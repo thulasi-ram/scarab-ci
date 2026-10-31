@@ -208,7 +208,8 @@ fn openapi_document_has_the_plugin_admin_api_but_not_the_broker() {
             "offer_actions",
             "use_connection",
             "contribute_ui",
-            "approve_gates"
+            "approve_gates",
+            "resolve_gates"
         ])
     );
 }

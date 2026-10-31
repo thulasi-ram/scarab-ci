@@ -25,6 +25,10 @@ spec:
         # values edit must reach a running server.
         checksum/connections: {{ include (print $.Template.BasePath "/configmap-connections.yaml") . | sha256sum }}
         {{- end }}
+        {{- if .Values.scarab.libsManifest }}
+        # Roll pods when the library manifest changes.
+        checksum/libs-manifest: {{ include (print $.Template.BasePath "/configmap-libs-manifest.yaml") . | sha256sum }}
+        {{- end }}
         {{- if .Values.scarab.placement }}
         # Roll pods when the placement config changes — it is read once at boot.
         checksum/placement: {{ include (print $.Template.BasePath "/configmap-placement.yaml") . | sha256sum }}
@@ -125,6 +129,13 @@ spec:
               mountPath: {{ include "scarab.connectionsDir" . | quote }}
               readOnly: true
             {{- end }}
+            {{- if .Values.scarab.libsManifest }}
+            # The first-party library manifest (ADR-0076 §5) —
+            # SCARAB_LIBS_MANIFEST points at the file inside.
+            - name: libs-manifest
+              mountPath: {{ include "scarab.libsManifestDir" . | quote }}
+              readOnly: true
+            {{- end }}
             {{- if .Values.scarab.placement }}
             # Operator placement config (ADR-0055) —
             # SCARAB_PLACEMENT_CONFIG_FILE points at the file inside.
@@ -152,6 +163,11 @@ spec:
         - name: connections
           configMap:
             name: {{ include "scarab.connectionsConfigMapName" . }}
+        {{- end }}
+        {{- if .Values.scarab.libsManifest }}
+        - name: libs-manifest
+          configMap:
+            name: {{ include "scarab.libsManifestConfigMapName" . }}
         {{- end }}
         {{- if .Values.scarab.placement }}
         - name: placement

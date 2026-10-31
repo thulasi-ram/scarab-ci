@@ -9,6 +9,8 @@
 //! - [`evaluate`](mod@evaluate): the evaluator, producing a
 //!   [`PolicyDecision`](evaluate::PolicyDecision) with its PolicySetDigest.
 //! - [`store`]: the `PolicyStore` port.
+//! - [`library`]: the `LibraryStore` port (ADR-0076) and the yank
+//!   PolicyInvariant.
 //! - [`schema`]: a checkpoint's typed input schema, generated from the Rust
 //!   types that build the input ([`policy_struct!`], [`policy_enum!`]).
 //! - [`run_create`]: the `run.create` checkpoint's input.
@@ -23,6 +25,7 @@ pub mod check;
 pub mod eval;
 pub mod evaluate;
 pub mod ir;
+pub mod library;
 pub mod policy;
 pub mod run_create;
 pub mod schema;

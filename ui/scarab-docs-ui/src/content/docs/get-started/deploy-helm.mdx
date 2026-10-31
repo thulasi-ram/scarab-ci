@@ -70,7 +70,8 @@ and has no error anywhere:
 - **Commit statuses: read & write** (App → *Permissions → Repository*): without `statuses:write`
   every status post is rejected `403 Resource not accessible by integration`. The run itself still
   succeeds, so the only visible effect is a pull request that never shows a Scarab status. Add
-  **Checks: read & write** only if you use checks; **Contents: read** is what a `clone` step needs.
+  **Checks: read & write** only if you use checks; **Contents: read** is what a checkout needs (add **Contents: write** only for a step with
+  `forge_token: write`).
 
 You do not have to verify these by eye: **Settings → Connections** runs a preflight against the
 App and names whatever is missing (`GET /v1/connections/{id}/preflight`), so a misconfigured App

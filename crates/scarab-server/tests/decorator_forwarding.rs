@@ -9,7 +9,7 @@
 //! `output_identity`, or every real (secrets-wired) deployment silently
 //! records NULL evidence. "The
 //! decorators" is PLURAL and this file honours that: production nests
-//! `clone(secret(k8s))` (main.rs), so `CloneEnrichingExecutor` — the
+//! `clone(secret(k8s))` (main.rs), so `ForgeCredentialExecutor` — the
 //! OUTERMOST layer, with its own forwards in clone_executor.rs — is driven
 //! here in that exact nesting, not just the secret layer alone.
 
@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use scarab_engine::ports::Executor;
 use scarab_engine::RunId;
-use scarab_server::clone_executor::CloneEnrichingExecutor;
+use scarab_server::forge_token::ForgeCredentialExecutor;
 use scarab_server::{LogService, SecretInjectingExecutor};
 use scarab_testkit::{FakeExecutor, FakeForge, FakeSecrets, InMemoryDb, InMemoryObjectStore};
 
@@ -87,7 +87,7 @@ async fn secret_injecting_executor_forwards_output_identity() {
 }
 
 /// The FULL production nesting (main.rs:535/550 — `clone(secret(k8s))`):
-/// `CloneEnrichingExecutor` is the OUTERMOST decorator, with its own
+/// `ForgeCredentialExecutor` is the OUTERMOST decorator, with its own
 /// `output_identity` override (clone_executor.rs) that the defaulted trait
 /// method would silently shadow if it were deleted. The secret-layer test
 /// above proves nothing about the layer production calls FIRST, so this
@@ -112,9 +112,8 @@ async fn the_production_decorator_stack_forwards_identity() {
         secrets,
         logs,
     ));
-    let stack = CloneEnrichingExecutor::new(
+    let stack = ForgeCredentialExecutor::new(
         secret_layer,
-        Arc::new(InMemoryDb::new()), // connection registry: empty is fine here
         Arc::new(FakeForge::new()),
     );
 

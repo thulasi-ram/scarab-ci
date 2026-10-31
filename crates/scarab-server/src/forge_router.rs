@@ -288,6 +288,27 @@ impl ForgePort for RegistryForge {
             .await
     }
 
+    async fn mints_repo_tokens(&self, repo: &RepoRef) -> Result<bool, ForgeError> {
+        self.adapter_for(repo).await?.mints_repo_tokens(repo).await
+    }
+
+    async fn mint_write_credential(
+        &self,
+        repo: &RepoRef,
+    ) -> Result<CheckoutCredential, ForgeError> {
+        self.adapter_for(repo)
+            .await?
+            .mint_write_credential(repo)
+            .await
+    }
+
+    async fn revoke_credential(&self, repo: &RepoRef, token: &str) -> Result<(), ForgeError> {
+        self.adapter_for(repo)
+            .await?
+            .revoke_credential(repo, token)
+            .await
+    }
+
     async fn registry_credential(
         &self,
         repo: &RepoRef,

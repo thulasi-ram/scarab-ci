@@ -137,11 +137,25 @@ impl Executor for SeamExec {
     ) -> Result<Option<scarab_engine::ProvisioningReport>, ExecError> {
         self.inner.workspace_provisioning(handle).await
     }
+    async fn gate_refusal(
+        &self,
+        gate: &scarab_engine::StepRun,
+    ) -> Result<Option<String>, scarab_engine::ExecError> {
+        self.inner.gate_refusal(gate).await
+    }
+
     async fn infra_condition(
         &self,
         handle: &ExecHandle,
     ) -> Result<Option<scarab_engine::InfraCondition>, ExecError> {
         self.inner.infra_condition(handle).await
+    }
+
+    async fn take_forge_credential(
+        &self,
+        handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::MountedForgeCredential>, ExecError> {
+        self.inner.take_forge_credential(handle).await
     }
 }
 

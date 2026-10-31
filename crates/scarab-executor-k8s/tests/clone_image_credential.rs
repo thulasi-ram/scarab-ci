@@ -25,7 +25,8 @@ const USER: &str = "scarab-bot";
 /// `scarab-bot:LONG-LIVED-PAT` as an HTTP Basic credential.
 const BASIC: &str = "Basic c2NhcmFiLWJvdDpMT05HLUxJVkVELVBBVA==";
 
-/// A temp dir holding the token file and a wrapper that runs the image's
+/// A temp dir holding the token and username files (as `forge_token` mounts
+/// them, ADR-0076 §9) and a wrapper that runs the image's
 /// askpass script from the source tree (so the test does not depend on the
 /// checkout preserving the exec bit).
 struct Helper {
@@ -47,6 +48,7 @@ impl Helper {
             std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         std::fs::write(dir.path().join("token"), TOKEN).unwrap();
+        std::fs::write(dir.path().join("username"), USER).unwrap();
         Helper { dir }
     }
 
@@ -66,7 +68,7 @@ impl Helper {
             .env("GIT_ASKPASS", self.askpass())
             .env("SCARAB_CLONE_URL", clone_url)
             .env("SCARAB_CLONE_TOKEN_FILE", self.dir.path().join("token"))
-            .env("SCARAB_CLONE_USERNAME", USER);
+            .env("SCARAB_CLONE_USERNAME_FILE", self.dir.path().join("username"));
         cmd
     }
 
@@ -103,7 +105,7 @@ impl Helper {
             .env("PATH", std::env::var("PATH").unwrap_or_default())
             .env("SCARAB_CLONE_URL", clone_url)
             .env("SCARAB_CLONE_TOKEN_FILE", self.dir.path().join("token"))
-            .env("SCARAB_CLONE_USERNAME", USER)
+            .env("SCARAB_CLONE_USERNAME_FILE", self.dir.path().join("username"))
             .stderr(Stdio::null())
             .output()
             .unwrap();

@@ -1,0 +1,158 @@
+---
+title: Libraries
+description: Install a library into your org from a git commit, use it with invoke lib:, upgrade it after reading the diff, and yank a version that must stop running.
+---
+
+import Doodle from '../../../components/Doodle.astro';
+
+<Doodle icon="package" size={200} rotate={-8} opacity={0.18} top="7rem" right="-2rem" />
+
+An org admin installs a library once, and every Pipeline in the org can use it:
+
+```yaml
+steps:
+  - id: ship
+    invoke: lib:acme/deploy-helm
+    with: { release: web }
+```
+
+A library is a YAML file with `kind: library` (see [Reuse: `invoke`](/scarab-ci/usage/pipeline-syntax/#reuse-invoke)).
+Scarab stores the file it installed and compiles Pipelines against that copy, so a Pipeline never
+fetches anything, and the org decides when a library changes.
+
+## Install a library
+
+Settings › Libraries › **Install library**, or the API. You give a **source**: a file in a git
+repository at a full commit id.
+
+```
+github.com/acme/scarab-libs//deploy-helm.yaml@8c2f4e1a9d7b3c5e0f6a2b8d4c1e7f9a3b5d2c6e
+```
+
+The part before `//` is the repository and the part after it is the file. A branch or tag is
+refused, because it can point somewhere else after you review it.
+
+Installing takes two steps:
+
+1. **Fetch and review.** Scarab reads the file, checks that it is a library, that it invokes only
+   `lib:` and `plugin:` targets (never `file:`), and that every library it invokes is installed in
+   the org. It stores the file as a version, keyed by its SHA-256, and shows you the content.
+   Nothing is installed yet. An org keeps its 50 most recent fetches that were never installed;
+   an older one is deleted and has to be fetched again before you install it.
+2. **Install.** Scarab installs the version you reviewed, by its hash. This asks you to confirm
+   with your passkey.
+
+```sh
+curl -X POST "$SCARAB/v1/orgs/acme/libraries/fetch" \
+  -d '{"source": "github.com/acme/scarab-libs//deploy-helm.yaml@8c2f…"}'
+# → {"publisher": "acme", "name": "deploy-helm", "content_hash": "5d1e…", "content": "…"}
+
+curl -X PUT "$SCARAB/v1/orgs/acme/libraries/acme/deploy-helm" \
+  -d '{"content_hash": "5d1e…"}'
+```
+
+**The name.** Pipelines name a library `lib:<publisher>/<name>`. The publisher defaults to the
+repository's owner and the name to the file name, and you can change both at install. Each
+publisher and name names one installation in the org. A name says nothing about where the library
+came from: the installation records its source, and Policies match on the source.
+
+**Where Scarab reads from.** A public repository on github.com, or on the host of a Forgejo
+connection, is read without credentials, over https only, from public addresses only, with no
+redirects and a 1 MiB limit. Any other host is refused. For a private repository, pick a
+connection: Scarab reads the file through it, but only from a repository bound to your org through
+that connection, or from a repository whose owner has your org's name. The owner-name match counts
+only when your org has at least one repository bound through that connection: an account with your
+org's name on another forge is not your org.
+
+## Upgrade
+
+Fetch the newer commit under the same name. Scarab shows the diff from the installed version, and
+**Upgrade** installs it. The upgrade names the version it replaces, so if someone else changed the
+installation after you fetched, it fails and you fetch again to see the current diff.
+
+A Run keeps the version it was created with. Its inlined Steps record the version's hash in
+`origin`, and a Rerun or Retry uses the stored Steps, so upgrading changes only Runs created after
+it.
+
+## Remove
+
+**Remove** deletes the installation. It needs no passkey. Pipelines that invoke it then fail to
+compile with "`lib:acme/deploy-helm` is not installed in this org"; Runs already created keep their
+Steps. The stored version stays, so those Runs still show what they ran.
+
+## Yank a version
+
+Yank a version when it must stop running, for example because an image it pins has a known
+vulnerability. Give a reason; every refusal shows it. Once a version is yanked in your org, Scarab
+refuses:
+
+- a new Run whose Steps or gates come from it, at Run creation;
+- each launch of a Step that comes from it, including Reruns and Retries of Runs created before the
+  yank (the Step fails with a configuration error naming the version and the reason);
+- approving or releasing a gate that comes from it; a timer gate from it fails with the reason
+  when its timer runs out;
+- a debug Pod of a Step that comes from it.
+
+A Policy cannot allow a yanked version, in `audit` mode or with `except_projects`. A yank applies
+to one org. Yanking needs no passkey; lifting a yank does.
+
+The usual fix is an upgrade to a version that pins the patched image, then a yank of the old one.
+
+```sh
+curl -X POST "$SCARAB/v1/orgs/acme/library-yanks" \
+  -d '{"content_hash": "5d1e…", "reason": "pins helm with CVE-2026-1234; upgrade to 9b2a…"}'
+```
+
+## First-party libraries
+
+Scarab's own libraries live in its repository under `libs/`. Each release publishes a
+`libs-manifest.json` asset listing every released version of each one, with its content hash and
+whether it fixes a security problem. A version whose hash is in that manifest is shown as
+first-party, wherever its copy came from.
+
+- **A new org** gets them installed when its first repository is bound. The bind does not wait for
+  this. If the source cannot be read, Settings › Libraries lists what is missing and why, and you
+  can retry, point at a mirror of Scarab's repository, or paste a copy of a file from the release.
+  Every copy must have the hash the manifest lists.
+- **An existing org** is offered them, and nothing is installed without an admin, including at a
+  Scarab upgrade.
+- When a newer first-party version exists, the panel says so, and marks it when it is a security
+  fix.
+
+The server reads the manifest of its own release from GitHub. `SCARAB_LIBS_MANIFEST` changes
+that: an https URL, a file path (for an install with no internet access), or `off`.
+
+The first-party clone library, `lib:thulasi-ram/clone`, pins the scarab-clone image by digest.
+To run checkouts from a mirror's image, install a copy of `libs/clone.yaml` that pins the mirror's
+image under the same name.
+
+## Trusting a library with forge credentials
+
+A step with `forge_token` receives a forge credential ([Pipeline syntax](/scarab-ci/usage/pipeline-syntax/#forge-credentials-forge_token)).
+On a Forgejo or GitHub token connection that credential is one long-lived token, so only a step
+from a library your org trusts receives it. Your org trusts its first-party clone library by
+default, wherever its copy came from. An org admin can trust another library by its source:
+
+```sh
+curl -X POST "$SCARAB/v1/orgs/acme/library-trust" \
+  -d '{"source": "github.com/acme/scarab-libs//release.yaml"}'
+```
+
+Trust is for the source without a commit, so it holds when you upgrade the library from the same
+source, and each upgrade still shows you its diff. Trusting needs a step-up; removing trust
+(`DELETE …/library-trust?source=<source>`) does not. Settings › Libraries lists the trusted sources.
+
+## Check a Pipeline before you push
+
+`scarab validate` without `--server` reports each `lib:` target as unresolved and checks the rest
+of the Pipeline. With `--server`, the server compiles it against your org's installed libraries:
+
+```sh
+scarab validate .scarab/ci.yaml --server "$SCARAB" --org acme --project web
+```
+
+## References
+
+- [ADR-0076, Libraries and plugins through invoke](/scarab-ci/tech/adr/0076-libraries-and-plugins-through-invoke/)
+- [ADR-0075, Policy engine](/scarab-ci/tech/adr/0075-policy-engine/)
+- [ADR-0073, Step-up confirmation](/scarab-ci/tech/adr/0073-step-up-confirmation/)

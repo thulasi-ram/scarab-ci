@@ -473,6 +473,56 @@ impl Event {
         }
     }
 
+    /// The trigger's values a `${{ event.* }}` template may read
+    /// (ADR-0076 §9), as the event carries them, **unchecked**:
+    /// `scarab_pipeline::event::facts` keeps the ones that pass their check.
+    /// `repo.clone_url` is not here: the server computes it from the
+    /// connection registry. `actor`, `body`, `schedule` and the provenance
+    /// fields are never here.
+    pub fn template_fields(&self) -> serde_json::Map<String, serde_json::Value> {
+        use serde_json::json;
+        let mut e = serde_json::Map::new();
+        e.insert("kind".into(), json!(self.trigger_kind().as_str()));
+        if let Some(r) = self.repo() {
+            e.insert("repo".into(), json!({ "owner": r.owner, "name": r.name }));
+        }
+        let branch = |r: &str| json!(r.strip_prefix("refs/heads/").unwrap_or(r));
+        match self {
+            Event::Push { r#ref, after, .. } => {
+                e.insert("ref".into(), json!(r#ref));
+                e.insert("branch".into(), branch(r#ref));
+                e.insert("sha".into(), json!(after));
+            }
+            Event::PullRequest {
+                number, head, fork, ..
+            } => {
+                e.insert("number".into(), json!(number));
+                e.insert("sha".into(), json!(head));
+                e.insert("fork".into(), json!(fork));
+            }
+            Event::Tag { tag, .. } => {
+                e.insert("tag".into(), json!(tag));
+                e.insert("ref".into(), json!(format!("refs/tags/{tag}")));
+            }
+            Event::Release { tag, .. } => {
+                e.insert("tag".into(), json!(tag));
+            }
+            Event::Comment { issue, .. } => {
+                e.insert("issue".into(), json!(issue));
+            }
+            Event::Cron { .. } => {}
+            Event::Manual { r#ref, sha, .. } | Event::Api { r#ref, sha, .. } => {
+                e.insert("ref".into(), json!(r#ref));
+                e.insert("branch".into(), branch(r#ref));
+                e.insert("sha".into(), json!(sha));
+            }
+            Event::Upstream { run, .. } => {
+                e.insert("run".into(), json!(run));
+            }
+        }
+        e
+    }
+
     /// A stable, flat JSON context for CEL trigger matching / interpolation
     /// (ADR-0010): `{ "event": { "kind", "repo", … } }` with event-specific
     /// fields (`branch`/`ref`/`sha` for push, `tag`, `number`, …). Authoring
@@ -592,6 +642,14 @@ pub struct CheckoutCredential {
     /// Whether the credential is read-only. A fork-PR checkout MUST be
     /// read-only (ADR-0045); an adapter must honor `read_only: true`.
     pub read_only: bool,
+    /// The forge minted this token for this request, scoped to one
+    /// repository, and it ends on its own (a GitHub App installation token).
+    /// `false`: the connection's one long-lived token (a Forgejo token, a
+    /// GitHub token connection). A launch decides from this, the credential
+    /// it holds, which Steps may receive it (ADR-0076 §9); absent reads as
+    /// long-lived.
+    #[serde(default)]
+    pub minted: bool,
 }
 
 /// A derived **registry credential** for the forge's own container registry
@@ -738,6 +796,37 @@ pub trait ForgePort: Send + Sync {
         repo: &RepoRef,
         read_only: bool,
     ) -> Result<CheckoutCredential, ForgeError>;
+
+    /// Whether this forge mints a short-lived token scoped to `repo` for each
+    /// request (GitHub App mode), rather than handing out one long-lived
+    /// token (a Forgejo or GitHub PAT connection). Run creation reads it to
+    /// decide which Steps may receive a forge credential (ADR-0076 §9).
+    /// Defaults to `false`: a forge that cannot say is treated as long-lived.
+    async fn mints_repo_tokens(&self, _repo: &RepoRef) -> Result<bool, ForgeError> {
+        Ok(false)
+    }
+
+    /// Mint a short-lived token that can push to `repo` (`contents: write`,
+    /// ADR-0076 §9). Only a forge that [mints](Self::mints_repo_tokens) can;
+    /// the default refuses.
+    async fn mint_write_credential(
+        &self,
+        _repo: &RepoRef,
+    ) -> Result<CheckoutCredential, ForgeError> {
+        Err(ForgeError::Unsupported(
+            "this forge connection hands out one long-lived token and cannot mint a write \
+             token"
+                .into(),
+        ))
+    }
+
+    /// Revoke a credential this forge minted for `repo`, when the Attempt
+    /// that held it ends (ADR-0076 §9). A forge that hands out a long-lived
+    /// token minted nothing, and must not revoke it: the default does
+    /// nothing.
+    async fn revoke_credential(&self, _repo: &RepoRef, _token: &str) -> Result<(), ForgeError> {
+        Ok(())
+    }
 
     /// Derive a credential for pushing to the forge's **own** registry
     /// (ADR-0018 amendment) — the zero-config case. `Ok(None)` when the

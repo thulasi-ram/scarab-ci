@@ -233,6 +233,23 @@ pub trait Db: Send + Sync {
         run: &RunId,
     ) -> Result<std::collections::BTreeMap<String, serde_json::Value>, DbError>;
 
+    /// Record the `event` values a Run's templates may read (ADR-0076 §9):
+    /// the trigger's allowlisted fields that passed their check, fixed when
+    /// the Run is created so every launch, rerun and retry renders the same
+    /// values. Overwrites any prior value.
+    async fn set_run_event_facts(
+        &self,
+        run: &RunId,
+        facts: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(), DbError>;
+
+    /// A Run's stored `event` values, or an empty map if it has none (a Run
+    /// created before they were stored, or an unknown Run).
+    async fn run_event_facts(
+        &self,
+        run: &RunId,
+    ) -> Result<serde_json::Map<String, serde_json::Value>, DbError>;
+
     /// Record a run's **deploy context** (ADR-0037) — set once at creation for a
     /// run whose pipeline declared an `environment:`. Lets gate-approval-time
     /// admission look up the environment's protection rules directly.
@@ -627,6 +644,51 @@ pub trait Db: Send + Sync {
     /// The wait (seconds) of a `timer` gate, or `None` if the step is not a timer
     /// gate (or is unknown). Read at admission to decide auto-release.
     async fn gate_timer_seconds(&self, run: &RunId, step: &StepId) -> Result<Option<i64>, DbError>;
+
+    /// Name the Principal that may release gate `step` (ADR-0076 §7): for a
+    /// `plugin` gate, `plugin:<installation>`. Written at Run creation, once.
+    async fn set_gate_releaser(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        releaser: &str,
+    ) -> Result<(), DbError>;
+
+    /// The Principal that may release gate `step`, if one is named.
+    async fn gate_releaser(&self, run: &RunId, step: &StepId) -> Result<Option<String>, DbError>;
+
+    /// Store `inputs` on gate `step`'s wait `attempt` (ADR-0076 §7: a plugin
+    /// gate's inputs, rendered when it is reached). Only while `attempt` is
+    /// still `Running` and holds none: a wait's inputs are written once.
+    /// Returns whether they were stored.
+    async fn set_gate_wait_inputs(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        inputs: &serde_json::Value,
+    ) -> Result<bool, DbError>;
+
+    /// The inputs stored on gate `step`'s wait `attempt`, if any.
+    async fn gate_wait_inputs(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<Option<serde_json::Value>, DbError>;
+
+    /// The open waits of `plugin` gates released by `releaser` in Runs of org
+    /// `org` (ADR-0076 §7): the gate `Pending`, its last Attempt `Running`
+    /// with its inputs stored. Ordered by [`PendingGateKey`], those after
+    /// `after`, at most `limit`. The org is the Run's tenant org: a Run with
+    /// none is in no org's list.
+    async fn pending_plugin_gates(
+        &self,
+        org: &str,
+        releaser: &str,
+        after: Option<&crate::PendingGateKey>,
+        limit: u32,
+    ) -> Result<Vec<crate::PendingGateWait>, DbError>;
 
     /// Create the durable [`RunService`] row for a shared service (ADR-0058),
     /// born in [`ServiceStatus::Starting`]. Idempotent on `{run, take, name}` —
@@ -1280,6 +1342,19 @@ pub trait Executor: Send + Sync {
         handle: &ExecHandle,
     ) -> Result<Option<crate::ProvisioningReport>, ExecError>;
 
+    /// Why gate `gate` may not pass now, or `Ok(None)`. The scheduler asks
+    /// before it releases a gate on its own verdict (a timer that elapsed),
+    /// and fails the gate with this reason instead; the API's release and
+    /// approve routes make the same check themselves. The yank check of
+    /// ADR-0076 §6 answers here, the same check a launch makes, because a
+    /// gate launches nothing and so never reaches [`launch`](Self::launch).
+    ///
+    /// **Deliberately REQUIRED — no default**, for the reason spelled out on
+    /// [`workspace_provisioning`](Self::workspace_provisioning): a decorator
+    /// that inherited a `None` default would release a gate the executor it
+    /// wraps refuses, and nothing would fail. Decorators forward it.
+    async fn gate_refusal(&self, gate: &StepRun) -> Result<Option<String>, ExecError>;
+
     /// The backend's current **infra condition** for a launched unit, or
     /// `Ok(None)` when it has nothing noteworthy to say — the unit is running,
     /// or is merely early in a normal start (ADR-0068).
@@ -1304,6 +1379,23 @@ pub trait Executor: Send + Sync {
         &self,
         handle: &ExecHandle,
     ) -> Result<Option<crate::InfraCondition>, ExecError>;
+
+    /// Remove the forge credential `handle`'s unit holds from the backend,
+    /// and return it (ADR-0076 §9). Called once the Attempt has ended, so
+    /// the control plane that sees the end can revoke a minted token,
+    /// whichever replica minted it, and a long-lived token does not stay
+    /// stored for as long as the unit is kept. On k8s that is the per-Pod
+    /// token Secret. `Ok(None)`: the unit holds none, or it was taken
+    /// already. A backend that never mounts one answers `Ok(None)`.
+    ///
+    /// **Deliberately REQUIRED — no default**, for the reason spelled out on
+    /// [`workspace_provisioning`](Self::workspace_provisioning): a decorator
+    /// that inherited a `None` default would leave every token of the
+    /// executor it wraps unrevoked, and nothing would fail.
+    async fn take_forge_credential(
+        &self,
+        handle: &ExecHandle,
+    ) -> Result<Option<crate::MountedForgeCredential>, ExecError>;
 
     /// Open a best-effort **live tail** of the unit's stdout/stderr for `step`,
     /// keyed by its fence (ADR-0013). The control plane drains the returned

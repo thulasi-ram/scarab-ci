@@ -149,10 +149,24 @@ impl Executor for GatedExec {
         Ok(None)
     }
 
+    async fn gate_refusal(
+        &self,
+        _gate: &scarab_engine::StepRun,
+    ) -> Result<Option<String>, scarab_engine::ExecError> {
+        Ok(None)
+    }
+
     async fn infra_condition(
         &self,
         _handle: &ExecHandle,
     ) -> Result<Option<scarab_engine::InfraCondition>, ExecError> {
+        Ok(None)
+    }
+
+    async fn take_forge_credential(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::MountedForgeCredential>, ExecError> {
         Ok(None)
     }
 

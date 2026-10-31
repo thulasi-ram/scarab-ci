@@ -1029,21 +1029,21 @@ async fn redteam_api_policy_test_with_a_giant_libs_map_and_a_deep_chain() {
         libs.insert(
             format!(".scarab/lib/c{i}.yaml"),
             json!(format!(
-                "steps:\n  - {{ id: n{i}, invoke: .scarab/lib/c{}.yaml }}\n",
+                "kind: library\nsteps:\n  - {{ id: n{i}, invoke: file:.scarab/lib/c{}.yaml }}\n",
                 i + 1
             )),
         );
     }
     libs.insert(
         ".scarab/lib/c9.yaml".into(),
-        json!("steps:\n  - { id: leaf, image: busybox }\n"),
+        json!("kind: library\nsteps:\n  - { id: leaf, image: busybox }\n"),
     );
     let (st, b) = h
         .cookie(
             "POST",
             "/v1/orgs/acme/policy-test",
             Some(json!({ "policy": audit_policy("d"), "pipeline": {
-                "yaml": "on:\n  push: {}\nsteps:\n  - { id: top, invoke: .scarab/lib/c0.yaml }\n",
+                "yaml": "on:\n  push: {}\nsteps:\n  - { id: top, invoke: file:.scarab/lib/c0.yaml }\n",
                 "project": "web", "libs": libs,
                 "trigger": { "kind": "push", "ref": "refs/heads/main" }
             }})),

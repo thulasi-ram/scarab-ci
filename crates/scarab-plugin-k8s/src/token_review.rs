@@ -93,14 +93,26 @@ impl VerdictCache {
 /// ServiceAccount to an installation); this only proves the identity.
 pub struct TokenReviewVerifier {
     client: Client,
+    /// The one audience a token must be for: `scarab-broker` for the
+    /// broker, `scarab-api` for the gate API (ADR-0076 §7). Each consumer
+    /// has its own verifier, so a token minted for one is refused by the
+    /// other.
+    audience: &'static str,
     cache: Mutex<VerdictCache>,
     reviews: tokio::sync::Semaphore,
 }
 
 impl TokenReviewVerifier {
+    /// A verifier for broker tokens (audience `scarab-broker`).
     pub fn new(client: Client) -> Self {
+        Self::for_audience(client, BROKER_TOKEN_AUDIENCE)
+    }
+
+    /// A verifier for tokens of `audience` only.
+    pub fn for_audience(client: Client, audience: &'static str) -> Self {
         Self {
             client,
+            audience,
             cache: Mutex::new(VerdictCache::default()),
             reviews: tokio::sync::Semaphore::new(MAX_CONCURRENT_TOKEN_REVIEWS),
         }
@@ -127,7 +139,7 @@ impl PluginTokenVerifier for TokenReviewVerifier {
         // Junk never reaches the cache or the API server. Not cached either:
         // the check is cheaper than a lookup, and caching junk would only
         // churn out real verdicts.
-        precheck_jwt(token, unix_now())?;
+        precheck_jwt_for(token, unix_now(), self.audience)?;
         let key: [u8; 32] = Sha256::digest(token.as_bytes()).into();
         if let Some(verdict) = self.cached(&key) {
             return verdict;
@@ -141,7 +153,7 @@ impl PluginTokenVerifier for TokenReviewVerifier {
                 // Asked for explicitly: the API server answers for THIS
                 // audience only, so a token minted for it (or for any other
                 // consumer) is not authenticated here.
-                audiences: Some(vec![BROKER_TOKEN_AUDIENCE.to_string()]),
+                audiences: Some(vec![self.audience.to_string()]),
                 token: token.to_string(),
             },
             ..Default::default()
@@ -152,7 +164,7 @@ impl PluginTokenVerifier for TokenReviewVerifier {
             // Not cached: an API server blip must not pin a "no" on a good
             // token for the cache's lifetime. Fail closed for this call only.
             .map_err(|e| TokenRejected(format!("TokenReview unavailable: {e}")))?;
-        let verdict = verdict_from_status(reviewed.status.as_ref());
+        let verdict = verdict_for(reviewed.status.as_ref(), self.audience);
         self.remember(key, verdict.clone());
         verdict
     }
@@ -169,7 +181,13 @@ fn unix_now() -> i64 {
 /// audience that has not expired. It proves nothing — the signature is the
 /// API server's to check — it only turns away what TokenReview would
 /// certainly refuse, so junk costs the cluster nothing.
+#[cfg(test)]
 fn precheck_jwt(token: &str, now: i64) -> Result<(), TokenRejected> {
+    precheck_jwt_for(token, now, BROKER_TOKEN_AUDIENCE)
+}
+
+/// [`precheck_jwt`] for tokens of `audience`.
+fn precheck_jwt_for(token: &str, now: i64, audience: &str) -> Result<(), TokenRejected> {
     let reject = |why: &str| Err(TokenRejected(format!("not a broker token: {why}")));
     if token.len() > MAX_TOKEN_BYTES {
         return reject("too long");
@@ -201,10 +219,8 @@ fn precheck_jwt(token: &str, now: i64) -> Result<(), TokenRejected> {
         return reject("no algorithm");
     }
     let for_broker = match claims.get("aud") {
-        Some(serde_json::Value::String(aud)) => aud == BROKER_TOKEN_AUDIENCE,
-        Some(serde_json::Value::Array(auds)) => auds
-            .iter()
-            .any(|a| a.as_str() == Some(BROKER_TOKEN_AUDIENCE)),
+        Some(serde_json::Value::String(aud)) => aud == audience,
+        Some(serde_json::Value::Array(auds)) => auds.iter().any(|a| a.as_str() == Some(audience)),
         _ => false,
     };
     if !for_broker {
@@ -221,7 +237,13 @@ fn precheck_jwt(token: &str, now: i64) -> Result<(), TokenRejected> {
 /// ServiceAccount, and bound to a Pod. Anything less is a rejection —
 /// including a legacy Secret-based token or a TokenRequest minted with no
 /// bound object, which would outlive any Pod.
+#[cfg(test)]
 fn verdict_from_status(status: Option<&TokenReviewStatus>) -> Verdict {
+    verdict_for(status, BROKER_TOKEN_AUDIENCE)
+}
+
+/// [`verdict_from_status`] for tokens of `audience`.
+fn verdict_for(status: Option<&TokenReviewStatus>, audience: &str) -> Verdict {
     let reject = |why: String| Err(TokenRejected(why));
     let Some(status) = status else {
         return reject("TokenReview returned no status".into());
@@ -240,9 +262,9 @@ fn verdict_from_status(status: Option<&TokenReviewStatus>) -> Verdict {
     let for_broker = status
         .audiences
         .as_ref()
-        .is_some_and(|a| a.iter().any(|a| a == BROKER_TOKEN_AUDIENCE));
+        .is_some_and(|a| a.iter().any(|a| a == audience));
     if !for_broker {
-        return reject(format!("not a `{BROKER_TOKEN_AUDIENCE}` token"));
+        return reject(format!("not a `{audience}` token"));
     }
     let Some(user) = status.user.as_ref() else {
         return reject("authenticated, but no user".into());
@@ -270,6 +292,44 @@ fn verdict_from_status(status: Option<&TokenReviewStatus>) -> Verdict {
         namespace: namespace.to_string(),
         service_account: service_account.to_string(),
     })
+}
+
+#[cfg(test)]
+mod audience_tests {
+    use super::*;
+    use base64::Engine;
+
+    fn jwt(aud: &str, exp: i64) -> String {
+        let enc = |v: serde_json::Value| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string())
+        };
+        format!(
+            "{}.{}.sig",
+            enc(serde_json::json!({"alg": "RS256"})),
+            enc(serde_json::json!({"aud": [aud], "exp": exp}))
+        )
+    }
+
+    #[test]
+    fn a_token_is_taken_only_for_its_own_audience() {
+        let now = 1_000;
+        let api = jwt(scarab_plugin::API_TOKEN_AUDIENCE, now + 600);
+        let broker = jwt(BROKER_TOKEN_AUDIENCE, now + 600);
+        assert!(precheck_jwt_for(&api, now, scarab_plugin::API_TOKEN_AUDIENCE).is_ok());
+        assert!(precheck_jwt_for(&api, now, BROKER_TOKEN_AUDIENCE).is_err());
+        assert!(precheck_jwt_for(&broker, now, scarab_plugin::API_TOKEN_AUDIENCE).is_err());
+        let status = |aud: &str| TokenReviewStatus {
+            authenticated: Some(true),
+            audiences: Some(vec![aud.to_string()]),
+            ..Default::default()
+        };
+        let refused = verdict_for(
+            Some(&status(BROKER_TOKEN_AUDIENCE)),
+            scarab_plugin::API_TOKEN_AUDIENCE,
+        )
+        .unwrap_err();
+        assert!(refused.0.contains("scarab-api"), "{refused}");
+    }
 }
 
 #[cfg(test)]

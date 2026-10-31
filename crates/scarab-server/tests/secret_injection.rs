@@ -28,10 +28,24 @@ impl Executor for CapturingExec {
         Ok(None)
     }
 
+    async fn gate_refusal(
+        &self,
+        _gate: &scarab_engine::StepRun,
+    ) -> Result<Option<String>, scarab_engine::ExecError> {
+        Ok(None)
+    }
+
     async fn infra_condition(
         &self,
         _handle: &ExecHandle,
     ) -> Result<Option<scarab_engine::InfraCondition>, ExecError> {
+        Ok(None)
+    }
+
+    async fn take_forge_credential(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::MountedForgeCredential>, ExecError> {
         Ok(None)
     }
 
@@ -92,7 +106,7 @@ fn spec_with_secret() -> StepSpec {
         workspace_inputs: vec![],
         workspace_outputs: vec![],
         cache: None,
-        clone: None,
+        forge_token: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],
@@ -102,6 +116,7 @@ fn spec_with_secret() -> StepSpec {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     }
 }
 fn logs(db: Arc<dyn Db>) -> Arc<LogService> {
@@ -251,10 +266,24 @@ impl Executor for SpecCapturingExec {
         Ok(None)
     }
 
+    async fn gate_refusal(
+        &self,
+        _gate: &scarab_engine::StepRun,
+    ) -> Result<Option<String>, scarab_engine::ExecError> {
+        Ok(None)
+    }
+
     async fn infra_condition(
         &self,
         _handle: &ExecHandle,
     ) -> Result<Option<scarab_engine::InfraCondition>, ExecError> {
+        Ok(None)
+    }
+
+    async fn take_forge_credential(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::MountedForgeCredential>, ExecError> {
         Ok(None)
     }
 
@@ -305,7 +334,7 @@ fn plain_spec() -> StepSpec {
         workspace_inputs: vec![],
         workspace_outputs: vec![],
         cache: None,
-        clone: None,
+        forge_token: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],
@@ -315,6 +344,7 @@ fn plain_spec() -> StepSpec {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     }
 }
 
@@ -450,6 +480,13 @@ impl Executor for ConditionExec {
         Ok(None)
     }
 
+    async fn gate_refusal(
+        &self,
+        _gate: &scarab_engine::StepRun,
+    ) -> Result<Option<String>, scarab_engine::ExecError> {
+        Ok(None)
+    }
+
     async fn infra_condition(
         &self,
         _handle: &ExecHandle,
@@ -458,6 +495,13 @@ impl Executor for ConditionExec {
             "ErrImagePull",
             Some("pulling https://u:sup3r-s3cret@registry.test/acme:v1 failed".into()),
         )))
+    }
+
+    async fn take_forge_credential(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::MountedForgeCredential>, ExecError> {
+        Ok(None)
     }
 
     async fn workspace_provisioning(

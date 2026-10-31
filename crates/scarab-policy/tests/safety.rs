@@ -31,6 +31,8 @@ fn facts() -> RunCreateFacts {
         environment: None,
         principal: None,
         time: Timestamp::from_unix_millis(0).unwrap(),
+        params: Default::default(),
+        event: Default::default(),
     }
 }
 
@@ -126,21 +128,26 @@ fn a_run_over_the_step_cap_is_refused_before_its_steps_are_built() {
     );
 }
 
-/// A matrix fans one Step out to 8,000; the cap refuses the Run.
+/// A matrix fans one Step out to 600, which compiles (under
+/// `scarab_pipeline::MAX_COMPILED_STEPS`); the cap refuses the Run.
 #[test]
 fn a_matrix_over_the_step_cap_is_refused() {
-    let vals = (0..20)
-        .map(|i| format!("v{i}"))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let vals = |n: usize| {
+        (0..n)
+            .map(|i| format!("v{i}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     let yaml = format!(
-        "steps:\n  - id: m\n    image: busybox\n    matrix: {{ dimensions: {{ a: [{vals}], b: [{vals}], c: [{vals}] }} }}\n"
+        "steps:\n  - id: m\n    image: busybox\n    matrix: {{ dimensions: {{ a: [{}], b: [{}] }} }}\n",
+        vals(20),
+        vals(30)
     );
     let ir = scarab_pipeline::compile_yaml(&yaml).expect("compiles");
-    assert_eq!(ir.steps.len(), 8000);
+    assert_eq!(ir.steps.len(), 600);
     let err = input_from_pipeline(&ir, facts()).unwrap_err();
     assert!(
-        err.to_string().starts_with("the Run has 8000 Steps"),
+        err.to_string().starts_with("the Run has 600 Steps"),
         "{err}"
     );
 }

@@ -12,6 +12,10 @@
 //! `matrix`). Bad expressions are caught at **submit time** by [`check`], never
 //! mid-run.
 
+use std::ops::Range;
+use std::sync::Arc;
+
+use cel::common::ast::{operators, EntryExpr, Expr, IdedExpr, LiteralValue};
 use cel::{Context, Program};
 
 use crate::PipelineError;
@@ -52,7 +56,7 @@ pub const CEL_STACK_BYTES: usize = if cfg!(debug_assertions) {
 };
 
 /// The expression as quoted in an error: whole when short, else its start.
-fn shown(expr: &str) -> String {
+pub(crate) fn shown(expr: &str) -> String {
     const MAX: usize = 80;
     if expr.len() <= MAX {
         return expr.to_string();
@@ -229,46 +233,298 @@ pub fn eval_bool(expr: &str, ctx: &serde_json::Value) -> Result<bool, PipelineEr
     }
 }
 
+/// One dimension of a product of string values, for [`eval_bool_product`].
+pub(crate) struct Dim<'a> {
+    pub name: &'a str,
+    pub values: &'a [Arc<String>],
+}
+
+/// Evaluate the guard `expr`, parsing it once, at each of `points` of the
+/// product of `dims`: point `p` binds each dimension to one of its values,
+/// numbered with the last dimension changing fastest. `fixed` names are
+/// bound once, to the same value at every point. The result of
+/// [`eval_bool`] at each point, in order, or the first error.
+pub(crate) fn eval_bool_product(
+    expr: &str,
+    fixed: &[(&str, Arc<String>)],
+    dims: &[Dim<'_>],
+    points: &[usize],
+) -> Result<Vec<bool>, PipelineError> {
+    with_program(expr, |program| {
+        // One context: building one registers the standard functions, which
+        // costs more than the evaluation. Each binding replaces the last.
+        let mut context = Context::default();
+        for (name, value) in fixed {
+            context.add_variable_from_value(*name, cel::Value::String(value.clone()));
+        }
+        points
+            .iter()
+            .map(|&point| {
+                let mut rest = point;
+                for d in dims.iter().rev() {
+                    let n = d.values.len().max(1);
+                    let value = d.values[rest % n].clone();
+                    context.add_variable_from_value(d.name, cel::Value::String(value));
+                    rest /= n;
+                }
+                let value = program
+                    .execute(&context)
+                    .map_err(|e| PipelineError::Cel(format!("`{}`: {e}", shown(expr))))?;
+                match value {
+                    cel::Value::Bool(b) => Ok(b),
+                    other => Err(PipelineError::Cel(format!(
+                        "`{}`: expected a boolean, got `{}`",
+                        shown(expr),
+                        other
+                            .json()
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|_| format!("{other:?}"))
+                    ))),
+                }
+            })
+            .collect()
+    })
+}
+
 /// Resolve every `${{ <cel> }}` interpolation in `template` against `ctx`.
 /// String results are inserted raw (no quotes); other JSON values use their
 /// compact JSON form.
 pub fn interpolate(template: &str, ctx: &serde_json::Value) -> Result<String, PipelineError> {
+    let (found, unterminated) = scan_interpolations(template);
     let mut out = String::new();
-    let mut rest = template;
-    while let Some(start) = rest.find("${{") {
-        out.push_str(&rest[..start]);
-        let after = &rest[start + 3..];
-        let end = after
-            .find("}}")
-            .ok_or_else(|| PipelineError::Cel(format!("unterminated `${{{{` in `{template}`")))?;
-        let expr = after[..end].trim();
-        out.push_str(&render(&eval(expr, ctx)?));
-        rest = &after[end + 2..];
+    let mut at = 0;
+    for i in found {
+        out.push_str(&template[at..i.outer.start]);
+        out.push_str(&render(&eval(template[i.inner].trim(), ctx)?));
+        at = i.outer.end;
     }
-    out.push_str(rest);
+    if unterminated.is_some() {
+        return Err(unterminated_error(template));
+    }
+    out.push_str(&template[at..]);
     Ok(out)
 }
 
 /// Extract the (trimmed) expressions inside each `${{ … }}` in `template`,
 /// erroring if any is unterminated.
 pub(crate) fn interpolations(template: &str) -> Result<Vec<&str>, PipelineError> {
-    let mut exprs = Vec::new();
-    let mut rest = template;
-    while let Some(start) = rest.find("${{") {
-        let after = &rest[start + 3..];
-        let end = after
-            .find("}}")
-            .ok_or_else(|| PipelineError::Cel(format!("unterminated `${{{{` in `{template}`")))?;
-        exprs.push(after[..end].trim());
-        rest = &after[end + 2..];
+    match scan_interpolations(template) {
+        (_, Some(_)) => Err(unterminated_error(template)),
+        (found, None) => Ok(found
+            .into_iter()
+            .map(|i| template[i.inner].trim())
+            .collect()),
     }
-    Ok(exprs)
 }
 
-fn render(v: &serde_json::Value) -> String {
+fn unterminated_error(template: &str) -> PipelineError {
+    PipelineError::Cel(format!("unterminated `${{{{` in `{template}`"))
+}
+
+/// One `${{ … }}` in a template.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Interpolation {
+    /// Byte range of the whole `${{ … }}`.
+    pub outer: Range<usize>,
+    /// Byte range of the text between `${{` and `}}`, not trimmed.
+    pub inner: Range<usize>,
+}
+
+/// Each `${{ … }}` in `template`, in order, found the way [`interpolate`]
+/// finds them when a Step launches: a `${{`, then the first `}}` after it.
+/// The second value is the byte offset of a `${{` with no `}}` after it.
+pub(crate) fn scan_interpolations(template: &str) -> (Vec<Interpolation>, Option<usize>) {
+    let mut found = Vec::new();
+    let mut at = 0;
+    while let Some(rel) = template[at..].find("${{") {
+        let start = at + rel;
+        let Some(len) = template[start + 3..].find("}}") else {
+            return (found, Some(start));
+        };
+        let inner = start + 3..start + 3 + len;
+        at = inner.end + 2;
+        found.push(Interpolation {
+            outer: start..at,
+            inner,
+        });
+    }
+    (found, None)
+}
+
+/// One read of a variable in a parsed CEL expression: the variable, then the
+/// members selected from it while each is a constant (`v.a.b`, `v["a"].b`,
+/// `has(v.a)`). Found from the parser's tree, never from the text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Read {
+    /// The variable, without the leading `.` of a root-qualified read.
+    pub var: String,
+    /// The first member, when it is a constant. `None` when the variable is
+    /// used whole (`size(v)`, `v` passed on) or with a computed key (`v[k]`).
+    pub first: Option<String>,
+    /// The member selected from `first`, when that is a constant too.
+    pub second: Option<String>,
+}
+
+/// Every read of a variable in `expr`, by the CEL parser (ADR-0076). A
+/// comprehension's own variables are reported like any other name, which
+/// only ever makes a caller treat the expression as reading more.
+pub(crate) fn reads(expr: &str) -> Result<Vec<Read>, PipelineError> {
+    with_program(expr, |program| {
+        let mut out = Vec::new();
+        read_walk(program.expression(), &mut out);
+        Ok(out)
+    })
+}
+
+/// The variable and constant members of `expr` when it is nothing else
+/// (`inputs.region`, `inputs["region"]`): `["inputs", "region"]`. `None`
+/// for any other expression, or one that does not parse.
+pub(crate) fn path(expr: &str) -> Option<Vec<String>> {
+    with_program(expr, |program| {
+        let mut keys = Vec::new();
+        let mut cur = program.expression();
+        while let Some((operand, key, _)) = member_of(cur) {
+            keys.push(key);
+            cur = operand;
+        }
+        let Expr::Ident(name) = &cur.expr else {
+            return Ok(None);
+        };
+        let mut out = vec![name.trim_start_matches('.').to_string()];
+        for key in keys.into_iter().rev() {
+            let Some(key) = key else { return Ok(None) };
+            out.push(key);
+        }
+        Ok(Some(out))
+    })
+    .ok()
+    .flatten()
+}
+
+/// One member step of a selection chain: the operand, the member when it is
+/// a constant, and the key expression when it is computed.
+fn member_of(e: &IdedExpr) -> Option<(&IdedExpr, Option<String>, Option<&IdedExpr>)> {
+    match &e.expr {
+        Expr::Select(s) => Some((&s.operand, Some(s.field.clone()), None)),
+        Expr::Call(c)
+            if c.func_name == operators::INDEX && c.target.is_none() && c.args.len() == 2 =>
+        {
+            match &c.args[1].expr {
+                Expr::Literal(LiteralValue::String(s)) => {
+                    Some((&c.args[0], Some(s.inner().to_string()), None))
+                }
+                _ => Some((&c.args[0], None, Some(&c.args[1]))),
+            }
+        }
+        _ => None,
+    }
+}
+
+fn read_walk(e: &IdedExpr, out: &mut Vec<Read>) {
+    // The longest selection chain starting here, innermost operand last.
+    let mut keys: Vec<Option<String>> = Vec::new();
+    let mut computed: Vec<&IdedExpr> = Vec::new();
+    let mut cur = e;
+    while let Some((operand, key, key_expr)) = member_of(cur) {
+        keys.push(key);
+        computed.extend(key_expr);
+        cur = operand;
+    }
+    if !keys.is_empty() {
+        keys.reverse();
+        match &cur.expr {
+            Expr::Ident(name) => {
+                let first = keys[0].clone();
+                let second = first.as_ref().and(keys.get(1).cloned().flatten());
+                out.push(Read {
+                    var: name.trim_start_matches('.').to_string(),
+                    first,
+                    second,
+                });
+            }
+            _ => read_walk(cur, out),
+        }
+        for k in computed {
+            read_walk(k, out);
+        }
+        return;
+    }
+    match &e.expr {
+        Expr::Ident(name) => out.push(Read {
+            var: name.trim_start_matches('.').to_string(),
+            first: None,
+            second: None,
+        }),
+        // A selection is always a chain, handled above.
+        Expr::Select(_) => {}
+        Expr::Call(c) => {
+            if let Some(t) = &c.target {
+                read_walk(t, out);
+            }
+            c.args.iter().for_each(|a| read_walk(a, out));
+        }
+        Expr::Comprehension(c) => {
+            for part in [
+                &c.iter_range,
+                &c.accu_init,
+                &c.loop_cond,
+                &c.loop_step,
+                &c.result,
+            ] {
+                read_walk(part, out);
+            }
+        }
+        Expr::List(l) => l.elements.iter().for_each(|x| read_walk(x, out)),
+        Expr::Map(m) => m.entries.iter().for_each(|x| entry_reads(&x.expr, out)),
+        Expr::Struct(s) => s.entries.iter().for_each(|x| entry_reads(&x.expr, out)),
+        Expr::Literal(_) | Expr::Unspecified => {}
+    }
+}
+
+fn entry_reads(e: &EntryExpr, out: &mut Vec<Read>) {
+    match e {
+        EntryExpr::StructField(f) => read_walk(&f.value, out),
+        EntryExpr::MapEntry(m) => {
+            read_walk(&m.key, out);
+            read_walk(&m.value, out);
+        }
+    }
+}
+
+/// A value as `${{ … }}` writes it into text: a string verbatim, anything
+/// else its compact JSON.
+pub(crate) fn render(v: &serde_json::Value) -> String {
     match v {
         serde_json::Value::String(s) => s.clone(),
         other => other.to_string(),
+    }
+}
+
+/// A JSON value as CEL sees it. An integer is an `int` whenever it fits one,
+/// so a whole-number input or result does arithmetic with a literal
+/// (`inputs.count + 1`); the `cel` crate's own JSON mapping makes every
+/// non-negative integer a `uint`, which CEL does not add to an `int`.
+fn to_cel(v: &serde_json::Value) -> cel::Value {
+    use std::sync::Arc;
+    match v {
+        serde_json::Value::Null => cel::Value::Null,
+        serde_json::Value::Bool(b) => cel::Value::Bool(*b),
+        serde_json::Value::Number(n) => match (n.as_i64(), n.as_u64()) {
+            (Some(i), _) => cel::Value::Int(i),
+            (None, Some(u)) => cel::Value::UInt(u),
+            _ => cel::Value::Float(n.as_f64().unwrap_or(f64::NAN)),
+        },
+        serde_json::Value::String(s) => cel::Value::String(Arc::new(s.clone())),
+        serde_json::Value::Array(items) => {
+            cel::Value::List(Arc::new(items.iter().map(to_cel).collect()))
+        }
+        serde_json::Value::Object(fields) => cel::Value::Map(
+            fields
+                .iter()
+                .map(|(k, v)| (k.clone(), to_cel(v)))
+                .collect::<std::collections::HashMap<String, cel::Value>>()
+                .into(),
+        ),
     }
 }
 
@@ -278,9 +534,7 @@ fn bind(context: &mut Context, ctx: &serde_json::Value, expr: &str) -> Result<()
     match ctx {
         serde_json::Value::Object(map) => {
             for (k, v) in map {
-                context.add_variable(k.clone(), v.clone()).map_err(|e| {
-                    PipelineError::Cel(format!("`{}`: binding `{k}`: {e}", shown(expr)))
-                })?;
+                context.add_variable_from_value(k.clone(), to_cel(v));
             }
             Ok(())
         }
@@ -296,6 +550,17 @@ fn bind(context: &mut Context, ctx: &serde_json::Value, expr: &str) -> Result<()
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_path_is_a_variable_and_constant_members_only() {
+        let p = |e: &str| path(e);
+        assert_eq!(p("inputs.region"), Some(vec!["inputs".into(), "region".into()]));
+        assert_eq!(p("inputs['region']"), Some(vec!["inputs".into(), "region".into()]));
+        assert_eq!(p(".inputs"), Some(vec!["inputs".into()]));
+        for e in ["inputs.region + ''", "inputs[k]", "size(inputs)", "'x'", "1 +"] {
+            assert_eq!(p(e), None, "{e}");
+        }
+    }
 
     #[test]
     fn eval_bool_reads_context_variables() {
@@ -472,5 +737,108 @@ mod tests {
         assert_eq!(max_nesting(&format!("'unterminated\n{deep}")), 100);
         assert_eq!(max_nesting("(a[b]{c[d]})"), 3);
         on_worker_stack(move || check(&format!("'{deep}' == 'x'")).unwrap());
+    }
+
+    #[test]
+    fn the_scan_finds_interpolations_as_a_launch_does() {
+        let text = "a ${{ x }}b${{y}}} ${{ z";
+        let (found, open) = scan_interpolations(text);
+        let shown: Vec<(&str, &str)> = found
+            .iter()
+            .map(|i| (&text[i.outer.clone()], &text[i.inner.clone()]))
+            .collect();
+        assert_eq!(shown, vec![("${{ x }}", " x "), ("${{y}}", "y")]);
+        assert_eq!(open, Some(19));
+        assert_eq!(scan_interpolations("none").0, vec![]);
+    }
+
+    #[test]
+    fn json_values_bind_with_their_cel_types() {
+        let ctx =
+            json!({ "n": null, "i": 5, "u": u64::MAX, "f": 1.5, "l": [1], "m": { "k": "v" } });
+        assert_eq!(
+            eval(
+                "[n == null, i + 1 == 6, u > 0u, f > 1.0, l[0] == 1, m.k == 'v']",
+                &ctx
+            )
+            .unwrap(),
+            json!([true, true, true, true, true, true])
+        );
+    }
+
+    #[test]
+    fn reads_name_each_variable_and_its_constant_members_by_the_parser() {
+        let got = |expr: &str| {
+            reads(expr)
+                .unwrap()
+                .into_iter()
+                .map(|r| (r.var, r.first, r.second))
+                .collect::<Vec<_>>()
+        };
+        let read = |v: &str, a: Option<&str>, b: Option<&str>| {
+            (v.to_string(), a.map(String::from), b.map(String::from))
+        };
+        assert_eq!(got("1 + 2"), vec![]);
+        assert_eq!(
+            got(r#"has(outputs.a) ? outputs["b"].v : [outputs.c][0].d.size()"#),
+            vec![
+                read("outputs", Some("a"), None),
+                read("outputs", Some("b"), Some("v")),
+                read("outputs", Some("c"), None),
+            ]
+        );
+        assert_eq!(
+            got(r#"{"k": .inputs.a}.k + inputs .b + 'inputs.x'"#),
+            vec![
+                read("inputs", Some("a"), None),
+                read("inputs", Some("b"), None)
+            ]
+        );
+        // A computed key, or the variable used whole, names no member; the
+        // key's own reads are found too.
+        assert_eq!(
+            got("outputs[matrix.k].v"),
+            vec![read("outputs", None, None), read("matrix", Some("k"), None)]
+        );
+        assert_eq!(got("size(inputs)"), vec![read("inputs", None, None)]);
+        assert_eq!(
+            got("x.outputs.b"),
+            vec![read("x", Some("outputs"), Some("b"))]
+        );
+        assert!(reads("outputs.").is_err());
+    }
+
+    #[test]
+    fn eval_bool_product_checks_each_point() {
+        let a: Vec<Arc<String>> = ["x", "y"].map(|v| Arc::new(v.to_string())).to_vec();
+        let b: Vec<Arc<String>> = ["1", "2", "3"].map(|v| Arc::new(v.to_string())).to_vec();
+        let dims = [
+            Dim {
+                name: "a",
+                values: &a,
+            },
+            Dim {
+                name: "b",
+                values: &b,
+            },
+        ];
+        let fixed = [("c", Arc::new("z".to_string()))];
+        // Point 4 is (a = y, b = 2).
+        assert_eq!(
+            eval_bool_product(
+                "a == 'y' && b == '2' && c == 'z'",
+                &fixed,
+                &dims,
+                &[0, 4, 5]
+            )
+            .unwrap(),
+            vec![false, true, false]
+        );
+        let err = eval_bool_product("a", &[], &dims, &[0])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("expected a boolean"), "{err}");
+        assert!(eval_bool_product("missing", &[], &dims, &[0]).is_err());
+        assert!(eval_bool_product("1 +", &[], &dims, &[]).is_err());
     }
 }

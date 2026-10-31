@@ -122,7 +122,32 @@ fi
 # Render a transient values file from .env (deleted on exit — no secrets on the
 # CLI, none left on disk).
 VALUES="$(mktemp)"
-trap 'rm -f "$VALUES"' EXIT
+LIBS_DIR="$(mktemp -d)"
+trap 'rm -rf "$VALUES" "$LIBS_DIR"' EXIT
+
+# The clone library (ADR-0076 §9). Checkouts run `lib:thulasi-ram/clone`, and
+# the image is the one the library pins — there is no server setting for it.
+# So this deploy writes a copy of libs/clone.yaml that pins SCARAB_CLONE_IMAGE
+# (`just local-helm local`: the image built from the tree), and a release
+# manifest that lists that copy as first-party, which the chart hands the
+# server (`scarab.libsManifest`). After the roll-out the copy is installed into
+# SCARAB_ORG (see the end of this script).
+LIBS_VALUES=""
+if [ -n "${SCARAB_CLONE_IMAGE:-}" ]; then
+  python3 -I - "$ROOT/libs/clone.yaml" "$SCARAB_CLONE_IMAGE" > "$LIBS_DIR/clone.yaml" <<'PY'
+import re, sys
+text = open(sys.argv[1]).read()
+new, n = re.subn(r"(?m)^(\s*image:\s*)ghcr\.io/thulasi-ram/scarab-clone\S*$", r"\g<1>" + sys.argv[2], text)
+if n != 1:
+    sys.exit("libs/clone.yaml: expected one scarab-clone image line")
+sys.stdout.write(new)
+PY
+  python3 -I "$ROOT/scripts/libs_manifest.py" --libs "$LIBS_DIR" \
+    --repository github.com/thulasi-ram/scarab-ci \
+    --commit "$(git -C "$ROOT" rev-parse HEAD)" --release v0.0.0-local > "$LIBS_DIR/manifest.json"
+  LIBS_VALUES="  libsManifest: |
+$(sed 's/^/    /' "$LIBS_DIR/manifest.json")"
+fi
 cat > "$VALUES" <<YAML
 image:
   repository: ${IMAGE_REPOSITORY:-scarab-server}
@@ -143,7 +168,7 @@ scarab:
   devInsecure: ${DEV_INSECURE:-true}
   githubAppId: "${SCARAB_GITHUB_APP_ID:-}"
   publicUrl: "${SCARAB_PUBLIC_URL:-}"
-  cloneImage: "${SCARAB_CLONE_IMAGE:-}"
+${LIBS_VALUES}
   sidecarImage: "${SCARAB_SIDECAR_IMAGE:-ghcr.io/thulasi-ram/scarab-results-sidecar:edge}"
   stepTimeoutSecs: "${SCARAB_STEP_TIMEOUT_SECS:-3600}"
   extraEnv:
@@ -352,6 +377,43 @@ kubectl rollout status -n "$NS" deploy/scarab --timeout=180s
 # never came up is the "reports success but structurally cannot work" shape.
 echo "==> workspace service (ADR-0061)"
 kubectl rollout status -n "$NS" statefulset/scarab-workspace --timeout=180s
+
+# Install the clone library copy into SCARAB_ORG, replacing an earlier copy
+# that pinned another image. `library-defaults/retry` with an uploaded file
+# installs a first-party library the org is missing; the server checks the
+# copy's hash against the manifest above. Needs the dev-insecure server
+# (DEV_INSECURE=true): with auth on, an org admin does it from Settings.
+if [ -n "${SCARAB_CLONE_IMAGE:-}" ] && [ -n "${SCARAB_ORG:-}" ]; then
+  echo "==> clone library pinning $SCARAB_CLONE_IMAGE into org $SCARAB_ORG (ADR-0076 §9)"
+  LIB_PORT=18898
+  kubectl port-forward -n "$NS" svc/scarab "$LIB_PORT:80" >/dev/null 2>&1 &
+  pf=$!
+  for _ in $(seq 1 30); do
+    curl -sf -o /dev/null "http://127.0.0.1:$LIB_PORT/healthz" && break
+    sleep 1
+  done
+  base="http://127.0.0.1:$LIB_PORT/v1/orgs/$SCARAB_ORG"
+  want="$(shasum -a 256 "$LIBS_DIR/clone.yaml" | awk '{print $1}')"
+  have="$(curl -sf "$base/libraries" | python3 -I -c '
+import json, sys
+for i in json.load(sys.stdin).get("installations", []):
+    if (i["publisher"], i["name"]) == ("thulasi-ram", "clone"):
+        print(i["content_hash"])
+' || true)"
+  if [ "$have" = "$want" ]; then
+    echo "    already installed"
+  else
+    if [ -n "$have" ]; then
+      curl -sf -o /dev/null -X DELETE "$base/libraries/thulasi-ram/clone"
+    fi
+    python3 -I -c 'import json, sys; print(json.dumps({"files": {"thulasi-ram/clone": open(sys.argv[1]).read()}}))' \
+        "$LIBS_DIR/clone.yaml" \
+      | curl -sf -o /dev/null -w '    POST library-defaults/retry -> HTTP %{http_code}\n' \
+          -X POST "$base/library-defaults/retry" -H 'content-type: application/json' -d @- \
+      || echo "    could not install it (is DEV_INSECURE=true?); install libs/clone.yaml from Settings → Libraries" >&2
+  fi
+  kill "$pf" 2>/dev/null || true
+fi
 
 cat <<EOF
 

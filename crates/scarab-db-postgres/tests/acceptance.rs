@@ -68,7 +68,7 @@ async fn compile_and_create(db: &PostgresDb, run: &RunId) -> Vec<scarab_pipeline
             workspace_inputs: vec![],
             workspace_outputs: vec![],
             cache: None,
-            clone: None,
+            forge_token: None,
             build: None,
             artifacts: vec![],
             placement_profiles: vec![],
@@ -78,6 +78,7 @@ async fn compile_and_create(db: &PostgresDb, run: &RunId) -> Vec<scarab_pipeline
             services: Vec::new(),
             uses: Vec::new(),
             matrix_values: Default::default(),
+            scope: None,
         };
         let needs: Vec<StepId> = step.needs.0.iter().map(|n| StepId(n.clone())).collect();
         db.create_step_run(

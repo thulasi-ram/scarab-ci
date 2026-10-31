@@ -1,8 +1,8 @@
 #!/bin/sh
-# The canonical clone entrypoint (ADR-0045): SHA-pinned git clone into the
-# workspace, credential-free .git/config (token via GIT_ASKPASS from tmpfs),
-# opt-in submodules/LFS, and the config-scrub guard before handing the tree
-# to the CAS snapshot.
+# The clone library's entrypoint (ADR-0076 §9, `lib:thulasi-ram/clone`):
+# SHA-pinned git clone into the workspace, credential-free .git/config (token
+# via GIT_ASKPASS from tmpfs), opt-in submodules/LFS, and the config-scrub
+# guard before handing the tree to the CAS snapshot.
 #
 # Credential scope: the token is offered only for SCARAB_CLONE_URL's own
 # repository over https (see scarab-askpass). Submodules are fetched with no
@@ -10,16 +10,19 @@
 # objects come from the cloned repository's own LFS endpoint; an `lfs.url` in
 # the repository's `.lfsconfig` is overridden.
 #
-# Env contract (set by the engine from the run's trigger context):
+# Env contract (set by libs/clone.yaml from the Run's `event` values and the
+# library's inputs):
 #   SCARAB_CLONE_URL         credential-free https clone URL      (required;
 #                            a non-https URL is cloned without the token)
 #   SCARAB_CLONE_SHA         the pinned commit, 4-64 lower-case hex (required)
-#   SCARAB_CLONE_DEPTH       "1" (default) | "full"
+#   SCARAB_CLONE_DEPTH       "1" (default), a number of commits, or "full"
 #   SCARAB_CLONE_SUBMODULES  "true" to fetch submodules recursively
 #   SCARAB_CLONE_LFS         "true" to pull LFS objects
-#   SCARAB_CLONE_TOKEN_FILE  tmpfs token path (default /scarab/secrets/clone-token;
-#                            absent/empty = anonymous public clone)
-#   SCARAB_CLONE_USERNAME    basic-auth username (default x-access-token)
+#   SCARAB_CLONE_TOKEN_FILE  token path (default /scarab/secrets/forge-token,
+#                            where `forge_token` mounts it; absent/empty =
+#                            anonymous public clone)
+#   SCARAB_CLONE_USERNAME_FILE  username path (default
+#                            /scarab/secrets/forge-username; absent = x-access-token)
 #   SCARAB_WORKSPACE         target dir (default /workspace)
 set -eu
 
@@ -41,6 +44,12 @@ if [ "${#SCARAB_CLONE_SHA}" -lt 4 ] || [ "${#SCARAB_CLONE_SHA}" -gt 64 ]; then
 fi
 dest="${SCARAB_WORKSPACE:-/workspace}"
 depth="${SCARAB_CLONE_DEPTH:-1}"
+case "$depth" in
+  full) ;;
+  *[!0-9]*|'') echo "scarab-clone: SCARAB_CLONE_DEPTH must be \"full\" or a number, got \"$depth\"" >&2; exit 2 ;;
+esac
+export SCARAB_CLONE_TOKEN_FILE="${SCARAB_CLONE_TOKEN_FILE:-/scarab/secrets/forge-token}"
+export SCARAB_CLONE_USERNAME_FILE="${SCARAB_CLONE_USERNAME_FILE:-/scarab/secrets/forge-username}"
 
 export GIT_ASKPASS=/usr/local/bin/scarab-askpass
 export GIT_TERMINAL_PROMPT=0
@@ -57,7 +66,7 @@ git config --global credential.useHttpPath true
 case "$SCARAB_CLONE_URL" in
   https://*) ;;
   *)
-    if [ -s "${SCARAB_CLONE_TOKEN_FILE:-/scarab/secrets/clone-token}" ]; then
+    if [ -s "$SCARAB_CLONE_TOKEN_FILE" ]; then
       echo "scarab-clone: $SCARAB_CLONE_URL is not https; cloning without the token" >&2
     fi
     ;;
@@ -77,7 +86,7 @@ if [ "$depth" = "full" ]; then
   git fetch -q origin '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*' || fetch_failed=1
   git fetch -q origin -- "$SCARAB_CLONE_SHA" 2>/dev/null || true
 else
-  git fetch -q --depth 1 origin -- "$SCARAB_CLONE_SHA" || fetch_failed=1
+  git fetch -q --depth "$depth" origin -- "$SCARAB_CLONE_SHA" || fetch_failed=1
 fi
 
 if [ "$fetch_failed" -ne 0 ] || ! git cat-file -e "$SCARAB_CLONE_SHA^{commit}" 2>/dev/null; then

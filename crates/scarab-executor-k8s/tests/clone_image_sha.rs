@@ -69,6 +69,9 @@ impl Fixture {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&scrub, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
+        // The token and username files `forge_token` mounts (ADR-0076 §9).
+        std::fs::write(dir.path().join("forge-token"), "TOKEN").unwrap();
+        std::fs::write(dir.path().join("forge-username"), "scarab-bot").unwrap();
         Fixture { dir, sha }
     }
 
@@ -104,6 +107,11 @@ impl Fixture {
             )
             .env("SCARAB_CLONE_SHA", sha)
             .env("SCARAB_CLONE_DEPTH", depth)
+            .env("SCARAB_CLONE_TOKEN_FILE", self.dir.path().join("forge-token"))
+            .env(
+                "SCARAB_CLONE_USERNAME_FILE",
+                self.dir.path().join("forge-username"),
+            )
             .env("SCARAB_WORKSPACE", &ws)
             .output()
             .unwrap()
@@ -130,7 +138,7 @@ fn head_of(ws: &Path) -> String {
 fn a_clone_sha_that_is_not_hex_never_reaches_git() {
     let fx = Fixture::new();
 
-    for depth in ["1", "full"] {
+    for depth in ["1", "3", "full"] {
         let out = fx.clone(&fx.sha, depth);
         assert!(
             out.status.success(),
@@ -142,7 +150,7 @@ fn a_clone_sha_that_is_not_hex_never_reaches_git() {
 
     let marker = fx.marker();
     let upload_pack = format!("--upload-pack=touch '{}';git-upload-pack", marker.display());
-    for depth in ["1", "full"] {
+    for depth in ["1", "3", "full"] {
         for sha in [
             upload_pack.as_str(),
             "-c core.sshCommand=id",

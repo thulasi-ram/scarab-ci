@@ -1,9 +1,8 @@
-# The canonical scarab-clone image (ADR-0045): git + git-lfs + the tmpfs
-# askpass helper + the pre-snapshot config-scrub guard. The `clone` step kind
-# ALWAYS runs this image (pinned by digest, versioned with the server) — never
-# the author's — because the kind carries security invariants
-# (credential-free .git/config, tmpfs token delivery) an arbitrary image
-# cannot guarantee.
+# The scarab-clone image (ADR-0045, ADR-0076 §9): git + git-lfs + the tmpfs
+# askpass helper + the pre-snapshot config-scrub guard. The first-party clone
+# library (libs/clone.yaml) pins it by digest; its Step is the one an org
+# trusts with a long-lived forge token, because this image keeps .git/config
+# credential-free and reads the token only from the mounted file.
 #
 # Non-root and minimal per the ADR-0039 restricted baseline: uid 65532, no
 # shell tricks required at runtime, nothing writable but HOME and /workspace.

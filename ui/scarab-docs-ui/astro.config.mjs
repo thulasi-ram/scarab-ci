@@ -110,6 +110,7 @@ export default defineConfig({
           label: 'Usage',
           items: [
             { label: 'Pipeline Syntax', slug: 'usage/pipeline-syntax' },
+            { label: 'Libraries', slug: 'usage/libraries' },
             { label: 'Secrets', slug: 'usage/secrets' },
             { label: 'Environments', slug: 'usage/environments' },
             { label: 'Deploying with Argo CD', slug: 'usage/deploying-with-argo-cd' },

@@ -79,6 +79,18 @@ pub const RESERVED_CONFIG_KEY_PREFIX: &str = "SCARAB_";
 /// is useless against the broker, and a broker token is useless elsewhere.
 pub const BROKER_TOKEN_AUDIENCE: &str = "scarab-broker";
 
+/// The audience of the second projected token a Plugin that resolves gates
+/// gets (ADR-0076 §7): it calls the gate API with it. The broker's verifier
+/// refuses it and the gate API's refuses a broker token, so neither can
+/// stand in for the other.
+pub const API_TOKEN_AUDIENCE: &str = "scarab-api";
+
+/// Where a Plugin that resolves gates finds its `scarab-api` token, kept
+/// current by the kubelet. It calls the gate API at the broker's address
+/// (`SCARAB_BROKER_URL`), the one its network reaches, under the public
+/// API's paths.
+pub const PLUGIN_ENV_API_TOKEN_FILE: &str = "SCARAB_API_TOKEN_FILE";
+
 /// The Plugin contract's environment, as the runtime sets it: where the
 /// broker is, and the file the projected broker token is kept current in.
 /// The kubelet rotates the token in place before it expires, so a Plugin
@@ -107,19 +119,27 @@ pub enum PluginCapability {
     /// A PluginUiContribution at a declared trust tier (ADR-0072 §7).
     ContributeUi,
     /// Approve or reject approval gates where an Environment admin names the
-    /// PluginPrincipal (ADR-0072 §3).
+    /// PluginPrincipal (ADR-0072 §3). Dropped by ADR-0076 §8: a plugin is
+    /// never an approver on a manual gate. Still parses, so admission can
+    /// refuse it by name.
     ApproveGates,
+    /// Resolve the gates of kind `plugin` that name this installation, in its
+    /// own org, and only those (ADR-0076 §7): list them and release or fail
+    /// them. The manifest's [`gates`](PluginManifest::gates) are what it
+    /// resolves.
+    ResolveGates,
 }
 
 impl PluginCapability {
     /// Every capability, in declaration order.
-    pub const ALL: [PluginCapability; 6] = [
+    pub const ALL: [PluginCapability; 7] = [
         PluginCapability::ReportDeployments,
         PluginCapability::SubscribeEvents,
         PluginCapability::OfferActions,
         PluginCapability::UseConnection,
         PluginCapability::ContributeUi,
         PluginCapability::ApproveGates,
+        PluginCapability::ResolveGates,
     ];
 
     /// The wire name (`report_deployments`, …).
@@ -131,6 +151,7 @@ impl PluginCapability {
             PluginCapability::UseConnection => "use_connection",
             PluginCapability::ContributeUi => "contribute_ui",
             PluginCapability::ApproveGates => "approve_gates",
+            PluginCapability::ResolveGates => "resolve_gates",
         }
     }
 }
@@ -141,10 +162,37 @@ impl fmt::Display for PluginCapability {
     }
 }
 
-/// The capabilities this release can run (ADR-0072, MMP horizon):
-/// connections with **read** rules only. Everything else is refused at
-/// install, by name, rather than accepted and ignored.
-pub const MMP_ADMITTED_CAPABILITIES: [PluginCapability; 1] = [PluginCapability::UseConnection];
+/// The capabilities this release can run (ADR-0072, MMP horizon; ADR-0076
+/// §8): connections with **read** rules only, and resolving the plugin's
+/// own gates. Everything else is refused at install, by name, rather than
+/// accepted and ignored.
+pub const MMP_ADMITTED_CAPABILITIES: [PluginCapability; 2] = [
+    PluginCapability::UseConnection,
+    PluginCapability::ResolveGates,
+];
+
+/// The most gate definitions a manifest may declare, and the most inputs
+/// and outputs each may have: an approval screen shows all of them.
+pub const MAX_GATE_DEFINITIONS: usize = 16;
+pub const MAX_GATE_INPUTS: usize = 32;
+pub const MAX_GATE_OUTPUTS: usize = 32;
+/// The longest gate description, in characters.
+pub const MAX_GATE_DESCRIPTION_CHARS: usize = 512;
+
+/// A gate the plugin resolves (ADR-0076 §7): a Pipeline waits on it with
+/// `invoke: plugin:<installation>/<name>`, passing `interface.inputs` under
+/// `with:`; the plugin releases it with `interface.outputs`, each of its
+/// declared type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GateDefinition {
+    /// What the gate waits for, as the approval screen and the Pipeline
+    /// author read it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default)]
+    pub interface: scarab_pipeline::Interface,
+}
 
 /// An allowed request shape on a PluginConnection (ADR-0072 §5): a method,
 /// a path pattern (`*` matching exactly one segment) and the query keys the
@@ -196,6 +244,12 @@ pub struct PluginManifest {
     /// PluginConnections). Environment-variable shaped.
     #[serde(default)]
     pub config_keys: Vec<String>,
+    /// The gates this plugin resolves, by name (ADR-0076 §7). Declared
+    /// exactly when it asks for `resolve_gates`. Absent from a manifest that
+    /// has none, so the SHA-256 of a manifest approved before gates existed
+    /// does not change.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub gates: BTreeMap<String, GateDefinition>,
 }
 
 impl PluginManifest {
@@ -238,6 +292,29 @@ impl PluginManifest {
                 return invalid("connection slots need the `use_connection` capability".into())
             }
             _ => {}
+        }
+        // A gate definition without the capability is a grant nobody approved
+        // by name; the capability without one names nothing to resolve.
+        match (
+            self.has(PluginCapability::ResolveGates),
+            self.gates.is_empty(),
+        ) {
+            (true, true) => {
+                return invalid("`resolve_gates` needs at least one gate definition".into())
+            }
+            (false, false) => {
+                return invalid("gate definitions need the `resolve_gates` capability".into())
+            }
+            _ => {}
+        }
+        if self.gates.len() > MAX_GATE_DEFINITIONS {
+            return invalid(format!(
+                "at most {MAX_GATE_DEFINITIONS} gate definitions, got {}",
+                self.gates.len()
+            ));
+        }
+        for (name, gate) in &self.gates {
+            gate.validate(name)?;
         }
         if self.connections.len() > MAX_CONNECTION_SLOTS {
             return invalid(format!(
@@ -300,6 +377,44 @@ impl PluginManifest {
                     "`{key}` contains a control character"
                 )));
             }
+        }
+        Ok(())
+    }
+}
+
+impl GateDefinition {
+    /// The gate's name is a DNS-1123 label (it is the part after the `/` in
+    /// `invoke: plugin:<installation>/<gate>`); its description is one
+    /// bounded line; its interface is one a release can be checked against
+    /// ([`scarab_pipeline::validate_gate_interface`]).
+    fn validate(&self, name: &str) -> Result<(), PluginError> {
+        let invalid = |m: String| Err(PluginError::InvalidManifest(m));
+        if !is_dns1123_label(name) {
+            return invalid(format!("gate `{name}` must be a DNS-1123 label"));
+        }
+        if self.description.chars().count() > MAX_GATE_DESCRIPTION_CHARS
+            || self.description.chars().any(char::is_control)
+        {
+            return invalid(format!(
+                "gate `{name}`: the description must be one line of at most \
+                 {MAX_GATE_DESCRIPTION_CHARS} characters"
+            ));
+        }
+        if self.interface.inputs.len() > MAX_GATE_INPUTS
+            || self.interface.outputs.len() > MAX_GATE_OUTPUTS
+        {
+            return invalid(format!(
+                "gate `{name}`: at most {MAX_GATE_INPUTS} inputs and {MAX_GATE_OUTPUTS} outputs"
+            ));
+        }
+        let mut diagnostics = Vec::new();
+        scarab_pipeline::validate_gate_interface(
+            &self.interface,
+            &format!("gate `{name}`"),
+            &mut diagnostics,
+        );
+        if !diagnostics.is_empty() {
+            return invalid(diagnostics.join("; "));
         }
         Ok(())
     }
@@ -700,7 +815,8 @@ pub enum PluginError {
     /// implementation horizon). Lists them, comma-separated.
     #[error(
         "this Scarab release cannot run plugins that ask for: {0} (only read-only \
-         use_connection is available, ADR-0072; report_deployments was removed by ADR-0074)"
+         use_connection and resolve_gates are available, ADR-0072, ADR-0076 §8; \
+         report_deployments was removed by ADR-0074)"
     )]
     CapabilityNotAdmitted(String),
 }
@@ -730,6 +846,7 @@ mod tests {
                 ],
             }],
             config_keys: vec!["ARGOCD_UI_URL".into()],
+            gates: BTreeMap::new(),
         }
     }
 
@@ -925,6 +1042,68 @@ mod tests {
         ] {
             assert_eq!(installation_id_of_service_account(other), None, "{other}");
         }
+    }
+
+    fn with_wait_live() -> PluginManifest {
+        let mut m = argo_like();
+        m.capabilities.push(PluginCapability::ResolveGates);
+        m.gates.insert(
+            "wait-live".into(),
+            serde_json::from_value(serde_json::json!({
+                "description": "Pass when the Application is live at the image.",
+                "interface": {
+                    "inputs": [{ "name": "app", "type": "string" }],
+                    "outputs": [{ "name": "revision", "type": "string" }]
+                }
+            }))
+            .unwrap(),
+        );
+        m
+    }
+
+    #[test]
+    fn resolve_gates_is_admitted_with_the_gates_it_declares() {
+        assert_eq!(admit_for_mmp(&with_wait_live()), Ok(()));
+        // The capability and its definitions come together.
+        let mut m = with_wait_live();
+        m.gates.clear();
+        assert!(matches!(m.validate(), Err(PluginError::InvalidManifest(_))));
+        let mut m = with_wait_live();
+        m.capabilities.retain(|c| *c != PluginCapability::ResolveGates);
+        assert!(matches!(m.validate(), Err(PluginError::InvalidManifest(_))));
+    }
+
+    #[test]
+    fn a_gate_definition_is_named_bounded_and_typed() {
+        type Mutation = Box<dyn Fn(&mut GateDefinition)>;
+        let cases: Vec<(&str, Mutation)> = vec![
+            ("choice output", Box::new(|g| {
+                g.interface.outputs[0].r#type = scarab_pipeline::ParamType::Choice
+            })),
+            ("output name", Box::new(|g| g.interface.outputs[0].name = "a b".into())),
+            ("description", Box::new(|g| g.description = "two\nlines".into())),
+            ("input name", Box::new(|g| g.interface.inputs[0].name = "1app".into())),
+        ];
+        for (what, mutate) in cases {
+            let mut m = with_wait_live();
+            mutate(m.gates.get_mut("wait-live").unwrap());
+            assert!(
+                matches!(m.validate(), Err(PluginError::InvalidManifest(_))),
+                "{what}"
+            );
+        }
+        let mut m = with_wait_live();
+        let g = m.gates.remove("wait-live").unwrap();
+        m.gates.insert("Wait Live".into(), g);
+        assert!(matches!(m.validate(), Err(PluginError::InvalidManifest(_))));
+    }
+
+    #[test]
+    fn a_manifest_without_gates_serializes_as_it_did() {
+        // The approved manifest's SHA-256 is over its JSON: a field added
+        // empty must not change it.
+        let json = serde_json::to_value(argo_like()).unwrap();
+        assert!(json.get("gates").is_none(), "{json}");
     }
 
     #[test]

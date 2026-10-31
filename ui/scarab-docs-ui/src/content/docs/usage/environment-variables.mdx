@@ -62,7 +62,7 @@ machine, see [Local Development](/scarab-ci/get-started/local-development/).
 
 | Variable | Purpose |
 |---|---|
-| `SCARAB_CLONE_IMAGE` | Canonical scarab-clone image a `clone` step runs (default `ghcr.io/thulasi-ram/scarab-clone:edge`, digest-pin in prod). |
+| `SCARAB_LIBS_MANIFEST` | The first-party library manifest: an https URL, a file path, or `off` (default: the server's own release asset). The checkout image is the one `lib:thulasi-ram/clone` pins. |
 | `SCARAB_SIDECAR_IMAGE` | Results-egress sidecar image. |
 | `SCARAB_RESULTS_TOKEN_SECRET` | Enables the results-egress sidecar + ingest. |
 | `SCARAB_RESULTS_API_URL` | Base URL the sidecar posts results to. |

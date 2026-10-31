@@ -640,10 +640,24 @@ impl Executor for RecordingExec {
         Ok(None)
     }
 
+    async fn gate_refusal(
+        &self,
+        _gate: &scarab_engine::StepRun,
+    ) -> Result<Option<String>, scarab_engine::ExecError> {
+        Ok(None)
+    }
+
     async fn infra_condition(
         &self,
         _handle: &ExecHandle,
     ) -> Result<Option<scarab_engine::InfraCondition>, ExecError> {
+        Ok(None)
+    }
+
+    async fn take_forge_credential(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::MountedForgeCredential>, ExecError> {
         Ok(None)
     }
     async fn workspace_provisioning(
@@ -695,7 +709,7 @@ fn secret_step() -> (StepRun, StepSpec) {
         workspace_inputs: vec![],
         workspace_outputs: vec![],
         cache: None,
-        clone: None,
+        forge_token: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],
@@ -705,6 +719,7 @@ fn secret_step() -> (StepRun, StepSpec) {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     };
     (step, spec)
 }

@@ -18,6 +18,7 @@ use scarab_testkit::{FakeClock, InMemoryDb, InMemoryObjectStore, InMemoryPolicie
 const DENY_MESSAGE: &str = "The repository's own deploy library may not be used on main.";
 
 const LIB: &str = r#"
+kind: library
 steps:
   - { id: helm, image: busybox, command: ["true"] }
 "#;
@@ -28,7 +29,7 @@ on:
   push: {}
 steps:
   - { id: test, image: busybox, command: ["true"] }
-  - { id: ship, invoke: .scarab/lib/deploy.yaml, needs: [test] }
+  - { id: ship, invoke: file:.scarab/lib/deploy.yaml, needs: [test] }
 "#;
 
 /// Invokes no library.

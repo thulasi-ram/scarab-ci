@@ -632,7 +632,7 @@ async fn drive_to_gate(pg: &Arc<PostgresDb>, run: &RunId) {
         workspace_inputs: vec![],
         workspace_outputs: vec![],
         cache: None,
-        clone: None,
+        forge_token: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],
@@ -642,6 +642,7 @@ async fn drive_to_gate(pg: &Arc<PostgresDb>, run: &RunId) {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     };
     pg.create_run(run, 1, 1, Timestamp(0)).await.unwrap();
     pg.create_step_run(run, &a, Some(&spec), &[], Timestamp(0))

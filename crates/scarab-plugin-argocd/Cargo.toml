@@ -56,6 +56,9 @@ scarab-server = { path = "../scarab-server" }
 scarab-db-postgres = { workspace = true }
 scarab-plugin = { workspace = true }
 scarab-testkit = { workspace = true }
+# wait_live.rs drives a real Run to its plugin gate.
+scarab-engine = { workspace = true }
+scarab-forge = { workspace = true }
 async-trait = { workspace = true }
 axum = { workspace = true }
 futures = { workspace = true }

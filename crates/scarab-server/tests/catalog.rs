@@ -79,6 +79,11 @@ async fn catalog_lists_pipelines_with_flags_and_resolved_sha_excluding_lib() {
             ".scarab/lib/build.yaml",
             "steps: [{ id: b, image: busybox }]",
         )
+        // Nor a file marked `kind: library` directly under .scarab/ (ADR-0076 §2).
+        .with_file(
+            ".scarab/shared.yaml",
+            "kind: library\nsteps: [{ id: b, image: busybox }]",
+        )
         .with_commit("refs/heads/main", "sha-abc123");
 
     let app = app(forge);

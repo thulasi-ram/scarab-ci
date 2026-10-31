@@ -554,11 +554,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         scarab_server::connections_config::CredentialOverrides::from_specs(&config.connections)
             .with_github_app_pem(github_app_pem.clone(), config.github_app_id.is_some()),
     );
+    // The orgs config bound repos into: offered their first-party libraries
+    // once the API state exists (ADR-0076 §5).
+    let mut provisioned_orgs = std::collections::BTreeSet::new();
     {
         let provisioned =
             scarab_server::connections_config::provision(pg.as_ref(), &config.connections)
                 .await
                 .map_err(|e| format!("refusing to start: {e}"))?;
+        provisioned_orgs.extend(
+            provisioned
+                .bound
+                .iter()
+                .filter_map(|r| r.split_once('/').map(|(org, _)| org.to_string())),
+        );
         if !provisioned.owned.is_empty() {
             tracing::info!(
                 connections = ?provisioned.owned,
@@ -662,8 +671,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // This is the drain's READ half (tiered, falls through
                         // to cold); the WRITE half is the Depot handle below.
                         .with_workspace_cas(workspace_cas.clone())
-                        // The canonical clone image (ADR-0045).
-                        .with_clone_image(config.clone_image.clone())
                         // Artifact harvest (ADR-0052): /scarab/artifacts →
                         // object blobs + Pod-annotation metadata.
                         .with_artifact_store(store.clone())
@@ -724,7 +731,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 SecretInjectingExecutor::new(executor, db.clone(), secrets.clone(), logs.clone())
                     // ADR-0071 §2: re-admit a deploy step at the point its
                     // Environment's credentials would be used.
-                    .with_environment_governance(pg.clone());
+                    .with_environment_governance(pg.clone())
+                    // ADR-0076 §6: a yanked library version never launches.
+                    .with_libraries(pg.clone());
             // Per-attempt OIDC federation tokens (ADR-0015), tmpfs-delivered.
             if let (Some(issuer), Some(oidc_cfg)) = (oidc_issuer.clone(), &config.oidc) {
                 secret_exec = secret_exec.with_oidc(
@@ -735,18 +744,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tracing::info!("per-run OIDC token injection enabled (ADR-0015)");
             }
             let executor: Arc<dyn Executor> = Arc::new(secret_exec);
-            // Enrich clone-step launches (ADR-0045): resolve the clone URL
-            // from the registry and mint the short-TTL, read-only-for-forks
-            // checkout credential — in memory only, delivered via tmpfs.
+            // Mint a Step's forge credential at each launch and revoke it
+            // when its Attempt ends (ADR-0076 §9) — in memory only,
+            // delivered as files on tmpfs.
             let executor: Arc<dyn Executor> = Arc::new(
-                scarab_server::clone_executor::CloneEnrichingExecutor::new(
-                    executor,
-                    pg.clone(),
-                    forge.clone(),
-                )
+                scarab_server::forge_token::ForgeCredentialExecutor::new(executor, forge.clone())
                 // Build-step registry auth (ADR-0018): scoped REGISTRY_AUTH
                 // secret first, forge-derived credential as fallback.
-                .with_secrets(secrets.clone()),
+                .with_secrets(secrets.clone())
+                // A yanked library Step is refused before its forge
+                // credential or registry auth is asked for (ADR-0076 §6).
+                .with_libraries(db.clone(), pg.clone()),
             );
             // Local host processes finish instantly, so re-poll them quickly; k8s
             // Pods take time, so the default window avoids thundering re-claims.
@@ -800,6 +808,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_environment_governance(pg.clone())
         // Stored Policies (ADR-0075), consulted at Run creation.
         .with_policies(pg.clone())
+        // Org-installed libraries and yanks (ADR-0076): compiling resolves
+        // `lib:` through them; the release manifest says which versions are
+        // first-party (`SCARAB_LIBS_MANIFEST`: unset, `off`, a URL or a file).
+        .with_libraries(pg.clone())
+        .with_first_party(scarab_server::libraries::ManifestSource::from_env(
+            std::env::var("SCARAB_LIBS_MANIFEST").ok().as_deref(),
+        ))
         // Org-level Environments (ADR-0071): their admin API.
         .with_org_environments(pg.clone())
         // The PluginInstallation registry (ADR-0072). Wired whatever
@@ -834,6 +849,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // (ADR-0060 part D), so the Settings health readout reports a
         // config-supplied credential as present rather than MISSING.
         .with_credential_overrides(credential_overrides.clone());
+    // Anonymous library fetches from public forges (ADR-0076 §4). A client
+    // that cannot be built leaves only installs through a connection.
+    match scarab_server::library_fetch::HttpsFetcher::new() {
+        Ok(f) => state = state.with_library_fetcher(Arc::new(f)),
+        Err(e) => tracing::warn!(error = %e, "anonymous library fetches are off"),
+    }
+    // A new org bound by config gets the first-party libraries (ADR-0076 §5);
+    // claimed here, installed in the background.
+    for org in &provisioned_orgs {
+        scarab_server::libraries::offer_defaults_on_bind(&state, org).await;
+    }
     // The rerun-widening oracle's strict handle (git-bug 4afaa3e amendment F1):
     // only exists when a Depot is configured — without one, `workspace_cas` IS
     // the cold store and there is no warm leg to launder an outage through.
@@ -1024,7 +1050,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // which has no projected token. Otherwise TokenReview, below, once a
     // cluster is reachable. With neither, every broker call is a 401.
     if !config.plugins.dev_tokens.is_empty() {
-        state = state.with_plugin_tokens(Arc::new(scarab_server::broker::DevPluginTokens::new(
+        let dev = Arc::new(scarab_server::broker::DevPluginTokens::new(
             config.plugins.namespace.clone(),
             config
                 .plugins
@@ -1032,7 +1058,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .iter()
                 .map(|(id, token)| (id.clone(), token.expose().to_string()))
                 .collect(),
-        )));
+        ));
+        // A dev token stands for both audiences: a host-process plugin has
+        // no projected tokens to tell apart.
+        state = state.with_plugin_tokens(dev.clone()).with_plugin_api_tokens(dev);
     }
     // The plugin runtime (ADR-0072 §9): only with SCARAB_PLUGINS=on, in a
     // role that serves the broker, and with a cluster to run Plugins in. The
@@ -1042,9 +1071,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match scarab_plugin_k8s::default_client().await {
             Ok(client) => {
                 if config.plugins.dev_tokens.is_empty() {
-                    state = state.with_plugin_tokens(Arc::new(
-                        scarab_plugin_k8s::TokenReviewVerifier::new(client.clone()),
-                    ));
+                    state = state
+                        .with_plugin_tokens(Arc::new(scarab_plugin_k8s::TokenReviewVerifier::new(
+                            client.clone(),
+                        )))
+                        // The gate API's own verifier (ADR-0076 §7): a broker
+                        // token is not taken there, nor an api token here.
+                        .with_plugin_api_tokens(Arc::new(
+                            scarab_plugin_k8s::TokenReviewVerifier::for_audience(
+                                client.clone(),
+                                scarab_plugin::API_TOKEN_AUDIENCE,
+                            ),
+                        ));
                     tracing::info!(
                         "plugin broker tokens: TokenReview (audience {})",
                         scarab_plugin::BROKER_TOKEN_AUDIENCE

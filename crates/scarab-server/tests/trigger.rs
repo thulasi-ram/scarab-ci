@@ -649,10 +649,11 @@ async fn invoke_inlines_library_into_the_persisted_dag() {
 on: { push: {} }
 steps:
   - { id: checkout, image: busybox }
-  - { id: ci, invoke: .scarab/lib/ci.yaml, needs: [checkout] }
+  - { id: ci, invoke: file:.scarab/lib/ci.yaml, needs: [checkout] }
   - { id: publish, image: busybox, needs: [ci] }
 "#;
     let library = r#"
+kind: library
 steps:
   - { id: build, image: rust }
   - { id: test, image: rust, needs: [build] }
@@ -743,6 +744,33 @@ steps:
     );
 }
 
+/// ADR-0076 §2: a file marked `kind: library` is never triggered, even directly
+/// under `.scarab/`; discovery skips it instead of failing the delivery on it.
+#[tokio::test]
+async fn a_file_marked_as_a_library_is_not_triggered() {
+    let forge = FakeForge::new()
+        .with_file(".scarab/ci.yaml", CI_YAML)
+        .with_file(
+            ".scarab/shared.yaml",
+            "kind: library\nsteps:\n  - { id: lib, image: busybox }\n",
+        );
+    let db = Arc::new(InMemoryDb::new());
+    let clock = Arc::new(FakeClock::new(1_000));
+
+    let runs = trigger_run_from_event(
+        &forge,
+        db.as_ref(),
+        clock.as_ref(),
+        scarab_server::AdmissionPorts::governance(None),
+        &push("main"),
+    )
+    .await
+    .expect("a library file does not fail the delivery");
+    assert_eq!(runs.len(), 1, "only `.scarab/ci.yaml` triggers");
+    let steps = db.steps_of_run(&runs[0]).await.unwrap();
+    assert_eq!(steps[0].step.0, "build", "the run is ci.yaml's");
+}
+
 /// ADR-0038 (nesting): a library that itself `invoke:`s another library is
 /// fetched *transitively* by the trigger path and inlined to full depth, ids
 /// namespacing at each level (`deploy/db/migrate`).
@@ -751,14 +779,16 @@ async fn nested_invoke_is_fetched_transitively_and_inlined() {
     let caller = r#"
 on: { push: {} }
 steps:
-  - { id: deploy, invoke: .scarab/lib/deploy.yaml }
+  - { id: deploy, invoke: file:.scarab/lib/deploy.yaml }
 "#;
     let deploy_lib = r#"
+kind: library
 steps:
-  - { id: db, invoke: .scarab/lib/db.yaml }
+  - { id: db, invoke: file:.scarab/lib/db.yaml }
   - { id: app, image: busybox, needs: [db] }
 "#;
     let db_lib = r#"
+kind: library
 steps:
   - { id: migrate, image: postgres }
 "#;

@@ -103,8 +103,8 @@ fn first_party_catalog(policy: &PluginPolicy) -> Vec<CatalogEntry> {
     vec![CatalogEntry {
         manifest: argocd.clone(),
         repository: policy.argocd_repo.clone(),
-        description: "Reads Argo CD Applications through the CredentialBroker \
-                      (first-party).",
+        description: "Reads Argo CD Applications through the CredentialBroker and \
+                      resolves the `wait-live` gate (first-party).",
     }]
 }
 
@@ -165,6 +165,36 @@ fn manifest_sha256(manifest: &PluginManifest) -> String {
         .collect()
 }
 
+/// The gates `plugin:<installation>/<gate>` resolves to in `org` (ADR-0076
+/// §7): each gate declared by an installation whose approved manifest asks
+/// for `resolve_gates`, keyed `<installation>/<gate>`. A killed installation's
+/// gates still resolve: its gates wait, and expire, as any other's do.
+pub(crate) async fn gates_for_compile(
+    store: &dyn scarab_plugin::PluginStore,
+    org: &str,
+) -> Result<std::collections::BTreeMap<String, scarab_pipeline::PluginGateDef>, DbError> {
+    let installations = store
+        .installations(org)
+        .await
+        .map_err(|e| DbError::Other(format!("plugin store: {e}")))?;
+    let mut out = std::collections::BTreeMap::new();
+    for i in installations
+        .iter()
+        .filter(|i| i.org == org && i.manifest.has(PluginCapability::ResolveGates))
+    {
+        for (gate, def) in &i.manifest.gates {
+            out.insert(
+                format!("{}/{gate}", i.name),
+                scarab_pipeline::PluginGateDef {
+                    interface: def.interface.clone(),
+                    manifest_sha256: i.manifest_sha256.clone(),
+                },
+            );
+        }
+    }
+    Ok(out)
+}
+
 /// A [`PluginStoreError`] as the API answers it.
 pub(crate) fn plugin_store_api_error(e: PluginStoreError) -> ApiError {
     match e {
@@ -197,7 +227,10 @@ pub enum PluginCapabilityDto {
     OfferActions,
     UseConnection,
     ContributeUi,
+    /// Dropped by ADR-0076 §8; shown only so it can be refused by name.
     ApproveGates,
+    /// Resolve this installation's own gates of kind `plugin` (ADR-0076 §7).
+    ResolveGates,
 }
 
 impl From<PluginCapability> for PluginCapabilityDto {
@@ -209,6 +242,7 @@ impl From<PluginCapability> for PluginCapabilityDto {
             PluginCapability::UseConnection => Self::UseConnection,
             PluginCapability::ContributeUi => Self::ContributeUi,
             PluginCapability::ApproveGates => Self::ApproveGates,
+            PluginCapability::ResolveGates => Self::ResolveGates,
         }
     }
 }
@@ -250,6 +284,39 @@ pub struct PluginManifestDto {
     pub capabilities: Vec<PluginCapabilityDto>,
     pub connections: Vec<ConnectionSlotDto>,
     pub config_keys: Vec<String>,
+    /// The gates the plugin resolves (ADR-0076 §7), by name; empty without
+    /// `resolve_gates`.
+    pub gates: Vec<GateDefinitionDto>,
+}
+
+/// A gate a plugin resolves: a Pipeline waits on it with `invoke:
+/// plugin:<installation>/<name>`.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct GateDefinitionDto {
+    pub name: String,
+    pub description: String,
+    /// What a Pipeline passes under `with:`.
+    pub inputs: Vec<GateFieldDto>,
+    /// What the plugin returns when it releases the gate.
+    pub outputs: Vec<GateFieldDto>,
+}
+
+/// One input or output of a gate definition, with its type.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct GateFieldDto {
+    pub name: String,
+    /// `string`, `boolean`, `number` or `choice` (inputs only).
+    #[serde(rename = "type")]
+    pub r#type: String,
+    /// Whether a Pipeline must pass it (always true for an output).
+    pub required: bool,
+}
+
+fn param_type_wire(t: scarab_pipeline::ParamType) -> String {
+    serde_json::to_value(t)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default()
 }
 
 impl From<&PluginManifest> for PluginManifestDto {
@@ -267,6 +334,34 @@ impl From<&PluginManifest> for PluginManifestDto {
                 })
                 .collect(),
             config_keys: m.config_keys.clone(),
+            gates: m
+                .gates
+                .iter()
+                .map(|(name, g)| GateDefinitionDto {
+                    name: name.clone(),
+                    description: g.description.clone(),
+                    inputs: g
+                        .interface
+                        .inputs
+                        .iter()
+                        .map(|p| GateFieldDto {
+                            name: p.name.clone(),
+                            r#type: param_type_wire(p.r#type),
+                            required: p.required,
+                        })
+                        .collect(),
+                    outputs: g
+                        .interface
+                        .outputs
+                        .iter()
+                        .map(|o| GateFieldDto {
+                            name: o.name.clone(),
+                            r#type: param_type_wire(o.r#type),
+                            required: true,
+                        })
+                        .collect(),
+                })
+                .collect(),
         }
     }
 }

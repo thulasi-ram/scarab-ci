@@ -2,9 +2,14 @@
 
 - **Status:** Proposed
 - **Date:** 2026-10-28 (simplified 2026-10-29, see the end)
+- **Amended:** 2026-10-30 (§1: a library invocation is a scope rendered once at launch, and
+  inputs are no longer bound into the text at compile time; see "Amendment (2026-10-30)")
 - **Deciders:** thulasi.ram (architect)
 - **Amends:** [0038](0038-invoke-and-local-reuse.md) (`invoke` gains a prefix per target
-  kind, installed libraries and plugin gates; library inputs bind at compile time),
+  kind, installed libraries and plugin gates; library inputs bind at compile time, read in a
+  scope at launch since the 2026-10-30 amendment),
+  [0041](0041-named-results-and-interpolation.md) (2026-10-30: an invoke's outputs are read
+  through a view, no longer rewritten at compile time),
   [0045](0045-source-provisioning.md) (the `clone` Step kind becomes a first-party
   library), [0072](0072-plugins-a-governed-extension-point.md) (plugins act as Principals;
   `offer_actions`, `subscribe_events`, `approve_gates` and `plugin_action` are dropped),
@@ -94,6 +99,12 @@ type-checked against the library's `interface`. A reference to an input the libr
 not declare is a compile error. Inside a library, `${{ inputs.* }}` never means the
 calling Run's launch parameters. `SCARAB_PARAM_*` variables are still set.
 
+> **Amended 2026-10-30: superseded, see [Amendment (2026-10-30)](#amendment-2026-10-30-scoped-rendering).**
+> Inputs are not substituted into the text at compile time. Each library invocation is a scope,
+> and a library Step's `${{ inputs.* }}` reads that scope when the Step launches. The compile
+> error for an undeclared input stays, and `inputs` inside a library still never means the
+> calling Run's launch parameters.
+
 **What the invoke Step carries.** The invoke Step's `timeout`, `resources` and
 `placement_profiles` apply to each non-gate Step it inlines, only where the library Step
 leaves that field unset; the library's own value wins. Its `when` is ANDed with the
@@ -101,6 +112,10 @@ leaves that field unset; the library's own value wins. Its `when` is ANDed with 
 Step with `forge_token` (§9): a placement profile is an arbitrary Pod patch, so a caller
 could otherwise place a trusted Step next to its own. Any other Step field on an invoke
 Step is a compile error, where today it is dropped without a word.
+
+> **Amended 2026-10-30.** The `when` values are not joined as text. Each is kept as a separate
+> guard and evaluated in the scope it was written in; the Step runs only if all of them hold, so
+> the AND stands. See [Amendment (2026-10-30)](#amendment-2026-10-30-scoped-rendering).
 
 **Installed libraries are closed.** An installed library may `invoke` only `lib:` and
 `plugin:` targets, never `file:`, so a repository cannot replace Steps inside an approved
@@ -544,3 +559,111 @@ Decided by the owner on 2026-10-29, in a simplification pass:
   admins install the library after upgrading (§9).
 - The invoke Step's `timeout`, `resources`, `placement_profiles` and `when` carry; `env`
   does not (§1).
+
+## Amendment (2026-10-30): scoped rendering
+
+Decided by the owner on 2026-10-29 and 2026-10-30, and built on the `feat/libraries` branch.
+It replaces "Inputs bind at compile time" in §1 and the text join of `when`, and amends
+[0041](0041-named-results-and-interpolation.md) §2: an invoke's outputs are read through a
+view instead of being rewritten at compile time.
+
+### Why
+
+§1 bound inputs by pasting the caller's `with:` text into each library Step's `${{ }}` at
+compile time. That had three faults:
+
+- A caller value could join the library text around it into a new expression. A red team
+  showed a value ending in `$` joining the `{{ … }}` that followed it, and the expression this
+  made read a Run parameter at launch.
+- Caller text was evaluated in the library's scope, so a name in it meant the library's
+  value, not the caller's.
+- Output reads were rewritten as text at each level of inlining, and once invokes were nested
+  the rewrite no longer kept each level's outputs apart.
+
+Go templates, Jinja macros, Helm subcharts and Terraform modules each give a reused unit its
+own scope and pass values into it, never text. GitHub's guidance for Actions is to pass an
+untrusted value through an environment variable instead of writing it into a script. Scarab
+now does both.
+
+### Decision
+
+**Templates are code; values are data.** Every Step's `${{ }}` text is rendered once, when
+the Step launches, by one renderer. The debug Pod and the image preview at Run creation use
+the same renderer. A rendered value is never rendered again, and nothing is pasted or spliced
+into a template at compile time.
+
+**Each library invocation is a scope.** A Step inlined from a library renders in its
+invocation's scope:
+
+- `inputs` is the invocation's bound `with:` values. Inside a library, `inputs` never means
+  the Run's launch parameters.
+- `outputs` is a view from the library's own Step ids to the inlined Step ids, plus the
+  exposed outputs of the invokes inside the library.
+- `matrix` is the Step's own coordinate only.
+
+A library sees neither the caller's `matrix` nor `event`. A caller that wants a library to
+have one of them passes it through `with:`.
+
+A `with:` value is a literal or a template. A literal is converted to the input's type and
+checked against `validate:` at compile time. A template renders in the caller's scope when
+the library Step launches; the value is then converted to the input's type and checked
+against `validate:`, and a value that fails either fails the Step.
+
+`SCARAB_PARAM_*` on a library Step holds only that library's own bound inputs. They are added
+after rendering, so a parameter whose value contains `${{` is not evaluated.
+
+**`when` on an invoke Step is a guard.** The invoke Step's `when` and the library Step's
+`when` are kept apart, each evaluated in the scope it was written in, innermost out, when the
+Run is created. A Step runs only if all of them hold. No results exist yet at that point, so a
+library's `when` may not read `outputs`, and neither may an input bound to a template that
+reads them.
+
+**An invoke's outputs are read through a view.** A read of `outputs.<invoke>.<name>`,
+in the Pipeline file or in a library, resolves through the reader's `outputs` view when the
+Step launches. Its text is kept as written. The reader must `needs` the invoke (inside a
+library, the local Step it reads), and the compiler adds an edge to the backing Step, which
+need not be a leaf. Every Step a view points to is among the reader's `needs`, so a read
+never creates a hidden edge.
+
+**Escaping depends on where a value goes, and happens while rendering.** Nothing is escaped
+after rendering.
+
+- A `command` argument or an `env` value receives the value as it is, with no escaping.
+- **The command boundary (2026-10-30).** Scarab never puts a value from outside the Pipeline
+  into a Step's command, except a `choice` value the Pipeline listed, `true`/`false`, a
+  non-negative decimal number, or a hex commit SHA; every other outside value reaches the Step
+  only as the value of an environment variable the Pipeline named, passed byte for byte. A
+  value is from outside when it comes from a Run parameter, a Step's results, an `event` field,
+  or a `with:` template that reads one of these through any number of callers; a library input
+  counts by its declared type. The compiler refuses a free-text value in `command`, and the
+  launch renderer checks every argument again (each fixed value against its shape), so an IR
+  that skipped the compiler is covered. This replaces the leading-`-` rule, which depended on
+  knowing how each program reads its arguments.
+- A rendered `image` must parse as an OCI reference, or the Step fails as a config error
+  before launch.
+- `${{ }}` inside a script that a shell or interpreter runs (`sh -c`, `python -c`, `node -e`,
+  `perl -e`, `ruby -e`, also behind wrappers such as `env`, `timeout` and `busybox`) is a
+  lint warning for the Pipeline's own values and a compile error for a value from outside.
+  Pass the value through `env:` and read `"$VAR"` in the script.
+
+**Limits.** 1 MiB per Pipeline or library source file, 16 MiB of compiled IR, and 1,024
+compiled Steps and gates. Each is a compile error that names the limit.
+
+**IR version 3** marks a Pipeline with a scoped Step. A server refuses to launch a Step of a
+Run whose stored IR version is higher than the highest it knows, or is not a whole number. A
+server built before this amendment neither checks the version nor knows about scopes, so it
+would render a scoped Step without its scope. Upgrades therefore replace the server with the
+chart's `Recreate` strategy (the default since PR #50), not a rolling update.
+
+### What this changes elsewhere in this ADR
+
+- §1, "Inputs bind at compile time": replaced by the scope above. The compile error for an
+  undeclared input stays.
+- §1, "What the invoke Step carries": the AND of `when` stands, as separate guards.
+- §2: a library's outputs are still read as `${{ outputs.<invoke-id>.<name> }}`, through the
+  view.
+- §9: `libs/clone.yaml` reads `${{ event.* }}` inside a library, which a scope does not
+  allow. `event` in `${{ }}` is not built yet; how the clone library receives the repository
+  URL and SHA is left to that work.
+- Implementation horizon, item 1: "compile-time binding of `inputs.*`" now means binding in a
+  scope that is read at launch.

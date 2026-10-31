@@ -47,9 +47,14 @@ scarab:
   # carries (`{publicUrl}/runs/{id}`). Empty => the server default
   # (http://localhost:8080). Set this to your ingress / tunnel URL.
   publicUrl: ""
-  # The canonical scarab-clone image a `clone` step runs (ADR-0045). Empty =>
-  # the server default (ghcr `:edge`). Digest-pin in production.
-  cloneImage: ""
+  # The first-party library release manifest (ADR-0076 §5), as JSON text.
+  # Empty => the server reads `libs-manifest.json` from its own version's
+  # GitHub release. Set it for an air-gapped install, or for a build whose
+  # first-party libraries are not released (`just local-helm local` writes one
+  # that lists a clone library pinning the locally built scarab-clone image).
+  # The checkout image is the one `lib:thulasi-ram/clone` pins; to use a
+  # mirror, install a library version that pins the mirror's image.
+  libsManifest: ""
   # Global default step deadline in seconds (ADR-0047). Empty => server
   # default (3600). Per-step `timeout:` always overrides.
   stepTimeoutSecs: ""
@@ -376,7 +381,7 @@ workspace:
   #   - the EGRESS helper (s3-drain): `scarab-wsfetch hold` keeps the Pod open
   #     after the step exits, and the control plane execs `scarab-wsfetch
   #     drain` in it to publish /workspace to the Depot in-Pod.
-  # Digest-pin in production, exactly as with scarab.cloneImage.
+  # Digest-pin in production, as a library pins its images.
   #
   # ⚠ ROLLOUT ORDER: publish/load this image BEFORE (or with) a control plane
   # that expects the s3-drain helper. A stale wsfetch has no subcommands — the

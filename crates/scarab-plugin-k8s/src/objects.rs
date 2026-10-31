@@ -61,6 +61,9 @@ pub const DNS_POD_LABEL: (&str, &str) = ("k8s-app", "kube-dns");
 pub const BROKER_TOKEN_EXPIRATION_SECONDS: i64 = 600;
 pub const BROKER_TOKEN_DIR: &str = "/var/run/secrets/scarab/broker";
 pub const BROKER_TOKEN_FILE: &str = "token";
+/// Beside the broker token, for a Plugin that resolves gates: its
+/// `scarab-api` token (ADR-0076 §7), with the same lifetime.
+pub const API_TOKEN_FILE: &str = "api-token";
 
 /// The unprivileged uid/gid a Plugin runs as (distroless `nonroot`).
 pub const PLUGIN_UID: i64 = 65532;
@@ -348,7 +351,21 @@ fn plugin_env(installation: &PluginInstallation, broker_url: &str) -> Vec<EnvVar
         PLUGIN_ENV_BROKER_TOKEN_FILE,
         &format!("{BROKER_TOKEN_DIR}/{BROKER_TOKEN_FILE}"),
     ));
+    if resolves_gates(installation) {
+        vars.push(env(
+            scarab_plugin::PLUGIN_ENV_API_TOKEN_FILE,
+            &format!("{BROKER_TOKEN_DIR}/{API_TOKEN_FILE}"),
+        ));
+    }
     vars
+}
+
+/// Whether the installation's approved manifest asks to resolve gates: only
+/// then does its Pod get a `scarab-api` token (ADR-0076 §7).
+fn resolves_gates(installation: &PluginInstallation) -> bool {
+    installation
+        .manifest
+        .has(scarab_plugin::PluginCapability::ResolveGates)
 }
 
 /// `plugin-<id>`: one replica, `Recreate` — one instance per installation,
@@ -405,14 +422,21 @@ pub fn deployment(
         Volume {
             name: "broker-token".to_string(),
             projected: Some(ProjectedVolumeSource {
-                sources: Some(vec![VolumeProjection {
-                    service_account_token: Some(ServiceAccountTokenProjection {
-                        audience: Some(BROKER_TOKEN_AUDIENCE.to_string()),
-                        expiration_seconds: Some(BROKER_TOKEN_EXPIRATION_SECONDS),
-                        path: BROKER_TOKEN_FILE.to_string(),
-                    }),
-                    ..Default::default()
-                }]),
+                sources: Some({
+                    let token = |audience: &str, path: &str| VolumeProjection {
+                        service_account_token: Some(ServiceAccountTokenProjection {
+                            audience: Some(audience.to_string()),
+                            expiration_seconds: Some(BROKER_TOKEN_EXPIRATION_SECONDS),
+                            path: path.to_string(),
+                        }),
+                        ..Default::default()
+                    };
+                    let mut sources = vec![token(BROKER_TOKEN_AUDIENCE, BROKER_TOKEN_FILE)];
+                    if resolves_gates(installation) {
+                        sources.push(token(scarab_plugin::API_TOKEN_AUDIENCE, API_TOKEN_FILE));
+                    }
+                    sources
+                }),
                 ..Default::default()
             }),
             ..Default::default()
@@ -600,6 +624,7 @@ mod tests {
                 capabilities: vec![PluginCapability::UseConnection],
                 connections: vec![],
                 config_keys: vec!["ARGOCD_UI_URL".into()],
+                gates: Default::default(),
             },
             manifest_sha256: "f".repeat(64),
             config: BTreeMap::from([(
@@ -741,6 +766,40 @@ mod tests {
         let mounts = pod.containers[0].volume_mounts.as_ref().unwrap();
         let token_mount = mounts.iter().find(|m| m.name == "broker-token").unwrap();
         assert_eq!(token_mount.read_only, Some(true));
+    }
+
+    #[test]
+    fn a_plugin_that_resolves_gates_gets_an_api_token_beside_the_broker_s() {
+        let mut inst = installation();
+        inst.manifest
+            .capabilities
+            .push(PluginCapability::ResolveGates);
+        let d = deployment("scarab-plugins", &inst, BROKER_URL, PROBE_IMAGE);
+        let pod = pod_spec(&d);
+        let audiences: Vec<_> = pod
+            .volumes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.projected.as_ref())
+            .flat_map(|p| p.sources.as_ref().unwrap())
+            .filter_map(|s| s.service_account_token.as_ref())
+            .map(|t| (t.audience.clone().unwrap(), t.path.clone(), t.expiration_seconds))
+            .collect();
+        assert_eq!(
+            audiences,
+            [
+                ("scarab-broker".to_string(), "token".to_string(), Some(600)),
+                ("scarab-api".to_string(), "api-token".to_string(), Some(600)),
+            ]
+        );
+        assert_eq!(
+            env_of(&d)["SCARAB_API_TOKEN_FILE"],
+            "/var/run/secrets/scarab/broker/api-token"
+        );
+        // Without the capability there is no api token and no variable.
+        let plain = deployment("scarab-plugins", &installation(), BROKER_URL, PROBE_IMAGE);
+        assert!(!env_of(&plain).contains_key("SCARAB_API_TOKEN_FILE"));
     }
 
     #[test]

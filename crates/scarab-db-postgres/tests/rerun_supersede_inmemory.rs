@@ -27,7 +27,7 @@ fn spec() -> StepSpec {
         workspace_inputs: vec![],
         workspace_outputs: vec![],
         cache: None,
-        clone: None,
+        forge_token: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],
@@ -37,6 +37,7 @@ fn spec() -> StepSpec {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     }
 }
 

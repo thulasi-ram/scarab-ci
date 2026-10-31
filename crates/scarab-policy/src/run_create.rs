@@ -210,6 +210,13 @@ pub struct RunCreateFacts {
     /// The human or token creating the Run; `None` for a webhook.
     pub principal: Option<String>,
     pub time: Timestamp,
+    /// The Run's resolved launch parameters (empty for a webhook). Not part
+    /// of the input: each Step's `image` is previewed with them, the image
+    /// as Run creation knows it (ADR-0076).
+    pub params: std::collections::BTreeMap<String, serde_json::Value>,
+    /// The Run's checked `event` values (ADR-0076 §9). Not part of the
+    /// input either: an image is previewed with them, as with `params`.
+    pub event: serde_json::Map<String, serde_json::Value>,
 }
 
 /// A Run whose Steps or gates do not fit a list cap of the input schema. Its
@@ -274,8 +281,7 @@ fn gate_kind(step: &scarab_pipeline::StepSpec) -> Result<GateKind, CapExceeded> 
 /// Whether `step` uses the Environment's authority (ADR-0075 §5): it
 /// declares secrets, requests a governed grant or a raw overlay, or is a
 /// deploy Step (itself, or every non-gate Step of a `deploy: true`
-/// Pipeline). The Pipeline IR has no `forge_token` yet, so that item of the
-/// list cannot apply.
+/// Pipeline), or asks for `forge_token: write` (ADR-0076 §9).
 pub fn uses_environment_authority(
     ir: &scarab_pipeline::PipelineIr,
     step: &scarab_pipeline::StepSpec,
@@ -292,6 +298,7 @@ pub fn uses_environment_authority(
         || step.k8s_overlay.is_some()
         || step.deploy
         || ir.deploy
+        || step.forge_token == Some(scarab_pipeline::ForgeToken::Write)
 }
 
 /// A gate of a Run whose origin includes a plugin link: what the closed
@@ -474,20 +481,34 @@ pub fn input_from_pipeline(
                     .map(|c| format!("add-capabilities:{c}")),
             );
         }
+        // The image the Step will launch with, as far as Run creation knows
+        // it: the same renderer as the launch, with only literal values
+        // (ADR-0076). A `${{` left in it is not known yet, so it pins
+        // nothing.
+        let image = scarab_pipeline::preview_image(
+            &s.image,
+            s.scope.as_ref(),
+            &s.matrix_values,
+            &facts.params,
+            &facts.event,
+        );
+        let digest = (!image.contains("${{"))
+            .then(|| image.rsplit_once('@').map(|(_, d)| d.to_string()))
+            .flatten()
+            .filter(|d| !d.is_empty());
         steps.push(Step {
             id: s.id.clone(),
-            image: s.image.clone(),
-            digest: s
-                .image
-                .split_once('@')
-                .map(|(_, d)| d.to_string())
-                .filter(|d| !d.is_empty()),
+            image,
+            digest,
             grants: capped(grants, &what, "grants")?,
             k8s_overlay: s.k8s_overlay.is_some(),
             secrets: capped(s.secrets.clone(), &what, "secrets")?,
             placement_profiles: capped(s.placement_profiles.clone(), &what, "placement profiles")?,
             deploy: s.deploy || ir.deploy,
-            forge_token: None,
+            forge_token: s.forge_token.map(|t| match t {
+                scarab_pipeline::ForgeToken::Read => ForgeToken::Read,
+                scarab_pipeline::ForgeToken::Write => ForgeToken::Write,
+            }),
             uses_environment_authority: uses_environment_authority(ir, s),
             origin: origin_of(&s.origin, &what)?,
             upstream_gates: capped(upstream_gates, &what, "gates upstream of it")?,

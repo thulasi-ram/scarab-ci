@@ -1,5 +1,5 @@
 # Scarab's own CI — running on Scarab (dogfood, per docs/handoffs).
-# A clone step provisions the source at the run's pinned SHA; a real Rust
+# The clone library checks out the source at the run's pinned SHA; a real Rust
 # step type-checks a small crate and publishes a couple of artifacts of
 # record. Kept deliberately small: an uncached in-Pod cargo build is slow
 # (layer caching is future work, ADR-0018).
@@ -31,7 +31,7 @@ on:
 
 steps:
   - id: checkout
-    clone: {}
+    invoke: lib:thulasi-ram/clone
 
   - id: check
     image: rust:1-bookworm

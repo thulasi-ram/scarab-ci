@@ -47,6 +47,9 @@ pub struct SecretInjectingExecutor {
     /// Org Environment governance (ADR-0071). `None` = no launch-time
     /// re-check (a hand-built executor; `main.rs` wires it).
     governance: Option<Arc<dyn scarab_project::EnvironmentGovernanceStore>>,
+    /// Installed libraries and yanks (ADR-0076 §6). `None` = no launch-time
+    /// yank check (a hand-built executor; `main.rs` wires it).
+    libraries: Option<Arc<dyn scarab_policy::library::LibraryStore>>,
 }
 
 /// Per-attempt OIDC token TTL (ADR-0015: short-lived by design — long enough
@@ -68,6 +71,36 @@ impl SecretInjectingExecutor {
             oidc: None,
             issuer_url: String::new(),
             governance: None,
+            libraries: None,
+        }
+    }
+
+    /// Refuse, at every launch, a step whose `origin` uses a library version
+    /// yanked in the run's org (ADR-0076 §6).
+    pub fn with_libraries(
+        mut self,
+        libraries: Arc<dyn scarab_policy::library::LibraryStore>,
+    ) -> Self {
+        self.libraries = Some(libraries);
+        self
+    }
+
+    /// Refuse the launch when the step was inlined from a yanked library
+    /// version. Every launch is checked, so a Rerun or Retry of a Run created
+    /// before the yank is refused as well. This is where `step.admit`
+    /// (ADR-0075 §3) will decide; the check is a PolicyInvariant there.
+    async fn ensure_not_yanked(&self, step: &StepRun) -> Result<(), ExecError> {
+        match crate::libraries::stored_step_yank_refusal(
+            self.db.as_ref(),
+            self.libraries.as_deref(),
+            &step.run,
+            &step.step.0,
+        )
+        .await
+        {
+            Ok(None) => Ok(()),
+            Ok(Some(refusal)) => Err(ExecError::Refused(refusal)),
+            Err(e) => Err(ExecError::Other(e)),
         }
     }
 
@@ -196,6 +229,9 @@ impl Executor for SecretInjectingExecutor {
     }
 
     async fn launch(&self, step: &StepRun, spec: &StepSpec) -> Result<ExecHandle, ExecError> {
+        // ADR-0076 §6: a yanked library version never launches, whatever
+        // the run's age. Before any credential is used.
+        self.ensure_not_yanked(step).await?;
         // ADR-0071 §2 at the point of use: every launch of a deploy-context
         // step is re-admitted, not only one that mints a token or resolves a
         // secret. A step with neither can still carry admitted privileges
@@ -281,6 +317,20 @@ impl Executor for SecretInjectingExecutor {
         })
     }
 
+    async fn gate_refusal(
+        &self,
+        gate: &scarab_engine::StepRun,
+    ) -> Result<Option<String>, ExecError> {
+        // ADR-0076 §6: a gate inlined from a yanked library version does not
+        // pass, as a step from one does not launch. Then whatever the wrapped
+        // executor says.
+        match self.ensure_not_yanked(gate).await {
+            Ok(()) => self.inner.gate_refusal(gate).await,
+            Err(ExecError::Refused(refusal)) => Ok(Some(refusal)),
+            Err(e) => Err(e),
+        }
+    }
+
     async fn infra_condition(
         &self,
         handle: &ExecHandle,
@@ -296,6 +346,15 @@ impl Executor for SecretInjectingExecutor {
                 message: c.message.as_deref().map(|m| self.logs.redact_text(m)),
                 ..c
             }))
+    }
+
+    async fn take_forge_credential(
+        &self,
+        handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::MountedForgeCredential>, ExecError> {
+        // Forward: the default would leave every token of the wrapped
+        // executor unrevoked.
+        self.inner.take_forge_credential(handle).await
     }
 
     async fn cancel(&self, handle: &ExecHandle) -> Result<(), ExecError> {

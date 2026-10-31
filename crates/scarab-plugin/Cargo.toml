@@ -21,3 +21,7 @@ thiserror = { workspace = true }
 # A report's (installation, vendor grouping) IS an EnvironmentDeploymentSource
 # (ADR-0071 §5): one shape rule, owned there.
 scarab-project = { workspace = true }
+# A gate definition's interface is a Pipeline Interface: the compiler checks
+# a caller's `with:` against it, and a release's outputs against its types
+# (ADR-0076 §7). Pure, like this crate.
+scarab-pipeline = { workspace = true }

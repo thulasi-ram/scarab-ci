@@ -1,0 +1,18 @@
+{
+  "libraries": [
+    {
+      "name": "clone",
+      "publisher": "thulasi-ram",
+      "versions": [
+        {
+          "content_hash": "e2559693cb9687e42c8aa2318154c76b258d32729117b9fb65f18be22d1db22a",
+          "release": "v0.3.0",
+          "security_fix": false,
+          "source": "github.com/thulasi-ram/scarab-ci//libs/clone.yaml@1111111111111111111111111111111111111111"
+        }
+      ]
+    }
+  ],
+  "release": "v0.3.0",
+  "schema": 1
+}

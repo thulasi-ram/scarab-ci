@@ -32,6 +32,9 @@ pub use environment_governance::InMemoryEnvironmentGovernance;
 /// versioning, name and concurrency rules.
 mod policies;
 pub use policies::InMemoryPolicies;
+// The in-memory `LibraryStore` (ADR-0076).
+mod libraries;
+pub use libraries::InMemoryLibraries;
 
 /// In-memory step-up stores (ADR-0073) and a real-AEAD test `Sealer`, with
 /// the Postgres adapter's single-use, expiry and compare-and-swap semantics.
@@ -113,6 +116,8 @@ struct StepRec {
     gate_kind: Option<String>,
     /// For a `timer` gate, the wait (seconds) before auto-release.
     gate_timer_seconds: Option<i64>,
+    /// For a `plugin` gate, the Principal that releases it (ADR-0076 §7).
+    gate_releaser: Option<String>,
     /// Explicit input workspaces (subset of `needs`), or `None` = all needs.
     explicit_inputs: Option<Vec<StepId>>,
     /// Which attempt produced the denormalized `output`/`results` above —
@@ -171,6 +176,7 @@ struct InMemoryState {
     run_ir: HashMap<RunId, serde_json::Value>,
     /// Resolved launch parameters per run (ADR-0043).
     run_params: HashMap<RunId, std::collections::BTreeMap<String, serde_json::Value>>,
+    run_event_facts: HashMap<RunId, serde_json::Map<String, serde_json::Value>>,
     /// Per-run deploy context (ADR-0037); set only for deploy runs.
     run_deploy: HashMap<RunId, scarab_engine::DeployContext>,
     /// Deploy Runs (ADR-0074 §2) → their Steps marked `deploy: true`.
@@ -244,6 +250,8 @@ struct InMemoryState {
     artifacts: HashMap<(RunId, String, StepId, AttemptId), scarab_engine::ArtifactRecord>,
     /// Per-attempt immutable evidence (ADR-0056).
     attempt_evidence: HashMap<(RunId, StepId, AttemptId), AttemptEvidenceRec>,
+    /// A plugin gate wait's rendered inputs (ADR-0076 §7), by its Attempt.
+    gate_inputs: HashMap<(RunId, StepId, AttemptId), serde_json::Value>,
     /// Run-scoped shared services (ADR-0058), keyed `{run, take, name}` —
     /// value is `(status, handle, created_at)`.
     #[allow(clippy::type_complexity)]
@@ -360,6 +368,7 @@ impl InMemoryDb {
                 gate_timer_seconds: None,
                 explicit_inputs: None,
                 evidence_attempt: None,
+                gate_releaser: None,
             },
         );
     }
@@ -383,6 +392,7 @@ impl InMemoryDb {
                     gate_timer_seconds: None,
                     explicit_inputs: None,
                     evidence_attempt: None,
+                    gate_releaser: None,
                 },
             );
         }
@@ -624,6 +634,14 @@ fn resolve_gate_wait_locked(
     } else {
         StepStatus::Failed
     });
+    if let (true, Some(outputs)) = (res.passed, &res.outputs) {
+        rec.results = outputs.clone();
+        rec.evidence_attempt = Some(attempt.clone());
+        st.attempt_evidence
+            .entry((run.clone(), step.clone(), attempt.clone()))
+            .or_default()
+            .results = outputs.clone();
+    }
     for kind in scarab_engine::gate_resolution_events(step, &attempt, minted, res) {
         st.events.push(EventKind {
             version: scarab_engine::EVENT_VERSION,
@@ -747,6 +765,7 @@ impl Db for InMemoryDb {
                 gate_timer_seconds: None,
                 explicit_inputs: None,
                 evidence_attempt: None,
+                gate_releaser: None,
             },
         );
         Ok(())
@@ -1321,6 +1340,110 @@ impl Db for InMemoryDb {
             .and_then(|r| r.gate_timer_seconds))
     }
 
+    async fn set_gate_releaser(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        releaser: &str,
+    ) -> Result<(), DbError> {
+        let mut st = self.state.lock().unwrap();
+        if let Some(rec) = st.steps.get_mut(&(run.clone(), step.clone())) {
+            rec.gate_releaser = Some(releaser.to_string());
+        }
+        Ok(())
+    }
+
+    async fn gate_releaser(&self, run: &RunId, step: &StepId) -> Result<Option<String>, DbError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .steps
+            .get(&(run.clone(), step.clone()))
+            .and_then(|r| r.gate_releaser.clone()))
+    }
+
+    async fn set_gate_wait_inputs(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        inputs: &serde_json::Value,
+    ) -> Result<bool, DbError> {
+        let mut st = self.state.lock().unwrap();
+        let running = st
+            .steps
+            .get(&(run.clone(), step.clone()))
+            .and_then(|r| r.attempts.iter().find(|a| &a.id == attempt))
+            .is_some_and(|a| a.outcome == AttemptOutcome::Running);
+        let key = (run.clone(), step.clone(), attempt.clone());
+        if !running || st.gate_inputs.contains_key(&key) {
+            return Ok(false);
+        }
+        st.gate_inputs.insert(key, inputs.clone());
+        Ok(true)
+    }
+
+    async fn gate_wait_inputs(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<Option<serde_json::Value>, DbError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .gate_inputs
+            .get(&(run.clone(), step.clone(), attempt.clone()))
+            .cloned())
+    }
+
+    async fn pending_plugin_gates(
+        &self,
+        org: &str,
+        releaser: &str,
+        after: Option<&scarab_engine::PendingGateKey>,
+        limit: u32,
+    ) -> Result<Vec<scarab_engine::PendingGateWait>, DbError> {
+        let st = self.state.lock().unwrap();
+        let mut out: Vec<scarab_engine::PendingGateWait> = Vec::new();
+        for ((run, step), rec) in &st.steps {
+            if st.run_tenant.get(run).map(|(o, _)| o.as_str()) != Some(org)
+                || rec.gate_kind.as_deref() != Some("plugin")
+                || rec.gate_releaser.as_deref() != Some(releaser)
+                || rec.status != Some(StepStatus::Pending)
+            {
+                continue;
+            }
+            for a in rec
+                .attempts
+                .iter()
+                .filter(|a| a.outcome == AttemptOutcome::Running)
+            {
+                let Some(inputs) = st
+                    .gate_inputs
+                    .get(&(run.clone(), step.clone(), a.id.clone()))
+                else {
+                    continue;
+                };
+                out.push(scarab_engine::PendingGateWait {
+                    run: run.clone(),
+                    step: step.clone(),
+                    attempt: a.id.clone(),
+                    started_at: a.started_at,
+                    inputs: inputs.clone(),
+                });
+            }
+        }
+        out.sort_by_key(|w| w.key());
+        Ok(out
+            .into_iter()
+            .filter(|w| after.is_none_or(|k| &w.key() > k))
+            .take(limit as usize)
+            .collect())
+    }
+
     async fn create_run_service(
         &self,
         run: &RunId,
@@ -1390,6 +1513,33 @@ impl Db for InMemoryDb {
 
     async fn run_ir(&self, run: &RunId) -> Result<Option<serde_json::Value>, DbError> {
         Ok(self.state.lock().unwrap().run_ir.get(run).cloned())
+    }
+
+    async fn set_run_event_facts(
+        &self,
+        run: &RunId,
+        facts: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(), DbError> {
+        self.state
+            .lock()
+            .unwrap()
+            .run_event_facts
+            .insert(run.clone(), facts.clone());
+        Ok(())
+    }
+
+    async fn run_event_facts(
+        &self,
+        run: &RunId,
+    ) -> Result<serde_json::Map<String, serde_json::Value>, DbError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .run_event_facts
+            .get(run)
+            .cloned()
+            .unwrap_or_default())
     }
 
     async fn set_run_params(
@@ -1916,6 +2066,7 @@ impl Db for InMemoryDb {
                 fence: None,
                 legacy_started_at: at,
                 at,
+                outputs: None,
             };
             resolve_gate_wait_locked(&mut st, run, step, &release);
         }
@@ -2311,6 +2462,9 @@ impl Db for InMemoryDb {
 struct FakeExecState {
     /// Scripted outcomes a test wants `poll` to return, in order.
     scripted: Vec<ExecState>,
+    /// The forge credential each launched unit holds (ADR-0076 §9), as the
+    /// k8s per-Pod token Secret holds it, until `take_forge_credential`.
+    forge_credentials: HashMap<String, scarab_engine::MountedForgeCredential>,
     /// Handles the test has declared "dead" (backend lost them).
     dead: Vec<ExecHandle>,
     /// How many times each handle has been launched — proves idempotent
@@ -2514,11 +2668,12 @@ impl FakeExecutor {
 
     /// `(step id, attempt id)` out of a `fake://{run}/{step}/{attempt}` handle.
     fn step_and_attempt(handle: &ExecHandle) -> Option<(String, String)> {
+        // `fake://<run>/<step>/<attempt>`: a Step inlined from a library has
+        // `/` in its id (`deploy/build`), so the attempt is the last part.
         let rest = handle.0.strip_prefix("fake://")?;
-        let mut parts = rest.split('/').skip(1);
-        let step = parts.next()?.to_string();
-        let attempt = parts.next()?.to_string();
-        Some((step, attempt))
+        let (run_and_step, attempt) = rest.rsplit_once('/')?;
+        let (_, step) = run_and_step.split_once('/')?;
+        Some((step.to_string(), attempt.to_string()))
     }
 
     /// Set the named results `step` (by id) emits on success (ADR-0041).
@@ -2575,6 +2730,12 @@ impl FakeExecutor {
 
     /// The spec `handle` was most recently launched with (after launch-time
     /// interpolation, ADR-0041), or `None` if it was never launched.
+    /// Whether `handle`'s unit still holds a forge credential: launched with
+    /// one, and not yet taken by `take_forge_credential`.
+    pub fn holds_forge_credential(&self, handle: &ExecHandle) -> bool {
+        self.inner.lock().unwrap().forge_credentials.contains_key(&handle.0)
+    }
+
     pub fn launched_spec(&self, handle: &ExecHandle) -> Option<StepSpec> {
         self.inner
             .lock()
@@ -2686,6 +2847,20 @@ impl Executor for FakeExecutor {
         let mut st = self.inner.lock().unwrap();
         *st.launches.entry(handle.0.clone()).or_insert(0) += 1;
         st.launched_specs.insert(handle.0.clone(), spec.clone());
+        // A re-drive writes its credential over the unit's, as the k8s
+        // executor replaces the Secret.
+        if let Some(f) = &spec.forge_token {
+            if let Some(c) = &f.credential {
+                st.forge_credentials.insert(
+                    handle.0.clone(),
+                    scarab_engine::MountedForgeCredential {
+                        owner: f.owner.clone(),
+                        name: f.name.clone(),
+                        credential: c.clone(),
+                    },
+                );
+            }
+        }
         Ok(handle)
     }
 
@@ -2767,6 +2942,20 @@ impl Executor for FakeExecutor {
         Ok(self.inner.lock().unwrap().cache_saves.get(&step).cloned())
     }
 
+    async fn gate_refusal(
+        &self,
+        _gate: &scarab_engine::StepRun,
+    ) -> Result<Option<String>, scarab_engine::ExecError> {
+        Ok(None)
+    }
+
+    async fn take_forge_credential(
+        &self,
+        handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::MountedForgeCredential>, ExecError> {
+        Ok(self.inner.lock().unwrap().forge_credentials.remove(&handle.0))
+    }
+
     async fn infra_condition(
         &self,
         handle: &ExecHandle,
@@ -2797,12 +2986,9 @@ impl Executor for FakeExecutor {
         &self,
         handle: &ExecHandle,
     ) -> Result<std::collections::BTreeMap<String, serde_json::Value>, ExecError> {
-        let step = handle
-            .0
-            .strip_prefix("fake://")
-            .and_then(|rest| rest.split('/').nth(1));
+        let step = Self::step_and_attempt(handle).map(|(step, _)| step);
         Ok(step
-            .and_then(|s| self.inner.lock().unwrap().results.get(s).cloned())
+            .and_then(|s| self.inner.lock().unwrap().results.get(&s).cloned())
             .unwrap_or_default())
     }
 
@@ -2824,12 +3010,9 @@ impl Executor for FakeExecutor {
         &self,
         handle: &ExecHandle,
     ) -> Result<Vec<scarab_engine::ArtifactMeta>, ExecError> {
-        let step = handle
-            .0
-            .strip_prefix("fake://")
-            .and_then(|rest| rest.split('/').nth(1));
+        let step = Self::step_and_attempt(handle).map(|(step, _)| step);
         Ok(step
-            .and_then(|s| self.inner.lock().unwrap().artifacts.get(s).cloned())
+            .and_then(|s| self.inner.lock().unwrap().artifacts.get(&s).cloned())
             .unwrap_or_default())
     }
 
@@ -3016,6 +3199,17 @@ pub struct FakeForge {
     /// = an adapter that cannot enumerate (`Unsupported`); `Err` = a listing
     /// that failed part-way, which an import must not prune on.
     collaborators: Mutex<Option<Result<Vec<scarab_forge::Collaborator>, String>>>,
+    /// How many times a credential was asked for: each
+    /// [`mint_checkout_credential`](ForgePort::mint_checkout_credential) and
+    /// [`registry_credential`](ForgePort::registry_credential) call. A test
+    /// asserts a refused launch reached neither.
+    credential_calls: Mutex<usize>,
+    /// Whether this forge mints a short-lived token per request, like GitHub
+    /// App mode (ADR-0076 §9). `false` (default) models a Forgejo or PAT
+    /// connection: one long-lived token, no write mint, nothing to revoke.
+    mints: Mutex<bool>,
+    /// The tokens [`revoke_credential`](ForgePort::revoke_credential) ended.
+    revoked: Mutex<Vec<String>>,
     /// How many checkout credentials [`mint_checkout_credential`](ForgePort::mint_checkout_credential)
     /// has handed out — lets a test assert a refused launch minted nothing.
     checkout_mints: Mutex<u32>,
@@ -3024,6 +3218,24 @@ pub struct FakeForge {
 impl FakeForge {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A forge that mints short-lived repository tokens (GitHub App mode):
+    /// each mint returns a new token, a write mint is possible, and tokens
+    /// are revoked.
+    pub fn with_minted_tokens(self) -> Self {
+        *self.mints.lock().unwrap() = true;
+        self
+    }
+
+    /// The tokens revoked so far, in order.
+    pub fn revoked(&self) -> Vec<String> {
+        self.revoked.lock().unwrap().clone()
+    }
+
+    /// How many checkout or registry credentials were asked for.
+    pub fn credential_calls(&self) -> usize {
+        *self.credential_calls.lock().unwrap()
     }
 
     /// How many checkout credentials this forge has minted.
@@ -3501,6 +3713,7 @@ impl ForgePort for FakeForge {
         &self,
         _repo: &RepoRef,
     ) -> Result<Option<scarab_forge::RegistryCredential>, ForgeError> {
+        *self.credential_calls.lock().unwrap() += 1;
         Ok(self.registry_credential.lock().unwrap().clone())
     }
 
@@ -3509,15 +3722,63 @@ impl ForgePort for FakeForge {
         repo: &RepoRef,
         read_only: bool,
     ) -> Result<CheckoutCredential, ForgeError> {
+        let n = {
+            let mut calls = self.credential_calls.lock().unwrap();
+            *calls += 1;
+            *calls
+        };
         // Deterministic fake credential: scoped to the repo, short TTL,
-        // read-only honored verbatim (the contract forbids widening it).
+        // read-only honored verbatim (the contract forbids widening it). A
+        // minting forge returns a new token each time; a long-lived one the
+        // same token.
+        let minted = *self.mints.lock().unwrap();
+        let token = if minted {
+            format!("fake-token-{}-{}-{n}", repo.owner, repo.name)
+        } else {
+            format!("fake-token-{}-{}", repo.owner, repo.name)
+        };
         *self.checkout_mints.lock().unwrap() += 1;
         Ok(CheckoutCredential {
             username: "x-access-token".into(),
-            token: format!("fake-token-{}-{}", repo.owner, repo.name),
+            token,
             expires_at: 9_999_999_999_999,
             read_only,
+            minted,
         })
+    }
+
+    async fn mints_repo_tokens(&self, _repo: &RepoRef) -> Result<bool, ForgeError> {
+        Ok(*self.mints.lock().unwrap())
+    }
+
+    async fn mint_write_credential(
+        &self,
+        repo: &RepoRef,
+    ) -> Result<CheckoutCredential, ForgeError> {
+        if !*self.mints.lock().unwrap() {
+            return Err(ForgeError::Unsupported(
+                "this forge hands out one long-lived token".into(),
+            ));
+        }
+        let n = {
+            let mut calls = self.credential_calls.lock().unwrap();
+            *calls += 1;
+            *calls
+        };
+        Ok(CheckoutCredential {
+            username: "x-access-token".into(),
+            token: format!("fake-write-token-{}-{}-{n}", repo.owner, repo.name),
+            expires_at: 9_999_999_999_999,
+            read_only: false,
+            minted: true,
+        })
+    }
+
+    async fn revoke_credential(&self, _repo: &RepoRef, token: &str) -> Result<(), ForgeError> {
+        if *self.mints.lock().unwrap() {
+            self.revoked.lock().unwrap().push(token.to_string());
+        }
+        Ok(())
     }
 
     async fn list_collaborators(

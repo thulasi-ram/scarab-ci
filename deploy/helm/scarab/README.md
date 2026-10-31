@@ -240,7 +240,7 @@ mechanism, applied kind-wide to GitHub App-mode connections.
 
 Step Pods are created by the server at run time, so the chart's `tolerations` /
 `nodeSelector` (which place the **server**) never reach them. On a cluster whose
-every node pool is tainted, step Pods (clone steps included) stay `Pending`
+every node pool is tainted, step Pods (checkout Steps included) stay `Pending`
 until you give them tolerations here:
 
 ```yaml

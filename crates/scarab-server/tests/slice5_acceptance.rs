@@ -13,7 +13,7 @@ use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
 use scarab_engine::{Db, RunId, StepId, StepRun};
 use scarab_executor_k8s::{
-    build_pod, image_artifact, DEFAULT_CLONE_IMAGE, DEFAULT_STEP_TIMEOUT_SECS,
+    build_pod, image_artifact, DEFAULT_STEP_TIMEOUT_SECS,
 };
 use scarab_identity::{Claims, OidcIssuer};
 use scarab_secrets::{Secret, SecretProvider, SecretScope};
@@ -141,7 +141,7 @@ async fn secret_used_not_logged_oidc_verifies_and_build_produces_digest() {
         workspace_inputs: vec![],
         workspace_outputs: vec![],
         cache: None,
-        clone: None,
+        forge_token: None,
         build: Some(build.clone()),
         artifacts: vec![],
         placement_profiles: vec![],
@@ -151,6 +151,7 @@ async fn secret_used_not_logged_oidc_verifies_and_build_produces_digest() {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     };
     let pod = build_pod(
         "scarab-image",
@@ -160,7 +161,6 @@ async fn secret_used_not_logged_oidc_verifies_and_build_produces_digest() {
         None,
         DEFAULT_STEP_TIMEOUT_SECS,
         false,
-        DEFAULT_CLONE_IMAGE,
         // No workspace flow here, so no ADR-0061 workspace service is needed.
         None,
     );

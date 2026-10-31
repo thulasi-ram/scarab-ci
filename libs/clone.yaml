@@ -1,0 +1,53 @@
+# The first-party clone library (ADR-0076 §9): check out the Run's repository
+# at the commit the Run is pinned to.
+#
+#   - id: checkout
+#     invoke: lib:thulasi-ram/clone
+#     with: { depth: full, lfs: true }
+#
+# Its one Step is `checkout/git`; `needs: [checkout]` reaches it across the
+# invoke. The Step asks for `forge_token: read`: Scarab mints the credential
+# when each Attempt launches and mounts it as /scarab/secrets/forge-token and
+# /scarab/secrets/forge-username. It is never an environment variable.
+#
+# The image is pinned by digest to a published scarab-clone build. A release
+# cannot pin the image it builds itself (its digest exists only after the
+# build), so this file pins an image an earlier build published, and a change
+# to docker/clone ships in the release after the one that builds it:
+# `scripts/pin_clone_image.sh <tag>` writes the digest of a published tag here.
+# SCARAB_CLONE_TOKEN_FILE points images built before the forge-token file
+# existed at it; newer images read it by default. The pinned image is the main
+# build after the clone credential was scoped to the cloned repository. It
+# predates the forge-username file and numeric depths: it answers git with
+# the username x-access-token (GitHub and Forgejo accept a token under any
+# username), and it fetches one commit for any depth but "full".
+kind: library
+interface:
+  inputs:
+    - name: depth
+      type: string
+      required: false
+      default: "1"
+      validate: 'value == "full" || value.matches("^[0-9]+$")'
+      description: '"1" for the commit alone, a number for that much history, or "full"'
+    - name: submodules
+      type: boolean
+      required: false
+      default: false
+      description: fetch submodules recursively
+    - name: lfs
+      type: boolean
+      required: false
+      default: false
+      description: pull Git LFS objects
+steps:
+  - id: git
+    image: ghcr.io/thulasi-ram/scarab-clone:sha-0d4ec26809c5f52b235f365e356a91cf9bc6942d@sha256:ca5b539ea2cb2dc590390ed4e8a339e4bcbf6255cd38f627de861c44c7961928
+    forge_token: read
+    env:
+      - [SCARAB_CLONE_URL, "${{ event.repo.clone_url }}"]
+      - [SCARAB_CLONE_SHA, "${{ event.sha }}"]
+      - [SCARAB_CLONE_DEPTH, "${{ inputs.depth }}"]
+      - [SCARAB_CLONE_SUBMODULES, "${{ inputs.submodules }}"]
+      - [SCARAB_CLONE_LFS, "${{ inputs.lfs }}"]
+      - [SCARAB_CLONE_TOKEN_FILE, /scarab/secrets/forge-token]

@@ -1158,7 +1158,7 @@ pub async fn reject_gate(
     };
     if !matches!(
         gate.gate_kind.as_deref(),
-        Some("manual") | Some("timer") | Some("external")
+        Some("manual") | Some("timer") | Some("external") | Some("plugin")
     ) {
         return Err(RerunError::NotARejectableGate(step.clone()));
     }
@@ -1179,6 +1179,158 @@ pub async fn reject_gate(
     let resolved = resolve_gate(db, clock, run, gate, &verdict, Some(by.to_string()), None).await?;
     if resolved {
         reopen_if_runnable(db, clock, run).await?;
+    }
+    Ok(resolved)
+}
+
+/// A plugin's answer to one of its gates (ADR-0076 §7).
+#[derive(Debug, Clone)]
+pub struct PluginGateVerdict {
+    /// `true` releases the gate with `outputs`; `false` fails it with
+    /// `reason`.
+    pub passed: bool,
+    /// Why the gate failed (required, already bounded, when `passed` is
+    /// false).
+    pub reason: Option<String>,
+    /// The outputs of a release, checked here against what the gate
+    /// declares.
+    pub outputs: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Why a plugin's answer to a gate was not taken (ADR-0076 §7).
+#[derive(Debug, thiserror::Error)]
+pub enum PluginGateError {
+    /// No such gate for this releaser: an unknown step, a gate of another
+    /// kind (a manual gate never takes a plugin's answer), or a plugin gate
+    /// another installation releases. One answer for all of them, so a
+    /// plugin learns nothing about gates that are not its own.
+    #[error("no such plugin gate")]
+    NotFound,
+    /// The gate is not waiting on this answer: not reached, already
+    /// resolved, or `attempt` is not its open wait (superseded or retried).
+    #[error("the gate is not waiting on this answer: {0}")]
+    NotWaiting(String),
+    /// The wait passed its `gate_expires_after`; the scheduler fails it.
+    #[error("the gate expired {0}s after its needs finished; it can no longer be released")]
+    Expired(i64),
+    /// The outputs do not match what the gate declares.
+    #[error("{0}")]
+    Invalid(String),
+    #[error(transparent)]
+    Db(#[from] DbError),
+}
+
+/// Whether `step` of `run` is a gate of kind `plugin` that `releaser`
+/// (`plugin:<installation>`) releases (ADR-0076 §7). The caller decides
+/// this before any other check on the gate, and answers "no such gate" when
+/// it is false, so a plugin learns nothing about gates that are not its own:
+/// not their kind, state, expiry, library or Environment. The caller checks
+/// the Run's org.
+pub async fn releases_plugin_gate(
+    db: &dyn Db,
+    run: &RunId,
+    step: &StepId,
+    releaser: &str,
+) -> Result<bool, DbError> {
+    let is_plugin_gate = db
+        .steps_of_run(run)
+        .await?
+        .iter()
+        .any(|s| &s.step == step && s.gate_kind.as_deref() == Some("plugin"));
+    Ok(is_plugin_gate && db.gate_releaser(run, step).await?.as_deref() == Some(releaser))
+}
+
+/// Resolve plugin gate `step` of `run` as `releaser` (`plugin:<installation>`)
+/// answering its wait `attempt` (ADR-0076 §7). The machine path: no
+/// approval, no step-up. Taken only when the gate is of kind `plugin`, names
+/// `releaser`, is reached and still waits on `attempt`, and has not passed
+/// its expiry; a release's outputs must be exactly what the gate declares,
+/// of their types. The verdict is journalled `by` the releaser and fenced on
+/// `attempt`, so an answer to a superseded or retried wait is dropped.
+/// Returns whether this call resolved the gate (`false`: a racing resolver
+/// got there first). The caller checks the Run's org.
+pub async fn resolve_plugin_gate(
+    db: &dyn Db,
+    clock: &dyn Clock,
+    run: &RunId,
+    step: &StepId,
+    releaser: &str,
+    attempt: &AttemptId,
+    verdict: PluginGateVerdict,
+) -> Result<bool, PluginGateError> {
+    let steps = db.steps_of_run(run).await?;
+    let Some(gate) = steps
+        .iter()
+        .find(|s| &s.step == step && s.gate_kind.as_deref() == Some("plugin"))
+    else {
+        return Err(PluginGateError::NotFound);
+    };
+    if !releases_plugin_gate(db, run, step, releaser).await? {
+        return Err(PluginGateError::NotFound);
+    }
+    if gate.status != StepStatus::Pending {
+        return Err(PluginGateError::NotWaiting(format!(
+            "it is {:?}",
+            gate.status
+        )));
+    }
+    if !gate_reached(gate, &steps) {
+        return Err(PluginGateError::NotWaiting("it is not reached yet".into()));
+    }
+    let open = open_gate_attempt(gate).ok_or_else(|| {
+        PluginGateError::NotWaiting("it has no open wait".into())
+    })?;
+    if &open.id != attempt {
+        return Err(PluginGateError::NotWaiting(format!(
+            "its open wait is `{}`, not `{}`",
+            open.id.0, attempt.0
+        )));
+    }
+    let now = clock.now().await;
+    let expiry = db
+        .run_ir(run)
+        .await?
+        .as_ref()
+        .and_then(|ir| crate::render::ir_step(ir, step))
+        .and_then(|s| s.get("gate_expires_after"))
+        .and_then(|t| t.as_i64());
+    if let Some(secs) = expiry {
+        if now.0 >= open.started_at.0.saturating_add(secs.saturating_mul(1000)) {
+            return Err(PluginGateError::Expired(secs));
+        }
+    }
+    let (reason, outputs) = if verdict.passed {
+        let declared = crate::render::gate_declared_outputs(db, run, step)
+            .await?
+            .ok_or(PluginGateError::NotFound)?;
+        let outputs = scarab_pipeline::check_gate_outputs(&declared, &verdict.outputs)
+            .map_err(PluginGateError::Invalid)?;
+        (format!("released by {releaser}"), Some(outputs))
+    } else {
+        let reason = verdict
+            .reason
+            .filter(|r| !r.trim().is_empty())
+            .ok_or_else(|| PluginGateError::Invalid("a fail needs a reason".into()))?;
+        (reason, None)
+    };
+    let res = GateResolution {
+        passed: verdict.passed,
+        reason,
+        expired: false,
+        by: Some(releaser.to_string()),
+        fence: Some(attempt.clone()),
+        legacy_started_at: now,
+        at: now,
+        outputs,
+    };
+    let resolved = db.resolve_gate_wait(run, step, &res).await?.is_some();
+    if resolved {
+        reopen_if_runnable(db, clock, run)
+            .await
+            .map_err(|e| match e {
+                RerunError::Db(e) => PluginGateError::Db(e),
+                other => PluginGateError::NotWaiting(other.to_string()),
+            })?;
     }
     Ok(resolved)
 }
@@ -1392,6 +1544,7 @@ async fn resolve_gate(
         fence,
         legacy_started_at,
         at: now,
+        outputs: None,
     };
     Ok(db.resolve_gate_wait(run, &gate.step, &res).await?.is_some())
 }
@@ -3629,103 +3782,24 @@ impl<'a> Scheduler<'a> {
         }
     }
 
-    /// Resolve `${{ … }}` interpolations in a step's launch spec against its
-    /// upstream results (ADR-0041), returning the launchable spec — or the
-    /// interpolation error string (`Ok(Err(_))`) when a reference is bad, which
-    /// the caller turns into a *step* failure (fail-fast, not a scheduler error).
-    /// A `DbError` (infra) propagates as `Err(_)` so it retries.
+    /// Render a step's launch spec (ADR-0041, ADR-0076) with
+    /// [`render_launch_spec`](crate::render::render_launch_spec), returning
+    /// the launchable spec — or the render error (`Ok(Err(_))`) when a
+    /// reference is bad, which the caller turns into a *step* failure
+    /// (fail-fast, not a scheduler error). A `DbError` (infra) propagates as
+    /// `Err(_)` so it retries.
+    ///
+    /// Every launched step receives its inputs as `SCARAB_PARAM_<NAME>` env
+    /// (ADR-0008): a Step written in the Pipeline file gets the Run's launch
+    /// parameters, a library Step its own bound inputs. They are added after
+    /// rendering, so a value holding `${{` reaches the step as text.
     async fn interpolate_spec(
         &self,
         run: &RunId,
         step: &StepId,
         spec: StepSpec,
     ) -> Result<Result<StepSpec, String>, SchedulerError> {
-        // Launch parameters (ADR-0043) are frozen on the run at creation. Every
-        // launched step receives them as `SCARAB_PARAM_<NAME>` env (stringified),
-        // even one it never references — unreferenced params still reach the step
-        // (ADR-0008 param convention). They are added after the interpolation
-        // pass, never before: a param value is data, and one holding `${{ … }}`
-        // must reach the step as that text, not be evaluated.
-        let params = self.db.run_params(run).await?;
-        let with_params = |mut spec: StepSpec| {
-            if !params.is_empty() {
-                // Prepend so a step's own explicit env of the same name still wins.
-                let mut env: Vec<(String, String)> = params
-                    .iter()
-                    .map(|(k, v)| {
-                        (
-                            format!("SCARAB_PARAM_{}", k.to_uppercase()),
-                            scarab_pipeline::params::stringify(v),
-                        )
-                    })
-                    .collect();
-                env.append(&mut spec.env);
-                spec.env = env;
-            }
-            spec
-        };
-
-        // Fast path: no interpolation → launch verbatim (the common case).
-        let has_interp = spec.image.contains("${{")
-            || spec.command.iter().any(|c| c.contains("${{"))
-            || spec.env.iter().any(|(_, v)| v.contains("${{"));
-        if !has_interp {
-            return Ok(Ok(with_params(spec)));
-        }
-
-        // Build the `outputs` context from this step's upstream results, keyed by
-        // step id. Only `needs` are gathered — the compile-time check guarantees
-        // a reference names a step the caller `needs` (ADR-0041 §4).
-        let needs = self
-            .db
-            .steps_of_run(run)
-            .await?
-            .into_iter()
-            .find(|s| &s.step == step)
-            .map(|s| s.needs)
-            .unwrap_or_default();
-        let mut outputs = serde_json::Map::new();
-        for need in &needs {
-            let results = self.db.step_results(run, need).await?;
-            if !results.is_empty() {
-                outputs.insert(
-                    need.0.clone(),
-                    serde_json::Value::Object(results.into_iter().collect()),
-                );
-            }
-        }
-        // `inputs` exposes the resolved launch params (typed), so `${{ inputs.x }}`
-        // resolves and a numeric guard like `inputs.n > 80` compares numerically.
-        let inputs = serde_json::Value::Object(params.clone().into_iter().collect());
-        // `matrix` exposes this instance's concrete coordinate (ADR-0023). A matrix
-        // leg is expanded with `${{ matrix.<dim> }}` left in its image/command/env
-        // and its coordinate carried on `spec.matrix_values`; without binding it a
-        // matrixed step's `${{ matrix.* }}` fails to resolve and the leg dies at
-        // launch before a Pod is ever created.
-        let matrix = serde_json::Value::Object(
-            spec.matrix_values
-                .iter()
-                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-                .collect(),
-        );
-        let ctx = serde_json::json!({ "outputs": outputs, "inputs": inputs, "matrix": matrix });
-
-        let interp =
-            |s: &str| scarab_pipeline::cel::interpolate(s, &ctx).map_err(|e| e.to_string());
-        let mut out = spec;
-        match (|| {
-            out.image = interp(&out.image)?;
-            for c in &mut out.command {
-                *c = interp(c)?;
-            }
-            for (_, v) in &mut out.env {
-                *v = interp(v)?;
-            }
-            Ok::<(), String>(())
-        })() {
-            Ok(()) => Ok(Ok(with_params(out))),
-            Err(reason) => Ok(Err(reason)),
-        }
+        Ok(crate::render::render_launch_spec(self.db, run, step, spec).await?)
     }
 
     /// Settle the run once every step is terminal, mapping the cause to the
@@ -3933,6 +4007,45 @@ impl<'a> Scheduler<'a> {
                     }
                 }
             };
+            // A plugin gate's inputs render once, when it is reached
+            // (ADR-0076 §7), and are stored on this wait before the plugin
+            // can list it. One that does not render fails the gate with the
+            // reason.
+            if gate.gate_kind.as_deref() == Some("plugin")
+                && self
+                    .db
+                    .gate_wait_inputs(run, &gate.step, &attempt.id)
+                    .await?
+                    .is_none()
+            {
+                match crate::render::render_gate_inputs(self.db, run, &gate.step, &gate.needs)
+                    .await?
+                {
+                    Ok(inputs) => {
+                        self.db
+                            .set_gate_wait_inputs(run, &gate.step, &attempt.id, &inputs)
+                            .await?;
+                    }
+                    Err(reason) => {
+                        let verdict = GateVerdict {
+                            passed: false,
+                            reason: format!("its inputs do not render: {reason}"),
+                            expired: false,
+                        };
+                        resolve_gate(
+                            self.db,
+                            self.clock,
+                            run,
+                            gate,
+                            &verdict,
+                            None,
+                            Some(attempt.id.clone()),
+                        )
+                        .await?;
+                        continue;
+                    }
+                }
+            }
             if settings.is_none() {
                 settings = Some(self.gate_settings(run).await?);
             }
@@ -3941,10 +4054,22 @@ impl<'a> Scheduler<'a> {
                 .and_then(|m| m.get(gate.step.0.as_str()).cloned())
                 .unwrap_or_default();
             let now = self.clock.now().await;
-            if let Some(verdict) = self
+            if let Some(mut verdict) = self
                 .gate_verdict(run, gate, &attempt, &gate_settings, now)
                 .await?
             {
+                // A pass is the executor's to refuse (ADR-0076 §6: a gate
+                // from a yanked library version), as a launch is: the gate
+                // fails with the reason instead of releasing.
+                if verdict.passed {
+                    if let Some(refusal) = self.executor.gate_refusal(gate).await? {
+                        verdict = GateVerdict {
+                            passed: false,
+                            reason: format!("the gate cannot release: {refusal}"),
+                            expired: false,
+                        };
+                    }
+                }
                 // Fenced on THIS wait: a wait superseded or cancelled since the
                 // snapshot takes no verdict.
                 resolve_gate(

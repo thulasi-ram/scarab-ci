@@ -24,7 +24,7 @@ fn spec(cmd: &[&str]) -> StepSpec {
         workspace_inputs: vec![],
         workspace_outputs: vec![],
         cache: None,
-        clone: None,
+        forge_token: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],
@@ -34,6 +34,7 @@ fn spec(cmd: &[&str]) -> StepSpec {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     }
 }
 
@@ -227,28 +228,35 @@ async fn no_results_emitted_is_an_empty_map() {
 // Each of these is a step kind whose contract is a *container* — a canonical
 // image, rootless BuildKit, a co-located sidecar. The local backend runs a bare
 // child process, so it must FAIL with direction rather than run the step
-// without the thing that makes it that kind of step. A silent no-source clone
+// without the thing that makes it that kind of step. A checkout without its credential
 // or a service-less step that exits 0 is the failure mode being pinned here:
 // the step would look green while having done something else entirely.
 // ---------------------------------------------------------------------------
 
-/// ADR-0045: a clone step's contract is the `scarab-clone` image plus tmpfs
-/// credential delivery. Locally that is unhonorable — reject, never run a step
-/// that quietly checks nothing out.
+/// ADR-0076 §9: a forge credential is mounted as files into the step's own
+/// container. Locally that is unhonorable — reject, never run a checkout that
+/// quietly has no credential, or leaves one where any process can read it.
 #[tokio::test]
-async fn a_clone_step_is_rejected_not_silently_run_without_source() {
+async fn a_forge_token_step_is_rejected() {
     let exec = LocalExecutor::new();
-    let s = step("r1", "checkout");
+    let s = step("r1", "checkout/git");
     let mut sp = spec(&["sh", "-c", "exit 0"]);
-    sp.clone = Some(Default::default());
+    sp.forge_token = Some(scarab_engine::ForgeTokenConfig {
+        access: scarab_pipeline::ForgeToken::Read,
+        owner: "acme".into(),
+        name: "web".into(),
+        read_only: false,
+        trusted_library: None,
+        credential: None,
+    });
 
     let err = exec
         .launch(&s, &sp)
         .await
-        .expect_err("a clone step must not launch on the local backend");
+        .expect_err("a forge_token step must not launch on the local backend");
     let msg = err.to_string();
     assert!(
-        msg.contains("k8s executor") && msg.contains("ADR-0045"),
+        msg.contains("k8s executor") && msg.contains("forge_token"),
         "the rejection has to point at the backend that CAN do it: {msg}"
     );
 }
@@ -434,4 +442,15 @@ async fn a_cancelled_unit_is_torn_down() {
     assert!(exec.torn_down(&handle).await.unwrap());
     let bogus = scarab_engine::ports::ExecHandle("local://nope/nope/0".into());
     assert!(exec.torn_down(&bogus).await.unwrap());
+}
+
+/// The local executor resolves no library state and mounts no forge
+/// credential: a gate is never refused here, and no Attempt ever holds a
+/// token to revoke (a `forge_token` Step is refused at launch instead).
+#[tokio::test]
+async fn no_gate_refusal_and_no_forge_credential_to_take() {
+    let exec = LocalExecutor::new();
+    assert_eq!(exec.gate_refusal(&step("r1", "gate")).await.unwrap(), None);
+    let handle = scarab_engine::ports::ExecHandle("local://r1/ok/0".into());
+    assert!(exec.take_forge_credential(&handle).await.unwrap().is_none());
 }

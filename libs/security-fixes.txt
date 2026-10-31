@@ -1,0 +1,7 @@
+# First-party library versions that fix a security problem (ADR-0076 §5).
+#
+# One SHA-256 content hash per line (`sha256sum libs/<name>.yaml`), with an
+# optional comment after `#`. scripts/libs_manifest.py marks each listed
+# version `security_fix: true` in the release manifest, and Scarab marks an
+# update to it as a security fix. Add the hash in the release that ships the
+# fixed file.

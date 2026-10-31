@@ -546,6 +546,7 @@ mod tests {
                 capabilities: vec![PluginCapability::UseConnection],
                 connections: vec![],
                 config_keys: vec![],
+                gates: Default::default(),
             },
             manifest_sha256: "0".repeat(64),
             config: BTreeMap::new(),

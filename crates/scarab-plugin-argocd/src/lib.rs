@@ -9,8 +9,9 @@
 //! What stays is library code a plugin will need to answer whether an
 //! Application is live: the Argo CD API types ([`argo`]), the status rules
 //! ([`assess`]), the rendered image set ([`version`]) and the broker client
-//! ([`broker`]). The process itself only checks it can reach both
-//! ([`standby`]).
+//! ([`broker`]). The process checks it can reach both ([`standby`]) and,
+//! when its installation resolves gates, answers its `wait-live` gates
+//! ([`gates`], ADR-0076 §7).
 //!
 //! This crate depends on no `scarab-*` crate: what it knows of Scarab is the
 //! broker's HTTP contract.
@@ -19,6 +20,7 @@ pub mod argo;
 pub mod assess;
 pub mod broker;
 pub mod config;
+pub mod gates;
 pub mod standby;
 pub mod version;
 

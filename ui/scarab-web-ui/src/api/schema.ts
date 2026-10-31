@@ -764,6 +764,149 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/orgs/{org}/gates": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List the open waits of the gates that name the calling plugin (ADR-0076
+         *     §7). Only a plugin's `scarab-api` token is accepted; another org's list
+         *     is a 404. The query reads current state, so a restarted plugin catches up
+         *     with nothing to replay.
+         */
+        get: operations["list_pending_gates"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/libraries": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** An org's installed libraries (ADR-0076 §4) */
+        get: operations["list_libraries"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/libraries/fetch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Fetch a library version to review before installing (ADR-0076 §4) */
+        post: operations["fetch_library"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/libraries/{publisher}/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Install or upgrade a library (ADR-0076 §4) */
+        put: operations["install_library"];
+        post?: never;
+        /** Remove an installed library (ADR-0076 §4) */
+        delete: operations["remove_library"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/library-defaults/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Retry installing the first-party libraries (ADR-0076 §5) */
+        post: operations["retry_library_defaults"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/library-trust": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Trust a library source with forge credentials (ADR-0076 §9) */
+        post: operations["trust_library_source"];
+        /** Stop trusting a library source with forge credentials (ADR-0076 §9) */
+        delete: operations["untrust_library_source"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/library-yanks": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Yank a library version (ADR-0076 §6) */
+        post: operations["yank_library"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/library-yanks/{hash}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Lift a library yank (ADR-0076 §6) */
+        delete: operations["unyank_library"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/orgs/{org}/members/{subject}/passkeys/reset": {
         parameters: {
             query?: never;
@@ -1320,7 +1463,8 @@ export interface paths {
          * The manually-dispatchable catalog at a ref (ADR-0043 §4). Resolves `ref` to a
          *     concrete commit (echoed back), enumerates every `.scarab/*.{yaml,yml}` at it
          *     (direct children only — `.scarab/lib/**` is excluded, mirroring webhook
-         *     discovery), and reports each pipeline's `manual`/`api` opt-in from a
+         *     discovery, and so is a file marked `kind: library`), and reports each
+         *     pipeline's `manual`/`api` opt-in from a
          *     **lightweight `on:`-only parse** (no `invoke:` pre-fetch, no full compile —
          *     that cost is deferred to the on-selection interface read). A single file that
          *     fails to parse is flagged with an `error` rather than failing the whole list;
@@ -2721,6 +2865,64 @@ export interface components {
              */
             reason?: string | null;
         };
+        FetchLibraryRequest: {
+            /**
+             * @description A ForgeConnection id, for a private repository. Omitted: fetched
+             *     anonymously over https.
+             */
+            connection?: string | null;
+            /** @description Defaults to the file name without its extension. */
+            name?: string | null;
+            /** @description Defaults to the source's owner. */
+            publisher?: string | null;
+            /** @description `<host>/<owner>/<repo>//<path>@<commit>`. */
+            source: string;
+        };
+        FetchedLibraryDto: {
+            content: string;
+            content_hash: string;
+            current?: null | components["schemas"]["InstalledVersionDto"];
+            /**
+             * @description The change from `current`, one line per entry, each starting with
+             *     `+`, `-` or a space. Empty when nothing is installed.
+             */
+            diff: string;
+            first_party: boolean;
+            name: string;
+            publisher: string;
+            source: string;
+        };
+        /** @description A first-party library in the server's release manifest. */
+        FirstPartyLibraryDto: {
+            content_hash: string;
+            /** @description Installed in this org under its name, at any version. */
+            installed: boolean;
+            name: string;
+            publisher: string;
+            release: string;
+            security_fix: boolean;
+            source: string;
+        };
+        /**
+         * @description A gate a plugin resolves: a Pipeline waits on it with `invoke:
+         *     plugin:<installation>/<name>`.
+         */
+        GateDefinitionDto: {
+            description: string;
+            /** @description What a Pipeline passes under `with:`. */
+            inputs: components["schemas"]["GateFieldDto"][];
+            name: string;
+            /** @description What the plugin returns when it releases the gate. */
+            outputs: components["schemas"]["GateFieldDto"][];
+        };
+        /** @description One input or output of a gate definition, with its type. */
+        GateFieldDto: {
+            name: string;
+            /** @description Whether a Pipeline must pass it (always true for an output). */
+            required: boolean;
+            /** @description `string`, `boolean`, `number` or `choice` (inputs only). */
+            type: string;
+        };
         /** @description How a gate's wait resolved: its `GateResolved` journal entry. */
         GateResolutionDto: {
             /**
@@ -2757,6 +2959,12 @@ export interface components {
             /** @description May run as a privileged container. */
             privileged?: boolean;
         };
+        InstallLibraryRequest: {
+            /** @description A version fetched into this org. */
+            content_hash: string;
+            /** @description The hash installed now (an upgrade), or omitted for a first install. */
+            replaces?: string | null;
+        };
         /** @description `POST /v1/orgs/{org}/plugins`. */
         InstallPluginRequest: {
             /** @description Values for the manifest's `config_keys`; omitted = none. */
@@ -2779,6 +2987,10 @@ export interface components {
          * @enum {string}
          */
         InstallationStateDto: "enabled" | "killed";
+        InstalledVersionDto: {
+            content_hash: string;
+            source: string;
+        };
         /**
          * @description A Project's ADR-0037 per-repo rules as the migration found them. The
          *     canonical `secret_scope` / `oidc_subject` are left out: the server always
@@ -2800,6 +3012,36 @@ export interface components {
              * @description Seconds.
              */
             wait_timer: number;
+        };
+        LibraryDefaultsDto: {
+            mirror?: string | null;
+            missing: components["schemas"]["MissingDefaultDto"][];
+            /**
+             * @description `offered` (an org from before libraries: nothing installed without an
+             *     admin), `pending`, `installed` or `missing`.
+             */
+            state: string;
+            /** Format: int64 */
+            updated_at: number;
+        };
+        LibraryInstallationDto: {
+            content_hash: string;
+            first_party: boolean;
+            /** Format: int64 */
+            installed_at: number;
+            installed_by: string;
+            name: string;
+            publisher: string;
+            source: string;
+            update?: null | components["schemas"]["UpdateNoticeDto"];
+            yanked?: null | components["schemas"]["LibraryYankDto"];
+        };
+        LibraryYankDto: {
+            content_hash: string;
+            reason: string;
+            /** Format: int64 */
+            yanked_at: number;
+            yanked_by: string;
         };
         /** @description `POST /v1/me/identities/link` body. */
         LinkIdentityRequest: {
@@ -2934,6 +3176,12 @@ export interface components {
              */
             token: string;
         };
+        MissingDefaultDto: {
+            error: string;
+            name: string;
+            /** @description Empty when the release manifest itself could not be read. */
+            publisher: string;
+        };
         /**
          * @description What a human is asked to confirm: the server-rendered, redacted
          *     description of one operation (shown in the 403, on the confirm page and
@@ -2974,6 +3222,20 @@ export interface components {
             updated_at: number;
             /** @description Who last wrote it (a Principal subject). */
             updated_by: string;
+        };
+        OrgLibrariesDto: {
+            defaults?: null | components["schemas"]["LibraryDefaultsDto"];
+            first_party: components["schemas"]["FirstPartyLibraryDto"][];
+            installations: components["schemas"]["LibraryInstallationDto"][];
+            /** @description Why the release manifest could not be read, if it could not. */
+            manifest_error?: string | null;
+            /**
+             * @description The library sources this org trusts with long-lived forge credentials
+             *     (ADR-0076 §9), besides the first-party clone library, which it trusts
+             *     by default.
+             */
+            trusted_sources: components["schemas"]["TrustedSourceDto"][];
+            yanks: components["schemas"]["LibraryYankDto"][];
         };
         /** @description `GET /v1/orgs/{org}/security/summary`. */
         OrgSecuritySummary: {
@@ -3047,6 +3309,37 @@ export interface components {
              */
             windows_revoked: number;
         };
+        /** @description One open wait of a plugin gate. */
+        PendingGateDto: {
+            /**
+             * @description The wait's Attempt: a release names it, and an answer to another wait
+             *     is dropped.
+             */
+            attempt: string;
+            /**
+             * Format: int64
+             * @description When the wait expires and fails (Unix ms).
+             */
+            expires_at?: number | null;
+            /** @description The gate's name in the plugin's manifest. */
+            gate: string;
+            /** @description The gate's inputs, rendered when it was reached. */
+            inputs: Record<string, never>;
+            run: string;
+            /** @description The gate's step id in the Run. */
+            step: string;
+            /**
+             * Format: int64
+             * @description When the wait began (Unix ms).
+             */
+            waiting_since: number;
+        };
+        /** @description A page of open waits. */
+        PendingGatesPage: {
+            gates: components["schemas"]["PendingGateDto"][];
+            /** @description Pass as `after` for the next page; absent on the last. */
+            next?: string | null;
+        };
         /**
          * @description `GET /v1/repos/{org}/{repo}/pipelines?ref=` body: the manually-dispatchable
          *     catalog at a ref (ADR-0043 §4). Lightweight — each entry is an `on:`-only
@@ -3054,8 +3347,8 @@ export interface components {
          */
         PipelineCatalogResponse: {
             /**
-             * @description Every `.scarab/*.{yaml,yml}` at the commit (excluding `.scarab/lib/**`),
-             *     path-sorted.
+             * @description Every `.scarab/*.{yaml,yml}` at the commit (excluding `.scarab/lib/**`
+             *     and files marked `kind: library`), path-sorted.
              */
             pipelines: components["schemas"]["CatalogEntry"][];
             /**
@@ -3135,7 +3428,7 @@ export interface components {
          * @description One entry of the closed PluginCapability vocabulary (ADR-0072 §2).
          * @enum {string}
          */
-        PluginCapabilityDto: "report_deployments" | "subscribe_events" | "offer_actions" | "use_connection" | "contribute_ui" | "approve_gates";
+        PluginCapabilityDto: "report_deployments" | "subscribe_events" | "offer_actions" | "use_connection" | "contribute_ui" | "approve_gates" | "resolve_gates";
         /** @description A plugin this Scarab can install. */
         PluginCatalogEntryDto: {
             description: string;
@@ -3188,6 +3481,20 @@ export interface components {
             updated_at?: number | null;
             updated_by?: string | null;
         };
+        /** @description A plugin's answer on `POST /v1/runs/{id}/gates/{step}/release`. */
+        PluginGateRelease: {
+            /** @description The wait being answered, as the pending-gates query listed it. */
+            attempt: string;
+            /** @description A release's outputs: exactly what the gate declares, each of its type. */
+            outputs?: Record<string, never>;
+            /**
+             * @description `true` releases the gate with `outputs`; `false` fails it with
+             *     `reason`.
+             */
+            passed: boolean;
+            /** @description Why the gate failed: 1 to 1024 bytes, required with `passed: false`. */
+            reason?: string | null;
+        };
         /** @description A PluginInstallation (ADR-0072 §10). */
         PluginInstallationDto: {
             /**
@@ -3235,6 +3542,11 @@ export interface components {
             capabilities: components["schemas"]["PluginCapabilityDto"][];
             config_keys: string[];
             connections: components["schemas"]["ConnectionSlotDto"][];
+            /**
+             * @description The gates the plugin resolves (ADR-0076 §7), by name; empty without
+             *     `resolve_gates`.
+             */
+            gates: components["schemas"]["GateDefinitionDto"][];
             plugin: string;
         };
         /**
@@ -3339,8 +3651,8 @@ export interface components {
          */
         PolicyTestPipeline: {
             /**
-             * @description Every library the Pipeline invokes, transitively: repository path
-             *     (`.scarab/lib/deploy.yaml`) to source.
+             * @description Every `file:` library the Pipeline invokes, transitively: repository
+             *     path (`.scarab/lib/deploy.yaml`) to source.
              */
             libs?: {
                 [key: string]: string;
@@ -3683,6 +3995,19 @@ export interface components {
              *     see the handler's note on why re-sync never unbinds.
              */
             confirmed: number;
+        };
+        RetryDefaultsRequest: {
+            /** @description A ForgeConnection to read the mirror through. */
+            connection?: string | null;
+            /** @description Uploaded copies: `<publisher>/<name>` → the file's content. */
+            files?: {
+                [key: string]: string;
+            };
+            /**
+             * @description A mirror of Scarab's repository, `<host>/<owner>/<repo>`; each
+             *     library is read from the same path and commit there.
+             */
+            mirror?: string | null;
         };
         RuleReadsDto: {
             /** @description The rule's index in `rules`; 0 for a typed setting. */
@@ -4258,9 +4583,35 @@ export interface components {
             /** @description `executed` (the operation answered 2xx) or `failed`. */
             state: string;
         };
+        TrustSourceRequest: {
+            /**
+             * @description `<host>/<owner>/<repo>//<path>`; an `@<commit>` is dropped, since
+             *     trust is for every version from the source.
+             */
+            source: string;
+        };
+        /**
+         * @description A library source the org trusts with long-lived forge credentials
+         *     (ADR-0076 §9). Trust holds across upgrades from the same source.
+         */
+        TrustedSourceDto: {
+            /** @description `<host>/<owner>/<repo>//<path>`, without a commit. */
+            source: string;
+            /** Format: int64 */
+            trusted_at: number;
+            trusted_by: string;
+        };
         /** @description What an uninstall removed. */
         UninstalledPluginDto: {
             name: string;
+        };
+        /** @description A newer first-party version than the one installed. */
+        UpdateNoticeDto: {
+            content_hash: string;
+            release: string;
+            /** @description A version between the installed one and this one is a security fix. */
+            security_fix: boolean;
+            source: string;
         };
         /** @description `PUT …/policies/{id}`: the whole Policy, replaced. */
         UpdatePolicyRequest: {
@@ -4329,6 +4680,11 @@ export interface components {
             entries: components["schemas"]["WorkspaceEntryDto"][];
             /** @description The path listed (empty string = snapshot root). */
             path: string;
+        };
+        YankLibraryRequest: {
+            content_hash: string;
+            /** @description Shown in every refusal. */
+            reason: string;
         };
     };
     responses: never;
@@ -6299,6 +6655,505 @@ export interface operations {
             };
             /** @description the governed state changed between this request's read and its write (reload and retry), or the request conflicts with the current state */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_pending_gates: {
+        parameters: {
+            query?: {
+                /** @description Must be `true`: only open waits are listed. */
+                pending?: boolean;
+                /** @description Must be `me`: the waits whose releaser is the calling plugin. */
+                releaser?: string;
+                /** @description The `next` cursor of the previous page. */
+                after?: string;
+                /** @description At most this many waits (default 50, at most 200). */
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description a page of open waits naming the calling plugin */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PendingGatesPage"];
+                };
+            };
+            /** @description `pending` is not `true`, `releaser` is not `me`, or a bad cursor */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no plugin `scarab-api` token, or one that proves nothing */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description the installation is killed, or was not approved to resolve gates */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description another org */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_libraries: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrgLibrariesDto"];
+                };
+            };
+            /** @description no read access to the org */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description libraries not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    fetch_library: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FetchLibraryRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FetchedLibraryDto"];
+                };
+            };
+            /** @description a bad source or name, a fetch that failed, or a file that does not compile as a closed library */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an org admin, a host Scarab does not fetch from, or a private repository outside the org */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description libraries not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    install_library: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description publisher */
+                publisher: string;
+                /** @description library name */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InstallLibraryRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LibraryInstallationDto"];
+                };
+            };
+            /** @description a bad name or hash, a version not fetched into this org, or one that no longer compiles here */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an org admin, or no step-up — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
+            /** @description libraries not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description `replaces` is not what is installed now */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    remove_library: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description publisher */
+                publisher: string;
+                /** @description library name */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description removed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not installed, or libraries not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    retry_library_defaults: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RetryDefaultsRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LibraryDefaultsDto"];
+                };
+            };
+            /** @description a bad mirror, or an uploaded file for no first-party library */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an org admin, or no step-up — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
+            /** @description libraries not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    trust_library_source: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TrustSourceRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrustedSourceDto"];
+                };
+            };
+            /** @description not a library source */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an org admin, or no step-up — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
+            /** @description libraries not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    untrust_library_source: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description The trusted source, `<host>/<owner>/<repo>//<path>`. */
+                source: string | null;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description no longer trusted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no `source`, or not a library source */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not trusted, or libraries not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    yank_library: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["YankLibraryRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LibraryYankDto"];
+                };
+            };
+            /** @description a bad hash, an empty or long reason, or a version this org never fetched */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description libraries not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    unyank_library: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description content hash */
+                hash: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LibraryYankDto"];
+                };
+            };
+            /** @description not an org admin, or no step-up — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
+            /** @description not yanked, or libraries not configured */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -8610,7 +9465,7 @@ export interface operations {
             };
             cookie?: never;
         };
-        /** @description optional: `{"passed": false, "reason": "…"}` fails the gate instead of releasing it */
+        /** @description external gate (`x-scarab-gate-token`): optional, `{"passed": false, "reason": "…"}` fails the gate instead of releasing it. Plugin gate (a plugin's `scarab-api` bearer token, ADR-0076 §7): a `PluginGateRelease`, `{"attempt", "passed": true, "outputs": {…}}` or `{"attempt", "passed": false, "reason": "…"}` */
         requestBody?: {
             content: {
                 "application/json": null | components["schemas"]["ExternalGateVerdict"];
@@ -8926,6 +9781,13 @@ export interface operations {
             };
             /** @description no such run/step, no step spec, or debug-pod disabled */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description the step was inlined from a library version yanked in the run's org */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

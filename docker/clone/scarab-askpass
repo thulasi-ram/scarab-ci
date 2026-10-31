@@ -1,8 +1,9 @@
 #!/bin/sh
-# GIT_ASKPASS helper (ADR-0045 token delivery): git invokes this with a prompt
-# string; we answer Username/Password from env + the tmpfs token file under
-# /scarab/secrets/. The token therefore never appears in a URL, in argv, or in
-# .git/config — the remote URL stays credential-free by construction.
+# GIT_ASKPASS helper (ADR-0045 token delivery, ADR-0076 §9 `forge_token`):
+# git invokes this with a prompt string; we answer Username/Password from the
+# tmpfs files under /scarab/secrets/ that `forge_token` mounts. The token
+# therefore never appears in a URL, in argv, or in .git/config — the remote
+# URL stays credential-free by construction.
 #
 # SCOPED TO ONE REPOSITORY: the token answers only when the prompt names the
 # clone URL's own repository over https: same host, same path (a `.git`
@@ -70,6 +71,8 @@ case "$path" in
 esac
 
 case "$what" in
-  Username) printf '%s' "${SCARAB_CLONE_USERNAME:-x-access-token}" ;;
-  Password) cat "${SCARAB_CLONE_TOKEN_FILE:-/scarab/secrets/clone-token}" ;;
+  Username)
+    user_file="${SCARAB_CLONE_USERNAME_FILE:-/scarab/secrets/forge-username}"
+    if [ -s "$user_file" ]; then cat "$user_file"; else printf '%s' "${SCARAB_CLONE_USERNAME:-x-access-token}"; fi ;;
+  Password) cat "${SCARAB_CLONE_TOKEN_FILE:-/scarab/secrets/forge-token}" ;;
 esac

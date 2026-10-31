@@ -18,14 +18,16 @@
 //! Everything below is a compiling skeleton — method bodies are stubs.
 
 pub mod ports;
+pub mod render;
 pub mod scheduler;
 
 pub use ports::{Clock, Db, Executor, LogChunks, SnapshotRetention, WorkspaceSnapshots};
 pub use scheduler::{
     cancel_run_request, fail_run_creation, gate_approvers, pin_run_snapshots, plan_rerun,
-    record_gate_approval, reject_gate, release_gate, rerun_step, rerun_step_widened, retry_step,
-    retry_step_widened, run_status_post_key, unpin_run_snapshots, wait_began_at, AttemptTeardown,
-    ExpiredInput, PlanReason, PlannedStep, RerunError, RerunPlan, Scheduler, SchedulerError,
+    record_gate_approval, reject_gate, release_gate, releases_plugin_gate, resolve_plugin_gate,
+    rerun_step, rerun_step_widened, retry_step, retry_step_widened, run_status_post_key,
+    unpin_run_snapshots, wait_began_at, AttemptTeardown, ExpiredInput, PlanReason, PlannedStep,
+    PluginGateError, PluginGateVerdict, RerunError, RerunPlan, Scheduler, SchedulerError,
     Supervision, TeardownAttempt, TickHealth, CANCEL_ATTEMPT, CANCEL_RUN, LAUNCH_STEP,
     MAX_DELIVERY_ATTEMPTS, RUN_STATUS_CHANGED, SUPERSEDE_TEARDOWN,
 };
@@ -432,6 +434,44 @@ pub struct GateResolution {
     pub legacy_started_at: Timestamp,
     /// When the verdict lands — the `at` of every event it journals.
     pub at: Timestamp,
+    /// On a pass, the gate's outputs (ADR-0076 §7: a plugin gate's release),
+    /// already checked against what the gate declares. Stored as the closed
+    /// Attempt's results and the step's, in the same transaction, so a
+    /// dependent reads them as `${{ outputs.<gate>.<name> }}`. `None` for
+    /// every other resolution.
+    pub outputs: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+}
+
+/// One open wait of a plugin gate (ADR-0076 §7), as the pending-gates query
+/// lists it: the gate, its wait's Attempt (the fence a release names), when
+/// the wait began, and the inputs rendered when the gate was reached.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingGateWait {
+    pub run: RunId,
+    pub step: StepId,
+    pub attempt: AttemptId,
+    pub started_at: Timestamp,
+    pub inputs: serde_json::Value,
+}
+
+impl PendingGateWait {
+    /// Where the next page of the query starts: after this wait.
+    pub fn key(&self) -> PendingGateKey {
+        PendingGateKey {
+            run: self.run.0.clone(),
+            step: self.step.0.clone(),
+            attempt: self.attempt.0.clone(),
+        }
+    }
+}
+
+/// The order of the pending-gates query, and its cursor: waits are listed by
+/// (run id, step id, attempt id).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct PendingGateKey {
+    pub run: String,
+    pub step: String,
+    pub attempt: String,
 }
 
 impl GateResolution {
@@ -631,11 +671,12 @@ pub struct StepSpec {
     /// cache for the attempt, never fails it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<CacheConfig>,
-    /// Set when this is a **clone** step (ADR-0045): the engine runs the
-    /// canonical scarab-clone image with this context instead of an authored
-    /// image/command.
+    /// The forge credential this Step receives (ADR-0076 §9), as Run
+    /// creation decided it: the access (a fork pull request's is always
+    /// `read`) and the repository. The credential itself is minted when each
+    /// Attempt launches and never stored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub clone: Option<CloneConfig>,
+    pub forge_token: Option<ForgeTokenConfig>,
     /// Set when this is a **build** step (ADR-0018): the engine runs rootless
     /// BuildKit with this context instead of an authored image/command.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -688,6 +729,15 @@ pub struct StepSpec {
     /// (absent in older stored specs → empty).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub matrix_values: std::collections::BTreeMap<String, String>,
+    /// What this Step's `${{ … }}` templates read (ADR-0076): set by the
+    /// compiler on a Step inlined from a library, whose `inputs` are its
+    /// invocation's bound inputs and whose `outputs` a view of the library's
+    /// own Steps. `None` (every Step written in the Pipeline file, and every
+    /// spec stored before scopes existed) renders as it always has: `inputs`
+    /// are the Run's launch parameters, `outputs` the results of its direct
+    /// needs, `matrix` its [`matrix_values`](Self::matrix_values).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<scarab_pipeline::Scope>,
 }
 
 /// The launch context of a step's keyed directory Cache (ADR-0065 s1).
@@ -843,46 +893,58 @@ pub struct RegistryCredential {
     pub token: String,
 }
 
-/// The launch context of a clone step (ADR-0045), resolved from the run's
-/// trigger at creation (owner/name/sha/read_only + the authored knobs) and
-/// enriched at launch (URL from the ForgeConnection registry; the short-TTL
-/// checkout credential — in-memory only, never persisted).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CloneConfig {
-    /// The forge coordinate, pinned at run creation.
+/// A Step's forge credential (ADR-0076 §9): what Run creation decided, and
+/// the credential minted for one Attempt's launch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForgeTokenConfig {
+    /// `read` or `write`, fixed at Run creation. A fork pull request's is
+    /// always `read`.
+    pub access: scarab_pipeline::ForgeToken,
+    /// The Run's repository, the only one the credential is for.
     pub owner: String,
     pub name: String,
-    /// The commit the run is pinned to (resolved ONCE at trigger time,
-    /// ADR-0043/0044) — clone always fetches THIS, never re-resolves.
-    pub sha: String,
-    /// `depth: full` (complete history) vs the shallow default.
-    #[serde(default)]
-    pub depth_full: bool,
-    #[serde(default)]
-    pub submodules: bool,
-    #[serde(default)]
-    pub lfs: bool,
-    /// Fork-PR runs get a READ-ONLY credential (ADR-0045 trust model), fixed
-    /// immutably at run creation from the trigger.
+    /// The Run is a fork pull request, or is locked out of its
+    /// Environment's secrets: every launch gets `read`, whatever `access`
+    /// says.
     #[serde(default)]
     pub read_only: bool,
-    /// The credential-free clone URL — filled at LAUNCH by the composition
-    /// root (from the repo's ForgeConnection); empty in the stored spec.
-    #[serde(default)]
-    pub url: String,
-    /// The short-TTL checkout credential — filled at LAUNCH, **never
-    /// serialized** (in-memory enrichment only; delivery to the Pod is via a
-    /// tmpfs file, never env/URL/argv — ADR-0045 §Token delivery).
+    /// The content hash of the library version this Step was written in,
+    /// set when Run creation let the Step hold a long-lived token because
+    /// the org trusts that library. Each launch on a connection that does
+    /// not mint short-lived tokens checks the org still trusts it. `None`:
+    /// the Step may hold only a short-lived token, and a launch on a
+    /// long-lived connection fails.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted_library: Option<String>,
+    /// The credential minted for this launch — filled at LAUNCH, **never
+    /// serialized**. The executor mounts it as the files
+    /// `/scarab/secrets/forge-token` and `/scarab/secrets/forge-username`,
+    /// never as an environment variable.
     #[serde(skip)]
-    pub credential: Option<CloneCredential>,
+    pub credential: Option<ForgeCredential>,
 }
 
-/// The in-memory half of a minted checkout credential (mirrors the forge
+/// The in-memory half of a minted forge credential (mirrors the forge
 /// port's type without a crate dependency; the engine stays forge-free).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CloneCredential {
+pub struct ForgeCredential {
     pub username: String,
     pub token: String,
+    /// The forge minted it for this launch and it can be revoked (a GitHub
+    /// App installation token). `false`: the connection's long-lived token,
+    /// which is never revoked.
+    pub minted: bool,
+}
+
+/// The forge credential an execution's unit held, read back from the
+/// backend by [`Executor::take_forge_credential`] so that whichever control
+/// plane sees the Attempt end can revoke it (ADR-0076 §9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountedForgeCredential {
+    /// The repository the credential is for.
+    pub owner: String,
+    pub name: String,
+    pub credential: ForgeCredential,
 }
 
 /// One artifact of record (ADR-0052): an output a step published to

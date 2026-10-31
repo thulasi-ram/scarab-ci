@@ -67,7 +67,7 @@ export function approvableGates<T extends GateLike>(steps: readonly T[]): T[] {
 // line the DAG node and the step pane both show.
 
 /** The kinds a human can REJECT (fail with a reason): every gate kind. */
-const REJECTABLE_KINDS: ReadonlySet<string> = new Set(["manual", "timer", "external"]);
+const REJECTABLE_KINDS: ReadonlySet<string> = new Set(["manual", "timer", "external", "plugin"]);
 
 /** A gate verdict as the server journals it (`GateResolutionDto`). */
 export type GateResolutionLike = {
@@ -169,6 +169,8 @@ export function gateWaitHint(s: GateStatusLike, statusOf: (step: string) => stri
       return "waiting for its timer";
     case "external":
       return "waiting for an external release";
+    case "plugin":
+      return "waiting for its plugin";
     default:
       return "waiting for a decision";
   }

@@ -148,6 +148,30 @@ separate step is needed:
 
 Mark that step `deploy: true`.
 
+## Waiting with the Argo CD plugin
+
+With the first-party Argo CD plugin installed in your org (for example as `argocd-prod`, with its
+`argocd` connection bound to your Argo CD), a pipeline can wait on the plugin's `wait-live` gate
+instead of a wait step. No Pod waits and the pipeline holds no Argo token: the plugin reads the
+Application through Scarab's credential broker.
+
+```yaml
+  - id: live
+    needs: [bump]
+    invoke: plugin:argocd-prod/wait-live
+    with:
+      app: payments-api
+      image: ${{ outputs.bump.image }}
+    gate_expires_after: 1800
+```
+
+The plugin passes the gate when Argo CD reports the Application synced and healthy, with no
+operation running, and its target manifests render `image`. It fails the gate with Argo's message
+when Argo gives up: a failed sync of the current revision, a failed hook, or a rollout past its
+progress deadline. It fails the gate at once when `app` is `.` or `..` or holds a `/`, which no
+Application name does. The gate's output `revision` is the git revision Argo synced. The run fails when
+the gate expires. See [Plugin gates](/scarab-ci/usage/pipeline-syntax/#plugin-gates).
+
 ## What this doesn't cover
 
 - **The wait costs a Pod and a secret.** The wait step holds a Pod for as long as it waits, and

@@ -1,0 +1,14 @@
+{{- if .Values.scarab.libsManifest -}}
+{{- /* The first-party library release manifest (ADR-0076 §5): which library
+       versions are first-party, and where each is fetched from. The server
+       reads it at SCARAB_LIBS_MANIFEST instead of its release asset. */ -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "scarab.libsManifestConfigMapName" . }}
+  labels:
+    {{- include "scarab.labels" . | nindent 4 }}
+data:
+  libs-manifest.json: |
+    {{- .Values.scarab.libsManifest | nindent 4 }}
+{{- end }}

@@ -374,14 +374,42 @@ fn unique_run(prefix: &str) -> String {
 /// clone (this one) may be private, in which case an anonymous clone is
 /// SourceUnavailable by design. Set SCARAB_TEST_CLONE_TOKEN (CI: the ambient
 /// GITHUB_TOKEN; locally: `gh auth token`) to authenticate; delivery still
-/// goes through the tmpfs + GIT_ASKPASS path (ADR-0045), never the URL.
-fn clone_credential() -> Option<scarab_engine::CloneCredential> {
+/// goes through the tmpfs + GIT_ASKPASS path (ADR-0076 §9), never the URL.
+fn clone_credential() -> Option<scarab_engine::ForgeCredential> {
     std::env::var("SCARAB_TEST_CLONE_TOKEN")
         .ok()
-        .map(|token| scarab_engine::CloneCredential {
+        .map(|token| scarab_engine::ForgeCredential {
             username: "x-access-token".into(),
             token,
+            minted: false,
         })
+}
+
+/// What `lib:thulasi-ram/clone` renders for its `git` Step (ADR-0076 §9):
+/// the clone image, the clone's env, and a forge credential.
+fn clone_env(sha: &str, depth: &str) -> Vec<(String, String)> {
+    [
+        ("SCARAB_CLONE_URL", "https://github.com/thulasi-ram/scarab-ci.git"),
+        ("SCARAB_CLONE_SHA", sha),
+        ("SCARAB_CLONE_DEPTH", depth),
+        ("SCARAB_CLONE_SUBMODULES", "false"),
+        ("SCARAB_CLONE_LFS", "false"),
+        ("SCARAB_CLONE_TOKEN_FILE", "/scarab/secrets/forge-token"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect()
+}
+
+fn clone_forge_token() -> Option<scarab_engine::ForgeTokenConfig> {
+    Some(scarab_engine::ForgeTokenConfig {
+        access: scarab_pipeline::ForgeToken::Read,
+        owner: "thulasi-ram".into(),
+        name: "scarab-ci".into(),
+        read_only: false,
+        trusted_library: None,
+        credential: clone_credential(),
+    })
 }
 
 /// A one-step StepRun under a UNIQUE run id (see [`unique_run`]): the fence
@@ -427,7 +455,7 @@ async fn busybox_runs_to_completion_and_relaunch_reattaches() {
         workspace_inputs: vec![],
         workspace_outputs: vec![],
         cache: None,
-        clone: None,
+        forge_token: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],
@@ -437,6 +465,7 @@ async fn busybox_runs_to_completion_and_relaunch_reattaches() {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     };
 
     // launch, then launch again — the second call must re-attach, not relaunch.
@@ -494,7 +523,7 @@ async fn sleeping_step_is_killed_at_its_deadline() {
         workspace_inputs: vec![],
         workspace_outputs: vec![],
         cache: None,
-        clone: None,
+        forge_token: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],
@@ -504,6 +533,7 @@ async fn sleeping_step_is_killed_at_its_deadline() {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     };
 
     let h = exec.launch(&step, &spec).await.expect("launch");
@@ -548,7 +578,7 @@ async fn log_stream_tails_pod_stdout() {
         workspace_inputs: vec![],
         workspace_outputs: vec![],
         cache: None,
-        clone: None,
+        forge_token: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],
@@ -558,6 +588,7 @@ async fn log_stream_tails_pod_stdout() {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     };
 
     let h = exec.launch(&step, &spec).await.expect("launch");
@@ -631,7 +662,7 @@ async fn workspace_flows_from_a_to_b_through_the_cas() {
         workspace_inputs: inputs,
         workspace_outputs: vec![],
         cache: None,
-        clone: None,
+        forge_token: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],
@@ -641,6 +672,7 @@ async fn workspace_flows_from_a_to_b_through_the_cas() {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     };
     async fn settle(exec: &K8sExecutor, h: &ExecHandle) -> ExecState {
         poll_to_terminal(exec, h, 90)
@@ -843,7 +875,7 @@ async fn a_green_attempt_is_backed_by_a_durable_snapshot_at_the_instant_it_goes_
         workspace_inputs: vec![],
         workspace_outputs: vec![],
         cache: None,
-        clone: None,
+        forge_token: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],
@@ -853,6 +885,7 @@ async fn a_green_attempt_is_backed_by_a_durable_snapshot_at_the_instant_it_goes_
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     };
 
     let h = exec.launch(&step, &spec).await.expect("launch");
@@ -1021,7 +1054,7 @@ async fn a_missing_input_snapshot_fails_the_attempt_instead_of_hanging() {
         workspace_inputs: vec!["f".repeat(64)],
         workspace_outputs: vec![],
         cache: None,
-        clone: None,
+        forge_token: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],
@@ -1031,6 +1064,7 @@ async fn a_missing_input_snapshot_fails_the_attempt_instead_of_hanging() {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     };
 
     let h = exec.launch(&step, &spec).await.expect("launch");
@@ -1109,7 +1143,7 @@ async fn a_step_with_inputs_is_refused_when_no_workspace_service_is_configured()
         workspace_inputs: vec!["a".repeat(64)],
         workspace_outputs: vec![],
         cache: None,
-        clone: None,
+        forge_token: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],
@@ -1119,6 +1153,7 @@ async fn a_step_with_inputs_is_refused_when_no_workspace_service_is_configured()
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     };
     let pods: kube::Api<k8s_openapi::api::core::v1::Pod> = kube::Api::namespaced(
         kube_client().await,
@@ -1217,7 +1252,7 @@ async fn declared_outputs_publish_only_those_paths_through_the_cas() {
         workspace_inputs: inputs,
         workspace_outputs: outputs,
         cache: None,
-        clone: None,
+        forge_token: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],
@@ -1227,6 +1262,7 @@ async fn declared_outputs_publish_only_those_paths_through_the_cas() {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     };
 
     // Producer writes a publishable dir AND junk; it declares only `dist`.
@@ -1335,8 +1371,7 @@ async fn clone_step_produces_a_source_workspace() {
     let exec = K8sExecutor::with_client(ns, client)
         .with_workspace_cas(cas.clone())
         .with_workspace_depot(ws.depot.clone())
-        .with_workspace_service(ws.fetch.clone())
-        .with_clone_image(&clone_image);
+        .with_workspace_service(ws.fetch.clone());
 
     let step = StepRun {
         run: RunId(run_id.clone()),
@@ -1353,9 +1388,9 @@ async fn clone_step_produces_a_source_workspace() {
         gate_kind: None,
     };
     let spec = StepSpec {
-        image: String::new(),
+        image: clone_image.clone(),
         command: vec![],
-        env: vec![],
+        env: clone_env(sha.as_str(), "1"),
         secrets: vec![],
         run_as_root: false, // scarab-clone is non-root by construction
         add_capabilities: vec![],
@@ -1364,14 +1399,7 @@ async fn clone_step_produces_a_source_workspace() {
         workspace_inputs: vec![],
         workspace_outputs: vec![],
         cache: None,
-        clone: Some(scarab_engine::CloneConfig {
-            owner: "thulasi-ram".into(),
-            name: "scarab-ci".into(),
-            sha: sha.clone(),
-            url: "https://github.com/thulasi-ram/scarab-ci.git".into(),
-            credential: clone_credential(),
-            ..Default::default()
-        }),
+        forge_token: clone_forge_token(),
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],
@@ -1381,6 +1409,7 @@ async fn clone_step_produces_a_source_workspace() {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     };
 
     let h = exec.launch(&step, &spec).await.expect("launch clone");
@@ -1460,7 +1489,7 @@ async fn clone_step_produces_a_source_workspace() {
         workspace_inputs: vec![root.clone()],
         workspace_outputs: vec![],
         cache: None,
-        clone: None,
+        forge_token: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],
@@ -1470,6 +1499,7 @@ async fn clone_step_produces_a_source_workspace() {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     };
     let bh = exec
         .launch(&build, &build_spec)
@@ -1504,8 +1534,7 @@ async fn clone_depth_full_exposes_history() {
     let exec = K8sExecutor::with_client(ns, client)
         .with_workspace_cas(ws.cas.clone())
         .with_workspace_depot(ws.depot.clone())
-        .with_workspace_service(ws.fetch.clone())
-        .with_clone_image(&clone_image);
+        .with_workspace_service(ws.fetch.clone());
 
     let step = StepRun {
         run: RunId(run_id.clone()),
@@ -1522,9 +1551,9 @@ async fn clone_depth_full_exposes_history() {
         gate_kind: None,
     };
     let spec = StepSpec {
-        image: String::new(),
+        image: clone_image.clone(),
         command: vec![],
-        env: vec![],
+        env: clone_env(sha.as_str(), "full"),
         secrets: vec![],
         run_as_root: false,
         add_capabilities: vec![],
@@ -1533,15 +1562,7 @@ async fn clone_depth_full_exposes_history() {
         workspace_inputs: vec![],
         workspace_outputs: vec![],
         cache: None,
-        clone: Some(scarab_engine::CloneConfig {
-            owner: "thulasi-ram".into(),
-            name: "scarab-ci".into(),
-            sha: sha.clone(),
-            depth_full: true,
-            url: "https://github.com/thulasi-ram/scarab-ci.git".into(),
-            credential: clone_credential(),
-            ..Default::default()
-        }),
+        forge_token: clone_forge_token(),
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],
@@ -1551,6 +1572,7 @@ async fn clone_depth_full_exposes_history() {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     };
     let h = exec.launch(&step, &spec).await.expect("launch full clone");
     let terminal = poll_to_terminal(&exec, &h, 180).await;
@@ -1594,7 +1616,7 @@ async fn clone_depth_full_exposes_history() {
         workspace_inputs: vec![root],
         workspace_outputs: vec![],
         cache: None,
-        clone: None,
+        forge_token: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],
@@ -1604,6 +1626,7 @@ async fn clone_depth_full_exposes_history() {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     };
     let ch = exec
         .launch(&count, &count_spec)
@@ -1637,8 +1660,7 @@ async fn clone_vanished_sha_fails_fast_with_source_unavailable() {
     let exec = K8sExecutor::with_client(ns, client)
         .with_workspace_cas(ws.cas.clone())
         .with_workspace_depot(ws.depot.clone())
-        .with_workspace_service(ws.fetch.clone())
-        .with_clone_image(&clone_image);
+        .with_workspace_service(ws.fetch.clone());
 
     let step = StepRun {
         run: RunId(unique_run("run-clone-gone")),
@@ -1655,9 +1677,9 @@ async fn clone_vanished_sha_fails_fast_with_source_unavailable() {
         gate_kind: None,
     };
     let spec = StepSpec {
-        image: String::new(),
+        image: clone_image.clone(),
         command: vec![],
-        env: vec![],
+        env: clone_env("0000000000000000000000000000000000000001", "1"),
         secrets: vec![],
         run_as_root: false,
         add_capabilities: vec![],
@@ -1666,18 +1688,7 @@ async fn clone_vanished_sha_fails_fast_with_source_unavailable() {
         workspace_inputs: vec![],
         workspace_outputs: vec![],
         cache: None,
-        clone: Some(scarab_engine::CloneConfig {
-            owner: "thulasi-ram".into(),
-            name: "scarab-ci".into(),
-            // A well-formed SHA that exists on no forge: the rewritten-history
-            // case. The fetch fails, the guard exits 86 — SourceUnavailable.
-            sha: "0000000000000000000000000000000000000001".into(),
-            url: "https://github.com/thulasi-ram/scarab-ci.git".into(),
-            // Authenticated so the 86 is genuinely the vanished SHA, not a
-            // repo-access rejection (the repo may be private).
-            credential: clone_credential(),
-            ..Default::default()
-        }),
+        forge_token: clone_forge_token(),
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],
@@ -1687,6 +1698,7 @@ async fn clone_vanished_sha_fails_fast_with_source_unavailable() {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     };
 
     let started = std::time::Instant::now();
@@ -1780,7 +1792,7 @@ async fn build_step_builds_and_pushes_to_a_local_registry() {
         workspace_inputs: vec![root],
         workspace_outputs: vec![],
         cache: None,
-        clone: None,
+        forge_token: None,
         build: Some(scarab_engine::BuildConfig {
             context: ".".into(),
             dockerfile: "Dockerfile".into(),
@@ -1797,6 +1809,7 @@ async fn build_step_builds_and_pushes_to_a_local_registry() {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     };
     let h = exec.launch(&step, &spec).await.expect("launch build");
     let terminal = poll_to_terminal(&exec, &h, 300).await;
@@ -1838,7 +1851,7 @@ async fn build_step_builds_and_pushes_to_a_local_registry() {
         workspace_inputs: vec![],
         workspace_outputs: vec![],
         cache: None,
-        clone: None,
+        forge_token: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],
@@ -1848,6 +1861,7 @@ async fn build_step_builds_and_pushes_to_a_local_registry() {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     };
     let vh = exec
         .launch(&verify, &verify_spec)
@@ -1947,7 +1961,7 @@ async fn results_sidecar_captures_a_named_result_end_to_end() {
         workspace_inputs: vec![],
         workspace_outputs: vec![],
         cache: None,
-        clone: None,
+        forge_token: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],
@@ -1957,6 +1971,7 @@ async fn results_sidecar_captures_a_named_result_end_to_end() {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     };
     let h = exec.launch(&step, &spec).await.expect("launch");
     let terminal = poll_to_terminal(&exec, &h, 120).await;
@@ -2132,7 +2147,7 @@ async fn cancel_tears_down_a_running_pod() {
         workspace_inputs: vec![],
         workspace_outputs: vec![],
         cache: None,
-        clone: None,
+        forge_token: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],
@@ -2142,6 +2157,7 @@ async fn cancel_tears_down_a_running_pod() {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     };
     let h = exec.launch(&step, &spec).await.expect("launch");
     // Wait until it is actually Running (the interesting teardown case).
@@ -2229,7 +2245,7 @@ async fn artifacts_are_harvested_post_step() {
         workspace_inputs: vec![],
         workspace_outputs: vec![],
         cache: None,
-        clone: None,
+        forge_token: None,
         build: None,
         artifacts: vec!["dist/*".into()], // the .tmp is NOT published
         placement_profiles: vec![],
@@ -2239,6 +2255,7 @@ async fn artifacts_are_harvested_post_step() {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     };
     let h = exec.launch(&step, &spec).await.expect("launch");
     let terminal = poll_to_terminal(&exec, &h, 120).await;
@@ -2312,7 +2329,7 @@ async fn artifacts_are_harvested_from_a_failed_step() {
         workspace_inputs: vec![],
         workspace_outputs: vec![],
         cache: None,
-        clone: None,
+        forge_token: None,
         build: None,
         artifacts: vec!["dist/*".into()],
         placement_profiles: vec![],
@@ -2322,6 +2339,7 @@ async fn artifacts_are_harvested_from_a_failed_step() {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     };
     let h = exec.launch(&step, &spec).await.expect("launch");
     let terminal = poll_to_terminal(&exec, &h, 120).await;
@@ -2378,7 +2396,7 @@ fn busybox_spec(cmd: &str, run_as_root: bool) -> StepSpec {
         workspace_inputs: vec![],
         workspace_outputs: vec![],
         cache: None,
-        clone: None,
+        forge_token: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],
@@ -2388,6 +2406,7 @@ fn busybox_spec(cmd: &str, run_as_root: bool) -> StepSpec {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     }
 }
 
@@ -2666,7 +2685,7 @@ async fn fanin_collision_summary_survives_the_termination_log_as_uid_65532() {
         workspace_inputs: inputs,
         workspace_outputs: vec![],
         cache: None,
-        clone: None,
+        forge_token: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],
@@ -2676,6 +2695,7 @@ async fn fanin_collision_summary_survives_the_termination_log_as_uid_65532() {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     };
     async fn settle(exec: &K8sExecutor, h: &ExecHandle) -> ExecState {
         poll_to_terminal(exec, h, 90)

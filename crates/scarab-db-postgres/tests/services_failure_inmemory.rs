@@ -31,7 +31,7 @@ fn spec(uses: &[&str]) -> StepSpec {
         workspace_inputs: vec![],
         workspace_outputs: vec![],
         cache: None,
-        clone: None,
+        forge_token: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],
@@ -41,6 +41,7 @@ fn spec(uses: &[&str]) -> StepSpec {
         services: Vec::new(),
         uses: uses.iter().map(|s| s.to_string()).collect(),
         matrix_values: Default::default(),
+        scope: None,
     }
 }
 

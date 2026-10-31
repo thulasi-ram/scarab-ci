@@ -245,6 +245,8 @@ fn facts() -> RunCreateFacts {
         environment: None,
         principal: None,
         time: Timestamp::from_unix_millis(0).unwrap(),
+        params: Default::default(),
+        event: Default::default(),
     }
 }
 

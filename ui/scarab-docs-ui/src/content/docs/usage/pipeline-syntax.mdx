@@ -16,7 +16,7 @@ are triggered and wired together. Structurally a pipeline is a **flat recursive 
 
 You write YAML, with **CEL** for expressions. Scarab compiles it to a **typed IR**, and the IR
 (not the YAML) defines what a valid pipeline is.
-`invoke` reuses a library pipeline by inlining it into the caller's DAG at compile time.
+`invoke` reuses a library by inlining it into the caller's DAG at compile time.
 `matrix` is a modifier that fans a step out over a set of inputs.
 
 Compilation is **static**: the whole DAG (every matrix combination, every inlined library step) is
@@ -37,8 +37,8 @@ dropped.
 
 A repo's CI lives in `.scarab/`. A triggered pipeline is a YAML file such as `.scarab/ci.yaml`;
 its file name is the default display name (`ci.yaml` reads as `ci`, overridable with a top-level
-`name:`). Reusable **library** pipelines live under `.scarab/lib/` and are pulled in with
-[`invoke`](#reuse-invoke). Start from
+`name:`). Reusable **libraries** (files marked `kind: library`) live under `.scarab/lib/` by
+convention and are pulled in with [`invoke`](#reuse-invoke). Start from
 [Run locally](/scarab-ci/get-started/run-locally/) to submit your first pipeline.
 
 :::caution[Commit `.scarab/`, and never blanket-ignore it]
@@ -63,7 +63,7 @@ on:
 
 steps:
   - id: checkout
-    clone: {}
+    invoke: lib:thulasi-ram/clone
 
   - id: check
     image: rust:1-bookworm
@@ -136,8 +136,11 @@ steps:
   with a bad value (fail-closed).
 
 Resolved parameters are read in steps as `${{ inputs.<name> }}` and are also injected into the
-step environment as `SCARAB_PARAM_<NAME>`. A **reusable library** pipeline additionally declares the
-`outputs` it exposes to its caller (see [Reuse: `invoke`](#reuse-invoke)).
+step environment as `SCARAB_PARAM_<NAME>`. A `choice`, `boolean` or `number` parameter may be
+written into a `command`, as above; a `string` parameter reaches a step only through `env:` (see
+[Values in commands and scripts](#values-in-commands-and-scripts)). A **library** additionally declares the `outputs` it
+exposes to its caller, and inside a library `${{ inputs.<name> }}` reads the caller's `with:`, not
+the Run's launch parameters (see [Reuse: `invoke`](#reuse-invoke)).
 
 ## Steps: the step shape
 
@@ -178,30 +181,78 @@ the image digest.
 
 Some steps are **kinds** with no image that the engine runs on your behalf (you set no `image`/`command`):
 
-- **`clone: {}`**: source provisioning (see [The `clone` step](#the-clone-step)).
 - **`build: { image: ..., push: true }`**: a rootless BuildKit image build.
 - **`gate: manual`**: a durable approval/wait point (see [Environments & gates](#environments--gates)).
-- **`invoke: .scarab/lib/...`**: reuse at compile time (see [Reuse: `invoke`](#reuse-invoke)).
+- **`invoke: file:.scarab/lib/...`**: reuse at compile time (see [Reuse: `invoke`](#reuse-invoke)).
 
-### The `clone` step
+### Checking out the repository
 
-A built-in **`clone` step** fetches the source. It needs no configuration by design: the repo,
-ref, resolved SHA, and token all come from the run's trigger context, so `clone: {}` is the common
-case. Downstream steps inherit the cloned workspace through ordinary `needs`.
+The first-party clone library, `lib:thulasi-ram/clone`, checks out the Run's repository at the
+commit the Run is pinned to. Your org installs it like any other library
+([Libraries](/scarab-ci/usage/libraries/)); a new org gets it when its first repository is bound.
 
 ```yaml
 - id: checkout
-  clone: {}          # depth 1, current ref pinned to its SHA
+  invoke: lib:thulasi-ram/clone          # depth 1, the Run's commit
 
 - id: full
-  clone:
-    depth: full      # complete history (`1` is the shallow default)
-    submodules: true
-    lfs: true
+  invoke: lib:thulasi-ram/clone
+  with: { depth: full, submodules: true, lfs: true }
+  timeout: 1800                          # carried onto the library's step
 ```
 
-GitHub and Forgejo both have supported adapters, and the `clone` step is identical for
-either.
+`depth` is `"1"`, a number of commits, or `full`. The library's one step is `checkout/git`, and
+`needs: [checkout]` reaches it, so later steps inherit the checked-out workspace as usual. It works
+the same on GitHub and Forgejo.
+
+The `clone` step kind is gone. A `clone:` step fails the pipeline check with a message that names
+`invoke: lib:thulasi-ram/clone`.
+
+### Forge credentials: `forge_token`
+
+A step that needs to talk to the Run's repository asks for a forge credential:
+
+```yaml
+- id: tag
+  image: alpine/git@sha256:…
+  forge_token: write        # or read
+```
+
+Scarab mints the credential each time the step's attempt launches, a rerun or retry included, and
+mounts it as two files: `/scarab/secrets/forge-token` and `/scarab/secrets/forge-username`. It is
+never an environment variable. When the attempt ends, the Kubernetes Secret that holds it is
+deleted, even if the Pod is kept, and a token GitHub minted is revoked, by whichever Scarab server
+sees the end.
+
+Whether a step may have one is decided when the Run is created; a Run that asks for more is
+refused with the reason. Each launch checks again, from the connection and the org's trust as
+they are then: a step that may no longer have the token fails with the reason, and nothing is
+minted.
+
+- **On a GitHub App connection**, which mints a short-lived token for one repository, any step may
+  ask. **On a Forgejo or GitHub token connection**, which hands out one long-lived token, only a
+  step from a library your org trusts receives it: the first-party clone library, or a source an
+  org admin trusted ([Libraries](/scarab-ci/usage/libraries/#trusting-a-library-with-forge-credentials)).
+  A repository's own steps never read that token. Such a step also starts with an empty
+  workspace: no file another step wrote is present while the token is mounted.
+- **The forge connection** must be served over `https://`. A Run with a step that asks for
+  `forge_token` on a connection whose base URL is `http://` is refused: the token is never sent
+  over plain HTTP.
+- **A fork pull request** always gets `read`, whatever the step asks for.
+- **`write`** needs a GitHub App connection, and a Run governed by an environment that restricts
+  the refs it deploys from. Where that environment has approvers, put a `gate: manual` in the
+  step's `needs`.
+- **The `image` and `command`** of a step with `forge_token` are written out in full: a
+  `${{ … }}` in either is a compile error. An input, a result or an `event` value reaches the step
+  only through `env:`, and only under a name of the form `SCARAB_<NAME>` (upper-case letters,
+  digits and `_`) that Scarab does not set itself. Other names can make the value run as code:
+  git runs `GIT_SSH_COMMAND`, and the loader reads `LD_PRELOAD`. A literal value may use any name.
+- **A library input** that reaches a step with `forge_token` must be a `boolean`, a `number`, a
+  `choice`, or a `string` with a `validate:` rule.
+- A step with `forge_token` may not have a `cache`.
+- An invoke step's `placement_profiles` is never carried onto a step with `forge_token`.
+
+The local executor refuses a step with `forge_token`; it needs the Kubernetes executor.
 
 The clone uses the forge connection's token only for the repository being cloned, and
 only over https. Submodules are fetched without it, so a private submodule fails the
@@ -239,6 +290,11 @@ CEL predicates (evaluated against each combination's own coordinate) drops combi
 Each instance gets a deterministic id like `test[arch=amd64,os=linux]`, and a downstream
 `needs: [test]` fans in over every surviving instance.
 
+A matrix can have at most 65,536 combinations before `exclude`, and 256 `exclude` predicates. All
+the matrices of one pipeline, counting a library's matrix each time the library is inlined, can
+have at most 1,048,576 combinations, and at most 262,144 `exclude` checks (combinations times
+predicates).
+
 ## Conditions: `when`
 
 A `when:` CEL guard skips a step whose predicate is false; expressions read the run's context
@@ -266,43 +322,95 @@ step `build`: when cel error: `1+1+1+…`: expression is 5000 bytes; the limit i
 The CEL parser recurses once per nesting level and once per operator in a chain such as
 `a + b + c`, so these limits bound how much stack one expression can use on the server.
 
+### Size limits
+
+A pipeline or library file can be at most **1 MiB**, and the libraries one pipeline invokes can
+hold at most **16 MiB** in all, each counted once however often it is invoked. The compiled
+pipeline can be at most **16 MiB** of JSON: each step a library inlines stores the library's
+inputs, and each matrix leg stores a copy of its step, so a small file can compile to a large
+pipeline. A pipeline over any of these limits is rejected at submit time, and the error names the
+file or step and the limit. The server also stops a compile that takes longer than 10 seconds,
+and the trigger fails with that reason.
+
 ## Reuse: `invoke`
 
-`invoke` inlines a **library** pipeline (under `.scarab/lib/` by convention) into the caller's DAG
-at compile time; it is not a runtime call.
-It is local only, and will stay that way: repo-relative paths, read at the caller's ref; no `../` escape and no
-cross-repo references (cross-repo causation is `on: upstream`). The invoked steps are namespaced
-by the invoke step's id (`deploy/plan`, `deploy/url`), and `matrix` on an invoke step fans out the
-whole subgraph.
+`invoke` inlines a **library** into the caller's DAG at compile time; it is not a runtime call.
+The invoked steps are namespaced by the invoke step's id (`deploy/plan`, `deploy/url`), and
+`matrix` on an invoke step fans out the whole subgraph.
 
-A library declares its contract with `interface` (the `inputs` it requires and the `outputs` it
-exposes) and the caller supplies inputs with `with:`:
+The target always has a prefix that says where it comes from:
+
+| `invoke:` | Target |
+|---|---|
+| `file:<path>` | a library file in the repository, read at the caller's ref |
+| `lib:<publisher>/<name>` | a library installed in your org |
+| `plugin:<installation>/<gate>` | a gate a plugin installed in your org resolves ([Plugin gates](#plugin-gates)) |
+
+A `file:` path is repo-relative: no leading `/`, no `..`, and no remote or cross-repo forms
+(cross-repo causation is `on: upstream`). A bare path is a compile error that tells you to add
+`file:`, and `url:` is refused: Scarab does not invoke from a URL. A `lib:` target resolves to the
+version your org installed ([Libraries](/scarab-ci/usage/libraries/)); a name the org has not
+installed fails with "`lib:<publisher>/<name>` is not installed in this org".
+
+A library is a YAML file marked `kind: library`. It has no `on:` triggers and never runs on its
+own: Scarab does not trigger it or list it for dispatch, even directly under `.scarab/`. It
+declares its contract with `interface` (the `inputs` it takes and the `outputs` it exposes) and the
+caller supplies inputs with `with:`:
 
 ```yaml
 # .scarab/lib/deploy.yaml
+kind: library
 interface:
-  inputs:  [region, replicas]
+  inputs:
+    - { name: region, type: choice, options: [us-east-1, eu-west-1] }
+    - { name: replicas, type: number, required: false, default: 2 }
   outputs: [url]
 steps:
-  - { id: plan, image: tf, command: ["plan"] }
-  - { id: url,  image: tf, command: ["apply"], needs: [plan] }
+  - { id: plan, image: tf@sha256:…, command: ["plan", "${{ inputs.region }}"] }
+  - { id: url,  image: tf@sha256:…, command: ["apply"], needs: [plan] }
 ```
 
 ```yaml
 # .scarab/ci.yaml
 steps:
   - id: deploy
-    invoke: .scarab/lib/deploy.yaml
+    invoke: file:.scarab/lib/deploy.yaml
     with: { region: us-east-1, replicas: "3" }
+    timeout: 1800
 
   - id: notify
     image: busybox
     needs: [deploy]
-    command: ["echo", "${{ outputs.deploy.url }}"]
+    env: [[URL, "${{ outputs.deploy.url }}"]]
+    command: ["sh", "-c", 'echo "$URL"']
 ```
 
-The interface is validated at compile time: every required input present, no unknown extras, and every
-referenced output declared. Supplied inputs reach each inlined step as `SCARAB_PARAM_<NAME>`.
+The interface is checked at compile time: every required input present, no unknown extras, each
+value of its declared type, and every referenced output declared.
+
+**Inputs are read at launch.** Inside a library step, `${{ inputs.<name> }}` in its `image`,
+`command`, `env`, `when:` and the `with:` of its own invokes reads the value its caller bound, so
+in the example above `plan` runs `plan us-east-1`. Inside a library, `inputs` never means the
+Run's launch parameters, and reading an input the library does not declare is a compile error. A
+literal `with:` value is checked against the input's type when the pipeline compiles. A `with:`
+value that holds a template, such as the caller's `${{ outputs.<step>.<name> }}`, is rendered in
+the caller's scope when the library step launches, then checked against the input's type and
+`validate:`. The inputs also reach each inlined step as `SCARAB_PARAM_<NAME>`.
+
+**What the invoke step carries.** An invoke step may set `needs`, `with`, `matrix`, `when`,
+`deploy`, `timeout`, `resources` and `placement_profiles`. Its `timeout`, `resources` and
+`placement_profiles` apply to each inlined step that leaves them unset (the library's own value
+wins), and never to a gate. `placement_profiles` never applies to a step with `forge_token`. Its `when` is ANDed with the `when` of every inlined step and gate.
+Any other field, `env` included, is a compile error on an invoke step.
+
+**Installed libraries are closed.** A `lib:` library may invoke only `lib:` and `plugin:`
+targets, never `file:`, so a repository cannot change the steps of a library its org installed.
+
+**Every inlined step records where it came from** in `origin`: the chain of libraries that
+produced it, outermost first, each with its kind, name and content hash (and, for `lib:`, the
+source it was installed from). Policies read it, so a library can be allowed or blocked through
+any depth of nesting. A library should pin its images by digest; `scarab lint` warns about a
+library image pinned only by tag.
 
 ## Results & interpolation
 
@@ -312,7 +420,7 @@ Interpolation is resolved at launch time against the upstream step's captured re
 consumer must `needs:` the producer.
 
 **Results are not artifacts.** A result is a small typed value the DAG interpolates into a later
-step's command or environment; an [artifact](#steps-the-step-shape) is a file published from
+step's environment; an [artifact](#steps-the-step-shape) is a file published from
 `/scarab/artifacts/` that you download after the run.
 
 ### Publishing a result
@@ -336,7 +444,8 @@ result's name is the filename minus `.json`, and the file must hold **valid JSON
 - id: notify
   image: busybox
   needs: [version]
-  command: ["echo", "release ${{ outputs.version.tag }}"]
+  env: [[TAG, "${{ outputs.version.tag }}"]]
+  command: ["sh", "-c", 'echo "release $TAG"']
 ```
 
 A step can also list the results it writes, with `results: [tag, build]`. The list is a
@@ -356,20 +465,127 @@ guess, publishes **nothing**: the glob matches no file, the sidecar logs only
 they produced no result.
 
 So make the consumer check that its interpolation resolved. That turns the silent no-op into a
-failure where the value is used:
+failure where the value is used. The value goes in through `env:`, not into the script (see
+[Values in commands and scripts](#values-in-commands-and-scripts)):
 
 ```yaml
 - id: notify
   image: busybox
   needs: [version]
+  env:
+    - [TAG, "${{ outputs.version.tag }}"]
   command:
     - sh
     - -c
     - |
-      TAG='${{ outputs.version.tag }}'
       test -n "$TAG"    # a producer-side typo fails HERE instead of shipping ""
       echo "release $TAG"
 ```
+
+### Values in commands and scripts
+
+Scarab never puts a value from outside the pipeline into a step's command, except a `choice`
+value the pipeline listed, `true`/`false`, a non-negative decimal number, a hex commit SHA, or the
+trigger kind; every other outside value reaches the step only as the value of an environment
+variable the pipeline named, passed byte for byte.
+
+A value is **from outside the pipeline** when it comes from a launch parameter (`inputs` in a
+pipeline file), a step's results (`outputs`), a trigger event's fields, or a library input whose
+caller's `with:` reads one of these, through any number of callers. Literals, `matrix` values, a
+literal `with:` value and an input's `default` are the pipeline's own, and may go anywhere.
+
+To use a free-text value (a branch, a ref, a URL, a result) in a command, name an environment
+variable in `env:` and read it from the environment. In a shell, quote it:
+
+```yaml
+- id: checkout
+  image: alpine/git
+  env: [[REF, "${{ inputs.ref }}"]]
+  command: ["sh", "-c", 'git checkout -- "$REF"']
+```
+
+The fixed shapes may be written into a command, whole or inside an argument:
+
+| Value | Where it comes from | What Scarab checks when the step launches |
+|---|---|---|
+| a `choice` value | an input declared `type: choice` | the value is one of its `options` |
+| `true` or `false` | an input declared `type: boolean`, or an expression over fixed values (`${{ inputs.replicas > 3 }}`) | it is a boolean |
+| a number | an input declared `type: number`, or an expression over fixed values (`${{ inputs.replicas + 1 }}`) | it matches `^[0-9]+(\.[0-9]+)?$`: no sign, no exponent |
+| a commit SHA | `${{ event.sha }}` | it matches `^[0-9a-f]{40}([0-9a-f]{24})?$`: 40 or 64 lower-case hex characters |
+| a pull request or issue number | `${{ event.number }}`, `${{ event.issue }}` | it matches `^[0-9]+$` |
+| `true` or `false` | `${{ event.fork }}` | it is a boolean |
+| the trigger kind | `${{ event.kind }}` | it is one of `push`, `pull_request`, `tag`, `release`, `comment`, `cron`, `manual`, `api`, `upstream` |
+
+The other event fields (`ref`, `branch`, `tag`, `repo.owner`, `repo.name`, `repo.clone_url` and
+`run`) are free text and reach a step only through `env:`.
+
+```yaml
+- id: ship
+  image: deployer
+  command: ["deploy", "${{ inputs.region }}", "n=${{ inputs.replicas }}"]
+
+- id: checkout
+  image: alpine/git
+  command: ["git", "checkout", "${{ event.sha }}"]
+```
+
+A library input counts by the type the library declares, so a library that takes a `string`
+input can use it in a command only through `env:`. A free-text value in a command is a compile
+error that names the step and the argument; for a library step it also names the library and the
+caller's `with:` that binds the input. The step launch checks the same rule again, so a pipeline
+posted to the API without compiling cannot skip it. A value that does not fit its shape when the
+step launches (a number that turns negative, a choice value the pipeline did not list) fails the
+step before it starts.
+
+Why so strict: many programs read some of their arguments as code or as instructions. An argument
+that starts with `-` is an option (`git fetch origin --upload-pack=…` runs a command), `@file`
+reads a file, `+ref` force-pushes, and `ssh`, `su -c` and `env -S` join their arguments back into
+a shell command. A `--` in front does not help either: it ends the options of one program, and the
+value can reach another one (`sh -c '…' -- "$1"`, `npm run lint -- …`). No list of such programs
+can be complete, so Scarab does not keep one. The fixed shapes contain none of these forms. An
+environment variable's value is not parsed by anything until your step reads it.
+
+**In a script**, any `${{ … }}` becomes part of the code. This covers the script of `sh -c` (and
+`bash`, `dash`, `zsh`, `ash`, `ksh`), `python -c`, `node -e`, `perl -e` and `ruby -e`, also behind
+`env`, `busybox`, `timeout`, `nice`, `nohup`, `stdbuf`, `setsid`, `sudo` and `exec`. A value from
+outside the pipeline in a script is a compile error, fixed shapes included; a value written in the
+pipeline is a lint warning. Pass the value in `env:` and read it as `"$VALUE"`.
+
+What stays your responsibility: once a step reads an environment variable, Scarab no longer sees
+it. An unquoted `$REF`, `eval "$REF"` or `ssh host "git checkout $REF"` turns it back into code.
+Quote it, and pass it to programs as one argument.
+
+### Trigger values: `event`
+
+A template can read the trigger's values through `${{ event.<field> }}`, in a pipeline file and in
+a library. Only fields whose values Scarab can check are readable:
+
+| Field | Value | In a `command` |
+|---|---|---|
+| `kind` | the trigger kind | yes |
+| `sha` | the commit, 40 or 64 hex characters, where the trigger has one | yes, lower-case hex only |
+| `number`, `issue` | a pull request or issue number | yes |
+| `fork` | `true` for a pull request from a fork | yes |
+| `run` | the upstream Run's id | no, `env:` only |
+| `repo.clone_url` | the repository's clone URL, from its forge connection | no, `env:` only |
+| `repo.owner`, `repo.name` | letters, digits, `.`, `_` and `-`; no leading `-`, not `.` or `..`; at most 100 bytes | no, `env:` only |
+| `ref`, `branch`, `tag` | letters, digits, `.`, `_`, `/`, `@` and `-`; no leading `-`, no `..` or `//`; at most 255 bytes | no, `env:` only |
+
+The last column is the [command rule](#values-in-commands-and-scripts): a field marked yes may be
+written into a command and is checked against its shape again when the step launches.
+
+`repo.clone_url` is at most 2048 bytes, `run` 64 and `kind` 32.
+
+`actor`, a comment's `body` and `schedule` are not readable, and neither is `${{ event }}` as a
+whole: each is a compile error. The same holds for a `concurrency.group`, which renders against the
+same checked values. A group reads only `inputs` and `event`: it is fixed when the Run is created,
+before any step has run, so reading `outputs` is a compile error. A `when:` still sees the whole
+event.
+
+The values are checked and stored when the Run is created, so a rerun reads the same ones. A
+pipeline that reads a field the trigger does not have, or one whose value fails its check, is
+refused: a push to `fix;rm` refuses a pipeline that reads `${{ event.branch }}` ("branch name
+contains `;`"), and runs every pipeline that does not.
 
 ## Environments & gates
 
@@ -411,6 +627,43 @@ manual gate is the approval mechanism for a governed environment:
 Any gate can fail with a reason: by expiry, by a human reject, or by an external gate released
 with `{"passed": false, "reason": "..."}`. A waiting gate holds only the steps that depend on it,
 and each gate has its own clock, measured from when its `needs` finished.
+
+### Plugin gates
+
+A plugin installed in your org with the `resolve_gates` capability declares gates in its manifest.
+A pipeline waits on one with `invoke: plugin:<installation>/<gate>`:
+
+```yaml
+- id: live
+  needs: [bump]
+  invoke: plugin:argocd-prod/wait-live
+  with:
+    app: payments-api
+    image: ${{ outputs.bump.image }}
+  gate_expires_after: 1800
+
+- id: smoke
+  image: curlimages/curl
+  needs: [live]
+  env: [[REVISION, "${{ outputs.live.revision }}"]]
+```
+
+This inlines one gate, `gate: plugin`, with the invoke step's id. Only the installation it names
+can release it. `with:` is checked against the gate's declared inputs when the pipeline compiles,
+and a value that reads an upstream output is rendered once, when the gate is reached. A value that
+does not render fails the gate with the reason. The inputs are sent to the plugin, so `with:`
+cannot read `secrets` or `env`, and an upstream output it reads must be one that step declares;
+each is a compile error. `gate_expires_after` is required, at most 2592000 seconds (30 days): a
+gate the plugin never answers fails when it expires. Anyone with write access to the project can
+reject it sooner.
+
+The plugin releases the gate with the outputs it declares, each of its declared type, and a later
+step reads them as `${{ outputs.<gate>.<name> }}`. They are values from outside the pipeline, like
+a step's results: the same `command` and script rules apply to them. A plugin never approves a
+`gate: manual`, and it cannot see or release a gate in another org or one another installation
+releases.
+
+No plugin's gates run until an org admin lists the installation in the `plugins_allowed` setting.
 
 ## Deploys: `deploy: true`
 
@@ -527,7 +780,7 @@ for them.
 - [ADR-0041: Named step results + launch-time interpolation](/scarab-ci/tech/adr/0041-named-results-and-interpolation/)
 - [ADR-0042: Trusted per-Pod egress sidecar → fence-scoped results API → Postgres](/scarab-ci/tech/adr/0042-trusted-egress-sidecar/)
 - [ADR-0043: Launch parameters + manual dispatch as a repo-aware trigger](/scarab-ci/tech/adr/0043-launch-parameters-and-manual-dispatch/)
-- [ADR-0045: Source provisioning: the `clone` step kind](/scarab-ci/tech/adr/0045-source-provisioning/)
+- [ADR-0045: Source provisioning: the `clone` step kind](/scarab-ci/tech/adr/0045-source-provisioning/) (the kind is replaced by the clone library, ADR-0076 §9)
 - [ADR-0046: Forge auth is adapter-internal; GitHub + Forgejo adapters in v1](/scarab-ci/tech/adr/0046-forge-auth-and-multi-adapter/)
 - [ADR-0047: Retry classification, attempt/fence model, and dead-letter](/scarab-ci/tech/adr/0047-retry-classification-and-attempt-model/)
 - [ADR-0052: Artifacts: a dedicated per-run store, convention-emitted](/scarab-ci/tech/adr/0052-artifacts/)
@@ -535,4 +788,5 @@ for them.
 - [ADR-0056: Run Takes and attempt-grain evidence](/scarab-ci/tech/adr/0056-run-takes-and-attempt-grain-evidence/)
 - [ADR-0057: Run provenance: trigger context and origin details](/scarab-ci/tech/adr/0057-run-provenance-trigger-context/)
 - [ADR-0074: Deployments leave core](/scarab-ci/tech/adr/0074-deployments-leave-core/)
+- [ADR-0076: Libraries and plugins through `invoke`](/scarab-ci/tech/adr/0076-libraries-and-plugins-through-invoke/)
 ```

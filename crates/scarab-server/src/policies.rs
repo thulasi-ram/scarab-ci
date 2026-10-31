@@ -267,8 +267,8 @@ pub struct PolicyTestPipeline {
     /// declares none. Default `.scarab/ci.yaml`.
     #[serde(default)]
     pub path: Option<String>,
-    /// Every library the Pipeline invokes, transitively: repository path
-    /// (`.scarab/lib/deploy.yaml`) to source.
+    /// Every `file:` library the Pipeline invokes, transitively: repository
+    /// path (`.scarab/lib/deploy.yaml`) to source.
     #[serde(default)]
     pub libs: BTreeMap<String, String>,
     /// The Project the Run would be created in.
@@ -1261,9 +1261,16 @@ async fn pipeline_input(
         name: p.project.clone(),
     };
     let event = test_event(p.trigger, repo.clone(), caller)?;
-    let (yaml, libs) = (p.yaml, p.libs);
-    let ir = blocking(move || scarab_pipeline::compile_yaml_with_libs(&yaml, &libs))
-        .await?
+    // `lib:` resolves against the org's installations, as at admission.
+    let installed = crate::installed_libraries(st.libraries.as_deref(), st.plugins.as_deref(), org)
+        .await
+        .map_err(ApiError::Db)?;
+    let libraries = scarab_pipeline::Libraries {
+        files: p.libs,
+        ..installed
+    };
+    let (ir, _) = crate::compile_bounded(p.yaml, libraries)
+        .await
         .map_err(|e| ApiError::BadRequest(format!("the Pipeline does not compile: {e}")))?;
 
     let refused = |why: String| {
@@ -1298,7 +1305,7 @@ async fn pipeline_input(
         .principal_of(&event, &repo)
         .await
         .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?;
-    let (facts, ctx) = crate::run_create_facts(&event, linked, &path, &repo, &gov, now);
+    let (facts, ctx) = crate::run_create_facts(&event, linked, &path, &repo, &gov, now, None);
     let plugin_gates = run_create::plugin_gates(&ir);
     let input = match facts {
         Ok(facts) => blocking(move || crate::run_create_input(&ir, facts)).await?,

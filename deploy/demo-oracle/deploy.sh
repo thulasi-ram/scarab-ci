@@ -29,7 +29,6 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 # otherwise file-wins for durable config + secrets. Capture caller-provided
 # image refs now; re-apply after the .env load.
 _img_repo="${IMAGE_REPOSITORY:-}"
-_img_clone="${SCARAB_CLONE_IMAGE:-}"
 _img_sidecar="${SCARAB_SIDECAR_IMAGE:-}"
 _img_wsfetch="${SCARAB_WSFETCH_IMAGE:-}"
 
@@ -80,7 +79,6 @@ fi
 
 # Caller-provided image source wins over .env (see capture above).
 [ -n "$_img_repo" ] && export IMAGE_REPOSITORY="$_img_repo"
-[ -n "$_img_clone" ] && export SCARAB_CLONE_IMAGE="$_img_clone"
 [ -n "$_img_sidecar" ] && export SCARAB_SIDECAR_IMAGE="$_img_sidecar"
 [ -n "$_img_wsfetch" ] && export SCARAB_WSFETCH_IMAGE="$_img_wsfetch"
 
@@ -255,7 +253,6 @@ scarab:
     region: "${S3_REGION}"
   githubAppId: "${SCARAB_GITHUB_APP_ID:-}"
   publicUrl: "${SCARAB_PUBLIC_URL}"
-  cloneImage: "${SCARAB_CLONE_IMAGE:-}"
   sidecarImage: "${SCARAB_SIDECAR_IMAGE:-ghcr.io/thulasi-ram/scarab-results-sidecar:edge}"
   oauth:
     clientId: "${SCARAB_OAUTH_CLIENT_ID}"

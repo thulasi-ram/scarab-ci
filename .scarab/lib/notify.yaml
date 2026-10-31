@@ -1,11 +1,16 @@
-# A small reusable **library pipeline** (ADR-0038) — invoked + inlined at
-# compile time by dogfood.yaml's `notify` step. A library declares its reuse
-# `interface` (the inputs a caller must pass via `with:`); its steps are
-# flattened into the caller's DAG, id-namespaced by the invoke-step id.
+# A small reusable **library** (ADR-0038, ADR-0076): invoked and inlined at
+# compile time by dogfood.yaml's `notify` step (`invoke: file:.scarab/lib/notify.yaml`).
+# `kind: library` marks the file: it has no triggers and never runs on its own.
+# A library declares its `interface` (the inputs a caller passes via `with:`);
+# its steps are flattened into the caller's DAG, id-namespaced by the
+# invoke-step id.
+kind: library
+
 interface:
   inputs:
-    # A typed, optional input with a default — supplied by the caller's `with:`
-    # and injected into every inlined step as `SCARAB_PARAM_CHANNEL`.
+    # A typed, optional input with a default, supplied by the caller's `with:`.
+    # `${{ inputs.channel }}` below reads it when the step launches, and every
+    # inlined step also gets it as `SCARAB_PARAM_CHANNEL`.
     - name: channel
       type: string
       required: false
@@ -15,8 +20,11 @@ interface:
 steps:
   - id: post
     image: curlimages/curl:8.10.1
+    # `${{ inputs.channel }}` reads the caller's `with: { channel: … }`. It goes
+    # in through env, not into the script: a value in a script becomes code.
+    env:
+      - [CHANNEL, "${{ inputs.channel }}"]
     command:
       - sh
       - -c
-      # `${{ inputs.channel }}` — reference the library's own launch input.
-      - 'echo "posting deploy notification to #${{ inputs.channel }}"'
+      - 'echo "posting deploy notification to #$CHANNEL"'

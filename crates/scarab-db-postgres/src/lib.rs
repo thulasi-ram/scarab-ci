@@ -32,6 +32,9 @@ use scarab_project::{Deployment, Environment, EnvironmentStore, ProjectError};
 /// `EnvironmentGovernanceStore` (ADR-0071 §2, §3, §8): baseline, eligibility,
 /// overlays and grants, and the one-snapshot read admission makes.
 mod environment_governance;
+/// `LibraryStore` (ADR-0076): installed libraries, their versions, yanks
+/// and each org's first-party defaults.
+mod libraries;
 /// `OrgEnvironmentStore` (ADR-0071): the org-level Environment.
 mod org_environments;
 /// `PluginStore` (ADR-0072): PluginInstallations, the kill switch, their
@@ -321,6 +324,42 @@ impl Db for PostgresDb {
         match row.and_then(|r| r.get::<Option<Value>, _>("params")) {
             Some(v) => serde_json::from_value(v).map_err(|e| DbError::Other(e.to_string())),
             None => Ok(std::collections::BTreeMap::new()),
+        }
+    }
+
+    async fn set_run_event_facts(
+        &self,
+        run: &RunId,
+        facts: &serde_json::Map<String, Value>,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE runs
+             SET event_facts = $2, updated_at = (extract(epoch from now()) * 1000)::bigint
+             WHERE id = $1",
+        )
+        .bind(&run.0)
+        .bind(Value::Object(facts.clone()))
+        .execute(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn run_event_facts(
+        &self,
+        run: &RunId,
+    ) -> Result<serde_json::Map<String, Value>, DbError> {
+        let row = sqlx::query("SELECT event_facts FROM runs WHERE id = $1")
+            .bind(&run.0)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(db_err)?;
+        match row.and_then(|r| r.get::<Option<Value>, _>("event_facts")) {
+            Some(Value::Object(m)) => Ok(m),
+            Some(other) => Err(DbError::Other(format!(
+                "runs.event_facts is not an object: {other}"
+            ))),
+            None => Ok(serde_json::Map::new()),
         }
     }
 
@@ -1289,6 +1328,130 @@ impl Db for PostgresDb {
         Ok(row.and_then(|r| r.get::<Option<i64>, _>("gate_timer_seconds")))
     }
 
+    async fn set_gate_releaser(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        releaser: &str,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE step_runs SET gate_releaser = $3,
+                 updated_at = (extract(epoch from now()) * 1000)::bigint
+             WHERE run_id = $1 AND step_id = $2",
+        )
+        .bind(&run.0)
+        .bind(&step.0)
+        .bind(releaser)
+        .execute(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn gate_releaser(&self, run: &RunId, step: &StepId) -> Result<Option<String>, DbError> {
+        let row =
+            sqlx::query("SELECT gate_releaser FROM step_runs WHERE run_id = $1 AND step_id = $2")
+                .bind(&run.0)
+                .bind(&step.0)
+                .fetch_optional(self.pool())
+                .await
+                .map_err(db_err)?;
+        Ok(row.and_then(|r| r.get::<Option<String>, _>("gate_releaser")))
+    }
+
+    async fn set_gate_wait_inputs(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        inputs: &Value,
+    ) -> Result<bool, DbError> {
+        let stored = sqlx::query(&format!(
+            "UPDATE attempts SET gate_inputs = $4
+             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3
+               AND gate_inputs IS NULL AND {ATTEMPT_IS_RUNNING}"
+        ))
+        .bind(&run.0)
+        .bind(&step.0)
+        .bind(&attempt.0)
+        .bind(inputs)
+        .execute(self.pool())
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+        Ok(stored == 1)
+    }
+
+    async fn gate_wait_inputs(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<Option<Value>, DbError> {
+        let row = sqlx::query(
+            "SELECT gate_inputs FROM attempts
+             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3",
+        )
+        .bind(&run.0)
+        .bind(&step.0)
+        .bind(&attempt.0)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(row.and_then(|r| r.get::<Option<Value>, _>("gate_inputs")))
+    }
+
+    async fn pending_plugin_gates(
+        &self,
+        org: &str,
+        releaser: &str,
+        after: Option<&scarab_engine::PendingGateKey>,
+        limit: u32,
+    ) -> Result<Vec<scarab_engine::PendingGateWait>, DbError> {
+        // The open wait is the step's last Attempt while it is running; a
+        // gate keeps one open wait at a time, so `running` + inputs stored
+        // is that wait.
+        let (a_run, a_step, a_attempt) = match after {
+            Some(k) => (k.run.as_str(), k.step.as_str(), k.attempt.as_str()),
+            None => ("", "", ""),
+        };
+        let rows = sqlx::query(&format!(
+            "SELECT a.run_id, a.step_id, a.attempt_id, a.started_at, a.gate_inputs
+             FROM step_runs s
+             JOIN runs r ON r.id = s.run_id
+             JOIN attempts a ON a.run_id = s.run_id AND a.step_id = s.step_id
+             WHERE r.tenant_org = $1
+               AND s.gate_releaser = $2
+               AND s.gate_kind = 'plugin'
+               AND s.status = 'pending'
+               AND a.gate_inputs IS NOT NULL
+               AND {running}
+               AND (a.run_id, a.step_id, a.attempt_id) > ($3, $4, $5)
+             ORDER BY a.run_id, a.step_id, a.attempt_id
+             LIMIT $6",
+            running = ATTEMPT_IS_RUNNING.replace("outcome", "a.outcome").replace("failure", "a.failure"),
+        ))
+        .bind(org)
+        .bind(releaser)
+        .bind(a_run)
+        .bind(a_step)
+        .bind(a_attempt)
+        .bind(i64::from(limit))
+        .fetch_all(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| scarab_engine::PendingGateWait {
+                run: RunId(r.get("run_id")),
+                step: StepId(r.get("step_id")),
+                attempt: AttemptId(r.get("attempt_id")),
+                started_at: Timestamp(r.get::<i64, _>("started_at")),
+                inputs: r.get::<Value, _>("gate_inputs"),
+            })
+            .collect())
+    }
+
     async fn create_run_service(
         &self,
         run: &RunId,
@@ -1995,6 +2158,34 @@ impl Db for PostgresDb {
         .rows_affected();
         if moved == 0 {
             return Ok(None);
+        }
+        // A release's outputs (ADR-0076 §7) are the gate's results, written
+        // with the verdict so a dependent never runs without them.
+        if let (true, Some(outputs)) = (res.passed, &res.outputs) {
+            let json =
+                serde_json::to_value(outputs).map_err(|e| DbError::Other(e.to_string()))?;
+            sqlx::query(
+                "UPDATE step_runs SET results = $3, evidence_attempt = $4
+                 WHERE run_id = $1 AND step_id = $2",
+            )
+            .bind(&run.0)
+            .bind(&step.0)
+            .bind(&json)
+            .bind(&attempt.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            sqlx::query(
+                "UPDATE attempts SET results = $4
+                 WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3",
+            )
+            .bind(&run.0)
+            .bind(&step.0)
+            .bind(&attempt.0)
+            .bind(&json)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
         }
         for kind in scarab_engine::gate_resolution_events(step, &attempt, minted, res) {
             insert_event(
