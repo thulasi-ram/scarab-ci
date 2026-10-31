@@ -4634,7 +4634,7 @@ export interface components {
             inputs: components["schemas"]["BoundInputDto"][];
             /** @description The Pipeline the Run was created from, by name. */
             pipeline?: string | null;
-            /** @description Why `rendered` is absent, when it is not simply a gate. */
+            /** @description Why `rendered` is absent. Not set for a gate. */
             render_note?: string | null;
             rendered?: null | components["schemas"]["RenderedSpecDto"];
             step: string;

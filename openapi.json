@@ -12481,7 +12481,7 @@
               "string",
               "null"
             ],
-            "description": "Why `rendered` is absent, when it is not simply a gate."
+            "description": "Why `rendered` is absent. Not set for a gate."
           },
           "rendered": {
             "oneOf": [

@@ -211,7 +211,7 @@ pub struct StepOriginDto {
     /// launch, for a gate, or when it does not render.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rendered: Option<RenderedSpecDto>,
-    /// Why `rendered` is absent, when it is not simply a gate.
+    /// Why `rendered` is absent. Not set for a gate.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub render_note: Option<String>,
 }
