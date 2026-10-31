@@ -226,6 +226,52 @@ steps:
     }
 
     #[test]
+    fn a_script_template_is_read_back() {
+        let yaml = r#"
+interface:
+  inputs:
+    - { name: version, type: string }
+on:
+  manual: {}
+steps:
+  - id: tag
+    image: alpine/git@sha256:aaaa
+    command: [sh, -c, "git tag ${{ inputs.version }}"]
+"#;
+        let e = errors(yaml, &Libraries::default());
+        let d = e
+            .iter()
+            .find(|d| d.kind == DiagnosticKind::ScriptTemplate)
+            .unwrap_or_else(|| panic!("{e:?}"));
+        assert_eq!(d.step.as_deref(), Some("tag"));
+        assert_eq!(d.command_index, Some(2));
+        assert_eq!(d.read.as_deref(), Some("${{ inputs.version }}"));
+    }
+
+    #[test]
+    fn a_line_cut_short_keeps_what_it_has() {
+        for (line, step) in [
+            ("library `a/b` and nothing else", None),
+            ("library `a/b`, step `x` without a colon", None),
+            ("step `x` without a colon", None),
+            ("step `x`: `command[nine]` reads `y`", Some("x")),
+            ("step `x`: `command[1]` reads `y` and stops", Some("x")),
+            ("step `x`: `command[1]` reads `y`, which step `s` binds", Some("x")),
+            ("step `x`: `command[1]` reads `y`, which step `s` binds with `with.i: t` and stops", Some("x")),
+            ("step `x`: `command[1]` reads `y`, which step `s` binds with `with.i` and stops, a value from outside", Some("x")),
+            ("step `x`: `command[1]` is a script that `sh`", Some("x")),
+            ("step `x`: `command[1]` is a script that `sh` runs, with `y`", Some("x")),
+            ("step `x`: `command[1]` does something else", Some("x")),
+        ] {
+            let d = Diagnostic::parse(line);
+            assert_eq!(d.kind, DiagnosticKind::Other, "{line}");
+            assert_eq!(d.step.as_deref(), step, "{line}");
+            assert_eq!(d.message, line);
+        }
+        assert_eq!(diagnostics("plain").len(), 1);
+    }
+
+    #[test]
     fn a_line_in_no_known_format_keeps_its_text() {
         let d = Diagnostic::parse("step `a`: `needs` names `b`, which is not a step");
         assert_eq!(d.kind, DiagnosticKind::Other);
