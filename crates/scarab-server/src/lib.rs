@@ -8586,9 +8586,10 @@ fn gate_reject_outcome(res: Result<bool, RerunError>) -> Result<(), ApiError> {
 /// (no deploy context) or a hand-built state with no governance store, which
 /// releases as it always did.
 ///
-/// Timer gates release inside the engine with no request to hold; they are
-/// covered by the launch re-check instead (`SecretInjectingExecutor`): the
-/// first step after the gate is refused at launch and fails `Config`.
+/// Timer gates release inside the engine with no request to hold; the engine
+/// asks [`Executor::gate_refusal`](scarab_engine::ports::Executor::gate_refusal)
+/// first, and `SecretInjectingExecutor` answers it with the same Environment
+/// check, so the gate fails with the reason.
 async fn gate_release_governance(
     st: &AppState,
     ctx: Option<&scarab_engine::DeployContext>,

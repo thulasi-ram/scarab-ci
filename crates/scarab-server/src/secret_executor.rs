@@ -21,8 +21,9 @@
 //! and no OIDC token can still carry admitted `privileged` /
 //! `add_capabilities` / `k8s_overlay` grants, which are Environment authority
 //! too. A refusal is [`ExecError::Refused`], which the scheduler turns into a
-//! `Config` step failure carrying the reason. Timer and external gates rely on
-//! this check: whatever releases the gate, the next launch fails closed.
+//! `Config` step failure carrying the reason. The same check holds a gate the
+//! scheduler would release on its own verdict (a timer that passed): the gate
+//! fails with the reason ([`Executor::gate_refusal`]).
 
 use std::sync::Arc;
 
@@ -322,9 +323,15 @@ impl Executor for SecretInjectingExecutor {
         gate: &scarab_engine::StepRun,
     ) -> Result<Option<String>, ExecError> {
         // ADR-0076 §6: a gate inlined from a yanked library version does not
-        // pass, as a step from one does not launch. Then whatever the wrapped
-        // executor says.
-        match self.ensure_not_yanked(gate).await {
+        // pass, as a step from one does not launch. ADR-0071 §2: a gate in a
+        // deploy Run does not pass once its Environment is gone or no longer
+        // admits the Project — the check the API's release and approve routes
+        // make (git-bug 492a603). Then whatever the wrapped executor says.
+        let refused = match self.ensure_not_yanked(gate).await {
+            Ok(()) => self.ensure_still_admitted(gate).await,
+            Err(e) => Err(e),
+        };
+        match refused {
             Ok(()) => self.inner.gate_refusal(gate).await,
             Err(ExecError::Refused(refusal)) => Ok(Some(refusal)),
             Err(e) => Err(e),

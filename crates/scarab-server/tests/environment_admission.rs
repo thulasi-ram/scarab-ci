@@ -869,3 +869,97 @@ async fn a_revoked_projects_privileged_step_without_secrets_fails_config() {
         }
     }
 }
+
+/// A timer gate in a deploy Run checks the Environment when its timer passes,
+/// as an approval does (git-bug 492a603). Once the Project is no longer
+/// eligible, the gate fails with the reason instead of showing `Succeeded`,
+/// and the step after it does not run.
+#[tokio::test]
+async fn timer_gate_fails_once_the_project_is_no_longer_eligible() {
+    const TIMED_YAML: &str = r#"
+on:
+  manual: {}
+environment: prod
+steps:
+  - { id: build, image: busybox, command: ["true"] }
+  - { id: soak, gate: timer, gate_after: 60, needs: [build] }
+  - { id: ship, image: busybox, command: ["true"], needs: [soak] }
+"#;
+    let db = Arc::new(InMemoryDb::new());
+    let clock = FakeClock::new(1_000);
+    let run = dispatch_run(
+        &FakeForge::new()
+            .with_file(".scarab/deploy.yaml", TIMED_YAML)
+            .with_commit(
+                "refs/heads/main",
+                "1234567890abcdef1234567890abcdef12345678",
+            ),
+        db.as_ref(),
+        &clock,
+        scarab_server::AdmissionPorts::governance(Some(&prod_for_everyone())),
+        "bob".into(),
+        repo(),
+        "refs/heads/main".into(),
+        "deploy".into(),
+        std::collections::BTreeMap::new(),
+        DispatchKind::Manual,
+        None,
+    )
+    .await
+    .expect("admitted while eligible");
+    let status = |step: &'static str| {
+        let db = db.clone();
+        let run = run.clone();
+        async move {
+            db.steps_of_run(&run)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|s| s.step.0 == step)
+                .unwrap()
+                .status
+        }
+    };
+
+    // While eligible: `build` runs and the timer starts.
+    let plain = FakeExecutor::new();
+    plain.script_outcome(ExecState::Succeeded);
+    let sched = Scheduler::new(db.as_ref(), &clock as &dyn Clock, &plain, "sched");
+    for _ in 0..4 {
+        sched.tick(&run).await.unwrap();
+    }
+    assert_eq!(status("build").await, StepStatus::Succeeded);
+    assert_eq!(status("soak").await, StepStatus::Pending);
+
+    // The admin withdraws `web` from `prod`; then the timer passes.
+    let logs = Arc::new(LogService::new(
+        Arc::new(InMemoryObjectStore::new()),
+        db.clone(),
+    ));
+    let inner = Arc::new(FakeExecutor::new());
+    let exec = SecretInjectingExecutor::new(
+        inner,
+        db.clone() as Arc<dyn Db>,
+        Arc::new(FakeSecrets::new()),
+        logs,
+    )
+    .with_environment_governance(Arc::new(prod_for_checkout_only()));
+    clock.advance(10 * 60 * 1000);
+    let sched = Scheduler::new(db.as_ref(), &clock as &dyn Clock, &exec, "sched");
+    for _ in 0..3 {
+        sched.tick(&run).await.unwrap();
+    }
+
+    assert_eq!(
+        status("soak").await,
+        StepStatus::Failed,
+        "a timer gate released for a Project the Environment no longer admits"
+    );
+    let attempts = db
+        .attempts_of_step(&run, &StepId("soak".into()))
+        .await
+        .unwrap();
+    let detail = format!("{:?}", attempts.last().unwrap());
+    assert!(detail.contains("no longer eligible"), "{detail}");
+    assert_ne!(status("ship").await, StepStatus::Succeeded);
+}
