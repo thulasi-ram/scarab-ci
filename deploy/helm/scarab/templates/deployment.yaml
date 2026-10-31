@@ -50,6 +50,15 @@ spec:
         - name: scarab-server
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.command }}
+          # Overrides the image ENTRYPOINT, e.g. a binary from extraVolumeMounts.
+          command:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.args }}
+          args:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
           # Plain config from the ConfigMap; sensitive vars from the Secret.
@@ -143,6 +152,9 @@ spec:
               mountPath: {{ include "scarab.placementDir" . | quote }}
               readOnly: true
             {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
       volumes:
         - name: scratch
           emptyDir: {}
@@ -173,6 +185,9 @@ spec:
         - name: placement
           configMap:
             name: {{ include "scarab.placementConfigMapName" . }}
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

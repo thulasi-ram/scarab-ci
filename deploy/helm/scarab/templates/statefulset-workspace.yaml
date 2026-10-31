@@ -72,6 +72,14 @@ spec:
         - name: scarab-workspace
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.workspace.command }}
+          command:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.workspace.args }}
+          args:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
           envFrom:
@@ -187,11 +195,17 @@ spec:
               mountPath: /home/scarab/.scarab
             - name: tmp
               mountPath: /tmp
+            {{- with .Values.workspace.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
       volumes:
         - name: scratch
           emptyDir: {}
         - name: tmp
           emptyDir: {}
+        {{- with .Values.workspace.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
       {{- with .Values.workspace.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

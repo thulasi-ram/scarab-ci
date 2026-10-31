@@ -465,6 +465,14 @@ workspace:
       memory: 2Gi
   nodeSelector: {}
   tolerations: []
+  # The same four knobs as the server's top-level command / args /
+  # extraVolumes / extraVolumeMounts, for the workspace container and Pod.
+  # They change only the Pod template, never volumeClaimTemplates, so an
+  # upgrade may set or clear them.
+  command: []
+  args: []
+  extraVolumes: []
+  extraVolumeMounts: []
   # Annotations for the workspace ServiceAccount (it has its own — see
   # templates/serviceaccount-workspace.yaml), e.g. the IRSA role it uses to
   # reach the bucket when secrets.s3AccessKey/s3SecretKey are empty.
@@ -527,6 +535,9 @@ service:
   type: ClusterIP
   port: 80
   targetPort: 8080
+  # A fixed node port, used only when type is NodePort. Empty => Kubernetes
+  # picks one. `just up` fixes it so a kind port mapping can point at it.
+  nodePort: ""
   annotations: {}
 
 ingress:
@@ -574,6 +585,24 @@ securityContext:
   readOnlyRootFilesystem: true
   capabilities:
     drop: ["ALL"]
+
+# Override the server container's entrypoint and arguments. Empty => the
+# image's ENTRYPOINT. The role comes from scarab.role either way (SCARAB_ROLE).
+# `just up` uses this to run a binary built on the host from a hostPath volume:
+#   command: ["/opt/scarab/bin/scarab-server"]
+command: []
+args: []
+# Extra volumes for the server Pod, and where its container mounts them. Plain
+# Kubernetes volume and volumeMount lists, appended after the chart's own.
+#   extraVolumes:
+#     - name: host-build
+#       hostPath: { path: /scarab, type: Directory }
+#   extraVolumeMounts:
+#     - name: host-build
+#       mountPath: /opt/scarab
+#       readOnly: true
+extraVolumes: []
+extraVolumeMounts: []
 
 podAnnotations: {}
 nodeSelector: {}
