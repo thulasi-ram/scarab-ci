@@ -306,6 +306,28 @@ on `127.0.0.1` is sent to the `localhost` address first, so the sign-in keeps it
 Session cookies are marked `Secure`. Chrome and Firefox accept them on `http://localhost`;
 Safari may not, so sign in to a plain-`http` local install with Chrome or Firefox.
 
+### Grant the first roles
+
+The people in `scarab.oauth.owners` are Owners each time they sign in. To give anyone a role
+before an Owner can do it in the UI, or to have an install's first members listed on the org's
+Members page, run the server binary with the database URL:
+
+```sh
+scarab-server admin grant --org acme --subject github:alice --role member --reason "first members"
+```
+
+`--role` is `viewer`, `member`, `admin` or `owner`. The person must have signed in once; until
+then the command exits 3 and says so. A role the person already holds in the org is left as
+it is. Every other grant is recorded in the org's event log as `binding.operator_grant`, with
+the host, OS user and reason. The command needs only `--database-url` or
+`SCARAB_DATABASE_URL` and never migrates the database. In a cluster, run it in the server Pod,
+which has the database URL:
+
+```sh
+kubectl exec -n scarab deploy/scarab -c scarab-server -- \
+  scarab-server admin grant --org acme --subject github:alice --role member
+```
+
 ## The chart on a local kind cluster
 
 `just stack up` installs the same chart on a local kind cluster, `scarab-dev`, with Postgres and

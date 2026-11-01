@@ -253,6 +253,18 @@ record. Read Breaking changes before you upgrade.
   only the parts that changed. Delete and withdrawing a grant ask you to type the name. An
   Environment cannot be renamed: its name is the key pipelines use.
   [View and edit an Environment](https://thulasi-ram.github.io/scarab-ci/usage/environments/#view-and-edit-an-environment)
+- **`scarab.uiUrl` (`SCARAB_UI_URL`)**, for when people open the web UI at another address
+  than the one forges reach (`publicUrl`). The login callback, the passkey origin and the
+  step-up confirmation link use it; webhook URLs and commit-status links stay on `publicUrl`.
+  Empty means `publicUrl`. A sign-in started on `127.0.0.1` while the UI URL says `localhost`
+  is sent to `localhost` first, so it keeps its cookie.
+  [The UI URL](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#the-ui-url)
+- **`scarab-server admin grant --org --subject --role [--reason]`** gives a person a role in an
+  org straight in the database, for an install's first members. It needs only the database
+  URL, never migrates, and records `binding.operator_grant` in the org's event log with the
+  host, OS user and reason. A role already held is left as it is and not recorded again. A
+  person who has never signed in is refused (exit 3).
+  [Grant the first roles](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#grant-the-first-roles)
 
 ### Enhancement
 
@@ -307,6 +319,9 @@ record. Read Breaking changes before you upgrade.
   500 on its required inputs. A cache root a replica cannot walk is now left out of the grant
   (git-bug 2a79b73), and a later refused read of that token is answered without walking its
   inputs again.
+- **The Depot did not start with named login providers.** With `scarab.oauth.providers` set,
+  the chart gave the providers' client secrets to the server Deployment only, and the Depot
+  StatefulSet refused to boot for want of them. Both get them now.
 
 ### Tests
 
@@ -328,6 +343,12 @@ record. Read Breaking changes before you upgrade.
 
 ### Misc
 
+- `just stack up dogfood` signs in with GitHub instead of running dev-insecure: identity store,
+  role bindings, API tokens and passkey step-up, as a real install. It needs
+  `SCARAB_OAUTH_CLIENT_ID` and `SCARAB_OAUTH_CLIENT_SECRET` in `dogfood.env`, grants
+  `DOGFOOD_OWNER` and `DOGFOOD_MEMBER` their roles, and prints the fresh-database steps that
+  now need a passkey. `just stack seed dogfood` runs the grants again.
+  `SCARAB_DOGFOOD_DEV_INSECURE` is gone. See `deploy/kind/README.md`.
 - The local stack is one kind cluster, `scarab-dev`, with one Helm release in four modes
   (dev, dogfood, e2e, chaos), each with its own database and bucket; Forgejo runs in it.
   `deploy/local-helm`, `deploy/local-proc` and the colima k3s setup are gone. The chart gains
