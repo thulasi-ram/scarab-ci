@@ -110,8 +110,8 @@ pub fn router(state: AppState) -> Router {
             axum::routing::post(crate::plugin_gates::release_on_broker),
         );
     Router::new()
-        // Unauthenticated: the reachability probe (proc-mode discovery and
-        // the isolation probe, slice d2) must not need a token.
+        // Unauthenticated: the reachability probe (the isolation probe,
+        // slice d2) must not need a token.
         .route(&format!("{BROKER_PREFIX}/healthz"), get(healthz))
         .merge(reads)
         .merge(proxy)

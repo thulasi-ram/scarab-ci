@@ -4875,7 +4875,7 @@ fn fs_capacity_bytes(_path: &std::path::Path) -> Option<u64> {
 ///
 /// The default is only meaningful on a volume DEDICATED to the warm tier: 90%
 /// of a shared dev disk bounds nothing anyone meant, which is why
-/// `deploy/local-proc` sets an explicit `SCARAB_WORKSPACE_WARM_BUDGET_BYTES`.
+/// `deploy/kind/values.yaml` sets an explicit `workspace.warmBudgetBytes`.
 fn resolve_warm_budget(warm_dir: &std::path::Path, explicit: Option<u64>) -> u64 {
     if let Some(bytes) = explicit {
         return bytes;
@@ -9417,7 +9417,6 @@ mod tests {
             workspace: Some(crate::config::WorkspaceServiceConfig {
                 token_secret: b"test-secret".to_vec(),
                 url: "http://127.0.0.1:0".into(),
-                control_url: "http://127.0.0.1:0".into(),
                 data_dir: warm.path().to_string_lossy().into_owned(),
                 fetcher_image: "ghcr.io/example/wsfetch:test".into(),
                 warm_budget_bytes: None,

@@ -69,9 +69,8 @@ const CANCEL_GRACE_SECS: i64 = 30;
 /// eager copy of anything.
 #[derive(Debug, Clone)]
 pub struct WorkspaceFetch {
-    /// Base URL of the workspace service **as a Pod sees it**. In proc mode
-    /// that is generally *not* the URL the host uses (see
-    /// `deploy/local-proc/up.sh`).
+    /// Base URL of the workspace service **as a Pod sees it** (in the chart,
+    /// the Depot's Service).
     pub url: String,
     /// HMAC secret the workspace token is minted with — the same secret the
     /// service verifies with. Never the results-egress secret: see

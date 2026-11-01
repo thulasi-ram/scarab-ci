@@ -36,7 +36,8 @@ pub use runtime::{K8sPluginRuntime, PluginRuntimeConfig, RuntimeError, WorkloadS
 pub use token_review::{TokenReviewVerifier, VERDICT_CACHE_TTL};
 
 /// A client for the cluster this process is configured for: in-cluster
-/// config in a Pod, `KUBECONFIG` (the isolated kind kubeconfig) in proc mode.
+/// config in a Pod, `KUBECONFIG` otherwise (a test on the host uses the
+/// isolated kind kubeconfig).
 /// The composition root holds it without naming kube's types.
 ///
 /// The client speaks rustls, and the binaries that link this crate link more
@@ -65,14 +66,14 @@ pub const MANAGED_BY: &str = "scarab";
 
 /// The Pod Security Admission label the plugin namespace must carry, and the
 /// level it must name (ADR-0072 §9). The runtime only reads it: who may
-/// label namespaces is the operator's (the chart, or `deploy/local-proc/up.sh`).
+/// label namespaces is the operator's (the chart's `plugins.createNamespace`).
 pub const PSA_ENFORCE_LABEL: &str = "pod-security.kubernetes.io/enforce";
 pub const PSA_RESTRICTED: &str = "restricted";
 
 /// How a plugin NetworkPolicy names the CredentialBroker
 /// (`SCARAB_PLUGIN_BROKER_PEER`). In-cluster (Helm) the broker is the
-/// control plane's own Pods; in proc mode it is a host process, reachable
-/// only by address.
+/// control plane's own Pods; a broker outside the cluster (a host process)
+/// is reachable only by address.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BrokerPeer {
     /// `pods:<namespace>:<k=v,…>` — Pods with these labels in that namespace.
