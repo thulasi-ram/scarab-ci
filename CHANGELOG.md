@@ -82,13 +82,36 @@ record. Read Breaking changes before you upgrade.
   upgrade an older Depot refuses a newer server's workspace token when the token carries cache
   roots, so a Step with a Cache restore can fail with a Transient error until both are
   upgraded.
-- **A forge connection serves one org.** `POST /v1/connections` needs an `org` field, and a
-  declared connection in the `connections:` config needs `org:` unless all its `repos:` have
-  one owner. Every repo bound through a connection must be owned by its org. Migration
-  `0076_org_connections.sql` assigns each existing connection the org of its repos when they
-  all have one owner; a connection with repos of several owners, or none, becomes
-  unassigned, and only a global admin sees it or acts on it. A private library is read only
-  through a connection of the installing org.
+- **A forge connection serves one org** (git-bug 19b0a45). Every repository bound through a
+  connection must be owned by its org.
+  - `POST /v1/connections` needs an `org` field. Only a global admin creates an org's first
+    connection; after that, the org's admins can add more.
+  - `GET /v1/connections` lists only the connections of orgs you administer (a global admin
+    sees every one) and takes `?org=<org>` to list one org's.
+  - A connection declared in the `connections:` config needs `org:`, unless all its `repos:`
+    have one owner. A repo of another owner, repos of several owners without `org:`, or no
+    repos and no `org:` fail the boot.
+  - A private library is read only through a connection of the installing org.
+
+  **Upgrade note.** Migration `0076_org_connections.sql` gives each existing connection the org
+  of its repositories when they all have one owner. A connection whose repositories have
+  several owners, or none, stays unassigned: only a global admin sees it or acts on it, and its
+  repositories keep working as before. A GitHub App installation connection whose repositories
+  span owners (an earlier re-sync could bind another installation's repositories to it) is one
+  of these. After the upgrade:
+  1. A global admin re-syncs each GitHub App installation connection (Settings › Connections ›
+     **Re-sync**). A re-sync moves a repository off a connection with no org onto the one it
+     belongs to, and lists in `skipped` the repositories it left alone.
+  2. For each connection still unassigned, a global admin either assigns it an org with
+     **Assign to org** (`PUT /v1/connections/{id}/org`, refused while it holds a repository of
+     another owner), or adds a connection for each org, binds or re-syncs the repositories
+     through it (a repository moves off a connection with no org), and then removes the old
+     one. Do not remove a connection that still has bound repositories: that removes their
+     Projects.
+
+  A server built before this release does not start against a database where 0076 has run
+  (sqlx refuses an unknown migration). To roll back, restore the database from before the
+  upgrade.
 
 ### Security
 
@@ -98,6 +121,12 @@ record. Read Breaking changes before you upgrade.
   org's connection answers 404. A GitHub App connection mints tokens only from its own
   installation and lists only that installation's repositories, so a re-sync no longer binds
   repos of other installations. A bind no longer moves a repo bound in another org.
+  A connection with no org gets one only from its installation's account, when every
+  repository it holds is owned by that account and no org of that name uses another forge,
+  or from a global admin; opening a page never assigns one. Through a connection that has an
+  org, tokens are minted, libraries read and repositories unbound only for repositories that
+  org owns. A repository moves between connections only off a connection with no org: a move
+  between two connections of one org is refused (409 on bind, `skipped` on re-sync).
 - The clone image's askpass gave the token to an LFS server named in `.lfsconfig`, to other
   repositories on the same host through submodules, and over `http://` (#53).
 - A value from outside the Pipeline holding `$(SECRET_NAME)` was filled with that secret by
@@ -153,6 +182,23 @@ record. Read Breaking changes before you upgrade.
   the filters are in the URL. The event log API takes `cursor`, `actor`, `target`, `from` and
   `to`; `before` still works.
   [ADR-0073 §7](https://thulasi-ram.github.io/scarab-ci/tech/adr/0073-step-up-confirmation/#7-orgsecurityeventlog)
+- **Settings sidebar** (git-bug 734ffa1). Settings is one page with a sidebar in up to three
+  groups, and each section has its own address: Your account under `/settings/<section>`
+  (Profile, Security, Appearance), an org's settings under `/orgs/<org>/settings/<section>`, and
+  Server administration under `/settings/server/<section>` for global admins, where Connect a
+  forge creates a new org's first connection. You see only the groups you may use, and an admin
+  of several orgs switches org in the sidebar. `/settings`, `/account`, `/account/security` and
+  `/settings/libraries/review` redirect to the new addresses, keeping their query.
+  [Settings](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#settings)
+- **Mono palette.** Settings › Appearance picks the palette, Emerald or Mono (greys), in light
+  and dark mode. The choice is kept per browser.
+  [Appearance](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#appearance)
+- **Environment pages** (git-bug c11abc5). An Environment opens read-only at
+  `/orgs/<org>/settings/environments/<name>`, and its **Edit** button opens a separate edit
+  screen for the description, baseline, eligibility, privilege grants and Delete. One Save sends
+  only the parts that changed. Delete and withdrawing a grant ask you to type the name. An
+  Environment cannot be renamed: its name is the key pipelines use.
+  [View and edit an Environment](https://thulasi-ram.github.io/scarab-ci/usage/environments/#view-and-edit-an-environment)
 
 ### Enhancement
 
@@ -163,6 +209,17 @@ record. Read Breaking changes before you upgrade.
   failed Step. Changing the replica count moves about 1/N of the keys, and each moved key
   misses once. `workspace.homeUrlTemplate` overrides the per-replica address.
   [ADR-0077 amendment](https://thulasi-ram.github.io/scarab-ci/tech/adr/0077-end-to-end-fault-and-agent-driven-testing/#amendment-2026-11-01-grill)
+- **One install flow for plugins and libraries** (git-bug 3741861). Every catalog plugin
+  installs through the same form, with its publisher shown as a field. Every library installs
+  through the review page, first-party or not, and the libraries in Scarab's release manifest
+  are offered there as sources. The one-click **Install first-party libraries** button is gone:
+  an existing org installs each first-party library on its own, with a review and a passkey
+  confirmation.
+  [Install a library](https://thulasi-ram.github.io/scarab-ci/usage/libraries/#install-a-library)
+- `GET /v1/me` adds `global_admin`: whether you hold a global `Administer` role, which the UI
+  uses to show Server administration. It is always `false` for an API token.
+- A connection's re-sync result adds `skipped`: the repositories the forge reports that it did
+  not bind, because another account owns them or another org's connection holds them.
 - The server and CLI now link to `/settings/profile` and `/settings/security?enroll=1`
   instead of `/account` and `/account/security?enroll=1`. The UI still redirects the old
   addresses.
@@ -171,6 +228,7 @@ record. Read Breaking changes before you upgrade.
   only in some environments ("only in production"). A repository key that replaces an org key
   reads "overrides org". Names only; no value is shown. The secret matrix response adds
   `overrides`, which names the broader scope a set cell hides.
+  [Secrets](https://thulasi-ram.github.io/scarab-ci/usage/secrets/#where-you-set-them-one-grid-by-scope)
 
 ### Bug Fixes
 
@@ -204,6 +262,14 @@ record. Read Breaking changes before you upgrade.
   mid-drain for longer than the lease TTL and shorter than the Pod's grace period; every Run
   must still succeed. C1 checks that a Cache restores from its home replica when no fault
   hit that replica.
+
+### Documentation
+
+- The Installation page describes forge connections per org (Settings › Connections, Connect a
+  forge, `org:` in `scarab.connections`, a connection with no org) and the settings page with
+  its addresses. The Libraries, Secrets and Environments pages name the new settings addresses,
+  the per-org connection rule for private library sources, inherited secret keys, and the
+  Environment view and edit pages.
 
 ### Misc
 
