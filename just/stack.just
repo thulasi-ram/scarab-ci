@@ -19,13 +19,15 @@ help:
 # database and bucket).
 #
 # `just stack up dogfood` is the same stack in GitHub App mode with its own
-# database and bucket, plus a named Cloudflare tunnel. It reads
-# ~/.config/scarab/dogfood.env (CLOUDFLARE_TUNNEL_TOKEN and DOGFOOD_HOSTNAME are
+# database and bucket, GitHub login (no dev-insecure), plus a named Cloudflare
+# tunnel. It reads ~/.config/scarab/dogfood.env (CLOUDFLARE_TUNNEL_TOKEN,
+# DOGFOOD_HOSTNAME, SCARAB_OAUTH_CLIENT_ID and SCARAB_OAUTH_CLIENT_SECRET are
 # required; values are never printed). The tunnel's public hostname must route
 # ONLY path ^/webhooks/ to http://scarab.scarab.svc.cluster.local:80 (set in
-# the Cloudflare dashboard); the release is dev-insecure, so up.sh checks from
-# outside and takes the tunnel down when / or /v1/repos reaches Scarab. The UI
-# stays on SCARAB_ADDR.
+# the Cloudflare dashboard); up.sh checks from outside and takes the tunnel
+# down when / or /v1/repos reaches Scarab. People sign in on
+# http://localhost:<SCARAB_ADDR port>, not 127.0.0.1: passkeys refuse an IP
+# address.
 #
 # `just stack up demo-oracle [ref]` deploys the PUBLIC demo (deploy/demo-oracle):
 # one Oracle Cloud "Always Free" A1 instance (arm64, 2 OCPU / 12 GB) running
@@ -77,6 +79,25 @@ up mode="dev" ref="":
         SCARAB_WSFETCH_IMAGE="$owner/scarab-wsfetch:$ref" \
           bash deploy/demo-oracle/deploy.sh "$ref"
         ;;
+      *) usage ;;
+    esac
+
+# `just stack seed dogfood` grants the dogfood stack's Owner (DOGFOOD_OWNER,
+# default github:$SCARAB_ORG) the owner role and its member (DOGFOOD_MEMBER)
+# the member role in SCARAB_ORG, with `scarab-server admin grant` in the
+# server Pod. `just stack up dogfood` runs it too; run it again after someone
+# it named has signed in for the first time (a grant needs a Principal, which
+# a first sign-in creates). Idempotent. `checklist` also prints the one-time
+# steps of a fresh database that need a passkey. See deploy/kind/seed.sh.
+[doc('Grant the dogfood Owner and member their roles; `checklist` adds the fresh-database steps')]
+seed mode="dogfood" what="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    usage() { echo "usage: just stack seed dogfood [checklist]" >&2; exit 2; }
+    [ "{{mode}}" = dogfood ] || usage
+    case "{{what}}" in
+      "") bash deploy/kind/seed.sh ;;
+      checklist) bash deploy/kind/seed.sh --checklist ;;
       *) usage ;;
     esac
 

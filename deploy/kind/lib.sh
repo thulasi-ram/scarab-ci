@@ -101,6 +101,23 @@ scarab_addr() {
   base="http://${host_ip/0.0.0.0/127.0.0.1}:$host_port"
 }
 
+# dogfood_principals FILE: the dogfood stack's Owner and member as Principal
+# ids, github:<login> (the GitHub login provider's id is `github`).
+# DOGFOOD_OWNER defaults to github:$SCARAB_ORG; DOGFOOD_MEMBER is optional.
+# Sets dogfood_owner and dogfood_member (empty when unset).
+dogfood_principals() {
+  local p
+  dogfood_owner="$(env_get "$1" DOGFOOD_OWNER)"
+  [ -n "$dogfood_owner" ] || dogfood_owner="github:$(env_get "$1" SCARAB_ORG)"
+  dogfood_member="$(env_get "$1" DOGFOOD_MEMBER)"
+  for p in "$dogfood_owner" ${dogfood_member:+"$dogfood_member"}; do
+    [[ "$p" =~ ^github:[A-Za-z0-9][A-Za-z0-9-]*$ ]] \
+      || die "'$p' (DOGFOOD_OWNER / DOGFOOD_MEMBER in $1) is not github:<GitHub login>"
+  done
+  [ "$dogfood_owner" != "$dogfood_member" ] \
+    || die "DOGFOOD_MEMBER in $1 is the owner; name a second GitHub account"
+}
+
 # unpause_node: a paused node container (`docker pause`, as `just test chaos
 # pause-node` does; a chaos run killed mid-pause leaves it so) reads as running,
 # and every kubectl call against it hangs. Unpause it, and say so. Not called
