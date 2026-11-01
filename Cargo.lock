@@ -2762,6 +2762,7 @@ version = "0.2.2"
 dependencies = [
  "axum",
  "reqwest",
+ "scarab-chaos",
  "scarab-db-postgres",
  "scarab-forge",
  "serde",

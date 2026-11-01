@@ -3,8 +3,8 @@
 //! In its container the server is PID 1 with no init
 //! (`docker/server/Dockerfile`), and the kernel drops a signal sent from
 //! inside that PID namespace when PID 1 has no handler for it. So the
-//! harness does what `crates/scarab-e2e/tests/crash_resume.rs` does: it
-//! reads the container's host PID with `crictl inspect` on the node, checks
+//! harness (and `crates/scarab-e2e/tests/crash_resume.rs`, which uses this
+//! module) reads the container's host PID with `crictl inspect` on the node, checks
 //! that the PID's cgroup names that container (the Depot runs the same
 //! binary, so a process name proves nothing), and runs `kill` there through
 //! `docker exec <node>`. ADR-0077's first Amendment says delivery of SIGSTOP

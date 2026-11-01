@@ -23,3 +23,6 @@ scarab-db-postgres = { workspace = true }
 scarab-forge = { workspace = true }
 # The in-test fake Forgejo the dispatch scenario points a connection at.
 axum = { workspace = true }
+# crash_resume signals the server from the kind node the way the fault tier
+# does (scarab_chaos::node).
+scarab-chaos = { workspace = true }
