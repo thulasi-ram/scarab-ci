@@ -330,7 +330,6 @@ api -o /dev/null -X PUT "$base/api/v1/teams/$team_id/repos/$team_org/$team_repo"
 api -o /dev/null -X PUT -d '{"permission":"read"}' \
   "$base/api/v1/repos/$team_org/$team_repo/collaborators/$collaborator"
 
-clone_hash=""
 if [ "$tunnel" = 1 ]; then
   # The forge_token cases (crates/scarab-e2e/tests/forgejo_tunnel.rs). A
   # private repo with three Pipelines: `ci` clones it through the first-party
