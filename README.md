@@ -97,9 +97,9 @@ but none of them has carried production load.
 - **Tested for one case.** Control-plane crash and resume with a real Pod in flight. The
   `crash_resume` test in `crates/scarab-e2e` SIGKILLs the server from the kind node while a
   step Pod runs; the kubelet restarts the container in the same Pod, and the new process
-  re-adopts the Attempt without running it again. It passes in `just e2e` on a local kind
-  cluster and has not yet run green in `.github/workflows/e2e.yml`. A server Pod moved to
-  another node, or a lost node, is not tested.
+  re-adopts the Attempt without running it again. It passes in `just e2e`, on a local kind
+  cluster and in `.github/workflows/e2e.yml`. A server Pod moved to another node, or a lost
+  node, is not tested.
 - **Not proven yet.** Nothing has run at production scale.
 - **Missing.** `on: cron` and `on: upstream` triggers parse, but nothing produces those
   events yet, so they never fire.
