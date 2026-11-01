@@ -1,8 +1,10 @@
-# Full-stack E2E, weekly + on-demand (test-strategy Phase 2): the proc-mode
-# harness (compose Postgres+MinIO, a kind cluster, scarab-server as a host
-# process) driven by the env-gated `scarab-e2e` crate — CI parity with
-# `just e2e`. Deliberately NOT per-PR: it is the slowest tier, and a red
-# run is triaged as a real timing bug (zero auto-retries).
+# Full-stack E2E, weekly + on-demand (test-strategy Phase 2): `just e2e`, the
+# same recipe a developer runs. It brings the kind release up in its e2e mode
+# (`deploy/kind/up.sh e2e`: cluster, Postgres, MinIO, the chart with a server
+# binary built here) and drives it with the env-gated `scarab-e2e` crate;
+# `crash_resume` SIGKILLs the server from the kind node. Deliberately NOT
+# per-PR: it is the slowest tier, and a red run is triaged as a real timing
+# bug (zero auto-retries).
 #
 # WEEKLY, not nightly, because Actions minutes are limited: it failed all 18
 # nightly runs of Oct 1-19 2026 (~74 billed minutes) on the same red
@@ -23,10 +25,14 @@ jobs:
   e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    permissions:
+      contents: read
     env:
       # Debuginfo is the bulk of target/ and worthless in CI — without this the
       # workspace build exhausts the runner's disk (see ci.yml).
       CARGO_PROFILE_DEV_DEBUG: "0"
+      # No e2e case reads the web UI; building it would cost npm ci + a vite build.
+      SCARAB_KIND_SKIP_UI: "1"
     steps:
       # ONLY WHEN SHORT. The cleanup is slow (deleting ~30 GB of small files: 1.5-4
       # billed minutes a run), and today's runner images are 145 GB disks (113 GB
@@ -38,11 +44,9 @@ jobs:
           echo "free before: ${avail}G"
           if [ "$avail" -lt 40 ]; then
             sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup "$AGENT_TOOLSDIRECTORY"
-            # $AGENT_TOOLSDIRECTORY is /opt/hostedtoolcache, and `helm/kind-action`
-            # below installs kind THROUGH it: deleting it without putting the
-            # (empty) directory back fails the action outright — "Cache directory
-            # '/opt/hostedtoolcache' does not exist" — before a single test runs.
-            # Recreating it keeps the ~8GB the tree needs and the kind install.
+            # Actions that install through the tool cache fail outright when
+            # /opt/hostedtoolcache is missing ("Cache directory ... does not
+            # exist"), so put the empty directory back.
             if [ -n "${AGENT_TOOLSDIRECTORY:-}" ]; then
               sudo mkdir -p "$AGENT_TOOLSDIRECTORY"
               sudo chown "$(id -u):$(id -g)" "$AGENT_TOOLSDIRECTORY"
@@ -55,14 +59,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest,just
-      # up.sh needs the kind binary; kubectl and docker compose ship on the
-      # runner. install_only — the recipe creates + owns its own cluster.
-      - uses: helm/kind-action@v1
-        with:
-          install_only: true
-      # The one canonical entrypoint (CLAUDE.md): compose up + kind + server,
-      # build the server/CLI binaries, run the suite, tear down even on red
-      # (the recipe tails the server log before teardown when the suite fails).
+          tool: cargo-nextest,just,cargo-zigbuild@0.24.0
+      # kind, Helm 4 and zig, pinned (see the action's header).
+      - uses: ./.github/actions/kind-tools
+      # The one canonical entrypoint (CLAUDE.md): the release in e2e mode,
+      # the CLI build, the suite, crash_resume last; on a red run the recipe
+      # prints the server's log.
       - name: Run the full-stack E2E suite
         run: just e2e

@@ -159,9 +159,13 @@ fi
 # The web UI: built when it is missing or older than its sources, then staged.
 # Without node the stack runs API-only (the server serves the UI only when
 # index.html exists), and `just ui` still works against it.
+# SCARAB_KIND_SKIP_UI=1 skips the build and stages no UI (CI: no test reads it).
 ui_src="$root/ui/scarab-web-ui"
 ui_dist="$ui_src/dist"
-if command -v npm >/dev/null 2>&1; then
+if [ "${SCARAB_KIND_SKIP_UI:-0}" = 1 ]; then
+  echo "    SCARAB_KIND_SKIP_UI=1: the stack runs without the web UI"
+  rm -rf "$mount/ui"
+elif command -v npm >/dev/null 2>&1; then
   if [ ! -f "$ui_dist/index.html" ] \
      || [ -n "$(find "$ui_src/src" "$ui_src/index.html" "$root/ui/brand" -newer "$ui_dist/index.html" -print -quit 2>/dev/null)" ]; then
     echo "==> building the web UI (npm)"
@@ -171,7 +175,7 @@ if command -v npm >/dev/null 2>&1; then
 else
   echo "    npm not found: the stack runs without the web UI (the API is unaffected)"
 fi
-if [ -f "$ui_dist/index.html" ]; then
+if [ "${SCARAB_KIND_SKIP_UI:-0}" != 1 ] && [ -f "$ui_dist/index.html" ]; then
   rm -rf "$mount/ui.new"
   cp -R "$ui_dist" "$mount/ui.new"
   rm -rf "$mount/ui.old"
@@ -376,9 +380,8 @@ chmod 600 "$values"
 
 # The clone library (ADR-0076 §9): checkouts run `lib:thulasi-ram/clone` with
 # the image it pins, so the release gets a manifest listing a copy of
-# libs/clone.yaml that pins the scarab-clone:dev image built above (the same
-# approach `just local-helm local` used). `just dogfood` installs that copy
-# into the org after the roll-out.
+# libs/clone.yaml that pins the scarab-clone:dev image built above.
+# `just dogfood` installs that copy into the org after the roll-out.
 python3 -I - "$root/libs/clone.yaml" scarab-clone:dev > "$libs_dir/clone.yaml" <<'PY'
 import re, sys
 text = open(sys.argv[1]).read()
@@ -396,8 +399,8 @@ python3 -I "$root/scripts/libs_manifest.py" --libs "$libs_dir" \
 # start, so a UI staged after the Pod started needs a roll too.
 binary_sum="$({ cat "$mount/bin/scarab-server"; cat "$mount/ui/index.html" 2>/dev/null || true; } | shasum -a 256 | cut -c1-16)"
 if [ "$mode" = dogfood ]; then
-  # Dev-insecure, as the colima dogfood ran (deploy/local-helm/.env): no
-  # login, every caller is an Owner. So the tunnel must publish only
+  # Dev-insecure, as the earlier dogfood on colima's k3s ran: no login,
+  # every caller is an Owner. So the tunnel must publish only
   # /webhooks/; the check after cloudflared starts enforces that. Set
   # SCARAB_DOGFOOD_DEV_INSECURE=false once OAuth values are added here.
   dev_insecure="${SCARAB_DOGFOOD_DEV_INSECURE:-true}"
@@ -558,8 +561,7 @@ for i in json.load(sys.stdin).get("installations", []):
   fi
 
   # A fresh database has no GitHub installation until GitHub delivers one. The
-  # same signed synthetic `installation:created` deploy/local-helm/reseed.sh
-  # sent registers it now. Idempotent.
+  # signed synthetic `installation:created` registers it now. Idempotent.
   install_id="$(env_get "$dogfood_env" SCARAB_INSTALL_ID)"
   repo="$(env_get "$dogfood_env" SCARAB_REPO)"
   if [ -n "$install_id" ] && [ -n "$repo" ]; then

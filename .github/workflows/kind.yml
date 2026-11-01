@@ -1,37 +1,24 @@
-# kind-in-CI tier (test-strategy Phase 2): run the live-cluster executor tests
-# (`crates/scarab-executor-k8s/tests/cluster.rs`, all `#[ignore]`d + gated on
-# SCARAB_TEST_KUBE) against a throwaway kind cluster on every PR/push that
-# touches the execution path.
+# kind-in-CI tier (test-strategy Phase 2): run `just kube-tests`, the live
+# cluster suites of the executor (`crates/scarab-executor-k8s/tests/cluster.rs`)
+# and the plugin runtime (`crates/scarab-plugin-k8s/tests/cluster.rs`), on
+# every PR/push that touches the execution path. The recipe is the same one a
+# developer runs (ADR-0077 Amendment, 2026-11-01): `deploy/kind/up.sh e2e`
+# creates the kind cluster `scarab-dev`, runs Postgres and MinIO in it, builds
+# the step images from the tree and installs the chart with the server and the
+# Depot running a binary built here. Everything the old workflow set up by hand
+# (a Postgres service, MinIO, a registry, a workspace service host process,
+# image pulls and loads, the host IP a Pod reaches) the recipe now does.
 #
-# REQUIRED (promoted off probation 2026-07-25, git-bug a0b42ad). Nine runs,
-# one failure — and that failure was the *harness* `.expect()`ing a transient
-# poll error the engine is designed to retry (`workspace: broken pipe`), not
-# cluster flake; `poll_to_terminal` in tests/cluster.rs now rides transients
-# out the way the scheduler does. Enforcement lives in
-# `.github/required-checks.txt` + `just pr-gate <n>`, because branch
+# REQUIRED (promoted off probation 2026-07-25, git-bug a0b42ad). Enforcement
+# lives in `.github/required-checks.txt` + `just pr-gate <n>`, because branch
 # protection and rulesets are both 403 on this repo (private, free plan).
-# Listed there as `required-if-run`: the path filter below means a clean
-# absence on an unrelated PR is correct, not a missing gate.
+# Listed there as `required-if-run` (`kind/cluster-tests`): the path filter
+# below means a clean absence on an unrelated PR is correct, not a missing
+# gate. Keep the job id `cluster-tests`.
 #
-# Images: the clone + results-sidecar step images are pulled from the GHCR
-# `edge` tags image.yml publishes off main and `kind load`ed; when the PR
-# itself changes `docker/**` they are instead built fresh from the tree so
-# the run exercises the PR's Dockerfiles. The ADR-0061 workspace FETCHER is
-# always built from the tree — see the step that builds it.
-#
-# ADR-0061: this job also stands up a workspace service, because since s3-feed
-# every Step with `needs:` is provisioned by an init container that dials one and
-# there is no control-plane feed to fall back on. Seven live cases (five of which
-# used to pass) went silent the moment `tests/cluster.rs` started asking for
-# `SCARAB_TEST_WORKSPACE_*` that nothing here set; they now PANIC rather than
-# skip, so this wiring is load-bearing, not optional colour.
-#
-# ADR-0067: the Depot's two hard dependencies are real here too. Postgres
-# (a service container, migrated by the same migrator a converged boot runs)
-# carries the fence and pack rows; MinIO is the cold store the live tier
-# archives into — it used to be a local directory, which booted fine but
-# could never see S3 wire semantics, and which the boot write-probe (part 1)
-# exists to stop trusting on faith.
+# Every SCARAB_TEST_* the suites read is MANDATORY once SCARAB_TEST_KUBE is
+# set: tests/cluster.rs panics on an absent one instead of skipping, so a
+# recipe that stops setting one turns this job red, not silently green.
 name: kind
 
 on:
@@ -46,7 +33,16 @@ on:
       # The workspace client is the fetcher's source AND the `Cas` the live
       # workspace cases point the executor at (ADR-0061 s3-feed).
       - 'crates/scarab-workspace-client/**'
+      - 'crates/scarab-plugin-k8s/**'
       - 'docker/**'
+      # The recipe and everything it reads: the kind stack, the chart, the
+      # clone library manifest it writes.
+      - 'Justfile'
+      - 'deploy/kind/**'
+      - 'deploy/helm/scarab/**'
+      - 'libs/clone.yaml'
+      - 'scripts/libs_manifest.py'
+      - '.github/actions/kind-tools/**'
       - '.github/workflows/kind.yml'
   # `labeled` / `unlabeled`: the ci:skip label skips the job, and removing it
   # starts a run (see ci.yml's trigger note). ci:full changes nothing here:
@@ -59,8 +55,19 @@ on:
       - 'crates/scarab-engine/**'
       - 'crates/scarab-server/**'
       - 'crates/scarab-storage*/**'
+      # The workspace client is the fetcher's source AND the `Cas` the live
+      # workspace cases point the executor at (ADR-0061 s3-feed).
       - 'crates/scarab-workspace-client/**'
+      - 'crates/scarab-plugin-k8s/**'
       - 'docker/**'
+      # The recipe and everything it reads: the kind stack, the chart, the
+      # clone library manifest it writes.
+      - 'Justfile'
+      - 'deploy/kind/**'
+      - 'deploy/helm/scarab/**'
+      - 'libs/clone.yaml'
+      - 'scripts/libs_manifest.py'
+      - '.github/actions/kind-tools/**'
       - '.github/workflows/kind.yml'
 
 # A run started by a change to any label but ci:skip gets a group of its own,
@@ -72,26 +79,8 @@ concurrency:
 env:
   # This repo's debug builds exhaust runner disk with full debuginfo.
   CARGO_PROFILE_DEV_DEBUG: 0
-  CLONE_IMAGE: ghcr.io/thulasi-ram/scarab-clone:edge
-  SIDECAR_IMAGE: ghcr.io/thulasi-ram/scarab-results-sidecar:edge
-  # The ADR-0061 fetcher, always built from the tree (never the GHCR `edge` tag):
-  # its source is a bin target of `crates/scarab-workspace-client`, so a PR can
-  # change the fetcher without touching `docker/**` — pulling a published tag would
-  # test last week's fetcher against this week's executor.
-  WSFETCH_IMAGE: scarab-wsfetch:kind
-  WORKSPACE_PORT: '8081'
-  # The HMAC secret the control plane (here: the test process) mints workspace
-  # tokens with and the service verifies them with. Throwaway, for one throwaway
-  # cluster; it is in the clear because it grants nothing outside this job.
-  WORKSPACE_SECRET: kind-tier-workspace-secret
-  # ADR-0067: the Depot's two hard dependencies (see the header note). One
-  # place for each value — the service boot, the migrator and the test env
-  # below must never disagree about where the database or the bucket is.
-  DATABASE_URL: postgres://scarab:scarab@127.0.0.1:55432/scarab
-  S3_ENDPOINT: http://127.0.0.1:9000
-  S3_BUCKET: scarab-kind
-  S3_ACCESS_KEY: scarab
-  S3_SECRET_KEY: scarabsecret
+  # No test reads the web UI; building it would cost npm ci + a vite build.
+  SCARAB_KIND_SKIP_UI: 1
 
 jobs:
   cluster-tests:
@@ -106,28 +95,8 @@ jobs:
       )
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    # The control plane's Postgres (ADR-0067 part 2): the workspace service
-    # refuses to boot without SCARAB_DATABASE_URL now, and the fence/pack rows
-    # live here. Same shape as ci.yml's service.
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: scarab
-          POSTGRES_PASSWORD: scarab
-          POSTGRES_DB: scarab
-        ports:
-          - 55432:5432
-        options: >-
-          --health-cmd "pg_isready -U scarab -d scarab"
-          --health-interval 2s
-          --health-timeout 3s
-          --health-retries 30
     permissions:
       contents: read
-      packages: read
-      # dorny/paths-filter lists the PR's changed files via the API.
-      pull-requests: read
     steps:
       - uses: actions/checkout@v4
 
@@ -149,276 +118,37 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest
+          tool: cargo-nextest,just,cargo-zigbuild@0.24.0
 
-      # Did this change touch the image build contexts? If so, build the step
-      # images from the tree instead of pulling the (pre-change) `edge` tags.
-      - name: Detect docker/ changes
-        id: changes
-        uses: dorny/paths-filter@v3
-        with:
-          filters: |
-            docker:
-              - 'docker/**'
+      # The kind toolchain the recipe expects. See .github/actions/kind-tools.
+      - uses: ./.github/actions/kind-tools
 
-      - name: Create kind cluster
-        uses: helm/kind-action@v1
-        with:
-          cluster_name: scarab-ci
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Pull step images (GHCR edge)
-        if: steps.changes.outputs.docker != 'true'
-        run: |
-          docker pull "$CLONE_IMAGE"
-          docker pull "$SIDECAR_IMAGE"
-
-      - name: Build step images from the tree (docker/ changed)
-        if: steps.changes.outputs.docker == 'true'
-        run: |
-          docker build -t "$CLONE_IMAGE" docker/clone
-          docker build -t "$SIDECAR_IMAGE" docker/sidecar
-
-      # The ADR-0061 s3-feed fetcher init container. ALWAYS from the tree: it is a
-      # bin target of `crates/scarab-workspace-client`, so the `docker/**` filter
-      # above cannot tell whether the fetcher changed, and a published tag would
-      # pair last week's fetcher with this week's executor. The gha layer cache
-      # keeps the release build off the critical path when nothing in `crates/`
-      # moved.
-      #
-      # ⚠ Goes away with the node driver (git-bug 0628369), together with
-      # docker/wsfetch/ and the executor's WorkspaceFetch.
-      # The GHA layer cache below is a BuildKit cache IMPORT, which the default
-      # `docker` driver cannot do — without this step the build fails before any
-      # test runs. setup-buildx-action creates a `docker-container` builder, which
-      # supports both the cache and the `load: true` this step needs. image.yml
-      # already does the same before its builds.
-      - uses: docker/setup-buildx-action@v4
-
-      - name: Build the workspace fetcher image from the tree
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: docker/wsfetch/Dockerfile
-          tags: ${{ env.WSFETCH_IMAGE }}
-          load: true
-          # image.yml's amd64 fetcher cache — the same Dockerfile, so one copy
-          # serves both (a private `wsfetch` scope was a second ~GB of the 10 GB
-          # repo cache). Read-only here: image.yml on main is what writes it.
-          cache-from: type=gha,scope=scarab-wsfetch-linux/amd64
-
-      # Preload busybox too: nearly every live case runs it, and pulling it
-      # once here dodges Docker Hub anonymous-pull throttling on the kubelet.
-      # busybox:1.36 as well as :latest — the egress/helper container is pinned
-      # to :1.36 (ADR-0039: :latest defaults to root and the kubelet refuses it).
-      # postgres:16 is the uid-pinned service sidecar case's image (git-bug
-      # 908f534); the job's own Postgres service already pulled it.
-      #
-      # Each image is loaded as a ONE-platform archive. `kind load docker-image`
-      # imports with `--all-platforms`, and under the runner's containerd image
-      # store a multi-arch pull holds only amd64's layers, so the import fails
-      # with "content digest ...: not found" before any test runs. This failed
-      # every run from 304171e0 (postgres:16 added) on. The `kube-tests` recipe
-      # loads the same way.
-      - name: Load step images into kind
-        run: |
-          platform="linux/$(docker version -f '{{.Server.Arch}}')"
-          for img in busybox:latest busybox:1.36 postgres:16; do
-            docker pull -q --platform "$platform" "$img"
-          done
-          for img in "$CLONE_IMAGE" "$SIDECAR_IMAGE" "$WSFETCH_IMAGE" busybox:latest busybox:1.36 postgres:16; do
-            archive="$RUNNER_TEMP/kind-image.tar"
-            docker save --platform "$platform" -o "$archive" "$img"
-            kind load image-archive "$archive" --name scarab-ci
-            rm -f "$archive"
-          done
-
-      # The `kind: build` live test pushes to an in-cluster plain-HTTP registry
-      # (SCARAB_TEST_REGISTRY) and verifies its tag list from a Pod.
-      - name: Deploy an in-cluster registry
-        run: |
-          kubectl apply -f - <<'EOF'
-          apiVersion: apps/v1
-          kind: Deployment
-          metadata:
-            name: registry
-            namespace: default
-          spec:
-            replicas: 1
-            selector:
-              matchLabels: { app: registry }
-            template:
-              metadata:
-                labels: { app: registry }
-              spec:
-                containers:
-                  - name: registry
-                    image: registry:2
-                    ports:
-                      - containerPort: 5000
-          ---
-          apiVersion: v1
-          kind: Service
-          metadata:
-            name: registry
-            namespace: default
-          spec:
-            selector: { app: registry }
-            ports:
-              - port: 5000
-                targetPort: 5000
-          EOF
-          kubectl rollout status deployment/registry -n default --timeout=120s
-
-      # The results-sidecar test POSTs from a Pod to a stub listener in the
-      # test process on this runner: the host is the kind docker network's
-      # gateway from inside the cluster.
-      - name: Resolve host IP reachable from Pods
-        id: hostip
-        run: |
-          # The kind network's IPv4 gateway = this host, as seen from the
-          # cluster. The IPAM config may list IPv6 first (or omit Gateway),
-          # so scan all entries; fall back to the default-route source IP.
-          ip="$(docker network inspect kind \
-                  -f '{{range .IPAM.Config}}{{.Gateway}}{{"\n"}}{{end}}' \
-                | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)"
-          if [ -z "$ip" ]; then
-            ip="$(ip -4 route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -1)"
-          fi
-          echo "host ip reachable from Pods: $ip"
-          test -n "$ip" # fail loud here, not as a silent test hang
-          echo "ip=$ip" >> "$GITHUB_OUTPUT"
-
-      # The workspace service (ADR-0061) — the SAME binary under `--role
-      # workspace`, run as a host process exactly as `deploy/local-proc/up.sh`
-      # does. Built from the tree, not pulled: `--role workspace` only exists on
-      # this branch, so `scarab-server:edge` could not serve it.
-      #
-      # Two audiences, one service: the test process IS the control plane and
-      # reaches it on loopback; a Step Pod's fetcher reaches it at the kind
-      # network's gateway (already resolved above — on a Linux runner that gateway
-      # IS a host interface, which is what makes a host process viable here and
-      # what does NOT hold on darwin; see the long note in up.sh).
-      # The cold store (ADR-0067 part 1). A plain step, not a `services:`
-      # container — GitHub's service containers cannot pass a command, and
-      # MinIO needs `server /data`. Same image as the dev compose stack.
-      # MinIO upstream is ARCHIVED (minio/minio, read-only since 2026-04) and its
-      # images are GONE from Docker Hub (`pull access denied`), which turned every CI
-      # run red. pgsty/minio is the maintained AGPL community fork: same binary, same
-      # env vars, same `server /data`, same entrypoint. Pinned by digest — bump the
-      # tag AND the digest together, never to a floating tag again.
-      # The boot write-probe makes this load-bearing: a workspace service
-      # pointed at a bucket that does not exist refuses to serve, so the
-      # bucket is created before the service starts.
-      - name: Start MinIO (the Depot's cold store)
-        run: |
-          docker run -d --name minio -p 9000:9000 \
-            -e MINIO_ROOT_USER="$S3_ACCESS_KEY" -e MINIO_ROOT_PASSWORD="$S3_SECRET_KEY" \
-            pgsty/minio:RELEASE.2026-08-04T00-00-00Z@sha256:b6bfe7239bfc83fb90d31612d9704d86039dd714f7904b3f1ad68f211e602372 server /data
-          for i in $(seq 1 30); do
-            curl -sf http://127.0.0.1:9000/minio/health/live >/dev/null && break
-            sleep 1
-          done
-          AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY" \
-            aws --endpoint-url "$S3_ENDPOINT" --region us-east-1 \
-            s3 mb "s3://$S3_BUCKET"
-
-      - name: Build scarab-server (the workspace service is the same binary)
-        run: cargo build -p scarab-server
-
-      # The fence/pack tables (ADR-0067 part 2). The workspace role NEVER
-      # migrates, and this tier has no control-plane boot to do it — so run
-      # the same migrator a converged boot runs, once, from the tree.
-      - name: Migrate the database (the control plane's job, done by its migrator)
-        run: cargo run -p scarab-db-postgres --example migrate -- "$DATABASE_URL"
-
-      - name: Start the workspace service (--role workspace)
+      # The recipe: cluster, Postgres, MinIO, images, the release in e2e mode,
+      # an in-cluster registry, port-forwards, the Pod-reachable host address,
+      # then both live suites with --run-ignored all --no-fail-fast.
+      - name: just kube-tests
         env:
-          SCARAB_ADDR: 0.0.0.0:${{ env.WORKSPACE_PORT }}
-          SCARAB_WORKSPACE_TOKEN_SECRET: ${{ env.WORKSPACE_SECRET }}
-          SCARAB_WORKSPACE_DATA_DIR: ${{ github.workspace }}/.scarab/workspace-cas
-          # ADR-0067: both hard dependencies, for real. The role connects to
-          # Postgres (never migrates — the step above did) and write-probes
-          # the bucket at boot, so a typo in any of these five is a refusal
-          # in workspace.log, not a green boot that fails its first drain.
-          SCARAB_DATABASE_URL: ${{ env.DATABASE_URL }}
-          SCARAB_S3_BUCKET: ${{ env.S3_BUCKET }}
-          SCARAB_S3_ENDPOINT: ${{ env.S3_ENDPOINT }}
-          SCARAB_S3_ACCESS_KEY: ${{ env.S3_ACCESS_KEY }}
-          SCARAB_S3_SECRET_KEY: ${{ env.S3_SECRET_KEY }}
-        run: |
-          mkdir -p "$SCARAB_WORKSPACE_DATA_DIR"
-          nohup ./target/debug/scarab-server --role workspace \
-            > workspace.log 2>&1 &
-          echo $! > workspace.pid
-          for _ in $(seq 1 60); do
-            if curl -sf "http://127.0.0.1:$WORKSPACE_PORT/readyz" >/dev/null; then
-              echo "workspace service ready on 127.0.0.1:$WORKSPACE_PORT"
-              exit 0
-            fi
-            kill -0 "$(cat workspace.pid)" 2>/dev/null || break
-            sleep 1
-          done
-          echo "::error::the workspace service never answered /readyz"
-          tail -n 60 workspace.log
-          exit 1
-
-      # Everything is a normal test; `#[ignore]` + the SCARAB_TEST_* gates are
-      # the opt-in, so run the ignored set explicitly. --no-fail-fast: one
-      # flaky live case must not mask the rest of the tier's signal.
-      #
-      # Every SCARAB_TEST_* below is now MANDATORY once SCARAB_TEST_KUBE is set:
-      # tests/cluster.rs panics on an absent one instead of skipping. Deleting a
-      # line here turns the tier red, which is the whole repair — it used to turn
-      # it silently green.
-      - name: Run live cluster tests
-        env:
-          SCARAB_TEST_KUBE: '1'
-          SCARAB_TEST_KUBE_NS: default
-          # ADR-0061: host-facing for the test process (it stands in for the
-          # control plane and mints itself a browse token), Pod-facing for the
-          # fetcher init container. They differ, and both are load-bearing.
-          SCARAB_TEST_WORKSPACE_URL: http://127.0.0.1:${{ env.WORKSPACE_PORT }}
-          SCARAB_TEST_WORKSPACE_POD_URL: http://${{ steps.hostip.outputs.ip }}:${{ env.WORKSPACE_PORT }}
-          SCARAB_TEST_WORKSPACE_SECRET: ${{ env.WORKSPACE_SECRET }}
-          SCARAB_TEST_WSFETCH_IMAGE: ${{ env.WSFETCH_IMAGE }}
-          SCARAB_TEST_CLONE_IMAGE: ${{ env.CLONE_IMAGE }}
           # A SHA this event guarantees exists on the forge: the PR head, or
-          # the pushed main commit (the clone tests fetch it anonymously).
+          # the pushed main commit (the clone tests fetch it). The recipe's
+          # default, origin/main, is not in a shallow checkout.
           SCARAB_TEST_CLONE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           # The clone tests fetch THIS repo, which may be private: hand them
           # the ambient read-only token (delivered via tmpfs + GIT_ASKPASS).
           SCARAB_TEST_CLONE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SCARAB_TEST_SIDECAR_IMAGE: ${{ env.SIDECAR_IMAGE }}
-          SCARAB_TEST_REGISTRY: registry.default.svc.cluster.local:5000
-          SCARAB_TEST_HOST_IP: ${{ steps.hostip.outputs.ip }}
-          # ADR-0067: the test process resolves its cold-store handle exactly
-          # as the Depot resolves its own (tests/cluster.rs depot_cold_store),
-          # so it must see the SAME MinIO the service was started with.
-          SCARAB_S3_BUCKET: ${{ env.S3_BUCKET }}
-          SCARAB_S3_ENDPOINT: ${{ env.S3_ENDPOINT }}
-          SCARAB_S3_ACCESS_KEY: ${{ env.S3_ACCESS_KEY }}
-          SCARAB_S3_SECRET_KEY: ${{ env.S3_SECRET_KEY }}
-        run: |
-          cargo nextest run -p scarab-executor-k8s --test cluster \
-            --run-ignored all --no-fail-fast
+        run: just kube-tests
 
       - name: Cluster diagnostics (on failure)
         if: failure()
         run: |
-          kubectl get pods -A -o wide || true
-          kubectl get events -A --sort-by=.lastTimestamp | tail -50 || true
-          kubectl describe pods -n default | tail -200 || true
-          # A 401 from a Step, or a warm-tier warning, lands in the workspace
-          # service's log and NOWHERE else — it is a second process.
-          echo "---- workspace service log ----"
-          tail -n 200 workspace.log || true
+          k=deploy/kind/kubectl.sh
+          bash $k get pods -A -o wide || true
+          bash $k get events -A --sort-by=.lastTimestamp | tail -50 || true
+          bash $k describe pods -n scarab-kube-tests | tail -200 || true
+          echo "---- server log ----"
+          bash $k logs -n scarab deploy/scarab --tail 200 || true
+          # A 401 from a Step, or a warm-tier warning, lands in the Depot's
+          # log and nowhere else: it is a second process.
+          echo "---- Depot log ----"
+          bash $k logs -n scarab statefulset/scarab-workspace --tail 200 || true

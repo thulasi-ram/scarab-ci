@@ -1,0 +1,48 @@
+# The tools deploy/kind/up.sh needs on a Linux runner, beyond what the runner
+# image ships (docker, kubectl, curl, python3): kind, Helm 4 and zig. Each is a
+# pinned release checked against its sha256, installed into $RUNNER_TEMP/bin.
+# cargo-zigbuild comes from taiki-e/install-action in the calling workflow.
+#
+# zig, because the runtime image is debian:bookworm-slim (glibc 2.36): a plain
+# `cargo build` on ubuntu-latest links the runner's newer glibc, and C code in
+# the dependency tree (aws-lc-sys) compiled against 2.38+ headers can reference
+# symbols bookworm does not have (the __isoc23_* family, GLIBC_2.38). up.sh uses `cargo zigbuild --target
+# x86_64-unknown-linux-gnu.2.36` whenever cargo-zigbuild is installed, the same
+# path a macOS laptop takes.
+#
+# Bump a version AND its sha256 together.
+name: kind tools
+description: Install pinned kind, Helm 4 and zig for deploy/kind/up.sh
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        KIND_VERSION: v0.32.0
+        KIND_SHA256: 50030de23cf40a18505f20426f6a8506bedf13c6e509244bd1fa9463721b0f54
+        HELM_VERSION: v4.1.1
+        HELM_SHA256: 5d4c7623283e6dfb1971957f4b755468ab64917066a8567dd50464af298f4031
+        ZIG_VERSION: 0.17.0
+        ZIG_SHA256: 1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026
+      run: |
+        set -euo pipefail
+        [ "$(uname -m)" = x86_64 ] || { echo "::error::pinned for x86_64 runners only"; exit 1; }
+        bin="$RUNNER_TEMP/bin"; dl="$RUNNER_TEMP/dl"
+        mkdir -p "$bin" "$dl"
+        fetch() { # $1 url, $2 file, $3 sha256
+          curl -fsSL --retry 3 -o "$dl/$2" "$1"
+          echo "$3  $dl/$2" | sha256sum -c - >/dev/null
+        }
+        fetch "https://github.com/kubernetes-sigs/kind/releases/download/$KIND_VERSION/kind-linux-amd64" kind "$KIND_SHA256"
+        install -m 0755 "$dl/kind" "$bin/kind"
+        fetch "https://get.helm.sh/helm-$HELM_VERSION-linux-amd64.tar.gz" helm.tar.gz "$HELM_SHA256"
+        tar -xzf "$dl/helm.tar.gz" -C "$dl" linux-amd64/helm
+        install -m 0755 "$dl/linux-amd64/helm" "$bin/helm"
+        fetch "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz" zig.tar.xz "$ZIG_SHA256"
+        tar -xJf "$dl/zig.tar.xz" -C "$RUNNER_TEMP"
+        rm -rf "$dl"
+        echo "$bin" >> "$GITHUB_PATH"
+        echo "$RUNNER_TEMP/zig-x86_64-linux-$ZIG_VERSION" >> "$GITHUB_PATH"
+        "$bin/kind" version
+        "$bin/helm" version --short
+        "$RUNNER_TEMP/zig-x86_64-linux-$ZIG_VERSION/zig" version
