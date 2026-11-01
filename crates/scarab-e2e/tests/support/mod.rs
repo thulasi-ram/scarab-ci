@@ -42,7 +42,9 @@ pub fn base_url() -> String {
 /// seed a connection and a binding.
 pub fn database_url() -> String {
     std::env::var("SCARAB_E2E_DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://scarab:scarab@127.0.0.1:55432/scarab_e2e".into())
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| panic!("SCARAB_E2E_DATABASE_URL unset: `just e2e` port-forwards the release's Postgres"))
 }
 
 /// The workspace root (this crate lives at `crates/scarab-e2e`).

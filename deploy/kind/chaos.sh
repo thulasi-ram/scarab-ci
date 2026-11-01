@@ -11,7 +11,9 @@
 #      Runs, one Depot Pod deleted with grace 0 mid-drain or mid-feed, then
 #      the invariant checker. Each run writes a directory under
 #      $SCARAB_CHAOS_DIR (default deploy/kind/.chaos): scenario.json (the
-#      replayable file), pods.jsonl, verdict.json, memory.log.
+#      replayable file), pods.jsonl, verdict.json, release-log.txt and, for
+#      mid-feed, fetcher-log.txt. The kind node's memory samples go to
+#      $SCARAB_CHAOS_DIR/memory-<time>.log.
 #   3. cancels the chaos database's non-terminal Runs through the API (a
 #      scenario refuses to start while one is left), then switches the
 #      release back to the mode that was active before (dev or

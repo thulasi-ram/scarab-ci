@@ -400,7 +400,7 @@ Pod-side probe in `test-env.sh` finds it.
 | `SCARAB_KIND_PROFILE` | `dev` | cargo profile for the binaries (`release` for a faster drain, slower build) |
 | `SCARAB_KIND_SKIP_BUILD` | `0` | `1` uses the binaries already in `.mount/bin` |
 | `SCARAB_KIND_SKIP_UI` | `0` | `1` builds no web UI and stages none; the server runs API-only (CI sets it) |
-| `SCARAB_KIND_FORCE_SWITCH` | `0` | `1` switches dev <-> dogfood while step Pods are running |
+| `SCARAB_KIND_FORCE_SWITCH` | `0` | `1` switches modes while step Pods are running (their Attempts fail on resume) |
 | `SCARAB_KIND_RECREATE` | `0` | `1` deletes and recreates a `scarab-dev` cluster that does not fit (its data goes with it) |
 | `SCARAB_DEV_ORG` | `thulasi-ram` | org whose `production` Environment dev mode seeds |
 | `SCARAB_DOGFOOD_ENV` | `~/.config/scarab/dogfood.env` | the dogfood env file |

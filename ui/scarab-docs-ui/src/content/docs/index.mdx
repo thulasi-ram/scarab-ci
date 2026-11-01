@@ -148,9 +148,10 @@ statuses); `just e2e` drives a real Forgejo from hook to Run, and the live demo 
 its webhooks from a GitHub App. **Implemented, and tested on a kind cluster:** Pod execution and
 re-attach (`scarab-executor-k8s`) and the results-egress sidecar (`docker/sidecar/`).
 `e2e.yml` runs those tests with `just e2e` on PRs labelled `ci:full` and weekly, not on every
-PR. **Not proven
-yet:** control-plane crash and resume with a real Pod in flight (the weekly e2e test for it
-doesn't pass yet) and production-scale load. **Missing:** `on: cron` and `on: upstream`
+PR. **Tested for one case:** control-plane crash and resume with a real Pod in flight. The
+`just e2e` test SIGKILLs the server while a step Pod runs, the server restarts in the same Pod
+and re-adopts the Attempt; it passes on a local kind cluster, not yet in `e2e.yml`. **Not
+proven yet:** a server moved to another node or a lost node, and production-scale load. **Missing:** `on: cron` and `on: upstream`
 triggers parse, but nothing produces those events yet. **Out of scope:** continuous delivery.
 Scarab runs and governs the run that deploys and keeps no record of what is live after it ends;
 your CD tool does that ([Deploying with Argo CD](/scarab-ci/usage/deploying-with-argo-cd/)).
