@@ -213,8 +213,12 @@ kubectl -n scarab create secret generic scarab-forgejo \
 
 helm upgrade --install scarab deploy/helm/scarab -n scarab \
   --set secrets.existingSecret=scarab-forgejo \
-  --set-json 'scarab.connections=[{"id":"forgejo-main","kind":"forgejo","base_url":"https://git.example.com","credential":{"env":"FORGEJO_CI_TOKEN"},"repos":["acme/widgets"]}]'
+  --set-json 'scarab.connections=[{"id":"forgejo-main","kind":"forgejo","org":"acme","base_url":"https://git.example.com","credential":{"env":"FORGEJO_CI_TOKEN"},"repos":["acme/widgets"]}]'
 ```
+
+A connection serves one org, named by `org` or taken from the owner of its `repos`
+when they all have one. Every repo in `repos` must be owned by that org, or the boot
+fails.
 
 The block is rendered verbatim into a mounted ConfigMap and
 `SCARAB_CONNECTIONS_FILE` points at it, so the keys are the **server's** schema

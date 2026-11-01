@@ -225,8 +225,19 @@
           "Forge Connections"
         ],
         "summary": "Registered forge connections + their bound Projects and health (ADR-0060)",
-        "description": "Read-only, and `Administer` on the Org: a connection spans every Project it\nserves, so seeing the fleet is an org-level act, not a per-repo one. No\ncredential material is ever returned — only whether the handle resolves.",
+        "description": "Read-only, and per Org (git-bug 19b0a45): the caller sees the connections\nof the Orgs it administers, and a global admin also sees the unassigned\nones. No credential material is ever returned — only whether the handle\nresolves.",
         "operationId": "list_connections",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "query",
+            "description": "only the connections serving this org",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "",
@@ -242,7 +253,7 @@
             }
           },
           "403": {
-            "description": "requires Administer on the org"
+            "description": "requires Administer on an org"
           },
           "404": {
             "description": "no connection registry wired"
@@ -286,10 +297,10 @@
             }
           },
           "400": {
-            "description": "unknown kind, non-creatable kind, or a malformed base URL"
+            "description": "unknown kind, non-creatable kind, a malformed base URL, or a missing or reserved org"
           },
           "403": {
-            "description": "requires Administer on the org — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "description": "requires Administer on the org; a new org needs a global admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
             "content": {
               "application/json": {
                 "schema": {
@@ -302,7 +313,7 @@
             "description": "no connection registry or secret store wired"
           },
           "409": {
-            "description": "a connection to that forge and base URL already exists"
+            "description": "the org already has a connection to that forge and base URL"
           },
           "429": {
             "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
@@ -521,7 +532,7 @@
             }
           },
           "400": {
-            "description": "missing owner/name"
+            "description": "missing owner/name, or a repo not owned by the connection's org"
           },
           "403": {
             "description": "requires Administer on the org — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
@@ -8598,6 +8609,13 @@
             "type": "boolean",
             "description": "Is this connection managed declaratively (config-owned) and therefore\nread-only here (ADR-0060 part D)? A connection has exactly one owner —\nthe `connections:` config or the database — and this says which, so the\nUI never offers an edit the next boot would silently revert."
           },
+          "org": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The Org this connection serves (git-bug 19b0a45); `null` = unassigned,\nvisible to and editable by global admins only."
+          },
           "projects": {
             "type": "array",
             "items": {
@@ -8760,6 +8778,7 @@
         "type": "object",
         "description": "`POST /v1/connections` body (ADR-0060 part D, manual path): the forge to\nconnect and the credential to reach it with.\n\n`credential` is **write-only** — it is written through to `SecretProvider`\nunder a server-generated handle and never appears in any response. There is\ndeliberately no \"update the credential\" field on the read DTO: a secret you\ncan read back is a secret you have leaked.",
         "required": [
+          "org",
           "kind",
           "base_url",
           "credential"
@@ -8776,6 +8795,10 @@
           "kind": {
             "type": "string",
             "description": "`forgejo`. GitHub is not creatable here — installing the App *is* its\nregistration (ADR-0060 part C), so a create form for it could not work."
+          },
+          "org": {
+            "type": "string",
+            "description": "The Org the connection serves (git-bug 19b0a45): the forge owner whose\nrepositories it binds. The caller must administer it; the first\nconnection of an Org that does not exist yet needs a global admin."
           }
         }
       },
@@ -9813,6 +9836,7 @@
           "roles",
           "can_administer",
           "admin_orgs",
+          "global_admin",
           "identities"
         ],
         "properties": {
@@ -9833,6 +9857,10 @@
               "null"
             ],
             "description": "Human display name, when the identity provides one."
+          },
+          "global_admin": {
+            "type": "boolean",
+            "description": "Does the caller hold a global `Administer` role? Only such a caller\nmay add the first connection of an Org that does not exist yet, or\nact on an unassigned connection (git-bug 19b0a45). Always `false` for\nan API token."
           },
           "identities": {
             "type": "array",
@@ -11858,6 +11886,7 @@
         "description": "`POST /v1/connections/{id}/resync` body: what reconciliation changed.",
         "required": [
           "bound",
+          "skipped",
           "confirmed"
         ],
         "properties": {
@@ -11872,6 +11901,13 @@
             "type": "integer",
             "description": "How many bindings the forge confirms. Reported rather than acted on:\nsee the handler's note on why re-sync never unbinds.",
             "minimum": 0
+          },
+          "skipped": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Repos the forge reports that were not bound: owned by another account\nthan the connection's Org, or bound through another Org's connection\n(git-bug 19b0a45)."
           }
         }
       },

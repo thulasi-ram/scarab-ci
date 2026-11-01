@@ -102,9 +102,14 @@ scarab:
   # declarative repo-onboarding path, and the only way Forgejo repos become
   # Projects without clicking through the UI.
   #
+  # A connection serves one org: `org:`, or the one owner of its `repos:`.
+  # Every repo must be owned by that org; a repo of another owner, repos of
+  # several owners without `org:`, or no repos and no `org:` fail the boot.
+  #
   # connections:
   #   - id: forgejo-main
   #     kind: forgejo                  # github | forgejo
+  #     org: acme
   #     base_url: https://git.example.com
   #     credential:
   #       env: FORGEJO_CI_TOKEN

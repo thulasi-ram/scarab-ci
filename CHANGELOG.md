@@ -82,9 +82,22 @@ record. Read Breaking changes before you upgrade.
   upgrade an older Depot refuses a newer server's workspace token when the token carries cache
   roots, so a Step with a Cache restore can fail with a Transient error until both are
   upgraded.
+- **A forge connection serves one org.** `POST /v1/connections` needs an `org` field, and a
+  declared connection in the `connections:` config needs `org:` unless all its `repos:` have
+  one owner. Every repo bound through a connection must be owned by its org. Migration
+  `0076_org_connections.sql` assigns each existing connection the org of its repos when they
+  all have one owner; a connection with repos of several owners, or none, becomes
+  unassigned, and only a global admin sees it or acts on it. A private library is read only
+  through a connection of the installing org.
 
 ### Security
 
+- An admin of one org could list, delete, re-sync and bind repos through another org's forge
+  connections, and an API token scoped to one org could do the same (git-bug 19b0a45). Each
+  connection now belongs to an org, and its routes need `Administer` on that org; another
+  org's connection answers 404. A GitHub App connection mints tokens only from its own
+  installation and lists only that installation's repositories, so a re-sync no longer binds
+  repos of other installations. A bind no longer moves a repo bound in another org.
 - The clone image's askpass gave the token to an LFS server named in `.lfsconfig`, to other
   repositories on the same host through submodules, and over `http://` (#53).
 - A value from outside the Pipeline holding `$(SECRET_NAME)` was filled with that secret by
