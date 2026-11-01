@@ -540,6 +540,11 @@ if e["V_MODE"] == "chaos":
     v["replicaCount"] = 2
     v["workspace"] = {"replicaCount": 2}
     v["plugins"] = {"enabled": False}
+    # ADR-0077 rank 4 SIGSTOPs the scheduler leader for a little over the
+    # 30 s lease TTL. At the chart's 3 failures x 15 s the kubelet restarts
+    # the stopped server in that window and the scenario is INCONCLUSIVE;
+    # 8 x 15 s leaves it stopped until the scenario resumes it.
+    v["livenessProbe"] = {"failureThreshold": 8}
 if e["V_MODE"] == "dogfood":
     v["scarab"].update(githubAppId=e["V_APP_ID"], publicUrl=e["V_PUBLIC_URL"], stepTimeoutSecs=e["V_TIMEOUT"])
     v["secrets"].update(githubWebhookSecret=e["V_WEBHOOK"],

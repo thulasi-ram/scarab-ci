@@ -213,7 +213,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // This replica's identity for leases + outbox claims (ADR-0051): MUST be
     // unique per process — identical owners would make every replica believe
     // it holds every lease (leader election + tail dedup would be void).
-    let replica_id = format!("scarab-server-{}", uuid::Uuid::new_v4());
+    // It carries the host name (the Pod name on k8s) so an operator, and the
+    // fault tier's harness (ADR-0077 rank 2), can tell which Pod holds a lease
+    // or an outbox claim; the uuid keeps it unique across restarts of one Pod.
+    let replica_id = match std::env::var("HOSTNAME") {
+        Ok(host) if !host.is_empty() => format!("scarab-server-{host}-{}", uuid::Uuid::new_v4()),
+        _ => format!("scarab-server-{}", uuid::Uuid::new_v4()),
+    };
+    tracing::info!(replica_id = %replica_id, "replica identity for leases and outbox claims");
 
     // Durable store — mandatory, already guaranteed by the config gate.
     let pg = PostgresDb::connect(&database_url).await?;
