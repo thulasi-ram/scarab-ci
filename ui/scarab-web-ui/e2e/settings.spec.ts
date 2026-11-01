@@ -20,8 +20,9 @@ test("an admin lands on their org's settings and every section opens at its own 
   const nav = page.getByRole("navigation", { name: "Settings" });
   const links = nav.getByRole("link");
   const count = await links.count();
-  // Your account (3) + Organization settings (9) for the fixture's admin.
-  expect(count).toBe(12);
+  // Your account (3) + Organization settings (9) + Server administration (1)
+  // for the fixture's admin, who is a global admin.
+  expect(count).toBe(13);
 
   const seen = new Set<string>();
   for (let i = 0; i < count; i++) {
@@ -164,5 +165,43 @@ test("Appearance switches the palette and the mode, and the choice survives a re
 
   await page.getByRole("radio", { name: /Emerald/ }).click();
   await expect(html).toHaveAttribute("data-palette", "emerald");
+  expect(errors).toEqual([]);
+});
+
+test("Connections lists the org's connections and, for a global admin, the unassigned ones apart", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/orgs/acme/settings/connections");
+  const page_ = page.locator("section.page");
+  await expect(page_.getByText("forgejo-7f3a91c2", { exact: true })).toBeVisible();
+  const unassigned = page_.locator(".panel", { hasText: "Unassigned connections" });
+  await expect(unassigned.getByText("github-install-90211", { exact: true })).toBeVisible();
+
+  // Add repository offers only repositories owned by the org.
+  await page_.getByRole("button", { name: "Add repository" }).click();
+  await expect(page.getByText("acme/terraform-modules")).toBeVisible();
+  await expect(page.getByText("globex/shared-ci")).toHaveCount(0);
+  await page.locator(".modal-scrim").click({ position: { x: 5, y: 5 } });
+
+  // Removing a connection asks for its id typed exactly.
+  const row = page_.locator("li.conn", { hasText: "forgejo-7f3a91c2" });
+  await row.getByRole("button", { name: "Remove", exact: true }).first().click();
+  const go = row.getByRole("button", { name: "Remove connection" });
+  await expect(go).toBeDisabled();
+  await row.getByRole("textbox", { name: "Type forgejo-7f3a91c2 to confirm" }).fill("forgejo-7f3a91c2");
+  await expect(go).toBeEnabled();
+  expect(errors).toEqual([]);
+});
+
+test("a global admin connects a forge for a new org and lands on its connections", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/settings/server/connect-forge");
+  await expect(page.getByRole("heading", { level: 1, name: "Connect a forge", exact: true })).toBeVisible();
+  const add = page.getByRole("button", { name: "Add connection" });
+  await expect(add).toBeDisabled();
+  await page.locator("#conn-org").fill("globex");
+  await page.locator("#conn-url").fill("https://git.globex.dev");
+  await page.locator("#conn-token").fill("x".repeat(24));
+  await add.click();
+  await expect(page).toHaveURL(/\/orgs\/globex\/settings\/connections$/);
   expect(errors).toEqual([]);
 });
