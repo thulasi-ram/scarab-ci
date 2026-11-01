@@ -21,10 +21,12 @@ use serde_json::{json, Value};
 use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
 use scarab_identity::{
-    api_token_hash, ApiToken, ApiTokenStore, IdentityStore, PasskeyStore, ProviderIdentity, Role,
-    Scope, SecurityEventFilter, SecurityEventLog, StepUpStore,
+    api_token_hash, ApiToken, ApiTokenStore, IdentityStore, PasskeyStore, ProviderIdentity,
+    RbacStore, Role, Scope, SecurityEventFilter, SecurityEventLog, StepUpStore,
 };
-use scarab_server::step_up::admin::{reset_passkeys, OperatorInfo};
+use scarab_server::step_up::admin::{
+    grant_role, reset_passkeys, OperatorGrant, OperatorInfo, NO_PRINCIPAL,
+};
 use scarab_webauthn::soft::SoftPasskey;
 
 use step_up_harness::*;
@@ -1035,6 +1037,133 @@ async fn the_break_glass_resets_and_is_recorded() {
         pg.schema_version().await.unwrap().unwrap() < 62,
         "untouched"
     );
+    tdb.cleanup().await;
+}
+
+/// `scarab-server admin grant`: seeds a native binding for a principal that
+/// signed in once, records `binding.operator_grant` in the Org's log (caller
+/// `operator:grant`, host, user, reason, previous role), does nothing and
+/// records nothing when the role is already held, and refuses an id no
+/// Principal holds with a message a script can recognise.
+#[tokio::test]
+async fn the_operator_grant_is_idempotent_and_recorded() {
+    let Some((tdb, pg)) = pg().await else { return };
+    let alice = IdentityStore::sign_in(
+        pg.as_ref(),
+        &ProviderIdentity {
+            provider: "github".into(),
+            external_id: "7".into(),
+            handle: "alice".into(),
+            email: None,
+            email_verified: false,
+            display_name: None,
+        },
+        "github:alice",
+        T0,
+    )
+    .await
+    .unwrap();
+    assert_eq!(alice, "github:alice");
+    let operator = OperatorInfo {
+        host: "laptop".into(),
+        os_user: "ops".into(),
+    };
+    let acme = Scope::Org("acme".into());
+    let grants = || async {
+        SecurityEventLog::list(
+            pg.as_ref(),
+            &SecurityEventFilter {
+                kinds: vec!["binding.operator_grant".into()],
+                limit: 10,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+    };
+
+    // Nobody signed in as bob: refused, nothing bound, nothing recorded.
+    let err = grant_role(&pg, "acme", "github:bob", "member", None, &operator, T0)
+        .await
+        .unwrap_err();
+    assert!(err.starts_with(NO_PRINCIPAL), "{err}");
+    assert!(err.contains("sign in"), "{err}");
+    assert_eq!(
+        RbacStore::role_of(pg.as_ref(), "github:bob", &acme).await.unwrap(),
+        None
+    );
+    // An unknown role is refused before anything is read.
+    let err = grant_role(&pg, "acme", "github:alice", "root", None, &operator, T0)
+        .await
+        .unwrap_err();
+    assert!(err.contains("unknown role"), "{err}");
+    assert!(grants().await.is_empty());
+
+    // The first grant binds and records.
+    let done = grant_role(
+        &pg,
+        "acme",
+        "github:alice",
+        "member",
+        Some("staging seed"),
+        &operator,
+        T0,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        done,
+        OperatorGrant::Granted {
+            subject: "github:alice".into(),
+            previous: None
+        }
+    );
+    assert_eq!(
+        RbacStore::role_of(pg.as_ref(), "github:alice", &acme).await.unwrap(),
+        Some(Role::Member)
+    );
+    let events = grants().await;
+    assert_eq!(events.len(), 1);
+    let e = &events[0];
+    assert_eq!(e.org.as_deref(), Some("acme"));
+    assert_eq!(e.subject, "github:alice");
+    assert_eq!(e.caller, "operator:grant");
+    assert_eq!(e.detail["role"], "member");
+    assert_eq!(e.detail["previous"], Value::Null);
+    assert_eq!(e.detail["reason"], "staging seed");
+    assert_eq!(e.detail["host"], "laptop");
+    assert_eq!(e.detail["os_user"], "ops");
+
+    // Again: unchanged, and not recorded a second time.
+    let again = grant_role(&pg, "acme", "github:alice", "member", None, &operator, T0)
+        .await
+        .unwrap();
+    assert_eq!(
+        again,
+        OperatorGrant::Unchanged {
+            subject: "github:alice".into()
+        }
+    );
+    assert_eq!(grants().await.len(), 1);
+
+    // A different role replaces it, and says what it replaced.
+    let up = grant_role(&pg, "acme", "github:alice", "admin", None, &operator, T0)
+        .await
+        .unwrap();
+    assert_eq!(
+        up,
+        OperatorGrant::Granted {
+            subject: "github:alice".into(),
+            previous: Some("member".into())
+        }
+    );
+    assert_eq!(
+        RbacStore::role_of(pg.as_ref(), "github:alice", &acme).await.unwrap(),
+        Some(Role::Admin)
+    );
+    let events = grants().await;
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].detail["previous"], "member", "newest first");
     tdb.cleanup().await;
 }
 

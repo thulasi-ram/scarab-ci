@@ -158,6 +158,67 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Operator grant: seed a role binding straight in the database (a fresh
+    // install's first members). Same shape as the break-glass above.
+    if let Some(scarab_server::config::ServerCommand::Admin {
+        command:
+            scarab_server::config::AdminCommand::Grant {
+                org,
+                subject,
+                role,
+                reason,
+            },
+    }) = &cli.command
+    {
+        let Some(url) = cli.database_url.as_deref() else {
+            eprintln!("scarab-server admin grant: set --database-url or SCARAB_DATABASE_URL");
+            std::process::exit(2);
+        };
+        let pg = PostgresDb::connect(url).await?;
+        let operator = scarab_server::step_up::admin::OperatorInfo::current();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or_default();
+        match scarab_server::step_up::admin::grant_role(
+            &pg,
+            org,
+            subject,
+            role,
+            reason.as_deref(),
+            &operator,
+            now,
+        )
+        .await
+        {
+            Ok(scarab_server::step_up::admin::OperatorGrant::Unchanged { subject }) => {
+                println!("grant: `{subject}` already holds {role} in {org}; nothing changed.");
+                return Ok(());
+            }
+            Ok(scarab_server::step_up::admin::OperatorGrant::Granted { subject, previous }) => {
+                println!(
+                    "grant: `{subject}` now holds {role} in {org} (was {}); recorded as \
+                     binding.operator_grant (host {}, user {}).",
+                    previous.as_deref().unwrap_or("no role"),
+                    operator.host,
+                    operator.os_user
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("scarab-server admin grant: {e}");
+                // 3: the principal has not signed in yet — a caller can
+                // tell that apart from a failure and ask them to.
+                let code = if e.starts_with(scarab_server::step_up::admin::NO_PRINCIPAL) {
+                    3
+                } else {
+                    1
+                };
+                std::process::exit(code);
+            }
+        }
+    }
+
     // The startup gate: refuse to boot on invalid configuration, before any
     // socket binds or connection is made (ADR-0048).
     let config = match Config::resolve(&cli) {
@@ -810,6 +871,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // any other feature (it used to ride on `with_oauth_login`) makes every
         // hook in a login-less deployment point at localhost and die silently.
         .with_public_url(config.public_url.clone())
+        // Where people open the UI (SCARAB_UI_URL, default the public URL):
+        // the OAuth callback and step-up confirmation links point there.
+        .with_ui_url(config.ui_url.clone())
         // The legacy approval history (ADR-0024, ADR-0070 §1), still written
         // on every gate release.
         .with_environments(pg.clone())
@@ -979,8 +1043,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Step-up confirmation (ADR-0073): with a human to confirm (login
         // wired) and the mode enforce, every crown jewel needs a passkey.
         if config.step_up == StepUpMode::Enforce {
-            let rp = scarab_webauthn::RelyingParty::from_public_url(&config.public_url, "Scarab")
-                .map_err(|e| format!("SCARAB_PUBLIC_URL: {e}"))?;
+            // Passkeys bind to the origin people open the UI at.
+            let rp = scarab_webauthn::RelyingParty::from_public_url(&config.ui_url, "Scarab")
+                .map_err(|e| format!("SCARAB_UI_URL: {e}"))?;
             state = state.with_step_up(scarab_server::step_up::StepUpService::new(
                 pg.clone(),
                 pg.clone(),

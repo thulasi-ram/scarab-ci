@@ -271,13 +271,18 @@ pub struct AppState {
     /// the credential-exchange `POST /v1/auth/login` through [`Self::auth`].
     pub oauth_providers: Vec<Arc<oauth::OAuthAuthenticator>>,
     /// Scarab's public base URL — where the outside world reaches this server.
-    /// Two things are built from it, and **neither depends on login being on**:
-    /// the OAuth callback `redirect_uri` (`{public_url}/v1/auth/callback`) and
-    /// the forge-webhook callback every registered hook posts to
-    /// (`{public_url}/webhooks/{forge}`, ADR-0046). Set it with
+    /// The forge-webhook callback every registered hook posts to
+    /// (`{public_url}/webhooks/{forge}`, ADR-0046) is built from it, whether
+    /// or not login is on. Set it with
     /// [`with_public_url`](AppState::with_public_url); the dev default only
     /// works when the forge shares this host's loopback.
     pub public_url: String,
+    /// Where people open the web UI (`SCARAB_UI_URL`), when that is not
+    /// [`public_url`](Self::public_url): the OAuth callback `redirect_uri`
+    /// (`{ui_url}/v1/auth/callback`) and the step-up confirmation link are
+    /// built from it. `None` = the public URL. Read it through
+    /// [`ui_url`](AppState::ui_url).
+    pub ui_url: Option<String>,
     /// Deployment-supplied forge-connection credentials (ADR-0060 part D): the
     /// env-override half of the one credential-resolution path. The API needs
     /// it so a connection whose credential comes from configuration is not
@@ -341,6 +346,7 @@ impl AppState {
             identities: None,
             oauth_providers: Vec::new(),
             public_url: "http://localhost:8080".into(),
+            ui_url: None,
             credential_overrides: Arc::new(connections_config::CredentialOverrides::new()),
             snapshot_retention_days: DEFAULT_SNAPSHOT_RETENTION_DAYS,
             step_up: step_up::StepUpPolicy::Off,
@@ -660,9 +666,27 @@ impl AppState {
         self
     }
 
+    /// Where people open the web UI, when that is not the public URL (a
+    /// staging stack whose public hostname serves only `/webhooks/`). The
+    /// OAuth callback and the step-up confirmation link use it; webhook
+    /// URLs and forge status links stay on the public URL.
+    pub fn with_ui_url(mut self, ui_url: impl Into<String>) -> Self {
+        self.ui_url = Some(ui_url.into());
+        self
+    }
+
+    /// The UI's base URL without a trailing slash: [`ui_url`](Self::ui_url)
+    /// when set, else the public URL.
+    pub fn ui_url(&self) -> &str {
+        self.ui_url
+            .as_deref()
+            .unwrap_or(&self.public_url)
+            .trim_end_matches('/')
+    }
+
     /// Enable the browser OAuth login flow (ADR-0049): `GET /v1/auth/login`
     /// redirects to the provider; the callback lands on
-    /// `{public_url}/v1/auth/callback`.
+    /// `{ui_url}/v1/auth/callback` (see [`ui_url`](AppState::ui_url)).
     ///
     /// Auth only — the public URL comes from
     /// [`with_public_url`](AppState::with_public_url), because webhook
@@ -7266,7 +7290,44 @@ fn set_session_cookies(headers: &mut HeaderMap, session: &Session, csrf: &str) {
 /// link) returns to. The authorize redirect and the token exchange must carry
 /// it byte-for-byte alike (RFC 6749 §4.1.3), so both build it here.
 fn oauth_callback_url(st: &AppState) -> String {
-    format!("{}/v1/auth/callback", st.public_url.trim_end_matches('/'))
+    format!("{}/v1/auth/callback", st.ui_url())
+}
+
+/// Where a login started on another loopback name than the UI URL's must go
+/// first. The flow cookie is set on the host the login started on and the
+/// provider returns to the UI URL's host: a login begun at
+/// `http://127.0.0.1:8080` with the UI URL `http://localhost:8080` would
+/// reach the callback without its cookie and fail. So such a login is sent
+/// to the same path on the UI URL before anything is minted.
+///
+/// Only between loopback names, and only when the host NAMES differ: a
+/// proxy that rewrites `Host` to an internal name never gets a redirect
+/// (no loop), and the redirect's own request matches by name.
+fn loopback_login_detour(
+    st: &AppState,
+    headers: &HeaderMap,
+    uri: &axum::http::Uri,
+) -> Option<String> {
+    fn host_name(authority: &str) -> String {
+        let a = authority.trim().to_ascii_lowercase();
+        match a.strip_prefix('[') {
+            Some(v6) => format!("[{}]", v6.split(']').next().unwrap_or_default()),
+            None => a.split(':').next().unwrap_or_default().to_string(),
+        }
+    }
+    fn loopback(name: &str) -> bool {
+        matches!(name, "localhost" | "127.0.0.1" | "[::1]")
+    }
+    let ui = st.ui_url();
+    let ui_host = host_name(ui.split_once("://")?.1.split(['/', '?', '#']).next()?);
+    let req_host = host_name(headers.get(axum::http::header::HOST)?.to_str().ok()?);
+    if req_host == ui_host || !loopback(&req_host) || !loopback(&ui_host) {
+        return None;
+    }
+    Some(match uri.query() {
+        Some(q) => format!("{ui}/v1/auth/login?{q}"),
+        None => format!("{ui}/v1/auth/login"),
+    })
 }
 
 /// `GET /v1/auth/login` (ADR-0049): begin the browser OAuth flow — mint the
@@ -7276,11 +7337,20 @@ fn oauth_callback_url(st: &AppState) -> String {
 #[utoipa::path(get, path = "/v1/auth/login", summary = "Begin the browser OAuth flow (ADR-0049)", params(("provider" = Option<String>, Query, description = "login provider id (ADR-0069); default = the only, or the unqualified_ids, provider"), ("next" = Option<String>, Query, description = "a relative path to land on after the callback (ADR-0073); default `/`")), responses((status = 302, description = "redirect to the provider with a state cookie"), (status = 400, description = "unknown provider, several and none named, or a `next` that is not a relative path"), (status = 404, description = "OAuth not configured")))]
 async fn oauth_login_redirect(
     State(st): State<AppState>,
+    headers: HeaderMap,
+    uri: axum::http::Uri,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Response, ApiError> {
     let Some(provider) = st.oauth_provider(q.get("provider").map(String::as_str))? else {
         return Err(ApiError::NotFound);
     };
+    if let Some(location) = loopback_login_detour(&st, &headers, &uri) {
+        let mut resp = (StatusCode::FOUND, ()).into_response();
+        if let Ok(v) = axum::http::HeaderValue::from_str(&location) {
+            resp.headers_mut().insert(axum::http::header::LOCATION, v);
+        }
+        return Ok(resp);
+    }
     // The provider rides in the state cookie, so every provider shares the one
     // registered callback URL (ADR-0069).
     // `?next=` (ADR-0073 §10): where the browser lands after the callback —

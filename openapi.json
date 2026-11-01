@@ -12441,7 +12441,7 @@
           },
           "caller": {
             "type": "string",
-            "description": "`session:cookie`, `session:bearer`, `api_token:<id>` or\n`operator:break-glass`."
+            "description": "`session:cookie`, `session:bearer`, `api_token:<id>`,\n`operator:break-glass` or `operator:grant`."
           },
           "confirmation_id": {
             "type": [
@@ -12458,7 +12458,7 @@
           },
           "kind": {
             "type": "string",
-            "description": "`step_up.confirmed`, `step_up.refused`, `op.authorised`,\n`op.completed`, `request.raised|confirmed|executed|failed`,\n`passkey.enrolled|removed|reset|break_glass_reset|clone_suspected`,\n`guard.not_consulted`."
+            "description": "`step_up.confirmed`, `step_up.refused`, `op.authorised`,\n`op.completed`, `request.raised|confirmed|executed|failed`,\n`passkey.enrolled|removed|reset|break_glass_reset|clone_suspected`,\n`guard.not_consulted`, `binding.operator_grant`."
           },
           "op": {
             "type": [

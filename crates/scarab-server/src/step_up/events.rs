@@ -86,12 +86,12 @@ pub struct SecurityEventDto {
     /// `step_up.confirmed`, `step_up.refused`, `op.authorised`,
     /// `op.completed`, `request.raised|confirmed|executed|failed`,
     /// `passkey.enrolled|removed|reset|break_glass_reset|clone_suspected`,
-    /// `guard.not_consulted`.
+    /// `guard.not_consulted`, `binding.operator_grant`.
     pub kind: String,
     /// The human/principal it is about.
     pub subject: String,
-    /// `session:cookie`, `session:bearer`, `api_token:<id>` or
-    /// `operator:break-glass`.
+    /// `session:cookie`, `session:bearer`, `api_token:<id>`,
+    /// `operator:break-glass` or `operator:grant`.
     pub caller: String,
     pub op: Option<String>,
     pub target: Option<String>,

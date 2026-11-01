@@ -385,6 +385,31 @@ async fn a_token_s_request_runs_once_for_its_human_only(backend: Backend) {
     assert!(!log.contains("S3CR3T"), "an event recorded the value");
 }
 
+/// `SCARAB_UI_URL`: the confirmation link a parked request answers with
+/// points where people open the UI, not at the public URL (which may serve
+/// only `/webhooks/`).
+#[tokio::test]
+async fn the_confirmation_link_is_on_the_ui_url() {
+    let h = harness_with(|st| {
+        st.with_public_url("https://hooks.example.com")
+            .with_ui_url(format!("{PUBLIC_URL}/"))
+    });
+    h.grant("amy", Scope::Org("acme".into()), Role::Owner).await;
+    let _amy = amy_in_browser(&h).await;
+    let token = pat(&h, "t1", Scope::Org("acme".into()), Role::Admin).await;
+    let (st, b) = h
+        .bearer("POST", "/v1/secrets", Some(secret("v1")), &token)
+        .await;
+    assert_step_up(st, &b, "window");
+    let id = b["request_id"].as_str().expect("a request id");
+    assert_eq!(
+        b["confirmation_url"],
+        format!("{PUBLIC_URL}/security/confirm/{id}"),
+        "{b}"
+    );
+    assert_ne!(PUBLIC_URL, "https://hooks.example.com");
+}
+
 #[tokio::test]
 async fn a_token_s_request_runs_once_for_its_human_only_in_memory() {
     a_token_s_request_runs_once_for_its_human_only(Backend::Memory).await;

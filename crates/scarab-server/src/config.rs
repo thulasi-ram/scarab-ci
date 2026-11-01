@@ -49,6 +49,7 @@
 //! | `SCARAB_STEP_TIMEOUT_SECS` | env | global default step deadline (ADR-0047); default 3600 (1h), per-step overridable via `timeout:` |
 //! | `SCARAB_PROJECT_RUN_CAP` | env | how many of one project's Runs may be `Running` at once; the rest wait `Pending` (ADR-0011). Unset or `0` = no cap (default). A Run waiting on a gate is not counted |
 //! | `SCARAB_PUBLIC_URL` | env | Scarab's public base URL — the run deep-link every forge status carries (ADR-0046); default `http://localhost:8080` (dev) |
+//! | `SCARAB_UI_URL` | env | the URL people open the web UI at, when it is not `SCARAB_PUBLIC_URL` (a staging stack whose public hostname serves only `/webhooks/`). Three things are built from it: the OAuth callback (`{ui_url}/v1/auth/callback`), the passkey (WebAuthn) origin, and the step-up confirmation link. Webhook URLs and forge status links stay on `SCARAB_PUBLIC_URL`. Default `SCARAB_PUBLIC_URL`. An `http(s)` URL with no query or fragment; with step-up enforced it must be `https` or loopback `http`. Browsers refuse passkeys on an IP literal, so a local one is `http://localhost:<port>` |
 //! | `SCARAB_PLACEMENT_CONFIG_FILE` | env | path to the operator placement config (ADR-0055): cluster baseline + PlacementProfile registry (YAML/JSON, gitops-managed); a bad path/parse is a boot failure |
 //! | `SCARAB_GITHUB_APP_ID` | env | GitHub App id (ADR-0046): when set, GitHub connections authenticate in **App mode** (their credential secret is the App PEM); absent = token mode (dev) |
 //! | `SCARAB_OAUTH_CLIENT_ID` … `_CLIENT_SECRET`, `_AUTHORIZE_URL`, `_TOKEN_URL`, `_USERINFO_URL` | env | OAuth/OIDC login provider (ADR-0049): all five together enable real authn (GitHub, Forgejo, or any OIDC issuer); a partial set refuses boot |
@@ -225,6 +226,29 @@ pub enum ServerCommand {
 /// `scarab-server admin <command>`.
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum AdminCommand {
+    /// Grant a principal a role in an Org, directly in the database, for
+    /// seeding a fresh install (the first members of a staging stack).
+    /// Needs only `--database-url` / `SCARAB_DATABASE_URL`; never migrates.
+    /// The principal must exist (it signed in once, or a forge import
+    /// created it). Idempotent: a principal that already holds the role in
+    /// the Org is left as it is and nothing is recorded. Otherwise the grant
+    /// is a native binding, recorded in the OrgSecurityEventLog as
+    /// `binding.operator_grant` with this host, OS user and reason.
+    Grant {
+        /// The Org.
+        #[arg(long)]
+        org: String,
+        /// The principal id, e.g. `github:alice` (a merged id is followed
+        /// to its Principal).
+        #[arg(long)]
+        subject: String,
+        /// viewer, member, admin or owner.
+        #[arg(long)]
+        role: String,
+        /// Why — recorded with the grant.
+        #[arg(long)]
+        reason: Option<String>,
+    },
     /// Remove EVERY passkey of a principal and revoke its standing
     /// step-ups, for when no Owner can step up to reset them. Needs only
     /// `--database-url` / `SCARAB_DATABASE_URL`; never migrates (refuses a
@@ -612,6 +636,11 @@ pub struct Config {
     /// status carries (`{public_url}/runs/{id}`). Dev default
     /// `http://localhost:8080`.
     pub public_url: String,
+    /// The URL people open the web UI at (`SCARAB_UI_URL`), no trailing
+    /// slash; defaults to [`public_url`](Self::public_url). The OAuth
+    /// callback, the passkey origin and the step-up confirmation link are
+    /// built from it; webhook URLs and forge status links are not.
+    pub ui_url: String,
     /// GitHub App id (ADR-0046). `Some` = App mode (connection credentials
     /// are the App private-key PEM); `None` = token mode (dev).
     pub github_app_id: Option<String>,
@@ -704,6 +733,26 @@ impl StepUpMode {
             (false, Some(other)) => Err(ConfigError::InvalidStepUpMode(other.to_string())),
         }
     }
+}
+
+/// `SCARAB_UI_URL`, or `public_url` when it is unset or blank, without a
+/// trailing slash. An explicit value must be an `http(s)` URL a relying
+/// party can be built from, with no query or fragment: the OAuth callback
+/// is that URL with `/v1/auth/callback` appended.
+fn resolve_ui_url(raw: Option<String>, public_url: &str) -> Result<String, ConfigError> {
+    let Some(raw) = raw.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) else {
+        return Ok(public_url.trim_end_matches('/').to_string());
+    };
+    if raw.contains(['?', '#']) {
+        return Err(ConfigError::InvalidUiUrl(
+            raw,
+            "it has a query or fragment".into(),
+        ));
+    }
+    if let Err(e) = scarab_webauthn::RelyingParty::from_public_url(&raw, "Scarab") {
+        return Err(ConfigError::InvalidUiUrl(raw, e.to_string()));
+    }
+    Ok(raw.trim_end_matches('/').to_string())
 }
 
 /// Is `public_url` acceptable as the WebAuthn relying party when step-up is
@@ -1251,11 +1300,19 @@ pub enum ConfigError {
     InvalidStepUpMode(String),
 
     #[error(
-        "step-up is enforced (ADR-0073) but SCARAB_PUBLIC_URL `{0}` cannot be a WebAuthn \
-         relying party: passkeys need an https origin (plain http only on localhost / \
-         127.0.0.1 / ::1). Set SCARAB_PUBLIC_URL to the https URL browsers reach Scarab at."
+        "step-up is enforced (ADR-0073) but the UI URL `{0}` (SCARAB_UI_URL, default \
+         SCARAB_PUBLIC_URL) cannot be a WebAuthn relying party: passkeys need an https \
+         origin (plain http only on localhost / 127.0.0.1 / ::1). Set SCARAB_UI_URL, or \
+         SCARAB_PUBLIC_URL, to the https URL browsers open Scarab at."
     )]
-    StepUpNeedsHttpsPublicUrl(String),
+    StepUpNeedsHttpsUiUrl(String),
+
+    #[error(
+        "SCARAB_UI_URL `{0}` is not a usable UI URL: {1}. Want the http(s) URL people \
+         open the web UI at, with no query or fragment, e.g. https://ci.example.com or \
+         http://localhost:8080."
+    )]
+    InvalidUiUrl(String, String),
 
     #[error(
         "SCARAB_RETENTION_LOG_DAYS is set but invalid — want a positive integer number \
@@ -1694,18 +1751,19 @@ impl Config {
         let public_url = env("SCARAB_PUBLIC_URL")
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| "http://localhost:8080".into());
+        let ui_url = resolve_ui_url(env("SCARAB_UI_URL"), &public_url)?;
         // Step-up (ADR-0073 §8): enforce unless the dev escape hatch says
         // otherwise; a typo or an `off` refuses the boot.
         let step_up = StepUpMode::resolve(env("SCARAB_STEP_UP").as_deref(), dev_insecure)?;
-        // Passkeys are bound to the public URL's origin: with login wired,
-        // an origin browsers will not run WebAuthn on would make every
-        // crown jewel unconfirmable.
+        // Passkeys are bound to the UI URL's origin: with login wired, an
+        // origin browsers will not run WebAuthn on would make every crown
+        // jewel unconfirmable.
         if step_up == StepUpMode::Enforce
             && !oauth.is_empty()
             && !matches!(cli.role, Role::Workspace)
-            && !step_up_public_url_ok(&public_url)
+            && !step_up_public_url_ok(&ui_url)
         {
-            return Err(ConfigError::StepUpNeedsHttpsPublicUrl(public_url));
+            return Err(ConfigError::StepUpNeedsHttpsUiUrl(ui_url));
         }
 
         Ok(Config {
@@ -1727,6 +1785,7 @@ impl Config {
             step_timeout_secs,
             project_run_cap,
             public_url,
+            ui_url,
             github_app_id: env("SCARAB_GITHUB_APP_ID").filter(|v| !v.is_empty()),
             github_app_pem: env("SCARAB_GITHUB_APP_PEM").filter(|v| !v.is_empty()),
             github_app_pem_file: env("SCARAB_GITHUB_APP_PEM_FILE").filter(|v| !v.is_empty()),
@@ -1836,7 +1895,7 @@ impl Config {
                     .to_string()
             }
             (_, StepUpMode::Enforce) => {
-                match scarab_webauthn::RelyingParty::from_public_url(&self.public_url, "Scarab") {
+                match scarab_webauthn::RelyingParty::from_public_url(&self.ui_url, "Scarab") {
                     Ok(rp) => format!(
                         "step-up: enforced (ADR-0073; rpId={}, origin={})",
                         rp.rp_id(),
@@ -1911,6 +1970,14 @@ impl Config {
                 self.step_timeout_secs,
             ),
             format!("public url: {} (run deep-links, ADR-0046)", self.public_url),
+            if self.ui_url == self.public_url.trim_end_matches('/') {
+                "ui url: the public url (login callback, passkeys, confirmation links)".to_string()
+            } else {
+                format!(
+                    "ui url: {} (login callback, passkeys, confirmation links)",
+                    self.ui_url
+                )
+            },
             self.step_up_report(),
             if self.clone_image_ignored {
                 "SCARAB_CLONE_IMAGE is set and not read: checkouts run the image \
@@ -3727,11 +3794,11 @@ connections:
         };
         assert_eq!(
             with_url("http://ci.example.com").unwrap_err(),
-            ConfigError::StepUpNeedsHttpsPublicUrl("http://ci.example.com".into())
+            ConfigError::StepUpNeedsHttpsUiUrl("http://ci.example.com".into())
         );
         assert!(matches!(
             with_url("ftp://ci.example.com").unwrap_err(),
-            ConfigError::StepUpNeedsHttpsPublicUrl(_)
+            ConfigError::StepUpNeedsHttpsUiUrl(_)
         ));
         for ok in [
             "https://ci.example.com",
@@ -3752,6 +3819,86 @@ connections:
             cfg.startup_report()
         );
         assert!(!cfg.boot_warnings().iter().any(|w| w.contains("STEP-UP")));
+    }
+
+    /// `SCARAB_UI_URL` defaults to the public URL, and an explicit one is
+    /// what passkeys bind to: a staging stack whose public hostname serves
+    /// only `/webhooks/` signs in on `http://localhost:<port>`.
+    #[test]
+    fn the_ui_url_defaults_to_the_public_url_and_can_be_set() {
+        let cli = cli(Some("postgres://l/scarab"));
+        let resolve = |extra| Config::resolve_from(&cli, prod_env(extra));
+
+        let default = resolve(vec![]).unwrap();
+        assert_eq!(default.ui_url, "https://ci.example.com");
+        let trailing =
+            resolve(vec![("SCARAB_PUBLIC_URL", "https://ci.example.com/".into())]).unwrap();
+        assert_eq!(trailing.ui_url, "https://ci.example.com", "no trailing slash");
+        assert!(default.startup_report().contains(
+            &"ui url: the public url (login callback, passkeys, confirmation links)".to_string()
+        ));
+
+        let local = resolve(vec![("SCARAB_UI_URL", "http://localhost:8080/".into())]).unwrap();
+        assert_eq!(local.ui_url, "http://localhost:8080");
+        assert_eq!(local.public_url, "https://ci.example.com", "webhooks stay public");
+        let report = local.startup_report();
+        assert!(
+            report.contains(
+                &"ui url: http://localhost:8080 (login callback, passkeys, confirmation links)"
+                    .to_string()
+            ),
+            "{report:?}"
+        );
+        // The passkey origin is the UI URL's, not the public URL's.
+        assert!(
+            report.contains(
+                &"step-up: enforced (ADR-0073; rpId=localhost, origin=http://localhost:8080)"
+                    .to_string()
+            ),
+            "{report:?}"
+        );
+
+        // A blank value is unset.
+        assert_eq!(
+            resolve(vec![("SCARAB_UI_URL", "  ".into())]).unwrap().ui_url,
+            "https://ci.example.com"
+        );
+    }
+
+    /// An explicit `SCARAB_UI_URL` must be an http(s) URL with no query or
+    /// fragment, and with step-up enforced an https or loopback one — the
+    /// public URL being https does not rescue a plain-http UI URL.
+    #[test]
+    fn a_bad_ui_url_refuses_the_boot() {
+        let cli = cli(Some("postgres://l/scarab"));
+        let with_ui = |url: &str| {
+            Config::resolve_from(&cli, prod_env(vec![("SCARAB_UI_URL", url.to_string())]))
+        };
+        for bad in [
+            "localhost:8080",
+            "ftp://ci.example.com",
+            "https://user@ci.example.com",
+            "https://ci.example.com/?next=/",
+            "https://ci.example.com/#x",
+        ] {
+            assert!(
+                matches!(with_ui(bad).unwrap_err(), ConfigError::InvalidUiUrl(ref v, _) if v == bad),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            with_ui("http://ci.example.com").unwrap_err(),
+            ConfigError::StepUpNeedsHttpsUiUrl("http://ci.example.com".into())
+        );
+        let msg = ConfigError::StepUpNeedsHttpsUiUrl("http://x".into()).to_string();
+        assert!(msg.contains("SCARAB_UI_URL"), "{msg}");
+        // Under the dev escape hatch step-up is off, so plain http boots.
+        let dev = Config::resolve_from(
+            &cli,
+            dev_env(&[("SCARAB_UI_URL", "http://ci.example.com:8080")]),
+        )
+        .unwrap();
+        assert_eq!(dev.ui_url, "http://ci.example.com:8080");
     }
 
     /// Without OAuth and without the dev escape hatch there is no boot at all
@@ -4067,5 +4214,44 @@ connections:
         assert!(Cli::try_parse_from(["scarab-server", "admin", "reset-passkeys"]).is_err());
         // No subcommand: serve, as before.
         assert_eq!(Cli::try_parse_from(["scarab-server"]).unwrap().command, None);
+    }
+
+    /// `scarab-server admin grant`: org, subject and role are mandatory.
+    #[test]
+    fn the_operator_grant_parses() {
+        let cli = Cli::try_parse_from([
+            "scarab-server",
+            "admin",
+            "grant",
+            "--org",
+            "acme",
+            "--subject",
+            "github:alice",
+            "--role",
+            "member",
+            "--reason",
+            "staging seed",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.command,
+            Some(ServerCommand::Admin {
+                command: AdminCommand::Grant {
+                    org: "acme".into(),
+                    subject: "github:alice".into(),
+                    role: "member".into(),
+                    reason: Some("staging seed".into()),
+                }
+            })
+        );
+        for missing in [
+            ["--org", "acme", "--subject", "github:alice"],
+            ["--org", "acme", "--role", "member"],
+            ["--subject", "github:alice", "--role", "member"],
+        ] {
+            let mut argv = vec!["scarab-server", "admin", "grant"];
+            argv.extend(missing);
+            assert!(Cli::try_parse_from(argv).is_err(), "{missing:?}");
+        }
     }
 }

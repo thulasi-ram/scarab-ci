@@ -14,6 +14,11 @@
 //!   --principal …`, against the database directly ([`reset_passkeys`]),
 //!   for when no Owner can step up. No route reaches it, and the `scarab`
 //!   CLI has no such command: it needs the database credentials.
+//!
+//! The operator grant ([`grant_role`], `scarab-server admin grant`) lives
+//! here too: the same shape (database credentials only, never migrates,
+//! recorded with host, OS user and reason), for seeding a fresh install's
+//! first members without a browser.
 
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
@@ -23,7 +28,8 @@ use utoipa::ToSchema;
 
 use scarab_db_postgres::PostgresDb;
 use scarab_identity::{
-    security_event_kind as kind, Action, PasskeyStore, Role, Scope, SecurityEventLog, StepUpStore,
+    security_event_kind as kind, Action, Binding, BindingOrigin, PasskeyStore, RbacStore, Role,
+    Scope, SecurityEventLog, StepUpStore,
 };
 
 use super::ceremony::service;
@@ -303,5 +309,147 @@ pub async fn reset_passkeys(
         subject,
         removed,
         windows_revoked,
+    })
+}
+
+/// The `caller` an operator grant is recorded as.
+pub const OPERATOR_GRANT_CALLER: &str = "operator:grant";
+
+/// How a [`grant_role`] error about a principal that does not exist starts:
+/// `scarab-server admin grant` exits 3 on it, so a script can tell "has not
+/// signed in yet" from a failure.
+pub const NO_PRINCIPAL: &str = "no principal";
+
+/// What [`grant_role`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperatorGrant {
+    /// The principal already held exactly this role in the Org: nothing
+    /// written, nothing recorded.
+    Unchanged { subject: String },
+    /// The binding was written and recorded. `previous` is the Org-scoped
+    /// role it replaced, if any.
+    Granted {
+        subject: String,
+        previous: Option<String>,
+    },
+}
+
+/// The operator grant (`scarab-server admin grant`): give `subject` `role`
+/// in `org` as a native binding, for seeding a fresh install's first members
+/// without a browser. Records `binding.operator_grant` in the Org's security
+/// event log (caller `operator:grant`, with the host, OS user and reason)
+/// before it writes, and writes nothing it could not record.
+///
+/// Idempotent: a principal already holding exactly `role` at the Org scope
+/// is [`Unchanged`](OperatorGrant::Unchanged), and nothing is recorded.
+/// Refuses an unknown role, an invalid org name, a database whose schema
+/// predates the event log (it never migrates), and an id no Principal was
+/// ever minted for — granting to one would hand the role to whoever next
+/// signs in with that id (ADR-0069 §3).
+pub async fn grant_role(
+    db: &PostgresDb,
+    org: &str,
+    subject: &str,
+    role: &str,
+    reason: Option<&str>,
+    operator: &OperatorInfo,
+    now_ms: i64,
+) -> Result<OperatorGrant, String> {
+    let role = match role {
+        "viewer" => Role::Viewer,
+        "member" => Role::Member,
+        "admin" => Role::Admin,
+        "owner" => Role::Owner,
+        other => {
+            return Err(format!(
+                "unknown role `{other}` (want viewer, member, admin or owner)"
+            ))
+        }
+    };
+    if let Some(problem) = crate::org_name_problem(org) {
+        return Err(problem);
+    }
+    let version = db
+        .schema_version()
+        .await
+        .map_err(|e| format!("could not read the schema version: {e}"))?;
+    match version {
+        Some(v) if v >= BREAK_GLASS_MIN_SCHEMA => {}
+        Some(v) => {
+            return Err(format!(
+                "the database schema is at migration {v}, older than {BREAK_GLASS_MIN_SCHEMA} \
+                 (the security event log); upgrade the server first — this command never \
+                 migrates"
+            ))
+        }
+        None => {
+            return Err("the database has never been migrated; this command never migrates".into())
+        }
+    }
+    let resolved = scarab_identity::resolve_principal(db, subject)
+        .await
+        .map_err(|e| format!("could not resolve `{subject}`: {e}"))?
+        .ok_or_else(|| {
+            format!(
+                "{NO_PRINCIPAL} `{subject}` exists: they must sign in to Scarab once before \
+                 a role can name them"
+            )
+        })?;
+    let scope = Scope::Org(org.to_string());
+    let previous = RbacStore::bindings(db, org)
+        .await
+        .map_err(|e| format!("could not read the bindings of `{org}`: {e}"))?
+        .into_iter()
+        .find(|b| b.subject == resolved && b.scope == scope)
+        .map(|b| b.role);
+    if previous == Some(role) {
+        return Ok(OperatorGrant::Unchanged { subject: resolved });
+    }
+    let name = |r: Role| match r {
+        Role::Viewer => "viewer",
+        Role::Member => "member",
+        Role::Admin => "admin",
+        Role::Owner => "owner",
+    };
+    let mut ev = event(
+        kind::BINDING_OPERATOR_GRANT,
+        &resolved,
+        OPERATOR_GRANT_CALLER.to_string(),
+        Some(org.to_string()),
+        now_ms,
+    );
+    ev.op = Some("binding.operator_grant".into());
+    ev.target = Some(resolved.clone());
+    ev.detail = serde_json::json!({
+        "requested": subject,
+        "role": name(role),
+        "previous": previous.map(name),
+        "reason": reason,
+        "host": operator.host,
+        "os_user": operator.os_user,
+    });
+    SecurityEventLog::append(db, &ev).await.map_err(|e| {
+        format!(
+            "the grant could not be recorded in the security event log, so nothing was \
+             granted: {e}"
+        )
+    })?;
+    scarab_forge::ForgeConnectionStore::record_org(db, org)
+        .await
+        .map_err(|e| format!("could not record the org `{org}`: {e}"))?;
+    RbacStore::grant(
+        db,
+        &Binding {
+            subject: resolved.clone(),
+            scope,
+            role,
+        },
+        BindingOrigin::Native,
+    )
+    .await
+    .map_err(|e| format!("could not grant `{resolved}` {} in `{org}`: {e}", name(role)))?;
+    Ok(OperatorGrant::Granted {
+        subject: resolved,
+        previous: previous.map(|r| name(r).to_string()),
     })
 }

@@ -4499,8 +4499,8 @@ export interface components {
              */
             at: number;
             /**
-             * @description `session:cookie`, `session:bearer`, `api_token:<id>` or
-             *     `operator:break-glass`.
+             * @description `session:cookie`, `session:bearer`, `api_token:<id>`,
+             *     `operator:break-glass` or `operator:grant`.
              */
             caller: string;
             /** @description The StepUpConfirmation it was authorised by / that it records. */
@@ -4511,7 +4511,7 @@ export interface components {
              * @description `step_up.confirmed`, `step_up.refused`, `op.authorised`,
              *     `op.completed`, `request.raised|confirmed|executed|failed`,
              *     `passkey.enrolled|removed|reset|break_glass_reset|clone_suspected`,
-             *     `guard.not_consulted`.
+             *     `guard.not_consulted`, `binding.operator_grant`.
              */
             kind: string;
             op?: string | null;

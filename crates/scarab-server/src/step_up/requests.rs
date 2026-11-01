@@ -396,10 +396,7 @@ pub(crate) async fn raise<T>(
     svc.record(ev).await;
 
     refusal.message = MSG_REQUEST.to_string();
-    refusal.confirmation_url = Some(format!(
-        "{}/security/confirm/{id}",
-        st.public_url.trim_end_matches('/')
-    ));
+    refusal.confirmation_url = Some(format!("{}/security/confirm/{id}", st.ui_url()));
     refusal.request_id = Some(id.clone());
     refusal.expires_at = Some(expires_at);
     super::refuse_with(st, op, p, refusal, "confirmation request raised", Some(id)).await

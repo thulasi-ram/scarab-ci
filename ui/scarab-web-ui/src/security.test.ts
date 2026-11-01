@@ -100,6 +100,7 @@ describe("event rows", () => {
     expect(callerLabel("session:bearer")).toBe("CLI session");
     expect(callerLabel("api_token:tok-9")).toBe("API token tok-9");
     expect(callerLabel("operator:break-glass")).toBe("operator");
+    expect(callerLabel("operator:grant")).toBe("operator");
   });
 });
 

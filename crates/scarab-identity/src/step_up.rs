@@ -586,6 +586,9 @@ pub mod security_event_kind {
     pub const PASSKEY_BREAK_GLASS_RESET: &str = "passkey.break_glass_reset";
     pub const PASSKEY_CLONE_SUSPECTED: &str = "passkey.clone_suspected";
     pub const GUARD_NOT_CONSULTED: &str = "guard.not_consulted";
+    /// `scarab-server admin grant`: an operator seeded a role binding
+    /// straight in the database.
+    pub const BINDING_OPERATOR_GRANT: &str = "binding.operator_grant";
 
     /// The Org-less kinds an Org's log shows about its members: the human's
     /// own confirmations and passkey lifecycle. Org-less operations,
