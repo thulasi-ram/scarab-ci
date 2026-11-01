@@ -18,11 +18,13 @@ fills / outline colors differ.
 ## Halftone mark
 
 A scarab drawn in dots, inside a pointy-top hexagon outlined by 72 hexagonal
-dots. Each ring dot is a small hexagon whose sides run parallel to the
-outline's sides. Dot size in the beetle follows a light above it: the wing
-cases carry the largest dots and the pronotum has a highlight. The head
-carries a pair of curved horns, and the six legs have a thick femur, a knee, a
-thinner spiny tibia and a small foot.
+dots. The hexagon has rounded corners (radius 14 on the 120-unit canvas, where
+the sides are 55.5 long) and the dots are spaced evenly along it. Each ring
+dot is a small hexagon with its point up, so its sides run parallel to the
+outline's vertical and slanted sides. Dot size in the beetle follows a light
+above it: the wing cases carry the largest dots and the pronotum has a
+highlight. The head carries a pair of curved horns, and the six legs have a
+thick femur, a knee, a thinner spiny tibia and a small foot.
 
 | File | What it is |
 |------|-----------|
