@@ -12,6 +12,38 @@ fills / outline colors differ.
 | Gold (deep) | `#9c7a2f` | Body fill on the dark variant           |
 | Emerald     | `#1f9e74` | Wing fill (both variants)               |
 | Ink         | `#111418` | Outline / border (light variant)        |
+| Cream       | `#f4f1ea` | Dots of the halftone mark               |
+| Night       | `#0b0c0e` | Background of the halftone tile         |
+
+## Halftone mark
+
+A scarab drawn as a field of dots inside a hexagon. Dot size follows a light
+above the beetle: the wing cases carry the largest dots and the pronotum has a
+highlight. The head carries a pair of curved horns, and the six legs have a
+thick femur, a knee, a thinner spiny tibia and a small foot.
+
+| File | What it is |
+|------|-----------|
+| `logo/scarab-halftone.svg` | cream dots on a transparent background |
+| `logo/scarab-halftone-tile.svg` | the same on an opaque `#0b0c0e` square |
+| `icons/halftone/icon-{16..1024}.png` | transparent PNGs of the first |
+| `icons/halftone-tile/icon-{16..1024}.png` | opaque PNGs of the second; use these for app icons (apple-touch 180, PWA 192 and 512) |
+
+Status and limits:
+
+- It sits beside the emblem. The favicon, the docs logo and the web UI still
+  use the emblem; nothing is rewired to this mark yet.
+- Dark surfaces only. The dots are cream, so on white they disappear. There is
+  no light-background version.
+- Below about 48 px the legs and horns merge, and at 16 px the mark is a blob.
+  There is no simplified favicon glyph yet.
+- The body proportions were measured on a dorsal photograph of *Scarabaeus
+  sacer* (Wikimedia Commons, `Scarabaeus.sacer.jpg`). No pixels from the photo
+  are in the files.
+- The figure is mirror-symmetric: every dot has a partner (checked in the
+  generator). The SVG has 931 circles.
+- The generator is a set of Python scripts that is not in this repo yet, so
+  the SVG is the source for now.
 
 ## Primary emblem
 
