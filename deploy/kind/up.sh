@@ -463,7 +463,21 @@ fi
 
 values="$(mktemp "$state/values.XXXXXX")"
 libs_dir="$(mktemp -d "$state/libs.XXXXXX")"
-trap 'rm -rf "$values" "$libs_dir"' EXIT
+# tunnel_unchecked: dogfood's cloudflared was applied and the outside check
+# below has not passed yet. Any exit in that window (a rollout timeout, a
+# failed command, Ctrl-C) scales it to 0, so a dev-insecure release is never
+# left public on a route nobody checked.
+tunnel_unchecked=0
+on_exit() {
+  rm -rf "$values" "$libs_dir"
+  if [ "$tunnel_unchecked" = 1 ]; then
+    echo "==> stopped before the tunnel check passed: scaling cloudflared to 0" >&2
+    ( kc scale deploy scarab-cloudflared -n "$ns" --replicas=0 >/dev/null 2>&1 ) || true
+  fi
+}
+trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 chmod 600 "$values"
 
 # The clone library (ADR-0076 §9): checkouts run `lib:thulasi-ram/clone` with
@@ -583,6 +597,7 @@ kc rollout status -n "$ns" statefulset/"$release-workspace" --timeout=180s
 FORGEJO_TUNNEL_URL="$tunnel_url" bash "$here/forgejo.sh"
 
 if [ "$mode" = dogfood ]; then
+  tunnel_unchecked=1
   kc apply -n "$ns" -f "$here/cloudflared.yaml" >/dev/null
   kc rollout status -n "$ns" deploy/scarab-cloudflared --timeout=120s
 
@@ -619,6 +634,7 @@ if [ "$mode" = dogfood ]; then
   (the catch-all rule then answers 404), and rerun 'just up dogfood'.
   The UI and API stay on $base. (000 or 5xx means the check could not reach the tunnel.)"
   fi
+  tunnel_unchecked=0
   webhook_code="$(public_code POST /webhooks/github)"
   echo "    / and /v1/repos -> 404 (not routed); unsigned POST /webhooks/github -> HTTP $webhook_code"
   case "$webhook_code" in
