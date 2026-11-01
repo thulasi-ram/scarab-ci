@@ -4,9 +4,9 @@
 # `just down keep`; `just down` deletes the cluster and the data with it.
 #
 # Each mode has its own database on this one server: `scarab` for `just up`,
-# `scarab_dogfood` for `just dogfood`. deploy/kind/up.sh creates the database a
-# mode needs (ADR-0077 Amendment: a mode is a set of values, isolated by
-# database URL and bucket).
+# `scarab_dogfood` for `just dogfood`, `scarab_e2e` for the test recipes.
+# deploy/kind/up.sh creates the database a mode needs (ADR-0077 Amendment: a
+# mode is a set of values, isolated by database URL and bucket).
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:

@@ -3,12 +3,19 @@
 # cluster `scarab-dev`, Postgres and MinIO in it, and one Helm release of the
 # real chart whose server and Depot run a binary built on the host.
 #
-#   deploy/kind/up.sh [dev|dogfood]
+#   deploy/kind/up.sh [dev|dogfood|e2e]
 #
 #   dev      (`just up`)      dev-insecure, database `scarab`, bucket `scarab-logs`
 #   dogfood  (`just dogfood`) GitHub App mode from ~/.config/scarab/dogfood.env,
 #                             database `scarab_dogfood`, bucket `scarab-dogfood`,
 #                             and a cloudflared tunnel to the public hostname
+#   e2e      (`just e2e`, `just forgejo-verify`, `just kube-tests`)
+#                             dev-insecure, database `scarab_e2e`, bucket
+#                             `scarab-e2e`, so test data never mixes with dev's
+#
+# SCARAB_KIND_EXTRA_VALUES names one more Helm values file, applied last (for
+# example the Forgejo tier's public URL and webhook secret). It is not
+# remembered: `just reload` re-applies the mode without it.
 #
 # Idempotent: re-running rebuilds the binary and rolls the Pods only when the
 # binary changed. `just reload` is the short path for that alone.
@@ -35,12 +42,11 @@ set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
 # shellcheck source=deploy/kind/lib.sh
-. "$here/lib.sh"   # cluster, node, ns, release, kubeconfig, kc, hc, die
+. "$here/lib.sh"   # cluster, node, ns, release, node_port, kubeconfig, kc, hc, die
 mode="${1:-dev}"
 state="$here/.state"           # gitignored: generated config, dev secrets
 mount="$here/.mount"           # gitignored: staged binaries + UI, mounted on the node
 node_mount=/scarab             # where $mount appears on the kind node
-node_port=30080                # service.nodePort in values.yaml
 dogfood_env="${SCARAB_DOGFOOD_ENV:-$HOME/.config/scarab/dogfood.env}"
 
 need() { command -v "$1" >/dev/null 2>&1 || die "'$1' not found on PATH"; }
@@ -51,9 +57,13 @@ helm_major="$(helm version --template '{{.Version}}' 2>/dev/null | sed -n 's/^v\
 [ "${helm_major:-0}" -ge 4 ] || die "Helm 4 is required (found $(helm version --short 2>/dev/null || echo none)); see https://helm.sh/docs/intro/install/"
 
 case "$mode" in
-  dev|dogfood) ;;
-  *) die "unknown mode '$mode' (expected dev or dogfood)" ;;
+  dev|dogfood|e2e) ;;
+  *) die "unknown mode '$mode' (expected dev, dogfood or e2e)" ;;
 esac
+extra_values="${SCARAB_KIND_EXTRA_VALUES:-}"
+if [ -n "$extra_values" ]; then
+  [ -f "$extra_values" ] || die "SCARAB_KIND_EXTRA_VALUES=$extra_values does not exist"
+fi
 
 mkdir -p "$state" "$mount/bin"
 chmod 700 "$state"
@@ -86,14 +96,16 @@ if [ "$mode" = dogfood ]; then
   [ -f "$pem" ] || die "SCARAB_APP_PEM in $dogfood_env names a file that does not exist"
   database=scarab_dogfood
   bucket=scarab-dogfood
+elif [ "$mode" = e2e ]; then
+  database=scarab_e2e
+  bucket=scarab-e2e
 else
   database=scarab
   bucket=scarab-logs
 fi
 
-# The host port: SCARAB_ADDR from deploy/local-proc/.env (lib.sh scarab_addr;
-# `just ui`'s SCARAB_API_URL must name the same port). Only that key is read;
-# the rest of the file describes proc mode.
+# The host port: SCARAB_ADDR from deploy/kind/.env (lib.sh scarab_addr;
+# `just ui`'s SCARAB_API_URL must name the same port).
 scarab_addr   # addr_file, host_ip, host_port, base
 
 port_listening() { (exec 3<>"/dev/tcp/$1/$2") 2>/dev/null; }
@@ -170,8 +182,8 @@ fi
 
 # --- 2. the cluster ---------------------------------------------------------
 # A `scarab-dev` cluster must have this worktree's mount and this host port, both
-# fixed at creation. One created by proc mode (deploy/local-proc/kind.yaml), by
-# another worktree, or before SCARAB_ADDR changed has neither. Recreating it
+# fixed at creation. One created by another worktree, or before SCARAB_ADDR
+# changed, has neither. Recreating it
 # deletes its Postgres and MinIO data, so that needs SCARAB_KIND_RECREATE=1.
 misfit=""
 cluster_fits() {
@@ -179,7 +191,7 @@ cluster_fits() {
   local mounts ports
   mounts="$(docker inspect -f '{{range .Mounts}}{{.Source}}={{.Destination}}{{"\n"}}{{end}}' "$node")"
   printf '%s\n' "$mounts" | grep -qxF "$mount=$node_mount" \
-    || { misfit="it does not mount this worktree's $mount (another worktree or proc mode created it)"; return 1; }
+    || { misfit="it does not mount this worktree's $mount (another worktree created it)"; return 1; }
   ports="$(docker inspect -f '{{range $p, $b := .HostConfig.PortBindings}}{{range $b}}{{$p}}={{.HostIp}}:{{.HostPort}}{{"\n"}}{{end}}{{end}}' "$node")"
   printf '%s\n' "$ports" | grep -qxF "$node_port/tcp=$host_ip:$host_port" \
     || { misfit="it does not publish the API on $host_ip:$host_port (SCARAB_ADDR in $addr_file changed since it was created)"; return 1; }
@@ -203,8 +215,7 @@ else
   # is not a conflict: deleting the cluster frees it.
   if port_listening "${host_ip/0.0.0.0/127.0.0.1}" "$host_port" \
      && ! { [ "$exists" = 1 ] && docker port "$node" 2>/dev/null | grep -q ":$host_port\$"; }; then
-    die "something already listens on $host_ip:$host_port (SCARAB_ADDR in $addr_file).
-  A proc-mode server ('deploy/local-proc/down.sh' stops it) or a 'just serve'? Find it with:
+    die "something already listens on $host_ip:$host_port (SCARAB_ADDR in $addr_file). Find it with:
     lsof -nP -iTCP:$host_port -sTCP:LISTEN"
   fi
   if [ "$exists" = 1 ]; then
@@ -351,7 +362,7 @@ if [ -n "$last_mode" ] && [ "$last_mode" != "$mode" ]; then
   if [ "$active" != 0 ] && [ "${SCARAB_KIND_FORCE_SWITCH:-0}" != 1 ]; then
     die "refusing to switch $last_mode -> $mode: $active step Pod(s) of the $last_mode stack are still running.
   Let their Runs finish (or cancel them), then rerun. To switch anyway and fail them:
-    SCARAB_KIND_FORCE_SWITCH=1 just $([ "$mode" = dev ] && echo up || echo dogfood)"
+    SCARAB_KIND_FORCE_SWITCH=1 bash deploy/kind/up.sh $mode"
   fi
   echo "==> mode $last_mode -> $mode: deleting the Depot's warm PVC"
   kc delete statefulset -n "$ns" "$release-workspace" --ignore-not-found --wait=true >/dev/null
@@ -447,7 +458,7 @@ echo "==> helm upgrade --install $release (mode: $mode, database: $database, buc
 # --force-conflicts (Helm 4, checked at the top): Helm 4 applies server-side; a field touched with kubectl
 # would otherwise abort the whole upgrade. The values are the authority.
 hc upgrade --install "$release" "$root/deploy/helm/scarab" -n "$ns" \
-  -f "$here/values.yaml" -f "$values" --force-conflicts >/dev/null
+  -f "$here/values.yaml" -f "$values" ${extra_values:+-f "$extra_values"} --force-conflicts >/dev/null
 echo "$mode" > "$state/mode"
 kc rollout status -n "$ns" deploy/"$release" --timeout=180s
 kc rollout status -n "$ns" statefulset/"$release-workspace" --timeout=180s

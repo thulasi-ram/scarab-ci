@@ -11,6 +11,7 @@ cluster=scarab-dev
 node="$cluster-control-plane"
 ns=scarab
 release=scarab
+node_port=30080            # service.nodePort in values.yaml: the API on the node
 kubeconfig="$kind_dir/.kubeconfig"
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -30,16 +31,16 @@ env_get() {
 }
 
 # scarab_addr: the host address the stack answers on. SCARAB_ADDR from
-# deploy/local-proc/.env (.env.example when there is none), the one dev env
-# file `just ui` also reads. Normalised here for up.sh and the Justfile's demo
+# deploy/kind/.env (.env.example when there is none), the one dev env file
+# `just ui` also reads. Normalised here for up.sh and the Justfile's demo
 # recipes alike: a trailing comment, quotes and blanks are dropped; `localhost`
 # and an empty host mean 127.0.0.1; a missing port means 8080, and a bare
 # number is a port. Sets addr_file, host_ip, host_port and base (the URL to
 # call; 0.0.0.0 is called through 127.0.0.1).
 scarab_addr() {
   local raw
-  addr_file="$kind_dir/../local-proc/.env"
-  [ -f "$addr_file" ] || addr_file="$kind_dir/../local-proc/.env.example"
+  addr_file="$kind_dir/.env"
+  [ -f "$addr_file" ] || addr_file="$kind_dir/.env.example"
   raw="$(env_get "$addr_file" SCARAB_ADDR)"
   raw="${raw%%#*}"
   raw="$(printf '%s' "$raw" | tr -d "[:space:]\"'")"
