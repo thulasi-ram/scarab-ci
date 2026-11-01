@@ -17,7 +17,9 @@ fullnameOverride: ""
 # it holds that Step's launch intent claim, and renews the claim while it works
 # (a workspace drain can outlast the 30 s window), so two replicas never drive
 # one Pod at once; a replica that dies stops renewing and a peer takes the
-# intent over within 30 s.
+# intent over within 30 s. Admission is leader-only, and the leader's writes are
+# fenced on its lease term: a leader paused past its 30 s lease has its writes
+# refused once a peer takes over.
 replicaCount: 1
 
 # How the server Deployment is updated. `Recreate` stops every old server Pod

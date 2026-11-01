@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use scarab_engine::ports::{ExecHandle, ExecState, Lease};
+use scarab_engine::ports::{ExecHandle, ExecState, LeaderTerm, Lease};
 use scarab_engine::{
     Attempt, AttemptId, AttemptOutcome, Clock, ConcurrencyPolicy, Db, DbError, EventKind,
     ExecError, Executor, FailureKind, LogChunkMeta, OutboxId, OutboxMessage, RunId, RunService,
@@ -82,6 +82,17 @@ impl Clock for FakeClock {
     /// virtual time could never make it due.
     async fn sleep(&self, ms: u64) {
         tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    }
+}
+
+/// The in-memory leader fence (git-bug aaf4e3e): `leader` still holds its
+/// lease term, or [`DbError::NotLeader`]. Called with the state lock held, so
+/// the check and the write after it are one step, like the postgres
+/// transaction.
+fn holds_leader_term(st: &InMemoryState, leader: &LeaderTerm) -> Result<(), DbError> {
+    match st.leases.get(leader.resource()) {
+        Some((owner, _, term)) if owner == leader.owner() && *term == leader.term() => Ok(()),
+        _ => Err(DbError::NotLeader),
     }
 }
 
@@ -255,8 +266,8 @@ struct InMemoryState {
     forge_config_owned: std::collections::HashSet<String>,
     /// Webhook delivery-id replay guard: (forge kind token, delivery id).
     webhook_deliveries: std::collections::HashSet<(String, String)>,
-    /// Lease table: resource → (owner, expiry instant).
-    leases: HashMap<String, (String, std::time::Instant)>,
+    /// Lease table: resource → (owner, expiry instant, term).
+    leases: HashMap<String, (String, std::time::Instant, i64)>,
     /// Artifact versions (ADR-0052, immutable per attempt by ADR-0056),
     /// keyed (run, name, step, attempt).
     artifacts: HashMap<(RunId, String, StepId, AttemptId), scarab_engine::ArtifactRecord>,
@@ -300,6 +311,11 @@ struct InMemoryState {
 /// fake for driving the pure engine.
 pub struct InMemoryDb {
     state: Mutex<InMemoryState>,
+    /// The leader fence's row lock (git-bug aaf4e3e), mirroring postgres
+    /// `FOR SHARE` on the lease row: a `fenced_write` holds it shared across
+    /// its write, and a lease takeover needs it exclusively — or, like the
+    /// postgres `lock_timeout`, gives up and reports the holder unchanged.
+    fence_gate: tokio::sync::RwLock<()>,
     /// A one-shot hook the next call of the named method awaits before it
     /// does anything — see [`interleave_before_next`](Self::interleave_before_next).
     /// Kept outside `state` so the hook can call back into this store.
@@ -314,6 +330,7 @@ impl InMemoryDb {
     pub fn new() -> Self {
         Self {
             state: Mutex::new(InMemoryState::default()),
+            fence_gate: tokio::sync::RwLock::new(()),
             interleave: Mutex::new(None),
         }
     }
@@ -688,8 +705,13 @@ fn attempt_order_key(a: &Attempt) -> u64 {
 
 #[async_trait]
 impl Db for InMemoryDb {
-    async fn claim_ready_steps(&self, limit: u32) -> Result<Vec<StepRun>, DbError> {
+    async fn claim_ready_steps(
+        &self,
+        leader: &LeaderTerm,
+        limit: u32,
+    ) -> Result<Vec<StepRun>, DbError> {
         let mut st = self.state.lock().unwrap();
+        holds_leader_term(&st, leader)?;
         let mut claimed = Vec::new();
         // Deterministic order for tests.
         let mut keys: Vec<(RunId, StepId)> = st
@@ -1096,8 +1118,14 @@ impl Db for InMemoryDb {
         Ok(self.state.lock().unwrap().concurrency.get(run).cloned())
     }
 
-    async fn acquire_slot(&self, group: &str, run: &RunId) -> Result<Option<RunId>, DbError> {
+    async fn acquire_slot(
+        &self,
+        leader: &LeaderTerm,
+        group: &str,
+        run: &RunId,
+    ) -> Result<Option<RunId>, DbError> {
         let mut st = self.state.lock().unwrap();
+        holds_leader_term(&st, leader)?;
         match st.slots.get(group).cloned() {
             None => {
                 st.slots.insert(group.to_string(), run.clone());
@@ -1422,12 +1450,14 @@ impl Db for InMemoryDb {
 
     async fn set_gate_wait_inputs(
         &self,
+        leader: &LeaderTerm,
         run: &RunId,
         step: &StepId,
         attempt: &AttemptId,
         inputs: &serde_json::Value,
     ) -> Result<bool, DbError> {
         let mut st = self.state.lock().unwrap();
+        holds_leader_term(&st, leader)?;
         let running = st
             .steps
             .get(&(run.clone(), step.clone()))
@@ -2052,6 +2082,7 @@ impl Db for InMemoryDb {
 
     async fn open_gate_wait(
         &self,
+        leader: &LeaderTerm,
         run: &RunId,
         step: &StepId,
         started_at: Timestamp,
@@ -2059,6 +2090,7 @@ impl Db for InMemoryDb {
     ) -> Result<Option<Attempt>, DbError> {
         // One lock = the Postgres transaction with the step row locked.
         let mut st = self.state.lock().unwrap();
+        holds_leader_term(&st, leader)?;
         let Some(rec) = st.steps.get_mut(&(run.clone(), step.clone())) else {
             return Ok(None);
         };
@@ -2492,43 +2524,47 @@ impl Db for InMemoryDb {
     }
 
     async fn lease(&self, resource: &str, owner: &str, ttl_ms: i64) -> Result<Lease, DbError> {
-        // Real lease semantics (the PG adapter's contract): the holder renews;
-        // a peer only takes over an EXPIRED lease. Wall-clock via Instant —
-        // a process-local fake needs no injected clock for expiry.
+        // Real lease semantics (the PG adapter's contract): the holder renews
+        // and keeps its term; a peer only takes over an EXPIRED lease, and the
+        // takeover starts the next term (git-bug aaf4e3e). Wall-clock via
+        // Instant — a process-local fake needs no injected clock for expiry.
+        // A takeover needs the fence gate exclusively: while a holder's
+        // `fenced_write` runs it is refused and the holder reported, as the
+        // postgres `lock_timeout` does.
+        let gate = self.fence_gate.try_write();
         let mut st = self.state.lock().unwrap();
         let now = std::time::Instant::now();
-        let entry = st.leases.entry(resource.to_string());
-        use std::collections::hash_map::Entry;
-        match entry {
-            Entry::Occupied(mut e) => {
-                let (holder, expires) = e.get().clone();
-                if holder == owner || now >= expires {
-                    e.insert((
-                        owner.to_string(),
-                        now + std::time::Duration::from_millis(ttl_ms as u64),
-                    ));
-                    Ok(Lease {
-                        owner: owner.to_string(),
-                        expires_at: Timestamp(ttl_ms),
-                    })
-                } else {
-                    Ok(Lease {
-                        owner: holder,
-                        expires_at: Timestamp(ttl_ms),
-                    })
-                }
-            }
-            Entry::Vacant(v) => {
-                v.insert((
-                    owner.to_string(),
-                    now + std::time::Duration::from_millis(ttl_ms as u64),
-                ));
-                Ok(Lease {
-                    owner: owner.to_string(),
+        let ttl = std::time::Duration::from_millis(ttl_ms.max(0) as u64);
+        let current = st.leases.get(resource).cloned();
+        let (holder, term) = match current {
+            None => (owner.to_string(), 1),
+            Some((holder, _, term)) if holder == owner => (holder, term),
+            Some((holder, expires, term)) if now < expires || gate.is_err() => {
+                return Ok(Lease {
+                    owner: holder,
                     expires_at: Timestamp(ttl_ms),
+                    term,
                 })
             }
-        }
+            Some((_, _, term)) => (owner.to_string(), term + 1),
+        };
+        st.leases
+            .insert(resource.to_string(), (holder.clone(), now + ttl, term));
+        Ok(Lease {
+            owner: holder,
+            expires_at: Timestamp(ttl_ms),
+            term,
+        })
+    }
+
+    async fn fenced_write<'a>(
+        &'a self,
+        leader: &'a LeaderTerm,
+        write: scarab_engine::ports::FencedWrite<'a>,
+    ) -> Result<(), DbError> {
+        let _shared = self.fence_gate.read().await;
+        holds_leader_term(&self.state.lock().unwrap(), leader)?;
+        write.await
     }
 }
 

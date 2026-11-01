@@ -17,11 +17,15 @@
 //!
 //! Everything below is a compiling skeleton — method bodies are stubs.
 
+pub mod leader;
 pub mod ports;
 pub mod render;
 pub mod scheduler;
 
-pub use ports::{Clock, Db, Executor, LogChunks, SnapshotRetention, WorkspaceSnapshots};
+pub use ports::{
+    Clock, Db, Executor, LeaderTerm, LogChunks, SnapshotRetention, WorkspaceSnapshots,
+    SCHEDULER_LEASE,
+};
 pub use scheduler::{
     cancel_run_request, fail_run_creation, gate_approvers, pin_run_snapshots, plan_rerun,
     record_gate_approval, reject_gate, release_gate, releases_plugin_gate, resolve_plugin_gate,
@@ -1377,6 +1381,12 @@ pub enum DbError {
     Unavailable,
     #[error("optimistic concurrency conflict")]
     Conflict,
+    /// A leader-only write was refused: the caller's [`LeaderTerm`] no longer
+    /// holds the lease (git-bug aaf4e3e). Not a fault — the caller lost
+    /// leadership while it was paused or slow — so the scheduler ends that
+    /// leader leg quietly; it is never counted toward a dead-letter.
+    #[error("not the leader: the lease moved to another owner or a later term")]
+    NotLeader,
     #[error("db error: {0}")]
     Other(String),
 }

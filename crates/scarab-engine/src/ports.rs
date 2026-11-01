@@ -17,7 +17,65 @@ use crate::{
 pub struct Lease {
     pub owner: String,
     pub expires_at: Timestamp,
+    /// The lease's **term** (git-bug aaf4e3e): incremented each time a
+    /// different owner takes the lease over, never on a renewal. A holder's
+    /// writes are fenced on `(owner, term)`, so a holder that was paused past
+    /// its TTL, lost the lease and got it back still cannot write under the
+    /// term it held before.
+    pub term: i64,
 }
+
+impl Lease {
+    /// The fencing token for `owner`'s writes, when `owner` holds this lease.
+    pub fn held_by(&self, resource: &str, owner: &str) -> Option<LeaderTerm> {
+        (self.owner == owner).then(|| LeaderTerm {
+            resource: resource.to_string(),
+            owner: owner.to_string(),
+            term: self.term,
+        })
+    }
+}
+
+/// The lease resource the scheduler's leader holds (ADR-0003).
+pub const SCHEDULER_LEASE: &str = "scheduler";
+
+/// Proof, for one tick, that the caller held a leadership lease at a term
+/// (git-bug aaf4e3e). Leader-only writes take one, and the store refuses a
+/// write whose `(owner, term)` no longer holds the lease with
+/// [`DbError::NotLeader`]: a leader paused past its TTL (SIGSTOP, a GC
+/// pause, a VM suspend) resumes and cannot act on a term a peer has taken
+/// over. Obtained from [`Lease::held_by`]; the store re-checks it, so a value
+/// built by hand gains nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaderTerm {
+    resource: String,
+    owner: String,
+    term: i64,
+}
+
+impl LeaderTerm {
+    /// For a store adapter that must rebuild one, and for tests.
+    pub fn new(resource: impl Into<String>, owner: impl Into<String>, term: i64) -> Self {
+        Self {
+            resource: resource.into(),
+            owner: owner.into(),
+            term,
+        }
+    }
+    pub fn resource(&self) -> &str {
+        &self.resource
+    }
+    pub fn owner(&self) -> &str {
+        &self.owner
+    }
+    pub fn term(&self) -> i64 {
+        self.term
+    }
+}
+
+/// A write a store runs under a leader fence: see [`Db::fenced_write`].
+pub type FencedWrite<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), DbError>> + Send + 'a>>;
 
 /// One run's **cold-tier retention facts** for its Workspace Snapshots
 /// (ADR-0061 s5 / ADR-0050).
@@ -157,7 +215,15 @@ pub enum ExecState {
 pub trait Db: Send + Sync {
     /// Atomically claim up to `limit` ready steps for this worker, using a
     /// `SELECT … FOR UPDATE SKIP LOCKED`-style claim so replicas don't collide.
-    async fn claim_ready_steps(&self, limit: u32) -> Result<Vec<StepRun>, DbError>;
+    ///
+    /// Leader-only (git-bug aaf4e3e): refused with [`DbError::NotLeader`]
+    /// when `leader` no longer holds its lease term, checked in the claim's
+    /// own transaction.
+    async fn claim_ready_steps(
+        &self,
+        leader: &LeaderTerm,
+        limit: u32,
+    ) -> Result<Vec<StepRun>, DbError>;
 
     /// Create a new run in `Pending`, self-describing its `{ir_version,
     /// event_schema_version}` (ADR-0022).
@@ -496,7 +562,15 @@ pub trait Db: Send + Sync {
     /// holder had settled), or `Some(holder)` when a *different, still-active*
     /// run holds it. The atomicity is what serializes a concurrency group across
     /// replicas (ADR-0011).
-    async fn acquire_slot(&self, group: &str, run: &RunId) -> Result<Option<RunId>, DbError>;
+    ///
+    /// Leader-only (git-bug aaf4e3e): fenced on `leader` in its own
+    /// transaction, like [`claim_ready_steps`](Db::claim_ready_steps).
+    async fn acquire_slot(
+        &self,
+        leader: &LeaderTerm,
+        group: &str,
+        run: &RunId,
+    ) -> Result<Option<RunId>, DbError>;
 
     /// Release `group`'s slot if `run` holds it, letting a queued run acquire.
     async fn release_slot(&self, group: &str, run: &RunId) -> Result<(), DbError>;
@@ -671,8 +745,12 @@ pub trait Db: Send + Sync {
     /// gate's inputs, rendered when it is reached). Only while `attempt` is
     /// still `Running` and holds none: a wait's inputs are written once.
     /// Returns whether they were stored.
+    ///
+    /// Leader-only (git-bug aaf4e3e): fenced on `leader` in its own
+    /// transaction.
     async fn set_gate_wait_inputs(
         &self,
+        leader: &LeaderTerm,
         run: &RunId,
         step: &StepId,
         attempt: &AttemptId,
@@ -975,8 +1053,12 @@ pub trait Db: Send + Sync {
     /// transaction. The step-row lock is what serialises a mint against a
     /// concurrent [`resolve_gate_wait`](Db::resolve_gate_wait) or cancel: a
     /// mint can never land on a gate that already resolved.
+    ///
+    /// Leader-only (git-bug aaf4e3e): fenced on `leader` in its own
+    /// transaction.
     async fn open_gate_wait(
         &self,
+        leader: &LeaderTerm,
         run: &RunId,
         step: &StepId,
         started_at: Timestamp,
@@ -1186,8 +1268,28 @@ pub trait Db: Send + Sync {
 
     /// Acquire (or renew) a time-bounded lease over a named `resource` (a step
     /// id, `"scheduler"` leadership, …) for `owner`. Only an expired lease is
-    /// taken over; the returned [`Lease`] names the current holder.
+    /// taken over; the returned [`Lease`] names the current holder and its
+    /// term. A takeover increments the term; a renewal keeps it. A takeover
+    /// waits for (or, past a short lock timeout, gives up on) an in-flight
+    /// [`fenced_write`](Db::fenced_write) of the current holder, and reports
+    /// the holder unchanged.
     async fn lease(&self, resource: &str, owner: &str, ttl_ms: i64) -> Result<Lease, DbError>;
+
+    /// Run `write` only while `leader` holds its lease term (git-bug aaf4e3e).
+    /// Refused with [`DbError::NotLeader`] — `write` not run — when the lease
+    /// has another owner or a later term. While `write` runs, a takeover of
+    /// the lease waits for it, so a stale leader's write is refused or
+    /// ordered before the takeover, never interleaved with the new leader's
+    /// writes; no clock is assumed.
+    ///
+    /// For writes shared with non-leader callers. A Db method only the leader
+    /// calls takes the [`LeaderTerm`] itself and fences in its own
+    /// transaction (e.g. [`claim_ready_steps`](Db::claim_ready_steps)).
+    async fn fenced_write<'a>(
+        &'a self,
+        leader: &'a LeaderTerm,
+        write: FencedWrite<'a>,
+    ) -> Result<(), DbError>;
 }
 
 /// A best-effort **live tail** of a running unit's combined stdout/stderr, pulled

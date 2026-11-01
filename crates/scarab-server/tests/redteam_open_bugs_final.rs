@@ -656,6 +656,16 @@ both!(a_resent_cancel_enqueues_one_services_teardown);
 // and enqueues its launch. The launch is refused (no unit — survives), but
 // a1 is left outcome `Running` forever under a Cancelled step and Run.
 // ---------------------------------------------------------------------------
+/// A scheduler leader term on `db`, for calling the leader-only Db methods
+/// directly (git-bug aaf4e3e).
+async fn lead(db: &dyn Db) -> scarab_engine::LeaderTerm {
+    db.lease(scarab_engine::SCHEDULER_LEASE, "test-leader", 600_000)
+        .await
+        .unwrap()
+        .held_by(scarab_engine::SCHEDULER_LEASE, "test-leader")
+        .expect("the test holds the scheduler lease")
+}
+
 async fn an_attempt_minted_after_its_cancel_is_not_left_running(w: World) {
     w.seed_plain("rp").await;
     w.db.record_step_transition(
@@ -666,7 +676,7 @@ async fn an_attempt_minted_after_its_cancel_is_not_left_running(w: World) {
     )
     .await
     .unwrap();
-    let claimed = w.db.claim_ready_steps(10).await.unwrap();
+    let claimed = w.db.claim_ready_steps(&lead(&*w.db).await, 10).await.unwrap();
     assert!(claimed.iter().any(|s| s.step == id("build")));
     assert!(cancel_run_request(&*w.db, &w.clock, &rid("rp"), None)
         .await

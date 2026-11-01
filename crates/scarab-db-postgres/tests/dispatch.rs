@@ -14,6 +14,16 @@ use sqlx::Row;
 
 /// Many workers hammering `claim_ready_steps` in parallel each get disjoint
 /// steps: every ready step is claimed exactly once, none twice.
+/// A scheduler leader term on `db`, for calling the leader-only Db methods
+/// directly (git-bug aaf4e3e).
+async fn lead(db: &dyn Db) -> scarab_engine::LeaderTerm {
+    db.lease(scarab_engine::SCHEDULER_LEASE, "test-leader", 600_000)
+        .await
+        .unwrap()
+        .held_by(scarab_engine::SCHEDULER_LEASE, "test-leader")
+        .expect("the test holds the scheduler lease")
+}
+
 #[tokio::test]
 async fn concurrent_claim_yields_no_double_dispatch() {
     let Some(tdb) = fresh_db().await else {
@@ -39,14 +49,16 @@ async fn concurrent_claim_yields_no_double_dispatch() {
         .unwrap();
 
     // Four workers drain concurrently until each sees the queue empty.
+    let leader = lead(&*db).await;
     const WORKERS: usize = 4;
     let mut handles = Vec::new();
     for _ in 0..WORKERS {
         let db = db.clone();
+        let leader = leader.clone();
         handles.push(tokio::spawn(async move {
             let mut mine = Vec::new();
             loop {
-                let batch = db.claim_ready_steps(3).await.unwrap();
+                let batch = db.claim_ready_steps(&leader, 3).await.unwrap();
                 if batch.is_empty() {
                     break;
                 }

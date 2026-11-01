@@ -18,7 +18,7 @@ use serde_json::Value;
 use sqlx::migrate::Migrator;
 use sqlx::{PgPool, Row};
 
-use scarab_engine::ports::Lease;
+use scarab_engine::ports::{FencedWrite, LeaderTerm, Lease};
 use scarab_engine::{
     Attempt, AttemptId, AttemptOutcome, ConcurrencyPolicy, Db, DbError, EventKind, EventPayload,
     FailureKind, LogChunkMeta, OutboxId, OutboxMessage, RunId, RunService, RunStatus, RunSummary,
@@ -134,7 +134,11 @@ impl PostgresDb {
 
 #[async_trait]
 impl Db for PostgresDb {
-    async fn claim_ready_steps(&self, limit: u32) -> Result<Vec<StepRun>, DbError> {
+    async fn claim_ready_steps(
+        &self,
+        leader: &LeaderTerm,
+        limit: u32,
+    ) -> Result<Vec<StepRun>, DbError> {
         // Atomic dequeue: the inner SELECT locks up to `limit` ready rows with
         // FOR UPDATE SKIP LOCKED (concurrent claimers skip each other's locked
         // rows), and the outer UPDATE flips them to `running` in the same
@@ -153,10 +157,13 @@ impl Db for PostgresDb {
              )
              RETURNING run_id, step_id, status, needs, gate_kind",
         )
-        .bind(limit as i64)
-        .fetch_all(self.pool())
-        .await
-        .map_err(db_err)?;
+        .bind(limit as i64);
+        // Leader-only (git-bug aaf4e3e): the fence and the claim commit
+        // together, so a deposed leader claims nothing.
+        let mut tx = self.pool().begin().await.map_err(db_err)?;
+        hold_leader_term(&mut tx, leader).await?;
+        let rows = rows.fetch_all(&mut *tx).await.map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
 
         let mut claimed = Vec::with_capacity(rows.len());
         for r in rows {
@@ -921,9 +928,15 @@ impl Db for PostgresDb {
         }))
     }
 
-    async fn acquire_slot(&self, group: &str, run: &RunId) -> Result<Option<RunId>, DbError> {
+    async fn acquire_slot(
+        &self,
+        leader: &LeaderTerm,
+        group: &str,
+        run: &RunId,
+    ) -> Result<Option<RunId>, DbError> {
         // Serialize acquirers on this group with a row lock, so exactly one wins.
         let mut tx = self.pool().begin().await.map_err(db_err)?;
+        hold_leader_term(&mut tx, leader).await?;
         let holder: Option<String> =
             sqlx::query("SELECT holder FROM concurrency_slots WHERE group_key = $1 FOR UPDATE")
                 .bind(group)
@@ -1379,11 +1392,14 @@ impl Db for PostgresDb {
 
     async fn set_gate_wait_inputs(
         &self,
+        leader: &LeaderTerm,
         run: &RunId,
         step: &StepId,
         attempt: &AttemptId,
         inputs: &Value,
     ) -> Result<bool, DbError> {
+        let mut tx = self.pool().begin().await.map_err(db_err)?;
+        hold_leader_term(&mut tx, leader).await?;
         let stored = sqlx::query(&format!(
             "UPDATE attempts SET gate_inputs = $4
              WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3
@@ -1393,10 +1409,11 @@ impl Db for PostgresDb {
         .bind(&step.0)
         .bind(&attempt.0)
         .bind(inputs)
-        .execute(self.pool())
+        .execute(&mut *tx)
         .await
         .map_err(db_err)?
         .rows_affected();
+        tx.commit().await.map_err(db_err)?;
         Ok(stored == 1)
     }
 
@@ -2121,6 +2138,7 @@ impl Db for PostgresDb {
 
     async fn open_gate_wait(
         &self,
+        leader: &LeaderTerm,
         run: &RunId,
         step: &StepId,
         started_at: Timestamp,
@@ -2130,6 +2148,7 @@ impl Db for PostgresDb {
         // cancel of this gate waits for the mint, or the mint sees its result.
         // An early return drops `tx`, which rolls it back.
         let mut tx = self.pool().begin().await.map_err(db_err)?;
+        hold_leader_term(&mut tx, leader).await?;
         if !lock_pending_step(&mut tx, run, step).await? {
             return Ok(None);
         }
@@ -2763,47 +2782,117 @@ impl Db for PostgresDb {
     async fn lease(&self, resource: &str, owner: &str, ttl_ms: i64) -> Result<Lease, DbError> {
         // Acquire or renew, taking over only an expired lease. The holder's own
         // re-request is a RENEWAL and must EXTEND `expires_at` (the port
-        // contract: the scheduler's `is_leader` re-leases every tick to keep
+        // contract: the scheduler's leader re-leases every tick to keep
         // leadership) — hence the `owner = EXCLUDED.owner` arm; without it a
         // constantly-renewing leader still expired after one TTL and a peer
         // could steal leadership at the boundary. A different owner only gets
-        // the DO UPDATE once the incumbent lease has expired. RETURNING yields
-        // the winning holder; if the incumbent lease is still valid the DO
-        // UPDATE is skipped and we read back the current holder instead.
+        // the DO UPDATE once the incumbent lease has expired, and that
+        // takeover starts a new TERM; a renewal keeps the term (git-bug
+        // aaf4e3e). RETURNING yields the winning holder; if the incumbent
+        // lease is still valid the DO UPDATE is skipped and we read back the
+        // current holder instead.
+        //
+        // ON CONFLICT DO UPDATE locks the row even when its WHERE skips the
+        // update, so this statement waits for a holder's in-flight
+        // `fenced_write` (it holds the row FOR SHARE). That wait is the fence:
+        // a takeover lands after the stale leader's write, never between its
+        // check and its commit. It is bounded by `lock_timeout` so a peer's
+        // tick never hangs behind a holder stopped mid-write; on the timeout
+        // the holder is reported unchanged and the peer tries next tick.
+        let mut tx = self.pool().begin().await.map_err(db_err)?;
+        sqlx::query("SET LOCAL lock_timeout = '2s'")
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
         let row = sqlx::query(
-            "INSERT INTO leases (resource, owner, expires_at)
-             VALUES ($1, $2, (extract(epoch from now()) * 1000)::bigint + $3)
+            "INSERT INTO leases (resource, owner, expires_at, term)
+             VALUES ($1, $2, (extract(epoch from now()) * 1000)::bigint + $3, 1)
              ON CONFLICT (resource) DO UPDATE
-               SET owner = EXCLUDED.owner, expires_at = EXCLUDED.expires_at
+               SET owner = EXCLUDED.owner,
+                   expires_at = EXCLUDED.expires_at,
+                   term = CASE WHEN leases.owner = EXCLUDED.owner
+                               THEN leases.term ELSE leases.term + 1 END
                WHERE leases.owner = EXCLUDED.owner
                   OR leases.expires_at < (extract(epoch from now()) * 1000)::bigint
-             RETURNING owner, expires_at",
+             RETURNING owner, expires_at, term",
         )
         .bind(resource)
         .bind(owner)
         .bind(ttl_ms)
-        .fetch_optional(self.pool())
-        .await
-        .map_err(db_err)?;
-
-        match row {
-            Some(r) => Ok(Lease {
-                owner: r.get::<String, _>("owner"),
-                expires_at: Timestamp(r.get::<i64, _>("expires_at")),
-            }),
+        .fetch_optional(&mut *tx)
+        .await;
+        let row = match row {
+            Ok(row) => {
+                tx.commit().await.map_err(db_err)?;
+                row
+            }
+            // lock_not_available: the holder is inside a fenced write.
+            Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("55P03") => {
+                drop(tx);
+                None
+            }
+            Err(e) => return Err(db_err(e)),
+        };
+        let r = match row {
+            Some(r) => r,
             None => {
                 // Not acquired: a valid lease is still held by someone else.
-                let r = sqlx::query("SELECT owner, expires_at FROM leases WHERE resource = $1")
+                // A plain read takes no row lock, so it does not wait.
+                sqlx::query("SELECT owner, expires_at, term FROM leases WHERE resource = $1")
                     .bind(resource)
                     .fetch_one(self.pool())
                     .await
-                    .map_err(db_err)?;
-                Ok(Lease {
-                    owner: r.get::<String, _>("owner"),
-                    expires_at: Timestamp(r.get::<i64, _>("expires_at")),
-                })
+                    .map_err(db_err)?
             }
-        }
+        };
+        Ok(Lease {
+            owner: r.get::<String, _>("owner"),
+            expires_at: Timestamp(r.get::<i64, _>("expires_at")),
+            term: r.get::<i64, _>("term"),
+        })
+    }
+
+    async fn fenced_write<'a>(
+        &'a self,
+        leader: &'a LeaderTerm,
+        write: FencedWrite<'a>,
+    ) -> Result<(), DbError> {
+        // The fence transaction holds the lease row FOR SHARE while `write`
+        // runs on its own pooled connection and commits. A takeover's UPDATE
+        // of the row waits for this transaction (see `lease`), so the write
+        // either is refused here or commits before any takeover: the same
+        // ordering as running the check inside the write's own transaction,
+        // without threading a transaction through every shared Db method.
+        // A deadlock is not possible: the only statement that wants this row
+        // exclusively is `lease`, and it holds no other lock.
+        let mut tx = self.pool().begin().await.map_err(db_err)?;
+        hold_leader_term(&mut tx, leader).await?;
+        let written = write.await;
+        tx.commit().await.map_err(db_err)?;
+        written
+    }
+}
+
+/// The leader fence (git-bug aaf4e3e): lock `leader`'s lease row FOR SHARE
+/// inside `tx`, or refuse with [`DbError::NotLeader`] when the lease has
+/// another owner or a later term. Held until `tx` ends, so a takeover waits
+/// for everything `tx` writes.
+async fn hold_leader_term(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    leader: &LeaderTerm,
+) -> Result<(), DbError> {
+    let held = sqlx::query(
+        "SELECT 1 FROM leases WHERE resource = $1 AND owner = $2 AND term = $3 FOR SHARE",
+    )
+    .bind(leader.resource())
+    .bind(leader.owner())
+    .bind(leader.term())
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(db_err)?;
+    match held {
+        Some(_) => Ok(()),
+        None => Err(DbError::NotLeader),
     }
 }
 

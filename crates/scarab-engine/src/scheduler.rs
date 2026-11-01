@@ -23,7 +23,8 @@ use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
-use crate::ports::{ExecHandle, ExecState, FailureClass};
+use crate::leader::LeaderDb;
+use crate::ports::{ExecHandle, ExecState, FailureClass, LeaderTerm, SCHEDULER_LEASE};
 
 /// The bounded auto-retry budget for **never-started infra** failures
 /// (ADR-0047): the step's main process never ran, so no side effect is
@@ -2073,6 +2074,7 @@ pub fn run_status_post_key(run: &RunId, generation: u64, to: RunStatus) -> Strin
 }
 
 /// Configuration knobs (sane slice-1 defaults via [`Scheduler::new`]).
+#[derive(Clone)]
 struct Config {
     lease_ttl_ms: i64,
     outbox_batch: u32,
@@ -2438,35 +2440,70 @@ impl<'a> Scheduler<'a> {
     pub async fn sweep_unfinished_creations(
         &self,
     ) -> Result<Vec<(RunId, SchedulerError)>, SchedulerError> {
-        if !self.is_leader().await? {
+        let Some(term) = self.leader_term().await? else {
             return Ok(Vec::new());
-        }
+        };
+        let db = LeaderDb::new(self.db, term);
         let now = self.clock.now().await;
         let cutoff = Timestamp(now.0 - self.cfg.unfinished_creation_bound_ms);
         let mut isolated = Vec::new();
-        for run in self.db.unfinished_creations_before(cutoff).await? {
-            match fail_run_creation(self.db, &run, UNFINISHED_CREATION_REASON.into(), now).await {
+        for run in db.unfinished_creations_before(cutoff).await? {
+            match fail_run_creation(&db, &run, UNFINISHED_CREATION_REASON.into(), now).await {
                 Ok(()) | Err(DbError::Conflict) => {}
+                // Deposed mid-sweep (git-bug aaf4e3e): the new leader sweeps.
+                Err(DbError::NotLeader) => break,
                 Err(e) => isolated.push((run, e.into())),
             }
         }
         Ok(isolated)
     }
 
-    /// Are we the admission leader right now?
-    async fn is_leader(&self) -> Result<bool, SchedulerError> {
+    /// This replica's term as the scheduler leader, when it holds the lease
+    /// right now. Re-leasing renews it (the term stays); a takeover of an
+    /// expired lease starts a new term (git-bug aaf4e3e).
+    async fn leader_term(&self) -> Result<Option<LeaderTerm>, SchedulerError> {
         let lease = self
             .db
-            .lease("scheduler", &self.owner, self.cfg.lease_ttl_ms)
+            .lease(SCHEDULER_LEASE, &self.owner, self.cfg.lease_ttl_ms)
             .await?;
-        Ok(lease.owner == self.owner)
+        Ok(lease.held_by(SCHEDULER_LEASE, &self.owner))
+    }
+
+    /// This scheduler with its store swapped for the leader's fenced view
+    /// (git-bug aaf4e3e): a leader leg runs on it, so every write the leg
+    /// makes — through any helper it shares with non-leader paths — is
+    /// refused once `db`'s term no longer holds the lease.
+    fn as_leader<'b>(&self, db: &'b LeaderDb<'b>) -> Scheduler<'b>
+    where
+        'a: 'b,
+    {
+        Scheduler {
+            db,
+            clock: self.clock,
+            executor: self.executor,
+            snapshots: self.snapshots,
+            owner: self.owner.clone(),
+            cfg: self.cfg.clone(),
+            supervised: self.supervised.clone(),
+            health: self.health.clone(),
+        }
     }
 
     /// Admit ready work for `run` (leader-only) and emit launch intents.
+    ///
+    /// A leader deposed while it admits (its lease taken over after it was
+    /// paused past the TTL) has its next write refused with
+    /// [`DbError::NotLeader`]; the leg then ends quietly — no error, no
+    /// failure streak — and the new leader admits the run.
     pub async fn admit(&self, run: &RunId) -> Result<(), SchedulerError> {
-        if !self.is_leader().await? {
+        let Some(term) = self.leader_term().await? else {
             return Ok(());
-        }
+        };
+        let db = LeaderDb::new(self.db, term);
+        deposed_is_quiet(self.as_leader(&db).admit_as_leader(db.term(), run).await)
+    }
+
+    async fn admit_as_leader(&self, leader: &LeaderTerm, run: &RunId) -> Result<(), SchedulerError> {
         let status = self
             .db
             .run_status(run)
@@ -2503,7 +2540,7 @@ impl<'a> Scheduler<'a> {
                 }
             }
             if let Some((group, policy)) = self.db.run_concurrency(run).await? {
-                if let Some(holder) = self.db.acquire_slot(&group, run).await? {
+                if let Some(holder) = self.db.acquire_slot(leader, &group, run).await? {
                     if policy == ConcurrencyPolicy::CancelInProgress {
                         self.cancel_run(&holder).await?;
                     }
@@ -2519,7 +2556,7 @@ impl<'a> Scheduler<'a> {
         // `started_at` is its own clock start, and each is checked against its
         // own timer / `gate_expires_after`. Before any promotion, so a gate
         // that resolves now unblocks (or Skips) its dependents this same pass.
-        self.evaluate_waiting_gates(run).await?;
+        self.evaluate_waiting_gates(leader, run).await?;
 
         // A suspended run is one whose only outstanding work is gate waits.
         // It reopens as soon as that stops being true — a gate resolved, a
@@ -2706,7 +2743,11 @@ impl<'a> Scheduler<'a> {
 
         // Claim ready steps (atomic ready→running) and emit a launch intent per
         // claimed step, minting its next Attempt.
-        for claimed in self.db.claim_ready_steps(self.cfg.outbox_batch).await? {
+        for claimed in self
+            .db
+            .claim_ready_steps(leader, self.cfg.outbox_batch)
+            .await?
+        {
             let n = claimed.attempts.len() + 1;
             let attempt = AttemptId(format!("a{n}"));
             let now = self.clock.now().await;
@@ -4074,7 +4115,11 @@ impl<'a> Scheduler<'a> {
     ///
     /// A terminal gate is never re-evaluated. The gate step stays `Pending`
     /// throughout its wait.
-    async fn evaluate_waiting_gates(&self, run: &RunId) -> Result<(), SchedulerError> {
+    async fn evaluate_waiting_gates(
+        &self,
+        leader: &LeaderTerm,
+        run: &RunId,
+    ) -> Result<(), SchedulerError> {
         let steps = self.db.steps_of_run(run).await?;
         if !steps
             .iter()
@@ -4115,7 +4160,7 @@ impl<'a> Scheduler<'a> {
                     // reject, a cancel) — nothing to wait on.
                     match self
                         .db
-                        .open_gate_wait(run, &gate.step, started, now)
+                        .open_gate_wait(leader, run, &gate.step, started, now)
                         .await?
                     {
                         Some(a) => a,
@@ -4139,7 +4184,7 @@ impl<'a> Scheduler<'a> {
                 {
                     Ok(inputs) => {
                         self.db
-                            .set_gate_wait_inputs(run, &gate.step, &attempt.id, &inputs)
+                            .set_gate_wait_inputs(leader, run, &gate.step, &attempt.id, &inputs)
                             .await?;
                     }
                     Err(reason) => {
@@ -4933,9 +4978,14 @@ impl<'a> Scheduler<'a> {
     /// down once the run is terminal. Leader-only + executor-owning, like the
     /// launch reconcile. A run with no `services:` is a no-op.
     pub async fn reconcile_services(&self, run: &RunId) -> Result<(), SchedulerError> {
-        if !self.is_leader().await? {
+        let Some(term) = self.leader_term().await? else {
             return Ok(());
-        }
+        };
+        let db = LeaderDb::new(self.db, term);
+        deposed_is_quiet(self.as_leader(&db).reconcile_services_as_leader(run).await)
+    }
+
+    async fn reconcile_services_as_leader(&self, run: &RunId) -> Result<(), SchedulerError> {
         let services = self.pipeline_services(run).await?;
         if services.is_empty() {
             return Ok(());
@@ -5173,6 +5223,17 @@ impl<'a> Scheduler<'a> {
             })
             .await?;
         Ok(())
+    }
+}
+
+/// A leader leg that was refused because its term no longer holds the lease
+/// ([`DbError::NotLeader`], git-bug aaf4e3e) ends quietly: losing leadership
+/// is not a fault of the run, so it must not count toward the run's
+/// dead-letter bound or be logged as a tick error.
+fn deposed_is_quiet(r: Result<(), SchedulerError>) -> Result<(), SchedulerError> {
+    match r {
+        Err(SchedulerError::Db(DbError::NotLeader)) => Ok(()),
+        r => r,
     }
 }
 
