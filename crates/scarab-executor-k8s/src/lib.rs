@@ -804,7 +804,8 @@ impl K8sExecutor {
                     // DrainRecord LAST — so a record's existence implies the
                     // ingest completed.
                     let t_leg = std::time::Instant::now();
-                    let exec_outcome = self.exec_drain(pods, &name, &declared, &cache_dirs).await;
+                    let (exec_outcome, helper_line) =
+                        self.exec_drain(pods, &name, &declared, &cache_dirs).await;
                     let exec_drain_ms = t_leg.elapsed().as_millis();
                     // RECORD-FIRST classification: the record on the Depot is
                     // the truth about what the drain did; the exec outcome is
@@ -842,6 +843,13 @@ impl K8sExecutor {
                             return Err(DriveErr::OutputContract(cause))
                         }
                         DrainDecision::Transient(cause) => {
+                            // With no record, the helper's own last line is
+                            // the only account of why (which 422, which POST
+                            // error); keep it in the cause.
+                            let cause = match (&record, &helper_line) {
+                                (None, Some(line)) => format!("{cause}; the helper said: {line}"),
+                                _ => cause,
+                            };
                             return Err(self
                                 .drain_failure(pods, &name, &annotations, cause)
                                 .await)
@@ -1415,14 +1423,15 @@ impl K8sExecutor {
     /// [`exec_capture_stdout`](Self::exec_capture_stdout): no payload crosses
     /// this exec. The truth about the drain is the DrainRecord on the Depot;
     /// the caller classifies RECORD-FIRST and uses this outcome only as a hint
-    /// when there is no record.
+    /// when there is no record. The second value is the helper's last output
+    /// line ([`helper_last_line`]), for the cause when there is no record.
     async fn exec_drain(
         &self,
         pods: &Api<Pod>,
         pod: &str,
         output_globs: &[String],
         cache_dirs: &[String],
-    ) -> DrainExecOutcome {
+    ) -> (DrainExecOutcome, Option<String>) {
         use tokio::io::AsyncReadExt as _;
         let mut cmd: Vec<String> = vec![
             "scarab-wsfetch".to_string(),
@@ -1449,7 +1458,7 @@ impl K8sExecutor {
             Ok(proc) => proc,
             // The exec never started (container restarting, apiserver blip):
             // nothing ran, so nothing permanent can be concluded.
-            Err(e) => return DrainExecOutcome::StartFailed(e.to_string()),
+            Err(e) => return (DrainExecOutcome::StartFailed(e.to_string()), None),
         };
         // Before `join`, which takes the status receiver away.
         let status = proc.take_status();
@@ -1469,8 +1478,9 @@ impl K8sExecutor {
         if let Some(mut stdout) = proc.stdout() {
             let _ = stdout.read_to_end(&mut stdout_buf).await;
         }
+        let line = helper_last_line(&stderr_buf, &stdout_buf);
         if let Err(e) = proc.join().await {
-            return DrainExecOutcome::StatusLost(format!("exec join: {e}"));
+            return (DrainExecOutcome::StatusLost(format!("exec join: {e}")), line);
         }
         let status = match status {
             Some(fut) => fut.await,
@@ -1480,20 +1490,23 @@ impl K8sExecutor {
             // The frame can legitimately be torn down with the container (see
             // `exec_with_stdin`) — the record decides; absent one this is
             // indeterminate, never fatal.
-            return DrainExecOutcome::StatusLost("no status frame".to_string());
+            return (DrainExecOutcome::StatusLost("no status frame".to_string()), line);
         };
         if status.status.as_deref() == Some("Success") {
-            return DrainExecOutcome::Exit(0);
+            return (DrainExecOutcome::Exit(0), line);
         }
         if let Some(code) = exec_status_exit_code(&status) {
-            return DrainExecOutcome::Exit(code);
+            return (DrainExecOutcome::Exit(code), line);
         }
-        DrainExecOutcome::Failure(format!(
-            "reason={:?} message={:?} stderr_tail={:?}",
-            status.reason,
-            status.message,
-            tail_str(&stderr_buf, 512),
-        ))
+        (
+            DrainExecOutcome::Failure(format!(
+                "reason={:?} message={:?} stderr_tail={:?}",
+                status.reason,
+                status.message,
+                tail_str(&stderr_buf, 512),
+            )),
+            line,
+        )
     }
 }
 
@@ -1515,6 +1528,28 @@ fn exec_status_exit_code(
 }
 
 /// The last `max` bytes of a stream, lossily decoded — a diagnostic tail.
+/// The drain helper's last non-empty output line, stderr first (where
+/// `scarab-wsfetch drain` writes why it exits 12), else stdout, at most
+/// [`HELPER_LINE_MAX`] characters. `None` when it printed nothing.
+fn helper_last_line(stderr: &[u8], stdout: &[u8]) -> Option<String> {
+    let last = |b: &[u8]| {
+        String::from_utf8_lossy(b)
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .map(str::to_string)
+    };
+    let line = last(stderr).or_else(|| last(stdout))?;
+    if line.chars().count() <= HELPER_LINE_MAX {
+        return Some(line);
+    }
+    Some(line.chars().take(HELPER_LINE_MAX).collect::<String>() + "…")
+}
+
+/// How much of the helper's line a drain cause carries.
+const HELPER_LINE_MAX: usize = 400;
+
 fn tail_str(bytes: &[u8], max: usize) -> String {
     let start = bytes.len().saturating_sub(max);
     String::from_utf8_lossy(&bytes[start..]).into_owned()
@@ -9224,6 +9259,24 @@ mod tests {
             cache_roots: Default::default(),
             error: None,
         }
+    }
+
+    /// The cause of a drain with no record keeps the helper's own reason
+    /// (git-bug 068cc0b follow-up: an exit 12 said nothing about which 422).
+    /// Stderr's last line wins, stdout is the fallback, and it is bounded.
+    #[test]
+    fn the_helper_last_line_is_kept_bounded_stderr_first() {
+        let stderr = b"scarab-wsfetch: drain: drain state incomplete ... retrying in 500ms: x\n\
+                       scarab-wsfetch: drain: record POST still incomplete after 10000ms \xe2\x80\x94 handing over: 422 drain_state_incomplete\n\n";
+        assert_eq!(
+            helper_last_line(stderr, b"ingest done\n").as_deref(),
+            Some("scarab-wsfetch: drain: record POST still incomplete after 10000ms \u{2014} handing over: 422 drain_state_incomplete")
+        );
+        assert_eq!(helper_last_line(b"", b"only stdout\n").as_deref(), Some("only stdout"));
+        assert_eq!(helper_last_line(b"\n  \n", b""), None);
+        let long = "\u{e9}".repeat(HELPER_LINE_MAX + 50);
+        let got = helper_last_line(long.as_bytes(), b"").unwrap();
+        assert_eq!(got.chars().count(), HELPER_LINE_MAX + 1, "bounded, with an ellipsis");
     }
 
     fn error_record(
