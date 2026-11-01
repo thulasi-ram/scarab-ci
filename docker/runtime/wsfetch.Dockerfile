@@ -5,7 +5,7 @@
 # cannot come from a hostPath mount like the server does; it stays an image,
 # built in seconds from the binary deploy/kind/up.sh builds next to the server.
 #
-# Same posture as docker/wsfetch/Dockerfile: uid 65532 by default (the egress
+# Same user and layout as docker/wsfetch/Dockerfile: uid 65532 by default (the egress
 # container's securityContext sets root itself), /workspace and
 # /scarab/secrets present, tar available (Debian slim ships it).
 #
