@@ -21,7 +21,9 @@ import {
   administers,
   legacyRedirect,
   navGroups,
-  orgFromParam,
+  decodeParam,
+  FIRST_ORG_SECTION,
+  groupHome,
   orgHref,
   resolveSection,
   settingsHome,
@@ -53,12 +55,12 @@ export function AccountSettings() {
 /** `/orgs/:org/settings/:section?` — a section of one org's settings. */
 export function OrgSettings() {
   const params = useParams<{ org: string; section?: string }>();
-  return <SettingsShell kind="org" org={orgFromParam(params.org)} section={params.section} />;
+  return <SettingsShell kind="org" org={decodeParam(params.org)} section={params.section} />;
 }
 
-/** `/settings/server/:section` — a section only a global admin may use. */
+/** `/settings/server/:section?` — a section only a global admin may use. */
 export function ServerSettings() {
-  const params = useParams<{ section: string }>();
+  const params = useParams<{ section?: string }>();
   return <SettingsShell kind="server" section={params.section} />;
 }
 
@@ -86,11 +88,9 @@ export function LegacySettings() {
 function SettingsShell(props: { kind: SettingsGroupKind; org?: string; section?: string }) {
   const section = () => resolveSection(props.kind, props.section);
   return (
-    // `/orgs/<org>/settings` alone opens the org's first section.
-    <Show
-      when={props.kind !== "org" || props.section}
-      fallback={<Navigate href={orgHref(props.org!, "connections")} />}
-    >
+    // `/orgs/<org>/settings` or `/settings/server` alone opens the group's
+    // first section.
+    <Show when={props.section} fallback={<Navigate href={groupHome(props.kind, props.org)} />}>
       <SettingsFrame kind={props.kind} org={props.org} section={props.section}>
         <Show when={section()} fallback={<NotFound />}>
           {(s) => <SectionPage kind={props.kind} org={props.org} section={s()} />}
@@ -244,7 +244,7 @@ function OrgSwitch(props: { org: string; others: string[]; section?: string }) {
       <select
         class="input settings-nav-orgpick mono"
         aria-label="Organization"
-        onChange={(e) => nav(orgHref(e.currentTarget.value, props.section ?? "connections"))}
+        onChange={(e) => nav(orgHref(e.currentTarget.value, props.section ?? FIRST_ORG_SECTION))}
       >
         <For each={[props.org, ...props.others].sort()}>
           {(o) => (

@@ -34,7 +34,7 @@ import {
   type SideCell,
 } from "../libraries";
 import Icon from "../components/Icon";
-import { orgFromParam, orgHref } from "../settings-nav";
+import { decodeParam, orgHref } from "../settings-nav";
 import { me } from "../session";
 import { SettingsCrumbs, SettingsFrame } from "./Settings";
 
@@ -44,7 +44,7 @@ const one = (v: string | string[] | undefined) => (Array.isArray(v) ? v[0] ?? ""
  *  it only to an admin of the org. */
 export default function LibraryReview() {
   const params = useParams<{ org: string }>();
-  const org = () => orgFromParam(params.org);
+  const org = () => decodeParam(params.org);
   return (
     <SettingsFrame kind="org" org={org()} section="libraries">
       {/* Keyed: the review holds what it fetched for one org, so another org

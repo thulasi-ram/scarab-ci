@@ -7,6 +7,7 @@
 // reviewed, naming the hash it replaces). These helpers only let the form say
 // what is wrong before the round trip; where they could disagree, the server
 // wins and its text is shown.
+import { libraryReviewHref } from "./settings-nav";
 
 const SEGMENT = /^[A-Za-z0-9_][A-Za-z0-9._-]{0,99}$/;
 const COMMIT = /^([0-9a-f]{40}|[0-9a-f]{64})$/;
@@ -333,7 +334,7 @@ export function reviewHref(
   const q = new URLSearchParams();
   for (const [k, v] of Object.entries(p)) if (v) q.set(k, v);
   const s = q.toString();
-  return `/orgs/${encodeURIComponent(org)}/settings/libraries/review${s ? `?${s}` : ""}`;
+  return `${libraryReviewHref(org)}${s ? `?${s}` : ""}`;
 }
 
 /** A library Scarab's release manifest lists, as the review page offers it:

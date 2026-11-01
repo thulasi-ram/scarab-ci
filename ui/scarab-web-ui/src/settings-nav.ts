@@ -47,9 +47,13 @@ export const ORG_SECTIONS: readonly SettingsSection[] = [
   { id: "libraries", label: "Libraries", sub: "installed libraries" },
   { id: "secrets", label: "Secrets", sub: "org-wide secrets" },
   { id: "tokens", label: "API tokens", sub: "machine credentials" },
-  { id: "security", label: "Security", sub: "step-up posture and recent refusals" },
+  { id: "security", label: "Security", sub: "step-up settings and recent refusals" },
   { id: "events", label: "Event log", sub: "every security event, filterable" },
 ];
+
+/** An org's home section: where `/orgs/<org>/settings` opens, and where
+ *  switching org lands when no section is in view. */
+export const FIRST_ORG_SECTION = ORG_SECTIONS[0]!.id;
 
 // Global admins only.
 export const SERVER_SECTIONS: readonly SettingsSection[] = [
@@ -67,9 +71,12 @@ export const serverHref = (section: string) => `/settings/server/${section}`;
 export const orgHref = (org: string, section: string) =>
   `/orgs/${encodeURIComponent(org)}/settings/${section}`;
 
-/** The org from a route's `:org` param, which the router leaves
- *  percent-encoded; a malformed escape stays as written. */
-export function orgFromParam(raw: string): string {
+/** The library review page of `org`, without a query. */
+export const libraryReviewHref = (org: string) => `${orgHref(org, "libraries")}/review`;
+
+/** A route param (`:org`, `:env`), which the router leaves percent-encoded,
+ *  decoded; a malformed escape stays as written. */
+export function decodeParam(raw: string): string {
   try {
     return decodeURIComponent(raw);
   } catch {
@@ -104,7 +111,7 @@ export function activeSectionHref(pathname: string): string | null {
     return resolveSection("account", parts[1]) ? accountHref(parts[1]) : null;
   }
   if (parts[0] === "orgs" && parts[1] !== undefined && parts[2] === "settings" && parts[3] !== undefined) {
-    return resolveSection("org", parts[3]) ? orgHref(orgFromParam(parts[1]), parts[3]) : null;
+    return resolveSection("org", parts[3]) ? orgHref(decodeParam(parts[1]), parts[3]) : null;
   }
   return null;
 }
@@ -161,6 +168,14 @@ export function navGroups(who: SettingsCaller, org: string | undefined): NavGrou
   return groups;
 }
 
+/** Where a group's URL with no section opens: its first section
+ *  (`/orgs/<org>/settings`, `/settings/server`). */
+export function groupHome(kind: SettingsGroupKind, org?: string): string {
+  if (kind === "org" && org !== undefined) return orgHref(org, FIRST_ORG_SECTION);
+  if (kind === "server") return serverHref(SERVER_SECTIONS[0]!.id);
+  return accountHref(ACCOUNT_SECTIONS[0]!.id);
+}
+
 /**
  * Where `/settings` lands: the first org's first section; for a global admin
  * with no org yet, Connect a forge (the only way an org comes to exist); else
@@ -168,9 +183,9 @@ export function navGroups(who: SettingsCaller, org: string | undefined): NavGrou
  */
 export function settingsHome(who: SettingsCaller): string {
   const org = who.can_administer ? who.admin_orgs[0] : undefined;
-  if (org) return orgHref(org, ORG_SECTIONS[0]!.id);
-  if (who.global_admin) return serverHref(SERVER_SECTIONS[0]!.id);
-  return accountHref(ACCOUNT_SECTIONS[0]!.id);
+  if (org) return groupHome("org", org);
+  if (who.global_admin) return groupHome("server");
+  return groupHome("account");
 }
 
 /**
@@ -189,7 +204,7 @@ export function legacyRedirect(pathname: string, search: string, who: SettingsCa
       return settingsHome(who) + search;
     case "/settings/libraries/review": {
       const org = who.admin_orgs[0];
-      return org ? `${orgHref(org, "libraries")}/review${search}` : settingsHome(who);
+      return org ? `${libraryReviewHref(org)}${search}` : settingsHome(who);
     }
     default:
       return null;

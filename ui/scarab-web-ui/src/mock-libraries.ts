@@ -1,11 +1,11 @@
-// ADR-0076 fixtures for mock mode (`just ui mock`): libraries with every
+// Library fixtures for mock mode (`just ui mock`): libraries with every
 // badge, a yank's impact, an upgrade to review, Runs whose Steps come from
 // libraries (one with a yanked version), a plugin gate in each of its four
 // states, a Pipeline that does not compile, and refused triggers in the Runs
 // list. Page query parameters pick a variant, so each screen can be
 // captured:
 //
-//   /settings?libs=empty | ?libs=missing        the two empty states
+//   /orgs/acme/settings/libraries?libs=empty | ?libs=missing   the two empty states
 //   /acme/edge-gateway/runs/<PLUGIN>?gate=pass | exp | kill
 //   /acme/orders-api/run                         the compile errors (pick release)
 //   /acme/orders-api?status=refused              refused rows

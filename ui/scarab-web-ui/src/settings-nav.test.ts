@@ -5,9 +5,11 @@ import {
   SERVER_SECTIONS,
   accountHref,
   activeSectionHref,
+  groupHome,
   legacyRedirect,
+  libraryReviewHref,
   navGroups,
-  orgFromParam,
+  decodeParam,
   orgHref,
   paletteEntries,
   resolveSection,
@@ -39,9 +41,9 @@ describe("route table", () => {
   });
 
   it("decodes the org from a route param, and keeps a malformed one as written", () => {
-    expect(orgFromParam("a%20b%2Fc")).toBe("a b/c");
-    expect(orgFromParam("acme")).toBe("acme");
-    expect(orgFromParam("bad%zz")).toBe("bad%zz");
+    expect(decodeParam("a%20b%2Fc")).toBe("a b/c");
+    expect(decodeParam("acme")).toBe("acme");
+    expect(decodeParam("bad%zz")).toBe("bad%zz");
   });
 
   it("resolves a known section and refuses an unknown one", () => {
@@ -191,6 +193,35 @@ describe("where /settings lands", () => {
   });
   it("still sends a global admin with an org to that org", () => {
     expect(settingsHome(globalWithOrg)).toBe("/orgs/acme/settings/connections");
+  });
+});
+
+describe("a group's URL with no section", () => {
+  it("opens the group's first section", () => {
+    expect(groupHome("org", "acme")).toBe("/orgs/acme/settings/connections");
+    expect(groupHome("server")).toBe("/settings/server/connect-forge");
+    expect(groupHome("account")).toBe("/settings/profile");
+  });
+
+  it("escapes the org", () => {
+    expect(groupHome("org", "a b")).toBe("/orgs/a%20b/settings/connections");
+  });
+});
+
+describe("the library review page", () => {
+  it("lives under the org's Libraries section", () => {
+    expect(libraryReviewHref("acme")).toBe("/orgs/acme/settings/libraries/review");
+    expect(libraryReviewHref("a b")).toBe("/orgs/a%20b/settings/libraries/review");
+    expect(activeSectionHref(libraryReviewHref("acme"))).toBe(orgHref("acme", "libraries"));
+  });
+});
+
+describe("section copy", () => {
+  it("uses none of the words docs/WRITING.md bans", () => {
+    const banned = /\b(posture|substrate|wedge|honest|honestly|load-bearing|first-class|seam|lens|leverage|delve)\b/i;
+    for (const s of [...ACCOUNT_SECTIONS, ...ORG_SECTIONS, ...SERVER_SECTIONS]) {
+      expect(`${s.label} ${s.sub}`, s.id).not.toMatch(banned);
+    }
   });
 });
 
