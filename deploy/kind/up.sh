@@ -598,6 +598,13 @@ if e["V_MODE"] == "chaos":
     v["replicaCount"] = 2
     v["workspace"] = {"replicaCount": 2}
     v["plugins"] = {"enabled": False}
+    # First-party libraries off: the Cache probe binds a repo, and the first
+    # bind into an org installs the org's default libraries, which reads
+    # libs/clone.yaml from github.com. The fault tier makes no network calls
+    # and none of its pipelines use a library. An empty manifest alone would
+    # not do it: the server then reads its release's manifest from GitHub.
+    v["scarab"]["libsManifest"] = ""
+    v["scarab"]["extraEnv"] = {"SCARAB_LIBS_MANIFEST": "off"}
     # ADR-0077 rank 4 SIGSTOPs the scheduler leader for a little over the
     # 30 s lease TTL. At the chart's 3 failures x 15 s the kubelet restarts
     # the stopped server in that window and the scenario is INCONCLUSIVE;
