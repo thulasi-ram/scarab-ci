@@ -356,6 +356,7 @@ fn redact_orgless_confirmation(e: &mut SecurityEventDto) {
     summary = "My security events (ADR-0073 §7)",
     responses(
         (status = 200, body = SecurityEventsResponse),
+        (status = 400, description = "a cursor this server did not issue, or both cursor and before"),
         (status = 401, description = "not signed in"),
         (status = 403, description = "an API token: it never reads its owner's security history")
     )
@@ -396,6 +397,7 @@ pub(crate) async fn my_security_events(
     summary = "The install-wide security event log (ADR-0073 §7)",
     responses(
         (status = 200, body = SecurityEventsResponse),
+        (status = 400, description = "a cursor this server did not issue, or both cursor and before"),
         (status = 401, description = "not signed in"),
         (status = 403, description = "not a global administrator")
     )
