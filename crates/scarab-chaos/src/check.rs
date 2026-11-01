@@ -23,7 +23,7 @@
 //! | L1   | rank 4: a takeover of the scheduler lease increments `leases.term`, and the term never goes back (only where the column exists) |
 //! | L2   | rank 4: a peer takes the stopped leader's lease over within the TTL + 30 s, wherever the stop landed (inside a fenced write too: the fence's stall bound releases the lease row) |
 //! | W1   | the workload's own outcome: every scenario Run that ended, ended `succeeded`, and every green Attempt has an output snapshot |
-//! | N1   | `pause-node` (git-bug 070d042): no Attempt of a scenario Run finished with a lost-node verdict ("workspace snapshot lost", "egress sidecar died"); the node was paused, not lost. Any other failed Attempt is a warning |
+//! | N1   | `pause-node` (a freeze shorter than the Pod's grace): no Attempt of a scenario Run finished with a lost-node verdict ("workspace snapshot lost", "egress sidecar died"); the node was paused, not lost. Any other failed Attempt is a warning |
 //! | D1   | `two-replicas` (git-bug 068cc0b): no two different server replicas ran a drain of the same scenario Pod over overlapping time. Each drain's interval comes from the replica's `ws-timing` line with `leg: drain` (end = the line's timestamp, start = end − `total_ms`). A re-drive by another replica after the first drain ended is allowed |
 //! | C1   | the Cache probe (`crate::cache::c1`, git-bug 12e2f6b): when the seed Run succeeded and no fault hit the Cache's home replica, every restore of the probe Run is a hit from that home. Otherwise not exercised, with the reason as an info finding; it has no minimum |
 //!
@@ -539,11 +539,21 @@ pub fn exercised(kind: Kind, faults: &[Fault]) -> Vec<String> {
                     if !p.paused {
                         why.push(format!("{} {}: docker did not report the node paused", x.action, x.pod));
                     }
+                    // Past the lease TTL and the claim window, so the frozen
+                    // servers' lease and claims lapse; short of the Pod's
+                    // grace, which no freeze is meant to survive.
                     let held_ms = x.resumed_at_ms.map(|r| r - x.fired_at_ms).unwrap_or(0);
-                    if held_ms < (p.ceiling_secs as i64) * 1000 {
+                    if held_ms <= (p.floor_secs as i64) * 1000 {
                         why.push(format!(
-                            "{} {}: paused {held_ms} ms, not past the {} s sidecar reporting ceiling",
-                            x.action, x.pod, p.ceiling_secs
+                            "{} {}: paused {held_ms} ms, not past the {} s lease TTL and claim window",
+                            x.action, x.pod, p.floor_secs
+                        ));
+                    }
+                    if held_ms >= (p.grace_secs as i64) * 1000 {
+                        why.push(format!(
+                            "{} {}: paused {held_ms} ms, not short of the Pod's {} s grace period (the kubelet \
+                             kills the egress on the resume; pause-node checks a freeze shorter than that)",
+                            x.action, x.pod, p.grace_secs
                         ));
                     }
                 }
@@ -1040,7 +1050,7 @@ pub fn evaluate(f: &Facts) -> Verdict {
         checked.insert("L2".into(), l2);
     }
 
-    // N1: no lost-node verdict across a node pause (git-bug 070d042).
+    // N1: no lost-node verdict across a freeze shorter than the Pod's grace.
     if f.kind == Some(Kind::PauseNode) {
         let (n, found) = lost_node_verdicts(&f.events);
         findings.extend(found);
@@ -1830,8 +1840,8 @@ mod tests {
         assert_eq!(failed(&evaluate(&f)), vec!["I10"]);
     }
 
-    /// git-bug 070d042's verdict (the executor's cause from `settled_state`)
-    /// fails N1; a clean finish passes it; any other failure is a warning.
+    /// A lost-node verdict (the executor's cause from `settled_state`) after
+    /// a freeze shorter than the grace fails N1; a clean finish passes it; any other failure is a warning.
     #[test]
     fn a_lost_node_verdict_fails_n1() {
         let mut f = base();
@@ -1871,8 +1881,9 @@ mod tests {
         assert!(!evaluate(&f).checked.contains_key("N1"));
     }
 
-    /// A pause that docker did not report, or that ended before the sidecar
-    /// reporting ceiling, did not test git-bug 070d042.
+    /// A pause that docker did not report, that did not outlast the lease TTL
+    /// and claim window, or that reached the Pod's grace, did not test what
+    /// pause-node names.
     #[test]
     fn a_short_or_missing_pause_is_inconclusive() {
         let fault = |paused: bool, held_s: i64| Fault {
@@ -1883,18 +1894,20 @@ mod tests {
             resumed_at_ms: Some(held_s * 1000),
             landing: Some(crate::scenario::classify(Kind::MidDrain, 0, Some(-1), None)),
             pause: Some(crate::scenario::NodePause {
-                ceiling_secs: 900,
-                planned_secs: 930,
+                grace_secs: 600,
+                floor_secs: 30,
+                planned_secs: 240,
                 paused,
                 unpaused: true,
                 ..Default::default()
             }),
             ..Default::default()
         };
-        assert_eq!(exercised(Kind::PauseNode, &[fault(true, 930)]), Vec::<String>::new());
-        assert!(exercised(Kind::PauseNode, &[fault(false, 930)])[0].contains("did not report the node paused"));
-        assert!(exercised(Kind::PauseNode, &[fault(true, 600)])[0].contains("not past the 900 s"));
-        let mut late = fault(true, 930);
+        assert_eq!(exercised(Kind::PauseNode, &[fault(true, 240)]), Vec::<String>::new());
+        assert!(exercised(Kind::PauseNode, &[fault(false, 240)])[0].contains("did not report the node paused"));
+        assert!(exercised(Kind::PauseNode, &[fault(true, 30)])[0].contains("not past the 30 s lease TTL"));
+        assert!(exercised(Kind::PauseNode, &[fault(true, 600)])[0].contains("not short of the Pod's 600 s grace"));
+        let mut late = fault(true, 240);
         late.landing = Some(crate::scenario::classify(Kind::MidDrain, 0, Some(-10), Some(-1)));
         assert!(exercised(Kind::PauseNode, &[late])[0].contains("landed after-window"));
     }

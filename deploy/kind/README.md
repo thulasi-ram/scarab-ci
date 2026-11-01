@@ -240,21 +240,22 @@ at two server replicas and two Depot replicas:
   that holds a launch claim SIGKILLed while its drain is in flight;
 - rank 4, `stop-leader`: the scheduler leader SIGSTOPped past its 30 s lease
   until a peer takes over, then SIGCONTed;
-- `pause-node` (git-bug 070d042, not an ADR-0077 rank): the whole kind node
-  `docker pause`d while a producer's drain is owed, past the sidecar
-  reporting ceiling, then `docker unpause`d. This is a host suspend: the
-  kubelet, the egress mid-drain and both servers freeze together, and the
-  wall clock jumps on the resume.
+- `pause-node` (not an ADR-0077 rank): the whole kind node `docker pause`d
+  while a producer's drain is owed, for longer than the 30 s lease TTL and
+  claim window and shorter than the Pod's grace period, then `docker
+  unpause`d. This is a host suspend: the kubelet, the egress mid-drain and
+  both servers freeze together, and the wall clock jumps on the resume. Every
+  Run must still succeed.
 
 Server signals are sent from the kind node, because the server is PID 1 in its
 container. The `scarab-chaos` binary (`crates/scarab-chaos`) fires the fault and
 then checks the invariants.
 
 ```sh
-just test chaos             # the five ranked scenarios (not pause-node), seed 1
+just test chaos             # all six scenarios, seed 1
 just test chaos rank2       # one rank
 just test chaos mid-feed 7  # one scenario, another seed
-just test chaos pause-node  # about 20 minutes; not part of `all`
+just test chaos pause-node  # about 8-10 minutes
 just test chaos replay deploy/kind/.chaos/<dir>/scenario.json
 ```
 
@@ -336,7 +337,7 @@ does not take the API's or a Step's word for success:
 | I8 | after quiesce, no Pod of a scenario Run is pending or running, and no per-Pod workspace Secret outlives its Pod |
 | I10 | no uncommitted pack row older than 60 s for a fence that has a drain record; every committed pack's object exists at its recorded size |
 | W1 | the workload's outcome (not an ADR-0077 §2 invariant): every scenario Run ends `succeeded`, and every green Attempt has an output snapshot |
-| N1 | `pause-node` only (git-bug 070d042): no Attempt finished with a lost-node cause ("workspace snapshot lost", "egress sidecar died"); any other failed Attempt is a warning |
+| N1 | `pause-node` only: no Attempt finished with a lost-node cause ("workspace snapshot lost", "egress sidecar died"); any other failed Attempt is a warning |
 | D1 | `two-replicas` only (git-bug 068cc0b): no two different server replicas drained the same scenario Pod over overlapping time. Each drain's interval comes from the replica's `ws-timing` line with `leg: drain` in `release-log.txt` (end = its timestamp, start = end − `total_ms`); a re-drive by another replica after the first drain ended passes. A drain that failed logs no `ws-timing` line. "drain helper exited 12 with no record posted" means a record POST failed (the Depot's `drain_state_incomplete` 422 at two Depot replicas, for one) and is printed as info |
 | C1 | the Cache probe (git-bug 12e2f6b): when the probe's seed Run succeeded and no fault hit the Cache's home Depot replica, every restore of the probe Run is a hit from that home. Otherwise it is printed `not exercised` with the reason, and it has no minimum |
 
@@ -363,15 +364,17 @@ retry, so rank 1 never exercises it; it is printed as such and not counted.
 
 N1 exists because the executor's lost-node verdict is an Infra failure that
 the engine retries: the Run can still end `succeeded` on a second Attempt and
-pass W1. `pause-node` pauses the node for the target Pod's
-`terminationGracePeriodSeconds` + 300 s (`RESULTS_DRAIN_SLACK_SECS` in
-`scarab-executor-k8s`) + 30 s. The producer is a workspace Pod with a grace
-of 600 s, so the pause is 930 s, and a scenario takes about 20 minutes. The
-pause is never longer than 20 minutes, and a scenario file that planned a
-longer one is refused. Its
+pass W1. `pause-node` pauses the node for min(grace − 120 s, 240 s), from the
+target Pod's recorded `terminationGracePeriodSeconds`. The producer is a
+workspace Pod with a grace of 600 s, so the pause is 240 s, and a scenario
+takes about 8-10 minutes. A freeze longer than the grace is not survivable by
+design: on the resume the kubelet SIGKILLs the egress sidecar and the Runs
+dead-letter (git-bug 070d042, closed as not a bug), so the scenario stays
+short of it. A scenario file that planned more than 240 s is refused. Its
 trigger and window are `mid-drain`'s, with a delay of 0 to 2 s. It is
 INCONCLUSIVE when the pause landed outside the drain window, when docker did
-not report the node paused, or when the pause ended before the ceiling. The
+not report the node paused, when it did not outlast the 30 s lease TTL and
+claim window, or when it reached the Pod's grace. The
 harness unpauses the node on every path it controls (a guard on every
 return, and a SIGINT or SIGTERM handler), and `chaos.sh` unpauses a paused
 node when it starts and first thing when it exits. If chaos.sh itself is

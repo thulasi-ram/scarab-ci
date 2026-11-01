@@ -17,9 +17,9 @@
 //! Kinds: mid-drain, mid-feed (rank 1: a Depot Pod deleted with grace 0),
 //! two-replicas (rank 2 with no fault), kill-server (rank 2: SIGKILL of the
 //! producer's claim holder), stop-leader (rank 4: SIGSTOP of the scheduler
-//! leader past the lease TTL, then SIGCONT), pause-node (git-bug 070d042:
-//! `docker pause` of the whole kind node mid-drain past the sidecar
-//! reporting ceiling, then `docker unpause`). See `scenario::Kind`.
+//! leader past the lease TTL, then SIGCONT), pause-node (`docker pause` of
+//! the whole kind node mid-drain, past the lease TTL and short of the Pod's
+//! grace period, then `docker unpause`). See `scenario::Kind`.
 //!
 //! Connections come from the environment `deploy/kind/chaos.sh` sets:
 //! SCARAB_CHAOS_API, SCARAB_CHAOS_KUBECONFIG, SCARAB_CHAOS_NAMESPACE,
@@ -184,8 +184,8 @@ async fn check_dir(conn: &Conn, file: &Path) -> Result<check::Outcome, String> {
             }
             if let Some(p) = &f.pause {
                 line += &format!(
-                    "; node {} paused: {}, planned {} s (sidecar ceiling {} s), unpaused: {}",
-                    p.node, p.paused, p.planned_secs, p.ceiling_secs, p.unpaused
+                    "; node {} paused: {}, planned {} s (floor {} s, Pod grace {} s), unpaused: {}",
+                    p.node, p.paused, p.planned_secs, p.floor_secs, p.grace_secs, p.unpaused
                 );
                 if let Some(e) = &p.error {
                     line += &format!(" ({e})");

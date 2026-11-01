@@ -11,14 +11,13 @@
 #                 launch claim while its drain is in flight
 #   stop-leader   rank 4: SIGSTOP the scheduler leader until a peer takes the
 #                 lease over (past the 30 s TTL), then SIGCONT it
-#   pause-node    git-bug 070d042: `docker pause` the whole kind node while a
-#                 producer's drain is owed, past the sidecar reporting ceiling
-#                 (the Pod's grace + 300 s + 30 s: 930 s for a workspace Pod),
-#                 then `docker unpause` it; no Attempt may end "workspace
-#                 snapshot lost". About 20 minutes, so not in `all`.
+#   pause-node    `docker pause` the whole kind node while a producer's drain
+#                 is owed, past the 30 s lease TTL and claim window and short
+#                 of the Pod's grace period (min(grace - 120 s, 240 s): 240 s
+#                 for a workspace Pod), then `docker unpause` it; every Run
+#                 must still succeed. Not an ADR-0077 rank; about 8-10 minutes.
 # Groups: rank1 (mid-drain mid-feed), rank2 (two-replicas kill-server),
-# rank4 (stop-leader), all (the five ranked scenarios, in that order;
-# pause-node only by name). The server signals go from the kind node's PID
+# rank4 (stop-leader), all (the five ranked scenarios, then pause-node). The server signals go from the kind node's PID
 # namespace (`docker exec <node> kill`), because the server is PID 1 in its
 # container; see crates/scarab-chaos/src/node.rs.
 #
@@ -74,7 +73,7 @@ case "$what" in
   rank1) kinds=(mid-drain mid-feed) ;;
   rank2) kinds=(two-replicas kill-server) ;;
   rank4) kinds=(stop-leader) ;;
-  all) kinds=(mid-drain mid-feed two-replicas kill-server stop-leader) ;;
+  all) kinds=(mid-drain mid-feed two-replicas kill-server stop-leader pause-node) ;;
   replay)
     [ -f "$arg" ] || die "just test chaos replay <scenario.json>: '$arg' does not exist"
     replay_file="$(cd "$(dirname "$arg")" && pwd)/$(basename "$arg")"

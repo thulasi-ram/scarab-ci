@@ -4,7 +4,7 @@
 //! goes into the scenario file. The faults: rank 1 deletes the planned Depot
 //! replica with grace 0; ranks 2 and 4 signal a server replica from the
 //! kind node (`crate::servers`); `pause-node` pauses the whole kind node
-//! container past the sidecar reporting ceiling (git-bug 070d042);
+//! container past the lease TTL and short of the Pod's grace period;
 //! `two-replicas` fires nothing.
 
 use std::path::{Path, PathBuf};
@@ -365,8 +365,8 @@ async fn delete_depot(
     })
 }
 
-/// `pause-node` (git-bug 070d042): `docker pause` the kind node for the
-/// target Pod's sidecar reporting ceiling + a margin (`scenario::pause_secs`),
+/// `pause-node`: `docker pause` the kind node for `scenario::pause_secs` (past
+/// the lease TTL and the claim window, short of the target Pod's grace),
 /// then `docker unpause` it, then re-open the harness's port-forwards and
 /// wait until Postgres and the kube API answer again. The node is unpaused
 /// on every path out of here (`UnpauseGuard`, and the signal handler
@@ -383,14 +383,16 @@ async fn pause_node(
     let held = view.as_ref().is_some_and(holds);
     let grace = view.as_ref().and_then(|p| p.grace_secs);
     let planned_secs = crate::scenario::pause_secs(grace);
-    let ceiling_secs = crate::scenario::sidecar_ceiling_secs(grace);
+    let grace_secs = crate::scenario::grace_or_default(grace);
+    let floor_secs = crate::scenario::pause_floor_secs();
     let fence_rows = match &t.attempt {
         Some(a) => fence_pack_rows(&stack.pg, &t.run, &t.step, a).await,
         None => None,
     };
     let mut pause = NodePause {
         node: node.name.clone(),
-        ceiling_secs,
+        grace_secs,
+        floor_secs,
         planned_secs,
         ..Default::default()
     };
@@ -404,7 +406,7 @@ async fn pause_node(
         Err(e) => errors.push(format!("after the pause: {e}")),
     }
     log(&format!(
-        "paused {} for {planned_secs} s (sidecar ceiling {ceiling_secs} s, grace {grace:?}); paused: {}; \
+        "paused {} for {planned_secs} s (floor {floor_secs} s, grace {grace_secs} s); paused: {}; \
          condition held: {held}; fence pack rows: {fence_rows:?}",
         node.name, pause.paused
     ));

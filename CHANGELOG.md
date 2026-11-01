@@ -185,10 +185,11 @@ record. Read Upgrading before you upgrade.
   `just release <version>` checks a release before it is tagged.
 - The fault tier (`just test chaos`, ADR-0077) runs ranks 1, 2 and 4: a Depot Pod deleted
   mid-drain and mid-feed, two server replicas sharing the work, a server replica killed while
-  it drains, and the scheduler leader paused past its lease. All five passed on 2026-11-01
-  (`just test chaos all 1`). `pause-node` (run by name, not in `all`) pauses the kind node
-  past the sidecar reporting ceiling. C1 checks that a Cache restores from its home replica
-  when no fault hit that replica.
+  it drains, and the scheduler leader paused past its lease. The five ranked scenarios passed
+  on 2026-11-01 (`just test chaos all 1`). `pause-node`, last in `all`, freezes the kind node
+  mid-drain for longer than the lease TTL and shorter than the Pod's grace period; every Run
+  must still succeed. C1 checks that a Cache restores from its home replica when no fault
+  hit that replica.
 - The ADR-0062 overlay change-set code, its tests and its recipes are deleted; ADR-0066 had
   already dropped the feature.
 

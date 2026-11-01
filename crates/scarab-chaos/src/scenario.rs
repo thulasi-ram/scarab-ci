@@ -13,44 +13,44 @@ pub const FORMAT: u32 = 1;
 /// a holder stops (`crates/scarab-engine/src/scheduler.rs`).
 pub const LEASE_TTL_SECS: u64 = 30;
 
-/// `RESULTS_DRAIN_SLACK_SECS` (`crates/scarab-executor-k8s/src/lib.rs`): the
-/// slack past a Pod's `terminationGracePeriodSeconds` after which the executor
-/// reads an egress sidecar still showing `running` as a lost node. The sidecar
-/// reporting ceiling is the step container's `finishedAt` + the grace + this.
-pub const RESULTS_DRAIN_SLACK_SECS: u64 = 300;
+/// The outbox claim window at k8s (`outbox_visibility_ms`, 30 s): a launch
+/// claim not renewed for this long can be taken by a peer.
+pub const CLAIM_WINDOW_SECS: u64 = 30;
 
-/// How much longer than the sidecar reporting ceiling `pause-node` keeps the
-/// node paused, so the first poll after the resume reads the ceiling as
-/// passed on the wall clock.
-pub const PAUSE_MARGIN_SECS: u64 = 30;
+/// How long before the producer Pod's `terminationGracePeriodSeconds` runs
+/// out the `pause-node` freeze ends. A freeze longer than the grace is not
+/// survivable by design: on the resume the kubelet SIGKILLs the egress
+/// sidecar (exit 137) and the Attempt is lost (git-bug 070d042, closed as not
+/// a bug).
+pub const GRACE_MARGIN_SECS: u64 = 120;
+
+/// The longest `pause-node` freeze: 240 s. A scenario file that planned more
+/// is refused ([`Scenario::read`]).
+pub const MAX_PAUSE_SECS: u64 = 240;
 
 /// The Kubernetes default `terminationGracePeriodSeconds`, for a Pod record
 /// that does not carry one.
 pub const DEFAULT_GRACE_SECS: u64 = 30;
 
-/// The longest `pause-node` ever pauses the kind node: 20 minutes. A Pod
-/// record with a huge grace must not freeze the developer's whole stack for
-/// hours, and a scenario file that planned more is refused
-/// ([`Scenario::read`]).
-pub const MAX_PAUSE_SECS: u64 = 20 * 60;
-
-/// The sidecar reporting ceiling of a Pod whose
-/// `terminationGracePeriodSeconds` is `grace_secs`: grace +
-/// [`RESULTS_DRAIN_SLACK_SECS`].
-pub fn sidecar_ceiling_secs(grace_secs: Option<i64>) -> u64 {
-    let grace = grace_secs.and_then(|g| u64::try_from(g).ok()).unwrap_or(DEFAULT_GRACE_SECS);
-    grace.saturating_add(RESULTS_DRAIN_SLACK_SECS)
+/// The shortest freeze that tests anything: past the scheduler lease TTL and
+/// the outbox claim window, so the frozen servers' lease and claims lapse.
+pub fn pause_floor_secs() -> u64 {
+    LEASE_TTL_SECS.max(CLAIM_WINDOW_SECS)
 }
 
-/// How long `pause-node` pauses the node for a Pod whose
-/// `terminationGracePeriodSeconds` is `grace_secs`: the sidecar reporting
-/// ceiling + [`PAUSE_MARGIN_SECS`], at most [`MAX_PAUSE_SECS`]. The
-/// producer's Pod is a workspace Pod with a grace of 600 s, so 930 s. A pause
-/// clamped short of the ceiling makes the scenario INCONCLUSIVE (the checker
-/// compares the time held with the ceiling).
+/// A recorded grace, or the Kubernetes default.
+pub fn grace_or_default(grace_secs: Option<i64>) -> u64 {
+    grace_secs.and_then(|g| u64::try_from(g).ok()).unwrap_or(DEFAULT_GRACE_SECS)
+}
+
+/// How long `pause-node` freezes the node for a producer Pod whose
+/// `terminationGracePeriodSeconds` is `grace_secs`: the grace minus
+/// [`GRACE_MARGIN_SECS`], at most [`MAX_PAUSE_SECS`]. A workspace Pod's
+/// grace is 600 s, so 240 s. A grace too short to leave a freeze past
+/// [`pause_floor_secs`] gives a pause the checker reports as INCONCLUSIVE.
 pub fn pause_secs(grace_secs: Option<i64>) -> u64 {
-    sidecar_ceiling_secs(grace_secs)
-        .saturating_add(PAUSE_MARGIN_SECS)
+    grace_or_default(grace_secs)
+        .saturating_sub(GRACE_MARGIN_SECS)
         .min(MAX_PAUSE_SECS)
 }
 
@@ -64,8 +64,8 @@ pub const DRAIN_ESCALATION_SECS: u64 = 300;
 /// lease TTL, then resumed. The server signals are sent from the kind
 /// node's PID namespace (`crate::node`): in its container the server is PID
 /// 1 with no init and ignores them. `pause-node` is not one of ADR-0077's
-/// ranks: it reproduces git-bug 070d042 (a host suspend judged a live node
-/// lost).
+/// ranks: it checks that a host freeze shorter than the producer Pod's grace
+/// period is survived.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum Kind {
@@ -87,11 +87,12 @@ pub enum Kind {
     /// stopped until a peer takes the lease over (past the 30 s TTL), then
     /// SIGCONT it.
     StopLeader,
-    /// git-bug 070d042: while a producer's workspace drain is owed or running
-    /// (the `mid-drain` trigger), `docker pause` the whole kind node past the
-    /// sidecar reporting ceiling (`pause_secs`), then `docker unpause` it.
-    /// The kubelet, the egress mid-drain and both servers freeze together, as
-    /// in a host suspend, and the wall clock jumps on the resume.
+    /// While a producer's workspace drain is owed or running (the
+    /// `mid-drain` trigger), `docker pause` the whole kind node for
+    /// [`pause_secs`]: past the lease TTL and the claim window, short of the
+    /// Pod's grace period. Then `docker unpause` it. The kubelet, the egress
+    /// mid-drain and both servers freeze together, as in a host suspend, and
+    /// the wall clock jumps on the resume. Every Run must still succeed.
     PauseNode,
 }
 
@@ -297,9 +298,13 @@ pub struct NodeSignal {
 pub struct NodePause {
     /// The kind node container (`SCARAB_CHAOS_NODE`).
     pub node: String,
-    /// The target Pod's sidecar reporting ceiling: its grace +
-    /// [`RESULTS_DRAIN_SLACK_SECS`].
-    pub ceiling_secs: u64,
+    /// The target Pod's `terminationGracePeriodSeconds` the pause was
+    /// planned from (the Kubernetes default when the record had none).
+    #[serde(default)]
+    pub grace_secs: u64,
+    /// The freeze had to last longer than this ([`pause_floor_secs`]).
+    #[serde(default)]
+    pub floor_secs: u64,
     /// How long the pause was planned for ([`pause_secs`]).
     pub planned_secs: u64,
     /// `docker inspect` said `State.Paused = true` after the pause.
@@ -625,10 +630,10 @@ mod tests {
     }
 
     /// `pause-node` parses from the recipe's argument and the file, keeps
-    /// the mid-drain trigger and window, and pauses past the workspace Pod's
-    /// sidecar reporting ceiling (600 s grace + 300 s slack).
+    /// the mid-drain trigger and window, and freezes past the lease TTL and
+    /// claim window but short of the workspace Pod's 600 s grace.
     #[test]
-    fn pause_node_parses_and_pauses_past_the_ceiling() {
+    fn pause_node_parses_and_pauses_short_of_the_grace() {
         use clap::ValueEnum as _;
         assert_eq!(Kind::from_str("pause-node", false), Ok(Kind::PauseNode));
         assert_eq!(serde_json::to_value(Kind::PauseNode).unwrap(), "pause-node");
@@ -636,11 +641,13 @@ mod tests {
         assert_eq!(Kind::PauseNode.window(), Some(Kind::MidDrain));
         assert_eq!(Kind::PauseNode.target_step(), "produce");
         assert!(Kind::PauseNode.has_fault() && !Kind::PauseNode.targets_servers());
-        assert_eq!(pause_secs(Some(600)), 930);
-        assert_eq!(pause_secs(Some(30)), 360);
-        assert_eq!(pause_secs(None), 360, "a record without the grace uses the Kubernetes default");
-        assert_eq!(pause_secs(Some(86_400)), MAX_PAUSE_SECS, "a huge grace is clamped");
+        assert_eq!(pause_floor_secs(), 30);
+        assert_eq!(pause_secs(Some(600)), 240, "a workspace Pod: capped at 240 s");
+        assert_eq!(pause_secs(Some(300)), 180, "grace - 120 s");
+        assert!(pause_secs(Some(600)) > pause_floor_secs() && pause_secs(Some(600)) < 600);
+        assert_eq!(pause_secs(None), 0, "the 30 s default grace leaves no freeze to test");
         assert_eq!(pause_secs(Some(i64::MAX)), MAX_PAUSE_SECS);
+        assert_eq!(pause_secs(Some(-5)), 0);
         let w = Workload::default();
         for seed in 0..50 {
             assert!(Plan::from_seed(Kind::PauseNode, seed, &w, 2, 2).delay_ms <= 2_000);
@@ -651,11 +658,12 @@ mod tests {
         s.faults.push(Fault {
             action: "pause-node".into(),
             fired_at_ms: 1_000,
-            resumed_at_ms: Some(931_000),
+            resumed_at_ms: Some(241_000),
             pause: Some(NodePause {
                 node: "scarab-dev-control-plane".into(),
-                ceiling_secs: 900,
-                planned_secs: 930,
+                grace_secs: 600,
+                floor_secs: 30,
+                planned_secs: 240,
                 paused: true,
                 unpaused: true,
                 error: None,
@@ -664,7 +672,7 @@ mod tests {
         });
         let back: Scenario = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(back, s);
-        assert_eq!(s.quiesce_deadline_ms(), 931_000 + (s.quiesce_bound_secs as i64) * 1000);
+        assert_eq!(s.quiesce_deadline_ms(), 241_000 + (s.quiesce_bound_secs as i64) * 1000);
 
         // A file that planned a pause above the maximum is refused, so a
         // replay never pauses the node that long; at the maximum it reads.
@@ -676,7 +684,7 @@ mod tests {
         s.faults[0].pause.as_mut().unwrap().planned_secs = MAX_PAUSE_SECS + 1;
         s.write(&file).unwrap();
         let err = Scenario::read(&file).unwrap_err();
-        assert!(err.contains("above the 1200 s maximum"), "{err}");
+        assert!(err.contains("above the 240 s maximum"), "{err}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
