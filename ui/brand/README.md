@@ -31,7 +31,7 @@ thick femur, a knee, a thinner spiny tibia and a small foot.
 | `icons/halftone-ink/icon-{16..1024}.png` | transparent PNGs of the ink mark |
 | `icons/halftone-tile/icon-{16..1024}.png` | opaque PNGs of the tile; use these for app icons (apple-touch 180, PWA 192 and 512) |
 | `favicon/halftone/favicon.svg` | the same mark without the hexagon dots, theme-aware: ink on light, cream on dark |
-| `favicon/halftone/favicon.ico`, `favicon-{16,32,48,64}.png` | cream mark on a rounded `#0b0c0e` tile, visible on any tab colour |
+| `favicon/halftone/favicon.ico`, `favicon-{16,32,48,64}.png` | emerald mark on a transparent background, for browsers that ignore the SVG; emerald reads on light and dark tabs (about 3.4:1 on white, 4.7:1 on `#202124`) |
 | `favicon/halftone/apple-touch-icon.png`, `icon-192.png`, `icon-512.png` | cream mark on a square `#0b0c0e` tile |
 
 The ink mark is not the cream mark with the colour changed. The shading is
