@@ -42,7 +42,6 @@ image="$repo:verify"
 keep="${KEEP:-0}"
 state="$here/.state"
 
-need() { command -v "$1" >/dev/null 2>&1 || die "'$1' not found on PATH"; }
 need docker; need kind; need kubectl; need curl; need python3; need cargo
 
 step() { echo "==> $*"; }
@@ -56,8 +55,7 @@ step "building the plugin image ($image)"
 docker build -q -f "$root/docker/plugin-argocd/Dockerfile" -t "$image" "$root" >/dev/null
 step "building the fake Argo CD (host)"
 ( cd "$root" && cargo build -q -p scarab-plugin-argocd --features fake --bin fake-argocd )
-target_dir="${CARGO_TARGET_DIR:-$root/target}"
-case "$target_dir" in /*) ;; *) target_dir="$root/$target_dir" ;; esac
+target_dir="$(cargo_target_dir)"
 
 # --- 2. the release, plugins on -----------------------------------------------
 mkdir -p "$state"
@@ -73,11 +71,7 @@ api="$base"
 plugins_ns=scarab-plugins
 
 step "loading $image into kind"
-platform="linux/$(docker version -f '{{.Server.Arch}}')"
-archive="$(mktemp "$state/image.XXXXXX")"
-docker save --platform "$platform" -o "$archive" "$image"
-kind load image-archive "$archive" --name "$cluster" >/dev/null
-rm -f "$archive"
+load_image "$image"
 
 # --- 3. the fake Argo CD on the host -----------------------------------------
 # The broker runs in the server Pod, so it reaches the fake at the host

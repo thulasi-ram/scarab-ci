@@ -115,8 +115,7 @@ cleanup() {
 trap cleanup EXIT
 
 cargo build -p scarab-chaos
-target="${CARGO_TARGET_DIR:-target}"; case "$target" in /*) ;; *) target="$root/$target" ;; esac
-bin="$target/debug/scarab-chaos"
+bin="$(cargo_target_dir)/debug/scarab-chaos"
 
 bash "$here/up.sh" chaos
 switched=1

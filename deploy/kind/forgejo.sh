@@ -25,7 +25,6 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 state="$here/.state"
 trap 'stop_forwards' EXIT
 
-need() { command -v "$1" >/dev/null 2>&1 || die "'$1' not found on PATH"; }
 need curl; need python3; need git
 
 owner=scarab-admin

@@ -14,7 +14,51 @@ release=scarab
 node_port=30080            # service.nodePort in values.yaml: the API on the node
 kubeconfig="$kind_dir/.kubeconfig"
 
+repo_root="$(cd "$kind_dir/../.." && pwd)"
+
 die() { echo "error: $*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "'$1' not found on PATH"; }
+
+# cargo_target_dir: where cargo puts its output, as an absolute path.
+# CARGO_TARGET_DIR when set (a relative one is taken from the repo root, where
+# the recipes run cargo), else <repo>/target.
+cargo_target_dir() {
+  local t="${CARGO_TARGET_DIR:-$repo_root/target}"
+  case "$t" in /*) ;; *) t="$repo_root/$t" ;; esac
+  printf '%s\n' "$t"
+}
+
+# Images for the kind node. $platform (linux/<docker arch>) is computed on
+# first use unless the caller set it.
+image_platform() {
+  [ -n "${platform:-}" ] || platform="linux/$(docker version -f '{{.Server.Arch}}')"
+}
+pull_image() { # a third-party image, pulled once for this platform
+  image_platform
+  docker image inspect "$1" >/dev/null 2>&1 || docker pull -q --platform "$platform" "$1" >/dev/null
+}
+# load_image IMG: load a local image into the kind node as a ONE-platform
+# archive (`kind load docker-image` imports every platform and fails on a
+# multi-arch image under the containerd image store). Skipped when the node
+# has the tag and this stack last loaded the same local image ID
+# (.state/loaded-images).
+load_image() {
+  local img="$1" id archive loaded="$kind_dir/.state/loaded-images"
+  image_platform
+  id="$(docker image inspect -f '{{.Id}}' "$img")"
+  if grep -qxF "$img $id" "$loaded" 2>/dev/null \
+     && { docker exec "$node" crictl inspecti "$img" >/dev/null 2>&1 \
+          || docker exec "$node" crictl inspecti "docker.io/library/$img" >/dev/null 2>&1; }; then
+    return 0
+  fi
+  echo "    loading $img into $cluster"
+  archive="$(mktemp "$kind_dir/.state/image.XXXXXX")"
+  docker save --platform "$platform" -o "$archive" "$img"
+  kind load image-archive "$archive" --name "$cluster" >/dev/null
+  rm -f "$archive"
+  { grep -v "^$img " "$loaded" 2>/dev/null || true; echo "$img $id"; } > "$loaded.new"
+  mv "$loaded.new" "$loaded"
+}
 
 # env_get FILE KEY: the value of KEY's last line in an env file, read without
 # sourcing it (values are never printed). The value is everything after the

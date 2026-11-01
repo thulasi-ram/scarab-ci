@@ -57,25 +57,16 @@ SCARAB_E2E_TUNNEL=1 bash "$here/up.sh" e2e
 scarab_addr
 
 cargo build -p scarab-cli
-target="${CARGO_TARGET_DIR:-target}"; case "$target" in /*) ;; *) target="$PWD/$target" ;; esac
+target="$(cargo_target_dir)"
 
 # --- the cluster suites' namespace, images and registry -----------------------
 kc create namespace "$tns" --dry-run=client -o yaml | kc apply -f - >/dev/null
 # A Pod created before the namespace's `default` ServiceAccount exists is refused.
 for _ in $(seq 1 30); do kc get serviceaccount default -n "$tns" >/dev/null 2>&1 && break; sleep 1; done
 # The service image the uid-pinned-service case runs (git-bug 908f534), loaded
-# so the node never pulls it. One-platform archive: `kind load docker-image`
-# imports every platform and fails under the containerd store.
-platform="linux/$(docker version -f '{{.Server.Arch}}')"
-for img in postgres:16; do
-  docker image inspect "$img" >/dev/null 2>&1 || docker pull -q --platform "$platform" "$img" >/dev/null
-  if ! docker exec "$node" crictl inspecti "docker.io/library/$img" >/dev/null 2>&1; then
-    archive="$(mktemp "$kind_dir/.state/image.XXXXXX")"
-    docker save --platform "$platform" -o "$archive" "$img"
-    kind load image-archive "$archive" --name "$cluster" >/dev/null
-    rm -f "$archive"
-  fi
-done
+# so the node never pulls it (lib.sh's pull_image and load_image).
+pull_image postgres:16
+load_image postgres:16
 # The plain-HTTP registry the `kind: build` case pushes to and then reads the
 # tag list of, from inside the cluster.
 echo "==> ensuring an in-cluster registry in namespace $tns"

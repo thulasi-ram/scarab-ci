@@ -56,7 +56,6 @@ mount="$here/.mount"           # gitignored: staged binaries + UI, mounted on th
 node_mount=/scarab             # where $mount appears on the kind node
 dogfood_env="${SCARAB_DOGFOOD_ENV:-$HOME/.config/scarab/dogfood.env}"
 
-need() { command -v "$1" >/dev/null 2>&1 || die "'$1' not found on PATH"; }
 need docker; need kind; need kubectl; need helm; need curl; need python3
 
 # `helm upgrade --force-conflicts` below exists only in Helm 4.
@@ -142,8 +141,7 @@ esac
 platform="linux/$docker_arch"
 profile="${SCARAB_KIND_PROFILE:-dev}"
 case "$profile" in dev) profile_dir=debug ;; *) profile_dir="$profile" ;; esac
-target_dir="${CARGO_TARGET_DIR:-$root/target}"
-case "$target_dir" in /*) ;; *) target_dir="$root/$target_dir" ;; esac
+target_dir="$(cargo_target_dir)"
 bins=(-p scarab-server --bin scarab-server -p scarab-workspace-client --bin scarab-wsfetch)
 
 if [ "${SCARAB_KIND_SKIP_BUILD:-0}" = 1 ]; then
@@ -295,28 +293,8 @@ if [ -n "$last_mode" ] && [ "$last_mode" != "$mode" ]; then
 fi
 
 # --- 3. images ----------------------------------------------------------------
-# Loaded as a ONE-platform archive: `kind load docker-image` imports every
-# platform and fails on a multi-arch image under the containerd image store.
-# A load is skipped when the node already has the tag and this script last
-# loaded the same local image ID.
-load_image() {
-  local img="$1" id archive
-  id="$(docker image inspect -f '{{.Id}}' "$img")"
-  if grep -qxF "$img $id" "$state/loaded-images" 2>/dev/null \
-     && docker exec "$node" crictl inspecti "$img" >/dev/null 2>&1; then
-    return 0
-  fi
-  echo "    loading $img into $cluster"
-  archive="$(mktemp "$state/image.XXXXXX")"
-  docker save --platform "$platform" -o "$archive" "$img"
-  kind load image-archive "$archive" --name "$cluster" >/dev/null
-  rm -f "$archive"
-  { grep -v "^$img " "$state/loaded-images" 2>/dev/null || true; echo "$img $id"; } > "$state/loaded-images.new"
-  mv "$state/loaded-images.new" "$state/loaded-images"
-}
-pull_image() { # a third-party image, pulled once for this platform
-  docker image inspect "$1" >/dev/null 2>&1 || docker pull -q --platform "$platform" "$1" >/dev/null
-}
+# lib.sh's load_image (one-platform archive, skipped when unchanged) and
+# pull_image.
 echo "==> images"
 # --provenance=false: the default attestation records the build time, so an
 # unchanged image got a new ID on every build and was loaded again every run.
