@@ -355,8 +355,9 @@ private addresses, and the tier would pass without testing ingest) and
 `security.INSTALL_LOCK=true`.
 
 `forgejo.sh` seeds it on every `up.sh`: an admin user (`scarab-admin`, a random
-password in `.state/forgejo-admin-password`), a fresh API token, the working
-repos with a `.scarab/ci.yaml`, 55 filler repos (more than the adapter's page
+password in `.state/forgejo-admin-password`), a fresh API token (the earlier
+`scarab-kind-*` tokens are revoked first), the working repos with a
+`.scarab/ci.yaml` (a seed file whose content changed is updated in place), 55 filler repos (more than the adapter's page
 size of 50, so the pick-list must page), an org repo reached by a team member
 and a collaborator, and the private repos of the forge_token cases. It writes
 `.state/forgejo.env` (mode 600), the `SCARAB_TEST_FORGEJO_*` values the tests

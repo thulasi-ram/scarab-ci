@@ -78,6 +78,30 @@ if ! fj admin user create --admin --username "$owner" --password "$password" \
     --must-change-password=false >/dev/null
 fi
 
+# The token endpoints take basic auth only. The credentials go to curl on
+# stdin (a config file), not argv.
+basic() { # curl args...: as the admin user, with basic auth
+  printf 'user = "%s:%s"\n' "$owner" "$password" | curl -s -K - "$@"
+}
+echo "==> revoking earlier scarab-kind-* tokens"
+# One is minted per run; without this they pile up, each with every scope.
+for _ in $(seq 1 20); do   # a page at a time, until none is left
+  old_tokens="$(basic "$base/api/v1/users/$owner/tokens?limit=50" | python3 -I -c '
+import json, sys
+try:
+    rows = json.load(sys.stdin)
+except ValueError:
+    rows = []
+for t in rows if isinstance(rows, list) else []:
+    if t.get("name", "").startswith("scarab-kind-"):
+        print(t["name"])
+')"
+  [ -n "$old_tokens" ] || break
+  for t in $old_tokens; do
+    basic -o /dev/null -X DELETE "$base/api/v1/users/$owner/tokens/$t"
+  done
+done
+
 echo "==> minting an API access token"
 # Token names must be unique per user, so name each run's token for the run.
 token="$(fj admin user generate-access-token --username "$owner" \
@@ -105,13 +129,32 @@ ensure_repo() {
     -d "{\"name\":\"$name\",\"auto_init\":$auto_init,\"default_branch\":\"main\",\"private\":$private}" \
     "$base/api/v1/user/repos"
 }
+# Create the file on main, or update it when its content differs (so a seed
+# edited here reaches an existing cluster).
 put_file() {
-  local repo="$1" path="$2" content="$3" code b64
-  code="$(api -o /dev/null -w '%{http_code}' "$base/api/v1/repos/$owner/$repo/contents/$path?ref=main")"
-  [ "$code" = "200" ] && return 0
+  local repo="$1" path="$2" content="$3" b64 sha
   b64="$(printf '%s' "$content" | python3 -I -c 'import base64,sys;sys.stdout.write(base64.b64encode(sys.stdin.buffer.read()).decode())')"
-  api -o /dev/null -X POST -d "{\"content\":\"$b64\",\"message\":\"seed $path\",\"branch\":\"main\"}" \
-    "$base/api/v1/repos/$owner/$repo/contents/$path"
+  # The current file's sha when it exists, "same" when it already holds this
+  # content, empty when there is none.
+  sha="$(api "$base/api/v1/repos/$owner/$repo/contents/$path?ref=main" | V_WANT="$b64" python3 -I -c '
+import base64, json, os, sys
+try:
+    f = json.load(sys.stdin)
+except ValueError:
+    sys.exit(0)
+if not isinstance(f, dict) or "sha" not in f:
+    sys.exit(0)
+have = base64.b64decode(f.get("content") or "")
+print("same" if have == base64.b64decode(os.environ["V_WANT"]) else f["sha"])
+')"
+  case "$sha" in
+    same) ;;
+    '') api -o /dev/null -X POST -d "{\"content\":\"$b64\",\"message\":\"seed $path\",\"branch\":\"main\"}" \
+          "$base/api/v1/repos/$owner/$repo/contents/$path" ;;
+    *) echo "    updating $repo/$path"
+       api -o /dev/null -X PUT -d "{\"content\":\"$b64\",\"sha\":\"$sha\",\"message\":\"seed $path\",\"branch\":\"main\"}" \
+          "$base/api/v1/repos/$owner/$repo/contents/$path" ;;
+  esac
 }
 
 echo "==> seeding the working repos"
