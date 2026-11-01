@@ -18,6 +18,14 @@
 //! | I4   | every green Attempt's output snapshot closure is in committed packs whose ranges read back and hash to their addresses; a member in another fence's pack needs a `depot_fence_borrows` edge |
 //! | I8   | after quiesce no Pod of a scenario Run is still pending or running, and no per-Pod Secret outlives its Pod |
 //! | I10  | no `committed = FALSE` pack row older than the linger for a fence whose drain has a record; every committed pack's object exists at its recorded size |
+//! | W1   | the rank-1 workload's own outcome: every scenario Run that ended, ended `succeeded`, and every green Attempt has an output snapshot |
+//!
+//! W1 is not one of ADR-0077 §2's invariants. As written there, I3 accepts a
+//! dead-lettered Run and I4 passes a green Attempt whose snapshot is NULL, so
+//! a Depot outage that dead-letters Runs (git-bug e140121) or a lost
+//! workspace would pass them. The workload (`scenario::Workload`) is built so
+//! that every Run succeeds and every step writes to `/workspace`: a consumer
+//! that finds a missing or corrupt file fails its `sha256sum -c`.
 //!
 //! Outside the invariants, a scenario is INCONCLUSIVE, not PASS, when its
 //! fault did not exercise what it names ([`exercised`]): no fault fired, the
@@ -474,6 +482,32 @@ pub fn evaluate(f: &Facts) -> Verdict {
         findings.push(fail("I3", format!("run {id} still has creating = TRUE")));
     }
     checked.insert("I3".into(), f.runs.len());
+
+    // W1: the workload's outcome. A Run that is not terminal is I3's finding.
+    let mut w1 = 0;
+    for r in &f.runs {
+        if crate::env::TERMINAL_RUN_STATUSES.contains(&r.status.as_str()) {
+            w1 += 1;
+            if r.status != "succeeded" {
+                findings.push(fail("W1", format!("run {} ended {}, not succeeded", r.id, r.status)));
+            }
+        }
+    }
+    for a in &f.attempts {
+        if a.outcome.as_deref() == Some("succeeded") {
+            w1 += 1;
+            if a.output_snapshot.is_none() {
+                findings.push(fail(
+                    "W1",
+                    format!(
+                        "run {} step {} attempt {} is succeeded with no output snapshot (its workspace was not recorded)",
+                        a.run, a.step, a.attempt
+                    ),
+                ));
+            }
+        }
+    }
+    checked.insert("W1".into(), w1);
 
     // I4: green snapshots are durable and read back.
     for s in &f.snapshots {

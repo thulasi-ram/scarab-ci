@@ -179,3 +179,38 @@ fn a_finding_is_fail_even_when_nothing_was_exercised() {
     f.events.pop();
     assert_eq!(evaluate(&f).outcome, Outcome::Fail);
 }
+
+// --- W1: the workload's outcome --------------------------------------------------
+
+/// Red team: a Depot outage dead-letters the Run (git-bug e140121). T1 and I3
+/// accept any terminal status, so this passed.
+#[test]
+fn a_dead_lettered_run_fails_w1() {
+    let mut f = clean();
+    f.runs[0].status = "dead_lettered".into();
+    f.events.pop();
+    f.events.push(ev(5, serde_json::json!({"RunTransitioned": {"from": "Running", "to": "DeadLettered"}})));
+    let v = evaluate(&f);
+    assert_eq!(v.outcome, Outcome::Fail);
+    let w1: Vec<&Finding> = v.findings.iter().filter(|x| x.invariant == "W1").collect();
+    assert_eq!(w1.len(), 1, "{:?}", v.findings);
+    assert!(w1[0].detail.contains("run r ended dead_lettered"), "{}", w1[0].detail);
+}
+
+/// Red team: the producer is green with no output snapshot, the consumer's
+/// `sha256sum -c` fails and the Run fails. I4 checked nothing and passed.
+#[test]
+fn a_lost_workspace_and_a_failed_run_fail_w1() {
+    let mut f = clean();
+    f.runs[0].status = "failed".into();
+    f.events.pop();
+    f.events.push(ev(5, serde_json::json!({"RunTransitioned": {"from": "Running", "to": "Failed"}})));
+    f.attempts = vec![att("produce", "succeeded", None), att("consume", "failed", None)];
+    f.steps = vec![step_row("produce", "succeeded", None), step_row("consume", "failed", None)];
+    f.snapshots.clear();
+    let v = evaluate(&f);
+    assert_eq!(v.outcome, Outcome::Fail);
+    let details: Vec<&str> = v.findings.iter().filter(|x| x.invariant == "W1").map(|x| x.detail.as_str()).collect();
+    assert!(details.iter().any(|d| d.contains("ended failed")), "{details:?}");
+    assert!(details.iter().any(|d| d.contains("step produce attempt a1 is succeeded with no output snapshot")), "{details:?}");
+}

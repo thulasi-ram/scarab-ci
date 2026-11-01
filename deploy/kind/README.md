@@ -296,6 +296,13 @@ does not take the API's or a Step's word for success:
 | I4 | every green Attempt's snapshot closure is in committed packs; every tree and blob range is read from the bucket and hashed against its address; a member in another fence's pack needs a `depot_fence_borrows` edge |
 | I8 | after quiesce, no Pod of a scenario Run is pending or running, and no per-Pod workspace Secret outlives its Pod |
 | I10 | no uncommitted pack row older than 60 s for a fence that has a drain record; every committed pack's object exists at its recorded size |
+| W1 | the workload's outcome (not an ADR-0077 §2 invariant): every scenario Run ends `succeeded`, and every green Attempt has an output snapshot |
+
+W1 is separate from the ADR's I-numbers because I3 and I4 as written there
+accept a dead-lettered Run and a green Attempt with no snapshot. The workload
+is built so that every Run succeeds: a Run that ends failed or dead-lettered
+(git-bug e140121, a Depot outage that dead-letters Runs) fails W1 with its
+Run id and status.
 
 Completed step Pods stay in the namespace on main, so I8 counts a Pod in
 phase Succeeded or Failed as torn down. An uncommitted pack row of a fence
