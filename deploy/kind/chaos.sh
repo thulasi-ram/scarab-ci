@@ -12,7 +12,9 @@
 #      the invariant checker. Each run writes a directory under
 #      $SCARAB_CHAOS_DIR (default deploy/kind/.chaos): scenario.json (the
 #      replayable file), pods.jsonl, verdict.json, memory.log.
-#   3. switches the release back to the mode that was active before (dev or
+#   3. cancels the chaos database's non-terminal Runs through the API (a
+#      scenario refuses to start while one is left), then switches the
+#      release back to the mode that was active before (dev or
 #      dogfood; e2e and anything else go back to dev, because restoring e2e
 #      would open a new public Forgejo tunnel) and runs `just demo` there.
 #
@@ -63,16 +65,26 @@ rc=0
 # when `up.sh chaos` refuses because they run, or the build fails, the cleanup
 # only stops the port-forwards.
 switched=0
+checker_env=0   # set once the SCARAB_CHAOS_* connections are exported
 cleanup() {
   local code=$? mode_now
   [ -z "$stats_pid" ] || kill "$stats_pid" 2>/dev/null || true
-  stop_forwards
   [ "$rc" -ne 0 ] || rc=$code
   mode_now="$(cat "$here/.state/mode" 2>/dev/null || true)"
   if [ "$switched" != 1 ] && [ "$mode_now" != chaos ]; then
+    stop_forwards
     echo "==> the release was not switched to chaos mode; leaving it in ${mode_now:-its current mode}"
     exit "$rc"
   fi
+  # A Run the quiesce bound gave up on stays non-terminal in scarab_chaos and
+  # would resume beside the next session's workload. Cancel it through the
+  # API while the chaos release still runs (the next `just chaos` refuses to
+  # start while one is left).
+  if [ "$checker_env" = 1 ] && [ -x "$bin" ]; then
+    echo "==> cancelling non-terminal chaos Runs"
+    "$bin" cancel-leftovers || echo "warning: could not cancel every chaos Run; the next 'just chaos' refuses until they end" >&2
+  fi
+  stop_forwards
   # A Run the bound gave up on can leave its step Pods running; they belong to
   # the chaos mode and would block the switch back. The checker has already
   # recorded them (I8). A deleted Pod still counts in up.sh's guard while it
@@ -121,6 +133,7 @@ export SCARAB_CHAOS_S3_ENDPOINT="http://127.0.0.1:$s3_port"
 export SCARAB_CHAOS_S3_BUCKET=scarab-chaos
 export SCARAB_CHAOS_S3_ACCESS_KEY=scarab
 export SCARAB_CHAOS_S3_SECRET_KEY=scarabsecret
+checker_env=1
 
 server_replicas="$(kc get deploy "$release" -n "$ns" -o jsonpath='{.spec.replicas}')"
 depot_replicas="$(kc get statefulset "$release-workspace" -n "$ns" -o jsonpath='{.spec.replicas}')"

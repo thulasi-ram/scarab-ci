@@ -109,6 +109,21 @@ impl Api {
         v["id"].as_str().map(str::to_string).ok_or_else(|| format!("no id in {text}"))
     }
 
+    /// `POST /v1/runs/{id}/cancel`. 409 (already terminal) is not an error.
+    pub async fn cancel_run(&self, id: &str) -> Result<(), String> {
+        let resp = self
+            .http
+            .post(format!("{}/v1/runs/{id}/cancel", self.base))
+            .send()
+            .await
+            .map_err(|e| format!("cancel run {id}: {e}"))?;
+        let status = resp.status();
+        if status.is_success() || status == reqwest::StatusCode::CONFLICT {
+            return Ok(());
+        }
+        Err(format!("cancel run {id}: {status}: {}", resp.text().await.unwrap_or_default()))
+    }
+
     /// `status` of `GET /v1/runs/{id}`.
     pub async fn run_status(&self, id: &str) -> Result<String, String> {
         let resp = self
@@ -125,6 +140,18 @@ impl Api {
         let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("{e}: {text}"))?;
         v["status"].as_str().map(str::to_string).ok_or_else(|| format!("no status in {text}"))
     }
+}
+
+/// Runs in the chaos database that are not terminal: (id, status). Only the
+/// harness creates Runs there, so any such Run is a scenario's.
+pub async fn non_terminal_runs(pg: &sqlx::PgPool) -> Result<Vec<(String, String)>, String> {
+    sqlx::query_as::<_, (String, String)>(
+        "SELECT id, status FROM runs WHERE NOT (status = ANY($1)) ORDER BY created_at",
+    )
+    .bind(TERMINAL_RUN_STATUSES)
+    .fetch_all(pg)
+    .await
+    .map_err(|e| format!("postgres: {e}"))
 }
 
 pub const TERMINAL_RUN_STATUSES: &[&str] = &["succeeded", "failed", "cancelled", "dead_lettered"];

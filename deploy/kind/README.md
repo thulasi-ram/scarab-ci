@@ -260,9 +260,14 @@ What it does, in order:
    lease TTL (30 s) + the workload's time (300 s) + the drain escalation
    (300 s), counted from the fault.
 5. Runs the checker and prints one line per invariant and a `VERDICT` line.
-6. Switches the release back to the mode that was active before (dev or
-   dogfood; from e2e it goes to dev, since restoring e2e opens a new public
-   Forgejo tunnel) and runs `just demo` there.
+6. Cancels, through the API, every Run the chaos database still holds
+   non-terminal (one the quiesce bound gave up on would otherwise resume
+   beside the next session's workload; a scenario refuses to start while one
+   is left). Then switches the release back to the mode that was active
+   before (dev or dogfood; from e2e it goes to dev, since restoring e2e opens
+   a new public Forgejo tunnel) and runs `just demo` there. When `up.sh chaos`
+   refused or the build failed, the release was never switched: nothing is
+   deleted or switched, and the recipe only exits.
 
 The seed picks the target Run, the delay (2-10 s after the trigger for a
 drain, 0-2 s for a feed) and the replica. Each scenario run writes a
