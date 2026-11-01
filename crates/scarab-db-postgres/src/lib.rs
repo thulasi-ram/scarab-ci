@@ -3029,27 +3029,42 @@ fn lease_of(r: &sqlx::postgres::PgRow) -> Lease {
 #[async_trait]
 impl ForgeConnectionStore for PostgresDb {
     async fn put_connection(&self, conn: &ForgeConnection) -> Result<(), RegistryError> {
+        let mut tx = self.pool().begin().await.map_err(reg_err)?;
+        // The connection's Org enters the Org record (git-bug 19b0a45).
+        if let Some(org) = &conn.org {
+            sqlx::query("INSERT INTO orgs (name) VALUES ($1) ON CONFLICT (name) DO NOTHING")
+                .bind(org)
+                .execute(&mut *tx)
+                .await
+                .map_err(reg_err)?;
+        }
         sqlx::query(
-            "INSERT INTO forge_connections (id, kind, base_url, credential_ref)
-             VALUES ($1, $2, $3, $4)
+            "INSERT INTO forge_connections (id, kind, base_url, credential_ref, org, installation_id)
+             VALUES ($1, $2, $3, $4, $5, $6)
              ON CONFLICT (id) DO UPDATE SET
                  kind = EXCLUDED.kind,
                  base_url = EXCLUDED.base_url,
-                 credential_ref = EXCLUDED.credential_ref",
+                 credential_ref = EXCLUDED.credential_ref,
+                 org = EXCLUDED.org,
+                 installation_id = EXCLUDED.installation_id",
         )
         .bind(&conn.id)
         .bind(conn.kind.as_str())
         .bind(&conn.base_url)
         .bind(&conn.credential_ref)
-        .execute(self.pool())
+        .bind(&conn.org)
+        .bind(conn.installation_id.map(|i| i as i64))
+        .execute(&mut *tx)
         .await
         .map_err(reg_err)?;
+        tx.commit().await.map_err(reg_err)?;
         Ok(())
     }
 
     async fn get_connection(&self, id: &str) -> Result<Option<ForgeConnection>, RegistryError> {
         let row = sqlx::query(
-            "SELECT id, kind, base_url, credential_ref FROM forge_connections WHERE id = $1",
+            "SELECT id, kind, base_url, credential_ref, org, installation_id
+             FROM forge_connections WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(self.pool())
@@ -3060,7 +3075,8 @@ impl ForgeConnectionStore for PostgresDb {
 
     async fn list_connections(&self) -> Result<Vec<ForgeConnection>, RegistryError> {
         let rows = sqlx::query(
-            "SELECT id, kind, base_url, credential_ref FROM forge_connections ORDER BY id",
+            "SELECT id, kind, base_url, credential_ref, org, installation_id
+             FROM forge_connections ORDER BY id",
         )
         .fetch_all(self.pool())
         .await
@@ -3085,6 +3101,47 @@ impl ForgeConnectionStore for PostgresDb {
         org: &str,
         project: &str,
     ) -> Result<(), RegistryError> {
+        let mut tx = self.pool().begin().await.map_err(reg_err)?;
+        sqlx::query("INSERT INTO orgs (name) VALUES ($1) ON CONFLICT (name) DO NOTHING")
+            .bind(org)
+            .execute(&mut *tx)
+            .await
+            .map_err(reg_err)?;
+        // A re-bind moves the repo only off a connection of the same Org or
+        // an unassigned one (git-bug 19b0a45). The current binding is locked
+        // for the check, so a concurrent move cannot slip between the check
+        // and the write.
+        let holder = sqlx::query(
+            "SELECT r.connection_id, c.org
+             FROM forge_repos r JOIN forge_connections c ON c.id = r.connection_id
+             WHERE r.owner = $1 AND r.name = $2
+             FOR UPDATE OF r",
+        )
+        .bind(&repo.owner)
+        .bind(&repo.name)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(reg_err)?;
+        if let Some(h) = holder {
+            let holder_id: String = h.get("connection_id");
+            let holder_org: Option<String> = h.get("org");
+            if holder_id != connection_id && holder_org.is_some() {
+                let new_org: Option<String> =
+                    sqlx::query_scalar("SELECT org FROM forge_connections WHERE id = $1")
+                        .bind(connection_id)
+                        .fetch_optional(&mut *tx)
+                        .await
+                        .map_err(reg_err)?
+                        .flatten();
+                if new_org != holder_org {
+                    return Err(RegistryError::BoundElsewhere {
+                        owner: repo.owner.clone(),
+                        name: repo.name.clone(),
+                        connection: holder_id,
+                    });
+                }
+            }
+        }
         sqlx::query(
             "INSERT INTO forge_repos (connection_id, owner, name, org, project)
              VALUES ($1, $2, $3, $4, $5)
@@ -3098,9 +3155,10 @@ impl ForgeConnectionStore for PostgresDb {
         .bind(&repo.name)
         .bind(org)
         .bind(project)
-        .execute(self.pool())
+        .execute(&mut *tx)
         .await
         .map_err(reg_err)?;
+        tx.commit().await.map_err(reg_err)?;
         Ok(())
     }
 
@@ -3136,7 +3194,8 @@ impl ForgeConnectionStore for PostgresDb {
 
     async fn resolve(&self, repo: &RepoRef) -> Result<Option<ResolvedRepo>, RegistryError> {
         let row = sqlx::query(
-            "SELECT c.id, c.kind, c.base_url, c.credential_ref, r.org, r.project
+            "SELECT c.id, c.kind, c.base_url, c.credential_ref, c.org AS conn_org,
+                    c.installation_id, r.org, r.project
              FROM forge_repos r JOIN forge_connections c ON c.id = r.connection_id
              WHERE r.owner = $1 AND r.name = $2",
         )
@@ -3202,6 +3261,14 @@ impl ForgeConnectionStore for PostgresDb {
         Ok(())
     }
 
+    /// The `orgs` table (git-bug 19b0a45): an Org outlives its last binding.
+    async fn list_orgs(&self) -> Result<Vec<String>, RegistryError> {
+        sqlx::query_scalar("SELECT name FROM orgs ORDER BY name")
+            .fetch_all(self.pool())
+            .await
+            .map_err(reg_err)
+    }
+
     async fn config_owned_connection_ids(&self) -> Result<Vec<String>, RegistryError> {
         let rows =
             sqlx::query("SELECT id FROM forge_connections WHERE owned_by_config ORDER BY id")
@@ -3214,12 +3281,22 @@ impl ForgeConnectionStore for PostgresDb {
 
 fn connection_from_row(r: sqlx::postgres::PgRow) -> Result<ForgeConnection, RegistryError> {
     let kind = r.get::<String, _>("kind");
+    // `resolve` joins the binding's own `org`, so it names the connection's
+    // `conn_org`; every other query selects it as `org`.
+    let org = match r.try_get::<Option<String>, _>("conn_org") {
+        Ok(org) => org,
+        Err(_) => r.get::<Option<String>, _>("org"),
+    };
     Ok(ForgeConnection {
         id: r.get::<String, _>("id"),
         kind: ForgeKind::from_str_token(&kind)
             .ok_or_else(|| RegistryError::Store(format!("unknown forge kind {kind:?}")))?,
         base_url: r.get::<String, _>("base_url"),
         credential_ref: r.get::<String, _>("credential_ref"),
+        org,
+        installation_id: r
+            .get::<Option<i64>, _>("installation_id")
+            .and_then(|i| u64::try_from(i).ok()),
     })
 }
 

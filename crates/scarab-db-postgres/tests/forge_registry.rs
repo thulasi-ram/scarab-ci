@@ -16,6 +16,8 @@ fn github_conn() -> ForgeConnection {
         kind: ForgeKind::GitHub,
         base_url: "https://api.github.com".into(),
         credential_ref: "gh-acme-app-pem".into(),
+        org: Some("acme".into()),
+        installation_id: Some(41),
     }
 }
 
@@ -25,6 +27,8 @@ fn forgejo_conn() -> ForgeConnection {
         kind: ForgeKind::Forgejo,
         base_url: "https://codeberg.org".into(),
         credential_ref: "codeberg-acme-token".into(),
+        org: Some("acme".into()),
+        installation_id: None,
     }
 }
 
@@ -75,7 +79,7 @@ async fn registration_and_resolution_round_trip() {
         .unwrap();
     db.bind_repo(
         "codeberg-acme",
-        &repo("acme-mirror", "web"),
+        &repo("acme", "web-mirror"),
         "acme",
         "web-mirror",
     )
@@ -97,7 +101,7 @@ async fn registration_and_resolution_round_trip() {
     assert_eq!(hit.project, "web");
     assert_eq!(hit.connection, rotated);
     let hit = db
-        .resolve(&repo("acme-mirror", "web"))
+        .resolve(&repo("acme", "web-mirror"))
         .await
         .unwrap()
         .expect("registered");
@@ -111,7 +115,8 @@ async fn registration_and_resolution_round_trip() {
         .unwrap()
         .is_none());
 
-    // Re-binding re-homes the repo (upsert by coordinate).
+    // Re-binding re-homes the repo (upsert by coordinate) between two
+    // connections of one org.
     db.bind_repo("codeberg-acme", &repo("acme", "api"), "acme", "api-moved")
         .await
         .unwrap();

@@ -160,6 +160,16 @@ pub async fn guard_with(table: &[RouteEntry], st: AppState, req: Request, next: 
             Some(id) => run_scope(&st, &scarab_engine::RunId(id)).await,
             None => None,
         },
+        OrgOf::Connection => match (param("id"), st.connections.as_ref()) {
+            (Some(id), Some(connections)) => connections
+                .get_connection(&id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|c| c.org)
+                .map(Scope::Org),
+            _ => None,
+        },
         OrgOf::Path(name) => param(name).map(Scope::Org),
         OrgOf::Query(name) => query_param(name).map(Scope::Org),
         OrgOf::Body(ptr) => body_str(ptr).map(Scope::Org),

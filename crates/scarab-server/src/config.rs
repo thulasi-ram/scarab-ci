@@ -499,6 +499,9 @@ pub struct ConnectionSpec {
     /// Repos this connection owns — each binding *is* a Project (ADR-0046), so
     /// declaring repos here is the declarative Project-onboarding path.
     pub repos: Vec<scarab_forge::RepoRef>,
+    /// The Org the connection serves (git-bug 19b0a45): `org:`, or the one
+    /// owner of its `repos:`. Every declared repo is owned by it.
+    pub org: String,
 }
 
 /// The `connections:` document, as written in `SCARAB_CONNECTIONS` /
@@ -527,6 +530,11 @@ struct RawConnection {
     /// Project is indistinguishable from a webhook-registered one.
     #[serde(default)]
     repos: Vec<String>,
+    /// The Org the connection serves (git-bug 19b0a45). Absent = the one
+    /// owner of `repos`; a block with no repos, or repos of several owners,
+    /// must name it.
+    #[serde(default)]
+    org: Option<String>,
 }
 
 /// Exactly one of the three sources. Two would make "which one wins?" a config
@@ -2207,6 +2215,46 @@ fn resolve_connection(
         });
     }
 
+    // The Org it serves: declared, or the one owner of its repos. A repo of
+    // another owner would bind outside that Org (git-bug 19b0a45).
+    let org = match raw.org.as_deref().map(str::trim) {
+        Some("") => return Err(format!("connection `{id}`: `org` is empty")),
+        Some(org) => org.to_string(),
+        None => {
+            let owners: std::collections::BTreeSet<&str> =
+                repos.iter().map(|r| r.owner.as_str()).collect();
+            match owners.len() {
+                1 => owners.into_iter().next().unwrap_or_default().to_string(),
+                0 => {
+                    return Err(format!(
+                        "connection `{id}`: set `org`, the org this connection serves \
+                         (it declares no repos to take it from)"
+                    ))
+                }
+                _ => {
+                    return Err(format!(
+                        "connection `{id}`: its repos have several owners ({}); a connection \
+                         serves one org, so split it or set `org`",
+                        owners.into_iter().collect::<Vec<_>>().join(", ")
+                    ))
+                }
+            }
+        }
+    };
+    if scarab_forge::is_reserved_org(&org) {
+        return Err(format!(
+            "connection `{id}`: `{org}` is a reserved org name (`_`-prefixed names are \
+             Scarab's own)"
+        ));
+    }
+    if let Some(other) = repos.iter().find(|r| r.owner != org) {
+        return Err(format!(
+            "connection `{id}` serves org `{org}`, but repo `{}/{}` is owned by `{}`; every \
+             repo of a connection is owned by its org",
+            other.owner, other.name, other.owner
+        ));
+    }
+
     Ok(ConnectionSpec {
         id,
         kind,
@@ -2215,6 +2263,7 @@ fn resolve_connection(
         credential_material,
         credential_source,
         repos,
+        org,
     })
 }
 
@@ -2890,6 +2939,7 @@ mod tests {
 connections:
   - id: forgejo-main
     kind: forgejo
+    org: acme
     base_url: https://git.example.com/
     credential:
       env: FORGEJO_CI_TOKEN
@@ -3013,6 +3063,7 @@ connections:
 connections:
   - id: forgejo-main
     kind: forgejo
+    org: acme
     base_url: https://git.example.com
     credential:
       secret_ref: forgejo-token
@@ -3034,6 +3085,7 @@ connections:
 connections:
   - id: c
     kind: forgejo
+    org: acme
     base_url: https://git.example.com
     credential: {}
 "#,
@@ -3044,6 +3096,7 @@ connections:
 connections:
   - id: c
     kind: forgejo
+    org: acme
     base_url: https://git.example.com
     credential:
       env: A
@@ -3084,6 +3137,7 @@ connections:
 connections:
   - id: c
     kind: forgejo
+    org: acme
     base_url: git.example.com
     credential: { secret_ref: t }
 "#,
@@ -3094,6 +3148,7 @@ connections:
 connections:
   - id: c
     kind: forgejo
+    org: acme
     base_url: https://git.example.com
     credential: { secret_ref: t }
     repos: [ widgets ]
@@ -3105,6 +3160,7 @@ connections:
 connections:
   - id: c
     kind: forgejo
+    org: acme
     base_urls: https://git.example.com
     credential: { secret_ref: t }
 "#,
@@ -3136,10 +3192,12 @@ connections:
 connections:
   - id: dup
     kind: forgejo
+    org: acme
     base_url: https://a.example.com
     credential: { secret_ref: t }
   - id: dup
     kind: forgejo
+    org: acme
     base_url: https://b.example.com
     credential: { secret_ref: t }
 "#,
@@ -3148,6 +3206,89 @@ connections:
         .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("declared twice"), "{msg}");
+    }
+
+    /// git-bug 19b0a45: a connection serves one Org. `org:` names it, or
+    /// the one owner of its repos does; every declared repo is that Org's.
+    #[test]
+    fn a_connection_serves_one_org_and_its_repos_are_that_orgs() {
+        let resolve = |block: &'static str| {
+            let env = move |k: &str| match k {
+                "SCARAB_DEV_INSECURE" => Some("1".to_string()),
+                "SCARAB_CONNECTIONS" => Some(block.to_string()),
+                _ => None,
+            };
+            Config::resolve_from(&cli(Some("postgres://l/scarab")), env)
+        };
+        // Absent: taken from the one owner of its repos.
+        let cfg = resolve(
+            r#"
+connections:
+  - id: c
+    kind: forgejo
+    base_url: https://git.example.com
+    credential: { secret_ref: t }
+    repos: [ initech/tps, initech/memo ]
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.connections[0].org, "initech");
+
+        for (block, expect) in [
+            // A declared repo of another owner.
+            (
+                r#"
+connections:
+  - id: c
+    kind: forgejo
+    org: acme
+    base_url: https://git.example.com
+    credential: { secret_ref: t }
+    repos: [ acme/web, globex/web ]
+"#,
+                "`globex/web` is owned by `globex`",
+            ),
+            // Several owners and no `org:` to choose between them.
+            (
+                r#"
+connections:
+  - id: c
+    kind: forgejo
+    base_url: https://git.example.com
+    credential: { secret_ref: t }
+    repos: [ acme/web, globex/web ]
+"#,
+                "several owners (acme, globex)",
+            ),
+            // Nothing to take it from.
+            (
+                r#"
+connections:
+  - id: c
+    kind: forgejo
+    base_url: https://git.example.com
+    credential: { secret_ref: t }
+"#,
+                "set `org`",
+            ),
+            // One of Scarab's own names.
+            (
+                r#"
+connections:
+  - id: c
+    kind: forgejo
+    org: _forge
+    base_url: https://git.example.com
+    credential: { secret_ref: t }
+"#,
+                "reserved org name",
+            ),
+        ] {
+            let err = resolve(block).unwrap_err();
+            let msg = err.to_string();
+            assert!(matches!(err, ConfigError::InvalidConnections(_)), "{msg}");
+            assert!(msg.contains(expect), "want {expect:?} in: {msg}");
+        }
     }
 
     #[test]
@@ -3161,6 +3302,7 @@ connections:
 connections:
   - id: from-file
     kind: forgejo
+    org: acme
     base_url: https://file.example.com
     credential: { secret_ref: t }
 "#,
@@ -3188,6 +3330,7 @@ connections:
 connections:
   - id: from-inline
     kind: forgejo
+    org: acme
     base_url: https://inline.example.com
     credential: { secret_ref: t }
 "#
@@ -3224,6 +3367,7 @@ connections:
 connections:
   - id: forgejo-main
     kind: forgejo
+    org: acme
     base_url: https://git.example.com
     credential:
       file: {}
@@ -3251,6 +3395,7 @@ connections:
 connections:
   - id: forgejo-main
     kind: forgejo
+    org: acme
     base_url: https://git.example.com
     credential:
       file: /nope/token

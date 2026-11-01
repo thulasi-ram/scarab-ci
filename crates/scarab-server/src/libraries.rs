@@ -715,33 +715,16 @@ pub(crate) async fn read_source(
                     src.host
                 )));
             }
-            // The org rule: the org's own repositories, or ones bound to it.
-            // A binding names a repository on one connection's forge; the
-            // same `<owner>/<name>` on another forge is another repository,
-            // so the binding counts only when it is through this connection.
-            // By the same reasoning an owner named like the org is the org's
-            // account only on a forge where the org is: the owner-name match
-            // counts only when the org has a repository bound through this
-            // connection.
-            let registry =
-                |e: scarab_forge::RegistryError| ApiError::Db(DbError::Other(e.to_string()));
-            let bound_here = match connections
-                .resolve(&src.repo_ref())
-                .await
-                .map_err(registry)?
-            {
-                Some(r) => r.org == org && r.connection.id == conn.id,
-                None => false,
-            };
-            let owner_is_org =
-                src.owner == org && org_has_repo_on(connections, &conn.id, org).await?;
-            if !owner_is_org && !bound_here {
+            // The org rule (git-bug 19b0a45): a private source is read only
+            // through a connection of the installing org. Such a connection
+            // reaches its own org's repositories (a GitHub one mints from its
+            // own installation only), so another org's credential is never
+            // used to read for this one.
+            if conn.org.as_deref() != Some(org) {
                 return Err(ApiError::Denied(format!(
-                    "`{}/{}` is not owned by org `{org}` and is not bound to it through \
-                     connection `{id}`, so it cannot be read through that connection (an owner \
-                     named `{org}` counts only when `{org}` has a repository bound through the \
-                     connection); install it from a public source, or bind the repository to \
-                     `{org}` first",
+                    "connection `{id}` does not belong to org `{org}`, so `{}/{}` cannot be \
+                     read through it for `{org}`; install it from a public source, or through \
+                     a connection of `{org}`",
                     src.owner, src.repo
                 )));
             }
@@ -759,24 +742,6 @@ pub(crate) async fn read_source(
         )));
     }
     String::from_utf8(bytes).map_err(|_| ApiError::BadRequest(format!("{src} is not UTF-8")))
-}
-
-/// Whether `org` has a repository bound through connection `id`: the org is
-/// on that connection's forge.
-async fn org_has_repo_on(
-    connections: &dyn scarab_forge::ForgeConnectionStore,
-    id: &str,
-    org: &str,
-) -> Result<bool, ApiError> {
-    let registry = |e: scarab_forge::RegistryError| ApiError::Db(DbError::Other(e.to_string()));
-    for repo in connections.repos_of(id).await.map_err(registry)? {
-        if let Some(r) = connections.resolve(&repo).await.map_err(registry)? {
-            if r.org == org && r.connection.id == id {
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
 }
 
 /// Checks `content` compiles as `lib:<publisher>/<name>` in `org`, in place

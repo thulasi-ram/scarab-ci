@@ -336,6 +336,8 @@ async fn declaring_a_database_owned_connection_in_config_refuses_the_boot() {
         kind: ForgeKind::Forgejo,
         base_url: "https://typed-by-hand.example.com".into(),
         credential_ref: "hand-made".into(),
+        org: None,
+        installation_id: None,
     })
     .await
     .unwrap();
@@ -426,6 +428,8 @@ async fn the_deployment_override_wins_over_the_secret_store() {
         kind: ForgeKind::Forgejo,
         base_url: "https://git.example.com".into(),
         credential_ref: "forgejo-main".into(),
+        org: None,
+        installation_id: None,
     };
     secrets
         .put(
@@ -464,12 +468,16 @@ async fn the_github_app_pem_is_an_override_in_the_same_table() {
         kind: ForgeKind::GitHub,
         base_url: "https://api.github.com".into(),
         credential_ref: "github-app".into(),
+        org: None,
+        installation_id: None,
     };
     let forgejo = ForgeConnection {
         id: "forgejo-main".into(),
         kind: ForgeKind::Forgejo,
         base_url: "https://git.example.com".into(),
         credential_ref: "forgejo-main".into(),
+        org: None,
+        installation_id: None,
     };
 
     let app_mode = CredentialOverrides::new().with_github_app_pem(Some("PEM".into()), true);

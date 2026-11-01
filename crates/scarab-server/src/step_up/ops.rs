@@ -98,6 +98,9 @@ pub enum OrgOf {
     Query(&'static str),
     /// The tenant of the run named by the `id` path parameter.
     Run,
+    /// The Org of the forge connection named by the `id` path parameter
+    /// (git-bug 19b0a45); none for an unassigned connection.
+    Connection,
     /// Not bound to one Org.
     None,
 }
@@ -734,7 +737,7 @@ pub static CONNECTION_RESYNC: Op = op(
     Class::CrownJewel(W),
     "§3 ForgeConnection edits (AMBIG)",
     ADMIN,
-    OrgOf::None,
+    OrgOf::Connection,
     &[],
     &["path:id"],
 );
@@ -744,7 +747,7 @@ pub static CONNECTION_WEBHOOK: Op = op(
     Class::NotGoverned("idempotent re-registration for an already-bound repo"),
     "§3 ForgeConnection edits (AMBIG)",
     ADMIN,
-    OrgOf::None,
+    OrgOf::Connection,
     &[],
     &["path:id", "path:owner", "path:name"],
 );
@@ -999,9 +1002,9 @@ pub static CONNECTION_CREATE: Op = op(
     Class::CrownJewel(W),
     "§3 ForgeConnection edits",
     ADMIN,
-    OrgOf::None,
+    OrgOf::Body("/org"),
     &["/credential"],
-    &["body:/kind", "body:/base_url"],
+    &["body:/org", "body:/kind", "body:/base_url"],
 );
 pub static CONNECTION_DELETE: Op = op(
     "connection.delete",
@@ -1009,7 +1012,7 @@ pub static CONNECTION_DELETE: Op = op(
     Class::CrownJewel(W),
     "§3 ForgeConnection edits; Project deletion",
     ADMIN,
-    OrgOf::None,
+    OrgOf::Connection,
     &[],
     &["path:id"],
 );
@@ -1019,7 +1022,7 @@ pub static CONNECTION_BIND_REPO: Op = op(
     Class::CrownJewel(W),
     "§3 ForgeConnection edits (AMBIG)",
     ADMIN,
-    OrgOf::None,
+    OrgOf::Connection,
     &[],
     &["path:id", "body:/owner", "body:/name"],
 );
@@ -1029,7 +1032,7 @@ pub static CONNECTION_UNBIND_REPO: Op = op(
     Class::CrownJewel(W),
     "§3 irreversible destruction (Project)",
     ADMIN,
-    OrgOf::None,
+    OrgOf::Connection,
     &[],
     &["path:id", "path:owner", "path:name"],
 );

@@ -3338,6 +3338,11 @@ pub struct MeResponse {
     /// bound to it, so `can_administer` can be true with nothing to administer
     /// yet.
     pub admin_orgs: Vec<String>,
+    /// Does the caller hold a global `Administer` role? Only such a caller
+    /// may add the first connection of an Org that does not exist yet, or
+    /// act on an unassigned connection (git-bug 19b0a45). Always `false` for
+    /// an API token.
+    pub global_admin: bool,
     /// The provider accounts this Principal can sign in with (ADR-0069).
     /// Empty when no identity store is wired (dev).
     pub identities: Vec<PrincipalIdentityDto>,
@@ -3356,7 +3361,8 @@ pub struct MeResponse {
 async fn me(State(st): State<AppState>, headers: HeaderMap) -> Result<Json<MeResponse>, ApiError> {
     let caller = authenticate(&st, &headers, Action::Read).await?;
     let admin_orgs = administrable_orgs(&st, &caller).await?;
-    let can_administer = caller.may_globally(Action::Administer) || !admin_orgs.is_empty();
+    let global_admin = caller.may_globally(Action::Administer);
+    let can_administer = global_admin || !admin_orgs.is_empty();
     let identities = match st.identities.as_ref() {
         Some(store) => store
             .identities_of(&caller.principal.subject)
@@ -3384,42 +3390,28 @@ async fn me(State(st): State<AppState>, headers: HeaderMap) -> Result<Json<MeRes
             .collect(),
         can_administer,
         admin_orgs,
+        global_admin,
         identities,
     }))
 }
 
 /// The orgs `principal` may administer (ADR-0060), sorted and deduplicated.
 ///
-/// An org exists only as the coordinate of a bound Project — there is no `orgs`
-/// table (ADR-0046) — so the candidate set is exactly the orgs of the registry's
-/// bindings. A globally-`Administer` role takes all of them; anyone else needs an
-/// `Admin`+ binding on that specific `Scope::Org`.
+/// The candidate set is the Org record (git-bug 19b0a45): the registry's
+/// [`list_orgs`](scarab_forge::ForgeConnectionStore::list_orgs). A
+/// globally-`Administer` role takes all of them; anyone else needs an
+/// `Admin`+ binding on that specific `Scope::Org` (an API token: one its
+/// scope covers).
 async fn administrable_orgs(st: &AppState, caller: &Caller) -> Result<Vec<String>, ApiError> {
     let Some(connections) = st.connections.as_ref() else {
         return Ok(Vec::new()); // no registry wired (dev): no orgs exist yet
     };
-    let mut orgs = std::collections::BTreeSet::new();
-    let conns = connections
-        .list_connections()
+    let orgs = connections
+        .list_orgs()
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    for conn in conns {
-        let repos = connections
-            .repos_of(&conn.id)
-            .await
-            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-        for repo in repos {
-            if let Some(resolved) = connections
-                .resolve(&repo)
-                .await
-                .map_err(|e| ApiError::BadRequest(e.to_string()))?
-            {
-                orgs.insert(resolved.org);
-            }
-        }
-    }
     if caller.may_globally(Action::Administer) {
-        return Ok(orgs.into_iter().collect());
+        return Ok(orgs);
     }
     let mut allowed = Vec::new();
     for org in orgs {
@@ -6786,6 +6778,135 @@ async fn ingest_event(
     }
 }
 
+/// The API base every GitHub App installation connection talks to.
+const GITHUB_API_BASE: &str = "https://api.github.com";
+
+/// Apply an installation delivery to the registry (ADR-0046: installing the
+/// App **is** registration), into the Org of the installation's account
+/// (git-bug 19b0a45).
+///
+/// The connection `github-install-<id>` serves the account's Org and records
+/// its installation id, so its tokens are minted from that installation
+/// only. It is registered **unassigned** (no Org, no repos bound) when an Org
+/// of the account's name already has a connection to another forge or host:
+/// a GitHub account must not join, by name alone, an Org made for another
+/// forge. A global admin's first action on it then assigns it.
+async fn register_installation(
+    st: &AppState,
+    connections: &dyn scarab_forge::ForgeConnectionStore,
+    sync: &scarab_forge_github::InstallationSync,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    let registry = |e: scarab_forge::RegistryError| ApiError::Db(DbError::Other(e.to_string()));
+    let account = sync.account.trim();
+    if account.is_empty() {
+        return Err(ApiError::BadRequest(
+            "installation delivery carries no account login, so it has no org".into(),
+        ));
+    }
+    let conn_id = format!("github-install-{}", sync.installation_id);
+    let existing = connections
+        .get_connection(&conn_id)
+        .await
+        .map_err(registry)?;
+    let org = match existing.as_ref().and_then(|c| c.org.clone()) {
+        Some(org) => Some(org),
+        None if account_org_is_elsewhere(connections, &conn_id, account).await? => None,
+        None => Some(account.to_string()),
+    };
+    connections
+        .put_connection(&scarab_forge::ForgeConnection {
+            id: conn_id.clone(),
+            kind: scarab_forge::ForgeKind::GitHub,
+            base_url: existing
+                .as_ref()
+                .map(|c| c.base_url.clone())
+                .unwrap_or_else(|| GITHUB_API_BASE.into()),
+            // The App credential is shared across installations; the
+            // composition root registers it under this handle.
+            credential_ref: "github-app".into(),
+            org: org.clone(),
+            installation_id: Some(sync.installation_id),
+        })
+        .await
+        .map_err(registry)?;
+    // Unassigned: the repos wait for a global admin, so nothing is homed in
+    // an Org by name alone. Removals still apply.
+    let sync = if org.is_some() {
+        sync.clone()
+    } else {
+        tracing::warn!(
+            connection = %conn_id,
+            account = %account,
+            "GitHub installation registered unassigned: an org of that name already has a \
+             connection to another forge; a global admin assigns it"
+        );
+        scarab_forge_github::InstallationSync {
+            added: Vec::new(),
+            ..sync.clone()
+        }
+    };
+    let skipped =
+        scarab_forge_github::apply_installation_sync(connections, &conn_id, account, &sync)
+            .await
+            .map_err(registry)?;
+    for repo in &skipped {
+        tracing::warn!(
+            connection = %conn_id,
+            repo = %format!("{}/{}", repo.owner, repo.name),
+            "installation sync skipped a repo of another owner, or one bound through another \
+             org's connection"
+        );
+    }
+    // A new org gets the first-party libraries (ADR-0076 §5).
+    if sync.added.len() > skipped.len() {
+        libraries::offer_defaults_on_bind(st, account).await;
+    }
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "registered": {
+                "added": sync.added.len() - skipped.len(),
+                "removed": sync.removed.len(),
+                "skipped": skipped.len(),
+                "org": org,
+            },
+        })),
+    ))
+}
+
+/// Does an Org named `account` already have a connection to another forge
+/// or host than GitHub's API (D7 of git-bug 19b0a45)? Counted: a connection
+/// assigned to that Org, and an unassigned one with a repo bound into it.
+async fn account_org_is_elsewhere(
+    connections: &dyn scarab_forge::ForgeConnectionStore,
+    conn_id: &str,
+    account: &str,
+) -> Result<bool, ApiError> {
+    let registry = |e: scarab_forge::RegistryError| ApiError::Db(DbError::Other(e.to_string()));
+    for c in connections.list_connections().await.map_err(registry)? {
+        if c.id == conn_id
+            || (c.kind == scarab_forge::ForgeKind::GitHub
+                && c.base_url.trim_end_matches('/') == GITHUB_API_BASE)
+        {
+            continue;
+        }
+        match c.org.as_deref() {
+            Some(org) if org == account => return Ok(true),
+            Some(_) => {}
+            None => {
+                for repo in connections.repos_of(&c.id).await.map_err(registry)? {
+                    if let Some(r) = connections.resolve(&repo).await.map_err(registry)? {
+                        if r.org == account && r.connection.id == c.id {
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// Inbound GitHub webhook ingest (ADR-0010, 0032, 0046): verify the HMAC
 /// signature with the GitHub secret, guard against replays by delivery id,
 /// auto-register installation events into the ForgeConnection registry
@@ -6831,36 +6952,7 @@ async fn github_webhook(
     // Installation lifecycle → registry auto-registration (ADR-0046).
     if let Some(sync) = scarab_forge_github::installation_sync(&delivery) {
         if let Some(connections) = st.connections.as_ref() {
-            let conn_id = format!("github-install-{}", sync.installation_id);
-            connections
-                .put_connection(&scarab_forge::ForgeConnection {
-                    id: conn_id.clone(),
-                    kind: scarab_forge::ForgeKind::GitHub,
-                    base_url: "https://api.github.com".into(),
-                    // The App credential is shared across installations; the
-                    // composition root registers it under this handle.
-                    credential_ref: "github-app".into(),
-                })
-                .await
-                .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?;
-            scarab_forge_github::apply_installation_sync(
-                connections.as_ref(),
-                &conn_id,
-                &sync.account,
-                &sync,
-            )
-            .await
-            .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?;
-            // A new org gets the first-party libraries (ADR-0076 §5).
-            if !sync.added.is_empty() {
-                libraries::offer_defaults_on_bind(&st, &sync.account).await;
-            }
-            return Ok((
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "registered": { "added": sync.added.len(), "removed": sync.removed.len() },
-                })),
-            ));
+            return register_installation(&st, connections.as_ref(), &sync).await;
         }
         return Ok((
             StatusCode::OK,
@@ -9672,6 +9764,9 @@ fn coverage_column(environment: &Option<String>) -> scarab_project::CoverageColu
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ConnectionDto {
     pub id: String,
+    /// The Org this connection serves (git-bug 19b0a45); `null` = unassigned,
+    /// visible to and editable by global admins only.
+    pub org: Option<String>,
     /// `github` | `forgejo`.
     pub kind: String,
     /// The API base URL the adapter talks to (GHES / a self-hosted Forgejo).
@@ -9728,6 +9823,10 @@ pub struct ConnectionProjectDto {
 /// can read back is a secret you have leaked.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateConnectionRequest {
+    /// The Org the connection serves (git-bug 19b0a45): the forge owner whose
+    /// repositories it binds. The caller must administer it; the first
+    /// connection of an Org that does not exist yet needs a global admin.
+    pub org: String,
     /// `forgejo`. GitHub is not creatable here — installing the App *is* its
     /// registration (ADR-0060 part C), so a create form for it could not work.
     pub kind: String,
@@ -9748,11 +9847,23 @@ pub struct CreatedConnectionDto {
     pub credential_ref: String,
 }
 
+/// `GET /v1/connections` query.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ListConnectionsQuery {
+    /// Only the connections serving this Org.
+    #[serde(default)]
+    pub org: Option<String>,
+}
+
 /// `POST /v1/connections/{id}/resync` body: what reconciliation changed.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ResyncResultDto {
     /// Repos the forge reports that Scarab did not have bound — now bound.
     pub bound: Vec<String>,
+    /// Repos the forge reports that were not bound: owned by another account
+    /// than the connection's Org, or bound through another Org's connection
+    /// (git-bug 19b0a45).
+    pub skipped: Vec<String>,
     /// How many bindings the forge confirms. Reported rather than acted on:
     /// see the handler's note on why re-sync never unbinds.
     pub confirmed: usize,
@@ -9795,23 +9906,115 @@ fn refuse_reserved_secret_org(org: &str) -> Result<(), ApiError> {
     refuse_reserved_org(org, "hold secrets written through /v1/secrets")
 }
 
-/// The gate every `/v1/connections*` endpoint shares: `Administer` on the Org.
+/// The gate in front of every `/v1/connections*` endpoint: the caller must be
+/// able to administer *some* Org (or hold the global role). A caller who
+/// administers nothing is refused 403 here, before any connection is looked
+/// at; which connections it may then see or act on is decided per
+/// connection ([`authorize_connection`], git-bug 19b0a45).
 ///
-/// A connection spans every Project it serves, so administering it is an
-/// org-level act, not a per-repo one — and there is no org in the path (one
-/// implicit Org, ADR-0060), so the check is "may this caller administer *an*
-/// org?". A globally-`Administer` role passes outright; anyone else needs an
-/// `Admin`+ binding on some `Scope::Org`. On a virgin install no org exists yet
-/// (an org is the coordinate of a bound Project), so bootstrapping the first
-/// connection necessarily needs the global role — the same asymmetry `/v1/me`
-/// already reports via `can_administer` + an empty `admin_orgs`.
-async fn authorize_org_administer(st: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+/// Returns the caller and whether it administers globally. On a virgin
+/// install no Org exists yet, so bootstrapping the first connection needs
+/// the global role, the asymmetry `/v1/me` reports via `global_admin`.
+async fn connection_caller(st: &AppState, headers: &HeaderMap) -> Result<(Caller, bool), ApiError> {
     let caller = authenticate(st, headers, Action::Administer).await?;
-    if !caller.may_globally(Action::Administer) && administrable_orgs(st, &caller).await?.is_empty()
-    {
+    let global = caller.may_globally(Action::Administer);
+    if !global && administrable_orgs(st, &caller).await?.is_empty() {
         return Err(ApiError::Forbidden);
     }
-    Ok(())
+    Ok((caller, global))
+}
+
+/// May `caller` administer connection `conn`? `Administer` on the Org the
+/// connection serves; a global admin may act on any, and only a global
+/// admin on an unassigned one (`org` NULL).
+async fn may_administer_connection(
+    st: &AppState,
+    caller: &Caller,
+    global: bool,
+    conn: &scarab_forge::ForgeConnection,
+) -> Result<bool, ApiError> {
+    if global {
+        return Ok(true);
+    }
+    match &conn.org {
+        Some(org) => {
+            caller
+                .may(
+                    st,
+                    Action::Administer,
+                    &scarab_identity::Scope::Org(org.clone()),
+                )
+                .await
+        }
+        None => Ok(false),
+    }
+}
+
+/// Load connection `id` for a caller who must administer it (git-bug
+/// 19b0a45): `Administer` on the connection's Org, or the global role.
+///
+/// A connection of an Org the caller does not administer answers **404**,
+/// the same as one that does not exist: an org admin learns nothing about
+/// another Org's connections, not even that the id is taken.
+async fn authorize_connection(
+    st: &AppState,
+    headers: &HeaderMap,
+    id: &str,
+) -> Result<scarab_forge::ForgeConnection, ApiError> {
+    let (caller, global) = connection_caller(st, headers).await?;
+    let connections = st.connections.as_ref().ok_or(ApiError::NotFound)?;
+    let conn = connections
+        .get_connection(id)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?
+        .ok_or(ApiError::NotFound)?;
+    if !may_administer_connection(st, &caller, global, &conn).await? {
+        return Err(ApiError::NotFound);
+    }
+    Ok(conn)
+}
+
+/// An unassigned GitHub installation connection takes its Org from the
+/// installation's account (`GET /app/installations/{id}`, git-bug 19b0a45)
+/// the first time an admin acts on it through the forge. Only a global
+/// admin reaches an unassigned connection, so this is that admin's act.
+///
+/// Best-effort: when the forge cannot say, the connection stays unassigned
+/// and the caller goes on with it as it is.
+async fn claim_installation_org(
+    st: &AppState,
+    conn: scarab_forge::ForgeConnection,
+) -> Result<scarab_forge::ForgeConnection, ApiError> {
+    if conn.org.is_some()
+        || conn.kind != scarab_forge::ForgeKind::GitHub
+        || conn.installation_id.is_none()
+    {
+        return Ok(conn);
+    }
+    let Some(connections) = st.connections.as_ref() else {
+        return Ok(conn);
+    };
+    let forge = connection_adapter(st, &conn).await?;
+    let account = match forge.connection_account().await {
+        Ok(a) if !a.is_empty() && !is_reserved_org(&a) => a,
+        Ok(a) => {
+            tracing::warn!(connection = %conn.id, account = %a, "installation account cannot be an org; the connection stays unassigned");
+            return Ok(conn);
+        }
+        Err(e) => {
+            tracing::warn!(connection = %conn.id, error = %e, "could not read the installation's account; the connection stays unassigned");
+            return Ok(conn);
+        }
+    };
+    let assigned = scarab_forge::ForgeConnection {
+        org: Some(account),
+        ..conn
+    };
+    connections
+        .put_connection(&assigned)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    Ok(assigned)
 }
 
 /// The forge adapter for **one connection** (ADR-0060) — the port the onboarding
@@ -9878,30 +10081,46 @@ fn is_loopback_callback(url: &str) -> bool {
 /// The registered forge connections and their health (ADR-0060 part C) — what
 /// the global Settings **Connections** section renders.
 ///
-/// Read-only, and `Administer` on the Org: a connection spans every Project it
-/// serves, so seeing the fleet is an org-level act, not a per-repo one. No
-/// credential material is ever returned — only whether the handle resolves.
+/// Read-only, and per Org (git-bug 19b0a45): the caller sees the connections
+/// of the Orgs it administers, and a global admin also sees the unassigned
+/// ones. No credential material is ever returned — only whether the handle
+/// resolves.
 #[utoipa::path(
     get,
     path = "/v1/connections",
     summary = "Registered forge connections + their bound Projects and health (ADR-0060)",
+    params(("org" = Option<String>, Query, description = "only the connections serving this org")),
     responses(
         (status = 200, body = [ConnectionDto]),
-        (status = 403, description = "requires Administer on the org"),
+        (status = 403, description = "requires Administer on an org"),
         (status = 404, description = "no connection registry wired")
     )
 )]
 async fn list_connections(
     State(st): State<AppState>,
     headers: HeaderMap,
+    Query(q): Query<ListConnectionsQuery>,
 ) -> Result<Json<Vec<ConnectionDto>>, ApiError> {
-    authorize_org_administer(&st, &headers).await?;
+    let (caller, global) = connection_caller(&st, &headers).await?;
     let connections = st.connections.as_ref().ok_or(ApiError::NotFound)?;
 
-    let conns = connections
+    // Only the connections of Orgs the caller administers (git-bug 19b0a45);
+    // an unassigned one only to a global admin.
+    let mut conns = Vec::new();
+    for conn in connections
         .list_connections()
         .await
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?
+    {
+        if let Some(org) = q.org.as_deref() {
+            if conn.org.as_deref() != Some(org) {
+                continue;
+            }
+        }
+        if may_administer_connection(&st, &caller, global, &conn).await? {
+            conns.push(conn);
+        }
+    }
     // Ownership (ADR-0060 part D), read once for the whole page: the durable
     // marker boot provisioning writes, not a guess.
     let config_owned: std::collections::BTreeSet<String> = connections
@@ -9968,6 +10187,7 @@ async fn list_connections(
         out.push(ConnectionDto {
             web_url: forge_web_host(conn.kind, &conn.base_url),
             id: conn.id,
+            org: conn.org,
             kind: conn.kind.as_str().to_string(),
             base_url: conn.base_url,
             credential_ref: conn.credential_ref,
@@ -10139,13 +10359,7 @@ async fn connection_preflight(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<ConnectionPreflightDto>, ApiError> {
-    authorize_org_administer(&st, &headers).await?;
-    let connections = st.connections.as_ref().ok_or(ApiError::NotFound)?;
-    let conn = connections
-        .get_connection(&id)
-        .await
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?
-        .ok_or(ApiError::NotFound)?;
+    let conn = authorize_connection(&st, &headers, &id).await?;
 
     let required: Vec<CapabilityRequirementDto> = scarab_forge::preflight::required(conn.kind)
         .iter()
@@ -10253,13 +10467,8 @@ async fn resync_connection(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<ResyncResultDto>, ApiError> {
-    authorize_org_administer(&st, &headers).await?;
+    let conn = authorize_connection(&st, &headers, &id).await?;
     let connections = st.connections.as_ref().ok_or(ApiError::NotFound)?;
-    let conn = connections
-        .get_connection(&id)
-        .await
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?
-        .ok_or(ApiError::NotFound)?;
     // Config-owned connections are read-only here (ADR-0060 part D): their repo
     // bindings are declared in the `connections:` block, so a binding written by
     // re-sync would live outside the source that is authoritative for them —
@@ -10274,6 +10483,9 @@ async fn resync_connection(
              declared in the `connections:` block. Add the repo there and redeploy."
         )));
     }
+    // An unassigned installation takes its account as its Org first, so the
+    // repos it binds land in that Org (git-bug 19b0a45).
+    let conn = claim_installation_org(&st, conn).await?;
     // THIS connection's adapter, not the repo-routed port: enumeration is a
     // connection-scoped question, and a connection whose registry drifted to
     // empty has no repo left to route through.
@@ -10297,10 +10509,18 @@ async fn resync_connection(
         .collect();
 
     let mut bound = Vec::new();
+    let mut skipped = Vec::new();
     let mut confirmed = 0usize;
     for repo in reported {
         if known.contains(&repo) {
             confirmed += 1;
+            continue;
+        }
+        // A connection binds only its own Org's repos (git-bug 19b0a45). A
+        // credential that reaches another owner's repo does not make it this
+        // Org's.
+        if conn.org.as_deref().is_some_and(|org| org != repo.owner) {
+            skipped.push(format!("{}/{}", repo.owner, repo.name));
             continue;
         }
         // A forge account named like one of Scarab's own Orgs is never homed
@@ -10317,15 +10537,28 @@ async fn resync_connection(
         // Project name = repo name, org = repo owner — the same 1:1 mapping
         // `apply_installation_sync` uses, so a re-synced Project is
         // indistinguishable from a webhook-registered one.
-        connections
+        match connections
             .bind_repo(&id, &repo, &repo.owner, &repo.name)
             .await
-            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        {
+            Ok(()) => {}
+            // Bound through another Org's connection: re-sync never moves a
+            // repo across Orgs (git-bug 19b0a45).
+            Err(scarab_forge::RegistryError::BoundElsewhere { .. }) => {
+                skipped.push(format!("{}/{}", repo.owner, repo.name));
+                continue;
+            }
+            Err(e) => return Err(ApiError::BadRequest(e.to_string())),
+        }
         // A new org gets the first-party libraries (ADR-0076 §5).
         libraries::offer_defaults_on_bind(&st, &repo.owner).await;
         bound.push(format!("{}/{}", repo.owner, repo.name));
     }
-    Ok(Json(ResyncResultDto { bound, confirmed }))
+    Ok(Json(ResyncResultDto {
+        bound,
+        skipped,
+        confirmed,
+    }))
 }
 
 /// Mint the ids for a manually-created connection: `(connection_id,
@@ -10366,10 +10599,10 @@ fn mint_connection_ids(kind: scarab_forge::ForgeKind) -> (String, String) {
     request_body = CreateConnectionRequest,
     responses(
         (status = 201, body = CreatedConnectionDto),
-        (status = 400, description = "unknown kind, non-creatable kind, or a malformed base URL"),
-        (status = 403, description = "requires Administer on the org"),
+        (status = 400, description = "unknown kind, non-creatable kind, a malformed base URL, or a missing or reserved org"),
+        (status = 403, description = "requires Administer on the org; a new org needs a global admin"),
         (status = 404, description = "no connection registry or secret store wired"),
-        (status = 409, description = "a connection to that forge and base URL already exists")
+        (status = 409, description = "the org already has a connection to that forge and base URL")
     )
 )]
 async fn create_connection(
@@ -10377,8 +10610,35 @@ async fn create_connection(
     headers: HeaderMap,
     Json(req): Json<CreateConnectionRequest>,
 ) -> Result<(StatusCode, Json<CreatedConnectionDto>), ApiError> {
-    authorize_org_administer(&st, &headers).await?;
+    let (caller, global) = connection_caller(&st, &headers).await?;
     let connections = st.connections.as_ref().ok_or(ApiError::NotFound)?;
+    // The Org it serves (git-bug 19b0a45). An admin of that Org may add it;
+    // an Org that does not exist yet needs a global admin, as the first
+    // connection of a fresh install always has.
+    let org = req.org.trim().to_string();
+    if org.is_empty() {
+        return Err(ApiError::BadRequest(
+            "org is required: the org this connection serves".into(),
+        ));
+    }
+    refuse_reserved_org(&org, "own a forge connection")?;
+    if !global {
+        let exists = connections
+            .list_orgs()
+            .await
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?
+            .contains(&org);
+        let administers = caller
+            .may(
+                &st,
+                Action::Administer,
+                &scarab_identity::Scope::Org(org.clone()),
+            )
+            .await?;
+        if !exists || !administers {
+            return Err(ApiError::Forbidden);
+        }
+    }
     // No secret store means no write-through target. Refusing is the only honest
     // answer: a connection row with an unresolvable credential is a row that
     // cannot serve a single call.
@@ -10406,19 +10666,19 @@ async fn create_connection(
         return Err(ApiError::BadRequest("credential is required".into()));
     }
 
-    // One connection per (kind, base URL). Two rows for one host would each
-    // carry their own credential and each claim to serve it — an ambiguity with
-    // no upside, and the shape an accidental double-submit produces.
+    // One connection per (org, kind, base URL). Two rows for one host in one
+    // Org would each carry their own credential and each claim to serve it —
+    // an ambiguity with no upside, and the shape an accidental double-submit
+    // produces. Two Orgs on one host each have their own (git-bug 19b0a45).
     let existing = connections
         .list_connections()
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    if let Some(dupe) = existing
-        .iter()
-        .find(|c| c.kind == kind && c.base_url == base_url)
-    {
+    if let Some(dupe) = existing.iter().find(|c| {
+        c.kind == kind && c.base_url == base_url && c.org.as_deref() == Some(org.as_str())
+    }) {
         return Err(ApiError::Conflict(format!(
-            "connection `{}` already serves {base_url}",
+            "connection `{}` already serves {base_url} for org `{org}`",
             dupe.id
         )));
     }
@@ -10442,6 +10702,8 @@ async fn create_connection(
             kind,
             base_url,
             credential_ref: credential_ref.clone(),
+            org: Some(org),
+            installation_id: None,
         })
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
@@ -10497,14 +10759,9 @@ async fn delete_connection(
     Path(id): Path<String>,
     Query(q): Query<DeleteConnectionQuery>,
 ) -> Result<StatusCode, ApiError> {
-    authorize_org_administer(&st, &headers).await?;
+    let conn = authorize_connection(&st, &headers, &id).await?;
     let connections = st.connections.as_ref().ok_or(ApiError::NotFound)?;
     deny_if_config_owned(connections, &id, "the connection itself").await?;
-    let conn = connections
-        .get_connection(&id)
-        .await
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?
-        .ok_or(ApiError::NotFound)?;
 
     let bound = connections
         .repos_of(&id)
@@ -10527,7 +10784,8 @@ async fn delete_connection(
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
-    // The credential outlives the row only if something else still points at it.
+    // The credential outlives the row only if something else still points at
+    // it — any connection, in any Org: the App credential is shared.
     if let Some(secrets) = st.secrets.as_ref() {
         let still_referenced = connections
             .list_connections()
@@ -10617,13 +10875,9 @@ async fn available_repos(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<AvailableRepoDto>>, ApiError> {
-    authorize_org_administer(&st, &headers).await?;
+    let conn = authorize_connection(&st, &headers, &id).await?;
     let connections = st.connections.as_ref().ok_or(ApiError::NotFound)?;
-    let conn = connections
-        .get_connection(&id)
-        .await
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?
-        .ok_or(ApiError::NotFound)?;
+    let conn = claim_installation_org(&st, conn).await?;
     let forge = connection_adapter(&st, &conn).await?;
 
     let reported = match forge.list_accessible_repos().await {
@@ -10642,6 +10896,8 @@ async fn available_repos(
         .map_err(|e| ApiError::BadRequest(e.to_string()))?
         .into_iter()
         .collect();
+    // Listed as the forge reports them. Only those owned by the connection's
+    // Org can be bound through it (git-bug 19b0a45); the bind says so.
     let mut out: Vec<AvailableRepoDto> = reported
         .into_iter()
         .map(|repo| AvailableRepoDto {
@@ -10677,7 +10933,7 @@ async fn available_repos(
     request_body = BindRepoRequest,
     responses(
         (status = 200, body = BindRepoResultDto),
-        (status = 400, description = "missing owner/name"),
+        (status = 400, description = "missing owner/name, or a repo not owned by the connection's org"),
         (status = 403, description = "requires Administer on the org"),
         (status = 404, description = "no such connection, or no registry wired"),
         (status = 409, description = "the repo is already bound to a different connection")
@@ -10689,14 +10945,9 @@ async fn bind_repo(
     Path(id): Path<String>,
     Json(req): Json<BindRepoRequest>,
 ) -> Result<Json<BindRepoResultDto>, ApiError> {
-    authorize_org_administer(&st, &headers).await?;
+    let conn = authorize_connection(&st, &headers, &id).await?;
     let connections = st.connections.as_ref().ok_or(ApiError::NotFound)?;
     deny_if_config_owned(connections, &id, "its set of repositories").await?;
-    let conn = connections
-        .get_connection(&id)
-        .await
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?
-        .ok_or(ApiError::NotFound)?;
     let repo = scarab_forge::RepoRef {
         owner: req.owner.trim().to_string(),
         name: req.name.trim().to_string(),
@@ -10705,6 +10956,19 @@ async fn bind_repo(
         return Err(ApiError::BadRequest("owner and name are required".into()));
     }
     refuse_reserved_org(&repo.owner, "own a bound repo")?;
+    let conn = claim_installation_org(&st, conn).await?;
+    // A connection binds only its own Org's repos (git-bug 19b0a45): the
+    // Project lands in the Org named by the repo's owner, and that must be
+    // the Org whose admin is acting.
+    if let Some(org) = conn.org.as_deref() {
+        if repo.owner != org {
+            return Err(ApiError::BadRequest(format!(
+                "connection `{id}` serves org `{org}`; `{}/{}` is owned by `{}`, so it cannot \
+                 be bound through it",
+                repo.owner, repo.name, repo.owner
+            )));
+        }
+    }
 
     // `bind_repo` upserts, so re-binding a repo owned by ANOTHER connection would
     // silently re-home a live Project onto a different forge account. A v1
@@ -10729,7 +10993,10 @@ async fn bind_repo(
     connections
         .bind_repo(&id, &repo, &repo.owner, &repo.name)
         .await
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        .map_err(|e| match e {
+            scarab_forge::RegistryError::BoundElsewhere { .. } => ApiError::Conflict(e.to_string()),
+            e => ApiError::BadRequest(e.to_string()),
+        })?;
     // A new org gets the first-party libraries (ADR-0076 §5): claimed now,
     // installed in the background, so the bind never waits on a forge.
     libraries::offer_defaults_on_bind(&st, &repo.owner).await;
@@ -10805,7 +11072,7 @@ async fn register_repo_webhook(
     headers: HeaderMap,
     Path((id, owner, name)): Path<(String, String, String)>,
 ) -> Result<Json<BindRepoResultDto>, ApiError> {
-    authorize_org_administer(&st, &headers).await?;
+    let conn = authorize_connection(&st, &headers, &id).await?;
     let connections = st.connections.as_ref().ok_or(ApiError::NotFound)?;
     deny_if_config_owned(
         connections,
@@ -10813,11 +11080,6 @@ async fn register_repo_webhook(
         "webhook registration for its repositories",
     )
     .await?;
-    let conn = connections
-        .get_connection(&id)
-        .await
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?
-        .ok_or(ApiError::NotFound)?;
     let repo = scarab_forge::RepoRef { owner, name };
     let resolved = connections
         .resolve(&repo)
@@ -10867,7 +11129,7 @@ async fn unbind_repo(
     headers: HeaderMap,
     Path((id, owner, name)): Path<(String, String, String)>,
 ) -> Result<StatusCode, ApiError> {
-    authorize_org_administer(&st, &headers).await?;
+    authorize_connection(&st, &headers, &id).await?;
     let connections = st.connections.as_ref().ok_or(ApiError::NotFound)?;
     deny_if_config_owned(connections, &id, "its set of repositories").await?;
     let repo = scarab_forge::RepoRef { owner, name };

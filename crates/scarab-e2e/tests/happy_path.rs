@@ -106,6 +106,8 @@ async fn happy_path_cli_dispatch_to_succeeded_with_logs() {
             kind: ForgeKind::Forgejo,
             base_url: forge_url,
             credential_ref: cred_ref.clone(),
+            org: Some(org.into()),
+            installation_id: None,
         })
         .await
         .expect("register e2e forge connection");

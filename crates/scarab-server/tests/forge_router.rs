@@ -42,6 +42,8 @@ async fn missing_credential_material_fails_loudly_at_use_time() {
             kind: ForgeKind::GitHub,
             base_url: "https://api.github.com".into(),
             credential_ref: "dangling-handle".into(),
+            org: Some("acme".into()),
+            installation_id: None,
         })
         .await
         .unwrap();
@@ -75,6 +77,8 @@ async fn a_connection_with_no_bound_repos_still_yields_an_adapter() {
         kind: ForgeKind::Forgejo,
         base_url: "https://git.acme.test".into(),
         credential_ref: "fj-1-credential".into(),
+        org: Some("acme".into()),
+        installation_id: None,
     };
     registry.put_connection(&conn).await.unwrap();
     let scope = SecretScope::Org {
@@ -141,6 +145,8 @@ async fn production_path_posts_a_status_with_run_deep_link_live() {
             kind: ForgeKind::GitHub,
             base_url: "https://api.github.com".into(),
             credential_ref: "gh-live-token".into(),
+            org: Some(owner.into()),
+            installation_id: None,
         })
         .await
         .unwrap();

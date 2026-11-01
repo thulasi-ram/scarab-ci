@@ -274,6 +274,8 @@ async fn a_forge_token_step_on_an_http_connection_is_refused() {
         kind: ForgeKind::Forgejo,
         base_url: "http://git.example.com".into(),
         credential_ref: "fj-token".into(),
+        org: Some("acme".into()),
+        installation_id: None,
     })
     .await
     .unwrap();

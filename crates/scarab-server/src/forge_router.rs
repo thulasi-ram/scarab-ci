@@ -102,13 +102,21 @@ impl RegistryForge {
         Ok(match conn.kind {
             ForgeKind::GitHub => match &self.github_app_id {
                 // App mode: the credential is the App private-key PEM.
-                Some(app_id) => Arc::new(
-                    scarab_forge_github::GithubForge::app(scarab_forge_github::GithubApp {
-                        app_id: app_id.clone(),
-                        private_key_pem: credential().await?,
+                // A connection that knows its installation mints only from it
+                // and lists only its repositories (git-bug 19b0a45); a legacy
+                // row without one looks each repo's installation up.
+                Some(app_id) => {
+                    let adapter =
+                        scarab_forge_github::GithubForge::app(scarab_forge_github::GithubApp {
+                            app_id: app_id.clone(),
+                            private_key_pem: credential().await?,
+                        })
+                        .with_base_url(conn.base_url.clone());
+                    Arc::new(match conn.installation_id {
+                        Some(id) => adapter.with_installation(id),
+                        None => adapter,
                     })
-                    .with_base_url(conn.base_url.clone()),
-                ),
+                }
                 // Token mode (dev): the credential is a plain token.
                 None => Arc::new(
                     scarab_forge_github::GithubForge::new(credential().await?)
@@ -137,14 +145,17 @@ impl RegistryForge {
         &self,
         conn: &ForgeConnection,
     ) -> Result<Arc<dyn ForgePort>, ForgeError> {
-        if let Some(adapter) = self.adapters.lock().unwrap().get(&conn.id) {
+        // Keyed by the installation too: a legacy row that later learns its
+        // installation id gets an adapter pinned to it, not the cached one.
+        let key = match conn.installation_id {
+            Some(id) => format!("{}#{id}", conn.id),
+            None => conn.id.clone(),
+        };
+        if let Some(adapter) = self.adapters.lock().unwrap().get(&key) {
             return Ok(adapter.clone());
         }
         let adapter = self.build_adapter(conn).await?;
-        self.adapters
-            .lock()
-            .unwrap()
-            .insert(conn.id.clone(), adapter.clone());
+        self.adapters.lock().unwrap().insert(key, adapter.clone());
         Ok(adapter)
     }
 

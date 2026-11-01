@@ -3443,11 +3443,22 @@ pub struct FakeForge {
     /// How many checkout credentials [`mint_checkout_credential`](ForgePort::mint_checkout_credential)
     /// has handed out — lets a test assert a refused launch minted nothing.
     checkout_mints: Mutex<u32>,
+    /// The account this credential is installed on, as
+    /// [`connection_account`](ForgePort::connection_account) reports it.
+    /// `None` (default) = an adapter that cannot say (`Unsupported`).
+    account: Mutex<Option<String>>,
 }
 
 impl FakeForge {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A forge whose credential is installed on `login` (a GitHub App
+    /// installation's `account.login`).
+    pub fn with_account(self, login: &str) -> Self {
+        *self.account.lock().unwrap() = Some(login.to_string());
+        self
     }
 
     /// A forge that mints short-lived repository tokens (GitHub App mode):
@@ -3669,8 +3680,26 @@ impl scarab_forge::ForgeConnectionStore for InMemoryDb {
         org: &str,
         project: &str,
     ) -> Result<(), scarab_forge::RegistryError> {
-        self.state.lock().unwrap().forge_repos.insert(
-            (repo.owner.clone(), repo.name.clone()),
+        let mut st = self.state.lock().unwrap();
+        let key = (repo.owner.clone(), repo.name.clone());
+        // Mirrors the Postgres guard (git-bug 19b0a45): a re-bind moves the
+        // repo only off a connection of the same Org or an unassigned one.
+        if let Some((holder, _, _)) = st.forge_repos.get(&key) {
+            let org_of = |id: &str| st.forge_connections.get(id).and_then(|c| c.org.clone());
+            let holder_org = org_of(holder);
+            if holder != connection_id
+                && holder_org.is_some()
+                && holder_org != org_of(connection_id)
+            {
+                return Err(scarab_forge::RegistryError::BoundElsewhere {
+                    owner: repo.owner.clone(),
+                    name: repo.name.clone(),
+                    connection: holder.clone(),
+                });
+            }
+        }
+        st.forge_repos.insert(
+            key,
             (
                 connection_id.to_string(),
                 org.to_string(),
@@ -3875,6 +3904,14 @@ impl ForgePort for FakeForge {
         query: Option<&str>,
     ) -> Result<Vec<ForgeRef>, ForgeError> {
         Ok(filter_refs(self.refs.lock().unwrap().clone(), query))
+    }
+
+    async fn connection_account(&self) -> Result<String, ForgeError> {
+        self.account
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| ForgeError::Unsupported("naming the installed account".into()))
     }
 
     async fn list_accessible_repos(&self) -> Result<Vec<RepoRef>, ForgeError> {

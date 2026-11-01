@@ -314,21 +314,36 @@ pub fn installation_sync(delivery: &WebhookDelivery) -> Option<InstallationSync>
 /// auto-registration): added repos bind to `(org, repo.name)` under
 /// `connection_id` (Project name = repo name, 1:1 in v1); removed repos
 /// unbind. Idempotent — replayed deliveries re-apply harmlessly.
+///
+/// Returns the added repos it did **not** bind: one owned by another account
+/// than `org`, or one already bound through a connection of another Org
+/// (git-bug 19b0a45). A delivery is not failed for those; the caller logs
+/// them. A reserved `org` still fails it.
 pub async fn apply_installation_sync(
     store: &dyn scarab_forge::ForgeConnectionStore,
     connection_id: &str,
     org: &str,
     sync: &InstallationSync,
-) -> Result<(), scarab_forge::RegistryError> {
+) -> Result<Vec<RepoRef>, scarab_forge::RegistryError> {
+    let mut skipped = Vec::new();
     for repo in &sync.added {
-        store
-            .bind_repo(connection_id, repo, org, &repo.name)
-            .await?;
+        if repo.owner != org {
+            skipped.push(repo.clone());
+            continue;
+        }
+        match store.bind_repo(connection_id, repo, org, &repo.name).await {
+            Ok(()) => {}
+            Err(
+                scarab_forge::RegistryError::OrgMismatch { .. }
+                | scarab_forge::RegistryError::BoundElsewhere { .. },
+            ) => skipped.push(repo.clone()),
+            Err(e) => return Err(e),
+        }
     }
     for repo in &sync.removed {
         store.unbind_repo(connection_id, repo).await?;
     }
-    Ok(())
+    Ok(skipped)
 }
 
 // ---------------------------------------------------------------------------
@@ -382,6 +397,10 @@ pub struct GithubForge {
     client: reqwest::Client,
     base_url: String,
     auth: Auth,
+    /// The installation this adapter serves, when its connection is one
+    /// (git-bug 19b0a45). App mode then mints only from it and lists only its
+    /// repositories; `None` resolves each repo's installation (legacy rows).
+    installation: Option<u64>,
 }
 
 #[derive(serde::Serialize)]
@@ -425,6 +444,7 @@ impl GithubForge {
             client: reqwest::Client::new(),
             base_url: "https://api.github.com".into(),
             auth: Auth::Token(token.into()),
+            installation: None,
         }
     }
 
@@ -438,7 +458,15 @@ impl GithubForge {
                 app,
                 cache: std::sync::Mutex::new(AppTokenCache::default()),
             },
+            installation: None,
         }
+    }
+
+    /// Serve one App installation (git-bug 19b0a45): every token is minted
+    /// from `installation_id`, and enumeration lists only its repositories.
+    pub fn with_installation(mut self, installation_id: u64) -> Self {
+        self.installation = Some(installation_id);
+        self
     }
 
     /// Point at a GHES host (e.g. `https://ghe.example.com/api/v3`).
@@ -468,13 +496,16 @@ impl GithubForge {
         };
         let now = now_unix_secs();
         let jwt = sign_app_jwt(app, now)?;
-        // Resolve the installation (reuses the cached mapping).
-        let cached = cache
-            .lock()
-            .unwrap()
-            .installations
-            .get(&format!("{}/{}", repo.owner, repo.name))
-            .copied();
+        // Resolve the installation: the connection's own when it is pinned,
+        // else the cached mapping, else a lookup.
+        let cached = self.installation.or_else(|| {
+            cache
+                .lock()
+                .unwrap()
+                .installations
+                .get(&format!("{}/{}", repo.owner, repo.name))
+                .copied()
+        });
         let installation_id = match cached {
             Some(id) => id,
             None => {
@@ -562,13 +593,18 @@ impl GithubForge {
         // Fast path: a cached, still-fresh installation token.
         let cached_installation = {
             let c = cache.lock().unwrap();
-            if let Some(id) = c.installations.get(&key) {
-                if let Some((token, exp)) = c.tokens.get(id) {
+            // A pinned installation (the connection's own) wins over the
+            // per-repo mapping, so no token is ever minted from another one.
+            if let Some(id) = self
+                .installation
+                .or_else(|| c.installations.get(&key).copied())
+            {
+                if let Some((token, exp)) = c.tokens.get(&id) {
                     if *exp - now > TOKEN_REFRESH_SLACK_SECS {
                         return Ok(token.clone());
                     }
                 }
-                Some(*id)
+                Some(id)
             } else {
                 None
             }
@@ -930,12 +966,13 @@ impl ForgePort for GithubForge {
         Ok(())
     }
 
-    /// The repos every installation of this App covers (ADR-0060) — the same
+    /// The repos this connection's installation covers (ADR-0060) — the same
     /// truth the `installation_repositories` webhook carries, pulled on demand so
     /// a missed delivery can be healed.
     ///
-    /// App mode walks `/app/installations` and asks each installation for its
-    /// repositories; fixed-token mode asks once as whatever the token is. Repos
+    /// App mode with a pinned installation asks that installation only. An
+    /// unpinned (legacy) adapter walks `/app/installations` and asks each
+    /// one; fixed-token mode asks once as whatever the token is. Repos
     /// are deduplicated: an App installed on both a user and an org can serve the
     /// same repo twice.
     async fn list_accessible_repos(&self) -> Result<Vec<RepoRef>, ForgeError> {
@@ -947,10 +984,18 @@ impl ForgePort for GithubForge {
             Auth::App { app, cache } => {
                 let now = now_unix_secs();
                 let jwt = sign_app_jwt(app, now)?;
-                for inst in self.get_paginated("/app/installations", &jwt).await? {
-                    let Some(id) = inst.get("id").and_then(Value::as_u64) else {
-                        continue;
-                    };
+                // A pinned installation lists its own repositories only, never
+                // another installation's (git-bug 19b0a45).
+                let ids: Vec<u64> = match self.installation {
+                    Some(id) => vec![id],
+                    None => self
+                        .get_paginated("/app/installations", &jwt)
+                        .await?
+                        .iter()
+                        .filter_map(|inst| inst.get("id").and_then(Value::as_u64))
+                        .collect(),
+                };
+                for id in ids {
                     // Mint (and cache) this installation's token, then ask it
                     // what it covers.
                     let url = self.url(&format!("/app/installations/{id}/access_tokens"));
@@ -971,6 +1016,26 @@ impl ForgePort for GithubForge {
             }
         }
         Ok(out.into_iter().collect())
+    }
+
+    /// `GET /app/installations/{id}` — the account the pinned installation
+    /// is on (git-bug 19b0a45). Needs App credentials and a pinned
+    /// installation; anything else cannot say which account it serves.
+    async fn connection_account(&self) -> Result<String, ForgeError> {
+        let (Auth::App { app, .. }, Some(id)) = (&self.auth, self.installation) else {
+            return Err(ForgeError::Unsupported(
+                "naming the installed account needs App credentials and an installation id".into(),
+            ));
+        };
+        let jwt = sign_app_jwt(app, now_unix_secs())?;
+        let url = self.url(&format!("/app/installations/{id}"));
+        let resp = self.send(|| self.client.get(&url), &jwt).await?;
+        let body = ok_json(resp).await?;
+        body.pointer("/account/login")
+            .and_then(Value::as_str)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| ForgeError::Api("installation.account.login missing".into()))
     }
 
     /// `GET /app` — the App's own record of what it was granted and what it
@@ -1199,12 +1264,14 @@ impl ForgePort for GithubForge {
                     Err(_) => return Ok(None),
                 };
                 let installation_id = {
-                    let cached = cache
-                        .lock()
-                        .unwrap()
-                        .installations
-                        .get(&format!("{}/{}", repo.owner, repo.name))
-                        .copied();
+                    let cached = self.installation.or_else(|| {
+                        cache
+                            .lock()
+                            .unwrap()
+                            .installations
+                            .get(&format!("{}/{}", repo.owner, repo.name))
+                            .copied()
+                    });
                     match cached {
                         Some(id) => id,
                         None => {

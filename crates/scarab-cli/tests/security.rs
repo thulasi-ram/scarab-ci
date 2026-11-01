@@ -81,6 +81,8 @@ async fn serve_with(enforce: bool, extra: impl FnOnce(AppState) -> AppState) -> 
         kind: ForgeKind::GitHub,
         base_url: "https://api.github.com".into(),
         credential_ref: "gh-token".into(),
+        org: Some("acme".into()),
+        installation_id: None,
     })
     .await
     .unwrap();

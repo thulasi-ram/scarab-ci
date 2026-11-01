@@ -784,6 +784,18 @@ pub trait ForgePort: Send + Sync {
         ))
     }
 
+    /// The forge account this connection's credential is installed on — for a
+    /// GitHub App installation, the installation's `account.login` (git-bug
+    /// 19b0a45). An unassigned installation connection takes it as its Org.
+    ///
+    /// Defaults to [`Unsupported`](ForgeError::Unsupported): only an
+    /// installation-style credential belongs to one account.
+    async fn connection_account(&self) -> Result<String, ForgeError> {
+        Err(ForgeError::Unsupported(
+            "naming the account this credential is installed on".into(),
+        ))
+    }
+
     async fn normalize_event(&self, raw: WebhookDelivery) -> Result<Event, ForgeError>;
 
     async fn set_status(
@@ -900,6 +912,20 @@ pub struct ForgeConnection {
     /// `SecretProvider`. Opaque here; resolved at use-time by the composition
     /// root. Never plaintext.
     pub credential_ref: String,
+    /// The Org this connection serves (git-bug 19b0a45): the forge owner or
+    /// account whose repositories it binds. Scarab's Org *is* that owner, so
+    /// every binding through the connection has `org == repo.owner ==
+    /// conn.org`. `None` = **unassigned**: a legacy row whose bindings span
+    /// several owners, or a GitHub installation not yet attached to an Org.
+    /// Only a global admin may act on an unassigned connection.
+    #[serde(default)]
+    pub org: Option<String>,
+    /// The GitHub App installation this connection is (`github-install-N`).
+    /// When known, tokens are minted from this installation only, and
+    /// enumeration lists only its repositories. `None` for every other kind
+    /// and for a legacy row the adapter must look the installation up for.
+    #[serde(default)]
+    pub installation_id: Option<u64>,
 }
 
 /// Construct the vendor adapter that serves one [`ForgeConnection`] — the
@@ -945,6 +971,27 @@ pub enum RegistryError {
          bound repo"
     )]
     ReservedOrg(String),
+    /// A connection serves one Org, and a repo bound through it must be owned
+    /// by that Org (`org == repo.owner == conn.org`, git-bug 19b0a45).
+    #[error(
+        "connection `{connection}` serves org `{connection_org}`; `{owner}/{name}` is owned by \
+         `{owner}` and cannot be bound through it"
+    )]
+    OrgMismatch {
+        connection: String,
+        connection_org: String,
+        owner: String,
+        name: String,
+    },
+    /// The repo is bound through a connection of another Org. A bind never
+    /// moves a repo across Orgs (git-bug 19b0a45); it may move one between
+    /// connections of the same Org, or off an unassigned connection.
+    #[error("`{owner}/{name}` is already bound through connection `{connection}` of another org")]
+    BoundElsewhere {
+        owner: String,
+        name: String,
+        connection: String,
+    },
 }
 
 /// Org names Scarab keeps for itself: every `_`-prefixed name. Its own
@@ -990,12 +1037,33 @@ pub trait ForgeConnectionStore: Send + Sync {
         if is_reserved_org(org) {
             return Err(RegistryError::ReservedOrg(org.to_string()));
         }
+        // An assigned connection binds only its own Org's repos, into that
+        // Org. An unassigned one (legacy, global admins only) is not checked.
+        if let Some(conn) = self.get_connection(connection_id).await? {
+            if let Some(conn_org) = conn.org {
+                if repo.owner != conn_org || org != conn_org {
+                    return Err(RegistryError::OrgMismatch {
+                        connection: connection_id.to_string(),
+                        connection_org: conn_org,
+                        owner: repo.owner.clone(),
+                        name: repo.name.clone(),
+                    });
+                }
+            }
+        }
         self.upsert_repo_binding(connection_id, repo, org, project)
             .await
     }
 
     /// The adapter's raw upsert behind [`bind_repo`](Self::bind_repo). Call
     /// `bind_repo`, never this.
+    ///
+    /// Re-binding a repo bound through another connection moves it only when
+    /// that connection is unassigned (`org` NULL) or serves the same Org as
+    /// `connection_id`; otherwise it answers
+    /// [`BoundElsewhere`](RegistryError::BoundElsewhere) and changes nothing.
+    /// An implementation also records `org` (and a connection's `org`) in its
+    /// Org list ([`list_orgs`](Self::list_orgs)).
     async fn upsert_repo_binding(
         &self,
         connection_id: &str,
@@ -1051,6 +1119,27 @@ pub trait ForgeConnectionStore: Send + Sync {
         _owned: bool,
     ) -> Result<(), RegistryError> {
         Ok(())
+    }
+
+    /// Every Org Scarab knows of, sorted (git-bug 19b0a45): the Org record
+    /// that `/v1/me` and the connection routes authorize against.
+    ///
+    /// The default derives it from the registry (each connection's `org` and
+    /// each binding's), which is what a store without an Org table can say.
+    /// Postgres keeps an `orgs` table, so an Org outlives its last binding.
+    async fn list_orgs(&self) -> Result<Vec<String>, RegistryError> {
+        let mut orgs = std::collections::BTreeSet::new();
+        for conn in self.list_connections().await? {
+            if let Some(org) = &conn.org {
+                orgs.insert(org.clone());
+            }
+            for repo in self.repos_of(&conn.id).await? {
+                if let Some(resolved) = self.resolve(&repo).await? {
+                    orgs.insert(resolved.org);
+                }
+            }
+        }
+        Ok(orgs.into_iter().collect())
     }
 
     /// The ids of connections currently owned by configuration (ADR-0060 part D)

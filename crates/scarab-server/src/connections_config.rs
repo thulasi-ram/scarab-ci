@@ -215,6 +215,8 @@ pub async fn provision(
                 kind: spec.kind,
                 base_url: spec.base_url.clone(),
                 credential_ref: spec.credential_ref.clone(),
+                org: Some(spec.org.clone()),
+                installation_id: None,
             })
             .await
             .map_err(store_err(&spec.id))?;
