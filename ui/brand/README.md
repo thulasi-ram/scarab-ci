@@ -30,26 +30,27 @@ thick femur, a knee, a thinner spiny tibia and a small foot.
 | `icons/halftone/icon-{16..1024}.png` | transparent PNGs of the cream mark |
 | `icons/halftone-ink/icon-{16..1024}.png` | transparent PNGs of the ink mark |
 | `icons/halftone-tile/icon-{16..1024}.png` | opaque PNGs of the tile; use these for app icons (apple-touch 180, PWA 192 and 512) |
-| `logo/scarab-glyph-ink.svg`, `logo/scarab-glyph-cream.svg` | solid glyph for sizes below about 48 px |
-| `favicon/halftone/favicon.svg` | the glyph, theme-aware: ink on light, cream on dark |
-| `favicon/halftone/favicon.ico`, `favicon-{16,32,48,64}.png` | cream glyph on a rounded `#0b0c0e` tile, visible on any tab colour |
-| `favicon/halftone/apple-touch-icon.png`, `icon-192.png`, `icon-512.png` | cream glyph on a square `#0b0c0e` tile |
+| `favicon/halftone/favicon.svg` | the same mark without the hexagon dots, theme-aware: ink on light, cream on dark |
+| `favicon/halftone/favicon.ico`, `favicon-{16,32,48,64}.png` | cream mark on a rounded `#0b0c0e` tile, visible on any tab colour |
+| `favicon/halftone/apple-touch-icon.png`, `icon-192.png`, `icon-512.png` | cream mark on a square `#0b0c0e` tile |
 
 The ink mark is not the cream mark with the colour changed. The shading is
 inverted, so the lit wing cases get the smallest dots and the shaded pronotum
 gets the largest. A plain colour swap would draw the lit areas as the darkest.
 
-The glyph is a solid drawing of the same outline: head, pronotum, two wing
-cases with a seam, horns and six legs, with no dots. It stays recognisable at
-16 px, where the dotted mark does not.
+The favicon files drop the hexagon dots: they are invisible at tab size, and
+without them the file is half the size and the beetle fills more of the icon.
 
 Status and limits:
 
-- It sits beside the emblem. The favicon, the docs logo and the web UI still
-  use the emblem; nothing is rewired to this mark yet.
-- The dotted mark is a blob at 16 px and loses its legs and horns below about
-  48 px. Use the glyph there.
-- The glyph has no hexagon and no shading. It does not carry the dot motif.
+- It sits beside the emblem. The docs logo and the web UI still use the
+  emblem; nothing is rewired to this mark yet.
+- At 16 to 32 px the dots blur into a shaded beetle that keeps its horns and
+  legs. Its contrast there is lower than a solid mark's: measured as the mean
+  contrast of the mark against its background at 32 px, about 1.3:1 on white
+  and 2:1 on a dark tab, against 2.4:1 and 8.9:1 for a solid silhouette. A
+  version with larger dots, a narrower gutter and thicker legs measured about
+  1.9:1 and 5:1, and is not in the repo.
 - The body proportions were measured on a dorsal photograph of *Scarabaeus
   sacer* (Wikimedia Commons, `Scarabaeus.sacer.jpg`). No pixels from the photo
   are in the files.
