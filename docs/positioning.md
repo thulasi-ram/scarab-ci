@@ -26,8 +26,8 @@ durable execution passes none of them:
   exactly-once, in [`crash_resume.rs`](../crates/scarab-db-postgres/tests/crash_resume.rs),
   which runs against real Postgres) is the part the durable workflow engines already have. The
   part that would set us apart is proven for one case only: the control-plane crash test with a
-  real Pod in flight (`crates/scarab-e2e/tests/crash_resume.rs`) passes in `just e2e` on a local
-  kind cluster, not yet in `e2e.yml`. It SIGKILLs the server from the kind node; the kubelet
+  real Pod in flight (`crates/scarab-e2e/tests/crash_resume.rs`) passes in `just e2e`, on a
+  local kind cluster and in `e2e.yml`. It SIGKILLs the server from the kind node; the kubelet
   restarts the container in the same Pod, and the new process re-adopts the Attempt without
   running it again. A server Pod moved to another node, or a lost node, is not tested. And
   execution replay is not a feature.
@@ -151,7 +151,7 @@ Show respect and say where we differ; never take a swipe.
 2. ❌ Any end-to-end durability-on-Kubernetes or live-Pod re-attach claim. The
    executor's live-cluster tests, re-attach after relaunch included, pass on kind
    (`just e2e`, run by `e2e.yml`). The stack-level crash/resume test with a real Pod in flight
-   passes in `just e2e` locally, not yet in `e2e.yml`, and covers only a server container
+   passes in `just e2e` (locally and in `e2e.yml`) and covers only a server container
    SIGKILLed and restarted in the same Pod (not a Pod moved to another node, not a lost node).
 3. ❌ Durable execution as a selling point against Argo/Tekton/Temporal/Kestra.
 4. ❌ Time-travel / replay as a feature.
