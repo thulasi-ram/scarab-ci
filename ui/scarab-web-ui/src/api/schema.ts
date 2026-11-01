@@ -248,6 +248,29 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/connections/{id}/org": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Assign a forge connection to an org (global admins)
+         * @description Refused (409, with the reason) when a repo bound through the connection
+         *     is not the Org's, or when an Org of that name already exists and is
+         *     served by another forge or host, or by no connection at all: the same
+         *     rule the installation delivery applies.
+         */
+        put: operations["assign_connection_org"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/connections/{id}/preflight": {
         parameters: {
             query?: never;
@@ -2375,6 +2398,14 @@ export interface components {
             step: string;
             succeeded: boolean;
         };
+        /** @description `PUT /v1/connections/{id}/org` body. */
+        AssignConnectionOrgRequest: {
+            /**
+             * @description The Org the connection is to serve: the forge owner whose
+             *     repositories it binds.
+             */
+            org: string;
+        };
         /**
          * @description One attempt at executing a step (ADR-0047) — the rerun unit. A step with more
          *     than one attempt is one that failed-and-retried (or was restarted); the last
@@ -2648,6 +2679,11 @@ export interface components {
             supports_resync: boolean;
             /** @description The forge's own web host, for deep links out of the UI. */
             web_url: string;
+        };
+        /** @description `PUT /v1/connections/{id}/org` result. */
+        ConnectionOrgDto: {
+            id: string;
+            org: string;
         };
         /**
          * @description The result of checking a connection's app configuration against what Scarab
@@ -4212,9 +4248,10 @@ export interface components {
              */
             confirmed: number;
             /**
-             * @description Repos the forge reports that were not bound: owned by another account
-             *     than the connection's Org, or bound through another Org's connection
-             *     (git-bug 19b0a45).
+             * @description Repos the forge reports that were not bound (git-bug 19b0a45): owned
+             *     by another account than the connection's Org, already bound through
+             *     another connection that serves an Org, or reported to a connection
+             *     that serves no Org yet (it binds nothing until it is assigned).
              */
             skipped: string[];
         };
@@ -5437,6 +5474,69 @@ export interface operations {
             };
         };
     };
+    assign_connection_org: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description connection id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AssignConnectionOrgRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConnectionOrgDto"];
+                };
+            };
+            /** @description not an org name: empty, longer than 100 characters, containing `/` or spaces, or `_`-prefixed */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description requires a global admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
+            /** @description no such connection, or no registry wired */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description a bound repo is not the org's, the org is served by another forge or by no connection, or the connection is managed by configuration */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     connection_preflight: {
         parameters: {
             query?: never;
@@ -5995,6 +6095,13 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["SecurityEventsResponse"];
                 };
+            };
+            /** @description a cursor this server did not issue, or both cursor and before */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description not signed in */
             401: {
@@ -10680,6 +10787,13 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["SecurityEventsResponse"];
                 };
+            };
+            /** @description a cursor this server did not issue, or both cursor and before */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description not signed in */
             401: {
