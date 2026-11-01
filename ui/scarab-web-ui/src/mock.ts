@@ -8,8 +8,8 @@
 // Neutral identity so nothing real leaks into screenshots: org=acme,
 // author=a.kim, approver=j.lee; the `scarab` repo is kept (its build log
 // references the crates), the rest are generic. Add `?theme=dark` (or `light`)
-// to the URL to pin the theme (used for deterministic capture); otherwise the
-// normal stored/toggle theme applies.
+// to the URL to pin the theme, and `?palette=mono` (or `emerald`) to pin the
+// palette (used for deterministic capture); otherwise the stored choices apply.
 
 // Type-only imports — erased at compile time, so the install-before-App-loads
 // ordering in index.tsx is unaffected. The fixtures typecheck against the
@@ -1566,6 +1566,16 @@ export function installMock() {
       /* ignore */
     }
     document.documentElement.setAttribute("data-theme", pinned);
+  }
+  // The same for the palette: `?palette=mono|emerald`.
+  const pinnedPalette = new URLSearchParams(window.location.search).get("palette");
+  if (pinnedPalette === "mono" || pinnedPalette === "emerald") {
+    try {
+      localStorage.setItem("scarab-palette", pinnedPalette);
+    } catch {
+      /* ignore */
+    }
+    document.documentElement.setAttribute("data-palette", pinnedPalette);
   }
 
   const realFetch = window.fetch.bind(window);

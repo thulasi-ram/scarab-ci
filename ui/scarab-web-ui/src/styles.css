@@ -8,9 +8,16 @@
 
    Theming: light is the default (:root). `<html data-theme="dark">` restores the
    beetle carapace. Every rule reads the semantic aliases below, so a theme swap
-   is just re-pointing the tokens. */
+   is just re-pointing the tokens.
 
-:root {
+   Palette: `<html data-palette="mono">` re-points the same tokens to greys, in
+   either mode (the Mono blocks after the dark one). Emerald is the default and
+   needs no attribute. The mode and palette selectors are not tied to :root, so
+   an element that carries its own data-theme/data-palette (the swatches in
+   Settings → Appearance) renders in that look. */
+
+:root,
+[data-theme="light"] {
   /* Type scale (DESIGN.md §3). Mono uses the same steps. New components use
      only these; the older one-off sizes move to them in a follow-up. */
   --fs-xs: 11px;  /* badges, chips, hashes */
@@ -31,6 +38,8 @@
   --terminal-elev: #16281e;  /* dag nodes */
   --terminal-ink: #cfe2d6;
   --terminal-line: #263d31;
+  --terminal-dim: #8fb3a0;    /* quiet text on a terminal panel */
+  --terminal-cursor: #2ea77f; /* the debug shell's cursor */
 
   /* ── Accent — emerald (interactive/active/success) ───────────────────── */
   --emerald: #137a52;        /* links, active nav, focus — deepened for white contrast */
@@ -115,6 +124,116 @@
   --badge-ink: #0b120e;
 
   color-scheme: dark;
+}
+
+/* ── Role tokens ───────────────────────────────────────────────────────────
+   Uses whose meaning must survive a palette change read these, not the brand
+   tokens. In Emerald each one points at the brand token it replaced, so the
+   look is unchanged; the Mono blocks below give each its own value. Declared
+   on every element with a mode so a swatch resolves them against its own
+   tokens. */
+:root,
+[data-theme] {
+  --warn: var(--copper);                /* caution, waiting on a gate, superseded */
+  --border-warn: var(--border-copper);
+  --ok-ink: var(--emerald);             /* success as text: passed, approve, recover */
+  --running-ink: var(--emerald);        /* in progress as text: live, running */
+  --terminal-accent: var(--emerald-bright); /* selection and hover on terminal panels */
+  --pine-hover: var(--emerald-bright);  /* primary button hover fill */
+}
+
+/* ── Mono palette, light ───────────────────────────────────────────────────
+   Greys for surfaces, text, lines and the accent. The status colours stay
+   hues, a little less saturated: success green, running blue-teal (pushed
+   bluer than Emerald's so it does not read as success once the accent is no
+   longer green), in-flight yellow, failure red, caution amber. */
+[data-palette="mono"] {
+  --carapace-black: #f4f4f4;
+  --pine-deep: #ebebeb;
+  --pine: #1a1a1a;
+  --emerald-surface: #ffffff;
+  --emerald-elevated: #ffffff;
+
+  --terminal: #111111;
+  --terminal-elev: #1c1c1c;
+  --terminal-ink: #d6d6d6;
+  --terminal-line: #333333;
+  --terminal-dim: #9a9a9a;
+  --terminal-cursor: #e6e6e6;
+  --terminal-accent: #f2f2f2;
+
+  --emerald: #262626;
+  --emerald-bright: #000000;
+  --pine-hover: #3d3d3d;
+
+  --copper: #6e6e6e;
+  --border-copper: rgba(0, 0, 0, 0.26);
+
+  --soft-white: #171717;
+  --display-ink: #050505;
+  --sage: #4f4f4f;
+  --muted-sage: #808080;
+  --on-pine: #f5f5f5;
+
+  --border: #dedede;
+  --border-soft: #ebebeb;
+  --dot: rgba(0, 0, 0, 0.05);
+
+  --ok: #2e8a60;
+  --running: #2b7d8f;
+  --run: #d6a514;
+  --danger: #bf4840;
+  --badge-ink: #f7f7f7;
+  --warn: #8c6520;
+  --border-warn: rgba(140, 101, 32, 0.5);
+  --ok-ink: #24774f;
+  --running-ink: #236d7d;
+}
+
+/* ── Mono palette, dark ────────────────────────────────────────────────────
+   Sets every token the light block sets, so nothing light leaks into dark.
+   The primary button inverts (light fill, dark text). */
+[data-palette="mono"][data-theme="dark"] {
+  --carapace-black: #0f0f0f;
+  --pine-deep: #1a1a1a;
+  --pine: #e8e8e8;
+  --emerald-surface: #171717;
+  --emerald-elevated: #1f1f1f;
+
+  --terminal: #0a0a0a;
+  --terminal-elev: #171717;
+  --terminal-ink: #bdbdbd;
+  --terminal-line: #2e2e2e;
+  --terminal-dim: #8a8a8a;
+  --terminal-cursor: #e6e6e6;
+  --terminal-accent: #f2f2f2;
+
+  --emerald: #e6e6e6;
+  --emerald-bright: #ffffff;
+  --pine-hover: #ffffff;
+
+  --copper: #9c9c9c;
+  --border-copper: rgba(255, 255, 255, 0.26);
+
+  --soft-white: #f2f2f2;
+  --display-ink: #ffffff;
+  --sage: #b3b3b3;
+  --muted-sage: #7a7a7a;
+  --on-pine: #111111;
+
+  --border: #333333;
+  --border-soft: #262626;
+  --dot: rgba(255, 255, 255, 0.05);
+
+  --ok: #4aa57c;
+  --running: #4a9db0;
+  --run: #e3c043;
+  --danger: #cf5f57;
+  --badge-ink: #0d0d0d;
+  --warn: #c6974e;
+  --border-warn: rgba(198, 151, 78, 0.42);
+  --ok-ink: #5cb68c;
+  --running-ink: #5aabbe;
 }
 
 * {
@@ -425,7 +544,7 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
   gap: 6px;
 }
 .btn-primary:not(:disabled):hover {
-  background: var(--emerald-bright);
+  background: var(--pine-hover);
 }
 
 /* Ghost: transparent, hairline border, hover border → emerald */
@@ -531,7 +650,7 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 .badge-running,
 .badge-pending {
   background: var(--running);
-  border-color: var(--copper);
+  border-color: var(--warn);
 }
 .badge-skipped {
   background: transparent;
@@ -714,7 +833,7 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
   color: var(--muted-sage);
   overflow-wrap: anywhere;
 }
-.gate-status.passed, .dnode-meta.gnote.passed { color: var(--emerald); }
+.gate-status.passed, .dnode-meta.gnote.passed { color: var(--ok-ink); }
 .gate-status.failed, .dnode-meta.gnote.failed { color: var(--danger); }
 .run-toolbar .btn-sm {
   display: inline-flex;
@@ -725,11 +844,11 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 /* Workspace-Snapshot retention (ADR-0061 s5). A rerun WIDENED by expired inputs
    is a bigger action than the button implies, so the button stops looking like a
    plain ghost action — the visual change and the label change land together.
-   `--copper` is the theme's cautionary ink (never a fill), which is exactly the
+   `--warn` is the theme's cautionary ink (never a fill), which is exactly the
    register here: this is not an error, it is a bigger job than you asked for. */
 .run-toolbar .btn.widened {
-  border-color: var(--border-copper);
-  color: var(--copper);
+  border-color: var(--border-warn);
+  color: var(--warn);
 }
 /* A pinned run is holding storage on purpose: mark the toggle as engaged. */
 .run-toolbar .btn.pinned {
@@ -749,7 +868,7 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
   font-size: 12.5px;
   text-align: right;
 }
-.rd-widened { color: var(--copper); }
+.rd-widened { color: var(--warn); }
 
 /* The rerun/retry CONFIRM popover (git-bug 4afaa3e): portalled + fixed, the
    SearchSelect machinery, sized for a sentence or a grouped step list. */
@@ -764,7 +883,7 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 .rc-headline { margin: 0 0 8px; font-weight: 600; }
 .rc-warning {
   display: flex; align-items: center; gap: 6px;
-  margin: 0 0 8px; color: var(--copper); font-size: 12.5px;
+  margin: 0 0 8px; color: var(--warn); font-size: 12.5px;
 }
 .rc-sentence { margin: 0 0 10px; line-height: 1.45; }
 .rc-unavailable { margin: 0 0 10px; color: var(--muted-sage); font-style: italic; }
@@ -793,9 +912,9 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
   right: 16px; bottom: 16px;
   display: flex; align-items: center; gap: 8px;
   max-width: 420px; padding: 10px 12px;
-  background: var(--emerald-elevated); border: 1px solid var(--copper);
+  background: var(--emerald-elevated); border: 1px solid var(--warn);
   border-radius: var(--radius-sm); box-shadow: 0 10px 30px rgba(0, 0, 0, 0.28);
-  color: var(--copper); font-size: 12.5px;
+  color: var(--warn); font-size: 12.5px;
 }
 .rd-toast-x {
   border: none; background: none; cursor: pointer;
@@ -1059,7 +1178,7 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 .pfact.link { cursor: pointer; transition: color 0.12s ease; }
 .pfact.link:hover, .pfact.link:hover .sha { color: var(--emerald); }
 .pfact.link:hover svg { color: var(--emerald); }
-.pfact.live, .pfact.live svg { color: var(--emerald); }
+.pfact.live, .pfact.live svg { color: var(--running-ink); }
 
 /* The `base ← head` arrow (ADR-0057): the direction glyph between a PR's base
    branch and its head commit, muted so the refs read as the content. */
@@ -1167,16 +1286,16 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 }
 
 .dnode:hover {
-  border-color: var(--emerald-bright);
+  border-color: var(--terminal-accent);
 }
 
 .dnode.sel {
-  border-color: var(--emerald-bright);
-  box-shadow: inset 0 0 0 1px var(--emerald-bright);
+  border-color: var(--terminal-accent);
+  box-shadow: inset 0 0 0 1px var(--terminal-accent);
 }
 
 .dnode.running {
-  border-color: var(--copper);
+  border-color: var(--warn);
 }
 
 /* Reused (ADR-0056 amendment): while time-traveling, a step carried forward
@@ -1193,7 +1312,7 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 }
 
 .dnode-gate {
-  color: var(--copper);
+  color: var(--warn);
 }
 
 /* status dots (shared by DAG + anywhere step status shows as a glyph) */
@@ -1566,10 +1685,10 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 
 /* ---- buttons additions ---- */
 .btn-copper {
-  background: transparent; border-color: var(--copper); color: var(--copper);
+  background: transparent; border-color: var(--warn); color: var(--warn);
   display: inline-flex; align-items: center; gap: 6px;
 }
-.btn-copper:hover { background: color-mix(in srgb, var(--copper) 10%, transparent); }
+.btn-copper:hover { background: color-mix(in srgb, var(--warn) 10%, transparent); }
 .btn-sm { padding: 5px 11px; font-size: 12px; }
 
 /* ---- repo cards ---- */
@@ -1675,7 +1794,7 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 .rr-head { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 16px; }
 .rr-facts { display: flex; align-items: center; flex-wrap: wrap; gap: 5px 14px; }
 .rr-facts .pfact { font-size: 12px; color: var(--muted-sage); }
-.rr-facts .pfact.live { color: var(--emerald); }
+.rr-facts .pfact.live { color: var(--running-ink); }
 .rr-facts .pfact .mono { font-size: 11.5px; }
 .rr-facts-sep { color: var(--muted-sage); opacity: 0.5; }
 .rr-right { display: inline-flex; align-items: center; margin-left: auto; flex: none; }
@@ -1683,7 +1802,7 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
   display: inline-flex; align-items: center; gap: 7px;
   font-size: 12.5px; text-transform: capitalize; color: var(--muted-sage);
 }
-.rr-status.running, .rr-status.pending, .rr-status.suspended { color: var(--emerald); }
+.rr-status.running, .rr-status.pending, .rr-status.suspended { color: var(--running-ink); }
 .rr-status.failed, .rr-status.dead_lettered { color: var(--danger, #d66); }
 .rr-status.succeeded { color: var(--ok); }
 .rr-trigger {
@@ -1695,7 +1814,7 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 .rr-facts { display: flex; flex-wrap: wrap; gap: 6px 18px; }
 .rr-fact { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--sage); min-width: 0; }
 .rr-fact svg { color: var(--muted-sage); flex: none; }
-.rr-fact.live { color: var(--emerald); }
+.rr-fact.live { color: var(--running-ink); }
 
 /* ---- environments ---- */
 .env-panel .env-body { padding: 14px 16px; }
@@ -1716,8 +1835,8 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 .set-row .k { color: var(--muted-sage); }
 .secrets-add { margin-top: 4px; }
 .secrets-actions { margin-top: 4px; }
-.modal-body label.secret-overwrite { display: flex; align-items: center; gap: 8px; margin: 0; font-family: inherit; font-size: 12.5px; color: var(--copper); text-transform: none; letter-spacing: normal; }
-.secret-overwrite input { accent-color: var(--copper); flex: none; }
+.modal-body label.secret-overwrite { display: flex; align-items: center; gap: 8px; margin: 0; font-family: inherit; font-size: 12.5px; color: var(--warn); text-transform: none; letter-spacing: normal; }
+.secret-overwrite input { accent-color: var(--warn); flex: none; }
 
 /* ---- modal ---- */
 .modal-scrim {
@@ -1912,7 +2031,7 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
   font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px;
   text-align: center; padding: 3px 6px; border-radius: 5px; border: 1px solid currentColor;
 }
-.verb-approve { color: var(--emerald); }
+.verb-approve { color: var(--ok-ink); }
 .verb-rerun  { color: var(--danger); }
 .verb-input  { color: var(--copper); }
 .verb-resume { color: var(--muted-sage); }
@@ -2037,8 +2156,8 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 .rp-notice {
   display: flex; align-items: center; gap: 7px; margin: 0;
   padding: 9px 12px; border-radius: var(--radius-sm);
-  border: 1px solid var(--border-copper); color: var(--copper);
-  background: color-mix(in srgb, var(--copper) 7%, transparent); font-size: 12px;
+  border: 1px solid var(--border-warn); color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 7%, transparent); font-size: 12px;
 }
 .rp-notice b { font-weight: 600; }
 
@@ -2096,7 +2215,7 @@ h1, .crumb-head, .run-title {
   font-size: 11.5px; color: var(--muted-sage);
 }
 .rcard-foot .ok { color: var(--ok); }
-.rcard-foot .warn { color: var(--copper); }
+.rcard-foot .warn { color: var(--warn); }
 .rcard-foot .fail { color: var(--danger); }
 
 /* Duration sparkline: thin fixed-width bars, bottom-aligned, rounded; bar
@@ -2112,7 +2231,7 @@ h1, .crumb-head, .run-title {
 .runbar.ok        { background: var(--ok); }        /* succeeded — green */
 .runbar.fail      { background: var(--danger); }    /* failed — red */
 .runbar.cancelled { background: var(--muted-sage); }/* cancelled — grey */
-.runbar.warn      { background: var(--copper); }    /* suspended on a gate — amber */
+.runbar.warn      { background: var(--warn); }    /* suspended on a gate — amber */
 .runbar.run       { background: var(--run); }       /* running — yellow */
 .runbar.idle      { background: color-mix(in srgb, var(--muted-sage) 45%, transparent); } /* pending */
 
@@ -2274,9 +2393,9 @@ h1, .crumb-head, .run-title {
   cursor: pointer;
   transition: border-color 0.12s ease, box-shadow 0.12s ease;
 }
-.dnode:hover { border-color: var(--emerald-bright); }
-.dnode.sel { border-color: var(--emerald-bright); box-shadow: inset 0 0 0 1px var(--emerald-bright); }
-.dnode.running { border-color: var(--copper); }
+.dnode:hover { border-color: var(--terminal-accent); }
+.dnode.sel { border-color: var(--terminal-accent); box-shadow: inset 0 0 0 1px var(--terminal-accent); }
+.dnode.running { border-color: var(--warn); }
 .dnode.failed { border-color: color-mix(in srgb, var(--danger) 60%, var(--terminal-line)); }
 .dnode.reused { opacity: 0.5; filter: saturate(0.55); }
 
@@ -2302,7 +2421,7 @@ h1, .crumb-head, .run-title {
   color: var(--copper); border: 1px solid var(--border-copper);
   border-radius: 3px; padding: 1px 6px;
 }
-.dnode-gate { color: var(--copper); }
+.dnode-gate { color: var(--warn); }
 .dnode-prog {
   position: absolute; left: 10px; right: 10px; bottom: 4px; height: 2px; border-radius: 2px;
   background: linear-gradient(90deg, transparent, var(--running), transparent);
@@ -2326,9 +2445,9 @@ h1, .crumb-head, .run-title {
 /* Superseded (time-travel display status, ADR-0056): a step cut short by a
    rerun of an ancestor — a copper ring with a dotted inset + a copper core.
    TERMINAL/status tokens only (the DAG canvas is always-dark). */
-.dring.superseded { background: conic-gradient(var(--copper) 100%, var(--terminal-line) 0); }
-.dring.superseded::after { border: 1px dotted var(--copper); }
-.dring.superseded .dring-core { background: var(--copper); }
+.dring.superseded { background: conic-gradient(var(--warn) 100%, var(--terminal-line) 0); }
+.dring.superseded::after { border: 1px dotted var(--warn); }
+.dring.superseded .dring-core { background: var(--warn); }
 /* Not run (time-travel display status, ADR-0056): a step that never started in
    the viewed version — a hollow, dashed muted ring with an empty core, the
    whole node dimmed. Distinct from skipped (hatched), pending (grey core), and
@@ -2405,7 +2524,7 @@ h1, .crumb-head, .run-title {
   transition: border-color 0.12s ease, background 0.12s ease;
 }
 .dnode-sidecar:hover { border-color: var(--copper); background: color-mix(in srgb, var(--copper) 10%, transparent); }
-.dnode-sidecar.sel { border-color: var(--emerald-bright); box-shadow: inset 0 0 0 1px var(--emerald-bright); }
+.dnode-sidecar.sel { border-color: var(--terminal-accent); box-shadow: inset 0 0 0 1px var(--terminal-accent); }
 .dnode-sidecar .sc-hex { line-height: 1; }
 .dnode-sidecar .sc-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
@@ -2444,7 +2563,7 @@ h1, .crumb-head, .run-title {
 }
 .lseg:last-child { border-right: none; }
 .lseg:hover { color: var(--terminal-ink); }
-.lseg.on { color: var(--emerald-bright); background: color-mix(in srgb, var(--emerald-bright) 12%, transparent); }
+.lseg.on { color: var(--terminal-accent); background: color-mix(in srgb, var(--terminal-accent) 12%, transparent); }
 .lgerr {
   display: inline-flex; align-items: center; gap: 5px; font-family: var(--font-mono); font-size: 11px;
   color: var(--danger); border: 1px solid color-mix(in srgb, var(--danger) 45%, transparent);
@@ -2458,14 +2577,14 @@ h1, .crumb-head, .run-title {
   background: transparent; border: none; cursor: pointer; text-align: left;
   font-family: var(--font-mono); font-size: 12.5px; color: var(--terminal-ink);
 }
-.fold-h:hover { background: color-mix(in srgb, var(--emerald-bright) 7%, transparent); }
-.fold-h.sel { background: color-mix(in srgb, var(--emerald-bright) 11%, transparent); }
+.fold-h:hover { background: color-mix(in srgb, var(--terminal-accent) 7%, transparent); }
+.fold-h.sel { background: color-mix(in srgb, var(--terminal-accent) 11%, transparent); }
 .fold-h .caret { color: var(--muted-sage); transition: transform 0.15s ease; flex: none; }
 .fold.open > .fold-h .caret { transform: rotate(90deg); }
 .fold-h .fname { color: var(--terminal-ink); }
 .fold-h .fretry {
-  display: inline-flex; align-items: center; gap: 2px; font-size: 9.5px; color: var(--copper);
-  border: 1px solid var(--border-copper); border-radius: 20px; padding: 0 5px;
+  display: inline-flex; align-items: center; gap: 2px; font-size: 9.5px; color: var(--warn);
+  border: 1px solid var(--border-warn); border-radius: 20px; padding: 0 5px;
 }
 .fold-h .fstatus { margin-left: auto; font-size: 10.5px; color: var(--muted-sage); }
 
@@ -2477,7 +2596,7 @@ h1, .crumb-head, .run-title {
   background: transparent; border: none; cursor: pointer; text-align: left;
   font-family: var(--font-mono); font-size: 11.5px; color: var(--muted-sage);
 }
-.afold-h:hover { background: color-mix(in srgb, var(--emerald-bright) 6%, transparent); }
+.afold-h:hover { background: color-mix(in srgb, var(--terminal-accent) 6%, transparent); }
 .afold-h .caret { transition: transform 0.15s ease; }
 .afold.open > .afold-h .caret { transform: rotate(90deg); }
 .afold-h .aname.failed { color: var(--danger); }
@@ -2485,7 +2604,7 @@ h1, .crumb-head, .run-title {
 /* log line rows: gutter + level colour */
 .lgbody { padding: 2px 0; font-family: var(--font-mono); font-size: 12.5px; line-height: 1.6; }
 .lgrow { display: grid; grid-template-columns: 46px 1fr; gap: 0; padding: 0 12px; }
-.lgrow:hover { background: color-mix(in srgb, var(--emerald-bright) 6%, transparent); }
+.lgrow:hover { background: color-mix(in srgb, var(--terminal-accent) 6%, transparent); }
 .lgbody.nowrap .lgtx { white-space: pre; overflow-x: auto; }
 .lgrow .lgln { color: var(--terminal-line); text-align: right; padding-right: 14px; user-select: none; }
 .lgrow .lgtx { color: var(--terminal-ink); white-space: pre-wrap; word-break: break-word; }
@@ -2501,7 +2620,7 @@ h1, .crumb-head, .run-title {
 .lgrow.err .lgtx { color: var(--danger); }
 .lgrow.warn .lgtx { color: var(--run); }
 .lgrow.ok .lgtx { color: var(--ok); }
-.lgrow.cmd .lgtx { color: var(--emerald-bright); }
+.lgrow.cmd .lgtx { color: var(--terminal-accent); }
 .lgrow.empty { color: var(--muted-sage); padding: 8px 12px; }
 
 /* Log skeleton — shown for the switch window so a reload is unmistakable even
@@ -2628,7 +2747,7 @@ h1, .crumb-head, .run-title {
 .tl-glyph.ok { border-color: var(--ok); color: var(--ok); }
 .tl-glyph.run { border-color: var(--running); color: var(--running); }
 .tl-glyph.err { border-color: var(--danger); color: var(--danger); }
-.tl-glyph.gate { border-color: var(--copper); color: var(--copper); }
+.tl-glyph.gate { border-color: var(--warn); color: var(--warn); }
 .tl-glyph.info { border-color: var(--border-copper); color: var(--copper); }
 .tl-body { padding-top: 2px; }
 .tl-msg { font-size: 13px; color: var(--soft-white); }
@@ -2656,7 +2775,7 @@ h1, .crumb-head, .run-title {
 .fileview-body { background: var(--terminal); color: var(--terminal-ink); font-size: 12.5px; line-height: 1.6; max-height: 420px; overflow: auto; padding: 8px 0; }
 .fileview-body.binary { padding: 16px; color: var(--muted-sage); font-family: var(--font-mono); }
 .fvrow { display: grid; grid-template-columns: 46px 1fr; padding: 0 12px; }
-.fvrow:hover { background: color-mix(in srgb, var(--emerald-bright) 6%, transparent); }
+.fvrow:hover { background: color-mix(in srgb, var(--terminal-accent) 6%, transparent); }
 .fvrow .lgln { color: var(--terminal-line); text-align: right; padding-right: 14px; user-select: none; }
 .fvrow .lgtx { color: var(--terminal-ink); white-space: pre-wrap; word-break: break-word; }
 
@@ -2811,7 +2930,7 @@ h1, .crumb-head, .run-title {
 .readonly-banner {
   display: flex; align-items: center; gap: 8px;
   padding: 8px 14px; border-bottom: 1px solid var(--border);
-  background: color-mix(in srgb, var(--copper) 12%, var(--emerald-surface));
+  background: color-mix(in srgb, var(--warn) 12%, var(--emerald-surface));
   font-family: var(--font-mono); font-size: 12px; color: var(--sage);
 }
 .readonly-banner .rb-eye { font-size: 13px; line-height: 1; }
@@ -2835,9 +2954,9 @@ h1, .crumb-head, .run-title {
 .vdrop-btn.open { border-color: var(--emerald); background: color-mix(in srgb, var(--emerald) 10%, transparent); }
 /* Time-travelling (an older version in view): copper tint, echoing the caution
    read-only banner below the toolbar. */
-.vdrop-btn.traveling { color: var(--copper); border-color: var(--border-copper); }
+.vdrop-btn.traveling { color: var(--warn); border-color: var(--border-warn); }
 .vdrop-emblem { flex: none; color: var(--emerald); font-size: 11px; }
-.vdrop-btn.traveling .vdrop-emblem { color: var(--copper); }
+.vdrop-btn.traveling .vdrop-emblem { color: var(--warn); }
 .vdrop-lbl { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
 .vdrop-caret { flex: none; font-size: 9px; opacity: 0.75; margin-left: 1px; }
 /* Live pip (viewing the live frontier): a pulsing dot — in the trigger it sits
@@ -3004,11 +3123,11 @@ h1, .crumb-head, .run-title {
 /* Outcome tone — accent colour on the text + a tinted border on the pill. */
 .adrop-chip.emerald, .adrop-btn.emerald, .adrop-row.emerald { color: var(--ok); }
 .adrop-chip.danger,  .adrop-btn.danger,  .adrop-row.danger  { color: var(--danger); }
-.adrop-chip.copper,  .adrop-btn.copper,  .adrop-row.copper  { color: var(--copper); }
+.adrop-chip.copper,  .adrop-btn.copper,  .adrop-row.copper  { color: var(--warn); }
 .adrop-chip.running, .adrop-btn.running, .adrop-row.running { color: var(--running); }
 .adrop-chip.emerald, .adrop-btn.emerald { border-color: color-mix(in srgb, var(--ok) 45%, var(--border)); }
 .adrop-chip.danger,  .adrop-btn.danger  { border-color: color-mix(in srgb, var(--danger) 55%, var(--border)); }
-.adrop-chip.copper,  .adrop-btn.copper  { border-color: var(--border-copper); }
+.adrop-chip.copper,  .adrop-btn.copper  { border-color: var(--border-warn); }
 .adrop-chip.running, .adrop-btn.running { border-color: color-mix(in srgb, var(--running) 50%, var(--border)); }
 /* A shadowed success (a newer success took over as of-record) dims. */
 .adrop-chip.shadow, .adrop-btn.shadow, .adrop-row.shadow { opacity: 0.5; }
@@ -3117,10 +3236,10 @@ h1, .crumb-head, .run-title {
 /* Activity glyphs for the two new event kinds: a human Take boundary and a
    control-plane re-adoption (the durability wedge, visible). */
 .tl-glyph.take { border-color: var(--copper); color: var(--copper); }
-.tl-glyph.recover { border-color: var(--emerald); color: var(--emerald); }
+.tl-glyph.recover { border-color: var(--ok-ink); color: var(--ok-ink); }
 /* Fan-in collision warning (2e1a458): louder than info's copper-on-border-copper,
    quieter than err — copper on both, like a gate, but with the △ glyph. */
-.tl-glyph.warning { border-color: var(--copper); color: var(--copper); }
+.tl-glyph.warning { border-color: var(--warn); color: var(--warn); }
 
 /* --- Sign-in screen (ADR-0049) -------------------------------------------
    Replaces the whole shell when there is no session, so it centres in the
@@ -3318,8 +3437,8 @@ h1, .crumb-head, .run-title {
    holder's hands, and a quiet panel is one people close without reading. */
 .tok-warn {
   display: flex; gap: 9px; align-items: flex-start; margin: 0;
-  font-size: 12.5px; line-height: 1.5; color: var(--copper);
-  border: 1px dashed var(--border-copper); border-radius: var(--radius-sm);
+  font-size: 12.5px; line-height: 1.5; color: var(--warn);
+  border: 1px dashed var(--border-warn); border-radius: var(--radius-sm);
   padding: 10px 12px;
 }
 .tok-warn svg { flex: none; margin-top: 2px; }
@@ -3405,7 +3524,7 @@ h1, .crumb-head, .run-title {
 .sec-table td:first-child, .sec-table td:nth-child(3) { white-space: nowrap; }
 .sec-kind { white-space: nowrap; }
 .sec-danger { color: var(--danger); }
-.sec-warn { color: var(--copper); }
+.sec-warn { color: var(--warn); }
 .sec-ok { color: var(--ok); }
 .sec-plain { color: var(--sage); }
 .sec-add, .sec-filter { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
@@ -3414,7 +3533,7 @@ h1, .crumb-head, .run-title {
 .evlog-filter { align-items: flex-end; }
 .sec-chips { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px; }
 .sec-chips li {
-  font-size: 12px; color: var(--copper); border: 1px dashed var(--border-copper);
+  font-size: 12px; color: var(--warn); border: 1px dashed var(--border-warn);
   border-radius: var(--radius-sm); padding: 2px 8px;
 }
 .sec-result { display: grid; gap: 10px; margin-top: 10px; }
@@ -3427,8 +3546,8 @@ h1, .crumb-head, .run-title {
 /* App-wide: admins without a passkey are refused every crown jewel. */
 .sec-banner {
   display: flex; align-items: center; gap: 8px; padding: 7px 16px;
-  font-family: var(--font-mono); font-size: 12px; color: var(--copper);
-  border-bottom: 1px dashed var(--border-copper); background: var(--carapace-black);
+  font-family: var(--font-mono); font-size: 12px; color: var(--warn);
+  border-bottom: 1px dashed var(--border-warn); background: var(--carapace-black);
 }
 .sec-banner-link { color: var(--emerald); margin-left: auto; }
 
@@ -3458,7 +3577,7 @@ h1, .crumb-head, .run-title {
 .lib-checks li { display: flex; gap: 7px; align-items: flex-start; color: var(--sage); }
 .lib-checks li svg { flex: none; margin-top: 3px; }
 .lib-checks .ok svg { color: var(--ok); }
-.lib-checks .warn svg { color: var(--copper); }
+.lib-checks .warn svg { color: var(--warn); }
 .lib-checks .info svg { color: var(--muted-sage); }
 .ud { border: 1px solid var(--border); border-radius: var(--radius-sm); font-family: var(--font-mono); font-size: var(--fs-sm); overflow: auto; max-height: 26rem; }
 .ud-row { display: grid; grid-template-columns: 34px 34px 14px 1fr; white-space: pre; line-height: 1.55; }
@@ -3538,14 +3657,14 @@ h1, .crumb-head, .run-title {
 .split2 { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; }
 .pane-sub { font-family: var(--font-mono); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 1px; color: var(--muted-sage); margin: 0 0 10px; }
 .rendered { margin: 0; background: var(--terminal); color: var(--terminal-ink); border: 1px solid var(--terminal-line); border-radius: var(--radius-sm); padding: 10px 12px; font-family: var(--font-mono); font-size: var(--fs-sm); white-space: pre-wrap; word-break: break-all; }
-.rendered .from { color: #8fb3a0; }
+.rendered .from { color: var(--terminal-dim); }
 
 /* --- plugin gate pane --- */
 .gp { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
 .gp-card { border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 14px; display: grid; gap: 8px; align-content: start; }
 .gp-card h4 { margin: 0; font-family: var(--font-mono); font-weight: 500; font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 1px; color: var(--muted-sage); }
 .gp-big { font-family: var(--font-mono); font-size: var(--fs-xl); color: var(--soft-white); }
-.gp-big.warn { color: var(--copper); }
+.gp-big.warn { color: var(--warn); }
 .gp-big.bad { color: var(--danger); }
 .gp-big.good { color: var(--emerald); }
 .gp-line { font-size: var(--fs-sm); color: var(--sage); }
@@ -3555,7 +3674,7 @@ h1, .crumb-head, .run-title {
 .gate-clock { font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--sage); }
 .gate-clock.low { color: var(--danger); }
 .bar { height: 4px; background: var(--border-soft); border-radius: 2px; overflow: hidden; }
-.bar > i { display: block; height: 100%; background: var(--copper); }
+.bar > i { display: block; height: 100%; background: var(--warn); }
 
 /* --- compile error --- */
 .cerr { display: grid; gap: 12px; }
@@ -3578,10 +3697,21 @@ h1, .crumb-head, .run-title {
   --well-dot: rgba(200, 224, 208, .08);
   --inset: inset 0 1px 3px rgba(0, 0, 0, .6), inset 0 -1px 0 rgba(200, 224, 208, .05);
 }
+/* Mono (after the two blocks above, which it must beat at equal specificity). */
+[data-palette="mono"] {
+  --well: #e8e8e8;
+  --well-dot: rgba(0, 0, 0, .12);
+  --inset: inset 0 1px 2px rgba(0, 0, 0, .2), inset 0 -1px 0 rgba(255, 255, 255, .9);
+}
+[data-palette="mono"][data-theme="dark"] {
+  --well: #121212;
+  --well-dot: rgba(255, 255, 255, .08);
+  --inset: inset 0 1px 3px rgba(0, 0, 0, .6), inset 0 -1px 0 rgba(255, 255, 255, .05);
+}
 .lib-empty { display: grid; justify-items: center; gap: 6px; text-align: center; padding: 4px 12px 6px; }
 .lib-empty .t1 { display: flex; gap: 7px; align-items: center; font-size: var(--fs-md); font-weight: 500; color: var(--soft-white); }
 .lib-empty .t1 svg { color: var(--muted-sage); }
-.lib-empty .t1.warn svg { color: var(--copper); }
+.lib-empty .t1.warn svg { color: var(--warn); }
 .lib-empty .t2 { margin: 0; font-size: var(--fs-sm); color: var(--sage); max-width: 580px; }
 .lib-empty .acts { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; margin-top: 6px; }
 .lib-empty .acts .btn.on { border-color: var(--emerald); color: var(--emerald); }
@@ -3653,7 +3783,7 @@ code.c { font-family: var(--font-mono); font-size: var(--fs-sm); color: var(--co
   .sbs { grid-template-columns: 1fr; }
   .lib-side { position: static; }
 }.dnode.plugin { border-style: dashed; border-color: var(--border-copper); }
-.dnode.waiting { border-color: var(--copper); }
+.dnode.waiting { border-color: var(--warn); }
 .lib-well .doodle { position: static; display: block; margin-bottom: 2px; }
 .lib-well .doodle svg { width: 100%; height: 100%; }
 .dag-cols .dgroup .dag-cols { display: flex; }

@@ -8,14 +8,22 @@
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
     <script>
-      // Pre-paint theme guard (docs/DESIGN.md §1): light is the default; honor a
-      // stored choice before first paint to avoid a flash.
+      // Pre-paint theme guard (docs/DESIGN.md §1): light and the emerald palette
+      // are the defaults; honor stored choices before first paint to avoid a
+      // flash. The palette rule mirrors parsePalette in src/appearance.ts.
       (function () {
+        var root = document.documentElement;
         try {
           var t = localStorage.getItem("scarab-theme");
-          document.documentElement.setAttribute("data-theme", t === "dark" ? "dark" : "light");
+          root.setAttribute("data-theme", t === "dark" ? "dark" : "light");
         } catch (e) {
-          document.documentElement.setAttribute("data-theme", "light");
+          root.setAttribute("data-theme", "light");
+        }
+        try {
+          var p = localStorage.getItem("scarab-palette");
+          root.setAttribute("data-palette", p === "mono" ? "mono" : "emerald");
+        } catch (e) {
+          root.setAttribute("data-palette", "emerald");
         }
       })();
     </script>
