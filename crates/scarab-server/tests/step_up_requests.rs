@@ -1178,6 +1178,7 @@ async fn a_request_shows_the_query_it_runs_with() {
             credential_ref: "github-app".into(),
             org: Some("acme".into()),
             installation_id: None,
+            account_id: None,
         })
         .await
         .unwrap();
@@ -1222,6 +1223,7 @@ async fn a_token_raises_no_request_for_another_orgs_connection() {
             credential_ref: "fj-globex-token".into(),
             org: Some("globex".into()),
             installation_id: None,
+            account_id: None,
         })
         .await
         .unwrap();

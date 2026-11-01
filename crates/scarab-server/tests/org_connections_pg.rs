@@ -6,6 +6,9 @@
 //!   holding another installation's repository still mints for that
 //!   repository from the installation that covers it: the adapter is pinned
 //!   to the row's own installation only once the row serves an Org.
+//! * An unassigned `github-install-<id>` row whose bindings all belong to
+//!   one owner that is not its account stays unassigned after the upgrade,
+//!   and that owner's repository keeps minting through the lookup.
 //! * An installation delivery does not attach to an Org that exists but has
 //!   no connection left (its secrets, members and policies remain).
 //!
@@ -152,6 +155,86 @@ async fn an_unassigned_legacy_installation_row_still_mints_through_the_lookup() 
         .unwrap();
     assert_eq!(row.org, None, "two owners: unassigned");
     assert_eq!(row.installation_id, Some(5));
+
+    let forge = RegistryForge::new(
+        pg.clone(),
+        Arc::new(FakeSecrets::new()),
+        Some("4323648".into()),
+        Some(app_pem().to_string()),
+    );
+    let cred = forge
+        .mint_checkout_credential(&repo("globex", "site"), true)
+        .await
+        .expect("mints from the installation that covers globex/site");
+    assert_eq!(cred.token, "ghs_from_9");
+    let paths: Vec<String> = rec
+        .lock()
+        .unwrap()
+        .seen
+        .iter()
+        .map(|(_, p)| p.clone())
+        .collect();
+    assert_eq!(
+        paths,
+        vec![
+            "/repos/globex/site/installation".to_string(),
+            "/app/installations/9/access_tokens".to_string()
+        ]
+    );
+
+    tdb.cleanup().await;
+}
+
+/// J1 of git-bug 19b0a45: an old re-sync of installation 5 (account acme,
+/// whose own installation covered nothing) left `globex/site` of
+/// installation 9 as its only binding. Every binding is globex's, but the
+/// row is an installation, so 0076 leaves it unassigned: assigned to
+/// globex it would be pinned to installation 5, every `globex/site` token
+/// would be asked of an installation that does not cover it, and globex's
+/// own installation could not take the repo back. Unassigned, the repo
+/// mints from the installation the lookup finds. Before the fix the row
+/// was assigned `globex` and minted from installation 5.
+#[tokio::test]
+async fn an_installation_row_holding_only_another_owners_repo_stays_unassigned_and_mints() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let pool = tdb.pool.clone();
+    let (base, rec) = stub_github(vec![
+        (StatusCode::OK, r#"{"id": 9}"#),
+        (StatusCode::CREATED, r#"{"token": "ghs_from_9"}"#),
+    ])
+    .await;
+
+    apply(&pool, |v| v < VERSION).await;
+    sqlx::query(
+        "INSERT INTO forge_connections (id, kind, base_url, credential_ref)
+         VALUES ('github-install-5', 'github', $1, 'github-app')",
+    )
+    .bind(&base)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO forge_repos (connection_id, owner, name, org, project)
+         VALUES ('github-install-5', 'globex', 'site', 'globex', 'site')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    apply(&pool, |v| v >= VERSION).await;
+
+    let pg = Arc::new(PostgresDb::with_pool(pool.clone()));
+    let row = pg
+        .get_connection("github-install-5")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.org, None,
+        "an installation row is not assigned by its bindings"
+    );
 
     let forge = RegistryForge::new(
         pg.clone(),

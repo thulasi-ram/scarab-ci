@@ -1025,7 +1025,10 @@ pub static CONNECTION_ASSIGN_ORG: Op = op(
     OrgOf::Body("/org"),
     &[],
     &["path:id", "body:/org"],
-);
+)
+// Global admins only, and a token is never global (git-bug 19b0a45): a
+// request a token raised could only ever be confirmed into a 403.
+.not_by_token();
 pub static CONNECTION_BIND_REPO: Op = op(
     "connection.bind_repo",
     "Bind a repository",
@@ -1459,9 +1462,11 @@ mod tests {
     }
 
     /// The operations a machine caller may never raise a request for: the
-    /// browser-only flows, and token minting for a token (git-bug ff7a014).
+    /// browser-only flows, token minting for a token (git-bug ff7a014), and
+    /// assigning a connection's org, which only a global admin may do and a
+    /// token never is (git-bug 19b0a45).
     #[test]
-    fn only_the_browser_flows_and_token_minting_refuse_a_machine() {
+    fn only_the_browser_flows_token_minting_and_org_assignment_refuse_a_machine() {
         let mut browser_only = Vec::new();
         let mut not_by_token = Vec::new();
         for e in crate::route_table() {
@@ -1477,7 +1482,8 @@ mod tests {
             browser_only,
             vec!["identity.link", "identity.unlink", "passkey.add"]
         );
-        assert_eq!(not_by_token, vec!["token.mint"]);
+        not_by_token.sort_unstable();
+        assert_eq!(not_by_token, vec!["connection.assign_org", "token.mint"]);
     }
 
     #[test]

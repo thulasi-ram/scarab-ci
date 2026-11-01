@@ -311,6 +311,7 @@ async fn an_anonymous_fetch_never_reaches_an_unknown_host() {
         credential_ref: "c".into(),
         org: None,
         installation_id: None,
+        account_id: None,
     })
     .await
     .unwrap();
@@ -360,6 +361,7 @@ async fn github_connection(db: &InMemoryDb, id: &str, org: Option<&str>) {
         credential_ref: "c".into(),
         org: org.map(str::to_string),
         installation_id: None,
+        account_id: None,
     })
     .await
     .unwrap();

@@ -247,6 +247,10 @@ pub struct InstallationSync {
     /// The account (user/org login) the App was installed on — the default
     /// Scarab Org for auto-registered Projects.
     pub account: String,
+    /// The account's immutable GitHub id (`installation.account.id`): a
+    /// login can be renamed and taken by another account, this id cannot
+    /// (git-bug 19b0a45). `None` when the delivery does not carry it.
+    pub account_id: Option<u64>,
     pub added: Vec<RepoRef>,
     pub removed: Vec<RepoRef>,
 }
@@ -262,6 +266,9 @@ pub fn installation_sync(delivery: &WebhookDelivery) -> Option<InstallationSync>
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+    let account_id = p
+        .pointer("/installation/account/id")
+        .and_then(Value::as_u64);
     let repos_at = |ptr: &str| -> Vec<RepoRef> {
         p.pointer(ptr)
             .and_then(Value::as_array)
@@ -288,12 +295,14 @@ pub fn installation_sync(delivery: &WebhookDelivery) -> Option<InstallationSync>
                 "created" | "unsuspend" => Some(InstallationSync {
                     installation_id,
                     account,
+                    account_id,
                     added: repos,
                     removed: vec![],
                 }),
                 "deleted" | "suspend" => Some(InstallationSync {
                     installation_id,
                     account,
+                    account_id,
                     added: vec![],
                     removed: repos,
                 }),
@@ -303,6 +312,7 @@ pub fn installation_sync(delivery: &WebhookDelivery) -> Option<InstallationSync>
         "installation_repositories" => Some(InstallationSync {
             installation_id,
             account,
+            account_id,
             added: repos_at("/repositories_added"),
             removed: repos_at("/repositories_removed"),
         }),
@@ -1006,6 +1016,11 @@ impl ForgePort for GithubForge {
     /// one; fixed-token mode asks once as whatever the token is. Repos
     /// are deduplicated: an App installed on both a user and an org can serve the
     /// same repo twice.
+    ///
+    /// In App mode an adapter that serves an owner lists that owner's
+    /// repositories only. Unpinned, the walk reaches every installation of
+    /// the App, and the names of other accounts' private repositories are
+    /// not the owner's to see (git-bug 19b0a45).
     async fn list_accessible_repos(&self) -> Result<Vec<RepoRef>, ForgeError> {
         let mut out = std::collections::BTreeSet::new();
         match &self.auth {
@@ -1043,6 +1058,9 @@ impl ForgePort for GithubForge {
                         .tokens
                         .insert(id, (token.clone(), now + 3600));
                     out.extend(self.installation_repos(&token).await?);
+                }
+                if let Some(owner) = &self.owner {
+                    out.retain(|r| r.owner == *owner);
                 }
             }
         }
@@ -1540,7 +1558,7 @@ mod tests {
             "installation",
             json!({
                 "action": "created",
-                "installation": { "id": 77, "account": { "login": "acme" } },
+                "installation": { "id": 77, "account": { "login": "acme", "id": 4321 } },
                 "repositories": [
                     { "full_name": "acme/web" },
                     { "full_name": "acme/api" },
@@ -1552,6 +1570,7 @@ mod tests {
             InstallationSync {
                 installation_id: 77,
                 account: "acme".into(),
+                account_id: Some(4321),
                 added: vec![
                     RepoRef {
                         owner: "acme".into(),

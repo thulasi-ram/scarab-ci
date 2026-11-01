@@ -294,3 +294,27 @@ async fn an_adapter_serving_an_owner_mints_nothing_for_another_owners_repo() {
         stub.seen().iter().map(|s| &s.path).collect::<Vec<_>>()
     );
 }
+
+/// git-bug 19b0a45: an unpinned App adapter (a config-declared connection
+/// without an installation id) walks every installation of the App. When it
+/// serves an owner it lists that owner's repositories only: the names of
+/// another account's private repositories are not the owner's to see.
+#[tokio::test]
+async fn an_unpinned_adapter_serving_an_owner_lists_only_that_owners_repositories() {
+    let stub = Stub::start(vec![
+        Reply::ok(r#"[{"id": 1}, {"id": 2}]"#),
+        Reply::new(StatusCode::CREATED, r#"{"token": "ghs_one"}"#),
+        Reply::ok(r#"{"total_count": 1, "repositories": [{"full_name": "acme/web"}]}"#),
+        Reply::new(StatusCode::CREATED, r#"{"token": "ghs_two"}"#),
+        Reply::ok(r#"{"total_count": 1, "repositories": [{"full_name": "globex/secret"}]}"#),
+    ])
+    .await;
+    let repos = stub
+        .app_forge()
+        .with_owner("acme")
+        .list_accessible_repos()
+        .await
+        .unwrap();
+    assert_eq!(repos, vec![repo()]);
+    assert_eq!(stub.seen()[0].path, "/app/installations", "the walk ran");
+}

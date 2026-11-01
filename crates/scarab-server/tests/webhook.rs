@@ -320,6 +320,7 @@ async fn an_installation_serves_its_accounts_org_and_binds_only_its_repos() {
         credential_ref: "fj-globex-token".into(),
         org: Some("globex".into()),
         installation_id: None,
+        account_id: None,
     })
     .await
     .unwrap();
@@ -383,6 +384,7 @@ async fn an_installation_does_not_join_a_same_named_org_of_another_forge() {
         credential_ref: "fj-acme-token".into(),
         org: Some("acme".into()),
         installation_id: None,
+        account_id: None,
     })
     .await
     .unwrap();
@@ -456,6 +458,7 @@ async fn a_delivery_does_not_assign_a_connection_holding_another_owners_repo() {
         credential_ref: "github-app".into(),
         org: None,
         installation_id: Some(5),
+        account_id: None,
     })
     .await
     .unwrap();

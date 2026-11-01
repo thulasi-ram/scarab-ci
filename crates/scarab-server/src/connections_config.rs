@@ -149,6 +149,29 @@ pub enum ProvisionError {
     )]
     OwnershipCollision { id: String },
 
+    #[error(
+        "forge connection `{id}` serves org `{from}`, but the `connections:` config now says \
+         `org: {to}`. A connection's org is not changed by config: its projects belong to \
+         `{from}`. To move it, remove `{id}` from the config, unbind its repositories, and add \
+         it again with the new org."
+    )]
+    OrgChanged {
+        id: String,
+        from: String,
+        to: String,
+    },
+
+    #[error(
+        "forge connection `{id}` holds `{repo}`, which is not owned by `{org}`, the org the \
+         `connections:` config gives it. Unbind `{repo}` from it first, or remove `{id}` from \
+         the config."
+    )]
+    ForeignBinding {
+        id: String,
+        org: String,
+        repo: String,
+    },
+
     #[error("forge connection registry unavailable while provisioning `{id}`: {message}")]
     Store { id: String, message: String },
 }
@@ -208,6 +231,44 @@ pub async fn provision(
                 id: spec.id.clone(),
             });
         }
+        // Config does not move a connection to another Org (git-bug
+        // 19b0a45): its bindings would stay, so the new Org's admins would
+        // hold the old Org's Projects. Exact comparison: `Acme` is another
+        // Org than `acme`.
+        match existing.as_ref().and_then(|c| c.org.as_deref()) {
+            Some(from) if from != spec.org => {
+                return Err(ProvisionError::OrgChanged {
+                    id: spec.id.clone(),
+                    from: from.to_string(),
+                    to: spec.org.clone(),
+                });
+            }
+            Some(_) => {}
+            // Unassigned (the upgrade leaves a connection whose bindings span
+            // owners unassigned): config assigns it only when everything
+            // bound through it is that Org's.
+            None if existing.is_some() => {
+                for repo in store
+                    .repos_of(&spec.id)
+                    .await
+                    .map_err(store_err(&spec.id))?
+                {
+                    let homed = store
+                        .resolve(&repo)
+                        .await
+                        .map_err(store_err(&spec.id))?
+                        .map(|r| r.org);
+                    if repo.owner != spec.org || homed.as_deref().is_some_and(|h| h != spec.org) {
+                        return Err(ProvisionError::ForeignBinding {
+                            id: spec.id.clone(),
+                            org: spec.org.clone(),
+                            repo: format!("{}/{}", repo.owner, repo.name),
+                        });
+                    }
+                }
+            }
+            None => {}
+        }
 
         store
             .put_connection(&ForgeConnection {
@@ -216,7 +277,9 @@ pub async fn provision(
                 base_url: spec.base_url.clone(),
                 credential_ref: spec.credential_ref.clone(),
                 org: Some(spec.org.clone()),
-                installation_id: None,
+                installation_id: spec.installation_id,
+                // Kept by the store: config does not know it.
+                account_id: None,
             })
             .await
             .map_err(store_err(&spec.id))?;

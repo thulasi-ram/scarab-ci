@@ -117,6 +117,7 @@ async fn projects_are_ordered_by_last_run_at() {
         credential_ref: "gh-token".into(),
         org: Some("acme".into()),
         installation_id: None,
+        account_id: None,
     })
     .await
     .unwrap();

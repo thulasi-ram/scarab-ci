@@ -502,6 +502,12 @@ pub struct ConnectionSpec {
     /// The Org the connection serves (git-bug 19b0a45): `org:`, or the one
     /// owner of its `repos:`. Every declared repo is owned by it.
     pub org: String,
+    /// The GitHub App installation the connection mints from and lists
+    /// (git-bug 19b0a45): `installation_id:`, or the `<id>` of a
+    /// `github-install-<id>` id. In App mode a `kind: github` connection
+    /// must have one, or its repository listing would walk every
+    /// installation of the App. `None` for every other connection.
+    pub installation_id: Option<u64>,
 }
 
 /// The `connections:` document, as written in `SCARAB_CONNECTIONS` /
@@ -535,6 +541,11 @@ struct RawConnection {
     /// must name it.
     #[serde(default)]
     org: Option<String>,
+    /// The GitHub App installation id (App mode, git-bug 19b0a45). Required
+    /// for a `kind: github` connection in App mode unless the id is
+    /// `github-install-<id>`.
+    #[serde(default)]
+    installation_id: Option<u64>,
 }
 
 /// Exactly one of the three sources. Two would make "which one wins?" a config
@@ -2076,7 +2087,8 @@ pub fn connections_from_env(
 
     let mut out: Vec<ConnectionSpec> = Vec::with_capacity(doc.connections.len());
     for raw_conn in doc.connections {
-        let spec = resolve_connection(raw_conn, env)
+        let app_mode = env("SCARAB_GITHUB_APP_ID").is_some_and(|v| !v.is_empty());
+        let spec = resolve_connection(raw_conn, env, app_mode)
             .map_err(|e| ConfigError::InvalidConnections(format!("{source}: {e}")))?;
         // Duplicate ids would race each other into the same row on every boot,
         // with the last one silently winning.
@@ -2096,6 +2108,7 @@ pub fn connections_from_env(
 fn resolve_connection(
     raw: RawConnection,
     env: &impl Fn(&str) -> Option<String>,
+    github_app_mode: bool,
 ) -> Result<ConnectionSpec, String> {
     let id = raw.id.trim().to_string();
     if id.is_empty() {
@@ -2241,17 +2254,43 @@ fn resolve_connection(
             }
         }
     };
-    if scarab_forge::is_reserved_org(&org) {
-        return Err(format!(
-            "connection `{id}`: `{org}` is a reserved org name (`_`-prefixed names are \
-             Scarab's own)"
-        ));
+    // The API's rule for an org name, so config cannot make an Org the API
+    // would refuse.
+    if let Some(problem) = crate::org_name_problem(&org) {
+        return Err(format!("connection `{id}`: {problem}"));
     }
     if let Some(other) = repos.iter().find(|r| r.owner != org) {
         return Err(format!(
             "connection `{id}` serves org `{org}`, but repo `{}/{}` is owned by `{}`; every \
              repo of a connection is owned by its org",
             other.owner, other.name, other.owner
+        ));
+    }
+
+    // The installation it is (git-bug 19b0a45). Unpinned, an App-mode
+    // GitHub connection would list every installation's repositories, other
+    // accounts' included, so App mode needs one.
+    let named = scarab_forge::installation_id_of(&id);
+    let installation_id = match (kind, raw.installation_id, named) {
+        (scarab_forge::ForgeKind::GitHub, Some(declared), Some(named)) if declared != named => {
+            return Err(format!(
+                "connection `{id}`: `installation_id: {declared}` is not the installation \
+                 its id names ({named})"
+            ))
+        }
+        (scarab_forge::ForgeKind::GitHub, declared, named) => declared.or(named),
+        (_, Some(_), _) => {
+            return Err(format!(
+                "connection `{id}`: `installation_id` is for `kind: github` connections only"
+            ))
+        }
+        (_, None, _) => None,
+    };
+    if github_app_mode && kind == scarab_forge::ForgeKind::GitHub && installation_id.is_none() {
+        return Err(format!(
+            "connection `{id}`: set `installation_id`, the GitHub App installation this \
+             connection is (SCARAB_GITHUB_APP_ID is set, so GitHub connections use the App). \
+             Without it the connection would list every installation's repositories"
         ));
     }
 
@@ -2264,6 +2303,7 @@ fn resolve_connection(
         credential_source,
         repos,
         org,
+        installation_id,
     })
 }
 
@@ -3283,12 +3323,122 @@ connections:
 "#,
                 "reserved org name",
             ),
+            // The API's org-name rule applies to config too (git-bug
+            // 19b0a45): before, config checked only empty and reserved.
+            (
+                r#"
+connections:
+  - id: c
+    kind: forgejo
+    org: a/b
+    base_url: https://git.example.com
+    credential: { secret_ref: t }
+"#,
+                "may not contain `/` or spaces",
+            ),
+            (
+                r#"
+connections:
+  - id: c
+    kind: forgejo
+    org: ".."
+    base_url: https://git.example.com
+    credential: { secret_ref: t }
+"#,
+                "a URL cannot address it",
+            ),
+            (
+                r#"
+connections:
+  - id: c
+    kind: forgejo
+    org: settings
+    base_url: https://git.example.com
+    credential: { secret_ref: t }
+"#,
+                "first part of a Scarab web address",
+            ),
         ] {
             let err = resolve(block).unwrap_err();
             let msg = err.to_string();
             assert!(matches!(err, ConfigError::InvalidConnections(_)), "{msg}");
             assert!(msg.contains(expect), "want {expect:?} in: {msg}");
         }
+    }
+
+    /// git-bug 19b0a45: in App mode a config-declared GitHub connection is
+    /// pinned to one installation. `installation_id:` names it, or a
+    /// `github-install-<id>` id does; without either the boot is refused,
+    /// since the connection would list every installation's repositories.
+    /// Token mode needs neither.
+    #[test]
+    fn an_app_mode_github_connection_names_its_installation() {
+        let specs = |block: &'static str, app_mode: bool| {
+            connections_from_env(&move |k: &str| match k {
+                "SCARAB_CONNECTIONS" => Some(block.to_string()),
+                "SCARAB_GITHUB_APP_ID" if app_mode => Some("4323648".to_string()),
+                _ => None,
+            })
+        };
+        let unnamed = r#"
+connections:
+  - id: github-main
+    kind: github
+    org: acme
+    base_url: https://api.github.com
+    credential: { secret_ref: github-app }
+"#;
+        let err = specs(unnamed, true).unwrap_err().to_string();
+        assert!(err.contains("set `installation_id`"), "{err}");
+        assert_eq!(specs(unnamed, false).unwrap()[0].installation_id, None);
+
+        let declared = r#"
+connections:
+  - id: github-main
+    kind: github
+    org: acme
+    installation_id: 55
+    base_url: https://api.github.com
+    credential: { secret_ref: github-app }
+"#;
+        assert_eq!(specs(declared, true).unwrap()[0].installation_id, Some(55));
+
+        let named = r#"
+connections:
+  - id: github-install-77
+    kind: github
+    org: acme
+    base_url: https://api.github.com
+    credential: { secret_ref: github-app }
+"#;
+        assert_eq!(specs(named, true).unwrap()[0].installation_id, Some(77));
+
+        let disagree = r#"
+connections:
+  - id: github-install-77
+    kind: github
+    org: acme
+    installation_id: 5
+    base_url: https://api.github.com
+    credential: { secret_ref: github-app }
+"#;
+        let err = specs(disagree, true).unwrap_err().to_string();
+        assert!(
+            err.contains("is not the installation its id names"),
+            "{err}"
+        );
+
+        let forgejo = r#"
+connections:
+  - id: c
+    kind: forgejo
+    org: acme
+    installation_id: 5
+    base_url: https://git.example.com
+    credential: { secret_ref: t }
+"#;
+        let err = specs(forgejo, true).unwrap_err().to_string();
+        assert!(err.contains("for `kind: github` connections only"), "{err}");
     }
 
     #[test]

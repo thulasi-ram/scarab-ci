@@ -898,6 +898,7 @@ pub(crate) async fn trust_library_source(
     let by = org_caller(&st, &headers, &org, Action::Administer).await?;
     super::refuse_reserved_org(&org, "trust a library source")?;
     let source = trust_source_key(&body.source)?;
+    super::note_org(&st, &org).await?;
     let now = st.clock.now().await.0;
     let t = store(&st)?
         .trust_source(&TrustedSource {
@@ -984,6 +985,7 @@ pub(crate) async fn fetch_library(
     let mut name = body.name.clone().unwrap_or_else(|| src.default_name());
     check_names(&publisher, &name)?;
     let content = read_source(&st, &org, &src, body.connection.as_deref()).await?;
+    super::note_org(&st, &org).await?;
     let hash = content_hash(&content);
     // First-party content is stored under the name the release manifest
     // gives it, whatever the request or the source path says: trust in the
@@ -1091,6 +1093,7 @@ pub(crate) async fn install_library(
     check_names(&publisher, &name)?;
     check_hash(&body.content_hash)?;
     let store = store(&st)?;
+    super::note_org(&st, &org).await?;
     let version = store
         .version(&org, &body.content_hash)
         .await

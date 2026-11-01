@@ -86,6 +86,7 @@ async fn harness_at(
         credential_ref: CRED_REF.into(),
         org: Some("acme".into()),
         installation_id: None,
+        account_id: None,
     })
     .await
     .unwrap();
@@ -980,6 +981,7 @@ async fn deleting_a_connection_with_projects_needs_an_acknowledgement() {
         credential_ref: CRED_REF.into(),
         org: Some("acme".into()),
         installation_id: None,
+        account_id: None,
     })
     .await
     .unwrap();
@@ -1401,6 +1403,7 @@ async fn no_bind_path_homes_a_repo_in_a_reserved_org() {
     // The installation-sync path (GitHub) goes through the same registry.
     let sync = scarab_forge_github::InstallationSync {
         installation_id: 1,
+        account_id: None,
         account: "_forge".into(),
         added: vec![forge_web.clone()],
         removed: vec![],

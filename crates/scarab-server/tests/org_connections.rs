@@ -32,6 +32,7 @@ use scarab_testkit::{
 const T0: i64 = 1_000_000;
 const DAY: i64 = 24 * 60 * 60 * 1000;
 const GLOBEX_TOKEN: &str = "scarab_pat_globex_0123456789abcdef0123456789abcdef";
+const WEBHOOK_SECRET: &[u8] = b"topsecret";
 
 struct Harness {
     app: axum::Router,
@@ -59,6 +60,7 @@ fn conn(
         credential_ref: format!("{id}-credential"),
         org: org.map(str::to_string),
         installation_id: inst,
+        account_id: None,
     }
 }
 
@@ -173,9 +175,59 @@ async fn harness(forge: FakeForge) -> Harness {
             .with_api_tokens(tokens)
             .with_secrets(secrets)
             .with_forge(Arc::new(forge))
-            .with_forge_connections(db.clone()),
+            .with_forge_connections(db.clone())
+            .with_github_webhook_secret(WEBHOOK_SECRET.to_vec()),
     );
     Harness { app, db }
+}
+
+/// Deliver a signed GitHub `installation` event: installation `id` on the
+/// account `login` whose immutable GitHub id is `account_id`, covering
+/// `repos` (`owner/name`).
+async fn deliver_installation(
+    h: &Harness,
+    delivery: &str,
+    id: u64,
+    login: &str,
+    account_id: u64,
+    repos: &[&str],
+) -> StatusCode {
+    let repositories: Vec<serde_json::Value> = repos
+        .iter()
+        .map(|r| serde_json::json!({ "full_name": r }))
+        .collect();
+    let body = serde_json::to_vec(&serde_json::json!({
+        "action": "created",
+        "installation": { "id": id, "account": { "login": login, "id": account_id } },
+        "repositories": repositories,
+    }))
+    .unwrap();
+    let sig = scarab_forge_github::sign_hex(WEBHOOK_SECRET, &body);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/webhooks/github")
+        .header("content-type", "application/json")
+        .header("x-github-event", "installation")
+        .header("x-github-delivery", delivery)
+        .header("x-hub-signature-256", &sig)
+        .body(Body::from(body))
+        .unwrap();
+    h.app.clone().oneshot(req).await.unwrap().status()
+}
+
+/// Bind `r` through `conn_id` although the connection serves another Org,
+/// as an old re-sync, or a config whose `org:` changed, could leave it: the
+/// connection is unassigned for the bind and assigned again after.
+async fn misbind(h: &Harness, conn_id: &str, r: &RepoRef) {
+    let c = h.db.get_connection(conn_id).await.unwrap().unwrap();
+    h.db.put_connection(&ForgeConnection {
+        org: None,
+        ..c.clone()
+    })
+    .await
+    .unwrap();
+    h.db.bind_repo(conn_id, r, &r.owner, &r.name).await.unwrap();
+    h.db.put_connection(&c).await.unwrap();
 }
 
 async fn login(app: &axum::Router, credential: &str) -> String {
@@ -509,26 +561,22 @@ async fn resync_never_binds_or_moves_another_orgs_repo() {
     }
 }
 
-/// No read and no re-sync assigns an unassigned connection, and a re-sync
-/// through one binds nothing: its repos would be homed by owner name alone,
-/// which is how a GitHub account joins a same-named Org of another forge
-/// (D7). A global admin assigns it first (`PUT .../org`).
+/// A re-sync through an unassigned connection binds nothing and does not
+/// assign it: its repos would be homed by owner name alone, which is how a
+/// GitHub account joins a same-named Org of another forge (D7). A global
+/// admin assigns it first (`PUT .../org`).
+///
+/// (That a read such as `available-repos` assigns nothing is not tested
+/// here: the code that assigned on a read asked the forge for the
+/// connection's account, a call the forge port no longer has, so no fake
+/// can make that half fail.)
 #[tokio::test]
-async fn an_unassigned_connection_is_not_assigned_or_bound_by_a_read_or_a_resync() {
+async fn an_unassigned_connection_is_not_assigned_or_bound_by_a_resync() {
     let h =
         harness(FakeForge::new().with_accessible_repos(&[("umbrella", "app"), ("acme", "new")]))
             .await;
     let root = login(&h.app, "root-code").await;
 
-    let (st, b) = call(
-        &h,
-        "GET",
-        "/v1/connections/gh-legacy/available-repos",
-        &root,
-        None,
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK, "{b}");
     let (st, b) = call(&h, "POST", "/v1/connections/gh-legacy/resync", &root, None).await;
     assert_eq!(st, StatusCode::OK, "{b}");
     assert_eq!(b["bound"], serde_json::json!([]));
@@ -619,10 +667,7 @@ async fn a_repo_moves_only_off_an_unassigned_connection() {
 #[tokio::test]
 async fn an_org_admin_cannot_unbind_another_owners_repo_from_its_connection() {
     let h = harness(forge()).await;
-    // Written past `bind_repo`'s owner check, as an old server could have.
-    h.db.upsert_repo_binding("gh-acme", &repo("globex", "other"), "globex", "other")
-        .await
-        .unwrap();
+    misbind(&h, "gh-acme", &repo("globex", "other")).await;
     let acme = login(&h.app, "acme-code").await;
     let (st, b) = call(
         &h,
@@ -667,7 +712,11 @@ async fn only_a_global_admin_assigns_a_connection_and_only_to_its_repos_org() {
     assert_eq!(st, StatusCode::CONFLICT, "{b}");
     assert!(b.as_str().unwrap().contains("umbrella/app"), "{b}");
     // Not an org name.
-    for bad in ["", "a/b", "a b", "_forge"] {
+    // Nor `.`/`..` (a URL cannot address them), a control character, or a
+    // first segment of the web UI's addresses.
+    for bad in [
+        "", "a/b", "a b", "_forge", ".", "..", "a\u{7}b", "settings", "orgs", "account", "security",
+    ] {
         let (st, b) = call(&h, "PUT", uri, &root, put(bad)).await;
         assert_eq!(st, StatusCode::BAD_REQUEST, "{bad:?}: {b}");
     }
@@ -718,4 +767,166 @@ async fn only_a_global_admin_assigns_a_connection_and_only_to_its_repos_org() {
             .org,
         None
     );
+}
+
+/// Removing a connection with its Projects takes only its own Org's. A
+/// binding of another owner that it holds (an old re-sync, a config whose
+/// `org:` changed) is refused, named, and left in place, and the connection
+/// stays. That Org takes its repo back by re-syncing its own connection,
+/// after which the removal goes through. Before the fix the first removal
+/// deleted globex's Project.
+#[tokio::test]
+async fn removing_a_connection_never_takes_another_orgs_project_with_it() {
+    let h = harness(forge()).await;
+    misbind(&h, "gh-acme", &repo("globex", "other")).await;
+    let acme = login(&h.app, "acme-code").await;
+
+    let (st, b) = call(
+        &h,
+        "DELETE",
+        "/v1/connections/gh-acme?unbind_repos=true",
+        &acme,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{b}");
+    assert!(b.as_str().unwrap().contains("globex/other"), "{b}");
+    assert!(h.db.get_connection("gh-acme").await.unwrap().is_some());
+    assert_eq!(
+        h.db.resolve(&repo("globex", "other"))
+            .await
+            .unwrap()
+            .unwrap()
+            .connection
+            .id,
+        "gh-acme"
+    );
+
+    // globex re-syncs its own connection: the repo moves off a connection
+    // that does not serve its owner.
+    let globex = login(&h.app, "globex-code").await;
+    let (st, b) = call(
+        &h,
+        "POST",
+        "/v1/connections/fj-globex/resync",
+        &globex,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert!(
+        b["bound"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("globex/other")),
+        "{b}"
+    );
+    let moved =
+        h.db.resolve(&repo("globex", "other"))
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(moved.connection.id, "fj-globex");
+
+    let (st, b) = call(
+        &h,
+        "DELETE",
+        "/v1/connections/gh-acme?unbind_repos=true",
+        &acme,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT, "{b}");
+    assert!(h.db.resolve(&repo("acme", "web")).await.unwrap().is_none());
+    assert_eq!(
+        h.db.resolve(&repo("globex", "other"))
+            .await
+            .unwrap()
+            .unwrap()
+            .connection
+            .id,
+        "fj-globex"
+    );
+}
+
+/// D7 of git-bug 19b0a45, the renamed-login case. acme's installation was
+/// recorded with GitHub account id 1. That account renames itself, and a
+/// new account (id 2) takes the free login `acme` and installs the App. Its
+/// installation is registered unassigned and binds nothing: the login is
+/// the same, the account is not. The account with id 1 installing again
+/// joins acme. Before the fix any GitHub installation named `acme` joined.
+#[tokio::test]
+async fn an_installation_by_a_new_holder_of_a_renamed_login_does_not_join_its_org() {
+    let h = harness(forge()).await;
+    h.db.set_connection_account("gh-acme", 1).await.unwrap();
+
+    let st = deliver_installation(&h, "rename-1", 9, "acme", 2, &["acme/new"]).await;
+    assert_eq!(st, StatusCode::OK);
+    let c =
+        h.db.get_connection("github-install-9")
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(c.org, None, "registered unassigned");
+    assert_eq!(c.account_id, Some(2), "its account id is recorded");
+    assert!(h.db.repos_of("github-install-9").await.unwrap().is_empty());
+    assert!(h.db.resolve(&repo("acme", "new")).await.unwrap().is_none());
+
+    let st = deliver_installation(&h, "rename-2", 10, "acme", 1, &["acme/more"]).await;
+    assert_eq!(st, StatusCode::OK);
+    let c =
+        h.db.get_connection("github-install-10")
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(c.org.as_deref(), Some("acme"));
+    assert_eq!(
+        h.db.repos_of("github-install-10").await.unwrap(),
+        vec![repo("acme", "more")]
+    );
+}
+
+/// D7 of git-bug 19b0a45, the data-only case. A global admin sets up
+/// `initech` with a secret before it has any connection. A GitHub account
+/// named `initech` installing the App does not join it by name: the secret
+/// made the Org exist. An account with no Org of its name founds one.
+/// Before the fix a secret did not make an Org exist, and the installation
+/// took `initech` and its secret.
+#[tokio::test]
+async fn an_installation_does_not_join_an_org_that_only_holds_data() {
+    let h = harness(forge()).await;
+    let root = login(&h.app, "root-code").await;
+    let (st, b) = call(
+        &h,
+        "POST",
+        "/v1/secrets",
+        &root,
+        Some(serde_json::json!({ "org": "initech", "name": "DEPLOY_KEY", "value": "v" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT, "{b}");
+
+    let st = deliver_installation(&h, "data-1", 12, "initech", 7, &["initech/tps"]).await;
+    assert_eq!(st, StatusCode::OK);
+    let c =
+        h.db.get_connection("github-install-12")
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(c.org, None, "registered unassigned");
+    assert!(h
+        .db
+        .resolve(&repo("initech", "tps"))
+        .await
+        .unwrap()
+        .is_none());
+
+    let st = deliver_installation(&h, "data-2", 13, "hooli", 8, &["hooli/app"]).await;
+    assert_eq!(st, StatusCode::OK);
+    let c =
+        h.db.get_connection("github-install-13")
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(c.org.as_deref(), Some("hooli"));
 }

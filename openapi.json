@@ -375,7 +375,7 @@
             "description": "no such connection, or no registry wired"
           },
           "409": {
-            "description": "the connection still has bound repos (Projects)"
+            "description": "the connection still has bound repos (Projects), or holds a repo of another org"
           },
           "429": {
             "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
@@ -485,7 +485,7 @@
             }
           },
           "400": {
-            "description": "not an org name: empty, longer than 100 characters, containing `/` or spaces, or `_`-prefixed"
+            "description": "not an org name: empty, longer than 100 characters, containing `/`, spaces or control characters, `.` or `..`, `_`-prefixed, or one of the reserved names `settings`, `orgs`, `account`, `security`"
           },
           "403": {
             "description": "requires a global admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",

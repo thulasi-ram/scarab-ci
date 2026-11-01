@@ -6785,13 +6785,14 @@ const GITHUB_API_BASE: &str = "https://api.github.com";
 /// App **is** registration), into the Org of the installation's account
 /// (git-bug 19b0a45).
 ///
-/// The connection `github-install-<id>` serves the account's Org and records
-/// its installation id, so its tokens are minted from that installation
-/// only. A connection that already serves an Org keeps it. An unassigned one
-/// takes the account's Org only when [`org_assign_refusal`] finds nothing
-/// against it: every repo already bound through it is the account's, and an
-/// existing Org of that name is served by GitHub's API alone. Otherwise it
-/// is registered (or stays) **unassigned**, binds none of the delivery's
+/// The connection `github-install-<id>` records its installation id and the
+/// account's immutable id, so once it serves an Org its tokens are minted
+/// from that installation only. A connection that already serves an Org
+/// keeps it. An unassigned one takes the account's Org only when
+/// [`delivery_assign_refusal`] finds nothing against it: every repo already
+/// bound through it is the account's, and the Org is new or is already
+/// served by a GitHub connection of the same account id. Otherwise it is
+/// registered (or stays) **unassigned**, binds none of the delivery's
 /// repos, and waits for a global admin to assign it
 /// (`PUT /v1/connections/{id}/org`).
 async fn register_installation(
@@ -6811,28 +6812,48 @@ async fn register_installation(
         .get_connection(&conn_id)
         .await
         .map_err(registry)?;
-    let mut conn = scarab_forge::ForgeConnection {
-        id: conn_id.clone(),
-        kind: scarab_forge::ForgeKind::GitHub,
-        base_url: existing
-            .as_ref()
-            .map(|c| c.base_url.clone())
-            .unwrap_or_else(|| GITHUB_API_BASE.into()),
-        // The App credential is shared across installations; the
-        // composition root registers it under this handle.
-        credential_ref: "github-app".into(),
-        org: existing.as_ref().and_then(|c| c.org.clone()),
-        installation_id: Some(sync.installation_id),
+    let mut org = match &existing {
+        Some(conn) => {
+            if let Some(account_id) = sync.account_id {
+                connections
+                    .set_connection_account(&conn_id, account_id)
+                    .await
+                    .map_err(registry)?;
+            }
+            conn.org.clone()
+        }
+        None => {
+            connections
+                .put_connection(&scarab_forge::ForgeConnection {
+                    id: conn_id.clone(),
+                    kind: scarab_forge::ForgeKind::GitHub,
+                    base_url: GITHUB_API_BASE.into(),
+                    // The App credential is shared across installations; the
+                    // composition root registers it under this handle.
+                    credential_ref: "github-app".into(),
+                    org: None,
+                    installation_id: Some(sync.installation_id),
+                    account_id: sync.account_id,
+                })
+                .await
+                .map_err(registry)?;
+            None
+        }
     };
-    if conn.org.is_none() {
-        let refusal = if is_reserved_org(account) {
-            Some(format!("`{account}` is a reserved org name"))
-        } else {
-            org_assign_refusal(connections, &conn, account).await?
+    if org.is_none() {
+        let account_id = sync.account_id;
+        let outcome = match org_name_problem(account) {
+            Some(problem) => Err(problem),
+            None => connections
+                .assign_connection_org(&conn_id, account, &|view| {
+                    delivery_assign_refusal(view, account, account_id)
+                })
+                .await
+                .map_err(registry)?,
         };
-        match refusal {
-            None => conn.org = Some(account.to_string()),
-            Some(reason) => tracing::warn!(
+        match outcome {
+            Ok(assigned) => org = assigned.org,
+            Err(reason) => tracing::warn!(
                 connection = %conn_id,
                 account = %account,
                 reason = %reason,
@@ -6840,8 +6861,6 @@ async fn register_installation(
             ),
         }
     }
-    let org = conn.org.clone();
-    connections.put_connection(&conn).await.map_err(registry)?;
     // Unassigned: the repos wait for a global admin, so nothing is homed in
     // an Org by name alone. Removals still apply.
     let sync = if org.is_some() {
@@ -6881,92 +6900,98 @@ async fn register_installation(
     ))
 }
 
-/// Why connection `conn` may **not** take Org `org` (git-bug 19b0a45), or
-/// `None` when it may. One rule for the installation delivery and for a
-/// global admin's `PUT /v1/connections/{id}/org`:
+/// Two connections reach the same forge: the same kind and API base URL.
+fn same_forge(a: &scarab_forge::ForgeConnection, b: &scarab_forge::ForgeConnection) -> bool {
+    a.kind == b.kind && a.base_url.trim_end_matches('/') == b.base_url.trim_end_matches('/')
+}
+
+/// The part of every Org assignment rule that is about the connection
+/// itself and the Org's other connections (git-bug 19b0a45):
 ///
-/// * every repo already bound through `conn` is owned by `org` and homed
-///   there: assigning a connection that holds another owner's Project would
-///   hand that Project to `org`'s admins;
-/// * an Org of that name that already exists is served only by connections
-///   to the same forge and host as `conn`, and by at least one: a forge
-///   account must not join, by name alone, an Org made for another forge,
-///   nor one whose connections are gone but whose secrets, members and
-///   policies remain.
-async fn org_assign_refusal(
-    connections: &dyn scarab_forge::ForgeConnectionStore,
-    conn: &scarab_forge::ForgeConnection,
-    org: &str,
-) -> Result<Option<String>, ApiError> {
-    let registry = |e: scarab_forge::RegistryError| ApiError::Db(DbError::Other(e.to_string()));
-    let own = connections.repos_of(&conn.id).await.map_err(registry)?;
-    for repo in &own {
-        let homed = connections
-            .resolve(repo)
-            .await
-            .map_err(registry)?
-            .map(|r| r.org);
-        if repo.owner != org || homed.as_deref().is_some_and(|h| h != org) {
-            return Ok(Some(format!(
-                "`{}/{}` is bound through connection `{}` and is not `{org}`'s; unbind it or \
-                 bind it through a connection of its own org first",
-                repo.owner, repo.name, conn.id
-            )));
-        }
-    }
-    let same_forge = |c: &scarab_forge::ForgeConnection| {
-        c.kind == conn.kind
-            && c.base_url.trim_end_matches('/') == conn.base_url.trim_end_matches('/')
-    };
-    // `conn`'s own bindings, all `org`'s by now, already show it serves it.
-    let mut served = !own.is_empty();
-    for c in connections.list_connections().await.map_err(registry)? {
-        if c.id == conn.id {
-            continue;
-        }
-        let serves = match c.org.as_deref() {
-            Some(o) => o == org,
-            // An unassigned connection serves the Org a repo of it is homed in.
-            None => {
-                let mut homed_here = false;
-                for repo in connections.repos_of(&c.id).await.map_err(registry)? {
-                    if let Some(r) = connections.resolve(&repo).await.map_err(registry)? {
-                        if r.org == org && r.connection.id == c.id {
-                            homed_here = true;
-                            break;
-                        }
-                    }
-                }
-                homed_here
-            }
-        };
-        if !serves {
-            continue;
-        }
-        if !same_forge(&c) {
-            return Ok(Some(format!(
-                "org `{org}` has connection `{}` to {}, another forge or host than {}; an \
-                 account of the same name there is not known to be the same account",
-                c.id, c.base_url, conn.base_url
-            )));
-        }
-        served = true;
-    }
-    if !served
-        && connections
-            .list_orgs()
-            .await
-            .map_err(registry)?
-            .iter()
-            .any(|o| o == org)
+/// * every repo already bound through it is owned by `org` and homed there:
+///   assigning a connection that holds another owner's Project would hand
+///   that Project to `org`'s admins;
+/// * no connection serving `org` reaches another forge or host: an account
+///   of the same name there is not known to be the same account.
+fn assign_base_refusal(view: &scarab_forge::OrgAssignView, org: &str) -> Option<String> {
+    let conn = &view.conn;
+    if let Some((repo, _)) = view
+        .bindings
+        .iter()
+        .find(|(repo, homed)| repo.owner != org || homed != org)
     {
-        return Ok(Some(format!(
+        return Some(format!(
+            "`{}/{}` is bound through connection `{}` and is not `{org}`'s; unbind it or \
+             bind it through a connection of its own org first",
+            repo.owner, repo.name, conn.id
+        ));
+    }
+    if let Some(other) = view.servers.iter().find(|c| !same_forge(c, conn)) {
+        return Some(format!(
+            "org `{org}` has connection `{}` to {}, another forge or host than {}; an \
+             account of the same name there is not known to be the same account",
+            other.id, other.base_url, conn.base_url
+        ));
+    }
+    None
+}
+
+/// Why a global admin may **not** assign `view.conn` to `org`
+/// (`PUT /v1/connections/{id}/org`), or `None` when they may: the base rule
+/// ([`assign_base_refusal`]), and an Org that already exists must be served
+/// by at least one connection (its bindings through this one count). An
+/// Org whose connections are gone but whose secrets, members and policies
+/// remain is not joined by name.
+fn admin_assign_refusal(view: &scarab_forge::OrgAssignView, org: &str) -> Option<String> {
+    if let Some(reason) = assign_base_refusal(view, org) {
+        return Some(reason);
+    }
+    let served = !view.bindings.is_empty() || !view.servers.is_empty();
+    if !served && view.org_exists {
+        return Some(format!(
             "org `{org}` exists but no connection serves it, so nothing shows that the \
              account `{org}` on {} is the same account",
-            conn.base_url
-        )));
+            view.conn.base_url
+        ));
     }
-    Ok(None)
+    None
+}
+
+/// Why an installation delivery for account `org` (immutable id
+/// `account_id`) may **not** assign `view.conn` to the Org of that name, or
+/// `None` when it may: the base rule ([`assign_base_refusal`]), and an Org
+/// that already exists is joined only when a connection already serving it
+/// reaches the same forge with the same account id. A login can be renamed
+/// and registered again by someone else; the id cannot. So an Org served
+/// only by connections whose account id is unknown or different, by
+/// another forge, or by none (its secrets, members or policies remain) is
+/// not joined; the connection stays unassigned for a global admin. This
+/// connection's own bindings prove nothing: an old re-sync could have put
+/// them there.
+fn delivery_assign_refusal(
+    view: &scarab_forge::OrgAssignView,
+    org: &str,
+    account_id: Option<u64>,
+) -> Option<String> {
+    if let Some(reason) = assign_base_refusal(view, org) {
+        return Some(reason);
+    }
+    if !view.org_exists && view.servers.is_empty() {
+        return None;
+    }
+    let proven = account_id.is_some()
+        && view.servers.iter().any(|c| {
+            c.org.as_deref() == Some(org) && same_forge(c, &view.conn) && c.account_id == account_id
+        });
+    if proven {
+        return None;
+    }
+    Some(format!(
+        "org `{org}` exists and no connection serving it is to {} with the same account id \
+         ({}), so nothing shows that this account `{org}` is the one the org was made for",
+        view.conn.base_url,
+        account_id.map_or_else(|| "unknown".to_string(), |id| id.to_string())
+    ))
 }
 
 /// Inbound GitHub webhook ingest (ADR-0010, 0032, 0046): verify the HMAC
@@ -7763,6 +7788,7 @@ async fn put_binding(
         },
         role: parse_role(&req.role)?,
     };
+    note_org(&st, binding.scope.org()).await?;
     rbac.grant(&binding, scarab_identity::BindingOrigin::Native)
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
@@ -8222,6 +8248,7 @@ async fn mint_api_token(
         last_used_at: None,
         revoked_at: None,
     };
+    note_org(&st, token.scope.org()).await?;
     store
         .put(&token, &scarab_identity::api_token_hash(&plaintext))
         .await
@@ -9406,6 +9433,7 @@ async fn put_secret(
     if req.name.is_empty() {
         return Err(ApiError::BadRequest("name is required".into()));
     }
+    note_org(&st, &req.org).await?;
     let scope = secret_scope(req.org, req.repo, req.environment)?;
     secrets
         .put(
@@ -10037,27 +10065,73 @@ async fn authorize_connection(
     Ok(conn)
 }
 
-/// An Org name a connection may serve (git-bug 19b0a45): non-empty, at
-/// most 100 characters, no `/` and no whitespace (it is a path segment of
-/// `/orgs/{org}/...` and must be able to match a forge owner), and not
-/// `_`-prefixed (Scarab's own).
-fn validate_org_name(org: &str) -> Result<(), ApiError> {
+/// First path segments of the web UI that an Org name would shadow:
+/// `/<org>/<repo>` is a Project's page, so an Org named like one of these
+/// could not reach its Projects (git-bug 19b0a45).
+pub const RESERVED_ORG_NAMES: &[&str] = &["settings", "orgs", "account", "security"];
+
+/// Why `org` cannot name an Org a connection serves, or `None` when it can
+/// (git-bug 19b0a45). One rule for the API and the `connections:` config.
+///
+/// Non-empty, at most 100 characters, no `/`, no whitespace and no control
+/// characters (it is a path segment of `/orgs/{org}/...` and must be able to
+/// match a forge owner), not `.` or `..` (a URL cannot address them), not
+/// `_`-prefixed (Scarab's own), and not one of [`RESERVED_ORG_NAMES`].
+pub fn org_name_problem(org: &str) -> Option<String> {
     if org.is_empty() {
-        return Err(ApiError::BadRequest(
-            "org is required: the org this connection serves".into(),
-        ));
+        return Some("org is required: the org this connection serves".into());
     }
     if org.chars().count() > 100 {
-        return Err(ApiError::BadRequest(
-            "an org name is at most 100 characters".into(),
-        ));
+        return Some("an org name is at most 100 characters".into());
     }
     if org.contains('/') || org.chars().any(char::is_whitespace) {
-        return Err(ApiError::BadRequest(format!(
+        return Some(format!(
             "`{org}` is not an org name: it may not contain `/` or spaces"
-        )));
+        ));
     }
-    refuse_reserved_org(org, "own a forge connection")
+    if org.chars().any(char::is_control) {
+        return Some("an org name may not contain control characters".into());
+    }
+    if org == "." || org == ".." {
+        return Some(format!(
+            "`{org}` is not an org name: a URL cannot address it"
+        ));
+    }
+    if is_reserved_org(org) {
+        return Some(format!(
+            "`{org}` is a reserved org name (`_`-prefixed names are Scarab's own)"
+        ));
+    }
+    if RESERVED_ORG_NAMES.contains(&org) {
+        return Some(format!(
+            "`{org}` is reserved: it is the first part of a Scarab web address, so its \
+             projects' pages could not be reached"
+        ));
+    }
+    None
+}
+
+/// Put `org` in the Org list before anything keyed by it is written
+/// (git-bug 19b0a45): every org-keyed write calls this first, so an Org
+/// exists as soon as anything in it does, and an installation of a
+/// same-named account does not join it by name. No registry wired = no Org
+/// list to keep.
+pub(crate) async fn note_org(st: &AppState, org: &str) -> Result<(), ApiError> {
+    if let Some(connections) = st.connections.as_ref() {
+        connections
+            .record_org(org)
+            .await
+            .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?;
+    }
+    Ok(())
+}
+
+/// [`org_name_problem`] as a 400.
+fn validate_org_name(org: &str) -> Result<(), ApiError> {
+    match org_name_problem(org) {
+        Some(problem) => Err(ApiError::BadRequest(problem)),
+        None => Ok(()),
+    }
 }
 
 /// The forge adapter for **one connection** (ADR-0060) — the port the onboarding
@@ -10741,6 +10815,7 @@ async fn create_connection(
             credential_ref: credential_ref.clone(),
             org: Some(org),
             installation_id: None,
+            account_id: None,
         })
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
@@ -10781,7 +10856,7 @@ pub struct ConnectionOrgDto {
     request_body = AssignConnectionOrgRequest,
     responses(
         (status = 200, body = ConnectionOrgDto),
-        (status = 400, description = "not an org name: empty, longer than 100 characters, containing `/` or spaces, or `_`-prefixed"),
+        (status = 400, description = "not an org name: empty, longer than 100 characters, containing `/`, spaces or control characters, `.` or `..`, `_`-prefixed, or one of the reserved names `settings`, `orgs`, `account`, `security`"),
         (status = 403, description = "requires a global admin"),
         (status = 404, description = "no such connection, or no registry wired"),
         (status = 409, description = "a bound repo is not the org's, the org is served by another forge or by no connection, or the connection is managed by configuration")
@@ -10807,18 +10882,17 @@ async fn assign_connection_org(
     let org = req.org.trim().to_string();
     validate_org_name(&org)?;
     if conn.org.as_deref() != Some(org.as_str()) {
-        if let Some(reason) = org_assign_refusal(connections.as_ref(), &conn, &org).await? {
+        // Decided and written under the store's hold on the connection and
+        // the Org, so a concurrent assign or bind cannot slip in between.
+        let outcome = connections
+            .assign_connection_org(&id, &org, &|view| admin_assign_refusal(view, &org))
+            .await
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        if let Err(reason) = outcome {
             return Err(ApiError::Conflict(format!(
                 "connection `{id}` cannot serve org `{org}`: {reason}"
             )));
         }
-        connections
-            .put_connection(&scarab_forge::ForgeConnection {
-                org: Some(org.clone()),
-                ..conn
-            })
-            .await
-            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     }
     Ok(Json(ConnectionOrgDto { id, org }))
 }
@@ -10860,7 +10934,7 @@ pub struct DeleteConnectionQuery {
         (status = 204, description = "connection deleted"),
         (status = 403, description = "requires Administer on the org"),
         (status = 404, description = "no such connection, or no registry wired"),
-        (status = 409, description = "the connection still has bound repos (Projects)")
+        (status = 409, description = "the connection still has bound repos (Projects), or holds a repo of another org")
     )
 )]
 async fn delete_connection(
@@ -10877,6 +10951,32 @@ async fn delete_connection(
         .repos_of(&id)
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    // A connection that serves an Org takes only that Org's Projects with
+    // it. A binding of another owner (left by an old re-sync, or by a
+    // config whose `org:` changed) is not its admins' to remove: unbinding
+    // it would delete another Org's Project (git-bug 19b0a45).
+    if let Some(org) = conn.org.as_deref() {
+        let mut foreign = Vec::new();
+        for repo in &bound {
+            let homed = connections
+                .resolve(repo)
+                .await
+                .map_err(|e| ApiError::BadRequest(e.to_string()))?
+                .map(|r| r.org);
+            if repo.owner != org || homed.as_deref().is_some_and(|h| h != org) {
+                foreign.push(format!("{}/{}", repo.owner, repo.name));
+            }
+        }
+        if !foreign.is_empty() {
+            return Err(ApiError::Conflict(format!(
+                "connection `{id}` serves org `{org}` but also holds {} of another org: {}. \
+                 It cannot be removed while it does. Move them first: their own org re-syncs \
+                 or adds them on its connection",
+                foreign.len(),
+                foreign.join(", ")
+            )));
+        }
+    }
     if !bound.is_empty() && !q.unbind_repos {
         let names: Vec<String> = bound
             .iter()
@@ -11081,16 +11181,19 @@ async fn bind_repo(
     // `bind_repo` upserts, so re-binding a repo owned by ANOTHER connection would
     // silently re-home a live Project onto a different forge account. A v1
     // `RepoRef` is globally unique across connections (ADR-0046), so this is a
-    // conflict, not a move — except off an unassigned connection, the one
-    // move the registry allows (git-bug 19b0a45), which is how a repo leaves
-    // a legacy connection for its own Org's. The registry checks the same
-    // rule in the write itself, so a concurrent bind is refused too.
+    // conflict, not a move — except off a connection that does not serve
+    // the repo's owner (unassigned, or another Org's), the one move the
+    // registry allows (git-bug 19b0a45), which is how a repo leaves a legacy
+    // connection for its own Org's. The registry checks the same rule in the
+    // write itself, so a concurrent bind is refused too.
     if let Some(existing) = connections
         .resolve(&repo)
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?
     {
-        if existing.connection.id != id && existing.connection.org.is_some() {
+        if existing.connection.id != id
+            && existing.connection.org.as_deref() == Some(repo.owner.as_str())
+        {
             return Err(ApiError::Conflict(format!(
                 "{}/{} is already bound to connection `{}`; unbind it there first",
                 repo.owner, repo.name, existing.connection.id

@@ -83,6 +83,7 @@ async fn serve_with(enforce: bool, extra: impl FnOnce(AppState) -> AppState) -> 
         credential_ref: "gh-token".into(),
         org: Some("acme".into()),
         installation_id: None,
+        account_id: None,
     })
     .await
     .unwrap();

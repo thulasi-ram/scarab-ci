@@ -53,6 +53,7 @@ async fn harness(bind: &[(&str, &str)]) -> Harness {
             credential_ref: "gh-token".into(),
             org: None,
             installation_id: None,
+            account_id: None,
         })
         .await
         .unwrap();

@@ -5415,7 +5415,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description the connection still has bound repos (Projects) */
+            /** @description the connection still has bound repos (Projects), or holds a repo of another org */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -5498,7 +5498,7 @@ export interface operations {
                     "application/json": components["schemas"]["ConnectionOrgDto"];
                 };
             };
-            /** @description not an org name: empty, longer than 100 characters, containing `/` or spaces, or `_`-prefixed */
+            /** @description not an org name: empty, longer than 100 characters, containing `/`, spaces or control characters, `.` or `..`, `_`-prefixed, or one of the reserved names `settings`, `orgs`, `account`, `security` */
             400: {
                 headers: {
                     [name: string]: unknown;

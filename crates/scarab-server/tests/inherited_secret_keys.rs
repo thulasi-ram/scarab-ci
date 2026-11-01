@@ -57,6 +57,7 @@ async fn app() -> axum::Router {
             credential_ref: "gh-token".into(),
             org: Some(org.into()),
             installation_id: None,
+            account_id: None,
         })
         .await
         .unwrap();
