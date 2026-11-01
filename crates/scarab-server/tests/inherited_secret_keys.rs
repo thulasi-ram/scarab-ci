@@ -47,17 +47,21 @@ async fn app() -> axum::Router {
         Arc::new(InMemoryObjectStore::new()),
         db.clone(),
     ));
-    db.put_connection(&ForgeConnection {
-        id: "gh".into(),
-        kind: ForgeKind::GitHub,
-        base_url: "https://api.github.com".into(),
-        credential_ref: "gh-token".into(),
-    })
-    .await
-    .unwrap();
+    // One connection per org: a connection binds only its own org's repos.
     for (org, repo) in [("acme", "web"), ("globex", "api")] {
+        let conn = format!("gh-{org}");
+        db.put_connection(&ForgeConnection {
+            id: conn.clone(),
+            kind: ForgeKind::GitHub,
+            base_url: "https://api.github.com".into(),
+            credential_ref: "gh-token".into(),
+            org: Some(org.into()),
+            installation_id: None,
+        })
+        .await
+        .unwrap();
         db.bind_repo(
-            "gh",
+            &conn,
             &RepoRef {
                 owner: org.into(),
                 name: repo.into(),
