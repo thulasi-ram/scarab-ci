@@ -9720,6 +9720,7 @@ mod tests {
             master_key_warnings: vec![],
             dev_insecure: false,
             step_timeout_secs: 3600,
+            project_run_cap: None,
             public_url: "http://localhost:8080".into(),
             github_app_id: None,
             github_app_pem: None,

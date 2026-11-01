@@ -138,8 +138,10 @@ record. Read Upgrading before you upgrade.
   server that stopped is failed after 10 minutes.
 - **Caches never saved or restored.** No Run created from a repository had the project the
   scheduler keys Caches by, so every Step's `cache:` was off. Runs now carry `<org>/<repo>`.
-  The per-project in-flight cap (20 Runs, ADR-0011) counts by the same value and now applies
-  too.
+  The per-project cap (ADR-0011) keys by the same value. It never applied before, and it
+  stays off unless you set it: `scarab.projectRunCap` (`SCARAB_PROJECT_RUN_CAP`) is the most
+  Runs of one repository that may be Running at once. A Run waiting on a gate is not
+  counted.
 - A dispatch parameter holding `${{ … }}` was evaluated as an expression (#49).
 - A deep or long CEL expression in a pushed Pipeline could overflow the stack and stop the
   server (#44).

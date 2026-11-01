@@ -65,6 +65,71 @@ async fn per_project_cap_holds() {
     tdb.cleanup().await;
 }
 
+/// No cap unless one is configured (SCARAB_PROJECT_RUN_CAP): every run of a
+/// busy project admits.
+#[tokio::test]
+async fn no_project_cap_by_default() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = PostgresDb::with_pool(tdb.pool.clone());
+    db.migrate().await.unwrap();
+    for (i, id) in ["a", "b", "c"].iter().enumerate() {
+        seed_run(&db, id, "proj", 0, i as i64 + 1).await;
+    }
+    let clock = FakeClock::new(1_000);
+    let exec = FakeExecutor::new();
+    let sched = Scheduler::new(&db, &clock, &exec, "sched-1");
+    admit_pass(&sched, &db).await;
+    for id in ["a", "b", "c"] {
+        assert_eq!(status(&db, id).await, RunStatus::Running, "{id} admits with no cap");
+    }
+    tdb.cleanup().await;
+}
+
+/// A run waiting on a gate (Suspended) holds no Pods and does not count toward
+/// the project cap: runs waiting for approval must not stop the project's
+/// other runs.
+#[tokio::test]
+async fn a_suspended_run_does_not_count_toward_the_project_cap() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = PostgresDb::with_pool(tdb.pool.clone());
+    db.migrate().await.unwrap();
+    seed_run(&db, "waiting", "proj", 0, 1).await;
+    seed_run(&db, "next", "proj", 0, 2).await;
+    let clock = FakeClock::new(1_000);
+    let exec = FakeExecutor::new();
+    let sched = Scheduler::new(&db, &clock, &exec, "sched-1").with_project_run_cap(1);
+    admit_pass(&sched, &db).await;
+    assert_eq!(status(&db, "waiting").await, RunStatus::Running);
+    assert_eq!(status(&db, "next").await, RunStatus::Pending, "the cap of 1 holds");
+    // The running run now waits on a gate.
+    db.commit_run_transition(
+        None,
+        &RunId("waiting".into()),
+        RunStatus::Running,
+        RunStatus::Suspended,
+        0,
+        &[],
+        &[],
+    )
+    .await
+    .unwrap();
+    // Admit only `next`: admitting the Suspended run here would reopen it,
+    // because this test gives it no real gate to wait on.
+    sched.admit(&RunId("next".into())).await.unwrap();
+    assert_eq!(
+        status(&db, "next").await,
+        RunStatus::Running,
+        "a Suspended run must not hold the project's slot"
+    );
+    tdb.cleanup().await;
+}
+
 /// The global in-flight cap holds across projects.
 #[tokio::test]
 async fn global_cap_holds() {

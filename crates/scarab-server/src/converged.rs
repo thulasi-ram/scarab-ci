@@ -35,6 +35,7 @@ pub async fn tick_once(
     owner: &str,
     visibility_ms: i64,
     step_timeout_ms: i64,
+    project_run_cap: Option<u32>,
     public_url: &str,
     supervision: &Supervision,
     health: &TickHealth,
@@ -50,7 +51,11 @@ pub async fn tick_once(
     // 6825830 for reconcile_services alone) come back here — the pure engine
     // does not log; the driver, which owns tracing, surfaces them without
     // aborting the tick.
-    let isolated = Scheduler::new(&**db, &**clock, &**executor, owner)
+    let mut scheduler = Scheduler::new(&**db, &**clock, &**executor, owner);
+    if let Some(cap) = project_run_cap {
+        scheduler = scheduler.with_project_run_cap(cap);
+    }
+    let isolated = scheduler
         // Cache-key resolution at launch (ADR-0065 s1) rides the same oracle
         // the rerun-widening legs use; `None` = the cache is silently off.
         .with_snapshots(snapshots.map(|s| &**s as &dyn WorkspaceSnapshots))
@@ -207,6 +212,7 @@ pub fn spawn_driver(
     interval: Duration,
     visibility_ms: i64,
     step_timeout_ms: i64,
+    project_run_cap: Option<u32>,
     public_url: String,
 ) -> tokio::task::JoinHandle<()> {
     // Claim-to-tail lease (ADR-0051): with 2+ replicas, only the fence's
@@ -234,6 +240,7 @@ pub fn spawn_driver(
                 &owner,
                 visibility_ms,
                 step_timeout_ms,
+                project_run_cap,
                 &public_url,
                 &supervision,
                 &health,

@@ -64,6 +64,10 @@ scarab:
   # Global default step deadline in seconds (ADR-0047). Empty => server
   # default (3600). Per-step `timeout:` always overrides.
   stepTimeoutSecs: ""
+  # The most Runs of one project (repository) that may be Running at once; the
+  # rest wait Pending and start in priority order as Runs finish (ADR-0011).
+  # A Run waiting on a gate is not counted. Empty or 0 => no cap (default).
+  projectRunCap: ""
   # In-flight object-store round-trips per workspace-CAS leg (ADR-0061 s2).
   # Empty => server default (32). The legs are latency-bound, so 32 is a FLOOR
   # for remote object storage — raise it the further away the bucket is. Lower it

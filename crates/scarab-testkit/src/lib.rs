@@ -1446,6 +1446,17 @@ impl Db for InMemoryDb {
         Ok(n as u32)
     }
 
+    async fn count_running_runs(&self, project: &str) -> Result<u32, DbError> {
+        let st = self.state.lock().unwrap();
+        let n = st
+            .runs
+            .iter()
+            .filter(|(_, s)| matches!(s, RunStatus::Running))
+            .filter(|(r, _)| st.run_project.get(*r).map(String::as_str) == Some(project))
+            .count();
+        Ok(n as u32)
+    }
+
     async fn set_step_gate(
         &self,
         run: &RunId,

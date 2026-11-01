@@ -770,6 +770,11 @@ pub trait Db: Send + Sync {
     /// (backpressure).
     async fn count_in_flight_runs(&self, project: Option<&str>) -> Result<u32, DbError>;
 
+    /// How many of `project`'s runs are `Running` (the per-project cap). A
+    /// `Suspended` run, waiting on a gate, holds no Pods and is not counted:
+    /// runs waiting for approval must not stop the project's other runs.
+    async fn count_running_runs(&self, project: &str) -> Result<u32, DbError>;
+
     /// Mark a step as a gate of `kind` (`manual`/`timer`/`external`) — a durable
     /// suspend point that launches no Pod (ADR-0008). For a `timer` gate,
     /// `timer_seconds` is the wait after which the run auto-releases; `None` for

@@ -2094,8 +2094,9 @@ struct Config {
     lease_ttl_ms: i64,
     outbox_batch: u32,
     outbox_visibility_ms: i64,
-    /// Max in-flight runs per project (fairness). Default 20 (ADR-0032).
-    project_run_cap: u32,
+    /// Max `Running` runs per project (fairness, ADR-0011). `None`, the
+    /// default, is no cap (`SCARAB_PROJECT_RUN_CAP`).
+    project_run_cap: Option<u32>,
     /// Max in-flight runs globally (backpressure). Default unbounded.
     global_run_cap: u32,
     /// The global default step deadline (ADR-0047), used when a step declares
@@ -2251,7 +2252,7 @@ impl<'a> Scheduler<'a> {
                 lease_ttl_ms: 30_000,
                 outbox_batch: 16,
                 outbox_visibility_ms: 30_000,
-                project_run_cap: 20,
+                project_run_cap: None,
                 global_run_cap: u32::MAX,
                 default_step_timeout_ms: 3_600_000,
                 service_ready_timeout_ms: 300_000,
@@ -2311,9 +2312,10 @@ impl<'a> Scheduler<'a> {
         self
     }
 
-    /// Override the per-project in-flight cap (fairness).
+    /// Cap how many of one project's runs may be `Running` at once (fairness,
+    /// ADR-0011); the rest wait `Pending`. Off by default.
     pub fn with_project_run_cap(mut self, cap: u32) -> Self {
-        self.cfg.project_run_cap = cap;
+        self.cfg.project_run_cap = Some(cap);
         self
     }
 
@@ -2590,9 +2592,11 @@ impl<'a> Scheduler<'a> {
             if self.db.count_in_flight_runs(None).await? >= self.cfg.global_run_cap {
                 return Ok(());
             }
-            if let Some(project) = self.db.run_project(run).await? {
-                if self.db.count_in_flight_runs(Some(&project)).await? >= self.cfg.project_run_cap {
-                    return Ok(());
+            if let Some(cap) = self.cfg.project_run_cap {
+                if let Some(project) = self.db.run_project(run).await? {
+                    if self.db.count_running_runs(&project).await? >= cap {
+                        return Ok(());
+                    }
                 }
             }
             if let Some((group, policy)) = self.db.run_concurrency(run).await? {

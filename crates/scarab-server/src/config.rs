@@ -47,6 +47,7 @@
 //! | `SCARAB_DEV_INSECURE` | env | `1`/`true`: downgrade the **security** hard-fails (KEK, auth) to loud boot warnings — dev only, never relaxes the Postgres requirement |
 //! | `SCARAB_STEP_UP` | env | step-up confirmation (ADR-0073). Unset/blank or `enforce` = **enforce** (production: crown-jewel operations need a passkey confirmation); any other value refuses boot — there is no `off` or `log` mode. Under `SCARAB_DEV_INSECURE=1` it is off unless explicitly `enforce` (local passkey testing). Enforce with OAuth login needs an `https` (or loopback) `SCARAB_PUBLIC_URL` |
 //! | `SCARAB_STEP_TIMEOUT_SECS` | env | global default step deadline (ADR-0047); default 3600 (1h), per-step overridable via `timeout:` |
+//! | `SCARAB_PROJECT_RUN_CAP` | env | how many of one project's Runs may be `Running` at once; the rest wait `Pending` (ADR-0011). Unset or `0` = no cap (default). A Run waiting on a gate is not counted |
 //! | `SCARAB_PUBLIC_URL` | env | Scarab's public base URL — the run deep-link every forge status carries (ADR-0046); default `http://localhost:8080` (dev) |
 //! | `SCARAB_PLACEMENT_CONFIG_FILE` | env | path to the operator placement config (ADR-0055): cluster baseline + PlacementProfile registry (YAML/JSON, gitops-managed); a bad path/parse is a boot failure |
 //! | `SCARAB_GITHUB_APP_ID` | env | GitHub App id (ADR-0046): when set, GitHub connections authenticate in **App mode** (their credential secret is the App PEM); absent = token mode (dev) |
@@ -585,6 +586,9 @@ pub struct Config {
     /// declares no `timeout:`. A default is mandatory — it closes the
     /// "hung Pod wedges the run forever" hole.
     pub step_timeout_secs: u32,
+    /// `SCARAB_PROJECT_RUN_CAP`: the most Runs of one project that may be
+    /// `Running` at once (ADR-0011). `None` (unset or `0`) = no cap.
+    pub project_run_cap: Option<u32>,
     /// Scarab's public base URL (ADR-0046): the run deep-link every forge
     /// status carries (`{public_url}/runs/{id}`). Dev default
     /// `http://localhost:8080`.
@@ -1258,6 +1262,13 @@ pub enum ConfigError {
     InvalidStepTimeout,
 
     #[error(
+        "SCARAB_PROJECT_RUN_CAP is set but invalid (got {0:?}) — want a non-negative \
+         integer: the most Runs of one project that may be Running at once (ADR-0011); \
+         0 or unset means no cap."
+    )]
+    InvalidProjectRunCap(String),
+
+    #[error(
         "{0} is set but invalid (got {1:?}) — want a non-negative integer: the wsfetch \
          helper resource axes (ticket 16a7768) are millicpu / MiB, applied requests==limits \
          to both helper containers of every workspace Step Pod; 0 opts the axis out."
@@ -1549,6 +1560,15 @@ impl Config {
             None => 3_600,
         };
 
+        let project_run_cap = match env("SCARAB_PROJECT_RUN_CAP").filter(|v| !v.trim().is_empty()) {
+            Some(v) => match v.trim().parse::<u32>() {
+                Ok(0) => None,
+                Ok(n) => Some(n),
+                Err(_) => return Err(ConfigError::InvalidProjectRunCap(v)),
+            },
+            None => None,
+        };
+
         // ADR-0061 s2's CAS-leg parallelism. Read here, not in the adapter: an
         // ambient env read there could neither fail the boot nor be reported.
         let cas_concurrency = match env(scarab_storage_s3::CAS_CONCURRENCY_ENV)
@@ -1686,6 +1706,7 @@ impl Config {
             master_key_warnings,
             dev_insecure,
             step_timeout_secs,
+            project_run_cap,
             public_url,
             github_app_id: env("SCARAB_GITHUB_APP_ID").filter(|v| !v.is_empty()),
             github_app_pem: env("SCARAB_GITHUB_APP_PEM").filter(|v| !v.is_empty()),
