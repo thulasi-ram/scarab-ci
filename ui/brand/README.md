@@ -17,10 +17,12 @@ fills / outline colors differ.
 
 ## Halftone mark
 
-A scarab drawn as a field of dots inside a hexagon. Dot size follows a light
-above the beetle: the wing cases carry the largest dots and the pronotum has a
-highlight. The head carries a pair of curved horns, and the six legs have a
-thick femur, a knee, a thinner spiny tibia and a small foot.
+A scarab drawn in dots, inside a pointy-top hexagon outlined by 72 hexagonal
+dots. Each ring dot is a small hexagon whose sides run parallel to the
+outline's sides. Dot size in the beetle follows a light above it: the wing
+cases carry the largest dots and the pronotum has a highlight. The head
+carries a pair of curved horns, and the six legs have a thick femur, a knee, a
+thinner spiny tibia and a small foot.
 
 | File | What it is |
 |------|-----------|
@@ -30,7 +32,7 @@ thick femur, a knee, a thinner spiny tibia and a small foot.
 | `icons/halftone/icon-{16..1024}.png` | transparent PNGs of the cream mark |
 | `icons/halftone-ink/icon-{16..1024}.png` | transparent PNGs of the ink mark |
 | `icons/halftone-tile/icon-{16..1024}.png` | opaque PNGs of the tile; use these for app icons (apple-touch 180, PWA 192 and 512) |
-| `favicon/halftone/favicon.svg` | the full mark with the hexagon dots, theme-aware: ink on light, cream on dark (75 KB) |
+| `favicon/halftone/favicon.svg` | the full mark with the ring, theme-aware: ink on light, cream on dark (60 KB) |
 | `favicon/halftone/favicon.ico`, `favicon-{16,32,48,64}.png` | emerald mark on a transparent background, for browsers that ignore the SVG; emerald reads on light and dark tabs (about 3.4:1 on white, 4.7:1 on `#202124`) |
 | `favicon/halftone/apple-touch-icon.png`, `icon-192.png`, `icon-512.png` | cream mark on a square `#0b0c0e` tile |
 
@@ -38,26 +40,28 @@ The ink mark is not the cream mark with the colour changed. The shading is
 inverted, so the lit wing cases get the smallest dots and the shaded pronotum
 gets the largest. A plain colour swap would draw the lit areas as the darkest.
 
-The favicon keeps the hexagon dots, all one size with no fade. At 24 px and
-up they show as a faint hexagon behind the beetle; at 16 px they are a haze.
-We measured the favicon with and without them and the contrast was the same
-(about 1.3:1 on white and 2:1 on a dark tab at 32 px).
+The ring replaces an earlier field of tiny dots. The beetle is scaled to about
+63% of its size in that version so its horns and hind feet sit inside the ring
+with a gap of about 2.4 units.
 
 Status and limits:
 
 - It sits beside the emblem. The docs logo and the web UI still use the
   emblem; nothing is rewired to this mark yet.
-- At 16 to 32 px the dots blur into a shaded beetle that keeps its horns and
-  legs. Its contrast there is lower than a solid mark's: measured as the mean
-  contrast of the mark against its background at 32 px, about 1.3:1 on white
-  and 2:1 on a dark tab, against 2.4:1 and 8.9:1 for a solid silhouette. A
-  version with larger dots, a narrower gutter and thicker legs measured about
-  1.9:1 and 5:1, and is not in the repo.
+- At 16 to 32 px the beetle blurs into a shaded shape that keeps its horns and
+  legs, and the ring shows as a faint dotted hexagon. Contrast there is low,
+  measured as the mean contrast of the mark against its background over the
+  whole mark, ring included: about 1.2:1 on white and 1.7:1 on a dark tab at
+  32 px. The earlier version without the ring measured 1.3:1 and 2:1; part of
+  the drop is the empty area inside the ring, and part is the smaller beetle.
+  A solid silhouette measures 2.4:1 and 8.9:1. A version with larger dots, a
+  narrower gutter and thicker legs measured about 1.9:1 and 5:1 and is not in
+  the repo.
 - The body proportions were measured on a dorsal photograph of *Scarabaeus
   sacer* (Wikimedia Commons, `Scarabaeus.sacer.jpg`). No pixels from the photo
   are in the files.
-- The figure is mirror-symmetric: every dot has a partner (checked in the
-  generator). The SVG has 931 circles.
+- The figure is mirror-symmetric: every dot has a partner (checked on the SVG).
+  The SVG has 629 circles and 72 hexagons.
 - The generator is a set of Python scripts that is not in this repo yet, so
   the SVG is the source for now.
 
