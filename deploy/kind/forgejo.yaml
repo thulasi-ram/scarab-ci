@@ -39,8 +39,12 @@ spec:
       containers:
         - name: forgejo
           # Pinned: the point of the tier is to say WHICH Forgejo the adapter
-          # was checked against. Multi-arch.
-          image: codeberg.org/forgejo/forgejo:16.0.1
+          # was checked against. Multi-arch. From data.forgejo.org, not
+          # codeberg.org: on 2026-11-01 codeberg's index for 16.0.1 listed an
+          # amd64 manifest (sha256:9c0c82b4...) its registry answered 404 for,
+          # so every amd64 pull (CI) failed; data.forgejo.org serves the same
+          # index with every platform.
+          image: data.forgejo.org/forgejo/forgejo:16.0.1
           env:
             - { name: USER_UID, value: "1000" }
             - { name: USER_GID, value: "1000" }

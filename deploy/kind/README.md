@@ -224,7 +224,7 @@ kubelet restarts the container in the same Pod.
 ## Forgejo
 
 Forgejo runs in every mode, like Postgres and MinIO, so the Forgejo adapter is
-checked against a real Forgejo (`codeberg.org/forgejo/forgejo:16.0.1`) and not
+checked against a real Forgejo (`data.forgejo.org/forgejo/forgejo:16.0.1`) and not
 only against the shapes we believed it sends (git-bug 3863d5e: a hook created
 with no `config.secret` shipped once). The server and step Pods reach it at
 `http://scarab-forgejo.scarab.svc.cluster.local:3000`; the tests through a
