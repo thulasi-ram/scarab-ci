@@ -879,7 +879,7 @@ const orgSecretNames = { names: ["GHCR_TOKEN", "SENTRY_DSN"] };
 // One healthy GitHub connection covering the acme repos (ADR-0060 part C).
 // Each connection serves one org (git-bug 19b0a45); `org: null` is unassigned
 // and listed to global admins only.
-const connections = [
+const connections: components["schemas"]["ConnectionDto"][] = [
   {
     id: "gh-acme",
     org: "acme",
@@ -1248,7 +1248,7 @@ function json(body: unknown, init?: ResponseInit) {
 // `method` matters where one path serves several verbs — minting a token POSTs
 // to the path the list GETs; an org Environment is GET/PUT/DELETE on one path —
 // so it is threaded through rather than having a route guess from the body.
-function route(pathname: string, search: string, method: string): Response | null {
+function route(pathname: string, search: string, method: string, body = ""): Response | null {
   const p = pathname;
   if (p === "/v1/me") return json(me);
   const lib = libraryRoute(p, method, json);
@@ -1504,12 +1504,41 @@ function route(pathname: string, search: string, method: string): Response | nul
   }
   if (p === "/v1/connections") {
     if (method === "POST") {
-      return json({ id: "forgejo-5be0d4a1", credential_ref: "forgejo-5be0d4a1-credential" }, { status: 201 });
+      // The new connection serves the org named in the body; a new org's
+      // first connection makes the caller (a global admin) its admin, as
+      // `/v1/me` reports on the next ask.
+      const req = JSON.parse(body || "{}") as { org?: string; base_url?: string };
+      const org = req.org ?? "acme";
+      const id = "forgejo-5be0d4a1";
+      connections.push({
+        id,
+        org,
+        kind: "forgejo",
+        base_url: req.base_url ?? "https://git.example.dev",
+        web_url: req.base_url ?? "https://git.example.dev",
+        credential_ref: `${id}-credential`,
+        credential_present: true,
+        last_delivery_at: null,
+        projects: [],
+        supports_resync: true,
+        supports_preflight: false,
+        managed_by_config: false,
+      });
+      if (!me.admin_orgs.includes(org)) me.admin_orgs = [...me.admin_orgs, org].sort();
+      return json({ id, credential_ref: `${id}-credential` }, { status: 201 });
     }
     // `?org=` lists one org's connections; without it, every org plus the
     // unassigned ones (the fixture caller is a global admin).
     const org = new URLSearchParams(search).get("org");
     return json(org ? connections.filter((c) => c.org === org) : connections);
+  }
+  if (method === "PUT" && (m = p.match(/^\/v1\/connections\/([^/]+)\/org$/))) {
+    const org = (JSON.parse(body || "{}") as { org?: string }).org ?? "";
+    const found = connections.find((c) => c.id === m![1]);
+    if (!found) return new Response("not found", { status: 404 });
+    found.org = org;
+    if (!me.admin_orgs.includes(org)) me.admin_orgs = [...me.admin_orgs, org].sort();
+    return json({ id: found.id, org });
   }
   if (method === "POST" && /^\/v1\/connections\/[^/]+\/resync$/.test(p)) {
     return json({ bound: [], confirmed: 3, skipped: ["globex/shared-ci"] });
@@ -1595,6 +1624,22 @@ function urlOf(input: RequestInfo | URL): string {
   return (input as Request).url;
 }
 
+/** The request body as text: from `init.body` when it is a string, else from
+ * the built `Request` openapi-fetch passes (a clone, so a real fetch can still
+ * send it). Empty when `read` is false or there is none. */
+async function bodyOf(input: RequestInfo | URL, init: RequestInit | undefined, read: boolean): Promise<string> {
+  if (!read) return "";
+  if (typeof init?.body === "string") return init.body;
+  if (typeof input !== "string" && !(input instanceof URL)) {
+    try {
+      return await (input as Request).clone().text();
+    } catch {
+      return "";
+    }
+  }
+  return "";
+}
+
 /** The verb, from wherever the caller put it: `openapi-fetch` passes a built
  * `Request`, hand-rolled calls pass `init.method`, a bare URL means GET. */
 function methodOf(input: RequestInfo | URL, init?: RequestInit): string {
@@ -1643,9 +1688,14 @@ export function installMock() {
     } catch {
       /* fall through to real fetch */
     }
-    const res = pathname ? route(pathname, search, methodOf(input, init)) : null;
-    if (res) return Promise.resolve(res);
-    return realFetch(input as RequestInfo, init);
+    if (!pathname) return realFetch(input as RequestInfo, init);
+    const method = methodOf(input, init);
+    // A body is read only for the writes the fixture records.
+    const reads = method === "POST" || method === "PUT";
+    return bodyOf(input, init, reads).then((body) => {
+      const res = route(pathname, search, method, body);
+      return res ?? realFetch(input as RequestInfo, init);
+    });
   }) as typeof window.fetch;
 
   // EventSource — step/service log streams. Replays fixture lines then idles.

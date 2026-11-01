@@ -46,7 +46,18 @@ export function resyncNote(r: { bound: string[]; confirmed: number; skipped?: st
       : `Already in sync: ${r.confirmed} ${repos(r.confirmed)} confirmed.`;
   const skipped = r.skipped ?? [];
   if (skipped.length === 0) return head;
-  return `${head} Not bound: ${skipped.join(", ")} (owned by another account, or bound through another organization's connection).`;
+  return `${head} Not bound: ${skipped.join(", ")} (owned by another account, or already bound through another connection).`;
+}
+
+/**
+ * The org an unassigned connection can be assigned to without a refusal: the
+ * one owner of every repository bound through it. Null when it has none
+ * bound (any org may be typed) or repositories of several owners (the server
+ * refuses every org until they are moved).
+ */
+export function soleOwner(projects: readonly RepoLike[]): string | null {
+  const owners = new Set(projects.map((p) => p.owner));
+  return owners.size === 1 ? [...owners][0]! : null;
 }
 
 /**

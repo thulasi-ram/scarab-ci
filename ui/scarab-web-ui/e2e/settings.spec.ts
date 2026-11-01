@@ -203,5 +203,32 @@ test("a global admin connects a forge for a new org and lands on its connections
   await page.locator("#conn-token").fill("x".repeat(24));
   await add.click();
   await expect(page).toHaveURL(/\/orgs\/globex\/settings\/connections$/);
+  // The page renders globex's connections, not the "You do not administer"
+  // panel: the new org reached `admin_orgs` on the next `/v1/me`.
+  const page_ = page.locator("section.page");
+  await expect(page_.getByText("forgejo-5be0d4a1", { exact: true })).toBeVisible();
+  await expect(page_.getByText("https://git.globex.dev", { exact: true })).toBeVisible();
+  await expect(page_.getByText(/You do not administer/)).toHaveCount(0);
+  expect(errors).toEqual([]);
+});
+
+test("a global admin assigns an unassigned connection to an org", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/orgs/acme/settings/connections");
+  const page_ = page.locator("section.page");
+  const unassigned = page_.locator(".panel", { hasText: "Unassigned connections" });
+  const row = unassigned.locator("li.conn", { hasText: "github-install-90211" });
+  // It binds nothing on a re-sync, so it offers none.
+  await expect(row.getByRole("button", { name: /Re-sync/ })).toHaveCount(0);
+  await row.getByRole("button", { name: "Assign to org" }).click();
+  const assign = row.getByRole("button", { name: "Assign", exact: true });
+  const field = row.getByRole("textbox", { name: "Organization to assign" });
+  await field.fill("a/b");
+  await expect(assign).toBeDisabled();
+  await field.fill("umbrella");
+  await expect(assign).toBeEnabled();
+  await assign.click();
+  // Assigned, it is no longer unassigned, so the panel goes.
+  await expect(unassigned).toHaveCount(0);
   expect(errors).toEqual([]);
 });

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { orgNameProblem, reposForOrg, resyncNote, unassignedConnections } from "./connections";
+import { orgNameProblem, reposForOrg, resyncNote, soleOwner, unassignedConnections } from "./connections";
 
 describe("unassigned connections", () => {
   it("keeps only the connections with no org", () => {
@@ -67,5 +67,16 @@ describe("new org name", () => {
     expect(orgNameProblem("_forge")).not.toBeNull();
     expect(orgNameProblem("acme/api")).not.toBeNull();
     expect(orgNameProblem("acme corp")).not.toBeNull();
+  });
+});
+
+describe("the org an unassigned connection can take", () => {
+  it("is the one owner of its repositories", () => {
+    expect(soleOwner([{ owner: "acme" }, { owner: "acme" }])).toBe("acme");
+  });
+
+  it("is none for repositories of several owners, or none bound", () => {
+    expect(soleOwner([{ owner: "acme" }, { owner: "globex" }])).toBeNull();
+    expect(soleOwner([])).toBeNull();
   });
 });

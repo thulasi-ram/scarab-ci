@@ -1594,6 +1594,22 @@ export async function deleteConnection(id: string, unbindRepos = false): Promise
   }
 }
 
+/**
+ * Assign a connection to an org (`PUT /v1/connections/{id}/org`), a global
+ * admin's act. The server answers 409, with the reason, when a repository
+ * bound through it is owned by another account, or when an org of that name
+ * is served by another forge or by no connection.
+ */
+export async function assignConnectionOrg(id: string, org: string): Promise<void> {
+  const { error, response } = await api.PUT("/v1/connections/{id}/org", {
+    params: { path: { id } },
+    body: { org },
+  });
+  if (error) {
+    throw new Error(errorText(error) || `could not assign the connection (${response.status})`);
+  }
+}
+
 // --- Repo binding = Project onboarding (ADR-0060 part C). There is no
 // `projects` table: a Project IS a `forge_repos` binding (ADR-0046), so these
 // calls are what bring a repo into existence as a governed Project. ---

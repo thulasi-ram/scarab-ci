@@ -30,6 +30,7 @@
 import { createResource, createSignal, For, Show } from "solid-js";
 import { useNavigate } from "@solidjs/router";
 import {
+  assignConnectionOrg,
   availableRepos,
   bindRepo,
   connectionPreflight,
@@ -42,7 +43,13 @@ import {
   type CapabilityRequirement,
   type Connection,
 } from "../api/client";
-import { orgNameProblem, reposForOrg, resyncNote, unassignedConnections } from "../connections";
+import {
+  orgNameProblem,
+  reposForOrg,
+  resyncNote,
+  soleOwner,
+  unassignedConnections,
+} from "../connections";
 import { relTime } from "../fmt";
 import { confirmsName } from "../org-environments";
 import { me, refetchMe } from "../session";
@@ -139,9 +146,11 @@ export default function Connections(props: { org: string }) {
             <p class="subtle">
               <small>
                 These connections serve no organization, so only global admins see them, here
-                on every organization's page. A GitHub connection takes its organization from the
-                App installation's account on its next re-sync. For any other, remove it and add
-                it again from its organization's Connections page.
+                on every organization's page. Assign one to the organization that owns its
+                repositories. If its repositories belong to more than one organization, give each
+                organization its own connection (for GitHub, install the App on that account; for
+                Forgejo, add one on its Connections page) and re-sync it there: the repositories
+                move to it with their projects. Then remove this one.
               </small>
             </p>
             <ul class="conn-list">
@@ -333,13 +342,14 @@ function ConnectionRow(props: { conn: Connection; onChanged: () => void }) {
   const [error, setError] = createSignal<string | null>(null);
   const [adding, setAdding] = createSignal(false);
   const [removing, setRemoving] = createSignal(false);
+  const [assigning, setAssigning] = createSignal(false);
 
   // Which connections accept in-product repo management. GitHub does not: its
   // repo selection lives on GitHub (the App's coverage decides it), so an add or
   // remove here would be undone by the next `installation_repositories`
   // delivery. Config-owned connections are read-only wherever they come from.
   // An unassigned connection serves no org, so there is no owner to bind
-  // repositories for: it offers re-sync and remove only.
+  // repositories for: it offers assign and remove only.
   const manual = () => c().kind !== "github" && !c().managed_by_config && c().org != null;
 
   const resync = async () => {
@@ -438,7 +448,18 @@ function ConnectionRow(props: { conn: Connection; onChanged: () => void }) {
             </a>
           )}
         </Show>
-        <Show when={c().supports_resync && !c().managed_by_config}>
+        <Show when={c().org == null && !c().managed_by_config}>
+          <button
+            class="btn btn-ghost btn-sm"
+            disabled={busy() || assigning()}
+            title="Choose the organization this connection serves"
+            onClick={() => setAssigning(true)}
+          >
+            Assign to org
+          </button>
+        </Show>
+        {/* An unassigned connection binds nothing on a re-sync, so it offers none. */}
+        <Show when={c().supports_resync && !c().managed_by_config && c().org != null}>
           <button
             class="btn btn-ghost btn-sm"
             disabled={busy()}
@@ -530,6 +551,18 @@ function ConnectionRow(props: { conn: Connection; onChanged: () => void }) {
         </div>
       </Show>
 
+      <Show when={assigning()}>
+        <AssignConnection
+          conn={c()}
+          onAssigned={(org) => {
+            setAssigning(false);
+            setNote(`Assigned to ${org}. It is listed on that organization's Connections page.`);
+            props.onChanged();
+          }}
+          onCancel={() => setAssigning(false)}
+        />
+      </Show>
+
       <Show when={removing()}>
         <RemoveConnection
           conn={c()}
@@ -603,6 +636,78 @@ function RemoveConnection(props: {
       <div class="modal-actions">
         <button class="btn btn-danger btn-sm" disabled={!ok()} onClick={() => props.onConfirm()}>
           {props.busy ? "Removing…" : "Remove connection"}
+        </button>
+        <button class="btn btn-ghost btn-sm" onClick={() => props.onCancel()}>
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Assign an unassigned connection to an org, for a global admin. The org is
+ * the account that owns the repositories bound through it, so the field
+ * starts with that owner when there is one. The server refuses an org that
+ * does not own every bound repository, or one served by another forge, and
+ * says why; the reason is shown as it comes.
+ */
+function AssignConnection(props: {
+  conn: Connection;
+  onAssigned: (org: string) => void;
+  onCancel: () => void;
+}) {
+  const [org, setOrg] = createSignal(soleOwner(props.conn.projects) ?? "");
+  const [saving, setSaving] = createSignal(false);
+  const [error, setError] = createSignal<string | null>(null);
+  const problem = () => orgNameProblem(org());
+  const save = async () => {
+    if (problem() != null || saving()) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const name = org().trim();
+      await assignConnectionOrg(props.conn.id, name);
+      props.onAssigned(name);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not assign the connection.");
+    } finally {
+      setSaving(false);
+    }
+  };
+  return (
+    <div class="typed-confirm">
+      <p>
+        Which organization does <span class="mono">{props.conn.id}</span> serve? Its admins then
+        manage it, and it binds only repositories that organization owns.
+      </p>
+      <label>
+        <span>organization</span>
+        <input
+          class="input mono"
+          aria-label="Organization to assign"
+          placeholder="acme"
+          value={org()}
+          onInput={(e) => setOrg(e.currentTarget.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") void save();
+          }}
+          autofocus
+        />
+      </label>
+      <Show when={org().trim() !== "" && problem()}>
+        <p class="fieldnote">{problem()}</p>
+      </Show>
+      <Show when={error()}>
+        <p class="error">{error()}</p>
+      </Show>
+      <div class="modal-actions">
+        <button
+          class="btn btn-primary btn-sm"
+          disabled={saving() || problem() != null}
+          onClick={() => void save()}
+        >
+          {saving() ? "Assigning…" : "Assign"}
         </button>
         <button class="btn btn-ghost btn-sm" onClick={() => props.onCancel()}>
           Cancel
