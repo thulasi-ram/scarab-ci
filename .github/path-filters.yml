@@ -5,9 +5,8 @@
 # WHY A SHARED FILE: `ci.yml` and `image.yml` both have to answer "did Rust
 # change?" and "did the UI change?". Two copies of that answer drift, and a
 # drifted filter is worse than no filter — it makes a real break invisible
-# instead of merely slow. `kind.yml` keeps its own inline `paths:` because it
-# filters at the WORKFLOW level (the whole workflow sits out), which is a
-# different mechanism with no job to read an output.
+# instead of merely slow. (A workflow-level `paths:` filter, where the whole
+# workflow sits out, is a different mechanism with no job to read an output.)
 #
 # THE RULE FOR EDITING THIS FILE: a filter must name every input the gated job
 # READS, not just the obvious one. If a job runs a script, the script is an

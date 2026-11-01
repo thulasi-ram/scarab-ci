@@ -1,28 +1,51 @@
-# Full-stack E2E, weekly + on-demand (test-strategy Phase 2): `just e2e`, the
-# same recipe a developer runs. It brings the kind release up in its e2e mode
-# (`deploy/kind/up.sh e2e`: cluster, Postgres, MinIO, the chart with a server
-# binary built here) and drives it with the env-gated `scarab-e2e` crate;
-# `crash_resume` SIGKILLs the server from the kind node. Deliberately NOT
-# per-PR: it is the slowest tier, and a red run is triaged as a real timing
-# bug (zero auto-retries).
+# Every live suite: `just e2e`, the recipe a developer runs (test-strategy
+# Phase 2, ADR-0077 Amendment 2026-11-01). It brings the kind release up in its
+# e2e mode (`deploy/kind/up.sh e2e`: cluster, Postgres, MinIO, Forgejo behind a
+# cloudflared quick tunnel, the chart with a server binary built here) and runs
+# the scarab-e2e crate, the Forgejo cases, the forge_token cases through the
+# tunnel, the executor's and the plugin runtime's cluster suites, and
+# crash_resume last. The tunnel makes network calls (accepted by the owner,
+# 2026-11-01).
 #
-# WEEKLY, not nightly, because Actions minutes are limited: it failed all 18
-# nightly runs of Oct 1-19 2026 (~74 billed minutes) on the same red
-# `crash_resume` case — a nightly repeat of a known failure buys no new signal.
-# Dispatch it by hand after a fix; restore nightly once it is green and stays so.
+# When it runs (Actions minutes are limited; the only PR controls are the
+# ci:skip and ci:full labels, README "CI labels on pull requests"):
+#   - a PR labelled ci:full (and not ci:skip): on every push, and when ci:full
+#     is added or ci:skip is removed;
+#   - weekly on main, as a safety net; and by hand (workflow_dispatch).
+# A PR without ci:full runs `ci.yml` only (the workspace suite, no cluster).
+# Pushes to main do not run it.
+#
+# Listed in `.github/required-checks.txt` as `required-if-run`: on a PR without
+# ci:full the job skips, which is correct. Zero auto-retries: a red run is a
+# real timing bug, not flake to mask.
 name: e2e
 
 on:
   schedule:
     - cron: "23 2 * * 1" # weekly, Mondays
   workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
 
+# One run per ref; a newer push cancels the one in flight. A run started by a
+# change to any label but ci:skip and ci:full gets a group of its own, so it
+# cannot cancel a real run.
 concurrency:
-  group: e2e-${{ github.ref }}
+  group: e2e-${{ github.ref }}${{ (github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ci:skip' && github.event.label.name != 'ci:full' && format('-label-{0}', github.run_id) || '' }}
   cancel-in-progress: true
 
 jobs:
   e2e:
+    # On a PR: only with ci:full and without ci:skip, and never for a change to
+    # another label. Removing ci:full skips (the label is gone).
+    if: >-
+      github.event_name != 'pull_request' || (
+        contains(github.event.pull_request.labels.*.name, 'ci:full') &&
+        !contains(github.event.pull_request.labels.*.name, 'ci:skip') && !(
+          (github.event.action == 'labeled' || github.event.action == 'unlabeled') &&
+          github.event.label.name != 'ci:skip' && github.event.label.name != 'ci:full'
+        )
+      )
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -31,7 +54,7 @@ jobs:
       # Debuginfo is the bulk of target/ and worthless in CI — without this the
       # workspace build exhausts the runner's disk (see ci.yml).
       CARGO_PROFILE_DEV_DEBUG: "0"
-      # No e2e case reads the web UI; building it would cost npm ci + a vite build.
+      # No case reads the web UI; building it would cost npm ci + a vite build.
       SCARAB_KIND_SKIP_UI: "1"
     steps:
       # ONLY WHEN SHORT. The cleanup is slow (deleting ~30 GB of small files: 1.5-4
@@ -54,16 +77,39 @@ jobs:
             sudo docker system prune -af >/dev/null 2>&1 || true
           fi
           df -h /
+      # The PR head, not the merge commit: up.sh points the release's library
+      # manifest at the checked-out commit, and the server fetches libs/ from
+      # github.com at that commit, so it must be one GitHub has on a branch.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest,just,cargo-zigbuild@0.24.0
-      # kind, Helm 4 and zig, pinned (see the action's header).
+      # kind, kubectl, Helm 4 and zig, pinned (see the action's header).
       - uses: ./.github/actions/kind-tools
-      # The one canonical entrypoint (CLAUDE.md): the release in e2e mode,
-      # the CLI build, the suite, crash_resume last; on a red run the recipe
-      # prints the server's log.
-      - name: Run the full-stack E2E suite
+      - name: just e2e
+        env:
+          # A SHA this event guarantees exists on the forge: the PR head, or
+          # the commit on main (the clone cases fetch it). The recipe's
+          # default, origin/main, is not in a shallow checkout.
+          SCARAB_TEST_CLONE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          # The clone cases fetch THIS repo: hand them the run's read-only
+          # token (delivered via tmpfs + GIT_ASKPASS).
+          SCARAB_TEST_CLONE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: just e2e
+      - name: Cluster diagnostics (on failure)
+        if: failure()
+        run: |
+          k=deploy/kind/kubectl.sh
+          bash $k get pods -A -o wide || true
+          bash $k get events -A --sort-by=.lastTimestamp | tail -50 || true
+          bash $k describe pods -n scarab-kube-tests | tail -200 || true
+          # A 401 from a Step, or a warm-tier warning, lands in the Depot's
+          # log and nowhere else: it is a second process.
+          echo "---- Depot log ----"
+          bash $k logs -n scarab statefulset/scarab-workspace --tail 200 || true
+          echo "---- Forgejo log ----"
+          bash $k logs -n scarab deploy/scarab-forgejo --tail 100 || true

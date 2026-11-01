@@ -164,7 +164,7 @@ def main(argv):
         ref = f"{workflow}/{job}"
         # "It did not run" arrives in two shapes and they mean the same thing.
         # A workflow-level `paths:` filter makes the check ABSENT (bucket None,
-        # as `kind/cluster-tests` is on an unrelated PR); a job-level
+        # as a path-filtered workflow's check is on an unrelated PR); a job-level
         # `if: needs.changes.outputs.… == 'true'` makes it SKIPPED. Only the
         # tier decides whether that is acceptable — never the mechanism. This
         # used to let `skipping` pass at ANY tier, so a required check that was
