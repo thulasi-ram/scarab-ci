@@ -4,10 +4,13 @@
 //! from its **home** replica; this shows whether that happens under the
 //! scenario's fault.
 //!
-//! It is informational. A Cache miss is correct by design (ADR-0065: a Cache
-//! is warm-only and may be evicted; ADR-0077: the checker treats a miss as
-//! correct), so nothing here can fail a verdict. The probe's Runs are not
-//! scenario Runs: the invariants and their minimums do not count them.
+//! A Cache miss is correct by design in general (ADR-0065: a Cache is
+//! warm-only and may be evicted), so the probe checks one narrow case,
+//! invariant **C1** ([`c1`]): when the seed Run succeeded (it saved the Cache
+//! to its home before the workload started) and no fault hit that home
+//! replica, the probe's restore is a hit from the home. In every other case
+//! C1 is not exercised and says why. The probe's Runs are not scenario Runs:
+//! the other invariants and their minimums do not count them.
 //!
 //! A Cache needs a Project: the scheduler keys cache rows by the Run's project
 //! and leaves the Cache off for an untenanted Run, and the inline
@@ -35,6 +38,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::env::{Api, TERMINAL_RUN_STATUSES};
 
+/// The env var the executor sets on a cached Step's containers to the Cache's
+/// home replica (`workspace_token::WORKSPACE_CACHE_URL_ENV` in
+/// scarab-executor-k8s, which this crate does not link).
+pub const CACHE_URL_ENV: &str = "SCARAB_WORKSPACE_CACHE_URL";
+
 /// The Forgejo repo the probe's pipeline lives in.
 pub const REPO: &str = "chaos-cache";
 /// The pipeline's name (`.scarab/<name>.yaml`).
@@ -48,8 +56,8 @@ pub const CACHE_DIR: &str = "deps";
 pub const SEED_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// The in-cluster Forgejo, as `deploy/kind/chaos.sh` exports it from
-/// `deploy/kind/.state/forgejo.env`.
-#[derive(Debug, Clone)]
+/// `deploy/kind/.state/forgejo.env`. `Debug` leaves the token out.
+#[derive(Clone)]
 pub struct Forgejo {
     /// The host's port-forward to Forgejo (`SCARAB_CHAOS_FORGEJO_URL`).
     pub url: String,
@@ -58,6 +66,17 @@ pub struct Forgejo {
     pub server_url: String,
     pub token: String,
     pub owner: String,
+}
+
+impl std::fmt::Debug for Forgejo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Forgejo")
+            .field("url", &self.url)
+            .field("server_url", &self.server_url)
+            .field("token", &"<redacted>")
+            .field("owner", &self.owner)
+            .finish()
+    }
 }
 
 impl Forgejo {
@@ -104,6 +123,11 @@ pub struct CacheProbe {
     /// What each cached Step's fetcher said about its Cache.
     #[serde(default)]
     pub restores: Vec<Restore>,
+    /// The Cache home URL the executor gave the cached Step's Pods
+    /// ([`CACHE_URL_ENV`] in their spec). Seed and probe share a key, so
+    /// they share it. `None` at one Depot replica, or when no Pod was read.
+    #[serde(default)]
+    pub home_url: Option<String>,
     /// The Runs that last saved a `cache_entries` row of the probe (the row
     /// is an upsert, so a probe that saved hides the seed's save).
     #[serde(default)]
@@ -120,8 +144,9 @@ pub struct Restore {
     pub role: String,
     pub run: String,
     pub pod: String,
-    /// `hit`, `miss`, `skipped`, or `none` (no restore was offered: the key
-    /// had no Cache, or the lookup failed).
+    /// `hit`, `miss`, `skipped`, `none` (no restore was offered: the key
+    /// had no Cache, or the lookup failed), or `unread` (the fetcher's log
+    /// could not be read).
     pub outcome: String,
     #[serde(default)]
     pub dir: Option<String>,
@@ -252,14 +277,18 @@ pub fn summary_lines(p: &CacheProbe, fault_pods: &[String]) -> Vec<String> {
     if let Some(why) = &p.skipped {
         out.push(format!("cache probe skipped: {why}"));
     }
-    let restored: Vec<&Restore> = p.restores.iter().filter(|r| r.outcome != "none").collect();
+    let restored: Vec<&Restore> = p
+        .restores
+        .iter()
+        .filter(|r| r.outcome != "none" && r.outcome != "unread")
+        .collect();
     let hits = restored.iter().filter(|r| r.outcome == "hit").count();
     let misses = restored.iter().filter(|r| r.outcome == "miss").count();
     let from_home = restored.iter().filter(|r| r.home_ordinal.is_some()).count();
     if p.seed_run.is_some() || p.probe_run.is_some() {
         out.push(format!(
-            "cache (informational; a miss is correct by design): {hits} hit(s), {misses} miss(es), \
-             {from_home} restore(s) from a home replica"
+            "cache: {hits} hit(s), {misses} miss(es), {from_home} restore(s) from a home replica \
+             (C1 above judges the probe's)"
         ));
     }
     for (role, run, status) in [
@@ -278,6 +307,7 @@ pub fn summary_lines(p: &CacheProbe, fault_pods: &[String]) -> Vec<String> {
         for r in mine {
             line += &match r.outcome.as_str() {
                 "none" => ": no restore offered (no Cache for the key)".to_string(),
+                "unread" => ": the fetcher's log could not be read".to_string(),
                 o => format!(
                     ": {o} dir={} from {}{}",
                     r.dir.as_deref().unwrap_or("?"),
@@ -308,6 +338,85 @@ pub fn summary_lines(p: &CacheProbe, fault_pods: &[String]) -> Vec<String> {
 
 fn home_ordinal_of_pod(pod: &str) -> Option<u32> {
     pod.rsplit_once("-workspace-")?.1.parse().ok()
+}
+
+/// What [`c1`] concluded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum C1 {
+    /// Checked; `Err` holds the finding's detail.
+    Checked(Result<(), String>),
+    /// Not exercised, and why.
+    NotExercised(String),
+}
+
+/// Invariant C1: when the seed Run succeeded and no fault hit the Cache's
+/// home replica, every restore of the probe Run is a hit from that home.
+///
+/// The home is [`CacheProbe::home_url`], else the home a probe restore
+/// names. A `pause-node` fault stops the whole kind node, every replica
+/// with it, so it always hits the home. Not exercised: no seed success, no
+/// probe Run, no home (one Depot replica), a fault on the home, a fetcher
+/// log that could not be read, or no probe Pod seen.
+pub fn c1(p: &CacheProbe, faults: &[crate::scenario::Fault]) -> C1 {
+    let not = |why: String| C1::NotExercised(why);
+    if let Some(why) = &p.skipped {
+        return not(format!("the probe did not run to the end: {why}"));
+    }
+    if p.seed_status.as_deref() != Some("succeeded") {
+        return not(format!(
+            "the seed Run did not succeed ({})",
+            p.seed_status.as_deref().unwrap_or("no status")
+        ));
+    }
+    let Some(probe_run) = &p.probe_run else {
+        return not("no probe Run was dispatched".into());
+    };
+    let probe: Vec<&Restore> = p.restores.iter().filter(|r| &r.run == probe_run).collect();
+    let home = p
+        .home_url
+        .as_deref()
+        .and_then(home_ordinal)
+        .or_else(|| probe.iter().find_map(|r| r.home_ordinal));
+    let Some(home) = home else {
+        return not("the probe's Pods name no Cache home (one Depot replica?)".into());
+    };
+    if let Some(f) = faults
+        .iter()
+        .find(|f| f.action == "pause-node" || home_ordinal_of_pod(&f.pod) == Some(home))
+    {
+        return not(format!(
+            "the fault ({} {}) hit the Cache's home replica {home}",
+            f.action, f.pod
+        ));
+    }
+    if probe.is_empty() {
+        return not(format!("no Pod of the probe Run {probe_run} was read"));
+    }
+    if probe.iter().any(|r| r.outcome == "unread") {
+        return not("a probe Pod's fetcher log could not be read".into());
+    }
+    let wrong: Vec<String> = probe
+        .iter()
+        .filter(|r| !(r.outcome == "hit" && r.home_ordinal == Some(home)))
+        .map(|r| {
+            format!(
+                "pod {} restore {} from {}",
+                if r.pod.is_empty() { "?" } else { &r.pod },
+                r.outcome,
+                r.from.as_deref().unwrap_or("nowhere")
+            )
+        })
+        .collect();
+    if wrong.is_empty() {
+        C1::Checked(Ok(()))
+    } else {
+        C1::Checked(Err(format!(
+            "the seed Run {} saved the Cache to home replica {home} and no fault hit it, \
+             but the probe Run {probe_run} did not restore it from there: {}",
+            p.seed_run.as_deref().unwrap_or("?"),
+            wrong.join("; ")
+        )))
+    }
 }
 
 // --- the live half ------------------------------------------------------------------
@@ -482,6 +591,9 @@ pub async fn observe(api: &Api, pods: &KubeApi<Pod>, pg: &sqlx::PgPool, p: &mut 
             }
         };
         for pod in list {
+            if p.home_url.is_none() {
+                p.home_url = pod_cache_url(&pod);
+            }
             let name = pod.metadata.name.unwrap_or_default();
             let log = pods
                 .logs(
@@ -491,9 +603,15 @@ pub async fn observe(api: &Api, pods: &KubeApi<Pod>, pg: &sqlx::PgPool, p: &mut 
                         ..Default::default()
                     },
                 )
-                .await
-                .unwrap_or_else(|e| format!("could not read the fetcher's log: {e}\n"));
-            let mut seen = parse_restores(&log);
+                .await;
+            let mut seen = match &log {
+                Ok(log) => parse_restores(log),
+                Err(e) => vec![Restore {
+                    outcome: "unread".into(),
+                    line: Some(format!("could not read the fetcher's log: {e}")),
+                    ..Default::default()
+                }],
+            };
             if seen.is_empty() {
                 seen.push(Restore {
                     outcome: "none".into(),
@@ -519,6 +637,18 @@ pub async fn observe(api: &Api, pods: &KubeApi<Pod>, pg: &sqlx::PgPool, p: &mut 
         .await
         .unwrap_or_default();
     }
+}
+
+/// [`CACHE_URL_ENV`] from any container of `pod`.
+fn pod_cache_url(pod: &Pod) -> Option<String> {
+    let spec = pod.spec.as_ref()?;
+    spec.init_containers
+        .iter()
+        .flatten()
+        .chain(&spec.containers)
+        .flat_map(|c| c.env.iter().flatten())
+        .find(|e| e.name == CACHE_URL_ENV)
+        .and_then(|e| e.value.clone())
 }
 
 #[cfg(test)]
@@ -638,5 +768,103 @@ scarab-wsfetch: cache restore skipped (source wins) dir=deps — the workspace a
             summary_lines(&skipped, &[]),
             vec!["cache probe skipped: SCARAB_CHAOS_FORGEJO_URL is not set".to_string()]
         );
+    }
+
+    /// A probe as `observe` records it: the seed saved, the probe restored
+    /// `outcome` from `from`, the Pods' home is replica 1.
+    fn recorded(outcome: &str, from: &str) -> CacheProbe {
+        let restore = |role: &str, run: &str, outcome: &str, from: Option<&str>| Restore {
+            role: role.into(),
+            run: run.into(),
+            pod: format!("{run}-cached"),
+            outcome: outcome.into(),
+            dir: Some("deps".into()),
+            home_ordinal: from.and_then(home_ordinal),
+            from: from.map(String::from),
+            ..Default::default()
+        };
+        CacheProbe {
+            seed_run: Some("r-seed".into()),
+            seed_status: Some("succeeded".into()),
+            probe_run: Some("r-probe".into()),
+            probe_status: Some("succeeded".into()),
+            home_url: Some("http://scarab-workspace-1.scarab.svc:8080".into()),
+            restores: vec![
+                restore("seed", "r-seed", "none", None),
+                restore("probe", "r-probe", outcome, Some(from)),
+            ],
+            ..Default::default()
+        }
+    }
+
+    fn fault(action: &str, pod: &str) -> crate::scenario::Fault {
+        crate::scenario::Fault {
+            action: action.into(),
+            pod: pod.into(),
+            ..Default::default()
+        }
+    }
+
+    /// C1's checked side: the home was not hit, so a hit from it passes and a
+    /// miss (or a restore from another replica) fails. A recorded delete of
+    /// the OTHER replica, or a server kill, leaves the home untouched.
+    #[test]
+    fn c1_fails_a_probe_that_did_not_restore_from_an_unfaulted_home() {
+        let home = "http://scarab-workspace-1.scarab.svc:8080";
+        let other_replica = [fault("delete-pod", "scarab-workspace-0")];
+        let server = [fault("kill-server", "scarab-7d9f-abcde")];
+        assert_eq!(c1(&recorded("hit", home), &other_replica), C1::Checked(Ok(())));
+        assert_eq!(c1(&recorded("hit", home), &server), C1::Checked(Ok(())));
+        assert_eq!(c1(&recorded("hit", home), &[]), C1::Checked(Ok(())));
+
+        let miss = c1(&recorded("miss", home), &other_replica);
+        assert!(
+            matches!(&miss, C1::Checked(Err(d)) if d.contains("home replica 1") && d.contains("restore miss")),
+            "{miss:?}"
+        );
+        let elsewhere = c1(&recorded("hit", "http://scarab-workspace-0.scarab.svc:8080"), &[]);
+        assert!(matches!(elsewhere, C1::Checked(Err(_))), "{elsewhere:?}");
+        let none = c1(&recorded("none", home), &[]);
+        assert!(matches!(none, C1::Checked(Err(_))), "no restore offered after a saved seed: {none:?}");
+    }
+
+    /// C1's not-exercised side: a failed seed, a fault on the home (a Pod
+    /// delete of it, or a node pause, which stops every replica), one Depot
+    /// replica (no home), or an unread fetcher log.
+    #[test]
+    fn c1_is_not_exercised_when_the_home_was_hit_or_the_seed_failed() {
+        let home = "http://scarab-workspace-1.scarab.svc:8080";
+        let ne = |r: C1| matches!(r, C1::NotExercised(_));
+        assert!(ne(c1(&recorded("miss", home), &[fault("delete-pod", "scarab-workspace-1")])));
+        assert!(ne(c1(&recorded("miss", home), &[fault("pause-node", "scarab-dev-control-plane")])));
+
+        let mut seed_failed = recorded("miss", home);
+        seed_failed.seed_status = Some("failed".into());
+        assert!(ne(c1(&seed_failed, &[])));
+
+        let mut one_replica = recorded("miss", "http://scarab-workspace.scarab.svc:8080");
+        one_replica.home_url = None;
+        assert!(ne(c1(&one_replica, &[])));
+
+        let mut unread = recorded("hit", home);
+        unread.restores[1].outcome = "unread".into();
+        assert!(ne(c1(&unread, &[])));
+
+        let mut no_probe = recorded("hit", home);
+        no_probe.probe_run = None;
+        assert!(ne(c1(&no_probe, &[])));
+    }
+
+    /// The token stays out of `Debug` output.
+    #[test]
+    fn forgejo_debug_redacts_the_token() {
+        let fj = Forgejo {
+            url: "http://127.0.0.1:3000".into(),
+            server_url: "http://forgejo".into(),
+            token: "s3cr3t-token".into(),
+            owner: "scarab".into(),
+        };
+        let shown = format!("{fj:?}");
+        assert!(!shown.contains("s3cr3t-token") && shown.contains("<redacted>"), "{shown}");
     }
 }

@@ -394,7 +394,7 @@ pub struct Scenario {
     /// When every Run was terminal, or the bound ran out.
     pub quiesced_at_ms: Option<i64>,
     pub notes: Vec<String>,
-    /// The Cache probe (`crate::cache`): informational, its Runs are not in
+    /// The Cache probe (`crate::cache`, invariant C1): its Runs are not in
     /// `runs`. `None` in a file written before it existed; a replay of such a
     /// file runs no probe.
     #[serde(default)]

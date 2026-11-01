@@ -25,6 +25,7 @@
 //! | W1   | the workload's own outcome: every scenario Run that ended, ended `succeeded`, and every green Attempt has an output snapshot |
 //! | N1   | `pause-node` (git-bug 070d042): no Attempt of a scenario Run finished with a lost-node verdict ("workspace snapshot lost", "egress sidecar died"); the node was paused, not lost. Any other failed Attempt is a warning |
 //! | D1   | `two-replicas` (git-bug 068cc0b): no release log line about a scenario Pod says "drain helper exited 12 with no record posted". With no fault, that line means a second replica drove the same drain |
+//! | C1   | the Cache probe (`crate::cache::c1`, git-bug 12e2f6b): when the seed Run succeeded and no fault hit the Cache's home replica, every restore of the probe Run is a hit from that home. Otherwise not exercised, with the reason as an info finding; it has no minimum |
 //!
 //! W1 is not one of ADR-0077 §2's invariants. As written there, I3 accepts a
 //! dead-lettered Run and I4 passes a green Attempt whose snapshot is NULL, so
@@ -130,7 +131,8 @@ pub struct Verdict {
     /// closure and the bytes read from the bucket and hashed.
     pub snapshots: Vec<SnapshotSummary>,
     /// The Cache probe's lines (`crate::cache::summary_lines`), set by the
-    /// caller from the scenario file. Informational: no outcome reads them.
+    /// caller from the scenario file. No outcome reads them; C1 is judged
+    /// in `evaluate`.
     #[serde(default)]
     pub cache: Vec<String>,
 }
@@ -243,6 +245,9 @@ pub struct Facts {
     /// lines that name a scenario Pod, each prefixed with its Pod. `None`
     /// when the file was not written. D1 reads it.
     pub release_log: Option<String>,
+    /// The Cache probe as recorded (scenario.json). C1 reads it; `None`
+    /// skips C1.
+    pub cache: Option<crate::cache::CacheProbe>,
 }
 
 /// The causes the executor gives when it judges a node lost while the step's
@@ -1003,6 +1008,27 @@ pub fn evaluate(f: &Facts) -> Verdict {
         }
     }
 
+    // C1: the Cache probe. Not exercised is not inconclusive: the probe is
+    // beside the scenario, not what it names.
+    if let Some(probe) = &f.cache {
+        match crate::cache::c1(probe, &f.faults) {
+            crate::cache::C1::Checked(r) => {
+                checked.insert("C1".into(), 1);
+                if let Err(detail) = r {
+                    findings.push(Finding { invariant: "C1".into(), severity: Severity::Fail, detail });
+                }
+            }
+            crate::cache::C1::NotExercised(why) => {
+                checked.insert("C1".into(), 0);
+                findings.push(Finding {
+                    invariant: "C1".into(),
+                    severity: Severity::Info,
+                    detail: format!("not exercised: {why}"),
+                });
+            }
+        }
+    }
+
     let inconclusive = match f.kind {
         Some(kind) => {
             let mut why = exercised(kind, &f.faults);
@@ -1085,6 +1111,7 @@ pub async fn gather(src: &Sources<'_>, scenario: &Scenario, pod_records: Vec<Pod
         kind: Some(scenario.kind),
         faults: scenario.faults.clone(),
         expected_runs: scenario.workload.runs as usize,
+        cache: scenario.cache.clone(),
         ..Default::default()
     };
 

@@ -77,7 +77,8 @@ pub async fn run(stack: &Stack, mut scenario: Scenario, dir: &Path) -> Result<Sc
 
     // The Cache probe's seed Run (`crate::cache`), before the workload and
     // waited for, so the probe Run below has a Cache to restore. A probe that
-    // cannot run is a note, never a harness failure: it is informational.
+    // cannot run is a note, never a harness failure: C1 is then reported as
+    // not exercised.
     if let Some(probe) = scenario.cache.as_mut() {
         let salt = format!("{}-{}-{}", scenario.kind.as_str(), scenario.seed, now_ms());
         let seeded = match crate::cache::Forgejo::from_env() {
