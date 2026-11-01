@@ -17,7 +17,8 @@ CI runs the same recipes: `ci.yml` runs the workspace suite on every PR, and
 
 `just` lists every recipe. The Justfile holds the small ones; the modules
 `just/stack.just`, `just/test.just` and `just/check.just` hold the rest, each
-recipe with its notes beside it.
+recipe with its notes beside it. The modules need just 1.43.0 or later (see the
+Justfile header).
 
 | Task | Recipe | What it is |
 |------|--------|-----------|

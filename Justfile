@@ -8,6 +8,10 @@
 #
 # Requires: docker, kind, kubectl, helm, cargo (+ cargo-zigbuild and zig on
 # macOS), and python3 for the demo.
+#
+# Requires just 1.43.0 or later: the modules use the `[default]` attribute
+# (added in 1.43.0) and `set working-directory` (added in 1.33.0). An older
+# just fails to parse just/*.just.
 
 [private]
 [doc('List every recipe, modules included')]
