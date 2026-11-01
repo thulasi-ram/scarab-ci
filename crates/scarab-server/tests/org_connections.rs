@@ -511,27 +511,213 @@ async fn resync_never_binds_or_moves_another_orgs_repo() {
     }
 }
 
-/// An unassigned installation connection takes the installation's account
-/// as its Org on the first re-sync, and then binds only that account's repos.
+/// No read and no re-sync assigns an unassigned connection, and a re-sync
+/// through one binds nothing: its repos would be homed by owner name alone,
+/// which is how a GitHub account joins a same-named Org of another forge
+/// (D7). A global admin assigns it first (`PUT .../org`).
 #[tokio::test]
-async fn an_unassigned_installation_takes_its_accounts_org_on_resync() {
-    let h = harness(
-        FakeForge::new()
-            .with_account("umbrella")
-            .with_accessible_repos(&[("umbrella", "app"), ("initech", "tps")]),
+async fn an_unassigned_connection_is_not_assigned_or_bound_by_a_read_or_a_resync() {
+    let h =
+        harness(FakeForge::new().with_accessible_repos(&[("umbrella", "app"), ("acme", "new")]))
+            .await;
+    let root = login(&h.app, "root-code").await;
+
+    let (st, b) = call(
+        &h,
+        "GET",
+        "/v1/connections/gh-legacy/available-repos",
+        &root,
+        None,
     )
     .await;
-    let root = login(&h.app, "root-code").await;
+    assert_eq!(st, StatusCode::OK, "{b}");
     let (st, b) = call(&h, "POST", "/v1/connections/gh-legacy/resync", &root, None).await;
     assert_eq!(st, StatusCode::OK, "{b}");
-    assert_eq!(b["bound"], serde_json::json!(["umbrella/app"]));
-    assert_eq!(b["skipped"], serde_json::json!(["initech/tps"]));
-    let c = h.db.get_connection("gh-legacy").await.unwrap().unwrap();
-    assert_eq!(c.org.as_deref(), Some("umbrella"));
-    assert!(h
-        .db
-        .resolve(&repo("initech", "tps"))
-        .await
+    assert_eq!(b["bound"], serde_json::json!([]));
+    let mut skipped: Vec<&str> = b["skipped"]
+        .as_array()
         .unwrap()
-        .is_none());
+        .iter()
+        .map(|s| s.as_str().unwrap())
+        .collect();
+    skipped.sort();
+    assert_eq!(skipped, vec!["acme/new", "umbrella/app"]);
+
+    let c = h.db.get_connection("gh-legacy").await.unwrap().unwrap();
+    assert_eq!(c.org, None, "still unassigned");
+    assert!(h.db.repos_of("gh-legacy").await.unwrap().is_empty());
+}
+
+/// A repo moves only off an unassigned connection. Manual bind and re-sync
+/// give the same answer as the registry: a second connection of the same
+/// Org does not take a repo its first one holds (409 / `skipped`), and a
+/// repo held by an unassigned (legacy) connection moves to its Org's own.
+#[tokio::test]
+async fn a_repo_moves_only_off_an_unassigned_connection() {
+    let h = harness(forge()).await;
+    h.db.put_connection(&conn(
+        "fj-acme",
+        ForgeKind::Forgejo,
+        "https://git.acme.test",
+        Some("acme"),
+        None,
+    ))
+    .await
+    .unwrap();
+    // A legacy row that holds an acme repo.
+    h.db.bind_repo("gh-legacy", &repo("acme", "api"), "acme", "api")
+        .await
+        .unwrap();
+    let acme = login(&h.app, "acme-code").await;
+
+    // Off the unassigned connection: an acme admin's bind moves it.
+    let (st, b) = call(
+        &h,
+        "POST",
+        "/v1/connections/gh-acme/repos",
+        &acme,
+        Some(serde_json::json!({ "owner": "acme", "name": "api", "register_webhook": false })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    let moved = h.db.resolve(&repo("acme", "api")).await.unwrap().unwrap();
+    assert_eq!(moved.connection.id, "gh-acme");
+    assert_eq!(moved.org, "acme");
+
+    // Same Org, another connection: refused by bind, skipped by re-sync.
+    let (st, b) = call(
+        &h,
+        "POST",
+        "/v1/connections/fj-acme/repos",
+        &acme,
+        Some(serde_json::json!({ "owner": "acme", "name": "web", "register_webhook": false })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{b}");
+    let (st, b) = call(&h, "POST", "/v1/connections/fj-acme/resync", &acme, None).await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert!(
+        b["skipped"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("acme/web")),
+        "{b}"
+    );
+    assert_eq!(
+        h.db.resolve(&repo("acme", "web"))
+            .await
+            .unwrap()
+            .unwrap()
+            .connection
+            .id,
+        "gh-acme",
+        "acme/web stayed where it was"
+    );
+}
+
+/// A connection that serves an Org governs that Org's repos only: a row
+/// binding another owner's repo through it (an old re-sync, a hand edit)
+/// is not its admin's to remove.
+#[tokio::test]
+async fn an_org_admin_cannot_unbind_another_owners_repo_from_its_connection() {
+    let h = harness(forge()).await;
+    // Written past `bind_repo`'s owner check, as an old server could have.
+    h.db.upsert_repo_binding("gh-acme", &repo("globex", "other"), "globex", "other")
+        .await
+        .unwrap();
+    let acme = login(&h.app, "acme-code").await;
+    let (st, b) = call(
+        &h,
+        "DELETE",
+        "/v1/connections/gh-acme/repos/globex/other",
+        &acme,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{b}");
+    assert_eq!(
+        h.db.resolve(&repo("globex", "other"))
+            .await
+            .unwrap()
+            .unwrap()
+            .org,
+        "globex"
+    );
+}
+
+/// `PUT /v1/connections/{id}/org`: a global admin's explicit act, refused
+/// to anyone else, and refused (409) when a repo bound through the
+/// connection is not the Org's or the Org is served by another forge.
+#[tokio::test]
+async fn only_a_global_admin_assigns_a_connection_and_only_to_its_repos_org() {
+    let h = harness(forge()).await;
+    h.db.bind_repo("gh-legacy", &repo("umbrella", "app"), "umbrella", "app")
+        .await
+        .unwrap();
+    let put = |org: &str| Some(serde_json::json!({ "org": org }));
+    let uri = "/v1/connections/gh-legacy/org";
+
+    let acme = login(&h.app, "acme-code").await;
+    let (st, b) = call(&h, "PUT", uri, &acme, put("acme")).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "an org admin: {b}");
+    let (st, _) = call(&h, "PUT", uri, GLOBEX_TOKEN, put("globex")).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "an org-scoped token");
+
+    let root = login(&h.app, "root-code").await;
+    // A bound repo of another owner.
+    let (st, b) = call(&h, "PUT", uri, &root, put("acme")).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{b}");
+    assert!(b.as_str().unwrap().contains("umbrella/app"), "{b}");
+    // Not an org name.
+    for bad in ["", "a/b", "a b", "_forge"] {
+        let (st, b) = call(&h, "PUT", uri, &root, put(bad)).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{bad:?}: {b}");
+    }
+    assert_eq!(
+        h.db.get_connection("gh-legacy").await.unwrap().unwrap().org,
+        None
+    );
+
+    // The Org of its repos: assigned, and its admin then sees it.
+    let (st, b) = call(&h, "PUT", uri, &root, put("umbrella")).await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(b["org"], "umbrella");
+    assert_eq!(
+        h.db.get_connection("gh-legacy")
+            .await
+            .unwrap()
+            .unwrap()
+            .org
+            .as_deref(),
+        Some("umbrella")
+    );
+
+    // D7 again: globex is served by a Forgejo connection, so a GitHub
+    // connection with nothing bound is not attached to it by name.
+    h.db.put_connection(&conn(
+        "github-install-8",
+        ForgeKind::GitHub,
+        "https://api.github.com",
+        None,
+        Some(8),
+    ))
+    .await
+    .unwrap();
+    let (st, b) = call(
+        &h,
+        "PUT",
+        "/v1/connections/github-install-8/org",
+        &root,
+        put("globex"),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{b}");
+    assert_eq!(
+        h.db.get_connection("github-install-8")
+            .await
+            .unwrap()
+            .unwrap()
+            .org,
+        None
+    );
 }

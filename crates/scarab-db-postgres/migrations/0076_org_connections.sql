@@ -8,8 +8,21 @@
 -- Expand-only, safe while old and new servers overlap in a rollout:
 -- * an old server's INSERT omits `org` and `installation_id` and gets NULL,
 --   which the new server reads as an unassigned connection;
--- * an old server ignores both columns and the `orgs` table, so rolling back
---   leaves data the old code does not read.
+-- * an old server ignores both columns and the `orgs` table, and the new
+--   server also reads the Orgs of bindings, so a repo an old server binds
+--   still names an Org.
+--
+-- Rollback: a server built before this migration refuses to boot against a
+-- database that has it (sqlx reports migration 76 as unknown). To roll
+-- back, restore the database from before the upgrade, or delete row 76
+-- from `_sqlx_migrations`; the added columns and table are harmless to the
+-- old code. A connection an old server creates after that stays unassigned
+-- until a global admin assigns it, because this backfill runs once.
+--
+-- `installation_id` is filled for every `github-install-<id>` row, assigned
+-- or not. The server pins token minting to it only once the connection
+-- serves an Org: an unassigned row may hold repositories of other
+-- installations, and those keep the per-repo installation lookup.
 ALTER TABLE forge_connections ADD COLUMN IF NOT EXISTS org TEXT;
 ALTER TABLE forge_connections ADD COLUMN IF NOT EXISTS installation_id BIGINT;
 

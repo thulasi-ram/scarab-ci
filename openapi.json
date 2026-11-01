@@ -444,6 +444,79 @@
         ]
       }
     },
+    "/v1/connections/{id}/org": {
+      "put": {
+        "tags": [
+          "Forge Connections"
+        ],
+        "summary": "Assign a forge connection to an org (global admins)",
+        "description": "Refused (409, with the reason) when a repo bound through the connection\nis not the Org's, or when an Org of that name already exists and is\nserved by another forge or host, or by no connection at all: the same\nrule the installation delivery applies.",
+        "operationId": "assign_connection_org",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "connection id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AssignConnectionOrgRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectionOrgDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "not an org name: empty, longer than 100 characters, containing `/` or spaces, or `_`-prefixed"
+          },
+          "403": {
+            "description": "requires a global admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such connection, or no registry wired"
+          },
+          "409": {
+            "description": "a bound repo is not the org's, the org is served by another forge or by no connection, or the connection is managed by configuration"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
     "/v1/connections/{id}/preflight": {
       "get": {
         "tags": [
@@ -1159,6 +1232,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "a cursor this server did not issue, or both cursor and before"
           },
           "401": {
             "description": "not signed in"
@@ -7879,6 +7955,9 @@
               }
             }
           },
+          "400": {
+            "description": "a cursor this server did not issue, or both cursor and before"
+          },
           "401": {
             "description": "not signed in"
           },
@@ -8205,6 +8284,19 @@
           },
           "succeeded": {
             "type": "boolean"
+          }
+        }
+      },
+      "AssignConnectionOrgRequest": {
+        "type": "object",
+        "description": "`PUT /v1/connections/{id}/org` body.",
+        "required": [
+          "org"
+        ],
+        "properties": {
+          "org": {
+            "type": "string",
+            "description": "The Org the connection is to serve: the forge owner whose\nrepositories it binds."
           }
         }
       },
@@ -8634,6 +8726,22 @@
           "web_url": {
             "type": "string",
             "description": "The forge's own web host, for deep links out of the UI."
+          }
+        }
+      },
+      "ConnectionOrgDto": {
+        "type": "object",
+        "description": "`PUT /v1/connections/{id}/org` result.",
+        "required": [
+          "id",
+          "org"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "org": {
+            "type": "string"
           }
         }
       },
@@ -11907,7 +12015,7 @@
             "items": {
               "type": "string"
             },
-            "description": "Repos the forge reports that were not bound: owned by another account\nthan the connection's Org, or bound through another Org's connection\n(git-bug 19b0a45)."
+            "description": "Repos the forge reports that were not bound (git-bug 19b0a45): owned\nby another account than the connection's Org, already bound through\nanother connection that serves an Org, or reported to a connection\nthat serves no Org yet (it binds nothing until it is assigned)."
           }
         }
       },

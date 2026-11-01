@@ -1016,6 +1016,16 @@ pub static CONNECTION_DELETE: Op = op(
     &[],
     &["path:id"],
 );
+pub static CONNECTION_ASSIGN_ORG: Op = op(
+    "connection.assign_org",
+    "Assign a forge connection to an org",
+    Class::CrownJewel(W),
+    "§3 ForgeConnection edits",
+    ADMIN,
+    OrgOf::Body("/org"),
+    &[],
+    &["path:id", "body:/org"],
+);
 pub static CONNECTION_BIND_REPO: Op = op(
     "connection.bind_repo",
     "Bind a repository",

@@ -267,7 +267,7 @@ async fn a_bind_never_moves_a_repo_across_orgs() {
         "gh-acme"
     );
 
-    // Off an unassigned connection, a repo moves (the reinstall-heals path).
+    // Off an unassigned connection, a repo moves.
     db.bind_repo("legacy", &repo("acme", "old"), "acme", "old")
         .await
         .unwrap();
@@ -317,6 +317,107 @@ async fn orgs_are_recorded_and_outlive_their_connections() {
     assert_eq!(
         db.list_orgs().await.unwrap(),
         vec!["acme".to_string(), "initech".to_string()]
+    );
+
+    tdb.cleanup().await;
+}
+
+/// git-bug 19b0a45: a repo moves only off an unassigned connection. A
+/// second connection of the same Org does not take it either: the admin
+/// unbinds it where it is first. Re-binding through the connection that
+/// holds it still updates the binding.
+#[tokio::test]
+async fn a_bind_never_moves_a_repo_off_a_connection_that_serves_an_org() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = PostgresDb::with_pool(tdb.pool.clone());
+    db.migrate().await.unwrap();
+    db.put_connection(&github_conn()).await.unwrap();
+    db.put_connection(&forgejo_conn()).await.unwrap();
+
+    db.bind_repo("gh-acme", &repo("acme", "web"), "acme", "web")
+        .await
+        .unwrap();
+    let err = db
+        .bind_repo("codeberg-acme", &repo("acme", "web"), "acme", "web")
+        .await
+        .expect_err("a same-org connection does not take the repo");
+    assert!(
+        matches!(err, scarab_forge::RegistryError::BoundElsewhere { ref connection, .. } if connection == "gh-acme"),
+        "{err:?}"
+    );
+    db.bind_repo("gh-acme", &repo("acme", "web"), "acme", "web-renamed")
+        .await
+        .unwrap();
+    let held = db.resolve(&repo("acme", "web")).await.unwrap().unwrap();
+    assert_eq!(held.connection.id, "gh-acme");
+    assert_eq!(held.project, "web-renamed");
+
+    tdb.cleanup().await;
+}
+
+/// git-bug 19b0a45: two binds of the same unbound repo at once, through two
+/// connections that serve an Org. The guard is in the upsert itself, so one
+/// wins and the other is refused; a check made before the write would let
+/// both pass and the second overwrite the first.
+#[tokio::test]
+async fn two_concurrent_binds_of_an_unbound_repo_do_not_both_win() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = PostgresDb::with_pool(tdb.pool.clone());
+    db.migrate().await.unwrap();
+    db.put_connection(&github_conn()).await.unwrap();
+    db.put_connection(&forgejo_conn()).await.unwrap();
+
+    for i in 0..16 {
+        let r = repo("acme", &format!("race-{i}"));
+        let (a, b) = tokio::join!(
+            db.bind_repo("gh-acme", &r, "acme", &r.name),
+            db.bind_repo("codeberg-acme", &r, "acme", &r.name),
+        );
+        assert!(
+            a.is_ok() != b.is_ok(),
+            "exactly one bind of {} wins: {a:?} {b:?}",
+            r.name
+        );
+        let winner = if a.is_ok() {
+            "gh-acme"
+        } else {
+            "codeberg-acme"
+        };
+        assert_eq!(db.resolve(&r).await.unwrap().unwrap().connection.id, winner);
+    }
+
+    tdb.cleanup().await;
+}
+
+/// git-bug 19b0a45: during a rolling upgrade a server built before the
+/// `orgs` table binds repos without recording their Org. The Org list still
+/// names it, so its admins are not refused on every connection route.
+#[tokio::test]
+async fn the_org_list_includes_orgs_only_a_binding_names() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = PostgresDb::with_pool(tdb.pool.clone());
+    db.migrate().await.unwrap();
+    db.put_connection(&forgejo_conn()).await.unwrap();
+    // What an old server writes: the binding, and no `orgs` row.
+    sqlx::query(
+        "INSERT INTO forge_repos (connection_id, owner, name, org, project)
+         VALUES ('codeberg-acme', 'globex', 'site', 'globex', 'site')",
+    )
+    .execute(&tdb.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        db.list_orgs().await.unwrap(),
+        vec!["acme".to_string(), "globex".to_string()]
     );
 
     tdb.cleanup().await;

@@ -484,6 +484,12 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
         "CJ-W",
     ),
     (
+        "PUT",
+        "/v1/connections/{id}/org",
+        "connection.assign_org",
+        "CJ-W",
+    ),
+    (
         "POST",
         "/v1/connections/{id}/resync",
         "connection.resync",

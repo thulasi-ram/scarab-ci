@@ -784,18 +784,6 @@ pub trait ForgePort: Send + Sync {
         ))
     }
 
-    /// The forge account this connection's credential is installed on — for a
-    /// GitHub App installation, the installation's `account.login` (git-bug
-    /// 19b0a45). An unassigned installation connection takes it as its Org.
-    ///
-    /// Defaults to [`Unsupported`](ForgeError::Unsupported): only an
-    /// installation-style credential belongs to one account.
-    async fn connection_account(&self) -> Result<String, ForgeError> {
-        Err(ForgeError::Unsupported(
-            "naming the account this credential is installed on".into(),
-        ))
-    }
-
     async fn normalize_event(&self, raw: WebhookDelivery) -> Result<Event, ForgeError>;
 
     async fn set_status(
@@ -921,11 +909,23 @@ pub struct ForgeConnection {
     #[serde(default)]
     pub org: Option<String>,
     /// The GitHub App installation this connection is (`github-install-N`).
-    /// When known, tokens are minted from this installation only, and
-    /// enumeration lists only its repositories. `None` for every other kind
-    /// and for a legacy row the adapter must look the installation up for.
+    /// Once the connection serves an Org, tokens are minted from this
+    /// installation only and enumeration lists only its repositories. An
+    /// unassigned connection is not pinned to it: a legacy row may hold
+    /// repositories of other installations, and each repo's installation is
+    /// looked up. `None` for every other kind.
     #[serde(default)]
     pub installation_id: Option<u64>,
+}
+
+/// The GitHub App installation id a `github-install-<id>` connection id
+/// names (git-bug 19b0a45); `None` for any other id.
+pub fn installation_id_of(connection_id: &str) -> Option<u64> {
+    let digits = connection_id.strip_prefix("github-install-")?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 /// Construct the vendor adapter that serves one [`ForgeConnection`] — the
@@ -983,10 +983,14 @@ pub enum RegistryError {
         owner: String,
         name: String,
     },
-    /// The repo is bound through a connection of another Org. A bind never
-    /// moves a repo across Orgs (git-bug 19b0a45); it may move one between
-    /// connections of the same Org, or off an unassigned connection.
-    #[error("`{owner}/{name}` is already bound through connection `{connection}` of another org")]
+    /// The repo is bound through another connection that serves an Org. A
+    /// bind moves a repo only off an unassigned connection (git-bug
+    /// 19b0a45), never off one that serves an Org, its own Org's included:
+    /// an admin unbinds it there first.
+    #[error(
+        "`{owner}/{name}` is already bound through connection `{connection}`; a repository \
+         moves only off a connection that serves no org"
+    )]
     BoundElsewhere {
         owner: String,
         name: String,
@@ -1059,9 +1063,10 @@ pub trait ForgeConnectionStore: Send + Sync {
     /// `bind_repo`, never this.
     ///
     /// Re-binding a repo bound through another connection moves it only when
-    /// that connection is unassigned (`org` NULL) or serves the same Org as
-    /// `connection_id`; otherwise it answers
+    /// that connection is unassigned (`org` NULL); otherwise it answers
     /// [`BoundElsewhere`](RegistryError::BoundElsewhere) and changes nothing.
+    /// The check and the write are one step, so two concurrent binds of an
+    /// unbound repo cannot both win.
     /// An implementation also records `org` (and a connection's `org`) in its
     /// Org list ([`list_orgs`](Self::list_orgs)).
     async fn upsert_repo_binding(

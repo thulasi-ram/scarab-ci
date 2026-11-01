@@ -365,6 +365,49 @@ async fn github_connection(db: &InMemoryDb, id: &str, org: Option<&str>) {
     .unwrap();
 }
 
+/// git-bug 19b0a45: the org's own connection reads for the org only the
+/// org's own repositories. Its credential may reach another owner's (a
+/// token with wider access, or a GitHub installation asked for a repository
+/// by name only), and that is not the org's to install from. A connection
+/// id that does not exist answers like another org's, so other orgs'
+/// connection ids cannot be probed.
+#[tokio::test]
+async fn the_orgs_own_connection_reads_only_the_orgs_repositories() {
+    let h = harness_with(
+        ManifestSource::Off,
+        FakeForge::new().with_file("deploy.yaml", V1),
+        InMemoryLibraries::new(),
+    );
+    github_connection(&h.db, "gh", Some("acme")).await;
+    github_connection(&h.db, "gh-globex", Some("globex")).await;
+
+    let (st, b) = fetch(
+        &h,
+        json!({
+            "source": format!("github.com/globex/secret//deploy.yaml@{C1}"),
+            "connection": "gh"
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{b}");
+    assert!(
+        b.as_str().unwrap().contains("is not owned by org `acme`"),
+        "{b}"
+    );
+
+    let source = format!("github.com/globex/secret//deploy.yaml@{C1}");
+    let (missing_st, missing) =
+        fetch(&h, json!({ "source": source, "connection": "gh-nope" })).await;
+    let (foreign_st, foreign) =
+        fetch(&h, json!({ "source": source, "connection": "gh-globex" })).await;
+    assert_eq!(missing_st, StatusCode::FORBIDDEN, "{missing}");
+    assert_eq!(missing_st, foreign_st);
+    assert_eq!(
+        missing.as_str().unwrap().replace("gh-nope", "ID"),
+        foreign.as_str().unwrap().replace("gh-globex", "ID"),
+    );
+}
+
 /// The org rule for private installs (git-bug 19b0a45): a private source is
 /// read only through a connection of the installing org. Another org's
 /// connection, or an unassigned one, is refused before the forge is asked,

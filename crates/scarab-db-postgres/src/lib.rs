@@ -3107,48 +3107,22 @@ impl ForgeConnectionStore for PostgresDb {
             .execute(&mut *tx)
             .await
             .map_err(reg_err)?;
-        // A re-bind moves the repo only off a connection of the same Org or
-        // an unassigned one (git-bug 19b0a45). The current binding is locked
-        // for the check, so a concurrent move cannot slip between the check
-        // and the write.
-        let holder = sqlx::query(
-            "SELECT r.connection_id, c.org
-             FROM forge_repos r JOIN forge_connections c ON c.id = r.connection_id
-             WHERE r.owner = $1 AND r.name = $2
-             FOR UPDATE OF r",
-        )
-        .bind(&repo.owner)
-        .bind(&repo.name)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(reg_err)?;
-        if let Some(h) = holder {
-            let holder_id: String = h.get("connection_id");
-            let holder_org: Option<String> = h.get("org");
-            if holder_id != connection_id && holder_org.is_some() {
-                let new_org: Option<String> =
-                    sqlx::query_scalar("SELECT org FROM forge_connections WHERE id = $1")
-                        .bind(connection_id)
-                        .fetch_optional(&mut *tx)
-                        .await
-                        .map_err(reg_err)?
-                        .flatten();
-                if new_org != holder_org {
-                    return Err(RegistryError::BoundElsewhere {
-                        owner: repo.owner.clone(),
-                        name: repo.name.clone(),
-                        connection: holder_id,
-                    });
-                }
-            }
-        }
-        sqlx::query(
+        // A re-bind moves the repo only off an unassigned connection
+        // (git-bug 19b0a45). The guard is the upsert's own `WHERE`, so it is
+        // evaluated against the row as it stands when the write happens: two
+        // concurrent binds of an unbound repo cannot both win, and a move
+        // checked against a stale read cannot slip through.
+        let written = sqlx::query(
             "INSERT INTO forge_repos (connection_id, owner, name, org, project)
              VALUES ($1, $2, $3, $4, $5)
              ON CONFLICT (owner, name) DO UPDATE SET
                  connection_id = EXCLUDED.connection_id,
                  org = EXCLUDED.org,
-                 project = EXCLUDED.project",
+                 project = EXCLUDED.project
+             WHERE forge_repos.connection_id = EXCLUDED.connection_id
+                OR NOT EXISTS (
+                    SELECT 1 FROM forge_connections c
+                     WHERE c.id = forge_repos.connection_id AND c.org IS NOT NULL)",
         )
         .bind(connection_id)
         .bind(&repo.owner)
@@ -3158,6 +3132,21 @@ impl ForgeConnectionStore for PostgresDb {
         .execute(&mut *tx)
         .await
         .map_err(reg_err)?;
+        if written.rows_affected() == 0 {
+            let holder: String = sqlx::query_scalar(
+                "SELECT connection_id FROM forge_repos WHERE owner = $1 AND name = $2",
+            )
+            .bind(&repo.owner)
+            .bind(&repo.name)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(reg_err)?;
+            return Err(RegistryError::BoundElsewhere {
+                owner: repo.owner.clone(),
+                name: repo.name.clone(),
+                connection: holder,
+            });
+        }
         tx.commit().await.map_err(reg_err)?;
         Ok(())
     }
@@ -3262,11 +3251,18 @@ impl ForgeConnectionStore for PostgresDb {
     }
 
     /// The `orgs` table (git-bug 19b0a45): an Org outlives its last binding.
+    /// The Orgs of bindings are added: during a rolling upgrade a server
+    /// built before the `orgs` table binds repos without recording their Org.
     async fn list_orgs(&self) -> Result<Vec<String>, RegistryError> {
-        sqlx::query_scalar("SELECT name FROM orgs ORDER BY name")
-            .fetch_all(self.pool())
-            .await
-            .map_err(reg_err)
+        sqlx::query_scalar(
+            "SELECT name FROM orgs
+             UNION
+             SELECT DISTINCT org FROM forge_repos WHERE org NOT LIKE '\\_%'
+             ORDER BY 1",
+        )
+        .fetch_all(self.pool())
+        .await
+        .map_err(reg_err)
     }
 
     async fn config_owned_connection_ids(&self) -> Result<Vec<String>, RegistryError> {

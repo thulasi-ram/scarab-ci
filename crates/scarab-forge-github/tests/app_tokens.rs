@@ -268,24 +268,29 @@ async fn a_pinned_installation_lists_only_its_own_repositories() {
     );
 }
 
-/// The installation's account is what an unassigned installation
-/// connection takes as its Org.
+/// git-bug 19b0a45: a pinned token request names the repository by name
+/// only (`repositories: ["x"]`), so an adapter serving `acme` must refuse
+/// `globex/x` itself, or installation 55 would mint for `acme/x`. Unpinned
+/// (a config-declared connection), the same owner check stands in front of
+/// the per-repo installation lookup.
 #[tokio::test]
-async fn a_pinned_installation_names_its_account() {
-    let stub = Stub::start(vec![Reply::ok(
-        r#"{"id": 55, "account": {"login": "acme", "type": "Organization"}}"#,
-    )])
-    .await;
-    let account = stub
-        .app_forge()
-        .with_installation(55)
-        .connection_account()
+async fn an_adapter_serving_an_owner_mints_nothing_for_another_owners_repo() {
+    let other = RepoRef {
+        owner: "globex".into(),
+        name: "web".into(),
+    };
+    let stub = Stub::start(vec![]).await;
+    let pinned = stub.app_forge().with_installation(55).with_owner("acme");
+    assert!(pinned.mint_checkout_credential(&other, true).await.is_err());
+    assert!(pinned.mint_write_credential(&other).await.is_err());
+    let unpinned = stub.app_forge().with_owner("acme");
+    assert!(unpinned
+        .read_file_at_ref(&other, "main", "README.md")
         .await
-        .unwrap();
-    assert_eq!(account, "acme");
-    assert_eq!(stub.seen()[0].path, "/app/installations/55");
-    // Unpinned, it cannot say which account it serves, and asks nothing.
-    let unpinned = Stub::start(vec![]).await;
-    assert!(unpinned.app_forge().connection_account().await.is_err());
-    assert!(unpinned.seen().is_empty());
+        .is_err());
+    assert!(
+        stub.seen().is_empty(),
+        "GitHub was asked: {:?}",
+        stub.seen().iter().map(|s| &s.path).collect::<Vec<_>>()
+    );
 }

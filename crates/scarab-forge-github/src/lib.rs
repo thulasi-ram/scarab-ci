@@ -401,6 +401,11 @@ pub struct GithubForge {
     /// (git-bug 19b0a45). App mode then mints only from it and lists only its
     /// repositories; `None` resolves each repo's installation (legacy rows).
     installation: Option<u64>,
+    /// The owner this adapter's connection serves (git-bug 19b0a45). In App
+    /// mode no token is minted, and no call made, for a repository of
+    /// another owner: a pinned token request names the repository by name
+    /// only, so the owner is checked here.
+    owner: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -445,6 +450,7 @@ impl GithubForge {
             base_url: "https://api.github.com".into(),
             auth: Auth::Token(token.into()),
             installation: None,
+            owner: None,
         }
     }
 
@@ -459,6 +465,7 @@ impl GithubForge {
                 cache: std::sync::Mutex::new(AppTokenCache::default()),
             },
             installation: None,
+            owner: None,
         }
     }
 
@@ -467,6 +474,28 @@ impl GithubForge {
     pub fn with_installation(mut self, installation_id: u64) -> Self {
         self.installation = Some(installation_id);
         self
+    }
+
+    /// Serve one owner's repositories (git-bug 19b0a45): in App mode a call
+    /// for a repository of another owner is refused before any token is
+    /// minted for it.
+    pub fn with_owner(mut self, owner: impl Into<String>) -> Self {
+        self.owner = Some(owner.into());
+        self
+    }
+
+    /// App mode: refuse `repo` when this adapter serves another owner.
+    fn check_owner(&self, repo: &RepoRef) -> Result<(), ForgeError> {
+        match (&self.auth, &self.owner) {
+            (Auth::App { .. }, Some(owner)) if repo.owner != *owner => {
+                Err(ForgeError::Api(format!(
+                    "this connection serves `{owner}`; `{}/{}` belongs to another owner, so no \
+                     token is minted for it",
+                    repo.owner, repo.name
+                )))
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Point at a GHES host (e.g. `https://ghe.example.com/api/v3`).
@@ -494,6 +523,7 @@ impl GithubForge {
                 "a GitHub token connection mints no installation token".into(),
             ));
         };
+        self.check_owner(repo)?;
         let now = now_unix_secs();
         let jwt = sign_app_jwt(app, now)?;
         // Resolve the installation: the connection's own when it is pinned,
@@ -587,6 +617,7 @@ impl GithubForge {
             };
             return Ok(t.clone());
         };
+        self.check_owner(repo)?;
 
         let key = format!("{}/{}", repo.owner, repo.name);
         let now = now_unix_secs();
@@ -1018,26 +1049,6 @@ impl ForgePort for GithubForge {
         Ok(out.into_iter().collect())
     }
 
-    /// `GET /app/installations/{id}` — the account the pinned installation
-    /// is on (git-bug 19b0a45). Needs App credentials and a pinned
-    /// installation; anything else cannot say which account it serves.
-    async fn connection_account(&self) -> Result<String, ForgeError> {
-        let (Auth::App { app, .. }, Some(id)) = (&self.auth, self.installation) else {
-            return Err(ForgeError::Unsupported(
-                "naming the installed account needs App credentials and an installation id".into(),
-            ));
-        };
-        let jwt = sign_app_jwt(app, now_unix_secs())?;
-        let url = self.url(&format!("/app/installations/{id}"));
-        let resp = self.send(|| self.client.get(&url), &jwt).await?;
-        let body = ok_json(resp).await?;
-        body.pointer("/account/login")
-            .and_then(Value::as_str)
-            .filter(|l| !l.is_empty())
-            .map(str::to_string)
-            .ok_or_else(|| ForgeError::Api("installation.account.login missing".into()))
-    }
-
     /// `GET /app` — the App's own record of what it was granted and what it
     /// subscribed to (ADR-0060 preflight).
     ///
@@ -1258,6 +1269,9 @@ impl ForgePort for GithubForge {
         let token = match &self.auth {
             Auth::Token(t) => t.clone(),
             Auth::App { app, cache } => {
+                if self.check_owner(repo).is_err() {
+                    return Ok(None);
+                }
                 let now = now_unix_secs();
                 let jwt = match sign_app_jwt(app, now) {
                     Ok(j) => j,

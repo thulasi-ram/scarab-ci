@@ -438,3 +438,66 @@ async fn an_installation_without_an_account_login_is_refused() {
         .unwrap()
         .is_none());
 }
+
+/// git-bug 19b0a45: an unassigned installation connection that an old
+/// re-sync left holding another owner's Project does not take the
+/// account's Org on its next delivery. Assigning it would hand globex's
+/// Project to acme's admins, who could then unbind it. It stays unassigned
+/// and binds nothing new.
+#[tokio::test]
+async fn a_delivery_does_not_assign_a_connection_holding_another_owners_repo() {
+    use scarab_forge::{ForgeConnection, ForgeConnectionStore, ForgeKind, RepoRef};
+
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    db.put_connection(&ForgeConnection {
+        id: "github-install-5".into(),
+        kind: ForgeKind::GitHub,
+        base_url: "https://api.github.com".into(),
+        credential_ref: "github-app".into(),
+        org: None,
+        installation_id: Some(5),
+    })
+    .await
+    .unwrap();
+    for (owner, name) in [("acme", "web"), ("globex", "site")] {
+        let r = RepoRef {
+            owner: owner.into(),
+            name: name.into(),
+        };
+        db.bind_repo("github-install-5", &r, owner, name)
+            .await
+            .unwrap();
+    }
+    let app = multi_forge_app(db.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(installation_request("inst-h1-1", 5, "acme", &["acme/new"]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let conn = db
+        .get_connection("github-install-5")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(conn.org, None, "left unassigned");
+    assert!(db
+        .resolve(&RepoRef {
+            owner: "acme".into(),
+            name: "new".into()
+        })
+        .await
+        .unwrap()
+        .is_none());
+    let globex = db
+        .resolve(&RepoRef {
+            owner: "globex".into(),
+            name: "site".into(),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(globex.org, "globex");
+}

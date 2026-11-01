@@ -702,12 +702,26 @@ pub(crate) async fn read_source(
             })?
         }
         Some(id) => {
-            let connections = st.connections.as_deref().ok_or(ApiError::NotFound)?;
+            // The org rule (git-bug 19b0a45): a private source is read only
+            // through a connection of the installing org, and only from that
+            // org's own repositories. A connection that does not exist and
+            // one of another org answer the same, so the ids of other orgs'
+            // connections cannot be probed from here.
+            let not_ours = || {
+                ApiError::Denied(format!(
+                    "connection `{id}` does not belong to org `{org}`, so `{}/{}` cannot be \
+                     read through it for `{org}`; install it from a public source, or through \
+                     a connection of `{org}`",
+                    src.owner, src.repo
+                ))
+            };
+            let connections = st.connections.as_deref().ok_or_else(not_ours)?;
             let conn = connections
                 .get_connection(id)
                 .await
                 .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?
-                .ok_or_else(|| ApiError::BadRequest(format!("no connection `{id}`")))?;
+                .filter(|c| c.org.as_deref() == Some(org))
+                .ok_or_else(not_ours)?;
             if connection_web_host(&conn).as_deref() != Some(src.host.as_str()) {
                 return Err(ApiError::BadRequest(format!(
                     "connection `{id}` serves {}, not {}",
@@ -715,16 +729,12 @@ pub(crate) async fn read_source(
                     src.host
                 )));
             }
-            // The org rule (git-bug 19b0a45): a private source is read only
-            // through a connection of the installing org. Such a connection
-            // reaches its own org's repositories (a GitHub one mints from its
-            // own installation only), so another org's credential is never
-            // used to read for this one.
-            if conn.org.as_deref() != Some(org) {
+            // A connection of the org reaches what its credential reaches; it
+            // reads for the org only the org's own repositories.
+            if src.owner != org {
                 return Err(ApiError::Denied(format!(
-                    "connection `{id}` does not belong to org `{org}`, so `{}/{}` cannot be \
-                     read through it for `{org}`; install it from a public source, or through \
-                     a connection of `{org}`",
+                    "`{}/{}` is not owned by org `{org}`; a connection of `{org}` reads only \
+                     `{org}`'s repositories, so install it from a public source",
                     src.owner, src.repo
                 )));
             }

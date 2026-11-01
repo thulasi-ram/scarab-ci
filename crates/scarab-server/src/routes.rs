@@ -540,6 +540,11 @@ pub(crate) fn governed_routes() -> Routes {
             &ops::CONNECTION_DELETE,
             delete_connection,
         )
+        .put(
+            "/v1/connections/{id}/org",
+            &ops::CONNECTION_ASSIGN_ORG,
+            assign_connection_org,
+        )
         .post(
             "/v1/connections/{id}/resync",
             &ops::CONNECTION_RESYNC,
