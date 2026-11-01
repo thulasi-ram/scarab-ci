@@ -41,8 +41,10 @@ help:
 # (bootstrap.sh installs k3s, which writes it) and deploy/demo-oracle/.env
 # exists. A Mac (the kind stack's home) fails the first check, a CI runner
 # (x86_64, no k3s) the second and third, and any machine without the box's
-# .env the last. deploy.sh then refuses unless the kube context is KUBE_CONTEXT
-# from that .env (k3s writes `default`), so it never targets the wrong cluster.
+# .env the last. deploy.sh then reads k3s's kubeconfig, not the shell's, passes
+# it and the context KUBE_CONTEXT (k3s writes `default`) to every kubectl and
+# helm call, and refuses unless that context's API server is the k3s API on
+# loopback, so it never targets another cluster.
 #
 # There is no variant that builds on the box. Two Ampere cores will not compile
 # this workspace in a time anyone will wait for, and doing it on the demo box
