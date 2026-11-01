@@ -61,8 +61,15 @@ ui what="":
 # `just docs` runs the docs site dev server (Astro Starlight; ADR-0040).
 # `just docs build` builds it once, the way docs.yml does (npm ci + astro build
 # into ui/scarab-docs-ui/dist). The prebuild step syncs CONTEXT.md and docs/adr.
-[doc('Docs site dev server; `build` builds it the way docs.yml does')]
-docs what="":
+#
+# `just docs screenshots` recaptures every committed screenshot (the README's
+# and the docs site's) from the mock UI with Playwright
+# (ui/scarab-web-ui/scripts/screenshots.mjs). Look at the images before you
+# commit them. `just docs screenshots check` only compares a fresh capture with
+# the committed files, as `just release` does; diffs go to
+# target/release-screenshots/.
+[doc('Docs site dev server; `build` builds it the way docs.yml does; `screenshots [check]` recaptures the UI screenshots')]
+docs what="" *args:
     #!/usr/bin/env bash
     set -euo pipefail
     case "{{what}}" in
@@ -74,32 +81,28 @@ docs what="":
         npm --prefix ui/scarab-docs-ui ci
         npm --prefix ui/scarab-docs-ui run build
         ;;
-      *) echo "usage: just docs [build]" >&2; exit 2 ;;
+      screenshots)
+        case "{{args}}" in
+          ""|check) ;;
+          *) echo "usage: just docs screenshots [check]" >&2; exit 2 ;;
+        esac
+        npm --prefix ui/scarab-web-ui install --no-audit --no-fund
+        npx --prefix ui/scarab-web-ui playwright install chromium
+        node ui/scarab-web-ui/scripts/screenshots.mjs {{args}}
+        ;;
+      *) echo "usage: just docs [build | screenshots [check]]" >&2; exit 2 ;;
     esac
 
 # `just release <version>` checks a release before you tag v<version>
 # (docs/RELEASING.md): Cargo.toml and Chart.yaml name <version>, libs/clone.yaml
 # pins an earlier scarab-clone build by digest, CHANGELOG.md has the version's
-# section (it prints the Release text release.yml will write), every New entry
-# links a docs page, and a fresh capture of the mock UI matches every committed
-# screenshot. It runs every check and ends with a PASS/FAIL list.
-# See scripts/release_check.sh.
-#
-# `just release screenshots` recaptures every committed screenshot from the mock
-# UI with Playwright (ui/scarab-web-ui/scripts/screenshots.mjs);
-# `just release screenshots check` only compares, as `just release` does.
-[doc('Check a release before tagging; `screenshots [check]` recaptures the UI screenshots')]
-release what *args:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    case "{{what}}" in
-      screenshots)
-        npm --prefix ui/scarab-web-ui install --no-audit --no-fund
-        npx --prefix ui/scarab-web-ui playwright install chromium
-        node ui/scarab-web-ui/scripts/screenshots.mjs {{args}}
-        ;;
-      *) bash scripts/release_check.sh "{{what}}" {{args}} ;;
-    esac
+# section (it prints the Release text release.yml will write), every New
+# entry links a docs page, and a fresh capture of the mock UI matches every
+# committed screenshot (`just docs screenshots` recaptures them). It runs every
+# check and ends with a PASS/FAIL list. See scripts/release_check.sh.
+[doc('Check a release before tagging v<version>')]
+release version:
+    bash scripts/release_check.sh {{quote(version)}}
 
 # Merge gate: are PR <n>'s REQUIRED checks green? Run this before merging.
 # Branch protection and rulesets are both unavailable on this repo (private,

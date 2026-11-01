@@ -29,7 +29,7 @@ On a branch from main:
 3. If `docker/clone` changed since the last release, pin `libs/clone.yaml` to
    a published build of it: `scripts/pin_clone_image.sh sha-<commit>`. A
    release cannot pin the image it builds itself.
-4. If the UI changed, run `just release screenshots` and look at the images
+4. If the UI changed, run `just docs screenshots` and look at the images
    before you commit them.
 5. Run `just release X.Y.Z`. It checks:
    - `Cargo.toml` and both `Chart.yaml` fields say `X.Y.Z`;
@@ -40,7 +40,8 @@ On a branch from main:
    - every New entry under `[Unreleased]` and `[X.Y.Z]` links a docs page
      that exists;
    - a fresh capture of the mock UI matches every committed screenshot
-     (diffs go to `target/release-screenshots/`).
+     (diffs go to `target/release-screenshots/`; `just docs screenshots`
+     recaptures them).
 
    It runs every check, then lists each as PASS or FAIL.
 

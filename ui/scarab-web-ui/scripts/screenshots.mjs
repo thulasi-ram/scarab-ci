@@ -1,5 +1,5 @@
 // The committed UI screenshots, captured from the mock UI (src/mock.ts, the
-// "acme" fixture) with Playwright. `just release screenshots` runs it.
+// "acme" fixture) with Playwright. `just docs screenshots` runs it.
 //
 //   node scripts/screenshots.mjs           # capture: overwrite every committed screenshot
 //   node scripts/screenshots.mjs check     # compare a fresh capture with the committed files

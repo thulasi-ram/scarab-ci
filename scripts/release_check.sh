@@ -14,7 +14,8 @@
 #   docs links   every New entry under [Unreleased] and [<version>] links a
 #                docs page that exists (scripts/changelog.py links)
 #   screenshots  a fresh capture of the mock UI matches every committed
-#                screenshot (ui/scarab-web-ui/scripts/screenshots.mjs check)
+#                screenshot (`just docs screenshots check`; `just docs
+#                screenshots` recaptures them)
 #
 # Run from the repository root. Needs python3, node and npm; the first run
 # downloads Playwright's Chromium.
@@ -91,7 +92,7 @@ if shots=$(node ui/scarab-web-ui/scripts/screenshots.mjs check 2>&1); then
   record PASS screenshots "$(printf '%s\n' "$shots" | tail -1)"
 else
   printf '%s\n' "$shots"
-  record FAIL screenshots "$(printf '%s\n' "$shots" | tail -1); \`just release screenshots\` recaptures them"
+  record FAIL screenshots "$(printf '%s\n' "$shots" | tail -1); run \`just docs screenshots\` to recapture them"
 fi
 
 printf '\nrelease check for %s\n' "$version"
