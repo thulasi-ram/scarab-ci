@@ -13,7 +13,7 @@ just stack demo chain  # produce -> consume, checks the workspace crossed a Step
 just stack reload      # rebuild and roll the server and Depot onto the new binary (after e2e or chaos: dev)
 just stack up dogfood  # the same stack in GitHub App mode, behind a named Cloudflare tunnel
 just test e2e          # every live suite, against the release in its e2e mode
-just test chaos        # ADR-0077 rank 1: a Depot Pod deleted mid-drain and mid-feed, then the invariant checker
+just test chaos        # ADR-0077 ranks 1, 2 and 4 under faults, then the invariant checker
 just stack logs        # follow the server's log
 just stack logs depot  # follow the Depot's log
 just stack status      # the Depot's readiness and gauges
@@ -231,14 +231,23 @@ kubelet restarts the container in the same Pod.
 
 ## `just test chaos`
 
-`just test chaos` (`chaos.sh`) runs ADR-0077's rank-1 fault scenario on this
-release: two Depot replicas, and one of them deleted with grace 0 while a
-workspace drain is in flight, then again while a fetcher is pulling a Step's
-inputs. The `scarab-chaos` binary (`crates/scarab-chaos`) fires the fault and
+`just test chaos` (`chaos.sh`) runs ADR-0077's fault scenarios on this release,
+at two server replicas and two Depot replicas:
+
+- rank 1, `mid-drain` and `mid-feed`: one Depot Pod deleted with grace 0 while a
+  workspace drain is in flight, then while a fetcher pulls a Step's inputs;
+- rank 2, `two-replicas` and `kill-server`: no fault, then the server replica
+  that holds a launch claim SIGKILLed while its drain is in flight;
+- rank 4, `stop-leader`: the scheduler leader SIGSTOPped past its 30 s lease
+  until a peer takes over, then SIGCONTed.
+
+Server signals are sent from the kind node, because the server is PID 1 in its
+container. The `scarab-chaos` binary (`crates/scarab-chaos`) fires the fault and
 then checks the invariants.
 
 ```sh
-just test chaos             # mid-drain, then mid-feed, seed 1
+just test chaos             # every scenario, seed 1
+just test chaos rank2       # one rank
 just test chaos mid-feed 7  # one scenario, another seed
 just test chaos replay deploy/kind/.chaos/<dir>/scenario.json
 ```
