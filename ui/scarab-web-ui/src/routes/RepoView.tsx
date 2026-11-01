@@ -593,6 +593,7 @@ export default function RepoView() {
         <ScopedSecrets
           scope={{ org: org(), repo: repo() }}
           title={`Secrets · ${org()}/${repo()}`}
+          showInherited
           focusPing={secretFocus()}
           epoch={secretListEpoch()}
           onChange={() => setSecretMatrixEpoch((n) => n + 1)}

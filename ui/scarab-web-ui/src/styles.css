@@ -1071,6 +1071,22 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
   margin-left: auto;
 }
 
+.secret-note {
+  color: var(--muted-sage);
+  font-size: 12px;
+}
+
+/* A key the repo can use but does not hold: shown, not editable. */
+.secret-row.secret-inherited {
+  background: transparent;
+  border-style: dashed;
+  color: var(--muted-sage);
+}
+
+.secret-row.secret-inherited .mono {
+  color: var(--muted-sage);
+}
+
 .error {
   color: var(--danger);
   font-size: 14px;

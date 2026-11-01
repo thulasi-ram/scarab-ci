@@ -1673,6 +1673,8 @@ export type SecretMatrix = {
     status: Record<string, SecretCellStatus>;
     /** For `inherited` cells: `"repo"` or `"org"` — what an edit would override. */
     inherited_from: Record<string, "repo" | "org">;
+    /** For `set` cells that hide a broader value: `"repo"` or `"org"`. */
+    overrides?: Record<string, "repo" | "org">;
   }[];
 };
 

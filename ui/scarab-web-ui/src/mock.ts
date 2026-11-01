@@ -868,7 +868,7 @@ const pluginConnections: Record<string, PluginConnectionDto[]> = {
     }),
   ],
 };
-const secretNames = { names: ["GHCR_TOKEN", "DATABASE_URL", "SLACK_WEBHOOK_URL"] };
+const secretNames = { names: ["DATABASE_URL", "SENTRY_DSN"] };
 // Org scope (no `repo=`) holds the org-wide base of the inheritance chain — the
 // Settings page's Org Secrets section (ADR-0060).
 const orgSecretNames = { names: ["GHCR_TOKEN", "SENTRY_DSN"] };
@@ -939,8 +939,10 @@ const availableRepos = [
 ];
 // The coverage matrix is now the repo/environment secret EDITOR (ADR-0060), so
 // the fixture carries the repo-default column ("") and inheritance origins:
-// GHCR_TOKEN comes from the org, DATABASE_URL is a repo default overridden in
-// both environments, SLACK_WEBHOOK_URL is production-only with qa silenced.
+// GHCR_TOKEN comes from the org, SENTRY_DSN is a repo key that overrides the
+// org's, DATABASE_URL is a repo default overridden in both environments,
+// SLACK_WEBHOOK_URL is production-only with qa silenced. The repo Secrets list
+// shows GHCR_TOKEN and SLACK_WEBHOOK_URL greyed out beside the repo's own keys.
 // Its environment columns are the org Environments the project may deploy
 // into (ADR-0071) — production and qa, as `projectEnvironments` lists them.
 const secretMatrix = {
@@ -951,16 +953,25 @@ const secretMatrix = {
       key: "GHCR_TOKEN",
       status: { "": "inherited", qa: "inherited", production: "inherited" },
       inherited_from: { "": "org", qa: "org", production: "org" },
+      overrides: {},
+    },
+    {
+      key: "SENTRY_DSN",
+      status: { "": "set", qa: "inherited", production: "inherited" },
+      inherited_from: { qa: "repo", production: "repo" },
+      overrides: { "": "org" },
     },
     {
       key: "DATABASE_URL",
       status: { "": "set", qa: "set", production: "set" },
       inherited_from: {},
+      overrides: { qa: "repo", production: "repo" },
     },
     {
       key: "SLACK_WEBHOOK_URL",
       status: { "": "unset", qa: "silenced", production: "set" },
       inherited_from: {},
+      overrides: {},
     },
   ],
 };

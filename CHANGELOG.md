@@ -153,6 +153,11 @@ record. Read Breaking changes before you upgrade.
 - The server and CLI now link to `/settings/profile` and `/settings/security?enroll=1`
   instead of `/account` and `/account/security?enroll=1`. The UI still redirects the old
   addresses.
+- **Inherited secret keys on a repository's Secrets tab.** The list now shows, in grey after
+  the repository's own keys, the org's keys the repository can use ("from org") and keys set
+  only in some environments ("only in production"). A repository key that replaces an org key
+  reads "overrides org". Names only; no value is shown. The secret matrix response adds
+  `overrides`, which names the broader scope a set cell hides.
 
 ### Bug Fixes
 
