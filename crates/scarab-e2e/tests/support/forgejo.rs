@@ -1,4 +1,4 @@
-//! Helpers for the live Forgejo tier (`just forgejo-verify`): the connection,
+//! Helpers for the live Forgejo tier (`just e2e`): the connection,
 //! the bind, real pushes through the contents API, and waits on what they
 //! produce. Shared by `forgejo_onboarding.rs` and `forgejo_tunnel.rs`.
 
@@ -12,7 +12,7 @@ pub fn enter_tier() {
         assert!(
             std::env::var(switch).ok().as_deref() == Some("1"),
             "this live case was asked to run (`--ignored` is the opt-in) but {switch} is not \
-             1. Run `just forgejo-verify`, which stands up the stack and a seeded Forgejo."
+             1. Run `just e2e`, which stands up the stack and a seeded Forgejo."
         );
     }
 }
@@ -21,7 +21,7 @@ pub fn env(key: &str) -> String {
     std::env::var(key)
         .ok()
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| panic!("{key} is not set — `just forgejo-verify` writes it"))
+        .unwrap_or_else(|| panic!("{key} is not set — `just e2e` writes it"))
 }
 
 /// POST/GET helper that keeps the body on the assertion message — every failure
@@ -61,10 +61,11 @@ pub async fn run_ids(
 /// Delete any connection already serving `forgejo`, so this scenario can create
 /// its own. **Not cleanup after a bug — a property of the tier.**
 ///
-/// `just forgejo-verify` destroys the Forgejo and its volume on every run, but the
-/// release's e2e database OUTLIVES it. So the second run meets a connection row
-/// from the first, and `POST /v1/connections` correctly answers 409: ADR-0060
-/// part D allows one connection per base URL.
+/// `just e2e` mints a new Forgejo token on every run (and a recreated cluster
+/// starts a new Forgejo), but the release's e2e database OUTLIVES the token.
+/// So the second run meets a connection row from the first, and
+/// `POST /v1/connections` correctly answers 409: ADR-0060 part D allows one
+/// connection per base URL.
 ///
 /// Reclaim by **delete-then-create**, never by reusing the row: a surviving
 /// connection's credential is the previous Forgejo's token, which died with
@@ -75,6 +76,26 @@ pub async fn run_ids(
 /// BOUND, and the delete handler refuses a connection that still serves Projects
 /// unless the caller acknowledges they go with it.
 pub async fn reclaim_connections_for(client: &reqwest::Client, base: &str, forgejo: &str) {
+    let want = forgejo.trim_end_matches('/').to_string();
+    reclaim_connections_where(client, base, move |url| url == want).await;
+}
+
+/// Delete the connections a quick tunnel of an EARLIER run left. Every
+/// `just e2e` run gets a new `https://<name>.trycloudflare.com` URL, so
+/// `reclaim_connections_for` (which matches the current URL) never sees them,
+/// and the repo they still have bound refuses the new bind with 409.
+pub async fn reclaim_quick_tunnel_connections(client: &reqwest::Client, base: &str) {
+    reclaim_connections_where(client, base, |url| {
+        url.starts_with("https://") && url.ends_with(".trycloudflare.com")
+    })
+    .await;
+}
+
+async fn reclaim_connections_where(
+    client: &reqwest::Client,
+    base: &str,
+    matches: impl Fn(&str) -> bool,
+) {
     let existing = json_ok(
         client
             .get(format!("{base}/v1/connections"))
@@ -84,19 +105,19 @@ pub async fn reclaim_connections_for(client: &reqwest::Client, base: &str, forge
         "list connections",
     )
     .await;
-    let want = forgejo.trim_end_matches('/');
     for conn in existing.as_array().into_iter().flatten() {
         let (Some(id), Some(url)) = (conn["id"].as_str(), conn["base_url"].as_str()) else {
             continue;
         };
-        if url.trim_end_matches('/') != want {
+        let url = url.trim_end_matches('/');
+        if !matches(url) {
             continue;
         }
         // A config-owned connection is read-only and answers 409 here; that is a
         // misconfigured tier, not a leftover, so say so rather than looping.
         assert_eq!(
             conn["managed_by_config"], false,
-            "connection `{id}` for {want} is declared in config and cannot be \
+            "connection `{id}` for {url} is declared in config and cannot be \
              reclaimed — unset it from SCARAB_CONNECTIONS before running the tier"
         );
         eprintln!("reclaiming connection `{id}` left by an earlier run of the tier");

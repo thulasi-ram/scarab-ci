@@ -4,8 +4,8 @@
 //! to mint for any other, and the pinned clone image's askpass refuses to hand
 //! it to git. The clone URL comes from the connection's base URL, which the
 //! server Pod and the step Pods must both reach, over TLS that image trusts.
-//! `FORGEJO_TUNNEL=1 just forgejo-verify` puts the seeded Forgejo behind a
-//! cloudflared quick tunnel for that, and only then runs this file. It is the
+//! `just e2e` puts the in-cluster Forgejo behind a cloudflared quick tunnel
+//! for that, and runs this file in a pass of its own. It is the
 //! one live tier that makes network calls.
 //!
 //! On one push to a private repository, with a PAT connection (one long-lived
@@ -45,7 +45,7 @@ fn forge_token_secrets() -> Vec<String> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs a seeded Forgejo behind a tunnel; run `FORGEJO_TUNNEL=1 just forgejo-verify`"]
+#[ignore = "needs a seeded Forgejo behind a tunnel; run `just e2e`"]
 async fn a_private_repo_clones_with_the_forge_token_and_nothing_else_gets_it() {
     enter_tier();
     let base = base_url();
@@ -74,6 +74,7 @@ async fn a_private_repo_clones_with_the_forge_token_and_nothing_else_gets_it() {
     // One connection serves this Forgejo: drop the kind-network one the
     // other cases made, then connect through the tunnel.
     reclaim_connections_for(&http, &base, &server_side).await;
+    reclaim_quick_tunnel_connections(&http, &base).await;
     let (org, project) = connect_and_bind(&http, &base, &https, &token, &owner, &name).await;
 
     // --- 1. the org defaults installed the first-party clone library --------

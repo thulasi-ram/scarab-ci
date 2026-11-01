@@ -1,6 +1,6 @@
 # Helm values for the kind dev stack (deploy/kind/up.sh). Every mode starts
 # from this file; up.sh adds the per-mode values (database URL, bucket,
-# secrets, the GitHub App for `just dogfood`) in a temporary file.
+# secrets, the GitHub App for `just up dogfood`) in a temporary file.
 #
 # The server and the Depot run a binary built on the host. The thin runtime
 # image (docker/runtime) has no Scarab binary in it: deploy/kind/.mount on the

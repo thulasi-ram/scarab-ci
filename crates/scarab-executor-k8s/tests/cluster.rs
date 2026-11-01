@@ -13,13 +13,13 @@
 //! Pod can reach. There are exactly two places that stand all of that up, and
 //! they set the SAME `SCARAB_TEST_*` set:
 //!
-//! - CI: the `kind` workflow (`.github/workflows/kind.yml`);
-//! - local: `just kube-tests`, which brings up the kind release and drives this
+//! - CI: the `kind` workflow (`.github/workflows/e2e.yml`);
+//! - local: `just e2e`, which brings up the kind release and drives this
 //!   suite against it.
 //!
 //! Do not hand-roll the env. Once `SCARAB_TEST_KUBE` is set, a missing var is a
 //! **panic** ([`tier_var`], [`workspace_fixture`]) and not a skip — because for
-//! seven cases it silently was a skip, and `kind/cluster-tests` is
+//! seven cases it silently was a skip, and `kind/cluster-tests` (since replaced by `e2e/e2e`) was
 //! `required-if-run`, so the merge gate read that silence as proof.
 //!
 //! It proves the acceptance: a busybox `echo` runs to completion with its exit
@@ -125,7 +125,7 @@ fn enter_tier() -> String {
         panic!(
             "this live case was asked to run (`--ignored` is the opt-in) but \
              SCARAB_TEST_KUBE is not set, and it will not pass by doing nothing. Run \
-             `just kube-tests` (local) or the kind workflow (CI), which set it and \
+             `just e2e` (local) or the e2e workflow (CI), which set it and \
              everything else the tier needs."
         );
     }
@@ -163,19 +163,19 @@ async fn kube_client() -> kube::Client {
 ///
 /// That is not pedantry. Every one of these used to be an `else { return }`, and
 /// with the ADR-0061 workspace vars nothing set them anywhere: seven cases
-/// reported PASS while executing nothing, and `kind/cluster-tests` is
+/// reported PASS while executing nothing, and `kind/cluster-tests` (since replaced by `e2e/e2e`) was
 /// `required-if-run` in `.github/required-checks.txt`, so `just pr-gate` read that
 /// silence as a green tier. A live case that cannot run must be RED.
 ///
 /// Wiring lives in exactly two places, both of which set the full set:
-/// `.github/workflows/kind.yml` and the `just kube-tests` recipe.
+/// `.github/workflows/e2e.yml` and the `just e2e` recipe.
 fn tier_var(name: &str) -> String {
     match std::env::var(name) {
         Ok(v) if !v.is_empty() => v,
         _ => panic!(
             "{name} is not set, but SCARAB_TEST_KUBE is — this live case would have \
              silently no-op'd while reporting PASS. Wire it in \
-             .github/workflows/kind.yml (CI) or run `just kube-tests` (local, which \
+             .github/workflows/e2e.yml (CI) or run `just e2e` (local, which \
              stands up everything this tier needs)."
         ),
     }
@@ -220,17 +220,16 @@ fn tier_var(name: &str) -> String {
 ///
 /// `SCARAB_TEST_WORKSPACE_URL` is host-facing (the test process is the control
 /// plane); `SCARAB_TEST_WORKSPACE_POD_URL` is what a Pod dials, and they
-/// differ wherever the test process is outside the cluster: CI runs the Depot
-/// as a host process that Pods reach at the kind gateway, and `just
-/// kube-tests` reaches the release's Depot through a port-forward while Pods
-/// use its Service. It defaults to the host URL.
+/// differ wherever the test process is outside the cluster: `just e2e` (local
+/// and CI) reaches the release's Depot through a port-forward while Pods use
+/// its Service. It defaults to the host URL.
 ///
 /// # Missing configuration is FATAL, not a skip
 ///
 /// This fixture shipped as a triple `else { return }`, and the effect was that
 /// seven cases — five of which ran green the week before — reported PASS while
 /// executing nothing, because no CI job, recipe or script set the three vars it
-/// asks for. `kind/cluster-tests` is `required-if-run`, so the merge gate saw
+/// asks for. `kind/cluster-tests` (since replaced by `e2e/e2e`) was `required-if-run`, so the merge gate saw
 /// green for a tier that had gone silent.
 ///
 /// So: once the tier is opted in ([`enter_tier`]), absent workspace configuration
@@ -258,9 +257,9 @@ struct WorkspaceFixture {
 /// A direct handle on the COLD store the tier's Depot archives into, resolved
 /// exactly as the Depot resolves its own (`config.rs`): `SCARAB_S3_BUCKET` set
 /// → S3/MinIO, else the local object dir. Both runners line up by
-/// construction, and both are MinIO now (ADR-0067): `just kube-tests` exports
-/// the e2e mode's bucket (through a port-forward), and the CI kind workflow exports the same
-/// `SCARAB_S3_*` it started the service with. The LocalDir arm survives for
+/// construction, and both are MinIO now (ADR-0067): `just e2e`, locally and
+/// in the CI e2e workflow, exports the e2e mode's bucket (through a
+/// port-forward). The LocalDir arm survives for
 /// ad-hoc runs against a dir-backed service — its `./.scarab/objects` is
 /// relative to the REPO ROOT (the service's cwd there), resolved here from
 /// `CARGO_MANIFEST_DIR` because the test binary's own cwd is this crate's
@@ -320,8 +319,8 @@ fn workspace_fixture() -> WorkspaceFixture {
              Since ADR-0061 s3-feed a Step with `needs:` is provisioned by an init \
              container that dials the workspace service, so a green run without these \
              proves nothing. Wire them up:\n\
-             \x20 CI:    .github/workflows/kind.yml (workspace service + kind-loaded fetcher)\n\
-             \x20 local: `just kube-tests` sets them against the kind release",
+             \x20 CI:    .github/workflows/e2e.yml (workspace service + kind-loaded fetcher)\n\
+             \x20 local: `just e2e` sets them against the kind release",
             missing.join(", ")
         );
     }
@@ -1892,7 +1891,7 @@ async fn build_step_builds_and_pushes_to_a_local_registry() {
 /// image) drains it on step exit and POSTs it — token-authenticated — to the
 /// ingest URL (a stub listener on the host standing in for the control
 /// plane). Needs SCARAB_TEST_SIDECAR_IMAGE (in-cluster image) and
-/// SCARAB_TEST_HOST_IP (host address reachable from Pods; `just kube-tests`
+/// SCARAB_TEST_HOST_IP (host address reachable from Pods; `just e2e`
 /// probes it from a Pod). `#[ignore]`d + SCARAB_TEST_KUBE gated.
 #[tokio::test]
 #[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
@@ -2930,7 +2929,7 @@ async fn a_needs_step_with_a_uid_pinned_service_can_write_its_workspace() {
     consumer.timeout_seconds = Some(180);
     consumer.workspace_inputs = vec![root_a];
     consumer.services = vec![scarab_pipeline::ServiceSpec {
-        // Kind-loaded by `just kube-tests` and the kind workflow: a tagged
+        // Kind-loaded by `just e2e` and the e2e workflow: a tagged
         // image is IfNotPresent, so the node never pulls it.
         image: "postgres:16".into(),
         command: vec![],

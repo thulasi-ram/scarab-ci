@@ -7,7 +7,7 @@
 //! kubeconfig. Asking for the ignored set is the opt-in, and a case then needs
 //! `SCARAB_TEST_KUBE` as well: without it, it panics ([`enter_tier`]) rather
 //! than passing having done nothing (git-bug dcc4ca9). Run it with `just
-//! plugin-kube-tests` (or the whole tier with `just kube-tests`), which points
+//! plugin-kube-tests` (or every live suite with `just e2e`), which points
 //! `KUBECONFIG` at the kind cluster's own kubeconfig (`deploy/kind/.kubeconfig`).
 //!
 //! Once `SCARAB_TEST_KUBE` is set, a misconfiguration is a **panic**, never a

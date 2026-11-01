@@ -1,5 +1,5 @@
-# Helpers the test recipes (`just e2e`, `just forgejo-verify`,
-# `just kube-tests`) source after deploy/kind/lib.sh. The tests run on the
+# Helpers deploy/kind/e2e.sh (`just e2e`) and deploy/kind/forgejo.sh source
+# after deploy/kind/lib.sh. The tests run on the
 # host and drive the release in the kind cluster; these give them what the
 # host cannot reach on its own.
 #

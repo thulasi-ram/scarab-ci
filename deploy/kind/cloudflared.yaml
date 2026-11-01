@@ -1,4 +1,4 @@
-# The dogfood stack's public front door (`just dogfood`): cloudflared dials out
+# The dogfood stack's public front door (`just up dogfood`): cloudflared dials out
 # to Cloudflare and proxies requests back to the scarab Service. Same shape as
 # deploy/demo-oracle/cloudflared.yaml: a token-mode (remotely managed) named
 # tunnel, so this file holds no routing. The route is set in the Cloudflare

@@ -1,7 +1,7 @@
 # The kind dev stack
 
 `just up` runs Scarab on one local kind cluster, `scarab-dev`, from the real
-Helm chart. Postgres and MinIO run in the cluster too. The server and the
+Helm chart. Postgres, MinIO and Forgejo run in the cluster too. The server and the
 Depot run a `scarab-server` binary built on your machine, so a code change
 needs a compile and a Pod restart, not an image build. This is the setup
 described in the ADR-0077 Amendment (2026-11-01).
@@ -11,6 +11,8 @@ just up          # build, create the cluster if needed, install the release
 just demo        # one-step pipeline, polled to success
 just demo-chain  # produce -> consume, checks the workspace crossed a Step boundary
 just reload      # rebuild and roll the server and Depot onto the new binary
+just up dogfood  # the same stack in GitHub App mode, behind a named Cloudflare tunnel
+just e2e         # every live suite, against the release in its e2e mode
 just logs        # follow the server's log
 just down        # delete the cluster and its data
 just down keep   # uninstall the release; keep the cluster, Postgres, MinIO and their data
@@ -76,18 +78,18 @@ Images are loaded as a one-platform archive (`docker save --platform` and
 and fails on a multi-arch image under the containerd image store. A load is
 skipped when the node already has the same image.
 
-## Postgres, MinIO and modes
+## Postgres, MinIO, Forgejo and modes
 
 `postgres.yaml` and `minio.yaml` run one Postgres (with
 `track_commit_timestamp=on`, which `just chaos` needs) and one MinIO, each on a
-PVC. A mode is a set of Helm values, and each mode has its own database and
+PVC. `forgejo.yaml` runs one Forgejo (SQLite on a PVC; see "Forgejo" below). A mode is a set of Helm values, and each mode has its own database and
 bucket on those two servers:
 
 | Mode | Recipe | Database | Bucket | Auth |
 |---|---|---|---|---|
 | dev | `just up` | `scarab` | `scarab-logs` | dev-insecure |
-| dogfood | `just dogfood` | `scarab_dogfood` | `scarab-dogfood` | dev-insecure, GitHub App |
-| e2e | `just e2e`, `just forgejo-verify`, `just kube-tests` | `scarab_e2e` | `scarab-e2e` | dev-insecure |
+| dogfood | `just up dogfood` | `scarab_dogfood` | `scarab-dogfood` | dev-insecure, GitHub App |
+| e2e | `just e2e` | `scarab_e2e` | `scarab-e2e` | dev-insecure; Forgejo behind a quick tunnel |
 
 Switching modes deletes the Depot's warm PVC. The warm tier caches blobs of
 one bucket, and would otherwise serve the new mode reads its bucket cannot
@@ -100,7 +102,7 @@ Dev secrets (master key, workspace token secret, results token secret) are
 generated once into `deploy/kind/.state/` (gitignored, mode 600) and kept
 across `just down`, so a kept database still decrypts.
 
-## `just dogfood`
+## `just up dogfood`
 
 This repository's own CI on Scarab, through the GitHub App, reached from
 GitHub through a named Cloudflare tunnel. It reads
@@ -113,7 +115,7 @@ GitHub through a named Cloudflare tunnel. It reads
 | `SCARAB_MASTER_KEY`, `SCARAB_RESULTS_TOKEN_SECRET`, `SCARAB_WORKSPACE_TOKEN_SECRET` | release secrets |
 | `SCARAB_ORG`, `SCARAB_REPO`, `SCARAB_INSTALL_ID` | the installation registered on a fresh database |
 | `SCARAB_STEP_TIMEOUT_SECS` | default step deadline |
-| `CLOUDFLARE_TUNNEL_TOKEN`, `DOGFOOD_HOSTNAME` | the tunnel; `just dogfood` refuses without them |
+| `CLOUDFLARE_TUNNEL_TOKEN`, `DOGFOOD_HOSTNAME` | the tunnel; `just up dogfood` refuses without them |
 
 Each line is `KEY=value`; a leading `export `, CRLF line endings and one pair
 of quotes around the value are accepted, and nothing else is interpreted.
@@ -144,7 +146,7 @@ must both answer 404. When the local resolver has no answer for the name (a
 cached "no such name" from before the DNS record existed), it resolves the
 name through 1.1.1.1 with `dig` and passes `--resolve` to curl. Any other
 answer, or none within a minute, scales cloudflared to 0 and fails
-`just dogfood` with a message naming the dashboard setting. The tunnel is
+`just up dogfood` with a message naming the dashboard setting. The tunnel is
 public for those few seconds. It then sends an unsigned
 `POST /webhooks/github` and expects Scarab's 400 or 401.
 
@@ -189,42 +191,80 @@ or an empty host means `127.0.0.1`, a missing port means `8080`.
 
 ## Tests on the release
 
-`just e2e`, `just forgejo-verify` and `just kube-tests` bring the release up in
-its e2e mode and leave it there; `just up` switches it back to dev. The test
-binaries run on the host. `test-env.sh` gives them what the host cannot reach
-directly:
+`just e2e` (`e2e.sh`) brings the release up in its e2e mode and leaves it
+there; `just up` switches it back to dev. It runs every live suite in passes,
+and all passes run even when one fails:
 
-- Postgres (for the e2e case that seeds a connection), the Depot and MinIO (for
-  the executor tier, whose test process stands in for the control plane)
-  through `kubectl port-forward` on a free loopback port;
+| Pass | What |
+|---|---|
+| e2e | `crates/scarab-e2e`: happy path, cancel, rerun Takes |
+| forgejo-adapter | `scarab-forge-forgejo` `tests/live.rs` against the real Forgejo: pick-list pagination, hook signing, the push payload |
+| forgejo-onboarding | add connection → pick-list → bind → hook → real push → Run, through the server; one test at a time |
+| forgejo-tunnel | the forge_token cases, through the quick tunnel |
+| cluster | the executor's and the plugin runtime's live cluster suites, in namespace `scarab-kube-tests` |
+| crash_resume | last, on its own: it kills the server every other case talks to |
+
+`just e2e <filter>` passes a nextest filter to every pass. The test binaries
+run on the host. `test-env.sh` gives them what the host cannot reach directly:
+
+- Postgres (for the e2e case that seeds a connection), Forgejo, the Depot and
+  MinIO (for the cluster suites, whose test process stands in for the control
+  plane) through `kubectl port-forward` on a free loopback port;
 - the host address a Pod reaches the host at, for a test that is itself a
-  server the cluster calls (`happy_path`'s fake forge, the results listener of
-  the executor tier). A listener on the host is asked for from a busybox Pod;
-  the first of `host.docker.internal`, the kind network's gateway and
-  `host.lima.internal` that answers wins. On macOS the gateway is the VM's,
-  not the host's.
+  server the cluster calls (`happy_path`'s fake forge, the Forgejo adapter's
+  capture listener, the results listener of the executor suite). A listener on
+  the host is asked for from a busybox Pod; the first of
+  `host.docker.internal`, the kind network's gateway and `host.lima.internal`
+  that answers wins. On macOS the gateway is the VM's, not the host's.
 
 `crash_resume` kills the server with SIGKILL from the kind node's PID
 namespace (`crictl inspect` gives the container's PID on the node), so the
-kubelet restarts the container in the same Pod. It runs after the other e2e
-cases, since they share the server.
+kubelet restarts the container in the same Pod.
 
-`just forgejo-verify` attaches the Forgejo container to the `kind` docker
-network: the server reaches it as `http://scarab-forgejo:3000`, and Forgejo
-delivers hooks to `http://scarab-dev-control-plane:30080` (the release's
-`publicUrl` for that run, with the hook secret, passed through
-`SCARAB_KIND_EXTRA_VALUES`).
+## Forgejo
+
+Forgejo runs in every mode, like Postgres and MinIO, so the Forgejo adapter is
+checked against a real Forgejo (`codeberg.org/forgejo/forgejo:16.0.1`) and not
+only against the shapes we believed it sends (git-bug 3863d5e: a hook created
+with no `config.secret` shipped once). The server and step Pods reach it at
+`http://scarab-forgejo.scarab.svc.cluster.local:3000`; the tests through a
+port-forward. Two settings in `forgejo.yaml` are required:
+`webhook.ALLOWED_HOST_LIST=*` (by default Forgejo refuses to deliver to
+private addresses, and the tier would pass without testing ingest) and
+`security.INSTALL_LOCK=true`.
+
+`forgejo.sh` seeds it on every `up.sh`: an admin user (`scarab-admin`, a random
+password in `.state/forgejo-admin-password`), a fresh API token, the working
+repos with a `.scarab/ci.yaml`, 55 filler repos (more than the adapter's page
+size of 50, so the pick-list must page), an org repo reached by a team member
+and a collaborator, and the private repos of the forge_token cases. It writes
+`.state/forgejo.env` (mode 600), the `SCARAB_TEST_FORGEJO_*` values the tests
+read. Its hooks are stamped with `.state/forgejo-webhook-secret`, which the
+release gets as `secrets.forgejoWebhookSecret`.
+
+In e2e mode `up.sh` first starts a cloudflared quick tunnel in front of it
+(`forgejo-tunnel.yaml`), reads the random `https://<name>.trycloudflare.com`
+URL from its log, and sets Forgejo's `ROOT_URL` to it with sign-in required to
+view. The forge_token cases need an https clone URL that the server Pod and the
+step Pods both reach, over TLS the clone image trusts; a quick tunnel needs no
+account. This makes network calls, and Forgejo is reachable from the internet
+while the tunnel runs; `just e2e` deletes the tunnel when it ends, and the next
+run gets a new URL. In e2e mode the release's library manifest is the real
+`libs/` at its last commit, which the server fetches from github.com, so
+`libs/` must be committed and pushed; the release's `publicUrl` is the server's
+Service, where Forgejo delivers hooks.
 
 ## CI
 
-`.github/workflows/kind.yml` runs `just kube-tests` and
-`.github/workflows/e2e.yml` runs `just e2e`, so CI creates the same cluster
-with the same `up.sh`. The runner gets pinned kind, Helm 4 and zig from
-`.github/actions/kind-tools`, and `cargo-zigbuild`. With `cargo-zigbuild`
-installed, `up.sh` builds for `x86_64-unknown-linux-gnu.2.36` there too: a
-plain `cargo build` on ubuntu-latest links a newer glibc than the runtime
-image's (bookworm, 2.36). On a Linux runner the kind network's gateway is a
-host address, so the Pod-side probe in `test-env.sh` finds it.
+`.github/workflows/e2e.yml` runs `just e2e` on PRs labelled `ci:full` and
+weekly, so CI creates the same cluster with the same `up.sh`. A PR without the
+label runs `ci.yml` only (the workspace suite, no cluster). The runner gets
+pinned kind, kubectl, Helm 4 and zig from `.github/actions/kind-tools`, and
+`cargo-zigbuild`. With `cargo-zigbuild` installed, `up.sh` builds for
+`x86_64-unknown-linux-gnu.2.36` there too: a plain `cargo build` on
+ubuntu-latest links a newer glibc than the runtime image's (bookworm, 2.36).
+On a Linux runner the kind network's gateway is a host address, so the
+Pod-side probe in `test-env.sh` finds it.
 
 ## Settings
 

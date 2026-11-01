@@ -6,7 +6,7 @@
 //! repo → its owner), each with the EFFECTIVE level from the per-user
 //! permission endpoint. And the all-or-nothing rule: one failed page fails the
 //! call, because a re-sync deletes the roles of everyone absent from the list.
-//! The wire shapes themselves are a guess until `just forgejo-verify` runs the
+//! The wire shapes themselves are a guess until `just e2e` runs the
 //! live tier (ADR-0069 s7).
 
 use std::collections::HashMap;

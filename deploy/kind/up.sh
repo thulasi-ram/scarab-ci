@@ -6,16 +6,16 @@
 #   deploy/kind/up.sh [dev|dogfood|e2e]
 #
 #   dev      (`just up`)      dev-insecure, database `scarab`, bucket `scarab-logs`
-#   dogfood  (`just dogfood`) GitHub App mode from ~/.config/scarab/dogfood.env,
+#   dogfood  (`just up dogfood`) GitHub App mode from ~/.config/scarab/dogfood.env,
 #                             database `scarab_dogfood`, bucket `scarab-dogfood`,
 #                             and a cloudflared tunnel to the public hostname
-#   e2e      (`just e2e`, `just forgejo-verify`, `just kube-tests`)
-#                             dev-insecure, database `scarab_e2e`, bucket
-#                             `scarab-e2e`, so test data never mixes with dev's
+#   e2e      (`just e2e`)     dev-insecure, database `scarab_e2e`, bucket
+#                             `scarab-e2e`, so test data never mixes with dev's,
+#                             and a cloudflared quick tunnel in front of Forgejo
 #
 # SCARAB_KIND_EXTRA_VALUES names one more Helm values file, applied last (for
-# example the Forgejo tier's public URL and webhook secret). It is not
-# remembered: `just reload` re-applies the mode without it.
+# example `just plugin-verify`'s plugin settings). It is not remembered:
+# `just reload` re-applies the mode without it.
 #
 # Idempotent: re-running rebuilds the binary and rolls the Pods only when the
 # binary changed. `just reload` is the short path for that alone.
@@ -29,9 +29,11 @@
 #      the host port of SCARAB_ADDR mapped to the API's node port, or recreate
 #      a `scarab-dev` cluster that lacks them;
 #   4. build the runtime image and the step helper images and load them;
-#   5. apply Postgres and MinIO, create the mode's database;
+#   5. apply Postgres, MinIO and Forgejo, create the mode's database; in e2e
+#      mode, start the Forgejo quick tunnel first (Forgejo's ROOT_URL is its URL);
 #   6. helm upgrade --install the chart with deploy/kind/values.yaml plus the
-#      mode's values.
+#      mode's values;
+#   7. seed Forgejo (deploy/kind/forgejo.sh).
 #
 # Kube safety: every kubectl and helm call goes through kc/hc below, which use
 # the cluster's own kubeconfig file (deploy/kind/.kubeconfig) and check that its
@@ -78,7 +80,7 @@ if [ "$mode" = dogfood ]; then
     [ -n "$(env_get "$dogfood_env" "$k")" ] || missing="$missing $k"
   done
   if [ -n "$missing" ]; then
-    die "just dogfood needs the named Cloudflare tunnel: set$missing in $dogfood_env
+    die "just up dogfood needs the named Cloudflare tunnel: set$missing in $dogfood_env
   CLOUDFLARE_TUNNEL_TOKEN  the tunnel's token (Zero Trust > Networks > Tunnels)
   DOGFOOD_HOSTNAME         its public hostname, routed to http://scarab.scarab.svc.cluster.local:80"
   fi
@@ -99,6 +101,18 @@ if [ "$mode" = dogfood ]; then
 elif [ "$mode" = e2e ]; then
   database=scarab_e2e
   bucket=scarab-e2e
+  # The forge_token cases bind an org whose first-party clone library the
+  # server installs from the release manifest (ADR-0076 §5). The server fetches
+  # libs/clone.yaml from github.com at the manifest's commit, so libs/ must be
+  # committed and pushed. In CI the checked-out commit is the pushed one.
+  need git
+  libs_commit="$(git -C "$root" log -1 --format=%H -- libs/)"
+  git -C "$root" diff --quiet "$libs_commit" -- libs/ \
+    || die "libs/ has uncommitted changes: the server fetches libs/clone.yaml from github.com at $libs_commit"
+  if [ "${GITHUB_ACTIONS:-}" != true ] \
+     && [ -z "$(git -C "$root" branch -r --contains "$libs_commit" 2>/dev/null)" ]; then
+    die "libs/ at $libs_commit is not pushed: the server fetches libs/clone.yaml from github.com at that commit"
+  fi
 else
   database=scarab
   bucket=scarab-logs
@@ -293,7 +307,7 @@ done
 # cluster recreate does not pull them again through the node. A digest-pinned
 # one (MinIO, mc, cloudflared) is left to the node: a one-platform archive
 # drops the index digest the reference names, so the node would pull it anyway.
-infra_images="$(sed -n 's/^ *image: *\([^ #]*\).*/\1/p' "$here/postgres.yaml" "$here/minio.yaml")"
+infra_images="$(sed -n 's/^ *image: *\([^ #]*\).*/\1/p' "$here/postgres.yaml" "$here/minio.yaml" "$here/forgejo.yaml")"
 for img in $infra_images; do
   case "$img" in *@*) continue ;; esac
   pull_image "$img"
@@ -323,6 +337,43 @@ if ! kc exec -n "$ns" deploy/scarab-postgres -- psql -U scarab -d scarab -tAc \
   kc exec -n "$ns" deploy/scarab-postgres -- createdb -U scarab "$database"
 fi
 database_url="postgres://scarab:scarab@scarab-postgres:5432/$database"
+
+# Forgejo, in every mode. In e2e mode a cloudflared quick tunnel goes in front
+# of it first: Forgejo builds clone URLs and payload links from ROOT_URL, so
+# ROOT_URL must be the tunnel's https URL, which is known only once cloudflared
+# has registered. Each tunnel Pod gets a new URL, so the e2e recipe deletes the
+# tunnel when it ends and every e2e run starts a new one.
+tunnel_url=""
+kc delete deploy scarab-forgejo-tunnel -n "$ns" --ignore-not-found --wait=true >/dev/null
+if [ "$mode" = e2e ]; then
+  echo "==> Forgejo quick tunnel (network calls; Forgejo is public while it runs)"
+  kc apply -n "$ns" -f "$here/forgejo-tunnel.yaml" >/dev/null
+  kc rollout status -n "$ns" deploy/scarab-forgejo-tunnel --timeout=120s
+  for _ in $(seq 1 60); do
+    tunnel_log="$(kc logs -n "$ns" deploy/scarab-forgejo-tunnel 2>&1 || true)"
+    tunnel_url="$(printf '%s\n' "$tunnel_log" | grep -ao 'https://[a-z0-9-]*\.trycloudflare\.com' | head -n 1 || true)"
+    if [ -n "$tunnel_url" ] && printf '%s\n' "$tunnel_log" | grep -aq "Registered tunnel connection"; then break; fi
+    tunnel_url=""
+    sleep 2
+  done
+  [ -n "$tunnel_url" ] || { printf '%s\n' "$tunnel_log" | tail -n 20 >&2; die "cloudflared did not register a quick tunnel"; }
+  echo "    $tunnel_url"
+  forgejo_root="$tunnel_url/"; forgejo_signin=true
+else
+  forgejo_root="http://scarab-forgejo.$ns.svc.cluster.local:3000/"; forgejo_signin=false
+fi
+# A random admin password and hook secret per stack, kept in .state (mode 600).
+for f in forgejo-admin-password forgejo-webhook-secret; do
+  [ -s "$state/$f" ] || ( umask 077; head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$state/$f" )
+done
+forgejo_webhook_secret="$(cat "$state/forgejo-webhook-secret")"
+echo "==> Forgejo (ROOT_URL $forgejo_root)"
+V_ROOT="$forgejo_root" V_SIGNIN="$forgejo_signin" python3 -I -c '
+import os, sys
+t = open(sys.argv[1]).read()
+sys.stdout.write(t.replace("__ROOT_URL__", os.environ["V_ROOT"]).replace("__SIGNIN_VIEW__", os.environ["V_SIGNIN"]))
+' "$here/forgejo.yaml" | kc apply -n "$ns" -f - >/dev/null
+kc rollout status -n "$ns" deploy/scarab-forgejo --timeout=180s
 
 # --- 5. secrets ---------------------------------------------------------------
 # Dev secrets are generated once and kept in deploy/kind/.state (gitignored),
@@ -381,7 +432,7 @@ chmod 600 "$values"
 # The clone library (ADR-0076 §9): checkouts run `lib:thulasi-ram/clone` with
 # the image it pins, so the release gets a manifest listing a copy of
 # libs/clone.yaml that pins the scarab-clone:dev image built above.
-# `just dogfood` installs that copy into the org after the roll-out.
+# `just up dogfood` installs that copy into the org after the roll-out.
 python3 -I - "$root/libs/clone.yaml" scarab-clone:dev > "$libs_dir/clone.yaml" <<'PY'
 import re, sys
 text = open(sys.argv[1]).read()
@@ -393,6 +444,18 @@ PY
 python3 -I "$root/scripts/libs_manifest.py" --libs "$libs_dir" \
   --repository github.com/thulasi-ram/scarab-ci \
   --commit "$(git -C "$root" rev-parse HEAD)" --release v0.0.0-kind > "$libs_dir/manifest.json"
+if [ "$mode" = e2e ]; then
+  # e2e: the real libs/ (every library, the published clone image), at the
+  # pushed commit checked above; the forge_token cases compare the installed
+  # clone library's hash with SCARAB_TEST_CLONE_HASH.
+  python3 -I "$root/scripts/libs_manifest.py" --libs "$root/libs" \
+    --repository github.com/thulasi-ram/scarab-ci --commit "$libs_commit" \
+    --release v0.0.0-kind-e2e > "$libs_dir/manifest.json"
+  clone_hash="$(python3 -I -c 'import json,sys
+m=json.load(open(sys.argv[1]))
+print(next(l["versions"][-1]["content_hash"] for l in m["libraries"] if l["name"]=="clone"))' "$libs_dir/manifest.json")"
+  printf '%s\n' "$clone_hash" > "$state/e2e-clone-hash"
+fi
 
 # Roll the Pods when the binary or the staged UI changes, and only then: helm
 # sees a new Pod template annotation. The server checks for ui/index.html at
@@ -415,7 +478,7 @@ fi
 V_MODE="$mode" V_SUM="$binary_sum" V_BUCKET="$bucket" V_DEV_INSECURE="$dev_insecure" \
 V_APP_ID="$app_id" V_PUBLIC_URL="https://${dogfood_host:-}" V_TIMEOUT="${timeout:-3600}" \
 V_DATABASE_URL="$database_url" V_MASTER_KEY="$master_key" V_RESULTS="$results_secret" \
-V_WORKSPACE="$workspace_secret" V_WEBHOOK="$webhook_secret" \
+V_WORKSPACE="$workspace_secret" V_WEBHOOK="$webhook_secret" V_FORGEJO_WEBHOOK="$forgejo_webhook_secret" \
 python3 -I - "$libs_dir/manifest.json" > "$values" <<'PY2'
 import json, os, sys
 e = os.environ
@@ -435,6 +498,13 @@ v = {
         "workspaceTokenSecret": e["V_WORKSPACE"],
     },
 }
+if e["V_MODE"] != "dogfood":
+    # The in-cluster Forgejo's hooks are stamped with this secret.
+    v["secrets"]["forgejoWebhookSecret"] = e["V_FORGEJO_WEBHOOK"]
+if e["V_MODE"] == "e2e":
+    # The address bind stamps onto a hook it registers: Forgejo delivers to
+    # the server's Service.
+    v["scarab"]["publicUrl"] = "http://scarab.scarab.svc.cluster.local"
 if e["V_MODE"] == "dogfood":
     v["scarab"].update(githubAppId=e["V_APP_ID"], publicUrl=e["V_PUBLIC_URL"], stepTimeoutSecs=e["V_TIMEOUT"])
     v["secrets"].update(githubWebhookSecret=e["V_WEBHOOK"],
@@ -465,6 +535,8 @@ hc upgrade --install "$release" "$root/deploy/helm/scarab" -n "$ns" \
 echo "$mode" > "$state/mode"
 kc rollout status -n "$ns" deploy/"$release" --timeout=180s
 kc rollout status -n "$ns" statefulset/"$release-workspace" --timeout=180s
+
+FORGEJO_TUNNEL_URL="$tunnel_url" bash "$here/forgejo.sh"
 
 if [ "$mode" = dogfood ]; then
   kc apply -n "$ns" -f "$here/cloudflared.yaml" >/dev/null
@@ -500,7 +572,7 @@ if [ "$mode" = dogfood ]; then
   / answered HTTP $root_code and /v1/repos HTTP $api_code; both must be Cloudflare's 404.
   This stack is dev-insecure, so a public UI or API makes every visitor an Owner.
   In the Cloudflare dashboard, set the tunnel's public hostname Path to ^/webhooks/
-  (the catch-all rule then answers 404), and rerun 'just dogfood'.
+  (the catch-all rule then answers 404), and rerun 'just up dogfood'.
   The UI and API stay on $base. (000 or 5xx means the check could not reach the tunnel.)"
   fi
   webhook_code="$(public_code POST /webhooks/github)"
