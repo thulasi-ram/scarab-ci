@@ -37,6 +37,14 @@ describe("route table", () => {
     expect(resolveSection("org", "profile")).toBeUndefined();
     expect(resolveSection("account", "members")).toBeUndefined();
   });
+
+  it("gives the org's event log its own section, last in the org group", () => {
+    expect(resolveSection("org", "events")?.label).toBe("Event log");
+    expect(ORG_SECTIONS.map((s) => s.id).slice(-2)).toEqual(["security", "events"]);
+    expect(navGroups(admin, "acme")[1]!.items.at(-1)!.href).toBe("/orgs/acme/settings/events");
+    // Only the org group has it: your own events stay on Your account → Security.
+    expect(resolveSection("account", "events")).toBeUndefined();
+  });
 });
 
 describe("admin gating", () => {

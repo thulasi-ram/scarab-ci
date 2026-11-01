@@ -1,61 +1,22 @@
-// Settings → Security (ADR-0073): the Org's step-up posture and its
-// OrgSecurityEventLog.
+// Settings → Security: the Org's step-up posture.
 //
 // - The posture: whether step-up is enforced, and which admins hold no
 //   passkey — every crown jewel is refused for them until they enroll one.
 // - Recent refusals (the last 24 hours): who was asked to confirm, for what.
-// - The event log, filterable by kind and paged by `next_before`.
+//   The whole log has its own section, Settings → Event log (`EventLog.tsx`).
 // - An Owner's "Reset passkeys" for a member who lost theirs — always-ask, so
 //   the step-up middleware has the Owner confirm it with their own passkey.
 import { For, Show, createResource, createSignal } from "solid-js";
-import {
-  getOrgSecuritySummary,
-  listBindings,
-  listOrgSecurityEvents,
-  resetMemberPasskeys,
-  type SecurityEvent,
-} from "../api/client";
-import {
-  EVENT_KINDS,
-  canResetPasskeys,
-  eventKindLabel,
-  postureText,
-  resetCandidates,
-} from "../security";
+import { A } from "@solidjs/router";
+import { getOrgSecuritySummary, listBindings, resetMemberPasskeys } from "../api/client";
+import { canResetPasskeys, postureText, resetCandidates } from "../security";
+import { orgHref } from "../settings-nav";
 import Icon from "./Icon";
 import SecurityEventTable from "./SecurityEventTable";
 
 export default function OrgSecurity(props: { org: string }) {
   const [summary, { refetch: refetchSummary }] = createResource(() => props.org, getOrgSecuritySummary);
   const [bindings] = createResource(() => props.org, listBindings);
-
-  const [kind, setKind] = createSignal("");
-  const [events, setEvents] = createSignal<SecurityEvent[]>([]);
-  const [nextBefore, setNextBefore] = createSignal<number | null>(null);
-  const [eventsError, setEventsError] = createSignal<string | null>(null);
-  const [loading, setLoading] = createSignal(false);
-
-  // Each load takes a token; a response that is not the latest load's is
-  // dropped, so a slow earlier page (say, the unfiltered log) can never
-  // overwrite the list a later filter asked for.
-  let latest = 0;
-  const loadEvents = async (before?: number) => {
-    const token = ++latest;
-    setLoading(true);
-    try {
-      const page = await listOrgSecurityEvents(props.org, { kind: kind(), before });
-      if (token !== latest) return;
-      setEvents((prev) => (before === undefined ? page.events : [...prev, ...page.events]));
-      setNextBefore(page.next_before ?? null);
-      setEventsError(null);
-    } catch (e) {
-      if (token !== latest) return;
-      setEventsError(e instanceof Error ? e.message : "Could not load the event log.");
-    } finally {
-      if (token === latest) setLoading(false);
-    }
-  };
-  void loadEvents();
 
   const [resetMsg, setResetMsg] = createSignal<{ ok: boolean; text: string } | null>(null);
   const [resetting, setResetting] = createSignal<string | null>(null);
@@ -75,7 +36,6 @@ export default function OrgSecurity(props: { org: string }) {
         text: `Reset ${r.subject}: ${r.removed} passkey${r.removed === 1 ? "" : "s"} removed, ${r.windows_revoked} confirmation${r.windows_revoked === 1 ? "" : "s"} revoked.`,
       });
       await refetchSummary();
-      await loadEvents();
     } catch (e) {
       setResetMsg({ ok: false, text: e instanceof Error ? e.message : "Could not reset." });
     } finally {
@@ -163,40 +123,12 @@ export default function OrgSecurity(props: { org: string }) {
           )}
         </Show>
 
-        <h3 class="sec-sub">Event log</h3>
-        <div class="secrets-actions sec-filter">
-          <select
-            class="input"
-            value={kind()}
-            onChange={(e) => {
-              setKind(e.currentTarget.value);
-              void loadEvents();
-            }}
-          >
-            <option value="">All events</option>
-            <For each={EVENT_KINDS}>
-              {(k) => <option value={k}>{eventKindLabel(k)}</option>}
-            </For>
-          </select>
-        </div>
-        <Show when={eventsError()}>
-          <p class="error">{eventsError()}</p>
-        </Show>
-        <SecurityEventTable
-          events={events()}
-          empty={kind() ? "No events of this kind." : "No security events yet."}
-        />
-        <Show when={nextBefore() !== null}>
-          <div class="secrets-actions">
-            <button
-              class="btn btn-ghost btn-sm"
-              disabled={loading()}
-              onClick={() => loadEvents(nextBefore()!)}
-            >
-              Older events
-            </button>
-          </div>
-        </Show>
+        <p class="subtle">
+          <small>
+            Every confirmation, refusal and passkey change is in the{" "}
+            <A href={orgHref(props.org, "events")}>event log</A>.
+          </small>
+        </p>
       </div>
     </div>
   );

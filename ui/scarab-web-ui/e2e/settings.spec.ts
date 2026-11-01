@@ -20,8 +20,8 @@ test("an admin lands on their org's settings and every section opens at its own 
   const nav = page.getByRole("navigation", { name: "Settings" });
   const links = nav.getByRole("link");
   const count = await links.count();
-  // Your account (2) + Organization settings (8) for the fixture's admin.
-  expect(count).toBe(10);
+  // Your account (2) + Organization settings (9) for the fixture's admin.
+  expect(count).toBe(11);
 
   const seen = new Set<string>();
   for (let i = 0; i < count; i++) {

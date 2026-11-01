@@ -1852,15 +1852,34 @@ export async function getOrgSecuritySummary(org: string): Promise<OrgSecuritySum
   return data;
 }
 
-/** An Org's security event log (`GET /v1/orgs/{org}/security/events`). */
+/** An Org's security event log (`GET /v1/orgs/{org}/security/events`), newest
+ * first: one page, filtered by kind, actor (subject), target text and time
+ * range (unix ms, `to` exclusive); `cursor` is the previous page's
+ * `next_cursor`. */
 export async function listOrgSecurityEvents(
   org: string,
-  opts: { kind?: string; before?: number; limit?: number } = {},
+  opts: {
+    kind?: string;
+    actor?: string;
+    target?: string;
+    from?: number;
+    to?: number;
+    cursor?: string;
+    limit?: number;
+  } = {},
 ): Promise<SecurityEvents> {
   const { data, error, response } = await api.GET("/v1/orgs/{org}/security/events", {
     params: {
       path: { org },
-      query: { kind: opts.kind || undefined, before: opts.before, limit: opts.limit ?? 50 },
+      query: {
+        kind: opts.kind || undefined,
+        actor: opts.actor || undefined,
+        target: opts.target || undefined,
+        from: opts.from,
+        to: opts.to,
+        cursor: opts.cursor || undefined,
+        limit: opts.limit ?? 50,
+      },
     },
   });
   if (error || !data) throw new Error(errorText(error) || `failed to load security events (${response.status})`);

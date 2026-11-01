@@ -33,6 +33,7 @@ import Libraries from "../components/Libraries";
 import ScopedSecrets from "../components/ScopedSecrets";
 import ApiTokens from "../components/ApiTokens";
 import OrgSecurity from "../components/OrgSecurity";
+import EventLog from "../components/EventLog";
 import Icon from "../components/Icon";
 
 /** `/settings/:section` — a section of Your account. */
@@ -223,6 +224,8 @@ function orgBody(id: string, org: string): JSX.Element {
       return <ApiTokens org={org} />;
     case "security":
       return <OrgSecurity org={org} />;
+    case "events":
+      return <EventLog org={org} />;
     default:
       return <NotFound />;
   }

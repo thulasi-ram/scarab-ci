@@ -134,6 +134,12 @@ record. Read Breaking changes before you upgrade.
   cluster the fault tier's `two-replicas`, `kill-server` and `stop-leader` scenarios passed
   (`just test chaos all 3`, 2026-11-01).
   [ADR-0077 amendment](https://thulasi-ram.github.io/scarab-ci/tech/adr/0077-end-to-end-fault-and-agent-driven-testing/#amendment-2026-11-01-grill)
+- **Event log page** (git-bug fa23028). An org's security event log moves from Settings →
+  Security to its own section, Settings → Event log, one page of 50 at a time. It filters by
+  event kind, actor, target text (a Run id, a project or a secret name) and time range, and
+  the filters are in the URL. The event log API takes `cursor`, `actor`, `target`, `from` and
+  `to`; `before` still works.
+  [ADR-0073 §7](https://thulasi-ram.github.io/scarab-ci/tech/adr/0073-step-up-confirmation/#7-orgsecurityeventlog)
 
 ### Enhancement
 

@@ -1072,6 +1072,70 @@ const securityEvents: SecurityEventDto[] = [
   }),
   secEvent(7, "passkey.enrolled", 3 * 24 * 60, { org: null, passkey_id: "pk-2" }),
 ];
+// Older Org events, so Settings → Event log has more than one page (50 a
+// page) to step through. Not in `securityEvents`: the Account → Security
+// list and the recent refusals stay as they were.
+const OLDER_KINDS = ["op.authorised", "op.completed", "step_up.confirmed", "step_up.refused"];
+const OLDER_ACTORS = ["a.kim", "j.lee", "r.patel"];
+const OLDER_TARGETS = [
+  "acme/orders-api/production/DB_PASSWORD",
+  "acme/edge-gateway/staging/TLS_KEY",
+  `run ${RICH_RUN_ID}/deploy`,
+  "acme",
+];
+const olderOrgEvents: SecurityEventDto[] = Array.from({ length: 64 }, (_, i) => {
+  const kind = OLDER_KINDS[i % OLDER_KINDS.length]!;
+  return secEvent(6 - i, kind, 4 * 24 * 60 + i * 90, {
+    id: `ev-old-${i}`,
+    subject: OLDER_ACTORS[i % OLDER_ACTORS.length]!,
+    op: kind === "step_up.confirmed" ? null : "secret.put",
+    target: OLDER_TARGETS[i % OLDER_TARGETS.length]!,
+  });
+});
+const orgEventLog = [...securityEvents, ...olderOrgEvents];
+
+/** The Org event log as the server serves it: newest first by `seq`,
+ * filtered, one page, with an opaque cursor (`seq:<n>`, base64url). */
+function orgEventsPage(search: string) {
+  const q = new URLSearchParams(search);
+  const kinds = q.get("kind")?.split(",").filter(Boolean) ?? [];
+  const actor = q.get("actor")?.trim() || "";
+  const target = q.get("target")?.trim().toLowerCase() || "";
+  const from = q.get("from") ? Number(q.get("from")) : undefined;
+  const to = q.get("to") ? Number(q.get("to")) : undefined;
+  const cursor = q.get("cursor");
+  let before: number | undefined;
+  if (cursor) {
+    let text = "";
+    try {
+      text = atob(cursor.replace(/-/g, "+").replace(/_/g, "/"));
+    } catch {
+      /* not base64 */
+    }
+    const m = /^seq:(-?\d+)$/.exec(text);
+    if (!m) return json("`cursor` is not one this server issued", { status: 400 });
+    before = Number(m[1]);
+  }
+  const limit = Math.min(Math.max(Number(q.get("limit") ?? 50) || 50, 1), 200);
+  const rows = orgEventLog
+    .filter((e) => !kinds.length || kinds.includes(e.kind))
+    .filter((e) => !actor || e.subject === actor)
+    .filter((e) => !target || (!!e.org && (e.target ?? "").toLowerCase().includes(target)))
+    .filter((e) => from === undefined || e.at >= from)
+    .filter((e) => to === undefined || e.at < to)
+    .filter((e) => before === undefined || e.seq < before)
+    .sort((a, b) => b.seq - a.seq);
+  const events = rows.slice(0, limit);
+  const more = rows.length > limit;
+  const last = events[events.length - 1];
+  const next = more && last ? last.seq : null;
+  return json({
+    events,
+    next_before: next,
+    next_cursor: next === null ? null : btoa(`seq:${next}`).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""),
+  });
+}
+
 const meSecurity: components["schemas"]["MeSecurityResponse"] = {
   subject: "a.kim",
   step_up: "enforce",
@@ -1156,10 +1220,7 @@ function route(pathname: string, search: string, method: string): Response | nul
     return json({ events: securityEvents.filter((e) => e.subject === "a.kim") });
   }
   if (/^\/v1\/orgs\/[^/]+\/security\/summary$/.test(p)) return json(orgSecuritySummary);
-  if (/^\/v1\/orgs\/[^/]+\/security\/events$/.test(p)) {
-    const kinds = new URLSearchParams(search).get("kind")?.split(",").filter(Boolean) ?? [];
-    return json({ events: securityEvents.filter((e) => !kinds.length || kinds.includes(e.kind)) });
-  }
+  if (/^\/v1\/orgs\/[^/]+\/security\/events$/.test(p)) return orgEventsPage(search);
   if (p === "/v1/step-up/requests/req-demo-1") return json(stepUpRequest);
   // Removing a passkey is always-ask: answer with the refusal so the step-up
   // dialog can be eyeballed (Cancel returns the 403 to the page).

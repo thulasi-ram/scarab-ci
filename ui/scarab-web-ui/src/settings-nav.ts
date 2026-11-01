@@ -40,7 +40,8 @@ export const ORG_SECTIONS: readonly SettingsSection[] = [
   { id: "libraries", label: "Libraries", sub: "installed libraries" },
   { id: "secrets", label: "Secrets", sub: "org-wide secrets" },
   { id: "tokens", label: "API tokens", sub: "machine credentials" },
-  { id: "security", label: "Security", sub: "step-up and the security event log" },
+  { id: "security", label: "Security", sub: "step-up posture and recent refusals" },
+  { id: "events", label: "Event log", sub: "every security event, filterable" },
 ];
 
 export const accountHref = (section: string) => `/settings/${section}`;
