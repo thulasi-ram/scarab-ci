@@ -11,6 +11,7 @@ import RunDetail from "./routes/RunDetail";
 import RunPipeline from "./routes/RunPipeline";
 import { AccountSettings, LegacySettings, OrgSettings } from "./routes/Settings";
 import LibraryReview from "./routes/LibraryReview";
+import { EnvironmentEdit, EnvironmentView } from "./routes/EnvironmentPage";
 import ConfirmRequest from "./routes/ConfirmRequest";
 
 export default function App() {
@@ -37,6 +38,12 @@ export default function App() {
       {/* Install or upgrade a library: its own page, so the
           review can be sent to a second reviewer. */}
       <Route path="/orgs/:org/settings/libraries/review" component={LibraryReview} />
+      {/* One Environment (git-bug c11abc5): read-only, and its edit screen.
+          Five and six segments under the static /orgs, so they collide with
+          neither the settings sections nor /:org/:repo/runs/:id; the name is
+          one encoded segment. */}
+      <Route path="/orgs/:org/settings/environments/:env" component={EnvironmentView} />
+      <Route path="/orgs/:org/settings/environments/:env/edit" component={EnvironmentEdit} />
       {/* Old addresses, kept for bookmarks and links sent before the move. */}
       <Route path="/settings/libraries/review" component={LegacySettings} />
       <Route path="/account" component={LegacySettings} />

@@ -18,6 +18,7 @@ import {
   type RulesForm,
   type RulesLike,
 } from "./environment-overlays";
+import { orgHref } from "./settings-nav";
 
 /** The editable fields. The name is the URL, not the body. */
 export type OrgEnvironmentForm = {
@@ -67,7 +68,7 @@ export function toPutBody(form: OrgEnvironmentForm): { body: OrgEnvironmentBody 
 // `/:org/:repo/runs/:id` or the four-segment settings sections. The name is
 // one encoded segment: names may hold `/`, spaces and `%`.
 
-const sectionHref = (org: string) => `/orgs/${encodeURIComponent(org)}/settings/environments`;
+const sectionHref = (org: string) => orgHref(org, "environments");
 
 /** The Environments list in org settings. */
 export const environmentsHref = (org: string) => sectionHref(org);

@@ -3243,11 +3243,26 @@ h1, .crumb-head, .run-title {
 .tok-life-unit { font-size: 12px; color: var(--muted-sage); margin-right: 4px; }
 .tok-preset-on { border-color: var(--emerald); color: var(--emerald); }
 
-/* ---- org Environments (ADR-0071) ---- */
+/* ---- org Environments ---- */
 /* Rows reuse the token block's rhythm (.tok/.tok-head/.tok-facts); only what a
    token has no equivalent for is here: two actions, a description, a source
    list, and the editable source rows in the dialog. */
 .oenv-actions { margin-left: auto; display: inline-flex; gap: 6px; }
+.oenv-link { color: inherit; text-decoration: none; }
+.oenv-link:hover { color: var(--emerald); text-decoration: underline; text-underline-offset: 3px; }
+/* The Environment's edit screen: numbered sections in one bordered form, then
+   the per-project grants, then Delete. */
+.env-sec { display: flex; flex-direction: column; gap: 8px; padding-bottom: 14px; border-bottom: 1px solid var(--border-soft); }
+.env-sec:last-child { border-bottom: 0; padding-bottom: 0; }
+.env-sec-h { display: flex; align-items: center; gap: 10px; margin: 0; font-size: var(--fs-lg); font-weight: 600; color: var(--soft-white); }
+.env-sec-n { display: inline-grid; place-items: center; width: 22px; height: 22px; border: 1px solid var(--border); border-radius: 50%; font-size: var(--fs-xs); font-weight: 400; color: var(--muted-sage); }
+.env-sec-body { display: flex; flex-direction: column; gap: 10px; }
+.env-sec-body label:not(.checkbox-inline) { font-size: var(--fs-sm); color: var(--sage); margin-bottom: 4px; }
+.input-static { color: var(--sage); background: var(--pine-deep); user-select: all; }
+.env-danger { border-color: color-mix(in srgb, var(--danger) 45%, var(--border)); }
+.env-danger p { margin: 0; font-size: var(--fs-md); }
+.typed-confirm { display: flex; flex-direction: column; gap: 8px; max-width: 420px; }
+.typed-confirm label { display: flex; flex-direction: column; gap: 6px; font-size: var(--fs-sm); color: var(--sage); }
 /* ADR-0071 §10 step 8: the split report above the Environment list. */
 .oenv-report { border: 1px dashed var(--line, currentColor); border-radius: 8px; padding: 10px 12px; margin-bottom: 12px; }
 .oenv-report-h { display: flex; align-items: center; gap: 8px; font-size: 12.5px; }
