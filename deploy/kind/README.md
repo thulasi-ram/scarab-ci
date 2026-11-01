@@ -90,7 +90,10 @@ bucket on those two servers:
 
 Switching modes deletes the Depot's warm PVC. The warm tier caches blobs of
 one bucket, and would otherwise serve the new mode reads its bucket cannot
-back. The Depot is a cache (ADR-0066), so it refills from the bucket.
+back. The Depot is a cache (ADR-0066), so it refills from the bucket. A switch
+is refused while step Pods (label `scarab.io/run`) of the current mode are
+running, since they would carry on against the other mode's server, Depot and
+secrets; `SCARAB_KIND_FORCE_SWITCH=1` switches anyway.
 
 Dev secrets (master key, workspace token secret, results token secret) are
 generated once into `deploy/kind/.state/` (gitignored, mode 600) and kept
@@ -155,6 +158,7 @@ port, and proc mode's teardown deletes the `scarab-dev` cluster.
 |---|---|---|
 | `SCARAB_KIND_PROFILE` | `dev` | cargo profile for the binaries (`release` for a faster drain, slower build) |
 | `SCARAB_KIND_SKIP_BUILD` | `0` | `1` uses the binaries already in `.mount/bin` |
+| `SCARAB_KIND_FORCE_SWITCH` | `0` | `1` switches dev <-> dogfood while step Pods are running |
 | `SCARAB_KIND_RECREATE` | `0` | `1` deletes and recreates a `scarab-dev` cluster that does not fit (its data goes with it) |
 | `SCARAB_DEV_ORG` | `thulasi-ram` | org whose `production` Environment dev mode seeds |
 | `SCARAB_DOGFOOD_ENV` | `~/.config/scarab/dogfood.env` | the dogfood env file |
