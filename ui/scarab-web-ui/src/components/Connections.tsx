@@ -54,6 +54,7 @@ import { relTime } from "../fmt";
 import { confirmsName } from "../org-environments";
 import { me, refetchMe } from "../session";
 import { orgHref } from "../settings-nav";
+import FormSection from "./FormSection";
 import Icon from "./Icon";
 
 /** Where a connection's own management lives, when the forge has such a page. */
@@ -122,18 +123,16 @@ export default function Connections(props: { org: string }) {
         </div>
         <Show when={adding()}>
           <div class="modal-scrim" onClick={() => setAdding(false)}>
-            <div class="modal" onClick={(e) => e.stopPropagation()}>
+            <div class="modal modal-tall" onClick={(e) => e.stopPropagation()}>
               <div class="panel-h"><span>Add Forgejo connection</span></div>
-              <div class="modal-body">
-                <ForgejoConnectionForm
-                  org={props.org}
-                  onSaved={() => {
-                    reload();
-                    setAdding(false);
-                  }}
-                  onCancel={() => setAdding(false)}
-                />
-              </div>
+              <ForgejoConnectionForm
+                org={props.org}
+                onSaved={() => {
+                  reload();
+                  setAdding(false);
+                }}
+                onCancel={() => setAdding(false)}
+              />
             </div>
           </div>
         </Show>
@@ -209,7 +208,8 @@ export function ConnectForge() {
  * on the server, that can render it back.
  *
  * With `org`, the org is fixed (the org page it was opened from) and shown
- * read-only; without it, the caller names a new org.
+ * read-only; without it, the caller names a new org. With `onCancel` it is a
+ * dialog's content: the sections in `.modal-body`, the actions in `.modal-foot`.
  */
 function ForgejoConnectionForm(props: {
   org?: string;
@@ -246,76 +246,62 @@ function ForgejoConnectionForm(props: {
     }
   };
 
-  return (
-    <div class="conn-form">
-      <section class="env-sec">
-        <h2 class="env-sec-h">
-          <span class="env-sec-n mono">1</span>
-          Organization
-        </h2>
-        <div class="env-sec-body">
-          <Show
-            when={props.org}
-            fallback={
-              <>
-                <label for="conn-org">forge account that owns the repositories</label>
-                <input
-                  id="conn-org"
-                  class="input mono"
-                  placeholder="acme"
-                  value={newOrg()}
-                  onInput={(e) => setNewOrg(e.currentTarget.value)}
-                />
-                <Show when={newOrg().trim() !== "" && orgProblem()}>
-                  <p class="fieldnote">{orgProblem()}</p>
-                </Show>
-              </>
-            }
-          >
-            <div class="input input-static mono" aria-label="Organization">
-              {props.org}
-            </div>
-            <p class="fieldnote">The connection binds only repositories owned by this account.</p>
-          </Show>
-        </div>
-      </section>
-      <section class="env-sec">
-        <h2 class="env-sec-h">
-          <span class="env-sec-n mono">2</span>
-          Forgejo instance
-        </h2>
-        <div class="env-sec-body">
-          <label for="conn-url">instance URL</label>
-          <input
-            id="conn-url"
-            class="input mono"
-            placeholder="https://codeberg.org"
-            value={baseUrl()}
-            onInput={(e) => setBaseUrl(e.currentTarget.value)}
-          />
-        </div>
-      </section>
-      <section class="env-sec">
-        <h2 class="env-sec-h">
-          <span class="env-sec-n mono">3</span>
-          Access token
-        </h2>
-        <div class="env-sec-body">
-          <label for="conn-token">token</label>
-          <input
-            id="conn-token"
-            class="input"
-            type="password"
-            placeholder="token (write-only)"
-            value={token()}
-            onInput={(e) => setToken(e.currentTarget.value)}
-          />
-          <p class="fieldnote">
-            It needs repository read and webhook administration on the repositories you intend to
-            build. It is stored encrypted and never displayed again.
-          </p>
-        </div>
-      </section>
+  const sections = (
+    <>
+      <FormSection n={1} title="Organization">
+        <Show
+          when={props.org}
+          fallback={
+            <>
+              <label for="conn-org">forge account that owns the repositories</label>
+              <input
+                id="conn-org"
+                class="input mono"
+                placeholder="acme"
+                value={newOrg()}
+                onInput={(e) => setNewOrg(e.currentTarget.value)}
+              />
+              <Show when={newOrg().trim() !== "" && orgProblem()}>
+                <p class="fieldnote">{orgProblem()}</p>
+              </Show>
+            </>
+          }
+        >
+          <div class="input input-static mono" aria-label="Organization">
+            {props.org}
+          </div>
+          <p class="fieldnote">The connection binds only repositories owned by this account.</p>
+        </Show>
+      </FormSection>
+      <FormSection n={2} title="Forgejo instance">
+        <label for="conn-url">instance URL</label>
+        <input
+          id="conn-url"
+          class="input mono"
+          placeholder="https://codeberg.org"
+          value={baseUrl()}
+          onInput={(e) => setBaseUrl(e.currentTarget.value)}
+        />
+      </FormSection>
+      <FormSection n={3} title="Access token">
+        <label for="conn-token">token</label>
+        <input
+          id="conn-token"
+          class="input"
+          type="password"
+          placeholder="token (write-only)"
+          value={token()}
+          onInput={(e) => setToken(e.currentTarget.value)}
+        />
+        <p class="fieldnote">
+          It needs repository read and webhook administration on the repositories you intend to
+          build. It is stored encrypted and never displayed again.
+        </p>
+      </FormSection>
+    </>
+  );
+  const actions = (
+    <>
       <Show when={error()}>
         <p class="error">{error()}</p>
       </Show>
@@ -331,7 +317,22 @@ function ForgejoConnectionForm(props: {
           )}
         </Show>
       </div>
-    </div>
+    </>
+  );
+
+  return (
+    <Show
+      when={props.onCancel}
+      fallback={
+        <div class="conn-form">
+          {sections}
+          {actions}
+        </div>
+      }
+    >
+      <div class="modal-body">{sections}</div>
+      <div class="modal-foot">{actions}</div>
+    </Show>
   );
 }
 
@@ -874,9 +875,13 @@ function AddRepoDialog(props: {
     void add(owner, name);
   };
 
+  // The forge cannot list its repositories, so the dialog asks for one by name
+  // and its footer carries Add.
+  const typing = () => !avail.loading && avail() == null;
+
   return (
     <div class="modal-scrim" onClick={props.onClose}>
-      <div class="modal" onClick={(e) => e.stopPropagation()}>
+      <div class="modal modal-tall" onClick={(e) => e.stopPropagation()}>
         <div class="panel-h"><span>Add repository</span></div>
         <div class="modal-body">
           <Show when={avail.error}>
@@ -897,17 +902,11 @@ function AddRepoDialog(props: {
                   <div class="form-r">
                     <label>repository</label>
                     <input
-                      class="input"
+                      class="input mono"
                       placeholder={`${org()}/name`}
                       value={manualRepo()}
                       onInput={(e) => setManualRepo(e.currentTarget.value)}
                     />
-                  </div>
-                  <div class="modal-actions">
-                    <button class="btn btn-primary" disabled={busy() != null} onClick={addTyped}>
-                      <Icon icon="plus" size={14} /> Add
-                    </button>
-                    <button class="btn btn-ghost" onClick={props.onClose}>Cancel</button>
                   </div>
                 </>
               }
@@ -963,15 +962,25 @@ function AddRepoDialog(props: {
               </small>
             </p>
           </Show>
-          <Show when={error()}>
-            <p class="error">{error()}</p>
-          </Show>
           <p class="subtle modal-note">
             <small>
               Adding a repository creates its project and registers a webhook, so pushes
               start runs.
             </small>
           </p>
+        </div>
+        <div class="modal-foot">
+          <Show when={error()}>
+            <p class="error">{error()}</p>
+          </Show>
+          <div class="modal-actions">
+            <Show when={typing()}>
+              <button class="btn btn-primary" disabled={busy() != null} onClick={addTyped}>
+                <Icon icon="plus" size={14} /> Add
+              </button>
+            </Show>
+            <button class="btn btn-ghost" onClick={props.onClose}>Cancel</button>
+          </div>
         </div>
       </div>
     </div>
