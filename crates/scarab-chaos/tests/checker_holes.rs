@@ -115,8 +115,10 @@ fn clean() -> Facts {
         events: vec![
             ev(1, serde_json::json!({"AttemptStarted": {"step": "produce", "attempt": "a1"}})),
             ev(2, serde_json::json!({"AttemptFinished": {"step": "produce", "attempt": "a1", "failure": null}})),
+            ev(2, serde_json::json!({"StepTransitioned": {"step": "produce", "from": "Running", "to": "Succeeded"}})),
             ev(3, serde_json::json!({"AttemptStarted": {"step": "consume", "attempt": "a1"}})),
             ev(4, serde_json::json!({"AttemptFinished": {"step": "consume", "attempt": "a1", "failure": null}})),
+            ev(4, serde_json::json!({"StepTransitioned": {"step": "consume", "from": "Running", "to": "Succeeded"}})),
             ev(5, serde_json::json!({"RunTransitioned": {"from": "Running", "to": "Succeeded"}})),
         ],
         attempts: vec![

@@ -14,6 +14,7 @@
 //! | I1b  | Attempt N+1's step container starts after Attempt N's ended, or after N was journalled finished or superseded or N's Pod was gone (only the journal counts for an N whose step container was never seen); an overlap after that is allowed until N's container has run the Pod's `terminationGracePeriodSeconds` + 30 s past its Pod's removal, and fails past it |
 //! | I1c  | no double execution: per Step at most one succeeded Attempt, one `AttemptStarted` and one `AttemptFinished` per journalled Attempt (with an `attempts` row or not), and a Succeeded Step's evidence Attempt is that one |
 //! | T1   | exactly one terminal `RunTransitioned` per Run, matching `runs.status` |
+//! | I5   | folding each Run's journal (its last `RunTransitioned`, and per Step its last `StepTransitioned` or `StepSkipped`) gives `runs.status` and `step_runs.status` |
 //! | I3   | every scenario Run terminal within the quiesce bound, and none left with `creating = TRUE` |
 //! | I4   | every green Attempt's output snapshot closure is in committed packs whose ranges read back and hash to their addresses; a member in another fence's pack needs a `depot_fence_borrows` edge |
 //! | I8   | after quiesce no Pod of a scenario Run is still pending or running, and no per-Pod Secret outlives its Pod |
@@ -33,6 +34,12 @@
 //! when it fired. It is also INCONCLUSIVE when an invariant looked at fewer
 //! things than the workload must produce ([`minimums`]). A FAIL finding still
 //! makes the verdict FAIL.
+//!
+//! I5 folds the transition events in the checker. `scarab-engine` exports no
+//! fold, and the checker does not link the engine it checks. A mismatch
+//! between two non-terminal statuses (`pending` against `ready`) is reported
+//! as a warning: not every admission step is journalled, and after quiesce
+//! every row is terminal anyway.
 //!
 //! I1b compares consecutive Attempts of one Step. A Depot fault does not
 //! cause a retry, so rank 1 never has a pair: I1b is reported as not
@@ -256,6 +263,9 @@ fn attempt_number(a: &str) -> u64 {
 
 const TERMINAL: &[&str] = &["Succeeded", "Failed", "Cancelled", "DeadLettered"];
 
+/// Terminal `step_runs.status` values.
+const STEP_TERMINAL: &[&str] = &["succeeded", "failed", "skipped", "cancelled"];
+
 fn status_token(to: &str) -> String {
     match to {
         "DeadLettered" => "dead_lettered".into(),
@@ -341,6 +351,7 @@ pub fn minimums(runs: usize, checked: &BTreeMap<String, usize>) -> Vec<String> {
         ("I3", runs, "one per scenario Run"),
         ("I1a", attempts, "the Pod of every Attempt, as the watcher saw it"),
         ("I1c", attempts, "every Step of every Run"),
+        ("I5", runs + attempts, "every Run row and Step row"),
         ("I4", attempts, "every green Attempt's snapshot, read back"),
     ];
     want.iter()
@@ -588,6 +599,59 @@ pub fn evaluate(f: &Facts) -> Verdict {
         }
     }
     checked.insert("T1".into(), f.runs.len());
+
+    // I5: the journal folds to the projected rows.
+    let mut i5 = 0;
+    for r in &f.runs {
+        if r.status == "missing" {
+            continue; // I3 and the minimums report a Run with no row
+        }
+        i5 += 1;
+        let folded = f
+            .events
+            .iter()
+            .filter(|e| e.run == r.id && event_kind(&e.payload) == "RunTransitioned")
+            .max_by_key(|e| e.seq)
+            .and_then(|e| event_field(&e.payload, "to"))
+            .map(status_token)
+            .unwrap_or_else(|| "pending".into());
+        if folded != r.status {
+            let terminal = |s: &str| crate::env::TERMINAL_RUN_STATUSES.contains(&s);
+            let detail = format!("run {}: the journal folds to {folded}, runs.status is {}", r.id, r.status);
+            findings.push(if terminal(&folded) || terminal(&r.status) {
+                fail("I5", detail)
+            } else {
+                warn("I5", detail)
+            });
+        }
+    }
+    for s in &f.steps {
+        i5 += 1;
+        let folded = f
+            .events
+            .iter()
+            .filter(|e| e.run == s.run && event_field(&e.payload, "step") == Some(s.step.as_str()))
+            .filter(|e| matches!(event_kind(&e.payload), "StepTransitioned" | "StepSkipped"))
+            .max_by_key(|e| e.seq)
+            .map(|e| match event_kind(&e.payload) {
+                "StepSkipped" => "skipped".to_string(),
+                _ => event_field(&e.payload, "to").unwrap_or_default().to_ascii_lowercase(),
+            })
+            .unwrap_or_else(|| "pending".into());
+        if folded != s.status {
+            let terminal = |x: &str| STEP_TERMINAL.contains(&x);
+            let detail = format!(
+                "run {} step {}: the journal folds to {folded}, step_runs.status is {}",
+                s.run, s.step, s.status
+            );
+            findings.push(if terminal(&folded) || terminal(&s.status) {
+                fail("I5", detail)
+            } else {
+                warn("I5", detail)
+            });
+        }
+    }
+    checked.insert("I5".into(), i5);
 
     // I3: terminal within the bound.
     for r in &f.runs {
@@ -1196,7 +1260,8 @@ mod tests {
             events: vec![
                 ev("r", 1, serde_json::json!({"AttemptStarted": {"step": "s", "attempt": "a1"}})),
                 ev("r", 2, serde_json::json!({"AttemptFinished": {"step": "s", "attempt": "a1", "failure": null}})),
-                ev("r", 3, serde_json::json!({"RunTransitioned": {"from": "Running", "to": "Succeeded"}})),
+                ev("r", 3, serde_json::json!({"StepTransitioned": {"step": "s", "from": "Running", "to": "Succeeded"}})),
+                ev("r", 4, serde_json::json!({"RunTransitioned": {"from": "Running", "to": "Succeeded"}})),
             ],
             attempts: vec![AttemptRow {
                 run: "r".into(),
@@ -1339,6 +1404,27 @@ mod tests {
         let mut f = base();
         f.runs[0].creating = true;
         assert_eq!(failed(&evaluate(&f)), vec!["I3"]);
+    }
+
+    #[test]
+    fn a_row_the_journal_does_not_fold_to_fails_i5() {
+        // The step row went terminal with no journalled transition
+        // (git-bug 586187a: the CAS and its event in separate writes).
+        let mut f = base();
+        f.events.retain(|e| event_kind(&e.payload) != "StepTransitioned");
+        let v = evaluate(&f);
+        assert_eq!(failed(&v), vec!["I5"], "{:?}", v.findings);
+        assert!(v.findings[0].detail.contains("folds to pending, step_runs.status is succeeded"));
+        // The journal says Failed, the row says succeeded.
+        let mut f = base();
+        f.events[2] = ev("r", 3, serde_json::json!({"StepTransitioned": {"step": "s", "from": "Running", "to": "Failed"}}));
+        assert_eq!(failed(&evaluate(&f)), vec!["I5"]);
+        // A later rerun's transition wins the fold: Succeeded, then
+        // re-armed to Pending, while the row says pending.
+        let mut f = base();
+        f.events.push(ev("r", 9, serde_json::json!({"StepTransitioned": {"step": "s", "from": "Succeeded", "to": "Pending"}})));
+        f.steps[0].status = "pending".into();
+        assert!(!evaluate(&f).findings.iter().any(|x| x.invariant == "I5"));
     }
 
     #[test]
