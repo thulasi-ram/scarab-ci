@@ -46,7 +46,7 @@ ADR-0017, CONTEXT.md §8.
 6. **The compiler is a test tier.** Don't demand unit tests for what the
    type system already pins. Spend the budget on functional (router+engine),
    module-E2E (kind), and cross-layer E2E instead.
-7. **k8s is the product.** `scarab-executor-local` and proc-mode plumbing
+7. **k8s is the product.** `scarab-executor-local` and host-process plumbing
    get minimal coverage; anything touching Pod specs, sidecars, fences,
    log tailing, or teardown needs coverage that reaches a real apiserver
    (kind tier) or, at minimum, the pod-spec unit suite in

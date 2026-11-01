@@ -1892,8 +1892,8 @@ async fn build_step_builds_and_pushes_to_a_local_registry() {
 /// image) drains it on step exit and POSTs it — token-authenticated — to the
 /// ingest URL (a stub listener on the host standing in for the control
 /// plane). Needs SCARAB_TEST_SIDECAR_IMAGE (in-cluster image) and
-/// SCARAB_TEST_HOST_IP (host address reachable from Pods; colima:
-/// 192.168.5.2). `#[ignore]`d + SCARAB_TEST_KUBE gated.
+/// SCARAB_TEST_HOST_IP (host address reachable from Pods; `just kube-tests`
+/// probes it from a Pod). `#[ignore]`d + SCARAB_TEST_KUBE gated.
 #[tokio::test]
 #[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
 async fn results_sidecar_captures_a_named_result_end_to_end() {

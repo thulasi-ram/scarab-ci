@@ -214,7 +214,7 @@ jobs:
       # env vars, same `server /data`, same entrypoint. Pinned by digest — bump the
       # tag AND the digest together, never to a floating tag again.
       # Same image + credentials as the dev compose stack
-      # (deploy/local-proc/compose.yaml), so local and CI disagree about
+      # (deploy/test-services/compose.yaml), so local and CI disagree about
       # nothing. The runner's preinstalled aws CLI creates the bucket.
       - name: Start MinIO (live object-store tier)
         run: |
