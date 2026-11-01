@@ -61,9 +61,6 @@ chmod 700 "$state"
 # --- mode config ------------------------------------------------------------
 # The dogfood env file is read key by key, never sourced and never printed:
 # it holds the App key path, the webhook secret and the master key.
-env_get() { # $1 file, $2 key: the value after the FIRST '=' (base64 keeps its '=')
-  sed -n "s/^$2=//p" "$1" | tail -n 1
-}
 if [ "$mode" = dogfood ]; then
   [ -f "$dogfood_env" ] || die "$dogfood_env does not exist (see deploy/kind/README.md)"
   missing=""
@@ -87,16 +84,10 @@ else
   bucket=scarab-logs
 fi
 
-# The host port: SCARAB_ADDR from deploy/local-proc/.env, the one dev env file
-# `just ui` also reads (its SCARAB_API_URL must name the same port). Only that
-# key is read; the rest of the file describes proc mode.
-proc_env="$root/deploy/local-proc/.env"
-[ -f "$proc_env" ] || proc_env="$root/deploy/local-proc/.env.example"
-addr="$(env_get "$proc_env" SCARAB_ADDR)"
-addr="${addr:-127.0.0.1:8080}"
-host_ip="${addr%:*}"
-host_port="${addr##*:}"
-base="http://${host_ip/0.0.0.0/127.0.0.1}:$host_port"
+# The host port: SCARAB_ADDR from deploy/local-proc/.env (lib.sh scarab_addr;
+# `just ui`'s SCARAB_API_URL must name the same port). Only that key is read;
+# the rest of the file describes proc mode.
+scarab_addr   # addr_file, host_ip, host_port, base
 
 port_listening() { (exec 3<>"/dev/tcp/$1/$2") 2>/dev/null; }
 
@@ -172,39 +163,50 @@ fi
 
 # --- 2. the cluster ---------------------------------------------------------
 # A `scarab-dev` cluster must have this worktree's mount and this host port, both
-# fixed at creation. One created by proc mode (deploy/local-proc/kind.yaml) or
-# by another worktree has neither, so it is recreated.
+# fixed at creation. One created by proc mode (deploy/local-proc/kind.yaml), by
+# another worktree, or before SCARAB_ADDR changed has neither. Recreating it
+# deletes its Postgres and MinIO data, so that needs SCARAB_KIND_RECREATE=1.
+misfit=""
 cluster_fits() {
-  docker inspect "$node" >/dev/null 2>&1 || return 1
+  docker inspect "$node" >/dev/null 2>&1 || { misfit="its node container $node is missing"; return 1; }
   local mounts ports
   mounts="$(docker inspect -f '{{range .Mounts}}{{.Source}}={{.Destination}}{{"\n"}}{{end}}' "$node")"
-  printf '%s\n' "$mounts" | grep -qxF "$mount=$node_mount" || return 1
+  printf '%s\n' "$mounts" | grep -qxF "$mount=$node_mount" \
+    || { misfit="it does not mount this worktree's $mount (another worktree or proc mode created it)"; return 1; }
   ports="$(docker inspect -f '{{range $p, $b := .HostConfig.PortBindings}}{{range $b}}{{$p}}={{.HostIp}}:{{.HostPort}}{{"\n"}}{{end}}{{end}}' "$node")"
-  printf '%s\n' "$ports" | grep -qxF "$node_port/tcp=$host_ip:$host_port" || return 1
+  printf '%s\n' "$ports" | grep -qxF "$node_port/tcp=$host_ip:$host_port" \
+    || { misfit="it does not publish the API on $host_ip:$host_port (SCARAB_ADDR in $addr_file changed since it was created)"; return 1; }
 }
-if kind get clusters 2>/dev/null | grep -qx "$cluster"; then
-  if cluster_fits; then
-    echo "==> reusing kind cluster '$cluster'"
-    if [ "$(docker inspect -f '{{.State.Running}}' "$node")" != true ]; then
-      echo "    its node container is stopped; starting it"
-      docker start "$node" >/dev/null || die "could not start the stopped node container $node ('just down' deletes the cluster)"
-    fi
-    kind export kubeconfig --name "$cluster" --kubeconfig "$kubeconfig" >/dev/null \
-      || die "could not export the kubeconfig of kind cluster '$cluster'"
-    for _ in $(seq 1 60); do
-      ( kc get --raw /readyz ) >/dev/null 2>&1 && break
-      sleep 2
-    done
-  else
-    echo "==> kind cluster '$cluster' lacks this worktree's mount or host port $host_ip:$host_port; recreating it"
-    kind delete cluster --name "$cluster" --kubeconfig "$kubeconfig"
+exists=0
+kind get clusters 2>/dev/null | grep -qx "$cluster" && exists=1
+if [ "$exists" = 1 ] && cluster_fits; then
+  echo "==> reusing kind cluster '$cluster'"
+  if [ "$(docker inspect -f '{{.State.Running}}' "$node")" != true ]; then
+    echo "    its node container is stopped; starting it"
+    docker start "$node" >/dev/null || die "could not start the stopped node container $node ('just down' deletes the cluster)"
   fi
-fi
-if ! kind get clusters 2>/dev/null | grep -qx "$cluster"; then
-  if port_listening "${host_ip/0.0.0.0/127.0.0.1}" "$host_port"; then
-    die "something already listens on $host_ip:$host_port (SCARAB_ADDR in $proc_env).
-  A proc-mode server ('just down' stops it) or a 'just serve'? Find it with:
+  kind export kubeconfig --name "$cluster" --kubeconfig "$kubeconfig" >/dev/null \
+    || die "could not export the kubeconfig of kind cluster '$cluster'"
+  for _ in $(seq 1 60); do
+    ( kc get --raw /readyz ) >/dev/null 2>&1 && break
+    sleep 2
+  done
+else
+  # The port first, before anything is deleted. The existing node holding it
+  # is not a conflict: deleting the cluster frees it.
+  if port_listening "${host_ip/0.0.0.0/127.0.0.1}" "$host_port" \
+     && ! { [ "$exists" = 1 ] && docker port "$node" 2>/dev/null | grep -q ":$host_port\$"; }; then
+    die "something already listens on $host_ip:$host_port (SCARAB_ADDR in $addr_file).
+  A proc-mode server ('deploy/local-proc/down.sh' stops it) or a 'just serve'? Find it with:
     lsof -nP -iTCP:$host_port -sTCP:LISTEN"
+  fi
+  if [ "$exists" = 1 ]; then
+    [ "${SCARAB_KIND_RECREATE:-0}" = 1 ] || die "kind cluster '$cluster' does not fit: $misfit.
+  Recreating it deletes its Postgres and MinIO data (both modes' databases and buckets).
+  Run 'just up' from the worktree or with the SCARAB_ADDR that created it, or
+  recreate it: SCARAB_KIND_RECREATE=1 just up   (or 'just down' first)"
+    echo "==> SCARAB_KIND_RECREATE=1: deleting kind cluster '$cluster' ($misfit)"
+    kind delete cluster --name "$cluster" --kubeconfig "$kubeconfig"
   fi
   cat > "$state/kind.yaml" <<EOF
 # Generated by deploy/kind/up.sh; do not edit.

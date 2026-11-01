@@ -132,7 +132,15 @@ that its server is the API port docker publishes for `scarab-dev-control-plane`
 `deploy/kind/kubectl.sh <args>` runs kubectl the same way.
 
 A `scarab-dev` cluster without this worktree's mount or the host port (one
-proc mode created, or one from another worktree) is deleted and recreated.
+proc mode created, one from another worktree, or one from before
+`SCARAB_ADDR` changed) is refused with the reason, since recreating it deletes
+its Postgres and MinIO data. `SCARAB_KIND_RECREATE=1 just up` recreates it.
+The host port is checked first, so a port held by something else stops
+`just up` before anything is deleted.
+
+`SCARAB_ADDR` is read by one helper (`scarab_addr` in `lib.sh`) for `up.sh`
+and `just demo`: a trailing comment, quotes and CRLF are dropped, `localhost`
+or an empty host means `127.0.0.1`, a missing port means `8080`.
 
 ## Proc mode
 
@@ -147,6 +155,7 @@ port, and proc mode's teardown deletes the `scarab-dev` cluster.
 |---|---|---|
 | `SCARAB_KIND_PROFILE` | `dev` | cargo profile for the binaries (`release` for a faster drain, slower build) |
 | `SCARAB_KIND_SKIP_BUILD` | `0` | `1` uses the binaries already in `.mount/bin` |
+| `SCARAB_KIND_RECREATE` | `0` | `1` deletes and recreates a `scarab-dev` cluster that does not fit (its data goes with it) |
 | `SCARAB_DEV_ORG` | `thulasi-ram` | org whose `production` Environment dev mode seeds |
 | `SCARAB_DOGFOOD_ENV` | `~/.config/scarab/dogfood.env` | the dogfood env file |
 | `SCARAB_DOGFOOD_DEV_INSECURE` | `true` | dogfood's `scarab.devInsecure` |

@@ -76,9 +76,8 @@ reload:
 demo:
     #!/usr/bin/env bash
     set -euo pipefail
-    addr="$(sed -n 's/^SCARAB_ADDR=//p' deploy/local-proc/.env 2>/dev/null | tail -n 1)"
-    addr="${addr:-127.0.0.1:8080}"
-    SCARAB_BASE="${SCARAB_BASE:-http://${addr/0.0.0.0/127.0.0.1}}"     SCARAB_DEMO_IMAGE="${SCARAB_DEMO_IMAGE:-scarab-clone:dev}"       bash deploy/local-proc/demo.sh
+    . deploy/kind/lib.sh; scarab_addr   # base: SCARAB_ADDR, normalised
+    SCARAB_BASE="${SCARAB_BASE:-$base}"     SCARAB_DEMO_IMAGE="${SCARAB_DEMO_IMAGE:-scarab-clone:dev}"       bash deploy/local-proc/demo.sh
 
 # `just demo` is ONE step with no `needs:`, so it never crosses a Step boundary and
 # exercises the workspace drain and none of the feed. Since ADR-0061 s3-feed the
@@ -90,9 +89,8 @@ demo:
 demo-chain:
     #!/usr/bin/env bash
     set -euo pipefail
-    addr="$(sed -n 's/^SCARAB_ADDR=//p' deploy/local-proc/.env 2>/dev/null | tail -n 1)"
-    addr="${addr:-127.0.0.1:8080}"
-    SCARAB_BASE="${SCARAB_BASE:-http://${addr/0.0.0.0/127.0.0.1}}"     SCARAB_DEMO_IMAGE="${SCARAB_DEMO_IMAGE:-scarab-clone:dev}"       bash deploy/local-proc/demo-chain.sh
+    . deploy/kind/lib.sh; scarab_addr   # base: SCARAB_ADDR, normalised
+    SCARAB_BASE="${SCARAB_BASE:-$base}"     SCARAB_DEMO_IMAGE="${SCARAB_DEMO_IMAGE:-scarab-clone:dev}"       bash deploy/local-proc/demo-chain.sh
 
 # Tear down the kind dev stack. `just down keep` uninstalls the release only and
 # keeps the cluster, Postgres, MinIO and their data.
