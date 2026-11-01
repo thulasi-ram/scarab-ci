@@ -1,6 +1,6 @@
 # 0077. End-to-end, fault and agent-driven testing: one invariant checker, a few fault scenarios on a throwaway cluster, and a red-team agent that only writes tests
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-11-01)
 - **Date:** 2026-10-31
 - **Deciders:** thulasi.ram (architect)
 - **Builds on:** [0017](0017-testing-strategy.md) (classical, lean,
@@ -453,20 +453,38 @@ clone library, `forge_token` and I8's forge-token Secret, yank), and step 4 adds
 
 1. **I1(b):** may Attempt N+1's container start while Attempt N's container is still
    terminating after a `Lost` verdict? If yes, within what bound?
+   **Answered (2026-11-01):** yes, once N's Pod object is gone from the API server. I1b
+   fails if N's step container is still seen running more than the Pod's
+   `terminationGracePeriodSeconds` plus 30 s after that.
 2. **Runs left with `creating = TRUE`:** should a sweeper fail Runs whose creation is older
    than a bound (git-bug `ccbf7fe`), and is a webhook redelivery for such a Run
    deduplicated away or does it create a second Run?
+   **Answered (2026-11-01):** built on main in c711d64d. The leader fails a Run left
+   `creating = TRUE` for longer than 10 minutes (`sweep_unfinished_creations`), pinned by
+   `crates/scarab-db-postgres/tests/creation_sweep.rs`. git-bug `ccbf7fe` is closed.
 3. **Failpoints in product code**, behind a cargo feature and absent from release images:
    acceptable?
+   **Answered (2026-11-01):** yes, behind a cargo feature, and a point is added only with
+   the scenario that uses it. The four windows in §5 are already handled in code (adopt on
+   the deterministic fence, the creation sweeper, staged pack rows, the rowless-bytes
+   scan), so failpoints verify them; none is needed for ranks 2 and 4.
 4. **git-bug `12e2f6b`** (cache restores at Depot `replicaCount > 1` almost always miss): an
    accepted slow path that the checker allows, or a blocker for the 2+2 topology?
+   **Answered (2026-11-01):** neither. A Cache is routed to one home Depot replica chosen
+   from its key, so it hits at any replica count (git-bug `12e2f6b`); a home that is down or
+   remapped is a miss. See the Amendment (2026-11-01, grill).
 5. **Where fault runs happen:** a throwaway kind cluster (proposed) or colima's k3s, and may
    colima be resized to 6 vCPU and 10 GiB for them?
-   Answered in part by the Amendment (2026-11-01): the shared kind cluster. The size is
-   still open.
+   Answered in part by the Amendment (2026-11-01): the shared kind cluster.
+   **Answered (2026-11-01):** colima stays at 2 vCPU and 4 GiB; the stack measured about
+   1.0 to 1.3 GiB.
 6. **Agent budget:** a monthly cap, and does the agentic layer start with `security`
    (proposed) rather than `chaos`?
+   **Answered (2026-11-01):** the agentic layer starts with `security`. No cap until
+   `just security` exists; it is set from the cost of the first real run.
 7. **The SIGSTOP pause scenario:** in scope? It was not in the original proposal.
+   **Answered (2026-11-01):** yes, as rank 4, together with term fencing of the scheduler
+   lease (git-bug `aaf4e3e`), which the scenario proves.
 
 ## Amendment (2026-11-01): one kind cluster, one release
 
@@ -549,8 +567,44 @@ a Pod (`deploy/local-proc/up.sh`), and a host process needs a second URL for the
 ### Still open
 
 - **colima's size.** Two servers and two Depots request about 1.5 GiB (`values.yaml`). Measure
-  before resizing past 2 vCPU and 4 GiB.
+  before resizing past 2 vCPU and 4 GiB. **Answered (2026-11-01):** measured; it stays at 2
+  vCPU and 4 GiB.
 - **Two converged replicas.** `values.yaml` advises one converged replica unless roles are
-  split; rank 2 wants two.
+  split; rank 2 wants two. **Answered (2026-11-01):** N replicas are supported; see the
+  Amendment (2026-11-01, grill).
 - **The dogfood stack** on colima's k3s, stopped since 2026-10-28: move it to the kind cluster
-  or retire it.
+  or retire it. **Answered (2026-11-01):** it runs on the kind cluster as the dogfood mode;
+  colima's k3s is retired.
+
+## Amendment (2026-11-01, grill)
+
+Decided by the owner on 2026-11-01 in a grill of this ADR. The status moves to Accepted:
+ranks 0 and 1 are built, and the first Amendment is merged.
+
+### Decision
+
+1. **N server replicas are a supported topology**, converged or with split roles. Postgres is
+   the coordination bus (ADR-0016). git-bug `068cc0b` (two replicas drive one Pod's drain) is
+   fixed in the outbox claim, not by limiting replicas: `reconcile` claims a launch intent for
+   30 s and a drain inside its poll can outlast the claim. `values.yaml` says scaling is safe.
+2. **The scheduler lease gets a term**, as Raft does. Every takeover increments it, and every
+   leader-only write checks owner and term inside its own transaction with `FOR SHARE`, so a
+   leader that resumes after a takeover writes nothing (git-bug `aaf4e3e`). Rank 4 proves it.
+3. **Ranks 2 and 4 are next**, in that order: rank 2 is the evidence for item 1, rank 4 for
+   item 2. Ranks 3, 5 and 6 stay in the horizon.
+4. **I1b's bound** is the Pod's `terminationGracePeriodSeconds` plus 30 s after Attempt N's
+   Pod object is gone (open question 1).
+5. **N Depot replicas keep their Caches.** The Depot is a cache (ADR-0066), so it needs no
+   replication, sharding or sticky sessions for correctness; drains are scatter-safe since
+   git-bug `afb13c2`. A Cache was the exception: its saves and restores scattered, so at N > 1
+   it almost always missed. Each cache key now has one home replica, chosen by rendezvous
+   hashing over the StatefulSet's ordinals; the executor gives the Pod that replica's address
+   for cache content only (git-bug `12e2f6b`). Peer fill by content owner was rejected: it
+   turns the scatter into peer hops on every read path. Durable caches were rejected: they
+   reverse ADR-0065's warm-only decision. A cache root that a replica cannot walk no longer
+   fails the token's blob walk (git-bug `2a79b73`).
+6. **Recipe names.** The Justfile is grouped into modules (git-bug `c043abf`). `just e2e`
+   becomes `just test e2e` and gains the plugin runtime pass; `just chaos` becomes
+   `just test chaos`; `just forgejo-verify`, `just kube-tests` and `just plugin-kube-tests`
+   are gone, folded into `just test e2e`. The body of this ADR keeps the old names as history.
+

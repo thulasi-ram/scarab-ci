@@ -2697,6 +2697,7 @@ dependencies = [
 name = "scarab-chaos"
 version = "0.2.2"
 dependencies = [
+ "base64",
  "clap",
  "futures",
  "k8s-openapi",
@@ -2705,6 +2706,7 @@ dependencies = [
  "rand 0.8.7",
  "reqwest",
  "rustls",
+ "scarab-pipeline",
  "scarab-storage",
  "scarab-workspace-client",
  "serde",
@@ -2760,6 +2762,7 @@ version = "0.2.2"
 dependencies = [
  "axum",
  "reqwest",
+ "scarab-chaos",
  "scarab-db-postgres",
  "scarab-forge",
  "serde",
@@ -3050,7 +3053,6 @@ dependencies = [
  "tracing-subscriber",
  "utoipa",
  "uuid",
- "xattr",
 ]
 
 [[package]]

@@ -103,7 +103,7 @@ use std::os::unix::fs::PermissionsExt;
 
 use scarab_storage::{PruneError, StorageError, TreeHash};
 use scarab_workspace_client::{
-    exclude_paths, fold_manifests, termination_summary, DrainErrorKind, DrainErrorRecord,
+    exclude_paths, fold_manifests, termination_summary, CacheSaveRoute, DrainErrorKind, DrainErrorRecord,
     DrainPostOutcome, DrainRecord, FanInReport, IngestReport, MemoCas, WorkspaceClient,
     EXIT_FETCH_CONFIG, EXIT_FETCH_DENIED, EXIT_FETCH_INPUT_CONFLICT, EXIT_FETCH_MISSING_INPUTS,
     EXIT_FETCH_TRANSIENT, STEP_TIMEOUT_ENV,
@@ -117,6 +117,13 @@ use scarab_workspace_client::{
 const TOKEN_FILE_ENV: &str = "SCARAB_WORKSPACE_TOKEN_FILE";
 /// The env var carrying the workspace service's base URL.
 const URL_ENV: &str = "SCARAB_WORKSPACE_URL";
+/// The base URL of this Step's Cache **home** — the one Depot replica the
+/// executor chose from the cache key (git-bug 12e2f6b). Set only when the
+/// Depot runs more than one replica and the Step has a resolved cache key;
+/// cache restores read from it and the drain sends cache-dir content to it.
+/// Unset = the service URL serves caches too, as before. Mirrors
+/// `scarab_executor_k8s::workspace_token::WORKSPACE_CACHE_URL_ENV`.
+const CACHE_URL_ENV: &str = "SCARAB_WORKSPACE_CACHE_URL";
 /// Comma-separated **Workspace Snapshot** roots, in merge order — the immutable
 /// trees this fetcher materialises the mutable Workspace from (CONTEXT.md §4.2).
 const ROOTS_ENV: &str = "SCARAB_SNAPSHOT_ROOTS";
@@ -530,7 +537,15 @@ fn run() -> Result<(), FetchError> {
     // two would serialise — which is the property this binary exists to have.
     let runtime = tokio::runtime::Runtime::new()
         .map_err(|e| FetchError::Transient(format!("tokio runtime: {e}")))?;
-    runtime.block_on(fetch(&base, &token_file, &roots, &cache_roots, &target))?;
+    let cache_base = std::env::var(CACHE_URL_ENV).ok().filter(|v| !v.is_empty());
+    runtime.block_on(fetch(
+        &base,
+        cache_base.as_deref(),
+        &token_file,
+        &roots,
+        &cache_roots,
+        &target,
+    ))?;
 
     widen_for_the_group(std::path::Path::new(&target))?;
     println!("scarab-wsfetch: workspace provisioned at {target}");
@@ -559,6 +574,7 @@ fn apply_transfer_budget(client: WorkspaceClient) -> Result<WorkspaceClient, Str
 
 async fn fetch(
     base: &str,
+    cache_base: Option<&str>,
     token_file: &str,
     roots: &[String],
     cache_roots: &[(String, String)],
@@ -688,8 +704,35 @@ async fn fetch(
     // replica, racing eviction between mint and fetch — is a logged MISS the
     // Step recovers from by rebuilding (slower, never wrong; that property is
     // the licence for evicting a Cache at all).
+    //
+    // From the Cache's home replica when there is one (git-bug 12e2f6b): the
+    // save went there, so the whole tree is there. A home that is down,
+    // evicted the tree, or is no longer the home after a scale change is a
+    // miss like any other.
+    let home = match cache_base {
+        Some(url) if !cache_roots.is_empty() => {
+            match WorkspaceClient::from_token_file(url, token_file)
+                .map_err(|e| e.to_string())
+                .and_then(apply_transfer_budget)
+            {
+                Ok(c) => Some((c, url)),
+                Err(e) => {
+                    println!(
+                        "scarab-wsfetch: cache home {url} unusable ({e}) — restoring \
+                         through the service URL"
+                    );
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+    let (cache_client, from) = match &home {
+        Some((c, url)) => (c, *url),
+        None => (&client, base),
+    };
     for (dir, root) in cache_roots {
-        restore_cache(&client, target, dir, root).await;
+        restore_cache(cache_client, from, target, dir, root).await;
     }
     Ok(())
 }
@@ -701,7 +744,13 @@ async fn fetch(
 /// source snapshots already produced a non-empty dir here, and a cache must
 /// never clobber source-derived content — validation makes this unreachable
 /// for well-formed pipelines, and the backstop holds even when it is not).
-async fn restore_cache(client: &WorkspaceClient, target: &str, dir: &str, root: &str) {
+async fn restore_cache(
+    client: &WorkspaceClient,
+    from: &str,
+    target: &str,
+    dir: &str,
+    root: &str,
+) {
     let at = std::path::Path::new(target).join(dir);
     match dir_absent_or_empty(&at) {
         Ok(true) => {}
@@ -727,7 +776,7 @@ async fn restore_cache(client: &WorkspaceClient, target: &str, dir: &str, root: 
     let started = std::time::Instant::now();
     match scarab_storage::Cas::materialize(client, &TreeHash(root.to_string()), at_str).await {
         Ok(()) => println!(
-            "scarab-wsfetch: cache restore hit dir={dir} root={root} in {} ms",
+            "scarab-wsfetch: cache restore hit dir={dir} root={root} from={from} in {} ms",
             started.elapsed().as_millis()
         ),
         Err(e) => {
@@ -736,7 +785,9 @@ async fn restore_cache(client: &WorkspaceClient, target: &str, dir: &str, root: 
             // one is only slow. Best-effort removal — a leftover empty dir
             // is harmless.
             let _ = std::fs::remove_dir_all(&at);
-            println!("scarab-wsfetch: cache restore miss dir={dir} root={root}: {e}");
+            println!(
+                "scarab-wsfetch: cache restore miss dir={dir} root={root} from={from}: {e}"
+            );
         }
     }
 }
@@ -988,6 +1039,28 @@ fn drain_main(args: &[String]) -> i32 {
             return EXIT_DRAIN_TRANSIENT;
         }
     };
+    // The Cache's home replica (git-bug 12e2f6b), when the executor chose
+    // one: same token file, same budget, a different Depot. A home client
+    // that cannot be built only means the cache-dir content goes through the
+    // service URL — a later miss, never a failed drain.
+    let home = match std::env::var(CACHE_URL_ENV) {
+        Ok(url) if !url.is_empty() && !cache_dirs.is_empty() => {
+            match WorkspaceClient::from_token_file(&url, &token_file)
+                .map_err(|e| e.to_string())
+                .and_then(apply_transfer_budget)
+            {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    eprintln!(
+                        "scarab-wsfetch: drain: cache home {url} unusable ({e}) — saving \
+                         through the service URL"
+                    );
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
     // Multi-thread for the same reason as `fetch`: the ingest overlaps
     // hashing/reading with uploads.
     let runtime = match tokio::runtime::Runtime::new() {
@@ -997,11 +1070,18 @@ fn drain_main(args: &[String]) -> i32 {
             return EXIT_DRAIN_TRANSIENT;
         }
     };
-    runtime.block_on(run_drain(&client, &workspace, &outputs, &cache_dirs))
+    runtime.block_on(run_drain(
+        &client,
+        home.as_ref(),
+        &workspace,
+        &outputs,
+        &cache_dirs,
+    ))
 }
 
 async fn run_drain(
     client: &WorkspaceClient,
+    cache_home: Option<&WorkspaceClient>,
     workspace: &str,
     outputs: &[String],
     cache_dirs: &[String],
@@ -1031,7 +1111,15 @@ async fn run_drain(
     let mut win = LegWindow::new(retry_window(step_timeout_secs()));
     let mut ingest_pause = std::time::Duration::from_secs(1);
     let report = loop {
-        let err = match client.drain_ingest_report(workspace, outputs, cache_dirs).await {
+        let attempt = match cache_home {
+            Some(home) => {
+                client
+                    .drain_ingest_report_with_cache_home(workspace, outputs, cache_dirs, home)
+                    .await
+            }
+            None => client.drain_ingest_report(workspace, outputs, cache_dirs).await,
+        };
+        let err = match attempt {
             Ok(r) => break r,
             Err(e) => e,
         };
@@ -1067,11 +1155,19 @@ async fn run_drain(
         bytes_uploaded,
         have_hits,
         cache_roots,
+        cache_route,
     } = report;
+    // Where the cache-dir content went (git-bug 12e2f6b): `home` is a save a
+    // later restore from the home can hit; `fell-back` is one it will miss.
+    let cache_to = match &cache_route {
+        CacheSaveRoute::Service => "service".to_string(),
+        CacheSaveRoute::Home => "home".to_string(),
+        CacheSaveRoute::FellBack(why) => format!("fell-back ({why})"),
+    };
     println!(
         "scarab-wsfetch: drain — ingested {workspace}: root={} files={files} \
          blobs_uploaded={blobs_uploaded} bytes_uploaded={bytes_uploaded} \
-         have_hits={have_hits} ingest_ms={ingest_ms} cache_saved={}",
+         have_hits={have_hits} ingest_ms={ingest_ms} cache_saved={} cache_to={cache_to}",
         snapshot.root.0,
         cache_roots.len()
     );
@@ -1559,14 +1655,14 @@ mod tests {
         std::fs::write(ws.join("node_modules/index.js"), b"from the source").expect("file");
 
         let target = ws.to_str().expect("utf-8");
-        restore_cache(&dead, target, "node_modules", &"a".repeat(64)).await;
+        restore_cache(&dead, "http://dead", target, "node_modules", &"a".repeat(64)).await;
         assert_eq!(
             std::fs::read(ws.join("node_modules/index.js")).expect("still there"),
             b"from the source",
             "source wins — the cache must not clobber it"
         );
 
-        restore_cache(&dead, target, "vendor", &"b".repeat(64)).await;
+        restore_cache(&dead, "http://dead", target, "vendor", &"b".repeat(64)).await;
         assert!(
             !ws.join("vendor").exists(),
             "a failed restore leaves the dir absent (miss), never torn"

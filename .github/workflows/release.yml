@@ -8,6 +8,12 @@
 # released version of each library, so the previous release's manifest is
 # read first and extended (scripts/libs_manifest.py).
 #
+# The Release text is the tag's section of CHANGELOG.md, then the install
+# lines (scripts/changelog.py notes), then GitHub's list of merged pull
+# requests. The job fails before it creates anything when CHANGELOG.md has no
+# section for the tag. `just release <version>` runs the same extraction
+# before you tag (docs/RELEASING.md).
+#
 # Tags only: no pull request runs this. One small job, standard-library
 # Python, no build.
 name: release
@@ -31,8 +37,15 @@ jobs:
       TAG: ${{ github.ref_name }}
     steps:
       - uses: actions/checkout@v4
-      - name: Test the manifest generator
-        run: python3 -I scripts/test_libs_manifest.py
+      - name: Test the manifest generator and the changelog reader
+        run: |
+          python3 -I scripts/test_libs_manifest.py
+          python3 -I scripts/test_changelog.py
+      - name: Write the release notes from CHANGELOG.md
+        run: |
+          set -euo pipefail
+          python3 -I scripts/changelog.py notes "$TAG" > release-notes.md
+          cat release-notes.md
       - name: Read the previous release's manifest
         run: |
           set -euo pipefail
@@ -59,7 +72,11 @@ jobs:
         run: |
           set -euo pipefail
           if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
+            # --generate-notes appends GitHub's pull request list to the file's text.
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag \
+              --notes-file release-notes.md --generate-notes
+          else
+            echo "::notice::$TAG already has a Release; its text is left as it is"
           fi
           shopt -s nullglob
           gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \

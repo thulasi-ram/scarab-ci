@@ -258,6 +258,37 @@ async fn dispatch_manual_pins_resolved_sha_and_freezes_and_interpolates_params()
     );
 }
 
+/// A Run triggered on a bound repo carries its project (`<org>/<repo>`) for
+/// the scheduler: the Cache (ADR-0065) keys and saves under it, and the
+/// per-project in-flight cap (ADR-0011) counts by it. Before, only tests
+/// set it, so every production Run had no project and its Cache was off:
+/// the chaos Cache probe's seed Run saved nothing and its probe Run was
+/// offered no restore.
+#[tokio::test]
+async fn a_dispatched_run_carries_its_project() {
+    let forge = scarab_testkit::FakeForge::new()
+        .with_file(".scarab/ship.yaml", MANUAL_YAML)
+        .with_commit("refs/heads/main", "deadbeef");
+    let db = Arc::new(InMemoryDb::new());
+    let clock = Arc::new(FakeClock::new(1_000));
+    let run = dispatch_run(
+        &forge,
+        db.as_ref(),
+        clock.as_ref(),
+        scarab_server::AdmissionPorts::governance(None),
+        "alice".into(),
+        repo(),
+        "refs/heads/main".into(),
+        "ship".into(),
+        std::collections::BTreeMap::from([("region".to_string(), json!("us-east-1"))]),
+        DispatchKind::Manual,
+        None,
+    )
+    .await
+    .expect("dispatch");
+    assert_eq!(db.run_project(&run).await.unwrap().as_deref(), Some("acme/web"));
+}
+
 // --- opt-in gate --------------------------------------------------------------
 
 #[tokio::test]

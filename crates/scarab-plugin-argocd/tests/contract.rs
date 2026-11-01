@@ -6,7 +6,7 @@
 //!
 //! Everything is real and on the wire (127.0.0.1 listeners) except the true
 //! externals: Argo CD (the in-process fake, `src/bin/fake-argocd/server.rs`
-//! — the very server `just plugin-verify` drives), TokenReview (a fake
+//! — the very server `just test e2e` drives), TokenReview (a fake
 //! verifier: `tok-<id>` is installation `<id>`'s token) and the secret store
 //! (`FakeSecrets`). Each test has its own database and skips cleanly when
 //! `SCARAB_TEST_DATABASE_URL` is unset.

@@ -44,6 +44,10 @@ pub struct PodView {
     pub deleting: bool,
     pub has_root: bool,
     pub containers: Vec<ContainerView>,
+    /// `spec.terminationGracePeriodSeconds`. I1b's bound is this plus 30 s.
+    /// `None` in a `pods.jsonl` written before the field was recorded.
+    #[serde(default)]
+    pub grace_secs: Option<i64>,
 }
 
 impl PodView {
@@ -86,6 +90,7 @@ impl PodView {
             deleting: !md["deletionTimestamp"].is_null(),
             has_root: md["annotations"][ROOT_ANNOTATION].is_string(),
             containers,
+            grace_secs: p["spec"]["terminationGracePeriodSeconds"].as_i64(),
         }
     }
 
@@ -113,6 +118,11 @@ pub fn feed_in_flight(p: &PodView) -> bool {
     p.container(INIT_CONTAINER).is_some_and(|c| c.state == "running") && !p.deleting
 }
 
+/// The step container is running (rank 4's trigger: a Run is in flight).
+pub fn step_running(p: &PodView) -> bool {
+    p.container(STEP_CONTAINER).is_some_and(|c| c.state == "running") && !p.deleting
+}
+
 /// One line of `pods.jsonl`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PodRecord {
@@ -138,9 +148,18 @@ fn interesting(v: &PodView) -> bool {
     v.run.is_some() || v.is_depot()
 }
 
+/// How long a list may take, and how long a watch may go without an event
+/// (the server ends it after 240 s), before the watcher gives up on it and
+/// re-lists. A paused node (`pause-node`) freezes the API server with the
+/// request in flight; the connection can outlive the pause in a state that
+/// never answers.
+const LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const WATCH_IDLE: std::time::Duration = std::time::Duration::from_secs(270);
+
 /// Watch `ns` until `stop` flips, appending a line to `out` whenever a step
-/// or Depot Pod changes. A watch that ends or errors is re-listed and
-/// resumed; a re-list records every Pod again as `added`.
+/// or Depot Pod changes. A watch that ends, errors or goes quiet past
+/// `WATCH_IDLE` is re-listed and resumed; a re-list records every Pod again
+/// as `added`.
 pub async fn watch(
     pods: Api<Pod>,
     out: std::path::PathBuf,
@@ -165,11 +184,15 @@ pub async fn watch(
         if *stop.borrow() {
             return Ok(());
         }
-        let list = match pods.list(&ListParams::default()).await {
-            Ok(l) => l,
-            Err(e) => {
+        let list = match tokio::time::timeout(LIST_TIMEOUT, pods.list(&ListParams::default())).await {
+            Ok(Ok(l)) => l,
+            Ok(Err(e)) => {
                 eprintln!("scarab-chaos: pod list failed ({e}); retrying");
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                continue;
+            }
+            Err(_) => {
+                eprintln!("scarab-chaos: pod list took over {LIST_TIMEOUT:?}; retrying");
                 continue;
             }
         };
@@ -195,18 +218,26 @@ pub async fn watch(
             }
             *map = seen;
         }
-        let stream = match pods.watch(&WatchParams::default().timeout(240), &rv).await {
-            Ok(s) => s,
-            Err(e) => {
+        let stream = match tokio::time::timeout(LIST_TIMEOUT, pods.watch(&WatchParams::default().timeout(240), &rv)).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
                 eprintln!("scarab-chaos: pod watch failed to start ({e}); re-listing");
+                continue;
+            }
+            Err(_) => {
+                eprintln!("scarab-chaos: pod watch took over {LIST_TIMEOUT:?} to start; re-listing");
                 continue;
             }
         };
         futures::pin_mut!(stream);
         loop {
             let ev = tokio::select! {
-                ev = stream.next() => ev,
+                ev = tokio::time::timeout(WATCH_IDLE, stream.next()) => ev,
                 _ = stop.changed() => return Ok(()),
+            };
+            let Ok(ev) = ev else {
+                eprintln!("scarab-chaos: pod watch quiet for {WATCH_IDLE:?}; re-listing");
+                break;
             };
             let Some(ev) = ev else { break };
             let (kind, pod) = match ev {
@@ -254,6 +285,7 @@ mod tests {
             _ => serde_json::json!({"waiting": {"reason": "PodInitializing"}}),
         };
         PodView::from_json(&serde_json::json!({
+            "spec": {"terminationGracePeriodSeconds": 600},
             "metadata": {"uid": "u1", "name": "scarab-produce-a1-x",
                 "labels": {"scarab.io/run": "r", "scarab.io/step": "produce", "scarab.io/attempt": "a1"},
                 "annotations": annotations},
@@ -273,6 +305,21 @@ mod tests {
         assert_eq!((c.state.as_str(), c.exit_code), ("terminated", Some(0)));
         assert_eq!(c.finished_at_ms.unwrap() - c.started_at_ms.unwrap(), 5_000);
         assert!(p.container(INIT_CONTAINER).unwrap().init);
+        assert_eq!(p.grace_secs, Some(600));
+    }
+
+    /// A `pods.jsonl` line written before `grace_secs` existed still parses.
+    #[test]
+    fn an_old_record_without_the_grace_period_parses() {
+        let mut v = serde_json::to_value(PodRecord {
+            at_ms: 1,
+            event: "added".into(),
+            pod: pod("running", None, "running", false),
+        })
+        .unwrap();
+        v["pod"].as_object_mut().unwrap().remove("grace_secs");
+        let back: PodRecord = serde_json::from_value(v).unwrap();
+        assert_eq!(back.pod.grace_secs, None);
     }
 
     #[test]
@@ -287,5 +334,11 @@ mod tests {
     #[test]
     fn the_feed_window_is_the_fetcher_running() {
         assert!(feed_in_flight(&pod("waiting", None, "waiting", false)));
+    }
+
+    #[test]
+    fn the_stop_trigger_is_the_step_running() {
+        assert!(step_running(&pod("running", None, "running", false)));
+        assert!(!step_running(&pod("terminated", Some(0), "running", false)));
     }
 }

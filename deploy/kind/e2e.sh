@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# `just e2e [filter]`: every live suite against the kind release in its e2e
-# mode (own database `scarab_e2e`, bucket `scarab-e2e`, a quick tunnel in front
-# of the in-cluster Forgejo). The test binaries run on the host; test-env.sh
-# gives them port-forwards and the address a Pod reaches the host at.
+# `just test e2e [filter]`: every live suite against the kind release in its
+# e2e mode (own database `scarab_e2e`, bucket `scarab-e2e`, plugins on, a quick
+# tunnel in front of the in-cluster Forgejo). The test binaries run on the
+# host; test-env.sh gives them port-forwards and the address a Pod reaches the
+# host at.
 #
-# Passes, in order (each takes the optional nextest filter):
+# Passes, in order (each nextest pass takes the optional nextest filter):
 #   1. crates/scarab-e2e, all but crash_resume and the Forgejo cases
 #   2. the Forgejo adapter against the real Forgejo (scarab-forge-forgejo live)
 #   3. Forgejo onboarding through the server (one test at a time: each one
@@ -13,11 +14,17 @@
 #   5. the executor's and the plugin runtime's live cluster suites, in
 #      namespace scarab-kube-tests (the test process stands in for the
 #      control plane, so it gets the Depot, its bucket and its token secret)
-#   6. crash_resume, alone and last: it kills the server every case talks to
+#   6. the first-party Argo CD plugin against a fake Argo CD on the host
+#      (plugin-verify.sh, ADR-0072). Not nextest: it runs when there is no
+#      filter or the filter is part of its name, `plugin-argocd`. It is a
+#      child process with its own EXIT trap, which stops the fake Argo CD and
+#      its port-forward however the pass ends.
+#   7. crash_resume, alone and last: it kills the server every case talks to
 #
 # All passes run; the exit code is non-zero when any failed. Zero
 # auto-retries: a red run is a real bug, not flake to mask. The release stays
-# in e2e mode afterwards (`just up` switches back); the tunnel is deleted.
+# in e2e mode afterwards (`just stack up` switches back); the tunnel is
+# deleted.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -52,8 +59,19 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+# Plugins on for the Argo CD pass, with the dev-only tag knob: kind images have
+# no repository digest (owner default 8). Set for the whole run, so the pass
+# needs no second helm upgrade, which would roll the Pods under the other
+# passes' port-forwards.
+plugin_repo=scarab.local/scarab-plugin-argocd
+mkdir -p "$here/.state"
+plugin_values="$here/.state/e2e-plugin-values.json"
+cat > "$plugin_values" <<EOF
+{"plugins": {"enabled": true, "argocdRepo": "$plugin_repo"},
+ "scarab": {"extraEnv": {"SCARAB_DEV_PLUGIN_ALLOW_TAG": "1"}}}
+EOF
 # Only this recipe asks up.sh for the public Forgejo tunnel.
-SCARAB_E2E_TUNNEL=1 bash "$here/up.sh" e2e
+SCARAB_E2E_TUNNEL=1 SCARAB_KIND_EXTRA_VALUES="$plugin_values" bash "$here/up.sh" e2e
 scarab_addr
 
 cargo build -p scarab-cli
@@ -169,5 +187,12 @@ pass forgejo-adapter -p scarab-forge-forgejo --test live
 pass forgejo-onboarding -p scarab-e2e --test forgejo_onboarding --run-ignored all --test-threads 1
 pass forgejo-tunnel -p scarab-e2e --test forgejo_tunnel --run-ignored all --test-threads 1
 pass cluster -p scarab-executor-k8s -p scarab-plugin-k8s --test cluster --run-ignored all
+case plugin-argocd in
+  *"$filter"*)
+    echo "==> pass: plugin-argocd"
+    PLUGIN_VERIFY_REPO="$plugin_repo" bash "$here/plugin-verify.sh" \
+      || { rc=$?; echo "==> pass FAILED: plugin-argocd"; } ;;
+  *) echo "==> pass: plugin-argocd skipped (the filter '$filter' is not part of its name)" ;;
+esac
 pass crash_resume -p scarab-e2e --test crash_resume
 exit "$rc"

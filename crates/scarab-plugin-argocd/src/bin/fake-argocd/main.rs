@@ -1,6 +1,7 @@
 //! `fake-argocd`: the fake Argo CD API server ([`server`]) as a process, for
-//! `just plugin-verify` (on the host, behind the proc-mode broker) and the
-//! image's `fake` target (in-cluster). Never part of the reporter image.
+//! the Argo CD plugin pass of `just test e2e` (on the host; the broker in the
+//! server Pod reaches it at the host address a Pod uses) and the image's
+//! `fake` target (in-cluster). Never part of the reporter image.
 //!
 //! Usage: `fake-argocd [--addr 127.0.0.1:18080]`. `FAKE_ARGOCD_TOKEN`, when
 //! set, is the bearer token Argo's routes require — what the admin binds as

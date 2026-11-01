@@ -207,19 +207,43 @@ const DURABILITY_HEADER: &str = "x-scarab-durability";
 /// One PUT's durability label (ADR-0067 part 6): what of a drain the Depot
 /// streams into the fence's pack (`Durable`) versus keeps warm-only,
 /// unpromised and evictable (`CacheOnly`).
+///
+/// `CacheDir` (git-bug 12e2f6b) is content under a declared cache dir: on the
+/// wire it is `cache-only` like any scratch, but the drain sends it to the
+/// Cache's **home** Depot replica instead of the ClusterIP, so the save lands
+/// whole on the one replica a later restore asks. `CacheOnly` keeps covering
+/// the rest of the scratch (the remainder of a pruned `outputs:` drain), which
+/// nothing restores, so it has no home.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Label {
     Durable,
     CacheOnly,
+    CacheDir,
 }
 
 impl Label {
     fn as_str(self) -> &'static str {
         match self {
             Label::Durable => "durable",
-            Label::CacheOnly => "cache-only",
+            Label::CacheOnly | Label::CacheDir => "cache-only",
         }
     }
+}
+
+/// Where a drain's cache-dir content went (git-bug 12e2f6b) — reported so
+/// the drain's log line says whether the save can hit.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum CacheSaveRoute {
+    /// No home was given (replica count 1, or no cache dir present): every
+    /// PUT went through the one service URL, as before homes existed.
+    #[default]
+    Service,
+    /// Every cache-dir PUT went to the home replica.
+    Home,
+    /// The home could not be reached; the remaining cache-dir PUTs went
+    /// through the service URL. The save is then spread across replicas and a
+    /// later restore from the home misses — slower, never a failed Step.
+    FellBack(String),
 }
 
 /// How a scan's uploads are labelled — decided BEFORE anything is uploaded,
@@ -248,6 +272,123 @@ impl LabelPlan {
             } else {
                 Label::CacheOnly
             }),
+        }
+    }
+}
+
+/// The drain's [`LabelPlan`] plus the Cache's home (git-bug 12e2f6b): which
+/// label each hash carries, and which Depot each PUT goes to.
+struct CacheRouter<'h> {
+    plan: LabelPlan,
+    /// The home replica and every hash under a present cache dir. `None` =
+    /// no home (replica count 1, the feed path, or no cache dir present).
+    home: Option<(&'h WorkspaceClient, std::collections::HashSet<String>)>,
+    /// Why the home was given up on, once it was. Sticky: one unreachable
+    /// home must not cost every remaining PUT a connect timeout.
+    failed: std::sync::Mutex<Option<String>>,
+}
+
+impl<'h> CacheRouter<'h> {
+    fn new(
+        plan: LabelPlan,
+        home: Option<(&'h WorkspaceClient, std::collections::HashSet<String>)>,
+    ) -> Self {
+        Self {
+            plan,
+            home,
+            failed: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn label_of(&self, hash: &str) -> Option<Label> {
+        match self.plan.label_of(hash) {
+            Some(Label::CacheOnly)
+                if self.home.as_ref().is_some_and(|(_, set)| set.contains(hash)) =>
+            {
+                Some(Label::CacheDir)
+            }
+            other => other,
+        }
+    }
+
+    /// The live home, unless it has been given up on.
+    fn home(&self) -> Option<&'h WorkspaceClient> {
+        let failed = self.failed.lock().unwrap_or_else(|p| p.into_inner());
+        if failed.is_some() {
+            return None;
+        }
+        self.home.as_ref().map(|(client, _)| *client)
+    }
+
+    fn give_up(&self, why: String) {
+        let mut failed = self.failed.lock().unwrap_or_else(|p| p.into_inner());
+        failed.get_or_insert(why);
+    }
+
+    /// The home's warm-tier misses among the cache-dir blobs, or `None` when
+    /// there is no home or it cannot answer (then the caller dedups those
+    /// blobs against the service's answer, and they go through the service).
+    async fn home_missing_warm(
+        &self,
+        blobs: &[String],
+    ) -> Option<std::collections::HashSet<String>> {
+        let home = self.home()?;
+        let ours: Vec<String> = blobs
+            .iter()
+            .filter(|h| self.label_of(h) == Some(Label::CacheDir))
+            .cloned()
+            .collect();
+        match home.missing_hashes(&ours, &[]).await {
+            Ok(report) => Some(report.warm),
+            Err(e) => {
+                self.give_up(format!("/have: {e}"));
+                None
+            }
+        }
+    }
+
+    /// PUT one object where its label sends it. A cache-dir PUT the home
+    /// refuses or cannot take goes through the service instead, and every
+    /// later one follows it there. `reload` produces the bytes a second time
+    /// for that fallback, so a blob is never held twice in memory (the
+    /// transfer byte budget charges it once).
+    async fn put<F, Fut>(
+        &self,
+        service: &WorkspaceClient,
+        kind: &str,
+        hash: &str,
+        data: Vec<u8>,
+        reload: F,
+    ) -> Result<(), StorageError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<Vec<u8>, StorageError>>,
+    {
+        let label = self.label_of(hash);
+        if label == Some(Label::CacheDir) {
+            if let Some(home) = self.home() {
+                match home.put_bytes(kind, hash, data, label).await {
+                    Ok(()) => return Ok(()),
+                    Err(e) => self.give_up(format!("PUT {kind}/{hash}: {e}")),
+                }
+                return service.put_bytes(kind, hash, reload().await?, label).await;
+            }
+        }
+        service.put_bytes(kind, hash, data, label).await
+    }
+
+    fn route(&self) -> CacheSaveRoute {
+        if self.home.is_none() {
+            return CacheSaveRoute::Service;
+        }
+        match self
+            .failed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+        {
+            Some(why) => CacheSaveRoute::FellBack(why),
+            None => CacheSaveRoute::Home,
         }
     }
 }
@@ -723,7 +864,7 @@ impl WorkspaceClient {
     /// the walk is a hard error from `scan_dir`, never a silent skip — the
     /// scan's `read_dir`/`read`/`metadata` failures all propagate.
     pub async fn ingest_report(&self, path: &str) -> Result<IngestReport, StorageError> {
-        self.ingest_report_inner(path, None, &[]).await
+        self.ingest_report_inner(path, None, &[], None).await
     }
 
     /// [`ingest_report`](Self::ingest_report) for the **drain**: every scan
@@ -763,7 +904,32 @@ impl WorkspaceClient {
         outputs: &[String],
         cache_dirs: &[String],
     ) -> Result<IngestReport, StorageError> {
-        self.ingest_report_inner(path, Some(outputs), cache_dirs).await
+        self.ingest_report_inner(path, Some(outputs), cache_dirs, None)
+            .await
+    }
+
+    /// [`drain_ingest_report`](Self::drain_ingest_report) with the Cache's
+    /// **home** Depot replica (git-bug 12e2f6b): the blobs and trees under the
+    /// declared cache dirs go to `home` (deduplicated against the home's warm
+    /// tier); everything else goes through `self` exactly as before. The
+    /// executor picks the home from the cache key, so a later restore of the
+    /// same key asks the same replica and finds the whole tree there.
+    ///
+    /// A home that cannot be reached is not an error: from the first failed
+    /// request on, the remaining cache-dir content goes through `self`, and
+    /// [`IngestReport::cache_route`] says so. The save is then a later miss,
+    /// never a failed Step. Content a PUT to `self` also needs (a blob that is
+    /// both under a cache dir and in the published closure) stays `durable`
+    /// and goes through `self`.
+    pub async fn drain_ingest_report_with_cache_home(
+        &self,
+        path: &str,
+        outputs: &[String],
+        cache_dirs: &[String],
+        home: &WorkspaceClient,
+    ) -> Result<IngestReport, StorageError> {
+        self.ingest_report_inner(path, Some(outputs), cache_dirs, Some(home))
+            .await
     }
 
     /// `drain`: `None` = the feed-path ingest (tree `/have` dedup, no labels);
@@ -775,6 +941,7 @@ impl WorkspaceClient {
         path: &str,
         drain: Option<&[String]>,
         cache_dirs: &[String],
+        cache_home: Option<&WorkspaceClient>,
     ) -> Result<IngestReport, StorageError> {
         let scan = scan_dir(std::path::Path::new(path))?;
         let dedup_trees = drain.is_none();
@@ -804,6 +971,24 @@ impl WorkspaceClient {
             }
         }
 
+        // The cache-dir content and its home (git-bug 12e2f6b): every hash
+        // under a present cache dir, scratch-labelled, goes to the home.
+        let router = CacheRouter::new(
+            plan,
+            match cache_home {
+                Some(home) if !cache_roots.is_empty() => {
+                    let memo = ScanTreeCas::new(&scan);
+                    let mut set = std::collections::HashSet::new();
+                    for root in cache_roots.values() {
+                        set.extend(closure_of(&memo, root.clone())?);
+                    }
+                    Some((home, set))
+                }
+                _ => None,
+            },
+        );
+        let plan = &router;
+
         // One question for every blob, then upload only the misses — keyed on
         // the answer that matches each blob's PROMISE (ADR-0067 part 4):
         // durable-labelled (and unlabelled, the durable default) blobs dedup
@@ -815,11 +1000,18 @@ impl WorkspaceClient {
         let missing = self.missing_hashes(&blob_hashes, &[]).await?;
         let durable_missing: std::collections::HashSet<&str> =
             missing.durable_blobs.iter().map(String::as_str).collect();
+        // Cache-dir blobs dedup against the HOME's warm tier — the tier the
+        // restore will read. A home that cannot answer is the fallback.
+        let home_missing = plan.home_missing_warm(&blob_hashes).await;
         let must_upload = |hash: &String| match plan.label_of(hash) {
             // `None` is the FEED-path ingest: a warm-seeding operation whose
             // PUTs open no pack (nothing durable can come of re-uploading),
             // so it deduplicates against warm — the tier it actually serves.
             Some(Label::CacheOnly) | None => missing.warm.contains(hash),
+            Some(Label::CacheDir) => match &home_missing {
+                Some(home) => home.contains(hash),
+                None => missing.warm.contains(hash),
+            },
             Some(Label::Durable) => durable_missing.contains(hash.as_str()),
         };
         let uploads: Vec<(String, BlobSource)> = blob_hashes
@@ -850,7 +1042,7 @@ impl WorkspaceClient {
                 })?;
                 let data = read_blob_source(&source).await?;
                 let len = data.len() as u64;
-                self.put_bytes("blobs", &hash, data, plan.label_of(&hash))
+                plan.put(self, "blobs", &hash, data, || read_blob_source(&source))
                     .await?;
                 Ok(len)
             })
@@ -879,15 +1071,19 @@ impl WorkspaceClient {
                 .collect();
             for (hash, bytes) in &scan.trees {
                 if missing_trees.iter().any(|m| m == hash) {
-                    self.put_bytes("trees", hash, bytes.clone(), plan.label_of(hash))
-                        .await?;
+                    plan.put(self, "trees", hash, bytes.clone(), || async {
+                        Ok(bytes.clone())
+                    })
+                    .await?;
                 }
             }
             (tree_hashes.len() - missing_trees.len()) as u64
         } else {
             for (hash, bytes) in &scan.trees {
-                self.put_bytes("trees", hash, bytes.clone(), plan.label_of(hash))
-                    .await?;
+                plan.put(self, "trees", hash, bytes.clone(), || async {
+                    Ok(bytes.clone())
+                })
+                .await?;
             }
             0
         };
@@ -904,6 +1100,7 @@ impl WorkspaceClient {
             bytes_uploaded,
             have_hits: blob_hits + tree_hits,
             cache_roots,
+            cache_route: router.route(),
         })
     }
 
@@ -1165,6 +1362,8 @@ pub struct IngestReport {
     /// scan (ADR-0065 s1). Empty outside the drain, and for steps that
     /// declared no cache.
     pub cache_roots: std::collections::BTreeMap<String, String>,
+    /// Where the cache-dir content went (git-bug 12e2f6b).
+    pub cache_route: CacheSaveRoute,
 }
 
 /// A [`Cas`] over a [`WorkspaceClient`] that serves `tree_entries` from an

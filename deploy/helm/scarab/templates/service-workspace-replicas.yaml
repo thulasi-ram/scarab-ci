@@ -1,0 +1,38 @@
+{{- if and (include "scarab.workspaceEnabled" .) (gt (int .Values.workspace.replicaCount) 1) -}}
+{{- /*
+  One Service per Depot replica (git-bug 12e2f6b), named like the replica's
+  Pod: `<fullname>-workspace-<ordinal>`. A Cache is warm-only and lives on one
+  replica, its home, chosen by the executor from the cache key; the Step Pod
+  saves and restores the Cache through that replica's Service and sends
+  everything else through the ClusterIP in service-workspace.yaml.
+
+  Why not a headless Service: per-Pod DNS names exist only under the Service a
+  StatefulSet's `serviceName` names, and that field is immutable. Changing it
+  would refuse every upgrade of an existing release. A Service that selects
+  one Pod by `statefulset.kubernetes.io/pod-name` (set on every StatefulSet Pod
+  by the controller) gives the same stable name with no migration.
+
+  Rendered only above one replica. A replica that is not Ready has no
+  endpoint here, so its caches miss until it is back — a miss, never a failed
+  Step. Scaling down removes the Services of the ordinals that went away.
+*/ -}}
+{{- range $ordinal := until (int .Values.workspace.replicaCount) }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "scarab.fullname" $ }}-workspace-{{ $ordinal }}
+  labels:
+    {{- include "scarab.workspaceLabels" $ | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "scarab.workspaceSelectorLabels" $ | nindent 4 }}
+    statefulset.kubernetes.io/pod-name: {{ include "scarab.fullname" $ }}-workspace-{{ $ordinal }}
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      protocol: TCP
+{{- end }}
+{{- end }}

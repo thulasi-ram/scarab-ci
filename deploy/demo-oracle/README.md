@@ -40,7 +40,7 @@ control plane, workspace service, Postgres, the tunnel, **and** every step Pod.
 | **step Pods** | namespace `scarab-steps`, capped by a LimitRange (`steps.yaml`) |
 
 Files: `bootstrap.sh` (one-time host prep) → `.env` → `deploy.sh` (everything
-else, idempotent, re-runnable). `just demo-oracle` is the entry point.
+else, idempotent, re-runnable). `just stack up demo-oracle` is the entry point.
 
 ## Before you can deploy
 
@@ -83,8 +83,8 @@ sudo bash deploy/demo-oracle/bootstrap.sh
 curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
 
 cp deploy/demo-oracle/.env.example deploy/demo-oracle/.env   # then fill it in
-just demo-oracle                # deploy ghcr `edge`
-just demo-oracle sha-<gitsha>   # deploy a specific published build
+just stack up demo-oracle                # deploy ghcr `edge`
+just stack up demo-oracle sha-<gitsha>   # deploy a specific published build
 ```
 
 `bootstrap.sh` is idempotent; so is `deploy.sh`. Re-run either freely.
@@ -100,7 +100,7 @@ and stitches the digests into one multi-arch manifest per tag, so `edge` and
 
 Install the GitHub App on the demo repo (or hit *Recreate all* on its Advanced →
 webhook page). The resulting `installation` delivery is what registers it.
-No synthetic `installation` event is sent here (`just up dogfood` sends one) and
+No synthetic `installation` event is sent here (`just stack up dogfood` sends one) and
 none is needed: the box is publicly reachable, so real GitHub deliveries arrive
 on their own.
 

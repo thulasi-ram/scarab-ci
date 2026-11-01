@@ -12,7 +12,7 @@ chart deploys `scarab-server` (one binary, selectable roles) with the RBAC it ne
 Pod per step in its namespace.
 
 The **same chart** targets any Kubernetes: a local kind cluster or a real, live cluster.
-`just up` (below) installs this chart on a local kind cluster; a live cluster uses the same
+`just stack up` (below) installs this chart on a local kind cluster; a live cluster uses the same
 `helm upgrade --install` with your own Postgres, object store, and credentials. The chart is
 new and will get more production hardening as people use it, but nothing in it is local-only.
 
@@ -181,18 +181,18 @@ reference.
 
 ## The chart on a local kind cluster
 
-`just up` installs the same chart on a local kind cluster, `scarab-dev`, with Postgres and
+`just stack up` installs the same chart on a local kind cluster, `scarab-dev`, with Postgres and
 MinIO running in the cluster beside it. What differs from a live install is where the
 binaries come from: the server and the workspace service run a `scarab-server` built from your
 working tree and mounted into a small runtime image, and the step helper images are built
 locally and loaded into the node. A code change needs a rebuild and a Pod restart
-(`just reload`), not an image build.
+(`just stack reload`), not an image build.
 
 ```sh
-just up          # build the server, create the kind cluster, install the chart
-just reload      # rebuild and roll the server and workspace Pods onto the new binary
-just up dogfood  # the same release in GitHub App mode, behind a Cloudflare tunnel
-just down        # delete the cluster and its data
+just stack up          # build the server, create the kind cluster, install the chart
+just stack reload      # rebuild and roll the server and workspace Pods onto the new binary
+just stack up dogfood  # the same release in GitHub App mode, behind a Cloudflare tunnel
+just stack down        # delete the cluster and its data
 ```
 
 Every kubectl and helm call uses the cluster's own kubeconfig (`deploy/kind/.kubeconfig`),

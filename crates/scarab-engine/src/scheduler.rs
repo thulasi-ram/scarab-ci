@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
-use crate::ports::{ExecHandle, ExecState, FailureClass};
+use crate::ports::{ExecHandle, ExecState, FailureClass, LeaderTerm, StepLaunch, SCHEDULER_LEASE};
 
 /// The bounded auto-retry budget for **never-started infra** failures
 /// (ADR-0047): the step's main process never ran, so no side effect is
@@ -745,7 +745,7 @@ pub async fn rerun_step_widened(
             .map(|r| r.name.as_str())
             .collect();
         for name in names {
-            db.create_run_service(run, cur + 1, name, now).await?;
+            db.create_run_service(None, run, cur + 1, name, now).await?;
         }
     }
 
@@ -1277,9 +1277,8 @@ pub async fn resolve_plugin_gate(
     if !gate_reached(gate, &steps) {
         return Err(PluginGateError::NotWaiting("it is not reached yet".into()));
     }
-    let open = open_gate_attempt(gate).ok_or_else(|| {
-        PluginGateError::NotWaiting("it has no open wait".into())
-    })?;
+    let open = open_gate_attempt(gate)
+        .ok_or_else(|| PluginGateError::NotWaiting("it has no open wait".into()))?;
     if &open.id != attempt {
         return Err(PluginGateError::NotWaiting(format!(
             "its open wait is `{}`, not `{}`",
@@ -1777,6 +1776,7 @@ pub async fn cancel_run_request(
     }
     match commit_run_transition(
         db,
+        None,
         run,
         current,
         RunStatus::Cancelled,
@@ -1969,7 +1969,7 @@ async fn reopen(
     // check read green — or red — for the whole rerun. Suspended → Running
     // (a gate released) is not news to the forge: both are `pending`.
     let notify = from.is_terminal();
-    match commit_run_transition(db, run, from, to, now, notify, &[]).await {
+    match commit_run_transition(db, None, run, from, to, now, notify, &[]).await {
         Ok(()) | Err(DbError::Conflict) => Ok(()),
         Err(e) => Err(e.into()),
     }
@@ -1981,8 +1981,10 @@ async fn reopen(
 /// ([`Db::commit_run_transition`]), with any `intents` the transition owes
 /// (a cancel's services teardown). `Conflict` = a peer already moved it, or
 /// the run was reopened since this read its generation — nothing written.
+#[allow(clippy::too_many_arguments)] // the commit's arguments plus the leader fence
 async fn commit_run_transition(
     db: &dyn Db,
+    leader: Option<&LeaderTerm>,
     run: &RunId,
     from: RunStatus,
     to: RunStatus,
@@ -1990,7 +1992,7 @@ async fn commit_run_transition(
     notify: bool,
     intents: &[OutboxMessage],
 ) -> Result<(), DbError> {
-    commit_run_transition_after(db, run, from, to, now, notify, intents, Vec::new()).await
+    commit_run_transition_after(db, leader, run, from, to, now, notify, intents, Vec::new()).await
 }
 
 /// End a run whose creation failed after [`Db::begin_run_creation`]:
@@ -2004,9 +2006,22 @@ pub async fn fail_run_creation(
     reason: String,
     now: Timestamp,
 ) -> Result<(), DbError> {
+    fail_run_creation_as(db, None, run, reason, now).await
+}
+
+/// [`fail_run_creation`], fenced on `leader` when the leader's sweep ends
+/// the run (git-bug aaf4e3e).
+async fn fail_run_creation_as(
+    db: &dyn Db,
+    leader: Option<&LeaderTerm>,
+    run: &RunId,
+    reason: String,
+    now: Timestamp,
+) -> Result<(), DbError> {
     let journal = vec![event(run, EventPayload::RunCreationFailed { reason }, now)];
     commit_run_transition_after(
         db,
+        leader,
         run,
         RunStatus::Pending,
         RunStatus::Failed,
@@ -2023,6 +2038,7 @@ pub async fn fail_run_creation(
 #[allow(clippy::too_many_arguments)] // commit_run_transition's arguments plus the journal
 async fn commit_run_transition_after(
     db: &dyn Db,
+    leader: Option<&LeaderTerm>,
     run: &RunId,
     from: RunStatus,
     to: RunStatus,
@@ -2059,7 +2075,7 @@ async fn commit_run_transition_after(
             at: now,
         });
     }
-    db.commit_run_transition(run, from, to, generation, &events, &outbox)
+    db.commit_run_transition(leader, run, from, to, generation, &events, &outbox)
         .await
 }
 
@@ -2073,12 +2089,14 @@ pub fn run_status_post_key(run: &RunId, generation: u64, to: RunStatus) -> Strin
 }
 
 /// Configuration knobs (sane slice-1 defaults via [`Scheduler::new`]).
+#[derive(Clone)]
 struct Config {
     lease_ttl_ms: i64,
     outbox_batch: u32,
     outbox_visibility_ms: i64,
-    /// Max in-flight runs per project (fairness). Default 20 (ADR-0032).
-    project_run_cap: u32,
+    /// Max `Running` runs per project (fairness, ADR-0011). `None`, the
+    /// default, is no cap (`SCARAB_PROJECT_RUN_CAP`).
+    project_run_cap: Option<u32>,
     /// Max in-flight runs globally (backpressure). Default unbounded.
     global_run_cap: u32,
     /// The global default step deadline (ADR-0047), used when a step declares
@@ -2207,6 +2225,11 @@ pub struct Scheduler<'a> {
     supervised: Supervision,
     /// See [`TickHealth`] — same per-process threading rule as `supervised`.
     health: TickHealth,
+    /// The lease term this scheduler acts under, set only on the copy a
+    /// leader leg runs on ([`as_leader`](Self::as_leader), git-bug
+    /// aaf4e3e). Shared helpers pass it to the writes that fence on it, so
+    /// the same helper is fenced in a leader leg and unfenced elsewhere.
+    leader: Option<LeaderTerm>,
 }
 
 impl<'a> Scheduler<'a> {
@@ -2224,11 +2247,12 @@ impl<'a> Scheduler<'a> {
             owner: owner.into(),
             supervised: Supervision::new(),
             health: TickHealth::new(),
+            leader: None,
             cfg: Config {
                 lease_ttl_ms: 30_000,
                 outbox_batch: 16,
                 outbox_visibility_ms: 30_000,
-                project_run_cap: 20,
+                project_run_cap: None,
                 global_run_cap: u32::MAX,
                 default_step_timeout_ms: 3_600_000,
                 service_ready_timeout_ms: 300_000,
@@ -2288,9 +2312,10 @@ impl<'a> Scheduler<'a> {
         self
     }
 
-    /// Override the per-project in-flight cap (fairness).
+    /// Cap how many of one project's runs may be `Running` at once (fairness,
+    /// ADR-0011); the rest wait `Pending`. Off by default.
     pub fn with_project_run_cap(mut self, cap: u32) -> Self {
-        self.cfg.project_run_cap = cap;
+        self.cfg.project_run_cap = Some(cap);
         self
     }
 
@@ -2352,21 +2377,34 @@ impl<'a> Scheduler<'a> {
         // alive in the process-lifetime map.
         self.health.retain_active(&runs);
         let mut stuck: std::collections::HashSet<&RunId> = std::collections::HashSet::new();
+        // Runs whose leader leg hit a fenced transaction's time bound
+        // ([`DbError::FenceTimeout`]): retried next tick, and this tick is no
+        // verdict on them — it neither starts nor ends a failure streak, so a
+        // run that also fails for real still dead-letters on its first
+        // streak's clock.
+        let mut deferred: std::collections::HashSet<&RunId> = std::collections::HashSet::new();
         for run in &runs {
             // Shared services (ADR-0058) before admit, so the readiness gate sees
             // fresh statuses this tick.
             let leg = async {
-                self.reconcile_services(run).await?;
-                self.admit(run).await
+                let services = self.reconcile_services_leg(run).await?;
+                let admission = self.admit_leg(run).await?;
+                Ok::<_, SchedulerError>(services == Leg::Deferred || admission == Leg::Deferred)
             }
             .await;
-            if let Err(e) = leg {
-                if let Some(e) = self.isolate_run_failure(run, e).await {
-                    isolated.push((run.clone(), e));
+            match leg {
+                Ok(true) => {
+                    deferred.insert(run);
                 }
-                // Advancing a run whose admission just failed only re-hits the
-                // same fault: one isolated error per run per tick.
-                stuck.insert(run);
+                Ok(false) => {}
+                Err(e) => {
+                    if let Some(e) = self.isolate_run_failure(run, e).await {
+                        isolated.push((run.clone(), e));
+                    }
+                    // Advancing a run whose admission just failed only re-hits the
+                    // same fault: one isolated error per run per tick.
+                    stuck.insert(run);
+                }
             }
         }
         self.reconcile().await?;
@@ -2382,7 +2420,9 @@ impl<'a> Scheduler<'a> {
                 continue;
             }
             match self.advance(run).await {
-                // A clean pass over every per-run leg ends the failure streak.
+                // A clean pass over every per-run leg ends the failure streak;
+                // a deferred leader leg was no pass.
+                Ok(()) if deferred.contains(run) => {}
                 Ok(()) => self.health.healthy(run),
                 Err(e) => {
                     if let Some(e) = self.isolate_run_failure(run, e).await {
@@ -2438,35 +2478,90 @@ impl<'a> Scheduler<'a> {
     pub async fn sweep_unfinished_creations(
         &self,
     ) -> Result<Vec<(RunId, SchedulerError)>, SchedulerError> {
-        if !self.is_leader().await? {
+        let Some(term) = self.leader_term().await? else {
             return Ok(Vec::new());
-        }
+        };
         let now = self.clock.now().await;
         let cutoff = Timestamp(now.0 - self.cfg.unfinished_creation_bound_ms);
         let mut isolated = Vec::new();
         for run in self.db.unfinished_creations_before(cutoff).await? {
-            match fail_run_creation(self.db, &run, UNFINISHED_CREATION_REASON.into(), now).await {
+            let reason = UNFINISHED_CREATION_REASON.into();
+            match fail_run_creation_as(self.db, Some(&term), &run, reason, now).await {
                 Ok(()) | Err(DbError::Conflict) => {}
+                // Deposed mid-sweep (git-bug aaf4e3e): the new leader sweeps.
+                // Timed out: this leader sweeps again next tick.
+                Err(DbError::NotLeader | DbError::FenceTimeout) => break,
                 Err(e) => isolated.push((run, e.into())),
             }
         }
         Ok(isolated)
     }
 
-    /// Are we the admission leader right now?
-    async fn is_leader(&self) -> Result<bool, SchedulerError> {
+    /// This replica's term as the scheduler leader, when it holds the lease
+    /// right now. Re-leasing renews it (the term stays); a takeover of an
+    /// expired lease starts a new term (git-bug aaf4e3e).
+    async fn leader_term(&self) -> Result<Option<LeaderTerm>, SchedulerError> {
         let lease = self
             .db
-            .lease("scheduler", &self.owner, self.cfg.lease_ttl_ms)
+            .lease(SCHEDULER_LEASE, &self.owner, self.cfg.lease_ttl_ms)
             .await?;
-        Ok(lease.owner == self.owner)
+        Ok(lease.held_by(SCHEDULER_LEASE, &self.owner))
+    }
+
+    /// This scheduler as the leader of `term` (git-bug aaf4e3e): the copy a
+    /// leader leg runs on. Its writes that a deposed leader could not safely
+    /// commit late take the term and are fenced on it in their own
+    /// transaction (see [`LeaderTerm`]): the claim with its Attempts and
+    /// launch intents, slot acquisition, step promotion, gate-wait mints and
+    /// inputs, every run transition, and shared-service rows. Its other
+    /// writes are step transitions, Attempt closes and gate resolutions,
+    /// each a compare-and-set on the state it read (status, Attempt
+    /// frontier, open wait), so a late commit lands only where it is still
+    /// the move this leader's successor makes; and `release_slot`, which
+    /// frees only the slot a settled run holds. A refused write ends the leg
+    /// ([`leader_leg`]).
+    fn as_leader(&self, term: LeaderTerm) -> Scheduler<'a> {
+        Scheduler {
+            db: self.db,
+            clock: self.clock,
+            executor: self.executor,
+            snapshots: self.snapshots,
+            owner: self.owner.clone(),
+            cfg: self.cfg.clone(),
+            supervised: self.supervised.clone(),
+            health: self.health.clone(),
+            leader: Some(term),
+        }
     }
 
     /// Admit ready work for `run` (leader-only) and emit launch intents.
+    ///
+    /// A leader deposed while it admits (its lease taken over after it was
+    /// paused past the TTL) has its next fenced write refused with
+    /// [`DbError::NotLeader`], and one whose fenced transaction hits its
+    /// bound gets [`DbError::FenceTimeout`]; either way the leg ends quietly
+    /// — no error, no failure streak — and the run is admitted next tick, by
+    /// the new leader or by this one.
     pub async fn admit(&self, run: &RunId) -> Result<(), SchedulerError> {
-        if !self.is_leader().await? {
-            return Ok(());
-        }
+        self.admit_leg(run).await.map(|_| ())
+    }
+
+    async fn admit_leg(&self, run: &RunId) -> Result<Leg, SchedulerError> {
+        let Some(term) = self.leader_term().await? else {
+            return Ok(Leg::Done);
+        };
+        leader_leg(
+            self.as_leader(term.clone())
+                .admit_as_leader(&term, run)
+                .await,
+        )
+    }
+
+    async fn admit_as_leader(
+        &self,
+        leader: &LeaderTerm,
+        run: &RunId,
+    ) -> Result<(), SchedulerError> {
         let status = self
             .db
             .run_status(run)
@@ -2497,13 +2592,15 @@ impl<'a> Scheduler<'a> {
             if self.db.count_in_flight_runs(None).await? >= self.cfg.global_run_cap {
                 return Ok(());
             }
-            if let Some(project) = self.db.run_project(run).await? {
-                if self.db.count_in_flight_runs(Some(&project)).await? >= self.cfg.project_run_cap {
-                    return Ok(());
+            if let Some(cap) = self.cfg.project_run_cap {
+                if let Some(project) = self.db.run_project(run).await? {
+                    if self.db.count_running_runs(&project).await? >= cap {
+                        return Ok(());
+                    }
                 }
             }
             if let Some((group, policy)) = self.db.run_concurrency(run).await? {
-                if let Some(holder) = self.db.acquire_slot(&group, run).await? {
+                if let Some(holder) = self.db.acquire_slot(leader, &group, run).await? {
                     if policy == ConcurrencyPolicy::CancelInProgress {
                         self.cancel_run(&holder).await?;
                     }
@@ -2519,7 +2616,7 @@ impl<'a> Scheduler<'a> {
         // `started_at` is its own clock start, and each is checked against its
         // own timer / `gate_expires_after`. Before any promotion, so a gate
         // that resolves now unblocks (or Skips) its dependents this same pass.
-        self.evaluate_waiting_gates(run).await?;
+        self.evaluate_waiting_gates(leader, run).await?;
 
         // A suspended run is one whose only outstanding work is gate waits.
         // It reopens as soon as that stops being true — a gate resolved, a
@@ -2693,10 +2790,27 @@ impl<'a> Scheduler<'a> {
                 if unchanged {
                     self.skip_unchanged(run, &step.step).await?;
                 } else {
-                    // Will run: record the input it consumes, then promote.
-                    self.db.set_step_input(run, &step.step, Some(&cur)).await?;
-                    self.transition_step(run, &step.step, StepStatus::Pending, StepStatus::Ready)
-                        .await?;
+                    // Will run: record the input it consumes and promote, as one
+                    // fenced commit. A lost CAS is benign, as in
+                    // `transition_step`: nothing is written.
+                    let now = self.clock.now().await;
+                    let promoted = [event(
+                        run,
+                        EventPayload::StepTransitioned {
+                            step: step.step.clone(),
+                            from: StepStatus::Pending,
+                            to: StepStatus::Ready,
+                        },
+                        now,
+                    )];
+                    match self
+                        .db
+                        .promote_step(leader, run, &step.step, &cur, &promoted)
+                        .await
+                    {
+                        Ok(()) | Err(DbError::Conflict) => {}
+                        Err(e) => return Err(e.into()),
+                    }
                 }
             } else if dep_dead(step) {
                 self.transition_step(run, &step.step, StepStatus::Pending, StepStatus::Skipped)
@@ -2704,53 +2818,51 @@ impl<'a> Scheduler<'a> {
             }
         }
 
-        // Claim ready steps (atomic ready→running) and emit a launch intent per
-        // claimed step, minting its next Attempt.
-        for claimed in self.db.claim_ready_steps(self.cfg.outbox_batch).await? {
+        // Claim ready steps (atomic ready→running) and launch each: its next
+        // Attempt, `AttemptStarted` and launch intent commit in the claim's
+        // own fenced transaction (git-bug 0f29112), so a leader deposed or
+        // stopped here leaves every step `Ready` or fully launched — never
+        // `Running` with no Attempt for the next leader to find.
+        let now = self.clock.now().await;
+        let mint = |claimed: &StepRun| -> Result<StepLaunch, DbError> {
             let n = claimed.attempts.len() + 1;
             let attempt = AttemptId(format!("a{n}"));
-            let now = self.clock.now().await;
-            self.db
-                .record_attempt(
-                    &claimed.run,
-                    &claimed.step,
-                    &Attempt {
-                        id: attempt.clone(),
-                        started_at: now,
-                        failure: None,
-                        failure_detail: None,
-                        outcome: AttemptOutcome::Running,
-                    },
-                )
-                .await?;
-            self.append(
-                &claimed.run,
-                EventPayload::AttemptStarted {
-                    step: claimed.step.clone(),
-                    attempt: attempt.clone(),
-                },
-                now,
-            )
-            .await?;
-
             let intent = LaunchIntent {
                 run: claimed.run.0.clone(),
                 step: claimed.step.0.clone(),
                 attempt: attempt.0.clone(),
             };
-            let key = launch_key(&claimed.run, &claimed.step, &attempt);
-            self.db
-                .enqueue_outbox(&OutboxMessage {
+            let payload = serde_json::to_value(&intent)
+                .map_err(|e| DbError::Other(format!("launch intent payload: {e}")))?;
+            Ok(StepLaunch {
+                attempt: Attempt {
+                    id: attempt.clone(),
+                    started_at: now,
+                    failure: None,
+                    failure_detail: None,
+                    outcome: AttemptOutcome::Running,
+                },
+                events: vec![event(
+                    &claimed.run,
+                    EventPayload::AttemptStarted {
+                        step: claimed.step.clone(),
+                        attempt: attempt.clone(),
+                    },
+                    now,
+                )],
+                outbox: vec![OutboxMessage {
                     id: crate::OutboxId(0),
                     run: claimed.run.clone(),
                     kind: LAUNCH_STEP.to_string(),
-                    payload: serde_json::to_value(&intent)
-                        .map_err(|e| SchedulerError::BadPayload(e.to_string()))?,
-                    idempotency_key: key,
+                    payload,
+                    idempotency_key: launch_key(&claimed.run, &claimed.step, &attempt),
                     at: now,
-                })
-                .await?;
-        }
+                }],
+            })
+        };
+        self.db
+            .claim_ready_steps(leader, self.cfg.outbox_batch, &mint)
+            .await?;
 
         // Suspend only when nothing else is runnable (slice b, criterion 3):
         // no step Ready/Running, and every outstanding step is a waiting gate
@@ -2781,13 +2893,23 @@ impl<'a> Scheduler<'a> {
             )
             .await?;
         for msg in msgs {
+            // One driver per launch intent (git-bug 068cc0b): the work runs
+            // only while this replica holds the message's claim, and the claim
+            // is renewed while it runs. A lost claim means another replica
+            // drives the intent now; this one stops and counts nothing.
+            let Some(outcome) = self
+                .while_claimed(&msg, self.process_launch_intent(&msg))
+                .await?
+            else {
+                continue;
+            };
             // Fault isolation + poison handling (ADR-0047): one failing
             // message must neither stall the batch behind it nor redeliver
             // forever. A processing error counts one failed delivery; at
             // MAX_DELIVERY_ATTEMPTS the message is dead-lettered (never
             // claimed again) and its run transitions to DeadLettered with
             // diagnostics — the operator signal.
-            if let Err(e) = self.process_launch_intent(&msg).await {
+            if let Err(e) = outcome {
                 let failures = self.db.record_outbox_failure(msg.id).await?;
                 if failures >= MAX_DELIVERY_ATTEMPTS {
                     self.db.dead_letter_outbox(msg.id).await?;
@@ -2804,6 +2926,69 @@ impl<'a> Scheduler<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Run `work` on the claimed outbox message `msg` only while this replica
+    /// holds its claim (git-bug 068cc0b). Returns `None` when the claim was
+    /// lost — before `work` started, or while it ran — and `work` was not run
+    /// or was dropped; `Some` with `work`'s result otherwise.
+    ///
+    /// The bug this closes: a claim hid a message for `outbox_visibility_ms`
+    /// and nothing extended it, so a launch intent whose poll ran longer than
+    /// the window (a workspace drain is a poll, and it can take minutes) was
+    /// claimed by a second replica while the first was still inside it. Two
+    /// replicas then drove one Pod's drain. Messages later in a batch had the
+    /// same hole: they waited out their claim behind the earlier ones.
+    ///
+    /// So the claim is checked (and extended) just before `work` starts, and
+    /// renewed every third of the window while it runs. A replica that dies
+    /// stops renewing, its claim lapses within one window, and the intent is
+    /// redelivered as before. A replica paused past the window (SIGSTOP, a VM
+    /// suspend) can lose the claim to a peer; its next renewal sees that and
+    /// drops `work` at its current await point. Dropping is the same as a
+    /// crash at that point, which launch-or-adopt already tolerates (ADR-0047):
+    /// every step of `process_launch_intent` is re-derived from durable state
+    /// by whoever drives the intent next.
+    ///
+    /// A window of zero or less holds nothing (tests use it to make every
+    /// message immediately reclaimable), so there is nothing to renew.
+    async fn while_claimed<T>(
+        &self,
+        msg: &OutboxMessage,
+        work: impl std::future::Future<Output = T>,
+    ) -> Result<Option<T>, SchedulerError> {
+        let window = self.cfg.outbox_visibility_ms;
+        if window <= 0 {
+            return Ok(Some(work.await));
+        }
+        if !self
+            .db
+            .renew_outbox_claim(msg.id, &self.owner, window)
+            .await?
+        {
+            return Ok(None);
+        }
+        let every = (window / 3).max(1) as u64;
+        let renew = async {
+            loop {
+                self.clock.sleep(every).await;
+                // An error is treated like a lost claim: this replica cannot
+                // show it still holds the message, so it must not keep
+                // driving it past the window.
+                if !matches!(
+                    self.db
+                        .renew_outbox_claim(msg.id, &self.owner, window)
+                        .await,
+                    Ok(true)
+                ) {
+                    return;
+                }
+            }
+        };
+        Ok(match first_of(work, renew).await {
+            First::Left(out) => Some(out),
+            First::Right(()) => None,
+        })
     }
 
     /// Drain cancel-teardown intents (ADR-0054): every [`CANCEL_ATTEMPT`]
@@ -2911,6 +3096,7 @@ impl<'a> Scheduler<'a> {
                     }
                     self.db
                         .set_run_service(
+                            None,
                             &msg.run,
                             svc.take,
                             &svc.name,
@@ -3962,6 +4148,7 @@ impl<'a> Scheduler<'a> {
             if !current.is_terminal() {
                 match commit_run_transition(
                     self.db,
+                    self.leader.as_ref(),
                     run,
                     current,
                     RunStatus::Cancelled,
@@ -4001,7 +4188,11 @@ impl<'a> Scheduler<'a> {
     ///
     /// A terminal gate is never re-evaluated. The gate step stays `Pending`
     /// throughout its wait.
-    async fn evaluate_waiting_gates(&self, run: &RunId) -> Result<(), SchedulerError> {
+    async fn evaluate_waiting_gates(
+        &self,
+        leader: &LeaderTerm,
+        run: &RunId,
+    ) -> Result<(), SchedulerError> {
         let steps = self.db.steps_of_run(run).await?;
         if !steps
             .iter()
@@ -4042,7 +4233,7 @@ impl<'a> Scheduler<'a> {
                     // reject, a cancel) — nothing to wait on.
                     match self
                         .db
-                        .open_gate_wait(run, &gate.step, started, now)
+                        .open_gate_wait(leader, run, &gate.step, started, now)
                         .await?
                     {
                         Some(a) => a,
@@ -4066,7 +4257,7 @@ impl<'a> Scheduler<'a> {
                 {
                     Ok(inputs) => {
                         self.db
-                            .set_gate_wait_inputs(run, &gate.step, &attempt.id, &inputs)
+                            .set_gate_wait_inputs(leader, run, &gate.step, &attempt.id, &inputs)
                             .await?;
                     }
                     Err(reason) => {
@@ -4270,17 +4461,33 @@ impl<'a> Scheduler<'a> {
                 .await?;
             cancel_open_gate_attempt(self.db, run, &step).await?;
         }
-        self.append(
+        // The verdict and its reason are one commit: appended on its own, a
+        // deposed leader's late `RunBudgetExhausted` journalled a second
+        // exhaustion next to its successor's.
+        let reason = vec![event(
             run,
             EventPayload::RunBudgetExhausted {
                 active_ms,
                 budget_ms,
             },
             now,
+        )];
+        match commit_run_transition_after(
+            self.db,
+            self.leader.as_ref(),
+            run,
+            RunStatus::Running,
+            RunStatus::Failed,
+            now,
+            true,
+            &[],
+            reason,
         )
-        .await?;
-        self.transition_run(run, RunStatus::Running, RunStatus::Failed)
-            .await?;
+        .await
+        {
+            Ok(()) | Err(DbError::Conflict) => {}
+            Err(e) => return Err(e.into()),
+        }
         if let Some((group, _)) = self.db.run_concurrency(run).await? {
             self.db.release_slot(&group, run).await?;
         }
@@ -4824,6 +5031,7 @@ impl<'a> Scheduler<'a> {
             Ok(handle) => {
                 self.db
                     .set_run_service(
+                        self.leader.as_ref(),
                         run,
                         take,
                         &svc.name,
@@ -4837,7 +5045,14 @@ impl<'a> Scheduler<'a> {
                 // Launch kept erroring past the readiness budget → fail-closed,
                 // unified with the readiness-timeout path (git-bug 6825830).
                 self.db
-                    .set_run_service(run, take, &svc.name, crate::ServiceStatus::Failed, None)
+                    .set_run_service(
+                        self.leader.as_ref(),
+                        run,
+                        take,
+                        &svc.name,
+                        crate::ServiceStatus::Failed,
+                        None,
+                    )
                     .await?;
                 Ok(None)
             }
@@ -4860,9 +5075,17 @@ impl<'a> Scheduler<'a> {
     /// down once the run is terminal. Leader-only + executor-owning, like the
     /// launch reconcile. A run with no `services:` is a no-op.
     pub async fn reconcile_services(&self, run: &RunId) -> Result<(), SchedulerError> {
-        if !self.is_leader().await? {
-            return Ok(());
-        }
+        self.reconcile_services_leg(run).await.map(|_| ())
+    }
+
+    async fn reconcile_services_leg(&self, run: &RunId) -> Result<Leg, SchedulerError> {
+        let Some(term) = self.leader_term().await? else {
+            return Ok(Leg::Done);
+        };
+        leader_leg(self.as_leader(term).reconcile_services_as_leader(run).await)
+    }
+
+    async fn reconcile_services_as_leader(&self, run: &RunId) -> Result<(), SchedulerError> {
         let services = self.pipeline_services(run).await?;
         if services.is_empty() {
             return Ok(());
@@ -4892,7 +5115,14 @@ impl<'a> Scheduler<'a> {
                         .await?;
                 }
                 self.db
-                    .set_run_service(run, r.take, &r.name, crate::ServiceStatus::TornDown, None)
+                    .set_run_service(
+                        self.leader.as_ref(),
+                        run,
+                        r.take,
+                        &r.name,
+                        crate::ServiceStatus::TornDown,
+                        None,
+                    )
                     .await?;
             }
         }
@@ -4911,7 +5141,7 @@ impl<'a> Scheduler<'a> {
                     // (git-bug 6825830). No `?` on the launch: a launch error must
                     // not abort the whole tick.
                     self.db
-                        .create_run_service(run, take, &svc.name, now)
+                        .create_run_service(self.leader.as_ref(), run, take, &svc.name, now)
                         .await?;
                     self.launch_service_bounded(run, take, svc, now, now)
                         .await?;
@@ -4936,6 +5166,7 @@ impl<'a> Scheduler<'a> {
                     if self.executor.service_ready(&handle).await? {
                         self.db
                             .set_run_service(
+                                self.leader.as_ref(),
                                 run,
                                 take,
                                 &svc.name,
@@ -4953,6 +5184,7 @@ impl<'a> Scheduler<'a> {
                         // unbound-dependency diagnostic in `admit`, failing the Run.
                         self.db
                             .set_run_service(
+                                self.leader.as_ref(),
                                 run,
                                 take,
                                 &svc.name,
@@ -4982,6 +5214,7 @@ impl<'a> Scheduler<'a> {
                         if !self.executor.service_ready(&ExecHandle(h.clone())).await? {
                             self.db
                                 .set_run_service(
+                                    self.leader.as_ref(),
                                     run,
                                     take,
                                     &svc.name,
@@ -5009,7 +5242,14 @@ impl<'a> Scheduler<'a> {
                         .await?;
                 }
                 self.db
-                    .set_run_service(run, r.take, &r.name, crate::ServiceStatus::TornDown, None)
+                    .set_run_service(
+                        self.leader.as_ref(),
+                        run,
+                        r.take,
+                        &r.name,
+                        crate::ServiceStatus::TornDown,
+                        None,
+                    )
                     .await?;
             }
         }
@@ -5025,7 +5265,9 @@ impl<'a> Scheduler<'a> {
         // The CAS, its journal entry and the exactly-once notification of
         // external observers (forge commit statuses) are one commit.
         let now = self.clock.now().await;
-        match commit_run_transition(self.db, run, from, to, now, true, &[]).await {
+        match commit_run_transition(self.db, self.leader.as_ref(), run, from, to, now, true, &[])
+            .await
+        {
             Ok(()) | Err(DbError::Conflict) => Ok(()),
             Err(e) => Err(e.into()),
         }
@@ -5101,6 +5343,58 @@ impl<'a> Scheduler<'a> {
             .await?;
         Ok(())
     }
+}
+
+/// How a leader leg ended, for [`Scheduler::tick_all`]'s failure streaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Leg {
+    /// Ran, or found this replica is not (or no longer) the leader.
+    Done,
+    /// A fenced transaction hit its bound ([`DbError::FenceTimeout`]); the
+    /// leg is retried next tick and this tick is no verdict on the run.
+    Deferred,
+}
+
+/// End a leader leg quietly when its term was refused or its fenced
+/// transaction timed out (git-bug aaf4e3e). Losing leadership is not a fault
+/// of the run, and neither is a row lock held elsewhere: neither may count
+/// toward the run's dead-letter bound or be logged as a tick error. Any
+/// other error is the run's, and goes the usual way (ADR-0059).
+fn leader_leg(r: Result<(), SchedulerError>) -> Result<Leg, SchedulerError> {
+    match r {
+        Ok(()) | Err(SchedulerError::Db(DbError::NotLeader)) => Ok(Leg::Done),
+        Err(SchedulerError::Db(DbError::FenceTimeout)) => Ok(Leg::Deferred),
+        Err(e) => Err(e),
+    }
+}
+
+/// Which of two futures finished first; see [`first_of`].
+enum First<L, R> {
+    Left(L),
+    Right(R),
+}
+
+/// Poll `left` and `right` together and return whichever finishes first,
+/// dropping the other. `left` is polled first, so work that is ready wins
+/// over a renewal that failed in the same wake-up. (The engine has no async
+/// runtime dependency, so this is the one `select` it needs, written out.)
+async fn first_of<L, R>(
+    left: impl std::future::Future<Output = L>,
+    right: impl std::future::Future<Output = R>,
+) -> First<L, R> {
+    use std::task::Poll;
+    let mut left = std::pin::pin!(left);
+    let mut right = std::pin::pin!(right);
+    std::future::poll_fn(|cx| {
+        if let Poll::Ready(v) = left.as_mut().poll(cx) {
+            return Poll::Ready(First::Left(v));
+        }
+        if let Poll::Ready(v) = right.as_mut().poll(cx) {
+            return Poll::Ready(First::Right(v));
+        }
+        Poll::Pending
+    })
+    .await
 }
 
 /// An [`EventKind`] of this build's schema version.

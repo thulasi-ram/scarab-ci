@@ -81,6 +81,9 @@ data:
   {{- with .Values.scarab.stepTimeoutSecs }}
   SCARAB_STEP_TIMEOUT_SECS: {{ . | quote }}
   {{- end }}
+  {{- with .Values.scarab.projectRunCap }}
+  SCARAB_PROJECT_RUN_CAP: {{ . | quote }}
+  {{- end }}
   {{- with .Values.scarab.casConcurrency }}
   {{- /* ADR-0061 s2. Read by BOTH workloads that touch the CAS: the server's
          ingest/materialize legs and the workspace StatefulSet sharing this
@@ -112,6 +115,14 @@ data:
          SCARAB_ROLE with an explicit `env` entry, which wins over envFrom. */}}
   SCARAB_WORKSPACE_URL: {{ include "scarab.workspaceUrl" . | quote }}
   SCARAB_WORKSPACE_DATA_DIR: {{ .Values.workspace.dataDir | quote }}
+  {{- if gt (int .Values.workspace.replicaCount) 1 }}
+  {{- /* Each Cache's home replica (git-bug 12e2f6b): the executor picks one
+         ordinal per cache key and gives the Step Pod that replica's URL for
+         cache content only. Rendered only above one replica, so a
+         single-replica install keeps its ConfigMap as it was. */}}
+  SCARAB_WORKSPACE_REPLICAS: {{ .Values.workspace.replicaCount | quote }}
+  SCARAB_WORKSPACE_HOME_URL_TEMPLATE: {{ include "scarab.workspaceHomeUrlTemplate" . | quote }}
+  {{- end }}
   {{- /* The fetcher image (ADR-0061 s3-feed): the init container every Step with
          `needs:` runs to pull its inputs from the service above. Set even though
          the server has its own default, so a chart-pinned digest is possible.

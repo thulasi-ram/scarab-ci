@@ -18,11 +18,11 @@ async fn shared_service_is_born_keyed_by_run_take_name_and_is_idempotent() {
     let run = RunId("r1".into());
 
     // Born at Take 1 in `starting`.
-    db.create_run_service(&run, 1, "db", Timestamp(100))
+    db.create_run_service(None, &run, 1, "db", Timestamp(100))
         .await
         .unwrap();
     // A re-tick / crash resume must NOT provision a second instance.
-    db.create_run_service(&run, 1, "db", Timestamp(999))
+    db.create_run_service(None, &run, 1, "db", Timestamp(999))
         .await
         .unwrap();
 
@@ -38,12 +38,12 @@ async fn shared_service_is_born_keyed_by_run_take_name_and_is_idempotent() {
 async fn status_and_handle_transitions_are_recorded() {
     let db = InMemoryDb::new();
     let run = RunId("r1".into());
-    db.create_run_service(&run, 1, "db", Timestamp(0))
+    db.create_run_service(None, &run, 1, "db", Timestamp(0))
         .await
         .unwrap();
 
     // starting → ready, recording the launch handle.
-    db.set_run_service(&run, 1, "db", ServiceStatus::Ready, Some("pod://db"))
+    db.set_run_service(None, &run, 1, "db", ServiceStatus::Ready, Some("pod://db"))
         .await
         .unwrap();
     let s = svc(&db.run_services(&run).await.unwrap(), 1, "db").clone();
@@ -51,7 +51,7 @@ async fn status_and_handle_transitions_are_recorded() {
     assert_eq!(s.handle.as_deref(), Some("pod://db"));
 
     // A later status-only update preserves the already-recorded handle.
-    db.set_run_service(&run, 1, "db", ServiceStatus::TornDown, None)
+    db.set_run_service(None, &run, 1, "db", ServiceStatus::TornDown, None)
         .await
         .unwrap();
     let s = svc(&db.run_services(&run).await.unwrap(), 1, "db").clone();
@@ -66,15 +66,22 @@ async fn a_rerun_take_gets_a_fresh_instance_beside_the_prior_take() {
     let run = RunId("r1".into());
 
     // Take 1 ran and was torn down.
-    db.create_run_service(&run, 1, "db", Timestamp(0))
+    db.create_run_service(None, &run, 1, "db", Timestamp(0))
         .await
         .unwrap();
-    db.set_run_service(&run, 1, "db", ServiceStatus::TornDown, Some("pod://t1"))
-        .await
-        .unwrap();
+    db.set_run_service(
+        None,
+        &run,
+        1,
+        "db",
+        ServiceStatus::TornDown,
+        Some("pod://t1"),
+    )
+    .await
+    .unwrap();
 
     // A Rerun opens Take 2 → a fresh instance, distinct row, no shared state.
-    db.create_run_service(&run, 2, "db", Timestamp(500))
+    db.create_run_service(None, &run, 2, "db", Timestamp(500))
         .await
         .unwrap();
 

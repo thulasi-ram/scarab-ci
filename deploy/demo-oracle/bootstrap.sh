@@ -8,7 +8,7 @@
 #
 # Idempotent — re-running it is a no-op on anything already done. It installs
 # k3s, opens the two cluster CIDRs through Oracle's stock firewall, and adds
-# swap. It deploys NOTHING: `deploy/demo-oracle/deploy.sh` (or `just
+# swap. It deploys NOTHING: `deploy/demo-oracle/deploy.sh` (or `just stack up
 # demo-oracle`) does that, as an unprivileged user, afterwards.
 #
 # ⚠ UNVERIFIED: no line of this has been run against a real Oracle instance.
@@ -240,7 +240,7 @@ Host prepared. Next, as the NON-root user:
   1. install helm (the deploy needs it; k3s does not ship it)
        curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
   2. cp deploy/demo-oracle/.env.example deploy/demo-oracle/.env  && fill it in
-  3. just demo-oracle          # or: bash deploy/demo-oracle/deploy.sh
+  3. just stack up demo-oracle          # or: bash deploy/demo-oracle/deploy.sh
 
 Read deploy/demo-oracle/README.md first — the Cloudflare tunnel, the R2 bucket
 and the GitHub OAuth app all have to exist before step 3 can work.

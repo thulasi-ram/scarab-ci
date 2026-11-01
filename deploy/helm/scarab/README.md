@@ -198,7 +198,7 @@ Helm values.
 **This covers the credential only.** Which installations and repos exist is
 separate durable state, registered by the App's `installation` /
 `installation_repositories` webhook deliveries (or, for the local dogfood stack,
-the signed synthetic `installation` event `just up dogfood` sends). A fresh database still needs one delivery.
+the signed synthetic `installation` event `just stack up dogfood` sends). A fresh database still needs one delivery.
 
 ## Declarative connections (`scarab.connections`, ADR-0060 part D)
 
@@ -337,9 +337,22 @@ cache). The warm tier exists so that reads and writes are local syscalls, so
 prefer local disk. An NFS-backed class adds a network round trip to every blob,
 which is the cost the warm tier is there to remove.
 
-> **Unverified in this chart version:** more than one replica, per-availability-
-> zone placement, and reachability from a step Pod. `workspace.replicaCount > 1`
-> has not been exercised.
+**More than one replica.** Drains and input fetches can land on any replica.
+Two replicas pass the ADR-0077 rank 1 fault runs (`just test chaos`). A Cache is the
+exception: it lives only in one replica's warm tier. Above one replica the
+chart renders one Service per replica, `<fullname>-workspace-<ordinal>`, and the
+server gives each step Pod the replica chosen from its cache key, its home. The
+Pod saves and restores that Cache through the home and sends everything else
+through `<fullname>-workspace`. A home that is down, has evicted the Cache, or
+is no longer the home after `workspace.replicaCount` changes is a cache miss:
+the step rebuilds the directory. Changing the count moves about 1/N of the keys.
+Change the count with `workspace.replicaCount` and a release upgrade, not
+`kubectl scale`: the server reads the count from `SCARAB_WORKSPACE_REPLICAS`,
+which the chart copies from that value, so after a scale it picks homes over
+the old count until the release is upgraded.
+The StatefulSet's `serviceName` is unchanged, so upgrading needs no migration.
+
+> **Unverified in this chart version:** per-availability-zone placement.
 
 ### Upgrading from 0.2.1 or earlier
 
@@ -414,7 +427,8 @@ DNS, which must be the usual `kube-system` Pods labelled `k8s-app=kube-dns`.
 | `workspace.persistence.size` / `.storageClass` | `20Gi` / cluster default | the warm tier's volume — bounded by SPACE via the LRU sweep (git-bug cba7165); prefer local disk (above) |
 | `workspace.warmBudgetBytes` | `""` = 90% of the volume | warm space bound in plain bytes (`SCARAB_WORKSPACE_WARM_BUDGET_BYTES`); the sweep evicts to 80% of it, committed-durable content first |
 | `workspace.blobAuthz` | `""` = `log` | blob-read authorization mode (`SCARAB_DEPOT_BLOB_AUTHZ`, ticket 52ef3aa): `off`/`log`/`enforce`; flip to `enforce` after `scarab_depot_blob_authz_would_deny_total` stays zero over a representative window. Caveat: `log` runs the real closure walk, so a roots claim holding an unwalkable root (absent from warm+packs+cold) 500s blob reads that miss the allowlist where `off` would have served them — intended fail-closed-on-availability behavior |
-| `workspace.replicaCount` | `1` | one per failure domain; `>1` is **unverified** |
+| `workspace.replicaCount` | `1` | one per failure domain; above 1, one Service per replica carries each Cache to its home replica (above) |
+| `workspace.homeUrlTemplate` | `""` = `http://<fullname>-workspace-{ordinal}.<ns>.svc` | one replica's URL with `{ordinal}` (`SCARAB_WORKSPACE_HOME_URL_TEMPLATE`); set it only beside `scarab.workspaceUrl` in a split install |
 | `secrets.workspaceTokenSecret` | — | HMAC secret for the workspace token; MUST differ from `resultsTokenSecret` (above) |
 | `scarab.workspaceUrl` | — | override the in-cluster workspace Service URL (split installs) |
 | `rbac.create` | `true` | Role/RoleBinding for Pod execution |

@@ -1,6 +1,6 @@
 # The fault tier's harness (ADR-0077 §2, §3): a seeded nemesis, scenario files
 # that replay, and the invariant checker, as a library and the `scarab-chaos`
-# binary. `just chaos` (deploy/kind/chaos.sh) drives it against the kind
+# binary. `just test chaos` (deploy/kind/chaos.sh) drives it against the kind
 # release in its chaos mode. The checker reads Postgres, the bucket and the
 # kube API directly; it does not take the API's word for success.
 #
@@ -22,7 +22,7 @@ scarab-storage = { workspace = true }
 scarab-workspace-client = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["signal"] }
 futures = { workspace = true }
 reqwest = { workspace = true }
 sqlx = { workspace = true }
@@ -32,3 +32,8 @@ k8s-openapi = { workspace = true }
 clap = { workspace = true }
 rand = { workspace = true }
 rustls = { workspace = true }
+base64 = { workspace = true }
+
+# The Cache probe's pipeline is compiled in a unit test (src/cache.rs).
+[dev-dependencies]
+scarab-pipeline = { workspace = true }

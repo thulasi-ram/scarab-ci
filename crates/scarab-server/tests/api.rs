@@ -457,10 +457,11 @@ async fn shared_service_status_and_logs_are_exposed() {
     // Terminal so the log SSE replays and closes (hermetic — no live tail hang).
     db.seed_run(&run, RunStatus::Succeeded);
     // A shared service instance at Take 1, promoted to `ready`.
-    db.create_run_service(&run, 1, "db", Timestamp(1_000))
+    db.create_run_service(None, &run, 1, "db", Timestamp(1_000))
         .await
         .unwrap();
     db.set_run_service(
+        None,
         &run,
         1,
         "db",

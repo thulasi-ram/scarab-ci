@@ -9,9 +9,9 @@
 //!   add connection → pick-list → bind → hook registered → real push → Run.
 //!
 //! `#[ignore]`d, and needs both `SCARAB_E2E=1` (the kind release) and
-//! `SCARAB_TEST_FORGEJO=1` (a seeded Forgejo). `just e2e` sets both and asks
+//! `SCARAB_TEST_FORGEJO=1` (a seeded Forgejo). `just test e2e` sets both and asks
 //! for the ignored set in a pass of its own. It is ignored
-//! rather than env-skipped because `just e2e` (and the e2e workflow) sets
+//! rather than env-skipped because `just test e2e` (and the e2e workflow) sets
 //! `SCARAB_E2E=1` with no Forgejo: the old second gate returned early there,
 //! and the run reported this case PASS in 8 ms (git-bug dcc4ca9). Ignored, it
 //! reports as skipped; asked for, it panics on a missing switch.
@@ -32,7 +32,7 @@ use support::forgejo::*;
 use support::*;
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs the kind release and a seeded Forgejo; run `just e2e`"]
+#[ignore = "needs the kind release and a seeded Forgejo; run `just test e2e`"]
 async fn a_real_forgejo_repo_onboards_and_its_push_becomes_a_run() {
     enter_tier();
 
@@ -200,7 +200,7 @@ async fn a_real_forgejo_repo_onboards_and_its_push_becomes_a_run() {
             Instant::now() < deadline,
             "no NEW Run appeared for {org}/{project} after a real push ({} pre-existing). \
              A delivery that was rejected shows up as a 401 in the server's log \
-             (`just logs`) — that is the `config.secret` failure mode this tier \
+             (`just stack logs`) — that is the `config.secret` failure mode this tier \
              exists to catch.",
             before.len()
         );
@@ -233,7 +233,7 @@ const NOTIFY_SOURCE: &str =
 
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs the kind release and a seeded Forgejo; run `just e2e`"]
+#[ignore = "needs the kind release and a seeded Forgejo; run `just test e2e`"]
 async fn an_installed_library_runs_and_a_yank_refuses_its_rerun() {
     enter_tier();
     let base = base_url();

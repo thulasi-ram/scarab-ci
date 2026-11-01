@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Submit a one-step pipeline to a running scarab-server and watch it complete.
-# Requires `just up` to be running first.
+# Requires `just stack up` to be running first.
 set -euo pipefail
 
 base="${SCARAB_BASE:-http://127.0.0.1:8080}"

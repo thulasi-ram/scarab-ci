@@ -6,7 +6,7 @@
 //! never re-executed (no second `AttemptStarted` per step), and the run makes
 //! exactly one terminal transition.
 //!
-//! The server under test is the release's own server Pod (`just e2e` runs the
+//! The server under test is the release's own server Pod (`just test e2e` runs the
 //! release in its e2e mode, with its own database and bucket). In the Pod the
 //! server is PID 1 with no init, and a signal sent from inside its PID
 //! namespace that it has no handler for is dropped. So the SIGKILL comes from
@@ -96,30 +96,16 @@ fn on_node(args: &[&str]) -> String {
 }
 
 /// SIGKILL the server container's process from the kind node's PID
-/// namespace. Returns the node-side PID it signalled.
-fn kill_server_from_node(target: &ServerContainer) -> String {
-    let pid = on_node(&[
-        "crictl",
-        "inspect",
-        "--output",
-        "go-template",
-        "--template",
-        "{{.info.pid}}",
-        &target.container_id,
-    ]);
-    assert!(
-        !pid.is_empty() && pid.chars().all(|c| c.is_ascii_digit()) && pid != "0",
-        "crictl gave no PID for container {}: {pid:?}",
-        target.container_id
-    );
-    // The PID belongs to the server container, not the Depot's: its cgroup
-    // names the container id.
-    let cgroup = on_node(&["cat", &format!("/proc/{pid}/cgroup")]);
-    assert!(
-        cgroup.contains(&target.container_id),
-        "PID {pid} is not in container {}'s cgroup: {cgroup}",
-        target.container_id
-    );
+/// namespace. Returns the node-side PID it signalled. The PID lookup and the
+/// signal are the fault tier's (`scarab_chaos::node::Node`): `crictl inspect`
+/// on the node, then a check that the PID's cgroup names the container, so
+/// the Depot (same binary) is never the one killed.
+async fn kill_server_from_node(target: &ServerContainer) -> i64 {
+    let node = scarab_chaos::node::Node { name: kind_node() };
+    let pid = node
+        .container_pid(&target.container_id)
+        .await
+        .unwrap_or_else(|e| panic!("the server container's node PID: {e}"));
     let cmdline = on_node(&["sh", "-c", &format!("tr '\\0' ' ' < /proc/{pid}/cmdline")]);
     eprintln!(
         "crash_resume: SIGKILL from node {} to PID {pid} ({cmdline}), container {} of Pod {} (restarts before: {})",
@@ -128,7 +114,9 @@ fn kill_server_from_node(target: &ServerContainer) -> String {
         target.pod,
         target.restarts
     );
-    on_node(&["kill", "-KILL", &pid]);
+    node.signal(pid, "KILL")
+        .await
+        .unwrap_or_else(|e| panic!("SIGKILL to PID {pid}: {e}"));
     pid
 }
 
@@ -207,7 +195,7 @@ async fn crash_resume_completes_exactly_once() {
     // --- SIGKILL mid-step-1 from the node; the kubelet restarts it ----------
     let before = server_container();
     assert!(before.ready, "the server must be ready before the kill: {before:?}");
-    kill_server_from_node(&before);
+    kill_server_from_node(&before).await;
     let (after, last) = wait_restarted(&before).await;
     eprintln!(
         "crash_resume: container restarted in place: Pod {} uid {} restarts {} -> {}, container {} -> {}, last termination {last}",

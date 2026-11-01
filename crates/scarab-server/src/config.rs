@@ -28,10 +28,11 @@
 //! | `SCARAB_SIDECAR_IMAGE` | env | results-egress sidecar image |
 //! | `SCARAB_WORKSPACE_TOKEN_SECRET` | env | enables the workspace service + the token Step Pods present to it (ADR-0061). **Required** under `--role workspace`; deliberately a DIFFERENT secret from `SCARAB_RESULTS_TOKEN_SECRET` |
 //! | `SCARAB_WORKSPACE_URL` | env | base URL of the workspace service; default `http://scarab-workspace` |
-//! | `SCARAB_WORKSPACE_CONTROL_URL` | env | base URL **this process** dials the workspace service on (its Depot client: drain-record reads, the warm CAS leg); default `SCARAB_WORKSPACE_URL`. Set only where the Pod-facing URL is not reachable from the control plane — proc mode, where a Pod dials `host.docker.internal` and the host cannot resolve it (git-bug 021b6bc) |
 //! | `SCARAB_WORKSPACE_DATA_DIR` | env | the workspace service's **warm tier** directory (its persistent volume); default `./.scarab/workspace-cas`. Only read under `--role workspace` |
-//! | `SCARAB_WORKSPACE_WARM_BUDGET_BYTES` | env | warm-tier space bound (git-bug cba7165): over it the Depot's LRU sweep evicts. Unset = 90% of the warm volume's `statvfs` capacity — right on a dedicated PVC, **effectively unbounded on a shared disk** (a dev machine), which is why `deploy/local-proc` sets one explicitly. Only meaningful under `--role workspace` |
+//! | `SCARAB_WORKSPACE_WARM_BUDGET_BYTES` | env | warm-tier space bound (git-bug cba7165): over it the Depot's LRU sweep evicts. Unset = 90% of the warm volume's `statvfs` capacity — right on a dedicated PVC, **effectively unbounded on a shared disk** (a dev machine), which is why `deploy/kind/values.yaml` sets one explicitly. Only meaningful under `--role workspace` |
 //! | `SCARAB_DEPOT_BLOB_AUTHZ` | env | blob-read authorization mode on the Depot (ticket 52ef3aa): `off` (authenticated-only, the pre-ticket behavior), `log` (compute the roots-closure allowlist, count and sample-log would-denies, never refuse), `enforce` (403 outside the token's roots closure). Default `log` for one release; flip to `enforce` after `scarab_depot_blob_authz_would_deny_total` stays zero over a representative window. Only meaningful under `--role workspace` |
+//! | `SCARAB_WORKSPACE_REPLICAS` | env | the Depot StatefulSet's replica count (git-bug 12e2f6b); default 1. Above 1, with the template below, the executor gives each Step Pod its Cache's home replica |
+//! | `SCARAB_WORKSPACE_HOME_URL_TEMPLATE` | env | one Depot replica's URL with `{ordinal}` for its StatefulSet ordinal, e.g. `http://scarab-workspace-{ordinal}.scarab.svc` (git-bug 12e2f6b). Cache saves and restores go to the replica chosen from the cache key; everything else keeps `SCARAB_WORKSPACE_URL`. Unset = caches use `SCARAB_WORKSPACE_URL` |
 //! | `SCARAB_WSFETCH_IMAGE` | env | the workspace **helper** image every workspace Step Pod carries (ADR-0061): the fetch init container (s3-feed) AND the egress hold/drain sidecar (`scarab-wsfetch hold` / the in-Pod `drain` the control plane execs); default `ghcr.io/thulasi-ram/scarab-wsfetch:edge`. ADR-0062 stage 2 replaces only the **eager-fetch** role; the egress role survives it — the old "dies with the node driver" note (git-bug 0628369) applied to the fetch role alone and is closed as superseded |
 //! | `SCARAB_WSFETCH_CPU_MILLIS` | env | requests==limits CPU (millicpu) for BOTH wsfetch helper containers (ticket 16a7768). Default unset — a CPU limit throttles the drain's hashing. `0` = explicitly unset |
 //! | `SCARAB_WSFETCH_MEMORY_MIB` | env | requests==limits memory (MiB) for both wsfetch helper containers; **default unset — opt-in** (a defaulted limit could OOM-loop a workspace holding one file above it). When set it also derives the helper's transfer byte budget (half the limit, `SCARAB_WORKSPACE_TRANSFER_BUDGET_BYTES` on the containers) so the limit and the in-flight cap move on one knob; unset, the wsfetch binary's own 256 MiB budget still bounds transfer memory. The helper whole-reads each file: a single workspace file approaching a configured limit needs it raised. `0` = explicitly unset |
@@ -46,6 +47,7 @@
 //! | `SCARAB_DEV_INSECURE` | env | `1`/`true`: downgrade the **security** hard-fails (KEK, auth) to loud boot warnings — dev only, never relaxes the Postgres requirement |
 //! | `SCARAB_STEP_UP` | env | step-up confirmation (ADR-0073). Unset/blank or `enforce` = **enforce** (production: crown-jewel operations need a passkey confirmation); any other value refuses boot — there is no `off` or `log` mode. Under `SCARAB_DEV_INSECURE=1` it is off unless explicitly `enforce` (local passkey testing). Enforce with OAuth login needs an `https` (or loopback) `SCARAB_PUBLIC_URL` |
 //! | `SCARAB_STEP_TIMEOUT_SECS` | env | global default step deadline (ADR-0047); default 3600 (1h), per-step overridable via `timeout:` |
+//! | `SCARAB_PROJECT_RUN_CAP` | env | how many of one project's Runs may be `Running` at once; the rest wait `Pending` (ADR-0011). Unset or `0` = no cap (default). A Run waiting on a gate is not counted |
 //! | `SCARAB_PUBLIC_URL` | env | Scarab's public base URL — the run deep-link every forge status carries (ADR-0046); default `http://localhost:8080` (dev) |
 //! | `SCARAB_PLACEMENT_CONFIG_FILE` | env | path to the operator placement config (ADR-0055): cluster baseline + PlacementProfile registry (YAML/JSON, gitops-managed); a bad path/parse is a boot failure |
 //! | `SCARAB_GITHUB_APP_ID` | env | GitHub App id (ADR-0046): when set, GitHub connections authenticate in **App mode** (their credential secret is the App PEM); absent = token mode (dev) |
@@ -290,15 +292,10 @@ pub struct WorkspaceServiceConfig {
     /// the results-egress secret: that one carries no verb and never expires,
     /// and sharing it would let the workspace service forge step results.
     pub token_secret: Vec<u8>,
-    /// Base URL of the workspace service a Step Pod's helpers dial (injected
-    /// into the fetcher and the in-Pod drain).
+    /// Base URL of the workspace service: a Step Pod's helpers dial it
+    /// (injected into the fetcher and the in-Pod drain), and so does this
+    /// process's Depot client (drain-record reads, the warm CAS leg).
     pub url: String,
-    /// Base URL THIS process dials the workspace service on — its Depot client
-    /// (drain-record reads, the warm CAS leg). Equals [`url`](Self::url) unless
-    /// `SCARAB_WORKSPACE_CONTROL_URL` says otherwise: in proc mode the
-    /// Pod-facing name (`host.docker.internal`) does not resolve on the host,
-    /// so a drain the Pod completed could never be read back (git-bug 021b6bc).
-    pub control_url: String,
     /// The **warm tier's** directory: the persistent volume the service holds
     /// its content-addressed store on. Only meaningful for `--role workspace`.
     pub data_dir: String,
@@ -339,6 +336,11 @@ pub struct WorkspaceServiceConfig {
     /// 52ef3aa). Default [`BlobAuthzMode::Log`] — see the enum docs for the
     /// flip-to-enforce criterion. Only meaningful for `--role workspace`.
     pub blob_authz: BlobAuthzMode,
+    /// Each Cache's home Depot replica (git-bug 12e2f6b), from
+    /// `SCARAB_WORKSPACE_REPLICAS` and `SCARAB_WORKSPACE_HOME_URL_TEMPLATE`.
+    /// `None` at one replica or with no template: caches use [`url`](Self::url)
+    /// like everything else.
+    pub cache_home: Option<scarab_executor_k8s::cache_home::CacheHome>,
 }
 
 /// Blob-read authorization mode on the Depot (`SCARAB_DEPOT_BLOB_AUTHZ`,
@@ -380,6 +382,39 @@ impl BlobAuthzMode {
             _ => None,
         }
     }
+}
+
+/// The Depot cache home (git-bug 12e2f6b): the replica count and the
+/// per-replica URL template the chart renders. Unset count = 1. A template
+/// without `{ordinal}` refuses the boot: it would send every Cache to one
+/// literal address.
+fn cache_home_from_env(
+    env: &impl Fn(&str) -> Option<String>,
+) -> Result<Option<scarab_executor_k8s::cache_home::CacheHome>, ConfigError> {
+    use scarab_executor_k8s::cache_home::{CacheHome, ORDINAL_PLACEHOLDER};
+    let replicas = match env("SCARAB_WORKSPACE_REPLICAS").filter(|v| !v.trim().is_empty()) {
+        Some(raw) => raw
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|n| *n > 0)
+            .ok_or_else(|| {
+                ConfigError::InvalidWorkspaceCacheHome(format!(
+                    "SCARAB_WORKSPACE_REPLICAS={raw:?}"
+                ))
+            })?,
+        None => 1,
+    };
+    let Some(template) = env("SCARAB_WORKSPACE_HOME_URL_TEMPLATE").filter(|v| !v.is_empty())
+    else {
+        return Ok(None);
+    };
+    if !template.contains(ORDINAL_PLACEHOLDER) {
+        return Err(ConfigError::InvalidWorkspaceCacheHome(format!(
+            "SCARAB_WORKSPACE_HOME_URL_TEMPLATE={template:?} has no {ORDINAL_PLACEHOLDER}"
+        )));
+    }
+    Ok(CacheHome::new(replicas, template))
 }
 
 /// One axis of the wsfetch helper resources: unset/blank = `default`,
@@ -551,6 +586,9 @@ pub struct Config {
     /// declares no `timeout:`. A default is mandatory — it closes the
     /// "hung Pod wedges the run forever" hole.
     pub step_timeout_secs: u32,
+    /// `SCARAB_PROJECT_RUN_CAP`: the most Runs of one project that may be
+    /// `Running` at once (ADR-0011). `None` (unset or `0`) = no cap.
+    pub project_run_cap: Option<u32>,
     /// Scarab's public base URL (ADR-0046): the run deep-link every forge
     /// status carries (`{public_url}/runs/{id}`). Dev default
     /// `http://localhost:8080`.
@@ -1088,7 +1126,7 @@ pub enum ConfigError {
         "SCARAB_DATABASE_URL is not set. Postgres is mandatory for every serving role \
          (ADR-0048) — there is no API-only mode, and the workspace role needs it too \
          (ADR-0067 part 2: it reads/writes drain records and write ledgers; it never \
-         migrates). Start a Postgres (dev: `just up`) and set SCARAB_DATABASE_URL; \
+         migrates). Start a Postgres (dev: `just stack up`) and set SCARAB_DATABASE_URL; \
          only `--emit-openapi` works without a database. SCARAB_DEV_INSECURE does \
          NOT relax this."
     )]
@@ -1224,6 +1262,13 @@ pub enum ConfigError {
     InvalidStepTimeout,
 
     #[error(
+        "SCARAB_PROJECT_RUN_CAP is set but invalid (got {0:?}) — want a non-negative \
+         integer: the most Runs of one project that may be Running at once (ADR-0011); \
+         0 or unset means no cap."
+    )]
+    InvalidProjectRunCap(String),
+
+    #[error(
         "{0} is set but invalid (got {1:?}) — want a non-negative integer: the wsfetch \
          helper resource axes (ticket 16a7768) are millicpu / MiB, applied requests==limits \
          to both helper containers of every workspace Step Pod; 0 opts the axis out."
@@ -1272,6 +1317,14 @@ pub enum ConfigError {
          typo refuses the boot (ADR-0048)."
     )]
     InvalidBlobAuthzMode(String),
+
+    #[error(
+        "the Depot cache home config is invalid: {0}. SCARAB_WORKSPACE_REPLICAS is the \
+         Depot StatefulSet's replica count (a positive integer) and \
+         SCARAB_WORKSPACE_HOME_URL_TEMPLATE is one replica's URL with `{{ordinal}}` in \
+         place of its ordinal (git-bug 12e2f6b)."
+    )]
+    InvalidWorkspaceCacheHome(String),
 
     #[error(
         "the plugin configuration is invalid (ADR-0072): {0}. A plugin runtime Scarab \
@@ -1507,6 +1560,15 @@ impl Config {
             None => 3_600,
         };
 
+        let project_run_cap = match env("SCARAB_PROJECT_RUN_CAP").filter(|v| !v.trim().is_empty()) {
+            Some(v) => match v.trim().parse::<u32>() {
+                Ok(0) => None,
+                Ok(n) => Some(n),
+                Err(_) => return Err(ConfigError::InvalidProjectRunCap(v)),
+            },
+            None => None,
+        };
+
         // ADR-0061 s2's CAS-leg parallelism. Read here, not in the adapter: an
         // ambient env read there could neither fail the boot nor be reported.
         let cas_concurrency = match env(scarab_storage_s3::CAS_CONCURRENCY_ENV)
@@ -1536,9 +1598,6 @@ impl Config {
         let workspace = match env("SCARAB_WORKSPACE_TOKEN_SECRET").filter(|v| !v.is_empty()) {
             Some(secret) => Some(WorkspaceServiceConfig {
                 token_secret: secret.into_bytes(),
-                control_url: env("SCARAB_WORKSPACE_CONTROL_URL")
-                    .filter(|v| !v.is_empty())
-                    .unwrap_or_else(|| workspace_url.clone()),
                 url: workspace_url,
                 data_dir: env("SCARAB_WORKSPACE_DATA_DIR")
                     .filter(|v| !v.is_empty())
@@ -1583,6 +1642,7 @@ impl Config {
                     Some(raw) => BlobAuthzMode::parse(&raw)
                         .ok_or(ConfigError::InvalidBlobAuthzMode(raw))?,
                 },
+                cache_home: cache_home_from_env(&env)?,
             }),
             None if matches!(cli.role, Role::Workspace) => {
                 return Err(ConfigError::MissingWorkspaceTokenSecret)
@@ -1646,6 +1706,7 @@ impl Config {
             master_key_warnings,
             dev_insecure,
             step_timeout_secs,
+            project_run_cap,
             public_url,
             github_app_id: env("SCARAB_GITHUB_APP_ID").filter(|v| !v.is_empty()),
             github_app_pem: env("SCARAB_GITHUB_APP_PEM").filter(|v| !v.is_empty()),
@@ -2283,34 +2344,6 @@ mod tests {
             .any(|l| l.contains("never migrates")));
     }
 
-    /// The control plane dials the workspace service on its OWN URL when one is
-    /// given, and on the Pod-facing one otherwise (git-bug 021b6bc). In proc
-    /// mode a Pod reaches the host as `host.docker.internal`, a name the host
-    /// itself cannot resolve: with one URL for both, every drain a Pod completed
-    /// was unreadable to the control plane, so the step never settled.
-    #[test]
-    fn the_workspace_control_url_defaults_to_the_pod_facing_url() {
-        // The workspace role needs no KEK, so nothing but the URLs is in play.
-        let mut cli = cli(Some("postgres://scarab:pw@db/scarab"));
-        cli.role = Role::Workspace;
-        let pod_only = |k: &str| match k {
-            "SCARAB_WORKSPACE_TOKEN_SECRET" => Some("ws-secret".to_string()),
-            "SCARAB_WORKSPACE_URL" => Some("http://host.docker.internal:8081".to_string()),
-            _ => None,
-        };
-        let ws = Config::resolve_from(&cli, pod_only).unwrap().workspace.unwrap();
-        assert_eq!(ws.url, "http://host.docker.internal:8081");
-        assert_eq!(ws.control_url, ws.url, "one URL serves both audiences by default");
-
-        let both = |k: &str| match k {
-            "SCARAB_WORKSPACE_CONTROL_URL" => Some("http://127.0.0.1:8081".to_string()),
-            other => pod_only(other),
-        };
-        let ws = Config::resolve_from(&cli, both).unwrap().workspace.unwrap();
-        assert_eq!(ws.url, "http://host.docker.internal:8081", "Pods keep their URL");
-        assert_eq!(ws.control_url, "http://127.0.0.1:8081");
-    }
-
     /// Every role requires Postgres — the workspace role included since
     /// ADR-0067 part 2. If `Api` ever passes without one, the ADR-0048
     /// "no API-only mode" rule has been quietly repealed.
@@ -2525,6 +2558,32 @@ mod tests {
     }
 
     /// Env: dev-insecure on, plus computed (owned) master-key vars.
+    /// git-bug 12e2f6b: one replica (the default) or no template = no cache
+    /// home; a template without `{ordinal}` or a garbled count refuses the
+    /// boot rather than routing every Cache to one address.
+    #[test]
+    fn the_cache_home_needs_replicas_and_an_ordinal_template() {
+        let t = "http://scarab-workspace-{ordinal}.ns.svc".to_string();
+        let home = |pairs: Vec<(&'static str, String)>| cache_home_from_env(&key_env(pairs));
+        assert_eq!(home(vec![]).unwrap(), None);
+        assert_eq!(home(vec![("SCARAB_WORKSPACE_HOME_URL_TEMPLATE", t.clone())]).unwrap(), None);
+        assert_eq!(home(vec![("SCARAB_WORKSPACE_REPLICAS", "3".into())]).unwrap(), None);
+        let got = home(vec![
+            ("SCARAB_WORKSPACE_REPLICAS", "3".into()),
+            ("SCARAB_WORKSPACE_HOME_URL_TEMPLATE", t.clone()),
+        ])
+        .unwrap()
+        .expect("three replicas and a template route caches");
+        assert_eq!(got.replicas, 3);
+        assert!(home(vec![
+            ("SCARAB_WORKSPACE_REPLICAS", "3".into()),
+            ("SCARAB_WORKSPACE_HOME_URL_TEMPLATE", "http://one.ns.svc".into()),
+        ])
+        .is_err());
+        assert!(home(vec![("SCARAB_WORKSPACE_REPLICAS", "two".into())]).is_err());
+        assert!(home(vec![("SCARAB_WORKSPACE_REPLICAS", "0".into())]).is_err());
+    }
+
     fn key_env(pairs: Vec<(&'static str, String)>) -> impl Fn(&str) -> Option<String> {
         move |k: &str| {
             if k == "SCARAB_DEV_INSECURE" {

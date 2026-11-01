@@ -12,6 +12,7 @@
 /// by the workspace service. Mint and verify live in ONE module on purpose —
 /// the results token's message format is duplicated across two crates and that
 /// is a standing drift hazard, not a pattern to copy.
+pub mod cache_home;
 pub mod workspace_token;
 
 use async_trait::async_trait;
@@ -69,9 +70,8 @@ const CANCEL_GRACE_SECS: i64 = 30;
 /// eager copy of anything.
 #[derive(Debug, Clone)]
 pub struct WorkspaceFetch {
-    /// Base URL of the workspace service **as a Pod sees it**. In proc mode
-    /// that is generally *not* the URL the host uses (see
-    /// `deploy/local-proc/up.sh`).
+    /// Base URL of the workspace service **as a Pod sees it** (in the chart,
+    /// the Depot's Service).
     pub url: String,
     /// HMAC secret the workspace token is minted with — the same secret the
     /// service verifies with. Never the results-egress secret: see
@@ -94,6 +94,21 @@ pub struct WorkspaceFetch {
     /// drain whole-reads each file, so a SINGLE output file approaching the
     /// limit needs the knob raised.
     pub helper_resources: scarab_pipeline::Resources,
+    /// Each Cache's home Depot replica (git-bug 12e2f6b). `None` (one Depot
+    /// replica, or no per-replica address configured) = caches use `url` like
+    /// everything else.
+    pub cache_home: Option<cache_home::CacheHome>,
+}
+
+impl WorkspaceFetch {
+    /// The Step's Cache home URL, when its cache key resolved and the Depot
+    /// has more than one replica. Restore hints come from the same key the
+    /// drain saves under, so a save and a later restore of that key ask the
+    /// same replica.
+    fn cache_home_url(&self, spec: &StepSpec) -> Option<String> {
+        let key = spec.cache.as_ref()?.key.as_ref()?;
+        self.cache_home.as_ref()?.url_for(key)
+    }
 }
 
 /// Configuration for the trusted per-Pod results-egress sidecar (ADR-0042). When
@@ -492,11 +507,8 @@ impl K8sExecutor {
         workspace_token::mint(&fetch.token_secret, &claims)
     }
 
-    /// Mint the fence-scoped, expiring, root-limited workspace token for a Step.
-    ///
-    /// `roots` is exactly the Step's declared inputs, so the service can refuse a
-    /// tree read the Step was never given (`WorkspaceClaims::may_read_tree`) — a
-    /// compromised Step cannot enumerate other runs' snapshots by asking.
+    /// Mint the fence-scoped, expiring, root-limited workspace token for a Step
+    /// (claims built by [`step_token_claims`]).
     fn mint_workspace_token(
         &self,
         fetch: &WorkspaceFetch,
@@ -515,30 +527,7 @@ impl K8sExecutor {
             now,
             spec.timeout_seconds.unwrap_or(self.default_step_timeout_secs),
         );
-        // The readable roots: the Step's declared inputs, plus the launch-
-        // resolved cache restore roots (ADR-0065 s1) — claims ONLY, never
-        // `workspace_inputs` itself, which feeds skip-signatures and the
-        // fetcher's merge order. The pod's cross-run cache read rides the
-        // existing exact-roots mechanism: zero new auth surface, and keys
-        // never cross the trust boundary.
-        let mut roots = spec.workspace_inputs.clone();
-        if let Some(cache) = &spec.cache {
-            for (_, root) in &cache.restore {
-                if !roots.contains(root) {
-                    roots.push(root.clone());
-                }
-            }
-        }
-        let claims = workspace_token::step_claims(
-            workspace_token::Fence {
-                run: step.run.0.clone(),
-                step: step.step.0.clone(),
-                attempt,
-            },
-            exp,
-            roots,
-        );
-        workspace_token::mint(&fetch.token_secret, &claims)
+        workspace_token::mint(&fetch.token_secret, &step_token_claims(step, spec, attempt, exp))
     }
 
     /// Upsert the per-Pod Secret carrying a Step's forge credential (ADR-0076
@@ -815,7 +804,8 @@ impl K8sExecutor {
                     // DrainRecord LAST — so a record's existence implies the
                     // ingest completed.
                     let t_leg = std::time::Instant::now();
-                    let exec_outcome = self.exec_drain(pods, &name, &declared, &cache_dirs).await;
+                    let (exec_outcome, helper_line) =
+                        self.exec_drain(pods, &name, &declared, &cache_dirs).await;
                     let exec_drain_ms = t_leg.elapsed().as_millis();
                     // RECORD-FIRST classification: the record on the Depot is
                     // the truth about what the drain did; the exec outcome is
@@ -853,6 +843,13 @@ impl K8sExecutor {
                             return Err(DriveErr::OutputContract(cause))
                         }
                         DrainDecision::Transient(cause) => {
+                            // With no record, the helper's own last line is
+                            // the only account of why (which 422, which POST
+                            // error); keep it in the cause.
+                            let cause = match (&record, &helper_line) {
+                                (None, Some(line)) => format!("{cause}; the helper said: {line}"),
+                                _ => cause,
+                            };
                             return Err(self
                                 .drain_failure(pods, &name, &annotations, cause)
                                 .await)
@@ -1426,14 +1423,15 @@ impl K8sExecutor {
     /// [`exec_capture_stdout`](Self::exec_capture_stdout): no payload crosses
     /// this exec. The truth about the drain is the DrainRecord on the Depot;
     /// the caller classifies RECORD-FIRST and uses this outcome only as a hint
-    /// when there is no record.
+    /// when there is no record. The second value is the helper's last output
+    /// line ([`helper_last_line`]), for the cause when there is no record.
     async fn exec_drain(
         &self,
         pods: &Api<Pod>,
         pod: &str,
         output_globs: &[String],
         cache_dirs: &[String],
-    ) -> DrainExecOutcome {
+    ) -> (DrainExecOutcome, Option<String>) {
         use tokio::io::AsyncReadExt as _;
         let mut cmd: Vec<String> = vec![
             "scarab-wsfetch".to_string(),
@@ -1460,7 +1458,7 @@ impl K8sExecutor {
             Ok(proc) => proc,
             // The exec never started (container restarting, apiserver blip):
             // nothing ran, so nothing permanent can be concluded.
-            Err(e) => return DrainExecOutcome::StartFailed(e.to_string()),
+            Err(e) => return (DrainExecOutcome::StartFailed(e.to_string()), None),
         };
         // Before `join`, which takes the status receiver away.
         let status = proc.take_status();
@@ -1480,8 +1478,9 @@ impl K8sExecutor {
         if let Some(mut stdout) = proc.stdout() {
             let _ = stdout.read_to_end(&mut stdout_buf).await;
         }
+        let line = helper_last_line(&stderr_buf, &stdout_buf);
         if let Err(e) = proc.join().await {
-            return DrainExecOutcome::StatusLost(format!("exec join: {e}"));
+            return (DrainExecOutcome::StatusLost(format!("exec join: {e}")), line);
         }
         let status = match status {
             Some(fut) => fut.await,
@@ -1491,20 +1490,23 @@ impl K8sExecutor {
             // The frame can legitimately be torn down with the container (see
             // `exec_with_stdin`) — the record decides; absent one this is
             // indeterminate, never fatal.
-            return DrainExecOutcome::StatusLost("no status frame".to_string());
+            return (DrainExecOutcome::StatusLost("no status frame".to_string()), line);
         };
         if status.status.as_deref() == Some("Success") {
-            return DrainExecOutcome::Exit(0);
+            return (DrainExecOutcome::Exit(0), line);
         }
         if let Some(code) = exec_status_exit_code(&status) {
-            return DrainExecOutcome::Exit(code);
+            return (DrainExecOutcome::Exit(code), line);
         }
-        DrainExecOutcome::Failure(format!(
-            "reason={:?} message={:?} stderr_tail={:?}",
-            status.reason,
-            status.message,
-            tail_str(&stderr_buf, 512),
-        ))
+        (
+            DrainExecOutcome::Failure(format!(
+                "reason={:?} message={:?} stderr_tail={:?}",
+                status.reason,
+                status.message,
+                tail_str(&stderr_buf, 512),
+            )),
+            line,
+        )
     }
 }
 
@@ -1526,6 +1528,28 @@ fn exec_status_exit_code(
 }
 
 /// The last `max` bytes of a stream, lossily decoded — a diagnostic tail.
+/// The drain helper's last non-empty output line, stderr first (where
+/// `scarab-wsfetch drain` writes why it exits 12), else stdout, at most
+/// [`HELPER_LINE_MAX`] characters. `None` when it printed nothing.
+fn helper_last_line(stderr: &[u8], stdout: &[u8]) -> Option<String> {
+    let last = |b: &[u8]| {
+        String::from_utf8_lossy(b)
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .map(str::to_string)
+    };
+    let line = last(stderr).or_else(|| last(stdout))?;
+    if line.chars().count() <= HELPER_LINE_MAX {
+        return Some(line);
+    }
+    Some(line.chars().take(HELPER_LINE_MAX).collect::<String>() + "…")
+}
+
+/// How much of the helper's line a drain cause carries.
+const HELPER_LINE_MAX: usize = 400;
+
 fn tail_str(bytes: &[u8], max: usize) -> String {
     let start = bytes.len().saturating_sub(max);
     String::from_utf8_lossy(&bytes[start..]).into_owned()
@@ -3590,6 +3614,7 @@ impl DebugLauncher for K8sExecutor {
                 fetch,
                 &roots,
                 &[],
+                None,
                 &ws_mount,
                 // A debug Pod has no per-step timeout; the operator default
                 // sizes its fetch retry window like a timeout-less step's.
@@ -3828,6 +3853,40 @@ pub fn eager_fetch_total() -> u64 {
     EAGER_FETCH_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// A Step's workspace-token claims.
+///
+/// `roots` is exactly the Step's declared inputs, so the service can refuse a
+/// tree read the Step was never given (`WorkspaceClaims::may_read_tree`) — a
+/// compromised Step cannot enumerate other runs' snapshots by asking. The
+/// launch-resolved cache restore roots (ADR-0065 s1) ride the separate
+/// `cache_roots` claim (git-bug 2a79b73): readable like an input, but
+/// best-effort, because a Cache is warm-only on one Depot replica and a
+/// replica that cannot walk it must not fail the Step's required reads. Claims
+/// only — never `workspace_inputs` itself, which feeds skip-signatures and the
+/// fetcher's merge order — and keys never cross the trust boundary.
+fn step_token_claims(
+    step: &StepRun,
+    spec: &StepSpec,
+    attempt: String,
+    exp: i64,
+) -> workspace_token::WorkspaceClaims {
+    let cache_roots: Vec<String> = spec
+        .cache
+        .as_ref()
+        .map(|c| c.restore.iter().map(|(_, root)| root.clone()).collect())
+        .unwrap_or_default();
+    workspace_token::step_claims(
+        workspace_token::Fence {
+            run: step.run.0.clone(),
+            step: step.step.0.clone(),
+            attempt,
+        },
+        exp,
+        spec.workspace_inputs.clone(),
+    )
+    .with_cache_roots(cache_roots)
+}
+
 /// The per-Pod Secret carrying the workspace token (owner-referenced to the Pod,
 /// so it is garbage-collected with it).
 fn workspace_secret_name(pod_name: &str) -> String {
@@ -3887,6 +3946,7 @@ fn workspace_fetch_container(
     fetch: &WorkspaceFetch,
     roots: &[String],
     cache_restore: &[(String, String)],
+    cache_home_url: Option<&str>,
     ws_mount: &VolumeMount,
     step_timeout_secs: u32,
 ) -> Container {
@@ -3939,6 +3999,10 @@ fn workspace_fetch_container(
             .map(|(dir, root)| format!("{dir}={root}"))
             .collect();
         env.push(env_var(WSFETCH_CACHE_ROOTS_ENV, &pairs.join(",")));
+        // The restores read from the Cache's home replica (git-bug 12e2f6b).
+        if let Some(url) = cache_home_url {
+            env.push(env_var(workspace_token::WORKSPACE_CACHE_URL_ENV, url));
+        }
     }
     Container {
         name: WORKSPACE_INIT_CONTAINER.to_string(),
@@ -4437,6 +4501,7 @@ pub fn build_pod(
                     fetch,
                     &spec.workspace_inputs,
                     cache_restore,
+                    fetch.cache_home_url(spec).as_deref(),
                     &ws,
                     // The same resolved number `activeDeadlineSeconds` gets
                     // below — the retry window is a fraction of THIS deadline.
@@ -4494,6 +4559,14 @@ pub fn build_pod(
         // from panicking here.
         if let Some(fetch) = fetch {
             egress_env.push(env_var(workspace_token::WORKSPACE_URL_ENV, &fetch.url));
+            // The drain sends cache-dir content to the Cache's home replica
+            // (git-bug 12e2f6b) — only when the key resolved and dirs are
+            // declared, the same condition the drain's --cache-dirs carries.
+            if spec.cache.as_ref().is_some_and(|c| !c.dirs.is_empty()) {
+                if let Some(url) = fetch.cache_home_url(spec) {
+                    egress_env.push(env_var(workspace_token::WORKSPACE_CACHE_URL_ENV, &url));
+                }
+            }
             egress_mounts.push(VolumeMount {
                 name: WORKSPACE_TOKEN_VOLUME.to_string(),
                 mount_path: workspace_token::WORKSPACE_SECRETS_MOUNT_PATH.to_string(),
@@ -6915,6 +6988,7 @@ mod tests {
             token_secret: b"ws-secret".to_vec(),
             fetcher_image: "ghcr.io/acme/scarab-wsfetch:test".into(),
             helper_resources: scarab_pipeline::Resources::default(),
+            cache_home: None,
         }
     }
 
@@ -9187,6 +9261,24 @@ mod tests {
         }
     }
 
+    /// The cause of a drain with no record keeps the helper's own reason
+    /// (git-bug 068cc0b follow-up: an exit 12 said nothing about which 422).
+    /// Stderr's last line wins, stdout is the fallback, and it is bounded.
+    #[test]
+    fn the_helper_last_line_is_kept_bounded_stderr_first() {
+        let stderr = b"scarab-wsfetch: drain: drain state incomplete ... retrying in 500ms: x\n\
+                       scarab-wsfetch: drain: record POST still incomplete after 10000ms \xe2\x80\x94 handing over: 422 drain_state_incomplete\n\n";
+        assert_eq!(
+            helper_last_line(stderr, b"ingest done\n").as_deref(),
+            Some("scarab-wsfetch: drain: record POST still incomplete after 10000ms \u{2014} handing over: 422 drain_state_incomplete")
+        );
+        assert_eq!(helper_last_line(b"", b"only stdout\n").as_deref(), Some("only stdout"));
+        assert_eq!(helper_last_line(b"\n  \n", b""), None);
+        let long = "\u{e9}".repeat(HELPER_LINE_MAX + 50);
+        let got = helper_last_line(long.as_bytes(), b"").unwrap();
+        assert_eq!(got.chars().count(), HELPER_LINE_MAX + 1, "bounded, with an ellipsis");
+    }
+
     fn error_record(
         kind: scarab_workspace_client::DrainErrorKind,
         detail: &str,
@@ -10149,6 +10241,96 @@ mod tests {
             .filter(|n| !scarab_pipeline::scarab_sets_env(n))
             .collect();
         assert!(unknown.is_empty(), "add these to scarab_pipeline::SCARAB_SET_ENV: {unknown:?}");
+    }
+
+    /// git-bug 2a79b73: the launch-resolved cache restore roots ride the
+    /// best-effort `cache_roots` claim, never the required `roots` — a Depot
+    /// replica that does not hold the Cache must not fail the Step's inputs.
+    #[test]
+    fn cache_restore_roots_are_claimed_as_cache_roots_not_inputs() {
+        let step = step_with_attempt("run-1", "build", "a1");
+        let mut spec = busybox();
+        spec.workspace_inputs = vec!["tree-a".into()];
+        spec.cache = Some(scarab_engine::CacheConfig {
+            dirs: vec!["target".into(), "dup".into()],
+            key: Some("k".into()),
+            restore: vec![
+                ("target".into(), "tree-c".into()),
+                ("dup".into(), "tree-a".into()),
+            ],
+            ..Default::default()
+        });
+        let claims = step_token_claims(&step, &spec, "a1".into(), 10);
+        assert_eq!(claims.roots, vec!["tree-a".to_string()]);
+        assert_eq!(claims.cache_roots, vec!["tree-c".to_string()]);
+        // No cache: no cache claim, so the token keeps the old wire form.
+        spec.cache = None;
+        assert!(step_token_claims(&step, &spec, "a1".into(), 10).cache_roots.is_empty());
+    }
+
+    /// git-bug 12e2f6b: with more than one Depot replica, the fetch init
+    /// container (restores) and the egress helper (the drain's saves) both
+    /// get the SAME home URL, chosen from the cache key; with one replica, or
+    /// a step whose key did not resolve, neither gets one and the Pod is
+    /// byte-for-byte what it was.
+    #[test]
+    fn the_cache_home_url_rides_the_fetch_and_drain_containers() {
+        let step = step_with_attempt("run-1", "build", "a1");
+        let mut spec = busybox();
+        spec.workspace_inputs = vec!["tree-a".into()];
+        spec.cache = Some(scarab_engine::CacheConfig {
+            dirs: vec!["target".into()],
+            key: Some("cache-key-1".into()),
+            restore: vec![("target".into(), "tree-c".into())],
+            ..Default::default()
+        });
+        let home_env = |fetch: &WorkspaceFetch, spec: &StepSpec| -> Vec<(String, Option<String>)> {
+            let pod = build_pod(
+                "scarab-x",
+                "ns",
+                &step,
+                spec,
+                None,
+                DEFAULT_STEP_TIMEOUT_SECS,
+                true,
+                Some(fetch),
+            );
+            pod.spec
+                .unwrap()
+                .init_containers
+                .unwrap_or_default()
+                .into_iter()
+                .flat_map(|c| {
+                    let name = c.name.clone();
+                    c.env
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|e| e.name == workspace_token::WORKSPACE_CACHE_URL_ENV)
+                        .map(move |e| (name.clone(), e.value))
+                })
+                .collect()
+        };
+
+        let mut fetch = sample_fetch();
+        fetch.cache_home =
+            cache_home::CacheHome::new(3, "http://scarab-workspace-{ordinal}.ns.svc");
+        let want = format!(
+            "http://scarab-workspace-{}.ns.svc",
+            cache_home::home_ordinal("cache-key-1", 3)
+        );
+        let got = home_env(&fetch, &spec);
+        let names: Vec<&str> = got.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec![WORKSPACE_INIT_CONTAINER, WORKSPACE_EGRESS_CONTAINER]);
+        assert!(got.iter().all(|(_, v)| v.as_deref() == Some(want.as_str())), "{got:?}");
+
+        // One Depot replica: no home, no env.
+        let mut one = sample_fetch();
+        one.cache_home = cache_home::CacheHome::new(1, "http://scarab-workspace-{ordinal}.ns.svc");
+        assert!(home_env(&one, &spec).is_empty());
+        // A key that did not resolve: no cache, no home.
+        spec.cache.as_mut().unwrap().key = None;
+        spec.cache.as_mut().unwrap().restore.clear();
+        assert!(home_env(&fetch, &spec).is_empty());
     }
 
     #[test]

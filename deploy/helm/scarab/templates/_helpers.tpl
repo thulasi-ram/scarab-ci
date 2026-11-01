@@ -104,6 +104,18 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end -}}
 {{- end -}}
 
+{{/* One Depot replica's URL with `{ordinal}` for its StatefulSet ordinal —
+     the value of SCARAB_WORKSPACE_HOME_URL_TEMPLATE (git-bug 12e2f6b). Each
+     ordinal has its own Service (service-workspace-replicas.yaml), named like
+     its Pod, so the default here and those Services cannot disagree. */}}
+{{- define "scarab.workspaceHomeUrlTemplate" -}}
+{{- if .Values.workspace.homeUrlTemplate -}}
+{{- .Values.workspace.homeUrlTemplate -}}
+{{- else -}}
+{{- printf "http://%s-workspace-{ordinal}.%s.svc" (include "scarab.fullname" .) .Release.Namespace -}}
+{{- end -}}
+{{- end -}}
+
 {{/* Namespace the executor launches step Pods into (defaults to release ns). */}}
 {{- define "scarab.execNamespace" -}}
 {{- default .Release.Namespace .Values.scarab.namespace -}}

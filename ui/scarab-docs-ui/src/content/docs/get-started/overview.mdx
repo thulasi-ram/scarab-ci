@@ -29,7 +29,7 @@ Both run the same engine against a real cluster; they differ in how
 |---|---|---|
 | Look at a running Scarab without installing anything | **Live demo** | [demo-scarab.ahiravan.dev](https://demo-scarab.ahiravan.dev/) |
 | Deploy Scarab inside the cluster the way it ships, on kind or a live/production cluster | **Helm chart** | [Installation](/scarab-ci/get-started/deploy-helm/) |
-| Iterate on the server from source with a loop that rebuilds and reruns | **kind dev loop** (`just up`) | [Run locally](/scarab-ci/get-started/run-locally/) |
+| Iterate on the server from source with a loop that rebuilds and reruns | **kind dev loop** (`just stack up`) | [Run locally](/scarab-ci/get-started/run-locally/) |
 
 The **same Helm chart** targets every environment: a local kind cluster
 and a live production cluster use the identical `helm upgrade --install`. There is

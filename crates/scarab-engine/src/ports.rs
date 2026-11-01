@@ -17,7 +17,96 @@ use crate::{
 pub struct Lease {
     pub owner: String,
     pub expires_at: Timestamp,
+    /// The lease's **term** (git-bug aaf4e3e): incremented each time a
+    /// different owner takes the lease over, never on a renewal. A holder's
+    /// writes are fenced on `(owner, term)`, so a holder that was paused past
+    /// its TTL, lost the lease and got it back still cannot write under the
+    /// term it held before.
+    pub term: i64,
 }
+
+impl Lease {
+    /// The fencing token for `owner`'s writes, when `owner` holds this lease.
+    pub fn held_by(&self, resource: &str, owner: &str) -> Option<LeaderTerm> {
+        (self.owner == owner).then(|| LeaderTerm {
+            resource: resource.to_string(),
+            owner: owner.to_string(),
+            term: self.term,
+        })
+    }
+}
+
+/// The lease resource the scheduler's leader holds (ADR-0003).
+pub const SCHEDULER_LEASE: &str = "scheduler";
+
+/// Proof, for one leader leg, that the caller held a leadership lease at a
+/// term (git-bug aaf4e3e). Obtained from [`Lease::held_by`]; the store
+/// re-checks it, so a value built by hand gains nothing.
+///
+/// The guarantee, and no more: a [`Db`] write that takes a `LeaderTerm`
+/// checks, **inside its own transaction**, that `(owner, term)` still holds
+/// the lease, and holds the lease row shared until that transaction ends. A
+/// takeover must update the row, so it waits for the transaction. The write
+/// is therefore either refused with [`DbError::NotLeader`] (nothing written)
+/// or committed before the takeover — never committed after a peer's term
+/// began. No clock is assumed for that ordering.
+///
+/// Each such transaction is bounded (Postgres: lock, statement and
+/// idle-in-transaction timeouts of [`LEADER_TX_BOUND_MS`]). A holder stopped
+/// mid-transaction (SIGSTOP, a GC pause, a VM suspend) has it rolled back by
+/// the store and loses the lease after its TTL like a holder stopped
+/// anywhere else; a live holder whose transaction hits the bound gets
+/// [`DbError::FenceTimeout`], with nothing written.
+///
+/// Writes a leader leg makes WITHOUT a term are not fenced; the scheduler
+/// makes only writes whose own compare-and-set makes a late commit by a
+/// deposed leader harmless that way (see `Scheduler::as_leader`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaderTerm {
+    resource: String,
+    owner: String,
+    term: i64,
+}
+
+impl LeaderTerm {
+    /// For a store adapter that must rebuild one, and for tests.
+    pub fn new(resource: impl Into<String>, owner: impl Into<String>, term: i64) -> Self {
+        Self {
+            resource: resource.into(),
+            owner: owner.into(),
+            term,
+        }
+    }
+    pub fn resource(&self) -> &str {
+        &self.resource
+    }
+    pub fn owner(&self) -> &str {
+        &self.owner
+    }
+    pub fn term(&self) -> i64 {
+        self.term
+    }
+}
+
+/// The bound on every leader-fenced transaction (git-bug aaf4e3e), in ms:
+/// its lock waits, each statement, and any idle time inside it. Well under
+/// the scheduler's 30 s lease TTL, so a leader stopped inside one loses the
+/// lease within TTL + this bound.
+pub const LEADER_TX_BOUND_MS: u64 = 5_000;
+
+/// What a claimed step launches with, committed in the claim's own fenced
+/// transaction ([`Db::claim_ready_steps`], git-bug 0f29112): its next
+/// Attempt, the events that journal it, and its launch intent(s).
+#[derive(Debug, Clone)]
+pub struct StepLaunch {
+    pub attempt: Attempt,
+    pub events: Vec<EventKind>,
+    pub outbox: Vec<OutboxMessage>,
+}
+
+/// Builds the [`StepLaunch`] for one claimed step, given the step as the
+/// claim locked it (its prior Attempts included).
+pub type MintLaunch<'a> = &'a (dyn Fn(&StepRun) -> Result<StepLaunch, DbError> + Send + Sync);
 
 /// One run's **cold-tier retention facts** for its Workspace Snapshots
 /// (ADR-0061 s5 / ADR-0050).
@@ -156,8 +245,23 @@ pub enum ExecState {
 #[async_trait]
 pub trait Db: Send + Sync {
     /// Atomically claim up to `limit` ready steps for this worker, using a
-    /// `SELECT … FOR UPDATE SKIP LOCKED`-style claim so replicas don't collide.
-    async fn claim_ready_steps(&self, limit: u32) -> Result<Vec<StepRun>, DbError>;
+    /// `SELECT … FOR UPDATE SKIP LOCKED`-style claim so replicas don't collide,
+    /// and launch each: `mint` builds its [`StepLaunch`], whose Attempt,
+    /// events and outbox rows commit in the SAME transaction as the
+    /// `ready → running` flip (git-bug 0f29112). No step is ever `Running`
+    /// without its Attempt and launch intent: a leader deposed or stopped
+    /// around the claim leaves the steps `Ready` or fully launched. A `mint`
+    /// error rolls the whole claim back. Returns the claimed steps as the
+    /// claim found them (Attempts before this launch's).
+    ///
+    /// Leader-only, fenced on `leader` in this transaction (see
+    /// [`LeaderTerm`]).
+    async fn claim_ready_steps(
+        &self,
+        leader: &LeaderTerm,
+        limit: u32,
+        mint: MintLaunch<'_>,
+    ) -> Result<Vec<StepRun>, DbError>;
 
     /// Create a new run in `Pending`, self-describing its `{ir_version,
     /// event_schema_version}` (ADR-0022).
@@ -458,6 +562,25 @@ pub trait Db: Send + Sync {
         signature: Option<&str>,
     ) -> Result<(), DbError>;
 
+    /// Admission's promotion of one step (ADR-0027): record the input
+    /// `signature` it will consume ([`set_step_input`](Db::set_step_input))
+    /// and move it `Pending → Ready`, with `events`, as ONE commit. A step no
+    /// longer `Pending` is a [`DbError::Conflict`] with nothing written — the
+    /// signature never lands without the promotion it belongs to.
+    ///
+    /// Leader-only, fenced on `leader` in this transaction (see
+    /// [`LeaderTerm`]): a deposed leader's late write could otherwise
+    /// overwrite the signature a step really consumed, and a later
+    /// skip-if-unchanged would compare against the wrong one.
+    async fn promote_step(
+        &self,
+        leader: &LeaderTerm,
+        run: &RunId,
+        step: &StepId,
+        signature: &str,
+        events: &[EventKind],
+    ) -> Result<(), DbError>;
+
     /// The input signature a step consumed on its last run, or `None` if it has
     /// not run (or was cleared to force a re-run, or the step is unknown).
     async fn step_input(&self, run: &RunId, step: &StepId) -> Result<Option<String>, DbError>;
@@ -496,7 +619,15 @@ pub trait Db: Send + Sync {
     /// holder had settled), or `Some(holder)` when a *different, still-active*
     /// run holds it. The atomicity is what serializes a concurrency group across
     /// replicas (ADR-0011).
-    async fn acquire_slot(&self, group: &str, run: &RunId) -> Result<Option<RunId>, DbError>;
+    ///
+    /// Leader-only (git-bug aaf4e3e): fenced on `leader` in its own
+    /// transaction, like [`claim_ready_steps`](Db::claim_ready_steps).
+    async fn acquire_slot(
+        &self,
+        leader: &LeaderTerm,
+        group: &str,
+        run: &RunId,
+    ) -> Result<Option<RunId>, DbError>;
 
     /// Release `group`'s slot if `run` holds it, letting a queued run acquire.
     async fn release_slot(&self, group: &str, run: &RunId) -> Result<(), DbError>;
@@ -639,6 +770,11 @@ pub trait Db: Send + Sync {
     /// (backpressure).
     async fn count_in_flight_runs(&self, project: Option<&str>) -> Result<u32, DbError>;
 
+    /// How many of `project`'s runs are `Running` (the per-project cap). A
+    /// `Suspended` run, waiting on a gate, holds no Pods and is not counted:
+    /// runs waiting for approval must not stop the project's other runs.
+    async fn count_running_runs(&self, project: &str) -> Result<u32, DbError>;
+
     /// Mark a step as a gate of `kind` (`manual`/`timer`/`external`) — a durable
     /// suspend point that launches no Pod (ADR-0008). For a `timer` gate,
     /// `timer_seconds` is the wait after which the run auto-releases; `None` for
@@ -671,8 +807,12 @@ pub trait Db: Send + Sync {
     /// gate's inputs, rendered when it is reached). Only while `attempt` is
     /// still `Running` and holds none: a wait's inputs are written once.
     /// Returns whether they were stored.
+    ///
+    /// Leader-only (git-bug aaf4e3e): fenced on `leader` in its own
+    /// transaction.
     async fn set_gate_wait_inputs(
         &self,
+        leader: &LeaderTerm,
         run: &RunId,
         step: &StepId,
         attempt: &AttemptId,
@@ -703,8 +843,13 @@ pub trait Db: Send + Sync {
     /// Create the durable [`RunService`] row for a shared service (ADR-0058),
     /// born in [`ServiceStatus::Starting`]. Idempotent on `{run, take, name}` —
     /// a re-create (crash resume, re-tick) is a no-op, never a second instance.
+    ///
+    /// With `leader`, fenced on it in this transaction (see [`LeaderTerm`]):
+    /// the leader's service reconcile passes its term; a Rerun creating the
+    /// next Take's rows passes `None`.
     async fn create_run_service(
         &self,
+        leader: Option<&LeaderTerm>,
         run: &RunId,
         take: i64,
         name: &str,
@@ -714,8 +859,16 @@ pub trait Db: Send + Sync {
     /// Update a shared service's lifecycle status (and, when launched, its
     /// executor handle) — the `starting → ready → running → torn-down | failed`
     /// transition. Unconditional (last-writer-wins); the scheduler owns ordering.
+    ///
+    /// With `leader`, fenced on it in this transaction (see [`LeaderTerm`]).
+    /// The leader's readiness verdicts pass its term: unconditional, a
+    /// deposed leader's late `Failed` or `Ready` from a stale poll would
+    /// overwrite its successor's. Non-leader teardowns of a settled or
+    /// cancelled Run pass `None` (`TornDown` is the verdict every writer
+    /// reaches there).
     async fn set_run_service(
         &self,
+        leader: Option<&LeaderTerm>,
         run: &RunId,
         take: i64,
         name: &str,
@@ -843,8 +996,14 @@ pub trait Db: Send + Sync {
     /// in `from` for the caller's re-drive. Separately, a crash after the CAS
     /// left a terminal run with no `RunTransitioned` and no forge status post,
     /// and nothing could ever write them: the re-driven CAS conflicts.
+    ///
+    /// With `leader`, fenced on it in this transaction (see [`LeaderTerm`]):
+    /// every run transition a scheduler leader leg makes passes its term
+    /// (admission is decided against the in-flight caps, which only the
+    /// leader may count on); API and non-leader paths pass `None`.
     async fn commit_run_transition(
         &self,
+        leader: Option<&LeaderTerm>,
         run: &RunId,
         from: RunStatus,
         to: RunStatus,
@@ -975,8 +1134,12 @@ pub trait Db: Send + Sync {
     /// transaction. The step-row lock is what serialises a mint against a
     /// concurrent [`resolve_gate_wait`](Db::resolve_gate_wait) or cancel: a
     /// mint can never land on a gate that already resolved.
+    ///
+    /// Leader-only (git-bug aaf4e3e): fenced on `leader` in its own
+    /// transaction.
     async fn open_gate_wait(
         &self,
+        leader: &LeaderTerm,
         run: &RunId,
         step: &StepId,
         started_at: Timestamp,
@@ -1032,6 +1195,20 @@ pub trait Db: Send + Sync {
         limit: u32,
         visibility_ms: i64,
     ) -> Result<Vec<OutboxMessage>, DbError>;
+
+    /// Extend `owner`'s claim on outbox message `id` by `visibility_ms` from
+    /// now, and say whether `owner` still holds it. `false` means another
+    /// drainer claimed the message since (`owner`'s claim lapsed, git-bug
+    /// 068cc0b), or it was dispatched or dead-lettered: `owner` must stop
+    /// driving it. A drainer renews while it works on a message, so a claim
+    /// lapses only when its holder stops renewing (it died, or was paused
+    /// past the window) and the message is then redelivered as before.
+    async fn renew_outbox_claim(
+        &self,
+        id: OutboxId,
+        owner: &str,
+        visibility_ms: i64,
+    ) -> Result<bool, DbError>;
 
     /// Mark a claimed outbox message dispatched, so it is never redelivered.
     async fn mark_dispatched(&self, id: OutboxId) -> Result<(), DbError>;
@@ -1172,7 +1349,15 @@ pub trait Db: Send + Sync {
 
     /// Acquire (or renew) a time-bounded lease over a named `resource` (a step
     /// id, `"scheduler"` leadership, …) for `owner`. Only an expired lease is
-    /// taken over; the returned [`Lease`] names the current holder.
+    /// taken over; the returned [`Lease`] names the current holder and its
+    /// term. A takeover increments the term; a renewal keeps it.
+    ///
+    /// A caller that does not hold the lease and finds it live takes no lock
+    /// and never waits: a follower's tick is not slowed by the holder's
+    /// fenced transactions. Only a takeover of an expired lease waits for the
+    /// holder's in-flight fenced transaction (see [`LeaderTerm`]), and only
+    /// briefly: past a short bound it reports the holder unchanged and the
+    /// caller tries again next tick.
     async fn lease(&self, resource: &str, owner: &str, ttl_ms: i64) -> Result<Lease, DbError>;
 }
 
@@ -1194,6 +1379,12 @@ pub trait LogChunks: Send {
 #[async_trait]
 pub trait Clock: Send + Sync {
     async fn now(&self) -> Timestamp;
+
+    /// Wait `ms` milliseconds of real time. The scheduler uses it only to pace
+    /// its outbox-claim renewal while a message is being worked on (git-bug
+    /// 068cc0b): the claim's expiry is the database's wall clock, so the pace
+    /// is real time even under a fake `now`.
+    async fn sleep(&self, ms: u64);
 }
 
 /// Launches and observes units of execution on some backend (k8s, local…).

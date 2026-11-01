@@ -1,6 +1,6 @@
-# The services `just test`, `just test-one` and `just coverage` run the
+# The services `just test`, `just test rust` and `just test coverage` run the
 # workspace suite against: Postgres for the PG-backed tests and MinIO for the
-# live-S3 test. Not a way to run Scarab (that is `just up`, deploy/kind/).
+# live-S3 test. Not a way to run Scarab (that is `just stack up`, deploy/kind/).
 # Postgres is published on 55432 to avoid clashing with a host Postgres on 5432.
 # The project name is kept from when this file also served the dev stack, so
 # an existing container and volume are reused.

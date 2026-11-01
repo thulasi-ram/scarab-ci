@@ -2,7 +2,7 @@
 """Merge gate: are this PR's REQUIRED checks green? (test-strategy Phase 0/2)
 
 Usage:
-    pr_gate.py <pr-number>            # or `just pr-gate <n>`
+    pr_gate.py <pr-number>            # or `just pr <n>`
 
 Branch protection and rulesets are both 403 on this repo (private, free plan),
 so GitHub cannot enforce a required-check set server-side. This script is that

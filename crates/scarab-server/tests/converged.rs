@@ -73,6 +73,7 @@ async fn background_driver_runs_a_pipeline_end_to_end() {
         Duration::from_millis(10),
         30_000,
         3_600_000,
+        None,
         "http://scarab.test".to_string(),
     );
 

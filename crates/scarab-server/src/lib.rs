@@ -49,12 +49,6 @@ use scarab_identity::{Action, Principal, Session};
 /// not part of the public API.
 pub mod broker;
 pub mod broker_proxy;
-/// ADR-0062 part 3: the **change set** of a Workspace Export — the exact paths an
-/// Attempt wrote, read out of an `overlayfs` upper layer rather than inferred.
-/// The Export lifecycle it fed was deleted when ADR-0066 cancelled lazy delivery
-/// (git-bug `0ec3b39`); this module survives as the revival package, exercised
-/// by `tests/changeset_overlay.rs`.
-pub mod changeset;
 pub mod forge_token;
 pub mod config;
 pub mod connections_config;
@@ -115,6 +109,10 @@ impl Clock for SystemClock {
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         Timestamp(ms)
+    }
+
+    async fn sleep(&self, ms: u64) {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
     }
 }
 
@@ -6217,6 +6215,11 @@ async fn write_run_from_ir(
     // Untenanted runs (no repo — inline dev submissions) stay global-only.
     if let Some(repo) = event.repo() {
         db.set_run_tenant(run, &repo.owner, &repo.name).await?;
+        // The scheduler's project (`<org>/<repo>`): the Cache keys and saves
+        // under it (ADR-0065), and the per-project in-flight cap counts by it
+        // (ADR-0011). Nothing else writes it; without it a Run's Cache is off.
+        db.set_run_scheduling(run, &format!("{}/{}", repo.owner, repo.name), 0)
+            .await?;
         // Allocate the per-repo run number (ADR-0057 amendment) once the tenant
         // is known — the human `#N` handle. Untenanted inline runs skip this.
         db.allocate_run_number(run, &repo.owner, &repo.name).await?;
