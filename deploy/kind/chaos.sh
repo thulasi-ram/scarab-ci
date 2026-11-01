@@ -129,20 +129,28 @@ unpause_node() {
 # after the unpause (SCARAB_CHAOS_FORWARD_PIDFILES) and the loop re-opens it.
 # stop_forwards ends the loop, which ends its port-forward.
 forward_pidfiles=""
+chaos_pid=$$
 forward_kept() { # $1 Service name, $2 its port
   local log pidfile
   fwd_port="$(free_port)"
   log="$kind_dir/.state/forward-$1.log"
   pidfile="$kind_dir/.state/forward-$1.pid"
   : >"$log"
+  # The loop ends when chaos.sh is gone ($$ is chaos.sh's PID in the
+  # subshell too), so a chaos.sh killed with SIGKILL, whose EXIT trap never
+  # ran, does not leave a port-forward restarting forever.
   (
     child=""
     trap '[ -z "$child" ] || kill "$child" 2>/dev/null; exit 0' TERM INT
-    while true; do
+    while kill -0 "$chaos_pid" 2>/dev/null; do
       kc port-forward -n "$ns" "svc/$1" "$fwd_port:$2" --address 127.0.0.1 >>"$log" 2>&1 &
       child=$!
       echo "$child" >"$pidfile"
-      wait "$child" || true
+      while kill -0 "$child" 2>/dev/null && kill -0 "$chaos_pid" 2>/dev/null; do
+        sleep 1
+      done
+      kill "$child" 2>/dev/null || true
+      wait "$child" 2>/dev/null || true
       sleep 1
     done
   ) &
@@ -250,7 +258,7 @@ depot_replicas="$(kc get statefulset "$release-workspace" -n "$ns" -o jsonpath='
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 mem_log="$out_root/memory-$stamp.log"
 docker stats --no-stream --format '{{.MemUsage}}' "$node" | sed 's/^/idle-before-workload /' > "$mem_log"
-( while true; do
+( while kill -0 "$chaos_pid" 2>/dev/null; do
     docker stats --no-stream --format '{{.MemUsage}}' "$node" 2>/dev/null | sed "s/^/$(date -u +%H:%M:%S) /"
     sleep 5
   done >> "$mem_log" ) &
