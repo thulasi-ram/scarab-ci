@@ -5,15 +5,18 @@
 // app: the top bar stays the only app-wide navigation. Two groups — Your
 // account (`/settings/<section>`, everyone's) and Organization settings
 // (`/orgs/<org>/settings/<section>`, admins of that org). Under ~900px the
-// list becomes a `<select>` above the section. The route table, the gating
+// list becomes a `<select>` above the section. A page under a section (one
+// Environment, a library review) renders in the same frame, with its parent
+// section marked. The route table, the gating, which section a path sits in
 // and the old-URL redirects are pure functions in `settings-nav.ts`.
 //
 // Gating here is presentation: the server enforces `Administer` on the org
 // for every request an org section makes.
-import { For, Match, Show, Switch, createMemo, type JSX } from "solid-js";
+import { For, Show, createMemo, type JSX } from "solid-js";
 import { A, Navigate, useLocation, useNavigate, useParams } from "@solidjs/router";
 import { me } from "../session";
 import {
+  activeSectionHref,
   administers,
   legacyRedirect,
   navGroups,
@@ -64,10 +67,42 @@ export function LegacySettings() {
 }
 
 function SettingsShell(props: { kind: SettingsGroupKind; org?: string; section?: string }) {
+  const section = () => resolveSection(props.kind, props.section);
+  return (
+    // `/orgs/<org>/settings` alone opens the org's first section.
+    <Show
+      when={props.kind !== "org" || props.section}
+      fallback={<Navigate href={orgHref(props.org!, "connections")} />}
+    >
+      <SettingsFrame kind={props.kind} org={props.org} section={props.section}>
+        <Show when={section()} fallback={<NotFound />}>
+          {(s) => <SectionPage kind={props.kind} org={props.org} section={s()} />}
+        </Show>
+      </SettingsFrame>
+    </Show>
+  );
+}
+
+/**
+ * The settings page around `children`: the sidebar, the narrow-screen
+ * `<select>`, and the main column. A section renders in it, and so does a
+ * page under a section (one Environment, a library review), so the sidebar
+ * stays in view and marks the section the page belongs to.
+ *
+ * On an org page the main column shows `children` only to an admin of that
+ * org; everyone else sees why not.
+ */
+export function SettingsFrame(props: {
+  kind: SettingsGroupKind;
+  org?: string;
+  /** The section id, so switching orgs lands on the same section. */
+  section?: string;
+  children: JSX.Element;
+}) {
   const nav = useNavigate();
   const location = useLocation();
   const groups = createMemo(() => (me() ? navGroups(me()!, props.org) : []));
-  const section = () => resolveSection(props.kind, props.section);
+  const active = createMemo(() => activeSectionHref(location.pathname));
 
   return (
     <section class="page">
@@ -75,71 +110,110 @@ function SettingsShell(props: { kind: SettingsGroupKind; org?: string; section?:
         <p class="error">Could not load your identity. Is the server up?</p>
       </Show>
       <Show when={me()} fallback={<Show when={!me.error}><p class="empty">loading…</p></Show>}>
-        {/* `/orgs/<org>/settings` alone opens the org's first section. */}
-        <Show when={props.kind !== "org" || props.section}>
-          <div class="settings">
-            <nav class="settings-nav" aria-label="Settings">
+        <div class="settings">
+          <nav class="settings-nav" aria-label="Settings">
+            <For each={groups()}>
+              {(g) => (
+                <div class="settings-nav-group">
+                  <div class="settings-nav-h">{g.heading}</div>
+                  <Show when={g.org}>
+                    {(o) => <OrgSwitch org={o()} others={g.otherOrgs ?? []} section={props.section} />}
+                  </Show>
+                  <For each={g.items}>
+                    {(item) => (
+                      <A
+                        href={item.href}
+                        class="settings-nav-link"
+                        classList={{ on: active() === item.href }}
+                        aria-current={active() === item.href ? "page" : undefined}
+                      >
+                        {item.label}
+                      </A>
+                    )}
+                  </For>
+                </div>
+              )}
+            </For>
+          </nav>
+
+          <div class="settings-main">
+            <select
+              class="input settings-select"
+              aria-label="Settings section"
+              onChange={(e) => nav(e.currentTarget.value)}
+            >
               <For each={groups()}>
                 {(g) => (
-                  <div class="settings-nav-group">
-                    <div class="settings-nav-h">{g.heading}</div>
-                    <Show when={g.org}>
-                      {(o) => <OrgSwitch org={o()} others={g.otherOrgs ?? []} section={props.section} />}
-                    </Show>
+                  <optgroup label={g.org ? `${g.heading} · ${g.org}` : g.heading}>
                     <For each={g.items}>
                       {(item) => (
-                        <A
-                          href={item.href}
-                          class="settings-nav-link"
-                          classList={{ on: location.pathname === item.href }}
-                          aria-current={location.pathname === item.href ? "page" : undefined}
-                        >
+                        <option value={item.href} selected={active() === item.href}>
                           {item.label}
-                        </A>
+                        </option>
                       )}
                     </For>
-                  </div>
+                  </optgroup>
                 )}
               </For>
-            </nav>
+            </select>
 
-            <div class="settings-main">
-              <select
-                class="input settings-select"
-                aria-label="Settings section"
-                onChange={(e) => nav(e.currentTarget.value)}
-              >
-                <For each={groups()}>
-                  {(g) => (
-                    <optgroup label={g.org ? `${g.heading} · ${g.org}` : g.heading}>
-                      <For each={g.items}>
-                        {(item) => (
-                          <option value={item.href} selected={location.pathname === item.href}>
-                            {item.label}
-                          </option>
-                        )}
-                      </For>
-                    </optgroup>
-                  )}
-                </For>
-              </select>
-
-              <Switch fallback={<NotFound />}>
-                <Match when={props.kind === "org" && !administers(me(), props.org)}>
-                  <NotYours org={props.org!} />
-                </Match>
-                <Match when={section()}>
-                  {(s) => <SectionPage kind={props.kind} org={props.org} section={s()} />}
-                </Match>
-              </Switch>
-            </div>
+            <Show
+              when={props.kind !== "org" || administers(me(), props.org)}
+              fallback={<NotYours org={props.org!} />}
+            >
+              {props.children}
+            </Show>
           </div>
-        </Show>
-        <Show when={props.kind === "org" && !props.section}>
-          <Navigate href={orgHref(props.org!, "connections")} />
-        </Show>
+        </div>
       </Show>
     </section>
+  );
+}
+
+/** One step of a page's trail; the last is the page itself (no `href`). */
+export interface Crumb {
+  label: string;
+  href?: string;
+  mono?: boolean;
+}
+
+/**
+ * The heading of a page under a section, inside the settings main column:
+ * the trail from the section down to this page, e.g.
+ * Environments › production › Edit.
+ */
+export function SettingsCrumbs(props: { trail: Crumb[]; sub: JSX.Element }) {
+  return (
+    <>
+      <div class="page-head">
+        <h1 class="settings-crumb">
+          <For each={props.trail}>
+            {(c, i) => (
+              <>
+                <Show when={i() > 0}>
+                  <Icon icon="chevron-right" size={16} class="settings-crumb-sep" />
+                </Show>
+                <Show
+                  when={c.href}
+                  fallback={
+                    <span class="settings-crumb-here" classList={{ mono: !!c.mono }} aria-current="page">
+                      {c.label}
+                    </span>
+                  }
+                >
+                  {(href) => (
+                    <A href={href()} class="settings-crumb-link" classList={{ mono: !!c.mono }}>
+                      {c.label}
+                    </A>
+                  )}
+                </Show>
+              </>
+            )}
+          </For>
+        </h1>
+      </div>
+      <p class="page-sub">{props.sub}</p>
+    </>
   );
 }
 

@@ -3,7 +3,7 @@
 // removes it, and yanks a version.
 //
 // The panel is a table of installations. Installing and upgrading happen on
-// their own page (`/settings/libraries/review`, routes/LibraryReview.tsx):
+// their own page (`/orgs/<org>/settings/libraries/review`, routes/LibraryReview.tsx):
 // fetch, read the diff and the checks, then install, which asks for a
 // step-up. Removing and yanking tighten and ask for nothing; lifting a yank
 // asks for a step-up. Yanking opens a dialog that says which Runs in

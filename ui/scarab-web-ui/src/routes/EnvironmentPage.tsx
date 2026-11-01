@@ -11,9 +11,10 @@
 // The name cannot be changed: it is the key every pipeline's `environment:`
 // uses, and the server has no rename.
 //
-// Pages of their own, outside the settings shell, like a library review: each
-// can be sent as a link. The server enforces Administer on every request; the
-// check here decides only what to show.
+// Both render inside the settings frame, with Environments marked in the
+// sidebar, and each has its own URL to send as a link. The frame shows them
+// only to an admin of the org; the server enforces Administer on every
+// request.
 import { createResource, createSignal, For, Show, type JSX } from "solid-js";
 import { A, useNavigate, useParams } from "@solidjs/router";
 import {
@@ -46,8 +47,7 @@ import {
   type EnvironmentWrite,
 } from "../org-environments";
 import { addToList } from "../identities";
-import { administers } from "../settings-nav";
-import { me } from "../session";
+import { SettingsCrumbs, SettingsFrame, type Crumb } from "./Settings";
 import { absTime, relTime } from "../fmt";
 import PrincipalSearch from "../components/PrincipalSearch";
 import Icon from "../components/Icon";
@@ -71,36 +71,30 @@ function useEnvironment(org: () => string, name: () => string) {
   return [envs, refetch] as const;
 }
 
-/** The breadcrumb heading both pages share. */
+/** The trail both pages share, at the top of the settings main column. */
 function Head(props: { org: string; name: string; edit?: boolean }) {
+  const trail = (): Crumb[] =>
+    props.edit
+      ? [
+          { label: "Environments", href: environmentsHref(props.org) },
+          { label: props.name, href: environmentHref(props.org, props.name), mono: true },
+          { label: "Edit" },
+        ]
+      : [{ label: "Environments", href: environmentsHref(props.org) }, { label: props.name, mono: true }];
   return (
-    <>
-      <div class="run-head">
-        <h1 class="crumb-head">
-          <A href={environmentsHref(props.org)} class="crumb-head-link">
-            Environments
-          </A>
-          <Icon icon="chevron-right" size={20} class="crumb-head-sep" />
-          <Show
-            when={props.edit}
-            fallback={<span class="crumb-head-title mono">{props.name}</span>}
-          >
-            <A href={environmentHref(props.org, props.name)} class="crumb-head-link mono">
-              {props.name}
-            </A>
-            <Icon icon="chevron-right" size={20} class="crumb-head-sep" />
-            <span class="crumb-head-title">Edit</span>
-          </Show>
-        </h1>
-      </div>
-      <p class="page-sub">
-        <span class="mono">{props.org}</span> · {props.edit ? "edit an environment" : "where deploys land"}
-      </p>
-    </>
+    <SettingsCrumbs
+      trail={trail()}
+      sub={
+        <>
+          <span class="mono">{props.org}</span> · {props.edit ? "edit an environment" : "where deploys land"}
+        </>
+      }
+    />
   );
 }
 
-/** Loading, not-yours, not-found and load errors, around `children`. */
+/** Load errors, loading and not-found, around `children`. Signing in and
+ *  administering the org are the frame's to check. */
 function Guard(props: {
   org: string;
   name: string;
@@ -110,33 +104,21 @@ function Guard(props: {
   children: (env: OrgEnvironment) => JSX.Element;
 }) {
   return (
-    <Show when={me()} fallback={<p class="empty">loading…</p>}>
-      <Show
-        when={administers(me(), props.org)}
-        fallback={
-          <p class="empty">
-            You do not administer <b class="mono">{props.org}</b>. Environments need the{" "}
-            <b>Administer</b> capability on the organization.
-          </p>
-        }
-      >
-        <Show when={!props.error} fallback={<p class="error">Could not load the org's environments.</p>}>
-          <Show when={!props.loading || props.env} fallback={<p class="empty">loading…</p>}>
-            {/* Keyed: another Environment (or a reload) renders afresh, so
-                the edit form starts from what is stored. */}
-            <Show
-              when={props.env}
-              keyed
-              fallback={
-                <p class="empty">
-                  There is no environment named <b class="mono">{props.name}</b> in {props.org}.{" "}
-                  <A href={environmentsHref(props.org)}>All environments</A>
-                </p>
-              }
-            >
-              {(env) => props.children(env)}
-            </Show>
-          </Show>
+    <Show when={!props.error} fallback={<p class="error">Could not load the org's environments.</p>}>
+      <Show when={!props.loading || props.env} fallback={<p class="empty">loading…</p>}>
+        {/* Keyed: another Environment (or a reload) renders afresh, so
+            the edit form starts from what is stored. */}
+        <Show
+          when={props.env}
+          keyed
+          fallback={
+            <p class="empty">
+              There is no environment named <b class="mono">{props.name}</b> in {props.org}.{" "}
+              <A href={environmentsHref(props.org)}>All environments</A>
+            </p>
+          }
+        >
+          {(env) => props.children(env)}
         </Show>
       </Show>
     </Show>
@@ -150,7 +132,7 @@ export function EnvironmentView() {
   const p = useEnvironmentParams();
   const [env] = useEnvironment(p.org, p.name);
   return (
-    <section class="page">
+    <SettingsFrame kind="org" org={p.org()} section="environments">
       <Head org={p.org()} name={p.name()} />
       <Guard org={p.org()} name={p.name()} env={env()} loading={env.loading} error={env.error}>
         {(e) => (
@@ -165,7 +147,7 @@ export function EnvironmentView() {
           </>
         )}
       </Guard>
-    </section>
+    </SettingsFrame>
   );
 }
 
@@ -283,12 +265,12 @@ export function EnvironmentEdit() {
   const p = useEnvironmentParams();
   const [env] = useEnvironment(p.org, p.name);
   return (
-    <section class="page">
+    <SettingsFrame kind="org" org={p.org()} section="environments">
       <Head org={p.org()} name={p.name()} edit />
       <Guard org={p.org()} name={p.name()} env={env()} loading={env.loading} error={env.error}>
         {(e) => <EditForm org={p.org()} env={e} />}
       </Guard>
-    </section>
+    </SettingsFrame>
   );
 }
 

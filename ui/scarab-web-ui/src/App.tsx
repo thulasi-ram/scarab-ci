@@ -35,11 +35,11 @@ export default function App() {
       <Route path="/settings" component={LegacySettings} />
       <Route path="/settings/:section" component={AccountSettings} />
       <Route path="/orgs/:org/settings/:section?" component={OrgSettings} />
-      {/* Install or upgrade a library: its own page, so the
-          review can be sent to a second reviewer. */}
+      {/* Install or upgrade a library: its own URL inside the settings
+          frame, so the review can be sent to a second reviewer. */}
       <Route path="/orgs/:org/settings/libraries/review" component={LibraryReview} />
-      {/* One Environment (git-bug c11abc5): read-only, and its edit screen.
-          Five and six segments under the static /orgs, so they collide with
+      {/* One Environment (git-bug c11abc5): read-only, and its edit screen,
+          both inside the settings frame. Five and six segments under the static /orgs, so they collide with
           neither the settings sections nor /:org/:repo/runs/:id; the name is
           one encoded segment. */}
       <Route path="/orgs/:org/settings/environments/:env" component={EnvironmentView} />

@@ -3,6 +3,7 @@ import {
   ACCOUNT_SECTIONS,
   ORG_SECTIONS,
   accountHref,
+  activeSectionHref,
   legacyRedirect,
   navGroups,
   orgHref,
@@ -80,6 +81,49 @@ describe("admin gating", () => {
   it("lists the other administrable orgs to switch to", () => {
     expect(navGroups(twoOrgs, "globex")[1]?.otherOrgs).toEqual(["acme"]);
     expect(navGroups(admin, "acme")[1]?.otherOrgs).toEqual([]);
+  });
+});
+
+describe("which section the sidebar marks", () => {
+  it("marks a section on its own URL, with or without a trailing slash", () => {
+    expect(activeSectionHref("/orgs/acme/settings/members")).toBe("/orgs/acme/settings/members");
+    expect(activeSectionHref("/orgs/acme/settings/members/")).toBe("/orgs/acme/settings/members");
+    expect(activeSectionHref("/settings/security")).toBe("/settings/security");
+  });
+
+  it("marks the parent section on a page under it", () => {
+    expect(activeSectionHref("/orgs/acme/settings/environments/production")).toBe(
+      "/orgs/acme/settings/environments",
+    );
+    expect(activeSectionHref("/orgs/acme/settings/environments/production/edit")).toBe(
+      "/orgs/acme/settings/environments",
+    );
+    expect(activeSectionHref("/orgs/acme/settings/libraries/review")).toBe(
+      "/orgs/acme/settings/libraries",
+    );
+  });
+
+  it("returns exactly one sidebar href for every section", () => {
+    for (const item of navGroups(admin, "acme").flatMap((g) => g.items)) {
+      expect(activeSectionHref(item.href)).toBe(item.href);
+      expect(activeSectionHref(`${item.href}/anything/below`)).toBe(item.href);
+    }
+  });
+
+  it("keeps an escaped org escaped, so it matches the sidebar's href", () => {
+    expect(activeSectionHref(`${orgHref("a b/c", "environments")}/production/edit`)).toBe(
+      orgHref("a b/c", "environments"),
+    );
+  });
+
+  it("marks nothing outside settings or for an unknown section", () => {
+    expect(activeSectionHref("/orgs/acme/settings")).toBeNull();
+    expect(activeSectionHref("/orgs/acme/settings/nope/x")).toBeNull();
+    // Libraries is an org section, not an account one.
+    expect(activeSectionHref("/settings/libraries/review")).toBeNull();
+    expect(activeSectionHref("/acme/orders-api/runs/1")).toBeNull();
+    expect(activeSectionHref("/orgs/acme/members")).toBeNull();
+    expect(activeSectionHref("/")).toBeNull();
   });
 });
 

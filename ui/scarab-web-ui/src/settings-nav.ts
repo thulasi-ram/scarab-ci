@@ -57,6 +57,27 @@ export function resolveSection(
   return (kind === "account" ? ACCOUNT_SECTIONS : ORG_SECTIONS).find((s) => s.id === id);
 }
 
+/**
+ * The href of the sidebar section `pathname` sits in: the section's own URL,
+ * or the section a page under it belongs to (`…/environments/<name>/edit` is
+ * in Environments, `…/libraries/review` in Libraries). The sidebar link and
+ * the narrow-screen `<select>` both mark this one. `null` outside settings or
+ * for a section that does not exist.
+ *
+ * The org stays as the path has it (percent-encoded), so the result compares
+ * equal to the hrefs `navGroups` builds with `orgHref`.
+ */
+export function activeSectionHref(pathname: string): string | null {
+  const parts = pathname.split("/").filter((p) => p !== "");
+  if (parts[0] === "settings" && parts[1] !== undefined) {
+    return resolveSection("account", parts[1]) ? accountHref(parts[1]) : null;
+  }
+  if (parts[0] === "orgs" && parts[1] !== undefined && parts[2] === "settings" && parts[3] !== undefined) {
+    return resolveSection("org", parts[3]) ? `/orgs/${parts[1]}/settings/${parts[3]}` : null;
+  }
+  return null;
+}
+
 /** May `who` administer `org`? Presentation only; the server decides. */
 export const administers = (who: SettingsCaller | undefined, org: string | undefined) =>
   !!who && !!org && who.can_administer && who.admin_orgs.includes(org);
