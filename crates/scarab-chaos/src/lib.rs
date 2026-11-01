@@ -3,6 +3,7 @@
 //! drives the binary against the kind release in its chaos mode
 //! (deploy/kind/chaos.sh).
 
+pub mod cache;
 pub mod check;
 pub mod env;
 pub mod nemesis;

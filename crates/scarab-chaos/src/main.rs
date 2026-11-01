@@ -147,7 +147,13 @@ async fn check_dir(conn: &Conn, file: &Path) -> Result<check::Outcome, String> {
         namespace: &conn.stack.namespace,
     };
     let facts = check::gather(&src, &s, records).await?;
-    let v = check::evaluate(&facts);
+    let mut v = check::evaluate(&facts);
+    let fault_pods: Vec<String> = s.faults.iter().map(|f| f.pod.clone()).collect();
+    v.cache = s
+        .cache
+        .as_ref()
+        .map(|c| scarab_chaos::cache::summary_lines(c, &fault_pods))
+        .unwrap_or_default();
     let out = dir.join("verdict.json");
     std::fs::write(&out, serde_json::to_string_pretty(&v).map_err(|e| e.to_string())? + "\n")
         .map_err(|e| format!("{}: {e}", out.display()))?;
@@ -207,6 +213,9 @@ async fn check_dir(conn: &Conn, file: &Path) -> Result<check::Outcome, String> {
     }
     for n in &s.notes {
         println!("  note: {n}");
+    }
+    for line in &v.cache {
+        println!("  {line}");
     }
     for why in &v.inconclusive {
         println!("  inconclusive: {why}");

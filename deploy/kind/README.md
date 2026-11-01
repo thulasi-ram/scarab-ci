@@ -296,6 +296,19 @@ it):
 | `verdict.json` | the checker's findings and, per green Attempt, the objects and bytes it read back |
 | `release-log.txt` | server and Depot log lines that name the target Pod or the deleted replica |
 | `fetcher-log.txt` | mid-feed only: the target fetcher's own log |
+| `cache-log.txt` | the Cache probe's `cache restore` lines, one per cached Step Pod |
+
+Each scenario also runs a Cache probe beside its workload: a seed Run, waited
+for before the workload, whose cached Step saves a Cache, and a probe Run,
+submitted with the workload, whose cached Step restores it from the Cache's
+home Depot replica. A Cache needs a Project, so the probe's pipeline is written
+to the Forgejo repo `scarab-admin/chaos-cache`, which is bound (without a
+webhook) through a fresh connection in the chaos database and dispatched
+through the API. The verdict prints the hits, the misses and the restores from
+a home replica. These lines are information only: a Cache miss is correct, so
+it never fails or narrows a verdict, and the probe's Runs are not counted by
+the invariants. A replay writes the recorded pipeline again with a new salt,
+so its seed starts cold too.
 
 A replay reads `scenario.json` and fires the same plan (target Run, delay,
 replica) without drawing from the seed again. Timing still varies, so a replay

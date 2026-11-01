@@ -25,8 +25,15 @@
 #      Runs, the scenario's fault, then the invariant checker. Each run writes
 #      a directory under $SCARAB_CHAOS_DIR (default deploy/kind/.chaos):
 #      scenario.json (the replayable file), pods.jsonl, verdict.json,
-#      release-log.txt and, for mid-feed, fetcher-log.txt. The kind node's
-#      memory samples go to $SCARAB_CHAOS_DIR/memory-<time>.log.
+#      release-log.txt, cache-log.txt and, for mid-feed, fetcher-log.txt. The
+#      kind node's memory samples go to $SCARAB_CHAOS_DIR/memory-<time>.log.
+#      Each scenario also runs the Cache probe (crates/scarab-chaos/src/cache.rs):
+#      a cached Step whose second Run restores the first Run's Cache from its
+#      home Depot replica. A Cache needs a Project, so the probe's pipeline
+#      lives in the in-cluster Forgejo repo scarab-admin/chaos-cache, bound
+#      (no webhook) through a connection in the chaos database and dispatched
+#      through the API. Its hits, misses and restores from a home replica are
+#      printed with the verdict; a miss never fails it.
 #   3. sends SIGCONT to every server container on the node (an interrupted
 #      stop-leader run must not leave a server stopped), cancels the chaos
 #      database's non-terminal Runs through the API (a scenario refuses to
@@ -166,6 +173,19 @@ export SCARAB_CHAOS_S3_BUCKET=scarab-chaos
 export SCARAB_CHAOS_S3_ACCESS_KEY=scarab
 export SCARAB_CHAOS_S3_SECRET_KEY=scarabsecret
 export SCARAB_CHAOS_NODE="$node"
+# The Cache probe's Forgejo (up.sh seeded it and wrote forgejo.env, with a
+# token minted for this run). Without it the probe is skipped with a note.
+forgejo_env="$here/.state/forgejo.env"
+if [ -f "$forgejo_env" ]; then
+  forward scarab-forgejo 3000
+  export SCARAB_CHAOS_FORGEJO_URL="http://127.0.0.1:$fwd_port"
+  SCARAB_CHAOS_FORGEJO_SERVER_URL="$(env_get "$forgejo_env" SCARAB_TEST_FORGEJO_SERVER_URL)"
+  SCARAB_CHAOS_FORGEJO_TOKEN="$(env_get "$forgejo_env" SCARAB_TEST_FORGEJO_TOKEN)"
+  SCARAB_CHAOS_FORGEJO_OWNER="$(env_get "$forgejo_env" SCARAB_TEST_FORGEJO_OWNER)"
+  export SCARAB_CHAOS_FORGEJO_SERVER_URL SCARAB_CHAOS_FORGEJO_TOKEN SCARAB_CHAOS_FORGEJO_OWNER
+else
+  echo "warning: $forgejo_env is missing; the Cache probe is skipped" >&2
+fi
 checker_env=1
 
 server_replicas="$(kc get deploy "$release" -n "$ns" -o jsonpath='{.spec.replicas}')"

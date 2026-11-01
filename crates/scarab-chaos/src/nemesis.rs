@@ -68,12 +68,44 @@ pub async fn run(stack: &Stack, mut scenario: Scenario, dir: &Path) -> Result<Sc
         scenario.plan
     ));
 
+    // The Cache probe's seed Run (`crate::cache`), before the workload and
+    // waited for, so the probe Run below has a Cache to restore. A probe that
+    // cannot run is a note, never a harness failure: it is informational.
+    if let Some(probe) = scenario.cache.as_mut() {
+        let salt = format!("{}-{}-{}", scenario.kind.as_str(), scenario.seed, now_ms());
+        let seeded = match crate::cache::Forgejo::from_env() {
+            Ok(fj) => crate::cache::seed(&stack.api, &fj, probe, salt).await,
+            Err(e) => Err(e),
+        };
+        match seeded {
+            Ok(()) => log(&format!(
+                "cache probe: seed run {:?} {:?}",
+                probe.seed_run, probe.seed_status
+            )),
+            Err(e) => {
+                log(&format!("cache probe skipped: {e}"));
+                probe.skipped = Some(e);
+            }
+        }
+        scenario.write(&file)?;
+    }
+
     scenario.started_at_ms = now_ms();
     let body = scenario.workload.pipeline();
     for _ in 0..scenario.workload.runs {
         let id = stack.api.create_run(&body).await?;
         log(&format!("created run {id}"));
         scenario.runs.push(id);
+    }
+    // The probe Run goes in with the workload, so its restore runs under the
+    // fault.
+    if let Some(probe) = scenario.cache.as_mut() {
+        if let Err(e) = crate::cache::dispatch_probe(&stack.api, probe).await {
+            log(&format!("cache probe not dispatched: {e}"));
+            probe.skipped = Some(format!("the probe run was not dispatched: {e}"));
+        } else if let Some(run) = &probe.probe_run {
+            log(&format!("cache probe: dispatched probe run {run}"));
+        }
     }
     scenario.write(&file)?;
 
@@ -118,8 +150,12 @@ pub async fn run(stack: &Stack, mut scenario: Scenario, dir: &Path) -> Result<Sc
 
     // --- quiesce --------------------------------------------------------------
     let deadline_ms = scenario.quiesce_deadline_ms();
+    // The probe Run is waited for too (its Pod logs are read below), under
+    // the same bound.
+    let mut waited = scenario.runs.clone();
+    waited.extend(scenario.cache.as_ref().and_then(|c| c.probe_run.clone()));
     loop {
-        if all_terminal(stack, &scenario.runs).await {
+        if all_terminal(stack, &waited).await {
             scenario.quiesced_at_ms = Some(now_ms());
             log("every run is terminal");
             break;
@@ -169,6 +205,25 @@ pub async fn run(stack: &Stack, mut scenario: Scenario, dir: &Path) -> Result<Sc
             };
             let _ = std::fs::write(dir.join("fetcher-log.txt"), text);
         }
+    }
+
+    // The Cache probe: each cached Step's fetcher log, while the Pods exist.
+    if let Some(probe) = scenario.cache.as_mut() {
+        crate::cache::observe(&stack.api, &pods_api, &stack.pg, probe).await;
+        let text: String = probe
+            .restores
+            .iter()
+            .map(|r| {
+                format!(
+                    "{} run {} pod {}: {}\n",
+                    r.role,
+                    r.run,
+                    r.pod,
+                    r.line.as_deref().unwrap_or("no `cache restore` line")
+                )
+            })
+            .collect();
+        let _ = std::fs::write(dir.join("cache-log.txt"), text);
     }
 
     // --- where it landed --------------------------------------------------------

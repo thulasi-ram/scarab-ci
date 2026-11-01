@@ -334,6 +334,11 @@ pub struct Scenario {
     /// When every Run was terminal, or the bound ran out.
     pub quiesced_at_ms: Option<i64>,
     pub notes: Vec<String>,
+    /// The Cache probe (`crate::cache`): informational, its Runs are not in
+    /// `runs`. `None` in a file written before it existed; a replay of such a
+    /// file runs no probe.
+    #[serde(default)]
+    pub cache: Option<crate::cache::CacheProbe>,
 }
 
 impl Scenario {
@@ -351,6 +356,7 @@ impl Scenario {
         depot_replicas: u32,
     ) -> Self {
         let quiesce_bound_secs = quiesce_bound_secs(&workload);
+        let cache = Some(crate::cache::CacheProbe::new(&workload.image));
         Self {
             format: FORMAT,
             kind,
@@ -366,6 +372,7 @@ impl Scenario {
             faults: Vec::new(),
             quiesced_at_ms: None,
             notes: Vec::new(),
+            cache,
         }
     }
 
@@ -380,6 +387,9 @@ impl Scenario {
             self.depot_replicas,
         );
         s.replay_of = Some(path.to_string());
+        // The recorded pipeline, not this build's: the replay writes what the
+        // original wrote.
+        s.cache = self.cache.as_ref().map(crate::cache::CacheProbe::replay);
         s
     }
 
@@ -479,6 +489,12 @@ mod tests {
         assert_eq!(back, s);
         let r = back.replay(path.to_str().unwrap());
         assert_eq!((r.plan.clone(), r.quiesce_bound_secs), (s.plan.clone(), s.quiesce_bound_secs));
+        // The replay writes the recorded probe pipeline, with nothing observed.
+        assert_eq!(
+            r.cache.as_ref().map(|c| c.pipeline_yaml.as_str()),
+            s.cache.as_ref().map(|c| c.pipeline_yaml.as_str())
+        );
+        assert_eq!(r.cache.as_ref().and_then(|c| c.seed_run.clone()), None);
         assert!(r.runs.is_empty() && r.replay_of.is_some());
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -494,9 +510,12 @@ mod tests {
             "trigger": null, "condition_held_at_fire": true, "fence_pack_rows_at_fire": null,
             "fired_at_ms": 5, "landing": null
         }]);
+        v.as_object_mut().unwrap().remove("cache");
         let s: Scenario = serde_json::from_value(v).unwrap();
         assert_eq!(s.plan.hold_ms, 0);
         assert_eq!(s.faults[0].signal, None);
+        assert_eq!(s.cache, None, "a file from before the Cache probe has none");
+        assert_eq!(s.replay("old.json").cache, None, "and its replay runs none");
     }
 
     /// The bound counts from a stopped leader's resume, not from its stop.

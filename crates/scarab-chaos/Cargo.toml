@@ -32,3 +32,8 @@ k8s-openapi = { workspace = true }
 clap = { workspace = true }
 rand = { workspace = true }
 rustls = { workspace = true }
+base64 = { workspace = true }
+
+# The Cache probe's pipeline is compiled in a unit test (src/cache.rs).
+[dev-dependencies]
+scarab-pipeline = { workspace = true }

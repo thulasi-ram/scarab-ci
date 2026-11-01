@@ -127,6 +127,10 @@ pub struct Verdict {
     /// What I4 read back: per green Attempt, the objects in its snapshot
     /// closure and the bytes read from the bucket and hashed.
     pub snapshots: Vec<SnapshotSummary>,
+    /// The Cache probe's lines (`crate::cache::summary_lines`), set by the
+    /// caller from the scenario file. Informational: no outcome reads them.
+    #[serde(default)]
+    pub cache: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -933,6 +937,7 @@ pub fn evaluate(f: &Facts) -> Verdict {
                 bytes_read: s.bytes,
             })
             .collect(),
+        cache: Vec::new(),
     }
 }
 
