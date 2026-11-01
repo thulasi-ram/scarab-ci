@@ -1,6 +1,6 @@
 # Full-stack E2E tier (test-strategy Phase 2): a pure HTTP driver for the kind
 # release (`deploy/kind/`, in its `e2e` mode: own database and bucket). The
-# crate assumes a RUNNING release; `just e2e` brings it up and runs the suite.
+# crate assumes a RUNNING release; `just test e2e` brings it up and runs the suite.
 # Every test is env-gated behind `SCARAB_E2E=1` and skips loudly otherwise, so
 # the default `just test` / workspace run never depends on a cluster. Zero
 # auto-retries — a red run is a real timing bug (grow-from-bugs applies to the

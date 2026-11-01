@@ -1082,7 +1082,7 @@ pub enum ConfigError {
         "SCARAB_DATABASE_URL is not set. Postgres is mandatory for every serving role \
          (ADR-0048) — there is no API-only mode, and the workspace role needs it too \
          (ADR-0067 part 2: it reads/writes drain records and write ledgers; it never \
-         migrates). Start a Postgres (dev: `just up`) and set SCARAB_DATABASE_URL; \
+         migrates). Start a Postgres (dev: `just stack up`) and set SCARAB_DATABASE_URL; \
          only `--emit-openapi` works without a database. SCARAB_DEV_INSECURE does \
          NOT relax this."
     )]

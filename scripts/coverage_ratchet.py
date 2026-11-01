@@ -12,7 +12,7 @@ and appends it to $GITHUB_STEP_SUMMARY when that is set.
 
 Ratchet: exits 1 if any crate's line coverage drops more than SLACK
 percentage points below the committed baseline. `--write` regenerates the
-baseline instead; a human commits it deliberately (see `just coverage`).
+baseline instead; a human commits it deliberately (see `just test coverage`).
 
 The baseline is a deliberately trivial TOML subset: comments, a `[crates]`
 header, and `name = <float>` lines. No TOML library needed to read or write.
@@ -68,7 +68,7 @@ DEFAULT_HEADER = [
     "# Per-crate line-coverage baseline (percent), consumed by",
     "# scripts/coverage_ratchet.py: CI fails if any crate drops more than",
     f"# {SLACK} percentage points below its value here. Regenerate",
-    "# deliberately with `just coverage` and commit the result.",
+    "# deliberately with `just test coverage` and commit the result.",
 ]
 
 

@@ -1,4 +1,4 @@
-//! Helpers for the live Forgejo tier (`just e2e`): the connection,
+//! Helpers for the live Forgejo tier (`just test e2e`): the connection,
 //! the bind, real pushes through the contents API, and waits on what they
 //! produce. Shared by `forgejo_onboarding.rs` and `forgejo_tunnel.rs`.
 
@@ -12,7 +12,7 @@ pub fn enter_tier() {
         assert!(
             std::env::var(switch).ok().as_deref() == Some("1"),
             "this live case was asked to run (`--ignored` is the opt-in) but {switch} is not \
-             1. Run `just e2e`, which stands up the stack and a seeded Forgejo."
+             1. Run `just test e2e`, which stands up the stack and a seeded Forgejo."
         );
     }
 }
@@ -21,7 +21,7 @@ pub fn env(key: &str) -> String {
     std::env::var(key)
         .ok()
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| panic!("{key} is not set — `just e2e` writes it"))
+        .unwrap_or_else(|| panic!("{key} is not set — `just test e2e` writes it"))
 }
 
 /// POST/GET helper that keeps the body on the assertion message — every failure
@@ -61,7 +61,7 @@ pub async fn run_ids(
 /// Delete any connection already serving `forgejo`, so this scenario can create
 /// its own. **Not cleanup after a bug — a property of the tier.**
 ///
-/// `just e2e` mints a new Forgejo token on every run (and a recreated cluster
+/// `just test e2e` mints a new Forgejo token on every run (and a recreated cluster
 /// starts a new Forgejo), but the release's e2e database OUTLIVES the token.
 /// So the second run meets a connection row from the first, and
 /// `POST /v1/connections` correctly answers 409: ADR-0060 part D allows one
@@ -81,7 +81,7 @@ pub async fn reclaim_connections_for(client: &reqwest::Client, base: &str, forge
 }
 
 /// Delete the connections a quick tunnel of an EARLIER run left. Every
-/// `just e2e` run gets a new `https://<name>.trycloudflare.com` URL, so
+/// `just test e2e` run gets a new `https://<name>.trycloudflare.com` URL, so
 /// `reclaim_connections_for` (which matches the current URL) never sees them,
 /// and the repo they still have bound refuses the new bind with 409.
 pub async fn reclaim_quick_tunnel_connections(client: &reqwest::Client, base: &str) {

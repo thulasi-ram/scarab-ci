@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Seed the in-cluster Forgejo (deploy/kind/forgejo.yaml) for the Forgejo cases
-# of `just e2e` (git-bug 3863d5e). deploy/kind/up.sh runs it in every mode,
+# of `just test e2e` (git-bug 3863d5e). deploy/kind/up.sh runs it in every mode,
 # after Forgejo is rolled out:
 #   - an admin user + an API access token
 #   - enough repos to force `list_accessible_repos` onto a second page

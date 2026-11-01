@@ -7,7 +7,7 @@
 //!
 //! `run` and `replay` refuse while the chaos database holds a non-terminal
 //! Run: it would resume beside the new workload and add load and timing the
-//! scenario file does not record. `just chaos` runs `cancel-leftovers` when it
+//! scenario file does not record. `just test chaos` runs `cancel-leftovers` when it
 //! exits, before it switches the release back.
 //!
 //! Exit code: 0 PASS, 1 FAIL (an invariant does not hold), 2 the harness
@@ -68,7 +68,7 @@ async fn refuse_leftovers(conn: &Conn) -> Result<(), String> {
     }
     Err(format!(
         "{} non-terminal Run(s) in the chaos database from an earlier session: {left:?}. \
-         They would run beside this scenario's workload. `just chaos` cancels them when it exits; \
+         They would run beside this scenario's workload. `just test chaos` cancels them when it exits; \
          rerun it.",
         left.len()
     ))
@@ -99,7 +99,7 @@ async fn cancel_leftovers(conn: &Conn) -> Result<(), String> {
 }
 
 fn var(k: &str) -> Result<String, String> {
-    std::env::var(k).map_err(|_| format!("{k} is not set (run through `just chaos`)"))
+    std::env::var(k).map_err(|_| format!("{k} is not set (run through `just test chaos`)"))
 }
 
 struct Conn {

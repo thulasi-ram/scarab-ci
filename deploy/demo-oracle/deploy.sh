@@ -25,7 +25,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 
 # Image SOURCE (repository + clone/sidecar/wsfetch refs) is a per-invocation
-# choice, so a caller (`just demo-oracle`) may override it even though .env is
+# choice, so a caller (`just stack up demo-oracle`) may override it even though .env is
 # otherwise file-wins for durable config + secrets. Capture caller-provided
 # image refs now; re-apply after the .env load.
 _img_repo="${IMAGE_REPOSITORY:-}"

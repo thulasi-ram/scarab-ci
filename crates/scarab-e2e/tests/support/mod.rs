@@ -1,7 +1,7 @@
 //! Shared harness for the full-stack E2E tier (test-strategy Phase 2).
 //!
 //! The crate is a pure HTTP driver over the kind release in its `e2e` mode
-//! (`deploy/kind/up.sh e2e`: own database and bucket): `just e2e` owns the
+//! (`deploy/kind/up.sh e2e`: own database and bucket): `just test e2e` owns the
 //! lifecycle, these helpers only speak to it. DTOs are hand-rolled minimal
 //! structs carrying exactly the fields the scenarios assert — deliberately not
 //! a generated client.
@@ -23,28 +23,28 @@ macro_rules! require_e2e {
         if std::env::var("SCARAB_E2E").ok().as_deref() != Some("1") {
             eprintln!(
                 "SKIPPED (full-stack e2e): set SCARAB_E2E=1 against the kind release — \
-                 `just e2e` brings it up in its e2e mode and runs the suite"
+                 `just test e2e` brings it up in its e2e mode and runs the suite"
             );
             return;
         }
     };
 }
 
-// --- configuration (env, set by `just e2e`) ----------------------------------
+// --- configuration (env, set by `just test e2e`) ----------------------------------
 
 /// Base URL of the release's API, on the host port the kind node publishes.
 pub fn base_url() -> String {
     std::env::var("SCARAB_E2E_URL").unwrap_or_else(|_| "http://localhost:8080".into())
 }
 
-/// The e2e mode's Postgres database, through the port-forward `just e2e` opens
+/// The e2e mode's Postgres database, through the port-forward `just test e2e` opens
 /// (the server's Postgres runs in the cluster). Only `happy_path` uses it, to
 /// seed a connection and a binding.
 pub fn database_url() -> String {
     std::env::var("SCARAB_E2E_DATABASE_URL")
         .ok()
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| panic!("SCARAB_E2E_DATABASE_URL unset: `just e2e` port-forwards the release's Postgres"))
+        .unwrap_or_else(|| panic!("SCARAB_E2E_DATABASE_URL unset: `just test e2e` port-forwards the release's Postgres"))
 }
 
 /// The workspace root (this crate lives at `crates/scarab-e2e`).
@@ -75,13 +75,13 @@ pub fn kind_node() -> String {
 }
 
 /// The host name or address a Pod (the server included) reaches this host
-/// at; `just e2e` probes it from a real Pod. A test that serves something the
+/// at; `just test e2e` probes it from a real Pod. A test that serves something the
 /// server must call binds 0.0.0.0 and hands out this host.
 pub fn pod_host() -> String {
     std::env::var("SCARAB_E2E_POD_HOST")
         .ok()
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| panic!("SCARAB_E2E_POD_HOST unset: `just e2e` probes it from a Pod"))
+        .unwrap_or_else(|| panic!("SCARAB_E2E_POD_HOST unset: `just test e2e` probes it from a Pod"))
 }
 
 /// Path to the `scarab` CLI binary (the happy-path scenario dispatches

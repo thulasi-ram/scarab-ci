@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# `just chaos [mid-drain|mid-feed|all] [seed]` and `just chaos replay <file>`:
+# `just test chaos [mid-drain|mid-feed|all] [seed]` and `just test chaos replay <file>`:
 # ADR-0077 rank 1 on the kind release (Amendment 2026-11-01 §4).
 #
 #   1. up.sh chaos: refused while step Pods of the current mode run; deletes
@@ -18,7 +18,7 @@
 #      scenario refuses to start while one is left), then switches the
 #      release back to the mode that was active before (dev or
 #      dogfood; e2e and anything else go back to dev, because restoring e2e
-#      would open a new public Forgejo tunnel) and runs `just demo` there.
+#      would open a new public Forgejo tunnel) and runs `just stack demo` there.
 #
 # Exit code: 0 when every verdict passed; 1 when a verdict failed (a finding);
 # 2 when the harness could not run a scenario; 3 when no verdict failed but a
@@ -41,7 +41,7 @@ case "$what" in
   mid-drain|mid-feed) kinds=("$what") ;;
   all) kinds=(mid-drain mid-feed) ;;
   replay)
-    [ -f "$arg" ] || die "just chaos replay <scenario.json>: '$arg' does not exist"
+    [ -f "$arg" ] || die "just test chaos replay <scenario.json>: '$arg' does not exist"
     replay_file="$(cd "$(dirname "$arg")" && pwd)/$(basename "$arg")"
     ;;
   *) die "unknown scenario '$what' (expected mid-drain, mid-feed, all or replay <file>)" ;;
@@ -80,11 +80,11 @@ cleanup() {
   fi
   # A Run the quiesce bound gave up on stays non-terminal in scarab_chaos and
   # would resume beside the next session's workload. Cancel it through the
-  # API while the chaos release still runs (the next `just chaos` refuses to
+  # API while the chaos release still runs (the next `just test chaos` refuses to
   # start while one is left).
   if [ "$checker_env" = 1 ] && [ -x "$bin" ]; then
     echo "==> cancelling non-terminal chaos Runs"
-    "$bin" cancel-leftovers || echo "warning: could not cancel every chaos Run; the next 'just chaos' refuses until they end" >&2
+    "$bin" cancel-leftovers || echo "warning: could not cancel every chaos Run; the next 'just test chaos' refuses until they end" >&2
   fi
   stop_forwards
   # A Run the bound gave up on can leave its step Pods running; they belong to
@@ -103,9 +103,9 @@ cleanup() {
   echo "==> switching the release back to $back"
   if bash "$here/up.sh" "$back"; then
     scarab_addr
-    echo "==> just demo on $back"
+    echo "==> just stack demo on $back"
     SCARAB_BASE="$base" SCARAB_DEMO_IMAGE="${SCARAB_DEMO_IMAGE:-scarab-clone:dev}" bash "$here/demo.sh" \
-      || { echo "error: just demo failed after switching back to $back" >&2; [ "$rc" = 1 ] || rc=2; }
+      || { echo "error: just stack demo failed after switching back to $back" >&2; [ "$rc" = 1 ] || rc=2; }
   else
     echo "error: could not switch back to $back" >&2
     [ "$rc" = 1 ] || rc=2

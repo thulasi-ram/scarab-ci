@@ -26,7 +26,7 @@ durable execution passes none of them:
   exactly-once, in [`crash_resume.rs`](../crates/scarab-db-postgres/tests/crash_resume.rs),
   which runs against real Postgres) is the part the durable workflow engines already have. The
   part that would set us apart is proven for one case only: the control-plane crash test with a
-  real Pod in flight (`crates/scarab-e2e/tests/crash_resume.rs`) passes in `just e2e`, on a
+  real Pod in flight (`crates/scarab-e2e/tests/crash_resume.rs`) passes in `just test e2e`, on a
   local kind cluster and in `e2e.yml`. It SIGKILLs the server from the kind node; the kubelet
   restarts the container in the same Pod, and the new process re-adopts the Attempt without
   running it again. A server Pod moved to another node, or a lost node, is not tested. And
@@ -150,8 +150,8 @@ Show respect and say where we differ; never take a swipe.
    implemented; not yet hardened against live forges."
 2. ❌ Any end-to-end durability-on-Kubernetes or live-Pod re-attach claim. The
    executor's live-cluster tests, re-attach after relaunch included, pass on kind
-   (`just e2e`, run by `e2e.yml`). The stack-level crash/resume test with a real Pod in flight
-   passes in `just e2e` (locally and in `e2e.yml`) and covers only a server container
+   (`just test e2e`, run by `e2e.yml`). The stack-level crash/resume test with a real Pod in flight
+   passes in `just test e2e` (locally and in `e2e.yml`) and covers only a server container
    SIGKILLed and restarted in the same Pod (not a Pod moved to another node, not a lost node).
 3. ❌ Durable execution as a selling point against Argo/Tekton/Temporal/Kestra.
 4. ❌ Time-travel / replay as a feature.
@@ -166,7 +166,7 @@ Show respect and say where we differ; never take a swipe.
 8. ❌ "Every change runs the full test suite." `ci.yml` runs the Rust suite against
    real Postgres on every push to main and on PRs that touch Rust (in CI a skipped
    Postgres test fails the job), but `e2e.yml` runs the live-cluster and full-stack
-   tiers (`just e2e`) only on PRs labelled `ci:full` and weekly.
+   tiers (`just test e2e`) only on PRs labelled `ci:full` and weekly.
 
 **Keep a visible Status line, and don't apologise for it.** Durable engine:
 proven. Forge-native domain model: proven against a fake forge. Forge adapters

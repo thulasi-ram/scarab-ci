@@ -59,7 +59,7 @@ jobs:
   # `ci.yml` reads, so "did the UI change?" has one answer in this repo.
   #
   # ON A PUSH OR A TAG, ALL FOUR GET EVERY TAG. The `edge` / `sha-<sha>` /
-  # semver tags are how `just demo-oracle sha-<sha>` and the chart
+  # semver tags are how `just stack up demo-oracle sha-<sha>` and the chart
   # pin a build, and a tag that exists for some images and not others is a trap
   # you only discover in a deploy.
   #

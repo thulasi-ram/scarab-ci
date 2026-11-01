@@ -78,7 +78,7 @@ pub struct Finding {
     pub detail: String,
 }
 
-/// The verdict's outcome. `just chaos` exits 0, 1 and 3 for them.
+/// The verdict's outcome. `just test chaos` exits 0, 1 and 3 for them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Outcome {

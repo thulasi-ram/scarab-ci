@@ -1,11 +1,11 @@
-# Dev-only in-cluster Postgres for the kind dev stack (`just up`, `just
-# dogfood`). Not for production: use a managed Postgres there. One replica on a
+# Dev-only in-cluster Postgres for the kind dev stack (`just stack up`, `just
+# stack up dogfood`). Not for production: use a managed Postgres there. One replica on a
 # PVC (kind's local-path provisioner), so the data survives Pod restarts and
-# `just down keep`; `just down` deletes the cluster and the data with it.
+# `just stack down keep`; `just stack down` deletes the cluster and the data with it.
 #
-# Each mode has its own database on this one server: `scarab` for `just up`,
-# `scarab_dogfood` for `just up dogfood`, `scarab_e2e` for `just e2e`,
-# `scarab_chaos` for `just chaos` (reached through toxiproxy).
+# Each mode has its own database on this one server: `scarab` for `just stack up`,
+# `scarab_dogfood` for `just stack up dogfood`, `scarab_e2e` for `just test e2e`,
+# `scarab_chaos` for `just test chaos` (reached through toxiproxy).
 # deploy/kind/up.sh creates the database a mode needs (ADR-0077 Amendment: a
 # mode is a set of values, isolated by database URL and bucket).
 apiVersion: v1
@@ -35,7 +35,7 @@ spec:
       containers:
         - name: postgres
           image: postgres:16-alpine   # official image is multi-arch (runs on arm64)
-          # On from the start: `just chaos` (ADR-0077) checks commit order on
+          # On from the start: `just test chaos` (ADR-0077) checks commit order on
           # its own database on this server, and the setting needs a restart,
           # which would also hit dev's data.
           args: ["-c", "track_commit_timestamp=on"]

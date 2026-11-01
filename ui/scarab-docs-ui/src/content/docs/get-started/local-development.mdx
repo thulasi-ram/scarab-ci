@@ -1,19 +1,19 @@
 ---
 title: Local Development
-description: 'Run scarab-server from the tree in a local kind cluster: the .env setup and the just up → reload → demo → down loop.'
+description: 'Run scarab-server from the tree in a local kind cluster: the .env setup and the just stack up → reload → demo → down loop.'
 ---
 
 import Doodle from '../../../components/Doodle.astro';
 
 <Doodle icon="wrench" size={200} rotate={8} opacity={0.18} top="7rem" right="-2rem" />
 
-This page covers the day-to-day development loop and the `.env` file it reads. `just up` runs
+This page covers the day-to-day development loop and the `.env` file it reads. `just stack up` runs
 Scarab in a local kind cluster from the Helm chart, with a `scarab-server` built from the working
 tree and mounted into the server Pods, so you rebuild and rerun without building an image
 (`deploy/kind/README.md`). The test recipes run against the same release in its e2e mode.
-`Justfile` recipes over `deploy/` drive all of it. Use them rather
+`just` recipes over `deploy/` drive all of it (`just` alone lists them). Use them rather
 than typing docker/kind/kubectl commands yourself: they set the right env, an isolated kubeconfig,
-and the kube safety checks. CI runs the same recipes (`just test`, `just e2e`).
+and the kube safety checks. CI runs the same recipes (`just test`, `just test e2e`).
 
 For a guided first run see [Run locally](/scarab-ci/get-started/run-locally/); to deploy the
 packaged Helm chart inside the cluster instead, see
@@ -25,7 +25,7 @@ packaged Helm chart inside the cluster instead, see
 - **kind**, **kubectl**, **Helm 4**: the stack runs in a local kind cluster (`scarab-dev`).
 - **cargo** (Rust toolchain, see `rust-toolchain.toml`): the server is built from source, with
   **zig** and `cargo-zigbuild` on macOS (the binary is built for Linux).
-- **python3**: `just demo` submits a pipeline over the REST API.
+- **python3**: `just stack demo` submits a pipeline over the REST API.
 - [`just`](https://github.com/casey/just): the task runner that fronts every recipe below.
 
 ## Configuring your environment
@@ -40,9 +40,9 @@ SCARAB_ADDR=127.0.0.1:8080
 SCARAB_API_URL=http://127.0.0.1:8080
 ```
 
-`just up` maps the host port of `SCARAB_ADDR` to the server's node port when it creates the
+`just stack up` maps the host port of `SCARAB_ADDR` to the server's node port when it creates the
 cluster, so changing the port later needs the cluster recreated
-(`SCARAB_KIND_RECREATE=1 just up`). Everything else (database URL, bucket, secrets, the
+(`SCARAB_KIND_RECREATE=1 just stack up`). Everything else (database URL, bucket, secrets, the
 dev-only `scarab.devInsecure` that boots without an authenticator or key-encryption key under
 [fail-closed startup (ADR-0048)](/scarab-ci/tech/adr/0048-fail-closed-startup/)) is a Helm value
 set by `deploy/kind/up.sh`. **Production must never set `devInsecure`.**
@@ -54,55 +54,59 @@ the main `SCARAB_*` variables and what each does, see
 ## The workflow
 
 ```sh
-just up      # bring the whole stack up in kind
-just reload  # after a code change: rebuild and roll the server Pods
-just ui      # start the web UI dev server
-just demo    # submit a pipeline and watch it complete
-just logs    # follow the server's log
-just down    # tear it all down
+just stack up      # bring the whole stack up in kind
+just stack reload  # after a code change: rebuild and roll the server Pods
+just ui            # start the web UI dev server
+just stack demo    # submit a pipeline and watch it complete
+just stack logs    # follow the server's log
+just stack down    # tear it all down
 ```
 
-- **`just up`** builds `scarab-server` for Linux (cargo-zigbuild on macOS), creates the
+- **`just stack up`** builds `scarab-server` for Linux (cargo-zigbuild on macOS), creates the
   `scarab-dev` kind cluster (isolated kubeconfig at `deploy/kind/.kubeconfig`), runs Postgres and
   MinIO in it, and installs the Helm chart with the server and the workspace service running that
   binary. It reads only `SCARAB_ADDR` from `deploy/kind/.env`: the host port of the API.
-- **`just reload`** rebuilds and restarts the server and workspace Pods on the new binary, about
+- **`just stack reload`** rebuilds and restarts the server and workspace Pods on the new binary, about
   40 s after a one-line change.
 - **`just ui`** runs the SolidJS web UI on Vite (`http://localhost:5173`), which proxies `/v1` to
   the running server using `SCARAB_API_URL` from the env file.
-- **`just demo`** POSTs a one-step pipeline to the running server and polls it to a
+- **`just stack demo`** POSTs a one-step pipeline to the running server and polls it to a
   terminal state, the smallest end-to-end run.
-- **`just logs`** follows the server Pod's log.
-- **`just down`** deletes the kind cluster and its data; `just down keep` uninstalls the release and
+- **`just stack logs`** follows the server Pod's log; `just stack logs depot` follows the Data
+  Depot's, and `just stack status` prints its readiness and gauges.
+- **`just stack down`** deletes the kind cluster and its data; `just stack down keep` uninstalls the release and
   keeps the cluster, Postgres, MinIO and their data.
 
-Also handy: **`just docs`** serves this documentation site locally.
+Also handy: **`just docs`** serves this documentation site locally, and **`just ui mock`** runs
+the web UI against built-in fixtures, with no server.
 
 ## Tests against the stack
 
 ```sh
-just e2e                # every live suite
-just e2e crash_resume   # the same, narrowed by a nextest filter
+just test e2e               # every live suite
+just test e2e crash_resume  # the same, narrowed by a nextest filter
 ```
 
-`just e2e` switches the release to its e2e mode, with its own database (`scarab_e2e`) and
-bucket (`scarab-e2e`), so dev data is not touched, and leaves it there; `just up` switches back.
+`just test e2e` switches the release to its e2e mode, with its own database (`scarab_e2e`) and
+bucket (`scarab-e2e`), so dev data is not touched, and leaves it there; `just stack up` switches back.
 It runs the full-stack suite (`crates/scarab-e2e`), the Forgejo adapter and onboarding against
 the Forgejo that runs in the cluster, the forge_token cases through a cloudflared quick tunnel
 (network calls; Forgejo is public while it runs), the executor's and the plugin runtime's live
-cluster suites, and the control-plane crash test last. The test binaries run on your machine.
-CI runs the same recipe on PRs labelled `ci:full`. `just test` runs the workspace suite against a separate
-compose Postgres and MinIO (`deploy/test-services/`).
+cluster suites, the Argo CD plugin against a fake Argo CD, and the control-plane crash test last.
+The test binaries run on your machine. CI runs the same recipe on PRs labelled `ci:full`.
+`just test` runs the workspace suite against a separate compose Postgres and MinIO
+(`deploy/test-services/`), then the UI no-DOM suite; `just test rust <filter>` runs one test or a
+group, and `just test ui` adds the Playwright browser specs.
 
 ### Fault scenarios
 
 ```sh
-just chaos                                            # mid-drain, then mid-feed, seed 1
-just chaos mid-feed 7                                 # one scenario, another seed
-just chaos replay deploy/kind/.chaos/<dir>/scenario.json
+just test chaos             # mid-drain, then mid-feed, seed 1
+just test chaos mid-feed 7  # one scenario, another seed
+just test chaos replay deploy/kind/.chaos/<dir>/scenario.json
 ```
 
-`just chaos` runs the first fault scenario of
+`just test chaos` runs the first fault scenario of
 [ADR-0077](/scarab-ci/tech/adr/0077-end-to-end-fault-and-agent-driven-testing/) on the same
 release. It switches the release to its chaos mode: its own database (`scarab_chaos`) and bucket
 (`scarab-chaos`) on the same Postgres and MinIO, reached through toxiproxy, with two servers and
@@ -116,15 +120,15 @@ has run out, the `scarab-chaos` checker reads Postgres, the bucket and the Kuber
 directly. It reports whether each Run made exactly one terminal transition, whether any Step ran
 twice, whether every green Attempt's snapshot reads back from the bucket and hashes to its
 address, and whether anything of a finished Run is still running. Each scenario run leaves a
-`scenario.json` that `just chaos replay` fires again. The recipe then switches the release back
-to the mode it found (dev or dogfood) and runs `just demo` there. See `deploy/kind/README.md`
+`scenario.json` that `just test chaos replay` fires again. The recipe then switches the release back
+to the mode it found (dev or dogfood) and runs `just stack demo` there. See `deploy/kind/README.md`
 for the files it writes and the full invariant list.
 
 :::note[Dogfood and Helm]
-`just up dogfood` is `just up` in GitHub App mode, with its own database and bucket, behind a
+`just stack up dogfood` is `just stack up` in GitHub App mode, with its own database and bucket, behind a
 Cloudflare tunnel; it reads `~/.config/scarab/dogfood.env`. The stack has no login, so the
 tunnel's public hostname must route only the path `^/webhooks/` (set in the Cloudflare
-dashboard). `just up dogfood` checks this from outside and scales the tunnel to zero, then
+dashboard). `just stack up dogfood` checks this from outside and scales the tunnel to zero, then
 fails, when `/` or `/v1/repos` reaches Scarab. The UI and API stay on
 `http://127.0.0.1:<port>`. To install the published chart on a cluster of your own, see [Installation](/scarab-ci/get-started/deploy-helm/).
 :::

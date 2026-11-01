@@ -1,4 +1,4 @@
-# The cloudflared quick tunnel `just e2e` puts in front of the in-cluster
+# The cloudflared quick tunnel `just test e2e` puts in front of the in-cluster
 # Forgejo (deploy/kind/up.sh e2e creates it; the e2e recipe deletes it when it
 # ends). A quick tunnel needs no account: cloudflared prints a random
 # https://<name>.trycloudflare.com URL to its log, and up.sh reads it there.

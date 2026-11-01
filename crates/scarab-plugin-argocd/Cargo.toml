@@ -24,7 +24,7 @@ path = "src/lib.rs"
 name = "scarab-plugin-argocd"
 path = "src/main.rs"
 
-# A fake Argo CD API server for local verification (`just plugin-verify`) and
+# A fake Argo CD API server for local verification (the Argo CD pass of `just test e2e`) and
 # the `fake` image target. Never part of the plugin image.
 [[bin]]
 name = "fake-argocd"

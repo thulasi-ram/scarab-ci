@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Submit a CHAINED pipeline (produce → consume) and watch it complete.
 #
-# Why this exists next to demo.sh: `just demo` submits ONE step with no `needs:`,
+# Why this exists next to demo.sh: `just stack demo` submits ONE step with no `needs:`,
 # which never crosses a Step boundary — so it exercises the workspace **drain**
 # and nothing at all of the **feed**. Since ADR-0061 s3-feed the feed is a
 # Scarab-owned init container (`scarab-wsfetch`) that dials the workspace service
@@ -12,7 +12,7 @@
 # a step that ran against a silently empty /workspace must fail this, because an
 # empty workspace is not an error — it is a wrong answer.
 #
-# Requires `just up` to be running first.
+# Requires `just stack up` to be running first.
 set -euo pipefail
 
 base="${SCARAB_BASE:-http://127.0.0.1:8080}"

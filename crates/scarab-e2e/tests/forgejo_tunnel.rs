@@ -4,7 +4,7 @@
 //! to mint for any other, and the pinned clone image's askpass refuses to hand
 //! it to git. The clone URL comes from the connection's base URL, which the
 //! server Pod and the step Pods must both reach, over TLS that image trusts.
-//! `just e2e` puts the in-cluster Forgejo behind a cloudflared quick tunnel
+//! `just test e2e` puts the in-cluster Forgejo behind a cloudflared quick tunnel
 //! for that, and runs this file in a pass of its own. It is the
 //! one live tier that makes network calls.
 //!
@@ -45,7 +45,7 @@ fn forge_token_secrets() -> Vec<String> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs a seeded Forgejo behind a tunnel; run `just e2e`"]
+#[ignore = "needs a seeded Forgejo behind a tunnel; run `just test e2e`"]
 async fn a_private_repo_clones_with_the_forge_token_and_nothing_else_gets_it() {
     enter_tier();
     let base = base_url();

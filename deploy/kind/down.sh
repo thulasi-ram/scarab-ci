@@ -6,7 +6,7 @@
 #   deploy/kind/down.sh keep     uninstall the release and delete both
 #                                tunnels (dogfood's and e2e's); the cluster,
 #                                Postgres, MinIO and their PVCs stay, so the
-#                                next `just up` starts on the same data
+#                                next `just stack up` starts on the same data
 #
 # The generated dev secrets in deploy/kind/.state are kept either way, so a
 # kept database still decrypts with the same master key.

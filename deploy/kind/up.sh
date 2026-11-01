@@ -5,24 +5,24 @@
 #
 #   deploy/kind/up.sh [dev|dogfood|e2e|chaos]
 #
-#   dev      (`just up`)      dev-insecure, database `scarab`, bucket `scarab-logs`
-#   dogfood  (`just up dogfood`) GitHub App mode from ~/.config/scarab/dogfood.env,
+#   dev      (`just stack up`)      dev-insecure, database `scarab`, bucket `scarab-logs`
+#   dogfood  (`just stack up dogfood`) GitHub App mode from ~/.config/scarab/dogfood.env,
 #                             database `scarab_dogfood`, bucket `scarab-dogfood`,
 #                             and a cloudflared tunnel to the public hostname
-#   e2e      (`just e2e`)     dev-insecure, database `scarab_e2e`, bucket
+#   e2e      (`just test e2e`)     dev-insecure, database `scarab_e2e`, bucket
 #                             `scarab-e2e`, so test data never mixes with dev's;
 #                             a cloudflared quick tunnel in front of Forgejo only
 #                             when e2e.sh sets SCARAB_E2E_TUNNEL=1
-#   chaos    (`just chaos`)   dev-insecure, database `scarab_chaos`, bucket
+#   chaos    (`just test chaos`)   dev-insecure, database `scarab_chaos`, bucket
 #                             `scarab-chaos`, both reached through toxiproxy;
 #                             2 server replicas and 2 Depot replicas (ADR-0077)
 #
 # SCARAB_KIND_EXTRA_VALUES names one more Helm values file, applied last (for
-# example `just plugin-verify`'s plugin settings). It is not remembered:
-# `just reload` re-applies the mode without it.
+# example the plugin settings `just test e2e` adds). It is not remembered:
+# `just stack reload` re-applies the mode without it.
 #
 # Idempotent: re-running rebuilds the binary and rolls the Pods only when the
-# binary changed. `just reload` is the short path for that alone.
+# binary changed. `just stack reload` is the short path for that alone.
 #
 # What it does, in order:
 #   1. build scarab-server and scarab-wsfetch for Linux on the host
@@ -34,7 +34,7 @@
 #      a `scarab-dev` cluster that lacks them;
 #   4. build the runtime image and the step helper images and load them;
 #   5. apply Postgres, MinIO and Forgejo, create the mode's database; under
-#      `just e2e` (SCARAB_E2E_TUNNEL=1), start the Forgejo quick tunnel first
+#      `just test e2e` (SCARAB_E2E_TUNNEL=1), start the Forgejo quick tunnel first
 #      (Forgejo's ROOT_URL is its URL);
 #   6. helm upgrade --install the chart with deploy/kind/values.yaml plus the
 #      mode's values;
@@ -84,7 +84,7 @@ if [ "$mode" = dogfood ]; then
     [ -n "$(env_get "$dogfood_env" "$k")" ] || missing="$missing $k"
   done
   if [ -n "$missing" ]; then
-    die "just up dogfood needs the named Cloudflare tunnel: set$missing in $dogfood_env
+    die "just stack up dogfood needs the named Cloudflare tunnel: set$missing in $dogfood_env
   CLOUDFLARE_TUNNEL_TOKEN  the tunnel's token (Zero Trust > Networks > Tunnels)
   DOGFOOD_HOSTNAME         its public hostname, routed to http://scarab.scarab.svc.cluster.local:80"
   fi
@@ -226,7 +226,7 @@ if [ "$exists" = 1 ] && cluster_fits; then
   echo "==> reusing kind cluster '$cluster'"
   if [ "$(docker inspect -f '{{.State.Running}}' "$node")" != true ]; then
     echo "    its node container is stopped; starting it"
-    docker start "$node" >/dev/null || die "could not start the stopped node container $node ('just down' deletes the cluster)"
+    docker start "$node" >/dev/null || die "could not start the stopped node container $node ('just stack down' deletes the cluster)"
   fi
   kind export kubeconfig --name "$cluster" --kubeconfig "$kubeconfig" >/dev/null \
     || die "could not export the kubeconfig of kind cluster '$cluster'"
@@ -245,8 +245,8 @@ else
   if [ "$exists" = 1 ]; then
     [ "${SCARAB_KIND_RECREATE:-0}" = 1 ] || die "kind cluster '$cluster' does not fit: $misfit.
   Recreating it deletes its Postgres and MinIO data (both modes' databases and buckets).
-  Run 'just up' from the worktree or with the SCARAB_ADDR that created it, or
-  recreate it: SCARAB_KIND_RECREATE=1 just up   (or 'just down' first)"
+  Run 'just stack up' from the worktree or with the SCARAB_ADDR that created it, or
+  recreate it: SCARAB_KIND_RECREATE=1 just stack up   (or 'just stack down' first)"
     echo "==> SCARAB_KIND_RECREATE=1: deleting kind cluster '$cluster' ($misfit)"
     kind delete cluster --name "$cluster" --kubeconfig "$kubeconfig"
   fi
@@ -356,14 +356,13 @@ else
   kc delete -n "$ns" -f "$here/toxiproxy.yaml" --ignore-not-found >/dev/null
 fi
 
-# Forgejo, in every mode. `just e2e` (e2e.sh, which sets SCARAB_E2E_TUNNEL=1
+# Forgejo, in every mode. `just test e2e` (e2e.sh, which sets SCARAB_E2E_TUNNEL=1
 # and deletes the tunnel on exit) also puts a cloudflared quick tunnel in
 # front of it: Forgejo builds clone URLs and payload links from ROOT_URL, so
 # ROOT_URL must be the tunnel's https URL, which is known only once
 # cloudflared has registered. Each tunnel Pod gets a new URL, so every e2e run
-# starts a new one. Nothing else opens it: e2e mode without the flag (by hand,
-# or `just plugin-verify`) runs without a tunnel, and every run deletes one an
-# earlier run left.
+# starts a new one. Nothing else opens it: e2e mode without the flag (by hand)
+# runs without a tunnel, and every run deletes one an earlier run left.
 # A random admin password and hook secret per stack, kept in .state (mode 600).
 for f in forgejo-admin-password forgejo-webhook-secret; do
   [ -s "$state/$f" ] || ( umask 077; head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$state/$f" )
@@ -461,7 +460,7 @@ chmod 600 "$values"
 # The clone library (ADR-0076 §9): checkouts run `lib:thulasi-ram/clone` with
 # the image it pins, so the release gets a manifest listing a copy of
 # libs/clone.yaml that pins the scarab-clone:dev image built above.
-# `just up dogfood` installs that copy into the org after the roll-out.
+# `just stack up dogfood` installs that copy into the org after the roll-out.
 python3 -I - "$root/libs/clone.yaml" scarab-clone:dev > "$libs_dir/clone.yaml" <<'PY'
 import re, sys
 text = open(sys.argv[1]).read()
@@ -609,7 +608,7 @@ if [ "$mode" = dogfood ]; then
   / answered HTTP $root_code and /v1/repos HTTP $api_code; both must be Cloudflare's 404.
   This stack is dev-insecure, so a public UI or API makes every visitor an Owner.
   In the Cloudflare dashboard, set the tunnel's public hostname Path to ^/webhooks/
-  (the catch-all rule then answers 404), and rerun 'just up dogfood'.
+  (the catch-all rule then answers 404), and rerun 'just stack up dogfood'.
   The UI and API stay on $base. (000 or 5xx means the check could not reach the tunnel.)"
   fi
   tunnel_unchecked=0
@@ -686,8 +685,8 @@ for i in json.load(sys.stdin).get("installations", []):
 fi
 
 echo "==> up: $base (mode: $mode)"
-echo "    server log:  just logs          Depot: just workspace-status"
-echo "    pipelines:   just demo, just demo-chain"
+echo "    server log:  just stack logs     Depot: just stack logs depot, just stack status"
+echo "    pipelines:   just stack demo, just stack demo chain"
 if [ "$mode" = dogfood ]; then
   echo "    GitHub webhooks: https://\$DOGFOOD_HOSTNAME/webhooks/github (only /webhooks/ is public)"
 fi

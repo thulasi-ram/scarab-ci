@@ -13,7 +13,7 @@
 #             is the runtime's small /tmp), and it has no shell — a Plugin Pod
 #             has nothing in it but the plugin binary.
 #   `fake`    — the fake Argo CD API server (`fake-argocd`) that
-#             `just plugin-verify` and the contract test drive. Test tooling:
+#             the contract test and `just test e2e` drive. Test tooling:
 #             never installed as a Plugin, never pushed with the plugin image.
 #
 #   docker build -f docker/plugin-argocd/Dockerfile -t scarab-plugin-argocd .

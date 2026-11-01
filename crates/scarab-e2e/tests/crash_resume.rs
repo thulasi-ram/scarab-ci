@@ -6,7 +6,7 @@
 //! never re-executed (no second `AttemptStarted` per step), and the run makes
 //! exactly one terminal transition.
 //!
-//! The server under test is the release's own server Pod (`just e2e` runs the
+//! The server under test is the release's own server Pod (`just test e2e` runs the
 //! release in its e2e mode, with its own database and bucket). In the Pod the
 //! server is PID 1 with no init, and a signal sent from inside its PID
 //! namespace that it has no handler for is dropped. So the SIGKILL comes from

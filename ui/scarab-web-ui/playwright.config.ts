@@ -17,7 +17,7 @@ export default defineConfig({
   },
   projects: [{ name: "chromium", use: { ...devices["Desktop Chrome"] } }],
   webServer: {
-    // The mock-mode Vite dev server — same entry `just ui-mock` uses. A pinned
+    // The mock-mode Vite dev server — same entry `just ui mock` uses. A pinned
     // strict port so a stray dev server on 5173 never gets picked up silently.
     command: `npm run dev:mock -- --port ${PORT} --strictPort`,
     url: `http://localhost:${PORT}`,

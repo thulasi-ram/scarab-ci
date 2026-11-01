@@ -13,7 +13,7 @@ import "@fontsource/jetbrains-mono/400.css";
 import "@fontsource/jetbrains-mono/500.css";
 import "./styles.css";
 
-// Fixture/demo mode (`just ui-mock`): VITE_SCARAB_MOCK=1 serves an "acme" org
+// Fixture/demo mode (`just ui mock`): VITE_SCARAB_MOCK=1 serves an "acme" org
 // with no server — quick UI eyeballing + the docs screenshots. Install BEFORE
 // importing App: the api client (openapi-fetch) binds globalThis.fetch when
 // its module is first evaluated, so the fetch/EventSource patch must be in

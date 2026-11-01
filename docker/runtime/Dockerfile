@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 #
-# scarab-runtime: the image `just up` runs scarab-server in (ADR-0077,
+# scarab-runtime: the image `just stack up` runs scarab-server in (ADR-0077,
 # Amendment 2026-11-01). It holds no Scarab binary. The binary is built on the
 # host (cargo-zigbuild on macOS, cargo on Linux) and mounted as a directory:
 # kind `extraMounts` puts deploy/kind/.mount on the node, a hostPath volume

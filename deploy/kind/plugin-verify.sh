@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# `just plugin-verify` — the first-party Argo CD Plugin on a REAL cluster
-# (ADR-0072), on the kind release in its e2e mode:
+# The Argo CD plugin pass of `just test e2e` (deploy/kind/e2e.sh runs it): the
+# first-party Argo CD Plugin on a REAL cluster (ADR-0072), on the kind release
+# in its e2e mode, which e2e.sh brought up with plugins on and the dev tag knob:
 #
-#   build the plugin image → kind load → the release with plugins on and the
-#   dev tag knob → a fake Argo CD on the host (the broker, in the server Pod,
-#   reads it at the host address a Pod reaches) → install the plugin through
-#   the API → bind its connection → wait for the isolation probe and the Pod →
+#   build the plugin image → kind load → a fake Argo CD on the host (the
+#   broker, in the server Pod, reads it at the host address a Pod reaches) →
+#   install the plugin through the API → bind its connection → wait for the
+#   isolation probe and the Pod →
 #   wait until the Pod has read Argo CD through the broker's read proxy (its
 #   standby check) → kill switch: the broker answers 403 and the workload is
 #   scaled to zero.
@@ -19,10 +20,9 @@
 # ingest, an Environment's Deployments or a DeploymentGate.
 #
 # Idempotent: every run installs a NEW installation (names are never reused in
-# an org). The release stays up in e2e mode with plugins on; `just up` switches
-# it back to dev. e2e mode here has no Forgejo quick tunnel (up.sh opens it
-# only for `just e2e`, and deletes one a run left). The fake Argo CD is stopped
-# on exit unless KEEP=1.
+# an org). It runs as its own process, so its EXIT trap (below) stops the fake
+# Argo CD and the broker port-forward however the pass ends, and e2e.sh's
+# trap is not replaced.
 #
 # Every cluster command goes through kc (deploy/kind/lib.sh): the stack's own
 # kubeconfig, checked against the kind cluster before each call.
@@ -37,9 +37,9 @@ root="$(cd "$here/../.." && pwd)"
 . "$here/test-env.sh"
 
 org="${PLUGIN_VERIFY_ORG:-acme}"
-repo="scarab.local/scarab-plugin-argocd"
+# The repository e2e.sh allowed in the release's values (plugins.argocdRepo).
+repo="${PLUGIN_VERIFY_REPO:-scarab.local/scarab-plugin-argocd}"
 image="$repo:verify"
-keep="${KEEP:-0}"
 state="$here/.state"
 
 need docker; need kind; need kubectl; need curl; need python3; need cargo
@@ -50,6 +50,10 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 # JSON helpers: `jq`-free, python3 is already a dev-stack requirement.
 json() { python3 -I -c "import json,sys; d=json.load(sys.stdin); print(eval(sys.argv[1], {'d': d}))" "$1"; }
 
+# The release e2e.sh brought up, plugins on.
+[ "$(cat "$state/mode" 2>/dev/null || true)" = e2e ] \
+  || fail "the release is not in e2e mode; run this through \`just test e2e\`"
+
 # --- 1. images + host binaries ------------------------------------------------
 step "building the plugin image ($image)"
 docker build -q -f "$root/docker/plugin-argocd/Dockerfile" -t "$image" "$root" >/dev/null
@@ -57,15 +61,7 @@ step "building the fake Argo CD (host)"
 ( cd "$root" && cargo build -q -p scarab-plugin-argocd --features fake --bin fake-argocd )
 target_dir="$(cargo_target_dir)"
 
-# --- 2. the release, plugins on -----------------------------------------------
-mkdir -p "$state"
-values="$state/plugin-verify-values.json"
-# kind images have no repository digest: the dev-only tag knob (owner default 8).
-cat > "$values" <<EOF
-{"plugins": {"enabled": true, "argocdRepo": "$repo"},
- "scarab": {"extraEnv": {"SCARAB_DEV_PLUGIN_ALLOW_TAG": "1"}}}
-EOF
-SCARAB_KIND_EXTRA_VALUES="$values" bash "$here/up.sh" e2e
+# --- 2. the release ------------------------------------------------------------
 scarab_addr
 api="$base"
 plugins_ns=scarab-plugins
@@ -75,8 +71,10 @@ load_image "$image"
 
 # --- 3. the fake Argo CD on the host -----------------------------------------
 # The broker runs in the server Pod, so it reaches the fake at the host
-# address a Pod uses; the fake binds 0.0.0.0 for that.
-probe_pod_host
+# address a Pod uses; the fake binds 0.0.0.0 for that. e2e.sh has probed it
+# already.
+pod_host="${SCARAB_E2E_POD_HOST:-}"
+[ -n "$pod_host" ] || probe_pod_host
 fake_port="${PLUGIN_VERIFY_FAKE_PORT:-$(free_port)}"
 fake_pid_file="$state/fake-argocd.pid"
 if [ -f "$fake_pid_file" ]; then
@@ -87,6 +85,30 @@ fi
 if (exec 3<>"/dev/tcp/127.0.0.1/$fake_port") 2>/dev/null; then
   fail "127.0.0.1:$fake_port is taken by something else (set PLUGIN_VERIFY_FAKE_PORT)"
 fi
+# Set before the fake starts, so no exit path leaves it serving on 0.0.0.0.
+# The fake is stopped first; the cluster calls run in subshells, because kc
+# exits when the cluster is gone and that must not skip the rest.
+cleanup() {
+  local code=$?
+  if [ -f "$fake_pid_file" ]; then
+    kill "$(cat "$fake_pid_file")" 2>/dev/null || true
+    rm -f "$fake_pid_file"
+  fi
+  stop_forwards
+  if [ "$code" -ne 0 ]; then
+    echo "---- tail of the server log ----" >&2
+    ( kc logs -n "$ns" deploy/"$release" --tail=60 >&2 ) || true
+    if [ -n "${id:-}" ]; then
+      echo "---- plugin Pod (plugin-$id) ----" >&2
+      ( kc -n "$plugins_ns" get pods -l "scarab.io/plugin-installation=$id" -o wide >&2 ) || true
+      ( kc -n "$plugins_ns" logs "deploy/plugin-$id" --all-containers --tail=60 >&2 ) || true
+    fi
+  fi
+  exit "$code"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 argo_token="verify-$(date +%s)-$RANDOM"
 FAKE_ARGOCD_TOKEN="$argo_token" nohup "$target_dir/debug/fake-argocd" --addr "0.0.0.0:$fake_port" \
   > "$state/fake-argocd.log" 2>&1 &
@@ -94,24 +116,6 @@ echo $! > "$fake_pid_file"
 # The broker's port, for the whoami checks from the host.
 forward "$release-broker" 8090
 broker="http://127.0.0.1:$fwd_port"
-cleanup() {
-  code=$?
-  stop_forwards
-  if [ "$code" -ne 0 ]; then
-    echo "---- tail of the server log ----" >&2; kc logs -n "$ns" deploy/"$release" --tail=60 >&2 || true
-    if [ -n "${id:-}" ]; then
-      echo "---- plugin Pod (plugin-$id) ----" >&2
-      kc -n "$plugins_ns" get pods -l "scarab.io/plugin-installation=$id" -o wide >&2 || true
-      kc -n "$plugins_ns" logs "deploy/plugin-$id" --all-containers --tail=60 >&2 || true
-    fi
-  fi
-  if [ "$keep" != 1 ] && [ -f "$fake_pid_file" ]; then
-    kill "$(cat "$fake_pid_file")" 2>/dev/null || true
-    rm -f "$fake_pid_file"
-  fi
-  exit "$code"
-}
-trap cleanup EXIT
 fake="http://127.0.0.1:$fake_port"
 for _ in $(seq 1 30); do curl -sf "$fake/_fake/healthz" >/dev/null && break; sleep 0.5; done
 curl -sf "$fake/_fake/healthz" >/dev/null || fail "the fake Argo CD did not start (see $state/fake-argocd.log)"
@@ -189,5 +193,4 @@ for i in $(seq 1 60); do
 done
 echo "    ok: plugin-$id scaled to 0"
 
-echo "==> plugin-verify PASSED ($org/$name, installation $id)"
-echo "    the release stays in e2e mode with plugins on ('just up' switches back); the killed installation stays recorded"
+echo "==> plugin-argocd PASSED ($org/$name, installation $id; the killed installation stays recorded)"

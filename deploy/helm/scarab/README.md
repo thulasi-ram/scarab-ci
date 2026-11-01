@@ -198,7 +198,7 @@ Helm values.
 **This covers the credential only.** Which installations and repos exist is
 separate durable state, registered by the App's `installation` /
 `installation_repositories` webhook deliveries (or, for the local dogfood stack,
-the signed synthetic `installation` event `just up dogfood` sends). A fresh database still needs one delivery.
+the signed synthetic `installation` event `just stack up dogfood` sends). A fresh database still needs one delivery.
 
 ## Declarative connections (`scarab.connections`, ADR-0060 part D)
 

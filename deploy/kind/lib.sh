@@ -76,8 +76,8 @@ env_get() {
 
 # scarab_addr: the host address the stack answers on. SCARAB_ADDR from
 # deploy/kind/.env (.env.example when there is none), the one dev env file
-# `just ui` also reads. Normalised here for up.sh and the Justfile's demo
-# recipes alike: a trailing comment, quotes and blanks are dropped; `localhost`
+# `just ui` also reads. Normalised here for up.sh and `just stack demo`
+# alike: a trailing comment, quotes and blanks are dropped; `localhost`
 # and an empty host mean 127.0.0.1; a missing port means 8080, and a bare
 # number is a port. Sets addr_file, host_ip, host_port and base (the URL to
 # call; 0.0.0.0 is called through 127.0.0.1).
@@ -109,8 +109,8 @@ api_url() { # the API server URL docker publishes for this cluster's node
 }
 verify_kubeconfig() {
   local want got
-  [ -f "$kubeconfig" ] || die "no kubeconfig at $kubeconfig (is the stack up? 'just up')"
-  want="$(api_url)" || die "kind cluster '$cluster' is not running ('just up')"
+  [ -f "$kubeconfig" ] || die "no kubeconfig at $kubeconfig (is the stack up? 'just stack up')"
+  want="$(api_url)" || die "kind cluster '$cluster' is not running ('just stack up')"
   got="$(KUBECONFIG="$kubeconfig" kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')"
   [ "$got" = "$want" ] || die "refusing: $kubeconfig points at '$got', not this kind cluster ($want)"
 }

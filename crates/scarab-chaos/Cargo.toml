@@ -1,6 +1,6 @@
 # The fault tier's harness (ADR-0077 §2, §3): a seeded nemesis, scenario files
 # that replay, and the invariant checker, as a library and the `scarab-chaos`
-# binary. `just chaos` (deploy/kind/chaos.sh) drives it against the kind
+# binary. `just test chaos` (deploy/kind/chaos.sh) drives it against the kind
 # release in its chaos mode. The checker reads Postgres, the bucket and the
 # kube API directly; it does not take the API's word for success.
 #

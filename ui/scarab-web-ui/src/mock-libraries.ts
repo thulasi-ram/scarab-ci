@@ -1,4 +1,4 @@
-// ADR-0076 fixtures for mock mode (`just ui-mock`): libraries with every
+// ADR-0076 fixtures for mock mode (`just ui mock`): libraries with every
 // badge, a yank's impact, an upgrade to review, Runs whose Steps come from
 // libraries (one with a yanked version), a plugin gate in each of its four
 // states, a Pipeline that does not compile, and refused triggers in the Runs

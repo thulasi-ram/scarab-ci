@@ -50,7 +50,7 @@ scarab:
   # The first-party library release manifest (ADR-0076 §5), as JSON text.
   # Empty => the server reads `libs-manifest.json` from its own version's
   # GitHub release. Set it for an air-gapped install, or for a build whose
-  # first-party libraries are not released (`just up` writes one that lists a
+  # first-party libraries are not released (`just stack up` writes one that lists a
   # clone library pinning the locally built scarab-clone image).
   # The checkout image is the one `lib:thulasi-ram/clone` pins; to use a
   # mirror, install a library version that pins the mirror's image.
@@ -536,7 +536,7 @@ service:
   port: 80
   targetPort: 8080
   # A fixed node port, used only when type is NodePort. Empty => Kubernetes
-  # picks one. `just up` fixes it so a kind port mapping can point at it.
+  # picks one. `just stack up` fixes it so a kind port mapping can point at it.
   nodePort: ""
   annotations: {}
 
@@ -588,7 +588,7 @@ securityContext:
 
 # Override the server container's entrypoint and arguments. Empty => the
 # image's ENTRYPOINT. The role comes from scarab.role either way (SCARAB_ROLE).
-# `just up` uses this to run a binary built on the host from a hostPath volume:
+# `just stack up` uses this to run a binary built on the host from a hostPath volume:
 #   command: ["/opt/scarab/bin/scarab-server"]
 command: []
 args: []
