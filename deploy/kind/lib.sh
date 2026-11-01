@@ -16,10 +16,17 @@ kubeconfig="$kind_dir/.kubeconfig"
 die() { echo "error: $*" >&2; exit 1; }
 
 # env_get FILE KEY: the value of KEY's last line in an env file, read without
-# sourcing it. The value is everything after the FIRST '=' (base64 keeps its
-# '='), with a trailing CR removed.
+# sourcing it (values are never printed). The value is everything after the
+# FIRST '=' (base64 keeps its '='). A leading `export `, a trailing CR and one
+# pair of surrounding quotes are dropped.
 env_get() {
-  sed -n "s/^$2=//p" "$1" | tail -n 1 | tr -d '\r'
+  local v
+  v="$(sed -n -E "s/^[[:space:]]*(export[[:space:]]+)?$2=//p" "$1" | tail -n 1 | tr -d '\r')"
+  case "$v" in
+    \"*\") v="${v#\"}"; v="${v%\"}" ;;
+    \'*\') v="${v#\'}"; v="${v%\'}" ;;
+  esac
+  printf '%s\n' "$v"
 }
 
 # scarab_addr: the host address the stack answers on. SCARAB_ADDR from

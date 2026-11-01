@@ -72,9 +72,16 @@ if [ "$mode" = dogfood ]; then
   CLOUDFLARE_TUNNEL_TOKEN  the tunnel's token (Zero Trust > Networks > Tunnels)
   DOGFOOD_HOSTNAME         its public hostname, routed to http://scarab.scarab.svc.cluster.local:80"
   fi
-  for k in SCARAB_GITHUB_APP_ID SCARAB_APP_PEM SCARAB_GITHUB_WEBHOOK_SECRET SCARAB_MASTER_KEY SCARAB_RESULTS_TOKEN_SECRET; do
+  for k in SCARAB_GITHUB_APP_ID SCARAB_APP_PEM SCARAB_GITHUB_WEBHOOK_SECRET SCARAB_MASTER_KEY SCARAB_RESULTS_TOKEN_SECRET SCARAB_ORG; do
     [ -n "$(env_get "$dogfood_env" "$k")" ] || die "$k is empty or missing in $dogfood_env"
   done
+  # A bare host name: it becomes https://<it> in publicUrl and the probes.
+  dogfood_host="$(env_get "$dogfood_env" DOGFOOD_HOSTNAME)"
+  dogfood_host="${dogfood_host#https://}"
+  dogfood_host="${dogfood_host#http://}"
+  case "$dogfood_host" in
+    ''|*[!A-Za-z0-9.-]*) die "DOGFOOD_HOSTNAME in $dogfood_env must be a bare host name such as ci.example.com (no spaces, path or slash)" ;;
+  esac
   pem="$(env_get "$dogfood_env" SCARAB_APP_PEM)"
   [ -f "$pem" ] || die "SCARAB_APP_PEM in $dogfood_env names a file that does not exist"
   database=scarab_dogfood
@@ -377,39 +384,49 @@ python3 -I "$root/scripts/libs_manifest.py" --libs "$libs_dir" \
 # sees a new Pod template annotation. The server checks for ui/index.html at
 # start, so a UI staged after the Pod started needs a roll too.
 binary_sum="$({ cat "$mount/bin/scarab-server"; cat "$mount/ui/index.html" 2>/dev/null || true; } | shasum -a 256 | cut -c1-16)"
-{
-  echo "podAnnotations:"
-  echo "  scarab.dev/binary-sha256: \"$binary_sum\""
-  echo "scarab:"
-  echo "  s3:"
-  echo "    bucket: \"$bucket\""
-  echo "  libsManifest: |"
-  sed 's/^/    /' "$libs_dir/manifest.json"
-  if [ "$mode" = dogfood ]; then
-    # Dev-insecure, as the colima dogfood ran (deploy/local-helm/.env): no
-    # login, every caller is an Owner. The tunnel makes that public; put a
-    # Cloudflare Access policy on the hostname, or set
-    # SCARAB_DOGFOOD_DEV_INSECURE=false once OAuth values are added here.
-    echo "  devInsecure: ${SCARAB_DOGFOOD_DEV_INSECURE:-true}"
-    echo "  githubAppId: \"$(env_get "$dogfood_env" SCARAB_GITHUB_APP_ID)\""
-    echo "  publicUrl: \"https://$(env_get "$dogfood_env" DOGFOOD_HOSTNAME)\""
-    timeout="$(env_get "$dogfood_env" SCARAB_STEP_TIMEOUT_SECS)"
-    echo "  stepTimeoutSecs: \"${timeout:-3600}\""
-  else
-    echo "  devInsecure: true"
-  fi
-  echo "secrets:"
-  echo "  databaseUrl: \"$database_url\""
-  echo "  masterKey: \"$master_key\""
-  echo "  resultsTokenSecret: \"$results_secret\""
-  echo "  workspaceTokenSecret: \"$workspace_secret\""
-  if [ "$mode" = dogfood ]; then
-    echo "  githubWebhookSecret: \"$webhook_secret\""
-    echo "  githubAppPemSecret:"
-    echo "    name: scarab-github-app"
-    echo "    key: github-app.pem"
-  fi
-} > "$values"
+if [ "$mode" = dogfood ]; then
+  # Dev-insecure, as the colima dogfood ran (deploy/local-helm/.env): no
+  # login, every caller is an Owner. The tunnel makes that public; put a
+  # Cloudflare Access policy on the hostname, or set
+  # SCARAB_DOGFOOD_DEV_INSECURE=false once OAuth values are added here.
+  dev_insecure="${SCARAB_DOGFOOD_DEV_INSECURE:-true}"
+  app_id="$(env_get "$dogfood_env" SCARAB_GITHUB_APP_ID)"
+  timeout="$(env_get "$dogfood_env" SCARAB_STEP_TIMEOUT_SECS)"
+else
+  dev_insecure=true; app_id=""; timeout=""
+fi
+# Written as JSON (valid YAML) by python, never spliced into YAML text: a
+# secret with a quote, a backslash or a '#' stays the same bytes. The values
+# reach python through its environment, not argv, so they never show in `ps`.
+V_MODE="$mode" V_SUM="$binary_sum" V_BUCKET="$bucket" V_DEV_INSECURE="$dev_insecure" \
+V_APP_ID="$app_id" V_PUBLIC_URL="https://${dogfood_host:-}" V_TIMEOUT="${timeout:-3600}" \
+V_DATABASE_URL="$database_url" V_MASTER_KEY="$master_key" V_RESULTS="$results_secret" \
+V_WORKSPACE="$workspace_secret" V_WEBHOOK="$webhook_secret" \
+python3 -I - "$libs_dir/manifest.json" > "$values" <<'PY2'
+import json, os, sys
+e = os.environ
+if e["V_DEV_INSECURE"] not in ("true", "false"):
+    sys.exit("SCARAB_DOGFOOD_DEV_INSECURE must be true or false")
+v = {
+    "podAnnotations": {"scarab.dev/binary-sha256": e["V_SUM"]},
+    "scarab": {
+        "s3": {"bucket": e["V_BUCKET"]},
+        "libsManifest": open(sys.argv[1]).read(),
+        "devInsecure": e["V_DEV_INSECURE"] == "true",
+    },
+    "secrets": {
+        "databaseUrl": e["V_DATABASE_URL"],
+        "masterKey": e["V_MASTER_KEY"],
+        "resultsTokenSecret": e["V_RESULTS"],
+        "workspaceTokenSecret": e["V_WORKSPACE"],
+    },
+}
+if e["V_MODE"] == "dogfood":
+    v["scarab"].update(githubAppId=e["V_APP_ID"], publicUrl=e["V_PUBLIC_URL"], stepTimeoutSecs=e["V_TIMEOUT"])
+    v["secrets"].update(githubWebhookSecret=e["V_WEBHOOK"],
+                        githubAppPemSecret={"name": "scarab-github-app", "key": "github-app.pem"})
+json.dump(v, sys.stdout, indent=1)
+PY2
 
 if [ "$mode" = dogfood ]; then
   echo "==> GitHub App PEM secret, cloudflared"
@@ -510,7 +527,7 @@ echo "    server log:  just logs          Depot: just workspace-status"
 echo "    pipelines:   just demo, just demo-chain"
 if [ "$mode" = dogfood ]; then
   # Checked, not printed: values from dogfood.env stay out of terminal logs.
-  public="https://$(env_get "$dogfood_env" DOGFOOD_HOSTNAME)"
+  public="https://$dogfood_host"
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$public/readyz" || true)"
   echo "    public URL:  https://\$DOGFOOD_HOSTNAME from $dogfood_env (/readyz -> HTTP $code)"
   [ "$code" = 200 ] || echo "    (not 200: check the tunnel's Public Hostname route in the Cloudflare dashboard;" \

@@ -114,6 +114,13 @@ GitHub through a named Cloudflare tunnel. It reads
 | `SCARAB_STEP_TIMEOUT_SECS` | default step deadline |
 | `CLOUDFLARE_TUNNEL_TOKEN`, `DOGFOOD_HOSTNAME` | the tunnel; `just dogfood` refuses without them |
 
+Each line is `KEY=value`; a leading `export `, CRLF line endings and one pair
+of quotes around the value are accepted, and nothing else is interpreted.
+`SCARAB_ORG` is required. `DOGFOOD_HOSTNAME` is a bare host name
+(`https://` is dropped; a space or a path is refused). Secret values go into
+the release as JSON-escaped Helm values, so quotes, backslashes and `#` are
+kept as they are.
+
 `cloudflared.yaml` runs cloudflared in token mode, so the route lives in the
 Cloudflare Zero Trust dashboard: the tunnel's public hostname must point at
 `http://scarab.scarab.svc.cluster.local:80`. `publicUrl` is
