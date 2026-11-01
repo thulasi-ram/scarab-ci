@@ -78,3 +78,5 @@ __pycache__/
 /deploy/kind/.kubeconfig
 /deploy/kind/.state/
 /deploy/kind/.mount/
+# `just chaos` scenario files, Pod records and verdicts (deploy/kind/chaos.sh).
+/deploy/kind/.chaos/

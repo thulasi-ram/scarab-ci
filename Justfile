@@ -285,6 +285,17 @@ coverage:
 e2e filter="":
     bash deploy/kind/e2e.sh "{{filter}}"
 
+# ADR-0077 rank 1 on the kind release: switch it to chaos mode (database
+# `scarab_chaos` and bucket `scarab-chaos` through toxiproxy, 2 servers, 2
+# Depot replicas), run three chained Runs, delete one Depot Pod with grace 0
+# mid-drain and then mid-feed, and check the invariants (crates/scarab-chaos).
+# Switches back to the mode that was active before (dev or dogfood; else dev)
+# and runs `just demo` there. Scenario files land in deploy/kind/.chaos (or
+# $SCARAB_CHAOS_DIR). Exit 1 means a verdict failed. See deploy/kind/chaos.sh.
+# Usage: `just chaos` | `just chaos mid-feed 7` | `just chaos replay <scenario.json>`.
+chaos what="all" seed="1":
+    bash deploy/kind/chaos.sh "{{what}}" "{{seed}}"
+
 # LIVE plugin-runtime tier alone (`crates/scarab-plugin-k8s/tests/cluster.rs`,
 # ADR-0072 §9/§11): the isolation probe passes on kind and FAILS once the egress
 # policies are gone; the namespace baseline refuses a non-`restricted` namespace
