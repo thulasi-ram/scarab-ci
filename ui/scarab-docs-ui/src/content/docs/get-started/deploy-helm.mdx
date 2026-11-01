@@ -89,20 +89,31 @@ administer (`?org=<org>` narrows it to one).
 
 - **An org's first connection** is created by a global admin, under **Settings › Server
   administration › Connect a forge** (`/settings/server/connect-forge`), or with
-  `POST /v1/connections` and an `org` field. After that, the org's own admins can add more. An
-  org name is not empty, is at most 100 characters, has no `/` or spaces, and does not start
-  with `_`; the server answers 400 otherwise.
-- **A GitHub App installation** registers itself from its `installation` webhook. It is assigned
-  the org named like the account the App is installed on when two things hold: every repository
-  already bound through it is owned by that account, and the org either does not exist yet or
-  is served only by GitHub connections to the same host. An org that exists with no connection
-  left is not joined by name. Otherwise the connection stays unassigned and binds none of the
+  `POST /v1/connections` and an `org` field. After that, the org's own admins can add more.
+- **An org name** is not empty, is at most 100 characters, and has no `/`, spaces or control
+  characters. It is not `.` or `..`, does not start with `_` (those names are Scarab's own), and
+  is not one of `settings`, `orgs`, `account` or `security`: a project's page is
+  `/<org>/<repository>`, and those are the first part of other web UI addresses. The server
+  answers 400 otherwise, and a `connections:` entry with such an `org:` fails the boot.
+- **A GitHub App installation** registers itself from its `installation` webhook, which also
+  records the account's GitHub id. It is assigned the org named like the account the App is
+  installed on when two things hold: every repository already bound through it is owned by that
+  account, and the org either does not exist yet or is already served by a GitHub connection to
+  the same host with the same account id. A login can be renamed and then registered by another
+  account, so a login alone does not join an org. An org exists once anything is kept for it:
+  members, an API token, a secret, an Environment, a Policy, a Plugin or a library, as well as a
+  connection or a repository. Otherwise the connection stays unassigned and binds none of the
   delivery's repositories. Once it serves an org, it mints tokens only from its own
   installation, and only for repositories that org owns.
 - **A connection declared in `scarab.connections`** names its org with `org:`. Without `org:`,
   the org is the one owner of its `repos:`. A repository of another owner, repositories of
   several owners without `org:`, no repositories and no `org:`, or a repository already bound
-  through another connection that serves an org fail the boot:
+  through another connection that serves an org fail the boot. So does an `org:` that differs
+  from the org the connection already serves, a change of case included; to move a connection
+  to another org, remove it from the config, unbind its repositories, and add it again. In
+  GitHub App mode a `kind: github` entry needs `installation_id:` (the installation it is),
+  unless its id is `github-install-<id>`; the boot is refused without it, because the
+  connection would otherwise list the repositories of every installation of the App:
 
   ```yaml
   scarab:
@@ -113,11 +124,22 @@ administer (`?org=<org>` narrows it to one).
         base_url: https://git.example.com
         credential: { env: FORGEJO_CI_TOKEN }
         repos: [acme/widgets]
+      - id: github-acme
+        kind: github
+        org: acme
+        installation_id: 12345678
+        base_url: https://api.github.com
+        credential: { secret_ref: github-app }
   ```
 
-A connection with no org (for example one created before connections had an org, whose
-repositories have several owners) is shown only to global admins, and its repositories keep
-working. Nothing assigns it an org as a side effect: opening Add repository, a re-sync or a bind
+A connection with no org is shown only to global admins, and its repositories keep working.
+After an upgrade from a release before connections had an org, these are the connections whose
+repositories have several owners or none, and **every GitHub App installation connection**: the
+database does not hold an installation's account, and an earlier re-sync could bind another
+installation's repositories to it. An unassigned installation connection keeps looking up each
+repository's installation, so its repositories keep getting tokens. Its next `installation`
+delivery assigns it when the rules above allow it; for an org that existed before the upgrade
+they do not (no connection has an account id yet), so a global admin assigns it. Nothing assigns it an org as a side effect: opening Add repository, a re-sync or a bind
 leaves it unassigned. A re-sync through it binds nothing and lists every repository the forge
 reports in `skipped`, so the UI does not offer Re-sync on it.
 
@@ -129,10 +151,13 @@ connection, or when the connection is managed by configuration. Anyone other tha
 an API token included, gets 403.
 
 To split a connection whose repositories have several owners, add a connection for each org and
-bind or re-sync the repositories through it. A repository moves only off a connection with no
-org; one bound through a connection that serves an org stays there, even when you bind it through
-another connection of the same org (409 on Add repository, `skipped` on re-sync). Unbind it from
-the connection that holds it first. When every repository has moved, remove the old connection.
+bind or re-sync the repositories through it. A repository moves only off a connection that does
+not serve its owner (one with no org, or one of another org); one bound through a connection of
+its own org stays there, even when you bind it through another connection of the same org (409
+on Add repository, `skipped` on re-sync). Unbind it from the connection that holds it first.
+When every repository has moved, remove the old connection. Removing a connection that still
+holds a repository of another org is refused (409, naming it): that org re-syncs or adds it on
+its own connection first.
 
 ## Settings
 
