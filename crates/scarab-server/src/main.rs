@@ -689,6 +689,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 cpu_millis: ws.helper_cpu_millis,
                                 memory_mib: ws.helper_memory_mib,
                             },
+                            // Each Cache's home Depot replica (git-bug 12e2f6b).
+                            cache_home: ws.cache_home.clone(),
                         });
                         // The drain's read-back half (ADR-0067): the Pod's
                         // helper drains straight into packs on the Depot; the
@@ -894,6 +896,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             cpu_millis: ws.helper_cpu_millis,
                             memory_mib: ws.helper_memory_mib,
                         },
+                        // A debug Pod restores no Cache.
+                        cache_home: None,
                     });
                 }
                 let exec = Arc::new(exec);

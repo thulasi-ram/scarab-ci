@@ -12,6 +12,7 @@
 /// by the workspace service. Mint and verify live in ONE module on purpose —
 /// the results token's message format is duplicated across two crates and that
 /// is a standing drift hazard, not a pattern to copy.
+pub mod cache_home;
 pub mod workspace_token;
 
 use async_trait::async_trait;
@@ -93,6 +94,21 @@ pub struct WorkspaceFetch {
     /// drain whole-reads each file, so a SINGLE output file approaching the
     /// limit needs the knob raised.
     pub helper_resources: scarab_pipeline::Resources,
+    /// Each Cache's home Depot replica (git-bug 12e2f6b). `None` (one Depot
+    /// replica, or no per-replica address configured) = caches use `url` like
+    /// everything else.
+    pub cache_home: Option<cache_home::CacheHome>,
+}
+
+impl WorkspaceFetch {
+    /// The Step's Cache home URL, when its cache key resolved and the Depot
+    /// has more than one replica. Restore hints come from the same key the
+    /// drain saves under, so a save and a later restore of that key ask the
+    /// same replica.
+    fn cache_home_url(&self, spec: &StepSpec) -> Option<String> {
+        let key = spec.cache.as_ref()?.key.as_ref()?;
+        self.cache_home.as_ref()?.url_for(key)
+    }
 }
 
 /// Configuration for the trusted per-Pod results-egress sidecar (ADR-0042). When
@@ -3563,6 +3579,7 @@ impl DebugLauncher for K8sExecutor {
                 fetch,
                 &roots,
                 &[],
+                None,
                 &ws_mount,
                 // A debug Pod has no per-step timeout; the operator default
                 // sizes its fetch retry window like a timeout-less step's.
@@ -3894,6 +3911,7 @@ fn workspace_fetch_container(
     fetch: &WorkspaceFetch,
     roots: &[String],
     cache_restore: &[(String, String)],
+    cache_home_url: Option<&str>,
     ws_mount: &VolumeMount,
     step_timeout_secs: u32,
 ) -> Container {
@@ -3946,6 +3964,10 @@ fn workspace_fetch_container(
             .map(|(dir, root)| format!("{dir}={root}"))
             .collect();
         env.push(env_var(WSFETCH_CACHE_ROOTS_ENV, &pairs.join(",")));
+        // The restores read from the Cache's home replica (git-bug 12e2f6b).
+        if let Some(url) = cache_home_url {
+            env.push(env_var(workspace_token::WORKSPACE_CACHE_URL_ENV, url));
+        }
     }
     Container {
         name: WORKSPACE_INIT_CONTAINER.to_string(),
@@ -4444,6 +4466,7 @@ pub fn build_pod(
                     fetch,
                     &spec.workspace_inputs,
                     cache_restore,
+                    fetch.cache_home_url(spec).as_deref(),
                     &ws,
                     // The same resolved number `activeDeadlineSeconds` gets
                     // below — the retry window is a fraction of THIS deadline.
@@ -4501,6 +4524,14 @@ pub fn build_pod(
         // from panicking here.
         if let Some(fetch) = fetch {
             egress_env.push(env_var(workspace_token::WORKSPACE_URL_ENV, &fetch.url));
+            // The drain sends cache-dir content to the Cache's home replica
+            // (git-bug 12e2f6b) — only when the key resolved and dirs are
+            // declared, the same condition the drain's --cache-dirs carries.
+            if spec.cache.as_ref().is_some_and(|c| !c.dirs.is_empty()) {
+                if let Some(url) = fetch.cache_home_url(spec) {
+                    egress_env.push(env_var(workspace_token::WORKSPACE_CACHE_URL_ENV, &url));
+                }
+            }
             egress_mounts.push(VolumeMount {
                 name: WORKSPACE_TOKEN_VOLUME.to_string(),
                 mount_path: workspace_token::WORKSPACE_SECRETS_MOUNT_PATH.to_string(),
@@ -6922,6 +6953,7 @@ mod tests {
             token_secret: b"ws-secret".to_vec(),
             fetcher_image: "ghcr.io/acme/scarab-wsfetch:test".into(),
             helper_resources: scarab_pipeline::Resources::default(),
+            cache_home: None,
         }
     }
 
@@ -10181,6 +10213,71 @@ mod tests {
         // No cache: no cache claim, so the token keeps the old wire form.
         spec.cache = None;
         assert!(step_token_claims(&step, &spec, "a1".into(), 10).cache_roots.is_empty());
+    }
+
+    /// git-bug 12e2f6b: with more than one Depot replica, the fetch init
+    /// container (restores) and the egress helper (the drain's saves) both
+    /// get the SAME home URL, chosen from the cache key; with one replica, or
+    /// a step whose key did not resolve, neither gets one and the Pod is
+    /// byte-for-byte what it was.
+    #[test]
+    fn the_cache_home_url_rides_the_fetch_and_drain_containers() {
+        let step = step_with_attempt("run-1", "build", "a1");
+        let mut spec = busybox();
+        spec.workspace_inputs = vec!["tree-a".into()];
+        spec.cache = Some(scarab_engine::CacheConfig {
+            dirs: vec!["target".into()],
+            key: Some("cache-key-1".into()),
+            restore: vec![("target".into(), "tree-c".into())],
+            ..Default::default()
+        });
+        let home_env = |fetch: &WorkspaceFetch, spec: &StepSpec| -> Vec<(String, Option<String>)> {
+            let pod = build_pod(
+                "scarab-x",
+                "ns",
+                &step,
+                spec,
+                None,
+                DEFAULT_STEP_TIMEOUT_SECS,
+                true,
+                Some(fetch),
+            );
+            pod.spec
+                .unwrap()
+                .init_containers
+                .unwrap_or_default()
+                .into_iter()
+                .flat_map(|c| {
+                    let name = c.name.clone();
+                    c.env
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|e| e.name == workspace_token::WORKSPACE_CACHE_URL_ENV)
+                        .map(move |e| (name.clone(), e.value))
+                })
+                .collect()
+        };
+
+        let mut fetch = sample_fetch();
+        fetch.cache_home =
+            cache_home::CacheHome::new(3, "http://scarab-workspace-{ordinal}.ns.svc");
+        let want = format!(
+            "http://scarab-workspace-{}.ns.svc",
+            cache_home::home_ordinal("cache-key-1", 3)
+        );
+        let got = home_env(&fetch, &spec);
+        let names: Vec<&str> = got.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec![WORKSPACE_INIT_CONTAINER, WORKSPACE_EGRESS_CONTAINER]);
+        assert!(got.iter().all(|(_, v)| v.as_deref() == Some(want.as_str())), "{got:?}");
+
+        // One Depot replica: no home, no env.
+        let mut one = sample_fetch();
+        one.cache_home = cache_home::CacheHome::new(1, "http://scarab-workspace-{ordinal}.ns.svc");
+        assert!(home_env(&one, &spec).is_empty());
+        // A key that did not resolve: no cache, no home.
+        spec.cache.as_mut().unwrap().key = None;
+        spec.cache.as_mut().unwrap().restore.clear();
+        assert!(home_env(&fetch, &spec).is_empty());
     }
 
     #[test]

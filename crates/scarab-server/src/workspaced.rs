@@ -9577,6 +9577,7 @@ mod tests {
                 helper_cpu_millis: None,
                 helper_memory_mib: None,
                 blob_authz: BlobAuthzMode::Log,
+                cache_home: None,
             }),
             github_webhook_secret: None,
             forgejo_webhook_secret: None,

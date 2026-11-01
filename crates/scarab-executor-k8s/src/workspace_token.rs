@@ -72,6 +72,12 @@ pub const WORKSPACE_TOKEN_FILE_ENV: &str = "SCARAB_WORKSPACE_TOKEN_FILE";
 /// The env var carrying the workspace service's base URL into a Pod.
 pub const WORKSPACE_URL_ENV: &str = "SCARAB_WORKSPACE_URL";
 
+/// The env var carrying the base URL of the Step's Cache **home** Depot
+/// replica (git-bug 12e2f6b), for cache content only. Set only when the Depot
+/// runs more than one replica and the Step's cache key resolved; unset, the
+/// service URL above serves caches too.
+pub const WORKSPACE_CACHE_URL_ENV: &str = "SCARAB_WORKSPACE_CACHE_URL";
+
 /// Extra lifetime beyond the step deadline, so a Pod that is being torn down
 /// can still finish talking to the service.
 pub const WORKSPACE_TOKEN_GRACE_SECS: i64 = 600;

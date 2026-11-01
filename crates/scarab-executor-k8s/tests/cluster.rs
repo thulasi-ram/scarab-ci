@@ -363,6 +363,7 @@ fn workspace_fixture() -> WorkspaceFixture {
             token_secret: secret.into_bytes(),
             fetcher_image: image,
             helper_resources: scarab_pipeline::Resources::default(),
+            cache_home: None,
         },
     }
 }
