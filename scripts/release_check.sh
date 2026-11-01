@@ -84,7 +84,7 @@ else
 fi
 
 section "screenshots"
-npm --prefix ui/scarab-web-ui install --no-audit --no-fund >/dev/null
+npm --prefix ui/scarab-web-ui ci --no-audit --no-fund >/dev/null
 npx --prefix ui/scarab-web-ui playwright install chromium >/dev/null
 if shots=$(node ui/scarab-web-ui/scripts/screenshots.mjs check 2>&1); then
   printf '%s\n' "$shots"
