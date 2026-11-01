@@ -48,8 +48,12 @@ cleanup() {
   exit "$code"
 }
 trap cleanup EXIT
+# Ctrl-C or a kill must still reach cleanup, which deletes the public tunnel.
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
-bash "$here/up.sh" e2e
+# Only this recipe asks up.sh for the public Forgejo tunnel.
+SCARAB_E2E_TUNNEL=1 bash "$here/up.sh" e2e
 scarab_addr
 
 cargo build -p scarab-cli

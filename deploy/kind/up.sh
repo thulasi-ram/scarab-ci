@@ -10,8 +10,9 @@
 #                             database `scarab_dogfood`, bucket `scarab-dogfood`,
 #                             and a cloudflared tunnel to the public hostname
 #   e2e      (`just e2e`)     dev-insecure, database `scarab_e2e`, bucket
-#                             `scarab-e2e`, so test data never mixes with dev's,
-#                             and a cloudflared quick tunnel in front of Forgejo
+#                             `scarab-e2e`, so test data never mixes with dev's;
+#                             a cloudflared quick tunnel in front of Forgejo only
+#                             when e2e.sh sets SCARAB_E2E_TUNNEL=1
 #   chaos    (`just chaos`)   dev-insecure, database `scarab_chaos`, bucket
 #                             `scarab-chaos`, both reached through toxiproxy;
 #                             2 server replicas and 2 Depot replicas (ADR-0077)
@@ -32,8 +33,9 @@
 #      the host port of SCARAB_ADDR mapped to the API's node port, or recreate
 #      a `scarab-dev` cluster that lacks them;
 #   4. build the runtime image and the step helper images and load them;
-#   5. apply Postgres, MinIO and Forgejo, create the mode's database; in e2e
-#      mode, start the Forgejo quick tunnel first (Forgejo's ROOT_URL is its URL);
+#   5. apply Postgres, MinIO and Forgejo, create the mode's database; under
+#      `just e2e` (SCARAB_E2E_TUNNEL=1), start the Forgejo quick tunnel first
+#      (Forgejo's ROOT_URL is its URL);
 #   6. helm upgrade --install the chart with deploy/kind/values.yaml plus the
 #      mode's values;
 #   7. seed Forgejo (deploy/kind/forgejo.sh).
@@ -376,14 +378,34 @@ else
   kc delete -n "$ns" -f "$here/toxiproxy.yaml" --ignore-not-found >/dev/null
 fi
 
-# Forgejo, in every mode. In e2e mode a cloudflared quick tunnel goes in front
-# of it first: Forgejo builds clone URLs and payload links from ROOT_URL, so
-# ROOT_URL must be the tunnel's https URL, which is known only once cloudflared
-# has registered. Each tunnel Pod gets a new URL, so the e2e recipe deletes the
-# tunnel when it ends and every e2e run starts a new one.
+# Forgejo, in every mode. `just e2e` (e2e.sh, which sets SCARAB_E2E_TUNNEL=1
+# and deletes the tunnel on exit) also puts a cloudflared quick tunnel in
+# front of it: Forgejo builds clone URLs and payload links from ROOT_URL, so
+# ROOT_URL must be the tunnel's https URL, which is known only once
+# cloudflared has registered. Each tunnel Pod gets a new URL, so every e2e run
+# starts a new one. Nothing else opens it: e2e mode without the flag (by hand,
+# or `just plugin-verify`) runs without a tunnel, and every run deletes one an
+# earlier run left.
+# A random admin password and hook secret per stack, kept in .state (mode 600).
+for f in forgejo-admin-password forgejo-webhook-secret; do
+  [ -s "$state/$f" ] || ( umask 077; head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$state/$f" )
+done
+forgejo_webhook_secret="$(cat "$state/forgejo-webhook-secret")"
+render_forgejo() { # $1 ROOT_URL, $2 REQUIRE_SIGNIN_VIEW
+  echo "==> Forgejo (ROOT_URL $1, sign-in required to view: $2)"
+  V_ROOT="$1" V_SIGNIN="$2" python3 -I -c '
+import os, sys
+t = open(sys.argv[1]).read()
+sys.stdout.write(t.replace("__ROOT_URL__", os.environ["V_ROOT"]).replace("__SIGNIN_VIEW__", os.environ["V_SIGNIN"]))
+' "$here/forgejo.yaml" | kc apply -n "$ns" -f - >/dev/null
+  kc rollout status -n "$ns" deploy/scarab-forgejo --timeout=180s
+}
+in_cluster_root="http://scarab-forgejo.$ns.svc.cluster.local:3000/"
 tunnel_url=""
 kc delete deploy scarab-forgejo-tunnel -n "$ns" --ignore-not-found --wait=true >/dev/null
-if [ "$mode" = e2e ]; then
+if [ "$mode" = e2e ] && [ "${SCARAB_E2E_TUNNEL:-0}" = 1 ]; then
+  # Sign-in required BEFORE the tunnel makes Forgejo public.
+  render_forgejo "$in_cluster_root" true
   echo "==> Forgejo quick tunnel (network calls; Forgejo is public while it runs)"
   kc apply -n "$ns" -f "$here/forgejo-tunnel.yaml" >/dev/null
   kc rollout status -n "$ns" deploy/scarab-forgejo-tunnel --timeout=120s
@@ -396,22 +418,10 @@ if [ "$mode" = e2e ]; then
   done
   [ -n "$tunnel_url" ] || { printf '%s\n' "$tunnel_log" | tail -n 20 >&2; die "cloudflared did not register a quick tunnel"; }
   echo "    $tunnel_url"
-  forgejo_root="$tunnel_url/"; forgejo_signin=true
+  render_forgejo "$tunnel_url/" true
 else
-  forgejo_root="http://scarab-forgejo.$ns.svc.cluster.local:3000/"; forgejo_signin=false
+  render_forgejo "$in_cluster_root" false
 fi
-# A random admin password and hook secret per stack, kept in .state (mode 600).
-for f in forgejo-admin-password forgejo-webhook-secret; do
-  [ -s "$state/$f" ] || ( umask 077; head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$state/$f" )
-done
-forgejo_webhook_secret="$(cat "$state/forgejo-webhook-secret")"
-echo "==> Forgejo (ROOT_URL $forgejo_root)"
-V_ROOT="$forgejo_root" V_SIGNIN="$forgejo_signin" python3 -I -c '
-import os, sys
-t = open(sys.argv[1]).read()
-sys.stdout.write(t.replace("__ROOT_URL__", os.environ["V_ROOT"]).replace("__SIGNIN_VIEW__", os.environ["V_SIGNIN"]))
-' "$here/forgejo.yaml" | kc apply -n "$ns" -f - >/dev/null
-kc rollout status -n "$ns" deploy/scarab-forgejo --timeout=180s
 
 # --- 5. secrets ---------------------------------------------------------------
 # Dev secrets are generated once and kept in deploy/kind/.state (gitignored),

@@ -67,11 +67,19 @@ up mode="dev":
     bash deploy/kind/up.sh "{{mode}}"
 
 # Rebuild the binary and roll the server and Depot Pods onto it, in the mode the
-# stack was last brought up in. No image is built for the server.
+# stack was last brought up in (dev or dogfood). After `just e2e` or `just
+# chaos` it goes to dev: those modes are entered only by their own recipes,
+# which open and close what they need (e2e's public Forgejo tunnel, chaos's
+# toxiproxy). No image is built for the server.
 reload:
     #!/usr/bin/env bash
     set -euo pipefail
-    bash deploy/kind/up.sh "$(cat deploy/kind/.state/mode 2>/dev/null || echo dev)"
+    mode="$(cat deploy/kind/.state/mode 2>/dev/null || echo dev)"
+    case "$mode" in
+      dev|dogfood) ;;
+      *) echo "==> the stack is in $mode mode; just reload goes to dev (just e2e / just chaos re-enter $mode)"; mode=dev ;;
+    esac
+    bash deploy/kind/up.sh "$mode"
 
 # Submit a one-step pipeline to the running server and watch it complete.
 demo:

@@ -20,7 +20,9 @@
 #
 # Idempotent: every run installs a NEW installation (names are never reused in
 # an org). The release stays up in e2e mode with plugins on; `just up` switches
-# it back to dev. The fake Argo CD is stopped on exit unless KEEP=1.
+# it back to dev. e2e mode here has no Forgejo quick tunnel (up.sh opens it
+# only for `just e2e`, and deletes one a run left). The fake Argo CD is stopped
+# on exit unless KEEP=1.
 #
 # Every cluster command goes through kc (deploy/kind/lib.sh): the stack's own
 # kubeconfig, checked against the kind cluster before each call.

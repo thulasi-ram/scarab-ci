@@ -10,13 +10,13 @@ described in the ADR-0077 Amendment (2026-11-01).
 just up          # build, create the cluster if needed, install the release
 just demo        # one-step pipeline, polled to success
 just demo-chain  # produce -> consume, checks the workspace crossed a Step boundary
-just reload      # rebuild and roll the server and Depot onto the new binary
+just reload      # rebuild and roll the server and Depot onto the new binary (after e2e or chaos: dev)
 just up dogfood  # the same stack in GitHub App mode, behind a named Cloudflare tunnel
 just e2e         # every live suite, against the release in its e2e mode
 just chaos       # ADR-0077 rank 1: a Depot Pod deleted mid-drain and mid-feed, then the invariant checker
 just logs        # follow the server's log
 just down        # delete the cluster and its data
-just down keep   # uninstall the release; keep the cluster, Postgres, MinIO and their data
+just down keep   # uninstall the release and both tunnels; keep the cluster, Postgres, MinIO and their data
 ```
 
 The API and the web UI answer on the host at `SCARAB_ADDR` from
@@ -90,7 +90,7 @@ bucket on those two servers:
 |---|---|---|---|---|
 | dev | `just up` | `scarab` | `scarab-logs` | dev-insecure |
 | dogfood | `just up dogfood` | `scarab_dogfood` | `scarab-dogfood` | dev-insecure, GitHub App |
-| e2e | `just e2e` | `scarab_e2e` | `scarab-e2e` | dev-insecure; Forgejo behind a quick tunnel |
+| e2e | `just e2e` | `scarab_e2e` | `scarab-e2e` | dev-insecure; Forgejo behind a quick tunnel while `just e2e` runs |
 | chaos | `just chaos` | `scarab_chaos` | `scarab-chaos` | dev-insecure; Postgres and MinIO through toxiproxy; 2 servers, 2 Depot replicas |
 
 Switching modes deletes the Depot's warm PVC. The warm tier caches blobs of
@@ -363,14 +363,19 @@ and a collaborator, and the private repos of the forge_token cases. It writes
 read. Its hooks are stamped with `.state/forgejo-webhook-secret`, which the
 release gets as `secrets.forgejoWebhookSecret`.
 
-In e2e mode `up.sh` first starts a cloudflared quick tunnel in front of it
-(`forgejo-tunnel.yaml`), reads the random `https://<name>.trycloudflare.com`
-URL from its log, and sets Forgejo's `ROOT_URL` to it with sign-in required to
-view. The forge_token cases need an https clone URL that the server Pod and the
-step Pods both reach, over TLS the clone image trusts; a quick tunnel needs no
-account. This makes network calls, and Forgejo is reachable from the internet
-while the tunnel runs; `just e2e` deletes the tunnel when it ends, and the next
-run gets a new URL. In e2e mode the release's library manifest is the real
+Under `just e2e` (which sets `SCARAB_E2E_TUNNEL=1` for `up.sh e2e`), `up.sh`
+first re-renders Forgejo with sign-in required to view, then starts a
+cloudflared quick tunnel in front of it (`forgejo-tunnel.yaml`), reads the
+random `https://<name>.trycloudflare.com` URL from its log, and sets Forgejo's
+`ROOT_URL` to it. The forge_token cases need an https clone URL that the
+server Pod and the step Pods both reach, over TLS the clone image trusts; a
+quick tunnel needs no account. This makes network calls, and Forgejo is
+reachable from the internet while the tunnel runs. `just e2e` deletes the
+tunnel when it exits, on success, failure or Ctrl-C, and the next run gets a
+new URL. Nothing else opens it: `up.sh e2e` without the flag (`just
+plugin-verify`) runs without a tunnel, every `up.sh` run deletes one a run
+left, `just down keep` deletes it, and `just reload` after `just e2e` goes to
+dev. In e2e mode the release's library manifest is the real
 `libs/` at its last commit, which the server fetches from github.com, so
 `libs/` must be committed and pushed; the release's `publicUrl` is the server's
 Service, where Forgejo delivers hooks.

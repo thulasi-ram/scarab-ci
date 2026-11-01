@@ -3,7 +3,8 @@
 #
 #   deploy/kind/down.sh          delete the kind cluster: the release, Postgres,
 #                                MinIO and all their data
-#   deploy/kind/down.sh keep     uninstall the release only; the cluster,
+#   deploy/kind/down.sh keep     uninstall the release and delete both
+#                                tunnels (dogfood's and e2e's); the cluster,
 #                                Postgres, MinIO and their PVCs stay, so the
 #                                next `just up` starts on the same data
 #
@@ -31,6 +32,9 @@ case "$what" in
     echo "==> uninstalling release $release (Postgres, MinIO and their data stay)"
     hc uninstall "$release" -n "$ns" --ignore-not-found
     kc delete deploy scarab-cloudflared -n "$ns" --ignore-not-found
+    # The e2e Forgejo quick tunnel, if a run left it: Forgejo is public while
+    # it runs.
+    kc delete deploy scarab-forgejo-tunnel -n "$ns" --ignore-not-found
     echo "==> down (kept the cluster and its data)."
     ;;
   *)
