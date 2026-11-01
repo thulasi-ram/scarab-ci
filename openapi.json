@@ -1079,9 +1079,47 @@
             }
           },
           {
+            "name": "target",
+            "in": "query",
+            "description": "only events whose target contains this text (ignoring case)",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "description": "only events at or after this time (unix ms)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "description": "only events before this time (unix ms)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "the previous page's next_cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
             "name": "before",
             "in": "query",
-            "description": "only events with seq below this (paging)",
+            "description": "only events with seq below this (paging; not with cursor)",
             "required": false,
             "schema": {
               "type": "integer",
@@ -4946,9 +4984,56 @@
             }
           },
           {
+            "name": "actor",
+            "in": "query",
+            "description": "only events about this subject",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "target",
+            "in": "query",
+            "description": "only events whose target contains this text (ignoring case); events bound to the Org only",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "description": "only events at or after this time (unix ms)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "description": "only events before this time (unix ms)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "the previous page's next_cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
             "name": "before",
             "in": "query",
-            "description": "only events with seq below this (paging)",
+            "description": "only events with seq below this (paging; not with cursor)",
             "required": false,
             "schema": {
               "type": "integer",
@@ -4977,6 +5062,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "a cursor this server did not issue, or both cursor and before"
           },
           "401": {
             "description": "not signed in"
@@ -7701,9 +7789,56 @@
             }
           },
           {
+            "name": "actor",
+            "in": "query",
+            "description": "only events about this subject",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "target",
+            "in": "query",
+            "description": "only events whose target contains this text (ignoring case)",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "description": "only events at or after this time (unix ms)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "description": "only events before this time (unix ms)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "the previous page's next_cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
             "name": "before",
             "in": "query",
-            "description": "only events with seq below this (paging)",
+            "description": "only events with seq below this (paging; not with cursor)",
             "required": false,
             "schema": {
               "type": "integer",
@@ -12239,7 +12374,14 @@
               "null"
             ],
             "format": "int64",
-            "description": "Pass as `before` for the next page; absent on the last."
+            "description": "Pass as `before` for the next page; absent on the last. The same\nposition as `next_cursor`, kept for older callers."
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Pass as `cursor` for the next page; absent on the last."
           }
         }
       },

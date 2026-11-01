@@ -4466,9 +4466,12 @@ export interface components {
             events: components["schemas"]["SecurityEventDto"][];
             /**
              * Format: int64
-             * @description Pass as `before` for the next page; absent on the last.
+             * @description Pass as `before` for the next page; absent on the last. The same
+             *     position as `next_cursor`, kept for older callers.
              */
             next_before?: number | null;
+            /** @description Pass as `cursor` for the next page; absent on the last. */
+            next_cursor?: string | null;
         };
         /**
          * @description A **shared service** instance of a run (ADR-0058) — the evidence a shared
@@ -5930,7 +5933,15 @@ export interface operations {
             query?: {
                 /** @description comma-separated event kinds */
                 kind?: string;
-                /** @description only events with seq below this (paging) */
+                /** @description only events whose target contains this text (ignoring case) */
+                target?: string;
+                /** @description only events at or after this time (unix ms) */
+                from?: number;
+                /** @description only events before this time (unix ms) */
+                to?: number;
+                /** @description the previous page's next_cursor */
+                cursor?: string;
+                /** @description only events with seq below this (paging; not with cursor) */
                 before?: number;
                 /** @description page size (default 50, max 200) */
                 limit?: number;
@@ -8812,7 +8823,17 @@ export interface operations {
             query?: {
                 /** @description comma-separated event kinds */
                 kind?: string;
-                /** @description only events with seq below this (paging) */
+                /** @description only events about this subject */
+                actor?: string;
+                /** @description only events whose target contains this text (ignoring case); events bound to the Org only */
+                target?: string;
+                /** @description only events at or after this time (unix ms) */
+                from?: number;
+                /** @description only events before this time (unix ms) */
+                to?: number;
+                /** @description the previous page's next_cursor */
+                cursor?: string;
+                /** @description only events with seq below this (paging; not with cursor) */
                 before?: number;
                 /** @description page size (default 50, max 200) */
                 limit?: number;
@@ -8833,6 +8854,13 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["SecurityEventsResponse"];
                 };
+            };
+            /** @description a cursor this server did not issue, or both cursor and before */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description not signed in */
             401: {
@@ -10588,7 +10616,17 @@ export interface operations {
             query?: {
                 /** @description comma-separated event kinds */
                 kind?: string;
-                /** @description only events with seq below this (paging) */
+                /** @description only events about this subject */
+                actor?: string;
+                /** @description only events whose target contains this text (ignoring case) */
+                target?: string;
+                /** @description only events at or after this time (unix ms) */
+                from?: number;
+                /** @description only events before this time (unix ms) */
+                to?: number;
+                /** @description the previous page's next_cursor */
+                cursor?: string;
+                /** @description only events with seq below this (paging; not with cursor) */
                 before?: number;
                 /** @description page size (default 50, max 200) */
                 limit?: number;

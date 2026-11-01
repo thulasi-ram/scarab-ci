@@ -634,13 +634,22 @@ pub struct SecurityEvent {
 /// - `subject: Some(s)` — only events about `s` (the **own log**, alone).
 /// - both `None` — every event (**install-wide**).
 ///
-/// The two compose with AND; `kinds` (empty = any) and `before_seq` narrow
-/// further.
+/// The two compose with AND; `kinds` (empty = any), the time range,
+/// `target_contains` and `before_seq` narrow further.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SecurityEventFilter {
     pub org: Option<String>,
     pub subject: Option<String>,
     pub kinds: Vec<String>,
+    /// Only events with `at >= from_at` (unix ms).
+    pub from_at: Option<i64>,
+    /// Only events with `at < to_at` (unix ms).
+    pub to_at: Option<i64>,
+    /// Only events whose `target` contains this text, ignoring case. In an
+    /// Org view (`org: Some`) it matches only events bound to an Org: an
+    /// Org-less event's target can be redacted in that view, and a filter
+    /// on it would reveal what the redaction hides.
+    pub target_contains: Option<String>,
     /// Only events with `seq < before_seq` (keyset pagination).
     pub before_seq: Option<i64>,
     /// At most this many; 0 is treated as 1.

@@ -1222,3 +1222,197 @@ async fn an_unrecorded_authorisation_runs_nothing() {
     assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE, "{b}");
     assert_eq!(acme_secret(&secrets).await, None, "the secret was written");
 }
+
+// ---------------------------------------------------------------------------
+// The Event log page: cursor paging and filters
+// ---------------------------------------------------------------------------
+
+/// A seeded event: `at` in ms, an id that names it.
+fn seeded(
+    id: &str,
+    org: Option<&str>,
+    at: i64,
+    kind: &str,
+    subject: &str,
+    target: &str,
+) -> scarab_identity::SecurityEvent {
+    scarab_identity::SecurityEvent {
+        seq: 0,
+        id: id.into(),
+        org: org.map(str::to_string),
+        at,
+        kind: kind.into(),
+        subject: subject.into(),
+        caller: "session:cookie".into(),
+        op: Some("secret.put".into()),
+        target: Some(target.into()),
+        confirmation_id: None,
+        request_id: None,
+        passkey_id: None,
+        session_hash: None,
+        detail: json!({}),
+    }
+}
+
+fn ids_of(page: &Value) -> Vec<String> {
+    page["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// Every page of `uri` (which carries its own query), followed by
+/// `next_cursor` until the last: the ids in order, and how many pages.
+async fn all_pages(h: &Harness, s: &Sess, uri: &str) -> (Vec<String>, usize) {
+    let mut ids = Vec::new();
+    let mut pages = 0;
+    let mut cursor: Option<String> = None;
+    loop {
+        let u = match &cursor {
+            None => uri.to_string(),
+            Some(c) => format!("{uri}&cursor={c}"),
+        };
+        let (st, page) = h.cookie("GET", &u, None, s).await;
+        assert_eq!(st, StatusCode::OK, "{u}: {page}");
+        pages += 1;
+        assert!(pages < 100, "the cursor never ran out: {u}");
+        ids.extend(ids_of(&page));
+        match page["next_cursor"].as_str() {
+            Some(c) => {
+                assert!(!page["events"].as_array().unwrap().is_empty(), "a cursor after an empty page");
+                cursor = Some(c.to_string());
+            }
+            None => break,
+        }
+    }
+    (ids, pages)
+}
+
+/// acme's admin pages the Org log three at a time: every acme event comes
+/// back once, newest first, with no gap and no repeat, and the last page
+/// carries no cursor. Each filter (kind, actor, target, time range) narrows
+/// every page, alone and combined; beta's events — which name acme in their
+/// targets — never show; an Org-less confirmation about a member shows in
+/// the log but is never found by its (redacted) target.
+async fn the_event_log_pages_by_cursor_and_filters(backend: Backend) {
+    let h = harness_on(backend, |st| st);
+    h.grant("amy", Scope::Org("acme".into()), Role::Owner).await;
+    h.grant("cat", Scope::Org("acme".into()), Role::Member).await;
+    let amy = h.browser_session(scoped("amy")).await;
+
+    // (id, org, at, kind, subject, target), appended oldest first.
+    let seeds: Vec<(&str, Option<&str>, i64, &str, &str, &str)> = vec![
+        ("a1", Some("acme"), 1_000, "op.authorised", "amy", "acme/web/DB_PASSWORD"),
+        ("b1", Some("beta"), 1_500, "op.authorised", "amy", "acme/web/DB_PASSWORD"),
+        ("a2", Some("acme"), 2_000, "step_up.refused", "cat", "acme/api/TOKEN"),
+        ("a3", Some("acme"), 3_000, "op.authorised", "cat", "run-7f3a/deploy"),
+        ("o1", None, 3_500, "step_up.confirmed", "amy", "acme/web/HIDDEN"),
+        ("a4", Some("acme"), 4_000, "step_up.refused", "amy", "acme/web/API_KEY"),
+        ("b2", Some("beta"), 4_500, "step_up.refused", "cat", "acme/web/X"),
+        ("a5", Some("acme"), 5_000, "step_up.refused", "cat", "run-7f3a/build"),
+        ("a6", Some("acme"), 6_000, "op.authorised", "amy", "acme/api/DB_PASSWORD"),
+        ("a7", Some("acme"), 7_000, "step_up.refused", "cat", "acme/web/DB_PASSWORD"),
+    ];
+    for (id, org, at, kind, subject, target) in &seeds {
+        h.log
+            .append(&seeded(id, *org, *at, kind, subject, target))
+            .await
+            .unwrap();
+    }
+    let ours = |ids: Vec<String>| -> Vec<String> {
+        ids.into_iter()
+            .filter(|i| seeds.iter().any(|s| s.0 == i.as_str()))
+            .collect()
+    };
+    let expect = |keep: &dyn Fn(&(&str, Option<&str>, i64, &str, &str, &str)) -> bool| {
+        seeds
+            .iter()
+            .rev()
+            .filter(|s| keep(s))
+            .map(|s| s.0.to_string())
+            .collect::<Vec<_>>()
+    };
+    let base = "/v1/orgs/acme/security/events";
+
+    // The whole log in one page, then three at a time: the same rows.
+    let (st, whole) = h.cookie("GET", &format!("{base}?limit=200"), None, &amy).await;
+    assert_eq!(st, StatusCode::OK, "{whole}");
+    assert!(whole["next_cursor"].is_null(), "one page holds it all");
+    let whole = ids_of(&whole);
+    let (paged, pages) = all_pages(&h, &amy, &format!("{base}?limit=3")).await;
+    assert_eq!(paged, whole, "paging repeats or skips nothing");
+    assert_eq!(pages, whole.len().div_ceil(3));
+    assert_eq!(
+        ours(paged),
+        vec!["a7", "a6", "a5", "a4", "o1", "a3", "a2", "a1"],
+        "acme's own events and its member's confirmation, newest first; never beta's"
+    );
+
+    // Each filter, paged two at a time.
+    let cases: Vec<(&str, Vec<String>)> = vec![
+        (
+            "kind=step_up.refused",
+            expect(&|s| s.1 == Some("acme") && s.3 == "step_up.refused"),
+        ),
+        ("actor=cat", expect(&|s| s.1 == Some("acme") && s.4 == "cat")),
+        (
+            "kind=step_up.refused&actor=cat",
+            expect(&|s| s.1 == Some("acme") && s.3 == "step_up.refused" && s.4 == "cat"),
+        ),
+        (
+            "from=3000&to=6000",
+            expect(&|s| s.1 != Some("beta") && (3_000..6_000).contains(&s.2)),
+        ),
+        (
+            // Ignores case; the Org-less confirmation's target is redacted
+            // in this view, so the filter never finds it either.
+            "target=WEB",
+            expect(&|s| s.1 == Some("acme") && s.5.contains("web")),
+        ),
+        ("target=run-7f3a", vec!["a5".into(), "a3".into()]),
+        (
+            "kind=step_up.refused,op.authorised&actor=amy&from=1000&to=7000&target=acme/",
+            vec!["a6".into(), "a4".into(), "a1".into()],
+        ),
+    ];
+    for (q, want) in cases {
+        let (got, _) = all_pages(&h, &amy, &format!("{base}?limit=2&{q}")).await;
+        assert_eq!(ours(got), want, "?{q}");
+    }
+
+    // The older `before` pages the same as the cursor.
+    let (_, p1) = h.cookie("GET", &format!("{base}?limit=3"), None, &amy).await;
+    let before = p1["next_before"].as_i64().expect("a next page");
+    let cursor = p1["next_cursor"].as_str().expect("a next page").to_string();
+    let (_, by_before) = h
+        .cookie("GET", &format!("{base}?limit=3&before={before}"), None, &amy)
+        .await;
+    let (_, by_cursor) = h
+        .cookie("GET", &format!("{base}?limit=3&cursor={cursor}"), None, &amy)
+        .await;
+    assert_eq!(ids_of(&by_before), ids_of(&by_cursor));
+
+    // A cursor this server did not issue, or both forms at once: refused.
+    for q in [
+        "cursor=42".to_string(),
+        "cursor=not-a-cursor".to_string(),
+        format!("cursor={cursor}&before={before}"),
+    ] {
+        let (st, b) = h.cookie("GET", &format!("{base}?{q}"), None, &amy).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "?{q}: {b}");
+    }
+}
+
+#[tokio::test]
+async fn the_event_log_pages_by_cursor_and_filters_in_memory() {
+    the_event_log_pages_by_cursor_and_filters(Backend::Memory).await;
+}
+
+#[tokio::test]
+async fn the_event_log_pages_by_cursor_and_filters_on_postgres() {
+    let Some((tdb, pg)) = pg().await else { return };
+    the_event_log_pages_by_cursor_and_filters(Backend::Pg(pg)).await;
+    tdb.cleanup().await;
+}

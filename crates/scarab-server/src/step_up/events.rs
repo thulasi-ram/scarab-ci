@@ -10,14 +10,17 @@
 //!   and the "step-up enforced; N admins have no passkey" banner show.
 //!   Administer on the Org.
 //!
-//! Each list is newest first, filtered by `?kind=a,b`, paged by
-//! `?before=<seq>` (the `next_before` of the previous page) and `?limit`.
+//! Each list is newest first (by `seq`), filtered by `?kind=a,b`,
+//! `?actor=<subject>`, `?target=<text>` and `?from`/`?to` (unix ms), and
+//! paged by `?cursor` (the `next_cursor` of the previous page) and `?limit`.
+//! `?before=<seq>` (the older `next_before`) still pages too.
 
 use std::collections::BTreeSet;
 
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::Json;
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -36,15 +39,33 @@ pub const MAX_EVENT_LIMIT: u32 = 200;
 const RECENT_REFUSALS: u32 = 20;
 const RECENT_REFUSALS_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
 
-/// `?kind&before&limit`.
+/// `?kind&actor&target&from&to&cursor&before&limit`.
 #[derive(Debug, Default, Deserialize)]
 pub struct EventsQuery {
     /// Comma-separated event kinds (`step_up.refused,passkey.reset`); none =
     /// every kind.
     #[serde(default)]
     pub kind: Option<String>,
+    /// Only events about this subject (the "who"). Ignored on your own log,
+    /// which is always about you.
+    #[serde(default)]
+    pub actor: Option<String>,
+    /// Only events whose target contains this text, ignoring case: a Run id,
+    /// a Project, a secret's name. In an Org's log it matches only events
+    /// bound to the Org.
+    #[serde(default)]
+    pub target: Option<String>,
+    /// Only events at or after this time (unix ms).
+    #[serde(default)]
+    pub from: Option<i64>,
+    /// Only events before this time (unix ms).
+    #[serde(default)]
+    pub to: Option<i64>,
+    /// The previous page's `next_cursor`.
+    #[serde(default)]
+    pub cursor: Option<String>,
     /// Only events with `seq` below this (the previous page's
-    /// `next_before`).
+    /// `next_before`). Not with `cursor`.
     #[serde(default)]
     pub before: Option<i64>,
     /// At most this many (default 50, at most 200).
@@ -110,7 +131,10 @@ impl From<SecurityEvent> for SecurityEventDto {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SecurityEventsResponse {
     pub events: Vec<SecurityEventDto>,
-    /// Pass as `before` for the next page; absent on the last.
+    /// Pass as `cursor` for the next page; absent on the last.
+    pub next_cursor: Option<String>,
+    /// Pass as `before` for the next page; absent on the last. The same
+    /// position as `next_cursor`, kept for older callers.
     pub next_before: Option<i64>,
 }
 
@@ -136,10 +160,47 @@ pub struct OrgSecuritySummary {
     pub pending_requests: u64,
 }
 
-fn filter_of(q: &EventsQuery) -> SecurityEventFilter {
-    SecurityEventFilter {
+/// The text a cursor encodes: a position in the log, newest first.
+const CURSOR_PREFIX: &str = "seq:";
+
+/// The opaque cursor for "the events older than `seq`".
+pub fn encode_cursor(seq: i64) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!("{CURSOR_PREFIX}{seq}"))
+}
+
+/// The `seq` a cursor from [`encode_cursor`] stands for; `None` for any
+/// other text.
+pub fn decode_cursor(cursor: &str) -> Option<i64> {
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(cursor.trim())
+        .ok()?;
+    let text = String::from_utf8(bytes).ok()?;
+    text.strip_prefix(CURSOR_PREFIX)?.parse().ok()
+}
+
+/// A query text parameter: trimmed, and absent when empty.
+fn text_param(v: &Option<String>) -> Option<String> {
+    v.as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+}
+
+fn filter_of(q: &EventsQuery) -> Result<SecurityEventFilter, ApiError> {
+    let before_seq = match (text_param(&q.cursor), q.before) {
+        (Some(_), Some(_)) => {
+            return Err(ApiError::BadRequest(
+                "pass `cursor` or `before`, not both".into(),
+            ))
+        }
+        (Some(c), None) => Some(decode_cursor(&c).ok_or_else(|| {
+            ApiError::BadRequest("`cursor` is not one this server issued".into())
+        })?),
+        (None, before) => before,
+    };
+    Ok(SecurityEventFilter {
         org: None,
-        subject: None,
+        subject: text_param(&q.actor),
         kinds: q
             .kind
             .as_deref()
@@ -149,12 +210,15 @@ fn filter_of(q: &EventsQuery) -> SecurityEventFilter {
             .filter(|k| !k.is_empty())
             .map(str::to_string)
             .collect(),
-        before_seq: q.before,
+        from_at: q.from,
+        to_at: q.to,
+        target_contains: text_param(&q.target),
+        before_seq,
         limit: q
             .limit
             .unwrap_or(DEFAULT_EVENT_LIMIT)
             .clamp(1, MAX_EVENT_LIMIT),
-    }
+    })
 }
 
 async fn page(
@@ -165,15 +229,27 @@ async fn page(
     let Some(svc) = st.step_up.service() else {
         return Ok(SecurityEventsResponse {
             events: vec![],
+            next_cursor: None,
             next_before: None,
         });
     };
-    let events = svc.events.list(&filter).await.map_err(store_err)?;
-    let next_before = (events.len() == filter.limit as usize)
-        .then(|| events.last().map(|e| e.seq))
-        .flatten();
+    // One more than the page: whether it comes back says whether there is a
+    // next page, so the last page carries no cursor to an empty one.
+    let limit = filter.limit.max(1);
+    let mut events = svc
+        .events
+        .list(&SecurityEventFilter {
+            limit: limit + 1,
+            ..filter
+        })
+        .await
+        .map_err(store_err)?;
+    let more = events.len() > limit as usize;
+    events.truncate(limit as usize);
+    let next_before = more.then(|| events.last().map(|e| e.seq)).flatten();
     Ok(SecurityEventsResponse {
         events: events.into_iter().map(SecurityEventDto::from).collect(),
+        next_cursor: next_before.map(encode_cursor),
         next_before,
     })
 }
@@ -185,12 +261,18 @@ async fn page(
     params(
         ("org" = String, Path, description = "org"),
         ("kind" = Option<String>, Query, description = "comma-separated event kinds"),
-        ("before" = Option<i64>, Query, description = "only events with seq below this (paging)"),
+        ("actor" = Option<String>, Query, description = "only events about this subject"),
+        ("target" = Option<String>, Query, description = "only events whose target contains this text (ignoring case); events bound to the Org only"),
+        ("from" = Option<i64>, Query, description = "only events at or after this time (unix ms)"),
+        ("to" = Option<i64>, Query, description = "only events before this time (unix ms)"),
+        ("cursor" = Option<String>, Query, description = "the previous page's next_cursor"),
+        ("before" = Option<i64>, Query, description = "only events with seq below this (paging; not with cursor)"),
         ("limit" = Option<u32>, Query, description = "page size (default 50, max 200)")
     ),
     summary = "An Org's security event log (ADR-0073 §7)",
     responses(
         (status = 200, body = SecurityEventsResponse),
+        (status = 400, description = "a cursor this server did not issue, or both cursor and before"),
         (status = 401, description = "not signed in"),
         (status = 403, description = "not an admin of the Org")
     )
@@ -208,7 +290,7 @@ pub(crate) async fn org_security_events(
     {
         return Err(ApiError::Forbidden);
     }
-    let mut filter = filter_of(&q);
+    let mut filter = filter_of(&q)?;
     filter.org = Some(org);
     let mut page = page(&st, filter).await?;
     // An API token never reads its owner's passkeys (fe777ed): not on
@@ -264,7 +346,11 @@ fn redact_orgless_confirmation(e: &mut SecurityEventDto) {
     path = "/v1/me/security/events",
     params(
         ("kind" = Option<String>, Query, description = "comma-separated event kinds"),
-        ("before" = Option<i64>, Query, description = "only events with seq below this (paging)"),
+        ("target" = Option<String>, Query, description = "only events whose target contains this text (ignoring case)"),
+        ("from" = Option<i64>, Query, description = "only events at or after this time (unix ms)"),
+        ("to" = Option<i64>, Query, description = "only events before this time (unix ms)"),
+        ("cursor" = Option<String>, Query, description = "the previous page's next_cursor"),
+        ("before" = Option<i64>, Query, description = "only events with seq below this (paging; not with cursor)"),
         ("limit" = Option<u32>, Query, description = "page size (default 50, max 200)")
     ),
     summary = "My security events (ADR-0073 §7)",
@@ -288,7 +374,7 @@ pub(crate) async fn my_security_events(
             "an API token cannot read its owner's security events; use a signed-in session".into(),
         ));
     }
-    let mut filter = filter_of(&q);
+    let mut filter = filter_of(&q)?;
     filter.subject = Some(caller.principal.subject);
     Ok(Json(page(&st, filter).await?))
 }
@@ -299,7 +385,12 @@ pub(crate) async fn my_security_events(
     path = "/v1/security/events",
     params(
         ("kind" = Option<String>, Query, description = "comma-separated event kinds"),
-        ("before" = Option<i64>, Query, description = "only events with seq below this (paging)"),
+        ("actor" = Option<String>, Query, description = "only events about this subject"),
+        ("target" = Option<String>, Query, description = "only events whose target contains this text (ignoring case)"),
+        ("from" = Option<i64>, Query, description = "only events at or after this time (unix ms)"),
+        ("to" = Option<i64>, Query, description = "only events before this time (unix ms)"),
+        ("cursor" = Option<String>, Query, description = "the previous page's next_cursor"),
+        ("before" = Option<i64>, Query, description = "only events with seq below this (paging; not with cursor)"),
         ("limit" = Option<u32>, Query, description = "page size (default 50, max 200)")
     ),
     summary = "The install-wide security event log (ADR-0073 §7)",
@@ -318,7 +409,7 @@ pub(crate) async fn security_events(
     if !caller.may_globally(Action::Administer) {
         return Err(ApiError::Forbidden);
     }
-    Ok(Json(page(&st, filter_of(&q)).await?))
+    Ok(Json(page(&st, filter_of(&q)?).await?))
 }
 
 fn role_name(r: Role) -> String {
@@ -405,10 +496,9 @@ pub(crate) async fn org_security_summary(
         .events
         .list(&SecurityEventFilter {
             org: Some(org.clone()),
-            subject: None,
             kinds: vec![kind::STEP_UP_REFUSED.to_string()],
-            before_seq: None,
             limit: RECENT_REFUSALS,
+            ..Default::default()
         })
         .await
         .map_err(store_err)?
@@ -430,4 +520,74 @@ pub(crate) async fn org_security_summary(
         recent_refusals,
         pending_requests,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_cursor_round_trips_and_is_not_the_bare_seq() {
+        for seq in [1_i64, 42, i64::MAX] {
+            let c = encode_cursor(seq);
+            assert_ne!(c, seq.to_string(), "the cursor is opaque");
+            assert_eq!(decode_cursor(&c), Some(seq));
+        }
+    }
+
+    #[test]
+    fn a_cursor_the_server_did_not_issue_is_refused() {
+        for bad in [
+            "",
+            "42",
+            "!!!",
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("42"),
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("seq:x"),
+        ] {
+            assert_eq!(decode_cursor(bad), None, "{bad:?}");
+        }
+        let q = EventsQuery {
+            cursor: Some("not-a-cursor".into()),
+            ..Default::default()
+        };
+        assert!(matches!(filter_of(&q), Err(ApiError::BadRequest(_))));
+    }
+
+    #[test]
+    fn the_query_maps_onto_the_store_filter() {
+        let q = EventsQuery {
+            kind: Some(" step_up.refused, ,passkey.reset ".into()),
+            actor: Some(" amy ".into()),
+            target: Some("  ".into()),
+            from: Some(10),
+            to: Some(20),
+            cursor: Some(encode_cursor(7)),
+            before: None,
+            limit: Some(10_000),
+        };
+        let Ok(f) = filter_of(&q) else {
+            panic!("a valid query")
+        };
+        assert_eq!(f.kinds, vec!["step_up.refused", "passkey.reset"]);
+        assert_eq!(f.subject.as_deref(), Some("amy"));
+        assert_eq!(f.target_contains, None, "a blank target is no filter");
+        assert_eq!((f.from_at, f.to_at), (Some(10), Some(20)));
+        assert_eq!(f.before_seq, Some(7));
+        assert_eq!(f.limit, MAX_EVENT_LIMIT);
+
+        let both = EventsQuery {
+            cursor: Some(encode_cursor(7)),
+            before: Some(7),
+            ..Default::default()
+        };
+        assert!(matches!(filter_of(&both), Err(ApiError::BadRequest(_))));
+        let legacy = EventsQuery {
+            before: Some(9),
+            ..Default::default()
+        };
+        let Ok(f) = filter_of(&legacy) else {
+            panic!("before alone is valid")
+        };
+        assert_eq!(f.before_seq, Some(9));
+    }
 }

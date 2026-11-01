@@ -884,7 +884,8 @@ impl SecurityEventLog for PostgresDb {
         // The Org log (ADR-0073 §7): the Org's own events, plus Org-less
         // events of the allowed kinds (confirmations, passkeys) about anyone
         // holding a live binding anywhere in the Org — membership read now,
-        // not at append.
+        // not at append. Newest first by `seq`, which is unique, so a keyset
+        // page (`seq < before_seq`) never repeats or skips a row.
         let orgless: Vec<String> = scarab_identity::security_event_kind::ORG_VISIBLE_ORGLESS
             .iter()
             .map(|k| k.to_string())
@@ -898,6 +899,11 @@ impl SecurityEventLog for PostgresDb {
                AND ($2::text IS NULL OR e.subject = $2)
                AND (cardinality($3::text[]) = 0 OR e.kind = ANY($3))
                AND ($4::bigint IS NULL OR e.seq < $4)
+               AND ($7::bigint IS NULL OR e.at >= $7)
+               AND ($8::bigint IS NULL OR e.at < $8)
+               AND ($9::text IS NULL
+                    OR (strpos(lower(coalesce(e.target, '')), lower($9)) > 0
+                        AND ($1::text IS NULL OR e.org IS NOT NULL)))
              ORDER BY e.seq DESC
              LIMIT $5"
         ))
@@ -907,6 +913,9 @@ impl SecurityEventLog for PostgresDb {
         .bind(f.before_seq)
         .bind(i64::from(f.limit.max(1)))
         .bind(&orgless)
+        .bind(f.from_at)
+        .bind(f.to_at)
+        .bind(&f.target_contains)
         .fetch_all(self.pool())
         .await
         .map_err(identity_err)?;
