@@ -438,8 +438,8 @@ impl InMemoryDb {
     }
 
     /// Make `run` a **poison run** (test seam for ADR-0059 tick isolation): its
-    /// per-run reads — `run_project` (on the admit leg) and `steps_of_run` (on
-    /// the advance leg) — fail with a backend error until
+    /// per-run reads — `superseded_by` (which the admit leg makes for every
+    /// Pending run) and `steps_of_run` (on the advance leg) — fail with a backend error until
     /// [`heal_run`](Self::heal_run) clears it. Models the class of fault the
     /// tick must isolate: one run that cannot be driven forward, for a reason
     /// that has nothing to do with any other run.
@@ -1210,6 +1210,12 @@ impl Db for InMemoryDb {
 
     async fn superseded_by(&self, run: &RunId) -> Result<Vec<RunId>, DbError> {
         let st = self.state.lock().unwrap();
+        if st.poisoned_runs.contains(run) {
+            return Err(DbError::Other(format!(
+                "injected: run {} is poisoned (admit leg)",
+                run.0
+            )));
+        }
         let Some(key) = st.supersede_keys.get(run) else {
             return Ok(Vec::new());
         };
@@ -1240,12 +1246,6 @@ impl Db for InMemoryDb {
 
     async fn run_project(&self, run: &RunId) -> Result<Option<String>, DbError> {
         let st = self.state.lock().unwrap();
-        if st.poisoned_runs.contains(run) {
-            return Err(DbError::Other(format!(
-                "injected: run {} is poisoned (admit leg)",
-                run.0
-            )));
-        }
         Ok(st.run_project.get(run).cloned())
     }
 
