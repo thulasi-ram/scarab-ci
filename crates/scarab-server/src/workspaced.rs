@@ -109,8 +109,8 @@
 //!
 //! (The ADR-0062 Workspace Export lifecycle — Snapshot Farms, overlay Exports
 //! and their settle path — lived here until ADR-0066 cancelled lazy delivery;
-//! git-bug `0ec3b39` removed it. `crate::changeset` survives as the revival
-//! package, exercised by `tests/changeset_overlay.rs`.)
+//! git-bug `0ec3b39` removed it. Its overlay change-set reader, `changeset.rs`,
+//! was deleted on 2026-11-01; git history keeps it.)
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};

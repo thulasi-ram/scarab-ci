@@ -135,9 +135,6 @@ tempfile = "3"
 # loop) and Windows ReFS. Currently unreferenced by any crate on purpose.
 # NOT the `reflink` crate — that one has been abandoned since 2019.
 reflink-copy = "0.1"
-# l*xattr, for reading the overlay's trusted.* markers. Linux-only at the
-# call site; the crate itself is unconditional here.
-xattr = "1"
 rsa = { version = "0.9", features = ["pem"] }
 # ADR-0073 step-up: the WebAuthn relying party (`crates/scarab-webauthn`)
 # verifies ES256 / EdDSA / RS256 assertion signatures with ring. Not a new
