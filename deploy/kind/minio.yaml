@@ -4,8 +4,8 @@
 # provisioner), so the data survives Pod restarts and `just down keep`.
 #
 # Each mode has its own bucket: `scarab-logs` for `just up`, `scarab-dogfood`
-# for `just up dogfood`, `scarab-e2e` for `just e2e`. The Job below creates
-# all three.
+# for `just up dogfood`, `scarab-e2e` for `just e2e`, `scarab-chaos` for
+# `just chaos`. The Job below creates all four.
 #
 # `pgsty/minio` + `pgsty/mc` (multi-arch, run on arm64) — we deliberately avoid
 # the Bitnami images, matching the Postgres setup.
@@ -98,6 +98,7 @@ spec:
               mc mb --ignore-existing local/scarab-logs
               mc mb --ignore-existing local/scarab-dogfood
               mc mb --ignore-existing local/scarab-e2e
+              mc mb --ignore-existing local/scarab-chaos
               # Incomplete-multipart hygiene (git-bug ad79c90): nothing to
               # configure HERE — MinIO expires stale multipart uploads
               # natively (api: stale_uploads_expiry=24h, swept every
@@ -107,4 +108,4 @@ spec:
               # lists none). On real S3 the equivalent is a REQUIRED bucket
               # lifecycle rule — see the scarab.s3 comment in
               # deploy/helm/scarab/values.yaml.
-              echo 'buckets scarab-logs, scarab-dogfood and scarab-e2e ready'
+              echo 'buckets scarab-logs, scarab-dogfood, scarab-e2e and scarab-chaos ready'

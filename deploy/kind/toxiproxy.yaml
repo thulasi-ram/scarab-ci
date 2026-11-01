@@ -1,0 +1,77 @@
+# toxiproxy for `just chaos` (ADR-0077 §3, Amendment §4). In chaos mode the
+# release reaches the same Postgres and MinIO servers as dev, but through
+# these proxies, so a scenario can cut or slow those connections without
+# touching dev's data. up.sh applies this file in chaos mode only and deletes
+# it in every other mode.
+#
+# One proxy per upstream today:
+#
+#   postgres  :15432 -> scarab-postgres:5432   (server and Depot)
+#   minio     :19000 -> scarab-minio:9000      (server and Depot)
+#
+# Rank 3 (Postgres partition and ambiguous commit) wants the control plane and
+# the Depot on separate proxies. That is one more entry in the config below and
+# one more Service port (for example `postgres-depot` on :15433), plus a Depot
+# database URL in the chart; rank 1 does not need it, so it is not built.
+#
+# The API (:8474) is for the nemesis. The image is pinned by digest: bump the
+# tag and the digest together.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: scarab-toxiproxy
+data:
+  toxiproxy.json: |
+    [
+      {"name": "postgres", "listen": "0.0.0.0:15432", "upstream": "scarab-postgres:5432", "enabled": true},
+      {"name": "minio", "listen": "0.0.0.0:19000", "upstream": "scarab-minio:9000", "enabled": true}
+    ]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scarab-toxiproxy
+  labels: { app: scarab-toxiproxy }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: scarab-toxiproxy }
+  template:
+    metadata:
+      labels: { app: scarab-toxiproxy }
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+      containers:
+        - name: toxiproxy
+          image: ghcr.io/shopify/toxiproxy:2.12.0@sha256:9378ed52a28bc50edc1350f936f518f31fa95f0d15917d6eb40b8e376d1a214e   # multi-arch
+          args: ["-host=0.0.0.0", "-config=/config/toxiproxy.json"]
+          ports:
+            - { name: api, containerPort: 8474 }
+            - { name: postgres, containerPort: 15432 }
+            - { name: minio, containerPort: 19000 }
+          resources:
+            requests: { cpu: 20m, memory: 16Mi }
+            limits: { memory: 128Mi }
+          readinessProbe:
+            httpGet: { path: /version, port: 8474 }
+            periodSeconds: 5
+          volumeMounts:
+            - { name: config, mountPath: /config, readOnly: true }
+      volumes:
+        - name: config
+          configMap:
+            name: scarab-toxiproxy
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: scarab-toxiproxy
+  labels: { app: scarab-toxiproxy }
+spec:
+  selector: { app: scarab-toxiproxy }
+  ports:
+    - { name: api, port: 8474, targetPort: 8474 }
+    - { name: postgres, port: 15432, targetPort: 15432 }
+    - { name: minio, port: 19000, targetPort: 19000 }

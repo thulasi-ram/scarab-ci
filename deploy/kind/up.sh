@@ -3,7 +3,7 @@
 # cluster `scarab-dev`, Postgres and MinIO in it, and one Helm release of the
 # real chart whose server and Depot run a binary built on the host.
 #
-#   deploy/kind/up.sh [dev|dogfood|e2e]
+#   deploy/kind/up.sh [dev|dogfood|e2e|chaos]
 #
 #   dev      (`just up`)      dev-insecure, database `scarab`, bucket `scarab-logs`
 #   dogfood  (`just up dogfood`) GitHub App mode from ~/.config/scarab/dogfood.env,
@@ -12,6 +12,9 @@
 #   e2e      (`just e2e`)     dev-insecure, database `scarab_e2e`, bucket
 #                             `scarab-e2e`, so test data never mixes with dev's,
 #                             and a cloudflared quick tunnel in front of Forgejo
+#   chaos    (`just chaos`)   dev-insecure, database `scarab_chaos`, bucket
+#                             `scarab-chaos`, both reached through toxiproxy;
+#                             2 server replicas and 2 Depot replicas (ADR-0077)
 #
 # SCARAB_KIND_EXTRA_VALUES names one more Helm values file, applied last (for
 # example `just plugin-verify`'s plugin settings). It is not remembered:
@@ -59,8 +62,8 @@ helm_major="$(helm version --template '{{.Version}}' 2>/dev/null | sed -n 's/^v\
 [ "${helm_major:-0}" -ge 4 ] || die "Helm 4 is required (found $(helm version --short 2>/dev/null || echo none)); see https://helm.sh/docs/intro/install/"
 
 case "$mode" in
-  dev|dogfood|e2e) ;;
-  *) die "unknown mode '$mode' (expected dev, dogfood or e2e)" ;;
+  dev|dogfood|e2e|chaos) ;;
+  *) die "unknown mode '$mode' (expected dev, dogfood, e2e or chaos)" ;;
 esac
 extra_values="${SCARAB_KIND_EXTRA_VALUES:-}"
 if [ -n "$extra_values" ]; then
@@ -113,6 +116,9 @@ elif [ "$mode" = e2e ]; then
      && [ -z "$(git -C "$root" branch -r --contains "$libs_commit" 2>/dev/null)" ]; then
     die "libs/ at $libs_commit is not pushed: the server fetches libs/clone.yaml from github.com at that commit"
   fi
+elif [ "$mode" = chaos ]; then
+  database=scarab_chaos
+  bucket=scarab-chaos
 else
   database=scarab
   bucket=scarab-logs
@@ -337,6 +343,20 @@ if ! kc exec -n "$ns" deploy/scarab-postgres -- psql -U scarab -d scarab -tAc \
   kc exec -n "$ns" deploy/scarab-postgres -- createdb -U scarab "$database"
 fi
 database_url="postgres://scarab:scarab@scarab-postgres:5432/$database"
+# Chaos mode reaches the same Postgres and MinIO through toxiproxy, so a
+# scenario can fault those connections (ADR-0077 §3). Other modes do not run it.
+s3_endpoint="http://scarab-minio:9000"
+if [ "$mode" = chaos ]; then
+  echo "==> toxiproxy (chaos mode: Postgres and MinIO through it)"
+  kc apply -n "$ns" -f "$here/toxiproxy.yaml" >/dev/null
+  # The proxies are read from the ConfigMap at start; restart on a change.
+  kc rollout restart -n "$ns" deploy/scarab-toxiproxy >/dev/null
+  kc rollout status -n "$ns" deploy/scarab-toxiproxy --timeout=180s
+  database_url="postgres://scarab:scarab@scarab-toxiproxy:15432/$database"
+  s3_endpoint="http://scarab-toxiproxy:19000"
+else
+  kc delete -n "$ns" -f "$here/toxiproxy.yaml" --ignore-not-found >/dev/null
+fi
 
 # Forgejo, in every mode. In e2e mode a cloudflared quick tunnel goes in front
 # of it first: Forgejo builds clone URLs and payload links from ROOT_URL, so
@@ -475,7 +495,7 @@ fi
 # Written as JSON (valid YAML) by python, never spliced into YAML text: a
 # secret with a quote, a backslash or a '#' stays the same bytes. The values
 # reach python through its environment, not argv, so they never show in `ps`.
-V_MODE="$mode" V_SUM="$binary_sum" V_BUCKET="$bucket" V_DEV_INSECURE="$dev_insecure" \
+V_MODE="$mode" V_SUM="$binary_sum" V_BUCKET="$bucket" V_S3_ENDPOINT="$s3_endpoint" V_DEV_INSECURE="$dev_insecure" \
 V_APP_ID="$app_id" V_PUBLIC_URL="https://${dogfood_host:-}" V_TIMEOUT="${timeout:-3600}" \
 V_DATABASE_URL="$database_url" V_MASTER_KEY="$master_key" V_RESULTS="$results_secret" \
 V_WORKSPACE="$workspace_secret" V_WEBHOOK="$webhook_secret" V_FORGEJO_WEBHOOK="$forgejo_webhook_secret" \
@@ -487,7 +507,7 @@ if e["V_DEV_INSECURE"] not in ("true", "false"):
 v = {
     "podAnnotations": {"scarab.dev/binary-sha256": e["V_SUM"]},
     "scarab": {
-        "s3": {"bucket": e["V_BUCKET"]},
+        "s3": {"bucket": e["V_BUCKET"], "endpoint": e["V_S3_ENDPOINT"]},
         "libsManifest": open(sys.argv[1]).read(),
         "devInsecure": e["V_DEV_INSECURE"] == "true",
     },
@@ -505,6 +525,13 @@ if e["V_MODE"] == "e2e":
     # The address bind stamps onto a hook it registers: Forgejo delivers to
     # the server's Service.
     v["scarab"]["publicUrl"] = "http://scarab.scarab.svc.cluster.local"
+if e["V_MODE"] == "chaos":
+    # ADR-0077 rank 1 and 2: two servers and two Depot replicas. Plugins off:
+    # the plugin runtime would delete the Deployments of plugins the chaos
+    # database does not know.
+    v["replicaCount"] = 2
+    v["workspace"] = {"replicaCount": 2}
+    v["plugins"] = {"enabled": False}
 if e["V_MODE"] == "dogfood":
     v["scarab"].update(githubAppId=e["V_APP_ID"], publicUrl=e["V_PUBLIC_URL"], stepTimeoutSecs=e["V_TIMEOUT"])
     v["secrets"].update(githubWebhookSecret=e["V_WEBHOOK"],
