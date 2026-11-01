@@ -10,6 +10,8 @@
 // references the crates), the rest are generic. Add `?theme=dark` (or `light`)
 // to the URL to pin the theme, and `?palette=mono` (or `emerald`) to pin the
 // palette (used for deterministic capture); otherwise the stored choices apply.
+// `?admin_orgs=acme,globex` makes the caller an admin of those orgs instead of
+// acme alone (the settings org switch).
 
 // Type-only imports — erased at compile time, so the install-before-App-loads
 // ordering in index.tsx is unaffected. The fixtures typecheck against the
@@ -1577,6 +1579,10 @@ export function installMock() {
     }
     document.documentElement.setAttribute("data-palette", pinnedPalette);
   }
+
+  // Which orgs the caller administers: `?admin_orgs=acme,globex`.
+  const adminOrgs = new URLSearchParams(window.location.search).get("admin_orgs");
+  if (adminOrgs) me.admin_orgs = adminOrgs.split(",").filter(Boolean);
 
   const realFetch = window.fetch.bind(window);
   window.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {

@@ -50,6 +50,16 @@ export const accountHref = (section: string) => `/settings/${section}`;
 export const orgHref = (org: string, section: string) =>
   `/orgs/${encodeURIComponent(org)}/settings/${section}`;
 
+/** The org from a route's `:org` param, which the router leaves
+ *  percent-encoded; a malformed escape stays as written. */
+export function orgFromParam(raw: string): string {
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
+}
+
 export function resolveSection(
   kind: SettingsGroupKind,
   id: string | undefined,
@@ -64,8 +74,8 @@ export function resolveSection(
  * the narrow-screen `<select>` both mark this one. `null` outside settings or
  * for a section that does not exist.
  *
- * The org stays as the path has it (percent-encoded), so the result compares
- * equal to the hrefs `navGroups` builds with `orgHref`.
+ * The org is decoded and escaped again with `orgHref`, so the result
+ * compares equal to the hrefs `navGroups` builds however the path spelled it.
  */
 export function activeSectionHref(pathname: string): string | null {
   const parts = pathname.split("/").filter((p) => p !== "");
@@ -73,7 +83,7 @@ export function activeSectionHref(pathname: string): string | null {
     return resolveSection("account", parts[1]) ? accountHref(parts[1]) : null;
   }
   if (parts[0] === "orgs" && parts[1] !== undefined && parts[2] === "settings" && parts[3] !== undefined) {
-    return resolveSection("org", parts[3]) ? `/orgs/${parts[1]}/settings/${parts[3]}` : null;
+    return resolveSection("org", parts[3]) ? orgHref(orgFromParam(parts[1]), parts[3]) : null;
   }
   return null;
 }

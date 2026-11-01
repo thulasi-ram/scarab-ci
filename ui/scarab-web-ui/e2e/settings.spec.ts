@@ -71,10 +71,27 @@ test("an environment opens read-only and its Edit button opens the edit screen",
   await expect(view.getByRole("checkbox")).toHaveCount(0);
   await expect(view.getByRole("button", { name: /delete|withdraw|grant|save/i })).toHaveCount(0);
 
+  // It sits in the settings frame, with its section marked in the sidebar.
+  const nav = page.getByRole("navigation", { name: "Settings" });
+  await expect(nav).toBeVisible();
+  await expect(nav.getByRole("link", { name: "Environments", exact: true })).toHaveAttribute(
+    "aria-current",
+    "page",
+  );
+  await expect(nav.locator('[aria-current="page"]')).toHaveCount(1);
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText(/Environments\s*production/);
+
   await view.getByRole("link", { name: "Edit", exact: true }).click();
   await expect(page).toHaveURL(/\/orgs\/acme\/settings\/environments\/production\/edit$/);
 
-  // The edit screen: every change the view left out.
+  // The edit screen: every change the view left out, in the same frame.
+  await expect(nav).toBeVisible();
+  await expect(nav.getByRole("link", { name: "Environments", exact: true })).toHaveAttribute(
+    "aria-current",
+    "page",
+  );
+  await expect(nav.locator('[aria-current="page"]')).toHaveCount(1);
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText(/Environments\s*production\s*Edit/);
   const edit = page.locator("section.page");
   await expect(edit.getByRole("textbox", { name: "description", exact: true })).toHaveValue(
     "customer-facing, eu-west-1 + us-east-1",
@@ -99,6 +116,31 @@ test("an environment opens read-only and its Edit button opens the edit screen",
   // Cancel goes back to the view without saving.
   await edit.getByRole("link", { name: "Cancel" }).click();
   await expect(page).toHaveURL(/\/orgs\/acme\/settings\/environments\/production$/);
+  expect(errors).toEqual([]);
+});
+
+test("the library review sits in the settings frame, with Libraries marked", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/orgs/acme/settings/libraries/review");
+  const nav = page.getByRole("navigation", { name: "Settings" });
+  await expect(nav.getByRole("link", { name: "Libraries", exact: true })).toHaveAttribute(
+    "aria-current",
+    "page",
+  );
+  await expect(page.locator("section.page section.page")).toHaveCount(0);
+  expect(errors).toEqual([]);
+});
+
+test("switching org on a section shows the other org's settings, not the first's", async ({ page }) => {
+  const errors = collectErrors(page);
+  // The mock makes the caller an admin of both orgs only when asked.
+  await page.goto("/orgs/acme/settings/secrets?admin_orgs=acme,globex");
+  await expect(page.getByText("Org secrets · acme", { exact: true })).toBeVisible();
+
+  await page.getByRole("combobox", { name: "Organization" }).selectOption("globex");
+  await expect(page).toHaveURL(/\/orgs\/globex\/settings\/secrets$/);
+  await expect(page.getByText("Org secrets · globex", { exact: true })).toBeVisible();
+  await expect(page.getByText("Org secrets · acme", { exact: true })).toHaveCount(0);
   expect(errors).toEqual([]);
 });
 

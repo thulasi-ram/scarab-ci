@@ -20,6 +20,7 @@ import {
   administers,
   legacyRedirect,
   navGroups,
+  orgFromParam,
   orgHref,
   resolveSection,
   settingsHome,
@@ -40,6 +41,8 @@ import OrgSecurity from "../components/OrgSecurity";
 import EventLog from "../components/EventLog";
 import Icon from "../components/Icon";
 
+const IDENTITY_ERROR = "Could not load your identity. Is the server up?";
+
 /** `/settings/:section` — a section of Your account. */
 export function AccountSettings() {
   const params = useParams<{ section: string }>();
@@ -49,14 +52,21 @@ export function AccountSettings() {
 /** `/orgs/:org/settings/:section?` — a section of one org's settings. */
 export function OrgSettings() {
   const params = useParams<{ org: string; section?: string }>();
-  return <SettingsShell kind="org" org={params.org} section={params.section} />;
+  return <SettingsShell kind="org" org={orgFromParam(params.org)} section={params.section} />;
 }
 
 /** An old settings URL (`/settings`, `/account`, …): where it lives now. */
 export function LegacySettings() {
   const location = useLocation();
   return (
-    <Show when={me()} fallback={<p class="empty page">loading…</p>}>
+    <Show
+      when={me()}
+      fallback={
+        <Show when={me.error} fallback={<p class="empty page">loading…</p>}>
+          <p class="error page">{IDENTITY_ERROR}</p>
+        </Show>
+      }
+    >
       {(who) => (
         <Navigate
           href={legacyRedirect(location.pathname, location.search, who()) ?? settingsHome(who())}
@@ -107,7 +117,7 @@ export function SettingsFrame(props: {
   return (
     <section class="page">
       <Show when={me.error}>
-        <p class="error">Could not load your identity. Is the server up?</p>
+        <p class="error">{IDENTITY_ERROR}</p>
       </Show>
       <Show when={me()} fallback={<Show when={!me.error}><p class="empty">loading…</p></Show>}>
         <div class="settings">
@@ -240,6 +250,11 @@ function OrgSwitch(props: { org: string; others: string[]; section?: string }) {
 }
 
 function SectionPage(props: { kind: SettingsGroupKind; org?: string; section: SettingsSection }) {
+  // The body is built once per org and section: a body reads the org when it
+  // is built, so switching org on the same section (the org picker, ⌘K) must
+  // build it again, not only switching section. The child keeps its
+  // parameter: Show calls a child function only when it takes one.
+  const key = createMemo(() => `${props.kind}:${props.org ?? ""}:${props.section.id}`);
   return (
     <>
       <div class="page-head">
@@ -251,8 +266,10 @@ function SectionPage(props: { kind: SettingsGroupKind; org?: string; section: Se
         </Show>{" "}
         · {props.section.sub}
       </p>
-      <Show when={props.section.id} keyed>
-        {(id) => (props.kind === "account" ? accountBody(id) : orgBody(id, props.org!))}
+      <Show when={key()} keyed>
+        {(_key) =>
+          props.kind === "account" ? accountBody(props.section.id) : orgBody(props.section.id, props.org!)
+        }
       </Show>
     </>
   );

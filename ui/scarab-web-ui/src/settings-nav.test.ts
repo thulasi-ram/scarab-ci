@@ -6,6 +6,7 @@ import {
   activeSectionHref,
   legacyRedirect,
   navGroups,
+  orgFromParam,
   orgHref,
   paletteEntries,
   resolveSection,
@@ -30,6 +31,12 @@ describe("route table", () => {
 
   it("escapes the org in the path", () => {
     expect(orgHref("a b/c", "members")).toBe("/orgs/a%20b%2Fc/settings/members");
+  });
+
+  it("decodes the org from a route param, and keeps a malformed one as written", () => {
+    expect(orgFromParam("a%20b%2Fc")).toBe("a b/c");
+    expect(orgFromParam("acme")).toBe("acme");
+    expect(orgFromParam("bad%zz")).toBe("bad%zz");
   });
 
   it("resolves a known section and refuses an unknown one", () => {
@@ -110,10 +117,12 @@ describe("which section the sidebar marks", () => {
     }
   });
 
-  it("keeps an escaped org escaped, so it matches the sidebar's href", () => {
+  it("matches the sidebar's href for an org that needs escaping, however the path spells it", () => {
     expect(activeSectionHref(`${orgHref("a b/c", "environments")}/production/edit`)).toBe(
       orgHref("a b/c", "environments"),
     );
+    // A browser leaves `@` unescaped in a path; orgHref escapes it.
+    expect(activeSectionHref("/orgs/team@x/settings/members")).toBe(orgHref("team@x", "members"));
   });
 
   it("marks nothing outside settings or for an unknown section", () => {

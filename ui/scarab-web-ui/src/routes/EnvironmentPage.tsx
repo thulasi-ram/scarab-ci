@@ -15,7 +15,7 @@
 // sidebar, and each has its own URL to send as a link. The frame shows them
 // only to an admin of the org; the server enforces Administer on every
 // request.
-import { createResource, createSignal, For, Show, type JSX } from "solid-js";
+import { createMemo, createResource, createSignal, For, Show, type JSX } from "solid-js";
 import { A, useNavigate, useParams } from "@solidjs/router";
 import {
   deleteOrgEnvironment,
@@ -47,26 +47,38 @@ import {
   type EnvironmentWrite,
 } from "../org-environments";
 import { addToList } from "../identities";
+import { orgFromParam } from "../settings-nav";
 import { SettingsCrumbs, SettingsFrame, type Crumb } from "./Settings";
 import { absTime, relTime } from "../fmt";
 import PrincipalSearch from "../components/PrincipalSearch";
 import Icon from "../components/Icon";
 
-/** The route's org and Environment name, decoded. */
-function useEnvironmentParams() {
+/**
+ * The settings frame around one Environment's page, with the org and name
+ * from the route, decoded. The page is built again for each org and name:
+ * what it loads and edits belongs to the ones it was built with.
+ */
+function EnvironmentFrame(props: { children: (org: string, name: string) => JSX.Element }) {
   const params = useParams<{ org: string; env: string }>();
-  return {
-    org: () => params.org,
-    name: () => nameFromParam(params.env),
-  };
+  const org = () => orgFromParam(params.org);
+  const name = () => nameFromParam(params.env);
+  const key = createMemo(() => JSON.stringify([org(), name()]));
+  return (
+    <SettingsFrame kind="org" org={org()} section="environments">
+      {/* The child keeps its parameter: Show calls a child function only
+          when it takes one. */}
+      <Show when={key()} keyed>
+        {(_key) => props.children(org(), name())}
+      </Show>
+    </SettingsFrame>
+  );
 }
 
 /** The Environment by name, from the org's list (there is no single read).
  *  `undefined` while loading; `null` when there is none of that name. */
-function useEnvironment(org: () => string, name: () => string) {
+function useEnvironment(org: string, name: string) {
   const [envs, { refetch }] = createResource(
-    () => ({ org: org(), name: name() }),
-    async (k) => (await listOrgEnvironments(k.org))?.find((e) => e.name === k.name) ?? null,
+    async () => (await listOrgEnvironments(org))?.find((e) => e.name === name) ?? null,
   );
   return [envs, refetch] as const;
 }
@@ -129,25 +141,28 @@ function Guard(props: {
 
 /** `/orgs/:org/settings/environments/:env` — the Environment, read-only. */
 export function EnvironmentView() {
-  const p = useEnvironmentParams();
-  const [env] = useEnvironment(p.org, p.name);
+  return <EnvironmentFrame>{(org, name) => <View org={org} name={name} />}</EnvironmentFrame>;
+}
+
+function View(props: { org: string; name: string }) {
+  const [env] = useEnvironment(props.org, props.name);
   return (
-    <SettingsFrame kind="org" org={p.org()} section="environments">
-      <Head org={p.org()} name={p.name()} />
-      <Guard org={p.org()} name={p.name()} env={env()} loading={env.loading} error={env.error}>
+    <>
+      <Head org={props.org} name={props.name} />
+      <Guard org={props.org} name={props.name} env={env()} loading={env.loading} error={env.error}>
         {(e) => (
           <>
             <div class="run-toolbar">
-              <A href={environmentEditHref(p.org(), e.name)} class="btn btn-primary btn-sm">
+              <A href={environmentEditHref(props.org, e.name)} class="btn btn-primary btn-sm">
                 Edit
               </A>
             </div>
             <Details env={e} />
-            <ProjectsPanel org={p.org()} env={e.name} />
+            <ProjectsPanel org={props.org} env={e.name} />
           </>
         )}
       </Guard>
-    </SettingsFrame>
+    </>
   );
 }
 
@@ -262,15 +277,18 @@ function ProjectsPanel(props: {
 
 /** `/orgs/:org/settings/environments/:env/edit` — every change to it. */
 export function EnvironmentEdit() {
-  const p = useEnvironmentParams();
-  const [env] = useEnvironment(p.org, p.name);
+  return <EnvironmentFrame>{(org, name) => <Edit org={org} name={name} />}</EnvironmentFrame>;
+}
+
+function Edit(props: { org: string; name: string }) {
+  const [env] = useEnvironment(props.org, props.name);
   return (
-    <SettingsFrame kind="org" org={p.org()} section="environments">
-      <Head org={p.org()} name={p.name()} edit />
-      <Guard org={p.org()} name={p.name()} env={env()} loading={env.loading} error={env.error}>
-        {(e) => <EditForm org={p.org()} env={e} />}
+    <>
+      <Head org={props.org} name={props.name} edit />
+      <Guard org={props.org} name={props.name} env={env()} loading={env.loading} error={env.error}>
+        {(e) => <EditForm org={props.org} env={e} />}
       </Guard>
-    </SettingsFrame>
+    </>
   );
 }
 
