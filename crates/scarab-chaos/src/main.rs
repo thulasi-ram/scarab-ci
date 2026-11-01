@@ -1,0 +1,175 @@
+//! `scarab-chaos`: run a rank-1 scenario, replay one, or check one.
+//!
+//!   scarab-chaos run --kind mid-drain --seed 7 --out-root DIR   run, then check
+//!   scarab-chaos replay DIR/scenario.json --out-root DIR         same plan, new run, then check
+//!   scarab-chaos check DIR/scenario.json                         check a finished run again
+//!
+//! Connections come from the environment `deploy/kind/chaos.sh` sets:
+//! SCARAB_CHAOS_API, SCARAB_CHAOS_KUBECONFIG, SCARAB_CHAOS_NAMESPACE,
+//! SCARAB_CHAOS_DATABASE_URL, SCARAB_CHAOS_S3_ENDPOINT, SCARAB_CHAOS_S3_BUCKET,
+//! SCARAB_CHAOS_S3_ACCESS_KEY, SCARAB_CHAOS_S3_SECRET_KEY.
+
+use std::path::{Path, PathBuf};
+
+use clap::{Parser, Subcommand};
+use scarab_chaos::{check, env, nemesis, pods, scenario};
+
+#[derive(Parser)]
+#[command(name = "scarab-chaos", about = "ADR-0077 fault scenarios and invariant checker")]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Run a fresh scenario from a seed, then check it.
+    Run {
+        #[arg(long, value_enum)]
+        kind: scenario::Kind,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        /// Directory the per-run directory is created in.
+        #[arg(long)]
+        out_root: PathBuf,
+        #[arg(long, default_value_t = 2)]
+        server_replicas: u32,
+        #[arg(long, default_value_t = 2)]
+        depot_replicas: u32,
+    },
+    /// Fire the plan of an earlier scenario file again (no RNG), then check.
+    Replay {
+        file: PathBuf,
+        #[arg(long)]
+        out_root: PathBuf,
+    },
+    /// Check a finished scenario (its directory holds pods.jsonl).
+    Check { file: PathBuf },
+}
+
+fn var(k: &str) -> Result<String, String> {
+    std::env::var(k).map_err(|_| format!("{k} is not set (run through `just chaos`)"))
+}
+
+struct Conn {
+    stack: nemesis::Stack,
+    bucket: object_store::aws::AmazonS3,
+}
+
+async fn connect() -> Result<Conn, String> {
+    let kube = env::kube_client(Path::new(&var("SCARAB_CHAOS_KUBECONFIG")?)).await?;
+    let pg = env::pg(&var("SCARAB_CHAOS_DATABASE_URL")?).await?;
+    let bucket = env::bucket(
+        &var("SCARAB_CHAOS_S3_ENDPOINT")?,
+        &var("SCARAB_CHAOS_S3_BUCKET")?,
+        &var("SCARAB_CHAOS_S3_ACCESS_KEY")?,
+        &var("SCARAB_CHAOS_S3_SECRET_KEY")?,
+    )?;
+    Ok(Conn {
+        stack: nemesis::Stack {
+            api: env::Api::new(&var("SCARAB_CHAOS_API")?)?,
+            kube,
+            namespace: std::env::var("SCARAB_CHAOS_NAMESPACE").unwrap_or_else(|_| "scarab".into()),
+            release: std::env::var("SCARAB_CHAOS_RELEASE").unwrap_or_else(|_| "scarab".into()),
+            pg,
+        },
+        bucket,
+    })
+}
+
+/// Check the scenario in `dir`, write `verdict.json` beside it and print the
+/// verdict lines. Returns whether it passed.
+async fn check_dir(conn: &Conn, file: &Path) -> Result<bool, String> {
+    let s = scenario::Scenario::read(file)?;
+    let dir = file.parent().unwrap_or(Path::new("."));
+    let records = pods::read_records(&dir.join("pods.jsonl"))?;
+    let src = check::Sources {
+        pg: &conn.stack.pg,
+        bucket: &conn.bucket,
+        kube: conn.stack.kube.clone(),
+        namespace: &conn.stack.namespace,
+    };
+    let facts = check::gather(&src, &s, records).await?;
+    let v = check::evaluate(&facts);
+    let out = dir.join("verdict.json");
+    std::fs::write(&out, serde_json::to_string_pretty(&v).map_err(|e| e.to_string())? + "\n")
+        .map_err(|e| format!("{}: {e}", out.display()))?;
+    let landing = s
+        .faults
+        .iter()
+        .map(|f| {
+            format!(
+                "{} {} at +{} ms after trigger, landed {}",
+                f.action,
+                f.pod,
+                f.trigger.as_ref().map(|t| f.fired_at_ms - t.observed_at_ms).unwrap_or(0),
+                f.landing.as_ref().map(|l| l.class.as_str()).unwrap_or("unknown")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    println!("scenario: {}", file.display());
+    println!(
+        "  {} seed {} runs {:?}; faults: {}",
+        s.kind.as_str(),
+        s.seed,
+        s.runs,
+        if landing.is_empty() { "none fired".into() } else { landing }
+    );
+    for (inv, n) in &v.checked {
+        let fails = v.findings.iter().filter(|f| &f.invariant == inv && f.severity == check::Severity::Fail).count();
+        println!("  {inv:<4} {} ({n} checked)", if fails == 0 { "ok".to_string() } else { format!("FAIL x{fails}") });
+    }
+    for f in &v.findings {
+        println!("  [{:?}] {}: {}", f.severity, f.invariant, f.detail);
+    }
+    for n in &s.notes {
+        println!("  note: {n}");
+    }
+    println!("VERDICT {} {} ({})", if v.pass { "PASS" } else { "FAIL" }, s.kind.as_str(), out.display());
+    Ok(v.pass)
+}
+
+async fn main_inner() -> Result<bool, String> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let cli = Cli::parse();
+    match cli.cmd {
+        Cmd::Run {
+            kind,
+            seed,
+            out_root,
+            server_replicas,
+            depot_replicas,
+        } => {
+            let conn = connect().await?;
+            let s = scenario::Scenario::new(kind, seed, scenario::Workload::default(), server_replicas, depot_replicas);
+            let dir = nemesis::run_dir(&out_root, kind, seed, false);
+            nemesis::run(&conn.stack, s, &dir).await?;
+            check_dir(&conn, &dir.join("scenario.json")).await
+        }
+        Cmd::Replay { file, out_root } => {
+            let conn = connect().await?;
+            let old = scenario::Scenario::read(&file)?;
+            let s = old.replay(&file.display().to_string());
+            let dir = nemesis::run_dir(&out_root, s.kind, s.seed, true);
+            nemesis::run(&conn.stack, s, &dir).await?;
+            check_dir(&conn, &dir.join("scenario.json")).await
+        }
+        Cmd::Check { file } => {
+            let conn = connect().await?;
+            check_dir(&conn, &file).await
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    match main_inner().await {
+        Ok(true) => {}
+        Ok(false) => std::process::exit(1),
+        Err(e) => {
+            eprintln!("scarab-chaos: {e}");
+            std::process::exit(2);
+        }
+    }
+}

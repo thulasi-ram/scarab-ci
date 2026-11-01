@@ -2694,6 +2694,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "scarab-chaos"
+version = "0.2.2"
+dependencies = [
+ "clap",
+ "futures",
+ "k8s-openapi",
+ "kube",
+ "object_store",
+ "rand 0.8.7",
+ "reqwest",
+ "rustls",
+ "scarab-storage",
+ "scarab-workspace-client",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+]
+
+[[package]]
 name = "scarab-cli"
 version = "0.2.2"
 dependencies = [
