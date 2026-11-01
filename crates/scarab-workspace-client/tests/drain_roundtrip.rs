@@ -14,7 +14,9 @@ use std::sync::Arc;
 use scarab_executor_k8s::workspace_token::{self, Fence};
 use scarab_storage::TreeHash;
 use scarab_storage_s3::S3Storage;
-use scarab_workspace_client::{DrainPostOutcome, DrainRecord, MemoCas, WorkspaceClient};
+use scarab_workspace_client::{
+    CacheSaveRoute, DrainPostOutcome, DrainRecord, MemoCas, WorkspaceClient,
+};
 
 mod common;
 
@@ -1970,17 +1972,28 @@ async fn a_depot_restart_mid_drain_re_drives_from_scratch_and_a_lost_2xx_is_post
 // ---------------------------------------------------------------------------
 
 /// A producer Step's whole drain of [`build_cached_workspace`] with
-/// `node_modules` cached, through `content` — what `run_drain` does. Returns the published (cache-excluded)
-/// root, which is durable, and the saved cache root, which is warm-only on
-/// whichever replica took the cache-dir PUTs.
-async fn drain_cached_workspace(content: &WorkspaceClient) -> (String, String) {
+/// `node_modules` cached, through `content` and, when given, the Cache's
+/// `home` replica — what `run_drain` does. Returns the published
+/// (cache-excluded) root, which is durable, the saved cache root, which is
+/// warm-only on whichever replica took the cache-dir PUTs, and where they went.
+async fn drain_cached_workspace(
+    content: &WorkspaceClient,
+    home: Option<&WorkspaceClient>,
+) -> (String, String, CacheSaveRoute) {
     let ws = tempfile::tempdir().unwrap();
     build_cached_workspace(ws.path());
     let cache_dirs = vec!["node_modules".to_string()];
-    let report = content
-        .drain_ingest_report(ws.path().to_str().unwrap(), &[], &cache_dirs)
-        .await
-        .expect("drain ingest");
+    let path = ws.path().to_str().unwrap();
+    let report = match home {
+        None => content.drain_ingest_report(path, &[], &cache_dirs).await,
+        Some(home) => {
+            content
+                .drain_ingest_report_with_cache_home(path, &[], &cache_dirs, home)
+                .await
+        }
+    }
+    .expect("drain ingest");
+    let route = report.cache_route.clone();
     let cache_root = report.cache_roots["node_modules"].clone();
     let memo = MemoCas::new(content, report.trees);
     let excluded =
@@ -2007,7 +2020,7 @@ async fn drain_cached_workspace(content: &WorkspaceClient) -> (String, String) {
         })
         .await
         .expect("the producer's record posts");
-    (excluded.0, cache_root)
+    (excluded.0, cache_root, route)
 }
 
 /// A consumer Step's token: its required input, plus the cache restore root
@@ -2050,8 +2063,9 @@ fn consumer_client(base: &str, input: &str, cache_root: &str, legacy: bool) -> W
 async fn a_cache_on_one_replica_does_not_fail_a_required_fetch_on_another() {
     let Some(a) = Harness::start().await else { return };
     let b = a.replica().await;
-    let (input, cache_root) =
-        drain_cached_workspace(&a.fence_client_for("run-producer", "build", "a1")).await;
+    let (input, cache_root, route) =
+        drain_cached_workspace(&a.fence_client_for("run-producer", "build", "a1"), None).await;
+    assert_eq!(route, CacheSaveRoute::Service, "no home: replicaCount 1 behaviour");
 
     // `/flat` on A, blob GETs on B: the scatter, constructed.
     let manifest = consumer_client(&a.base, &input, &cache_root, false)
@@ -2102,4 +2116,120 @@ async fn a_cache_on_one_replica_does_not_fail_a_required_fetch_on_another() {
         matches!(err, scarab_storage::StorageError::Status { status: 500, .. }),
         "expected the walk's 500, got {err:?}"
     );
+}
+
+/// Restore `root` through `client` into a fresh dir: `Ok(dir)` is a hit.
+async fn restore(
+    client: &WorkspaceClient,
+    root: &str,
+) -> Result<tempfile::TempDir, scarab_storage::StorageError> {
+    let dir = tempfile::tempdir().unwrap();
+    scarab_storage::Cas::materialize(client, &TreeHash(root.to_string()), dir.path().to_str().unwrap())
+        .await
+        .map(|()| dir)
+}
+
+/// A base URL nothing listens on — a home replica that is down.
+async fn dead_base() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    format!("http://{addr}")
+}
+
+/// git-bug 12e2f6b, three Depot replicas on one Postgres and one bucket. The
+/// producer's drain goes through A (the ClusterIP stand-in) with C as the
+/// Cache's home: the cache-dir content lands on C alone, so a restore from C
+/// is a hit and a restore from any other replica is a miss — which is why
+/// both the save and the restore must go to the home. The published root
+/// stays durable and reads anywhere.
+///
+/// Mutations killed: routing cache-dir content through the service (the hit
+/// on C becomes a miss, the miss on A a hit); routing durable content to the
+/// home (the record's durable-presence gate or B's input read fails).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cache_saved_to_its_home_restores_from_its_home() {
+    let Some(a) = Harness::start().await else { return };
+    let b = a.replica().await;
+    let c = a.replica().await;
+    let producer = |base: &str| {
+        WorkspaceClient::new(
+            base,
+            workspace_token::mint(
+                SECRET,
+                &workspace_token::step_claims(
+                    Fence {
+                        run: "run-producer".into(),
+                        step: "build".into(),
+                        attempt: "a1".into(),
+                    },
+                    far_future(),
+                    Vec::new(),
+                ),
+            ),
+        )
+    };
+    let (input, cache_root, route) =
+        drain_cached_workspace(&producer(&a.base), Some(&producer(&c.base))).await;
+    assert_eq!(route, CacheSaveRoute::Home);
+
+    let hit = restore(&consumer_client(&c.base, &input, &cache_root, false), &cache_root)
+        .await
+        .expect("a restore from the home is a hit");
+    assert_eq!(
+        std::fs::read(hit.path().join("leftpad/index.js")).unwrap(),
+        b"module.exports = cache-only bytes, unique to the cache dir"
+    );
+    for (name, other) in [("A", &a), ("B", &b)] {
+        assert!(
+            restore(&consumer_client(&other.base, &input, &cache_root, false), &cache_root)
+                .await
+                .is_err(),
+            "replica {name} is not the home and must not hold the cache"
+        );
+    }
+    // The published input is durable: any replica serves it.
+    let got = restore(&consumer_client(&b.base, &input, &cache_root, false), &input)
+        .await
+        .expect("the input reads from any replica");
+    assert!(got.path().join("src/main.rs").exists());
+
+    // The home gone (down, or remapped by a scale change): a clean miss,
+    // an error the fetcher logs as `cache restore miss`, never a panic.
+    let gone = consumer_client(&dead_base().await, &input, &cache_root, false);
+    assert!(restore(&gone, &cache_root).await.is_err());
+}
+
+/// A home that cannot be reached during the save is not a failed drain
+/// (git-bug 12e2f6b): the cache-dir content goes through the service
+/// instead, the record posts, and the drain says it fell back. The save
+/// then lives where the service put it — here A — and a later restore from
+/// the home misses.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unreachable_home_falls_back_to_the_service_and_the_drain_succeeds() {
+    let Some(a) = Harness::start().await else { return };
+    let producer = a.fence_client_for("run-fallback", "build", "a1");
+    let home = WorkspaceClient::new(
+        dead_base().await,
+        workspace_token::mint(
+            SECRET,
+            &workspace_token::step_claims(
+                Fence {
+                    run: "run-fallback".into(),
+                    step: "build".into(),
+                    attempt: "a1".into(),
+                },
+                far_future(),
+                Vec::new(),
+            ),
+        ),
+    );
+    let (input, cache_root, route) = drain_cached_workspace(&producer, Some(&home)).await;
+    assert!(
+        matches!(route, CacheSaveRoute::FellBack(_)),
+        "the drain must say the save missed its home: {route:?}"
+    );
+    restore(&consumer_client(&a.base, &input, &cache_root, false), &cache_root)
+        .await
+        .expect("the fallback save is on the service replica");
 }
