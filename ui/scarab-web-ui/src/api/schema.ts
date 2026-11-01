@@ -167,9 +167,10 @@ export interface paths {
         };
         /**
          * Registered forge connections + their bound Projects and health (ADR-0060)
-         * @description Read-only, and `Administer` on the Org: a connection spans every Project it
-         *     serves, so seeing the fleet is an org-level act, not a per-repo one. No
-         *     credential material is ever returned — only whether the handle resolves.
+         * @description Read-only, and per Org (git-bug 19b0a45): the caller sees the connections
+         *     of the Orgs it administers, and a global admin also sees the unassigned
+         *     ones. No credential material is ever returned — only whether the handle
+         *     resolves.
          */
         get: operations["list_connections"];
         put?: never;
@@ -2622,6 +2623,11 @@ export interface components {
              */
             managed_by_config: boolean;
             /**
+             * @description The Org this connection serves (git-bug 19b0a45); `null` = unassigned,
+             *     visible to and editable by global admins only.
+             */
+            org?: string | null;
+            /**
              * @description The Projects this connection serves, from its repo bindings — a Project
              *     *is* a binding (ADR-0046), so this is the connection's whole footprint.
              */
@@ -2736,6 +2742,12 @@ export interface components {
              *     registration (ADR-0060 part C), so a create form for it could not work.
              */
             kind: string;
+            /**
+             * @description The Org the connection serves (git-bug 19b0a45): the forge owner whose
+             *     repositories it binds. The caller must administer it; the first
+             *     connection of an Org that does not exist yet needs a global admin.
+             */
+            org: string;
         };
         /** @description `POST …/policies`. */
         CreatePolicyRequest: {
@@ -3199,6 +3211,13 @@ export interface components {
             can_administer: boolean;
             /** @description Human display name, when the identity provides one. */
             display_name?: string | null;
+            /**
+             * @description Does the caller hold a global `Administer` role? Only such a caller
+             *     may add the first connection of an Org that does not exist yet, or
+             *     act on an unassigned connection (git-bug 19b0a45). Always `false` for
+             *     an API token.
+             */
+            global_admin: boolean;
             /**
              * @description The provider accounts this Principal can sign in with (ADR-0069).
              *     Empty when no identity store is wired (dev).
@@ -4192,6 +4211,12 @@ export interface components {
              *     see the handler's note on why re-sync never unbinds.
              */
             confirmed: number;
+            /**
+             * @description Repos the forge reports that were not bound: owned by another account
+             *     than the connection's Org, or bound through another Org's connection
+             *     (git-bug 19b0a45).
+             */
+            skipped: string[];
         };
         RetryDefaultsRequest: {
             /** @description A ForgeConnection to read the mirror through. */
@@ -5221,7 +5246,10 @@ export interface operations {
     };
     list_connections: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description only the connections serving this org */
+                org?: string;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -5236,7 +5264,7 @@ export interface operations {
                     "application/json": components["schemas"]["ConnectionDto"][];
                 };
             };
-            /** @description requires Administer on the org */
+            /** @description requires Administer on an org */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -5273,14 +5301,14 @@ export interface operations {
                     "application/json": components["schemas"]["CreatedConnectionDto"];
                 };
             };
-            /** @description unknown kind, non-creatable kind, or a malformed base URL */
+            /** @description unknown kind, non-creatable kind, a malformed base URL, or a missing or reserved org */
             400: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content?: never;
             };
-            /** @description requires Administer on the org — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            /** @description requires Administer on the org; a new org needs a global admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -5296,7 +5324,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description a connection to that forge and base URL already exists */
+            /** @description the org already has a connection to that forge and base URL */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -5469,7 +5497,7 @@ export interface operations {
                     "application/json": components["schemas"]["BindRepoResultDto"];
                 };
             };
-            /** @description missing owner/name */
+            /** @description missing owner/name, or a repo not owned by the connection's org */
             400: {
                 headers: {
                     [name: string]: unknown;
