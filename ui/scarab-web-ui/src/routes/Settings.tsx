@@ -25,6 +25,7 @@ import {
 } from "../settings-nav";
 import LinkedAccounts from "../components/LinkedAccounts";
 import SecuritySettings from "../components/SecuritySettings";
+import AppearanceSettings from "../components/AppearanceSettings";
 import Connections from "../components/Connections";
 import Members from "../components/Members";
 import OrgEnvironments from "../components/OrgEnvironments";
@@ -189,6 +190,8 @@ function accountBody(id: string): JSX.Element {
       return <LinkedAccounts />;
     case "security":
       return <SecuritySettings />;
+    case "appearance":
+      return <AppearanceSettings />;
     default:
       return <NotFound />;
   }

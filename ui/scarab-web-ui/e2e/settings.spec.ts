@@ -20,8 +20,8 @@ test("an admin lands on their org's settings and every section opens at its own 
   const nav = page.getByRole("navigation", { name: "Settings" });
   const links = nav.getByRole("link");
   const count = await links.count();
-  // Your account (2) + Organization settings (9) for the fixture's admin.
-  expect(count).toBe(11);
+  // Your account (3) + Organization settings (9) for the fixture's admin.
+  expect(count).toBe(12);
 
   const seen = new Set<string>();
   for (let i = 0; i < count; i++) {
@@ -99,5 +99,28 @@ test("an environment opens read-only and its Edit button opens the edit screen",
   // Cancel goes back to the view without saving.
   await edit.getByRole("link", { name: "Cancel" }).click();
   await expect(page).toHaveURL(/\/orgs\/acme\/settings\/environments\/production$/);
+  expect(errors).toEqual([]);
+});
+
+test("Appearance switches the palette and the mode, and the choice survives a reload", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/settings/appearance");
+  await expect(page.getByRole("heading", { level: 1, name: "Appearance", exact: true })).toBeVisible();
+  const html = page.locator("html");
+  await expect(html).toHaveAttribute("data-palette", "emerald");
+
+  await page.getByRole("radio", { name: /Mono/ }).click();
+  await expect(html).toHaveAttribute("data-palette", "mono");
+  await expect(page.getByRole("radio", { name: /Mono/ })).toBeChecked();
+
+  await page.getByRole("radio", { name: /Dark/ }).click();
+  await expect(html).toHaveAttribute("data-theme", "dark");
+
+  await page.reload();
+  await expect(html).toHaveAttribute("data-palette", "mono");
+  await expect(html).toHaveAttribute("data-theme", "dark");
+
+  await page.getByRole("radio", { name: /Emerald/ }).click();
+  await expect(html).toHaveAttribute("data-palette", "emerald");
   expect(errors).toEqual([]);
 });

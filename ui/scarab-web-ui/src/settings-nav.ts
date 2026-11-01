@@ -28,6 +28,7 @@ export interface SettingsCaller {
 export const ACCOUNT_SECTIONS: readonly SettingsSection[] = [
   { id: "profile", label: "Profile", sub: "your sign-in accounts" },
   { id: "security", label: "Security", sub: "your passkeys and security events" },
+  { id: "appearance", label: "Appearance", sub: "palette and light or dark mode" },
 ];
 
 // Connections first: without one there are no repositories, so nothing below

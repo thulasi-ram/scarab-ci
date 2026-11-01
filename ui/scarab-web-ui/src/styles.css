@@ -3814,3 +3814,39 @@ code.c { font-family: var(--font-mono); font-size: var(--fs-sm); color: var(--co
   .settings-nav { display: none; }
   .settings-select { display: block; width: 100%; margin-bottom: 20px; }
 }
+
+/* Settings → Appearance: one card per choice, each with a swatch. A swatch
+   carries its own data-palette and data-theme, so every var() inside it reads
+   the look it offers, not the page's. */
+.appearance-choices { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 12px; }
+.appearance-choice {
+  display: flex; flex-direction: column; gap: 6px; padding: 10px;
+  border: 1px solid var(--border); border-radius: var(--radius); cursor: pointer;
+  background: var(--emerald-surface); transition: border-color 0.12s var(--ease-out);
+}
+.appearance-choice:hover { border-color: var(--sage); }
+.appearance-choice.on { border-color: var(--emerald); box-shadow: inset 0 0 0 1px var(--emerald); }
+.appearance-choice-row { display: flex; align-items: center; gap: 8px; }
+.appearance-choice-row input { margin: 0; accent-color: var(--emerald); }
+.appearance-choice-label { font-size: var(--fs-md); font-weight: 600; color: var(--soft-white); }
+.appearance-choice-sub { font-size: var(--fs-sm); color: var(--muted-sage); }
+.swatch {
+  display: flex; flex-direction: column; gap: 6px; height: 84px; padding: 0 8px 8px;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--carapace-black); overflow: hidden;
+}
+.swatch-bar { height: 10px; margin: 0 -8px; background: var(--pine-deep); border-bottom: 1px solid var(--border); }
+.swatch-card {
+  flex: 1; display: flex; flex-direction: column; gap: 5px; padding: 7px 8px;
+  background: var(--emerald-surface); border: 1px solid var(--border); border-radius: var(--radius-sm);
+}
+.swatch-line { height: 4px; width: 70%; border-radius: 2px; background: var(--soft-white); }
+.swatch-line.short { width: 45%; background: var(--muted-sage); }
+.swatch-foot { margin-top: auto; display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+.swatch-accent { height: 6px; width: 28px; border-radius: 2px; background: var(--emerald); }
+.swatch-dots { display: flex; gap: 4px; }
+.swatch-dots i { width: 7px; height: 7px; border-radius: 50%; }
+.swatch-dots .ok { background: var(--ok); }
+.swatch-dots .running { background: var(--running); }
+.swatch-dots .warn { background: var(--warn); }
+.swatch-dots .danger { background: var(--danger); }

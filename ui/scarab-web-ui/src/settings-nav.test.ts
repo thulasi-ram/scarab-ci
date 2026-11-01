@@ -34,6 +34,7 @@ describe("route table", () => {
   it("resolves a known section and refuses an unknown one", () => {
     expect(resolveSection("org", "members")?.label).toBe("Members");
     expect(resolveSection("account", "security")?.label).toBe("Security");
+    expect(resolveSection("account", "appearance")?.label).toBe("Appearance");
     expect(resolveSection("org", "profile")).toBeUndefined();
     expect(resolveSection("account", "members")).toBeUndefined();
   });
@@ -51,6 +52,11 @@ describe("admin gating", () => {
   it("shows a non-admin only their own group", () => {
     const groups = navGroups(member, undefined);
     expect(groups.map((g) => g.kind)).toEqual(["account"]);
+    expect(groups[0]!.items.map((i) => i.href)).toEqual([
+      "/settings/profile",
+      "/settings/security",
+      "/settings/appearance",
+    ]);
   });
 
   it("shows an admin their account and the org in view", () => {
