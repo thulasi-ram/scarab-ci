@@ -1278,6 +1278,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }));
     }
+    // API token call counts (git-bug a4cb94f) are counted in memory and
+    // written every minute, and once more at shutdown, so a rollout loses at
+    // most what arrives during the drain.
+    let token_uses_state = state.clone();
+    let token_uses_flusher = state.api_tokens.is_some().then(|| {
+        let st = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                tick.tick().await;
+                scarab_server::flush_api_token_uses(&st).await;
+            }
+        })
+    });
     let app = router(state);
 
     let listener = tokio::net::TcpListener::bind(&config.addr).await?;
@@ -1288,6 +1302,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+    if let Some(handle) = token_uses_flusher {
+        handle.abort();
+    }
+    scarab_server::flush_api_token_uses(&token_uses_state).await;
     if let Some(handle) = broker_handle {
         // It got the same signal; give it its own drain, then stop waiting.
         let _ = tokio::time::timeout(Duration::from_secs(10), handle).await;

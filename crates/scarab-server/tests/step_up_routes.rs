@@ -62,6 +62,9 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
     ("POST", "/v1/me/step-up/options", "step_up.options", "CER"),
     ("POST", "/v1/me/step-up", "step_up.confirm", "CER"),
     ("GET", "/v1/me/security/events", "read", "READ"),
+    ("GET", "/v1/me/tokens", "read", "READ"),
+    ("POST", "/v1/me/tokens", "token.mint_own", "CJ-A"),
+    ("DELETE", "/v1/me/tokens/{id}", "token.revoke_own", "EX"),
     ("GET", "/v1/security/events", "read", "READ"),
     ("GET", "/v1/orgs/{org}/security/events", "read", "READ"),
     ("GET", "/v1/orgs/{org}/security/summary", "read", "READ"),
@@ -882,6 +885,9 @@ fn well_formed(r: &scarab_server::RouteEntry) -> (String, Option<Value>) {
         ("DELETE", "/v1/orgs/{org}/bindings") => return (format!("{uri}?subject=carl"), None),
         ("POST", "/v1/orgs/{org}/tokens") => {
             Some(json!({"name": "ci", "role": "member", "expires_in_days": 1}))
+        }
+        ("POST", "/v1/me/tokens") => {
+            Some(json!({"org": "acme", "name": "ci", "role": "member", "expires_in_days": 1}))
         }
         ("POST", "/v1/repos/{org}/{repo}/bindings/import") => Some(json!({"subjects": []})),
         ("POST", "/v1/secrets") => Some(json!({"org": "acme", "name": "X", "value": "v"})),

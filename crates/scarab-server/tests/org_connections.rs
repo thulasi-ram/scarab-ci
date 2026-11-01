@@ -146,6 +146,7 @@ async fn harness(forge: FakeForge) -> Harness {
                 created_by: "globex-admin".into(),
                 created_at: T0,
                 last_used_at: None,
+                use_count: 0,
                 revoked_at: None,
             },
             &api_token_hash(GLOBEX_TOKEN),

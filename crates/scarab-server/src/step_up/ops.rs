@@ -585,6 +585,7 @@ const fn op(
 
 const ADMIN: Option<Role> = Some(Role::Admin);
 const MEMBER: Option<Role> = Some(Role::Member);
+const VIEWER: Option<Role> = Some(Role::Viewer);
 const ANYONE: Option<Role> = None;
 const W: Mode = Mode::Window;
 const A: Mode = Mode::AlwaysAsk;
@@ -813,6 +814,16 @@ pub static TOKEN_REVOKE: Op = op(
     OrgOf::Path("org"),
     &[],
     &["path:org", "path:id"],
+);
+pub static TOKEN_REVOKE_OWN: Op = op(
+    "token.revoke_own",
+    "Revoke one of your API tokens",
+    Class::Exempt("revocation tightens"),
+    "§3 not on the list",
+    ANYONE,
+    OrgOf::None,
+    &[],
+    &["path:id"],
 );
 pub static RUN_CANCEL: Op = op(
     "run.cancel",
@@ -1052,15 +1063,28 @@ pub static CONNECTION_UNBIND_REPO: Op = op(
 
 // --- crown jewels, always ask ------------------------------------------------
 
+// Any human may mint a personal token up to the role they hold in its scope
+// (git-bug a4cb94f), so the lowest role the handler accepts is Viewer.
 pub static TOKEN_MINT: Op = op(
     "token.mint",
     "Create an API token",
     Class::CrownJewel(A),
     "§3/§4 API token creation",
-    ADMIN,
+    VIEWER,
     OrgOf::Path("org"),
     &[],
     &["path:org", "body:/project", "body:/name"],
+)
+.not_by_token();
+pub static TOKEN_MINT_OWN: Op = op(
+    "token.mint_own",
+    "Create a personal API token",
+    Class::CrownJewel(A),
+    "§3/§4 API token creation",
+    VIEWER,
+    OrgOf::Body("/org"),
+    &[],
+    &["body:/org", "body:/project", "body:/name"],
 )
 .not_by_token();
 pub static PLUGIN_INSTALL: Op = op(
@@ -1483,7 +1507,10 @@ mod tests {
             vec!["identity.link", "identity.unlink", "passkey.add"]
         );
         not_by_token.sort_unstable();
-        assert_eq!(not_by_token, vec!["connection.assign_org", "token.mint"]);
+        assert_eq!(
+            not_by_token,
+            vec!["connection.assign_org", "token.mint", "token.mint_own"]
+        );
     }
 
     #[test]

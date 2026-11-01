@@ -4185,7 +4185,8 @@ impl SessionStore for InMemorySessions {
 
 /// An in-memory [`scarab_identity::ApiTokenStore`] with the same semantics as
 /// the Postgres adapter: keyed on the hash of the plaintext (never the
-/// plaintext), revocation idempotent-but-honest, and `touch` monotonic.
+/// plaintext), revocation idempotent-but-honest, and `touch` monotonic in
+/// `last_used_at` while it always adds its `uses` to the count.
 #[derive(Default)]
 pub struct InMemoryApiTokens {
     /// hash → record. The hash is the key here for the same reason it is the
@@ -4243,6 +4244,22 @@ impl scarab_identity::ApiTokenStore for InMemoryApiTokens {
         Ok(out)
     }
 
+    async fn list_owned(
+        &self,
+        owner: &str,
+    ) -> Result<Vec<scarab_identity::ApiToken>, IdentityError> {
+        let mut out: Vec<scarab_identity::ApiToken> = self
+            .tokens
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|t| t.owner_subject == owner)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(a.id.cmp(&b.id)));
+        Ok(out)
+    }
+
     async fn revoke(&self, id: &str, now_ms: i64) -> Result<bool, IdentityError> {
         let mut rows = self.tokens.lock().unwrap();
         let Some(t) = rows.values_mut().find(|t| t.id == id) else {
@@ -4255,12 +4272,13 @@ impl scarab_identity::ApiTokenStore for InMemoryApiTokens {
         Ok(true)
     }
 
-    async fn touch(&self, id: &str, now_ms: i64) -> Result<(), IdentityError> {
+    async fn touch(&self, id: &str, now_ms: i64, uses: u64) -> Result<(), IdentityError> {
         let mut rows = self.tokens.lock().unwrap();
         if let Some(t) = rows.values_mut().find(|t| t.id == id) {
             if t.last_used_at.is_none_or(|prev| prev < now_ms) {
                 t.last_used_at = Some(now_ms);
             }
+            t.use_count = t.use_count.saturating_add(uses);
         }
         Ok(())
     }

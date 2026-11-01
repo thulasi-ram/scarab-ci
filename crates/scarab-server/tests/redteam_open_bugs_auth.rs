@@ -67,6 +67,7 @@ async fn pat(h: &Harness, id: &str, scope: Scope, role: Role) -> String {
                 created_by: "amy".into(),
                 created_at: now,
                 last_used_at: None,
+                use_count: 0,
                 revoked_at: None,
             },
             &api_token_hash(&plaintext),

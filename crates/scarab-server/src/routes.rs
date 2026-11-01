@@ -162,6 +162,14 @@ pub(crate) fn governed_routes() -> Routes {
             "/v1/me/security/events",
             step_up::events::my_security_events,
         )
+        // The caller's own API tokens (git-bug a4cb94f).
+        .get("/v1/me/tokens", list_own_api_tokens)
+        .post("/v1/me/tokens", &ops::TOKEN_MINT_OWN, mint_own_api_token)
+        .delete(
+            "/v1/me/tokens/{id}",
+            &ops::TOKEN_REVOKE_OWN,
+            revoke_own_api_token,
+        )
         .get("/v1/security/events", step_up::events::security_events)
         .get(
             "/v1/orgs/{org}/security/events",

@@ -389,6 +389,12 @@ pub struct ApiToken {
     /// coarsely rather than on every request. A token whose last use nobody can
     /// see is a token nobody will ever dare revoke.
     pub last_used_at: Option<i64>,
+    /// How many requests have presented this token. Approximate: the server
+    /// counts calls in memory and adds them to the stored count in batches
+    /// ([`ApiTokenStore::touch`]), so it lags by up to a minute and a replica
+    /// that stops loses the calls it had not written yet.
+    #[serde(default)]
+    pub use_count: u64,
     /// Unix-ms revocation. Set means dead, forever — revocation is why this is
     /// an opaque secret in a table rather than a self-describing JWT, which
     /// could not be withdrawn before its own expiry.
@@ -451,12 +457,17 @@ pub trait ApiTokenStore: Send + Sync {
     /// Every token issued within `org` — org- and project-scoped alike —
     /// newest first. Records only; there is no plaintext to return.
     async fn list(&self, org: &str) -> Result<Vec<ApiToken>, IdentityError>;
+    /// Every token `owner` holds, in every org, newest first — what a person
+    /// sees under their own account.
+    async fn list_owned(&self, owner: &str) -> Result<Vec<ApiToken>, IdentityError>;
     /// Revoke `id` at `now_ms`. `false` if no such token, or it was already
     /// revoked — revocation is idempotent but not silent.
     async fn revoke(&self, id: &str, now_ms: i64) -> Result<bool, IdentityError>;
-    /// Record a use. Called coarsely, and best-effort: a failed write here must
-    /// never fail the request it was observing.
-    async fn touch(&self, id: &str, now_ms: i64) -> Result<(), IdentityError>;
+    /// Record `uses` calls, the last of them at `now_ms`: add `uses` to the
+    /// stored count and move `last_used_at` forward (never back). Called
+    /// coarsely, and best-effort: a failed write here must never fail the
+    /// request it was observing.
+    async fn touch(&self, id: &str, now_ms: i64, uses: u64) -> Result<(), IdentityError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -989,6 +1000,7 @@ mod tests {
             created_by: "amy".into(),
             created_at: 1_000,
             last_used_at: None,
+            use_count: 0,
             revoked_at: None,
         }
     }

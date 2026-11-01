@@ -4512,6 +4512,8 @@ fn api_token_from_row(r: &sqlx::postgres::PgRow) -> Option<scarab_identity::ApiT
         created_by: r.get::<String, _>("created_by"),
         created_at: r.get::<i64, _>("created_at"),
         last_used_at: r.get::<Option<i64>, _>("last_used_at"),
+        // BIGINT, never negative: it only ever grows by `touch`'s `uses`.
+        use_count: u64::try_from(r.get::<i64, _>("use_count")).unwrap_or(0),
         revoked_at: r.get::<Option<i64>, _>("revoked_at"),
     })
 }
@@ -5085,7 +5087,8 @@ impl scarab_identity::IdentityStore for PostgresDb {
 }
 
 const API_TOKEN_COLS: &str = "id, name, owner_subject, scope_org, scope_project, role, \
-                              expires_at, created_by, created_at, last_used_at, revoked_at";
+                              expires_at, created_by, created_at, last_used_at, use_count, \
+                              revoked_at";
 
 #[async_trait]
 impl scarab_identity::ApiTokenStore for PostgresDb {
@@ -5164,6 +5167,22 @@ impl scarab_identity::ApiTokenStore for PostgresDb {
         Ok(rows.iter().filter_map(api_token_from_row).collect())
     }
 
+    async fn list_owned(
+        &self,
+        owner: &str,
+    ) -> Result<Vec<scarab_identity::ApiToken>, scarab_identity::IdentityError> {
+        // `api_tokens_owner_idx` serves this.
+        let rows = sqlx::query(&format!(
+            "SELECT {API_TOKEN_COLS} FROM api_tokens WHERE owner_subject = $1 \
+             ORDER BY created_at DESC, id"
+        ))
+        .bind(owner)
+        .fetch_all(self.pool())
+        .await
+        .map_err(identity_err)?;
+        Ok(rows.iter().filter_map(api_token_from_row).collect())
+    }
+
     async fn revoke(&self, id: &str, now_ms: i64) -> Result<bool, scarab_identity::IdentityError> {
         // `revoked_at IS NULL` makes this idempotent AND honest: a second
         // revoke reports false rather than moving the stamp, so the record of
@@ -5179,15 +5198,24 @@ impl scarab_identity::ApiTokenStore for PostgresDb {
         Ok(done.rows_affected() > 0)
     }
 
-    async fn touch(&self, id: &str, now_ms: i64) -> Result<(), scarab_identity::IdentityError> {
+    async fn touch(
+        &self,
+        id: &str,
+        now_ms: i64,
+        uses: u64,
+    ) -> Result<(), scarab_identity::IdentityError> {
         // Monotonic: two in-flight requests cannot make last_used_at go
-        // backwards, which would misreport a token as staler than it is.
+        // backwards, which would misreport a token as staler than it is. The
+        // count is added in the same statement, so a late batch still counts.
         sqlx::query(
-            "UPDATE api_tokens SET last_used_at = $2
-             WHERE id = $1 AND (last_used_at IS NULL OR last_used_at < $2)",
+            "UPDATE api_tokens
+                SET last_used_at = GREATEST(COALESCE(last_used_at, $2), $2),
+                    use_count = use_count + $3
+              WHERE id = $1",
         )
         .bind(id)
         .bind(now_ms)
+        .bind(i64::try_from(uses).unwrap_or(i64::MAX))
         .execute(self.pool())
         .await
         .map_err(identity_err)?;

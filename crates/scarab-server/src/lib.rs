@@ -154,6 +154,10 @@ pub struct AppState {
     /// `scarab_pat_…` bearer a 401: an unwired store must refuse tokens, never
     /// fall through to treating one as a session id.
     pub api_tokens: Option<Arc<dyn scarab_identity::ApiTokenStore>>,
+    /// Calls by API token not yet added to the stored count (git-bug
+    /// a4cb94f). Shared by every clone of this state, so one process counts
+    /// once; written by [`flush_api_token_uses`].
+    pub api_token_uses: Arc<ApiTokenUses>,
     /// The legacy per-Project environment store (ADR-0037), kept for the
     /// legacy approval history (`record_deployment` on every gate release and
     /// its read endpoint). Admission never reads it since ADR-0071 — see
@@ -318,6 +322,7 @@ impl AppState {
             auth: None,
             sessions: None,
             api_tokens: None,
+            api_token_uses: Arc::default(),
             environments: None,
             environment_governance: None,
             policies: None,
@@ -8145,6 +8150,24 @@ pub struct MintTokenRequest {
     pub expires_in_days: u32,
 }
 
+/// `POST /v1/me/tokens` body: [`MintTokenRequest`] plus the org, which the
+/// personal route cannot take from its path.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct MintOwnTokenRequest {
+    /// The org the token is scoped to (or the org of its project).
+    pub org: String,
+    /// Human label — what makes the token revocable in practice.
+    pub name: String,
+    /// Project within the org to scope the token to. Absent = the whole org.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// The **ceiling**: `viewer` | `member` | `admin` | `owner`, never more
+    /// than the caller holds in this scope.
+    pub role: String,
+    /// Lifetime in days, `1..=365`.
+    pub expires_in_days: u32,
+}
+
 /// The mint response — the **only** place the plaintext ever appears.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct MintedTokenDto {
@@ -8161,7 +8184,7 @@ pub struct MintedTokenDto {
 pub struct ApiTokenDto {
     pub id: String,
     pub name: String,
-    /// The principal whose live authority bounds this token.
+    /// The principal who holds the token and whose live authority bounds it.
     pub owner_subject: String,
     pub org: String,
     /// `None` for an org-scoped token.
@@ -8177,6 +8200,10 @@ pub struct ApiTokenDto {
     /// Unix-ms of the last request that presented it, written back at most once
     /// a minute. `None` means it has never been used.
     pub last_used_at: Option<i64>,
+    /// How many requests have presented it. Approximate: calls are counted in
+    /// memory and written in batches, so the count can lag by up to a minute,
+    /// and a server that stops loses the calls it had not written yet.
+    pub use_count: u64,
     /// Unix-ms revocation, or `None` while it is live.
     pub revoked_at: Option<i64>,
 }
@@ -8198,6 +8225,7 @@ impl From<scarab_identity::ApiToken> for ApiTokenDto {
             created_at: t.created_at,
             expires_at: t.expires_at,
             last_used_at: t.last_used_at,
+            use_count: t.use_count,
             revoked_at: t.revoked_at,
         }
     }
@@ -8205,18 +8233,19 @@ impl From<scarab_identity::ApiToken> for ApiTokenDto {
 
 const MS_PER_DAY: i64 = 24 * 60 * 60 * 1000;
 
-/// Mint an API token scoped to this org (or one of its projects). Administer on
-/// the scope the token targets. The plaintext is returned **once**, here.
+/// Mint a personal API token: owned by the caller, scoped to `org` (or one of
+/// its projects). Kept for clients built before `POST /v1/me/tokens`; it does
+/// exactly what that route does, with the org taken from the path.
 #[utoipa::path(
     post,
     path = "/v1/orgs/{org}/tokens",
     params(("org" = String, Path, description = "org the token is scoped to")),
     request_body = MintTokenRequest,
-    summary = "Mint an API token - the plaintext is returned ONCE (ADR-0049)",
+    summary = "Mint a personal API token in an org - the plaintext is returned ONCE (ADR-0049)",
     responses(
         (status = 201, body = MintedTokenDto),
         (status = 400, description = "bad role, name, or lifetime, or the role exceeds the minter's"),
-        (status = 403, description = "not an admin of the target scope, or the caller is itself a token"),
+        (status = 403, description = "the caller holds no role in the target scope, or is itself a token"),
         (status = 404, description = "API tokens not configured")
     )
 )]
@@ -8225,6 +8254,62 @@ async fn mint_api_token(
     headers: HeaderMap,
     Path(org): Path<String>,
     Json(req): Json<MintTokenRequest>,
+) -> Result<Response, ApiError> {
+    mint_personal_token(&st, &headers, org, req).await
+}
+
+/// Mint a personal API token: owned by the caller, scoped to one org or one
+/// project, with a role ceiling no higher than the caller holds there. The
+/// plaintext is returned **once**, here.
+#[utoipa::path(
+    post,
+    path = "/v1/me/tokens",
+    request_body = MintOwnTokenRequest,
+    summary = "Mint a personal API token - the plaintext is returned ONCE (ADR-0049)",
+    responses(
+        (status = 201, body = MintedTokenDto),
+        (status = 400, description = "bad role, name, or lifetime, or the role exceeds the minter's"),
+        (status = 403, description = "the caller holds no role in the target scope, or is itself a token"),
+        (status = 404, description = "API tokens not configured")
+    )
+)]
+async fn mint_own_api_token(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<MintOwnTokenRequest>,
+) -> Result<Response, ApiError> {
+    let MintOwnTokenRequest {
+        org,
+        name,
+        project,
+        role,
+        expires_in_days,
+    } = req;
+    if org.trim().is_empty() {
+        return Err(ApiError::BadRequest("token `org` must not be empty".into()));
+    }
+    mint_personal_token(
+        &st,
+        &headers,
+        org,
+        MintTokenRequest {
+            name,
+            project,
+            role,
+            expires_in_days,
+        },
+    )
+    .await
+}
+
+/// The one mint path behind both routes. Any human may mint a token for
+/// themselves, up to the role they hold in its scope; there is no separate
+/// "may issue tokens" permission yet (the org issuance policy is not built).
+async fn mint_personal_token(
+    st: &AppState,
+    headers: &HeaderMap,
+    org: String,
+    req: MintTokenRequest,
 ) -> Result<Response, ApiError> {
     let store = st.api_tokens.as_ref().ok_or(ApiError::NotFound)?.clone();
     let scope = match req.project.as_deref().filter(|p| !p.is_empty()) {
@@ -8235,18 +8320,13 @@ async fn mint_api_token(
         None => scarab_identity::Scope::Org(org.clone()),
     };
 
-    let caller = authenticate(&st, &headers, Action::Administer).await?;
+    let caller = authenticate(st, headers, Action::Write).await?;
     // A token may not mint tokens. Without this, "every token expires" is a
-    // story rather than a property: a token holding Administer could mint its
-    // own successor forever, and the expiry that makes this credential safe to
-    // hand to a machine would bound nothing at all. Issuance stays an act a
-    // human performs.
+    // story rather than a property: a token could mint its own successor
+    // forever, and the expiry that makes this credential safe to hand to a
+    // machine would bound nothing at all. Issuance stays an act a human
+    // performs.
     if caller.grant.is_some() {
-        return Err(ApiError::Forbidden);
-    }
-    if !caller.may_globally(Action::Administer)
-        && !caller.may(&st, Action::Administer, &scope).await?
-    {
         return Err(ApiError::Forbidden);
     }
 
@@ -8279,9 +8359,9 @@ async fn mint_api_token(
     let owner_view = Principal {
         subject: caller.principal.subject.clone(),
         display_name: None,
-        roles: token_owner_roles(&st, &caller.principal.subject).await,
+        roles: token_owner_roles(st, &caller.principal.subject).await,
     };
-    match live_role_in(&st, &owner_view, &scope).await? {
+    match live_role_in(st, &owner_view, &scope).await? {
         Some(held) if held >= role => {}
         Some(held) => {
             return Err(ApiError::BadRequest(format!(
@@ -8290,11 +8370,15 @@ async fn mint_api_token(
                 role_name(held)
             )))
         }
-        None => {
+        // Someone whose session snapshot administers everything (the C1
+        // bootstrap owner before any binding exists) is told how to fix it.
+        None if caller.may_globally(Action::Administer) => {
             return Err(ApiError::BadRequest(
                 "cannot mint a token here: you hold no role binding in this scope — grant yourself one on the org or project first (PUT /v1/orgs/{org}/bindings)".into(),
             ))
         }
+        // Everyone else holds nothing here, and that is a refusal.
+        None => return Err(ApiError::Forbidden),
     }
 
     let now = st.clock.now().await.0;
@@ -8316,9 +8400,10 @@ async fn mint_api_token(
         created_by: caller.principal.subject.clone(),
         created_at: now,
         last_used_at: None,
+        use_count: 0,
         revoked_at: None,
     };
-    note_org(&st, token.scope.org()).await?;
+    note_org(st, token.scope.org()).await?;
     store
         .put(&token, &scarab_identity::api_token_hash(&plaintext))
         .await
@@ -8345,15 +8430,57 @@ fn random_token_secret() -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
-/// List the tokens issued within this org, org- and project-scoped alike.
-/// Administer on the Org. Records only — there is no plaintext to return.
+/// The order of the org's token list.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenSort {
+    /// Most recently used first; never-used tokens last.
+    #[default]
+    LastUsed,
+    /// Most calls first.
+    UseCount,
+    /// Newest first.
+    Created,
+}
+
+/// `GET /v1/orgs/{org}/tokens` query.
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct TokenListQuery {
+    /// `last_used` (default), `use_count` or `created`; each descending, ties
+    /// broken by newest first.
+    #[serde(default)]
+    pub sort: Option<TokenSort>,
+}
+
+/// Order `tokens` by `sort`, descending; ties go newest first, then by id, so
+/// the order is stable.
+fn sort_api_tokens(tokens: &mut [scarab_identity::ApiToken], sort: TokenSort) {
+    use std::cmp::Reverse;
+    tokens.sort_by(|a, b| {
+        let primary = match sort {
+            // `Option` orders `None` first, so reversed it puts never-used last.
+            TokenSort::LastUsed => Reverse(a.last_used_at).cmp(&Reverse(b.last_used_at)),
+            TokenSort::UseCount => b.use_count.cmp(&a.use_count),
+            TokenSort::Created => std::cmp::Ordering::Equal,
+        };
+        primary
+            .then(b.created_at.cmp(&a.created_at))
+            .then(a.id.cmp(&b.id))
+    });
+}
+
+/// List every token issued within this org, org- and project-scoped alike,
+/// whoever holds it. Administer on the Org. Records only — there is no
+/// plaintext to return.
 #[utoipa::path(
     get,
     path = "/v1/orgs/{org}/tokens",
-    params(("org" = String, Path, description = "org")),
+    params(("org" = String, Path, description = "org"), TokenListQuery),
     summary = "List the API tokens issued in an org (ADR-0049)",
     responses(
         (status = 200, body = [ApiTokenDto]),
+        (status = 400, description = "unknown `sort`"),
         (status = 403, description = "not an org admin"),
         (status = 404, description = "API tokens not configured")
     )
@@ -8362,15 +8489,102 @@ async fn list_api_tokens(
     State(st): State<AppState>,
     headers: HeaderMap,
     Path(org): Path<String>,
+    Query(q): Query<TokenListQuery>,
 ) -> Result<Json<Vec<ApiTokenDto>>, ApiError> {
     let store = st.api_tokens.as_ref().ok_or(ApiError::NotFound)?;
     let scope = scarab_identity::Scope::Org(org.clone());
     authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
-    let tokens = store
+    // This process's unwritten calls first, so the counts read here include
+    // them.
+    flush_api_token_uses(&st).await;
+    let mut tokens = store
         .list(&org)
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    sort_api_tokens(&mut tokens, q.sort.unwrap_or_default());
     Ok(Json(tokens.into_iter().map(ApiTokenDto::from).collect()))
+}
+
+/// The tokens the caller holds, in every org, newest first. A token caller
+/// sees only the ones inside its own scope.
+#[utoipa::path(
+    get,
+    path = "/v1/me/tokens",
+    summary = "List your own API tokens (ADR-0049)",
+    responses(
+        (status = 200, body = [ApiTokenDto]),
+        (status = 401, description = "not signed in"),
+        (status = 404, description = "API tokens not configured")
+    )
+)]
+async fn list_own_api_tokens(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<ApiTokenDto>>, ApiError> {
+    let store = st.api_tokens.as_ref().ok_or(ApiError::NotFound)?;
+    let caller = authenticate(&st, &headers, Action::Read).await?;
+    flush_api_token_uses(&st).await;
+    let tokens = store
+        .list_owned(&caller.principal.subject)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    Ok(Json(
+        tokens
+            .into_iter()
+            .filter(|t| caller_sees_own_token(&caller, t))
+            .map(ApiTokenDto::from)
+            .collect(),
+    ))
+}
+
+/// May `caller` see and revoke `token` through `/v1/me/tokens`? Only its
+/// owner, and when the caller is itself a token, only one inside that
+/// token's scope: a token for one project must not list its owner's tokens
+/// in other orgs.
+fn caller_sees_own_token(caller: &Caller, token: &scarab_identity::ApiToken) -> bool {
+    token.owner_subject == caller.principal.subject
+        && caller
+            .grant
+            .as_ref()
+            .is_none_or(|grant| grant.covers(&token.scope))
+}
+
+/// Revoke one of the caller's own tokens — permanent, and effective on the
+/// very next request that presents it.
+#[utoipa::path(
+    delete,
+    path = "/v1/me/tokens/{id}",
+    params(("id" = String, Path, description = "token id - NOT the token itself")),
+    summary = "Revoke one of your own API tokens (ADR-0049)",
+    responses(
+        (status = 204, description = "revoked"),
+        (status = 404, description = "no such live token of yours")
+    )
+)]
+async fn revoke_own_api_token(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let store = st.api_tokens.as_ref().ok_or(ApiError::NotFound)?;
+    let caller = authenticate(&st, &headers, Action::Write).await?;
+    // Someone else's token answers exactly as a missing one does, so the
+    // route says nothing about which ids exist.
+    let token = store
+        .by_id(&id)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?
+        .filter(|t| caller_sees_own_token(&caller, t))
+        .ok_or(ApiError::NotFound)?;
+    let now = st.clock.now().await.0;
+    match store
+        .revoke(&token.id, now)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?
+    {
+        true => Ok(StatusCode::NO_CONTENT),
+        false => Err(ApiError::NotFound),
+    }
 }
 
 /// Revoke an issued token — permanent, and effective on the very next request
@@ -8419,11 +8633,57 @@ async fn revoke_api_token(
     }
 }
 
-/// How coarsely a token's `last_used_at` is written back. Observability, not
-/// accounting: the question it answers is "is anyone still using this?", and one
-/// write per token per minute answers it without putting an UPDATE on the hot
-/// path of every request a busy CI robot makes.
+/// How coarsely a token's `last_used_at` and call count are written back.
+/// Observability, not accounting: the questions they answer are "is anyone
+/// still using this?" and "which tokens carry the load?", and one write per
+/// token per minute answers both without putting an UPDATE on the hot path of
+/// every request a busy CI robot makes.
 const API_TOKEN_TOUCH_INTERVAL_MS: i64 = 60_000;
+
+/// Calls by API token that this process has counted and not yet written
+/// (git-bug a4cb94f). Every authenticated token request adds one; the count
+/// reaches the store in batches: when the token's `last_used_at` is a minute
+/// old, when a token list is read, and from the server's one-minute flusher.
+#[derive(Debug, Default)]
+pub struct ApiTokenUses {
+    /// token id → (calls not yet written, unix-ms of the latest of them).
+    pending: std::sync::Mutex<std::collections::HashMap<String, (u64, i64)>>,
+}
+
+impl ApiTokenUses {
+    fn record(&self, id: &str, now_ms: i64) {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = pending.entry(id.to_string()).or_insert((0, now_ms));
+        entry.0 = entry.0.saturating_add(1);
+        entry.1 = entry.1.max(now_ms);
+    }
+
+    fn take(&self, id: &str) -> Option<(u64, i64)> {
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id)
+    }
+
+    fn drain(&self) -> Vec<(String, u64, i64)> {
+        std::mem::take(&mut *self.pending.lock().unwrap_or_else(|e| e.into_inner()))
+            .into_iter()
+            .map(|(id, (uses, last))| (id, uses, last))
+            .collect()
+    }
+}
+
+/// Write every call this process has counted and not yet stored. Best-effort:
+/// a failed write drops that batch, which only makes the count lower than it
+/// should be. The server binary calls this every minute and at shutdown.
+pub async fn flush_api_token_uses(st: &AppState) {
+    let Some(store) = st.api_tokens.as_ref() else {
+        return;
+    };
+    for (id, uses, last) in st.api_token_uses.drain() {
+        let _ = store.touch(&id, last, uses).await;
+    }
+}
 
 /// The authenticated caller of a request: who they are, plus — when the
 /// credential was an issued API token — the narrowing that token carries.
@@ -8676,12 +8936,17 @@ async fn authenticate_api_token(
         return Err(ApiError::Unauthorized);
     }
     // Observability, coarse and best-effort: a failure to record the use must
-    // never fail the request that was being observed.
+    // never fail the request that was being observed. Every call is counted
+    // in memory; the batch is written once the stored last use is a minute
+    // old (and by `flush_api_token_uses`).
+    st.api_token_uses.record(&token.id, now);
     if token
         .last_used_at
         .is_none_or(|prev| now - prev >= API_TOKEN_TOUCH_INTERVAL_MS)
     {
-        let _ = store.touch(&token.id, now).await;
+        if let Some((uses, last)) = st.api_token_uses.take(&token.id) {
+            let _ = store.touch(&token.id, last, uses).await;
+        }
     }
     let roles = token_owner_roles(st, &token.owner_subject).await;
     Ok(Caller {
@@ -11983,6 +12248,9 @@ impl utoipa::Modify for StepUpResponses {
         mint_api_token,
         list_api_tokens,
         revoke_api_token,
+        mint_own_api_token,
+        list_own_api_tokens,
+        revoke_own_api_token,
         list_bindings,
         put_binding,
         delete_binding,
@@ -12175,8 +12443,10 @@ impl utoipa::Modify for StepUpResponses {
         PrincipalDto,
         PrincipalIdentityDto,
         MintTokenRequest,
+        MintOwnTokenRequest,
         MintedTokenDto,
         ApiTokenDto,
+        TokenSort,
         org_environments::OrgEnvironmentDto,
         org_environments::PutOrgEnvironmentRequest,
         org_environments::EnvironmentEligibilityDto,
