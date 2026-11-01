@@ -5,7 +5,7 @@
 //   node scripts/screenshots.mjs check     # compare a fresh capture with the committed files
 //
 // SHOTS lists every screenshot the README and the docs site show, at the size
-// and theme it is committed in. One capture can be committed at several paths
+// it is committed in. Every shot uses the same look (THEME and PALETTE below). One capture can be committed at several paths
 // (the README and the docs site share two). `check` writes the fresh capture
 // and a diff image per file to target/release-screenshots/ (or $SCREENSHOT_OUT)
 // and exits 1 when any file drifted: a different size, or more than
@@ -13,7 +13,7 @@
 // The tolerance absorbs JPEG re-encoding and font antialiasing, not UI changes.
 //
 // The clock is fixed, so "6m ago" and running durations render the same on
-// every capture. The mock's `?theme=` pins the theme.
+// every capture. The mock's `?theme=` and `?palette=` pin the look.
 import { chromium } from "@playwright/test";
 import { spawn } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
@@ -31,6 +31,10 @@ const MAX_RATIO = Number(process.env.SCREENSHOT_MAX_RATIO ?? 0.002);
 const QUALITY = 80;
 const CLOCK = new Date("2026-07-22T12:00:00Z");
 
+// The docs show the UI in the light Mono palette. Every capture pins both.
+const THEME = "light";
+const PALETTE = "mono";
+
 // The run the README's run view shows (RUN_ID in src/mock.ts).
 const RUN_ID = "0190f8a2000071fb8c0011223344aabb";
 
@@ -39,22 +43,20 @@ const SHOTS = [
     name: "dashboard",
     path: "/",
     size: [1485, 812],
-    theme: "dark",
     files: ["docs/assets/screenshots/dashboard-dark.jpg", "ui/scarab-docs-ui/src/assets/dashboard.jpg"],
   },
   {
     name: "run-detail",
     path: `/acme/scarab/runs/${RUN_ID}`,
     size: [1485, 812],
-    theme: "dark",
     files: ["docs/assets/screenshots/run-detail-dark.jpg", "ui/scarab-docs-ui/src/assets/run-detail.jpg"],
   },
   {
-    // usage/environments.mdx: the New environment dialog (org Settings).
+    // usage/environments.mdx: the New environment dialog (org Settings,
+    // Environments section).
     name: "environments",
-    path: "/settings",
+    path: "/orgs/acme/settings/environments",
     size: [1485, 812],
-    theme: "dark",
     files: ["ui/scarab-docs-ui/src/assets/environments.jpg"],
     async act(page) {
       await page.getByRole("button", { name: "New environment" }).click();
@@ -66,7 +68,6 @@ const SHOTS = [
     name: "secrets",
     path: "/acme/scarab?tab=secrets",
     size: [1562, 784],
-    theme: "dark",
     files: ["ui/scarab-docs-ui/src/assets/secrets.jpg"],
     async act(page) {
       await page.getByRole("button", { name: "New secret" }).first().click();
@@ -113,13 +114,13 @@ async function capture(browser, shot) {
   const context = await browser.newContext({
     viewport: { width, height },
     deviceScaleFactor: 1,
-    colorScheme: shot.theme,
+    colorScheme: THEME,
     reducedMotion: "reduce",
   });
   const page = await context.newPage();
   await page.clock.setFixedTime(CLOCK);
   const sep = shot.path.includes("?") ? "&" : "?";
-  await page.goto(`${BASE}${shot.path}${sep}theme=${shot.theme}`, { waitUntil: "networkidle" });
+  await page.goto(`${BASE}${shot.path}${sep}theme=${THEME}&palette=${PALETTE}`, { waitUntil: "networkidle" });
   await page.evaluate(() => document.fonts.ready);
   if (shot.act) await shot.act(page);
   await page.waitForTimeout(500);
@@ -207,7 +208,7 @@ async function main() {
       if (mode === "capture") {
         for (const f of shot.files) {
           writeFileSync(join(repo, f), fresh);
-          console.log(`wrote ${f} (${shot.size.join("x")}, ${shot.theme})`);
+          console.log(`wrote ${f} (${shot.size.join("x")}, ${THEME} ${PALETTE})`);
         }
         continue;
       }
