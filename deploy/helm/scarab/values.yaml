@@ -367,10 +367,22 @@ workspace:
   # One per failure domain. Drains are replica-safe by construction since
   # git-bug afb13c2 — sealed packs are staged into the shared index at seal
   # time and the record POST commits the fence's union (see
-  # templates/service-workspace.yaml) — so >1 is CORRECT. Per-AZ topology is a
-  # later slice, and >1 has been exercised at the acceptance-test grain
-  # (two routers, one Postgres, one bucket), not yet on a live cluster.
+  # templates/service-workspace.yaml) — so >1 is CORRECT, and 2 replicas pass
+  # the ADR-0077 rank 1 fault runs (`just chaos`). Per-AZ topology is a later
+  # slice.
+  #
+  # Above 1, each Cache has a home replica chosen from its cache key, and the
+  # chart renders one Service per replica (`<fullname>-workspace-<ordinal>`,
+  # templates/service-workspace-replicas.yaml) so a Step Pod can reach it
+  # (git-bug 12e2f6b). Changing the count moves about 1/N of the cache keys
+  # to a new home; each moved key misses once.
   replicaCount: 1
+  # One Depot replica's URL with `{ordinal}` in place of its StatefulSet
+  # ordinal — where a Step Pod sends and reads its Cache. Empty = the
+  # per-replica Services above, `http://<fullname>-workspace-{ordinal}.<ns>.svc`.
+  # Set it only when scarab.workspaceUrl points somewhere else too (a split
+  # install). Ignored at replicaCount 1.
+  homeUrlTemplate: ""
   # Where the warm tier lives inside the container — the PVC's mount point, and
   # the value of SCARAB_WORKSPACE_DATA_DIR.
   dataDir: /var/lib/scarab/cas
