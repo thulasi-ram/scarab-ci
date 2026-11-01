@@ -10,9 +10,8 @@ import Doodle from '../../../components/Doodle.astro';
 This page covers the day-to-day development loop and the `.env` file it reads. `just up` runs
 Scarab in a local kind cluster from the Helm chart, with a `scarab-server` built from the working
 tree and mounted into the server Pods, so you rebuild and rerun without building an image
-(`deploy/kind/README.md`). **Proc-mode**, where the server runs as a host process against a compose
-Postgres + MinIO, still backs `just serve` and the test recipes. `Justfile` recipes over `deploy/`
-drive all of it. Use them rather
+(`deploy/kind/README.md`). The test recipes run against the same release in its e2e mode.
+`Justfile` recipes over `deploy/` drive all of it. Use them rather
 than typing docker/kind/kubectl commands yourself: they set the right env, an isolated kubeconfig,
 and the colima safety guards.
 
@@ -22,60 +21,35 @@ packaged Helm chart inside the cluster instead, see
 
 ## Prerequisites
 
-- **docker** (or colima): hosts the compose Postgres + MinIO and backs kind.
-- **kind**, **kubectl**: step Pods run against a local kind cluster (`scarab-dev`).
-- **cargo** (Rust toolchain, see `rust-toolchain.toml`): the server is built from source.
+- **docker** (or colima): backs kind.
+- **kind**, **kubectl**, **Helm 4**: the stack runs in a local kind cluster (`scarab-dev`).
+- **cargo** (Rust toolchain, see `rust-toolchain.toml`): the server is built from source, with
+  **zig** and `cargo-zigbuild` on macOS (the binary is built for Linux).
 - **python3**: `just demo` submits a pipeline over the REST API.
 - [`just`](https://github.com/casey/just): the task runner that fronts every recipe below.
 
 ## Configuring your environment
 
-The recipes read a single dev env file, `deploy/local-proc/.env`. It's gitignored (env files may
-hold secrets), so seed it from the committed template on first run:
+The recipes read one small env file, `deploy/kind/.env`. It's gitignored, and `just ui` creates it
+from the committed `deploy/kind/.env.example` when it is missing:
 
 ```sh
-cp deploy/local-proc/.env.example deploy/local-proc/.env
-```
-
-You usually don't need to: `just up`, `just serve`, and `just ui` each create the
-`.env` from `.env.example` if it's missing, then `source` it. Copy it yourself only when you want to
-edit values before the first run.
-
-The template ships working defaults for the compose stack:
-
-```sh
-# scarab-server: bind loopback on the dev port the UI proxies to.
+# The host address the API and the web UI answer on.
 SCARAB_ADDR=127.0.0.1:8080
-# Durable store (the compose Postgres; published on 55432 to dodge a host 5432).
-SCARAB_DATABASE_URL=postgres://scarab:scarab@127.0.0.1:55432/scarab
-# Object store: the compose MinIO (S3 API on 9000, console on 9001).
-SCARAB_S3_BUCKET=scarab-logs
-SCARAB_S3_ENDPOINT=http://127.0.0.1:9000
-SCARAB_S3_ACCESS_KEY=scarab
-SCARAB_S3_SECRET_KEY=scarabsecret
-SCARAB_S3_REGION=us-east-1
-SCARAB_NAMESPACE=scarab
-# Dev-only escape hatch (ADR-0048) — see below.
-SCARAB_DEV_INSECURE=1
 # Vite dev server (`just ui`) proxies /v1 to this address.
 SCARAB_API_URL=http://127.0.0.1:8080
 ```
 
-Key settings for development only:
+`just up` maps the host port of `SCARAB_ADDR` to the server's node port when it creates the
+cluster, so changing the port later needs the cluster recreated
+(`SCARAB_KIND_RECREATE=1 just up`). Everything else (database URL, bucket, secrets, the
+dev-only `scarab.devInsecure` that boots without an authenticator or key-encryption key under
+[fail-closed startup (ADR-0048)](/scarab-ci/tech/adr/0048-fail-closed-startup/)) is a Helm value
+set by `deploy/kind/up.sh`. **Production must never set `devInsecure`.**
 
-- **`SCARAB_DEV_INSECURE=1`** boots the server without an authenticator or key-encryption key,
-  with loud warnings, so you don't have to stand up identity/KEK to iterate. Under
-  [fail-closed startup (ADR-0048)](/scarab-ci/tech/adr/0048-fail-closed-startup/) this is the *only*
-  way to skip those mandatory checks. **Production must never set it.**
-- **`SCARAB_DATABASE_URL`** points at the compose Postgres on host port **55432** (mapped from the
-  container's 5432, so it won't clash with a Postgres already on 5432). Migrations run on connect.
-- **`SCARAB_S3_*`** point at the compose MinIO: the S3 API on **9000** and the `scarab-logs` bucket
-  (the console is on **9001**). `SCARAB_NAMESPACE=scarab` is where step Pods launch in kind.
-- **`SCARAB_API_URL`** is read by the Vite dev server (`just ui`); Vite refuses to guess it.
-
-`KUBECONFIG` is *not* in the file; it's dynamic per run and set by the recipes to
-`deploy/local-proc/.kubeconfig`. For the main `SCARAB_*` variables and what each does,
-see [Environment Variables](/scarab-ci/usage/environment-variables/).
+Kube calls use `deploy/kind/.kubeconfig` only, checked against the cluster before each call. For
+the main `SCARAB_*` variables and what each does, see
+[Environment Variables](/scarab-ci/usage/environment-variables/).
 
 ## The workflow
 
@@ -91,12 +65,9 @@ just down    # tear it all down
 - **`just up`** builds `scarab-server` for Linux (cargo-zigbuild on macOS), creates the
   `scarab-dev` kind cluster (isolated kubeconfig at `deploy/kind/.kubeconfig`), runs Postgres and
   MinIO in it, and installs the Helm chart with the server and the workspace service running that
-  binary. It reads only `SCARAB_ADDR` from `deploy/local-proc/.env`: the host port of the API.
+  binary. It reads only `SCARAB_ADDR` from `deploy/kind/.env`: the host port of the API.
 - **`just reload`** rebuilds and restarts the server and workspace Pods on the new binary, about
   40 s after a one-line change.
-- **`just serve`** (proc-mode) runs `scarab-server --role converged --serve` in the **foreground**
-  against the compose Postgres + MinIO from `deploy/local-proc/`. It sources
-  `deploy/local-proc/.env` and sets `KUBECONFIG` for you. Run `just down` first.
 - **`just ui`** runs the SolidJS web UI on Vite (`http://localhost:5173`), which proxies `/v1` to
   the running server using `SCARAB_API_URL` from the env file.
 - **`just demo`** POSTs a one-step pipeline to the running server and polls it to a
@@ -106,6 +77,19 @@ just down    # tear it all down
   keeps the cluster, Postgres, MinIO and their data.
 
 Also handy: **`just docs`** serves this documentation site locally.
+
+## Tests against the stack
+
+```sh
+just e2e             # the full-stack suite (crates/scarab-e2e)
+just forgejo-verify  # a real Forgejo: connect, bind, push, Run
+just kube-tests      # the executor's and the plugin runtime's live cluster suites
+```
+
+These switch the release to its e2e mode, with its own database (`scarab_e2e`) and bucket
+(`scarab-e2e`), so dev data is not touched, and leave it there; `just up` switches back. The
+test binaries run on your machine. `just test` runs the workspace suite against a separate
+compose Postgres and MinIO (`deploy/test-services/`).
 
 :::note[Dogfood and Helm]
 `just dogfood` is `just up` in GitHub App mode, with its own database and bucket, behind a

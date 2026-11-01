@@ -34,7 +34,7 @@ just up      # kind + Postgres + MinIO + the chart, server built from the tree
 `just up` builds `scarab-server` for Linux, creates the `scarab-dev` kind cluster, starts Postgres
 and MinIO in it, and installs the Helm chart. The server and the workspace service run the binary
 you just built, mounted into a small runtime image. The API and the UI answer on `SCARAB_ADDR`
-from `deploy/local-proc/.env`.
+from `deploy/kind/.env`.
 
 ## Submit a pipeline and watch it complete
 
@@ -54,10 +54,9 @@ just docs    # serve this documentation site locally
 just down    # tear the whole stack down (`just down keep` keeps the data)
 ```
 
-:::note[Proc mode]
-`just serve` and the test recipes (`just e2e`, `just forgejo-verify`, `just kube-tests`) still run
-the server as a host process against compose Postgres and MinIO (`deploy/local-proc/`). Run
-`just down` first: both setups use the `SCARAB_ADDR` port.
+:::note[Tests]
+The test recipes (`just e2e`, `just forgejo-verify`, `just kube-tests`) run against the same
+release, switched to its e2e mode with its own database and bucket. `just up` switches it back.
 :::
 
 :::tip[See the UI]

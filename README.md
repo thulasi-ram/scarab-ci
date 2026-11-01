@@ -199,22 +199,19 @@ cargo run -p scarab-server -- --help
 
 ## Local dev
 
-Config for the local stack lives in `deploy/local-proc/.env` — gitignored (env
-files may hold secrets), seeded from the committed `deploy/local-proc/.env.example`
-the first time you run a recipe. Edit your copy to change it. A root `.env.local`
-can hold optional per-machine overrides (e.g. a dev `SCARAB_ADDR`) — it's
-gitignored and loaded by your shell/direnv, not by the recipes themselves. Real
-secrets for the in-cluster dogfood live in its own gitignored
-`deploy/local-helm/.env`.
+The local stack's host address lives in `deploy/kind/.env` (gitignored, seeded
+from the committed `deploy/kind/.env.example` the first time you run a
+recipe): `SCARAB_ADDR` is where the API and UI answer, `SCARAB_API_URL` is
+where `just ui` proxies. Real secrets for the dogfood stack live in
+`~/.config/scarab/dogfood.env` (see `deploy/kind/README.md`).
 
 ```sh
-just ui       # Vite dev server on http://localhost:5173, proxies /v1 → server
-just serve    # scarab-server in the foreground against the dev stack (needs `just up`)
+just ui       # Vite dev server on http://localhost:5173, proxies /v1 → the stack
+just reload   # rebuild scarab-server and roll the stack's Pods onto it
 ```
 
-Every setting (`SCARAB_ADDR`, `SCARAB_DATABASE_URL`, `SCARAB_S3_*`, `SCARAB_API_URL`,
-…) comes from that file — point elsewhere by editing it. Auth is disabled in dev
-(`SCARAB_DEV_INSECURE=1`), so every request is an Owner.
+Auth is disabled in the dev stack (`scarab.devInsecure`), so every request is
+an Owner.
 
 ## Full dev stack (k8s)
 
@@ -231,15 +228,16 @@ just down    # delete the cluster (`just down keep` keeps its data)
 
 Requires `docker`, `kind`, `kubectl`, `helm`, `cargo`, and `python3`, plus
 `zig` and `cargo-zigbuild` on macOS (the binary is cross-built for Linux). The
-API and UI answer on `SCARAB_ADDR` from `deploy/local-proc/.env`. The cluster's
+API and UI answer on `SCARAB_ADDR` from `deploy/kind/.env`. The cluster's
 kubeconfig is `deploy/kind/.kubeconfig`, checked against the cluster before
 every call, so the recipes never touch an ambient (e.g. production) context.
 `just dogfood` is the same stack in GitHub App mode behind a Cloudflare tunnel.
 See `deploy/kind/README.md`.
 
-`just e2e`, `just forgejo-verify`, `just kube-tests` and `just serve` still run
-the server as a host process against compose Postgres + MinIO
-(`deploy/local-proc/`); run `just down` before them.
+`just e2e`, `just forgejo-verify` and `just kube-tests` run against the same
+release, switched to its e2e mode: its own database and bucket, so dev data is
+not touched. `just up` switches it back. `just test` runs the workspace suite
+against a separate compose Postgres and MinIO (`deploy/test-services/`).
 
 Without Docker/kind, the server still runs API-only against a local Postgres and
 a filesystem object store (`--object-dir`); the background driver is skipped

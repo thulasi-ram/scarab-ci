@@ -1,8 +1,7 @@
 # `local-forgejo` — the live Forgejo verification tier
 
-A third `deploy/` mode, alongside `local-proc/` and `local-helm/`. Unlike those
-two it is not a way to *run* Scarab: it exists to answer one question that only a
-real Forgejo can answer.
+Not a way to *run* Scarab (that is `deploy/kind/`): it exists to answer one
+question that only a real Forgejo can answer.
 
 ## Why it exists (git-bug 3863d5e)
 
@@ -24,17 +23,17 @@ Three similar guesses were still unverified:
 ## Running it
 
 ```sh
-just forgejo-verify          # up → seed → verify → tear both stacks down
-just forgejo-verify keep     # …but leave everything running afterwards
+just forgejo-verify          # release (e2e mode) → Forgejo → seed → verify → remove Forgejo
+just forgejo-verify keep     # …but leave Forgejo running afterwards
 ```
 
 Prerequisites:
 
 - **docker** running, and able to pull from `codeberg.org` (the Forgejo image).
-- **kind** + **kubectl** — the recipe brings up the whole proc-mode stack,
-  because the test also checks that a Run appears.
-- Free ports: **3300** (Forgejo) and **8080** (scarab-server). Change them in
-  `deploy/local-forgejo/.env` / `deploy/local-proc/.env`.
+- What `just up` needs (deploy/kind/README.md): the recipe brings the kind
+  release up in its e2e mode, because the test also checks that a Run appears.
+  The release stays in e2e mode afterwards; `just up` switches it back.
+- A free port **3300** (Forgejo; change it in `deploy/local-forgejo/.env`).
 - `cargo-nextest`.
 
 Nothing else: the admin user, the access token, the repos and their
@@ -43,15 +42,25 @@ volume. Never point this at a Forgejo you care about.
 
 ### What the recipe wires up
 
+The Forgejo container joins the kind cluster's `kind` docker network as well as
+its own, so the two sides reach each other by name: the server Pod calls
+`http://scarab-forgejo:3000` (Pods resolve container names through the node's
+docker DNS), and Forgejo delivers hooks to the kind node's API node port,
+`http://scarab-dev-control-plane:30080`. The tests on the host use the
+published port, `http://127.0.0.1:3300`.
+
 `up.sh` writes two gitignored files:
 
 - `.env.generated` — the `SCARAB_TEST_FORGEJO_*` contract the tests read
-  (instance URL, token, owner, repo names, seeded repo count, hook secret).
-- `.env.scarab` — an overlay `deploy/local-proc/up.sh` applies **after** its own
-  `.env` (via `SCARAB_ENV_EXTRA`). It binds the server on `0.0.0.0` and sets
-  `SCARAB_PUBLIC_URL` to `host.docker.internal`, because a hook registered
-  against `127.0.0.1` is a hook the Forgejo *container* can never deliver to. It
-  also sets `SCARAB_FORGEJO_WEBHOOK_SECRET` to the same secret the hook carries.
+  (host URL, server URL, token, owner, repo names, seeded repo count, hook
+  secret).
+- `.values.json` — Helm values the recipe passes to `deploy/kind/up.sh` through
+  `SCARAB_KIND_EXTRA_VALUES`: `scarab.publicUrl` (the address bind stamps onto
+  the hook it registers, which must be one Forgejo can reach),
+  `secrets.forgejoWebhookSecret` (the same secret the hook carries), and in
+  tunnel mode `scarab.libsManifest`. `up.sh values` writes only this file; the
+  recipe runs it before the release, which must exist before Forgejo can join
+  its network.
 
 Two Forgejo settings in `compose.yaml` are required:
 

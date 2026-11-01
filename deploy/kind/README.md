@@ -17,7 +17,7 @@ just down keep   # uninstall the release; keep the cluster, Postgres, MinIO and 
 ```
 
 The API and the web UI answer on the host at `SCARAB_ADDR` from
-`deploy/local-proc/.env` (`127.0.0.1:8080` in `.env.example`). `just ui` (Vite)
+`deploy/kind/.env` (`127.0.0.1:8080` in `.env.example`). `just ui` (Vite)
 proxies to the same address, so it works against this stack unchanged.
 
 Requires docker, kind, kubectl, Helm 4, cargo, python3 and curl, plus zig and
@@ -87,6 +87,7 @@ bucket on those two servers:
 |---|---|---|---|---|
 | dev | `just up` | `scarab` | `scarab-logs` | dev-insecure |
 | dogfood | `just dogfood` | `scarab_dogfood` | `scarab-dogfood` | dev-insecure, GitHub App |
+| e2e | `just e2e`, `just forgejo-verify`, `just kube-tests` | `scarab_e2e` | `scarab-e2e` | dev-insecure |
 
 Switching modes deletes the Depot's warm PVC. The warm tier caches blobs of
 one bucket, and would otherwise serve the new mode reads its bucket cannot
@@ -157,8 +158,7 @@ that its server is the API port docker publishes for `scarab-dev-control-plane`
 `deploy/kind/kubectl.sh <args>` runs kubectl the same way.
 
 A `scarab-dev` cluster without this worktree's mount or the host port (one
-proc mode created, one from another worktree, or one from before
-`SCARAB_ADDR` changed) is refused with the reason, since recreating it deletes
+from another worktree, or one from before `SCARAB_ADDR` changed) is refused with the reason, since recreating it deletes
 its Postgres and MinIO data. `SCARAB_KIND_RECREATE=1 just up` recreates it.
 The host port is checked first, so a port held by something else stops
 `just up` before anything is deleted.
@@ -167,12 +167,33 @@ The host port is checked first, so a port held by something else stops
 and `just demo`: a trailing comment, quotes and CRLF are dropped, `localhost`
 or an empty host means `127.0.0.1`, a missing port means `8080`.
 
-## Proc mode
+## Tests on the release
 
-`just e2e`, `just forgejo-verify`, `just kube-tests` and `just serve` still
-run the server as a host process (`deploy/local-proc/`) until they move onto
-the release. Run `just down` before them: both setups use the `SCARAB_ADDR`
-port, and proc mode's teardown deletes the `scarab-dev` cluster.
+`just e2e`, `just forgejo-verify` and `just kube-tests` bring the release up in
+its e2e mode and leave it there; `just up` switches it back to dev. The test
+binaries run on the host. `test-env.sh` gives them what the host cannot reach
+directly:
+
+- Postgres (for the e2e case that seeds a connection), the Depot and MinIO (for
+  the executor tier, whose test process stands in for the control plane)
+  through `kubectl port-forward` on a free loopback port;
+- the host address a Pod reaches the host at, for a test that is itself a
+  server the cluster calls (`happy_path`'s fake forge, the results listener of
+  the executor tier). A listener on the host is asked for from a busybox Pod;
+  the first of `host.docker.internal`, the kind network's gateway and
+  `host.lima.internal` that answers wins. On macOS the gateway is the VM's,
+  not the host's.
+
+`crash_resume` kills the server with SIGKILL from the kind node's PID
+namespace (`crictl inspect` gives the container's PID on the node), so the
+kubelet restarts the container in the same Pod. It runs after the other e2e
+cases, since they share the server.
+
+`just forgejo-verify` attaches the Forgejo container to the `kind` docker
+network: the server reaches it as `http://scarab-forgejo:3000`, and Forgejo
+delivers hooks to `http://scarab-dev-control-plane:30080` (the release's
+`publicUrl` for that run, with the hook secret, passed through
+`SCARAB_KIND_EXTRA_VALUES`).
 
 ## Settings
 
@@ -185,3 +206,4 @@ port, and proc mode's teardown deletes the `scarab-dev` cluster.
 | `SCARAB_DEV_ORG` | `thulasi-ram` | org whose `production` Environment dev mode seeds |
 | `SCARAB_DOGFOOD_ENV` | `~/.config/scarab/dogfood.env` | the dogfood env file |
 | `SCARAB_DOGFOOD_DEV_INSECURE` | `true` | dogfood's `scarab.devInsecure` |
+| `SCARAB_KIND_EXTRA_VALUES` | none | one more Helm values file, applied last; not remembered by `just reload` |
