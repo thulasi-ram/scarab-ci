@@ -64,9 +64,10 @@ machine and browser. The SVGs are the source: edit the generator, run
 
 Status and limits:
 
-- The web UI (header, login, favicon) and the docs site (logo, home-page hero,
-  favicon) use this mark. The emblem files below are unchanged, and the repo's
-  root `README.md` still shows the emblem.
+- The web UI (header, login, favicon), the docs site (logo, home-page hero,
+  favicon) and the repo's root `README.md` use this mark. The emblem files
+  below are unchanged, and the ASCII beetle scenes in `ascii/` are still baked
+  from the emblem.
 - At 16 to 32 px the beetle blurs into a shaded shape that keeps its horns and
   legs, and the ring shows as a faint dotted hexagon. Contrast there is low,
   measured as the mean contrast of the mark against its background over the
