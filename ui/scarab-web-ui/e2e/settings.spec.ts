@@ -57,3 +57,47 @@ test("an org the caller does not administer shows no org sections", async ({ pag
   const nav = page.getByRole("navigation", { name: "Settings" });
   await expect(nav.getByRole("link", { name: "Members" })).toHaveCount(0);
 });
+
+test("an environment opens read-only and its Edit button opens the edit screen", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/orgs/acme/settings/environments");
+  await page.getByRole("link", { name: "production", exact: true }).click();
+  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/environments\/production$/);
+
+  // The view: the record, and no way to change it from here.
+  const view = page.locator("section.page");
+  await expect(view.getByText("customer-facing, eu-west-1 + us-east-1")).toBeVisible();
+  await expect(view.getByRole("textbox")).toHaveCount(0);
+  await expect(view.getByRole("checkbox")).toHaveCount(0);
+  await expect(view.getByRole("button", { name: /delete|withdraw|grant|save/i })).toHaveCount(0);
+
+  await view.getByRole("link", { name: "Edit", exact: true }).click();
+  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/environments\/production\/edit$/);
+
+  // The edit screen: every change the view left out.
+  const edit = page.locator("section.page");
+  await expect(edit.getByRole("textbox", { name: "description", exact: true })).toHaveValue(
+    "customer-facing, eu-west-1 + us-east-1",
+  );
+  await expect(edit.getByRole("textbox", { name: "approvers", exact: true })).toHaveValue("ops-lead");
+  await expect(edit.getByRole("checkbox", { name: /every project in acme/ })).toBeChecked();
+  // Nothing changed yet, so there is nothing to save.
+  await expect(edit.getByRole("button", { name: "Save", exact: true })).toBeDisabled();
+  await edit.getByRole("textbox", { name: "description", exact: true }).fill("customer-facing, eu-west-1");
+  await expect(edit.getByRole("button", { name: "Save", exact: true })).toBeEnabled();
+
+  // Delete asks for the exact name before it is allowed.
+  await edit.getByRole("button", { name: "Delete environment" }).click();
+  const confirm = edit.getByRole("textbox", { name: "Type production to confirm" });
+  const go = edit.getByRole("button", { name: "Delete environment" });
+  await expect(go).toBeDisabled();
+  await confirm.fill("Production");
+  await expect(go).toBeDisabled();
+  await confirm.fill("production");
+  await expect(go).toBeEnabled();
+
+  // Cancel goes back to the view without saving.
+  await edit.getByRole("link", { name: "Cancel" }).click();
+  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/environments\/production$/);
+  expect(errors).toEqual([]);
+});
