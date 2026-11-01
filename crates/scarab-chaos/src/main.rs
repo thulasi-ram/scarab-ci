@@ -4,6 +4,10 @@
 //!   scarab-chaos replay DIR/scenario.json --out-root DIR         same plan, new run, then check
 //!   scarab-chaos check DIR/scenario.json                         check a finished run again
 //!
+//! Exit code: 0 PASS, 1 FAIL (an invariant does not hold), 2 the harness
+//! could not run or check, 3 INCONCLUSIVE (the fault did not exercise what
+//! the scenario names; see `check::exercised`).
+//!
 //! Connections come from the environment `deploy/kind/chaos.sh` sets:
 //! SCARAB_CHAOS_API, SCARAB_CHAOS_KUBECONFIG, SCARAB_CHAOS_NAMESPACE,
 //! SCARAB_CHAOS_DATABASE_URL, SCARAB_CHAOS_S3_ENDPOINT, SCARAB_CHAOS_S3_BUCKET,
@@ -78,8 +82,8 @@ async fn connect() -> Result<Conn, String> {
 }
 
 /// Check the scenario in `dir`, write `verdict.json` beside it and print the
-/// verdict lines. Returns whether it passed.
-async fn check_dir(conn: &Conn, file: &Path) -> Result<bool, String> {
+/// verdict lines.
+async fn check_dir(conn: &Conn, file: &Path) -> Result<check::Outcome, String> {
     let s = scenario::Scenario::read(file)?;
     let dir = file.parent().unwrap_or(Path::new("."));
     let records = pods::read_records(&dir.join("pods.jsonl"))?;
@@ -126,11 +130,14 @@ async fn check_dir(conn: &Conn, file: &Path) -> Result<bool, String> {
     for n in &s.notes {
         println!("  note: {n}");
     }
-    println!("VERDICT {} {} ({})", if v.pass { "PASS" } else { "FAIL" }, s.kind.as_str(), out.display());
-    Ok(v.pass)
+    for why in &v.inconclusive {
+        println!("  inconclusive: {why}");
+    }
+    println!("VERDICT {} {} ({})", v.outcome.as_str(), s.kind.as_str(), out.display());
+    Ok(v.outcome)
 }
 
-async fn main_inner() -> Result<bool, String> {
+async fn main_inner() -> Result<check::Outcome, String> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let cli = Cli::parse();
     match cli.cmd {
@@ -164,9 +171,12 @@ async fn main_inner() -> Result<bool, String> {
 
 #[tokio::main]
 async fn main() {
+    // 0 PASS, 1 FAIL (a finding), 2 the harness could not run or check, 3
+    // INCONCLUSIVE (the fault did not exercise what the scenario names).
     match main_inner().await {
-        Ok(true) => {}
-        Ok(false) => std::process::exit(1),
+        Ok(check::Outcome::Pass) => {}
+        Ok(check::Outcome::Fail) => std::process::exit(1),
+        Ok(check::Outcome::Inconclusive) => std::process::exit(3),
         Err(e) => {
             eprintln!("scarab-chaos: {e}");
             std::process::exit(2);

@@ -18,6 +18,11 @@
 //! | I4   | every green Attempt's output snapshot closure is in committed packs whose ranges read back and hash to their addresses; a member in another fence's pack needs a `depot_fence_borrows` edge |
 //! | I8   | after quiesce no Pod of a scenario Run is still pending or running, and no per-Pod Secret outlives its Pod |
 //! | I10  | no `committed = FALSE` pack row older than the linger for a fence whose drain has a record; every committed pack's object exists at its recorded size |
+//!
+//! Outside the invariants, a scenario is INCONCLUSIVE, not PASS, when its
+//! fault did not exercise what it names ([`exercised`]): no fault fired, the
+//! fault landed outside its window, or the trigger condition no longer held
+//! when it fired. A FAIL finding still makes the verdict FAIL.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -29,7 +34,7 @@ use object_store::{path::Path as ObjPath, ObjectStoreExt as _};
 use serde::{Deserialize, Serialize};
 
 use crate::pods::{self, PodRecord};
-use crate::scenario::Scenario;
+use crate::scenario::{Fault, Kind, Scenario};
 use crate::time::now_ms;
 
 /// How old an uncommitted pack row of a recorded fence may be: the Depot's
@@ -59,9 +64,34 @@ pub struct Finding {
     pub detail: String,
 }
 
+/// The verdict's outcome. `just chaos` exits 0, 1 and 3 for them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Outcome {
+    Pass,
+    /// At least one invariant does not hold.
+    Fail,
+    /// No invariant failed, but the scenario did not test what it names.
+    Inconclusive,
+}
+
+impl Outcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Outcome::Pass => "PASS",
+            Outcome::Fail => "FAIL",
+            Outcome::Inconclusive => "INCONCLUSIVE",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Verdict {
+    /// `outcome == Pass`.
     pub pass: bool,
+    pub outcome: Outcome,
+    /// Why the scenario does not count as a test, when it does not.
+    pub inconclusive: Vec<String>,
     pub checked_at_ms: i64,
     /// Every invariant that was evaluated, with the number of things it
     /// looked at (so "PASS" over nothing is visible).
@@ -167,6 +197,12 @@ pub struct Facts {
     pub live_pod_names: HashSet<String>,
     pub quiesce_deadline_ms: i64,
     pub now_ms: i64,
+    /// The scenario's kind; `gather` always sets it. `None` evaluates the
+    /// invariants alone, with no "exercised" check (the unit tests of one
+    /// invariant).
+    pub kind: Option<Kind>,
+    /// The faults as fired (scenario.json).
+    pub faults: Vec<Fault>,
 }
 
 // --- evaluate (pure) -------------------------------------------------------------
@@ -211,6 +247,33 @@ fn status_token(to: &str) -> String {
         "DeadLettered" => "dead_lettered".into(),
         other => other.to_ascii_lowercase(),
     }
+}
+
+/// Why `faults` did not exercise `kind`; empty when they did. Each fault must
+/// have fired with its trigger condition still holding and landed inside the
+/// window it names.
+pub fn exercised(kind: Kind, faults: &[Fault]) -> Vec<String> {
+    if faults.is_empty() {
+        return vec!["no fault fired (the trigger never held, or every Run ended first)".into()];
+    }
+    let mut why = Vec::new();
+    for x in faults {
+        if !x.condition_held_at_fire {
+            why.push(format!("{} {}: the trigger condition no longer held when it fired", x.action, x.pod));
+        }
+        match &x.landing {
+            None => why.push(format!("{} {}: where it landed is unknown", x.action, x.pod)),
+            Some(l) if l.class != kind.as_str() => why.push(format!(
+                "{} {}: landed {}, outside the {} window",
+                x.action,
+                x.pod,
+                l.class,
+                kind.as_str()
+            )),
+            Some(_) => {}
+        }
+    }
+    why
 }
 
 pub fn evaluate(f: &Facts) -> Verdict {
@@ -474,9 +537,21 @@ pub fn evaluate(f: &Facts) -> Verdict {
     }
     checked.insert("I10".into(), f.packs.len());
 
-    let pass = !findings.iter().any(|x| x.severity == Severity::Fail);
+    let inconclusive = match f.kind {
+        Some(kind) => exercised(kind, &f.faults),
+        None => Vec::new(),
+    };
+    let outcome = if findings.iter().any(|x| x.severity == Severity::Fail) {
+        Outcome::Fail
+    } else if !inconclusive.is_empty() {
+        Outcome::Inconclusive
+    } else {
+        Outcome::Pass
+    };
     Verdict {
-        pass,
+        pass: outcome == Outcome::Pass,
+        outcome,
+        inconclusive,
         checked_at_ms: f.now_ms,
         checked,
         findings,
@@ -519,6 +594,8 @@ pub async fn gather(src: &Sources<'_>, scenario: &Scenario, pod_records: Vec<Pod
     let mut f = Facts {
         pod_records,
         quiesce_deadline_ms: scenario.quiesce_deadline_ms(),
+        kind: Some(scenario.kind),
+        faults: scenario.faults.clone(),
         ..Default::default()
     };
 

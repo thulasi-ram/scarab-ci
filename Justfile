@@ -291,7 +291,8 @@ e2e filter="":
 # mid-drain and then mid-feed, and check the invariants (crates/scarab-chaos).
 # Switches back to the mode that was active before (dev or dogfood; else dev)
 # and runs `just demo` there. Scenario files land in deploy/kind/.chaos (or
-# $SCARAB_CHAOS_DIR). Exit 1 means a verdict failed. See deploy/kind/chaos.sh.
+# $SCARAB_CHAOS_DIR). Exit 1 means a verdict failed, 3 that a scenario was
+# inconclusive (its fault did not land in its window). See deploy/kind/chaos.sh.
 # Usage: `just chaos` | `just chaos mid-feed 7` | `just chaos replay <scenario.json>`.
 chaos what="all" seed="1":
     bash deploy/kind/chaos.sh "{{what}}" "{{seed}}"

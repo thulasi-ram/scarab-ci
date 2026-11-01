@@ -303,8 +303,14 @@ with no drain record (an abandoned drain) is reported as a warning: the pack
 reclaimer removes it later (git-bug ad79c90). ADR-0077's I2, I5, I6, I7, I9
 and I11 are not part of rank 1 and are not checked here.
 
+A scenario whose fault did not test what it names is INCONCLUSIVE, not PASS:
+no fault fired (the trigger never held, or every Run ended first), the fault
+landed `before-window` or `after-window`, or the trigger condition no longer
+held when it fired.
+
 `just chaos` exits 0 when every verdict passed, 1 when one failed (a finding:
-keep the scenario file and replay it), and 2 when a scenario could not run.
+keep the scenario file and replay it), 2 when a scenario could not run, and 3
+when none failed but one was inconclusive (rerun it, or try another seed).
 It also samples the kind node's memory every 5 s into
 `deploy/kind/.chaos/memory-<time>.log` and prints the peak.
 

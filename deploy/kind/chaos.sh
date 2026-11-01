@@ -17,7 +17,9 @@
 #      would open a new public Forgejo tunnel) and runs `just demo` there.
 #
 # Exit code: 0 when every verdict passed; 1 when a verdict failed (a finding);
-# 2 when the harness could not run a scenario.
+# 2 when the harness could not run a scenario; 3 when no verdict failed but a
+# scenario was INCONCLUSIVE (its fault did not fire, landed outside its window
+# or fired after its condition stopped holding), which is not a pass.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -89,10 +91,10 @@ cleanup() {
     scarab_addr
     echo "==> just demo on $back"
     SCARAB_BASE="$base" SCARAB_DEMO_IMAGE="${SCARAB_DEMO_IMAGE:-scarab-clone:dev}" bash "$here/demo.sh" \
-      || { echo "error: just demo failed after switching back to $back" >&2; [ "$rc" -ne 0 ] || rc=2; }
+      || { echo "error: just demo failed after switching back to $back" >&2; [ "$rc" = 1 ] || rc=2; }
   else
     echo "error: could not switch back to $back" >&2
-    [ "$rc" -ne 0 ] || rc=2
+    [ "$rc" = 1 ] || rc=2
   fi
   exit "$rc"
 }
@@ -137,9 +139,11 @@ stats_pid=$!
 run_one() {
   local code=0
   "$bin" "$@" || code=$?
+  # Worst first: 2 (harness), 1 (a finding), 3 (inconclusive), 0.
   case "$code" in
     0) ;;
     1) [ "$rc" -eq 2 ] || rc=1 ;;
+    3) [ "$rc" -ne 0 ] || rc=3 ;;
     *) rc=2 ;;
   esac
 }
