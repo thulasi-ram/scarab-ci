@@ -18,7 +18,7 @@
   know `--role workspace`. One built before ADR-0061 renders a perfectly valid
   StatefulSet whose container exits 2 with
     error: invalid value 'workspace' for '--role <ROLE>'
-  and CrashLoopBackOffs. A chart cannot check that, so `deploy/local-helm/deploy.sh`
+  and CrashLoopBackOffs. A chart cannot check that, so `deploy/demo-oracle/deploy.sh`
   preflights it — it asks the image which roles it supports and refuses the deploy
   with the cause and the way out. An operator installing this chart directly owns
   the same check; the failure is a CrashLoopBackOff on this StatefulSet with that
@@ -138,8 +138,8 @@ spec:
             # CrashLoopBackOff, and because readiness gates the deploy, the
             # install fails at `rollout status` with the cause three layers
             # down in a Pod log. Only reachable with real OAuth configured,
-            # which is why deploy/local-helm (SCARAB_DEV_INSECURE=true) never
-            # hit it and deploy/demo-oracle did, on its first deploy.
+            # which is why the dev-insecure local stacks never hit it and
+            # deploy/demo-oracle did, on its first deploy.
             - name: SCARAB_OAUTH_CLIENT_SECRET
               valueFrom:
                 secretKeyRef:

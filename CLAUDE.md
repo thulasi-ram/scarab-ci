@@ -11,7 +11,9 @@ decisions.
 Scarab. Prefer them for any test run / dogfood / local verification — do not
 hand-roll `docker` / `kind` / `kubectl` / `helm` invocations.** The recipes
 encode the correct env, isolated kubeconfig, image source, pull policy, and
-colima safety guards; a bare command skips those and drifts from what CI does.
+kube safety checks; a bare command skips those and drifts from what CI does.
+CI runs the same recipes: `kind.yml` runs `just kube-tests`, `e2e.yml` runs
+`just e2e`.
 
 | Task | Recipe | What it is |
 |------|--------|-----------|
@@ -20,7 +22,6 @@ colima safety guards; a bare command skips those and drifts from what CI does.
 | **Full local stack** (kind) | `just up` → `just demo` → `just down` | one kind cluster `scarab-dev`: Postgres + MinIO + the real chart in it; server and Depot run a host-built binary (cargo-zigbuild on macOS) mounted into a thin runtime image; `just reload` rolls a rebuild, `just logs` follows the server. See `deploy/kind/README.md` |
 | **Workspace service** (ADR-0061) | `just workspace-logs`, `just workspace-status` | the Depot, StatefulSet `scarab-workspace` in the release, with its own log and its own `/readyz` |
 | **Dogfood** | `just dogfood` | `just up` in GitHub App mode with its own database + bucket, behind a named Cloudflare tunnel; reads `~/.config/scarab/dogfood.env` |
-| Helm on colima (retired) | `just local-helm` | the old dogfood on colima's k3s, which is off; `just dogfood` replaces it |
 | **Full-stack E2E** | `just e2e` | the release in its e2e mode (own database + bucket) driven by `crates/scarab-e2e`; `crash_resume` SIGKILLs the server from the kind node |
 | **Live Forgejo verification** | `just forgejo-verify` | a REAL Forgejo container on the kind network + the release in e2e mode; drives add-connection → bind → hook → push → Run. `FORGEJO_TUNNEL=1` adds the forge_token cases. Env-gated (`SCARAB_TEST_FORGEJO`), never in CI |
 | **Live k8s executor tier** | `just kube-tests` | `scarab-executor-k8s` + `scarab-plugin-k8s` cluster suites against the release's Depot (e2e mode), in namespace `scarab-kube-tests` |
@@ -37,9 +38,9 @@ an actual Pod** (`deploy/kind/test-env.sh`), because the kind docker network
 gateway is wrong on darwin.
 
 The deployment modes live under `deploy/`: `kind/` (the dev, dogfood and e2e
-stack) and `local-helm/` (retired: colima's k3s is off), plus
-`local-forgejo/`, the throwaway Forgejo the verification tier drives, and
-`test-services/`, the compose Postgres + MinIO `just test` uses.
+stack) and `demo-oracle/` (the public demo), plus `local-forgejo/`, the
+throwaway Forgejo the verification tier drives, and `test-services/`, the
+compose Postgres + MinIO `just test` uses.
 Image build contexts live under `docker/` (`server/`, `runtime/`, `clone/`,
 `sidecar/`, `wsfetch/`). `deploy/helm/` is the distribution chart.
 

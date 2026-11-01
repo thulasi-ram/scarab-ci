@@ -197,8 +197,8 @@ Helm values.
 
 **This covers the credential only.** Which installations and repos exist is
 separate durable state, registered by the App's `installation` /
-`installation_repositories` webhook deliveries (or `deploy/local-helm/reseed.sh`
-for a local loop). A fresh database still needs one delivery.
+`installation_repositories` webhook deliveries (or, for the local dogfood stack,
+the signed synthetic `installation` event `just dogfood` sends). A fresh database still needs one delivery.
 
 ## Declarative connections (`scarab.connections`, ADR-0060 part D)
 

@@ -69,7 +69,7 @@ the mount. `just up` builds them locally and loads them into the node:
 Local builds keep these helpers in step with the tree. A published `edge` tag
 is built from `main`, and a `scarab-wsfetch` older than the server fails every
 drain. The release gets a library manifest whose copy of `libs/clone.yaml`
-pins `scarab-clone:dev` (the approach `just local-helm local` used).
+pins `scarab-clone:dev`.
 
 Images are loaded as a one-platform archive (`docker save --platform` and
 `kind load image-archive`). `kind load docker-image` imports every platform
@@ -129,8 +129,8 @@ only GitHub's deliveries reach Scarab and every other path gets the tunnel's
 catch-all 404. `publicUrl` is
 `https://$DOGFOOD_HOSTNAME`. After the roll-out, `up.sh` seeds the
 `production` Environment, installs the clone library into `SCARAB_ORG` and
-registers the installation with a signed `installation:created`, as
-`deploy/local-helm/reseed.sh` did.
+registers the installation with a signed `installation:created`, so a fresh
+database knows the installation before GitHub sends anything.
 
 The dogfood runs dev-insecure, as it did on colima: there is no login, and
 anyone who reaches the UI or the API is an Owner of a server that holds the
@@ -149,6 +149,26 @@ public for those few seconds. It then sends an unsigned
 `POST /webhooks/github` and expects Scarab's 400 or 401.
 
 `just up` switches back to dev and removes the tunnel.
+
+### GitHub App settings
+
+The webhook URL and secret are not enough. Two App settings must be right, and
+when either is wrong nothing reports an error:
+
+1. **Subscribe to events.** Under *Permissions & events > Subscribe to events*,
+   check **Push** and **Pull request**. With an empty list, `push` and
+   `pull_request` are never delivered, so nothing triggers. `installation` and
+   `installation_repositories` still arrive (they do not depend on the list),
+   so the repo registers and `GET /v1/repos` looks fine: the repo is
+   registered, but nothing ever runs.
+2. **Grant Commit statuses: read & write.** Without it, posting a status gets
+   403 `Resource not accessible by integration`. Scarab logs it and
+   dead-letters the status message after retries, but the Run still succeeds,
+   so the PR never shows a status. Also grant **Contents: read** (clone) and
+   **Metadata: read**.
+
+After a permission change, GitHub asks an installation owner to approve the
+new access by email; the change is not live until then.
 
 ## Kube safety
 
@@ -195,12 +215,24 @@ delivers hooks to `http://scarab-dev-control-plane:30080` (the release's
 `publicUrl` for that run, with the hook secret, passed through
 `SCARAB_KIND_EXTRA_VALUES`).
 
+## CI
+
+`.github/workflows/kind.yml` runs `just kube-tests` and
+`.github/workflows/e2e.yml` runs `just e2e`, so CI creates the same cluster
+with the same `up.sh`. The runner gets pinned kind, Helm 4 and zig from
+`.github/actions/kind-tools`, and `cargo-zigbuild`. With `cargo-zigbuild`
+installed, `up.sh` builds for `x86_64-unknown-linux-gnu.2.36` there too: a
+plain `cargo build` on ubuntu-latest links a newer glibc than the runtime
+image's (bookworm, 2.36). On a Linux runner the kind network's gateway is a
+host address, so the Pod-side probe in `test-env.sh` finds it.
+
 ## Settings
 
 | Variable | Default | Effect |
 |---|---|---|
 | `SCARAB_KIND_PROFILE` | `dev` | cargo profile for the binaries (`release` for a faster drain, slower build) |
 | `SCARAB_KIND_SKIP_BUILD` | `0` | `1` uses the binaries already in `.mount/bin` |
+| `SCARAB_KIND_SKIP_UI` | `0` | `1` builds no web UI and stages none; the server runs API-only (CI sets it) |
 | `SCARAB_KIND_FORCE_SWITCH` | `0` | `1` switches dev <-> dogfood while step Pods are running |
 | `SCARAB_KIND_RECREATE` | `0` | `1` deletes and recreates a `scarab-dev` cluster that does not fit (its data goes with it) |
 | `SCARAB_DEV_ORG` | `thulasi-ram` | org whose `production` Environment dev mode seeds |

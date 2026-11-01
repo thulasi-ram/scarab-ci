@@ -13,7 +13,7 @@ tree and mounted into the server Pods, so you rebuild and rerun without building
 (`deploy/kind/README.md`). The test recipes run against the same release in its e2e mode.
 `Justfile` recipes over `deploy/` drive all of it. Use them rather
 than typing docker/kind/kubectl commands yourself: they set the right env, an isolated kubeconfig,
-and the colima safety guards.
+and the kube safety checks. CI runs the same recipes (`just kube-tests`, `just e2e`).
 
 For a guided first run see [Run locally](/scarab-ci/get-started/run-locally/); to deploy the
 packaged Helm chart inside the cluster instead, see
@@ -21,7 +21,7 @@ packaged Helm chart inside the cluster instead, see
 
 ## Prerequisites
 
-- **docker** (or colima): backs kind.
+- **docker** (Docker Desktop, colima or plain docker on Linux): backs kind.
 - **kind**, **kubectl**, **Helm 4**: the stack runs in a local kind cluster (`scarab-dev`).
 - **cargo** (Rust toolchain, see `rust-toolchain.toml`): the server is built from source, with
   **zig** and `cargo-zigbuild` on macOS (the binary is built for Linux).

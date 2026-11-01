@@ -50,8 +50,8 @@ scarab:
   # The first-party library release manifest (ADR-0076 §5), as JSON text.
   # Empty => the server reads `libs-manifest.json` from its own version's
   # GitHub release. Set it for an air-gapped install, or for a build whose
-  # first-party libraries are not released (`just local-helm local` writes one
-  # that lists a clone library pinning the locally built scarab-clone image).
+  # first-party libraries are not released (`just up` writes one that lists a
+  # clone library pinning the locally built scarab-clone image).
   # The checkout image is the one `lib:thulasi-ram/clone` pins; to use a
   # mirror, install a library version that pins the mirror's image.
   libsManifest: ""
@@ -144,7 +144,7 @@ scarab:
   # and the workspace StatefulSet additionally write-probes the bucket at boot
   # and refuses to serve if it is unreachable or read-only. The chart does not
   # ship a MinIO; point this at any S3-compatible endpoint you run (the
-  # in-cluster MinIO of deploy/local-helm, a cloud bucket, ...). The only way
+  # in-cluster MinIO of deploy/kind, a cloud bucket, ...). The only way
   # to run without a bucket is an explicit SCARAB_OBJECT_DIR via
   # scarab.extraEnv — a tests/dev stand-in whose contents die with the Pod;
   # never production.

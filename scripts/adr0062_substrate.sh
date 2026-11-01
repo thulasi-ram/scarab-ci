@@ -4,9 +4,10 @@
 # ADR-0062 ("Workspace export: lazy materialisation without a node driver")
 # does not choose its design from taste — it chooses it because a handful of
 # kernel and Kubernetes behaviours are what they are. Each of those was measured
-# once, by hand, on colima. Every one of them is a property of a *kernel version*
-# or an *admission plugin*, so any of them can change under a colima/k3s bump and
-# invalidate the ADR's reasoning **silently**.
+# once, by hand, on colima's k3s (since retired). Every one of them is a property
+# of a *kernel version* or an *admission plugin*, so any of them can change under
+# a kernel or Kubernetes bump and invalidate the ADR's reasoning **silently**.
+# It now runs on the kind cluster `just up` creates (deploy/kind).
 #
 # That is exactly the failure this repo has paid for before, so the measurements
 # are a recipe rather than a paragraph. This script re-runs them and FAILS LOUDLY
@@ -16,6 +17,20 @@
 #
 # Run: just adr0062-substrate
 set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Guard. Production EKS contexts sit in the ambient kubeconfig on developer
+# machines; every probe below creates a privileged Pod, so a wrong cluster is
+# not a small mistake. Every kubectl call goes through the kind stack's own
+# kubeconfig (deploy/kind/.kubeconfig), checked against the kind cluster's API
+# port before each call (deploy/kind/lib.sh). The ambient one is never read.
+# ---------------------------------------------------------------------------
+# shellcheck source=deploy/kind/lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/deploy/kind/lib.sh"
+verify_kubeconfig
+# Defined before the cleanup trap, so the trap's kubectl is this one too.
+kubectl() { verify_kubeconfig; KUBECONFIG="$kubeconfig" command kubectl --context "kind-$cluster" "$@"; }
+echo "context: kind-$cluster ($kubeconfig)"
 
 NS=default
 POD_PREFIX=scarab-adr0062-probe
@@ -35,18 +50,6 @@ cleanup() {
 TMP=$(mktemp -d)
 trap cleanup EXIT
 
-# ---------------------------------------------------------------------------
-# Guard. Production EKS contexts sit beside colima on developer machines; every
-# probe below creates a privileged Pod, so a wrong context is not a small
-# mistake. Exact match, no substring.
-# ---------------------------------------------------------------------------
-CTX=$(kubectl config current-context 2>/dev/null || echo "<none>")
-if [ "$CTX" != "colima" ]; then
-  echo "REFUSING: kube context is '$CTX', not exactly 'colima'." >&2
-  echo "This probe creates privileged Pods. Switch context and re-run." >&2
-  exit 2
-fi
-echo "context: $CTX"
 kubectl get nodes -o jsonpath='{range .items[*]}node: {.metadata.name}  runtime: {.status.nodeInfo.containerRuntimeVersion}  kubelet: {.status.nodeInfo.kubeletVersion}{"\n"}{end}'
 
 # ---------------------------------------------------------------------------

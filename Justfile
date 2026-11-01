@@ -122,89 +122,19 @@ workspace-status:
     echo "== /readyz =="; bash deploy/kind/kubectl.sh get --raw "$svc/readyz" || echo "NOT READY"
     echo; echo "== /metrics =="; bash deploy/kind/kubectl.sh get --raw "$svc/metrics"
 
-# Requires deploy/local-helm/.env and kube context `colima`. Usage:
-#   just local-helm             # pull + deploy the latest ghcr `edge`
-#   just local-helm sha-abc123  # pull + deploy a specific published SHA
-#   just local-helm local       # build server+clone+sidecar+wsfetch locally, then deploy
-#
-# NFS prerequisite (ADR-0062 stage 2b ONLY — probed 2026-08-02):
-#   Nothing here needs an NFS client today, and nothing in stage 2a will: the
-#   `LocalPath` delivery hands a co-located Step the Depot's overlay through a
-#   `local` PV, no network. Only the NFS-delivered Export (2b) needs a client on
-#   each Step node, and the colima VM ships without one:
-#       colima ssh -- sudo apt-get update && colima ssh -- sudo apt-get install -y nfs-common
-#   Installed once, it survives `colima stop`/`start` and is lost on `colima
-#   delete`. Without it kubelet fails with "you might need a /sbin/mount.nfs
-#   helper program" and the Pod hangs in ContainerCreating FOREVER — no event
-#   worth reading, no timeout. Any PV we create must also pin
-#   `mountOptions: [nfsvers=4.2]` (on kind, a v3 mount dies with "rpc.statd is
-#   not running": the node has no systemd to run it; v4 works).
-
-# Deploy the Helm dogfood stack on colima; pulls ghcr by default, `local` builds.
-local-helm ref="edge":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    owner=ghcr.io/thulasi-ram
-    if [ "{{ref}}" = "local" ]; then
-      echo "==> building server + clone + sidecar + wsfetch from the working tree"
-      docker build -t scarab-server:dogfood-local -f docker/server/Dockerfile .
-      docker build -t scarab-clone:dogfood docker/clone
-      docker build -t scarab-results-sidecar:dogfood docker/sidecar
-      # The ADR-0061 wsfetch image — TWO jobs since s3-drain: the s3-feed fetcher
-      # init container AND the egress helper every workspace Pod carries
-      # (`scarab-wsfetch hold` + the in-Pod `drain` the control plane execs).
-      # Context is the repo root: it is a bin target of
-      # crates/scarab-workspace-client. Under ADR-0062 the Export replaces the
-      # in-cluster FEED, but this image does NOT go away — it stays the fetch
-      # path for modes without an Export and the drain helper regardless (the
-      # old node-driver deletion note, git-bug 0628369, is closed as
-      # superseded). Rollout order: this image must land BEFORE a control
-      # plane that expects the drain helper — a stale image makes every drain
-      # exit 0 with NO record, a prompt Config failure naming the skew (see
-      # deploy/helm values comment).
-      docker build -t scarab-wsfetch:dogfood -f docker/wsfetch/Dockerfile .
-      IMAGE_REPOSITORY=scarab-server \
-      SCARAB_CLONE_IMAGE=scarab-clone:dogfood \
-      SCARAB_SIDECAR_IMAGE=scarab-results-sidecar:dogfood \
-      SCARAB_WSFETCH_IMAGE=scarab-wsfetch:dogfood \
-        bash deploy/local-helm/deploy.sh dogfood-local
-    else
-      echo "==> pulling + deploying published images @ {{ref}} (ghcr, pullPolicy Always)"
-      IMAGE_REPOSITORY="$owner/scarab-server" \
-      IMAGE_PULL_POLICY=Always \
-      SCARAB_CLONE_IMAGE="$owner/scarab-clone:{{ref}}" \
-      SCARAB_SIDECAR_IMAGE="$owner/scarab-results-sidecar:{{ref}}" \
-      SCARAB_WSFETCH_IMAGE="$owner/scarab-wsfetch:{{ref}}" \
-        bash deploy/local-helm/deploy.sh {{ref}}
-    fi
-
-# Persistent port-forward to the in-cluster server (UI + API) on colima. A plain
-# `kubectl port-forward` binds to ONE Pod and dies when it rolls — and every
-# `just local-helm` now rolls the server Pod — so this loops against the Service
-# and auto-reconnects. Leave it running; Ctrl-C to stop. Usage: `just local-helm-ui [port]`.
-local-helm-ui port="8080":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    [ "$(kubectl config current-context)" = "colima" ] || { echo "refusing: context is not 'colima'." >&2; exit 1; }
-    echo "==> http://127.0.0.1:{{port}}  (auto-reconnects across deploys; Ctrl-C to stop)"
-    until kubectl port-forward -n scarab svc/scarab {{port}}:80; do
-      echo "   port-forward dropped (Pod roll?) — reconnecting…" >&2
-      sleep 1
-    done
-
 # The PUBLIC demo (deploy/demo-oracle): one Oracle Cloud "Always Free" A1
 # instance — arm64, 2 OCPU / 12 GB — running k3s, the control plane, the
 # workspace service and every step Pod, reached through a Cloudflare Tunnel.
 #
 # Run this ON THE BOX, after `sudo bash deploy/demo-oracle/bootstrap.sh` and
 # after filling in deploy/demo-oracle/.env. It refuses unless the kube context
-# matches KUBE_CONTEXT (k3s writes `default`) — the same "never target the wrong
-# cluster" guard `just local-helm` has for colima.
+# matches KUBE_CONTEXT (k3s writes `default`), so it never targets the wrong
+# cluster.
 #
 #   just demo-oracle             # deploy the latest published ghcr `edge`
 #   just demo-oracle sha-<sha>   # deploy a specific published SHA
 #
-# There is deliberately NO `local` variant, unlike `just local-helm local`. Two
+# There is no `local` variant that builds on the box. Two
 # Ampere cores will not compile this workspace in a time anyone will wait for,
 # and doing it on the demo box would starve the running demo of both cores while
 # it happened. image.yml builds arm64 on native runners, so every published tag
@@ -474,7 +404,7 @@ kube-tests filter="":
       fi
     done
     # The plain-HTTP registry the `kind: build` case pushes to and then reads
-    # the tag list of, from inside the cluster (same shape as kind.yml).
+    # the tag list of, from inside the cluster.
     echo "==> ensuring an in-cluster registry in namespace $tns"
     kc apply -n "$tns" -f - >/dev/null <<EOF
     apiVersion: apps/v1
@@ -657,14 +587,17 @@ policy-conformance cel_rust:
 check:
     cargo check --workspace
 
-# Re-assert the platform facts ADR-0062 rests on (kube context must be `colima`).
+# Re-assert the platform facts ADR-0062 rests on, on the kind cluster `just up`
+# creates (through deploy/kind/.kubeconfig, like every other kind recipe).
 #
 # ADR-0062 picks its design because of a handful of kernel and PodSecurity
 # behaviours — Bidirectional needs privilege, `baseline` already forbids it,
 # `restricted` forbids inline `nfs:` but allows a PVC, overlayfs copy-up leaves
 # the lower layer intact, a hardlink shares its inode, metacopy does not help.
 # Every one of those is a property of a kernel version or an admission plugin, so
-# a colima/k3s bump can invalidate the ADR's reasoning WITHOUT ANY CODE CHANGING.
+# a kernel or Kubernetes bump can invalidate the ADR's reasoning WITHOUT ANY CODE
+# CHANGING. The facts were first measured on colima's k3s (retired); the kernel
+# under kind on a Mac is still colima's VM.
 #
 # This asserts them and fails loudly, naming the ADR section that would have to
 # be rewritten. It is not a demo: it prints no number it does not check.
@@ -745,22 +678,14 @@ overlay-tests dir="/var/tmp/scarab-overlay":
 overlay-tests-colima image="rust:1-bookworm":
     #!/usr/bin/env bash
     set -euo pipefail
-    # This recipe runs containers on the machine that also hosts the operator's
-    # dogfood stack, and production EKS contexts sit next to the local one. Both
-    # handles must point at colima or we stop — even though only docker is used,
-    # a kube context that is not colima means this shell is aimed somewhere else.
+    # This recipe runs a --privileged container on the machine that also hosts
+    # the kind dev stack. Only docker is used, so the docker context is the one
+    # guard: it must be the local colima VM.
     dctx=$(docker context show)
     if [ "$dctx" != "colima" ]; then
       echo "REFUSING: docker context is '$dctx', not 'colima'." >&2
       echo "This recipe runs a --privileged container; it will only do that on the local VM." >&2
       exit 2
-    fi
-    if command -v kubectl >/dev/null 2>&1; then
-      kctx=$(kubectl config current-context 2>/dev/null || echo none)
-      if [ "$kctx" != "colima" ]; then
-        echo "REFUSING: kube context is '$kctx', not 'colima'." >&2
-        exit 2
-      fi
     fi
     # Named volumes: /var/lib/docker is ext4 on the VM, so /scratch is a legal
     # overlayfs upperdir — the container ROOTFS is not (it is overlayfs itself,

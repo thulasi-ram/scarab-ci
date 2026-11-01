@@ -85,19 +85,20 @@ but none of them has carried production load.
   commit-status posting over real HTTP. `just forgejo-verify` drives a real Forgejo container
   through add-connection → bind → hook → signed push → Run. It doesn't check status posting,
   and CI doesn't run it. The [live demo](#live-demo) and this repo's own dogfood setup
-  (`deploy/local-helm/`) take their webhooks from a GitHub App. Each adapter also has a live
+  (`just dogfood`, `deploy/kind/`) take their webhooks from a GitHub App. Each adapter also has a live
   contract test (`tests/contract_live.rs`) that you run by hand.
 - **Implemented, and tested on a kind cluster.** Pod-per-step execution on Kubernetes
   (`scarab-executor-k8s`): re-attach after an executor relaunch, step deadlines, cancel, clone
   and build steps, the workspace feed and drain, artifact harvest, and the results-egress
   sidecar image (`docker/sidecar/`). `.github/workflows/kind.yml` runs these live-cluster
-  tests on a throwaway kind cluster for PRs and pushes to main that change the execution path
-  (the executor, engine, server, storage and workspace-client crates, or `docker/`), not on
-  every PR. As of 2026-10-28 the kind job fails at image load, before the tests run; it was
+  tests with `just kube-tests`, the recipe you run locally, on a kind cluster the recipe
+  creates. It runs for PRs and pushes to main that change the execution path (the executor,
+  engine, server, storage, workspace-client and plugin-k8s crates, `docker/`, `deploy/kind/`,
+  the chart or the `Justfile`), not on every PR. As of 2026-10-28 the kind job fails at image load, before the tests run; it was
   last green on main on 2026-10-20.
 - **Not proven yet.** Control-plane crash and resume with a real Pod in flight. The
   `crash_resume` test in `crates/scarab-e2e` does this on a kind cluster; it runs weekly
-  (`.github/workflows/e2e.yml`) and doesn't pass yet. Nothing has run at production scale.
+  (`.github/workflows/e2e.yml`, which runs `just e2e`) and doesn't pass yet. Nothing has run at production scale.
 - **Missing.** `on: cron` and `on: upstream` triggers parse, but nothing produces those
   events yet, so they never fire.
 
@@ -243,24 +244,10 @@ Without Docker/kind, the server still runs API-only against a local Postgres and
 a filesystem object store (`--object-dir`); the background driver is skipped
 until a cluster is reachable.
 
-## Helm dogfood (in-cluster, colima)
-
-To test the **real chart and published image** inside a cluster (a production-like
-setup, e.g. Scarab-on-Scarab), use the `local-helm` mode:
-
-```sh
-just local-helm             # pull + deploy the latest ghcr `edge`
-just local-helm sha-<sha>   # pull + deploy a specific published SHA
-just local-helm local       # build server+clone+sidecar+wsfetch from the tree, then deploy
-```
-
-Needs `deploy/local-helm/.env` and kube context `colima`; see
-`deploy/local-helm/README.md`.
-
 > **Running or testing Scarab locally: use the `just` recipes as the canonical
 > entrypoints** (`just up`/`demo`/`down`, `just dogfood`, `just test`) rather
 > than hand-rolled `docker`/`kubectl`/`helm` commands — they carry the right
-> env, isolated kubeconfig, image source, and colima guards. Missing something?
+> env, isolated kubeconfig, image source, and kube safety checks. Missing something?
 > Add a recipe. (Agents: this is also in `CLAUDE.md`.)
 
 ## API contract workflow

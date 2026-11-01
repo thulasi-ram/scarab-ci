@@ -1,6 +1,6 @@
 ---
 title: Installation
-description: Installing Scarab on any Kubernetes cluster (local kind/colima or a live/production cluster) via the packaged Helm chart.
+description: Installing Scarab on any Kubernetes cluster (a local kind cluster or a live/production cluster) via the packaged Helm chart.
 ---
 
 import Doodle from '../../../components/Doodle.astro';
@@ -11,10 +11,9 @@ You install Scarab on a cluster with its Helm chart; Scarab is Kubernetes-only b
 chart deploys `scarab-server` (one binary, selectable roles) with the RBAC it needs to launch one
 Pod per step in its namespace.
 
-The **same chart** targets any Kubernetes: a local kind/colima cluster or a real, live cluster.
-`just local-helm` (below) is a convenience recipe that installs this chart on colima; a live
-cluster uses the same `helm upgrade --install` with your own Postgres, object store, and
-credentials. The chart is new and will get more production hardening as people use it, but
+The **same chart** targets any Kubernetes: a local kind cluster or a real, live cluster.
+`just up` (below) installs this chart on a local kind cluster; a live cluster uses the same
+`helm upgrade --install` with your own Postgres, object store, and credentials. The chart is new and will get more production hardening as people use it, but
 nothing in it is local-only.
 
 ## The chart
@@ -180,27 +179,25 @@ ingress:
 Every key above exists in the chart's `values.yaml`; see it (and `README.md`) for the full
 reference.
 
-## The colima local loop
+## The chart on a local kind cluster
 
-`just local-helm` installs the same chart on a local colima cluster and brings the whole stack up
-**inside the cluster**: Postgres, MinIO, and `scarab-server` (which also serves the web UI at
-`/`), so you can repeatedly deploy a pinned image and watch this repo's own CI run on Scarab.
+`just up` installs the same chart on a local kind cluster, `scarab-dev`, with Postgres and
+MinIO running in the cluster beside it. The one difference from a live install is the server
+binary: the server and the workspace service run a `scarab-server` built from your working
+tree and mounted into a small runtime image, so a code change needs a rebuild and a Pod
+restart (`just reload`), not an image build.
 
 ```sh
-just local-helm             # deploy the latest ghcr `edge` image
-just local-helm sha-<sha>   # deploy a specific published SHA
-just local-helm local       # build server + clone + sidecar from the tree, then deploy
-just local-helm-ui 8080     # port-forward the in-cluster UI (reconnects across deploys)
+just up        # build the server, create the kind cluster, install the chart
+just reload    # rebuild and roll the server and workspace Pods onto the new binary
+just dogfood   # the same release in GitHub App mode, behind a Cloudflare tunnel
+just down      # delete the cluster and its data
 ```
 
-The kube context must be `colima` (the deploy script refuses otherwise). Configuration
-(image source, GitHub App knobs, webhook secrets, seed inputs) lives in one gitignored file,
-`deploy/local-helm/.env`; see `deploy/local-helm/README.md` for the steps to configure the App and
-the caveats about the object store.
-
-To skip the chart, [Run locally](/scarab-ci/get-started/run-locally/) runs `scarab-server` as a
-host process on your laptop, with Postgres and MinIO in docker compose and step Pods on a local
-kind cluster.
+Every kubectl and helm call uses the cluster's own kubeconfig (`deploy/kind/.kubeconfig`),
+checked against the cluster before each call. See
+[Run locally](/scarab-ci/get-started/run-locally/) for a first run and `deploy/kind/README.md`
+for the details.
 
 ## References
 

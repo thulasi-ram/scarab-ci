@@ -9,7 +9,7 @@ import Doodle from '../../../components/Doodle.astro';
 
 This page covers what Scarab needs and the two ways to bring it up. Every
 pipeline step runs as a Pod, so either way you need a **Kubernetes cluster**:
-kind or colima on your laptop works, and so does a remote production cluster.
+a local kind cluster works, and so does a remote production cluster.
 
 Neither way is a cut-down version of the other; pick the one that fits what
 you're doing.
@@ -28,11 +28,10 @@ Both run the same engine against a real cluster; they differ in how
 | If you want to… | Use | Where |
 |---|---|---|
 | Look at a running Scarab without installing anything | **Live demo** | [demo-scarab.ahiravan.dev](https://demo-scarab.ahiravan.dev/) |
-| Deploy Scarab inside the cluster the way it ships, on kind/colima or a live/production cluster | **Helm chart** | [Installation](/scarab-ci/get-started/deploy-helm/) |
+| Deploy Scarab inside the cluster the way it ships, on kind or a live/production cluster | **Helm chart** | [Installation](/scarab-ci/get-started/deploy-helm/) |
 | Iterate on the server from source with a loop that rebuilds and reruns | **kind dev loop** (`just up`) | [Run locally](/scarab-ci/get-started/run-locally/) |
-| Reproduce the exact deployment inside the cluster on your laptop before shipping | **Helm chart on colima** (`just local-helm`) | [Installation](/scarab-ci/get-started/deploy-helm/) |
 
-The **same Helm chart** targets every environment: a local kind/colima cluster
+The **same Helm chart** targets every environment: a local kind cluster
 and a live production cluster use the identical `helm upgrade --install`. There is
 no separate "production build"; the kind dev loop only swaps the packaged image
 for a `scarab-server` built from the tree and mounted into the Pods, so you
