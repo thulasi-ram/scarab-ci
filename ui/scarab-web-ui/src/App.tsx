@@ -37,8 +37,7 @@ export default function App() {
       {/* Install or upgrade a library: its own page, so the
           review can be sent to a second reviewer. */}
       <Route path="/orgs/:org/settings/libraries/review" component={LibraryReview} />
-      {/* Old addresses: the server still sends people to /account?… and
-          /account/security?enroll=1, and bookmarks outlive us. */}
+      {/* Old addresses, kept for bookmarks and links sent before the move. */}
       <Route path="/settings/libraries/review" component={LegacySettings} />
       <Route path="/account" component={LegacySettings} />
       <Route path="/account/security" component={LegacySettings} />

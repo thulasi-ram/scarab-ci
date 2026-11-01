@@ -107,9 +107,9 @@ export function settingsHome(who: SettingsCaller): string {
 }
 
 /**
- * Where an old settings URL now lives, keeping its query string (the server
- * still sends people to `/account?identity_linked=…` and
- * `/account/security?enroll=1`). `null` when `pathname` is not an old URL.
+ * Where an old settings URL now lives, keeping its query string (an old
+ * `/account?identity_linked=…` or `/account/security?enroll=1` link still
+ * lands on the right section). `null` when `pathname` is not an old URL.
  */
 export function legacyRedirect(pathname: string, search: string, who: SettingsCaller): string | null {
   const path = pathname.replace(/\/+$/, "") || "/";
