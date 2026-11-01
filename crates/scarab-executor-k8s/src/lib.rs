@@ -13,6 +13,7 @@
 /// the results token's message format is duplicated across two crates and that
 /// is a standing drift hazard, not a pattern to copy.
 pub mod cache_home;
+mod watch_clock;
 pub mod workspace_token;
 
 use async_trait::async_trait;
@@ -226,6 +227,11 @@ pub struct K8sExecutor {
     /// both failures at once, which is what the annotation already is —
     /// everywhere except under the RBAC outage itself.
     ws_drain_fallback_anchors: std::sync::Mutex<std::collections::HashMap<String, i64>>,
+    /// How long this executor has itself watched each Pod's step end and
+    /// results drain (git-bug 070d042): the second clock every sidecar
+    /// ceiling must pass, so a host suspend or a paused node is not judged a
+    /// lost node on the first poll after it. See [`watch_clock`].
+    watch_clock: watch_clock::WatchClock,
 }
 
 impl K8sExecutor {
@@ -241,6 +247,7 @@ impl K8sExecutor {
             artifact_store: None,
             placement: PlacementConfig::default(),
             ws_drain_fallback_anchors: std::sync::Mutex::new(std::collections::HashMap::new()),
+            watch_clock: watch_clock::WatchClock::default(),
         }
     }
 
@@ -256,6 +263,7 @@ impl K8sExecutor {
             artifact_store: None,
             placement: PlacementConfig::default(),
             ws_drain_fallback_anchors: std::sync::Mutex::new(std::collections::HashMap::new()),
+            watch_clock: watch_clock::WatchClock::default(),
         }
     }
 
@@ -2090,9 +2098,10 @@ enum WorkspaceLeg {
     PastCeiling,
 }
 
-fn workspace_leg(pod: &Pod, now_secs: i64) -> WorkspaceLeg {
+fn workspace_leg(pod: &Pod, now: impl Into<Now>) -> WorkspaceLeg {
+    let now: Now = now.into();
     if init_container_running(pod, WORKSPACE_EGRESS_CONTAINER)
-        && sidecar_reporting_ceiling_passed(pod, now_secs)
+        && sidecar_reporting_ceiling_passed(pod, now)
     {
         WorkspaceLeg::PastCeiling
     } else {
@@ -2127,10 +2136,11 @@ fn frozen_step_failure(pod: &Pod) -> Option<ExecState> {
     })
 }
 
-fn settled_state(pod: &Pod, harvesting: bool, now_secs: i64) -> ExecState {
+fn settled_state(pod: &Pod, harvesting: bool, now: impl Into<Now>) -> ExecState {
+    let now: Now = now.into();
     // The results-egress drain is owed on a workspace Pod too (ADR-0042):
     // see `results_settled_state`.
-    let state = results_settled_state(pod, now_secs);
+    let state = results_settled_state(pod, now);
     // The workspace egress still showing `running` is "settle in flight" —
     // until the sidecar reporting ceiling (red team R3 on git-bug f02588d):
     // past it a live kubelet has SIGKILLed and reported every sidecar, so a
@@ -2139,7 +2149,7 @@ fn settled_state(pod: &Pod, harvesting: bool, now_secs: i64) -> ExecState {
     // `Running` until its timeout (`Timeout`, never retried) on every
     // workspace Pod — the default path.
     let settling = init_container_running(pod, WORKSPACE_EGRESS_CONTAINER)
-        && !sidecar_reporting_ceiling_passed(pod, now_secs);
+        && !sidecar_reporting_ceiling_passed(pod, now);
     // The kubelet holds the phase `Running` until every sidecar stopped, and
     // a lost node never reports them: the step's own exit 0 is the verdict
     // to settle on once the egress is gone (the snapshot rule below decides
@@ -2148,9 +2158,9 @@ fn settled_state(pod: &Pod, harvesting: bool, now_secs: i64) -> ExecState {
         ExecState::Running
             if !settling
                 && is_workspace_pod(pod)
-                && sidecar_reporting_ceiling_passed(pod, now_secs)
+                && sidecar_reporting_ceiling_passed(pod, now)
                 && step_terminated_exit(pod) == Some(0)
-                && !(results_draining(pod) && !results_drain_overdue(pod, now_secs)) =>
+                && !(results_draining(pod) && !results_drain_overdue(pod, now)) =>
         {
             ExecState::Succeeded
         }
@@ -2159,7 +2169,7 @@ fn settled_state(pod: &Pod, harvesting: bool, now_secs: i64) -> ExecState {
         ExecState::Running
             if !settling
                 && is_workspace_pod(pod)
-                && sidecar_reporting_ceiling_passed(pod, now_secs) =>
+                && sidecar_reporting_ceiling_passed(pod, now) =>
         {
             frozen_step_failure(pod).unwrap_or(ExecState::Running)
         }
@@ -2170,7 +2180,7 @@ fn settled_state(pod: &Pod, harvesting: bool, now_secs: i64) -> ExecState {
         // ADR-0061 part 4: an Attempt is not `Succeeded` until its Workspace
         // Snapshot is durable. The sidecar being gone is not proof that it is —
         // see `workspace_snapshot_lost`.
-        ExecState::Succeeded if workspace_snapshot_lost(pod, now_secs) => ExecState::Failed {
+        ExecState::Succeeded if workspace_snapshot_lost(pod, now) => ExecState::Failed {
             exit_code: None,
             // The step's process DID run, so a side effect is possible: the
             // engine's retry has to be the at-least-once kind (CONTEXT.md §2),
@@ -2292,7 +2302,7 @@ fn results_draining(pod: &Pod) -> bool {
 /// the kubelet's reason when it gave one.
 ///
 /// Also `Some` when the drain is still unobserved-as-finished (no status, or
-/// `running`) but [`results_drain_overdue`] at `now_secs` (git-bug
+/// `running`) but [`results_drain_overdue`] at `now` (git-bug
 /// `f02588d`): the verdict was released without the sidecar's word, so a
 /// missing result is an UNCONFIRMED delivery — most likely a lost node — not
 /// the author's omission.
@@ -2300,7 +2310,8 @@ fn results_draining(pod: &Pod) -> bool {
 /// `None` for no sidecar (results egress not configured), an exit 0 (the POST
 /// committed), and a drain still in flight or never observed within its bound
 /// — nothing proves a failure, so the author-facing reason stands.
-fn pod_results_delivery_failure(pod: &Pod, now_secs: i64) -> Option<String> {
+fn pod_results_delivery_failure(pod: &Pod, now: impl Into<Now>) -> Option<String> {
+    let now: Now = now.into();
     let declared = pod
         .spec
         .as_ref()
@@ -2328,7 +2339,7 @@ fn pod_results_delivery_failure(pod: &Pod, now_secs: i64) -> Option<String> {
     });
     let Some(terminated) = terminated else {
         // Never seen to finish. Only the bound turns that into a reason.
-        if results_draining(pod) && results_drain_overdue(pod, now_secs) {
+        if results_draining(pod) && results_drain_overdue(pod, now) {
             let bound = results_drain_bound_secs(pod);
             return Some(format!(
                 "the results sidecar `{RESULTS_EGRESS_CONTAINER}` never reported \
@@ -2369,16 +2380,23 @@ const K8S_DEFAULT_TERMINATION_GRACE_SECS: i64 = 30;
 const RESULTS_DRAIN_SLACK_SECS: i64 = 300;
 
 /// Has every native sidecar of this Pod had its chance to report terminating
-/// at `now_secs`? True once the step container's `finishedAt` +
+/// at `now`? True once the step container's `finishedAt` +
 /// [`results_drain_bound_secs`] has passed: the kubelet SIGKILLs a finished
 /// Pod's sidecars within its `terminationGracePeriodSeconds` and reports them
 /// well inside the slack, so a sidecar still showing `running` past this
 /// ceiling belongs to a node that stopped reporting (red team R3 on git-bug
 /// `f02588d`). No `finishedAt`, or a broken clock (`i64::MIN`), → never.
-fn sidecar_reporting_ceiling_passed(pod: &Pod, now_secs: i64) -> bool {
-    step_terminated_finished_at(pod).is_some_and(|finished| {
-        now_secs >= finished.saturating_add(results_drain_bound_secs(pod))
-    })
+///
+/// The bound must ALSO have elapsed in time this executor watched the step's
+/// end ([`Now::step_end_watched`], git-bug 070d042): a host suspend or a
+/// paused node freezes the kubelet, the sidecar mid-drain and this executor
+/// alike, and the wall clock alone then reads the ceiling as long passed on
+/// the first poll after the resume — a live node judged lost.
+fn sidecar_reporting_ceiling_passed(pod: &Pod, now: Now) -> bool {
+    let bound = results_drain_bound_secs(pod);
+    now.step_end_watched >= bound
+        && step_terminated_finished_at(pod)
+            .is_some_and(|finished| now.wall >= finished.saturating_add(bound))
 }
 
 /// How long after its drain could begin ([`results_drain_began_at`]) a
@@ -2396,7 +2414,7 @@ fn results_drain_bound_secs(pod: &Pod) -> i64 {
 }
 
 /// Has a results drain that is still not seen to finish outlived its bound at
-/// `now_secs` (unix seconds)? (git-bug `f02588d`.) True once the step
+/// `now`? (git-bug `f02588d`.) True once the step
 /// container's `finishedAt` + [`results_drain_bound_secs`] has passed.
 ///
 /// A live kubelet ends the sidecar inside that bound (SIGKILL at the grace)
@@ -2415,10 +2433,16 @@ fn results_drain_bound_secs(pod: &Pod) -> i64 {
 /// sidecar may still be settling; past it, its status is frozen by a lost
 /// node and no start will ever be observed — "no bound" there left the
 /// verdict withheld until the step timeout on every workspace Pod.
-fn results_drain_overdue(pod: &Pod, now_secs: i64) -> bool {
+///
+/// As with the ceiling, the bound must also have elapsed in time this
+/// executor watched the drain ([`Now::drain_watched`], git-bug 070d042).
+fn results_drain_overdue(pod: &Pod, now: Now) -> bool {
     match results_drain_began_at(pod) {
-        Some(began) => now_secs >= began.saturating_add(results_drain_bound_secs(pod)),
-        None => sidecar_reporting_ceiling_passed(pod, now_secs),
+        Some(began) => {
+            let bound = results_drain_bound_secs(pod);
+            now.drain_watched >= bound && now.wall >= began.saturating_add(bound)
+        }
+        None => sidecar_reporting_ceiling_passed(pod, now),
     }
 }
 
@@ -2484,7 +2508,7 @@ fn step_terminated_finished_at(pod: &Pod) -> Option<i64> {
 
 /// [`pod_state`] with `Succeeded` withheld (reported `Running`) while the
 /// results-egress drain is in flight ([`results_draining`]) — but only until
-/// that drain is [`results_drain_overdue`] at `now_secs` (git-bug `f02588d`).
+/// that drain is [`results_drain_overdue`] at `now` (git-bug `f02588d`).
 /// Past the bound the step's own exit 0 is the verdict: `Succeeded`, and a
 /// result that never arrived reads as missing, its reason naming the
 /// unconfirmed delivery ([`pod_results_delivery_failure`], git-bug `0cb5895`).
@@ -2500,9 +2524,10 @@ fn step_terminated_finished_at(pod: &Pod) -> Option<i64> {
 /// Every other verdict passes through verbatim — a failed or lost Pod owes no
 /// results the engine would read. Pure: the scheduler's next poll re-derives
 /// it from the Pod.
-fn results_settled_state(pod: &Pod, now_secs: i64) -> ExecState {
+fn results_settled_state(pod: &Pod, now: impl Into<Now>) -> ExecState {
+    let now: Now = now.into();
     let draining = results_draining(pod);
-    let overdue = draining && results_drain_overdue(pod, now_secs);
+    let overdue = draining && results_drain_overdue(pod, now);
     match pod_state(pod) {
         ExecState::Succeeded if draining && !overdue => ExecState::Running,
         ExecState::Running if overdue && step_terminated_exit(pod) == Some(0) => {
@@ -2515,9 +2540,70 @@ fn results_settled_state(pod: &Pod, now_secs: i64) -> ExecState {
     }
 }
 
-/// Wall-clock unix seconds, the `now` the pure verdict functions take.
+/// Wall-clock unix seconds.
 fn unix_now_secs() -> i64 {
     unix_secs(std::time::SystemTime::now())
+}
+
+/// The `now` the pure verdict functions take: the wall clock the sidecar
+/// ceilings compare with node-stamped times, and how long this executor has
+/// itself watched each ceiling's anchor (git-bug 070d042, see
+/// [`watch_clock`]). A ceiling passes only when both have elapsed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Now {
+    /// Unix seconds ([`unix_secs`]; `i64::MIN` for a broken clock).
+    wall: i64,
+    /// Seconds this executor watched the step container terminated; 0 when
+    /// the step's end is not seen yet.
+    step_end_watched: i64,
+    /// Seconds this executor watched the results drain's start
+    /// ([`results_drain_began_at`]) known; 0 before it is.
+    drain_watched: i64,
+}
+
+/// Tests that predate git-bug 070d042 pass a bare wall time: the executor
+/// has watched every anchor long enough, so only the wall bound decides.
+#[cfg(test)]
+impl From<i64> for Now {
+    fn from(wall: i64) -> Self {
+        Now {
+            wall,
+            step_end_watched: i64::MAX,
+            drain_watched: i64::MAX,
+        }
+    }
+}
+
+impl K8sExecutor {
+    /// [`Now`] for this observation of `pod`: the wall clock, and one more
+    /// tick of the Pod's watch clocks for each anchor the Pod now reports.
+    fn now_for(&self, pod: &Pod) -> Now {
+        let instant = std::time::Instant::now();
+        let uid = pod
+            .metadata
+            .uid
+            .as_deref()
+            .or(pod.metadata.name.as_deref())
+            .unwrap_or_default();
+        let watched = |anchor, seen: bool| {
+            if seen {
+                self.watch_clock.observe(uid, anchor, instant)
+            } else {
+                0
+            }
+        };
+        Now {
+            wall: unix_now_secs(),
+            step_end_watched: watched(
+                watch_clock::Anchor::StepEnd,
+                step_terminated_finished_at(pod).is_some(),
+            ),
+            drain_watched: watched(
+                watch_clock::Anchor::ResultsDrain,
+                results_drain_began_at(pod).is_some(),
+            ),
+        }
+    }
 }
 
 /// `t` as unix seconds — failing CLOSED (review safety S5): a clock before
@@ -2594,13 +2680,14 @@ fn is_workspace_pod(pod: &Pod) -> bool {
 /// owe. Its *artifacts* are owed, and [`artifact_harvest_owed`] is that rule.
 ///
 /// "Gone" includes a sidecar whose status is frozen at `running` past the
-/// [`sidecar_reporting_ceiling_passed`] at `now_secs` — the lost node itself
+/// [`sidecar_reporting_ceiling_passed`] at `now` — the lost node itself
 /// (red team R3 on git-bug `f02588d`): it will never be seen to terminate.
-fn workspace_snapshot_lost(pod: &Pod, now_secs: i64) -> bool {
+fn workspace_snapshot_lost(pod: &Pod, now: impl Into<Now>) -> bool {
+    let now: Now = now.into();
     is_workspace_pod(pod)
         && step_terminated_exit(pod) == Some(0)
         && (!init_container_running(pod, WORKSPACE_EGRESS_CONTAINER)
-            || sidecar_reporting_ceiling_passed(pod, now_secs))
+            || sidecar_reporting_ceiling_passed(pod, now))
         && !pod
             .metadata
             .annotations
@@ -2735,7 +2822,7 @@ impl Executor for K8sExecutor {
                     // Skip straight to that verdict, which owns what a lost
                     // node forfeits: no root, or declared artifacts never
                     // harvested, is the retried Infra failure — never green.
-                    let now = unix_now_secs();
+                    let now = self.now_for(&pod);
                     if workspace_leg(&pod, now) == WorkspaceLeg::PastCeiling {
                         return Ok(settled_state(&pod, self.artifact_store.is_some(), now));
                     }
@@ -2876,17 +2963,14 @@ impl Executor for K8sExecutor {
                         Some(pod) => pod,
                         None => return Ok(ExecState::Lost),
                     };
-                    return Ok(settled_state(
-                        &pod,
-                        self.artifact_store.is_some(),
-                        unix_now_secs(),
-                    ));
+                    let now = self.now_for(&pod);
+                    return Ok(settled_state(&pod, self.artifact_store.is_some(), now));
                 }
                 // No workspace settle, but the results-egress drain may
                 // still be owed (ADR-0042): withhold `Succeeded` until it
                 // finished (see `results_draining`), bounded by
                 // `results_drain_overdue` (git-bug f02588d).
-                Ok(results_settled_state(&pod, unix_now_secs()))
+                Ok(results_settled_state(&pod, self.now_for(&pod)))
             }
             // The Pod is gone (evicted, GC'd, node lost) — the backend lost it.
             None => Ok(ExecState::Lost),
@@ -3076,7 +3160,7 @@ impl Executor for K8sExecutor {
         let pod = pod.ok_or_else(|| {
             ExecError::Other(format!("the step's Pod `{}` is already gone", handle.0))
         })?;
-        Ok(pod_results_delivery_failure(&pod, unix_now_secs()))
+        Ok(pod_results_delivery_failure(&pod, self.now_for(&pod)))
     }
 
     async fn workspace_provisioning(
@@ -8344,6 +8428,120 @@ mod tests {
             settled_state(&bare, true, finished + bound),
             ExecState::Failed { .. }
         ));
+    }
+
+    /// git-bug 070d042: a host suspend (or a paused node) freezes the
+    /// kubelet, the egress mid-drain and the executor alike, and the wall
+    /// clock jumps on resume. The step finished long ago by the wall clock,
+    /// but this executor has watched it for less than the ceiling: still a
+    /// settle in flight — not "egress sidecar died". Once the ceiling has
+    /// also elapsed in watched time, a status still frozen at `running` is a
+    /// lost node as before (f02588d stays fixed).
+    #[test]
+    fn a_wall_clock_jump_alone_never_judges_a_live_node_lost() {
+        let finished = NOW - 900; // a 15-minute sleep since the step's end
+        let grace = 30;
+        let bound = grace + RESULTS_DRAIN_SLACK_SECS;
+        let frozen = || {
+            let mut pod = with_results_sidecar(
+                step_finished_at(settling_pod_with("Running", 0, true, true, false), finished),
+                Some(results_status(results_running(), false)),
+            );
+            pod.spec.as_mut().unwrap().termination_grace_period_seconds = Some(grace);
+            pod
+        };
+        // The executor first saw the step's end and the drain's start on the
+        // same poll (the helper declares the results sidecar last, so its
+        // drain begins at the step's end).
+        let watched = |secs: i64| Now {
+            wall: NOW,
+            step_end_watched: secs,
+            drain_watched: secs,
+        };
+        assert!(NOW >= finished + bound, "the wall ceiling alone has passed");
+        // The first poll after the resume, and every poll short of the
+        // ceiling in watched time: the drain is given its chance.
+        for secs in [0, bound - 1] {
+            assert_eq!(workspace_leg(&frozen(), watched(secs)), WorkspaceLeg::Drive);
+            assert!(!workspace_snapshot_lost(&frozen(), watched(secs)));
+            assert_eq!(
+                settled_state(&frozen(), true, watched(secs)),
+                ExecState::Running,
+                "watched {secs}s"
+            );
+            assert_eq!(
+                pod_results_delivery_failure(&frozen(), watched(secs)),
+                None,
+                "watched {secs}s"
+            );
+        }
+        // Watched for the whole ceiling and still frozen: the lost node.
+        assert_eq!(
+            workspace_leg(&frozen(), watched(bound)),
+            WorkspaceLeg::PastCeiling
+        );
+        match settled_state(&frozen(), true, watched(bound)) {
+            ExecState::Failed {
+                class: FailureClass::Infra {
+                    never_started: false,
+                },
+                cause: Some(cause),
+                ..
+            } => assert!(cause.contains("workspace snapshot lost"), "{cause}"),
+            other => panic!("expected the lost-snapshot infra failure, got {other:?}"),
+        }
+        // Watched long enough but the wall ceiling not reached (a fresh
+        // step end): still withheld — both clocks must pass.
+        let fresh = Now {
+            wall: finished + bound - 1,
+            step_end_watched: bound,
+            drain_watched: bound,
+        };
+        assert_eq!(settled_state(&frozen(), true, fresh), ExecState::Running);
+    }
+
+    /// git-bug 070d042, the results drain's own bound: a drain that began
+    /// before the freeze is overdue by the wall clock on resume, but this
+    /// executor has watched it for less than the bound — still withheld, and
+    /// no unconfirmed delivery is claimed.
+    #[test]
+    fn a_results_drain_is_overdue_only_after_it_was_watched_for_its_bound() {
+        let finished = NOW - 900;
+        let grace = 30;
+        let bound = grace + RESULTS_DRAIN_SLACK_SECS;
+        let mut pod = with_results_sidecar(
+            step_finished_at(plain_pod("Running", 0), finished),
+            Some(results_status(results_running(), false)),
+        );
+        pod.spec.as_mut().unwrap().termination_grace_period_seconds = Some(grace);
+        let at = |drain_watched: i64| Now {
+            wall: NOW,
+            step_end_watched: drain_watched,
+            drain_watched,
+        };
+        assert_eq!(results_settled_state(&pod, at(0)), ExecState::Running);
+        assert_eq!(results_settled_state(&pod, at(bound - 1)), ExecState::Running);
+        assert_eq!(pod_results_delivery_failure(&pod, at(bound - 1)), None);
+        assert_eq!(results_settled_state(&pod, at(bound)), ExecState::Succeeded);
+        assert!(pod_results_delivery_failure(&pod, at(bound)).is_some());
+    }
+
+    /// The executor's side of git-bug 070d042: a Pod this executor sees for
+    /// the first time starts its watch at zero, whatever the wall clock says
+    /// about its step's end; a Pod whose step has not ended has no watch.
+    #[test]
+    fn a_pod_seen_for_the_first_time_has_been_watched_for_nothing() {
+        let exec = K8sExecutor::new("ns");
+        let mut pod = step_finished_at(plain_pod("Running", 0), NOW - 10_000);
+        pod.metadata.uid = Some("uid-1".into());
+        let now = exec.now_for(&pod);
+        assert_eq!(now.step_end_watched, 0);
+        assert_eq!(now.drain_watched, 0, "no results sidecar: the drain began at the step's end");
+        let mut unended = plain_pod("Running", 0);
+        unended.status.as_mut().unwrap().container_statuses = None;
+        unended.metadata.uid = Some("uid-2".into());
+        assert_eq!(exec.now_for(&unended).step_end_watched, 0);
+        assert_eq!(exec.watch_clock.len(), 2, "uid-1's two anchors; none for uid-2");
     }
 
     // ------------------------------------------------------------------
