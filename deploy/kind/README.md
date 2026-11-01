@@ -251,7 +251,7 @@ container. The `scarab-chaos` binary (`crates/scarab-chaos`) fires the fault and
 then checks the invariants.
 
 ```sh
-just test chaos             # every scenario, seed 1
+just test chaos             # the five ranked scenarios (not pause-node), seed 1
 just test chaos rank2       # one rank
 just test chaos mid-feed 7  # one scenario, another seed
 just test chaos pause-node  # about 20 minutes; not part of `all`
@@ -338,6 +338,7 @@ does not take the API's or a Step's word for success:
 | W1 | the workload's outcome (not an ADR-0077 §2 invariant): every scenario Run ends `succeeded`, and every green Attempt has an output snapshot |
 | N1 | `pause-node` only (git-bug 070d042): no Attempt finished with a lost-node cause ("workspace snapshot lost", "egress sidecar died"); any other failed Attempt is a warning |
 | D1 | `two-replicas` only (git-bug 068cc0b): no `release-log.txt` line about a scenario Pod says "drain helper exited 12 with no record posted"; with no fault, that line means a second replica drove the same drain |
+| C1 | the Cache probe (git-bug 12e2f6b): when the probe's seed Run succeeded and no fault hit the Cache's home Depot replica, every restore of the probe Run is a hit from that home. Otherwise it is printed `not exercised` with the reason, and it has no minimum |
 
 W1 is separate from the ADR's I-numbers because I3 and I4 as written there
 accept a dead-lettered Run and a green Attempt with no snapshot. The workload
@@ -365,14 +366,19 @@ the engine retries: the Run can still end `succeeded` on a second Attempt and
 pass W1. `pause-node` pauses the node for the target Pod's
 `terminationGracePeriodSeconds` + 300 s (`RESULTS_DRAIN_SLACK_SECS` in
 `scarab-executor-k8s`) + 30 s. The producer is a workspace Pod with a grace
-of 600 s, so the pause is 930 s, and a scenario takes about 20 minutes. Its
+of 600 s, so the pause is 930 s, and a scenario takes about 20 minutes. The
+pause is never longer than 20 minutes, and a scenario file that planned a
+longer one is refused. Its
 trigger and window are `mid-drain`'s, with a delay of 0 to 2 s. It is
 INCONCLUSIVE when the pause landed outside the drain window, when docker did
 not report the node paused, or when the pause ended before the ceiling. The
 harness unpauses the node on every path it controls (a guard on every
 return, and a SIGINT or SIGTERM handler), and `chaos.sh` unpauses a paused
-node when it starts and first thing when it exits. Its port-forwards are
-kept open by a loop that restarts each one when it exits; after the unpause
+node when it starts and first thing when it exits. If chaos.sh itself is
+killed (SIGKILL), `just stack up` and `just stack down` find the node paused
+and unpause it, and say so. Its port-forwards are
+kept open by a loop that restarts each one when it exits, and that ends once
+chaos.sh is gone; after the unpause
 the harness ends each (their PIDs are in `deploy/kind/.state/forward-*.pid`),
 the loop re-opens it on the same port, and the harness waits until Postgres
 and the kube API answer before it goes on. Its Pod watch re-lists when a list

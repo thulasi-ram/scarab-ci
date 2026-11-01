@@ -338,7 +338,7 @@ prefer local disk. An NFS-backed class adds a network round trip to every blob,
 which is the cost the warm tier is there to remove.
 
 **More than one replica.** Drains and input fetches can land on any replica.
-Two replicas pass the ADR-0077 rank 1 fault runs (`just chaos`). A Cache is the
+Two replicas pass the ADR-0077 rank 1 fault runs (`just test chaos`). A Cache is the
 exception: it lives only in one replica's warm tier. Above one replica the
 chart renders one Service per replica, `<fullname>-workspace-<ordinal>`, and the
 server gives each step Pod the replica chosen from its cache key, its home. The
@@ -346,6 +346,10 @@ Pod saves and restores that Cache through the home and sends everything else
 through `<fullname>-workspace`. A home that is down, has evicted the Cache, or
 is no longer the home after `workspace.replicaCount` changes is a cache miss:
 the step rebuilds the directory. Changing the count moves about 1/N of the keys.
+Change the count with `workspace.replicaCount` and a release upgrade, not
+`kubectl scale`: the server reads the count from `SCARAB_WORKSPACE_REPLICAS`,
+which the chart copies from that value, so after a scale it picks homes over
+the old count until the release is upgraded.
 The StatefulSet's `serviceName` is unchanged, so upgrading needs no migration.
 
 > **Unverified in this chart version:** per-availability-zone placement.

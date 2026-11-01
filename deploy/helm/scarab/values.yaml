@@ -14,12 +14,12 @@ fullnameOverride: ""
 # Number of scarab-server replicas. Safe to scale, with converged or split
 # roles: Postgres is the coordination bus, and `launch` is idempotent on the
 # Attempt's fence (ADR-0021, ADR-0047). A replica supervises a Step only while
-# it holds that Step's launch intent claim, and renews the claim while it works
-# (a workspace drain can outlast the 30 s window), so two replicas never drive
-# one Pod at once; a replica that dies stops renewing and a peer takes the
-# intent over within 30 s. Admission is leader-only, and the leader's writes are
-# fenced on its lease term: a leader paused past its 30 s lease has its writes
-# refused once a peer takes over.
+# it holds that Step's launch intent claim, and renews the claim every 10 s
+# while it works (a workspace drain can outlast the 30 s window). A replica that
+# loses its claim stops driving the launch within one renewal period; a replica
+# that dies stops renewing and a peer takes the intent over within 30 s.
+# Admission is leader-only; the ADR-0077 amendment covers how a leader that
+# lost its lease is kept from writing.
 replicaCount: 1
 
 # How the server Deployment is updated. `Recreate` stops every old server Pod
@@ -374,14 +374,20 @@ workspace:
   # git-bug afb13c2 — sealed packs are staged into the shared index at seal
   # time and the record POST commits the fence's union (see
   # templates/service-workspace.yaml) — so >1 is CORRECT, and 2 replicas pass
-  # the ADR-0077 rank 1 fault runs (`just chaos`). Per-AZ topology is a later
-  # slice.
+  # the ADR-0077 rank 1 fault runs (`just test chaos`). Per-AZ topology is a
+  # later slice.
   #
   # Above 1, each Cache has a home replica chosen from its cache key, and the
   # chart renders one Service per replica (`<fullname>-workspace-<ordinal>`,
   # templates/service-workspace-replicas.yaml) so a Step Pod can reach it
   # (git-bug 12e2f6b). Changing the count moves about 1/N of the cache keys
   # to a new home; each moved key misses once.
+  #
+  # The server reads the count from SCARAB_WORKSPACE_REPLICAS, which the chart
+  # copies from this value. Change it here and upgrade the release: after a
+  # `kubectl scale` of the StatefulSet the server still picks homes over the
+  # old count, so Caches go to the wrong replica (or to one that does not
+  # exist, a miss) until the release is upgraded.
   replicaCount: 1
   # One Depot replica's URL with `{ordinal}` in place of its StatefulSet
   # ordinal — where a Step Pod sends and reads its Cache. Empty = the
