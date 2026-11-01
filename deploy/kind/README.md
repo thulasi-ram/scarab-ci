@@ -173,15 +173,26 @@ The login provider's id is `github`, so people are `github:<login>`. The Owner
 is an Owner at every sign-in (`scarab.oauth.owners`). After the roll-out,
 `up.sh` runs `deploy/kind/seed.sh`, which grants the Owner the owner role and
 the member the member role in `SCARAB_ORG` with
-`scarab-server admin grant`, run in the server Pod against its database, so
-both appear on the org's Members page. A grant needs someone who has signed in
-once. Until then the script prints `sign in as github:<login> at
+`scarab-server admin grant --if-absent`, run in the server Pod against its
+database, so both appear on the org's Members page. `--if-absent` grants only
+to someone who has no role binding in the org, a revoked one included: when
+the Owner changes or removes a role in the UI, the next `up` or `reload`
+leaves it as the Owner set it. A grant needs someone who has signed in once.
+Until then the script prints `sign in as github:<login> at
 http://localhost:<port>, then run just stack seed dogfood`; that recipe runs the
-grants again and changes nothing that is already granted.
+grants again.
+
+`SCARAB_ADDR` must be on `127.0.0.1` in dogfood mode; `up.sh` refuses another
+address. The UI URL is `http://localhost:<port>`, and the UI and API are for
+this machine only.
+
+`just stack demo` refuses dogfood mode: it calls the API without a credential.
 
 On a fresh database, `up.sh` also prints a checklist of the steps that now need
 a passkey, which it used to do with plain curl (`just stack seed dogfood
-checklist` prints it again):
+checklist` prints it again). On an existing database it compares the clone
+library installed in the org with `deploy/kind/.state/dogfood-clone.yaml`
+(read with `psql` in the Postgres Pod) and prints step 3 when they differ:
 
 1. Sign in at `http://localhost:<port>` as the Owner and enroll a passkey in
    Settings > Security. Every new database needs a new one.

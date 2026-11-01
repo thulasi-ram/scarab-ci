@@ -259,10 +259,12 @@ record. Read Breaking changes before you upgrade.
   Empty means `publicUrl`. A sign-in started on `127.0.0.1` while the UI URL says `localhost`
   is sent to `localhost` first, so it keeps its cookie.
   [The UI URL](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#the-ui-url)
-- **`scarab-server admin grant --org --subject --role [--reason]`** gives a person a role in an
-  org straight in the database, for an install's first members. It needs only the database
-  URL, never migrates, and records `binding.operator_grant` in the org's event log with the
-  host, OS user and reason. A role already held is left as it is and not recorded again. A
+- **`scarab-server admin grant --org --subject --role [--if-absent] [--reason]`** gives a
+  person a role in an org straight in the database, for an install's first members. It needs
+  only the database URL, never migrates, and records `binding.operator_grant` in the org's
+  event log with the host, OS user and reason, in the same transaction as the binding. It sets
+  the role exactly: a higher role is lowered and a revoked one restored. With `--if-absent` it
+  writes nothing when the person already has a binding in the org, a revoked one included. A
   person who has never signed in is refused (exit 3).
   [Grant the first roles](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#grant-the-first-roles)
 
@@ -345,10 +347,12 @@ record. Read Breaking changes before you upgrade.
 
 - `just stack up dogfood` signs in with GitHub instead of running dev-insecure: identity store,
   role bindings, API tokens and passkey step-up, as a real install. It needs
-  `SCARAB_OAUTH_CLIENT_ID` and `SCARAB_OAUTH_CLIENT_SECRET` in `dogfood.env`, grants
-  `DOGFOOD_OWNER` and `DOGFOOD_MEMBER` their roles, and prints the fresh-database steps that
-  now need a passkey. `just stack seed dogfood` runs the grants again.
-  `SCARAB_DOGFOOD_DEV_INSECURE` is gone. See `deploy/kind/README.md`.
+  `SCARAB_OAUTH_CLIENT_ID` and `SCARAB_OAUTH_CLIENT_SECRET` in `dogfood.env` and
+  `SCARAB_ADDR` on `127.0.0.1`, grants `DOGFOOD_OWNER` and `DOGFOOD_MEMBER` their roles when
+  they have none in the org, and prints the fresh-database steps that now need a passkey, or
+  the clone library step when the installed copy differs. `just stack seed dogfood` runs the
+  grants again. `just stack demo` refuses dogfood mode. `SCARAB_DOGFOOD_DEV_INSECURE` is gone.
+  See `deploy/kind/README.md`.
 - The local stack is one kind cluster, `scarab-dev`, with one Helm release in four modes
   (dev, dogfood, e2e, chaos), each with its own database and bucket; Forgejo runs in it.
   `deploy/local-helm`, `deploy/local-proc` and the colima k3s setup are gone. The chart gains

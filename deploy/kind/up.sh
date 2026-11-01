@@ -136,6 +136,13 @@ fi
 # The host port: SCARAB_ADDR from deploy/kind/.env (lib.sh scarab_addr;
 # `just ui`'s SCARAB_API_URL must name the same port).
 scarab_addr   # addr_file, host_ip, host_port, base
+# The dogfood stack's UI is http://localhost:<port> (scarab.uiUrl) and is for
+# this machine only. A LAN or 0.0.0.0 address would publish a login and an API
+# to the network that the localhost UI URL does not serve.
+if [ "$mode" = dogfood ] && [ "$host_ip" != 127.0.0.1 ]; then
+  die "the dogfood stack answers on 127.0.0.1 only, and SCARAB_ADDR in $addr_file has host $host_ip.
+  Set SCARAB_ADDR=127.0.0.1:$host_port there and rerun 'just stack up dogfood'."
+fi
 
 port_listening() { (exec 3<>"/dev/tcp/$1/$2") 2>/dev/null; }
 
@@ -760,10 +767,12 @@ if [ "$mode" != dogfood ]; then
 fi
 
 if [ "$mode" = dogfood ]; then
-  # The Owner and member role bindings (`scarab-server admin grant` in the
-  # server Pod). On a fresh database also the one-time steps that need a
-  # passkey: the `production` Environment and the clone library copy that
-  # pins scarab-clone:dev. Without login up.sh did those with plain curl.
+  # The Owner and member role bindings (`scarab-server admin grant
+  # --if-absent` in the server Pod). On a fresh database also the one-time
+  # steps that need a passkey: the `production` Environment and the clone
+  # library copy that pins scarab-clone:dev. On an existing one, the step that
+  # reinstalls the clone library when the installed copy differs. Without
+  # login up.sh did those with plain curl.
   if [ "$fresh_database" = 1 ]; then
     bash "$here/seed.sh" --checklist
   else

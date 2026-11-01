@@ -317,11 +317,18 @@ scarab-server admin grant --org acme --subject github:alice --role member --reas
 ```
 
 `--role` is `viewer`, `member`, `admin` or `owner`. The person must have signed in once; until
-then the command exits 3 and says so. A role the person already holds in the org is left as
-it is. Every other grant is recorded in the org's event log as `binding.operator_grant`, with
-the host, OS user and reason. The command needs only `--database-url` or
-`SCARAB_DATABASE_URL` and never migrates the database. In a cluster, run it in the server Pod,
-which has the database URL:
+then the command exits 3 and says so. The command sets the role exactly: it lowers a higher
+role, restores a revoked one, and turns a role a forge import gave into one the forge sync
+does not change. When the person already holds that role, nothing is written. Each grant is
+recorded in the org's event log as `binding.operator_grant`, with the host, OS user and
+reason, in the same transaction as the role. The command needs only `--database-url` or
+`SCARAB_DATABASE_URL` and never migrates the database.
+
+A script that runs on every deploy should pass `--if-absent`. The command then writes nothing
+when the person has any role binding in the org, at the org or at a project, or one that was
+revoked, and prints what is there. A role an Owner changed in the UI stays as the Owner set it.
+
+In a cluster, run it in the server Pod, which has the database URL:
 
 ```sh
 kubectl exec -n scarab deploy/scarab -c scarab-server -- \

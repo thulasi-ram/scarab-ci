@@ -87,8 +87,11 @@ up mode="dev" ref="":
 # the member role in SCARAB_ORG, with `scarab-server admin grant` in the
 # server Pod. `just stack up dogfood` runs it too; run it again after someone
 # it named has signed in for the first time (a grant needs a Principal, which
-# a first sign-in creates). Idempotent. `checklist` also prints the one-time
-# steps of a fresh database that need a passkey. See deploy/kind/seed.sh.
+# a first sign-in creates). It grants only to someone with no role binding in
+# the org (`--if-absent`; a revoked one counts), so a role the Owner changed
+# or removed in the UI stays. It also says when the installed clone library
+# is not the one up.sh wrote. `checklist` prints the one-time steps of a
+# fresh database that need a passkey instead. See deploy/kind/seed.sh.
 [doc('Grant the dogfood Owner and member their roles; `checklist` adds the fresh-database steps')]
 seed mode="dogfood" what="":
     #!/usr/bin/env bash
@@ -158,6 +161,9 @@ status:
 # that dials the Depot, and this is the cheapest real proof that it works:
 # `consume` asserts on the CONTENT it inherited, so a silently empty /workspace
 # fails it.
+#
+# Both call the API without a credential, so they run against dev mode (and
+# e2e or chaos), not dogfood, which signs people in: there the recipe refuses.
 [doc('Submit a one-step pipeline and watch it; `chain` runs produce → consume')]
 demo what="":
     #!/usr/bin/env bash
@@ -167,5 +173,9 @@ demo what="":
       chain) script=deploy/kind/demo-chain.sh ;;
       *) echo "usage: just stack demo [chain]" >&2; exit 2 ;;
     esac
+    if [ "$(cat deploy/kind/.state/mode 2>/dev/null)" = dogfood ]; then
+      echo "REFUSING: the stack is in dogfood mode, which signs people in, and the demo calls the API without a credential. Run it after 'just stack up' (dev mode)." >&2
+      exit 2
+    fi
     . deploy/kind/lib.sh; scarab_addr   # base: SCARAB_ADDR, normalised
     SCARAB_BASE="${SCARAB_BASE:-$base}" SCARAB_DEMO_IMAGE="${SCARAB_DEMO_IMAGE:-scarab-clone:dev}" bash "$script"
