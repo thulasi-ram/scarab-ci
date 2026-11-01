@@ -1945,6 +1945,11 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 /* Forge connections (ADR-0060). One block per connection: identity line with its
    actions, a health line, then the Projects it serves. */
 .conn-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
+/* The Forgejo connection form: numbered sections (the org, the instance, the
+   token), in the Add dialog and on Connect a forge. */
+.conn-form { display: flex; flex-direction: column; gap: 14px; }
+.conn .typed-confirm { margin-top: 10px; }
+.conn .typed-confirm p { margin: 0; font-size: var(--fs-md); }
 .conn {
   border: 1px solid var(--border-soft);
   border-radius: 5px;

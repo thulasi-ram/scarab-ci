@@ -1502,9 +1502,16 @@ export type Connection = components["schemas"]["ConnectionDto"];
 export type ResyncResult = components["schemas"]["ResyncResultDto"];
 export type CreatedConnection = components["schemas"]["CreatedConnectionDto"];
 
-/** The registered forge connections with their bound Projects and health. */
-export async function listConnections(): Promise<Connection[]> {
-  const { data, error } = await api.GET("/v1/connections");
+/**
+ * The forge connections the caller may administer, with their bound Projects
+ * and health. With `org`, only the connections serving that org; without it,
+ * every org the caller administers, plus the unassigned ones (`org` null) for
+ * a global admin.
+ */
+export async function listConnections(org?: string): Promise<Connection[]> {
+  const { data, error } = await api.GET("/v1/connections", {
+    params: { query: org ? { org } : {} },
+  });
   if (error || !data) throw new Error("failed to load connections");
   return data;
 }
@@ -1521,7 +1528,7 @@ export async function resyncConnection(id: string): Promise<ResyncResult> {
   if (response.status === 501) {
     throw new Error("this forge can't list its repositories, so there's nothing to re-sync");
   }
-  if (error || !data) throw new Error("re-sync failed");
+  if (error || !data) throw new Error(errorText(error) || `re-sync failed (${response.status})`);
   return data;
 }
 
@@ -1562,6 +1569,8 @@ export async function createConnection(body: {
   kind: string;
   base_url: string;
   credential: string;
+  /** The org it serves: the forge account that owns its repositories. */
+  org: string;
 }): Promise<CreatedConnection> {
   const { data, error, response } = await api.POST("/v1/connections", { body });
   if (error || !data) {

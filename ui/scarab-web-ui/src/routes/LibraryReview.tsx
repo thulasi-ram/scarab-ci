@@ -62,7 +62,11 @@ function Review(props: { org: string }) {
   const org = () => props.org;
   const back = () => orgHref(props.org, "libraries");
   const [libs] = createResource(org, (o) => listLibraries(o));
-  const [connections] = createResource(() => listConnections().catch(() => []));
+  // A library is read through a connection of the installing org only.
+  const [connections] = createResource(
+    () => props.org,
+    (o) => listConnections(o).catch(() => []),
+  );
   const [form, setForm] = createSignal<FetchForm>({
     source: one(search.source),
     connection: one(search.connection),

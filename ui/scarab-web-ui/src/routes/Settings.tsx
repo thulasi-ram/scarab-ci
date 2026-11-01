@@ -2,17 +2,18 @@
 // section.
 //
 // The sidebar sits inside the usual 1200px `.page` column, not beside the
-// app: the top bar stays the only app-wide navigation. Two groups — Your
-// account (`/settings/<section>`, everyone's) and Organization settings
-// (`/orgs/<org>/settings/<section>`, admins of that org). Under ~900px the
-// list becomes a `<select>` above the section. A page under a section (one
+// app: the top bar stays the only app-wide navigation. Three groups — Your
+// account (`/settings/<section>`, everyone's), Organization settings
+// (`/orgs/<org>/settings/<section>`, admins of that org) and Server
+// administration (`/settings/server/<section>`, global admins). Under ~900px
+// the list becomes a `<select>` above the section. A page under a section (one
 // Environment, a library review) renders in the same frame, with its parent
 // section marked. The route table, the gating, which section a path sits in
 // and the old-URL redirects are pure functions in `settings-nav.ts`.
 //
 // Gating here is presentation: the server enforces `Administer` on the org
 // for every request an org section makes.
-import { For, Show, createMemo, type JSX } from "solid-js";
+import { For, Match, Show, Switch, createMemo, type JSX } from "solid-js";
 import { A, Navigate, useLocation, useNavigate, useParams } from "@solidjs/router";
 import { me } from "../session";
 import {
@@ -30,7 +31,7 @@ import {
 import LinkedAccounts from "../components/LinkedAccounts";
 import SecuritySettings from "../components/SecuritySettings";
 import AppearanceSettings from "../components/AppearanceSettings";
-import Connections from "../components/Connections";
+import Connections, { ConnectForge } from "../components/Connections";
 import Members from "../components/Members";
 import OrgEnvironments from "../components/OrgEnvironments";
 import Plugins from "../components/Plugins";
@@ -53,6 +54,12 @@ export function AccountSettings() {
 export function OrgSettings() {
   const params = useParams<{ org: string; section?: string }>();
   return <SettingsShell kind="org" org={orgFromParam(params.org)} section={params.section} />;
+}
+
+/** `/settings/server/:section` — a section only a global admin may use. */
+export function ServerSettings() {
+  const params = useParams<{ section: string }>();
+  return <SettingsShell kind="server" section={params.section} />;
 }
 
 /** An old settings URL (`/settings`, `/account`, …): where it lives now. */
@@ -167,12 +174,14 @@ export function SettingsFrame(props: {
               </For>
             </select>
 
-            <Show
-              when={props.kind !== "org" || administers(me(), props.org)}
-              fallback={<NotYours org={props.org!} />}
-            >
-              {props.children}
-            </Show>
+            <Switch fallback={props.children}>
+              <Match when={props.kind === "org" && !administers(me(), props.org)}>
+                <NotYours org={props.org!} />
+              </Match>
+              <Match when={props.kind === "server" && !me()?.global_admin}>
+                <NotGlobalAdmin />
+              </Match>
+            </Switch>
           </div>
         </div>
       </Show>
@@ -261,14 +270,21 @@ function SectionPage(props: { kind: SettingsGroupKind; org?: string; section: Se
         <h1>{props.section.label}</h1>
       </div>
       <p class="page-sub">
-        <Show when={props.kind === "org"} fallback="your account">
-          <span class="mono">{props.org}</span>
-        </Show>{" "}
+        <Switch fallback="your account">
+          <Match when={props.kind === "org"}>
+            <span class="mono">{props.org}</span>
+          </Match>
+          <Match when={props.kind === "server"}>this server</Match>
+        </Switch>{" "}
         · {props.section.sub}
       </p>
       <Show when={key()} keyed>
         {(_key) =>
-          props.kind === "account" ? accountBody(props.section.id) : orgBody(props.section.id, props.org!)
+          props.kind === "account"
+            ? accountBody(props.section.id)
+            : props.kind === "server"
+              ? serverBody(props.section.id)
+              : orgBody(props.section.id, props.org!)
         }
       </Show>
     </>
@@ -288,10 +304,19 @@ function accountBody(id: string): JSX.Element {
   }
 }
 
+function serverBody(id: string): JSX.Element {
+  switch (id) {
+    case "connect-forge":
+      return <ConnectForge />;
+    default:
+      return <NotFound />;
+  }
+}
+
 function orgBody(id: string, org: string): JSX.Element {
   switch (id) {
     case "connections":
-      return <Connections />;
+      return <Connections org={org} />;
     case "members":
       return <Members org={org} />;
     case "environments":
@@ -333,6 +358,20 @@ function NotYours(props: { org: string }) {
         <p class="empty">
           You do not administer <b class="mono">{props.org}</b>. These settings need the{" "}
           <b>Administer</b> capability on the organization; ask an owner if you need access.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function NotGlobalAdmin() {
+  return (
+    <div class="panel">
+      <div class="panel-h"><span>Server administration</span></div>
+      <div class="secrets-body">
+        <p class="empty">
+          This section needs a global <b>Administer</b> role. Ask a server administrator if you need
+          a new organization connected.
         </p>
       </div>
     </div>

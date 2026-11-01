@@ -7,6 +7,8 @@
 import { createResource } from "solid-js";
 import { getMe, type Me } from "./api/client";
 
-const [me] = createResource<Me>(getMe);
+const [me, { refetch: refetchMe }] = createResource<Me>(getMe);
 
-export { me };
+// Refetched when something the caller just did changes the answer: adding a
+// new org's first connection makes that org appear in `admin_orgs`.
+export { me, refetchMe };

@@ -50,11 +50,14 @@ const GATES_RUN_ID = "0190f8a2000071fb8c00d3e9107a1616";
 
 // ── /v1/me ────────────────────────────────────────────────────────────────
 // An Owner of the one implicit org (ADR-0060), so the Settings gear renders.
+// The Owner role is global, so Avery is a global admin: Settings shows Connect
+// a forge and the unassigned connection below (git-bug 19b0a45).
 const me = {
   subject: "a.kim",
   display_name: "Avery Kim",
   roles: ["Owner"],
   can_administer: true,
+  global_admin: true,
   admin_orgs: ["acme"],
   // Signed in two ways (ADR-0069): the legacy GitHub provider and Okta.
   identities: [
@@ -874,9 +877,12 @@ const secretNames = { names: ["DATABASE_URL", "SENTRY_DSN"] };
 const orgSecretNames = { names: ["GHCR_TOKEN", "SENTRY_DSN"] };
 
 // One healthy GitHub connection covering the acme repos (ADR-0060 part C).
+// Each connection serves one org (git-bug 19b0a45); `org: null` is unassigned
+// and listed to global admins only.
 const connections = [
   {
     id: "gh-acme",
+    org: "acme",
     kind: "github",
     base_url: "https://api.github.com",
     web_url: "https://github.com",
@@ -897,6 +903,7 @@ const connections = [
   // parts C/D), so the repo add/remove + webhook affordances render.
   {
     id: "forgejo-7f3a91c2",
+    org: "acme",
     kind: "forgejo",
     base_url: "https://git.acme.dev",
     web_url: "https://git.acme.dev",
@@ -907,6 +914,22 @@ const connections = [
     supports_resync: true,
     // Forgejo tokens are not introspectable, so the preflight line is not
     // offered for them at all (the endpoint would only answer "unknown").
+    supports_preflight: false,
+    managed_by_config: false,
+  },
+  // An installation whose account could not be told apart from a same-named
+  // org on another forge, so it serves no org yet.
+  {
+    id: "github-install-90211",
+    org: null,
+    kind: "github",
+    base_url: "https://api.github.com",
+    web_url: "https://github.com",
+    credential_ref: "github-app",
+    credential_present: true,
+    last_delivery_at: null,
+    projects: [],
+    supports_resync: true,
     supports_preflight: false,
     managed_by_config: false,
   },
@@ -932,10 +955,13 @@ const connectionPreflight = {
 };
 
 // What the Forgejo credential reaches — the bind pick-list (ADR-0060 slice 5).
+// The token also reaches a repo of another account, which the Add repository
+// dialog does not offer (the server would refuse to bind it).
 const availableRepos = [
   { owner: "acme", name: "infra", bound: true },
   { owner: "acme", name: "terraform-modules", bound: false },
   { owner: "acme", name: "runbooks", bound: false },
+  { owner: "globex", name: "shared-ci", bound: false },
 ];
 // The coverage matrix is now the repo/environment secret EDITOR (ADR-0060), so
 // the fixture carries the repo-default column ("") and inheritance origins:
@@ -1476,7 +1502,18 @@ function route(pathname: string, search: string, method: string): Response | nul
     }
     return json(found);
   }
-  if (p === "/v1/connections") return json(connections);
+  if (p === "/v1/connections") {
+    if (method === "POST") {
+      return json({ id: "forgejo-5be0d4a1", credential_ref: "forgejo-5be0d4a1-credential" }, { status: 201 });
+    }
+    // `?org=` lists one org's connections; without it, every org plus the
+    // unassigned ones (the fixture caller is a global admin).
+    const org = new URLSearchParams(search).get("org");
+    return json(org ? connections.filter((c) => c.org === org) : connections);
+  }
+  if (method === "POST" && /^\/v1\/connections\/[^/]+\/resync$/.test(p)) {
+    return json({ bound: [], confirmed: 3, skipped: ["globex/shared-ci"] });
+  }
   if (/^\/v1\/connections\/[^/]+\/available-repos$/.test(p)) return json(availableRepos);
   if (/^\/v1\/connections\/[^/]+\/preflight$/.test(p)) return json(connectionPreflight);
   // Secret names are scope-addressed: no `repo=` is the org scope (ADR-0060).

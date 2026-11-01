@@ -9,7 +9,7 @@ import Repos from "./routes/Repos";
 import RepoView from "./routes/RepoView";
 import RunDetail from "./routes/RunDetail";
 import RunPipeline from "./routes/RunPipeline";
-import { AccountSettings, LegacySettings, OrgSettings } from "./routes/Settings";
+import { AccountSettings, LegacySettings, OrgSettings, ServerSettings } from "./routes/Settings";
 import LibraryReview from "./routes/LibraryReview";
 import { EnvironmentEdit, EnvironmentView } from "./routes/EnvironmentPage";
 import ConfirmRequest from "./routes/ConfirmRequest";
@@ -34,6 +34,7 @@ export default function App() {
           segments, so they outrank the /:org/:repo tier. */}
       <Route path="/settings" component={LegacySettings} />
       <Route path="/settings/:section" component={AccountSettings} />
+      <Route path="/settings/server/:section" component={ServerSettings} />
       <Route path="/orgs/:org/settings/:section?" component={OrgSettings} />
       {/* Install or upgrade a library: its own URL inside the settings
           frame, so the review can be sent to a second reviewer. */}

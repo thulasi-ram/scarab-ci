@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   ACCOUNT_SECTIONS,
   ORG_SECTIONS,
+  SERVER_SECTIONS,
   accountHref,
   activeSectionHref,
   legacyRedirect,
@@ -10,13 +11,17 @@ import {
   orgHref,
   paletteEntries,
   resolveSection,
+  serverHref,
   settingsHome,
 } from "./settings-nav";
 
-type Who = { can_administer: boolean; admin_orgs: string[] };
+type Who = { can_administer: boolean; admin_orgs: string[]; global_admin?: boolean };
 const member: Who = { can_administer: false, admin_orgs: [] };
 const admin: Who = { can_administer: true, admin_orgs: ["acme"] };
 const twoOrgs: Who = { can_administer: true, admin_orgs: ["acme", "globex"] };
+// A global admin on a fresh server: no org exists until its first connection.
+const freshGlobal: Who = { can_administer: true, admin_orgs: [], global_admin: true };
+const globalWithOrg: Who = { can_administer: true, admin_orgs: ["acme"], global_admin: true };
 
 describe("route table", () => {
   it("gives every section its own URL, with no two sections sharing one", () => {
@@ -96,6 +101,8 @@ describe("which section the sidebar marks", () => {
     expect(activeSectionHref("/orgs/acme/settings/members")).toBe("/orgs/acme/settings/members");
     expect(activeSectionHref("/orgs/acme/settings/members/")).toBe("/orgs/acme/settings/members");
     expect(activeSectionHref("/settings/security")).toBe("/settings/security");
+    expect(activeSectionHref("/settings/server/connect-forge")).toBe("/settings/server/connect-forge");
+    expect(activeSectionHref("/settings/server/nope")).toBeNull();
   });
 
   it("marks the parent section on a page under it", () => {
@@ -136,6 +143,39 @@ describe("which section the sidebar marks", () => {
   });
 });
 
+describe("connect a forge (a new org's first connection)", () => {
+  it("lives at its own URL, apart from Your account", () => {
+    expect(serverHref("connect-forge")).toBe("/settings/server/connect-forge");
+    expect(resolveSection("server", "connect-forge")?.label).toBe("Connect a forge");
+    expect(resolveSection("account", "connect-forge")).toBeUndefined();
+    expect(resolveSection("org", "connect-forge")).toBeUndefined();
+  });
+
+  it("is shown to a global admin with no org yet", () => {
+    const groups = navGroups(freshGlobal, undefined);
+    expect(groups.map((g) => g.kind)).toEqual(["account", "server"]);
+    expect(groups[1]!.items.map((i) => i.href)).toEqual(["/settings/server/connect-forge"]);
+  });
+
+  it("is shown to a global admin next to the org in view", () => {
+    expect(navGroups(globalWithOrg, "acme").map((g) => g.kind)).toEqual(["account", "org", "server"]);
+  });
+
+  it("is not shown to an org admin who is not a global admin", () => {
+    expect(navGroups(admin, "acme").map((g) => g.kind)).toEqual(["account", "org"]);
+    expect(navGroups({ ...admin, global_admin: false }, "acme").map((g) => g.kind)).toEqual([
+      "account",
+      "org",
+    ]);
+  });
+
+  it("is in the palette for a global admin only", () => {
+    const href = serverHref(SERVER_SECTIONS[0]!.id);
+    expect(paletteEntries(freshGlobal).map((e) => e.href)).toContain(href);
+    expect(paletteEntries(admin).map((e) => e.href)).not.toContain(href);
+  });
+});
+
 describe("where /settings lands", () => {
   it("sends an admin to their first org's first section", () => {
     expect(settingsHome(admin)).toBe("/orgs/acme/settings/connections");
@@ -144,6 +184,13 @@ describe("where /settings lands", () => {
     expect(settingsHome(member)).toBe("/settings/profile");
     // A global admin before any org exists has no org page to go to.
     expect(settingsHome({ can_administer: true, admin_orgs: [] })).toBe("/settings/profile");
+  });
+  it("sends a global admin with no org to Connect a forge", () => {
+    expect(settingsHome(freshGlobal)).toBe("/settings/server/connect-forge");
+    expect(legacyRedirect("/settings", "", freshGlobal)).toBe("/settings/server/connect-forge");
+  });
+  it("still sends a global admin with an org to that org", () => {
+    expect(settingsHome(globalWithOrg)).toBe("/orgs/acme/settings/connections");
   });
 });
 

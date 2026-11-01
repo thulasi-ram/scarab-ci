@@ -1,16 +1,20 @@
 // The settings route table (git-bug 734ffa1): which sections exist, where
 // each one lives, who sees which group, and where the old URLs go.
 //
-// Two groups. **Your account** is everyone's and lives under `/settings/…`.
+// Three groups. **Your account** is everyone's and lives under `/settings/…`.
 // **Organization settings** belongs to one org and lives under
 // `/orgs/<org>/settings/…`, so an admin of two orgs can reach both and a link
-// names the org it is about. The server enforces `Administer` on every
-// request; the gating here only decides what to show.
+// names the org it is about. **Server administration** is for global admins
+// only and lives under `/settings/server/…`: today it holds Connect a forge,
+// the way a new org comes into being (its first connection), which no org's
+// own settings can offer because the org does not exist yet (git-bug
+// 19b0a45). The server enforces `Administer` on every request; the gating
+// here only decides what to show.
 //
-// Pure functions over `{ can_administer, admin_orgs }`, so the no-DOM vitest
-// tier covers the table, the gating and the redirects.
+// Pure functions over `{ can_administer, admin_orgs, global_admin }`, so the
+// no-DOM vitest tier covers the table, the gating and the redirects.
 
-export type SettingsGroupKind = "account" | "org";
+export type SettingsGroupKind = "account" | "org" | "server";
 
 export interface SettingsSection {
   id: string;
@@ -23,6 +27,8 @@ export interface SettingsSection {
 export interface SettingsCaller {
   can_administer: boolean;
   admin_orgs: string[];
+  /** Holds a global `Administer` role: may create a new org's first connection. */
+  global_admin?: boolean;
 }
 
 export const ACCOUNT_SECTIONS: readonly SettingsSection[] = [
@@ -45,7 +51,18 @@ export const ORG_SECTIONS: readonly SettingsSection[] = [
   { id: "events", label: "Event log", sub: "every security event, filterable" },
 ];
 
+// Global admins only.
+export const SERVER_SECTIONS: readonly SettingsSection[] = [
+  {
+    id: "connect-forge",
+    label: "Connect a forge",
+    sub: "a new organization's first forge connection",
+  },
+];
+
 export const accountHref = (section: string) => `/settings/${section}`;
+
+export const serverHref = (section: string) => `/settings/server/${section}`;
 
 export const orgHref = (org: string, section: string) =>
   `/orgs/${encodeURIComponent(org)}/settings/${section}`;
@@ -64,7 +81,8 @@ export function resolveSection(
   kind: SettingsGroupKind,
   id: string | undefined,
 ): SettingsSection | undefined {
-  return (kind === "account" ? ACCOUNT_SECTIONS : ORG_SECTIONS).find((s) => s.id === id);
+  const table = kind === "account" ? ACCOUNT_SECTIONS : kind === "org" ? ORG_SECTIONS : SERVER_SECTIONS;
+  return table.find((s) => s.id === id);
 }
 
 /**
@@ -79,6 +97,9 @@ export function resolveSection(
  */
 export function activeSectionHref(pathname: string): string | null {
   const parts = pathname.split("/").filter((p) => p !== "");
+  if (parts[0] === "settings" && parts[1] === "server" && parts[2] !== undefined) {
+    return resolveSection("server", parts[2]) ? serverHref(parts[2]) : null;
+  }
   if (parts[0] === "settings" && parts[1] !== undefined) {
     return resolveSection("account", parts[1]) ? accountHref(parts[1]) : null;
   }
@@ -130,13 +151,26 @@ export function navGroups(who: SettingsCaller, org: string | undefined): NavGrou
       items: ORG_SECTIONS.map((s) => ({ id: s.id, label: s.label, href: orgHref(shown!, s.id) })),
     });
   }
+  if (who.global_admin) {
+    groups.push({
+      kind: "server",
+      heading: "Server administration",
+      items: SERVER_SECTIONS.map((s) => ({ id: s.id, label: s.label, href: serverHref(s.id) })),
+    });
+  }
   return groups;
 }
 
-/** Where `/settings` lands: the first org's first section, else your profile. */
+/**
+ * Where `/settings` lands: the first org's first section; for a global admin
+ * with no org yet, Connect a forge (the only way an org comes to exist); else
+ * your profile.
+ */
 export function settingsHome(who: SettingsCaller): string {
   const org = who.can_administer ? who.admin_orgs[0] : undefined;
-  return org ? orgHref(org, ORG_SECTIONS[0]!.id) : accountHref(ACCOUNT_SECTIONS[0]!.id);
+  if (org) return orgHref(org, ORG_SECTIONS[0]!.id);
+  if (who.global_admin) return serverHref(SERVER_SECTIONS[0]!.id);
+  return accountHref(ACCOUNT_SECTIONS[0]!.id);
 }
 
 /**
@@ -178,6 +212,11 @@ export function paletteEntries(who: SettingsCaller): PaletteEntry[] {
   for (const org of who.admin_orgs.filter((o) => administers(who, o))) {
     for (const s of ORG_SECTIONS) {
       out.push({ label: `${s.label} · ${org}`, sub: s.sub, href: orgHref(org, s.id) });
+    }
+  }
+  if (who.global_admin) {
+    for (const s of SERVER_SECTIONS) {
+      out.push({ label: `${s.label} · server`, sub: s.sub, href: serverHref(s.id) });
     }
   }
   return out;
