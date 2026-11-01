@@ -5,7 +5,9 @@
 #
 #   forward SVC PORT   kubectl port-forward of svc/SVC:PORT in namespace $ns to
 #                      a free loopback port, through kc (the stack's own
-#                      kubeconfig); sets fwd_port. stop_forwards ends them all.
+#                      kubeconfig); sets fwd_port. stop_forwards ends them all,
+#                      and the probe listener below; the recipes call it from
+#                      their EXIT trap.
 #   probe_pod_host     the host name or address a Pod reaches the host at, for
 #                      a test that is itself a server (a fake forge, a results
 #                      listener); sets pod_host.
@@ -56,6 +58,9 @@ class H(http.server.BaseHTTPRequestHandler):
 http.server.HTTPServer(("0.0.0.0", int(sys.argv[1])), H).serve_forever()
 ' "$port" &
   pid=$!
+  # Killed by stop_forwards too, so a probe that dies (no candidate answers,
+  # `kc run` fails under set -e) does not leave it serving on 0.0.0.0.
+  fwd_pids="$fwd_pids $pid"
   cands="host.docker.internal"
   for gw in $(docker network inspect kind -f '{{range .IPAM.Config}}{{.Gateway}} {{end}}' 2>/dev/null || true); do
     case "$gw" in *:*|'') ;; *) cands="$cands $gw" ;; esac
