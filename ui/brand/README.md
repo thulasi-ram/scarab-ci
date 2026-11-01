@@ -46,10 +46,27 @@ The ring replaces an earlier field of tiny dots. The beetle is scaled to about
 63% of its size in that version so its horns and hind feet sit inside the ring
 with a gap of about 2.4 units.
 
+Regenerating:
+
+```
+just brand         # write the four SVGs from halftone/generate.py
+just brand-check   # fail if the SVGs on disk differ from the generator
+just brand-png     # re-render the 37 PNGs in a browser, then rebuild favicon.ico
+```
+
+`halftone/generate.py` uses only the standard library. It holds the measured
+body tables, the light model, the leg, horn and rim chains and the ring.
+`halftone/serve_png.py` and `halftone/raster.html` draw each SVG at every size in
+a browser and save the PNGs; the server only writes `.png` files under the four
+icon folders. Re-rendering gave byte-identical files when we checked, on one
+machine and browser. The SVGs are the source: edit the generator, run
+`just brand`, then `just brand-png`.
+
 Status and limits:
 
-- It sits beside the emblem. The docs logo and the web UI still use the
-  emblem; nothing is rewired to this mark yet.
+- The web UI (header, login, favicon) and the docs site (logo, home-page hero,
+  favicon) use this mark. The emblem files below are unchanged, and the repo's
+  root `README.md` still shows the emblem.
 - At 16 to 32 px the beetle blurs into a shaded shape that keeps its horns and
   legs, and the ring shows as a faint dotted hexagon. Contrast there is low,
   measured as the mean contrast of the mark against its background over the
@@ -64,8 +81,6 @@ Status and limits:
   are in the files.
 - The figure is mirror-symmetric: every dot has a partner (checked on the SVG).
   The SVG has 629 circles and 72 hexagons.
-- The generator is a set of Python scripts that is not in this repo yet, so
-  the SVG is the source for now.
 
 ## Primary emblem
 

@@ -40,6 +40,21 @@ docs-build:
     npm --prefix ui/scarab-docs-ui ci
     npm --prefix ui/scarab-docs-ui run build
 
+# Regenerate the halftone mark's SVGs in ui/brand (python3, standard library only).
+brand:
+    python3 ui/brand/halftone/generate.py
+
+# Fail if the halftone SVGs on disk differ from what the generator produces.
+brand-check:
+    python3 ui/brand/halftone/generate.py --check
+
+# Opens a browser tab, which draws each SVG at every size; serve_png.py saves the
+# 37 PNGs under ui/brand and exits when the page reports it is done.
+# Re-render the halftone PNG icons in a browser, then rebuild favicon.ico.
+brand-png:
+    python3 ui/brand/halftone/serve_png.py
+    python3 ui/brand/halftone/generate.py --ico
+
 # The kind dev stack (ADR-0077 Amendment, deploy/kind/README.md): one kind
 # cluster `scarab-dev`, Postgres + MinIO in it, and the real chart with the
 # server and the Depot running a binary built on the host (cargo-zigbuild on
