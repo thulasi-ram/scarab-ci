@@ -46,9 +46,9 @@ Requires docker, kind, kubectl, Helm 4, cargo, python3 and curl, plus zig and
 A directory is mounted, not the file. Cargo writes a new file on each build,
 and a file mount keeps showing the old one.
 
-The release's Pod template carries the binary's SHA-256 as an annotation, so a
-`just up` or `just reload` after a change rolls both Pods, and one with no
-change rolls nothing.
+The release's Pod template carries a SHA-256 of the binary and the staged UI's
+`index.html` as an annotation, so a `just up` or `just reload` after a change
+rolls both Pods, and one with no change rolls nothing.
 
 Measured on 2026-11-01 (M-series Mac, colima 2 vCPU / 4 GiB): `just up` from no
 cluster took 2m07s with a warm `target/`; a rerun with no change 16 s; `just

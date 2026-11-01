@@ -352,9 +352,10 @@ python3 -I "$root/scripts/libs_manifest.py" --libs "$libs_dir" \
   --repository github.com/thulasi-ram/scarab-ci \
   --commit "$(git -C "$root" rev-parse HEAD)" --release v0.0.0-kind > "$libs_dir/manifest.json"
 
-# Roll the Pods when the binary changes, and only then: helm sees a new Pod
-# template annotation.
-binary_sum="$(shasum -a 256 "$mount/bin/scarab-server" | cut -c1-16)"
+# Roll the Pods when the binary or the staged UI changes, and only then: helm
+# sees a new Pod template annotation. The server checks for ui/index.html at
+# start, so a UI staged after the Pod started needs a roll too.
+binary_sum="$({ cat "$mount/bin/scarab-server"; cat "$mount/ui/index.html" 2>/dev/null || true; } | shasum -a 256 | cut -c1-16)"
 {
   echo "podAnnotations:"
   echo "  scarab.dev/binary-sha256: \"$binary_sum\""
