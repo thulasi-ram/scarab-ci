@@ -11,10 +11,16 @@
 #                 launch claim while its drain is in flight
 #   stop-leader   rank 4: SIGSTOP the scheduler leader until a peer takes the
 #                 lease over (past the 30 s TTL), then SIGCONT it
+#   pause-node    git-bug 070d042: `docker pause` the whole kind node while a
+#                 producer's drain is owed, past the sidecar reporting ceiling
+#                 (the Pod's grace + 300 s + 30 s: 930 s for a workspace Pod),
+#                 then `docker unpause` it; no Attempt may end "workspace
+#                 snapshot lost". About 20 minutes, so not in `all`.
 # Groups: rank1 (mid-drain mid-feed), rank2 (two-replicas kill-server),
-# rank4 (stop-leader), all (every scenario, in that order). The server signals
-# go from the kind node's PID namespace (`docker exec <node> kill`), because
-# the server is PID 1 in its container; see crates/scarab-chaos/src/node.rs.
+# rank4 (stop-leader), all (the five ranked scenarios, in that order;
+# pause-node only by name). The server signals go from the kind node's PID
+# namespace (`docker exec <node> kill`), because the server is PID 1 in its
+# container; see crates/scarab-chaos/src/node.rs.
 #
 #   1. up.sh chaos: refused while step Pods of the current mode run; deletes
 #      the Depot's PVCs (a warm cache of another bucket would hide faults);
@@ -34,7 +40,9 @@
 #      (no webhook) through a connection in the chaos database and dispatched
 #      through the API. Its hits, misses and restores from a home replica are
 #      printed with the verdict; a miss never fails it.
-#   3. sends SIGCONT to every server container on the node (an interrupted
+#   3. unpauses the kind node if it is paused (an interrupted pause-node run
+#      must not leave it paused; the harness unpauses on its own paths too),
+#      sends SIGCONT to every server container on the node (an interrupted
 #      stop-leader run must not leave a server stopped), cancels the chaos
 #      database's non-terminal Runs through the API (a scenario refuses to
 #      start while one is left), then switches the release back to the mode
@@ -62,7 +70,7 @@ cd "$root"
 . "$here/test-env.sh"
 
 case "$what" in
-  mid-drain|mid-feed|two-replicas|kill-server|stop-leader) kinds=("$what") ;;
+  mid-drain|mid-feed|two-replicas|kill-server|stop-leader|pause-node) kinds=("$what") ;;
   rank1) kinds=(mid-drain mid-feed) ;;
   rank2) kinds=(two-replicas kill-server) ;;
   rank4) kinds=(stop-leader) ;;
@@ -71,7 +79,7 @@ case "$what" in
     [ -f "$arg" ] || die "just test chaos replay <scenario.json>: '$arg' does not exist"
     replay_file="$(cd "$(dirname "$arg")" && pwd)/$(basename "$arg")"
     ;;
-  *) die "unknown scenario '$what' (expected mid-drain, mid-feed, two-replicas, kill-server, stop-leader, rank1, rank2, rank4, all or replay <file>)" ;;
+  *) die "unknown scenario '$what' (expected mid-drain, mid-feed, two-replicas, kill-server, stop-leader, pause-node, rank1, rank2, rank4, all or replay <file>)" ;;
 esac
 if [ "$what" != replay ]; then
   case "$arg" in ''|*[!0-9]*) die "seed must be a non-negative integer, got '$arg'" ;; esac
@@ -105,8 +113,51 @@ resume_servers() {
       if [ -n "$pid" ] && [ "$pid" != 0 ]; then kill -CONT "$pid" || true; fi
     done' || echo "warning: could not send SIGCONT to the server containers on $node" >&2
 }
+# `docker unpause` the kind node when it is paused. pause-node unpauses it on
+# every path it controls (a Drop guard, SIGINT and SIGTERM); this covers a
+# harness that was SIGKILLed, and runs first on exit, before anything that
+# needs the node.
+unpause_node() {
+  if [ "$(docker inspect --format '{{.State.Paused}}' "$node" 2>/dev/null || true)" = true ]; then
+    echo "==> the kind node $node is paused; unpausing it"
+    docker unpause "$node" >/dev/null || echo "error: could not unpause $node; run: docker unpause $node" >&2
+  fi
+}
+# Like test-env.sh's `forward`, but kept open: a loop starts the port-forward
+# again on the same local port whenever it exits, and writes its current PID
+# to a file. A paused node breaks a port-forward; pause-node kills each one
+# after the unpause (SCARAB_CHAOS_FORWARD_PIDFILES) and the loop re-opens it.
+# stop_forwards ends the loop, which ends its port-forward.
+forward_pidfiles=""
+forward_kept() { # $1 Service name, $2 its port
+  local log pidfile
+  fwd_port="$(free_port)"
+  log="$kind_dir/.state/forward-$1.log"
+  pidfile="$kind_dir/.state/forward-$1.pid"
+  : >"$log"
+  (
+    child=""
+    trap '[ -z "$child" ] || kill "$child" 2>/dev/null; exit 0' TERM INT
+    while true; do
+      kc port-forward -n "$ns" "svc/$1" "$fwd_port:$2" --address 127.0.0.1 >>"$log" 2>&1 &
+      child=$!
+      echo "$child" >"$pidfile"
+      wait "$child" || true
+      sleep 1
+    done
+  ) &
+  fwd_pids="$fwd_pids $!"
+  forward_pidfiles="${forward_pidfiles:+$forward_pidfiles:}$pidfile"
+  for _ in $(seq 1 30); do
+    (exec 3<>"/dev/tcp/127.0.0.1/$fwd_port") 2>/dev/null && return 0
+    sleep 0.5
+  done
+  cat "$log" >&2
+  die "the port-forward to svc/$1:$2 did not open 127.0.0.1:$fwd_port"
+}
 cleanup() {
   local code=$? mode_now
+  unpause_node
   [ -z "$stats_pid" ] || kill "$stats_pid" 2>/dev/null || true
   [ "$rc" -ne 0 ] || rc=$code
   mode_now="$(cat "$here/.state/mode" 2>/dev/null || true)"
@@ -151,6 +202,8 @@ cleanup() {
   exit "$rc"
 }
 trap cleanup EXIT
+# A node an earlier, killed run left paused would hang everything below.
+unpause_node
 
 cargo build -p scarab-chaos
 bin="$(cargo_target_dir)/debug/scarab-chaos"
@@ -161,8 +214,8 @@ scarab_addr
 
 # The checker reads Postgres and MinIO directly, not through toxiproxy: it is
 # not under test.
-forward scarab-postgres 5432; pg_port="$fwd_port"
-forward scarab-minio 9000; s3_port="$fwd_port"
+forward_kept scarab-postgres 5432; pg_port="$fwd_port"
+forward_kept scarab-minio 9000; s3_port="$fwd_port"
 export SCARAB_CHAOS_API="$base"
 export SCARAB_CHAOS_KUBECONFIG="$kubeconfig"
 export SCARAB_CHAOS_NAMESPACE="$ns"
@@ -177,7 +230,7 @@ export SCARAB_CHAOS_NODE="$node"
 # token minted for this run). Without it the probe is skipped with a note.
 forgejo_env="$here/.state/forgejo.env"
 if [ -f "$forgejo_env" ]; then
-  forward scarab-forgejo 3000
+  forward_kept scarab-forgejo 3000
   export SCARAB_CHAOS_FORGEJO_URL="http://127.0.0.1:$fwd_port"
   SCARAB_CHAOS_FORGEJO_SERVER_URL="$(env_get "$forgejo_env" SCARAB_TEST_FORGEJO_SERVER_URL)"
   SCARAB_CHAOS_FORGEJO_TOKEN="$(env_get "$forgejo_env" SCARAB_TEST_FORGEJO_TOKEN)"
@@ -186,6 +239,7 @@ if [ -f "$forgejo_env" ]; then
 else
   echo "warning: $forgejo_env is missing; the Cache probe is skipped" >&2
 fi
+export SCARAB_CHAOS_FORWARD_PIDFILES="$forward_pidfiles"
 checker_env=1
 
 server_replicas="$(kc get deploy "$release" -n "$ns" -o jsonpath='{.spec.replicas}')"

@@ -23,6 +23,8 @@
 //! | L1   | rank 4: a takeover of the scheduler lease increments `leases.term`, and the term never goes back (only where the column exists) |
 //! | L2   | rank 4: a peer takes the stopped leader's lease over within the TTL + 30 s, wherever the stop landed (inside a fenced write too: the fence's stall bound releases the lease row) |
 //! | W1   | the workload's own outcome: every scenario Run that ended, ended `succeeded`, and every green Attempt has an output snapshot |
+//! | N1   | `pause-node` (git-bug 070d042): no Attempt of a scenario Run finished with a lost-node verdict ("workspace snapshot lost", "egress sidecar died"); the node was paused, not lost. Any other failed Attempt is a warning |
+//! | D1   | `two-replicas` (git-bug 068cc0b): no release log line about a scenario Pod says "drain helper exited 12 with no record posted". With no fault, that line means a second replica drove the same drain |
 //!
 //! W1 is not one of ADR-0077 §2's invariants. As written there, I3 accepts a
 //! dead-lettered Run and I4 passes a green Attempt whose snapshot is NULL, so
@@ -237,6 +239,71 @@ pub struct Facts {
     /// Distinct `outbox.claimed_by` of the scenario's launch intents: the
     /// replicas that drove a step to its end (`two-replicas`).
     pub launch_claimers: BTreeSet<String>,
+    /// `release-log.txt` (`nemesis::RELEASE_LOG`): the server and Depot log
+    /// lines that name a scenario Pod, each prefixed with its Pod. `None`
+    /// when the file was not written. D1 reads it.
+    pub release_log: Option<String>,
+}
+
+/// The causes the executor gives when it judges a node lost while the step's
+/// egress still shows `running` (`settled_state` in
+/// `crates/scarab-executor-k8s/src/lib.rs`). N1 fails on either.
+pub const LOST_NODE_CAUSES: &[&str] = &["workspace snapshot lost", "egress sidecar died"];
+
+/// The executor's cause when a drain helper's record POST failed
+/// (`drain_decision`); with two replicas and no fault it is the second driver
+/// of git-bug 068cc0b.
+pub const SECOND_DRIVER_LINE: &str = "drain helper exited 12 with no record posted";
+
+/// N1 over the journal: (Attempts finished, findings). Fails on a lost-node
+/// cause, warns on any other failed Attempt.
+pub fn lost_node_verdicts(events: &[EventRow]) -> (usize, Vec<Finding>) {
+    let mut n = 0;
+    let mut out = Vec::new();
+    for e in events.iter().filter(|e| event_kind(&e.payload) == "AttemptFinished") {
+        n += 1;
+        let body = e.payload.as_object().and_then(|m| m.values().next());
+        let failure = body.and_then(|b| b.get("failure")).filter(|f| !f.is_null());
+        let cause = event_field(&e.payload, "cause");
+        let step = event_field(&e.payload, "step").unwrap_or("?");
+        let att = event_field(&e.payload, "attempt").unwrap_or("?");
+        if let Some(c) = cause.filter(|c| LOST_NODE_CAUSES.iter().any(|l| c.contains(l))) {
+            out.push(fail(
+                "N1",
+                format!(
+                    "run {} step {step} attempt {att} finished with a lost-node verdict across the node pause: {c}",
+                    e.run
+                ),
+            ));
+        } else if failure.is_some() || cause.is_some() {
+            out.push(warn(
+                "N1",
+                format!(
+                    "run {} step {step} attempt {att} failed across the node pause ({}): {}",
+                    e.run,
+                    failure.map(|f| f.to_string()).unwrap_or_default(),
+                    cause.unwrap_or("no cause")
+                ),
+            ));
+        }
+    }
+    (n, out)
+}
+
+/// D1 over `release-log.txt`. A line fails when it carries
+/// [`SECOND_DRIVER_LINE`] and names one of `pods` (the scenario's step Pods;
+/// the log's time range can reach lines of an earlier scenario's Pods).
+pub fn second_drain_drivers(log: &str, pods: &BTreeSet<String>) -> Vec<Finding> {
+    let mut out = Vec::new();
+    for line in log.lines() {
+        if line.contains(SECOND_DRIVER_LINE) && pods.iter().any(|p| line.contains(p.as_str())) {
+            out.push(fail(
+                "D1",
+                format!("a second replica drove a drain with no fault (git-bug 068cc0b): {line}"),
+            ));
+        }
+    }
+    out
 }
 
 // --- evaluate (pure) -------------------------------------------------------------
@@ -404,6 +471,21 @@ pub fn exercised(kind: Kind, faults: &[Fault]) -> Vec<String> {
                     Some(_) => {}
                 }
             }
+            Kind::PauseNode => match &x.pause {
+                None => why.push(format!("{} {}: no pause was recorded", x.action, x.pod)),
+                Some(p) => {
+                    if !p.paused {
+                        why.push(format!("{} {}: docker did not report the node paused", x.action, x.pod));
+                    }
+                    let held_ms = x.resumed_at_ms.map(|r| r - x.fired_at_ms).unwrap_or(0);
+                    if held_ms < (p.ceiling_secs as i64) * 1000 {
+                        why.push(format!(
+                            "{} {}: paused {held_ms} ms, not past the {} s sidecar reporting ceiling",
+                            x.action, x.pod, p.ceiling_secs
+                        ));
+                    }
+                }
+            },
             _ => {}
         }
     }
@@ -896,10 +978,45 @@ pub fn evaluate(f: &Facts) -> Verdict {
         checked.insert("L2".into(), l2);
     }
 
+    // N1: no lost-node verdict across a node pause (git-bug 070d042).
+    if f.kind == Some(Kind::PauseNode) {
+        let (n, found) = lost_node_verdicts(&f.events);
+        findings.extend(found);
+        checked.insert("N1".into(), n);
+    }
+
+    // D1: one driver per drain at two replicas with no fault (git-bug
+    // 068cc0b).
+    let mut d1_unread = None;
+    if f.kind == Some(Kind::TwoReplicas) {
+        let pods: BTreeSet<String> = f.pod_records.iter().filter(|r| r.pod.run.is_some()).map(|r| r.pod.name.clone()).collect();
+        match &f.release_log {
+            Some(log) => {
+                findings.extend(second_drain_drivers(log, &pods));
+                // What D1 looked at: the log lines of each scenario Pod.
+                checked.insert("D1".into(), pods.len());
+            }
+            None => {
+                checked.insert("D1".into(), 0);
+                d1_unread = Some("D1: release-log.txt was not written, so no release log line was read".to_string());
+            }
+        }
+    }
+
     let inconclusive = match f.kind {
         Some(kind) => {
             let mut why = exercised(kind, &f.faults);
             why.extend(minimums(f.expected_runs, &checked));
+            if kind == Kind::PauseNode {
+                let attempts = f.expected_runs * crate::scenario::Workload::STEPS;
+                let n = checked.get("N1").copied().unwrap_or(0);
+                if n < attempts {
+                    why.push(format!(
+                        "N1 looked at {n} finished Attempts, below its minimum of {attempts} (every Attempt of every Run)"
+                    ));
+                }
+            }
+            why.extend(d1_unread);
             if kind == Kind::TwoReplicas && f.launch_claimers.len() < 2 {
                 why.push(format!(
                     "{} replica(s) drove the scenario's steps ({:?}); two replicas did not share the work",
@@ -1623,6 +1740,106 @@ mod tests {
             object: Err("not found".into()),
         });
         assert_eq!(failed(&evaluate(&f)), vec!["I10"]);
+    }
+
+    /// git-bug 070d042's verdict (the executor's cause from `settled_state`)
+    /// fails N1; a clean finish passes it; any other failure is a warning.
+    #[test]
+    fn a_lost_node_verdict_fails_n1() {
+        let mut f = base();
+        f.kind = Some(Kind::PauseNode);
+        f.expected_runs = 1;
+        let v = evaluate(&f);
+        assert!(!v.findings.iter().any(|x| x.invariant == "N1"), "{:?}", v.findings);
+        assert_eq!(v.checked.get("N1"), Some(&1));
+        // One Attempt, below the workload's two per Run.
+        assert!(v.inconclusive.iter().any(|w| w.starts_with("N1 looked at 1")), "{:?}", v.inconclusive);
+
+        let lost = "workspace snapshot lost: the step exited 0 but its egress sidecar died before the drain \
+                    recorded a root — the emptyDir is gone and the snapshot can never be produced (ADR-0061 part 4)";
+        f.events.push(ev(
+            "r",
+            5,
+            serde_json::json!({"AttemptFinished": {"step": "s", "attempt": "a0",
+                "failure": {"Infra": {"never_started": false}}, "cause": lost}}),
+        ));
+        let v = evaluate(&f);
+        assert!(failed(&v).contains(&"N1"), "{:?}", v.findings);
+        assert!(v.findings.iter().any(|x| x.invariant == "N1" && x.detail.contains("attempt a0")));
+
+        let mut f = base();
+        f.kind = Some(Kind::PauseNode);
+        f.events.push(ev(
+            "r",
+            5,
+            serde_json::json!({"AttemptFinished": {"step": "s", "attempt": "a0",
+                "failure": "Timeout", "cause": "step budget exhausted"}}),
+        ));
+        let v = evaluate(&f);
+        assert!(!failed(&v).contains(&"N1"));
+        assert!(v.findings.iter().any(|x| x.invariant == "N1" && x.severity == Severity::Warn));
+        // N1 is pause-node's own: another scenario does not run it.
+        f.kind = Some(Kind::MidDrain);
+        assert!(!evaluate(&f).checked.contains_key("N1"));
+    }
+
+    /// A pause that docker did not report, or that ended before the sidecar
+    /// reporting ceiling, did not test git-bug 070d042.
+    #[test]
+    fn a_short_or_missing_pause_is_inconclusive() {
+        let fault = |paused: bool, held_s: i64| Fault {
+            action: "pause-node".into(),
+            pod: "node".into(),
+            condition_held_at_fire: true,
+            fired_at_ms: 0,
+            resumed_at_ms: Some(held_s * 1000),
+            landing: Some(crate::scenario::classify(Kind::MidDrain, 0, Some(-1), None)),
+            pause: Some(crate::scenario::NodePause {
+                ceiling_secs: 900,
+                planned_secs: 930,
+                paused,
+                unpaused: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(exercised(Kind::PauseNode, &[fault(true, 930)]), Vec::<String>::new());
+        assert!(exercised(Kind::PauseNode, &[fault(false, 930)])[0].contains("did not report the node paused"));
+        assert!(exercised(Kind::PauseNode, &[fault(true, 600)])[0].contains("not past the 900 s"));
+        let mut late = fault(true, 930);
+        late.landing = Some(crate::scenario::classify(Kind::MidDrain, 0, Some(-10), Some(-1)));
+        assert!(exercised(Kind::PauseNode, &[late])[0].contains("landed after-window"));
+    }
+
+    /// A release-log.txt line shaped like the executor's warning (git-bug
+    /// 068cc0b, a 2+2 run with no fault): a second driver fails D1, but only
+    /// for a Pod of this scenario.
+    #[test]
+    fn a_second_drain_driver_fails_d1() {
+        let line = "scarab-7d9c-x2: 2026-11-01T08:12:03.551Z  WARN scarab_executor_k8s: workspace settle is \
+                    transient; re-driving next poll pod=p-u1 cause=drain helper exited 12 with no record posted";
+        let mut f = base();
+        f.kind = Some(Kind::TwoReplicas);
+        f.release_log = Some("scarab-7d9c-x1: unrelated line about p-u1\n".into());
+        let v = evaluate(&f);
+        assert!(!v.findings.iter().any(|x| x.invariant == "D1"), "{:?}", v.findings);
+        assert_eq!(v.checked.get("D1"), Some(&1));
+
+        f.release_log = Some(format!("{line}\n"));
+        let v = evaluate(&f);
+        assert_eq!(failed(&v), vec!["D1"], "{:?}", v.findings);
+
+        // Another scenario's Pod is not this one's finding.
+        f.release_log = Some(line.replace("p-u1", "p-other"));
+        assert!(!failed(&evaluate(&f)).contains(&"D1"));
+
+        // No log at all: D1 read nothing, which is not a pass.
+        f.release_log = None;
+        let v = evaluate(&f);
+        assert!(v.inconclusive.iter().any(|w| w.starts_with("D1:")), "{:?}", v.inconclusive);
+        // D1 is two-replicas' own.
+        f.kind = Some(Kind::MidDrain);
+        assert!(!evaluate(&f).checked.contains_key("D1"));
     }
 
     #[test]

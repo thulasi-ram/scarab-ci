@@ -17,13 +17,17 @@
 //! Kinds: mid-drain, mid-feed (rank 1: a Depot Pod deleted with grace 0),
 //! two-replicas (rank 2 with no fault), kill-server (rank 2: SIGKILL of the
 //! producer's claim holder), stop-leader (rank 4: SIGSTOP of the scheduler
-//! leader past the lease TTL, then SIGCONT). See `scenario::Kind`.
+//! leader past the lease TTL, then SIGCONT), pause-node (git-bug 070d042:
+//! `docker pause` of the whole kind node mid-drain past the sidecar
+//! reporting ceiling, then `docker unpause`). See `scenario::Kind`.
 //!
 //! Connections come from the environment `deploy/kind/chaos.sh` sets:
 //! SCARAB_CHAOS_API, SCARAB_CHAOS_KUBECONFIG, SCARAB_CHAOS_NAMESPACE,
 //! SCARAB_CHAOS_DATABASE_URL, SCARAB_CHAOS_S3_ENDPOINT, SCARAB_CHAOS_S3_BUCKET,
 //! SCARAB_CHAOS_S3_ACCESS_KEY, SCARAB_CHAOS_S3_SECRET_KEY, and for the
-//! server signals SCARAB_CHAOS_NODE (the kind node container).
+//! server signals and the pause SCARAB_CHAOS_NODE (the kind node container),
+//! and for pause-node SCARAB_CHAOS_FORWARD_PIDFILES (the PID files of the
+//! port-forwards the recipe keeps open, restarted after the unpause).
 
 use std::path::{Path, PathBuf};
 
@@ -146,7 +150,8 @@ async fn check_dir(conn: &Conn, file: &Path) -> Result<check::Outcome, String> {
         kube: conn.stack.kube.clone(),
         namespace: &conn.stack.namespace,
     };
-    let facts = check::gather(&src, &s, records).await?;
+    let mut facts = check::gather(&src, &s, records).await?;
+    facts.release_log = std::fs::read_to_string(dir.join(nemesis::RELEASE_LOG)).ok();
     let mut v = check::evaluate(&facts);
     let fault_pods: Vec<String> = s.faults.iter().map(|f| f.pod.clone()).collect();
     v.cache = s
@@ -176,6 +181,15 @@ async fn check_dir(conn: &Conn, file: &Path) -> Result<check::Outcome, String> {
             }
             if let Some(role) = &f.victim_role {
                 line += &format!("; victim: {role}, chosen by {}", f.target_basis.as_deref().unwrap_or("?"));
+            }
+            if let Some(p) = &f.pause {
+                line += &format!(
+                    "; node {} paused: {}, planned {} s (sidecar ceiling {} s), unpaused: {}",
+                    p.node, p.paused, p.planned_secs, p.ceiling_secs, p.unpaused
+                );
+                if let Some(e) = &p.error {
+                    line += &format!(" ({e})");
+                }
             }
             if let Some(r) = f.resumed_at_ms {
                 line += &format!("; resumed after {} ms", r - f.fired_at_ms);

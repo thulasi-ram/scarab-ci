@@ -239,7 +239,12 @@ at two server replicas and two Depot replicas:
 - rank 2, `two-replicas` and `kill-server`: no fault, then the server replica
   that holds a launch claim SIGKILLed while its drain is in flight;
 - rank 4, `stop-leader`: the scheduler leader SIGSTOPped past its 30 s lease
-  until a peer takes over, then SIGCONTed.
+  until a peer takes over, then SIGCONTed;
+- `pause-node` (git-bug 070d042, not an ADR-0077 rank): the whole kind node
+  `docker pause`d while a producer's drain is owed, past the sidecar
+  reporting ceiling, then `docker unpause`d. This is a host suspend: the
+  kubelet, the egress mid-drain and both servers freeze together, and the
+  wall clock jumps on the resume.
 
 Server signals are sent from the kind node, because the server is PID 1 in its
 container. The `scarab-chaos` binary (`crates/scarab-chaos`) fires the fault and
@@ -249,6 +254,7 @@ then checks the invariants.
 just test chaos             # every scenario, seed 1
 just test chaos rank2       # one rank
 just test chaos mid-feed 7  # one scenario, another seed
+just test chaos pause-node  # about 20 minutes; not part of `all`
 just test chaos replay deploy/kind/.chaos/<dir>/scenario.json
 ```
 
@@ -294,7 +300,7 @@ it):
 | `scenario.json` | seed, plan, workload, quiesce bound, Run IDs, the fault with its trigger, its time and where it landed (`mid-drain`, `mid-feed`, `before-window`, `after-window`) |
 | `pods.jsonl` | every change to a step Pod or a Depot Pod during the run |
 | `verdict.json` | the checker's findings and, per green Attempt, the objects and bytes it read back |
-| `release-log.txt` | server and Depot log lines that name the target Pod or the deleted replica |
+| `release-log.txt` | server and Depot log lines that name a step Pod of the scenario's Runs, the fault's target or the replica it hit; written for every scenario |
 | `fetcher-log.txt` | mid-feed only: the target fetcher's own log |
 | `cache-log.txt` | the Cache probe's `cache restore` lines, one per cached Step Pod |
 
@@ -330,6 +336,8 @@ does not take the API's or a Step's word for success:
 | I8 | after quiesce, no Pod of a scenario Run is pending or running, and no per-Pod workspace Secret outlives its Pod |
 | I10 | no uncommitted pack row older than 60 s for a fence that has a drain record; every committed pack's object exists at its recorded size |
 | W1 | the workload's outcome (not an ADR-0077 §2 invariant): every scenario Run ends `succeeded`, and every green Attempt has an output snapshot |
+| N1 | `pause-node` only (git-bug 070d042): no Attempt finished with a lost-node cause ("workspace snapshot lost", "egress sidecar died"); any other failed Attempt is a warning |
+| D1 | `two-replicas` only (git-bug 068cc0b): no `release-log.txt` line about a scenario Pod says "drain helper exited 12 with no record posted"; with no fault, that line means a second replica drove the same drain |
 
 W1 is separate from the ADR's I-numbers because I3 and I4 as written there
 accept a dead-lettered Run and a green Attempt with no snapshot. The workload
@@ -351,6 +359,24 @@ workload produces: T1 and I3 one per Run, I1a, I1c and I4 one per Attempt
 (two per Run). An invariant that looked at nothing prints `not exercised`, not
 `ok`. I1b compares a Step's consecutive Attempts, and a Depot fault causes no
 retry, so rank 1 never exercises it; it is printed as such and not counted.
+
+N1 exists because the executor's lost-node verdict is an Infra failure that
+the engine retries: the Run can still end `succeeded` on a second Attempt and
+pass W1. `pause-node` pauses the node for the target Pod's
+`terminationGracePeriodSeconds` + 300 s (`RESULTS_DRAIN_SLACK_SECS` in
+`scarab-executor-k8s`) + 30 s. The producer is a workspace Pod with a grace
+of 600 s, so the pause is 930 s, and a scenario takes about 20 minutes. Its
+trigger and window are `mid-drain`'s, with a delay of 0 to 2 s. It is
+INCONCLUSIVE when the pause landed outside the drain window, when docker did
+not report the node paused, or when the pause ended before the ceiling. The
+harness unpauses the node on every path it controls (a guard on every
+return, and a SIGINT or SIGTERM handler), and `chaos.sh` unpauses a paused
+node when it starts and first thing when it exits. Its port-forwards are
+kept open by a loop that restarts each one when it exits; after the unpause
+the harness ends each (their PIDs are in `deploy/kind/.state/forward-*.pid`),
+the loop re-opens it on the same port, and the harness waits until Postgres
+and the kube API answer before it goes on. Its Pod watch re-lists when a list
+takes over 30 s or the watch is quiet for 270 s.
 
 Before the workload starts, the binary waits for the scenario's topology:
 as many ready server Pods and Depot Pods as the scenario file records. A

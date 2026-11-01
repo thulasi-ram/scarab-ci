@@ -75,6 +75,7 @@ e2e filter="":
 # (or $SCARAB_CHAOS_DIR). Exit 1 means a verdict failed, 3 that a scenario was
 # inconclusive (its fault did not land in its window). See deploy/kind/chaos.sh.
 # Usage: `just test chaos` | `just test chaos mid-feed 7` |
+# `just test chaos pause-node` (about 20 minutes, not in `all`) |
 # `just test chaos replay <scenario.json>`.
 [doc('Fault tier: delete a Depot Pod mid-drain / mid-feed, check the invariants')]
 chaos what="all" seed="1":

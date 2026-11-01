@@ -116,6 +116,128 @@ impl Node {
     }
 }
 
+impl Node {
+    /// `docker <verb> <node>` from the host (`pause`, `unpause`).
+    pub async fn docker(&self, verb: &str) -> Result<(), String> {
+        let out = tokio::process::Command::new("docker")
+            .args([verb, &self.name])
+            .output()
+            .await
+            .map_err(|e| format!("docker {verb} {}: {e}", self.name))?;
+        if !out.status.success() {
+            return Err(format!(
+                "docker {verb} {}: {}: {}",
+                self.name,
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Ok(())
+    }
+
+    /// `docker inspect`'s `State.Paused` of the node container.
+    pub async fn is_paused(&self) -> Result<bool, String> {
+        let out = tokio::process::Command::new("docker")
+            .args(["inspect", "--format", "{{.State.Paused}}", &self.name])
+            .output()
+            .await
+            .map_err(|e| format!("docker inspect {}: {e}", self.name))?;
+        if !out.status.success() {
+            return Err(format!(
+                "docker inspect {}: {}: {}",
+                self.name,
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        parse_paused(&String::from_utf8_lossy(&out.stdout))
+    }
+}
+
+/// `docker inspect --format {{.State.Paused}}`: `true` or `false`.
+pub fn parse_paused(raw: &str) -> Result<bool, String> {
+    match raw.trim() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(format!("docker inspect gave State.Paused {other:?}")),
+    }
+}
+
+/// Unpauses the kind node container when dropped, unless disarmed: an error,
+/// a panic or an early return between the `docker pause` and the planned
+/// `docker unpause` must not leave the node paused. Blocking on purpose:
+/// `Drop` cannot await. A signal that kills the process skips `Drop`;
+/// `pause-node` unpauses on SIGINT and SIGTERM itself, and `chaos.sh`'s exit
+/// trap unpauses a paused node on every path.
+pub struct UnpauseGuard {
+    node: String,
+    armed: bool,
+}
+
+/// The node a live [`UnpauseGuard`] may have paused, for the signal handler
+/// ([`unpause_on_signal`]), which exits without running `Drop`.
+static PAUSED_NODE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn set_paused_node(node: Option<String>) {
+    *PAUSED_NODE.lock().unwrap_or_else(|p| p.into_inner()) = node;
+}
+
+/// `docker unpause <node>`, blocking, logged.
+fn unpause_blocking(node: &str, why: &str) {
+    let res = std::process::Command::new("docker").args(["unpause", node]).output();
+    eprintln!("scarab-chaos: {why}: docker unpause {node}: {res:?}");
+}
+
+impl UnpauseGuard {
+    /// Arm before the `docker pause`, so a pause that half-happened is undone
+    /// too (an unpause of a running container fails and changes nothing).
+    pub fn new(node: &Node) -> Self {
+        set_paused_node(Some(node.name.clone()));
+        Self {
+            node: node.name.clone(),
+            armed: true,
+        }
+    }
+
+    /// The node is unpaused (checked): nothing left to undo.
+    pub fn disarm(&mut self) {
+        self.armed = false;
+        set_paused_node(None);
+    }
+}
+
+impl Drop for UnpauseGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        set_paused_node(None);
+        unpause_blocking(&self.node, "cleanup");
+    }
+}
+
+/// On SIGINT or SIGTERM: unpause the node a live [`UnpauseGuard`] holds, then
+/// exit (130 or 143, as a shell reports those signals). Installed for the
+/// whole `pause-node` run: once tokio handles a signal its default action is
+/// gone for the life of the process, so the handler also has to exit.
+pub fn unpause_on_signal() -> Result<(), String> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut int = signal(SignalKind::interrupt()).map_err(|e| format!("SIGINT handler: {e}"))?;
+    let mut term = signal(SignalKind::terminate()).map_err(|e| format!("SIGTERM handler: {e}"))?;
+    tokio::spawn(async move {
+        let code = tokio::select! {
+            _ = int.recv() => 130,
+            _ = term.recv() => 143,
+        };
+        let node = PAUSED_NODE.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if let Some(node) = node {
+            unpause_blocking(&node, "signal");
+        }
+        std::process::exit(code);
+    });
+    Ok(())
+}
+
 /// A `crictl` PID: digits, not 0.
 pub fn parse_pid(raw: &str) -> Option<i64> {
     let t = raw.trim();
@@ -182,6 +304,13 @@ mod tests {
         // `t` is a ptrace stop, not SIGSTOP.
         assert!(!is_stopped("State:\tt (tracing stop)"));
         assert!(!is_stopped("Name:\tT"));
+    }
+
+    #[test]
+    fn reads_the_paused_state() {
+        assert_eq!(parse_paused("true\n"), Ok(true));
+        assert_eq!(parse_paused("false"), Ok(false));
+        assert!(parse_paused("").is_err());
     }
 
     #[test]

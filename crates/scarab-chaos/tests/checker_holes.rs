@@ -446,6 +446,8 @@ fn two_replicas_needs_both_replicas_to_have_claimed_launches() {
     let mut f = clean();
     f.kind = Some(Kind::TwoReplicas);
     f.faults.clear();
+    // D1 reads release-log.txt, which every scenario writes.
+    f.release_log = Some(String::new());
     f.launch_claimers = ["scarab-server-a".to_string()].into();
     let v = evaluate(&f);
     assert_eq!(v.outcome, Outcome::Inconclusive);

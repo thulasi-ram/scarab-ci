@@ -3,7 +3,9 @@
 //! for every Run to end or the quiesce bound to run out. Everything it did
 //! goes into the scenario file. The faults: rank 1 deletes the planned Depot
 //! replica with grace 0; ranks 2 and 4 signal a server replica from the
-//! kind node (`crate::servers`); `two-replicas` fires nothing.
+//! kind node (`crate::servers`); `pause-node` pauses the whole kind node
+//! container past the sidecar reporting ceiling (git-bug 070d042);
+//! `two-replicas` fires nothing.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -14,7 +16,7 @@ use kube::api::{Api as KubeApi, DeleteParams, ListParams, LogParams};
 use crate::env::{Api, TERMINAL_RUN_STATUSES};
 use crate::node::Node;
 use crate::pods::{self, PodView, Views};
-use crate::scenario::{classify, Fault, Kind, Scenario, Trigger};
+use crate::scenario::{classify, Fault, Kind, NodePause, Scenario, Trigger};
 use crate::time::now_ms;
 
 pub struct Stack {
@@ -38,6 +40,11 @@ pub async fn run(stack: &Stack, mut scenario: Scenario, dir: &Path) -> Result<Sc
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let file = dir.join("scenario.json");
     let pods_api: KubeApi<Pod> = KubeApi::namespaced(stack.kube.clone(), &stack.namespace);
+
+    if scenario.kind == Kind::PauseNode {
+        // Before anything can pause the node: Ctrl-C or SIGTERM unpauses it.
+        crate::node::unpause_on_signal()?;
+    }
 
     let views: Views = Default::default();
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
@@ -117,7 +124,7 @@ pub async fn run(stack: &Stack, mut scenario: Scenario, dir: &Path) -> Result<Sc
     let kind = scenario.kind;
     if kind.has_fault() {
         let holds = move |p: &PodView| match kind {
-            Kind::MidDrain | Kind::KillServer => pods::drain_in_flight(p),
+            Kind::MidDrain | Kind::KillServer | Kind::PauseNode => pods::drain_in_flight(p),
             Kind::MidFeed => pods::feed_in_flight(p),
             Kind::StopLeader => pods::step_running(p),
             Kind::TwoReplicas => false,
@@ -140,6 +147,7 @@ pub async fn run(stack: &Stack, mut scenario: Scenario, dir: &Path) -> Result<Sc
                     Kind::StopLeader => {
                         crate::servers::stop_leader(stack, &Node::from_env(), &views, &t, &scenario.plan, &holds).await?
                     }
+                    Kind::PauseNode => pause_node(stack, &pods_api, &views, t, &Node::from_env(), &holds).await?,
                     Kind::TwoReplicas => unreachable!("two-replicas has no fault"),
                 };
                 scenario.faults.push(fault);
@@ -176,23 +184,29 @@ pub async fn run(stack: &Stack, mut scenario: Scenario, dir: &Path) -> Result<Sc
         .map_err(|e| format!("watcher task: {e}"))?
         .map_err(|e| format!("watcher: {e}"))?;
 
-    // The release's own log lines about the target Pod: what the drain or
-    // feed did around the fault, for whoever reads the scenario later.
+    // The release's own log lines about the scenario's step Pods and the
+    // fault's target: what the drains, feeds and the fault did, for whoever
+    // reads the scenario later, and for the checks that read it (D1). Every
+    // scenario writes it, `two-replicas` included.
+    let records = pods::read_records(&dir.join("pods.jsonl"))?;
+    let since = ((now_ms() - scenario.started_at_ms) / 1000 + 60).max(60);
+    let mut needles: Vec<String> = records
+        .iter()
+        .filter(|r| r.pod.run.as_ref().is_some_and(|x| scenario.runs.contains(x)))
+        .map(|r| r.pod.name.clone())
+        .collect();
+    for f in &scenario.faults {
+        needles.extend(f.trigger.as_ref().map(|t| t.pod.clone()));
+        needles.push(f.pod.clone());
+        needles.extend(f.claim.as_ref().and_then(|c| c.owner.clone()));
+        needles.extend(f.lease.as_ref().map(|l| l.owner_before.clone()));
+    }
+    needles.sort();
+    needles.dedup();
+    let needles: Vec<&str> = needles.iter().map(String::as_str).filter(|n| !n.is_empty()).collect();
+    let text = release_log_lines(&pods_api, since, &needles).await;
+    let _ = std::fs::write(dir.join(RELEASE_LOG), text);
     if let Some(t) = scenario.faults.iter().find_map(|f| f.trigger.as_ref()) {
-        let since = ((now_ms() - scenario.started_at_ms) / 1000 + 60).max(60);
-        let mut needles = vec![t.pod.as_str(), scenario.faults[0].pod.as_str()];
-        let owners: Vec<String> = scenario
-            .faults
-            .iter()
-            .flat_map(|f| {
-                let claim = f.claim.as_ref().and_then(|c| c.owner.clone());
-                let lease = f.lease.as_ref().map(|l| l.owner_before.clone());
-                claim.into_iter().chain(lease)
-            })
-            .collect();
-        needles.extend(owners.iter().map(String::as_str));
-        let text = release_log_lines(&pods_api, since, &needles).await;
-        let _ = std::fs::write(dir.join("release-log.txt"), text);
         if kind == Kind::MidFeed {
             // The fetcher's own account of the fault (retries, resets).
             let lp = LogParams {
@@ -227,7 +241,6 @@ pub async fn run(stack: &Stack, mut scenario: Scenario, dir: &Path) -> Result<Sc
     }
 
     // --- where it landed --------------------------------------------------------
-    let records = pods::read_records(&dir.join("pods.jsonl"))?;
     for fault in &mut scenario.faults {
         if let (Some(t), Some(w)) = (&fault.trigger, kind.window()) {
             let (start, end) = window(w, &records, &t.pod_uid);
@@ -237,6 +250,9 @@ pub async fn run(stack: &Stack, mut scenario: Scenario, dir: &Path) -> Result<Sc
     scenario.write(&file)?;
     Ok(scenario)
 }
+
+/// The release's log lines about the scenario, beside `scenario.json`.
+pub const RELEASE_LOG: &str = "release-log.txt";
 
 /// The window on the target Pod, from the watcher's record: for a drain,
 /// the step container's exit to the first record with the root annotation;
@@ -259,7 +275,7 @@ pub fn window(kind: Kind, records: &[pods::PodRecord], uid: &str) -> (Option<i64
             let end = of_pod.iter().filter_map(|r| c(r)?.finished_at_ms).min();
             (start, end)
         }
-        Kind::TwoReplicas | Kind::KillServer | Kind::StopLeader => (None, None),
+        Kind::TwoReplicas | Kind::KillServer | Kind::StopLeader | Kind::PauseNode => (None, None),
     }
 }
 
@@ -283,7 +299,7 @@ async fn wait_trigger(
                 pod: p.name.clone(),
                 pod_uid: p.uid.clone(),
                 condition: match kind {
-                    Kind::MidDrain | Kind::KillServer => {
+                    Kind::MidDrain | Kind::KillServer | Kind::PauseNode => {
                         "step exited 0, egress running, no workspace-root annotation".into()
                     }
                     Kind::MidFeed => "scarab-workspace-init running".into(),
@@ -346,6 +362,143 @@ async fn delete_depot(
         fired_at_ms,
         ..Default::default()
     })
+}
+
+/// `pause-node` (git-bug 070d042): `docker pause` the kind node for the
+/// target Pod's sidecar reporting ceiling + a margin (`scenario::pause_secs`),
+/// then `docker unpause` it, then re-open the harness's port-forwards and
+/// wait until Postgres and the kube API answer again. The node is unpaused
+/// on every path out of here (`UnpauseGuard`, and the signal handler
+/// `run` installed).
+async fn pause_node(
+    stack: &Stack,
+    pods_api: &KubeApi<Pod>,
+    views: &Views,
+    t: Trigger,
+    node: &Node,
+    holds: &impl Fn(&PodView) -> bool,
+) -> Result<Fault, String> {
+    let view = views.lock().expect("views lock").get(&t.pod_uid).cloned();
+    let held = view.as_ref().is_some_and(holds);
+    let grace = view.as_ref().and_then(|p| p.grace_secs);
+    let planned_secs = crate::scenario::pause_secs(grace);
+    let ceiling_secs = planned_secs - crate::scenario::PAUSE_MARGIN_SECS;
+    let fence_rows = match &t.attempt {
+        Some(a) => fence_pack_rows(&stack.pg, &t.run, &t.step, a).await,
+        None => None,
+    };
+    let mut pause = NodePause {
+        node: node.name.clone(),
+        ceiling_secs,
+        planned_secs,
+        ..Default::default()
+    };
+    let mut errors = Vec::new();
+
+    let mut guard = crate::node::UnpauseGuard::new(node);
+    let fired_at_ms = now_ms();
+    node.docker("pause").await?;
+    match node.is_paused().await {
+        Ok(p) => pause.paused = p,
+        Err(e) => errors.push(format!("after the pause: {e}")),
+    }
+    log(&format!(
+        "paused {} for {planned_secs} s (sidecar ceiling {ceiling_secs} s, grace {grace:?}); paused: {}; \
+         condition held: {held}; fence pack rows: {fence_rows:?}",
+        node.name, pause.paused
+    ));
+    tokio::time::sleep(Duration::from_secs(planned_secs)).await;
+    let unpaused = node.docker("unpause").await;
+    let resumed_at_ms = now_ms();
+    match (unpaused, node.is_paused().await) {
+        (Ok(()), Ok(false)) => {
+            pause.unpaused = true;
+            guard.disarm();
+        }
+        (u, p) => errors.push(format!("the unpause: {u:?}, paused after it: {p:?}")),
+    }
+    // A failed unpause is retried by the guard here, before anything waits on
+    // the node.
+    drop(guard);
+    log(&format!(
+        "unpaused {} after {} ms; unpaused: {}",
+        node.name,
+        resumed_at_ms - fired_at_ms,
+        pause.unpaused
+    ));
+
+    // The port-forwards ran over the paused API server; re-open them, then
+    // wait for what the rest of the run reads.
+    restart_forwards();
+    if let Err(e) = wait_reachable(stack, pods_api).await {
+        errors.push(e);
+    }
+    if !errors.is_empty() {
+        pause.error = Some(errors.join("; "));
+    }
+    Ok(Fault {
+        action: "pause-node".into(),
+        pod: node.name.clone(),
+        trigger: Some(t),
+        condition_held_at_fire: held,
+        fence_pack_rows_at_fire: fence_rows,
+        fired_at_ms,
+        resumed_at_ms: Some(resumed_at_ms),
+        pause: Some(pause),
+        ..Default::default()
+    })
+}
+
+/// End each `kubectl port-forward` the recipe keeps (`SCARAB_CHAOS_FORWARD_PIDFILES`,
+/// colon-separated files that hold the current PID of each). The recipe's
+/// loop starts it again on the same local port: one that ran across the
+/// pause may still be up with a dead stream to the API server.
+fn restart_forwards() {
+    let Ok(files) = std::env::var("SCARAB_CHAOS_FORWARD_PIDFILES") else {
+        log("SCARAB_CHAOS_FORWARD_PIDFILES is not set; the port-forwards are not restarted");
+        return;
+    };
+    for f in files.split(':').filter(|f| !f.is_empty()) {
+        let pid = std::fs::read_to_string(f).ok().and_then(|t| crate::node::parse_pid(&t));
+        match pid {
+            Some(pid) => {
+                let res = std::process::Command::new("kill").arg(pid.to_string()).output();
+                log(&format!("restarting the port-forward in {f} (PID {pid}): {:?}", res.map(|o| o.status)));
+            }
+            None => log(&format!("{f} holds no PID; its port-forward is not restarted")),
+        }
+    }
+}
+
+/// Wait (up to 300 s) until Postgres answers through its port-forward and the
+/// kube API answers a list.
+async fn wait_reachable(stack: &Stack, pods_api: &KubeApi<Pod>) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(300);
+    loop {
+        let pg = tokio::time::timeout(
+            Duration::from_secs(20),
+            sqlx::query_scalar::<_, i32>("SELECT 1").fetch_one(&stack.pg),
+        )
+        .await;
+        let kube = tokio::time::timeout(Duration::from_secs(20), pods_api.list(&ListParams::default().limit(1))).await;
+        match (pg, kube) {
+            (Ok(Ok(_)), Ok(Ok(_))) => {
+                log("Postgres and the kube API answer again");
+                return Ok(());
+            }
+            (pg, kube) => {
+                let last = format!(
+                    "postgres: {:?}; kube: {:?}",
+                    pg.map(|r| r.map(|_| ()).map_err(|e| e.to_string())),
+                    kube.map(|r| r.map(|_| ()).map_err(|e| e.to_string()))
+                );
+                if std::time::Instant::now() > deadline {
+                    return Err(format!("not reachable 300 s after the unpause: {last}"));
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
 }
 
 fn find_target(

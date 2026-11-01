@@ -13,6 +13,30 @@ pub const FORMAT: u32 = 1;
 /// a holder stops (`crates/scarab-engine/src/scheduler.rs`).
 pub const LEASE_TTL_SECS: u64 = 30;
 
+/// `RESULTS_DRAIN_SLACK_SECS` (`crates/scarab-executor-k8s/src/lib.rs`): the
+/// slack past a Pod's `terminationGracePeriodSeconds` after which the executor
+/// reads an egress sidecar still showing `running` as a lost node. The sidecar
+/// reporting ceiling is the step container's `finishedAt` + the grace + this.
+pub const RESULTS_DRAIN_SLACK_SECS: u64 = 300;
+
+/// How much longer than the sidecar reporting ceiling `pause-node` keeps the
+/// node paused, so the first poll after the resume reads the ceiling as
+/// passed on the wall clock.
+pub const PAUSE_MARGIN_SECS: u64 = 30;
+
+/// The Kubernetes default `terminationGracePeriodSeconds`, for a Pod record
+/// that does not carry one.
+pub const DEFAULT_GRACE_SECS: u64 = 30;
+
+/// How long `pause-node` pauses the node for a Pod whose
+/// `terminationGracePeriodSeconds` is `grace_secs`: the sidecar reporting
+/// ceiling (grace + [`RESULTS_DRAIN_SLACK_SECS`]) + [`PAUSE_MARGIN_SECS`].
+/// The producer's Pod is a workspace Pod with a grace of 600 s, so 930 s.
+pub fn pause_secs(grace_secs: Option<i64>) -> u64 {
+    let grace = grace_secs.and_then(|g| u64::try_from(g).ok()).unwrap_or(DEFAULT_GRACE_SECS);
+    grace + RESULTS_DRAIN_SLACK_SECS + PAUSE_MARGIN_SECS
+}
+
 /// `WS_DRAIN_ESCALATION_MS` (`crates/scarab-executor-k8s/src/lib.rs`): how long
 /// the control plane keeps re-driving a failing drain before it gives up.
 pub const DRAIN_ESCALATION_SECS: u64 = 300;
@@ -22,7 +46,9 @@ pub const DRAIN_ESCALATION_SECS: u64 = 300;
 /// SIGKILLed mid-drain. Rank 4: the scheduler leader SIGSTOPped past the
 /// lease TTL, then resumed. The server signals are sent from the kind
 /// node's PID namespace (`crate::node`): in its container the server is PID
-/// 1 with no init and ignores them.
+/// 1 with no init and ignores them. `pause-node` is not one of ADR-0077's
+/// ranks: it reproduces git-bug 070d042 (a host suspend judged a live node
+/// lost).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum Kind {
@@ -44,6 +70,12 @@ pub enum Kind {
     /// stopped until a peer takes the lease over (past the 30 s TTL), then
     /// SIGCONT it.
     StopLeader,
+    /// git-bug 070d042: while a producer's workspace drain is owed or running
+    /// (the `mid-drain` trigger), `docker pause` the whole kind node past the
+    /// sidecar reporting ceiling (`pause_secs`), then `docker unpause` it.
+    /// The kubelet, the egress mid-drain and both servers freeze together, as
+    /// in a host suspend, and the wall clock jumps on the resume.
+    PauseNode,
 }
 
 impl Kind {
@@ -54,6 +86,7 @@ impl Kind {
             Kind::TwoReplicas => "two-replicas",
             Kind::KillServer => "kill-server",
             Kind::StopLeader => "stop-leader",
+            Kind::PauseNode => "pause-node",
         }
     }
 
@@ -69,7 +102,7 @@ impl Kind {
     /// class; `None` for a scenario with no window.
     pub fn window(self) -> Option<Kind> {
         match self {
-            Kind::MidDrain | Kind::KillServer => Some(Kind::MidDrain),
+            Kind::MidDrain | Kind::KillServer | Kind::PauseNode => Some(Kind::MidDrain),
             Kind::MidFeed => Some(Kind::MidFeed),
             Kind::TwoReplicas | Kind::StopLeader => None,
         }
@@ -95,6 +128,9 @@ impl Kind {
             Kind::MidDrain | Kind::KillServer => 2_000..=10_000,
             Kind::MidFeed => 0..=2_000,
             Kind::StopLeader => 0..=3_000,
+            // Early in the drain window: the pause must start before the
+            // drain records its root.
+            Kind::PauseNode => 0..=2_000,
             Kind::TwoReplicas => 0..=0,
         }
     }
@@ -239,6 +275,25 @@ pub struct NodeSignal {
     pub evidence: String,
 }
 
+/// `pause-node`: the node container paused and unpaused from the host.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct NodePause {
+    /// The kind node container (`SCARAB_CHAOS_NODE`).
+    pub node: String,
+    /// The target Pod's sidecar reporting ceiling: its grace +
+    /// [`RESULTS_DRAIN_SLACK_SECS`].
+    pub ceiling_secs: u64,
+    /// How long the pause was planned for ([`pause_secs`]).
+    pub planned_secs: u64,
+    /// `docker inspect` said `State.Paused = true` after the pause.
+    pub paused: bool,
+    /// `docker inspect` said `State.Paused = false` after the unpause.
+    pub unpaused: bool,
+    /// What went wrong, if anything (a failed inspect, an early unpause on a
+    /// signal).
+    pub error: Option<String>,
+}
+
 /// Rank 2: the producer's launch claim, from `outbox`, and whether its owner
 /// kept writing after the kill.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -279,7 +334,8 @@ pub struct LeaseObservation {
 pub struct Fault {
     /// `delete-pod`: a Pod delete with `gracePeriodSeconds: 0`. `kill-server`:
     /// SIGKILL from the kind node. `stop-leader`: SIGSTOP, then SIGCONT, from
-    /// the kind node.
+    /// the kind node. `pause-node`: `docker pause`, then `docker unpause`, of
+    /// the kind node container.
     pub action: String,
     pub pod: String,
     pub pod_uid: Option<String>,
@@ -305,13 +361,17 @@ pub struct Fault {
     /// the kubelet restarted it before the SIGCONT.
     #[serde(default)]
     pub victim_role: Option<String>,
-    /// Rank 4: when the SIGCONT was sent.
+    /// Rank 4: when the SIGCONT was sent. `pause-node`: when the unpause
+    /// returned.
     #[serde(default)]
     pub resumed_at_ms: Option<i64>,
     #[serde(default)]
     pub claim: Option<ClaimObservation>,
     #[serde(default)]
     pub lease: Option<LeaseObservation>,
+    /// `pause-node`: the pause as done. Its end is `resumed_at_ms`.
+    #[serde(default)]
+    pub pause: Option<NodePause>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -533,6 +593,47 @@ mod tests {
     #[test]
     fn the_bound_is_the_adr_sum() {
         assert_eq!(quiesce_bound_secs(&Workload::default()), 30 + 300 + 300);
+    }
+
+    /// `pause-node` parses from the recipe's argument and the file, keeps
+    /// the mid-drain trigger and window, and pauses past the workspace Pod's
+    /// sidecar reporting ceiling (600 s grace + 300 s slack).
+    #[test]
+    fn pause_node_parses_and_pauses_past_the_ceiling() {
+        use clap::ValueEnum as _;
+        assert_eq!(Kind::from_str("pause-node", false), Ok(Kind::PauseNode));
+        assert_eq!(serde_json::to_value(Kind::PauseNode).unwrap(), "pause-node");
+        assert_eq!(Kind::PauseNode.as_str(), "pause-node");
+        assert_eq!(Kind::PauseNode.window(), Some(Kind::MidDrain));
+        assert_eq!(Kind::PauseNode.target_step(), "produce");
+        assert!(Kind::PauseNode.has_fault() && !Kind::PauseNode.targets_servers());
+        assert_eq!(pause_secs(Some(600)), 930);
+        assert_eq!(pause_secs(Some(30)), 360);
+        assert_eq!(pause_secs(None), 360, "a record without the grace uses the Kubernetes default");
+        let w = Workload::default();
+        for seed in 0..50 {
+            assert!(Plan::from_seed(Kind::PauseNode, seed, &w, 2, 2).delay_ms <= 2_000);
+        }
+        // A scenario file round-trips with its pause, and the quiesce bound
+        // counts from the unpause.
+        let mut s = Scenario::new(Kind::PauseNode, 1, w, 2, 2);
+        s.faults.push(Fault {
+            action: "pause-node".into(),
+            fired_at_ms: 1_000,
+            resumed_at_ms: Some(931_000),
+            pause: Some(NodePause {
+                node: "scarab-dev-control-plane".into(),
+                ceiling_secs: 900,
+                planned_secs: 930,
+                paused: true,
+                unpaused: true,
+                error: None,
+            }),
+            ..Default::default()
+        });
+        let back: Scenario = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back, s);
+        assert_eq!(s.quiesce_deadline_ms(), 931_000 + (s.quiesce_bound_secs as i64) * 1000);
     }
 
     #[test]

@@ -148,9 +148,18 @@ fn interesting(v: &PodView) -> bool {
     v.run.is_some() || v.is_depot()
 }
 
+/// How long a list may take, and how long a watch may go without an event
+/// (the server ends it after 240 s), before the watcher gives up on it and
+/// re-lists. A paused node (`pause-node`) freezes the API server with the
+/// request in flight; the connection can outlive the pause in a state that
+/// never answers.
+const LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const WATCH_IDLE: std::time::Duration = std::time::Duration::from_secs(270);
+
 /// Watch `ns` until `stop` flips, appending a line to `out` whenever a step
-/// or Depot Pod changes. A watch that ends or errors is re-listed and
-/// resumed; a re-list records every Pod again as `added`.
+/// or Depot Pod changes. A watch that ends, errors or goes quiet past
+/// `WATCH_IDLE` is re-listed and resumed; a re-list records every Pod again
+/// as `added`.
 pub async fn watch(
     pods: Api<Pod>,
     out: std::path::PathBuf,
@@ -175,11 +184,15 @@ pub async fn watch(
         if *stop.borrow() {
             return Ok(());
         }
-        let list = match pods.list(&ListParams::default()).await {
-            Ok(l) => l,
-            Err(e) => {
+        let list = match tokio::time::timeout(LIST_TIMEOUT, pods.list(&ListParams::default())).await {
+            Ok(Ok(l)) => l,
+            Ok(Err(e)) => {
                 eprintln!("scarab-chaos: pod list failed ({e}); retrying");
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                continue;
+            }
+            Err(_) => {
+                eprintln!("scarab-chaos: pod list took over {LIST_TIMEOUT:?}; retrying");
                 continue;
             }
         };
@@ -205,18 +218,26 @@ pub async fn watch(
             }
             *map = seen;
         }
-        let stream = match pods.watch(&WatchParams::default().timeout(240), &rv).await {
-            Ok(s) => s,
-            Err(e) => {
+        let stream = match tokio::time::timeout(LIST_TIMEOUT, pods.watch(&WatchParams::default().timeout(240), &rv)).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
                 eprintln!("scarab-chaos: pod watch failed to start ({e}); re-listing");
+                continue;
+            }
+            Err(_) => {
+                eprintln!("scarab-chaos: pod watch took over {LIST_TIMEOUT:?} to start; re-listing");
                 continue;
             }
         };
         futures::pin_mut!(stream);
         loop {
             let ev = tokio::select! {
-                ev = stream.next() => ev,
+                ev = tokio::time::timeout(WATCH_IDLE, stream.next()) => ev,
                 _ = stop.changed() => return Ok(()),
+            };
+            let Ok(ev) = ev else {
+                eprintln!("scarab-chaos: pod watch quiet for {WATCH_IDLE:?}; re-listing");
+                break;
             };
             let Some(ev) = ev else { break };
             let (kind, pod) = match ev {

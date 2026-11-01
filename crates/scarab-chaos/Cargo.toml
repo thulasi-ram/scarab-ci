@@ -22,7 +22,7 @@ scarab-storage = { workspace = true }
 scarab-workspace-client = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["signal"] }
 futures = { workspace = true }
 reqwest = { workspace = true }
 sqlx = { workspace = true }
