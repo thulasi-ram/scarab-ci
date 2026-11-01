@@ -189,10 +189,10 @@ locally and loaded into the node. A code change needs a rebuild and a Pod restar
 (`just reload`), not an image build.
 
 ```sh
-just up        # build the server, create the kind cluster, install the chart
-just reload    # rebuild and roll the server and workspace Pods onto the new binary
-just dogfood   # the same release in GitHub App mode, behind a Cloudflare tunnel
-just down      # delete the cluster and its data
+just up          # build the server, create the kind cluster, install the chart
+just reload      # rebuild and roll the server and workspace Pods onto the new binary
+just up dogfood  # the same release in GitHub App mode, behind a Cloudflare tunnel
+just down        # delete the cluster and its data
 ```
 
 Every kubectl and helm call uses the cluster's own kubeconfig (`deploy/kind/.kubeconfig`),

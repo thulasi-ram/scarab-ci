@@ -100,7 +100,7 @@ and stitches the digests into one multi-arch manifest per tag, so `edge` and
 
 Install the GitHub App on the demo repo (or hit *Recreate all* on its Advanced →
 webhook page). The resulting `installation` delivery is what registers it.
-No synthetic `installation` event is sent here (`just dogfood` sends one) and
+No synthetic `installation` event is sent here (`just up dogfood` sends one) and
 none is needed: the box is publicly reachable, so real GitHub deliveries arrive
 on their own.
 

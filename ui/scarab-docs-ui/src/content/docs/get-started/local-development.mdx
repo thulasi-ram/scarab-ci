@@ -13,7 +13,7 @@ tree and mounted into the server Pods, so you rebuild and rerun without building
 (`deploy/kind/README.md`). The test recipes run against the same release in its e2e mode.
 `Justfile` recipes over `deploy/` drive all of it. Use them rather
 than typing docker/kind/kubectl commands yourself: they set the right env, an isolated kubeconfig,
-and the kube safety checks. CI runs the same recipes (`just kube-tests`, `just e2e`).
+and the kube safety checks. CI runs the same recipes (`just test`, `just e2e`).
 
 For a guided first run see [Run locally](/scarab-ci/get-started/run-locally/); to deploy the
 packaged Helm chart inside the cluster instead, see
@@ -81,23 +81,26 @@ Also handy: **`just docs`** serves this documentation site locally.
 ## Tests against the stack
 
 ```sh
-just e2e             # the full-stack suite (crates/scarab-e2e)
-just forgejo-verify  # a real Forgejo: connect, bind, push, Run
-just kube-tests      # the executor's and the plugin runtime's live cluster suites
+just e2e                # every live suite
+just e2e crash_resume   # the same, narrowed by a nextest filter
 ```
 
-These switch the release to its e2e mode, with its own database (`scarab_e2e`) and bucket
-(`scarab-e2e`), so dev data is not touched, and leave it there; `just up` switches back. The
-test binaries run on your machine. `just test` runs the workspace suite against a separate
+`just e2e` switches the release to its e2e mode, with its own database (`scarab_e2e`) and
+bucket (`scarab-e2e`), so dev data is not touched, and leaves it there; `just up` switches back.
+It runs the full-stack suite (`crates/scarab-e2e`), the Forgejo adapter and onboarding against
+the Forgejo that runs in the cluster, the forge_token cases through a cloudflared quick tunnel
+(network calls; Forgejo is public while it runs), the executor's and the plugin runtime's live
+cluster suites, and the control-plane crash test last. The test binaries run on your machine.
+CI runs the same recipe on PRs labelled `ci:full`. `just test` runs the workspace suite against a separate
 compose Postgres and MinIO (`deploy/test-services/`).
 
 :::note[Dogfood and Helm]
-`just dogfood` is `just up` in GitHub App mode, with its own database and bucket, behind a
+`just up dogfood` is `just up` in GitHub App mode, with its own database and bucket, behind a
 Cloudflare tunnel; it reads `~/.config/scarab/dogfood.env`. The stack has no login, so the
 tunnel's public hostname must route only the path `^/webhooks/` (set in the Cloudflare
-dashboard). `just dogfood` checks this from outside and scales the tunnel to zero, then fails,
-when `/` or `/v1/repos` reaches Scarab. The UI and API stay on `http://127.0.0.1:<port>`. To install the published chart on a
-cluster of your own, see [Installation](/scarab-ci/get-started/deploy-helm/).
+dashboard). `just up dogfood` checks this from outside and scales the tunnel to zero, then
+fails, when `/` or `/v1/repos` reaches Scarab. The UI and API stay on
+`http://127.0.0.1:<port>`. To install the published chart on a cluster of your own, see [Installation](/scarab-ci/get-started/deploy-helm/).
 :::
 
 ## References

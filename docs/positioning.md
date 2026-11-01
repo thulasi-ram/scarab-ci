@@ -145,7 +145,7 @@ Show respect and say where we differ; never take a swipe.
    implemented; not yet hardened against live forges."
 2. ❌ Any end-to-end durability-on-Kubernetes or live-Pod re-attach claim. The
    executor's live-cluster tests, re-attach after relaunch included, pass on kind
-   (`kind.yml`), but the stack-level crash/resume test with a real Pod in flight
+   (`just e2e`, run by `e2e.yml`), but the stack-level crash/resume test with a real Pod in flight
    doesn't pass yet.
 3. ❌ Durable execution as a selling point against Argo/Tekton/Temporal/Kestra.
 4. ❌ Time-travel / replay as a feature.
@@ -159,8 +159,8 @@ Show respect and say where we differ; never take a swipe.
    that: tested on a kind cluster.
 8. ❌ "Every change runs the full test suite." `ci.yml` runs the Rust suite against
    real Postgres on every push to main and on PRs that touch Rust (in CI a skipped
-   Postgres test fails the job), but `kind.yml` runs the live-cluster tests only for
-   changes to the execution path, and the full-stack e2e tier runs weekly.
+   Postgres test fails the job), but `e2e.yml` runs the live-cluster and full-stack
+   tiers (`just e2e`) only on PRs labelled `ci:full` and weekly.
 
 **Keep a visible Status line, and don't apologise for it.** Durable engine:
 proven. Forge-native domain model: proven against a fake forge. Forge adapters

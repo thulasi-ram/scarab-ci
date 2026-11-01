@@ -82,23 +82,21 @@ but none of them has carried production load.
   in-repo `.scarab` config → run → commit statuses posted back → OAuth-gated reads.
 - **Implemented, and run against real forges by hand.** Two forge adapters, GitHub
   (`/webhooks/github`) and Forgejo (`/webhooks/forgejo`), each with HMAC webhook ingest and
-  commit-status posting over real HTTP. `just forgejo-verify` drives a real Forgejo container
-  through add-connection → bind → hook → signed push → Run. It doesn't check status posting,
-  and CI doesn't run it. The [live demo](#live-demo) and this repo's own dogfood setup
-  (`just dogfood`, `deploy/kind/`) take their webhooks from a GitHub App. Each adapter also has a live
-  contract test (`tests/contract_live.rs`) that you run by hand.
+  commit-status posting over real HTTP. `just e2e` drives a real Forgejo, running in the kind
+  cluster, through add-connection → bind → hook → signed push → Run. It doesn't check status
+  posting. CI runs it only on PRs labelled `ci:full` and weekly. The [live demo](#live-demo)
+  and this repo's own dogfood setup (`just up dogfood`, `deploy/kind/`) take their webhooks
+  from a GitHub App. Each adapter also has a live contract test (`tests/contract_live.rs`)
+  that you run by hand.
 - **Implemented, and tested on a kind cluster.** Pod-per-step execution on Kubernetes
   (`scarab-executor-k8s`): re-attach after an executor relaunch, step deadlines, cancel, clone
   and build steps, the workspace feed and drain, artifact harvest, and the results-egress
-  sidecar image (`docker/sidecar/`). `.github/workflows/kind.yml` runs these live-cluster
-  tests with `just kube-tests`, the recipe you run locally, on a kind cluster the recipe
-  creates. It runs for PRs and pushes to main that change the execution path (the executor,
-  engine, server, storage, workspace-client and plugin-k8s crates, `docker/`, `deploy/kind/`,
-  the chart or the `Justfile`), not on every PR. As of 2026-10-28 the kind job fails at image load, before the tests run; it was
-  last green on main on 2026-10-20.
+  sidecar image (`docker/sidecar/`). `just e2e` runs these live-cluster tests on a kind
+  cluster the recipe creates, and `.github/workflows/e2e.yml` runs the same recipe on PRs
+  labelled `ci:full` and weekly, not on every PR.
 - **Not proven yet.** Control-plane crash and resume with a real Pod in flight. The
-  `crash_resume` test in `crates/scarab-e2e` does this on a kind cluster; it runs weekly
-  (`.github/workflows/e2e.yml`, which runs `just e2e`) and doesn't pass yet. Nothing has run at production scale.
+  `crash_resume` test in `crates/scarab-e2e` does this on a kind cluster; it runs in
+  `just e2e` (`.github/workflows/e2e.yml`: weekly and on `ci:full` PRs) and doesn't pass yet. Nothing has run at production scale.
 - **Missing.** `on: cron` and `on: upstream` triggers parse, but nothing produces those
   events yet, so they never fire.
 
@@ -232,12 +230,12 @@ Requires `docker`, `kind`, `kubectl`, `helm`, `cargo`, and `python3`, plus
 API and UI answer on `SCARAB_ADDR` from `deploy/kind/.env`. The cluster's
 kubeconfig is `deploy/kind/.kubeconfig`, checked against the cluster before
 every call, so the recipes never touch an ambient (e.g. production) context.
-`just dogfood` is the same stack in GitHub App mode behind a Cloudflare tunnel.
+`just up dogfood` is the same stack in GitHub App mode behind a Cloudflare tunnel.
 See `deploy/kind/README.md`.
 
-`just e2e`, `just forgejo-verify` and `just kube-tests` run against the same
-release, switched to its e2e mode: its own database and bucket, so dev data is
-not touched. `just up` switches it back. `just test` runs the workspace suite
+`just e2e` runs every live suite against the same release, switched to its e2e
+mode: its own database and bucket, so dev data is not touched, and a cloudflared
+quick tunnel in front of the in-cluster Forgejo. `just up` switches it back. `just test` runs the workspace suite
 against a separate compose Postgres and MinIO (`deploy/test-services/`).
 
 Without Docker/kind, the server still runs API-only against a local Postgres and
@@ -245,7 +243,7 @@ a filesystem object store (`--object-dir`); the background driver is skipped
 until a cluster is reachable.
 
 > **Running or testing Scarab locally: use the `just` recipes as the canonical
-> entrypoints** (`just up`/`demo`/`down`, `just dogfood`, `just test`) rather
+> entrypoints** (`just up`/`demo`/`down`, `just up dogfood`, `just test`, `just e2e`) rather
 > than hand-rolled `docker`/`kubectl`/`helm` commands — they carry the right
 > env, isolated kubeconfig, image source, and kube safety checks. Missing something?
 > Add a recipe. (Agents: this is also in `CLAUDE.md`.)
@@ -273,8 +271,9 @@ Pushes to `main` and `v*` tags ignore both.
 
 | Label | Effect |
 |---|---|
-| `ci:skip` | Every job in `ci`, `kind` and `image` skips without starting a runner. Adding it cancels a run in progress. Removing it starts a run. |
-| `ci:full` | `ci` and `image` ignore the path filters and run every job. `kind` still runs only when the PR touches its paths. |
+| none | `ci` runs the workspace suite and the other jobs its path filters select; `image` builds the images whose inputs changed. No cluster job runs. |
+| `ci:skip` | Every job in `ci`, `e2e` and `image` skips without starting a runner. Adding it cancels a run in progress. Removing it starts a run. |
+| `ci:full` | `ci` and `image` ignore the path filters and run every job, and `e2e` runs `just e2e` (every live suite on a kind cluster; it makes network calls through a cloudflared quick tunnel). Adding it starts a run. |
 
 `ci:skip` wins when both are set. A PR with `ci:skip` never passes
 `just pr-gate <n>`: remove the label, wait for the run, then run the gate.
