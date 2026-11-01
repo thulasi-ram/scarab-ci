@@ -30,7 +30,7 @@ thick femur, a knee, a thinner spiny tibia and a small foot.
 | `icons/halftone/icon-{16..1024}.png` | transparent PNGs of the cream mark |
 | `icons/halftone-ink/icon-{16..1024}.png` | transparent PNGs of the ink mark |
 | `icons/halftone-tile/icon-{16..1024}.png` | opaque PNGs of the tile; use these for app icons (apple-touch 180, PWA 192 and 512) |
-| `favicon/halftone/favicon.svg` | the same mark without the hexagon dots, theme-aware: ink on light, cream on dark |
+| `favicon/halftone/favicon.svg` | the full mark with the hexagon dots, theme-aware: ink on light, cream on dark (75 KB) |
 | `favicon/halftone/favicon.ico`, `favicon-{16,32,48,64}.png` | emerald mark on a transparent background, for browsers that ignore the SVG; emerald reads on light and dark tabs (about 3.4:1 on white, 4.7:1 on `#202124`) |
 | `favicon/halftone/apple-touch-icon.png`, `icon-192.png`, `icon-512.png` | cream mark on a square `#0b0c0e` tile |
 
@@ -38,8 +38,10 @@ The ink mark is not the cream mark with the colour changed. The shading is
 inverted, so the lit wing cases get the smallest dots and the shaded pronotum
 gets the largest. A plain colour swap would draw the lit areas as the darkest.
 
-The favicon files drop the hexagon dots: they are invisible at tab size, and
-without them the file is half the size and the beetle fills more of the icon.
+The favicon keeps the hexagon dots, all one size with no fade. At 24 px and
+up they show as a faint hexagon behind the beetle; at 16 px they are a haze.
+We measured the favicon with and without them and the contrast was the same
+(about 1.3:1 on white and 2:1 on a dark tab at 32 px).
 
 Status and limits:
 
