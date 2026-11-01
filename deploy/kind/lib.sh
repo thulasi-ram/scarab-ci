@@ -101,6 +101,17 @@ scarab_addr() {
   base="http://${host_ip/0.0.0.0/127.0.0.1}:$host_port"
 }
 
+# unpause_node: a paused node container (`docker pause`, as `just test chaos
+# pause-node` does; a chaos run killed mid-pause leaves it so) reads as running,
+# and every kubectl call against it hangs. Unpause it, and say so. Not called
+# from kc: chaos.sh pauses the node on purpose while it runs.
+unpause_node() {
+  if [ "$(docker inspect -f '{{.State.Paused}}' "$node" 2>/dev/null)" = true ]; then
+    echo "==> the kind node container $node is paused (a chaos pause-node run that did not finish?); unpausing it"
+    docker unpause "$node" >/dev/null || die "could not unpause the kind node container $node"
+  fi
+}
+
 api_url() { # the API server URL docker publishes for this cluster's node
   local hp
   hp="$(docker port "$node" 6443/tcp 2>/dev/null | head -n 1)" || return 1

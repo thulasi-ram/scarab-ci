@@ -28,13 +28,30 @@ pub const PAUSE_MARGIN_SECS: u64 = 30;
 /// that does not carry one.
 pub const DEFAULT_GRACE_SECS: u64 = 30;
 
+/// The longest `pause-node` ever pauses the kind node: 20 minutes. A Pod
+/// record with a huge grace must not freeze the developer's whole stack for
+/// hours, and a scenario file that planned more is refused
+/// ([`Scenario::read`]).
+pub const MAX_PAUSE_SECS: u64 = 20 * 60;
+
+/// The sidecar reporting ceiling of a Pod whose
+/// `terminationGracePeriodSeconds` is `grace_secs`: grace +
+/// [`RESULTS_DRAIN_SLACK_SECS`].
+pub fn sidecar_ceiling_secs(grace_secs: Option<i64>) -> u64 {
+    let grace = grace_secs.and_then(|g| u64::try_from(g).ok()).unwrap_or(DEFAULT_GRACE_SECS);
+    grace.saturating_add(RESULTS_DRAIN_SLACK_SECS)
+}
+
 /// How long `pause-node` pauses the node for a Pod whose
 /// `terminationGracePeriodSeconds` is `grace_secs`: the sidecar reporting
-/// ceiling (grace + [`RESULTS_DRAIN_SLACK_SECS`]) + [`PAUSE_MARGIN_SECS`].
-/// The producer's Pod is a workspace Pod with a grace of 600 s, so 930 s.
+/// ceiling + [`PAUSE_MARGIN_SECS`], at most [`MAX_PAUSE_SECS`]. The
+/// producer's Pod is a workspace Pod with a grace of 600 s, so 930 s. A pause
+/// clamped short of the ceiling makes the scenario INCONCLUSIVE (the checker
+/// compares the time held with the ceiling).
 pub fn pause_secs(grace_secs: Option<i64>) -> u64 {
-    let grace = grace_secs.and_then(|g| u64::try_from(g).ok()).unwrap_or(DEFAULT_GRACE_SECS);
-    grace + RESULTS_DRAIN_SLACK_SECS + PAUSE_MARGIN_SECS
+    sidecar_ceiling_secs(grace_secs)
+        .saturating_add(PAUSE_MARGIN_SECS)
+        .min(MAX_PAUSE_SECS)
 }
 
 /// `WS_DRAIN_ESCALATION_MS` (`crates/scarab-executor-k8s/src/lib.rs`): how long
@@ -460,6 +477,18 @@ impl Scenario {
         if s.format != FORMAT {
             return Err(format!("{}: format {} (expected {FORMAT})", path.display(), s.format));
         }
+        if let Some(p) = s
+            .faults
+            .iter()
+            .filter_map(|f| f.pause.as_ref())
+            .find(|p| p.planned_secs > MAX_PAUSE_SECS)
+        {
+            return Err(format!(
+                "{}: a pause-node fault planned {} s, above the {MAX_PAUSE_SECS} s maximum",
+                path.display(),
+                p.planned_secs
+            ));
+        }
         Ok(s)
     }
 
@@ -610,6 +639,8 @@ mod tests {
         assert_eq!(pause_secs(Some(600)), 930);
         assert_eq!(pause_secs(Some(30)), 360);
         assert_eq!(pause_secs(None), 360, "a record without the grace uses the Kubernetes default");
+        assert_eq!(pause_secs(Some(86_400)), MAX_PAUSE_SECS, "a huge grace is clamped");
+        assert_eq!(pause_secs(Some(i64::MAX)), MAX_PAUSE_SECS);
         let w = Workload::default();
         for seed in 0..50 {
             assert!(Plan::from_seed(Kind::PauseNode, seed, &w, 2, 2).delay_ms <= 2_000);
@@ -634,6 +665,19 @@ mod tests {
         let back: Scenario = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(back, s);
         assert_eq!(s.quiesce_deadline_ms(), 931_000 + (s.quiesce_bound_secs as i64) * 1000);
+
+        // A file that planned a pause above the maximum is refused, so a
+        // replay never pauses the node that long; at the maximum it reads.
+        let dir = std::env::temp_dir().join(format!("scarab-chaos-pause-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("scenario.json");
+        s.write(&file).unwrap();
+        assert!(Scenario::read(&file).is_ok());
+        s.faults[0].pause.as_mut().unwrap().planned_secs = MAX_PAUSE_SECS + 1;
+        s.write(&file).unwrap();
+        let err = Scenario::read(&file).unwrap_err();
+        assert!(err.contains("above the 1200 s maximum"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -224,6 +224,7 @@ exists=0
 kind get clusters 2>/dev/null | grep -qx "$cluster" && exists=1
 if [ "$exists" = 1 ] && cluster_fits; then
   echo "==> reusing kind cluster '$cluster'"
+  unpause_node
   if [ "$(docker inspect -f '{{.State.Running}}' "$node")" != true ]; then
     echo "    its node container is stopped; starting it"
     docker start "$node" >/dev/null || die "could not start the stopped node container $node ('just stack down' deletes the cluster)"

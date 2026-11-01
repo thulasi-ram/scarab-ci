@@ -383,7 +383,7 @@ async fn pause_node(
     let held = view.as_ref().is_some_and(holds);
     let grace = view.as_ref().and_then(|p| p.grace_secs);
     let planned_secs = crate::scenario::pause_secs(grace);
-    let ceiling_secs = planned_secs - crate::scenario::PAUSE_MARGIN_SECS;
+    let ceiling_secs = crate::scenario::sidecar_ceiling_secs(grace);
     let fence_rows = match &t.attempt {
         Some(a) => fence_pack_rows(&stack.pg, &t.run, &t.step, a).await,
         None => None,
