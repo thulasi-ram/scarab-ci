@@ -94,6 +94,32 @@ cluster suites, and the control-plane crash test last. The test binaries run on 
 CI runs the same recipe on PRs labelled `ci:full`. `just test` runs the workspace suite against a separate
 compose Postgres and MinIO (`deploy/test-services/`).
 
+### Fault scenarios
+
+```sh
+just chaos                                            # mid-drain, then mid-feed, seed 1
+just chaos mid-feed 7                                 # one scenario, another seed
+just chaos replay deploy/kind/.chaos/<dir>/scenario.json
+```
+
+`just chaos` runs the first fault scenario of
+[ADR-0077](/scarab-ci/tech/adr/0077-end-to-end-fault-and-agent-driven-testing/) on the same
+release. It switches the release to its chaos mode: its own database (`scarab_chaos`) and bucket
+(`scarab-chaos`) on the same Postgres and MinIO, reached through toxiproxy, with two servers and
+two Depot replicas. It deletes the Depot's PVCs first, so no warm cache from another bucket can
+hide a fault. Then it submits three chained Runs whose producers write 128 MiB each, and deletes
+one Depot Pod with grace 0 while a producer's workspace drain is in flight, and in a second run
+while a consumer's fetcher is pulling its inputs. A seed picks the Run, the delay and the replica.
+
+After every Run has ended, or the quiesce bound (lease TTL + workload time + drain escalation)
+has run out, the `scarab-chaos` checker reads Postgres, the bucket and the Kubernetes API
+directly. It reports whether each Run made exactly one terminal transition, whether any Step ran
+twice, whether every green Attempt's snapshot reads back from the bucket and hashes to its
+address, and whether anything of a finished Run is still running. Each scenario run leaves a
+`scenario.json` that `just chaos replay` fires again. The recipe then switches the release back
+to the mode it found (dev or dogfood) and runs `just demo` there. See `deploy/kind/README.md`
+for the files it writes and the full invariant list.
+
 :::note[Dogfood and Helm]
 `just up dogfood` is `just up` in GitHub App mode, with its own database and bucket, behind a
 Cloudflare tunnel; it reads `~/.config/scarab/dogfood.env`. The stack has no login, so the

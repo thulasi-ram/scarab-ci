@@ -13,6 +13,7 @@ just demo-chain  # produce -> consume, checks the workspace crossed a Step bound
 just reload      # rebuild and roll the server and Depot onto the new binary
 just up dogfood  # the same stack in GitHub App mode, behind a named Cloudflare tunnel
 just e2e         # every live suite, against the release in its e2e mode
+just chaos       # ADR-0077 rank 1: a Depot Pod deleted mid-drain and mid-feed, then the invariant checker
 just logs        # follow the server's log
 just down        # delete the cluster and its data
 just down keep   # uninstall the release; keep the cluster, Postgres, MinIO and their data
@@ -90,6 +91,7 @@ bucket on those two servers:
 | dev | `just up` | `scarab` | `scarab-logs` | dev-insecure |
 | dogfood | `just up dogfood` | `scarab_dogfood` | `scarab-dogfood` | dev-insecure, GitHub App |
 | e2e | `just e2e` | `scarab_e2e` | `scarab-e2e` | dev-insecure; Forgejo behind a quick tunnel |
+| chaos | `just chaos` | `scarab_chaos` | `scarab-chaos` | dev-insecure; Postgres and MinIO through toxiproxy; 2 servers, 2 Depot replicas |
 
 Switching modes deletes the Depot's warm PVC. The warm tier caches blobs of
 one bucket, and would otherwise serve the new mode reads its bucket cannot
@@ -221,6 +223,100 @@ run on the host. `test-env.sh` gives them what the host cannot reach directly:
 namespace (`crictl inspect` gives the container's PID on the node), so the
 kubelet restarts the container in the same Pod.
 
+## `just chaos`
+
+`just chaos` (`chaos.sh`) runs ADR-0077's rank-1 fault scenario on this
+release: two Depot replicas, and one of them deleted with grace 0 while a
+workspace drain is in flight, then again while a fetcher is pulling a Step's
+inputs. The `scarab-chaos` binary (`crates/scarab-chaos`) fires the fault and
+then checks the invariants.
+
+```sh
+just chaos                          # mid-drain, then mid-feed, seed 1
+just chaos mid-feed 7               # one scenario, another seed
+just chaos replay deploy/kind/.chaos/<dir>/scenario.json
+```
+
+What it does, in order:
+
+1. Switches the release to chaos mode (`up.sh chaos`). The switch is refused
+   while step Pods of the current mode run, and it deletes the Depot's PVCs:
+   a warm cache filled from another bucket would serve reads the chaos bucket
+   cannot back, and hide the faults this looks for. Chaos mode uses its own
+   database and bucket on the same Postgres and MinIO, reached through
+   toxiproxy (`toxiproxy.yaml`), with `replicaCount: 2`,
+   `workspace.replicaCount: 2` and plugins off.
+2. Submits three chained Runs at once. Each producer writes 64 files of 2 MiB
+   of random bytes and their SHA-256 list into `/workspace`; each consumer
+   inherits the workspace and checks every file against the list.
+3. Watches the namespace's Pods (a kube watch, one JSONL line per change)
+   until the planned Run's Pod shows the trigger, waits the planned delay, and
+   deletes the planned Depot replica with `gracePeriodSeconds: 0`:
+   - mid-drain: the producer's `step` container exited 0, its egress helper
+     still runs, and the Pod has no `scarab.io/workspace-root` annotation
+     (the drain record) yet;
+   - mid-feed: the consumer's `scarab-workspace-init` fetcher is running.
+4. Waits until every Run is terminal or the quiesce bound runs out: the
+   lease TTL (30 s) + the workload's time (300 s) + the drain escalation
+   (300 s), counted from the fault.
+5. Runs the checker and prints one line per invariant and a `VERDICT` line.
+6. Switches the release back to the mode that was active before (dev or
+   dogfood; from e2e it goes to dev, since restoring e2e opens a new public
+   Forgejo tunnel) and runs `just demo` there.
+
+The seed picks the target Run, the delay (2-10 s after the trigger for a
+drain, 0-2 s for a feed) and the replica. Each scenario run writes a
+directory under `deploy/kind/.chaos/` (gitignored; `SCARAB_CHAOS_DIR` moves
+it):
+
+| File | What |
+|---|---|
+| `scenario.json` | seed, plan, workload, quiesce bound, Run IDs, the fault with its trigger, its time and where it landed (`mid-drain`, `mid-feed`, `before-window`, `after-window`) |
+| `pods.jsonl` | every change to a step Pod or a Depot Pod during the run |
+| `verdict.json` | the checker's findings and, per green Attempt, the objects and bytes it read back |
+| `release-log.txt` | server and Depot log lines that name the target Pod or the deleted replica |
+| `fetcher-log.txt` | mid-feed only: the target fetcher's own log |
+
+A replay reads `scenario.json` and fires the same plan (target Run, delay,
+replica) without drawing from the seed again. Timing still varies, so a replay
+reproduces the class of the fault (where it landed), not the exact
+interleaving.
+
+The checker reads the chaos database and the bucket through port-forwards
+straight to Postgres and MinIO, not through toxiproxy, and the kube API. It
+does not take the API's or a Step's word for success:
+
+| Id | Invariant (ADR-0077 §2) |
+|---|---|
+| I1a | at most one Pod UID per Attempt |
+| I1b | Attempt N+1's step container starts after N's ended, or after N was journalled finished or superseded |
+| I1c | per Step at most one succeeded Attempt, one `AttemptStarted` and one `AttemptFinished` per Attempt, and a Succeeded Step's evidence Attempt is that one |
+| T1 | exactly one terminal `RunTransitioned` per Run, matching `runs.status` |
+| I3 | every Run terminal within the quiesce bound; no row left with `creating = TRUE` |
+| I4 | every green Attempt's snapshot closure is in committed packs; every tree and blob range is read from the bucket and hashed against its address; a member in another fence's pack needs a `depot_fence_borrows` edge |
+| I8 | after quiesce, no Pod of a scenario Run is pending or running, and no per-Pod workspace Secret outlives its Pod |
+| I10 | no uncommitted pack row older than 60 s for a fence that has a drain record; every committed pack's object exists at its recorded size |
+
+Completed step Pods stay in the namespace on main, so I8 counts a Pod in
+phase Succeeded or Failed as torn down. An uncommitted pack row of a fence
+with no drain record (an abandoned drain) is reported as a warning: the pack
+reclaimer removes it later (git-bug ad79c90). ADR-0077's I2, I5, I6, I7, I9
+and I11 are not part of rank 1 and are not checked here.
+
+`just chaos` exits 0 when every verdict passed, 1 when one failed (a finding:
+keep the scenario file and replay it), and 2 when a scenario could not run.
+It also samples the kind node's memory every 5 s into
+`deploy/kind/.chaos/memory-<time>.log` and prints the peak.
+
+Measured on 2026-11-01 (colima 2 vCPU / 4 GiB): the kind node used 1.46 GiB
+at 2+2 before the workload (Postgres, MinIO, Forgejo and toxiproxy included)
+and 1.72 to 1.91 GiB at the peak with the step Pods running. One scenario
+takes 3 to 5 minutes; `just chaos` with both and the two mode switches took
+about 9. With two server replicas, both drive the same Pod's drain: one
+drain often exits 12 (`drain_state_incomplete` while another replica's tail
+pack lingers) and the next poll's re-drive posts the record, with or without
+a fault.
+
 ## Forgejo
 
 Forgejo runs in every mode, like Postgres and MinIO, so the Forgejo adapter is
@@ -279,3 +375,4 @@ Pod-side probe in `test-env.sh` finds it.
 | `SCARAB_DOGFOOD_ENV` | `~/.config/scarab/dogfood.env` | the dogfood env file |
 | `SCARAB_DOGFOOD_DEV_INSECURE` | `true` | dogfood's `scarab.devInsecure` |
 | `SCARAB_KIND_EXTRA_VALUES` | none | one more Helm values file, applied last; not remembered by `just reload` |
+| `SCARAB_CHAOS_DIR` | `deploy/kind/.chaos` | where `just chaos` writes scenario files, Pod records and verdicts |
