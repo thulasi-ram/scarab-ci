@@ -62,6 +62,7 @@ import {
 } from "../plugins";
 import { relTime, absTime } from "../fmt";
 import Icon from "./Icon";
+import FormSection from "./FormSection";
 
 /** A badge tone in the StatusBadge palette's classes. */
 const BADGE: Record<BadgeTone, string> = {
@@ -742,7 +743,7 @@ function InstallDialog(props: {
         <div class="panel-h">
           <span>Install plugin</span>
         </div>
-        <div class="modal-body token-form">
+        <div class="modal-body">
           <Show when={catalog.error}>
             <p class="error">Could not load the plugin catalog.</p>
           </Show>
@@ -750,9 +751,13 @@ function InstallDialog(props: {
             <p class="empty">This server has no plugins to install.</p>
           </Show>
 
-          <div class="form-r">
-            <label>plugin</label>
-            <select class="input" value={plugin()} onChange={(e) => choose(e.currentTarget.value)}>
+          <FormSection n={1} title="Plugin">
+            <select
+              class="input mono"
+              aria-label="plugin"
+              value={plugin()}
+              onChange={(e) => choose(e.currentTarget.value)}
+            >
               <option value="">choose a plugin…</option>
               <For each={entries()}>
                 {(c) => (
@@ -763,27 +768,26 @@ function InstallDialog(props: {
               </For>
             </select>
             <Show when={entry()}>
-              {(c) => <p class="fieldnote">{c().description}</p>}
+              {(c) => (
+                <>
+                  <p class="fieldnote">{c().description}</p>
+                  <div class="form-r">
+                    <label>publisher</label>
+                    <div class="mono">{pluginPublisher(c().image_repository) || "none in the image name"}</div>
+                    <p class="fieldnote">
+                      The owner of <span class="mono">{c().image_repository}</span>: whose image you are
+                      approving.
+                    </p>
+                  </div>
+                </>
+              )}
             </Show>
-          </div>
+          </FormSection>
 
-          <Show when={entry()}>
-            {(c) => (
-              <div class="form-r">
-                <label>publisher</label>
-                <div class="mono">{pluginPublisher(c().image_repository) || "none in the image name"}</div>
-                <p class="fieldnote">
-                  The owner of <span class="mono">{c().image_repository}</span>: whose image you are
-                  approving.
-                </p>
-              </div>
-            )}
-          </Show>
-
-          <div class="form-r">
-            <label>name</label>
+          <FormSection n={2} title="Name">
             <input
               class="input mono"
+              aria-label="name"
               placeholder="argocd-prod"
               value={name()}
               onInput={(e) => setName(e.currentTarget.value)}
@@ -793,12 +797,12 @@ function InstallDialog(props: {
               <span class="mono">plugin:{name() || "<name>"}</span>.
               Unique in the org and never reused — not even after an uninstall.
             </p>
-          </div>
+          </FormSection>
 
-          <div class="form-r">
-            <label>image</label>
+          <FormSection n={3} title="Image">
             <input
               class="input mono"
+              aria-label="image"
               placeholder="ghcr.io/…@sha256:…"
               value={image()}
               onInput={(e) => setImage(e.currentTarget.value)}
@@ -807,26 +811,29 @@ function InstallDialog(props: {
               Pinned by digest — paste the <span class="mono">sha256:</span> of the release you are
               approving. A tag can change under the same name; a digest cannot.
             </p>
-          </div>
+          </FormSection>
 
           <Show when={entry()}>
             {(c) => (
               <>
-                <For each={c().manifest.config_keys}>
-                  {(key) => (
-                    <div class="form-r">
-                      <label class="mono">{key}</label>
-                      <input
-                        class="input"
-                        placeholder="optional"
-                        value={config()[key] ?? ""}
-                        onInput={(e) => setConfig((cfg) => ({ ...cfg, [key]: e.currentTarget.value }))}
-                      />
-                    </div>
-                  )}
-                </For>
-                <div class="form-r">
-                  <label>you are approving</label>
+                <Show when={c().manifest.config_keys.length > 0}>
+                  <FormSection n={4} title="Settings">
+                    <For each={c().manifest.config_keys}>
+                      {(key) => (
+                        <div class="form-r">
+                          <label class="mono">{key}</label>
+                          <input
+                            class="input mono"
+                            placeholder="optional"
+                            value={config()[key] ?? ""}
+                            onInput={(e) => setConfig((cfg) => ({ ...cfg, [key]: e.currentTarget.value }))}
+                          />
+                        </div>
+                      )}
+                    </For>
+                  </FormSection>
+                </Show>
+                <FormSection n={c().manifest.config_keys.length > 0 ? 5 : 4} title="You are approving">
                   <div class="plg-caps">
                     <For each={c().manifest.capabilities}>
                       {(cap) => <span class="dep-tag dep-tag-muted">{cap.replace(/_/g, " ")}</span>}
@@ -843,7 +850,7 @@ function InstallDialog(props: {
                       </p>
                     )}
                   </For>
-                </div>
+                </FormSection>
               </>
             )}
           </Show>

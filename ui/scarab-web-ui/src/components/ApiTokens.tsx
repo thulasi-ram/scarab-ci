@@ -37,6 +37,7 @@ import {
 } from "../api-tokens";
 import { relTime, absTime } from "../fmt";
 import Icon from "./Icon";
+import FormSection from "./FormSection";
 
 /** The lifetime a token gets unless someone says otherwise. A quarter: long
  * enough that rotating is not a weekly chore, short enough that an abandoned
@@ -299,11 +300,11 @@ function MintTokenDialog(props: { org: string; onClose: () => void; onMinted: ()
         <Show
           when={minted()}
           fallback={
-            <div class="modal-body token-form">
-              <div class="form-r">
-                <label>name</label>
+            <div class="modal-body">
+              <FormSection n={1} title="Name">
                 <input
                   class="input"
+                  aria-label="name"
                   placeholder="release-bot, amy's laptop, demo keepalive"
                   value={name()}
                   onInput={(e) => setName(e.currentTarget.value)}
@@ -312,12 +313,12 @@ function MintTokenDialog(props: { org: string; onClose: () => void; onMinted: ()
                 <p class="fieldnote">
                   What makes it revocable later — the only way to tell two tokens apart.
                 </p>
-              </div>
+              </FormSection>
 
-              <div class="form-r">
-                <label>scope</label>
+              <FormSection n={2} title="Scope">
                 <select
-                  class="input"
+                  class="input mono"
+                  aria-label="scope"
                   value={project()}
                   onChange={(e) => setProject(e.currentTarget.value)}
                 >
@@ -334,12 +335,12 @@ function MintTokenDialog(props: { org: string; onClose: () => void; onMinted: ()
                   A token scoped to one repository cannot see another's runs, let alone act
                   on them. Narrow it unless it genuinely needs the whole org.
                 </p>
-              </div>
+              </FormSection>
 
-              <div class="form-r">
-                <label>role ceiling</label>
+              <FormSection n={3} title="Role ceiling">
                 <select
                   class="input"
+                  aria-label="role ceiling"
                   value={role()}
                   onChange={(e) => setRole(e.currentTarget.value as TokenRole)}
                 >
@@ -356,13 +357,13 @@ function MintTokenDialog(props: { org: string; onClose: () => void; onMinted: ()
                   moment and takes the lower of the two. You cannot mint above your own
                   role in this scope.
                 </p>
-              </div>
+              </FormSection>
 
-              <div class="form-r">
-                <label>expires in</label>
+              <FormSection n={4} title="Expires in">
                 <div class="tok-life">
                   <input
-                    class="input tok-days"
+                    class="input mono tok-days"
+                    aria-label="expires in (days)"
                     type="number"
                     min="1"
                     max={MAX_TOKEN_DAYS}
@@ -387,8 +388,7 @@ function MintTokenDialog(props: { org: string; onClose: () => void; onMinted: ()
                   carries no verb and never expires is the one shape this system does not
                   mint.
                 </p>
-              </div>
-
+              </FormSection>
             </div>
           }
         >
@@ -403,6 +403,12 @@ function MintTokenDialog(props: { org: string; onClose: () => void; onMinted: ()
                 </span>
               </p>
               <code class="tok-secret mono">{m().token}</code>
+            </div>
+          )}
+        </Show>
+        <Show when={minted()}>
+          {(m) => (
+            <div class="modal-foot">
               <div class="modal-actions">
                 <button class="btn btn-primary" onClick={copy}>
                   {copied() ? "Copied" : "Copy token"}
@@ -424,8 +430,8 @@ function MintTokenDialog(props: { org: string; onClose: () => void; onMinted: ()
           )}
         </Show>
 
-        {/* Pinned below the scrolling fields — and gone entirely once the token
-            exists, because at that point the only actions are the reveal's own. */}
+        {/* Pinned below the scrolling fields; once the token exists the footer
+            above carries the reveal's own actions instead. */}
         <Show when={!minted()}>
           <div class="modal-foot">
             <Show when={lifetimeProblem()}>

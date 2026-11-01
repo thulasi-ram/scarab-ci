@@ -550,7 +550,7 @@ function YankDialog(props: {
 
   return (
     <div class="modal-scrim" onClick={props.onClose}>
-      <div class="modal" style={{ width: "min(580px, 94vw)" }} onClick={(e) => e.stopPropagation()}>
+      <div class="modal modal-wide" onClick={(e) => e.stopPropagation()}>
         <div class="panel-h">
           <span>
             <Icon icon="ban" size={13} /> Yank lib:{l().publisher}/{l().name} {shortHash(l().content_hash)}
@@ -599,18 +599,17 @@ function YankDialog(props: {
               </li>
             </ul>
             <Show when={runs().length > 0}>
-              <label class="yk-cancel">
-                <input type="checkbox" checked={cancel()} onChange={(e) => setCancel(e.currentTarget.checked)} />{" "}
-                Cancel {runs().length === 1 ? "this Run" : `these ${runs().length} Runs`} now
+              <label class="checkbox-inline">
+                <input type="checkbox" checked={cancel()} onChange={(e) => setCancel(e.currentTarget.checked)} />
+                <span>Cancel {runs().length === 1 ? "this Run" : `these ${runs().length} Runs`} now</span>
               </label>
             </Show>
           </div>
-          <div>
+          <div class="form-r">
             <label>reason (shown with every refusal)</label>
             <textarea
               class="input"
               rows={3}
-              style={{ width: "100%", "font-family": "var(--font-ui)" }}
               value={reason()}
               onInput={(e) => setReason(e.currentTarget.value)}
               ref={(el) => queueMicrotask(() => el.focus())}
@@ -622,16 +621,20 @@ function YankDialog(props: {
           </div>
           <Show when={l().update}>
             {(u) => (
-              <label class="yk-cancel">
-                <input type="checkbox" checked={upgrade()} onChange={(e) => setUpgrade(e.currentTarget.checked)} />{" "}
-                then review the upgrade to <span class="lib-hash">{shortHash(u().content_hash)}</span> (
-                {u().release}; asks for your passkey)
+              <label class="checkbox-inline">
+                <input type="checkbox" checked={upgrade()} onChange={(e) => setUpgrade(e.currentTarget.checked)} />
+                <span>
+                  then review the upgrade to <span class="lib-hash">{shortHash(u().content_hash)}</span> (
+                  {u().release}; asks for your passkey)
+                </span>
               </label>
             )}
           </Show>
           <Show when={error()}>
             <p class="error">{error()}</p>
           </Show>
+        </div>
+        <div class="modal-foot">
           <div class="modal-actions">
             <button class="btn btn-danger" disabled={busy() || reason().trim() === ""} onClick={() => void submit()}>
               <Icon icon="ban" size={14} /> {busy() ? "Yanking…" : yankButtonLabel(cancel(), runs().length)}

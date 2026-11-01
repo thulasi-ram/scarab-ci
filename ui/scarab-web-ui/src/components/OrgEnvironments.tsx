@@ -216,7 +216,7 @@ function CreateDialog(props: {
         <div class="panel-h">
           <span>New environment</span>
         </div>
-        <div class="modal-body token-form">
+        <div class="modal-body">
           <div class="form-r">
             <label for="new-env-name">name</label>
             <input

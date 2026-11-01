@@ -80,7 +80,7 @@ function StepUpModal(props: {
   return (
     <div class="modal-scrim" onClick={() => !busy() && props.settle(false)}>
       <div
-        class="modal step-up-modal"
+        class="modal modal-wide"
         role="dialog"
         aria-modal="true"
         aria-labelledby="step-up-title"
@@ -130,7 +130,8 @@ function StepUpModal(props: {
           <Show when={error()}>
             <p class="error">{error()}</p>
           </Show>
-
+        </div>
+        <div class="modal-foot">
           <div class="modal-actions">
             <Show when={canConfirm()}>
               <button class="btn btn-primary" disabled={busy()} onClick={confirm} autofocus>

@@ -50,6 +50,7 @@ import { decodeParam } from "../settings-nav";
 import { SettingsCrumbs, SettingsFrame, type Crumb } from "./Settings";
 import { absTime, relTime } from "../fmt";
 import PrincipalSearch from "../components/PrincipalSearch";
+import FormSection from "../components/FormSection";
 import Icon from "../components/Icon";
 
 /**
@@ -483,22 +484,6 @@ function EditForm(props: { org: string; env: OrgEnvironment }) {
 
       <DeleteSection org={props.org} name={props.env.name} />
     </div>
-  );
-}
-
-/** A numbered section of the edit form. */
-function FormSection(props: { n: number; title: string; note?: string; children: JSX.Element }) {
-  return (
-    <section class="env-sec">
-      <h2 class="env-sec-h">
-        <span class="env-sec-n mono">{props.n}</span>
-        {props.title}
-      </h2>
-      <Show when={props.note}>
-        <p class="fieldnote">{props.note}</p>
-      </Show>
-      <div class="env-sec-body">{props.children}</div>
-    </section>
   );
 }
 

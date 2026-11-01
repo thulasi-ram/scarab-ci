@@ -169,7 +169,7 @@ export function NewSecretDialog(props: {
             <label>name</label>
             <input
               ref={nameRef}
-              class="input"
+              class="input mono"
               placeholder="NAME"
               value={name()}
               onInput={(e) => setName(e.currentTarget.value)}
@@ -178,7 +178,7 @@ export function NewSecretDialog(props: {
           <div class="form-r">
             <label>value</label>
             <input
-              class="input"
+              class="input mono"
               type="password"
               placeholder="value (write-only)"
               value={value()}
@@ -186,7 +186,7 @@ export function NewSecretDialog(props: {
             />
           </div>
           <Show when={exists()}>
-            <label class="secret-overwrite">
+            <label class="checkbox-inline secret-overwrite">
               <input
                 type="checkbox"
                 checked={overwrite()}
@@ -200,6 +200,8 @@ export function NewSecretDialog(props: {
           <Show when={error()}>
             <p class="error">{error()}</p>
           </Show>
+        </div>
+        <div class="modal-foot">
           <div class="modal-actions">
             <button
               class="btn btn-primary"
