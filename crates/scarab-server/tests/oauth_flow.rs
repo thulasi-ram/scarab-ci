@@ -655,6 +655,42 @@ async fn a_login_on_another_loopback_name_goes_to_the_ui_url_first() {
     }
 }
 
+/// The detour is between loopback names only. A production UI URL
+/// (`https://…`) reached through a port-forward on `127.0.0.1` must not send
+/// the browser to the production host: the login starts where it was asked.
+#[tokio::test]
+async fn a_login_on_loopback_is_not_sent_to_a_non_loopback_ui_url() {
+    let p = provider(None).await;
+    for app in [
+        app_with(&p, vec![], false, |st| {
+            st.with_ui_url("https://ci.example.com")
+        }),
+        // No UI URL: the public URL, https://scarab.example.com.
+        app_for(&p, vec![], false),
+    ] {
+        for host in ["127.0.0.1:8080", "localhost:8080"] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/v1/auth/login")
+                        .header("host", host)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::FOUND, "{host}");
+            let location = resp.headers()["location"].to_str().unwrap();
+            assert!(
+                location.starts_with(&format!("{}/authorize?", p.base)),
+                "{host}: {location}"
+            );
+            assert!(cookie_from(&resp, "scarab_oauth_state").is_some(), "{host}");
+        }
+    }
+}
+
 /// RFC 6749 §4.1.3: an authorize request that carried `redirect_uri` obliges
 /// the token request to carry the same one. GitHub lets it slide; Authentik
 /// answers `invalid_client`, which surfaced as a bare 401 on every login. The

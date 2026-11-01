@@ -230,10 +230,17 @@ pub enum AdminCommand {
     /// seeding a fresh install (the first members of a staging stack).
     /// Needs only `--database-url` / `SCARAB_DATABASE_URL`; never migrates.
     /// The principal must exist (it signed in once, or a forge import
-    /// created it). Idempotent: a principal that already holds the role in
-    /// the Org is left as it is and nothing is recorded. Otherwise the grant
-    /// is a native binding, recorded in the OrgSecurityEventLog as
-    /// `binding.operator_grant` with this host, OS user and reason.
+    /// created it); exit 3 when it does not.
+    ///
+    /// Sets the role exactly: a higher role is lowered, a revoked binding is
+    /// restored, and a role a forge import gave becomes a native binding. A
+    /// principal that already holds the role as a native binding is left as
+    /// it is and nothing is recorded. With `--if-absent`, nothing is written
+    /// when the principal has any binding in the Org (a revoked one
+    /// included), so a seed script run again leaves an Owner's changes
+    /// alone. A grant is a native binding, recorded in the
+    /// OrgSecurityEventLog as `binding.operator_grant` with this host, OS
+    /// user and reason, in the same transaction.
     Grant {
         /// The Org.
         #[arg(long)]
@@ -245,6 +252,11 @@ pub enum AdminCommand {
         /// viewer, member, admin or owner.
         #[arg(long)]
         role: String,
+        /// Write only when the principal has no binding in the Org at all
+        /// (at the Org or a Project, revoked included); otherwise print what
+        /// is there and exit 0.
+        #[arg(long)]
+        if_absent: bool,
         /// Why — recorded with the grant.
         #[arg(long)]
         reason: Option<String>,
@@ -4240,10 +4252,33 @@ connections:
                     org: "acme".into(),
                     subject: "github:alice".into(),
                     role: "member".into(),
+                    if_absent: false,
                     reason: Some("staging seed".into()),
                 }
             })
         );
+        let seeded = Cli::try_parse_from([
+            "scarab-server",
+            "admin",
+            "grant",
+            "--org",
+            "acme",
+            "--subject",
+            "github:alice",
+            "--role",
+            "member",
+            "--if-absent",
+        ])
+        .unwrap();
+        assert!(matches!(
+            seeded.command,
+            Some(ServerCommand::Admin {
+                command: AdminCommand::Grant {
+                    if_absent: true,
+                    ..
+                }
+            })
+        ));
         for missing in [
             ["--org", "acme", "--subject", "github:alice"],
             ["--org", "acme", "--role", "member"],

@@ -26,10 +26,10 @@ use axum::{Extension, Json};
 use serde::Serialize;
 use utoipa::ToSchema;
 
-use scarab_db_postgres::PostgresDb;
+use scarab_db_postgres::{BindingRow, PostgresDb};
 use scarab_identity::{
-    security_event_kind as kind, Action, Binding, BindingOrigin, PasskeyStore, RbacStore, Role,
-    Scope, SecurityEventLog, StepUpStore,
+    security_event_kind as kind, Action, Binding, PasskeyStore, Role, Scope, SecurityEventLog,
+    StepUpStore,
 };
 
 use super::ceremony::service;
@@ -323,34 +323,53 @@ pub const NO_PRINCIPAL: &str = "no principal";
 /// What [`grant_role`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OperatorGrant {
-    /// The principal already held exactly this role in the Org: nothing
-    /// written, nothing recorded.
+    /// The principal already held exactly this role in the Org as a native
+    /// binding: nothing written, nothing recorded.
     Unchanged { subject: String },
-    /// The binding was written and recorded. `previous` is the Org-scoped
-    /// role it replaced, if any.
+    /// The binding was written and recorded. `previous` is the Org-scope row
+    /// it replaced, if any: a role, a revoked row (role `None`), or a role a
+    /// forge import gave (origin `import`, now `native`).
     Granted {
         subject: String,
-        previous: Option<String>,
+        previous: Option<BindingRow>,
+    },
+    /// `--if-absent`, and the principal has a binding row in the Org (at the
+    /// Org or at a Project, revoked rows included): nothing written, nothing
+    /// recorded. `rows` is what is there.
+    Exists {
+        subject: String,
+        rows: Vec<BindingRow>,
     },
 }
 
 /// The operator grant (`scarab-server admin grant`): give `subject` `role`
 /// in `org` as a native binding, for seeding a fresh install's first members
 /// without a browser. Records `binding.operator_grant` in the Org's security
-/// event log (caller `operator:grant`, with the host, OS user and reason)
-/// before it writes, and writes nothing it could not record.
+/// event log (caller `operator:grant`, with the host, OS user and reason) in
+/// the same transaction as the binding: both land or neither does.
 ///
-/// Idempotent: a principal already holding exactly `role` at the Org scope
-/// is [`Unchanged`](OperatorGrant::Unchanged), and nothing is recorded.
+/// Without `if_absent` the role is set exactly: a higher role is lowered, a
+/// revoked binding is restored, and a role a forge import gave becomes a
+/// native binding (so a later forge sync cannot remove it). A principal that
+/// already holds exactly `role` as a native binding is
+/// [`Unchanged`](OperatorGrant::Unchanged), and nothing is recorded.
+///
+/// With `if_absent` it writes only when the principal has no binding row in
+/// the Org at all: not at the Org scope, not at any Project, not a revoked
+/// one. Otherwise it is [`Exists`](OperatorGrant::Exists) and nothing is
+/// written: a seed script run again never undoes what an Owner changed.
+///
 /// Refuses an unknown role, an invalid org name, a database whose schema
 /// predates the event log (it never migrates), and an id no Principal was
 /// ever minted for — granting to one would hand the role to whoever next
 /// signs in with that id (ADR-0069 §3).
+#[allow(clippy::too_many_arguments)]
 pub async fn grant_role(
     db: &PostgresDb,
     org: &str,
     subject: &str,
     role: &str,
+    if_absent: bool,
     reason: Option<&str>,
     operator: &OperatorInfo,
     now_ms: i64,
@@ -395,15 +414,17 @@ pub async fn grant_role(
                  a role can name them"
             )
         })?;
-    let scope = Scope::Org(org.to_string());
-    let previous = RbacStore::bindings(db, org)
-        .await
-        .map_err(|e| format!("could not read the bindings of `{org}`: {e}"))?
-        .into_iter()
-        .find(|b| b.subject == resolved && b.scope == scope)
-        .map(|b| b.role);
-    if previous == Some(role) {
-        return Ok(OperatorGrant::Unchanged { subject: resolved });
+    let rows = || async {
+        db.binding_rows(&resolved, org)
+            .await
+            .map_err(|e| format!("could not read the bindings of `{resolved}` in `{org}`: {e}"))
+    };
+    let existing = rows().await?;
+    if if_absent && !existing.is_empty() {
+        return Ok(OperatorGrant::Exists {
+            subject: resolved,
+            rows: existing,
+        });
     }
     let name = |r: Role| match r {
         Role::Viewer => "viewer",
@@ -411,6 +432,12 @@ pub async fn grant_role(
         Role::Admin => "admin",
         Role::Owner => "owner",
     };
+    let previous = existing.into_iter().find(|r| r.project.is_empty());
+    if let Some(p) = &previous {
+        if p.role.as_deref() == Some(name(role)) && p.origin == "native" {
+            return Ok(OperatorGrant::Unchanged { subject: resolved });
+        }
+    }
     let mut ev = event(
         kind::BINDING_OPERATOR_GRANT,
         &resolved,
@@ -423,33 +450,38 @@ pub async fn grant_role(
     ev.detail = serde_json::json!({
         "requested": subject,
         "role": name(role),
-        "previous": previous.map(name),
+        "previous": previous.as_ref().and_then(|p| p.role.clone()),
+        "previous_origin": previous.as_ref().map(|p| p.origin.clone()),
+        "if_absent": if_absent,
         "reason": reason,
         "host": operator.host,
         "os_user": operator.os_user,
     });
-    SecurityEventLog::append(db, &ev).await.map_err(|e| {
-        format!(
-            "the grant could not be recorded in the security event log, so nothing was \
-             granted: {e}"
-        )
-    })?;
-    scarab_forge::ForgeConnectionStore::record_org(db, org)
+    let binding = Binding {
+        subject: resolved.clone(),
+        scope: Scope::Org(org.to_string()),
+        role,
+    };
+    let written = db
+        .operator_grant(&ev, &binding, if_absent)
         .await
-        .map_err(|e| format!("could not record the org `{org}`: {e}"))?;
-    RbacStore::grant(
-        db,
-        &Binding {
-            subject: resolved.clone(),
-            scope,
-            role,
-        },
-        BindingOrigin::Native,
-    )
-    .await
-    .map_err(|e| format!("could not grant `{resolved}` {} in `{org}`: {e}", name(role)))?;
+        .map_err(|e| {
+            format!(
+                "could not grant `{resolved}` {} in `{org}`; nothing was granted or \
+                 recorded: {e}",
+                name(role)
+            )
+        })?;
+    if !written {
+        // A row appeared between the read and the write (an Owner acted in
+        // the UI meanwhile): leave it, as `--if-absent` promises.
+        return Ok(OperatorGrant::Exists {
+            rows: rows().await?,
+            subject: resolved,
+        });
+    }
     Ok(OperatorGrant::Granted {
         subject: resolved,
-        previous: previous.map(|r| name(r).to_string()),
+        previous,
     })
 }

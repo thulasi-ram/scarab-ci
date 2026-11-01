@@ -19,10 +19,10 @@ use axum::http::StatusCode;
 use serde_json::{json, Value};
 
 use common::fresh_db;
-use scarab_db_postgres::PostgresDb;
+use scarab_db_postgres::{BindingRow, PostgresDb};
 use scarab_identity::{
-    api_token_hash, ApiToken, ApiTokenStore, IdentityStore, PasskeyStore, ProviderIdentity,
-    RbacStore, Role, Scope, SecurityEventFilter, SecurityEventLog, StepUpStore,
+    api_token_hash, ApiToken, ApiTokenStore, Binding, BindingOrigin, IdentityStore, PasskeyStore,
+    ProviderIdentity, RbacStore, Role, Scope, SecurityEventFilter, SecurityEventLog, StepUpStore,
 };
 use scarab_server::step_up::admin::{
     grant_role, reset_passkeys, OperatorGrant, OperatorInfo, NO_PRINCIPAL,
@@ -1083,9 +1083,18 @@ async fn the_operator_grant_is_idempotent_and_recorded() {
     };
 
     // Nobody signed in as bob: refused, nothing bound, nothing recorded.
-    let err = grant_role(&pg, "acme", "github:bob", "member", None, &operator, T0)
-        .await
-        .unwrap_err();
+    let err = grant_role(
+        &pg,
+        "acme",
+        "github:bob",
+        "member",
+        false,
+        None,
+        &operator,
+        T0,
+    )
+    .await
+    .unwrap_err();
     assert!(err.starts_with(NO_PRINCIPAL), "{err}");
     assert!(err.contains("sign in"), "{err}");
     assert_eq!(
@@ -1093,9 +1102,18 @@ async fn the_operator_grant_is_idempotent_and_recorded() {
         None
     );
     // An unknown role is refused before anything is read.
-    let err = grant_role(&pg, "acme", "github:alice", "root", None, &operator, T0)
-        .await
-        .unwrap_err();
+    let err = grant_role(
+        &pg,
+        "acme",
+        "github:alice",
+        "root",
+        false,
+        None,
+        &operator,
+        T0,
+    )
+    .await
+    .unwrap_err();
     assert!(err.contains("unknown role"), "{err}");
     assert!(grants().await.is_empty());
 
@@ -1105,6 +1123,7 @@ async fn the_operator_grant_is_idempotent_and_recorded() {
         "acme",
         "github:alice",
         "member",
+        false,
         Some("staging seed"),
         &operator,
         T0,
@@ -1135,9 +1154,18 @@ async fn the_operator_grant_is_idempotent_and_recorded() {
     assert_eq!(e.detail["os_user"], "ops");
 
     // Again: unchanged, and not recorded a second time.
-    let again = grant_role(&pg, "acme", "github:alice", "member", None, &operator, T0)
-        .await
-        .unwrap();
+    let again = grant_role(
+        &pg,
+        "acme",
+        "github:alice",
+        "member",
+        false,
+        None,
+        &operator,
+        T0,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         again,
         OperatorGrant::Unchanged {
@@ -1147,14 +1175,27 @@ async fn the_operator_grant_is_idempotent_and_recorded() {
     assert_eq!(grants().await.len(), 1);
 
     // A different role replaces it, and says what it replaced.
-    let up = grant_role(&pg, "acme", "github:alice", "admin", None, &operator, T0)
-        .await
-        .unwrap();
+    let up = grant_role(
+        &pg,
+        "acme",
+        "github:alice",
+        "admin",
+        false,
+        None,
+        &operator,
+        T0,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         up,
         OperatorGrant::Granted {
             subject: "github:alice".into(),
-            previous: Some("member".into())
+            previous: Some(BindingRow {
+                project: String::new(),
+                role: Some("member".into()),
+                origin: "native".into(),
+            })
         }
     );
     assert_eq!(
@@ -1164,6 +1205,325 @@ async fn the_operator_grant_is_idempotent_and_recorded() {
     let events = grants().await;
     assert_eq!(events.len(), 2);
     assert_eq!(events[0].detail["previous"], "member", "newest first");
+
+    // Without --if-absent the role is set exactly: an admin is lowered.
+    let down = grant_role(
+        &pg,
+        "acme",
+        "github:alice",
+        "member",
+        false,
+        None,
+        &operator,
+        T0,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(down, OperatorGrant::Granted { .. }), "{down:?}");
+    assert_eq!(
+        RbacStore::role_of(pg.as_ref(), "github:alice", &acme)
+            .await
+            .unwrap(),
+        Some(Role::Member)
+    );
+    tdb.cleanup().await;
+}
+
+/// `login` signed in once through the `github` provider: a Principal
+/// `github:<login>` exists.
+async fn signed_in(pg: &PostgresDb, login: &str, external_id: &str) -> String {
+    IdentityStore::sign_in(
+        pg,
+        &ProviderIdentity {
+            provider: "github".into(),
+            external_id: external_id.into(),
+            handle: login.into(),
+            email: None,
+            email_verified: false,
+            display_name: None,
+        },
+        &format!("github:{login}"),
+        T0,
+    )
+    .await
+    .unwrap()
+}
+
+fn operator() -> OperatorInfo {
+    OperatorInfo {
+        host: "laptop".into(),
+        os_user: "ops".into(),
+    }
+}
+
+async fn operator_grants(pg: &PostgresDb) -> usize {
+    SecurityEventLog::list(
+        pg,
+        &SecurityEventFilter {
+            kinds: vec!["binding.operator_grant".into()],
+            limit: 50,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap()
+    .len()
+}
+
+/// `--if-absent` (what deploy/kind/seed.sh runs on every `just stack up
+/// dogfood`): it writes only when the principal has no binding row in the
+/// Org, so an Owner who promoted someone, revoked them, or bound them to one
+/// Project keeps that change. Nothing is written or recorded in those cases.
+#[tokio::test]
+async fn the_if_absent_grant_leaves_existing_bindings_alone() {
+    let Some((tdb, pg)) = pg().await else { return };
+    let op = operator();
+    let acme = Scope::Org("acme".into());
+    let alice = signed_in(&pg, "alice", "7").await;
+    let bob = signed_in(&pg, "bob", "8").await;
+    let carol = signed_in(&pg, "carol", "9").await;
+
+    // Absent: written and recorded.
+    let first = grant_role(&pg, "acme", &alice, "member", true, None, &op, T0)
+        .await
+        .unwrap();
+    assert_eq!(
+        first,
+        OperatorGrant::Granted {
+            subject: alice.clone(),
+            previous: None
+        }
+    );
+    assert_eq!(operator_grants(&pg).await, 1);
+
+    // The Owner promotes alice in the UI; the seed runs again.
+    RbacStore::grant(
+        pg.as_ref(),
+        &Binding {
+            subject: alice.clone(),
+            scope: acme.clone(),
+            role: Role::Admin,
+        },
+        BindingOrigin::Native,
+    )
+    .await
+    .unwrap();
+    let again = grant_role(&pg, "acme", &alice, "member", true, None, &op, T0)
+        .await
+        .unwrap();
+    assert!(
+        matches!(&again, OperatorGrant::Exists { rows, .. }
+            if rows.len() == 1 && rows[0].role.as_deref() == Some("admin")),
+        "{again:?}"
+    );
+    assert_eq!(
+        RbacStore::role_of(pg.as_ref(), &alice, &acme)
+            .await
+            .unwrap(),
+        Some(Role::Admin),
+        "the promotion stays"
+    );
+
+    // The Owner removed bob: a revoked row. The seed does not restore him.
+    RbacStore::revoke(pg.as_ref(), &bob, &acme).await.unwrap();
+    let revoked = grant_role(&pg, "acme", &bob, "member", true, None, &op, T0)
+        .await
+        .unwrap();
+    assert!(
+        matches!(&revoked, OperatorGrant::Exists { rows, .. }
+            if rows.len() == 1 && rows[0].role.is_none()),
+        "{revoked:?}"
+    );
+    assert_eq!(
+        RbacStore::role_of(pg.as_ref(), &bob, &acme).await.unwrap(),
+        None
+    );
+
+    // carol holds a role in one Project only: that is a binding in the Org.
+    RbacStore::grant(
+        pg.as_ref(),
+        &Binding {
+            subject: carol.clone(),
+            scope: Scope::Project {
+                org: "acme".into(),
+                name: "web".into(),
+            },
+            role: Role::Viewer,
+        },
+        BindingOrigin::Native,
+    )
+    .await
+    .unwrap();
+    let project = grant_role(&pg, "acme", &carol, "member", true, None, &op, T0)
+        .await
+        .unwrap();
+    assert!(
+        matches!(&project, OperatorGrant::Exists { rows, .. }
+            if rows.len() == 1 && rows[0].project == "web"),
+        "{project:?}"
+    );
+    assert_eq!(
+        RbacStore::role_of(pg.as_ref(), &carol, &acme)
+            .await
+            .unwrap(),
+        None
+    );
+
+    assert_eq!(
+        operator_grants(&pg).await,
+        1,
+        "nothing recorded after the first"
+    );
+    tdb.cleanup().await;
+}
+
+/// A role a forge import gave (origin `import`). A plain grant of the same
+/// role makes it a native binding and records it, rather than reporting
+/// "unchanged": an import row is the forge sync's to change, so the operator
+/// would otherwise lose the role on the next sync. `--if-absent` leaves it as
+/// it is, like any other row.
+#[tokio::test]
+async fn a_grant_over_an_imported_role_makes_it_native() {
+    let Some((tdb, pg)) = pg().await else { return };
+    let op = operator();
+    let dave = signed_in(&pg, "dave", "10").await;
+    RbacStore::grant(
+        pg.as_ref(),
+        &Binding {
+            subject: dave.clone(),
+            scope: Scope::Org("acme".into()),
+            role: Role::Member,
+        },
+        BindingOrigin::Import,
+    )
+    .await
+    .unwrap();
+    let imported = BindingRow {
+        project: String::new(),
+        role: Some("member".into()),
+        origin: "import".into(),
+    };
+
+    let seeded = grant_role(&pg, "acme", &dave, "member", true, None, &op, T0)
+        .await
+        .unwrap();
+    assert_eq!(
+        seeded,
+        OperatorGrant::Exists {
+            subject: dave.clone(),
+            rows: vec![imported.clone()]
+        }
+    );
+    assert_eq!(operator_grants(&pg).await, 0);
+
+    let granted = grant_role(&pg, "acme", &dave, "member", false, None, &op, T0)
+        .await
+        .unwrap();
+    assert_eq!(
+        granted,
+        OperatorGrant::Granted {
+            subject: dave.clone(),
+            previous: Some(imported)
+        }
+    );
+    assert_eq!(
+        pg.binding_rows(&dave, "acme").await.unwrap(),
+        vec![BindingRow {
+            project: String::new(),
+            role: Some("member".into()),
+            origin: "native".into(),
+        }]
+    );
+    assert_eq!(operator_grants(&pg).await, 1);
+    // Now native at that role: unchanged.
+    let again = grant_role(&pg, "acme", &dave, "member", false, None, &op, T0)
+        .await
+        .unwrap();
+    assert_eq!(again, OperatorGrant::Unchanged { subject: dave });
+    tdb.cleanup().await;
+}
+
+/// The event, the org and the binding are one transaction: when the binding
+/// write fails, the log does not show a grant that was not made.
+#[tokio::test]
+async fn a_failed_operator_grant_records_nothing() {
+    let Some((tdb, pg)) = pg().await else { return };
+    let alice = signed_in(&pg, "alice", "7").await;
+    sqlx::query(
+        "CREATE FUNCTION refuse_binding() RETURNS trigger LANGUAGE plpgsql AS
+         $$ BEGIN RAISE EXCEPTION 'refused by the test'; END $$",
+    )
+    .execute(&tdb.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER refuse_binding BEFORE INSERT ON rbac_bindings
+         FOR EACH ROW EXECUTE FUNCTION refuse_binding()",
+    )
+    .execute(&tdb.pool)
+    .await
+    .unwrap();
+
+    let err = grant_role(&pg, "acme", &alice, "member", false, None, &operator(), T0)
+        .await
+        .unwrap_err();
+    assert!(err.contains("refused by the test"), "{err}");
+    assert!(err.contains("nothing was granted or recorded"), "{err}");
+    assert_eq!(
+        operator_grants(&pg).await,
+        0,
+        "the event rolled back with the binding"
+    );
+    let orgs: i64 = sqlx::query_scalar("SELECT count(*) FROM orgs WHERE name = 'acme'")
+        .fetch_one(&tdb.pool)
+        .await
+        .unwrap();
+    assert_eq!(orgs, 0, "the org rolled back too");
+    tdb.cleanup().await;
+}
+
+/// `scarab-server admin grant` exits 3 for a principal that never signed in
+/// (deploy/kind/seed.sh reads that as "ask them to sign in"), 0 for a grant
+/// and for an `--if-absent` that found a binding, and 1 for other refusals.
+#[tokio::test]
+async fn the_grant_command_exits_3_for_someone_who_never_signed_in() {
+    let Some((tdb, pg)) = pg().await else { return };
+    let alice = signed_in(&pg, "alice", "7").await;
+    let url = tdb.url();
+    let run = |subject: &str, role: &str, extra: &[&str]| {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_scarab-server"))
+            .env("SCARAB_DATABASE_URL", &url)
+            .args(["admin", "grant", "--org", "acme", "--subject", subject])
+            .args(["--role", role])
+            .args(extra)
+            .output()
+            .expect("run scarab-server");
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+
+    let (code, _, stderr) = run("github:nobody", "member", &[]);
+    assert_eq!(code, Some(3), "{stderr}");
+    assert!(stderr.contains("sign in"), "{stderr}");
+
+    let (code, _, stderr) = run(&alice, "root", &[]);
+    assert_eq!(code, Some(1), "{stderr}");
+
+    let (code, stdout, stderr) = run(&alice, "member", &["--if-absent"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stdout.contains("now holds member"), "{stdout}");
+    let (code, stdout, stderr) = run(&alice, "owner", &["--if-absent"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stdout.contains("member in acme (native)"), "{stdout}");
+    assert_eq!(
+        RbacStore::role_of(pg.as_ref(), &alice, &Scope::Org("acme".into()))
+            .await
+            .unwrap(),
+        Some(Role::Member)
+    );
     tdb.cleanup().await;
 }
 

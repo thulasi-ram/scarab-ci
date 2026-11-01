@@ -166,6 +166,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 org,
                 subject,
                 role,
+                if_absent,
                 reason,
             },
     }) = &cli.command
@@ -185,6 +186,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             org,
             subject,
             role,
+            *if_absent,
             reason.as_deref(),
             &operator,
             now,
@@ -196,12 +198,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
             Ok(scarab_server::step_up::admin::OperatorGrant::Granted { subject, previous }) => {
+                let was = match &previous {
+                    None => "no role".to_string(),
+                    Some(p) => match (&p.role, p.origin.as_str()) {
+                        (None, _) => "revoked".to_string(),
+                        (Some(r), "import") => format!("{r}, from a forge import"),
+                        (Some(r), _) => r.clone(),
+                    },
+                };
                 println!(
-                    "grant: `{subject}` now holds {role} in {org} (was {}); recorded as \
+                    "grant: `{subject}` now holds {role} in {org} (was {was}); recorded as \
                      binding.operator_grant (host {}, user {}).",
-                    previous.as_deref().unwrap_or("no role"),
-                    operator.host,
-                    operator.os_user
+                    operator.host, operator.os_user
+                );
+                return Ok(());
+            }
+            Ok(scarab_server::step_up::admin::OperatorGrant::Exists { subject, rows }) => {
+                let held: Vec<String> = rows
+                    .iter()
+                    .map(|r| {
+                        let scope = if r.project.is_empty() {
+                            org.clone()
+                        } else {
+                            format!("{org}/{}", r.project)
+                        };
+                        match &r.role {
+                            Some(role) => format!("{role} in {scope} ({})", r.origin),
+                            None => format!("revoked in {scope}"),
+                        }
+                    })
+                    .collect();
+                println!(
+                    "grant: `{subject}` already has a binding in {org}: {}; --if-absent, so \
+                     nothing changed.",
+                    held.join(", ")
                 );
                 return Ok(());
             }

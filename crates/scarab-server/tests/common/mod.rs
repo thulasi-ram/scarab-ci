@@ -21,6 +21,13 @@ pub struct TestDb {
 }
 
 impl TestDb {
+    /// The connection URL of this database, for a test that runs the
+    /// `scarab-server` binary against it.
+    #[allow(dead_code)]
+    pub fn url(&self) -> String {
+        swap_db(&self.admin_url, &self.dbname)
+    }
+
     /// Drop the throwaway database. Call at the end of a test.
     pub async fn cleanup(self) {
         self.pool.close().await;
