@@ -59,6 +59,7 @@ fn pod(uid: &str, step: &str, start: i64, end: i64) -> PodRecord {
                 exit_code: Some(0),
                 restarts: 0,
             }],
+            grace_secs: Some(30),
         },
     }
 }

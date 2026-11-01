@@ -11,7 +11,7 @@
 //! | id   | invariant (ADR-0077 §2) |
 //! |------|-------------------------|
 //! | I1a  | at most one Pod UID per Attempt |
-//! | I1b  | Attempt N+1's step container starts after Attempt N's ended, or after N was journalled finished or superseded (only the journal counts for an N whose step container was never seen) |
+//! | I1b  | Attempt N+1's step container starts after Attempt N's ended, or after N was journalled finished or superseded or N's Pod was gone (only the journal counts for an N whose step container was never seen); an overlap after that is allowed until N's container has run the Pod's `terminationGracePeriodSeconds` + 30 s past its Pod's removal, and fails past it |
 //! | I1c  | no double execution: per Step at most one succeeded Attempt, one `AttemptStarted` and one `AttemptFinished` per journalled Attempt (with an `attempts` row or not), and a Succeeded Step's evidence Attempt is that one |
 //! | T1   | exactly one terminal `RunTransitioned` per Run, matching `runs.status` |
 //! | I3   | every scenario Run terminal within the quiesce bound, and none left with `creating = TRUE` |
@@ -263,6 +263,47 @@ fn status_token(to: &str) -> String {
     }
 }
 
+/// I1b's slack (ADR-0077 open question 1, answered 2026-11-01): Attempt N's
+/// step container may still run this long past its Pod's
+/// `terminationGracePeriodSeconds`, counted from the Pod's removal, while
+/// Attempt N+1 runs.
+pub const I1B_SLACK_SECS: i64 = 30;
+
+/// The Kubernetes default `terminationGracePeriodSeconds`, for a Pod record
+/// written before the watcher recorded it.
+pub const DEFAULT_GRACE_SECS: i64 = 30;
+
+/// What the watcher saw of one Attempt's Pod object going away.
+#[derive(Debug, Clone, Default)]
+struct PodLife {
+    /// First record with a `deletionTimestamp`, or of the object gone.
+    removal_ms: Option<i64>,
+    /// First record of the object gone (`deleted`).
+    gone_ms: Option<i64>,
+    grace_secs: Option<i64>,
+}
+
+/// I1b's bound for an Attempt N whose step container overlapped N+1's:
+/// `Some((until, anchor, bound_ms))` when N's container was seen running
+/// later than `anchor + bound_ms`, else `None`.
+///
+/// The owner's rule counts the bound from N's Pod object being gone. The
+/// watcher sees a container only through its Pod object, so once the object
+/// is gone nothing more is seen and a bound counted from there could never
+/// fail. The anchor is therefore the first sign of removal (the
+/// `deletionTimestamp`, or the object gone if no record carried one), which
+/// is never later than the object gone; a Pod that was never removed is
+/// counted from N+1's start. `until` is N's container finish, else the
+/// moment its object was gone (the last moment it could be seen), else the
+/// last record of the run (it was still running when recording stopped).
+fn i1b_overrun(life: &PodLife, end: Option<i64>, start_b: i64, last_record_ms: i64) -> Option<(i64, i64, i64)> {
+    let grace = life.grace_secs.unwrap_or(DEFAULT_GRACE_SECS);
+    let bound_ms = (grace + I1B_SLACK_SECS) * 1000;
+    let anchor = life.removal_ms.unwrap_or(start_b);
+    let until = end.or(life.gone_ms).unwrap_or(last_record_ms);
+    (until > anchor + bound_ms).then_some((until, anchor, bound_ms))
+}
+
 /// Why `faults` did not exercise `kind`; empty when they did. Each fault must
 /// have fired with its trigger condition still holding and landed inside the
 /// window it names.
@@ -334,13 +375,28 @@ pub fn evaluate(f: &Facts) -> Verdict {
     }
 
     // I1b: step container intervals of consecutive Attempts do not overlap,
-    // unless the earlier one was journalled finished or superseded first.
+    // unless the earlier one was journalled finished or superseded, or its
+    // Pod was gone, before the later one started; and then only within the
+    // bound (`I1B_SLACK_SECS`).
     let mut intervals: BTreeMap<(String, String), BTreeMap<String, Interval>> =
         BTreeMap::new();
+    let mut lives: HashMap<(String, String, String), PodLife> = HashMap::new();
+    let last_record_ms = f.pod_records.iter().map(|r| r.at_ms).max().unwrap_or(0);
     for r in &f.pod_records {
         let (Some(run), Some(step), Some(att)) = (&r.pod.run, &r.pod.step, &r.pod.attempt) else {
             continue;
         };
+        let life = lives.entry((run.clone(), step.clone(), att.clone())).or_default();
+        let gone = r.event == "deleted";
+        if gone {
+            life.gone_ms = Some(life.gone_ms.map_or(r.at_ms, |x| x.min(r.at_ms)));
+        }
+        if gone || r.pod.deleting {
+            life.removal_ms = Some(life.removal_ms.map_or(r.at_ms, |x| x.min(r.at_ms)));
+        }
+        if r.pod.grace_secs.is_some() {
+            life.grace_secs = r.pod.grace_secs;
+        }
         let Some(c) = r.pod.container(pods::STEP_CONTAINER) else { continue };
         let e = intervals
             .entry((run.clone(), step.clone()))
@@ -386,7 +442,7 @@ pub fn evaluate(f: &Facts) -> Verdict {
         for w in atts.windows(2) {
             pairs += 1;
             let ((a, (start_a, end_a)), (b, (start_b, _))) = (w[0], w[1]);
-            let Some(start_b) = start_b else { continue };
+            let Some(start_b) = *start_b else { continue };
             let started_b = seq_of(run, "AttemptStarted", step, b);
             let ended_a = [
                 seq_of(run, "AttemptFinished", step, a),
@@ -395,9 +451,10 @@ pub fn evaluate(f: &Facts) -> Verdict {
             .into_iter()
             .flatten()
             .min();
+            let journalled_ended = matches!((ended_a, started_b), (Some(e), Some(s)) if e < s);
             if start_a.is_none() && end_a.is_none() {
                 // a's step container was never seen: no interval to compare.
-                if !matches!((ended_a, started_b), (Some(e), Some(s)) if e < s) {
+                if !journalled_ended {
                     findings.push(fail(
                         "I1b",
                         format!(
@@ -409,26 +466,44 @@ pub fn evaluate(f: &Facts) -> Verdict {
                 continue;
             }
             let overlaps = match end_a {
-                Some(end) => start_b < end,
+                Some(end) => start_b < *end,
                 // Attempt a's container started and never finished.
                 None => start_a.is_some(),
             };
             if !overlaps {
                 continue;
             }
-            match (ended_a, started_b) {
-                (Some(e), Some(s)) if e < s => findings.push(warn(
-                    "I1b",
-                    format!(
-                        "run {run} step {step}: {b}'s container started while {a}'s was still running, \
-                         after {a} was journalled ended (allowed; the bound is ADR-0077 open question 1)"
-                    ),
-                )),
-                _ => findings.push(fail(
+            let life = lives
+                .get(&(run.clone(), step.clone(), a.clone()))
+                .cloned()
+                .unwrap_or_default();
+            let gone_first = life.gone_ms.is_some_and(|g| g <= start_b);
+            if !journalled_ended && !gone_first {
+                findings.push(fail(
                     "I1b",
                     format!(
                         "run {run} step {step}: {b}'s step container started at {start_b} before {a}'s \
-                         ended ({end_a:?}) and before {a} was journalled ended"
+                         ended ({end_a:?}), before {a} was journalled ended and before {a}'s Pod was gone"
+                    ),
+                ));
+                continue;
+            }
+            match i1b_overrun(&life, *end_a, start_b, last_record_ms) {
+                None => findings.push(warn(
+                    "I1b",
+                    format!(
+                        "run {run} step {step}: {b}'s container started while {a}'s was still running, after \
+                         {a} was journalled ended or its Pod was gone (allowed within the Pod's grace period \
+                         + {I1B_SLACK_SECS} s)"
+                    ),
+                )),
+                Some((until, anchor, bound_ms)) => findings.push(fail(
+                    "I1b",
+                    format!(
+                        "run {run} step {step}: {a}'s step container was seen running until {until}, {} ms \
+                         after its Pod's removal at {anchor}, past the bound of {bound_ms} ms (grace period \
+                         + {I1B_SLACK_SECS} s), while {b} ran",
+                        until - anchor
                     ),
                 )),
             }
@@ -1106,6 +1181,7 @@ mod tests {
                     exit_code: end.map(|_| 0),
                     restarts: 0,
                 }],
+                grace_secs: Some(30),
             },
         }
     }
@@ -1176,6 +1252,66 @@ mod tests {
         // Without the journal entry it is a double effect.
         f.events.retain(|e| event_kind(&e.payload) != "AttemptFinished");
         assert!(failed(&evaluate(&f)).contains(&"I1b"));
+    }
+
+    /// a1 was journalled ended and its Pod marked for deletion at 1 000 with
+    /// a 30 s grace period: the bound is 60 000 ms from there. a2 starts at
+    /// 500. a1's step container finishing at `end` decides the verdict.
+    fn i1b_bound_facts(end: i64) -> Facts {
+        let mut f = base();
+        f.pod_records = vec![pod_rec("u1", "a1", 10, None), pod_rec("u2", "a2", 500, Some(70_000))];
+        let mut deleting = pod_rec("u1", "a1", 10, None);
+        deleting.at_ms = 1_000;
+        deleting.pod.deleting = true;
+        f.pod_records.push(deleting);
+        f.pod_records.push(pod_rec("u1", "a1", 10, Some(end)));
+        f.events.push(ev("r", 5, serde_json::json!({"AttemptStarted": {"step": "s", "attempt": "a2"}})));
+        f
+    }
+
+    #[test]
+    fn i1b_allows_an_overlap_up_to_the_grace_period_plus_30_s_after_removal() {
+        let v = evaluate(&i1b_bound_facts(1_000 + 60_000));
+        assert!(failed(&v).is_empty(), "{:?}", v.findings);
+        assert!(v.findings.iter().any(|x| x.invariant == "I1b" && x.severity == Severity::Warn));
+    }
+
+    #[test]
+    fn i1b_fails_an_overlap_past_the_grace_period_plus_30_s_after_removal() {
+        let v = evaluate(&i1b_bound_facts(1_000 + 60_001));
+        assert_eq!(failed(&v), vec!["I1b"], "{:?}", v.findings);
+        assert!(v.findings[0].detail.contains("past the bound of 60000 ms"), "{}", v.findings[0].detail);
+    }
+
+    /// The bound uses the Pod's own grace period: at 600 s the same overrun
+    /// is within it.
+    #[test]
+    fn i1b_bound_follows_the_pods_grace_period() {
+        let mut f = i1b_bound_facts(1_000 + 60_001);
+        for r in &mut f.pod_records {
+            r.pod.grace_secs = Some(600);
+        }
+        assert!(failed(&evaluate(&f)).is_empty());
+        // A record written before the field existed falls back to 30 s.
+        for r in &mut f.pod_records {
+            r.pod.grace_secs = None;
+        }
+        assert_eq!(failed(&evaluate(&f)), vec!["I1b"]);
+    }
+
+    /// The Pod gone before a2 started allows the start without a journal
+    /// entry; a Pod still there and no journal entry does not.
+    #[test]
+    fn i1b_allows_a_start_after_the_pod_is_gone() {
+        let mut f = i1b_bound_facts(30_000);
+        f.events.retain(|e| event_kind(&e.payload) != "AttemptFinished");
+        assert_eq!(failed(&evaluate(&f)), vec!["I1b"]);
+        let mut gone = pod_rec("u1", "a1", 10, None);
+        gone.at_ms = 400;
+        gone.event = "deleted".into();
+        f.pod_records.push(gone);
+        let v = evaluate(&f);
+        assert!(failed(&v).is_empty(), "{:?}", v.findings);
     }
 
     #[test]

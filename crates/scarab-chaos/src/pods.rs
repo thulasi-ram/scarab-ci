@@ -44,6 +44,10 @@ pub struct PodView {
     pub deleting: bool,
     pub has_root: bool,
     pub containers: Vec<ContainerView>,
+    /// `spec.terminationGracePeriodSeconds`. I1b's bound is this plus 30 s.
+    /// `None` in a `pods.jsonl` written before the field was recorded.
+    #[serde(default)]
+    pub grace_secs: Option<i64>,
 }
 
 impl PodView {
@@ -86,6 +90,7 @@ impl PodView {
             deleting: !md["deletionTimestamp"].is_null(),
             has_root: md["annotations"][ROOT_ANNOTATION].is_string(),
             containers,
+            grace_secs: p["spec"]["terminationGracePeriodSeconds"].as_i64(),
         }
     }
 
@@ -254,6 +259,7 @@ mod tests {
             _ => serde_json::json!({"waiting": {"reason": "PodInitializing"}}),
         };
         PodView::from_json(&serde_json::json!({
+            "spec": {"terminationGracePeriodSeconds": 600},
             "metadata": {"uid": "u1", "name": "scarab-produce-a1-x",
                 "labels": {"scarab.io/run": "r", "scarab.io/step": "produce", "scarab.io/attempt": "a1"},
                 "annotations": annotations},
@@ -273,6 +279,21 @@ mod tests {
         assert_eq!((c.state.as_str(), c.exit_code), ("terminated", Some(0)));
         assert_eq!(c.finished_at_ms.unwrap() - c.started_at_ms.unwrap(), 5_000);
         assert!(p.container(INIT_CONTAINER).unwrap().init);
+        assert_eq!(p.grace_secs, Some(600));
+    }
+
+    /// A `pods.jsonl` line written before `grace_secs` existed still parses.
+    #[test]
+    fn an_old_record_without_the_grace_period_parses() {
+        let mut v = serde_json::to_value(PodRecord {
+            at_ms: 1,
+            event: "added".into(),
+            pod: pod("running", None, "running", false),
+        })
+        .unwrap();
+        v["pod"].as_object_mut().unwrap().remove("grace_secs");
+        let back: PodRecord = serde_json::from_value(v).unwrap();
+        assert_eq!(back.pod.grace_secs, None);
     }
 
     #[test]
