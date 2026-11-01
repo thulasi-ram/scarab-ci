@@ -17,7 +17,7 @@
 
 image:
   # repository/tag come from deploy.sh (the image SOURCE is a per-invocation
-  # choice, exactly as in local-helm). pullPolicy is a mode fact, not a run
+  # choice). pullPolicy is a mode fact, not a run
   # choice: this box builds nothing, so every image is always pulled.
   pullPolicy: Always
 

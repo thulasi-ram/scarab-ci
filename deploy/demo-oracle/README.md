@@ -71,7 +71,7 @@ way `deploy.sh` can diagnose for you.
      `SCARAB_GITHUB_WEBHOOK_SECRET`. It must **subscribe to Push and Pull
      request** events and be granted **Contents: read**, **Metadata: read**,
      **Commit statuses: read & write**. Both failure modes here are silent
-     and are documented in `deploy/local-helm/README.md`;
+     and are documented in `deploy/kind/README.md` ("GitHub App settings");
    * a **GitHub OAuth app** (visitor login). Authorization callback URL
      `https://demo-scarab.<domain>/v1/auth/callback`.
 
@@ -89,7 +89,7 @@ just demo-oracle sha-<gitsha>   # deploy a specific published build
 
 `bootstrap.sh` is idempotent; so is `deploy.sh`. Re-run either freely.
 
-**There is no local-build path**, unlike `just local-helm local`. Two Ampere
+**There is no local-build path**. Two Ampere
 cores will not compile this workspace in a time anyone will wait for, and doing
 it on the demo box would starve the running demo of both cores while it
 happened. `image.yml` builds every image on native amd64 **and arm64** runners
@@ -100,8 +100,9 @@ and stitches the digests into one multi-arch manifest per tag, so `edge` and
 
 Install the GitHub App on the demo repo (or hit *Recreate all* on its Advanced →
 webhook page). The resulting `installation` delivery is what registers it.
-Unlike `deploy/local-helm` there is **no `reseed.sh`** here and none is needed:
-the box is publicly reachable, so real GitHub deliveries arrive on their own.
+No synthetic `installation` event is sent here (`just up dogfood` sends one) and
+none is needed: the box is publicly reachable, so real GitHub deliveries arrive
+on their own.
 
 The App **PEM** is a different matter and is handled: `deploy.sh` puts
 `SCARAB_APP_PEM` into a k8s Secret the chart mounts, so the server holds the
@@ -134,8 +135,8 @@ already installed.
 Fixed in the chart, not here (`deploy/helm/scarab/templates/statefulset-workspace.yaml`).
 The Pod saw four of five `SCARAB_OAUTH_*` values and refused to boot, since
 ADR-0049 makes a provider all-five-or-none and ADR-0048 validates config before
-the role is dispatched. Unreachable from `deploy/local-helm`, which runs
-`SCARAB_DEV_INSECURE=true`; this is the first mode with authentication turned
+the role is dispatched. Unreachable from the dev-insecure local stacks
+(`SCARAB_DEV_INSECURE=true`); this is the first mode with authentication turned
 on. Fixing it exposed a second problem now guarded in `deploy.sh`: a
 StatefulSet's RollingUpdate will not replace a Pod that never became Ready, so
 the corrected template changed nothing until the Pod was deleted by hand.

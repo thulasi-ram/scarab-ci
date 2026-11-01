@@ -18,7 +18,7 @@
 #     publishes its fmt/clippy reports, each `test` leg its own cargo log, and
 #     `version` a version.txt.
 #
-# Dispatching it locally (`just local-helm`, then POST .../dispatch):
+# Dispatching it locally (`just up dogfood`, then POST .../dispatch):
 #   - Use ref `main`. `deploy` is `when: event.branch == 'main'`, so on a PR it
 #     and `notify` correctly SKIP — dispatch main to exercise the whole DAG.
 #   - `approve` is a MANUAL gate: the run parks there until you approve it.

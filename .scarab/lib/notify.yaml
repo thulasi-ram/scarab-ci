@@ -19,7 +19,10 @@ interface:
 
 steps:
   - id: post
-    image: curlimages/curl:8.10.1
+    # A non-root user given by NUMBER. Steps run with runAsNonRoot, and the
+    # kubelet refuses an image whose USER is a name (curlimages/curl's
+    # `curl_user`): it cannot check that the name is not root.
+    image: cgr.dev/chainguard/busybox:latest@sha256:9cf938251dfb3cc081ef9847e79c203b5de90ecc20855e40bef8a7cc191bb218
     # `${{ inputs.channel }}` reads the caller's `with: { channel: … }`. It goes
     # in through env, not into the script: a value in a script becomes code.
     env:

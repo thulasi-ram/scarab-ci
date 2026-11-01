@@ -1,0 +1,96 @@
+# Dev-only in-cluster Forgejo for the kind stack, next to Postgres and MinIO,
+# in every mode. `just e2e` drives it (git-bug 3863d5e: the Forgejo adapter's
+# request and response shapes are checked against a real Forgejo, not against
+# what we believed it sends). Throwaway: SQLite on a PVC, install wizard locked,
+# registration off. Never point anything real here.
+#
+# deploy/kind/up.sh renders this file: __ROOT_URL__ is the URL Forgejo builds
+# clone URLs and payload links from (the in-cluster Service URL, or in e2e mode
+# the quick tunnel's https URL), __SIGNIN_VIEW__ is true in e2e mode, where the
+# tunnel makes the instance reachable from the internet. deploy/kind/forgejo.sh
+# seeds it (admin user, token, repos).
+#
+# The server and step Pods reach it at http://scarab-forgejo.scarab.svc.cluster.local:3000;
+# the tests on the host through `kubectl port-forward`.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: scarab-forgejo
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scarab-forgejo
+  labels: { app: scarab-forgejo }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }        # single RWO volume — never two pods at once
+  selector:
+    matchLabels: { app: scarab-forgejo }
+  template:
+    metadata:
+      labels: { app: scarab-forgejo }
+    spec:
+      containers:
+        - name: forgejo
+          # Pinned: the point of the tier is to say WHICH Forgejo the adapter
+          # was checked against. Multi-arch. From data.forgejo.org, not
+          # codeberg.org: on 2026-11-01 codeberg's index for 16.0.1 listed an
+          # amd64 manifest (sha256:9c0c82b4...) its registry answered 404 for,
+          # so every amd64 pull (CI) failed; data.forgejo.org serves the same
+          # index with every platform.
+          image: data.forgejo.org/forgejo/forgejo:16.0.1
+          env:
+            - { name: USER_UID, value: "1000" }
+            - { name: USER_GID, value: "1000" }
+            # No install wizard: boot straight into a usable instance.
+            - { name: FORGEJO__security__INSTALL_LOCK, value: "true" }
+            - { name: FORGEJO__database__DB_TYPE, value: sqlite3 }
+            # Must live under /data/gitea: the only subtree the entrypoint
+            # creates and chowns to USER_UID. Elsewhere the server loops on
+            # DB init and never binds the API.
+            - { name: FORGEJO__database__PATH, value: /data/gitea/forgejo.db }
+            - { name: FORGEJO__server__HTTP_PORT, value: "3000" }
+            - { name: FORGEJO__server__ROOT_URL, value: "__ROOT_URL__" }
+            - { name: FORGEJO__server__DISABLE_SSH, value: "true" }
+            - { name: FORGEJO__service__DISABLE_REGISTRATION, value: "true" }
+            - { name: FORGEJO__service__REQUIRE_SIGNIN_VIEW, value: "__SIGNIN_VIEW__" }
+            - { name: FORGEJO__repository__DEFAULT_BRANCH, value: main }
+            # Forgejo's webhook allow-list defaults to `external`, which
+            # refuses private addresses. Scarab and the adapter test's capture
+            # listener are private addresses, so without this every delivery
+            # is dropped and the tier passes without testing ingest.
+            - { name: FORGEJO__webhook__ALLOWED_HOST_LIST, value: "*" }
+            - { name: FORGEJO__webhook__DELIVER_TIMEOUT, value: "30" }
+            - { name: FORGEJO__log__LEVEL, value: warn }
+          ports:
+            - { name: http, containerPort: 3000 }
+          # Requests near measured use; the stack shares a 4 GiB colima VM.
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { memory: 512Mi }
+          readinessProbe:
+            tcpSocket: { port: 3000 }
+            initialDelaySeconds: 3
+            periodSeconds: 3
+          volumeMounts:
+            - { name: data, mountPath: /data }
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: scarab-forgejo
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: scarab-forgejo
+  labels: { app: scarab-forgejo }
+spec:
+  selector: { app: scarab-forgejo }
+  ports:
+    - { name: http, port: 3000, targetPort: 3000 }

@@ -197,8 +197,8 @@ Helm values.
 
 **This covers the credential only.** Which installations and repos exist is
 separate durable state, registered by the App's `installation` /
-`installation_repositories` webhook deliveries (or `deploy/local-helm/reseed.sh`
-for a local loop). A fresh database still needs one delivery.
+`installation_repositories` webhook deliveries (or, for the local dogfood stack,
+the signed synthetic `installation` event `just up dogfood` sends). A fresh database still needs one delivery.
 
 ## Declarative connections (`scarab.connections`, ADR-0060 part D)
 
@@ -423,6 +423,11 @@ DNS, which must be the usual `kube-system` Pods labelled `k8s-app=kube-dns`.
 | `plugins.brokerPort` | `8090` | the broker listener and its ClusterIP Service port |
 | `plugins.probeImage` | `""` = `busybox:1.36.1@sha256:73aa…` | the isolation probe's and the per-Pod self-check's image; digest-pin an override |
 | `ingress.enabled` | `false` | expose the HTTP API |
+| `service.type` / `service.nodePort` | `ClusterIP` / `""` | the API Service; with `NodePort`, `nodePort` fixes the port (empty => assigned) |
+| `command` / `args` | `[]` / `[]` | override the server container's entrypoint and arguments; empty => the image's |
+| `extraVolumes` / `extraVolumeMounts` | `[]` / `[]` | volumes added to the server Pod and mounted in its container, after the chart's own |
+| `workspace.command` / `workspace.args` | `[]` / `[]` | the same override for the workspace container |
+| `workspace.extraVolumes` / `workspace.extraVolumeMounts` | `[]` / `[]` | the same for the workspace Pod; Pod template only, never `volumeClaimTemplates` |
 
 See `values.yaml` for every value. Every value maps to a `SCARAB_*` env var
 read by `crates/scarab-server/src/config.rs`. Webhook verification binds a secret

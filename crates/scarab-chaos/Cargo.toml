@@ -1,0 +1,34 @@
+# The fault tier's harness (ADR-0077 §2, §3): a seeded nemesis, scenario files
+# that replay, and the invariant checker, as a library and the `scarab-chaos`
+# binary. `just chaos` (deploy/kind/chaos.sh) drives it against the kind
+# release in its chaos mode. The checker reads Postgres, the bucket and the
+# kube API directly; it does not take the API's word for success.
+#
+# Every dependency is already in the workspace. Internal crates are named only
+# for formulas the checker must agree with: the drain fence key
+# (scarab-workspace-client) and the tree format (scarab-storage).
+[package]
+name = "scarab-chaos"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "scarab-chaos"
+path = "src/main.rs"
+
+[dependencies]
+scarab-storage = { workspace = true }
+scarab-workspace-client = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+reqwest = { workspace = true }
+sqlx = { workspace = true }
+object_store = { workspace = true }
+kube = { workspace = true }
+k8s-openapi = { workspace = true }
+clap = { workspace = true }
+rand = { workspace = true }
+rustls = { workspace = true }

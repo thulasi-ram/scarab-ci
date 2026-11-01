@@ -17,10 +17,9 @@
 # `scripts/pin_clone_image.sh <tag>` writes the digest of a published tag here.
 # SCARAB_CLONE_TOKEN_FILE points images built before the forge-token file
 # existed at it; newer images read it by default. The pinned image is the main
-# build after the clone credential was scoped to the cloned repository. It
-# predates the forge-username file and numeric depths: it answers git with
-# the username x-access-token (GitHub and Forgejo accept a token under any
-# username), and it fetches one commit for any depth but "full".
+# build at ac8c661a (v0.3.0's library): it offers the credential only for the
+# cloned repository, answers git with the username in the forge-username file,
+# and fetches as many commits as a numeric depth asks for.
 kind: library
 interface:
   inputs:
@@ -42,7 +41,7 @@ interface:
       description: pull Git LFS objects
 steps:
   - id: git
-    image: ghcr.io/thulasi-ram/scarab-clone:sha-0d4ec26809c5f52b235f365e356a91cf9bc6942d@sha256:ca5b539ea2cb2dc590390ed4e8a339e4bcbf6255cd38f627de861c44c7961928
+    image: ghcr.io/thulasi-ram/scarab-clone:sha-ac8c661a540d702a9c46492c7525bac1bf7c28a4@sha256:85c0df2a66d5fc110b31f8197834635b36eeeb949b1926bf93137e6f99f2e23d
     forge_token: read
     env:
       - [SCARAB_CLONE_URL, "${{ event.repo.clone_url }}"]

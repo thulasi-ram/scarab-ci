@@ -1,0 +1,84 @@
+# Helm values for the kind dev stack (deploy/kind/up.sh). Every mode starts
+# from this file; up.sh adds the per-mode values (database URL, bucket,
+# secrets, the GitHub App for `just up dogfood`) in a temporary file.
+#
+# The server and the Depot run a binary built on the host. The thin runtime
+# image (docker/runtime) has no Scarab binary in it: deploy/kind/.mount on the
+# host is mounted on the kind node at /scarab (kind extraMounts), and from
+# there into each Pod at /opt/scarab (hostPath). `command` runs it.
+
+image:
+  repository: scarab-runtime
+  tag: dev
+  # Loaded into the node with `kind load`; never pulled.
+  pullPolicy: Never
+
+command: ["/opt/scarab/bin/scarab-server"]
+extraVolumes:
+  - name: host-build
+    hostPath:
+      path: /scarab
+      type: Directory
+extraVolumeMounts:
+  - name: host-build
+    mountPath: /opt/scarab
+    readOnly: true
+
+scarab:
+  role: converged
+  executor: k8s
+  s3:
+    endpoint: http://scarab-minio:9000
+    region: us-east-1
+  sidecarImage: scarab-results-sidecar:dev
+  extraEnv:
+    RUST_LOG: "info,scarab=debug"
+
+# Requests near measured use, not the chart's production defaults (256Mi
+# server, 512Mi Depot): the whole stack shares a 4 GiB colima VM. Measured
+# 2026-11-01 after `just demo-chain`: server ~20 MiB, Depot ~47 MiB working set.
+# The server keeps the chart's limit; the Depot's is 1Gi (chart: 2Gi), which
+# still leaves a drain room on a VM this size.
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 512Mi
+
+workspace:
+  enabled: true
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 1Gi
+  replicaCount: 1
+  command: ["/opt/scarab/bin/scarab-server"]
+  extraVolumes:
+    - name: host-build
+      hostPath:
+        path: /scarab
+        type: Directory
+  extraVolumeMounts:
+    - name: host-build
+      mountPath: /opt/scarab
+      readOnly: true
+  fetcherImage: scarab-wsfetch:dev
+  persistence:
+    size: 5Gi
+  # The default (90% of the volume's statvfs capacity) is sized for a
+  # dedicated disk. kind's local-path volumes share colima's disk, so bound
+  # the warm tier explicitly.
+  warmBudgetBytes: "2147483648"
+
+# The API on a fixed node port; the kind cluster maps a host port to it
+# (extraPortMappings, set when the cluster is created).
+service:
+  type: NodePort
+  nodePort: 30080
+
+secrets:
+  s3AccessKey: scarab
+  s3SecretKey: scarabsecret

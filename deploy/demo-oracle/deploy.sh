@@ -11,12 +11,12 @@
 #
 #   deploy/demo-oracle/deploy.sh [IMAGE_TAG]
 #
-# Modeled on deploy/local-helm/deploy.sh — same env-file-wins loader, same
-# stable-workspace-token-on-disk handling, same refusal when the workspace token
-# equals the results token, same "ask the image which roles it knows before
-# touching the cluster" preflight. The differences are all consequences of this
-# box being PUBLIC and having no Docker daemon; each is called out where it
-# happens.
+# Modeled on the retired colima deploy script (deploy/local-helm/deploy.sh, in
+# git history): env-file-wins loader, stable workspace token on disk, refusal
+# when the workspace token equals the results token, and an "ask the image which
+# roles it knows before touching the cluster" preflight. The differences are
+# consequences of this box being PUBLIC and having no Docker daemon; each is
+# called out where it happens.
 #
 # ⚠ UNVERIFIED: this has never been run against a real Oracle instance.
 set -euo pipefail
@@ -82,9 +82,8 @@ fi
 [ -n "$_img_sidecar" ] && export SCARAB_SIDECAR_IMAGE="$_img_sidecar"
 [ -n "$_img_wsfetch" ] && export SCARAB_WSFETCH_IMAGE="$_img_wsfetch"
 
-# HARD GUARD: only ever touch the cluster this .env names. k3s writes `default`;
-# the point is the same as local-helm's colima guard — a deploy script must
-# never be pointable at a cluster you did not mean.
+# HARD GUARD: only ever touch the cluster this .env names. k3s writes `default`.
+# A deploy script must never be pointable at a cluster you did not mean.
 want_ctx="${KUBE_CONTEXT:-default}"
 ctx="$(kubectl config current-context)"
 [ "$ctx" = "$want_ctx" ] || {
@@ -283,8 +282,7 @@ YAML
 # (It does create the namespace and one throwaway Pod, because that Pod IS the
 # check; nothing durable is applied until it passes.)
 #
-# Same idea as local-helm's, DIFFERENT MECHANISM: there is no Docker daemon on a
-# k3s box, so `docker run --rm <image> --role <nonsense>` is not available. The
+# There is no Docker daemon on a k3s box, so `docker run --rm <image> --role <nonsense>` is not available. The
 # kubelet is asked instead, which is strictly better here — it proves the image
 # is pullable BY THE NODE THAT WILL RUN IT (arm64 manifest included), not merely
 # by some other machine, and it warms containerd's cache for the real deploy.
@@ -513,6 +511,6 @@ Deployed. ${SCARAB_PUBLIC_URL} should serve the UI within a few seconds.
 
 Fresh install only: install the GitHub App on the demo repo (or hit
 "Recreate all" on its Advanced webhook page) — the resulting \`installation\`
-delivery is what registers it. Unlike local-helm there is no reseed.sh: the box
-is publicly reachable, so real GitHub deliveries arrive on their own.
+delivery is what registers it. No synthetic installation event is needed: the
+box is publicly reachable, so real GitHub deliveries arrive on their own.
 EOF

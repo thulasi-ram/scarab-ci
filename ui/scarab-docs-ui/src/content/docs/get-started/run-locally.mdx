@@ -1,6 +1,6 @@
 ---
 title: Run locally
-description: Bring up the full Scarab dev stack (Postgres, MinIO, a kind cluster, and scarab-server) and watch a pipeline complete.
+description: Bring up the Scarab dev stack (a kind cluster with Postgres, MinIO and the Helm chart, running a server built from the tree) and watch a pipeline complete.
 ---
 
 import Doodle from '../../../components/Doodle.astro';
@@ -8,9 +8,9 @@ import Doodle from '../../../components/Doodle.astro';
 <Doodle icon="terminal" size={200} rotate={-10} opacity={0.18} top="7rem" right="-2rem" />
 
 This page gets the whole stack running on your machine and pushes a pipeline through it. One
-command (a `Justfile` over `deploy/local-proc/`) runs `scarab-server` straight from the tree, so
-you can rebuild and rerun without publishing an image. To deploy the packaged chart
-instead (on kind/colima or a live cluster), see [Installation](/scarab-ci/get-started/deploy-helm/);
+command (a `Justfile` over `deploy/kind/`) builds `scarab-server` from the tree and runs it inside a
+local kind cluster from the Helm chart, so you can rebuild and rerun without building an image. To deploy the packaged chart
+instead (on kind or a live cluster), see [Installation](/scarab-ci/get-started/deploy-helm/);
 the [Overview](/scarab-ci/get-started/overview/) compares the two paths.
 
 If you would rather look before you install, the [live demo](https://demo-scarab.ahiravan.dev/)
@@ -19,19 +19,22 @@ pipeline. The steps below run Scarab on your machine.
 
 ## Prerequisites
 
-- **docker**, **kind**, **kubectl**: the stack runs `scarab-server` against a local kind cluster.
-- **cargo** (Rust toolchain, see `rust-toolchain.toml`): the server is built from source.
+- **docker**, **kind**, **kubectl**, **helm**: the stack runs in a local kind cluster.
+- **cargo** (Rust toolchain, see `rust-toolchain.toml`): the server is built from source. On macOS
+  also **zig** and **cargo-zigbuild**, which build the Linux binary the cluster runs.
 - **python3**: the demo submits a pipeline over the REST API.
 - [`just`](https://github.com/casey/just): the task runner.
 
 ## Bring up the stack
 
 ```sh
-just up      # Postgres + MinIO + kind + scarab-server (background)
+just up      # kind + Postgres + MinIO + the chart, server built from the tree
 ```
 
-`just up` starts Postgres and MinIO (via `deploy/local-proc/compose.yaml`), creates a kind cluster
-(`deploy/local-proc/kind.yaml`), and runs `scarab-server` in converged mode against them.
+`just up` builds `scarab-server` for Linux, creates the `scarab-dev` kind cluster, starts Postgres
+and MinIO in it, and installs the Helm chart. The server and the workspace service run the binary
+you just built, mounted into a small runtime image. The API and the UI answer on `SCARAB_ADDR`
+from `deploy/kind/.env`.
 
 ## Submit a pipeline and watch it complete
 
@@ -45,17 +48,15 @@ end-to-end run, and it survives you killing the control plane partway through.
 ## Iterate
 
 ```sh
-just serve   # run scarab-server in the FOREGROUND against the dev stack (Ctrl-C to stop)
-just logs    # tail the background server log
+just reload  # rebuild and roll the server onto the new binary
+just logs    # follow the server's log
 just docs    # serve this documentation site locally
-just down    # tear the whole stack down
+just down    # tear the whole stack down (`just down keep` keeps the data)
 ```
 
-:::note[The other mode: Helm inside the cluster]
-`just up` runs the server as a host process (kind for step Pods). To run everything inside the cluster
-(`scarab-server` deployed via the Helm chart on colima, with Postgres and MinIO inside the cluster), use
-`just local-helm` (`just local-helm local` builds from the tree; `just local-helm sha-<sha>` pins a
-published build). See [Installation](/scarab-ci/get-started/deploy-helm/).
+:::note[Tests]
+`just e2e` runs every live suite against the same release, switched to its e2e mode with its
+own database and bucket. `just up` switches it back.
 :::
 
 :::tip[See the UI]

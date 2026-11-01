@@ -1,0 +1,77 @@
+# The dogfood stack's public front door (`just up dogfood`): cloudflared dials out
+# to Cloudflare and proxies requests back to the scarab Service. Same shape as
+# deploy/demo-oracle/cloudflared.yaml: a token-mode (remotely managed) named
+# tunnel, so this file holds no routing. The route is set in the Cloudflare
+# Zero Trust dashboard, on the tunnel's Public Hostname tab:
+#
+#     $DOGFOOD_HOSTNAME   Path ^/webhooks/   ->   http://scarab.scarab.svc.cluster.local:80
+#
+# Only /webhooks/: the dogfood release is dev-insecure, so a public UI or API
+# would make every visitor an Owner. Other paths hit the catch-all 404, and
+# deploy/kind/up.sh checks that from outside, scaling this Deployment to 0 when
+# anything else reaches Scarab.
+#
+# That URL must match the chart's Service (release `scarab`, namespace
+# `scarab`, service.port 80). A mismatch shows up as a Cloudflare 502.
+#
+# deploy/kind/up.sh creates the `scarab-cloudflared` Secret from
+# CLOUDFLARE_TUNNEL_TOKEN in ~/.config/scarab/dogfood.env, and sets the
+# release's publicUrl to https://$DOGFOOD_HOSTNAME.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scarab-cloudflared
+  labels: { app: scarab-cloudflared }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: scarab-cloudflared }
+  template:
+    metadata:
+      labels: { app: scarab-cloudflared }
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: cloudflared
+          # Pinned: this container is the dogfood's front door. Bump the tag and
+          # the digest together.
+          image: cloudflare/cloudflared:2026.10.1@sha256:a15a3b50b8dabd57ac2090e9484c0247dba9dfa1f0df4d298d4317f9d69eb2d5
+          args:
+            - tunnel
+            - --no-autoupdate
+            # /ready answers 200 once at least one edge connection is registered.
+            - --metrics
+            - 0.0.0.0:2000
+            - run
+          env:
+            - name: TUNNEL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: scarab-cloudflared
+                  key: token
+          ports:
+            - { name: metrics, containerPort: 2000 }
+          livenessProbe:
+            httpGet: { path: /ready, port: metrics }
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /ready, port: metrics }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 20m, memory: 48Mi }
+            limits: { memory: 128Mi }
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: tmp
+          emptyDir: {}

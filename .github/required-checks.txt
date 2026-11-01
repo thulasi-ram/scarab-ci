@@ -16,7 +16,7 @@
 #   advisory         reported, never blocks — a tier serving probation
 #
 # "DID NOT RUN" HAS TWO SHAPES and the tier is what decides, not the shape: a
-# workflow-level `paths:` filter makes a check ABSENT (`kind/cluster-tests`),
+# workflow-level `paths:` filter makes a check ABSENT,
 # while `ci.yml`'s `changes` job makes one SKIPPED. `pr_gate.py` treats them
 # identically — a `required` line fails on either. So a job that can be
 # filtered out MUST be `required-if-run`, and the line MUST move in the same
@@ -52,11 +52,12 @@ required-if-run  ci/test-and-coverage   # workspace nextest under llvm-cov, real
 required-if-run  ci/openapi-drift       # committed spec + generated client + tsc
 required-if-run  ci/ui-tests            # UI no-DOM vitest suites
 
-# Promoted off probation 2026-07-25. Nine runs, one failure — and that failure
-# was the harness `.expect()`ing a transient poll error the engine is designed
-# to retry ("workspace: broken pipe"), fixed in the same commit. No product
-# flake was ever observed, so it graduates.
-required-if-run  kind/cluster-tests     # live-cluster executor tier
+# Every live suite (`just e2e`: the scarab-e2e crate, Forgejo, the tunnel
+# cases, the executor and plugin cluster suites, crash_resume). Runs on a PR
+# only under the ci:full label, so on any other PR it skips, which is correct.
+# It replaces `kind/cluster-tests` (2026-11-01), which ran the cluster suites
+# alone and had been required since 2026-07-25.
+required-if-run  e2e/e2e                # `just e2e` on the kind release
 
 # Path-filtered (`chart` in .github/path-filters.yml) on PRs; on a `v*` tag it
 # is the job that PUBLISHES the chart, so a red render here is a release that

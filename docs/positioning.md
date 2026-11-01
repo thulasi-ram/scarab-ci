@@ -25,8 +25,11 @@ durable execution passes none of them:
 - **Only partly proven so far.** The part our code proves (Postgres crash/resume and
   exactly-once, in [`crash_resume.rs`](../crates/scarab-db-postgres/tests/crash_resume.rs),
   which runs against real Postgres) is the part the durable workflow engines already have. The
-  part that would set us apart is not proven: the control-plane crash test with a real Pod in
-  flight (`crates/scarab-e2e/tests/crash_resume.rs`, weekly in `e2e.yml`) doesn't pass yet, and
+  part that would set us apart is proven for one case only: the control-plane crash test with a
+  real Pod in flight (`crates/scarab-e2e/tests/crash_resume.rs`) passes in `just e2e` on a local
+  kind cluster, not yet in `e2e.yml`. It SIGKILLs the server from the kind node; the kubelet
+  restarts the container in the same Pod, and the new process re-adopts the Attempt without
+  running it again. A server Pod moved to another node, or a lost node, is not tested. And
   execution replay is not a feature.
 
 So we keep durability but stop leading with it. It guides the engineering and is
@@ -52,7 +55,8 @@ The caveat that keeps this defensible: the durable engine is proven, and the
 forge-native domain model is proven **against a fake forge**. The GitHub and
 Forgejo adapters and Pod execution on Kubernetes are implemented and tested (a
 kind cluster in CI, real forges by hand), but not yet hardened, and crash/resume
-with a live Pod doesn't pass yet (see Claims we don't make).
+with a live Pod is tested only for a server container restarted in the same Pod
+(see Claims we don't make).
 
 ## One-liners (ranked)
 
@@ -87,7 +91,8 @@ with a live Pod doesn't pass yet (see Claims we don't make).
 - ❌ "Durable execution" as a bare H1 or a one-word pitch.
 - ❌ "Durable execution **on Kubernetes**" or live-Pod re-attach. The Postgres
   crash test's executor is a fake, and the stack-level crash test with a real Pod
-  (`scarab-e2e` `crash_resume`) doesn't pass yet.
+  (`scarab-e2e` `crash_resume`) covers only a server container SIGKILLed and
+  restarted in the same Pod, on a local kind cluster.
 - ❌ "**Unlike** Argo/Tekton/Temporal, we're durable." They are durable too, so
   it makes us look uninformed. Never compare ourselves with that group on
   durability.
@@ -145,8 +150,9 @@ Show respect and say where we differ; never take a swipe.
    implemented; not yet hardened against live forges."
 2. ❌ Any end-to-end durability-on-Kubernetes or live-Pod re-attach claim. The
    executor's live-cluster tests, re-attach after relaunch included, pass on kind
-   (`kind.yml`), but the stack-level crash/resume test with a real Pod in flight
-   doesn't pass yet.
+   (`just e2e`, run by `e2e.yml`). The stack-level crash/resume test with a real Pod in flight
+   passes in `just e2e` locally, not yet in `e2e.yml`, and covers only a server container
+   SIGKILLed and restarted in the same Pod (not a Pod moved to another node, not a lost node).
 3. ❌ Durable execution as a selling point against Argo/Tekton/Temporal/Kestra.
 4. ❌ Time-travel / replay as a feature.
 5. ❌ Indefinite gates as a differentiator.
@@ -159,8 +165,8 @@ Show respect and say where we differ; never take a swipe.
    that: tested on a kind cluster.
 8. ❌ "Every change runs the full test suite." `ci.yml` runs the Rust suite against
    real Postgres on every push to main and on PRs that touch Rust (in CI a skipped
-   Postgres test fails the job), but `kind.yml` runs the live-cluster tests only for
-   changes to the execution path, and the full-stack e2e tier runs weekly.
+   Postgres test fails the job), but `e2e.yml` runs the live-cluster and full-stack
+   tiers (`just e2e`) only on PRs labelled `ci:full` and weekly.
 
 **Keep a visible Status line, and don't apologise for it.** Durable engine:
 proven. Forge-native domain model: proven against a fake forge. Forge adapters

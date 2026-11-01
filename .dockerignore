@@ -2,9 +2,9 @@
 .git
 target
 .workspaces
-deploy/local-proc/.kubeconfig
-deploy/local-proc/server.log
-deploy/local-proc/server.pid
+deploy/kind/.kubeconfig
+deploy/kind/.state
+deploy/kind/.mount
 .scarab
 .env.local
 .direnv

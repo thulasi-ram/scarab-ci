@@ -2,10 +2,6 @@
 **/*.rs.bk
 .DS_Store
 
-# dev harness runtime artifacts (local-proc mode)
-/deploy/local-proc/.kubeconfig
-/deploy/local-proc/server.pid
-/deploy/local-proc/server.log
 # local object-store backend (default dev fallback) and other runtime state
 # under .scarab/ — but keep committed pipeline configs (.scarab/*.yaml and the
 # .scarab/lib/ catalog) tracked; that is where a repo declares its own CI.
@@ -39,30 +35,17 @@
 # where a toolchain lives). It was tracked; it is not any more. Note `.env.*`
 # above does NOT cover this — that pattern needs a literal dot after `env`.
 .envrc
-# The kube-context overlay a local .envrc may generate to pin this repo to
-# colima. Holds no credentials (it names a context and nothing else) but it is
-# machine-local state, and must not exist until the local cluster does.
+# Files the retired deploy/local-helm mode (colima's k3s) wrote into checkouts
+# that still have them: a kube-context overlay and the workspace token secret.
+# The mode is gone; the rules stay so an old secret is never committed.
 /deploy/local-helm/.kubeconfig-colima
-# The workspace-service token secret deploy.sh generates once (ADR-0061). Kept on
-# disk rather than regenerated per deploy so tokens the control plane already
-# minted keep verifying; it is a secret, so it is never committed.
 /deploy/local-helm/.workspace-token-secret
-# The same secret in the public-demo mode (deploy/demo-oracle/deploy.sh
-# generates it once, for the same reason: the control plane mints workspace
-# tokens with it and the service verifies them, so rotating it per deploy would
-# invalidate every in-flight Step's credential mid-run). Its `.env` needs no
-# entry here — the `.env` rule above already covers it, exactly as it covers
-# local-helm's.
+# The workspace token secret of the public-demo mode (ADR-0061).
+# deploy/demo-oracle/deploy.sh generates it once and keeps it: the control plane
+# mints workspace tokens with it and the service verifies them, so rotating it
+# per deploy would invalidate every in-flight Step's credential mid-run. Its `.env` needs no
+# entry here — the `.env` rule above already covers it.
 /deploy/demo-oracle/.workspace-token-secret
-# Proc-mode workspace service (ADR-0061): its pidfile and its log. Its warm tier
-# lands under /.scarab/, which lines 12-15 above already ignore while keeping the
-# committed pipeline configs tracked — do NOT add a bare `/.scarab/` here, it
-# would shadow .scarab/dogfood.yaml.
-/deploy/local-proc/workspace.pid
-/deploy/local-proc/workspace.log
-# `just plugin-verify`: the host-side fake Argo CD (ADR-0072 d4).
-/deploy/local-proc/fake-argocd.pid
-/deploy/local-proc/fake-argocd.log
 
 # `.cargo/config.toml` IS tracked — repo-level build settings belong in version
 # control. `cargo login` writes a registry token next to it, and that must never
@@ -89,3 +72,11 @@
 # Python bytecode (scripts/ are run directly, never imported in normal use).
 __pycache__/
 *.pyc
+
+# The kind dev stack (deploy/kind/up.sh): its kubeconfig, generated config and
+# dev secrets (.state), and the staged binaries + UI mounted on the node (.mount).
+/deploy/kind/.kubeconfig
+/deploy/kind/.state/
+/deploy/kind/.mount/
+# `just chaos` scenario files, Pod records and verdicts (deploy/kind/chaos.sh).
+/deploy/kind/.chaos/

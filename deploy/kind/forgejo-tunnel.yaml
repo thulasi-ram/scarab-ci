@@ -1,0 +1,57 @@
+# The cloudflared quick tunnel `just e2e` puts in front of the in-cluster
+# Forgejo (deploy/kind/up.sh e2e creates it; the e2e recipe deletes it when it
+# ends). A quick tunnel needs no account: cloudflared prints a random
+# https://<name>.trycloudflare.com URL to its log, and up.sh reads it there.
+#
+# Why a tunnel: the forge_token cases (crates/scarab-e2e/tests/forgejo_tunnel.rs).
+# A forge token is only sent to an https clone URL that the server Pod AND the
+# step Pods resolve, over TLS the pinned clone image trusts. This makes network
+# calls, and the instance is reachable from the internet while it runs: the
+# admin password is random and Forgejo requires sign-in to view.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scarab-forgejo-tunnel
+  labels: { app: scarab-forgejo-tunnel }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: scarab-forgejo-tunnel }
+  template:
+    metadata:
+      labels: { app: scarab-forgejo-tunnel }
+    spec:
+      containers:
+        - name: cloudflared
+          # The same pinned image as cloudflared.yaml (the dogfood tunnel).
+          image: cloudflare/cloudflared:2026.10.1@sha256:a15a3b50b8dabd57ac2090e9484c0247dba9dfa1f0df4d298d4317f9d69eb2d5
+          args:
+            - tunnel
+            - --no-autoupdate
+            - --metrics
+            - 0.0.0.0:2000
+            - --url
+            - http://scarab-forgejo:3000
+          env:
+            - { name: HOME, value: /tmp }
+          ports:
+            - { name: metrics, containerPort: 2000 }
+          readinessProbe:
+            httpGet: { path: /ready, port: metrics }
+            initialDelaySeconds: 3
+            periodSeconds: 3
+          resources:
+            requests: { cpu: 20m, memory: 48Mi }
+            limits: { memory: 128Mi }
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: tmp
+          emptyDir: {}

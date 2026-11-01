@@ -70,14 +70,16 @@ async fn fake_forgejo() -> String {
         .route("/api/v1/repos/{owner}/{repo}/raw/{*path}", get(raw))
         .fallback(fallback)
         .with_state(());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    // The server runs in the kind cluster, so it calls this fake through the
+    // host address a Pod reaches (probed by `just e2e`), not loopback.
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:0")
         .await
         .expect("bind fake forgejo");
-    let addr = listener.local_addr().expect("local addr");
+    let port = listener.local_addr().expect("local addr").port();
     tokio::spawn(async move {
         axum::serve(listener, app).await.ok();
     });
-    format!("http://{addr}")
+    format!("http://{}:{port}", pod_host())
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -97,7 +99,7 @@ async fn happy_path_cli_dispatch_to_succeeded_with_logs() {
 
     let registry = scarab_db_postgres::PostgresDb::connect(&database_url())
         .await
-        .expect("connect stack Postgres");
+        .expect("connect the e2e database (`just e2e` port-forwards it)");
     registry
         .put_connection(&ForgeConnection {
             id: conn_id.clone(),

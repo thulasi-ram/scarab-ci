@@ -49,9 +49,8 @@ spec:
       terminationGracePeriodSeconds: 60
       containers:
         - name: cloudflared
-          # ⚠ Pin this before you care about the demo. `latest` is used here to
-          # match the house precedent (deploy/local-helm/minio.yaml) and because
-          # cloudflared's images are multi-arch (arm64 runs on Ampere), but this
+          # ⚠ Pin this before you care about the demo. `latest` is used here
+          # because cloudflared's images are multi-arch (arm64 runs on Ampere), but this
           # container is the demo's front door: a bad `latest` takes the whole
           # site down with no local change to blame. `cloudflare/cloudflared:2025.x.y`.
           image: cloudflare/cloudflared:latest

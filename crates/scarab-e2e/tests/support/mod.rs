@@ -1,11 +1,14 @@
 //! Shared harness for the full-stack E2E tier (test-strategy Phase 2).
 //!
-//! The crate is a pure HTTP driver over a RUNNING proc-mode stack
-//! (`deploy/local-proc/`): `just e2e` owns the lifecycle, these helpers only
-//! speak to it. DTOs are hand-rolled minimal structs carrying exactly the
-//! fields the scenarios assert — deliberately not a generated client.
+//! The crate is a pure HTTP driver over the kind release in its `e2e` mode
+//! (`deploy/kind/up.sh e2e`: own database and bucket): `just e2e` owns the
+//! lifecycle, these helpers only speak to it. DTOs are hand-rolled minimal
+//! structs carrying exactly the fields the scenarios assert — deliberately not
+//! a generated client.
 
 #![allow(dead_code)] // each test binary uses a different slice of the harness
+
+pub mod forgejo;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -19,52 +22,29 @@ macro_rules! require_e2e {
     () => {
         if std::env::var("SCARAB_E2E").ok().as_deref() != Some("1") {
             eprintln!(
-                "SKIPPED (full-stack e2e): set SCARAB_E2E=1 against a running proc-mode stack — \
-                 `just e2e` owns the lifecycle (up.sh → nextest → down.sh)"
+                "SKIPPED (full-stack e2e): set SCARAB_E2E=1 against the kind release — \
+                 `just e2e` brings it up in its e2e mode and runs the suite"
             );
             return;
         }
     };
 }
 
-// --- configuration (env, with the proc-mode defaults) -----------------------
+// --- configuration (env, set by `just e2e`) ----------------------------------
 
-/// Base URL of the stack's scarab-server.
+/// Base URL of the release's API, on the host port the kind node publishes.
 pub fn base_url() -> String {
     std::env::var("SCARAB_E2E_URL").unwrap_or_else(|_| "http://localhost:8080".into())
 }
 
-/// The workspace-service settings the stack's server was booted with, for a
-/// test that spawns ITS OWN server against the same kind cluster.
-///
-/// `up.sh` DISCOVERS the Pod-facing workspace URL by probing from a real Pod
-/// and exports it only into the stack server's process; `.env` carries the
-/// token secret but not the URL. A spawned server inheriting just `.env` turns
-/// the workspace flow ON (the secret selects it) with the default URL
-/// `http://scarab-workspace` — resolvable only in Helm mode — so its step Pods
-/// can never drain and sit `Running` forever. `.env.generated` records the
-/// discovered values for exactly this "a different process" case; `just e2e`
-/// sources it. Missing → panic: an opted-in tier must not boot a server that
-/// structurally cannot finish a step.
-pub fn stack_workspace_env() -> [(&'static str, String); 3] {
-    let need = |k: &str| {
-        std::env::var(k).unwrap_or_else(|_| {
-            panic!("{k} unset — `just e2e` sources deploy/local-proc/.env.generated (written by up.sh)")
-        })
-    };
-    [
-        ("SCARAB_WORKSPACE_URL", need("SCARAB_TEST_WORKSPACE_POD_URL")),
-        ("SCARAB_WORKSPACE_TOKEN_SECRET", need("SCARAB_TEST_WORKSPACE_SECRET")),
-        ("SCARAB_WSFETCH_IMAGE", need("SCARAB_TEST_WSFETCH_IMAGE")),
-    ]
-}
-
-/// The stack's Postgres URL. Doubles as the *maintenance* URL the
-/// crash/resume scenario carves its throwaway database from (the same
-/// pattern as `scarab-db-postgres/tests/common`).
+/// The e2e mode's Postgres database, through the port-forward `just e2e` opens
+/// (the server's Postgres runs in the cluster). Only `happy_path` uses it, to
+/// seed a connection and a binding.
 pub fn database_url() -> String {
     std::env::var("SCARAB_E2E_DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://scarab:scarab@127.0.0.1:55432/scarab".into())
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| panic!("SCARAB_E2E_DATABASE_URL unset: `just e2e` port-forwards the release's Postgres"))
 }
 
 /// The workspace root (this crate lives at `crates/scarab-e2e`).
@@ -75,26 +55,33 @@ pub fn workspace_root() -> PathBuf {
         .expect("workspace root resolves")
 }
 
-/// The isolated kubeconfig of the stack's kind cluster.
+/// The kind cluster's own kubeconfig file (never the ambient one).
 pub fn kubeconfig() -> PathBuf {
     match std::env::var("SCARAB_E2E_KUBECONFIG") {
         Ok(p) => PathBuf::from(p),
-        Err(_) => workspace_root().join("deploy/local-proc/.kubeconfig"),
+        Err(_) => workspace_root().join("deploy/kind/.kubeconfig"),
     }
 }
 
-/// The k8s namespace step Pods land in.
+/// The k8s namespace the release and its step Pods live in.
 pub fn namespace() -> String {
     std::env::var("SCARAB_E2E_NAMESPACE").unwrap_or_else(|_| "scarab".into())
 }
 
-/// Path to a `scarab-server` binary (the crash/resume scenario spawns its own
-/// instance so its SIGKILLs never poison the shared stack).
-pub fn server_bin() -> PathBuf {
-    match std::env::var("SCARAB_E2E_SERVER_BIN") {
-        Ok(p) => PathBuf::from(p),
-        Err(_) => workspace_root().join("target/debug/scarab-server"),
-    }
+/// The kind node's docker container (`scarab-dev-control-plane`): the
+/// crash/resume scenario signals the server from the node's PID namespace.
+pub fn kind_node() -> String {
+    std::env::var("SCARAB_E2E_KIND_NODE").unwrap_or_else(|_| "scarab-dev-control-plane".into())
+}
+
+/// The host name or address a Pod (the server included) reaches this host
+/// at; `just e2e` probes it from a real Pod. A test that serves something the
+/// server must call binds 0.0.0.0 and hands out this host.
+pub fn pod_host() -> String {
+    std::env::var("SCARAB_E2E_POD_HOST")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| panic!("SCARAB_E2E_POD_HOST unset: `just e2e` probes it from a Pod"))
 }
 
 /// Path to the `scarab` CLI binary (the happy-path scenario dispatches
@@ -104,6 +91,22 @@ pub fn cli_bin() -> PathBuf {
         Ok(p) => PathBuf::from(p),
         Err(_) => workspace_root().join("target/debug/scarab"),
     }
+}
+
+/// `kubectl` on the kind cluster's own kubeconfig, with `args`; panics with
+/// stderr on failure and returns stdout.
+pub fn kubectl(args: &[&str]) -> String {
+    let out = std::process::Command::new("kubectl")
+        .env("KUBECONFIG", kubeconfig())
+        .args(args)
+        .output()
+        .expect("kubectl runs");
+    assert!(
+        out.status.success(),
+        "kubectl {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
 // --- minimal DTOs (just the fields the scenarios assert) --------------------
@@ -297,30 +300,20 @@ pub async fn logs(client: &reqwest::Client, base: &str, id: &str) -> String {
 /// Names of the step Pods for `run_id` in the stack's kind cluster, via the
 /// isolated kubeconfig (never the ambient context).
 pub fn pods_of_run(run_id: &str) -> Vec<String> {
-    let out = std::process::Command::new("kubectl")
-        .env("KUBECONFIG", kubeconfig())
-        .args([
-            "get",
-            "pods",
-            "-n",
-            &namespace(),
-            "-l",
-            &format!("scarab.io/run={run_id}"),
-            "--no-headers",
-            "-o",
-            "custom-columns=:metadata.name",
-        ])
-        .output()
-        .expect("kubectl runs");
-    assert!(
-        out.status.success(),
-        "kubectl get pods failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(str::to_string)
-        .collect()
+    kubectl(&[
+        "get",
+        "pods",
+        "-n",
+        &namespace(),
+        "-l",
+        &format!("scarab.io/run={run_id}"),
+        "--no-headers",
+        "-o",
+        "custom-columns=:metadata.name",
+    ])
+    .lines()
+    .map(str::trim)
+    .filter(|l| !l.is_empty())
+    .map(str::to_string)
+    .collect()
 }

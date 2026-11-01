@@ -18,7 +18,7 @@
 //!
 //! Env-gated (`SCARAB_TEST_FORGEJO=1`) exactly like the `SCARAB_TEST_KUBE` tier,
 //! so a plain `cargo test` / CI run never needs a Forgejo. The lifecycle is
-//! owned by `just forgejo-verify`; see `deploy/local-forgejo/README.md`.
+//! owned by `just e2e`; see `deploy/kind/README.md`.
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
@@ -38,7 +38,7 @@ macro_rules! require_forgejo {
         if std::env::var("SCARAB_TEST_FORGEJO").ok().as_deref() != Some("1") {
             eprintln!(
                 "SKIPPED (live Forgejo): set SCARAB_TEST_FORGEJO=1 against a seeded instance — \
-                 `just forgejo-verify` owns the lifecycle (deploy/local-forgejo/)"
+                 `just e2e` owns the lifecycle (deploy/kind/forgejo.yaml)"
             );
             return;
         }
@@ -49,7 +49,7 @@ fn env(key: &str) -> String {
     std::env::var(key)
         .ok()
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| panic!("{key} is not set — `just forgejo-verify` writes it"))
+        .unwrap_or_else(|| panic!("{key} is not set — `just e2e` writes it"))
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -179,7 +179,7 @@ async fn await_delivery(inbox: &Inbox, timeout: Duration) -> Delivery {
             start.elapsed() < timeout,
             "no delivery arrived within {timeout:?}. Forgejo refuses to deliver to \
              private/loopback addresses unless `webhook.ALLOWED_HOST_LIST` allows them \
-             (deploy/local-forgejo/compose.yaml sets it), and the callback host must be \
+             (deploy/kind/forgejo.yaml sets it), and the callback host must be \
              reachable from inside the container."
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -203,7 +203,7 @@ async fn list_accessible_repos_walks_past_the_first_page() {
         env("SCARAB_TEST_FORGEJO_TOKEN"),
     );
     let owner = env("SCARAB_TEST_FORGEJO_OWNER");
-    let expected: usize = env_or("SCARAB_TEST_FORGEJO_REPO_TOTAL", "57")
+    let expected: usize = env_or("SCARAB_TEST_FORGEJO_REPO_TOTAL", "59")
         .parse()
         .expect("SCARAB_TEST_FORGEJO_REPO_TOTAL is a number");
     assert!(
@@ -239,8 +239,14 @@ async fn list_accessible_repos_walks_past_the_first_page() {
     // The owner spelling actually used by the real response — `repos_from_page`
     // accepts `login` or `username`, and an owner-less row is dropped silently,
     // so an empty owner here would mean the pick-list lost its coordinates.
+    // The admin's own repos, plus the team org's repo, which it owns through
+    // the org (seeded for the list_collaborators cases).
+    let team_org = env("SCARAB_TEST_FORGEJO_TEAM_ORG");
     for r in &repos {
-        assert_eq!(r.owner, owner, "every seeded repo belongs to {owner}");
+        assert!(
+            r.owner == owner || r.owner == team_org,
+            "every seeded repo belongs to {owner} or {team_org}: {r:?}"
+        );
     }
     // And the two working repos are in the set, not just the filler.
     for name in [
