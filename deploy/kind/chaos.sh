@@ -1,6 +1,20 @@
 #!/usr/bin/env bash
-# `just test chaos [mid-drain|mid-feed|all] [seed]` and `just test chaos replay <file>`:
-# ADR-0077 rank 1 on the kind release (Amendment 2026-11-01 §4).
+# `just test chaos [<scenario>|<rank>|all] [seed]` and `just test chaos replay <file>`:
+# ADR-0077 ranks 1, 2 and 4 on the kind release (Amendment 2026-11-01 §4).
+#
+# Scenarios (each runs three chained Runs, then the invariant checker):
+#   mid-drain     rank 1: delete a Depot Pod (grace 0) while a producer drains
+#   mid-feed      rank 1: the same while a consumer's fetcher pulls its inputs
+#   two-replicas  rank 2: no fault, two server replicas; counts only when both
+#                 replicas claimed some of the launches
+#   kill-server   rank 2: SIGKILL the server replica holding the producer's
+#                 launch claim while its drain is in flight
+#   stop-leader   rank 4: SIGSTOP the scheduler leader until a peer takes the
+#                 lease over (past the 30 s TTL), then SIGCONT it
+# Groups: rank1 (mid-drain mid-feed), rank2 (two-replicas kill-server),
+# rank4 (stop-leader), all (every scenario, in that order). The server signals
+# go from the kind node's PID namespace (`docker exec <node> kill`), because
+# the server is PID 1 in its container; see crates/scarab-chaos/src/node.rs.
 #
 #   1. up.sh chaos: refused while step Pods of the current mode run; deletes
 #      the Depot's PVCs (a warm cache of another bucket would hide faults);
@@ -8,22 +22,25 @@
 #      and MinIO, reached through toxiproxy; 2 servers, 2 Depot replicas,
 #      plugins off.
 #   2. scarab-chaos (crates/scarab-chaos) runs each scenario: three chained
-#      Runs, one Depot Pod deleted with grace 0 mid-drain or mid-feed, then
-#      the invariant checker. Each run writes a directory under
-#      $SCARAB_CHAOS_DIR (default deploy/kind/.chaos): scenario.json (the
-#      replayable file), pods.jsonl, verdict.json, release-log.txt and, for
-#      mid-feed, fetcher-log.txt. The kind node's memory samples go to
-#      $SCARAB_CHAOS_DIR/memory-<time>.log.
-#   3. cancels the chaos database's non-terminal Runs through the API (a
-#      scenario refuses to start while one is left), then switches the
-#      release back to the mode that was active before (dev or
-#      dogfood; e2e and anything else go back to dev, because restoring e2e
-#      would open a new public Forgejo tunnel) and runs `just stack demo` there.
+#      Runs, the scenario's fault, then the invariant checker. Each run writes
+#      a directory under $SCARAB_CHAOS_DIR (default deploy/kind/.chaos):
+#      scenario.json (the replayable file), pods.jsonl, verdict.json,
+#      release-log.txt and, for mid-feed, fetcher-log.txt. The kind node's
+#      memory samples go to $SCARAB_CHAOS_DIR/memory-<time>.log.
+#   3. sends SIGCONT to every server container on the node (an interrupted
+#      stop-leader run must not leave a server stopped), cancels the chaos
+#      database's non-terminal Runs through the API (a scenario refuses to
+#      start while one is left), then switches the release back to the mode
+#      that was active before (dev or dogfood; e2e and anything else go back
+#      to dev, because restoring e2e would open a new public Forgejo tunnel)
+#      and runs `just stack demo` there.
 #
 # Exit code: 0 when every verdict passed; 1 when a verdict failed (a finding);
-# 2 when the harness could not run a scenario; 3 when no verdict failed but a
-# scenario was INCONCLUSIVE (its fault did not fire, landed outside its window
-# or fired after its condition stopped holding), which is not a pass.
+# 2 when the harness could not run a scenario (including a SIGSTOP that did not
+# stop the leader); 3 when no verdict failed but a scenario was INCONCLUSIVE
+# (its fault did not fire, landed outside its window, fired after its
+# condition stopped holding, or hit a replica other than the one it names),
+# which is not a pass.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -38,13 +55,16 @@ cd "$root"
 . "$here/test-env.sh"
 
 case "$what" in
-  mid-drain|mid-feed) kinds=("$what") ;;
-  all) kinds=(mid-drain mid-feed) ;;
+  mid-drain|mid-feed|two-replicas|kill-server|stop-leader) kinds=("$what") ;;
+  rank1) kinds=(mid-drain mid-feed) ;;
+  rank2) kinds=(two-replicas kill-server) ;;
+  rank4) kinds=(stop-leader) ;;
+  all) kinds=(mid-drain mid-feed two-replicas kill-server stop-leader) ;;
   replay)
     [ -f "$arg" ] || die "just test chaos replay <scenario.json>: '$arg' does not exist"
     replay_file="$(cd "$(dirname "$arg")" && pwd)/$(basename "$arg")"
     ;;
-  *) die "unknown scenario '$what' (expected mid-drain, mid-feed, all or replay <file>)" ;;
+  *) die "unknown scenario '$what' (expected mid-drain, mid-feed, two-replicas, kill-server, stop-leader, rank1, rank2, rank4, all or replay <file>)" ;;
 esac
 if [ "$what" != replay ]; then
   case "$arg" in ''|*[!0-9]*) die "seed must be a non-negative integer, got '$arg'" ;; esac
@@ -68,6 +88,16 @@ rc=0
 # only stops the port-forwards.
 switched=0
 checker_env=0   # set once the SCARAB_CHAOS_* connections are exported
+# SIGCONT to every scarab-server container's process on the node. The harness
+# resumes a server it stopped on every path it controls; this covers the ones
+# it does not (an interrupt). SIGCONT to a running process does nothing.
+resume_servers() {
+  docker exec "$node" sh -c '
+    for id in $(crictl ps -q --name "^scarab-server$"); do
+      pid=$(crictl inspect --output go-template --template "{{.info.pid}}" "$id" || true)
+      if [ -n "$pid" ] && [ "$pid" != 0 ]; then kill -CONT "$pid" || true; fi
+    done' || echo "warning: could not send SIGCONT to the server containers on $node" >&2
+}
 cleanup() {
   local code=$? mode_now
   [ -z "$stats_pid" ] || kill "$stats_pid" 2>/dev/null || true
@@ -78,6 +108,7 @@ cleanup() {
     echo "==> the release was not switched to chaos mode; leaving it in ${mode_now:-its current mode}"
     exit "$rc"
   fi
+  resume_servers
   # A Run the quiesce bound gave up on stays non-terminal in scarab_chaos and
   # would resume beside the next session's workload. Cancel it through the
   # API while the chaos release still runs (the next `just test chaos` refuses to
@@ -134,6 +165,7 @@ export SCARAB_CHAOS_S3_ENDPOINT="http://127.0.0.1:$s3_port"
 export SCARAB_CHAOS_S3_BUCKET=scarab-chaos
 export SCARAB_CHAOS_S3_ACCESS_KEY=scarab
 export SCARAB_CHAOS_S3_SECRET_KEY=scarabsecret
+export SCARAB_CHAOS_NODE="$node"
 checker_env=1
 
 server_replicas="$(kc get deploy "$release" -n "$ns" -o jsonpath='{.spec.replicas}')"
