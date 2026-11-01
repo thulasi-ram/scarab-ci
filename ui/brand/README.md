@@ -24,19 +24,32 @@ thick femur, a knee, a thinner spiny tibia and a small foot.
 
 | File | What it is |
 |------|-----------|
-| `logo/scarab-halftone.svg` | cream dots on a transparent background |
-| `logo/scarab-halftone-tile.svg` | the same on an opaque `#0b0c0e` square |
-| `icons/halftone/icon-{16..1024}.png` | transparent PNGs of the first |
-| `icons/halftone-tile/icon-{16..1024}.png` | opaque PNGs of the second; use these for app icons (apple-touch 180, PWA 192 and 512) |
+| `logo/scarab-halftone.svg` | cream dots on a transparent background, for dark surfaces |
+| `logo/scarab-halftone-ink.svg` | ink dots on a transparent background, for light surfaces |
+| `logo/scarab-halftone-tile.svg` | the cream mark on an opaque `#0b0c0e` square |
+| `icons/halftone/icon-{16..1024}.png` | transparent PNGs of the cream mark |
+| `icons/halftone-ink/icon-{16..1024}.png` | transparent PNGs of the ink mark |
+| `icons/halftone-tile/icon-{16..1024}.png` | opaque PNGs of the tile; use these for app icons (apple-touch 180, PWA 192 and 512) |
+| `logo/scarab-glyph-ink.svg`, `logo/scarab-glyph-cream.svg` | solid glyph for sizes below about 48 px |
+| `favicon/halftone/favicon.svg` | the glyph, theme-aware: ink on light, cream on dark |
+| `favicon/halftone/favicon.ico`, `favicon-{16,32,48,64}.png` | cream glyph on a rounded `#0b0c0e` tile, visible on any tab colour |
+| `favicon/halftone/apple-touch-icon.png`, `icon-192.png`, `icon-512.png` | cream glyph on a square `#0b0c0e` tile |
+
+The ink mark is not the cream mark with the colour changed. The shading is
+inverted, so the lit wing cases get the smallest dots and the shaded pronotum
+gets the largest. A plain colour swap would draw the lit areas as the darkest.
+
+The glyph is a solid drawing of the same outline: head, pronotum, two wing
+cases with a seam, horns and six legs, with no dots. It stays recognisable at
+16 px, where the dotted mark does not.
 
 Status and limits:
 
 - It sits beside the emblem. The favicon, the docs logo and the web UI still
   use the emblem; nothing is rewired to this mark yet.
-- Dark surfaces only. The dots are cream, so on white they disappear. There is
-  no light-background version.
-- Below about 48 px the legs and horns merge, and at 16 px the mark is a blob.
-  There is no simplified favicon glyph yet.
+- The dotted mark is a blob at 16 px and loses its legs and horns below about
+  48 px. Use the glyph there.
+- The glyph has no hexagon and no shading. It does not carry the dot motif.
 - The body proportions were measured on a dorsal photograph of *Scarabaeus
   sacer* (Wikimedia Commons, `Scarabaeus.sacer.jpg`). No pixels from the photo
   are in the files.
