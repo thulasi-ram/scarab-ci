@@ -115,6 +115,29 @@ repositories have several owners) is shown only to global admins. A global admin
 To split one, add a connection for each org and bind (or re-sync) the repositories through it: a
 repository moves off a connection with no org. Then remove the old connection.
 
+## Settings
+
+The web UI's settings page has a sidebar with up to three groups, and each section has its own
+address:
+
+- **Your account**, for everyone, under `/settings/<section>`: Profile (your sign-in accounts),
+  Security (your passkeys and security events) and Appearance.
+- **Organization settings**, for the admins of an org, under `/orgs/<org>/settings/<section>`:
+  Connections, Members, Environments, Plugins, Libraries, Secrets, API tokens, Security and Event
+  log. `/orgs/<org>/settings` opens Connections. An admin of several orgs switches org at the top
+  of the group.
+- **Server administration**, for global admins, under `/settings/server/<section>`: Connect a
+  forge.
+
+`/settings` opens the first org you administer, or your profile. The old addresses (`/account`,
+`/account/security`, `/settings/libraries/review`) redirect to the new ones. The UI shows only
+the groups you may use; the server checks every request.
+
+### Appearance
+
+Settings › Appearance picks the palette, **Emerald** or **Mono** (greys), and light or dark mode.
+Both choices are kept in your browser, so they apply to you on that browser only.
+
 ## Key values
 
 Every key in this table exists in `values.yaml`:
