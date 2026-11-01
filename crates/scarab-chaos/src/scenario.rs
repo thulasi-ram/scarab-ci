@@ -17,8 +17,12 @@ pub const LEASE_TTL_SECS: u64 = 30;
 /// the control plane keeps re-driving a failing drain before it gives up.
 pub const DRAIN_ESCALATION_SECS: u64 = 300;
 
-/// Rank 1's two scenarios: the same fault (one Depot Pod deleted with grace
-/// 0) at two moments.
+/// The scenarios. Rank 1 (ADR-0077 §3): one Depot Pod deleted with grace 0,
+/// at two moments. Rank 2: two server replicas with no fault, and one server
+/// SIGKILLed mid-drain. Rank 4: the scheduler leader SIGSTOPped past the
+/// lease TTL, then resumed. The server signals are sent from the kind
+/// node's PID namespace (`crate::node`): in its container the server is PID
+/// 1 with no init and ignores them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum Kind {
@@ -29,6 +33,17 @@ pub enum Kind {
     /// While a consumer's `scarab-workspace-init` fetcher is pulling its
     /// inputs from the Depot.
     MidFeed,
+    /// Rank 2 with no fault: the workload at two server replicas. It counts
+    /// only when both replicas claimed some of its launch intents.
+    TwoReplicas,
+    /// Rank 2: SIGKILL the server replica that holds the producer's launch
+    /// claim (and so polls its Pod and drives its drain) while the drain is
+    /// in flight. The kubelet restarts the container in the same Pod.
+    KillServer,
+    /// Rank 4: SIGSTOP the scheduler leader while a producer runs, keep it
+    /// stopped until a peer takes the lease over (past the 30 s TTL), then
+    /// SIGCONT it.
+    StopLeader,
 }
 
 impl Kind {
@@ -36,24 +51,51 @@ impl Kind {
         match self {
             Kind::MidDrain => "mid-drain",
             Kind::MidFeed => "mid-feed",
+            Kind::TwoReplicas => "two-replicas",
+            Kind::KillServer => "kill-server",
+            Kind::StopLeader => "stop-leader",
         }
     }
 
     /// The step whose Pod the trigger watches.
     pub fn target_step(self) -> &'static str {
         match self {
-            Kind::MidDrain => "produce",
             Kind::MidFeed => "consume",
+            _ => "produce",
         }
+    }
+
+    /// The window on the target Pod the fault must land in, by its landing
+    /// class; `None` for a scenario with no window.
+    pub fn window(self) -> Option<Kind> {
+        match self {
+            Kind::MidDrain | Kind::KillServer => Some(Kind::MidDrain),
+            Kind::MidFeed => Some(Kind::MidFeed),
+            Kind::TwoReplicas | Kind::StopLeader => None,
+        }
+    }
+
+    /// Whether the scenario fires a fault at all.
+    pub fn has_fault(self) -> bool {
+        self != Kind::TwoReplicas
+    }
+
+    /// Whether the victim is a server replica (else a Depot replica).
+    pub fn targets_servers(self) -> bool {
+        matches!(self, Kind::KillServer | Kind::StopLeader | Kind::TwoReplicas)
     }
 
     /// The seeded delay range after the trigger, in ms. Measured 2026-11-01
     /// at 2+2 on colima (2 vCPU) with 64 x 2 MiB per producer: the drain
-    /// window (step exit to root annotation) was 63 s, the feed 8 s.
+    /// window (step exit to root annotation) was 63 s, the feed 8 s. The
+    /// leader stop needs only Runs in flight, and the producer's step runs
+    /// for several seconds.
     fn delay_range_ms(self) -> std::ops::RangeInclusive<u64> {
         match self {
-            Kind::MidDrain => 2_000..=10_000,
+            Kind::MidDrain | Kind::KillServer => 2_000..=10_000,
             Kind::MidFeed => 0..=2_000,
+            Kind::StopLeader => 0..=3_000,
+            Kind::TwoReplicas => 0..=0,
         }
     }
 }
@@ -123,20 +165,36 @@ pub struct Plan {
     pub target_run: u32,
     /// How long after the trigger condition is first seen the fault fires.
     pub delay_ms: u64,
-    /// Which Depot replica is deleted: `scarab-workspace-<ordinal>`.
+    /// Which replica is the victim. Rank 1: the Depot Pod
+    /// `scarab-workspace-<ordinal>`. Ranks 2 and 4: the index into the
+    /// server Pods sorted by name, used only when the claim or lease owner
+    /// cannot be mapped to a Pod (the scenario records which it used).
     pub victim_ordinal: u32,
+    /// Rank 4: how long the leader stays stopped after a peer has taken the
+    /// lease over. Drawn last, so rank 1's plans did not change when it was
+    /// added.
+    #[serde(default)]
+    pub hold_ms: u64,
 }
 
 impl Plan {
-    pub fn from_seed(kind: Kind, seed: u64, workload: &Workload, depot_replicas: u32) -> Plan {
+    pub fn from_seed(kind: Kind, seed: u64, workload: &Workload, server_replicas: u32, depot_replicas: u32) -> Plan {
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        let victims = if kind.targets_servers() { server_replicas } else { depot_replicas };
         Plan {
             target_run: rng.gen_range(0..workload.runs.max(1)),
             delay_ms: rng.gen_range(kind.delay_range_ms()),
-            victim_ordinal: rng.gen_range(0..depot_replicas.max(1)),
+            victim_ordinal: rng.gen_range(0..victims.max(1)),
+            hold_ms: rng.gen_range(0..=HOLD_MAX_MS),
         }
     }
 }
+
+/// Rank 4's longest hold after the takeover. Short on purpose: the chart's
+/// liveness probe (`/healthz` every 15 s, three failures) restarts a stopped
+/// server 30 to 45 s after it stops answering, and the lease TTL already
+/// takes 30 s of that.
+pub const HOLD_MAX_MS: u64 = 2_000;
 
 /// The trigger as the nemesis saw it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -163,10 +221,65 @@ pub struct Landing {
     pub window_end_ms: Option<i64>,
 }
 
+/// A signal sent to a server process from the kind node's PID namespace.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct NodeSignal {
+    /// `KILL` or `STOP` (a `STOP` is always followed by a `CONT`).
+    pub signal: String,
+    pub node: String,
+    /// The `scarab-server` container's id (no `containerd://` prefix).
+    pub container_id: String,
+    /// The process's PID in the node's PID namespace (`crictl inspect`).
+    pub pid: i64,
+    /// Whether the signal took effect: for `KILL`, the kubelet restarted the
+    /// container in the same Pod after a termination by signal 9 (exit
+    /// 137); for `STOP`, `/proc/<pid>/status` said `T` (stopped).
+    pub delivered: bool,
+    /// What showed it (the termination record, or the `State:` line).
+    pub evidence: String,
+}
+
+/// Rank 2: the producer's launch claim, from `outbox`, and whether its owner
+/// kept writing after the kill.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ClaimObservation {
+    /// `outbox.claimed_by` of the launch intent when the kill fired (only a
+    /// claim that had not lapsed and an intent not yet dispatched).
+    pub owner: Option<String>,
+    pub claimed_until: Option<i64>,
+    /// The latest `claimed_until` or lease `expires_at` the owner had
+    /// written, 5 s after the kill (writes in flight at the kill have landed
+    /// by then) and 20 s after it. Equal: the owner stopped writing, so it
+    /// was the process killed. Grown: it is still alive.
+    pub owner_written_until_5s: Option<i64>,
+    pub owner_written_until_20s: Option<i64>,
+}
+
+/// Rank 4: the `leases` row `resource = 'scheduler'` around the stop. `term`
+/// is read only when the column exists (ADR-0077 Amendment, grill, item 2).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LeaseObservation {
+    pub owner_before: String,
+    pub expires_before: i64,
+    pub term_before: Option<i64>,
+    /// The first different owner seen while the old one was stopped.
+    pub owner_after: Option<String>,
+    pub term_after: Option<i64>,
+    pub takeover_at_ms: Option<i64>,
+    /// The row 10 s after the resume: the resumed process must not hold it.
+    pub owner_after_resume: Option<String>,
+    pub term_after_resume: Option<i64>,
+    /// Replicas stopped and resumed first because the lease kept being
+    /// renewed while they were stopped (they were not the leader).
+    pub probes: Vec<String>,
+}
+
 /// One fault, as fired.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Fault {
-    /// `delete-pod`: a Pod delete with `gracePeriodSeconds: 0`.
+    /// `delete-pod`: a Pod delete with `gracePeriodSeconds: 0`. `kill-server`:
+    /// SIGKILL from the kind node. `stop-leader`: SIGSTOP, then SIGCONT, from
+    /// the kind node.
     pub action: String,
     pub pod: String,
     pub pod_uid: Option<String>,
@@ -179,6 +292,26 @@ pub struct Fault {
     pub fence_pack_rows_at_fire: Option<i64>,
     pub fired_at_ms: i64,
     pub landing: Option<Landing>,
+    /// Ranks 2 and 4: the signal as sent and whether it took effect.
+    #[serde(default)]
+    pub signal: Option<NodeSignal>,
+    /// Ranks 2 and 4: how the victim was chosen (`owner-names-pod`,
+    /// `owner-in-pod-log`, `seed`, `lease-renewal`).
+    #[serde(default)]
+    pub target_basis: Option<String>,
+    /// Ranks 2 and 4: what the victim turned out to be. Rank 2:
+    /// `claim-holder`, `peer` or `unknown`. Rank 4: `leader`,
+    /// `leader-no-takeover` or `not-leader`; `restarted-while-stopped` when
+    /// the kubelet restarted it before the SIGCONT.
+    #[serde(default)]
+    pub victim_role: Option<String>,
+    /// Rank 4: when the SIGCONT was sent.
+    #[serde(default)]
+    pub resumed_at_ms: Option<i64>,
+    #[serde(default)]
+    pub claim: Option<ClaimObservation>,
+    #[serde(default)]
+    pub lease: Option<LeaseObservation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -205,7 +338,7 @@ pub struct Scenario {
 
 impl Scenario {
     pub fn new(kind: Kind, seed: u64, workload: Workload, server_replicas: u32, depot_replicas: u32) -> Self {
-        let plan = Plan::from_seed(kind, seed, &workload, depot_replicas);
+        let plan = Plan::from_seed(kind, seed, &workload, server_replicas, depot_replicas);
         Self::with_plan(kind, seed, workload, plan, server_replicas, depot_replicas)
     }
 
@@ -267,31 +400,35 @@ impl Scenario {
         std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
     }
 
-    /// The deadline every Run must be terminal by: the bound, from the fault
-    /// (or from the start when nothing fired).
+    /// The deadline every Run must be terminal by: the bound, from the end
+    /// of the fault (its resume, for a stop), or from the start when nothing
+    /// fired.
     pub fn quiesce_deadline_ms(&self) -> i64 {
         let from = self
             .faults
             .iter()
-            .map(|f| f.fired_at_ms)
+            .map(|f| f.resumed_at_ms.unwrap_or(f.fired_at_ms).max(f.fired_at_ms))
             .max()
             .unwrap_or(self.started_at_ms);
         from + (self.quiesce_bound_secs as i64) * 1000
     }
 }
 
-/// ADR-0077 §2: lease TTL + the workload's step time + the drain escalation,
-/// for any scenario that faults the Depot.
+/// ADR-0077 §2: lease TTL + the workload's step time + the drain escalation.
+/// The escalation term is for scenarios that fault the Depot; the server
+/// scenarios keep it too, because a killed or stopped replica can leave a
+/// drain to be driven again.
 pub fn quiesce_bound_secs(workload: &Workload) -> u64 {
     LEASE_TTL_SECS + workload.expected_secs + DRAIN_ESCALATION_SECS
 }
 
-/// Where a fault fired relative to a window.
-pub fn classify(kind: Kind, fired_at_ms: i64, start: Option<i64>, end: Option<i64>) -> Landing {
+/// Where a fault fired relative to a window. Inside it, the class is the
+/// window's name (`mid-drain`, `mid-feed`).
+pub fn classify(window: Kind, fired_at_ms: i64, start: Option<i64>, end: Option<i64>) -> Landing {
     let class = match (start, end) {
         (Some(s), _) if fired_at_ms < s => "before-window".to_string(),
         (Some(_), Some(e)) if fired_at_ms >= e => "after-window".to_string(),
-        (Some(_), _) => kind.as_str().to_string(),
+        (Some(_), _) => window.as_str().to_string(),
         (None, _) => "before-window".to_string(),
     };
     Landing {
@@ -309,17 +446,21 @@ mod tests {
     fn a_seed_gives_the_same_plan_and_stays_in_range() {
         let w = Workload::default();
         for seed in 0..200 {
-            let a = Plan::from_seed(Kind::MidDrain, seed, &w, 2);
-            assert_eq!(a, Plan::from_seed(Kind::MidDrain, seed, &w, 2));
+            let a = Plan::from_seed(Kind::MidDrain, seed, &w, 2, 2);
+            assert_eq!(a, Plan::from_seed(Kind::MidDrain, seed, &w, 2, 2));
             assert!(a.target_run < w.runs && a.victim_ordinal < 2);
             assert!((2_000..=10_000).contains(&a.delay_ms));
-            let f = Plan::from_seed(Kind::MidFeed, seed, &w, 2);
+            let f = Plan::from_seed(Kind::MidFeed, seed, &w, 2, 2);
             assert!(f.delay_ms <= 2_000);
+            // The victim ordinal ranges over the replicas the scenario faults.
+            let k = Plan::from_seed(Kind::KillServer, seed, &w, 3, 1);
+            assert!(k.victim_ordinal < 3 && k.hold_ms <= HOLD_MAX_MS);
+            assert_eq!(Plan::from_seed(Kind::MidFeed, seed, &w, 3, 1).victim_ordinal, 0);
         }
         // Different seeds explore different plans.
         let plans: std::collections::HashSet<_> = (0..50)
             .map(|s| {
-                let p = Plan::from_seed(Kind::MidDrain, s, &w, 2);
+                let p = Plan::from_seed(Kind::MidDrain, s, &w, 2, 2);
                 (p.target_run, p.victim_ordinal, p.delay_ms)
             })
             .collect();
@@ -342,6 +483,34 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// A scenario file written before the rank 2 and 4 fields existed still
+    /// reads, and replays with the same plan.
+    #[test]
+    fn an_old_scenario_file_still_reads() {
+        let mut v = serde_json::to_value(Scenario::new(Kind::MidDrain, 3, Workload::default(), 2, 2)).unwrap();
+        v["plan"].as_object_mut().unwrap().remove("hold_ms");
+        v["faults"] = serde_json::json!([{
+            "action": "delete-pod", "pod": "scarab-workspace-0", "pod_uid": null, "grace_seconds": 0,
+            "trigger": null, "condition_held_at_fire": true, "fence_pack_rows_at_fire": null,
+            "fired_at_ms": 5, "landing": null
+        }]);
+        let s: Scenario = serde_json::from_value(v).unwrap();
+        assert_eq!(s.plan.hold_ms, 0);
+        assert_eq!(s.faults[0].signal, None);
+    }
+
+    /// The bound counts from a stopped leader's resume, not from its stop.
+    #[test]
+    fn the_quiesce_deadline_counts_from_the_resume() {
+        let mut s = Scenario::new(Kind::StopLeader, 1, Workload::default(), 2, 2);
+        s.faults.push(Fault {
+            fired_at_ms: 1_000,
+            resumed_at_ms: Some(40_000),
+            ..Default::default()
+        });
+        assert_eq!(s.quiesce_deadline_ms(), 40_000 + (s.quiesce_bound_secs as i64) * 1000);
+    }
+
     #[test]
     fn the_bound_is_the_adr_sum() {
         assert_eq!(quiesce_bound_secs(&Workload::default()), 30 + 300 + 300);
@@ -349,7 +518,7 @@ mod tests {
 
     #[test]
     fn landing_classes() {
-        let k = Kind::MidDrain;
+        let k = Kind::KillServer.window().unwrap();
         assert_eq!(classify(k, 5, Some(10), Some(20)).class, "before-window");
         assert_eq!(classify(k, 15, Some(10), Some(20)).class, "mid-drain");
         assert_eq!(classify(k, 15, Some(10), None).class, "mid-drain");

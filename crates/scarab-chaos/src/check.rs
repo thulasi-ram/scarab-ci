@@ -1,4 +1,5 @@
-//! The invariant checker (ADR-0077 §2), for the invariants rank 1 exercises.
+//! The invariant checker (ADR-0077 §2), for the invariants ranks 1, 2 and 4
+//! exercise.
 //!
 //! [`gather`] reads the recorded state: Postgres (`runs`, `step_runs`,
 //! `attempts`, `events`, the Depot tables), the bucket (HEAD and ranged GET
@@ -19,7 +20,8 @@
 //! | I4   | every green Attempt's output snapshot closure is in committed packs whose ranges read back and hash to their addresses; a member in another fence's pack needs a `depot_fence_borrows` edge |
 //! | I8   | after quiesce no Pod of a scenario Run is still pending or running, and no per-Pod Secret outlives its Pod |
 //! | I10  | no `committed = FALSE` pack row older than the linger for a fence whose drain has a record; every committed pack's object exists at its recorded size |
-//! | W1   | the rank-1 workload's own outcome: every scenario Run that ended, ended `succeeded`, and every green Attempt has an output snapshot |
+//! | L1   | rank 4: a takeover of the scheduler lease increments `leases.term`, and the term never goes back (only where the column exists) |
+//! | W1   | the workload's own outcome: every scenario Run that ended, ended `succeeded`, and every green Attempt has an output snapshot |
 //!
 //! W1 is not one of ADR-0077 §2's invariants. As written there, I3 accepts a
 //! dead-lettered Run and I4 passes a green Attempt whose snapshot is NULL, so
@@ -30,22 +32,25 @@
 //!
 //! Outside the invariants, a scenario is INCONCLUSIVE, not PASS, when its
 //! fault did not exercise what it names ([`exercised`]): no fault fired, the
-//! fault landed outside its window, or the trigger condition no longer held
-//! when it fired. It is also INCONCLUSIVE when an invariant looked at fewer
-//! things than the workload must produce ([`minimums`]). A FAIL finding still
-//! makes the verdict FAIL.
+//! fault landed outside its window, the trigger condition no longer held
+//! when it fired, a server signal did not take effect, or it hit a replica
+//! other than the one the scenario names. `two-replicas` is INCONCLUSIVE
+//! when one replica drove every step. It is also INCONCLUSIVE when an
+//! invariant looked at fewer things than the workload must produce
+//! ([`minimums`]). A FAIL finding still makes the verdict FAIL.
 //!
 //! I5 folds the transition events in the checker. `scarab-engine` exports no
 //! fold, and the checker does not link the engine it checks. A mismatch
 //! between two non-terminal statuses (`pending` against `ready`) is reported
-//! as a warning: not every admission step is journalled, and after quiesce
-//! every row is terminal anyway.
+//! as a warning: the checker does not assume every non-terminal step is
+//! journalled, and after quiesce every row should be terminal.
 //!
-//! I1b compares consecutive Attempts of one Step. A Depot fault does not
-//! cause a retry, so rank 1 never has a pair: I1b is reported as not
-//! exercised and has no minimum.
+//! I1b compares consecutive Attempts of one Step. None of the workloads here
+//! is built to cause a retry (a Depot fault or a server kill is meant to be
+//! absorbed), so I1b often has no pair: it is reported as not exercised and
+//! has no minimum.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use futures::StreamExt as _;
 use k8s_openapi::api::core::v1::{Pod, Secret, Service};
@@ -224,6 +229,9 @@ pub struct Facts {
     pub faults: Vec<Fault>,
     /// How many Runs the workload submits (`workload.runs`).
     pub expected_runs: usize,
+    /// Distinct `outbox.claimed_by` of the scenario's launch intents: the
+    /// replicas that drove a step to its end (`two-replicas`).
+    pub launch_claimers: BTreeSet<String>,
 }
 
 // --- evaluate (pure) -------------------------------------------------------------
@@ -316,8 +324,17 @@ fn i1b_overrun(life: &PodLife, end: Option<i64>, start_b: i64, last_record_ms: i
 
 /// Why `faults` did not exercise `kind`; empty when they did. Each fault must
 /// have fired with its trigger condition still holding and landed inside the
-/// window it names.
+/// window it names. A server signal must also have taken effect and hit the
+/// replica the scenario names: rank 2 the producer's claim holder, rank 4
+/// the leader, stopped until a peer took the lease and past its TTL, then
+/// resumed. `two-replicas` fires nothing.
 pub fn exercised(kind: Kind, faults: &[Fault]) -> Vec<String> {
+    if !kind.has_fault() {
+        return faults
+            .iter()
+            .map(|x| format!("{} {} fired in a scenario that has no fault", x.action, x.pod))
+            .collect();
+    }
     if faults.is_empty() {
         return vec!["no fault fired (the trigger never held, or every Run ended first)".into()];
     }
@@ -326,24 +343,64 @@ pub fn exercised(kind: Kind, faults: &[Fault]) -> Vec<String> {
         if !x.condition_held_at_fire {
             why.push(format!("{} {}: the trigger condition no longer held when it fired", x.action, x.pod));
         }
-        match &x.landing {
-            None => why.push(format!("{} {}: where it landed is unknown", x.action, x.pod)),
-            Some(l) if l.class != kind.as_str() => why.push(format!(
-                "{} {}: landed {}, outside the {} window",
+        if let Some(w) = kind.window() {
+            match &x.landing {
+                None => why.push(format!("{} {}: where it landed is unknown", x.action, x.pod)),
+                Some(l) if l.class != w.as_str() => why.push(format!(
+                    "{} {}: landed {}, outside the {} window",
+                    x.action,
+                    x.pod,
+                    l.class,
+                    w.as_str()
+                )),
+                Some(_) => {}
+            }
+        }
+        if kind.targets_servers() {
+            match &x.signal {
+                Some(sig) if sig.delivered => {}
+                Some(sig) => why.push(format!(
+                    "{} {}: SIG{} to PID {} did not take effect ({})",
+                    x.action, x.pod, sig.signal, sig.pid, sig.evidence
+                )),
+                None => why.push(format!("{} {}: no signal was recorded", x.action, x.pod)),
+            }
+        }
+        let role = x.victim_role.as_deref().unwrap_or("unknown");
+        match kind {
+            Kind::KillServer if role != "claim-holder" => why.push(format!(
+                "{} {}: the victim was the {role}, not the replica holding the producer's launch claim \
+                 (chosen by {})",
                 x.action,
                 x.pod,
-                l.class,
-                kind.as_str()
+                x.target_basis.as_deref().unwrap_or("?")
             )),
-            Some(_) => {}
+            Kind::StopLeader => {
+                if role != "leader" {
+                    why.push(format!("{} {}: {role} (no peer took the lease over while it was stopped, \
+                                      or it did not stay stopped until its resume)", x.action, x.pod));
+                }
+                match x.resumed_at_ms {
+                    None => why.push(format!("{} {}: never resumed", x.action, x.pod)),
+                    Some(r) if r - x.fired_at_ms <= crate::scenario::LEASE_TTL_SECS as i64 * 1000 => why.push(format!(
+                        "{} {}: stopped {} ms, not past the {} s lease TTL",
+                        x.action,
+                        x.pod,
+                        r - x.fired_at_ms,
+                        crate::scenario::LEASE_TTL_SECS
+                    )),
+                    Some(_) => {}
+                }
+            }
+            _ => {}
         }
     }
     why
 }
 
 /// The least each invariant must have looked at for `runs` Runs of the
-/// rank-1 workload, and why a count below it makes the scenario
-/// inconclusive. I1b, I8 and I10 have none (I1b: rank 1 causes no retry).
+/// workload, and why a count below it makes the scenario inconclusive. I1b,
+/// I8 and I10 have none (I1b: no scenario here is built to cause a retry).
 pub fn minimums(runs: usize, checked: &BTreeMap<String, usize>) -> Vec<String> {
     let attempts = runs * crate::scenario::Workload::STEPS;
     let want = [
@@ -768,10 +825,48 @@ pub fn evaluate(f: &Facts) -> Verdict {
     }
     checked.insert("I10".into(), f.packs.len());
 
+    // L1: a takeover of the scheduler lease increments its term (ADR-0077
+    // Amendment, grill, item 2), and the term never goes back. Read only
+    // where the `leases.term` column exists.
+    let mut l1 = 0;
+    for x in &f.faults {
+        let Some(l) = &x.lease else { continue };
+        if let (Some(after), Some(tb), Some(ta)) = (&l.owner_after, l.term_before, l.term_after) {
+            l1 += 1;
+            if *after != l.owner_before && ta <= tb {
+                findings.push(fail(
+                    "L1",
+                    format!("the scheduler lease passed from {} to {after} with term {tb} -> {ta}", l.owner_before),
+                ));
+            }
+        }
+        if let (Some(ta), Some(tr)) = (l.term_after, l.term_after_resume) {
+            if tr < ta {
+                findings.push(fail("L1", format!("the scheduler lease's term went back from {ta} to {tr} after the resume")));
+            }
+        }
+        if l.owner_after.is_some() && l.owner_after_resume.as_deref() == Some(l.owner_before.as_str()) {
+            findings.push(warn(
+                "L1",
+                format!("the resumed replica {} holds the scheduler lease again 10 s after its resume", l.owner_before),
+            ));
+        }
+    }
+    if f.faults.iter().any(|x| x.lease.is_some()) {
+        checked.insert("L1".into(), l1);
+    }
+
     let inconclusive = match f.kind {
         Some(kind) => {
             let mut why = exercised(kind, &f.faults);
             why.extend(minimums(f.expected_runs, &checked));
+            if kind == Kind::TwoReplicas && f.launch_claimers.len() < 2 {
+                why.push(format!(
+                    "{} replica(s) drove the scenario's steps ({:?}); two replicas did not share the work",
+                    f.launch_claimers.len(),
+                    f.launch_claimers
+                ));
+            }
             why
         }
         None => Vec::new(),
@@ -898,6 +993,17 @@ pub async fn gather(src: &Sources<'_>, scenario: &Scenario, pod_records: Vec<Pod
             evidence_attempt,
         });
     }
+
+    f.launch_claimers = sqlx::query_scalar::<_, String>(
+        "SELECT DISTINCT claimed_by FROM outbox WHERE run_id = ANY($1) AND kind = $2 AND claimed_by IS NOT NULL",
+    )
+    .bind(runs)
+    .bind(crate::servers::LAUNCH_STEP)
+    .fetch_all(src.pg)
+    .await
+    .map_err(db_err)?
+    .into_iter()
+    .collect();
 
     // Every fence the scenario's Attempts could have drained into.
     let fences: Vec<String> = f

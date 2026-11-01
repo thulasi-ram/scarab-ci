@@ -118,6 +118,11 @@ pub fn feed_in_flight(p: &PodView) -> bool {
     p.container(INIT_CONTAINER).is_some_and(|c| c.state == "running") && !p.deleting
 }
 
+/// The step container is running (rank 4's trigger: a Run is in flight).
+pub fn step_running(p: &PodView) -> bool {
+    p.container(STEP_CONTAINER).is_some_and(|c| c.state == "running") && !p.deleting
+}
+
 /// One line of `pods.jsonl`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PodRecord {
@@ -308,5 +313,11 @@ mod tests {
     #[test]
     fn the_feed_window_is_the_fetcher_running() {
         assert!(feed_in_flight(&pod("waiting", None, "waiting", false)));
+    }
+
+    #[test]
+    fn the_stop_trigger_is_the_step_running() {
+        assert!(step_running(&pod("running", None, "running", false)));
+        assert!(!step_running(&pod("terminated", Some(0), "running", false)));
     }
 }

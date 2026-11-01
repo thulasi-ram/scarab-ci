@@ -1,4 +1,4 @@
-//! `scarab-chaos`: run a rank-1 scenario, replay one, or check one.
+//! `scarab-chaos`: run a scenario, replay one, or check one.
 //!
 //!   scarab-chaos run --kind mid-drain --seed 7 --out-root DIR   run, then check
 //!   scarab-chaos replay DIR/scenario.json --out-root DIR         same plan, new run, then check
@@ -14,10 +14,16 @@
 //! could not run or check, 3 INCONCLUSIVE (the fault did not exercise what
 //! the scenario names; see `check::exercised`).
 //!
+//! Kinds: mid-drain, mid-feed (rank 1: a Depot Pod deleted with grace 0),
+//! two-replicas (rank 2 with no fault), kill-server (rank 2: SIGKILL of the
+//! producer's claim holder), stop-leader (rank 4: SIGSTOP of the scheduler
+//! leader past the lease TTL, then SIGCONT). See `scenario::Kind`.
+//!
 //! Connections come from the environment `deploy/kind/chaos.sh` sets:
 //! SCARAB_CHAOS_API, SCARAB_CHAOS_KUBECONFIG, SCARAB_CHAOS_NAMESPACE,
 //! SCARAB_CHAOS_DATABASE_URL, SCARAB_CHAOS_S3_ENDPOINT, SCARAB_CHAOS_S3_BUCKET,
-//! SCARAB_CHAOS_S3_ACCESS_KEY, SCARAB_CHAOS_S3_SECRET_KEY.
+//! SCARAB_CHAOS_S3_ACCESS_KEY, SCARAB_CHAOS_S3_SECRET_KEY, and for the
+//! server signals SCARAB_CHAOS_NODE (the kind node container).
 
 use std::path::{Path, PathBuf};
 
@@ -149,13 +155,32 @@ async fn check_dir(conn: &Conn, file: &Path) -> Result<check::Outcome, String> {
         .faults
         .iter()
         .map(|f| {
-            format!(
+            let mut line = format!(
                 "{} {} at +{} ms after trigger, landed {}",
                 f.action,
                 f.pod,
                 f.trigger.as_ref().map(|t| f.fired_at_ms - t.observed_at_ms).unwrap_or(0),
-                f.landing.as_ref().map(|l| l.class.as_str()).unwrap_or("unknown")
-            )
+                f.landing.as_ref().map(|l| l.class.as_str()).unwrap_or("no window")
+            );
+            if let Some(sig) = &f.signal {
+                line += &format!(
+                    "; SIG{} to PID {} (container {}) delivered: {} ({})",
+                    sig.signal, sig.pid, sig.container_id, sig.delivered, sig.evidence
+                );
+            }
+            if let Some(role) = &f.victim_role {
+                line += &format!("; victim: {role}, chosen by {}", f.target_basis.as_deref().unwrap_or("?"));
+            }
+            if let Some(r) = f.resumed_at_ms {
+                line += &format!("; resumed after {} ms", r - f.fired_at_ms);
+            }
+            if let Some(l) = &f.lease {
+                line += &format!(
+                    "; lease {} (term {:?}) -> {:?} (term {:?}), after resume {:?} (term {:?})",
+                    l.owner_before, l.term_before, l.owner_after, l.term_after, l.owner_after_resume, l.term_after_resume
+                );
+            }
+            line
         })
         .collect::<Vec<_>>()
         .join("; ");
@@ -165,12 +190,12 @@ async fn check_dir(conn: &Conn, file: &Path) -> Result<check::Outcome, String> {
         s.kind.as_str(),
         s.seed,
         s.runs,
-        if landing.is_empty() { "none fired".into() } else { landing }
+        if landing.is_empty() { "none fired".to_string() } else { landing }
     );
     for (inv, n) in &v.checked {
         let fails = v.findings.iter().filter(|f| &f.invariant == inv && f.severity == check::Severity::Fail).count();
         let state = match (fails, *n, inv.as_str()) {
-            (0, 0, "I1b") => "not exercised (rank 1 causes no retry; not counted)".to_string(),
+            (0, 0, "I1b") => "not exercised (no retry in this scenario; not counted)".to_string(),
             (0, 0, _) => "not exercised".to_string(),
             (0, _, _) => "ok".to_string(),
             (k, _, _) => format!("FAIL x{k}"),

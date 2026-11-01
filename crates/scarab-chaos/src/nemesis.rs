@@ -1,7 +1,9 @@
-//! The nemesis for rank 1 (ADR-0077 §3): submit the workload, wait for the
-//! trigger on the planned run's Pod, wait the planned delay, delete the
-//! planned Depot replica with grace 0, then wait for every Run to end or the
-//! quiesce bound to run out. Everything it did goes into the scenario file.
+//! The nemesis (ADR-0077 §3): submit the workload, wait for the trigger on
+//! the planned run's Pod, wait the planned delay, fire the fault, then wait
+//! for every Run to end or the quiesce bound to run out. Everything it did
+//! goes into the scenario file. The faults: rank 1 deletes the planned Depot
+//! replica with grace 0; ranks 2 and 4 signal a server replica from the
+//! kind node (`crate::servers`); `two-replicas` fires nothing.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -10,6 +12,7 @@ use k8s_openapi::api::core::v1::Pod;
 use kube::api::{Api as KubeApi, DeleteParams, ListParams, LogParams};
 
 use crate::env::{Api, TERMINAL_RUN_STATUSES};
+use crate::node::Node;
 use crate::pods::{self, PodView, Views};
 use crate::scenario::{classify, Fault, Kind, Scenario, Trigger};
 use crate::time::now_ms;
@@ -47,6 +50,13 @@ pub async fn run(stack: &Stack, mut scenario: Scenario, dir: &Path) -> Result<Sc
 
     // The stack must be at the scenario's topology before anything runs: a
     // replay of a 2+2 file on a 1-server release is not the same scenario.
+    if scenario.kind.targets_servers() && scenario.server_replicas < 2 {
+        return Err(format!(
+            "{} needs at least 2 server replicas; the release has {}",
+            scenario.kind.as_str(),
+            scenario.server_replicas
+        ));
+    }
     let servers = wait_servers_ready(&pods_api, &stack.release, scenario.server_replicas as usize).await?;
     let depots = wait_depots_ready(&views, scenario.depot_replicas as usize).await?;
     log(&format!(
@@ -72,87 +82,36 @@ pub async fn run(stack: &Stack, mut scenario: Scenario, dir: &Path) -> Result<Sc
         .get(scenario.plan.target_run as usize)
         .cloned()
         .ok_or("plan.target_run is past the last run")?;
-    let victim = format!("{}-workspace-{}", stack.release, scenario.plan.victim_ordinal);
-
-    // --- the trigger --------------------------------------------------------
     let kind = scenario.kind;
-    let holds = move |p: &PodView| match kind {
-        Kind::MidDrain => pods::drain_in_flight(p),
-        Kind::MidFeed => pods::feed_in_flight(p),
-    };
-    let deadline = std::time::Instant::now() + TRIGGER_TIMEOUT;
-    let trigger = loop {
-        let found = find_target(&views, &target_run, kind.target_step(), &holds);
-        if let Some(p) = found {
-            break Some(Trigger {
-                run: target_run.clone(),
-                step: kind.target_step().into(),
-                attempt: p.attempt.clone(),
-                pod: p.name.clone(),
-                pod_uid: p.uid.clone(),
-                condition: match kind {
-                    Kind::MidDrain => "step exited 0, egress running, no workspace-root annotation".into(),
-                    Kind::MidFeed => "scarab-workspace-init running".into(),
-                },
-                observed_at_ms: now_ms(),
-            });
-        }
-        if std::time::Instant::now() > deadline || all_terminal(stack, &scenario.runs).await {
-            break None;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    };
-
-    match trigger {
-        None => {
-            scenario
-                .notes
-                .push(format!("trigger never held on run {target_run}; no fault fired"));
-            log("trigger never held; no fault fired");
-        }
-        Some(t) => {
-            log(&format!("trigger on {} ({}); firing in {} ms", t.pod, t.condition, scenario.plan.delay_ms));
-            tokio::time::sleep(Duration::from_millis(scenario.plan.delay_ms)).await;
-            let held = views
-                .lock()
-                .expect("views lock")
-                .get(&t.pod_uid)
-                .is_some_and(holds);
-            let fence_rows = match (&t.attempt, kind) {
-                (Some(a), Kind::MidDrain) => fence_pack_rows(&stack.pg, &t.run, &t.step, a).await,
-                _ => None,
-            };
-            let victim_uid = views
-                .lock()
-                .expect("views lock")
-                .values()
-                .find(|p| p.name == victim && !p.deleting)
-                .map(|p| p.uid.clone());
-            let fired_at_ms = now_ms();
-            pods_api
-                .delete(
-                    &victim,
-                    &DeleteParams {
-                        grace_period_seconds: Some(0),
-                        ..Default::default()
-                    },
-                )
-                .await
-                .map_err(|e| format!("delete {victim}: {e}"))?;
-            log(&format!(
-                "deleted {victim} (uid {victim_uid:?}) with grace 0; condition held: {held}; fence pack rows: {fence_rows:?}"
-            ));
-            scenario.faults.push(Fault {
-                action: "delete-pod".into(),
-                pod: victim.clone(),
-                pod_uid: victim_uid,
-                grace_seconds: 0,
-                trigger: Some(t),
-                condition_held_at_fire: held,
-                fence_pack_rows_at_fire: fence_rows,
-                fired_at_ms,
-                landing: None,
-            });
+    if kind.has_fault() {
+        let holds = move |p: &PodView| match kind {
+            Kind::MidDrain | Kind::KillServer => pods::drain_in_flight(p),
+            Kind::MidFeed => pods::feed_in_flight(p),
+            Kind::StopLeader => pods::step_running(p),
+            Kind::TwoReplicas => false,
+        };
+        match wait_trigger(stack, &views, &scenario.runs, &target_run, kind, &holds).await {
+            None => {
+                scenario
+                    .notes
+                    .push(format!("trigger never held on run {target_run}; no fault fired"));
+                log("trigger never held; no fault fired");
+            }
+            Some(t) => {
+                log(&format!("trigger on {} ({}); firing in {} ms", t.pod, t.condition, scenario.plan.delay_ms));
+                tokio::time::sleep(Duration::from_millis(scenario.plan.delay_ms)).await;
+                let fault = match kind {
+                    Kind::MidDrain | Kind::MidFeed => delete_depot(stack, &pods_api, &views, t, &scenario, &holds).await?,
+                    Kind::KillServer => {
+                        crate::servers::kill_server(stack, &Node::from_env(), &views, &t, &scenario.plan, &holds).await?
+                    }
+                    Kind::StopLeader => {
+                        crate::servers::stop_leader(stack, &Node::from_env(), &views, &t, &scenario.plan, &holds).await?
+                    }
+                    Kind::TwoReplicas => unreachable!("two-replicas has no fault"),
+                };
+                scenario.faults.push(fault);
+            }
         }
     }
     scenario.write(&file)?;
@@ -185,7 +144,18 @@ pub async fn run(stack: &Stack, mut scenario: Scenario, dir: &Path) -> Result<Sc
     // feed did around the fault, for whoever reads the scenario later.
     if let Some(t) = scenario.faults.iter().find_map(|f| f.trigger.as_ref()) {
         let since = ((now_ms() - scenario.started_at_ms) / 1000 + 60).max(60);
-        let text = release_log_lines(&pods_api, since, &[t.pod.as_str(), &scenario.faults[0].pod]).await;
+        let mut needles = vec![t.pod.as_str(), scenario.faults[0].pod.as_str()];
+        let owners: Vec<String> = scenario
+            .faults
+            .iter()
+            .flat_map(|f| {
+                let claim = f.claim.as_ref().and_then(|c| c.owner.clone());
+                let lease = f.lease.as_ref().map(|l| l.owner_before.clone());
+                claim.into_iter().chain(lease)
+            })
+            .collect();
+        needles.extend(owners.iter().map(String::as_str));
+        let text = release_log_lines(&pods_api, since, &needles).await;
         let _ = std::fs::write(dir.join("release-log.txt"), text);
         if kind == Kind::MidFeed {
             // The fetcher's own account of the fault (retries, resets).
@@ -204,9 +174,9 @@ pub async fn run(stack: &Stack, mut scenario: Scenario, dir: &Path) -> Result<Sc
     // --- where it landed --------------------------------------------------------
     let records = pods::read_records(&dir.join("pods.jsonl"))?;
     for fault in &mut scenario.faults {
-        if let Some(t) = &fault.trigger {
-            let (start, end) = window(kind, &records, &t.pod_uid);
-            fault.landing = Some(classify(kind, fault.fired_at_ms, start, end));
+        if let (Some(t), Some(w)) = (&fault.trigger, kind.window()) {
+            let (start, end) = window(w, &records, &t.pod_uid);
+            fault.landing = Some(classify(w, fault.fired_at_ms, start, end));
         }
     }
     scenario.write(&file)?;
@@ -215,7 +185,8 @@ pub async fn run(stack: &Stack, mut scenario: Scenario, dir: &Path) -> Result<Sc
 
 /// The window on the target Pod, from the watcher's record: for a drain,
 /// the step container's exit to the first record with the root annotation;
-/// for a feed, the fetcher's start to its exit.
+/// for a feed, the fetcher's start to its exit. `kind` is a window
+/// (`Kind::window`); any other kind has none.
 pub fn window(kind: Kind, records: &[pods::PodRecord], uid: &str) -> (Option<i64>, Option<i64>) {
     let of_pod: Vec<&pods::PodRecord> = records.iter().filter(|r| r.pod.uid == uid).collect();
     match kind {
@@ -233,7 +204,93 @@ pub fn window(kind: Kind, records: &[pods::PodRecord], uid: &str) -> (Option<i64
             let end = of_pod.iter().filter_map(|r| c(r)?.finished_at_ms).min();
             (start, end)
         }
+        Kind::TwoReplicas | Kind::KillServer | Kind::StopLeader => (None, None),
     }
+}
+
+/// Wait (up to `TRIGGER_TIMEOUT`, or until every Run has ended) for `holds`
+/// on a Pod of `target_run`'s target step.
+async fn wait_trigger(
+    stack: &Stack,
+    views: &Views,
+    runs: &[String],
+    target_run: &str,
+    kind: Kind,
+    holds: &impl Fn(&PodView) -> bool,
+) -> Option<Trigger> {
+    let deadline = std::time::Instant::now() + TRIGGER_TIMEOUT;
+    loop {
+        if let Some(p) = find_target(views, target_run, kind.target_step(), holds) {
+            return Some(Trigger {
+                run: target_run.to_string(),
+                step: kind.target_step().into(),
+                attempt: p.attempt.clone(),
+                pod: p.name.clone(),
+                pod_uid: p.uid.clone(),
+                condition: match kind {
+                    Kind::MidDrain | Kind::KillServer => {
+                        "step exited 0, egress running, no workspace-root annotation".into()
+                    }
+                    Kind::MidFeed => "scarab-workspace-init running".into(),
+                    Kind::StopLeader => "step container running".into(),
+                    Kind::TwoReplicas => String::new(),
+                },
+                observed_at_ms: now_ms(),
+            });
+        }
+        if std::time::Instant::now() > deadline || all_terminal(stack, runs).await {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Rank 1: delete the planned Depot replica with grace 0.
+async fn delete_depot(
+    stack: &Stack,
+    pods_api: &KubeApi<Pod>,
+    views: &Views,
+    t: Trigger,
+    scenario: &Scenario,
+    holds: &impl Fn(&PodView) -> bool,
+) -> Result<Fault, String> {
+    let victim = format!("{}-workspace-{}", stack.release, scenario.plan.victim_ordinal);
+    let held = views.lock().expect("views lock").get(&t.pod_uid).is_some_and(holds);
+    let fence_rows = match (&t.attempt, scenario.kind) {
+        (Some(a), Kind::MidDrain) => fence_pack_rows(&stack.pg, &t.run, &t.step, a).await,
+        _ => None,
+    };
+    let victim_uid = views
+        .lock()
+        .expect("views lock")
+        .values()
+        .find(|p| p.name == victim && !p.deleting)
+        .map(|p| p.uid.clone());
+    let fired_at_ms = now_ms();
+    pods_api
+        .delete(
+            &victim,
+            &DeleteParams {
+                grace_period_seconds: Some(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|e| format!("delete {victim}: {e}"))?;
+    log(&format!(
+        "deleted {victim} (uid {victim_uid:?}) with grace 0; condition held: {held}; fence pack rows: {fence_rows:?}"
+    ));
+    Ok(Fault {
+        action: "delete-pod".into(),
+        pod: victim,
+        pod_uid: victim_uid,
+        grace_seconds: 0,
+        trigger: Some(t),
+        condition_held_at_fire: held,
+        fence_pack_rows_at_fire: fence_rows,
+        fired_at_ms,
+        ..Default::default()
+    })
 }
 
 fn find_target(
@@ -309,7 +366,7 @@ async fn all_terminal(stack: &Stack, runs: &[String]) -> bool {
 }
 
 /// `depot_packs` rows staged for the drain fence of (run, step, attempt).
-async fn fence_pack_rows(pg: &sqlx::PgPool, run: &str, step: &str, attempt: &str) -> Option<i64> {
+pub(crate) async fn fence_pack_rows(pg: &sqlx::PgPool, run: &str, step: &str, attempt: &str) -> Option<i64> {
     let fence = scarab_workspace_client::drain_fence_key(run, step, attempt);
     sqlx::query_scalar::<_, i64>("SELECT count(*) FROM depot_packs WHERE fence_key = $1")
         .bind(fence)
