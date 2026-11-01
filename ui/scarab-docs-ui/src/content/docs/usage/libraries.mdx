@@ -22,8 +22,10 @@ fetches anything, and the org decides when a library changes.
 
 ## Install a library
 
-Settings › Libraries › **Install library**, or the API. You give a **source**: a file in a git
-repository at a full commit id.
+Settings › Libraries › **Install library**, or the API. **Install library** opens the review page
+(`/orgs/<org>/settings/libraries/review`), which every library goes through, first-party or not.
+You give a **source**: a file in a git repository at a full commit id. The review page also lists
+the libraries in Scarab's release manifest, so you can pick one of those as the source.
 
 ```
 github.com/acme/scarab-libs//deploy-helm.yaml@8c2f4e1a9d7b3c5e0f6a2b8d4c1e7f9a3b5d2c6e
@@ -59,10 +61,9 @@ came from: the installation records its source, and Policies match on the source
 **Where Scarab reads from.** A public repository on github.com, or on the host of a Forgejo
 connection, is read without credentials, over https only, from public addresses only, with no
 redirects and a 1 MiB limit. Any other host is refused. For a private repository, pick a
-connection: Scarab reads the file through it, but only from a repository bound to your org through
-that connection, or from a repository whose owner has your org's name. The owner-name match counts
-only when your org has at least one repository bound through that connection: an account with your
-org's name on another forge is not your org.
+connection of the installing org, and Scarab reads the file through it. A connection of another
+org, or one with no org yet, is refused, and through a GitHub App connection Scarab reads only
+repositories your org owns. See [Forge connections](/scarab-ci/get-started/deploy-helm/#forge-connections).
 
 ## Upgrade
 
@@ -114,8 +115,9 @@ first-party, wherever its copy came from.
   this. If the source cannot be read, Settings › Libraries lists what is missing and why, and you
   can retry, point at a mirror of Scarab's repository, or paste a copy of a file from the release.
   Every copy must have the hash the manifest lists.
-- **An existing org** is offered them, and nothing is installed without an admin, including at a
-  Scarab upgrade.
+- **An existing org** gets nothing installed without an admin, including at a Scarab upgrade. An
+  admin installs each first-party library the way they install any other: pick it on the review
+  page, read it, and confirm with a passkey. There is no button that installs them all at once.
 - When a newer first-party version exists, the panel says so, and marks it when it is a security
   fix.
 

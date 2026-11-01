@@ -72,12 +72,48 @@ and has no error anywhere:
   **Checks: read & write** only if you use checks; **Contents: read** is what a checkout needs (add **Contents: write** only for a step with
   `forge_token: write`).
 
-You do not have to verify these by eye: **Settings → Connections** runs a preflight against the
+You do not have to verify these by eye: the org's **Settings › Connections** runs a preflight against the
 App and names whatever is missing (`GET /v1/connections/{id}/preflight`), so a misconfigured App
 shows as *unhealthy* instead of failing silently. A permission change is not live until an
 installation owner **approves the new access** (GitHub emails them). Until they do, the preflight
 keeps reporting the gap.
 :::
+
+## Forge connections
+
+A forge connection (a GitHub App installation, or a Forgejo or GitHub token) serves one org, and
+every repository bound through it must be owned by that org. An org's admins manage its
+connections under **Settings › Connections** (`/orgs/<org>/settings/connections`); they do not
+see another org's connections, and `GET /v1/connections` lists only the connections of orgs you
+administer (`?org=<org>` narrows it to one).
+
+- **An org's first connection** is created by a global admin, under **Settings › Server
+  administration › Connect a forge** (`/settings/server/connect-forge`), or with
+  `POST /v1/connections` and an `org` field. After that, the org's own admins can add more.
+- **A GitHub App installation** registers itself from its `installation` webhook. It is assigned
+  the org named like the account the App is installed on, and mints tokens only for that
+  installation's repositories. It stays unassigned when an org of that name already uses another
+  forge, or when it already holds a repository of another owner.
+- **A connection declared in `scarab.connections`** names its org with `org:`. Without `org:`,
+  the org is the one owner of its `repos:`. A repository of another owner, repositories of
+  several owners without `org:`, or no repositories and no `org:` fail the boot:
+
+  ```yaml
+  scarab:
+    connections:
+      - id: forgejo-main
+        kind: forgejo
+        org: acme
+        base_url: https://git.example.com
+        credential: { env: FORGEJO_CI_TOKEN }
+        repos: [acme/widgets]
+  ```
+
+A connection with no org (for example one created before connections had an org, whose
+repositories have several owners) is shown only to global admins. A global admin assigns it with **Assign to org**
+(`PUT /v1/connections/{id}/org`), which is refused while it holds a repository of another owner.
+To split one, add a connection for each org and bind (or re-sync) the repositories through it: a
+repository moves off a connection with no org. Then remove the old connection.
 
 ## Key values
 
