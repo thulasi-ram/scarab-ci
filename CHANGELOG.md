@@ -135,6 +135,10 @@ record. Read Upgrading before you upgrade.
 - A Run was visible to the scheduler before its parameters, `when` exclusions and concurrency
   group were written; a Step could start without them (#51). A Run left half-created by a
   server that stopped is failed after 10 minutes.
+- **Caches never saved or restored.** No Run created from a repository had the project the
+  scheduler keys Caches by, so every Step's `cache:` was off. Runs now carry `<org>/<repo>`.
+  The per-project in-flight cap (20 Runs, ADR-0011) counts by the same value and now applies
+  too.
 - A dispatch parameter holding `${{ … }}` was evaluated as an expression (#49).
 - A deep or long CEL expression in a pushed Pipeline could overflow the stack and stop the
   server (#44).

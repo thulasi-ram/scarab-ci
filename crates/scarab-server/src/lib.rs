@@ -6215,6 +6215,11 @@ async fn write_run_from_ir(
     // Untenanted runs (no repo — inline dev submissions) stay global-only.
     if let Some(repo) = event.repo() {
         db.set_run_tenant(run, &repo.owner, &repo.name).await?;
+        // The scheduler's project (`<org>/<repo>`): the Cache keys and saves
+        // under it (ADR-0065), and the per-project in-flight cap counts by it
+        // (ADR-0011). Nothing else writes it; without it a Run's Cache is off.
+        db.set_run_scheduling(run, &format!("{}/{}", repo.owner, repo.name), 0)
+            .await?;
         // Allocate the per-repo run number (ADR-0057 amendment) once the tenant
         // is known — the human `#N` handle. Untenanted inline runs skip this.
         db.allocate_run_number(run, &repo.owner, &repo.name).await?;
