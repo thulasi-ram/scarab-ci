@@ -254,3 +254,46 @@ fn i4_over_nothing_is_inconclusive() {
     assert_eq!(v.outcome, Outcome::Inconclusive);
     assert!(v.inconclusive.iter().any(|w| w.starts_with("I4 looked at 0")), "{:?}", v.inconclusive);
 }
+
+// --- I1b / I1c over the journal ---------------------------------------------------
+
+/// Red team: a1 ran but the watcher never saw its step container; a2 started
+/// while a1 was never journalled ended. I1b looked at 0 pairs and passed.
+#[test]
+fn an_overlap_with_an_unseen_first_attempt_fails_i1b() {
+    let mut f = clean();
+    f.events.insert(0, ev(0, serde_json::json!({"AttemptStarted": {"step": "produce", "attempt": "a0"}})));
+    f.attempts.push(AttemptRow {
+        attempt: "a0".into(),
+        outcome: Some("failed".into()),
+        output_snapshot: None,
+        ..f.attempts[0].clone()
+    });
+    let v = evaluate(&f);
+    assert_eq!(v.outcome, Outcome::Fail);
+    let i1b: Vec<&Finding> = v.findings.iter().filter(|x| x.invariant == "I1b").collect();
+    assert_eq!(i1b.len(), 1, "{:?}", v.findings);
+    assert!(i1b[0].detail.contains("a0's was never seen"), "{}", i1b[0].detail);
+    // Journalled ended before a1 started: allowed, nothing to report.
+    f.events[0].seq = -1;
+    f.events.insert(1, ev(0, serde_json::json!({"AttemptFinished": {"step": "produce", "attempt": "a0", "failure": "step"}})));
+    let v = evaluate(&f);
+    assert!(!v.findings.iter().any(|x| x.invariant == "I1b"), "{:?}", v.findings);
+}
+
+/// Red team: two AttemptStarted for an Attempt that has no `attempts` row.
+/// I1c counted events only for Attempts with a row and passed.
+#[test]
+fn a_duplicate_attempt_started_without_a_row_fails_i1c() {
+    let mut f = clean();
+    for seq in [6, 7] {
+        f.events.push(ev(seq, serde_json::json!({"AttemptStarted": {"step": "consume", "attempt": "a9"}})));
+    }
+    let v = evaluate(&f);
+    assert_eq!(v.outcome, Outcome::Fail);
+    assert!(
+        v.findings.iter().any(|x| x.invariant == "I1c" && x.detail.contains("attempt a9: 2 AttemptStarted events")),
+        "{:?}",
+        v.findings
+    );
+}

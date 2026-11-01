@@ -11,8 +11,8 @@
 //! | id   | invariant (ADR-0077 §2) |
 //! |------|-------------------------|
 //! | I1a  | at most one Pod UID per Attempt |
-//! | I1b  | Attempt N+1's step container starts after Attempt N's ended, or after N was journalled finished or superseded |
-//! | I1c  | no double execution: per Step at most one succeeded Attempt, one `AttemptStarted` and one `AttemptFinished` per Attempt, and a Succeeded Step's evidence Attempt is that one |
+//! | I1b  | Attempt N+1's step container starts after Attempt N's ended, or after N was journalled finished or superseded (only the journal counts for an N whose step container was never seen) |
+//! | I1c  | no double execution: per Step at most one succeeded Attempt, one `AttemptStarted` and one `AttemptFinished` per journalled Attempt (with an `attempts` row or not), and a Succeeded Step's evidence Attempt is that one |
 //! | T1   | exactly one terminal `RunTransitioned` per Run, matching `runs.status` |
 //! | I3   | every scenario Run terminal within the quiesce bound, and none left with `creating = TRUE` |
 //! | I4   | every green Attempt's output snapshot closure is in committed packs whose ranges read back and hash to their addresses; a member in another fence's pack needs a `depot_fence_borrows` edge |
@@ -354,6 +354,22 @@ pub fn evaluate(f: &Facts) -> Verdict {
             e.1 = Some(e.1.map_or(t, |x: i64| x.max(t)));
         }
     }
+    // An Attempt the journal started but whose step container the watcher
+    // never saw (its Pod deleted before a status was recorded, or a watch
+    // gap) is still paired: with no interval, only the journal can show it
+    // ended before the next one started.
+    for e in &f.events {
+        if event_kind(&e.payload) != "AttemptStarted" {
+            continue;
+        }
+        if let (Some(step), Some(att)) = (event_field(&e.payload, "step"), event_field(&e.payload, "attempt")) {
+            intervals
+                .entry((e.run.clone(), step.into()))
+                .or_default()
+                .entry(att.into())
+                .or_insert((None, None));
+        }
+    }
     let seq_of = |run: &str, kind: &str, step: &str, att: &str| -> Option<i64> {
         f.events
             .iter()
@@ -369,16 +385,8 @@ pub fn evaluate(f: &Facts) -> Verdict {
         atts.sort_by_key(|(a, _)| attempt_number(a));
         for w in atts.windows(2) {
             pairs += 1;
-            let ((a, (_, end_a)), (b, (start_b, _))) = (w[0], w[1]);
+            let ((a, (start_a, end_a)), (b, (start_b, _))) = (w[0], w[1]);
             let Some(start_b) = start_b else { continue };
-            let overlaps = match end_a {
-                Some(end) => start_b < end,
-                // Attempt a's container started and never finished.
-                None => by_att[a].0.is_some(),
-            };
-            if !overlaps {
-                continue;
-            }
             let started_b = seq_of(run, "AttemptStarted", step, b);
             let ended_a = [
                 seq_of(run, "AttemptFinished", step, a),
@@ -387,6 +395,27 @@ pub fn evaluate(f: &Facts) -> Verdict {
             .into_iter()
             .flatten()
             .min();
+            if start_a.is_none() && end_a.is_none() {
+                // a's step container was never seen: no interval to compare.
+                if !matches!((ended_a, started_b), (Some(e), Some(s)) if e < s) {
+                    findings.push(fail(
+                        "I1b",
+                        format!(
+                            "run {run} step {step}: {b}'s step container started at {start_b}, {a}'s was never \
+                             seen, and {a} was not journalled ended before {b} started"
+                        ),
+                    ));
+                }
+                continue;
+            }
+            let overlaps = match end_a {
+                Some(end) => start_b < end,
+                // Attempt a's container started and never finished.
+                None => start_a.is_some(),
+            };
+            if !overlaps {
+                continue;
+            }
             match (ended_a, started_b) {
                 (Some(e), Some(s)) if e < s => findings.push(warn(
                     "I1b",
@@ -423,20 +452,6 @@ pub fn evaluate(f: &Facts) -> Verdict {
         if green.len() > 1 {
             findings.push(fail("I1c", format!("run {run} step {step}: {} succeeded Attempts {green:?}", green.len())));
         }
-        for a in atts {
-            for kind in ["AttemptStarted", "AttemptFinished"] {
-                let n = f
-                    .events
-                    .iter()
-                    .filter(|e| e.run == *run && event_kind(&e.payload) == kind)
-                    .filter(|e| event_field(&e.payload, "step") == Some(step))
-                    .filter(|e| event_field(&e.payload, "attempt") == Some(&a.attempt))
-                    .count();
-                if n > 1 {
-                    findings.push(fail("I1c", format!("run {run} step {step} attempt {}: {n} {kind} events", a.attempt)));
-                }
-            }
-        }
         if let Some(s) = f.steps.iter().find(|s| s.run == *run && s.step == *step) {
             if s.status == "succeeded" {
                 match (&s.evidence_attempt, green.as_slice()) {
@@ -447,6 +462,23 @@ pub fn evaluate(f: &Facts) -> Verdict {
                     )),
                 }
             }
+        }
+    }
+    // One AttemptStarted and one AttemptFinished per Attempt, counted over
+    // the journal itself: an Attempt with no `attempts` row is counted too.
+    let mut per_attempt: BTreeMap<(String, String, String, &str), usize> = BTreeMap::new();
+    for e in &f.events {
+        let kind = event_kind(&e.payload);
+        if kind != "AttemptStarted" && kind != "AttemptFinished" {
+            continue;
+        }
+        if let (Some(step), Some(att)) = (event_field(&e.payload, "step"), event_field(&e.payload, "attempt")) {
+            *per_attempt.entry((e.run.clone(), step.into(), att.into(), kind)).or_default() += 1;
+        }
+    }
+    for ((run, step, att, kind), n) in &per_attempt {
+        if *n > 1 {
+            findings.push(fail("I1c", format!("run {run} step {step} attempt {att}: {n} {kind} events")));
         }
     }
     checked.insert("I1c".into(), steps_seen);
