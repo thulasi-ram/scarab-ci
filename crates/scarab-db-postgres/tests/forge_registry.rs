@@ -201,3 +201,123 @@ async fn connection_ownership_is_durable_and_defaults_to_the_database() {
 
     tdb.cleanup().await;
 }
+
+/// git-bug 19b0a45: a connection serves one Org, and no bind moves a repo
+/// out of the Org it is bound in. A bind through a connection of another
+/// Org is refused by the store itself, so every bind path (manual, re-sync,
+/// installation sync, config) gets the same answer.
+#[tokio::test]
+async fn a_bind_never_moves_a_repo_across_orgs() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = PostgresDb::with_pool(tdb.pool.clone());
+    db.migrate().await.unwrap();
+    db.put_connection(&github_conn()).await.unwrap();
+    let globex = ForgeConnection {
+        id: "gh-globex".into(),
+        kind: ForgeKind::GitHub,
+        base_url: "https://api.github.com".into(),
+        credential_ref: "github-app".into(),
+        org: Some("globex".into()),
+        installation_id: Some(42),
+    };
+    db.put_connection(&globex).await.unwrap();
+    let legacy = ForgeConnection {
+        id: "legacy".into(),
+        kind: ForgeKind::Forgejo,
+        base_url: "https://git.example".into(),
+        credential_ref: "legacy-token".into(),
+        org: None,
+        installation_id: None,
+    };
+    db.put_connection(&legacy).await.unwrap();
+
+    // An assigned connection binds only its own Org's repos.
+    let err = db
+        .bind_repo("gh-globex", &repo("acme", "web"), "acme", "web")
+        .await
+        .expect_err("globex's connection cannot bind an acme repo");
+    assert!(
+        matches!(err, scarab_forge::RegistryError::OrgMismatch { .. }),
+        "{err:?}"
+    );
+
+    // A repo bound in acme stays there: an unassigned connection's re-bind
+    // is refused, and the binding is unchanged.
+    db.bind_repo("gh-acme", &repo("acme", "web"), "acme", "web")
+        .await
+        .unwrap();
+    let err = db
+        .bind_repo("legacy", &repo("acme", "web"), "acme", "web")
+        .await
+        .expect_err("a bind does not move a repo out of its org");
+    assert!(
+        matches!(err, scarab_forge::RegistryError::BoundElsewhere { ref connection, .. } if connection == "gh-acme"),
+        "{err:?}"
+    );
+    assert_eq!(
+        db.resolve(&repo("acme", "web"))
+            .await
+            .unwrap()
+            .unwrap()
+            .connection
+            .id,
+        "gh-acme"
+    );
+
+    // Off an unassigned connection, a repo moves (the reinstall-heals path).
+    db.bind_repo("legacy", &repo("acme", "old"), "acme", "old")
+        .await
+        .unwrap();
+    db.bind_repo("gh-acme", &repo("acme", "old"), "acme", "old")
+        .await
+        .unwrap();
+    let moved = db.resolve(&repo("acme", "old")).await.unwrap().unwrap();
+    assert_eq!(moved.connection.id, "gh-acme");
+    assert_eq!(moved.connection.org.as_deref(), Some("acme"));
+    assert_eq!(moved.connection.installation_id, Some(41));
+
+    tdb.cleanup().await;
+}
+
+/// git-bug 19b0a45: the Org record. A connection's Org and a binding's Org
+/// enter it, and it outlives the connection that brought it.
+#[tokio::test]
+async fn orgs_are_recorded_and_outlive_their_connections() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = PostgresDb::with_pool(tdb.pool.clone());
+    db.migrate().await.unwrap();
+    assert!(db.list_orgs().await.unwrap().is_empty());
+
+    db.put_connection(&github_conn()).await.unwrap();
+    let legacy = ForgeConnection {
+        id: "legacy".into(),
+        kind: ForgeKind::Forgejo,
+        base_url: "https://git.example".into(),
+        credential_ref: "legacy-token".into(),
+        org: None,
+        installation_id: None,
+    };
+    db.put_connection(&legacy).await.unwrap();
+    db.bind_repo("legacy", &repo("initech", "tps"), "initech", "tps")
+        .await
+        .unwrap();
+    assert_eq!(
+        db.list_orgs().await.unwrap(),
+        vec!["acme".to_string(), "initech".to_string()]
+    );
+
+    db.delete_connection("gh-acme").await.unwrap();
+    db.delete_connection("legacy").await.unwrap();
+    assert_eq!(
+        db.list_orgs().await.unwrap(),
+        vec!["acme".to_string(), "initech".to_string()]
+    );
+
+    tdb.cleanup().await;
+}

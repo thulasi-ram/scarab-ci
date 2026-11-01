@@ -217,3 +217,75 @@ async fn a_fixed_token_neither_mints_a_write_token_nor_is_revoked() {
     forge.revoke_credential(&repo(), "ghp_pat").await.unwrap();
     assert!(stub.seen().is_empty(), "nothing reaches GitHub");
 }
+
+/// git-bug 19b0a45: a connection that knows its installation mints from it
+/// alone. The per-repo lookup (`GET /repos/{owner}/{name}/installation`),
+/// which answers with whichever installation covers the repo, is never made.
+#[tokio::test]
+async fn a_pinned_installation_mints_from_itself_without_a_lookup() {
+    let stub = Stub::start(vec![Reply::new(
+        StatusCode::CREATED,
+        r#"{"token": "ghs_pinned"}"#,
+    )])
+    .await;
+    let forge = stub.app_forge().with_installation(55);
+    let cred = forge.mint_checkout_credential(&repo(), true).await.unwrap();
+    assert_eq!(cred.token, "ghs_pinned");
+    let seen = stub.seen();
+    assert_eq!(
+        seen.len(),
+        1,
+        "no installation lookup: {:?}",
+        seen.iter().map(|s| &s.path).collect::<Vec<_>>()
+    );
+    assert_eq!(seen[0].path, "/app/installations/55/access_tokens");
+}
+
+/// git-bug 19b0a45: enumeration through a pinned installation lists that
+/// installation's repositories only; `/app/installations` (every account
+/// the App is on) is never walked.
+#[tokio::test]
+async fn a_pinned_installation_lists_only_its_own_repositories() {
+    let stub = Stub::start(vec![
+        Reply::new(StatusCode::CREATED, r#"{"token": "ghs_inst"}"#),
+        Reply::ok(r#"{"total_count": 1, "repositories": [{"full_name": "acme/web"}]}"#),
+    ])
+    .await;
+    let repos = stub
+        .app_forge()
+        .with_installation(55)
+        .list_accessible_repos()
+        .await
+        .unwrap();
+    assert_eq!(repos, vec![repo()]);
+    let paths: Vec<String> = stub.seen().into_iter().map(|s| s.path).collect();
+    assert_eq!(
+        paths,
+        vec![
+            "/app/installations/55/access_tokens".to_string(),
+            "/installation/repositories".to_string()
+        ]
+    );
+}
+
+/// The installation's account is what an unassigned installation
+/// connection takes as its Org.
+#[tokio::test]
+async fn a_pinned_installation_names_its_account() {
+    let stub = Stub::start(vec![Reply::ok(
+        r#"{"id": 55, "account": {"login": "acme", "type": "Organization"}}"#,
+    )])
+    .await;
+    let account = stub
+        .app_forge()
+        .with_installation(55)
+        .connection_account()
+        .await
+        .unwrap();
+    assert_eq!(account, "acme");
+    assert_eq!(stub.seen()[0].path, "/app/installations/55");
+    // Unpinned, it cannot say which account it serves, and asks nothing.
+    let unpinned = Stub::start(vec![]).await;
+    assert!(unpinned.app_forge().connection_account().await.is_err());
+    assert!(unpinned.seen().is_empty());
+}

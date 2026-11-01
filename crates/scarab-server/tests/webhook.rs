@@ -277,3 +277,164 @@ async fn installation_webhook_auto_registers_the_connection_and_repos() {
         .expect("repo bound");
     assert_eq!((hit.org.as_str(), hit.project.as_str()), ("acme", "web"));
 }
+
+/// A signed `installation` delivery for installation `id` on account `login`
+/// covering `repos` (`owner/name`).
+fn installation_request(delivery: &str, id: u64, login: &str, repos: &[&str]) -> Request<Body> {
+    let repositories: Vec<serde_json::Value> = repos
+        .iter()
+        .map(|r| serde_json::json!({ "full_name": r }))
+        .collect();
+    let body = serde_json::to_vec(&serde_json::json!({
+        "action": "created",
+        "installation": { "id": id, "account": { "login": login } },
+        "repositories": repositories,
+    }))
+    .unwrap();
+    let sig = scarab_forge_github::sign_hex(SECRET, &body);
+    Request::builder()
+        .method("POST")
+        .uri("/webhooks/github")
+        .header("content-type", "application/json")
+        .header("x-github-event", "installation")
+        .header("x-github-delivery", delivery)
+        .header("x-hub-signature-256", &sig)
+        .body(Body::from(body))
+        .unwrap()
+}
+
+/// git-bug 19b0a45: the installation connection serves the Org of the
+/// installation's account and records its installation id (tokens are minted
+/// from it alone). A repo of another owner in the delivery is not bound, and
+/// neither is a repo bound through another Org's connection.
+#[tokio::test]
+async fn an_installation_serves_its_accounts_org_and_binds_only_its_repos() {
+    use scarab_forge::{ForgeConnection, ForgeConnectionStore, ForgeKind, RepoRef};
+
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    // globex/shared is already bound through globex's own connection.
+    db.put_connection(&ForgeConnection {
+        id: "fj-globex".into(),
+        kind: ForgeKind::Forgejo,
+        base_url: "https://git.globex.test".into(),
+        credential_ref: "fj-globex-token".into(),
+        org: Some("globex".into()),
+        installation_id: None,
+    })
+    .await
+    .unwrap();
+    let shared = RepoRef {
+        owner: "globex".into(),
+        name: "shared".into(),
+    };
+    db.bind_repo("fj-globex", &shared, "globex", "shared")
+        .await
+        .unwrap();
+    let app = multi_forge_app(db.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(installation_request(
+            "inst-org-1",
+            7,
+            "acme",
+            &["acme/web", "globex/shared", "initech/tps"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let conn = db
+        .get_connection("github-install-7")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(conn.org.as_deref(), Some("acme"));
+    assert_eq!(conn.installation_id, Some(7));
+    assert_eq!(
+        db.repos_of("github-install-7").await.unwrap(),
+        vec![RepoRef {
+            owner: "acme".into(),
+            name: "web".into()
+        }],
+        "only the account's own repo is bound"
+    );
+    let still = db.resolve(&shared).await.unwrap().unwrap();
+    assert_eq!(
+        still.connection.id, "fj-globex",
+        "globex's repo was not moved"
+    );
+    assert_eq!(still.org, "globex");
+}
+
+/// git-bug 19b0a45 (D7): a GitHub account named like an Org that already has
+/// a connection to another forge does not join that Org by name. Its
+/// installation is registered unassigned and binds nothing until a global
+/// admin acts on it.
+#[tokio::test]
+async fn an_installation_does_not_join_a_same_named_org_of_another_forge() {
+    use scarab_forge::{ForgeConnection, ForgeConnectionStore, ForgeKind, RepoRef};
+
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    db.put_connection(&ForgeConnection {
+        id: "fj-acme".into(),
+        kind: ForgeKind::Forgejo,
+        base_url: "https://git.acme.test".into(),
+        credential_ref: "fj-acme-token".into(),
+        org: Some("acme".into()),
+        installation_id: None,
+    })
+    .await
+    .unwrap();
+    let app = multi_forge_app(db.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(installation_request("inst-d7-1", 9, "acme", &["acme/web"]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let conn = db
+        .get_connection("github-install-9")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(conn.org, None, "registered unassigned");
+    assert_eq!(conn.installation_id, Some(9));
+    assert!(db.repos_of("github-install-9").await.unwrap().is_empty());
+    assert!(db
+        .resolve(&RepoRef {
+            owner: "acme".into(),
+            name: "web".into()
+        })
+        .await
+        .unwrap()
+        .is_none());
+}
+
+/// An installation delivery with no account login names no Org: refused,
+/// and nothing is registered.
+#[tokio::test]
+async fn an_installation_without_an_account_login_is_refused() {
+    use scarab_forge::ForgeConnectionStore;
+
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    let app = multi_forge_app(db.clone());
+    let resp = app
+        .clone()
+        .oneshot(installation_request(
+            "inst-nologin-1",
+            11,
+            "",
+            &["acme/web"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(db
+        .get_connection("github-install-11")
+        .await
+        .unwrap()
+        .is_none());
+}
