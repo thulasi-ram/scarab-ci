@@ -141,7 +141,7 @@ function StepUpModal(props: {
             <Show when={r().mode === "enroll"}>
               <A
                 class="btn btn-primary"
-                href={r().enroll_url ?? "/account/security?enroll=1"}
+                href={r().enroll_url ?? "/settings/security?enroll=1"}
                 onClick={() => props.settle(false)}
               >
                 <Icon icon="key-round" size={14} /> Enroll a passkey

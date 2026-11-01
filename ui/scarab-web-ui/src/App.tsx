@@ -9,9 +9,8 @@ import Repos from "./routes/Repos";
 import RepoView from "./routes/RepoView";
 import RunDetail from "./routes/RunDetail";
 import RunPipeline from "./routes/RunPipeline";
-import Settings from "./routes/Settings";
+import { AccountSettings, LegacySettings, OrgSettings } from "./routes/Settings";
 import LibraryReview from "./routes/LibraryReview";
-import Account from "./routes/Account";
 import ConfirmRequest from "./routes/ConfirmRequest";
 
 export default function App() {
@@ -29,17 +28,20 @@ export default function App() {
     <Show when={!unauthenticated()} fallback={<Login />}>
     <Router root={Layout}>
       <Route path="/" component={Repos} />
-      {/* Global, org-scoped settings (ADR-0060). One segment, so it can't
-          collide with the two-segment /:org/:repo tier. */}
-      <Route path="/settings" component={Settings} />
+      {/* Settings (git-bug 734ffa1): Your account under /settings/<section>,
+          an org's settings under /orgs/<org>/settings/<section>. Static first
+          segments, so they outrank the /:org/:repo tier. */}
+      <Route path="/settings" component={LegacySettings} />
+      <Route path="/settings/:section" component={AccountSettings} />
+      <Route path="/orgs/:org/settings/:section?" component={OrgSettings} />
       {/* Install or upgrade a library (ADR-0076 §4): its own page, so the
           review can be sent to a second reviewer. */}
-      <Route path="/settings/libraries/review" component={LibraryReview} />
-      {/* Your sign-in accounts (ADR-0069) — everyone's, not admin-gated. */}
-      <Route path="/account" component={Account} />
-      {/* The same page, scrolled to Security (ADR-0073): where every "enroll
-          a passkey" link and the fresh-login redirect land (`?enroll=1`). */}
-      <Route path="/account/security" component={Account} />
+      <Route path="/orgs/:org/settings/libraries/review" component={LibraryReview} />
+      {/* Old addresses: the server still sends people to /account?… and
+          /account/security?enroll=1, and bookmarks outlive us. */}
+      <Route path="/settings/libraries/review" component={LegacySettings} />
+      <Route path="/account" component={LegacySettings} />
+      <Route path="/account/security" component={LegacySettings} />
       {/* A machine's StepUpConfirmationRequest (ADR-0073 §6): the
           `confirmation_url` its human opens. Three segments, so it can't
           collide with the two-segment /:org/:repo tier. */}

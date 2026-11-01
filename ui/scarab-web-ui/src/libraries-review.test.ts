@@ -121,9 +121,9 @@ describe("review checks", () => {
     expect(clean.map((c) => c.tone)).toEqual(["ok", "ok", "info", "ok"]);
   });
   it("links the review page with what is known", () => {
-    expect(reviewHref({})).toBe("/settings/libraries/review");
-    expect(reviewHref({ source: "s@c", publisher: "acme", name: "", connection: undefined })).toBe(
-      "/settings/libraries/review?source=s%40c&publisher=acme",
+    expect(reviewHref("acme", {})).toBe("/orgs/acme/settings/libraries/review");
+    expect(reviewHref("acme", { source: "s@c", publisher: "acme", name: "", connection: undefined })).toBe(
+      "/orgs/acme/settings/libraries/review?source=s%40c&publisher=acme",
     );
   });
 });

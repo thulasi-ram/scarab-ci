@@ -263,7 +263,7 @@ export function requestErrorLink(status: number, body: string): { text: string; 
   try {
     const j = JSON.parse(body) as { code?: unknown };
     if (j && j.code === "no_passkey") {
-      return { text: "Enroll a passkey first", href: "/account/security?enroll=1" };
+      return { text: "Enroll a passkey first", href: "/settings/security?enroll=1" };
     }
   } catch {
     /* not JSON */

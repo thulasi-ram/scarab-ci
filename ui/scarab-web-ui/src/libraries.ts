@@ -324,11 +324,14 @@ export function inputsChange(oldContent: string, newContent: string): string {
   return parts.join("; ");
 }
 
-/** The review page's URL for a library: a fresh install, or an upgrade
- *  from `source`. */
-export function reviewHref(p: { source?: string; publisher?: string; name?: string; connection?: string }): string {
+/** The review page's URL for a library in `org`: a fresh install, or an
+ *  upgrade from `source`. */
+export function reviewHref(
+  org: string,
+  p: { source?: string; publisher?: string; name?: string; connection?: string },
+): string {
   const q = new URLSearchParams();
   for (const [k, v] of Object.entries(p)) if (v) q.set(k, v);
   const s = q.toString();
-  return `/settings/libraries/review${s ? `?${s}` : ""}`;
+  return `/orgs/${encodeURIComponent(org)}/settings/libraries/review${s ? `?${s}` : ""}`;
 }

@@ -94,7 +94,7 @@ export default function ConfirmRequest() {
             <p class="subtle">
               <small>
                 Only the person a request is for can confirm it.{" "}
-                <A href="/account/security">Your security settings</A>
+                <A href="/settings/security">Your security settings</A>
               </small>
             </p>
           </div>

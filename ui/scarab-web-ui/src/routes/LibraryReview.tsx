@@ -5,7 +5,7 @@
 // version, the checks, and what changes. Install then installs exactly the
 // version shown, naming the version it replaces, and asks for a step-up.
 import { createEffect, createResource, createSignal, For, Show } from "solid-js";
-import { A, useNavigate, useSearchParams } from "@solidjs/router";
+import { A, useNavigate, useParams, useSearchParams } from "@solidjs/router";
 import {
   fetchLibrary,
   getMe,
@@ -29,6 +29,7 @@ import {
   type SideCell,
 } from "../libraries";
 import Icon from "../components/Icon";
+import { administers, orgHref } from "../settings-nav";
 
 const one = (v: string | string[] | undefined) => (Array.isArray(v) ? v[0] ?? "" : v ?? "");
 
@@ -36,7 +37,10 @@ export default function LibraryReview() {
   const nav = useNavigate();
   const [search, setSearch] = useSearchParams();
   const [me] = createResource(getMe);
-  const org = () => me()?.admin_orgs[0];
+  const params = useParams<{ org: string }>();
+  /** The org in the URL, once we know the caller administers it. */
+  const org = () => (administers(me(), params.org) ? params.org : undefined);
+  const back = () => orgHref(params.org, "libraries");
   const [libs] = createResource(org, (o) => listLibraries(o));
   const [connections] = createResource(() => listConnections().catch(() => []));
   const [form, setForm] = createSignal<FetchForm>({
@@ -99,7 +103,7 @@ export default function LibraryReview() {
         content_hash: f.content_hash,
         replaces: f.current?.content_hash ?? null,
       });
-      nav("/settings");
+      nav(back());
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not install the library.");
     } finally {
@@ -138,8 +142,8 @@ export default function LibraryReview() {
     <section class="page">
       <div class="run-head">
         <h1 class="crumb-head">
-          <A href="/settings" class="crumb-head-link">
-            Settings
+          <A href={back()} class="crumb-head-link">
+            Libraries
           </A>
           <Icon icon="chevron-right" size={20} class="crumb-head-sep" />
           <span class="crumb-head-title mono">{title()}</span>
@@ -151,7 +155,7 @@ export default function LibraryReview() {
       </p>
 
       <Show when={me()} fallback={<p class="empty">loading…</p>}>
-        <Show when={org()} fallback={<p class="empty">No organization yet: bind a repository first.</p>}>
+        <Show when={org()} fallback={<p class="empty">You do not administer this organization.</p>}>
           <div class="lib-review">
             <div>
               <div class="panel" style={{ "margin-top": 0 }}>
@@ -365,7 +369,7 @@ export default function LibraryReview() {
                           <Icon icon={f().current ? "arrow-up" : "plus"} size={14} />{" "}
                           {busy() === "install" ? "Installing…" : f().current ? "Upgrade" : "Install"}
                         </button>
-                        <button class="btn btn-ghost btn-sm" onClick={() => nav("/settings")}>
+                        <button class="btn btn-ghost btn-sm" onClick={() => nav(back())}>
                           Discard
                         </button>
                       </div>

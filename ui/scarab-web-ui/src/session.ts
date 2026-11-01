@@ -10,13 +10,3 @@ import { getMe, type Me } from "./api/client";
 const [me] = createResource<Me>(getMe);
 
 export { me };
-
-/**
- * May the current principal administer org-level settings (ADR-0060)?
- *
- * Drives whether the Settings nav entry renders at all. Defaults to `false`
- * while loading or on error — chrome that appears and then vanishes is worse
- * than chrome that arrives a beat late. This is presentation only: the server
- * enforces `Administer` on every request regardless.
- */
-export const canAdminister = () => me()?.can_administer ?? false;

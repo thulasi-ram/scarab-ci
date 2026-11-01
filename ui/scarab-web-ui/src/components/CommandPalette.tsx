@@ -6,7 +6,8 @@ import { createResource, createSignal, createMemo, createEffect, For, Show, onCl
 import { useNavigate } from "@solidjs/router";
 import { listProjects, type Project } from "../api/client";
 import { paletteOpen as open, setPaletteOpen as setOpen } from "../palette";
-import { canAdminister } from "../session";
+import { me } from "../session";
+import { paletteEntries } from "../settings-nav";
 import Icon from "./Icon";
 
 type Item =
@@ -14,10 +15,6 @@ type Item =
   | { kind: "run"; label: string; sub: string; href: string }
   | { kind: "page"; label: string; sub: string; href: string };
 
-/** Static destinations, offered only when the caller may actually reach them. */
-const PAGES: { label: string; sub: string; href: string; admin: boolean }[] = [
-  { label: "Settings", sub: "organization-wide configuration", href: "/settings", admin: true },
-];
 
 const RUN_ID = /^[0-9a-f]{4,}$/i;
 
@@ -42,8 +39,15 @@ export default function CommandPalette() {
         sub: `${p.owner}/${p.name}`,
         href: `/${p.org}/${p.project}`,
       }));
-    const pages = PAGES.filter((pg) => !pg.admin || canAdminister())
-      .filter((pg) => !query || pg.label.toLowerCase().includes(query))
+    // Every settings section the caller can reach (git-bug 734ffa1); with
+    // nothing typed, one entry for Settings rather than all of them.
+    const pages = (
+      query
+        ? (me() ? paletteEntries(me()!) : [])
+            .filter((pg) => `${pg.label} settings ${pg.sub}`.toLowerCase().includes(query))
+            .slice(0, 8)
+        : [{ label: "Settings", sub: "your account and organization settings", href: "/settings" }]
+    )
       .map<Item>((pg) => ({ kind: "page", label: pg.label, sub: pg.sub, href: pg.href }));
     const out: Item[] = [...repos, ...pages];
     // A hex-looking query is also a run id to jump to.
@@ -111,7 +115,7 @@ export default function CommandPalette() {
             <input
               ref={inputRef}
               type="text"
-              placeholder="Search repos, or paste a run id…"
+              placeholder="Search repos and settings, or paste a run id…"
               value={q()}
               onInput={(e) => setQ(e.currentTarget.value)}
             />

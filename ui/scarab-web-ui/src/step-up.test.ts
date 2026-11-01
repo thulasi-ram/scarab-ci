@@ -27,7 +27,7 @@ const refusalBody = (mode: string, extra: Record<string, unknown> = {}) => ({
   mode,
   op: "secret.put",
   summary,
-  ...(mode === "enroll" ? { enroll_url: "/account/security?enroll=1" } : { challenge }),
+  ...(mode === "enroll" ? { enroll_url: "/settings/security?enroll=1" } : { challenge }),
   ...extra,
 });
 
@@ -48,7 +48,7 @@ describe("parseStepUp", () => {
     }
     expect((parseStepUp(refusalBody("window")) as StepUpRequired).challenge?.id).toBe("ch-1");
     expect((parseStepUp(refusalBody("enroll")) as StepUpRequired).enroll_url).toBe(
-      "/account/security?enroll=1",
+      "/settings/security?enroll=1",
     );
   });
 
@@ -111,7 +111,7 @@ describe("withStepUp", () => {
     const res = await withStepUp(res403(refusalBody("enroll")), retry, ceremony);
     expect(res.status).toBe(403);
     expect(seen[0]!.mode).toBe("enroll");
-    expect(seen[0]!.enroll_url).toBe("/account/security?enroll=1");
+    expect(seen[0]!.enroll_url).toBe("/settings/security?enroll=1");
     expect(retry).not.toHaveBeenCalled();
   });
 

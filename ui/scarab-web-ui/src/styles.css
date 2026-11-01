@@ -3650,3 +3650,21 @@ code.c { font-family: var(--font-mono); font-size: var(--fs-sm); color: var(--co
 .origin-strip .lnk.y { color: var(--danger); }
 .lib-table td.lib-src { font-size: var(--fs-xs); }
 .lib-table td { font-size: var(--fs-md); }
+
+/* Settings shell (git-bug 734ffa1): an in-page sidebar inside the .page
+   column; under 900px the list becomes a <select> above the section. */
+.settings { display: grid; grid-template-columns: 200px minmax(0, 1fr); gap: 40px; }
+.settings-nav { position: sticky; top: 16px; align-self: start; display: flex; flex-direction: column; gap: 14px; padding-top: 6px; }
+.settings-nav-group { display: flex; flex-direction: column; gap: 1px; }
+.settings-nav-h { margin-bottom: 4px; padding-left: 10px; font-size: var(--fs-xs); font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted-sage); }
+.settings-nav-org { margin: -2px 0 6px; padding-left: 10px; font-size: var(--fs-sm); color: var(--sage); overflow-wrap: anywhere; }
+.settings-nav-orgpick { margin: 0 0 6px; width: 100%; font-size: var(--fs-sm); }
+.settings-nav-link { display: block; padding: 6px 10px; border-radius: var(--radius-sm); border-left: 2px solid transparent; color: var(--sage); font-size: var(--fs-md); text-decoration: none; }
+.settings-nav-link:hover { color: var(--soft-white); background: var(--pine-deep); }
+.settings-nav-link.on { color: var(--emerald); font-weight: 600; background: var(--pine-deep); border-left-color: var(--emerald); }
+.settings-select { display: none; }
+@media (max-width: 900px) {
+  .settings { grid-template-columns: 1fr; gap: 0; }
+  .settings-nav { display: none; }
+  .settings-select { display: block; width: 100%; margin-bottom: 20px; }
+}

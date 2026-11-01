@@ -1184,7 +1184,7 @@ function route(pathname: string, search: string, method: string): Response | nul
   // Linking: no provider to bounce through, so "authorize" straight back to
   // the Account page with the outcome a real callback would carry.
   if (p === "/v1/me/identities/link") {
-    return json({ authorize_url: "/account?identity_linked=forgejo" });
+    return json({ authorize_url: "/settings/profile?identity_linked=forgejo" });
   }
   if (/^\/v1\/me\/identities\/[^/]+$/.test(p)) return new Response(null, { status: 204 });
   if (/^\/v1\/orgs\/[^/]+\/bindings$/.test(p)) {

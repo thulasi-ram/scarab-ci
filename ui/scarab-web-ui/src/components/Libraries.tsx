@@ -161,7 +161,7 @@ export default function Libraries(props: { org: string }) {
                         out a repository needs <span class="mono">lib:thulasi-ram/clone</span>.
                       </p>
                       <div class="acts">
-                        <button class="btn btn-primary btn-sm" onClick={() => nav(reviewHref({}))}>
+                        <button class="btn btn-primary btn-sm" onClick={() => nav(reviewHref(props.org, {}))}>
                           <Icon icon="plus" size={14} /> Install library
                         </button>
                         <Show when={offered().length > 0}>
@@ -192,7 +192,7 @@ export default function Libraries(props: { org: string }) {
                         library={l}
                         trust={trustNote(l, libs()?.trusted_sources ?? [])}
                         onUpgrade={(source) =>
-                          nav(reviewHref({ source: source ?? l.source, publisher: l.publisher, name: l.name }))
+                          nav(reviewHref(props.org, { source: source ?? l.source, publisher: l.publisher, name: l.name }))
                         }
                         onRemove={() => remove(l)}
                         onYank={() => setYanking(l)}
@@ -219,7 +219,7 @@ export default function Libraries(props: { org: string }) {
                         <span class="oenv-actions">
                           <button
                             class="btn btn-ghost btn-sm"
-                            onClick={() => nav(reviewHref({ source: f.source, publisher: f.publisher, name: f.name }))}
+                            onClick={() => nav(reviewHref(props.org, { source: f.source, publisher: f.publisher, name: f.name }))}
                           >
                             install
                           </button>
@@ -277,7 +277,7 @@ export default function Libraries(props: { org: string }) {
 
             <Show when={rows().length > 0}>
               <div class="secrets-actions">
-                <button class="btn btn-primary btn-sm" onClick={() => nav(reviewHref({}))}>
+                <button class="btn btn-primary btn-sm" onClick={() => nav(reviewHref(props.org, {}))}>
                   <Icon icon="plus" size={14} /> Install library
                 </button>
               </div>
@@ -305,7 +305,7 @@ export default function Libraries(props: { org: string }) {
                 setError(null);
                 setNotice(msg);
                 reload();
-                if (upgrade) nav(reviewHref({ source: upgrade, publisher: l().publisher, name: l().name }));
+                if (upgrade) nav(reviewHref(props.org, { source: upgrade, publisher: l().publisher, name: l().name }));
               }}
             />
           </Portal>
