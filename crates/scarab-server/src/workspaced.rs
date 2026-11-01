@@ -1707,9 +1707,14 @@ struct BlobClosure {
     blobs: Vec<[u8; 32]>,
     /// The claimed roots this closure is complete for — every required root,
     /// and only the cache roots that walked (git-bug 2a79b73). A cache root
-    /// left out here is left out of the grant's completeness too, so the
-    /// allowlist never answers "denied, complete" for a root it never saw.
+    /// that did not walk is in `unwalkable` instead: it grants no blob.
     roots: Vec<String>,
+    /// The cache roots this replica tried to walk and could not: they grant
+    /// nothing here (a Cache restore goes to the Cache's home replica), so
+    /// they count toward completeness without contributing a blob. Without
+    /// this, an entry for a token naming another replica's Cache is never
+    /// complete, and every denied blob GET walks the required roots again.
+    unwalkable: Vec<String>,
 }
 
 /// One token's cached authorization: which blobs its roots reach, and how
@@ -1720,6 +1725,10 @@ struct BlobAllowEntry {
     /// Which of the token's claimed roots contributed (piggybacked `/flat`s
     /// insert one root each; the fallback walk inserts them all).
     roots_seen: BTreeSet<String>,
+    /// Cache roots a fallback walk on this replica could not walk
+    /// ([`BlobClosure::unwalkable`]). They grant no blob; they only let the
+    /// entry be complete, so a denial is answered from the entry.
+    unwalkable: BTreeSet<String>,
     /// The token's `exp`: an expired entry is a miss (and is dropped), so the
     /// allowlist can never outlive the credential it answers for. Belt and
     /// braces — an expired token already dies at [`authenticate`].
@@ -1805,7 +1814,8 @@ impl BlobAllowlist {
     }
 
     /// One membership question. `claimed_roots` is the token's WHOLE roots
-    /// claim — completeness is "this entry has seen every claimed root".
+    /// claim — completeness is "this entry has seen every claimed root, or
+    /// a walk here found the (cache) root unwalkable".
     fn lookup(
         &self,
         key: &[u8; 32],
@@ -1829,7 +1839,10 @@ impl BlobAllowlist {
         if entry.blobs.binary_search(blob).is_ok() {
             return BlobAllowVerdict::Allowed;
         }
-        if claimed_roots.iter().all(|r| entry.roots_seen.contains(r)) {
+        if claimed_roots
+            .iter()
+            .all(|r| entry.roots_seen.contains(r) || entry.unwalkable.contains(r))
+        {
             BlobAllowVerdict::DeniedComplete
         } else {
             BlobAllowVerdict::Miss
@@ -1845,6 +1858,19 @@ impl BlobAllowlist {
         key: [u8; 32],
         exp: i64,
         granted_roots: &[String],
+        blobs: Vec<[u8; 32]>,
+    ) {
+        self.grant_with_unwalkable(key, exp, granted_roots, &[], blobs);
+    }
+
+    /// [`Self::grant`] for a fallback walk's result: also records the cache
+    /// roots the walk could not walk here ([`BlobClosure::unwalkable`]).
+    fn grant_with_unwalkable(
+        &self,
+        key: [u8; 32],
+        exp: i64,
+        granted_roots: &[String],
+        unwalkable: &[String],
         mut blobs: Vec<[u8; 32]>,
     ) {
         blobs.sort_unstable();
@@ -1866,9 +1892,15 @@ impl BlobAllowlist {
                 union.dedup();
                 let mut roots_seen = existing.roots_seen;
                 roots_seen.extend(granted_roots.iter().cloned());
+                let mut unwalkable_seen = existing.unwalkable;
+                unwalkable_seen.extend(unwalkable.iter().cloned());
+                // A root that walked (a later /flat, a later walk) is a
+                // grant, not an absence.
+                unwalkable_seen.retain(|r| !roots_seen.contains(r));
                 BlobAllowEntry {
                     blobs: Arc::new(union),
                     roots_seen,
+                    unwalkable: unwalkable_seen,
                     exp,
                     tick,
                 }
@@ -1876,6 +1908,11 @@ impl BlobAllowlist {
             None => BlobAllowEntry {
                 blobs: Arc::new(blobs),
                 roots_seen: granted_roots.iter().cloned().collect(),
+                unwalkable: unwalkable
+                    .iter()
+                    .filter(|r| !granted_roots.contains(r))
+                    .cloned()
+                    .collect(),
                 exp,
                 tick,
             },
@@ -2018,7 +2055,11 @@ async fn walk_blob_closure(
 /// be — a Cache is warm-only and lives on one replica, so a replica that does
 /// not hold it would otherwise fail every required read of a Step that merely
 /// declared a cache. Leaving it out only narrows the grant: that root's blobs
-/// are not allowed here, and the entry never claims completeness for it.
+/// are not allowed here. It is returned in [`BlobClosure::unwalkable`] so the
+/// entry can still be complete — a denial is then answered from the entry
+/// instead of a walk per denied GET. If the Cache tree reaches this replica
+/// while the entry lives, its blobs stay denied here until the entry is
+/// rebuilt; that only narrows the grant further.
 ///
 /// Each cache root is walked with its own visited set: a failed cache walk
 /// must not mark trees seen that a later cache root still needs.
@@ -2029,19 +2070,23 @@ async fn walk_token_closure(
 ) -> Result<BlobClosure, String> {
     let mut blobs = walk_blob_closure(state, &roots).await?;
     let mut granted = roots;
+    let mut unwalkable = Vec::new();
     for cache_root in cache_roots {
         match walk_blob_closure(state, std::slice::from_ref(&cache_root)).await {
             Ok(more) => {
                 blobs.extend(more);
                 granted.push(cache_root);
             }
-            Err(e) => tracing::info!(
+            Err(e) => {
+                tracing::info!(
                 cache_root = %cache_root,
                 error = %e,
                 "blob authz: a cache root is not walkable on this replica — left out of \
                  the grant (a cache restore here is a miss; required inputs are \
                  unaffected, git-bug 2a79b73)"
-            ),
+                );
+                unwalkable.push(cache_root);
+            }
         }
     }
     blobs.sort_unstable();
@@ -2049,6 +2094,7 @@ async fn walk_token_closure(
     Ok(BlobClosure {
         blobs,
         roots: granted,
+        unwalkable,
     })
 }
 
@@ -2185,11 +2231,13 @@ async fn authorize_blob(
         .await
         .map_err(WsError::Backend)?; // F3: an incomplete REQUIRED walk is a 500.
     // Granted for the roots that walked — a cache root this replica could
-    // not walk is not among them (git-bug 2a79b73).
-    state.blob_allow.grant(
+    // not walk is not among them (git-bug 2a79b73), and is recorded as
+    // unwalkable so the entry is complete and the next denial needs no walk.
+    state.blob_allow.grant_with_unwalkable(
         key,
         claims.exp,
         &closure.roots,
+        &closure.unwalkable,
         closure.blobs.clone(),
     );
     if closure.blobs.binary_search(&blob).is_ok() {
@@ -5601,6 +5649,50 @@ mod tests {
         );
     }
 
+    /// A cache root this replica cannot walk must not keep the token's
+    /// allowlist entry incomplete: before the fix every denied blob GET
+    /// re-ran the whole fallback walk of the required roots (5 denied GETs,
+    /// 5 walks). The walk records the root as unwalkable, the entry is
+    /// complete, and later denials come from the entry, as for a token with
+    /// no cache roots. Found by the red team on the review stack.
+    #[tokio::test]
+    async fn an_unwalkable_cache_root_does_not_rewalk_on_every_denied_get() {
+        let Some(h) = DepotHarness::start().await else { return };
+        h.state.blob_allow.set_mode(BlobAuthzMode::Enforce);
+        let foreign = seed_foreign_blob(&h).await;
+        let fence = Fence { run: "run-rt-walk".into(), step: "build".into(), attempt: "a1".into() };
+        let plain = workspace_token::mint(
+            b"export-secret",
+            &workspace_token::step_claims(fence.clone(), i64::MAX / 2, vec![h.parent.root.0.clone()]),
+        );
+        let w0 = h.state.blob_allow.walks.load(Ordering::Relaxed);
+        for _ in 0..5 {
+            let (s, _) = h.call_as(&plain, "GET", &format!("/v1/cas/blobs/{foreign}"), None).await;
+            assert_eq!(s, StatusCode::FORBIDDEN);
+        }
+        let plain_walks = h.state.blob_allow.walks.load(Ordering::Relaxed) - w0;
+        let cached = workspace_token::mint(
+            b"export-secret",
+            &workspace_token::step_claims(
+                Fence { run: "run-rt-walk-2".into(), ..fence },
+                i64::MAX / 2,
+                vec![h.parent.root.0.clone()],
+            )
+            .with_cache_roots(vec!["e".repeat(64)]),
+        );
+        let w1 = h.state.blob_allow.walks.load(Ordering::Relaxed);
+        for _ in 0..5 {
+            let (s, _) = h.call_as(&cached, "GET", &format!("/v1/cas/blobs/{foreign}"), None).await;
+            assert_eq!(s, StatusCode::FORBIDDEN);
+        }
+        let cached_walks = h.state.blob_allow.walks.load(Ordering::Relaxed) - w1;
+        assert_eq!(plain_walks, 1, "a plain token walks once, then denies from its entry");
+        assert_eq!(
+            cached_walks, plain_walks,
+            "an unwalkable cache root must not re-walk on every denied GET"
+        );
+    }
+
     /// Enforce mode, whole surface (amendments F2a + F7): a fenced token
     /// reads a blob inside its roots closure via the FALLBACK WALK (no /flat
     /// first — the cold-start path), and is refused a blob outside it on GET,
@@ -6017,6 +6109,47 @@ mod tests {
                 BlobAllowVerdict::DeniedComplete
             ),
             "…while the same entry IS complete for a claim of [A] alone, and denies"
+        );
+    }
+
+    /// Unwalkable cache roots at the unit grain: they complete the entry
+    /// (an absent blob is denied from it) but grant nothing, and a root that
+    /// a piggyback seeds later is a grant again. The partial-piggyback rule
+    /// above still holds for a cache root never tried: only a walk that
+    /// FAILED on it may count it.
+    #[test]
+    fn an_unwalkable_cache_root_completes_the_entry_without_granting() {
+        let list = BlobAllowlist::new(BlobAuthzMode::Enforce);
+        let key = [7u8; 32];
+        let required = "a".repeat(64);
+        let cache = "c".repeat(64);
+        let claimed = vec![required.clone(), cache.clone()];
+        let input = [1u8; 32];
+        let cached = [3u8; 32];
+
+        list.grant(key, i64::MAX / 2, std::slice::from_ref(&required), vec![input]);
+        assert!(
+            matches!(list.lookup(&key, &cached, &claimed, 0), BlobAllowVerdict::Miss),
+            "a cache root no walk has tried must not count toward completeness"
+        );
+
+        list.grant_with_unwalkable(
+            key,
+            i64::MAX / 2,
+            std::slice::from_ref(&required),
+            std::slice::from_ref(&cache),
+            vec![input],
+        );
+        assert!(
+            matches!(list.lookup(&key, &cached, &claimed, 0), BlobAllowVerdict::DeniedComplete),
+            "an unwalkable cache root completes the entry and grants nothing"
+        );
+
+        // The Cache tree reaches this replica and a /flat on it seeds it.
+        list.grant(key, i64::MAX / 2, std::slice::from_ref(&cache), vec![cached]);
+        assert!(
+            matches!(list.lookup(&key, &cached, &claimed, 0), BlobAllowVerdict::Allowed),
+            "a root that walked later is a grant"
         );
     }
 
