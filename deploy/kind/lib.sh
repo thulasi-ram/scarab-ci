@@ -70,5 +70,13 @@ verify_kubeconfig() {
   got="$(KUBECONFIG="$kubeconfig" kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')"
   [ "$got" = "$want" ] || die "refusing: $kubeconfig points at '$got', not this kind cluster ($want)"
 }
+# active_step_pods: how many step Pods (the executor's scarab.io/run label) in
+# any namespace are neither Succeeded nor Failed. A Pod being deleted still
+# counts until it is gone. up.sh refuses a mode switch while this is not 0.
+active_step_pods() {
+  kc get pods -A -l scarab.io/run \
+    --field-selector=status.phase!=Succeeded,status.phase!=Failed -o name | wc -l | tr -d ' '
+}
+
 kc() { verify_kubeconfig; KUBECONFIG="$kubeconfig" kubectl --context "kind-$cluster" "$@"; }
 hc() { verify_kubeconfig; KUBECONFIG="$kubeconfig" helm --kube-context "kind-$cluster" "$@"; }

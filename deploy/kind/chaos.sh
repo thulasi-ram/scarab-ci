@@ -56,16 +56,34 @@ esac
 
 stats_pid=""
 rc=0
+# Set once `up.sh chaos` has switched the release. Until then the release is
+# still in the previous mode, and its step Pods are not this recipe's to delete:
+# when `up.sh chaos` refuses because they run, or the build fails, the cleanup
+# only stops the port-forwards.
+switched=0
 cleanup() {
-  local code=$?
+  local code=$? mode_now
   [ -z "$stats_pid" ] || kill "$stats_pid" 2>/dev/null || true
   stop_forwards
   [ "$rc" -ne 0 ] || rc=$code
+  mode_now="$(cat "$here/.state/mode" 2>/dev/null || true)"
+  if [ "$switched" != 1 ] && [ "$mode_now" != chaos ]; then
+    echo "==> the release was not switched to chaos mode; leaving it in ${mode_now:-its current mode}"
+    exit "$rc"
+  fi
   # A Run the bound gave up on can leave its step Pods running; they belong to
   # the chaos mode and would block the switch back. The checker has already
-  # recorded them (I8).
+  # recorded them (I8). A deleted Pod still counts in up.sh's guard while it
+  # terminates, so wait (bounded) until none is left.
   ( kc delete pods -n "$ns" -l scarab.io/run --field-selector=status.phase!=Succeeded,status.phase!=Failed \
       --ignore-not-found --wait=false >/dev/null 2>&1 ) || true
+  local left=""
+  for _ in $(seq 1 60); do
+    left="$( (active_step_pods) 2>/dev/null || echo '?')"
+    [ "$left" = 0 ] && break
+    sleep 2
+  done
+  [ "$left" = 0 ] || echo "warning: $left step Pod(s) still terminating after 120 s; the switch back may refuse" >&2
   echo "==> switching the release back to $back"
   if bash "$here/up.sh" "$back"; then
     scarab_addr
@@ -85,6 +103,7 @@ target="${CARGO_TARGET_DIR:-target}"; case "$target" in /*) ;; *) target="$root/
 bin="$target/debug/scarab-chaos"
 
 bash "$here/up.sh" chaos
+switched=1
 scarab_addr
 
 # The checker reads Postgres and MinIO directly, not through toxiproxy: it is

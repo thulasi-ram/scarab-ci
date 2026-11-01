@@ -432,8 +432,7 @@ if [ -n "$last_mode" ] && [ "$last_mode" != "$mode" ]; then
   # A step Pod of the current mode would carry on against the other mode's
   # server, Depot, bucket and token secrets, and its Attempt fails on resume.
   # Step Pods carry the executor's scarab.io/run label.
-  active="$(kc get pods -A -l scarab.io/run \
-    --field-selector=status.phase!=Succeeded,status.phase!=Failed -o name | wc -l | tr -d ' ')"
+  active="$(active_step_pods)"
   if [ "$active" != 0 ] && [ "${SCARAB_KIND_FORCE_SWITCH:-0}" != 1 ]; then
     die "refusing to switch $last_mode -> $mode: $active step Pod(s) of the $last_mode stack are still running.
   Let their Runs finish (or cancel them), then rerun. To switch anyway and fail them:
