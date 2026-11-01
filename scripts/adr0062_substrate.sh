@@ -21,15 +21,14 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Guard. Production EKS contexts sit in the ambient kubeconfig on developer
 # machines; every probe below creates a privileged Pod, so a wrong cluster is
-# not a small mistake. Every kubectl call goes through the kind stack's own
+# not a small mistake. Every kubectl call is lib.sh's `kc`: the kind stack's own
 # kubeconfig (deploy/kind/.kubeconfig), checked against the kind cluster's API
-# port before each call (deploy/kind/lib.sh). The ambient one is never read.
+# port before each call. The ambient one is never read. lib.sh is sourced before
+# the cleanup trap is set, so the trap's calls go through `kc` too.
 # ---------------------------------------------------------------------------
 # shellcheck source=deploy/kind/lib.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/deploy/kind/lib.sh"
 verify_kubeconfig
-# Defined before the cleanup trap, so the trap's kubectl is this one too.
-kubectl() { verify_kubeconfig; KUBECONFIG="$kubeconfig" command kubectl --context "kind-$cluster" "$@"; }
 echo "context: kind-$cluster ($kubeconfig)"
 
 NS=default
@@ -43,14 +42,14 @@ bad()  { FAIL=$((FAIL+1)); FAILURES+=("$1 -- $2"); printf '  \033[31mFAIL\033[0m
 head_() { printf '\n\033[1m%s\033[0m\n' "$1"; }
 
 cleanup() {
-  kubectl delete pod -n "$NS" -l "adr0062probe=yes" --wait=false >/dev/null 2>&1 || true
-  kubectl delete ns "${POD_PREFIX}-baseline" "${POD_PREFIX}-restricted" --wait=false >/dev/null 2>&1 || true
+  kc delete pod -n "$NS" -l "adr0062probe=yes" --wait=false >/dev/null 2>&1 || true
+  kc delete ns "${POD_PREFIX}-baseline" "${POD_PREFIX}-restricted" --wait=false >/dev/null 2>&1 || true
   rm -rf "$TMP" 2>/dev/null || true
 }
 TMP=$(mktemp -d)
 trap cleanup EXIT
 
-kubectl get nodes -o jsonpath='{range .items[*]}node: {.metadata.name}  runtime: {.status.nodeInfo.containerRuntimeVersion}  kubelet: {.status.nodeInfo.kubeletVersion}{"\n"}{end}'
+kc get nodes -o jsonpath='{range .items[*]}node: {.metadata.name}  runtime: {.status.nodeInfo.containerRuntimeVersion}  kubelet: {.status.nodeInfo.kubeletVersion}{"\n"}{end}'
 
 # ---------------------------------------------------------------------------
 # 1. A hardlink shares its inode, so it shares mode and mtime.
@@ -123,7 +122,7 @@ mk_bidir false > "$TMP/bidir-unpriv.yaml"; mk_bidir true > "$TMP/bidir-priv.yaml
 # rejects, and under `set -o pipefail` a `kubectl | grep -q` pipeline inherits
 # that non-zero even when the grep matched -- which silently INVERTS every
 # expect-a-rejection check. This script reported a false FAIL that way once.
-dryrun() { kubectl apply --dry-run=server -n "$1" -f "$2" 2>&1 || true; }
+dryrun() { kc apply --dry-run=server -n "$1" -f "$2" 2>&1 || true; }
 if dryrun "$NS" "$TMP/bidir-unpriv.yaml" | grep -q "only to privileged containers"; then
   ok "unprivileged sidecar + Bidirectional is rejected"
 else
@@ -145,8 +144,8 @@ fi
 head_ "3. PodSecurity: what each level admits"
 for lvl in baseline restricted; do
   ns="${POD_PREFIX}-${lvl}"
-  kubectl create ns "$ns" >/dev/null 2>&1 || true
-  kubectl label ns "$ns" "pod-security.kubernetes.io/enforce=${lvl}" --overwrite >/dev/null
+  kc create ns "$ns" >/dev/null 2>&1 || true
+  kc label ns "$ns" "pod-security.kubernetes.io/enforce=${lvl}" --overwrite >/dev/null
 done
 psa_pod() { # $1 = name  $2 = volume block  $3 = extra spec
 cat <<EOF
@@ -306,16 +305,16 @@ spec:
         echo "REDIRECTDIR_WITH_NFSEXPORT=refused"
       fi
 EOF
-kubectl delete pod -n "$NS" scarab-adr0062-probe-kernel --ignore-not-found --wait=true >/dev/null 2>&1
-kubectl apply -n "$NS" -f "$TMP/kernel.yaml" >/dev/null
+kc delete pod -n "$NS" scarab-adr0062-probe-kernel --ignore-not-found --wait=true >/dev/null 2>&1
+kc apply -n "$NS" -f "$TMP/kernel.yaml" >/dev/null
 for _ in $(seq 60); do
-  ph=$(kubectl get pod -n "$NS" scarab-adr0062-probe-kernel -o jsonpath='{.status.phase}' 2>/dev/null || true)
+  ph=$(kc get pod -n "$NS" scarab-adr0062-probe-kernel -o jsonpath='{.status.phase}' 2>/dev/null || true)
   # `if`, not `[ ] || [ ] && break` -- the latter returns 1 when both tests fail,
   # which `set -e` treats as a fatal command and the wait becomes a single tick.
   if [ "$ph" = "Succeeded" ] || [ "$ph" = "Failed" ]; then break; fi
   sleep 2
 done
-OUT=$(kubectl logs -n "$NS" scarab-adr0062-probe-kernel -c t 2>&1 || true)
+OUT=$(kc logs -n "$NS" scarab-adr0062-probe-kernel -c t 2>&1 || true)
 get() { echo "$OUT" | grep -m1 "^$1=" | cut -d= -f2- ; }
 [ -n "$OUT" ] || bad "kernel probe" "the probe pod to produce output; it produced none"
 echo "  kernel=$(get KERNEL) node fs=$(get NODEFS)"
