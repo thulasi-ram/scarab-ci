@@ -2,12 +2,14 @@
 """Read CHANGELOG.md for a release (cb31124).
 
     python3 -I scripts/changelog.py section <version>     # print the [<version>] section's body
+    python3 -I scripts/changelog.py notes <tag>           # the section plus the install lines
     python3 -I scripts/changelog.py links [<version>...]  # check the New entries link docs pages
 
 `section` prints what release.yml uses as the GitHub Release body: everything
 between `## [<version>]` and the next `## ` heading, without the heading. It
 exits 1 when the section is missing or empty. A leading `v` is dropped, so the
-tag name works too.
+tag name works too. `notes` is the GitHub Release text release.yml writes: the
+section, then how to install that version.
 
 `links` checks every bullet under `### New` in the Unreleased section and in
 each named version's section: a bullet must link a docs page that exists. A
@@ -25,6 +27,17 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 DOCS_SITE = "https://thulasi-ram.github.io/scarab-ci/"
 CONTENT = Path("ui/scarab-docs-ui/src/content/docs")
+
+INSTALL = """
+## Install
+
+```sh
+helm install scarab oci://ghcr.io/thulasi-ram/charts/scarab --version {v} -n scarab --create-namespace
+```
+
+Images (linux/amd64 + linux/arm64), all tagged `{v}`:
+`ghcr.io/thulasi-ram/scarab-server`, `scarab-clone`, `scarab-wsfetch`, `scarab-results-sidecar`.
+"""
 
 LINK = re.compile(r"\]\(([^)\s]+)\)")
 
@@ -120,14 +133,14 @@ def check_bullet(root, bullet):
 
 
 def main(argv, root=ROOT):
-    if len(argv) < 2 or argv[1] not in ("section", "links"):
+    if len(argv) < 2 or argv[1] not in ("section", "notes", "links"):
         print(__doc__.strip().splitlines()[2], file=sys.stderr)
         return 2
     text = (root / "CHANGELOG.md").read_text(encoding="utf-8")
     secs = sections(text)
-    if argv[1] == "section":
+    if argv[1] in ("section", "notes"):
         if len(argv) != 3:
-            print("usage: changelog.py section <version>", file=sys.stderr)
+            print(f"usage: changelog.py {argv[1]} <version>", file=sys.stderr)
             return 2
         version = argv[2].removeprefix("v")
         body = secs.get(version, "").strip()
@@ -135,6 +148,8 @@ def main(argv, root=ROOT):
             print(f"error: CHANGELOG.md has no ## [{version}] section, or it is empty", file=sys.stderr)
             return 1
         print(body)
+        if argv[1] == "notes":
+            print(INSTALL.format(v=version), end="")
         return 0
     names = ["Unreleased"] + [v.removeprefix("v") for v in argv[2:]]
     checked = failed = 0

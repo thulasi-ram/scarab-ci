@@ -60,6 +60,13 @@ class ChangelogTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(out, "### Fixes\n\n- A fix.\n")
 
+    def test_notes_add_the_install_lines_for_the_version(self):
+        code, out, _ = self.run_main("notes", "v0.2.2")
+        self.assertEqual(code, 0)
+        self.assertTrue(out.startswith("### Fixes\n\n- A fix.\n\n## Install\n"))
+        self.assertIn("--version 0.2.2 ", out)
+        self.assertEqual(self.run_main("notes", "v0.9.0")[0], 1)
+
     def test_a_missing_or_empty_section_fails(self):
         self.assertEqual(self.run_main("section", "0.9.0")[0], 1)
         self.assertEqual(self.run_main("section", "0.2.1")[0], 1)
