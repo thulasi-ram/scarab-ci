@@ -8,7 +8,7 @@
 //! `SCARAB_TEST_KUBE` as well: without it, it panics ([`enter_tier`]) rather
 //! than passing having done nothing (git-bug dcc4ca9). Run it with `just
 //! plugin-kube-tests` (or the whole tier with `just kube-tests`), which points
-//! `KUBECONFIG` at the isolated proc-mode kind cluster.
+//! `KUBECONFIG` at the kind cluster's own kubeconfig (`deploy/kind/.kubeconfig`).
 //!
 //! Once `SCARAB_TEST_KUBE` is set, a misconfiguration is a **panic**, never a
 //! skip: a live case that silently does nothing reads as a green tier (the
@@ -77,7 +77,7 @@ fn enter_tier() {
             "this live case was asked to run (`--ignored` is the opt-in) but \
              SCARAB_TEST_KUBE is not set, and it will not pass by doing nothing. Run \
              `just plugin-kube-tests`, which sets it and points KUBECONFIG at the \
-             isolated proc-mode kind cluster."
+             kind cluster's own kubeconfig."
         );
     }
 }
@@ -102,7 +102,7 @@ async fn kind_client() -> Client {
         _ => panic!(
             "KUBECONFIG is not set, but SCARAB_TEST_KUBE is — this tier never uses an ambient \
              kubeconfig. Run `just plugin-kube-tests`, which points it at the isolated \
-             proc-mode kind cluster."
+             kind cluster's own kubeconfig."
         ),
     };
     let kubeconfig =

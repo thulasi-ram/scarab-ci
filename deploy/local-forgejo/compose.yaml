@@ -45,10 +45,19 @@ services:
       FORGEJO__webhook__ALLOWED_HOST_LIST: "*"
       FORGEJO__webhook__DELIVER_TIMEOUT: "30"
       FORGEJO__log__LEVEL: warn
-    # `host.docker.internal` is how the hook reaches the Scarab on the host. Docker
+    # `host.docker.internal` is how a hook reaches the adapter test's capture
+    # listener on the host (crates/scarab-forge-forgejo/tests/live.rs). Docker
     # Desktop/colima provide it; this mapping adds it on plain Linux docker too.
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    # Also on the kind cluster's docker network: the server Pod reaches this
+    # instance as http://scarab-forgejo:3000 (Pods resolve container names
+    # through the node's docker DNS), and Forgejo delivers hooks to the kind
+    # node's API node port (http://scarab-dev-control-plane:30080).
+    networks:
+      default: {}
+      kind:
+        aliases: [scarab-forgejo]
     ports:
       - "${FORGEJO_HTTP_PORT:-3300}:3000"
     volumes:
@@ -62,3 +71,9 @@ services:
 
 volumes:
   forgejo-data:
+
+networks:
+  # Created by kind with the cluster; `just forgejo-verify` brings the cluster
+  # up first.
+  kind:
+    external: true

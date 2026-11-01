@@ -16,5 +16,5 @@ echo "==> removing the verification Forgejo (container + volume)"
 docker compose -f "$here/compose.yaml" down -v --remove-orphans
 
 # The generated env files carry a live API token — do not leave them lying about.
-rm -f "$here/.env.generated" "$here/.env.scarab" "$here/.tunnel.pid" "$here/.tunnel.log" \
+rm -f "$here/.env.generated" "$here/.values.json" "$here/.tunnel.pid" "$here/.tunnel.log" \
   "$here/.libs-manifest.json"

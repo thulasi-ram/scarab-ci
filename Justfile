@@ -18,8 +18,8 @@ ui:
     #!/usr/bin/env bash
     set -euo pipefail
     npm --prefix ui/scarab-web-ui install
-    [ -f deploy/local-proc/.env ] || { echo "==> creating deploy/local-proc/.env from .env.example"; cp deploy/local-proc/.env.example deploy/local-proc/.env; }
-    set -a && source deploy/local-proc/.env && set +a
+    [ -f deploy/kind/.env ] || { echo "==> creating deploy/kind/.env from .env.example"; cp deploy/kind/.env.example deploy/kind/.env; }
+    set -a && source deploy/kind/.env && set +a
     npm --prefix ui/scarab-web-ui run dev
 
 # Run the web UI against a built-in fixture (no server, no DB) — the fastest way
@@ -44,12 +44,11 @@ docs-build:
 # cluster `scarab-dev`, Postgres + MinIO in it, and the real chart with the
 # server and the Depot running a binary built on the host (cargo-zigbuild on
 # macOS), mounted into a thin runtime image. The API and UI answer on the host
-# at SCARAB_ADDR from deploy/local-proc/.env, so `just ui` works against it.
+# at SCARAB_ADDR from deploy/kind/.env, so `just ui` works against it.
 # Kube calls use deploy/kind/.kubeconfig only, checked before every call.
 #
-# `just e2e`, `just forgejo-verify` and `just kube-tests` still run proc mode
-# (deploy/local-proc/up.sh, a host server) until they move onto the release;
-# run `just down` before them, since both use SCARAB_ADDR's port.
+# `just e2e`, `just forgejo-verify` and `just kube-tests` run on the same
+# release, switched to its e2e mode (own database and bucket).
 
 # Bring up the kind dev stack (build, cluster, Postgres, MinIO, the release).
 up:
@@ -79,7 +78,7 @@ demo:
     #!/usr/bin/env bash
     set -euo pipefail
     . deploy/kind/lib.sh; scarab_addr   # base: SCARAB_ADDR, normalised
-    SCARAB_BASE="${SCARAB_BASE:-$base}"     SCARAB_DEMO_IMAGE="${SCARAB_DEMO_IMAGE:-scarab-clone:dev}"       bash deploy/local-proc/demo.sh
+    SCARAB_BASE="${SCARAB_BASE:-$base}"     SCARAB_DEMO_IMAGE="${SCARAB_DEMO_IMAGE:-scarab-clone:dev}"       bash deploy/kind/demo.sh
 
 # `just demo` is ONE step with no `needs:`, so it never crosses a Step boundary and
 # exercises the workspace drain and none of the feed. Since ADR-0061 s3-feed the
@@ -92,7 +91,7 @@ demo-chain:
     #!/usr/bin/env bash
     set -euo pipefail
     . deploy/kind/lib.sh; scarab_addr   # base: SCARAB_ADDR, normalised
-    SCARAB_BASE="${SCARAB_BASE:-$base}"     SCARAB_DEMO_IMAGE="${SCARAB_DEMO_IMAGE:-scarab-clone:dev}"       bash deploy/local-proc/demo-chain.sh
+    SCARAB_BASE="${SCARAB_BASE:-$base}"     SCARAB_DEMO_IMAGE="${SCARAB_DEMO_IMAGE:-scarab-clone:dev}"       bash deploy/kind/demo-chain.sh
 
 # Tear down the kind dev stack. `just down keep` uninstalls the release only and
 # keeps the cluster, Postgres, MinIO and their data.
@@ -138,7 +137,8 @@ workspace-status:
 #   delete`. Without it kubelet fails with "you might need a /sbin/mount.nfs
 #   helper program" and the Pod hangs in ContainerCreating FOREVER — no event
 #   worth reading, no timeout. Any PV we create must also pin
-#   `mountOptions: [nfsvers=4.2]` (see the kind note in deploy/local-proc/up.sh).
+#   `mountOptions: [nfsvers=4.2]` (on kind, a v3 mount dies with "rpc.statd is
+#   not running": the node has no systemd to run it; v4 works).
 
 # Deploy the Helm dogfood stack on colima; pulls ghcr by default, `local` builds.
 local-helm ref="edge":
@@ -223,52 +223,35 @@ demo-oracle ref="edge":
     SCARAB_WSFETCH_IMAGE="$owner/scarab-wsfetch:{{ref}}" \
       bash deploy/demo-oracle/deploy.sh {{ref}}
 
-# Run scarab-server in the FOREGROUND against the dev stack (Ctrl-C to stop).
-# Useful when iterating; `just up` runs it in the background instead. Needs the
-# stack up first (`just up`). Env comes from the one dev env file, not inline,
-# plus what `just up` DISCOVERED (`.env.generated`, when present): the plugin
-# namespace and how a plugin Pod reaches the broker. Without it, with
-# SCARAB_PLUGINS=on, the broker peer is unset and no plugin ever runs.
-serve:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    [ -f deploy/local-proc/.env ] || { echo "==> creating deploy/local-proc/.env from .env.example"; cp deploy/local-proc/.env.example deploy/local-proc/.env; }
-    set -a && source deploy/local-proc/.env && set +a
-    if [ -f deploy/local-proc/.env.generated ]; then
-      set -a && source deploy/local-proc/.env.generated && set +a
-    fi
-    export KUBECONFIG=deploy/local-proc/.kubeconfig
-    cargo run -p scarab-server -- --role converged --serve
-
 # Run the workspace suite against the compose Postgres (brought up on demand),
 # so the PG-backed tests actually run — mirroring the CI `test` job. Uses
 # nextest when installed, plain `cargo test` otherwise.
 test:
     #!/usr/bin/env bash
     set -euo pipefail
-    # Reuse whatever already serves 55432 (a `just up` stack, or an ad-hoc dev
-    # container); otherwise bring up just the compose Postgres.
+    # Reuse whatever already serves 55432 (an earlier run's container, or an
+    # ad-hoc dev one); otherwise bring up just the compose Postgres.
     if (exec 3<>/dev/tcp/127.0.0.1/55432) 2>/dev/null; then
       echo "==> reusing the Postgres already listening on 127.0.0.1:55432"
     else
-      docker compose -f deploy/local-proc/compose.yaml up -d --wait postgres
+      docker compose -f deploy/test-services/compose.yaml up -d --wait postgres
     fi
     export SCARAB_TEST_DATABASE_URL=postgres://scarab:scarab@127.0.0.1:55432/scarab
     # The live-S3 test (crates/scarab-storage-s3/tests/minio.rs) wants the
     # compose MinIO too — same reuse-or-start dance as Postgres above.
     if (exec 3<>/dev/tcp/127.0.0.1/9000) 2>/dev/null; then
-      # A `just up` stack already ran createbuckets; a foreign MinIO with
-      # different credentials would wedge it, so do not re-run it here. (A stack
-      # from before the scarab-test bucket existed needs one manual
-      # `docker compose -f deploy/local-proc/compose.yaml run --rm createbuckets`.)
+      # An earlier run already ran createbuckets; a foreign MinIO with
+      # different credentials would wedge it, so do not re-run it here. (A
+      # MinIO from before the scarab-test bucket existed needs one manual
+      # `docker compose -f deploy/test-services/compose.yaml run --rm createbuckets`.)
       echo "==> reusing the MinIO already listening on 127.0.0.1:9000"
     else
-      docker compose -f deploy/local-proc/compose.yaml up -d --wait minio
-      docker compose -f deploy/local-proc/compose.yaml run --rm createbuckets
+      docker compose -f deploy/test-services/compose.yaml up -d --wait minio
+      docker compose -f deploy/test-services/compose.yaml run --rm createbuckets
     fi
     export SCARAB_TEST_S3_ENDPOINT=http://127.0.0.1:9000
-    # scarab-test, NOT scarab-logs: tests must never share the `just up` dev stack's
-    # bucket (A11) — a suite prune or fixture collision would eat dev-stack state.
+    # scarab-test: the suite's own bucket (A11), so a suite prune or fixture
+    # collision cannot eat another stack's state.
     export SCARAB_TEST_S3_BUCKET=scarab-test
     export SCARAB_TEST_S3_ACCESS_KEY=scarab
     export SCARAB_TEST_S3_SECRET_KEY=scarabsecret
@@ -288,24 +271,24 @@ test-one FILTER:
     if (exec 3<>/dev/tcp/127.0.0.1/55432) 2>/dev/null; then
       echo "==> reusing the Postgres already listening on 127.0.0.1:55432"
     else
-      docker compose -f deploy/local-proc/compose.yaml up -d --wait postgres
+      docker compose -f deploy/test-services/compose.yaml up -d --wait postgres
     fi
     export SCARAB_TEST_DATABASE_URL=postgres://scarab:scarab@127.0.0.1:55432/scarab
     # The live-S3 test (crates/scarab-storage-s3/tests/minio.rs) wants the
     # compose MinIO too — same reuse-or-start dance as Postgres above.
     if (exec 3<>/dev/tcp/127.0.0.1/9000) 2>/dev/null; then
-      # A `just up` stack already ran createbuckets; a foreign MinIO with
-      # different credentials would wedge it, so do not re-run it here. (A stack
-      # from before the scarab-test bucket existed needs one manual
-      # `docker compose -f deploy/local-proc/compose.yaml run --rm createbuckets`.)
+      # An earlier run already ran createbuckets; a foreign MinIO with
+      # different credentials would wedge it, so do not re-run it here. (A
+      # MinIO from before the scarab-test bucket existed needs one manual
+      # `docker compose -f deploy/test-services/compose.yaml run --rm createbuckets`.)
       echo "==> reusing the MinIO already listening on 127.0.0.1:9000"
     else
-      docker compose -f deploy/local-proc/compose.yaml up -d --wait minio
-      docker compose -f deploy/local-proc/compose.yaml run --rm createbuckets
+      docker compose -f deploy/test-services/compose.yaml up -d --wait minio
+      docker compose -f deploy/test-services/compose.yaml run --rm createbuckets
     fi
     export SCARAB_TEST_S3_ENDPOINT=http://127.0.0.1:9000
-    # scarab-test, NOT scarab-logs: tests must never share the `just up` dev stack's
-    # bucket (A11) — a suite prune or fixture collision would eat dev-stack state.
+    # scarab-test: the suite's own bucket (A11), so a suite prune or fixture
+    # collision cannot eat another stack's state.
     export SCARAB_TEST_S3_BUCKET=scarab-test
     export SCARAB_TEST_S3_ACCESS_KEY=scarab
     export SCARAB_TEST_S3_SECRET_KEY=scarabsecret
@@ -332,7 +315,7 @@ coverage:
     if (exec 3<>/dev/tcp/127.0.0.1/55432) 2>/dev/null; then
       echo "==> reusing the Postgres already listening on 127.0.0.1:55432"
     else
-      docker compose -f deploy/local-proc/compose.yaml up -d --wait postgres
+      docker compose -f deploy/test-services/compose.yaml up -d --wait postgres
     fi
     export SCARAB_TEST_DATABASE_URL=postgres://scarab:scarab@127.0.0.1:55432/scarab
     export SCARAB_TEST_REQUIRE_PG=1
@@ -341,8 +324,8 @@ coverage:
     if (exec 3<>/dev/tcp/127.0.0.1/9000) 2>/dev/null; then
       echo "==> reusing the MinIO already listening on 127.0.0.1:9000"
     else
-      docker compose -f deploy/local-proc/compose.yaml up -d --wait minio
-      docker compose -f deploy/local-proc/compose.yaml run --rm createbuckets
+      docker compose -f deploy/test-services/compose.yaml up -d --wait minio
+      docker compose -f deploy/test-services/compose.yaml run --rm createbuckets
     fi
     export SCARAB_TEST_S3_ENDPOINT=http://127.0.0.1:9000
     export SCARAB_TEST_S3_BUCKET=scarab-test
@@ -354,73 +337,88 @@ coverage:
       --lcov --output-path target/lcov.info
     python3 scripts/coverage_ratchet.py target/lcov.info docs/audits/coverage-baseline.toml --write
 
-# Full-stack E2E (test-strategy Phase 2): own the proc-mode stack for the
-# scarab-e2e suite — up.sh → nextest → down.sh. The crate is a pure HTTP
-# driver gated on SCARAB_E2E=1 (skips loudly in a plain `just test`); the
-# crash/resume scenario additionally spawns its OWN server from
-# SCARAB_E2E_SERVER_BIN so its SIGKILLs never poison the shared stack.
+# Full-stack E2E (test-strategy Phase 2) against the kind release in its e2e
+# mode (own database `scarab_e2e` and bucket `scarab-e2e`, so dev data is not
+# touched). The crate is a pure HTTP driver gated on SCARAB_E2E=1 (skips loudly
+# in a plain `just test`). crash_resume SIGKILLs the release's server from the
+# kind node and checks the restarted process re-adopts the Attempt. The release
+# stays in e2e mode afterwards; `just up` switches it back to dev.
 # Zero auto-retries: a red run is a real bug, not flake to mask.
 # Usage: `just e2e` | `just e2e crash_resume` (nextest filter).
 e2e filter="":
     #!/usr/bin/env bash
     set -euo pipefail
-    bash deploy/local-proc/up.sh
-    # Tear the stack down even when the suite fails; keep the suite's exit
-    # code, and surface the server log first on a red run (down.sh removes it).
-    trap 'code=$?; if [ "$code" -ne 0 ]; then echo "==> scarab-server log (suite failed):"; tail -n 200 deploy/local-proc/server.log 2>/dev/null || true; fi; bash deploy/local-proc/down.sh; exit "$code"' EXIT
-    cargo build -p scarab-server -p scarab-cli
-    # The same env file the stack booted from — SCARAB_ADDR names the server —
-    # plus what up.sh DISCOVERED at boot (the Pod-facing workspace URL, the
-    # fetcher image), which a test that spawns its own server must reuse.
-    set -a && source deploy/local-proc/.env && source deploy/local-proc/.env.generated && set +a
+    bash deploy/kind/up.sh e2e
+    . deploy/kind/lib.sh; scarab_addr
+    . deploy/kind/test-env.sh
+    # Keep the suite's exit code; on a red run show the server's log first.
+    trap 'code=$?; stop_forwards; if [ "$code" -ne 0 ]; then echo "==> scarab-server log (suite failed):"; kc logs -n "$ns" deploy/"$release" --tail 200 || true; fi; exit "$code"' EXIT
+    cargo build -p scarab-cli
+    target="${CARGO_TARGET_DIR:-target}"; case "$target" in /*) ;; *) target="$PWD/$target" ;; esac
+    # happy_path seeds a connection in the e2e database; Postgres is in the cluster.
+    forward scarab-postgres 5432
+    # happy_path's fake forge is called by the server Pod.
+    probe_pod_host
+    echo "==> e2e against $base (database scarab_e2e via 127.0.0.1:$fwd_port; Pods reach the host at $pod_host)"
     export SCARAB_E2E=1
-    export SCARAB_E2E_URL="http://${SCARAB_ADDR/0.0.0.0/127.0.0.1}"
-    export SCARAB_E2E_DATABASE_URL="$SCARAB_DATABASE_URL"
-    export SCARAB_E2E_SERVER_BIN="$PWD/target/debug/scarab-server"
-    export SCARAB_E2E_CLI_BIN="$PWD/target/debug/scarab"
-    export SCARAB_E2E_KUBECONFIG="$PWD/deploy/local-proc/.kubeconfig"
-    cargo nextest run -p scarab-e2e --no-fail-fast {{filter}}
+    export SCARAB_E2E_URL="$base"
+    export SCARAB_E2E_DATABASE_URL="postgres://scarab:scarab@127.0.0.1:$fwd_port/scarab_e2e"
+    export SCARAB_E2E_CLI_BIN="$target/debug/scarab"
+    export SCARAB_E2E_KUBECONFIG="$kubeconfig"
+    export SCARAB_E2E_NAMESPACE="$ns"
+    export SCARAB_E2E_KIND_NODE="$node"
+    export SCARAB_E2E_POD_HOST="$pod_host"
+    # crash_resume kills the release's server, which every other case talks
+    # to, so it runs on its own after the rest.
+    rc=0
+    cargo nextest run -p scarab-e2e --no-fail-fast --no-tests=pass -E 'not binary(crash_resume)' {{filter}} || rc=$?
+    cargo nextest run -p scarab-e2e --no-fail-fast --no-tests=pass -E 'binary(crash_resume)' {{filter}} || rc=$?
+    exit "$rc"
 
 # LIVE Forgejo verification (git-bug 3863d5e). Everything in the Forgejo path was
 # asserted against unit tests of the shapes we BELIEVED Forgejo uses, and one of
 # those guesses (a hook created with no `config.secret`) shipped. This recipe
 # answers the remaining guesses with the software itself: it stands up a real
-# Forgejo, seeds an admin + token + more repos than fit on one API page, points
-# the proc-mode stack at it, and drives the flow the FakeForge acceptance test
-# only simulates — add connection → pick-list → bind → hook registered → real
-# push → Run.
+# Forgejo, seeds an admin + token + more repos than fit on one API page, and
+# drives the kind release (e2e mode) through the flow the FakeForge acceptance
+# test only simulates — add connection → pick-list → bind → hook registered →
+# real push → Run.
 #
-# Needs: docker (Forgejo is pulled from codeberg.org), kind, and ports 3300 +
-# 8080 free. CI does NOT run this — both tiers are env-gated and skip loudly.
-# `just forgejo-verify keep` leaves both stacks up for poking at afterwards.
+# Forgejo joins the kind cluster's docker network: the server Pod reaches it as
+# http://scarab-forgejo:3000, and it delivers hooks to the kind node's API node
+# port. The tests use the published port 3300 on the host.
+#
+# Needs: docker (Forgejo is pulled from codeberg.org), kind, and port 3300 free.
+# CI does NOT run this — both tiers are env-gated and skip loudly.
+# `just forgejo-verify keep` leaves Forgejo up afterwards; the release stays in
+# e2e mode either way (`just up` switches back to dev).
 # `FORGEJO_TUNNEL=1 just forgejo-verify` also runs the forge_token cases through
 # a cloudflared quick tunnel (network calls; the Forgejo is reachable from the
 # internet while it runs).
 forgejo-verify keep="0":
     #!/usr/bin/env bash
     set -euo pipefail
-    # 1. The real Forgejo, seeded. Writes .env.generated (the tests' contract)
-    #    and .env.scarab (the server overlay).
+    # 1. The release in e2e mode, with this tier's values: the public URL
+    #    Forgejo delivers hooks to, the hook secret, and in tunnel mode the
+    #    library manifest. They are written before Forgejo starts, which needs
+    #    the kind network the cluster creates.
+    bash deploy/local-forgejo/up.sh values
+    SCARAB_KIND_EXTRA_VALUES="$PWD/deploy/local-forgejo/.values.json" bash deploy/kind/up.sh e2e
+    . deploy/kind/lib.sh; scarab_addr
+    # 2. The real Forgejo, seeded. Writes .env.generated (the tests' contract).
     bash deploy/local-forgejo/up.sh
-    # 2. The proc-mode stack, with the server bound 0.0.0.0 and publishing a URL
-    #    the Forgejo CONTAINER can reach — a hook pointed at 127.0.0.1 would be
-    #    registered successfully and then never deliver.
-    export SCARAB_ENV_EXTRA="$PWD/deploy/local-forgejo/.env.scarab"
-    bash deploy/local-proc/up.sh
     if [ "{{keep}}" = "0" ]; then
-      trap 'code=$?; if [ "$code" -ne 0 ]; then echo "==> scarab-server log (verification failed):"; tail -n 200 deploy/local-proc/server.log 2>/dev/null || true; fi; bash deploy/local-proc/down.sh; bash deploy/local-forgejo/down.sh; exit "$code"' EXIT
+      trap 'code=$?; if [ "$code" -ne 0 ]; then echo "==> scarab-server log (verification failed):"; kc logs -n "$ns" deploy/"$release" --tail 200 || true; fi; bash deploy/local-forgejo/down.sh; exit "$code"' EXIT
     else
-      echo "==> keep=1: both stacks stay up (tear down with 'bash deploy/local-proc/down.sh; bash deploy/local-forgejo/down.sh')"
+      echo "==> keep=1: Forgejo stays up (tear down with 'bash deploy/local-forgejo/down.sh')"
     fi
     set -a
-    source deploy/local-proc/.env
-    source deploy/local-forgejo/.env.scarab
     source deploy/local-forgejo/.env.generated
     set +a
     export SCARAB_E2E=1
-    export SCARAB_E2E_URL="http://${SCARAB_ADDR/0.0.0.0/127.0.0.1}"
-    export SCARAB_E2E_DATABASE_URL="$SCARAB_DATABASE_URL"
-    export SCARAB_E2E_KUBECONFIG="$PWD/deploy/local-proc/.kubeconfig"
+    export SCARAB_E2E_URL="$base"
+    export SCARAB_E2E_KUBECONFIG="$kubeconfig"
+    export SCARAB_E2E_NAMESPACE="$ns"
     # Adapter-level shapes first (pick-list pagination, hook signing, the push
     # payload spelling), then the whole onboarding flow through the server.
     # Captured real payloads land in target/forgejo-capture/.
@@ -430,71 +428,55 @@ forgejo-verify keep="0":
     # One test at a time: each one reclaims the Forgejo connection first.
     cargo nextest run -p scarab-e2e --test forgejo_onboarding --run-ignored all --no-fail-fast --test-threads 1
     # Tunnel mode only (FORGEJO_TUNNEL=1): the forge_token cases, which need an
-    # https clone URL that the host and the kind Pods both reach (see
+    # https clone URL that the server Pod and the step Pods both reach (see
     # deploy/local-forgejo/up.sh). Opt-in because it makes network calls.
     if [ "${FORGEJO_TUNNEL:-0}" = 1 ]; then
       cargo nextest run -p scarab-e2e --test forgejo_tunnel --run-ignored all --no-fail-fast --test-threads 1
     fi
 
 # LIVE k8s executor tier (`crates/scarab-executor-k8s/tests/cluster.rs`) — the
-# same tier `.github/workflows/kind.yml` runs, against the proc-mode kind cluster.
+# same tier `.github/workflows/kind.yml` runs, against the kind release in its
+# e2e mode, plus the plugin runtime's live suite (`scarab-plugin-k8s`).
 #
-# It exists because that tier needs far more than a cluster: an ADR-0061 workspace
-# service reachable BOTH from the host and from a Pod, the fetcher/clone/sidecar
-# images inside the node, an in-cluster registry, and a host address a Pod can
-# POST to. Nothing local supplied any of it, so seven cases skipped — five of
-# which had been passing — while `kind/cluster-tests` reported PASS. Those cases
-# now PANIC on a missing var rather than skip, so this recipe is the local half of
-# the repair: it is the only supported way to run the tier by hand.
+# The test process stands in for the control plane, so it needs what the server
+# Pod has: the release's Depot (a port-forward on the host; the Pods use its
+# Service), the Depot's bucket (a port-forward to MinIO), its workspace token
+# secret, the step images `just up` loads, an in-cluster registry, and a host
+# address a Pod can POST to (the results case runs a listener in the test
+# process; probed from a Pod). A missing var PANICS rather than skips, so this
+# recipe is the only supported way to run the tier by hand. The cases run in
+# their own namespace, `scarab-kube-tests`.
 #
-# It does NOT tear the stack down: the suite is slow, you will want to poke at the
-# cluster afterwards, and `just down` runs `compose down -v` which would take the
-# shared dev Postgres with it. Stop with `just down` when you are actually done.
-#
+# The release stays up in e2e mode afterwards; `just up` switches it back.
 # Usage: `just kube-tests` | `just kube-tests workspace_flows` (nextest filter).
 kube-tests filter="":
     #!/usr/bin/env bash
     set -euo pipefail
-    # 1. The stack. Idempotent, and it re-probes the Pod-reachable workspace URL,
-    #    so a stale .env.generated from a torn-down cluster cannot be used.
-    bash deploy/local-proc/up.sh
-    set -a
-    source deploy/local-proc/.env
-    source deploy/local-proc/.env.generated
-    set +a
-    # The ISOLATED kubeconfig, never the ambient context: production EKS contexts
-    # sit next to the local one and this suite creates and deletes Pods.
-    export KUBECONFIG="$PWD/deploy/local-proc/.kubeconfig"
-    ns="${SCARAB_TEST_KUBE_NS:-scarab}"
-    cluster=scarab-dev
-    # 2. The step images the tier drives. up.sh needs neither (it only builds the
-    #    fetcher), so they are built and kind-loaded here.
-    for entry in "scarab-clone:kube-tests docker/clone" "scarab-results-sidecar:kube-tests docker/sidecar"; do
-      set -- $entry
-      echo "==> building $1"
-      docker build -q -t "$1" "$2" >/dev/null
-      kind load docker-image "$1" --name "$cluster" >/dev/null
-    done
-    # The service image the uid-pinned-service case runs (git-bug 908f534). A
-    # tagged image is IfNotPresent, so a kind-loaded copy is never pulled by the
-    # node — whose Docker Hub DNS has been flaky here. Loaded as a ONE-platform
-    # archive: `kind load docker-image` imports `--all-platforms` and fails on a
-    # multi-arch pull under the containerd image store (only one platform's
-    # layers are local).
+    bash deploy/kind/up.sh e2e
+    . deploy/kind/lib.sh
+    . deploy/kind/test-env.sh
+    trap 'stop_forwards' EXIT
+    tns="${SCARAB_TEST_KUBE_NS:-scarab-kube-tests}"
+    kc create namespace "$tns" --dry-run=client -o yaml | kc apply -f - >/dev/null
+    # A Pod created before the namespace's `default` ServiceAccount exists is refused.
+    for _ in $(seq 1 30); do kc get serviceaccount default -n "$tns" >/dev/null 2>&1 && break; sleep 1; done
+    # The service image the uid-pinned-service case runs (git-bug 908f534),
+    # loaded so the node never pulls it. One-platform archive: `kind load
+    # docker-image` imports every platform and fails under the containerd store.
     platform="linux/$(docker version -f '{{{{.Server.Arch}}')"
     for img in postgres:16; do
       docker image inspect "$img" >/dev/null 2>&1 || docker pull -q --platform "$platform" "$img" >/dev/null
-      archive="$(mktemp -t scarab-kind-image).tar"
-      docker save --platform "$platform" -o "$archive" "$img"
-      kind load image-archive "$archive" --name "$cluster" >/dev/null
-      rm -f "$archive"
+      if ! docker exec "$node" crictl inspecti "docker.io/library/$img" >/dev/null 2>&1; then
+        archive="$(mktemp "$kind_dir/.state/image.XXXXXX")"
+        docker save --platform "$platform" -o "$archive" "$img"
+        kind load image-archive "$archive" --name "$cluster" >/dev/null
+        rm -f "$archive"
+      fi
     done
-    export SCARAB_TEST_CLONE_IMAGE=scarab-clone:kube-tests
-    export SCARAB_TEST_SIDECAR_IMAGE=scarab-results-sidecar:kube-tests
-    # 3. The plain-HTTP registry the `kind: build` case pushes to and then reads
-    #    the tag list of, from inside the cluster (same shape as kind.yml).
-    echo "==> ensuring an in-cluster registry in namespace $ns"
-    kubectl apply -n "$ns" -f - <<EOF
+    # The plain-HTTP registry the `kind: build` case pushes to and then reads
+    # the tag list of, from inside the cluster (same shape as kind.yml).
+    echo "==> ensuring an in-cluster registry in namespace $tns"
+    kc apply -n "$tns" -f - >/dev/null <<EOF
     apiVersion: apps/v1
     kind: Deployment
     metadata:
@@ -523,44 +505,64 @@ kube-tests filter="":
         - port: 5000
           targetPort: 5000
     EOF
-    kubectl rollout status deployment/registry -n "$ns" --timeout=180s
-    export SCARAB_TEST_REGISTRY="registry.$ns.svc.cluster.local:5000"
-    # 4. The clone cases fetch THIS repo at a SHA that must exist ON THE FORGE, so
-    #    the default is origin/main and not HEAD (which may be unpushed). The repo
-    #    is private, hence the token — delivered via tmpfs + GIT_ASKPASS (ADR-0045).
-    export SCARAB_TEST_CLONE_SHA="${SCARAB_TEST_CLONE_SHA:-$(git rev-parse origin/main)}"
-    export SCARAB_TEST_CLONE_TOKEN="${SCARAB_TEST_CLONE_TOKEN:-$(gh auth token 2>/dev/null || true)}"
+    kc rollout status deployment/registry -n "$tns" --timeout=180s
+    forward "$release-workspace" 80; ws_port="$fwd_port"
+    forward scarab-minio 9000; s3_port="$fwd_port"
+    probe_pod_host
+    export KUBECONFIG="$kubeconfig"
     export SCARAB_TEST_KUBE=1
-    echo "==> running the live tier (ns=$ns, workspace=$SCARAB_TEST_WORKSPACE_URL,"
-    echo "    pod-facing=$SCARAB_TEST_WORKSPACE_POD_URL, fetcher=$SCARAB_TEST_WSFETCH_IMAGE)"
+    export SCARAB_TEST_KUBE_NS="$tns"
+    export SCARAB_TEST_WORKSPACE_URL="http://127.0.0.1:$ws_port"
+    export SCARAB_TEST_WORKSPACE_POD_URL="http://$release-workspace.$ns.svc"
+    SCARAB_TEST_WORKSPACE_SECRET="$(cat "$kind_dir/.state/workspace-token-secret")"
+    export SCARAB_TEST_WORKSPACE_SECRET
+    export SCARAB_TEST_WSFETCH_IMAGE=scarab-wsfetch:dev
+    export SCARAB_TEST_CLONE_IMAGE=scarab-clone:dev
+    export SCARAB_TEST_SIDECAR_IMAGE=scarab-results-sidecar:dev
+    export SCARAB_TEST_REGISTRY="registry.$tns.svc.cluster.local:5000"
+    export SCARAB_TEST_HOST_IP="$pod_host"
+    # The Depot's cold store: the e2e mode's bucket, through the port-forward.
+    export SCARAB_S3_BUCKET=scarab-e2e
+    export SCARAB_S3_ENDPOINT="http://127.0.0.1:$s3_port"
+    export SCARAB_S3_REGION=us-east-1
+    export SCARAB_S3_ACCESS_KEY=scarab
+    export SCARAB_S3_SECRET_KEY=scarabsecret
+    # The clone cases fetch THIS repo at a SHA that must exist ON THE FORGE, so
+    # the default is origin/main and not HEAD (which may be unpushed). The repo
+    # is private, hence the token — delivered via tmpfs + GIT_ASKPASS (ADR-0045).
+    export SCARAB_TEST_CLONE_SHA="${SCARAB_TEST_CLONE_SHA:-$(git rev-parse origin/main)}"
+    SCARAB_TEST_CLONE_TOKEN="${SCARAB_TEST_CLONE_TOKEN:-$(gh auth token 2>/dev/null || true)}"
+    export SCARAB_TEST_CLONE_TOKEN
+    echo "==> running the live tier (ns=$tns, Depot=$SCARAB_TEST_WORKSPACE_URL -> $SCARAB_TEST_WORKSPACE_POD_URL, Pods reach the host at $pod_host)"
     # Both live suites: the executor's and the plugin runtime's (ADR-0072 §9 —
     # its isolation probe, Pod Security admission, TokenReview).
+    rc=0
     if [ -n "{{filter}}" ]; then
       cargo nextest run -p scarab-executor-k8s -p scarab-plugin-k8s --test cluster \
-        --run-ignored all --no-fail-fast -E 'test(~{{filter}})'
+        --run-ignored all --no-fail-fast -E 'test(~{{filter}})' || rc=$?
     else
       cargo nextest run -p scarab-executor-k8s -p scarab-plugin-k8s --test cluster \
-        --run-ignored all --no-fail-fast
+        --run-ignored all --no-fail-fast || rc=$?
     fi
+    # A failed case can leave its step Pod running, and a running step Pod
+    # blocks the next mode switch (`just up`).
+    kc delete pods -n "$tns" -l scarab.io/run --ignore-not-found --wait=false >/dev/null || true
+    exit "$rc"
 
 # LIVE plugin-runtime tier alone (`crates/scarab-plugin-k8s/tests/cluster.rs`,
 # ADR-0072 §9/§11): the isolation probe passes on kind and FAILS once the egress
 # policies are gone; the namespace baseline refuses a non-`restricted` namespace
 # and a stray policy; Pod Security admits the plugin workload; TokenReview accepts
 # a live Pod's broker token and nothing else. Self-contained — throwaway
-# namespaces and an in-cluster fake broker — so it needs only the proc-mode kind
-# cluster, through its ISOLATED kubeconfig (the suite also refuses any context
+# namespaces and an in-cluster fake broker — so it needs only the kind cluster
+# (`just up`), through its own kubeconfig (the suite also refuses any context
 # that is not `kind-*`). Usage: `just plugin-kube-tests` | `just plugin-kube-tests token_review`.
 plugin-kube-tests filter="":
     #!/usr/bin/env bash
     set -euo pipefail
-    bash deploy/local-proc/up.sh
-    export KUBECONFIG="$PWD/deploy/local-proc/.kubeconfig"
-    ctx="$(kubectl config current-context)"
-    case "$ctx" in
-      kind-*) ;;
-      *) echo "error: refusing to run against context '$ctx' (expected kind-*)" >&2; exit 1 ;;
-    esac
+    . deploy/kind/lib.sh
+    verify_kubeconfig
+    export KUBECONFIG="$kubeconfig"
     export SCARAB_TEST_KUBE=1
     if [ -n "{{filter}}" ]; then
       cargo nextest run -p scarab-plugin-k8s --test cluster \
@@ -570,17 +572,18 @@ plugin-kube-tests filter="":
         --run-ignored all --no-fail-fast
     fi
 
-# LIVE first-party Argo CD Plugin (ADR-0072) on the proc-mode kind cluster:
-# builds the plugin image and kind-loads it, brings the stack up with plugins on
-# and the dev-only tag knob, runs a fake Argo CD on the host, installs the plugin
+# LIVE first-party Argo CD Plugin (ADR-0072) on the kind release: builds the
+# plugin image and kind-loads it, brings the release up in e2e mode with plugins
+# on and the dev-only tag knob, runs a fake Argo CD on the host (the broker in
+# the server Pod reaches it at the probed host address), installs the plugin
 # through the API and binds its connection; then asserts the isolation probe
 # passed, the Pod read Argo CD through the broker's read proxy with the bound
 # credential, and that the kill switch makes the broker answer 403 and scales
-# the workload to 0. Asserts the ISOLATED kubeconfig's context is
-# kind-scarab-dev before any cluster command. Leaves the stack up (`just down`).
+# the workload to 0. Every cluster call goes through deploy/kind/lib.sh's kc.
+# Leaves the release in e2e mode (`just up` switches back).
 # Usage: `just plugin-verify` | `KEEP=1 just plugin-verify` (keep the fake Argo).
 plugin-verify:
-    bash deploy/local-proc/plugin-verify.sh
+    bash deploy/kind/plugin-verify.sh
 
 # UI no-DOM suite (test-strategy Phase 3, base of the UI pyramid): vitest over
 # the run-detail derivations — event folding, Takes, attempts, logs, DAG layout.

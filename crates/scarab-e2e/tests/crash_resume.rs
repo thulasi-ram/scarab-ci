@@ -1,131 +1,167 @@
 //! Scenario 2 — **crash/resume at stack grain, THE WEDGE.**
 //!
 //! Kill `scarab-server` (SIGKILL, no goodbye) while a step Pod is mid-flight
-//! on the real kind cluster, restart it, and prove the run completes
+//! on the real kind cluster, let it restart, and prove the run completes
 //! **exactly once**: the surviving attempt is re-adopted (`AttemptReadopted`),
 //! never re-executed (no second `AttemptStarted` per step), and the run makes
 //! exactly one terminal transition.
 //!
-//! This test spawns its OWN server instance — separate port, separate
-//! throwaway database carved from the stack Postgres (the maintenance-URL
-//! pattern of `scarab-db-postgres/tests/common`), a local object dir — against
-//! the SAME kind cluster, so its SIGKILLs can never poison the shared stack.
+//! The server under test is the release's own server Pod (`just e2e` runs the
+//! release in its e2e mode, with its own database and bucket). In the Pod the
+//! server is PID 1 with no init, and a signal sent from inside its PID
+//! namespace that it has no handler for is dropped. So the SIGKILL comes from
+//! the kind node's PID namespace (ADR-0077 Amendment §5): the server
+//! container's host PID is read with `crictl inspect` on the node and killed
+//! there with `kill -KILL`. The kubelet then restarts the container in the
+//! SAME Pod, and the new process re-adopts the Attempt. The Depot runs the
+//! same binary, so the target is chosen by container id (the server
+//! Deployment's Pod, container `scarab-server`), never by process name, and
+//! the PID's cgroup is checked against that id before the signal.
 
 mod support;
 
-use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use support::*;
 
-/// Spawn a converged scarab-server on `port` against `db_url`, steps on the
-/// stack's kind cluster. S3 env is stripped ON PURPOSE — this instance gets
-/// SIGKILLed mid-flight, and its debris must land in its own throwaway object
-/// dir, never in the stack's shared MinIO. That stays legal after ADR-0067
-/// part 1 (no silent LocalDir default) precisely because SCARAB_OBJECT_DIR is
-/// passed explicitly below: the store is chosen, not defaulted, so the strip
-/// is isolation rather than a smaller promise.
-fn spawn_server(port: u16, db_url: &str, object_dir: &std::path::Path, log: &std::path::Path) -> Child {
-    let logfile = std::fs::File::create(log).expect("server log file");
-    let errfile = logfile.try_clone().expect("clone log handle");
-    Command::new(server_bin())
-        .args(["--role", "converged"])
-        .env("SCARAB_ADDR", format!("127.0.0.1:{port}"))
-        .env("SCARAB_DATABASE_URL", db_url)
-        .env("SCARAB_OBJECT_DIR", object_dir)
-        .env("SCARAB_NAMESPACE", namespace())
-        .env("SCARAB_DEV_INSECURE", "1")
-        .env("KUBECONFIG", kubeconfig())
-        // The stack server's workspace service, not `.env`'s half of it (see
-        // `stack_workspace_env`): without the discovered URL every step Pod of
-        // this server hung undrainable — the run sat `slow:running` for the
-        // whole 240s budget on every e2e run since at least 2026-09-08.
-        .envs(stack_workspace_env())
-        .env_remove("SCARAB_S3_BUCKET")
-        .env_remove("SCARAB_S3_ENDPOINT")
-        .env_remove("SCARAB_S3_ACCESS_KEY")
-        .env_remove("SCARAB_S3_SECRET_KEY")
-        .stdout(Stdio::from(logfile))
-        .stderr(Stdio::from(errfile))
-        .spawn()
-        .expect("spawn scarab-server (build it first: `cargo build -p scarab-server`)")
+/// The server Pod's identity and its `scarab-server` container's state.
+#[derive(Debug, Clone, PartialEq)]
+struct ServerContainer {
+    pod: String,
+    uid: String,
+    /// Bare container id (the `containerd://` prefix stripped).
+    container_id: String,
+    restarts: u64,
+    ready: bool,
 }
 
-async fn wait_healthy(client: &reqwest::Client, base: &str, log: &std::path::Path) {
-    for _ in 0..60 {
-        if let Ok(resp) = client.get(format!("{base}/healthz")).send().await {
-            if resp.status().is_success() {
-                return;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-    panic!(
-        "spawned scarab-server never became healthy at {base}; log:\n{}",
-        std::fs::read_to_string(log).unwrap_or_default()
+/// The single server Pod of the release: the Deployment's Pods carry
+/// `app.kubernetes.io/name=scarab` (the Depot's carry `scarab-workspace`).
+fn server_container() -> ServerContainer {
+    let raw = kubectl(&[
+        "get",
+        "pods",
+        "-n",
+        &namespace(),
+        "-l",
+        "app.kubernetes.io/name=scarab,app.kubernetes.io/instance=scarab",
+        "-o",
+        "json",
+    ]);
+    let v: serde_json::Value = serde_json::from_str(&raw).expect("pods JSON");
+    let pods: Vec<&serde_json::Value> = v["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .filter(|p| p["metadata"]["deletionTimestamp"].is_null())
+        .collect();
+    assert_eq!(
+        pods.len(),
+        1,
+        "expected exactly one server Pod (replicaCount 1), got {}",
+        pods.len()
     );
-}
-
-/// Prints this test's OWN server log if the test panics. The suite's failure
-/// trap tails the STACK server's log, which says nothing about this instance —
-/// and its log lives in a tempdir deleted on drop.
-struct LogOnPanic(std::path::PathBuf);
-
-impl Drop for LogOnPanic {
-    fn drop(&mut self) {
-        if std::thread::panicking() {
-            let log = std::fs::read_to_string(&self.0).unwrap_or_default();
-            let tail: Vec<&str> = log.lines().rev().take(200).collect();
-            eprintln!("==> crash_resume's own scarab-server log (last 200 lines):");
-            for line in tail.iter().rev() {
-                eprintln!("{line}");
-            }
-        }
+    let pod = pods[0];
+    let status = pod["status"]["containerStatuses"]
+        .as_array()
+        .expect("containerStatuses")
+        .iter()
+        .find(|c| c["name"] == "scarab-server")
+        .expect("a scarab-server container");
+    let id = status["containerID"].as_str().unwrap_or_default();
+    ServerContainer {
+        pod: pod["metadata"]["name"].as_str().expect("name").to_string(),
+        uid: pod["metadata"]["uid"].as_str().expect("uid").to_string(),
+        container_id: id.rsplit("://").next().unwrap_or_default().to_string(),
+        restarts: status["restartCount"].as_u64().unwrap_or(0),
+        ready: status["ready"].as_bool().unwrap_or(false),
     }
 }
 
-/// A free loopback port, chosen by the OS.
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind :0")
-        .local_addr()
-        .expect("local addr")
-        .port()
+/// `docker exec <kind node> <args>`: a command in the node's namespaces.
+fn on_node(args: &[&str]) -> String {
+    let out = std::process::Command::new("docker")
+        .arg("exec")
+        .arg(kind_node())
+        .args(args)
+        .output()
+        .expect("docker runs");
+    assert!(
+        out.status.success(),
+        "docker exec {} {args:?} failed: {}",
+        kind_node(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// SIGKILL the server container's process from the kind node's PID
+/// namespace. Returns the node-side PID it signalled.
+fn kill_server_from_node(target: &ServerContainer) -> String {
+    let pid = on_node(&[
+        "crictl",
+        "inspect",
+        "--output",
+        "go-template",
+        "--template",
+        "{{.info.pid}}",
+        &target.container_id,
+    ]);
+    assert!(
+        !pid.is_empty() && pid.chars().all(|c| c.is_ascii_digit()) && pid != "0",
+        "crictl gave no PID for container {}: {pid:?}",
+        target.container_id
+    );
+    // The PID belongs to the server container, not the Depot's: its cgroup
+    // names the container id.
+    let cgroup = on_node(&["cat", &format!("/proc/{pid}/cgroup")]);
+    assert!(
+        cgroup.contains(&target.container_id),
+        "PID {pid} is not in container {}'s cgroup: {cgroup}",
+        target.container_id
+    );
+    let cmdline = on_node(&["sh", "-c", &format!("tr '\\0' ' ' < /proc/{pid}/cmdline")]);
+    eprintln!(
+        "crash_resume: SIGKILL from node {} to PID {pid} ({cmdline}), container {} of Pod {} (restarts before: {})",
+        kind_node(),
+        target.container_id,
+        target.pod,
+        target.restarts
+    );
+    on_node(&["kill", "-KILL", &pid]);
+    pid
+}
+
+/// Waits for the kubelet to restart the killed container in the same Pod and
+/// for it to be ready again; returns its new state and the last termination.
+async fn wait_restarted(before: &ServerContainer) -> (ServerContainer, serde_json::Value) {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let now = server_container();
+        if now.restarts > before.restarts && now.ready {
+            let raw = kubectl(&["get", "pod", "-n", &namespace(), &now.pod, "-o", "json"]);
+            let v: serde_json::Value = serde_json::from_str(&raw).expect("pod JSON");
+            let last = v["status"]["containerStatuses"]
+                .as_array()
+                .and_then(|a| a.iter().find(|c| c["name"] == "scarab-server"))
+                .map(|c| c["lastState"]["terminated"].clone())
+                .unwrap_or_default();
+            return (now, last);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the server container did not restart and become ready within 120s: before {before:?}, now {now:?}"
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn crash_resume_completes_exactly_once() {
     require_e2e!();
 
-    // --- carve a throwaway database from the stack Postgres -----------------
-    let admin_url = database_url();
-    let dbname = format!("scarab_e2e_crash_{}", std::process::id());
-    let admin = sqlx::PgPool::connect(&admin_url).await.expect("admin PG");
-    sqlx::query(&format!("DROP DATABASE IF EXISTS {dbname} WITH (FORCE)"))
-        .execute(&admin)
-        .await
-        .expect("drop stale e2e db");
-    sqlx::query(&format!("CREATE DATABASE {dbname}"))
-        .execute(&admin)
-        .await
-        .expect("create e2e db");
-    let db_url = {
-        // Same swap as the db-postgres harness: replace the database path.
-        let slash = admin_url.rfind('/').expect("url has a path");
-        format!("{}/{dbname}", &admin_url[..slash])
-    };
-
-    // --- boot our own server (migrations run on connect) --------------------
-    let port = free_port();
-    let base = format!("http://127.0.0.1:{port}");
-    let objects = tempfile::tempdir().expect("object dir");
-    let log = objects.path().join("server.log");
-    // Declared after `objects` so it drops FIRST — the tempdir must still exist.
-    let _log_on_panic = LogOnPanic(log.clone());
+    let base = base_url();
     let client = client();
-
-    let mut child = spawn_server(port, &db_url, objects.path(), &log);
-    wait_healthy(&client, &base, &log).await;
 
     // --- a 2-step run whose first step is slow enough to die under ----------
     let run = create_inline_run(
@@ -157,10 +193,10 @@ async fn crash_resume_completes_exactly_once() {
         },
     )
     .await;
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while pods_of_run(&run).is_empty() {
         assert!(
-            std::time::Instant::now() < deadline,
+            Instant::now() < deadline,
             "run {run}: step `slow` never got a Pod on the cluster"
         );
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -168,12 +204,22 @@ async fn crash_resume_completes_exactly_once() {
     // A beat more, so the attempt handle is durably recorded before the kill.
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    // --- SIGKILL mid-step-1, then respawn ------------------------------------
-    child.kill().expect("SIGKILL scarab-server");
-    child.wait().expect("reap killed server");
-
-    let mut child = spawn_server(port, &db_url, objects.path(), &log);
-    wait_healthy(&client, &base, &log).await;
+    // --- SIGKILL mid-step-1 from the node; the kubelet restarts it ----------
+    let before = server_container();
+    assert!(before.ready, "the server must be ready before the kill: {before:?}");
+    kill_server_from_node(&before);
+    let (after, last) = wait_restarted(&before).await;
+    eprintln!(
+        "crash_resume: container restarted in place: Pod {} uid {} restarts {} -> {}, container {} -> {}, last termination {last}",
+        after.pod, after.uid, before.restarts, after.restarts, before.container_id, after.container_id
+    );
+    // The same Pod (a restart, not a replacement) with a new container.
+    assert_eq!(after.uid, before.uid, "the kill must restart the container, not replace the Pod");
+    assert_ne!(after.container_id, before.container_id);
+    assert!(
+        last["signal"] == 9 || last["exitCode"] == 137,
+        "the last termination must be the SIGKILL: {last}"
+    );
 
     // --- the run completes; evidence says exactly-once -----------------------
     // Budget: outbox claim-lease (30s) + the 20s sleep + step 2 + slack.
@@ -198,10 +244,7 @@ async fn crash_resume_completes_exactly_once() {
     // Exactly one AttemptStarted per step (the durable launch, once).
     let started = events_of_kind(&evs, "AttemptStarted");
     for step in ["slow", "second"] {
-        let n = started
-            .iter()
-            .filter(|p| p["step"] == *step)
-            .count();
+        let n = started.iter().filter(|p| p["step"] == *step).count();
         assert_eq!(n, 1, "expected exactly one AttemptStarted for `{step}`, got {n}");
     }
 
@@ -213,6 +256,7 @@ async fn crash_resume_completes_exactly_once() {
         "expected an AttemptReadopted for `slow` after the restart; events: {:?}",
         evs.iter().map(support::event_kind).collect::<Vec<_>>()
     );
+    eprintln!("crash_resume: run {run} AttemptReadopted: {readopted:?}");
 
     // Exactly one terminal transition, and it is Succeeded.
     let terminal: Vec<_> = events_of_kind(&evs, "RunTransitioned")
@@ -235,13 +279,4 @@ async fn crash_resume_completes_exactly_once() {
     let text = logs(&client, &base, &run).await;
     assert!(text.contains("slow step done"), "missing step-1 log; got: {text}");
     assert!(text.contains("second step done"), "missing step-2 log; got: {text}");
-
-    // --- teardown -------------------------------------------------------------
-    child.kill().ok();
-    child.wait().ok();
-    sqlx::query(&format!("DROP DATABASE IF EXISTS {dbname} WITH (FORCE)"))
-        .execute(&admin)
-        .await
-        .ok();
-    admin.close().await;
 }

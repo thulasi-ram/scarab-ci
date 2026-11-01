@@ -2,10 +2,6 @@
 **/*.rs.bk
 .DS_Store
 
-# dev harness runtime artifacts (local-proc mode)
-/deploy/local-proc/.kubeconfig
-/deploy/local-proc/server.pid
-/deploy/local-proc/server.log
 # local object-store backend (default dev fallback) and other runtime state
 # under .scarab/ — but keep committed pipeline configs (.scarab/*.yaml and the
 # .scarab/lib/ catalog) tracked; that is where a repo declares its own CI.
@@ -54,15 +50,6 @@
 # entry here — the `.env` rule above already covers it, exactly as it covers
 # local-helm's.
 /deploy/demo-oracle/.workspace-token-secret
-# Proc-mode workspace service (ADR-0061): its pidfile and its log. Its warm tier
-# lands under /.scarab/, which lines 12-15 above already ignore while keeping the
-# committed pipeline configs tracked — do NOT add a bare `/.scarab/` here, it
-# would shadow .scarab/dogfood.yaml.
-/deploy/local-proc/workspace.pid
-/deploy/local-proc/workspace.log
-# `just plugin-verify`: the host-side fake Argo CD (ADR-0072 d4).
-/deploy/local-proc/fake-argocd.pid
-/deploy/local-proc/fake-argocd.log
 
 # `.cargo/config.toml` IS tracked — repo-level build settings belong in version
 # control. `cargo login` writes a registry token next to it, and that must never
@@ -90,9 +77,10 @@
 __pycache__/
 *.pyc
 
-# just forgejo-verify tunnel mode (deploy/local-forgejo/up.sh)
+# just forgejo-verify (deploy/local-forgejo/up.sh): tunnel files, generated values
 deploy/local-forgejo/.tunnel.*
 deploy/local-forgejo/.libs-manifest.json
+deploy/local-forgejo/.values.json
 
 # The kind dev stack (deploy/kind/up.sh): its kubeconfig, generated config and
 # dev secrets (.state), and the staged binaries + UI mounted on the node (.mount).

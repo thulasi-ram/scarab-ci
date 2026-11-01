@@ -12,7 +12,7 @@
 # a step that ran against a silently empty /workspace must fail this, because an
 # empty workspace is not an error — it is a wrong answer.
 #
-# Requires `just up` (or `just serve`) to be running first.
+# Requires `just up` to be running first.
 set -euo pipefail
 
 base="${SCARAB_BASE:-http://127.0.0.1:8080}"

@@ -62,15 +62,14 @@ pub async fn run_ids(
 /// its own. **Not cleanup after a bug — a property of the tier.**
 ///
 /// `just forgejo-verify` destroys the Forgejo and its volume on every run, but the
-/// Scarab Postgres it borrows from the proc stack OUTLIVES it. So the second run
-/// meets a connection row from the first, and `POST /v1/connections` correctly
-/// answers 409: ADR-0060 part D allows one connection per base URL.
+/// release's e2e database OUTLIVES it. So the second run meets a connection row
+/// from the first, and `POST /v1/connections` correctly answers 409: ADR-0060
+/// part D allows one connection per base URL.
 ///
-/// Reclaim by **delete-then-create**, never by reusing the row. The proc stack
-/// runs with no `SCARAB_MASTER_KEY`, so its KEK is ephemeral per boot: a surviving
-/// connection's write-through credential cannot be decrypted after a restart
-/// (visible as `startup: DEGRADED — forge connection credential unavailable`).
-/// Reusing it would authenticate every forge call with a dead secret.
+/// Reclaim by **delete-then-create**, never by reusing the row: a surviving
+/// connection's credential is the previous Forgejo's token, which died with
+/// that Forgejo's volume. Reusing it would authenticate every forge call with
+/// a dead secret.
 ///
 /// `unbind_repos=true` is required, not optional: the previous run left the repo
 /// BOUND, and the delete handler refuses a connection that still serves Projects

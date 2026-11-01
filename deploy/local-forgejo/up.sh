@@ -1,19 +1,31 @@
 #!/usr/bin/env bash
 # Stand up a REAL Forgejo and seed it for the verification tier (git-bug 3863d5e):
-#   - the container (compose.yaml), install-locked, webhooks allowed to loopback
+#   - the container (compose.yaml), install-locked, webhooks allowed to any
+#     host, attached to the kind cluster's docker network
 #   - an admin user + an API access token
 #   - enough repos to force `list_accessible_repos` onto a second page
 #   - two working repos with a `.scarab/ci.yaml` on `main`
 #
-# Writes two gitignored env files the recipe and the tests read:
+#   up.sh values   only write .values.json (below) and exit; `just
+#                  forgejo-verify` runs this before it installs the release
+#   up.sh          the instance, seeded (the kind cluster must exist)
+#
+# Writes gitignored files the recipe and the tests read:
 #   .env.generated  — SCARAB_TEST_FORGEJO_*   (the tests' contract)
-#   .env.scarab     — SCARAB_* overlay for deploy/local-proc/up.sh
+#   .values.json    — Helm values for the kind release (deploy/kind/up.sh via
+#                     SCARAB_KIND_EXTRA_VALUES): the public URL Forgejo
+#                     delivers hooks to, the hook secret, and in tunnel mode
+#                     the library manifest
 #
 # Idempotent: safe to re-run. Requires docker + curl + python3.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+root="$(cd "$here/../.." && pwd)"
 compose="docker compose -f $here/compose.yaml"
+# shellcheck source=deploy/kind/lib.sh
+. "$root/deploy/kind/lib.sh"   # node, node_port (where Forgejo delivers hooks)
+phase="${1:-all}"
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "error: '$1' not found on PATH" >&2; exit 1; }; }
 need docker; need curl; need python3
@@ -26,6 +38,8 @@ set -a
 set +a
 
 base="http://127.0.0.1:${FORGEJO_HTTP_PORT}"
+# The same instance as the server Pod sees it: its alias on the kind network.
+server_base="http://scarab-forgejo:3000"
 owner="$FORGEJO_ADMIN_USER"
 hook_repo="verify-hook"
 onboard_repo="verify-onboard"
@@ -37,7 +51,7 @@ library_repo="verify-library"
 # is only ever sent to an https clone URL: the server refuses to mint for any
 # other (forge_token.rs), and the pinned clone image's askpass refuses to hand
 # it over (docker/clone/scarab-askpass). The clone URL comes from the
-# connection's base URL, which the host server AND the kind Pods must both
+# connection's base URL, which the server Pod AND the step Pods must both
 # resolve, over TLS the pinned image trusts. A cloudflared quick tunnel is the
 # one local setup that gives all three, so this mode makes network calls; the
 # default mode makes none. The instance is then reachable from the internet:
@@ -54,7 +68,52 @@ if [ "$tunnel" = 1 ]; then
   fi
 fi
 
-# Same rule as deploy/local-proc/up.sh: never seed, or grade, an instance this
+# The Helm values the release needs for this tier, written before the
+# instance starts so `just forgejo-verify` can install them first.
+write_values() {
+  clone_hash=""
+  local manifest=""
+  if [ "$tunnel" = 1 ]; then
+    # The release manifest the server reads, so binding the org installs the
+    # first-party clone library from this tree's libs/ (ADR-0076 §5). The
+    # server fetches it from github.com at the commit, so it must be pushed.
+    libs_commit="$(git -C "$root" log -1 --format=%H -- libs/)"
+    if ! git -C "$root" diff --quiet "$libs_commit" -- libs/ \
+       || [ -z "$(git -C "$root" branch -r --contains "$libs_commit" 2>/dev/null)" ]; then
+      echo "error: libs/ must be committed and pushed: the server fetches libs/clone.yaml" >&2
+      echo "  from github.com at commit $libs_commit" >&2
+      exit 1
+    fi
+    python3 "$root/scripts/libs_manifest.py" --libs "$root/libs" \
+      --repository github.com/thulasi-ram/scarab-ci --commit "$libs_commit" \
+      --release v0.0.0-forgejo-verify >"$here/.libs-manifest.json"
+    clone_hash="$(python3 -c 'import json,sys
+m=json.load(open(sys.argv[1]))
+print(next(l["versions"][-1]["content_hash"] for l in m["libraries"] if l["name"]=="clone"))' "$here/.libs-manifest.json")"
+    manifest="$here/.libs-manifest.json"
+  fi
+  # Forgejo delivers hooks to the kind node's API node port, by the node
+  # container's name on the kind network. Written as JSON (valid YAML).
+  V_PUBLIC="http://$node:$node_port" V_SECRET="$FORGEJO_WEBHOOK_SECRET" \
+    python3 -I - "$manifest" > "$here/.values.json" <<'PY'
+import json, os, sys
+v = {"scarab": {"publicUrl": os.environ["V_PUBLIC"]},
+     "secrets": {"forgejoWebhookSecret": os.environ["V_SECRET"]}}
+if sys.argv[1]:
+    v["scarab"]["libsManifest"] = open(sys.argv[1]).read()
+json.dump(v, sys.stdout, indent=1)
+PY
+  chmod 600 "$here/.values.json"
+}
+write_values
+if [ "$phase" = values ]; then
+  echo "==> wrote $here/.values.json"
+  exit 0
+fi
+docker network inspect kind >/dev/null 2>&1 \
+  || die "the kind cluster's docker network 'kind' does not exist: bring the release up first (just forgejo-verify does)"
+
+# Never seed, or grade, an instance this
 # script did not start. Here the port bind would normally fail loudly inside
 # `compose up -d`, but if a FOREIGN Forgejo already holds the port we would
 # happily mint tokens and repos in someone else's instance — and the tier would
@@ -179,8 +238,7 @@ ensure_repo "$hook_repo" true
 ensure_repo "$onboard_repo" true
 
 # The pipeline the onboarding leg's push must trigger. One step, no clone — the
-# assertion is that a Run is CREATED from a real delivery, and the kind cluster
-# cannot reach a Forgejo published on the docker host anyway.
+# assertion is that a Run is CREATED from a real delivery.
 ci_yaml=$(cat <<'YAML'
 on:
   push: {}
@@ -337,30 +395,16 @@ YAML
   fi
   rm -rf "$work"
 
-  # The release manifest the server reads, so binding the org installs the
-  # first-party clone library from this tree's libs/ (ADR-0076 §5). The
-  # server fetches it from github.com at the commit, so it must be pushed.
-  root="$(cd "$here/../.." && pwd)"
-  libs_commit="$(git -C "$root" log -1 --format=%H -- libs/)"
-  if ! git -C "$root" diff --quiet "$libs_commit" -- libs/ \
-     || [ -z "$(git -C "$root" branch -r --contains "$libs_commit" 2>/dev/null)" ]; then
-    echo "error: libs/ must be committed and pushed: the server fetches libs/clone.yaml" >&2
-    echo "  from github.com at commit $libs_commit" >&2
-    exit 1
-  fi
-  python3 "$root/scripts/libs_manifest.py" --libs "$root/libs" \
-    --repository github.com/thulasi-ram/scarab-ci --commit "$libs_commit" \
-    --release v0.0.0-forgejo-verify >"$here/.libs-manifest.json"
-  clone_hash="$(python3 -c 'import json,sys
-m=json.load(open(sys.argv[1]))
-print(next(l["versions"][-1]["content_hash"] for l in m["libraries"] if l["name"]=="clone"))' "$here/.libs-manifest.json")"
 fi
 
 echo "==> writing $here/.env.generated"
 cat > "$here/.env.generated" <<EOF
 # GENERATED by deploy/local-forgejo/up.sh — do not edit, do not commit.
 SCARAB_TEST_FORGEJO=1
+# Host-facing: the tests push and read hooks through the published port.
 SCARAB_TEST_FORGEJO_URL=$base
+# Server-facing: the connection's base URL, as the server Pod reaches it.
+SCARAB_TEST_FORGEJO_SERVER_URL=$server_base
 SCARAB_TEST_FORGEJO_TOKEN=$token
 SCARAB_TEST_FORGEJO_OWNER=$owner
 SCARAB_TEST_FORGEJO_HOOK_REPO=$hook_repo
@@ -385,25 +429,6 @@ SCARAB_TEST_FORGEJO_PRIVATE_REPO=$private_repo
 SCARAB_TEST_FORGEJO_ADMIN_PASSWORD=$FORGEJO_ADMIN_PASSWORD
 SCARAB_TEST_CLONE_HASH=$clone_hash
 EOF
-fi
-
-echo "==> writing $here/.env.scarab (overlay for the local-proc server)"
-cat > "$here/.env.scarab" <<EOF
-# GENERATED by deploy/local-forgejo/up.sh — sourced by deploy/local-proc/up.sh
-# AFTER its own .env, via SCARAB_ENV_EXTRA.
-#
-# 0.0.0.0, not 127.0.0.1: the Forgejo container delivers to the docker host, and
-# a loopback-bound server is unreachable from it.
-SCARAB_ADDR=0.0.0.0:$SCARAB_VERIFY_PORT
-# The callback URL bind stamps onto the hook it registers — must be the address
-# FORGEJO can reach, not the one a human types.
-SCARAB_PUBLIC_URL=http://$FORGEJO_CALLBACK_HOST:$SCARAB_VERIFY_PORT
-# The secret /webhooks/forgejo verifies with; the same one the adapter stamps
-# into the hook it creates. Mismatch here = every delivery 401s.
-SCARAB_FORGEJO_WEBHOOK_SECRET=$FORGEJO_WEBHOOK_SECRET
-EOF
-if [ "$tunnel" = 1 ]; then
-  echo "SCARAB_LIBS_MANIFEST=$here/.libs-manifest.json" >> "$here/.env.scarab"
 fi
 
 echo "==> Forgejo ready at $base (admin: $owner)"

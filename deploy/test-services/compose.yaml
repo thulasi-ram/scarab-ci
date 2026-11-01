@@ -1,5 +1,9 @@
-# Scarab dev stack: the two stateful dependencies (Postgres + object store).
+# The services `just test`, `just test-one` and `just coverage` run the
+# workspace suite against: Postgres for the PG-backed tests and MinIO for the
+# live-S3 test. Not a way to run Scarab (that is `just up`, deploy/kind/).
 # Postgres is published on 55432 to avoid clashing with a host Postgres on 5432.
+# The project name is kept from when this file also served the dev stack, so
+# an existing container and volume are reused.
 name: scarab-dev
 
 services:
@@ -34,7 +38,7 @@ services:
     volumes:
       - minio-data:/data
 
-  # One-shot: create the logs/artifacts bucket, then exit.
+  # One-shot: create the test bucket, then exit.
   createbuckets:
     image: pgsty/mc:RELEASE.2026-09-16T00-00-00Z@sha256:cfc83108c3abb371f8fb84d99c1fdc88f8c237e022409b0081fb7c0a3be634dd
     depends_on:
@@ -42,9 +46,8 @@ services:
     entrypoint: >
       /bin/sh -c "
       until mc alias set local http://minio:9000 scarab scarabsecret; do sleep 1; done;
-      mc mb --ignore-existing local/scarab-logs;
       mc mb --ignore-existing local/scarab-test;
-      echo 'buckets scarab-logs (dev stack) and scarab-test (test suite) ready';
+      echo 'bucket scarab-test (test suite) ready';
       "
 
 volumes:

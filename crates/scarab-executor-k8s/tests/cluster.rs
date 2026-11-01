@@ -14,7 +14,7 @@
 //! they set the SAME `SCARAB_TEST_*` set:
 //!
 //! - CI: the `kind` workflow (`.github/workflows/kind.yml`);
-//! - local: `just kube-tests`, which owns the proc-mode stack and drives this
+//! - local: `just kube-tests`, which brings up the kind release and drives this
 //!   suite against it.
 //!
 //! Do not hand-roll the env. Once `SCARAB_TEST_KUBE` is set, a missing var is a
@@ -219,10 +219,11 @@ fn tier_var(name: &str) -> String {
 /// # Two URLs, deliberately
 ///
 /// `SCARAB_TEST_WORKSPACE_URL` is host-facing (the test process is the control
-/// plane); `SCARAB_TEST_WORKSPACE_POD_URL` is what a Pod dials, and in proc mode
-/// they differ — the host reaches loopback, a Pod cannot (see the long note in
-/// `deploy/local-proc/up.sh`). It defaults to the host URL, which is right in
-/// Helm mode where there is one in-cluster Service.
+/// plane); `SCARAB_TEST_WORKSPACE_POD_URL` is what a Pod dials, and they
+/// differ wherever the test process is outside the cluster: CI runs the Depot
+/// as a host process that Pods reach at the kind gateway, and `just
+/// kube-tests` reaches the release's Depot through a port-forward while Pods
+/// use its Service. It defaults to the host URL.
 ///
 /// # Missing configuration is FATAL, not a skip
 ///
@@ -257,8 +258,8 @@ struct WorkspaceFixture {
 /// A direct handle on the COLD store the tier's Depot archives into, resolved
 /// exactly as the Depot resolves its own (`config.rs`): `SCARAB_S3_BUCKET` set
 /// → S3/MinIO, else the local object dir. Both runners line up by
-/// construction, and both are MinIO now (ADR-0067): `just kube-tests` sources
-/// `deploy/local-proc/.env`, and the CI kind workflow exports the same
+/// construction, and both are MinIO now (ADR-0067): `just kube-tests` exports
+/// the e2e mode's bucket (through a port-forward), and the CI kind workflow exports the same
 /// `SCARAB_S3_*` it started the service with. The LocalDir arm survives for
 /// ad-hoc runs against a dir-backed service — its `./.scarab/objects` is
 /// relative to the REPO ROOT (the service's cwd there), resolved here from
@@ -320,8 +321,7 @@ fn workspace_fixture() -> WorkspaceFixture {
              container that dials the workspace service, so a green run without these \
              proves nothing. Wire them up:\n\
              \x20 CI:    .github/workflows/kind.yml (workspace service + kind-loaded fetcher)\n\
-             \x20 local: `just up` writes deploy/local-proc/.env.generated; \
-             `just kube-tests` sources it",
+             \x20 local: `just kube-tests` sets them against the kind release",
             missing.join(", ")
         );
     }

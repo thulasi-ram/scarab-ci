@@ -3,7 +3,7 @@
 //! A forge token is only ever sent to an https clone URL: the server refuses
 //! to mint for any other, and the pinned clone image's askpass refuses to hand
 //! it to git. The clone URL comes from the connection's base URL, which the
-//! host server and the kind Pods must both reach, over TLS that image trusts.
+//! server Pod and the step Pods must both reach, over TLS that image trusts.
 //! `FORGEJO_TUNNEL=1 just forgejo-verify` puts the seeded Forgejo behind a
 //! cloudflared quick tunnel for that, and only then runs this file. It is the
 //! one live tier that makes network calls.
@@ -51,6 +51,7 @@ async fn a_private_repo_clones_with_the_forge_token_and_nothing_else_gets_it() {
     let base = base_url();
     let http = client();
     let local = env("SCARAB_TEST_FORGEJO_URL");
+    let server_side = env("SCARAB_TEST_FORGEJO_SERVER_URL");
     let https = env("SCARAB_TEST_FORGEJO_HTTPS_URL");
     let token = env("SCARAB_TEST_FORGEJO_TOKEN");
     let owner = env("SCARAB_TEST_FORGEJO_OWNER");
@@ -70,9 +71,9 @@ async fn a_private_repo_clones_with_the_forge_token_and_nothing_else_gets_it() {
     .await;
     assert_eq!(meta["private"], true, "{repo} must be private");
 
-    // One connection serves this Forgejo: drop the loopback one the other
-    // cases made, then connect through the tunnel.
-    reclaim_connections_for(&http, &base, &local).await;
+    // One connection serves this Forgejo: drop the kind-network one the
+    // other cases made, then connect through the tunnel.
+    reclaim_connections_for(&http, &base, &server_side).await;
     let (org, project) = connect_and_bind(&http, &base, &https, &token, &owner, &name).await;
 
     // --- 1. the org defaults installed the first-party clone library --------

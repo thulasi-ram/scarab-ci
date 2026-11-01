@@ -8,7 +8,7 @@
 //!
 //!   add connection → pick-list → bind → hook registered → real push → Run.
 //!
-//! `#[ignore]`d, and needs both `SCARAB_E2E=1` (a running proc-mode stack) and
+//! `#[ignore]`d, and needs both `SCARAB_E2E=1` (the kind release) and
 //! `SCARAB_TEST_FORGEJO=1` (a seeded Forgejo). `just forgejo-verify` owns both
 //! lifecycles and asks for the ignored set; CI runs neither. It is ignored
 //! rather than env-skipped because `just e2e` (and the e2e workflow) sets
@@ -16,9 +16,12 @@
 //! and the run reported this case PASS in 8 ms (git-bug dcc4ca9). Ignored, it
 //! reports as skipped; asked for, it panics on a missing switch.
 //!
-//! What is deliberately NOT asserted: that the Run *succeeds*. The step Pods live
-//! in the kind cluster, which cannot reach a Forgejo published on the docker
-//! host. The claim under test is the ingest path — a real signed delivery is
+//! The server runs in the kind cluster and reaches Forgejo on the kind docker
+//! network (`SCARAB_TEST_FORGEJO_SERVER_URL`, the connection's base URL); the
+//! test pushes and reads hooks through the host port (`SCARAB_TEST_FORGEJO_URL`).
+//!
+//! What is deliberately NOT asserted here: that the onboarding Run *succeeds*.
+//! The claim under test is the ingest path — a real signed delivery is
 //! accepted and becomes a Run attributed to the Project the bind created.
 
 mod support;
@@ -29,7 +32,7 @@ use support::forgejo::*;
 use support::*;
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs the proc-mode stack and a seeded Forgejo; run `just forgejo-verify`"]
+#[ignore = "needs the kind release and a seeded Forgejo; run `just forgejo-verify`"]
 async fn a_real_forgejo_repo_onboards_and_its_push_becomes_a_run() {
     enter_tier();
 
@@ -37,6 +40,7 @@ async fn a_real_forgejo_repo_onboards_and_its_push_becomes_a_run() {
     let http = client();
 
     let forgejo = env("SCARAB_TEST_FORGEJO_URL");
+    let server_side = env("SCARAB_TEST_FORGEJO_SERVER_URL");
     let token = env("SCARAB_TEST_FORGEJO_TOKEN");
     let owner = env("SCARAB_TEST_FORGEJO_OWNER");
     let name = env("SCARAB_TEST_FORGEJO_ONBOARD_REPO");
@@ -46,14 +50,14 @@ async fn a_real_forgejo_repo_onboards_and_its_push_becomes_a_run() {
         .unwrap_or(59);
 
     // --- 0. the tier is re-runnable: the Postgres outlives the Forgejo -------
-    reclaim_connections_for(&http, &base, &forgejo).await;
+    reclaim_connections_for(&http, &base, &server_side).await;
 
     // --- 1. add the connection (the admin's form) ----------------------------
     let created = json_ok(
         http.post(format!("{base}/v1/connections"))
             .json(&serde_json::json!({
                 "kind": "forgejo",
-                "base_url": forgejo,
+                "base_url": server_side,
                 "credential": token,
             }))
             .send()
@@ -195,9 +199,9 @@ async fn a_real_forgejo_repo_onboards_and_its_push_becomes_a_run() {
         assert!(
             Instant::now() < deadline,
             "no NEW Run appeared for {org}/{project} after a real push ({} pre-existing). \
-             A delivery that was rejected shows up as a 401 in \
-             deploy/local-proc/server.log — that is the `config.secret` failure mode \
-             this tier exists to catch.",
+             A delivery that was rejected shows up as a 401 in the server's log \
+             (`just logs`) — that is the `config.secret` failure mode this tier \
+             exists to catch.",
             before.len()
         );
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -229,18 +233,20 @@ const NOTIFY_SOURCE: &str =
 
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs the proc-mode stack and a seeded Forgejo; run `just forgejo-verify`"]
+#[ignore = "needs the kind release and a seeded Forgejo; run `just forgejo-verify`"]
 async fn an_installed_library_runs_and_a_yank_refuses_its_rerun() {
     enter_tier();
     let base = base_url();
     let http = client();
     let forgejo = env("SCARAB_TEST_FORGEJO_URL");
+    let server_side = env("SCARAB_TEST_FORGEJO_SERVER_URL");
     let token = env("SCARAB_TEST_FORGEJO_TOKEN");
     let owner = env("SCARAB_TEST_FORGEJO_OWNER");
     let name = env("SCARAB_TEST_FORGEJO_LIBRARY_REPO");
     let repo = format!("{owner}/{name}");
 
-    let (org, project) = connect_and_bind(&http, &base, &forgejo, &token, &owner, &name).await;
+    let (org, project) =
+        connect_and_bind(&http, &base, &server_side, &token, &owner, &name).await;
 
     // --- 1. fetch and install lib:thulasi-ram/notify ------------------------
     let fetched = json_ok(
