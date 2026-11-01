@@ -318,7 +318,7 @@ async fn a_stepped_up_identity_link_still_completes() {
     assert_eq!(cb.status(), StatusCode::FOUND);
     assert_eq!(
         cb.headers()[axum::http::header::LOCATION],
-        "/account?identity_linked=default"
+        "/settings/profile?identity_linked=default"
     );
     assert!(has_default_identity(&ids).await, "the identity was not attached");
 }

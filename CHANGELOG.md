@@ -144,6 +144,9 @@ record. Read Breaking changes before you upgrade.
   failed Step. Changing the replica count moves about 1/N of the keys, and each moved key
   misses once. `workspace.homeUrlTemplate` overrides the per-replica address.
   [ADR-0077 amendment](https://thulasi-ram.github.io/scarab-ci/tech/adr/0077-end-to-end-fault-and-agent-driven-testing/#amendment-2026-11-01-grill)
+- The server and CLI now link to `/settings/profile` and `/settings/security?enroll=1`
+  instead of `/account` and `/account/security?enroll=1`. The UI still redirects the old
+  addresses.
 
 ### Bug Fixes
 

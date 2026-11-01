@@ -891,9 +891,9 @@ mod tests {
     fn next_survives_the_cookie_and_only_a_relative_path_does() {
         let flow = LoginFlow::generate()
             .for_provider("github")
-            .with_next("/account/security?enroll=1");
+            .with_next("/settings/security?enroll=1");
         let back = LoginFlow::from_cookie(&flow.to_cookie()).expect("round trip");
-        assert_eq!(back.next, "/account/security?enroll=1");
+        assert_eq!(back.next, "/settings/security?enroll=1");
         assert_eq!(back, flow);
         // Without a provider either, the next still rides in the 6th part.
         let bare = LoginFlow::generate().with_next("/x");

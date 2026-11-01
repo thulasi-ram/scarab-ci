@@ -1635,7 +1635,7 @@ impl From<DispatchError> for ApiError {
 /// Where a `fresh_login_required` refusal sends the browser: a fresh login
 /// that lands on passkey enrollment (ADR-0073 §2, §10). The refusal adds the
 /// caller's `provider` ([`AppState::fresh_login_url`]).
-pub const FRESH_LOGIN_URL: &str = "/v1/auth/login?next=/account/security%3Fenroll%3D1";
+pub const FRESH_LOGIN_URL: &str = "/v1/auth/login?next=/settings/security%3Fenroll%3D1";
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -7343,14 +7343,14 @@ async fn link_callback(
     let location = match store.link(&principal.subject, &identity, now).await {
         Ok(scarab_identity::LinkOutcome::Merged { from }) => {
             format!(
-                "/account?identity_linked={}&merged={}",
+                "/settings/profile?identity_linked={}&merged={}",
                 flow.provider,
                 query_escape(&from)
             )
         }
-        Ok(_) => format!("/account?identity_linked={}", flow.provider),
+        Ok(_) => format!("/settings/profile?identity_linked={}", flow.provider),
         Err(scarab_identity::IdentityError::Conflict(why)) => {
-            format!("/account?identity_link_error={}", query_escape(&why))
+            format!("/settings/profile?identity_link_error={}", query_escape(&why))
         }
         Err(e) => return Err(ApiError::BadRequest(e.to_string())),
     };

@@ -760,7 +760,7 @@ async fn every_crown_jewel_needs_a_step_up_even_for_an_owner() {
         assert!(is_step_up(st, &b), "{} {}: {st} {b}", r.method, r.path);
         assert_eq!(b["mode"], "enroll", "{} {}: {b}", r.method, r.path);
         assert_eq!(b["op"], r.op.id);
-        assert_eq!(b["enroll_url"], "/account/security?enroll=1");
+        assert_eq!(b["enroll_url"], "/settings/security?enroll=1");
         assert!(b["message"].as_str().unwrap().contains("step-up"));
     }
 
