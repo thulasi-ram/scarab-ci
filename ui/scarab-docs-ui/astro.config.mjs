@@ -28,19 +28,24 @@ export default defineConfig({
     starlight({
       title: 'Scarab',
       tagline: 'A CI engine for Kubernetes — forge-native, on a durable core.',
-      // The brand emblem (ui/brand): ink-outline variant on light, gold-outline
-      // on dark — same mark as the favicon.
+      // The halftone mark (ui/brand): ink dots on light, cream dots on dark,
+      // the same mark as the favicon.
       logo: {
-        light: './src/assets/brand/scarab-emblem.svg',
-        dark: './src/assets/brand/scarab-emblem-dark.svg',
+        light: './src/assets/brand/scarab-halftone-ink.svg',
+        dark: './src/assets/brand/scarab-halftone.svg',
         alt: 'Scarab',
       },
-      // Brand favicon (ui/brand): theme-aware SVG (ink outline on light, gold on
-      // dark), with .ico + apple-touch fallbacks. Starlight prepends `base` to
-      // `favicon`; the `head` hrefs are written with the build's base inline.
+      // Brand favicon (ui/brand/favicon/halftone): theme-aware SVG (ink on
+      // light, cream on dark) with .ico + apple-touch fallbacks. Starlight
+      // renders the `head` links first and its own `favicon` link last, and
+      // browsers that read SVG favicons use the last matching link. So the
+      // SVG is the `favicon` and the .ico goes in `head` with a fixed size
+      // (an `any` size would win over the SVG in Chrome). Starlight prepends
+      // `base` to `favicon`; the `head` hrefs are written with the build's
+      // base inline.
       favicon: '/favicon.svg',
       head: [
-        { tag: 'link', attrs: { rel: 'icon', href: `${DOCS_BASE}favicon.ico`, sizes: 'any' } },
+        { tag: 'link', attrs: { rel: 'icon', href: `${DOCS_BASE}favicon.ico`, sizes: '32x32' } },
         { tag: 'link', attrs: { rel: 'apple-touch-icon', href: `${DOCS_BASE}apple-touch-icon.png` } },
       ],
       // Docs versioning: the version dropdown rides in the header, the

@@ -12,7 +12,8 @@ import { setPaletteOpen } from "./palette";
 import { me } from "./session";
 import { getOrgSecuritySummary } from "./api/client";
 import { bannerText } from "./security";
-import emblemGold from "./assets/brand/scarab-emblem-dark.svg";
+import glyphInk from "./assets/brand/scarab-halftone-ink.svg";
+import glyphCream from "./assets/brand/scarab-halftone.svg";
 
 export default function Layout(props: ParentProps) {
   // Step-up posture for callers who administer an Org (ADR-0073): a crown
@@ -26,13 +27,8 @@ export default function Layout(props: ParentProps) {
       <nav class="topbar">
         <A href="/" class="brand" end>
           {/* The brand emblem (ui/brand): gold carapace in both themes. */}
-          <img
-            class="brand-emblem"
-            src={emblemGold}
-            alt=""
-            width={26}
-            height={23}
-          />
+          <img class="brand-emblem brand-emblem--light" src={glyphInk} alt="" width={60} height={60} />
+          <img class="brand-emblem brand-emblem--dark" src={glyphCream} alt="" width={60} height={60} />
           <span>Scarab</span>
         </A>
         <span class="topbar-spacer" />

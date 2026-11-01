@@ -93,6 +93,27 @@ docs what="" *args:
       *) echo "usage: just docs [build | screenshots [check]]" >&2; exit 2 ;;
     esac
 
+# `just brand` regenerates the halftone mark's SVGs in ui/brand from
+# ui/brand/halftone/generate.py (python3, standard library only).
+# `just brand check` fails if the SVGs on disk differ from what the generator
+# produces. `just brand png` re-renders the 37 PNG icons in a browser: it opens
+# a tab that draws each SVG at every size, serve_png.py saves the files and
+# exits when the page reports it is done, then favicon.ico is rebuilt from the
+# favicon PNGs.
+[doc('Regenerate the halftone mark SVGs; `check` compares them; `png` re-renders the PNG icons')]
+brand what="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "{{what}}" in
+      "") python3 ui/brand/halftone/generate.py ;;
+      check) python3 ui/brand/halftone/generate.py --check ;;
+      png)
+        python3 ui/brand/halftone/serve_png.py
+        python3 ui/brand/halftone/generate.py --ico
+        ;;
+      *) echo "usage: just brand [check | png]" >&2; exit 2 ;;
+    esac
+
 # `just release <version>` checks a release before you tag v<version>
 # (docs/RELEASING.md): Cargo.toml and Chart.yaml name <version>, libs/clone.yaml
 # pins an earlier scarab-clone build by digest, CHANGELOG.md has the version's

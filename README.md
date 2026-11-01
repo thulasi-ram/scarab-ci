@@ -1,8 +1,8 @@
 <div align="center">
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="ui/brand/logo/scarab-emblem-dark-square.svg">
-  <img alt="The Scarab emblem — a scarab with spread wings inside a ring" src="ui/brand/logo/scarab-emblem-square.svg" width="132" height="132">
+  <source media="(prefers-color-scheme: dark)" srcset="ui/brand/logo/scarab-halftone.svg">
+  <img alt="The Scarab mark: a scarab with horns inside a dotted hexagon" src="ui/brand/logo/scarab-halftone-ink.svg" width="132" height="132">
 </picture>
 
 # Scarab
