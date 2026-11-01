@@ -312,10 +312,9 @@ Measured on 2026-11-01 (colima 2 vCPU / 4 GiB): the kind node used 1.46 GiB
 at 2+2 before the workload (Postgres, MinIO, Forgejo and toxiproxy included)
 and 1.72 to 1.91 GiB at the peak with the step Pods running. One scenario
 takes 3 to 5 minutes; `just chaos` with both and the two mode switches took
-about 9. With two server replicas, both drive the same Pod's drain: one
-drain often exits 12 (`drain_state_incomplete` while another replica's tail
-pack lingers) and the next poll's re-drive posts the record, with or without
-a fault.
+about 9. With two server replicas, the drain of one Pod is driven from
+both: one replica's drain helper often exits 12 (its record POST failed) and
+the other replica's re-drive posts the record, with or without a fault.
 
 ## Forgejo
 
