@@ -89,14 +89,20 @@ administer (`?org=<org>` narrows it to one).
 
 - **An org's first connection** is created by a global admin, under **Settings › Server
   administration › Connect a forge** (`/settings/server/connect-forge`), or with
-  `POST /v1/connections` and an `org` field. After that, the org's own admins can add more.
+  `POST /v1/connections` and an `org` field. After that, the org's own admins can add more. An
+  org name is not empty, is at most 100 characters, has no `/` or spaces, and does not start
+  with `_`; the server answers 400 otherwise.
 - **A GitHub App installation** registers itself from its `installation` webhook. It is assigned
-  the org named like the account the App is installed on, and mints tokens only for that
-  installation's repositories. It stays unassigned when an org of that name already uses another
-  forge, or when it already holds a repository of another owner.
+  the org named like the account the App is installed on when two things hold: every repository
+  already bound through it is owned by that account, and the org either does not exist yet or
+  is served only by GitHub connections to the same host. An org that exists with no connection
+  left is not joined by name. Otherwise the connection stays unassigned and binds none of the
+  delivery's repositories. Once it serves an org, it mints tokens only from its own
+  installation, and only for repositories that org owns.
 - **A connection declared in `scarab.connections`** names its org with `org:`. Without `org:`,
   the org is the one owner of its `repos:`. A repository of another owner, repositories of
-  several owners without `org:`, or no repositories and no `org:` fail the boot:
+  several owners without `org:`, no repositories and no `org:`, or a repository already bound
+  through another connection that serves an org fail the boot:
 
   ```yaml
   scarab:
@@ -110,10 +116,23 @@ administer (`?org=<org>` narrows it to one).
   ```
 
 A connection with no org (for example one created before connections had an org, whose
-repositories have several owners) is shown only to global admins. A global admin assigns it with **Assign to org**
-(`PUT /v1/connections/{id}/org`), which is refused while it holds a repository of another owner.
-To split one, add a connection for each org and bind (or re-sync) the repositories through it: a
-repository moves off a connection with no org. Then remove the old connection.
+repositories have several owners) is shown only to global admins, and its repositories keep
+working. Nothing assigns it an org as a side effect: opening Add repository, a re-sync or a bind
+leaves it unassigned. A re-sync through it binds nothing and lists every repository the forge
+reports in `skipped`, so the UI does not offer Re-sync on it.
+
+A global admin assigns it with **Assign to org** (`PUT /v1/connections/{id}/org` with
+`{ "org": "<name>" }`). It asks for step-up confirmation and is recorded in the org's event log.
+The server answers 409 with the reason when a repository bound through the connection is owned
+by another account, when the org is served by another forge or host, when the org exists with no
+connection, or when the connection is managed by configuration. Anyone other than a global admin,
+an API token included, gets 403.
+
+To split a connection whose repositories have several owners, add a connection for each org and
+bind or re-sync the repositories through it. A repository moves only off a connection with no
+org; one bound through a connection that serves an org stays there, even when you bind it through
+another connection of the same org (409 on Add repository, `skipped` on re-sync). Unbind it from
+the connection that holds it first. When every repository has moved, remove the old connection.
 
 ## Settings
 

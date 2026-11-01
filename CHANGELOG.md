@@ -85,48 +85,73 @@ record. Read Breaking changes before you upgrade.
 - **A forge connection serves one org** (git-bug 19b0a45). Every repository bound through a
   connection must be owned by its org.
   - `POST /v1/connections` needs an `org` field. Only a global admin creates an org's first
-    connection; after that, the org's admins can add more.
+    connection; after that, the org's admins can add more. The server checks the org name when
+    a connection is created or assigned: not empty, at most 100 characters, no `/`, no spaces,
+    not starting with `_` (400).
   - `GET /v1/connections` lists only the connections of orgs you administer (a global admin
     sees every one) and takes `?org=<org>` to list one org's.
+  - Nothing assigns an org to a connection as a side effect. Opening Add repository, a re-sync
+    or a bind leaves an unassigned connection unassigned, and a re-sync through it binds
+    nothing: every repository the forge reports is listed in `skipped`. The UI does not offer
+    Re-sync on it.
+  - New: `PUT /v1/connections/{id}/org` with `{ "org": "<name>" }` assigns an unassigned
+    connection, for global admins only (403 for anyone else, API tokens included). It answers
+    409 with the reason when a repository bound through the connection is owned by another
+    account, when the org is served by another forge or host, when the org exists with no
+    connection, or when the connection is managed by configuration. It asks for step-up
+    confirmation (`connection.assign_org`) and is recorded in the org's event log. In the UI it
+    is **Assign to org** on the Unassigned connections panel.
+  - A repository moves only off an unassigned connection. Binding it through a second
+    connection of the same org is refused: 409 on Add repository, listed in `skipped` on
+    re-sync. Unbind it from the connection that holds it first. Add repository can now move a
+    repository off an unassigned connection, as re-sync already could.
   - A connection declared in the `connections:` config needs `org:`, unless all its `repos:`
-    have one owner. A repo of another owner, repos of several owners without `org:`, or no
-    repos and no `org:` fail the boot.
-  - A private library is read only through a connection of the installing org.
+    have one owner. A repo of another owner, repos of several owners without `org:`, no repos
+    and no `org:`, or a repo already bound through another connection that serves an org fail
+    the boot.
+  - A private library is read only through a connection of the installing org, and only for
+    repositories that org owns.
 
   **Upgrade note.** Migration `0076_org_connections.sql` gives each existing connection the org
   of its repositories when they all have one owner. A connection whose repositories have
   several owners, or none, stays unassigned: only a global admin sees it or acts on it, and its
   repositories keep working as before. A GitHub App installation connection whose repositories
   span owners (an earlier re-sync could bind another installation's repositories to it) is one
-  of these. After the upgrade:
-  1. A global admin re-syncs each GitHub App installation connection (Settings › Connections ›
-     **Re-sync**). A re-sync moves a repository off a connection with no org onto the one it
-     belongs to, and lists in `skipped` the repositories it left alone.
-  2. For each connection still unassigned, a global admin either assigns it an org with
-     **Assign to org** (`PUT /v1/connections/{id}/org`, refused while it holds a repository of
-     another owner), or adds a connection for each org, binds or re-syncs the repositories
-     through it (a repository moves off a connection with no org), and then removes the old
-     one. Do not remove a connection that still has bound repositories: that removes their
-     Projects.
+  of these; it keeps looking up each repository's installation, so those repositories keep
+  getting tokens. After the upgrade, as a global admin, open Settings › Connections:
+  1. Assign each unassigned connection to the org that owns its repositories with **Assign to
+     org**.
+  2. For a connection whose repositories belong to several accounts, re-sync each account's
+     own connection (for GitHub, its installation connection; for Forgejo, add one for that
+     org first). Its repositories move there with their Projects. Then
+     assign the old connection or remove it. Do not remove a connection that still has bound
+     repositories: that removes their Projects.
 
-  A server built before this release does not start against a database where 0076 has run
-  (sqlx refuses an unknown migration). To roll back, restore the database from before the
-  upgrade.
+  During a rolling upgrade, `/v1/me` `admin_orgs` and the connection routes also count orgs
+  that only a repository binding names, so admins of an org bound by an older server are not
+  refused. A server built before this release does not start against a database where 0076 has
+  run (sqlx refuses an unknown migration). To roll back, restore the database from before the
+  upgrade, or delete row 76 from `_sqlx_migrations`; the added columns and table do not affect
+  the older server.
 
 ### Security
 
 - An admin of one org could list, delete, re-sync and bind repos through another org's forge
   connections, and an API token scoped to one org could do the same (git-bug 19b0a45). Each
   connection now belongs to an org, and its routes need `Administer` on that org; another
-  org's connection answers 404. A GitHub App connection mints tokens only from its own
-  installation and lists only that installation's repositories, so a re-sync no longer binds
-  repos of other installations. A bind no longer moves a repo bound in another org.
-  A connection with no org gets one only from its installation's account, when every
-  repository it holds is owned by that account and no org of that name uses another forge,
-  or from a global admin; opening a page never assigns one. Through a connection that has an
-  org, tokens are minted, libraries read and repositories unbound only for repositories that
-  org owns. A repository moves between connections only off a connection with no org: a move
-  between two connections of one org is refused (409 on bind, `skipped` on re-sync).
+  org's connection answers 404. A GitHub App connection that serves an org mints tokens only
+  from its own installation and lists only that installation's repositories, so a re-sync no
+  longer binds repos of other installations; an unassigned one keeps looking up each
+  repository's installation. A bind no longer moves a repo bound in another org.
+  A connection with no org gets one from an `installation` delivery only when every repository
+  already bound through it is owned by the installation's account, and the org of that name
+  either does not exist or is served only by GitHub connections to the same host; an org that
+  exists with no connection is not joined by name. Otherwise only a global admin assigns one.
+  No read, re-sync or bind assigns one. Through a connection that has an org, tokens are
+  minted, libraries read and repositories unbound only for repositories that org owns
+  (unbinding another owner's repository answers 404). A library source naming a connection
+  that does not exist and one naming another org's connection get the same answer (403). A
+  repository moves between connections only off a connection with no org.
 - The clone image's askpass gave the token to an LFS server named in `.lfsconfig`, to other
   repositories on the same host through submodules, and over `http://` (#53).
 - A value from outside the Pipeline holding `$(SECRET_NAME)` was filled with that secret by
@@ -219,7 +244,8 @@ record. Read Breaking changes before you upgrade.
 - `GET /v1/me` adds `global_admin`: whether you hold a global `Administer` role, which the UI
   uses to show Server administration. It is always `false` for an API token.
 - A connection's re-sync result adds `skipped`: the repositories the forge reports that it did
-  not bind, because another account owns them or another org's connection holds them.
+  not bind, because another account owns them, another connection that serves an org holds
+  them, or the connection serves no org (then every repository is listed).
 - The server and CLI now link to `/settings/profile` and `/settings/security?enroll=1`
   instead of `/account` and `/account/security?enroll=1`. The UI still redirects the old
   addresses.
