@@ -292,7 +292,7 @@ does not take the API's or a Step's word for success:
 | I1b | Attempt N+1's step container starts after N's ended, or after N was journalled finished or superseded |
 | I1c | per Step at most one succeeded Attempt, one `AttemptStarted` and one `AttemptFinished` per Attempt, and a Succeeded Step's evidence Attempt is that one |
 | T1 | exactly one terminal `RunTransitioned` per Run, matching `runs.status` |
-| I3 | every Run terminal within the quiesce bound; no row left with `creating = TRUE` |
+| I3 | every scenario Run terminal within the quiesce bound; none left with `creating = TRUE` |
 | I4 | every green Attempt's snapshot closure is in committed packs; every tree and blob range is read from the bucket and hashed against its address; a member in another fence's pack needs a `depot_fence_borrows` edge |
 | I8 | after quiesce, no Pod of a scenario Run is pending or running, and no per-Pod workspace Secret outlives its Pod |
 | I10 | no uncommitted pack row older than 60 s for a fence that has a drain record; every committed pack's object exists at its recorded size |
@@ -313,7 +313,15 @@ and I11 are not part of rank 1 and are not checked here.
 A scenario whose fault did not test what it names is INCONCLUSIVE, not PASS:
 no fault fired (the trigger never held, or every Run ended first), the fault
 landed `before-window` or `after-window`, or the trigger condition no longer
-held when it fired.
+held when it fired. So is one where an invariant looked at less than the
+workload produces: T1 and I3 one per Run, I1a, I1c and I4 one per Attempt
+(two per Run). An invariant that looked at nothing prints `not exercised`, not
+`ok`. I1b compares a Step's consecutive Attempts, and a Depot fault causes no
+retry, so rank 1 never exercises it; it is printed as such and not counted.
+
+Before the workload starts, the binary waits for the scenario's topology:
+as many ready server Pods and Depot Pods as the scenario file records. A
+replay of a 2+2 file on a release at another scale fails there (exit 2).
 
 `just chaos` exits 0 when every verdict passed, 1 when one failed (a finding:
 keep the scenario file and replay it), 2 when a scenario could not run, and 3

@@ -45,12 +45,15 @@ pub async fn run(stack: &Stack, mut scenario: Scenario, dir: &Path) -> Result<Sc
         stop_rx,
     ));
 
-    // The stack must be at the scenario's topology before anything runs.
+    // The stack must be at the scenario's topology before anything runs: a
+    // replay of a 2+2 file on a 1-server release is not the same scenario.
+    let servers = wait_servers_ready(&pods_api, &stack.release, scenario.server_replicas as usize).await?;
     let depots = wait_depots_ready(&views, scenario.depot_replicas as usize).await?;
     log(&format!(
-        "{} seed {}: Depot replicas {:?}; plan {:?}",
+        "{} seed {}: servers {:?}; Depot replicas {:?}; plan {:?}",
         scenario.kind.as_str(),
         scenario.seed,
+        servers,
         depots,
         scenario.plan
     ));
@@ -265,6 +268,34 @@ async fn wait_depots_ready(views: &Views, want: usize) -> Result<Vec<String>, St
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     Err(format!("expected {want} ready Depot Pods within 120 s"))
+}
+
+/// Wait until exactly `want` server Pods of the release (the Deployment, not
+/// the Depot) are ready and not being deleted.
+async fn wait_servers_ready(pods: &KubeApi<Pod>, release: &str, want: usize) -> Result<Vec<String>, String> {
+    let lp = ListParams::default().labels(&format!("app.kubernetes.io/name=scarab,app.kubernetes.io/instance={release}"));
+    let mut ready = Vec::new();
+    for _ in 0..240 {
+        let list = pods.list(&lp).await.map_err(|e| format!("list server Pods: {e}"))?;
+        ready = list
+            .items
+            .iter()
+            .filter(|p| p.metadata.deletion_timestamp.is_none())
+            .filter(|p| {
+                p.status
+                    .as_ref()
+                    .and_then(|s| s.conditions.as_ref())
+                    .is_some_and(|c| c.iter().any(|c| c.type_ == "Ready" && c.status == "True"))
+            })
+            .filter_map(|p| p.metadata.name.clone())
+            .collect();
+        ready.sort();
+        if ready.len() == want {
+            return Ok(ready);
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    Err(format!("expected {want} ready server Pods within 120 s; ready: {ready:?}"))
 }
 
 async fn all_terminal(stack: &Stack, runs: &[String]) -> bool {

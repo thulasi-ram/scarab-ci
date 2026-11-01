@@ -122,7 +122,13 @@ async fn check_dir(conn: &Conn, file: &Path) -> Result<check::Outcome, String> {
     );
     for (inv, n) in &v.checked {
         let fails = v.findings.iter().filter(|f| &f.invariant == inv && f.severity == check::Severity::Fail).count();
-        println!("  {inv:<4} {} ({n} checked)", if fails == 0 { "ok".to_string() } else { format!("FAIL x{fails}") });
+        let state = match (fails, *n, inv.as_str()) {
+            (0, 0, "I1b") => "not exercised (rank 1 causes no retry; not counted)".to_string(),
+            (0, 0, _) => "not exercised".to_string(),
+            (0, _, _) => "ok".to_string(),
+            (k, _, _) => format!("FAIL x{k}"),
+        };
+        println!("  {inv:<4} {state} ({n} checked)");
     }
     for f in &v.findings {
         println!("  [{:?}] {}: {}", f.severity, f.invariant, f.detail);

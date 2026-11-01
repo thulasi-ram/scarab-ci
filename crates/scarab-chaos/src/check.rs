@@ -14,7 +14,7 @@
 //! | I1b  | Attempt N+1's step container starts after Attempt N's ended, or after N was journalled finished or superseded |
 //! | I1c  | no double execution: per Step at most one succeeded Attempt, one `AttemptStarted` and one `AttemptFinished` per Attempt, and a Succeeded Step's evidence Attempt is that one |
 //! | T1   | exactly one terminal `RunTransitioned` per Run, matching `runs.status` |
-//! | I3   | every Run (and every `creating = TRUE` row) terminal within the quiesce bound |
+//! | I3   | every scenario Run terminal within the quiesce bound, and none left with `creating = TRUE` |
 //! | I4   | every green Attempt's output snapshot closure is in committed packs whose ranges read back and hash to their addresses; a member in another fence's pack needs a `depot_fence_borrows` edge |
 //! | I8   | after quiesce no Pod of a scenario Run is still pending or running, and no per-Pod Secret outlives its Pod |
 //! | I10  | no `committed = FALSE` pack row older than the linger for a fence whose drain has a record; every committed pack's object exists at its recorded size |
@@ -30,7 +30,13 @@
 //! Outside the invariants, a scenario is INCONCLUSIVE, not PASS, when its
 //! fault did not exercise what it names ([`exercised`]): no fault fired, the
 //! fault landed outside its window, or the trigger condition no longer held
-//! when it fired. A FAIL finding still makes the verdict FAIL.
+//! when it fired. It is also INCONCLUSIVE when an invariant looked at fewer
+//! things than the workload must produce ([`minimums`]). A FAIL finding still
+//! makes the verdict FAIL.
+//!
+//! I1b compares consecutive Attempts of one Step. A Depot fault does not
+//! cause a retry, so rank 1 never has a pair: I1b is reported as not
+//! exercised and has no minimum.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -190,8 +196,6 @@ pub struct LiveObject {
 #[derive(Debug, Clone, Default)]
 pub struct Facts {
     pub runs: Vec<RunRow>,
-    /// Every row in the database with `creating = TRUE`.
-    pub creating: Vec<String>,
     pub events: Vec<EventRow>,
     pub attempts: Vec<AttemptRow>,
     pub steps: Vec<StepRow>,
@@ -211,6 +215,8 @@ pub struct Facts {
     pub kind: Option<Kind>,
     /// The faults as fired (scenario.json).
     pub faults: Vec<Fault>,
+    /// How many Runs the workload submits (`workload.runs`).
+    pub expected_runs: usize,
 }
 
 // --- evaluate (pure) -------------------------------------------------------------
@@ -282,6 +288,26 @@ pub fn exercised(kind: Kind, faults: &[Fault]) -> Vec<String> {
         }
     }
     why
+}
+
+/// The least each invariant must have looked at for `runs` Runs of the
+/// rank-1 workload, and why a count below it makes the scenario
+/// inconclusive. I1b, I8 and I10 have none (I1b: rank 1 causes no retry).
+pub fn minimums(runs: usize, checked: &BTreeMap<String, usize>) -> Vec<String> {
+    let attempts = runs * crate::scenario::Workload::STEPS;
+    let want = [
+        ("T1", runs, "one per scenario Run"),
+        ("I3", runs, "one per scenario Run"),
+        ("I1a", attempts, "the Pod of every Attempt, as the watcher saw it"),
+        ("I1c", attempts, "every Step of every Run"),
+        ("I4", attempts, "every green Attempt's snapshot, read back"),
+    ];
+    want.iter()
+        .filter_map(|(inv, min, what)| {
+            let n = checked.get(*inv).copied().unwrap_or(0);
+            (n < *min).then(|| format!("{inv} looked at {n}, below its minimum of {min} ({what})"))
+        })
+        .collect()
 }
 
 pub fn evaluate(f: &Facts) -> Verdict {
@@ -478,8 +504,8 @@ pub fn evaluate(f: &Facts) -> Verdict {
             }
         }
     }
-    for id in &f.creating {
-        findings.push(fail("I3", format!("run {id} still has creating = TRUE")));
+    for r in f.runs.iter().filter(|r| r.creating) {
+        findings.push(fail("I3", format!("run {} still has creating = TRUE", r.id)));
     }
     checked.insert("I3".into(), f.runs.len());
 
@@ -521,9 +547,7 @@ pub fn evaluate(f: &Facts) -> Verdict {
     checked.insert("I4".into(), f.snapshots.len());
 
     // I8: nothing of a terminal scenario Run still runs.
-    let mut live_checked = 0;
     for o in &f.live {
-        live_checked += 1;
         match o.kind.as_str() {
             "Pod" => {
                 let phase = o.phase.as_deref().unwrap_or("Unknown");
@@ -535,7 +559,9 @@ pub fn evaluate(f: &Facts) -> Verdict {
             kind => findings.push(fail("I8", format!("{kind} {} of run {:?} remains after quiesce", o.name, o.run))),
         }
     }
-    checked.insert("I8".into(), live_checked);
+    // What I8 looked at is every scenario Run's leftovers; finding none is
+    // the pass, so the count is the Runs, not the objects found.
+    checked.insert("I8".into(), f.runs.len());
 
     // I10: no stale uncommitted pack rows; committed packs have their object.
     let cutoff_s = (f.now_ms - LINGER_BOUND_MS) / 1000;
@@ -572,7 +598,11 @@ pub fn evaluate(f: &Facts) -> Verdict {
     checked.insert("I10".into(), f.packs.len());
 
     let inconclusive = match f.kind {
-        Some(kind) => exercised(kind, &f.faults),
+        Some(kind) => {
+            let mut why = exercised(kind, &f.faults);
+            why.extend(minimums(f.expected_runs, &checked));
+            why
+        }
         None => Vec::new(),
     };
     let outcome = if findings.iter().any(|x| x.severity == Severity::Fail) {
@@ -630,6 +660,7 @@ pub async fn gather(src: &Sources<'_>, scenario: &Scenario, pod_records: Vec<Pod
         quiesce_deadline_ms: scenario.quiesce_deadline_ms(),
         kind: Some(scenario.kind),
         faults: scenario.faults.clone(),
+        expected_runs: scenario.workload.runs as usize,
         ..Default::default()
     };
 
@@ -652,10 +683,6 @@ pub async fn gather(src: &Sources<'_>, scenario: &Scenario, pod_records: Vec<Pod
             });
         }
     }
-    f.creating = sqlx::query_scalar::<_, String>("SELECT id FROM runs WHERE creating")
-        .fetch_all(src.pg)
-        .await
-        .map_err(db_err)?;
     for (run, seq, at, payload) in sqlx::query_as::<_, (String, i64, i64, serde_json::Value)>(
         "SELECT run_id, seq, at, payload FROM events WHERE run_id = ANY($1) ORDER BY run_id, seq",
     )
@@ -1142,7 +1169,7 @@ mod tests {
         f.events.pop();
         assert_eq!(failed(&evaluate(&f)), vec!["I3"]);
         let mut f = base();
-        f.creating = vec!["x".into()];
+        f.runs[0].creating = true;
         assert_eq!(failed(&evaluate(&f)), vec!["I3"]);
     }
 

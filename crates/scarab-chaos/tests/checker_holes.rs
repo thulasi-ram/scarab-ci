@@ -132,6 +132,7 @@ fn clean() -> Facts {
         now_ms: 2_000_000,
         kind: Some(Kind::MidDrain),
         faults: vec![fault("mid-drain", true)],
+        expected_runs: 1,
         ..Default::default()
     }
 }
@@ -213,4 +214,43 @@ fn a_lost_workspace_and_a_failed_run_fail_w1() {
     let details: Vec<&str> = v.findings.iter().filter(|x| x.invariant == "W1").map(|x| x.detail.as_str()).collect();
     assert!(details.iter().any(|d| d.contains("ended failed")), "{details:?}");
     assert!(details.iter().any(|d| d.contains("step produce attempt a1 is succeeded with no output snapshot")), "{details:?}");
+}
+
+// --- minimums ------------------------------------------------------------------
+
+#[test]
+fn i1b_at_zero_is_not_exercised_and_does_not_count() {
+    let v = evaluate(&clean());
+    assert_eq!(v.checked["I1b"], 0);
+    assert_eq!(v.outcome, Outcome::Pass, "{:?}", v.inconclusive);
+}
+
+/// The watcher missed the consumer's Pod: I1a looked at one Attempt of two.
+#[test]
+fn an_invariant_below_its_minimum_is_inconclusive() {
+    let mut f = clean();
+    f.pod_records.pop();
+    let v = evaluate(&f);
+    assert_eq!(v.outcome, Outcome::Inconclusive);
+    assert!(v.inconclusive.iter().any(|w| w.starts_with("I1a looked at 1, below its minimum of 2")), "{:?}", v.inconclusive);
+}
+
+/// Fewer Runs than the workload submits: T1 and I3 are below their minimum.
+#[test]
+fn fewer_runs_than_the_workload_is_inconclusive() {
+    let mut f = clean();
+    f.expected_runs = 3;
+    let v = evaluate(&f);
+    assert_eq!(v.outcome, Outcome::Inconclusive);
+    assert!(v.inconclusive.iter().any(|w| w.starts_with("T1 looked at 1")), "{:?}", v.inconclusive);
+}
+
+/// A green Attempt's snapshot that was never walked: I4 checked nothing.
+#[test]
+fn i4_over_nothing_is_inconclusive() {
+    let mut f = clean();
+    f.snapshots.clear();
+    let v = evaluate(&f);
+    assert_eq!(v.outcome, Outcome::Inconclusive);
+    assert!(v.inconclusive.iter().any(|w| w.starts_with("I4 looked at 0")), "{:?}", v.inconclusive);
 }

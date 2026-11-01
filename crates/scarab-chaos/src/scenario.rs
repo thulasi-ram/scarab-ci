@@ -87,6 +87,9 @@ impl Default for Workload {
 }
 
 impl Workload {
+    /// Steps per Run in [`Workload::pipeline`]: produce and consume.
+    pub const STEPS: usize = 2;
+
     /// The inline pipeline for one run (`POST /v1/runs` body).
     pub fn pipeline(&self) -> serde_json::Value {
         let bytes = u64::from(self.file_mib) * 1024 * 1024;
