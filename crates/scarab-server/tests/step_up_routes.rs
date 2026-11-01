@@ -834,7 +834,7 @@ async fn a_refusal_never_echoes_a_secret_value() {
         (
             "POST",
             "/v1/connections",
-            json!({"kind": "github", "base_url": "https://github.com", "credential": "S3CR3T-pat"}),
+            json!({"org": "acme", "kind": "github", "base_url": "https://github.com", "credential": "S3CR3T-pat"}),
         ),
         (
             "PUT",
@@ -893,9 +893,10 @@ fn well_formed(r: &scarab_server::RouteEntry) -> (String, Option<Value>) {
             Some(json!({"base_url": "https://argo.example", "credential": "c"}))
         }
         ("POST", "/v1/connections") => {
-            Some(json!({"kind": "github", "base_url": "https://github.com", "credential": "c"}))
+            Some(json!({"org": "acme", "kind": "github", "base_url": "https://github.com", "credential": "c"}))
         }
         ("POST", "/v1/connections/{id}/repos") => Some(json!({"owner": "acme", "name": "web"})),
+        ("PUT", "/v1/connections/{id}/org") => Some(json!({"org": "acme"})),
         ("PUT", "/v1/orgs/{org}/libraries/{publisher}/{name}") => {
             Some(json!({"content_hash": "a".repeat(64)}))
         }

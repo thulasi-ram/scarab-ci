@@ -381,6 +381,7 @@ async fn re_provisioning_is_idempotent_and_config_stays_authoritative() {
 connections:
   - id: forgejo-main
     kind: forgejo
+    org: acme
     base_url: https://git2.example.com
     credential:
       env: FORGEJO_CI_TOKEN

@@ -117,22 +117,23 @@ async fn registration_and_resolution_round_trip() {
         .unwrap()
         .is_none());
 
-    // Re-binding re-homes the repo (upsert by coordinate) between two
-    // connections of one org.
-    db.bind_repo("codeberg-acme", &repo("acme", "api"), "acme", "api-moved")
+    // A repo does not move between two connections that both serve its org:
+    // the second bind is refused and the repo stays where it was.
+    let refused = db
+        .bind_repo("codeberg-acme", &repo("acme", "api"), "acme", "api-moved")
         .await
-        .unwrap();
-    let moved = db.resolve(&repo("acme", "api")).await.unwrap().unwrap();
-    assert_eq!(moved.connection.id, "codeberg-acme");
-    assert_eq!(moved.project, "api-moved");
+        .unwrap_err();
+    assert!(
+        matches!(refused, scarab_forge::RegistryError::BoundElsewhere { .. }),
+        "{refused:?}"
+    );
+    let kept = db.resolve(&repo("acme", "api")).await.unwrap().unwrap();
+    assert_eq!(kept.connection.id, "gh-acme");
+    assert_eq!(kept.project, "api");
 
     // Unbind is idempotent and removes resolution.
-    db.unbind_repo("codeberg-acme", &repo("acme", "api"))
-        .await
-        .unwrap();
-    db.unbind_repo("codeberg-acme", &repo("acme", "api"))
-        .await
-        .unwrap();
+    db.unbind_repo("gh-acme", &repo("acme", "api")).await.unwrap();
+    db.unbind_repo("gh-acme", &repo("acme", "api")).await.unwrap();
     assert!(db.resolve(&repo("acme", "api")).await.unwrap().is_none());
 
     // Deleting a connection cascades its bindings.
