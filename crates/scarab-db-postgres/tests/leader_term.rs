@@ -215,6 +215,107 @@ async fn scheduler_deposed_mid_admit_writes_nothing(db: Arc<dyn Db>) {
     );
 }
 
+/// A leader stopped INSIDE a fenced write (a SIGSTOP, a GC pause) must not
+/// hold the lease row until its connection dies: Postgres ends the stalled
+/// fence after the stall bound and a peer takes the lease over within
+/// TTL + bound. The stopped leader is modelled exactly: its fenced write is
+/// polled until the fence is held, then not polled at all — no keepalive, no
+/// progress, its connections open. Resumed, its fence is gone: the write
+/// reports NotLeader, and its old term is refused from then on.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_a_leader_stopped_inside_a_fenced_write_loses_the_lease() {
+    let Some(tdb) = fresh_db().await else { return };
+    let bound = Duration::from_millis(1_000);
+    let db = PostgresDb::with_pool(tdb.pool.clone()).with_fence_stall_bound(bound);
+    db.migrate().await.unwrap();
+    seed_ready(&db).await;
+    let a = term_of(&db, "a").await.unwrap();
+
+    let (held, fence_held) = tokio::sync::oneshot::channel::<()>();
+    let mut stopped = Box::pin(db.fenced_write(
+        &a,
+        Box::pin(async move {
+            let _ = held.send(());
+            std::future::pending::<Result<(), DbError>>().await
+        }),
+    ));
+    tokio::select! {
+        r = &mut stopped => panic!("the fenced write cannot finish: {r:?}"),
+        _ = fence_held => {}
+    }
+    // `stopped` is not polled from here on: the leader is stopped.
+
+    let t0 = std::time::Instant::now();
+    let deadline = Duration::from_millis(TTL_MS as u64) + bound + Duration::from_secs(4);
+    let b = loop {
+        if let Some(b) = term_of(&db, "b").await {
+            break b;
+        }
+        assert!(
+            t0.elapsed() < deadline,
+            "no peer took the lease over within TTL + stall bound: the stopped \
+             leader's fence still holds the lease row"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(b.term(), a.term() + 1);
+
+    // The leader resumes: its fence is gone.
+    let resumed = tokio::time::timeout(Duration::from_secs(10), stopped)
+        .await
+        .expect("the resumed fenced write ends");
+    assert!(matches!(resumed, Err(DbError::NotLeader)), "{resumed:?}");
+    assert!(matches!(
+        LeaderDb::new(&db, a).append_event(&note(4)).await,
+        Err(DbError::NotLeader)
+    ));
+    LeaderDb::new(&db, b).append_event(&note(5)).await.unwrap();
+    tdb.cleanup().await;
+}
+
+/// As many concurrent fenced writes as the main pool has connections, each
+/// holding its fence until all are held, complete: the fence connections come
+/// from their own pool, so a fence never waits for a connection another fence
+/// is holding. From one shared pool every connection would hold a fence and
+/// every write would wait for one more.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_pool_size_concurrent_fenced_writes_complete() {
+    let Some(tdb) = fresh_db().await else { return };
+    const POOL: u32 = 3;
+    let small = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(POOL)
+        .acquire_timeout(Duration::from_secs(60))
+        .connect_with((*tdb.pool.connect_options()).clone())
+        .await
+        .unwrap();
+    let db = Arc::new(PostgresDb::with_pool(small));
+    db.migrate().await.unwrap();
+    seed_ready(&*db).await;
+    let a = term_of(&*db, "a").await.unwrap();
+    let all_held = Arc::new(tokio::sync::Barrier::new(POOL as usize));
+    let mut writes = tokio::task::JoinSet::new();
+    for i in 0..POOL {
+        let (db, a, all_held) = (db.clone(), a.clone(), all_held.clone());
+        writes.spawn(async move {
+            let db2 = db.clone();
+            db.fenced_write(
+                &a,
+                Box::pin(async move {
+                    all_held.wait().await;
+                    db2.append_event(&note(10 + i as i64)).await
+                }),
+            )
+            .await
+        });
+    }
+    let done = tokio::time::timeout(Duration::from_secs(20), writes.join_all())
+        .await
+        .expect("pool-size concurrent fenced writes deadlocked");
+    assert!(done.iter().all(Result::is_ok), "{done:?}");
+    assert_eq!(db.events(&run_id()).await.unwrap().len(), POOL as usize);
+    tdb.cleanup().await;
+}
+
 async fn pg() -> Option<(Arc<PostgresDb>, common::TestDb)> {
     let tdb = fresh_db().await?;
     let db = PostgresDb::with_pool(tdb.pool.clone());

@@ -57,12 +57,48 @@ pub static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 /// deleted, not guarded.
 pub struct PostgresDb {
     pool: PgPool,
+    /// The connections a leader fence holds (git-bug aaf4e3e), apart from
+    /// `pool`. A fenced write holds one fence connection while its write takes
+    /// a connection from `pool`; from one shared pool, as many concurrent
+    /// fenced writes as the pool has connections would each hold one and wait
+    /// forever for a second. Lazily connected with `pool`'s options.
+    fence_pool: PgPool,
+    /// How long a fence transaction may go without hearing from its holder
+    /// before Postgres ends it (`idle_in_transaction_session_timeout`). See
+    /// [`FENCE_STALL_BOUND`].
+    fence_stall_bound: std::time::Duration,
 }
+
+/// How long a leader's fence may stall — the holder stopped (SIGSTOP, a GC
+/// pause, a VM suspend) or cut off — before Postgres terminates its fence
+/// transaction and releases the lease row (git-bug aaf4e3e). Well under the
+/// 30 s scheduler lease TTL, so a leader stopped inside a fenced write loses
+/// the lease when it expires, as a leader stopped anywhere else does. A live
+/// holder pings its fence every third of this, so a slow write keeps it.
+pub const FENCE_STALL_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Connections in the fence pool. Fenced writes are leader-only and the
+/// leader runs them one at a time; more callers than this wait for a fence
+/// connection while holding no other connection, so they cannot deadlock.
+const FENCE_POOL_SIZE: u32 = 4;
 
 impl PostgresDb {
     /// Construct from an existing connection pool.
     pub fn with_pool(pool: PgPool) -> Self {
-        Self { pool }
+        let fence_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(FENCE_POOL_SIZE)
+            .connect_lazy_with((*pool.connect_options()).clone());
+        Self {
+            pool,
+            fence_pool,
+            fence_stall_bound: FENCE_STALL_BOUND,
+        }
+    }
+
+    /// Override [`FENCE_STALL_BOUND`] (tests that stall a fence on purpose).
+    pub fn with_fence_stall_bound(mut self, bound: std::time::Duration) -> Self {
+        self.fence_stall_bound = bound;
+        self
     }
 
     /// Connect a pool to `url`.
@@ -161,7 +197,7 @@ impl Db for PostgresDb {
         // Leader-only (git-bug aaf4e3e): the fence and the claim commit
         // together, so a deposed leader claims nothing.
         let mut tx = self.pool().begin().await.map_err(db_err)?;
-        hold_leader_term(&mut tx, leader).await?;
+        hold_leader_term(&mut tx, leader, self.fence_stall_bound).await?;
         let rows = rows.fetch_all(&mut *tx).await.map_err(db_err)?;
         tx.commit().await.map_err(db_err)?;
 
@@ -936,7 +972,7 @@ impl Db for PostgresDb {
     ) -> Result<Option<RunId>, DbError> {
         // Serialize acquirers on this group with a row lock, so exactly one wins.
         let mut tx = self.pool().begin().await.map_err(db_err)?;
-        hold_leader_term(&mut tx, leader).await?;
+        hold_leader_term(&mut tx, leader, self.fence_stall_bound).await?;
         let holder: Option<String> =
             sqlx::query("SELECT holder FROM concurrency_slots WHERE group_key = $1 FOR UPDATE")
                 .bind(group)
@@ -1399,7 +1435,7 @@ impl Db for PostgresDb {
         inputs: &Value,
     ) -> Result<bool, DbError> {
         let mut tx = self.pool().begin().await.map_err(db_err)?;
-        hold_leader_term(&mut tx, leader).await?;
+        hold_leader_term(&mut tx, leader, self.fence_stall_bound).await?;
         let stored = sqlx::query(&format!(
             "UPDATE attempts SET gate_inputs = $4
              WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3
@@ -2148,7 +2184,7 @@ impl Db for PostgresDb {
         // cancel of this gate waits for the mint, or the mint sees its result.
         // An early return drops `tx`, which rolls it back.
         let mut tx = self.pool().begin().await.map_err(db_err)?;
-        hold_leader_term(&mut tx, leader).await?;
+        hold_leader_term(&mut tx, leader, self.fence_stall_bound).await?;
         if !lock_pending_step(&mut tx, run, step).await? {
             return Ok(None);
         }
@@ -2798,7 +2834,9 @@ impl Db for PostgresDb {
         // a takeover lands after the stale leader's write, never between its
         // check and its commit. It is bounded by `lock_timeout` so a peer's
         // tick never hangs behind a holder stopped mid-write; on the timeout
-        // the holder is reported unchanged and the peer tries next tick.
+        // the holder is reported unchanged and the peer tries next tick. A
+        // holder that stays stopped loses its fence after `fence_stall_bound`
+        // (see `hold_leader_term`), and the takeover then goes through.
         let mut tx = self.pool().begin().await.map_err(db_err)?;
         sqlx::query("SET LOCAL lock_timeout = '2s'")
             .execute(&mut *tx)
@@ -2858,17 +2896,48 @@ impl Db for PostgresDb {
         write: FencedWrite<'a>,
     ) -> Result<(), DbError> {
         // The fence transaction holds the lease row FOR SHARE while `write`
-        // runs on its own pooled connection and commits. A takeover's UPDATE
-        // of the row waits for this transaction (see `lease`), so the write
-        // either is refused here or commits before any takeover: the same
-        // ordering as running the check inside the write's own transaction,
-        // without threading a transaction through every shared Db method.
-        // A deadlock is not possible: the only statement that wants this row
-        // exclusively is `lease`, and it holds no other lock.
-        let mut tx = self.pool().begin().await.map_err(db_err)?;
-        hold_leader_term(&mut tx, leader).await?;
-        let written = write.await;
-        tx.commit().await.map_err(db_err)?;
+        // runs on its own connection from the main pool and commits. A
+        // takeover's UPDATE of the row waits for this transaction (see
+        // `lease`), so the write is refused here or commits before any
+        // takeover: the same ordering as checking inside the write's own
+        // transaction, without threading a transaction through every shared
+        // Db method. No deadlock: the only statement that wants this row
+        // exclusively is `lease`, which holds no other lock, and the fence
+        // connection comes from its own pool (see `fence_pool`).
+        //
+        // Bounded stall (git-bug aaf4e3e review): a holder stopped inside the
+        // write must not keep the row locked until its connection dies — that
+        // would stop every peer from taking the lease over, where a leader
+        // stopped anywhere else loses it after the TTL. Postgres ends the
+        // fence once it has been idle for `fence_stall_bound`; a live holder
+        // pings it every third of that while `write` runs. A fence that died
+        // under a live write (the ping or the commit fails) is NotLeader. What
+        // the bound cannot undo: a holder stopped in the middle of a
+        // multi-statement write transaction on the main pool resumes after
+        // the takeover with that transaction still open, and may commit it.
+        // Its row locks were held throughout, so a peer's writes to the same
+        // rows waited for it and re-check their CAS against its result.
+        let mut tx = self.fence_pool.begin().await.map_err(db_err)?;
+        hold_leader_term(&mut tx, leader, self.fence_stall_bound).await?;
+        let ping_every = self.fence_stall_bound / 3;
+        let keepalive = async {
+            loop {
+                tokio::time::sleep(ping_every).await;
+                if sqlx::query("SELECT 1").execute(&mut *tx).await.is_err() {
+                    return;
+                }
+            }
+        };
+        let written = tokio::select! {
+            biased;
+            written = write => written,
+            // The fence died under a live write: the write is dropped at its
+            // await point and the leg ends as deposed.
+            () = keepalive => return Err(DbError::NotLeader),
+        };
+        if tx.commit().await.is_err() {
+            return Err(DbError::NotLeader);
+        }
         written
     }
 }
@@ -2877,10 +2946,28 @@ impl Db for PostgresDb {
 /// inside `tx`, or refuse with [`DbError::NotLeader`] when the lease has
 /// another owner or a later term. Held until `tx` ends, so a takeover waits
 /// for everything `tx` writes.
+///
+/// `stall_bound` limits how long the lock can outlive its holder: Postgres
+/// ends `tx` once it sits idle that long (a holder stopped or cut off), which
+/// releases the row so a peer can take the lease over after its TTL, and
+/// rolls back whatever `tx` wrote. The same bound caps the wait for the share
+/// lock behind a takeover in progress; that wait ending is also NotLeader.
 async fn hold_leader_term(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     leader: &LeaderTerm,
+    stall_bound: std::time::Duration,
 ) -> Result<(), DbError> {
+    let bound_ms = stall_bound.as_millis().max(1);
+    sqlx::query(&format!(
+        "SET LOCAL idle_in_transaction_session_timeout = {bound_ms}"
+    ))
+    .execute(&mut **tx)
+    .await
+    .map_err(db_err)?;
+    sqlx::query(&format!("SET LOCAL lock_timeout = {bound_ms}"))
+        .execute(&mut **tx)
+        .await
+        .map_err(db_err)?;
     let held = sqlx::query(
         "SELECT 1 FROM leases WHERE resource = $1 AND owner = $2 AND term = $3 FOR SHARE",
     )
@@ -2888,11 +2975,15 @@ async fn hold_leader_term(
     .bind(leader.owner())
     .bind(leader.term())
     .fetch_optional(&mut **tx)
-    .await
-    .map_err(db_err)?;
+    .await;
     match held {
-        Some(_) => Ok(()),
-        None => Err(DbError::NotLeader),
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(DbError::NotLeader),
+        // lock_not_available: a takeover holds the row.
+        Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("55P03") => {
+            Err(DbError::NotLeader)
+        }
+        Err(e) => Err(db_err(e)),
     }
 }
 

@@ -1280,7 +1280,10 @@ pub trait Db: Send + Sync {
     /// has another owner or a later term. While `write` runs, a takeover of
     /// the lease waits for it, so a stale leader's write is refused or
     /// ordered before the takeover, never interleaved with the new leader's
-    /// writes; no clock is assumed.
+    /// writes; no clock is assumed for that ordering. A store bounds how long
+    /// a stalled holder (stopped, or cut off mid-write) can keep a takeover
+    /// waiting, so a leader stopped inside `write` still loses the lease
+    /// after its TTL; its fence then ends and the write reports NotLeader.
     ///
     /// For writes shared with non-leader callers. A Db method only the leader
     /// calls takes the [`LeaderTerm`] itself and fences in its own
