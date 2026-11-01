@@ -20,8 +20,8 @@ import { A, useNavigate, useParams } from "@solidjs/router";
 import {
   deleteOrgEnvironment,
   deletePrivilegeGrant,
+  getOrgEnvironment,
   listEnvironmentProjects,
-  listOrgEnvironments,
   putEnvironmentEligibility,
   putEnvironmentProtection,
   putOrgEnvironment,
@@ -41,13 +41,12 @@ import {
   environmentEditHref,
   environmentHref,
   environmentsHref,
-  nameFromParam,
   planSave,
   toEditForm,
   type EnvironmentWrite,
 } from "../org-environments";
 import { addToList } from "../identities";
-import { orgFromParam } from "../settings-nav";
+import { decodeParam } from "../settings-nav";
 import { SettingsCrumbs, SettingsFrame, type Crumb } from "./Settings";
 import { absTime, relTime } from "../fmt";
 import PrincipalSearch from "../components/PrincipalSearch";
@@ -60,8 +59,8 @@ import Icon from "../components/Icon";
  */
 function EnvironmentFrame(props: { children: (org: string, name: string) => JSX.Element }) {
   const params = useParams<{ org: string; env: string }>();
-  const org = () => orgFromParam(params.org);
-  const name = () => nameFromParam(params.env);
+  const org = () => decodeParam(params.org);
+  const name = () => decodeParam(params.env);
   const key = createMemo(() => JSON.stringify([org(), name()]));
   return (
     <SettingsFrame kind="org" org={org()} section="environments">
@@ -74,13 +73,11 @@ function EnvironmentFrame(props: { children: (org: string, name: string) => JSX.
   );
 }
 
-/** The Environment by name, from the org's list (there is no single read).
- *  `undefined` while loading; `null` when there is none of that name. */
+/** The Environment by name (`GET …/environments/{env}`). `undefined` while
+ *  loading; `null` when there is none of that name. */
 function useEnvironment(org: string, name: string) {
-  const [envs, { refetch }] = createResource(
-    async () => (await listOrgEnvironments(org))?.find((e) => e.name === name) ?? null,
-  );
-  return [envs, refetch] as const;
+  const [env, { refetch }] = createResource(() => getOrgEnvironment(org, name));
+  return [env, refetch] as const;
 }
 
 /** The trail both pages share, at the top of the settings main column. */
@@ -116,7 +113,7 @@ function Guard(props: {
   children: (env: OrgEnvironment) => JSX.Element;
 }) {
   return (
-    <Show when={!props.error} fallback={<p class="error">Could not load the org's environments.</p>}>
+    <Show when={!props.error} fallback={<p class="error">Could not load this environment.</p>}>
       <Show when={!props.loading || props.env} fallback={<p class="empty">loading…</p>}>
         {/* Keyed: another Environment (or a reload) renders afresh, so
             the edit form starts from what is stored. */}

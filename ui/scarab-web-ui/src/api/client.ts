@@ -607,6 +607,23 @@ export async function listOrgEnvironments(org: string): Promise<OrgEnvironment[]
 }
 
 /**
+ * One Environment (`GET /v1/orgs/{org}/environments/{env}`). `null` when the
+ * org has no Environment of that name, or the server has no org-Environment
+ * store (both are a 404).
+ */
+export async function getOrgEnvironment(org: string, env: string): Promise<OrgEnvironment | null> {
+  const { data, error, response } = await api.GET("/v1/orgs/{org}/environments/{env}", {
+    params: { path: { org, env } },
+  });
+  if (response.status === 404) return null;
+  if (response.status === 403) throw new OrgEnvironmentsForbiddenError(org);
+  if (error || !data) {
+    throw new Error(errorText(error) || `failed to load ${env} (${response.status})`);
+  }
+  return data;
+}
+
+/**
  * Create or replace an Environment (`PUT /v1/orgs/{org}/environments/{env}`),
  * org admins only. A full replace: send every field. The server's 400 is
  * passed through verbatim — it is the answer to "why will this not save".

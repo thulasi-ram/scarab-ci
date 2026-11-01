@@ -1,14 +1,13 @@
 import { describe, it, expect } from "vitest";
+import { decodeParam } from "./settings-nav";
 import {
   confirmsName,
   environmentEditHref,
   environmentHref,
   environmentsHref,
   nameError,
-  nameFromParam,
   planSave,
   toEditForm,
-  toForm,
   toPutBody,
   type EditableEnvironmentLike,
 } from "./org-environments";
@@ -18,17 +17,6 @@ describe("toPutBody", () => {
     expect(toPutBody({ description: "  the one prod " })).toEqual({
       body: { description: "the one prod" },
     });
-  });
-});
-
-describe("toForm", () => {
-  it("round-trips a stored Environment through the form unchanged", () => {
-    const stored = { name: "prod", description: "the one prod" };
-    expect(toPutBody(toForm(stored)).body).toEqual({ description: stored.description });
-  });
-
-  it("starts a new Environment blank", () => {
-    expect(toForm()).toEqual({ description: "" });
   });
 });
 
@@ -57,10 +45,10 @@ describe("environment pages", () => {
   it("read back the exact name from the route param", () => {
     for (const n of ["prod", "prod/eu west", "100%", "Prod-EU", "edit"]) {
       const seg = environmentHref("acme", n).split("/").pop()!;
-      expect(nameFromParam(seg)).toBe(n);
+      expect(decodeParam(seg)).toBe(n);
     }
     // A malformed escape is taken as typed rather than throwing.
-    expect(nameFromParam("bad%zz")).toBe("bad%zz");
+    expect(decodeParam("bad%zz")).toBe("bad%zz");
   });
 });
 
@@ -97,6 +85,20 @@ describe("planSave", () => {
     form.baseline.approvers = "a.kim,j.lee , ";
     form.patterns = " payments ,team-a-*";
     expect(planSave(stored, form)).toEqual({ writes: [] });
+  });
+
+  it("sends nothing when the stored description has edge spaces and the form is untouched", () => {
+    const spaced = { ...stored, description: "  the one prod \n" };
+    expect(planSave(spaced, toEditForm(spaced))).toEqual({ writes: [] });
+  });
+
+  it("sends the trimmed description when it changed beyond its edge spaces", () => {
+    const spaced = { ...stored, description: "  the one prod " };
+    const form = toEditForm(spaced);
+    form.description = "the other prod";
+    expect(planSave(spaced, form).writes).toEqual([
+      { part: "description", body: { description: "the other prod" } },
+    ]);
   });
 
   it("sends only the part that changed", () => {

@@ -50,11 +50,6 @@ export function nameError(name: string): string | null {
   return null;
 }
 
-/** The form for an existing Environment (or a fresh one). */
-export function toForm(env?: OrgEnvironmentLike): OrgEnvironmentForm {
-  return { description: env?.description ?? "" };
-}
-
 /** The PUT body for `form`. The description is trimmed. */
 export function toPutBody(form: OrgEnvironmentForm): { body: OrgEnvironmentBody } {
   return { body: { description: form.description.trim() } };
@@ -79,16 +74,6 @@ export const environmentHref = (org: string, name: string) =>
 
 /** The edit page of one Environment. */
 export const environmentEditHref = (org: string, name: string) => `${environmentHref(org, name)}/edit`;
-
-/** The Environment name in a route param. The router hands over the raw,
- *  still-encoded path segment; a malformed escape is taken as typed. */
-export function nameFromParam(raw: string): string {
-  try {
-    return decodeURIComponent(raw);
-  } catch {
-    return raw;
-  }
-}
 
 /** A destructive action goes ahead only when the exact name is typed — case
  *  and spaces included, as everywhere else the name is used. */
@@ -147,7 +132,9 @@ export function planSave(
 
   const writes: EnvironmentWrite[] = [];
   const description = toPutBody({ description: form.description }).body;
-  if (description.description !== env.description) {
+  // The stored value is compared trimmed too: one stored with edge spaces
+  // (set through the API) is not a change the form made.
+  if (description.description !== env.description.trim()) {
     writes.push({ part: "description", body: description });
   }
   const p = protection.body;
