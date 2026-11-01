@@ -119,9 +119,9 @@ record. Read Upgrading before you upgrade.
   (git-bug 068cc0b); when a replica dies, a peer takes over its Steps within 30 s. The
   scheduler lease has a term that every takeover increments. A leader write that has no
   compare-and-set of its own checks the term inside its own transaction, bounded at 5 s, so a
-  leader that lost its lease cannot commit one after a peer took over (git-bug aaf4e3e). Tested against Postgres, and on a local kind cluster the
-  fault tier's `two-replicas`, `kill-server` and `stop-leader` scenarios passed
-  (`just test chaos all 1`, 2026-11-01).
+  leader that lost its lease cannot commit one after a peer took over (git-bug aaf4e3e). Tested against Postgres, and on a local kind
+  cluster the fault tier's `two-replicas`, `kill-server` and `stop-leader` scenarios passed
+  (`just test chaos all 3`, 2026-11-01).
   [ADR-0077 amendment](https://thulasi-ram.github.io/scarab-ci/tech/adr/0077-end-to-end-fault-and-agent-driven-testing/#amendment-2026-11-01-grill)
 - **Caches at more than one Depot replica.** Each Cache key has one home Depot replica, chosen
   by rendezvous hashing over the StatefulSet's ordinals, and a Step saves and restores the
@@ -188,8 +188,8 @@ record. Read Upgrading before you upgrade.
   `just release <version>` checks a release before it is tagged.
 - The fault tier (`just test chaos`, ADR-0077) runs ranks 1, 2 and 4: a Depot Pod deleted
   mid-drain and mid-feed, two server replicas sharing the work, a server replica killed while
-  it drains, and the scheduler leader paused past its lease. The five ranked scenarios passed
-  on 2026-11-01 (`just test chaos all 1`). `pause-node`, last in `all`, freezes the kind node
+  it drains, and the scheduler leader paused past its lease. All six scenarios passed on
+  2026-11-01 (`just test chaos all 3`). `pause-node`, last in `all`, freezes the kind node
   mid-drain for longer than the lease TTL and shorter than the Pod's grace period; every Run
   must still succeed. C1 checks that a Cache restores from its home replica when no fault
   hit that replica.
