@@ -522,6 +522,8 @@ pub async fn stop_leader(
                 "leader"
             }
             LeaseOutcome::NoTakeover => {
+                // A finding (L2): even a stop inside a fenced write releases
+                // the lease row after the fence's stall bound.
                 log("the lease stopped being renewed but no peer took it over");
                 "leader-no-takeover"
             }

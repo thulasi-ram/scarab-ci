@@ -21,6 +21,7 @@
 //! | I8   | after quiesce no Pod of a scenario Run is still pending or running, and no per-Pod Secret outlives its Pod |
 //! | I10  | no `committed = FALSE` pack row older than the linger for a fence whose drain has a record; every committed pack's object exists at its recorded size |
 //! | L1   | rank 4: a takeover of the scheduler lease increments `leases.term`, and the term never goes back (only where the column exists) |
+//! | L2   | rank 4: a peer takes the stopped leader's lease over within the TTL + 30 s, wherever the stop landed (inside a fenced write too: the fence's stall bound releases the lease row) |
 //! | W1   | the workload's own outcome: every scenario Run that ended, ended `succeeded`, and every green Attempt has an output snapshot |
 //!
 //! W1 is not one of ADR-0077 §2's invariants. As written there, I3 accepts a
@@ -326,8 +327,9 @@ fn i1b_overrun(life: &PodLife, end: Option<i64>, start_b: i64, last_record_ms: i
 /// have fired with its trigger condition still holding and landed inside the
 /// window it names. A server signal must also have taken effect and hit the
 /// replica the scenario names: rank 2 the producer's claim holder, rank 4
-/// the leader, stopped until a peer took the lease and past its TTL, then
-/// resumed. `two-replicas` fires nothing.
+/// the leader, stopped past its TTL, then resumed. A leader whose lease no
+/// peer took over was exercised: that is a liveness finding (L2), not a
+/// missed window. `two-replicas` fires nothing.
 pub fn exercised(kind: Kind, faults: &[Fault]) -> Vec<String> {
     if !kind.has_fault() {
         return faults
@@ -376,9 +378,15 @@ pub fn exercised(kind: Kind, faults: &[Fault]) -> Vec<String> {
                 x.target_basis.as_deref().unwrap_or("?")
             )),
             Kind::StopLeader => {
-                if role != "leader" {
-                    why.push(format!("{} {}: {role} (no peer took the lease over while it was stopped, \
-                                      or it did not stay stopped until its resume)", x.action, x.pod));
+                // `leader-no-takeover` is exercised and judged by L2. Before
+                // the fence's stall bound (git-bug aaf4e3e) a stop that landed
+                // inside a fenced write held the lease row until the resume,
+                // and this was the escape for it; now it is a finding.
+                if role != "leader" && role != "leader-no-takeover" {
+                    why.push(format!(
+                        "{} {}: {role} (it was not the leader, or it did not stay stopped until its resume)",
+                        x.action, x.pod
+                    ));
                 }
                 match x.resumed_at_ms {
                     None => why.push(format!("{} {}: never resumed", x.action, x.pod)),
@@ -854,6 +862,34 @@ pub fn evaluate(f: &Facts) -> Verdict {
     }
     if f.faults.iter().any(|x| x.lease.is_some()) {
         checked.insert("L1".into(), l1);
+    }
+
+    // L2: the stopped leader lost its lease. The harness waits the TTL + 30 s
+    // for a takeover; the scheduler lease expires 30 s after the last renewal
+    // and a fence the stopped leader held ends after its 10 s stall bound.
+    let mut l2 = 0;
+    for x in &f.faults {
+        match x.victim_role.as_deref() {
+            Some("leader") => l2 += 1,
+            Some("leader-no-takeover") => {
+                l2 += 1;
+                findings.push(fail(
+                    "L2",
+                    format!(
+                        "{} {}: the scheduler lease was neither renewed nor taken over within the {} s TTL + 30 s \
+                         while its leader was stopped (a fence held by the stopped leader should end after its \
+                         stall bound)",
+                        x.action,
+                        x.pod,
+                        crate::scenario::LEASE_TTL_SECS
+                    ),
+                ));
+            }
+            _ => {}
+        }
+    }
+    if f.kind == Some(Kind::StopLeader) {
+        checked.insert("L2".into(), l2);
     }
 
     let inconclusive = match f.kind {

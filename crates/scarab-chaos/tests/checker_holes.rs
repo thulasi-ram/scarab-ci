@@ -406,13 +406,12 @@ fn a_takeover_without_a_term_bump_fails_l1() {
     assert!(evaluate(&f).findings.iter().any(|x| x.invariant == "L1" && x.detail.contains("went back")));
 }
 
-/// Stopped for less than the TTL, never taken over, or restarted by the
-/// kubelet before the SIGCONT: the stale-leader case was not tested.
+/// Stopped for less than the TTL, or restarted by the kubelet before the
+/// SIGCONT: the stale-leader case was not tested.
 #[test]
 fn a_stop_that_did_not_outlast_the_lease_is_inconclusive() {
     for (role, ms, want) in [
         ("leader", 30_000, "not past the 30 s lease TTL"),
-        ("leader-no-takeover", 50_000, "leader-no-takeover"),
         ("restarted-while-stopped", 40_000, "restarted-while-stopped"),
     ] {
         let mut f = clean();
@@ -422,6 +421,22 @@ fn a_stop_that_did_not_outlast_the_lease_is_inconclusive() {
         assert_eq!(v.outcome, Outcome::Inconclusive, "{role}");
         assert!(v.inconclusive.iter().any(|w| w.contains(want)), "{role}: {:?}", v.inconclusive);
     }
+}
+
+/// A stopped leader whose lease no peer took over is a liveness finding, not
+/// an inconclusive run: wherever the stop landed, inside a fenced write too,
+/// the lease must move within the TTL + 30 s.
+#[test]
+fn a_stopped_leader_never_taken_over_fails_l2() {
+    let mut f = clean();
+    f.kind = Some(Kind::StopLeader);
+    f.faults = vec![stop("leader-no-takeover", 61_000, (Some(1), None, Some(1)))];
+    let v = evaluate(&f);
+    assert_eq!(v.outcome, Outcome::Fail, "{:?}", v.inconclusive);
+    assert!(v.findings.iter().any(|x| x.invariant == "L2"), "{:?}", v.findings);
+    f.faults = vec![stop("leader", 31_000, (Some(1), Some(2), Some(2)))];
+    let v = evaluate(&f);
+    assert_eq!((v.outcome, v.checked["L2"]), (Outcome::Pass, 1));
 }
 
 /// `two-replicas` has no fault; it counts only when both replicas drove
