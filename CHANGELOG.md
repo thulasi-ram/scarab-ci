@@ -117,8 +117,9 @@ record. Read Upgrading before you upgrade.
   split roles. A replica renews its claim on a Step's launch every 10 s while it works on it,
   and a replica stops driving a launch within one renewal period after it loses its claim
   (git-bug 068cc0b); when a replica dies, a peer takes over its Steps within 30 s. The
-  scheduler lease has a term that every takeover increments, and the leader's writes are
-  fenced on it (git-bug aaf4e3e). Tested against Postgres, and on a local kind cluster the
+  scheduler lease has a term that every takeover increments. A leader write that has no
+  compare-and-set of its own checks the term inside its own transaction, bounded at 5 s, so a
+  leader that lost its lease cannot commit one after a peer took over (git-bug aaf4e3e). Tested against Postgres, and on a local kind cluster the
   fault tier's `two-replicas`, `kill-server` and `stop-leader` scenarios passed
   (`just test chaos all 1`, 2026-11-01).
   [ADR-0077 amendment](https://thulasi-ram.github.io/scarab-ci/tech/adr/0077-end-to-end-fault-and-agent-driven-testing/#amendment-2026-11-01-grill)
