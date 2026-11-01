@@ -331,25 +331,32 @@ canary_ns=scarab-netpol-canary
 canary_image=busybox:1.36
 pull_image "$canary_image"
 load_image "$canary_image"
-# probe NAME: run a Pod that tries the API server's Service three times and
-# print REACHED or UNREACHED.
+# probe NAME WANT: run a Pod that tries the API server's Service once a second
+# for up to 30 s and stops at the first result equal to WANT (REACHED or
+# UNREACHED); it prints the last result. Repeating, because kindnet programs a
+# new Pod's policy a moment after the Pod starts: a first connection can get
+# through before it (the plugin runtime's self-check repeats for the same
+# reason, scarab-plugin-k8s probe.rs `until_isolated`).
 probe() {
   kc run "$1" -n "$canary_ns" --image="$canary_image" --image-pull-policy=IfNotPresent \
-    --restart=Never --quiet --command -- sh -c '
-      for i in 1 2 3; do
-        if nc -z -w 3 "$KUBERNETES_SERVICE_HOST" "$KUBERNETES_SERVICE_PORT"; then
-          echo REACHED; exit 0
+    --restart=Never --quiet --env="WANT=$2" --command -- sh -c '
+      i=0
+      while :; do
+        if nc -z -w 2 "$KUBERNETES_SERVICE_HOST" "$KUBERNETES_SERVICE_PORT"; then
+          got=REACHED
+        else
+          got=UNREACHED
         fi
-        sleep 1
-      done
-      echo UNREACHED' >/dev/null
-  kc wait -n "$canary_ns" --for=jsonpath='{.status.phase}'=Succeeded "pod/$1" --timeout=90s >/dev/null \
-    || die "the NetworkPolicy canary Pod $1 did not finish in 90 s (kubectl -n $canary_ns describe pod $1)"
+        if [ "$got" = "$WANT" ] || [ $i -ge 30 ]; then echo "$got"; exit 0; fi
+        i=$((i+1)); sleep 1
+      done' >/dev/null
+  kc wait -n "$canary_ns" --for=jsonpath='{.status.phase}'=Succeeded "pod/$1" --timeout=150s >/dev/null \
+    || die "the NetworkPolicy canary Pod $1 did not finish in 150 s (kubectl -n $canary_ns describe pod $1)"
   kc logs -n "$canary_ns" "$1" | tail -1
 }
 kc delete namespace "$canary_ns" --ignore-not-found --wait=true >/dev/null
 kc create namespace "$canary_ns" >/dev/null
-open_result="$(probe open)"
+open_result="$(probe open REACHED)"
 [ "$open_result" = REACHED ] \
   || die "the NetworkPolicy canary cannot reach the API server even with no policy ($open_result); the probe itself is broken"
 kc apply -n "$canary_ns" -f - >/dev/null <<'YAML'
@@ -361,10 +368,10 @@ spec:
   podSelector: {}
   policyTypes: [Egress]
 YAML
-denied_result="$(probe denied)"
+denied_result="$(probe denied UNREACHED)"
 kc delete namespace "$canary_ns" --wait=false >/dev/null
 [ "$denied_result" = UNREACHED ] || die "kind cluster '$cluster' does not enforce NetworkPolicy:
-  a Pod whose namespace denies all egress reached the API server (git-bug ba32d49).
+  a Pod whose namespace denies all egress still reached the API server after 30 s (git-bug ba32d49).
   Plugins will refuse to start, and NetworkPolicy tests will fail.
   Recreate the cluster: 'just stack down', then 'just stack up'
   (this deletes the in-cluster Postgres and MinIO data of every mode)."
