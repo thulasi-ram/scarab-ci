@@ -472,8 +472,7 @@ async fn a_bind_refuses_a_repo_the_connections_org_does_not_own() {
 
 /// Re-sync binds what the credential reaches, but only the connection's own
 /// Org's repos, and never moves a repo bound through another Org's
-/// connection — even on an unassigned connection, where no owner filter
-/// applies and the registry's own guard is all that stands.
+/// connection. An unassigned connection binds nothing on a re-sync.
 #[tokio::test]
 async fn resync_never_binds_or_moves_another_orgs_repo() {
     let h = harness(forge()).await;
@@ -491,9 +490,8 @@ async fn resync_never_binds_or_moves_another_orgs_repo() {
     skipped.sort();
     assert_eq!(skipped, vec!["globex/other", "globex/site"]);
 
-    // The unassigned installation cannot name its account here (the fake
-    // forge cannot), so it stays unassigned and binds by owner — but the
-    // repos already bound in acme and globex stay where they are.
+    // The unassigned installation binds nothing, and the repos already
+    // bound in acme and globex stay where they are.
     let (st, b) = call(&h, "POST", "/v1/connections/gh-legacy/resync", &root, None).await;
     assert_eq!(st, StatusCode::OK, "{b}");
     for (r, holder) in [
