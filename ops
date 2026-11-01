@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1793556600,"nonce":"MI1wzTRUE7cVDhDRqZP32S6eS9k=","message":"Fixed on main via PR #79: claiming a Step, its Attempt, AttemptStarted and launch intent commit in one fenced transaction; regression test in leader_term.rs (A deposed after its claim, B finishes the Run).","files":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":4,"timestamp":1793556600,"nonce":"lFbmo9iJtx4K6Ycpq7Cz3Coe6QE=","status":2}]}
