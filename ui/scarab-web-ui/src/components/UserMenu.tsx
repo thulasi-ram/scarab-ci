@@ -1,4 +1,4 @@
-// The signed-in identity (ADR-0049): an avatar showing initials, opening a
+// The signed-in identity: an avatar showing initials, opening a
 // dropdown with the principal's name, subject, and role, plus sign-out. Driven
 // by the real `GET /v1/me` — no more hardcoded placeholder.
 import { createSignal, onCleanup, onMount, Show } from "solid-js";

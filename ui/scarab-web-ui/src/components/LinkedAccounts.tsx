@@ -1,4 +1,4 @@
-// Your sign-in accounts (ADR-0069): the accounts linked to you, and the way
+// Your sign-in accounts: the accounts linked to you, and the way
 // to link another or unlink one. The Profile section of Your account.
 //
 // Open to everyone signed in. Linking is a full browser round-trip to the

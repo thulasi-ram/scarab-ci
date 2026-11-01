@@ -1,4 +1,4 @@
-// Install or upgrade a library (ADR-0076 §4) — a page of its own, so a
+// Install or upgrade a library — a page of its own, so a
 // second reviewer can be sent its URL. The source is fetched (the server
 // reads it at its commit, checks it compiles as a closed library and stores
 // it); the page shows the file, or the side-by-side diff from the installed

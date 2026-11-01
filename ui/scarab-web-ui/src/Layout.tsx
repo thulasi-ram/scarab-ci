@@ -17,7 +17,7 @@ import glyphInk from "./assets/brand/scarab-halftone-ink.svg";
 import glyphCream from "./assets/brand/scarab-halftone.svg";
 
 export default function Layout(props: ParentProps) {
-  // Step-up posture for callers who administer an Org (ADR-0073): a crown
+  // Step-up posture for callers who administer an Org: a crown
   // jewel is refused for every admin with no passkey, so say so app-wide
   // until it is fixed. Nobody else is asked for the summary at all.
   const [security] = createResource(() => me()?.admin_orgs[0], getOrgSecuritySummary);
@@ -69,7 +69,7 @@ export default function Layout(props: ParentProps) {
         </div>
       </Show>
       <CommandPalette />
-      {/* The one step-up dialog (ADR-0073): the API client opens it whenever
+      {/* The one step-up dialog: the API client opens it whenever
           a request is refused with `step_up_required`. */}
       <StepUpDialog />
       {props.children}

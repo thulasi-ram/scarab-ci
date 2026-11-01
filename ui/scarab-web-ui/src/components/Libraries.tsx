@@ -1,4 +1,4 @@
-// Libraries (ADR-0076 §4-§6) — the Settings section where an org admin
+// Libraries — the Settings section where an org admin
 // installs a library from a git source, upgrades it after reading the diff,
 // removes it, and yanks a version.
 //

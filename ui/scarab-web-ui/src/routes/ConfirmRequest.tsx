@@ -1,4 +1,4 @@
-// Confirm a StepUpConfirmationRequest (ADR-0073 §6) — the page a
+// Confirm a StepUpConfirmationRequest — the page a
 // `confirmation_url` opens.
 //
 // An API token or a CLI session can never confirm a crown jewel itself; it is

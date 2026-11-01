@@ -1,4 +1,4 @@
-// The signed-in principal, fetched once for the whole app (ADR-0049).
+// The signed-in principal, fetched once for the whole app.
 //
 // Several bits of chrome need it — the avatar, the Settings nav entry, the
 // command palette — and they must agree. A module-level resource makes it one

@@ -1,4 +1,4 @@
-// App = the client-side router (ADR-0028). Repo-first, deep-linkable tiers:
+// App = the client-side router. Repo-first, deep-linkable tiers:
 // repos → repo → run. Each is a real URL, shareable and refreshable.
 import { Show } from "solid-js";
 import { Router, Route } from "@solidjs/router";
@@ -15,7 +15,7 @@ import ConfirmRequest from "./routes/ConfirmRequest";
 
 export default function App() {
   // The sign-in gate sits ABOVE the Router, not inside its root, and that
-  // placement is the whole point (ADR-0049).
+  // placement is the whole point.
   //
   // Gating inside `root={Layout}` looks equivalent and is not: flipping it
   // unmounts the router's OUTLET while the route context around it is still
@@ -34,7 +34,7 @@ export default function App() {
       <Route path="/settings" component={LegacySettings} />
       <Route path="/settings/:section" component={AccountSettings} />
       <Route path="/orgs/:org/settings/:section?" component={OrgSettings} />
-      {/* Install or upgrade a library (ADR-0076 §4): its own page, so the
+      {/* Install or upgrade a library: its own page, so the
           review can be sent to a second reviewer. */}
       <Route path="/orgs/:org/settings/libraries/review" component={LibraryReview} />
       {/* Old addresses: the server still sends people to /account?… and
@@ -42,11 +42,11 @@ export default function App() {
       <Route path="/settings/libraries/review" component={LegacySettings} />
       <Route path="/account" component={LegacySettings} />
       <Route path="/account/security" component={LegacySettings} />
-      {/* A machine's StepUpConfirmationRequest (ADR-0073 §6): the
+      {/* A machine's StepUpConfirmationRequest: the
           `confirmation_url` its human opens. Three segments, so it can't
           collide with the two-segment /:org/:repo tier. */}
       <Route path="/security/confirm/:id" component={ConfirmRequest} />
-      {/* What is live where (ADR-0070), org-scoped; `?env=` picks the
+      {/* What is live where, org-scoped; `?env=` picks the
           Environment. One segment, like /settings. */}
       <Route path="/:org/:repo/run" component={RunPipeline} />
       <Route path="/:org/:repo/runs/:id" component={RunDetail} />

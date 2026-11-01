@@ -1,4 +1,4 @@
-// The one step-up dialog (ADR-0073), mounted once in Layout and opened by the
+// The one step-up dialog, mounted once in Layout and opened by the
 // API client whenever a request is refused with `403 step_up_required`.
 //
 // It shows the server's own summary of what is being confirmed (operation,
