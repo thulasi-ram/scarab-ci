@@ -1691,13 +1691,26 @@ fn mode_from_u8(raw: u8) -> BlobAuthzMode {
 }
 
 /// A fallback closure walk's shared future (per-token singleflight): `Ok` is
-/// the COMPLETE sorted blob closure of the token's roots claim; `Err` is a
-/// walk that could not complete — which is the caller's 500, never a 403
-/// (amendment F3). `String` rather than [`WsError`] because
+/// the COMPLETE sorted blob closure of the roots it names (every required
+/// root, plus the cache roots this replica could walk); `Err` is a walk that
+/// could not complete a REQUIRED root — which is the caller's 500, never a
+/// 403 (amendment F3). `String` rather than [`WsError`] because
 /// [`futures::future::Shared`] requires `Clone`.
 type BlobWalkShared = futures::future::Shared<
-    futures::future::BoxFuture<'static, Result<Arc<Vec<[u8; 32]>>, String>>,
+    futures::future::BoxFuture<'static, Result<Arc<BlobClosure>, String>>,
 >;
+
+/// What one fallback walk proved.
+#[derive(Debug, PartialEq, Eq)]
+struct BlobClosure {
+    /// Sorted, deduped: the blobs reachable from `roots`.
+    blobs: Vec<[u8; 32]>,
+    /// The claimed roots this closure is complete for — every required root,
+    /// and only the cache roots that walked (git-bug 2a79b73). A cache root
+    /// left out here is left out of the grant's completeness too, so the
+    /// allowlist never answers "denied, complete" for a root it never saw.
+    roots: Vec<String>,
+}
 
 /// One token's cached authorization: which blobs its roots reach, and how
 /// much of the claim that answer covers.
@@ -1741,9 +1754,11 @@ enum BlobAllowVerdict {
 /// presented token string (binding the exact claims+exp+signature that were
 /// verified), value = the blob closure of that token's `roots` claim.
 ///
-/// Replica-local by design: fence affinity is already a correctness
-/// requirement (ADR-0066), and an entry lost to a restart or eviction only
-/// costs the next read a rebuild walk.
+/// Replica-local by design: every input it is built from (the token's claims,
+/// trees from warm or the pack index) is readable on any replica, so an entry
+/// lost to a restart, an eviction or a request landing on another replica
+/// only costs that read a rebuild walk. No affinity is needed for
+/// correctness (drains are scatter-safe since git-bug afb13c2).
 struct BlobAllowlist {
     /// The [`BlobAuthzMode`] in force (see [`mode_to_u8`]).
     mode: AtomicU8,
@@ -1935,7 +1950,8 @@ static BLOB_WALK_GATE: Mutex<
 /// The blob closure of `roots` — the fallback walk.
 ///
 /// **SECURITY-LOAD-BEARING (ticket 52ef3aa amendment F1, the keystone):**
-/// `roots` comes EXCLUSIVELY from the token's `roots` claim. The write
+/// `roots` comes EXCLUSIVELY from the token's `roots` claim (and
+/// `cache_roots`, see [`walk_token_closure`]). The write
 /// ledger (`depot_fence_writes`) is NEVER an input to blob authorization —
 /// [`authorize_tree`]'s Single arm (the ledger consult) is the anti-pattern
 /// here, because `put_tree` ledgers a parent without verifying its children
@@ -1996,6 +2012,46 @@ async fn walk_blob_closure(
     Ok(blobs)
 }
 
+/// The whole token's closure (git-bug 2a79b73): the required `roots` must
+/// walk (an `Err` is the caller's 500, exactly as before), then each
+/// `cache_roots` member is walked on its own and is LEFT OUT when it cannot
+/// be — a Cache is warm-only and lives on one replica, so a replica that does
+/// not hold it would otherwise fail every required read of a Step that merely
+/// declared a cache. Leaving it out only narrows the grant: that root's blobs
+/// are not allowed here, and the entry never claims completeness for it.
+///
+/// Each cache root is walked with its own visited set: a failed cache walk
+/// must not mark trees seen that a later cache root still needs.
+async fn walk_token_closure(
+    state: &WorkspaceState,
+    roots: Vec<String>,
+    cache_roots: Vec<String>,
+) -> Result<BlobClosure, String> {
+    let mut blobs = walk_blob_closure(state, &roots).await?;
+    let mut granted = roots;
+    for cache_root in cache_roots {
+        match walk_blob_closure(state, std::slice::from_ref(&cache_root)).await {
+            Ok(more) => {
+                blobs.extend(more);
+                granted.push(cache_root);
+            }
+            Err(e) => tracing::info!(
+                cache_root = %cache_root,
+                error = %e,
+                "blob authz: a cache root is not walkable on this replica — left out of \
+                 the grant (a cache restore here is a miss; required inputs are \
+                 unaffected, git-bug 2a79b73)"
+            ),
+        }
+    }
+    blobs.sort_unstable();
+    blobs.dedup();
+    Ok(BlobClosure {
+        blobs,
+        roots: granted,
+    })
+}
+
 /// The walk, singleflighted per token: concurrent misses on one credential
 /// share one walk; a second walk for the same token starts only after the
 /// first finished (and, if cacheable, already granted).
@@ -2003,7 +2059,7 @@ async fn singleflight_walk(
     state: &WorkspaceState,
     key: [u8; 32],
     claims: &WorkspaceClaims,
-) -> Result<Arc<Vec<[u8; 32]>>, String> {
+) -> Result<Arc<BlobClosure>, String> {
     use futures::FutureExt;
 
     let (walk_id, shared) = {
@@ -2018,6 +2074,7 @@ async fn singleflight_walk(
             let id = state.blob_allow.next_walk_id.fetch_add(1, Ordering::Relaxed);
             let owned_state = state.clone();
             let roots = claims.roots.clone();
+            let cache_roots = claims.cache_roots.clone();
             #[cfg_attr(not(test), allow(unused_variables))]
             let gate_key = claims.fence.run.clone();
             let fut = async move {
@@ -2044,7 +2101,7 @@ async fn singleflight_walk(
                     .blob_allow
                     .walks
                     .fetch_add(1, Ordering::Relaxed);
-                walk_blob_closure(&owned_state, &roots)
+                walk_token_closure(&owned_state, roots, cache_roots)
                     .await
                     .map(Arc::new)
             }
@@ -2108,9 +2165,12 @@ async fn authorize_blob(
         )));
     };
 
+    // Completeness is judged over EVERY claimed root, cache roots included:
+    // an entry that has not seen a cache root cannot deny a blob under it.
+    let claimed: Vec<String> = claims.claimed_roots().map(String::from).collect();
     match state
         .blob_allow
-        .lookup(&key, &blob, &claims.roots, now_secs())
+        .lookup(&key, &blob, &claimed, now_secs())
     {
         BlobAllowVerdict::Allowed => return Ok(()),
         BlobAllowVerdict::DeniedComplete => {
@@ -2123,14 +2183,16 @@ async fn authorize_blob(
     // claim — see the F1 keystone comment on `walk_blob_closure`.
     let closure = singleflight_walk(state, key, claims)
         .await
-        .map_err(WsError::Backend)?; // F3: an incomplete walk is a 500.
+        .map_err(WsError::Backend)?; // F3: an incomplete REQUIRED walk is a 500.
+    // Granted for the roots that walked — a cache root this replica could
+    // not walk is not among them (git-bug 2a79b73).
     state.blob_allow.grant(
         key,
         claims.exp,
-        &claims.roots,
-        closure.as_ref().clone(),
+        &closure.roots,
+        closure.blobs.clone(),
     );
-    if closure.binary_search(&blob).is_ok() {
+    if closure.blobs.binary_search(&blob).is_ok() {
         Ok(())
     } else {
         blob_authz_deny(state, claims, hash, mode)
@@ -5447,6 +5509,98 @@ mod tests {
             .status()
     }
 
+    /// git-bug 2a79b73 at the route grain, under `enforce`. A cache root is
+    /// granted only the blobs under it, like any root; a cache root this
+    /// replica cannot walk (warm-only on another replica) is left out of the
+    /// grant instead of failing the walk, so the Step's required input still
+    /// reads; and a token that carries the same unwalkable root as a
+    /// REQUIRED root (every token minted before `cache_roots`) keeps today's
+    /// 500.
+    ///
+    /// Mutations killed: walking cache roots as required (the 200 on the
+    /// input blob becomes a 500); skipping cache roots entirely (the cached
+    /// blob 403s); granting completeness for an unwalked cache root, or
+    /// granting more than its closure (the foreign blob stops being a 403).
+    #[tokio::test]
+    async fn a_cache_root_grants_its_closure_and_an_unwalkable_one_does_not_fail_the_walk() {
+        let Some(h) = DepotHarness::start().await else { return };
+        h.state.blob_allow.set_mode(BlobAuthzMode::Enforce);
+
+        // A cache tree in THIS replica's warm tier.
+        let cache_src = h.tmp.path().join("cache-src");
+        std::fs::create_dir_all(&cache_src).unwrap();
+        std::fs::write(cache_src.join("index.js"), b"cached module bytes").unwrap();
+        let cache = S3Storage::local(h.tmp.path().join("warm"))
+            .unwrap()
+            .ingest(cache_src.to_str().unwrap())
+            .await
+            .expect("seed the cache tree into warm");
+        let cached_blob = hash_hex(b"cached module bytes");
+        let foreign = seed_foreign_blob(&h).await;
+        // A cache root that no tier holds: saved on another replica.
+        let elsewhere = "e".repeat(64);
+        let fence = Fence {
+            run: "run-cache-authz".into(),
+            step: "build".into(),
+            attempt: "a1".into(),
+        };
+        let mint = |claims: &workspace_token::WorkspaceClaims| {
+            workspace_token::mint(b"export-secret", claims)
+        };
+
+        // Walkable cache root: its blob reads, a foreign blob does not.
+        let token = mint(
+            &workspace_token::step_claims(fence.clone(), i64::MAX / 2, vec![h.parent.root.0.clone()])
+                .with_cache_roots(vec![cache.root.0.clone()]),
+        );
+        let (status, body) = h
+            .call_as(&token, "GET", &format!("/v1/cas/blobs/{cached_blob}"), None)
+            .await;
+        assert!(status.is_success(), "a blob under the cache root reads: {body}");
+        let (status, _) = h
+            .call_as(&token, "GET", &format!("/v1/cas/blobs/{foreign}"), None)
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "a cache root grants only its closure");
+
+        // Unwalkable cache root: the required input still reads, the
+        // foreign blob is still refused, and nothing is a 500.
+        let token = mint(
+            &workspace_token::step_claims(
+                Fence { run: "run-cache-authz-2".into(), ..fence.clone() },
+                i64::MAX / 2,
+                vec![h.parent.root.0.clone()],
+            )
+            .with_cache_roots(vec![elsewhere.clone()]),
+        );
+        let inside = in_closure_blob();
+        let (status, body) = h
+            .call_as(&token, "GET", &format!("/v1/cas/blobs/{inside}"), None)
+            .await;
+        assert!(
+            status.is_success(),
+            "a cache root this replica cannot walk must not fail a required read: {status} {body}"
+        );
+        let (status, _) = h
+            .call_as(&token, "GET", &format!("/v1/cas/blobs/{foreign}"), None)
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "still no read outside the claim");
+
+        // The same root as a REQUIRED root (the pre-`cache_roots` token
+        // shape): an incomplete walk is still the 500 it always was (F3).
+        let legacy = token_with_roots(
+            "run-cache-authz-3",
+            vec![h.parent.root.0.clone(), elsewhere],
+        );
+        let (status, _) = h
+            .call_as(&legacy, "GET", &format!("/v1/cas/blobs/{inside}"), None)
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a required root that cannot be walked keeps the F3 500"
+        );
+    }
+
     /// Enforce mode, whole surface (amendments F2a + F7): a fenced token
     /// reads a blob inside its roots closure via the FALLBACK WALK (no /flat
     /// first — the cold-start path), and is refused a blob outside it on GET,
@@ -5783,7 +5937,7 @@ mod tests {
         let (r1, r2) = (r1.expect("walk result"), r2.expect("walk result"));
         assert_eq!(r1, r2, "both callers hold the same closure");
         assert!(
-            r1.binary_search(&hex32(&in_closure_blob()).unwrap()).is_ok(),
+            r1.blobs.binary_search(&hex32(&in_closure_blob()).unwrap()).is_ok(),
             "and it is the real closure"
         );
         assert_eq!(

@@ -491,11 +491,8 @@ impl K8sExecutor {
         workspace_token::mint(&fetch.token_secret, &claims)
     }
 
-    /// Mint the fence-scoped, expiring, root-limited workspace token for a Step.
-    ///
-    /// `roots` is exactly the Step's declared inputs, so the service can refuse a
-    /// tree read the Step was never given (`WorkspaceClaims::may_read_tree`) — a
-    /// compromised Step cannot enumerate other runs' snapshots by asking.
+    /// Mint the fence-scoped, expiring, root-limited workspace token for a Step
+    /// (claims built by [`step_token_claims`]).
     fn mint_workspace_token(
         &self,
         fetch: &WorkspaceFetch,
@@ -514,30 +511,7 @@ impl K8sExecutor {
             now,
             spec.timeout_seconds.unwrap_or(self.default_step_timeout_secs),
         );
-        // The readable roots: the Step's declared inputs, plus the launch-
-        // resolved cache restore roots (ADR-0065 s1) — claims ONLY, never
-        // `workspace_inputs` itself, which feeds skip-signatures and the
-        // fetcher's merge order. The pod's cross-run cache read rides the
-        // existing exact-roots mechanism: zero new auth surface, and keys
-        // never cross the trust boundary.
-        let mut roots = spec.workspace_inputs.clone();
-        if let Some(cache) = &spec.cache {
-            for (_, root) in &cache.restore {
-                if !roots.contains(root) {
-                    roots.push(root.clone());
-                }
-            }
-        }
-        let claims = workspace_token::step_claims(
-            workspace_token::Fence {
-                run: step.run.0.clone(),
-                step: step.step.0.clone(),
-                attempt,
-            },
-            exp,
-            roots,
-        );
-        workspace_token::mint(&fetch.token_secret, &claims)
+        workspace_token::mint(&fetch.token_secret, &step_token_claims(step, spec, attempt, exp))
     }
 
     /// Upsert the per-Pod Secret carrying a Step's forge credential (ADR-0076
@@ -3825,6 +3799,40 @@ static EAGER_FETCH_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 /// lands; while it climbs, the stepping stone is load-bearing.
 pub fn eager_fetch_total() -> u64 {
     EAGER_FETCH_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A Step's workspace-token claims.
+///
+/// `roots` is exactly the Step's declared inputs, so the service can refuse a
+/// tree read the Step was never given (`WorkspaceClaims::may_read_tree`) — a
+/// compromised Step cannot enumerate other runs' snapshots by asking. The
+/// launch-resolved cache restore roots (ADR-0065 s1) ride the separate
+/// `cache_roots` claim (git-bug 2a79b73): readable like an input, but
+/// best-effort, because a Cache is warm-only on one Depot replica and a
+/// replica that cannot walk it must not fail the Step's required reads. Claims
+/// only — never `workspace_inputs` itself, which feeds skip-signatures and the
+/// fetcher's merge order — and keys never cross the trust boundary.
+fn step_token_claims(
+    step: &StepRun,
+    spec: &StepSpec,
+    attempt: String,
+    exp: i64,
+) -> workspace_token::WorkspaceClaims {
+    let cache_roots: Vec<String> = spec
+        .cache
+        .as_ref()
+        .map(|c| c.restore.iter().map(|(_, root)| root.clone()).collect())
+        .unwrap_or_default();
+    workspace_token::step_claims(
+        workspace_token::Fence {
+            run: step.run.0.clone(),
+            step: step.step.0.clone(),
+            attempt,
+        },
+        exp,
+        spec.workspace_inputs.clone(),
+    )
+    .with_cache_roots(cache_roots)
 }
 
 /// The per-Pod Secret carrying the workspace token (owner-referenced to the Pod,
@@ -10148,6 +10156,31 @@ mod tests {
             .filter(|n| !scarab_pipeline::scarab_sets_env(n))
             .collect();
         assert!(unknown.is_empty(), "add these to scarab_pipeline::SCARAB_SET_ENV: {unknown:?}");
+    }
+
+    /// git-bug 2a79b73: the launch-resolved cache restore roots ride the
+    /// best-effort `cache_roots` claim, never the required `roots` — a Depot
+    /// replica that does not hold the Cache must not fail the Step's inputs.
+    #[test]
+    fn cache_restore_roots_are_claimed_as_cache_roots_not_inputs() {
+        let step = step_with_attempt("run-1", "build", "a1");
+        let mut spec = busybox();
+        spec.workspace_inputs = vec!["tree-a".into()];
+        spec.cache = Some(scarab_engine::CacheConfig {
+            dirs: vec!["target".into(), "dup".into()],
+            key: Some("k".into()),
+            restore: vec![
+                ("target".into(), "tree-c".into()),
+                ("dup".into(), "tree-a".into()),
+            ],
+            ..Default::default()
+        });
+        let claims = step_token_claims(&step, &spec, "a1".into(), 10);
+        assert_eq!(claims.roots, vec!["tree-a".to_string()]);
+        assert_eq!(claims.cache_roots, vec!["tree-c".to_string()]);
+        // No cache: no cache claim, so the token keeps the old wire form.
+        spec.cache = None;
+        assert!(step_token_claims(&step, &spec, "a1".into(), 10).cache_roots.is_empty());
     }
 
     #[test]

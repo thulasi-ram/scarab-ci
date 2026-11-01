@@ -1964,3 +1964,142 @@ async fn a_depot_restart_mid_drain_re_drives_from_scratch_and_a_lost_2xx_is_post
         .await
         .expect("post_drain_record maps AlreadyPosted to Ok");
 }
+
+// ---------------------------------------------------------------------------
+// Caches at Depot replicaCount > 1 (git-bug 2a79b73, 12e2f6b)
+// ---------------------------------------------------------------------------
+
+/// A producer Step's whole drain of [`build_cached_workspace`] with
+/// `node_modules` cached, through `content` — what `run_drain` does. Returns the published (cache-excluded)
+/// root, which is durable, and the saved cache root, which is warm-only on
+/// whichever replica took the cache-dir PUTs.
+async fn drain_cached_workspace(content: &WorkspaceClient) -> (String, String) {
+    let ws = tempfile::tempdir().unwrap();
+    build_cached_workspace(ws.path());
+    let cache_dirs = vec!["node_modules".to_string()];
+    let report = content
+        .drain_ingest_report(ws.path().to_str().unwrap(), &[], &cache_dirs)
+        .await
+        .expect("drain ingest");
+    let cache_root = report.cache_roots["node_modules"].clone();
+    let memo = MemoCas::new(content, report.trees);
+    let excluded =
+        scarab_workspace_client::exclude_paths(&memo, &report.snapshot.root, &cache_dirs)
+            .await
+            .expect("exclusion");
+    let identity = scarab_storage::content_identity(&memo, &excluded)
+        .await
+        .expect("excluded identity");
+    content
+        .post_drain_record(&DrainRecord {
+            root: report.snapshot.root.0.clone(),
+            pruned_root: Some(excluded.0.clone()),
+            identity: Some(identity.0),
+            files: report.files,
+            tree_bytes: report.tree_bytes,
+            blobs_uploaded: report.blobs_uploaded,
+            bytes_uploaded: report.bytes_uploaded,
+            have_hits: report.have_hits,
+            ingest_ms: 1,
+            prune_ms: 0,
+            cache_roots: report.cache_roots.clone(),
+            error: None,
+        })
+        .await
+        .expect("the producer's record posts");
+    (excluded.0, cache_root)
+}
+
+/// A consumer Step's token: its required input, plus the cache restore root
+/// in the claim the executor mints (`cache_roots`), or — `legacy` — inside
+/// `roots`, the shape every token had before git-bug 2a79b73.
+fn consumer_client(base: &str, input: &str, cache_root: &str, legacy: bool) -> WorkspaceClient {
+    let fence = Fence {
+        run: "run-consumer".into(),
+        step: "test".into(),
+        attempt: "a1".into(),
+    };
+    let claims = if legacy {
+        workspace_token::step_claims(
+            fence,
+            far_future(),
+            vec![input.to_string(), cache_root.to_string()],
+        )
+    } else {
+        workspace_token::step_claims(fence, far_future(), vec![input.to_string()])
+            .with_cache_roots(vec![cache_root.to_string()])
+    };
+    WorkspaceClient::new(base, workspace_token::mint(SECRET, &claims))
+}
+
+/// git-bug 2a79b73, at the grain it bit: two Depot replicas on one Postgres
+/// and one bucket, a cache saved through replica A (warm-only there), and a
+/// consumer whose token claims that cache root. Its REQUIRED input fetch is
+/// `/flat` then blob GETs, which `scarab-wsfetch` sends through the ClusterIP,
+/// so they scatter: here the `/flat` lands on A and the blob GETs on B,
+/// constructed rather than hoped for. B has no allowlist entry for the
+/// token, so the first blob GET walks every claimed root, and the cache
+/// root's trees are on A alone. Before the fix that walk was incomplete and
+/// the GET a 500 — in `log` mode too — and the Attempt ended Transient. Now
+/// the cache root is left out of B's grant and the input materialises; the
+/// cache restore through B is a clean miss, and through A a hit.
+///
+/// The legacy half pins the compatibility story: a token carrying the cache
+/// root inside `roots` keeps today's behaviour, the 500.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cache_on_one_replica_does_not_fail_a_required_fetch_on_another() {
+    let Some(a) = Harness::start().await else { return };
+    let b = a.replica().await;
+    let (input, cache_root) =
+        drain_cached_workspace(&a.fence_client_for("run-producer", "build", "a1")).await;
+
+    // `/flat` on A, blob GETs on B: the scatter, constructed.
+    let manifest = consumer_client(&a.base, &input, &cache_root, false)
+        .flat(&TreeHash(input.clone()))
+        .await
+        .expect("the input's manifest through A");
+    let consumer = consumer_client(&b.base, &input, &cache_root, false);
+    let target = tempfile::tempdir().unwrap();
+    consumer
+        .materialize_flat(&manifest, target.path().to_str().unwrap())
+        .await
+        .expect("the required input's blobs read through the replica WITHOUT the cache");
+    assert_eq!(
+        std::fs::read(target.path().join("src/main.rs")).unwrap(),
+        b"fn main() {}"
+    );
+
+    // The cache restore through B: a miss, never an error the Step sees.
+    let miss = tempfile::tempdir().unwrap();
+    assert!(
+        scarab_storage::Cas::materialize(
+            &consumer,
+            &TreeHash(cache_root.clone()),
+            miss.path().to_str().unwrap(),
+        )
+        .await
+        .is_err(),
+        "replica B does not hold the cache tree"
+    );
+    // Through A, where the save landed: a hit.
+    let hit = tempfile::tempdir().unwrap();
+    scarab_storage::Cas::materialize(
+        &consumer_client(&a.base, &input, &cache_root, false),
+        &TreeHash(cache_root.clone()),
+        hit.path().to_str().unwrap(),
+    )
+    .await
+    .expect("the cache restores from the replica that holds it");
+    assert!(hit.path().join("leftpad/index.js").exists());
+
+    // A pre-fix token (the cache root as a required root) on B: still 500.
+    let legacy = consumer_client(&b.base, &input, &cache_root, true);
+    let err = legacy
+        .materialize_flat(&manifest, tempfile::tempdir().unwrap().path().to_str().unwrap())
+        .await
+        .expect_err("a required root that cannot be walked keeps the F3 500");
+    assert!(
+        matches!(err, scarab_storage::StorageError::Status { status: 500, .. }),
+        "expected the walk's 500, got {err:?}"
+    );
+}
