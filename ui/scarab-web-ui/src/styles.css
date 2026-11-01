@@ -1372,7 +1372,7 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
   display: flex;
   align-items: center;
   gap: 18px;
-  padding: 12px 24px;
+  padding: 4px 24px;
   background: var(--carapace-black);
   border-bottom: 1px solid var(--border);
 }
@@ -1391,6 +1391,10 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 .brand:active { transform: scale(0.97); }
 .brand svg { color: var(--copper); }
 .brand-emblem { display: block; }
+/* ink mark on the light theme, cream on the dark one */
+.brand-emblem--dark, .login-emblem--dark { display: none; }
+[data-theme="dark"] .brand-emblem--light, [data-theme="dark"] .login-emblem--light { display: none; }
+[data-theme="dark"] .brand-emblem--dark, [data-theme="dark"] .login-emblem--dark { display: block; }
 .crumbs { display: inline-flex; align-items: center; gap: 6px; font-family: var(--font-mono); font-size: 13px; }
 .crumb { color: var(--sage); text-decoration: none; }
 .crumb:hover { color: var(--emerald); text-decoration: underline; text-underline-offset: 3px; }
