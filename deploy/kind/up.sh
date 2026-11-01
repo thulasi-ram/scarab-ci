@@ -274,6 +274,24 @@ chmod 600 "$kubeconfig"
 verify_kubeconfig
 kc get nodes >/dev/null
 
+# The mode-switch guard, before anything is applied or deleted: a refused
+# switch must leave the running mode as it was (its toxiproxy, its Forgejo
+# tunnel and ROOT_URL, its release). A step Pod of the current mode would
+# carry on against the other mode's server, Depot, bucket and token secrets,
+# and its Attempt fails on resume. Step Pods carry the executor's
+# scarab.io/run label. A cluster created above has none.
+last_mode="$(cat "$state/mode" 2>/dev/null || true)"
+switching=0
+if [ -n "$last_mode" ] && [ "$last_mode" != "$mode" ]; then
+  switching=1
+  active="$(active_step_pods)"
+  if [ "$active" != 0 ] && [ "${SCARAB_KIND_FORCE_SWITCH:-0}" != 1 ]; then
+    die "refusing to switch $last_mode -> $mode: $active step Pod(s) of the $last_mode stack are still running.
+  Let their Runs finish (or cancel them), then rerun. To switch anyway and fail them:
+    SCARAB_KIND_FORCE_SWITCH=1 bash deploy/kind/up.sh $mode"
+  fi
+fi
+
 # --- 3. images ----------------------------------------------------------------
 # Loaded as a ONE-platform archive: `kind load docker-image` imports every
 # platform and fails on a multi-arch image under the containerd image store.
@@ -427,17 +445,7 @@ fi
 # bucket, and a warm tier holding the other mode's blobs would serve reads the
 # new bucket cannot back (ADR-0077 Amendment §4). The Depot is a cache
 # (ADR-0066), so its PVC is deleted on a mode switch and refills from the bucket.
-last_mode="$(cat "$state/mode" 2>/dev/null || true)"
-if [ -n "$last_mode" ] && [ "$last_mode" != "$mode" ]; then
-  # A step Pod of the current mode would carry on against the other mode's
-  # server, Depot, bucket and token secrets, and its Attempt fails on resume.
-  # Step Pods carry the executor's scarab.io/run label.
-  active="$(active_step_pods)"
-  if [ "$active" != 0 ] && [ "${SCARAB_KIND_FORCE_SWITCH:-0}" != 1 ]; then
-    die "refusing to switch $last_mode -> $mode: $active step Pod(s) of the $last_mode stack are still running.
-  Let their Runs finish (or cancel them), then rerun. To switch anyway and fail them:
-    SCARAB_KIND_FORCE_SWITCH=1 bash deploy/kind/up.sh $mode"
-  fi
+if [ "$switching" = 1 ]; then
   echo "==> mode $last_mode -> $mode: deleting the Depot's warm PVC"
   kc delete statefulset -n "$ns" "$release-workspace" --ignore-not-found --wait=true >/dev/null
   kc delete pvc -n "$ns" -l app.kubernetes.io/component=workspace --ignore-not-found --wait=true >/dev/null
