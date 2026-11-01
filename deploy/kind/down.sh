@@ -19,7 +19,7 @@ what="${1:-all}"
 case "$what" in
   all)
     echo "==> deleting kind cluster '$cluster'"
-    kind delete cluster --name "$cluster" 2>/dev/null || true
+    kind delete cluster --name "$cluster" --kubeconfig "$kubeconfig" 2>/dev/null || true
     rm -f "$kubeconfig" "$here/.state/loaded-images" "$here/.state/mode"
     echo "==> down."
     ;;

@@ -185,10 +185,19 @@ cluster_fits() {
 if kind get clusters 2>/dev/null | grep -qx "$cluster"; then
   if cluster_fits; then
     echo "==> reusing kind cluster '$cluster'"
-    kind export kubeconfig --name "$cluster" --kubeconfig "$kubeconfig" >/dev/null 2>&1
+    if [ "$(docker inspect -f '{{.State.Running}}' "$node")" != true ]; then
+      echo "    its node container is stopped; starting it"
+      docker start "$node" >/dev/null || die "could not start the stopped node container $node ('just down' deletes the cluster)"
+    fi
+    kind export kubeconfig --name "$cluster" --kubeconfig "$kubeconfig" >/dev/null \
+      || die "could not export the kubeconfig of kind cluster '$cluster'"
+    for _ in $(seq 1 60); do
+      ( kc get --raw /readyz ) >/dev/null 2>&1 && break
+      sleep 2
+    done
   else
     echo "==> kind cluster '$cluster' lacks this worktree's mount or host port $host_ip:$host_port; recreating it"
-    kind delete cluster --name "$cluster"
+    kind delete cluster --name "$cluster" --kubeconfig "$kubeconfig"
   fi
 fi
 if ! kind get clusters 2>/dev/null | grep -qx "$cluster"; then
