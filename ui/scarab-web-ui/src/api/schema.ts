@@ -596,6 +596,41 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/me/tokens": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List your own API tokens (ADR-0049) */
+        get: operations["list_own_api_tokens"];
+        put?: never;
+        /** Mint a personal API token - the plaintext is returned ONCE (ADR-0049) */
+        post: operations["mint_own_api_token"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/me/tokens/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Revoke one of your own API tokens (ADR-0049) */
+        delete: operations["revoke_own_api_token"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/orgs/{org}/bindings": {
         parameters: {
             query?: never;
@@ -1341,7 +1376,7 @@ export interface paths {
         /** List the API tokens issued in an org (ADR-0049) */
         get: operations["list_api_tokens"];
         put?: never;
-        /** Mint an API token - the plaintext is returned ONCE (ADR-0049) */
+        /** Mint a personal API token in an org - the plaintext is returned ONCE (ADR-0049) */
         post: operations["mint_api_token"];
         delete?: never;
         options?: never;
@@ -2366,7 +2401,7 @@ export interface components {
             last_used_at?: number | null;
             name: string;
             org: string;
-            /** @description The principal whose live authority bounds this token. */
+            /** @description The principal who holds the token and whose live authority bounds it. */
             owner_subject: string;
             /** @description `None` for an org-scoped token. */
             project?: string | null;
@@ -2380,6 +2415,13 @@ export interface components {
              *     depends on what its owner holds at the moment of each request.
              */
             role: string;
+            /**
+             * Format: int64
+             * @description How many requests have presented it. Approximate: calls are counted in
+             *     memory and written in batches, so the count can lag by up to a minute,
+             *     and a server that stops loses the calls it had not written yet.
+             */
+            use_count: number;
         };
         /**
          * @description One artifact **version** in a run's list (ADR-0052, immutable per attempt
@@ -3304,6 +3346,28 @@ export interface components {
              * @description This browser session's open window, if any (unix ms).
              */
             window_expires_at?: number | null;
+        };
+        /**
+         * @description `POST /v1/me/tokens` body: [`MintTokenRequest`] plus the org, which the
+         *     personal route cannot take from its path.
+         */
+        MintOwnTokenRequest: {
+            /**
+             * Format: int32
+             * @description Lifetime in days, `1..=365`.
+             */
+            expires_in_days: number;
+            /** @description Human label — what makes the token revocable in practice. */
+            name: string;
+            /** @description The org the token is scoped to (or the org of its project). */
+            org: string;
+            /** @description Project within the org to scope the token to. Absent = the whole org. */
+            project?: string | null;
+            /**
+             * @description The **ceiling**: `viewer` | `member` | `admin` | `owner`, never more
+             *     than the caller holds in this scope.
+             */
+            role: string;
         };
         /**
          * @description `POST /v1/orgs/{org}/tokens` body. Every field is required on purpose: a
@@ -4898,6 +4962,11 @@ export interface components {
             /** @description `executed` (the operation answered 2xx) or `failed`. */
             state: string;
         };
+        /**
+         * @description The order of the org's token list.
+         * @enum {string}
+         */
+        TokenSort: "last_used" | "use_count" | "created";
         TrustSourceRequest: {
             /**
              * @description `<host>/<owner>/<repo>//<path>`; an `@<commit>` is dropped, since
@@ -6196,6 +6265,120 @@ export interface operations {
                 content?: never;
             };
             /** @description step-up is off */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_own_api_tokens: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiTokenDto"][];
+                };
+            };
+            /** @description not signed in */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description API tokens not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    mint_own_api_token: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MintOwnTokenRequest"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MintedTokenDto"];
+                };
+            };
+            /** @description bad role, name, or lifetime, or the role exceeds the minter's */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description the caller holds no role in the target scope, or is itself a token — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
+            /** @description API tokens not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    revoke_own_api_token: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description token id - NOT the token itself */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description revoked */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such live token of yours */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -9059,7 +9242,13 @@ export interface operations {
     };
     list_api_tokens: {
         parameters: {
-            query?: never;
+            query?: {
+                /**
+                 * @description `last_used` (default), `use_count` or `created`; each descending, ties
+                 *     broken by newest first.
+                 */
+                sort?: components["schemas"]["TokenSort"];
+            };
             header?: never;
             path: {
                 /** @description org */
@@ -9076,6 +9265,13 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["ApiTokenDto"][];
                 };
+            };
+            /** @description unknown `sort` */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description not an org admin */
             403: {
@@ -9124,7 +9320,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description not an admin of the target scope, or the caller is itself a token — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            /** @description the caller holds no role in the target scope, or is itself a token — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
             403: {
                 headers: {
                     [name: string]: unknown;

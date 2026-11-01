@@ -1339,6 +1339,136 @@
         ]
       }
     },
+    "/v1/me/tokens": {
+      "get": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "List your own API tokens (ADR-0049)",
+        "operationId": "list_own_api_tokens",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ApiTokenDto"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "not signed in"
+          },
+          "404": {
+            "description": "API tokens not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Mint a personal API token - the plaintext is returned ONCE (ADR-0049)",
+        "operationId": "mint_own_api_token",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MintOwnTokenRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MintedTokenDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "bad role, name, or lifetime, or the role exceeds the minter's"
+          },
+          "403": {
+            "description": "the caller holds no role in the target scope, or is itself a token — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "API tokens not configured"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/me/tokens/{id}": {
+      "delete": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Revoke one of your own API tokens (ADR-0049)",
+        "operationId": "revoke_own_api_token",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "token id - NOT the token itself",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "revoked"
+          },
+          "404": {
+            "description": "no such live token of yours"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
     "/v1/orgs/{org}/bindings": {
       "get": {
         "tags": [
@@ -5232,6 +5362,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "sort",
+            "in": "query",
+            "description": "`last_used` (default), `use_count` or `created`; each descending, ties\nbroken by newest first.",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/TokenSort"
+            }
           }
         ],
         "responses": {
@@ -5247,6 +5386,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "unknown `sort`"
           },
           "403": {
             "description": "not an org admin"
@@ -5268,7 +5410,7 @@
         "tags": [
           "Auth & Identity"
         ],
-        "summary": "Mint an API token - the plaintext is returned ONCE (ADR-0049)",
+        "summary": "Mint a personal API token in an org - the plaintext is returned ONCE (ADR-0049)",
         "operationId": "mint_api_token",
         "parameters": [
           {
@@ -5306,7 +5448,7 @@
             "description": "bad role, name, or lifetime, or the role exceeds the minter's"
           },
           "403": {
-            "description": "not an admin of the target scope, or the caller is itself a token — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "description": "the caller holds no role in the target scope, or is itself a token — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
             "content": {
               "application/json": {
                 "schema": {
@@ -8191,7 +8333,8 @@
           "role",
           "created_by",
           "created_at",
-          "expires_at"
+          "expires_at",
+          "use_count"
         ],
         "properties": {
           "created_at": {
@@ -8226,7 +8369,7 @@
           },
           "owner_subject": {
             "type": "string",
-            "description": "The principal whose live authority bounds this token."
+            "description": "The principal who holds the token and whose live authority bounds it."
           },
           "project": {
             "type": [
@@ -8246,6 +8389,12 @@
           "role": {
             "type": "string",
             "description": "The granted ceiling, not the effective role — what the token can do\ndepends on what its owner holds at the moment of each request."
+          },
+          "use_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many requests have presented it. Approximate: calls are counted in\nmemory and written in batches, so the count can lag by up to a minute,\nand a server that stops loses the calls it had not written yet.",
+            "minimum": 0
           }
         }
       },
@@ -10055,6 +10204,43 @@
             ],
             "format": "int64",
             "description": "This browser session's open window, if any (unix ms)."
+          }
+        }
+      },
+      "MintOwnTokenRequest": {
+        "type": "object",
+        "description": "`POST /v1/me/tokens` body: [`MintTokenRequest`] plus the org, which the\npersonal route cannot take from its path.",
+        "required": [
+          "org",
+          "name",
+          "role",
+          "expires_in_days"
+        ],
+        "properties": {
+          "expires_in_days": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Lifetime in days, `1..=365`.",
+            "minimum": 0
+          },
+          "name": {
+            "type": "string",
+            "description": "Human label — what makes the token revocable in practice."
+          },
+          "org": {
+            "type": "string",
+            "description": "The org the token is scoped to (or the org of its project)."
+          },
+          "project": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Project within the org to scope the token to. Absent = the whole org."
+          },
+          "role": {
+            "type": "string",
+            "description": "The **ceiling**: `viewer` | `member` | `admin` | `owner`, never more\nthan the caller holds in this scope."
           }
         }
       },
@@ -13184,6 +13370,15 @@
             "description": "`executed` (the operation answered 2xx) or `failed`."
           }
         }
+      },
+      "TokenSort": {
+        "type": "string",
+        "description": "The order of the org's token list.",
+        "enum": [
+          "last_used",
+          "use_count",
+          "created"
+        ]
       },
       "TrustSourceRequest": {
         "type": "object",
