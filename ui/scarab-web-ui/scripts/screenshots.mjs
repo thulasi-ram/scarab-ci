@@ -43,13 +43,13 @@ const SHOTS = [
     name: "dashboard",
     path: "/",
     size: [1485, 812],
-    files: ["docs/assets/screenshots/dashboard-dark.jpg", "ui/scarab-docs-ui/src/assets/dashboard.jpg"],
+    files: ["docs/assets/screenshots/dashboard.jpg", "ui/scarab-docs-ui/src/assets/dashboard.jpg"],
   },
   {
     name: "run-detail",
     path: `/acme/scarab/runs/${RUN_ID}`,
     size: [1485, 812],
-    files: ["docs/assets/screenshots/run-detail-dark.jpg", "ui/scarab-docs-ui/src/assets/run-detail.jpg"],
+    files: ["docs/assets/screenshots/run-detail.jpg", "ui/scarab-docs-ui/src/assets/run-detail.jpg"],
   },
   {
     // usage/environments.mdx: the New environment dialog (org Settings,

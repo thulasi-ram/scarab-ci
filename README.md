@@ -30,7 +30,7 @@ resumes instead of starting over. Written in Rust.
 
 <div align="center">
 
-<img alt="Scarab dashboard — an action inbox of runs suspended on a gate, recently-visited repos as pass/fail status cards, and the recency-sorted repo list" src="docs/assets/screenshots/dashboard-dark.jpg" width="820">
+<img alt="Scarab dashboard — an action inbox of runs suspended on a gate, recently-visited repos as pass/fail status cards, and the recency-sorted repo list" src="docs/assets/screenshots/dashboard.jpg" width="820">
 
 <sub>The dashboard: an **action inbox** of runs suspended on a gate, **recently-visited repos** as pass/fail status cards, and the recency-sorted repo list. ⌘K to jump anywhere.</sub>
 
@@ -138,7 +138,7 @@ all 70+ ADRs. In-repo, the same sources live under:
 
 <div align="center">
 
-<img alt="Scarab run detail — the step DAG, live logs, and an event timeline showing a retried step and the run suspended on a manual deploy gate" src="docs/assets/screenshots/run-detail-dark.jpg" width="820">
+<img alt="Scarab run detail — the step DAG, live logs, and an event timeline showing a retried step and the run suspended on a manual deploy gate" src="docs/assets/screenshots/run-detail.jpg" width="820">
 
 <sub>A run is durable **state**: the step DAG, live logs and an append-only event timeline.
 Here a flaky step was retried automatically, then the run paused on a manual
