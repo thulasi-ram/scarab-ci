@@ -3,7 +3,7 @@
 
     python3 -I scripts/changelog.py section <version>     # print the [<version>] section's body
     python3 -I scripts/changelog.py notes <tag>           # the section plus the install lines
-    python3 -I scripts/changelog.py links [<version>...]  # check the New entries link docs pages
+    python3 -I scripts/changelog.py links [<version>...]  # check the Features entries link docs pages
 
 `section` prints what release.yml uses as the GitHub Release body: everything
 between `## [<version>]` and the next `## ` heading, without the heading. It
@@ -11,7 +11,7 @@ exits 1 when the section is missing or empty. A leading `v` is dropped, so the
 tag name works too. `notes` is the GitHub Release text release.yml writes: the
 section, then how to install that version.
 
-`links` checks every bullet under `### New` in the Unreleased section and in
+`links` checks every bullet under `### Features` in the Unreleased section and in
 each named version's section: a bullet must link a docs page that exists. A
 docs page is a docs-site URL (`https://thulasi-ram.github.io/scarab-ci/<path>/`,
 or the same path from `/scarab-ci/`) that maps to a file under
@@ -38,6 +38,9 @@ helm install scarab oci://ghcr.io/thulasi-ram/charts/scarab --version {v} -n sca
 Images (linux/amd64 + linux/arm64), all tagged `{v}`:
 `ghcr.io/thulasi-ram/scarab-server`, `scarab-clone`, `scarab-wsfetch`, `scarab-results-sidecar`.
 """
+
+# The heading whose entries must link a docs page.
+FEATURES = "Features"
 
 LINK = re.compile(r"\]\(([^)\s]+)\)")
 
@@ -154,13 +157,13 @@ def main(argv, root=ROOT):
     names = ["Unreleased"] + [v.removeprefix("v") for v in argv[2:]]
     checked = failed = 0
     for name in dict.fromkeys(names):
-        for b in bullets(subsection(secs.get(name, ""), "New")):
+        for b in bullets(subsection(secs.get(name, ""), FEATURES)):
             checked += 1
             why = check_bullet(root, b)
             if why:
                 failed += 1
-                print(f"[{name}] New entry {why}: {b[:80]}", file=sys.stderr)
-    print(f"{checked - failed} of {checked} New entries link a docs page")
+                print(f"[{name}] {FEATURES} entry {why}: {b[:80]}", file=sys.stderr)
+    print(f"{checked - failed} of {checked} {FEATURES} entries link a docs page")
     return 1 if failed else 0
 
 

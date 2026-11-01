@@ -4,10 +4,14 @@ What changed in each Scarab release. The layout follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
-Each release has up to four parts: **Upgrading** (what to do before or after you
-upgrade), **New**, **Fixes**, and **Development** (changes for people working on
-Scarab itself). A pull request with a change users can see adds a line under
-`[Unreleased]`. Every entry under New links the docs page that explains it;
+Each release sorts its entries under these headings, in this order, and leaves
+out the empty ones (the headings follow
+[Woodpecker CI's changelog](https://github.com/woodpecker-ci/woodpecker/blob/main/CHANGELOG.md)):
+**Breaking changes** (what to do before or after you upgrade), **Security**,
+**Features**, **Enhancement**, **Bug Fixes**, **Tests**, **Documentation**,
+**Dependency** and **Misc** (other changes for people working on Scarab itself).
+A pull request with a change users can see adds a line under `[Unreleased]`.
+Every entry under Features links the docs page that explains it;
 `just release <version>` fails on one that doesn't. When a `v*` tag is pushed,
 release.yml uses that version's section as the GitHub Release text. See
 [docs/RELEASING.md](docs/RELEASING.md).
@@ -16,9 +20,9 @@ release.yml uses that version's section as the GitHub Release text. See
 
 Adds libraries and plugin gates through `invoke`, a policy engine for Run creation, and
 checked forge credentials for Steps. Removes the `clone:` Step kind and the deployment
-record. Read Upgrading before you upgrade.
+record. Read Breaking changes before you upgrade.
 
-### Upgrading
+### Breaking changes
 
 - **Upgrade with `Recreate`.** Old and new servers must not run at the same time. A 0.2.x
   server ignores the scope this release stores on library Steps, and would fill a library
@@ -79,7 +83,14 @@ record. Read Upgrading before you upgrade.
   roots, so a Step with a Cache restore can fail with a Transient error until both are
   upgraded.
 
-### New
+### Security
+
+- The clone image's askpass gave the token to an LFS server named in `.lfsconfig`, to other
+  repositories on the same host through submodules, and over `http://` (#53).
+- A value from outside the Pipeline holding `$(SECRET_NAME)` was filled with that secret by
+  Kubernetes (#52). Plugin Deployments and probe Pods are escaped the same way.
+
+### Features
 
 - **Libraries** (ADR-0076). `invoke: file:<path>` for a library in the repository,
   `invoke: lib:<publisher>/<name>` for one installed in the org. An org admin installs a
@@ -123,6 +134,9 @@ record. Read Upgrading before you upgrade.
   cluster the fault tier's `two-replicas`, `kill-server` and `stop-leader` scenarios passed
   (`just test chaos all 3`, 2026-11-01).
   [ADR-0077 amendment](https://thulasi-ram.github.io/scarab-ci/tech/adr/0077-end-to-end-fault-and-agent-driven-testing/#amendment-2026-11-01-grill)
+
+### Enhancement
+
 - **Caches at more than one Depot replica.** Each Cache key has one home Depot replica, chosen
   by rendezvous hashing over the StatefulSet's ordinals, and a Step saves and restores the
   Cache there. Before, a Cache's saves and restores scattered over the replicas, so a restore
@@ -131,7 +145,7 @@ record. Read Upgrading before you upgrade.
   misses once. `workspace.homeUrlTemplate` overrides the per-replica address.
   [ADR-0077 amendment](https://thulasi-ram.github.io/scarab-ci/tech/adr/0077-end-to-end-fault-and-agent-driven-testing/#amendment-2026-11-01-grill)
 
-### Fixes
+### Bug Fixes
 
 - A Run was visible to the scheduler before its parameters, `when` exclusions and concurrency
   group were written; a Step could start without them (#51). A Run left half-created by a
@@ -145,10 +159,6 @@ record. Read Upgrading before you upgrade.
 - A dispatch parameter holding `${{ … }}` was evaluated as an expression (#49).
 - A deep or long CEL expression in a pushed Pipeline could overflow the stack and stop the
   server (#44).
-- The clone image's askpass gave the token to an LFS server named in `.lfsconfig`, to other
-  repositories on the same host through submodules, and over `http://` (#53).
-- A value from outside the Pipeline holding `$(SECRET_NAME)` was filled with that secret by
-  Kubernetes (#52). Plugin Deployments and probe Pods are escaped the same way.
 - Environment re-admission runs before any checkout token or registry credential is minted; a
   timer gate fails when the Environment no longer admits the Run.
 - A NUL byte in a dispatch reason, commit subject, PR title or Step result no longer causes a
@@ -158,7 +168,17 @@ record. Read Upgrading before you upgrade.
   (git-bug 2a79b73), and a later refused read of that token is answered without walking its
   inputs again.
 
-### Development
+### Tests
+
+- The fault tier (`just test chaos`, ADR-0077) runs ranks 1, 2 and 4: a Depot Pod deleted
+  mid-drain and mid-feed, two server replicas sharing the work, a server replica killed while
+  it drains, and the scheduler leader paused past its lease. All six scenarios passed on
+  2026-11-01 (`just test chaos all 3`). `pause-node`, last in `all`, freezes the kind node
+  mid-drain for longer than the lease TTL and shorter than the Pod's grace period; every Run
+  must still succeed. C1 checks that a Cache restores from its home replica when no fault
+  hit that replica.
+
+### Misc
 
 - The local stack is one kind cluster, `scarab-dev`, with one Helm release in four modes
   (dev, dogfood, e2e, chaos), each with its own database and bucket; Forgejo runs in it.
@@ -186,19 +206,12 @@ record. Read Upgrading before you upgrade.
     `just overlay-tests-colima`) are deleted.
 
   `just release <version>` checks a release before it is tagged.
-- The fault tier (`just test chaos`, ADR-0077) runs ranks 1, 2 and 4: a Depot Pod deleted
-  mid-drain and mid-feed, two server replicas sharing the work, a server replica killed while
-  it drains, and the scheduler leader paused past its lease. All six scenarios passed on
-  2026-11-01 (`just test chaos all 3`). `pause-node`, last in `all`, freezes the kind node
-  mid-drain for longer than the lease TTL and shorter than the Pod's grace period; every Run
-  must still succeed. C1 checks that a Cache restores from its home replica when no fault
-  hit that replica.
 - The ADR-0062 overlay change-set code, its tests and its recipes are deleted; ADR-0066 had
   already dropped the feature.
 
 ## [0.2.2] - 2026-10-28
 
-### Upgrading
+### Breaking changes
 
 - **From 0.2.1 or earlier, recreate the workspace StatefulSet once.** Delete it without
   deleting its Pod or PVC, then upgrade:
@@ -212,7 +225,7 @@ record. Read Upgrading before you upgrade.
   The new StatefulSet re-adopts the existing PVC by name (`cas-<sts>-0`); no data is lost.
   Expect one workspace Pod restart. For Argo CD: run the delete, then sync.
 
-### Fixes
+### Bug Fixes
 
 - **Chart upgrades were rejected by the API server.** The workspace StatefulSet's
   `volumeClaimTemplates` carried `helm.sh/chart` and `app.kubernetes.io/version` labels. That
@@ -220,14 +233,14 @@ record. Read Upgrading before you upgrade.
   `StatefulSet.apps "...-workspace" is invalid: spec: Forbidden: updates to statefulset spec for fields other than ...`
   (and Argo CD syncs failed). The template now carries only version-free labels (#38).
 
-### Development
+### Misc
 
 - A CI guard (`scripts/chart_statefulset_immutable.sh`) renders the chart at two versions
   under default and feature-on values and fails if any immutable StatefulSet field differs.
 
 ## [0.2.1] - 2026-10-27
 
-### New
+### Features
 
 - **Versioned docs** (#36). Each release line is published at
   `https://thulasi-ram.github.io/scarab-ci/vX.Y/`, the latest stays at the root, and a version
@@ -237,36 +250,39 @@ No server, chart or API behaviour changes.
 
 ## [0.2.0] - 2026-10-27
 
-### New
+### Features
 
 - **Deployments**: vendor-neutral Deployment requests with deployment gates and concurrency
   holds (#32).
 - **Step-up confirmation** (ADR-0073): passkeys, the step-up guard, requests and a security
   log (#32).
+
+### Enhancement
+
 - **S3 ambient credentials** (#34). Leave `SCARAB_S3_ACCESS_KEY` and `SCARAB_S3_SECRET_KEY`
   unset to use AWS's credential chain (IRSA, Pod Identity). The chart adds
   `workspace.serviceAccount.annotations`.
 
-### Fixes
+### Bug Fixes
 
 - The control plane dials the workspace service on its own URL (#29).
 - 27 open bugs fixed in one sweep (#32).
 
 ## [0.1.1] - 2026-10-17
 
-### Upgrading
+### Breaking changes
 
 - **GitHub App installs:** this login doesn't use the GitHub App's callback URL. Clear that
   URL, and untick "Request user authorization (OAuth) during installation". Otherwise anyone
   who installs the App gets sent to `/v1/auth/callback` with a GitHub code and sees a 401.
 
-### New
+### Features
 
 - **Identity links** (ADR-0069, #10). One Principal can hold several provider identities, each
   tied to the provider's immutable account id. Accounts can be linked, merged after proving
   control of both, and unlinked.
 
-### Fixes
+### Bug Fixes
 
 - **Login through Authentik and other strict OIDC providers** (#13). The OAuth token request
   now includes the same `redirect_uri` sent on the authorize redirect, as RFC 6749 §4.1.3
@@ -280,7 +296,7 @@ No server, chart or API behaviour changes.
 - **Helm: `existingSecret` no longer drops the results sidecar** (#11). The results-sidecar
   image and URL now stay set when the chart is deployed with `existingSecret`.
 
-### Development
+### Dependency
 
 - CI uses the digest-pinned `pgsty/minio` and `pgsty/mc` images, replacing the archived MinIO
   images (#12).

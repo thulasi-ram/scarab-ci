@@ -11,7 +11,7 @@
 #                builds itself (scripts/pin_clone_image.sh, ADR-0076 §9)
 #   changelog    CHANGELOG.md has a [<version>] section; prints the Release
 #                text release.yml will write from it
-#   docs links   every New entry under [Unreleased] and [<version>] links a
+#   docs links   every Features entry under [Unreleased] and [<version>] links a
 #                docs page that exists (scripts/changelog.py links)
 #   screenshots  a fresh capture of the mock UI matches every committed
 #                screenshot (`just docs screenshots check`; `just docs

@@ -6,11 +6,25 @@ workflows do the rest.
 ## 1. Keep the changelog current
 
 Every pull request with a change users can see adds a line to
-[CHANGELOG.md](../CHANGELOG.md) under `[Unreleased]`, in one of its parts:
-**Upgrading**, **New**, **Fixes** or **Development**. A New entry links the
-docs page that explains it, as a docs-site URL
-(`https://thulasi-ram.github.io/scarab-ci/usage/libraries/`, anchors allowed)
-or `README.md#<anchor>`. Write the entries the way
+[CHANGELOG.md](../CHANGELOG.md) under `[Unreleased]`, under the heading that
+fits it. The headings come in this order, and a release leaves out the empty
+ones:
+
+| Heading | For |
+|---|---|
+| `### Breaking changes` | what an operator must do before or after the upgrade |
+| `### Security` | a fix that stops a credential or secret reaching someone it shouldn't |
+| `### Features` | something new a user can do |
+| `### Enhancement` | an existing feature that works better or in more places |
+| `### Bug Fixes` | other fixes |
+| `### Tests` | new test tiers and scenarios |
+| `### Documentation` | docs changes worth a line |
+| `### Dependency` | a dependency or image replaced or upgraded |
+| `### Misc` | other changes for people working on Scarab |
+
+A Features entry links the docs page that explains it, as a docs-site URL
+(`https://thulasi-ram.github.io/scarab-ci/usage/libraries/`, anchors allowed;
+an ADR page counts) or `README.md#<anchor>`. Write the entries the way
 [WRITING.md](WRITING.md) asks, and claim only what
 [positioning.md](positioning.md) allows.
 
@@ -37,7 +51,7 @@ On a branch from main:
      `X.Y.Z` build;
    - `CHANGELOG.md` has a `[X.Y.Z]` section, and prints the Release text
      release.yml will write from it;
-   - every New entry under `[Unreleased]` and `[X.Y.Z]` links a docs page
+   - every Features entry under `[Unreleased]` and `[X.Y.Z]` links a docs page
      that exists;
    - a fresh capture of the mock UI matches every committed screenshot
      (diffs go to `target/release-screenshots/`; `just docs screenshots`

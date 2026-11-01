@@ -96,7 +96,7 @@ docs what="" *args:
 # `just release <version>` checks a release before you tag v<version>
 # (docs/RELEASING.md): Cargo.toml and Chart.yaml name <version>, libs/clone.yaml
 # pins an earlier scarab-clone build by digest, CHANGELOG.md has the version's
-# section (it prints the Release text release.yml will write), every New
+# section (it prints the Release text release.yml will write), every Features
 # entry links a docs page, and a fresh capture of the mock UI matches every
 # committed screenshot (`just docs screenshots` recaptures them). It runs every
 # check and ends with a PASS/FAIL list. See scripts/release_check.sh.

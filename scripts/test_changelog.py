@@ -15,7 +15,11 @@ CHANGELOG = """# Changelog
 
 ## [Unreleased]
 
-### New
+### Breaking changes
+
+- **Upgrade with `Recreate`.** No docs link needed here.
+
+### Features
 
 - **Libraries.** See [libraries](https://thulasi-ram.github.io/scarab-ci/usage/libraries/#yank-a-version).
 - **Policies**, in
@@ -24,9 +28,13 @@ CHANGELOG = """# Changelog
 
 ## [0.2.2] - 2026-10-28
 
-### Fixes
+### Bug Fixes
 
 - A fix.
+
+### Misc
+
+- A CI guard.
 
 ## [0.2.1] - 2026-10-27
 
@@ -58,12 +66,12 @@ class ChangelogTest(unittest.TestCase):
     def test_section_is_the_body_up_to_the_next_heading(self):
         code, out, _ = self.run_main("section", "v0.2.2")
         self.assertEqual(code, 0)
-        self.assertEqual(out, "### Fixes\n\n- A fix.\n")
+        self.assertEqual(out, "### Bug Fixes\n\n- A fix.\n\n### Misc\n\n- A CI guard.\n")
 
     def test_notes_add_the_install_lines_for_the_version(self):
         code, out, _ = self.run_main("notes", "v0.2.2")
         self.assertEqual(code, 0)
-        self.assertTrue(out.startswith("### Fixes\n\n- A fix.\n\n## Install\n"))
+        self.assertTrue(out.startswith("### Bug Fixes\n\n- A fix.\n\n### Misc\n\n- A CI guard.\n\n## Install\n"))
         self.assertIn("--version 0.2.2 ", out)
         self.assertEqual(self.run_main("notes", "v0.9.0")[0], 1)
 
@@ -71,12 +79,12 @@ class ChangelogTest(unittest.TestCase):
         self.assertEqual(self.run_main("section", "0.9.0")[0], 1)
         self.assertEqual(self.run_main("section", "0.2.1")[0], 1)
 
-    def test_new_entries_with_docs_links_pass(self):
+    def test_features_entries_with_docs_links_pass(self):
         code, out, err = self.run_main("links")
         self.assertEqual((code, err), (0, ""))
         self.assertIn("3 of 3", out)
 
-    def test_a_new_entry_without_a_docs_page_fails(self):
+    def test_a_features_entry_without_a_docs_page_fails(self):
         text = CHANGELOG.replace("README.md#status", "README.md#nope").replace(
             "usage/libraries/", "usage/nothing/"
         )
@@ -85,6 +93,14 @@ class ChangelogTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("usage/nothing", err)
         self.assertIn("no heading #nope", err)
+
+    def test_only_features_entries_need_a_docs_page(self):
+        # The Breaking changes entry links nothing and is not checked; nor is
+        # a bullet under an old `### New` heading.
+        (self.root / "CHANGELOG.md").write_text(CHANGELOG.replace("### Features", "### New"))
+        code, out, err = self.run_main("links")
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("0 of 0 Features", out)
 
 
 if __name__ == "__main__":
