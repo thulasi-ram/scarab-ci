@@ -58,8 +58,10 @@ up:
 # The dogfood stack: `just up` in GitHub App mode with its own database and
 # bucket, plus a named Cloudflare tunnel. Reads ~/.config/scarab/dogfood.env
 # (CLOUDFLARE_TUNNEL_TOKEN and DOGFOOD_HOSTNAME are required; values are never
-# printed). The tunnel's public hostname must route to
-# http://scarab.scarab.svc.cluster.local:80 (set in the Cloudflare dashboard).
+# printed). The tunnel's public hostname must route ONLY path ^/webhooks/ to
+# http://scarab.scarab.svc.cluster.local:80 (set in the Cloudflare dashboard);
+# the release is dev-insecure, so up.sh checks from outside and takes the tunnel
+# down when / or /v1/repos reaches Scarab. The UI stays on SCARAB_ADDR.
 
 # Bring up the dogfood stack behind its Cloudflare tunnel.
 dogfood:

@@ -109,7 +109,10 @@ Also handy: **`just docs`** serves this documentation site locally.
 
 :::note[Dogfood and Helm]
 `just dogfood` is `just up` in GitHub App mode, with its own database and bucket, behind a
-Cloudflare tunnel; it reads `~/.config/scarab/dogfood.env`. To install the published chart on a
+Cloudflare tunnel; it reads `~/.config/scarab/dogfood.env`. The stack has no login, so the
+tunnel's public hostname must route only the path `^/webhooks/` (set in the Cloudflare
+dashboard). `just dogfood` checks this from outside and scales the tunnel to zero, then fails,
+when `/` or `/v1/repos` reaches Scarab. The UI and API stay on `http://127.0.0.1:<port>`. To install the published chart on a
 cluster of your own, see [Installation](/scarab-ci/get-started/deploy-helm/).
 :::
 

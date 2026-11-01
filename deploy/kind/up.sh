@@ -386,8 +386,8 @@ python3 -I "$root/scripts/libs_manifest.py" --libs "$libs_dir" \
 binary_sum="$({ cat "$mount/bin/scarab-server"; cat "$mount/ui/index.html" 2>/dev/null || true; } | shasum -a 256 | cut -c1-16)"
 if [ "$mode" = dogfood ]; then
   # Dev-insecure, as the colima dogfood ran (deploy/local-helm/.env): no
-  # login, every caller is an Owner. The tunnel makes that public; put a
-  # Cloudflare Access policy on the hostname, or set
+  # login, every caller is an Owner. So the tunnel must publish only
+  # /webhooks/; the check after cloudflared starts enforces that. Set
   # SCARAB_DOGFOOD_DEV_INSECURE=false once OAuth values are added here.
   dev_insecure="${SCARAB_DOGFOOD_DEV_INSECURE:-true}"
   app_id="$(env_get "$dogfood_env" SCARAB_GITHUB_APP_ID)"
@@ -455,6 +455,46 @@ kc rollout status -n "$ns" statefulset/"$release-workspace" --timeout=180s
 if [ "$mode" = dogfood ]; then
   kc apply -n "$ns" -f "$here/cloudflared.yaml" >/dev/null
   kc rollout status -n "$ns" deploy/scarab-cloudflared --timeout=120s
+
+  # The release is dev-insecure: whoever reaches the UI or the API is an
+  # Owner, and this server holds the GitHub App's key. The tunnel's public
+  # hostname must therefore route only `^/webhooks/` (path rule in the
+  # Cloudflare dashboard; the catch-all answers 404). Check that from outside,
+  # through Cloudflare, and take the tunnel down if anything else reaches
+  # Scarab, or if it cannot be checked.
+  resolve=()
+  if ! python3 -I -c 'import socket, sys; socket.gethostbyname(sys.argv[1])' "$dogfood_host" 2>/dev/null; then
+    # A resolver that cached "no such name" before the DNS record existed
+    # keeps answering that until the cache expires; ask 1.1.1.1 instead.
+    ip="$(dig +short @1.1.1.1 "$dogfood_host" A 2>/dev/null | grep -E '^[0-9.]+$' | head -n 1 || true)"
+    [ -z "$ip" ] || resolve=(--resolve "$dogfood_host:443:$ip")
+  fi
+  public_code() { # $1 method, $2 path: the status the public hostname answers
+    curl -s -o /dev/null -w '%{http_code}' --max-time 15 ${resolve[@]+"${resolve[@]}"} \
+      -X "$1" "https://$dogfood_host$2" 2>/dev/null || true
+  }
+  echo "==> checking from outside that the tunnel serves only /webhooks/"
+  root_code=000; api_code=000
+  for _ in $(seq 1 30); do
+    root_code="$(public_code GET /)"; api_code="$(public_code GET /v1/repos)"
+    # 000: no answer; 5xx: Cloudflare has no live connection to the tunnel yet.
+    case "$root_code$api_code" in *000*|5*|???5*) sleep 2 ;; *) break ;; esac
+  done
+  if [ "$root_code" != 404 ] || [ "$api_code" != 404 ]; then
+    kc scale deploy scarab-cloudflared -n "$ns" --replicas=0 >/dev/null
+    die "the tunnel is down again (cloudflared scaled to 0): through https://\$DOGFOOD_HOSTNAME,
+  / answered HTTP $root_code and /v1/repos HTTP $api_code; both must be Cloudflare's 404.
+  This stack is dev-insecure, so a public UI or API makes every visitor an Owner.
+  In the Cloudflare dashboard, set the tunnel's public hostname Path to ^/webhooks/
+  (the catch-all rule then answers 404), and rerun 'just dogfood'.
+  The UI and API stay on $base. (000 or 5xx means the check could not reach the tunnel.)"
+  fi
+  webhook_code="$(public_code POST /webhooks/github)"
+  echo "    / and /v1/repos -> 404 (not routed); unsigned POST /webhooks/github -> HTTP $webhook_code"
+  case "$webhook_code" in
+    400|401) ;;
+    *) echo "warning: an unsigned webhook should reach Scarab and get 400/401; GitHub deliveries may not arrive" >&2 ;;
+  esac
 fi
 
 # --- 7. the host can reach it ---------------------------------------------------
@@ -526,10 +566,5 @@ echo "==> up: $base (mode: $mode)"
 echo "    server log:  just logs          Depot: just workspace-status"
 echo "    pipelines:   just demo, just demo-chain"
 if [ "$mode" = dogfood ]; then
-  # Checked, not printed: values from dogfood.env stay out of terminal logs.
-  public="https://$dogfood_host"
-  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$public/readyz" || true)"
-  echo "    public URL:  https://\$DOGFOOD_HOSTNAME from $dogfood_env (/readyz -> HTTP $code)"
-  [ "$code" = 200 ] || echo "    (not 200: check the tunnel's Public Hostname route in the Cloudflare dashboard;" \
-    "a resolver that cached the name before its DNS record existed answers nothing until the cache expires)"
+  echo "    GitHub webhooks: https://\$DOGFOOD_HOSTNAME/webhooks/github (only /webhooks/ is public)"
 fi

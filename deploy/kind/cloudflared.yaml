@@ -4,7 +4,12 @@
 # tunnel, so this file holds no routing. The route is set in the Cloudflare
 # Zero Trust dashboard, on the tunnel's Public Hostname tab:
 #
-#     $DOGFOOD_HOSTNAME   ->   http://scarab.scarab.svc.cluster.local:80
+#     $DOGFOOD_HOSTNAME   Path ^/webhooks/   ->   http://scarab.scarab.svc.cluster.local:80
+#
+# Only /webhooks/: the dogfood release is dev-insecure, so a public UI or API
+# would make every visitor an Owner. Other paths hit the catch-all 404, and
+# deploy/kind/up.sh checks that from outside, scaling this Deployment to 0 when
+# anything else reaches Scarab.
 #
 # That URL must match the chart's Service (release `scarab`, namespace
 # `scarab`, service.port 80). A mismatch shows up as a Cloudflare 502.

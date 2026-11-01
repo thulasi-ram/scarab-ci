@@ -123,15 +123,30 @@ kept as they are.
 
 `cloudflared.yaml` runs cloudflared in token mode, so the route lives in the
 Cloudflare Zero Trust dashboard: the tunnel's public hostname must point at
-`http://scarab.scarab.svc.cluster.local:80`. `publicUrl` is
+`http://scarab.scarab.svc.cluster.local:80` with Path `^/webhooks/`, so that
+only GitHub's deliveries reach Scarab and every other path gets the tunnel's
+catch-all 404. `publicUrl` is
 `https://$DOGFOOD_HOSTNAME`. After the roll-out, `up.sh` seeds the
 `production` Environment, installs the clone library into `SCARAB_ORG` and
 registers the installation with a signed `installation:created`, as
 `deploy/local-helm/reseed.sh` did.
 
 The dogfood runs dev-insecure, as it did on colima: there is no login, and
-anyone who can reach the hostname is an Owner. Put a Cloudflare Access policy
-on the hostname, or add OAuth values and set `SCARAB_DOGFOOD_DEV_INSECURE=false`.
+anyone who reaches the UI or the API is an Owner of a server that holds the
+GitHub App's key. That is why the hostname carries only `/webhooks/`. The UI
+and API stay on the host at `SCARAB_ADDR` (`http://127.0.0.1:<port>`).
+Webhook signatures are checked with or without dev-insecure.
+
+Once cloudflared has an edge connection, `up.sh` checks this from outside,
+through Cloudflare: `GET /` and `GET /v1/repos` on `https://$DOGFOOD_HOSTNAME`
+must both answer 404. When the local resolver has no answer for the name (a
+cached "no such name" from before the DNS record existed), it resolves the
+name through 1.1.1.1 with `dig` and passes `--resolve` to curl. Any other
+answer, or none within a minute, scales cloudflared to 0 and fails
+`just dogfood` with a message naming the dashboard setting. The tunnel is
+public for those few seconds. It then sends an unsigned
+`POST /webhooks/github` and expects Scarab's 400 or 401.
+
 `just up` switches back to dev and removes the tunnel.
 
 ## Kube safety
