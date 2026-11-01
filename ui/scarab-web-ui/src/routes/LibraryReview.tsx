@@ -4,6 +4,10 @@
 // it); the page shows the file, or the side-by-side diff from the installed
 // version, the checks, and what changes. Install then installs exactly the
 // version shown, naming the version it replaces, and asks for a step-up.
+//
+// Every library takes this one path, whoever publishes it. The libraries
+// Scarab's release manifest lists are offered as sources to fill in, and
+// whether a fetched version is in the manifest is one of its checks.
 import { createEffect, createResource, createSignal, For, Show } from "solid-js";
 import { A, useNavigate, useParams, useSearchParams } from "@solidjs/router";
 import {
@@ -20,6 +24,7 @@ import {
   foldDiff,
   inputsChange,
   numberDiff,
+  releaseSources,
   reviewChecks,
   shortHash,
   sideBySide,
@@ -59,6 +64,12 @@ export default function LibraryReview() {
     setForm((f) => ({ ...f, [k]: v }));
   };
   const built = () => toFetchBody(form());
+  const listed = () => releaseSources(libs()?.first_party ?? []);
+  /** Fill the form from a source the release manifest lists. */
+  const useListed = (r: { source: string; publisher: string; name: string }) => {
+    setFetched(null);
+    setForm((f) => ({ ...f, source: r.source, publisher: r.publisher, name: r.name }));
+  };
 
   const doFetch = async () => {
     const o = org();
@@ -199,6 +210,24 @@ export default function LibraryReview() {
                         A file in a git repository at a full commit id. A public repository on
                         github.com or a Forgejo connection's host is read without credentials.
                       </p>
+                      <Show when={listed().length > 0}>
+                        <p class="fieldnote">
+                          Listed in Scarab's release {listed()[0]!.release}, not installed here:
+                        </p>
+                        <div class="plg-caps">
+                          <For each={listed()}>
+                            {(r) => (
+                              <button
+                                class="btn btn-ghost btn-sm mono"
+                                title={r.source}
+                                onClick={() => useListed(r)}
+                              >
+                                {r.id}
+                              </button>
+                            )}
+                          </For>
+                        </div>
+                      </Show>
                     </div>
                     <div class="form-r">
                       <label>connection (private repository)</label>

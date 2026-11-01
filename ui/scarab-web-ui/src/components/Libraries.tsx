@@ -9,10 +9,12 @@
 // asks for a step-up. Yanking opens a dialog that says which Runs in
 // progress use the version and can cancel them.
 //
-// First-party libraries come from Scarab's release manifest. A new org gets
-// them when its first repo is bound; if the source could not be read, the
-// empty state says what is missing, and the admin can retry, point at a
-// mirror, or paste a copy (checked against the manifest's hash).
+// Every library installs through the review page, whoever publishes it; the
+// libraries Scarab's release manifest lists are offered there as sources.
+// A new org gets the manifest's defaults when its first repo is bound; if
+// their source could not be read, the empty state says what is missing, and
+// the admin can retry, point at a mirror, or paste a copy (checked against
+// the manifest's hash).
 import { createResource, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { Portal } from "solid-js/web";
 import { A, useNavigate } from "@solidjs/router";
@@ -55,7 +57,6 @@ export default function Libraries(props: { org: string }) {
 
   const unavailable = () => !libs.loading && !libs.error && libs() === null;
   const rows = () => libs()?.installations ?? [];
-  const offered = () => (libs()?.first_party ?? []).filter((f) => !f.installed);
   const missing = () => libs()?.defaults?.state === "missing";
 
   const act = async (what: () => Promise<unknown>, fallback: string, done?: string) => {
@@ -86,13 +87,6 @@ export default function Libraries(props: { org: string }) {
       () => unyankLibrary(props.org, hash),
       "Could not lift the yank.",
       `Version ${shortHash(hash)} can run again.`,
-    );
-
-  const installDefaults = () =>
-    void act(
-      () => retryLibraryDefaults(props.org, { mirror: null, files: {} }),
-      "Could not install the first-party libraries.",
-      "The first-party libraries are installed.",
     );
 
   return (
@@ -164,11 +158,6 @@ export default function Libraries(props: { org: string }) {
                         <button class="btn btn-primary btn-sm" onClick={() => nav(reviewHref(props.org, {}))}>
                           <Icon icon="plus" size={14} /> Install library
                         </button>
-                        <Show when={offered().length > 0}>
-                          <button class="btn btn-ghost btn-sm" onClick={installDefaults}>
-                            Install first-party libraries ({offered().length})
-                          </button>
-                        </Show>
                       </div>
                     </div>
                   </div>
@@ -202,33 +191,6 @@ export default function Libraries(props: { org: string }) {
                   </For>
                 </tbody>
               </table>
-            </Show>
-
-            <Show when={offered().length > 0 && rows().length > 0}>
-              <p class="subtle">First-party libraries not installed here:</p>
-              <ul class="tok-list">
-                <For each={offered()}>
-                  {(f) => (
-                    <li class="tok">
-                      <div class="tok-head">
-                        <Icon icon="package" size={15} />
-                        <span class="tok-name mono">
-                          lib:{f.publisher}/{f.name}
-                        </span>
-                        <span class="tok-scope">{f.release}</span>
-                        <span class="oenv-actions">
-                          <button
-                            class="btn btn-ghost btn-sm"
-                            onClick={() => nav(reviewHref(props.org, { source: f.source, publisher: f.publisher, name: f.name }))}
-                          >
-                            install
-                          </button>
-                        </span>
-                      </div>
-                    </li>
-                  )}
-                </For>
-              </ul>
             </Show>
 
             <Show when={(libs()?.yanks ?? []).some((y) => !rows().some((r) => r.content_hash === y.content_hash))}>

@@ -274,7 +274,7 @@ export type ReviewCheck = { tone: "ok" | "info" | "warn"; text: string };
  *  library; these lines say what that means for this file. */
 export function reviewChecks(
   content: string,
-  firstParty: boolean,
+  inManifest: boolean,
   installed: { publisher: string; name: string; content_hash: string }[],
 ): ReviewCheck[] {
   const out: ReviewCheck[] = [
@@ -304,9 +304,9 @@ export function reviewChecks(
       : { tone: "info", text: "No Step asks for forge_token, so trust with forge credentials does not apply" },
   );
   out.push(
-    firstParty
-      ? { tone: "ok", text: "First-party: the hash is in Scarab's release manifest" }
-      : { tone: "info", text: "Not first-party: the hash is not in a Scarab release manifest" },
+    inManifest
+      ? { tone: "ok", text: "The hash is in Scarab's release manifest" }
+      : { tone: "info", text: "The hash is not in a Scarab release manifest" },
   );
   return out;
 }
@@ -334,4 +334,34 @@ export function reviewHref(
   for (const [k, v] of Object.entries(p)) if (v) q.set(k, v);
   const s = q.toString();
   return `/orgs/${encodeURIComponent(org)}/settings/libraries/review${s ? `?${s}` : ""}`;
+}
+
+/** A library Scarab's release manifest lists, as the review page offers it:
+ *  a source to fill in and review like any other, nothing more. */
+export type ReleaseSource = {
+  id: string;
+  source: string;
+  publisher: string;
+  name: string;
+  release: string;
+  security_fix: boolean;
+};
+
+/** The release manifest's libraries the org has not installed under their
+ *  name, sorted by id. They go through the same fetch, review and install
+ *  as any source; the manifest only says where to find them. */
+export function releaseSources(
+  listed: { publisher: string; name: string; source: string; release: string; security_fix: boolean; installed: boolean }[],
+): ReleaseSource[] {
+  return listed
+    .filter((l) => !l.installed)
+    .map((l) => ({
+      id: `lib:${l.publisher}/${l.name}`,
+      source: l.source,
+      publisher: l.publisher,
+      name: l.name,
+      release: l.release,
+      security_fix: l.security_fix,
+    }))
+    .sort((a, b) => a.id.localeCompare(b.id));
 }
