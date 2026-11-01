@@ -337,7 +337,7 @@ does not take the API's or a Step's word for success:
 | I10 | no uncommitted pack row older than 60 s for a fence that has a drain record; every committed pack's object exists at its recorded size |
 | W1 | the workload's outcome (not an ADR-0077 §2 invariant): every scenario Run ends `succeeded`, and every green Attempt has an output snapshot |
 | N1 | `pause-node` only (git-bug 070d042): no Attempt finished with a lost-node cause ("workspace snapshot lost", "egress sidecar died"); any other failed Attempt is a warning |
-| D1 | `two-replicas` only (git-bug 068cc0b): no `release-log.txt` line about a scenario Pod says "drain helper exited 12 with no record posted"; with no fault, that line means a second replica drove the same drain |
+| D1 | `two-replicas` only (git-bug 068cc0b): no two different server replicas drained the same scenario Pod over overlapping time. Each drain's interval comes from the replica's `ws-timing` line with `leg: drain` in `release-log.txt` (end = its timestamp, start = end − `total_ms`); a re-drive by another replica after the first drain ended passes. A drain that failed logs no `ws-timing` line. "drain helper exited 12 with no record posted" means a record POST failed (the Depot's `drain_state_incomplete` 422 at two Depot replicas, for one) and is printed as info |
 | C1 | the Cache probe (git-bug 12e2f6b): when the probe's seed Run succeeded and no fault hit the Cache's home Depot replica, every restore of the probe Run is a hit from that home. Otherwise it is printed `not exercised` with the reason, and it has no minimum |
 
 W1 is separate from the ADR's I-numbers because I3 and I4 as written there

@@ -24,7 +24,7 @@
 //! | L2   | rank 4: a peer takes the stopped leader's lease over within the TTL + 30 s, wherever the stop landed (inside a fenced write too: the fence's stall bound releases the lease row) |
 //! | W1   | the workload's own outcome: every scenario Run that ended, ended `succeeded`, and every green Attempt has an output snapshot |
 //! | N1   | `pause-node` (git-bug 070d042): no Attempt of a scenario Run finished with a lost-node verdict ("workspace snapshot lost", "egress sidecar died"); the node was paused, not lost. Any other failed Attempt is a warning |
-//! | D1   | `two-replicas` (git-bug 068cc0b): no release log line about a scenario Pod says "drain helper exited 12 with no record posted". With no fault, that line means a second replica drove the same drain |
+//! | D1   | `two-replicas` (git-bug 068cc0b): no two different server replicas ran a drain of the same scenario Pod over overlapping time. Each drain's interval comes from the replica's `ws-timing` line with `leg: drain` (end = the line's timestamp, start = end − `total_ms`). A re-drive by another replica after the first drain ended is allowed |
 //! | C1   | the Cache probe (`crate::cache::c1`, git-bug 12e2f6b): when the seed Run succeeded and no fault hit the Cache's home replica, every restore of the probe Run is a hit from that home. Otherwise not exercised, with the reason as an info finding; it has no minimum |
 //!
 //! W1 is not one of ADR-0077 §2's invariants. As written there, I3 accepts a
@@ -256,9 +256,47 @@ pub struct Facts {
 pub const LOST_NODE_CAUSES: &[&str] = &["workspace snapshot lost", "egress sidecar died"];
 
 /// The executor's cause when a drain helper's record POST failed
-/// (`drain_decision`); with two replicas and no fault it is the second driver
-/// of git-bug 068cc0b.
-pub const SECOND_DRIVER_LINE: &str = "drain helper exited 12 with no record posted";
+/// (`EXIT_DRAIN_RECORD_POST` in scarab-wsfetch). Any record POST failure
+/// gives it, the Depot's `drain_state_incomplete` 422 at two Depot replicas
+/// included, so it is NOT evidence of a second driver: D1 reports it as info.
+pub const DRAIN_RECORD_POST_FAILED: &str = "drain helper exited 12 with no record posted";
+
+/// One completed drain of a step Pod, from a server replica's `ws-timing`
+/// line (`leg: drain`): `[start_ms, end_ms]`, unix ms.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrainSpan {
+    pub replica: String,
+    pub pod: String,
+    pub start_ms: i64,
+    pub end_ms: i64,
+}
+
+/// The drain spans in `release-log.txt` (`<replica>: <JSON log line>`). The
+/// executor logs `total_ms` as a string (it is a u128); a number is read too.
+/// A drain that failed logs no `ws-timing` line, so it has no span.
+pub fn drain_spans(log: &str) -> Vec<DrainSpan> {
+    log.lines()
+        .filter_map(|line| {
+            let (replica, json) = line.split_once(": ")?;
+            let v: serde_json::Value = serde_json::from_str(json.trim()).ok()?;
+            let fields = &v["fields"];
+            if fields["message"] != "ws-timing" || fields["leg"] != "drain" {
+                return None;
+            }
+            let end_ms = crate::time::parse_rfc3339_ms(v["timestamp"].as_str()?)?;
+            let total: i64 = match &fields["total_ms"] {
+                serde_json::Value::String(s) => s.parse().ok()?,
+                n => n.as_i64()?,
+            };
+            Some(DrainSpan {
+                replica: replica.to_string(),
+                pod: fields["pod"].as_str()?.to_string(),
+                start_ms: end_ms - total,
+                end_ms,
+            })
+        })
+        .collect()
+}
 
 /// N1 over the journal: (Attempts finished, findings). Fails on a lost-node
 /// cause, warns on any other failed Attempt.
@@ -295,20 +333,39 @@ pub fn lost_node_verdicts(events: &[EventRow]) -> (usize, Vec<Finding>) {
     (n, out)
 }
 
-/// D1 over `release-log.txt`. A line fails when it carries
-/// [`SECOND_DRIVER_LINE`] and names one of `pods` (the scenario's step Pods;
-/// the log's time range can reach lines of an earlier scenario's Pods).
-pub fn second_drain_drivers(log: &str, pods: &BTreeSet<String>) -> Vec<Finding> {
+/// D1 over `release-log.txt`: (drain spans of `pods` read, findings). Fails
+/// when two DIFFERENT replicas' drains of one Pod overlap in time (the
+/// second driver of git-bug 068cc0b). Sequential drains by different
+/// replicas (a re-drive after a failed record POST) pass. Each
+/// [`DRAIN_RECORD_POST_FAILED`] line about one of `pods` is an info finding.
+/// `pods` are the scenario's step Pods; the log's time range can reach
+/// lines of an earlier scenario's Pods.
+pub fn second_drain_drivers(log: &str, pods: &BTreeSet<String>) -> (usize, Vec<Finding>) {
     let mut out = Vec::new();
-    for line in log.lines() {
-        if line.contains(SECOND_DRIVER_LINE) && pods.iter().any(|p| line.contains(p.as_str())) {
-            out.push(fail(
-                "D1",
-                format!("a second replica drove a drain with no fault (git-bug 068cc0b): {line}"),
-            ));
+    let spans: Vec<DrainSpan> = drain_spans(log).into_iter().filter(|s| pods.contains(&s.pod)).collect();
+    for (i, a) in spans.iter().enumerate() {
+        for b in &spans[i + 1..] {
+            if a.pod == b.pod && a.replica != b.replica && a.start_ms < b.end_ms && b.start_ms < a.end_ms {
+                out.push(fail(
+                    "D1",
+                    format!(
+                        "two replicas drained pod {} at once (git-bug 068cc0b): {} over [{}, {}] ms and {} over [{}, {}] ms",
+                        a.pod, a.replica, a.start_ms, a.end_ms, b.replica, b.start_ms, b.end_ms
+                    ),
+                ));
+            }
         }
     }
-    out
+    for line in log.lines() {
+        if line.contains(DRAIN_RECORD_POST_FAILED) && pods.iter().any(|p| line.contains(p.as_str())) {
+            out.push(Finding {
+                invariant: "D1".into(),
+                severity: Severity::Info,
+                detail: format!("a drain's record POST failed and was re-driven (not a second driver by itself): {line}"),
+            });
+        }
+    }
+    (spans.len(), out)
 }
 
 // --- evaluate (pure) -------------------------------------------------------------
@@ -997,9 +1054,13 @@ pub fn evaluate(f: &Facts) -> Verdict {
         let pods: BTreeSet<String> = f.pod_records.iter().filter(|r| r.pod.run.is_some()).map(|r| r.pod.name.clone()).collect();
         match &f.release_log {
             Some(log) => {
-                findings.extend(second_drain_drivers(log, &pods));
-                // What D1 looked at: the log lines of each scenario Pod.
-                checked.insert("D1".into(), pods.len());
+                let (n, found) = second_drain_drivers(log, &pods);
+                findings.extend(found);
+                // What D1 looked at: the drains of the scenario's Pods.
+                checked.insert("D1".into(), n);
+                if n == 0 {
+                    d1_unread = Some("D1: release-log.txt has no drain ws-timing line for a scenario Pod".to_string());
+                }
             }
             None => {
                 checked.insert("D1".into(), 0);
@@ -1838,27 +1899,67 @@ mod tests {
         assert!(exercised(Kind::PauseNode, &[late])[0].contains("landed after-window"));
     }
 
-    /// A release-log.txt line shaped like the executor's warning (git-bug
-    /// 068cc0b, a 2+2 run with no fault): a second driver fails D1, but only
-    /// for a Pod of this scenario.
+    /// D1 on recorded lines (the 2026-11-01 two-replicas s2 run, shapes
+    /// kept): two replicas whose drains of one Pod overlap fail D1; the same
+    /// Pod drained by one replica, then re-driven by the other after the
+    /// first ended, passes. An exit-12 line is info, never a failure, and
+    /// only a Pod of this scenario counts.
     #[test]
-    fn a_second_drain_driver_fails_d1() {
-        let line = "scarab-7d9c-x2: 2026-11-01T08:12:03.551Z  WARN scarab_executor_k8s: workspace settle is \
-                    transient; re-driving next poll pod=p-u1 cause=drain helper exited 12 with no record posted";
+    fn d1_fails_overlapping_drains_by_two_replicas_and_passes_a_sequential_re_drive() {
+        let drain = |replica: &str, pod: &str, end: &str, total: &str| {
+            format!(
+                r#"{replica}: {{"timestamp":"{end}","level":"INFO","fields":{{"message":"ws-timing","pod":"{pod}","leg":"drain","files":65,"exec_drain_ms":"{total}","outputs":0,"total_ms":"{total}"}},"target":"scarab_executor_k8s"}}"#
+            )
+        };
+        let exit12 = r#"scarab-589f5865d9-gwncm: {"timestamp":"2026-11-01T14:13:53.397335Z","level":"WARN","fields":{"message":"workspace settle is transient; re-driving next poll","pod":"p-u1","cause":"drain helper exited 12 with no record posted"},"target":"scarab_executor_k8s"}"#;
         let mut f = base();
         f.kind = Some(Kind::TwoReplicas);
-        f.release_log = Some("scarab-7d9c-x1: unrelated line about p-u1\n".into());
-        let v = evaluate(&f);
-        assert!(!v.findings.iter().any(|x| x.invariant == "D1"), "{:?}", v.findings);
-        assert_eq!(v.checked.get("D1"), Some(&1));
 
-        f.release_log = Some(format!("{line}\n"));
+        // Sequential: x1 drains 14:18:00.000-14:18:05.000, x2 re-drives
+        // 14:18:06.000-14:18:08.000. Plus the exit-12 line before them.
+        f.release_log = Some(format!(
+            "{exit12}\n{}\n{}\nscarab-x1: not json about p-u1\n",
+            drain("scarab-x1", "p-u1", "2026-11-01T14:18:05.000000Z", "5000"),
+            drain("scarab-x2", "p-u1", "2026-11-01T14:18:08.000000Z", "2000"),
+        ));
+        let v = evaluate(&f);
+        assert!(!failed(&v).contains(&"D1"), "{:?}", v.findings);
+        assert_eq!(v.checked.get("D1"), Some(&2));
+        assert!(
+            v.findings.iter().any(|x| x.invariant == "D1" && x.severity == Severity::Info && x.detail.contains("exited 12")),
+            "{:?}",
+            v.findings
+        );
+
+        // Overlapping: x2's drain started at 14:18:04.000, before x1's ended.
+        f.release_log = Some(format!(
+            "{}\n{}\n",
+            drain("scarab-x1", "p-u1", "2026-11-01T14:18:05.000000Z", "5000"),
+            drain("scarab-x2", "p-u1", "2026-11-01T14:18:08.000000Z", "4000"),
+        ));
         let v = evaluate(&f);
         assert_eq!(failed(&v), vec!["D1"], "{:?}", v.findings);
 
-        // Another scenario's Pod is not this one's finding.
-        f.release_log = Some(line.replace("p-u1", "p-other"));
+        // The same overlap by ONE replica (a retry in-process) is not D1's;
+        // nor is an overlap on another scenario's Pod.
+        f.release_log = Some(format!(
+            "{}\n{}\n",
+            drain("scarab-x1", "p-u1", "2026-11-01T14:18:05.000000Z", "5000"),
+            drain("scarab-x1", "p-u1", "2026-11-01T14:18:08.000000Z", "4000"),
+        ));
         assert!(!failed(&evaluate(&f)).contains(&"D1"));
+        f.release_log = Some(format!(
+            "{}\n{}\n",
+            drain("scarab-x1", "p-other", "2026-11-01T14:18:05.000000Z", "5000"),
+            drain("scarab-x2", "p-other", "2026-11-01T14:18:08.000000Z", "4000"),
+        ));
+        let v = evaluate(&f);
+        assert!(!failed(&v).contains(&"D1"));
+        assert!(v.inconclusive.iter().any(|w| w.starts_with("D1:")), "no drain of a scenario Pod read: {:?}", v.inconclusive);
+
+        // A numeric total_ms reads too.
+        let spans = drain_spans(&drain("r", "p", "2026-11-01T00:00:01Z", "1000").replace(r#""total_ms":"1000""#, r#""total_ms":1000"#));
+        assert_eq!(spans[0].start_ms + 1000, spans[0].end_ms);
 
         // No log at all: D1 read nothing, which is not a pass.
         f.release_log = None;

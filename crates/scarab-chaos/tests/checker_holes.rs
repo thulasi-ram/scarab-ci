@@ -446,8 +446,11 @@ fn two_replicas_needs_both_replicas_to_have_claimed_launches() {
     let mut f = clean();
     f.kind = Some(Kind::TwoReplicas);
     f.faults.clear();
-    // D1 reads release-log.txt, which every scenario writes.
-    f.release_log = Some(String::new());
+    // D1 reads the drains in release-log.txt, which every scenario writes.
+    f.release_log = Some(
+        r#"scarab-server-a: {"timestamp":"2026-11-01T14:18:05Z","fields":{"message":"ws-timing","pod":"p-u1","leg":"drain","total_ms":"900"}}"#
+            .to_string(),
+    );
     f.launch_claimers = ["scarab-server-a".to_string()].into();
     let v = evaluate(&f);
     assert_eq!(v.outcome, Outcome::Inconclusive);
