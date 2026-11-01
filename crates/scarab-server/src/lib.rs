@@ -1355,6 +1355,10 @@ pub struct SecretMatrixRow {
     /// `"org"`. Lets a cell say *what* it would be overriding, so an edit reads
     /// as "override the repo default" rather than an unexplained write.
     pub inherited_from: std::collections::BTreeMap<String, String>,
+    /// For each `set` cell that hides a broader value, the scope it hides —
+    /// `"repo"` or `"org"`. The counterpart of `inherited_from`: a repo key that
+    /// the org also defines reads as overriding the org, not as a lone key.
+    pub overrides: std::collections::BTreeMap<String, String>,
 }
 
 /// `PUT …/secrets/matrix/silenced` body — and, as a query, the `DELETE`
@@ -9528,6 +9532,7 @@ async fn secret_matrix(
         .map(|key| {
             let mut status = std::collections::BTreeMap::new();
             let mut inherited_from = std::collections::BTreeMap::new();
+            let mut overrides = std::collections::BTreeMap::new();
             for column in &columns {
                 // Where a value sits at *exactly* this column's scope.
                 let set_here = if column == REPO_DEFAULT_COLUMN {
@@ -9535,18 +9540,23 @@ async fn secret_matrix(
                 } else {
                     env_keys.get(column).is_some_and(|k| k.contains(&key))
                 };
-                // What it falls through to, nearest broader scope first.
-                let from = if set_here {
-                    None
-                } else if column != REPO_DEFAULT_COLUMN && repo_keys.contains(&key) {
+                // The nearest broader scope that also holds the key: what an
+                // unset cell falls through to, or what a set cell hides.
+                let broader = if column != REPO_DEFAULT_COLUMN && repo_keys.contains(&key) {
                     Some("repo")
                 } else if org_keys.contains(&key) {
                     Some("org")
                 } else {
                     None
                 };
+                let from = if set_here { None } else { broader };
                 let s = match (set_here, from) {
-                    (true, _) => "set",
+                    (true, _) => {
+                        if let Some(hidden) = broader {
+                            overrides.insert(column.clone(), hidden.to_string());
+                        }
+                        "set"
+                    }
                     (false, Some(origin)) => {
                         inherited_from.insert(column.clone(), origin.to_string());
                         "inherited"
@@ -9563,6 +9573,7 @@ async fn secret_matrix(
                 key,
                 status,
                 inherited_from,
+                overrides,
             }
         })
         .collect();

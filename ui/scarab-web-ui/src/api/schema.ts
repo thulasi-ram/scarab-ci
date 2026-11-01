@@ -4410,6 +4410,14 @@ export interface components {
             };
             key: string;
             /**
+             * @description For each `set` cell that hides a broader value, the scope it hides —
+             *     `"repo"` or `"org"`. The counterpart of `inherited_from`: a repo key that
+             *     the org also defines reads as overriding the org, not as a lone key.
+             */
+            overrides: {
+                [key: string]: string;
+            };
+            /**
              * @description `column id -> "set" | "inherited" | "unset" | "silenced"`.
              *
              *     `set` = a value lives at exactly that scope · `inherited` = none here, but
