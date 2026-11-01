@@ -20,7 +20,7 @@ The API and the web UI answer on the host at `SCARAB_ADDR` from
 `deploy/local-proc/.env` (`127.0.0.1:8080` in `.env.example`). `just ui` (Vite)
 proxies to the same address, so it works against this stack unchanged.
 
-Requires docker, kind, kubectl, helm, cargo, python3 and curl, plus zig and
+Requires docker, kind, kubectl, Helm 4, cargo, python3 and curl, plus zig and
 `cargo-zigbuild` on macOS. npm is optional: without it the server runs API-only.
 
 ## How the binary gets into the Pod

@@ -46,6 +46,10 @@ dogfood_env="${SCARAB_DOGFOOD_ENV:-$HOME/.config/scarab/dogfood.env}"
 need() { command -v "$1" >/dev/null 2>&1 || die "'$1' not found on PATH"; }
 need docker; need kind; need kubectl; need helm; need curl; need python3
 
+# `helm upgrade --force-conflicts` below exists only in Helm 4.
+helm_major="$(helm version --template '{{.Version}}' 2>/dev/null | sed -n 's/^v\([0-9][0-9]*\)\..*/\1/p')"
+[ "${helm_major:-0}" -ge 4 ] || die "Helm 4 is required (found $(helm version --short 2>/dev/null || echo none)); see https://helm.sh/docs/intro/install/"
+
 case "$mode" in
   dev|dogfood) ;;
   *) die "unknown mode '$mode' (expected dev or dogfood)" ;;
@@ -401,7 +405,7 @@ else
 fi
 
 echo "==> helm upgrade --install $release (mode: $mode, database: $database, bucket: $bucket)"
-# --force-conflicts: Helm 4 applies server-side; a field touched with kubectl
+# --force-conflicts (Helm 4, checked at the top): Helm 4 applies server-side; a field touched with kubectl
 # would otherwise abort the whole upgrade. The values are the authority.
 hc upgrade --install "$release" "$root/deploy/helm/scarab" -n "$ns" \
   -f "$here/values.yaml" -f "$values" --force-conflicts >/dev/null
