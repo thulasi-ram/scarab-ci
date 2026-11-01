@@ -1,12 +1,13 @@
-// Plugins (ADR-0072) — the Settings section where an org admin installs a
-// plugin, sees whether it is running, kills it, and binds its connections.
+// Plugins — the Settings section where an org admin installs a plugin, sees
+// whether it is running, kills it, and binds its connections.
 //
 // A PluginInstallation is the approval of exactly (image digest, manifest), so
-// the install form asks for a digest and shows what the manifest asks for. The
-// MMP installs first-party plugins only; anything else is the server's 403,
-// shown verbatim. Kill is the switch ADR-0072 §10 promises: it revokes at the
-// token-to-installation mapping, so it bites on the next request rather than
-// when a token expires. Uninstall retires the name forever.
+// the install form asks for a digest and shows what the manifest asks for.
+// Every catalog plugin installs through the same form; its publisher is shown
+// as a field, read from the image repository. A refusal from the server is
+// shown verbatim. Kill revokes at the token-to-installation mapping, so it
+// bites on the next request rather than when a token expires. Uninstall
+// retires the name forever.
 //
 // "Connections" (d3, ADR-0072 §5) bind each manifest connection slot to the
 // ONE destination the CredentialBroker sends the plugin's reads to, and the
@@ -44,6 +45,7 @@ import {
   imageRepository,
   INSECURE_HTTP_WARNING,
   isInsecureHttp,
+  pluginPublisher,
   toConnectionBody,
   type ConnectionForm,
   installNameError,
@@ -180,8 +182,8 @@ export default function Plugins(props: { org: string }) {
             <p class="subtle">
               <small>
                 <Icon icon="shield-check" size={12} /> An installation approves one image digest
-                and exactly what its manifest asks for — a new digest is a new install. Only
-                first-party plugins can be installed today. A plugin acts as{" "}
+                and exactly what its manifest asks for — a new digest is a new install. A
+                plugin acts as{" "}
                 <span class="mono">plugin:&lt;name&gt;</span>, never as a person.
               </small>
             </p>
@@ -233,6 +235,13 @@ function PluginRow(props: {
         <span class="tok-scope mono" title="The catalog plugin">
           {p().plugin}
         </span>
+        <Show when={pluginPublisher(p().image)}>
+          {(pub) => (
+            <span class="tok-scope" title="The publisher: the owner of the image repository">
+              by <span class="mono">{pub()}</span>
+            </span>
+          )}
+        </Show>
         <span class="tok-role" title="What it acts as in audit — not tied to any human">
           {p().principal}
         </span>
@@ -654,7 +663,8 @@ function ConnectionRow(props: {
   );
 }
 
-/** Install a catalog plugin, pinned by digest. */
+/** Install a catalog plugin, pinned by digest. Every catalog entry takes
+ *  this one path; the publisher is shown, not branched on. */
 function InstallDialog(props: {
   org: string;
   taken: string[];
@@ -680,7 +690,7 @@ function InstallDialog(props: {
     onCleanup(() => document.removeEventListener("keydown", onKey));
   });
 
-  const entries = () => (catalog() ?? []).filter((c) => c.first_party);
+  const entries = () => catalog() ?? [];
   const entry = (): PluginCatalogEntry | undefined => entries().find((c) => c.plugin === plugin());
 
   /** Picking a plugin prefills its repository (the admin supplies the
@@ -718,8 +728,8 @@ function InstallDialog(props: {
     try {
       props.onInstalled(await installPlugin(props.org, body));
     } catch (e) {
-      // The 403 ("third-party installs are off (ADR-0072): …") and the 409
-      // (name taken or retired, or plugins off) are the whole answer.
+      // A 403 (the server refuses this plugin) or a 409 (name taken or
+      // retired, or plugins off) is the whole answer.
       setError(e instanceof Error ? e.message : "Could not install the plugin.");
     } finally {
       setSaving(false);
@@ -743,13 +753,32 @@ function InstallDialog(props: {
           <div class="form-r">
             <label>plugin</label>
             <select class="input" value={plugin()} onChange={(e) => choose(e.currentTarget.value)}>
-              <option value="">choose a first-party plugin…</option>
-              <For each={entries()}>{(c) => <option value={c.plugin}>{c.plugin}</option>}</For>
+              <option value="">choose a plugin…</option>
+              <For each={entries()}>
+                {(c) => (
+                  <option value={c.plugin}>
+                    {pluginPublisher(c.image_repository) ? `${c.plugin} · ${pluginPublisher(c.image_repository)}` : c.plugin}
+                  </option>
+                )}
+              </For>
             </select>
             <Show when={entry()}>
               {(c) => <p class="fieldnote">{c().description}</p>}
             </Show>
           </div>
+
+          <Show when={entry()}>
+            {(c) => (
+              <div class="form-r">
+                <label>publisher</label>
+                <div class="mono">{pluginPublisher(c().image_repository) || "none in the image name"}</div>
+                <p class="fieldnote">
+                  The owner of <span class="mono">{c().image_repository}</span>: whose image you are
+                  approving.
+                </p>
+              </div>
+            )}
+          </Show>
 
           <div class="form-r">
             <label>name</label>

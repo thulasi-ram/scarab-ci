@@ -784,8 +784,7 @@ const argocdManifest: PluginCatalogEntryDto["manifest"] = {
 const pluginCatalog: PluginCatalogEntryDto[] = [
   {
     plugin: "argocd",
-    description:
-      "Reads Argo CD Application state through its connection (first-party).",
+    description: "Reads Argo CD Application state through its connection.",
     image_repository: ARGOCD_REPO,
     manifest: argocdManifest,
     first_party: true,
