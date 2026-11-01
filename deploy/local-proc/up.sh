@@ -19,6 +19,18 @@ cluster="scarab-dev"
 need() { command -v "$1" >/dev/null 2>&1 || { echo "error: '$1' not found on PATH" >&2; exit 1; }; }
 need docker; need kind; need kubectl
 
+# The kind dev stack (deploy/kind, `just up`) uses the same cluster name. Its
+# node mounts deploy/kind/.mount at /scarab; reusing that cluster here would
+# put proc mode's steps on it, and the e2e/forgejo-verify teardown would then
+# delete it with its data. Refuse instead.
+if kind get clusters 2>/dev/null | grep -qx "$cluster" \
+   && docker inspect -f '{{range .Mounts}}{{.Destination}}{{"\n"}}{{end}}' "$cluster-control-plane" 2>/dev/null \
+      | grep -qx /scarab; then
+  echo "error: kind cluster '$cluster' belongs to the kind dev stack ('just up'); proc mode" >&2
+  echo "  would reuse it and its teardown deletes it. Run 'just down' first." >&2
+  exit 1
+fi
+
 # Liveness helpers. Deliberately not lsof/ss/fuser — these scripts assume only
 # docker/kind/kubectl/curl, and bash's own /dev/tcp (already used for the
 # Postgres reuse check below) answers the only question we have: "is anything
