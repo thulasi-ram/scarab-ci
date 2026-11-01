@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":4,"timestamp":1793556600,"nonce":"ukgAPKtHhT4+HbHdw1fGyrVP4vc=","status":2}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":2,"timestamp":1793556696,"nonce":"pZXLqMOGMpDgNvXM58Whoh5Xi24=","title":"Scheduler lease: Raft-style term fencing so a paused leader cannot write after a takeover","was":"Owner decision 2026-11-01 (ADR-0077 grill, open question 7 / rank 4): build Raft-style term fencing for the scheduler lease."}]}
