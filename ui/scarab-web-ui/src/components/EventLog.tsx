@@ -3,17 +3,18 @@
 // target text and time range. The filters and the page's cursor live in the
 // URL (`event-log.ts`), so a filtered view can be shared and Back returns to
 // the newer page.
-import { For, Show, createEffect, createResource, createSignal } from "solid-js";
+import { For, Show, createEffect, createMemo, createResource, createSignal, on } from "solid-js";
 import { useSearchParams } from "@solidjs/router";
 import { listOrgSecurityEvents } from "../api/client";
 import {
   emptyText,
-  eventsQuery,
+  filterKey,
   filterSearch,
   fromLocalInput,
   isFiltered,
   rangeProblem,
   readView,
+  requestFor,
   toLocalInput,
   type EventLogFilter,
 } from "../event-log";
@@ -24,19 +25,23 @@ export default function EventLog(props: { org: string }) {
   const [search, setSearch] = useSearchParams();
   const view = () => readView(search);
 
-  // The form's drafts; the URL is the truth, and the drafts follow it (Back,
-  // a pasted link) until someone edits them.
+  // The form's drafts; the URL is the truth, and the drafts follow its
+  // filters (Back, a pasted link) until someone edits them. Paging changes
+  // only the cursor, so it leaves a draft not yet applied alone.
   const [actor, setActor] = createSignal("");
   const [target, setTarget] = createSignal("");
   const [from, setFrom] = createSignal("");
   const [to, setTo] = createSignal("");
-  createEffect(() => {
-    const v = view();
-    setActor(v.actor);
-    setTarget(v.target);
-    setFrom(toLocalInput(v.from));
-    setTo(toLocalInput(v.to));
-  });
+  const filters = createMemo(() => filterKey(view()));
+  createEffect(
+    on(filters, () => {
+      const v = view();
+      setActor(v.actor);
+      setTarget(v.target);
+      setFrom(toLocalInput(v.from));
+      setTo(toLocalInput(v.to));
+    }),
+  );
 
   const draft = (kind = view().kind): EventLogFilter => ({
     kind,
@@ -49,8 +54,12 @@ export default function EventLog(props: { org: string }) {
   const apply = (f: EventLogFilter) => setSearch(filterSearch(f), { replace: true });
   const clear = () => apply({ kind: "", actor: "", target: "", from: "", to: "" });
 
+  // A wrong time range sends nothing; the form says what is wrong.
   const [page] = createResource(
-    () => ({ org: props.org, q: eventsQuery(view()) }),
+    () => {
+      const q = requestFor(view());
+      return q && { org: props.org, q };
+    },
     (k) => listOrgSecurityEvents(k.org, k.q),
   );
   // The last page that loaded, kept on screen while the next one loads;
@@ -149,7 +158,7 @@ export default function EventLog(props: { org: string }) {
         <Show when={page.loading && !latest()}>
           <p class="empty">loading…</p>
         </Show>
-        <Show when={latest()}>
+        <Show when={!problem() && latest()}>
           {(p) => (
             <SecurityEventTable events={p().events} empty={emptyText(view(), !!view().cursor)} />
           )}

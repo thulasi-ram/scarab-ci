@@ -3,12 +3,14 @@ import { describe, expect, it } from "vitest";
 import {
   emptyText,
   eventsQuery,
+  filterKey,
   filterSearch,
   fromLocalInput,
   isFiltered,
   parseInstant,
   rangeProblem,
   readView,
+  requestFor,
   toLocalInput,
 } from "./event-log";
 
@@ -95,6 +97,38 @@ describe("rangeProblem", () => {
     expect(rangeProblem({ ...none, from: "2026-11-01T00:00Z", to: "2026-11-01T00:00Z" })).toBe(
       "From must be before To.",
     );
+  });
+});
+
+describe("requestFor", () => {
+  it("sends nothing for a reversed or unreadable range", () => {
+    const view = { ...none, cursor: "" };
+    expect(requestFor({ ...view, from: "2026-11-02T00:00Z", to: "2026-11-01T00:00Z" })).toBeNull();
+    expect(requestFor({ ...view, from: "soon" })).toBeNull();
+  });
+
+  it("sends the query for an ordered range", () => {
+    const view = { ...none, kind: "secret.read", from: "2026-11-01T00:00Z", to: "2026-11-02T00:00Z", cursor: "c1" };
+    expect(requestFor(view)).toEqual({
+      kind: "secret.read",
+      from: Date.parse("2026-11-01T00:00Z"),
+      to: Date.parse("2026-11-02T00:00Z"),
+      cursor: "c1",
+    });
+  });
+});
+
+describe("filterKey", () => {
+  it("ignores the cursor, so paging does not reset the drafts", () => {
+    const view = { ...none, actor: "j.lee", cursor: "" };
+    expect(filterKey({ ...view, cursor: "c2" })).toBe(filterKey(view));
+  });
+
+  it("changes with every filter", () => {
+    const base = filterKey({ ...none, cursor: "" });
+    for (const k of ["kind", "actor", "target", "from", "to"] as const) {
+      expect(filterKey({ ...none, cursor: "", [k]: "x" }), k).not.toBe(base);
+    }
   });
 });
 

@@ -90,6 +90,18 @@ export function rangeProblem(f: EventLogFilter): string | null {
   return null;
 }
 
+/** The request for a view, or `null` when its time range is wrong: the
+ *  form says why, and nothing is sent. */
+export function requestFor(v: EventLogView): ReturnType<typeof eventsQuery> | null {
+  return rangeProblem(v) === null ? eventsQuery(v) : null;
+}
+
+/** The view's filters without its cursor, as one comparable value: paging
+ *  changes the cursor only, so it leaves this unchanged. */
+export function filterKey(v: EventLogView): string {
+  return JSON.stringify([v.kind, v.actor, v.target, v.from, v.to]);
+}
+
 const pad = (n: number) => String(n).padStart(2, "0");
 
 /** A URL instant as a `datetime-local` value, in local time; `""` when unset
