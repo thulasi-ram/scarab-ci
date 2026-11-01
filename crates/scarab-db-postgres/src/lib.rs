@@ -2370,6 +2370,32 @@ impl Db for PostgresDb {
             .collect())
     }
 
+    async fn renew_outbox_claim(
+        &self,
+        id: OutboxId,
+        owner: &str,
+        visibility_ms: i64,
+    ) -> Result<bool, DbError> {
+        // Conditional on `claimed_by`: a claim that lapsed and was taken by
+        // another drainer is theirs now, and this renewal must not steal it
+        // back (git-bug 068cc0b). A lapsed claim nobody re-took is still ours,
+        // and extending it is harmless — nobody else is driving the message.
+        let renewed = sqlx::query(
+            "UPDATE outbox
+             SET claimed_until = (extract(epoch from now()) * 1000)::bigint + $3
+             WHERE id = $1 AND claimed_by = $2
+               AND dispatched_at IS NULL AND dead_lettered_at IS NULL",
+        )
+        .bind(id.0)
+        .bind(owner)
+        .bind(visibility_ms)
+        .execute(self.pool())
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+        Ok(renewed == 1)
+    }
+
     async fn mark_dispatched(&self, id: OutboxId) -> Result<(), DbError> {
         sqlx::query(
             "UPDATE outbox SET dispatched_at = (extract(epoch from now()) * 1000)::bigint

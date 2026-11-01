@@ -1033,6 +1033,20 @@ pub trait Db: Send + Sync {
         visibility_ms: i64,
     ) -> Result<Vec<OutboxMessage>, DbError>;
 
+    /// Extend `owner`'s claim on outbox message `id` by `visibility_ms` from
+    /// now, and say whether `owner` still holds it. `false` means another
+    /// drainer claimed the message since (`owner`'s claim lapsed, git-bug
+    /// 068cc0b), or it was dispatched or dead-lettered: `owner` must stop
+    /// driving it. A drainer renews while it works on a message, so a claim
+    /// lapses only when its holder stops renewing (it died, or was paused
+    /// past the window) and the message is then redelivered as before.
+    async fn renew_outbox_claim(
+        &self,
+        id: OutboxId,
+        owner: &str,
+        visibility_ms: i64,
+    ) -> Result<bool, DbError>;
+
     /// Mark a claimed outbox message dispatched, so it is never redelivered.
     async fn mark_dispatched(&self, id: OutboxId) -> Result<(), DbError>;
 
@@ -1194,6 +1208,12 @@ pub trait LogChunks: Send {
 #[async_trait]
 pub trait Clock: Send + Sync {
     async fn now(&self) -> Timestamp;
+
+    /// Wait `ms` milliseconds of real time. The scheduler uses it only to pace
+    /// its outbox-claim renewal while a message is being worked on (git-bug
+    /// 068cc0b): the claim's expiry is the database's wall clock, so the pace
+    /// is real time even under a fake `now`.
+    async fn sleep(&self, ms: u64);
 }
 
 /// Launches and observes units of execution on some backend (k8s, local…).

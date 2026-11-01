@@ -110,6 +110,10 @@ impl Clock for SystemClock {
             .unwrap_or(0);
         Timestamp(ms)
     }
+
+    async fn sleep(&self, ms: u64) {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    }
 }
 
 /// Shared handler state: the durable store, a clock, and the log pipeline.

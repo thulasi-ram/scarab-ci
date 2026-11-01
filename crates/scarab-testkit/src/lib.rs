@@ -75,6 +75,14 @@ impl Clock for FakeClock {
     async fn now(&self) -> Timestamp {
         Timestamp(self.millis.load(Ordering::SeqCst))
     }
+
+    /// Real time, not virtual: the only sleeper is the scheduler's outbox
+    /// claim renewal, and a claim expires on the store's wall clock (both the
+    /// postgres `claimed_until` and this crate's `Instant`), so advancing
+    /// virtual time could never make it due.
+    async fn sleep(&self, ms: u64) {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -88,6 +96,8 @@ struct OutboxEntry {
     /// `None` = never claimed; while set and in the future the row is hidden
     /// from every drainer. Wall-clock via `Instant`, like `leases` below.
     claimed_until: Option<std::time::Instant>,
+    /// Who holds (or last held) the claim — mirrors `outbox.claimed_by`.
+    claimed_by: Option<String>,
     dispatched: bool,
     /// Failed-delivery count (ADR-0047 poison handling).
     delivery_attempts: u32,
@@ -497,6 +507,7 @@ fn enqueue_outbox_locked(st: &mut InMemoryState, msg: &OutboxMessage) {
     st.outbox.push(OutboxEntry {
         msg,
         claimed_until: None,
+        claimed_by: None,
         dispatched: false,
         delivery_attempts: 0,
         dead_lettered: false,
@@ -2139,7 +2150,7 @@ impl Db for InMemoryDb {
 
     async fn claim_outbox(
         &self,
-        _owner: &str,
+        owner: &str,
         kind: Option<&str>,
         limit: u32,
         visibility_ms: i64,
@@ -2163,10 +2174,31 @@ impl Db for InMemoryDb {
             if !entry.dispatched && !entry.dead_lettered && claim_free && kind_ok {
                 entry.claimed_until =
                     Some(now + std::time::Duration::from_millis(visibility_ms.max(0) as u64));
+                entry.claimed_by = Some(owner.to_string());
                 out.push(entry.msg.clone());
             }
         }
         Ok(out)
+    }
+
+    async fn renew_outbox_claim(
+        &self,
+        id: OutboxId,
+        owner: &str,
+        visibility_ms: i64,
+    ) -> Result<bool, DbError> {
+        let mut st = self.state.lock().unwrap();
+        let Some(e) = st.outbox.iter_mut().find(|e| e.msg.id == id) else {
+            return Ok(false);
+        };
+        if e.dispatched || e.dead_lettered || e.claimed_by.as_deref() != Some(owner) {
+            return Ok(false);
+        }
+        e.claimed_until = Some(
+            std::time::Instant::now()
+                + std::time::Duration::from_millis(visibility_ms.max(0) as u64),
+        );
+        Ok(true)
     }
 
     async fn mark_dispatched(&self, id: OutboxId) -> Result<(), DbError> {
@@ -2591,6 +2623,19 @@ pub struct FakeExecutor {
     /// A one-shot hook the next `launch` awaits before it returns — see
     /// [`during_next_launch`](Self::during_next_launch).
     launch_hook: Mutex<Option<LaunchHook>>,
+    /// A one-shot hook the next `poll` awaits — see
+    /// [`during_next_poll`](Self::during_next_poll).
+    poll_hook: Mutex<Option<LaunchHook>>,
+    /// Polls in flight right now, and the most ever in flight at once, for
+    /// one handle (git-bug 068cc0b: two replicas driving one unit).
+    polls: Mutex<PollCount>,
+}
+
+#[derive(Default)]
+struct PollCount {
+    in_flight: HashMap<String, u32>,
+    max_in_flight: u32,
+    total: u32,
 }
 
 /// Work a test runs while a [`FakeExecutor::launch`] is in flight.
@@ -2603,7 +2648,28 @@ impl FakeExecutor {
             inner: Mutex::new(FakeExecState::default()),
             cancelled: Mutex::new(Vec::new()),
             launch_hook: Mutex::new(None),
+            poll_hook: Mutex::new(None),
+            polls: Mutex::new(PollCount::default()),
         }
+    }
+
+    /// Run `hook` to completion INSIDE the next `poll`, before it reports
+    /// (test seam, like [`during_next_launch`](Self::during_next_launch)):
+    /// models a poll that takes long — a workspace drain runs inside the k8s
+    /// executor's poll — so a test can act while it is in flight.
+    pub fn during_next_poll(&self, hook: LaunchHook) {
+        *self.poll_hook.lock().unwrap() = Some(hook);
+    }
+
+    /// The most polls of ONE handle that were ever in flight at the same
+    /// time. More than 1 means two drivers supervised the same unit at once.
+    pub fn max_concurrent_polls(&self) -> u32 {
+        self.polls.lock().unwrap().max_in_flight
+    }
+
+    /// How many polls have started, over every handle.
+    pub fn polls_started(&self) -> u32 {
+        self.polls.lock().unwrap().total
     }
 
     /// Run `hook` to completion INSIDE the next `launch`, before it returns
@@ -2911,6 +2977,30 @@ impl Executor for FakeExecutor {
     }
 
     async fn poll(&self, handle: &ExecHandle) -> Result<ExecState, ExecError> {
+        {
+            let mut p = self.polls.lock().unwrap();
+            p.total += 1;
+            let n = p.in_flight.entry(handle.0.clone()).or_default();
+            *n += 1;
+            let n = *n;
+            p.max_in_flight = p.max_in_flight.max(n);
+        }
+        // Decrements on every exit, including a dropped (cancelled) poll.
+        struct Done<'a>(&'a Mutex<PollCount>, String);
+        impl Drop for Done<'_> {
+            fn drop(&mut self) {
+                if let Ok(mut p) = self.0.lock() {
+                    if let Some(n) = p.in_flight.get_mut(&self.1) {
+                        *n = n.saturating_sub(1);
+                    }
+                }
+            }
+        }
+        let _done = Done(&self.polls, handle.0.clone());
+        let hook = self.poll_hook.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook().await;
+        }
         let mut st = self.inner.lock().unwrap();
         if st.dead.contains(handle) {
             return Ok(ExecState::Lost);

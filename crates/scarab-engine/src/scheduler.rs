@@ -2781,13 +2781,23 @@ impl<'a> Scheduler<'a> {
             )
             .await?;
         for msg in msgs {
+            // One driver per launch intent (git-bug 068cc0b): the work runs
+            // only while this replica holds the message's claim, and the claim
+            // is renewed while it runs. A lost claim means another replica
+            // drives the intent now; this one stops and counts nothing.
+            let Some(outcome) = self
+                .while_claimed(&msg, self.process_launch_intent(&msg))
+                .await?
+            else {
+                continue;
+            };
             // Fault isolation + poison handling (ADR-0047): one failing
             // message must neither stall the batch behind it nor redeliver
             // forever. A processing error counts one failed delivery; at
             // MAX_DELIVERY_ATTEMPTS the message is dead-lettered (never
             // claimed again) and its run transitions to DeadLettered with
             // diagnostics — the operator signal.
-            if let Err(e) = self.process_launch_intent(&msg).await {
+            if let Err(e) = outcome {
                 let failures = self.db.record_outbox_failure(msg.id).await?;
                 if failures >= MAX_DELIVERY_ATTEMPTS {
                     self.db.dead_letter_outbox(msg.id).await?;
@@ -2804,6 +2814,69 @@ impl<'a> Scheduler<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Run `work` on the claimed outbox message `msg` only while this replica
+    /// holds its claim (git-bug 068cc0b). Returns `None` when the claim was
+    /// lost — before `work` started, or while it ran — and `work` was not run
+    /// or was dropped; `Some` with `work`'s result otherwise.
+    ///
+    /// The bug this closes: a claim hid a message for `outbox_visibility_ms`
+    /// and nothing extended it, so a launch intent whose poll ran longer than
+    /// the window (a workspace drain is a poll, and it can take minutes) was
+    /// claimed by a second replica while the first was still inside it. Two
+    /// replicas then drove one Pod's drain. Messages later in a batch had the
+    /// same hole: they waited out their claim behind the earlier ones.
+    ///
+    /// So the claim is checked (and extended) just before `work` starts, and
+    /// renewed every third of the window while it runs. A replica that dies
+    /// stops renewing, its claim lapses within one window, and the intent is
+    /// redelivered as before. A replica paused past the window (SIGSTOP, a VM
+    /// suspend) can lose the claim to a peer; its next renewal sees that and
+    /// drops `work` at its current await point. Dropping is the same as a
+    /// crash at that point, which launch-or-adopt already tolerates (ADR-0047):
+    /// every step of `process_launch_intent` is re-derived from durable state
+    /// by whoever drives the intent next.
+    ///
+    /// A window of zero or less holds nothing (tests use it to make every
+    /// message immediately reclaimable), so there is nothing to renew.
+    async fn while_claimed<T>(
+        &self,
+        msg: &OutboxMessage,
+        work: impl std::future::Future<Output = T>,
+    ) -> Result<Option<T>, SchedulerError> {
+        let window = self.cfg.outbox_visibility_ms;
+        if window <= 0 {
+            return Ok(Some(work.await));
+        }
+        if !self
+            .db
+            .renew_outbox_claim(msg.id, &self.owner, window)
+            .await?
+        {
+            return Ok(None);
+        }
+        let every = (window / 3).max(1) as u64;
+        let renew = async {
+            loop {
+                self.clock.sleep(every).await;
+                // An error is treated like a lost claim: this replica cannot
+                // show it still holds the message, so it must not keep
+                // driving it past the window.
+                if !matches!(
+                    self.db
+                        .renew_outbox_claim(msg.id, &self.owner, window)
+                        .await,
+                    Ok(true)
+                ) {
+                    return;
+                }
+            }
+        };
+        Ok(match first_of(work, renew).await {
+            First::Left(out) => Some(out),
+            First::Right(()) => None,
+        })
     }
 
     /// Drain cancel-teardown intents (ADR-0054): every [`CANCEL_ATTEMPT`]
@@ -5101,6 +5174,35 @@ impl<'a> Scheduler<'a> {
             .await?;
         Ok(())
     }
+}
+
+/// Which of two futures finished first; see [`first_of`].
+enum First<L, R> {
+    Left(L),
+    Right(R),
+}
+
+/// Poll `left` and `right` together and return whichever finishes first,
+/// dropping the other. `left` is polled first, so work that is ready wins
+/// over a renewal that failed in the same wake-up. (The engine has no async
+/// runtime dependency, so this is the one `select` it needs, written out.)
+async fn first_of<L, R>(
+    left: impl std::future::Future<Output = L>,
+    right: impl std::future::Future<Output = R>,
+) -> First<L, R> {
+    use std::task::Poll;
+    let mut left = std::pin::pin!(left);
+    let mut right = std::pin::pin!(right);
+    std::future::poll_fn(|cx| {
+        if let Poll::Ready(v) = left.as_mut().poll(cx) {
+            return Poll::Ready(First::Left(v));
+        }
+        if let Poll::Ready(v) = right.as_mut().poll(cx) {
+            return Poll::Ready(First::Right(v));
+        }
+        Poll::Pending
+    })
+    .await
 }
 
 /// An [`EventKind`] of this build's schema version.

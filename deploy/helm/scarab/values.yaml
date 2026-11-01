@@ -11,9 +11,13 @@ imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""
 
-# Number of scarab-server replicas. Safe to scale: Postgres (the outbox) is the
-# coordination bus, and `launch` is idempotent (ADR-0021). For a converged
-# deployment keep this at 1 unless you split roles.
+# Number of scarab-server replicas. Safe to scale, with converged or split
+# roles: Postgres is the coordination bus, and `launch` is idempotent on the
+# Attempt's fence (ADR-0021, ADR-0047). A replica supervises a Step only while
+# it holds that Step's launch intent claim, and renews the claim while it works
+# (a workspace drain can outlast the 30 s window), so two replicas never drive
+# one Pod at once; a replica that dies stops renewing and a peer takes the
+# intent over within 30 s.
 replicaCount: 1
 
 # How the server Deployment is updated. `Recreate` stops every old server Pod

@@ -17,8 +17,11 @@ scarab-project = { workspace = true }
 scarab-policy = { workspace = true }
 async-trait = { workspace = true }
 serde_json = { workspace = true }
+# A real timer for `FakeClock::sleep` (the scheduler paces its outbox-claim
+# renewal with it, git-bug 068cc0b) and the async lock the in-memory leader
+# fence holds across a write (git-bug aaf4e3e). Every consumer of this crate
+# is a tokio test already.
+tokio = { workspace = true }
 
-# Test-only: an async runtime to drive the async `Db`/`Clock` ports in tests.
-# This is a dev-dependency, so the testkit library itself stays infra-free.
 [dev-dependencies]
 tokio = { workspace = true }
