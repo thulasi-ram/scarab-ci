@@ -42,8 +42,8 @@ import {
   environmentHref,
   environmentsHref,
   planSave,
+  runSave,
   toEditForm,
-  type EnvironmentWrite,
 } from "../org-environments";
 import { addToList } from "../identities";
 import { decodeParam } from "../settings-nav";
@@ -290,12 +290,6 @@ function Edit(props: { org: string; name: string }) {
   );
 }
 
-const PART_LABEL: Record<EnvironmentWrite["part"], string> = {
-  description: "description",
-  baseline: "baseline",
-  eligibility: "list of projects that may deploy",
-};
-
 function EditForm(props: { org: string; env: OrgEnvironment }) {
   const nav = useNavigate();
   const initial = toEditForm(props.env);
@@ -322,20 +316,21 @@ function EditForm(props: { org: string; env: OrgEnvironment }) {
     if (!writes || writes.length === 0 || saving()) return;
     setSaving(true);
     setError(null);
-    const done: string[] = [];
     try {
-      for (const w of writes) {
-        try {
-          if (w.part === "description") await putOrgEnvironment(props.org, props.env.name, w.body);
-          else if (w.part === "baseline") await putEnvironmentProtection(props.org, props.env.name, w.body);
-          else await putEnvironmentEligibility(props.org, props.env.name, w.body);
-          done.push(PART_LABEL[w.part]);
-        } catch (e) {
-          const why = e instanceof Error ? e.message : "the server refused it";
-          const saved = done.length > 0 ? ` The ${done.join(" and ")} saved.` : "";
-          setError(`Could not save the ${PART_LABEL[w.part]}: ${why}.${saved}`);
-          return;
-        }
+      const problem = await runSave(writes, {
+        // Re-read first: the description write would recreate an
+        // Environment another admin deleted since this page loaded.
+        stillThere: async () => (await getOrgEnvironment(props.org, props.env.name)) !== null,
+        send: (w) =>
+          w.part === "description"
+            ? putOrgEnvironment(props.org, props.env.name, w.body)
+            : w.part === "baseline"
+              ? putEnvironmentProtection(props.org, props.env.name, w.body)
+              : putEnvironmentEligibility(props.org, props.env.name, w.body),
+      });
+      if (problem !== null) {
+        setError(problem);
+        return;
       }
       nav(viewHref());
     } finally {

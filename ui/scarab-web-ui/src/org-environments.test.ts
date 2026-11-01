@@ -7,9 +7,12 @@ import {
   environmentsHref,
   nameError,
   planSave,
+  runSave,
+  DELETED_ELSEWHERE,
   toEditForm,
   toPutBody,
   type EditableEnvironmentLike,
+  type EnvironmentWrite,
 } from "./org-environments";
 
 describe("toPutBody", () => {
@@ -153,5 +156,65 @@ describe("planSave", () => {
     const plan = planSave(stored, form);
     expect(plan.writes).toBeUndefined();
     expect(plan.error).toMatch(/wait timer/);
+  });
+});
+
+describe("runSave", () => {
+  const writes: EnvironmentWrite[] = [
+    { part: "description", body: { description: "prod, EU" } },
+    { part: "eligibility", body: { all_projects: true, projects: [] } },
+  ];
+
+  // Another admin deleted the Environment after this page loaded. The
+  // description write is a create-or-replace, so sending it would bring the
+  // Environment back with the default baseline and undo the delete.
+  it("sends nothing and says so when the environment was deleted since the page loaded", async () => {
+    const sent: EnvironmentWrite[] = [];
+    const problem = await runSave(writes, {
+      stillThere: async () => false,
+      send: async (w) => {
+        sent.push(w);
+      },
+    });
+    expect(problem).toBe(DELETED_ELSEWHERE);
+    expect(sent).toEqual([]);
+  });
+
+  it("sends every write in order when the environment is still there", async () => {
+    const sent: string[] = [];
+    const problem = await runSave(writes, {
+      stillThere: async () => true,
+      send: async (w) => {
+        sent.push(w.part);
+      },
+    });
+    expect(problem).toBeNull();
+    expect(sent).toEqual(["description", "eligibility"]);
+  });
+
+  it("stops at the first failed write and names what saved", async () => {
+    const problem = await runSave(writes, {
+      stillThere: async () => true,
+      send: async (w) => {
+        if (w.part === "eligibility") throw new Error("pattern list is empty");
+      },
+    });
+    expect(problem).toBe(
+      "Could not save the list of projects that may deploy: pattern list is empty. The description saved.",
+    );
+  });
+
+  it("sends nothing when the check itself fails", async () => {
+    const sent: EnvironmentWrite[] = [];
+    const problem = await runSave(writes, {
+      stillThere: async () => {
+        throw new Error("network down");
+      },
+      send: async (w) => {
+        sent.push(w);
+      },
+    });
+    expect(problem).toBe("Could not check the environment before saving: network down.");
+    expect(sent).toEqual([]);
   });
 });

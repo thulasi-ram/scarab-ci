@@ -154,3 +154,52 @@ export function planSave(
   }
   return { writes };
 }
+
+/** How each part is named when a Save reports what did or did not save. */
+export const PART_LABEL: Record<EnvironmentWrite["part"], string> = {
+  description: "description",
+  baseline: "baseline",
+  eligibility: "list of projects that may deploy",
+};
+
+/** What a Save says when the Environment is gone before its first write. */
+export const DELETED_ELSEWHERE = "This environment was deleted by someone else.";
+
+/**
+ * Send a Save's `writes` in order, and say what went wrong, or `null`.
+ *
+ * Before the first write it asks `stillThere` whether the Environment still
+ * exists. The description write is a create-or-replace, so a Save on a page
+ * opened before another admin deleted the Environment would otherwise bring
+ * it back with the default baseline and eligibility, and the delete would be
+ * lost. A missing Environment stops the Save with nothing sent.
+ *
+ * Stops at the first write that fails and names the parts that did save.
+ */
+export async function runSave(
+  writes: readonly EnvironmentWrite[],
+  io: {
+    stillThere: () => Promise<boolean>;
+    send: (write: EnvironmentWrite) => Promise<unknown>;
+  },
+): Promise<string | null> {
+  if (writes.length === 0) return null;
+  try {
+    if (!(await io.stillThere())) return DELETED_ELSEWHERE;
+  } catch (e) {
+    const why = e instanceof Error ? e.message : "the server did not answer";
+    return `Could not check the environment before saving: ${why}.`;
+  }
+  const done: string[] = [];
+  for (const w of writes) {
+    try {
+      await io.send(w);
+      done.push(PART_LABEL[w.part]);
+    } catch (e) {
+      const why = e instanceof Error ? e.message : "the server refused it";
+      const saved = done.length > 0 ? ` The ${done.join(" and ")} saved.` : "";
+      return `Could not save the ${PART_LABEL[w.part]}: ${why}.${saved}`;
+    }
+  }
+  return null;
+}

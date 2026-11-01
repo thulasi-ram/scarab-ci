@@ -53,7 +53,7 @@ import {
 import { relTime } from "../fmt";
 import { confirmsName } from "../org-environments";
 import { me, refetchMe } from "../session";
-import { orgHref } from "../settings-nav";
+import { FIRST_ORG_SECTION, orgHref } from "../settings-nav";
 import FormSection from "./FormSection";
 import Icon from "./Icon";
 
@@ -188,8 +188,9 @@ export function ConnectForge() {
         <ForgejoConnectionForm
           onSaved={async (org) => {
             // The new org is in `admin_orgs` only once `/v1/me` is asked again.
+            // Then its home section, which is its Connections.
             await refetchMe();
-            nav(orgHref(org, "connections"));
+            nav(orgHref(org, FIRST_ORG_SECTION));
           }}
         />
       </div>
