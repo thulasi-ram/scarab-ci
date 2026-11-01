@@ -1,5 +1,5 @@
 # Dev-only in-cluster Forgejo for the kind stack, next to Postgres and MinIO,
-# in every mode. `just e2e` drives it (git-bug 3863d5e: the Forgejo adapter's
+# in every mode. `just test e2e` drives it (git-bug 3863d5e: the Forgejo adapter's
 # request and response shapes are checked against a real Forgejo, not against
 # what we believed it sends). Throwaway: SQLite on a PVC, install wizard locked,
 # registration off. Never point anything real here.

@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use scarab_engine::ports::{ExecHandle, ExecState, Lease};
+use scarab_engine::ports::{ExecHandle, ExecState, LeaderTerm, Lease};
 use scarab_engine::{
     Attempt, AttemptId, AttemptOutcome, Clock, ConcurrencyPolicy, Db, DbError, EventKind,
     ExecError, Executor, FailureKind, LogChunkMeta, OutboxId, OutboxMessage, RunId, RunService,
@@ -75,6 +75,32 @@ impl Clock for FakeClock {
     async fn now(&self) -> Timestamp {
         Timestamp(self.millis.load(Ordering::SeqCst))
     }
+
+    /// Real time, not virtual: the only sleeper is the scheduler's outbox
+    /// claim renewal, and a claim expires on the store's wall clock (both the
+    /// postgres `claimed_until` and this crate's `Instant`), so advancing
+    /// virtual time could never make it due.
+    async fn sleep(&self, ms: u64) {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    }
+}
+
+/// The in-memory leader fence (git-bug aaf4e3e): `leader` still holds its
+/// lease term, or [`DbError::NotLeader`]. Called with the state lock held, so
+/// the check and the write after it are one step, as the postgres fenced
+/// transaction is, and a takeover (`lease`, under the same lock) is ordered
+/// before or after it, never between. There are no lock waits here, so a
+/// fenced write never times out ([`DbError::FenceTimeout`] is postgres-only).
+fn holds_leader_term(st: &InMemoryState, leader: &LeaderTerm) -> Result<(), DbError> {
+    match st.leases.get(leader.resource()) {
+        Some((owner, _, term)) if owner == leader.owner() && *term == leader.term() => Ok(()),
+        _ => Err(DbError::NotLeader),
+    }
+}
+
+/// [`holds_leader_term`] when the write is a leader's; a no-op otherwise.
+fn holds_leader_term_if(st: &InMemoryState, leader: Option<&LeaderTerm>) -> Result<(), DbError> {
+    leader.map_or(Ok(()), |l| holds_leader_term(st, l))
 }
 
 // ---------------------------------------------------------------------------
@@ -88,6 +114,8 @@ struct OutboxEntry {
     /// `None` = never claimed; while set and in the future the row is hidden
     /// from every drainer. Wall-clock via `Instant`, like `leases` below.
     claimed_until: Option<std::time::Instant>,
+    /// Who holds (or last held) the claim — mirrors `outbox.claimed_by`.
+    claimed_by: Option<String>,
     dispatched: bool,
     /// Failed-delivery count (ADR-0047 poison handling).
     delivery_attempts: u32,
@@ -245,8 +273,8 @@ struct InMemoryState {
     forge_config_owned: std::collections::HashSet<String>,
     /// Webhook delivery-id replay guard: (forge kind token, delivery id).
     webhook_deliveries: std::collections::HashSet<(String, String)>,
-    /// Lease table: resource → (owner, expiry instant).
-    leases: HashMap<String, (String, std::time::Instant)>,
+    /// Lease table: resource → (owner, expiry instant, term).
+    leases: HashMap<String, (String, std::time::Instant, i64)>,
     /// Artifact versions (ADR-0052, immutable per attempt by ADR-0056),
     /// keyed (run, name, step, attempt).
     artifacts: HashMap<(RunId, String, StepId, AttemptId), scarab_engine::ArtifactRecord>,
@@ -410,8 +438,8 @@ impl InMemoryDb {
     }
 
     /// Make `run` a **poison run** (test seam for ADR-0059 tick isolation): its
-    /// per-run reads — `run_project` (on the admit leg) and `steps_of_run` (on
-    /// the advance leg) — fail with a backend error until
+    /// per-run reads — `superseded_by` (which the admit leg makes for every
+    /// Pending run) and `steps_of_run` (on the advance leg) — fail with a backend error until
     /// [`heal_run`](Self::heal_run) clears it. Models the class of fault the
     /// tick must isolate: one run that cannot be driven forward, for a reason
     /// that has nothing to do with any other run.
@@ -497,6 +525,7 @@ fn enqueue_outbox_locked(st: &mut InMemoryState, msg: &OutboxMessage) {
     st.outbox.push(OutboxEntry {
         msg,
         claimed_until: None,
+        claimed_by: None,
         dispatched: false,
         delivery_attempts: 0,
         dead_lettered: false,
@@ -677,9 +706,17 @@ fn attempt_order_key(a: &Attempt) -> u64 {
 
 #[async_trait]
 impl Db for InMemoryDb {
-    async fn claim_ready_steps(&self, limit: u32) -> Result<Vec<StepRun>, DbError> {
+    async fn claim_ready_steps(
+        &self,
+        leader: &LeaderTerm,
+        limit: u32,
+        mint: scarab_engine::ports::MintLaunch<'_>,
+    ) -> Result<Vec<StepRun>, DbError> {
+        // One lock = the postgres fenced transaction: the fence, the claim and
+        // every claimed step's launch (git-bug 0f29112). Every launch is built
+        // and checked before the first mutation, so a failure claims nothing.
         let mut st = self.state.lock().unwrap();
-        let mut claimed = Vec::new();
+        holds_leader_term(&st, leader)?;
         // Deterministic order for tests.
         let mut keys: Vec<(RunId, StepId)> = st
             .steps
@@ -690,19 +727,38 @@ impl Db for InMemoryDb {
         keys.sort_by(|a, b| {
             (a.0 .0.as_str(), a.1 .0.as_str()).cmp(&(b.0 .0.as_str(), b.1 .0.as_str()))
         });
+        let mut claimed = Vec::new();
+        let mut launches = Vec::new();
         for key in keys.into_iter().take(limit as usize) {
-            let rec = st.steps.get_mut(&key).unwrap();
-            rec.status = Some(StepStatus::Running);
+            let rec = &st.steps[&key];
             let mut attempts = rec.attempts.clone();
             attempts.sort_by_key(attempt_order_key);
-            claimed.push(StepRun {
+            let step = StepRun {
                 run: key.0.clone(),
                 step: key.1.clone(),
                 status: StepStatus::Running,
                 attempts,
                 needs: rec.needs.clone(),
                 gate_kind: rec.gate_kind.clone(),
-            });
+            };
+            launches.push(mint(&step)?);
+            claimed.push(step);
+        }
+        let events: Vec<EventKind> = launches.iter().flat_map(|l| l.events.clone()).collect();
+        take_event_append_failure(&mut st, &events)?;
+        for (step, launch) in claimed.iter().zip(launches) {
+            let rec = st
+                .steps
+                .get_mut(&(step.run.clone(), step.step.clone()))
+                .expect("read above");
+            rec.status = Some(StepStatus::Running);
+            if !rec.attempts.iter().any(|a| a.id == launch.attempt.id) {
+                rec.attempts.push(launch.attempt);
+            }
+            st.events.extend(launch.events);
+            for msg in &launch.outbox {
+                enqueue_outbox_locked(&mut st, msg);
+            }
         }
         Ok(claimed)
     }
@@ -1026,6 +1082,29 @@ impl Db for InMemoryDb {
         Ok(())
     }
 
+    async fn promote_step(
+        &self,
+        leader: &LeaderTerm,
+        run: &RunId,
+        step: &StepId,
+        signature: &str,
+        events: &[EventKind],
+    ) -> Result<(), DbError> {
+        // One lock = the postgres fenced transaction.
+        let mut st = self.state.lock().unwrap();
+        holds_leader_term(&st, leader)?;
+        check_step_transition_locked(&mut st, run, step, StepStatus::Pending)?;
+        take_event_append_failure(&mut st, events)?;
+        let rec = st
+            .steps
+            .get_mut(&(run.clone(), step.clone()))
+            .expect("checked above");
+        rec.status = Some(StepStatus::Ready);
+        rec.input = Some(signature.to_string());
+        st.events.extend(events.iter().cloned());
+        Ok(())
+    }
+
     async fn step_input(&self, run: &RunId, step: &StepId) -> Result<Option<String>, DbError> {
         Ok(self
             .state
@@ -1085,8 +1164,14 @@ impl Db for InMemoryDb {
         Ok(self.state.lock().unwrap().concurrency.get(run).cloned())
     }
 
-    async fn acquire_slot(&self, group: &str, run: &RunId) -> Result<Option<RunId>, DbError> {
+    async fn acquire_slot(
+        &self,
+        leader: &LeaderTerm,
+        group: &str,
+        run: &RunId,
+    ) -> Result<Option<RunId>, DbError> {
         let mut st = self.state.lock().unwrap();
+        holds_leader_term(&st, leader)?;
         match st.slots.get(group).cloned() {
             None => {
                 st.slots.insert(group.to_string(), run.clone());
@@ -1125,6 +1210,12 @@ impl Db for InMemoryDb {
 
     async fn superseded_by(&self, run: &RunId) -> Result<Vec<RunId>, DbError> {
         let st = self.state.lock().unwrap();
+        if st.poisoned_runs.contains(run) {
+            return Err(DbError::Other(format!(
+                "injected: run {} is poisoned (admit leg)",
+                run.0
+            )));
+        }
         let Some(key) = st.supersede_keys.get(run) else {
             return Ok(Vec::new());
         };
@@ -1155,12 +1246,6 @@ impl Db for InMemoryDb {
 
     async fn run_project(&self, run: &RunId) -> Result<Option<String>, DbError> {
         let st = self.state.lock().unwrap();
-        if st.poisoned_runs.contains(run) {
-            return Err(DbError::Other(format!(
-                "injected: run {} is poisoned (admit leg)",
-                run.0
-            )));
-        }
         Ok(st.run_project.get(run).cloned())
     }
 
@@ -1361,6 +1446,17 @@ impl Db for InMemoryDb {
         Ok(n as u32)
     }
 
+    async fn count_running_runs(&self, project: &str) -> Result<u32, DbError> {
+        let st = self.state.lock().unwrap();
+        let n = st
+            .runs
+            .iter()
+            .filter(|(_, s)| matches!(s, RunStatus::Running))
+            .filter(|(r, _)| st.run_project.get(*r).map(String::as_str) == Some(project))
+            .count();
+        Ok(n as u32)
+    }
+
     async fn set_step_gate(
         &self,
         run: &RunId,
@@ -1411,12 +1507,14 @@ impl Db for InMemoryDb {
 
     async fn set_gate_wait_inputs(
         &self,
+        leader: &LeaderTerm,
         run: &RunId,
         step: &StepId,
         attempt: &AttemptId,
         inputs: &serde_json::Value,
     ) -> Result<bool, DbError> {
         let mut st = self.state.lock().unwrap();
+        holds_leader_term(&st, leader)?;
         let running = st
             .steps
             .get(&(run.clone(), step.clone()))
@@ -1492,16 +1590,16 @@ impl Db for InMemoryDb {
 
     async fn create_run_service(
         &self,
+        leader: Option<&LeaderTerm>,
         run: &RunId,
         take: i64,
         name: &str,
         at: Timestamp,
     ) -> Result<(), DbError> {
         // Idempotent on {run, take, name}: an existing row is left untouched.
-        self.state
-            .lock()
-            .unwrap()
-            .run_services
+        let mut st = self.state.lock().unwrap();
+        holds_leader_term_if(&st, leader)?;
+        st.run_services
             .entry((run.clone(), take, name.to_string()))
             .or_insert((ServiceStatus::Starting, None, at));
         Ok(())
@@ -1509,6 +1607,7 @@ impl Db for InMemoryDb {
 
     async fn set_run_service(
         &self,
+        leader: Option<&LeaderTerm>,
         run: &RunId,
         take: i64,
         name: &str,
@@ -1516,6 +1615,7 @@ impl Db for InMemoryDb {
         handle: Option<&str>,
     ) -> Result<(), DbError> {
         let mut st = self.state.lock().unwrap();
+        holds_leader_term_if(&st, leader)?;
         if let Some(rec) = st
             .run_services
             .get_mut(&(run.clone(), take, name.to_string()))
@@ -2005,6 +2105,7 @@ impl Db for InMemoryDb {
 
     async fn commit_run_transition(
         &self,
+        leader: Option<&LeaderTerm>,
         run: &RunId,
         from: RunStatus,
         to: RunStatus,
@@ -2013,8 +2114,9 @@ impl Db for InMemoryDb {
         outbox: &[OutboxMessage],
     ) -> Result<(), DbError> {
         // One lock = the Postgres transaction: every check (including the
-        // crash injector) runs before the first mutation.
+        // leader fence and the crash injector) runs before the first mutation.
         let mut st = self.state.lock().unwrap();
+        holds_leader_term_if(&st, leader)?;
         let current = st.runs.get(run).copied().unwrap_or(RunStatus::Pending);
         // The Postgres CAS's generation guard: a run reopened since the
         // caller read `generation` is a miss, never an ABA hit.
@@ -2041,6 +2143,7 @@ impl Db for InMemoryDb {
 
     async fn open_gate_wait(
         &self,
+        leader: &LeaderTerm,
         run: &RunId,
         step: &StepId,
         started_at: Timestamp,
@@ -2048,6 +2151,7 @@ impl Db for InMemoryDb {
     ) -> Result<Option<Attempt>, DbError> {
         // One lock = the Postgres transaction with the step row locked.
         let mut st = self.state.lock().unwrap();
+        holds_leader_term(&st, leader)?;
         let Some(rec) = st.steps.get_mut(&(run.clone(), step.clone())) else {
             return Ok(None);
         };
@@ -2139,7 +2243,7 @@ impl Db for InMemoryDb {
 
     async fn claim_outbox(
         &self,
-        _owner: &str,
+        owner: &str,
         kind: Option<&str>,
         limit: u32,
         visibility_ms: i64,
@@ -2163,10 +2267,31 @@ impl Db for InMemoryDb {
             if !entry.dispatched && !entry.dead_lettered && claim_free && kind_ok {
                 entry.claimed_until =
                     Some(now + std::time::Duration::from_millis(visibility_ms.max(0) as u64));
+                entry.claimed_by = Some(owner.to_string());
                 out.push(entry.msg.clone());
             }
         }
         Ok(out)
+    }
+
+    async fn renew_outbox_claim(
+        &self,
+        id: OutboxId,
+        owner: &str,
+        visibility_ms: i64,
+    ) -> Result<bool, DbError> {
+        let mut st = self.state.lock().unwrap();
+        let Some(e) = st.outbox.iter_mut().find(|e| e.msg.id == id) else {
+            return Ok(false);
+        };
+        if e.dispatched || e.dead_lettered || e.claimed_by.as_deref() != Some(owner) {
+            return Ok(false);
+        }
+        e.claimed_until = Some(
+            std::time::Instant::now()
+                + std::time::Duration::from_millis(visibility_ms.max(0) as u64),
+        );
+        Ok(true)
     }
 
     async fn mark_dispatched(&self, id: OutboxId) -> Result<(), DbError> {
@@ -2460,43 +2585,35 @@ impl Db for InMemoryDb {
     }
 
     async fn lease(&self, resource: &str, owner: &str, ttl_ms: i64) -> Result<Lease, DbError> {
-        // Real lease semantics (the PG adapter's contract): the holder renews;
-        // a peer only takes over an EXPIRED lease. Wall-clock via Instant —
-        // a process-local fake needs no injected clock for expiry.
+        // Real lease semantics (the PG adapter's contract): the holder renews
+        // and keeps its term; a peer only takes over an EXPIRED lease, and the
+        // takeover starts the next term (git-bug aaf4e3e). Wall-clock via
+        // Instant — a process-local fake needs no injected clock for expiry.
+        // Under the state lock, so a takeover is ordered before or after any
+        // fenced write, never inside one.
         let mut st = self.state.lock().unwrap();
         let now = std::time::Instant::now();
-        let entry = st.leases.entry(resource.to_string());
-        use std::collections::hash_map::Entry;
-        match entry {
-            Entry::Occupied(mut e) => {
-                let (holder, expires) = e.get().clone();
-                if holder == owner || now >= expires {
-                    e.insert((
-                        owner.to_string(),
-                        now + std::time::Duration::from_millis(ttl_ms as u64),
-                    ));
-                    Ok(Lease {
-                        owner: owner.to_string(),
-                        expires_at: Timestamp(ttl_ms),
-                    })
-                } else {
-                    Ok(Lease {
-                        owner: holder,
-                        expires_at: Timestamp(ttl_ms),
-                    })
-                }
-            }
-            Entry::Vacant(v) => {
-                v.insert((
-                    owner.to_string(),
-                    now + std::time::Duration::from_millis(ttl_ms as u64),
-                ));
-                Ok(Lease {
-                    owner: owner.to_string(),
+        let ttl = std::time::Duration::from_millis(ttl_ms.max(0) as u64);
+        let current = st.leases.get(resource).cloned();
+        let (holder, term) = match current {
+            None => (owner.to_string(), 1),
+            Some((holder, _, term)) if holder == owner => (holder, term),
+            Some((holder, expires, term)) if now < expires => {
+                return Ok(Lease {
+                    owner: holder,
                     expires_at: Timestamp(ttl_ms),
+                    term,
                 })
             }
-        }
+            Some((_, _, term)) => (owner.to_string(), term + 1),
+        };
+        st.leases
+            .insert(resource.to_string(), (holder.clone(), now + ttl, term));
+        Ok(Lease {
+            owner: holder,
+            expires_at: Timestamp(ttl_ms),
+            term,
+        })
     }
 }
 
@@ -2591,6 +2708,19 @@ pub struct FakeExecutor {
     /// A one-shot hook the next `launch` awaits before it returns — see
     /// [`during_next_launch`](Self::during_next_launch).
     launch_hook: Mutex<Option<LaunchHook>>,
+    /// A one-shot hook the next `poll` awaits — see
+    /// [`during_next_poll`](Self::during_next_poll).
+    poll_hook: Mutex<Option<LaunchHook>>,
+    /// Polls in flight right now, and the most ever in flight at once, for
+    /// one handle (git-bug 068cc0b: two replicas driving one unit).
+    polls: Mutex<PollCount>,
+}
+
+#[derive(Default)]
+struct PollCount {
+    in_flight: HashMap<String, u32>,
+    max_in_flight: u32,
+    total: u32,
 }
 
 /// Work a test runs while a [`FakeExecutor::launch`] is in flight.
@@ -2603,7 +2733,28 @@ impl FakeExecutor {
             inner: Mutex::new(FakeExecState::default()),
             cancelled: Mutex::new(Vec::new()),
             launch_hook: Mutex::new(None),
+            poll_hook: Mutex::new(None),
+            polls: Mutex::new(PollCount::default()),
         }
+    }
+
+    /// Run `hook` to completion INSIDE the next `poll`, before it reports
+    /// (test seam, like [`during_next_launch`](Self::during_next_launch)):
+    /// models a poll that takes long — a workspace drain runs inside the k8s
+    /// executor's poll — so a test can act while it is in flight.
+    pub fn during_next_poll(&self, hook: LaunchHook) {
+        *self.poll_hook.lock().unwrap() = Some(hook);
+    }
+
+    /// The most polls of ONE handle that were ever in flight at the same
+    /// time. More than 1 means two drivers supervised the same unit at once.
+    pub fn max_concurrent_polls(&self) -> u32 {
+        self.polls.lock().unwrap().max_in_flight
+    }
+
+    /// How many polls have started, over every handle.
+    pub fn polls_started(&self) -> u32 {
+        self.polls.lock().unwrap().total
     }
 
     /// Run `hook` to completion INSIDE the next `launch`, before it returns
@@ -2779,7 +2930,11 @@ impl FakeExecutor {
     /// Whether `handle`'s unit still holds a forge credential: launched with
     /// one, and not yet taken by `take_forge_credential`.
     pub fn holds_forge_credential(&self, handle: &ExecHandle) -> bool {
-        self.inner.lock().unwrap().forge_credentials.contains_key(&handle.0)
+        self.inner
+            .lock()
+            .unwrap()
+            .forge_credentials
+            .contains_key(&handle.0)
     }
 
     pub fn launched_spec(&self, handle: &ExecHandle) -> Option<StepSpec> {
@@ -2911,6 +3066,30 @@ impl Executor for FakeExecutor {
     }
 
     async fn poll(&self, handle: &ExecHandle) -> Result<ExecState, ExecError> {
+        {
+            let mut p = self.polls.lock().unwrap();
+            p.total += 1;
+            let n = p.in_flight.entry(handle.0.clone()).or_default();
+            *n += 1;
+            let n = *n;
+            p.max_in_flight = p.max_in_flight.max(n);
+        }
+        // Decrements on every exit, including a dropped (cancelled) poll.
+        struct Done<'a>(&'a Mutex<PollCount>, String);
+        impl Drop for Done<'_> {
+            fn drop(&mut self) {
+                if let Ok(mut p) = self.0.lock() {
+                    if let Some(n) = p.in_flight.get_mut(&self.1) {
+                        *n = n.saturating_sub(1);
+                    }
+                }
+            }
+        }
+        let _done = Done(&self.polls, handle.0.clone());
+        let hook = self.poll_hook.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook().await;
+        }
         let mut st = self.inner.lock().unwrap();
         if st.dead.contains(handle) {
             return Ok(ExecState::Lost);
@@ -2999,7 +3178,12 @@ impl Executor for FakeExecutor {
         &self,
         handle: &ExecHandle,
     ) -> Result<Option<scarab_engine::MountedForgeCredential>, ExecError> {
-        Ok(self.inner.lock().unwrap().forge_credentials.remove(&handle.0))
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .forge_credentials
+            .remove(&handle.0))
     }
 
     async fn infra_condition(

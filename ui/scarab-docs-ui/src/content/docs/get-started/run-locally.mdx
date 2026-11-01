@@ -28,10 +28,10 @@ pipeline. The steps below run Scarab on your machine.
 ## Bring up the stack
 
 ```sh
-just up      # kind + Postgres + MinIO + the chart, server built from the tree
+just stack up  # kind + Postgres + MinIO + the chart, server built from the tree
 ```
 
-`just up` builds `scarab-server` for Linux, creates the `scarab-dev` kind cluster, starts Postgres
+`just stack up` builds `scarab-server` for Linux, creates the `scarab-dev` kind cluster, starts Postgres
 and MinIO in it, and installs the Helm chart. The server and the workspace service run the binary
 you just built, mounted into a small runtime image. The API and the UI answer on `SCARAB_ADDR`
 from `deploy/kind/.env`.
@@ -39,7 +39,7 @@ from `deploy/kind/.env`.
 ## Submit a pipeline and watch it complete
 
 ```sh
-just demo    # submit a one-step pipeline and watch it run to completion
+just stack demo  # submit a one-step pipeline and watch it run to completion
 ```
 
 This posts a pipeline to the running server and follows it until it finishes. It's the smallest
@@ -48,22 +48,22 @@ end-to-end run, and it survives you killing the control plane partway through.
 ## Iterate
 
 ```sh
-just reload  # rebuild and roll the server onto the new binary
-just logs    # follow the server's log
-just docs    # serve this documentation site locally
-just down    # tear the whole stack down (`just down keep` keeps the data)
+just stack reload  # rebuild and roll the server onto the new binary
+just stack logs    # follow the server's log
+just docs          # serve this documentation site locally
+just stack down    # tear the whole stack down (`just stack down keep` keeps the data)
 ```
 
 :::note[Tests]
-`just e2e` runs every live suite against the same release, switched to its e2e mode with its
-own database and bucket. `just up` switches it back.
+`just test e2e` runs every live suite against the same release, switched to its e2e mode with its
+own database and bucket. `just stack up` switches it back.
 :::
 
 :::tip[See the UI]
 `just ui` starts the SolidJS web UI (Vite on <code>http://localhost:5173</code>), which proxies
 `/v1` to the running server. Open a run to see its step DAG and event timeline, which refresh
 while the run is going, and each step's logs, which stream live over SSE. To look around
-without a server, `just ui-mock` renders the same UI from built-in fixtures.
+without a server, `just ui mock` renders the same UI from built-in fixtures.
 :::
 
 ## What just happened

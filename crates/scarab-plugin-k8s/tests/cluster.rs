@@ -6,8 +6,8 @@
 //! `#[ignore]`d, so `cargo test` never runs it and never touches an ambient
 //! kubeconfig. Asking for the ignored set is the opt-in, and a case then needs
 //! `SCARAB_TEST_KUBE` as well: without it, it panics ([`enter_tier`]) rather
-//! than passing having done nothing (git-bug dcc4ca9). Run it with `just
-//! plugin-kube-tests` (or every live suite with `just e2e`), which points
+//! than passing having done nothing (git-bug dcc4ca9). Run it with `just test
+//! e2e` (its `cluster` pass; `just test e2e <filter>` narrows it), which points
 //! `KUBECONFIG` at the kind cluster's own kubeconfig (`deploy/kind/.kubeconfig`).
 //!
 //! Once `SCARAB_TEST_KUBE` is set, a misconfiguration is a **panic**, never a
@@ -76,7 +76,7 @@ fn enter_tier() {
         panic!(
             "this live case was asked to run (`--ignored` is the opt-in) but \
              SCARAB_TEST_KUBE is not set, and it will not pass by doing nothing. Run \
-             `just plugin-kube-tests`, which sets it and points KUBECONFIG at the \
+             `just test e2e`, which sets it and points KUBECONFIG at the \
              kind cluster's own kubeconfig."
         );
     }
@@ -101,7 +101,7 @@ async fn kind_client() -> Client {
         Ok(p) if !p.is_empty() => p,
         _ => panic!(
             "KUBECONFIG is not set, but SCARAB_TEST_KUBE is — this tier never uses an ambient \
-             kubeconfig. Run `just plugin-kube-tests`, which points it at the isolated \
+             kubeconfig. Run `just test e2e`, which points it at the isolated \
              kind cluster's own kubeconfig."
         ),
     };

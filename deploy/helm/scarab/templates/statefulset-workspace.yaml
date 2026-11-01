@@ -43,9 +43,13 @@ metadata:
   labels:
     {{- include "scarab.workspaceLabels" . | nindent 4 }}
 spec:
+  # IMMUTABLE. It names the ClusterIP Service, so the Pods get no per-Pod DNS
+  # records; the per-replica Services (service-workspace-replicas.yaml) give
+  # each replica a stable name instead. Pointing this at a new headless Service
+  # would refuse every `helm upgrade` of an existing release.
   serviceName: {{ include "scarab.fullname" . }}-workspace
-  # One per failure domain. Per-AZ topology is a later slice; today this is 1 and
-  # nothing in the design has yet been exercised with more than one instance.
+  # One per failure domain (per-AZ topology is a later slice). 2 replicas pass
+  # the ADR-0077 rank 1 fault runs; see values.yaml for what N > 1 changes.
   replicas: {{ .Values.workspace.replicaCount }}
   selector:
     matchLabels:

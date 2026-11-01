@@ -213,7 +213,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // This replica's identity for leases + outbox claims (ADR-0051): MUST be
     // unique per process — identical owners would make every replica believe
     // it holds every lease (leader election + tail dedup would be void).
-    let replica_id = format!("scarab-server-{}", uuid::Uuid::new_v4());
+    // It carries the host name (the Pod name on k8s) so an operator, and the
+    // fault tier's harness (ADR-0077 rank 2), can tell which Pod holds a lease
+    // or an outbox claim; the uuid keeps it unique across restarts of one Pod.
+    let replica_id = match std::env::var("HOSTNAME") {
+        Ok(host) if !host.is_empty() => format!("scarab-server-{host}-{}", uuid::Uuid::new_v4()),
+        _ => format!("scarab-server-{}", uuid::Uuid::new_v4()),
+    };
+    tracing::info!(replica_id = %replica_id, "replica identity for leases and outbox claims");
 
     // Durable store — mandatory, already guaranteed by the config gate.
     let pg = PostgresDb::connect(&database_url).await?;
@@ -269,9 +276,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let secret = ws.token_secret.clone();
             Arc::new(
                 scarab_workspace_client::WorkspaceClient::with_minted_token_tuned(
-                    // The control plane's own address for the service — NOT
-                    // the Pod-facing `url` (git-bug 021b6bc).
-                    ws.control_url.clone(),
+                    ws.url.clone(),
                     move || {
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -342,7 +347,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let workspace_cas: Arc<dyn scarab_storage::Cas> = match &depot_client {
         Some(client) => {
             tracing::info!(
-                url = %config.workspace.as_ref().map(|ws| ws.control_url.as_str()).unwrap_or_default(),
+                url = %config.workspace.as_ref().map(|ws| ws.url.as_str()).unwrap_or_default(),
                 "workspace snapshots: warm = the workspace service (cache-only leg), cold = \
                  the object store, direct (ADR-0061 D1.6 reads fall through to cold; drains \
                  are in-Pod into the Depot's packs — ADR-0067, no flush pass)"
@@ -691,6 +696,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 cpu_millis: ws.helper_cpu_millis,
                                 memory_mib: ws.helper_memory_mib,
                             },
+                            // Each Cache's home Depot replica (git-bug 12e2f6b).
+                            cache_home: ws.cache_home.clone(),
                         });
                         // The drain's read-back half (ADR-0067): the Pod's
                         // helper drains straight into packs on the Depot; the
@@ -789,6 +796,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Duration::from_millis(500),
                 visibility_ms,
                 (config.step_timeout_secs as i64).saturating_mul(1000),
+                config.project_run_cap,
                 config.public_url.clone(),
             ));
             tracing::info!("converged driver started");
@@ -896,6 +904,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             cpu_millis: ws.helper_cpu_millis,
                             memory_mib: ws.helper_memory_mib,
                         },
+                        // A debug Pod restores no Cache.
+                        cache_home: None,
                     });
                 }
                 let exec = Arc::new(exec);
@@ -1049,9 +1059,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // Broker tokens (ADR-0072 §11). Static dev tokens, when configured (the
     // config gate admitted them only under SCARAB_DEV_INSECURE), stand in for
-    // TokenReview — the proc-mode path for a plugin run as a host process,
-    // which has no projected token. Otherwise TokenReview, below, once a
-    // cluster is reachable. With neither, every broker call is a 401.
+    // TokenReview, for a plugin run as a host process, which has no projected
+    // token. Otherwise TokenReview, below, once a cluster is reachable. With
+    // neither, every broker call is a 401.
     if !config.plugins.dev_tokens.is_empty() {
         let dev = Arc::new(scarab_server::broker::DevPluginTokens::new(
             config.plugins.namespace.clone(),

@@ -13,12 +13,59 @@ pub const FORMAT: u32 = 1;
 /// a holder stops (`crates/scarab-engine/src/scheduler.rs`).
 pub const LEASE_TTL_SECS: u64 = 30;
 
+/// The outbox claim window at k8s (`outbox_visibility_ms`, 30 s): a launch
+/// claim not renewed for this long can be taken by a peer.
+pub const CLAIM_WINDOW_SECS: u64 = 30;
+
+/// How long before the producer Pod's `terminationGracePeriodSeconds` runs
+/// out the `pause-node` freeze ends. A freeze longer than the grace is not
+/// survivable by design: on the resume the kubelet SIGKILLs the egress
+/// sidecar (exit 137) and the Attempt is lost (git-bug 070d042, closed as not
+/// a bug).
+pub const GRACE_MARGIN_SECS: u64 = 120;
+
+/// The longest `pause-node` freeze: 240 s. A scenario file that planned more
+/// is refused ([`Scenario::read`]).
+pub const MAX_PAUSE_SECS: u64 = 240;
+
+/// The Kubernetes default `terminationGracePeriodSeconds`, for a Pod record
+/// that does not carry one.
+pub const DEFAULT_GRACE_SECS: u64 = 30;
+
+/// The shortest freeze that tests anything: past the scheduler lease TTL and
+/// the outbox claim window, so the frozen servers' lease and claims lapse.
+pub fn pause_floor_secs() -> u64 {
+    LEASE_TTL_SECS.max(CLAIM_WINDOW_SECS)
+}
+
+/// A recorded grace, or the Kubernetes default.
+pub fn grace_or_default(grace_secs: Option<i64>) -> u64 {
+    grace_secs.and_then(|g| u64::try_from(g).ok()).unwrap_or(DEFAULT_GRACE_SECS)
+}
+
+/// How long `pause-node` freezes the node for a producer Pod whose
+/// `terminationGracePeriodSeconds` is `grace_secs`: the grace minus
+/// [`GRACE_MARGIN_SECS`], at most [`MAX_PAUSE_SECS`]. A workspace Pod's
+/// grace is 600 s, so 240 s. A grace too short to leave a freeze past
+/// [`pause_floor_secs`] gives a pause the checker reports as INCONCLUSIVE.
+pub fn pause_secs(grace_secs: Option<i64>) -> u64 {
+    grace_or_default(grace_secs)
+        .saturating_sub(GRACE_MARGIN_SECS)
+        .min(MAX_PAUSE_SECS)
+}
+
 /// `WS_DRAIN_ESCALATION_MS` (`crates/scarab-executor-k8s/src/lib.rs`): how long
 /// the control plane keeps re-driving a failing drain before it gives up.
 pub const DRAIN_ESCALATION_SECS: u64 = 300;
 
-/// Rank 1's two scenarios: the same fault (one Depot Pod deleted with grace
-/// 0) at two moments.
+/// The scenarios. Rank 1 (ADR-0077 §3): one Depot Pod deleted with grace 0,
+/// at two moments. Rank 2: two server replicas with no fault, and one server
+/// SIGKILLed mid-drain. Rank 4: the scheduler leader SIGSTOPped past the
+/// lease TTL, then resumed. The server signals are sent from the kind
+/// node's PID namespace (`crate::node`): in its container the server is PID
+/// 1 with no init and ignores them. `pause-node` is not one of ADR-0077's
+/// ranks: it checks that a host freeze shorter than the producer Pod's grace
+/// period is survived.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum Kind {
@@ -29,6 +76,24 @@ pub enum Kind {
     /// While a consumer's `scarab-workspace-init` fetcher is pulling its
     /// inputs from the Depot.
     MidFeed,
+    /// Rank 2 with no fault: the workload at two server replicas. It counts
+    /// only when both replicas claimed some of its launch intents.
+    TwoReplicas,
+    /// Rank 2: SIGKILL the server replica that holds the producer's launch
+    /// claim (and so polls its Pod and drives its drain) while the drain is
+    /// in flight. The kubelet restarts the container in the same Pod.
+    KillServer,
+    /// Rank 4: SIGSTOP the scheduler leader while a producer runs, keep it
+    /// stopped until a peer takes the lease over (past the 30 s TTL), then
+    /// SIGCONT it.
+    StopLeader,
+    /// While a producer's workspace drain is owed or running (the
+    /// `mid-drain` trigger), `docker pause` the whole kind node for
+    /// [`pause_secs`]: past the lease TTL and the claim window, short of the
+    /// Pod's grace period. Then `docker unpause` it. The kubelet, the egress
+    /// mid-drain and both servers freeze together, as in a host suspend, and
+    /// the wall clock jumps on the resume. Every Run must still succeed.
+    PauseNode,
 }
 
 impl Kind {
@@ -36,24 +101,55 @@ impl Kind {
         match self {
             Kind::MidDrain => "mid-drain",
             Kind::MidFeed => "mid-feed",
+            Kind::TwoReplicas => "two-replicas",
+            Kind::KillServer => "kill-server",
+            Kind::StopLeader => "stop-leader",
+            Kind::PauseNode => "pause-node",
         }
     }
 
     /// The step whose Pod the trigger watches.
     pub fn target_step(self) -> &'static str {
         match self {
-            Kind::MidDrain => "produce",
             Kind::MidFeed => "consume",
+            _ => "produce",
         }
+    }
+
+    /// The window on the target Pod the fault must land in, by its landing
+    /// class; `None` for a scenario with no window.
+    pub fn window(self) -> Option<Kind> {
+        match self {
+            Kind::MidDrain | Kind::KillServer | Kind::PauseNode => Some(Kind::MidDrain),
+            Kind::MidFeed => Some(Kind::MidFeed),
+            Kind::TwoReplicas | Kind::StopLeader => None,
+        }
+    }
+
+    /// Whether the scenario fires a fault at all.
+    pub fn has_fault(self) -> bool {
+        self != Kind::TwoReplicas
+    }
+
+    /// Whether the victim is a server replica (else a Depot replica).
+    pub fn targets_servers(self) -> bool {
+        matches!(self, Kind::KillServer | Kind::StopLeader | Kind::TwoReplicas)
     }
 
     /// The seeded delay range after the trigger, in ms. Measured 2026-11-01
     /// at 2+2 on colima (2 vCPU) with 64 x 2 MiB per producer: the drain
-    /// window (step exit to root annotation) was 63 s, the feed 8 s.
+    /// window (step exit to root annotation) was 63 s, the feed 8 s. The
+    /// leader stop needs only Runs in flight, and the producer's step runs
+    /// for several seconds.
     fn delay_range_ms(self) -> std::ops::RangeInclusive<u64> {
         match self {
-            Kind::MidDrain => 2_000..=10_000,
+            Kind::MidDrain | Kind::KillServer => 2_000..=10_000,
             Kind::MidFeed => 0..=2_000,
+            Kind::StopLeader => 0..=3_000,
+            // Early in the drain window: the pause must start before the
+            // drain records its root.
+            Kind::PauseNode => 0..=2_000,
+            Kind::TwoReplicas => 0..=0,
         }
     }
 }
@@ -123,20 +219,36 @@ pub struct Plan {
     pub target_run: u32,
     /// How long after the trigger condition is first seen the fault fires.
     pub delay_ms: u64,
-    /// Which Depot replica is deleted: `scarab-workspace-<ordinal>`.
+    /// Which replica is the victim. Rank 1: the Depot Pod
+    /// `scarab-workspace-<ordinal>`. Ranks 2 and 4: the index into the
+    /// server Pods sorted by name, used only when the claim or lease owner
+    /// cannot be mapped to a Pod (the scenario records which it used).
     pub victim_ordinal: u32,
+    /// Rank 4: how long the leader stays stopped after a peer has taken the
+    /// lease over. Drawn last, so rank 1's plans did not change when it was
+    /// added.
+    #[serde(default)]
+    pub hold_ms: u64,
 }
 
 impl Plan {
-    pub fn from_seed(kind: Kind, seed: u64, workload: &Workload, depot_replicas: u32) -> Plan {
+    pub fn from_seed(kind: Kind, seed: u64, workload: &Workload, server_replicas: u32, depot_replicas: u32) -> Plan {
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        let victims = if kind.targets_servers() { server_replicas } else { depot_replicas };
         Plan {
             target_run: rng.gen_range(0..workload.runs.max(1)),
             delay_ms: rng.gen_range(kind.delay_range_ms()),
-            victim_ordinal: rng.gen_range(0..depot_replicas.max(1)),
+            victim_ordinal: rng.gen_range(0..victims.max(1)),
+            hold_ms: rng.gen_range(0..=HOLD_MAX_MS),
         }
     }
 }
+
+/// Rank 4's longest hold after the takeover. Short on purpose: the chart's
+/// liveness probe (`/healthz` every 15 s, three failures) restarts a stopped
+/// server 30 to 45 s after it stops answering, and the lease TTL already
+/// takes 30 s of that.
+pub const HOLD_MAX_MS: u64 = 2_000;
 
 /// The trigger as the nemesis saw it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -163,10 +275,89 @@ pub struct Landing {
     pub window_end_ms: Option<i64>,
 }
 
+/// A signal sent to a server process from the kind node's PID namespace.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct NodeSignal {
+    /// `KILL` or `STOP` (a `STOP` is always followed by a `CONT`).
+    pub signal: String,
+    pub node: String,
+    /// The `scarab-server` container's id (no `containerd://` prefix).
+    pub container_id: String,
+    /// The process's PID in the node's PID namespace (`crictl inspect`).
+    pub pid: i64,
+    /// Whether the signal took effect: for `KILL`, the kubelet restarted the
+    /// container in the same Pod after a termination by signal 9 (exit
+    /// 137); for `STOP`, `/proc/<pid>/status` said `T` (stopped).
+    pub delivered: bool,
+    /// What showed it (the termination record, or the `State:` line).
+    pub evidence: String,
+}
+
+/// `pause-node`: the node container paused and unpaused from the host.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct NodePause {
+    /// The kind node container (`SCARAB_CHAOS_NODE`).
+    pub node: String,
+    /// The target Pod's `terminationGracePeriodSeconds` the pause was
+    /// planned from (the Kubernetes default when the record had none).
+    #[serde(default)]
+    pub grace_secs: u64,
+    /// The freeze had to last longer than this ([`pause_floor_secs`]).
+    #[serde(default)]
+    pub floor_secs: u64,
+    /// How long the pause was planned for ([`pause_secs`]).
+    pub planned_secs: u64,
+    /// `docker inspect` said `State.Paused = true` after the pause.
+    pub paused: bool,
+    /// `docker inspect` said `State.Paused = false` after the unpause.
+    pub unpaused: bool,
+    /// What went wrong, if anything (a failed inspect, an early unpause on a
+    /// signal).
+    pub error: Option<String>,
+}
+
+/// Rank 2: the producer's launch claim, from `outbox`, and whether its owner
+/// kept writing after the kill.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ClaimObservation {
+    /// `outbox.claimed_by` of the launch intent when the kill fired (only a
+    /// claim that had not lapsed and an intent not yet dispatched).
+    pub owner: Option<String>,
+    pub claimed_until: Option<i64>,
+    /// The latest `claimed_until` or lease `expires_at` the owner had
+    /// written, 5 s after the kill (writes in flight at the kill have landed
+    /// by then) and 20 s after it. Equal: the owner stopped writing, so it
+    /// was the process killed. Grown: it is still alive.
+    pub owner_written_until_5s: Option<i64>,
+    pub owner_written_until_20s: Option<i64>,
+}
+
+/// Rank 4: the `leases` row `resource = 'scheduler'` around the stop. `term`
+/// is read only when the column exists (ADR-0077 Amendment, grill, item 2).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LeaseObservation {
+    pub owner_before: String,
+    pub expires_before: i64,
+    pub term_before: Option<i64>,
+    /// The first different owner seen while the old one was stopped.
+    pub owner_after: Option<String>,
+    pub term_after: Option<i64>,
+    pub takeover_at_ms: Option<i64>,
+    /// The row 10 s after the resume: the resumed process must not hold it.
+    pub owner_after_resume: Option<String>,
+    pub term_after_resume: Option<i64>,
+    /// Replicas stopped and resumed first because the lease kept being
+    /// renewed while they were stopped (they were not the leader).
+    pub probes: Vec<String>,
+}
+
 /// One fault, as fired.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Fault {
-    /// `delete-pod`: a Pod delete with `gracePeriodSeconds: 0`.
+    /// `delete-pod`: a Pod delete with `gracePeriodSeconds: 0`. `kill-server`:
+    /// SIGKILL from the kind node. `stop-leader`: SIGSTOP, then SIGCONT, from
+    /// the kind node. `pause-node`: `docker pause`, then `docker unpause`, of
+    /// the kind node container.
     pub action: String,
     pub pod: String,
     pub pod_uid: Option<String>,
@@ -179,6 +370,30 @@ pub struct Fault {
     pub fence_pack_rows_at_fire: Option<i64>,
     pub fired_at_ms: i64,
     pub landing: Option<Landing>,
+    /// Ranks 2 and 4: the signal as sent and whether it took effect.
+    #[serde(default)]
+    pub signal: Option<NodeSignal>,
+    /// Ranks 2 and 4: how the victim was chosen (`owner-names-pod`,
+    /// `owner-in-pod-log`, `seed`, `lease-renewal`).
+    #[serde(default)]
+    pub target_basis: Option<String>,
+    /// Ranks 2 and 4: what the victim turned out to be. Rank 2:
+    /// `claim-holder`, `peer` or `unknown`. Rank 4: `leader`,
+    /// `leader-no-takeover` or `not-leader`; `restarted-while-stopped` when
+    /// the kubelet restarted it before the SIGCONT.
+    #[serde(default)]
+    pub victim_role: Option<String>,
+    /// Rank 4: when the SIGCONT was sent. `pause-node`: when the unpause
+    /// returned.
+    #[serde(default)]
+    pub resumed_at_ms: Option<i64>,
+    #[serde(default)]
+    pub claim: Option<ClaimObservation>,
+    #[serde(default)]
+    pub lease: Option<LeaseObservation>,
+    /// `pause-node`: the pause as done. Its end is `resumed_at_ms`.
+    #[serde(default)]
+    pub pause: Option<NodePause>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -201,11 +416,16 @@ pub struct Scenario {
     /// When every Run was terminal, or the bound ran out.
     pub quiesced_at_ms: Option<i64>,
     pub notes: Vec<String>,
+    /// The Cache probe (`crate::cache`, invariant C1): its Runs are not in
+    /// `runs`. `None` in a file written before it existed; a replay of such a
+    /// file runs no probe.
+    #[serde(default)]
+    pub cache: Option<crate::cache::CacheProbe>,
 }
 
 impl Scenario {
     pub fn new(kind: Kind, seed: u64, workload: Workload, server_replicas: u32, depot_replicas: u32) -> Self {
-        let plan = Plan::from_seed(kind, seed, &workload, depot_replicas);
+        let plan = Plan::from_seed(kind, seed, &workload, server_replicas, depot_replicas);
         Self::with_plan(kind, seed, workload, plan, server_replicas, depot_replicas)
     }
 
@@ -218,6 +438,7 @@ impl Scenario {
         depot_replicas: u32,
     ) -> Self {
         let quiesce_bound_secs = quiesce_bound_secs(&workload);
+        let cache = Some(crate::cache::CacheProbe::new(&workload.image));
         Self {
             format: FORMAT,
             kind,
@@ -233,6 +454,7 @@ impl Scenario {
             faults: Vec::new(),
             quiesced_at_ms: None,
             notes: Vec::new(),
+            cache,
         }
     }
 
@@ -247,6 +469,9 @@ impl Scenario {
             self.depot_replicas,
         );
         s.replay_of = Some(path.to_string());
+        // The recorded pipeline, not this build's: the replay writes what the
+        // original wrote.
+        s.cache = self.cache.as_ref().map(crate::cache::CacheProbe::replay);
         s
     }
 
@@ -256,6 +481,18 @@ impl Scenario {
             serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
         if s.format != FORMAT {
             return Err(format!("{}: format {} (expected {FORMAT})", path.display(), s.format));
+        }
+        if let Some(p) = s
+            .faults
+            .iter()
+            .filter_map(|f| f.pause.as_ref())
+            .find(|p| p.planned_secs > MAX_PAUSE_SECS)
+        {
+            return Err(format!(
+                "{}: a pause-node fault planned {} s, above the {MAX_PAUSE_SECS} s maximum",
+                path.display(),
+                p.planned_secs
+            ));
         }
         Ok(s)
     }
@@ -267,31 +504,35 @@ impl Scenario {
         std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
     }
 
-    /// The deadline every Run must be terminal by: the bound, from the fault
-    /// (or from the start when nothing fired).
+    /// The deadline every Run must be terminal by: the bound, from the end
+    /// of the fault (its resume, for a stop), or from the start when nothing
+    /// fired.
     pub fn quiesce_deadline_ms(&self) -> i64 {
         let from = self
             .faults
             .iter()
-            .map(|f| f.fired_at_ms)
+            .map(|f| f.resumed_at_ms.unwrap_or(f.fired_at_ms).max(f.fired_at_ms))
             .max()
             .unwrap_or(self.started_at_ms);
         from + (self.quiesce_bound_secs as i64) * 1000
     }
 }
 
-/// ADR-0077 §2: lease TTL + the workload's step time + the drain escalation,
-/// for any scenario that faults the Depot.
+/// ADR-0077 §2: lease TTL + the workload's step time + the drain escalation.
+/// The escalation term is for scenarios that fault the Depot; the server
+/// scenarios keep it too, because a killed or stopped replica can leave a
+/// drain to be driven again.
 pub fn quiesce_bound_secs(workload: &Workload) -> u64 {
     LEASE_TTL_SECS + workload.expected_secs + DRAIN_ESCALATION_SECS
 }
 
-/// Where a fault fired relative to a window.
-pub fn classify(kind: Kind, fired_at_ms: i64, start: Option<i64>, end: Option<i64>) -> Landing {
+/// Where a fault fired relative to a window. Inside it, the class is the
+/// window's name (`mid-drain`, `mid-feed`).
+pub fn classify(window: Kind, fired_at_ms: i64, start: Option<i64>, end: Option<i64>) -> Landing {
     let class = match (start, end) {
         (Some(s), _) if fired_at_ms < s => "before-window".to_string(),
         (Some(_), Some(e)) if fired_at_ms >= e => "after-window".to_string(),
-        (Some(_), _) => kind.as_str().to_string(),
+        (Some(_), _) => window.as_str().to_string(),
         (None, _) => "before-window".to_string(),
     };
     Landing {
@@ -309,17 +550,21 @@ mod tests {
     fn a_seed_gives_the_same_plan_and_stays_in_range() {
         let w = Workload::default();
         for seed in 0..200 {
-            let a = Plan::from_seed(Kind::MidDrain, seed, &w, 2);
-            assert_eq!(a, Plan::from_seed(Kind::MidDrain, seed, &w, 2));
+            let a = Plan::from_seed(Kind::MidDrain, seed, &w, 2, 2);
+            assert_eq!(a, Plan::from_seed(Kind::MidDrain, seed, &w, 2, 2));
             assert!(a.target_run < w.runs && a.victim_ordinal < 2);
             assert!((2_000..=10_000).contains(&a.delay_ms));
-            let f = Plan::from_seed(Kind::MidFeed, seed, &w, 2);
+            let f = Plan::from_seed(Kind::MidFeed, seed, &w, 2, 2);
             assert!(f.delay_ms <= 2_000);
+            // The victim ordinal ranges over the replicas the scenario faults.
+            let k = Plan::from_seed(Kind::KillServer, seed, &w, 3, 1);
+            assert!(k.victim_ordinal < 3 && k.hold_ms <= HOLD_MAX_MS);
+            assert_eq!(Plan::from_seed(Kind::MidFeed, seed, &w, 3, 1).victim_ordinal, 0);
         }
         // Different seeds explore different plans.
         let plans: std::collections::HashSet<_> = (0..50)
             .map(|s| {
-                let p = Plan::from_seed(Kind::MidDrain, s, &w, 2);
+                let p = Plan::from_seed(Kind::MidDrain, s, &w, 2, 2);
                 (p.target_run, p.victim_ordinal, p.delay_ms)
             })
             .collect();
@@ -338,8 +583,45 @@ mod tests {
         assert_eq!(back, s);
         let r = back.replay(path.to_str().unwrap());
         assert_eq!((r.plan.clone(), r.quiesce_bound_secs), (s.plan.clone(), s.quiesce_bound_secs));
+        // The replay writes the recorded probe pipeline, with nothing observed.
+        assert_eq!(
+            r.cache.as_ref().map(|c| c.pipeline_yaml.as_str()),
+            s.cache.as_ref().map(|c| c.pipeline_yaml.as_str())
+        );
+        assert_eq!(r.cache.as_ref().and_then(|c| c.seed_run.clone()), None);
         assert!(r.runs.is_empty() && r.replay_of.is_some());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A scenario file written before the rank 2 and 4 fields existed still
+    /// reads, and replays with the same plan.
+    #[test]
+    fn an_old_scenario_file_still_reads() {
+        let mut v = serde_json::to_value(Scenario::new(Kind::MidDrain, 3, Workload::default(), 2, 2)).unwrap();
+        v["plan"].as_object_mut().unwrap().remove("hold_ms");
+        v["faults"] = serde_json::json!([{
+            "action": "delete-pod", "pod": "scarab-workspace-0", "pod_uid": null, "grace_seconds": 0,
+            "trigger": null, "condition_held_at_fire": true, "fence_pack_rows_at_fire": null,
+            "fired_at_ms": 5, "landing": null
+        }]);
+        v.as_object_mut().unwrap().remove("cache");
+        let s: Scenario = serde_json::from_value(v).unwrap();
+        assert_eq!(s.plan.hold_ms, 0);
+        assert_eq!(s.faults[0].signal, None);
+        assert_eq!(s.cache, None, "a file from before the Cache probe has none");
+        assert_eq!(s.replay("old.json").cache, None, "and its replay runs none");
+    }
+
+    /// The bound counts from a stopped leader's resume, not from its stop.
+    #[test]
+    fn the_quiesce_deadline_counts_from_the_resume() {
+        let mut s = Scenario::new(Kind::StopLeader, 1, Workload::default(), 2, 2);
+        s.faults.push(Fault {
+            fired_at_ms: 1_000,
+            resumed_at_ms: Some(40_000),
+            ..Default::default()
+        });
+        assert_eq!(s.quiesce_deadline_ms(), 40_000 + (s.quiesce_bound_secs as i64) * 1000);
     }
 
     #[test]
@@ -347,9 +629,68 @@ mod tests {
         assert_eq!(quiesce_bound_secs(&Workload::default()), 30 + 300 + 300);
     }
 
+    /// `pause-node` parses from the recipe's argument and the file, keeps
+    /// the mid-drain trigger and window, and freezes past the lease TTL and
+    /// claim window but short of the workspace Pod's 600 s grace.
+    #[test]
+    fn pause_node_parses_and_pauses_short_of_the_grace() {
+        use clap::ValueEnum as _;
+        assert_eq!(Kind::from_str("pause-node", false), Ok(Kind::PauseNode));
+        assert_eq!(serde_json::to_value(Kind::PauseNode).unwrap(), "pause-node");
+        assert_eq!(Kind::PauseNode.as_str(), "pause-node");
+        assert_eq!(Kind::PauseNode.window(), Some(Kind::MidDrain));
+        assert_eq!(Kind::PauseNode.target_step(), "produce");
+        assert!(Kind::PauseNode.has_fault() && !Kind::PauseNode.targets_servers());
+        assert_eq!(pause_floor_secs(), 30);
+        assert_eq!(pause_secs(Some(600)), 240, "a workspace Pod: capped at 240 s");
+        assert_eq!(pause_secs(Some(300)), 180, "grace - 120 s");
+        assert!(pause_secs(Some(600)) > pause_floor_secs() && pause_secs(Some(600)) < 600);
+        assert_eq!(pause_secs(None), 0, "the 30 s default grace leaves no freeze to test");
+        assert_eq!(pause_secs(Some(i64::MAX)), MAX_PAUSE_SECS);
+        assert_eq!(pause_secs(Some(-5)), 0);
+        let w = Workload::default();
+        for seed in 0..50 {
+            assert!(Plan::from_seed(Kind::PauseNode, seed, &w, 2, 2).delay_ms <= 2_000);
+        }
+        // A scenario file round-trips with its pause, and the quiesce bound
+        // counts from the unpause.
+        let mut s = Scenario::new(Kind::PauseNode, 1, w, 2, 2);
+        s.faults.push(Fault {
+            action: "pause-node".into(),
+            fired_at_ms: 1_000,
+            resumed_at_ms: Some(241_000),
+            pause: Some(NodePause {
+                node: "scarab-dev-control-plane".into(),
+                grace_secs: 600,
+                floor_secs: 30,
+                planned_secs: 240,
+                paused: true,
+                unpaused: true,
+                error: None,
+            }),
+            ..Default::default()
+        });
+        let back: Scenario = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back, s);
+        assert_eq!(s.quiesce_deadline_ms(), 241_000 + (s.quiesce_bound_secs as i64) * 1000);
+
+        // A file that planned a pause above the maximum is refused, so a
+        // replay never pauses the node that long; at the maximum it reads.
+        let dir = std::env::temp_dir().join(format!("scarab-chaos-pause-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("scenario.json");
+        s.write(&file).unwrap();
+        assert!(Scenario::read(&file).is_ok());
+        s.faults[0].pause.as_mut().unwrap().planned_secs = MAX_PAUSE_SECS + 1;
+        s.write(&file).unwrap();
+        let err = Scenario::read(&file).unwrap_err();
+        assert!(err.contains("above the 240 s maximum"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn landing_classes() {
-        let k = Kind::MidDrain;
+        let k = Kind::KillServer.window().unwrap();
         assert_eq!(classify(k, 5, Some(10), Some(20)).class, "before-window");
         assert_eq!(classify(k, 15, Some(10), Some(20)).class, "mid-drain");
         assert_eq!(classify(k, 15, Some(10), None).class, "mid-drain");

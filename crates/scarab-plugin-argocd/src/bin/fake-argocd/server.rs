@@ -1,6 +1,6 @@
 //! A fake Argo CD API server: just enough of Argo's REST API for the
 //! reporter — list, get, managed resources and the NDJSON watch stream —
-//! plus a control API (`/_fake/…`) a test or `just plugin-verify` drives.
+//! plus a control API (`/_fake/…`) a test or `just test e2e` drives.
 //!
 //! Self-contained on purpose (axum, futures, serde, tokio only): the
 //! `fake-argocd` binary and the contract test both `#[path]`-include this

@@ -50,8 +50,8 @@ Regenerating:
 
 ```
 just brand         # write the four SVGs from halftone/generate.py
-just brand-check   # fail if the SVGs on disk differ from the generator
-just brand-png     # re-render the 37 PNGs in a browser, then rebuild favicon.ico
+just brand check   # fail if the SVGs on disk differ from the generator
+just brand png     # re-render the 37 PNGs in a browser, then rebuild favicon.ico
 ```
 
 `halftone/generate.py` uses only the standard library. It holds the measured
@@ -60,7 +60,7 @@ body tables, the light model, the leg, horn and rim chains and the ring.
 a browser and save the PNGs; the server only writes `.png` files under the four
 icon folders. Re-rendering gave byte-identical files when we checked, on one
 machine and browser. The SVGs are the source: edit the generator, run
-`just brand`, then `just brand-png`.
+`just brand`, then `just brand png`.
 
 Status and limits:
 

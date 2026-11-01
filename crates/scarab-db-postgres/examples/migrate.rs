@@ -3,7 +3,7 @@
 //! For harnesses that have a Postgres but no control-plane process to migrate
 //! it: a test process that stands in for the control plane while a workspace
 //! service needs the ADR-0067 fence/pack tables to exist. (The kind CI tier
-//! used it until 2026-11-01; `just e2e` now migrates through the release's
+//! used it until 2026-11-01; `just test e2e` now migrates through the release's
 //! own server.) It runs the SAME migrator
 //! the server runs on boot (`PostgresDb::migrate`), so a database prepared
 //! here is indistinguishable from one a converged boot prepared.

@@ -5,24 +5,24 @@
 #
 #   deploy/kind/up.sh [dev|dogfood|e2e|chaos]
 #
-#   dev      (`just up`)      dev-insecure, database `scarab`, bucket `scarab-logs`
-#   dogfood  (`just up dogfood`) GitHub App mode from ~/.config/scarab/dogfood.env,
+#   dev      (`just stack up`)      dev-insecure, database `scarab`, bucket `scarab-logs`
+#   dogfood  (`just stack up dogfood`) GitHub App mode from ~/.config/scarab/dogfood.env,
 #                             database `scarab_dogfood`, bucket `scarab-dogfood`,
 #                             and a cloudflared tunnel to the public hostname
-#   e2e      (`just e2e`)     dev-insecure, database `scarab_e2e`, bucket
+#   e2e      (`just test e2e`)     dev-insecure, database `scarab_e2e`, bucket
 #                             `scarab-e2e`, so test data never mixes with dev's;
 #                             a cloudflared quick tunnel in front of Forgejo only
 #                             when e2e.sh sets SCARAB_E2E_TUNNEL=1
-#   chaos    (`just chaos`)   dev-insecure, database `scarab_chaos`, bucket
+#   chaos    (`just test chaos`)   dev-insecure, database `scarab_chaos`, bucket
 #                             `scarab-chaos`, both reached through toxiproxy;
 #                             2 server replicas and 2 Depot replicas (ADR-0077)
 #
 # SCARAB_KIND_EXTRA_VALUES names one more Helm values file, applied last (for
-# example `just plugin-verify`'s plugin settings). It is not remembered:
-# `just reload` re-applies the mode without it.
+# example the plugin settings `just test e2e` adds). It is not remembered:
+# `just stack reload` re-applies the mode without it.
 #
 # Idempotent: re-running rebuilds the binary and rolls the Pods only when the
-# binary changed. `just reload` is the short path for that alone.
+# binary changed. `just stack reload` is the short path for that alone.
 #
 # What it does, in order:
 #   1. build scarab-server and scarab-wsfetch for Linux on the host
@@ -34,7 +34,7 @@
 #      a `scarab-dev` cluster that lacks them;
 #   4. build the runtime image and the step helper images and load them;
 #   5. apply Postgres, MinIO and Forgejo, create the mode's database; under
-#      `just e2e` (SCARAB_E2E_TUNNEL=1), start the Forgejo quick tunnel first
+#      `just test e2e` (SCARAB_E2E_TUNNEL=1), start the Forgejo quick tunnel first
 #      (Forgejo's ROOT_URL is its URL);
 #   6. helm upgrade --install the chart with deploy/kind/values.yaml plus the
 #      mode's values;
@@ -84,7 +84,7 @@ if [ "$mode" = dogfood ]; then
     [ -n "$(env_get "$dogfood_env" "$k")" ] || missing="$missing $k"
   done
   if [ -n "$missing" ]; then
-    die "just up dogfood needs the named Cloudflare tunnel: set$missing in $dogfood_env
+    die "just stack up dogfood needs the named Cloudflare tunnel: set$missing in $dogfood_env
   CLOUDFLARE_TUNNEL_TOKEN  the tunnel's token (Zero Trust > Networks > Tunnels)
   DOGFOOD_HOSTNAME         its public hostname, routed to http://scarab.scarab.svc.cluster.local:80"
   fi
@@ -224,9 +224,10 @@ exists=0
 kind get clusters 2>/dev/null | grep -qx "$cluster" && exists=1
 if [ "$exists" = 1 ] && cluster_fits; then
   echo "==> reusing kind cluster '$cluster'"
+  unpause_node
   if [ "$(docker inspect -f '{{.State.Running}}' "$node")" != true ]; then
     echo "    its node container is stopped; starting it"
-    docker start "$node" >/dev/null || die "could not start the stopped node container $node ('just down' deletes the cluster)"
+    docker start "$node" >/dev/null || die "could not start the stopped node container $node ('just stack down' deletes the cluster)"
   fi
   kind export kubeconfig --name "$cluster" --kubeconfig "$kubeconfig" >/dev/null \
     || die "could not export the kubeconfig of kind cluster '$cluster'"
@@ -245,8 +246,8 @@ else
   if [ "$exists" = 1 ]; then
     [ "${SCARAB_KIND_RECREATE:-0}" = 1 ] || die "kind cluster '$cluster' does not fit: $misfit.
   Recreating it deletes its Postgres and MinIO data (both modes' databases and buckets).
-  Run 'just up' from the worktree or with the SCARAB_ADDR that created it, or
-  recreate it: SCARAB_KIND_RECREATE=1 just up   (or 'just down' first)"
+  Run 'just stack up' from the worktree or with the SCARAB_ADDR that created it, or
+  recreate it: SCARAB_KIND_RECREATE=1 just stack up   (or 'just stack down' first)"
     echo "==> SCARAB_KIND_RECREATE=1: deleting kind cluster '$cluster' ($misfit)"
     kind delete cluster --name "$cluster" --kubeconfig "$kubeconfig"
   fi
@@ -318,6 +319,64 @@ for img in $infra_images; do
   load_image "$img"
 done
 
+# --- 3b. NetworkPolicy is enforced ----------------------------------------------
+# kindnet enforces NetworkPolicy, and the plugin runtime depends on it: a plugin
+# Pod whose isolation self-check reaches the API server refuses to start. On a
+# kind cluster 13 h old, after many mode switches, the policies existed and
+# kindnet ran, yet a Pod reached the API server and the internet (git-bug
+# ba32d49); a fresh cluster enforced them. So every run checks it: a Pod with
+# no policy must reach the API server (the probe works), and one in a namespace
+# that denies all egress must not (the policy is enforced).
+echo "==> checking that the cluster enforces NetworkPolicy"
+canary_ns=scarab-netpol-canary
+canary_image=busybox:1.36
+pull_image "$canary_image"
+load_image "$canary_image"
+# probe NAME WANT: run a Pod that tries the API server's Service once a second
+# for up to 30 s and stops at the first result equal to WANT (REACHED or
+# UNREACHED); it prints the last result. Repeating, because kindnet programs a
+# new Pod's policy a moment after the Pod starts: a first connection can get
+# through before it (the plugin runtime's self-check repeats for the same
+# reason, scarab-plugin-k8s probe.rs `until_isolated`).
+probe() {
+  kc run "$1" -n "$canary_ns" --image="$canary_image" --image-pull-policy=IfNotPresent \
+    --restart=Never --quiet --env="WANT=$2" --command -- sh -c '
+      i=0
+      while :; do
+        if nc -z -w 2 "$KUBERNETES_SERVICE_HOST" "$KUBERNETES_SERVICE_PORT"; then
+          got=REACHED
+        else
+          got=UNREACHED
+        fi
+        if [ "$got" = "$WANT" ] || [ $i -ge 30 ]; then echo "$got"; exit 0; fi
+        i=$((i+1)); sleep 1
+      done' >/dev/null
+  kc wait -n "$canary_ns" --for=jsonpath='{.status.phase}'=Succeeded "pod/$1" --timeout=150s >/dev/null \
+    || die "the NetworkPolicy canary Pod $1 did not finish in 150 s (kubectl -n $canary_ns describe pod $1)"
+  kc logs -n "$canary_ns" "$1" | tail -1
+}
+kc delete namespace "$canary_ns" --ignore-not-found --wait=true >/dev/null
+kc create namespace "$canary_ns" >/dev/null
+open_result="$(probe open REACHED)"
+[ "$open_result" = REACHED ] \
+  || die "the NetworkPolicy canary cannot reach the API server even with no policy ($open_result); the probe itself is broken"
+kc apply -n "$canary_ns" -f - >/dev/null <<'YAML'
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-all-egress
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+YAML
+denied_result="$(probe denied UNREACHED)"
+kc delete namespace "$canary_ns" --wait=false >/dev/null
+[ "$denied_result" = UNREACHED ] || die "kind cluster '$cluster' does not enforce NetworkPolicy:
+  a Pod whose namespace denies all egress still reached the API server after 30 s (git-bug ba32d49).
+  Plugins will refuse to start, and NetworkPolicy tests will fail.
+  Recreate the cluster: 'just stack down', then 'just stack up'
+  (this deletes the in-cluster Postgres and MinIO data of every mode)."
+
 # --- 4. Postgres, MinIO, the mode's database ---------------------------------
 echo "==> namespace $ns, Postgres, MinIO"
 kc create namespace "$ns" --dry-run=client -o yaml | kc apply -f - >/dev/null
@@ -356,14 +415,13 @@ else
   kc delete -n "$ns" -f "$here/toxiproxy.yaml" --ignore-not-found >/dev/null
 fi
 
-# Forgejo, in every mode. `just e2e` (e2e.sh, which sets SCARAB_E2E_TUNNEL=1
+# Forgejo, in every mode. `just test e2e` (e2e.sh, which sets SCARAB_E2E_TUNNEL=1
 # and deletes the tunnel on exit) also puts a cloudflared quick tunnel in
 # front of it: Forgejo builds clone URLs and payload links from ROOT_URL, so
 # ROOT_URL must be the tunnel's https URL, which is known only once
 # cloudflared has registered. Each tunnel Pod gets a new URL, so every e2e run
-# starts a new one. Nothing else opens it: e2e mode without the flag (by hand,
-# or `just plugin-verify`) runs without a tunnel, and every run deletes one an
-# earlier run left.
+# starts a new one. Nothing else opens it: e2e mode without the flag (by hand)
+# runs without a tunnel, and every run deletes one an earlier run left.
 # A random admin password and hook secret per stack, kept in .state (mode 600).
 for f in forgejo-admin-password forgejo-webhook-secret; do
   [ -s "$state/$f" ] || ( umask 077; head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$state/$f" )
@@ -461,7 +519,7 @@ chmod 600 "$values"
 # The clone library (ADR-0076 §9): checkouts run `lib:thulasi-ram/clone` with
 # the image it pins, so the release gets a manifest listing a copy of
 # libs/clone.yaml that pins the scarab-clone:dev image built above.
-# `just up dogfood` installs that copy into the org after the roll-out.
+# `just stack up dogfood` installs that copy into the org after the roll-out.
 python3 -I - "$root/libs/clone.yaml" scarab-clone:dev > "$libs_dir/clone.yaml" <<'PY'
 import re, sys
 text = open(sys.argv[1]).read()
@@ -541,6 +599,18 @@ if e["V_MODE"] == "chaos":
     v["replicaCount"] = 2
     v["workspace"] = {"replicaCount": 2}
     v["plugins"] = {"enabled": False}
+    # First-party libraries off: the Cache probe binds a repo, and the first
+    # bind into an org installs the org's default libraries, which reads
+    # libs/clone.yaml from github.com. The fault tier makes no network calls
+    # and none of its pipelines use a library. An empty manifest alone would
+    # not do it: the server then reads its release's manifest from GitHub.
+    v["scarab"]["libsManifest"] = ""
+    v["scarab"]["extraEnv"] = {"SCARAB_LIBS_MANIFEST": "off"}
+    # ADR-0077 rank 4 SIGSTOPs the scheduler leader for a little over the
+    # 30 s lease TTL. At the chart's 3 failures x 15 s the kubelet restarts
+    # the stopped server in that window and the scenario is INCONCLUSIVE;
+    # 8 x 15 s leaves it stopped until the scenario resumes it.
+    v["livenessProbe"] = {"failureThreshold": 8}
 if e["V_MODE"] == "dogfood":
     v["scarab"].update(githubAppId=e["V_APP_ID"], publicUrl=e["V_PUBLIC_URL"], stepTimeoutSecs=e["V_TIMEOUT"])
     v["secrets"].update(githubWebhookSecret=e["V_WEBHOOK"],
@@ -609,7 +679,7 @@ if [ "$mode" = dogfood ]; then
   / answered HTTP $root_code and /v1/repos HTTP $api_code; both must be Cloudflare's 404.
   This stack is dev-insecure, so a public UI or API makes every visitor an Owner.
   In the Cloudflare dashboard, set the tunnel's public hostname Path to ^/webhooks/
-  (the catch-all rule then answers 404), and rerun 'just up dogfood'.
+  (the catch-all rule then answers 404), and rerun 'just stack up dogfood'.
   The UI and API stay on $base. (000 or 5xx means the check could not reach the tunnel.)"
   fi
   tunnel_unchecked=0
@@ -686,8 +756,8 @@ for i in json.load(sys.stdin).get("installations", []):
 fi
 
 echo "==> up: $base (mode: $mode)"
-echo "    server log:  just logs          Depot: just workspace-status"
-echo "    pipelines:   just demo, just demo-chain"
+echo "    server log:  just stack logs     Depot: just stack logs depot, just stack status"
+echo "    pipelines:   just stack demo, just stack demo chain"
 if [ "$mode" = dogfood ]; then
   echo "    GitHub webhooks: https://\$DOGFOOD_HOSTNAME/webhooks/github (only /webhooks/ is public)"
 fi

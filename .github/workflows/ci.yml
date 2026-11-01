@@ -8,7 +8,7 @@ on:
     branches: [main]
   # `labeled` / `unlabeled` are for the two CI labels (git-bug ba1cab5):
   #   ci:skip  every job below skips, with no runner started. Removing the label
-  #            starts a run. `just pr-gate` refuses a PR that has it.
+  #            starts a run. `just pr` refuses a PR that has it.
   #   ci:full  the path filters are ignored and every job runs.
   # ci:skip wins when both are set. A change to any other label also starts a
   # run (GitHub cannot filter triggers by label name); in that run every job
@@ -59,7 +59,7 @@ jobs:
   #
   # The ci:skip label skips THIS job (a job-level `if:` is evaluated without a
   # runner), and every job below skips with it. So under ci:skip the anchor
-  # itself reports skipped, and `just pr-gate` fails the PR until the label is
+  # itself reports skipped, and `just pr` fails the PR until the label is
   # removed and a run passes. A run started by another label's change skips the
   # same way; the gate ignores a skipped run when the commit has a real one.
   changes:

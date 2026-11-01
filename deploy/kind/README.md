@@ -1,22 +1,24 @@
 # The kind dev stack
 
-`just up` runs Scarab on one local kind cluster, `scarab-dev`, from the real
+`just stack up` runs Scarab on one local kind cluster, `scarab-dev`, from the real
 Helm chart. Postgres, MinIO and Forgejo run in the cluster too. The server and the
 Depot run a `scarab-server` binary built on your machine, so a code change
 needs a compile and a Pod restart, not an image build. This is the setup
 described in the ADR-0077 Amendment (2026-11-01).
 
 ```sh
-just up          # build, create the cluster if needed, install the release
-just demo        # one-step pipeline, polled to success
-just demo-chain  # produce -> consume, checks the workspace crossed a Step boundary
-just reload      # rebuild and roll the server and Depot onto the new binary (after e2e or chaos: dev)
-just up dogfood  # the same stack in GitHub App mode, behind a named Cloudflare tunnel
-just e2e         # every live suite, against the release in its e2e mode
-just chaos       # ADR-0077 rank 1: a Depot Pod deleted mid-drain and mid-feed, then the invariant checker
-just logs        # follow the server's log
-just down        # delete the cluster and its data
-just down keep   # uninstall the release and both tunnels; keep the cluster, Postgres, MinIO and their data
+just stack up          # build, create the cluster if needed, install the release
+just stack demo        # one-step pipeline, polled to success
+just stack demo chain  # produce -> consume, checks the workspace crossed a Step boundary
+just stack reload      # rebuild and roll the server and Depot onto the new binary (after e2e or chaos: dev)
+just stack up dogfood  # the same stack in GitHub App mode, behind a named Cloudflare tunnel
+just test e2e          # every live suite, against the release in its e2e mode
+just test chaos        # ADR-0077 ranks 1, 2 and 4 under faults, then the invariant checker
+just stack logs        # follow the server's log
+just stack logs depot  # follow the Depot's log
+just stack status      # the Depot's readiness and gauges
+just stack down        # delete the cluster and its data
+just stack down keep   # uninstall the release and both tunnels; keep the cluster, Postgres, MinIO and their data
 ```
 
 The API and the web UI answer on the host at `SCARAB_ADDR` from
@@ -50,24 +52,24 @@ A directory is mounted, not the file. Cargo writes a new file on each build,
 and a file mount keeps showing the old one.
 
 The release's Pod template carries a SHA-256 of the binary and the staged UI's
-`index.html` as an annotation, so a `just up` or `just reload` after a change
+`index.html` as an annotation, so a `just stack up` or `just stack reload` after a change
 rolls both Pods, and one with no change rolls nothing.
 
-Measured on 2026-11-01 (M-series Mac, colima 2 vCPU / 4 GiB): `just up` from no
+Measured on 2026-11-01 (M-series Mac, colima 2 vCPU / 4 GiB): `just stack up` from no
 cluster took 2m07s with a warm `target/`; a rerun with no change 16 s; `just
-reload` after a one-line change in `scarab-server` 40 s, 9 s of it compiling.
+stack reload` after a one-line change in `scarab-server` 40 s, 9 s of it compiling.
 A cold zigbuild of the server took 2m05s in the spike.
 
 ## Step images
 
 Step Pods are created by the server, so their helper images cannot come from
-the mount. `just up` builds them locally and loads them into the node:
+the mount. `just stack up` builds them locally and loads them into the node:
 
 | Image | Built from | Used as |
 |---|---|---|
 | `scarab-wsfetch:dev` | `docker/runtime/wsfetch.Dockerfile`: the runtime image plus the zigbuilt `scarab-wsfetch` | the fetch init container and the drain helper (`workspace.fetcherImage`) |
 | `scarab-results-sidecar:dev` | `docker/sidecar` | the results sidecar (`scarab.sidecarImage`) |
-| `scarab-clone:dev` | `docker/clone` | the clone library's image, and the image `just demo` runs |
+| `scarab-clone:dev` | `docker/clone` | the clone library's image, and the image `just stack demo` runs |
 
 Local builds keep these helpers in step with the tree. A published `edge` tag
 is built from `main`, and a `scarab-wsfetch` older than the server fails every
@@ -82,16 +84,16 @@ skipped when the node already has the same image.
 ## Postgres, MinIO, Forgejo and modes
 
 `postgres.yaml` and `minio.yaml` run one Postgres (with
-`track_commit_timestamp=on`, which `just chaos` needs) and one MinIO, each on a
+`track_commit_timestamp=on`, which `just test chaos` needs) and one MinIO, each on a
 PVC. `forgejo.yaml` runs one Forgejo (SQLite on a PVC; see "Forgejo" below). A mode is a set of Helm values, and each mode has its own database and
 bucket on those two servers:
 
 | Mode | Recipe | Database | Bucket | Auth |
 |---|---|---|---|---|
-| dev | `just up` | `scarab` | `scarab-logs` | dev-insecure |
-| dogfood | `just up dogfood` | `scarab_dogfood` | `scarab-dogfood` | dev-insecure, GitHub App |
-| e2e | `just e2e` | `scarab_e2e` | `scarab-e2e` | dev-insecure; Forgejo behind a quick tunnel while `just e2e` runs |
-| chaos | `just chaos` | `scarab_chaos` | `scarab-chaos` | dev-insecure; Postgres and MinIO through toxiproxy; 2 servers, 2 Depot replicas |
+| dev | `just stack up` | `scarab` | `scarab-logs` | dev-insecure |
+| dogfood | `just stack up dogfood` | `scarab_dogfood` | `scarab-dogfood` | dev-insecure, GitHub App |
+| e2e | `just test e2e` | `scarab_e2e` | `scarab-e2e` | dev-insecure; Forgejo behind a quick tunnel while `just test e2e` runs |
+| chaos | `just test chaos` | `scarab_chaos` | `scarab-chaos` | dev-insecure; Postgres and MinIO through toxiproxy; 2 servers, 2 Depot replicas |
 
 Switching modes deletes the Depot's warm PVC. The warm tier caches blobs of
 one bucket, and would otherwise serve the new mode reads its bucket cannot
@@ -102,9 +104,9 @@ secrets; `SCARAB_KIND_FORCE_SWITCH=1` switches anyway.
 
 Dev secrets (master key, workspace token secret, results token secret) are
 generated once into `deploy/kind/.state/` (gitignored, mode 600) and kept
-across `just down`, so a kept database still decrypts.
+across `just stack down`, so a kept database still decrypts.
 
-## `just up dogfood`
+## `just stack up dogfood`
 
 This repository's own CI on Scarab, through the GitHub App, reached from
 GitHub through a named Cloudflare tunnel. It reads
@@ -117,7 +119,7 @@ GitHub through a named Cloudflare tunnel. It reads
 | `SCARAB_MASTER_KEY`, `SCARAB_RESULTS_TOKEN_SECRET`, `SCARAB_WORKSPACE_TOKEN_SECRET` | release secrets |
 | `SCARAB_ORG`, `SCARAB_REPO`, `SCARAB_INSTALL_ID` | the installation registered on a fresh database |
 | `SCARAB_STEP_TIMEOUT_SECS` | default step deadline |
-| `CLOUDFLARE_TUNNEL_TOKEN`, `DOGFOOD_HOSTNAME` | the tunnel; `just up dogfood` refuses without them |
+| `CLOUDFLARE_TUNNEL_TOKEN`, `DOGFOOD_HOSTNAME` | the tunnel; `just stack up dogfood` refuses without them |
 
 Each line is `KEY=value`; a leading `export `, CRLF line endings and one pair
 of quotes around the value are accepted, and nothing else is interpreted.
@@ -148,11 +150,11 @@ must both answer 404. When the local resolver has no answer for the name (a
 cached "no such name" from before the DNS record existed), it resolves the
 name through 1.1.1.1 with `dig` and passes `--resolve` to curl. Any other
 answer, or none within a minute, scales cloudflared to 0 and fails
-`just up dogfood` with a message naming the dashboard setting. The tunnel is
+`just stack up dogfood` with a message naming the dashboard setting. The tunnel is
 public for those few seconds. It then sends an unsigned
 `POST /webhooks/github` and expects Scarab's 400 or 401.
 
-`just up` switches back to dev and removes the tunnel.
+`just stack up` switches back to dev and removes the tunnel.
 
 ### GitHub App settings
 
@@ -183,19 +185,20 @@ that its server is the API port docker publishes for `scarab-dev-control-plane`
 
 A `scarab-dev` cluster without this worktree's mount or the host port (one
 from another worktree, or one from before `SCARAB_ADDR` changed) is refused with the reason, since recreating it deletes
-its Postgres and MinIO data. `SCARAB_KIND_RECREATE=1 just up` recreates it.
+its Postgres and MinIO data. `SCARAB_KIND_RECREATE=1 just stack up` recreates it.
 The host port is checked first, so a port held by something else stops
-`just up` before anything is deleted.
+`just stack up` before anything is deleted.
 
 `SCARAB_ADDR` is read by one helper (`scarab_addr` in `lib.sh`) for `up.sh`
-and `just demo`: a trailing comment, quotes and CRLF are dropped, `localhost`
+and `just stack demo`: a trailing comment, quotes and CRLF are dropped, `localhost`
 or an empty host means `127.0.0.1`, a missing port means `8080`.
 
 ## Tests on the release
 
-`just e2e` (`e2e.sh`) brings the release up in its e2e mode and leaves it
-there; `just up` switches it back to dev. It runs every live suite in passes,
-and all passes run even when one fails:
+`just test e2e` (`e2e.sh`) brings the release up in its e2e mode, with plugins
+on, and leaves it there; `just stack up` switches it back to dev. It runs every
+live suite in passes, and all passes run even when one fails; the exit code is
+non-zero when any failed:
 
 | Pass | What |
 |---|---|
@@ -204,9 +207,12 @@ and all passes run even when one fails:
 | forgejo-onboarding | add connection → pick-list → bind → hook → real push → Run, through the server; one test at a time |
 | forgejo-tunnel | the forge_token cases, through the quick tunnel |
 | cluster | the executor's and the plugin runtime's live cluster suites, in namespace `scarab-kube-tests` |
+| plugin-argocd | `plugin-verify.sh`: builds the Argo CD plugin image and loads it, starts a fake Argo CD on the host, installs and binds the plugin through the API, then checks the isolation probe, the Pod's read of Argo CD through the broker with the bound credential, and that the kill switch makes the broker answer 403 and scales the workload to 0. It stops the fake Argo CD when it ends |
 | crash_resume | last, on its own: it kills the server every other case talks to |
 
-`just e2e <filter>` passes a nextest filter to every pass. The test binaries
+`just test e2e <filter>` passes a nextest filter to every nextest pass; the
+plugin-argocd pass runs only when the filter is part of its name (so `just test
+e2e argocd` runs it alone, with the nextest passes matching nothing). The test binaries
 run on the host. `test-env.sh` gives them what the host cannot reach directly:
 
 - Postgres (for the e2e case that seeds a connection), Forgejo, the Depot and
@@ -223,18 +229,34 @@ run on the host. `test-env.sh` gives them what the host cannot reach directly:
 namespace (`crictl inspect` gives the container's PID on the node), so the
 kubelet restarts the container in the same Pod.
 
-## `just chaos`
+## `just test chaos`
 
-`just chaos` (`chaos.sh`) runs ADR-0077's rank-1 fault scenario on this
-release: two Depot replicas, and one of them deleted with grace 0 while a
-workspace drain is in flight, then again while a fetcher is pulling a Step's
-inputs. The `scarab-chaos` binary (`crates/scarab-chaos`) fires the fault and
+`just test chaos` (`chaos.sh`) runs ADR-0077's fault scenarios on this release,
+at two server replicas and two Depot replicas:
+
+- rank 1, `mid-drain` and `mid-feed`: one Depot Pod deleted with grace 0 while a
+  workspace drain is in flight, then while a fetcher pulls a Step's inputs;
+- rank 2, `two-replicas` and `kill-server`: no fault, then the server replica
+  that holds a launch claim SIGKILLed while its drain is in flight;
+- rank 4, `stop-leader`: the scheduler leader SIGSTOPped past its 30 s lease
+  until a peer takes over, then SIGCONTed;
+- `pause-node` (not an ADR-0077 rank): the whole kind node `docker pause`d
+  while a producer's drain is owed, for longer than the 30 s lease TTL and
+  claim window and shorter than the Pod's grace period, then `docker
+  unpause`d. This is a host suspend: the kubelet, the egress mid-drain and
+  both servers freeze together, and the wall clock jumps on the resume. Every
+  Run must still succeed.
+
+Server signals are sent from the kind node, because the server is PID 1 in its
+container. The `scarab-chaos` binary (`crates/scarab-chaos`) fires the fault and
 then checks the invariants.
 
 ```sh
-just chaos                          # mid-drain, then mid-feed, seed 1
-just chaos mid-feed 7               # one scenario, another seed
-just chaos replay deploy/kind/.chaos/<dir>/scenario.json
+just test chaos             # all six scenarios, seed 1
+just test chaos rank2       # one rank
+just test chaos mid-feed 7  # one scenario, another seed
+just test chaos pause-node  # about 8-10 minutes
+just test chaos replay deploy/kind/.chaos/<dir>/scenario.json
 ```
 
 What it does, in order:
@@ -265,7 +287,7 @@ What it does, in order:
    beside the next session's workload; a scenario refuses to start while one
    is left). Then switches the release back to the mode that was active
    before (dev or dogfood; from e2e it goes to dev, since restoring e2e opens
-   a new public Forgejo tunnel) and runs `just demo` there. When `up.sh chaos`
+   a new public Forgejo tunnel) and runs `just stack demo` there. When `up.sh chaos`
    refused or the build failed, the release was never switched: nothing is
    deleted or switched, and the recipe only exits.
 
@@ -279,8 +301,21 @@ it):
 | `scenario.json` | seed, plan, workload, quiesce bound, Run IDs, the fault with its trigger, its time and where it landed (`mid-drain`, `mid-feed`, `before-window`, `after-window`) |
 | `pods.jsonl` | every change to a step Pod or a Depot Pod during the run |
 | `verdict.json` | the checker's findings and, per green Attempt, the objects and bytes it read back |
-| `release-log.txt` | server and Depot log lines that name the target Pod or the deleted replica |
+| `release-log.txt` | server and Depot log lines that name a step Pod of the scenario's Runs, the fault's target or the replica it hit; written for every scenario |
 | `fetcher-log.txt` | mid-feed only: the target fetcher's own log |
+| `cache-log.txt` | the Cache probe's `cache restore` lines, one per cached Step Pod |
+
+Each scenario also runs a Cache probe beside its workload: a seed Run, waited
+for before the workload, whose cached Step saves a Cache, and a probe Run,
+submitted with the workload, whose cached Step restores it from the Cache's
+home Depot replica. A Cache needs a Project, so the probe's pipeline is written
+to the Forgejo repo `scarab-admin/chaos-cache`, which is bound (without a
+webhook) through a fresh connection in the chaos database and dispatched
+through the API. The verdict prints the hits, the misses and the restores from
+a home replica. These lines are information only: a Cache miss is correct, so
+it never fails or narrows a verdict, and the probe's Runs are not counted by
+the invariants. A replay writes the recorded pipeline again with a new salt,
+so its seed starts cold too.
 
 A replay reads `scenario.json` and fires the same plan (target Run, delay,
 replica) without drawing from the seed again. Timing still varies, so a replay
@@ -302,6 +337,9 @@ does not take the API's or a Step's word for success:
 | I8 | after quiesce, no Pod of a scenario Run is pending or running, and no per-Pod workspace Secret outlives its Pod |
 | I10 | no uncommitted pack row older than 60 s for a fence that has a drain record; every committed pack's object exists at its recorded size |
 | W1 | the workload's outcome (not an ADR-0077 §2 invariant): every scenario Run ends `succeeded`, and every green Attempt has an output snapshot |
+| N1 | `pause-node` only: no Attempt finished with a lost-node cause ("workspace snapshot lost", "egress sidecar died"); any other failed Attempt is a warning |
+| D1 | `two-replicas` only (git-bug 068cc0b): no two different server replicas drained the same scenario Pod over overlapping time. Each drain's interval comes from the replica's `ws-timing` line with `leg: drain` in `release-log.txt` (end = its timestamp, start = end − `total_ms`); a re-drive by another replica after the first drain ended passes. A drain that failed logs no `ws-timing` line. "drain helper exited 12 with no record posted" means a record POST failed (the Depot's `drain_state_incomplete` 422 at two Depot replicas, for one) and is printed as info |
+| C1 | the Cache probe (git-bug 12e2f6b): when the probe's seed Run succeeded and no fault hit the Cache's home Depot replica, every restore of the probe Run is a hit from that home. Otherwise it is printed `not exercised` with the reason, and it has no minimum |
 
 W1 is separate from the ADR's I-numbers because I3 and I4 as written there
 accept a dead-lettered Run and a green Attempt with no snapshot. The workload
@@ -324,11 +362,36 @@ workload produces: T1 and I3 one per Run, I1a, I1c and I4 one per Attempt
 `ok`. I1b compares a Step's consecutive Attempts, and a Depot fault causes no
 retry, so rank 1 never exercises it; it is printed as such and not counted.
 
+N1 exists because the executor's lost-node verdict is an Infra failure that
+the engine retries: the Run can still end `succeeded` on a second Attempt and
+pass W1. `pause-node` pauses the node for min(grace − 120 s, 240 s), from the
+target Pod's recorded `terminationGracePeriodSeconds`. The producer is a
+workspace Pod with a grace of 600 s, so the pause is 240 s, and a scenario
+takes about 8-10 minutes. A freeze longer than the grace is not survivable by
+design: on the resume the kubelet SIGKILLs the egress sidecar and the Runs
+dead-letter (git-bug 070d042, closed as not a bug), so the scenario stays
+short of it. A scenario file that planned more than 240 s is refused. Its
+trigger and window are `mid-drain`'s, with a delay of 0 to 2 s. It is
+INCONCLUSIVE when the pause landed outside the drain window, when docker did
+not report the node paused, when it did not outlast the 30 s lease TTL and
+claim window, or when it reached the Pod's grace. The
+harness unpauses the node on every path it controls (a guard on every
+return, and a SIGINT or SIGTERM handler), and `chaos.sh` unpauses a paused
+node when it starts and first thing when it exits. If chaos.sh itself is
+killed (SIGKILL), `just stack up` and `just stack down` find the node paused
+and unpause it, and say so. Its port-forwards are
+kept open by a loop that restarts each one when it exits, and that ends once
+chaos.sh is gone; after the unpause
+the harness ends each (their PIDs are in `deploy/kind/.state/forward-*.pid`),
+the loop re-opens it on the same port, and the harness waits until Postgres
+and the kube API answer before it goes on. Its Pod watch re-lists when a list
+takes over 30 s or the watch is quiet for 270 s.
+
 Before the workload starts, the binary waits for the scenario's topology:
 as many ready server Pods and Depot Pods as the scenario file records. A
 replay of a 2+2 file on a release at another scale fails there (exit 2).
 
-`just chaos` exits 0 when every verdict passed, 1 when one failed (a finding:
+`just test chaos` exits 0 when every verdict passed, 1 when one failed (a finding:
 keep the scenario file and replay it), 2 when a scenario could not run, and 3
 when none failed but one was inconclusive (rerun it, or try another seed).
 It also samples the kind node's memory every 5 s into
@@ -337,7 +400,7 @@ It also samples the kind node's memory every 5 s into
 Measured on 2026-11-01 (colima 2 vCPU / 4 GiB): the kind node used 1.46 GiB
 at 2+2 before the workload (Postgres, MinIO, Forgejo and toxiproxy included)
 and 1.72 to 1.91 GiB at the peak with the step Pods running. One scenario
-takes 3 to 5 minutes; `just chaos` with both and the two mode switches took
+takes 3 to 5 minutes; `just test chaos` with both and the two mode switches took
 about 9. With two server replicas, the drain of one Pod is driven from
 both: one replica's drain helper often exits 12 (its record POST failed) and
 the other replica's re-drive posts the record, with or without a fault.
@@ -364,18 +427,17 @@ and a collaborator, and the private repos of the forge_token cases. It writes
 read. Its hooks are stamped with `.state/forgejo-webhook-secret`, which the
 release gets as `secrets.forgejoWebhookSecret`.
 
-Under `just e2e` (which sets `SCARAB_E2E_TUNNEL=1` for `up.sh e2e`), `up.sh`
+Under `just test e2e` (which sets `SCARAB_E2E_TUNNEL=1` for `up.sh e2e`), `up.sh`
 first re-renders Forgejo with sign-in required to view, then starts a
 cloudflared quick tunnel in front of it (`forgejo-tunnel.yaml`), reads the
 random `https://<name>.trycloudflare.com` URL from its log, and sets Forgejo's
 `ROOT_URL` to it. The forge_token cases need an https clone URL that the
 server Pod and the step Pods both reach, over TLS the clone image trusts; a
 quick tunnel needs no account. This makes network calls, and Forgejo is
-reachable from the internet while the tunnel runs. `just e2e` deletes the
+reachable from the internet while the tunnel runs. `just test e2e` deletes the
 tunnel when it exits, on success, failure or Ctrl-C, and the next run gets a
-new URL. Nothing else opens it: `up.sh e2e` without the flag (`just
-plugin-verify`) runs without a tunnel, every `up.sh` run deletes one a run
-left, `just down keep` deletes it, and `just reload` after `just e2e` goes to
+new URL. Nothing else opens it: `up.sh e2e` without the flag runs without a
+tunnel, every `up.sh` run deletes one a run left, `just stack down keep` deletes it, and `just stack reload` after `just test e2e` goes to
 dev. In e2e mode the release's library manifest is the real
 `libs/` at its last commit, which the server fetches from github.com, so
 `libs/` must be committed and pushed; the release's `publicUrl` is the server's
@@ -383,7 +445,7 @@ Service, where Forgejo delivers hooks.
 
 ## CI
 
-`.github/workflows/e2e.yml` runs `just e2e` on PRs labelled `ci:full` and
+`.github/workflows/e2e.yml` runs `just test e2e` on PRs labelled `ci:full` and
 weekly, so CI creates the same cluster with the same `up.sh`. A PR without the
 label runs `ci.yml` only (the workspace suite, no cluster). The runner gets
 pinned kind, kubectl, Helm 4 and zig from `.github/actions/kind-tools`, and
@@ -405,5 +467,5 @@ Pod-side probe in `test-env.sh` finds it.
 | `SCARAB_DEV_ORG` | `thulasi-ram` | org whose `production` Environment dev mode seeds |
 | `SCARAB_DOGFOOD_ENV` | `~/.config/scarab/dogfood.env` | the dogfood env file |
 | `SCARAB_DOGFOOD_DEV_INSECURE` | `true` | dogfood's `scarab.devInsecure` |
-| `SCARAB_KIND_EXTRA_VALUES` | none | one more Helm values file, applied last; not remembered by `just reload` |
-| `SCARAB_CHAOS_DIR` | `deploy/kind/.chaos` | where `just chaos` writes scenario files, Pod records and verdicts |
+| `SCARAB_KIND_EXTRA_VALUES` | none | one more Helm values file, applied last; not remembered by `just stack reload` |
+| `SCARAB_CHAOS_DIR` | `deploy/kind/.chaos` | where `just test chaos` writes scenario files, Pod records and verdicts |

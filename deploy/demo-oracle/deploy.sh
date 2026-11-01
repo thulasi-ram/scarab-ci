@@ -25,7 +25,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 
 # Image SOURCE (repository + clone/sidecar/wsfetch refs) is a per-invocation
-# choice, so a caller (`just demo-oracle`) may override it even though .env is
+# choice, so a caller (`just stack up demo-oracle`) may override it even though .env is
 # otherwise file-wins for durable config + secrets. Capture caller-provided
 # image refs now; re-apply after the .env load.
 _img_repo="${IMAGE_REPOSITORY:-}"
@@ -82,14 +82,34 @@ fi
 [ -n "$_img_sidecar" ] && export SCARAB_SIDECAR_IMAGE="$_img_sidecar"
 [ -n "$_img_wsfetch" ] && export SCARAB_WSFETCH_IMAGE="$_img_wsfetch"
 
-# HARD GUARD: only ever touch the cluster this .env names. k3s writes `default`.
-# A deploy script must never be pointable at a cluster you did not mean.
+# HARD GUARD: only ever touch this box's own k3s. The ambient kubeconfig and
+# context are not trusted: every kubectl and helm call below names the k3s
+# kubeconfig and the context, and the context must point at the k3s API on
+# loopback. k3s writes /etc/rancher/k3s/k3s.yaml (readable by the deploy user's
+# group, see bootstrap.sh), and bootstrap.sh copies it to ~/.kube/config.
 want_ctx="${KUBE_CONTEXT:-default}"
-ctx="$(kubectl config current-context)"
-[ "$ctx" = "$want_ctx" ] || {
-  echo "refusing: kubectl context is '$ctx', not '$want_ctx' (KUBE_CONTEXT in $ENVFILE)." >&2
+if [ -r /etc/rancher/k3s/k3s.yaml ]; then
+  KUBECONFIG_FILE=/etc/rancher/k3s/k3s.yaml
+elif [ -r "$HOME/.kube/config" ]; then
+  KUBECONFIG_FILE="$HOME/.kube/config"
+else
+  echo "refusing: neither /etc/rancher/k3s/k3s.yaml nor ~/.kube/config is readable (run bootstrap.sh first)." >&2
   exit 1
-}
+fi
+export KUBECONFIG="$KUBECONFIG_FILE"
+kc() { kubectl --kubeconfig "$KUBECONFIG_FILE" --context "$want_ctx" "$@"; }
+hc() { helm --kubeconfig "$KUBECONFIG_FILE" --kube-context "$want_ctx" "$@"; }
+# --minify keeps only the named context's cluster; an unknown context fails
+# here and leaves api_server empty, which is refused below.
+api_server="$(kc config view --raw --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null || true)"
+case "$api_server" in
+  https://127.0.0.1:6443|https://localhost:6443|https://\[::1\]:6443) ;;
+  *)
+    echo "refusing: context '$want_ctx' in $KUBECONFIG_FILE points at '${api_server:-nothing}'," >&2
+    echo "  not this box's k3s API on loopback (https://127.0.0.1:6443)." >&2
+    exit 1
+    ;;
+esac
 
 command -v helm >/dev/null 2>&1 || {
   echo "refusing: helm is not installed. k3s does not ship it:" >&2
@@ -301,7 +321,7 @@ SERVER_IMAGE="${IMAGE_REPOSITORY:-ghcr.io/thulasi-ram/scarab-server}:${TAG}"
 WSFETCH_IMAGE="${SCARAB_WSFETCH_IMAGE:-ghcr.io/thulasi-ram/scarab-wsfetch:edge}"
 
 echo "==> namespace $NS"
-kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
+kc create namespace "$NS" --dry-run=client -o yaml | kc apply -f -
 
 # Run `<image> <args…>` to completion in a throwaway Pod and echo everything it
 # printed. Never fails the script — the CALLER decides what the output means,
@@ -312,8 +332,8 @@ kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
 # `kubectl run` fail with AlreadyExists instead of with the real problem.
 preflight_run() {
   local name="$1" image="$2"; shift 2
-  kubectl delete pod -n "$NS" "scarab-preflight-$name" --ignore-not-found --wait >/dev/null 2>&1 || true
-  kubectl run "scarab-preflight-$name" -n "$NS" \
+  kc delete pod -n "$NS" "scarab-preflight-$name" --ignore-not-found --wait >/dev/null 2>&1 || true
+  kc run "scarab-preflight-$name" -n "$NS" \
     --rm --restart=Never --attach --quiet \
     --pod-running-timeout=300s \
     --image-pull-policy=Always \
@@ -405,20 +425,20 @@ esac
 # ---------------------------------------------------------------------------
 if [ -n "${SCARAB_APP_PEM:-}" ]; then
   echo "==> GitHub App PEM secret ($APP_PEM_SECRET)"
-  kubectl create secret generic "$APP_PEM_SECRET" -n "$NS" \
+  kc create secret generic "$APP_PEM_SECRET" -n "$NS" \
     --from-file="$APP_PEM_KEY=$SCARAB_APP_PEM" \
-    --dry-run=client -o yaml | kubectl apply -f -
+    --dry-run=client -o yaml | kc apply -f -
 fi
 
 echo "==> OAuth client secret ($OAUTH_SECRET)"
-kubectl create secret generic "$OAUTH_SECRET" -n "$NS" \
+kc create secret generic "$OAUTH_SECRET" -n "$NS" \
   --from-literal="$OAUTH_SECRET_KEY=$SCARAB_OAUTH_CLIENT_SECRET" \
-  --dry-run=client -o yaml | kubectl apply -f -
+  --dry-run=client -o yaml | kc apply -f -
 
 echo "==> Cloudflare tunnel token (scarab-cloudflared)"
-kubectl create secret generic scarab-cloudflared -n "$NS" \
+kc create secret generic scarab-cloudflared -n "$NS" \
   --from-literal="token=$CLOUDFLARE_TUNNEL_TOKEN" \
-  --dry-run=client -o yaml | kubectl apply -f -
+  --dry-run=client -o yaml | kc apply -f -
 
 # The nightly pg_dump CronJob's own credentials. Its OWN Secret rather than the
 # chart's: a backup must not depend on chart-internal key names it does not own.
@@ -427,28 +447,28 @@ kubectl create secret generic scarab-cloudflared -n "$NS" \
 # nothing on this box listens publicly). The override exists so changing it
 # there is one place plus one env var, not a hunt.
 echo "==> backup credentials (scarab-backup)"
-kubectl create secret generic scarab-backup -n "$NS" \
+kc create secret generic scarab-backup -n "$NS" \
   --from-literal="PGPASSWORD=${POSTGRES_PASSWORD:-scarab}" \
   --from-literal="S3_ACCESS_KEY=$SCARAB_S3_ACCESS_KEY" \
   --from-literal="S3_SECRET_KEY=$SCARAB_S3_SECRET_KEY" \
   --from-literal="S3_ENDPOINT=$S3_ENDPOINT" \
   --from-literal="S3_BUCKET=$SCARAB_S3_BUCKET" \
-  --dry-run=client -o yaml | kubectl apply -f -
+  --dry-run=client -o yaml | kc apply -f -
 
 # The step namespace must exist BEFORE the Helm release: the chart renders the
 # executor's Role/RoleBinding into it (scarab.namespace in values.yaml), and
 # applying a Role to a namespace that does not exist fails the whole upgrade.
 echo "==> step namespace + LimitRange"
-kubectl apply -f "$ROOT/deploy/demo-oracle/steps.yaml"
+kc apply -f "$ROOT/deploy/demo-oracle/steps.yaml"
 
 echo "==> in-cluster Postgres (+ nightly dump to R2)"
-kubectl apply -n "$NS" -f "$ROOT/deploy/demo-oracle/postgres.yaml"
-kubectl rollout status -n "$NS" deploy/scarab-postgres --timeout=180s
+kc apply -n "$NS" -f "$ROOT/deploy/demo-oracle/postgres.yaml"
+kc rollout status -n "$NS" deploy/scarab-postgres --timeout=180s
 
 echo "==> scarab-server + workspace service (image tag: $TAG)"
-helm upgrade --install scarab "$ROOT/deploy/helm/scarab" -n "$NS" \
+hc upgrade --install scarab "$ROOT/deploy/helm/scarab" -n "$NS" \
   -f "$ROOT/deploy/demo-oracle/values.yaml" -f "$VALUES"
-kubectl rollout status -n "$NS" deploy/scarab --timeout=300s
+kc rollout status -n "$NS" deploy/scarab --timeout=300s
 # The workspace service is standard-path, so its readiness is a deploy gate, not
 # a footnote: Ready means its PVC bound AND its /readyz passed — warm writable,
 # and the R2 bucket reachable and writable. Deploying a control plane whose data
@@ -475,30 +495,30 @@ echo "==> workspace service (ADR-0061)"
 # they differ AND the Pod is not ready — i.e. it is provably running superseded
 # spec and is not healthy, so nothing is lost by restarting it. A Pod that is
 # merely slow to start is left alone.
-_sts_rev=$(kubectl get sts scarab-workspace -n "$NS" \
+_sts_rev=$(kc get sts scarab-workspace -n "$NS" \
   -o jsonpath='{.status.updateRevision}' 2>/dev/null || true)
-_pod_rev=$(kubectl get pod scarab-workspace-0 -n "$NS" \
+_pod_rev=$(kc get pod scarab-workspace-0 -n "$NS" \
   -o jsonpath='{.metadata.labels.controller-revision-hash}' 2>/dev/null || true)
-_pod_ready=$(kubectl get pod scarab-workspace-0 -n "$NS" \
+_pod_ready=$(kc get pod scarab-workspace-0 -n "$NS" \
   -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null || true)
 if [ -n "$_pod_rev" ] && [ -n "$_sts_rev" ] && \
    [ "$_pod_rev" != "$_sts_rev" ] && [ "$_pod_ready" != "true" ]; then
   echo "    scarab-workspace-0 is stuck on a superseded revision and is not"
   echo "    ready ($_pod_rev, want $_sts_rev) — deleting it so the StatefulSet"
   echo "    can recreate it from the current spec."
-  kubectl delete pod scarab-workspace-0 -n "$NS" --wait=false
+  kc delete pod scarab-workspace-0 -n "$NS" --wait=false
 fi
 unset _sts_rev _pod_rev _pod_ready
 
-kubectl rollout status -n "$NS" statefulset/scarab-workspace --timeout=300s
+kc rollout status -n "$NS" statefulset/scarab-workspace --timeout=300s
 
 # cloudflared LAST, deliberately: it is the front door, and there is no point
 # opening it onto a control plane that has not come up. Its readiness probe
 # reads cloudflared's own /ready, which means an edge connection is registered —
 # so a Ready Pod here is a real statement about the public URL working.
 echo "==> cloudflared (ingress)"
-kubectl apply -n "$NS" -f "$ROOT/deploy/demo-oracle/cloudflared.yaml"
-kubectl rollout status -n "$NS" deploy/scarab-cloudflared --timeout=180s
+kc apply -n "$NS" -f "$ROOT/deploy/demo-oracle/cloudflared.yaml"
+kc rollout status -n "$NS" deploy/scarab-cloudflared --timeout=180s
 
 cat <<EOF
 

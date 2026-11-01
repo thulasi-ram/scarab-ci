@@ -6,7 +6,7 @@
 #   deploy/kind/down.sh keep     uninstall the release and delete both
 #                                tunnels (dogfood's and e2e's); the cluster,
 #                                Postgres, MinIO and their PVCs stay, so the
-#                                next `just up` starts on the same data
+#                                next `just stack up` starts on the same data
 #
 # The generated dev secrets in deploy/kind/.state are kept either way, so a
 # kept database still decrypts with the same master key.
@@ -19,6 +19,7 @@ what="${1:-all}"
 
 case "$what" in
   all)
+    unpause_node
     echo "==> deleting kind cluster '$cluster'"
     kind delete cluster --name "$cluster" --kubeconfig "$kubeconfig" 2>/dev/null || true
     rm -f "$kubeconfig" "$here/.state/loaded-images" "$here/.state/mode"
@@ -29,6 +30,7 @@ case "$what" in
       echo "==> no kind cluster '$cluster'; nothing to do"
       exit 0
     fi
+    unpause_node
     echo "==> uninstalling release $release (Postgres, MinIO and their data stay)"
     hc uninstall "$release" -n "$ns" --ignore-not-found
     kc delete deploy scarab-cloudflared -n "$ns" --ignore-not-found

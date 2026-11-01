@@ -1,9 +1,10 @@
-# Every live suite: `just e2e`, the recipe a developer runs (test-strategy
+# Every live suite: `just test e2e`, the recipe a developer runs (test-strategy
 # Phase 2, ADR-0077 Amendment 2026-11-01). It brings the kind release up in its
 # e2e mode (`deploy/kind/up.sh e2e`: cluster, Postgres, MinIO, Forgejo behind a
 # cloudflared quick tunnel, the chart with a server binary built here) and runs
 # the scarab-e2e crate, the Forgejo cases, the forge_token cases through the
-# tunnel, the executor's and the plugin runtime's cluster suites, and
+# tunnel, the executor's and the plugin runtime's cluster suites, the Argo CD
+# plugin against a fake Argo CD (its image is built here, with docker), and
 # crash_resume last. The tunnel makes network calls (accepted by the owner,
 # 2026-11-01).
 #
@@ -90,7 +91,7 @@ jobs:
           tool: cargo-nextest,just,cargo-zigbuild@0.24.0
       # kind, kubectl, Helm 4 and zig, pinned (see the action's header).
       - uses: ./.github/actions/kind-tools
-      - name: just e2e
+      - name: just test e2e
         env:
           # A SHA this event guarantees exists on the forge: the PR head, or
           # the commit on main (the clone cases fetch it). The recipe's
@@ -99,7 +100,7 @@ jobs:
           # The clone cases fetch THIS repo: hand them the run's read-only
           # token (delivered via tmpfs + GIT_ASKPASS).
           SCARAB_TEST_CLONE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: just e2e
+        run: just test e2e
       - name: Cluster diagnostics (on failure)
         if: failure()
         run: |

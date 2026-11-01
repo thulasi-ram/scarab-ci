@@ -1,0 +1,20 @@
+-- Lease terms for leader fencing (git-bug aaf4e3e, ADR-0077 rank 4).
+--
+-- `term` counts takeovers of a lease: a new owner taking over an expired
+-- lease increments it, a renewal by the holder keeps it. The scheduler's
+-- leader-only writes check `(owner, term)` with `FOR SHARE` on this row in
+-- the same transaction (or a transaction held open across the write), so a
+-- leader that was paused past its TTL and lost the lease has its writes
+-- refused instead of interleaved with the new leader's.
+--
+-- Expand-only, safe while old and new servers overlap in a rollout:
+-- * an old server's INSERT omits `term` and gets the default 0; its takeover
+--   UPDATE leaves `term` unchanged. A new server's fence still refuses a
+--   stale write after such a takeover, because the fence checks the owner
+--   too; the term only adds the case where the same owner lost the lease and
+--   got it back.
+-- * an old server never fences, as before this migration.
+-- * nothing reads `term` but the new code, so rolling back leaves a column
+--   the old code ignores.
+-- ADD COLUMN with a constant default does not rewrite the table (PG 11+).
+ALTER TABLE leases ADD COLUMN IF NOT EXISTS term BIGINT NOT NULL DEFAULT 0;

@@ -1,4 +1,5 @@
-//! The invariant checker (ADR-0077 §2), for the invariants rank 1 exercises.
+//! The invariant checker (ADR-0077 §2), for the invariants ranks 1, 2 and 4
+//! exercise.
 //!
 //! [`gather`] reads the recorded state: Postgres (`runs`, `step_runs`,
 //! `attempts`, `events`, the Depot tables), the bucket (HEAD and ranged GET
@@ -11,14 +12,20 @@
 //! | id   | invariant (ADR-0077 §2) |
 //! |------|-------------------------|
 //! | I1a  | at most one Pod UID per Attempt |
-//! | I1b  | Attempt N+1's step container starts after Attempt N's ended, or after N was journalled finished or superseded (only the journal counts for an N whose step container was never seen) |
+//! | I1b  | Attempt N+1's step container starts after Attempt N's ended, or after N was journalled finished or superseded or N's Pod was gone (only the journal counts for an N whose step container was never seen); an overlap after that is allowed until N's container has run the Pod's `terminationGracePeriodSeconds` + 30 s past its Pod's removal, and fails past it |
 //! | I1c  | no double execution: per Step at most one succeeded Attempt, one `AttemptStarted` and one `AttemptFinished` per journalled Attempt (with an `attempts` row or not), and a Succeeded Step's evidence Attempt is that one |
 //! | T1   | exactly one terminal `RunTransitioned` per Run, matching `runs.status` |
+//! | I5   | folding each Run's journal (its last `RunTransitioned`, and per Step its last `StepTransitioned` or `StepSkipped`) gives `runs.status` and `step_runs.status` |
 //! | I3   | every scenario Run terminal within the quiesce bound, and none left with `creating = TRUE` |
 //! | I4   | every green Attempt's output snapshot closure is in committed packs whose ranges read back and hash to their addresses; a member in another fence's pack needs a `depot_fence_borrows` edge |
 //! | I8   | after quiesce no Pod of a scenario Run is still pending or running, and no per-Pod Secret outlives its Pod |
 //! | I10  | no `committed = FALSE` pack row older than the linger for a fence whose drain has a record; every committed pack's object exists at its recorded size |
-//! | W1   | the rank-1 workload's own outcome: every scenario Run that ended, ended `succeeded`, and every green Attempt has an output snapshot |
+//! | L1   | rank 4: a takeover of the scheduler lease increments `leases.term`, and the term never goes back (only where the column exists) |
+//! | L2   | rank 4: a peer takes the stopped leader's lease over within the TTL + 30 s, wherever the stop landed (inside a fenced write too: the fence's stall bound releases the lease row) |
+//! | W1   | the workload's own outcome: every scenario Run that ended, ended `succeeded`, and every green Attempt has an output snapshot |
+//! | N1   | `pause-node` (a freeze shorter than the Pod's grace): no Attempt of a scenario Run finished with a lost-node verdict ("workspace snapshot lost", "egress sidecar died"); the node was paused, not lost. Any other failed Attempt is a warning |
+//! | D1   | `two-replicas` (git-bug 068cc0b): no two different server replicas ran a drain of the same scenario Pod over overlapping time. Each drain's interval comes from the replica's `ws-timing` line with `leg: drain` (end = the line's timestamp, start = end − `total_ms`). A re-drive by another replica after the first drain ended is allowed |
+//! | C1   | the Cache probe (`crate::cache::c1`, git-bug 12e2f6b): when the seed Run succeeded and no fault hit the Cache's home replica, every restore of the probe Run is a hit from that home. Otherwise not exercised, with the reason as an info finding; it has no minimum |
 //!
 //! W1 is not one of ADR-0077 §2's invariants. As written there, I3 accepts a
 //! dead-lettered Run and I4 passes a green Attempt whose snapshot is NULL, so
@@ -29,16 +36,25 @@
 //!
 //! Outside the invariants, a scenario is INCONCLUSIVE, not PASS, when its
 //! fault did not exercise what it names ([`exercised`]): no fault fired, the
-//! fault landed outside its window, or the trigger condition no longer held
-//! when it fired. It is also INCONCLUSIVE when an invariant looked at fewer
-//! things than the workload must produce ([`minimums`]). A FAIL finding still
-//! makes the verdict FAIL.
+//! fault landed outside its window, the trigger condition no longer held
+//! when it fired, a server signal did not take effect, or it hit a replica
+//! other than the one the scenario names. `two-replicas` is INCONCLUSIVE
+//! when one replica drove every step. It is also INCONCLUSIVE when an
+//! invariant looked at fewer things than the workload must produce
+//! ([`minimums`]). A FAIL finding still makes the verdict FAIL.
 //!
-//! I1b compares consecutive Attempts of one Step. A Depot fault does not
-//! cause a retry, so rank 1 never has a pair: I1b is reported as not
-//! exercised and has no minimum.
+//! I5 folds the transition events in the checker. `scarab-engine` exports no
+//! fold, and the checker does not link the engine it checks. A mismatch
+//! between two non-terminal statuses (`pending` against `ready`) is reported
+//! as a warning: the checker does not assume every non-terminal step is
+//! journalled, and after quiesce every row should be terminal.
+//!
+//! I1b compares consecutive Attempts of one Step. None of the workloads here
+//! is built to cause a retry (a Depot fault or a server kill is meant to be
+//! absorbed), so I1b often has no pair: it is reported as not exercised and
+//! has no minimum.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use futures::StreamExt as _;
 use k8s_openapi::api::core::v1::{Pod, Secret, Service};
@@ -78,7 +94,7 @@ pub struct Finding {
     pub detail: String,
 }
 
-/// The verdict's outcome. `just chaos` exits 0, 1 and 3 for them.
+/// The verdict's outcome. `just test chaos` exits 0, 1 and 3 for them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Outcome {
@@ -114,6 +130,11 @@ pub struct Verdict {
     /// What I4 read back: per green Attempt, the objects in its snapshot
     /// closure and the bytes read from the bucket and hashed.
     pub snapshots: Vec<SnapshotSummary>,
+    /// The Cache probe's lines (`crate::cache::summary_lines`), set by the
+    /// caller from the scenario file. No outcome reads them; C1 is judged
+    /// in `evaluate`.
+    #[serde(default)]
+    pub cache: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,6 +238,134 @@ pub struct Facts {
     pub faults: Vec<Fault>,
     /// How many Runs the workload submits (`workload.runs`).
     pub expected_runs: usize,
+    /// Distinct `outbox.claimed_by` of the scenario's launch intents: the
+    /// replicas that drove a step to its end (`two-replicas`).
+    pub launch_claimers: BTreeSet<String>,
+    /// `release-log.txt` (`nemesis::RELEASE_LOG`): the server and Depot log
+    /// lines that name a scenario Pod, each prefixed with its Pod. `None`
+    /// when the file was not written. D1 reads it.
+    pub release_log: Option<String>,
+    /// The Cache probe as recorded (scenario.json). C1 reads it; `None`
+    /// skips C1.
+    pub cache: Option<crate::cache::CacheProbe>,
+}
+
+/// The causes the executor gives when it judges a node lost while the step's
+/// egress still shows `running` (`settled_state` in
+/// `crates/scarab-executor-k8s/src/lib.rs`). N1 fails on either.
+pub const LOST_NODE_CAUSES: &[&str] = &["workspace snapshot lost", "egress sidecar died"];
+
+/// The executor's cause when a drain helper's record POST failed
+/// (`EXIT_DRAIN_RECORD_POST` in scarab-wsfetch). Any record POST failure
+/// gives it, the Depot's `drain_state_incomplete` 422 at two Depot replicas
+/// included, so it is NOT evidence of a second driver: D1 reports it as info.
+pub const DRAIN_RECORD_POST_FAILED: &str = "drain helper exited 12 with no record posted";
+
+/// One completed drain of a step Pod, from a server replica's `ws-timing`
+/// line (`leg: drain`): `[start_ms, end_ms]`, unix ms.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrainSpan {
+    pub replica: String,
+    pub pod: String,
+    pub start_ms: i64,
+    pub end_ms: i64,
+}
+
+/// The drain spans in `release-log.txt` (`<replica>: <JSON log line>`). The
+/// executor logs `total_ms` as a string (it is a u128); a number is read too.
+/// A drain that failed logs no `ws-timing` line, so it has no span.
+pub fn drain_spans(log: &str) -> Vec<DrainSpan> {
+    log.lines()
+        .filter_map(|line| {
+            let (replica, json) = line.split_once(": ")?;
+            let v: serde_json::Value = serde_json::from_str(json.trim()).ok()?;
+            let fields = &v["fields"];
+            if fields["message"] != "ws-timing" || fields["leg"] != "drain" {
+                return None;
+            }
+            let end_ms = crate::time::parse_rfc3339_ms(v["timestamp"].as_str()?)?;
+            let total: i64 = match &fields["total_ms"] {
+                serde_json::Value::String(s) => s.parse().ok()?,
+                n => n.as_i64()?,
+            };
+            Some(DrainSpan {
+                replica: replica.to_string(),
+                pod: fields["pod"].as_str()?.to_string(),
+                start_ms: end_ms - total,
+                end_ms,
+            })
+        })
+        .collect()
+}
+
+/// N1 over the journal: (Attempts finished, findings). Fails on a lost-node
+/// cause, warns on any other failed Attempt.
+pub fn lost_node_verdicts(events: &[EventRow]) -> (usize, Vec<Finding>) {
+    let mut n = 0;
+    let mut out = Vec::new();
+    for e in events.iter().filter(|e| event_kind(&e.payload) == "AttemptFinished") {
+        n += 1;
+        let body = e.payload.as_object().and_then(|m| m.values().next());
+        let failure = body.and_then(|b| b.get("failure")).filter(|f| !f.is_null());
+        let cause = event_field(&e.payload, "cause");
+        let step = event_field(&e.payload, "step").unwrap_or("?");
+        let att = event_field(&e.payload, "attempt").unwrap_or("?");
+        if let Some(c) = cause.filter(|c| LOST_NODE_CAUSES.iter().any(|l| c.contains(l))) {
+            out.push(fail(
+                "N1",
+                format!(
+                    "run {} step {step} attempt {att} finished with a lost-node verdict across the node pause: {c}",
+                    e.run
+                ),
+            ));
+        } else if failure.is_some() || cause.is_some() {
+            out.push(warn(
+                "N1",
+                format!(
+                    "run {} step {step} attempt {att} failed across the node pause ({}): {}",
+                    e.run,
+                    failure.map(|f| f.to_string()).unwrap_or_default(),
+                    cause.unwrap_or("no cause")
+                ),
+            ));
+        }
+    }
+    (n, out)
+}
+
+/// D1 over `release-log.txt`: (drain spans of `pods` read, findings). Fails
+/// when two DIFFERENT replicas' drains of one Pod overlap in time (the
+/// second driver of git-bug 068cc0b). Sequential drains by different
+/// replicas (a re-drive after a failed record POST) pass. Each
+/// [`DRAIN_RECORD_POST_FAILED`] line about one of `pods` is an info finding.
+/// `pods` are the scenario's step Pods; the log's time range can reach
+/// lines of an earlier scenario's Pods.
+pub fn second_drain_drivers(log: &str, pods: &BTreeSet<String>) -> (usize, Vec<Finding>) {
+    let mut out = Vec::new();
+    let spans: Vec<DrainSpan> = drain_spans(log).into_iter().filter(|s| pods.contains(&s.pod)).collect();
+    for (i, a) in spans.iter().enumerate() {
+        for b in &spans[i + 1..] {
+            if a.pod == b.pod && a.replica != b.replica && a.start_ms < b.end_ms && b.start_ms < a.end_ms {
+                out.push(fail(
+                    "D1",
+                    format!(
+                        "two replicas drained pod {} at once (git-bug 068cc0b): {} over [{}, {}] ms and {} over [{}, {}] ms",
+                        a.pod, a.replica, a.start_ms, a.end_ms, b.replica, b.start_ms, b.end_ms
+                    ),
+                ));
+            }
+        }
+    }
+    for line in log.lines() {
+        if line.contains(DRAIN_RECORD_POST_FAILED) && pods.iter().any(|p| line.contains(p.as_str())) {
+            out.push(Finding {
+                invariant: "D1".into(),
+                severity: Severity::Info,
+                detail: format!("a drain's record POST failed and was re-driven (not a second driver by itself): {line}"),
+            });
+        }
+    }
+    (spans.len(), out)
 }
 
 // --- evaluate (pure) -------------------------------------------------------------
@@ -256,6 +405,9 @@ fn attempt_number(a: &str) -> u64 {
 
 const TERMINAL: &[&str] = &["Succeeded", "Failed", "Cancelled", "DeadLettered"];
 
+/// Terminal `step_runs.status` values.
+const STEP_TERMINAL: &[&str] = &["succeeded", "failed", "skipped", "cancelled"];
+
 fn status_token(to: &str) -> String {
     match to {
         "DeadLettered" => "dead_lettered".into(),
@@ -263,10 +415,61 @@ fn status_token(to: &str) -> String {
     }
 }
 
+/// I1b's slack (ADR-0077 open question 1, answered 2026-11-01): Attempt N's
+/// step container may still run this long past its Pod's
+/// `terminationGracePeriodSeconds`, counted from the Pod's removal, while
+/// Attempt N+1 runs.
+pub const I1B_SLACK_SECS: i64 = 30;
+
+/// The Kubernetes default `terminationGracePeriodSeconds`, for a Pod record
+/// written before the watcher recorded it.
+pub const DEFAULT_GRACE_SECS: i64 = 30;
+
+/// What the watcher saw of one Attempt's Pod object going away.
+#[derive(Debug, Clone, Default)]
+struct PodLife {
+    /// First record with a `deletionTimestamp`, or of the object gone.
+    removal_ms: Option<i64>,
+    /// First record of the object gone (`deleted`).
+    gone_ms: Option<i64>,
+    grace_secs: Option<i64>,
+}
+
+/// I1b's bound for an Attempt N whose step container overlapped N+1's:
+/// `Some((until, anchor, bound_ms))` when N's container was seen running
+/// later than `anchor + bound_ms`, else `None`.
+///
+/// The owner's rule counts the bound from N's Pod object being gone. The
+/// watcher sees a container only through its Pod object, so once the object
+/// is gone nothing more is seen and a bound counted from there could never
+/// fail. The anchor is therefore the first sign of removal (the
+/// `deletionTimestamp`, or the object gone if no record carried one), which
+/// is never later than the object gone; a Pod that was never removed is
+/// counted from N+1's start. `until` is N's container finish, else the
+/// moment its object was gone (the last moment it could be seen), else the
+/// last record of the run (it was still running when recording stopped).
+fn i1b_overrun(life: &PodLife, end: Option<i64>, start_b: i64, last_record_ms: i64) -> Option<(i64, i64, i64)> {
+    let grace = life.grace_secs.unwrap_or(DEFAULT_GRACE_SECS);
+    let bound_ms = (grace + I1B_SLACK_SECS) * 1000;
+    let anchor = life.removal_ms.unwrap_or(start_b);
+    let until = end.or(life.gone_ms).unwrap_or(last_record_ms);
+    (until > anchor + bound_ms).then_some((until, anchor, bound_ms))
+}
+
 /// Why `faults` did not exercise `kind`; empty when they did. Each fault must
 /// have fired with its trigger condition still holding and landed inside the
-/// window it names.
+/// window it names. A server signal must also have taken effect and hit the
+/// replica the scenario names: rank 2 the producer's claim holder, rank 4
+/// the leader, stopped past its TTL, then resumed. A leader whose lease no
+/// peer took over was exercised: that is a liveness finding (L2), not a
+/// missed window. `two-replicas` fires nothing.
 pub fn exercised(kind: Kind, faults: &[Fault]) -> Vec<String> {
+    if !kind.has_fault() {
+        return faults
+            .iter()
+            .map(|x| format!("{} {} fired in a scenario that has no fault", x.action, x.pod))
+            .collect();
+    }
     if faults.is_empty() {
         return vec!["no fault fired (the trigger never held, or every Run ended first)".into()];
     }
@@ -275,24 +478,95 @@ pub fn exercised(kind: Kind, faults: &[Fault]) -> Vec<String> {
         if !x.condition_held_at_fire {
             why.push(format!("{} {}: the trigger condition no longer held when it fired", x.action, x.pod));
         }
-        match &x.landing {
-            None => why.push(format!("{} {}: where it landed is unknown", x.action, x.pod)),
-            Some(l) if l.class != kind.as_str() => why.push(format!(
-                "{} {}: landed {}, outside the {} window",
+        if let Some(w) = kind.window() {
+            match &x.landing {
+                None => why.push(format!("{} {}: where it landed is unknown", x.action, x.pod)),
+                Some(l) if l.class != w.as_str() => why.push(format!(
+                    "{} {}: landed {}, outside the {} window",
+                    x.action,
+                    x.pod,
+                    l.class,
+                    w.as_str()
+                )),
+                Some(_) => {}
+            }
+        }
+        if kind.targets_servers() {
+            match &x.signal {
+                Some(sig) if sig.delivered => {}
+                Some(sig) => why.push(format!(
+                    "{} {}: SIG{} to PID {} did not take effect ({})",
+                    x.action, x.pod, sig.signal, sig.pid, sig.evidence
+                )),
+                None => why.push(format!("{} {}: no signal was recorded", x.action, x.pod)),
+            }
+        }
+        let role = x.victim_role.as_deref().unwrap_or("unknown");
+        match kind {
+            Kind::KillServer if role != "claim-holder" => why.push(format!(
+                "{} {}: the victim was the {role}, not the replica holding the producer's launch claim \
+                 (chosen by {})",
                 x.action,
                 x.pod,
-                l.class,
-                kind.as_str()
+                x.target_basis.as_deref().unwrap_or("?")
             )),
-            Some(_) => {}
+            Kind::StopLeader => {
+                // `leader-no-takeover` is exercised and judged by L2. Before
+                // the fence's stall bound (git-bug aaf4e3e) a stop that landed
+                // inside a fenced write held the lease row until the resume,
+                // and this was the escape for it; now it is a finding.
+                if role != "leader" && role != "leader-no-takeover" {
+                    why.push(format!(
+                        "{} {}: {role} (it was not the leader, or it did not stay stopped until its resume)",
+                        x.action, x.pod
+                    ));
+                }
+                match x.resumed_at_ms {
+                    None => why.push(format!("{} {}: never resumed", x.action, x.pod)),
+                    Some(r) if r - x.fired_at_ms <= crate::scenario::LEASE_TTL_SECS as i64 * 1000 => why.push(format!(
+                        "{} {}: stopped {} ms, not past the {} s lease TTL",
+                        x.action,
+                        x.pod,
+                        r - x.fired_at_ms,
+                        crate::scenario::LEASE_TTL_SECS
+                    )),
+                    Some(_) => {}
+                }
+            }
+            Kind::PauseNode => match &x.pause {
+                None => why.push(format!("{} {}: no pause was recorded", x.action, x.pod)),
+                Some(p) => {
+                    if !p.paused {
+                        why.push(format!("{} {}: docker did not report the node paused", x.action, x.pod));
+                    }
+                    // Past the lease TTL and the claim window, so the frozen
+                    // servers' lease and claims lapse; short of the Pod's
+                    // grace, which no freeze is meant to survive.
+                    let held_ms = x.resumed_at_ms.map(|r| r - x.fired_at_ms).unwrap_or(0);
+                    if held_ms <= (p.floor_secs as i64) * 1000 {
+                        why.push(format!(
+                            "{} {}: paused {held_ms} ms, not past the {} s lease TTL and claim window",
+                            x.action, x.pod, p.floor_secs
+                        ));
+                    }
+                    if held_ms >= (p.grace_secs as i64) * 1000 {
+                        why.push(format!(
+                            "{} {}: paused {held_ms} ms, not short of the Pod's {} s grace period (the kubelet \
+                             kills the egress on the resume; pause-node checks a freeze shorter than that)",
+                            x.action, x.pod, p.grace_secs
+                        ));
+                    }
+                }
+            },
+            _ => {}
         }
     }
     why
 }
 
 /// The least each invariant must have looked at for `runs` Runs of the
-/// rank-1 workload, and why a count below it makes the scenario
-/// inconclusive. I1b, I8 and I10 have none (I1b: rank 1 causes no retry).
+/// workload, and why a count below it makes the scenario inconclusive. I1b,
+/// I8 and I10 have none (I1b: no scenario here is built to cause a retry).
 pub fn minimums(runs: usize, checked: &BTreeMap<String, usize>) -> Vec<String> {
     let attempts = runs * crate::scenario::Workload::STEPS;
     let want = [
@@ -300,6 +574,7 @@ pub fn minimums(runs: usize, checked: &BTreeMap<String, usize>) -> Vec<String> {
         ("I3", runs, "one per scenario Run"),
         ("I1a", attempts, "the Pod of every Attempt, as the watcher saw it"),
         ("I1c", attempts, "every Step of every Run"),
+        ("I5", runs + attempts, "every Run row and Step row"),
         ("I4", attempts, "every green Attempt's snapshot, read back"),
     ];
     want.iter()
@@ -334,13 +609,28 @@ pub fn evaluate(f: &Facts) -> Verdict {
     }
 
     // I1b: step container intervals of consecutive Attempts do not overlap,
-    // unless the earlier one was journalled finished or superseded first.
+    // unless the earlier one was journalled finished or superseded, or its
+    // Pod was gone, before the later one started; and then only within the
+    // bound (`I1B_SLACK_SECS`).
     let mut intervals: BTreeMap<(String, String), BTreeMap<String, Interval>> =
         BTreeMap::new();
+    let mut lives: HashMap<(String, String, String), PodLife> = HashMap::new();
+    let last_record_ms = f.pod_records.iter().map(|r| r.at_ms).max().unwrap_or(0);
     for r in &f.pod_records {
         let (Some(run), Some(step), Some(att)) = (&r.pod.run, &r.pod.step, &r.pod.attempt) else {
             continue;
         };
+        let life = lives.entry((run.clone(), step.clone(), att.clone())).or_default();
+        let gone = r.event == "deleted";
+        if gone {
+            life.gone_ms = Some(life.gone_ms.map_or(r.at_ms, |x| x.min(r.at_ms)));
+        }
+        if gone || r.pod.deleting {
+            life.removal_ms = Some(life.removal_ms.map_or(r.at_ms, |x| x.min(r.at_ms)));
+        }
+        if r.pod.grace_secs.is_some() {
+            life.grace_secs = r.pod.grace_secs;
+        }
         let Some(c) = r.pod.container(pods::STEP_CONTAINER) else { continue };
         let e = intervals
             .entry((run.clone(), step.clone()))
@@ -386,7 +676,7 @@ pub fn evaluate(f: &Facts) -> Verdict {
         for w in atts.windows(2) {
             pairs += 1;
             let ((a, (start_a, end_a)), (b, (start_b, _))) = (w[0], w[1]);
-            let Some(start_b) = start_b else { continue };
+            let Some(start_b) = *start_b else { continue };
             let started_b = seq_of(run, "AttemptStarted", step, b);
             let ended_a = [
                 seq_of(run, "AttemptFinished", step, a),
@@ -395,9 +685,10 @@ pub fn evaluate(f: &Facts) -> Verdict {
             .into_iter()
             .flatten()
             .min();
+            let journalled_ended = matches!((ended_a, started_b), (Some(e), Some(s)) if e < s);
             if start_a.is_none() && end_a.is_none() {
                 // a's step container was never seen: no interval to compare.
-                if !matches!((ended_a, started_b), (Some(e), Some(s)) if e < s) {
+                if !journalled_ended {
                     findings.push(fail(
                         "I1b",
                         format!(
@@ -409,26 +700,44 @@ pub fn evaluate(f: &Facts) -> Verdict {
                 continue;
             }
             let overlaps = match end_a {
-                Some(end) => start_b < end,
+                Some(end) => start_b < *end,
                 // Attempt a's container started and never finished.
                 None => start_a.is_some(),
             };
             if !overlaps {
                 continue;
             }
-            match (ended_a, started_b) {
-                (Some(e), Some(s)) if e < s => findings.push(warn(
-                    "I1b",
-                    format!(
-                        "run {run} step {step}: {b}'s container started while {a}'s was still running, \
-                         after {a} was journalled ended (allowed; the bound is ADR-0077 open question 1)"
-                    ),
-                )),
-                _ => findings.push(fail(
+            let life = lives
+                .get(&(run.clone(), step.clone(), a.clone()))
+                .cloned()
+                .unwrap_or_default();
+            let gone_first = life.gone_ms.is_some_and(|g| g <= start_b);
+            if !journalled_ended && !gone_first {
+                findings.push(fail(
                     "I1b",
                     format!(
                         "run {run} step {step}: {b}'s step container started at {start_b} before {a}'s \
-                         ended ({end_a:?}) and before {a} was journalled ended"
+                         ended ({end_a:?}), before {a} was journalled ended and before {a}'s Pod was gone"
+                    ),
+                ));
+                continue;
+            }
+            match i1b_overrun(&life, *end_a, start_b, last_record_ms) {
+                None => findings.push(warn(
+                    "I1b",
+                    format!(
+                        "run {run} step {step}: {b}'s container started while {a}'s was still running, after \
+                         {a} was journalled ended or its Pod was gone (allowed within the Pod's grace period \
+                         + {I1B_SLACK_SECS} s)"
+                    ),
+                )),
+                Some((until, anchor, bound_ms)) => findings.push(fail(
+                    "I1b",
+                    format!(
+                        "run {run} step {step}: {a}'s step container was seen running until {until}, {} ms \
+                         after its Pod's removal at {anchor}, past the bound of {bound_ms} ms (grace period \
+                         + {I1B_SLACK_SECS} s), while {b} ran",
+                        until - anchor
                     ),
                 )),
             }
@@ -513,6 +822,59 @@ pub fn evaluate(f: &Facts) -> Verdict {
         }
     }
     checked.insert("T1".into(), f.runs.len());
+
+    // I5: the journal folds to the projected rows.
+    let mut i5 = 0;
+    for r in &f.runs {
+        if r.status == "missing" {
+            continue; // I3 and the minimums report a Run with no row
+        }
+        i5 += 1;
+        let folded = f
+            .events
+            .iter()
+            .filter(|e| e.run == r.id && event_kind(&e.payload) == "RunTransitioned")
+            .max_by_key(|e| e.seq)
+            .and_then(|e| event_field(&e.payload, "to"))
+            .map(status_token)
+            .unwrap_or_else(|| "pending".into());
+        if folded != r.status {
+            let terminal = |s: &str| crate::env::TERMINAL_RUN_STATUSES.contains(&s);
+            let detail = format!("run {}: the journal folds to {folded}, runs.status is {}", r.id, r.status);
+            findings.push(if terminal(&folded) || terminal(&r.status) {
+                fail("I5", detail)
+            } else {
+                warn("I5", detail)
+            });
+        }
+    }
+    for s in &f.steps {
+        i5 += 1;
+        let folded = f
+            .events
+            .iter()
+            .filter(|e| e.run == s.run && event_field(&e.payload, "step") == Some(s.step.as_str()))
+            .filter(|e| matches!(event_kind(&e.payload), "StepTransitioned" | "StepSkipped"))
+            .max_by_key(|e| e.seq)
+            .map(|e| match event_kind(&e.payload) {
+                "StepSkipped" => "skipped".to_string(),
+                _ => event_field(&e.payload, "to").unwrap_or_default().to_ascii_lowercase(),
+            })
+            .unwrap_or_else(|| "pending".into());
+        if folded != s.status {
+            let terminal = |x: &str| STEP_TERMINAL.contains(&x);
+            let detail = format!(
+                "run {} step {}: the journal folds to {folded}, step_runs.status is {}",
+                s.run, s.step, s.status
+            );
+            findings.push(if terminal(&folded) || terminal(&s.status) {
+                fail("I5", detail)
+            } else {
+                warn("I5", detail)
+            });
+        }
+    }
+    checked.insert("I5".into(), i5);
 
     // I3: terminal within the bound.
     for r in &f.runs {
@@ -629,10 +991,136 @@ pub fn evaluate(f: &Facts) -> Verdict {
     }
     checked.insert("I10".into(), f.packs.len());
 
+    // L1: a takeover of the scheduler lease increments its term (ADR-0077
+    // Amendment, grill, item 2), and the term never goes back. Read only
+    // where the `leases.term` column exists.
+    let mut l1 = 0;
+    for x in &f.faults {
+        let Some(l) = &x.lease else { continue };
+        if let (Some(after), Some(tb), Some(ta)) = (&l.owner_after, l.term_before, l.term_after) {
+            l1 += 1;
+            if *after != l.owner_before && ta <= tb {
+                findings.push(fail(
+                    "L1",
+                    format!("the scheduler lease passed from {} to {after} with term {tb} -> {ta}", l.owner_before),
+                ));
+            }
+        }
+        if let (Some(ta), Some(tr)) = (l.term_after, l.term_after_resume) {
+            if tr < ta {
+                findings.push(fail("L1", format!("the scheduler lease's term went back from {ta} to {tr} after the resume")));
+            }
+        }
+        if l.owner_after.is_some() && l.owner_after_resume.as_deref() == Some(l.owner_before.as_str()) {
+            findings.push(warn(
+                "L1",
+                format!("the resumed replica {} holds the scheduler lease again 10 s after its resume", l.owner_before),
+            ));
+        }
+    }
+    if f.faults.iter().any(|x| x.lease.is_some()) {
+        checked.insert("L1".into(), l1);
+    }
+
+    // L2: the stopped leader lost its lease. The harness waits the TTL + 30 s
+    // for a takeover; the scheduler lease expires 30 s after the last renewal
+    // and a fence the stopped leader held ends after its 10 s stall bound.
+    let mut l2 = 0;
+    for x in &f.faults {
+        match x.victim_role.as_deref() {
+            Some("leader") => l2 += 1,
+            Some("leader-no-takeover") => {
+                l2 += 1;
+                findings.push(fail(
+                    "L2",
+                    format!(
+                        "{} {}: the scheduler lease was neither renewed nor taken over within the {} s TTL + 30 s \
+                         while its leader was stopped (a fence held by the stopped leader should end after its \
+                         stall bound)",
+                        x.action,
+                        x.pod,
+                        crate::scenario::LEASE_TTL_SECS
+                    ),
+                ));
+            }
+            _ => {}
+        }
+    }
+    if f.kind == Some(Kind::StopLeader) {
+        checked.insert("L2".into(), l2);
+    }
+
+    // N1: no lost-node verdict across a freeze shorter than the Pod's grace.
+    if f.kind == Some(Kind::PauseNode) {
+        let (n, found) = lost_node_verdicts(&f.events);
+        findings.extend(found);
+        checked.insert("N1".into(), n);
+    }
+
+    // D1: one driver per drain at two replicas with no fault (git-bug
+    // 068cc0b).
+    let mut d1_unread = None;
+    if f.kind == Some(Kind::TwoReplicas) {
+        let pods: BTreeSet<String> = f.pod_records.iter().filter(|r| r.pod.run.is_some()).map(|r| r.pod.name.clone()).collect();
+        match &f.release_log {
+            Some(log) => {
+                let (n, found) = second_drain_drivers(log, &pods);
+                findings.extend(found);
+                // What D1 looked at: the drains of the scenario's Pods.
+                checked.insert("D1".into(), n);
+                if n == 0 {
+                    d1_unread = Some("D1: release-log.txt has no drain ws-timing line for a scenario Pod".to_string());
+                }
+            }
+            None => {
+                checked.insert("D1".into(), 0);
+                d1_unread = Some("D1: release-log.txt was not written, so no release log line was read".to_string());
+            }
+        }
+    }
+
+    // C1: the Cache probe. Not exercised is not inconclusive: the probe is
+    // beside the scenario, not what it names.
+    if let Some(probe) = &f.cache {
+        match crate::cache::c1(probe, &f.faults) {
+            crate::cache::C1::Checked(r) => {
+                checked.insert("C1".into(), 1);
+                if let Err(detail) = r {
+                    findings.push(Finding { invariant: "C1".into(), severity: Severity::Fail, detail });
+                }
+            }
+            crate::cache::C1::NotExercised(why) => {
+                checked.insert("C1".into(), 0);
+                findings.push(Finding {
+                    invariant: "C1".into(),
+                    severity: Severity::Info,
+                    detail: format!("not exercised: {why}"),
+                });
+            }
+        }
+    }
+
     let inconclusive = match f.kind {
         Some(kind) => {
             let mut why = exercised(kind, &f.faults);
             why.extend(minimums(f.expected_runs, &checked));
+            if kind == Kind::PauseNode {
+                let attempts = f.expected_runs * crate::scenario::Workload::STEPS;
+                let n = checked.get("N1").copied().unwrap_or(0);
+                if n < attempts {
+                    why.push(format!(
+                        "N1 looked at {n} finished Attempts, below its minimum of {attempts} (every Attempt of every Run)"
+                    ));
+                }
+            }
+            why.extend(d1_unread);
+            if kind == Kind::TwoReplicas && f.launch_claimers.len() < 2 {
+                why.push(format!(
+                    "{} replica(s) drove the scenario's steps ({:?}); two replicas did not share the work",
+                    f.launch_claimers.len(),
+                    f.launch_claimers
+                ));
+            }
             why
         }
         None => Vec::new(),
@@ -663,6 +1151,7 @@ pub fn evaluate(f: &Facts) -> Verdict {
                 bytes_read: s.bytes,
             })
             .collect(),
+        cache: Vec::new(),
     }
 }
 
@@ -693,6 +1182,7 @@ pub async fn gather(src: &Sources<'_>, scenario: &Scenario, pod_records: Vec<Pod
         kind: Some(scenario.kind),
         faults: scenario.faults.clone(),
         expected_runs: scenario.workload.runs as usize,
+        cache: scenario.cache.clone(),
         ..Default::default()
     };
 
@@ -759,6 +1249,17 @@ pub async fn gather(src: &Sources<'_>, scenario: &Scenario, pod_records: Vec<Pod
             evidence_attempt,
         });
     }
+
+    f.launch_claimers = sqlx::query_scalar::<_, String>(
+        "SELECT DISTINCT claimed_by FROM outbox WHERE run_id = ANY($1) AND kind = $2 AND claimed_by IS NOT NULL",
+    )
+    .bind(runs)
+    .bind(crate::servers::LAUNCH_STEP)
+    .fetch_all(src.pg)
+    .await
+    .map_err(db_err)?
+    .into_iter()
+    .collect();
 
     // Every fence the scenario's Attempts could have drained into.
     let fences: Vec<String> = f
@@ -1106,6 +1607,7 @@ mod tests {
                     exit_code: end.map(|_| 0),
                     restarts: 0,
                 }],
+                grace_secs: Some(30),
             },
         }
     }
@@ -1120,7 +1622,8 @@ mod tests {
             events: vec![
                 ev("r", 1, serde_json::json!({"AttemptStarted": {"step": "s", "attempt": "a1"}})),
                 ev("r", 2, serde_json::json!({"AttemptFinished": {"step": "s", "attempt": "a1", "failure": null}})),
-                ev("r", 3, serde_json::json!({"RunTransitioned": {"from": "Running", "to": "Succeeded"}})),
+                ev("r", 3, serde_json::json!({"StepTransitioned": {"step": "s", "from": "Running", "to": "Succeeded"}})),
+                ev("r", 4, serde_json::json!({"RunTransitioned": {"from": "Running", "to": "Succeeded"}})),
             ],
             attempts: vec![AttemptRow {
                 run: "r".into(),
@@ -1178,6 +1681,66 @@ mod tests {
         assert!(failed(&evaluate(&f)).contains(&"I1b"));
     }
 
+    /// a1 was journalled ended and its Pod marked for deletion at 1 000 with
+    /// a 30 s grace period: the bound is 60 000 ms from there. a2 starts at
+    /// 500. a1's step container finishing at `end` decides the verdict.
+    fn i1b_bound_facts(end: i64) -> Facts {
+        let mut f = base();
+        f.pod_records = vec![pod_rec("u1", "a1", 10, None), pod_rec("u2", "a2", 500, Some(70_000))];
+        let mut deleting = pod_rec("u1", "a1", 10, None);
+        deleting.at_ms = 1_000;
+        deleting.pod.deleting = true;
+        f.pod_records.push(deleting);
+        f.pod_records.push(pod_rec("u1", "a1", 10, Some(end)));
+        f.events.push(ev("r", 5, serde_json::json!({"AttemptStarted": {"step": "s", "attempt": "a2"}})));
+        f
+    }
+
+    #[test]
+    fn i1b_allows_an_overlap_up_to_the_grace_period_plus_30_s_after_removal() {
+        let v = evaluate(&i1b_bound_facts(1_000 + 60_000));
+        assert!(failed(&v).is_empty(), "{:?}", v.findings);
+        assert!(v.findings.iter().any(|x| x.invariant == "I1b" && x.severity == Severity::Warn));
+    }
+
+    #[test]
+    fn i1b_fails_an_overlap_past_the_grace_period_plus_30_s_after_removal() {
+        let v = evaluate(&i1b_bound_facts(1_000 + 60_001));
+        assert_eq!(failed(&v), vec!["I1b"], "{:?}", v.findings);
+        assert!(v.findings[0].detail.contains("past the bound of 60000 ms"), "{}", v.findings[0].detail);
+    }
+
+    /// The bound uses the Pod's own grace period: at 600 s the same overrun
+    /// is within it.
+    #[test]
+    fn i1b_bound_follows_the_pods_grace_period() {
+        let mut f = i1b_bound_facts(1_000 + 60_001);
+        for r in &mut f.pod_records {
+            r.pod.grace_secs = Some(600);
+        }
+        assert!(failed(&evaluate(&f)).is_empty());
+        // A record written before the field existed falls back to 30 s.
+        for r in &mut f.pod_records {
+            r.pod.grace_secs = None;
+        }
+        assert_eq!(failed(&evaluate(&f)), vec!["I1b"]);
+    }
+
+    /// The Pod gone before a2 started allows the start without a journal
+    /// entry; a Pod still there and no journal entry does not.
+    #[test]
+    fn i1b_allows_a_start_after_the_pod_is_gone() {
+        let mut f = i1b_bound_facts(30_000);
+        f.events.retain(|e| event_kind(&e.payload) != "AttemptFinished");
+        assert_eq!(failed(&evaluate(&f)), vec!["I1b"]);
+        let mut gone = pod_rec("u1", "a1", 10, None);
+        gone.at_ms = 400;
+        gone.event = "deleted".into();
+        f.pod_records.push(gone);
+        let v = evaluate(&f);
+        assert!(failed(&v).is_empty(), "{:?}", v.findings);
+    }
+
     #[test]
     fn two_green_attempts_fail_i1c() {
         let mut f = base();
@@ -1203,6 +1766,27 @@ mod tests {
         let mut f = base();
         f.runs[0].creating = true;
         assert_eq!(failed(&evaluate(&f)), vec!["I3"]);
+    }
+
+    #[test]
+    fn a_row_the_journal_does_not_fold_to_fails_i5() {
+        // The step row went terminal with no journalled transition
+        // (git-bug 586187a: the CAS and its event in separate writes).
+        let mut f = base();
+        f.events.retain(|e| event_kind(&e.payload) != "StepTransitioned");
+        let v = evaluate(&f);
+        assert_eq!(failed(&v), vec!["I5"], "{:?}", v.findings);
+        assert!(v.findings[0].detail.contains("folds to pending, step_runs.status is succeeded"));
+        // The journal says Failed, the row says succeeded.
+        let mut f = base();
+        f.events[2] = ev("r", 3, serde_json::json!({"StepTransitioned": {"step": "s", "from": "Running", "to": "Failed"}}));
+        assert_eq!(failed(&evaluate(&f)), vec!["I5"]);
+        // A later rerun's transition wins the fold: Succeeded, then
+        // re-armed to Pending, while the row says pending.
+        let mut f = base();
+        f.events.push(ev("r", 9, serde_json::json!({"StepTransitioned": {"step": "s", "from": "Succeeded", "to": "Pending"}})));
+        f.steps[0].status = "pending".into();
+        assert!(!evaluate(&f).findings.iter().any(|x| x.invariant == "I5"));
     }
 
     #[test]
@@ -1254,6 +1838,149 @@ mod tests {
             object: Err("not found".into()),
         });
         assert_eq!(failed(&evaluate(&f)), vec!["I10"]);
+    }
+
+    /// A lost-node verdict (the executor's cause from `settled_state`) after
+    /// a freeze shorter than the grace fails N1; a clean finish passes it; any other failure is a warning.
+    #[test]
+    fn a_lost_node_verdict_fails_n1() {
+        let mut f = base();
+        f.kind = Some(Kind::PauseNode);
+        f.expected_runs = 1;
+        let v = evaluate(&f);
+        assert!(!v.findings.iter().any(|x| x.invariant == "N1"), "{:?}", v.findings);
+        assert_eq!(v.checked.get("N1"), Some(&1));
+        // One Attempt, below the workload's two per Run.
+        assert!(v.inconclusive.iter().any(|w| w.starts_with("N1 looked at 1")), "{:?}", v.inconclusive);
+
+        let lost = "workspace snapshot lost: the step exited 0 but its egress sidecar died before the drain \
+                    recorded a root — the emptyDir is gone and the snapshot can never be produced (ADR-0061 part 4)";
+        f.events.push(ev(
+            "r",
+            5,
+            serde_json::json!({"AttemptFinished": {"step": "s", "attempt": "a0",
+                "failure": {"Infra": {"never_started": false}}, "cause": lost}}),
+        ));
+        let v = evaluate(&f);
+        assert!(failed(&v).contains(&"N1"), "{:?}", v.findings);
+        assert!(v.findings.iter().any(|x| x.invariant == "N1" && x.detail.contains("attempt a0")));
+
+        let mut f = base();
+        f.kind = Some(Kind::PauseNode);
+        f.events.push(ev(
+            "r",
+            5,
+            serde_json::json!({"AttemptFinished": {"step": "s", "attempt": "a0",
+                "failure": "Timeout", "cause": "step budget exhausted"}}),
+        ));
+        let v = evaluate(&f);
+        assert!(!failed(&v).contains(&"N1"));
+        assert!(v.findings.iter().any(|x| x.invariant == "N1" && x.severity == Severity::Warn));
+        // N1 is pause-node's own: another scenario does not run it.
+        f.kind = Some(Kind::MidDrain);
+        assert!(!evaluate(&f).checked.contains_key("N1"));
+    }
+
+    /// A pause that docker did not report, that did not outlast the lease TTL
+    /// and claim window, or that reached the Pod's grace, did not test what
+    /// pause-node names.
+    #[test]
+    fn a_short_or_missing_pause_is_inconclusive() {
+        let fault = |paused: bool, held_s: i64| Fault {
+            action: "pause-node".into(),
+            pod: "node".into(),
+            condition_held_at_fire: true,
+            fired_at_ms: 0,
+            resumed_at_ms: Some(held_s * 1000),
+            landing: Some(crate::scenario::classify(Kind::MidDrain, 0, Some(-1), None)),
+            pause: Some(crate::scenario::NodePause {
+                grace_secs: 600,
+                floor_secs: 30,
+                planned_secs: 240,
+                paused,
+                unpaused: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(exercised(Kind::PauseNode, &[fault(true, 240)]), Vec::<String>::new());
+        assert!(exercised(Kind::PauseNode, &[fault(false, 240)])[0].contains("did not report the node paused"));
+        assert!(exercised(Kind::PauseNode, &[fault(true, 30)])[0].contains("not past the 30 s lease TTL"));
+        assert!(exercised(Kind::PauseNode, &[fault(true, 600)])[0].contains("not short of the Pod's 600 s grace"));
+        let mut late = fault(true, 240);
+        late.landing = Some(crate::scenario::classify(Kind::MidDrain, 0, Some(-10), Some(-1)));
+        assert!(exercised(Kind::PauseNode, &[late])[0].contains("landed after-window"));
+    }
+
+    /// D1 on recorded lines (the 2026-11-01 two-replicas s2 run, shapes
+    /// kept): two replicas whose drains of one Pod overlap fail D1; the same
+    /// Pod drained by one replica, then re-driven by the other after the
+    /// first ended, passes. An exit-12 line is info, never a failure, and
+    /// only a Pod of this scenario counts.
+    #[test]
+    fn d1_fails_overlapping_drains_by_two_replicas_and_passes_a_sequential_re_drive() {
+        let drain = |replica: &str, pod: &str, end: &str, total: &str| {
+            format!(
+                r#"{replica}: {{"timestamp":"{end}","level":"INFO","fields":{{"message":"ws-timing","pod":"{pod}","leg":"drain","files":65,"exec_drain_ms":"{total}","outputs":0,"total_ms":"{total}"}},"target":"scarab_executor_k8s"}}"#
+            )
+        };
+        let exit12 = r#"scarab-589f5865d9-gwncm: {"timestamp":"2026-11-01T14:13:53.397335Z","level":"WARN","fields":{"message":"workspace settle is transient; re-driving next poll","pod":"p-u1","cause":"drain helper exited 12 with no record posted"},"target":"scarab_executor_k8s"}"#;
+        let mut f = base();
+        f.kind = Some(Kind::TwoReplicas);
+
+        // Sequential: x1 drains 14:18:00.000-14:18:05.000, x2 re-drives
+        // 14:18:06.000-14:18:08.000. Plus the exit-12 line before them.
+        f.release_log = Some(format!(
+            "{exit12}\n{}\n{}\nscarab-x1: not json about p-u1\n",
+            drain("scarab-x1", "p-u1", "2026-11-01T14:18:05.000000Z", "5000"),
+            drain("scarab-x2", "p-u1", "2026-11-01T14:18:08.000000Z", "2000"),
+        ));
+        let v = evaluate(&f);
+        assert!(!failed(&v).contains(&"D1"), "{:?}", v.findings);
+        assert_eq!(v.checked.get("D1"), Some(&2));
+        assert!(
+            v.findings.iter().any(|x| x.invariant == "D1" && x.severity == Severity::Info && x.detail.contains("exited 12")),
+            "{:?}",
+            v.findings
+        );
+
+        // Overlapping: x2's drain started at 14:18:04.000, before x1's ended.
+        f.release_log = Some(format!(
+            "{}\n{}\n",
+            drain("scarab-x1", "p-u1", "2026-11-01T14:18:05.000000Z", "5000"),
+            drain("scarab-x2", "p-u1", "2026-11-01T14:18:08.000000Z", "4000"),
+        ));
+        let v = evaluate(&f);
+        assert_eq!(failed(&v), vec!["D1"], "{:?}", v.findings);
+
+        // The same overlap by ONE replica (a retry in-process) is not D1's;
+        // nor is an overlap on another scenario's Pod.
+        f.release_log = Some(format!(
+            "{}\n{}\n",
+            drain("scarab-x1", "p-u1", "2026-11-01T14:18:05.000000Z", "5000"),
+            drain("scarab-x1", "p-u1", "2026-11-01T14:18:08.000000Z", "4000"),
+        ));
+        assert!(!failed(&evaluate(&f)).contains(&"D1"));
+        f.release_log = Some(format!(
+            "{}\n{}\n",
+            drain("scarab-x1", "p-other", "2026-11-01T14:18:05.000000Z", "5000"),
+            drain("scarab-x2", "p-other", "2026-11-01T14:18:08.000000Z", "4000"),
+        ));
+        let v = evaluate(&f);
+        assert!(!failed(&v).contains(&"D1"));
+        assert!(v.inconclusive.iter().any(|w| w.starts_with("D1:")), "no drain of a scenario Pod read: {:?}", v.inconclusive);
+
+        // A numeric total_ms reads too.
+        let spans = drain_spans(&drain("r", "p", "2026-11-01T00:00:01Z", "1000").replace(r#""total_ms":"1000""#, r#""total_ms":1000"#));
+        assert_eq!(spans[0].start_ms + 1000, spans[0].end_ms);
+
+        // No log at all: D1 read nothing, which is not a pass.
+        f.release_log = None;
+        let v = evaluate(&f);
+        assert!(v.inconclusive.iter().any(|w| w.starts_with("D1:")), "{:?}", v.inconclusive);
+        // D1 is two-replicas' own.
+        f.kind = Some(Kind::MidDrain);
+        assert!(!evaluate(&f).checked.contains_key("D1"));
     }
 
     #[test]

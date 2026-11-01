@@ -174,7 +174,11 @@ async fn record_attempt_is_idempotent(db: &dyn Db) {
     db.record_attempt(&run, &step, &a1).await.unwrap();
 
     let attempts = db.attempts_of_step(&run, &step).await.unwrap();
-    assert_eq!(attempts.len(), 1, "a duplicate record_attempt must be a no-op");
+    assert_eq!(
+        attempts.len(),
+        1,
+        "a duplicate record_attempt must be a no-op"
+    );
     assert_eq!(attempts[0], a1);
 }
 
@@ -217,7 +221,10 @@ async fn recorded_evidence_is_never_downgraded(db: &dyn Db) {
     // The human-readable cause (4cf03d7) is evidence too: it survives the
     // re-drive and reads back verbatim — kills a store that accepts the
     // detail param and drops it (write not persisted, or read not selected).
-    assert_eq!(attempts[0].failure_detail.as_deref(), Some("exit 1: tests failed"));
+    assert_eq!(
+        attempts[0].failure_detail.as_deref(),
+        Some("exit 1: tests failed")
+    );
 
     // a2: cancelled on purpose; its dying Pod's self-inflicted `Lost` (and any
     // later weaker outcome) must not clobber the intent verdict.
@@ -336,8 +343,12 @@ async fn outbox_claim_and_poison_semantics(db: &dyn Db) {
     db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
 
     // Exactly-once enqueue: a duplicate idempotency key collapses.
-    db.enqueue_outbox(&msg(&run, "launch_step", "m1")).await.unwrap();
-    db.enqueue_outbox(&msg(&run, "launch_step", "m1")).await.unwrap();
+    db.enqueue_outbox(&msg(&run, "launch_step", "m1"))
+        .await
+        .unwrap();
+    db.enqueue_outbox(&msg(&run, "launch_step", "m1"))
+        .await
+        .unwrap();
     assert_eq!(db.outbox_depth().await.unwrap(), 1);
 
     // Claim hides the message from other drainers for the visibility window.
@@ -359,7 +370,9 @@ async fn outbox_claim_and_poison_semantics(db: &dyn Db) {
     // An EXPIRED claim is redeliverable (the crashed-drainer case): claiming
     // with a zero visibility window writes an already-expired claim, so any
     // later drainer — including one with a positive window — picks it up.
-    db.enqueue_outbox(&msg(&run, "launch_step", "m2")).await.unwrap();
+    db.enqueue_outbox(&msg(&run, "launch_step", "m2"))
+        .await
+        .unwrap();
     let first = db.claim_outbox("a", None, 16, 0).await.unwrap();
     assert_eq!(first.len(), 1);
     let redelivered = db.claim_outbox("b", None, 16, 60_000).await.unwrap();
@@ -372,13 +385,21 @@ async fn outbox_claim_and_poison_semantics(db: &dyn Db) {
 
     // Kind-scoped claims never steal foreign work. (m2 is still claimed by
     // "b" for 60s, so it cannot leak into these claims either.)
-    db.enqueue_outbox(&msg(&run, "post_status", "m3")).await.unwrap();
-    let wrong_kind = db.claim_outbox("c", Some("launch_step"), 16, 0).await.unwrap();
+    db.enqueue_outbox(&msg(&run, "post_status", "m3"))
+        .await
+        .unwrap();
+    let wrong_kind = db
+        .claim_outbox("c", Some("launch_step"), 16, 0)
+        .await
+        .unwrap();
     assert!(
         wrong_kind.is_empty(),
         "a kind-scoped claim must not return other kinds: {wrong_kind:?}"
     );
-    let right_kind = db.claim_outbox("c", Some("post_status"), 16, 0).await.unwrap();
+    let right_kind = db
+        .claim_outbox("c", Some("post_status"), 16, 0)
+        .await
+        .unwrap();
     assert_eq!(right_kind.len(), 1);
     assert_eq!(right_kind[0].idempotency_key, "m3");
     db.mark_dispatched(right_kind[0].id).await.unwrap();
@@ -448,7 +469,6 @@ async fn attempts_list_in_stable_defined_order(db: &dyn Db) {
 }
 
 contract_test!(attempt_ordering, attempts_list_in_stable_defined_order);
-
 
 // ---------------------------------------------------------------------------
 // 7. Launch-time workspace input steps (git-bug b6b8510): an attempt's
@@ -698,7 +718,7 @@ async fn transitions_are_guarded_by_frontier_and_generation(db: &dyn Db) {
 
     // Run grain: the generation the caller read.
     let run_to =
-        |from, to, generation| db.commit_run_transition(&run, from, to, generation, &[], &[]);
+        |from, to, generation| db.commit_run_transition(None, &run, from, to, generation, &[], &[]);
     run_to(RunStatus::Pending, RunStatus::Running, 0)
         .await
         .unwrap();
@@ -784,12 +804,20 @@ async fn refused_runs_list_per_project_newest_first(db: &dyn Db) {
         errors: serde_json::json!([{ "kind": "other", "message": kind }]),
         created_at: Timestamp(at),
     };
-    db.record_refused_run(&refused("web", 10, "compile")).await.unwrap();
-    db.record_refused_run(&refused("web", 20, "yanked")).await.unwrap();
-    db.record_refused_run(&refused("api", 30, "policy")).await.unwrap();
+    db.record_refused_run(&refused("web", 10, "compile"))
+        .await
+        .unwrap();
+    db.record_refused_run(&refused("web", 20, "yanked"))
+        .await
+        .unwrap();
+    db.record_refused_run(&refused("api", 30, "policy"))
+        .await
+        .unwrap();
     let web = db.refused_runs_for_tenant("acme", "web", 10).await.unwrap();
     assert_eq!(
-        web.iter().map(|r| r.reason_kind.as_str()).collect::<Vec<_>>(),
+        web.iter()
+            .map(|r| r.reason_kind.as_str())
+            .collect::<Vec<_>>(),
         vec!["yanked", "compile"]
     );
     let first = &web[0];
@@ -799,8 +827,21 @@ async fn refused_runs_list_per_project_newest_first(db: &dyn Db) {
     assert_eq!(first.title.as_deref(), Some("Bump chart"));
     assert_eq!(first.errors[0]["message"], "yanked");
     assert_eq!(first.created_at, Timestamp(20));
-    assert_eq!(db.refused_runs_for_tenant("acme", "web", 1).await.unwrap().len(), 1);
-    assert!(db.refused_runs_for_tenant("globex", "web", 10).await.unwrap().is_empty());
+    assert_eq!(
+        db.refused_runs_for_tenant("acme", "web", 1)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(db
+        .refused_runs_for_tenant("globex", "web", 10)
+        .await
+        .unwrap()
+        .is_empty());
 }
 
-contract_test!(refused_runs_contract, refused_runs_list_per_project_newest_first);
+contract_test!(
+    refused_runs_contract,
+    refused_runs_list_per_project_newest_first
+);

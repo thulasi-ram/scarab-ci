@@ -18,7 +18,7 @@
 //!
 //! Env-gated (`SCARAB_TEST_FORGEJO=1`) exactly like the `SCARAB_TEST_KUBE` tier,
 //! so a plain `cargo test` / CI run never needs a Forgejo. The lifecycle is
-//! owned by `just e2e`; see `deploy/kind/README.md`.
+//! owned by `just test e2e`; see `deploy/kind/README.md`.
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
@@ -38,7 +38,7 @@ macro_rules! require_forgejo {
         if std::env::var("SCARAB_TEST_FORGEJO").ok().as_deref() != Some("1") {
             eprintln!(
                 "SKIPPED (live Forgejo): set SCARAB_TEST_FORGEJO=1 against a seeded instance — \
-                 `just e2e` owns the lifecycle (deploy/kind/forgejo.yaml)"
+                 `just test e2e` owns the lifecycle (deploy/kind/forgejo.yaml)"
             );
             return;
         }
@@ -49,7 +49,7 @@ fn env(key: &str) -> String {
     std::env::var(key)
         .ok()
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| panic!("{key} is not set — `just e2e` writes it"))
+        .unwrap_or_else(|| panic!("{key} is not set — `just test e2e` writes it"))
 }
 
 fn env_or(key: &str, default: &str) -> String {

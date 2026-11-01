@@ -1,11 +1,11 @@
-# Dev-only in-cluster MinIO for the kind dev stack (`just up`, `just up dogfood`).
+# Dev-only in-cluster MinIO for the kind dev stack (`just stack up`, `just stack up dogfood`).
 # Not for production: use a managed S3 there. It is the object store (logs,
 # artifacts, the Depot's packs). One replica on a PVC (kind's local-path
-# provisioner), so the data survives Pod restarts and `just down keep`.
+# provisioner), so the data survives Pod restarts and `just stack down keep`.
 #
-# Each mode has its own bucket: `scarab-logs` for `just up`, `scarab-dogfood`
-# for `just up dogfood`, `scarab-e2e` for `just e2e`, `scarab-chaos` for
-# `just chaos`. The Job below creates all four.
+# Each mode has its own bucket: `scarab-logs` for `just stack up`, `scarab-dogfood`
+# for `just stack up dogfood`, `scarab-e2e` for `just test e2e`, `scarab-chaos` for
+# `just test chaos`. The Job below creates all four.
 #
 # `pgsty/minio` + `pgsty/mc` (multi-arch, run on arm64) — we deliberately avoid
 # the Bitnami images, matching the Postgres setup.

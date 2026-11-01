@@ -5,8 +5,7 @@
 //! — a projected token dies with its Pod and its ServiceAccount, so deleting
 //! a killed installation's ServiceAccount revokes its tokens at the source —
 //! and it needs no issuer or JWKS reachability, so it works the same on
-//! kind, k3s and EKS, and from a proc-mode host process through the kind
-//! kubeconfig. The control plane's ServiceAccount needs
+//! kind, k3s and EKS, and from a host process through a kubeconfig. The control plane's ServiceAccount needs
 //! `system:auth-delegator` (the chart binds it).
 
 use std::collections::HashMap;

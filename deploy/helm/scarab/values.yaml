@@ -11,9 +11,15 @@ imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""
 
-# Number of scarab-server replicas. Safe to scale: Postgres (the outbox) is the
-# coordination bus, and `launch` is idempotent (ADR-0021). For a converged
-# deployment keep this at 1 unless you split roles.
+# Number of scarab-server replicas. Safe to scale, with converged or split
+# roles: Postgres is the coordination bus, and `launch` is idempotent on the
+# Attempt's fence (ADR-0021, ADR-0047). A replica supervises a Step only while
+# it holds that Step's launch intent claim, and renews the claim every 10 s
+# while it works (a workspace drain can outlast the 30 s window). A replica that
+# loses its claim stops driving the launch within one renewal period; a replica
+# that dies stops renewing and a peer takes the intent over within 30 s.
+# Admission is leader-only; the ADR-0077 amendment covers how a leader that
+# lost its lease is kept from writing.
 replicaCount: 1
 
 # How the server Deployment is updated. `Recreate` stops every old server Pod
@@ -50,7 +56,7 @@ scarab:
   # The first-party library release manifest (ADR-0076 §5), as JSON text.
   # Empty => the server reads `libs-manifest.json` from its own version's
   # GitHub release. Set it for an air-gapped install, or for a build whose
-  # first-party libraries are not released (`just up` writes one that lists a
+  # first-party libraries are not released (`just stack up` writes one that lists a
   # clone library pinning the locally built scarab-clone image).
   # The checkout image is the one `lib:thulasi-ram/clone` pins; to use a
   # mirror, install a library version that pins the mirror's image.
@@ -58,6 +64,10 @@ scarab:
   # Global default step deadline in seconds (ADR-0047). Empty => server
   # default (3600). Per-step `timeout:` always overrides.
   stepTimeoutSecs: ""
+  # The most Runs of one project (repository) that may be Running at once; the
+  # rest wait Pending and start in priority order as Runs finish (ADR-0011).
+  # A Run waiting on a gate is not counted. Empty or 0 => no cap (default).
+  projectRunCap: ""
   # In-flight object-store round-trips per workspace-CAS leg (ADR-0061 s2).
   # Empty => server default (32). The legs are latency-bound, so 32 is a FLOOR
   # for remote object storage — raise it the further away the bucket is. Lower it
@@ -367,10 +377,28 @@ workspace:
   # One per failure domain. Drains are replica-safe by construction since
   # git-bug afb13c2 — sealed packs are staged into the shared index at seal
   # time and the record POST commits the fence's union (see
-  # templates/service-workspace.yaml) — so >1 is CORRECT. Per-AZ topology is a
-  # later slice, and >1 has been exercised at the acceptance-test grain
-  # (two routers, one Postgres, one bucket), not yet on a live cluster.
+  # templates/service-workspace.yaml) — so >1 is CORRECT, and 2 replicas pass
+  # the ADR-0077 rank 1 fault runs (`just test chaos`). Per-AZ topology is a
+  # later slice.
+  #
+  # Above 1, each Cache has a home replica chosen from its cache key, and the
+  # chart renders one Service per replica (`<fullname>-workspace-<ordinal>`,
+  # templates/service-workspace-replicas.yaml) so a Step Pod can reach it
+  # (git-bug 12e2f6b). Changing the count moves about 1/N of the cache keys
+  # to a new home; each moved key misses once.
+  #
+  # The server reads the count from SCARAB_WORKSPACE_REPLICAS, which the chart
+  # copies from this value. Change it here and upgrade the release: after a
+  # `kubectl scale` of the StatefulSet the server still picks homes over the
+  # old count, so Caches go to the wrong replica (or to one that does not
+  # exist, a miss) until the release is upgraded.
   replicaCount: 1
+  # One Depot replica's URL with `{ordinal}` in place of its StatefulSet
+  # ordinal — where a Step Pod sends and reads its Cache. Empty = the
+  # per-replica Services above, `http://<fullname>-workspace-{ordinal}.<ns>.svc`.
+  # Set it only when scarab.workspaceUrl points somewhere else too (a split
+  # install). Ignored at replicaCount 1.
+  homeUrlTemplate: ""
   # Where the warm tier lives inside the container — the PVC's mount point, and
   # the value of SCARAB_WORKSPACE_DATA_DIR.
   dataDir: /var/lib/scarab/cas
@@ -536,7 +564,7 @@ service:
   port: 80
   targetPort: 8080
   # A fixed node port, used only when type is NodePort. Empty => Kubernetes
-  # picks one. `just up` fixes it so a kind port mapping can point at it.
+  # picks one. `just stack up` fixes it so a kind port mapping can point at it.
   nodePort: ""
   annotations: {}
 
@@ -588,7 +616,7 @@ securityContext:
 
 # Override the server container's entrypoint and arguments. Empty => the
 # image's ENTRYPOINT. The role comes from scarab.role either way (SCARAB_ROLE).
-# `just up` uses this to run a binary built on the host from a hostPath volume:
+# `just stack up` uses this to run a binary built on the host from a hostPath volume:
 #   command: ["/opt/scarab/bin/scarab-server"]
 command: []
 args: []

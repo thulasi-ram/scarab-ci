@@ -216,7 +216,7 @@ impl K8sPluginRuntime {
 
     /// The broker URL as a Plugin Pod dials it: by IP, because a Plugin has
     /// no DNS (see `plugin-egress`). A URL that names an IP is used as is
-    /// (proc mode: `up.sh` resolves the host as a Pod sees it). A name — the
+    /// (a broker outside the cluster, at the host address a Pod uses). A name — the
     /// chart's broker Service — is resolved HERE, by the control plane, on
     /// every call, so a re-created Service's new ClusterIP is picked up
     /// within a pass; the NetworkPolicy peer is unaffected, since it is

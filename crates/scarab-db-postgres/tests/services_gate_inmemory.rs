@@ -252,13 +252,20 @@ async fn rerun_provisions_fresh_take_and_tears_down_the_prior() {
     db.seed_run(&run, RunStatus::Running);
 
     // Take 1's `db` is up and ready.
-    db.create_run_service(&run, 1, "db", Timestamp(0))
+    db.create_run_service(None, &run, 1, "db", Timestamp(0))
         .await
         .unwrap();
     let t1_handle = FakeExecutor::service_handle("run-1", 1, "db");
-    db.set_run_service(&run, 1, "db", ServiceStatus::Ready, Some(&t1_handle.0))
-        .await
-        .unwrap();
+    db.set_run_service(
+        None,
+        &run,
+        1,
+        "db",
+        ServiceStatus::Ready,
+        Some(&t1_handle.0),
+    )
+    .await
+    .unwrap();
 
     let clock = FakeClock::new(1_000);
     let exec = FakeExecutor::new();
@@ -328,11 +335,11 @@ async fn run_terminal_tears_down_services() {
     .await
     .unwrap();
     db.seed_run(&run, RunStatus::Running);
-    db.create_run_service(&run, 1, "db", Timestamp(0))
+    db.create_run_service(None, &run, 1, "db", Timestamp(0))
         .await
         .unwrap();
     let handle = FakeExecutor::service_handle("run-1", 1, "db");
-    db.set_run_service(&run, 1, "db", ServiceStatus::Ready, Some(&handle.0))
+    db.set_run_service(None, &run, 1, "db", ServiceStatus::Ready, Some(&handle.0))
         .await
         .unwrap();
 
@@ -389,11 +396,11 @@ async fn seed_running_run_with_service(db: &InMemoryDb, run_name: &str) -> (RunI
         .unwrap();
     db.seed_run(&run, RunStatus::Running);
 
-    db.create_run_service(&run, 1, "db", Timestamp(0))
+    db.create_run_service(None, &run, 1, "db", Timestamp(0))
         .await
         .unwrap();
     let handle = FakeExecutor::service_handle(run_name, 1, "db");
-    db.set_run_service(&run, 1, "db", ServiceStatus::Ready, Some(&handle.0))
+    db.set_run_service(None, &run, 1, "db", ServiceStatus::Ready, Some(&handle.0))
         .await
         .unwrap();
     (run, handle.0)
@@ -422,7 +429,10 @@ async fn operator_cancel_tears_down_shared_services() {
             .await
             .unwrap()
     );
-    assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Cancelled));
+    assert_eq!(
+        db.run_status(&run).await.unwrap(),
+        Some(RunStatus::Cancelled)
+    );
     assert!(
         exec.torn_down_services().is_empty(),
         "teardown is the driver's job, not inline in the request"
@@ -520,11 +530,11 @@ async fn a_dead_lettered_run_tears_down_its_shared_services() {
     .await
     .unwrap();
     db.seed_run(&run, RunStatus::Running);
-    db.create_run_service(&run, 1, "db", Timestamp(0))
+    db.create_run_service(None, &run, 1, "db", Timestamp(0))
         .await
         .unwrap();
     let handle = FakeExecutor::service_handle("run-dl", 1, "db");
-    db.set_run_service(&run, 1, "db", ServiceStatus::Ready, Some(&handle.0))
+    db.set_run_service(None, &run, 1, "db", ServiceStatus::Ready, Some(&handle.0))
         .await
         .unwrap();
 

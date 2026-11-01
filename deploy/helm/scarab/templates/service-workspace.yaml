@@ -4,20 +4,22 @@
   matching the main Service's shape, so SCARAB_WORKSPACE_URL is
   `http://<fullname>-workspace.<ns>.svc` with no port.
 
-  Deliberately NOT headless: a headless Service exists to give each replica its
-  own DNS name, and nothing addresses an individual workspace replica by name.
-  Since ADR-0067 the READ side (and the drain-record read) is
+  Not headless. Since ADR-0067 the READ side (and the drain-record read) is
   replica-independent — the fence rows, the drain records and the pack index
   live in Postgres and the durable bytes in the bucket, so any replica can
   ANSWER for any fence. Since git-bug afb13c2 the drain WRITE path is
   replica-safe too: a sealed body pack's index rows are staged the moment its
   multipart upload completes, an idle tail pack is sealed by a 2 s linger,
   and whichever replica receives POST /v1/drains commits the union of the
-  fence's packs — wherever the 16-wide PUTs scattered (exercised at the
-  acceptance-test grain, not yet on a live cluster). No replica affinity is
-  needed for correctness (it remains only a possible warmth optimisation);
-  per-failure-domain placement (a later slice) is "which zone's service" — a
-  second Service or a topology-aware hint, not per-Pod DNS.
+  fence's packs — wherever the 16-wide PUTs scattered (at the acceptance-test
+  grain, and live at 2 replicas in the ADR-0077 rank 1 fault runs on
+  2026-11-01). No replica affinity is needed for correctness.
+
+  The one thing addressed to a single replica is a Cache (git-bug 12e2f6b): it
+  is warm-only, so its saves and restores go to the home replica chosen from
+  its key, through the per-replica Services in
+  service-workspace-replicas.yaml. This Service is also the StatefulSet's
+  `serviceName`, which is immutable, so it stays as it is.
 
   `publishNotReadyAddresses` is left at its default (false) on purpose: a replica
   whose warm volume is not writable must leave rotation, which is the entire

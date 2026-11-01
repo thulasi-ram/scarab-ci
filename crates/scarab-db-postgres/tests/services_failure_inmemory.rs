@@ -544,12 +544,19 @@ async fn reconcile_error_on_one_run_does_not_starve_another() {
     .unwrap();
     db.seed_run(&run_a, RunStatus::Running);
     let a_handle = FakeExecutor::service_handle("run-a", 1, "db");
-    db.create_run_service(&run_a, 1, "db", Timestamp(0))
+    db.create_run_service(None, &run_a, 1, "db", Timestamp(0))
         .await
         .unwrap();
-    db.set_run_service(&run_a, 1, "db", ServiceStatus::Starting, Some(&a_handle.0))
-        .await
-        .unwrap();
+    db.set_run_service(
+        None,
+        &run_a,
+        1,
+        "db",
+        ServiceStatus::Starting,
+        Some(&a_handle.0),
+    )
+    .await
+    .unwrap();
     exec.fail_service_ready(&a_handle);
 
     // Run B: a fresh run whose `db` service should still be born + launched this

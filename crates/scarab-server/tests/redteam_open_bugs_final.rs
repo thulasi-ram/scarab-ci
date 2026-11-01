@@ -650,12 +650,44 @@ both!(a_resent_cancel_enqueues_one_services_teardown);
 
 // ---------------------------------------------------------------------------
 // F7 — a step claimed (Running) but not yet minted when the cancel lands.
-// `cancel_step` correctly stamps nothing (no in-flight attempt) and writes no
-// intent; replica A then resumes `admit`: `record_attempt` mints a1 under the
-// now-Cancelled step (the PG FOR SHARE only orders it, it does not refuse),
-// and enqueues its launch. The launch is refused (no unit — survives), but
-// a1 is left outcome `Running` forever under a Cancelled step and Run.
+// Before git-bug 0f29112 the claim and the mint were separate writes:
+// `cancel_step` stamped nothing (no in-flight attempt), then replica A
+// resumed `admit` and minted a1 under the now-Cancelled step, left outcome
+// `Running` forever. The claim now mints a1 and its launch intent in its own
+// transaction, so the cancel always finds a1 and stamps it.
 // ---------------------------------------------------------------------------
+/// A scheduler leader term on `db`, for calling the leader-only Db methods
+/// directly (git-bug aaf4e3e).
+async fn lead(db: &dyn Db) -> scarab_engine::LeaderTerm {
+    db.lease(scarab_engine::SCHEDULER_LEASE, "test-leader", 600_000)
+        .await
+        .unwrap()
+        .held_by(scarab_engine::SCHEDULER_LEASE, "test-leader")
+        .expect("the test holds the scheduler lease")
+}
+
+/// The launch admission mints for a claimed step: a1 and its launch intent.
+fn launch_a1(s: &StepRun) -> Result<scarab_engine::StepLaunch, scarab_engine::DbError> {
+    Ok(scarab_engine::StepLaunch {
+        attempt: Attempt {
+            id: AttemptId("a1".into()),
+            started_at: Timestamp(T0),
+            failure: None,
+            failure_detail: None,
+            outcome: AttemptOutcome::Running,
+        },
+        events: Vec::new(),
+        outbox: vec![OutboxMessage {
+            id: OutboxId(0),
+            run: s.run.clone(),
+            kind: LAUNCH_STEP.to_string(),
+            payload: json!({ "run": s.run.0, "step": s.step.0, "attempt": "a1" }),
+            idempotency_key: format!("launch:{}/{}/a1", s.run.0, s.step.0),
+            at: Timestamp(T0),
+        }],
+    })
+}
+
 async fn an_attempt_minted_after_its_cancel_is_not_left_running(w: World) {
     w.seed_plain("rp").await;
     w.db.record_step_transition(
@@ -666,35 +698,15 @@ async fn an_attempt_minted_after_its_cancel_is_not_left_running(w: World) {
     )
     .await
     .unwrap();
-    let claimed = w.db.claim_ready_steps(10).await.unwrap();
+    let claimed = w
+        .db
+        .claim_ready_steps(&lead(&*w.db).await, 10, &launch_a1)
+        .await
+        .unwrap();
     assert!(claimed.iter().any(|s| s.step == id("build")));
     assert!(cancel_run_request(&*w.db, &w.clock, &rid("rp"), None)
         .await
         .unwrap());
-    // Replica A resumes admit exactly where it paused.
-    w.db.record_attempt(
-        &rid("rp"),
-        &id("build"),
-        &Attempt {
-            id: AttemptId("a1".into()),
-            started_at: Timestamp(T0),
-            failure: None,
-            failure_detail: None,
-            outcome: AttemptOutcome::Running,
-        },
-    )
-    .await
-    .unwrap();
-    w.db.enqueue_outbox(&OutboxMessage {
-        id: OutboxId(0),
-        run: rid("rp"),
-        kind: LAUNCH_STEP.to_string(),
-        payload: json!({ "run": "rp", "step": "build", "attempt": "a1" }),
-        idempotency_key: "launch:rp/build/a1".into(),
-        at: Timestamp(T0),
-    })
-    .await
-    .unwrap();
     w.ticks(3).await;
     assert!(
         !w.launched(&handle("rp", "build", "a1")),
@@ -711,10 +723,7 @@ async fn an_attempt_minted_after_its_cancel_is_not_left_running(w: World) {
     );
     w.finish().await;
 }
-both!(
-    an_attempt_minted_after_its_cancel_is_not_left_running,
-    ignore = "redteam: BROKE F7 — attempt minted after cancel stays Running forever"
-);
+both!(an_attempt_minted_after_its_cancel_is_not_left_running);
 
 // ---------------------------------------------------------------------------
 // F8 — rolling upgrade: a legacy null-payload CANCEL_RUN (an old binary's

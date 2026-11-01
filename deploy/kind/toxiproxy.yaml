@@ -1,4 +1,4 @@
-# toxiproxy for `just chaos` (ADR-0077 §3, Amendment §4). In chaos mode the
+# toxiproxy for `just test chaos` (ADR-0077 §3, Amendment §4). In chaos mode the
 # release reaches the same Postgres and MinIO servers as dev, but through
 # these proxies, so a scenario can cut or slow those connections without
 # touching dev's data. up.sh applies this file in chaos mode only and deletes

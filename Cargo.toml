@@ -77,6 +77,8 @@ scarab-storage-s3 = { path = "crates/scarab-storage-s3" }
 # `ContentSource`. An adapter over reqwest — no kube, so the node driver can use
 # it without linking the kubernetes executor.
 scarab-workspace-client = { path = "crates/scarab-workspace-client" }
+# The fault tier's harness; crash_resume (scarab-e2e) uses its node signals.
+scarab-chaos = { path = "crates/scarab-chaos" }
 # The rule that turns off the kubelet's `$(VAR)` expansion, shared by every
 # crate that builds Pods (the k8s executor and the plugin runtime).
 scarab-k8s-expansion = { path = "crates/scarab-k8s-expansion" }
@@ -135,9 +137,6 @@ tempfile = "3"
 # loop) and Windows ReFS. Currently unreferenced by any crate on purpose.
 # NOT the `reflink` crate — that one has been abandoned since 2019.
 reflink-copy = "0.1"
-# l*xattr, for reading the overlay's trusted.* markers. Linux-only at the
-# call site; the crate itself is unconditional here.
-xattr = "1"
 rsa = { version = "0.9", features = ["pem"] }
 # ADR-0073 step-up: the WebAuthn relying party (`crates/scarab-webauthn`)
 # verifies ES256 / EdDSA / RS256 assertion signatures with ring. Not a new

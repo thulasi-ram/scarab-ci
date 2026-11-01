@@ -14,7 +14,7 @@
 # Renders the chart at two versions that differ in every component, under both
 # the default values and a features-on set (so a version behind a non-default
 # branch is caught too), and diffs everything in each StatefulSet's spec except
-# the allowlist. Run by image.yml's `chart` job and `just chart-immutable`.
+# the allowlist. Run by image.yml's `chart` job and `just check all`.
 #
 # Out of reach by construction: a value that changes per RELEASE rather than per
 # chart version (`.Release.Revision`, `now`) renders the same in both passes.

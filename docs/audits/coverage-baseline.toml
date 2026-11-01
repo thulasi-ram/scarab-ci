@@ -1,7 +1,7 @@
 # Per-crate line-coverage baseline (percent), consumed by
 # scripts/coverage_ratchet.py: CI fails if any crate drops more than
 # 0.5 percentage points below its value here. Regenerate
-# deliberately with `just coverage` and commit the result.
+# deliberately with `just test coverage` and commit the result.
 #
 # REGENERATED 2026-08-31 from the `lcov` ARTIFACT of a green CI `coverage` job
 # (run 33377942205, PR #4 head 68e768e) — not from a laptop. That distinction
@@ -16,7 +16,7 @@
 # 15pp below reality is not a ratchet, it is a decoration — those three crates
 # could have lost half their tests without CI saying a word.
 #
-# The cause was `just coverage` starting Postgres but not MinIO (fixed in the
+# The cause was `just test coverage` starting Postgres but not MinIO (fixed in the
 # same change), so an earlier `--write` recorded a narrower suite as the floor.
 # If a crate here ever drops far below what you can reproduce locally, suspect a
 # service that did not start before you suspect the tests.

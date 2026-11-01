@@ -144,12 +144,12 @@ content-addressed workspace, `invoke`, secrets, and the OIDC issuer. `ci.yml` ru
 workspace suite on every push to main and on every PR that touches Rust code. **Tested against
 a fake forge:** webhook → in-repo config → run → commit statuses posted back. **Implemented, and
 run against real forges by hand:** the GitHub and Forgejo adapters (webhook ingest and commit
-statuses); `just e2e` drives a real Forgejo from hook to Run, and the live demo takes
+statuses); `just test e2e` drives a real Forgejo from hook to Run, and the live demo takes
 its webhooks from a GitHub App. **Implemented, and tested on a kind cluster:** Pod execution and
 re-attach (`scarab-executor-k8s`) and the results-egress sidecar (`docker/sidecar/`).
-`e2e.yml` runs those tests with `just e2e` on PRs labelled `ci:full` and weekly, not on every
+`e2e.yml` runs those tests with `just test e2e` on PRs labelled `ci:full` and weekly, not on every
 PR. **Tested for one case:** control-plane crash and resume with a real Pod in flight. The
-`just e2e` test SIGKILLs the server while a step Pod runs, the server restarts in the same Pod
+`just test e2e` test SIGKILLs the server while a step Pod runs, the server restarts in the same Pod
 and re-adopts the Attempt; it passes on a local kind cluster and in `e2e.yml`. **Not
 proven yet:** a server moved to another node or a lost node, and production-scale load. **Missing:** `on: cron` and `on: upstream`
 triggers parse, but nothing produces those events yet. **Out of scope:** continuous delivery.

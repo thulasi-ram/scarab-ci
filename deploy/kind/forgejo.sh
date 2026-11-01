@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Seed the in-cluster Forgejo (deploy/kind/forgejo.yaml) for the Forgejo cases
-# of `just e2e` (git-bug 3863d5e). deploy/kind/up.sh runs it in every mode,
+# of `just test e2e` (git-bug 3863d5e). deploy/kind/up.sh runs it in every mode,
 # after Forgejo is rolled out:
 #   - an admin user + an API access token
 #   - enough repos to force `list_accessible_repos` onto a second page
 #   - the working repos with a `.scarab/ci.yaml` on `main`
 #   - an org repo reached by a team member and a collaborator (ADR-0069 s7)
+#   - the empty repo the Cache probe of `just test chaos` writes its pipeline to
 #   - with FORGEJO_TUNNEL_URL set (e2e mode): the private repos of the
 #     forge_token cases, one with a submodule at the tunnel URL
 #
@@ -240,6 +241,11 @@ api -o /dev/null -X PUT -d '{"permission":"read"}' \
 ensure_repo "$private_repo" true true
 ensure_repo "$sub_repo" true true
 total=$((total + 2))
+# The Cache probe of `just test chaos` (crates/scarab-chaos/src/cache.rs)
+# writes its pipeline here. Created in every mode for the same reason: a repo
+# only the chaos run created would change the count the pagination case expects.
+ensure_repo chaos-cache true
+total=$((total + 1))
 if [ -n "$tunnel_url" ]; then
   # The forge_token cases (crates/scarab-e2e/tests/forgejo_tunnel.rs). `ci`
   # clones the private repo through the first-party clone library and reads a

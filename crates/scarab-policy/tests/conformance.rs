@@ -1,6 +1,6 @@
 //! The cel-spec conformance cases that fall inside the policy subset, run
 //! through the checker. Opt-in: needs the cases extracted from a cel-rust
-//! checkout (see `just policy-conformance`), named by
+//! checkout (see `just check conformance`), named by
 //! `SCARAB_CEL_CONFORMANCE_CASES`. Panics when run without it.
 //!
 //! A case is inside the subset when it declares no variables, types or
@@ -46,7 +46,7 @@ fn kind(t: &Type) -> &'static str {
 }
 
 #[test]
-#[ignore = "needs SCARAB_CEL_CONFORMANCE_CASES; run with `just policy-conformance`"]
+#[ignore = "needs SCARAB_CEL_CONFORMANCE_CASES; run with `just check conformance`"]
 fn cel_spec_cases_inside_the_subset() {
     // cel 0.15's parser needs more than a test thread's 2 MiB of stack in a
     // debug build for `parse/nest` (12 nested calls overflow it; a release

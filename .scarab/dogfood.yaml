@@ -18,7 +18,7 @@
 #     publishes its fmt/clippy reports, each `test` leg its own cargo log, and
 #     `version` a version.txt.
 #
-# Dispatching it locally (`just up dogfood`, then POST .../dispatch):
+# Dispatching it locally (`just stack up dogfood`, then POST .../dispatch):
 #   - Use ref `main`. `deploy` is `when: event.branch == 'main'`, so on a PR it
 #     and `notify` correctly SKIP — dispatch main to exercise the whole DAG.
 #   - `approve` is a MANUAL gate: the run parks there until you approve it.
@@ -83,7 +83,7 @@ interface:
 # against the environment's protection rules and opt out of newest-wins cancel.
 # Since ADR-0071 the name must be an org-level Environment that lists this
 # project as eligible: an unknown or ineligible one is REFUSED at Run creation
-# (the webhook skips this pipeline; a dispatch answers 403). `just up` seeds
+# (the webhook skips this pipeline; a dispatch answers 403). `just stack up` seeds
 # `production` in the dogfood org, eligible for every project; anywhere else,
 # an org admin creates it (PUT /v1/orgs/{org}/environments/production) and
 # makes this project eligible (…/production/eligibility).

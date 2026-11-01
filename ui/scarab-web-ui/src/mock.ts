@@ -1,5 +1,5 @@
 // Fixture / demo mode for the web UI. Gated behind VITE_SCARAB_MOCK=1
-// (`just ui-mock` / `npm run dev:mock`); patches window.fetch +
+// (`just ui mock` / `npm run dev:mock`); patches window.fetch +
 // window.EventSource to serve a fixed "acme" org so the UI renders with no
 // server or DB. The fastest way to eyeball a UI change, and the source of the
 // docs screenshots. Off by default — the guard in index.tsx never imports this

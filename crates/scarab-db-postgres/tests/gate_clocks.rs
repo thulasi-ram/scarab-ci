@@ -345,12 +345,22 @@ async fn gate_facts(db: &dyn Db, run: &RunId) -> (usize, usize) {
     (started, resolved)
 }
 
+/// A scheduler leader term on `db`, for calling the leader-only Db methods
+/// directly (git-bug aaf4e3e).
+async fn lead(db: &dyn Db) -> scarab_engine::LeaderTerm {
+    db.lease(scarab_engine::SCHEDULER_LEASE, "test-leader", 600_000)
+        .await
+        .unwrap()
+        .held_by(scarab_engine::SCHEDULER_LEASE, "test-leader")
+        .expect("the test holds the scheduler lease")
+}
+
 /// (a) An API release lands after the scheduler opened the wait: it closes
 /// THAT Attempt — one `AttemptStarted`, one Attempt, Succeeded.
 async fn scenario_release_after_mint(db: &dyn Db, run: &RunId) {
     seed_reached_gate(db, run).await;
     let a1 = db
-        .open_gate_wait(run, &id("approve"), Timestamp(2_000), Timestamp(3_000))
+        .open_gate_wait(&lead(db).await, run, &id("approve"), Timestamp(2_000), Timestamp(3_000))
         .await
         .unwrap()
         .expect("a Pending gate opens its wait");
@@ -359,7 +369,7 @@ async fn scenario_release_after_mint(db: &dyn Db, run: &RunId) {
     assert_eq!(a1.started_at, Timestamp(2_000));
     // Asking again while it waits returns the same wait and writes nothing.
     let again = db
-        .open_gate_wait(run, &id("approve"), Timestamp(2_500), Timestamp(3_500))
+        .open_gate_wait(&lead(db).await, run, &id("approve"), Timestamp(2_500), Timestamp(3_500))
         .await
         .unwrap();
     assert_eq!(again.map(|a| a.id), Some(AttemptId("a1".into())));
@@ -396,7 +406,7 @@ async fn scenario_mint_after_release(db: &dyn Db, run: &RunId) {
     );
 
     let late = db
-        .open_gate_wait(run, &id("approve"), Timestamp(2_000), Timestamp(5_000))
+        .open_gate_wait(&lead(db).await, run, &id("approve"), Timestamp(2_000), Timestamp(5_000))
         .await
         .unwrap();
     assert_eq!(late, None, "a resolved gate opens no wait");
@@ -410,7 +420,7 @@ async fn scenario_mint_after_release(db: &dyn Db, run: &RunId) {
 /// `false` and does not append its event.
 async fn scenario_superseded_fence(db: &dyn Db, run: &RunId) {
     seed_reached_gate(db, run).await;
-    db.open_gate_wait(run, &id("approve"), Timestamp(2_000), Timestamp(3_000))
+    db.open_gate_wait(&lead(db).await, run, &id("approve"), Timestamp(2_000), Timestamp(3_000))
         .await
         .unwrap()
         .unwrap();
@@ -463,7 +473,7 @@ async fn scenario_superseded_fence(db: &dyn Db, run: &RunId) {
 /// and a later mint attempt finds the gate cancelled and writes nothing.
 async fn scenario_cancel_after_mint(db: &dyn Db, run: &RunId) {
     seed_reached_gate(db, run).await;
-    db.open_gate_wait(run, &id("approve"), Timestamp(2_000), Timestamp(3_000))
+    db.open_gate_wait(&lead(db).await, run, &id("approve"), Timestamp(2_000), Timestamp(3_000))
         .await
         .unwrap()
         .unwrap();
@@ -476,7 +486,7 @@ async fn scenario_cancel_after_mint(db: &dyn Db, run: &RunId) {
     assert_eq!(gate.attempts.len(), 1);
     assert_eq!(gate.attempts[0].outcome, AttemptOutcome::Cancelled);
     let late = db
-        .open_gate_wait(run, &id("approve"), Timestamp(2_000), Timestamp(5_000))
+        .open_gate_wait(&lead(db).await, run, &id("approve"), Timestamp(2_000), Timestamp(5_000))
         .await
         .unwrap();
     assert_eq!(late, None);
@@ -487,7 +497,7 @@ async fn scenario_cancel_after_mint(db: &dyn Db, run: &RunId) {
 /// nothing at all.
 async fn scenario_losing_resolver_writes_nothing(db: &dyn Db, run: &RunId) {
     seed_reached_gate(db, run).await;
-    db.open_gate_wait(run, &id("approve"), Timestamp(2_000), Timestamp(3_000))
+    db.open_gate_wait(&lead(db).await, run, &id("approve"), Timestamp(2_000), Timestamp(3_000))
         .await
         .unwrap()
         .unwrap();
@@ -526,7 +536,7 @@ async fn scenario_losing_resolver_writes_nothing(db: &dyn Db, run: &RunId) {
 /// a log replay (the UI's Takes view) does not leave it `running` forever.
 async fn scenario_released_gate_journals_its_transition(db: &dyn Db, run: &RunId) {
     seed_reached_gate(db, run).await;
-    db.open_gate_wait(run, &id("approve"), Timestamp(2_000), Timestamp(3_000))
+    db.open_gate_wait(&lead(db).await, run, &id("approve"), Timestamp(2_000), Timestamp(3_000))
         .await
         .unwrap()
         .unwrap();

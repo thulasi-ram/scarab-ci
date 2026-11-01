@@ -82,22 +82,22 @@ but none of them has carried production load.
   in-repo `.scarab` config → run → commit statuses posted back → OAuth-gated reads.
 - **Implemented, and run against real forges by hand.** Two forge adapters, GitHub
   (`/webhooks/github`) and Forgejo (`/webhooks/forgejo`), each with HMAC webhook ingest and
-  commit-status posting over real HTTP. `just e2e` drives a real Forgejo, running in the kind
+  commit-status posting over real HTTP. `just test e2e` drives a real Forgejo, running in the kind
   cluster, through add-connection → bind → hook → signed push → Run. It doesn't check status
   posting. CI runs it only on PRs labelled `ci:full` and weekly. The [live demo](#live-demo)
-  and this repo's own dogfood setup (`just up dogfood`, `deploy/kind/`) take their webhooks
+  and this repo's own dogfood setup (`just stack up dogfood`, `deploy/kind/`) take their webhooks
   from a GitHub App. Each adapter also has a live contract test (`tests/contract_live.rs`)
   that you run by hand.
 - **Implemented, and tested on a kind cluster.** Pod-per-step execution on Kubernetes
   (`scarab-executor-k8s`): re-attach after an executor relaunch, step deadlines, cancel, clone
   and build steps, the workspace feed and drain, artifact harvest, and the results-egress
-  sidecar image (`docker/sidecar/`). `just e2e` runs these live-cluster tests on the
+  sidecar image (`docker/sidecar/`). `just test e2e` runs these live-cluster tests on the
   `scarab-dev` kind cluster (created if missing), and `.github/workflows/e2e.yml` runs the
   same recipe on PRs labelled `ci:full` and weekly, not on every PR.
 - **Tested for one case.** Control-plane crash and resume with a real Pod in flight. The
   `crash_resume` test in `crates/scarab-e2e` SIGKILLs the server from the kind node while a
   step Pod runs; the kubelet restarts the container in the same Pod, and the new process
-  re-adopts the Attempt without running it again. It passes in `just e2e`, on a local kind
+  re-adopts the Attempt without running it again. It passes in `just test e2e`, on a local kind
   cluster and in `.github/workflows/e2e.yml`. A server Pod moved to another node, or a lost
   node, is not tested.
 - **Not proven yet.** Nothing has run at production scale.
@@ -209,8 +209,8 @@ where `just ui` proxies. Real secrets for the dogfood stack live in
 `~/.config/scarab/dogfood.env` (see `deploy/kind/README.md`).
 
 ```sh
-just ui       # Vite dev server on http://localhost:5173, proxies /v1 → the stack
-just reload   # rebuild scarab-server and roll the stack's Pods onto it
+just ui            # Vite dev server on http://localhost:5173, proxies /v1 → the stack
+just stack reload  # rebuild scarab-server and roll the stack's Pods onto it
 ```
 
 Auth is disabled in the dev stack (`scarab.devInsecure`), so every request is
@@ -223,10 +223,10 @@ One command builds `scarab-server` on your machine, creates a
 installs the Helm chart with the server and the Depot running that binary:
 
 ```sh
-just up      # kind + Postgres + MinIO + the chart; the server binary is built on the host
-just demo    # POST a one-step pipeline, poll until it succeeds, print logs
-just reload  # rebuild and roll the server onto the new binary (no image build)
-just down    # delete the cluster (`just down keep` keeps its data)
+just stack up      # kind + Postgres + MinIO + the chart; the server binary is built on the host
+just stack demo    # POST a one-step pipeline, poll until it succeeds, print logs
+just stack reload  # rebuild and roll the server onto the new binary (no image build)
+just stack down    # delete the cluster (`just stack down keep` keeps its data)
 ```
 
 Requires `docker`, `kind`, `kubectl`, `helm`, `cargo`, and `python3`, plus
@@ -234,21 +234,23 @@ Requires `docker`, `kind`, `kubectl`, `helm`, `cargo`, and `python3`, plus
 API and UI answer on `SCARAB_ADDR` from `deploy/kind/.env`. The cluster's
 kubeconfig is `deploy/kind/.kubeconfig`, checked against the cluster before
 every call, so the recipes never touch an ambient (e.g. production) context.
-`just up dogfood` is the same stack in GitHub App mode behind a Cloudflare tunnel.
-See `deploy/kind/README.md`.
+`just stack up dogfood` is the same stack in GitHub App mode behind a Cloudflare
+tunnel. See `deploy/kind/README.md`.
 
-`just e2e` runs every live suite against the same release, switched to its e2e
-mode: its own database and bucket, so dev data is not touched, and a cloudflared
-quick tunnel in front of the in-cluster Forgejo. `just up` switches it back. `just test` runs the workspace suite
-against a separate compose Postgres and MinIO (`deploy/test-services/`).
+`just test e2e` runs every live suite against the same release, switched to its
+e2e mode: its own database and bucket, so dev data is not touched, and a
+cloudflared quick tunnel in front of the in-cluster Forgejo. `just stack up`
+switches it back. `just test` runs the workspace suite against a separate
+compose Postgres and MinIO (`deploy/test-services/`), then the UI no-DOM
+suite. `just` with no arguments lists every recipe.
 
 Without Docker/kind, the server still runs API-only against a local Postgres and
 a filesystem object store (`--object-dir`); the background driver is skipped
 until a cluster is reachable.
 
 > **Running or testing Scarab locally: use the `just` recipes as the canonical
-> entrypoints** (`just up`/`demo`/`down`, `just up dogfood`, `just test`, `just e2e`) rather
-> than hand-rolled `docker`/`kubectl`/`helm` commands — they carry the right
+> entrypoints** (`just stack up`/`demo`/`down`, `just stack up dogfood`,
+> `just test`, `just test e2e`) rather than hand-rolled `docker`/`kubectl`/`helm` commands — they carry the right
 > env, isolated kubeconfig, image source, and kube safety checks. Missing something?
 > Add a recipe. (Agents: this is also in `CLAUDE.md`.)
 
@@ -277,10 +279,10 @@ Pushes to `main` and `v*` tags ignore both.
 |---|---|
 | none | `ci` runs the workspace suite and the other jobs its path filters select; `image` builds the images whose inputs changed. No cluster job runs. |
 | `ci:skip` | Every job in `ci`, `e2e` and `image` skips without starting a runner. Adding it cancels a run in progress. Removing it starts a run. |
-| `ci:full` | `ci` and `image` ignore the path filters and run every job, and `e2e` runs `just e2e` (every live suite on a kind cluster; it makes network calls through a cloudflared quick tunnel). Adding it starts a run. |
+| `ci:full` | `ci` and `image` ignore the path filters and run every job, and `e2e` runs `just test e2e` (every live suite on a kind cluster; it makes network calls through a cloudflared quick tunnel). Adding it starts a run. |
 
 `ci:skip` wins when both are set. A PR with `ci:skip` never passes
-`just pr-gate <n>`: remove the label, wait for the run, then run the gate.
+`just pr <n>`: remove the label, wait for the run, then run the gate.
 
 For a stack of PRs, where only the tip's run matters:
 
@@ -289,13 +291,13 @@ For a stack of PRs, where only the tip's run matters:
    not with `main`, so without the label they would skip jobs that the lower
    PRs' changes need.
 3. To merge, take the PRs bottom-up: remove `ci:skip` from the bottom PR, wait
-   for its run, check it with `just pr-gate`, merge, and repeat. To spend one
+   for its run, check it with `just pr`, merge, and repeat. To spend one
    run instead of one per PR, merge the stack down into the bottom PR's branch
    once the tip is green, then remove `ci:skip` from the bottom PR and merge it.
 
 A change to any other label also starts a run, because GitHub cannot filter
 triggers by label name. In that run every job skips, it does not cancel a run
-in progress, and `just pr-gate` ignores it when the commit has a real run.
+in progress, and `just pr` ignores it when the commit has a real run.
 
 ## License
 

@@ -45,9 +45,11 @@
 //! # What the service enforces
 //!
 //! See [`WorkspaceClaims`] and the service's own module docs. In one line:
-//! tree reads are checked against the token's `roots`; blob reads are checked
-//! against the **blob closure** of those roots (ticket 52ef3aa — rollout-gated
-//! by `SCARAB_DEPOT_BLOB_AUTHZ`).
+//! tree reads are checked against the token's `roots` and `cache_roots`; blob
+//! reads are checked against the **blob closure** of those roots (ticket
+//! 52ef3aa — rollout-gated by `SCARAB_DEPOT_BLOB_AUTHZ`). A cache root's
+//! closure is best-effort (git-bug 2a79b73): a replica that cannot walk it
+//! leaves it out of the grant instead of failing the walk.
 
 use base64::Engine;
 
@@ -69,6 +71,12 @@ pub const WORKSPACE_TOKEN_FILE_ENV: &str = "SCARAB_WORKSPACE_TOKEN_FILE";
 
 /// The env var carrying the workspace service's base URL into a Pod.
 pub const WORKSPACE_URL_ENV: &str = "SCARAB_WORKSPACE_URL";
+
+/// The env var carrying the base URL of the Step's Cache **home** Depot
+/// replica (git-bug 12e2f6b), for cache content only. Set only when the Depot
+/// runs more than one replica and the Step's cache key resolved; unset, the
+/// service URL above serves caches too.
+pub const WORKSPACE_CACHE_URL_ENV: &str = "SCARAB_WORKSPACE_CACHE_URL";
 
 /// Extra lifetime beyond the step deadline, so a Pod that is being torn down
 /// can still finish talking to the service.
@@ -153,8 +161,18 @@ pub struct WorkspaceClaims {
     pub exp: i64,
     pub scope: Scope,
     /// The Workspace Snapshot roots this token may read, sorted. Empty for
-    /// [`Scope::Browse`], which is not root-limited.
+    /// [`Scope::Browse`], which is not root-limited. These are the Step's
+    /// **required** inputs: a Depot that cannot walk one answers 500.
     pub roots: Vec<String>,
+    /// Cache restore roots (ADR-0065 s1) the token may also read, sorted, and
+    /// never repeating a member of `roots` (git-bug 2a79b73). Readable exactly
+    /// like `roots` — a tree read must name one, a blob read must fall in its
+    /// closure — but **best-effort**: a Cache is warm-only and lives on one
+    /// replica, so a replica that cannot walk a cache root leaves it out of
+    /// the blob grant instead of failing the whole walk. A token minted before
+    /// this field existed carries its cache roots inside `roots`, and behaves
+    /// as it always did.
+    pub cache_roots: Vec<String>,
 }
 
 impl WorkspaceClaims {
@@ -167,7 +185,28 @@ impl WorkspaceClaims {
     /// never needs to walk sub-trees by hash and never needs a root it was not
     /// given.
     pub fn may_read_tree(&self, hash: &str) -> bool {
-        matches!(self.scope, Scope::Browse) || self.roots.iter().any(|r| r == hash)
+        matches!(self.scope, Scope::Browse) || self.claimed_roots().any(|r| r == hash)
+    }
+
+    /// Every root the token claims: the required `roots`, then the
+    /// best-effort `cache_roots`.
+    pub fn claimed_roots(&self) -> impl Iterator<Item = &str> {
+        self.roots
+            .iter()
+            .chain(self.cache_roots.iter())
+            .map(String::as_str)
+    }
+
+    /// Add cache restore roots (ADR-0065 s1, git-bug 2a79b73). Sorted and
+    /// deduped like `roots`; a hash that is already a required root stays
+    /// required only, so a cache that happens to equal an input never weakens
+    /// that input's guarantee.
+    pub fn with_cache_roots(mut self, mut cache_roots: Vec<String>) -> Self {
+        cache_roots.retain(|r| !r.is_empty() && !self.roots.contains(r));
+        cache_roots.sort();
+        cache_roots.dedup();
+        self.cache_roots = cache_roots;
+        self
     }
 }
 
@@ -219,8 +258,15 @@ fn unesc(field: &str) -> String {
 ///
 /// `roots` is sorted and `,`-joined so a token's claim does not depend on the
 /// order the executor happened to collect the inputs in.
+///
+/// `cache_roots` (git-bug 2a79b73) is an OPTIONAL eighth field, written only
+/// when non-empty: a token with no cache roots is byte-identical to one minted
+/// before the field existed, so it verifies on a Depot of either age. A token
+/// that does carry it is refused as malformed by a Depot older than this field
+/// — the server and the Depot ship as one binary from one chart, so that only
+/// happens inside a rolling upgrade, and the Attempt it fails is Transient.
 fn message(claims: &WorkspaceClaims) -> String {
-    format!(
+    let mut msg = format!(
         "wsv1|{}|{}|{}|{}|{}|{}",
         esc(&claims.fence.run),
         esc(&claims.fence.step),
@@ -228,7 +274,12 @@ fn message(claims: &WorkspaceClaims) -> String {
         claims.exp,
         claims.scope.as_str(),
         claims.roots.join(","),
-    )
+    );
+    if !claims.cache_roots.is_empty() {
+        msg.push('|');
+        msg.push_str(&claims.cache_roots.join(","));
+    }
+    msg
 }
 
 /// When a token minted for a Pod launching now should expire: the step deadline
@@ -318,9 +369,16 @@ pub fn verify(
 /// are un-escaped (see [`esc`]).
 fn parse_message(msg: &str) -> Result<WorkspaceClaims, WorkspaceTokenError> {
     let fields: Vec<&str> = msg.split('|').collect();
-    if fields.len() != 7 || fields[0] != "wsv1" {
+    // 7 fields, or 8 with the optional `cache_roots` (see [`message`]).
+    if !(fields.len() == 7 || fields.len() == 8) || fields[0] != "wsv1" {
         return Err(WorkspaceTokenError::Malformed);
     }
+    let list = |raw: &str| -> Vec<String> {
+        raw.split(',')
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect()
+    };
     Ok(WorkspaceClaims {
         fence: Fence {
             run: unesc(fields[1]),
@@ -331,11 +389,8 @@ fn parse_message(msg: &str) -> Result<WorkspaceClaims, WorkspaceTokenError> {
             .parse::<i64>()
             .map_err(|_| WorkspaceTokenError::Malformed)?,
         scope: Scope::parse(fields[5]).ok_or(WorkspaceTokenError::Malformed)?,
-        roots: fields[6]
-            .split(',')
-            .filter(|s| !s.is_empty())
-            .map(String::from)
-            .collect(),
+        roots: list(fields[6]),
+        cache_roots: fields.get(7).map(|raw| list(raw)).unwrap_or_default(),
     })
 }
 
@@ -354,6 +409,7 @@ pub fn step_claims(
         exp,
         scope: Scope::Read,
         roots,
+        cache_roots: Vec::new(),
     }
 }
 
@@ -370,6 +426,7 @@ pub fn browse_claims(exp: i64) -> WorkspaceClaims {
         exp,
         scope: Scope::Browse,
         roots: Vec::new(),
+        cache_roots: Vec::new(),
     }
 }
 
@@ -534,6 +591,55 @@ mod tests {
         assert_ne!(
             mint(SECRET, &step_claims(fence_named("a|b"), 1, vec![])),
             mint(SECRET, &step_claims(fence_named("a%7Cb"), 1, vec![])),
+        );
+    }
+
+    /// git-bug 2a79b73: cache roots ride their own claim, so the Depot can
+    /// tell a best-effort root from a required one. Mutation killed: dropping
+    /// the eighth field on mint or parse (the round trip loses them), or
+    /// leaving them out of `may_read_tree` (the restore's `/flat` 403s).
+    #[test]
+    fn cache_roots_round_trip_and_are_readable_but_not_required() {
+        let claims = step_claims(fence(), 2_000, vec!["in1".into()])
+            .with_cache_roots(vec!["c2".into(), "in1".into(), "c1".into(), "c2".into()]);
+        // An input that is also a cache root stays required only.
+        assert_eq!(claims.cache_roots, vec!["c1".to_string(), "c2".to_string()]);
+        let out = verify(SECRET, &mint(SECRET, &claims), 0).expect("verifies");
+        assert_eq!(out.roots, vec!["in1".to_string()]);
+        assert_eq!(out.cache_roots, vec!["c1".to_string(), "c2".to_string()]);
+        assert!(out.may_read_tree("c1") && out.may_read_tree("in1"));
+        assert!(!out.may_read_tree("other"));
+    }
+
+    /// The compatibility story: a token with no cache roots is the SAME
+    /// seven-field message as before the claim existed, so a Depot that
+    /// predates it still verifies every cache-less Step's token; and a
+    /// seven-field token parses with no cache roots on a new Depot.
+    #[test]
+    fn a_token_without_cache_roots_keeps_the_seven_field_wire_form() {
+        let claims = step_claims(fence(), 2_000, vec!["aaa".into()]);
+        assert_eq!(message(&claims), "wsv1|run-1|build|a1|2000|read|aaa");
+        let out = verify(SECRET, &mint(SECRET, &claims), 0).expect("verifies");
+        assert!(out.cache_roots.is_empty());
+        let with = claims.with_cache_roots(vec!["ccc".into()]);
+        assert_eq!(message(&with), "wsv1|run-1|build|a1|2000|read|aaa|ccc");
+    }
+
+    /// A Pod cannot widen its cache claim either.
+    #[test]
+    fn tampering_with_the_cache_roots_claim_fails_the_mac() {
+        let claims = step_claims(fence(), 2_000, vec!["aaa".into()])
+            .with_cache_roots(vec!["ccc".into()]);
+        let token = mint(SECRET, &claims);
+        let forged = message(&WorkspaceClaims {
+            cache_roots: vec!["ccc".into(), "secret-tree".into()],
+            ..claims
+        });
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(forged.as_bytes());
+        let sig = token.rsplit('.').next().unwrap();
+        assert_eq!(
+            verify(SECRET, &format!("wsv1.{encoded}.{sig}"), 1_000),
+            Err(WorkspaceTokenError::BadSignature)
         );
     }
 

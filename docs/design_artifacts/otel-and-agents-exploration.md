@@ -1012,7 +1012,7 @@ Four harmony rules:
    19* ↗" without the engine knowing what a Mandate is.
 4. **One identity, one ingress.** Same OIDC session across both UIs; path-routed
    under one origin (`/mandates` → steward) so cookies and CORS stay trivial.
-   Steward-ui gets the same mock mode treatment as `just ui-mock`.
+   Steward-ui gets the same mock mode treatment as `just ui mock`.
 
 Because none of this leans on a license boundary, "give it away free later" moves
 nothing: the seam earns its keep as coupling discipline (the steward iterates at

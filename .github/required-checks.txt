@@ -4,7 +4,7 @@
 # rulesets, and BOTH are 403 on this repo (private on a free plan:
 # "Upgrade to GitHub Pro or make this repository public to enable this
 # feature"). So there is no server-side gate to configure. This file plus
-# `just pr-gate <n>` (scripts/pr_gate.py) is the gate: run it before merging.
+# `just pr <n>` (scripts/pr_gate.py) is the gate: run it before merging.
 # The moment protection becomes available, the `required*` lines below are
 # exactly the list to paste into it — no re-derivation.
 #
@@ -52,12 +52,13 @@ required-if-run  ci/test-and-coverage   # workspace nextest under llvm-cov, real
 required-if-run  ci/openapi-drift       # committed spec + generated client + tsc
 required-if-run  ci/ui-tests            # UI no-DOM vitest suites
 
-# Every live suite (`just e2e`: the scarab-e2e crate, Forgejo, the tunnel
-# cases, the executor and plugin cluster suites, crash_resume). Runs on a PR
+# Every live suite (`just test e2e`: the scarab-e2e crate, Forgejo, the tunnel
+# cases, the executor and plugin cluster suites, the Argo CD plugin,
+# crash_resume). Runs on a PR
 # only under the ci:full label, so on any other PR it skips, which is correct.
 # It replaces `kind/cluster-tests` (2026-11-01), which ran the cluster suites
 # alone and had been required since 2026-07-25.
-required-if-run  e2e/e2e                # `just e2e` on the kind release
+required-if-run  e2e/e2e                # `just test e2e` on the kind release
 
 # Path-filtered (`chart` in .github/path-filters.yml) on PRs; on a `v*` tag it
 # is the job that PUBLISHES the chart, so a red render here is a release that

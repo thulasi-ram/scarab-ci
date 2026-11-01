@@ -4,7 +4,7 @@
 
 use scarab_chaos::check::*;
 use scarab_chaos::pods::{ContainerView, PodRecord, PodView, STEP_CONTAINER};
-use scarab_chaos::scenario::{Fault, Kind, Landing, Trigger};
+use scarab_chaos::scenario::{Fault, Kind, Landing, LeaseObservation, NodeSignal, Trigger};
 
 fn ev(seq: i64, payload: serde_json::Value) -> EventRow {
     EventRow {
@@ -59,6 +59,7 @@ fn pod(uid: &str, step: &str, start: i64, end: i64) -> PodRecord {
                 exit_code: Some(0),
                 restarts: 0,
             }],
+            grace_secs: Some(30),
         },
     }
 }
@@ -98,6 +99,7 @@ fn fault(class: &str, held: bool) -> Fault {
             window_start_ms: Some(12),
             window_end_ms: Some(60),
         }),
+        ..Default::default()
     }
 }
 
@@ -114,8 +116,10 @@ fn clean() -> Facts {
         events: vec![
             ev(1, serde_json::json!({"AttemptStarted": {"step": "produce", "attempt": "a1"}})),
             ev(2, serde_json::json!({"AttemptFinished": {"step": "produce", "attempt": "a1", "failure": null}})),
+            ev(2, serde_json::json!({"StepTransitioned": {"step": "produce", "from": "Running", "to": "Succeeded"}})),
             ev(3, serde_json::json!({"AttemptStarted": {"step": "consume", "attempt": "a1"}})),
             ev(4, serde_json::json!({"AttemptFinished": {"step": "consume", "attempt": "a1", "failure": null}})),
+            ev(4, serde_json::json!({"StepTransitioned": {"step": "consume", "from": "Running", "to": "Succeeded"}})),
             ev(5, serde_json::json!({"RunTransitioned": {"from": "Running", "to": "Succeeded"}})),
         ],
         attempts: vec![
@@ -296,4 +300,162 @@ fn a_duplicate_attempt_started_without_a_row_fails_i1c() {
         "{:?}",
         v.findings
     );
+}
+
+// --- ranks 2 and 4 ---------------------------------------------------------------
+
+fn signal(sig: &str, delivered: bool) -> Option<NodeSignal> {
+    Some(NodeSignal {
+        signal: sig.into(),
+        node: "scarab-dev-control-plane".into(),
+        container_id: "abc".into(),
+        pid: 4242,
+        delivered,
+        evidence: "test".into(),
+    })
+}
+
+/// A rank-2 kill that hit the claim holder mid-drain, and was delivered.
+fn kill(role: &str, delivered: bool) -> Fault {
+    Fault {
+        action: "kill-server".into(),
+        pod: "scarab-6c9-x1".into(),
+        signal: signal("KILL", delivered),
+        target_basis: Some("seed".into()),
+        victim_role: Some(role.into()),
+        ..fault("mid-drain", true)
+    }
+}
+
+#[test]
+fn a_kill_of_the_claim_holder_mid_drain_passes() {
+    let mut f = clean();
+    f.kind = Some(Kind::KillServer);
+    f.faults = vec![kill("claim-holder", true)];
+    let v = evaluate(&f);
+    assert_eq!(v.outcome, Outcome::Pass, "{:?} {:?}", v.findings, v.inconclusive);
+}
+
+/// The kill hit the replica that did not hold the claim, or the restart
+/// that shows the SIGKILL took effect was never seen: not a test of rank 2.
+#[test]
+fn a_kill_of_the_peer_or_an_unconfirmed_kill_is_inconclusive() {
+    for (role, delivered, want) in [("peer", true, "the victim was the peer"), ("unknown", true, "the victim was the unknown"), ("claim-holder", false, "did not take effect")] {
+        let mut f = clean();
+        f.kind = Some(Kind::KillServer);
+        f.faults = vec![kill(role, delivered)];
+        let v = evaluate(&f);
+        assert_eq!(v.outcome, Outcome::Inconclusive, "{role} {delivered}");
+        assert!(v.inconclusive.iter().any(|w| w.contains(want)), "{:?}", v.inconclusive);
+    }
+    // Outside the drain window is inconclusive as for rank 1.
+    let mut f = clean();
+    f.kind = Some(Kind::KillServer);
+    f.faults = vec![Fault { landing: Some(Landing { class: "after-window".into(), window_start_ms: Some(1), window_end_ms: Some(2) }), ..kill("claim-holder", true) }];
+    assert_eq!(evaluate(&f).outcome, Outcome::Inconclusive);
+}
+
+fn stop(role: &str, stopped_ms: i64, terms: (Option<i64>, Option<i64>, Option<i64>)) -> Fault {
+    Fault {
+        action: "stop-leader".into(),
+        pod: "scarab-6c9-x1".into(),
+        landing: None,
+        signal: signal("STOP", true),
+        target_basis: Some("owner-in-pod-log".into()),
+        victim_role: Some(role.into()),
+        resumed_at_ms: Some(18 + stopped_ms),
+        lease: Some(LeaseObservation {
+            owner_before: "scarab-server-a".into(),
+            expires_before: 1,
+            term_before: terms.0,
+            owner_after: Some("scarab-server-b".into()),
+            term_after: terms.1,
+            takeover_at_ms: Some(30_000),
+            owner_after_resume: Some("scarab-server-b".into()),
+            term_after_resume: terms.2,
+            probes: vec![],
+        }),
+        ..fault("mid-drain", true)
+    }
+}
+
+#[test]
+fn a_leader_stopped_past_the_ttl_with_a_term_bump_passes() {
+    let mut f = clean();
+    f.kind = Some(Kind::StopLeader);
+    f.faults = vec![stop("leader", 31_000, (Some(4), Some(5), Some(5)))];
+    let v = evaluate(&f);
+    assert_eq!(v.outcome, Outcome::Pass, "{:?} {:?}", v.findings, v.inconclusive);
+    assert_eq!(v.checked["L1"], 1);
+    // On a schema with no term column L1 checks nothing, and that is not a
+    // reason to withhold the verdict.
+    f.faults = vec![stop("leader", 31_000, (None, None, None))];
+    let v = evaluate(&f);
+    assert_eq!((v.outcome, v.checked["L1"]), (Outcome::Pass, 0));
+}
+
+#[test]
+fn a_takeover_without_a_term_bump_fails_l1() {
+    let mut f = clean();
+    f.kind = Some(Kind::StopLeader);
+    f.faults = vec![stop("leader", 31_000, (Some(4), Some(4), Some(4)))];
+    let v = evaluate(&f);
+    assert_eq!(v.outcome, Outcome::Fail);
+    assert!(v.findings.iter().any(|x| x.invariant == "L1" && x.detail.contains("term 4 -> 4")), "{:?}", v.findings);
+    f.faults = vec![stop("leader", 31_000, (Some(4), Some(5), Some(3)))];
+    assert!(evaluate(&f).findings.iter().any(|x| x.invariant == "L1" && x.detail.contains("went back")));
+}
+
+/// Stopped for less than the TTL, or restarted by the kubelet before the
+/// SIGCONT: the stale-leader case was not tested.
+#[test]
+fn a_stop_that_did_not_outlast_the_lease_is_inconclusive() {
+    for (role, ms, want) in [
+        ("leader", 30_000, "not past the 30 s lease TTL"),
+        ("restarted-while-stopped", 40_000, "restarted-while-stopped"),
+    ] {
+        let mut f = clean();
+        f.kind = Some(Kind::StopLeader);
+        f.faults = vec![stop(role, ms, (Some(1), Some(2), Some(2)))];
+        let v = evaluate(&f);
+        assert_eq!(v.outcome, Outcome::Inconclusive, "{role}");
+        assert!(v.inconclusive.iter().any(|w| w.contains(want)), "{role}: {:?}", v.inconclusive);
+    }
+}
+
+/// A stopped leader whose lease no peer took over is a liveness finding, not
+/// an inconclusive run: wherever the stop landed, inside a fenced write too,
+/// the lease must move within the TTL + 30 s.
+#[test]
+fn a_stopped_leader_never_taken_over_fails_l2() {
+    let mut f = clean();
+    f.kind = Some(Kind::StopLeader);
+    f.faults = vec![stop("leader-no-takeover", 61_000, (Some(1), None, Some(1)))];
+    let v = evaluate(&f);
+    assert_eq!(v.outcome, Outcome::Fail, "{:?}", v.inconclusive);
+    assert!(v.findings.iter().any(|x| x.invariant == "L2"), "{:?}", v.findings);
+    f.faults = vec![stop("leader", 31_000, (Some(1), Some(2), Some(2)))];
+    let v = evaluate(&f);
+    assert_eq!((v.outcome, v.checked["L2"]), (Outcome::Pass, 1));
+}
+
+/// `two-replicas` has no fault; it counts only when both replicas drove
+/// some of the work.
+#[test]
+fn two_replicas_needs_both_replicas_to_have_claimed_launches() {
+    let mut f = clean();
+    f.kind = Some(Kind::TwoReplicas);
+    f.faults.clear();
+    // D1 reads the drains in release-log.txt, which every scenario writes.
+    f.release_log = Some(
+        r#"scarab-server-a: {"timestamp":"2026-11-01T14:18:05Z","fields":{"message":"ws-timing","pod":"p-u1","leg":"drain","total_ms":"900"}}"#
+            .to_string(),
+    );
+    f.launch_claimers = ["scarab-server-a".to_string()].into();
+    let v = evaluate(&f);
+    assert_eq!(v.outcome, Outcome::Inconclusive);
+    assert!(v.inconclusive[0].contains("1 replica(s) drove"), "{:?}", v.inconclusive);
+    f.launch_claimers.insert("scarab-server-b".into());
+    let v = evaluate(&f);
+    assert_eq!(v.outcome, Outcome::Pass, "{:?}", v.inconclusive);
 }

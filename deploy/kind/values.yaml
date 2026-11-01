@@ -1,6 +1,6 @@
 # Helm values for the kind dev stack (deploy/kind/up.sh). Every mode starts
 # from this file; up.sh adds the per-mode values (database URL, bucket,
-# secrets, the GitHub App for `just up dogfood`) in a temporary file.
+# secrets, the GitHub App for `just stack up dogfood`) in a temporary file.
 #
 # The server and the Depot run a binary built on the host. The thin runtime
 # image (docker/runtime) has no Scarab binary in it: deploy/kind/.mount on the
@@ -36,7 +36,7 @@ scarab:
 
 # Requests near measured use, not the chart's production defaults (256Mi
 # server, 512Mi Depot): the whole stack shares a 4 GiB colima VM. Measured
-# 2026-11-01 after `just demo-chain`: server ~20 MiB, Depot ~47 MiB working set.
+# 2026-11-01 after `just stack demo chain`: server ~20 MiB, Depot ~47 MiB working set.
 # The server keeps the chart's limit; the Depot's is 1Gi (chart: 2Gi), which
 # still leaves a drain room on a VM this size.
 resources:

@@ -124,6 +124,101 @@ impl Api {
         Err(format!("cancel run {id}: {status}: {}", resp.text().await.unwrap_or_default()))
     }
 
+    /// A send whose non-2xx answer is an `Err` naming `what`; the body as
+    /// JSON (`null` when empty).
+    async fn json(&self, what: &str, req: reqwest::RequestBuilder) -> Result<serde_json::Value, String> {
+        let resp = req.send().await.map_err(|e| format!("{what}: {e}"))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(format!("{what}: {status}: {text}"));
+        }
+        if text.trim().is_empty() {
+            return Ok(serde_json::Value::Null);
+        }
+        serde_json::from_str(&text).map_err(|e| format!("{what}: {e}: {text}"))
+    }
+
+    /// A Forgejo connection to `base_url` in this database, made fresh:
+    /// `up.sh` mints a new Forgejo token on every run and revokes the old
+    /// ones, so a connection an earlier session left holds a dead credential.
+    /// Deletes every connection to `base_url` (unbinding its repos), then
+    /// creates one. Returns its id.
+    pub async fn recreate_forgejo_connection(&self, base_url: &str, token: &str) -> Result<String, String> {
+        let want = base_url.trim_end_matches('/');
+        let list = self
+            .json("GET /v1/connections", self.http.get(format!("{}/v1/connections", self.base)))
+            .await?;
+        for c in list.as_array().into_iter().flatten() {
+            let (Some(id), Some(url)) = (c["id"].as_str(), c["base_url"].as_str()) else {
+                continue;
+            };
+            if url.trim_end_matches('/') == want {
+                self.json(
+                    "DELETE /v1/connections/{id}",
+                    self.http
+                        .delete(format!("{}/v1/connections/{id}?unbind_repos=true", self.base)),
+                )
+                .await?;
+            }
+        }
+        let created = self
+            .json(
+                "POST /v1/connections",
+                self.http
+                    .post(format!("{}/v1/connections", self.base))
+                    .json(&serde_json::json!({ "kind": "forgejo", "base_url": want, "credential": token })),
+            )
+            .await?;
+        created["id"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| format!("POST /v1/connections: no id in {created}"))
+    }
+
+    /// Bind `owner/name` to connection `conn` without a webhook (the probe is
+    /// dispatched, never pushed). Returns the (org, project) the bind made.
+    pub async fn bind_repo(&self, conn: &str, owner: &str, name: &str) -> Result<(String, String), String> {
+        let bound = self
+            .json(
+                "bind repo",
+                self.http
+                    .post(format!("{}/v1/connections/{conn}/repos", self.base))
+                    .json(&serde_json::json!({ "owner": owner, "name": name, "register_webhook": false })),
+            )
+            .await?;
+        match (bound["org"].as_str(), bound["project"].as_str()) {
+            (Some(org), Some(project)) => Ok((org.to_string(), project.to_string())),
+            _ => Err(format!("bind repo: no org/project in {bound}")),
+        }
+    }
+
+    /// `POST /v1/repos/{org}/{repo}/dispatch` with kind `api`. Returns the Run id.
+    pub async fn dispatch(
+        &self,
+        org: &str,
+        repo: &str,
+        pipeline: &str,
+        r#ref: &str,
+        params: &serde_json::Value,
+    ) -> Result<String, String> {
+        let created = self
+            .json(
+                "dispatch",
+                self.http
+                    .post(format!("{}/v1/repos/{org}/{repo}/dispatch", self.base))
+                    .json(&serde_json::json!({
+                        "ref": r#ref, "pipeline": pipeline, "kind": "api", "params": params,
+                        "reason": "scarab-chaos Cache probe",
+                    })),
+            )
+            .await?;
+        created["id"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| format!("dispatch: no id in {created}"))
+    }
+
     /// `status` of `GET /v1/runs/{id}`.
     pub async fn run_status(&self, id: &str) -> Result<String, String> {
         let resp = self
