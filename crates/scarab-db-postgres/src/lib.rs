@@ -18,7 +18,7 @@ use serde_json::Value;
 use sqlx::migrate::Migrator;
 use sqlx::{PgPool, Row};
 
-use scarab_engine::ports::{FencedWrite, LeaderTerm, Lease};
+use scarab_engine::ports::{LeaderTerm, Lease, MintLaunch};
 use scarab_engine::{
     Attempt, AttemptId, AttemptOutcome, ConcurrencyPolicy, Db, DbError, EventKind, EventPayload,
     FailureKind, LogChunkMeta, OutboxId, OutboxMessage, RunId, RunService, RunStatus, RunSummary,
@@ -57,48 +57,90 @@ pub static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 /// deleted, not guarded.
 pub struct PostgresDb {
     pool: PgPool,
-    /// The connections a leader fence holds (git-bug aaf4e3e), apart from
-    /// `pool`. A fenced write holds one fence connection while its write takes
-    /// a connection from `pool`; from one shared pool, as many concurrent
-    /// fenced writes as the pool has connections would each hold one and wait
-    /// forever for a second. Lazily connected with `pool`'s options.
-    fence_pool: PgPool,
-    /// How long a fence transaction may go without hearing from its holder
-    /// before Postgres ends it (`idle_in_transaction_session_timeout`). See
-    /// [`FENCE_STALL_BOUND`].
-    fence_stall_bound: std::time::Duration,
+    /// The bound on every leader-fenced transaction (git-bug aaf4e3e):
+    /// [`LEADER_TX_BOUND_MS`](scarab_engine::LEADER_TX_BOUND_MS) unless a
+    /// test shortens it. See [`PostgresDb::begin_fenced`].
+    leader_tx_bound: std::time::Duration,
 }
 
-/// How long a leader's fence may stall — the holder stopped (SIGSTOP, a GC
-/// pause, a VM suspend) or cut off — before Postgres terminates its fence
-/// transaction and releases the lease row (git-bug aaf4e3e). Well under the
-/// 30 s scheduler lease TTL, so a leader stopped inside a fenced write loses
-/// the lease when it expires, as a leader stopped anywhere else does. A live
-/// holder pings its fence every third of this, so a slow write keeps it.
-pub const FENCE_STALL_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// Connections in the fence pool. Fenced writes are leader-only and the
-/// leader runs them one at a time; more callers than this wait for a fence
-/// connection while holding no other connection, so they cannot deadlock.
-const FENCE_POOL_SIZE: u32 = 4;
+/// How long a lease takeover waits for the holder's in-flight fenced
+/// transaction before it reports the holder and leaves the takeover to the
+/// caller's next tick. Only a takeover of an EXPIRED lease waits at all; a
+/// follower that finds the lease live never does (git-bug aaf4e3e).
+const TAKEOVER_WAIT: &str = "1s";
 
 impl PostgresDb {
     /// Construct from an existing connection pool.
     pub fn with_pool(pool: PgPool) -> Self {
-        let fence_pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(FENCE_POOL_SIZE)
-            .connect_lazy_with((*pool.connect_options()).clone());
         Self {
             pool,
-            fence_pool,
-            fence_stall_bound: FENCE_STALL_BOUND,
+            leader_tx_bound: std::time::Duration::from_millis(scarab_engine::LEADER_TX_BOUND_MS),
         }
     }
 
-    /// Override [`FENCE_STALL_BOUND`] (tests that stall a fence on purpose).
-    pub fn with_fence_stall_bound(mut self, bound: std::time::Duration) -> Self {
-        self.fence_stall_bound = bound;
+    /// Override the leader-fenced transaction bound (tests that stall one on
+    /// purpose).
+    pub fn with_leader_tx_bound(mut self, bound: std::time::Duration) -> Self {
+        self.leader_tx_bound = bound;
         self
+    }
+
+    /// Begin a leader-fenced transaction (git-bug aaf4e3e): bound it, then
+    /// check that `leader` still holds its lease term and hold the lease row
+    /// `FOR SHARE` until the transaction ends. A takeover updates that row,
+    /// so it waits for this transaction: whatever the caller writes in it is
+    /// refused here ([`DbError::NotLeader`]) or committed before the
+    /// takeover. A share lock waiting behind a takeover in progress sees the
+    /// new owner when it is granted, and is refused.
+    ///
+    /// The bound (`lock_timeout`, `statement_timeout` and
+    /// `idle_in_transaction_session_timeout`, all `leader_tx_bound`, local
+    /// to the transaction) is what keeps the lease row from outliving its
+    /// holder: a holder stopped mid-transaction has it rolled back by
+    /// Postgres — a statement waiting on a lock is cancelled, an idle one
+    /// has its session ended — so a peer takes the lease over within TTL +
+    /// bound and the stopped holder's writes never land. A live holder that
+    /// hits the bound gets [`DbError::FenceTimeout`] (see [`db_err`]).
+    async fn begin_fenced(
+        &self,
+        leader: &LeaderTerm,
+    ) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, DbError> {
+        let mut tx = self.pool().begin().await.map_err(db_err)?;
+        let bound = format!("{}ms", self.leader_tx_bound.as_millis().max(1));
+        sqlx::query(
+            "SELECT set_config('lock_timeout', $1, true),
+                    set_config('statement_timeout', $1, true),
+                    set_config('idle_in_transaction_session_timeout', $1, true)",
+        )
+        .bind(&bound)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        let held = sqlx::query(
+            "SELECT 1 FROM leases WHERE resource = $1 AND owner = $2 AND term = $3 FOR SHARE",
+        )
+        .bind(leader.resource())
+        .bind(leader.owner())
+        .bind(leader.term())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        match held {
+            Some(_) => Ok(tx),
+            None => Err(DbError::NotLeader),
+        }
+    }
+
+    /// [`begin_fenced`](Self::begin_fenced) with a leader, a plain
+    /// transaction without one.
+    async fn begin_maybe_fenced(
+        &self,
+        leader: Option<&LeaderTerm>,
+    ) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, DbError> {
+        match leader {
+            Some(leader) => self.begin_fenced(leader).await,
+            None => self.pool().begin().await.map_err(db_err),
+        }
     }
 
     /// Connect a pool to `url`.
@@ -174,12 +216,18 @@ impl Db for PostgresDb {
         &self,
         leader: &LeaderTerm,
         limit: u32,
+        mint: MintLaunch<'_>,
     ) -> Result<Vec<StepRun>, DbError> {
         // Atomic dequeue: the inner SELECT locks up to `limit` ready rows with
         // FOR UPDATE SKIP LOCKED (concurrent claimers skip each other's locked
         // rows), and the outer UPDATE flips them to `running` in the same
         // statement. After commit the rows are no longer `ready`, so a later
         // claim cannot hand out the same step — no double-dispatch.
+        //
+        // Leader-only (git-bug aaf4e3e): the fence, the claim and every
+        // claimed step's Attempt, events and launch intent commit together
+        // (git-bug 0f29112), so no step is ever `running` without them.
+        let mut tx = self.begin_fenced(leader).await?;
         let rows = sqlx::query(
             "UPDATE step_runs
              SET status = 'running',
@@ -193,13 +241,10 @@ impl Db for PostgresDb {
              )
              RETURNING run_id, step_id, status, needs, gate_kind",
         )
-        .bind(limit as i64);
-        // Leader-only (git-bug aaf4e3e): the fence and the claim commit
-        // together, so a deposed leader claims nothing.
-        let mut tx = self.pool().begin().await.map_err(db_err)?;
-        hold_leader_term(&mut tx, leader, self.fence_stall_bound).await?;
-        let rows = rows.fetch_all(&mut *tx).await.map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
+        .bind(limit as i64)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db_err)?;
 
         let mut claimed = Vec::with_capacity(rows.len());
         for r in rows {
@@ -208,16 +253,26 @@ impl Db for PostgresDb {
             let status = step_status_from_str(r.get::<String, _>("status"))?;
             let needs = needs_from_value(r.get::<Value, _>("needs"))?;
             let gate_kind = r.get::<Option<String>, _>("gate_kind");
-            let attempts = self.attempts(&run, &step).await?;
-            claimed.push(StepRun {
+            let attempts = attempts_on(&mut *tx, &run, &step).await?;
+            let step_run = StepRun {
                 run,
                 step,
                 status,
                 attempts,
                 needs,
                 gate_kind,
-            });
+            };
+            let launch = mint(&step_run)?;
+            insert_attempt(&mut tx, &step_run.run, &step_run.step, &launch.attempt).await?;
+            for event in &launch.events {
+                insert_event(&mut *tx, event).await?;
+            }
+            for msg in &launch.outbox {
+                insert_outbox(&mut *tx, msg).await?;
+            }
+            claimed.push(step_run);
         }
+        tx.commit().await.map_err(db_err)?;
         Ok(claimed)
     }
 
@@ -868,6 +923,39 @@ impl Db for PostgresDb {
         Ok(())
     }
 
+    async fn promote_step(
+        &self,
+        leader: &LeaderTerm,
+        run: &RunId,
+        step: &StepId,
+        signature: &str,
+        events: &[EventKind],
+    ) -> Result<(), DbError> {
+        // One fenced transaction: the CAS takes the step row's lock, the
+        // signature lands only with the promotion, an early return rolls back.
+        let mut tx = self.begin_fenced(leader).await?;
+        let promoted = sqlx::query(
+            "UPDATE step_runs
+             SET status = 'ready', input_signature = $3,
+                 updated_at = (extract(epoch from now()) * 1000)::bigint
+             WHERE run_id = $1 AND step_id = $2 AND status = 'pending'",
+        )
+        .bind(&run.0)
+        .bind(&step.0)
+        .bind(signature)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+        if promoted == 0 {
+            return Err(DbError::Conflict);
+        }
+        for event in events {
+            insert_event(&mut *tx, event).await?;
+        }
+        tx.commit().await.map_err(db_err)
+    }
+
     async fn step_input(&self, run: &RunId, step: &StepId) -> Result<Option<String>, DbError> {
         let row =
             sqlx::query("SELECT input_signature FROM step_runs WHERE run_id = $1 AND step_id = $2")
@@ -971,8 +1059,7 @@ impl Db for PostgresDb {
         run: &RunId,
     ) -> Result<Option<RunId>, DbError> {
         // Serialize acquirers on this group with a row lock, so exactly one wins.
-        let mut tx = self.pool().begin().await.map_err(db_err)?;
-        hold_leader_term(&mut tx, leader, self.fence_stall_bound).await?;
+        let mut tx = self.begin_fenced(leader).await?;
         let holder: Option<String> =
             sqlx::query("SELECT holder FROM concurrency_slots WHERE group_key = $1 FOR UPDATE")
                 .bind(group)
@@ -1434,8 +1521,7 @@ impl Db for PostgresDb {
         attempt: &AttemptId,
         inputs: &Value,
     ) -> Result<bool, DbError> {
-        let mut tx = self.pool().begin().await.map_err(db_err)?;
-        hold_leader_term(&mut tx, leader, self.fence_stall_bound).await?;
+        let mut tx = self.begin_fenced(leader).await?;
         let stored = sqlx::query(&format!(
             "UPDATE attempts SET gate_inputs = $4
              WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3
@@ -1500,7 +1586,9 @@ impl Db for PostgresDb {
                AND (a.run_id, a.step_id, a.attempt_id) > ($3, $4, $5)
              ORDER BY a.run_id, a.step_id, a.attempt_id
              LIMIT $6",
-            running = ATTEMPT_IS_RUNNING.replace("outcome", "a.outcome").replace("failure", "a.failure"),
+            running = ATTEMPT_IS_RUNNING
+                .replace("outcome", "a.outcome")
+                .replace("failure", "a.failure"),
         ))
         .bind(org)
         .bind(releaser)
@@ -1525,6 +1613,7 @@ impl Db for PostgresDb {
 
     async fn create_run_service(
         &self,
+        leader: Option<&LeaderTerm>,
         run: &RunId,
         take: i64,
         name: &str,
@@ -1532,6 +1621,7 @@ impl Db for PostgresDb {
     ) -> Result<(), DbError> {
         // Idempotent on {run, take, name} (ADR-0058): a re-tick / crash resume
         // never provisions a second instance.
+        let mut tx = self.begin_maybe_fenced(leader).await?;
         sqlx::query(
             "INSERT INTO run_services (run_id, take, name, status, created_at, updated_at)
              VALUES ($1, $2, $3, 'starting', $4, $4)
@@ -1541,14 +1631,15 @@ impl Db for PostgresDb {
         .bind(take)
         .bind(name)
         .bind(at.0)
-        .execute(self.pool())
+        .execute(&mut *tx)
         .await
         .map_err(db_err)?;
-        Ok(())
+        tx.commit().await.map_err(db_err)
     }
 
     async fn set_run_service(
         &self,
+        leader: Option<&LeaderTerm>,
         run: &RunId,
         take: i64,
         name: &str,
@@ -1556,6 +1647,7 @@ impl Db for PostgresDb {
         handle: Option<&str>,
     ) -> Result<(), DbError> {
         // COALESCE keeps a previously-recorded handle when this update omits one.
+        let mut tx = self.begin_maybe_fenced(leader).await?;
         sqlx::query(
             "UPDATE run_services
                 SET status = $4, handle = COALESCE($5, handle),
@@ -1567,10 +1659,10 @@ impl Db for PostgresDb {
         .bind(name)
         .bind(status.as_str())
         .bind(handle)
-        .execute(self.pool())
+        .execute(&mut *tx)
         .await
         .map_err(db_err)?;
-        Ok(())
+        tx.commit().await.map_err(db_err)
     }
 
     async fn run_services(&self, run: &RunId) -> Result<Vec<RunService>, DbError> {
@@ -2144,6 +2236,7 @@ impl Db for PostgresDb {
 
     async fn commit_run_transition(
         &self,
+        leader: Option<&LeaderTerm>,
         run: &RunId,
         from: RunStatus,
         to: RunStatus,
@@ -2153,8 +2246,9 @@ impl Db for PostgresDb {
     ) -> Result<(), DbError> {
         // ONE transaction: the CAS takes the run row's lock first, so a
         // competing CAS waits and then sees the committed status (Conflict).
-        // An early return drops `tx`, which rolls everything back.
-        let mut tx = self.pool().begin().await.map_err(db_err)?;
+        // An early return drops `tx`, which rolls everything back. A leader's
+        // transition is fenced on its term in this same transaction.
+        let mut tx = self.begin_maybe_fenced(leader).await?;
         if !cas_run_status(&mut *tx, run, from, to, Some(generation)).await? {
             tx.rollback().await.map_err(db_err)?;
             return Err(DbError::Conflict);
@@ -2183,8 +2277,7 @@ impl Db for PostgresDb {
         // One transaction with the step row locked: a concurrent resolve or
         // cancel of this gate waits for the mint, or the mint sees its result.
         // An early return drops `tx`, which rolls it back.
-        let mut tx = self.pool().begin().await.map_err(db_err)?;
-        hold_leader_term(&mut tx, leader, self.fence_stall_bound).await?;
+        let mut tx = self.begin_fenced(leader).await?;
         if !lock_pending_step(&mut tx, run, step).await? {
             return Ok(None);
         }
@@ -2299,8 +2392,7 @@ impl Db for PostgresDb {
         // A release's outputs (ADR-0076 §7) are the gate's results, written
         // with the verdict so a dependent never runs without them.
         if let (true, Some(outputs)) = (res.passed, &res.outputs) {
-            let json =
-                serde_json::to_value(outputs).map_err(|e| DbError::Other(e.to_string()))?;
+            let json = serde_json::to_value(outputs).map_err(|e| DbError::Other(e.to_string()))?;
             sqlx::query(
                 "UPDATE step_runs SET results = $3, evidence_attempt = $4
                  WHERE run_id = $1 AND step_id = $2",
@@ -2816,174 +2908,110 @@ impl Db for PostgresDb {
     }
 
     async fn lease(&self, resource: &str, owner: &str, ttl_ms: i64) -> Result<Lease, DbError> {
-        // Acquire or renew, taking over only an expired lease. The holder's own
-        // re-request is a RENEWAL and must EXTEND `expires_at` (the port
-        // contract: the scheduler's leader re-leases every tick to keep
-        // leadership) — hence the `owner = EXCLUDED.owner` arm; without it a
-        // constantly-renewing leader still expired after one TTL and a peer
-        // could steal leadership at the boundary. A different owner only gets
-        // the DO UPDATE once the incumbent lease has expired, and that
-        // takeover starts a new TERM; a renewal keeps the term (git-bug
-        // aaf4e3e). RETURNING yields the winning holder; if the incumbent
-        // lease is still valid the DO UPDATE is skipped and we read back the
-        // current holder instead.
-        //
-        // ON CONFLICT DO UPDATE locks the row even when its WHERE skips the
-        // update, so this statement waits for a holder's in-flight
-        // `fenced_write` (it holds the row FOR SHARE). That wait is the fence:
-        // a takeover lands after the stale leader's write, never between its
-        // check and its commit. It is bounded by `lock_timeout` so a peer's
-        // tick never hangs behind a holder stopped mid-write; on the timeout
-        // the holder is reported unchanged and the peer tries next tick. A
-        // holder that stays stopped loses its fence after `fence_stall_bound`
-        // (see `hold_leader_term`), and the takeover then goes through.
-        let mut tx = self.pool().begin().await.map_err(db_err)?;
-        sqlx::query("SET LOCAL lock_timeout = '2s'")
-            .execute(&mut *tx)
+        // Read first, without a lock. Only the holder's renewal and the
+        // takeover of an EXPIRED lease write the row, so a follower that finds
+        // the lease live never waits on the holder's fenced transactions
+        // (they hold the row FOR SHARE, git-bug aaf4e3e): its tick is not
+        // slowed by the leader's writes. Every write below is guarded on the
+        // row it read; a lost race re-reads and reports the winner.
+        for _ in 0..3 {
+            let current = sqlx::query(
+                "SELECT owner, expires_at, term,
+                        expires_at < (extract(epoch from now()) * 1000)::bigint AS expired
+                 FROM leases WHERE resource = $1",
+            )
+            .bind(resource)
+            .fetch_optional(self.pool())
             .await
             .map_err(db_err)?;
-        let row = sqlx::query(
-            "INSERT INTO leases (resource, owner, expires_at, term)
-             VALUES ($1, $2, (extract(epoch from now()) * 1000)::bigint + $3, 1)
-             ON CONFLICT (resource) DO UPDATE
-               SET owner = EXCLUDED.owner,
-                   expires_at = EXCLUDED.expires_at,
-                   term = CASE WHEN leases.owner = EXCLUDED.owner
-                               THEN leases.term ELSE leases.term + 1 END
-               WHERE leases.owner = EXCLUDED.owner
-                  OR leases.expires_at < (extract(epoch from now()) * 1000)::bigint
-             RETURNING owner, expires_at, term",
-        )
-        .bind(resource)
-        .bind(owner)
-        .bind(ttl_ms)
-        .fetch_optional(&mut *tx)
-        .await;
-        let row = match row {
-            Ok(row) => {
-                tx.commit().await.map_err(db_err)?;
-                row
-            }
-            // lock_not_available: the holder is inside a fenced write.
-            Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("55P03") => {
-                drop(tx);
-                None
-            }
-            Err(e) => return Err(db_err(e)),
-        };
-        let r = match row {
-            Some(r) => r,
-            None => {
-                // Not acquired: a valid lease is still held by someone else.
-                // A plain read takes no row lock, so it does not wait.
-                sqlx::query("SELECT owner, expires_at, term FROM leases WHERE resource = $1")
-                    .bind(resource)
-                    .fetch_one(self.pool())
-                    .await
-                    .map_err(db_err)?
-            }
-        };
-        Ok(Lease {
-            owner: r.get::<String, _>("owner"),
-            expires_at: Timestamp(r.get::<i64, _>("expires_at")),
-            term: r.get::<i64, _>("term"),
-        })
-    }
-
-    async fn fenced_write<'a>(
-        &'a self,
-        leader: &'a LeaderTerm,
-        write: FencedWrite<'a>,
-    ) -> Result<(), DbError> {
-        // The fence transaction holds the lease row FOR SHARE while `write`
-        // runs on its own connection from the main pool and commits. A
-        // takeover's UPDATE of the row waits for this transaction (see
-        // `lease`), so the write is refused here or commits before any
-        // takeover: the same ordering as checking inside the write's own
-        // transaction, without threading a transaction through every shared
-        // Db method. No deadlock: the only statement that wants this row
-        // exclusively is `lease`, which holds no other lock, and the fence
-        // connection comes from its own pool (see `fence_pool`).
-        //
-        // Bounded stall (git-bug aaf4e3e review): a holder stopped inside the
-        // write must not keep the row locked until its connection dies — that
-        // would stop every peer from taking the lease over, where a leader
-        // stopped anywhere else loses it after the TTL. Postgres ends the
-        // fence once it has been idle for `fence_stall_bound`; a live holder
-        // pings it every third of that while `write` runs. A fence that died
-        // under a live write (the ping or the commit fails) is NotLeader. What
-        // the bound cannot undo: a holder stopped in the middle of a
-        // multi-statement write transaction on the main pool resumes after
-        // the takeover with that transaction still open, and may commit it.
-        // Its row locks were held throughout, so a peer's writes to the same
-        // rows waited for it and re-check their CAS against its result.
-        let mut tx = self.fence_pool.begin().await.map_err(db_err)?;
-        hold_leader_term(&mut tx, leader, self.fence_stall_bound).await?;
-        let ping_every = self.fence_stall_bound / 3;
-        let keepalive = async {
-            loop {
-                tokio::time::sleep(ping_every).await;
-                if sqlx::query("SELECT 1").execute(&mut *tx).await.is_err() {
-                    return;
+            let Some(current) = current else {
+                // Nobody has held it yet: the first insert wins term 1.
+                let row = sqlx::query(
+                    "INSERT INTO leases (resource, owner, expires_at, term)
+                     VALUES ($1, $2, (extract(epoch from now()) * 1000)::bigint + $3, 1)
+                     ON CONFLICT (resource) DO NOTHING
+                     RETURNING owner, expires_at, term",
+                )
+                .bind(resource)
+                .bind(owner)
+                .bind(ttl_ms)
+                .fetch_optional(self.pool())
+                .await
+                .map_err(db_err)?;
+                match row {
+                    Some(r) => return Ok(lease_of(&r)),
+                    None => continue,
                 }
+            };
+            let holder: String = current.get("owner");
+            let expired: bool = current.get("expired");
+            if holder != owner && !expired {
+                return Ok(lease_of(&current));
             }
-        };
-        let written = tokio::select! {
-            biased;
-            written = write => written,
-            // The fence died under a live write: the write is dropped at its
-            // await point and the leg ends as deposed.
-            () = keepalive => return Err(DbError::NotLeader),
-        };
-        if tx.commit().await.is_err() {
-            return Err(DbError::NotLeader);
+            // The holder's renewal (the term stays: an expired lease nobody
+            // took over is still this owner's term), or a takeover of an
+            // expired lease (the next term). The renewal of a constantly
+            // re-leasing leader must EXTEND `expires_at`, or it expires after
+            // one TTL and a peer steals leadership at the boundary.
+            //
+            // The UPDATE waits for an in-flight fenced transaction of the
+            // holder; that wait is the fence (a takeover lands after the
+            // stale leader's commit, or after Postgres rolled it back). It is
+            // bounded by TAKEOVER_WAIT: past it the holder is reported
+            // unchanged and the caller tries again next tick, by when a
+            // stopped holder's transaction has hit its own bound.
+            let mut tx = self.pool().begin().await.map_err(db_err)?;
+            sqlx::query(&format!("SET LOCAL lock_timeout = '{TAKEOVER_WAIT}'"))
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+            let row = sqlx::query(
+                "UPDATE leases
+                 SET owner = $2,
+                     expires_at = (extract(epoch from now()) * 1000)::bigint + $3,
+                     term = CASE WHEN owner = $2 THEN term ELSE term + 1 END
+                 WHERE resource = $1 AND owner = $4 AND term = $5
+                   AND (owner = $2 OR expires_at < (extract(epoch from now()) * 1000)::bigint)
+                 RETURNING owner, expires_at, term",
+            )
+            .bind(resource)
+            .bind(owner)
+            .bind(ttl_ms)
+            .bind(&holder)
+            .bind(current.get::<i64, _>("term"))
+            .fetch_optional(&mut *tx)
+            .await;
+            match row {
+                Ok(Some(r)) => {
+                    tx.commit().await.map_err(db_err)?;
+                    return Ok(lease_of(&r));
+                }
+                // The row moved since the read (a renewal or a takeover won).
+                Ok(None) => continue,
+                // lock_not_available: the holder is inside a fenced
+                // transaction. Report it as it was read.
+                Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("55P03") => {
+                    return Ok(lease_of(&current));
+                }
+                Err(e) => return Err(db_err(e)),
+            }
         }
-        written
+        // Three lost races in a row: report whoever holds it now.
+        let r = sqlx::query("SELECT owner, expires_at, term FROM leases WHERE resource = $1")
+            .bind(resource)
+            .fetch_one(self.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(lease_of(&r))
     }
 }
 
-/// The leader fence (git-bug aaf4e3e): lock `leader`'s lease row FOR SHARE
-/// inside `tx`, or refuse with [`DbError::NotLeader`] when the lease has
-/// another owner or a later term. Held until `tx` ends, so a takeover waits
-/// for everything `tx` writes.
-///
-/// `stall_bound` limits how long the lock can outlive its holder: Postgres
-/// ends `tx` once it sits idle that long (a holder stopped or cut off), which
-/// releases the row so a peer can take the lease over after its TTL, and
-/// rolls back whatever `tx` wrote. The same bound caps the wait for the share
-/// lock behind a takeover in progress; that wait ending is also NotLeader.
-async fn hold_leader_term(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    leader: &LeaderTerm,
-    stall_bound: std::time::Duration,
-) -> Result<(), DbError> {
-    let bound_ms = stall_bound.as_millis().max(1);
-    sqlx::query(&format!(
-        "SET LOCAL idle_in_transaction_session_timeout = {bound_ms}"
-    ))
-    .execute(&mut **tx)
-    .await
-    .map_err(db_err)?;
-    sqlx::query(&format!("SET LOCAL lock_timeout = {bound_ms}"))
-        .execute(&mut **tx)
-        .await
-        .map_err(db_err)?;
-    let held = sqlx::query(
-        "SELECT 1 FROM leases WHERE resource = $1 AND owner = $2 AND term = $3 FOR SHARE",
-    )
-    .bind(leader.resource())
-    .bind(leader.owner())
-    .bind(leader.term())
-    .fetch_optional(&mut **tx)
-    .await;
-    match held {
-        Ok(Some(_)) => Ok(()),
-        Ok(None) => Err(DbError::NotLeader),
-        // lock_not_available: a takeover holds the row.
-        Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("55P03") => {
-            Err(DbError::NotLeader)
-        }
-        Err(e) => Err(db_err(e)),
+/// A [`Lease`] from a `leases` row (owner, expires_at, term).
+fn lease_of(r: &sqlx::postgres::PgRow) -> Lease {
+    Lease {
+        owner: r.get::<String, _>("owner"),
+        expires_at: Timestamp(r.get::<i64, _>("expires_at")),
+        term: r.get::<i64, _>("term"),
     }
 }
 
@@ -3849,9 +3877,28 @@ async fn close_attempt_on(
 fn db_err(e: sqlx::Error) -> DbError {
     match e {
         sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed => DbError::Unavailable,
+        // A bound passed: only leader-fenced transactions set one
+        // (`PostgresDb::begin_fenced`; `lease` handles its own lock wait),
+        // and Postgres rolled the transaction back.
+        sqlx::Error::Database(d)
+            if matches!(
+                d.code().as_deref(),
+                Some(LOCK_NOT_AVAILABLE | QUERY_CANCELED | IDLE_IN_TRANSACTION_TIMEOUT)
+            ) =>
+        {
+            DbError::FenceTimeout
+        }
         other => DbError::Other(other.to_string()),
     }
 }
+
+/// SQLSTATE `lock_not_available`: a lock wait passed `lock_timeout`.
+const LOCK_NOT_AVAILABLE: &str = "55P03";
+/// SQLSTATE `query_canceled`: a statement passed `statement_timeout`.
+const QUERY_CANCELED: &str = "57014";
+/// SQLSTATE `idle_in_transaction_session_timeout`: Postgres ended a session
+/// that sat idle inside a transaction past the bound.
+const IDLE_IN_TRANSACTION_TIMEOUT: &str = "25P03";
 
 // ---------------------------------------------------------------------------
 // SessionStore (ADR-0049 C1): server-side login sessions in Postgres.

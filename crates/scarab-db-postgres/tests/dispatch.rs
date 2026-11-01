@@ -9,11 +9,27 @@ use std::sync::Arc;
 
 use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
-use scarab_engine::{Db, OutboxId, OutboxMessage, RunId, StepId, Timestamp};
+use scarab_engine::{
+    Attempt, AttemptId, AttemptOutcome, Db, DbError, OutboxId, OutboxMessage, RunId, StepId,
+    StepLaunch, StepRun, Timestamp,
+};
 use sqlx::Row;
 
-/// Many workers hammering `claim_ready_steps` in parallel each get disjoint
-/// steps: every ready step is claimed exactly once, none twice.
+/// A claimed step's launch: its next Attempt, nothing else.
+fn attempt_only(s: &StepRun) -> Result<StepLaunch, DbError> {
+    Ok(StepLaunch {
+        attempt: Attempt {
+            id: AttemptId(format!("a{}", s.attempts.len() + 1)),
+            started_at: Timestamp(0),
+            failure: None,
+            failure_detail: None,
+            outcome: AttemptOutcome::Running,
+        },
+        events: Vec::new(),
+        outbox: Vec::new(),
+    })
+}
+
 /// A scheduler leader term on `db`, for calling the leader-only Db methods
 /// directly (git-bug aaf4e3e).
 async fn lead(db: &dyn Db) -> scarab_engine::LeaderTerm {
@@ -24,6 +40,8 @@ async fn lead(db: &dyn Db) -> scarab_engine::LeaderTerm {
         .expect("the test holds the scheduler lease")
 }
 
+/// Many workers hammering `claim_ready_steps` in parallel each get disjoint
+/// steps: every ready step is claimed exactly once, none twice.
 #[tokio::test]
 async fn concurrent_claim_yields_no_double_dispatch() {
     let Some(tdb) = fresh_db().await else {
@@ -58,7 +76,10 @@ async fn concurrent_claim_yields_no_double_dispatch() {
         handles.push(tokio::spawn(async move {
             let mut mine = Vec::new();
             loop {
-                let batch = db.claim_ready_steps(&leader, 3).await.unwrap();
+                let batch = db
+                    .claim_ready_steps(&leader, 3, &attempt_only)
+                    .await
+                    .unwrap();
                 if batch.is_empty() {
                     break;
                 }

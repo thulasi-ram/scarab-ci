@@ -87,13 +87,20 @@ impl Clock for FakeClock {
 
 /// The in-memory leader fence (git-bug aaf4e3e): `leader` still holds its
 /// lease term, or [`DbError::NotLeader`]. Called with the state lock held, so
-/// the check and the write after it are one step, like the postgres
-/// transaction.
+/// the check and the write after it are one step, as the postgres fenced
+/// transaction is, and a takeover (`lease`, under the same lock) is ordered
+/// before or after it, never between. There are no lock waits here, so a
+/// fenced write never times out ([`DbError::FenceTimeout`] is postgres-only).
 fn holds_leader_term(st: &InMemoryState, leader: &LeaderTerm) -> Result<(), DbError> {
     match st.leases.get(leader.resource()) {
         Some((owner, _, term)) if owner == leader.owner() && *term == leader.term() => Ok(()),
         _ => Err(DbError::NotLeader),
     }
+}
+
+/// [`holds_leader_term`] when the write is a leader's; a no-op otherwise.
+fn holds_leader_term_if(st: &InMemoryState, leader: Option<&LeaderTerm>) -> Result<(), DbError> {
+    leader.map_or(Ok(()), |l| holds_leader_term(st, l))
 }
 
 // ---------------------------------------------------------------------------
@@ -311,11 +318,6 @@ struct InMemoryState {
 /// fake for driving the pure engine.
 pub struct InMemoryDb {
     state: Mutex<InMemoryState>,
-    /// The leader fence's row lock (git-bug aaf4e3e), mirroring postgres
-    /// `FOR SHARE` on the lease row: a `fenced_write` holds it shared across
-    /// its write, and a lease takeover needs it exclusively — or, like the
-    /// postgres `lock_timeout`, gives up and reports the holder unchanged.
-    fence_gate: tokio::sync::RwLock<()>,
     /// A one-shot hook the next call of the named method awaits before it
     /// does anything — see [`interleave_before_next`](Self::interleave_before_next).
     /// Kept outside `state` so the hook can call back into this store.
@@ -330,7 +332,6 @@ impl InMemoryDb {
     pub fn new() -> Self {
         Self {
             state: Mutex::new(InMemoryState::default()),
-            fence_gate: tokio::sync::RwLock::new(()),
             interleave: Mutex::new(None),
         }
     }
@@ -709,10 +710,13 @@ impl Db for InMemoryDb {
         &self,
         leader: &LeaderTerm,
         limit: u32,
+        mint: scarab_engine::ports::MintLaunch<'_>,
     ) -> Result<Vec<StepRun>, DbError> {
+        // One lock = the postgres fenced transaction: the fence, the claim and
+        // every claimed step's launch (git-bug 0f29112). Every launch is built
+        // and checked before the first mutation, so a failure claims nothing.
         let mut st = self.state.lock().unwrap();
         holds_leader_term(&st, leader)?;
-        let mut claimed = Vec::new();
         // Deterministic order for tests.
         let mut keys: Vec<(RunId, StepId)> = st
             .steps
@@ -723,19 +727,38 @@ impl Db for InMemoryDb {
         keys.sort_by(|a, b| {
             (a.0 .0.as_str(), a.1 .0.as_str()).cmp(&(b.0 .0.as_str(), b.1 .0.as_str()))
         });
+        let mut claimed = Vec::new();
+        let mut launches = Vec::new();
         for key in keys.into_iter().take(limit as usize) {
-            let rec = st.steps.get_mut(&key).unwrap();
-            rec.status = Some(StepStatus::Running);
+            let rec = &st.steps[&key];
             let mut attempts = rec.attempts.clone();
             attempts.sort_by_key(attempt_order_key);
-            claimed.push(StepRun {
+            let step = StepRun {
                 run: key.0.clone(),
                 step: key.1.clone(),
                 status: StepStatus::Running,
                 attempts,
                 needs: rec.needs.clone(),
                 gate_kind: rec.gate_kind.clone(),
-            });
+            };
+            launches.push(mint(&step)?);
+            claimed.push(step);
+        }
+        let events: Vec<EventKind> = launches.iter().flat_map(|l| l.events.clone()).collect();
+        take_event_append_failure(&mut st, &events)?;
+        for (step, launch) in claimed.iter().zip(launches) {
+            let rec = st
+                .steps
+                .get_mut(&(step.run.clone(), step.step.clone()))
+                .expect("read above");
+            rec.status = Some(StepStatus::Running);
+            if !rec.attempts.iter().any(|a| a.id == launch.attempt.id) {
+                rec.attempts.push(launch.attempt);
+            }
+            st.events.extend(launch.events);
+            for msg in &launch.outbox {
+                enqueue_outbox_locked(&mut st, msg);
+            }
         }
         Ok(claimed)
     }
@@ -1056,6 +1079,29 @@ impl Db for InMemoryDb {
         if let Some(rec) = st.steps.get_mut(&(run.clone(), step.clone())) {
             rec.input = signature.map(|s| s.to_string());
         }
+        Ok(())
+    }
+
+    async fn promote_step(
+        &self,
+        leader: &LeaderTerm,
+        run: &RunId,
+        step: &StepId,
+        signature: &str,
+        events: &[EventKind],
+    ) -> Result<(), DbError> {
+        // One lock = the postgres fenced transaction.
+        let mut st = self.state.lock().unwrap();
+        holds_leader_term(&st, leader)?;
+        check_step_transition_locked(&mut st, run, step, StepStatus::Pending)?;
+        take_event_append_failure(&mut st, events)?;
+        let rec = st
+            .steps
+            .get_mut(&(run.clone(), step.clone()))
+            .expect("checked above");
+        rec.status = Some(StepStatus::Ready);
+        rec.input = Some(signature.to_string());
+        st.events.extend(events.iter().cloned());
         Ok(())
     }
 
@@ -1533,16 +1579,16 @@ impl Db for InMemoryDb {
 
     async fn create_run_service(
         &self,
+        leader: Option<&LeaderTerm>,
         run: &RunId,
         take: i64,
         name: &str,
         at: Timestamp,
     ) -> Result<(), DbError> {
         // Idempotent on {run, take, name}: an existing row is left untouched.
-        self.state
-            .lock()
-            .unwrap()
-            .run_services
+        let mut st = self.state.lock().unwrap();
+        holds_leader_term_if(&st, leader)?;
+        st.run_services
             .entry((run.clone(), take, name.to_string()))
             .or_insert((ServiceStatus::Starting, None, at));
         Ok(())
@@ -1550,6 +1596,7 @@ impl Db for InMemoryDb {
 
     async fn set_run_service(
         &self,
+        leader: Option<&LeaderTerm>,
         run: &RunId,
         take: i64,
         name: &str,
@@ -1557,6 +1604,7 @@ impl Db for InMemoryDb {
         handle: Option<&str>,
     ) -> Result<(), DbError> {
         let mut st = self.state.lock().unwrap();
+        holds_leader_term_if(&st, leader)?;
         if let Some(rec) = st
             .run_services
             .get_mut(&(run.clone(), take, name.to_string()))
@@ -2046,6 +2094,7 @@ impl Db for InMemoryDb {
 
     async fn commit_run_transition(
         &self,
+        leader: Option<&LeaderTerm>,
         run: &RunId,
         from: RunStatus,
         to: RunStatus,
@@ -2054,8 +2103,9 @@ impl Db for InMemoryDb {
         outbox: &[OutboxMessage],
     ) -> Result<(), DbError> {
         // One lock = the Postgres transaction: every check (including the
-        // crash injector) runs before the first mutation.
+        // leader fence and the crash injector) runs before the first mutation.
         let mut st = self.state.lock().unwrap();
+        holds_leader_term_if(&st, leader)?;
         let current = st.runs.get(run).copied().unwrap_or(RunStatus::Pending);
         // The Postgres CAS's generation guard: a run reopened since the
         // caller read `generation` is a miss, never an ABA hit.
@@ -2528,10 +2578,8 @@ impl Db for InMemoryDb {
         // and keeps its term; a peer only takes over an EXPIRED lease, and the
         // takeover starts the next term (git-bug aaf4e3e). Wall-clock via
         // Instant — a process-local fake needs no injected clock for expiry.
-        // A takeover needs the fence gate exclusively: while a holder's
-        // `fenced_write` runs it is refused and the holder reported, as the
-        // postgres `lock_timeout` does.
-        let gate = self.fence_gate.try_write();
+        // Under the state lock, so a takeover is ordered before or after any
+        // fenced write, never inside one.
         let mut st = self.state.lock().unwrap();
         let now = std::time::Instant::now();
         let ttl = std::time::Duration::from_millis(ttl_ms.max(0) as u64);
@@ -2539,7 +2587,7 @@ impl Db for InMemoryDb {
         let (holder, term) = match current {
             None => (owner.to_string(), 1),
             Some((holder, _, term)) if holder == owner => (holder, term),
-            Some((holder, expires, term)) if now < expires || gate.is_err() => {
+            Some((holder, expires, term)) if now < expires => {
                 return Ok(Lease {
                     owner: holder,
                     expires_at: Timestamp(ttl_ms),
@@ -2555,16 +2603,6 @@ impl Db for InMemoryDb {
             expires_at: Timestamp(ttl_ms),
             term,
         })
-    }
-
-    async fn fenced_write<'a>(
-        &'a self,
-        leader: &'a LeaderTerm,
-        write: scarab_engine::ports::FencedWrite<'a>,
-    ) -> Result<(), DbError> {
-        let _shared = self.fence_gate.read().await;
-        holds_leader_term(&self.state.lock().unwrap(), leader)?;
-        write.await
     }
 }
 
@@ -2881,7 +2919,11 @@ impl FakeExecutor {
     /// Whether `handle`'s unit still holds a forge credential: launched with
     /// one, and not yet taken by `take_forge_credential`.
     pub fn holds_forge_credential(&self, handle: &ExecHandle) -> bool {
-        self.inner.lock().unwrap().forge_credentials.contains_key(&handle.0)
+        self.inner
+            .lock()
+            .unwrap()
+            .forge_credentials
+            .contains_key(&handle.0)
     }
 
     pub fn launched_spec(&self, handle: &ExecHandle) -> Option<StepSpec> {
@@ -3125,7 +3167,12 @@ impl Executor for FakeExecutor {
         &self,
         handle: &ExecHandle,
     ) -> Result<Option<scarab_engine::MountedForgeCredential>, ExecError> {
-        Ok(self.inner.lock().unwrap().forge_credentials.remove(&handle.0))
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .forge_credentials
+            .remove(&handle.0))
     }
 
     async fn infra_condition(

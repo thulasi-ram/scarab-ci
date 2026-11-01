@@ -17,14 +17,13 @@
 //!
 //! Everything below is a compiling skeleton — method bodies are stubs.
 
-pub mod leader;
 pub mod ports;
 pub mod render;
 pub mod scheduler;
 
 pub use ports::{
-    Clock, Db, Executor, LeaderTerm, LogChunks, SnapshotRetention, WorkspaceSnapshots,
-    SCHEDULER_LEASE,
+    Clock, Db, Executor, LeaderTerm, LogChunks, SnapshotRetention, StepLaunch,
+    WorkspaceSnapshots, LEADER_TX_BOUND_MS, SCHEDULER_LEASE,
 };
 pub use scheduler::{
     cancel_run_request, fail_run_creation, gate_approvers, pin_run_snapshots, plan_rerun,
@@ -1387,6 +1386,14 @@ pub enum DbError {
     /// leader leg quietly; it is never counted toward a dead-letter.
     #[error("not the leader: the lease moved to another owner or a later term")]
     NotLeader,
+    /// A leader-fenced transaction hit its time bound
+    /// ([`LEADER_TX_BOUND_MS`]: a lock wait, a statement, or idle time
+    /// inside it) and rolled back; nothing was written (git-bug aaf4e3e).
+    /// Not a fault of the run — a row lock held elsewhere, a slow database —
+    /// so the scheduler defers that leader leg to the next tick: no failure
+    /// streak starts or ends on it, and nothing dead-letters on it.
+    #[error("a leader transaction hit its time bound and rolled back")]
+    FenceTimeout,
     #[error("db error: {0}")]
     Other(String),
 }
