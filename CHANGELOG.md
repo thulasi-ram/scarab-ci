@@ -71,7 +71,13 @@ record. Read Upgrading before you upgrade.
   Depot on `SCARAB_WORKSPACE_URL`, which it already did when the variable was unset.
 - **At `workspace.replicaCount` above 1,** the chart renders one Service per Depot replica
   (`<fullname>-workspace-<ordinal>`), and Caches saved before the upgrade miss once: each
-  Cache now has a home replica.
+  Cache now has a home replica. Change the replica count with `workspace.replicaCount` and an
+  upgrade, not `kubectl scale`: the server reads the count from `SCARAB_WORKSPACE_REPLICAS`,
+  which the chart copies from that value.
+- **Upgrade the Data Depot before the server, or accept a short window.** During a rolling
+  upgrade an older Depot refuses a newer server's workspace token when the token carries cache
+  roots, so a Step with a Cache restore can fail with a Transient error until both are
+  upgraded.
 
 ### New
 
@@ -108,13 +114,13 @@ record. Read Upgrading before you upgrade.
   branch named with `;` refuses only the Pipelines that read `event.branch`.
   [Trigger values](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#trigger-values-event)
 - **More than one server replica.** `replicaCount` above 1 is supported, with converged or
-  split roles. A replica renews its claim on a Step's launch while it works on it, so two
-  replicas no longer drive one Pod's workspace drain at once (git-bug 068cc0b); when a
-  replica dies, a peer takes over its Steps within 30 s. The scheduler lease has a term that
-  every takeover increments; each leader-only write checks it in its own transaction, so a
-  leader paused past its 30 s lease writes nothing once a peer has taken over (git-bug
-  aaf4e3e). Tested against Postgres (`replica_claims.rs`, `leader_term.rs`); the fault tier
-  adds scenarios that kill a server replica and pause the leader on a local kind cluster.
+  split roles. A replica renews its claim on a Step's launch every 10 s while it works on it,
+  and a replica stops driving a launch within one renewal period after it loses its claim
+  (git-bug 068cc0b); when a replica dies, a peer takes over its Steps within 30 s. The
+  scheduler lease has a term that every takeover increments, and the leader's writes are
+  fenced on it (git-bug aaf4e3e). Tested against Postgres, and on a local kind cluster the
+  fault tier's `two-replicas`, `kill-server` and `stop-leader` scenarios passed
+  (`just test chaos all 1`, 2026-11-01).
   [ADR-0077 amendment](https://thulasi-ram.github.io/scarab-ci/tech/adr/0077-end-to-end-fault-and-agent-driven-testing/#amendment-2026-11-01-grill)
 - **Caches at more than one Depot replica.** Each Cache key has one home Depot replica, chosen
   by rendezvous hashing over the StatefulSet's ordinals, and a Step saves and restores the
@@ -142,7 +148,8 @@ record. Read Upgrading before you upgrade.
   500.
 - At more than one Depot replica, a Step whose token named a Cache another replica held got a
   500 on its required inputs. A cache root a replica cannot walk is now left out of the grant
-  (git-bug 2a79b73).
+  (git-bug 2a79b73), and a later refused read of that token is answered without walking its
+  inputs again.
 
 ### Development
 
@@ -151,13 +158,33 @@ record. Read Upgrading before you upgrade.
   `deploy/local-helm`, `deploy/local-proc` and the colima k3s setup are gone. The chart gains
   `command`, `args`, `extraVolumes` and `extraVolumeMounts` for the server and the workspace
   container, and `service.nodePort`, which the kind stack uses.
-- The Justfile is split into modules: `just stack …`, `just test …` and `just check …`.
-  `just e2e` is `just test e2e`, `just chaos` is `just test chaos`, and `just up` is
-  `just stack up`; `just forgejo-verify`, `just kube-tests` and `just plugin-kube-tests` are
-  folded into `just test e2e`. `just release <version>` checks a release before it is tagged.
+- The Justfile is split into modules, `just stack …`, `just test …` and `just check …`, and
+  needs just 1.43.0 or later. Renamed recipes:
+  - `just up`, `down`, `reload`, `logs`, `demo` and `demo-chain` are `just stack up`,
+    `stack down`, `stack reload`, `stack logs`, `stack demo` and `stack demo chain`;
+    `just demo-oracle` is `just stack up demo-oracle`.
+  - `just workspace-logs` is `just stack logs depot`; `just workspace-status` is
+    `just stack status`.
+  - `just test-one <filter>` is `just test rust <filter>`; `just test` runs the Rust suite and
+    then the UI no-DOM suite.
+  - `just e2e` is `just test e2e`, and `just plugin-verify`, `just plugin-kube-tests`,
+    `just forgejo-verify` and `just kube-tests` are folded into it.
+  - `just chaos` is `just test chaos`; `just coverage` is `just test coverage`.
+  - `just ui-mock` is `just ui mock`; `just ui-test` and `just ui-e2e` are `just test ui`.
+  - `just docs-build` is `just docs build`.
+  - `just pr-gate <n>` is `just pr <n>`; `just sweep` and `just disk` are `just clean`.
+  - `just openapi-drift` and `just chart-immutable` run in `just check all`;
+    `just policy-conformance` is `just check conformance`.
+  - The overlay recipes (`just adr0062-substrate`, `just overlay-tests`,
+    `just overlay-tests-colima`) are deleted.
+
+  `just release <version>` checks a release before it is tagged.
 - The fault tier (`just test chaos`, ADR-0077) runs ranks 1, 2 and 4: a Depot Pod deleted
   mid-drain and mid-feed, two server replicas sharing the work, a server replica killed while
-  it drains, and the scheduler leader paused past its lease.
+  it drains, and the scheduler leader paused past its lease. All five passed on 2026-11-01
+  (`just test chaos all 1`). `pause-node` (run by name, not in `all`) pauses the kind node
+  past the sidecar reporting ceiling. C1 checks that a Cache restores from its home replica
+  when no fault hit that replica.
 - The ADR-0062 overlay change-set code, its tests and its recipes are deleted; ADR-0066 had
   already dropped the feature.
 
