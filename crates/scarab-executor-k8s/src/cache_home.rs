@@ -19,9 +19,9 @@
 /// of one replica, with `{ordinal}` standing for its StatefulSet ordinal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CacheHome {
-    /// The Depot StatefulSet's replica count. At 1 there is no home to
-    /// choose: [`CacheHome::url_for`] answers `None` and the Pod keeps the
-    /// service URL for caches, exactly as before homes existed.
+    /// The Depot StatefulSet's replica count, above 1. At 1 there is no
+    /// home to choose: [`CacheHome::new`] answers `None` and the Pod keeps
+    /// the service URL for caches, as before homes existed.
     pub replicas: u32,
     /// The URL of one replica, e.g.
     /// `http://scarab-workspace-{ordinal}.scarab.svc`. Must contain
@@ -48,11 +48,9 @@ impl CacheHome {
         })
     }
 
-    /// The home replica's URL for `cache_key`.
+    /// The home replica's URL for `cache_key`. A `CacheHome` exists only
+    /// above one replica ([`CacheHome::new`]), so there is always a home.
     pub fn url_for(&self, cache_key: &str) -> Option<String> {
-        if self.replicas <= 1 {
-            return None;
-        }
         let ordinal = home_ordinal(cache_key, self.replicas);
         Some(
             self.url_template
