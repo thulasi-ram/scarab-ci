@@ -9,11 +9,11 @@ default:
     cargo check --workspace
 
 # What CI checks besides the test suites: `cargo check`, then the contract gate
-# (the CI `openapi-drift` job) and the chart guard (a step of the CI `chart`
-# job), in that order; the first failure stops it. The chart guard needs
-# helm + yq v4.
-[doc('cargo check, then the openapi-drift and chart-immutable gates CI runs')]
-all: default _openapi-drift _chart-immutable
+# (the CI `openapi-drift` job), the chart guard (a step of the CI `chart`
+# job) and the chart render check, in that order; the first failure stops it.
+# The chart recipes need helm + yq v4.
+[doc('cargo check, then the openapi-drift, chart-immutable and chart-render gates')]
+all: default _openapi-drift _chart-immutable _chart-render
 
 # Contract gate (mirrors the CI `openapi-drift` job, ADR-0054): regenerate the
 # OpenAPI spec and the generated TS client, then fail if either differs from
@@ -47,6 +47,14 @@ _openapi-drift:
 [private]
 _chart-immutable:
     scripts/chart_statefulset_immutable.sh deploy/helm/scarab
+
+# Chart render check: under login-on values, scarab.uiUrl reaches the ConfigMap
+# as SCARAB_UI_URL, and each scarab.oauth.providers client secret reaches both
+# the server Deployment and the Depot StatefulSet (whose config gate refuses
+# the boot without them). Needs helm + yq v4.
+[private]
+_chart-render:
+    scripts/chart_render_check.sh deploy/helm/scarab
 
 # The CEL policy checker (ADR-0075) against the cel-spec conformance cases inside
 # its subset. cel-rust's conformance/tests/gen embeds cel-spec's cases, so this

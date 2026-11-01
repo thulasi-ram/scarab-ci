@@ -192,6 +192,8 @@ Every key in this table exists in `values.yaml`:
 | `scarab.role` | `converged` | `api` / `scheduler` / `executor` / `webhook` / `converged` |
 | `scarab.executor` | `k8s` | `k8s` (prod) or `local` (dev only) |
 | `scarab.namespace` | release ns | namespace step Pods launch into (RBAC granted there) |
+| `scarab.publicUrl` | `http://localhost:8080` | where forges reach Scarab: webhook URLs and the run link in commit statuses |
+| `scarab.uiUrl` | `scarab.publicUrl` | where people open the web UI, when that differs from `publicUrl`; see [The UI URL](#the-ui-url) |
 | `scarab.s3.*` | — | object store; set `bucket` to enable S3/MinIO |
 | `secrets.*` / `secrets.existingSecret` | — | sensitive `SCARAB_*` env (DB URL, S3 keys, master key, webhook secrets) |
 | `secrets.githubAppPemSecret.name` / `.key` | — / `github-app.pem` | mount the GitHub App private key from your own Secret |
@@ -281,6 +283,28 @@ ingress:
 
 Every key above exists in the chart's `values.yaml`; see it (and `README.md`) for the full
 reference.
+
+### The UI URL
+
+`scarab.uiUrl` (`SCARAB_UI_URL`) is the address people open the web UI at. Leave it empty when
+that is `scarab.publicUrl`. Set it when forges and people reach Scarab at different addresses,
+for example a staging install whose public hostname routes only `/webhooks/` while people use
+`http://localhost:8080` through a port-forward. Three things use it:
+
+- the login callback, `{uiUrl}/v1/auth/callback`, which is the callback URL to register with the
+  login provider;
+- the passkey origin: a passkey works only on that origin, and one enrolled on another address
+  does not work here;
+- the confirmation link a step-up request answers with.
+
+Webhook URLs and the run links in commit statuses stay on `scarab.publicUrl`. The server refuses
+to boot when `uiUrl` is not an `http` or `https` URL, has a query or fragment, or, with step-up
+on, is plain `http` on a host other than `localhost`, `127.0.0.1` or `::1`. Browsers refuse
+passkeys on an IP address, so a local `uiUrl` is `http://localhost:<port>`. A sign-in started
+on `127.0.0.1` is sent to the `localhost` address first, so the sign-in keeps its cookie.
+
+Session cookies are marked `Secure`. Chrome and Firefox accept them on `http://localhost`;
+Safari may not, so sign in to a plain-`http` local install with Chrome or Firefox.
 
 ## The chart on a local kind cluster
 
