@@ -144,9 +144,12 @@
 
 /* ── Mono palette, light ───────────────────────────────────────────────────
    Greys for surfaces, text, lines and the accent. The status colours stay
-   hues, a little less saturated: success green, running blue-teal (pushed
-   bluer than Emerald's so it does not read as success once the accent is no
-   longer green), in-flight yellow, failure red, caution amber. */
+   hues at about two thirds of Emerald's chroma: success green, running
+   blue-teal (pushed bluer than Emerald's so it does not read as success once
+   the accent is no longer green), in-flight yellow, failure red, caution
+   amber. Each status colour is text on the page and the cards (4.5:1 or
+   more), a pill under --badge-ink (4.5:1) and a fill on the DAG canvas
+   (3:1); --run is a fill on the cards (3:1) and text on the terminal. */
 [data-palette="mono"] {
   --carapace-black: #f4f4f4;
   --pine-deep: #ebebeb;
@@ -179,15 +182,15 @@
   --border-soft: #ebebeb;
   --dot: rgba(0, 0, 0, 0.05);
 
-  --ok: #2e8a60;
-  --running: #2b7d8f;
-  --run: #d6a514;
-  --danger: #bf4840;
+  --ok: #44795b;
+  --running: #3e7588;
+  --run: #a59145;
+  --danger: #a45951;
   --badge-ink: #f7f7f7;
-  --warn: #8c6520;
-  --border-warn: rgba(140, 101, 32, 0.5);
-  --ok-ink: #24774f;
-  --running-ink: #236d7d;
+  --warn: #8b683c;
+  --border-warn: rgba(139, 104, 60, 0.5);
+  --ok-ink: #396e51;
+  --running-ink: #336a7d;
 }
 
 /* ── Mono palette, dark ────────────────────────────────────────────────────
@@ -225,15 +228,15 @@
   --border-soft: #262626;
   --dot: rgba(255, 255, 255, 0.05);
 
-  --ok: #4aa57c;
-  --running: #4a9db0;
-  --run: #e3c043;
-  --danger: #cf5f57;
+  --ok: #639a7a;
+  --running: #5e96a9;
+  --run: #c9b468;
+  --danger: #c77970;
   --badge-ink: #0d0d0d;
-  --warn: #c6974e;
-  --border-warn: rgba(198, 151, 78, 0.42);
-  --ok-ink: #5cb68c;
-  --running-ink: #5aabbe;
+  --warn: #ac885b;
+  --border-warn: rgba(172, 136, 91, 0.42);
+  --ok-ink: #74ab8b;
+  --running-ink: #6fa7ba;
 }
 
 * {
@@ -1352,7 +1355,7 @@ select.input {
 .sdot.running {
   background: var(--running);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--running) 22%, transparent),
-    0 0 0 4px var(--border-copper);
+    0 0 0 4px var(--border-warn);
 }
 .sdot.pending,
 .sdot.ready,
@@ -2092,7 +2095,7 @@ select.input {
   padding: 20px 22px; border: 1px solid var(--border); border-radius: var(--radius-lg);
   background: var(--emerald-surface);
 }
-.allclear .ac-ico { color: var(--emerald); flex: none; }
+.allclear .ac-ico { color: var(--ok-ink); flex: none; }
 
 /* State-moment beetle: an idle/failed pose stands in for an empty list.
    The caption sits DIRECTLY under the art — it reads as the beetle's own line,
@@ -3012,7 +3015,7 @@ h1, .crumb-head, .run-title {
 }
 .vdrop-live .dot {
   width: 6px; height: 6px; border-radius: 50%; background: var(--running);
-  box-shadow: 0 0 0 1px var(--border-copper); animation: pulse 1.4s ease-in-out infinite;
+  box-shadow: 0 0 0 1px var(--border-warn); animation: pulse 1.4s ease-in-out infinite;
 }
 
 /* Backdrop: a transparent full-viewport click-catcher beneath the open menu. */
@@ -3066,7 +3069,7 @@ h1, .crumb-head, .run-title {
 .vr-chip.ok { color: var(--ok); }
 .vr-chip.danger { color: var(--danger); }
 .vr-chip.running { color: var(--running); }
-.vr-chip.copper { color: var(--copper); }
+.vr-chip.copper { color: var(--warn); }
 .vr-chip.sage,
 .vr-chip.other { color: var(--muted-sage); }
 
@@ -3443,7 +3446,7 @@ h1, .crumb-head, .run-title {
 /* ---- Plugins (ADR-0072) ---- */
 /* Same block rhythm again; a plugin row adds a runtime line, the kill state,
    and an expandable list of its connections. */
-.plg-enabled { color: var(--emerald); }
+.plg-enabled { color: var(--ok-ink); }
 .plg-killed { color: var(--danger); }
 /* Libraries (ADR-0076): a fetched version's content or diff. */
 .lib-diff {
@@ -3599,7 +3602,7 @@ h1, .crumb-head, .run-title {
 /* ── ADR-0076: libraries, invocation boxes, origin, plugin gates, compile
    errors, refused runs. From the reviewed mock (adr-0076-ui-mock). ── */
 /* --- Libraries: proposed badges --- */
-.lib-trust { color: var(--emerald); }
+.lib-trust { color: var(--ok-ink); }
 .lib-upd { color: var(--sage); }
 .lib-sec { color: var(--danger); }
 .lib-badges { display: inline-flex; gap: 6px; flex-wrap: wrap; align-items: center; }
