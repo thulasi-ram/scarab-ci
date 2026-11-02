@@ -141,10 +141,10 @@ export function scopeLabel(t: { org: string; project?: string | null }): string 
 }
 
 /** The orgs a person may be offered when minting a token for themselves:
- * those they administer and those any visible project sits in, each once,
- * sorted. The server still decides whether they hold a role there. */
-export function mintableOrgs(adminOrgs: readonly string[], projectOrgs: readonly string[]): string[] {
-  return [...new Set([...adminOrgs, ...projectOrgs])].filter((o) => o !== "").sort();
+ * those `/v1/me` lists in `token_mint_orgs` (where they hold a role), each
+ * once, sorted. The server still checks the role in the exact scope. */
+export function mintableOrgs(tokenMintOrgs: readonly string[]): string[] {
+  return [...new Set(tokenMintOrgs)].filter((o) => o !== "").sort();
 }
 
 /** The orders the org's token list offers, in the server's `sort` values. */

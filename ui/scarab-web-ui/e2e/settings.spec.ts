@@ -256,9 +256,13 @@ test("a token minted under Your account shows in the org's list", async ({ page 
   await expect(row.getByText("a.kim", { exact: true })).toBeVisible();
   await expect(page_.getByRole("button", { name: "New token" })).toHaveCount(0);
 
-  // Sorting by calls puts the busiest token first.
+  // By last use the project token is second; by calls the status poller,
+  // which is used less recently but more often, takes its place.
+  const second = page_.getByRole("row").nth(2);
+  await expect(second).toContainText("orders-api deploy gate");
   await page_.getByRole("button", { name: "Calls", exact: true }).click();
-  await expect(page_.getByRole("row").nth(1)).toContainText("release-bot");
+  await expect(second).toContainText("status poller");
+  await expect(page_.getByRole("row").nth(3)).toContainText("orders-api deploy gate");
 
   // Revoking asks for the token's name typed exactly.
   await row.getByRole("button", { name: "Revoke", exact: true }).click();

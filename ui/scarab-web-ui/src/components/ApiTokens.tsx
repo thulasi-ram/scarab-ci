@@ -15,7 +15,17 @@
 // that ceiling and whatever the owner holds at that moment, so demoting the
 // owner demotes their tokens at once. Every place a role appears here says
 // "up to" for that reason.
-import { createResource, createSignal, For, onCleanup, onMount, Show, type JSX } from "solid-js";
+import {
+  createResource,
+  createSignal,
+  For,
+  Match,
+  onCleanup,
+  onMount,
+  Show,
+  Switch,
+  type JSX,
+} from "solid-js";
 import { A } from "@solidjs/router";
 import {
   getMe,
@@ -386,8 +396,9 @@ export function OrgApiTokens(props: { org: string }) {
             <small>
               <Icon icon="clock" size={12} /> Last use and calls are written back at most once a
               minute per token, so both can lag by a minute. An org policy that decides who may
-              issue tokens, with which scopes and lifetimes, is not available yet: today any
-              member may issue a token up to their own role, for up to {MAX_TOKEN_DAYS} days.
+              issue tokens, with which scopes and lifetimes, is not available yet: today anyone
+              with a role in an org or project, viewers included, may issue a token there up to
+              that role, for up to {MAX_TOKEN_DAYS} days.
             </small>
           </p>
         </Show>
@@ -468,15 +479,17 @@ function MintTokenDialog(props: { onClose: () => void; onMinted: () => void }) {
     onCleanup(() => document.removeEventListener("keydown", onKey));
   });
 
-  // The orgs and projects you can see, so the scope picker offers real ones.
-  // A failure here is not fatal: the org can still be typed.
+  // The orgs where you hold a role (the server's list) and the projects you
+  // can see, so the scope picker offers only orgs a mint can succeed in. A
+  // failure here is not fatal: the org can still be typed.
   const [scopes] = createResource(async () => {
     const [me, projects] = await Promise.all([
       getMe().catch(() => null),
       listProjects().catch(() => []),
     ]);
-    const orgs = mintableOrgs(me?.admin_orgs ?? [], projects.map((p) => p.org));
-    if (org() === "" && orgs.length > 0) setOrg(orgs[0]!);
+    // No list (the call failed, or a server from before the field): type it.
+    const orgs = me?.token_mint_orgs ? mintableOrgs(me.token_mint_orgs) : null;
+    if (org() === "" && orgs && orgs.length > 0) setOrg(orgs[0]!);
     return { orgs, projects };
   });
   const orgProjects = () =>
@@ -550,8 +563,7 @@ function MintTokenDialog(props: { onClose: () => void; onMinted: () => void }) {
               </FormSection>
 
               <FormSection n={2} title="Scope">
-                <Show
-                  when={(scopes()?.orgs.length ?? 0) > 0}
+                <Switch
                   fallback={
                     <input
                       class="input mono"
@@ -562,18 +574,26 @@ function MintTokenDialog(props: { onClose: () => void; onMinted: () => void }) {
                     />
                   }
                 >
-                  <select
-                    class="input mono"
-                    aria-label="organization"
-                    value={org()}
-                    onChange={(e) => {
-                      setOrg(e.currentTarget.value);
-                      setProject("");
-                    }}
-                  >
-                    <For each={scopes()?.orgs ?? []}>{(o) => <option value={o}>{o}</option>}</For>
-                  </select>
-                </Show>
+                  <Match when={scopes()?.orgs?.length === 0}>
+                    <p class="fieldnote" role="status">
+                      You hold no role in any organization, so there is nowhere to mint a token
+                      yet. An org admin can grant you one.
+                    </p>
+                  </Match>
+                  <Match when={(scopes()?.orgs?.length ?? 0) > 0}>
+                    <select
+                      class="input mono"
+                      aria-label="organization"
+                      value={org()}
+                      onChange={(e) => {
+                        setOrg(e.currentTarget.value);
+                        setProject("");
+                      }}
+                    >
+                      <For each={scopes()?.orgs ?? []}>{(o) => <option value={o}>{o}</option>}</For>
+                    </select>
+                  </Match>
+                </Switch>
                 <select
                   class="input mono"
                   aria-label="scope"

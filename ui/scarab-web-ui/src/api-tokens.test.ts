@@ -147,10 +147,10 @@ describe("scopeLabel", () => {
 });
 
 describe("mintableOrgs", () => {
-  it("offers each org once, administered or seen through a project, sorted", () => {
-    expect(mintableOrgs(["acme"], ["globex", "acme", ""])).toEqual(["acme", "globex"]);
+  it("offers each org the server lists once, sorted", () => {
+    expect(mintableOrgs(["globex", "acme", "", "acme"])).toEqual(["acme", "globex"]);
   });
-  it("offers nothing when the person is in no org", () => {
-    expect(mintableOrgs([], [])).toEqual([]);
+  it("offers nothing when the person holds no role anywhere", () => {
+    expect(mintableOrgs([])).toEqual([]);
   });
 });

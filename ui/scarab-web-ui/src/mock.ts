@@ -59,6 +59,7 @@ const me = {
   can_administer: true,
   global_admin: true,
   admin_orgs: ["acme"],
+  token_mint_orgs: ["acme"],
   // Signed in two ways (ADR-0069): the legacy GitHub provider and Okta.
   identities: [
     { provider: "default", handle: "a-kim" },
@@ -1006,7 +1007,9 @@ const secretMatrix = {
 // Four records covering every state the panels render differently: a live token
 // in daily use, one narrowed to a single project and held by someone else, one
 // inside the two-week expiry warning, and a revoked one (a killed credential
-// stays visible). No plaintext anywhere: the mint 201 below is the only place
+// stays visible). Last use and calls order the live ones differently (the
+// project token is second by last use, the status poller second by calls), so
+// the org list's sort can be seen to work. No plaintext anywhere: the mint 201 below is the only place
 // one exists, and it is obviously fake.
 const day = 86_400_000;
 const apiTokens: components["schemas"]["ApiTokenDto"][] = [
@@ -1034,7 +1037,7 @@ const apiTokens: components["schemas"]["ApiTokenDto"][] = [
     created_by: "a.kim",
     created_at: ago(9 * day),
     expires_at: now + 81 * day,
-    last_used_at: ago(3 * 60 * min),
+    last_used_at: ago(20 * min),
     use_count: 1_203,
     revoked_at: null,
   },
@@ -1410,9 +1413,16 @@ function route(pathname: string, search: string, method: string, body = ""): Res
     const sort = new URLSearchParams(search).get("sort") ?? "last_used";
     return json(sortMockTokens(apiTokens.filter((t) => t.org === org), sort));
   }
-  if ((m = p.match(/^\/v1\/(?:me|orgs\/[^/]+)\/tokens\/([^/]+)$/))) {
-    const t = apiTokens.find((x) => x.id === decodeURIComponent(m![1]!));
-    if (t && method === "DELETE") t.revoked_at = Date.now();
+  // Revoke answers 404, as the server does, for an id that is not a live token
+  // of yours (personal route) or of the org (org route).
+  if (method === "DELETE" && (m = p.match(/^\/v1\/(?:me|orgs\/([^/]+))\/tokens\/([^/]+)$/))) {
+    const org = m[1] === undefined ? null : decodeURIComponent(m[1]);
+    const id = decodeURIComponent(m[2]!);
+    const t = apiTokens.find(
+      (x) => x.id === id && (org === null ? x.owner_subject === me.subject : x.org === org),
+    );
+    if (!t || t.revoked_at != null) return new Response("not found", { status: 404 });
+    t.revoked_at = Date.now();
     return new Response(null, { status: 204 });
   }
 
@@ -1567,6 +1577,7 @@ function route(pathname: string, search: string, method: string, body = ""): Res
         managed_by_config: false,
       });
       if (!me.admin_orgs.includes(org)) me.admin_orgs = [...me.admin_orgs, org].sort();
+      if (!me.token_mint_orgs.includes(org)) me.token_mint_orgs = [...me.token_mint_orgs, org].sort();
       return json({ id, credential_ref: `${id}-credential` }, { status: 201 });
     }
     // `?org=` lists one org's connections; without it, every org plus the
@@ -1580,6 +1591,7 @@ function route(pathname: string, search: string, method: string, body = ""): Res
     if (!found) return new Response("not found", { status: 404 });
     found.org = org;
     if (!me.admin_orgs.includes(org)) me.admin_orgs = [...me.admin_orgs, org].sort();
+    if (!me.token_mint_orgs.includes(org)) me.token_mint_orgs = [...me.token_mint_orgs, org].sort();
     return json({ id: found.id, org });
   }
   if (method === "POST" && /^\/v1\/connections\/[^/]+\/resync$/.test(p)) {
