@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1793597628,"nonce":"2zmarHd57V0I3EcmFLzSfHtGvGw=","message":"Merged in #85: one install flow for every plugin and library, publisher shown as data. The one-click install of first-party libraries is gone; each goes through the review page.","files":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":4,"timestamp":1793597628,"nonce":"jafwsSTA4Ua2uWbdkCbQMzXiO9k=","status":2}]}
