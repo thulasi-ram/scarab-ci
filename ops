@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1793631643,"nonce":"AoEQmGuAmYDG2de8YMgP4qd+v1w=","message":"Sweep 2026-11-02. Fixed on main: 3f434539 (PR #54), ci:skip / ci:full labels across ci.yml, image.yml, e2e.yml; pr_gate.py; documented in README.","files":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":4,"timestamp":1793631643,"nonce":"lq4XJ45Wg8WM1WVeYSaNIQYum7I=","status":2}]}
