@@ -14,10 +14,11 @@ tokens** (`/settings/tokens`), or through the API:
 
 | Call | What it does |
 |------|--------------|
-| `GET /v1/me/tokens` | your tokens, in every org, newest first |
+| `GET /v1/me/tokens` | your tokens, in every org, newest first. Called with a token, it lists only your tokens inside that token's scope |
 | `POST /v1/me/tokens` | mint one; the body names `org`, `name`, `role`, `expires_in_days` and, optionally, `project` |
-| `DELETE /v1/me/tokens/{id}` | revoke one of yours |
+| `DELETE /v1/me/tokens/{id}` | revoke one of yours. A token cannot call it (403): sign in, or ask an org admin |
 
+You may mint a token in any org or project where you hold a role, a viewer role included.
 When you mint a token you choose:
 
 - **Scope**: one org, or one project in it. A project-scoped token cannot see another
@@ -44,12 +45,13 @@ calls it has made, and when it expires. Sort it with `?sort=last_used` (the defa
 token in the org (`DELETE /v1/orgs/{org}/tokens/{id}`). Nobody mints from this page.
 
 Last use and the call count are approximate. The server counts calls in memory and writes them
-at most once a minute per token, when a token list is read, and when it shuts down. A list can
-lag by a minute, and a server replica that stops without shutting down loses the calls it had
-not written yet.
+at most once a minute per token, when a token list is read, when it is told to shut down, and
+after its last connection closes. A list can lag by a minute. A server replica that stops
+without shutting down, or whose shutdown outlasts the Pod's termination grace period, loses the
+calls it had not written yet.
 
 ## Not available yet
 
-An org policy that decides whether members may issue tokens at all, and which scopes and
-lifetimes they may choose, is not built yet. Until it is, any member of an org may issue a token
-up to their own role there, for up to 365 days.
+An org policy that decides who may issue tokens, and which scopes and lifetimes they may choose,
+is not built yet. Until it is, anyone with a role in an org or project, viewers included, may
+issue a token there up to that role, for up to 365 days.

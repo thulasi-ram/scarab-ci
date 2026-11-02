@@ -254,9 +254,10 @@ record. Read Breaking changes before you upgrade.
   Environment cannot be renamed: its name is the key pipelines use.
   [View and edit an Environment](https://thulasi-ram.github.io/scarab-ci/usage/environments/#view-and-edit-an-environment)
 - **Personal API tokens** (git-bug a4cb94f). You mint, list and revoke your own tokens under
-  Settings › Your account › API tokens (`/v1/me/tokens`). Any member may mint a token up to the
-  role they hold in its org or project; minting still needs a passkey confirmation, and a token
-  still cannot mint tokens. Organization settings › API tokens lists every token issued in the
+  Settings › Your account › API tokens (`/v1/me/tokens`). Anyone with a role in an org or
+  project, viewers included, may mint a token there up to that role; minting still needs a
+  passkey confirmation, and a token still cannot mint tokens or revoke them through
+  `/v1/me/tokens`. Organization settings › API tokens lists every token issued in the
   org with its owner, last use and call count, sorted by last use (the default), calls or
   creation, and an org admin can revoke any of them; it no longer mints.
   `POST /v1/orgs/{org}/tokens` still works and mints the same personal token. The call count is
