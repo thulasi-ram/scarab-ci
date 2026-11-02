@@ -49,6 +49,7 @@
 //! | `SCARAB_STEP_TIMEOUT_SECS` | env | global default step deadline (ADR-0047); default 3600 (1h), per-step overridable via `timeout:` |
 //! | `SCARAB_PROJECT_RUN_CAP` | env | how many of one project's Runs may be `Running` at once; the rest wait `Pending` (ADR-0011). Unset or `0` = no cap (default). A Run waiting on a gate is not counted |
 //! | `SCARAB_PUBLIC_URL` | env | Scarab's public base URL — the run deep-link every forge status carries (ADR-0046); default `http://localhost:8080` (dev) |
+//! | `SCARAB_UI_URL` | env | the URL people open the web UI at, when it is not `SCARAB_PUBLIC_URL` (a staging stack whose public hostname serves only `/webhooks/`). Three things are built from it: the OAuth callback (`{ui_url}/v1/auth/callback`), the passkey (WebAuthn) origin, and the step-up confirmation link. Webhook URLs and forge status links stay on `SCARAB_PUBLIC_URL`. Default `SCARAB_PUBLIC_URL`. An `http(s)` URL with no query or fragment; with step-up enforced it must be `https` or loopback `http`. Browsers refuse passkeys on an IP literal, so a local one is `http://localhost:<port>` |
 //! | `SCARAB_PLACEMENT_CONFIG_FILE` | env | path to the operator placement config (ADR-0055): cluster baseline + PlacementProfile registry (YAML/JSON, gitops-managed); a bad path/parse is a boot failure |
 //! | `SCARAB_GITHUB_APP_ID` | env | GitHub App id (ADR-0046): when set, GitHub connections authenticate in **App mode** (their credential secret is the App PEM); absent = token mode (dev) |
 //! | `SCARAB_OAUTH_CLIENT_ID` … `_CLIENT_SECRET`, `_AUTHORIZE_URL`, `_TOKEN_URL`, `_USERINFO_URL` | env | OAuth/OIDC login provider (ADR-0049): all five together enable real authn (GitHub, Forgejo, or any OIDC issuer); a partial set refuses boot |
@@ -225,6 +226,41 @@ pub enum ServerCommand {
 /// `scarab-server admin <command>`.
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum AdminCommand {
+    /// Grant a principal a role in an Org, directly in the database, for
+    /// seeding a fresh install (the first members of a staging stack).
+    /// Needs only `--database-url` / `SCARAB_DATABASE_URL`; never migrates.
+    /// The principal must exist (it signed in once, or a forge import
+    /// created it); exit 3 when it does not.
+    ///
+    /// Sets the role exactly: a higher role is lowered, a revoked binding is
+    /// restored, and a role a forge import gave becomes a native binding. A
+    /// principal that already holds the role as a native binding is left as
+    /// it is and nothing is recorded. With `--if-absent`, nothing is written
+    /// when the principal has any binding in the Org (a revoked one
+    /// included), so a seed script run again leaves an Owner's changes
+    /// alone. A grant is a native binding, recorded in the
+    /// OrgSecurityEventLog as `binding.operator_grant` with this host, OS
+    /// user and reason, in the same transaction.
+    Grant {
+        /// The Org.
+        #[arg(long)]
+        org: String,
+        /// The principal id, e.g. `github:alice` (a merged id is followed
+        /// to its Principal).
+        #[arg(long)]
+        subject: String,
+        /// viewer, member, admin or owner.
+        #[arg(long)]
+        role: String,
+        /// Write only when the principal has no binding in the Org at all
+        /// (at the Org or a Project, revoked included); otherwise print what
+        /// is there and exit 0.
+        #[arg(long)]
+        if_absent: bool,
+        /// Why — recorded with the grant.
+        #[arg(long)]
+        reason: Option<String>,
+    },
     /// Remove EVERY passkey of a principal and revoke its standing
     /// step-ups, for when no Owner can step up to reset them. Needs only
     /// `--database-url` / `SCARAB_DATABASE_URL`; never migrates (refuses a
@@ -499,6 +535,15 @@ pub struct ConnectionSpec {
     /// Repos this connection owns — each binding *is* a Project (ADR-0046), so
     /// declaring repos here is the declarative Project-onboarding path.
     pub repos: Vec<scarab_forge::RepoRef>,
+    /// The Org the connection serves (git-bug 19b0a45): `org:`, or the one
+    /// owner of its `repos:`. Every declared repo is owned by it.
+    pub org: String,
+    /// The GitHub App installation the connection mints from and lists
+    /// (git-bug 19b0a45): `installation_id:`, or the `<id>` of a
+    /// `github-install-<id>` id. In App mode a `kind: github` connection
+    /// must have one, or its repository listing would walk every
+    /// installation of the App. `None` for every other connection.
+    pub installation_id: Option<u64>,
 }
 
 /// The `connections:` document, as written in `SCARAB_CONNECTIONS` /
@@ -527,6 +572,16 @@ struct RawConnection {
     /// Project is indistinguishable from a webhook-registered one.
     #[serde(default)]
     repos: Vec<String>,
+    /// The Org the connection serves (git-bug 19b0a45). Absent = the one
+    /// owner of `repos`; a block with no repos, or repos of several owners,
+    /// must name it.
+    #[serde(default)]
+    org: Option<String>,
+    /// The GitHub App installation id (App mode, git-bug 19b0a45). Required
+    /// for a `kind: github` connection in App mode unless the id is
+    /// `github-install-<id>`.
+    #[serde(default)]
+    installation_id: Option<u64>,
 }
 
 /// Exactly one of the three sources. Two would make "which one wins?" a config
@@ -593,6 +648,11 @@ pub struct Config {
     /// status carries (`{public_url}/runs/{id}`). Dev default
     /// `http://localhost:8080`.
     pub public_url: String,
+    /// The URL people open the web UI at (`SCARAB_UI_URL`), no trailing
+    /// slash; defaults to [`public_url`](Self::public_url). The OAuth
+    /// callback, the passkey origin and the step-up confirmation link are
+    /// built from it; webhook URLs and forge status links are not.
+    pub ui_url: String,
     /// GitHub App id (ADR-0046). `Some` = App mode (connection credentials
     /// are the App private-key PEM); `None` = token mode (dev).
     pub github_app_id: Option<String>,
@@ -685,6 +745,26 @@ impl StepUpMode {
             (false, Some(other)) => Err(ConfigError::InvalidStepUpMode(other.to_string())),
         }
     }
+}
+
+/// `SCARAB_UI_URL`, or `public_url` when it is unset or blank, without a
+/// trailing slash. An explicit value must be an `http(s)` URL a relying
+/// party can be built from, with no query or fragment: the OAuth callback
+/// is that URL with `/v1/auth/callback` appended.
+fn resolve_ui_url(raw: Option<String>, public_url: &str) -> Result<String, ConfigError> {
+    let Some(raw) = raw.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) else {
+        return Ok(public_url.trim_end_matches('/').to_string());
+    };
+    if raw.contains(['?', '#']) {
+        return Err(ConfigError::InvalidUiUrl(
+            raw,
+            "it has a query or fragment".into(),
+        ));
+    }
+    if let Err(e) = scarab_webauthn::RelyingParty::from_public_url(&raw, "Scarab") {
+        return Err(ConfigError::InvalidUiUrl(raw, e.to_string()));
+    }
+    Ok(raw.trim_end_matches('/').to_string())
 }
 
 /// Is `public_url` acceptable as the WebAuthn relying party when step-up is
@@ -1232,11 +1312,19 @@ pub enum ConfigError {
     InvalidStepUpMode(String),
 
     #[error(
-        "step-up is enforced (ADR-0073) but SCARAB_PUBLIC_URL `{0}` cannot be a WebAuthn \
-         relying party: passkeys need an https origin (plain http only on localhost / \
-         127.0.0.1 / ::1). Set SCARAB_PUBLIC_URL to the https URL browsers reach Scarab at."
+        "step-up is enforced (ADR-0073) but the UI URL `{0}` (SCARAB_UI_URL, default \
+         SCARAB_PUBLIC_URL) cannot be a WebAuthn relying party: passkeys need an https \
+         origin (plain http only on localhost / 127.0.0.1 / ::1). Set SCARAB_UI_URL, or \
+         SCARAB_PUBLIC_URL, to the https URL browsers open Scarab at."
     )]
-    StepUpNeedsHttpsPublicUrl(String),
+    StepUpNeedsHttpsUiUrl(String),
+
+    #[error(
+        "SCARAB_UI_URL `{0}` is not a usable UI URL: {1}. Want the http(s) URL people \
+         open the web UI at, with no query or fragment, e.g. https://ci.example.com or \
+         http://localhost:8080."
+    )]
+    InvalidUiUrl(String, String),
 
     #[error(
         "SCARAB_RETENTION_LOG_DAYS is set but invalid — want a positive integer number \
@@ -1675,18 +1763,19 @@ impl Config {
         let public_url = env("SCARAB_PUBLIC_URL")
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| "http://localhost:8080".into());
+        let ui_url = resolve_ui_url(env("SCARAB_UI_URL"), &public_url)?;
         // Step-up (ADR-0073 §8): enforce unless the dev escape hatch says
         // otherwise; a typo or an `off` refuses the boot.
         let step_up = StepUpMode::resolve(env("SCARAB_STEP_UP").as_deref(), dev_insecure)?;
-        // Passkeys are bound to the public URL's origin: with login wired,
-        // an origin browsers will not run WebAuthn on would make every
-        // crown jewel unconfirmable.
+        // Passkeys are bound to the UI URL's origin: with login wired, an
+        // origin browsers will not run WebAuthn on would make every crown
+        // jewel unconfirmable.
         if step_up == StepUpMode::Enforce
             && !oauth.is_empty()
             && !matches!(cli.role, Role::Workspace)
-            && !step_up_public_url_ok(&public_url)
+            && !step_up_public_url_ok(&ui_url)
         {
-            return Err(ConfigError::StepUpNeedsHttpsPublicUrl(public_url));
+            return Err(ConfigError::StepUpNeedsHttpsUiUrl(ui_url));
         }
 
         Ok(Config {
@@ -1708,6 +1797,7 @@ impl Config {
             step_timeout_secs,
             project_run_cap,
             public_url,
+            ui_url,
             github_app_id: env("SCARAB_GITHUB_APP_ID").filter(|v| !v.is_empty()),
             github_app_pem: env("SCARAB_GITHUB_APP_PEM").filter(|v| !v.is_empty()),
             github_app_pem_file: env("SCARAB_GITHUB_APP_PEM_FILE").filter(|v| !v.is_empty()),
@@ -1817,7 +1907,7 @@ impl Config {
                     .to_string()
             }
             (_, StepUpMode::Enforce) => {
-                match scarab_webauthn::RelyingParty::from_public_url(&self.public_url, "Scarab") {
+                match scarab_webauthn::RelyingParty::from_public_url(&self.ui_url, "Scarab") {
                     Ok(rp) => format!(
                         "step-up: enforced (ADR-0073; rpId={}, origin={})",
                         rp.rp_id(),
@@ -1892,6 +1982,14 @@ impl Config {
                 self.step_timeout_secs,
             ),
             format!("public url: {} (run deep-links, ADR-0046)", self.public_url),
+            if self.ui_url == self.public_url.trim_end_matches('/') {
+                "ui url: the public url (login callback, passkeys, confirmation links)".to_string()
+            } else {
+                format!(
+                    "ui url: {} (login callback, passkeys, confirmation links)",
+                    self.ui_url
+                )
+            },
             self.step_up_report(),
             if self.clone_image_ignored {
                 "SCARAB_CLONE_IMAGE is set and not read: checkouts run the image \
@@ -2068,7 +2166,8 @@ pub fn connections_from_env(
 
     let mut out: Vec<ConnectionSpec> = Vec::with_capacity(doc.connections.len());
     for raw_conn in doc.connections {
-        let spec = resolve_connection(raw_conn, env)
+        let app_mode = env("SCARAB_GITHUB_APP_ID").is_some_and(|v| !v.is_empty());
+        let spec = resolve_connection(raw_conn, env, app_mode)
             .map_err(|e| ConfigError::InvalidConnections(format!("{source}: {e}")))?;
         // Duplicate ids would race each other into the same row on every boot,
         // with the last one silently winning.
@@ -2088,6 +2187,7 @@ pub fn connections_from_env(
 fn resolve_connection(
     raw: RawConnection,
     env: &impl Fn(&str) -> Option<String>,
+    github_app_mode: bool,
 ) -> Result<ConnectionSpec, String> {
     let id = raw.id.trim().to_string();
     if id.is_empty() {
@@ -2207,6 +2307,72 @@ fn resolve_connection(
         });
     }
 
+    // The Org it serves: declared, or the one owner of its repos. A repo of
+    // another owner would bind outside that Org (git-bug 19b0a45).
+    let org = match raw.org.as_deref().map(str::trim) {
+        Some("") => return Err(format!("connection `{id}`: `org` is empty")),
+        Some(org) => org.to_string(),
+        None => {
+            let owners: std::collections::BTreeSet<&str> =
+                repos.iter().map(|r| r.owner.as_str()).collect();
+            match owners.len() {
+                1 => owners.into_iter().next().unwrap_or_default().to_string(),
+                0 => {
+                    return Err(format!(
+                        "connection `{id}`: set `org`, the org this connection serves \
+                         (it declares no repos to take it from)"
+                    ))
+                }
+                _ => {
+                    return Err(format!(
+                        "connection `{id}`: its repos have several owners ({}); a connection \
+                         serves one org, so split it or set `org`",
+                        owners.into_iter().collect::<Vec<_>>().join(", ")
+                    ))
+                }
+            }
+        }
+    };
+    // The API's rule for an org name, so config cannot make an Org the API
+    // would refuse.
+    if let Some(problem) = crate::org_name_problem(&org) {
+        return Err(format!("connection `{id}`: {problem}"));
+    }
+    if let Some(other) = repos.iter().find(|r| r.owner != org) {
+        return Err(format!(
+            "connection `{id}` serves org `{org}`, but repo `{}/{}` is owned by `{}`; every \
+             repo of a connection is owned by its org",
+            other.owner, other.name, other.owner
+        ));
+    }
+
+    // The installation it is (git-bug 19b0a45). Unpinned, an App-mode
+    // GitHub connection would list every installation's repositories, other
+    // accounts' included, so App mode needs one.
+    let named = scarab_forge::installation_id_of(&id);
+    let installation_id = match (kind, raw.installation_id, named) {
+        (scarab_forge::ForgeKind::GitHub, Some(declared), Some(named)) if declared != named => {
+            return Err(format!(
+                "connection `{id}`: `installation_id: {declared}` is not the installation \
+                 its id names ({named})"
+            ))
+        }
+        (scarab_forge::ForgeKind::GitHub, declared, named) => declared.or(named),
+        (_, Some(_), _) => {
+            return Err(format!(
+                "connection `{id}`: `installation_id` is for `kind: github` connections only"
+            ))
+        }
+        (_, None, _) => None,
+    };
+    if github_app_mode && kind == scarab_forge::ForgeKind::GitHub && installation_id.is_none() {
+        return Err(format!(
+            "connection `{id}`: set `installation_id`, the GitHub App installation this \
+             connection is (SCARAB_GITHUB_APP_ID is set, so GitHub connections use the App). \
+             Without it the connection would list every installation's repositories"
+        ));
+    }
+
     Ok(ConnectionSpec {
         id,
         kind,
@@ -2215,6 +2381,8 @@ fn resolve_connection(
         credential_material,
         credential_source,
         repos,
+        org,
+        installation_id,
     })
 }
 
@@ -2890,6 +3058,7 @@ mod tests {
 connections:
   - id: forgejo-main
     kind: forgejo
+    org: acme
     base_url: https://git.example.com/
     credential:
       env: FORGEJO_CI_TOKEN
@@ -3013,6 +3182,7 @@ connections:
 connections:
   - id: forgejo-main
     kind: forgejo
+    org: acme
     base_url: https://git.example.com
     credential:
       secret_ref: forgejo-token
@@ -3034,6 +3204,7 @@ connections:
 connections:
   - id: c
     kind: forgejo
+    org: acme
     base_url: https://git.example.com
     credential: {}
 "#,
@@ -3044,6 +3215,7 @@ connections:
 connections:
   - id: c
     kind: forgejo
+    org: acme
     base_url: https://git.example.com
     credential:
       env: A
@@ -3084,6 +3256,7 @@ connections:
 connections:
   - id: c
     kind: forgejo
+    org: acme
     base_url: git.example.com
     credential: { secret_ref: t }
 "#,
@@ -3094,6 +3267,7 @@ connections:
 connections:
   - id: c
     kind: forgejo
+    org: acme
     base_url: https://git.example.com
     credential: { secret_ref: t }
     repos: [ widgets ]
@@ -3105,6 +3279,7 @@ connections:
 connections:
   - id: c
     kind: forgejo
+    org: acme
     base_urls: https://git.example.com
     credential: { secret_ref: t }
 "#,
@@ -3136,10 +3311,12 @@ connections:
 connections:
   - id: dup
     kind: forgejo
+    org: acme
     base_url: https://a.example.com
     credential: { secret_ref: t }
   - id: dup
     kind: forgejo
+    org: acme
     base_url: https://b.example.com
     credential: { secret_ref: t }
 "#,
@@ -3148,6 +3325,199 @@ connections:
         .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("declared twice"), "{msg}");
+    }
+
+    /// git-bug 19b0a45: a connection serves one Org. `org:` names it, or
+    /// the one owner of its repos does; every declared repo is that Org's.
+    #[test]
+    fn a_connection_serves_one_org_and_its_repos_are_that_orgs() {
+        let resolve = |block: &'static str| {
+            let env = move |k: &str| match k {
+                "SCARAB_DEV_INSECURE" => Some("1".to_string()),
+                "SCARAB_CONNECTIONS" => Some(block.to_string()),
+                _ => None,
+            };
+            Config::resolve_from(&cli(Some("postgres://l/scarab")), env)
+        };
+        // Absent: taken from the one owner of its repos.
+        let cfg = resolve(
+            r#"
+connections:
+  - id: c
+    kind: forgejo
+    base_url: https://git.example.com
+    credential: { secret_ref: t }
+    repos: [ initech/tps, initech/memo ]
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.connections[0].org, "initech");
+
+        for (block, expect) in [
+            // A declared repo of another owner.
+            (
+                r#"
+connections:
+  - id: c
+    kind: forgejo
+    org: acme
+    base_url: https://git.example.com
+    credential: { secret_ref: t }
+    repos: [ acme/web, globex/web ]
+"#,
+                "`globex/web` is owned by `globex`",
+            ),
+            // Several owners and no `org:` to choose between them.
+            (
+                r#"
+connections:
+  - id: c
+    kind: forgejo
+    base_url: https://git.example.com
+    credential: { secret_ref: t }
+    repos: [ acme/web, globex/web ]
+"#,
+                "several owners (acme, globex)",
+            ),
+            // Nothing to take it from.
+            (
+                r#"
+connections:
+  - id: c
+    kind: forgejo
+    base_url: https://git.example.com
+    credential: { secret_ref: t }
+"#,
+                "set `org`",
+            ),
+            // One of Scarab's own names.
+            (
+                r#"
+connections:
+  - id: c
+    kind: forgejo
+    org: _forge
+    base_url: https://git.example.com
+    credential: { secret_ref: t }
+"#,
+                "reserved org name",
+            ),
+            // The API's org-name rule applies to config too (git-bug
+            // 19b0a45): before, config checked only empty and reserved.
+            (
+                r#"
+connections:
+  - id: c
+    kind: forgejo
+    org: a/b
+    base_url: https://git.example.com
+    credential: { secret_ref: t }
+"#,
+                "may not contain `/` or spaces",
+            ),
+            (
+                r#"
+connections:
+  - id: c
+    kind: forgejo
+    org: ".."
+    base_url: https://git.example.com
+    credential: { secret_ref: t }
+"#,
+                "a URL cannot address it",
+            ),
+            (
+                r#"
+connections:
+  - id: c
+    kind: forgejo
+    org: settings
+    base_url: https://git.example.com
+    credential: { secret_ref: t }
+"#,
+                "first part of a Scarab web address",
+            ),
+        ] {
+            let err = resolve(block).unwrap_err();
+            let msg = err.to_string();
+            assert!(matches!(err, ConfigError::InvalidConnections(_)), "{msg}");
+            assert!(msg.contains(expect), "want {expect:?} in: {msg}");
+        }
+    }
+
+    /// git-bug 19b0a45: in App mode a config-declared GitHub connection is
+    /// pinned to one installation. `installation_id:` names it, or a
+    /// `github-install-<id>` id does; without either the boot is refused,
+    /// since the connection would list every installation's repositories.
+    /// Token mode needs neither.
+    #[test]
+    fn an_app_mode_github_connection_names_its_installation() {
+        let specs = |block: &'static str, app_mode: bool| {
+            connections_from_env(&move |k: &str| match k {
+                "SCARAB_CONNECTIONS" => Some(block.to_string()),
+                "SCARAB_GITHUB_APP_ID" if app_mode => Some("4323648".to_string()),
+                _ => None,
+            })
+        };
+        let unnamed = r#"
+connections:
+  - id: github-main
+    kind: github
+    org: acme
+    base_url: https://api.github.com
+    credential: { secret_ref: github-app }
+"#;
+        let err = specs(unnamed, true).unwrap_err().to_string();
+        assert!(err.contains("set `installation_id`"), "{err}");
+        assert_eq!(specs(unnamed, false).unwrap()[0].installation_id, None);
+
+        let declared = r#"
+connections:
+  - id: github-main
+    kind: github
+    org: acme
+    installation_id: 55
+    base_url: https://api.github.com
+    credential: { secret_ref: github-app }
+"#;
+        assert_eq!(specs(declared, true).unwrap()[0].installation_id, Some(55));
+
+        let named = r#"
+connections:
+  - id: github-install-77
+    kind: github
+    org: acme
+    base_url: https://api.github.com
+    credential: { secret_ref: github-app }
+"#;
+        assert_eq!(specs(named, true).unwrap()[0].installation_id, Some(77));
+
+        let disagree = r#"
+connections:
+  - id: github-install-77
+    kind: github
+    org: acme
+    installation_id: 5
+    base_url: https://api.github.com
+    credential: { secret_ref: github-app }
+"#;
+        let err = specs(disagree, true).unwrap_err().to_string();
+        assert!(
+            err.contains("is not the installation its id names"),
+            "{err}"
+        );
+
+        let forgejo = r#"
+connections:
+  - id: c
+    kind: forgejo
+    org: acme
+    installation_id: 5
+    base_url: https://git.example.com
+    credential: { secret_ref: t }
+"#;
+        let err = specs(forgejo, true).unwrap_err().to_string();
+        assert!(err.contains("for `kind: github` connections only"), "{err}");
     }
 
     #[test]
@@ -3161,6 +3531,7 @@ connections:
 connections:
   - id: from-file
     kind: forgejo
+    org: acme
     base_url: https://file.example.com
     credential: { secret_ref: t }
 "#,
@@ -3188,6 +3559,7 @@ connections:
 connections:
   - id: from-inline
     kind: forgejo
+    org: acme
     base_url: https://inline.example.com
     credential: { secret_ref: t }
 "#
@@ -3224,6 +3596,7 @@ connections:
 connections:
   - id: forgejo-main
     kind: forgejo
+    org: acme
     base_url: https://git.example.com
     credential:
       file: {}
@@ -3251,6 +3624,7 @@ connections:
 connections:
   - id: forgejo-main
     kind: forgejo
+    org: acme
     base_url: https://git.example.com
     credential:
       file: /nope/token
@@ -3432,11 +3806,11 @@ connections:
         };
         assert_eq!(
             with_url("http://ci.example.com").unwrap_err(),
-            ConfigError::StepUpNeedsHttpsPublicUrl("http://ci.example.com".into())
+            ConfigError::StepUpNeedsHttpsUiUrl("http://ci.example.com".into())
         );
         assert!(matches!(
             with_url("ftp://ci.example.com").unwrap_err(),
-            ConfigError::StepUpNeedsHttpsPublicUrl(_)
+            ConfigError::StepUpNeedsHttpsUiUrl(_)
         ));
         for ok in [
             "https://ci.example.com",
@@ -3457,6 +3831,86 @@ connections:
             cfg.startup_report()
         );
         assert!(!cfg.boot_warnings().iter().any(|w| w.contains("STEP-UP")));
+    }
+
+    /// `SCARAB_UI_URL` defaults to the public URL, and an explicit one is
+    /// what passkeys bind to: a staging stack whose public hostname serves
+    /// only `/webhooks/` signs in on `http://localhost:<port>`.
+    #[test]
+    fn the_ui_url_defaults_to_the_public_url_and_can_be_set() {
+        let cli = cli(Some("postgres://l/scarab"));
+        let resolve = |extra| Config::resolve_from(&cli, prod_env(extra));
+
+        let default = resolve(vec![]).unwrap();
+        assert_eq!(default.ui_url, "https://ci.example.com");
+        let trailing =
+            resolve(vec![("SCARAB_PUBLIC_URL", "https://ci.example.com/".into())]).unwrap();
+        assert_eq!(trailing.ui_url, "https://ci.example.com", "no trailing slash");
+        assert!(default.startup_report().contains(
+            &"ui url: the public url (login callback, passkeys, confirmation links)".to_string()
+        ));
+
+        let local = resolve(vec![("SCARAB_UI_URL", "http://localhost:8080/".into())]).unwrap();
+        assert_eq!(local.ui_url, "http://localhost:8080");
+        assert_eq!(local.public_url, "https://ci.example.com", "webhooks stay public");
+        let report = local.startup_report();
+        assert!(
+            report.contains(
+                &"ui url: http://localhost:8080 (login callback, passkeys, confirmation links)"
+                    .to_string()
+            ),
+            "{report:?}"
+        );
+        // The passkey origin is the UI URL's, not the public URL's.
+        assert!(
+            report.contains(
+                &"step-up: enforced (ADR-0073; rpId=localhost, origin=http://localhost:8080)"
+                    .to_string()
+            ),
+            "{report:?}"
+        );
+
+        // A blank value is unset.
+        assert_eq!(
+            resolve(vec![("SCARAB_UI_URL", "  ".into())]).unwrap().ui_url,
+            "https://ci.example.com"
+        );
+    }
+
+    /// An explicit `SCARAB_UI_URL` must be an http(s) URL with no query or
+    /// fragment, and with step-up enforced an https or loopback one — the
+    /// public URL being https does not rescue a plain-http UI URL.
+    #[test]
+    fn a_bad_ui_url_refuses_the_boot() {
+        let cli = cli(Some("postgres://l/scarab"));
+        let with_ui = |url: &str| {
+            Config::resolve_from(&cli, prod_env(vec![("SCARAB_UI_URL", url.to_string())]))
+        };
+        for bad in [
+            "localhost:8080",
+            "ftp://ci.example.com",
+            "https://user@ci.example.com",
+            "https://ci.example.com/?next=/",
+            "https://ci.example.com/#x",
+        ] {
+            assert!(
+                matches!(with_ui(bad).unwrap_err(), ConfigError::InvalidUiUrl(ref v, _) if v == bad),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            with_ui("http://ci.example.com").unwrap_err(),
+            ConfigError::StepUpNeedsHttpsUiUrl("http://ci.example.com".into())
+        );
+        let msg = ConfigError::StepUpNeedsHttpsUiUrl("http://x".into()).to_string();
+        assert!(msg.contains("SCARAB_UI_URL"), "{msg}");
+        // Under the dev escape hatch step-up is off, so plain http boots.
+        let dev = Config::resolve_from(
+            &cli,
+            dev_env(&[("SCARAB_UI_URL", "http://ci.example.com:8080")]),
+        )
+        .unwrap();
+        assert_eq!(dev.ui_url, "http://ci.example.com:8080");
     }
 
     /// Without OAuth and without the dev escape hatch there is no boot at all
@@ -3772,5 +4226,67 @@ connections:
         assert!(Cli::try_parse_from(["scarab-server", "admin", "reset-passkeys"]).is_err());
         // No subcommand: serve, as before.
         assert_eq!(Cli::try_parse_from(["scarab-server"]).unwrap().command, None);
+    }
+
+    /// `scarab-server admin grant`: org, subject and role are mandatory.
+    #[test]
+    fn the_operator_grant_parses() {
+        let cli = Cli::try_parse_from([
+            "scarab-server",
+            "admin",
+            "grant",
+            "--org",
+            "acme",
+            "--subject",
+            "github:alice",
+            "--role",
+            "member",
+            "--reason",
+            "staging seed",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.command,
+            Some(ServerCommand::Admin {
+                command: AdminCommand::Grant {
+                    org: "acme".into(),
+                    subject: "github:alice".into(),
+                    role: "member".into(),
+                    if_absent: false,
+                    reason: Some("staging seed".into()),
+                }
+            })
+        );
+        let seeded = Cli::try_parse_from([
+            "scarab-server",
+            "admin",
+            "grant",
+            "--org",
+            "acme",
+            "--subject",
+            "github:alice",
+            "--role",
+            "member",
+            "--if-absent",
+        ])
+        .unwrap();
+        assert!(matches!(
+            seeded.command,
+            Some(ServerCommand::Admin {
+                command: AdminCommand::Grant {
+                    if_absent: true,
+                    ..
+                }
+            })
+        ));
+        for missing in [
+            ["--org", "acme", "--subject", "github:alice"],
+            ["--org", "acme", "--role", "member"],
+            ["--subject", "github:alice", "--role", "member"],
+        ] {
+            let mut argv = vec!["scarab-server", "admin", "grant"];
+            argv.extend(missing);
+            assert!(Cli::try_parse_from(argv).is_err(), "{missing:?}");
+        }
     }
 }

@@ -55,7 +55,7 @@ pub const DIGEST_KEY_LABEL: &str = "scarab-step-up-digest/v1";
 pub const LINK_KEY_LABEL: &str = "scarab-identity-link/v1";
 
 /// Where a refusal with no passkey sends the human.
-pub const ENROLL_URL: &str = "/account/security?enroll=1";
+pub const ENROLL_URL: &str = "/settings/security?enroll=1";
 
 /// Whether step-up is enforced in this process.
 #[derive(Clone, Default)]

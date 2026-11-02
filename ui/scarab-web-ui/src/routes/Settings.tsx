@@ -1,124 +1,385 @@
-// Global Settings (ADR-0060 part A) — the org-scoped surface that has no repo
-// to hang off. There is exactly one Org (single-tenant *experience*), so there
-// is no org switcher and no org navigation; `Org` stays the model's real RBAC /
-// secret inheritance root (ADR-0049 / ADR-0037), we just never make the user
-// pick one.
+// Settings (git-bug 734ffa1): one shell, an in-page sidebar, one URL per
+// section.
 //
-// Everything here needs `Administer` on the Org. The server decides that
-// (`GET /v1/me` → `can_administer` / `admin_orgs`) and enforces it per request;
-// this route mirrors the answer so a non-admin gets an honest "not yours" page
-// rather than a wall of failed fetches. Layout hides the nav entry too — belt
-// and braces, not a security boundary.
+// The sidebar sits inside the usual 1200px `.page` column, not beside the
+// app: the top bar stays the only app-wide navigation. Three groups — Your
+// account (`/settings/<section>`, everyone's), Organization settings
+// (`/orgs/<org>/settings/<section>`, admins of that org) and Server
+// administration (`/settings/server/<section>`, global admins). Under ~900px
+// the list becomes a `<select>` above the section. A page under a section (one
+// Environment, a library review) renders in the same frame, with its parent
+// section marked. The route table, the gating, which section a path sits in
+// and the old-URL redirects are pure functions in `settings-nav.ts`.
 //
-// Sections today: **Connections** (which forges Scarab is wired to, and
-// what they cover), **Members**, **Environments** (ADR-0071 — the org-level
-// places deploys land in: protection, eligibility, privilege grants),
-// **Plugins** (ADR-0072 — the org's plugin installations and their kill switch),
-// **Security** (ADR-0073 — step-up posture, refusals, the event log),
-// **API tokens**
-// (ADR-0049 — the credential a machine can hold, minted here and nowhere else)
-// and **Org Secrets** (the top of the `env → repo → org` inheritance chain,
-// until now settable only by raw HTTP).
-// Connections comes first: without one there are no Projects, so nothing else
-// here has anything to act on. Tokens sit above secrets because they are the
-// only thing on this page that hands out authority rather than data.
-import { createResource, Show } from "solid-js";
-import { getMe } from "../api/client";
-import ScopedSecrets from "../components/ScopedSecrets";
-import Connections from "../components/Connections";
-import ApiTokens from "../components/ApiTokens";
+// Gating here is presentation: the server enforces `Administer` on the org
+// for every request an org section makes.
+import { For, Match, Show, Switch, createMemo, type JSX } from "solid-js";
+import { A, Navigate, useLocation, useNavigate, useParams } from "@solidjs/router";
+import { me } from "../session";
+import {
+  activeSectionHref,
+  administers,
+  legacyRedirect,
+  navGroups,
+  decodeParam,
+  FIRST_ORG_SECTION,
+  groupHome,
+  orgHref,
+  resolveSection,
+  settingsHome,
+  type SettingsGroupKind,
+  type SettingsSection,
+} from "../settings-nav";
+import LinkedAccounts from "../components/LinkedAccounts";
+import SecuritySettings from "../components/SecuritySettings";
+import AppearanceSettings from "../components/AppearanceSettings";
+import Connections, { ConnectForge } from "../components/Connections";
 import Members from "../components/Members";
 import OrgEnvironments from "../components/OrgEnvironments";
 import Plugins from "../components/Plugins";
 import Libraries from "../components/Libraries";
+import ScopedSecrets from "../components/ScopedSecrets";
+import { MyApiTokens, OrgApiTokens } from "../components/ApiTokens";
 import OrgSecurity from "../components/OrgSecurity";
+import EventLog from "../components/EventLog";
 import Icon from "../components/Icon";
 
-export default function Settings() {
-  const [me] = createResource(getMe);
-  /** The one implicit Org, once anything is bound to it. */
-  const org = () => me()?.admin_orgs[0];
+const IDENTITY_ERROR = "Could not load your identity. Is the server up?";
+
+/** `/settings/:section` — a section of Your account. */
+export function AccountSettings() {
+  const params = useParams<{ section: string }>();
+  return <SettingsShell kind="account" section={params.section} />;
+}
+
+/** `/orgs/:org/settings/:section?` — a section of one org's settings. */
+export function OrgSettings() {
+  const params = useParams<{ org: string; section?: string }>();
+  return <SettingsShell kind="org" org={decodeParam(params.org)} section={params.section} />;
+}
+
+/** `/settings/server/:section?` — a section only a global admin may use. */
+export function ServerSettings() {
+  const params = useParams<{ section?: string }>();
+  return <SettingsShell kind="server" section={params.section} />;
+}
+
+/** An old settings URL (`/settings`, `/account`, …): where it lives now. */
+export function LegacySettings() {
+  const location = useLocation();
+  return (
+    <Show
+      when={me()}
+      fallback={
+        <Show when={me.error} fallback={<p class="empty page">loading…</p>}>
+          <p class="error page">{IDENTITY_ERROR}</p>
+        </Show>
+      }
+    >
+      {(who) => (
+        <Navigate
+          href={legacyRedirect(location.pathname, location.search, who()) ?? settingsHome(who())}
+        />
+      )}
+    </Show>
+  );
+}
+
+function SettingsShell(props: { kind: SettingsGroupKind; org?: string; section?: string }) {
+  const section = () => resolveSection(props.kind, props.section);
+  return (
+    // `/orgs/<org>/settings` or `/settings/server` alone opens the group's
+    // first section.
+    <Show when={props.section} fallback={<Navigate href={groupHome(props.kind, props.org)} />}>
+      <SettingsFrame kind={props.kind} org={props.org} section={props.section}>
+        <Show when={section()} fallback={<NotFound />}>
+          {(s) => <SectionPage kind={props.kind} org={props.org} section={s()} />}
+        </Show>
+      </SettingsFrame>
+    </Show>
+  );
+}
+
+/**
+ * The settings page around `children`: the sidebar, the narrow-screen
+ * `<select>`, and the main column. A section renders in it, and so does a
+ * page under a section (one Environment, a library review), so the sidebar
+ * stays in view and marks the section the page belongs to.
+ *
+ * On an org page the main column shows `children` only to an admin of that
+ * org; everyone else sees why not.
+ */
+export function SettingsFrame(props: {
+  kind: SettingsGroupKind;
+  org?: string;
+  /** The section id, so switching orgs lands on the same section. */
+  section?: string;
+  children: JSX.Element;
+}) {
+  const nav = useNavigate();
+  const location = useLocation();
+  const groups = createMemo(() => (me() ? navGroups(me()!, props.org) : []));
+  const active = createMemo(() => activeSectionHref(location.pathname));
 
   return (
     <section class="page">
-      <div class="page-head">
-        <h1>Settings</h1>
-      </div>
-      <p class="page-sub">organization-wide configuration</p>
-
       <Show when={me.error}>
-        <p class="error">Could not load your identity. Is the server up?</p>
+        <p class="error">{IDENTITY_ERROR}</p>
       </Show>
-
       <Show when={me()} fallback={<Show when={!me.error}><p class="empty">loading…</p></Show>}>
-        <Show
-          when={me()!.can_administer}
-          fallback={
-            <div class="panel">
-              <div class="panel-h"><span>Settings</span></div>
-              <div class="secrets-body">
-                <p class="empty">
-                  These settings need the <b>Administer</b> capability on the organization.
-                  Ask an owner if you need access.
-                </p>
-              </div>
-            </div>
-          }
-        >
-          <Connections />
-          <Show
-            when={org()}
-            fallback={
-              <div class="panel">
-                <div class="panel-h"><span>API tokens &amp; org secrets</span></div>
-                <div class="secrets-body">
-                  <p class="empty">
-                    No organization yet. An org comes into being with its first connected
-                    repository — connect a forge and bind a repo, then org-wide secrets and
-                    API tokens live here.
-                  </p>
+        <div class="settings">
+          <nav class="settings-nav" aria-label="Settings">
+            <For each={groups()}>
+              {(g) => (
+                <div class="settings-nav-group">
+                  <div class="settings-nav-h">{g.heading}</div>
+                  <Show when={g.org}>
+                    {(o) => <OrgSwitch org={o()} others={g.otherOrgs ?? []} section={props.section} />}
+                  </Show>
+                  <For each={g.items}>
+                    {(item) => (
+                      <A
+                        href={item.href}
+                        class="settings-nav-link"
+                        classList={{ on: active() === item.href }}
+                        aria-current={active() === item.href ? "page" : undefined}
+                      >
+                        {item.label}
+                      </A>
+                    )}
+                  </For>
                 </div>
-              </div>
-            }
-          >
-            {(o) => (
-              <>
-                {/* Org-scoped: a token narrowed to one Project is still issued
-                    against the org that contains it, so this needs the same
-                    `admin_orgs[0]` the secrets below do. */}
-                {/* Who holds what (ADR-0049/0069) — first among the org panels,
-                    because every other permission on this page is someone's. */}
-                <Members org={o()} />
-                {/* Step-up (ADR-0073): who can still confirm a crown jewel, who
-                    was refused, and the Org's security event log — next to
-                    Members, because the admins it counts are theirs. */}
-                <OrgSecurity org={o()} />
-                {/* Org-level Environments (ADR-0071): org admins administer
-                    them until an Environment gets an RBAC scope of its own. */}
-                <OrgEnvironments org={o()} />
-                {/* Plugins (ADR-0072): installed, killed and connected here. */}
-                <Plugins org={o()} />
-                {/* Libraries (ADR-0076): installed, upgraded and yanked here. */}
-                <Libraries org={o()} />
-                <ApiTokens org={o()} />
-                <ScopedSecrets
-                  scope={{ org: o() }}
-                  title={`Org secrets · ${o()}`}
-                  emptyLabel="No org-wide secrets yet."
-                />
-                <p class="subtle">
-                  <small>
-                    <Icon icon="key-round" size={12} /> Org secrets are the base of the
-                    inheritance chain — every repo and environment in <b>{o()}</b> resolves
-                    them unless it sets the same key at a narrower scope. Per-repo and
-                    per-environment values live on the repository's Secrets tab.
-                  </small>
-                </p>
-              </>
-            )}
-          </Show>
-        </Show>
+              )}
+            </For>
+          </nav>
+
+          <div class="settings-main">
+            <select
+              class="input settings-select"
+              aria-label="Settings section"
+              onChange={(e) => nav(e.currentTarget.value)}
+            >
+              <For each={groups()}>
+                {(g) => (
+                  <optgroup label={g.org ? `${g.heading} · ${g.org}` : g.heading}>
+                    <For each={g.items}>
+                      {(item) => (
+                        <option value={item.href} selected={active() === item.href}>
+                          {item.label}
+                        </option>
+                      )}
+                    </For>
+                  </optgroup>
+                )}
+              </For>
+            </select>
+
+            <Switch fallback={props.children}>
+              <Match when={props.kind === "org" && !administers(me(), props.org)}>
+                <NotYours org={props.org!} />
+              </Match>
+              <Match when={props.kind === "server" && !me()?.global_admin}>
+                <NotGlobalAdmin />
+              </Match>
+            </Switch>
+          </div>
+        </div>
       </Show>
     </section>
   );
+}
+
+/** One step of a page's trail; the last is the page itself (no `href`). */
+export interface Crumb {
+  label: string;
+  href?: string;
+  mono?: boolean;
+}
+
+/**
+ * The heading of a page under a section, inside the settings main column:
+ * the trail from the section down to this page, e.g.
+ * Environments › production › Edit.
+ */
+export function SettingsCrumbs(props: { trail: Crumb[]; sub: JSX.Element }) {
+  return (
+    <>
+      <div class="page-head">
+        <h1 class="settings-crumb">
+          <For each={props.trail}>
+            {(c, i) => (
+              <>
+                <Show when={i() > 0}>
+                  <Icon icon="chevron-right" size={16} class="settings-crumb-sep" />
+                </Show>
+                <Show
+                  when={c.href}
+                  fallback={
+                    <span class="settings-crumb-here" classList={{ mono: !!c.mono }} aria-current="page">
+                      {c.label}
+                    </span>
+                  }
+                >
+                  {(href) => (
+                    <A href={href()} class="settings-crumb-link" classList={{ mono: !!c.mono }}>
+                      {c.label}
+                    </A>
+                  )}
+                </Show>
+              </>
+            )}
+          </For>
+        </h1>
+      </div>
+      <p class="page-sub">{props.sub}</p>
+    </>
+  );
+}
+
+/** The org name in the group heading; a picker when there is more than one. */
+function OrgSwitch(props: { org: string; others: string[]; section?: string }) {
+  const nav = useNavigate();
+  return (
+    <Show when={props.others.length > 0} fallback={<div class="settings-nav-org mono">{props.org}</div>}>
+      <select
+        class="input settings-nav-orgpick mono"
+        aria-label="Organization"
+        onChange={(e) => nav(orgHref(e.currentTarget.value, props.section ?? FIRST_ORG_SECTION))}
+      >
+        <For each={[props.org, ...props.others].sort()}>
+          {(o) => (
+            <option value={o} selected={o === props.org}>
+              {o}
+            </option>
+          )}
+        </For>
+      </select>
+    </Show>
+  );
+}
+
+function SectionPage(props: { kind: SettingsGroupKind; org?: string; section: SettingsSection }) {
+  // The body is built once per org and section: a body reads the org when it
+  // is built, so switching org on the same section (the org picker, ⌘K) must
+  // build it again, not only switching section. The child keeps its
+  // parameter: Show calls a child function only when it takes one.
+  const key = createMemo(() => `${props.kind}:${props.org ?? ""}:${props.section.id}`);
+  return (
+    <>
+      <div class="page-head">
+        <h1>{props.section.label}</h1>
+      </div>
+      <p class="page-sub">
+        <Switch fallback="your account">
+          <Match when={props.kind === "org"}>
+            <span class="mono">{props.org}</span>
+          </Match>
+          <Match when={props.kind === "server"}>this server</Match>
+        </Switch>{" "}
+        · {props.section.sub}
+      </p>
+      <Show when={key()} keyed>
+        {(_key) =>
+          props.kind === "account"
+            ? accountBody(props.section.id)
+            : props.kind === "server"
+              ? serverBody(props.section.id)
+              : orgBody(props.section.id, props.org!)
+        }
+      </Show>
+    </>
+  );
+}
+
+function accountBody(id: string): JSX.Element {
+  switch (id) {
+    case "profile":
+      return <LinkedAccounts />;
+    case "security":
+      return <SecuritySettings />;
+    case "tokens":
+      return <MyApiTokens />;
+    case "appearance":
+      return <AppearanceSettings />;
+    default:
+      return <NotFound />;
+  }
+}
+
+function serverBody(id: string): JSX.Element {
+  switch (id) {
+    case "connect-forge":
+      return <ConnectForge />;
+    default:
+      return <NotFound />;
+  }
+}
+
+function orgBody(id: string, org: string): JSX.Element {
+  switch (id) {
+    case "connections":
+      return <Connections org={org} />;
+    case "members":
+      return <Members org={org} />;
+    case "environments":
+      return <OrgEnvironments org={org} />;
+    case "plugins":
+      return <Plugins org={org} />;
+    case "libraries":
+      return <Libraries org={org} />;
+    case "secrets":
+      return (
+        <>
+          <ScopedSecrets scope={{ org }} title={`Org secrets · ${org}`} emptyLabel="No org-wide secrets yet." />
+          <p class="subtle">
+            <small>
+              <Icon icon="key-round" size={12} /> Org secrets are the base of the inheritance chain —
+              every repo and environment in <b>{org}</b> resolves them unless it sets the same key at
+              a narrower scope. Per-repo and per-environment values live on the repository's Secrets
+              tab.
+            </small>
+          </p>
+        </>
+      );
+    case "tokens":
+      return <OrgApiTokens org={org} />;
+    case "security":
+      return <OrgSecurity org={org} />;
+    case "events":
+      return <EventLog org={org} />;
+    default:
+      return <NotFound />;
+  }
+}
+
+function NotYours(props: { org: string }) {
+  return (
+    <div class="panel">
+      <div class="panel-h"><span>Organization settings</span></div>
+      <div class="secrets-body">
+        <p class="empty">
+          You do not administer <b class="mono">{props.org}</b>. These settings need the{" "}
+          <b>Administer</b> capability on the organization; ask an owner if you need access.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function NotGlobalAdmin() {
+  return (
+    <div class="panel">
+      <div class="panel-h"><span>Server administration</span></div>
+      <div class="secrets-body">
+        <p class="empty">
+          This section needs a global <b>Administer</b> role. Ask a server administrator if you need
+          a new organization connected.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function NotFound() {
+  return <p class="empty">There is no such settings section.</p>;
 }

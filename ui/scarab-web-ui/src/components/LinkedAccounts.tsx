@@ -1,16 +1,12 @@
-// Your account (ADR-0069): the sign-in accounts linked to you, and the way to
-// link another or unlink one.
+// Your sign-in accounts: the accounts linked to you, and the way
+// to link another or unlink one. The Profile section of Your account.
 //
-// Open to everyone signed in — unlike Settings, nothing here is about the org.
-// Linking is a full browser round-trip to the provider (the server needs the
-// provider to prove you control that account), so the Link button POSTs for
-// an authorize URL and then NAVIGATES; the callback lands back here with the
-// outcome in the query string, which is read once and shown as a notice.
-//
-// Below them, Security (ADR-0073): passkeys and your security events. It has
-// its own address, `/account/security`, because that is where every "enroll a
-// passkey" link and the fresh-login redirect land.
-import { For, Show, createResource, createSignal, onMount } from "solid-js";
+// Open to everyone signed in. Linking is a full browser round-trip to the
+// provider (the server needs the provider to prove you control that account),
+// so the Link button POSTs for an authorize URL and then NAVIGATES; the
+// callback lands back on this section with the outcome in the query string,
+// which is read once and shown as a notice.
+import { For, Show, createResource, createSignal } from "solid-js";
 import { useLocation } from "@solidjs/router";
 import {
   beginLinkIdentity,
@@ -18,11 +14,10 @@ import {
   listAuthProviders,
   unlinkIdentity,
 } from "../api/client";
-import Icon from "../components/Icon";
-import SecuritySettings from "../components/SecuritySettings";
+import Icon from "./Icon";
 import { canUnlink, linkNotice, linkable, providerName } from "../identities";
 
-export default function Account() {
+export default function LinkedAccounts() {
   const location = useLocation();
   const [me, { refetch }] = createResource(getMe);
   const [providers] = createResource(listAuthProviders);
@@ -30,11 +25,6 @@ export default function Account() {
   const [error, setError] = createSignal<string | null>(null);
 
   const notice = () => linkNotice(location.search, providers() ?? []);
-  onMount(() => {
-    if (location.pathname.endsWith("/security")) {
-      queueMicrotask(() => document.getElementById("security")?.scrollIntoView({ block: "start" }));
-    }
-  });
   const identities = () => me()?.identities ?? [];
 
   const link = async (provider: string) => {
@@ -69,18 +59,14 @@ export default function Account() {
   };
 
   return (
-    <section class="page">
-      <div class="page-head">
-        <h1>Account</h1>
-      </div>
-      <p class="page-sub">
-        the accounts you sign in with
-        <Show when={me()}>
-          {/* The id grants and approver lists name — shown verbatim, never in
-              the uppercased panel header, because it is matched exactly. */}
-          {" "}· you are <code class="mono">{me()!.subject}</code>
-        </Show>
-      </p>
+    <>
+      <Show when={me()}>
+        {/* The id grants and approver lists name — shown verbatim, never in
+            the uppercased panel header, because it is matched exactly. */}
+        <p class="subtle">
+          You are <code class="mono">{me()!.subject}</code>.
+        </p>
+      </Show>
 
       <Show when={notice()}>
         {(n) => <p class={n().kind === "error" ? "error" : "notice-ok"}>{n().text}</p>}
@@ -159,8 +145,6 @@ export default function Account() {
           </p>
         </div>
       </div>
-
-      <SecuritySettings />
-    </section>
+    </>
   );
 }

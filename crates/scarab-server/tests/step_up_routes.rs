@@ -62,6 +62,9 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
     ("POST", "/v1/me/step-up/options", "step_up.options", "CER"),
     ("POST", "/v1/me/step-up", "step_up.confirm", "CER"),
     ("GET", "/v1/me/security/events", "read", "READ"),
+    ("GET", "/v1/me/tokens", "read", "READ"),
+    ("POST", "/v1/me/tokens", "token.mint_own", "CJ-A"),
+    ("DELETE", "/v1/me/tokens/{id}", "token.revoke_own", "EX"),
     ("GET", "/v1/security/events", "read", "READ"),
     ("GET", "/v1/orgs/{org}/security/events", "read", "READ"),
     ("GET", "/v1/orgs/{org}/security/summary", "read", "READ"),
@@ -484,6 +487,12 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
         "CJ-W",
     ),
     (
+        "PUT",
+        "/v1/connections/{id}/org",
+        "connection.assign_org",
+        "CJ-W",
+    ),
+    (
         "POST",
         "/v1/connections/{id}/resync",
         "connection.resync",
@@ -760,7 +769,7 @@ async fn every_crown_jewel_needs_a_step_up_even_for_an_owner() {
         assert!(is_step_up(st, &b), "{} {}: {st} {b}", r.method, r.path);
         assert_eq!(b["mode"], "enroll", "{} {}: {b}", r.method, r.path);
         assert_eq!(b["op"], r.op.id);
-        assert_eq!(b["enroll_url"], "/account/security?enroll=1");
+        assert_eq!(b["enroll_url"], "/settings/security?enroll=1");
         assert!(b["message"].as_str().unwrap().contains("step-up"));
     }
 
@@ -828,7 +837,7 @@ async fn a_refusal_never_echoes_a_secret_value() {
         (
             "POST",
             "/v1/connections",
-            json!({"kind": "github", "base_url": "https://github.com", "credential": "S3CR3T-pat"}),
+            json!({"org": "acme", "kind": "github", "base_url": "https://github.com", "credential": "S3CR3T-pat"}),
         ),
         (
             "PUT",
@@ -877,6 +886,9 @@ fn well_formed(r: &scarab_server::RouteEntry) -> (String, Option<Value>) {
         ("POST", "/v1/orgs/{org}/tokens") => {
             Some(json!({"name": "ci", "role": "member", "expires_in_days": 1}))
         }
+        ("POST", "/v1/me/tokens") => {
+            Some(json!({"org": "acme", "name": "ci", "role": "member", "expires_in_days": 1}))
+        }
         ("POST", "/v1/repos/{org}/{repo}/bindings/import") => Some(json!({"subjects": []})),
         ("POST", "/v1/secrets") => Some(json!({"org": "acme", "name": "X", "value": "v"})),
         ("DELETE", "/v1/secrets") => return ("/v1/secrets?org=acme&name=X".into(), None),
@@ -887,9 +899,10 @@ fn well_formed(r: &scarab_server::RouteEntry) -> (String, Option<Value>) {
             Some(json!({"base_url": "https://argo.example", "credential": "c"}))
         }
         ("POST", "/v1/connections") => {
-            Some(json!({"kind": "github", "base_url": "https://github.com", "credential": "c"}))
+            Some(json!({"org": "acme", "kind": "github", "base_url": "https://github.com", "credential": "c"}))
         }
         ("POST", "/v1/connections/{id}/repos") => Some(json!({"owner": "acme", "name": "web"})),
+        ("PUT", "/v1/connections/{id}/org") => Some(json!({"org": "acme"})),
         ("PUT", "/v1/orgs/{org}/libraries/{publisher}/{name}") => {
             Some(json!({"content_hash": "a".repeat(64)}))
         }
@@ -973,7 +986,7 @@ async fn exempt_and_ungoverned_routes_never_ask_for_a_step_up() {
         );
         checked += 1;
     }
-    assert_eq!(checked, 35, "the EX + NG mutating routes");
+    assert_eq!(checked, 36, "the EX + NG mutating routes");
     assert!(h.events_of("step_up.refused").is_empty());
 }
 

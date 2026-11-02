@@ -1,0 +1,57 @@
+---
+title: API tokens
+description: Personal tokens for the CLI, scripts and CI jobs on other systems. Each token acts as the person who minted it, inside one org or project, up to a role ceiling, until it expires or is revoked.
+---
+
+An API token lets something that is not a browser call Scarab as you: `scarab-cli`, a CI job on
+another system, a status poller, an agent that starts Runs. Send it as
+`Authorization: Bearer scarab_pat_…`, or give it to the CLI as `SCARAB_TOKEN`.
+
+## Your tokens
+
+Tokens are personal. You mint, list and revoke your own under **Settings › Your account › API
+tokens** (`/settings/tokens`), or through the API:
+
+| Call | What it does |
+|------|--------------|
+| `GET /v1/me/tokens` | your tokens, in every org, newest first. Called with a token, it lists only your tokens inside that token's scope |
+| `POST /v1/me/tokens` | mint one; the body names `org`, `name`, `role`, `expires_in_days` and, optionally, `project` |
+| `DELETE /v1/me/tokens/{id}` | revoke one of yours. A token cannot call it (403): sign in, or ask an org admin |
+
+You may mint a token in any org or project where you hold a role, a viewer role included.
+When you mint a token you choose:
+
+- **Scope**: one org, or one project in it. A project-scoped token cannot see another
+  project's Runs.
+- **Role ceiling**: `viewer`, `member`, `admin` or `owner`, never higher than the role you hold
+  in that scope. On every request the token gets the lower of its ceiling and the role you hold
+  at that moment, so when your access is removed, your tokens lose it too.
+- **Lifetime**: 1 to 365 days. There is no token that never expires.
+
+Minting needs a passkey confirmation each time, and a token cannot mint tokens. The plaintext is
+shown once, in the mint response. Scarab stores only its SHA-256, so a lost token is replaced,
+not recovered.
+
+`POST /v1/orgs/{org}/tokens` still works for clients written before `/v1/me/tokens`. It mints
+the same personal token, with the org taken from the path.
+
+## The org's list
+
+Org admins see every token issued in their org under **Settings › Organization settings › API
+tokens** (`/orgs/<org>/settings/tokens`), or with `GET /v1/orgs/{org}/tokens`. Each row shows the
+token's owner, name, scope and ceiling, when it was created, when it was last used, how many
+calls it has made, and when it expires. Sort it with `?sort=last_used` (the default),
+`?sort=use_count` or `?sort=created`; each sorts newest or largest first. An admin can revoke any
+token in the org (`DELETE /v1/orgs/{org}/tokens/{id}`). Nobody mints from this page.
+
+Last use and the call count are approximate. The server counts calls in memory and writes them
+at most once a minute per token, when a token list is read, when it is told to shut down, and
+after its last connection closes. A list can lag by a minute. A server replica that stops
+without shutting down, or whose shutdown outlasts the Pod's termination grace period, loses the
+calls it had not written yet.
+
+## Not available yet
+
+An org policy that decides who may issue tokens, and which scopes and lifetimes they may choose,
+is not built yet. Until it is, anyone with a role in an org or project, viewers included, may
+issue a token there up to that role, for up to 365 days.

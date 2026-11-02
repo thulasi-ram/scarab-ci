@@ -25,7 +25,8 @@ use scarab_engine::{
     ServiceStatus, StepId, StepRun, StepSpec, StepStatus, Timestamp,
 };
 use scarab_forge::{
-    ForgeConnection, ForgeConnectionStore, ForgeKind, RegistryError, RepoRef, ResolvedRepo,
+    ForgeConnection, ForgeConnectionStore, ForgeKind, OrgAssignView, RegistryError, RepoRef,
+    ResolvedRepo,
 };
 use scarab_project::{Deployment, Environment, EnvironmentStore, ProjectError};
 
@@ -45,7 +46,7 @@ mod policies;
 /// Step-up confirmation (ADR-0073): `PasskeyStore`, `ChallengeStore`,
 /// `StepUpStore` and the append-only `SecurityEventLog`.
 mod step_up;
-pub use step_up::step_up_request_lock_key;
+pub use step_up::{step_up_request_lock_key, BindingRow};
 
 /// The embedded, ordered set of forward-only migrations. `MIGRATOR.run(pool)`
 /// applies all pending ones (tracked in `_sqlx_migrations`); tests can also walk
@@ -3029,27 +3030,48 @@ fn lease_of(r: &sqlx::postgres::PgRow) -> Lease {
 #[async_trait]
 impl ForgeConnectionStore for PostgresDb {
     async fn put_connection(&self, conn: &ForgeConnection) -> Result<(), RegistryError> {
+        let mut tx = self.pool().begin().await.map_err(reg_err)?;
+        // The connection's Org enters the Org record (git-bug 19b0a45).
+        if let Some(org) = &conn.org {
+            sqlx::query("INSERT INTO orgs (name) VALUES ($1) ON CONFLICT (name) DO NOTHING")
+                .bind(org)
+                .execute(&mut *tx)
+                .await
+                .map_err(reg_err)?;
+        }
+        // A known account id is kept when the writer does not know it (boot
+        // provisioning, the connection form): it is a fact about the forge
+        // account, recorded only from an installation delivery.
         sqlx::query(
-            "INSERT INTO forge_connections (id, kind, base_url, credential_ref)
-             VALUES ($1, $2, $3, $4)
+            "INSERT INTO forge_connections
+                 (id, kind, base_url, credential_ref, org, installation_id, account_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
              ON CONFLICT (id) DO UPDATE SET
                  kind = EXCLUDED.kind,
                  base_url = EXCLUDED.base_url,
-                 credential_ref = EXCLUDED.credential_ref",
+                 credential_ref = EXCLUDED.credential_ref,
+                 org = EXCLUDED.org,
+                 installation_id = EXCLUDED.installation_id,
+                 account_id = COALESCE(EXCLUDED.account_id, forge_connections.account_id)",
         )
         .bind(&conn.id)
         .bind(conn.kind.as_str())
         .bind(&conn.base_url)
         .bind(&conn.credential_ref)
-        .execute(self.pool())
+        .bind(&conn.org)
+        .bind(conn.installation_id.map(|i| i as i64))
+        .bind(conn.account_id.map(|i| i as i64))
+        .execute(&mut *tx)
         .await
         .map_err(reg_err)?;
+        tx.commit().await.map_err(reg_err)?;
         Ok(())
     }
 
     async fn get_connection(&self, id: &str) -> Result<Option<ForgeConnection>, RegistryError> {
         let row = sqlx::query(
-            "SELECT id, kind, base_url, credential_ref FROM forge_connections WHERE id = $1",
+            "SELECT id, kind, base_url, credential_ref, org, installation_id, account_id
+             FROM forge_connections WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(self.pool())
@@ -3060,7 +3082,8 @@ impl ForgeConnectionStore for PostgresDb {
 
     async fn list_connections(&self) -> Result<Vec<ForgeConnection>, RegistryError> {
         let rows = sqlx::query(
-            "SELECT id, kind, base_url, credential_ref FROM forge_connections ORDER BY id",
+            "SELECT id, kind, base_url, credential_ref, org, installation_id, account_id
+             FROM forge_connections ORDER BY id",
         )
         .fetch_all(self.pool())
         .await
@@ -3085,22 +3108,77 @@ impl ForgeConnectionStore for PostgresDb {
         org: &str,
         project: &str,
     ) -> Result<(), RegistryError> {
-        sqlx::query(
+        let mut tx = self.pool().begin().await.map_err(reg_err)?;
+        // Held to commit: an assign of this connection, or of any connection
+        // to this Org, waits for the bind, and the bind waits for it. The
+        // connection's Org is read under the row lock, so a bind cannot land
+        // a repo of another owner on a connection being assigned
+        // (git-bug 19b0a45).
+        lock_org(&mut tx, org).await?;
+        let conn_org: Option<Option<String>> =
+            sqlx::query_scalar("SELECT org FROM forge_connections WHERE id = $1 FOR SHARE")
+                .bind(connection_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(reg_err)?;
+        if let Some(Some(conn_org)) = conn_org {
+            if repo.owner != conn_org || org != conn_org {
+                return Err(RegistryError::OrgMismatch {
+                    connection: connection_id.to_string(),
+                    connection_org: conn_org,
+                    owner: repo.owner.clone(),
+                    name: repo.name.clone(),
+                });
+            }
+        }
+        sqlx::query("INSERT INTO orgs (name) VALUES ($1) ON CONFLICT (name) DO NOTHING")
+            .bind(org)
+            .execute(&mut *tx)
+            .await
+            .map_err(reg_err)?;
+        // A re-bind moves the repo only off a connection that does not serve
+        // its owner: an unassigned one, or one of another Org that holds it
+        // by mistake (git-bug 19b0a45). The guard is the upsert's own
+        // `WHERE`, so it is evaluated against the row as it stands when the
+        // write happens: two
+        // concurrent binds of an unbound repo cannot both win, and a move
+        // checked against a stale read cannot slip through.
+        let written = sqlx::query(
             "INSERT INTO forge_repos (connection_id, owner, name, org, project)
              VALUES ($1, $2, $3, $4, $5)
              ON CONFLICT (owner, name) DO UPDATE SET
                  connection_id = EXCLUDED.connection_id,
                  org = EXCLUDED.org,
-                 project = EXCLUDED.project",
+                 project = EXCLUDED.project
+             WHERE forge_repos.connection_id = EXCLUDED.connection_id
+                OR NOT EXISTS (
+                    SELECT 1 FROM forge_connections c
+                     WHERE c.id = forge_repos.connection_id AND c.org = forge_repos.owner)",
         )
         .bind(connection_id)
         .bind(&repo.owner)
         .bind(&repo.name)
         .bind(org)
         .bind(project)
-        .execute(self.pool())
+        .execute(&mut *tx)
         .await
         .map_err(reg_err)?;
+        if written.rows_affected() == 0 {
+            let holder: String = sqlx::query_scalar(
+                "SELECT connection_id FROM forge_repos WHERE owner = $1 AND name = $2",
+            )
+            .bind(&repo.owner)
+            .bind(&repo.name)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(reg_err)?;
+            return Err(RegistryError::BoundElsewhere {
+                owner: repo.owner.clone(),
+                name: repo.name.clone(),
+                connection: holder,
+            });
+        }
+        tx.commit().await.map_err(reg_err)?;
         Ok(())
     }
 
@@ -3136,7 +3214,8 @@ impl ForgeConnectionStore for PostgresDb {
 
     async fn resolve(&self, repo: &RepoRef) -> Result<Option<ResolvedRepo>, RegistryError> {
         let row = sqlx::query(
-            "SELECT c.id, c.kind, c.base_url, c.credential_ref, r.org, r.project
+            "SELECT c.id, c.kind, c.base_url, c.credential_ref, c.org AS conn_org,
+                    c.installation_id, c.account_id, r.org, r.project
              FROM forge_repos r JOIN forge_connections c ON c.id = r.connection_id
              WHERE r.owner = $1 AND r.name = $2",
         )
@@ -3202,6 +3281,136 @@ impl ForgeConnectionStore for PostgresDb {
         Ok(())
     }
 
+    /// The `orgs` table (git-bug 19b0a45): an Org outlives its last binding.
+    /// The Orgs of bindings are added: during a rolling upgrade a server
+    /// built before the `orgs` table binds repos without recording their Org.
+    async fn list_orgs(&self) -> Result<Vec<String>, RegistryError> {
+        sqlx::query_scalar(
+            "SELECT name FROM orgs
+             UNION
+             SELECT DISTINCT org FROM forge_repos WHERE org NOT LIKE '\\_%'
+             ORDER BY 1",
+        )
+        .fetch_all(self.pool())
+        .await
+        .map_err(reg_err)
+    }
+
+    async fn record_org(&self, org: &str) -> Result<(), RegistryError> {
+        if org.is_empty() || scarab_forge::is_reserved_org(org) {
+            return Ok(());
+        }
+        sqlx::query("INSERT INTO orgs (name) VALUES ($1) ON CONFLICT (name) DO NOTHING")
+            .bind(org)
+            .execute(self.pool())
+            .await
+            .map_err(reg_err)?;
+        Ok(())
+    }
+
+    async fn set_connection_account(&self, id: &str, account_id: u64) -> Result<(), RegistryError> {
+        sqlx::query("UPDATE forge_connections SET account_id = $2 WHERE id = $1")
+            .bind(id)
+            .bind(account_id as i64)
+            .execute(self.pool())
+            .await
+            .map_err(reg_err)?;
+        Ok(())
+    }
+
+    /// One transaction: the Org's advisory lock, then the connection row
+    /// `FOR UPDATE`, then the reads `decide` is asked about, then the write.
+    async fn assign_connection_org(
+        &self,
+        id: &str,
+        org: &str,
+        decide: &(dyn for<'v> Fn(&'v OrgAssignView) -> Option<String> + Send + Sync),
+    ) -> Result<Result<ForgeConnection, String>, RegistryError> {
+        let mut tx = self.pool().begin().await.map_err(reg_err)?;
+        lock_org(&mut tx, org).await?;
+        let conn = sqlx::query(
+            "SELECT id, kind, base_url, credential_ref, org, installation_id, account_id
+             FROM forge_connections WHERE id = $1 FOR UPDATE",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(reg_err)?
+        .map(connection_from_row)
+        .transpose()?
+        .ok_or_else(|| RegistryError::Store(format!("no connection `{id}`")))?;
+        let bindings = sqlx::query(
+            "SELECT owner, name, org FROM forge_repos WHERE connection_id = $1
+             ORDER BY owner, name",
+        )
+        .bind(id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(reg_err)?
+        .into_iter()
+        .map(|r| {
+            (
+                RepoRef {
+                    owner: r.get::<String, _>("owner"),
+                    name: r.get::<String, _>("name"),
+                },
+                r.get::<String, _>("org"),
+            )
+        })
+        .collect();
+        let servers = sqlx::query(
+            "SELECT id, kind, base_url, credential_ref, org, installation_id, account_id
+             FROM forge_connections c
+             WHERE c.id <> $1
+               AND (c.org = $2
+                    OR (c.org IS NULL AND EXISTS (
+                        SELECT 1 FROM forge_repos r
+                         WHERE r.connection_id = c.id AND r.org = $2)))
+             ORDER BY id",
+        )
+        .bind(id)
+        .bind(org)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(reg_err)?
+        .into_iter()
+        .map(connection_from_row)
+        .collect::<Result<Vec<_>, _>>()?;
+        let org_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM orgs WHERE name = $1)
+                 OR EXISTS (SELECT 1 FROM forge_repos WHERE org = $1)",
+        )
+        .bind(org)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(reg_err)?;
+        let view = OrgAssignView {
+            conn,
+            bindings,
+            servers,
+            org_exists,
+        };
+        if let Some(reason) = decide(&view) {
+            return Ok(Err(reason));
+        }
+        sqlx::query("UPDATE forge_connections SET org = $2 WHERE id = $1")
+            .bind(id)
+            .bind(org)
+            .execute(&mut *tx)
+            .await
+            .map_err(reg_err)?;
+        sqlx::query("INSERT INTO orgs (name) VALUES ($1) ON CONFLICT (name) DO NOTHING")
+            .bind(org)
+            .execute(&mut *tx)
+            .await
+            .map_err(reg_err)?;
+        tx.commit().await.map_err(reg_err)?;
+        Ok(Ok(ForgeConnection {
+            org: Some(org.to_string()),
+            ..view.conn
+        }))
+    }
+
     async fn config_owned_connection_ids(&self) -> Result<Vec<String>, RegistryError> {
         let rows =
             sqlx::query("SELECT id FROM forge_connections WHERE owned_by_config ORDER BY id")
@@ -3214,13 +3423,42 @@ impl ForgeConnectionStore for PostgresDb {
 
 fn connection_from_row(r: sqlx::postgres::PgRow) -> Result<ForgeConnection, RegistryError> {
     let kind = r.get::<String, _>("kind");
+    // `resolve` joins the binding's own `org`, so it names the connection's
+    // `conn_org`; every other query selects it as `org`.
+    let org = match r.try_get::<Option<String>, _>("conn_org") {
+        Ok(org) => org,
+        Err(_) => r.get::<Option<String>, _>("org"),
+    };
     Ok(ForgeConnection {
         id: r.get::<String, _>("id"),
         kind: ForgeKind::from_str_token(&kind)
             .ok_or_else(|| RegistryError::Store(format!("unknown forge kind {kind:?}")))?,
         base_url: r.get::<String, _>("base_url"),
         credential_ref: r.get::<String, _>("credential_ref"),
+        org,
+        installation_id: r
+            .get::<Option<i64>, _>("installation_id")
+            .and_then(|i| u64::try_from(i).ok()),
+        account_id: r
+            .get::<Option<i64>, _>("account_id")
+            .and_then(|i| u64::try_from(i).ok()),
     })
+}
+
+/// The transaction-scoped advisory lock every change to who serves `org`
+/// takes (git-bug 19b0a45): an assign of a connection to it and a bind of a
+/// repo into it. They then run one after the other, so a check one of them
+/// makes cannot be undone by the other before it writes.
+async fn lock_org(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    org: &str,
+) -> Result<(), RegistryError> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("scarab:org:{org}"))
+        .execute(&mut **tx)
+        .await
+        .map_err(reg_err)?;
+    Ok(())
 }
 
 fn reg_err(e: sqlx::Error) -> RegistryError {
@@ -4274,6 +4512,8 @@ fn api_token_from_row(r: &sqlx::postgres::PgRow) -> Option<scarab_identity::ApiT
         created_by: r.get::<String, _>("created_by"),
         created_at: r.get::<i64, _>("created_at"),
         last_used_at: r.get::<Option<i64>, _>("last_used_at"),
+        // BIGINT, never negative: it only ever grows by `touch`'s `uses`.
+        use_count: u64::try_from(r.get::<i64, _>("use_count")).unwrap_or(0),
         revoked_at: r.get::<Option<i64>, _>("revoked_at"),
     })
 }
@@ -4847,7 +5087,8 @@ impl scarab_identity::IdentityStore for PostgresDb {
 }
 
 const API_TOKEN_COLS: &str = "id, name, owner_subject, scope_org, scope_project, role, \
-                              expires_at, created_by, created_at, last_used_at, revoked_at";
+                              expires_at, created_by, created_at, last_used_at, use_count, \
+                              revoked_at";
 
 #[async_trait]
 impl scarab_identity::ApiTokenStore for PostgresDb {
@@ -4926,6 +5167,22 @@ impl scarab_identity::ApiTokenStore for PostgresDb {
         Ok(rows.iter().filter_map(api_token_from_row).collect())
     }
 
+    async fn list_owned(
+        &self,
+        owner: &str,
+    ) -> Result<Vec<scarab_identity::ApiToken>, scarab_identity::IdentityError> {
+        // `api_tokens_owner_idx` serves this.
+        let rows = sqlx::query(&format!(
+            "SELECT {API_TOKEN_COLS} FROM api_tokens WHERE owner_subject = $1 \
+             ORDER BY created_at DESC, id"
+        ))
+        .bind(owner)
+        .fetch_all(self.pool())
+        .await
+        .map_err(identity_err)?;
+        Ok(rows.iter().filter_map(api_token_from_row).collect())
+    }
+
     async fn revoke(&self, id: &str, now_ms: i64) -> Result<bool, scarab_identity::IdentityError> {
         // `revoked_at IS NULL` makes this idempotent AND honest: a second
         // revoke reports false rather than moving the stamp, so the record of
@@ -4941,15 +5198,24 @@ impl scarab_identity::ApiTokenStore for PostgresDb {
         Ok(done.rows_affected() > 0)
     }
 
-    async fn touch(&self, id: &str, now_ms: i64) -> Result<(), scarab_identity::IdentityError> {
+    async fn touch(
+        &self,
+        id: &str,
+        now_ms: i64,
+        uses: u64,
+    ) -> Result<(), scarab_identity::IdentityError> {
         // Monotonic: two in-flight requests cannot make last_used_at go
-        // backwards, which would misreport a token as staler than it is.
+        // backwards, which would misreport a token as staler than it is. The
+        // count is added in the same statement, so a late batch still counts.
         sqlx::query(
-            "UPDATE api_tokens SET last_used_at = $2
-             WHERE id = $1 AND (last_used_at IS NULL OR last_used_at < $2)",
+            "UPDATE api_tokens
+                SET last_used_at = GREATEST(COALESCE(last_used_at, $2), $2),
+                    use_count = use_count + $3
+              WHERE id = $1",
         )
         .bind(id)
         .bind(now_ms)
+        .bind(i64::try_from(uses).unwrap_or(i64::MAX))
         .execute(self.pool())
         .await
         .map_err(identity_err)?;

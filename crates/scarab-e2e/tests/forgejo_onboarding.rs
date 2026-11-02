@@ -56,6 +56,7 @@ async fn a_real_forgejo_repo_onboards_and_its_push_becomes_a_run() {
     let created = json_ok(
         http.post(format!("{base}/v1/connections"))
             .json(&serde_json::json!({
+                "org": owner,
                 "kind": "forgejo",
                 "base_url": server_side,
                 "credential": token,

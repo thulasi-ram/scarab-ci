@@ -1,4 +1,4 @@
-// The signed-in principal, fetched once for the whole app (ADR-0049).
+// The signed-in principal, fetched once for the whole app.
 //
 // Several bits of chrome need it — the avatar, the Settings nav entry, the
 // command palette — and they must agree. A module-level resource makes it one
@@ -7,16 +7,8 @@
 import { createResource } from "solid-js";
 import { getMe, type Me } from "./api/client";
 
-const [me] = createResource<Me>(getMe);
+const [me, { refetch: refetchMe }] = createResource<Me>(getMe);
 
-export { me };
-
-/**
- * May the current principal administer org-level settings (ADR-0060)?
- *
- * Drives whether the Settings nav entry renders at all. Defaults to `false`
- * while loading or on error — chrome that appears and then vanishes is worse
- * than chrome that arrives a beat late. This is presentation only: the server
- * enforces `Administer` on every request regardless.
- */
-export const canAdminister = () => me()?.can_administer ?? false;
+// Refetched when something the caller just did changes the answer: adding a
+// new org's first connection makes that org appear in `admin_orgs`.
+export { me, refetchMe };

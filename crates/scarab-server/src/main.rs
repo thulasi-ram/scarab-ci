@@ -158,6 +158,97 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Operator grant: seed a role binding straight in the database (a fresh
+    // install's first members). Same shape as the break-glass above.
+    if let Some(scarab_server::config::ServerCommand::Admin {
+        command:
+            scarab_server::config::AdminCommand::Grant {
+                org,
+                subject,
+                role,
+                if_absent,
+                reason,
+            },
+    }) = &cli.command
+    {
+        let Some(url) = cli.database_url.as_deref() else {
+            eprintln!("scarab-server admin grant: set --database-url or SCARAB_DATABASE_URL");
+            std::process::exit(2);
+        };
+        let pg = PostgresDb::connect(url).await?;
+        let operator = scarab_server::step_up::admin::OperatorInfo::current();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or_default();
+        match scarab_server::step_up::admin::grant_role(
+            &pg,
+            org,
+            subject,
+            role,
+            *if_absent,
+            reason.as_deref(),
+            &operator,
+            now,
+        )
+        .await
+        {
+            Ok(scarab_server::step_up::admin::OperatorGrant::Unchanged { subject }) => {
+                println!("grant: `{subject}` already holds {role} in {org}; nothing changed.");
+                return Ok(());
+            }
+            Ok(scarab_server::step_up::admin::OperatorGrant::Granted { subject, previous }) => {
+                let was = match &previous {
+                    None => "no role".to_string(),
+                    Some(p) => match (&p.role, p.origin.as_str()) {
+                        (None, _) => "revoked".to_string(),
+                        (Some(r), "import") => format!("{r}, from a forge import"),
+                        (Some(r), _) => r.clone(),
+                    },
+                };
+                println!(
+                    "grant: `{subject}` now holds {role} in {org} (was {was}); recorded as \
+                     binding.operator_grant (host {}, user {}).",
+                    operator.host, operator.os_user
+                );
+                return Ok(());
+            }
+            Ok(scarab_server::step_up::admin::OperatorGrant::Exists { subject, rows }) => {
+                let held: Vec<String> = rows
+                    .iter()
+                    .map(|r| {
+                        let scope = if r.project.is_empty() {
+                            org.clone()
+                        } else {
+                            format!("{org}/{}", r.project)
+                        };
+                        match &r.role {
+                            Some(role) => format!("{role} in {scope} ({})", r.origin),
+                            None => format!("revoked in {scope}"),
+                        }
+                    })
+                    .collect();
+                println!(
+                    "grant: `{subject}` already has a binding in {org}: {}; --if-absent, so \
+                     nothing changed.",
+                    held.join(", ")
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("scarab-server admin grant: {e}");
+                // 3: the principal has not signed in yet — a caller can
+                // tell that apart from a failure and ask them to.
+                let code = if e.starts_with(scarab_server::step_up::admin::NO_PRINCIPAL) {
+                    3
+                } else {
+                    1
+                };
+                std::process::exit(code);
+            }
+        }
+    }
+
     // The startup gate: refuse to boot on invalid configuration, before any
     // socket binds or connection is made (ADR-0048).
     let config = match Config::resolve(&cli) {
@@ -810,6 +901,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // any other feature (it used to ride on `with_oauth_login`) makes every
         // hook in a login-less deployment point at localhost and die silently.
         .with_public_url(config.public_url.clone())
+        // Where people open the UI (SCARAB_UI_URL, default the public URL):
+        // the OAuth callback and step-up confirmation links point there.
+        .with_ui_url(config.ui_url.clone())
         // The legacy approval history (ADR-0024, ADR-0070 §1), still written
         // on every gate release.
         .with_environments(pg.clone())
@@ -979,8 +1073,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Step-up confirmation (ADR-0073): with a human to confirm (login
         // wired) and the mode enforce, every crown jewel needs a passkey.
         if config.step_up == StepUpMode::Enforce {
-            let rp = scarab_webauthn::RelyingParty::from_public_url(&config.public_url, "Scarab")
-                .map_err(|e| format!("SCARAB_PUBLIC_URL: {e}"))?;
+            // Passkeys bind to the origin people open the UI at.
+            let rp = scarab_webauthn::RelyingParty::from_public_url(&config.ui_url, "Scarab")
+                .map_err(|e| format!("SCARAB_UI_URL: {e}"))?;
             state = state.with_step_up(scarab_server::step_up::StepUpService::new(
                 pg.clone(),
                 pg.clone(),
@@ -1183,6 +1278,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }));
     }
+    // API token call counts (git-bug a4cb94f) are counted in memory and
+    // written every minute, once more when the shutdown signal arrives, and a
+    // last time after the drain. The flusher is told to stop rather than
+    // aborted, so a batch it has taken from memory is always written. What
+    // arrives during the drain is written only if the drain ends inside the
+    // Pod's termination grace period: past it the process is killed, and
+    // those calls are lost (the count is approximate by contract).
+    let token_uses_state = state.clone();
+    let (token_uses_stop, mut token_uses_stopped) = tokio::sync::oneshot::channel::<()>();
+    let token_uses_flusher = state.api_tokens.is_some().then(|| {
+        let st = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(60));
+            let signal = shutdown_signal();
+            tokio::pin!(signal);
+            let mut signalled = false;
+            loop {
+                tokio::select! {
+                    _ = tick.tick() => {}
+                    _ = &mut signal, if !signalled => signalled = true,
+                    _ = &mut token_uses_stopped => break,
+                }
+                // Each flush runs to the end: the stop is only seen between
+                // flushes.
+                scarab_server::flush_api_token_uses(&st).await;
+            }
+        })
+    });
     let app = router(state);
 
     let listener = tokio::net::TcpListener::bind(&config.addr).await?;
@@ -1190,9 +1313,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Graceful shutdown (ADR-0053): SIGTERM/ctrl-c stops accepting, drains
     // in-flight connections (incl. SSE), then stops the driver — no torn
     // work on a rollout (safety still rests on crash-idempotency).
-    axum::serve(listener, app)
+    let served = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
-        .await?;
+        .await;
+    // Whatever serve returned: stop the flusher between flushes, then write
+    // what is left.
+    let _ = token_uses_stop.send(());
+    if let Some(handle) = token_uses_flusher {
+        let _ = handle.await;
+    }
+    scarab_server::flush_api_token_uses(&token_uses_state).await;
+    served?;
     if let Some(handle) = broker_handle {
         // It got the same signal; give it its own drain, then stop waiting.
         let _ = tokio::time::timeout(Duration::from_secs(10), handle).await;

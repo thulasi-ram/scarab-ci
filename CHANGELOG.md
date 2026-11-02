@@ -82,9 +82,105 @@ record. Read Breaking changes before you upgrade.
   upgrade an older Depot refuses a newer server's workspace token when the token carries cache
   roots, so a Step with a Cache restore can fail with a Transient error until both are
   upgraded.
+- **A forge connection serves one org** (git-bug 19b0a45). Every repository bound through a
+  connection must be owned by its org.
+  - `POST /v1/connections` needs an `org` field. Only a global admin creates an org's first
+    connection; after that, the org's admins can add more. The server checks the org name when
+    a connection is created or assigned, and at boot for the `connections:` config: not empty,
+    at most 100 characters, no `/`, spaces or control characters, not `.` or `..`, not starting
+    with `_`, and not `settings`, `orgs`, `account` or `security`, which are the first part of
+    web UI addresses (400, or a refused boot).
+  - `GET /v1/connections` lists only the connections of orgs you administer (a global admin
+    sees every one) and takes `?org=<org>` to list one org's.
+  - Nothing assigns an org to a connection as a side effect. Opening Add repository, a re-sync
+    or a bind leaves an unassigned connection unassigned, and a re-sync through it binds
+    nothing: every repository the forge reports is listed in `skipped`. The UI does not offer
+    Re-sync on it.
+  - New: `PUT /v1/connections/{id}/org` with `{ "org": "<name>" }` assigns an unassigned
+    connection, for global admins only (403 for anyone else, API tokens included). It answers
+    409 with the reason when a repository bound through the connection is owned by another
+    account, when the org is served by another forge or host, when the org exists with no
+    connection, or when the connection is managed by configuration. It asks for step-up
+    confirmation (`connection.assign_org`) and is recorded in the org's event log. In the UI it
+    is **Assign to org** on the Unassigned connections panel.
+  - A repository moves only off a connection that does not serve its owner: an unassigned one,
+    or one of another org that holds it. Binding it through a second connection of the same org
+    is refused: 409 on Add repository, listed in `skipped` on re-sync. Unbind it from the
+    connection that holds it first. Add repository can now move a repository off such a
+    connection, as re-sync already could.
+  - Removing a connection that holds a repository of another org is refused (409, naming the
+    repositories), with or without `unbind_repos=true`. That org takes them back by re-syncing
+    or adding them on its own connection; then the removal goes through.
+  - A connection declared in the `connections:` config needs `org:`, unless all its `repos:`
+    have one owner. A repo of another owner, repos of several owners without `org:`, no repos
+    and no `org:`, or a repo already bound through another connection that serves an org fail
+    the boot. So does an `org:` that differs from the org the connection already serves, a
+    change of case included: config does not move a connection to another org. To move one,
+    remove it from the config, unbind its repositories, and add it again.
+  - In GitHub App mode (`SCARAB_GITHUB_APP_ID` set), a `kind: github` connection in the
+    `connections:` config needs `installation_id:`, unless its id is `github-install-<id>`;
+    the boot is refused without it. The connection mints tokens from that installation and
+    lists only its repositories.
+  - A private library is read only through a connection of the installing org, and only for
+    repositories that org owns.
+
+  **Upgrade note.** Migration `0076_org_connections.sql` gives each existing Forgejo or token
+  connection the org of its repositories when they all have one owner. A connection whose
+  repositories have several owners, or none, stays unassigned: only a global admin sees it or
+  acts on it, and its repositories keep working as before. **Every GitHub App installation
+  connection (`github-install-<id>`) comes up unassigned**, whatever its repositories: the
+  database does not hold the installation's account, and an earlier re-sync could bind another
+  installation's repositories to it. It keeps looking up each repository's installation, so its
+  repositories keep getting tokens and their Runs keep working. It gets an org in one of two
+  ways: a global admin assigns it, or its next `installation` delivery does, when every
+  repository bound through it is the account's and the org of that name is new or is already
+  served by a GitHub connection with the same account id. After the upgrade no connection has
+  an account id yet, so for an existing org the global admin assigns it. The migration also
+  records every org that has members, API tokens, secrets, Environments, Policies, Plugins or
+  libraries, not only those with a repository. After the upgrade, as a global admin, open
+  Settings › Connections:
+  1. Assign each unassigned connection to the org that owns its repositories with **Assign to
+     org**.
+  2. For a connection whose repositories belong to several accounts, re-sync each account's
+     own connection (for GitHub, its installation connection; for Forgejo, add one for that
+     org first). Its repositories move there with their Projects. Then
+     assign the old connection or remove it. Do not remove a connection that still has bound
+     repositories: that removes their Projects.
+
+  During a rolling upgrade, `/v1/me` `admin_orgs` and the connection routes also count orgs
+  that only a repository binding names, so admins of an org bound by an older server are not
+  refused. A server built before this release does not start against a database where 0076 has
+  run (sqlx refuses an unknown migration). To roll back, restore the database from before the
+  upgrade, or delete row 76 from `_sqlx_migrations`; the added columns and table do not affect
+  the older server.
 
 ### Security
 
+- An admin of one org could list, delete, re-sync and bind repos through another org's forge
+  connections, and an API token scoped to one org could do the same (git-bug 19b0a45). Each
+  connection now belongs to an org, and its routes need `Administer` on that org; another
+  org's connection answers 404. A GitHub App connection that serves an org mints tokens only
+  from its own installation and lists only that installation's repositories, so a re-sync no
+  longer binds repos of other installations; an unassigned one keeps looking up each
+  repository's installation. A bind no longer moves a repo bound in another org.
+  A connection with no org gets one from an `installation` delivery only when every repository
+  already bound through it is owned by the installation's account, and the org of that name
+  either does not exist or is already served by a GitHub connection to the same host with the
+  same account id (`installation.account.id`, which the delivery now records). A GitHub login
+  can be renamed and registered again by another account; the id cannot, so the new holder of a
+  login does not join the org. An org exists once anything is kept for it (members, an API
+  token, a secret, an Environment, a Policy, a Plugin, a library), so an org with no connection
+  is not joined by name either. Otherwise only a global admin assigns one, and the assignment is
+  checked and written under a lock on the org, so a concurrent assign or bind cannot slip in
+  between. An App connection that serves an org but is not pinned to an installation lists only
+  that org's repositories, not every installation's. `connection.assign_org` cannot be raised
+  as a step-up request by an API token.
+  No read, re-sync or bind assigns one. Through a connection that has an org, tokens are
+  minted, libraries read and repositories unbound only for repositories that org owns
+  (unbinding another owner's repository answers 404). A library source naming a connection
+  that does not exist and one naming another org's connection get the same answer (403). A
+  repository moves between connections only off a connection that does not serve its owner,
+  and a connection's removal never takes another org's repository with it.
 - The clone image's askpass gave the token to an LFS server named in `.lfsconfig`, to other
   repositories on the same host through submodules, and over `http://` (#53).
 - A value from outside the Pipeline holding `$(SECRET_NAME)` was filled with that secret by
@@ -134,6 +230,54 @@ record. Read Breaking changes before you upgrade.
   cluster the fault tier's `two-replicas`, `kill-server` and `stop-leader` scenarios passed
   (`just test chaos all 3`, 2026-11-01).
   [ADR-0077 amendment](https://thulasi-ram.github.io/scarab-ci/tech/adr/0077-end-to-end-fault-and-agent-driven-testing/#amendment-2026-11-01-grill)
+- **Event log page** (git-bug fa23028). An org's security event log moves from Settings →
+  Security to its own section, Settings → Event log, one page of 50 at a time. It filters by
+  event kind, actor, target text (a Run id, a project or a secret name) and time range, and
+  the filters are in the URL. The event log API takes `cursor`, `actor`, `target`, `from` and
+  `to`; `before` still works.
+  [ADR-0073 §7](https://thulasi-ram.github.io/scarab-ci/tech/adr/0073-step-up-confirmation/#7-orgsecurityeventlog)
+- **Settings sidebar** (git-bug 734ffa1). Settings is one page with a sidebar in up to three
+  groups, and each section has its own address: Your account under `/settings/<section>`
+  (Profile, Security, Appearance), an org's settings under `/orgs/<org>/settings/<section>`, and
+  Server administration under `/settings/server/<section>` for global admins, where Connect a
+  forge creates a new org's first connection. You see only the groups you may use, and an admin
+  of several orgs switches org in the sidebar. `/settings`, `/account`, `/account/security` and
+  `/settings/libraries/review` redirect to the new addresses, keeping their query.
+  [Settings](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#settings)
+- **Mono palette.** Settings › Appearance picks the palette, Emerald or Mono (greys), in light
+  and dark mode. The choice is kept per browser.
+  [Appearance](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#appearance)
+- **Environment pages** (git-bug c11abc5). An Environment opens read-only at
+  `/orgs/<org>/settings/environments/<name>`, and its **Edit** button opens a separate edit
+  screen for the description, baseline, eligibility, privilege grants and Delete. One Save sends
+  only the parts that changed. Delete and withdrawing a grant ask you to type the name. An
+  Environment cannot be renamed: its name is the key pipelines use.
+  [View and edit an Environment](https://thulasi-ram.github.io/scarab-ci/usage/environments/#view-and-edit-an-environment)
+- **Personal API tokens** (git-bug a4cb94f). You mint, list and revoke your own tokens under
+  Settings › Your account › API tokens (`/v1/me/tokens`). Anyone with a role in an org or
+  project, viewers included, may mint a token there up to that role; minting still needs a
+  passkey confirmation, and a token still cannot mint tokens or revoke them through
+  `/v1/me/tokens`. Organization settings › API tokens lists every token issued in the
+  org with its owner, last use and call count, sorted by last use (the default), calls or
+  creation, and an org admin can revoke any of them; it no longer mints.
+  `POST /v1/orgs/{org}/tokens` still works and mints the same personal token. The call count is
+  approximate: calls are written at most once a minute per token. An org policy for who may
+  issue tokens, with which scopes and lifetimes, is not available yet.
+  [API tokens](https://thulasi-ram.github.io/scarab-ci/usage/api-tokens/)
+- **`scarab.uiUrl` (`SCARAB_UI_URL`)**, for when people open the web UI at another address
+  than the one forges reach (`publicUrl`). The login callback, the passkey origin and the
+  step-up confirmation link use it; webhook URLs and commit-status links stay on `publicUrl`.
+  Empty means `publicUrl`. A sign-in started on `127.0.0.1` while the UI URL says `localhost`
+  is sent to `localhost` first, so it keeps its cookie.
+  [The UI URL](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#the-ui-url)
+- **`scarab-server admin grant --org --subject --role [--if-absent] [--reason]`** gives a
+  person a role in an org straight in the database, for an install's first members. It needs
+  only the database URL, never migrates, and records `binding.operator_grant` in the org's
+  event log with the host, OS user and reason, in the same transaction as the binding. It sets
+  the role exactly: a higher role is lowered and a revoked one restored. With `--if-absent` it
+  writes nothing when the person already has a binding in the org, a revoked one included. A
+  person who has never signed in is refused (exit 3).
+  [Grant the first roles](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#grant-the-first-roles)
 
 ### Enhancement
 
@@ -144,6 +288,27 @@ record. Read Breaking changes before you upgrade.
   failed Step. Changing the replica count moves about 1/N of the keys, and each moved key
   misses once. `workspace.homeUrlTemplate` overrides the per-replica address.
   [ADR-0077 amendment](https://thulasi-ram.github.io/scarab-ci/tech/adr/0077-end-to-end-fault-and-agent-driven-testing/#amendment-2026-11-01-grill)
+- **One install flow for plugins and libraries** (git-bug 3741861). Every catalog plugin
+  installs through the same form, with its publisher shown as a field. Every library installs
+  through the review page, first-party or not, and the libraries in Scarab's release manifest
+  are offered there as sources. The one-click **Install first-party libraries** button is gone:
+  an existing org installs each first-party library on its own, with a review and a passkey
+  confirmation.
+  [Install a library](https://thulasi-ram.github.io/scarab-ci/usage/libraries/#install-a-library)
+- `GET /v1/me` adds `global_admin`: whether you hold a global `Administer` role, which the UI
+  uses to show Server administration. It is always `false` for an API token.
+- A connection's re-sync result adds `skipped`: the repositories the forge reports that it did
+  not bind, because another account owns them, another connection that serves an org holds
+  them, or the connection serves no org (then every repository is listed).
+- The server and CLI now link to `/settings/profile` and `/settings/security?enroll=1`
+  instead of `/account` and `/account/security?enroll=1`. The UI still redirects the old
+  addresses.
+- **Inherited secret keys on a repository's Secrets tab.** The list now shows, in grey after
+  the repository's own keys, the org's keys the repository can use ("from org") and keys set
+  only in some environments ("only in production"). A repository key that replaces an org key
+  reads "overrides org". Names only; no value is shown. The secret matrix response adds
+  `overrides`, which names the broader scope a set cell hides.
+  [Secrets](https://thulasi-ram.github.io/scarab-ci/usage/secrets/#where-you-set-them-one-grid-by-scope)
 
 ### Bug Fixes
 
@@ -167,6 +332,9 @@ record. Read Breaking changes before you upgrade.
   500 on its required inputs. A cache root a replica cannot walk is now left out of the grant
   (git-bug 2a79b73), and a later refused read of that token is answered without walking its
   inputs again.
+- **The Depot did not start with named login providers.** With `scarab.oauth.providers` set,
+  the chart gave the providers' client secrets to the server Deployment only, and the Depot
+  StatefulSet refused to boot for want of them. Both get them now.
 
 ### Tests
 
@@ -178,8 +346,24 @@ record. Read Breaking changes before you upgrade.
   must still succeed. C1 checks that a Cache restores from its home replica when no fault
   hit that replica.
 
+### Documentation
+
+- The Installation page describes forge connections per org (Settings › Connections, Connect a
+  forge, `org:` in `scarab.connections`, a connection with no org) and the settings page with
+  its addresses. The Libraries, Secrets and Environments pages name the new settings addresses,
+  the per-org connection rule for private library sources, inherited secret keys, and the
+  Environment view and edit pages.
+
 ### Misc
 
+- `just stack up dogfood` signs in with GitHub instead of running dev-insecure: identity store,
+  role bindings, API tokens and passkey step-up, as a real install. It needs
+  `SCARAB_OAUTH_CLIENT_ID` and `SCARAB_OAUTH_CLIENT_SECRET` in `dogfood.env` and
+  `SCARAB_ADDR` on `127.0.0.1`, grants `DOGFOOD_OWNER` and `DOGFOOD_MEMBER` their roles when
+  they have none in the org, and prints the fresh-database steps that now need a passkey, or
+  the clone library step when the installed copy differs. `just stack seed dogfood` runs the
+  grants again. `just stack demo` refuses dogfood mode. `SCARAB_DOGFOOD_DEV_INSECURE` is gone.
+  See `deploy/kind/README.md`.
 - The local stack is one kind cluster, `scarab-dev`, with one Helm release in four modes
   (dev, dogfood, e2e, chaos), each with its own database and bucket; Forgejo runs in it.
   `deploy/local-helm`, `deploy/local-proc` and the colima k3s setup are gone. The chart gains

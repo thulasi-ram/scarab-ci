@@ -1004,6 +1004,7 @@ async fn exempt_operations_never_need_a_step_up() {
                 created_by: "amy".into(),
                 created_at: now,
                 last_used_at: None,
+                use_count: 0,
                 revoked_at: None,
             },
             "hash-1",

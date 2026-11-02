@@ -1,4 +1,4 @@
-// The one step-up dialog (ADR-0073), mounted once in Layout and opened by the
+// The one step-up dialog, mounted once in Layout and opened by the
 // API client whenever a request is refused with `403 step_up_required`.
 //
 // It shows the server's own summary of what is being confirmed (operation,
@@ -80,7 +80,7 @@ function StepUpModal(props: {
   return (
     <div class="modal-scrim" onClick={() => !busy() && props.settle(false)}>
       <div
-        class="modal step-up-modal"
+        class="modal modal-wide"
         role="dialog"
         aria-modal="true"
         aria-labelledby="step-up-title"
@@ -130,7 +130,8 @@ function StepUpModal(props: {
           <Show when={error()}>
             <p class="error">{error()}</p>
           </Show>
-
+        </div>
+        <div class="modal-foot">
           <div class="modal-actions">
             <Show when={canConfirm()}>
               <button class="btn btn-primary" disabled={busy()} onClick={confirm} autofocus>
@@ -141,7 +142,7 @@ function StepUpModal(props: {
             <Show when={r().mode === "enroll"}>
               <A
                 class="btn btn-primary"
-                href={r().enroll_url ?? "/account/security?enroll=1"}
+                href={r().enroll_url ?? "/settings/security?enroll=1"}
                 onClick={() => props.settle(false)}
               >
                 <Icon icon="key-round" size={14} /> Enroll a passkey

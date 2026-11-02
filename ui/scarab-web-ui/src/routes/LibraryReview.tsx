@@ -1,14 +1,18 @@
-// Install or upgrade a library (ADR-0076 §4) — a page of its own, so a
-// second reviewer can be sent its URL. The source is fetched (the server
-// reads it at its commit, checks it compiles as a closed library and stores
-// it); the page shows the file, or the side-by-side diff from the installed
-// version, the checks, and what changes. Install then installs exactly the
-// version shown, naming the version it replaces, and asks for a step-up.
+// Install or upgrade a library — a page of its own inside the settings frame
+// (Libraries marked in the sidebar), so a second reviewer can be sent its
+// URL. The source is fetched (the server reads it at its commit, checks it
+// compiles as a closed library and stores it); the page shows the file, or
+// the side-by-side diff from the installed version, the checks, and what
+// changes. Install then installs exactly the version shown, naming the
+// version it replaces, and asks for a step-up.
+//
+// Every library takes this one path, whoever publishes it. The libraries
+// Scarab's release manifest lists are offered as sources to fill in, and
+// whether a fetched version is in the manifest is one of its checks.
 import { createEffect, createResource, createSignal, For, Show } from "solid-js";
-import { A, useNavigate, useSearchParams } from "@solidjs/router";
+import { A, useNavigate, useParams, useSearchParams } from "@solidjs/router";
 import {
   fetchLibrary,
-  getMe,
   installLibrary,
   listConnections,
   listLibraries,
@@ -20,6 +24,7 @@ import {
   foldDiff,
   inputsChange,
   numberDiff,
+  releaseSources,
   reviewChecks,
   shortHash,
   sideBySide,
@@ -29,16 +34,39 @@ import {
   type SideCell,
 } from "../libraries";
 import Icon from "../components/Icon";
+import { decodeParam, orgHref } from "../settings-nav";
+import { me } from "../session";
+import { SettingsCrumbs, SettingsFrame } from "./Settings";
 
 const one = (v: string | string[] | undefined) => (Array.isArray(v) ? v[0] ?? "" : v ?? "");
 
+/** `/orgs/:org/settings/libraries/review`, in the settings frame, which shows
+ *  it only to an admin of the org. */
 export default function LibraryReview() {
+  const params = useParams<{ org: string }>();
+  const org = () => decodeParam(params.org);
+  return (
+    <SettingsFrame kind="org" org={org()} section="libraries">
+      {/* Keyed: the review holds what it fetched for one org, so another org
+          in the URL starts a new review rather than installing into it. */}
+      <Show when={org()} keyed>
+        {(o) => <Review org={o} />}
+      </Show>
+    </SettingsFrame>
+  );
+}
+
+function Review(props: { org: string }) {
   const nav = useNavigate();
   const [search, setSearch] = useSearchParams();
-  const [me] = createResource(getMe);
-  const org = () => me()?.admin_orgs[0];
+  const org = () => props.org;
+  const back = () => orgHref(props.org, "libraries");
   const [libs] = createResource(org, (o) => listLibraries(o));
-  const [connections] = createResource(() => listConnections().catch(() => []));
+  // A library is read through a connection of the installing org only.
+  const [connections] = createResource(
+    () => props.org,
+    (o) => listConnections(o).catch(() => []),
+  );
   const [form, setForm] = createSignal<FetchForm>({
     source: one(search.source),
     connection: one(search.connection),
@@ -55,6 +83,12 @@ export default function LibraryReview() {
     setForm((f) => ({ ...f, [k]: v }));
   };
   const built = () => toFetchBody(form());
+  const listed = () => releaseSources(libs()?.first_party ?? []);
+  /** Fill the form from a source the release manifest lists. */
+  const useListed = (r: { source: string; publisher: string; name: string }) => {
+    setFetched(null);
+    setForm((f) => ({ ...f, source: r.source, publisher: r.publisher, name: r.name }));
+  };
 
   const doFetch = async () => {
     const o = org();
@@ -99,7 +133,7 @@ export default function LibraryReview() {
         content_hash: f.content_hash,
         replaces: f.current?.content_hash ?? null,
       });
-      nav("/settings");
+      nav(back());
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not install the library.");
     } finally {
@@ -135,256 +169,269 @@ export default function LibraryReview() {
   };
 
   return (
-    <section class="page">
-      <div class="run-head">
-        <h1 class="crumb-head">
-          <A href="/settings" class="crumb-head-link">
-            Settings
-          </A>
-          <Icon icon="chevron-right" size={20} class="crumb-head-sep" />
-          <span class="crumb-head-title mono">{title()}</span>
-        </h1>
-      </div>
-      <p class="page-sub">
-        {fetched()?.current ? "review an upgrade" : "review a library before installing it"}
-        <Show when={fetchedAt()}> · fetched just now by {me()?.subject}</Show>
-      </p>
+    <>
+      <SettingsCrumbs
+        trail={[
+          { label: "Libraries", href: back() },
+          { label: title(), mono: title().startsWith("lib:") },
+        ]}
+        sub={
+          <>
+            {fetched()?.current ? "review an upgrade" : "review a library before installing it"}
+            <Show when={fetchedAt()}> · fetched just now by {me()?.subject}</Show>
+          </>
+        }
+      />
 
-      <Show when={me()} fallback={<p class="empty">loading…</p>}>
-        <Show when={org()} fallback={<p class="empty">No organization yet: bind a repository first.</p>}>
-          <div class="lib-review">
-            <div>
-              <div class="panel" style={{ "margin-top": 0 }}>
-                <div class="panel-h">
-                  <span>Source</span>
-                  <span class="grow1" />
-                  <Show when={!editing()}>
-                    <button class="btn btn-ghost btn-sm" onClick={() => setEditing(true)}>
-                      edit
-                    </button>
+      <div class="lib-review">
+        <div>
+          <div class="panel" style={{ "margin-top": 0 }}>
+            <div class="panel-h">
+              <span>Source</span>
+              <span class="grow1" />
+              <Show when={!editing()}>
+                <button class="btn btn-ghost btn-sm" onClick={() => setEditing(true)}>
+                  edit
+                </button>
+              </Show>
+            </div>
+            <Show
+              when={editing()}
+              fallback={
+                <dl class="lib-facts">
+                  <dt>source</dt>
+                  <dd class="m">{fetched()?.source ?? form().source}</dd>
+                  <dt>connection</dt>
+                  <dd>{connectionLabel()}</dd>
+                  <dt>publisher</dt>
+                  <dd class="m">
+                    {fetched()?.publisher || form().publisher || "the repository owner"}
+                  </dd>
+                </dl>
+              }
+            >
+              <div class="secrets-body token-form">
+                <div class="form-r">
+                  <label>source</label>
+                  <input
+                    class="input mono"
+                    placeholder="github.com/acme/scarab-libs//deploy-helm.yaml@<commit>"
+                    value={form().source}
+                    onInput={(e) => set("source", e.currentTarget.value)}
+                  />
+                  <Show when={sourceError(form().source)}>
+                    <p class="error">{sourceError(form().source)}</p>
+                  </Show>
+                  <p class="fieldnote">
+                    A file in a git repository at a full commit id. A public repository on
+                    github.com or a Forgejo connection's host is read without credentials.
+                  </p>
+                  <Show when={listed().length > 0}>
+                    <p class="fieldnote">
+                      Listed in Scarab's release {listed()[0]!.release}, not installed here:
+                    </p>
+                    <div class="plg-caps">
+                      <For each={listed()}>
+                        {(r) => (
+                          <button
+                            class="btn btn-ghost btn-sm mono"
+                            title={r.source}
+                            onClick={() => useListed(r)}
+                          >
+                            {r.id}
+                          </button>
+                        )}
+                      </For>
+                    </div>
                   </Show>
                 </div>
-                <Show
-                  when={editing()}
-                  fallback={
-                    <dl class="lib-facts">
-                      <dt>source</dt>
-                      <dd class="m">{fetched()?.source ?? form().source}</dd>
-                      <dt>connection</dt>
-                      <dd>{connectionLabel()}</dd>
-                      <dt>publisher</dt>
-                      <dd class="m">
-                        {fetched()?.publisher || form().publisher || "the repository owner"}
-                      </dd>
-                    </dl>
-                  }
-                >
-                  <div class="secrets-body token-form">
-                    <div class="form-r">
-                      <label>source</label>
-                      <input
-                        class="input mono"
-                        placeholder="github.com/acme/scarab-libs//deploy-helm.yaml@<commit>"
-                        value={form().source}
-                        onInput={(e) => set("source", e.currentTarget.value)}
-                      />
-                      <Show when={sourceError(form().source)}>
-                        <p class="error">{sourceError(form().source)}</p>
-                      </Show>
-                      <p class="fieldnote">
-                        A file in a git repository at a full commit id. A public repository on
-                        github.com or a Forgejo connection's host is read without credentials.
-                      </p>
-                    </div>
-                    <div class="form-r">
-                      <label>connection (private repository)</label>
-                      <select class="input" value={form().connection} onChange={(e) => set("connection", e.currentTarget.value)}>
-                        <option value="">none: read it anonymously</option>
-                        <For each={connections() ?? []}>
-                          {(c) => (
-                            <option value={c.id}>
-                              {c.id} ({c.kind}, {c.base_url})
-                            </option>
-                          )}
-                        </For>
-                      </select>
-                    </div>
-                    <div class="form-r">
-                      <label>publisher and name (optional)</label>
-                      <div class="plg-caps">
-                        <input
-                          class="input mono"
-                          placeholder="the repository owner"
-                          value={form().publisher}
-                          onInput={(e) => set("publisher", e.currentTarget.value)}
-                        />
-                        <input
-                          class="input mono"
-                          placeholder="the file name"
-                          value={form().name}
-                          onInput={(e) => set("name", e.currentTarget.value)}
-                        />
-                      </div>
-                      <p class="fieldnote">
-                        Pipelines name it{" "}
-                        <span class="mono">
-                          lib:{form().publisher || "<owner>"}/{form().name || "<file>"}
-                        </span>
-                        .
-                      </p>
-                    </div>
-                    <Show when={built().error && form().source.trim() !== "" && !sourceError(form().source)}>
-                      <p class="error">{built().error}</p>
-                    </Show>
-                    <div class="modal-actions">
-                      <button
-                        class="btn btn-primary btn-sm"
-                        disabled={!built().body || busy() !== ""}
-                        onClick={() => void doFetch()}
-                      >
-                        {busy() === "fetch" ? "Fetching…" : "Fetch and review"}
-                      </button>
-                    </div>
+                <div class="form-r">
+                  <label>connection (private repository)</label>
+                  <select class="input" value={form().connection} onChange={(e) => set("connection", e.currentTarget.value)}>
+                    <option value="">none: read it anonymously</option>
+                    <For each={connections() ?? []}>
+                      {(c) => (
+                        <option value={c.id}>
+                          {c.id} ({c.kind}, {c.base_url})
+                        </option>
+                      )}
+                    </For>
+                  </select>
+                </div>
+                <div class="form-r">
+                  <label>publisher and name (optional)</label>
+                  <div class="plg-caps">
+                    <input
+                      class="input mono"
+                      placeholder="the repository owner"
+                      value={form().publisher}
+                      onInput={(e) => set("publisher", e.currentTarget.value)}
+                    />
+                    <input
+                      class="input mono"
+                      placeholder="the file name"
+                      value={form().name}
+                      onInput={(e) => set("name", e.currentTarget.value)}
+                    />
                   </div>
+                  <p class="fieldnote">
+                    Pipelines name it{" "}
+                    <span class="mono">
+                      lib:{form().publisher || "<owner>"}/{form().name || "<file>"}
+                    </span>
+                    .
+                  </p>
+                </div>
+                <Show when={built().error && form().source.trim() !== "" && !sourceError(form().source)}>
+                  <p class="error">{built().error}</p>
                 </Show>
-              </div>
-
-              <Show when={error()}>
-                <p class="error">{error()}</p>
-              </Show>
-              <Show when={busy() === "fetch"}>
-                <p class="empty">Fetching {form().source}…</p>
-              </Show>
-
-              <Show when={fetched()}>
-                {(f) => (
-                  <Show
-                    when={f().current}
-                    fallback={
-                      <>
-                        <p class="pane-sub" style={{ "margin-top": "18px" }}>
-                          content · {f().content.split("\n").length} lines
-                        </p>
-                        <div class="ud">
-                          <For each={f().content.split("\n")}>
-                            {(t, k) => (
-                              <div class="ud-row" style={{ "grid-template-columns": "34px 1fr" }}>
-                                <span class="ln">{k() + 1}</span>
-                                <span class="tx">{t}</span>
-                              </div>
-                            )}
-                          </For>
-                        </div>
-                      </>
-                    }
+                <div class="modal-actions">
+                  <button
+                    class="btn btn-primary btn-sm"
+                    disabled={!built().body || busy() !== ""}
+                    onClick={() => void doFetch()}
                   >
-                    {(cur) => (
-                      <Show when={!same()} fallback={<p class="empty">This version is installed already.</p>}>
-                        <p class="pane-sub" style={{ "margin-top": "18px" }}>
-                          diff · {counts().add} lines added, {counts().del} removed · unchanged lines folded
-                        </p>
-                        <div class="sbs">
-                          <div>
-                            <div class="sbs-h">
-                              installed <span class="lib-hash">{shortHash(cur().content_hash)}</span> · @
-                              {shortHash(cur().source.split("@").pop() ?? "")}
-                            </div>
-                            <div class="ud">
-                              <For each={sides().left}>{(c) => <Cell c={c} side="old" />}</For>
-                            </div>
+                    {busy() === "fetch" ? "Fetching…" : "Fetch and review"}
+                  </button>
+                </div>
+              </div>
+            </Show>
+          </div>
+
+          <Show when={error()}>
+            <p class="error">{error()}</p>
+          </Show>
+          <Show when={busy() === "fetch"}>
+            <p class="empty">Fetching {form().source}…</p>
+          </Show>
+
+          <Show when={fetched()}>
+            {(f) => (
+              <Show
+                when={f().current}
+                fallback={
+                  <>
+                    <p class="pane-sub" style={{ "margin-top": "18px" }}>
+                      content · {f().content.split("\n").length} lines
+                    </p>
+                    <div class="ud">
+                      <For each={f().content.split("\n")}>
+                        {(t, k) => (
+                          <div class="ud-row" style={{ "grid-template-columns": "34px 1fr" }}>
+                            <span class="ln">{k() + 1}</span>
+                            <span class="tx">{t}</span>
                           </div>
-                          <div>
-                            <div class="sbs-h">
-                              fetched <span class="lib-hash">{shortHash(f().content_hash)}</span> · @
-                              {shortHash(f().source.split("@").pop() ?? "")}
-                            </div>
-                            <div class="ud">
-                              <For each={sides().right}>{(c) => <Cell c={c} side="new" />}</For>
-                            </div>
-                          </div>
+                        )}
+                      </For>
+                    </div>
+                  </>
+                }
+              >
+                {(cur) => (
+                  <Show when={!same()} fallback={<p class="empty">This version is installed already.</p>}>
+                    <p class="pane-sub" style={{ "margin-top": "18px" }}>
+                      diff · {counts().add} lines added, {counts().del} removed · unchanged lines folded
+                    </p>
+                    <div class="sbs">
+                      <div>
+                        <div class="sbs-h">
+                          installed <span class="lib-hash">{shortHash(cur().content_hash)}</span> · @
+                          {shortHash(cur().source.split("@").pop() ?? "")}
                         </div>
-                      </Show>
-                    )}
+                        <div class="ud">
+                          <For each={sides().left}>{(c) => <Cell c={c} side="old" />}</For>
+                        </div>
+                      </div>
+                      <div>
+                        <div class="sbs-h">
+                          fetched <span class="lib-hash">{shortHash(f().content_hash)}</span> · @
+                          {shortHash(f().source.split("@").pop() ?? "")}
+                        </div>
+                        <div class="ud">
+                          <For each={sides().right}>{(c) => <Cell c={c} side="new" />}</For>
+                        </div>
+                      </div>
+                    </div>
                   </Show>
                 )}
               </Show>
-            </div>
+            )}
+          </Show>
+        </div>
 
-            <div class="lib-side">
-              <Show when={fetched()}>
-                {(f) => (
-                  <>
-                    <div class="panel">
-                      <div class="panel-h">
-                        <span>Checks</span>
-                      </div>
-                      <div style={{ padding: "12px 14px" }}>
-                        <ul class="lib-checks">
-                          <For each={checks()}>
-                            {(c) => (
-                              <li class={c.tone}>
-                                <Icon icon={c.tone === "ok" ? "check" : c.tone === "warn" ? "alert-triangle" : "search"} size={12} />
-                                <span>{c.text}</span>
-                              </li>
-                            )}
-                          </For>
-                        </ul>
-                      </div>
-                    </div>
-                    <div class="panel">
-                      <div class="panel-h">
-                        <span>What changes</span>
-                      </div>
-                      <dl class="lib-facts">
-                        <dt>version</dt>
-                        <dd class="m">
-                          <Show when={f().current} fallback={<span class="lib-hash">{shortHash(f().content_hash)}</span>}>
-                            {(cur) => (
-                              <>
-                                <span class="lib-hash">{shortHash(cur().content_hash)}</span> →{" "}
-                                <span class="lib-hash">{shortHash(f().content_hash)}</span>
-                              </>
-                            )}
-                          </Show>
-                        </dd>
-                        <dt>inputs</dt>
-                        <dd>
-                          {f().current
-                            ? inputsChange(diffSides(lines()).old, f().content)
-                            : inputsChange("", f().content)}
-                        </dd>
-                        <dt>runs</dt>
-                        <dd>Runs already created keep the Steps they were compiled with.</dd>
-                      </dl>
-                      <div style={{ padding: "0 14px 14px", display: "flex", gap: "8px" }}>
-                        <button
-                          class="btn btn-primary btn-sm"
-                          disabled={busy() !== "" || same()}
-                          onClick={() => void doInstall()}
-                        >
-                          <Icon icon={f().current ? "arrow-up" : "plus"} size={14} />{" "}
-                          {busy() === "install" ? "Installing…" : f().current ? "Upgrade" : "Install"}
-                        </button>
-                        <button class="btn btn-ghost btn-sm" onClick={() => nav("/settings")}>
-                          Discard
-                        </button>
-                      </div>
-                    </div>
-                  </>
-                )}
-              </Show>
-              <p class="subtle">
-                <small>
-                  <Icon icon="shield-check" size={12} /> Installing asks you to confirm with your
-                  passkey. The fetched version is stored for review; nothing is installed until you
-                  confirm.
-                </small>
-              </p>
-            </div>
-          </div>
-        </Show>
-      </Show>
-    </section>
+        <div class="lib-side">
+          <Show when={fetched()}>
+            {(f) => (
+              <>
+                <div class="panel">
+                  <div class="panel-h">
+                    <span>Checks</span>
+                  </div>
+                  <div style={{ padding: "12px 14px" }}>
+                    <ul class="lib-checks">
+                      <For each={checks()}>
+                        {(c) => (
+                          <li class={c.tone}>
+                            <Icon icon={c.tone === "ok" ? "check" : c.tone === "warn" ? "alert-triangle" : "search"} size={12} />
+                            <span>{c.text}</span>
+                          </li>
+                        )}
+                      </For>
+                    </ul>
+                  </div>
+                </div>
+                <div class="panel">
+                  <div class="panel-h">
+                    <span>What changes</span>
+                  </div>
+                  <dl class="lib-facts">
+                    <dt>version</dt>
+                    <dd class="m">
+                      <Show when={f().current} fallback={<span class="lib-hash">{shortHash(f().content_hash)}</span>}>
+                        {(cur) => (
+                          <>
+                            <span class="lib-hash">{shortHash(cur().content_hash)}</span> →{" "}
+                            <span class="lib-hash">{shortHash(f().content_hash)}</span>
+                          </>
+                        )}
+                      </Show>
+                    </dd>
+                    <dt>inputs</dt>
+                    <dd>
+                      {f().current
+                        ? inputsChange(diffSides(lines()).old, f().content)
+                        : inputsChange("", f().content)}
+                    </dd>
+                    <dt>runs</dt>
+                    <dd>Runs already created keep the Steps they were compiled with.</dd>
+                  </dl>
+                  <div style={{ padding: "0 14px 14px", display: "flex", gap: "8px" }}>
+                    <button
+                      class="btn btn-primary btn-sm"
+                      disabled={busy() !== "" || same()}
+                      onClick={() => void doInstall()}
+                    >
+                      <Icon icon={f().current ? "arrow-up" : "plus"} size={14} />{" "}
+                      {busy() === "install" ? "Installing…" : f().current ? "Upgrade" : "Install"}
+                    </button>
+                    <button class="btn btn-ghost btn-sm" onClick={() => nav(back())}>
+                      Discard
+                    </button>
+                  </div>
+                </div>
+              </>
+            )}
+          </Show>
+          <p class="subtle">
+            <small>
+              <Icon icon="shield-check" size={12} /> Installing asks you to confirm with your
+              passkey. The fetched version is stored for review; nothing is installed until you
+              confirm.
+            </small>
+          </p>
+        </div>
+      </div>
+    </>
   );
 }
 

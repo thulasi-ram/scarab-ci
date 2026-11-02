@@ -544,6 +544,7 @@ async fn create_at(
              ({MAX_POLICIES_PER_SCOPE}); delete one first"
         )));
     }
+    crate::note_org(st, scope.org()).await?;
     let now = st.clock.now().await.0;
     let stored = store
         .create(&NewPolicy {

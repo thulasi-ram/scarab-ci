@@ -69,6 +69,129 @@ impl PostgresDb {
             .map(|r| r.get::<String, _>("subject"))
             .collect())
     }
+
+    /// Every `rbac_bindings` row of `subject` in `org`, at the Org scope and
+    /// at every Project scope, revoked rows (role NULL) included — what the
+    /// operator grant's `--if-absent` checks before it writes. Org scope
+    /// first, then Projects by name.
+    pub async fn binding_rows(
+        &self,
+        subject: &str,
+        org: &str,
+    ) -> Result<Vec<BindingRow>, IdentityError> {
+        let rows = sqlx::query(
+            "SELECT project, role, origin FROM rbac_bindings
+             WHERE subject = $1 AND org = $2
+             ORDER BY project",
+        )
+        .bind(subject)
+        .bind(org)
+        .fetch_all(self.pool())
+        .await
+        .map_err(identity_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| BindingRow {
+                project: r.get("project"),
+                role: r.get("role"),
+                origin: r.get("origin"),
+            })
+            .collect())
+    }
+
+    /// The operator grant's writes (`scarab-server admin grant`), in ONE
+    /// transaction: append `event` to the OrgSecurityEventLog, record the Org,
+    /// and write `binding` as a native binding. Either all three land or none
+    /// does, so the log never shows a grant that was not made.
+    ///
+    /// `only_if_absent`: write the binding only when no row exists for its
+    /// subject and scope (a revoked row counts); when one appeared since the
+    /// caller looked, nothing is written and this returns `Ok(false)`.
+    pub async fn operator_grant(
+        &self,
+        event: &SecurityEvent,
+        binding: &scarab_identity::Binding,
+        only_if_absent: bool,
+    ) -> Result<bool, IdentityError> {
+        let (org, project) = match &binding.scope {
+            scarab_identity::Scope::Org(org) => (org.as_str(), ""),
+            scarab_identity::Scope::Project { org, name } => (org.as_str(), name.as_str()),
+        };
+        let mut tx = self.pool().begin().await.map_err(identity_err)?;
+        insert_security_event(&mut *tx, event)
+            .await
+            .map_err(identity_err)?;
+        sqlx::query("INSERT INTO orgs (name) VALUES ($1) ON CONFLICT (name) DO NOTHING")
+            .bind(org)
+            .execute(&mut *tx)
+            .await
+            .map_err(identity_err)?;
+        let conflict = if only_if_absent {
+            "ON CONFLICT (subject, org, project) DO NOTHING"
+        } else {
+            "ON CONFLICT (subject, org, project)
+             DO UPDATE SET role = EXCLUDED.role, origin = 'native'"
+        };
+        let written = sqlx::query(&format!(
+            "INSERT INTO rbac_bindings (subject, org, project, role, origin)
+             VALUES ($1, $2, $3, $4, 'native')
+             {conflict}"
+        ))
+        .bind(&binding.subject)
+        .bind(org)
+        .bind(project)
+        .bind(role_str(binding.role))
+        .execute(&mut *tx)
+        .await
+        .map_err(identity_err)?
+        .rows_affected();
+        if written == 0 {
+            // Dropping the transaction rolls the event back too.
+            return Ok(false);
+        }
+        tx.commit().await.map_err(identity_err)?;
+        Ok(true)
+    }
+}
+
+/// One `rbac_bindings` row as stored ([`PostgresDb::binding_rows`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindingRow {
+    /// `""` for the Org scope, else the Project's name.
+    pub project: String,
+    /// `None` for a revoked row.
+    pub role: Option<String>,
+    /// `native` or `import`.
+    pub origin: String,
+}
+
+/// Append one OrgSecurityEventLog row, on a pool or inside a transaction.
+async fn insert_security_event<'e, E: sqlx::PgExecutor<'e>>(
+    ex: E,
+    e: &SecurityEvent,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(
+        "INSERT INTO org_security_events
+             (id, org, at, kind, subject, caller, op, target, confirmation_id, request_id,
+              passkey_id, session_hash, detail)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+         RETURNING seq",
+    )
+    .bind(&e.id)
+    .bind(&e.org)
+    .bind(e.at)
+    .bind(&e.kind)
+    .bind(&e.subject)
+    .bind(&e.caller)
+    .bind(&e.op)
+    .bind(&e.target)
+    .bind(&e.confirmation_id)
+    .bind(&e.request_id)
+    .bind(&e.passkey_id)
+    .bind(&e.session_hash)
+    .bind(&e.detail)
+    .fetch_one(ex)
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -855,36 +978,17 @@ fn event_from_row(r: &sqlx::postgres::PgRow) -> SecurityEvent {
 #[async_trait]
 impl SecurityEventLog for PostgresDb {
     async fn append(&self, e: &SecurityEvent) -> Result<i64, IdentityError> {
-        sqlx::query_scalar(
-            "INSERT INTO org_security_events
-                 (id, org, at, kind, subject, caller, op, target, confirmation_id, request_id,
-                  passkey_id, session_hash, detail)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-             RETURNING seq",
-        )
-        .bind(&e.id)
-        .bind(&e.org)
-        .bind(e.at)
-        .bind(&e.kind)
-        .bind(&e.subject)
-        .bind(&e.caller)
-        .bind(&e.op)
-        .bind(&e.target)
-        .bind(&e.confirmation_id)
-        .bind(&e.request_id)
-        .bind(&e.passkey_id)
-        .bind(&e.session_hash)
-        .bind(&e.detail)
-        .fetch_one(self.pool())
-        .await
-        .map_err(identity_err)
+        insert_security_event(self.pool(), e)
+            .await
+            .map_err(identity_err)
     }
 
     async fn list(&self, f: &SecurityEventFilter) -> Result<Vec<SecurityEvent>, IdentityError> {
         // The Org log (ADR-0073 §7): the Org's own events, plus Org-less
         // events of the allowed kinds (confirmations, passkeys) about anyone
         // holding a live binding anywhere in the Org — membership read now,
-        // not at append.
+        // not at append. Newest first by `seq`, which is unique, so a keyset
+        // page (`seq < before_seq`) never repeats or skips a row.
         let orgless: Vec<String> = scarab_identity::security_event_kind::ORG_VISIBLE_ORGLESS
             .iter()
             .map(|k| k.to_string())
@@ -898,6 +1002,11 @@ impl SecurityEventLog for PostgresDb {
                AND ($2::text IS NULL OR e.subject = $2)
                AND (cardinality($3::text[]) = 0 OR e.kind = ANY($3))
                AND ($4::bigint IS NULL OR e.seq < $4)
+               AND ($7::bigint IS NULL OR e.at >= $7)
+               AND ($8::bigint IS NULL OR e.at < $8)
+               AND ($9::text IS NULL
+                    OR (strpos(lower(coalesce(e.target, '')), lower($9)) > 0
+                        AND ($1::text IS NULL OR e.org IS NOT NULL)))
              ORDER BY e.seq DESC
              LIMIT $5"
         ))
@@ -907,6 +1016,9 @@ impl SecurityEventLog for PostgresDb {
         .bind(f.before_seq)
         .bind(i64::from(f.limit.max(1)))
         .bind(&orgless)
+        .bind(f.from_at)
+        .bind(f.to_at)
+        .bind(&f.target_contains)
         .fetch_all(self.pool())
         .await
         .map_err(identity_err)?;

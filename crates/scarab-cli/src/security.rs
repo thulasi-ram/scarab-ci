@@ -601,13 +601,13 @@ mod tests {
         let body = serde_json::json!({
             "code": "fresh_login_required",
             "message": "Log in again to enroll your first passkey.",
-            "login_url": "/v1/auth/login?next=/account/security%3Fenroll%3D1",
+            "login_url": "/v1/auth/login?next=/settings/security%3Fenroll%3D1",
         })
         .to_string();
         let g = refusal_guidance("https://ci.example.com/", 403, &body).unwrap();
         assert!(g.contains("Log in again to enroll"), "{g}");
         assert!(
-            g.contains("https://ci.example.com/v1/auth/login?next=/account/security%3Fenroll%3D1"),
+            g.contains("https://ci.example.com/v1/auth/login?next=/settings/security%3Fenroll%3D1"),
             "{g}"
         );
     }

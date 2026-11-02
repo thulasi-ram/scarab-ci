@@ -51,6 +51,9 @@ async fn harness(bind: &[(&str, &str)]) -> Harness {
             kind: ForgeKind::GitHub,
             base_url: "https://api.github.com".into(),
             credential_ref: "gh-token".into(),
+            org: None,
+            installation_id: None,
+            account_id: None,
         })
         .await
         .unwrap();

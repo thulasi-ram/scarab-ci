@@ -76,8 +76,8 @@ async fn registration_options(h: &Harness, s: &Sess) -> (StatusCode, serde_json:
 #[tokio::test]
 async fn the_first_passkey_needs_a_fresh_browser_login() {
     let h = harness();
-    let (s, location) = browser_login(&h, "amy-code", "/account/security?enroll=1").await;
-    assert_eq!(location, "/account/security?enroll=1");
+    let (s, location) = browser_login(&h, "amy-code", "/settings/security?enroll=1").await;
+    assert_eq!(location, "/settings/security?enroll=1");
 
     let (st, b) = registration_options(&h, &s).await;
     assert_eq!(st, StatusCode::OK, "+0: {b}");
@@ -100,7 +100,7 @@ async fn the_first_passkey_needs_a_fresh_browser_login() {
     );
     assert_eq!(
         b["login_url"],
-        "/v1/auth/login?next=/account/security%3Fenroll%3D1"
+        "/v1/auth/login?next=/settings/security%3Fenroll%3D1"
     );
 
     // Logging in again restarts the clock.
@@ -270,7 +270,7 @@ async fn the_fresh_login_link_names_the_callers_provider_when_there_is_no_defaul
     });
     let (url, st, to) = fresh_login_for(&h, "okta:amy").await;
     assert!(url.contains("provider=okta"), "{url}");
-    assert!(url.contains("next=/account/security%3Fenroll%3D1"), "{url}");
+    assert!(url.contains("next=/settings/security%3Fenroll%3D1"), "{url}");
     assert_eq!(st, StatusCode::FOUND, "{url}");
     assert!(to.starts_with("https://okta.example.com/authorize"), "{to}");
 }
@@ -346,5 +346,5 @@ async fn me_security_names_the_callers_fresh_login_url() {
     assert_eq!(st, StatusCode::OK, "{me}");
     let url = me["fresh_login_url"].as_str().expect("named");
     assert!(url.contains("provider=okta"), "{url}");
-    assert!(url.contains("next=/account/security%3Fenroll%3D1"), "{url}");
+    assert!(url.contains("next=/settings/security%3Fenroll%3D1"), "{url}");
 }

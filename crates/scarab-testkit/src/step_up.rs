@@ -660,6 +660,19 @@ impl SecurityEventLog for InMemorySecurityEvents {
             .filter(|e| f.subject.as_ref().is_none_or(|s| &e.subject == s))
             .filter(|e| f.kinds.is_empty() || f.kinds.contains(&e.kind))
             .filter(|e| f.before_seq.is_none_or(|b| e.seq < b))
+            .filter(|e| f.from_at.is_none_or(|t| e.at >= t))
+            .filter(|e| f.to_at.is_none_or(|t| e.at < t))
+            .filter(|e| match &f.target_contains {
+                None => true,
+                Some(t) => {
+                    (f.org.is_none() || e.org.is_some())
+                        && e.target
+                            .as_deref()
+                            .unwrap_or_default()
+                            .to_lowercase()
+                            .contains(&t.to_lowercase())
+                }
+            })
             .take(f.limit.max(1) as usize)
             .cloned()
             .collect())

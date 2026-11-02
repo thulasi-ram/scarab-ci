@@ -702,12 +702,26 @@ pub(crate) async fn read_source(
             })?
         }
         Some(id) => {
-            let connections = st.connections.as_deref().ok_or(ApiError::NotFound)?;
+            // The org rule (git-bug 19b0a45): a private source is read only
+            // through a connection of the installing org, and only from that
+            // org's own repositories. A connection that does not exist and
+            // one of another org answer the same, so the ids of other orgs'
+            // connections cannot be probed from here.
+            let not_ours = || {
+                ApiError::Denied(format!(
+                    "connection `{id}` does not belong to org `{org}`, so `{}/{}` cannot be \
+                     read through it for `{org}`; install it from a public source, or through \
+                     a connection of `{org}`",
+                    src.owner, src.repo
+                ))
+            };
+            let connections = st.connections.as_deref().ok_or_else(not_ours)?;
             let conn = connections
                 .get_connection(id)
                 .await
                 .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?
-                .ok_or_else(|| ApiError::BadRequest(format!("no connection `{id}`")))?;
+                .filter(|c| c.org.as_deref() == Some(org))
+                .ok_or_else(not_ours)?;
             if connection_web_host(&conn).as_deref() != Some(src.host.as_str()) {
                 return Err(ApiError::BadRequest(format!(
                     "connection `{id}` serves {}, not {}",
@@ -715,33 +729,12 @@ pub(crate) async fn read_source(
                     src.host
                 )));
             }
-            // The org rule: the org's own repositories, or ones bound to it.
-            // A binding names a repository on one connection's forge; the
-            // same `<owner>/<name>` on another forge is another repository,
-            // so the binding counts only when it is through this connection.
-            // By the same reasoning an owner named like the org is the org's
-            // account only on a forge where the org is: the owner-name match
-            // counts only when the org has a repository bound through this
-            // connection.
-            let registry =
-                |e: scarab_forge::RegistryError| ApiError::Db(DbError::Other(e.to_string()));
-            let bound_here = match connections
-                .resolve(&src.repo_ref())
-                .await
-                .map_err(registry)?
-            {
-                Some(r) => r.org == org && r.connection.id == conn.id,
-                None => false,
-            };
-            let owner_is_org =
-                src.owner == org && org_has_repo_on(connections, &conn.id, org).await?;
-            if !owner_is_org && !bound_here {
+            // A connection of the org reaches what its credential reaches; it
+            // reads for the org only the org's own repositories.
+            if src.owner != org {
                 return Err(ApiError::Denied(format!(
-                    "`{}/{}` is not owned by org `{org}` and is not bound to it through \
-                     connection `{id}`, so it cannot be read through that connection (an owner \
-                     named `{org}` counts only when `{org}` has a repository bound through the \
-                     connection); install it from a public source, or bind the repository to \
-                     `{org}` first",
+                    "`{}/{}` is not owned by org `{org}`; a connection of `{org}` reads only \
+                     `{org}`'s repositories, so install it from a public source",
                     src.owner, src.repo
                 )));
             }
@@ -759,24 +752,6 @@ pub(crate) async fn read_source(
         )));
     }
     String::from_utf8(bytes).map_err(|_| ApiError::BadRequest(format!("{src} is not UTF-8")))
-}
-
-/// Whether `org` has a repository bound through connection `id`: the org is
-/// on that connection's forge.
-async fn org_has_repo_on(
-    connections: &dyn scarab_forge::ForgeConnectionStore,
-    id: &str,
-    org: &str,
-) -> Result<bool, ApiError> {
-    let registry = |e: scarab_forge::RegistryError| ApiError::Db(DbError::Other(e.to_string()));
-    for repo in connections.repos_of(id).await.map_err(registry)? {
-        if let Some(r) = connections.resolve(&repo).await.map_err(registry)? {
-            if r.org == org && r.connection.id == id {
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
 }
 
 /// Checks `content` compiles as `lib:<publisher>/<name>` in `org`, in place
@@ -923,6 +898,7 @@ pub(crate) async fn trust_library_source(
     let by = org_caller(&st, &headers, &org, Action::Administer).await?;
     super::refuse_reserved_org(&org, "trust a library source")?;
     let source = trust_source_key(&body.source)?;
+    super::note_org(&st, &org).await?;
     let now = st.clock.now().await.0;
     let t = store(&st)?
         .trust_source(&TrustedSource {
@@ -1009,6 +985,7 @@ pub(crate) async fn fetch_library(
     let mut name = body.name.clone().unwrap_or_else(|| src.default_name());
     check_names(&publisher, &name)?;
     let content = read_source(&st, &org, &src, body.connection.as_deref()).await?;
+    super::note_org(&st, &org).await?;
     let hash = content_hash(&content);
     // First-party content is stored under the name the release manifest
     // gives it, whatever the request or the source path says: trust in the
@@ -1116,6 +1093,7 @@ pub(crate) async fn install_library(
     check_names(&publisher, &name)?;
     check_hash(&body.content_hash)?;
     let store = store(&st)?;
+    super::note_org(&st, &org).await?;
     let version = store
         .version(&org, &body.content_hash)
         .await

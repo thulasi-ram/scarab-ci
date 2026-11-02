@@ -1,4 +1,4 @@
-// Confirm a StepUpConfirmationRequest (ADR-0073 §6) — the page a
+// Confirm a StepUpConfirmationRequest — the page a
 // `confirmation_url` opens.
 //
 // An API token or a CLI session can never confirm a crown jewel itself; it is
@@ -94,7 +94,7 @@ export default function ConfirmRequest() {
             <p class="subtle">
               <small>
                 Only the person a request is for can confirm it.{" "}
-                <A href="/account/security">Your security settings</A>
+                <A href="/settings/security">Your security settings</A>
               </small>
             </p>
           </div>

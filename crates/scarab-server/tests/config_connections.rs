@@ -336,6 +336,9 @@ async fn declaring_a_database_owned_connection_in_config_refuses_the_boot() {
         kind: ForgeKind::Forgejo,
         base_url: "https://typed-by-hand.example.com".into(),
         credential_ref: "hand-made".into(),
+        org: None,
+        installation_id: None,
+        account_id: None,
     })
     .await
     .unwrap();
@@ -378,6 +381,7 @@ async fn re_provisioning_is_idempotent_and_config_stays_authoritative() {
 connections:
   - id: forgejo-main
     kind: forgejo
+    org: acme
     base_url: https://git2.example.com
     credential:
       env: FORGEJO_CI_TOKEN
@@ -426,6 +430,9 @@ async fn the_deployment_override_wins_over_the_secret_store() {
         kind: ForgeKind::Forgejo,
         base_url: "https://git.example.com".into(),
         credential_ref: "forgejo-main".into(),
+        org: None,
+        installation_id: None,
+        account_id: None,
     };
     secrets
         .put(
@@ -464,12 +471,18 @@ async fn the_github_app_pem_is_an_override_in_the_same_table() {
         kind: ForgeKind::GitHub,
         base_url: "https://api.github.com".into(),
         credential_ref: "github-app".into(),
+        org: None,
+        installation_id: None,
+        account_id: None,
     };
     let forgejo = ForgeConnection {
         id: "forgejo-main".into(),
         kind: ForgeKind::Forgejo,
         base_url: "https://git.example.com".into(),
         credential_ref: "forgejo-main".into(),
+        org: None,
+        installation_id: None,
+        account_id: None,
     };
 
     let app_mode = CredentialOverrides::new().with_github_app_pem(Some("PEM".into()), true);
@@ -485,4 +498,122 @@ async fn the_github_app_pem_is_an_override_in_the_same_table() {
         .with_connection("gh-1", "explicit")
         .with_github_app_pem(Some("PEM".into()), true);
     assert_eq!(both.material_for(&github), Some("explicit"));
+}
+
+/// git-bug 19b0a45: config does not move a connection to another Org. Its
+/// bindings would stay, so the new Org's admins would hold the old Org's
+/// Projects, and could later remove them. A changed `org:` refuses the boot
+/// with what to do instead, case-only changes included (`Acme` is another
+/// Org than `acme`), and the row is left as it was. Before the fix the boot
+/// rewrote the connection's org and kept acme's binding on it.
+#[tokio::test]
+async fn changing_a_config_connections_org_refuses_the_boot() {
+    let db = Arc::new(InMemoryDb::new());
+    provision(db.as_ref(), &specs_from_block(BLOCK))
+        .await
+        .unwrap();
+    assert_eq!(
+        db.get_connection("forgejo-main")
+            .await
+            .unwrap()
+            .unwrap()
+            .org
+            .as_deref(),
+        Some("acme")
+    );
+
+    for (block, to) in [
+        (
+            r#"
+connections:
+  - id: forgejo-main
+    kind: forgejo
+    org: globex
+    base_url: https://git.example.com
+    credential:
+      env: FORGEJO_CI_TOKEN
+"#,
+            "globex",
+        ),
+        (
+            r#"
+connections:
+  - id: forgejo-main
+    kind: forgejo
+    org: Acme
+    base_url: https://git.example.com
+    credential:
+      env: FORGEJO_CI_TOKEN
+"#,
+            "Acme",
+        ),
+    ] {
+        let err = provision(db.as_ref(), &specs_from_block(block))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            ProvisionError::OrgChanged {
+                id: "forgejo-main".into(),
+                from: "acme".into(),
+                to: to.into(),
+            }
+        );
+        assert!(
+            err.to_string()
+                .contains("remove `forgejo-main` from the config"),
+            "{err}"
+        );
+    }
+    let conn = db.get_connection("forgejo-main").await.unwrap().unwrap();
+    assert_eq!(conn.org.as_deref(), Some("acme"));
+    assert_eq!(
+        db.repos_of("forgejo-main").await.unwrap(),
+        vec![RepoRef {
+            owner: "acme".into(),
+            name: "widgets".into()
+        }]
+    );
+}
+
+/// git-bug 19b0a45: a config-owned connection the upgrade left unassigned
+/// (its bindings span owners) is not assigned by config while it holds a
+/// repo of another owner: the boot is refused and names the repo.
+#[tokio::test]
+async fn config_does_not_assign_a_connection_holding_another_owners_repo() {
+    let db = Arc::new(InMemoryDb::new());
+    provision(db.as_ref(), &specs_from_block(BLOCK))
+        .await
+        .unwrap();
+    // What the upgrade leaves: unassigned, holding a globex repo too.
+    let mut conn = db.get_connection("forgejo-main").await.unwrap().unwrap();
+    conn.org = None;
+    db.put_connection(&conn).await.unwrap();
+    let globex = RepoRef {
+        owner: "globex".into(),
+        name: "site".into(),
+    };
+    db.bind_repo("forgejo-main", &globex, "globex", "site")
+        .await
+        .unwrap();
+
+    let err = provision(db.as_ref(), &specs_from_block(BLOCK))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        ProvisionError::ForeignBinding {
+            id: "forgejo-main".into(),
+            org: "acme".into(),
+            repo: "globex/site".into(),
+        }
+    );
+    assert_eq!(
+        db.get_connection("forgejo-main")
+            .await
+            .unwrap()
+            .unwrap()
+            .org,
+        None
+    );
 }

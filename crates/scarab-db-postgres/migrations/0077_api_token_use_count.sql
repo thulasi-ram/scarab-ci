@@ -1,0 +1,19 @@
+-- How many requests each issued API token has made (git-bug a4cb94f).
+--
+-- The org's token list sorts by last use and by this count, so an admin can
+-- find the tokens nobody uses any more and the ones a robot leans on.
+--
+-- A counter on the row, not one row per call. The server counts calls in
+-- memory and adds them here in batches, in the same write that moves
+-- `last_used_at` (at most once a minute per token), when a token list is read,
+-- and every minute in the background. So the count is approximate: it lags by
+-- up to a minute, and a replica that stops loses the calls it had not written.
+--
+-- Expand-only, safe while old and new servers overlap in a rollout: an old
+-- server's INSERT omits the column and gets 0, and its write-back leaves the
+-- count alone, so a mixed rollout only undercounts.
+--
+-- Rollback: a server built before this migration refuses to boot against a
+-- database that has it (sqlx reports migration 77 as unknown). Delete row 77
+-- from `_sqlx_migrations`; the added column is harmless to the old code.
+ALTER TABLE api_tokens ADD COLUMN use_count BIGINT NOT NULL DEFAULT 0;

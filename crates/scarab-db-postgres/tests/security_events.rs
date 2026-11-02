@@ -225,3 +225,107 @@ async fn an_org_sees_its_events_and_its_members_passkey_events_only() {
 
     tdb.cleanup().await;
 }
+
+/// The time range is `[from_at, to_at)`; `target_contains` ignores case and,
+/// in an Org view, never matches an Org-less event (its target is redacted
+/// there). Keyset pages over a filter neither repeat nor skip a row.
+#[tokio::test]
+async fn the_time_range_and_target_filters_narrow_every_page() {
+    let Some(tdb) = fresh_db().await else { return };
+    let db = PostgresDb::with_pool(tdb.pool.clone());
+    db.migrate().await.unwrap();
+    db.grant(
+        &Binding {
+            subject: "amy".into(),
+            scope: Scope::Org("acme".into()),
+            role: Role::Member,
+        },
+        BindingOrigin::Native,
+    )
+    .await
+    .unwrap();
+
+    let at = |id: &str, org: Option<&str>, kind: &str, at: i64, target: &str| SecurityEvent {
+        at,
+        target: Some(target.into()),
+        ..event(id, org, kind, "amy")
+    };
+    for e in [
+        at("t1", Some("acme"), kind::OP_AUTHORISED, 1_000, "acme/web/A"),
+        at("t2", Some("acme"), kind::OP_AUTHORISED, 2_000, "acme/api/B"),
+        at(
+            "t3",
+            None,
+            kind::STEP_UP_CONFIRMED,
+            3_000,
+            "acme/web/HIDDEN",
+        ),
+        at(
+            "t4",
+            Some("globex"),
+            kind::OP_AUTHORISED,
+            3_500,
+            "acme/web/C",
+        ),
+        at("t5", Some("acme"), kind::OP_AUTHORISED, 4_000, "ACME/WEB/D"),
+        at("t6", Some("acme"), kind::OP_AUTHORISED, 5_000, "acme/web/E"),
+    ] {
+        db.append(&e).await.unwrap();
+    }
+    let acme = |f: SecurityEventFilter| SecurityEventFilter {
+        org: Some("acme".into()),
+        ..f
+    };
+    let dbr = &db;
+    let list =
+        |f: SecurityEventFilter| async move { SecurityEventLog::list(dbr, &f).await.unwrap() };
+
+    let ranged = list(acme(SecurityEventFilter {
+        from_at: Some(2_000),
+        to_at: Some(5_000),
+        ..filter()
+    }))
+    .await;
+    assert_eq!(
+        ids(&ranged),
+        vec!["t5", "t3", "t2"],
+        "from inclusive, to exclusive"
+    );
+
+    let web = list(acme(SecurityEventFilter {
+        target_contains: Some("Web".into()),
+        ..filter()
+    }))
+    .await;
+    assert_eq!(
+        ids(&web),
+        vec!["t6", "t5", "t1"],
+        "case-insensitive; not the Org-less t3, not globex's t4"
+    );
+    // Install-wide there is no redaction: the Org-less event matches.
+    let everywhere = list(SecurityEventFilter {
+        target_contains: Some("hidden".into()),
+        ..filter()
+    })
+    .await;
+    assert_eq!(ids(&everywhere), vec!["t3"]);
+
+    // Page the filtered Org view one row at a time.
+    let mut seen = Vec::new();
+    let mut before = None;
+    loop {
+        let page = list(acme(SecurityEventFilter {
+            target_contains: Some("web".into()),
+            before_seq: before,
+            limit: 1,
+            ..Default::default()
+        }))
+        .await;
+        let Some(last) = page.last() else { break };
+        before = Some(last.seq);
+        seen.extend(page.iter().map(|e| e.id.clone()));
+    }
+    assert_eq!(seen, vec!["t6", "t5", "t1"]);
+
+    tdb.cleanup().await;
+}

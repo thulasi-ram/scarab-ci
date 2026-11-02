@@ -100,6 +100,7 @@ describe("event rows", () => {
     expect(callerLabel("session:bearer")).toBe("CLI session");
     expect(callerLabel("api_token:tok-9")).toBe("API token tok-9");
     expect(callerLabel("operator:break-glass")).toBe("operator");
+    expect(callerLabel("operator:grant")).toBe("operator");
   });
 });
 
@@ -201,7 +202,7 @@ describe("the confirm page", () => {
   it("points a no-passkey refusal at enrollment", () => {
     expect(requestErrorLink(400, '{"code":"no_passkey","message":"enroll one first"}')).toEqual({
       text: "Enroll a passkey first",
-      href: "/account/security?enroll=1",
+      href: "/settings/security?enroll=1",
     });
     expect(requestErrorLink(400, '{"code":"challenge_invalid"}')).toBeNull();
     expect(requestErrorLink(404, '{"code":"no_passkey"}')).toBeNull();

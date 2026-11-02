@@ -1,18 +1,20 @@
-// Libraries (ADR-0076 §4-§6) — the Settings section where an org admin
+// Libraries — the Settings section where an org admin
 // installs a library from a git source, upgrades it after reading the diff,
 // removes it, and yanks a version.
 //
 // The panel is a table of installations. Installing and upgrading happen on
-// their own page (`/settings/libraries/review`, routes/LibraryReview.tsx):
+// their own page (`/orgs/<org>/settings/libraries/review`, routes/LibraryReview.tsx):
 // fetch, read the diff and the checks, then install, which asks for a
 // step-up. Removing and yanking tighten and ask for nothing; lifting a yank
 // asks for a step-up. Yanking opens a dialog that says which Runs in
 // progress use the version and can cancel them.
 //
-// First-party libraries come from Scarab's release manifest. A new org gets
-// them when its first repo is bound; if the source could not be read, the
-// empty state says what is missing, and the admin can retry, point at a
-// mirror, or paste a copy (checked against the manifest's hash).
+// Every library installs through the review page, whoever publishes it; the
+// libraries Scarab's release manifest lists are offered there as sources.
+// A new org gets the manifest's defaults when its first repo is bound; if
+// their source could not be read, the empty state says what is missing, and
+// the admin can retry, point at a mirror, or paste a copy (checked against
+// the manifest's hash).
 import { createResource, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { Portal } from "solid-js/web";
 import { A, useNavigate } from "@solidjs/router";
@@ -55,7 +57,6 @@ export default function Libraries(props: { org: string }) {
 
   const unavailable = () => !libs.loading && !libs.error && libs() === null;
   const rows = () => libs()?.installations ?? [];
-  const offered = () => (libs()?.first_party ?? []).filter((f) => !f.installed);
   const missing = () => libs()?.defaults?.state === "missing";
 
   const act = async (what: () => Promise<unknown>, fallback: string, done?: string) => {
@@ -86,13 +87,6 @@ export default function Libraries(props: { org: string }) {
       () => unyankLibrary(props.org, hash),
       "Could not lift the yank.",
       `Version ${shortHash(hash)} can run again.`,
-    );
-
-  const installDefaults = () =>
-    void act(
-      () => retryLibraryDefaults(props.org, { mirror: null, files: {} }),
-      "Could not install the first-party libraries.",
-      "The first-party libraries are installed.",
     );
 
   return (
@@ -161,14 +155,9 @@ export default function Libraries(props: { org: string }) {
                         out a repository needs <span class="mono">lib:thulasi-ram/clone</span>.
                       </p>
                       <div class="acts">
-                        <button class="btn btn-primary btn-sm" onClick={() => nav(reviewHref({}))}>
+                        <button class="btn btn-primary btn-sm" onClick={() => nav(reviewHref(props.org, {}))}>
                           <Icon icon="plus" size={14} /> Install library
                         </button>
-                        <Show when={offered().length > 0}>
-                          <button class="btn btn-ghost btn-sm" onClick={installDefaults}>
-                            Install first-party libraries ({offered().length})
-                          </button>
-                        </Show>
                       </div>
                     </div>
                   </div>
@@ -192,7 +181,7 @@ export default function Libraries(props: { org: string }) {
                         library={l}
                         trust={trustNote(l, libs()?.trusted_sources ?? [])}
                         onUpgrade={(source) =>
-                          nav(reviewHref({ source: source ?? l.source, publisher: l.publisher, name: l.name }))
+                          nav(reviewHref(props.org, { source: source ?? l.source, publisher: l.publisher, name: l.name }))
                         }
                         onRemove={() => remove(l)}
                         onYank={() => setYanking(l)}
@@ -202,33 +191,6 @@ export default function Libraries(props: { org: string }) {
                   </For>
                 </tbody>
               </table>
-            </Show>
-
-            <Show when={offered().length > 0 && rows().length > 0}>
-              <p class="subtle">First-party libraries not installed here:</p>
-              <ul class="tok-list">
-                <For each={offered()}>
-                  {(f) => (
-                    <li class="tok">
-                      <div class="tok-head">
-                        <Icon icon="package" size={15} />
-                        <span class="tok-name mono">
-                          lib:{f.publisher}/{f.name}
-                        </span>
-                        <span class="tok-scope">{f.release}</span>
-                        <span class="oenv-actions">
-                          <button
-                            class="btn btn-ghost btn-sm"
-                            onClick={() => nav(reviewHref({ source: f.source, publisher: f.publisher, name: f.name }))}
-                          >
-                            install
-                          </button>
-                        </span>
-                      </div>
-                    </li>
-                  )}
-                </For>
-              </ul>
             </Show>
 
             <Show when={(libs()?.yanks ?? []).some((y) => !rows().some((r) => r.content_hash === y.content_hash))}>
@@ -277,7 +239,7 @@ export default function Libraries(props: { org: string }) {
 
             <Show when={rows().length > 0}>
               <div class="secrets-actions">
-                <button class="btn btn-primary btn-sm" onClick={() => nav(reviewHref({}))}>
+                <button class="btn btn-primary btn-sm" onClick={() => nav(reviewHref(props.org, {}))}>
                   <Icon icon="plus" size={14} /> Install library
                 </button>
               </div>
@@ -305,7 +267,7 @@ export default function Libraries(props: { org: string }) {
                 setError(null);
                 setNotice(msg);
                 reload();
-                if (upgrade) nav(reviewHref({ source: upgrade, publisher: l().publisher, name: l().name }));
+                if (upgrade) nav(reviewHref(props.org, { source: upgrade, publisher: l().publisher, name: l().name }));
               }}
             />
           </Portal>
@@ -588,7 +550,7 @@ function YankDialog(props: {
 
   return (
     <div class="modal-scrim" onClick={props.onClose}>
-      <div class="modal" style={{ width: "min(580px, 94vw)" }} onClick={(e) => e.stopPropagation()}>
+      <div class="modal modal-wide" onClick={(e) => e.stopPropagation()}>
         <div class="panel-h">
           <span>
             <Icon icon="ban" size={13} /> Yank lib:{l().publisher}/{l().name} {shortHash(l().content_hash)}
@@ -637,18 +599,17 @@ function YankDialog(props: {
               </li>
             </ul>
             <Show when={runs().length > 0}>
-              <label class="yk-cancel">
-                <input type="checkbox" checked={cancel()} onChange={(e) => setCancel(e.currentTarget.checked)} />{" "}
-                Cancel {runs().length === 1 ? "this Run" : `these ${runs().length} Runs`} now
+              <label class="checkbox-inline">
+                <input type="checkbox" checked={cancel()} onChange={(e) => setCancel(e.currentTarget.checked)} />
+                <span>Cancel {runs().length === 1 ? "this Run" : `these ${runs().length} Runs`} now</span>
               </label>
             </Show>
           </div>
-          <div>
+          <div class="form-r">
             <label>reason (shown with every refusal)</label>
             <textarea
               class="input"
               rows={3}
-              style={{ width: "100%", "font-family": "var(--font-ui)" }}
               value={reason()}
               onInput={(e) => setReason(e.currentTarget.value)}
               ref={(el) => queueMicrotask(() => el.focus())}
@@ -660,16 +621,20 @@ function YankDialog(props: {
           </div>
           <Show when={l().update}>
             {(u) => (
-              <label class="yk-cancel">
-                <input type="checkbox" checked={upgrade()} onChange={(e) => setUpgrade(e.currentTarget.checked)} />{" "}
-                then review the upgrade to <span class="lib-hash">{shortHash(u().content_hash)}</span> (
-                {u().release}; asks for your passkey)
+              <label class="checkbox-inline">
+                <input type="checkbox" checked={upgrade()} onChange={(e) => setUpgrade(e.currentTarget.checked)} />
+                <span>
+                  then review the upgrade to <span class="lib-hash">{shortHash(u().content_hash)}</span> (
+                  {u().release}; asks for your passkey)
+                </span>
               </label>
             )}
           </Show>
           <Show when={error()}>
             <p class="error">{error()}</p>
           </Show>
+        </div>
+        <div class="modal-foot">
           <div class="modal-actions">
             <button class="btn btn-danger" disabled={busy() || reason().trim() === ""} onClick={() => void submit()}>
               <Icon icon="ban" size={14} /> {busy() ? "Yanking…" : yankButtonLabel(cancel(), runs().length)}

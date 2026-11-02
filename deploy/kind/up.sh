@@ -6,9 +6,10 @@
 #   deploy/kind/up.sh [dev|dogfood|e2e|chaos]
 #
 #   dev      (`just stack up`)      dev-insecure, database `scarab`, bucket `scarab-logs`
-#   dogfood  (`just stack up dogfood`) GitHub App mode from ~/.config/scarab/dogfood.env,
-#                             database `scarab_dogfood`, bucket `scarab-dogfood`,
-#                             and a cloudflared tunnel to the public hostname
+#   dogfood  (`just stack up dogfood`) GitHub App mode and GitHub login from
+#                             ~/.config/scarab/dogfood.env, database `scarab_dogfood`,
+#                             bucket `scarab-dogfood`, and a cloudflared tunnel to the
+#                             public hostname that serves only /webhooks/
 #   e2e      (`just test e2e`)     dev-insecure, database `scarab_e2e`, bucket
 #                             `scarab-e2e`, so test data never mixes with dev's;
 #                             a cloudflared quick tunnel in front of Forgejo only
@@ -91,6 +92,13 @@ if [ "$mode" = dogfood ]; then
   for k in SCARAB_GITHUB_APP_ID SCARAB_APP_PEM SCARAB_GITHUB_WEBHOOK_SECRET SCARAB_MASTER_KEY SCARAB_RESULTS_TOKEN_SECRET SCARAB_ORG; do
     [ -n "$(env_get "$dogfood_env" "$k")" ] || die "$k is empty or missing in $dogfood_env"
   done
+  # GitHub login (git-bug 2199c2e): the GitHub App's own OAuth client. Its
+  # callback URL in the App settings is http://localhost:<port>/v1/auth/callback.
+  for k in SCARAB_OAUTH_CLIENT_ID SCARAB_OAUTH_CLIENT_SECRET; do
+    [ -n "$(env_get "$dogfood_env" "$k")" ] \
+      || die "$k is empty or missing in $dogfood_env: the dogfood stack signs in with GitHub through the GitHub App's OAuth client (its Client ID, and a client secret generated in the App settings; see deploy/kind/README.md)"
+  done
+  dogfood_principals "$dogfood_env"   # dogfood_owner, dogfood_member (lib.sh)
   # A bare host name: it becomes https://<it> in publicUrl and the probes.
   dogfood_host="$(env_get "$dogfood_env" DOGFOOD_HOSTNAME)"
   dogfood_host="${dogfood_host#https://}"
@@ -128,6 +136,13 @@ fi
 # The host port: SCARAB_ADDR from deploy/kind/.env (lib.sh scarab_addr;
 # `just ui`'s SCARAB_API_URL must name the same port).
 scarab_addr   # addr_file, host_ip, host_port, base
+# The dogfood stack's UI is http://localhost:<port> (scarab.uiUrl) and is for
+# this machine only. A LAN or 0.0.0.0 address would publish a login and an API
+# to the network that the localhost UI URL does not serve.
+if [ "$mode" = dogfood ] && [ "$host_ip" != 127.0.0.1 ]; then
+  die "the dogfood stack answers on 127.0.0.1 only, and SCARAB_ADDR in $addr_file has host $host_ip.
+  Set SCARAB_ADDR=127.0.0.1:$host_port there and rerun 'just stack up dogfood'."
+fi
 
 port_listening() { (exec 3<>"/dev/tcp/$1/$2") 2>/dev/null; }
 
@@ -394,10 +409,12 @@ for _ in $(seq 1 30); do
   kc exec -n "$ns" deploy/scarab-postgres -- psql -U scarab -d scarab -tAc 'select 1' >/dev/null 2>&1 && break
   sleep 2
 done
+fresh_database=0
 if ! kc exec -n "$ns" deploy/scarab-postgres -- psql -U scarab -d scarab -tAc \
      "select 1 from pg_database where datname = '$database'" | grep -q 1; then
   echo "    creating database $database"
   kc exec -n "$ns" deploy/scarab-postgres -- createdb -U scarab "$database"
+  fresh_database=1
 fi
 database_url="postgres://scarab:scarab@scarab-postgres:5432/$database"
 # Chaos mode reaches the same Postgres and MinIO through toxiproxy, so a
@@ -501,11 +518,11 @@ values="$(mktemp "$state/values.XXXXXX")"
 libs_dir="$(mktemp -d "$state/libs.XXXXXX")"
 # tunnel_unchecked: dogfood's cloudflared was applied and the outside check
 # below has not passed yet. Any exit in that window (a rollout timeout, a
-# failed command, Ctrl-C) scales it to 0, so a dev-insecure release is never
-# left public on a route nobody checked.
+# failed command, Ctrl-C) scales it to 0, so the release is never left
+# public on a route nobody checked.
 tunnel_unchecked=0
 on_exit() {
-  rm -rf "$values" "$libs_dir"
+  rm -rf "$values" "$libs_dir" "${secret_file:-}" "${token_file:-}"
   if [ "$tunnel_unchecked" = 1 ]; then
     echo "==> stopped before the tunnel check passed: scaling cloudflared to 0" >&2
     ( kc scale deploy scarab-cloudflared -n "$ns" --replicas=0 >/dev/null 2>&1 ) || true
@@ -549,28 +566,29 @@ fi
 # start, so a UI staged after the Pod started needs a roll too.
 binary_sum="$({ cat "$mount/bin/scarab-server"; cat "$mount/ui/index.html" 2>/dev/null || true; } | shasum -a 256 | cut -c1-16)"
 if [ "$mode" = dogfood ]; then
-  # Dev-insecure, as the earlier dogfood on colima's k3s ran: no login,
-  # every caller is an Owner. So the tunnel must publish only
-  # /webhooks/; the check after cloudflared starts enforces that. Set
-  # SCARAB_DOGFOOD_DEV_INSECURE=false once OAuth values are added here.
-  dev_insecure="${SCARAB_DOGFOOD_DEV_INSECURE:-true}"
+  # Real GitHub login, as a real install runs (git-bug 2199c2e): an
+  # identity store, role bindings, API tokens and passkey step-up. The UI
+  # URL is localhost, not $base: browsers refuse passkeys on an IP address,
+  # and the login callback is registered for it.
+  dev_insecure=false
   app_id="$(env_get "$dogfood_env" SCARAB_GITHUB_APP_ID)"
   timeout="$(env_get "$dogfood_env" SCARAB_STEP_TIMEOUT_SECS)"
+  oauth_client_id="$(env_get "$dogfood_env" SCARAB_OAUTH_CLIENT_ID)"
+  ui_url="http://localhost:$host_port"
 else
-  dev_insecure=true; app_id=""; timeout=""
+  dev_insecure=true; app_id=""; timeout=""; oauth_client_id=""; ui_url=""
 fi
 # Written as JSON (valid YAML) by python, never spliced into YAML text: a
 # secret with a quote, a backslash or a '#' stays the same bytes. The values
 # reach python through its environment, not argv, so they never show in `ps`.
 V_MODE="$mode" V_SUM="$binary_sum" V_BUCKET="$bucket" V_S3_ENDPOINT="$s3_endpoint" V_DEV_INSECURE="$dev_insecure" \
 V_APP_ID="$app_id" V_PUBLIC_URL="https://${dogfood_host:-}" V_TIMEOUT="${timeout:-3600}" \
+V_UI_URL="$ui_url" V_OAUTH_CLIENT_ID="$oauth_client_id" V_OWNER="${dogfood_owner:-}" \
 V_DATABASE_URL="$database_url" V_MASTER_KEY="$master_key" V_RESULTS="$results_secret" \
 V_WORKSPACE="$workspace_secret" V_WEBHOOK="$webhook_secret" V_FORGEJO_WEBHOOK="$forgejo_webhook_secret" \
 python3 -I - "$libs_dir/manifest.json" > "$values" <<'PY2'
 import json, os, sys
 e = os.environ
-if e["V_DEV_INSECURE"] not in ("true", "false"):
-    sys.exit("SCARAB_DOGFOOD_DEV_INSECURE must be true or false")
 v = {
     "podAnnotations": {"scarab.dev/binary-sha256": e["V_SUM"]},
     "scarab": {
@@ -612,22 +630,46 @@ if e["V_MODE"] == "chaos":
     # 8 x 15 s leaves it stopped until the scenario resumes it.
     v["livenessProbe"] = {"failureThreshold": 8}
 if e["V_MODE"] == "dogfood":
-    v["scarab"].update(githubAppId=e["V_APP_ID"], publicUrl=e["V_PUBLIC_URL"], stepTimeoutSecs=e["V_TIMEOUT"])
+    v["scarab"].update(githubAppId=e["V_APP_ID"], publicUrl=e["V_PUBLIC_URL"], stepTimeoutSecs=e["V_TIMEOUT"],
+                       uiUrl=e["V_UI_URL"])
+    # A named provider `github`, so Principal ids are github:<login>. The
+    # client secret is the Secret scarab-oauth-github, made below.
+    v["scarab"]["oauth"] = {
+        "owners": [e["V_OWNER"]],
+        "providers": [{
+            "id": "github",
+            "name": "GitHub",
+            "clientId": e["V_OAUTH_CLIENT_ID"],
+            "authorizeUrl": "https://github.com/login/oauth/authorize",
+            "tokenUrl": "https://github.com/login/oauth/access_token",
+            "userinfoUrl": "https://api.github.com/user",
+            "scopes": "read:user",
+            "forgeUrl": "https://api.github.com",
+            "clientSecret": {"name": "scarab-oauth-github", "key": "client-secret"},
+        }],
+    }
     v["secrets"].update(githubWebhookSecret=e["V_WEBHOOK"],
                         githubAppPemSecret={"name": "scarab-github-app", "key": "github-app.pem"})
 json.dump(v, sys.stdout, indent=1)
 PY2
 
 if [ "$mode" = dogfood ]; then
-  echo "==> GitHub App PEM secret, cloudflared"
+  echo "==> GitHub App PEM secret, GitHub login client secret, cloudflared"
   kc create secret generic scarab-github-app -n "$ns" \
     --from-file="github-app.pem=$pem" --dry-run=client -o yaml | kc apply -f - >/dev/null
-  # The token goes through a file, not argv, so it never shows in `ps`.
+  # The secrets go through a file, not argv, so they never show in `ps`.
+  secret_file="$(mktemp "$state/oauth.XXXXXX")"
+  env_get "$dogfood_env" SCARAB_OAUTH_CLIENT_SECRET | tr -d '\n' > "$secret_file"
+  kc create secret generic scarab-oauth-github -n "$ns" \
+    --from-file="client-secret=$secret_file" --dry-run=client -o yaml | kc apply -f - >/dev/null
+  rm -f "$secret_file"
   token_file="$(mktemp "$state/cf.XXXXXX")"
   env_get "$dogfood_env" CLOUDFLARE_TUNNEL_TOKEN | tr -d '\n' > "$token_file"
   kc create secret generic scarab-cloudflared -n "$ns" \
     --from-file="token=$token_file" --dry-run=client -o yaml | kc apply -f - >/dev/null
   rm -f "$token_file"
+  # The clone library copy, for the fresh-database checklist (seed.sh).
+  cp "$libs_dir/clone.yaml" "$state/dogfood-clone.yaml"
 else
   # A dev stack has no tunnel; remove one a dogfood run left.
   kc delete deploy scarab-cloudflared -n "$ns" --ignore-not-found >/dev/null
@@ -649,12 +691,13 @@ if [ "$mode" = dogfood ]; then
   kc apply -n "$ns" -f "$here/cloudflared.yaml" >/dev/null
   kc rollout status -n "$ns" deploy/scarab-cloudflared --timeout=120s
 
-  # The release is dev-insecure: whoever reaches the UI or the API is an
-  # Owner, and this server holds the GitHub App's key. The tunnel's public
-  # hostname must therefore route only `^/webhooks/` (path rule in the
-  # Cloudflare dashboard; the catch-all answers 404). Check that from outside,
-  # through Cloudflare, and take the tunnel down if anything else reaches
-  # Scarab, or if it cannot be checked.
+  # The release signs people in with GitHub, but it holds the GitHub App's
+  # key and is a staging stack: the UI and API are for this machine only.
+  # The tunnel's public hostname must therefore route only `^/webhooks/`
+  # (path rule in the Cloudflare dashboard; the catch-all answers 404). The
+  # login callback is on localhost, so nothing else needs to be public.
+  # Check that from outside, through Cloudflare, and take the tunnel down if
+  # anything else reaches Scarab, or if it cannot be checked.
   resolve=()
   if ! python3 -I -c 'import socket, sys; socket.gethostbyname(sys.argv[1])' "$dogfood_host" 2>/dev/null; then
     # A resolver that cached "no such name" before the DNS record existed
@@ -677,10 +720,10 @@ if [ "$mode" = dogfood ]; then
     kc scale deploy scarab-cloudflared -n "$ns" --replicas=0 >/dev/null
     die "the tunnel is down again (cloudflared scaled to 0): through https://\$DOGFOOD_HOSTNAME,
   / answered HTTP $root_code and /v1/repos HTTP $api_code; both must be Cloudflare's 404.
-  This stack is dev-insecure, so a public UI or API makes every visitor an Owner.
+  The UI and API of this stack are for this machine only: it holds the GitHub App's key.
   In the Cloudflare dashboard, set the tunnel's public hostname Path to ^/webhooks/
   (the catch-all rule then answers 404), and rerun 'just stack up dogfood'.
-  The UI and API stay on $base. (000 or 5xx means the check could not reach the tunnel.)"
+  The UI and API stay on ${ui_url:-$base}. (000 or 5xx means the check could not reach the tunnel.)"
   fi
   tunnel_unchecked=0
   webhook_code="$(public_code POST /webhooks/github)"
@@ -699,45 +742,41 @@ for _ in $(seq 1 30); do
 done
 [ "$ok" = 1 ] || die "the release is rolled out but $base/readyz does not answer from the host"
 
-# ADR-0071 (c-full c2): a Deploy Run is admitted only into an org Environment
-# that exists and lists its Project as eligible. The dogfood pipeline deploys to
-# `production`, so seed it, eligible for every Project, when it is missing (the
-# PUTs replace, so an existing one is left as configured). Needs dev-insecure.
 org="${SCARAB_DEV_ORG:-thulasi-ram}"
 [ "$mode" = dogfood ] && org="$(env_get "$dogfood_env" SCARAB_ORG)"
-code="$(curl -s -o /dev/null -w '%{http_code}' "$base/v1/orgs/$org/environments/production")"
-case "$code" in
-  200) ;;
-  404)
-    curl -sf -X PUT "$base/v1/orgs/$org/environments/production" -H 'content-type: application/json' \
-      -d '{"description":"seeded by deploy/kind/up.sh for the dogfood pipeline"}' >/dev/null \
-    && curl -sf -X PUT "$base/v1/orgs/$org/environments/production/eligibility" \
-      -H 'content-type: application/json' -d '{"all_projects":true}' >/dev/null \
-    && echo "==> seeded org Environment $org/production (eligible: all projects)" \
-    || echo "warning: could not seed org Environment $org/production" >&2
-    ;;
-  *) echo "warning: could not read org Environment $org/production (HTTP $code); not seeding it" >&2 ;;
-esac
+if [ "$mode" != dogfood ]; then
+  # ADR-0071 (c-full c2): a Deploy Run is admitted only into an org Environment
+  # that exists and lists its Project as eligible. The dogfood pipeline deploys
+  # to `production`, so seed it, eligible for every Project, when it is missing
+  # (the PUTs replace, so an existing one is left as configured). Needs
+  # dev-insecure; the dogfood stack has login on, so seed.sh's checklist below
+  # lists it as a step for its Owner.
+  code="$(curl -s -o /dev/null -w '%{http_code}' "$base/v1/orgs/$org/environments/production")"
+  case "$code" in
+    200) ;;
+    404)
+      curl -sf -X PUT "$base/v1/orgs/$org/environments/production" -H 'content-type: application/json' \
+        -d '{"description":"seeded by deploy/kind/up.sh for the dogfood pipeline"}' >/dev/null \
+      && curl -sf -X PUT "$base/v1/orgs/$org/environments/production/eligibility" \
+        -H 'content-type: application/json' -d '{"all_projects":true}' >/dev/null \
+      && echo "==> seeded org Environment $org/production (eligible: all projects)" \
+      || echo "warning: could not seed org Environment $org/production" >&2
+      ;;
+    *) echo "warning: could not read org Environment $org/production (HTTP $code); not seeding it" >&2 ;;
+  esac
+fi
 
 if [ "$mode" = dogfood ]; then
-  # Install the clone library copy into the org, replacing a copy that pinned
-  # another image (the hash is checked against the manifest above).
-  libs="$base/v1/orgs/$org/libraries"
-  want="$(shasum -a 256 "$libs_dir/clone.yaml" | awk '{print $1}')"
-  have="$(curl -sf "$libs" | python3 -I -c '
-import json, sys
-for i in json.load(sys.stdin).get("installations", []):
-    if (i["publisher"], i["name"]) == ("thulasi-ram", "clone"):
-        print(i["content_hash"])
-' || true)"
-  if [ "$have" != "$want" ]; then
-    [ -z "$have" ] || curl -sf -o /dev/null -X DELETE "$libs/thulasi-ram/clone" || true
-    python3 -I -c 'import json, sys; print(json.dumps({"files": {"thulasi-ram/clone": open(sys.argv[1]).read()}}))' \
-        "$libs_dir/clone.yaml" \
-      | curl -sf -o /dev/null -X POST "$base/v1/orgs/$org/library-defaults/retry" \
-          -H 'content-type: application/json' -d @- \
-      && echo "==> installed the clone library (pins scarab-clone:dev) into $org" \
-      || echo "warning: could not install the clone library into $org; install it from Settings > Libraries" >&2
+  # The Owner and member role bindings (`scarab-server admin grant
+  # --if-absent` in the server Pod). On a fresh database also the one-time
+  # steps that need a passkey: the `production` Environment and the clone
+  # library copy that pins scarab-clone:dev. On an existing one, the step that
+  # reinstalls the clone library when the installed copy differs. Without
+  # login up.sh did those with plain curl.
+  if [ "$fresh_database" = 1 ]; then
+    bash "$here/seed.sh" --checklist
+  else
+    bash "$here/seed.sh"
   fi
 
   # A fresh database has no GitHub installation until GitHub delivers one. The
@@ -755,9 +794,11 @@ for i in json.load(sys.stdin).get("installations", []):
   fi
 fi
 
-echo "==> up: $base (mode: $mode)"
+echo "==> up: ${ui_url:-$base} (mode: $mode)"
 echo "    server log:  just stack logs     Depot: just stack logs depot, just stack status"
 echo "    pipelines:   just stack demo, just stack demo chain"
 if [ "$mode" = dogfood ]; then
+  echo "    sign in:     $ui_url with GitHub (localhost, not 127.0.0.1: passkeys refuse an IP address)"
+  echo "    seed again:  just stack seed dogfood (grants; add the checklist with: just stack seed dogfood checklist)"
   echo "    GitHub webhooks: https://\$DOGFOOD_HOSTNAME/webhooks/github (only /webhooks/ is public)"
 fi

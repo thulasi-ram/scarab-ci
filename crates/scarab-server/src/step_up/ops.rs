@@ -98,6 +98,9 @@ pub enum OrgOf {
     Query(&'static str),
     /// The tenant of the run named by the `id` path parameter.
     Run,
+    /// The Org of the forge connection named by the `id` path parameter
+    /// (git-bug 19b0a45); none for an unassigned connection.
+    Connection,
     /// Not bound to one Org.
     None,
 }
@@ -582,6 +585,7 @@ const fn op(
 
 const ADMIN: Option<Role> = Some(Role::Admin);
 const MEMBER: Option<Role> = Some(Role::Member);
+const VIEWER: Option<Role> = Some(Role::Viewer);
 const ANYONE: Option<Role> = None;
 const W: Mode = Mode::Window;
 const A: Mode = Mode::AlwaysAsk;
@@ -734,7 +738,7 @@ pub static CONNECTION_RESYNC: Op = op(
     Class::CrownJewel(W),
     "§3 ForgeConnection edits (AMBIG)",
     ADMIN,
-    OrgOf::None,
+    OrgOf::Connection,
     &[],
     &["path:id"],
 );
@@ -744,7 +748,7 @@ pub static CONNECTION_WEBHOOK: Op = op(
     Class::NotGoverned("idempotent re-registration for an already-bound repo"),
     "§3 ForgeConnection edits (AMBIG)",
     ADMIN,
-    OrgOf::None,
+    OrgOf::Connection,
     &[],
     &["path:id", "path:owner", "path:name"],
 );
@@ -811,6 +815,19 @@ pub static TOKEN_REVOKE: Op = op(
     &[],
     &["path:org", "path:id"],
 );
+pub static TOKEN_REVOKE_OWN: Op = op(
+    "token.revoke_own",
+    "Revoke one of your API tokens",
+    Class::Exempt("revocation tightens"),
+    "§3 not on the list",
+    ANYONE,
+    OrgOf::None,
+    &[],
+    &["path:id"],
+)
+// Its handler checks ownership only, so it refuses a token: a leaked
+// read-only token must not revoke its owner's other tokens.
+.not_by_token();
 pub static RUN_CANCEL: Op = op(
     "run.cancel",
     "Cancel a run",
@@ -999,9 +1016,9 @@ pub static CONNECTION_CREATE: Op = op(
     Class::CrownJewel(W),
     "§3 ForgeConnection edits",
     ADMIN,
-    OrgOf::None,
+    OrgOf::Body("/org"),
     &["/credential"],
-    &["body:/kind", "body:/base_url"],
+    &["body:/org", "body:/kind", "body:/base_url"],
 );
 pub static CONNECTION_DELETE: Op = op(
     "connection.delete",
@@ -1009,17 +1026,30 @@ pub static CONNECTION_DELETE: Op = op(
     Class::CrownJewel(W),
     "§3 ForgeConnection edits; Project deletion",
     ADMIN,
-    OrgOf::None,
+    OrgOf::Connection,
     &[],
     &["path:id"],
 );
+pub static CONNECTION_ASSIGN_ORG: Op = op(
+    "connection.assign_org",
+    "Assign a forge connection to an org",
+    Class::CrownJewel(W),
+    "§3 ForgeConnection edits",
+    ADMIN,
+    OrgOf::Body("/org"),
+    &[],
+    &["path:id", "body:/org"],
+)
+// Global admins only, and a token is never global (git-bug 19b0a45): a
+// request a token raised could only ever be confirmed into a 403.
+.not_by_token();
 pub static CONNECTION_BIND_REPO: Op = op(
     "connection.bind_repo",
     "Bind a repository",
     Class::CrownJewel(W),
     "§3 ForgeConnection edits (AMBIG)",
     ADMIN,
-    OrgOf::None,
+    OrgOf::Connection,
     &[],
     &["path:id", "body:/owner", "body:/name"],
 );
@@ -1029,22 +1059,35 @@ pub static CONNECTION_UNBIND_REPO: Op = op(
     Class::CrownJewel(W),
     "§3 irreversible destruction (Project)",
     ADMIN,
-    OrgOf::None,
+    OrgOf::Connection,
     &[],
     &["path:id", "path:owner", "path:name"],
 );
 
 // --- crown jewels, always ask ------------------------------------------------
 
+// Any human may mint a personal token up to the role they hold in its scope
+// (git-bug a4cb94f), so the lowest role the handler accepts is Viewer.
 pub static TOKEN_MINT: Op = op(
     "token.mint",
     "Create an API token",
     Class::CrownJewel(A),
     "§3/§4 API token creation",
-    ADMIN,
+    VIEWER,
     OrgOf::Path("org"),
     &[],
     &["path:org", "body:/project", "body:/name"],
+)
+.not_by_token();
+pub static TOKEN_MINT_OWN: Op = op(
+    "token.mint_own",
+    "Create a personal API token",
+    Class::CrownJewel(A),
+    "§3/§4 API token creation",
+    VIEWER,
+    OrgOf::Body("/org"),
+    &[],
+    &["body:/org", "body:/project", "body:/name"],
 )
 .not_by_token();
 pub static PLUGIN_INSTALL: Op = op(
@@ -1446,9 +1489,12 @@ mod tests {
     }
 
     /// The operations a machine caller may never raise a request for: the
-    /// browser-only flows, and token minting for a token (git-bug ff7a014).
+    /// browser-only flows, token minting for a token (git-bug ff7a014), the
+    /// personal token revoke (its handler refuses a token), and assigning a
+    /// connection's org, which only a global admin may do and a token never
+    /// is (git-bug 19b0a45).
     #[test]
-    fn only_the_browser_flows_and_token_minting_refuse_a_machine() {
+    fn only_the_browser_flows_token_minting_and_org_assignment_refuse_a_machine() {
         let mut browser_only = Vec::new();
         let mut not_by_token = Vec::new();
         for e in crate::route_table() {
@@ -1464,7 +1510,16 @@ mod tests {
             browser_only,
             vec!["identity.link", "identity.unlink", "passkey.add"]
         );
-        assert_eq!(not_by_token, vec!["token.mint"]);
+        not_by_token.sort_unstable();
+        assert_eq!(
+            not_by_token,
+            vec![
+                "connection.assign_org",
+                "token.mint",
+                "token.mint_own",
+                "token.revoke_own"
+            ]
+        );
     }
 
     #[test]

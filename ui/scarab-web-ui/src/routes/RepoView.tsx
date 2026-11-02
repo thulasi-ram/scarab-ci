@@ -41,6 +41,7 @@ import RunNumber from "../components/RunNumber";
 import Icon from "../components/Icon";
 import SearchSelect from "../components/SearchSelect";
 import PrincipalSearch from "../components/PrincipalSearch";
+import FormSection from "../components/FormSection";
 import { addToList } from "../identities";
 import ScopedSecrets from "../components/ScopedSecrets";
 import SecretMatrixEditor from "../components/SecretMatrixEditor";
@@ -593,6 +594,7 @@ export default function RepoView() {
         <ScopedSecrets
           scope={{ org: org(), repo: repo() }}
           title={`Secrets · ${org()}/${repo()}`}
+          showInherited
           focusPing={secretFocus()}
           epoch={secretListEpoch()}
           onChange={() => setSecretMatrixEpoch((n) => n + 1)}
@@ -871,13 +873,12 @@ function EnvDialog(props: {
 
   return (
     <div class="modal-scrim" onClick={props.onClose}>
-      <div class="modal" onClick={(e) => e.stopPropagation()}>
+      <div class="modal modal-tall" onClick={(e) => e.stopPropagation()}>
         <div class="panel-h">
           <span>Tighten for {props.repo}</span>
         </div>
         <div class="modal-body">
-          <div class="form-r">
-            <label>environment</label>
+          <FormSection n={1} title="Environment">
             <Show
               when={choices().length > 0}
               fallback={
@@ -890,6 +891,7 @@ function EnvDialog(props: {
             >
               <select
                 class="input mono"
+                aria-label="environment"
                 value={picked()}
                 onChange={(e) => setPicked(e.currentTarget.value)}
               >
@@ -904,60 +906,61 @@ function EnvDialog(props: {
                 </For>
               </select>
             </Show>
-          </div>
-          <div class="form-r">
-            <label>extra approvers</label>
+          </FormSection>
+          <FormSection n={2} title="Extra approvers">
             <input
-              class="input"
+              class="input mono"
+              aria-label="extra approvers"
               placeholder="comma-separated user ids (blank = none)"
               value={approvers()}
               onInput={(e) => setApprovers(e.currentTarget.value)}
             />
             {/* Approvers match a user id exactly and must name someone who
-                exists (ADR-0069 §3), so offer the search rather than leave
-                people to guess `github:alice` vs `alice`. */}
+                exists, so offer the search rather than leave people to guess
+                `github:alice` vs `alice`. */}
             <PrincipalSearch
               org={props.org}
               placeholder="add an approver — find a user"
               onPick={(id) => setApprovers(addToList(approvers(), id))}
             />
             <p class="fieldnote">Required in addition to the org baseline's approvers.</p>
-          </div>
-          <div class="form-r">
-            <label>allowed refs</label>
-            <input
-              class="input"
-              placeholder="comma-separated globs, e.g. refs/heads/main (blank = any)"
-              value={allowedRefs()}
-              onInput={(e) => setAllowedRefs(e.currentTarget.value)}
-            />
-            <p class="fieldnote">
-              A ref must match these <b>and</b> the baseline's. Use full refs —{" "}
-              <span class="mono">refs/heads/main</span>, not <span class="mono">main</span>.
-            </p>
-          </div>
-          <div class="form-r">
-            <label>wait timer (s)</label>
-            <input
-              class="input"
-              type="number"
-              min="0"
-              value={waitTimer()}
-              onInput={(e) => setWaitTimer(e.currentTarget.value)}
-            />
-            <p class="fieldnote">Recorded, not yet enforced.</p>
-          </div>
-          <div class="form-r">
-            <label>require reason</label>
+          </FormSection>
+          <FormSection n={3} title="Refs and timing">
+            <div class="form-r">
+              <label>allowed refs</label>
+              <input
+                class="input mono"
+                placeholder="comma-separated globs, e.g. refs/heads/main (blank = any)"
+                value={allowedRefs()}
+                onInput={(e) => setAllowedRefs(e.currentTarget.value)}
+              />
+              <p class="fieldnote">
+                A ref must match these <b>and</b> the baseline's. Use full refs —{" "}
+                <span class="mono">refs/heads/main</span>, not <span class="mono">main</span>.
+              </p>
+            </div>
+            <div class="form-r">
+              <label>wait timer (s)</label>
+              <input
+                class="input mono"
+                type="number"
+                min="0"
+                value={waitTimer()}
+                onInput={(e) => setWaitTimer(e.currentTarget.value)}
+              />
+              <p class="fieldnote">Recorded, not yet enforced.</p>
+            </div>
             <label class="checkbox-inline">
               <input
                 type="checkbox"
                 checked={requireReason()}
                 onInput={(e) => setRequireReason(e.currentTarget.checked)}
               />
-              <span class="subtle">manual/api dispatches must supply a reason</span>
+              <span>manual and API dispatches must give a reason</span>
             </label>
-          </div>
+          </FormSection>
+        </div>
+        <div class="modal-foot">
           <Show when={problem() && picked()}>
             <p class="error">{problem()}</p>
           </Show>
@@ -972,7 +975,7 @@ function EnvDialog(props: {
           </div>
           <p class="subtle modal-note">
             An overlay can only make {props.repo}'s deploys stricter than the org baseline.
-            Requires the Administer capability on this repo (ADR-0071).
+            Requires the Administer capability on this repo.
           </p>
         </div>
       </div>

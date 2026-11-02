@@ -150,6 +150,17 @@ spec:
                   name: {{ .Values.secrets.oauthClientSecret.name | quote }}
                   key: {{ .Values.secrets.oauthClientSecret.key | quote }}
             {{- end }}
+            {{- range .Values.scarab.oauth.providers }}
+            # The same trap for each named login provider (ADR-0069): the
+            # shared ConfigMap's SCARAB_OAUTH_PROVIDERS names the env var its
+            # client secret is read from, and the config gate refuses the boot
+            # when that variable is unset. Wired as deployment.yaml wires it.
+            - name: {{ include "scarab.providerSecretEnv" .id }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .clientSecret.name | quote }}
+                  key: {{ default "client-secret" .clientSecret.key | quote }}
+            {{- end }}
             {{- if .Values.scarab.connections }}
             # The same trap, opposite fix. SCARAB_CONNECTIONS_FILE arrives via
             # the shared ConfigMap, and the config gate reads + credential-

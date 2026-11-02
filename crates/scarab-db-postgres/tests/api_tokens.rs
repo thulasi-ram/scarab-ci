@@ -23,6 +23,7 @@ fn token(id: &str, scope: Scope, created_at: i64) -> ApiToken {
         created_by: "alice".into(),
         created_at,
         last_used_at: None,
+        use_count: 0,
         revoked_at: None,
     }
 }
@@ -84,18 +85,36 @@ async fn api_token_lifecycle_put_lookup_list_touch_revoke() {
     assert_eq!(db.list("acme").await.unwrap().len(), 2);
 
     // `touch` is monotonic: a late-arriving earlier stamp cannot rewind it.
-    db.touch("t-org", 5_000).await.unwrap();
-    db.touch("t-org", 4_000).await.unwrap();
+    // Its calls still count: the late batch adds to the total.
+    db.touch("t-org", 5_000, 3).await.unwrap();
+    db.touch("t-org", 4_000, 2).await.unwrap();
+    let touched = db
+        .by_hash(&api_token_hash("scarab_pat_org"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(touched.last_used_at, Some(5_000));
+    assert_eq!(touched.use_count, 5);
+    // Touching an unknown id is a no-op, not an error.
+    db.touch("no-such-token", 5_000, 1).await.unwrap();
+
+    // By owner: every org, newest first; another owner's token is not there.
+    let theirs = ApiToken {
+        owner_subject: "bob".into(),
+        ..token("t-bob", Scope::Org("acme".into()), 4_000)
+    };
+    db.put(&theirs, &api_token_hash("scarab_pat_bob"))
+        .await
+        .unwrap();
     assert_eq!(
-        db.by_hash(&api_token_hash("scarab_pat_org"))
+        db.list_owned("alice")
             .await
             .unwrap()
-            .unwrap()
-            .last_used_at,
-        Some(5_000)
+            .iter()
+            .map(|t| t.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["t-other", "t-proj", "t-org"]
     );
-    // Touching an unknown id is a no-op, not an error.
-    db.touch("no-such-token", 5_000).await.unwrap();
 
     // Revocation: once, honestly. The second call reports false rather than
     // moving the stamp, so when the credential actually died is never rewritten.
@@ -112,7 +131,7 @@ async fn api_token_lifecycle_put_lookup_list_touch_revoke() {
 
     // A revoked token is still LISTED — the row is the audit trail, and a
     // listing that hid it would hide the fact that it ever existed.
-    assert_eq!(db.list("acme").await.unwrap().len(), 2);
+    assert_eq!(db.list("acme").await.unwrap().len(), 3);
 
     tdb.cleanup().await;
 }

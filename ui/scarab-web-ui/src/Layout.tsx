@@ -12,11 +12,12 @@ import { setPaletteOpen } from "./palette";
 import { me } from "./session";
 import { getOrgSecuritySummary } from "./api/client";
 import { bannerText } from "./security";
+import { orgHref } from "./settings-nav";
 import glyphInk from "./assets/brand/scarab-halftone-ink.svg";
 import glyphCream from "./assets/brand/scarab-halftone.svg";
 
 export default function Layout(props: ParentProps) {
-  // Step-up posture for callers who administer an Org (ADR-0073): a crown
+  // Step-up posture for callers who administer an Org: a crown
   // jewel is refused for every admin with no passkey, so say so app-wide
   // until it is fixed. Nobody else is asked for the summary at all.
   const [security] = createResource(() => me()?.admin_orgs[0], getOrgSecuritySummary);
@@ -62,13 +63,13 @@ export default function Layout(props: ParentProps) {
         <div class="sec-banner" role="status">
           <Icon icon="shield-check" size={13} />
           <span>{banner()}</span>
-          <A href="/settings" class="sec-banner-link">
+          <A href={orgHref(me()!.admin_orgs[0]!, "security")} class="sec-banner-link">
             review
           </A>
         </div>
       </Show>
       <CommandPalette />
-      {/* The one step-up dialog (ADR-0073): the API client opens it whenever
+      {/* The one step-up dialog: the API client opens it whenever
           a request is refused with `step_up_required`. */}
       <StepUpDialog />
       {props.children}

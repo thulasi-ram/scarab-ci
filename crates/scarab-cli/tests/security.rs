@@ -81,6 +81,9 @@ async fn serve_with(enforce: bool, extra: impl FnOnce(AppState) -> AppState) -> 
         kind: ForgeKind::GitHub,
         base_url: "https://api.github.com".into(),
         credential_ref: "gh-token".into(),
+        org: Some("acme".into()),
+        installation_id: None,
+        account_id: None,
     })
     .await
     .unwrap();
@@ -398,7 +401,7 @@ async fn setup_names_the_login_provider_when_there_is_no_default() {
         .trim()
         .to_string();
     assert!(url.contains("provider=okta"), "{url}");
-    assert!(url.contains("next=/account/security%3Fenroll%3D1"), "{url}");
+    assert!(url.contains("next=/settings/security%3Fenroll%3D1"), "{url}");
     // Following it reaches Okta, not a 400.
     let resp = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())

@@ -47,6 +47,9 @@ async fn forgejo_adapter_passes_the_port_contract() {
         kind: ForgeKind::Forgejo,
         base_url: base_url.clone(),
         credential_ref: "forgejo-local-token".into(),
+        org: None,
+        installation_id: None,
+        account_id: None,
     };
     let forge = ForgejoForge::new(&conn.base_url, &token);
 

@@ -9722,6 +9722,7 @@ mod tests {
             step_timeout_secs: 3600,
             project_run_cap: None,
             public_url: "http://localhost:8080".into(),
+            ui_url: "http://localhost:8080".into(),
             github_app_id: None,
             github_app_pem: None,
             github_app_pem_file: None,

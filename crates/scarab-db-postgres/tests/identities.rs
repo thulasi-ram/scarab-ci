@@ -207,6 +207,7 @@ async fn link_merges_a_claimed_single_identity_principal_with_its_tokens() {
             created_by: stray.clone(),
             created_at: 2,
             last_used_at: None,
+            use_count: 0,
             revoked_at: None,
         },
         "hash-1",

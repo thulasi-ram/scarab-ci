@@ -21,11 +21,19 @@ export default function DebugShell(props: {
   let ws: WebSocket | undefined;
 
   onMount(() => {
+    // xterm draws on a canvas, so it takes colours, not CSS variables: read
+    // the terminal tokens once, so the shell matches the palette in use.
+    const css = getComputedStyle(document.documentElement);
+    const token = (name: string, fallback: string) => css.getPropertyValue(name).trim() || fallback;
     const t = new Terminal({
       fontFamily: '"JetBrains Mono", ui-monospace, Menlo, monospace',
       fontSize: 12.5,
       cursorBlink: true,
-      theme: { background: "#0e1a14", foreground: "#cfe2d6", cursor: "#2ea77f" },
+      theme: {
+        background: token("--terminal", "#0e1a14"),
+        foreground: token("--terminal-ink", "#cfe2d6"),
+        cursor: token("--terminal-cursor", "#2ea77f"),
+      },
     });
     const fit = new FitAddon();
     t.loadAddon(fit);

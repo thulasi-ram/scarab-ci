@@ -53,6 +53,7 @@ export const EVENT_KINDS: readonly string[] = [
   "passkey.break_glass_reset",
   "passkey.clone_suspected",
   "guard.not_consulted",
+  "binding.operator_grant",
 ];
 
 const KIND_LABELS: Record<string, string> = {
@@ -70,6 +71,7 @@ const KIND_LABELS: Record<string, string> = {
   "passkey.break_glass_reset": "Passkeys reset (break-glass)",
   "passkey.clone_suspected": "Passkey clone suspected",
   "guard.not_consulted": "Guard not consulted",
+  "binding.operator_grant": "Role granted by an operator",
 };
 
 /** A kind in words; an unknown (newer) kind is shown verbatim. */
@@ -97,7 +99,7 @@ export function eventTone(kind: string): "danger" | "warn" | "ok" | "plain" {
 export function callerLabel(caller: string): string {
   if (caller === "session:cookie") return "browser";
   if (caller === "session:bearer") return "CLI session";
-  if (caller === "operator:break-glass") return "operator";
+  if (caller === "operator:break-glass" || caller === "operator:grant") return "operator";
   if (caller.startsWith("api_token:")) return `API token ${caller.slice("api_token:".length)}`;
   return caller;
 }
@@ -263,7 +265,7 @@ export function requestErrorLink(status: number, body: string): { text: string; 
   try {
     const j = JSON.parse(body) as { code?: unknown };
     if (j && j.code === "no_passkey") {
-      return { text: "Enroll a passkey first", href: "/account/security?enroll=1" };
+      return { text: "Enroll a passkey first", href: "/settings/security?enroll=1" };
     }
   } catch {
     /* not JSON */

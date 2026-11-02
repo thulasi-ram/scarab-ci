@@ -53,6 +53,14 @@ scarab:
   # carries (`{publicUrl}/runs/{id}`). Empty => the server default
   # (http://localhost:8080). Set this to your ingress / tunnel URL.
   publicUrl: ""
+  # The URL people open the web UI at, when it is not publicUrl: for example a
+  # staging install whose public hostname serves only /webhooks/ while people
+  # use http://localhost:8080 through a port-forward. The OAuth callback
+  # (`{uiUrl}/v1/auth/callback`, the URL to register with the login provider),
+  # the passkey origin and step-up confirmation links use it; webhooks and
+  # commit-status links stay on publicUrl. Empty => publicUrl. Browsers refuse
+  # passkeys on an IP address, so a local one is http://localhost:<port>.
+  uiUrl: ""
   # The first-party library release manifest (ADR-0076 §5), as JSON text.
   # Empty => the server reads `libs-manifest.json` from its own version's
   # GitHub release. Set it for an air-gapped install, or for a build whose
@@ -102,9 +110,14 @@ scarab:
   # declarative repo-onboarding path, and the only way Forgejo repos become
   # Projects without clicking through the UI.
   #
+  # A connection serves one org: `org:`, or the one owner of its `repos:`.
+  # Every repo must be owned by that org; a repo of another owner, repos of
+  # several owners without `org:`, or no repos and no `org:` fail the boot.
+  #
   # connections:
   #   - id: forgejo-main
   #     kind: forgejo                  # github | forgejo
+  #     org: acme
   #     base_url: https://git.example.com
   #     credential:
   #       env: FORGEJO_CI_TOKEN

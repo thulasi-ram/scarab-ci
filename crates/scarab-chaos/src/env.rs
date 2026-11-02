@@ -143,8 +143,13 @@ impl Api {
     /// `up.sh` mints a new Forgejo token on every run and revokes the old
     /// ones, so a connection an earlier session left holds a dead credential.
     /// Deletes every connection to `base_url` (unbinding its repos), then
-    /// creates one. Returns its id.
-    pub async fn recreate_forgejo_connection(&self, base_url: &str, token: &str) -> Result<String, String> {
+    /// creates one serving `org`. Returns its id.
+    pub async fn recreate_forgejo_connection(
+        &self,
+        org: &str,
+        base_url: &str,
+        token: &str,
+    ) -> Result<String, String> {
         let want = base_url.trim_end_matches('/');
         let list = self
             .json("GET /v1/connections", self.http.get(format!("{}/v1/connections", self.base)))
@@ -167,7 +172,7 @@ impl Api {
                 "POST /v1/connections",
                 self.http
                     .post(format!("{}/v1/connections", self.base))
-                    .json(&serde_json::json!({ "kind": "forgejo", "base_url": want, "credential": token })),
+                    .json(&serde_json::json!({ "org": org, "kind": "forgejo", "base_url": want, "credential": token })),
             )
             .await?;
         created["id"]

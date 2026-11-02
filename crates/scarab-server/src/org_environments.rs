@@ -326,6 +326,7 @@ pub(crate) async fn put_org_environment(
         updated_by: principal.subject,
     };
     environment.validate().map_err(org_environment_api_error)?;
+    crate::note_org(&st, &environment.org).await?;
     let stored = store
         .put_org_environment(&environment)
         .await

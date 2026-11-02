@@ -7,6 +7,7 @@ import {
   impactRunLabel,
   inputsChange,
   numberDiff,
+  releaseSources,
   reviewChecks,
   reviewHref,
   sideBySide,
@@ -117,13 +118,44 @@ describe("review checks", () => {
     expect(checks.map((c) => c.tone)).toEqual(["ok", "ok", "warn", "warn", "info"]);
     expect(checks[1]!.text).toBe("Invokes lib:acme/http-probe, installed here at 2c8f61d0a9e4");
     expect(checks[2]!.text).toBe("Not pinned by digest: busybox");
+    expect(checks.at(-1)!.text).toBe("The hash is not in a Scarab release manifest");
     const clean = reviewChecks(OLD, true, []);
     expect(clean.map((c) => c.tone)).toEqual(["ok", "ok", "info", "ok"]);
+    expect(clean.at(-1)!.text).toBe("The hash is in Scarab's release manifest");
   });
   it("links the review page with what is known", () => {
-    expect(reviewHref({})).toBe("/settings/libraries/review");
-    expect(reviewHref({ source: "s@c", publisher: "acme", name: "", connection: undefined })).toBe(
-      "/settings/libraries/review?source=s%40c&publisher=acme",
+    expect(reviewHref("acme", {})).toBe("/orgs/acme/settings/libraries/review");
+    expect(reviewHref("acme", { source: "s@c", publisher: "acme", name: "", connection: undefined })).toBe(
+      "/orgs/acme/settings/libraries/review?source=s%40c&publisher=acme",
     );
+  });
+});
+
+describe("release sources", () => {
+  const listed = (name: string, installed: boolean) => ({
+    publisher: "thulasi-ram",
+    name,
+    source: `github.com/thulasi-ram/scarab-ci//libs/${name}.yaml@${C}`,
+    release: "v0.4.1",
+    security_fix: false,
+    installed,
+  });
+
+  it("offers the manifest's libraries that are not installed, as plain sources", () => {
+    const out = releaseSources([listed("clone", true), listed("zeta", false), listed("build-image", false)]);
+    expect(out.map((r) => r.id)).toEqual(["lib:thulasi-ram/build-image", "lib:thulasi-ram/zeta"]);
+    expect(out[0]).toEqual({
+      id: "lib:thulasi-ram/build-image",
+      source: `github.com/thulasi-ram/scarab-ci//libs/build-image.yaml@${C}`,
+      publisher: "thulasi-ram",
+      name: "build-image",
+      release: "v0.4.1",
+      security_fix: false,
+    });
+  });
+
+  it("offers nothing when every listed library is installed", () => {
+    expect(releaseSources([listed("clone", true)])).toEqual([]);
+    expect(releaseSources([])).toEqual([]);
   });
 });

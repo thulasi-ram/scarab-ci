@@ -217,3 +217,104 @@ async fn a_fixed_token_neither_mints_a_write_token_nor_is_revoked() {
     forge.revoke_credential(&repo(), "ghp_pat").await.unwrap();
     assert!(stub.seen().is_empty(), "nothing reaches GitHub");
 }
+
+/// git-bug 19b0a45: a connection that knows its installation mints from it
+/// alone. The per-repo lookup (`GET /repos/{owner}/{name}/installation`),
+/// which answers with whichever installation covers the repo, is never made.
+#[tokio::test]
+async fn a_pinned_installation_mints_from_itself_without_a_lookup() {
+    let stub = Stub::start(vec![Reply::new(
+        StatusCode::CREATED,
+        r#"{"token": "ghs_pinned"}"#,
+    )])
+    .await;
+    let forge = stub.app_forge().with_installation(55);
+    let cred = forge.mint_checkout_credential(&repo(), true).await.unwrap();
+    assert_eq!(cred.token, "ghs_pinned");
+    let seen = stub.seen();
+    assert_eq!(
+        seen.len(),
+        1,
+        "no installation lookup: {:?}",
+        seen.iter().map(|s| &s.path).collect::<Vec<_>>()
+    );
+    assert_eq!(seen[0].path, "/app/installations/55/access_tokens");
+}
+
+/// git-bug 19b0a45: enumeration through a pinned installation lists that
+/// installation's repositories only; `/app/installations` (every account
+/// the App is on) is never walked.
+#[tokio::test]
+async fn a_pinned_installation_lists_only_its_own_repositories() {
+    let stub = Stub::start(vec![
+        Reply::new(StatusCode::CREATED, r#"{"token": "ghs_inst"}"#),
+        Reply::ok(r#"{"total_count": 1, "repositories": [{"full_name": "acme/web"}]}"#),
+    ])
+    .await;
+    let repos = stub
+        .app_forge()
+        .with_installation(55)
+        .list_accessible_repos()
+        .await
+        .unwrap();
+    assert_eq!(repos, vec![repo()]);
+    let paths: Vec<String> = stub.seen().into_iter().map(|s| s.path).collect();
+    assert_eq!(
+        paths,
+        vec![
+            "/app/installations/55/access_tokens".to_string(),
+            "/installation/repositories".to_string()
+        ]
+    );
+}
+
+/// git-bug 19b0a45: a pinned token request names the repository by name
+/// only (`repositories: ["x"]`), so an adapter serving `acme` must refuse
+/// `globex/x` itself, or installation 55 would mint for `acme/x`. Unpinned
+/// (a config-declared connection), the same owner check stands in front of
+/// the per-repo installation lookup.
+#[tokio::test]
+async fn an_adapter_serving_an_owner_mints_nothing_for_another_owners_repo() {
+    let other = RepoRef {
+        owner: "globex".into(),
+        name: "web".into(),
+    };
+    let stub = Stub::start(vec![]).await;
+    let pinned = stub.app_forge().with_installation(55).with_owner("acme");
+    assert!(pinned.mint_checkout_credential(&other, true).await.is_err());
+    assert!(pinned.mint_write_credential(&other).await.is_err());
+    let unpinned = stub.app_forge().with_owner("acme");
+    assert!(unpinned
+        .read_file_at_ref(&other, "main", "README.md")
+        .await
+        .is_err());
+    assert!(
+        stub.seen().is_empty(),
+        "GitHub was asked: {:?}",
+        stub.seen().iter().map(|s| &s.path).collect::<Vec<_>>()
+    );
+}
+
+/// git-bug 19b0a45: an unpinned App adapter (a config-declared connection
+/// without an installation id) walks every installation of the App. When it
+/// serves an owner it lists that owner's repositories only: the names of
+/// another account's private repositories are not the owner's to see.
+#[tokio::test]
+async fn an_unpinned_adapter_serving_an_owner_lists_only_that_owners_repositories() {
+    let stub = Stub::start(vec![
+        Reply::ok(r#"[{"id": 1}, {"id": 2}]"#),
+        Reply::new(StatusCode::CREATED, r#"{"token": "ghs_one"}"#),
+        Reply::ok(r#"{"total_count": 1, "repositories": [{"full_name": "acme/web"}]}"#),
+        Reply::new(StatusCode::CREATED, r#"{"token": "ghs_two"}"#),
+        Reply::ok(r#"{"total_count": 1, "repositories": [{"full_name": "globex/secret"}]}"#),
+    ])
+    .await;
+    let repos = stub
+        .app_forge()
+        .with_owner("acme")
+        .list_accessible_repos()
+        .await
+        .unwrap();
+    assert_eq!(repos, vec![repo()]);
+    assert_eq!(stub.seen()[0].path, "/app/installations", "the walk ran");
+}

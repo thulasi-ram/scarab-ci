@@ -8,8 +8,10 @@
 // Neutral identity so nothing real leaks into screenshots: org=acme,
 // author=a.kim, approver=j.lee; the `scarab` repo is kept (its build log
 // references the crates), the rest are generic. Add `?theme=dark` (or `light`)
-// to the URL to pin the theme (used for deterministic capture); otherwise the
-// normal stored/toggle theme applies.
+// to the URL to pin the theme, and `?palette=mono` (or `emerald`) to pin the
+// palette (used for deterministic capture); otherwise the stored choices apply.
+// `?admin_orgs=acme,globex` makes the caller an admin of those orgs instead of
+// acme alone (the settings org switch).
 
 // Type-only imports — erased at compile time, so the install-before-App-loads
 // ordering in index.tsx is unaffected. The fixtures typecheck against the
@@ -48,12 +50,16 @@ const GATES_RUN_ID = "0190f8a2000071fb8c00d3e9107a1616";
 
 // ── /v1/me ────────────────────────────────────────────────────────────────
 // An Owner of the one implicit org (ADR-0060), so the Settings gear renders.
+// The Owner role is global, so Avery is a global admin: Settings shows Connect
+// a forge and the unassigned connection below (git-bug 19b0a45).
 const me = {
   subject: "a.kim",
   display_name: "Avery Kim",
   roles: ["Owner"],
   can_administer: true,
+  global_admin: true,
   admin_orgs: ["acme"],
+  token_mint_orgs: ["acme"],
   // Signed in two ways (ADR-0069): the legacy GitHub provider and Okta.
   identities: [
     { provider: "default", handle: "a-kim" },
@@ -784,8 +790,7 @@ const argocdManifest: PluginCatalogEntryDto["manifest"] = {
 const pluginCatalog: PluginCatalogEntryDto[] = [
   {
     plugin: "argocd",
-    description:
-      "Reads Argo CD Application state through its connection (first-party).",
+    description: "Reads Argo CD Application state through its connection.",
     image_repository: ARGOCD_REPO,
     manifest: argocdManifest,
     first_party: true,
@@ -867,15 +872,18 @@ const pluginConnections: Record<string, PluginConnectionDto[]> = {
     }),
   ],
 };
-const secretNames = { names: ["GHCR_TOKEN", "DATABASE_URL", "SLACK_WEBHOOK_URL"] };
+const secretNames = { names: ["DATABASE_URL", "SENTRY_DSN"] };
 // Org scope (no `repo=`) holds the org-wide base of the inheritance chain — the
 // Settings page's Org Secrets section (ADR-0060).
 const orgSecretNames = { names: ["GHCR_TOKEN", "SENTRY_DSN"] };
 
 // One healthy GitHub connection covering the acme repos (ADR-0060 part C).
-const connections = [
+// Each connection serves one org (git-bug 19b0a45); `org: null` is unassigned
+// and listed to global admins only.
+const connections: components["schemas"]["ConnectionDto"][] = [
   {
     id: "gh-acme",
+    org: "acme",
     kind: "github",
     base_url: "https://api.github.com",
     web_url: "https://github.com",
@@ -896,6 +904,7 @@ const connections = [
   // parts C/D), so the repo add/remove + webhook affordances render.
   {
     id: "forgejo-7f3a91c2",
+    org: "acme",
     kind: "forgejo",
     base_url: "https://git.acme.dev",
     web_url: "https://git.acme.dev",
@@ -906,6 +915,22 @@ const connections = [
     supports_resync: true,
     // Forgejo tokens are not introspectable, so the preflight line is not
     // offered for them at all (the endpoint would only answer "unknown").
+    supports_preflight: false,
+    managed_by_config: false,
+  },
+  // An installation whose account could not be told apart from a same-named
+  // org on another forge, so it serves no org yet.
+  {
+    id: "github-install-90211",
+    org: null,
+    kind: "github",
+    base_url: "https://api.github.com",
+    web_url: "https://github.com",
+    credential_ref: "github-app",
+    credential_present: true,
+    last_delivery_at: null,
+    projects: [],
+    supports_resync: true,
     supports_preflight: false,
     managed_by_config: false,
   },
@@ -931,15 +956,20 @@ const connectionPreflight = {
 };
 
 // What the Forgejo credential reaches — the bind pick-list (ADR-0060 slice 5).
+// The token also reaches a repo of another account, which the Add repository
+// dialog does not offer (the server would refuse to bind it).
 const availableRepos = [
   { owner: "acme", name: "infra", bound: true },
   { owner: "acme", name: "terraform-modules", bound: false },
   { owner: "acme", name: "runbooks", bound: false },
+  { owner: "globex", name: "shared-ci", bound: false },
 ];
 // The coverage matrix is now the repo/environment secret EDITOR (ADR-0060), so
 // the fixture carries the repo-default column ("") and inheritance origins:
-// GHCR_TOKEN comes from the org, DATABASE_URL is a repo default overridden in
-// both environments, SLACK_WEBHOOK_URL is production-only with qa silenced.
+// GHCR_TOKEN comes from the org, SENTRY_DSN is a repo key that overrides the
+// org's, DATABASE_URL is a repo default overridden in both environments,
+// SLACK_WEBHOOK_URL is production-only with qa silenced. The repo Secrets list
+// shows GHCR_TOKEN and SLACK_WEBHOOK_URL greyed out beside the repo's own keys.
 // Its environment columns are the org Environments the project may deploy
 // into (ADR-0071) — production and qa, as `projectEnvironments` lists them.
 const secretMatrix = {
@@ -950,28 +980,39 @@ const secretMatrix = {
       key: "GHCR_TOKEN",
       status: { "": "inherited", qa: "inherited", production: "inherited" },
       inherited_from: { "": "org", qa: "org", production: "org" },
+      overrides: {},
+    },
+    {
+      key: "SENTRY_DSN",
+      status: { "": "set", qa: "inherited", production: "inherited" },
+      inherited_from: { qa: "repo", production: "repo" },
+      overrides: { "": "org" },
     },
     {
       key: "DATABASE_URL",
       status: { "": "set", qa: "set", production: "set" },
       inherited_from: {},
+      overrides: { qa: "repo", production: "repo" },
     },
     {
       key: "SLACK_WEBHOOK_URL",
       status: { "": "unset", qa: "silenced", production: "set" },
       inherited_from: {},
+      overrides: {},
     },
   ],
 };
 
-// ── /v1/orgs/{org}/tokens (ADR-0049) ──────────────────────────────────────
-// Four records covering every state the panel renders differently: a live token
-// in daily use, one narrowed to a single project, one inside the two-week
-// expiry warning, and a revoked one (the graveyard row that proves a killed
-// credential stays visible). No plaintext anywhere — the mint 201 below is the
-// only place one exists, and it is obviously fake.
+// ── API tokens (ADR-0049, git-bug a4cb94f) ────────────────────────────────
+// Four records covering every state the panels render differently: a live token
+// in daily use, one narrowed to a single project and held by someone else, one
+// inside the two-week expiry warning, and a revoked one (a killed credential
+// stays visible). Last use and calls order the live ones differently (the
+// project token is second by last use, the status poller second by calls), so
+// the org list's sort can be seen to work. No plaintext anywhere: the mint 201 below is the only place
+// one exists, and it is obviously fake.
 const day = 86_400_000;
-const apiTokens = [
+const apiTokens: components["schemas"]["ApiTokenDto"][] = [
   {
     id: "9f2c1d84-0f2b-4f3a-9a11-2b7c5d0e4a10",
     name: "release-bot",
@@ -983,6 +1024,7 @@ const apiTokens = [
     created_at: ago(40 * day),
     expires_at: now + 50 * day,
     last_used_at: ago(4 * min),
+    use_count: 18_412,
     revoked_at: null,
   },
   {
@@ -995,7 +1037,8 @@ const apiTokens = [
     created_by: "a.kim",
     created_at: ago(9 * day),
     expires_at: now + 81 * day,
-    last_used_at: ago(3 * 60 * min),
+    last_used_at: ago(20 * min),
+    use_count: 1_203,
     revoked_at: null,
   },
   {
@@ -1009,6 +1052,7 @@ const apiTokens = [
     created_at: ago(84 * day),
     expires_at: now + 6 * day,
     last_used_at: ago(52 * min),
+    use_count: 9_870,
     revoked_at: null,
   },
   {
@@ -1022,9 +1066,51 @@ const apiTokens = [
     created_at: ago(120 * day),
     expires_at: now + 20 * day,
     last_used_at: ago(30 * day),
+    use_count: 312,
     revoked_at: ago(11 * day),
   },
 ];
+
+type MockToken = components["schemas"]["ApiTokenDto"];
+let mintedTokens = 0;
+
+/** A mint by a.kim: the record joins `apiTokens`, the plaintext is fake. */
+function mintMockToken(body: string, pathOrg?: string): Response {
+  const req = JSON.parse(body || "{}") as {
+    org?: string;
+    name?: string;
+    project?: string;
+    role?: string;
+    expires_in_days?: number;
+  };
+  mintedTokens += 1;
+  const record: MockToken = {
+    id: `0000ffff-0000-4fff-8fff-${String(mintedTokens).padStart(12, "0")}`,
+    name: req.name ?? "new token",
+    owner_subject: me.subject,
+    org: pathOrg ?? req.org ?? "acme",
+    project: req.project ?? null,
+    role: req.role ?? "viewer",
+    created_by: me.subject,
+    created_at: Date.now(),
+    expires_at: Date.now() + (req.expires_in_days ?? 90) * day,
+    last_used_at: null,
+    use_count: 0,
+    revoked_at: null,
+  };
+  apiTokens.unshift(record);
+  return json(
+    { token: "scarab_pat_EXAMPLE0NOTAREALTOKEN0000000000000000000000", record },
+    { status: 201 },
+  );
+}
+
+/** The server's org-list order: descending by `sort`, then newest first. */
+function sortMockTokens(tokens: MockToken[], sort: string): MockToken[] {
+  const key = (t: MockToken): number =>
+    sort === "use_count" ? t.use_count : sort === "created" ? 0 : (t.last_used_at ?? -1);
+  return [...tokens].sort((a, b) => key(b) - key(a) || b.created_at - a.created_at);
+}
 
 // ── step-up (ADR-0073) ────────────────────────────────────────────────────
 // Enforced, one admin (j.lee) without a passkey so the banner and the Settings
@@ -1072,6 +1158,70 @@ const securityEvents: SecurityEventDto[] = [
   }),
   secEvent(7, "passkey.enrolled", 3 * 24 * 60, { org: null, passkey_id: "pk-2" }),
 ];
+// Older Org events, so Settings → Event log has more than one page (50 a
+// page) to step through. Not in `securityEvents`: the Account → Security
+// list and the recent refusals stay as they were.
+const OLDER_KINDS = ["op.authorised", "op.completed", "step_up.confirmed", "step_up.refused"];
+const OLDER_ACTORS = ["a.kim", "j.lee", "r.patel"];
+const OLDER_TARGETS = [
+  "acme/orders-api/production/DB_PASSWORD",
+  "acme/edge-gateway/staging/TLS_KEY",
+  `run ${RICH_RUN_ID}/deploy`,
+  "acme",
+];
+const olderOrgEvents: SecurityEventDto[] = Array.from({ length: 64 }, (_, i) => {
+  const kind = OLDER_KINDS[i % OLDER_KINDS.length]!;
+  return secEvent(6 - i, kind, 4 * 24 * 60 + i * 90, {
+    id: `ev-old-${i}`,
+    subject: OLDER_ACTORS[i % OLDER_ACTORS.length]!,
+    op: kind === "step_up.confirmed" ? null : "secret.put",
+    target: OLDER_TARGETS[i % OLDER_TARGETS.length]!,
+  });
+});
+const orgEventLog = [...securityEvents, ...olderOrgEvents];
+
+/** The Org event log as the server serves it: newest first by `seq`,
+ * filtered, one page, with an opaque cursor (`seq:<n>`, base64url). */
+function orgEventsPage(search: string) {
+  const q = new URLSearchParams(search);
+  const kinds = q.get("kind")?.split(",").filter(Boolean) ?? [];
+  const actor = q.get("actor")?.trim() || "";
+  const target = q.get("target")?.trim().toLowerCase() || "";
+  const from = q.get("from") ? Number(q.get("from")) : undefined;
+  const to = q.get("to") ? Number(q.get("to")) : undefined;
+  const cursor = q.get("cursor");
+  let before: number | undefined;
+  if (cursor) {
+    let text = "";
+    try {
+      text = atob(cursor.replace(/-/g, "+").replace(/_/g, "/"));
+    } catch {
+      /* not base64 */
+    }
+    const m = /^seq:(-?\d+)$/.exec(text);
+    if (!m) return json("`cursor` is not one this server issued", { status: 400 });
+    before = Number(m[1]);
+  }
+  const limit = Math.min(Math.max(Number(q.get("limit") ?? 50) || 50, 1), 200);
+  const rows = orgEventLog
+    .filter((e) => !kinds.length || kinds.includes(e.kind))
+    .filter((e) => !actor || e.subject === actor)
+    .filter((e) => !target || (!!e.org && (e.target ?? "").toLowerCase().includes(target)))
+    .filter((e) => from === undefined || e.at >= from)
+    .filter((e) => to === undefined || e.at < to)
+    .filter((e) => before === undefined || e.seq < before)
+    .sort((a, b) => b.seq - a.seq);
+  const events = rows.slice(0, limit);
+  const more = rows.length > limit;
+  const last = events[events.length - 1];
+  const next = more && last ? last.seq : null;
+  return json({
+    events,
+    next_before: next,
+    next_cursor: next === null ? null : btoa(`seq:${next}`).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""),
+  });
+}
+
 const meSecurity: components["schemas"]["MeSecurityResponse"] = {
   subject: "a.kim",
   step_up: "enforce",
@@ -1146,7 +1296,7 @@ function json(body: unknown, init?: ResponseInit) {
 // `method` matters where one path serves several verbs — minting a token POSTs
 // to the path the list GETs; an org Environment is GET/PUT/DELETE on one path —
 // so it is threaded through rather than having a route guess from the body.
-function route(pathname: string, search: string, method: string): Response | null {
+function route(pathname: string, search: string, method: string, body = ""): Response | null {
   const p = pathname;
   if (p === "/v1/me") return json(me);
   const lib = libraryRoute(p, method, json);
@@ -1156,10 +1306,7 @@ function route(pathname: string, search: string, method: string): Response | nul
     return json({ events: securityEvents.filter((e) => e.subject === "a.kim") });
   }
   if (/^\/v1\/orgs\/[^/]+\/security\/summary$/.test(p)) return json(orgSecuritySummary);
-  if (/^\/v1\/orgs\/[^/]+\/security\/events$/.test(p)) {
-    const kinds = new URLSearchParams(search).get("kind")?.split(",").filter(Boolean) ?? [];
-    return json({ events: securityEvents.filter((e) => !kinds.length || kinds.includes(e.kind)) });
-  }
+  if (/^\/v1\/orgs\/[^/]+\/security\/events$/.test(p)) return orgEventsPage(search);
   if (p === "/v1/step-up/requests/req-demo-1") return json(stepUpRequest);
   // Removing a passkey is always-ask: answer with the refusal so the step-up
   // dialog can be eyeballed (Cancel returns the 403 to the page).
@@ -1184,7 +1331,7 @@ function route(pathname: string, search: string, method: string): Response | nul
   // Linking: no provider to bounce through, so "authorize" straight back to
   // the Account page with the outcome a real callback would carry.
   if (p === "/v1/me/identities/link") {
-    return json({ authorize_url: "/account?identity_linked=forgejo" });
+    return json({ authorize_url: "/settings/profile?identity_linked=forgejo" });
   }
   if (/^\/v1\/me\/identities\/[^/]+$/.test(p)) return new Response(null, { status: 204 });
   if (/^\/v1\/orgs\/[^/]+\/bindings$/.test(p)) {
@@ -1251,29 +1398,33 @@ function route(pathname: string, search: string, method: string): Response | nul
   // /v1/repos/{org}/{repo}/refs  (ref picker — not on the shot screens)
   if (/^\/v1\/repos\/[^/]+\/[^/]+\/refs$/.test(p)) return json({ refs: [] });
 
-  // /v1/orgs/{org}/tokens — list, and a mint that returns an obviously-fake
-  // plaintext so the one-time reveal can be exercised (and screenshotted)
-  // without a server. Nothing is persisted: the list is the fixture above.
-  if (/^\/v1\/orgs\/[^/]+\/tokens$/.test(p)) {
-    if (method === "POST") {
-      return json(
-        {
-          token: "scarab_pat_EXAMPLE0NOTAREALTOKEN0000000000000000000000",
-          record: {
-            ...apiTokens[0],
-            id: "0000ffff-0000-4fff-8fff-000000000000",
-            name: "new token",
-            created_at: now,
-            expires_at: now + 90 * day,
-            last_used_at: null,
-          },
-        },
-        { status: 201 },
-      );
-    }
-    return json(apiTokens);
+  // API tokens (git-bug a4cb94f): your own under /v1/me/tokens, every token in
+  // the org under /v1/orgs/{org}/tokens. A mint returns an obviously-fake
+  // plaintext so the one-time reveal can be exercised (and screenshotted), and
+  // joins the list for the rest of the page's life, so a token minted under
+  // Your account shows in the org's list.
+  if (p === "/v1/me/tokens") {
+    if (method === "POST") return mintMockToken(body);
+    return json(apiTokens.filter((t) => t.owner_subject === me.subject));
   }
-  if (/^\/v1\/orgs\/[^/]+\/tokens\/[^/]+$/.test(p)) return json({}, { status: 204 });
+  if ((m = p.match(/^\/v1\/orgs\/([^/]+)\/tokens$/))) {
+    const org = decodeURIComponent(m[1]!);
+    if (method === "POST") return mintMockToken(body, org);
+    const sort = new URLSearchParams(search).get("sort") ?? "last_used";
+    return json(sortMockTokens(apiTokens.filter((t) => t.org === org), sort));
+  }
+  // Revoke answers 404, as the server does, for an id that is not a live token
+  // of yours (personal route) or of the org (org route).
+  if (method === "DELETE" && (m = p.match(/^\/v1\/(?:me|orgs\/([^/]+))\/tokens\/([^/]+)$/))) {
+    const org = m[1] === undefined ? null : decodeURIComponent(m[1]);
+    const id = decodeURIComponent(m[2]!);
+    const t = apiTokens.find(
+      (x) => x.id === id && (org === null ? x.owner_subject === me.subject : x.org === org),
+    );
+    if (!t || t.revoked_at != null) return new Response("not found", { status: 404 });
+    t.revoked_at = Date.now();
+    return new Response(null, { status: 204 });
+  }
 
   // Org-level Environments (ADR-0071): list, one, and echoing writes.
   if (/^\/v1\/orgs\/[^/]+\/environments$/.test(p)) return json(orgEnvironments);
@@ -1403,7 +1554,49 @@ function route(pathname: string, search: string, method: string): Response | nul
     }
     return json(found);
   }
-  if (p === "/v1/connections") return json(connections);
+  if (p === "/v1/connections") {
+    if (method === "POST") {
+      // The new connection serves the org named in the body; a new org's
+      // first connection makes the caller (a global admin) its admin, as
+      // `/v1/me` reports on the next ask.
+      const req = JSON.parse(body || "{}") as { org?: string; base_url?: string };
+      const org = req.org ?? "acme";
+      const id = "forgejo-5be0d4a1";
+      connections.push({
+        id,
+        org,
+        kind: "forgejo",
+        base_url: req.base_url ?? "https://git.example.dev",
+        web_url: req.base_url ?? "https://git.example.dev",
+        credential_ref: `${id}-credential`,
+        credential_present: true,
+        last_delivery_at: null,
+        projects: [],
+        supports_resync: true,
+        supports_preflight: false,
+        managed_by_config: false,
+      });
+      if (!me.admin_orgs.includes(org)) me.admin_orgs = [...me.admin_orgs, org].sort();
+      if (!me.token_mint_orgs.includes(org)) me.token_mint_orgs = [...me.token_mint_orgs, org].sort();
+      return json({ id, credential_ref: `${id}-credential` }, { status: 201 });
+    }
+    // `?org=` lists one org's connections; without it, every org plus the
+    // unassigned ones (the fixture caller is a global admin).
+    const org = new URLSearchParams(search).get("org");
+    return json(org ? connections.filter((c) => c.org === org) : connections);
+  }
+  if (method === "PUT" && (m = p.match(/^\/v1\/connections\/([^/]+)\/org$/))) {
+    const org = (JSON.parse(body || "{}") as { org?: string }).org ?? "";
+    const found = connections.find((c) => c.id === m![1]);
+    if (!found) return new Response("not found", { status: 404 });
+    found.org = org;
+    if (!me.admin_orgs.includes(org)) me.admin_orgs = [...me.admin_orgs, org].sort();
+    if (!me.token_mint_orgs.includes(org)) me.token_mint_orgs = [...me.token_mint_orgs, org].sort();
+    return json({ id: found.id, org });
+  }
+  if (method === "POST" && /^\/v1\/connections\/[^/]+\/resync$/.test(p)) {
+    return json({ bound: [], confirmed: 3, skipped: ["globex/shared-ci"] });
+  }
   if (/^\/v1\/connections\/[^/]+\/available-repos$/.test(p)) return json(availableRepos);
   if (/^\/v1\/connections\/[^/]+\/preflight$/.test(p)) return json(connectionPreflight);
   // Secret names are scope-addressed: no `repo=` is the org scope (ADR-0060).
@@ -1485,6 +1678,22 @@ function urlOf(input: RequestInfo | URL): string {
   return (input as Request).url;
 }
 
+/** The request body as text: from `init.body` when it is a string, else from
+ * the built `Request` openapi-fetch passes (a clone, so a real fetch can still
+ * send it). Empty when `read` is false or there is none. */
+async function bodyOf(input: RequestInfo | URL, init: RequestInit | undefined, read: boolean): Promise<string> {
+  if (!read) return "";
+  if (typeof init?.body === "string") return init.body;
+  if (typeof input !== "string" && !(input instanceof URL)) {
+    try {
+      return await (input as Request).clone().text();
+    } catch {
+      return "";
+    }
+  }
+  return "";
+}
+
 /** The verb, from wherever the caller put it: `openapi-fetch` passes a built
  * `Request`, hand-rolled calls pass `init.method`, a bare URL means GET. */
 function methodOf(input: RequestInfo | URL, init?: RequestInit): string {
@@ -1507,6 +1716,20 @@ export function installMock() {
     }
     document.documentElement.setAttribute("data-theme", pinned);
   }
+  // The same for the palette: `?palette=mono|emerald`.
+  const pinnedPalette = new URLSearchParams(window.location.search).get("palette");
+  if (pinnedPalette === "mono" || pinnedPalette === "emerald") {
+    try {
+      localStorage.setItem("scarab-palette", pinnedPalette);
+    } catch {
+      /* ignore */
+    }
+    document.documentElement.setAttribute("data-palette", pinnedPalette);
+  }
+
+  // Which orgs the caller administers: `?admin_orgs=acme,globex`.
+  const adminOrgs = new URLSearchParams(window.location.search).get("admin_orgs");
+  if (adminOrgs) me.admin_orgs = adminOrgs.split(",").filter(Boolean);
 
   const realFetch = window.fetch.bind(window);
   window.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
@@ -1519,9 +1742,14 @@ export function installMock() {
     } catch {
       /* fall through to real fetch */
     }
-    const res = pathname ? route(pathname, search, methodOf(input, init)) : null;
-    if (res) return Promise.resolve(res);
-    return realFetch(input as RequestInfo, init);
+    if (!pathname) return realFetch(input as RequestInfo, init);
+    const method = methodOf(input, init);
+    // A body is read only for the writes the fixture records.
+    const reads = method === "POST" || method === "PUT";
+    return bodyOf(input, init, reads).then((body) => {
+      const res = route(pathname, search, method, body);
+      return res ?? realFetch(input as RequestInfo, init);
+    });
   }) as typeof window.fetch;
 
   // EventSource — step/service log streams. Replays fixture lines then idles.

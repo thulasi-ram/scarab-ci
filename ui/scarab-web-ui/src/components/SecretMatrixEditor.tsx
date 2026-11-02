@@ -231,7 +231,7 @@ function CellEditor(props: {
           <div class="form-r">
             <label>value</label>
             <input
-              class="input"
+              class="input mono"
               type="password"
               placeholder="value (write-only)"
               value={value()}
@@ -241,20 +241,8 @@ function CellEditor(props: {
           <Show when={error()}>
             <p class="error">{error()}</p>
           </Show>
-          <div class="modal-actions">
-            <button class="btn btn-primary" disabled={busy() || !value()} onClick={save}>
-              <Icon icon="key-round" size={14} />{" "}
-              {busy() ? "Saving…" : props.status === "set" ? "Replace" : "Set here"}
-            </button>
-            <Show when={props.status === "set"}>
-              <button class="btn btn-danger btn-sm" disabled={busy()} onClick={clear}>
-                Clear here
-              </button>
-            </Show>
-            <button class="btn btn-ghost" onClick={props.onClose}>Cancel</button>
-          </div>
           <Show when={props.status !== "set" && props.status !== "inherited"}>
-            <label class="secret-overwrite">
+            <label class="checkbox-inline secret-overwrite">
               <input
                 type="checkbox"
                 checked={props.status === "silenced"}
@@ -267,6 +255,20 @@ function CellEditor(props: {
               </span>
             </label>
           </Show>
+        </div>
+        <div class="modal-foot">
+          <div class="modal-actions">
+            <button class="btn btn-primary" disabled={busy() || !value()} onClick={save}>
+              <Icon icon="key-round" size={14} />{" "}
+              {busy() ? "Saving…" : props.status === "set" ? "Replace" : "Set here"}
+            </button>
+            <Show when={props.status === "set"}>
+              <button class="btn btn-danger" disabled={busy()} onClick={clear}>
+                Clear here
+              </button>
+            </Show>
+            <button class="btn btn-ghost" onClick={props.onClose}>Cancel</button>
+          </div>
           <p class="subtle modal-note">
             <small>
               Encrypted at rest, never displayed. Clearing here falls back to {fallback()}.

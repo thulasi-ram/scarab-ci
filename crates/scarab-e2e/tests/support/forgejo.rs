@@ -148,7 +148,7 @@ pub async fn connect_and_bind(
     reclaim_connections_for(http, base, forgejo).await;
     let created = json_ok(
         http.post(format!("{base}/v1/connections"))
-            .json(&serde_json::json!({ "kind": "forgejo", "base_url": forgejo, "credential": token }))
+            .json(&serde_json::json!({ "org": owner, "kind": "forgejo", "base_url": forgejo, "credential": token }))
             .send()
             .await
             .expect("POST /v1/connections"),

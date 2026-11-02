@@ -105,6 +105,9 @@ fn harness_with(forge_url: Option<&str>) -> Harness {
             kind: ForgeKind::GitHub,
             base_url: "https://api.github.com".into(),
             credential_ref: "github-app".into(),
+            org: Some("acme".into()),
+            installation_id: None,
+            account_id: None,
         })
         .await
         .unwrap();

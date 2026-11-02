@@ -203,21 +203,24 @@ export async function logout(): Promise<void> {
 export type ApiToken = components["schemas"]["ApiTokenDto"];
 /** The mint response: the plaintext, once, plus the record it just created. */
 export type MintedToken = components["schemas"]["MintedTokenDto"];
-/** The mint body — name, ceiling role and lifetime are all required. */
-export type MintTokenRequest = components["schemas"]["MintTokenRequest"];
+/** The personal mint body: the org, a name, a ceiling role and a lifetime are
+ * all required; the project is optional. */
+export type MintOwnTokenRequest = components["schemas"]["MintOwnTokenRequest"];
+/** How the org's list is ordered: by last use (the default), calls, or creation. */
+export type TokenSort = components["schemas"]["TokenSort"];
 
 /**
- * The tokens issued in an org (`GET /v1/orgs/{org}/tokens`), org- and
- * project-scoped alike.
+ * Every token issued in an org (`GET /v1/orgs/{org}/tokens`), whoever holds
+ * it, ordered by the server.
  *
  * Returns `null` when the deployment has no token store — every token endpoint
  * answers 404 before it authorizes anything, so that is "this server cannot
  * issue tokens", not "you have none" and not a failure. The caller renders the
  * difference; collapsing the three would tell an admin their tokens vanished.
  */
-export async function listApiTokens(org: string): Promise<ApiToken[] | null> {
+export async function listApiTokens(org: string, sort?: TokenSort): Promise<ApiToken[] | null> {
   const { data, error, response } = await api.GET("/v1/orgs/{org}/tokens", {
-    params: { path: { org } },
+    params: { path: { org }, query: sort ? { sort } : {} },
   });
   if (response.status === 404) return null;
   if (error || !data) {
@@ -227,29 +230,47 @@ export async function listApiTokens(org: string): Promise<ApiToken[] | null> {
 }
 
 /**
- * Mint a token (`POST /v1/orgs/{org}/tokens`). The 201 body carries the
+ * The caller's own tokens, in every org (`GET /v1/me/tokens`). `null` when the
+ * deployment has no token store, as for {@link listApiTokens}.
+ */
+export async function listMyApiTokens(): Promise<ApiToken[] | null> {
+  const { data, error, response } = await api.GET("/v1/me/tokens");
+  if (response.status === 404) return null;
+  if (error || !data) {
+    throw new Error(errorText(error) || "failed to load your API tokens");
+  }
+  return data;
+}
+
+/**
+ * Mint a token for yourself (`POST /v1/me/tokens`). The 201 body carries the
  * plaintext — the only time it exists outside the caller's hands.
  *
  * The 400s are worth surfacing verbatim rather than flattening to "invalid":
  * the server explains *which* ceiling was exceeded and what the minter actually
  * holds, which is the whole answer to "why can I not mint this".
  */
-export async function mintApiToken(
-  org: string,
-  body: MintTokenRequest,
-): Promise<MintedToken> {
-  const { data, error, response } = await api.POST("/v1/orgs/{org}/tokens", {
-    params: { path: { org } },
-    body,
-  });
+export async function mintMyApiToken(body: MintOwnTokenRequest): Promise<MintedToken> {
+  const { data, error, response } = await api.POST("/v1/me/tokens", { body });
   if (error || !data) {
     throw new Error(errorText(error) || `could not mint the token (${response.status})`);
   }
   return data;
 }
 
+/** Revoke one of your own tokens (`DELETE /v1/me/tokens/{id}`). */
+export async function revokeMyApiToken(id: string): Promise<void> {
+  const { error, response } = await api.DELETE("/v1/me/tokens/{id}", {
+    params: { path: { id } },
+  });
+  if (error) {
+    throw new Error(errorText(error) || `could not revoke the token (${response.status})`);
+  }
+}
+
 /**
- * Revoke a token (`DELETE /v1/orgs/{org}/tokens/{id}`) — permanent, and
+ * Revoke any token issued in an org, as its admin
+ * (`DELETE /v1/orgs/{org}/tokens/{id}`) — permanent, and
  * effective on the very next request that presents it. `id` is the record's id,
  * never the credential.
  */
@@ -602,6 +623,23 @@ export async function listOrgEnvironments(org: string): Promise<OrgEnvironment[]
   if (response.status === 403) throw new OrgEnvironmentsForbiddenError(org);
   if (error || !data) {
     throw new Error(errorText(error) || "failed to load the org's environments");
+  }
+  return data;
+}
+
+/**
+ * One Environment (`GET /v1/orgs/{org}/environments/{env}`). `null` when the
+ * org has no Environment of that name, or the server has no org-Environment
+ * store (both are a 404).
+ */
+export async function getOrgEnvironment(org: string, env: string): Promise<OrgEnvironment | null> {
+  const { data, error, response } = await api.GET("/v1/orgs/{org}/environments/{env}", {
+    params: { path: { org, env } },
+  });
+  if (response.status === 404) return null;
+  if (response.status === 403) throw new OrgEnvironmentsForbiddenError(org);
+  if (error || !data) {
+    throw new Error(errorText(error) || `failed to load ${env} (${response.status})`);
   }
   return data;
 }
@@ -1502,9 +1540,16 @@ export type Connection = components["schemas"]["ConnectionDto"];
 export type ResyncResult = components["schemas"]["ResyncResultDto"];
 export type CreatedConnection = components["schemas"]["CreatedConnectionDto"];
 
-/** The registered forge connections with their bound Projects and health. */
-export async function listConnections(): Promise<Connection[]> {
-  const { data, error } = await api.GET("/v1/connections");
+/**
+ * The forge connections the caller may administer, with their bound Projects
+ * and health. With `org`, only the connections serving that org; without it,
+ * every org the caller administers, plus the unassigned ones (`org` null) for
+ * a global admin.
+ */
+export async function listConnections(org?: string): Promise<Connection[]> {
+  const { data, error } = await api.GET("/v1/connections", {
+    params: { query: org ? { org } : {} },
+  });
   if (error || !data) throw new Error("failed to load connections");
   return data;
 }
@@ -1521,7 +1566,7 @@ export async function resyncConnection(id: string): Promise<ResyncResult> {
   if (response.status === 501) {
     throw new Error("this forge can't list its repositories, so there's nothing to re-sync");
   }
-  if (error || !data) throw new Error("re-sync failed");
+  if (error || !data) throw new Error(errorText(error) || `re-sync failed (${response.status})`);
   return data;
 }
 
@@ -1562,6 +1607,8 @@ export async function createConnection(body: {
   kind: string;
   base_url: string;
   credential: string;
+  /** The org it serves: the forge account that owns its repositories. */
+  org: string;
 }): Promise<CreatedConnection> {
   const { data, error, response } = await api.POST("/v1/connections", { body });
   if (error || !data) {
@@ -1582,6 +1629,22 @@ export async function deleteConnection(id: string, unbindRepos = false): Promise
   });
   if (error) {
     throw new Error(errorText(error) || `could not delete the connection (${response.status})`);
+  }
+}
+
+/**
+ * Assign a connection to an org (`PUT /v1/connections/{id}/org`), a global
+ * admin's act. The server answers 409, with the reason, when a repository
+ * bound through it is owned by another account, or when an org of that name
+ * is served by another forge or by no connection.
+ */
+export async function assignConnectionOrg(id: string, org: string): Promise<void> {
+  const { error, response } = await api.PUT("/v1/connections/{id}/org", {
+    params: { path: { id } },
+    body: { org },
+  });
+  if (error) {
+    throw new Error(errorText(error) || `could not assign the connection (${response.status})`);
   }
 }
 
@@ -1673,6 +1736,8 @@ export type SecretMatrix = {
     status: Record<string, SecretCellStatus>;
     /** For `inherited` cells: `"repo"` or `"org"` — what an edit would override. */
     inherited_from: Record<string, "repo" | "org">;
+    /** For `set` cells that hide a broader value: `"repo"` or `"org"`. */
+    overrides?: Record<string, "repo" | "org">;
   }[];
 };
 
@@ -1852,15 +1917,34 @@ export async function getOrgSecuritySummary(org: string): Promise<OrgSecuritySum
   return data;
 }
 
-/** An Org's security event log (`GET /v1/orgs/{org}/security/events`). */
+/** An Org's security event log (`GET /v1/orgs/{org}/security/events`), newest
+ * first: one page, filtered by kind, actor (subject), target text and time
+ * range (unix ms, `to` exclusive); `cursor` is the previous page's
+ * `next_cursor`. */
 export async function listOrgSecurityEvents(
   org: string,
-  opts: { kind?: string; before?: number; limit?: number } = {},
+  opts: {
+    kind?: string;
+    actor?: string;
+    target?: string;
+    from?: number;
+    to?: number;
+    cursor?: string;
+    limit?: number;
+  } = {},
 ): Promise<SecurityEvents> {
   const { data, error, response } = await api.GET("/v1/orgs/{org}/security/events", {
     params: {
       path: { org },
-      query: { kind: opts.kind || undefined, before: opts.before, limit: opts.limit ?? 50 },
+      query: {
+        kind: opts.kind || undefined,
+        actor: opts.actor || undefined,
+        target: opts.target || undefined,
+        from: opts.from,
+        to: opts.to,
+        cursor: opts.cursor || undefined,
+        limit: opts.limit ?? 50,
+      },
     },
   });
   if (error || !data) throw new Error(errorText(error) || `failed to load security events (${response.status})`);

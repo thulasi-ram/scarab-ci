@@ -1,12 +1,13 @@
-// Plugin installations (ADR-0072), as the UI has to reason about them. Pure —
-// no DOM, no fetch — so the Settings › Plugins panel and its tests agree on
-// what a form sends and what a badge says.
+// Plugin installations, as the UI has to reason about them. Pure — no DOM,
+// no fetch — so the Settings › Plugins panel and its tests agree on what a
+// form sends and what a badge says.
 //
 // A PluginInstallation is an org's approval of exactly (image digest,
-// manifest). The MMP installs first-party plugins only, pinned by digest; the
-// server refuses anything else with a 403 whose text is shown verbatim. These
-// helpers only let the form say what is wrong before the round trip — where
-// the two could disagree the server wins.
+// manifest). Every catalog plugin installs the same way, pinned by digest;
+// the publisher is a fact shown beside it, not a different path. The server
+// may still refuse an install (a 403 or 409), and its text is shown
+// verbatim. These helpers only let the form say what is wrong before the
+// round trip — where the two could disagree the server wins.
 
 /** A PluginInstallation name: a DNS-1123 label, as the server checks it. */
 const DNS1123_LABEL = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
@@ -28,10 +29,10 @@ export function installNameError(name: string, taken: readonly string[] = []): s
  * Why `image` cannot be installed, or `null` if it can (or is still empty —
  * the form stays unsubmittable then, without shouting at a blank field).
  *
- * The MMP installs only by digest: `<repository>@sha256:<64 lowercase hex>`.
+ * A plugin installs only by digest: `<repository>@sha256:<64 lowercase hex>`.
  * A tag can change under the same name, and what an admin approves is the
- * digest. With `repository` given, the image must be that catalog
- * repository — anything else is a third-party image, which is off.
+ * digest. With `repository` given, the image must come from the repository
+ * the catalog lists for the plugin.
  */
 export function imageError(image: string, repository?: string): string | null {
   if (image.length === 0) return null;
@@ -40,7 +41,7 @@ export function imageError(image: string, repository?: string): string | null {
   const repo = image.slice(0, at);
   const digest = image.slice(at + "@sha256:".length);
   if (repository && repo !== repository) {
-    return `The image must be ${repository}@sha256:… — any other repository is a third-party image, and those are off.`;
+    return `The image must be ${repository}@sha256:…, the repository the catalog lists for this plugin.`;
   }
   if (!SHA256_HEX.test(digest)) return "The digest must be 64 lowercase hex characters.";
   return null;
@@ -144,6 +145,21 @@ export function shortDigest(imageOrDigest: string, chars = 12): string {
 export function imageRepository(image: string): string {
   const at = image.indexOf("@");
   return at >= 0 ? image.slice(0, at) : image;
+}
+
+/**
+ * Who publishes a plugin: the owner segment of its image repository, the
+ * way a library's publisher is its source's owner.
+ * `ghcr.io/thulasi-ram/scarab-plugin-argocd@sha256:…` → `thulasi-ram`. The
+ * catalog names no publisher of its own, so this is read from the image.
+ * `""` when the repository has no owner segment (`argocd`, `ghcr.io/argocd`).
+ */
+export function pluginPublisher(imageOrRepository: string): string {
+  const parts = imageRepository(imageOrRepository.trim()).split("/").filter((p) => p !== "");
+  // A first segment with a "." or ":" (or `localhost`) is a registry host.
+  const first = parts[0] ?? "";
+  if (/[.:]/.test(first) || first === "localhost") parts.shift();
+  return parts.length >= 2 ? parts[0]! : "";
 }
 
 // --- PluginConnections (ADR-0072 §5) ----------------------------------------

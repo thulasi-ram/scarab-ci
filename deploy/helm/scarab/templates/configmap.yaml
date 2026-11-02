@@ -75,6 +75,9 @@ data:
   {{- with .Values.scarab.publicUrl }}
   SCARAB_PUBLIC_URL: {{ . | quote }}
   {{- end }}
+  {{- with .Values.scarab.uiUrl }}
+  SCARAB_UI_URL: {{ . | quote }}
+  {{- end }}
   {{- if .Values.scarab.libsManifest }}
   SCARAB_LIBS_MANIFEST: {{ include "scarab.libsManifestPath" . | quote }}
   {{- end }}

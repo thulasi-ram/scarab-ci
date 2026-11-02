@@ -8,6 +8,7 @@ import {
   isInsecureHttp,
   toConnectionBody,
   installNameError,
+  pluginPublisher,
   runtimeBadge,
   shortDigest,
   stateBadge,
@@ -52,8 +53,30 @@ describe("imageError", () => {
     expect(imageError(`${REPO}@sha256:${DIGEST.toUpperCase()}`, REPO)).toMatch(/64 lowercase hex/);
   });
 
-  it("refuses another repository — that is a third-party image", () => {
-    expect(imageError(`${REPO}-evil@sha256:${DIGEST}`, REPO)).toMatch(/third-party/);
+  it("refuses a repository other than the catalog's, naming the one it wants", () => {
+    const err = imageError(`${REPO}-evil@sha256:${DIGEST}`, REPO);
+    expect(err).toContain(`${REPO}@sha256:`);
+    expect(err).not.toMatch(/first-party|third-party/);
+  });
+});
+
+describe("pluginPublisher", () => {
+  it("reads the owner after the registry host, from a repository or a pinned image", () => {
+    expect(pluginPublisher(REPO)).toBe("acme");
+    expect(pluginPublisher("ghcr.io/thulasi-ram/scarab-plugin-argocd")).toBe("thulasi-ram");
+    expect(pluginPublisher(IMAGE)).toBe("acme");
+    expect(pluginPublisher("localhost:5000/acme/argocd@sha256:" + DIGEST)).toBe("acme");
+    expect(pluginPublisher("localhost/acme/argocd")).toBe("acme");
+  });
+
+  it("reads a Docker Hub path without a host the same way", () => {
+    expect(pluginPublisher("acme/argocd")).toBe("acme");
+  });
+
+  it("is empty when there is no owner segment", () => {
+    expect(pluginPublisher("argocd")).toBe("");
+    expect(pluginPublisher("ghcr.io/argocd")).toBe("");
+    expect(pluginPublisher("")).toBe("");
   });
 });
 

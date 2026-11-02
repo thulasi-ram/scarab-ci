@@ -835,6 +835,7 @@ pub(crate) async fn install_plugin(
         .as_ref()
         .map(PluginStorageRequest::validated)
         .transpose()?;
+    crate::note_org(&st, &org).await?;
     let now = st.clock.now().await.0;
     let mut installation = PluginInstallation {
         id: mint_installation_id(),

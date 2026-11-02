@@ -490,6 +490,9 @@ async fn connect(db: &InMemoryDb, id: &str, kind: ForgeKind, base: &str) {
         kind,
         base_url: base.into(),
         credential_ref: "c".into(),
+        org: None,
+        installation_id: None,
+        account_id: None,
     })
     .await
     .unwrap();
@@ -640,7 +643,7 @@ async fn defaults_retry_a_mirror_on_another_orgs_repo_obeys_the_org_rule() {
         "installed from another org's private repository: {b}"
     );
     assert!(
-        b.to_string().contains("not owned by org"),
+        b.to_string().contains("does not belong to org `acme`"),
         "not refused by the org rule: {b}"
     );
 }

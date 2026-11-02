@@ -84,6 +84,9 @@ async fn harness_at(
         kind: ForgeKind::GitHub,
         base_url: "https://api.github.com".into(),
         credential_ref: CRED_REF.into(),
+        org: Some("acme".into()),
+        installation_id: None,
+        account_id: None,
     })
     .await
     .unwrap();
@@ -729,6 +732,7 @@ const FORGEJO_TOKEN: &str = "fj-pat-do-not-leak-9f3c";
 
 fn create_forgejo(base_url: &str) -> serde_json::Value {
     serde_json::json!({
+        "org": "acme",
         "kind": "forgejo",
         "base_url": base_url,
         "credential": FORGEJO_TOKEN,
@@ -827,6 +831,7 @@ async fn github_connections_are_not_creatable_by_hand() {
             "/v1/connections",
             &root,
             serde_json::json!({
+                "org": "acme",
                 "kind": "github",
                 "base_url": "https://api.github.com",
                 "credential": "ghp_nope",
@@ -848,11 +853,14 @@ async fn a_malformed_create_is_refused_before_anything_is_stored() {
 
     let cases = [
         // Not a URL: the adapter would build nonsense request URLs per call.
-        serde_json::json!({ "kind": "forgejo", "base_url": "git.acme.test", "credential": FORGEJO_TOKEN }),
+        serde_json::json!({ "org": "acme", "kind": "forgejo", "base_url": "git.acme.test", "credential": FORGEJO_TOKEN }),
         // A blank credential is the "I'll fill it in later" trap: the row looks
         // healthy and every call 401s.
-        serde_json::json!({ "kind": "forgejo", "base_url": "https://git.acme.test", "credential": "   " }),
-        serde_json::json!({ "kind": "gitlab", "base_url": "https://gitlab.com", "credential": "x" }),
+        serde_json::json!({ "org": "acme", "kind": "forgejo", "base_url": "https://git.acme.test", "credential": "   " }),
+        serde_json::json!({ "org": "acme", "kind": "gitlab", "base_url": "https://gitlab.com", "credential": "x" }),
+        // A connection serves an Org, and never one of Scarab's own.
+        serde_json::json!({ "org": "  ", "kind": "forgejo", "base_url": "https://git.acme.test", "credential": "x" }),
+        serde_json::json!({ "org": "_forge", "kind": "forgejo", "base_url": "https://git.acme.test", "credential": "x" }),
     ];
     for body in cases {
         let resp = h
@@ -971,6 +979,9 @@ async fn deleting_a_connection_with_projects_needs_an_acknowledgement() {
         kind: ForgeKind::GitHub,
         base_url: "https://api.github.com".into(),
         credential_ref: CRED_REF.into(),
+        org: Some("acme".into()),
+        installation_id: None,
+        account_id: None,
     })
     .await
     .unwrap();
@@ -1392,6 +1403,7 @@ async fn no_bind_path_homes_a_repo_in_a_reserved_org() {
     // The installation-sync path (GitHub) goes through the same registry.
     let sync = scarab_forge_github::InstallationSync {
         installation_id: 1,
+        account_id: None,
         account: "_forge".into(),
         added: vec![forge_web.clone()],
         removed: vec![],

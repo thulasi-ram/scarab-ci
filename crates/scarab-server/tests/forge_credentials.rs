@@ -13,6 +13,9 @@ fn conn(credential_ref: &str) -> ForgeConnection {
         kind: ForgeKind::GitHub,
         base_url: "https://api.github.com".into(),
         credential_ref: credential_ref.into(),
+        org: None,
+        installation_id: None,
+        account_id: None,
     }
 }
 

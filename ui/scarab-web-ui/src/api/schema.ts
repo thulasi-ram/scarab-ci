@@ -167,9 +167,10 @@ export interface paths {
         };
         /**
          * Registered forge connections + their bound Projects and health (ADR-0060)
-         * @description Read-only, and `Administer` on the Org: a connection spans every Project it
-         *     serves, so seeing the fleet is an org-level act, not a per-repo one. No
-         *     credential material is ever returned — only whether the handle resolves.
+         * @description Read-only, and per Org (git-bug 19b0a45): the caller sees the connections
+         *     of the Orgs it administers, and a global admin also sees the unassigned
+         *     ones. No credential material is ever returned — only whether the handle
+         *     resolves.
          */
         get: operations["list_connections"];
         put?: never;
@@ -240,6 +241,29 @@ export interface paths {
          */
         get: operations["available_repos"];
         put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/connections/{id}/org": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Assign a forge connection to an org (global admins)
+         * @description Refused (409, with the reason) when a repo bound through the connection
+         *     is not the Org's, or when an Org of that name already exists and is
+         *     served by another forge or host, or by no connection at all: the same
+         *     rule the installation delivery applies.
+         */
+        put: operations["assign_connection_org"];
         post?: never;
         delete?: never;
         options?: never;
@@ -567,6 +591,41 @@ export interface paths {
         /** Begin a step-up: a challenge that opens a 5-minute window (ADR-0073 §4) */
         post: operations["step_up_options"];
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/me/tokens": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List your own API tokens (ADR-0049) */
+        get: operations["list_own_api_tokens"];
+        put?: never;
+        /** Mint a personal API token - the plaintext is returned ONCE (ADR-0049) */
+        post: operations["mint_own_api_token"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/me/tokens/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Revoke one of your own API tokens (ADR-0049) */
+        delete: operations["revoke_own_api_token"];
         options?: never;
         head?: never;
         patch?: never;
@@ -1317,7 +1376,7 @@ export interface paths {
         /** List the API tokens issued in an org (ADR-0049) */
         get: operations["list_api_tokens"];
         put?: never;
-        /** Mint an API token - the plaintext is returned ONCE (ADR-0049) */
+        /** Mint a personal API token in an org - the plaintext is returned ONCE (ADR-0049) */
         post: operations["mint_api_token"];
         delete?: never;
         options?: never;
@@ -2342,7 +2401,7 @@ export interface components {
             last_used_at?: number | null;
             name: string;
             org: string;
-            /** @description The principal whose live authority bounds this token. */
+            /** @description The principal who holds the token and whose live authority bounds it. */
             owner_subject: string;
             /** @description `None` for an org-scoped token. */
             project?: string | null;
@@ -2356,6 +2415,13 @@ export interface components {
              *     depends on what its owner holds at the moment of each request.
              */
             role: string;
+            /**
+             * Format: int64
+             * @description How many requests have presented it. Approximate: calls are counted in
+             *     memory and written in batches, so the count can lag by up to a minute,
+             *     and a server that stops loses the calls it had not written yet.
+             */
+            use_count: number;
         };
         /**
          * @description One artifact **version** in a run's list (ADR-0052, immutable per attempt
@@ -2373,6 +2439,14 @@ export interface components {
             size: number;
             step: string;
             succeeded: boolean;
+        };
+        /** @description `PUT /v1/connections/{id}/org` body. */
+        AssignConnectionOrgRequest: {
+            /**
+             * @description The Org the connection is to serve: the forge owner whose
+             *     repositories it binds.
+             */
+            org: string;
         };
         /**
          * @description One attempt at executing a step (ADR-0047) — the rerun unit. A step with more
@@ -2622,6 +2696,11 @@ export interface components {
              */
             managed_by_config: boolean;
             /**
+             * @description The Org this connection serves (git-bug 19b0a45); `null` = unassigned,
+             *     visible to and editable by global admins only.
+             */
+            org?: string | null;
+            /**
              * @description The Projects this connection serves, from its repo bindings — a Project
              *     *is* a binding (ADR-0046), so this is the connection's whole footprint.
              */
@@ -2642,6 +2721,11 @@ export interface components {
             supports_resync: boolean;
             /** @description The forge's own web host, for deep links out of the UI. */
             web_url: string;
+        };
+        /** @description `PUT /v1/connections/{id}/org` result. */
+        ConnectionOrgDto: {
+            id: string;
+            org: string;
         };
         /**
          * @description The result of checking a connection's app configuration against what Scarab
@@ -2736,6 +2820,12 @@ export interface components {
              *     registration (ADR-0060 part C), so a create form for it could not work.
              */
             kind: string;
+            /**
+             * @description The Org the connection serves (git-bug 19b0a45): the forge owner whose
+             *     repositories it binds. The caller must administer it; the first
+             *     connection of an Org that does not exist yet needs a global admin.
+             */
+            org: string;
         };
         /** @description `POST …/policies`. */
         CreatePolicyRequest: {
@@ -3200,6 +3290,13 @@ export interface components {
             /** @description Human display name, when the identity provides one. */
             display_name?: string | null;
             /**
+             * @description Does the caller hold a global `Administer` role? Only such a caller
+             *     may add the first connection of an Org that does not exist yet, or
+             *     act on an unassigned connection (git-bug 19b0a45). Always `false` for
+             *     an API token.
+             */
+            global_admin: boolean;
+            /**
              * @description The provider accounts this Principal can sign in with (ADR-0069).
              *     Empty when no identity store is wired (dev).
              */
@@ -3208,6 +3305,13 @@ export interface components {
             roles: string[];
             /** @description Stable, forge-agnostic identity subject. */
             subject: string;
+            /**
+             * @description The orgs this principal may mint a personal API token in, sorted: every
+             *     org where they hold a role binding (org or project), and every org for
+             *     a bootstrap owner. The mint still checks the role in the exact scope.
+             *     Always empty for an API token, which may not mint.
+             */
+            token_mint_orgs: string[];
         };
         /** @description `GET /v1/me/security`. */
         MeSecurityResponse: {
@@ -3249,6 +3353,28 @@ export interface components {
              * @description This browser session's open window, if any (unix ms).
              */
             window_expires_at?: number | null;
+        };
+        /**
+         * @description `POST /v1/me/tokens` body: [`MintTokenRequest`] plus the org, which the
+         *     personal route cannot take from its path.
+         */
+        MintOwnTokenRequest: {
+            /**
+             * Format: int32
+             * @description Lifetime in days, `1..=365`.
+             */
+            expires_in_days: number;
+            /** @description Human label — what makes the token revocable in practice. */
+            name: string;
+            /** @description The org the token is scoped to (or the org of its project). */
+            org: string;
+            /** @description Project within the org to scope the token to. Absent = the whole org. */
+            project?: string | null;
+            /**
+             * @description The **ceiling**: `viewer` | `member` | `admin` | `owner`, never more
+             *     than the caller holds in this scope.
+             */
+            role: string;
         };
         /**
          * @description `POST /v1/orgs/{org}/tokens` body. Every field is required on purpose: a
@@ -4192,6 +4318,13 @@ export interface components {
              *     see the handler's note on why re-sync never unbinds.
              */
             confirmed: number;
+            /**
+             * @description Repos the forge reports that were not bound (git-bug 19b0a45): owned
+             *     by another account than the connection's Org, already bound through
+             *     another connection that serves an Org, or reported to a connection
+             *     that serves no Org yet (it binds nothing until it is assigned).
+             */
+            skipped: string[];
         };
         RetryDefaultsRequest: {
             /** @description A ForgeConnection to read the mirror through. */
@@ -4410,6 +4543,14 @@ export interface components {
             };
             key: string;
             /**
+             * @description For each `set` cell that hides a broader value, the scope it hides —
+             *     `"repo"` or `"org"`. The counterpart of `inherited_from`: a repo key that
+             *     the org also defines reads as overriding the org, not as a lone key.
+             */
+            overrides: {
+                [key: string]: string;
+            };
+            /**
              * @description `column id -> "set" | "inherited" | "unset" | "silenced"`.
              *
              *     `set` = a value lives at exactly that scope · `inherited` = none here, but
@@ -4429,8 +4570,8 @@ export interface components {
              */
             at: number;
             /**
-             * @description `session:cookie`, `session:bearer`, `api_token:<id>` or
-             *     `operator:break-glass`.
+             * @description `session:cookie`, `session:bearer`, `api_token:<id>`,
+             *     `operator:break-glass` or `operator:grant`.
              */
             caller: string;
             /** @description The StepUpConfirmation it was authorised by / that it records. */
@@ -4441,7 +4582,7 @@ export interface components {
              * @description `step_up.confirmed`, `step_up.refused`, `op.authorised`,
              *     `op.completed`, `request.raised|confirmed|executed|failed`,
              *     `passkey.enrolled|removed|reset|break_glass_reset|clone_suspected`,
-             *     `guard.not_consulted`.
+             *     `guard.not_consulted`, `binding.operator_grant`.
              */
             kind: string;
             op?: string | null;
@@ -4466,9 +4607,12 @@ export interface components {
             events: components["schemas"]["SecurityEventDto"][];
             /**
              * Format: int64
-             * @description Pass as `before` for the next page; absent on the last.
+             * @description Pass as `before` for the next page; absent on the last. The same
+             *     position as `next_cursor`, kept for older callers.
              */
             next_before?: number | null;
+            /** @description Pass as `cursor` for the next page; absent on the last. */
+            next_cursor?: string | null;
         };
         /**
          * @description A **shared service** instance of a run (ADR-0058) — the evidence a shared
@@ -4825,6 +4969,11 @@ export interface components {
             /** @description `executed` (the operation answered 2xx) or `failed`. */
             state: string;
         };
+        /**
+         * @description The order of the org's token list.
+         * @enum {string}
+         */
+        TokenSort: "last_used" | "use_count" | "created";
         TrustSourceRequest: {
             /**
              * @description `<host>/<owner>/<repo>//<path>`; an `@<commit>` is dropped, since
@@ -5210,7 +5359,10 @@ export interface operations {
     };
     list_connections: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description only the connections serving this org */
+                org?: string;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -5225,7 +5377,7 @@ export interface operations {
                     "application/json": components["schemas"]["ConnectionDto"][];
                 };
             };
-            /** @description requires Administer on the org */
+            /** @description requires Administer on an org */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -5262,14 +5414,14 @@ export interface operations {
                     "application/json": components["schemas"]["CreatedConnectionDto"];
                 };
             };
-            /** @description unknown kind, non-creatable kind, or a malformed base URL */
+            /** @description unknown kind, non-creatable kind, a malformed base URL, or a missing or reserved org */
             400: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content?: never;
             };
-            /** @description requires Administer on the org — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            /** @description requires Administer on the org; a new org needs a global admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -5285,7 +5437,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description a connection to that forge and base URL already exists */
+            /** @description the org already has a connection to that forge and base URL */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -5339,7 +5491,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description the connection still has bound repos (Projects) */
+            /** @description the connection still has bound repos (Projects), or holds a repo of another org */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -5391,6 +5543,69 @@ export interface operations {
             };
             /** @description this forge adapter cannot enumerate repos */
             501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    assign_connection_org: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description connection id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AssignConnectionOrgRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConnectionOrgDto"];
+                };
+            };
+            /** @description not an org name: empty, longer than 100 characters, containing `/`, spaces or control characters, `.` or `..`, `_`-prefixed, or one of the reserved names `settings`, `orgs`, `account`, `security` */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description requires a global admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
+            /** @description no such connection, or no registry wired */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description a bound repo is not the org's, the org is served by another forge or by no connection, or the connection is managed by configuration */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -5458,7 +5673,7 @@ export interface operations {
                     "application/json": components["schemas"]["BindRepoResultDto"];
                 };
             };
-            /** @description missing owner/name */
+            /** @description missing owner/name, or a repo not owned by the connection's org */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -5930,7 +6145,15 @@ export interface operations {
             query?: {
                 /** @description comma-separated event kinds */
                 kind?: string;
-                /** @description only events with seq below this (paging) */
+                /** @description only events whose target contains this text (ignoring case) */
+                target?: string;
+                /** @description only events at or after this time (unix ms) */
+                from?: number;
+                /** @description only events before this time (unix ms) */
+                to?: number;
+                /** @description the previous page's next_cursor */
+                cursor?: string;
+                /** @description only events with seq below this (paging; not with cursor) */
                 before?: number;
                 /** @description page size (default 50, max 200) */
                 limit?: number;
@@ -5948,6 +6171,13 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["SecurityEventsResponse"];
                 };
+            };
+            /** @description a cursor this server did not issue, or both cursor and before */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description not signed in */
             401: {
@@ -6042,6 +6272,127 @@ export interface operations {
                 content?: never;
             };
             /** @description step-up is off */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_own_api_tokens: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiTokenDto"][];
+                };
+            };
+            /** @description not signed in */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description API tokens not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    mint_own_api_token: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MintOwnTokenRequest"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MintedTokenDto"];
+                };
+            };
+            /** @description bad role, name, or lifetime, or the role exceeds the minter's */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description the caller holds no role in the target scope, or is itself a token — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
+            /** @description API tokens not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    revoke_own_api_token: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description token id - NOT the token itself */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description revoked */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description the caller is an API token */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such live token of yours */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -8812,7 +9163,17 @@ export interface operations {
             query?: {
                 /** @description comma-separated event kinds */
                 kind?: string;
-                /** @description only events with seq below this (paging) */
+                /** @description only events about this subject */
+                actor?: string;
+                /** @description only events whose target contains this text (ignoring case); events bound to the Org only */
+                target?: string;
+                /** @description only events at or after this time (unix ms) */
+                from?: number;
+                /** @description only events before this time (unix ms) */
+                to?: number;
+                /** @description the previous page's next_cursor */
+                cursor?: string;
+                /** @description only events with seq below this (paging; not with cursor) */
                 before?: number;
                 /** @description page size (default 50, max 200) */
                 limit?: number;
@@ -8833,6 +9194,13 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["SecurityEventsResponse"];
                 };
+            };
+            /** @description a cursor this server did not issue, or both cursor and before */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description not signed in */
             401: {
@@ -8888,7 +9256,13 @@ export interface operations {
     };
     list_api_tokens: {
         parameters: {
-            query?: never;
+            query?: {
+                /**
+                 * @description `last_used` (default), `use_count` or `created`; each descending, ties
+                 *     broken by newest first.
+                 */
+                sort?: components["schemas"]["TokenSort"];
+            };
             header?: never;
             path: {
                 /** @description org */
@@ -8905,6 +9279,13 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["ApiTokenDto"][];
                 };
+            };
+            /** @description unknown `sort` */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description not an org admin */
             403: {
@@ -8953,7 +9334,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description not an admin of the target scope, or the caller is itself a token — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            /** @description the caller holds no role in the target scope, or is itself a token — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -10588,7 +10969,17 @@ export interface operations {
             query?: {
                 /** @description comma-separated event kinds */
                 kind?: string;
-                /** @description only events with seq below this (paging) */
+                /** @description only events about this subject */
+                actor?: string;
+                /** @description only events whose target contains this text (ignoring case) */
+                target?: string;
+                /** @description only events at or after this time (unix ms) */
+                from?: number;
+                /** @description only events before this time (unix ms) */
+                to?: number;
+                /** @description the previous page's next_cursor */
+                cursor?: string;
+                /** @description only events with seq below this (paging; not with cursor) */
                 before?: number;
                 /** @description page size (default 50, max 200) */
                 limit?: number;
@@ -10606,6 +10997,13 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["SecurityEventsResponse"];
                 };
+            };
+            /** @description a cursor this server did not issue, or both cursor and before */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description not signed in */
             401: {

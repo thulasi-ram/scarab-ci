@@ -271,6 +271,9 @@ struct InMemoryState {
     /// Connections owned by the declarative `connections:` config, not the DB
     /// (ADR-0060 part D single-owner marker; the `owned_by_config` column).
     forge_config_owned: std::collections::HashSet<String>,
+    /// Orgs recorded by `record_org` (the Postgres `orgs` table), beside the
+    /// ones the registry names.
+    orgs: std::collections::BTreeSet<String>,
     /// Webhook delivery-id replay guard: (forge kind token, delivery id).
     webhook_deliveries: std::collections::HashSet<(String, String)>,
     /// Lease table: resource → (owner, expiry instant, term).
@@ -3618,11 +3621,20 @@ impl scarab_forge::ForgeConnectionStore for InMemoryDb {
         &self,
         conn: &scarab_forge::ForgeConnection,
     ) -> Result<(), scarab_forge::RegistryError> {
-        self.state
-            .lock()
-            .unwrap()
-            .forge_connections
-            .insert(conn.id.clone(), conn.clone());
+        let mut st = self.state.lock().unwrap();
+        // Mirrors Postgres: a known account id survives a writer that does
+        // not know it.
+        let mut conn = conn.clone();
+        if conn.account_id.is_none() {
+            conn.account_id = st
+                .forge_connections
+                .get(&conn.id)
+                .and_then(|c| c.account_id);
+        }
+        if let Some(org) = &conn.org {
+            st.orgs.insert(org.clone());
+        }
+        st.forge_connections.insert(conn.id.clone(), conn);
         Ok(())
     }
 
@@ -3669,8 +3681,42 @@ impl scarab_forge::ForgeConnectionStore for InMemoryDb {
         org: &str,
         project: &str,
     ) -> Result<(), scarab_forge::RegistryError> {
-        self.state.lock().unwrap().forge_repos.insert(
-            (repo.owner.clone(), repo.name.clone()),
+        let mut st = self.state.lock().unwrap();
+        let key = (repo.owner.clone(), repo.name.clone());
+        // Mirrors Postgres: an assigned connection binds only its Org's repos,
+        // checked under the same hold as the write.
+        if let Some(conn_org) = st
+            .forge_connections
+            .get(connection_id)
+            .and_then(|c| c.org.clone())
+        {
+            if repo.owner != conn_org || org != conn_org {
+                return Err(scarab_forge::RegistryError::OrgMismatch {
+                    connection: connection_id.to_string(),
+                    connection_org: conn_org,
+                    owner: repo.owner.clone(),
+                    name: repo.name.clone(),
+                });
+            }
+        }
+        // Mirrors the Postgres guard (git-bug 19b0a45): a re-bind moves the
+        // repo only off a connection that does not serve its owner (an
+        // unassigned one, or another Org's), never off its own Org's.
+        if let Some((holder, _, _)) = st.forge_repos.get(&key) {
+            let holder_assigned = st
+                .forge_connections
+                .get(holder)
+                .is_some_and(|c| c.org.as_deref() == Some(repo.owner.as_str()));
+            if holder != connection_id && holder_assigned {
+                return Err(scarab_forge::RegistryError::BoundElsewhere {
+                    owner: repo.owner.clone(),
+                    name: repo.name.clone(),
+                    connection: holder.clone(),
+                });
+            }
+        }
+        st.forge_repos.insert(
+            key,
             (
                 connection_id.to_string(),
                 org.to_string(),
@@ -3765,6 +3811,19 @@ impl scarab_forge::ForgeConnectionStore for InMemoryDb {
             }
         }
         Ok(())
+    }
+
+    async fn record_org(&self, org: &str) -> Result<(), scarab_forge::RegistryError> {
+        if !org.is_empty() && !scarab_forge::is_reserved_org(org) {
+            self.state.lock().unwrap().orgs.insert(org.to_string());
+        }
+        Ok(())
+    }
+
+    async fn list_orgs(&self) -> Result<Vec<String>, scarab_forge::RegistryError> {
+        let mut orgs = scarab_forge::derived_orgs(self).await?;
+        orgs.extend(self.state.lock().unwrap().orgs.iter().cloned());
+        Ok(orgs.into_iter().collect())
     }
 
     async fn config_owned_connection_ids(
@@ -4126,7 +4185,8 @@ impl SessionStore for InMemorySessions {
 
 /// An in-memory [`scarab_identity::ApiTokenStore`] with the same semantics as
 /// the Postgres adapter: keyed on the hash of the plaintext (never the
-/// plaintext), revocation idempotent-but-honest, and `touch` monotonic.
+/// plaintext), revocation idempotent-but-honest, and `touch` monotonic in
+/// `last_used_at` while it always adds its `uses` to the count.
 #[derive(Default)]
 pub struct InMemoryApiTokens {
     /// hash → record. The hash is the key here for the same reason it is the
@@ -4184,6 +4244,22 @@ impl scarab_identity::ApiTokenStore for InMemoryApiTokens {
         Ok(out)
     }
 
+    async fn list_owned(
+        &self,
+        owner: &str,
+    ) -> Result<Vec<scarab_identity::ApiToken>, IdentityError> {
+        let mut out: Vec<scarab_identity::ApiToken> = self
+            .tokens
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|t| t.owner_subject == owner)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(a.id.cmp(&b.id)));
+        Ok(out)
+    }
+
     async fn revoke(&self, id: &str, now_ms: i64) -> Result<bool, IdentityError> {
         let mut rows = self.tokens.lock().unwrap();
         let Some(t) = rows.values_mut().find(|t| t.id == id) else {
@@ -4196,12 +4272,13 @@ impl scarab_identity::ApiTokenStore for InMemoryApiTokens {
         Ok(true)
     }
 
-    async fn touch(&self, id: &str, now_ms: i64) -> Result<(), IdentityError> {
+    async fn touch(&self, id: &str, now_ms: i64, uses: u64) -> Result<(), IdentityError> {
         let mut rows = self.tokens.lock().unwrap();
         if let Some(t) = rows.values_mut().find(|t| t.id == id) {
             if t.last_used_at.is_none_or(|prev| prev < now_ms) {
                 t.last_used_at = Some(now_ms);
             }
+            t.use_count = t.use_count.saturating_add(uses);
         }
         Ok(())
     }

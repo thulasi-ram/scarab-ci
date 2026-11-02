@@ -102,13 +102,26 @@ impl RegistryForge {
         Ok(match conn.kind {
             ForgeKind::GitHub => match &self.github_app_id {
                 // App mode: the credential is the App private-key PEM.
-                Some(app_id) => Arc::new(
-                    scarab_forge_github::GithubForge::app(scarab_forge_github::GithubApp {
-                        app_id: app_id.clone(),
-                        private_key_pem: credential().await?,
-                    })
-                    .with_base_url(conn.base_url.clone()),
-                ),
+                // A connection that serves an Org mints only for that Org's
+                // repositories, and only from its own installation when it
+                // has one (git-bug 19b0a45). An unassigned (legacy) row is
+                // not pinned: it may hold repositories of other
+                // installations, and each repo's installation is looked up.
+                Some(app_id) => {
+                    let mut adapter =
+                        scarab_forge_github::GithubForge::app(scarab_forge_github::GithubApp {
+                            app_id: app_id.clone(),
+                            private_key_pem: credential().await?,
+                        })
+                        .with_base_url(conn.base_url.clone());
+                    if let Some(org) = &conn.org {
+                        adapter = adapter.with_owner(org.clone());
+                    }
+                    if let Some(id) = pinned_installation(conn) {
+                        adapter = adapter.with_installation(id);
+                    }
+                    Arc::new(adapter)
+                }
                 // Token mode (dev): the credential is a plain token.
                 None => Arc::new(
                     scarab_forge_github::GithubForge::new(credential().await?)
@@ -137,14 +150,22 @@ impl RegistryForge {
         &self,
         conn: &ForgeConnection,
     ) -> Result<Arc<dyn ForgePort>, ForgeError> {
-        if let Some(adapter) = self.adapters.lock().unwrap().get(&conn.id) {
+        // Keyed by the Org and the installation too: a connection a global
+        // admin assigns to an Org gets an adapter held to it, not the
+        // unpinned one cached before.
+        let key = format!(
+            "{}#{}#{}",
+            conn.id,
+            conn.org.as_deref().unwrap_or(""),
+            pinned_installation(conn)
+                .map(|i| i.to_string())
+                .unwrap_or_default()
+        );
+        if let Some(adapter) = self.adapters.lock().unwrap().get(&key) {
             return Ok(adapter.clone());
         }
         let adapter = self.build_adapter(conn).await?;
-        self.adapters
-            .lock()
-            .unwrap()
-            .insert(conn.id.clone(), adapter.clone());
+        self.adapters.lock().unwrap().insert(key, adapter.clone());
         Ok(adapter)
     }
 
@@ -161,8 +182,31 @@ impl RegistryForge {
                     repo.owner, repo.name
                 ))
             })?;
+        // A binding through a connection that serves an Org is that Org's
+        // repo (git-bug 19b0a45); the registry guarantees it, and nothing is
+        // asked of the forge if a row says otherwise.
+        if let Some(org) = &resolved.connection.org {
+            if *org != repo.owner {
+                return Err(ForgeError::Api(format!(
+                    "connection `{}` serves org `{org}`, not the owner of {}/{}",
+                    resolved.connection.id, repo.owner, repo.name
+                )));
+            }
+        }
         self.cached_adapter(&resolved.connection).await
     }
+}
+
+/// The installation a GitHub connection mints from (git-bug 19b0a45): its
+/// own, once it serves an Org. Its stored id, or the one its
+/// `github-install-<id>` name carries (a row an older server registered, or
+/// a config-declared one). An unassigned connection is never pinned.
+fn pinned_installation(conn: &ForgeConnection) -> Option<u64> {
+    if conn.kind != ForgeKind::GitHub || conn.org.is_none() {
+        return None;
+    }
+    conn.installation_id
+        .or_else(|| scarab_forge::installation_id_of(&conn.id))
 }
 
 /// The connection-scoped half of the same wiring (ADR-0060): onboarding asks

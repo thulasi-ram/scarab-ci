@@ -1,4 +1,4 @@
-// Org-level Environments (ADR-0071, MMP step 1), as the UI has to reason about
+// Org-level Environments, as the UI has to reason about
 // them. Pure — no DOM, no fetch — so the Settings panel and its tests agree on
 // what a form sends.
 //
@@ -9,6 +9,16 @@
 // The server enforces every rule here; mirroring them only lets the form say
 // what is wrong before the round trip. Where the two could disagree the server
 // wins, and its 400/409 text is shown verbatim.
+import {
+  rulesToForm,
+  toEligibilityBody,
+  toProtectionBody,
+  type EligibilityLike,
+  type ProtectionBody,
+  type RulesForm,
+  type RulesLike,
+} from "./environment-overlays";
+import { orgHref } from "./settings-nav";
 
 /** The editable fields. The name is the URL, not the body. */
 export type OrgEnvironmentForm = {
@@ -40,12 +50,156 @@ export function nameError(name: string): string | null {
   return null;
 }
 
-/** The form for an existing Environment (or a fresh one). */
-export function toForm(env?: OrgEnvironmentLike): OrgEnvironmentForm {
-  return { description: env?.description ?? "" };
-}
-
 /** The PUT body for `form`. The description is trimmed. */
 export function toPutBody(form: OrgEnvironmentForm): { body: OrgEnvironmentBody } {
   return { body: { description: form.description.trim() } };
+}
+
+// ── The Environment's own pages ──────────────────────────────────────────────
+//
+// An Environment is viewed at `/orgs/<org>/settings/environments/<name>`
+// (read-only) and changed at `…/<name>/edit`. Five and six segments under a
+// static `/orgs` first segment, so neither can collide with `/:org/:repo`,
+// `/:org/:repo/runs/:id` or the four-segment settings sections. The name is
+// one encoded segment: names may hold `/`, spaces and `%`.
+
+const sectionHref = (org: string) => orgHref(org, "environments");
+
+/** The Environments list in org settings. */
+export const environmentsHref = (org: string) => sectionHref(org);
+
+/** The read-only page of one Environment. */
+export const environmentHref = (org: string, name: string) =>
+  `${sectionHref(org)}/${encodeURIComponent(name)}`;
+
+/** The edit page of one Environment. */
+export const environmentEditHref = (org: string, name: string) => `${environmentHref(org, name)}/edit`;
+
+/** A destructive action goes ahead only when the exact name is typed — case
+ *  and spaces included, as everywhere else the name is used. */
+export const confirmsName = (typed: string, name: string) => name.length > 0 && typed === name;
+
+/** What the edit page holds: the description, the baseline, eligibility. */
+export type EnvironmentEditForm = {
+  description: string;
+  baseline: RulesForm;
+  allProjects: boolean;
+  /** Comma-separated project-name patterns. */
+  patterns: string;
+};
+
+/** The stored record as the edit page reads it. Structural, like
+ *  `OrgEnvironmentLike`. */
+export type EditableEnvironmentLike = OrgEnvironmentLike & {
+  protection: RulesLike;
+  eligibility: EligibilityLike;
+};
+
+/** The edit form for a stored Environment. */
+export function toEditForm(env: EditableEnvironmentLike): EnvironmentEditForm {
+  return {
+    description: env.description,
+    baseline: rulesToForm(env.protection),
+    allProjects: env.eligibility.all_projects,
+    patterns: (env.eligibility.projects ?? []).join(", "),
+  };
+}
+
+/** One write a Save makes. Each part has its own endpoint, so a Save sends
+ *  only the parts that changed — an unchanged baseline is never re-sent. */
+export type EnvironmentWrite =
+  | { part: "description"; body: OrgEnvironmentBody }
+  | { part: "baseline"; body: ProtectionBody }
+  | { part: "eligibility"; body: { all_projects: boolean; projects: string[] } };
+
+const sameList = (a: readonly string[], b: readonly string[]) =>
+  a.length === b.length && a.every((x, i) => x === b[i]);
+
+/**
+ * The writes that turn `env` into `form`, in the order they are sent
+ * (description, baseline, eligibility), or the error that stops the Save
+ * before any is sent. Compared on the bodies the server would store, so
+ * re-ordering spaces or commas alone sends nothing.
+ */
+export function planSave(
+  env: EditableEnvironmentLike,
+  form: EnvironmentEditForm,
+): { writes: EnvironmentWrite[]; error?: undefined } | { writes?: undefined; error: string } {
+  const protection = toProtectionBody(form.baseline);
+  if (protection.error !== undefined) return { error: protection.error };
+  const eligibility = toEligibilityBody(form.allProjects, form.patterns);
+  if (eligibility.error !== undefined) return { error: eligibility.error };
+
+  const writes: EnvironmentWrite[] = [];
+  const description = toPutBody({ description: form.description }).body;
+  // The stored value is compared trimmed too: one stored with edge spaces
+  // (set through the API) is not a change the form made.
+  if (description.description !== env.description.trim()) {
+    writes.push({ part: "description", body: description });
+  }
+  const p = protection.body;
+  const was = env.protection;
+  if (
+    !sameList(p.approvers, was.approvers) ||
+    !sameList(p.allowed_refs, was.allowed_refs) ||
+    p.wait_timer_s !== was.wait_timer_s ||
+    p.require_reason !== was.require_reason
+  ) {
+    writes.push({ part: "baseline", body: p });
+  }
+  const e = eligibility.body;
+  const wasAll = env.eligibility.all_projects;
+  if (e.all_projects !== wasAll || (!wasAll && !sameList(e.projects, env.eligibility.projects ?? []))) {
+    writes.push({ part: "eligibility", body: e });
+  }
+  return { writes };
+}
+
+/** How each part is named when a Save reports what did or did not save. */
+export const PART_LABEL: Record<EnvironmentWrite["part"], string> = {
+  description: "description",
+  baseline: "baseline",
+  eligibility: "list of projects that may deploy",
+};
+
+/** What a Save says when the Environment is gone before its first write. */
+export const DELETED_ELSEWHERE = "This environment was deleted by someone else.";
+
+/**
+ * Send a Save's `writes` in order, and say what went wrong, or `null`.
+ *
+ * Before the first write it asks `stillThere` whether the Environment still
+ * exists. The description write is a create-or-replace, so a Save on a page
+ * opened before another admin deleted the Environment would otherwise bring
+ * it back with the default baseline and eligibility, and the delete would be
+ * lost. A missing Environment stops the Save with nothing sent.
+ *
+ * Stops at the first write that fails and names the parts that did save.
+ */
+export async function runSave(
+  writes: readonly EnvironmentWrite[],
+  io: {
+    stillThere: () => Promise<boolean>;
+    send: (write: EnvironmentWrite) => Promise<unknown>;
+  },
+): Promise<string | null> {
+  if (writes.length === 0) return null;
+  try {
+    if (!(await io.stillThere())) return DELETED_ELSEWHERE;
+  } catch (e) {
+    const why = e instanceof Error ? e.message : "the server did not answer";
+    return `Could not check the environment before saving: ${why}.`;
+  }
+  const done: string[] = [];
+  for (const w of writes) {
+    try {
+      await io.send(w);
+      done.push(PART_LABEL[w.part]);
+    } catch (e) {
+      const why = e instanceof Error ? e.message : "the server refused it";
+      const saved = done.length > 0 ? ` The ${done.join(" and ")} saved.` : "";
+      return `Could not save the ${PART_LABEL[w.part]}: ${why}.${saved}`;
+    }
+  }
+  return null;
 }

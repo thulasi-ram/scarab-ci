@@ -154,6 +154,10 @@ pub struct AppState {
     /// `scarab_pat_…` bearer a 401: an unwired store must refuse tokens, never
     /// fall through to treating one as a session id.
     pub api_tokens: Option<Arc<dyn scarab_identity::ApiTokenStore>>,
+    /// Calls by API token not yet added to the stored count (git-bug
+    /// a4cb94f). Shared by every clone of this state, so one process counts
+    /// once; written by [`flush_api_token_uses`].
+    pub api_token_uses: Arc<ApiTokenUses>,
     /// The legacy per-Project environment store (ADR-0037), kept for the
     /// legacy approval history (`record_deployment` on every gate release and
     /// its read endpoint). Admission never reads it since ADR-0071 — see
@@ -271,13 +275,18 @@ pub struct AppState {
     /// the credential-exchange `POST /v1/auth/login` through [`Self::auth`].
     pub oauth_providers: Vec<Arc<oauth::OAuthAuthenticator>>,
     /// Scarab's public base URL — where the outside world reaches this server.
-    /// Two things are built from it, and **neither depends on login being on**:
-    /// the OAuth callback `redirect_uri` (`{public_url}/v1/auth/callback`) and
-    /// the forge-webhook callback every registered hook posts to
-    /// (`{public_url}/webhooks/{forge}`, ADR-0046). Set it with
+    /// The forge-webhook callback every registered hook posts to
+    /// (`{public_url}/webhooks/{forge}`, ADR-0046) is built from it, whether
+    /// or not login is on. Set it with
     /// [`with_public_url`](AppState::with_public_url); the dev default only
     /// works when the forge shares this host's loopback.
     pub public_url: String,
+    /// Where people open the web UI (`SCARAB_UI_URL`), when that is not
+    /// [`public_url`](Self::public_url): the OAuth callback `redirect_uri`
+    /// (`{ui_url}/v1/auth/callback`) and the step-up confirmation link are
+    /// built from it. `None` = the public URL. Read it through
+    /// [`ui_url`](AppState::ui_url).
+    pub ui_url: Option<String>,
     /// Deployment-supplied forge-connection credentials (ADR-0060 part D): the
     /// env-override half of the one credential-resolution path. The API needs
     /// it so a connection whose credential comes from configuration is not
@@ -313,6 +322,7 @@ impl AppState {
             auth: None,
             sessions: None,
             api_tokens: None,
+            api_token_uses: Arc::default(),
             environments: None,
             environment_governance: None,
             policies: None,
@@ -341,6 +351,7 @@ impl AppState {
             identities: None,
             oauth_providers: Vec::new(),
             public_url: "http://localhost:8080".into(),
+            ui_url: None,
             credential_overrides: Arc::new(connections_config::CredentialOverrides::new()),
             snapshot_retention_days: DEFAULT_SNAPSHOT_RETENTION_DAYS,
             step_up: step_up::StepUpPolicy::Off,
@@ -660,9 +671,27 @@ impl AppState {
         self
     }
 
+    /// Where people open the web UI, when that is not the public URL (a
+    /// staging stack whose public hostname serves only `/webhooks/`). The
+    /// OAuth callback and the step-up confirmation link use it; webhook
+    /// URLs and forge status links stay on the public URL.
+    pub fn with_ui_url(mut self, ui_url: impl Into<String>) -> Self {
+        self.ui_url = Some(ui_url.into());
+        self
+    }
+
+    /// The UI's base URL without a trailing slash: [`ui_url`](Self::ui_url)
+    /// when set, else the public URL.
+    pub fn ui_url(&self) -> &str {
+        self.ui_url
+            .as_deref()
+            .unwrap_or(&self.public_url)
+            .trim_end_matches('/')
+    }
+
     /// Enable the browser OAuth login flow (ADR-0049): `GET /v1/auth/login`
     /// redirects to the provider; the callback lands on
-    /// `{public_url}/v1/auth/callback`.
+    /// `{ui_url}/v1/auth/callback` (see [`ui_url`](AppState::ui_url)).
     ///
     /// Auth only — the public URL comes from
     /// [`with_public_url`](AppState::with_public_url), because webhook
@@ -1355,6 +1384,10 @@ pub struct SecretMatrixRow {
     /// `"org"`. Lets a cell say *what* it would be overriding, so an edit reads
     /// as "override the repo default" rather than an unexplained write.
     pub inherited_from: std::collections::BTreeMap<String, String>,
+    /// For each `set` cell that hides a broader value, the scope it hides —
+    /// `"repo"` or `"org"`. The counterpart of `inherited_from`: a repo key that
+    /// the org also defines reads as overriding the org, not as a lone key.
+    pub overrides: std::collections::BTreeMap<String, String>,
 }
 
 /// `PUT …/secrets/matrix/silenced` body — and, as a query, the `DELETE`
@@ -1635,7 +1668,7 @@ impl From<DispatchError> for ApiError {
 /// Where a `fresh_login_required` refusal sends the browser: a fresh login
 /// that lands on passkey enrollment (ADR-0073 §2, §10). The refusal adds the
 /// caller's `provider` ([`AppState::fresh_login_url`]).
-pub const FRESH_LOGIN_URL: &str = "/v1/auth/login?next=/account/security%3Fenroll%3D1";
+pub const FRESH_LOGIN_URL: &str = "/v1/auth/login?next=/settings/security%3Fenroll%3D1";
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -3334,6 +3367,16 @@ pub struct MeResponse {
     /// bound to it, so `can_administer` can be true with nothing to administer
     /// yet.
     pub admin_orgs: Vec<String>,
+    /// Does the caller hold a global `Administer` role? Only such a caller
+    /// may add the first connection of an Org that does not exist yet, or
+    /// act on an unassigned connection (git-bug 19b0a45). Always `false` for
+    /// an API token.
+    pub global_admin: bool,
+    /// The orgs this principal may mint a personal API token in, sorted: every
+    /// org where they hold a role binding (org or project), and every org for
+    /// a bootstrap owner. The mint still checks the role in the exact scope.
+    /// Always empty for an API token, which may not mint.
+    pub token_mint_orgs: Vec<String>,
     /// The provider accounts this Principal can sign in with (ADR-0069).
     /// Empty when no identity store is wired (dev).
     pub identities: Vec<PrincipalIdentityDto>,
@@ -3352,7 +3395,9 @@ pub struct MeResponse {
 async fn me(State(st): State<AppState>, headers: HeaderMap) -> Result<Json<MeResponse>, ApiError> {
     let caller = authenticate(&st, &headers, Action::Read).await?;
     let admin_orgs = administrable_orgs(&st, &caller).await?;
-    let can_administer = caller.may_globally(Action::Administer) || !admin_orgs.is_empty();
+    let global_admin = caller.may_globally(Action::Administer);
+    let can_administer = global_admin || !admin_orgs.is_empty();
+    let token_mint_orgs = token_mint_orgs(&st, &caller).await;
     let identities = match st.identities.as_ref() {
         Some(store) => store
             .identities_of(&caller.principal.subject)
@@ -3380,42 +3425,53 @@ async fn me(State(st): State<AppState>, headers: HeaderMap) -> Result<Json<MeRes
             .collect(),
         can_administer,
         admin_orgs,
+        global_admin,
+        token_mint_orgs,
         identities,
     }))
 }
 
+/// The orgs `caller` may mint a personal API token in (see
+/// [`MeResponse::token_mint_orgs`]): the same sources the mint bounds a
+/// grant by, so the picker offers no org the mint refuses outright. A store
+/// failure only leaves the list shorter.
+async fn token_mint_orgs(st: &AppState, caller: &Caller) -> Vec<String> {
+    if caller.grant.is_some() {
+        return Vec::new();
+    }
+    let subject = &caller.principal.subject;
+    let mut orgs = match st.rbac.as_ref() {
+        Some(rbac) => rbac.orgs_of(subject).await.unwrap_or_default(),
+        None => Vec::new(),
+    };
+    if !token_owner_roles(st, subject).await.is_empty() {
+        if let Some(connections) = st.connections.as_ref() {
+            orgs.extend(connections.list_orgs().await.unwrap_or_default());
+        }
+    }
+    orgs.retain(|o| !o.is_empty());
+    orgs.sort();
+    orgs.dedup();
+    orgs
+}
+
 /// The orgs `principal` may administer (ADR-0060), sorted and deduplicated.
 ///
-/// An org exists only as the coordinate of a bound Project — there is no `orgs`
-/// table (ADR-0046) — so the candidate set is exactly the orgs of the registry's
-/// bindings. A globally-`Administer` role takes all of them; anyone else needs an
-/// `Admin`+ binding on that specific `Scope::Org`.
+/// The candidate set is the Org record (git-bug 19b0a45): the registry's
+/// [`list_orgs`](scarab_forge::ForgeConnectionStore::list_orgs). A
+/// globally-`Administer` role takes all of them; anyone else needs an
+/// `Admin`+ binding on that specific `Scope::Org` (an API token: one its
+/// scope covers).
 async fn administrable_orgs(st: &AppState, caller: &Caller) -> Result<Vec<String>, ApiError> {
     let Some(connections) = st.connections.as_ref() else {
         return Ok(Vec::new()); // no registry wired (dev): no orgs exist yet
     };
-    let mut orgs = std::collections::BTreeSet::new();
-    let conns = connections
-        .list_connections()
+    let orgs = connections
+        .list_orgs()
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    for conn in conns {
-        let repos = connections
-            .repos_of(&conn.id)
-            .await
-            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-        for repo in repos {
-            if let Some(resolved) = connections
-                .resolve(&repo)
-                .await
-                .map_err(|e| ApiError::BadRequest(e.to_string()))?
-            {
-                orgs.insert(resolved.org);
-            }
-        }
-    }
     if caller.may_globally(Action::Administer) {
-        return Ok(orgs.into_iter().collect());
+        return Ok(orgs);
     }
     let mut allowed = Vec::new();
     for org in orgs {
@@ -6782,6 +6838,222 @@ async fn ingest_event(
     }
 }
 
+/// The API base every GitHub App installation connection talks to.
+const GITHUB_API_BASE: &str = "https://api.github.com";
+
+/// Apply an installation delivery to the registry (ADR-0046: installing the
+/// App **is** registration), into the Org of the installation's account
+/// (git-bug 19b0a45).
+///
+/// The connection `github-install-<id>` records its installation id and the
+/// account's immutable id, so once it serves an Org its tokens are minted
+/// from that installation only. A connection that already serves an Org
+/// keeps it. An unassigned one takes the account's Org only when
+/// [`delivery_assign_refusal`] finds nothing against it: every repo already
+/// bound through it is the account's, and the Org is new or is already
+/// served by a GitHub connection of the same account id. Otherwise it is
+/// registered (or stays) **unassigned**, binds none of the delivery's
+/// repos, and waits for a global admin to assign it
+/// (`PUT /v1/connections/{id}/org`).
+async fn register_installation(
+    st: &AppState,
+    connections: &dyn scarab_forge::ForgeConnectionStore,
+    sync: &scarab_forge_github::InstallationSync,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    let registry = |e: scarab_forge::RegistryError| ApiError::Db(DbError::Other(e.to_string()));
+    let account = sync.account.trim();
+    if account.is_empty() {
+        return Err(ApiError::BadRequest(
+            "installation delivery carries no account login, so it has no org".into(),
+        ));
+    }
+    let conn_id = format!("github-install-{}", sync.installation_id);
+    let existing = connections
+        .get_connection(&conn_id)
+        .await
+        .map_err(registry)?;
+    let mut org = match &existing {
+        Some(conn) => {
+            if let Some(account_id) = sync.account_id {
+                connections
+                    .set_connection_account(&conn_id, account_id)
+                    .await
+                    .map_err(registry)?;
+            }
+            conn.org.clone()
+        }
+        None => {
+            connections
+                .put_connection(&scarab_forge::ForgeConnection {
+                    id: conn_id.clone(),
+                    kind: scarab_forge::ForgeKind::GitHub,
+                    base_url: GITHUB_API_BASE.into(),
+                    // The App credential is shared across installations; the
+                    // composition root registers it under this handle.
+                    credential_ref: "github-app".into(),
+                    org: None,
+                    installation_id: Some(sync.installation_id),
+                    account_id: sync.account_id,
+                })
+                .await
+                .map_err(registry)?;
+            None
+        }
+    };
+    if org.is_none() {
+        let account_id = sync.account_id;
+        let outcome = match org_name_problem(account) {
+            Some(problem) => Err(problem),
+            None => connections
+                .assign_connection_org(&conn_id, account, &|view| {
+                    delivery_assign_refusal(view, account, account_id)
+                })
+                .await
+                .map_err(registry)?,
+        };
+        match outcome {
+            Ok(assigned) => org = assigned.org,
+            Err(reason) => tracing::warn!(
+                connection = %conn_id,
+                account = %account,
+                reason = %reason,
+                "GitHub installation left unassigned; a global admin assigns it"
+            ),
+        }
+    }
+    // Unassigned: the repos wait for a global admin, so nothing is homed in
+    // an Org by name alone. Removals still apply.
+    let sync = if org.is_some() {
+        sync.clone()
+    } else {
+        scarab_forge_github::InstallationSync {
+            added: Vec::new(),
+            ..sync.clone()
+        }
+    };
+    let skipped =
+        scarab_forge_github::apply_installation_sync(connections, &conn_id, account, &sync)
+            .await
+            .map_err(registry)?;
+    for repo in &skipped {
+        tracing::warn!(
+            connection = %conn_id,
+            repo = %format!("{}/{}", repo.owner, repo.name),
+            "installation sync skipped a repo of another owner, or one bound through another \
+             org's connection"
+        );
+    }
+    // A new org gets the first-party libraries (ADR-0076 §5).
+    if sync.added.len() > skipped.len() {
+        libraries::offer_defaults_on_bind(st, account).await;
+    }
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "registered": {
+                "added": sync.added.len() - skipped.len(),
+                "removed": sync.removed.len(),
+                "skipped": skipped.len(),
+                "org": org,
+            },
+        })),
+    ))
+}
+
+/// Two connections reach the same forge: the same kind and API base URL.
+fn same_forge(a: &scarab_forge::ForgeConnection, b: &scarab_forge::ForgeConnection) -> bool {
+    a.kind == b.kind && a.base_url.trim_end_matches('/') == b.base_url.trim_end_matches('/')
+}
+
+/// The part of every Org assignment rule that is about the connection
+/// itself and the Org's other connections (git-bug 19b0a45):
+///
+/// * every repo already bound through it is owned by `org` and homed there:
+///   assigning a connection that holds another owner's Project would hand
+///   that Project to `org`'s admins;
+/// * no connection serving `org` reaches another forge or host: an account
+///   of the same name there is not known to be the same account.
+fn assign_base_refusal(view: &scarab_forge::OrgAssignView, org: &str) -> Option<String> {
+    let conn = &view.conn;
+    if let Some((repo, _)) = view
+        .bindings
+        .iter()
+        .find(|(repo, homed)| repo.owner != org || homed != org)
+    {
+        return Some(format!(
+            "`{}/{}` is bound through connection `{}` and is not `{org}`'s; unbind it or \
+             bind it through a connection of its own org first",
+            repo.owner, repo.name, conn.id
+        ));
+    }
+    if let Some(other) = view.servers.iter().find(|c| !same_forge(c, conn)) {
+        return Some(format!(
+            "org `{org}` has connection `{}` to {}, another forge or host than {}; an \
+             account of the same name there is not known to be the same account",
+            other.id, other.base_url, conn.base_url
+        ));
+    }
+    None
+}
+
+/// Why a global admin may **not** assign `view.conn` to `org`
+/// (`PUT /v1/connections/{id}/org`), or `None` when they may: the base rule
+/// ([`assign_base_refusal`]), and an Org that already exists must be served
+/// by at least one connection (its bindings through this one count). An
+/// Org whose connections are gone but whose secrets, members and policies
+/// remain is not joined by name.
+fn admin_assign_refusal(view: &scarab_forge::OrgAssignView, org: &str) -> Option<String> {
+    if let Some(reason) = assign_base_refusal(view, org) {
+        return Some(reason);
+    }
+    let served = !view.bindings.is_empty() || !view.servers.is_empty();
+    if !served && view.org_exists {
+        return Some(format!(
+            "org `{org}` exists but no connection serves it, so nothing shows that the \
+             account `{org}` on {} is the same account",
+            view.conn.base_url
+        ));
+    }
+    None
+}
+
+/// Why an installation delivery for account `org` (immutable id
+/// `account_id`) may **not** assign `view.conn` to the Org of that name, or
+/// `None` when it may: the base rule ([`assign_base_refusal`]), and an Org
+/// that already exists is joined only when a connection already serving it
+/// reaches the same forge with the same account id. A login can be renamed
+/// and registered again by someone else; the id cannot. So an Org served
+/// only by connections whose account id is unknown or different, by
+/// another forge, or by none (its secrets, members or policies remain) is
+/// not joined; the connection stays unassigned for a global admin. This
+/// connection's own bindings prove nothing: an old re-sync could have put
+/// them there.
+fn delivery_assign_refusal(
+    view: &scarab_forge::OrgAssignView,
+    org: &str,
+    account_id: Option<u64>,
+) -> Option<String> {
+    if let Some(reason) = assign_base_refusal(view, org) {
+        return Some(reason);
+    }
+    if !view.org_exists && view.servers.is_empty() {
+        return None;
+    }
+    let proven = account_id.is_some()
+        && view.servers.iter().any(|c| {
+            c.org.as_deref() == Some(org) && same_forge(c, &view.conn) && c.account_id == account_id
+        });
+    if proven {
+        return None;
+    }
+    Some(format!(
+        "org `{org}` exists and no connection serving it is to {} with the same account id \
+         ({}), so nothing shows that this account `{org}` is the one the org was made for",
+        view.conn.base_url,
+        account_id.map_or_else(|| "unknown".to_string(), |id| id.to_string())
+    ))
+}
+
 /// Inbound GitHub webhook ingest (ADR-0010, 0032, 0046): verify the HMAC
 /// signature with the GitHub secret, guard against replays by delivery id,
 /// auto-register installation events into the ForgeConnection registry
@@ -6827,36 +7099,7 @@ async fn github_webhook(
     // Installation lifecycle → registry auto-registration (ADR-0046).
     if let Some(sync) = scarab_forge_github::installation_sync(&delivery) {
         if let Some(connections) = st.connections.as_ref() {
-            let conn_id = format!("github-install-{}", sync.installation_id);
-            connections
-                .put_connection(&scarab_forge::ForgeConnection {
-                    id: conn_id.clone(),
-                    kind: scarab_forge::ForgeKind::GitHub,
-                    base_url: "https://api.github.com".into(),
-                    // The App credential is shared across installations; the
-                    // composition root registers it under this handle.
-                    credential_ref: "github-app".into(),
-                })
-                .await
-                .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?;
-            scarab_forge_github::apply_installation_sync(
-                connections.as_ref(),
-                &conn_id,
-                &sync.account,
-                &sync,
-            )
-            .await
-            .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?;
-            // A new org gets the first-party libraries (ADR-0076 §5).
-            if !sync.added.is_empty() {
-                libraries::offer_defaults_on_bind(&st, &sync.account).await;
-            }
-            return Ok((
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "registered": { "added": sync.added.len(), "removed": sync.removed.len() },
-                })),
-            ));
+            return register_installation(&st, connections.as_ref(), &sync).await;
         }
         return Ok((
             StatusCode::OK,
@@ -7083,7 +7326,44 @@ fn set_session_cookies(headers: &mut HeaderMap, session: &Session, csrf: &str) {
 /// link) returns to. The authorize redirect and the token exchange must carry
 /// it byte-for-byte alike (RFC 6749 §4.1.3), so both build it here.
 fn oauth_callback_url(st: &AppState) -> String {
-    format!("{}/v1/auth/callback", st.public_url.trim_end_matches('/'))
+    format!("{}/v1/auth/callback", st.ui_url())
+}
+
+/// Where a login started on another loopback name than the UI URL's must go
+/// first. The flow cookie is set on the host the login started on and the
+/// provider returns to the UI URL's host: a login begun at
+/// `http://127.0.0.1:8080` with the UI URL `http://localhost:8080` would
+/// reach the callback without its cookie and fail. So such a login is sent
+/// to the same path on the UI URL before anything is minted.
+///
+/// Only between loopback names, and only when the host NAMES differ: a
+/// proxy that rewrites `Host` to an internal name never gets a redirect
+/// (no loop), and the redirect's own request matches by name.
+fn loopback_login_detour(
+    st: &AppState,
+    headers: &HeaderMap,
+    uri: &axum::http::Uri,
+) -> Option<String> {
+    fn host_name(authority: &str) -> String {
+        let a = authority.trim().to_ascii_lowercase();
+        match a.strip_prefix('[') {
+            Some(v6) => format!("[{}]", v6.split(']').next().unwrap_or_default()),
+            None => a.split(':').next().unwrap_or_default().to_string(),
+        }
+    }
+    fn loopback(name: &str) -> bool {
+        matches!(name, "localhost" | "127.0.0.1" | "[::1]")
+    }
+    let ui = st.ui_url();
+    let ui_host = host_name(ui.split_once("://")?.1.split(['/', '?', '#']).next()?);
+    let req_host = host_name(headers.get(axum::http::header::HOST)?.to_str().ok()?);
+    if req_host == ui_host || !loopback(&req_host) || !loopback(&ui_host) {
+        return None;
+    }
+    Some(match uri.query() {
+        Some(q) => format!("{ui}/v1/auth/login?{q}"),
+        None => format!("{ui}/v1/auth/login"),
+    })
 }
 
 /// `GET /v1/auth/login` (ADR-0049): begin the browser OAuth flow — mint the
@@ -7093,11 +7373,20 @@ fn oauth_callback_url(st: &AppState) -> String {
 #[utoipa::path(get, path = "/v1/auth/login", summary = "Begin the browser OAuth flow (ADR-0049)", params(("provider" = Option<String>, Query, description = "login provider id (ADR-0069); default = the only, or the unqualified_ids, provider"), ("next" = Option<String>, Query, description = "a relative path to land on after the callback (ADR-0073); default `/`")), responses((status = 302, description = "redirect to the provider with a state cookie"), (status = 400, description = "unknown provider, several and none named, or a `next` that is not a relative path"), (status = 404, description = "OAuth not configured")))]
 async fn oauth_login_redirect(
     State(st): State<AppState>,
+    headers: HeaderMap,
+    uri: axum::http::Uri,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Response, ApiError> {
     let Some(provider) = st.oauth_provider(q.get("provider").map(String::as_str))? else {
         return Err(ApiError::NotFound);
     };
+    if let Some(location) = loopback_login_detour(&st, &headers, &uri) {
+        let mut resp = (StatusCode::FOUND, ()).into_response();
+        if let Ok(v) = axum::http::HeaderValue::from_str(&location) {
+            resp.headers_mut().insert(axum::http::header::LOCATION, v);
+        }
+        return Ok(resp);
+    }
     // The provider rides in the state cookie, so every provider shares the one
     // registered callback URL (ADR-0069).
     // `?next=` (ADR-0073 §10): where the browser lands after the callback —
@@ -7343,14 +7632,14 @@ async fn link_callback(
     let location = match store.link(&principal.subject, &identity, now).await {
         Ok(scarab_identity::LinkOutcome::Merged { from }) => {
             format!(
-                "/account?identity_linked={}&merged={}",
+                "/settings/profile?identity_linked={}&merged={}",
                 flow.provider,
                 query_escape(&from)
             )
         }
-        Ok(_) => format!("/account?identity_linked={}", flow.provider),
+        Ok(_) => format!("/settings/profile?identity_linked={}", flow.provider),
         Err(scarab_identity::IdentityError::Conflict(why)) => {
-            format!("/account?identity_link_error={}", query_escape(&why))
+            format!("/settings/profile?identity_link_error={}", query_escape(&why))
         }
         Err(e) => return Err(ApiError::BadRequest(e.to_string())),
     };
@@ -7605,6 +7894,7 @@ async fn put_binding(
         },
         role: parse_role(&req.role)?,
     };
+    note_org(&st, binding.scope.org()).await?;
     rbac.grant(&binding, scarab_identity::BindingOrigin::Native)
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
@@ -7891,6 +8181,24 @@ pub struct MintTokenRequest {
     pub expires_in_days: u32,
 }
 
+/// `POST /v1/me/tokens` body: [`MintTokenRequest`] plus the org, which the
+/// personal route cannot take from its path.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct MintOwnTokenRequest {
+    /// The org the token is scoped to (or the org of its project).
+    pub org: String,
+    /// Human label — what makes the token revocable in practice.
+    pub name: String,
+    /// Project within the org to scope the token to. Absent = the whole org.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// The **ceiling**: `viewer` | `member` | `admin` | `owner`, never more
+    /// than the caller holds in this scope.
+    pub role: String,
+    /// Lifetime in days, `1..=365`.
+    pub expires_in_days: u32,
+}
+
 /// The mint response — the **only** place the plaintext ever appears.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct MintedTokenDto {
@@ -7907,7 +8215,7 @@ pub struct MintedTokenDto {
 pub struct ApiTokenDto {
     pub id: String,
     pub name: String,
-    /// The principal whose live authority bounds this token.
+    /// The principal who holds the token and whose live authority bounds it.
     pub owner_subject: String,
     pub org: String,
     /// `None` for an org-scoped token.
@@ -7923,6 +8231,10 @@ pub struct ApiTokenDto {
     /// Unix-ms of the last request that presented it, written back at most once
     /// a minute. `None` means it has never been used.
     pub last_used_at: Option<i64>,
+    /// How many requests have presented it. Approximate: calls are counted in
+    /// memory and written in batches, so the count can lag by up to a minute,
+    /// and a server that stops loses the calls it had not written yet.
+    pub use_count: u64,
     /// Unix-ms revocation, or `None` while it is live.
     pub revoked_at: Option<i64>,
 }
@@ -7944,6 +8256,7 @@ impl From<scarab_identity::ApiToken> for ApiTokenDto {
             created_at: t.created_at,
             expires_at: t.expires_at,
             last_used_at: t.last_used_at,
+            use_count: t.use_count,
             revoked_at: t.revoked_at,
         }
     }
@@ -7951,18 +8264,19 @@ impl From<scarab_identity::ApiToken> for ApiTokenDto {
 
 const MS_PER_DAY: i64 = 24 * 60 * 60 * 1000;
 
-/// Mint an API token scoped to this org (or one of its projects). Administer on
-/// the scope the token targets. The plaintext is returned **once**, here.
+/// Mint a personal API token: owned by the caller, scoped to `org` (or one of
+/// its projects). Kept for clients built before `POST /v1/me/tokens`; it does
+/// exactly what that route does, with the org taken from the path.
 #[utoipa::path(
     post,
     path = "/v1/orgs/{org}/tokens",
     params(("org" = String, Path, description = "org the token is scoped to")),
     request_body = MintTokenRequest,
-    summary = "Mint an API token - the plaintext is returned ONCE (ADR-0049)",
+    summary = "Mint a personal API token in an org - the plaintext is returned ONCE (ADR-0049)",
     responses(
         (status = 201, body = MintedTokenDto),
         (status = 400, description = "bad role, name, or lifetime, or the role exceeds the minter's"),
-        (status = 403, description = "not an admin of the target scope, or the caller is itself a token"),
+        (status = 403, description = "the caller holds no role in the target scope, or is itself a token"),
         (status = 404, description = "API tokens not configured")
     )
 )]
@@ -7971,6 +8285,62 @@ async fn mint_api_token(
     headers: HeaderMap,
     Path(org): Path<String>,
     Json(req): Json<MintTokenRequest>,
+) -> Result<Response, ApiError> {
+    mint_personal_token(&st, &headers, org, req).await
+}
+
+/// Mint a personal API token: owned by the caller, scoped to one org or one
+/// project, with a role ceiling no higher than the caller holds there. The
+/// plaintext is returned **once**, here.
+#[utoipa::path(
+    post,
+    path = "/v1/me/tokens",
+    request_body = MintOwnTokenRequest,
+    summary = "Mint a personal API token - the plaintext is returned ONCE (ADR-0049)",
+    responses(
+        (status = 201, body = MintedTokenDto),
+        (status = 400, description = "bad role, name, or lifetime, or the role exceeds the minter's"),
+        (status = 403, description = "the caller holds no role in the target scope, or is itself a token"),
+        (status = 404, description = "API tokens not configured")
+    )
+)]
+async fn mint_own_api_token(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<MintOwnTokenRequest>,
+) -> Result<Response, ApiError> {
+    let MintOwnTokenRequest {
+        org,
+        name,
+        project,
+        role,
+        expires_in_days,
+    } = req;
+    if org.trim().is_empty() {
+        return Err(ApiError::BadRequest("token `org` must not be empty".into()));
+    }
+    mint_personal_token(
+        &st,
+        &headers,
+        org,
+        MintTokenRequest {
+            name,
+            project,
+            role,
+            expires_in_days,
+        },
+    )
+    .await
+}
+
+/// The one mint path behind both routes. Any human may mint a token for
+/// themselves, up to the role they hold in its scope; there is no separate
+/// "may issue tokens" permission yet (the org issuance policy is not built).
+async fn mint_personal_token(
+    st: &AppState,
+    headers: &HeaderMap,
+    org: String,
+    req: MintTokenRequest,
 ) -> Result<Response, ApiError> {
     let store = st.api_tokens.as_ref().ok_or(ApiError::NotFound)?.clone();
     let scope = match req.project.as_deref().filter(|p| !p.is_empty()) {
@@ -7981,18 +8351,13 @@ async fn mint_api_token(
         None => scarab_identity::Scope::Org(org.clone()),
     };
 
-    let caller = authenticate(&st, &headers, Action::Administer).await?;
+    let caller = authenticate(st, headers, Action::Write).await?;
     // A token may not mint tokens. Without this, "every token expires" is a
-    // story rather than a property: a token holding Administer could mint its
-    // own successor forever, and the expiry that makes this credential safe to
-    // hand to a machine would bound nothing at all. Issuance stays an act a
-    // human performs.
+    // story rather than a property: a token could mint its own successor
+    // forever, and the expiry that makes this credential safe to hand to a
+    // machine would bound nothing at all. Issuance stays an act a human
+    // performs.
     if caller.grant.is_some() {
-        return Err(ApiError::Forbidden);
-    }
-    if !caller.may_globally(Action::Administer)
-        && !caller.may(&st, Action::Administer, &scope).await?
-    {
         return Err(ApiError::Forbidden);
     }
 
@@ -8025,9 +8390,9 @@ async fn mint_api_token(
     let owner_view = Principal {
         subject: caller.principal.subject.clone(),
         display_name: None,
-        roles: token_owner_roles(&st, &caller.principal.subject).await,
+        roles: token_owner_roles(st, &caller.principal.subject).await,
     };
-    match live_role_in(&st, &owner_view, &scope).await? {
+    match live_role_in(st, &owner_view, &scope).await? {
         Some(held) if held >= role => {}
         Some(held) => {
             return Err(ApiError::BadRequest(format!(
@@ -8036,11 +8401,15 @@ async fn mint_api_token(
                 role_name(held)
             )))
         }
-        None => {
+        // Someone whose session snapshot administers everything (the C1
+        // bootstrap owner before any binding exists) is told how to fix it.
+        None if caller.may_globally(Action::Administer) => {
             return Err(ApiError::BadRequest(
                 "cannot mint a token here: you hold no role binding in this scope — grant yourself one on the org or project first (PUT /v1/orgs/{org}/bindings)".into(),
             ))
         }
+        // Everyone else holds nothing here, and that is a refusal.
+        None => return Err(ApiError::Forbidden),
     }
 
     let now = st.clock.now().await.0;
@@ -8062,8 +8431,10 @@ async fn mint_api_token(
         created_by: caller.principal.subject.clone(),
         created_at: now,
         last_used_at: None,
+        use_count: 0,
         revoked_at: None,
     };
+    note_org(st, token.scope.org()).await?;
     store
         .put(&token, &scarab_identity::api_token_hash(&plaintext))
         .await
@@ -8090,15 +8461,57 @@ fn random_token_secret() -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
-/// List the tokens issued within this org, org- and project-scoped alike.
-/// Administer on the Org. Records only — there is no plaintext to return.
+/// The order of the org's token list.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenSort {
+    /// Most recently used first; never-used tokens last.
+    #[default]
+    LastUsed,
+    /// Most calls first.
+    UseCount,
+    /// Newest first.
+    Created,
+}
+
+/// `GET /v1/orgs/{org}/tokens` query.
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct TokenListQuery {
+    /// `last_used` (default), `use_count` or `created`; each descending, ties
+    /// broken by newest first.
+    #[serde(default)]
+    pub sort: Option<TokenSort>,
+}
+
+/// Order `tokens` by `sort`, descending; ties go newest first, then by id, so
+/// the order is stable.
+fn sort_api_tokens(tokens: &mut [scarab_identity::ApiToken], sort: TokenSort) {
+    use std::cmp::Reverse;
+    tokens.sort_by(|a, b| {
+        let primary = match sort {
+            // `Option` orders `None` first, so reversed it puts never-used last.
+            TokenSort::LastUsed => Reverse(a.last_used_at).cmp(&Reverse(b.last_used_at)),
+            TokenSort::UseCount => b.use_count.cmp(&a.use_count),
+            TokenSort::Created => std::cmp::Ordering::Equal,
+        };
+        primary
+            .then(b.created_at.cmp(&a.created_at))
+            .then(a.id.cmp(&b.id))
+    });
+}
+
+/// List every token issued within this org, org- and project-scoped alike,
+/// whoever holds it. Administer on the Org. Records only — there is no
+/// plaintext to return.
 #[utoipa::path(
     get,
     path = "/v1/orgs/{org}/tokens",
-    params(("org" = String, Path, description = "org")),
+    params(("org" = String, Path, description = "org"), TokenListQuery),
     summary = "List the API tokens issued in an org (ADR-0049)",
     responses(
         (status = 200, body = [ApiTokenDto]),
+        (status = 400, description = "unknown `sort`"),
         (status = 403, description = "not an org admin"),
         (status = 404, description = "API tokens not configured")
     )
@@ -8107,15 +8520,111 @@ async fn list_api_tokens(
     State(st): State<AppState>,
     headers: HeaderMap,
     Path(org): Path<String>,
+    Query(q): Query<TokenListQuery>,
 ) -> Result<Json<Vec<ApiTokenDto>>, ApiError> {
     let store = st.api_tokens.as_ref().ok_or(ApiError::NotFound)?;
     let scope = scarab_identity::Scope::Org(org.clone());
     authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
-    let tokens = store
+    // This process's unwritten calls first, so the counts read here include
+    // them.
+    flush_api_token_uses(&st).await;
+    let mut tokens = store
         .list(&org)
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    sort_api_tokens(&mut tokens, q.sort.unwrap_or_default());
     Ok(Json(tokens.into_iter().map(ApiTokenDto::from).collect()))
+}
+
+/// The tokens the caller holds, in every org, newest first. A token caller
+/// sees only the ones inside its own scope.
+#[utoipa::path(
+    get,
+    path = "/v1/me/tokens",
+    summary = "List your own API tokens (ADR-0049)",
+    responses(
+        (status = 200, body = [ApiTokenDto]),
+        (status = 401, description = "not signed in"),
+        (status = 404, description = "API tokens not configured")
+    )
+)]
+async fn list_own_api_tokens(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<ApiTokenDto>>, ApiError> {
+    let store = st.api_tokens.as_ref().ok_or(ApiError::NotFound)?;
+    let caller = authenticate(&st, &headers, Action::Read).await?;
+    flush_api_token_uses(&st).await;
+    let tokens = store
+        .list_owned(&caller.principal.subject)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    Ok(Json(
+        tokens
+            .into_iter()
+            .filter(|t| caller_sees_own_token(&caller, t))
+            .map(ApiTokenDto::from)
+            .collect(),
+    ))
+}
+
+/// May `caller` see and revoke `token` through `/v1/me/tokens`? Only its
+/// owner, and when the caller is itself a token, only one inside that
+/// token's scope: a token for one project must not list its owner's tokens
+/// in other orgs.
+fn caller_sees_own_token(caller: &Caller, token: &scarab_identity::ApiToken) -> bool {
+    token.owner_subject == caller.principal.subject
+        && caller
+            .grant
+            .as_ref()
+            .is_none_or(|grant| grant.covers(&token.scope))
+}
+
+/// Revoke one of the caller's own tokens — permanent, and effective on the
+/// very next request that presents it. A signed-in person only: a token is
+/// refused.
+#[utoipa::path(
+    delete,
+    path = "/v1/me/tokens/{id}",
+    params(("id" = String, Path, description = "token id - NOT the token itself")),
+    summary = "Revoke one of your own API tokens (ADR-0049)",
+    responses(
+        (status = 204, description = "revoked"),
+        (status = 403, description = "the caller is an API token"),
+        (status = 404, description = "no such live token of yours")
+    )
+)]
+async fn revoke_own_api_token(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let store = st.api_tokens.as_ref().ok_or(ApiError::NotFound)?;
+    let caller = authenticate(&st, &headers, Action::Write).await?;
+    // A token may not revoke tokens here. This route checks ownership and
+    // nothing else, so a leaked read-only token could otherwise revoke every
+    // other token its owner holds, admin ones included. The org route asks
+    // for Administer on the org; a token that may do that can use it.
+    if caller.grant.is_some() {
+        return Err(ApiError::Forbidden);
+    }
+    // Someone else's token answers exactly as a missing one does, so the
+    // route says nothing about which ids exist.
+    let token = store
+        .by_id(&id)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?
+        .filter(|t| caller_sees_own_token(&caller, t))
+        .ok_or(ApiError::NotFound)?;
+    let now = st.clock.now().await.0;
+    match store
+        .revoke(&token.id, now)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?
+    {
+        true => Ok(StatusCode::NO_CONTENT),
+        false => Err(ApiError::NotFound),
+    }
 }
 
 /// Revoke an issued token — permanent, and effective on the very next request
@@ -8164,11 +8673,79 @@ async fn revoke_api_token(
     }
 }
 
-/// How coarsely a token's `last_used_at` is written back. Observability, not
-/// accounting: the question it answers is "is anyone still using this?", and one
-/// write per token per minute answers it without putting an UPDATE on the hot
-/// path of every request a busy CI robot makes.
+/// How coarsely a token's `last_used_at` and call count are written back.
+/// Observability, not accounting: the questions they answer are "is anyone
+/// still using this?" and "which tokens carry the load?", and one write per
+/// token per minute answers both without putting an UPDATE on the hot path of
+/// every request a busy CI robot makes.
 const API_TOKEN_TOUCH_INTERVAL_MS: i64 = 60_000;
+
+/// Calls by API token that this process has counted and not yet written
+/// (git-bug a4cb94f). Every authenticated token request adds one; the count
+/// reaches the store in batches: when the token's `last_used_at` is a minute
+/// old, when a token list is read, and from the server's one-minute flusher.
+#[derive(Debug, Default)]
+pub struct ApiTokenUses {
+    /// token id → (calls not yet written, unix-ms of the latest of them).
+    pending: std::sync::Mutex<std::collections::HashMap<String, (u64, i64)>>,
+}
+
+impl ApiTokenUses {
+    fn record(&self, id: &str, now_ms: i64) {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = pending.entry(id.to_string()).or_insert((0, now_ms));
+        entry.0 = entry.0.saturating_add(1);
+        entry.1 = entry.1.max(now_ms);
+    }
+
+    fn take(&self, id: &str) -> Option<(u64, i64)> {
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id)
+    }
+
+    fn drain(&self) -> Vec<(String, u64, i64)> {
+        std::mem::take(&mut *self.pending.lock().unwrap_or_else(|e| e.into_inner()))
+            .into_iter()
+            .map(|(id, (uses, last))| (id, uses, last))
+            .collect()
+    }
+}
+
+tokio::task_local! {
+    /// Whether this request's API token use has been counted. Set by
+    /// [`count_token_use_once`] around each routed request.
+    static TOKEN_USE_COUNTED: std::cell::Cell<bool>;
+}
+
+/// Run one routed request so that its API token is counted once, however
+/// many times it is authenticated. The step-up guard wraps every route in it.
+pub(crate) async fn count_token_use_once<F: std::future::Future>(request: F) -> F::Output {
+    TOKEN_USE_COUNTED
+        .scope(std::cell::Cell::new(false), request)
+        .await
+}
+
+/// Is this the first time the current request's token is counted? Outside
+/// [`count_token_use_once`] every authentication counts.
+fn first_token_use_of_request() -> bool {
+    TOKEN_USE_COUNTED
+        .try_with(|counted| !counted.replace(true))
+        .unwrap_or(true)
+}
+
+/// Write every call this process has counted and not yet stored. Best-effort:
+/// a failed write drops that batch, which only makes the count lower than it
+/// should be. The server binary calls this every minute and at shutdown.
+pub async fn flush_api_token_uses(st: &AppState) {
+    let Some(store) = st.api_tokens.as_ref() else {
+        return;
+    };
+    for (id, uses, last) in st.api_token_uses.drain() {
+        let _ = store.touch(&id, last, uses).await;
+    }
+}
 
 /// The authenticated caller of a request: who they are, plus — when the
 /// credential was an issued API token — the narrowing that token carries.
@@ -8421,12 +8998,20 @@ async fn authenticate_api_token(
         return Err(ApiError::Unauthorized);
     }
     // Observability, coarse and best-effort: a failure to record the use must
-    // never fail the request that was being observed.
-    if token
-        .last_used_at
-        .is_none_or(|prev| now - prev >= API_TOKEN_TOUCH_INTERVAL_MS)
-    {
-        let _ = store.touch(&token.id, now).await;
+    // never fail the request that was being observed. Every request is
+    // counted in memory, once even when it authenticates twice (the step-up
+    // guard and then the handler); the batch is written once the stored last
+    // use is a minute old (and by `flush_api_token_uses`).
+    if first_token_use_of_request() {
+        st.api_token_uses.record(&token.id, now);
+        if token
+            .last_used_at
+            .is_none_or(|prev| now - prev >= API_TOKEN_TOUCH_INTERVAL_MS)
+        {
+            if let Some((uses, last)) = st.api_token_uses.take(&token.id) {
+                let _ = store.touch(&token.id, last, uses).await;
+            }
+        }
     }
     let roles = token_owner_roles(st, &token.owner_subject).await;
     Ok(Caller {
@@ -9248,6 +9833,7 @@ async fn put_secret(
     if req.name.is_empty() {
         return Err(ApiError::BadRequest("name is required".into()));
     }
+    note_org(&st, &req.org).await?;
     let scope = secret_scope(req.org, req.repo, req.environment)?;
     secrets
         .put(
@@ -9528,6 +10114,7 @@ async fn secret_matrix(
         .map(|key| {
             let mut status = std::collections::BTreeMap::new();
             let mut inherited_from = std::collections::BTreeMap::new();
+            let mut overrides = std::collections::BTreeMap::new();
             for column in &columns {
                 // Where a value sits at *exactly* this column's scope.
                 let set_here = if column == REPO_DEFAULT_COLUMN {
@@ -9535,18 +10122,23 @@ async fn secret_matrix(
                 } else {
                     env_keys.get(column).is_some_and(|k| k.contains(&key))
                 };
-                // What it falls through to, nearest broader scope first.
-                let from = if set_here {
-                    None
-                } else if column != REPO_DEFAULT_COLUMN && repo_keys.contains(&key) {
+                // The nearest broader scope that also holds the key: what an
+                // unset cell falls through to, or what a set cell hides.
+                let broader = if column != REPO_DEFAULT_COLUMN && repo_keys.contains(&key) {
                     Some("repo")
                 } else if org_keys.contains(&key) {
                     Some("org")
                 } else {
                     None
                 };
+                let from = if set_here { None } else { broader };
                 let s = match (set_here, from) {
-                    (true, _) => "set",
+                    (true, _) => {
+                        if let Some(hidden) = broader {
+                            overrides.insert(column.clone(), hidden.to_string());
+                        }
+                        "set"
+                    }
                     (false, Some(origin)) => {
                         inherited_from.insert(column.clone(), origin.to_string());
                         "inherited"
@@ -9563,6 +10155,7 @@ async fn secret_matrix(
                 key,
                 status,
                 inherited_from,
+                overrides,
             }
         })
         .collect();
@@ -9661,6 +10254,9 @@ fn coverage_column(environment: &Option<String>) -> scarab_project::CoverageColu
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ConnectionDto {
     pub id: String,
+    /// The Org this connection serves (git-bug 19b0a45); `null` = unassigned,
+    /// visible to and editable by global admins only.
+    pub org: Option<String>,
     /// `github` | `forgejo`.
     pub kind: String,
     /// The API base URL the adapter talks to (GHES / a self-hosted Forgejo).
@@ -9717,6 +10313,10 @@ pub struct ConnectionProjectDto {
 /// can read back is a secret you have leaked.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateConnectionRequest {
+    /// The Org the connection serves (git-bug 19b0a45): the forge owner whose
+    /// repositories it binds. The caller must administer it; the first
+    /// connection of an Org that does not exist yet needs a global admin.
+    pub org: String,
     /// `forgejo`. GitHub is not creatable here — installing the App *is* its
     /// registration (ADR-0060 part C), so a create form for it could not work.
     pub kind: String,
@@ -9737,11 +10337,24 @@ pub struct CreatedConnectionDto {
     pub credential_ref: String,
 }
 
+/// `GET /v1/connections` query.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ListConnectionsQuery {
+    /// Only the connections serving this Org.
+    #[serde(default)]
+    pub org: Option<String>,
+}
+
 /// `POST /v1/connections/{id}/resync` body: what reconciliation changed.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ResyncResultDto {
     /// Repos the forge reports that Scarab did not have bound — now bound.
     pub bound: Vec<String>,
+    /// Repos the forge reports that were not bound (git-bug 19b0a45): owned
+    /// by another account than the connection's Org, already bound through
+    /// another connection that serves an Org, or reported to a connection
+    /// that serves no Org yet (it binds nothing until it is assigned).
+    pub skipped: Vec<String>,
     /// How many bindings the forge confirms. Reported rather than acted on:
     /// see the handler's note on why re-sync never unbinds.
     pub confirmed: usize,
@@ -9784,23 +10397,141 @@ fn refuse_reserved_secret_org(org: &str) -> Result<(), ApiError> {
     refuse_reserved_org(org, "hold secrets written through /v1/secrets")
 }
 
-/// The gate every `/v1/connections*` endpoint shares: `Administer` on the Org.
+/// The gate in front of every `/v1/connections*` endpoint: the caller must be
+/// able to administer *some* Org (or hold the global role). A caller who
+/// administers nothing is refused 403 here, before any connection is looked
+/// at; which connections it may then see or act on is decided per
+/// connection ([`authorize_connection`], git-bug 19b0a45).
 ///
-/// A connection spans every Project it serves, so administering it is an
-/// org-level act, not a per-repo one — and there is no org in the path (one
-/// implicit Org, ADR-0060), so the check is "may this caller administer *an*
-/// org?". A globally-`Administer` role passes outright; anyone else needs an
-/// `Admin`+ binding on some `Scope::Org`. On a virgin install no org exists yet
-/// (an org is the coordinate of a bound Project), so bootstrapping the first
-/// connection necessarily needs the global role — the same asymmetry `/v1/me`
-/// already reports via `can_administer` + an empty `admin_orgs`.
-async fn authorize_org_administer(st: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+/// Returns the caller and whether it administers globally. On a virgin
+/// install no Org exists yet, so bootstrapping the first connection needs
+/// the global role, the asymmetry `/v1/me` reports via `global_admin`.
+async fn connection_caller(st: &AppState, headers: &HeaderMap) -> Result<(Caller, bool), ApiError> {
     let caller = authenticate(st, headers, Action::Administer).await?;
-    if !caller.may_globally(Action::Administer) && administrable_orgs(st, &caller).await?.is_empty()
-    {
+    let global = caller.may_globally(Action::Administer);
+    if !global && administrable_orgs(st, &caller).await?.is_empty() {
         return Err(ApiError::Forbidden);
     }
+    Ok((caller, global))
+}
+
+/// May `caller` administer connection `conn`? `Administer` on the Org the
+/// connection serves; a global admin may act on any, and only a global
+/// admin on an unassigned one (`org` NULL).
+async fn may_administer_connection(
+    st: &AppState,
+    caller: &Caller,
+    global: bool,
+    conn: &scarab_forge::ForgeConnection,
+) -> Result<bool, ApiError> {
+    if global {
+        return Ok(true);
+    }
+    match &conn.org {
+        Some(org) => {
+            caller
+                .may(
+                    st,
+                    Action::Administer,
+                    &scarab_identity::Scope::Org(org.clone()),
+                )
+                .await
+        }
+        None => Ok(false),
+    }
+}
+
+/// Load connection `id` for a caller who must administer it (git-bug
+/// 19b0a45): `Administer` on the connection's Org, or the global role.
+///
+/// A connection of an Org the caller does not administer answers **404**,
+/// the same as one that does not exist: an org admin learns nothing about
+/// another Org's connections, not even that the id is taken.
+async fn authorize_connection(
+    st: &AppState,
+    headers: &HeaderMap,
+    id: &str,
+) -> Result<scarab_forge::ForgeConnection, ApiError> {
+    let (caller, global) = connection_caller(st, headers).await?;
+    let connections = st.connections.as_ref().ok_or(ApiError::NotFound)?;
+    let conn = connections
+        .get_connection(id)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?
+        .ok_or(ApiError::NotFound)?;
+    if !may_administer_connection(st, &caller, global, &conn).await? {
+        return Err(ApiError::NotFound);
+    }
+    Ok(conn)
+}
+
+/// First path segments of the web UI that an Org name would shadow:
+/// `/<org>/<repo>` is a Project's page, so an Org named like one of these
+/// could not reach its Projects (git-bug 19b0a45).
+pub const RESERVED_ORG_NAMES: &[&str] = &["settings", "orgs", "account", "security"];
+
+/// Why `org` cannot name an Org a connection serves, or `None` when it can
+/// (git-bug 19b0a45). One rule for the API and the `connections:` config.
+///
+/// Non-empty, at most 100 characters, no `/`, no whitespace and no control
+/// characters (it is a path segment of `/orgs/{org}/...` and must be able to
+/// match a forge owner), not `.` or `..` (a URL cannot address them), not
+/// `_`-prefixed (Scarab's own), and not one of [`RESERVED_ORG_NAMES`].
+pub fn org_name_problem(org: &str) -> Option<String> {
+    if org.is_empty() {
+        return Some("org is required: the org this connection serves".into());
+    }
+    if org.chars().count() > 100 {
+        return Some("an org name is at most 100 characters".into());
+    }
+    if org.contains('/') || org.chars().any(char::is_whitespace) {
+        return Some(format!(
+            "`{org}` is not an org name: it may not contain `/` or spaces"
+        ));
+    }
+    if org.chars().any(char::is_control) {
+        return Some("an org name may not contain control characters".into());
+    }
+    if org == "." || org == ".." {
+        return Some(format!(
+            "`{org}` is not an org name: a URL cannot address it"
+        ));
+    }
+    if is_reserved_org(org) {
+        return Some(format!(
+            "`{org}` is a reserved org name (`_`-prefixed names are Scarab's own)"
+        ));
+    }
+    if RESERVED_ORG_NAMES.contains(&org) {
+        return Some(format!(
+            "`{org}` is reserved: it is the first part of a Scarab web address, so its \
+             projects' pages could not be reached"
+        ));
+    }
+    None
+}
+
+/// Put `org` in the Org list before anything keyed by it is written
+/// (git-bug 19b0a45): every org-keyed write calls this first, so an Org
+/// exists as soon as anything in it does, and an installation of a
+/// same-named account does not join it by name. No registry wired = no Org
+/// list to keep.
+pub(crate) async fn note_org(st: &AppState, org: &str) -> Result<(), ApiError> {
+    if let Some(connections) = st.connections.as_ref() {
+        connections
+            .record_org(org)
+            .await
+            .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?;
+    }
     Ok(())
+}
+
+/// [`org_name_problem`] as a 400.
+fn validate_org_name(org: &str) -> Result<(), ApiError> {
+    match org_name_problem(org) {
+        Some(problem) => Err(ApiError::BadRequest(problem)),
+        None => Ok(()),
+    }
 }
 
 /// The forge adapter for **one connection** (ADR-0060) — the port the onboarding
@@ -9867,30 +10598,46 @@ fn is_loopback_callback(url: &str) -> bool {
 /// The registered forge connections and their health (ADR-0060 part C) — what
 /// the global Settings **Connections** section renders.
 ///
-/// Read-only, and `Administer` on the Org: a connection spans every Project it
-/// serves, so seeing the fleet is an org-level act, not a per-repo one. No
-/// credential material is ever returned — only whether the handle resolves.
+/// Read-only, and per Org (git-bug 19b0a45): the caller sees the connections
+/// of the Orgs it administers, and a global admin also sees the unassigned
+/// ones. No credential material is ever returned — only whether the handle
+/// resolves.
 #[utoipa::path(
     get,
     path = "/v1/connections",
     summary = "Registered forge connections + their bound Projects and health (ADR-0060)",
+    params(("org" = Option<String>, Query, description = "only the connections serving this org")),
     responses(
         (status = 200, body = [ConnectionDto]),
-        (status = 403, description = "requires Administer on the org"),
+        (status = 403, description = "requires Administer on an org"),
         (status = 404, description = "no connection registry wired")
     )
 )]
 async fn list_connections(
     State(st): State<AppState>,
     headers: HeaderMap,
+    Query(q): Query<ListConnectionsQuery>,
 ) -> Result<Json<Vec<ConnectionDto>>, ApiError> {
-    authorize_org_administer(&st, &headers).await?;
+    let (caller, global) = connection_caller(&st, &headers).await?;
     let connections = st.connections.as_ref().ok_or(ApiError::NotFound)?;
 
-    let conns = connections
+    // Only the connections of Orgs the caller administers (git-bug 19b0a45);
+    // an unassigned one only to a global admin.
+    let mut conns = Vec::new();
+    for conn in connections
         .list_connections()
         .await
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?
+    {
+        if let Some(org) = q.org.as_deref() {
+            if conn.org.as_deref() != Some(org) {
+                continue;
+            }
+        }
+        if may_administer_connection(&st, &caller, global, &conn).await? {
+            conns.push(conn);
+        }
+    }
     // Ownership (ADR-0060 part D), read once for the whole page: the durable
     // marker boot provisioning writes, not a guess.
     let config_owned: std::collections::BTreeSet<String> = connections
@@ -9957,6 +10704,7 @@ async fn list_connections(
         out.push(ConnectionDto {
             web_url: forge_web_host(conn.kind, &conn.base_url),
             id: conn.id,
+            org: conn.org,
             kind: conn.kind.as_str().to_string(),
             base_url: conn.base_url,
             credential_ref: conn.credential_ref,
@@ -10128,13 +10876,7 @@ async fn connection_preflight(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<ConnectionPreflightDto>, ApiError> {
-    authorize_org_administer(&st, &headers).await?;
-    let connections = st.connections.as_ref().ok_or(ApiError::NotFound)?;
-    let conn = connections
-        .get_connection(&id)
-        .await
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?
-        .ok_or(ApiError::NotFound)?;
+    let conn = authorize_connection(&st, &headers, &id).await?;
 
     let required: Vec<CapabilityRequirementDto> = scarab_forge::preflight::required(conn.kind)
         .iter()
@@ -10242,13 +10984,8 @@ async fn resync_connection(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<ResyncResultDto>, ApiError> {
-    authorize_org_administer(&st, &headers).await?;
+    let conn = authorize_connection(&st, &headers, &id).await?;
     let connections = st.connections.as_ref().ok_or(ApiError::NotFound)?;
-    let conn = connections
-        .get_connection(&id)
-        .await
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?
-        .ok_or(ApiError::NotFound)?;
     // Config-owned connections are read-only here (ADR-0060 part D): their repo
     // bindings are declared in the `connections:` block, so a binding written by
     // re-sync would live outside the source that is authoritative for them —
@@ -10286,10 +11023,20 @@ async fn resync_connection(
         .collect();
 
     let mut bound = Vec::new();
+    let mut skipped = Vec::new();
     let mut confirmed = 0usize;
     for repo in reported {
         if known.contains(&repo) {
             confirmed += 1;
+            continue;
+        }
+        // A connection binds only its own Org's repos (git-bug 19b0a45). A
+        // credential that reaches another owner's repo does not make it this
+        // Org's. An unassigned connection binds nothing: its repos would be
+        // homed by owner name alone, which is how an account joins a
+        // same-named Org of another forge. A global admin assigns it first.
+        if conn.org.as_deref() != Some(repo.owner.as_str()) {
+            skipped.push(format!("{}/{}", repo.owner, repo.name));
             continue;
         }
         // A forge account named like one of Scarab's own Orgs is never homed
@@ -10306,15 +11053,28 @@ async fn resync_connection(
         // Project name = repo name, org = repo owner — the same 1:1 mapping
         // `apply_installation_sync` uses, so a re-synced Project is
         // indistinguishable from a webhook-registered one.
-        connections
+        match connections
             .bind_repo(&id, &repo, &repo.owner, &repo.name)
             .await
-            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        {
+            Ok(()) => {}
+            // Bound through another connection that serves an Org: re-sync
+            // moves a repo only off an unassigned one (git-bug 19b0a45).
+            Err(scarab_forge::RegistryError::BoundElsewhere { .. }) => {
+                skipped.push(format!("{}/{}", repo.owner, repo.name));
+                continue;
+            }
+            Err(e) => return Err(ApiError::BadRequest(e.to_string())),
+        }
         // A new org gets the first-party libraries (ADR-0076 §5).
         libraries::offer_defaults_on_bind(&st, &repo.owner).await;
         bound.push(format!("{}/{}", repo.owner, repo.name));
     }
-    Ok(Json(ResyncResultDto { bound, confirmed }))
+    Ok(Json(ResyncResultDto {
+        bound,
+        skipped,
+        confirmed,
+    }))
 }
 
 /// Mint the ids for a manually-created connection: `(connection_id,
@@ -10355,10 +11115,10 @@ fn mint_connection_ids(kind: scarab_forge::ForgeKind) -> (String, String) {
     request_body = CreateConnectionRequest,
     responses(
         (status = 201, body = CreatedConnectionDto),
-        (status = 400, description = "unknown kind, non-creatable kind, or a malformed base URL"),
-        (status = 403, description = "requires Administer on the org"),
+        (status = 400, description = "unknown kind, non-creatable kind, a malformed base URL, or a missing or reserved org"),
+        (status = 403, description = "requires Administer on the org; a new org needs a global admin"),
         (status = 404, description = "no connection registry or secret store wired"),
-        (status = 409, description = "a connection to that forge and base URL already exists")
+        (status = 409, description = "the org already has a connection to that forge and base URL")
     )
 )]
 async fn create_connection(
@@ -10366,8 +11126,30 @@ async fn create_connection(
     headers: HeaderMap,
     Json(req): Json<CreateConnectionRequest>,
 ) -> Result<(StatusCode, Json<CreatedConnectionDto>), ApiError> {
-    authorize_org_administer(&st, &headers).await?;
+    let (caller, global) = connection_caller(&st, &headers).await?;
     let connections = st.connections.as_ref().ok_or(ApiError::NotFound)?;
+    // The Org it serves (git-bug 19b0a45). An admin of that Org may add it;
+    // an Org that does not exist yet needs a global admin, as the first
+    // connection of a fresh install always has.
+    let org = req.org.trim().to_string();
+    validate_org_name(&org)?;
+    if !global {
+        let exists = connections
+            .list_orgs()
+            .await
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?
+            .contains(&org);
+        let administers = caller
+            .may(
+                &st,
+                Action::Administer,
+                &scarab_identity::Scope::Org(org.clone()),
+            )
+            .await?;
+        if !exists || !administers {
+            return Err(ApiError::Forbidden);
+        }
+    }
     // No secret store means no write-through target. Refusing is the only honest
     // answer: a connection row with an unresolvable credential is a row that
     // cannot serve a single call.
@@ -10395,19 +11177,19 @@ async fn create_connection(
         return Err(ApiError::BadRequest("credential is required".into()));
     }
 
-    // One connection per (kind, base URL). Two rows for one host would each
-    // carry their own credential and each claim to serve it — an ambiguity with
-    // no upside, and the shape an accidental double-submit produces.
+    // One connection per (org, kind, base URL). Two rows for one host in one
+    // Org would each carry their own credential and each claim to serve it —
+    // an ambiguity with no upside, and the shape an accidental double-submit
+    // produces. Two Orgs on one host each have their own (git-bug 19b0a45).
     let existing = connections
         .list_connections()
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    if let Some(dupe) = existing
-        .iter()
-        .find(|c| c.kind == kind && c.base_url == base_url)
-    {
+    if let Some(dupe) = existing.iter().find(|c| {
+        c.kind == kind && c.base_url == base_url && c.org.as_deref() == Some(org.as_str())
+    }) {
         return Err(ApiError::Conflict(format!(
-            "connection `{}` already serves {base_url}",
+            "connection `{}` already serves {base_url} for org `{org}`",
             dupe.id
         )));
     }
@@ -10431,6 +11213,9 @@ async fn create_connection(
             kind,
             base_url,
             credential_ref: credential_ref.clone(),
+            org: Some(org),
+            installation_id: None,
+            account_id: None,
         })
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
@@ -10438,6 +11223,78 @@ async fn create_connection(
         StatusCode::CREATED,
         Json(CreatedConnectionDto { id, credential_ref }),
     ))
+}
+
+/// `PUT /v1/connections/{id}/org` body.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct AssignConnectionOrgRequest {
+    /// The Org the connection is to serve: the forge owner whose
+    /// repositories it binds.
+    pub org: String,
+}
+
+/// `PUT /v1/connections/{id}/org` result.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ConnectionOrgDto {
+    pub id: String,
+    pub org: String,
+}
+
+/// Assign a connection to an Org (git-bug 19b0a45): a global admin's
+/// explicit act, the only way an unassigned connection gets an Org other
+/// than its installation delivery.
+///
+/// Refused (409, with the reason) when a repo bound through the connection
+/// is not the Org's, or when an Org of that name already exists and is
+/// served by another forge or host, or by no connection at all: the same
+/// rule the installation delivery applies.
+#[utoipa::path(
+    put,
+    path = "/v1/connections/{id}/org",
+    summary = "Assign a forge connection to an org (global admins)",
+    params(("id" = String, Path, description = "connection id")),
+    request_body = AssignConnectionOrgRequest,
+    responses(
+        (status = 200, body = ConnectionOrgDto),
+        (status = 400, description = "not an org name: empty, longer than 100 characters, containing `/`, spaces or control characters, `.` or `..`, `_`-prefixed, or one of the reserved names `settings`, `orgs`, `account`, `security`"),
+        (status = 403, description = "requires a global admin"),
+        (status = 404, description = "no such connection, or no registry wired"),
+        (status = 409, description = "a bound repo is not the org's, the org is served by another forge or by no connection, or the connection is managed by configuration")
+    )
+)]
+async fn assign_connection_org(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<AssignConnectionOrgRequest>,
+) -> Result<Json<ConnectionOrgDto>, ApiError> {
+    let caller = authenticate(&st, &headers, Action::Administer).await?;
+    if !caller.may_globally(Action::Administer) {
+        return Err(ApiError::Forbidden);
+    }
+    let connections = st.connections.as_ref().ok_or(ApiError::NotFound)?;
+    let conn = connections
+        .get_connection(&id)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?
+        .ok_or(ApiError::NotFound)?;
+    deny_if_config_owned(connections, &id, "the org it serves").await?;
+    let org = req.org.trim().to_string();
+    validate_org_name(&org)?;
+    if conn.org.as_deref() != Some(org.as_str()) {
+        // Decided and written under the store's hold on the connection and
+        // the Org, so a concurrent assign or bind cannot slip in between.
+        let outcome = connections
+            .assign_connection_org(&id, &org, &|view| admin_assign_refusal(view, &org))
+            .await
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        if let Err(reason) = outcome {
+            return Err(ApiError::Conflict(format!(
+                "connection `{id}` cannot serve org `{org}`: {reason}"
+            )));
+        }
+    }
+    Ok(Json(ConnectionOrgDto { id, org }))
 }
 
 /// Query for [`delete_connection`]: the acknowledgement that removing a
@@ -10477,7 +11334,7 @@ pub struct DeleteConnectionQuery {
         (status = 204, description = "connection deleted"),
         (status = 403, description = "requires Administer on the org"),
         (status = 404, description = "no such connection, or no registry wired"),
-        (status = 409, description = "the connection still has bound repos (Projects)")
+        (status = 409, description = "the connection still has bound repos (Projects), or holds a repo of another org")
     )
 )]
 async fn delete_connection(
@@ -10486,19 +11343,40 @@ async fn delete_connection(
     Path(id): Path<String>,
     Query(q): Query<DeleteConnectionQuery>,
 ) -> Result<StatusCode, ApiError> {
-    authorize_org_administer(&st, &headers).await?;
+    let conn = authorize_connection(&st, &headers, &id).await?;
     let connections = st.connections.as_ref().ok_or(ApiError::NotFound)?;
     deny_if_config_owned(connections, &id, "the connection itself").await?;
-    let conn = connections
-        .get_connection(&id)
-        .await
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?
-        .ok_or(ApiError::NotFound)?;
 
     let bound = connections
         .repos_of(&id)
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    // A connection that serves an Org takes only that Org's Projects with
+    // it. A binding of another owner (left by an old re-sync, or by a
+    // config whose `org:` changed) is not its admins' to remove: unbinding
+    // it would delete another Org's Project (git-bug 19b0a45).
+    if let Some(org) = conn.org.as_deref() {
+        let mut foreign = Vec::new();
+        for repo in &bound {
+            let homed = connections
+                .resolve(repo)
+                .await
+                .map_err(|e| ApiError::BadRequest(e.to_string()))?
+                .map(|r| r.org);
+            if repo.owner != org || homed.as_deref().is_some_and(|h| h != org) {
+                foreign.push(format!("{}/{}", repo.owner, repo.name));
+            }
+        }
+        if !foreign.is_empty() {
+            return Err(ApiError::Conflict(format!(
+                "connection `{id}` serves org `{org}` but also holds {} of another org: {}. \
+                 It cannot be removed while it does. Move them first: their own org re-syncs \
+                 or adds them on its connection",
+                foreign.len(),
+                foreign.join(", ")
+            )));
+        }
+    }
     if !bound.is_empty() && !q.unbind_repos {
         let names: Vec<String> = bound
             .iter()
@@ -10516,7 +11394,8 @@ async fn delete_connection(
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
-    // The credential outlives the row only if something else still points at it.
+    // The credential outlives the row only if something else still points at
+    // it — any connection, in any Org: the App credential is shared.
     if let Some(secrets) = st.secrets.as_ref() {
         let still_referenced = connections
             .list_connections()
@@ -10606,13 +11485,8 @@ async fn available_repos(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<AvailableRepoDto>>, ApiError> {
-    authorize_org_administer(&st, &headers).await?;
+    let conn = authorize_connection(&st, &headers, &id).await?;
     let connections = st.connections.as_ref().ok_or(ApiError::NotFound)?;
-    let conn = connections
-        .get_connection(&id)
-        .await
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?
-        .ok_or(ApiError::NotFound)?;
     let forge = connection_adapter(&st, &conn).await?;
 
     let reported = match forge.list_accessible_repos().await {
@@ -10631,6 +11505,8 @@ async fn available_repos(
         .map_err(|e| ApiError::BadRequest(e.to_string()))?
         .into_iter()
         .collect();
+    // Listed as the forge reports them. Only those owned by the connection's
+    // Org can be bound through it (git-bug 19b0a45); the bind says so.
     let mut out: Vec<AvailableRepoDto> = reported
         .into_iter()
         .map(|repo| AvailableRepoDto {
@@ -10666,7 +11542,7 @@ async fn available_repos(
     request_body = BindRepoRequest,
     responses(
         (status = 200, body = BindRepoResultDto),
-        (status = 400, description = "missing owner/name"),
+        (status = 400, description = "missing owner/name, or a repo not owned by the connection's org"),
         (status = 403, description = "requires Administer on the org"),
         (status = 404, description = "no such connection, or no registry wired"),
         (status = 409, description = "the repo is already bound to a different connection")
@@ -10678,14 +11554,9 @@ async fn bind_repo(
     Path(id): Path<String>,
     Json(req): Json<BindRepoRequest>,
 ) -> Result<Json<BindRepoResultDto>, ApiError> {
-    authorize_org_administer(&st, &headers).await?;
+    let conn = authorize_connection(&st, &headers, &id).await?;
     let connections = st.connections.as_ref().ok_or(ApiError::NotFound)?;
     deny_if_config_owned(connections, &id, "its set of repositories").await?;
-    let conn = connections
-        .get_connection(&id)
-        .await
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?
-        .ok_or(ApiError::NotFound)?;
     let repo = scarab_forge::RepoRef {
         owner: req.owner.trim().to_string(),
         name: req.name.trim().to_string(),
@@ -10694,19 +11565,37 @@ async fn bind_repo(
         return Err(ApiError::BadRequest("owner and name are required".into()));
     }
     refuse_reserved_org(&repo.owner, "own a bound repo")?;
+    // A connection binds only its own Org's repos (git-bug 19b0a45): the
+    // Project lands in the Org named by the repo's owner, and that must be
+    // the Org whose admin is acting.
+    if let Some(org) = conn.org.as_deref() {
+        if repo.owner != org {
+            return Err(ApiError::BadRequest(format!(
+                "connection `{id}` serves org `{org}`; `{}/{}` is owned by `{}`, so it cannot \
+                 be bound through it",
+                repo.owner, repo.name, repo.owner
+            )));
+        }
+    }
 
     // `bind_repo` upserts, so re-binding a repo owned by ANOTHER connection would
     // silently re-home a live Project onto a different forge account. A v1
     // `RepoRef` is globally unique across connections (ADR-0046), so this is a
-    // conflict, not a move.
+    // conflict, not a move — except off a connection that does not serve
+    // the repo's owner (unassigned, or another Org's), the one move the
+    // registry allows (git-bug 19b0a45), which is how a repo leaves a legacy
+    // connection for its own Org's. The registry checks the same rule in the
+    // write itself, so a concurrent bind is refused too.
     if let Some(existing) = connections
         .resolve(&repo)
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?
     {
-        if existing.connection.id != id {
+        if existing.connection.id != id
+            && existing.connection.org.as_deref() == Some(repo.owner.as_str())
+        {
             return Err(ApiError::Conflict(format!(
-                "{}/{} is already bound to connection `{}`",
+                "{}/{} is already bound to connection `{}`; unbind it there first",
                 repo.owner, repo.name, existing.connection.id
             )));
         }
@@ -10718,7 +11607,10 @@ async fn bind_repo(
     connections
         .bind_repo(&id, &repo, &repo.owner, &repo.name)
         .await
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        .map_err(|e| match e {
+            scarab_forge::RegistryError::BoundElsewhere { .. } => ApiError::Conflict(e.to_string()),
+            e => ApiError::BadRequest(e.to_string()),
+        })?;
     // A new org gets the first-party libraries (ADR-0076 §5): claimed now,
     // installed in the background, so the bind never waits on a forge.
     libraries::offer_defaults_on_bind(&st, &repo.owner).await;
@@ -10794,7 +11686,7 @@ async fn register_repo_webhook(
     headers: HeaderMap,
     Path((id, owner, name)): Path<(String, String, String)>,
 ) -> Result<Json<BindRepoResultDto>, ApiError> {
-    authorize_org_administer(&st, &headers).await?;
+    let conn = authorize_connection(&st, &headers, &id).await?;
     let connections = st.connections.as_ref().ok_or(ApiError::NotFound)?;
     deny_if_config_owned(
         connections,
@@ -10802,11 +11694,6 @@ async fn register_repo_webhook(
         "webhook registration for its repositories",
     )
     .await?;
-    let conn = connections
-        .get_connection(&id)
-        .await
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?
-        .ok_or(ApiError::NotFound)?;
     let repo = scarab_forge::RepoRef { owner, name };
     let resolved = connections
         .resolve(&repo)
@@ -10856,10 +11743,16 @@ async fn unbind_repo(
     headers: HeaderMap,
     Path((id, owner, name)): Path<(String, String, String)>,
 ) -> Result<StatusCode, ApiError> {
-    authorize_org_administer(&st, &headers).await?;
+    let conn = authorize_connection(&st, &headers, &id).await?;
     let connections = st.connections.as_ref().ok_or(ApiError::NotFound)?;
     deny_if_config_owned(connections, &id, "its set of repositories").await?;
     let repo = scarab_forge::RepoRef { owner, name };
+    // A connection that serves an Org governs that Org's repos only
+    // (git-bug 19b0a45): another owner's binding on it is not its admin's
+    // to remove, whatever the row says.
+    if conn.org.as_deref().is_some_and(|org| org != repo.owner) {
+        return Err(ApiError::NotFound);
+    }
     // 404 rather than a silent 204 for a repo this connection does not govern: an
     // unbind aimed at the wrong connection must not read as "already gone".
     connections
@@ -11420,6 +12313,9 @@ impl utoipa::Modify for StepUpResponses {
         mint_api_token,
         list_api_tokens,
         revoke_api_token,
+        mint_own_api_token,
+        list_own_api_tokens,
+        revoke_own_api_token,
         list_bindings,
         put_binding,
         delete_binding,
@@ -11493,6 +12389,7 @@ impl utoipa::Modify for StepUpResponses {
         list_connections,
         create_connection,
         delete_connection,
+        assign_connection_org,
         resync_connection,
         connection_preflight,
         available_repos,
@@ -11594,6 +12491,8 @@ impl utoipa::Modify for StepUpResponses {
         ConnectionDto,
         ConnectionProjectDto,
         CreateConnectionRequest,
+        AssignConnectionOrgRequest,
+        ConnectionOrgDto,
         CreatedConnectionDto,
         AvailableRepoDto,
         BindRepoRequest,
@@ -11609,8 +12508,10 @@ impl utoipa::Modify for StepUpResponses {
         PrincipalDto,
         PrincipalIdentityDto,
         MintTokenRequest,
+        MintOwnTokenRequest,
         MintedTokenDto,
         ApiTokenDto,
+        TokenSort,
         org_environments::OrgEnvironmentDto,
         org_environments::PutOrgEnvironmentRequest,
         org_environments::EnvironmentEligibilityDto,

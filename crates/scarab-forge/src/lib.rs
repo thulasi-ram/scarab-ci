@@ -900,6 +900,41 @@ pub struct ForgeConnection {
     /// `SecretProvider`. Opaque here; resolved at use-time by the composition
     /// root. Never plaintext.
     pub credential_ref: String,
+    /// The Org this connection serves (git-bug 19b0a45): the forge owner or
+    /// account whose repositories it binds. Scarab's Org *is* that owner, so
+    /// every binding through the connection has `org == repo.owner ==
+    /// conn.org`. `None` = **unassigned**: a legacy row whose bindings span
+    /// several owners, or a GitHub installation not yet attached to an Org.
+    /// Only a global admin may act on an unassigned connection.
+    #[serde(default)]
+    pub org: Option<String>,
+    /// The GitHub App installation this connection is (`github-install-N`).
+    /// Once the connection serves an Org, tokens are minted from this
+    /// installation only and enumeration lists only its repositories. An
+    /// unassigned connection is not pinned to it: a legacy row may hold
+    /// repositories of other installations, and each repo's installation is
+    /// looked up. `None` for every other kind.
+    #[serde(default)]
+    pub installation_id: Option<u64>,
+    /// The forge's immutable id of the account the connection serves: a
+    /// GitHub installation's `account.id`, recorded from its installation
+    /// delivery (git-bug 19b0a45). A login can be renamed and then taken by
+    /// someone else; this id cannot, so an installation joins an existing
+    /// Org only when a connection already serving it has the same id.
+    /// `None` = not known (every other kind, and rows from before it was
+    /// recorded).
+    #[serde(default)]
+    pub account_id: Option<u64>,
+}
+
+/// The GitHub App installation id a `github-install-<id>` connection id
+/// names (git-bug 19b0a45); `None` for any other id.
+pub fn installation_id_of(connection_id: &str) -> Option<u64> {
+    let digits = connection_id.strip_prefix("github-install-")?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 /// Construct the vendor adapter that serves one [`ForgeConnection`] — the
@@ -934,6 +969,41 @@ pub struct ResolvedRepo {
     pub project: String,
 }
 
+/// What deciding a connection's Org rests on (git-bug 19b0a45), read by
+/// [`ForgeConnectionStore::assign_connection_org`] while it holds the
+/// connection and the Org, so nothing it reports changes before the write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrgAssignView {
+    /// The connection, as it stands.
+    pub conn: ForgeConnection,
+    /// Every repo bound through it, with the Org it is homed in.
+    pub bindings: Vec<(RepoRef, String)>,
+    /// The other connections that serve the Org: assigned to it, or
+    /// unassigned and holding a repo homed in it.
+    pub servers: Vec<ForgeConnection>,
+    /// The Org is in the Org list ([`ForgeConnectionStore::list_orgs`]).
+    pub org_exists: bool,
+}
+
+/// The Org list a store without an Org table can derive (git-bug 19b0a45):
+/// each connection's `org` and each binding's.
+pub async fn derived_orgs<S: ForgeConnectionStore + ?Sized>(
+    store: &S,
+) -> Result<std::collections::BTreeSet<String>, RegistryError> {
+    let mut orgs = std::collections::BTreeSet::new();
+    for conn in store.list_connections().await? {
+        if let Some(org) = &conn.org {
+            orgs.insert(org.clone());
+        }
+        for repo in store.repos_of(&conn.id).await? {
+            if let Some(resolved) = store.resolve(&repo).await? {
+                orgs.insert(resolved.org);
+            }
+        }
+    }
+    Ok(orgs)
+}
+
 /// Errors from the connection registry store.
 #[derive(Debug, thiserror::Error)]
 pub enum RegistryError {
@@ -945,6 +1015,31 @@ pub enum RegistryError {
          bound repo"
     )]
     ReservedOrg(String),
+    /// A connection serves one Org, and a repo bound through it must be owned
+    /// by that Org (`org == repo.owner == conn.org`, git-bug 19b0a45).
+    #[error(
+        "connection `{connection}` serves org `{connection_org}`; `{owner}/{name}` is owned by \
+         `{owner}` and cannot be bound through it"
+    )]
+    OrgMismatch {
+        connection: String,
+        connection_org: String,
+        owner: String,
+        name: String,
+    },
+    /// The repo is bound through another connection that serves an Org. A
+    /// bind moves a repo only off an unassigned connection (git-bug
+    /// 19b0a45), never off one that serves an Org, its own Org's included:
+    /// an admin unbinds it there first.
+    #[error(
+        "`{owner}/{name}` is already bound through connection `{connection}`; a repository \
+         moves only off a connection that does not serve its owner's org"
+    )]
+    BoundElsewhere {
+        owner: String,
+        name: String,
+        connection: String,
+    },
 }
 
 /// Org names Scarab keeps for itself: every `_`-prefixed name. Its own
@@ -990,12 +1085,38 @@ pub trait ForgeConnectionStore: Send + Sync {
         if is_reserved_org(org) {
             return Err(RegistryError::ReservedOrg(org.to_string()));
         }
+        // An assigned connection binds only its own Org's repos, into that
+        // Org. An unassigned one (legacy, global admins only) is not checked.
+        if let Some(conn) = self.get_connection(connection_id).await? {
+            if let Some(conn_org) = conn.org {
+                if repo.owner != conn_org || org != conn_org {
+                    return Err(RegistryError::OrgMismatch {
+                        connection: connection_id.to_string(),
+                        connection_org: conn_org,
+                        owner: repo.owner.clone(),
+                        name: repo.name.clone(),
+                    });
+                }
+            }
+        }
         self.upsert_repo_binding(connection_id, repo, org, project)
             .await
     }
 
     /// The adapter's raw upsert behind [`bind_repo`](Self::bind_repo). Call
     /// `bind_repo`, never this.
+    ///
+    /// Re-binding a repo bound through another connection moves it only when
+    /// that connection does not serve the repo's owner (it is unassigned, or
+    /// serves another Org and holds the repo by mistake); otherwise it
+    /// answers [`BoundElsewhere`](RegistryError::BoundElsewhere) and changes
+    /// nothing. When `connection_id` serves an Org, a repo of another owner
+    /// is refused ([`OrgMismatch`](RegistryError::OrgMismatch)). The checks
+    /// and the write are one step, so two concurrent binds of an unbound repo
+    /// cannot both win, and a bind cannot race an
+    /// [`assign_connection_org`](Self::assign_connection_org).
+    /// An implementation also records `org` (and a connection's `org`) in its
+    /// Org list ([`list_orgs`](Self::list_orgs)).
     async fn upsert_repo_binding(
         &self,
         connection_id: &str,
@@ -1051,6 +1172,117 @@ pub trait ForgeConnectionStore: Send + Sync {
         _owned: bool,
     ) -> Result<(), RegistryError> {
         Ok(())
+    }
+
+    /// Every Org Scarab knows of, sorted (git-bug 19b0a45): the Org record
+    /// that `/v1/me` and the connection routes authorize against.
+    ///
+    /// The default derives it from the registry (each connection's `org` and
+    /// each binding's), which is what a store without an Org table can say.
+    /// Postgres keeps an `orgs` table, so an Org outlives its last binding.
+    async fn list_orgs(&self) -> Result<Vec<String>, RegistryError> {
+        Ok(derived_orgs(self).await?.into_iter().collect())
+    }
+
+    /// Put `org` in the Org list (git-bug 19b0a45), before anything keyed by
+    /// it is first written: a role binding, a secret, an Environment, a
+    /// Policy, a Plugin or a library, an API token. An Org then exists as
+    /// soon as anything in it does, so an installation of a same-named
+    /// account cannot join it by name. A reserved (`_`-prefixed) or empty
+    /// name is ignored. Idempotent.
+    ///
+    /// Defaults to a no-op: a store without an Org table derives its list.
+    async fn record_org(&self, _org: &str) -> Result<(), RegistryError> {
+        Ok(())
+    }
+
+    /// Record the forge's account id on connection `id` (an installation
+    /// delivery carries it), leaving its other fields alone. No-op for a
+    /// missing connection.
+    async fn set_connection_account(&self, id: &str, account_id: u64) -> Result<(), RegistryError> {
+        if let Some(conn) = self.get_connection(id).await? {
+            self.put_connection(&ForgeConnection {
+                account_id: Some(account_id),
+                ..conn
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Assign connection `id` to Org `org` if `decide` finds no reason
+    /// against it (git-bug 19b0a45). `decide` is asked about an
+    /// [`OrgAssignView`] read while the store holds the connection and the
+    /// Org, and the write happens under the same hold: two assigns to one
+    /// Org, or an assign and a bind through the connection or into the Org,
+    /// run one after the other, so a check cannot pass against a state that
+    /// is gone by the time of the write.
+    ///
+    /// `Ok(Ok(conn))` = assigned (`conn` as written); `Ok(Err(reason))` =
+    /// refused, nothing changed. A missing connection is a store error.
+    ///
+    /// The default reads and writes without holding anything, which is
+    /// enough for a single-process store; Postgres overrides it.
+    async fn assign_connection_org(
+        &self,
+        id: &str,
+        org: &str,
+        decide: &(dyn for<'v> Fn(&'v OrgAssignView) -> Option<String> + Send + Sync),
+    ) -> Result<Result<ForgeConnection, String>, RegistryError> {
+        let conn = self
+            .get_connection(id)
+            .await?
+            .ok_or_else(|| RegistryError::Store(format!("no connection `{id}`")))?;
+        let mut bindings = Vec::new();
+        for repo in self.repos_of(id).await? {
+            let homed = self
+                .resolve(&repo)
+                .await?
+                .map(|r| r.org)
+                .unwrap_or_else(|| repo.owner.clone());
+            bindings.push((repo, homed));
+        }
+        let mut servers = Vec::new();
+        for c in self.list_connections().await? {
+            if c.id == id {
+                continue;
+            }
+            let serves = match c.org.as_deref() {
+                Some(o) => o == org,
+                None => {
+                    let mut homed_here = false;
+                    for repo in self.repos_of(&c.id).await? {
+                        if let Some(r) = self.resolve(&repo).await? {
+                            if r.org == org && r.connection.id == c.id {
+                                homed_here = true;
+                                break;
+                            }
+                        }
+                    }
+                    homed_here
+                }
+            };
+            if serves {
+                servers.push(c);
+            }
+        }
+        let org_exists = self.list_orgs().await?.iter().any(|o| o == org);
+        let view = OrgAssignView {
+            conn,
+            bindings,
+            servers,
+            org_exists,
+        };
+        if let Some(reason) = decide(&view) {
+            return Ok(Err(reason));
+        }
+        let assigned = ForgeConnection {
+            org: Some(org.to_string()),
+            ..view.conn
+        };
+        self.put_connection(&assigned).await?;
+        self.record_org(org).await?;
+        Ok(Ok(assigned))
     }
 
     /// The ids of connections currently owned by configuration (ADR-0060 part D)

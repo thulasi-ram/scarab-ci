@@ -1,11 +1,11 @@
-// The signed-in identity (ADR-0049): an avatar showing initials, opening a
+// The signed-in identity: an avatar showing initials, opening a
 // dropdown with the principal's name, subject, and role, plus sign-out. Driven
 // by the real `GET /v1/me` — no more hardcoded placeholder.
 import { createSignal, onCleanup, onMount, Show } from "solid-js";
 import { A } from "@solidjs/router";
 import Icon from "./Icon";
 import { logout } from "../api/client";
-import { canAdminister, me } from "../session";
+import { me } from "../session";
 import { theme, toggleTheme } from "../theme";
 
 /** Initials from a display name ("Thulasi Ram" → "TR") or subject ("t.ram" → "T"). */
@@ -65,31 +65,19 @@ export default function UserMenu() {
                 <span class="um-role">{r}</span>
               ))}
             </div>
-            {/* Per-account controls, moved off the top bar. Settings stays
-                hidden outright from non-admins (ADR-0060): nothing in there is
-                actionable or informative without `Administer`. */}
-            {/* Everyone's own sign-in accounts (ADR-0069): link another
-                provider, unlink one. Not admin-gated — it is about you. */}
+            {/* Settings (git-bug 734ffa1): one entry for everyone. A
+                non-admin lands on their own account; an admin on their
+                first org's settings, with their account a click away in the
+                same sidebar. */}
             <A
-              href="/account"
+              href="/settings"
               class="um-item um-link"
               role="menuitem"
               onClick={() => setOpen(false)}
             >
-              <Icon icon="user" size={14} />
-              Account
+              <Icon icon="settings" size={14} />
+              Settings
             </A>
-            <Show when={canAdminister()}>
-              <A
-                href="/settings"
-                class="um-item um-link"
-                role="menuitem"
-                onClick={() => setOpen(false)}
-              >
-                <Icon icon="settings" size={14} />
-                Settings
-              </A>
-            </Show>
             {/* Says what the click DOES, not what the theme currently is — the
                 top-bar toggle it replaces could lean on a sun/moon crossfade
                 to carry that, and a text row cannot. Leaves the menu open, so

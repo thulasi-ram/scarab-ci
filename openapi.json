@@ -225,8 +225,19 @@
           "Forge Connections"
         ],
         "summary": "Registered forge connections + their bound Projects and health (ADR-0060)",
-        "description": "Read-only, and `Administer` on the Org: a connection spans every Project it\nserves, so seeing the fleet is an org-level act, not a per-repo one. No\ncredential material is ever returned — only whether the handle resolves.",
+        "description": "Read-only, and per Org (git-bug 19b0a45): the caller sees the connections\nof the Orgs it administers, and a global admin also sees the unassigned\nones. No credential material is ever returned — only whether the handle\nresolves.",
         "operationId": "list_connections",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "query",
+            "description": "only the connections serving this org",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "",
@@ -242,7 +253,7 @@
             }
           },
           "403": {
-            "description": "requires Administer on the org"
+            "description": "requires Administer on an org"
           },
           "404": {
             "description": "no connection registry wired"
@@ -286,10 +297,10 @@
             }
           },
           "400": {
-            "description": "unknown kind, non-creatable kind, or a malformed base URL"
+            "description": "unknown kind, non-creatable kind, a malformed base URL, or a missing or reserved org"
           },
           "403": {
-            "description": "requires Administer on the org — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "description": "requires Administer on the org; a new org needs a global admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
             "content": {
               "application/json": {
                 "schema": {
@@ -302,7 +313,7 @@
             "description": "no connection registry or secret store wired"
           },
           "409": {
-            "description": "a connection to that forge and base URL already exists"
+            "description": "the org already has a connection to that forge and base URL"
           },
           "429": {
             "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
@@ -364,7 +375,7 @@
             "description": "no such connection, or no registry wired"
           },
           "409": {
-            "description": "the connection still has bound repos (Projects)"
+            "description": "the connection still has bound repos (Projects), or holds a repo of another org"
           },
           "429": {
             "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
@@ -421,6 +432,79 @@
           },
           "501": {
             "description": "this forge adapter cannot enumerate repos"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/connections/{id}/org": {
+      "put": {
+        "tags": [
+          "Forge Connections"
+        ],
+        "summary": "Assign a forge connection to an org (global admins)",
+        "description": "Refused (409, with the reason) when a repo bound through the connection\nis not the Org's, or when an Org of that name already exists and is\nserved by another forge or host, or by no connection at all: the same\nrule the installation delivery applies.",
+        "operationId": "assign_connection_org",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "connection id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AssignConnectionOrgRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectionOrgDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "not an org name: empty, longer than 100 characters, containing `/`, spaces or control characters, `.` or `..`, `_`-prefixed, or one of the reserved names `settings`, `orgs`, `account`, `security`"
+          },
+          "403": {
+            "description": "requires a global admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such connection, or no registry wired"
+          },
+          "409": {
+            "description": "a bound repo is not the org's, the org is served by another forge or by no connection, or the connection is managed by configuration"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
           }
         },
         "security": [
@@ -521,7 +605,7 @@
             }
           },
           "400": {
-            "description": "missing owner/name"
+            "description": "missing owner/name, or a repo not owned by the connection's org"
           },
           "403": {
             "description": "requires Administer on the org — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
@@ -1079,9 +1163,47 @@
             }
           },
           {
+            "name": "target",
+            "in": "query",
+            "description": "only events whose target contains this text (ignoring case)",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "description": "only events at or after this time (unix ms)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "description": "only events before this time (unix ms)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "the previous page's next_cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
             "name": "before",
             "in": "query",
-            "description": "only events with seq below this (paging)",
+            "description": "only events with seq below this (paging; not with cursor)",
             "required": false,
             "schema": {
               "type": "integer",
@@ -1110,6 +1232,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "a cursor this server did not issue, or both cursor and before"
           },
           "401": {
             "description": "not signed in"
@@ -1202,6 +1327,139 @@
           },
           "404": {
             "description": "step-up is off"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/me/tokens": {
+      "get": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "List your own API tokens (ADR-0049)",
+        "operationId": "list_own_api_tokens",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ApiTokenDto"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "not signed in"
+          },
+          "404": {
+            "description": "API tokens not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Mint a personal API token - the plaintext is returned ONCE (ADR-0049)",
+        "operationId": "mint_own_api_token",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MintOwnTokenRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MintedTokenDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "bad role, name, or lifetime, or the role exceeds the minter's"
+          },
+          "403": {
+            "description": "the caller holds no role in the target scope, or is itself a token — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "API tokens not configured"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/me/tokens/{id}": {
+      "delete": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Revoke one of your own API tokens (ADR-0049)",
+        "operationId": "revoke_own_api_token",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "token id - NOT the token itself",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "revoked"
+          },
+          "403": {
+            "description": "the caller is an API token"
+          },
+          "404": {
+            "description": "no such live token of yours"
           }
         },
         "security": [
@@ -4946,9 +5204,56 @@
             }
           },
           {
+            "name": "actor",
+            "in": "query",
+            "description": "only events about this subject",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "target",
+            "in": "query",
+            "description": "only events whose target contains this text (ignoring case); events bound to the Org only",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "description": "only events at or after this time (unix ms)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "description": "only events before this time (unix ms)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "the previous page's next_cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
             "name": "before",
             "in": "query",
-            "description": "only events with seq below this (paging)",
+            "description": "only events with seq below this (paging; not with cursor)",
             "required": false,
             "schema": {
               "type": "integer",
@@ -4977,6 +5282,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "a cursor this server did not issue, or both cursor and before"
           },
           "401": {
             "description": "not signed in"
@@ -5057,6 +5365,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "sort",
+            "in": "query",
+            "description": "`last_used` (default), `use_count` or `created`; each descending, ties\nbroken by newest first.",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/TokenSort"
+            }
           }
         ],
         "responses": {
@@ -5072,6 +5389,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "unknown `sort`"
           },
           "403": {
             "description": "not an org admin"
@@ -5093,7 +5413,7 @@
         "tags": [
           "Auth & Identity"
         ],
-        "summary": "Mint an API token - the plaintext is returned ONCE (ADR-0049)",
+        "summary": "Mint a personal API token in an org - the plaintext is returned ONCE (ADR-0049)",
         "operationId": "mint_api_token",
         "parameters": [
           {
@@ -5131,7 +5451,7 @@
             "description": "bad role, name, or lifetime, or the role exceeds the minter's"
           },
           "403": {
-            "description": "not an admin of the target scope, or the caller is itself a token — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "description": "the caller holds no role in the target scope, or is itself a token — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
             "content": {
               "application/json": {
                 "schema": {
@@ -7701,9 +8021,56 @@
             }
           },
           {
+            "name": "actor",
+            "in": "query",
+            "description": "only events about this subject",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "target",
+            "in": "query",
+            "description": "only events whose target contains this text (ignoring case)",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "description": "only events at or after this time (unix ms)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "description": "only events before this time (unix ms)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "the previous page's next_cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
             "name": "before",
             "in": "query",
-            "description": "only events with seq below this (paging)",
+            "description": "only events with seq below this (paging; not with cursor)",
             "required": false,
             "schema": {
               "type": "integer",
@@ -7732,6 +8099,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "a cursor this server did not issue, or both cursor and before"
           },
           "401": {
             "description": "not signed in"
@@ -7966,7 +8336,8 @@
           "role",
           "created_by",
           "created_at",
-          "expires_at"
+          "expires_at",
+          "use_count"
         ],
         "properties": {
           "created_at": {
@@ -8001,7 +8372,7 @@
           },
           "owner_subject": {
             "type": "string",
-            "description": "The principal whose live authority bounds this token."
+            "description": "The principal who holds the token and whose live authority bounds it."
           },
           "project": {
             "type": [
@@ -8021,6 +8392,12 @@
           "role": {
             "type": "string",
             "description": "The granted ceiling, not the effective role — what the token can do\ndepends on what its owner holds at the moment of each request."
+          },
+          "use_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many requests have presented it. Approximate: calls are counted in\nmemory and written in batches, so the count can lag by up to a minute,\nand a server that stops loses the calls it had not written yet.",
+            "minimum": 0
           }
         }
       },
@@ -8059,6 +8436,19 @@
           },
           "succeeded": {
             "type": "boolean"
+          }
+        }
+      },
+      "AssignConnectionOrgRequest": {
+        "type": "object",
+        "description": "`PUT /v1/connections/{id}/org` body.",
+        "required": [
+          "org"
+        ],
+        "properties": {
+          "org": {
+            "type": "string",
+            "description": "The Org the connection is to serve: the forge owner whose\nrepositories it binds."
           }
         }
       },
@@ -8463,6 +8853,13 @@
             "type": "boolean",
             "description": "Is this connection managed declaratively (config-owned) and therefore\nread-only here (ADR-0060 part D)? A connection has exactly one owner —\nthe `connections:` config or the database — and this says which, so the\nUI never offers an edit the next boot would silently revert."
           },
+          "org": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The Org this connection serves (git-bug 19b0a45); `null` = unassigned,\nvisible to and editable by global admins only."
+          },
           "projects": {
             "type": "array",
             "items": {
@@ -8481,6 +8878,22 @@
           "web_url": {
             "type": "string",
             "description": "The forge's own web host, for deep links out of the UI."
+          }
+        }
+      },
+      "ConnectionOrgDto": {
+        "type": "object",
+        "description": "`PUT /v1/connections/{id}/org` result.",
+        "required": [
+          "id",
+          "org"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "org": {
+            "type": "string"
           }
         }
       },
@@ -8625,6 +9038,7 @@
         "type": "object",
         "description": "`POST /v1/connections` body (ADR-0060 part D, manual path): the forge to\nconnect and the credential to reach it with.\n\n`credential` is **write-only** — it is written through to `SecretProvider`\nunder a server-generated handle and never appears in any response. There is\ndeliberately no \"update the credential\" field on the read DTO: a secret you\ncan read back is a secret you have leaked.",
         "required": [
+          "org",
           "kind",
           "base_url",
           "credential"
@@ -8641,6 +9055,10 @@
           "kind": {
             "type": "string",
             "description": "`forgejo`. GitHub is not creatable here — installing the App *is* its\nregistration (ADR-0060 part C), so a create form for it could not work."
+          },
+          "org": {
+            "type": "string",
+            "description": "The Org the connection serves (git-bug 19b0a45): the forge owner whose\nrepositories it binds. The caller must administer it; the first\nconnection of an Org that does not exist yet needs a global admin."
           }
         }
       },
@@ -9678,6 +10096,8 @@
           "roles",
           "can_administer",
           "admin_orgs",
+          "global_admin",
+          "token_mint_orgs",
           "identities"
         ],
         "properties": {
@@ -9699,6 +10119,10 @@
             ],
             "description": "Human display name, when the identity provides one."
           },
+          "global_admin": {
+            "type": "boolean",
+            "description": "Does the caller hold a global `Administer` role? Only such a caller\nmay add the first connection of an Org that does not exist yet, or\nact on an unassigned connection (git-bug 19b0a45). Always `false` for\nan API token."
+          },
           "identities": {
             "type": "array",
             "items": {
@@ -9716,6 +10140,13 @@
           "subject": {
             "type": "string",
             "description": "Stable, forge-agnostic identity subject."
+          },
+          "token_mint_orgs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The orgs this principal may mint a personal API token in, sorted: every\norg where they hold a role binding (org or project), and every org for\na bootstrap owner. The mint still checks the role in the exact scope.\nAlways empty for an API token, which may not mint."
           }
         }
       },
@@ -9784,6 +10215,43 @@
             ],
             "format": "int64",
             "description": "This browser session's open window, if any (unix ms)."
+          }
+        }
+      },
+      "MintOwnTokenRequest": {
+        "type": "object",
+        "description": "`POST /v1/me/tokens` body: [`MintTokenRequest`] plus the org, which the\npersonal route cannot take from its path.",
+        "required": [
+          "org",
+          "name",
+          "role",
+          "expires_in_days"
+        ],
+        "properties": {
+          "expires_in_days": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Lifetime in days, `1..=365`.",
+            "minimum": 0
+          },
+          "name": {
+            "type": "string",
+            "description": "Human label — what makes the token revocable in practice."
+          },
+          "org": {
+            "type": "string",
+            "description": "The org the token is scoped to (or the org of its project)."
+          },
+          "project": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Project within the org to scope the token to. Absent = the whole org."
+          },
+          "role": {
+            "type": "string",
+            "description": "The **ceiling**: `viewer` | `member` | `admin` | `owner`, never more\nthan the caller holds in this scope."
           }
         }
       },
@@ -11723,6 +12191,7 @@
         "description": "`POST /v1/connections/{id}/resync` body: what reconciliation changed.",
         "required": [
           "bound",
+          "skipped",
           "confirmed"
         ],
         "properties": {
@@ -11737,6 +12206,13 @@
             "type": "integer",
             "description": "How many bindings the forge confirms. Reported rather than acted on:\nsee the handler's note on why re-sync never unbinds.",
             "minimum": 0
+          },
+          "skipped": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Repos the forge reports that were not bound (git-bug 19b0a45): owned\nby another account than the connection's Org, already bound through\nanother connection that serves an Org, or reported to a connection\nthat serves no Org yet (it binds nothing until it is assigned)."
           }
         }
       },
@@ -12103,7 +12579,8 @@
         "required": [
           "key",
           "status",
-          "inherited_from"
+          "inherited_from",
+          "overrides"
         ],
         "properties": {
           "inherited_from": {
@@ -12118,6 +12595,16 @@
           },
           "key": {
             "type": "string"
+          },
+          "overrides": {
+            "type": "object",
+            "description": "For each `set` cell that hides a broader value, the scope it hides —\n`\"repo\"` or `\"org\"`. The counterpart of `inherited_from`: a repo key that\nthe org also defines reads as overriding the org, not as a lone key.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
           },
           "status": {
             "type": "object",
@@ -12151,7 +12638,7 @@
           },
           "caller": {
             "type": "string",
-            "description": "`session:cookie`, `session:bearer`, `api_token:<id>` or\n`operator:break-glass`."
+            "description": "`session:cookie`, `session:bearer`, `api_token:<id>`,\n`operator:break-glass` or `operator:grant`."
           },
           "confirmation_id": {
             "type": [
@@ -12168,7 +12655,7 @@
           },
           "kind": {
             "type": "string",
-            "description": "`step_up.confirmed`, `step_up.refused`, `op.authorised`,\n`op.completed`, `request.raised|confirmed|executed|failed`,\n`passkey.enrolled|removed|reset|break_glass_reset|clone_suspected`,\n`guard.not_consulted`."
+            "description": "`step_up.confirmed`, `step_up.refused`, `op.authorised`,\n`op.completed`, `request.raised|confirmed|executed|failed`,\n`passkey.enrolled|removed|reset|break_glass_reset|clone_suspected`,\n`guard.not_consulted`, `binding.operator_grant`."
           },
           "op": {
             "type": [
@@ -12239,7 +12726,14 @@
               "null"
             ],
             "format": "int64",
-            "description": "Pass as `before` for the next page; absent on the last."
+            "description": "Pass as `before` for the next page; absent on the last. The same\nposition as `next_cursor`, kept for older callers."
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Pass as `cursor` for the next page; absent on the last."
           }
         }
       },
@@ -12887,6 +13381,15 @@
             "description": "`executed` (the operation answered 2xx) or `failed`."
           }
         }
+      },
+      "TokenSort": {
+        "type": "string",
+        "description": "The order of the org's token list.",
+        "enum": [
+          "last_used",
+          "use_count",
+          "created"
+        ]
       },
       "TrustSourceRequest": {
         "type": "object",

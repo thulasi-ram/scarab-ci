@@ -14,6 +14,11 @@
 //!   --principal …`, against the database directly ([`reset_passkeys`]),
 //!   for when no Owner can step up. No route reaches it, and the `scarab`
 //!   CLI has no such command: it needs the database credentials.
+//!
+//! The operator grant ([`grant_role`], `scarab-server admin grant`) lives
+//! here too: the same shape (database credentials only, never migrates,
+//! recorded with host, OS user and reason), for seeding a fresh install's
+//! first members without a browser.
 
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
@@ -21,9 +26,10 @@ use axum::{Extension, Json};
 use serde::Serialize;
 use utoipa::ToSchema;
 
-use scarab_db_postgres::PostgresDb;
+use scarab_db_postgres::{BindingRow, PostgresDb};
 use scarab_identity::{
-    security_event_kind as kind, Action, PasskeyStore, Role, Scope, SecurityEventLog, StepUpStore,
+    security_event_kind as kind, Action, Binding, PasskeyStore, Role, Scope, SecurityEventLog,
+    StepUpStore,
 };
 
 use super::ceremony::service;
@@ -303,5 +309,179 @@ pub async fn reset_passkeys(
         subject,
         removed,
         windows_revoked,
+    })
+}
+
+/// The `caller` an operator grant is recorded as.
+pub const OPERATOR_GRANT_CALLER: &str = "operator:grant";
+
+/// How a [`grant_role`] error about a principal that does not exist starts:
+/// `scarab-server admin grant` exits 3 on it, so a script can tell "has not
+/// signed in yet" from a failure.
+pub const NO_PRINCIPAL: &str = "no principal";
+
+/// What [`grant_role`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperatorGrant {
+    /// The principal already held exactly this role in the Org as a native
+    /// binding: nothing written, nothing recorded.
+    Unchanged { subject: String },
+    /// The binding was written and recorded. `previous` is the Org-scope row
+    /// it replaced, if any: a role, a revoked row (role `None`), or a role a
+    /// forge import gave (origin `import`, now `native`).
+    Granted {
+        subject: String,
+        previous: Option<BindingRow>,
+    },
+    /// `--if-absent`, and the principal has a binding row in the Org (at the
+    /// Org or at a Project, revoked rows included): nothing written, nothing
+    /// recorded. `rows` is what is there.
+    Exists {
+        subject: String,
+        rows: Vec<BindingRow>,
+    },
+}
+
+/// The operator grant (`scarab-server admin grant`): give `subject` `role`
+/// in `org` as a native binding, for seeding a fresh install's first members
+/// without a browser. Records `binding.operator_grant` in the Org's security
+/// event log (caller `operator:grant`, with the host, OS user and reason) in
+/// the same transaction as the binding: both land or neither does.
+///
+/// Without `if_absent` the role is set exactly: a higher role is lowered, a
+/// revoked binding is restored, and a role a forge import gave becomes a
+/// native binding (so a later forge sync cannot remove it). A principal that
+/// already holds exactly `role` as a native binding is
+/// [`Unchanged`](OperatorGrant::Unchanged), and nothing is recorded.
+///
+/// With `if_absent` it writes only when the principal has no binding row in
+/// the Org at all: not at the Org scope, not at any Project, not a revoked
+/// one. Otherwise it is [`Exists`](OperatorGrant::Exists) and nothing is
+/// written: a seed script run again never undoes what an Owner changed.
+///
+/// Refuses an unknown role, an invalid org name, a database whose schema
+/// predates the event log (it never migrates), and an id no Principal was
+/// ever minted for — granting to one would hand the role to whoever next
+/// signs in with that id (ADR-0069 §3).
+#[allow(clippy::too_many_arguments)]
+pub async fn grant_role(
+    db: &PostgresDb,
+    org: &str,
+    subject: &str,
+    role: &str,
+    if_absent: bool,
+    reason: Option<&str>,
+    operator: &OperatorInfo,
+    now_ms: i64,
+) -> Result<OperatorGrant, String> {
+    let role = match role {
+        "viewer" => Role::Viewer,
+        "member" => Role::Member,
+        "admin" => Role::Admin,
+        "owner" => Role::Owner,
+        other => {
+            return Err(format!(
+                "unknown role `{other}` (want viewer, member, admin or owner)"
+            ))
+        }
+    };
+    if let Some(problem) = crate::org_name_problem(org) {
+        return Err(problem);
+    }
+    let version = db
+        .schema_version()
+        .await
+        .map_err(|e| format!("could not read the schema version: {e}"))?;
+    match version {
+        Some(v) if v >= BREAK_GLASS_MIN_SCHEMA => {}
+        Some(v) => {
+            return Err(format!(
+                "the database schema is at migration {v}, older than {BREAK_GLASS_MIN_SCHEMA} \
+                 (the security event log); upgrade the server first — this command never \
+                 migrates"
+            ))
+        }
+        None => {
+            return Err("the database has never been migrated; this command never migrates".into())
+        }
+    }
+    let resolved = scarab_identity::resolve_principal(db, subject)
+        .await
+        .map_err(|e| format!("could not resolve `{subject}`: {e}"))?
+        .ok_or_else(|| {
+            format!(
+                "{NO_PRINCIPAL} `{subject}` exists: they must sign in to Scarab once before \
+                 a role can name them"
+            )
+        })?;
+    let rows = || async {
+        db.binding_rows(&resolved, org)
+            .await
+            .map_err(|e| format!("could not read the bindings of `{resolved}` in `{org}`: {e}"))
+    };
+    let existing = rows().await?;
+    if if_absent && !existing.is_empty() {
+        return Ok(OperatorGrant::Exists {
+            subject: resolved,
+            rows: existing,
+        });
+    }
+    let name = |r: Role| match r {
+        Role::Viewer => "viewer",
+        Role::Member => "member",
+        Role::Admin => "admin",
+        Role::Owner => "owner",
+    };
+    let previous = existing.into_iter().find(|r| r.project.is_empty());
+    if let Some(p) = &previous {
+        if p.role.as_deref() == Some(name(role)) && p.origin == "native" {
+            return Ok(OperatorGrant::Unchanged { subject: resolved });
+        }
+    }
+    let mut ev = event(
+        kind::BINDING_OPERATOR_GRANT,
+        &resolved,
+        OPERATOR_GRANT_CALLER.to_string(),
+        Some(org.to_string()),
+        now_ms,
+    );
+    ev.op = Some("binding.operator_grant".into());
+    ev.target = Some(resolved.clone());
+    ev.detail = serde_json::json!({
+        "requested": subject,
+        "role": name(role),
+        "previous": previous.as_ref().and_then(|p| p.role.clone()),
+        "previous_origin": previous.as_ref().map(|p| p.origin.clone()),
+        "if_absent": if_absent,
+        "reason": reason,
+        "host": operator.host,
+        "os_user": operator.os_user,
+    });
+    let binding = Binding {
+        subject: resolved.clone(),
+        scope: Scope::Org(org.to_string()),
+        role,
+    };
+    let written = db
+        .operator_grant(&ev, &binding, if_absent)
+        .await
+        .map_err(|e| {
+            format!(
+                "could not grant `{resolved}` {} in `{org}`; nothing was granted or \
+                 recorded: {e}",
+                name(role)
+            )
+        })?;
+    if !written {
+        // A row appeared between the read and the write (an Owner acted in
+        // the UI meanwhile): leave it, as `--if-absent` promises.
+        return Ok(OperatorGrant::Exists {
+            rows: rows().await?,
+            subject: resolved,
+        });
+    }
+    Ok(OperatorGrant::Granted {
+        subject: resolved,
+        previous,
     })
 }

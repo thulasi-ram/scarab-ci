@@ -5,8 +5,19 @@
 // scope in the Project's Secrets tab and the org scope in global Settings. The
 // scope is the caller's business; this component only renders what it is given
 // and says so in its header.
+//
+// At the repo scope it also lists, greyed out, the keys the repo can use but
+// does not hold: the org's keys and keys set only in some environments. They
+// come from the secret matrix and cannot be edited here.
 import { createEffect, createResource, createSignal, For, Show } from "solid-js";
-import { listSecrets, putSecret, deleteSecret, type SecretScope } from "../api/client";
+import {
+  listSecrets,
+  putSecret,
+  deleteSecret,
+  fetchSecretMatrix,
+  type SecretScope,
+} from "../api/client";
+import { secretKeyNote, secretKeyRows } from "../secret-keys";
 import Icon from "./Icon";
 
 export default function ScopedSecrets(props: {
@@ -22,12 +33,26 @@ export default function ScopedSecrets(props: {
   epoch?: number;
   /** Called after this panel writes, so a sibling view of the scope can refresh. */
   onChange?: () => void;
+  /** Also list the keys this repo inherits (repo scope only). */
+  showInherited?: boolean;
 }) {
   const scope = () => props.scope;
-  const [names, { refetch }] = createResource(
-    () => ({ scope: props.scope, epoch: props.epoch ?? 0 }),
-    (k) => listSecrets(k.scope),
+  const [data, { refetch }] = createResource(
+    () => ({ scope: props.scope, inherited: props.showInherited ?? false, epoch: props.epoch ?? 0 }),
+    async (k) => {
+      const repo = k.scope.repo;
+      const [names, matrix] = await Promise.all([
+        listSecrets(k.scope),
+        // The list still works without the inherited keys, so a failed matrix
+        // read leaves just the repo's own.
+        k.inherited && repo
+          ? fetchSecretMatrix(k.scope.org, repo).catch(() => null)
+          : Promise.resolve(null),
+      ]);
+      return { names, rows: secretKeyRows(names, matrix) };
+    },
   );
+  const names = () => data()?.names;
   const changed = () => {
     refetch();
     props.onChange?.();
@@ -44,23 +69,36 @@ export default function ScopedSecrets(props: {
     <div class="panel">
       <div class="panel-h"><span>{props.title}</span></div>
       <div class="secrets-body">
-        <Show when={!names.loading} fallback={<p class="empty">loading…</p>}>
+        <Show when={!data.loading} fallback={<p class="empty">loading…</p>}>
           <Show
-            when={(names()?.length ?? 0) > 0}
+            when={(data()?.rows.length ?? 0) > 0}
             fallback={<p class="empty">{props.emptyLabel ?? "No secrets at this scope."}</p>}
           >
             <ul class="secret-list">
-              <For each={names()}>
-                {(n) => (
-                  <li class="secret-row">
+              <For each={data()?.rows}>
+                {(row) => (
+                  <li
+                    class="secret-row"
+                    classList={{ "secret-inherited": row.kind !== "own" }}
+                    title={
+                      row.kind === "own"
+                        ? undefined
+                        : "Not set at this scope. Add a secret with this name to set it here."
+                    }
+                  >
                     <Icon icon="key-round" size={15} />
-                    <code class="mono">{n}</code>
-                    <button
-                      class="btn btn-danger btn-sm"
-                      onClick={async () => { await deleteSecret(scope(), n); changed(); }}
-                    >
-                      delete
-                    </button>
+                    <code class="mono">{row.name}</code>
+                    <Show when={secretKeyNote(row)}>
+                      <span class="secret-note">{secretKeyNote(row)}</span>
+                    </Show>
+                    <Show when={row.kind === "own"}>
+                      <button
+                        class="btn btn-danger btn-sm"
+                        onClick={async () => { await deleteSecret(scope(), row.name); changed(); }}
+                      >
+                        delete
+                      </button>
+                    </Show>
                   </li>
                 )}
               </For>
@@ -131,7 +169,7 @@ export function NewSecretDialog(props: {
             <label>name</label>
             <input
               ref={nameRef}
-              class="input"
+              class="input mono"
               placeholder="NAME"
               value={name()}
               onInput={(e) => setName(e.currentTarget.value)}
@@ -140,7 +178,7 @@ export function NewSecretDialog(props: {
           <div class="form-r">
             <label>value</label>
             <input
-              class="input"
+              class="input mono"
               type="password"
               placeholder="value (write-only)"
               value={value()}
@@ -148,7 +186,7 @@ export function NewSecretDialog(props: {
             />
           </div>
           <Show when={exists()}>
-            <label class="secret-overwrite">
+            <label class="checkbox-inline secret-overwrite">
               <input
                 type="checkbox"
                 checked={overwrite()}
@@ -162,6 +200,8 @@ export function NewSecretDialog(props: {
           <Show when={error()}>
             <p class="error">{error()}</p>
           </Show>
+        </div>
+        <div class="modal-foot">
           <div class="modal-actions">
             <button
               class="btn btn-primary"

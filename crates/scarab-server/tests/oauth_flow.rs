@@ -251,6 +251,16 @@ async fn provider(id_token: Option<IdToken>) -> Provider {
 /// An app wired to `p`. `oidc` = configure the issuer, i.e. OIDC mode where a
 /// returned `id_token` is verified and authoritative.
 fn app_for(p: &Provider, owners: Vec<String>, oidc: bool) -> axum::Router {
+    app_with(p, owners, oidc, |st| st)
+}
+
+/// [`app_for`] with a last say over the state (e.g. a UI URL).
+fn app_with(
+    p: &Provider,
+    owners: Vec<String>,
+    oidc: bool,
+    tweak: impl FnOnce(AppState) -> AppState,
+) -> axum::Router {
     let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
     let clock = Arc::new(FakeClock::new(1_000));
     let store = Arc::new(InMemoryObjectStore::new());
@@ -272,12 +282,12 @@ fn app_for(p: &Provider, owners: Vec<String>, oidc: bool) -> axum::Router {
         })
         .with_identities(Arc::new(InMemoryIdentities::new())),
     );
-    router(
+    router(tweak(
         AppState::new(db, clock, logs)
             .with_public_url("https://scarab.example.com")
             .with_auth(login.clone(), Arc::new(InMemorySessions::new()))
             .with_oauth_login(login),
-    )
+    ))
 }
 
 fn cookie_from(resp: &axum::response::Response, name: &str) -> Option<String> {
@@ -579,6 +589,106 @@ async fn pkce_challenge_is_sent_and_the_verifier_round_trips() {
         &[Some(flow.verifier.clone())],
         "the token exchange must replay the cookie's verifier"
     );
+}
+
+/// `SCARAB_UI_URL` (a staging stack whose public hostname serves only
+/// `/webhooks/`): the callback the provider returns to, and the one the token
+/// exchange replays, are on the UI URL, not the public URL.
+#[tokio::test]
+async fn the_login_callback_is_on_the_ui_url() {
+    let p = provider(None).await;
+    let app = app_with(&p, vec![], false, |st| st.with_ui_url("http://localhost:8080/"));
+
+    let (location, flow) = begin_login(&app).await;
+    let sent = form_field(location.split_once('?').unwrap().1, "redirect_uri")
+        .expect("authorize redirect carries redirect_uri");
+    assert_eq!(sent, "http%3A%2F%2Flocalhost%3A8080%2Fv1%2Fauth%2Fcallback");
+
+    let resp = callback(&app, &flow, "good-code").await;
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    assert_eq!(p.redirect_uris.lock().unwrap().as_slice(), &[Some(sent)]);
+}
+
+/// A login begun at `127.0.0.1` while the UI URL says `localhost` would lose
+/// its flow cookie at the callback (a cookie belongs to one host name). It
+/// is sent to the UI URL first, with its query, before any cookie is set. A
+/// login on the UI URL's own name, or on a non-loopback name (a proxy that
+/// rewrites `Host`), goes straight to the provider.
+#[tokio::test]
+async fn a_login_on_another_loopback_name_goes_to_the_ui_url_first() {
+    let p = provider(None).await;
+    let app = app_with(&p, vec![], false, |st| st.with_ui_url("http://localhost:8080"));
+    let login_at = |host: &'static str| {
+        let app = app.clone();
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .uri("/v1/auth/login?next=%2Fsecurity")
+                    .header("host", host)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    for other in ["127.0.0.1:8080", "[::1]:8080", "127.0.0.1"] {
+        let resp = login_at(other).await;
+        assert_eq!(resp.status(), StatusCode::FOUND, "{other}");
+        assert_eq!(
+            resp.headers()["location"],
+            "http://localhost:8080/v1/auth/login?next=%2Fsecurity",
+            "{other}"
+        );
+        assert!(
+            cookie_from(&resp, "scarab_oauth_state").is_none(),
+            "no flow is started on {other}"
+        );
+    }
+    for same in ["localhost:8080", "LOCALHOST:8080", "ci.internal:8080"] {
+        let resp = login_at(same).await;
+        assert_eq!(resp.status(), StatusCode::FOUND, "{same}");
+        let location = resp.headers()["location"].to_str().unwrap();
+        assert!(location.starts_with(&format!("{}/authorize?", p.base)), "{same}: {location}");
+        assert!(cookie_from(&resp, "scarab_oauth_state").is_some(), "{same}");
+    }
+}
+
+/// The detour is between loopback names only. A production UI URL
+/// (`https://…`) reached through a port-forward on `127.0.0.1` must not send
+/// the browser to the production host: the login starts where it was asked.
+#[tokio::test]
+async fn a_login_on_loopback_is_not_sent_to_a_non_loopback_ui_url() {
+    let p = provider(None).await;
+    for app in [
+        app_with(&p, vec![], false, |st| {
+            st.with_ui_url("https://ci.example.com")
+        }),
+        // No UI URL: the public URL, https://scarab.example.com.
+        app_for(&p, vec![], false),
+    ] {
+        for host in ["127.0.0.1:8080", "localhost:8080"] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/v1/auth/login")
+                        .header("host", host)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::FOUND, "{host}");
+            let location = resp.headers()["location"].to_str().unwrap();
+            assert!(
+                location.starts_with(&format!("{}/authorize?", p.base)),
+                "{host}: {location}"
+            );
+            assert!(cookie_from(&resp, "scarab_oauth_state").is_some(), "{host}");
+        }
+    }
 }
 
 /// RFC 6749 §4.1.3: an authorize request that carried `redirect_uri` obliges

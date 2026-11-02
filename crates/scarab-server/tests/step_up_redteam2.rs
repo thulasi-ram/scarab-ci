@@ -88,6 +88,7 @@ async fn pat(h: &Harness, owner: &str, id: &str, scope: Scope, role: Role) -> St
                 created_by: owner.into(),
                 created_at: now,
                 last_used_at: None,
+                use_count: 0,
                 revoked_at: None,
             },
             &api_token_hash(&plaintext),

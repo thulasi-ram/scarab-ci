@@ -430,6 +430,9 @@ async fn a_linked_webhook_actor_is_the_run_create_principal() {
         kind: ForgeKind::GitHub,
         base_url: "https://api.github.com/".into(),
         credential_ref: "github-app".into(),
+        org: Some("acme".into()),
+        installation_id: None,
+        account_id: None,
     })
     .await
     .unwrap();

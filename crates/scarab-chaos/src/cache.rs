@@ -534,7 +534,7 @@ async fn wait_terminal(api: &Api, run: &str, timeout: Duration) -> Option<String
 pub async fn seed(api: &Api, fj: &Forgejo, p: &mut CacheProbe, salt: String) -> Result<(), String> {
     write_pipeline(fj, &p.pipeline_yaml).await?;
     let conn = api
-        .recreate_forgejo_connection(&fj.server_url, &fj.token)
+        .recreate_forgejo_connection(&fj.owner, &fj.server_url, &fj.token)
         .await?;
     let (org, project) = api.bind_repo(&conn, &fj.owner, REPO).await?;
     p.project = Some(format!("{org}/{project}"));

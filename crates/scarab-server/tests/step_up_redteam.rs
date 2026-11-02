@@ -80,6 +80,7 @@ async fn pat(h: &Harness, owner: &str, id: &str, scope: Scope, role: Role) -> St
                 created_by: owner.into(),
                 created_at: now,
                 last_used_at: None,
+                use_count: 0,
                 revoked_at: None,
             },
             &api_token_hash(&plaintext),
@@ -318,7 +319,7 @@ async fn a_stepped_up_identity_link_still_completes() {
     assert_eq!(cb.status(), StatusCode::FOUND);
     assert_eq!(
         cb.headers()[axum::http::header::LOCATION],
-        "/account?identity_linked=default"
+        "/settings/profile?identity_linked=default"
     );
     assert!(has_default_identity(&ids).await, "the identity was not attached");
 }

@@ -91,7 +91,7 @@ bucket on those two servers:
 | Mode | Recipe | Database | Bucket | Auth |
 |---|---|---|---|---|
 | dev | `just stack up` | `scarab` | `scarab-logs` | dev-insecure |
-| dogfood | `just stack up dogfood` | `scarab_dogfood` | `scarab-dogfood` | dev-insecure, GitHub App |
+| dogfood | `just stack up dogfood` | `scarab_dogfood` | `scarab-dogfood` | GitHub login, GitHub App |
 | e2e | `just test e2e` | `scarab_e2e` | `scarab-e2e` | dev-insecure; Forgejo behind a quick tunnel while `just test e2e` runs |
 | chaos | `just test chaos` | `scarab_chaos` | `scarab-chaos` | dev-insecure; Postgres and MinIO through toxiproxy; 2 servers, 2 Depot replicas |
 
@@ -120,6 +120,9 @@ GitHub through a named Cloudflare tunnel. It reads
 | `SCARAB_ORG`, `SCARAB_REPO`, `SCARAB_INSTALL_ID` | the installation registered on a fresh database |
 | `SCARAB_STEP_TIMEOUT_SECS` | default step deadline |
 | `CLOUDFLARE_TUNNEL_TOKEN`, `DOGFOOD_HOSTNAME` | the tunnel; `just stack up dogfood` refuses without them |
+| `SCARAB_OAUTH_CLIENT_ID`, `SCARAB_OAUTH_CLIENT_SECRET` | GitHub login through the GitHub App's OAuth client; `just stack up dogfood` refuses without them |
+| `DOGFOOD_OWNER` | optional; the Owner as `github:<login>`, default `github:$SCARAB_ORG` |
+| `DOGFOOD_MEMBER` | optional; a second GitHub account as `github:<login>`, granted the member role |
 
 Each line is `KEY=value`; a leading `export `, CRLF line endings and one pair
 of quotes around the value are accepted, and nothing else is interpreted.
@@ -133,16 +136,77 @@ Cloudflare Zero Trust dashboard: the tunnel's public hostname must point at
 `http://scarab.scarab.svc.cluster.local:80` with Path `^/webhooks/`, so that
 only GitHub's deliveries reach Scarab and every other path gets the tunnel's
 catch-all 404. `publicUrl` is
-`https://$DOGFOOD_HOSTNAME`. After the roll-out, `up.sh` seeds the
-`production` Environment, installs the clone library into `SCARAB_ORG` and
-registers the installation with a signed `installation:created`, so a fresh
-database knows the installation before GitHub sends anything.
+`https://$DOGFOOD_HOSTNAME`. After the roll-out, `up.sh` grants the Owner and
+the member their roles (see [Login](#login)) and registers the installation
+with a signed `installation:created`, so a fresh database knows the
+installation before GitHub sends anything.
 
-The dogfood runs dev-insecure, as it did on colima: there is no login, and
-anyone who reaches the UI or the API is an Owner of a server that holds the
-GitHub App's key. That is why the hostname carries only `/webhooks/`. The UI
-and API stay on the host at `SCARAB_ADDR` (`http://127.0.0.1:<port>`).
-Webhook signatures are checked with or without dev-insecure.
+The UI and API stay on the host. The server holds the GitHub App's key, so
+the hostname carries only `/webhooks/`. Webhook signatures are checked on every
+delivery.
+
+### Login
+
+The dogfood stack signs people in with GitHub, as a real install does: it has
+the identity store (linked accounts), role bindings, API tokens and passkey
+step-up, and no dev-insecure. Sign in at `http://localhost:<port>`, the port of
+`SCARAB_ADDR` (`scarab.uiUrl`). Use `localhost`, not `127.0.0.1`: browsers
+refuse passkeys on an IP address, and a sign-in started on `127.0.0.1` is sent
+to `localhost` first. The session cookie is marked `Secure`, which Chrome and
+Firefox accept on `http://localhost`; Safari may not, so use Chrome or Firefox.
+The login callback is on `localhost` too, so nothing but `/webhooks/` needs to
+be public.
+
+Set it up once:
+
+1. In the GitHub App's settings (the App has its own OAuth client), set the
+   **Callback URL** to `http://localhost:8080/v1/auth/callback` (use your
+   `SCARAB_ADDR` port), generate a **client secret**, and put the App's
+   **Client ID** and that secret in `dogfood.env` as `SCARAB_OAUTH_CLIENT_ID`
+   and `SCARAB_OAUTH_CLIENT_SECRET`. `up.sh` puts the secret in the Secret
+   `scarab-oauth-github` through a temporary file, so it never shows in `ps`
+   or the output.
+2. Optionally set `DOGFOOD_MEMBER=github:<login>` to a second GitHub account,
+   and `DOGFOOD_OWNER` when the Owner is not `github:$SCARAB_ORG`.
+
+The login provider's id is `github`, so people are `github:<login>`. The Owner
+is an Owner at every sign-in (`scarab.oauth.owners`). After the roll-out,
+`up.sh` runs `deploy/kind/seed.sh`, which grants the Owner the owner role and
+the member the member role in `SCARAB_ORG` with
+`scarab-server admin grant --if-absent`, run in the server Pod against its
+database, so both appear on the org's Members page. `--if-absent` grants only
+to someone who has no role binding in the org, a revoked one included: when
+the Owner changes or removes a role in the UI, the next `up` or `reload`
+leaves it as the Owner set it. A grant needs someone who has signed in once.
+Until then the script prints `sign in as github:<login> at
+http://localhost:<port>, then run just stack seed dogfood`; that recipe runs the
+grants again.
+
+`SCARAB_ADDR` must be on `127.0.0.1` in dogfood mode; `up.sh` refuses another
+address. The UI URL is `http://localhost:<port>`, and the UI and API are for
+this machine only.
+
+`just stack demo` refuses dogfood mode: it calls the API without a credential.
+
+On a fresh database, `up.sh` also prints a checklist of the steps that now need
+a passkey, which it used to do with plain curl (`just stack seed dogfood
+checklist` prints it again). On an existing database it compares the clone
+library installed in the org with `deploy/kind/.state/dogfood-clone.yaml`
+(read with `psql` in the Postgres Pod) and prints step 3 when they differ:
+
+1. Sign in at `http://localhost:<port>` as the Owner and enroll a passkey in
+   Settings > Security. Every new database needs a new one.
+2. Org settings > Environments: create `production` and make it eligible for
+   all projects; the dogfood pipeline deploys to it.
+3. Org settings > Libraries: the clone library must pin `scarab-clone:dev`.
+   When it is missing, choose **Paste the files** and paste
+   `deploy/kind/.state/dogfood-clone.yaml`. When it pins another image,
+   uninstall it first.
+4. To call the API, issue a token in Org settings > API tokens.
+
+To check that the member is refused an admin action, sign in as the member and
+open Org settings > Members, or `PUT` a binding with the member's API token:
+both answer 403.
 
 Once cloudflared has an edge connection, `up.sh` checks this from outside,
 through Cloudflare: `GET /` and `GET /v1/repos` on `https://$DOGFOOD_HOSTNAME`
@@ -466,6 +530,5 @@ Pod-side probe in `test-env.sh` finds it.
 | `SCARAB_KIND_RECREATE` | `0` | `1` deletes and recreates a `scarab-dev` cluster that does not fit (its data goes with it) |
 | `SCARAB_DEV_ORG` | `thulasi-ram` | org whose `production` Environment dev mode seeds |
 | `SCARAB_DOGFOOD_ENV` | `~/.config/scarab/dogfood.env` | the dogfood env file |
-| `SCARAB_DOGFOOD_DEV_INSECURE` | `true` | dogfood's `scarab.devInsecure` |
 | `SCARAB_KIND_EXTRA_VALUES` | none | one more Helm values file, applied last; not remembered by `just stack reload` |
 | `SCARAB_CHAOS_DIR` | `deploy/kind/.chaos` | where `just test chaos` writes scenario files, Pod records and verdicts |

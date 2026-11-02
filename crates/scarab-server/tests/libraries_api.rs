@@ -12,7 +12,7 @@ use axum::http::{Request, StatusCode};
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
-use scarab_forge::{ForgeConnection, ForgeConnectionStore, ForgeKind, RepoRef};
+use scarab_forge::{ForgeConnection, ForgeConnectionStore, ForgeKind};
 use scarab_policy::library::{content_hash, DefaultsState, LibraryStore};
 use scarab_server::libraries::{
     install_org_defaults, offer_defaults_on_bind, DefaultsFrom, LibraryManifest, ManifestLibrary,
@@ -309,6 +309,9 @@ async fn an_anonymous_fetch_never_reaches_an_unknown_host() {
         kind: ForgeKind::Forgejo,
         base_url: "http://git.example.com".into(),
         credential_ref: "c".into(),
+        org: None,
+        installation_id: None,
+        account_id: None,
     })
     .await
     .unwrap();
@@ -350,31 +353,36 @@ async fn a_file_that_invokes_a_repository_file_is_refused() {
         .is_none());
 }
 
-async fn github_connection(db: &InMemoryDb) {
+async fn github_connection(db: &InMemoryDb, id: &str, org: Option<&str>) {
     db.put_connection(&ForgeConnection {
-        id: "gh".into(),
+        id: id.into(),
         kind: ForgeKind::GitHub,
         base_url: "https://api.github.com".into(),
         credential_ref: "c".into(),
+        org: org.map(str::to_string),
+        installation_id: None,
+        account_id: None,
     })
     .await
     .unwrap();
 }
 
-/// The org rule for private installs: the source repository is the org's
-/// own, or bound to the org. An owner named like the org counts only once
-/// the org has a repository bound through the connection. Anything else is
-/// refused before the forge is asked.
+/// git-bug 19b0a45: the org's own connection reads for the org only the
+/// org's own repositories. Its credential may reach another owner's (a
+/// token with wider access, or a GitHub installation asked for a repository
+/// by name only), and that is not the org's to install from. A connection
+/// id that does not exist answers like another org's, so other orgs'
+/// connection ids cannot be probed.
 #[tokio::test]
-async fn a_private_source_must_belong_to_the_org() {
+async fn the_orgs_own_connection_reads_only_the_orgs_repositories() {
     let h = harness_with(
         ManifestSource::Off,
         FakeForge::new().with_file("deploy.yaml", V1),
         InMemoryLibraries::new(),
     );
-    github_connection(&h.db).await;
+    github_connection(&h.db, "gh", Some("acme")).await;
+    github_connection(&h.db, "gh-globex", Some("globex")).await;
 
-    // Another org's private repository: refused.
     let (st, b) = fetch(
         &h,
         json!({
@@ -385,80 +393,70 @@ async fn a_private_source_must_belong_to_the_org() {
     .await;
     assert_eq!(st, StatusCode::FORBIDDEN, "{b}");
     assert!(
-        b.as_str().unwrap().contains("not owned by org `acme`"),
+        b.as_str().unwrap().contains("is not owned by org `acme`"),
         "{b}"
     );
 
-    // Bound to another org: still refused.
-    h.db.bind_repo(
-        "gh",
-        &RepoRef {
-            owner: "globex".into(),
-            name: "secret".into(),
-        },
-        "globex",
-        "secret",
-    )
-    .await
-    .unwrap();
-    let (st, _) = fetch(
-        &h,
-        json!({
-            "source": format!("github.com/globex/secret//deploy.yaml@{C1}"),
-            "connection": "gh"
-        }),
-    )
-    .await;
-    assert_eq!(st, StatusCode::FORBIDDEN);
+    let source = format!("github.com/globex/secret//deploy.yaml@{C1}");
+    let (missing_st, missing) =
+        fetch(&h, json!({ "source": source, "connection": "gh-nope" })).await;
+    let (foreign_st, foreign) =
+        fetch(&h, json!({ "source": source, "connection": "gh-globex" })).await;
+    assert_eq!(missing_st, StatusCode::FORBIDDEN, "{missing}");
+    assert_eq!(missing_st, foreign_st);
+    assert_eq!(
+        missing.as_str().unwrap().replace("gh-nope", "ID"),
+        foreign.as_str().unwrap().replace("gh-globex", "ID"),
+    );
+}
 
-    // The org's own repository, before the org has a repository bound
-    // through this connection: an owner named `acme` on this forge is not
-    // yet known to be the org.
-    let own = json!({
-        "source": format!("github.com/acme/private-libs//deploy.yaml@{C1}"),
-        "connection": "gh"
-    });
-    let (st, b) = fetch(&h, own).await;
-    assert_eq!(st, StatusCode::FORBIDDEN, "{b}");
+/// The org rule for private installs (git-bug 19b0a45): a private source is
+/// read only through a connection of the installing org. Another org's
+/// connection, or an unassigned one, is refused before the forge is asked,
+/// whatever the source's owner is called or wherever it is bound.
+#[tokio::test]
+async fn a_private_source_must_belong_to_the_org() {
+    let h = harness_with(
+        ManifestSource::Off,
+        FakeForge::new().with_file("deploy.yaml", V1),
+        InMemoryLibraries::new(),
+    );
+    github_connection(&h.db, "gh-globex", Some("globex")).await;
+    github_connection(&h.db, "gh-legacy", None).await;
+    github_connection(&h.db, "gh", Some("acme")).await;
 
-    // Once the org has a repository bound through it: read.
-    h.db.bind_repo(
-        "gh",
-        &RepoRef {
-            owner: "acme".into(),
-            name: "web".into(),
-        },
-        "acme",
-        "web",
-    )
-    .await
-    .unwrap();
+    // Another org's connection: refused, for its own repository and for one
+    // owned by a name like the installing org's.
+    for source in [
+        format!("github.com/globex/secret//deploy.yaml@{C1}"),
+        format!("github.com/acme/private-libs//deploy.yaml@{C1}"),
+    ] {
+        let (st, b) = fetch(&h, json!({ "source": source, "connection": "gh-globex" })).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{source}: {b}");
+        assert!(
+            b.as_str()
+                .unwrap()
+                .contains("does not belong to org `acme`"),
+            "{b}"
+        );
+    }
+
+    // An unassigned connection belongs to no org: refused.
     let (st, b) = fetch(
         &h,
         json!({
             "source": format!("github.com/acme/private-libs//deploy.yaml@{C1}"),
-            "connection": "gh"
+            "connection": "gh-legacy"
         }),
     )
     .await;
-    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(st, StatusCode::FORBIDDEN, "{b}");
 
-    // Another owner's repository bound to this org: read too.
-    h.db.bind_repo(
-        "gh",
-        &RepoRef {
-            owner: "acme-tools".into(),
-            name: "libs".into(),
-        },
-        "acme",
-        "libs",
-    )
-    .await
-    .unwrap();
+    // The org's own connection: read.
     let (st, b) = fetch(
         &h,
         json!({
-            "source": format!("github.com/acme-tools/libs//deploy.yaml@{C1}"),
+            "source": format!("github.com/acme/private-libs//deploy.yaml@{C1}"),
             "connection": "gh"
         }),
     )
@@ -767,7 +765,7 @@ async fn a_bind_succeeds_when_the_defaults_cannot_be_fetched() {
         FakeForge::new(),
         InMemoryLibraries::new(),
     );
-    github_connection(&h.db).await;
+    github_connection(&h.db, "gh", Some("acme")).await;
     // Nothing is served: every fetch fails.
     let (st, b) = call(
         &h.app,

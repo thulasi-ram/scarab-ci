@@ -142,6 +142,7 @@ async fn pat(h: &Harness, id: &str, scope: Scope, role: Role) -> String {
                 created_by: "amy".into(),
                 created_at: now,
                 last_used_at: None,
+                use_count: 0,
                 revoked_at: None,
             },
             &api_token_hash(&plaintext),
@@ -383,6 +384,31 @@ async fn a_token_s_request_runs_once_for_its_human_only(backend: Backend) {
     assert!(h.events("request.failed").await.is_empty());
     let log = format!("{:?}", all_events(&h).await);
     assert!(!log.contains("S3CR3T"), "an event recorded the value");
+}
+
+/// `SCARAB_UI_URL`: the confirmation link a parked request answers with
+/// points where people open the UI, not at the public URL (which may serve
+/// only `/webhooks/`).
+#[tokio::test]
+async fn the_confirmation_link_is_on_the_ui_url() {
+    let h = harness_with(|st| {
+        st.with_public_url("https://hooks.example.com")
+            .with_ui_url(format!("{PUBLIC_URL}/"))
+    });
+    h.grant("amy", Scope::Org("acme".into()), Role::Owner).await;
+    let _amy = amy_in_browser(&h).await;
+    let token = pat(&h, "t1", Scope::Org("acme".into()), Role::Admin).await;
+    let (st, b) = h
+        .bearer("POST", "/v1/secrets", Some(secret("v1")), &token)
+        .await;
+    assert_step_up(st, &b, "window");
+    let id = b["request_id"].as_str().expect("a request id");
+    assert_eq!(
+        b["confirmation_url"],
+        format!("{PUBLIC_URL}/security/confirm/{id}"),
+        "{b}"
+    );
+    assert_ne!(PUBLIC_URL, "https://hooks.example.com");
 }
 
 #[tokio::test]
@@ -1166,7 +1192,27 @@ async fn a_replay_within_the_confirmed_loosenings_still_runs() {
 /// a forge connection `gh`".
 #[tokio::test]
 async fn a_request_shows_the_query_it_runs_with() {
-    let (h, _secrets) = world(Backend::Memory).await;
+    // The connection is acme's: a connection's operations are bound to its
+    // Org (git-bug 19b0a45), and an acme token may ask only for acme's.
+    use scarab_forge::ForgeConnectionStore;
+    let registry = Arc::new(scarab_testkit::InMemoryDb::new());
+    registry
+        .put_connection(&scarab_forge::ForgeConnection {
+            id: "gh".into(),
+            kind: scarab_forge::ForgeKind::GitHub,
+            base_url: "https://api.github.com".into(),
+            credential_ref: "github-app".into(),
+            org: Some("acme".into()),
+            installation_id: None,
+            account_id: None,
+        })
+        .await
+        .unwrap();
+    let h = harness_on(Backend::Memory, move |st| {
+        st.with_secrets(Arc::new(Secrets::new()))
+            .with_forge_connections(registry)
+    });
+    h.grant("amy", Scope::Org("acme".into()), Role::Owner).await;
     let (amy, _soft) = amy_in_browser(&h).await;
     let token = pat(&h, "t1", Scope::Org("acme".into()), Role::Admin).await;
     let (st, b) = h
@@ -1186,6 +1232,44 @@ async fn a_request_shows_the_query_it_runs_with() {
             .contains(&json!("?unbind_repos = true")),
         "{seen}"
     );
+}
+
+/// git-bug 19b0a45: a connection operation is bound to the connection's Org.
+/// An acme token aimed at globex's connection could never run it, so no
+/// confirmation request is raised for amy to approve by mistake.
+#[tokio::test]
+async fn a_token_raises_no_request_for_another_orgs_connection() {
+    use scarab_forge::ForgeConnectionStore;
+    let registry = Arc::new(scarab_testkit::InMemoryDb::new());
+    registry
+        .put_connection(&scarab_forge::ForgeConnection {
+            id: "fj-globex".into(),
+            kind: scarab_forge::ForgeKind::Forgejo,
+            base_url: "https://git.globex.test".into(),
+            credential_ref: "fj-globex-token".into(),
+            org: Some("globex".into()),
+            installation_id: None,
+            account_id: None,
+        })
+        .await
+        .unwrap();
+    let h = harness_on(Backend::Memory, move |st| {
+        st.with_secrets(Arc::new(Secrets::new()))
+            .with_forge_connections(registry)
+    });
+    h.grant("amy", Scope::Org("acme".into()), Role::Owner).await;
+    let token = pat(&h, "t1", Scope::Org("acme".into()), Role::Admin).await;
+    let (st, b) = h
+        .bearer(
+            "DELETE",
+            "/v1/connections/fj-globex?unbind_repos=true",
+            None,
+            &token,
+        )
+        .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{b}");
+    assert_eq!(b["code"], "outside_token_scope", "{b}");
+    assert!(h.step_up.requests().is_empty(), "a request was raised: {b}");
 }
 
 /// Retention: expired challenges and confirmations go, an expired request's
@@ -1255,4 +1339,25 @@ async fn a_member_s_own_events_and_the_request_records_stay_theirs() {
         .bearer("GET", &format!("/v1/step-up/requests/{id}"), None, &cli.id)
         .await;
     assert_eq!(st, StatusCode::NOT_FOUND);
+}
+
+/// One request counts one call, even when both the guard and the handler
+/// authenticate the token: a viewer token on a crown jewel passes the guard
+/// (it does not reach the op's role) and is refused by the handler.
+#[tokio::test]
+async fn a_request_the_guard_and_the_handler_both_authenticate_counts_once() {
+    let (h, _) = world(Backend::Memory).await;
+    let token = pat(&h, "v1", Scope::Org("acme".into()), Role::Viewer).await;
+    let (st, b) = h
+        .bearer("POST", "/v1/secrets", Some(secret("x")), &token)
+        .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{b}");
+    assert!(!is_step_up(st, &b), "{b}");
+
+    // Reading the list writes what is still counted in memory.
+    let s = h.browser_session(owner("amy")).await;
+    let (st, v) = h.cookie("GET", "/v1/me/tokens", None, &s).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v[0]["id"], "v1", "{v}");
+    assert_eq!(v[0]["use_count"], 1, "{v}");
 }

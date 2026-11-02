@@ -1,4 +1,4 @@
-// App = the client-side router (ADR-0028). Repo-first, deep-linkable tiers:
+// App = the client-side router. Repo-first, deep-linkable tiers:
 // repos → repo → run. Each is a real URL, shareable and refreshable.
 import { Show } from "solid-js";
 import { Router, Route } from "@solidjs/router";
@@ -9,14 +9,14 @@ import Repos from "./routes/Repos";
 import RepoView from "./routes/RepoView";
 import RunDetail from "./routes/RunDetail";
 import RunPipeline from "./routes/RunPipeline";
-import Settings from "./routes/Settings";
+import { AccountSettings, LegacySettings, OrgSettings, ServerSettings } from "./routes/Settings";
 import LibraryReview from "./routes/LibraryReview";
-import Account from "./routes/Account";
+import { EnvironmentEdit, EnvironmentView } from "./routes/EnvironmentPage";
 import ConfirmRequest from "./routes/ConfirmRequest";
 
 export default function App() {
   // The sign-in gate sits ABOVE the Router, not inside its root, and that
-  // placement is the whole point (ADR-0049).
+  // placement is the whole point.
   //
   // Gating inside `root={Layout}` looks equivalent and is not: flipping it
   // unmounts the router's OUTLET while the route context around it is still
@@ -29,23 +29,31 @@ export default function App() {
     <Show when={!unauthenticated()} fallback={<Login />}>
     <Router root={Layout}>
       <Route path="/" component={Repos} />
-      {/* Global, org-scoped settings (ADR-0060). One segment, so it can't
-          collide with the two-segment /:org/:repo tier. */}
-      <Route path="/settings" component={Settings} />
-      {/* Install or upgrade a library (ADR-0076 §4): its own page, so the
-          review can be sent to a second reviewer. */}
-      <Route path="/settings/libraries/review" component={LibraryReview} />
-      {/* Your sign-in accounts (ADR-0069) — everyone's, not admin-gated. */}
-      <Route path="/account" component={Account} />
-      {/* The same page, scrolled to Security (ADR-0073): where every "enroll
-          a passkey" link and the fresh-login redirect land (`?enroll=1`). */}
-      <Route path="/account/security" component={Account} />
-      {/* A machine's StepUpConfirmationRequest (ADR-0073 §6): the
+      {/* Settings (git-bug 734ffa1): Your account under /settings/<section>,
+          an org's settings under /orgs/<org>/settings/<section>. Static first
+          segments, so they outrank the /:org/:repo tier. */}
+      <Route path="/settings" component={LegacySettings} />
+      <Route path="/settings/:section" component={AccountSettings} />
+      <Route path="/settings/server/:section?" component={ServerSettings} />
+      <Route path="/orgs/:org/settings/:section?" component={OrgSettings} />
+      {/* Install or upgrade a library: its own URL inside the settings
+          frame, so the review can be sent to a second reviewer. */}
+      <Route path="/orgs/:org/settings/libraries/review" component={LibraryReview} />
+      {/* One Environment (git-bug c11abc5): read-only, and its edit screen,
+          both inside the settings frame. Five and six segments under the static /orgs, so they collide with
+          neither the settings sections nor /:org/:repo/runs/:id; the name is
+          one encoded segment. */}
+      <Route path="/orgs/:org/settings/environments/:env" component={EnvironmentView} />
+      <Route path="/orgs/:org/settings/environments/:env/edit" component={EnvironmentEdit} />
+      {/* Old addresses, kept for bookmarks and links sent before the move. */}
+      <Route path="/settings/libraries/review" component={LegacySettings} />
+      <Route path="/account" component={LegacySettings} />
+      <Route path="/account/security" component={LegacySettings} />
+      {/* A machine's StepUpConfirmationRequest: the
           `confirmation_url` its human opens. Three segments, so it can't
           collide with the two-segment /:org/:repo tier. */}
       <Route path="/security/confirm/:id" component={ConfirmRequest} />
-      {/* What is live where (ADR-0070), org-scoped; `?env=` picks the
-          Environment. One segment, like /settings. */}
+      {/* Start a Run of a pipeline in this repository. */}
       <Route path="/:org/:repo/run" component={RunPipeline} />
       <Route path="/:org/:repo/runs/:id" component={RunDetail} />
       <Route path="/:org/:repo" component={RepoView} />

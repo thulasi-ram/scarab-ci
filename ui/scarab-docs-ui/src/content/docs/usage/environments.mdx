@@ -42,7 +42,19 @@ Projects, and a pipeline that names an unknown Environment, or one that doesn't 
 is refused before any Pod starts.
 
 Org admins create Environments and edit their eligibility and rules, under the org's
-**Settings → Environments**.
+**Settings › Environments** (`/orgs/<org>/settings/environments`).
+
+## View and edit an Environment
+
+Each Environment has a read-only page, `/orgs/<org>/settings/environments/<name>`: its
+description, the baseline, which projects may deploy, and each project's overlay and privilege
+grant. Its **Edit** button opens `…/<name>/edit`, where you change the description, the baseline
+and eligibility (one **Save** sends only the parts you changed), each project's privilege grant,
+and delete the Environment. Deleting it, or withdrawing a grant, asks you to type the
+Environment's name.
+
+You cannot rename an Environment. Its name is the key every pipeline's `environment:` uses; to
+use another name, create a new Environment and delete the old one.
 
 ## The rules it holds
 
