@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1793629955,"nonce":"WJNuYtrYoQQ0aL1aFWJyXjNm14w=","message":"Fixed on main via PR #32: c51fb59e (one pipeline that cannot run no longer aborts the delivery) and 09b2b7e7 (only an unbindable deploy target is a per-pipeline refusal). Closing.","files":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":4,"timestamp":1793629955,"nonce":"OShKENntGqVSXqCGCTvjrgm2CvM=","status":2}]}
