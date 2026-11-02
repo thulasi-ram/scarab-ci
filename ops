@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1793631638,"nonce":"svXKQQYLlDQ+CR+Ouq5EzPNAluM=","message":"Sweep 2026-11-02. Fixed on main: 4dd5b465 + 5c5d2a9f, tokens see passkeys_hidden / usable_passkey_count and get 403 on /v1/me/security/events; test an_api_token_does_not_read_its_owner_s_passkeys_or_history.","files":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":4,"timestamp":1793631639,"nonce":"EimIwbOR/H4+ZFaU+P5tuHbWuew=","status":2}]}
