@@ -253,6 +253,16 @@ record. Read Breaking changes before you upgrade.
   only the parts that changed. Delete and withdrawing a grant ask you to type the name. An
   Environment cannot be renamed: its name is the key pipelines use.
   [View and edit an Environment](https://thulasi-ram.github.io/scarab-ci/usage/environments/#view-and-edit-an-environment)
+- **Personal API tokens** (git-bug a4cb94f). You mint, list and revoke your own tokens under
+  Settings › Your account › API tokens (`/v1/me/tokens`). Any member may mint a token up to the
+  role they hold in its org or project; minting still needs a passkey confirmation, and a token
+  still cannot mint tokens. Organization settings › API tokens lists every token issued in the
+  org with its owner, last use and call count, sorted by last use (the default), calls or
+  creation, and an org admin can revoke any of them; it no longer mints.
+  `POST /v1/orgs/{org}/tokens` still works and mints the same personal token. The call count is
+  approximate: calls are written at most once a minute per token. An org policy for who may
+  issue tokens, with which scopes and lifetimes, is not available yet.
+  [API tokens](https://thulasi-ram.github.io/scarab-ci/usage/api-tokens/)
 - **`scarab.uiUrl` (`SCARAB_UI_URL`)**, for when people open the web UI at another address
   than the one forges reach (`publicUrl`). The login callback, the passkey origin and the
   step-up confirmation link use it; webhook URLs and commit-status links stay on `publicUrl`.

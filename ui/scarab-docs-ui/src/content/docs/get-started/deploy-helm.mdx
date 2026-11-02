@@ -165,10 +165,11 @@ The web UI's settings page has a sidebar with up to three groups, and each secti
 address:
 
 - **Your account**, for everyone, under `/settings/<section>`: Profile (your sign-in accounts),
-  Security (your passkeys and security events) and Appearance.
+  Security (your passkeys and security events), [API tokens](/scarab-ci/usage/api-tokens/)
+  (your own tokens) and Appearance.
 - **Organization settings**, for the admins of an org, under `/orgs/<org>/settings/<section>`:
-  Connections, Members, Environments, Plugins, Libraries, Secrets, API tokens, Security and Event
-  log. `/orgs/<org>/settings` opens Connections. An admin of several orgs switches org at the top
+  Connections, Members, Environments, Plugins, Libraries, Secrets, API tokens (every token issued
+  in the org), Security and Event log. `/orgs/<org>/settings` opens Connections. An admin of several orgs switches org at the top
   of the group.
 - **Server administration**, for global admins, under `/settings/server/<section>`: Connect a
   forge.
