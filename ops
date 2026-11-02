@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1793631644,"nonce":"7Uc+iSiEiWA3HsdWyy+9gJrEtjc=","message":"Sweep 2026-11-02. Obsolete: ADR-0074 (fcd230ec, migration 0067) deleted the deployment_gates.rs fold and the deployment_inputs log.","files":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":4,"timestamp":1793631644,"nonce":"So1Pi0Be4qgkOFSMFKzGHZSvV7s=","status":2}]}
