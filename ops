@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1793631644,"nonce":"W3xxIaY06aWeTiQkNd33Y27Kxmw=","message":"Sweep 2026-11-02. Obsolete: ADR-0074 (fcd230ec, migration 0067) deleted the DeploymentGate resolver and the Environment deployment deadlines.","files":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":4,"timestamp":1793631644,"nonce":"UcNeNHWNks++NsAGJo6IOnkPF8A=","status":2}]}
