@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1793631645,"nonce":"TqnGzlWMcyVNUeo8bvIfWyugSp8=","message":"Sweep 2026-11-02. Obsolete: ADR-0074 deleted DeploymentConcurrencyHold and per-target concurrency (supersedes ADR-0071 §9).","files":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":4,"timestamp":1793631645,"nonce":"kznWZiXm7vZ2VBT2S3ExgAeLmN4=","status":2}]}
