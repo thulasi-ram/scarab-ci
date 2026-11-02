@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1793629955,"nonce":"cX3Qp93t2k1B3RNt4H6PZFpQSrI=","message":"Fixed on main via PR #32: 9c430582 refuses a version with leading/trailing whitespace and fixes json_kind (empty / blank / a string). Closing.","files":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":4,"timestamp":1793629955,"nonce":"uEQ9ZMz0694SYq7CiEeLANNAMCY=","status":2}]}
