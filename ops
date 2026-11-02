@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1793631639,"nonce":"5NlRzxJt/UIuAK23rIctIIUXTL0=","message":"Sweep 2026-11-02. Fixed on main: 4223f20f, README and ci.yml name route_table_equals_the_openapi_spec (step_up_routes.rs); the old name appears nowhere.","files":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":4,"timestamp":1793631639,"nonce":"9kCR9NMujncZLmk6hlUO0Tp5k+c=","status":2}]}
