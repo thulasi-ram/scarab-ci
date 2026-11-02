@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1793631640,"nonce":"d8YPzT0BEkOAkK+5HkuTu/aDpa8=","message":"Sweep 2026-11-02. Fixed on main: c56e47a9, step-up.ts shared / reissue answers spend no round; StepUpDialog re-sends for a fresh challenge; test step-up.test.ts.","files":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":4,"timestamp":1793631640,"nonce":"OGpLDNiMIfV7qUt47KpLFfcEVNI=","status":2}]}
