@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1793631644,"nonce":"y2jAMwu/3J7adjV0olRlEzIJQFQ=","message":"Sweep 2026-11-02. Obsolete: fixed in 7c9b0fa2, then ADR-0074 (PR #41) made deployment_requests a refused field, so no Step can declare it.","files":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":4,"timestamp":1793631644,"nonce":"1SiS04+RKDQzSlyf8YrNC0iLSF0=","status":2}]}
