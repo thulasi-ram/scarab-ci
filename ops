@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1793631636,"nonce":"+E8OS/sAX7RN/8wap4sj6iwK280=","message":"Sweep 2026-11-02. Fixed on main: 4ae6bd0d, attempts ordered by the a{n} suffix alone in PG attempts_on, the frontier guard and testkit; test in db_contract.rs (a1/a2/a7/a10 with a skewed start).","files":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":4,"timestamp":1793631637,"nonce":"6W9JN0mCFKl4NLOzaTub8AIja9I=","status":2}]}
