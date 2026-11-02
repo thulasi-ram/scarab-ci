@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1793629955,"nonce":"Kpfm+PS+n6I+g6d1pk3ij4TKmTc=","message":"Fixed on main via PR #32: 084d0e8e (refuse a library target input the library does not declare). Closing.","files":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":4,"timestamp":1793629955,"nonce":"PWQpctOhyeDdQzPOyAzNOAcUpTo=","status":2}]}
