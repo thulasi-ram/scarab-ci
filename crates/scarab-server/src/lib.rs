@@ -3372,6 +3372,11 @@ pub struct MeResponse {
     /// act on an unassigned connection (git-bug 19b0a45). Always `false` for
     /// an API token.
     pub global_admin: bool,
+    /// The orgs this principal may mint a personal API token in, sorted: every
+    /// org where they hold a role binding (org or project), and every org for
+    /// a bootstrap owner. The mint still checks the role in the exact scope.
+    /// Always empty for an API token, which may not mint.
+    pub token_mint_orgs: Vec<String>,
     /// The provider accounts this Principal can sign in with (ADR-0069).
     /// Empty when no identity store is wired (dev).
     pub identities: Vec<PrincipalIdentityDto>,
@@ -3392,6 +3397,7 @@ async fn me(State(st): State<AppState>, headers: HeaderMap) -> Result<Json<MeRes
     let admin_orgs = administrable_orgs(&st, &caller).await?;
     let global_admin = caller.may_globally(Action::Administer);
     let can_administer = global_admin || !admin_orgs.is_empty();
+    let token_mint_orgs = token_mint_orgs(&st, &caller).await;
     let identities = match st.identities.as_ref() {
         Some(store) => store
             .identities_of(&caller.principal.subject)
@@ -3420,8 +3426,33 @@ async fn me(State(st): State<AppState>, headers: HeaderMap) -> Result<Json<MeRes
         can_administer,
         admin_orgs,
         global_admin,
+        token_mint_orgs,
         identities,
     }))
+}
+
+/// The orgs `caller` may mint a personal API token in (see
+/// [`MeResponse::token_mint_orgs`]): the same sources the mint bounds a
+/// grant by, so the picker offers no org the mint refuses outright. A store
+/// failure only leaves the list shorter.
+async fn token_mint_orgs(st: &AppState, caller: &Caller) -> Vec<String> {
+    if caller.grant.is_some() {
+        return Vec::new();
+    }
+    let subject = &caller.principal.subject;
+    let mut orgs = match st.rbac.as_ref() {
+        Some(rbac) => rbac.orgs_of(subject).await.unwrap_or_default(),
+        None => Vec::new(),
+    };
+    if !token_owner_roles(st, subject).await.is_empty() {
+        if let Some(connections) = st.connections.as_ref() {
+            orgs.extend(connections.list_orgs().await.unwrap_or_default());
+        }
+    }
+    orgs.retain(|o| !o.is_empty());
+    orgs.sort();
+    orgs.dedup();
+    orgs
 }
 
 /// The orgs `principal` may administer (ADR-0060), sorted and deduplicated.
@@ -8550,7 +8581,8 @@ fn caller_sees_own_token(caller: &Caller, token: &scarab_identity::ApiToken) -> 
 }
 
 /// Revoke one of the caller's own tokens — permanent, and effective on the
-/// very next request that presents it.
+/// very next request that presents it. A signed-in person only: a token is
+/// refused.
 #[utoipa::path(
     delete,
     path = "/v1/me/tokens/{id}",
@@ -8558,6 +8590,7 @@ fn caller_sees_own_token(caller: &Caller, token: &scarab_identity::ApiToken) -> 
     summary = "Revoke one of your own API tokens (ADR-0049)",
     responses(
         (status = 204, description = "revoked"),
+        (status = 403, description = "the caller is an API token"),
         (status = 404, description = "no such live token of yours")
     )
 )]
@@ -8568,6 +8601,13 @@ async fn revoke_own_api_token(
 ) -> Result<StatusCode, ApiError> {
     let store = st.api_tokens.as_ref().ok_or(ApiError::NotFound)?;
     let caller = authenticate(&st, &headers, Action::Write).await?;
+    // A token may not revoke tokens here. This route checks ownership and
+    // nothing else, so a leaked read-only token could otherwise revoke every
+    // other token its owner holds, admin ones included. The org route asks
+    // for Administer on the org; a token that may do that can use it.
+    if caller.grant.is_some() {
+        return Err(ApiError::Forbidden);
+    }
     // Someone else's token answers exactly as a missing one does, so the
     // route says nothing about which ids exist.
     let token = store
@@ -8671,6 +8711,28 @@ impl ApiTokenUses {
             .map(|(id, (uses, last))| (id, uses, last))
             .collect()
     }
+}
+
+tokio::task_local! {
+    /// Whether this request's API token use has been counted. Set by
+    /// [`count_token_use_once`] around each routed request.
+    static TOKEN_USE_COUNTED: std::cell::Cell<bool>;
+}
+
+/// Run one routed request so that its API token is counted once, however
+/// many times it is authenticated. The step-up guard wraps every route in it.
+pub(crate) async fn count_token_use_once<F: std::future::Future>(request: F) -> F::Output {
+    TOKEN_USE_COUNTED
+        .scope(std::cell::Cell::new(false), request)
+        .await
+}
+
+/// Is this the first time the current request's token is counted? Outside
+/// [`count_token_use_once`] every authentication counts.
+fn first_token_use_of_request() -> bool {
+    TOKEN_USE_COUNTED
+        .try_with(|counted| !counted.replace(true))
+        .unwrap_or(true)
 }
 
 /// Write every call this process has counted and not yet stored. Best-effort:
@@ -8936,16 +8998,19 @@ async fn authenticate_api_token(
         return Err(ApiError::Unauthorized);
     }
     // Observability, coarse and best-effort: a failure to record the use must
-    // never fail the request that was being observed. Every call is counted
-    // in memory; the batch is written once the stored last use is a minute
-    // old (and by `flush_api_token_uses`).
-    st.api_token_uses.record(&token.id, now);
-    if token
-        .last_used_at
-        .is_none_or(|prev| now - prev >= API_TOKEN_TOUCH_INTERVAL_MS)
-    {
-        if let Some((uses, last)) = st.api_token_uses.take(&token.id) {
-            let _ = store.touch(&token.id, last, uses).await;
+    // never fail the request that was being observed. Every request is
+    // counted in memory, once even when it authenticates twice (the step-up
+    // guard and then the handler); the batch is written once the stored last
+    // use is a minute old (and by `flush_api_token_uses`).
+    if first_token_use_of_request() {
+        st.api_token_uses.record(&token.id, now);
+        if token
+            .last_used_at
+            .is_none_or(|prev| now - prev >= API_TOKEN_TOUCH_INTERVAL_MS)
+        {
+            if let Some((uses, last)) = st.api_token_uses.take(&token.id) {
+                let _ = store.touch(&token.id, last, uses).await;
+            }
         }
     }
     let roles = token_owner_roles(st, &token.owner_subject).await;

@@ -3305,6 +3305,13 @@ export interface components {
             roles: string[];
             /** @description Stable, forge-agnostic identity subject. */
             subject: string;
+            /**
+             * @description The orgs this principal may mint a personal API token in, sorted: every
+             *     org where they hold a role binding (org or project), and every org for
+             *     a bootstrap owner. The mint still checks the role in the exact scope.
+             *     Always empty for an API token, which may not mint.
+             */
+            token_mint_orgs: string[];
         };
         /** @description `GET /v1/me/security`. */
         MeSecurityResponse: {
@@ -6373,6 +6380,13 @@ export interface operations {
         responses: {
             /** @description revoked */
             204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description the caller is an API token */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };

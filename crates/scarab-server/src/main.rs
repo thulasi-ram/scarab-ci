@@ -1279,15 +1279,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }));
     }
     // API token call counts (git-bug a4cb94f) are counted in memory and
-    // written every minute, and once more at shutdown, so a rollout loses at
-    // most what arrives during the drain.
+    // written every minute, once more when the shutdown signal arrives, and a
+    // last time after the drain. The flusher is told to stop rather than
+    // aborted, so a batch it has taken from memory is always written. What
+    // arrives during the drain is written only if the drain ends inside the
+    // Pod's termination grace period: past it the process is killed, and
+    // those calls are lost (the count is approximate by contract).
     let token_uses_state = state.clone();
+    let (token_uses_stop, mut token_uses_stopped) = tokio::sync::oneshot::channel::<()>();
     let token_uses_flusher = state.api_tokens.is_some().then(|| {
         let st = state.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(60));
+            let signal = shutdown_signal();
+            tokio::pin!(signal);
+            let mut signalled = false;
             loop {
-                tick.tick().await;
+                tokio::select! {
+                    _ = tick.tick() => {}
+                    _ = &mut signal, if !signalled => signalled = true,
+                    _ = &mut token_uses_stopped => break,
+                }
+                // Each flush runs to the end: the stop is only seen between
+                // flushes.
                 scarab_server::flush_api_token_uses(&st).await;
             }
         })
@@ -1299,13 +1313,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Graceful shutdown (ADR-0053): SIGTERM/ctrl-c stops accepting, drains
     // in-flight connections (incl. SSE), then stops the driver — no torn
     // work on a rollout (safety still rests on crash-idempotency).
-    axum::serve(listener, app)
+    let served = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
-        .await?;
+        .await;
+    // Whatever serve returned: stop the flusher between flushes, then write
+    // what is left.
+    let _ = token_uses_stop.send(());
     if let Some(handle) = token_uses_flusher {
-        handle.abort();
+        let _ = handle.await;
     }
     scarab_server::flush_api_token_uses(&token_uses_state).await;
+    served?;
     if let Some(handle) = broker_handle {
         // It got the same signal; give it its own drain, then stop waiting.
         let _ = tokio::time::timeout(Duration::from_secs(10), handle).await;

@@ -1455,6 +1455,9 @@
           "204": {
             "description": "revoked"
           },
+          "403": {
+            "description": "the caller is an API token"
+          },
           "404": {
             "description": "no such live token of yours"
           }
@@ -10094,6 +10097,7 @@
           "can_administer",
           "admin_orgs",
           "global_admin",
+          "token_mint_orgs",
           "identities"
         ],
         "properties": {
@@ -10136,6 +10140,13 @@
           "subject": {
             "type": "string",
             "description": "Stable, forge-agnostic identity subject."
+          },
+          "token_mint_orgs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The orgs this principal may mint a personal API token in, sorted: every\norg where they hold a role binding (org or project), and every org for\na bootstrap owner. The mint still checks the role in the exact scope.\nAlways empty for an API token, which may not mint."
           }
         }
       },

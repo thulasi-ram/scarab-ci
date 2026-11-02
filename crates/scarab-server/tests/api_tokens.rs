@@ -1058,3 +1058,174 @@ async fn the_org_list_sorts_by_last_use_calls_or_creation() {
     let (st, _) = call(&h, get("/v1/orgs/acme/tokens", &amy)).await;
     assert_eq!(st, StatusCode::FORBIDDEN);
 }
+
+fn sorted_names(v: &serde_json::Value) -> Vec<String> {
+    let mut n = names(v);
+    n.sort();
+    n
+}
+
+/// A token on `/v1/me/tokens` lists only the tokens inside its own scope and
+/// may neither mint nor revoke: the personal revoke checks ownership and
+/// nothing else, so a leaked viewer token must not be able to revoke its
+/// owner's admin token. The owner's session can.
+#[tokio::test]
+async fn a_token_lists_within_its_scope_and_may_not_mint_or_revoke() {
+    let h = harness();
+    grant(&h, "amy", Scope::Org("acme".into()), Role::Admin).await;
+    grant(&h, "amy", Scope::Org("globex".into()), Role::Member).await;
+    let amy = login(&h.app, "amy-code").await;
+    let body = |org: &str, name: &str, role: &str, project: Option<&str>| {
+        let mut b =
+            serde_json::json!({ "org": org, "name": name, "role": role, "expires_in_days": 7 });
+        if let Some(p) = project {
+            b["project"] = serde_json::json!(p);
+        }
+        b
+    };
+    let (poller, poller_id) = mint_own(&h, &amy, body("acme", "poller", "viewer", None)).await;
+    let (_, deploy_id) = mint_own(&h, &amy, body("acme", "deploy", "admin", None)).await;
+    let (web, _) = mint_own(&h, &amy, body("acme", "web-only", "viewer", Some("web"))).await;
+    mint_own(&h, &amy, body("globex", "other", "member", None)).await;
+
+    // Listing: an org token sees its org's tokens, project ones included; a
+    // project token sees only its project's.
+    let (st, v) = call(&h, send("GET", "/v1/me/tokens", &poller, None)).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(sorted_names(&v), vec!["deploy", "poller", "web-only"]);
+    let (st, v) = call(&h, send("GET", "/v1/me/tokens", &web, None)).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(names(&v), vec!["web-only"]);
+
+    // Minting: refused for a token, whatever it asks for.
+    let (st, _) = call(
+        &h,
+        send(
+            "POST",
+            "/v1/me/tokens",
+            &poller,
+            Some(body("acme", "next", "viewer", None)),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+
+    // Revoking: refused for a token, a sibling's id and its own alike.
+    for id in [&deploy_id, &poller_id] {
+        let (st, _) = call(
+            &h,
+            send("DELETE", &format!("/v1/me/tokens/{id}"), &poller, None),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{id}");
+        assert!(h
+            .tokens
+            .by_id(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .revoked_at
+            .is_none());
+    }
+
+    // The owner's session revokes it.
+    let (st, _) = call(
+        &h,
+        send("DELETE", &format!("/v1/me/tokens/{deploy_id}"), &amy, None),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    assert!(h
+        .tokens
+        .by_id(&deploy_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .revoked_at
+        .is_some());
+}
+
+/// Anyone with a role in a scope may mint there, a viewer included, up to
+/// that role and no further.
+#[tokio::test]
+async fn a_viewer_mints_a_viewer_token_and_nothing_higher() {
+    let h = harness();
+    grant(&h, "eve", Scope::Org("acme".into()), Role::Viewer).await;
+    let eve = login(&h.app, "eve-code").await;
+
+    let (token, _) = mint_own(
+        &h,
+        &eve,
+        serde_json::json!({ "org": "acme", "name": "status", "role": "viewer", "expires_in_days": 7 }),
+    )
+    .await;
+    assert!(token.starts_with("scarab_pat_"));
+    let (st, v) = call(
+        &h,
+        send(
+            "POST",
+            "/v1/me/tokens",
+            &eve,
+            Some(serde_json::json!({ "org": "acme", "name": "up", "role": "member", "expires_in_days": 7 })),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+
+    // `/v1/me` offers acme to mint in.
+    let (st, v) = call(&h, get("/v1/me", &eve)).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["token_mint_orgs"], serde_json::json!(["acme"]));
+}
+
+/// An Admin of one project mints an admin token for that project, and
+/// nothing for the org around it: Org inherits down, never up.
+#[tokio::test]
+async fn a_project_admin_mints_for_the_project_but_not_the_org() {
+    let h = harness();
+    grant(
+        &h,
+        "amy",
+        Scope::Project {
+            org: "acme".into(),
+            name: "web".into(),
+        },
+        Role::Admin,
+    )
+    .await;
+    let amy = login(&h.app, "amy-code").await;
+
+    let (st, v) = call(
+        &h,
+        send(
+            "POST",
+            "/v1/me/tokens",
+            &amy,
+            Some(serde_json::json!({ "org": "acme", "project": "web", "name": "web-deploy", "role": "admin", "expires_in_days": 7 })),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{v}");
+    assert_eq!(v["record"]["project"], "web");
+
+    for role in ["admin", "viewer"] {
+        let (st, v) = call(
+            &h,
+            send(
+                "POST",
+                "/v1/me/tokens",
+                &amy,
+                Some(serde_json::json!({ "org": "acme", "name": "org-wide", "role": role, "expires_in_days": 7 })),
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{role}: {v}");
+    }
+
+    // The org of her project is offered; she holds nothing anywhere else.
+    let (_, v) = call(&h, get("/v1/me", &amy)).await;
+    assert_eq!(v["token_mint_orgs"], serde_json::json!(["acme"]));
+    let none = login(&h.app, "eve-code").await;
+    let (_, v) = call(&h, get("/v1/me", &none)).await;
+    assert_eq!(v["token_mint_orgs"], serde_json::json!([]));
+}

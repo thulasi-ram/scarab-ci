@@ -1340,3 +1340,24 @@ async fn a_member_s_own_events_and_the_request_records_stay_theirs() {
         .await;
     assert_eq!(st, StatusCode::NOT_FOUND);
 }
+
+/// One request counts one call, even when both the guard and the handler
+/// authenticate the token: a viewer token on a crown jewel passes the guard
+/// (it does not reach the op's role) and is refused by the handler.
+#[tokio::test]
+async fn a_request_the_guard_and_the_handler_both_authenticate_counts_once() {
+    let (h, _) = world(Backend::Memory).await;
+    let token = pat(&h, "v1", Scope::Org("acme".into()), Role::Viewer).await;
+    let (st, b) = h
+        .bearer("POST", "/v1/secrets", Some(secret("x")), &token)
+        .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{b}");
+    assert!(!is_step_up(st, &b), "{b}");
+
+    // Reading the list writes what is still counted in memory.
+    let s = h.browser_session(owner("amy")).await;
+    let (st, v) = h.cookie("GET", "/v1/me/tokens", None, &s).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v[0]["id"], "v1", "{v}");
+    assert_eq!(v[0]["use_count"], 1, "{v}");
+}

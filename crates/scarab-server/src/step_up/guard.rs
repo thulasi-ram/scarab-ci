@@ -41,8 +41,11 @@ use crate::{authenticate, route_table, run_scope, AppState, Caller, RouteEntry};
 pub const GUARD_BODY_LIMIT: usize = 2 * 1024 * 1024;
 
 /// The middleware, over [`route_table`].
+///
+/// It also scopes the request for API token counting: the guard and the
+/// handler may both authenticate a token, and the request counts once.
 pub(crate) async fn guard(State(st): State<AppState>, req: Request, next: Next) -> Response {
-    guard_with(route_table(), st, req, next).await
+    crate::count_token_use_once(guard_with(route_table(), st, req, next)).await
 }
 
 /// [`guard`] over an explicit table — so a test can prove an unclassified

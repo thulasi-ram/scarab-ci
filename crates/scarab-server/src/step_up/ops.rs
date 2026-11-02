@@ -824,7 +824,10 @@ pub static TOKEN_REVOKE_OWN: Op = op(
     OrgOf::None,
     &[],
     &["path:id"],
-);
+)
+// Its handler checks ownership only, so it refuses a token: a leaked
+// read-only token must not revoke its owner's other tokens.
+.not_by_token();
 pub static RUN_CANCEL: Op = op(
     "run.cancel",
     "Cancel a run",
@@ -1486,9 +1489,10 @@ mod tests {
     }
 
     /// The operations a machine caller may never raise a request for: the
-    /// browser-only flows, token minting for a token (git-bug ff7a014), and
-    /// assigning a connection's org, which only a global admin may do and a
-    /// token never is (git-bug 19b0a45).
+    /// browser-only flows, token minting for a token (git-bug ff7a014), the
+    /// personal token revoke (its handler refuses a token), and assigning a
+    /// connection's org, which only a global admin may do and a token never
+    /// is (git-bug 19b0a45).
     #[test]
     fn only_the_browser_flows_token_minting_and_org_assignment_refuse_a_machine() {
         let mut browser_only = Vec::new();
@@ -1509,7 +1513,12 @@ mod tests {
         not_by_token.sort_unstable();
         assert_eq!(
             not_by_token,
-            vec!["connection.assign_org", "token.mint", "token.mint_own"]
+            vec![
+                "connection.assign_org",
+                "token.mint",
+                "token.mint_own",
+                "token.revoke_own"
+            ]
         );
     }
 
