@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1793631641,"nonce":"ehNnbltr/e/fJf8jj4xEKXUwqP8=","message":"Sweep 2026-11-02. Fixed on main: ca029e0f, automount_service_account_token false on step, service and debug Pods (plugin and probe Pods already set it); Pod-spec test in executor-k8s lib.rs.","files":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":4,"timestamp":1793631642,"nonce":"Vm1iPiIA4i9GGaowvYshHuTvY9w=","status":2}]}
