@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1793631642,"nonce":"9TapdIYiuJG9uxidJGITQwtSgzI=","message":"Sweep 2026-11-02. Fixed on main: fd9fd68d, scarab-k8s-expansion::pass_through_k8s_expansion applied in plugin-k8s objects.rs deployment and probe.rs; tests in both.","files":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":4,"timestamp":1793631642,"nonce":"Hmxvxk/bLHJIcjfbe74nCfExbnc=","status":2}]}
