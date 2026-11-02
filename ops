@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1793631642,"nonce":"+5CxbirgpXP5cbkY+6X103ngFR4=","message":"Sweep 2026-11-02. Fixed on main: 912dc5c7, fetch_retry no-retry checks count requests instead of asserting elapsed time.","files":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":4,"timestamp":1793631642,"nonce":"S5CadYwHAGFVxtNEe9mMTRKXrrY=","status":2}]}
