@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+  mintableOrgs,
   daysLeft,
   expiresSoon,
   expiryLabel,
@@ -142,5 +143,14 @@ describe("scopeLabel", () => {
 
   it("names the project when the token is narrowed to one", () => {
     expect(scopeLabel({ org: "acme", project: "orders-api" })).toBe("acme/orders-api");
+  });
+});
+
+describe("mintableOrgs", () => {
+  it("offers each org once, administered or seen through a project, sorted", () => {
+    expect(mintableOrgs(["acme"], ["globex", "acme", ""])).toEqual(["acme", "globex"]);
+  });
+  it("offers nothing when the person is in no org", () => {
+    expect(mintableOrgs([], [])).toEqual([]);
   });
 });

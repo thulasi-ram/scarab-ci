@@ -139,3 +139,17 @@ export type TokenRole = (typeof ROLE_CHOICES)[number]["role"];
 export function scopeLabel(t: { org: string; project?: string | null }): string {
   return t.project ? `${t.org}/${t.project}` : t.org;
 }
+
+/** The orgs a person may be offered when minting a token for themselves:
+ * those they administer and those any visible project sits in, each once,
+ * sorted. The server still decides whether they hold a role there. */
+export function mintableOrgs(adminOrgs: readonly string[], projectOrgs: readonly string[]): string[] {
+  return [...new Set([...adminOrgs, ...projectOrgs])].filter((o) => o !== "").sort();
+}
+
+/** The orders the org's token list offers, in the server's `sort` values. */
+export const TOKEN_SORTS = [
+  { sort: "last_used", label: "Last used" },
+  { sort: "use_count", label: "Calls" },
+  { sort: "created", label: "Created" },
+] as const;

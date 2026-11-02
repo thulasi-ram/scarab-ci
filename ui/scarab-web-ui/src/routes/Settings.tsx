@@ -39,7 +39,7 @@ import OrgEnvironments from "../components/OrgEnvironments";
 import Plugins from "../components/Plugins";
 import Libraries from "../components/Libraries";
 import ScopedSecrets from "../components/ScopedSecrets";
-import ApiTokens from "../components/ApiTokens";
+import { MyApiTokens, OrgApiTokens } from "../components/ApiTokens";
 import OrgSecurity from "../components/OrgSecurity";
 import EventLog from "../components/EventLog";
 import Icon from "../components/Icon";
@@ -297,6 +297,8 @@ function accountBody(id: string): JSX.Element {
       return <LinkedAccounts />;
     case "security":
       return <SecuritySettings />;
+    case "tokens":
+      return <MyApiTokens />;
     case "appearance":
       return <AppearanceSettings />;
     default:
@@ -340,7 +342,7 @@ function orgBody(id: string, org: string): JSX.Element {
         </>
       );
     case "tokens":
-      return <ApiTokens org={org} />;
+      return <OrgApiTokens org={org} />;
     case "security":
       return <OrgSecurity org={org} />;
     case "events":

@@ -34,6 +34,7 @@ export interface SettingsCaller {
 export const ACCOUNT_SECTIONS: readonly SettingsSection[] = [
   { id: "profile", label: "Profile", sub: "your sign-in accounts" },
   { id: "security", label: "Security", sub: "your passkeys and security events" },
+  { id: "tokens", label: "API tokens", sub: "your tokens for the CLI and scripts" },
   { id: "appearance", label: "Appearance", sub: "palette and light or dark mode" },
 ];
 
@@ -46,7 +47,7 @@ export const ORG_SECTIONS: readonly SettingsSection[] = [
   { id: "plugins", label: "Plugins", sub: "installed plugins" },
   { id: "libraries", label: "Libraries", sub: "installed libraries" },
   { id: "secrets", label: "Secrets", sub: "org-wide secrets" },
-  { id: "tokens", label: "API tokens", sub: "machine credentials" },
+  { id: "tokens", label: "API tokens", sub: "every token issued in the org" },
   { id: "security", label: "Security", sub: "step-up settings and recent refusals" },
   { id: "events", label: "Event log", sub: "every security event, filterable" },
 ];

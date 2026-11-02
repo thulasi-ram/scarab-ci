@@ -3377,6 +3377,14 @@ h1, .crumb-head, .run-title {
 /* Inside the two-week renewal window: a warning an operator can still act on,
    which is the only reason to colour it at all. */
 .tok-soon { color: var(--copper); }
+/* The org's list (git-bug a4cb94f): one row per token, sorted by the server. */
+.tok-sort { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin: 4px 0 10px; }
+.tok-sort-label { font-size: var(--fs-sm); color: var(--muted-sage); margin-right: 4px; }
+.tok-table { font-size: 12.5px; }
+.tok-table td { vertical-align: middle; }
+.tok-table td:nth-child(n + 4):nth-child(-n + 7) { white-space: nowrap; }
+.tok-table tr.tok-dead { opacity: 0.6; }
+.tok-table-scroll { overflow-x: auto; }
 
 /* ---- dialog height and footer ---- */
 /* The default .modal clips its overflow, which is fine for a two-field dialog

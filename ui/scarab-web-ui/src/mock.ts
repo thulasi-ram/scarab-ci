@@ -1002,14 +1002,14 @@ const secretMatrix = {
   ],
 };
 
-// ── /v1/orgs/{org}/tokens (ADR-0049) ──────────────────────────────────────
-// Four records covering every state the panel renders differently: a live token
-// in daily use, one narrowed to a single project, one inside the two-week
-// expiry warning, and a revoked one (the graveyard row that proves a killed
-// credential stays visible). No plaintext anywhere — the mint 201 below is the
-// only place one exists, and it is obviously fake.
+// ── API tokens (ADR-0049, git-bug a4cb94f) ────────────────────────────────
+// Four records covering every state the panels render differently: a live token
+// in daily use, one narrowed to a single project and held by someone else, one
+// inside the two-week expiry warning, and a revoked one (a killed credential
+// stays visible). No plaintext anywhere: the mint 201 below is the only place
+// one exists, and it is obviously fake.
 const day = 86_400_000;
-const apiTokens = [
+const apiTokens: components["schemas"]["ApiTokenDto"][] = [
   {
     id: "9f2c1d84-0f2b-4f3a-9a11-2b7c5d0e4a10",
     name: "release-bot",
@@ -1021,6 +1021,7 @@ const apiTokens = [
     created_at: ago(40 * day),
     expires_at: now + 50 * day,
     last_used_at: ago(4 * min),
+    use_count: 18_412,
     revoked_at: null,
   },
   {
@@ -1034,6 +1035,7 @@ const apiTokens = [
     created_at: ago(9 * day),
     expires_at: now + 81 * day,
     last_used_at: ago(3 * 60 * min),
+    use_count: 1_203,
     revoked_at: null,
   },
   {
@@ -1047,6 +1049,7 @@ const apiTokens = [
     created_at: ago(84 * day),
     expires_at: now + 6 * day,
     last_used_at: ago(52 * min),
+    use_count: 9_870,
     revoked_at: null,
   },
   {
@@ -1060,9 +1063,51 @@ const apiTokens = [
     created_at: ago(120 * day),
     expires_at: now + 20 * day,
     last_used_at: ago(30 * day),
+    use_count: 312,
     revoked_at: ago(11 * day),
   },
 ];
+
+type MockToken = components["schemas"]["ApiTokenDto"];
+let mintedTokens = 0;
+
+/** A mint by a.kim: the record joins `apiTokens`, the plaintext is fake. */
+function mintMockToken(body: string, pathOrg?: string): Response {
+  const req = JSON.parse(body || "{}") as {
+    org?: string;
+    name?: string;
+    project?: string;
+    role?: string;
+    expires_in_days?: number;
+  };
+  mintedTokens += 1;
+  const record: MockToken = {
+    id: `0000ffff-0000-4fff-8fff-${String(mintedTokens).padStart(12, "0")}`,
+    name: req.name ?? "new token",
+    owner_subject: me.subject,
+    org: pathOrg ?? req.org ?? "acme",
+    project: req.project ?? null,
+    role: req.role ?? "viewer",
+    created_by: me.subject,
+    created_at: Date.now(),
+    expires_at: Date.now() + (req.expires_in_days ?? 90) * day,
+    last_used_at: null,
+    use_count: 0,
+    revoked_at: null,
+  };
+  apiTokens.unshift(record);
+  return json(
+    { token: "scarab_pat_EXAMPLE0NOTAREALTOKEN0000000000000000000000", record },
+    { status: 201 },
+  );
+}
+
+/** The server's org-list order: descending by `sort`, then newest first. */
+function sortMockTokens(tokens: MockToken[], sort: string): MockToken[] {
+  const key = (t: MockToken): number =>
+    sort === "use_count" ? t.use_count : sort === "created" ? 0 : (t.last_used_at ?? -1);
+  return [...tokens].sort((a, b) => key(b) - key(a) || b.created_at - a.created_at);
+}
 
 // ── step-up (ADR-0073) ────────────────────────────────────────────────────
 // Enforced, one admin (j.lee) without a passkey so the banner and the Settings
@@ -1350,29 +1395,26 @@ function route(pathname: string, search: string, method: string, body = ""): Res
   // /v1/repos/{org}/{repo}/refs  (ref picker — not on the shot screens)
   if (/^\/v1\/repos\/[^/]+\/[^/]+\/refs$/.test(p)) return json({ refs: [] });
 
-  // /v1/orgs/{org}/tokens — list, and a mint that returns an obviously-fake
-  // plaintext so the one-time reveal can be exercised (and screenshotted)
-  // without a server. Nothing is persisted: the list is the fixture above.
-  if (/^\/v1\/orgs\/[^/]+\/tokens$/.test(p)) {
-    if (method === "POST") {
-      return json(
-        {
-          token: "scarab_pat_EXAMPLE0NOTAREALTOKEN0000000000000000000000",
-          record: {
-            ...apiTokens[0],
-            id: "0000ffff-0000-4fff-8fff-000000000000",
-            name: "new token",
-            created_at: now,
-            expires_at: now + 90 * day,
-            last_used_at: null,
-          },
-        },
-        { status: 201 },
-      );
-    }
-    return json(apiTokens);
+  // API tokens (git-bug a4cb94f): your own under /v1/me/tokens, every token in
+  // the org under /v1/orgs/{org}/tokens. A mint returns an obviously-fake
+  // plaintext so the one-time reveal can be exercised (and screenshotted), and
+  // joins the list for the rest of the page's life, so a token minted under
+  // Your account shows in the org's list.
+  if (p === "/v1/me/tokens") {
+    if (method === "POST") return mintMockToken(body);
+    return json(apiTokens.filter((t) => t.owner_subject === me.subject));
   }
-  if (/^\/v1\/orgs\/[^/]+\/tokens\/[^/]+$/.test(p)) return json({}, { status: 204 });
+  if ((m = p.match(/^\/v1\/orgs\/([^/]+)\/tokens$/))) {
+    const org = decodeURIComponent(m[1]!);
+    if (method === "POST") return mintMockToken(body, org);
+    const sort = new URLSearchParams(search).get("sort") ?? "last_used";
+    return json(sortMockTokens(apiTokens.filter((t) => t.org === org), sort));
+  }
+  if ((m = p.match(/^\/v1\/(?:me|orgs\/[^/]+)\/tokens\/([^/]+)$/))) {
+    const t = apiTokens.find((x) => x.id === decodeURIComponent(m![1]!));
+    if (t && method === "DELETE") t.revoked_at = Date.now();
+    return new Response(null, { status: 204 });
+  }
 
   // Org-level Environments (ADR-0071): list, one, and echoing writes.
   if (/^\/v1\/orgs\/[^/]+\/environments$/.test(p)) return json(orgEnvironments);

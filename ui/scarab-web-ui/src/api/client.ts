@@ -203,21 +203,24 @@ export async function logout(): Promise<void> {
 export type ApiToken = components["schemas"]["ApiTokenDto"];
 /** The mint response: the plaintext, once, plus the record it just created. */
 export type MintedToken = components["schemas"]["MintedTokenDto"];
-/** The mint body — name, ceiling role and lifetime are all required. */
-export type MintTokenRequest = components["schemas"]["MintTokenRequest"];
+/** The personal mint body: the org, a name, a ceiling role and a lifetime are
+ * all required; the project is optional. */
+export type MintOwnTokenRequest = components["schemas"]["MintOwnTokenRequest"];
+/** How the org's list is ordered: by last use (the default), calls, or creation. */
+export type TokenSort = components["schemas"]["TokenSort"];
 
 /**
- * The tokens issued in an org (`GET /v1/orgs/{org}/tokens`), org- and
- * project-scoped alike.
+ * Every token issued in an org (`GET /v1/orgs/{org}/tokens`), whoever holds
+ * it, ordered by the server.
  *
  * Returns `null` when the deployment has no token store — every token endpoint
  * answers 404 before it authorizes anything, so that is "this server cannot
  * issue tokens", not "you have none" and not a failure. The caller renders the
  * difference; collapsing the three would tell an admin their tokens vanished.
  */
-export async function listApiTokens(org: string): Promise<ApiToken[] | null> {
+export async function listApiTokens(org: string, sort?: TokenSort): Promise<ApiToken[] | null> {
   const { data, error, response } = await api.GET("/v1/orgs/{org}/tokens", {
-    params: { path: { org } },
+    params: { path: { org }, query: sort ? { sort } : {} },
   });
   if (response.status === 404) return null;
   if (error || !data) {
@@ -227,29 +230,47 @@ export async function listApiTokens(org: string): Promise<ApiToken[] | null> {
 }
 
 /**
- * Mint a token (`POST /v1/orgs/{org}/tokens`). The 201 body carries the
+ * The caller's own tokens, in every org (`GET /v1/me/tokens`). `null` when the
+ * deployment has no token store, as for {@link listApiTokens}.
+ */
+export async function listMyApiTokens(): Promise<ApiToken[] | null> {
+  const { data, error, response } = await api.GET("/v1/me/tokens");
+  if (response.status === 404) return null;
+  if (error || !data) {
+    throw new Error(errorText(error) || "failed to load your API tokens");
+  }
+  return data;
+}
+
+/**
+ * Mint a token for yourself (`POST /v1/me/tokens`). The 201 body carries the
  * plaintext — the only time it exists outside the caller's hands.
  *
  * The 400s are worth surfacing verbatim rather than flattening to "invalid":
  * the server explains *which* ceiling was exceeded and what the minter actually
  * holds, which is the whole answer to "why can I not mint this".
  */
-export async function mintApiToken(
-  org: string,
-  body: MintTokenRequest,
-): Promise<MintedToken> {
-  const { data, error, response } = await api.POST("/v1/orgs/{org}/tokens", {
-    params: { path: { org } },
-    body,
-  });
+export async function mintMyApiToken(body: MintOwnTokenRequest): Promise<MintedToken> {
+  const { data, error, response } = await api.POST("/v1/me/tokens", { body });
   if (error || !data) {
     throw new Error(errorText(error) || `could not mint the token (${response.status})`);
   }
   return data;
 }
 
+/** Revoke one of your own tokens (`DELETE /v1/me/tokens/{id}`). */
+export async function revokeMyApiToken(id: string): Promise<void> {
+  const { error, response } = await api.DELETE("/v1/me/tokens/{id}", {
+    params: { path: { id } },
+  });
+  if (error) {
+    throw new Error(errorText(error) || `could not revoke the token (${response.status})`);
+  }
+}
+
 /**
- * Revoke a token (`DELETE /v1/orgs/{org}/tokens/{id}`) — permanent, and
+ * Revoke any token issued in an org, as its admin
+ * (`DELETE /v1/orgs/{org}/tokens/{id}`) — permanent, and
  * effective on the very next request that presents it. `id` is the record's id,
  * never the credential.
  */

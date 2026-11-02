@@ -50,6 +50,10 @@ describe("route table", () => {
     expect(resolveSection("org", "members")?.label).toBe("Members");
     expect(resolveSection("account", "security")?.label).toBe("Security");
     expect(resolveSection("account", "appearance")?.label).toBe("Appearance");
+    // API tokens are personal: every member mints their own under Your
+    // account, and the org section lists every token issued in the org.
+    expect(resolveSection("account", "tokens")?.label).toBe("API tokens");
+    expect(resolveSection("org", "tokens")?.label).toBe("API tokens");
     expect(resolveSection("org", "profile")).toBeUndefined();
     expect(resolveSection("account", "members")).toBeUndefined();
   });
@@ -70,6 +74,7 @@ describe("admin gating", () => {
     expect(groups[0]!.items.map((i) => i.href)).toEqual([
       "/settings/profile",
       "/settings/security",
+      "/settings/tokens",
       "/settings/appearance",
     ]);
   });

@@ -20,9 +20,9 @@ test("an admin lands on their org's settings and every section opens at its own 
   const nav = page.getByRole("navigation", { name: "Settings" });
   const links = nav.getByRole("link");
   const count = await links.count();
-  // Your account (3) + Organization settings (9) + Server administration (1)
+  // Your account (4) + Organization settings (9) + Server administration (1)
   // for the fixture's admin, who is a global admin.
-  expect(count).toBe(13);
+  expect(count).toBe(14);
 
   const seen = new Set<string>();
   for (let i = 0; i < count; i++) {
@@ -230,5 +230,41 @@ test("a global admin assigns an unassigned connection to an org", async ({ page 
   await assign.click();
   // Assigned, it is no longer unassigned, so the panel goes.
   await expect(unassigned).toHaveCount(0);
+  expect(errors).toEqual([]);
+});
+
+test("a token minted under Your account shows in the org's list", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/settings/tokens");
+  await expect(page.getByRole("heading", { level: 1, name: "API tokens", exact: true })).toBeVisible();
+  const page_ = page.locator("section.page");
+  await expect(page_.getByText("release-bot", { exact: true })).toBeVisible();
+
+  await page_.getByRole("button", { name: "New token" }).click();
+  await page.getByRole("textbox", { name: "name" }).fill("e2e laptop");
+  await page.getByRole("button", { name: "Mint token" }).click();
+  await expect(page.getByText(/^scarab_pat_/)).toBeVisible();
+  await page.getByRole("button", { name: "I've copied it" }).click();
+  await expect(page_.getByText("e2e laptop", { exact: true })).toBeVisible();
+
+  // The org's list: the new token with its owner, and no mint button there.
+  const nav = page.getByRole("navigation", { name: "Settings" });
+  await nav.locator('a[href="/orgs/acme/settings/tokens"]').click();
+  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/tokens$/);
+  const row = page_.getByRole("row", { name: /e2e laptop/ });
+  await expect(row).toBeVisible();
+  await expect(row.getByText("a.kim", { exact: true })).toBeVisible();
+  await expect(page_.getByRole("button", { name: "New token" })).toHaveCount(0);
+
+  // Sorting by calls puts the busiest token first.
+  await page_.getByRole("button", { name: "Calls", exact: true }).click();
+  await expect(page_.getByRole("row").nth(1)).toContainText("release-bot");
+
+  // Revoking asks for the token's name typed exactly.
+  await row.getByRole("button", { name: "Revoke", exact: true }).click();
+  const go = page_.getByRole("button", { name: "Revoke token" });
+  await expect(go).toBeDisabled();
+  await page_.getByRole("textbox", { name: "Type e2e laptop to confirm" }).fill("e2e laptop");
+  await expect(go).toBeEnabled();
   expect(errors).toEqual([]);
 });
