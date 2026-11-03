@@ -19,12 +19,14 @@
 
 pub mod ports;
 pub mod render;
+pub mod schedules;
 pub mod scheduler;
 
 pub use ports::{
     Clock, Db, Executor, LeaderTerm, LogChunks, SnapshotRetention, StepLaunch,
     WorkspaceSnapshots, LEADER_TX_BOUND_MS, SCHEDULER_LEASE,
 };
+pub use schedules::{ScheduleEntry, ScheduleFire, ScheduleStore};
 pub use scheduler::{
     cancel_run_request, fail_run_creation, gate_approvers, pin_run_snapshots, plan_rerun,
     record_gate_approval, reject_gate, release_gate, releases_plugin_gate, resolve_plugin_gate,

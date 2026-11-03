@@ -282,10 +282,10 @@ pub struct PolicyTestTrigger {
     /// `push`, `pull_request`, `tag`, `release`, `comment`, `cron`,
     /// `manual`, `api` or `upstream`.
     pub kind: String,
-    /// The symbolic ref, as admission sees it: `refs/heads/main` for a push
-    /// or a dispatch, `refs/pull/<n>/head` for a pull request,
-    /// `refs/tags/<tag>` for a tag or release. Required for those kinds;
-    /// `comment`, `cron` and `upstream` have none.
+    /// The symbolic ref, as admission sees it: `refs/heads/main` for a push,
+    /// a dispatch or a cron fire (the default branch), `refs/pull/<n>/head`
+    /// for a pull request, `refs/tags/<tag>` for a tag or release. Required
+    /// for those kinds; `comment` and `upstream` have none.
     #[serde(default, rename = "ref")]
     pub r#ref: Option<String>,
     #[serde(default)]
@@ -1216,7 +1216,13 @@ fn test_event(
             sha,
             reason: t.reason,
         },
-        TriggerKind::Comment | TriggerKind::Cron | TriggerKind::Upstream if t.r#ref.is_some() => {
+        TriggerKind::Cron => Event::Cron {
+            repo,
+            r#ref: needs_ref()?,
+            sha,
+            schedule: String::new(),
+        },
+        TriggerKind::Comment | TriggerKind::Upstream if t.r#ref.is_some() => {
             return Err(bad(format!("a {} trigger has no ref", t.kind)))
         }
         TriggerKind::Comment => Event::Comment {
@@ -1225,9 +1231,6 @@ fn test_event(
             repo,
             issue: 0,
             body: String::new(),
-        },
-        TriggerKind::Cron => Event::Cron {
-            schedule: String::new(),
         },
         TriggerKind::Upstream => Event::Upstream {
             repo,

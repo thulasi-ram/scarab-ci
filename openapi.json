@@ -6270,6 +6270,55 @@
         ]
       }
     },
+    "/v1/repos/{org}/{repo}/schedules": {
+      "get": {
+        "tags": [
+          "Repositories"
+        ],
+        "summary": "The Project's cron schedules and their next and last fires",
+        "operationId": "list_schedules",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "repo",
+            "in": "path",
+            "description": "project (repo) name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScheduleListResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
     "/v1/repos/{org}/{repo}/secrets/matrix": {
       "get": {
         "tags": [
@@ -11590,7 +11639,7 @@
               "string",
               "null"
             ],
-            "description": "The symbolic ref, as admission sees it: `refs/heads/main` for a push\nor a dispatch, `refs/pull/<n>/head` for a pull request,\n`refs/tags/<tag>` for a tag or release. Required for those kinds;\n`comment`, `cron` and `upstream` have none."
+            "description": "The symbolic ref, as admission sees it: `refs/heads/main` for a push,\na dispatch or a cron fire (the default branch), `refs/pull/<n>/head`\nfor a pull request, `refs/tags/<tag>` for a tag or release. Required\nfor those kinds; `comment` and `upstream` have none."
           },
           "sha": {
             "type": [
@@ -12527,6 +12576,91 @@
           "error",
           "stopped"
         ]
+      },
+      "ScheduleDto": {
+        "type": "object",
+        "description": "One schedule, with its Pipeline's last fire.",
+        "required": [
+          "pipeline",
+          "schedule",
+          "next_fire_at",
+          "source_sha"
+        ],
+        "properties": {
+          "last_fire": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ScheduleFireDto",
+                "description": "The Pipeline's last claimed slot, when it has one."
+              }
+            ]
+          },
+          "next_fire_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The next slot, Unix milliseconds. The default branch is read again\nthen; a schedule removed since does not fire."
+          },
+          "pipeline": {
+            "type": "string",
+            "description": "The pipeline file, `.scarab/<name>.yaml`."
+          },
+          "schedule": {
+            "type": "string",
+            "description": "The cron expression as written, in UTC."
+          },
+          "source_sha": {
+            "type": "string",
+            "description": "The default-branch commit this schedule was read from."
+          }
+        }
+      },
+      "ScheduleFireDto": {
+        "type": "object",
+        "description": "A claimed slot.",
+        "required": [
+          "schedule",
+          "slot_at",
+          "outcome"
+        ],
+        "properties": {
+          "outcome": {
+            "type": "string",
+            "description": "`pending`, `run`, `refused` (see the refused runs), `skipped` (its\n`when:` or step guards left nothing to run) or `missed` (the forge\ncould not be read in time)."
+          },
+          "run_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "schedule": {
+            "type": "string",
+            "description": "The schedule that fired."
+          },
+          "slot_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The slot, Unix milliseconds."
+          }
+        }
+      },
+      "ScheduleListResponse": {
+        "type": "object",
+        "description": "`GET /v1/repos/{org}/{repo}/schedules` body.",
+        "required": [
+          "schedules"
+        ],
+        "properties": {
+          "schedules": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ScheduleDto"
+            }
+          }
+        }
       },
       "SecretListResponse": {
         "type": "object",

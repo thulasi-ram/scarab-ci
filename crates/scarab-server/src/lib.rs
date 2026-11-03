@@ -79,6 +79,7 @@ pub mod retention;
 mod refused_runs;
 mod routes;
 pub mod run_origin;
+pub mod schedules;
 /// Slice b, criterion 5: the Run page's gate resolution per step.
 mod run_gate_view;
 pub use routes::{route_table, RouteEntry};
@@ -143,6 +144,10 @@ pub struct AppState {
     /// to [`forge`](AppState::forge), which is what a test wiring a single fake
     /// adapter wants.
     pub forge_adapters: Option<Arc<dyn scarab_forge::ForgeAdapters>>,
+    /// The cron schedule index and fired slots (git-bug 5d5fc8a). `None`
+    /// keeps `on: cron:` Pipelines from firing: no index is written on a
+    /// push and the scheduler loop is not started.
+    pub schedules: Option<Arc<dyn scarab_engine::ScheduleStore>>,
     /// Login provider (OAuth/OIDC). `None` leaves `/v1/auth/login` disabled.
     pub auth: Option<Arc<dyn scarab_identity::Authenticator>>,
     /// Session store. When `None`, API authz is **disabled** (dev/test default —
@@ -319,6 +324,7 @@ impl AppState {
             connections: None,
             forge: None,
             forge_adapters: None,
+            schedules: None,
             auth: None,
             sessions: None,
             api_tokens: None,
@@ -567,6 +573,12 @@ impl AppState {
     /// Set the forge port used to read in-repo config on a trigger.
     pub fn with_forge(mut self, forge: Arc<dyn scarab_forge::ForgePort>) -> Self {
         self.forge = Some(forge);
+        self
+    }
+
+    /// Set the cron schedule index (git-bug 5d5fc8a).
+    pub fn with_schedules(mut self, schedules: Arc<dyn scarab_engine::ScheduleStore>) -> Self {
+        self.schedules = Some(schedules);
         self
     }
 
@@ -4399,7 +4411,7 @@ fn config_ref(event: &scarab_forge::Event) -> String {
         // `sha` (ADR-0043): the config is read — and the Run pinned — at that
         // commit, exactly like Push reads at `after`. The symbolic `ref` is used
         // only for allowed_refs matching (see `Event::protection_ref`).
-        Event::Manual { sha, .. } | Event::Api { sha, .. } => sha.clone(),
+        Event::Manual { sha, .. } | Event::Api { sha, .. } | Event::Cron { sha, .. } => sha.clone(),
         _ => "HEAD".to_string(),
     }
 }
@@ -4413,7 +4425,9 @@ fn origin_sha(event: &scarab_forge::Event) -> Option<String> {
     match event {
         Event::Push { after, .. } => Some(after.clone()),
         Event::PullRequest { head, .. } => Some(head.clone()),
-        Event::Manual { sha, .. } | Event::Api { sha, .. } => Some(sha.clone()),
+        Event::Manual { sha, .. } | Event::Api { sha, .. } | Event::Cron { sha, .. } => {
+            Some(sha.clone())
+        }
         _ => None,
     }
 }
@@ -4628,17 +4642,30 @@ pub async fn trigger_runs_from_event(
     ports: AdmissionPorts<'_>,
     event: &scarab_forge::Event,
 ) -> Result<TriggerOutcome, TriggerError> {
-    // Repo-less events (cron/manual/api) don't carry in-repo config here.
-    let Some(repo) = event.repo() else {
+    // A cron fire starts one named Pipeline through the scheduler's own
+    // path (`schedules::fire`), never every Pipeline that declares `cron`.
+    if matches!(event, scarab_forge::Event::Cron { .. }) {
         return Ok(TriggerOutcome::default());
+    }
+    let files = read_event_pipelines(forge, event).await?;
+    trigger_runs_from_files(forge, db, clock, ports, event, &files).await
+}
+
+/// The event's `.scarab/` Pipeline files and their YAML, read at the event's
+/// commit. An absent directory yields nothing (not an error); a file that
+/// vanished between list and read is left out. Libraries are kept: the
+/// caller skips them.
+async fn read_event_pipelines(
+    forge: &dyn scarab_forge::ForgePort,
+    event: &scarab_forge::Event,
+) -> Result<Vec<(String, String)>, TriggerError> {
+    let Some(repo) = event.repo() else {
+        return Ok(Vec::new());
     };
     let git_ref = config_ref(event);
-
-    // Discover the pipeline files under `.scarab/`. An absent directory yields an
-    // empty listing → nothing to run (not an error).
     let entries = match forge.list_dir_at_ref(repo, &git_ref, CONFIG_DIR).await {
         Ok(e) => e,
-        Err(scarab_forge::ForgeError::Api(_)) => return Ok(TriggerOutcome::default()),
+        Err(scarab_forge::ForgeError::Api(_)) => return Ok(Vec::new()),
         Err(e) => return Err(TriggerError::Forge(e)),
     };
     let mut paths: Vec<String> = entries
@@ -4646,7 +4673,34 @@ pub async fn trigger_runs_from_event(
         .filter(|p| is_pipeline_file(p))
         .collect();
     paths.sort();
+    let mut files = Vec::new();
+    for path in paths {
+        let bytes = match forge.read_file_at_ref(repo, &git_ref, &path).await {
+            Ok(b) => b,
+            // A listed file that vanished between list and read → skip it.
+            Err(scarab_forge::ForgeError::Api(_)) => continue,
+            Err(e) => return Err(TriggerError::Forge(e)),
+        };
+        let yaml = String::from_utf8(bytes).map_err(|_| TriggerError::NotUtf8)?;
+        files.push((path, yaml));
+    }
+    Ok(files)
+}
 
+/// [`trigger_runs_from_event`] over Pipeline files already read at the
+/// event's commit ([`read_event_pipelines`]).
+async fn trigger_runs_from_files(
+    forge: &dyn scarab_forge::ForgePort,
+    db: &dyn Db,
+    clock: &dyn Clock,
+    ports: AdmissionPorts<'_>,
+    event: &scarab_forge::Event,
+    files: &[(String, String)],
+) -> Result<TriggerOutcome, TriggerError> {
+    let Some(repo) = event.repo() else {
+        return Ok(TriggerOutcome::default());
+    };
+    let git_ref = config_ref(event);
     let ctx = event.context();
     let kind = event.trigger_kind();
     let mut outcome = TriggerOutcome::default();
@@ -4654,14 +4708,8 @@ pub async fn trigger_runs_from_event(
     let installed = installed_libraries(ports.libraries, ports.plugins, &repo.owner)
         .await
         .map_err(TriggerError::Db)?;
-    for path in &paths {
-        let bytes = match forge.read_file_at_ref(repo, &git_ref, path).await {
-            Ok(b) => b,
-            // A listed file that vanished between list and read → skip it.
-            Err(scarab_forge::ForgeError::Api(_)) => continue,
-            Err(e) => return Err(TriggerError::Forge(e)),
-        };
-        let yaml = String::from_utf8(bytes).map_err(|_| TriggerError::NotUtf8)?;
+    for (path, yaml) in files {
+        let yaml = yaml.as_str();
         // A library (`kind: library`, ADR-0076 §2) runs only where it is
         // invoked, wherever it sits under `.scarab/`.
         if scarab_pipeline::is_library(&yaml) {
@@ -6797,15 +6845,35 @@ async fn ingest_event(
             Json(serde_json::json!({ "ignored": "no forge configured" })),
         ));
     };
-    match trigger_runs_from_event(
-        forge.as_ref(),
-        st.db.as_ref(),
-        st.clock.as_ref(),
-        st.admission_ports(),
-        &event,
-    )
-    .await
-    {
+    let triggered = async {
+        if matches!(event, scarab_forge::Event::Cron { .. }) {
+            return Ok(TriggerOutcome::default());
+        }
+        let files = read_event_pipelines(forge.as_ref(), &event).await?;
+        // A push to the live default branch rewrites the cron schedule index
+        // (git-bug 5d5fc8a) from the files this delivery read anyway.
+        if let Some(store) = st.schedules.as_ref() {
+            schedules::index_push(
+                forge.as_ref(),
+                store.as_ref(),
+                st.clock.as_ref(),
+                &event,
+                &files,
+            )
+            .await;
+        }
+        trigger_runs_from_files(
+            forge.as_ref(),
+            st.db.as_ref(),
+            st.clock.as_ref(),
+            st.admission_ports(),
+            &event,
+            &files,
+        )
+        .await
+    }
+    .await;
+    match triggered {
         // ADR-0071 §2: every deploy pipeline the Environment refused is named
         // in the body as `refused: [{pipeline, environment, reason}]` — beside
         // the runs that did start, or alone (200: nothing was accepted, but
@@ -12356,6 +12424,7 @@ impl utoipa::Modify for StepUpResponses {
         libraries::get_yank_impact,
         run_origin::get_step_origin,
         refused_runs::list_refused_runs,
+        schedules::list_schedules,
         policies::list_org_policies,
         policies::create_org_policy,
         policies::get_org_policy,
@@ -12545,6 +12614,9 @@ impl utoipa::Modify for StepUpResponses {
         CompileErrorResponse,
         refused_runs::RefusedRunDto,
         refused_runs::RefusedRunListResponse,
+        schedules::ScheduleDto,
+        schedules::ScheduleFireDto,
+        schedules::ScheduleListResponse,
         libraries::YankImpactRunDto,
         run_origin::OriginLinkDto,
         run_origin::RunYankDto,

@@ -38,6 +38,8 @@ pub use libraries::InMemoryLibraries;
 
 /// In-memory step-up stores (ADR-0073) and a real-AEAD test `Sealer`, with
 /// the Postgres adapter's single-use, expiry and compare-and-swap semantics.
+mod schedules;
+pub use schedules::InMemorySchedules;
 mod step_up;
 pub use step_up::{InMemoryChallenges, InMemoryPasskeys, InMemorySecurityEvents, InMemoryStepUp};
 
@@ -3446,11 +3448,67 @@ pub struct FakeForge {
     /// How many checkout credentials [`mint_checkout_credential`](ForgePort::mint_checkout_credential)
     /// has handed out — lets a test assert a refused launch minted nothing.
     checkout_mints: Mutex<u32>,
+    /// What [`default_branch`](ForgePort::default_branch) answers; empty
+    /// (default) answers `main`.
+    default_branch: Mutex<String>,
+    /// When set, every read (`default_branch`, `latest_commit`,
+    /// `list_dir_at_ref`, `read_file_at_ref`) fails with
+    /// [`RateLimited`](ForgeError::RateLimited).
+    rate_limited: Mutex<bool>,
+    /// How many `list_dir_at_ref` and `read_file_at_ref` calls were made: a
+    /// cron test asserts an unmoved head reads no file.
+    file_reads: Mutex<usize>,
 }
 
 impl FakeForge {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Add or replace a file after construction (the forge's content moved).
+    pub fn put_file(&self, path: impl Into<String>, content: impl Into<Vec<u8>>) {
+        self.files
+            .lock()
+            .unwrap()
+            .insert(path.into(), content.into());
+    }
+
+    /// Delete a file after construction.
+    pub fn remove_file(&self, path: &str) {
+        self.files.lock().unwrap().remove(path);
+    }
+
+    /// Point `git_ref` at `sha` after construction (a push moved it).
+    pub fn set_commit(&self, git_ref: impl Into<String>, sha: impl Into<String>) {
+        self.commits
+            .lock()
+            .unwrap()
+            .insert(git_ref.into(), sha.into());
+    }
+
+    /// Rename or switch the default branch.
+    pub fn set_default_branch(&self, name: impl Into<String>) {
+        *self.default_branch.lock().unwrap() = name.into();
+    }
+
+    /// Make every read fail as rate-limited, or stop doing so.
+    pub fn set_rate_limited(&self, on: bool) {
+        *self.rate_limited.lock().unwrap() = on;
+    }
+
+    /// How many `list_dir_at_ref` and `read_file_at_ref` calls were made.
+    pub fn file_reads(&self) -> usize {
+        *self.file_reads.lock().unwrap()
+    }
+
+    fn check_rate_limit(&self) -> Result<(), ForgeError> {
+        if *self.rate_limited.lock().unwrap() {
+            return Err(ForgeError::RateLimited {
+                retry_after_secs: Some(60),
+                detail: "fake forge is rate-limited".into(),
+            });
+        }
+        Ok(())
     }
 
     /// A forge that mints short-lived repository tokens (GitHub App mode):
@@ -3866,7 +3924,14 @@ pub fn fake_commit_sha(r#ref: &str) -> String {
 
 #[async_trait]
 impl ForgePort for FakeForge {
+    async fn default_branch(&self, _repo: &RepoRef) -> Result<String, ForgeError> {
+        self.check_rate_limit()?;
+        let name = self.default_branch.lock().unwrap().clone();
+        Ok(if name.is_empty() { "main".into() } else { name })
+    }
+
     async fn latest_commit(&self, _repo: &RepoRef, r#ref: &str) -> Result<Commit, ForgeError> {
+        self.check_rate_limit()?;
         let sha = self
             .commits
             .lock()
@@ -3886,6 +3951,8 @@ impl ForgePort for FakeForge {
         _ref: &str,
         path: &str,
     ) -> Result<Vec<u8>, ForgeError> {
+        self.check_rate_limit()?;
+        *self.file_reads.lock().unwrap() += 1;
         self.files
             .lock()
             .unwrap()
@@ -3900,6 +3967,8 @@ impl ForgePort for FakeForge {
         _ref: &str,
         dir: &str,
     ) -> Result<Vec<String>, ForgeError> {
+        self.check_rate_limit()?;
+        *self.file_reads.lock().unwrap() += 1;
         let prefix = format!("{}/", dir.trim_end_matches('/'));
         let mut out: Vec<String> = self
             .files

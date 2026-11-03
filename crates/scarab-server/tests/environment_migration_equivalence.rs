@@ -303,8 +303,15 @@ async fn assert_decides_as_legacy(
         );
     }
 
-    // Cron is repo-less: it never reaches admission, before or after.
+    // A cron event starts nothing on the webhook path: a fire goes through
+    // the scheduler's own path, one Pipeline at a time.
     let cron = Event::Cron {
+        repo: scarab_forge::RepoRef {
+            owner: "acme".into(),
+            name: "app".into(),
+        },
+        r#ref: "refs/heads/main".into(),
+        sha: "0123456789abcdef0123456789abcdef01234567".into(),
         schedule: "0 * * * *".into(),
     };
     assert!(trigger_run_from_event(

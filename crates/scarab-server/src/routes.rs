@@ -218,6 +218,7 @@ pub(crate) fn governed_routes() -> Routes {
         .get("/v1/repos", list_projects)
         .get("/v1/repos/{org}/{repo}/runs", list_repo_runs)
         .get("/v1/repos/{org}/{repo}/refused-runs", refused_runs::list_refused_runs)
+        .get("/v1/repos/{org}/{repo}/schedules", crate::schedules::list_schedules)
         .post("/v1/runs", &ops::RUN_CREATE, create_run)
         .get("/v1/runs", list_runs)
         .get("/v1/runs/{id}", get_run)

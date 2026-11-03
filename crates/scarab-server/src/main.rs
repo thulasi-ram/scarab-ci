@@ -939,6 +939,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // The same wiring, connection-scoped: repo enumeration for the bind
         // pick-list and per-repo webhook registration (ADR-0060).
         .with_forge_adapters(registry_forge.clone())
+        // The cron schedule index (git-bug 5d5fc8a): written by pushes to a
+        // default branch and by the cron leader below.
+        .with_schedules(pg.clone())
         // /v1/secrets management with the secrets store built above (ADR-0014).
         .with_secrets(secrets.clone())
         // Artifact list/download (ADR-0052), served from the object store.
@@ -1306,6 +1309,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         })
     });
+    // `on: cron:` fires (git-bug 5d5fc8a): a leader-gated loop on the
+    // replicas that drive Runs, like the retention sweeper.
+    if config.role.runs_driver() {
+        scarab_server::schedules::CronScheduler::new(state.clone(), replica_id.clone()).spawn();
+        tracing::info!(
+            "cron: scheduler loop started (lease {})",
+            scarab_server::schedules::CRON_LEASE
+        );
+    }
     let app = router(state);
 
     let listener = tokio::net::TcpListener::bind(&config.addr).await?;
