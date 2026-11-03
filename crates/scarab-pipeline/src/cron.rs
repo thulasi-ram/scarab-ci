@@ -12,6 +12,10 @@
 //! restricted (neither starts with `*`), a day matches if either matches;
 //! otherwise both must.
 //!
+//! Two fires of one schedule are at least [`MIN_INTERVAL_MINUTES`] apart:
+//! [`Schedule::parse`] refuses `* * * * *` and `*/2 * * * *`, as GitHub
+//! Actions does. Each fire costs forge API calls, and the floor bounds them.
+//!
 //! Pure: [`Schedule::next_after`] takes the time as an input and never reads
 //! a clock.
 
@@ -78,9 +82,28 @@ const DAY_OF_WEEK: Field = Field {
 /// schedule.
 const SEARCH_YEARS: i32 = 5;
 
+/// The shortest time, in minutes, a schedule may leave between two fires.
+pub const MIN_INTERVAL_MINUTES: u32 = 5;
+
 impl Schedule {
-    /// Parse a schedule. The error says which field is wrong and why.
+    /// Parse a schedule. The error says which field is wrong and why, or
+    /// that the schedule fires more often than [`MIN_INTERVAL_MINUTES`].
     pub fn parse(expr: &str) -> Result<Schedule, String> {
+        let schedule = Self::parse_fields(expr)?;
+        let gap = schedule.min_gap_minutes();
+        if gap < MIN_INTERVAL_MINUTES {
+            return Err(format!(
+                "`{}` can fire {gap} minute{} apart; schedules fire at most every \
+                 {MIN_INTERVAL_MINUTES} minutes",
+                expr.trim(),
+                if gap == 1 { "" } else { "s" }
+            ));
+        }
+        Ok(schedule)
+    }
+
+    /// The parse without the interval floor.
+    fn parse_fields(expr: &str) -> Result<Schedule, String> {
         let expr = expr.trim();
         let expanded = match expr.to_ascii_lowercase().as_str() {
             "@yearly" | "@annually" => "0 0 1 1 *".to_string(),
@@ -157,6 +180,29 @@ impl Schedule {
             return Some(t.and_utc().timestamp_millis());
         }
         None
+    }
+
+    /// The shortest gap, in minutes, between two fires. Taken over the
+    /// minutes of one day, and across midnight as if the next day also
+    /// matched, so a schedule is never let through on its day fields.
+    fn min_gap_minutes(&self) -> u32 {
+        let fires: Vec<u32> = (0..24)
+            .filter(|h| self.hours & (1 << h) != 0)
+            .flat_map(|h| {
+                (0..60)
+                    .filter(move |m| self.minutes & (1 << m) != 0)
+                    .map(move |m| h * 60 + m)
+            })
+            .collect();
+        let (Some(first), Some(last)) = (fires.first(), fires.last()) else {
+            return u32::MAX;
+        };
+        fires
+            .windows(2)
+            .map(|w| w[1] - w[0])
+            .chain(std::iter::once(first + 24 * 60 - last))
+            .min()
+            .unwrap_or(u32::MAX)
     }
 
     fn month_matches(&self, month: u32) -> bool {
@@ -269,8 +315,9 @@ mod tests {
             .timestamp_millis()
     }
 
+    /// The maths, without the interval floor, so `* * * * *` can be used.
     fn next(expr: &str, after: i64) -> i64 {
-        Schedule::parse(expr).unwrap().next_after(after).unwrap()
+        Schedule::parse_fields(expr).unwrap().next_after(after).unwrap()
     }
 
     #[test]
@@ -317,6 +364,13 @@ mod tests {
     }
 
     #[test]
+    fn schedules_five_minutes_apart_or_more_are_accepted() {
+        for expr in ["*/5 * * * *", "0,5 * * * *", "@hourly", "@daily", "58 3 * * *", "1,58 3 * * *"] {
+            assert!(Schedule::parse(expr).is_ok(), "{expr}");
+        }
+    }
+
+    #[test]
     fn a_leap_day_schedule_fires_on_the_next_leap_year() {
         assert_eq!(next("0 0 29 2 *", at(2026, 11, 3, 0, 0)), at(2028, 2, 29, 0, 0));
     }
@@ -338,6 +392,11 @@ mod tests {
             ("1,,2 * * * *", "empty list entry"),
             ("@reboot", "not a schedule this server knows"),
             ("0 0 30 2 *", "never fires"),
+            ("* * * * *", "can fire 1 minute apart"),
+            ("*/2 * * * *", "can fire 2 minutes apart"),
+            ("0,4 * * * *", "can fire 4 minutes apart"),
+            // Across midnight: 23:58 and 00:02.
+            ("2,58 0,23 * * *", "can fire 4 minutes apart"),
         ] {
             let e = Schedule::parse(expr).unwrap_err();
             assert!(e.contains(says), "{expr}: {e}");

@@ -541,6 +541,33 @@ pub fn cron_schedules(ir: &PipelineIr) -> &[String] {
         .unwrap_or_default()
 }
 
+/// The `on: cron:` schedules an authored Pipeline file declares, read from
+/// its `on:` block alone ([`triggers_of`]), without compiling it. The
+/// schedule index is built from this, so a Pipeline that does not compile
+/// still keeps its schedules: each fire compiles it and records the failure.
+/// A schedule that does not parse is left out; the compile reports it.
+/// Empty for a library or a file that does not parse.
+pub fn cron_schedules_of(yaml: &str) -> Vec<String> {
+    if is_library(yaml) {
+        return Vec::new();
+    }
+    let Ok(triggers) = triggers_of(yaml) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = triggers
+        .0
+        .get("cron")
+        .map(|f| f.schedule.clone())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| cron::Schedule::parse(s).is_ok())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// One step. The step contract (ADR-0008) is an OCI `image` + a `command`; the
 /// rest are DAG/placement modifiers. In authored YAML a step may carry a
 /// [`matrix`](StepSpec::matrix); after [`compile_yaml`] that field is always
@@ -6356,11 +6383,26 @@ mod tests {
     }
 
     #[test]
+    fn schedules_are_read_from_a_file_that_does_not_compile() {
+        // The steps are wrong, the `on:` block is not: the schedule index
+        // keeps the schedule, and each fire records the compile failure.
+        let yaml = r#"
+            on: { cron: { schedule: [" @hourly", "0 2 * * *", "*/1 * * * *", "nope"] } }
+            steps: [{ id: a }]
+            "#;
+        assert_eq!(cron_schedules_of(yaml), ["0 2 * * *", "@hourly"]);
+        assert!(cron_schedules_of("kind: library\non: { cron: { schedule: \"@daily\" } }").is_empty());
+        assert!(cron_schedules_of(": not yaml").is_empty());
+        assert!(cron_schedules_of("on: { push: {} }").is_empty());
+    }
+
+    #[test]
     fn a_cron_trigger_without_a_valid_schedule_fails_at_submit() {
         for (on, says) in [
             ("{ cron: {} }", "trigger `cron`: needs a `schedule`"),
             (r#"{ cron: { schedule: "0 25 * * *" } }"#, "hour: `25` is outside 0-23"),
             (r#"{ cron: { schedule: ["@daily", "@daily"] } }"#, "listed twice"),
+            (r#"{ cron: { schedule: "*/2 * * * *" } }"#, "at most every 5 minutes"),
             (r#"{ push: { schedule: "@daily" } }"#, "`schedule` belongs to `on: cron:`"),
         ] {
             let diags = errors(&format!("on: {on}\nsteps: [{{ id: a, image: busybox }}]"));
