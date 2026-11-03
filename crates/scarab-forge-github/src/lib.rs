@@ -629,9 +629,10 @@ impl GithubForge {
                     .and_then(|v| v.to_str().ok())
                     .and_then(|v| v.parse::<i64>().ok())
                     .map(|reset| (reset - now_unix_secs()).max(1) as u64);
+                let body = resp.text().await.unwrap_or_default();
                 return Err(ForgeError::RateLimited {
                     retry_after_secs: retry_after.or(reset_in),
-                    detail: format!("{status} after {attempt} attempts"),
+                    detail: format!("{status} after {attempt} attempts: {body}"),
                 });
             }
             return Ok(resp);
