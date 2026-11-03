@@ -2084,7 +2084,7 @@ async fn list_pipelines(
                 },
             },
             // A file that vanished between list and read → skip it.
-            Err(scarab_forge::ForgeError::Api(_)) => continue,
+            Err(scarab_forge::ForgeError::Api(_) | scarab_forge::ForgeError::NotFound(_)) => continue,
             Err(e) => return Err(ApiError::BadRequest(e.to_string())),
         };
         pipelines.push(entry);
@@ -4647,25 +4647,42 @@ pub async fn trigger_runs_from_event(
     if matches!(event, scarab_forge::Event::Cron { .. }) {
         return Ok(TriggerOutcome::default());
     }
-    let files = read_event_pipelines(forge, event).await?;
-    trigger_runs_from_files(forge, db, clock, ports, event, &files).await
+    let read = read_event_pipelines(forge, event).await?;
+    trigger_runs_from_files(forge, db, clock, ports, event, &read.files).await
+}
+
+/// The `.scarab/` Pipeline files of an event, read at its commit.
+struct EventPipelines {
+    /// Each file and its YAML. Libraries are kept: the caller skips them.
+    files: Vec<(String, String)>,
+    /// Every read either succeeded or the forge said the file is not there.
+    /// `false` when a read failed some other way (a timeout, a `5xx`): the
+    /// files are still used to trigger, as before, but the cron schedule
+    /// index is not rewritten from an incomplete list (git-bug 5d5fc8a).
+    complete: bool,
 }
 
 /// The event's `.scarab/` Pipeline files and their YAML, read at the event's
 /// commit. An absent directory yields nothing (not an error); a file that
-/// vanished between list and read is left out. Libraries are kept: the
-/// caller skips them.
+/// vanished between list and read is left out.
 async fn read_event_pipelines(
     forge: &dyn scarab_forge::ForgePort,
     event: &scarab_forge::Event,
-) -> Result<Vec<(String, String)>, TriggerError> {
+) -> Result<EventPipelines, TriggerError> {
+    let mut read = EventPipelines {
+        files: Vec::new(),
+        complete: true,
+    };
     let Some(repo) = event.repo() else {
-        return Ok(Vec::new());
+        return Ok(read);
     };
     let git_ref = config_ref(event);
     let entries = match forge.list_dir_at_ref(repo, &git_ref, CONFIG_DIR).await {
         Ok(e) => e,
-        Err(scarab_forge::ForgeError::Api(_)) => return Ok(Vec::new()),
+        Err(scarab_forge::ForgeError::Api(_)) => {
+            read.complete = false;
+            return Ok(read);
+        }
         Err(e) => return Err(TriggerError::Forge(e)),
     };
     let mut paths: Vec<String> = entries
@@ -4673,18 +4690,23 @@ async fn read_event_pipelines(
         .filter(|p| is_pipeline_file(p))
         .collect();
     paths.sort();
-    let mut files = Vec::new();
     for path in paths {
         let bytes = match forge.read_file_at_ref(repo, &git_ref, &path).await {
             Ok(b) => b,
             // A listed file that vanished between list and read → skip it.
-            Err(scarab_forge::ForgeError::Api(_)) => continue,
+            Err(scarab_forge::ForgeError::NotFound(_)) => continue,
+            // A failed read skips the file too, as it always did, but the
+            // list is no longer the whole of `.scarab/`.
+            Err(scarab_forge::ForgeError::Api(_)) => {
+                read.complete = false;
+                continue;
+            }
             Err(e) => return Err(TriggerError::Forge(e)),
         };
         let yaml = String::from_utf8(bytes).map_err(|_| TriggerError::NotUtf8)?;
-        files.push((path, yaml));
+        read.files.push((path, yaml));
     }
-    Ok(files)
+    Ok(read)
 }
 
 /// [`trigger_runs_from_event`] over Pipeline files already read at the
@@ -4884,7 +4906,7 @@ async fn prefetch_libs_and_compile(
                 worklist.extend(scarab_pipeline::invoke_refs(&src));
                 libs.insert(lib_path, src);
             }
-            Err(scarab_forge::ForgeError::Api(_)) => continue,
+            Err(scarab_forge::ForgeError::Api(_) | scarab_forge::ForgeError::NotFound(_)) => continue,
             Err(e) => return Err(TriggerError::Forge(e)),
         }
     }
@@ -5927,7 +5949,7 @@ async fn read_named_pipeline(
                 let yaml = String::from_utf8(bytes).map_err(|_| DispatchError::NotUtf8)?;
                 return Ok((candidate, yaml));
             }
-            Err(scarab_forge::ForgeError::Api(_)) => continue,
+            Err(scarab_forge::ForgeError::Api(_) | scarab_forge::ForgeError::NotFound(_)) => continue,
             Err(e) => return Err(DispatchError::Forge(e)),
         }
     }
@@ -6849,10 +6871,12 @@ async fn ingest_event(
         if matches!(event, scarab_forge::Event::Cron { .. }) {
             return Ok(TriggerOutcome::default());
         }
-        let files = read_event_pipelines(forge.as_ref(), &event).await?;
+        let read = read_event_pipelines(forge.as_ref(), &event).await?;
+        let files = read.files;
         // A push to the live default branch rewrites the cron schedule index
-        // (git-bug 5d5fc8a) from the files this delivery read anyway.
-        if let Some(store) = st.schedules.as_ref() {
+        // (git-bug 5d5fc8a) from the files this delivery read anyway, when
+        // every read succeeded.
+        if let (Some(store), true) = (st.schedules.as_ref(), read.complete) {
             schedules::index_push(
                 forge.as_ref(),
                 store.as_ref(),

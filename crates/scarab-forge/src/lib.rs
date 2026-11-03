@@ -721,6 +721,13 @@ pub enum ForgeError {
     /// reporting a forge outage.
     #[error("unsupported by this forge adapter: {0}")]
     Unsupported(String),
+    /// The forge answered that the file is not there (`404`). The only error
+    /// a caller may read as "absent": [`Api`](ForgeError::Api) also carries
+    /// timeouts, resets and `5xx`, and reading one of those as absent would
+    /// drop a schedule from the index (git-bug 5d5fc8a). Returned by
+    /// [`read_file_at_ref`](ForgePort::read_file_at_ref).
+    #[error("not found: {0}")]
+    NotFound(String),
     /// The forge refused the call for its rate limit, after the adapter's own
     /// retries. Distinct from [`Api`](ForgeError::Api), which several callers
     /// read as "that file is not there": a rate-limited read says nothing

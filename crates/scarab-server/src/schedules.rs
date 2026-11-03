@@ -65,6 +65,11 @@ pub const RETRY_AFTER_ERROR_MS: i64 = 10_000;
 pub const PER_OWNER_CHECKS: usize = 4;
 /// The wait after a rate limit that named no reset time.
 const DEFAULT_BACKOFF_MS: i64 = 60_000;
+/// How old a check may be when a slot fires from it. A check runs at most
+/// [`CHECK_EARLY_MS`] before the slot, and ticks are [`TICK_MS`] apart; a
+/// check older than this (the leader stalled, or the database was down) is
+/// made again, never reused.
+const REUSE_MAX_AGE_MS: i64 = CHECK_EARLY_MS + 2 * TICK_MS as i64;
 /// Due rows read per tick.
 const DUE_BATCH: u32 = 500;
 /// How long fired slots are kept: the schedules list shows the last one.
@@ -102,10 +107,11 @@ pub fn entries_from_files(
     out
 }
 
-/// Every Pipeline file under `.scarab/` at `sha`, with its YAML. A listing
-/// that fails is an error, never an empty list: an empty list would clear
-/// the project's index. A file that vanished between the listing and the
-/// read, or is not UTF-8, is left out.
+/// Every Pipeline file under `.scarab/` at `sha`, with its YAML. A failed
+/// listing or read is an error, never a shorter list: a shorter list would
+/// drop schedules from the project's index. Only a file the forge says is
+/// not there ([`NotFound`](ForgeError::NotFound)), or that is not UTF-8, is
+/// left out.
 pub async fn read_pipeline_files(
     forge: &dyn ForgePort,
     repo: &RepoRef,
@@ -126,7 +132,7 @@ pub async fn read_pipeline_files(
                     files.push((path, yaml));
                 }
             }
-            Err(ForgeError::Api(_)) => continue,
+            Err(ForgeError::NotFound(_)) => continue,
             Err(e) => return Err(e),
         }
     }
@@ -217,10 +223,16 @@ impl FireOutcome {
 }
 
 /// Start the Run of one Pipeline for one slot, at `sha` on `branch` (both
-/// just read from the forge). The shared read → compile → admission path,
-/// as a dispatch takes it: a Pipeline that does not compile, a launch input
-/// with no default, or an admission refusal is a refused Run; a `when:` on
-/// the cron trigger or step guards that leave nothing to run start nothing.
+/// just read from the forge). `schedules` are the Pipeline's schedules due
+/// at this slot, in order; the first whose `when:` matches and leaves a Step
+/// to run is the one the Run is for, so a `when: event.schedule == …` on one
+/// of two schedules naming the same minute still fires.
+///
+/// The shared read → compile → admission path, as a dispatch takes it: a
+/// Pipeline that does not compile, a launch input with no default, or an
+/// admission refusal is a refused Run; `when:` or step guards that leave
+/// nothing to run start nothing. A forge or database error is returned for
+/// the caller to record.
 #[allow(clippy::too_many_arguments)]
 pub async fn dispatch_cron(
     st: &AppState,
@@ -229,17 +241,21 @@ pub async fn dispatch_cron(
     branch: &str,
     sha: &str,
     pipeline: &str,
-    schedule: &str,
+    schedules: &[String],
 ) -> Result<FireOutcome, TriggerError> {
     let db = st.db.as_ref();
     let clock = st.clock.as_ref();
     let ports = st.admission_ports();
-    let event = Event::Cron {
+    let Some(first) = schedules.first() else {
+        return Ok(FireOutcome::Skipped);
+    };
+    let event_for = |schedule: &str| Event::Cron {
         repo: repo.clone(),
         r#ref: format!("refs/heads/{branch}"),
         sha: sha.to_string(),
         schedule: schedule.to_string(),
     };
+    let event = event_for(first);
     let refuse = |message: String| {
         let errors = vec![CompileErrorDto::other(message.clone())];
         let event = event.clone();
@@ -254,27 +270,23 @@ pub async fn dispatch_cron(
             Err(_) => return refuse("the Pipeline file is not UTF-8".into()).await,
         },
         // Gone since the check listed it: the schedule went with it.
-        Err(ForgeError::Api(_)) => return Ok(FireOutcome::Skipped),
-        Err(e) => return refuse(format!("the Pipeline could not be read: {e}")).await,
+        Err(ForgeError::NotFound(_)) => return Ok(FireOutcome::Skipped),
+        Err(e) => return Err(TriggerError::Forge(e)),
     };
     let installed = installed_libraries(ports.libraries, ports.plugins, &repo.owner).await?;
     let compiled = prefetch_libs_and_compile(forge, repo, sha, &yaml, &installed).await;
     let ir = match record_compile_failure(db, clock, &event, pipeline, compiled).await {
         Ok(ir) => ir,
         Err(TriggerError::Pipeline(_)) => return Ok(FireOutcome::Refused),
-        Err(e) => return refuse(format!("the Pipeline could not be compiled: {e}")).await,
+        Err(e) => return Err(e),
     };
     // The compiled Pipeline is the authority on what it declares.
-    if !scarab_pipeline::cron_schedules(&ir)
+    let declared: Vec<String> = scarab_pipeline::cron_schedules(&ir)
         .iter()
-        .any(|s| s.trim() == schedule)
-    {
-        return Ok(FireOutcome::Skipped);
-    }
-    let ctx = event.context();
-    if !scarab_pipeline::matches_trigger(&ir, "cron", &ctx)
-        .map_err(|e| TriggerError::Pipeline(e.to_string()))?
-    {
+        .map(|s| s.trim().to_string())
+        .collect();
+    let due: Vec<&String> = schedules.iter().filter(|s| declared.contains(s)).collect();
+    if due.is_empty() {
         return Ok(FireOutcome::Skipped);
     }
     let params = match scarab_pipeline::params::resolve_params(&ir.interface, &BTreeMap::new()) {
@@ -286,29 +298,39 @@ pub async fn dispatch_cron(
             .await
         }
     };
-    let excluded = scarab_pipeline::excluded_steps_with_params(&ir, &ctx, &params)
-        .map_err(|e| TriggerError::Pipeline(e.to_string()))?;
-    if excluded.len() == ir.steps.len() {
-        return Ok(FireOutcome::Skipped);
+    for schedule in due {
+        let event = event_for(schedule);
+        let ctx = event.context();
+        if !scarab_pipeline::matches_trigger(&ir, "cron", &ctx)
+            .map_err(|e| TriggerError::Pipeline(e.to_string()))?
+        {
+            continue;
+        }
+        let excluded = scarab_pipeline::excluded_steps_with_params(&ir, &ctx, &params)
+            .map_err(|e| TriggerError::Pipeline(e.to_string()))?;
+        if excluded.len() == ir.steps.len() {
+            continue;
+        }
+        return match admit_and_create_run(
+            forge,
+            db,
+            clock,
+            ports,
+            &event,
+            &ir,
+            pipeline,
+            &excluded,
+            Some(&params),
+        )
+        .await?
+        {
+            Admission::Created(run) => Ok(FireOutcome::Run(run.0)),
+            // Recorded by admission, except a branch-scoped Environment that
+            // does not admit the default branch, which is the rule working.
+            Admission::Refused(_) => Ok(FireOutcome::Refused),
+        };
     }
-    match admit_and_create_run(
-        forge,
-        db,
-        clock,
-        ports,
-        &event,
-        &ir,
-        pipeline,
-        &excluded,
-        Some(&params),
-    )
-    .await?
-    {
-        Admission::Created(run) => Ok(FireOutcome::Run(run.0)),
-        // Recorded by admission, except a branch-scoped Environment that does
-        // not admit the default branch, which is the rule working.
-        Admission::Refused(_) => Ok(FireOutcome::Refused),
-    }
+    Ok(FireOutcome::Skipped)
 }
 
 type ProjectKey = (String, String);
@@ -333,6 +355,8 @@ struct LoopState {
     /// An owner the forge rate-limited is not called before this.
     backoff_until: HashMap<String, i64>,
     last_prune: i64,
+    /// The lease term this replica last led in; a new term clears `checked`.
+    term: Option<i64>,
 }
 
 /// The cron leader's loop state. One per replica; only the lease holder acts.
@@ -381,16 +405,32 @@ impl CronScheduler {
         let (Some(store), Some(_)) = (self.st.schedules.clone(), self.st.forge.as_ref()) else {
             return Ok(Vec::new());
         };
-        let lease = self
+        let lease = match self
             .st
             .db
             .lease(CRON_LEASE, &self.owner, LEASE_TTL_MS)
             .await
-            .map_err(|e| e.to_string())?;
-        if lease.owner != self.owner {
-            // Another replica leads; what this one checked may go stale.
-            self.state.lock().unwrap().checked.clear();
-            return Ok(Vec::new());
+        {
+            Ok(lease) => lease,
+            Err(e) => {
+                // The lease may be lost meanwhile; nothing checked is kept.
+                self.state.lock().unwrap().checked.clear();
+                return Err(e.to_string());
+            }
+        };
+        {
+            let mut s = self.state.lock().unwrap();
+            if lease.owner != self.owner {
+                // Another replica leads; what this one checked may go stale.
+                s.checked.clear();
+                s.term = None;
+                return Ok(Vec::new());
+            }
+            if s.term != Some(lease.term) {
+                // Led again after another replica did: start fresh.
+                s.checked.clear();
+                s.term = Some(lease.term);
+            }
         }
         let now = self.st.clock.now().await.0;
         let prune = {
@@ -450,13 +490,20 @@ impl CronScheduler {
             name: key.1.clone(),
         };
         let earliest = rows.iter().map(|r| r.next_fire_at.0).min().unwrap_or(now);
+        let current = self.st.clock.now().await.0;
+        // A check is reused only when it was made for this slot, is still
+        // recent, and every row was read from the head it saw.
         let reuse = self
             .state
             .lock()
             .unwrap()
             .checked
             .get(key)
-            .filter(|c| c.at >= earliest - CHECK_EARLY_MS && c.sha == rows[0].source_sha)
+            .filter(|c| {
+                c.at >= earliest - CHECK_EARLY_MS
+                    && current - c.at <= REUSE_MAX_AGE_MS
+                    && rows.iter().all(|r| r.source_sha == c.sha)
+            })
             .cloned();
         let sem = self.semaphore(&repo.owner);
         let (checked, rows) = match reuse {
@@ -480,9 +527,20 @@ impl CronScheduler {
             }
         };
         let now = self.st.clock.now().await.0;
-        for row in rows.iter().filter(|r| r.next_fire_at.0 <= now) {
+        // One claim per Pipeline and slot: its schedules due then fire
+        // together, so whichever one's `when:` matches makes the Run.
+        let mut slots: BTreeMap<(String, i64), Vec<ScheduleEntry>> = BTreeMap::new();
+        for row in rows.into_iter().filter(|r| r.next_fire_at.0 <= now) {
+            slots
+                .entry((row.pipeline.clone(), row.next_fire_at.0))
+                .or_default()
+                .push(row);
+        }
+        let mut ordered: Vec<_> = slots.into_values().collect();
+        ordered.sort_by_key(|g| g[0].next_fire_at.0);
+        for group in ordered {
             let _permit = sem.acquire().await.expect("never closed");
-            self.fire(&repo, &checked, row, now).await;
+            self.fire(&repo, &checked, &group, now).await;
         }
     }
 
@@ -519,7 +577,7 @@ impl CronScheduler {
                 "the forge resolved the default branch to a value that is not a commit SHA".into(),
             ));
         }
-        let moved = rows.first().is_none_or(|r| r.source_sha != head.sha);
+        let moved = rows.is_empty() || rows.iter().any(|r| r.source_sha != head.sha);
         if moved {
             let files = read_pipeline_files(forge.as_ref(), repo, &head.sha).await?;
             let entries = entries_from_files(repo, &head.sha, &files, Timestamp(now));
@@ -553,22 +611,35 @@ impl CronScheduler {
         e: ForgeError,
     ) {
         tracing::warn!(org = %key.0, project = %key.1, "cron: checking the default branch failed: {e}");
-        {
-            let mut s = self.state.lock().unwrap();
-            s.retry_at.insert(key.clone(), now + RETRY_AFTER_ERROR_MS);
-            if let ForgeError::RateLimited {
-                retry_after_secs, ..
-            } = &e
-            {
-                let wait = retry_after_secs.map_or(DEFAULT_BACKOFF_MS, |s| s as i64 * 1000);
-                s.backoff_until.insert(key.0.clone(), now + wait);
-            }
-        }
+        // Waits run from when the check gave up, not from the tick: the
+        // adapter's own retries may have taken a while.
+        let failed_at = self.st.clock.now().await.0;
+        self.state
+            .lock()
+            .unwrap()
+            .retry_at
+            .insert(key.clone(), failed_at + RETRY_AFTER_ERROR_MS);
+        self.back_off(&key.0, &e, failed_at);
         let why = match &e {
             ForgeError::RateLimited { .. } => "the forge rate-limited Scarab".to_string(),
             other => format!("the forge could not be read: {other}"),
         };
         self.miss_overdue(rows, now, &why).await;
+    }
+
+    /// After a rate limit, leave the owner alone until the forge's reset.
+    fn back_off(&self, owner: &str, e: &ForgeError, at: i64) {
+        if let ForgeError::RateLimited {
+            retry_after_secs, ..
+        } = e
+        {
+            let wait = retry_after_secs.map_or(DEFAULT_BACKOFF_MS, |s| s as i64 * 1000);
+            self.state
+                .lock()
+                .unwrap()
+                .backoff_until
+                .insert(owner.to_string(), at + wait);
+        }
     }
 
     /// Skip each row whose slot is more than [`MISS_AFTER_MS`] past: claim it
@@ -622,42 +693,66 @@ impl CronScheduler {
         }
     }
 
-    /// Claim the row's slot, make its Run, record the outcome, and move the
-    /// row to its next slot after `now`.
-    async fn fire(&self, repo: &RepoRef, checked: &Checked, row: &ScheduleEntry, now: i64) {
+    /// Claim one Pipeline's slot, make its Run from the schedules due then
+    /// (`group`, all at the same slot), record the outcome, and move each row
+    /// to its next slot after `now`.
+    async fn fire(&self, repo: &RepoRef, checked: &Checked, group: &[ScheduleEntry], now: i64) {
         let store = self.st.schedules.clone().expect("checked by tick");
         let forge = self.st.forge.clone().expect("checked by tick");
+        let first = &group[0];
         let fire = ScheduleFire {
-            org: row.org.clone(),
-            project: row.project.clone(),
-            pipeline: row.pipeline.clone(),
-            schedule: row.schedule.clone(),
-            slot_at: row.next_fire_at,
+            org: first.org.clone(),
+            project: first.project.clone(),
+            pipeline: first.pipeline.clone(),
+            schedule: first.schedule.clone(),
+            slot_at: first.next_fire_at,
             fired_at: Timestamp(now),
             outcome: "pending".into(),
             run_id: None,
         };
         match store.claim_fire(&fire).await {
             Ok(true) => {
+                let schedules: Vec<String> = group.iter().map(|r| r.schedule.clone()).collect();
                 let outcome = match dispatch_cron(
                     &self.st,
                     forge.as_ref(),
                     repo,
                     &checked.branch,
                     &checked.sha,
-                    &row.pipeline,
-                    &row.schedule,
+                    &first.pipeline,
+                    &schedules,
                 )
                 .await
                 {
                     Ok(o) => o,
                     Err(e) => {
                         tracing::warn!(
-                            org = %row.org,
-                            project = %row.project,
-                            pipeline = %row.pipeline,
+                            org = %first.org,
+                            project = %first.project,
+                            pipeline = %first.pipeline,
                             "cron: the fire failed: {e}"
                         );
+                        if let TriggerError::Forge(fe) = &e {
+                            self.back_off(&repo.owner, fe, self.st.clock.now().await.0);
+                        }
+                        let event = Event::Cron {
+                            repo: repo.clone(),
+                            r#ref: format!("refs/heads/{}", checked.branch),
+                            sha: checked.sha.clone(),
+                            schedule: first.schedule.clone(),
+                        };
+                        let message = format!("the slot was skipped: {e}");
+                        let errors = vec![CompileErrorDto::other(message.clone())];
+                        record_refusal(
+                            self.st.db.as_ref(),
+                            self.st.clock.as_ref(),
+                            &event,
+                            &first.pipeline,
+                            "schedule",
+                            message,
+                            &errors,
+                        )
+                        .await;
                         FireOutcome::Refused
                     }
                 };
@@ -667,10 +762,10 @@ impl CronScheduler {
                 };
                 if let Err(e) = store
                     .finish_fire(
-                        &row.org,
-                        &row.project,
-                        &row.pipeline,
-                        row.next_fire_at,
+                        &first.org,
+                        &first.project,
+                        &first.pipeline,
+                        first.next_fire_at,
                         outcome.as_str(),
                         run,
                     )
@@ -679,15 +774,16 @@ impl CronScheduler {
                     tracing::warn!("cron: recording a fire failed: {e}");
                 }
             }
-            // Claimed already: another replica, or another schedule of this
-            // Pipeline naming the same minute.
+            // Claimed already: another replica made this slot's Run.
             Ok(false) => {}
             Err(e) => {
                 tracing::warn!("cron: claiming a slot failed: {e}");
                 return;
             }
         }
-        self.advance(row, now).await;
+        for row in group {
+            self.advance(row, now).await;
+        }
     }
 
     /// Move the row from its slot to the first slot after `now` (after a

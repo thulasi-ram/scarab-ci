@@ -36,6 +36,13 @@ impl EtagCache {
         }
     }
 
+    /// The `ETag` and body kept for `key`, read together: a request sends the
+    /// tag and, on a `304`, serves the body it read with it, so another
+    /// request replacing or forgetting the entry meanwhile changes nothing.
+    pub fn get(&self, key: &str) -> Option<(String, Vec<u8>)> {
+        self.entries.lock().unwrap().get(key).cloned()
+    }
+
     /// The `ETag` to send as `If-None-Match` for `key`, if one is kept.
     pub fn etag(&self, key: &str) -> Option<String> {
         self.entries

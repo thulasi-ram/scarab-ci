@@ -459,7 +459,8 @@ impl ForgejoForge {
     /// sends the kept `ETag` as `If-None-Match` and serves the kept body on a
     /// `304`. Returns the status (a `304` reads as `200`) and the body.
     async fn get_conditional(&self, url: &str) -> Result<(reqwest::StatusCode, Vec<u8>), ForgeError> {
-        let etag = self.etags.etag(url);
+        let cached = self.etags.get(url);
+        let etag = cached.as_ref().map(|(tag, _)| tag.clone());
         let resp = self
             .send(|| {
                 let req = self.client.get(url);
@@ -471,7 +472,7 @@ impl ForgejoForge {
             .await?;
         let status = resp.status();
         if status == reqwest::StatusCode::NOT_MODIFIED {
-            if let Some(body) = self.etags.body(url) {
+            if let Some((_, body)) = cached {
                 return Ok((reqwest::StatusCode::OK, body));
             }
         }
@@ -607,6 +608,9 @@ impl ForgePort for ForgejoForge {
             r#ref = r#ref
         ));
         let (status, bytes) = self.get_conditional(&url).await?;
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(ForgeError::NotFound(path.to_string()));
+        }
         if !status.is_success() {
             return Err(ForgeError::Api(format!(
                 "{status}: {}",

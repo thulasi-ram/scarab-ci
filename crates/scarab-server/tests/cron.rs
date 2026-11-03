@@ -329,3 +329,57 @@ async fn the_schedules_endpoint_lists_the_next_and_last_fire() {
     assert_eq!(s["last_fire"]["outcome"], "run");
     assert_eq!(s["last_fire"]["slot_at"], T0 + 30 * MIN);
 }
+
+#[tokio::test]
+async fn a_failed_read_at_fire_time_keeps_the_schedule() {
+    let h = H::new(&hourly("\"0 * * * *\""));
+    h.push("main", SHA1).await;
+    let eleven = T0 + 30 * MIN;
+    // The head moved without a webhook, and the forge then fails the read
+    // with a 502: the schedule must stay, not be read as removed.
+    h.forge.set_commit("main", SHA2);
+    h.forge.set_read_error(Some("502 Bad Gateway"));
+    h.tick_at(eleven + 2_000).await;
+    assert!(h.runs().await.is_empty());
+    assert_eq!(h.rows().await, [("0 * * * *".into(), eleven, SHA1.into())]);
+
+    h.forge.set_read_error(None);
+    h.tick_at(eleven + 20_000).await;
+    let runs = h.runs().await;
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].sha.as_deref(), Some(SHA2));
+}
+
+#[tokio::test]
+async fn a_check_is_not_reused_after_the_leader_stalled() {
+    let h = H::new(&hourly("\"0 * * * *\""));
+    h.push("main", SHA1).await;
+    let eleven = T0 + 30 * MIN;
+    // Checked early for the 11:00 slot, then nothing ticks for two hours
+    // while a push the webhook lost moves the head.
+    h.tick_at(eleven - 50_000).await;
+    h.forge.set_commit("main", SHA2);
+    h.forge
+        .put_file(PATH, hourly("\"0 * * * *\"").replace("true", "echo moved"));
+    h.tick_at(eleven + 2 * 60 * MIN).await;
+    let runs = h.runs().await;
+    assert_eq!(runs.len(), 1);
+    assert_eq!(
+        runs[0].sha.as_deref(),
+        Some(SHA2),
+        "fired from a stale check"
+    );
+}
+
+#[tokio::test]
+async fn the_schedule_whose_when_matches_makes_the_run() {
+    // Both schedules name 11:00; only the hourly one passes `when:`. The
+    // `*/30` one sorts first and must not use up the slot.
+    let yaml = "on: { cron: { schedule: [\"*/30 * * * *\", \"0 * * * *\"], when: \"event.schedule == '0 * * * *'\" } }\nsteps: [{ id: a, image: busybox, command: [\"true\"] }]\n";
+    let h = H::new(yaml);
+    h.push("main", SHA1).await;
+    h.tick_at(T0 + 30 * MIN + 1_000).await;
+    let runs = h.runs().await;
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].trigger_title.as_deref(), Some("0 * * * *"));
+}

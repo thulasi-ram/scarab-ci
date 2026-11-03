@@ -147,7 +147,9 @@ impl Schedule {
         // A schedule that names no real day (`0 0 31 2 *`) is refused rather
         // than kept as one that never fires.
         if schedule.next_after(0).is_none() {
-            return Err(format!("`{expr}` names no date that exists, so it never fires"));
+            return Err(format!(
+                "`{expr}` names no date that exists, so it never fires"
+            ));
         }
         Ok(schedule)
     }
@@ -244,6 +246,12 @@ fn parse_field(text: &str, field: &Field) -> Result<u64, String> {
                 if step == 0 {
                     return Err(format!("{}: a step must be at least 1", field.name));
                 }
+                if step > field.max {
+                    return Err(format!(
+                        "{}: step `{step}` is larger than {}",
+                        field.name, field.max
+                    ));
+                }
                 (r, step)
             }
             None => (part, 1),
@@ -254,10 +262,7 @@ fn parse_field(text: &str, field: &Field) -> Result<u64, String> {
             let lo = value(a, field)?;
             let hi = value(b, field)?;
             if lo > hi {
-                return Err(format!(
-                    "{}: range `{range}` runs backwards",
-                    field.name
-                ));
+                return Err(format!("{}: range `{range}` runs backwards", field.name));
             }
             (lo, hi)
         } else {
@@ -272,7 +277,11 @@ fn parse_field(text: &str, field: &Field) -> Result<u64, String> {
         let mut v = lo;
         while v <= hi {
             bits |= 1 << v;
-            v += step;
+            // A step past the field's end stops the walk; it never wraps.
+            match v.checked_add(step) {
+                Some(next) => v = next,
+                None => break,
+            }
         }
     }
     Ok(bits)
@@ -289,7 +298,11 @@ fn value(text: &str, field: &Field) -> Result<u32, String> {
         format!(
             "{}: `{text}` is not a number{}",
             field.name,
-            if field.names.is_empty() { "" } else { " or a name" }
+            if field.names.is_empty() {
+                ""
+            } else {
+                " or a name"
+            }
         )
     })?;
     if v < field.min || v > field.max {
@@ -317,7 +330,10 @@ mod tests {
 
     /// The maths, without the interval floor, so `* * * * *` can be used.
     fn next(expr: &str, after: i64) -> i64 {
-        Schedule::parse_fields(expr).unwrap().next_after(after).unwrap()
+        Schedule::parse_fields(expr)
+            .unwrap()
+            .next_after(after)
+            .unwrap()
     }
 
     #[test]
@@ -328,9 +344,15 @@ mod tests {
         assert_eq!(next("*/15 * * * *", t), at(2026, 11, 3, 10, 15));
         assert_eq!(next("0 2 * * *", t), at(2026, 11, 4, 2, 0));
         // Strictly after: a time on a slot moves to the next slot.
-        assert_eq!(next("0 * * * *", at(2026, 11, 3, 11, 0)), at(2026, 11, 3, 12, 0));
+        assert_eq!(
+            next("0 * * * *", at(2026, 11, 3, 11, 0)),
+            at(2026, 11, 3, 12, 0)
+        );
         // Seconds inside the minute do not count as the minute itself.
-        assert_eq!(next("0 * * * *", at(2026, 11, 3, 10, 59) + 30_000), at(2026, 11, 3, 11, 0));
+        assert_eq!(
+            next("0 * * * *", at(2026, 11, 3, 10, 59) + 30_000),
+            at(2026, 11, 3, 11, 0)
+        );
     }
 
     #[test]
@@ -341,7 +363,10 @@ mod tests {
         assert_eq!(next("0 0 * * fri", t), at(2026, 11, 6, 0, 0));
         assert_eq!(next("0 0 1 jan *", t), at(2027, 1, 1, 0, 0));
         assert_eq!(next("0 0 * * 7", t), at(2026, 11, 8, 0, 0)); // Sunday
-        assert_eq!(next("0 0 * * mon-fri", at(2026, 11, 6, 12, 0)), at(2026, 11, 9, 0, 0));
+        assert_eq!(
+            next("0 0 * * mon-fri", at(2026, 11, 6, 12, 0)),
+            at(2026, 11, 9, 0, 0)
+        );
     }
 
     #[test]
@@ -365,14 +390,24 @@ mod tests {
 
     #[test]
     fn schedules_five_minutes_apart_or_more_are_accepted() {
-        for expr in ["*/5 * * * *", "0,5 * * * *", "@hourly", "@daily", "58 3 * * *", "1,58 3 * * *"] {
+        for expr in [
+            "*/5 * * * *",
+            "0,5 * * * *",
+            "@hourly",
+            "@daily",
+            "58 3 * * *",
+            "1,58 3 * * *",
+        ] {
             assert!(Schedule::parse(expr).is_ok(), "{expr}");
         }
     }
 
     #[test]
     fn a_leap_day_schedule_fires_on_the_next_leap_year() {
-        assert_eq!(next("0 0 29 2 *", at(2026, 11, 3, 0, 0)), at(2028, 2, 29, 0, 0));
+        assert_eq!(
+            next("0 0 29 2 *", at(2026, 11, 3, 0, 0)),
+            at(2028, 2, 29, 0, 0)
+        );
     }
 
     #[test]
@@ -391,6 +426,10 @@ mod tests {
             ("* * * foo *", "month: `foo` is not a number or a name"),
             ("1,,2 * * * *", "empty list entry"),
             ("@reboot", "not a schedule this server knows"),
+            (
+                "0 1/4294967295 * * *",
+                "hour: step `4294967295` is larger than 23",
+            ),
             ("0 0 30 2 *", "never fires"),
             ("* * * * *", "can fire 1 minute apart"),
             ("*/2 * * * *", "can fire 2 minutes apart"),

@@ -3458,6 +3458,9 @@ pub struct FakeForge {
     /// How many `list_dir_at_ref` and `read_file_at_ref` calls were made: a
     /// cron test asserts an unmoved head reads no file.
     file_reads: Mutex<usize>,
+    /// When set, `read_file_at_ref` fails with this [`Api`](ForgeError::Api)
+    /// error (a timeout or a `5xx`, not "no such file").
+    read_error: Mutex<Option<String>>,
 }
 
 impl FakeForge {
@@ -3494,6 +3497,11 @@ impl FakeForge {
     /// Make every read fail as rate-limited, or stop doing so.
     pub fn set_rate_limited(&self, on: bool) {
         *self.rate_limited.lock().unwrap() = on;
+    }
+
+    /// Make `read_file_at_ref` fail as a forge outage would, or stop.
+    pub fn set_read_error(&self, error: Option<&str>) {
+        *self.read_error.lock().unwrap() = error.map(str::to_string);
     }
 
     /// How many `list_dir_at_ref` and `read_file_at_ref` calls were made.
@@ -3953,12 +3961,15 @@ impl ForgePort for FakeForge {
     ) -> Result<Vec<u8>, ForgeError> {
         self.check_rate_limit()?;
         *self.file_reads.lock().unwrap() += 1;
+        if let Some(e) = self.read_error.lock().unwrap().clone() {
+            return Err(ForgeError::Api(e));
+        }
         self.files
             .lock()
             .unwrap()
             .get(path)
             .cloned()
-            .ok_or_else(|| ForgeError::Api(format!("no such file: {path}")))
+            .ok_or_else(|| ForgeError::NotFound(path.to_string()))
     }
 
     async fn list_dir_at_ref(

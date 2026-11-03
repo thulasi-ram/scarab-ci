@@ -649,7 +649,8 @@ impl GithubForge {
         token: &str,
     ) -> Result<(reqwest::StatusCode, Vec<u8>), ForgeError> {
         let key = format!("{accept} {url}");
-        let etag = self.etags.etag(&key);
+        let cached = self.etags.get(&key);
+        let etag = cached.as_ref().map(|(tag, _)| tag.clone());
         let resp = self
             .send(
                 || {
@@ -664,7 +665,7 @@ impl GithubForge {
             .await?;
         let status = resp.status();
         if status == reqwest::StatusCode::NOT_MODIFIED {
-            if let Some(body) = self.etags.body(&key) {
+            if let Some((_, body)) = cached {
                 return Ok((reqwest::StatusCode::OK, body));
             }
         }
@@ -1002,6 +1003,9 @@ impl ForgePort for GithubForge {
         let (status, bytes) = self
             .get_conditional(&url, "application/vnd.github.raw+json", &token)
             .await?;
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(ForgeError::NotFound(path.to_string()));
+        }
         if !status.is_success() {
             return Err(ForgeError::Api(format!(
                 "{status}: {}",
