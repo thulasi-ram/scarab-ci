@@ -2885,6 +2885,7 @@ name = "scarab-pipeline"
 version = "0.2.2"
 dependencies = [
  "cel",
+ "chrono",
  "serde",
  "serde_json",
  "serde_yaml",
