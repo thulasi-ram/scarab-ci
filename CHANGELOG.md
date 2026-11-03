@@ -188,6 +188,14 @@ record. Read Breaking changes before you upgrade.
 
 ### Features
 
+- **Scheduled Runs.** `on: cron: { schedule: "0 2 * * *" }` (one expression or a list, UTC,
+  at most every 5 minutes) starts a Run from the head of the default branch. At each slot the
+  server reads the default branch, its head and the Pipeline from the forge again, so a schedule
+  removed or a default branch renamed takes effect even when its webhook was lost. A slot the
+  forge could not be read for is listed with the refused runs. The repository page lists each
+  schedule's next and last fire. Forge reads use conditional requests, and a rate-limited
+  forge is left alone until it resets. Migration 0078 adds two tables.
+  [Pipeline syntax](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#scheduled-runs-on-cron)
 - **Libraries** (ADR-0076). `invoke: file:<path>` for a library in the repository,
   `invoke: lib:<publisher>/<name>` for one installed in the org. An org admin installs a
   library from a git source pinned to a commit: fetch, review the diff, then install by

@@ -78,8 +78,8 @@ reuse, deploys, and the operational settings.
 
 `on:` maps a trigger kind to a filter. The kinds Scarab understands are `push`, `pull_request`,
 `tag`, `release`, `comment`, `cron`, `manual`, `api`, and `upstream`. An empty `on:` means the
-pipeline has no automatic triggers: it runs only when launched explicitly. `cron` and `upstream`
-parse, but nothing produces those events yet, so those two triggers never fire.
+pipeline has no automatic triggers: it runs only when launched explicitly. `upstream` parses, but
+nothing produces that event yet, so it never fires.
 
 ```yaml
 on:
@@ -105,6 +105,50 @@ on:
   manual: {}
   push: {}
 ```
+
+### Scheduled Runs: `on: cron`
+
+`on: cron` starts a Run on a schedule. `schedule:` takes one cron expression or a list:
+
+```yaml
+on:
+  cron:
+    schedule: "0 2 * * *"          # 02:00 UTC every day
+  # or: schedule: ["0 2 * * *", "30 14 * * mon-fri"]
+```
+
+A schedule has five fields, `minute hour day-of-month month day-of-week`, read in UTC. A field is
+`*`, a number, a range `a-b`, any of those with a step `/n`, or a comma-separated list. Months may
+be written `jan`-`dec` and days `sun`-`sat`; day-of-week `0` and `7` are both Sunday. When both
+day fields are set (neither starts with `*`), a day matches if either matches. The macros
+`@hourly`, `@daily`, `@weekly`, `@monthly` and `@yearly` are accepted too.
+
+The Pipeline check refuses a schedule that does not parse, that never fires (`0 0 30 2 *`), or
+that can fire less than 5 minutes apart (`*/2 * * * *`).
+
+A cron Run builds the head of the repository's **default branch**. Its ref is
+`refs/heads/<default branch>`, so an Environment's `allowed_refs` treats it as it treats a push
+to that branch, and its Headline is the schedule. `when:` applies, and the event context has
+`event.schedule`, `event.branch`, `event.ref` and `event.sha`. A cron Run has no launch inputs:
+every input the Pipeline declares needs a default, or the Run is refused.
+
+How a schedule is found and fired:
+
+- A push to the default branch records the schedules of every Pipeline file in it.
+- At each slot Scarab reads the default branch from the forge again, then its head, then the
+  Pipeline at that head. The Run starts only if the Pipeline there still declares the schedule. A
+  schedule removed, a Pipeline file deleted, or a default branch renamed takes effect at the next
+  slot, even when the webhook for that change was lost.
+- A schedule added in a push whose webhook was lost is not seen until the next push to the default
+  branch, or the next slot of another schedule in the same repository.
+- Each Pipeline gets at most one Run per minute, however many server replicas run and however many
+  of its schedules name that minute. After the server was down, a missed slot fires once, not once
+  for each slot it missed.
+- When the forge cannot be read within a minute after the slot (it is down, or it rate-limited
+  Scarab), the slot is skipped. It is listed with the repository's refused runs, as is a slot
+  whose Pipeline no longer compiles.
+
+The repository page lists each schedule with its next slot and the last one that fired.
 
 ## Interface: `interface.inputs` (and `outputs`)
 

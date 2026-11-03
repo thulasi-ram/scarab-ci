@@ -101,8 +101,8 @@ but none of them has carried production load.
   cluster and in `.github/workflows/e2e.yml`. A server Pod moved to another node, or a lost
   node, is not tested.
 - **Not proven yet.** Nothing has run at production scale.
-- **Missing.** `on: cron` and `on: upstream` triggers parse, but nothing produces those
-  events yet, so they never fire.
+- **Missing.** The `on: upstream` trigger parses, but nothing produces that event yet, so
+  it never fires.
 
 We build in thin end-to-end (tracer-bullet) slices. See
 [docs/positioning.md](docs/positioning.md) for what we do and don't claim, and why.
