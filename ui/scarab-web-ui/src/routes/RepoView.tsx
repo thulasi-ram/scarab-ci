@@ -12,7 +12,7 @@
 // shared link and the back button all land where you were. The defaults (Runs
 // tab, no filter) are the absent params, which keeps the bare repo URL clean.
 import { createResource, createSignal, createEffect, onCleanup, For, Show } from "solid-js";
-import { useParams, useNavigate, useSearchParams } from "@solidjs/router";
+import { A, useParams, useNavigate, useSearchParams } from "@solidjs/router";
 import { recordVisit } from "../visited";
 import {
   listRepoRuns,
@@ -25,6 +25,8 @@ import {
   type ProjectEnvironment,
   listRefusedRuns,
   type RefusedRun,
+  listSchedules,
+  type Schedule,
 } from "../api/client";
 import {
   isPermissive,
@@ -34,7 +36,7 @@ import {
   tightenable,
   toProtectionBody,
 } from "../environment-overlays";
-import { relTime, absTime, duration } from "../fmt";
+import { relTime, absTime, untilTime, duration } from "../fmt";
 import { forgeCommitUrl, forgePrUrl } from "../forge";
 import TriggerCell from "../components/TriggerCell";
 import RunNumber from "../components/RunNumber";
@@ -49,6 +51,7 @@ import Doodle from "../components/Doodle";
 import AsciiScene from "../components/AsciiScene";
 import { mergeRefused, runEnvironmentOptions, runListFilter } from "../runs-filter";
 import { refusalSummary } from "../compile-errors";
+import { fireOutcome, pipelineShortName } from "../schedules";
 import ponderIdle from "../../../brand/ascii/generated/ponder-ponder.json";
 
 type Tab = "runs" | "environments" | "secrets" | "settings";
@@ -179,6 +182,12 @@ export default function RepoView() {
   const [refused, { refetch: refetchRefused }] = createResource(
     () => ({ org: org(), repo: repo() }),
     (k) => listRefusedRuns(k.org, k.repo).catch(() => [] as RefusedRun[]),
+  );
+  // The Project's `on: cron:` schedules; an older server has none, and a repo
+  // without one shows no Schedules panel.
+  const [schedules, { refetch: refetchSchedules }] = createResource(
+    () => ({ org: org(), repo: repo() }),
+    (k) => listSchedules(k.org, k.repo).catch(() => [] as Schedule[]),
   );
   // The Project's Environments, for the Environment picker's options — the
   // loaded rows are already one Environment's once the filter is on. A caller
@@ -326,6 +335,20 @@ export default function RepoView() {
 
       {/* ---- Runs ---- */}
       <Show when={tab() === "runs"}>
+        <Show when={(schedules() ?? []).length > 0}>
+          <div class="panel">
+            <div class="panel-h">
+              <span>Schedules</span>
+              <span class="tok-count">{schedules()!.length}</span>
+            </div>
+            <div class="sched-body">
+              <For each={schedules()}>
+                {(s) => <ScheduleRow org={org()} repo={repo()} s={s} />}
+              </For>
+            </div>
+          </div>
+        </Show>
+
         <div class="filters">
           <For each={["all", "running", "failed", "refused"] as const}>
             {(f) => (
@@ -418,6 +441,7 @@ export default function RepoView() {
             onClick={() => {
               refetch();
               refetchRefused();
+              refetchSchedules();
             }}
           >
             <Icon icon="rotate-cw" size={13} /> Refresh
@@ -983,6 +1007,57 @@ function EnvDialog(props: {
   );
 }
 
+/** One `on: cron:` schedule: its pipeline, the expression (UTC), the next
+ *  slot, and how the Pipeline's last slot came out, linked to its Run. */
+function ScheduleRow(props: { org: string; repo: string; s: Schedule }) {
+  const s = () => props.s;
+  return (
+    <div class="rr-facts">
+      <span class="pfact strong" title={s().pipeline}>
+        <Icon icon="workflow" size={12} />
+        <span class="mono">{pipelineShortName(s().pipeline)}</span>
+      </span>
+      <span class="pfact" title={`read from ${s().source_sha.slice(0, 7)} on the default branch`}>
+        <Icon icon="clock" size={12} />
+        <span class="mono">{s().schedule}</span>
+        <span>UTC</span>
+      </span>
+      <span class="pfact" title={absTime(s().next_fire_at)}>
+        <Icon icon="timer" size={12} />
+        <span>next {untilTime(s().next_fire_at)}</span>
+      </span>
+      <Show
+        when={s().last_fire}
+        fallback={<span class="pfact subtle">not fired yet</span>}
+      >
+        {(f) => {
+          const o = () => fireOutcome(f().outcome);
+          return (
+            <>
+              <span class="pfact" title={absTime(f().slot_at)}>
+                <Icon icon="history" size={12} />
+                <span>last {relTime(f().slot_at)}</span>
+                <Show when={f().schedule !== s().schedule}>
+                  <span class="mono" title="the schedule that fired">({f().schedule})</span>
+                </Show>
+              </span>
+              <span class={`rr-status ${o().tone}`}>{o().label}</span>
+              <Show when={f().run_id}>
+                {(id) => (
+                  <A class="pfact link" href={`/${props.org}/${props.repo}/runs/${id()}`}>
+                    <Icon icon="play" size={12} />
+                    <span>open the run</span>
+                  </A>
+                )}
+              </Show>
+            </>
+          );
+        }}
+      </Show>
+    </div>
+  );
+}
+
 /** A trigger that did not become a Run (ADR-0076): where a Run would be,
  *  with the compact reason and its fix. */
 function RefusedRow(props: { r: RefusedRun }) {
@@ -1004,7 +1079,7 @@ function RefusedRow(props: { r: RefusedRun }) {
         <div class="rr-facts">
           <span class="pfact strong" title="pipeline">
             <Icon icon="workflow" size={12} />
-            <span class="mono">{r().pipeline.replace(/^\.scarab\//, "").replace(/\.ya?ml$/, "")}</span>
+            <span class="mono">{pipelineShortName(r().pipeline)}</span>
           </span>
           <Show when={r().sha}>
             {(sha) => (

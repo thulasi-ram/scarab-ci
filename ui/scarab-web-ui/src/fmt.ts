@@ -13,6 +13,18 @@ export function relTime(ms: number): string {
   return `${Math.round(h / 24)}d ago`;
 }
 
+/** Time until a future epoch-millis timestamp, the counterpart of `relTime`. */
+export function untilTime(ms: number): string {
+  const s = Math.round(Math.max(0, ms - Date.now()) / 1000);
+  if (s < 5) return "now";
+  if (s < 60) return `in ${s}s`;
+  const m = Math.round(s / 60);
+  if (m < 60) return `in ${m}m`;
+  const h = Math.round(m / 60);
+  if (h < 24) return `in ${h}h`;
+  return `in ${Math.round(h / 24)}d`;
+}
+
 export function absTime(ms: number): string {
   return new Date(ms).toLocaleString();
 }
