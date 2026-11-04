@@ -60,6 +60,14 @@ pub const LAUNCH_STEP: &str = "launch_step";
 /// same transition enqueues exactly one post.
 pub const RUN_STATUS_CHANGED: &str = "run_status_changed";
 
+/// Outbox `kind` for "this run finished": written in the same commit as a
+/// Run's move to `Succeeded` or `Failed` (from a status it ran in), so
+/// another Pipeline's `on: upstream:` can start from it (git-bug 149b4db).
+/// The payload is `{ "to": <RunStatus>, "generation": <u64> }`; the key is
+/// unique per (run, generation, state), so a Rerun that finishes again is a
+/// new message and a replay of the same transition is not.
+pub const RUN_FINISHED: &str = "run_finished";
+
 /// Outbox message kind: tear down a cancelled Run's **shared services**
 /// (ADR-0058) — Run-scoped units that are not steps, so no Attempt names
 /// them. Written by the Run's own `→ Cancelled` commit ([`cancel_run_request`],
@@ -2074,6 +2082,20 @@ async fn commit_run_transition_after(
             idempotency_key: run_status_post_key(run, posted, to),
             at: now,
         });
+        // A Run that ran and then succeeded or failed is news to the
+        // Pipelines that follow it (`on: upstream:`). A Run whose creation
+        // failed (`Pending → Failed`) never ran, and a cancelled one is not
+        // an ending a follow-up takes.
+        if matches!(to, RunStatus::Succeeded | RunStatus::Failed) && from != RunStatus::Pending {
+            outbox.push(OutboxMessage {
+                id: crate::OutboxId(0),
+                run: run.clone(),
+                kind: RUN_FINISHED.to_string(),
+                payload: serde_json::json!({ "to": to, "generation": posted }),
+                idempotency_key: format!("finished:{}:g{posted}:{to:?}", run.0),
+                at: now,
+            });
+        }
     }
     db.commit_run_transition(leader, run, from, to, generation, &events, &outbox)
         .await

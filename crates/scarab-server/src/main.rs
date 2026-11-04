@@ -1317,6 +1317,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "cron: scheduler loop started (lease {})",
             scarab_server::schedules::CRON_LEASE
         );
+        // `on: upstream:` follow-ups (git-bug 149b4db): every driver replica
+        // drains `run_finished`; the outbox lease keeps them apart.
+        scarab_server::followups::spawn(state.clone(), replica_id.clone());
+        tracing::info!("upstream: follow-up loop started");
     }
     let app = router(state);
 

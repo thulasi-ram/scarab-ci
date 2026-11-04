@@ -4027,7 +4027,8 @@ export interface components {
              * @description The symbolic ref, as admission sees it: `refs/heads/main` for a push,
              *     a dispatch or a cron fire (the default branch), `refs/pull/<n>/head`
              *     for a pull request, `refs/tags/<tag>` for a tag or release. Required
-             *     for those kinds; `comment` and `upstream` have none.
+             *     for those kinds; `comment` has none, and for `upstream` it is the
+             *     upstream Run's ref, if any.
              */
             ref?: string | null;
             sha?: string | null;
@@ -4239,8 +4240,9 @@ export interface components {
             /** @description The pipeline file, `.scarab/<name>.yaml`. */
             pipeline: string;
             /**
-             * @description `compile`, `yanked`, `policy`, `environment`, `event_field` or
-             *     `forge_token`.
+             * @description `compile`, `yanked`, `policy`, `environment`, `event_field`,
+             *     `forge_token`, `schedule` or `upstream` (a loop or too long a chain
+             *     of follow-ups).
              */
             reason_kind: string;
             sha?: string | null;

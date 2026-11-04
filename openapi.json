@@ -11639,7 +11639,7 @@
               "string",
               "null"
             ],
-            "description": "The symbolic ref, as admission sees it: `refs/heads/main` for a push,\na dispatch or a cron fire (the default branch), `refs/pull/<n>/head`\nfor a pull request, `refs/tags/<tag>` for a tag or release. Required\nfor those kinds; `comment` and `upstream` have none."
+            "description": "The symbolic ref, as admission sees it: `refs/heads/main` for a push,\na dispatch or a cron fire (the default branch), `refs/pull/<n>/head`\nfor a pull request, `refs/tags/<tag>` for a tag or release. Required\nfor those kinds; `comment` has none, and for `upstream` it is the\nupstream Run's ref, if any."
           },
           "sha": {
             "type": [
@@ -12074,7 +12074,7 @@
           },
           "reason_kind": {
             "type": "string",
-            "description": "`compile`, `yanked`, `policy`, `environment`, `event_field` or\n`forge_token`."
+            "description": "`compile`, `yanked`, `policy`, `environment`, `event_field`,\n`forge_token`, `schedule` or `upstream` (a loop or too long a chain\nof follow-ups)."
           },
           "sha": {
             "type": [

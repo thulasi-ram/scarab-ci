@@ -38,6 +38,40 @@ fn new_run_id() -> RunId {
     RunId(Uuid::now_v7().to_string())
 }
 
+/// The id of the Run `event` starts for the pipeline at `path`. A follow-up
+/// (`on: upstream:`) gets an id derived from its upstream Run, the verdict
+/// and the pipeline, so a redelivered `run_finished` finds the Run it already
+/// started instead of starting a second one (git-bug 149b4db). It keeps the
+/// v7 layout, dated by the upstream Run's id. Every other Run gets a new id.
+fn run_id_for(event: &scarab_forge::Event, path: &str) -> RunId {
+    use sha2::{Digest, Sha256};
+    let scarab_forge::Event::Upstream {
+        run,
+        generation,
+        status,
+        ..
+    } = event
+    else {
+        return new_run_id();
+    };
+    let digest = Sha256::digest(format!("upstream:{run}:g{generation}:{status}:{path}"));
+    let mut bytes = [0u8; 10];
+    bytes.copy_from_slice(&digest[..10]);
+    let millis = Uuid::parse_str(run)
+        .ok()
+        .and_then(|u| u.get_timestamp())
+        .map(|t| {
+            let (secs, nanos) = t.to_unix();
+            secs * 1000 + u64::from(nanos) / 1_000_000
+        })
+        .unwrap_or(0);
+    RunId(
+        uuid::Builder::from_unix_timestamp_millis(millis, &bytes)
+            .into_uuid()
+            .to_string(),
+    )
+}
+
 use scarab_engine::{
     AttemptId, Clock, ConcurrencyPolicy, Db, DbError, EventKind, EventPayload, RerunError, RunId,
     RunStatus, StepId, StepSpec, StepStatus, Timestamp, EVENT_VERSION, MAX_DELIVERY_ATTEMPTS,
@@ -80,6 +114,7 @@ mod refused_runs;
 mod routes;
 pub mod run_origin;
 pub mod schedules;
+pub mod followups;
 /// Slice b, criterion 5: the Run page's gate resolution per step.
 mod run_gate_view;
 pub use routes::{route_table, RouteEntry};
@@ -1980,6 +2015,41 @@ async fn dispatch(
             status: run_status_name(RunStatus::Pending).to_string(),
         }),
     ))
+}
+
+/// The name a Run of the pipeline at `path` is stamped with: its `name:`,
+/// else the bare file name. Commit statuses and `on: upstream:` use it.
+fn run_pipeline_name(ir: &scarab_pipeline::PipelineIr, path: &str) -> String {
+    ir.name.clone().unwrap_or_else(|| bare_pipeline_name(path))
+}
+
+/// Record on `run` the files among `files` whose `on: upstream:` follows
+/// the pipeline `name`, so its `run_finished` reads only those (none: no
+/// forge read at all). Best effort: without the record, the follow-up
+/// drain reads `.scarab/` at the Run's commit itself.
+async fn record_followups(
+    db: &dyn Db,
+    run: &RunId,
+    name: &str,
+    files: &[(String, String)],
+    at: Timestamp,
+) {
+    let paths: Vec<&str> = files
+        .iter()
+        .filter(|(_, yaml)| scarab_pipeline::upstream_pipeline_of(yaml).as_deref() == Some(name))
+        .map(|(path, _)| path.as_str())
+        .collect();
+    let recorded = db
+        .append_event(&EventKind {
+            version: EVENT_VERSION,
+            run: run.clone(),
+            kind: EventPayload::Raw(serde_json::json!({ "followups": paths })),
+            at,
+        })
+        .await;
+    if let Err(e) = recorded {
+        tracing::warn!(run = %run.0, error = %e, "recording a Run's follow-ups failed");
+    }
 }
 
 /// The bare selection name of a `.scarab/<name>.{yaml,yml}` pipeline (ADR-0043
@@ -4394,6 +4464,9 @@ fn supersede_key(event: &scarab_forge::Event, pipeline: &str) -> Option<String> 
     let scope = match event {
         Event::Push { r#ref, .. } => r#ref.clone(),
         Event::PullRequest { number, .. } => format!("pr-{number}"),
+        // A follow-up is keyed by its upstream's ref, so a newer chain on the
+        // same branch or pull request cancels an older one, as a push does.
+        Event::Upstream { r#ref, .. } if !r#ref.is_empty() => r#ref.clone(),
         _ => return None,
     };
     Some(format!("{}/{}:{scope}:{pipeline}", repo.owner, repo.name))
@@ -4412,6 +4485,8 @@ fn config_ref(event: &scarab_forge::Event) -> String {
         // commit, exactly like Push reads at `after`. The symbolic `ref` is used
         // only for allowed_refs matching (see `Event::protection_ref`).
         Event::Manual { sha, .. } | Event::Api { sha, .. } | Event::Cron { sha, .. } => sha.clone(),
+        // A follow-up builds the commit its upstream Run built.
+        Event::Upstream { sha, .. } => sha.clone(),
         _ => "HEAD".to_string(),
     }
 }
@@ -4425,9 +4500,10 @@ fn origin_sha(event: &scarab_forge::Event) -> Option<String> {
     match event {
         Event::Push { after, .. } => Some(after.clone()),
         Event::PullRequest { head, .. } => Some(head.clone()),
-        Event::Manual { sha, .. } | Event::Api { sha, .. } | Event::Cron { sha, .. } => {
-            Some(sha.clone())
-        }
+        Event::Manual { sha, .. }
+        | Event::Api { sha, .. }
+        | Event::Cron { sha, .. }
+        | Event::Upstream { sha, .. } => Some(sha.clone()),
         _ => None,
     }
 }
@@ -4648,7 +4724,7 @@ pub async fn trigger_runs_from_event(
         return Ok(TriggerOutcome::default());
     }
     let read = read_event_pipelines(forge, event).await?;
-    trigger_runs_from_files(forge, db, clock, ports, event, &read.files).await
+    trigger_runs_from_files(forge, db, clock, ports, event, &read.files, read.complete).await
 }
 
 /// The `.scarab/` Pipeline files of an event, read at its commit.
@@ -4710,14 +4786,18 @@ async fn read_event_pipelines(
 }
 
 /// [`trigger_runs_from_event`] over Pipeline files already read at the
-/// event's commit ([`read_event_pipelines`]).
-async fn trigger_runs_from_files(
+/// event's commit ([`read_event_pipelines`]). `complete` says `files` is the
+/// whole of `.scarab/` at that commit: each Run started then records which
+/// of them follow it (`on: upstream:`), so its `run_finished` needs no forge
+/// read when nothing does.
+pub(crate) async fn trigger_runs_from_files(
     forge: &dyn scarab_forge::ForgePort,
     db: &dyn Db,
     clock: &dyn Clock,
     ports: AdmissionPorts<'_>,
     event: &scarab_forge::Event,
     files: &[(String, String)],
+    complete: bool,
 ) -> Result<TriggerOutcome, TriggerError> {
     let Some(repo) = event.repo() else {
         return Ok(TriggerOutcome::default());
@@ -4737,6 +4817,13 @@ async fn trigger_runs_from_files(
         if scarab_pipeline::is_library(&yaml) {
             continue;
         }
+        // A follow-up already started by an earlier delivery of the same
+        // `run_finished` (its id is derived, [`run_id_for`]).
+        if matches!(event, scarab_forge::Event::Upstream { .. })
+            && db.run_status(&run_id_for(event, path)).await?.is_some()
+        {
+            continue;
+        }
 
         // Pre-fetch transitive `invoke:` libraries at this ref and compile
         // (ADR-0038) — the shared read-at-ref → compile primitive also used by
@@ -4754,6 +4841,32 @@ async fn trigger_runs_from_files(
             .map_err(|e| TriggerError::Pipeline(e.to_string()))?;
         if !matched {
             continue;
+        }
+        // A chain of follow-ups stops at a pipeline already in it (a loop)
+        // and at its length cap; either is a refused Run.
+        if let scarab_forge::Event::Upstream { chain, .. } = event {
+            let name = run_pipeline_name(&ir, path);
+            let refusal = if chain.contains(&name) {
+                Some(format!(
+                    "pipeline `{name}` is already in this chain of upstream Runs ({}), so it \
+                     would start itself again",
+                    chain.join(" → ")
+                ))
+            } else if chain.len() >= scarab_pipeline::MAX_UPSTREAM_CHAIN {
+                Some(format!(
+                    "this chain of upstream Runs ({}) is {} pipelines long, the most one chain \
+                     may be",
+                    chain.join(" → "),
+                    chain.len()
+                ))
+            } else {
+                None
+            };
+            if let Some(message) = refusal {
+                let errors = vec![CompileErrorDto::other(message.clone())];
+                record_refusal(db, clock, event, path, "upstream", message, &errors).await;
+                continue;
+            }
         }
 
         // Step-level `when:` guards against the event context (ADR-0009, 0033):
@@ -4775,7 +4888,13 @@ async fn trigger_runs_from_files(
         match admit_and_create_run(forge, db, clock, ports, event, &ir, path, &excluded, None)
             .await?
         {
-            Admission::Created(run) => outcome.runs.push(run),
+            Admission::Created(run) => {
+                if complete {
+                    let at = clock.now().await;
+                    record_followups(db, &run, &run_pipeline_name(&ir, path), files, at).await;
+                }
+                outcome.runs.push(run)
+            }
             // A branch-scoped Environment ignoring every other branch is the
             // rule working, not news: silent, as it always was.
             Admission::Refused(AdmissionRefusal::RefNotAllowed) => {}
@@ -5388,7 +5507,7 @@ async fn admit_unrecorded(
     }
 
     let now = clock.now().await;
-    let run = new_run_id();
+    let run = run_id_for(event, path);
     // ADR-0075: the `run.create` Policies, after the Environment's ref and
     // reason checks and before anything is persisted (`persist_run_from_ir`
     // is not atomic, so a deny after it would leave a partial Run). The run
@@ -5505,7 +5624,9 @@ fn run_create_trigger(
     let sha = match event {
         Event::Push { after, .. } => Some(after.clone()),
         Event::PullRequest { head, .. } => Some(head.clone()),
-        Event::Manual { sha, .. } | Event::Api { sha, .. } => Some(sha.clone()),
+        Event::Manual { sha, .. } | Event::Api { sha, .. } | Event::Upstream { sha, .. } => {
+            Some(sha.clone())
+        }
         _ => None,
     }
     .filter(|s| !s.is_empty());
@@ -6368,10 +6489,7 @@ async fn write_run_from_ir(
     // The pipeline name (the runs-list/detail "which pipeline is this") — the
     // explicit `name:` from the IR when set, else the bare `.scarab/<name>`
     // selection. Stamped beside origin.
-    let pipeline_name = ir
-        .name
-        .clone()
-        .unwrap_or_else(|| bare_pipeline_name(pipeline));
+    let pipeline_name = run_pipeline_name(ir, pipeline);
     db.set_run_pipeline(run, &pipeline_name).await?;
     // The Headline (ADR-0057): the one human line saying what this run is about,
     // extracted from the trigger event (a push's commit subject; thread B/C fill
@@ -6464,7 +6582,13 @@ async fn write_run_from_ir(
     db.append_event(&EventKind {
         version: EVENT_VERSION,
         run: run.clone(),
-        kind: EventPayload::Raw(serde_json::json!({ "trigger": event.context() })),
+        // The actor rides beside the trigger context, never in it (a login
+        // is not matching or template data); a follow-up reads it back to
+        // keep who started the chain (git-bug 149b4db).
+        kind: EventPayload::Raw(match event.actor() {
+            Some(actor) => serde_json::json!({ "trigger": event.context(), "actor": actor }),
+            None => serde_json::json!({ "trigger": event.context() }),
+        }),
         at: now,
     })
     .await?;
@@ -6883,6 +7007,7 @@ async fn ingest_event(
             return Ok(TriggerOutcome::default());
         }
         let read = read_event_pipelines(forge.as_ref(), &event).await?;
+        let complete = read.complete;
         let files = read.files;
         // A push to the live default branch rewrites the cron schedule index
         // (git-bug 5d5fc8a) from the files this delivery read anyway, when
@@ -6904,6 +7029,7 @@ async fn ingest_event(
             st.admission_ports(),
             &event,
             &files,
+            complete,
         )
         .await
     }

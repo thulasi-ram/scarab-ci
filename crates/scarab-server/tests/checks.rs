@@ -32,6 +32,22 @@ fn push() -> Event {
     }
 }
 
+/// Retire the `run_finished` messages (no pipeline here follows another).
+async fn drain_followups_once(forge: &dyn scarab_forge::ForgePort, db: &InMemoryDb, clock: &FakeClock) {
+    let started = scarab_server::followups::drain_followups(
+        forge,
+        db,
+        clock,
+        scarab_server::AdmissionPorts::governance(None),
+        "followups",
+        32,
+        30_000,
+    )
+    .await
+    .unwrap();
+    assert_eq!(started, 0);
+}
+
 /// Drive the run to terminal with a scripted executor outcome (bounded).
 async fn drive(db: &InMemoryDb, clock: &FakeClock, exec: &FakeExecutor, run: &RunId) {
     let sched = Scheduler::new(db, clock, exec, "sched-1");
@@ -260,6 +276,9 @@ async fn rejected_status_posts_are_retried_then_dead_lettered_not_silently_dropp
         .await
         .unwrap();
     assert_eq!(after, 0);
+    // The Run's `run_finished` (no pipeline follows `ci`) is retired by the
+    // follow-up drain, as the server runs it beside this one.
+    drain_followups_once(forge.as_ref(), &db, &clock).await;
     assert_eq!(
         db.outbox_depth().await.unwrap(),
         0,
@@ -332,5 +351,6 @@ async fn a_redelivered_start_post_never_lands_after_the_runs_verdict() {
     assert_eq!(late, 0, "the superseded start post is retired unposted");
     let states: Vec<StatusState> = healthy.statuses().iter().map(|s| s.state).collect();
     assert_eq!(states, vec![StatusState::Success]);
+    drain_followups_once(healthy.as_ref(), &db, &clock).await;
     assert_eq!(db.outbox_depth().await.unwrap(), 0, "and never redelivered");
 }

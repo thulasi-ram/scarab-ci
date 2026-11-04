@@ -195,6 +195,16 @@ record. Read Breaking changes before you upgrade.
 
 ### Features
 
+- **Runs after another pipeline.** `on: upstream: { pipeline: ci }` starts a Run when a Run
+  of `ci` in the same repository finishes (`status:` takes `succeeded`, the default, and
+  `failed`). The follow-up builds the same commit and runs on the same ref, so an
+  Environment's allowed refs apply to it. A newer follow-up on the same branch cancels an older
+  one, as a push does. A fork pull request's Run starts none, and a pipeline already in the
+  chain of follow-ups is a refused Run. This lets a build and its deploy be two pipelines, so
+  newest-wins still cancels stale builds and a rejected deploy gate no longer fails the build.
+  Other repositories cannot be followed. Before, `on: upstream` passed the Pipeline check and
+  never fired (git-bug 149b4db).
+  [Pipeline syntax](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#after-another-pipeline-on-upstream)
 - **Scheduled Runs.** `on: cron: { schedule: "0 2 * * *" }` (one expression or a list, UTC,
   at most every 5 minutes) starts a Run from the head of the default branch. At each slot the
   server reads the default branch, its head and the Pipeline from the forge again, so a schedule

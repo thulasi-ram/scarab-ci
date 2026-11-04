@@ -285,7 +285,8 @@ pub struct PolicyTestTrigger {
     /// The symbolic ref, as admission sees it: `refs/heads/main` for a push,
     /// a dispatch or a cron fire (the default branch), `refs/pull/<n>/head`
     /// for a pull request, `refs/tags/<tag>` for a tag or release. Required
-    /// for those kinds; `comment` and `upstream` have none.
+    /// for those kinds; `comment` has none, and for `upstream` it is the
+    /// upstream Run's ref, if any.
     #[serde(default, rename = "ref")]
     pub r#ref: Option<String>,
     #[serde(default)]
@@ -1222,7 +1223,7 @@ fn test_event(
             sha,
             schedule: String::new(),
         },
-        TriggerKind::Comment | TriggerKind::Upstream if t.r#ref.is_some() => {
+        TriggerKind::Comment if t.r#ref.is_some() => {
             return Err(bad(format!("a {} trigger has no ref", t.kind)))
         }
         TriggerKind::Comment => Event::Comment {
@@ -1235,6 +1236,13 @@ fn test_event(
         TriggerKind::Upstream => Event::Upstream {
             repo,
             run: String::new(),
+            generation: 0,
+            pipeline: String::new(),
+            status: "succeeded".into(),
+            r#ref: t.r#ref.clone().unwrap_or_default(),
+            sha,
+            actor,
+            chain: Vec::new(),
         },
     })
 }
