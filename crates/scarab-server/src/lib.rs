@@ -6713,7 +6713,7 @@ pub async fn drain_forge_statuses(
             }
         }
         let status = scarab_forge::Status {
-            context: "scarab".into(),
+            context: status_context(db.run_pipeline(&msg.run).await?.as_deref()),
             state: run_status_to_forge(to),
             target_url: format!("{}/runs/{}", public_url.trim_end_matches('/'), msg.run.0),
         };
@@ -6795,6 +6795,17 @@ async fn status_post_superseded(
             ))
             .await?),
         _ => Ok(false),
+    }
+}
+
+/// The commit-status context a Run posts under: `scarab/<pipeline>`, one per
+/// pipeline, so two pipelines on one commit do not overwrite each other's
+/// status. `<pipeline>` is the Run's pipeline name (its `name:`, else the
+/// file name). A Run with no stamped name posts under `scarab`.
+fn status_context(pipeline: Option<&str>) -> String {
+    match pipeline.map(str::trim).filter(|p| !p.is_empty()) {
+        Some(p) => format!("scarab/{p}"),
+        None => "scarab".into(),
     }
 }
 

@@ -85,7 +85,7 @@ async fn run_start_and_success_post_pending_then_success() {
     assert_eq!(posted, 2);
     let states: Vec<StatusState> = forge.statuses().iter().map(|s| s.state).collect();
     assert_eq!(states, vec![StatusState::Pending, StatusState::Success]);
-    assert!(forge.statuses().iter().all(|s| s.context == "scarab"));
+    assert!(forge.statuses().iter().all(|s| s.context == "scarab/ci"));
     // Every status carries the REQUIRED run deep-link (ADR-0046).
     assert!(
         forge
@@ -109,6 +109,53 @@ async fn run_start_and_success_post_pending_then_success() {
     .unwrap();
     assert_eq!(again, 0);
     assert_eq!(forge.statuses().len(), 2, "no duplicate posts");
+}
+
+#[tokio::test]
+async fn two_pipelines_on_one_commit_post_separate_contexts() {
+    // Every Run used to post the one context `scarab`, so a failing `lint`
+    // and a passing `test` on one commit overwrote each other and the commit
+    // showed whichever finished last. Each pipeline now owns its context.
+    let forge = Arc::new(
+        FakeForge::new()
+            .with_file(".scarab/test.yaml", CI_YAML)
+            .with_file(".scarab/lint.yaml", CI_YAML),
+    );
+    let db = InMemoryDb::new();
+    let clock = FakeClock::new(1_000);
+    let runs = trigger_run_from_event(
+        forge.as_ref(),
+        &db,
+        &clock,
+        scarab_server::AdmissionPorts::governance(None),
+        &push(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(runs.len(), 2, "both pipelines start");
+    let exec = FakeExecutor::new();
+    for run in &runs {
+        exec.script_outcome(ExecState::Succeeded);
+        drive(&db, &clock, &exec, run).await;
+    }
+    drain_forge_statuses(
+        forge.as_ref(),
+        &db,
+        "drainer",
+        32,
+        30_000,
+        "http://scarab.test",
+    )
+    .await
+    .unwrap();
+    let mut contexts: Vec<String> = forge
+        .statuses()
+        .iter()
+        .filter(|s| s.state == StatusState::Success)
+        .map(|s| s.context.clone())
+        .collect();
+    contexts.sort();
+    assert_eq!(contexts, vec!["scarab/lint", "scarab/test"]);
 }
 
 #[tokio::test]

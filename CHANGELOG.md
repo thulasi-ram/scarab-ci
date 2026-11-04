@@ -154,6 +154,13 @@ record. Read Breaking changes before you upgrade.
   upgrade, or delete row 76 from `_sqlx_migrations`; the added columns and table do not affect
   the older server.
 
+- **Each pipeline posts its own commit status.** The status context was `scarab` for every
+  Run, so two pipelines on one commit overwrote each other and the commit showed whichever
+  finished last. It is now `scarab/<pipeline>` (the pipeline's `name:`, or its file name
+  without `.scarab/` and the extension). If a branch protection rule requires the `scarab`
+  check, require `scarab/<pipeline>` for each pipeline instead before you upgrade, or the rule
+  waits for a status that is no longer posted.
+
 ### Security
 
 - An admin of one org could list, delete, re-sync and bind repos through another org's forge
