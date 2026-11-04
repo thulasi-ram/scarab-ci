@@ -20,6 +20,7 @@
 //! the [`cel`] submodule and is wired up by a later slice.
 
 pub mod cel;
+pub mod cron;
 pub mod diagnostic;
 pub mod event;
 pub mod oci;
@@ -504,6 +505,67 @@ impl Triggers {
 pub struct TriggerFilter {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub when: Option<String>,
+    /// `on: cron:` only: when the Pipeline fires, as [`cron`] expressions in
+    /// UTC. Written as one string or a list; required on `cron` and refused on
+    /// every other kind by [`validate`]. A cron Run builds the default
+    /// branch's head (git-bug 5d5fc8a).
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "one_or_many"
+    )]
+    pub schedule: Vec<String>,
+}
+
+/// A YAML value that is one string or a list of strings.
+fn one_or_many<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match OneOrMany::deserialize(d)? {
+        OneOrMany::One(s) => vec![s],
+        OneOrMany::Many(v) => v,
+    })
+}
+
+/// The `on: cron:` schedules a Pipeline declares, as written. Empty when it
+/// has no `cron` trigger.
+pub fn cron_schedules(ir: &PipelineIr) -> &[String] {
+    ir.triggers
+        .0
+        .get("cron")
+        .map(|f| f.schedule.as_slice())
+        .unwrap_or_default()
+}
+
+/// The `on: cron:` schedules an authored Pipeline file declares, read from
+/// its `on:` block alone ([`triggers_of`]), without compiling it. The
+/// schedule index is built from this, so a Pipeline that does not compile
+/// still keeps its schedules: each fire compiles it and records the failure.
+/// A schedule that does not parse is left out; the compile reports it.
+/// Empty for a library or a file that does not parse.
+pub fn cron_schedules_of(yaml: &str) -> Vec<String> {
+    if is_library(yaml) {
+        return Vec::new();
+    }
+    let Ok(triggers) = triggers_of(yaml) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = triggers
+        .0
+        .get("cron")
+        .map(|f| f.schedule.clone())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| cron::Schedule::parse(s).is_ok())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// One step. The step contract (ADR-0008) is an OCI `image` + a `command`; the
@@ -5425,6 +5487,28 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                 diagnostics.push(format!("trigger `{kind}`: when {e}"));
             }
         }
+        // A schedule belongs to `cron`, and `cron` needs one (git-bug 5d5fc8a).
+        if kind == "cron" {
+            if filter.schedule.is_empty() {
+                diagnostics.push(
+                    "trigger `cron`: needs a `schedule`, such as `schedule: \"0 2 * * *\"` \
+                     (minute hour day-of-month month day-of-week, UTC)"
+                        .to_string(),
+                );
+            }
+            let mut seen = BTreeSet::new();
+            for expr in &filter.schedule {
+                if let Err(e) = cron::Schedule::parse(expr) {
+                    diagnostics.push(format!("trigger `cron`: schedule {e}"));
+                } else if !seen.insert(expr.trim()) {
+                    diagnostics.push(format!("trigger `cron`: schedule `{expr}` is listed twice"));
+                }
+            }
+        } else if !filter.schedule.is_empty() {
+            diagnostics.push(format!(
+                "trigger `{kind}`: `schedule` belongs to `on: cron:`, not `{kind}`"
+            ));
+        }
     }
 
     // Concurrency: a non-empty group, a known policy, and a group whose `${{ … }}`
@@ -6274,6 +6358,56 @@ mod tests {
             diags.iter().any(|d| d.contains("trigger `push`")),
             "got {diags:?}"
         );
+    }
+
+    #[test]
+    fn a_cron_trigger_takes_one_schedule_or_a_list() {
+        let one = compile(
+            r#"
+            on: { cron: { schedule: "0 2 * * *" } }
+            steps: [{ id: a, image: busybox }]
+            "#,
+        );
+        assert_eq!(cron_schedules(&one), ["0 2 * * *"]);
+        let many = compile(
+            r#"
+            on: { cron: { schedule: ["@hourly", "30 6 * * mon"] } }
+            steps: [{ id: a, image: busybox }]
+            "#,
+        );
+        assert_eq!(cron_schedules(&many), ["@hourly", "30 6 * * mon"]);
+        // The schedule survives the IR's own round trip (a Run stores it).
+        let back: PipelineIr = serde_json::from_value(serde_json::to_value(&many).unwrap()).unwrap();
+        assert_eq!(cron_schedules(&back), cron_schedules(&many));
+        assert!(cron_schedules(&compile("steps: [{ id: a, image: busybox }]")).is_empty());
+    }
+
+    #[test]
+    fn schedules_are_read_from_a_file_that_does_not_compile() {
+        // The steps are wrong, the `on:` block is not: the schedule index
+        // keeps the schedule, and each fire records the compile failure.
+        let yaml = r#"
+            on: { cron: { schedule: [" @hourly", "0 2 * * *", "*/1 * * * *", "nope"] } }
+            steps: [{ id: a }]
+            "#;
+        assert_eq!(cron_schedules_of(yaml), ["0 2 * * *", "@hourly"]);
+        assert!(cron_schedules_of("kind: library\non: { cron: { schedule: \"@daily\" } }").is_empty());
+        assert!(cron_schedules_of(": not yaml").is_empty());
+        assert!(cron_schedules_of("on: { push: {} }").is_empty());
+    }
+
+    #[test]
+    fn a_cron_trigger_without_a_valid_schedule_fails_at_submit() {
+        for (on, says) in [
+            ("{ cron: {} }", "trigger `cron`: needs a `schedule`"),
+            (r#"{ cron: { schedule: "0 25 * * *" } }"#, "hour: `25` is outside 0-23"),
+            (r#"{ cron: { schedule: ["@daily", "@daily"] } }"#, "listed twice"),
+            (r#"{ cron: { schedule: "*/2 * * * *" } }"#, "at most every 5 minutes"),
+            (r#"{ push: { schedule: "@daily" } }"#, "`schedule` belongs to `on: cron:`"),
+        ] {
+            let diags = errors(&format!("on: {on}\nsteps: [{{ id: a, image: busybox }}]"));
+            assert!(diags.iter().any(|d| d.contains(says)), "{on}: {diags:?}");
+        }
     }
 
     #[test]
@@ -9305,7 +9439,7 @@ mod tests {
         // may have no source.
         let ir = compile(
             r#"
-            on: { cron: {} }
+            on: { cron: { schedule: "@daily" } }
             steps: [{ id: sweep, image: busybox }]
             "#,
         );

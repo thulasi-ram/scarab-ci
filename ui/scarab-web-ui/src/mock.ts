@@ -33,6 +33,8 @@ type MigrationReportDto = components["schemas"]["EnvironmentMigrationReportDto"]
 type PluginCatalogEntryDto = components["schemas"]["PluginCatalogEntryDto"];
 type PluginInstallationDto = components["schemas"]["PluginInstallationDto"];
 type PluginConnectionDto = components["schemas"]["PluginConnectionDto"];
+type ScheduleDto = components["schemas"]["ScheduleDto"];
+type RefusedRunDto = components["schemas"]["RefusedRunDto"];
 
 const now = Date.now();
 const ago = (ms: number) => now - ms;
@@ -972,6 +974,52 @@ const availableRepos = [
 // shows GHCR_TOKEN and SLACK_WEBHOOK_URL greyed out beside the repo's own keys.
 // Its environment columns are the org Environments the project may deploy
 // into (ADR-0071) — production and qa, as `projectEnvironments` lists them.
+// ── /v1/repos/acme/scarab/schedules: two `on: cron:` schedules ─────────────
+// The nightly one's last slot started a Run (the scarab run fixture); the
+// weekly one's last slot was missed, so it is also a refused row in the runs
+// list, as the server records it.
+const DAY = 24 * 60 * min;
+/** The next UTC slot at `hour`:00, on `weekday` (0 = Sunday) when given. */
+function nextUtc(hour: number, weekday?: number): number {
+  const d = new Date(now);
+  d.setUTCHours(hour, 0, 0, 0);
+  while (d.getTime() <= now || (weekday != null && d.getUTCDay() !== weekday)) {
+    d.setTime(d.getTime() + DAY);
+  }
+  return d.getTime();
+}
+const SCHEDULE_SHA = "c4e1a9b27d3f8e6a5b4c3d2e1f0a9b8c7d6e5f4a";
+const schedules: ScheduleDto[] = [
+  {
+    pipeline: ".scarab/nightly.yaml",
+    schedule: "0 2 * * *",
+    next_fire_at: nextUtc(2),
+    source_sha: SCHEDULE_SHA,
+    last_fire: { schedule: "0 2 * * *", slot_at: nextUtc(2) - DAY, outcome: "run", run_id: RUN_ID },
+  },
+  {
+    pipeline: ".scarab/audit.yaml",
+    schedule: "0 6 * * 1",
+    next_fire_at: nextUtc(6, 1),
+    source_sha: SCHEDULE_SHA,
+    last_fire: { schedule: "0 6 * * 1", slot_at: nextUtc(6, 1) - 7 * DAY, outcome: "missed" },
+  },
+];
+const missedSlotMessage =
+  "the slot was skipped: the forge rate-limited Scarab, so the default branch could not be read in time";
+const scheduleRefused: RefusedRunDto[] = [
+  {
+    id: 3,
+    pipeline: ".scarab/audit.yaml",
+    trigger_kind: "cron",
+    title: "0 6 * * 1",
+    reason_kind: "schedule",
+    message: missedSlotMessage,
+    created_at: nextUtc(6, 1) - 7 * DAY + 2 * min,
+    errors: [{ kind: "other", message: missedSlotMessage }],
+  },
+];
+
 const secretMatrix = {
   columns: ["", "production", "qa"],
   environments: ["production", "qa"],
@@ -1299,6 +1347,9 @@ function json(body: unknown, init?: ResponseInit) {
 function route(pathname: string, search: string, method: string, body = ""): Response | null {
   const p = pathname;
   if (p === "/v1/me") return json(me);
+  // Ahead of the library routes, which answer every other repo's refused
+  // runs with an empty list.
+  if (p === "/v1/repos/acme/scarab/refused-runs") return json({ refused: scheduleRefused });
   const lib = libraryRoute(p, method, json);
   if (lib) return lib;
   if (p === "/v1/me/security") return json(meSecurity);
@@ -1395,6 +1446,10 @@ function route(pathname: string, search: string, method: string, body = ""): Res
   }
   // /v1/repos/{org}/{repo}/secrets/matrix
   if (/^\/v1\/repos\/[^/]+\/[^/]+\/secrets\/matrix$/.test(p)) return json(secretMatrix);
+  // /v1/repos/{org}/{repo}/schedules
+  if ((m = p.match(/^\/v1\/repos\/[^/]+\/([^/]+)\/schedules$/))) {
+    return json({ schedules: m[1] === "scarab" ? schedules : [] });
+  }
   // /v1/repos/{org}/{repo}/refs  (ref picker — not on the shot screens)
   if (/^\/v1\/repos\/[^/]+\/[^/]+\/refs$/.test(p)) return json({ refs: [] });
 

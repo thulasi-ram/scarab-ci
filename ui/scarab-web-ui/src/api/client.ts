@@ -1177,6 +1177,18 @@ export async function listRefusedRuns(org: string, repo: string, limit = 50): Pr
   return data.refused;
 }
 
+export type Schedule = components["schemas"]["ScheduleDto"];
+
+/** A Project's `on: cron:` schedules, each with its next slot and its
+ *  Pipeline's last fire (`GET …/schedules`). */
+export async function listSchedules(org: string, repo: string): Promise<Schedule[]> {
+  const { data, error } = await api.GET("/v1/repos/{org}/{repo}/schedules", {
+    params: { path: { org, repo } },
+  });
+  if (error || !data) throw new Error(`failed to list schedules for ${org}/${repo}`);
+  return data.schedules;
+}
+
 export type StepOrigin = components["schemas"]["StepOriginDto"];
 
 /** Where a Step comes from (`GET /v1/runs/{id}/steps/{step}/origin`). */

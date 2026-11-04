@@ -21,6 +21,8 @@ export function triggerIcon(kind?: string | null): string {
     case "manual":
     case "api":
       return "play";
+    case "cron":
+      return "clock";
     default:
       return "circle-dot";
   }

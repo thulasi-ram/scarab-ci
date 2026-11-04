@@ -108,6 +108,7 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
     ("GET", "/v1/repos", "read", "READ"),
     ("GET", "/v1/repos/{org}/{repo}/runs", "read", "READ"),
     ("GET", "/v1/repos/{org}/{repo}/refused-runs", "read", "READ"),
+    ("GET", "/v1/repos/{org}/{repo}/schedules", "read", "READ"),
     ("POST", "/v1/runs", "run.create", "NG"),
     ("GET", "/v1/runs", "read", "READ"),
     ("GET", "/v1/runs/{id}", "read", "READ"),

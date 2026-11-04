@@ -232,6 +232,10 @@ impl ForgePort for RegistryForge {
             .await
     }
 
+    async fn default_branch(&self, repo: &RepoRef) -> Result<String, ForgeError> {
+        self.adapter_for(repo).await?.default_branch(repo).await
+    }
+
     async fn read_file_at_ref(
         &self,
         repo: &RepoRef,

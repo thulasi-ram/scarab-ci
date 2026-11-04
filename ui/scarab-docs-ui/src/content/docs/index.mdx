@@ -151,8 +151,8 @@ re-attach (`scarab-executor-k8s`) and the results-egress sidecar (`docker/sideca
 PR. **Tested for one case:** control-plane crash and resume with a real Pod in flight. The
 `just test e2e` test SIGKILLs the server while a step Pod runs, the server restarts in the same Pod
 and re-adopts the Attempt; it passes on a local kind cluster and in `e2e.yml`. **Not
-proven yet:** a server moved to another node or a lost node, and production-scale load. **Missing:** `on: cron` and `on: upstream`
-triggers parse, but nothing produces those events yet. **Out of scope:** continuous delivery.
+proven yet:** a server moved to another node or a lost node, and production-scale load. **Missing:** the `on: upstream` trigger
+parses, but nothing produces that event yet. **Out of scope:** continuous delivery.
 Scarab runs and governs the run that deploys and keeps no record of what is live after it ends;
 your CD tool does that ([Deploying with Argo CD](/scarab-ci/usage/deploying-with-argo-cd/)).
 :::

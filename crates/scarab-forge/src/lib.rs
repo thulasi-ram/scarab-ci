@@ -7,6 +7,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+pub mod conditional;
 pub mod preflight;
 
 /// A **forge coordinate** — `{owner, name}` as the forge addresses a
@@ -281,7 +282,16 @@ pub enum Event {
         issue: u64,
         body: String,
     },
+    /// A scheduled fire of an `on: cron:` Pipeline (git-bug 5d5fc8a). The
+    /// server builds it at fire time from what it just read from the forge:
+    /// `ref` is the repo's live default branch (`refs/heads/<name>`), `sha`
+    /// that branch's head, and the config is read and the Run pinned at
+    /// `sha`, as a push reads at `after`. `schedule` is the expression that
+    /// fired, as written.
     Cron {
+        repo: RepoRef,
+        r#ref: String,
+        sha: String,
         schedule: String,
     },
     /// A human dispatch of a named pipeline at a repo + ref (ADR-0043 "World B").
@@ -399,7 +409,11 @@ impl Event {
             Event::PullRequest { number, .. } => Some(format!("refs/pull/{number}/head")),
             // A dispatch carries its symbolic ref explicitly (ADR-0043).
             Event::Manual { r#ref, .. } | Event::Api { r#ref, .. } => Some(r#ref.clone()),
-            Event::Comment { .. } | Event::Cron { .. } | Event::Upstream { .. } => None,
+            // A cron fire runs on the default branch, read live at fire time,
+            // so a branch-scoped Environment admits it as it admits a push
+            // to that branch.
+            Event::Cron { r#ref, .. } => Some(r#ref.clone()),
+            Event::Comment { .. } | Event::Upstream { .. } => None,
         }
     }
 
@@ -463,13 +477,15 @@ impl Event {
             Event::Manual { reason, .. } | Event::Api { reason, .. } => {
                 reason.as_deref().unwrap_or_default()
             }
+            // A cron Run's headline is the schedule that fired.
+            Event::Cron { schedule, .. } => schedule,
             _ => "",
         };
         cap_trigger_title(raw)
     }
 
-    /// The repository this event targets, if any. Only `cron` is truly repo-less;
-    /// `manual`/`api` dispatch carry their target repo (ADR-0043).
+    /// The repository this event targets. Every kind carries one: `manual`/`api`
+    /// dispatch and `cron` name theirs explicitly (ADR-0043, git-bug 5d5fc8a).
     pub fn repo(&self) -> Option<&RepoRef> {
         match self {
             Event::Push { repo, .. }
@@ -479,8 +495,8 @@ impl Event {
             | Event::Comment { repo, .. }
             | Event::Manual { repo, .. }
             | Event::Api { repo, .. }
-            | Event::Upstream { repo, .. } => Some(repo),
-            Event::Cron { .. } => None,
+            | Event::Upstream { repo, .. }
+            | Event::Cron { repo, .. } => Some(repo),
         }
     }
 
@@ -521,8 +537,9 @@ impl Event {
             Event::Comment { issue, .. } => {
                 e.insert("issue".into(), json!(issue));
             }
-            Event::Cron { .. } => {}
-            Event::Manual { r#ref, sha, .. } | Event::Api { r#ref, sha, .. } => {
+            Event::Manual { r#ref, sha, .. }
+            | Event::Api { r#ref, sha, .. }
+            | Event::Cron { r#ref, sha, .. } => {
                 e.insert("ref".into(), json!(r#ref));
                 e.insert("branch".into(), branch(r#ref));
                 e.insert("sha".into(), json!(sha));
@@ -585,8 +602,19 @@ impl Event {
                 e.insert("issue".into(), json!(issue));
                 e.insert("body".into(), json!(body));
             }
-            Event::Cron { schedule } => {
+            Event::Cron {
+                r#ref,
+                sha,
+                schedule,
+                ..
+            } => {
                 e.insert("schedule".into(), json!(schedule));
+                e.insert("ref".into(), json!(r#ref));
+                e.insert(
+                    "branch".into(),
+                    json!(r#ref.strip_prefix("refs/heads/").unwrap_or(r#ref)),
+                );
+                e.insert("sha".into(), json!(sha));
             }
             Event::Manual {
                 actor, r#ref, sha, ..
@@ -693,6 +721,23 @@ pub enum ForgeError {
     /// reporting a forge outage.
     #[error("unsupported by this forge adapter: {0}")]
     Unsupported(String),
+    /// The forge answered that the file is not there (`404`). The only error
+    /// a caller may read as "absent": [`Api`](ForgeError::Api) also carries
+    /// timeouts, resets and `5xx`, and reading one of those as absent would
+    /// drop a schedule from the index (git-bug 5d5fc8a). Returned by
+    /// [`read_file_at_ref`](ForgePort::read_file_at_ref).
+    #[error("not found: {0}")]
+    NotFound(String),
+    /// The forge refused the call for its rate limit, after the adapter's own
+    /// retries. Distinct from [`Api`](ForgeError::Api), which several callers
+    /// read as "that file is not there": a rate-limited read says nothing
+    /// about the file. `retry_after_secs` is the wait the forge asked for,
+    /// when it said.
+    #[error("forge rate limit reached: {detail}")]
+    RateLimited {
+        retry_after_secs: Option<u64>,
+        detail: String,
+    },
 }
 
 /// Outbound port to a code forge, expressed as **forge-agnostic capabilities**
@@ -705,6 +750,15 @@ pub enum ForgeError {
 #[async_trait]
 pub trait ForgePort: Send + Sync {
     async fn latest_commit(&self, repo: &RepoRef, r#ref: &str) -> Result<Commit, ForgeError>;
+
+    /// The repo's default branch name (`main`, not `refs/heads/main`), as the
+    /// forge reports it now. A cron fire asks this every time rather than
+    /// keeping it, so a renamed or switched default branch is followed
+    /// without a webhook (git-bug 5d5fc8a). Defaults to
+    /// [`Unsupported`](ForgeError::Unsupported).
+    async fn default_branch(&self, _repo: &RepoRef) -> Result<String, ForgeError> {
+        Err(ForgeError::Unsupported("reading the default branch".into()))
+    }
 
     async fn read_file_at_ref(
         &self,
@@ -1446,6 +1500,15 @@ mod tests {
         }
     }
 
+    fn cron(schedule: &str) -> Event {
+        Event::Cron {
+            repo: repo(),
+            r#ref: "refs/heads/main".into(),
+            sha: "c0ffee".into(),
+            schedule: schedule.into(),
+        }
+    }
+
     #[test]
     fn every_event_maps_to_its_trigger_kind() {
         let cases = [
@@ -1502,9 +1565,7 @@ mod tests {
                 TriggerKind::Comment,
             ),
             (
-                Event::Cron {
-                    schedule: "0 * * * *".into(),
-                },
+                cron("0 * * * *"),
                 TriggerKind::Cron,
             ),
             (
@@ -1569,10 +1630,7 @@ mod tests {
         );
         // Internally-originated events have no forge principal.
         assert_eq!(
-            Event::Cron {
-                schedule: "0 * * * *".into()
-            }
-            .actor(),
+            cron("0 * * * *").actor(),
             None
         );
         // An empty stored login (payload had no sender) reads as None, not "".
@@ -1628,13 +1686,16 @@ mod tests {
     }
 
     #[test]
-    fn only_cron_is_repo_less() {
-        // `cron` is the sole repo-less event.
-        assert!(Event::Cron {
-            schedule: "@daily".into()
-        }
-        .repo()
-        .is_none());
+    fn every_event_carries_its_repo() {
+        // A cron fire names its repo, default branch and head (git-bug 5d5fc8a).
+        let c = cron("@daily");
+        assert_eq!(c.repo(), Some(&repo()));
+        assert_eq!(c.trigger_title().as_deref(), Some("@daily"));
+        let ctx = c.context();
+        assert_eq!(ctx["event"]["branch"], "main");
+        assert_eq!(ctx["event"]["sha"], "c0ffee");
+        assert_eq!(ctx["event"]["schedule"], "@daily");
+        assert_eq!(c.template_fields()["sha"], "c0ffee");
         // `manual`/`api` dispatch now carry (and return) their target repo + ref,
         // and `context()` still exposes the actor (ADR-0043).
         for event in [
@@ -1756,13 +1817,10 @@ mod tests {
             .as_deref(),
             Some("refs/pull/7/head"),
         );
-        // Refless events → None (fail-closed: only an empty allowed_refs admits).
+        // A cron fire runs on the default branch it read at fire time.
         assert_eq!(
-            Event::Cron {
-                schedule: "@daily".into()
-            }
-            .protection_ref(),
-            None
+            cron("@daily").protection_ref().as_deref(),
+            Some("refs/heads/main")
         );
         assert_eq!(
             Event::Comment {

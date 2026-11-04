@@ -1644,6 +1644,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/repos/{org}/{repo}/schedules": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The Project's cron schedules and their next and last fires */
+        get: operations["list_schedules"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/repos/{org}/{repo}/secrets/matrix": {
         parameters: {
             query?: never;
@@ -4007,10 +4024,10 @@ export interface components {
             /** @description The dispatch reason; `manual` and `api` only. Default none. */
             reason?: string | null;
             /**
-             * @description The symbolic ref, as admission sees it: `refs/heads/main` for a push
-             *     or a dispatch, `refs/pull/<n>/head` for a pull request,
-             *     `refs/tags/<tag>` for a tag or release. Required for those kinds;
-             *     `comment`, `cron` and `upstream` have none.
+             * @description The symbolic ref, as admission sees it: `refs/heads/main` for a push,
+             *     a dispatch or a cron fire (the default branch), `refs/pull/<n>/head`
+             *     for a pull request, `refs/tags/<tag>` for a tag or release. Required
+             *     for those kinds; `comment` and `upstream` have none.
              */
             ref?: string | null;
             sha?: string | null;
@@ -4505,6 +4522,43 @@ export interface components {
          * @enum {string}
          */
         RuntimeStatusDto: "pending" | "probing" | "running" | "probe_failed" | "error" | "stopped";
+        /** @description One schedule, with its Pipeline's last fire. */
+        ScheduleDto: {
+            last_fire?: null | components["schemas"]["ScheduleFireDto"];
+            /**
+             * Format: int64
+             * @description The next slot, Unix milliseconds. The default branch is read again
+             *     then; a schedule removed since does not fire.
+             */
+            next_fire_at: number;
+            /** @description The pipeline file, `.scarab/<name>.yaml`. */
+            pipeline: string;
+            /** @description The cron expression as written, in UTC. */
+            schedule: string;
+            /** @description The default-branch commit this schedule was read from. */
+            source_sha: string;
+        };
+        /** @description A claimed slot. */
+        ScheduleFireDto: {
+            /**
+             * @description `pending`, `run`, `refused` (see the refused runs), `skipped` (its
+             *     `when:` or step guards left nothing to run) or `missed` (the forge
+             *     could not be read in time).
+             */
+            outcome: string;
+            run_id?: string | null;
+            /** @description The schedule that fired. */
+            schedule: string;
+            /**
+             * Format: int64
+             * @description The slot, Unix milliseconds.
+             */
+            slot_at: number;
+        };
+        /** @description `GET /v1/repos/{org}/{repo}/schedules` body. */
+        ScheduleListResponse: {
+            schedules: components["schemas"]["ScheduleDto"][];
+        };
         /**
          * @description `GET /v1/secrets` body: the secret **names** at a scope. Values are never
          *     listed.
@@ -9796,6 +9850,30 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+        };
+    };
+    list_schedules: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org slug */
+                org: string;
+                /** @description project (repo) name */
+                repo: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScheduleListResponse"];
+                };
             };
         };
     };

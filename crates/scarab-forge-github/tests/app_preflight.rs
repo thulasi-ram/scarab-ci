@@ -470,7 +470,14 @@ async fn a_secondary_rate_limit_is_retried_and_the_retrying_is_bounded() {
         .describe_capabilities()
         .await
         .expect_err("persistent rate limiting must eventually surface");
-    assert!(api_error(err).contains("secondary rate limit"));
+    // A rate limit, never an `Api` error a caller could read as a missing
+    // file; GitHub's message is kept.
+    match err {
+        ForgeError::RateLimited { detail, .. } => {
+            assert!(detail.contains("secondary rate limit"), "{detail}")
+        }
+        other => panic!("expected RateLimited, got {other:?}"),
+    }
     assert_eq!(
         stub.seen().len(),
         3,

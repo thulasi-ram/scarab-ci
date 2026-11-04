@@ -45,6 +45,7 @@ mod plugins;
 mod policies;
 /// Step-up confirmation (ADR-0073): `PasskeyStore`, `ChallengeStore`,
 /// `StepUpStore` and the append-only `SecurityEventLog`.
+mod schedules;
 mod step_up;
 pub use step_up::{step_up_request_lock_key, BindingRow};
 

@@ -416,6 +416,9 @@ pub struct GithubForge {
     /// another owner: a pinned token request names the repository by name
     /// only, so the owner is checked here.
     owner: Option<String>,
+    /// The last `ETag` and body per GET URL, sent back as `If-None-Match`
+    /// (git-bug 5d5fc8a): a `304` does not count against GitHub's rate limit.
+    etags: scarab_forge::conditional::EtagCache,
 }
 
 #[derive(serde::Serialize)]
@@ -461,6 +464,7 @@ impl GithubForge {
             auth: Auth::Token(token.into()),
             installation: None,
             owner: None,
+            etags: Default::default(),
         }
     }
 
@@ -476,6 +480,7 @@ impl GithubForge {
             },
             installation: None,
             owner: None,
+            etags: Default::default(),
         }
     }
 
@@ -602,19 +607,98 @@ impl GithubForge {
                         == Some("0"))
                 || (status == reqwest::StatusCode::FORBIDDEN
                     && resp.headers().contains_key("retry-after"));
+            let retry_after = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok());
             if rate_limited && attempt < MAX_HTTP_ATTEMPTS {
-                let wait = resp
-                    .headers()
-                    .get("retry-after")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.parse::<u64>().ok())
+                let wait = retry_after
                     .unwrap_or(2 * attempt as u64)
                     .min(MAX_BACKOFF_SECS);
                 tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
                 continue;
             }
+            if rate_limited {
+                // Out of retries: say so as a rate limit, so no caller reads it
+                // as a missing file. An exhausted primary window says when it
+                // resets; `retry-after` wins when both are sent.
+                let reset_in = resp
+                    .headers()
+                    .get("x-ratelimit-reset")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .map(|reset| (reset - now_unix_secs()).max(1) as u64);
+                let body = resp.text().await.unwrap_or_default();
+                return Err(ForgeError::RateLimited {
+                    retry_after_secs: retry_after.or(reset_in),
+                    detail: format!("{status} after {attempt} attempts: {body}"),
+                });
+            }
             return Ok(resp);
         }
+    }
+
+    /// A GET through the [`EtagCache`](scarab_forge::conditional::EtagCache):
+    /// sends the kept `ETag` as `If-None-Match` and serves the kept body on a
+    /// `304`. Returns the status (a `304` reads as `200`) and the body.
+    async fn get_conditional(
+        &self,
+        url: &str,
+        accept: &str,
+        token: &str,
+    ) -> Result<(reqwest::StatusCode, Vec<u8>), ForgeError> {
+        let key = format!("{accept} {url}");
+        let cached = self.etags.get(&key);
+        let etag = cached.as_ref().map(|(tag, _)| tag.clone());
+        let resp = self
+            .send(
+                || {
+                    let req = self.client.get(url).header("accept", accept);
+                    match &etag {
+                        Some(tag) => req.header("if-none-match", tag),
+                        None => req,
+                    }
+                },
+                token,
+            )
+            .await?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_MODIFIED {
+            if let Some((_, body)) = cached {
+                return Ok((reqwest::StatusCode::OK, body));
+            }
+        }
+        let new_etag = resp
+            .headers()
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let body = resp
+            .bytes()
+            .await
+            .map_err(|e| ForgeError::Api(e.to_string()))?
+            .to_vec();
+        match (status.is_success(), new_etag) {
+            (true, Some(tag)) => self.etags.store(&key, &tag, &body),
+            _ => self.etags.forget(&key),
+        }
+        Ok((status, body))
+    }
+
+    /// [`get_conditional`](Self::get_conditional) for a JSON body; a non-2xx
+    /// is an [`Api`](ForgeError::Api) error carrying the status and body.
+    async fn get_json_conditional(&self, url: &str, token: &str) -> Result<Value, ForgeError> {
+        let (status, body) = self
+            .get_conditional(url, "application/vnd.github+json", token)
+            .await?;
+        if !status.is_success() {
+            return Err(ForgeError::Api(format!(
+                "{status}: {}",
+                String::from_utf8_lossy(&body)
+            )));
+        }
+        serde_json::from_slice(&body).map_err(|e| ForgeError::Api(format!("bad JSON: {e}")))
     }
 
     /// The token to authenticate a call against `repo` with. Fixed-token mode
@@ -887,8 +971,7 @@ impl ForgePort for GithubForge {
             repo.name,
             scarab_forge::encode_url_component(r#ref)
         ));
-        let resp = self.send(|| self.client.get(&url), &token).await?;
-        let body = ok_json(resp).await?;
+        let body = self.get_json_conditional(&url, &token).await?;
         Ok(Commit {
             sha: body
                 .get("sha")
@@ -917,28 +1000,31 @@ impl ForgePort for GithubForge {
             r#ref = r#ref
         ));
         // The raw media type returns file bytes directly (no base64 dance).
-        let resp = self
-            .send(
-                || {
-                    self.client
-                        .get(&url)
-                        .header("accept", "application/vnd.github.raw+json")
-                },
-                &token,
-            )
+        let (status, bytes) = self
+            .get_conditional(&url, "application/vnd.github.raw+json", &token)
             .await?;
-        let status = resp.status();
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| ForgeError::Api(e.to_string()))?;
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(ForgeError::NotFound(path.to_string()));
+        }
         if !status.is_success() {
             return Err(ForgeError::Api(format!(
                 "{status}: {}",
                 String::from_utf8_lossy(&bytes)
             )));
         }
-        Ok(bytes.to_vec())
+        Ok(bytes)
+    }
+
+    async fn default_branch(&self, repo: &RepoRef) -> Result<String, ForgeError> {
+        let token = self.auth_token_for(repo).await?;
+        let url = self.url(&format!("/repos/{}/{}", repo.owner, repo.name));
+        self.get_json_conditional(&url, &token)
+            .await?
+            .get("default_branch")
+            .and_then(Value::as_str)
+            .filter(|b| !b.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| ForgeError::Api("repository.default_branch missing".into()))
     }
 
     async fn list_dir_at_ref(
