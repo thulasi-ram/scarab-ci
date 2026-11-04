@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1793811244,"nonce":"JkZ5r+ZmmLVaXl7CS3xbXukRlhk=","message":"Closing: the fix is on main (f94c3744, through PR #32): the Owner reset and request replay now follow merges to the live Principal. The open owner question about passkeys moved to def16bd.","files":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":4,"timestamp":1793811244,"nonce":"W7FPkL0iStb6GsGbzxGPux63C3I=","status":2}]}
