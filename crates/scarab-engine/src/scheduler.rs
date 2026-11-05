@@ -3047,23 +3047,27 @@ impl<'a> Scheduler<'a> {
                 // Rolling upgrade: a `cancel_run` written by an older binary
                 // has a `null` payload and was its cancel's ONLY teardown of
                 // step units. Honour it for what that cancel provably stopped
-                // — a step's latest attempt stamped `Cancelled` — never an
-                // attempt still `Running` (a rerun's), which is what made the
-                // run-scoped drain unsafe.
+                // — attempts stamped `Cancelled` — never an attempt still
+                // `Running` (a rerun's), which is what made the run-scoped
+                // drain unsafe. Every Cancelled attempt, not only the latest:
+                // a rerun admitted before this drain makes a2 the latest, and
+                // the cancelled a1 was then never torn down (git-bug
+                // aaa559c). A Cancelled attempt of an earlier cancel costs one
+                // idempotent cancel of a unit already gone.
                 if msg.payload.is_null() {
                     for step in self.db.steps_of_run(&msg.run).await? {
-                        let Some(a) = step
+                        for a in step
                             .attempts
-                            .last()
+                            .iter()
                             .filter(|a| a.outcome == AttemptOutcome::Cancelled)
-                        else {
-                            continue;
-                        };
-                        if let Some(h) = self.db.attempt_handle(&msg.run, &step.step, &a.id).await?
                         {
-                            let h = ExecHandle(h);
-                            let gone = self.cancel_until_gone(&h).await;
-                            outcome.absorb(gone, &h);
+                            if let Some(h) =
+                                self.db.attempt_handle(&msg.run, &step.step, &a.id).await?
+                            {
+                                let h = ExecHandle(h);
+                                let gone = self.cancel_until_gone(&h).await;
+                                outcome.absorb(gone, &h);
+                            }
                         }
                     }
                 }
