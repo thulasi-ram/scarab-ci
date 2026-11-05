@@ -8,10 +8,11 @@
 //! - The opt-in active-time run budget cancels in-flight work and fails the
 //!   run; gate-suspended time never counts.
 
-use scarab_engine::ports::{ExecState, FailureClass};
+use scarab_engine::ports::{ExecHandle, ExecState, FailureClass};
 use scarab_engine::{
-    rerun_step, Clock, Db, EventKind, EventPayload, Executor, RunId, RunStatus, Scheduler, StepId,
-    StepSpec, StepStatus, Timestamp,
+    rerun_step, AttemptOutcome, Clock, Db, EventKind, EventPayload, Executor, OutboxId,
+    OutboxMessage, RunId, RunStatus, Scheduler, StepId, StepSpec, StepStatus, Timestamp,
+    LAUNCH_STEP, MAX_DELIVERY_ATTEMPTS,
 };
 use scarab_testkit::{FakeClock, FakeExecutor, InMemoryDb};
 
@@ -597,4 +598,149 @@ async fn no_budget_means_no_run_ceiling() {
         db.run_status(&run_id()).await.unwrap(),
         Some(RunStatus::Running)
     );
+}
+
+/// A scheduler for the whole-fleet tick (`tick_all`), which also drains the
+/// teardown intents (`reconcile_cancellations`) the per-run `tick` skips.
+fn fleet<'a>(db: &'a InMemoryDb, clock: &'a FakeClock, exec: &'a FakeExecutor) -> Scheduler<'a> {
+    Scheduler::new(
+        db as &dyn Db,
+        clock as &dyn Clock,
+        exec as &dyn Executor,
+        "sched",
+    )
+    .with_outbox_visibility_ms(0)
+}
+
+async fn tick_all(db: &InMemoryDb, clock: &FakeClock, exec: &FakeExecutor) {
+    let isolated = fleet(db, clock, exec).tick_all().await.unwrap();
+    assert!(isolated.is_empty(), "{isolated:?}");
+}
+
+/// Run `r1` with its one step `s` Running on a1, its unit launched.
+async fn running_on_a1(db: &InMemoryDb, clock: &FakeClock, exec: &FakeExecutor) -> ExecHandle {
+    let h = ExecHandle(format!("fake://{RUN}/s/a1"));
+    for _ in 0..3 {
+        tick_all(db, clock, exec).await;
+    }
+    let steps = db.steps_of_run(&run_id()).await.unwrap();
+    assert_eq!(steps[0].status, StepStatus::Running, "{steps:?}");
+    assert!(
+        exec.launch_count(&h) > 0,
+        "precondition: a1's unit launched"
+    );
+    h
+}
+
+/// The cancel paths' shared promise (git-bug e25c3b5): a step a terminal
+/// verdict cancels has its in-flight attempt stamped `Cancelled`, and that
+/// attempt's unit is torn down by a durable teardown intent even when the
+/// inline best-effort cancel fails.
+async fn assert_torn_down_through_its_intent(db: &InMemoryDb, exec: &FakeExecutor, h: &ExecHandle) {
+    let steps = db.steps_of_run(&run_id()).await.unwrap();
+    assert_eq!(steps[0].status, StepStatus::Cancelled);
+    assert_eq!(
+        steps[0].attempts.last().map(|a| a.outcome),
+        Some(AttemptOutcome::Cancelled),
+        "the in-flight attempt is stamped Cancelled: {:?}",
+        steps[0].attempts
+    );
+    let cancels = exec
+        .cancelled_handles()
+        .iter()
+        .filter(|c| **c == h.0)
+        .count();
+    assert!(
+        cancels >= 2,
+        "the inline cancel failed and nothing retried it: the unit outlives its Run \
+         (cancel calls on {}: {cancels})",
+        h.0
+    );
+    assert!(
+        !db.outbox_key_pending(&format!("cancel:{RUN}:s/a1"))
+            .await
+            .unwrap(),
+        "the CANCEL_ATTEMPT was drained"
+    );
+}
+
+/// Regression (git-bug e25c3b5): budget exhaustion cancelled its steps with
+/// only a best-effort inline cancel and wrote no attempt-scoped teardown, so a
+/// unit whose inline cancel failed ran on past its failed Run.
+#[tokio::test]
+async fn budget_exhaustion_tears_down_the_unit_through_a_durable_intent() {
+    let (db, clock, exec) = (
+        InMemoryDb::new(),
+        FakeClock::new(1_000),
+        FakeExecutor::new(),
+    );
+    db.create_run(&run_id(), 1, 1, Timestamp(1_000))
+        .await
+        .unwrap();
+    db.create_step_run(
+        &run_id(),
+        &StepId("s".into()),
+        Some(&spec()),
+        &[],
+        Timestamp(1_000),
+    )
+    .await
+    .unwrap();
+    db.store_run_ir(
+        &run_id(),
+        &serde_json::json!({ "ir_version": 1, "budget": 60,
+            "steps": [{ "id": "s", "image": "img" }] }),
+    )
+    .await
+    .unwrap();
+    let h = running_on_a1(&db, &clock, &exec).await;
+
+    exec.fail_cancels(1);
+    clock.advance(61_000);
+    for _ in 0..3 {
+        tick_all(&db, &clock, &exec).await;
+    }
+    assert_eq!(
+        db.run_status(&run_id()).await.unwrap(),
+        Some(RunStatus::Failed)
+    );
+    assert_torn_down_through_its_intent(&db, &exec, &h).await;
+}
+
+/// Regression (git-bug e25c3b5): dead-lettering a run (here a poison outbox
+/// message, ADR-0047) moved its steps to `Cancelled` with no teardown at all,
+/// so a live unit ran on, owned by nothing.
+#[tokio::test]
+async fn dead_lettering_a_run_tears_down_its_live_unit() {
+    let (db, clock, exec) = (
+        InMemoryDb::new(),
+        FakeClock::new(1_000),
+        FakeExecutor::new(),
+    );
+    seed_one_step(&db, serde_json::json!({ "id": "s", "image": "img" })).await;
+    let h = running_on_a1(&db, &clock, &exec).await;
+
+    exec.fail_cancels(1);
+    db.enqueue_outbox(&OutboxMessage {
+        id: OutboxId(0),
+        run: run_id(),
+        kind: LAUNCH_STEP.to_string(),
+        payload: serde_json::json!("garbage — not a LaunchIntent"),
+        idempotency_key: "poison-1".to_string(),
+        at: clock.now().await,
+    })
+    .await
+    .unwrap();
+    let sched = fleet(&db, &clock, &exec);
+    for _ in 0..(MAX_DELIVERY_ATTEMPTS + 2) {
+        sched.reconcile().await.unwrap();
+    }
+    assert_eq!(
+        db.run_status(&run_id()).await.unwrap(),
+        Some(RunStatus::DeadLettered)
+    );
+    for _ in 0..3 {
+        tick_all(&db, &clock, &exec).await;
+    }
+    assert_torn_down_through_its_intent(&db, &exec, &h).await;
 }

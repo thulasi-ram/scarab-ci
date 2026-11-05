@@ -4470,18 +4470,19 @@ impl<'a> Scheduler<'a> {
         // Exhausted: tear down in-flight work (best-effort), cancel the steps,
         // and fail the run with diagnostics. Failed — a liveness verdict — not
         // DeadLettered (the operator did nothing wrong; the budget did its job).
+        // As `cancel_run`: `cancel_step` stamps the in-flight attempt
+        // Cancelled and commits its CANCEL_ATTEMPT in the same write, so a
+        // unit whose inline cancel fails is still torn down (git-bug e25c3b5).
         for step in self.db.steps_of_run(run).await? {
             if step.status.is_terminal() {
                 continue;
             }
-            if let Some(attempt) = step.attempts.last() {
+            if let Some(attempt) = in_flight_attempt(&step) {
                 if let Some(h) = self.db.attempt_handle(run, &step.step, &attempt.id).await? {
                     let _ = self.executor.cancel(&ExecHandle(h)).await;
                 }
             }
-            self.transition_step(run, &step.step, step.status, StepStatus::Cancelled)
-                .await?;
-            cancel_open_gate_attempt(self.db, run, &step).await?;
+            cancel_step(self.db, run, step, now).await?;
         }
         // The verdict and its reason are one commit: appended on its own, a
         // deposed leader's late `RunBudgetExhausted` journalled a second
@@ -4722,13 +4723,22 @@ impl<'a> Scheduler<'a> {
         // terminal, so nothing launches from them, and fencing keeps any
         // still-live backend unit from mutating durable state (ADR-0021).
         let cleanup = async {
+            // As `cancel_run`: an inline cancel that only ASKS, then
+            // `cancel_step`, whose commit carries the attempt's Cancelled
+            // stamp and its CANCEL_ATTEMPT, and closes a gate's open Attempt.
+            // Without the intent a live unit ran on, owned by nothing
+            // (git-bug e25c3b5).
+            let now = self.clock.now().await;
             for step in self.db.steps_of_run(run).await? {
                 if !step.status.is_terminal() {
-                    self.transition_step(run, &step.step, step.status, StepStatus::Cancelled)
-                        .await?;
-                    // A gate dead-lettered mid-wait: close its open Attempt
-                    // too, as the other cancel paths do.
-                    cancel_open_gate_attempt(self.db, run, &step).await?;
+                    if let Some(attempt) = in_flight_attempt(&step) {
+                        if let Ok(Some(h)) =
+                            self.db.attempt_handle(run, &step.step, &attempt.id).await
+                        {
+                            let _ = self.executor.cancel(&ExecHandle(h)).await;
+                        }
+                    }
+                    cancel_step(self.db, run, step, now).await?;
                 }
             }
             // Shared services (ADR-0058) are NOT steps, so the loop above never
