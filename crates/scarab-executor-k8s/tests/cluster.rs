@@ -504,7 +504,7 @@ async fn sleeping_step_is_killed_at_its_deadline() {
     let client = kube_client().await;
     let exec = K8sExecutor::with_client(ns, client);
     let step = StepRun {
-        run: RunId("run-timeout".into()),
+        run: RunId(unique_run("run-timeout")),
         step: StepId("sleeper".into()),
         status: StepStatus::Running,
         attempts: vec![Attempt {
@@ -645,8 +645,10 @@ async fn workspace_flows_from_a_to_b_through_the_cas() {
         .with_workspace_depot(ws.depot.clone())
         .with_workspace_service(ws.fetch.clone());
 
+    // One unique run id for both steps: they share the run's workspace.
+    let run = unique_run("run-ws");
     let step_run = |id: &str, attempt: &str| StepRun {
-        run: RunId("run-ws".into()),
+        run: RunId(run.clone()),
         step: StepId(id.into()),
         status: StepStatus::Running,
         attempts: vec![Attempt {
