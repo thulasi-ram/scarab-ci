@@ -5606,7 +5606,7 @@ fn classify_failed_pod(pod: &Pod, exit_code: Option<i32>) -> (FailureClass, Opti
     // only the SIGKILL exit 137). The Pod itself is authoritative: if it
     // outlived its own spec'd deadline, the kill is a timeout — never the
     // step's verdict.
-    if outlived_deadline(pod) {
+    if outlived_deadline(pod, unix_now_secs()) {
         return (
             FailureClass::Timeout,
             Some(render_cause(
@@ -5636,18 +5636,18 @@ fn classify_failed_pod(pod: &Pod, exit_code: Option<i32>) -> (FailureClass, Opti
 /// True if the Pod ran past its own `activeDeadlineSeconds` — the
 /// deterministic timeout signal, independent of the (sometimes-late)
 /// `DeadlineExceeded` status reason.
-fn outlived_deadline(pod: &Pod) -> bool {
+///
+/// `now` is unix seconds from [`unix_secs`], which fails closed: a broken
+/// (pre-epoch) clock reads as `i64::MIN`, so no Pod looks overdue on it
+/// (git-bug 4855bb0). The subtraction saturates for the same reason.
+fn outlived_deadline(pod: &Pod, now: i64) -> bool {
     let Some(deadline) = pod.spec.as_ref().and_then(|s| s.active_deadline_seconds) else {
         return false;
     };
     let Some(start) = pod.status.as_ref().and_then(|s| s.start_time.as_ref()) else {
         return false;
     };
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(i64::MAX);
-    now_secs - start.0.as_second() >= deadline
+    now.saturating_sub(start.0.as_second()) >= deadline
 }
 
 /// True once the step container's main process has (ever) started: a running
@@ -8220,6 +8220,26 @@ mod tests {
             Some(results_status(results_running(), false)),
         );
         assert_eq!(results_settled_state(&succeeded, now), ExecState::Running);
+    }
+
+    /// git-bug 4855bb0: a broken (pre-epoch) wall clock fails CLOSED for the
+    /// Pod's own deadline too — it reads as the earliest instant, so a Pod
+    /// that started long ago is not taken to have outlived its
+    /// `activeDeadlineSeconds` (it used to read as the far future, turning
+    /// every failure into a Timeout), and the subtraction from `i64::MIN`
+    /// must not overflow.
+    #[test]
+    fn a_broken_clock_never_makes_a_pod_outlive_its_deadline() {
+        let mut pod = plain_pod("Failed", 137);
+        pod.spec.as_mut().unwrap().active_deadline_seconds = Some(120);
+        pod.status.as_mut().unwrap().start_time =
+            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                k8s_openapi::jiff::Timestamp::from_second(NOW - 100_000).unwrap(),
+            ));
+        let broken = std::time::UNIX_EPOCH - std::time::Duration::from_secs(1);
+        assert!(!outlived_deadline(&pod, unix_secs(broken)));
+        assert!(outlived_deadline(&pod, NOW));
+        assert!(!outlived_deadline(&pod, NOW - 100_000 + 119));
     }
 
     /// Review correctness F5: the kubelet stops a finished Pod's native
