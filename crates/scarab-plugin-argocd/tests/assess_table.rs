@@ -170,13 +170,12 @@ fn a_retry_label_drops_argos_retrying_attempt_note() {
     // every retry a new label.
     let expected = "retry 2/3: one or more synchronization tasks completed unsuccessfully";
     let mut a = app("app-retrying.json");
-    for message in [
-        "one or more synchronization tasks completed unsuccessfully. Retrying attempt #2 at 9:14AM.",
-        "Retrying attempt #2 at 9:14AM: one or more synchronization tasks completed unsuccessfully",
-    ] {
-        a.status.operation_state.as_mut().unwrap().message = Some(message.into());
-        assert_eq!(assess(&a).label, expected, "{message}");
-    }
+    // The suffix form Argo writes (the prefix form is the table row above).
+    a.status.operation_state.as_mut().unwrap().message = Some(
+        "one or more synchronization tasks completed unsuccessfully. Retrying attempt #2 at 9:14AM."
+            .into(),
+    );
+    assert_eq!(assess(&a).label, expected);
     // A message that is only the note leaves the bare prefix.
     a.status.operation_state.as_mut().unwrap().message =
         Some("Retrying attempt #2 at 9:14AM.".into());

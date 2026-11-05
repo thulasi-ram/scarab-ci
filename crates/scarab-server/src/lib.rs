@@ -6318,8 +6318,32 @@ fn admit_k8s_overlay(
 /// delete, even under `permit_k8s_overlay` (git-bug da0af59): the Helm
 /// chart's Services select Pods on `app.kubernetes.io/name` + `/instance`, so
 /// a step Pod carrying them would receive the server's traffic, and the
-/// executor reads `scarab.io/*` keys to find and harvest step Pods.
-const K8S_OVERLAY_RESERVED_PREFIXES: [&str; 2] = ["app.kubernetes.io/", "scarab.io/"];
+/// executor reads `scarab.io/*` and `scarab.dev/*` keys to find, harvest and
+/// drain step Pods.
+const K8S_OVERLAY_RESERVED_PREFIXES: [&str; 3] =
+    ["app.kubernetes.io/", "scarab.io/", "scarab.dev/"];
+
+/// `metadata` fields a raw `k8s_overlay` may not set or delete: the executor
+/// names each Pod itself and finds it again by that name, so a renamed Pod
+/// runs on out of its reach; `namespace` moves it the same way;
+/// `ownerReferences` and `finalizers` decide when the Pod is deleted, and a
+/// finalizer keeps a torn-down Pod from ever going.
+const K8S_OVERLAY_RESERVED_METADATA: [&str; 5] = [
+    "name",
+    "generateName",
+    "namespace",
+    "ownerReferences",
+    "finalizers",
+];
+
+/// The reserved prefixes as the refusal messages name them.
+fn k8s_overlay_reserved_prefix_list() -> String {
+    K8S_OVERLAY_RESERVED_PREFIXES
+        .iter()
+        .map(|p| format!("`{p}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 /// One refusal per reserved key the overlay touches under `metadata.labels`
 /// or `metadata.annotations`. The overlay is an RFC-7386 merge patch, so a
@@ -6331,14 +6355,21 @@ fn k8s_overlay_reserved_keys(overlay: &serde_json::Value) -> Vec<String> {
     let Some(metadata) = overlay.get("metadata") else {
         return refused;
     };
+    let prefixes = k8s_overlay_reserved_prefix_list();
     let Some(metadata) = metadata.as_object() else {
-        refused.push(
-            "raw `k8s_overlay` may not replace or delete `metadata`: it holds the reserved \
-             `app.kubernetes.io/` and `scarab.io/` labels and annotations"
-                .to_string(),
-        );
+        refused.push(format!(
+            "raw `k8s_overlay` may not replace or delete `metadata`: it holds the Pod's name \
+             and its reserved {prefixes} labels and annotations"
+        ));
         return refused;
     };
+    for field in K8S_OVERLAY_RESERVED_METADATA {
+        if metadata.contains_key(field) {
+            refused.push(format!(
+                "raw `k8s_overlay` may not set or delete `metadata.{field}`: Scarab manages it"
+            ));
+        }
+    }
     for field in ["labels", "annotations"] {
         let Some(map) = metadata.get(field) else {
             continue;
@@ -6346,7 +6377,7 @@ fn k8s_overlay_reserved_keys(overlay: &serde_json::Value) -> Vec<String> {
         let Some(map) = map.as_object() else {
             refused.push(format!(
                 "raw `k8s_overlay` may not replace or delete `metadata.{field}`: it holds the \
-                 reserved `app.kubernetes.io/` and `scarab.io/` keys"
+                 reserved {prefixes} keys"
             ));
             continue;
         };
@@ -6357,7 +6388,7 @@ fn k8s_overlay_reserved_keys(overlay: &serde_json::Value) -> Vec<String> {
             {
                 refused.push(format!(
                     "raw `k8s_overlay` may not set or delete the reserved `metadata.{field}` key \
-                     `{key}` (keys under `app.kubernetes.io/` and `scarab.io/` are Scarab's)"
+                     `{key}` (keys under {prefixes} are Scarab's)"
                 ));
             }
         }
@@ -13109,7 +13140,11 @@ mod grant_admission_tests {
     fn k8s_overlay_refuses_reserved_label_and_annotation_keys_even_when_permitted() {
         let g = permitting();
         for field in ["labels", "annotations"] {
-            for key in ["app.kubernetes.io/name", "scarab.io/run"] {
+            for key in [
+                "app.kubernetes.io/name",
+                "scarab.io/run",
+                "scarab.dev/ws-drain-first-failure-ms",
+            ] {
                 for value in [serde_json::json!("x"), serde_json::Value::Null] {
                     let overlay = serde_json::json!({"metadata": {field: {key: value}}});
                     let err = admit_k8s_overlay(Some(g.as_ref()), Some(&overlay))
@@ -13138,6 +13173,28 @@ mod grant_admission_tests {
                 admit_k8s_overlay(Some(g.as_ref()), Some(&overlay)).is_err(),
                 "{overlay} must be refused"
             );
+        }
+    }
+
+    /// The executor names each Pod and finds it again by that name; owner
+    /// references and finalizers decide when it is deleted. A permitting
+    /// grant reaches none of them (review of da0af59: a renamed Pod runs on
+    /// out of reach, a finalizer keeps a torn-down Pod alive).
+    #[test]
+    fn k8s_overlay_refuses_the_pods_identity_and_lifecycle_fields_even_when_permitted() {
+        let g = permitting();
+        for field in super::K8S_OVERLAY_RESERVED_METADATA {
+            for value in [
+                serde_json::json!("x"),
+                serde_json::json!(["x"]),
+                serde_json::Value::Null,
+            ] {
+                let overlay = serde_json::json!({"metadata": {field: value}});
+                let err = admit_k8s_overlay(Some(g.as_ref()), Some(&overlay))
+                    .expect_err(&format!("metadata.{field} = {value} must be refused"))
+                    .join("; ");
+                assert!(err.contains(&format!("metadata.{field}")), "{field}: {err}");
+            }
         }
     }
 

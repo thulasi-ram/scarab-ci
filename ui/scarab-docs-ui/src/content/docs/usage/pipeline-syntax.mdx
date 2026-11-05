@@ -742,7 +742,7 @@ A pipeline waits on one with `invoke: plugin:<installation>/<gate>`:
   gate_expires_after: 1800
 
 - id: smoke
-  image: cgr.dev/chainguard/busybox:latest@sha256:9cf938251dfb3cc081ef9847e79c203b5de90ecc20855e40bef8a7cc191bb218
+  image: cgr.dev/chainguard/busybox@sha256:…
   needs: [live]
   env: [[REVISION, "${{ outputs.live.revision }}"]]
 ```
@@ -837,7 +837,9 @@ with `resources`:
 For a rare dynamic per-job Kubernetes need there is a governed `k8s_overlay` escape hatch: a raw
 pod-spec fragment merged last onto the Pod. Writing one grants nothing by itself: it is admitted only
 if the run's target environment permits raw overlays; otherwise the run is rejected (fail-closed). Prefer a named
-profile for anything static.
+profile for anything static. Even where raw overlays are permitted, an overlay cannot set or delete the Pod's
+`metadata.name`, `generateName`, `namespace`, `ownerReferences` or `finalizers`, or labels and annotations
+under `app.kubernetes.io/`, `scarab.io/` or `scarab.dev/`: Scarab uses them to find, route to and clean up the Pod.
 
 ```yaml
 - id: heavy
