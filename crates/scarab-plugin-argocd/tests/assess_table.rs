@@ -97,8 +97,13 @@ fn assess_maps_argo_states_to_statuses() {
             InProgress,
             "progressing: Waiting for rollout to finish: 2 of 4",
         ),
-        // A failed attempt with retries left is NOT a give-up.
-        ("app-retrying.json", InProgress, "retry 2/3: Retrying attempt #2"),
+        // A failed attempt with retries left is NOT a give-up. Argo's
+        // "Retrying attempt #N at T" note is dropped: the prefix says it.
+        (
+            "app-retrying.json",
+            InProgress,
+            "retry 2/3: one or more synchronization tasks completed unsuccessfully",
+        ),
         // Retries exhausted: the first failed hook is the reason, one line.
         (
             "app-hook-failed-retries-exhausted.json",
@@ -156,6 +161,33 @@ fn assess_maps_argo_states_to_statuses() {
             "{name}: labels are one line"
         );
     }
+}
+
+#[test]
+fn a_retry_label_drops_argos_retrying_attempt_note() {
+    // Argo's controller appends ". Retrying attempt #N at <time>." to the
+    // operation message. Kept, it repeats the "retry n/l" prefix and makes
+    // every retry a new label.
+    let expected = "retry 2/3: one or more synchronization tasks completed unsuccessfully";
+    let mut a = app("app-retrying.json");
+    for message in [
+        "one or more synchronization tasks completed unsuccessfully. Retrying attempt #2 at 9:14AM.",
+        "Retrying attempt #2 at 9:14AM: one or more synchronization tasks completed unsuccessfully",
+    ] {
+        a.status.operation_state.as_mut().unwrap().message = Some(message.into());
+        assert_eq!(assess(&a).label, expected, "{message}");
+    }
+    // A message that is only the note leaves the bare prefix.
+    a.status.operation_state.as_mut().unwrap().message =
+        Some("Retrying attempt #2 at 9:14AM.".into());
+    assert_eq!(assess(&a).label, "retry 2/3");
+    // Text that merely mentions retrying stays.
+    a.status.operation_state.as_mut().unwrap().message =
+        Some("hook failed. Retrying attempt is disabled".into());
+    assert_eq!(
+        assess(&a).label,
+        "retry 2/3: hook failed. Retrying attempt is disabled"
+    );
 }
 
 #[test]
