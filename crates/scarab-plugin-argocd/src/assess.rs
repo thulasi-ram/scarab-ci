@@ -119,6 +119,34 @@ fn with_message(prefix: &str, message: Option<&str>) -> String {
     }
 }
 
+/// `message` without Argo's "Retrying attempt #N at <time>" note, which
+/// repeats what the "retry n/l" prefix says and would change the label on
+/// every attempt. Argo appends it as ". Retrying attempt #N at 3:04PM.";
+/// the prefix form "Retrying attempt #N at 3:04PM: <reason>" is kept apart
+/// from the reason too. Text without the `#N at` shape is left alone.
+fn without_retry_note(message: &str) -> String {
+    const NOTE: &str = "Retrying attempt #";
+    let Some(start) = message.find(NOTE) else {
+        return message.to_string();
+    };
+    let rest = &message[start + NOTE.len()..];
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 || !rest[digits..].starts_with(" at ") {
+        return message.to_string();
+    }
+    let time_and_after = &rest[digits + " at ".len()..];
+    let after = time_and_after
+        .find(": ")
+        .map_or("", |i| &time_and_after[i + 2..])
+        .trim();
+    let before = message[..start].trim_end().trim_end_matches('.').trim_end();
+    match (before.is_empty(), after.is_empty()) {
+        (true, _) => after.to_string(),
+        (false, true) => before.to_string(),
+        (false, false) => format!("{before}. {after}"),
+    }
+}
+
 /// The Application's status and label right now.
 pub fn assess(app: &Application) -> Assessment {
     if let Some(op) = app.status.operation_state.as_ref() {
@@ -200,9 +228,10 @@ fn running(app: &Application, op: &OperationState) -> Assessment {
             Some(l) if l > 0 => format!("retry {retries}/{l}"),
             _ => format!("retry {retries}"),
         };
+        let message = op.message.as_deref().map(without_retry_note);
         return assessment(
             Status::InProgress,
-            with_message(&prefix, op.message.as_deref()),
+            with_message(&prefix, message.as_deref()),
         );
     }
     if let Some(hook) = hooks(op).find(|h| h.hook_phase.as_deref() == Some("Running")) {

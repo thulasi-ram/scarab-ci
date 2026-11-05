@@ -558,10 +558,7 @@ async fn a_launch_outliving_the_teardown_ceiling_is_still_torn_down(w: World) {
     );
     w.finish().await;
 }
-both!(
-    a_launch_outliving_the_teardown_ceiling_is_still_torn_down,
-    ignore = "redteam: BROKE F3 — late launch after an abandoned CANCEL_ATTEMPT is 'owed' to a dead intent"
-);
+both!(a_launch_outliving_the_teardown_ceiling_is_still_torn_down);
 
 // ---------------------------------------------------------------------------
 // F5 — the R2-E1 class for SHARED SERVICES. The services-only CANCEL_RUN
@@ -788,10 +785,7 @@ async fn a_legacy_cancel_run_pending_across_a_rerun_still_tears_down_a1(w: World
     );
     w.finish().await;
 }
-both!(
-    a_legacy_cancel_run_pending_across_a_rerun_still_tears_down_a1,
-    ignore = "redteam: BROKE F8 — legacy CANCEL_RUN drain only honours the LATEST attempt"
-);
+both!(a_legacy_cancel_run_pending_across_a_rerun_still_tears_down_a1);
 
 // ---------------------------------------------------------------------------
 // F9 — the R2-E5 supersession rule is check-then-act across replicas. The

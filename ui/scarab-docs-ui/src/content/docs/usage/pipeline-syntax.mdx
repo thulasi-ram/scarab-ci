@@ -273,6 +273,11 @@ the image digest.
     run_as_root: true
 ```
 
+Without `run_as_root`, a step runs with `runAsNonRoot` and no user id of its own, so the image's
+`USER` must be a non-zero number (`USER 65532`). The kubelet cannot check that a user name is not
+root, so an image whose `USER` is a name, such as `curlimages/curl`, fails to start with
+`CreateContainerConfigError`.
+
 Some steps are **kinds** with no image that the engine runs on your behalf (you set no `image`/`command`):
 
 - **`build: { image: ..., push: true }`**: a rootless BuildKit image build.
@@ -737,7 +742,7 @@ A pipeline waits on one with `invoke: plugin:<installation>/<gate>`:
   gate_expires_after: 1800
 
 - id: smoke
-  image: curlimages/curl
+  image: cgr.dev/chainguard/busybox@sha256:…
   needs: [live]
   env: [[REVISION, "${{ outputs.live.revision }}"]]
 ```
@@ -832,7 +837,13 @@ with `resources`:
 For a rare dynamic per-job Kubernetes need there is a governed `k8s_overlay` escape hatch: a raw
 pod-spec fragment merged last onto the Pod. Writing one grants nothing by itself: it is admitted only
 if the run's target environment permits raw overlays; otherwise the run is rejected (fail-closed). Prefer a named
-profile for anything static.
+profile for anything static. Even where raw overlays are permitted, an overlay cannot set or delete the Pod's
+`metadata.name`, `generateName`, `namespace`, `ownerReferences` or `finalizers`, or labels and annotations
+under `app.kubernetes.io/`, `scarab.io/` or `scarab.dev/`: Scarab uses them to find, route to and clean up the Pod.
+The rest of the Pod spec is not checked. An overlay can ask for privileged containers, host mounts, the
+host network, or a ServiceAccount token. Step Pods run in Scarab's own namespace by default, so that can
+be Scarab's ServiceAccount. Permit raw overlays only on an Environment whose pipeline authors you trust
+with that.
 
 ```yaml
 - id: heavy
