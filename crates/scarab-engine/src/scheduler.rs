@@ -3366,38 +3366,29 @@ impl<'a> Scheduler<'a> {
     /// wanted while it launched ([`process_launch_intent`](Self::process_launch_intent)),
     /// when nothing else owes it one.
     ///
-    /// An attempt stamped `Cancelled` whose [`CANCEL_ATTEMPT`] is still
-    /// pending is already owed: [`drain_attempt_teardowns`](Self::drain_attempt_teardowns)
-    /// waits out a pending `launch:` intent, so that teardown will see this
-    /// unit. The stamp alone is not enough: the teardown waits only up to
-    /// its poison ceiling and is then dead-lettered, and a launch that
-    /// returns after that must still be torn down (git-bug b9e8e9f). A
-    /// `Superseded` attempt's intent is keyed by the rerun that superseded
-    /// it, which is not known here, so it is not looked up: one more
-    /// idempotent cancel of a unit that may already be gone is the cost.
-    /// Any other way an attempt stops being wanted before its unit exists
-    /// (its step finalized without it, its Run settled) wrote no teardown.
-    /// In every case but the first this writes one: a [`CANCEL_ATTEMPT`]
-    /// naming only that attempt — never a Run-wide teardown, which would
-    /// kill the Run's live units. Keyed per attempt (`…:launch`): an attempt
-    /// is launched for real at most once.
+    /// Always writes a [`CANCEL_ATTEMPT`] naming only that attempt —
+    /// never a Run-wide teardown, which would kill the Run's live units —
+    /// keyed per attempt (`…:launch`: an attempt is launched for real at
+    /// most once).
+    ///
+    /// It is written even when the attempt is stamped `Cancelled` or
+    /// `Superseded`, whose stamping commit already carried a teardown: that
+    /// teardown waits out a pending `launch:` intent only up to its poison
+    /// ceiling and is then dead-lettered, and it can reach the ceiling
+    /// between any check made here and this launch being marked dispatched.
+    /// A launch returning after that would otherwise leave its unit running
+    /// (git-bug b9e8e9f). The cost when the first teardown does reach the
+    /// unit is one idempotent cancel of a unit already gone. Any other way
+    /// an attempt stops being wanted before its unit exists (its step
+    /// finalized without it, its Run settled) wrote no teardown at all.
     async fn enqueue_late_launch_teardown(
         &self,
         run: &RunId,
         step: &StepId,
         attempt: &AttemptId,
     ) -> Result<(), SchedulerError> {
-        let cancelled = self
-            .db
-            .attempts_of_step(run, step)
-            .await?
-            .iter()
-            .any(|a| &a.id == attempt && a.outcome == AttemptOutcome::Cancelled);
         let now = self.clock.now().await;
         let mut msg = cancel_attempt_intent(run, step, attempt, now);
-        if cancelled && self.db.outbox_key_pending(&msg.idempotency_key).await? {
-            return Ok(());
-        }
         msg.idempotency_key.push_str(":launch");
         self.db.enqueue_outbox(&msg).await?;
         Ok(())
@@ -4146,6 +4137,29 @@ impl<'a> Scheduler<'a> {
         Ok(())
     }
 
+    /// Cancel every non-terminal step of `run`: ask its in-flight unit to
+    /// stop (best-effort — SIGTERM + grace via the backend), then
+    /// [`cancel_step`], whose one commit carries the step transition, the
+    /// attempt's `Cancelled` stamp and its [`CANCEL_ATTEMPT`], and closes a
+    /// gate's open Attempt. The intent re-cancels until the unit is gone, so
+    /// an inline cancel that fails is retried there. Shared by every path
+    /// that cancels a Run's steps: an operator or concurrency cancel, budget
+    /// exhaustion, and dead-lettering (git-bug e25c3b5).
+    async fn cancel_live_steps(&self, run: &RunId, now: Timestamp) -> Result<(), SchedulerError> {
+        for step in self.db.steps_of_run(run).await? {
+            if step.status.is_terminal() {
+                continue;
+            }
+            if let Some(attempt) = in_flight_attempt(&step) {
+                if let Some(h) = self.db.attempt_handle(run, &step.step, &attempt.id).await? {
+                    let _ = self.executor.cancel(&ExecHandle(h)).await;
+                }
+            }
+            cancel_step(self.db, run, step, now).await?;
+        }
+        Ok(())
+    }
+
     /// Cancel a run: drive its non-terminal steps and the run itself to
     /// `Cancelled` durably (no half-cancelled limbo, ADR-0020) and release its
     /// concurrency slot. Terminating the underlying Pods (SIGTERM + grace →
@@ -4161,18 +4175,7 @@ impl<'a> Scheduler<'a> {
         // GONE (git-bug f22056d) — so an inline cancel that fails is retried
         // there (red team R2-E2b).
         let now = self.clock.now().await;
-        for step in self.db.steps_of_run(run).await? {
-            if !step.status.is_terminal() {
-                // Tear down the in-flight execution first (best-effort —
-                // SIGTERM + grace via the backend), then settle durably.
-                if let Some(attempt) = in_flight_attempt(&step) {
-                    if let Some(h) = self.db.attempt_handle(run, &step.step, &attempt.id).await? {
-                        let _ = self.executor.cancel(&ExecHandle(h)).await;
-                    }
-                }
-                cancel_step(self.db, run, step, now).await?;
-            }
-        }
+        self.cancel_live_steps(run, now).await?;
         if let Some(current) = self.db.run_status(run).await? {
             if !current.is_terminal() {
                 match commit_run_transition(
@@ -4477,20 +4480,7 @@ impl<'a> Scheduler<'a> {
         // Exhausted: tear down in-flight work (best-effort), cancel the steps,
         // and fail the run with diagnostics. Failed — a liveness verdict — not
         // DeadLettered (the operator did nothing wrong; the budget did its job).
-        // As `cancel_run`: `cancel_step` stamps the in-flight attempt
-        // Cancelled and commits its CANCEL_ATTEMPT in the same write, so a
-        // unit whose inline cancel fails is still torn down (git-bug e25c3b5).
-        for step in self.db.steps_of_run(run).await? {
-            if step.status.is_terminal() {
-                continue;
-            }
-            if let Some(attempt) = in_flight_attempt(&step) {
-                if let Some(h) = self.db.attempt_handle(run, &step.step, &attempt.id).await? {
-                    let _ = self.executor.cancel(&ExecHandle(h)).await;
-                }
-            }
-            cancel_step(self.db, run, step, now).await?;
-        }
+        self.cancel_live_steps(run, now).await?;
         // The verdict and its reason are one commit: appended on its own, a
         // deposed leader's late `RunBudgetExhausted` journalled a second
         // exhaustion next to its successor's.
@@ -4729,25 +4719,9 @@ impl<'a> Scheduler<'a> {
         // proceeds. Leftover non-terminal step rows are harmless — the run is
         // terminal, so nothing launches from them, and fencing keeps any
         // still-live backend unit from mutating durable state (ADR-0021).
+        let now = self.clock.now().await;
         let cleanup = async {
-            // As `cancel_run`: an inline cancel that only ASKS, then
-            // `cancel_step`, whose commit carries the attempt's Cancelled
-            // stamp and its CANCEL_ATTEMPT, and closes a gate's open Attempt.
-            // Without the intent a live unit ran on, owned by nothing
-            // (git-bug e25c3b5).
-            let now = self.clock.now().await;
-            for step in self.db.steps_of_run(run).await? {
-                if !step.status.is_terminal() {
-                    if let Some(attempt) = in_flight_attempt(&step) {
-                        if let Ok(Some(h)) =
-                            self.db.attempt_handle(run, &step.step, &attempt.id).await
-                        {
-                            let _ = self.executor.cancel(&ExecHandle(h)).await;
-                        }
-                    }
-                    cancel_step(self.db, run, step, now).await?;
-                }
-            }
+            self.cancel_live_steps(run, now).await?;
             // Shared services (ADR-0058) are NOT steps, so the loop above never
             // reaches them — and this is the LAST moment anything will: the run
             // is about to go terminal and leave the active set, after which no
@@ -4778,7 +4752,6 @@ impl<'a> Scheduler<'a> {
                  shared-service Pods may be orphaned: {e})"
             ));
         }
-        let now = self.clock.now().await;
         self.append(run, EventPayload::RunDeadLettered { reason }, now)
             .await?;
         self.transition_run(run, current, RunStatus::DeadLettered)

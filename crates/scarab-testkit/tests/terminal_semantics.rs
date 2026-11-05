@@ -32,16 +32,7 @@ fn spec() -> StepSpec {
 }
 
 async fn tick(db: &InMemoryDb, clock: &FakeClock, exec: &FakeExecutor) {
-    Scheduler::new(
-        db as &dyn Db,
-        clock as &dyn Clock,
-        exec as &dyn Executor,
-        "sched",
-    )
-    .with_outbox_visibility_ms(0)
-    .tick(&run_id())
-    .await
-    .unwrap();
+    fleet(db, clock, exec).tick(&run_id()).await.unwrap();
 }
 
 fn failed(class: FailureClass) -> ExecState {
@@ -600,7 +591,7 @@ async fn no_budget_means_no_run_ceiling() {
     );
 }
 
-/// A scheduler for the whole-fleet tick (`tick_all`), which also drains the
+/// The test's scheduler. `tick_all` (the whole-fleet tick) also drains the
 /// teardown intents (`reconcile_cancellations`) the per-run `tick` skips.
 fn fleet<'a>(db: &'a InMemoryDb, clock: &'a FakeClock, exec: &'a FakeExecutor) -> Scheduler<'a> {
     Scheduler::new(
