@@ -34,7 +34,7 @@ pub use scheduler::{
     unpin_run_snapshots, wait_began_at, AttemptTeardown, ExpiredInput, PlanReason, PlannedStep,
     PluginGateError, PluginGateVerdict, RerunError, RerunPlan, Scheduler, SchedulerError,
     Supervision, TeardownAttempt, TickHealth, CANCEL_ATTEMPT, CANCEL_RUN, LAUNCH_STEP,
-    MAX_DELIVERY_ATTEMPTS, RUN_STATUS_CHANGED, SUPERSEDE_TEARDOWN,
+    MAX_DELIVERY_ATTEMPTS, RUN_FINISHED, RUN_STATUS_CHANGED, SUPERSEDE_TEARDOWN,
 };
 
 use serde::{Deserialize, Serialize};
@@ -99,8 +99,9 @@ pub struct RefusedRun {
     pub sha: Option<String>,
     /// The trigger's headline (a push's commit subject).
     pub title: Option<String>,
-    /// `compile`, `yanked`, `policy`, `environment`, `event_field` or
-    /// `forge_token`.
+    /// `compile`, `yanked`, `policy`, `environment`, `event_field`,
+    /// `forge_token`, `schedule` or `upstream` (a loop or too long a chain
+    /// of follow-ups).
     pub reason_kind: String,
     pub message: String,
     /// For `compile`: each error with its fields. `[]` otherwise.

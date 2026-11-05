@@ -78,8 +78,7 @@ reuse, deploys, and the operational settings.
 
 `on:` maps a trigger kind to a filter. The kinds Scarab understands are `push`, `pull_request`,
 `tag`, `release`, `comment`, `cron`, `manual`, `api`, and `upstream`. An empty `on:` means the
-pipeline has no automatic triggers: it runs only when launched explicitly. `upstream` parses, but
-nothing produces that event yet, so it never fires.
+pipeline has no automatic triggers: it runs only when launched explicitly.
 
 ```yaml
 on:
@@ -149,6 +148,57 @@ How a schedule is found and fired:
   whose Pipeline no longer compiles.
 
 The repository page lists each schedule with its next slot and the last one that fired.
+
+### After another pipeline: `on: upstream`
+
+`on: upstream` starts a Run when a Run of another pipeline in the same repository finishes.
+`pipeline:` names that pipeline: its `name:`, or its file name without `.scarab/` and the
+extension. `status:` says which endings start it: `succeeded` (the default), `failed`, or a list
+of both.
+
+```yaml
+# .scarab/deploy.yaml
+on:
+  upstream:
+    pipeline: ci
+    when: "event.branch == 'main'"
+```
+
+Use it to split a build from its deploy. In one pipeline, a deploy step makes the whole Run a
+Deploy Run, so a newer push no longer cancels its build ([Deploys](#deploys-deploy-true)), and a
+rejected or expired deploy gate fails the Run the build is in. With `ci` on `push` and `deploy`
+on `upstream`, newest-wins still cancels stale `ci` Runs, and only the `deploy` Run waits for
+approval.
+
+The follow-up Run:
+
+- builds the commit the upstream Run built, and runs on its ref, so an Environment's
+  `allowed_refs` applies to it as it applied to the upstream. A follow-up of a pull request Run
+  has the ref `refs/pull/<n>/head`; the `when:` above keeps `deploy` to the `main` branch.
+- has the upstream Run's actor, and the Headline `<pipeline> <status>`, such as `ci succeeded`.
+- sees `event.pipeline`, `event.status`, `event.run`, `event.ref`, `event.branch`, `event.sha`
+  and `event.chain` (the pipeline names that led to it) in `when:`. A template may read
+  `event.run`, `event.ref`, `event.branch` and `event.sha` ([Trigger values](#trigger-values-event)).
+- is cancelled by newest-wins as a push is: a newer follow-up of the same pipeline on the same
+  branch or pull request cancels an older one still running, unless it is a Deploy Run or names
+  an Environment.
+
+These start no follow-up:
+
+- a Run of a pull request from a fork;
+- a cancelled Run;
+- an ending of a Run that was rerun since. When the Rerun finishes, it starts the follow-up again.
+
+A pipeline already in the chain of Runs that led to it (`a` follows `b` and `b` follows `a`) is
+refused, and so is a follow-up of a chain 8 pipelines long. Both are listed with the repository's
+refused runs. Only pipelines in the same repository can be followed.
+
+### Commit statuses
+
+Each pipeline posts its own commit status to the forge, named `scarab/<pipeline>` (its `name:`,
+or its file name), so two pipelines on one commit do not overwrite each other. Two pipelines with
+the same `name:` share one status. A branch protection rule requires `scarab/<pipeline>` for each
+pipeline it waits for.
 
 ## Interface: `interface.inputs` (and `outputs`)
 
@@ -391,7 +441,7 @@ The target always has a prefix that says where it comes from:
 | `plugin:<installation>/<gate>` | a gate a plugin installed in your org resolves ([Plugin gates](#plugin-gates)) |
 
 A `file:` path is repo-relative: no leading `/`, no `..`, and no remote or cross-repo forms
-(cross-repo causation is `on: upstream`). A bare path is a compile error that tells you to add
+(a library from elsewhere is installed in the org and invoked as `lib:`). A bare path is a compile error that tells you to add
 `file:`, and `url:` is refused: Scarab does not invoke from a URL. A `lib:` target resolves to the
 version your org installed ([Libraries](/scarab-ci/usage/libraries/)); a name the org has not
 installed fails with "`lib:<publisher>/<name>` is not installed in this org".

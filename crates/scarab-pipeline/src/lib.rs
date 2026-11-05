@@ -515,6 +515,56 @@ pub struct TriggerFilter {
         deserialize_with = "one_or_many"
     )]
     pub schedule: Vec<String>,
+    /// `on: upstream:` only: the pipeline in this repository whose finished
+    /// Runs start this one, by its name (its `name:`, else its file name
+    /// without `.scarab/` and the extension). Required on `upstream` and
+    /// refused on every other kind by [`validate`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline: Option<String>,
+    /// `on: upstream:` only: which endings of the upstream Run start this
+    /// one, [`UPSTREAM_STATUSES`]. One string or a list; empty means
+    /// `succeeded`.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "one_or_many"
+    )]
+    pub status: Vec<String>,
+}
+
+/// The upstream endings an `on: upstream:` may name in `status:`.
+pub const UPSTREAM_STATUSES: [&str; 2] = ["succeeded", "failed"];
+
+/// The longest chain of `on: upstream:` Runs: a Run whose chain of upstream
+/// pipelines is this long starts no follow-up.
+pub const MAX_UPSTREAM_CHAIN: usize = 8;
+
+/// The pipeline an `on: upstream:` filter follows and the endings it takes
+/// (`succeeded` when it names none).
+pub fn upstream_follows(filter: &TriggerFilter) -> Option<(&str, Vec<&str>)> {
+    let pipeline = filter.pipeline.as_deref()?.trim();
+    if pipeline.is_empty() {
+        return None;
+    }
+    let statuses = if filter.status.is_empty() {
+        vec!["succeeded"]
+    } else {
+        filter.status.iter().map(|s| s.trim()).collect()
+    };
+    Some((pipeline, statuses))
+}
+
+/// The pipeline an authored file's `on: upstream:` follows, read from its
+/// `on:` block alone ([`triggers_of`]), without compiling it. `None` for a
+/// library, a file that does not parse, or one with no `upstream` trigger.
+/// Used to find a finished Run's follow-ups without compiling every file.
+pub fn upstream_pipeline_of(yaml: &str) -> Option<String> {
+    if is_library(yaml) {
+        return None;
+    }
+    let triggers = triggers_of(yaml).ok()?;
+    let filter = triggers.0.get("upstream")?;
+    upstream_follows(filter).map(|(p, _)| p.to_string())
 }
 
 /// A YAML value that is one string or a list of strings.
@@ -2232,7 +2282,7 @@ fn two_segment_name(rest: &str, prefix: &str, shape: &str) -> Result<String, Str
 ///
 /// The path must be repo-relative and resolve inside the repo tree. Absolute
 /// paths, `..` traversal, and cross-repo / remote references are rejected —
-/// cross-repo *causation* is `on: upstream`, not `invoke`. A single leading
+/// a library from elsewhere is installed in the org and invoked as `lib:`. A single leading
 /// `./` is accepted and stripped.
 fn resolve_lib_path(raw: &str) -> Result<String, String> {
     let path = raw.trim();
@@ -2242,7 +2292,7 @@ fn resolve_lib_path(raw: &str) -> Result<String, String> {
     // Cross-repo / remote forms (`scheme://…`, `github.com/org/repo//lib@sha`).
     if path.contains("://") || path.contains('@') {
         return Err(format!(
-            "invoke path `{raw}` looks like a cross-repo/remote reference — `invoke` is local-only; use `on: upstream` for cross-repo causation"
+            "invoke path `{raw}` looks like a cross-repo/remote reference — `invoke` is local-only; use `lib:<publisher>/<name>` for a library installed in your org"
         ));
     }
     if path.starts_with('/') {
@@ -5509,6 +5559,36 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                 "trigger `{kind}`: `schedule` belongs to `on: cron:`, not `{kind}`"
             ));
         }
+        // `pipeline` and `status` belong to `upstream`, and `upstream` needs
+        // a `pipeline` (git-bug 149b4db).
+        if kind == "upstream" {
+            if upstream_follows(filter).is_none() {
+                diagnostics.push(
+                    "trigger `upstream`: needs a `pipeline`, the name of the pipeline in this \
+                     repository whose Runs start this one, such as `pipeline: ci`"
+                        .to_string(),
+                );
+            }
+            for status in &filter.status {
+                if !UPSTREAM_STATUSES.contains(&status.trim()) {
+                    diagnostics.push(format!(
+                        "trigger `upstream`: status `{status}` is not one of {}",
+                        UPSTREAM_STATUSES.join(", ")
+                    ));
+                }
+            }
+        } else {
+            if filter.pipeline.is_some() {
+                diagnostics.push(format!(
+                    "trigger `{kind}`: `pipeline` belongs to `on: upstream:`, not `{kind}`"
+                ));
+            }
+            if !filter.status.is_empty() {
+                diagnostics.push(format!(
+                    "trigger `{kind}`: `status` belongs to `on: upstream:`, not `{kind}`"
+                ));
+            }
+        }
     }
 
     // Concurrency: a non-empty group, a known policy, and a group whose `${{ … }}`
@@ -5644,12 +5724,27 @@ pub fn matches_trigger(
     kind: &str,
     ctx: &serde_json::Value,
 ) -> Result<bool, PipelineError> {
-    match ir.triggers.0.get(kind) {
-        None => Ok(false),
-        Some(filter) => match &filter.when {
-            None => Ok(true),
-            Some(expr) => cel::eval_bool(expr, ctx),
-        },
+    let Some(filter) = ir.triggers.0.get(kind) else {
+        return Ok(false);
+    };
+    // An upstream trigger follows one pipeline's Runs, and only the endings
+    // it names.
+    if kind == "upstream" {
+        let Some((pipeline, statuses)) = upstream_follows(filter) else {
+            return Ok(false);
+        };
+        let event = &ctx["event"];
+        if event["pipeline"].as_str() != Some(pipeline)
+            || !event["status"]
+                .as_str()
+                .is_some_and(|s| statuses.contains(&s))
+        {
+            return Ok(false);
+        }
+    }
+    match &filter.when {
+        None => Ok(true),
+        Some(expr) => cel::eval_bool(expr, ctx),
     }
 }
 
@@ -6408,6 +6503,58 @@ mod tests {
             let diags = errors(&format!("on: {on}\nsteps: [{{ id: a, image: busybox }}]"));
             assert!(diags.iter().any(|d| d.contains(says)), "{on}: {diags:?}");
         }
+    }
+
+    #[test]
+    fn an_upstream_trigger_names_a_pipeline_and_known_endings() {
+        for (on, says) in [
+            ("{ upstream: {} }", "trigger `upstream`: needs a `pipeline`"),
+            (r#"{ upstream: { pipeline: " " } }"#, "needs a `pipeline`"),
+            (
+                "{ upstream: { pipeline: ci, status: cancelled } }",
+                "status `cancelled` is not one of succeeded, failed",
+            ),
+            ("{ push: { pipeline: ci } }", "`pipeline` belongs to `on: upstream:`"),
+            ("{ push: { status: failed } }", "`status` belongs to `on: upstream:`"),
+        ] {
+            let diags = errors(&format!("on: {on}\nsteps: [{{ id: a, image: busybox }}]"));
+            assert!(diags.iter().any(|d| d.contains(says)), "{on}: {diags:?}");
+        }
+        let ir = compile(
+            "on: { upstream: { pipeline: ci, status: [succeeded, failed] } }\n\
+             steps: [{ id: a, image: busybox }]",
+        );
+        assert_eq!(ir.triggers.0["upstream"].status, ["succeeded", "failed"]);
+    }
+
+    #[test]
+    fn an_upstream_trigger_matches_its_pipeline_and_endings_only() {
+        let ir = compile(
+            r#"
+            on:
+              upstream:
+                pipeline: ci
+                when: "event.branch == 'main'"
+            steps:
+              - { id: a, image: busybox }
+            "#,
+        );
+        let ctx = |pipeline: &str, status: &str, branch: &str| {
+            json!({ "event": { "pipeline": pipeline, "status": status, "branch": branch } })
+        };
+        assert!(matches_trigger(&ir, "upstream", &ctx("ci", "succeeded", "main")).unwrap());
+        // Another pipeline, a failure (the default is successes only), and
+        // the `when:` all still apply.
+        assert!(!matches_trigger(&ir, "upstream", &ctx("lint", "succeeded", "main")).unwrap());
+        assert!(!matches_trigger(&ir, "upstream", &ctx("ci", "failed", "main")).unwrap());
+        assert!(!matches_trigger(&ir, "upstream", &ctx("ci", "succeeded", "dev")).unwrap());
+        assert_eq!(
+            upstream_pipeline_of("on: { upstream: { pipeline: ci } }\nsteps: [{ id: a }]")
+                .as_deref(),
+            Some("ci"),
+            "read from a file that does not compile"
+        );
+        assert_eq!(upstream_pipeline_of("on: { push: {} }"), None);
     }
 
     #[test]

@@ -32,6 +32,22 @@ fn push() -> Event {
     }
 }
 
+/// Retire the `run_finished` messages (no pipeline here follows another).
+async fn drain_followups_once(forge: &dyn scarab_forge::ForgePort, db: &InMemoryDb, clock: &FakeClock) {
+    let started = scarab_server::followups::drain_followups(
+        forge,
+        db,
+        clock,
+        scarab_server::AdmissionPorts::governance(None),
+        "followups",
+        32,
+        30_000,
+    )
+    .await
+    .unwrap();
+    assert_eq!(started, 0);
+}
+
 /// Drive the run to terminal with a scripted executor outcome (bounded).
 async fn drive(db: &InMemoryDb, clock: &FakeClock, exec: &FakeExecutor, run: &RunId) {
     let sched = Scheduler::new(db, clock, exec, "sched-1");
@@ -85,7 +101,7 @@ async fn run_start_and_success_post_pending_then_success() {
     assert_eq!(posted, 2);
     let states: Vec<StatusState> = forge.statuses().iter().map(|s| s.state).collect();
     assert_eq!(states, vec![StatusState::Pending, StatusState::Success]);
-    assert!(forge.statuses().iter().all(|s| s.context == "scarab"));
+    assert!(forge.statuses().iter().all(|s| s.context == "scarab/ci"));
     // Every status carries the REQUIRED run deep-link (ADR-0046).
     assert!(
         forge
@@ -109,6 +125,53 @@ async fn run_start_and_success_post_pending_then_success() {
     .unwrap();
     assert_eq!(again, 0);
     assert_eq!(forge.statuses().len(), 2, "no duplicate posts");
+}
+
+#[tokio::test]
+async fn two_pipelines_on_one_commit_post_separate_contexts() {
+    // Every Run used to post the one context `scarab`, so a failing `lint`
+    // and a passing `test` on one commit overwrote each other and the commit
+    // showed whichever finished last. Each pipeline now owns its context.
+    let forge = Arc::new(
+        FakeForge::new()
+            .with_file(".scarab/test.yaml", CI_YAML)
+            .with_file(".scarab/lint.yaml", CI_YAML),
+    );
+    let db = InMemoryDb::new();
+    let clock = FakeClock::new(1_000);
+    let runs = trigger_run_from_event(
+        forge.as_ref(),
+        &db,
+        &clock,
+        scarab_server::AdmissionPorts::governance(None),
+        &push(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(runs.len(), 2, "both pipelines start");
+    let exec = FakeExecutor::new();
+    for run in &runs {
+        exec.script_outcome(ExecState::Succeeded);
+        drive(&db, &clock, &exec, run).await;
+    }
+    drain_forge_statuses(
+        forge.as_ref(),
+        &db,
+        "drainer",
+        32,
+        30_000,
+        "http://scarab.test",
+    )
+    .await
+    .unwrap();
+    let mut contexts: Vec<String> = forge
+        .statuses()
+        .iter()
+        .filter(|s| s.state == StatusState::Success)
+        .map(|s| s.context.clone())
+        .collect();
+    contexts.sort();
+    assert_eq!(contexts, vec!["scarab/lint", "scarab/test"]);
 }
 
 #[tokio::test]
@@ -213,6 +276,9 @@ async fn rejected_status_posts_are_retried_then_dead_lettered_not_silently_dropp
         .await
         .unwrap();
     assert_eq!(after, 0);
+    // The Run's `run_finished` (no pipeline follows `ci`) is retired by the
+    // follow-up drain, as the server runs it beside this one.
+    drain_followups_once(forge.as_ref(), &db, &clock).await;
     assert_eq!(
         db.outbox_depth().await.unwrap(),
         0,
@@ -285,5 +351,6 @@ async fn a_redelivered_start_post_never_lands_after_the_runs_verdict() {
     assert_eq!(late, 0, "the superseded start post is retired unposted");
     let states: Vec<StatusState> = healthy.statuses().iter().map(|s| s.state).collect();
     assert_eq!(states, vec![StatusState::Success]);
+    drain_followups_once(healthy.as_ref(), &db, &clock).await;
     assert_eq!(db.outbox_depth().await.unwrap(), 0, "and never redelivered");
 }

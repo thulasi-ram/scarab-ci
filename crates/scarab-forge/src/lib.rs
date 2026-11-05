@@ -331,9 +331,36 @@ pub enum Event {
         /// at admission (thread D), never at the dispatch endpoint.
         reason: Option<String>,
     },
+    /// Another Pipeline's Run in the same repository finished (`on:
+    /// upstream:`). The downstream Run builds the same commit. Built by the
+    /// server from the finished Run's record, never from a webhook.
     Upstream {
         repo: RepoRef,
+        /// The finished (upstream) Run's id.
         run: String,
+        /// The upstream Run's reopen generation when it finished: a Rerun
+        /// that finishes again is a new event.
+        #[serde(default)]
+        generation: u64,
+        /// The upstream Run's pipeline name (its `name:`, else its file name).
+        #[serde(default)]
+        pipeline: String,
+        /// How the upstream Run ended: `succeeded` or `failed`.
+        #[serde(default)]
+        status: String,
+        /// The upstream Run's symbolic ref (`refs/heads/main`,
+        /// `refs/pull/7/head`, …); empty when it had none.
+        #[serde(default)]
+        r#ref: String,
+        /// The commit the upstream Run built, which the downstream Run builds.
+        #[serde(default)]
+        sha: String,
+        /// The upstream Run's actor, so the chain keeps who started it.
+        #[serde(default)]
+        actor: String,
+        /// The pipeline names of the chain so far, the upstream's own last.
+        #[serde(default)]
+        chain: Vec<String>,
     },
 }
 
@@ -413,14 +440,17 @@ impl Event {
             // so a branch-scoped Environment admits it as it admits a push
             // to that branch.
             Event::Cron { r#ref, .. } => Some(r#ref.clone()),
-            Event::Comment { .. } | Event::Upstream { .. } => None,
+            // A follow-up runs on its upstream's ref, so an Environment's
+            // allowed refs apply to it as they applied to the upstream.
+            Event::Upstream { r#ref, .. } => (!r#ref.is_empty()).then(|| r#ref.clone()),
+            Event::Comment { .. } => None,
         }
     }
 
     /// The **Actor** (CONTEXT.md §4.5) — the forge principal who caused this
     /// event (pusher, PR opener, tagger, releaser, commenter, or `manual`/`api`
-    /// dispatcher), normalized to a login. `None` for the internally-originated
-    /// `cron` and `upstream` events, which have no forge principal. An empty
+    /// dispatcher), normalized to a login. `None` for `cron`, which has no forge
+    /// principal; an `upstream` event carries its upstream Run's actor. An empty
     /// stored login (a payload with no `sender`) also reads as `None`, so callers
     /// get either a real login or nothing.
     pub fn actor(&self) -> Option<&str> {
@@ -431,8 +461,9 @@ impl Event {
             | Event::Release { actor, .. }
             | Event::Comment { actor, .. }
             | Event::Manual { actor, .. }
-            | Event::Api { actor, .. } => actor.as_str(),
-            Event::Cron { .. } | Event::Upstream { .. } => "",
+            | Event::Api { actor, .. }
+            | Event::Upstream { actor, .. } => actor.as_str(),
+            Event::Cron { .. } => "",
         };
         (!a.is_empty()).then_some(a)
     }
@@ -461,9 +492,20 @@ impl Event {
     /// mid-UTF-8-sequence) and returned **clean** — no ellipsis; the UI owns the
     /// overflow signal. `None` when there is no headline (an empty commit
     /// message / PR title / reason, or a kind that carries none —
-    /// `tag`/`release`/`comment`/`cron`/`upstream`). Display/audit only; this
+    /// `tag`/`release`/`comment`). A `cron` Run's headline is its schedule, an
+    /// `upstream` Run's is `<pipeline> <status>`. Display/audit only; this
     /// value never enters [`Event::context()`].
     pub fn trigger_title(&self) -> Option<String> {
+        // An upstream Run's headline names what it follows: `ci succeeded`.
+        if let Event::Upstream {
+            pipeline, status, ..
+        } = self
+        {
+            if pipeline.is_empty() {
+                return None;
+            }
+            return cap_trigger_title(&format!("{pipeline} {status}"));
+        }
         let raw = match self {
             // The commit subject = the first line of the message; the body is
             // dropped (ADR-0057 §1).
@@ -544,8 +586,15 @@ impl Event {
                 e.insert("branch".into(), branch(r#ref));
                 e.insert("sha".into(), json!(sha));
             }
-            Event::Upstream { run, .. } => {
+            Event::Upstream {
+                run, r#ref, sha, ..
+            } => {
                 e.insert("run".into(), json!(run));
+                if !r#ref.is_empty() {
+                    e.insert("ref".into(), json!(r#ref));
+                    e.insert("branch".into(), branch(r#ref));
+                }
+                e.insert("sha".into(), json!(sha));
             }
         }
         e
@@ -634,8 +683,25 @@ impl Event {
                 );
                 e.insert("sha".into(), json!(sha));
             }
-            Event::Upstream { run, .. } => {
+            Event::Upstream {
+                run,
+                pipeline,
+                status,
+                r#ref,
+                sha,
+                chain,
+                ..
+            } => {
                 e.insert("run".into(), json!(run));
+                e.insert("pipeline".into(), json!(pipeline));
+                e.insert("status".into(), json!(status));
+                e.insert("ref".into(), json!(r#ref));
+                e.insert(
+                    "branch".into(),
+                    json!(r#ref.strip_prefix("refs/heads/").unwrap_or(r#ref)),
+                );
+                e.insert("sha".into(), json!(sha));
+                e.insert("chain".into(), json!(chain));
             }
         }
         json!({ "event": serde_json::Value::Object(e) })
@@ -1592,6 +1658,13 @@ mod tests {
                 Event::Upstream {
                     repo: repo(),
                     run: "r1".into(),
+                    generation: 0,
+                    pipeline: "ci".into(),
+                    status: "succeeded".into(),
+                    r#ref: "refs/heads/main".into(),
+                    sha: "deadbeef".into(),
+                    actor: "octocat".into(),
+                    chain: vec!["ci".into()],
                 },
                 TriggerKind::Upstream,
             ),
@@ -1833,14 +1906,23 @@ mod tests {
             .protection_ref(),
             None,
         );
+        // A follow-up runs on its upstream's ref; none when it had none.
+        let upstream = |r#ref: &str| Event::Upstream {
+            repo: repo(),
+            run: "r1".into(),
+            generation: 0,
+            pipeline: "ci".into(),
+            status: "succeeded".into(),
+            r#ref: r#ref.into(),
+            sha: "deadbeef".into(),
+            actor: String::new(),
+            chain: Vec::new(),
+        };
         assert_eq!(
-            Event::Upstream {
-                repo: repo(),
-                run: "r1".into()
-            }
-            .protection_ref(),
-            None,
+            upstream("refs/heads/main").protection_ref().as_deref(),
+            Some("refs/heads/main"),
         );
+        assert_eq!(upstream("").protection_ref(), None);
     }
 
     #[test]
