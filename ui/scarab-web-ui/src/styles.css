@@ -470,7 +470,7 @@ code,
   .btn:not(:disabled):active, .search-chip:active,
   .brand:active, .repo-card:active { transform: none; }
   /* Overlays + icon: keep the opacity fade, drop the scale/rotate movement. */
-  .modal-scrim, .modal, .usermenu-pop { transition-property: opacity; }
+  .modal-scrim, .modal, .dlg-scrim, .dlg, .usermenu-pop { transition-property: opacity; }
 }
 
 h1 {
@@ -3923,3 +3923,170 @@ code.c { font-family: var(--font-mono); font-size: var(--fs-sm); color: var(--co
 .swatch-dots .running { background: var(--running); }
 .swatch-dots .warn { background: var(--warn); }
 .swatch-dots .danger { background: var(--danger); }
+
+/* ════════════════════════════════════════════════════════════════════════
+   Shared form controls (components/Field.tsx) and the dialog frame
+   (components/Modal.tsx, ConfirmDestructive.tsx). Fields: a 30px hairline
+   box, emerald border + ring on focus, label above in mono. Dialogs: a 20px
+   title, a purpose line, numbered sections, a footer band, three widths.
+   ════════════════════════════════════════════════════════════════════════ */
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+}
+
+/* ---- Field ---- */
+.f { display: flex; flex-direction: column; min-width: 0; }
+.f-l { display: flex; align-items: baseline; gap: 6px; margin-bottom: 5px; }
+.f-lbl {
+  font-family: var(--font-mono); font-size: var(--fs-xs); text-transform: uppercase;
+  letter-spacing: 0.9px; color: var(--muted-sage);
+}
+/* A label that is a sentence ("Type production to confirm"), not a field name. */
+.f-lbl.plain {
+  font-family: var(--font-ui); font-size: var(--fs-sm); text-transform: none;
+  letter-spacing: 0; color: var(--sage);
+}
+.f-lbl.plain b { color: var(--soft-white); font-weight: 500; }
+.f-req { font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--danger); }
+.f-help, .f-err { margin: 5px 0 0; font-size: var(--fs-sm); line-height: 1.45; }
+.f-help { color: var(--muted-sage); }
+.f-err { display: flex; gap: 6px; align-items: flex-start; color: var(--danger); }
+.f-err svg { flex: none; margin-top: 2px; }
+.f-help code, .f-help .mono { font-family: var(--font-mono); color: var(--sage); }
+
+/* ---- the control box: Input, Select, Textarea ---- */
+.f-ctl {
+  position: relative; display: flex; align-items: center; gap: 8px;
+  min-height: 30px; padding: 0 9px;
+  background: var(--emerald-surface); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); color: var(--soft-white);
+  transition: border-color 0.12s var(--ease-out), box-shadow 0.12s var(--ease-out);
+}
+.dlg .f-ctl { background: var(--emerald-elevated); }
+.f-ctl:hover { border-color: color-mix(in srgb, var(--muted-sage) 60%, var(--border)); }
+.f-ctl:focus-within {
+  border-color: var(--emerald);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--emerald) 18%, transparent);
+}
+.f-ctl.is-err { border-color: var(--danger); }
+.f-ctl.is-err:focus-within { box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger) 16%, transparent); }
+.f-ctl.is-dis { background: var(--pine-deep); border-color: var(--border-soft); }
+.f-ctl.is-ro { background: var(--pine-deep); border-color: transparent; color: var(--sage); }
+.f-inp {
+  flex: 1; min-width: 0; height: 28px; margin: 0; padding: 0;
+  border: 0; background: transparent; color: inherit; outline: none;
+  font-family: var(--font-ui); font-size: var(--fs-md); letter-spacing: 0;
+}
+/* The box draws the focus ring; the bare control inside it does not. */
+.f-inp:focus-visible { outline: none; }
+.f-inp.mono { font-family: var(--font-mono); }
+.f-inp::placeholder { color: var(--muted-sage); opacity: 1; }
+.f-inp:disabled { cursor: not-allowed; color: var(--muted-sage); -webkit-text-fill-color: var(--muted-sage); }
+.f-aff { font-family: var(--font-mono); font-size: var(--fs-sm); color: var(--muted-sage); white-space: nowrap; }
+.f-sel select.f-inp { appearance: none; -webkit-appearance: none; cursor: pointer; padding-right: 22px; }
+.f-sel select.f-inp option { background: var(--emerald-elevated); color: var(--soft-white); }
+.f-chev { position: absolute; right: 9px; display: inline-flex; pointer-events: none; color: var(--muted-sage); }
+.f-area { align-items: stretch; padding: 6px 9px; }
+.f-area textarea.f-inp { height: auto; min-height: 80px; resize: vertical; line-height: 1.6; tab-size: 2; }
+.f-area textarea.f-inp.mono { font-size: var(--fs-sm); }
+
+/* ---- Checkbox ---- */
+.f-chk { position: relative; display: grid; grid-template-columns: auto 1fr; gap: 0 10px; align-items: start; cursor: pointer; }
+.f-chk input { position: absolute; width: 1px; height: 1px; margin: 0; opacity: 0; }
+.f-box {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 14px; height: 14px; margin-top: 2px;
+  border: 1px solid color-mix(in srgb, var(--muted-sage) 70%, var(--border));
+  border-radius: 2px; background: var(--emerald-surface); color: var(--badge-ink);
+  transition: background 0.12s var(--ease-out), border-color 0.12s var(--ease-out);
+}
+.f-box svg { opacity: 0; }
+.f-chk input:checked + .f-box { background: var(--emerald); border-color: var(--emerald); }
+.f-chk input:checked + .f-box svg { opacity: 1; }
+.f-chk input:focus-visible + .f-box { outline: 2px solid var(--emerald); outline-offset: 2px; }
+.f-chk.is-dis { cursor: not-allowed; opacity: 0.6; }
+.f-chk-t { display: flex; flex-direction: column; min-width: 0; }
+.f-chk-l { font-size: var(--fs-md); color: var(--soft-white); }
+.f-chk-h { font-size: var(--fs-sm); color: var(--muted-sage); }
+
+/* ---- Modal ---- */
+.dlg-scrim {
+  position: fixed; inset: 0; z-index: 50;
+  display: flex; align-items: flex-start; justify-content: center;
+  padding: 10vh 16px 16px;
+  background: rgba(10, 18, 14, 0.5); backdrop-filter: blur(2px);
+  transition: opacity 0.18s var(--ease-out);
+}
+@starting-style { .dlg-scrim { opacity: 0; } }
+/* The three widths. Only Modal's `size` picks one. */
+.dlg-narrow { --dlg-w: 440px; }
+.dlg-standard { --dlg-w: 560px; }
+.dlg-wide { --dlg-w: 760px; }
+.dlg {
+  position: relative; display: flex; flex-direction: column;
+  width: min(var(--dlg-w), 100%); max-height: min(84vh, 860px);
+  background: var(--emerald-elevated); border: 1px solid var(--border);
+  border-radius: var(--radius-lg); overflow: hidden; outline: none;
+  box-shadow: 0 24px 60px -28px rgba(10, 20, 14, 0.5);
+  transition: opacity 0.18s var(--ease-out), transform 0.18s var(--ease-out);
+}
+@starting-style { .dlg { opacity: 0; transform: scale(0.97); } }
+.dlg-h { position: relative; flex: none; padding: 22px 56px 18px 24px; border-bottom: 1px solid var(--border); }
+.dlg-eb { margin-bottom: 6px; font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--copper); }
+.dlg-t {
+  display: flex; align-items: center; gap: 8px; margin: 0;
+  font-family: "Space Grotesk", var(--font-ui); font-size: var(--fs-xl); font-weight: 600;
+  line-height: 1.25; letter-spacing: -0.4px; color: var(--soft-white);
+}
+.dlg-p { margin: 6px 0 0; font-size: var(--fs-md); line-height: 1.5; color: var(--sage); }
+.dlg-x {
+  position: absolute; top: 16px; right: 16px; display: inline-flex; padding: 4px;
+  background: none; border: 0; border-radius: var(--radius-sm); color: var(--muted-sage); cursor: pointer;
+}
+.dlg-x:hover { color: var(--soft-white); }
+.dlg-x:focus-visible { outline: 2px solid var(--emerald); outline-offset: 0; }
+.dlg-b {
+  flex: 1 1 auto; min-height: 0; overflow-y: auto;
+  display: flex; flex-direction: column; gap: 16px; padding: 20px 24px;
+}
+/* A sectioned body: each section carries its own padding and rule. */
+.dlg-b:has(> .dlg-sec) { gap: 0; padding: 0; }
+.dlg-sec {
+  display: grid; grid-template-columns: 112px minmax(0, 1fr); gap: 0 18px;
+  padding: 18px 24px; border-bottom: 1px solid var(--border-soft);
+}
+.dlg-sec:last-child { border-bottom: 0; }
+.dlg-sec-h {
+  margin: 0; padding-top: 2px; font-family: var(--font-mono); font-size: var(--fs-xs); font-weight: 400;
+  text-transform: uppercase; letter-spacing: 0.9px; color: var(--muted-sage);
+}
+.dlg-sec-h b { display: block; margin-top: 2px; font-weight: 500; color: var(--soft-white); }
+.dlg-sec-b { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+@media (max-width: 560px) { .dlg-sec { grid-template-columns: 1fr; gap: 10px; } }
+.dlg-f {
+  flex: none; display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 8px;
+  padding: 14px 24px; background: var(--pine-deep); border-top: 1px solid var(--border);
+}
+.dlg-f .sp { flex: 1; }
+.dlg-after {
+  flex-basis: 100%; display: grid; grid-template-columns: max-content 1fr; gap: 2px 12px;
+  margin-bottom: 4px; font-family: var(--font-mono); font-size: var(--fs-sm); color: var(--soft-white);
+}
+.dlg-after .k { padding-top: 1px; font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.9px; color: var(--muted-sage); }
+.dlg-msg { flex-basis: 100%; display: flex; gap: 6px; align-items: flex-start; margin: 0; font-size: var(--fs-sm); color: var(--danger); }
+.dlg-msg svg { flex: none; margin-top: 2px; }
+/* Context inside a dialog body: a fact the reader needs, not a control. */
+.dlg-ctx { margin: 0; font-family: var(--font-mono); font-size: var(--fs-sm); line-height: 1.55; color: var(--sage); }
+.dlg-ctx .k { color: var(--muted-sage); }
+.dlg-text { font-size: var(--fs-md); line-height: 1.5; color: var(--sage); }
+.dlg-text p { margin: 0; }
+.dlg-text p + p { margin-top: 8px; }
+
+/* The confirm button of a destructive dialog: a solid danger fill. */
+.btn-destroy {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: var(--danger); border-color: var(--danger); color: var(--badge-ink);
+}
+.btn-destroy:not(:disabled):hover { background: color-mix(in srgb, var(--danger) 85%, black); }
+.dlg-f .btn-primary, .dlg-f .btn-ghost { display: inline-flex; align-items: center; gap: 6px; }
