@@ -1,12 +1,13 @@
-// Find a user to grant a role to or to make an approver (ADR-0069 §3).
+// Find a user to grant a role to or to make an approver.
 //
 // Grants and approver entries must name a user who exists — a typed string
 // nobody holds would be claimed by whoever produced it first at sign-in — so
-// the honest input is a search over the users Scarab knows, not a free-text
+// the input is a search over the users Scarab knows, not a free-text
 // box. It shows who someone IS (name, linked accounts, whether they have
 // signed in yet) and hands back the id a grant stores.
 import { For, Show, createSignal, onCleanup } from "solid-js";
 import { searchPrincipals, type PrincipalMatch } from "../api/client";
+import { Input } from "./Field";
 
 export default function PrincipalSearch(props: {
   org: string;
@@ -47,11 +48,11 @@ export default function PrincipalSearch(props: {
 
   return (
     <div class="ps">
-      <input
-        class="input"
-        placeholder={props.placeholder ?? "find a user — name, login or email"}
+      <Input
         value={q()}
-        onInput={(e) => onInput(e.currentTarget.value)}
+        onValue={onInput}
+        placeholder={props.placeholder ?? "find a user — name, login or email"}
+        aria-label="Find a user"
       />
       <Show when={error()}>
         <p class="error">{error()}</p>
