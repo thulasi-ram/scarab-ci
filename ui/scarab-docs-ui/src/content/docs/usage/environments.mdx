@@ -76,7 +76,9 @@ stricter than the org baseline, never looser.
 
 Two governed settings are granted **to one Project within one Environment**, and fail closed: the
 privilege whitelist (which image digests may use the `add-capabilities` or `privileged` grants) and
-permission for a raw `k8s_overlay`.
+permission for a raw `k8s_overlay`. Raw overlay permission gives that Project's pipeline authors
+control of the step Pod spec, including privileged containers, host mounts and the Pod's
+ServiceAccount, so grant it only where you would grant those.
 
 A Run that names an Environment is also never cancelled by newest-wins: a newer push to the same
 branch does not cancel it, and its concurrency group queues even if the pipeline declares

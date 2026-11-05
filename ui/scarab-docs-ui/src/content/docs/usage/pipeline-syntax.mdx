@@ -840,6 +840,10 @@ if the run's target environment permits raw overlays; otherwise the run is rejec
 profile for anything static. Even where raw overlays are permitted, an overlay cannot set or delete the Pod's
 `metadata.name`, `generateName`, `namespace`, `ownerReferences` or `finalizers`, or labels and annotations
 under `app.kubernetes.io/`, `scarab.io/` or `scarab.dev/`: Scarab uses them to find, route to and clean up the Pod.
+The rest of the Pod spec is not checked. An overlay can ask for privileged containers, host mounts, the
+host network, or a ServiceAccount token. Step Pods run in Scarab's own namespace by default, so that can
+be Scarab's ServiceAccount. Permit raw overlays only on an Environment whose pipeline authors you trust
+with that.
 
 ```yaml
 - id: heavy
