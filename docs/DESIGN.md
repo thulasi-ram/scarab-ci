@@ -168,14 +168,14 @@ Major Mono Display; section headings stay Space Grotesk.
 | Role | Family | Size | Weight | Tracking |
 |------|--------|------|--------|----------|
 | Display / Hero (`h1`) | Major Mono Display | 32px | 400 | 0 |
-| Run title / breadcrumb | Major Mono Display | 22–24px | 400 | 0 |
+| Run breadcrumb (`.crumb-head`) / title | Major Mono Display | 28px / 20px | 400 | 0 |
 | Section heading (`h2`) | Space Grotesk | 20px | 600 | -0.4px |
 | Card / repo name | Space Grotesk | 15px | 600 | -0.3px |
 | Wordmark (`.brand`) | Major Mono Display | 19px | 400 | 0 |
-| Body / button | Inter | 14–16px | 400–600 | -0.16px |
-| Eyebrow / label / column head | **Mono** | 10–11px | 500 | +0.8–1.2px, UPPERCASE |
-| Filter pill / chip | Mono | 11.5px | 400 | 0 |
-| Code / id / SHA / log | Mono | 12–13px | 400 | 0 |
+| Body / button | Inter | 13px (`--fs-md`) | 400–600 | -0.16px |
+| Eyebrow / label / column head | **Mono** | 11px (`--fs-xs`) | 500 | +0.8–1.2px, UPPERCASE |
+| Filter pill / chip | Mono | 12px (`--fs-sm`) | 400 | 0 |
+| Code / id / SHA / log | Mono | 12px (`--fs-sm`) | 400 | 0 |
 
 ### Type scale
 
@@ -190,9 +190,11 @@ Inside the app, a font size is one of five steps, kept as custom properties in
 | `--fs-lg` | 15px | section headings |
 | `--fs-xl` | 20px | page titles |
 
-A new or rewritten component uses only these tokens: no literal font size and
-no half-pixel size. Older components still carry one-off sizes and move to the
-scale separately; do not add new ones.
+Every component uses only these tokens: no literal font size and no
+half-pixel size. The exceptions are the display heading row (`h1` 32px,
+`.crumb-head` 28px, `.login-title` 22px) and the wordmark (`.brand` 19px),
+which belong to the brand voice above, and the ASCII scenes, which size from
+their own `--ascii-fs`.
 
 ### Principles
 - **Punchy display, comfortable body.** Headlines are Space Grotesk 700 with
