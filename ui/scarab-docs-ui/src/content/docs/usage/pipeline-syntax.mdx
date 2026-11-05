@@ -273,6 +273,11 @@ the image digest.
     run_as_root: true
 ```
 
+Without `run_as_root`, a step runs with `runAsNonRoot` and no user id of its own, so the image's
+`USER` must be a non-zero number (`USER 65532`). The kubelet cannot check that a user name is not
+root, so an image whose `USER` is a name, such as `curlimages/curl`, fails to start with
+`CreateContainerConfigError`.
+
 Some steps are **kinds** with no image that the engine runs on your behalf (you set no `image`/`command`):
 
 - **`build: { image: ..., push: true }`**: a rootless BuildKit image build.
@@ -737,7 +742,7 @@ A pipeline waits on one with `invoke: plugin:<installation>/<gate>`:
   gate_expires_after: 1800
 
 - id: smoke
-  image: curlimages/curl
+  image: cgr.dev/chainguard/busybox:latest@sha256:9cf938251dfb3cc081ef9847e79c203b5de90ecc20855e40bef8a7cc191bb218
   needs: [live]
   env: [[REVISION, "${{ outputs.live.revision }}"]]
 ```
