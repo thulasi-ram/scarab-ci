@@ -558,10 +558,7 @@ async fn a_launch_outliving_the_teardown_ceiling_is_still_torn_down(w: World) {
     );
     w.finish().await;
 }
-both!(
-    a_launch_outliving_the_teardown_ceiling_is_still_torn_down,
-    ignore = "redteam: BROKE F3 — late launch after an abandoned CANCEL_ATTEMPT is 'owed' to a dead intent"
-);
+both!(a_launch_outliving_the_teardown_ceiling_is_still_torn_down);
 
 // ---------------------------------------------------------------------------
 // F5 — the R2-E1 class for SHARED SERVICES. The services-only CANCEL_RUN

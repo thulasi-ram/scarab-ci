@@ -3362,35 +3362,38 @@ impl<'a> Scheduler<'a> {
     /// wanted while it launched ([`process_launch_intent`](Self::process_launch_intent)),
     /// when nothing else owes it one.
     ///
-    /// An attempt stamped `Cancelled` or `Superseded` is already owed: the
-    /// commit that stamped it carried an attempt-scoped intent naming it,
-    /// and that intent cannot have been retired while this launch was in
-    /// flight ([`drain_attempt_teardowns`](Self::drain_attempt_teardowns)
-    /// waits out a pending `launch:` intent, which is dispatched only after
-    /// this). Any other way an attempt stops being wanted before its unit
-    /// exists (its step finalized without it, its Run settled) wrote no
-    /// teardown, so this writes one: a [`CANCEL_ATTEMPT`] naming only that
-    /// attempt — never a Run-wide teardown, which would kill the Run's live
-    /// units. Keyed per attempt (`…:launch`): an attempt is launched for real
-    /// at most once.
+    /// An attempt stamped `Cancelled` whose [`CANCEL_ATTEMPT`] is still
+    /// pending is already owed: [`drain_attempt_teardowns`](Self::drain_attempt_teardowns)
+    /// waits out a pending `launch:` intent, so that teardown will see this
+    /// unit. The stamp alone is not enough: the teardown waits only up to
+    /// its poison ceiling and is then dead-lettered, and a launch that
+    /// returns after that must still be torn down (git-bug b9e8e9f). A
+    /// `Superseded` attempt's intent is keyed by the rerun that superseded
+    /// it, which is not known here, so it is not looked up: one more
+    /// idempotent cancel of a unit that may already be gone is the cost.
+    /// Any other way an attempt stops being wanted before its unit exists
+    /// (its step finalized without it, its Run settled) wrote no teardown.
+    /// In every case but the first this writes one: a [`CANCEL_ATTEMPT`]
+    /// naming only that attempt — never a Run-wide teardown, which would
+    /// kill the Run's live units. Keyed per attempt (`…:launch`): an attempt
+    /// is launched for real at most once.
     async fn enqueue_late_launch_teardown(
         &self,
         run: &RunId,
         step: &StepId,
         attempt: &AttemptId,
     ) -> Result<(), SchedulerError> {
-        let owed = self.db.attempts_of_step(run, step).await?.iter().any(|a| {
-            &a.id == attempt
-                && matches!(
-                    a.outcome,
-                    AttemptOutcome::Cancelled | AttemptOutcome::Superseded
-                )
-        });
-        if owed {
-            return Ok(());
-        }
+        let cancelled = self
+            .db
+            .attempts_of_step(run, step)
+            .await?
+            .iter()
+            .any(|a| &a.id == attempt && a.outcome == AttemptOutcome::Cancelled);
         let now = self.clock.now().await;
         let mut msg = cancel_attempt_intent(run, step, attempt, now);
+        if cancelled && self.db.outbox_key_pending(&msg.idempotency_key).await? {
+            return Ok(());
+        }
         msg.idempotency_key.push_str(":launch");
         self.db.enqueue_outbox(&msg).await?;
         Ok(())
