@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":5,"timestamp":1788171348,"nonce":"+MMMUkMDEIvAO/1siMmY1+CSUzQ=","added":["type:chore","area:infra"],"removed":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1793994964,"nonce":"PED5Jr8Xh9KrKbI1ghfvIg7mTnY=","message":"Owner decision 2026-11-07: pin rustfmt in rust-toolchain.toml and make main fmt-clean in one commit (the one sanctioned repo-wide cargo fmt).","files":null}]}
