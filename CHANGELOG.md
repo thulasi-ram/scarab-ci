@@ -393,6 +393,9 @@ record. Read Breaking changes before you upgrade.
   only) and `If-Match: <etag>` (replace only the Environment that was read), answers 412 when
   either does not hold, and returns the Environment's `ETag`, as does its GET. Without either
   header it creates or replaces as before.
+- A Step whose image sets `USER` to a name failed with only `CreateContainerConfigError`.
+  The failure now says to use a numeric user: Steps run as non-root, and the kubelet can
+  check only a numeric one. Scarab does not override the image's user.
 
 ### Tests
 

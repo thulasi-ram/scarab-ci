@@ -276,7 +276,9 @@ the image digest.
 Without `run_as_root`, a step runs with `runAsNonRoot` and no user id of its own, so the image's
 `USER` must be a non-zero number (`USER 65532`). The kubelet cannot check that a user name is not
 root, so an image whose `USER` is a name, such as `curlimages/curl`, fails to start with
-`CreateContainerConfigError`.
+`CreateContainerConfigError`. The step fails as a configuration error whose message says to use a
+numeric user. Scarab does not override the image's user: rebuild the image with a numeric `USER`,
+use an image that has one, or ask for `run_as_root`.
 
 Some steps are **kinds** with no image that the engine runs on your behalf (you set no `image`/`command`):
 
