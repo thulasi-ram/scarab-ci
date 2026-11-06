@@ -657,11 +657,19 @@ pub struct StepSpec {
     pub image: String,
     pub command: Vec<String>,
     pub env: Vec<(String, String)>,
-    /// Secret keys the step wants injected at launch (ADR-0037). Resolved (with
-    /// inheritance) and merged into `env` by the launch path just before the Pod
-    /// starts — never persisted with a value. Empty for most steps.
+    /// The secrets the step declared (ADR-0014, 0037): each one a file under
+    /// `/scarab/secrets/`, and an environment variable too when its entry has
+    /// `env: true`. Resolved (with inheritance) by the launch path just before
+    /// the Pod starts into [`resolved_secrets`](Self::resolved_secrets) —
+    /// never persisted with a value. Empty for most steps.
     #[serde(default)]
-    pub secrets: Vec<String>,
+    pub secrets: Vec<scarab_pipeline::SecretRef>,
+    /// The values of [`secrets`](Self::secrets), resolved at LAUNCH —
+    /// **never serialized** (in-memory enrichment only, like
+    /// [`oidc_token`](Self::oidc_token)). The executor writes each one as a
+    /// file and never puts a value in a Pod spec or argv.
+    #[serde(skip)]
+    pub resolved_secrets: ResolvedSecrets,
     /// The privilege escalations **admitted** for this step (ADR-0039) — already
     /// authorized against the run's Environment whitelist and fork-lockout at run
     /// creation. The executor applies *exactly* these above the hardened baseline
@@ -769,6 +777,30 @@ pub struct StepSpec {
     /// needs, `matrix` its [`matrix_values`](Self::matrix_values).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<scarab_pipeline::Scope>,
+}
+
+/// A step's secret values for one launch, `(name, value)` in declared order.
+/// Its `Debug` prints the names only, so a logged [`StepSpec`] never carries
+/// a value.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct ResolvedSecrets(pub Vec<(String, String)>);
+
+impl ResolvedSecrets {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &(String, String)> {
+        self.0.iter()
+    }
+}
+
+impl std::fmt::Debug for ResolvedSecrets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(self.0.iter().map(|(k, _)| format!("{k}=<redacted>")))
+            .finish()
+    }
 }
 
 /// The launch context of a step's keyed directory Cache (ADR-0065 s1).

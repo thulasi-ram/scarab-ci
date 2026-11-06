@@ -449,7 +449,7 @@ pub const RETIRED_DEPLOYMENTS: &str = "deployments are no longer recorded by Sca
 /// entry under one of these names would be overwritten or would overwrite
 /// Scarab's, so a templated value may not use one on a `forge_token` Step.
 /// `scarab-executor-k8s` checks that every `SCARAB_*` name it sets is here.
-pub const SCARAB_SET_ENV: [&str; 9] = [
+pub const SCARAB_SET_ENV: [&str; 10] = [
     "SCARAB_RUN",
     "SCARAB_STEP",
     "SCARAB_ATTEMPT",
@@ -459,6 +459,7 @@ pub const SCARAB_SET_ENV: [&str; 9] = [
     "SCARAB_ARTIFACTS",
     "SCARAB_OIDC_TOKEN_FILE",
     "SCARAB_CACHE_ROOTS",
+    "SCARAB_SECRETS",
 ];
 
 /// Prefixes of env names Scarab sets: `SCARAB_PARAM_<NAME>` per input, and
@@ -712,11 +713,13 @@ pub struct StepSpec {
     /// Environment overrides for the step.
     #[serde(default)]
     pub env: Vec<(String, String)>,
-    /// Secret keys to resolve and inject as env vars at launch (ADR-0014, 0037).
-    /// Resolved against the run's scope with `env → repo → org` inheritance; a
-    /// fork-PR run is locked out and receives none.
+    /// Secrets to resolve at launch (ADR-0014, 0037), each mounted as the
+    /// file `/scarab/secrets/<name>`; an entry with `env: true` is also an
+    /// environment variable ([`SecretRef`]). Resolved against the run's scope
+    /// with `env → repo → org` inheritance; a fork-PR run is locked out and
+    /// receives none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub secrets: Vec<String>,
+    pub secrets: Vec<SecretRef>,
     /// Privilege escalation this step *requests* above the hardened baseline
     /// (ADR-0039). Absent = the restricted default. A request carries no
     /// authority: `run-as-root` is self-service, but `add_capabilities` and
@@ -1318,6 +1321,136 @@ impl ForgeToken {
             ForgeToken::Write => "write",
         }
     }
+}
+
+/// The directory a Step's secrets are mounted in, one file per secret
+/// (ADR-0014): `/scarab/secrets/<name>`. The forge credential's two files
+/// live there too.
+pub const SECRETS_DIR: &str = "/scarab/secrets";
+
+/// The file the forge credential's token is mounted as, in [`SECRETS_DIR`].
+pub const FORGE_TOKEN_FILE: &str = "forge-token";
+/// The file the forge credential's username is mounted as, in [`SECRETS_DIR`].
+pub const FORGE_USERNAME_FILE: &str = "forge-username";
+
+/// File names in [`SECRETS_DIR`] that Scarab writes itself. A secret with
+/// one of these names would replace Scarab's file, so the Pipeline check
+/// refuses it.
+pub const RESERVED_SECRET_FILES: [&str; 2] = [FORGE_TOKEN_FILE, FORGE_USERNAME_FILE];
+
+/// One entry of a Step's `secrets:` list. Written as a bare name (`TOKEN`),
+/// the secret is a file only, `/scarab/secrets/TOKEN`. Written as
+/// `{ name: TOKEN, env: true }`, it is also the environment variable
+/// `TOKEN`, which the k8s executor fills from the Pod's Secret
+/// (`valueFrom.secretKeyRef`), never as a value in the Pod spec.
+///
+/// Serialized as the bare name when `env` is false, so an IR stored before
+/// the map form existed reads the same, and reads as file-only.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SecretRef {
+    pub name: String,
+    /// Also set the environment variable `name` to the value.
+    pub env: bool,
+}
+
+impl SecretRef {
+    /// A secret delivered as a file only.
+    pub fn file(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            env: false,
+        }
+    }
+
+    /// A secret delivered as a file and as the environment variable `name`.
+    pub fn file_and_env(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            env: true,
+        }
+    }
+}
+
+impl From<&str> for SecretRef {
+    fn from(name: &str) -> Self {
+        Self::file(name)
+    }
+}
+
+impl From<String> for SecretRef {
+    fn from(name: String) -> Self {
+        Self::file(name)
+    }
+}
+
+impl Serialize for SecretRef {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        if self.env {
+            use serde::ser::SerializeStruct;
+            let mut st = s.serialize_struct("SecretRef", 2)?;
+            st.serialize_field("name", &self.name)?;
+            st.serialize_field("env", &self.env)?;
+            st.end()
+        } else {
+            s.serialize_str(&self.name)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SecretRef {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Entry {
+            name: String,
+            #[serde(default)]
+            env: bool,
+        }
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = SecretRef;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a secret name, or `{ name: NAME, env: true }`")
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<SecretRef, E> {
+                Ok(SecretRef::file(v))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<SecretRef, A::Error> {
+                let e = Entry::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                Ok(SecretRef {
+                    name: e.name,
+                    env: e.env,
+                })
+            }
+        }
+        d.deserialize_any(Visitor)
+    }
+}
+
+/// Whether `name` can be a secret's file name in [`SECRETS_DIR`] and a key
+/// of the Kubernetes Secret that holds it: letters, digits, `-`, `_` and
+/// `.`, not starting with `.` (the kubelet keeps its own `..data` entries
+/// there), at most 253 bytes.
+pub fn is_secret_file_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 253
+        && !name.starts_with('.')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+/// Whether `name` is an environment variable name a shell can read as
+/// `$name`: letters, digits and `_`, not starting with a digit.
+pub fn is_env_var_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes
+        .next()
+        .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 /// A step's keyed directory Cache declaration (ADR-0065 s1):
@@ -4339,7 +4472,8 @@ pub fn is_clone_library(link: &OriginEntry) -> bool {
 /// legitimately need none, hence a lint and not a hard error. A checkout is a
 /// Step inlined from the clone library ([`is_clone_library`]). Repo-less
 /// triggers (`cron`, `upstream`, …) never warn. Second rule: a Step inlined
-/// from a library runs an image pinned only by tag (ADR-0076 §2).
+/// from a library runs an image pinned only by tag (ADR-0076 §2). Third: a
+/// command reads a file-only secret as `$NAME` ([`secret_env_warnings`]).
 pub fn lint(ir: &PipelineIr) -> Vec<String> {
     let mut warnings = Vec::new();
     let source_triggered = ir
@@ -4366,6 +4500,8 @@ pub fn lint(ir: &PipelineIr) -> Vec<String> {
             .filter(|(severity, _)| *severity == Severity::Warning)
             .map(|(_, finding)| finding),
     );
+    // A script that reads a secret as `$NAME` when the secret is a file only.
+    warnings.extend(secret_env_warnings(ir));
     // A library pins the images it runs by digest (ADR-0076 §2). One warning
     // per library and image, however many Steps or matrix legs use it.
     let mut seen: BTreeSet<(&str, &str)> = BTreeSet::new();
@@ -4932,6 +5068,113 @@ fn paths_overlap(a: &str, b: &str) -> bool {
         .all(|(x, y)| x == y || x.contains('*') || y.contains('*'))
 }
 
+/// A Step's `secrets:` (ADR-0014): each name is a file in [`SECRETS_DIR`],
+/// so it must be a valid file name and Secret key, must not be one Scarab
+/// writes there itself, and is listed once. An `env: true` entry must also
+/// be an environment variable name that neither Scarab nor the Step's own
+/// `env:` sets.
+fn validate_secrets(step: &StepSpec, diagnostics: &mut Vec<String>) {
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for secret in &step.secrets {
+        let name = secret.name.as_str();
+        if !seen.insert(name) {
+            diagnostics.push(format!(
+                "step `{}`: secret `{name}` is listed more than once",
+                step.id
+            ));
+            continue;
+        }
+        if !is_secret_file_name(name) {
+            diagnostics.push(format!(
+                "step `{}`: secret `{name}` cannot be a file name: a secret is mounted as \
+                 {SECRETS_DIR}/<name>, so its name uses letters, digits, `-`, `_` and `.`, \
+                 does not start with `.`, and is at most 253 characters",
+                step.id
+            ));
+            continue;
+        }
+        if RESERVED_SECRET_FILES.contains(&name) {
+            diagnostics.push(format!(
+                "step `{}`: secret `{name}` would replace {SECRETS_DIR}/{name}, which Scarab \
+                 writes for the step's forge credential; rename the secret",
+                step.id
+            ));
+            continue;
+        }
+        if !secret.env {
+            continue;
+        }
+        if !is_env_var_name(name) {
+            diagnostics.push(format!(
+                "step `{}`: secret `{name}` has `env: true`, but `{name}` is not an \
+                 environment variable name (letters, digits and `_`, not starting with a \
+                 digit); read it from {SECRETS_DIR}/{name} instead",
+                step.id
+            ));
+        } else if scarab_sets_env(name) {
+            diagnostics.push(format!(
+                "step `{}`: secret `{name}` has `env: true`, but Scarab sets `{name}` itself",
+                step.id
+            ));
+        } else if step.env.iter().any(|(k, _)| k == name) {
+            diagnostics.push(format!(
+                "step `{}`: secret `{name}` has `env: true`, and `env:` also sets `{name}`; \
+                 keep one",
+                step.id
+            ));
+        }
+    }
+}
+
+/// Whether `text` reads the shell variable `name` as `$name` or `${name…`.
+fn mentions_shell_var(text: &str, name: &str) -> bool {
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let bytes = text.as_bytes();
+    let mut from = 0;
+    while let Some(at) = text[from..].find('$') {
+        let mut i = from + at + 1;
+        if bytes.get(i) == Some(&b'{') {
+            i += 1;
+        }
+        let end = i + name.len();
+        if text.get(i..end) == Some(name) && !bytes.get(end).copied().is_some_and(is_ident) {
+            return true;
+        }
+        from = from + at + 1;
+    }
+    false
+}
+
+/// Each Step whose `command` reads `$NAME` or `${NAME}` for a secret it
+/// lists without `env: true` (ADR-0014): that secret is a file only, so the
+/// variable is empty when the Step runs. A warning, not an error: the text
+/// may be a different variable of the same name that the Step sets itself.
+pub fn secret_env_warnings(ir: &PipelineIr) -> Vec<String> {
+    let mut out = Vec::new();
+    for step in &ir.steps {
+        for secret in step.secrets.iter().filter(|s| !s.env) {
+            let name = secret.name.as_str();
+            if !is_env_var_name(name) {
+                continue;
+            }
+            let Some(at) = step
+                .command
+                .iter()
+                .position(|c| mentions_shell_var(c, name))
+            else {
+                continue;
+            };
+            out.push(format!(
+                "step `{}`: `command[{at}]` reads `${name}`, but secret `{name}` is a file, not \
+                 an environment variable; read {SECRETS_DIR}/{name}, or list the secret as \
+                 `{{ name: {name}, env: true }}`",
+                step.id
+            ));
+        }
+    }
+    out
+}
+
 /// A Step's declared `results:` (ADR-0070 §7, kept by ADR-0074 §3), checked
 /// at pipeline check:
 ///
@@ -5199,6 +5442,7 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                 ));
             }
         }
+        validate_secrets(step, &mut diagnostics);
         // Placement (ADR-0055): profile names must be non-empty, and a raw
         // `k8s_overlay`, if present, must be a JSON object (a pod-spec fragment) —
         // never a scalar/array — so it can strategic-merge onto the Pod.
@@ -5892,6 +6136,97 @@ mod tests {
             Err(PipelineError::Parse(msg)) => msg,
             other => panic!("expected a parse error, got {other:?}"),
         }
+    }
+
+    /// git-bug bcf2c11: `secrets:` mixes bare names (a file only) with
+    /// `{ name, env: true }` entries (a file and an env var). A bare-name list
+    /// serializes as it did before the map form existed.
+    #[test]
+    fn secrets_accept_names_and_env_entries_mixed() {
+        let ir = compile(
+            "steps:\n  - id: s\n    image: busybox\n    secrets: [DB_PASSWORD, { name: ARGOCD_AUTH_TOKEN, env: true }, { name: plain-file }]\n",
+        );
+        assert_eq!(
+            ir.steps[0].secrets,
+            vec![
+                SecretRef::file("DB_PASSWORD"),
+                SecretRef::file_and_env("ARGOCD_AUTH_TOKEN"),
+                SecretRef::file("plain-file"),
+            ]
+        );
+        assert_eq!(
+            serde_json::to_value(&ir.steps[0].secrets).unwrap(),
+            json!(["DB_PASSWORD", { "name": "ARGOCD_AUTH_TOKEN", "env": true }, "plain-file"])
+        );
+        // A stored IR written with bare names reads back as file-only.
+        let old: Vec<SecretRef> = serde_json::from_value(json!(["A", "b-c"])).unwrap();
+        assert_eq!(old, vec![SecretRef::file("A"), SecretRef::file("b-c")]);
+    }
+
+    #[test]
+    fn bad_secret_entries_are_refused() {
+        for (entry, expect) in [
+            ("forge-token", "would replace /scarab/secrets/forge-token"),
+            (
+                "forge-username",
+                "would replace /scarab/secrets/forge-username",
+            ),
+            ("\"../etc\"", "cannot be a file name"),
+            ("\"a/b\"", "cannot be a file name"),
+            ("\".hidden\"", "cannot be a file name"),
+            ("\"\"", "cannot be a file name"),
+            (
+                "{ name: db-pass, env: true }",
+                "is not an environment variable name",
+            ),
+            (
+                "{ name: SCARAB_RUN, env: true }",
+                "Scarab sets `SCARAB_RUN` itself",
+            ),
+            ("{ name: MODE, env: true }", "`env:` also sets `MODE`"),
+        ] {
+            let e = errors(&format!(
+                "steps:\n  - {{ id: s, image: busybox, env: [[MODE, x]], secrets: [{entry}] }}\n"
+            ));
+            assert!(e.iter().any(|d| d.contains(expect)), "{entry}: {e:?}");
+        }
+        let e =
+            errors("steps:\n  - { id: s, image: busybox, secrets: [A, { name: A, env: true }] }\n");
+        assert!(
+            e.iter().any(|d| d.contains("`A` is listed more than once")),
+            "{e:?}"
+        );
+        for entry in [
+            "{ name: A, env: yes-please }",
+            "{ name: A, file: true }",
+            "{ env: true }",
+            "[A]",
+        ] {
+            parse_error(&format!(
+                "steps:\n  - {{ id: s, image: busybox, secrets: [{entry}] }}\n"
+            ));
+        }
+    }
+
+    /// `scarab validate` / lint: a command that reads `$NAME` for a secret
+    /// that is a file only gets a warning; `env: true` and a name the
+    /// command does not read get none.
+    #[test]
+    fn a_command_reading_a_file_only_secret_as_env_warns() {
+        let ir = compile(
+            "steps:\n  - id: s\n    image: busybox\n    secrets: [TOKEN, { name: ARGO, env: true }, OTHER]\n    command: [sh, -c, 'curl -H \"x: ${TOKEN}\" && argocd --auth $ARGO && echo $OTHERS']\n",
+        );
+        let w = secret_env_warnings(&ir);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(
+            w[0].contains("reads `$TOKEN`") && w[0].contains("{ name: TOKEN, env: true }"),
+            "{w:?}"
+        );
+        assert!(lint(&ir).iter().any(|l| l.contains("reads `$TOKEN`")));
+        assert!(mentions_shell_var("a $TOKEN", "TOKEN"));
+        assert!(mentions_shell_var("${TOKEN:-x}", "TOKEN"));
+        assert!(!mentions_shell_var("$TOKENS ${TOKEN_2}", "TOKEN"));
+        assert!(!mentions_shell_var("cat /scarab/secrets/TOKEN", "TOKEN"));
     }
 
     /// Zero, misplaced, and duplicated values are refused at authoring time,

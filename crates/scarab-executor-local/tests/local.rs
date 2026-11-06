@@ -31,6 +31,7 @@ fn spec(cmd: &[&str]) -> StepSpec {
         resources: Default::default(),
         k8s_overlay: None,
         oidc_token: None,
+        resolved_secrets: Default::default(),
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
@@ -453,4 +454,39 @@ async fn no_gate_refusal_and_no_forge_credential_to_take() {
     assert_eq!(exec.gate_refusal(&step("r1", "gate")).await.unwrap(), None);
     let handle = scarab_engine::ports::ExecHandle("local://r1/ok/0".into());
     assert!(exec.take_forge_credential(&handle).await.unwrap().is_none());
+}
+
+/// ADR-0014 (git-bug bcf2c11): each secret is a file in `$SCARAB_SECRETS`,
+/// the host stand-in for `/scarab/secrets`; only an `env: true` secret is
+/// also an env var. The files are gone once the step has ended.
+#[tokio::test]
+async fn secrets_are_files_and_env_only_when_asked() {
+    let exec = LocalExecutor::new();
+    let s = step("r-secrets", "deploy");
+    let mut sp = spec(&[
+        "sh",
+        "-c",
+        "printf '%s|%s|%s|%s' \"$(cat \"$SCARAB_SECRETS/DB_PASSWORD\")\" \"${DB_PASSWORD-unset}\" \
+         \"$(cat \"$SCARAB_SECRETS/API_TOKEN\")\" \"$API_TOKEN\" > \"$SCARAB_RESULTS/seen.json.txt\"; \
+         printf '\"%s\"' \"$SCARAB_SECRETS\" > \"$SCARAB_RESULTS/dir.json\"",
+    ]);
+    sp.secrets = vec![
+        "DB_PASSWORD".into(),
+        scarab_pipeline::SecretRef::file_and_env("API_TOKEN"),
+    ];
+    sp.resolved_secrets = scarab_engine::ResolvedSecrets(vec![
+        ("DB_PASSWORD".into(), "pw".into()),
+        ("API_TOKEN".into(), "tok".into()),
+    ]);
+    let handle = exec.launch(&s, &sp).await.unwrap();
+    assert_eq!(drive(&exec, &handle).await, ExecState::Succeeded);
+    let results = exec.results(&handle).await.unwrap();
+    let dir = std::path::PathBuf::from(results["dir"].as_str().unwrap());
+    let seen =
+        std::fs::read_to_string(dir.parent().unwrap().join("results/seen.json.txt")).unwrap();
+    assert_eq!(seen, "pw|unset|tok|tok");
+    assert!(
+        !dir.exists(),
+        "the secret files are removed once the step ended"
+    );
 }

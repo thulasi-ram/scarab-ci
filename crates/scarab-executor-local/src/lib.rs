@@ -94,6 +94,50 @@ impl LocalExecutor {
     fn results_dir(workdir: &std::path::Path) -> std::path::PathBuf {
         workdir.join("scarab").join("results")
     }
+
+    /// The secrets directory inside a step's workdir (ADR-0014): one file
+    /// per secret, removed when the step's process is seen to end.
+    fn secrets_dir(workdir: &std::path::Path) -> std::path::PathBuf {
+        workdir.join("scarab").join("secrets")
+    }
+
+    /// Remove a finished step's secret files. Best-effort: a dir that was
+    /// never written is fine.
+    fn remove_secrets(handle: &ExecHandle) {
+        if let Some(workdir) = Self::workdir_for(handle) {
+            let _ = std::fs::remove_dir_all(Self::secrets_dir(&workdir));
+        }
+    }
+}
+
+/// Write each resolved secret of `spec` as `<dir>/<name>`: the directory
+/// `0700` and each file `0600`, so only the step's own user reads them.
+fn write_secret_files(dir: &std::path::Path, spec: &StepSpec) -> std::io::Result<()> {
+    use std::io::Write;
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    for (name, value) in spec.resolved_secrets.iter() {
+        // The Pipeline check allows only plain file names; refuse anything
+        // else here too rather than write outside the directory.
+        if name.is_empty() || name.starts_with('.') || name.contains(['/', '\\']) {
+            return Err(std::io::Error::other(format!(
+                "secret `{name}` is not a plain file name"
+            )));
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options.open(dir.join(name))?.write_all(value.as_bytes())?;
+    }
+    Ok(())
 }
 
 impl Default for LocalExecutor {
@@ -240,6 +284,16 @@ impl Executor for LocalExecutor {
         std::fs::create_dir_all(&results_dir)
             .map_err(|e| ExecError::Launch(format!("results dir: {e}")))?;
 
+        // Secrets (ADR-0014): one file per secret in a per-attempt directory,
+        // the host-process stand-in for the k8s `/scarab/secrets` tmpfs
+        // mount, named by `$SCARAB_SECRETS`. An `env: true` secret is also
+        // an env var. A host process cannot mount at `/scarab/secrets`.
+        let secrets_dir = Self::secrets_dir(&workdir);
+        if !spec.resolved_secrets.is_empty() {
+            write_secret_files(&secrets_dir, spec)
+                .map_err(|e| ExecError::Launch(format!("secrets dir: {e}")))?;
+        }
+
         let mut cmd = Command::new(program);
         cmd.args(args)
             .current_dir(&workdir)
@@ -247,6 +301,14 @@ impl Executor for LocalExecutor {
             .env_clear()
             .envs(std::env::vars()) // inherit PATH etc. for a usable dev shell
             .envs(spec.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+        if !spec.resolved_secrets.is_empty() {
+            cmd.env("SCARAB_SECRETS", &secrets_dir);
+            for (key, value) in spec.resolved_secrets.iter() {
+                if spec.secrets.iter().any(|s| s.env && &s.name == key) {
+                    cmd.env(key, value);
+                }
+            }
+        }
         // Fence env vars (cooperating idempotency, ADR-0021), mirroring k8s.
         cmd.env("SCARAB_RUN", &step.run.0)
             .env("SCARAB_STEP", &step.step.0)
@@ -290,6 +352,7 @@ impl Executor for LocalExecutor {
                     Ok(Some(status)) => {
                         let state = state_of(status);
                         *slot = Proc::Done(state.clone());
+                        Self::remove_secrets(handle);
                         Ok(state)
                     }
                     // Kill-timer (ADR-0047): past the deadline, kill the child
@@ -303,6 +366,7 @@ impl Executor for LocalExecutor {
                             cause: None,
                         };
                         *slot = Proc::Done(state.clone());
+                        Self::remove_secrets(handle);
                         Ok(state)
                     }
                     Ok(None) => Ok(ExecState::Running),
@@ -318,6 +382,7 @@ impl Executor for LocalExecutor {
             // Best-effort kill; `kill_on_drop` also reaps if the slot is dropped.
             // A cancel is the platform ending a started process (ADR-0047).
             let _ = child.start_kill();
+            Self::remove_secrets(handle);
             procs.insert(
                 handle.0.clone(),
                 Proc::Done(ExecState::Failed {

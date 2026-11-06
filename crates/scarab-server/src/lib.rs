@@ -1856,7 +1856,9 @@ async fn create_run(
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
-            secrets: step.secrets.clone(),
+            // File-only: an inline run has no deploy context, so no secret
+            // resolves for it anyway.
+            secrets: step.secrets.iter().map(|k| k.as_str().into()).collect(),
             run_as_root: admitted.run_as_root,
             add_capabilities: admitted.add_capabilities,
             privileged: admitted.privileged,
@@ -1874,6 +1876,7 @@ async fn create_run(
             resources: step.resources.clone(),
             k8s_overlay,
             oidc_token: None,
+            resolved_secrets: Default::default(),
             services: step.services.clone(),
             uses: step.uses.clone(),
             // The inline `POST /v1/runs` escape hatch takes steps directly (no
@@ -6819,6 +6822,7 @@ async fn write_run_from_ir(
                     TriggerError::Pipeline(format!("step `{}`: {}", step.id, v.join("; ")))
                 })?,
                 oidc_token: None,
+                resolved_secrets: Default::default(),
                 // Sidecar services (ADR-0058) co-locate in this executed step's Pod.
                 services: step.services.clone(),
                 // Shared-service opt-in (ADR-0058): the executor labels this Pod

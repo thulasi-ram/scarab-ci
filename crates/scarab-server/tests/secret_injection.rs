@@ -1,7 +1,8 @@
 //! `SecretInjectingExecutor` acceptance (ADR-0037): at launch, a step's declared
 //! secrets are resolved against the run's deploy-context scope (with `env → repo
-//! → org` inheritance) and merged into the pod env — unless the run is locked out
-//! (fork PR) or has no deploy context. Uses in-memory fakes; no Postgres, so this
+//! → org` inheritance) and handed to the executor as `resolved_secrets`, never
+//! merged into the step's env (ADR-0014: the executor mounts them as files) —
+//! unless the run is locked out (fork PR) or has no deploy context. Uses in-memory fakes; no Postgres, so this
 //! always runs. Redaction of the injected values is covered by
 //! `secrets_redaction.rs` (the decorator calls the same `resolve_step_secrets`).
 
@@ -14,10 +15,12 @@ use scarab_secrets::{SecretProvider, SecretScope};
 use scarab_server::{LogService, SecretInjectingExecutor};
 use scarab_testkit::{FakeSecrets, InMemoryDb, InMemoryObjectStore};
 
-/// An inner executor that records the env of the last spec it was launched with.
+/// An inner executor that records the env and the resolved secrets of the
+/// last spec it was launched with.
 #[derive(Default)]
 struct CapturingExec {
     last_env: Mutex<Option<Vec<(String, String)>>>,
+    last_secrets: Mutex<Option<Vec<(String, String)>>>,
 }
 #[async_trait]
 impl Executor for CapturingExec {
@@ -61,6 +64,7 @@ impl Executor for CapturingExec {
 
     async fn launch(&self, _step: &StepRun, spec: &StepSpec) -> Result<ExecHandle, ExecError> {
         *self.last_env.lock().unwrap() = Some(spec.env.clone());
+        *self.last_secrets.lock().unwrap() = Some(spec.resolved_secrets.0.clone());
         Ok(ExecHandle("h".into()))
     }
     async fn poll(&self, _h: &ExecHandle) -> Result<ExecState, ExecError> {
@@ -113,6 +117,7 @@ fn spec_with_secret() -> StepSpec {
         resources: Default::default(),
         k8s_overlay: None,
         oidc_token: None,
+        resolved_secrets: Default::default(),
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
@@ -124,6 +129,13 @@ fn logs(db: Arc<dyn Db>) -> Arc<LogService> {
 }
 async fn launched_env(exec: &CapturingExec) -> Vec<(String, String)> {
     exec.last_env
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("inner executor was launched")
+}
+async fn launched_secrets(exec: &CapturingExec) -> Vec<(String, String)> {
+    exec.last_secrets
         .lock()
         .unwrap()
         .clone()
@@ -166,13 +178,15 @@ async fn injects_env_scoped_secret_with_repo_inheritance() {
     exec.launch(&step("r1"), &spec_with_secret()).await.unwrap();
 
     let env = launched_env(&inner).await;
-    assert!(
-        env.contains(&("PLAIN".into(), "1".into())),
-        "plain env preserved"
+    assert_eq!(
+        env,
+        vec![("PLAIN".to_string(), "1".to_string())],
+        "plain env preserved, and no secret value in it (git-bug bcf2c11)"
     );
-    assert!(
-        env.contains(&("TOKEN".into(), "s3cr3t".into())),
-        "inherited repo secret injected: {env:?}"
+    assert_eq!(
+        launched_secrets(&inner).await,
+        vec![("TOKEN".to_string(), "s3cr3t".to_string())],
+        "inherited repo secret resolved for the executor to mount"
     );
 }
 
@@ -215,6 +229,7 @@ async fn fork_pr_lockout_injects_no_secrets() {
         !env.iter().any(|(k, _)| k == "TOKEN"),
         "locked-out run gets no secrets: {env:?}"
     );
+    assert!(launched_secrets(&inner).await.is_empty());
 }
 
 #[tokio::test]
@@ -244,6 +259,7 @@ async fn non_deploy_run_injects_no_secrets() {
         !env.iter().any(|(k, _)| k == "TOKEN"),
         "no scope → no secret: {env:?}"
     );
+    assert!(launched_secrets(&inner).await.is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -341,6 +357,7 @@ fn plain_spec() -> StepSpec {
         resources: Default::default(),
         k8s_overlay: None,
         oidc_token: None,
+        resolved_secrets: Default::default(),
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),

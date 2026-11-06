@@ -1,8 +1,8 @@
 //! A launch parameter holding `$(NAME)` must reach the Pod as text.
 //!
 //! Kubernetes expands `$(VAR)` in a container's `command`, `args` and
-//! `env[].value` from that container's environment, and Step secrets are plain
-//! env vars. So a dispatch parameter `https://example.invalid/?t=$(DEPLOY_TOKEN)`
+//! `env[].value` from that container's environment, and a Step secret with
+//! `env: true` is an env var there. So a dispatch parameter `https://example.invalid/?t=$(DEPLOY_TOKEN)`
 //! rendered into an env value would become the secret before the Step ever
 //! ran, with no shell involved. A free-text parameter never reaches `command`
 //! (ADR-0076: it is refused there), so it rides in through `env:`; the same
@@ -85,6 +85,7 @@ fn curl_spec() -> StepSpec {
         resources: Default::default(),
         k8s_overlay: None,
         oidc_token: None,
+        resolved_secrets: Default::default(),
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
