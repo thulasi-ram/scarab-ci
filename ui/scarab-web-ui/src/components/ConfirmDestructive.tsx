@@ -91,3 +91,67 @@ export default function ConfirmDestructive(props: {
     </Modal>
   );
 }
+
+/** The confirmation for an action that can be undone (kill a plugin that
+ *  Enable brings back, stop mounting a claim whose data stays): a question
+ *  and a button, no name to type. Errors show as in ConfirmDestructive. */
+export function ConfirmAction(props: {
+  title: JSX.Element;
+  purpose?: JSX.Element;
+  eyebrow?: JSX.Element;
+  children?: JSX.Element;
+  confirmLabel: string;
+  /** A danger-toned button, for an action that stops something running. */
+  danger?: boolean;
+  onConfirm: () => Promise<void> | void;
+  onClose: () => void;
+}) {
+  const [busy, setBusy] = createSignal(false);
+  const [error, setError] = createSignal<string | null>(null);
+
+  const go = async () => {
+    if (busy()) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await props.onConfirm();
+      props.onClose();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "The server refused it.");
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal
+      size="narrow"
+      title={props.title}
+      purpose={props.purpose}
+      eyebrow={props.eyebrow}
+      busy={busy()}
+      onClose={props.onClose}
+      footer={
+        <>
+          <Show when={error()}>
+            <ModalMessage>{error()}</ModalMessage>
+          </Show>
+          <button class="btn btn-ghost" type="button" onClick={props.onClose} disabled={busy()}>
+            Cancel
+          </button>
+          <button
+            class={`btn ${props.danger ? "btn-danger" : "btn-primary"}`}
+            type="button"
+            disabled={busy()}
+            onClick={go}
+          >
+            {props.confirmLabel}
+          </button>
+        </>
+      }
+    >
+      <Show when={props.children}>
+        <div class="dlg-text">{props.children}</div>
+      </Show>
+    </Modal>
+  );
+}

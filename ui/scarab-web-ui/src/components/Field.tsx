@@ -105,6 +105,8 @@ export function Input(props: InputProps) {
       class={`f-ctl${a.invalid() ? " is-err" : ""}${own.disabled ? " is-dis" : ""}${own.readOnly ? " is-ro" : ""}${own.class ? ` ${own.class}` : ""}`}
     >
       <input
+        spellcheck={false}
+        autocomplete="off"
         {...rest}
         id={a.id()}
         class={`f-inp${own.mono ? " mono" : ""}`}
@@ -113,8 +115,6 @@ export function Input(props: InputProps) {
         readOnly={own.readOnly}
         aria-describedby={a.describedBy()}
         aria-invalid={a.invalid() || undefined}
-        spellcheck={false}
-        autocomplete="off"
         onInput={(e) => own.onValue(e.currentTarget.value)}
       />
       <Show when={own.suffix}>
@@ -163,6 +163,7 @@ export function Textarea(props: {
   rows?: number;
   placeholder?: string;
   disabled?: boolean;
+  autofocus?: boolean;
   id?: string;
   invalid?: boolean;
 }) {
@@ -176,6 +177,7 @@ export function Textarea(props: {
         value={props.value}
         placeholder={props.placeholder}
         disabled={props.disabled}
+        autofocus={props.autofocus}
         spellcheck={false}
         aria-describedby={a.describedBy()}
         aria-invalid={a.invalid() || undefined}
@@ -192,9 +194,11 @@ export function Checkbox(props: {
   label: JSX.Element;
   help?: JSX.Element;
   disabled?: boolean;
+  /** `warn` for a box that opts into overwriting something. */
+  tone?: "warn";
 }) {
   return (
-    <label class={`f-chk${props.disabled ? " is-dis" : ""}`}>
+    <label class={`f-chk${props.tone ? ` is-${props.tone}` : ""}${props.disabled ? " is-dis" : ""}`}>
       <input
         type="checkbox"
         checked={props.checked}
