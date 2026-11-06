@@ -12835,6 +12835,8 @@ impl utoipa::Modify for StepUpResponses {
         org_environments::ProjectEnvironmentDto,
         org_environments::EnvironmentProtectionRulesDto,
         org_environments::EffectiveProtectionDto,
+        org_environments::ApprovalGateRulesDto,
+        org_environments::MissingGateModeDto,
         org_environments::EnvironmentProjectPrivilegeGrantDto,
         org_environments::ImageGrantDto,
         org_environments::PutEnvironmentProtectionRequest,
