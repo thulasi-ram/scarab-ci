@@ -1,6 +1,6 @@
 ---
 title: Environments
-description: An Environment such as prod governs the Runs that name it, with approvers, allowed refs, a required reason, scoped secrets and privilege grants that an org admin owns and the engine enforces where they are used.
+description: An Environment such as prod governs the Runs that name it, with approvers and an approval gate, allowed refs, a required reason, scoped secrets and privilege grants that an org admin owns and the engine enforces where they are used.
 ---
 
 import Doodle from '../../../components/Doodle.astro';
@@ -61,17 +61,24 @@ use another name, create a new Environment and delete the old one.
 An Environment's baseline protection rules are:
 
 - **`approvers`**: principals whose approval is required. Approvals are recorded on a gate, not in
-  a separate table: a `manual` gate in the Run collects distinct approver identities on the Run's
-  durable event log (`GateApproved { step, by }`), and the Run stays suspended until every named
-  approver has approved. This survives restarts, and approvals cannot be forged.
+  a separate table: the Run's **Environment approval gate** collects distinct approver identities
+  on the Run's durable event log (`GateApproved { step, by }`), and the Steps after it wait until
+  the approvals are in. This survives restarts, and approvals cannot be forged. See
+  [The approval gate](#the-approval-gate).
 - **`allowed_refs`**: glob patterns for the git refs that may run here; checked at **Run
   creation**, so a disallowed ref is rejected before any Pod launches (blank = any ref).
 - **`require_reason`**: a human dispatch (`manual`/`api`) into this Environment must carry a
   reason; push, pull request, tag, release and cron are exempt.
-- **`wait_timer_s`**: a wait in seconds. It is stored and merged but **not enforced yet**.
+- **`wait_timer_s`**: a minimum wait in seconds on the Environment approval gate, counted from
+  when the gate's `needs` finished. The gate releases when the approvals are in and the timer has
+  run out; an approval given early counts. The timer applies only with approvers: the API refuses a
+  non-zero timer on an Environment with none, and a timer stored before that check does nothing.
+- **Approval gate settings** (baseline only): what happens when a pipeline has no gate (add one, the
+  default, or refuse the Run), the expiry of the gate the Environment adds, how many of the
+  approvers must approve (default: every one), and the maximum approval age (default 24 hours).
 
-A Project's admins can add a **tighten-only overlay** for their Project: more approvers, a
-narrower ref pattern, `require_reason`, a longer timer. An overlay can make that Project's Runs
+A Project's admins can add a **tighten-only overlay** for their Project: more approvers (each one
+required, whatever the baseline's count), a narrower ref pattern, `require_reason`, a longer timer. An overlay can make that Project's Runs
 stricter than the org baseline, never looser.
 
 Two governed settings are granted **to one Project within one Environment**, and fail closed: the
@@ -84,6 +91,44 @@ A Run that names an Environment is also never cancelled by newest-wins: a newer 
 branch does not cancel it, and its concurrency group queues even if the pipeline declares
 `cancel-in-progress`.
 
+## The approval gate
+
+A Step **uses the Environment's authority** when it declares `secrets:`, requests a governed grant
+or a `k8s_overlay`, asks for `forge_token: write`, or is marked `deploy: true` (itself, or its
+whole pipeline). In an Environment with approvers, no such Step runs until an approver releases an
+**Environment approval gate** upstream of it.
+
+An Environment approval gate is a `gate: manual` with a Step after it, through `needs`, that uses
+the Environment's authority. Only these gates need the Environment's approvers and a step-up. Any
+other `manual` gate in the Run is a plain gate: anyone with write on the Project releases it with
+one approval. Which gates are approval gates is decided when the Run is created and stored with it;
+the Run page marks them, and `scarab validate` lists them.
+
+When a pipeline has no `manual` gate in front of a Step that uses the authority, the Environment
+**adds one**: a `manual` gate with the id `environment-approval` (with `-2`, `-3`, … appended if the
+pipeline uses that id), in front of the earliest such Steps, with their `needs` combined. Its
+origin names the Environment. It works like any other gate: approve, reject, expiry and rerun.
+With `deploy: true` on the whole pipeline the added gate comes first, before the build.
+
+```yaml
+environment: prod
+steps:
+  - { id: build, image: rust:1, command: [cargo, build] }
+  # prod adds `environment-approval` here, needing `build`
+  - { id: ship, image: deployer, deploy: true, needs: [build] }
+```
+
+To keep every wait in the YAML, set the Environment's missing-gate mode to **refuse**: a Run with
+such a Step is refused, and the refusal names the Steps and the gate to add.
+
+Every launch of a Step that uses the authority checks the approval again, reruns and retries
+included. The launch is refused (the Step fails `Config` with the reason) when no released approval
+gate is upstream of it, when the Run's ref is no longer in the allowed refs, when the approver set
+has changed since the gate's approvals were given, or when the gate released longer ago than the
+maximum approval age. An `external`, `timer` or `plugin` gate is never an approval gate, so a Step
+behind only those is refused at launch. Steps with no released approval gate upstream get the
+`env=none` OIDC subject.
+
 ## Scoped secrets
 
 An Environment has two secret scopes: one shared by every eligible Project, and one per Project
@@ -94,10 +139,11 @@ Environment, and editing pipeline YAML cannot move them. See [Secrets](/scarab-c
 ## Admission at the point of use
 
 The engine enforces admission itself; a caller can't satisfy it with a request body. Eligibility
-and `allowed_refs` are checked at Run creation, `approvers` is satisfied by the gate approvals the
-Run has collected, and `require_reason` is checked at the admission gate. Eligibility is checked
-again when each step launches and when a manual or external gate is released, so a Project
-removed from the list mid-Run stops before its next secret is used.
+and `allowed_refs` are checked at Run creation, `approvers` is satisfied by the approvals the
+Run's approval gate has collected, and `require_reason` is checked at the admission gate.
+Eligibility is checked again when each step launches and when a manual or external gate is
+released, so a Project removed from the list mid-Run stops before its next secret is used. The
+approval is checked again at each launch too (see [The approval gate](#the-approval-gate)).
 
 ## API endpoints
 
