@@ -20,11 +20,8 @@ import {
   createSignal,
   For,
   Match,
-  onCleanup,
-  onMount,
   Show,
   Switch,
-  type JSX,
 } from "solid-js";
 import { A } from "@solidjs/router";
 import {
@@ -53,11 +50,12 @@ import {
   tokenState,
   type TokenRole,
 } from "../api-tokens";
-import { confirmsName } from "../org-environments";
 import { accountHref } from "../settings-nav";
 import { relTime, absTime } from "../fmt";
 import Icon from "./Icon";
-import FormSection from "./FormSection";
+import Modal, { ModalMessage, ModalSection } from "./Modal";
+import ConfirmDestructive from "./ConfirmDestructive";
+import { Field, Input, Select } from "./Field";
 
 /** The lifetime a token gets unless someone says otherwise. A quarter: long
  * enough that rotating is not a weekly chore, short enough that an abandoned
@@ -81,8 +79,6 @@ export function MyApiTokens() {
   const [tokens] = createResource(epoch, () => listMyApiTokens());
   const [minting, setMinting] = createSignal(false);
   const [revoking, setRevoking] = createSignal<string | null>(null);
-  const [busy, setBusy] = createSignal(false);
-  const [error, setError] = createSignal<string | null>(null);
   const reload = () => setEpoch((e) => e + 1);
 
   // `null` is the deployment answering "I have no token store", which is not
@@ -91,18 +87,11 @@ export function MyApiTokens() {
   const rows = () => sortTokens(tokens() ?? [], Date.now());
   const liveCount = () => rows().filter((t) => isLive(t, Date.now())).length;
 
+  const revokingToken = () => rows().find((t) => t.id === revoking());
+  // A refusal shows in the confirm dialog.
   const revoke = async (t: ApiToken) => {
-    setBusy(true);
-    setError(null);
-    try {
-      await revokeMyApiToken(t.id);
-      setRevoking(null);
-      reload();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Could not revoke the token.");
-    } finally {
-      setBusy(false);
-    }
+    await revokeMyApiToken(t.id);
+    reload();
   };
 
   return (
@@ -116,9 +105,6 @@ export function MyApiTokens() {
       <div class="secrets-body">
         <Show when={tokens.error}>
           <p class="error">Could not load your API tokens.</p>
-        </Show>
-        <Show when={error()}>
-          <p class="error">{error()}</p>
         </Show>
 
         <Show when={!tokens.loading} fallback={<p class="empty">loading…</p>}>
@@ -135,18 +121,7 @@ export function MyApiTokens() {
             >
               <ul class="tok-list">
                 <For each={rows()}>
-                  {(t) => (
-                    <TokenRow token={t} onRevoke={() => setRevoking(t.id)}>
-                      <Show when={revoking() === t.id}>
-                        <RevokeToken
-                          token={t}
-                          busy={busy()}
-                          onConfirm={() => void revoke(t)}
-                          onCancel={() => setRevoking(null)}
-                        />
-                      </Show>
-                    </TokenRow>
-                  )}
+                  {(t) => <TokenRow token={t} onRevoke={() => setRevoking(t.id)} />}
                 </For>
               </ul>
             </Show>
@@ -172,12 +147,17 @@ export function MyApiTokens() {
       <Show when={minting()}>
         <MintTokenDialog onClose={() => setMinting(false)} onMinted={reload} />
       </Show>
+      <Show when={revokingToken()}>
+        {(t) => (
+          <RevokeToken token={t()} onConfirm={() => revoke(t())} onClose={() => setRevoking(null)} />
+        )}
+      </Show>
     </div>
   );
 }
 
 /** One of your tokens: what it is, what it may do, and whether it is alive. */
-function TokenRow(props: { token: ApiToken; onRevoke: () => void; children?: JSX.Element }) {
+function TokenRow(props: { token: ApiToken; onRevoke: () => void }) {
   const t = () => props.token;
   const now = Date.now();
   const state = () => tokenState(t(), now);
@@ -234,52 +214,27 @@ function TokenRow(props: { token: ApiToken; onRevoke: () => void; children?: JSX
           created {relTime(t().created_at)}
         </span>
       </div>
-      {props.children}
     </li>
   );
 }
 
 /** The revoke confirm: what stops working, and the token's name typed exactly. */
-function RevokeToken(props: {
-  token: ApiToken;
-  busy: boolean;
-  onConfirm: () => void;
-  onCancel: () => void;
-}) {
-  const [typed, setTyped] = createSignal("");
-  const ok = () => confirmsName(typed(), props.token.name) && !props.busy;
+function RevokeToken(props: { token: ApiToken; onConfirm: () => Promise<void>; onClose: () => void }) {
   return (
-    <div class="typed-confirm">
+    <ConfirmDestructive
+      title={`Revoke ${props.token.name}?`}
+      purpose="The next request that presents it is refused."
+      name={props.token.name}
+      confirmLabel="Revoke token"
+      onConfirm={props.onConfirm}
+      onClose={props.onClose}
+    >
       <p>
-        Revoke <b>{props.token.name}</b>, held by{" "}
-        <span class="mono">{props.token.owner_subject}</span>? The next request that presents
-        it is refused. Anything still using it (a CI job, a script, an agent) starts failing,
-        and the token cannot be restored, only replaced.
+        Held by <span class="mono">{props.token.owner_subject}</span>. Anything still using it (a
+        CI job, a script, an agent) starts failing, and the token cannot be restored, only
+        replaced.
       </p>
-      <label>
-        <span>
-          Type <b class="mono">{props.token.name}</b> to confirm
-        </span>
-        <input
-          class="input mono"
-          aria-label={`Type ${props.token.name} to confirm`}
-          value={typed()}
-          onInput={(e) => setTyped(e.currentTarget.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && ok()) props.onConfirm();
-          }}
-          autofocus
-        />
-      </label>
-      <div class="modal-actions">
-        <button class="btn btn-danger btn-sm" disabled={!ok()} onClick={() => props.onConfirm()}>
-          {props.busy ? "Revoking…" : "Revoke token"}
-        </button>
-        <button class="btn btn-ghost btn-sm" onClick={() => props.onCancel()}>
-          Cancel
-        </button>
-      </div>
-    </div>
+    </ConfirmDestructive>
   );
 }
 
@@ -292,8 +247,6 @@ export function OrgApiTokens(props: { org: string }) {
     (k) => listApiTokens(k.org, k.sort),
   );
   const [revoking, setRevoking] = createSignal<string | null>(null);
-  const [busy, setBusy] = createSignal(false);
-  const [error, setError] = createSignal<string | null>(null);
   const reload = () => setEpoch((e) => e + 1);
 
   const unavailable = () => !tokens.loading && !tokens.error && tokens() === null;
@@ -303,18 +256,10 @@ export function OrgApiTokens(props: { org: string }) {
   const liveCount = () => rows().filter((t) => isLive(t, Date.now())).length;
   const revokingToken = () => rows().find((t) => t.id === revoking());
 
+  // A refusal shows in the confirm dialog.
   const revoke = async (t: ApiToken) => {
-    setBusy(true);
-    setError(null);
-    try {
-      await revokeApiToken(props.org, t.id);
-      setRevoking(null);
-      reload();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Could not revoke the token.");
-    } finally {
-      setBusy(false);
-    }
+    await revokeApiToken(props.org, t.id);
+    reload();
   };
 
   return (
@@ -333,9 +278,6 @@ export function OrgApiTokens(props: { org: string }) {
         </p>
         <Show when={tokens.error}>
           <p class="error">Could not load API tokens.</p>
-        </Show>
-        <Show when={error()}>
-          <p class="error">{error()}</p>
         </Show>
 
         <Show when={!unavailable()} fallback={<NoTokenStore />}>
@@ -384,12 +326,7 @@ export function OrgApiTokens(props: { org: string }) {
           </Show>
           <Show when={revokingToken()}>
             {(t) => (
-              <RevokeToken
-                token={t()}
-                busy={busy()}
-                onConfirm={() => void revoke(t())}
-                onCancel={() => setRevoking(null)}
-              />
+              <RevokeToken token={t()} onConfirm={() => revoke(t())} onClose={() => setRevoking(null)} />
             )}
           </Show>
           <p class="subtle">
@@ -469,15 +406,9 @@ function MintTokenDialog(props: { onClose: () => void; onMinted: () => void }) {
   const [minted, setMinted] = createSignal<MintedToken | null>(null);
   const [copied, setCopied] = createSignal(false);
 
-  // Escape dismisses the form and nothing else: once the plaintext is on
-  // screen, the reflex that closes a modal is the reflex that loses it.
-  onMount(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && !minted()) props.onClose();
-    };
-    document.addEventListener("keydown", onKey);
-    onCleanup(() => document.removeEventListener("keydown", onKey));
-  });
+  // Escape and the scrim dismiss the form and nothing else: once the
+  // plaintext is on screen, the reflex that closes a modal is the reflex that
+  // loses it, so the dialog counts as busy until "I've copied it".
 
   // The orgs where you hold a role (the server's list) and the projects you
   // can see, so the scope picker offers only orgs a mint can succeed in. A
@@ -536,70 +467,90 @@ function MintTokenDialog(props: { onClose: () => void; onMinted: () => void }) {
   };
 
   return (
-    <div class="modal-scrim" onClick={() => !minted() && props.onClose()}>
-      {/* `modal-tall`: the fields scroll on a short viewport and the actions
-          stay pinned in `.modal-foot`, where they can always be reached. */}
-      <div class="modal modal-tall" onClick={(e) => e.stopPropagation()}>
-        <div class="panel-h">
-          <span>{minted() ? "Your new token" : "New API token"}</span>
-        </div>
-
+    <Modal
+      title={minted() ? "Your new token" : "New API token"}
+      purpose={
+        minted()
+          ? "Shown once. Copy it before you close this dialog."
+          : "A token lets something that is not a browser talk to Scarab as you."
+      }
+      busy={saving() || !!minted()}
+      onClose={props.onClose}
+      footer={
         <Show
           when={minted()}
           fallback={
-            <div class="modal-body">
-              <FormSection n={1} title="Name">
-                <input
-                  class="input"
-                  aria-label="name"
+            <>
+              <Show when={error()}>
+                <ModalMessage>{error()}</ModalMessage>
+              </Show>
+              <button class="btn btn-ghost" type="button" onClick={props.onClose} disabled={saving()}>
+                Cancel
+              </button>
+              <button class="btn btn-primary" type="button" disabled={!ready() || saving()} onClick={mint}>
+                <Icon icon="plus" size={14} /> {saving() ? "Minting…" : "Mint token"}
+              </button>
+            </>
+          }
+        >
+          <button class="btn btn-ghost" type="button" onClick={props.onClose}>
+            {copied() ? "Done" : "I've copied it"}
+          </button>
+          <button class="btn btn-primary" type="button" onClick={copy}>
+            {copied() ? "Copied" : "Copy token"}
+          </button>
+        </Show>
+      }
+    >
+      <Show
+        when={minted()}
+        fallback={
+          <>
+            <ModalSection n={1} title="Token">
+              <Field label="Name" required help="What makes it revocable later: the only way to tell two tokens apart.">
+                <Input
+                  autofocus
                   placeholder="release-bot, laptop CLI, demo keepalive"
                   value={name()}
-                  onInput={(e) => setName(e.currentTarget.value)}
-                  autofocus
+                  onValue={setName}
                 />
-                <p class="fieldnote">
-                  What makes it revocable later: the only way to tell two tokens apart.
-                </p>
-              </FormSection>
+              </Field>
+            </ModalSection>
 
-              <FormSection n={2} title="Scope">
-                <Switch
-                  fallback={
-                    <input
-                      class="input mono"
-                      aria-label="organization"
-                      placeholder="acme"
+            <ModalSection n={2} title="Scope">
+              <Switch
+                fallback={
+                  <Field label="Organization" required>
+                    <Input mono placeholder="acme" value={org()} onValue={setOrg} />
+                  </Field>
+                }
+              >
+                <Match when={scopes()?.orgs?.length === 0}>
+                  <p class="f-help" role="status">
+                    You hold no role in any organization, so there is nowhere to mint a token
+                    yet. An org admin can grant you one.
+                  </p>
+                </Match>
+                <Match when={(scopes()?.orgs?.length ?? 0) > 0}>
+                  <Field label="Organization" required>
+                    <Select
+                      mono
                       value={org()}
-                      onInput={(e) => setOrg(e.currentTarget.value)}
-                    />
-                  }
-                >
-                  <Match when={scopes()?.orgs?.length === 0}>
-                    <p class="fieldnote" role="status">
-                      You hold no role in any organization, so there is nowhere to mint a token
-                      yet. An org admin can grant you one.
-                    </p>
-                  </Match>
-                  <Match when={(scopes()?.orgs?.length ?? 0) > 0}>
-                    <select
-                      class="input mono"
-                      aria-label="organization"
-                      value={org()}
-                      onChange={(e) => {
-                        setOrg(e.currentTarget.value);
+                      onValue={(v) => {
+                        setOrg(v);
                         setProject("");
                       }}
                     >
                       <For each={scopes()?.orgs ?? []}>{(o) => <option value={o}>{o}</option>}</For>
-                    </select>
-                  </Match>
-                </Switch>
-                <select
-                  class="input mono"
-                  aria-label="scope"
-                  value={project()}
-                  onChange={(e) => setProject(e.currentTarget.value)}
-                >
+                    </Select>
+                  </Field>
+                </Match>
+              </Switch>
+              <Field
+                label="Repository"
+                help="A token scoped to one repository cannot see another's runs. Narrow it unless it needs the whole org."
+              >
+                <Select mono value={project()} onValue={setProject}>
                   <option value="">All of {org() || "the org"}</option>
                   <For each={orgProjects()}>
                     {(p) => (
@@ -608,20 +559,16 @@ function MintTokenDialog(props: { onClose: () => void; onMinted: () => void }) {
                       </option>
                     )}
                   </For>
-                </select>
-                <p class="fieldnote">
-                  A token scoped to one repository cannot see another's runs. Narrow it unless
-                  it needs the whole org.
-                </p>
-              </FormSection>
+                </Select>
+              </Field>
+            </ModalSection>
 
-              <FormSection n={3} title="Role ceiling">
-                <select
-                  class="input"
-                  aria-label="role ceiling"
-                  value={role()}
-                  onChange={(e) => setRole(e.currentTarget.value as TokenRole)}
-                >
+            <ModalSection n={3} title="Limits">
+              <Field
+                label="Role ceiling"
+                help="A ceiling, not a grant: each request also checks what you hold at that moment and takes the lower of the two. You cannot mint above your own role in this scope."
+              >
+                <Select value={role()} onValue={(v) => setRole(v as TokenRole)}>
                   <For each={ROLE_CHOICES}>
                     {(r) => (
                       <option value={r.role}>
@@ -629,30 +576,28 @@ function MintTokenDialog(props: { onClose: () => void; onMinted: () => void }) {
                       </option>
                     )}
                   </For>
-                </select>
-                <p class="fieldnote">
-                  A ceiling, not a grant: each request also checks what you hold at that
-                  moment and takes the lower of the two. You cannot mint above your own role
-                  in this scope.
-                </p>
-              </FormSection>
-
-              <FormSection n={4} title="Expires in">
+                </Select>
+              </Field>
+              <Field
+                label="Expires in"
+                required
+                help={`Required, 1–${MAX_TOKEN_DAYS}. There is no "never": Scarab does not mint a credential that carries a role and never expires.`}
+                error={lifetimeProblem()}
+              >
                 <div class="tok-life">
-                  <input
-                    class="input mono tok-days"
-                    aria-label="expires in (days)"
-                    type="number"
-                    min="1"
-                    max={MAX_TOKEN_DAYS}
-                    value={days()}
-                    onInput={(e) => setDays(Number(e.currentTarget.value))}
+                  <Input
+                    mono
+                    class="tok-days"
+                    inputmode="numeric"
+                    suffix="days"
+                    value={String(days())}
+                    onValue={(v) => setDays(Number(v))}
                   />
-                  <span class="tok-life-unit">days</span>
                   <For each={[30, 90, 365]}>
                     {(d) => (
                       <button
                         class="btn btn-ghost btn-sm"
+                        type="button"
                         classList={{ "tok-preset-on": days() === d }}
                         onClick={() => setDays(d)}
                       >
@@ -661,72 +606,31 @@ function MintTokenDialog(props: { onClose: () => void; onMinted: () => void }) {
                     )}
                   </For>
                 </div>
-                <p class="fieldnote">
-                  Required, 1–{MAX_TOKEN_DAYS}. There is no "never": Scarab does not mint a
-                  credential that carries a role and never expires.
-                </p>
-              </FormSection>
-            </div>
-          }
-        >
-          {(m) => (
-            <div class="modal-body">
-              <p class="tok-warn">
-                <Icon icon="alert-triangle" size={14} />
-                <span>
-                  Copy this now. Scarab keeps only its SHA-256, so this string cannot be
-                  recovered from the database, from a backup, or by any later API call. A lost
-                  token is re-minted, never re-read.
-                </span>
-              </p>
-              <code class="tok-secret mono">{m().token}</code>
-            </div>
-          )}
-        </Show>
-        <Show when={minted()}>
-          {(m) => (
-            <div class="modal-foot">
-              <div class="modal-actions">
-                <button class="btn btn-primary" onClick={copy}>
-                  {copied() ? "Copied" : "Copy token"}
-                </button>
-                <button class="btn btn-ghost" onClick={props.onClose}>
-                  {copied() ? "Done" : "I've copied it"}
-                </button>
-              </div>
-              <p class="subtle modal-note">
-                <small>
-                  Send it as <code class="mono">Authorization: Bearer …</code>, or give it to
-                  the CLI as <code class="mono">SCARAB_TOKEN</code>. It acts as{" "}
-                  <b>{m().record.owner_subject}</b>, up to <b>{m().record.role}</b> on{" "}
-                  <b>{scopeLabel(m().record)}</b>, and expires {absTime(m().record.expires_at)}.
-                </small>
-              </p>
-            </div>
-          )}
-        </Show>
-
-        {/* Pinned below the scrolling fields; once the token exists the footer
-            above carries the reveal's own actions instead. */}
-        <Show when={!minted()}>
-          <div class="modal-foot">
-            <Show when={lifetimeProblem()}>
-              <p class="error">{lifetimeProblem()}</p>
-            </Show>
-            <Show when={error()}>
-              <p class="error">{error()}</p>
-            </Show>
-            <div class="modal-actions">
-              <button class="btn btn-primary" disabled={!ready() || saving()} onClick={mint}>
-                <Icon icon="plus" size={14} /> {saving() ? "Minting…" : "Mint token"}
-              </button>
-              <button class="btn btn-ghost" onClick={props.onClose}>
-                Cancel
-              </button>
-            </div>
-          </div>
-        </Show>
-      </div>
-    </div>
+              </Field>
+            </ModalSection>
+          </>
+        }
+      >
+        {(m) => (
+          <>
+            <p class="tok-warn">
+              <Icon icon="alert-triangle" size={14} />
+              <span>
+                Copy this now. Scarab keeps only its SHA-256, so this string cannot be
+                recovered from the database, from a backup, or by any later API call. A lost
+                token is re-minted, never re-read.
+              </span>
+            </p>
+            <code class="tok-secret mono">{m().token}</code>
+            <p class="dlg-text">
+              Send it as <code class="mono">Authorization: Bearer …</code>, or give it to the CLI as{" "}
+              <code class="mono">SCARAB_TOKEN</code>. It acts as <b>{m().record.owner_subject}</b>, up
+              to <b>{m().record.role}</b> on <b>{scopeLabel(m().record)}</b>, and expires{" "}
+              {absTime(m().record.expires_at)}.
+            </p>
+          </>
+        )}
+      </Show>
+    </Modal>
   );
 }
