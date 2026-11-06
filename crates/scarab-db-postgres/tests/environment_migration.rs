@@ -287,6 +287,14 @@ async fn backfill_reproduces_the_pure_migration_and_is_a_no_op_the_second_time()
         "a second backfill changes nothing"
     );
 
+    // The store reads the schema as it is now: the migrations after 0057
+    // (0079 adds the approval gate settings to `org_environments`).
+    for m in MIGRATOR.iter().filter(|m| m.version > 57) {
+        sqlx::raw_sql(&m.sql)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("apply migration {}: {e}", m.version));
+    }
     let db = PostgresDb::with_pool(pool.clone());
 
     // The legacy rows are frozen, not dropped, and still read as legacy rules.
