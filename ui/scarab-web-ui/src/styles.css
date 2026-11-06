@@ -470,7 +470,7 @@ code,
   .btn:not(:disabled):active, .search-chip:active,
   .brand:active, .repo-card:active { transform: none; }
   /* Overlays + icon: keep the opacity fade, drop the scale/rotate movement. */
-  .modal-scrim, .modal, .dlg-scrim, .dlg, .usermenu-pop { transition-property: opacity; }
+  .dlg-scrim, .dlg, .usermenu-pop { transition-property: opacity; }
 }
 
 h1 {
@@ -725,20 +725,6 @@ select.input {
   outline: none;
   border-color: var(--emerald);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--emerald) 18%, transparent);
-}
-
-.form-row {
-  display: flex;
-  gap: 12px;
-  align-items: center;
-  flex-wrap: wrap;
-}
-
-.checkbox-inline {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  cursor: pointer;
 }
 
 /* ---- Steps / detail --------------------------------------------------- */
@@ -1867,45 +1853,8 @@ select.input {
 .secrets-add { margin-top: 4px; }
 .secrets-actions { margin-top: 4px; }
 
-/* ---- modal ---- */
-.modal-scrim {
-  position: fixed; inset: 0; background: rgba(10, 18, 14, 0.5); z-index: 50;
-  backdrop-filter: blur(2px);
-  display: flex; align-items: flex-start; justify-content: center; padding-top: 12vh;
-  transition: opacity 0.18s var(--ease-out);
-}
-@starting-style { .modal-scrim { opacity: 0; } }
-.modal {
-  position: relative;
-  width: min(460px, 92vw); background: var(--emerald-elevated); border: 1px solid var(--border);
-  border-radius: var(--radius-lg); overflow: hidden;
-  box-shadow: 0 24px 60px -28px rgba(10, 20, 14, 0.45);
-  /* Not trigger-anchored — settles in from the viewport centre. */
-  transition: opacity 0.18s var(--ease-out), transform 0.18s var(--ease-out);
-}
-/* Every dialog is 460px; one that shows a list or a diff (the yank impact, the
-   step-up summary) is `.modal-wide`. No dialog sets its own width. */
-.modal-wide { width: min(580px, 92vw); }
-@starting-style { .modal { opacity: 0; transform: scale(0.97); } }
-.modal-body { padding: 18px; display: flex; flex-direction: column; gap: 12px; }
-.modal-body label { font-family: var(--font-mono); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 1px; color: var(--muted-sage); display: block; margin-bottom: 5px; }
-/* A key name is shown as written, not upper-cased. */
-.modal-body label.mono { text-transform: none; letter-spacing: 0; }
-/* A checkbox's label is a sentence, not a field name. */
-.modal-body label.checkbox-inline {
-  display: flex; margin: 0; font-family: var(--font-ui); font-size: var(--fs-md);
-  text-transform: none; letter-spacing: normal; color: var(--soft-white);
-}
-.modal-body label.checkbox-inline input { flex: none; }
-.modal-body label.secret-overwrite { color: var(--warn); }
-.secret-overwrite input { accent-color: var(--warn); }
-/* Fields in a dialog: one per row, the body's full width. Mono only for
-   machine values (`.input.mono`); names and prose are in the UI face. */
-.modal-body .form-r { display: flex; flex-direction: column; }
-.modal-body .input { width: 100%; }
-.modal-body .input:not(.mono) { font-family: var(--font-ui); }
+/* ---- actions row (inline forms, the Environment page footer) ---- */
 .modal-actions { display: flex; gap: 10px; margin-top: 6px; }
-.modal-note { margin: 0; }
 
 /* ---- run title (human, not mono) ---- */
 .run-title { font-family: var(--font-display); font-size: var(--fs-xl); font-weight: 700; letter-spacing: -0.6px; margin: 0; }
@@ -2224,8 +2173,6 @@ select.input {
 }
 .rp-req { font-size: var(--fs-xs); color: var(--copper); font-weight: 600; }
 .rp-opt { font-size: var(--fs-xs); color: var(--muted-sage); }
-.rp-check { display: flex; align-items: center; gap: 8px; color: var(--sage); }
-.rp-check input { accent-color: var(--emerald); width: 15px; height: 15px; }
 .rp-help { font-size: var(--fs-sm); color: var(--muted-sage); }
 .rp-err-msg { font-size: var(--fs-sm); color: var(--danger); }
 .rp-field.has-err .input { border-color: var(--danger); }
@@ -3390,17 +3337,7 @@ h1, .crumb-head, .run-title {
 .tok-table tr.tok-dead { opacity: 0.6; }
 .tok-table-scroll { overflow-x: auto; }
 
-/* ---- dialog height and footer ---- */
-/* The default .modal clips its overflow, which is fine for a two-field dialog
-   and hides the primary button on a four-field one. `.modal-tall` is a column
-   with a bounded height: the body scrolls, the footer never leaves. Every
-   dialog puts its primary action and Cancel in `.modal-foot`. */
-.modal-tall {
-  display: flex;
-  flex-direction: column;
-  max-height: min(74vh, 720px);
-}
-.modal-tall .modal-body { overflow-y: auto; min-height: 0; }
+/* ---- the Environment page's form footer ---- */
 .modal-foot {
   display: flex; flex-direction: column; gap: 10px;
   padding: 14px 18px;
@@ -3410,6 +3347,8 @@ h1, .crumb-head, .run-title {
 .modal-foot .modal-actions { margin-top: 0; }
 /* An inline form outside a dialog (plugin storage and connections, the
    Environment page, library review): fields go full width, as in a dialog. */
+.token-form { display: flex; flex-direction: column; gap: 12px; }
+.plg-conn-row .token-form { flex-basis: 100%; }
 .token-form .form-r { display: flex; flex-direction: column; }
 .token-form .input { width: 100%; }
 .fieldnote {
@@ -3417,8 +3356,7 @@ h1, .crumb-head, .run-title {
   font-size: var(--fs-sm); line-height: 1.45; color: var(--muted-sage);
 }
 .tok-life { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.tok-days, .modal-body .input.tok-days { width: 88px; }
-.tok-life-unit { font-size: var(--fs-sm); color: var(--muted-sage); margin-right: 4px; }
+.f-ctl.tok-days { width: 120px; flex: none; }
 .tok-preset-on { border-color: var(--emerald); color: var(--emerald); }
 
 /* ---- org Environments ---- */
@@ -3435,10 +3373,6 @@ h1, .crumb-head, .run-title {
 .env-sec-h { display: flex; align-items: center; gap: 10px; margin: 0; font-size: var(--fs-lg); font-weight: 600; color: var(--soft-white); }
 .env-sec-n { display: inline-grid; place-items: center; width: 22px; height: 22px; border: 1px solid var(--border); border-radius: 50%; font-size: var(--fs-xs); font-weight: 400; color: var(--muted-sage); }
 .env-sec-body { display: flex; flex-direction: column; gap: 10px; }
-.env-sec-body label:not(.checkbox-inline) { font-size: var(--fs-sm); color: var(--sage); margin-bottom: 4px; }
-/* In a dialog a section's field labels keep the dialog's label style. */
-.modal-body .env-sec-body label:not(.checkbox-inline) { font-size: var(--fs-xs); color: var(--muted-sage); }
-.input-static { color: var(--sage); background: var(--pine-deep); user-select: all; }
 .env-danger { border-color: color-mix(in srgb, var(--danger) 45%, var(--border)); }
 .env-danger p { margin: 0; font-size: var(--fs-md); }
 .typed-confirm { display: flex; flex-direction: column; gap: 8px; max-width: 420px; }
@@ -3450,7 +3384,7 @@ h1, .crumb-head, .run-title {
 .oenv-report-projects { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; }
 .oenv-desc { font-size: var(--fs-sm); color: var(--sage); }
 .oenv-rows { display: grid; gap: 6px; }
-.oenv-row { display: grid; grid-template-columns: 1fr 1fr auto; gap: 6px; align-items: center; }
+.oenv-row { display: grid; grid-template-columns: 1fr 1fr auto auto; gap: 6px; align-items: center; }
 @media (max-width: 560px) {
   .oenv-row { grid-template-columns: 1fr auto; }
   .oenv-row > :nth-child(2) { grid-column: 1; }
@@ -3588,8 +3522,10 @@ h1, .crumb-head, .run-title {
 .sec-ok { color: var(--ok); }
 .sec-plain { color: var(--sage); }
 .sec-add, .sec-filter { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-.sec-add .input { flex: 1 1 220px; max-width: 340px; }
+.sec-add .input, .sec-add .f-ctl { flex: 1 1 220px; max-width: 340px; }
 .sec-filter .input { max-width: 280px; }
+.evlog-filter .f { flex: 0 1 200px; }
+.lib-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .evlog-filter { align-items: flex-end; }
 .sec-chips { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px; }
 .sec-chips li {
@@ -3776,9 +3712,8 @@ h1, .crumb-head, .run-title {
 .lib-empty .acts { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; margin-top: 6px; }
 .lib-empty .acts .btn.on { border-color: var(--emerald); color: var(--emerald); }
 .lib-pane { width: min(600px, 100%); text-align: left; border-top: 1px dotted var(--border); padding-top: 12px; margin-top: 8px; display: grid; gap: 8px; }
-.lib-pane label { font-family: var(--font-mono); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 1px; color: var(--muted-sage); }
-.lib-pane .input { width: 100%; }
 .lib-pane .row { display: flex; gap: 8px; }
+.lib-pane .row .f-ctl { flex: 1; }
 .lib-pane .row .btn { flex: none; white-space: nowrap; }
 .lib-errs { font-size: var(--fs-sm); color: var(--muted-sage); }
 .lib-errs summary { cursor: pointer; font-family: var(--font-mono); font-size: var(--fs-xs); }
@@ -4006,6 +3941,8 @@ code.c { font-family: var(--font-mono); font-size: var(--fs-sm); color: var(--co
 .f-chk input:checked + .f-box svg { opacity: 1; }
 .f-chk input:focus-visible + .f-box { outline: 2px solid var(--emerald); outline-offset: 2px; }
 .f-chk.is-dis { cursor: not-allowed; opacity: 0.6; }
+.f-chk.is-warn .f-chk-l { color: var(--warn); }
+.f-chk.is-warn input:checked + .f-box { background: var(--warn); border-color: var(--warn); }
 .f-chk-t { display: flex; flex-direction: column; min-width: 0; }
 .f-chk-l { font-size: var(--fs-md); color: var(--soft-white); }
 .f-chk-h { font-size: var(--fs-sm); color: var(--muted-sage); }
@@ -4060,7 +3997,9 @@ code.c { font-family: var(--font-mono); font-size: var(--fs-sm); color: var(--co
   background:
     linear-gradient(to top, var(--emerald-elevated) 50%, transparent) center bottom / 100% 28px no-repeat local,
     linear-gradient(to top, rgba(0, 0, 0, 0.22), transparent) center bottom / 100% 14px no-repeat scroll;
-}/* A sectioned body: each section carries its own padding and rule. */
+}/* A dialog that is all question and footer has no body. */
+.dlg-b:empty { display: none; }
+/* A sectioned body: each section carries its own padding and rule. */
 .dlg-b:has(> .dlg-sec) { gap: 0; padding: 0; }
 .dlg-sec {
   display: grid; grid-template-columns: 112px minmax(0, 1fr); gap: 0 18px;
@@ -4089,7 +4028,7 @@ code.c { font-family: var(--font-mono); font-size: var(--fs-sm); color: var(--co
 /* Context inside a dialog body: a fact the reader needs, not a control. */
 .dlg-ctx { margin: 0; font-family: var(--font-mono); font-size: var(--fs-sm); line-height: 1.55; color: var(--sage); }
 .dlg-ctx .k { color: var(--muted-sage); }
-.dlg-text { font-size: var(--fs-md); line-height: 1.5; color: var(--sage); }
+.dlg-text { margin: 0; font-size: var(--fs-md); line-height: 1.5; color: var(--sage); }
 .dlg-text p { margin: 0; }
 .dlg-text p + p { margin-top: 8px; }
 
@@ -4100,3 +4039,9 @@ code.c { font-family: var(--font-mono); font-size: var(--fs-sm); color: var(--co
 }
 .btn-destroy:not(:disabled):hover { background: color-mix(in srgb, var(--danger) 85%, black); }
 .dlg-f .btn-primary, .dlg-f .btn-ghost { display: inline-flex; align-items: center; gap: 6px; }
+/* A danger action that can be undone (kill, clear, yank): a hairline button
+   at the footer's size, not the solid fill of a removal. */
+.dlg-f .btn-danger {
+  display: inline-flex; align-items: center; gap: 6px; padding: 8px 16px;
+  border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
+}

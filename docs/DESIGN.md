@@ -322,17 +322,36 @@ Placement is stricter than doodles, because motion competes with content:
   `--badge-ink`.
 
 ### Forms
-- Inputs (`.input`): `--emerald-surface` fill, `--border` hairline, mono value
-  text; focus → `--emerald` border + a soft emerald focus ring. Labels are mono
-  uppercase. Secret values are `type=password` and **write-only** (never rendered back).
+- Every form field is a `Field` holding an `Input`, `Select`, `Textarea` or
+  `Checkbox` (`components/Field.tsx`): a 30px box with an `--emerald-surface`
+  fill and a `--border` hairline; focus → `--emerald` border + a soft emerald
+  ring. The label sits above in mono uppercase, the help line below; an error
+  replaces the help line and marks the box. Values are in the UI face; mono only
+  for machine values (ids, refs, keys, paths, URLs). Secret values are
+  `type=password` and **write-only** (never rendered back).
+- A few controls stay plain on purpose: the command palette, the repo filter,
+  the search inside `SearchSelect`, the settings section and org pickers, and the
+  reject-reason box on a gate.
 
 ### Tabs & filter pills
 - Tabs: text buttons, active → `--emerald` text + emerald underline. Filter
   pills (`.fpill`): mono, hairline; active → emerald border + emerald text.
 
 ### Modal
-- Elevated (`--emerald-elevated`), a blurred dark scrim, and the single
-  permitted soft shadow. Mono uppercase field labels.
+- Every dialog is a `Modal` (`components/Modal.tsx`): elevated
+  (`--emerald-elevated`), a blurred dark scrim, and the single permitted soft
+  shadow. A 20px title, one line saying what the dialog is for, numbered
+  sections when it asks three or more questions, and a `--pine-deep` footer with
+  the actions and, when useful, a line saying what applies after saving. Three
+  widths: narrow 440px (a confirmation), standard 560px (a form), wide 760px (a
+  review).
+- It sits 10vh from the top. A taller dialog moves up first and scrolls its body
+  only when the window is too short; a shadow above the footer then says there is
+  more below.
+- Removing or revoking something asks through `ConfirmDestructive`: type the
+  thing's name to enable a solid danger button. An action that can be undone
+  (kill a plugin, stop mounting a claim) asks through `ConfirmAction`. Never the
+  browser's `confirm()` or `prompt()`.
 
 ### Empty states
 - No stock photography. A single faint doodle (§5) + one line of `--muted-sage` copy.
