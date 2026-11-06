@@ -9,10 +9,11 @@ use async_trait::async_trait;
 use sqlx::Row;
 
 use scarab_project::{
-    DeployGovernance, EnvironmentGovernanceStore, EnvironmentMigrationAcknowledgement,
-    EnvironmentMigrationReport, EnvironmentMigrationReportProject, EnvironmentProjectEligibility,
-    EnvironmentProjectOverlay, EnvironmentProjectPrivilegeGrant, EnvironmentProjectRecord,
-    EnvironmentProtectionRules, ImageGrant, OrgEnvironment, OrgEnvironmentError, ProtectionRules,
+    validate_org_environment_display_name, validate_org_environment_name, DeployGovernance,
+    EnvironmentGovernanceStore, EnvironmentMigrationAcknowledgement, EnvironmentMigrationReport,
+    EnvironmentMigrationReportProject, EnvironmentProjectEligibility, EnvironmentProjectOverlay,
+    EnvironmentProjectPrivilegeGrant, EnvironmentProjectRecord, EnvironmentProtectionRules,
+    ImageGrant, OrgEnvironment, OrgEnvironmentError, ProtectionRules,
 };
 
 use crate::org_environments::{
@@ -24,6 +25,9 @@ use crate::PostgresDb;
 /// Postgres' `foreign_key_violation`: a governance write naming an
 /// Environment that does not exist.
 const FOREIGN_KEY_VIOLATION: &str = "23503";
+
+/// Postgres' `unique_violation`: a duplicate whose new name is taken.
+const UNIQUE_VIOLATION: &str = "23505";
 
 fn not_found(org: &str, environment: &str) -> OrgEnvironmentError {
     OrgEnvironmentError::NotFound {
@@ -777,6 +781,98 @@ impl EnvironmentGovernanceStore for PostgresDb {
         .rows_affected();
         Ok(deleted > 0)
     }
+    async fn duplicate_environment(
+        &self,
+        org: &str,
+        from: &str,
+        to: &str,
+        display_name: Option<&str>,
+        updated_by: &str,
+        updated_at: i64,
+    ) -> Result<OrgEnvironment, OrgEnvironmentError> {
+        validate_org_environment_name(to)?;
+        if let Some(d) = display_name {
+            validate_org_environment_display_name(d)?;
+        }
+        // Each row is copied whole through `jsonb_populate_record`, with only
+        // the key and the stamps replaced: a baseline, overlay or grant
+        // column a later migration adds is copied without this code knowing
+        // of it. One transaction: a failure on any table leaves no copy.
+        let mut tx = self
+            .pool()
+            .begin()
+            .await
+            .map_err(org_environment_store_err)?;
+        let taken = |e: sqlx::Error| match &e {
+            sqlx::Error::Database(d) if d.code().as_deref() == Some(UNIQUE_VIOLATION) => {
+                OrgEnvironmentError::already_exists(org, to)
+            }
+            _ => org_environment_store_err(e),
+        };
+        let copied = sqlx::query(
+            "INSERT INTO org_environments
+             SELECT (jsonb_populate_record(NULL::org_environments, to_jsonb(e) || jsonb_build_object(
+                 'name', $3::text, 'display_name', $4::text,
+                 'created_at', $5::bigint, 'updated_at', $5::bigint, 'updated_by', $6::text))).*
+             FROM org_environments e WHERE e.org = $1 AND e.name = $2",
+        )
+        .bind(org)
+        .bind(from)
+        .bind(to)
+        .bind(display_name)
+        .bind(updated_at)
+        .bind(updated_by)
+        .execute(&mut *tx)
+        .await
+        .map_err(taken)?
+        .rows_affected();
+        if copied == 0 {
+            return Err(not_found(org, from));
+        }
+        sqlx::query(
+            "INSERT INTO environment_project_eligibility
+             SELECT (jsonb_populate_record(NULL::environment_project_eligibility,
+                 to_jsonb(x) || jsonb_build_object('environment', $3::text))).*
+             FROM environment_project_eligibility x WHERE x.org = $1 AND x.environment = $2",
+        )
+        .bind(org)
+        .bind(from)
+        .bind(to)
+        .execute(&mut *tx)
+        .await
+        .map_err(org_environment_store_err)?;
+        for table in [
+            "environment_project_overlays",
+            "environment_project_privilege_grants",
+        ] {
+            sqlx::query(&format!(
+                "INSERT INTO {table}
+                 SELECT (jsonb_populate_record(NULL::{table}, to_jsonb(x) || jsonb_build_object(
+                     'environment', $3::text, 'updated_at', $4::bigint, 'updated_by', $5::text))).*
+                 FROM {table} x WHERE x.org = $1 AND x.environment = $2"
+            ))
+            .bind(org)
+            .bind(from)
+            .bind(to)
+            .bind(updated_at)
+            .bind(updated_by)
+            .execute(&mut *tx)
+            .await
+            .map_err(org_environment_store_err)?;
+        }
+        let row = sqlx::query(&format!(
+            "SELECT {ORG_ENVIRONMENT_COLUMNS} FROM org_environments WHERE org = $1 AND name = $2"
+        ))
+        .bind(org)
+        .bind(to)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(org_environment_store_err)?;
+        let copy = stored_environment(&mut tx, &row, org, to).await?;
+        tx.commit().await.map_err(org_environment_store_err)?;
+        Ok(copy)
+    }
+
     async fn environment_projects(
         &self,
         org: &str,

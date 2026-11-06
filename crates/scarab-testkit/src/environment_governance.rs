@@ -82,6 +82,7 @@ fn new_environment(
     OrgEnvironment {
         org: org.to_string(),
         name: name.to_string(),
+        display_name: None,
         description: String::new(),
         protection: EnvironmentProtectionRules::default(),
         eligibility,
@@ -436,6 +437,72 @@ impl EnvironmentGovernanceStore for InMemoryEnvironmentGovernance {
                 project.to_string(),
             ))
             .is_some())
+    }
+
+    async fn duplicate_environment(
+        &self,
+        org: &str,
+        from: &str,
+        to: &str,
+        display_name: Option<&str>,
+        updated_by: &str,
+        updated_at: i64,
+    ) -> Result<OrgEnvironment, OrgEnvironmentError> {
+        // One lock: the copy is all or nothing, as Postgres' transaction.
+        let mut state = self.state.lock().unwrap();
+        let source = state
+            .environments
+            .get(&(org.to_string(), from.to_string()))
+            .ok_or_else(|| not_found(org, from))?
+            .clone();
+        let copy = OrgEnvironment {
+            name: to.to_string(),
+            display_name: display_name.map(str::to_string),
+            created_at: updated_at,
+            updated_at,
+            updated_by: updated_by.to_string(),
+            ..source
+        };
+        copy.validate()?;
+        if state
+            .environments
+            .contains_key(&(org.to_string(), to.to_string()))
+        {
+            return Err(OrgEnvironmentError::already_exists(org, to));
+        }
+        let in_source = |(o, e, _): &ProjectKey| o == org && e == from;
+        let overlays: Vec<EnvironmentProjectOverlay> = state
+            .overlays
+            .iter()
+            .filter(|(k, _)| in_source(k))
+            .map(|(_, o)| EnvironmentProjectOverlay {
+                environment: to.to_string(),
+                ..o.clone()
+            })
+            .collect();
+        let grants: Vec<EnvironmentProjectPrivilegeGrant> = state
+            .grants
+            .iter()
+            .filter(|(k, _)| in_source(k))
+            .map(|(_, g)| EnvironmentProjectPrivilegeGrant {
+                environment: to.to_string(),
+                ..g.clone()
+            })
+            .collect();
+        for o in overlays {
+            state
+                .overlays
+                .insert((o.org.clone(), o.environment.clone(), o.project.clone()), o);
+        }
+        for g in grants {
+            state
+                .grants
+                .insert((g.org.clone(), g.environment.clone(), g.project.clone()), g);
+        }
+        state
+            .environments
+            .insert((org.to_string(), to.to_string()), copy.clone());
+        Ok(copy)
     }
 
     async fn environment_projects(

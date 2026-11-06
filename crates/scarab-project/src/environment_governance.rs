@@ -791,6 +791,27 @@ pub trait EnvironmentGovernanceStore: Send + Sync {
         project: &str,
     ) -> Result<bool, OrgEnvironmentError>;
 
+    /// Create Environment `to` in `org` as a copy of `from` (git-bug
+    /// d002a0c): its description, its baseline protection rules (every
+    /// field), its eligibility, and every Project's overlay and privilege
+    /// grant — all in **one** transaction, so a failure leaves no partial
+    /// copy. The copy shows `display_name` and is stamped created and
+    /// updated by `updated_by` at `updated_at`. `from` is not changed.
+    ///
+    /// [`OrgEnvironmentError::NotFound`] when `from` does not exist;
+    /// [`OrgEnvironmentError::Conflict`] when `to` already does (nothing
+    /// changed either way); [`OrgEnvironmentError::Invalid`] for a name or
+    /// display name the rules refuse. Returns the copy as stored.
+    async fn duplicate_environment(
+        &self,
+        org: &str,
+        from: &str,
+        to: &str,
+        display_name: Option<&str>,
+        updated_by: &str,
+        updated_at: i64,
+    ) -> Result<OrgEnvironment, OrgEnvironmentError>;
+
     /// Every Project holding an overlay or a privilege grant in
     /// `environment`, by Project name, with its eligibility now — what the
     /// Environment's admin reviews (and why a delete is refused).
@@ -1032,6 +1053,7 @@ mod tests {
         let env = OrgEnvironment {
             org: "acme".into(),
             name: "prod".into(),
+            display_name: None,
             description: String::new(),
             protection: EnvironmentProtectionRules::default(),
             eligibility: EnvironmentProjectEligibility::Projects(strings(&["pay*"])),

@@ -314,6 +314,19 @@ impl PolicyStore for PostgresDb {
         rows.iter().map(policy_from_row).collect()
     }
 
+    async fn list_in_org(&self, org: &str) -> Result<Vec<StoredPolicy>, PolicyStoreError> {
+        let rows = sqlx::query(&format!(
+            "SELECT {POLICY_COLUMNS} FROM policies \
+             WHERE org = $1 AND NOT deleted \
+             ORDER BY project COLLATE \"C\" NULLS FIRST, name COLLATE \"C\""
+        ))
+        .bind(org)
+        .fetch_all(self.pool())
+        .await
+        .map_err(store_err)?;
+        rows.iter().map(policy_from_row).collect()
+    }
+
     async fn versions(&self, id: &str) -> Result<Vec<PolicyVersion>, PolicyStoreError> {
         let rows = sqlx::query(
             "SELECT policy_id, version, body, content_hash, author, reason, step_up_ref, \

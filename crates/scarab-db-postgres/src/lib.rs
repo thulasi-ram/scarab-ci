@@ -1787,6 +1787,24 @@ impl Db for PostgresDb {
         rows.into_iter().map(run_summary_from_row).collect()
     }
 
+    async fn projects_deploying_to(
+        &self,
+        org: &str,
+        environment: &str,
+    ) -> Result<Vec<String>, DbError> {
+        sqlx::query_scalar(
+            "SELECT deploy_project FROM runs
+             WHERE deploy_org = $1 AND deploy_environment = $2 AND deploy_project IS NOT NULL
+             GROUP BY deploy_project
+             ORDER BY deploy_project COLLATE \"C\"",
+        )
+        .bind(org)
+        .bind(environment)
+        .fetch_all(self.pool())
+        .await
+        .map_err(db_err)
+    }
+
     async fn record_refused_run(&self, r: &scarab_engine::RefusedRun) -> Result<(), DbError> {
         sqlx::query(
             "INSERT INTO refused_runs (org, project, pipeline, trigger_kind, actor, git_ref, sha,

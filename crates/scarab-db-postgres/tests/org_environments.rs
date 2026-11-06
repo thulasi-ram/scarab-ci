@@ -18,6 +18,7 @@ fn org_environment(org: &str, name: &str, at: i64) -> OrgEnvironment {
     OrgEnvironment {
         org: org.into(),
         name: name.into(),
+        display_name: None,
         description: format!("{name} for {org}"),
         // The governance half has its own writes (ADR-0071); a new
         // Environment stores the permissive, fail-closed defaults.

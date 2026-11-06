@@ -724,6 +724,38 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/orgs/{org}/environments/{env}/duplicate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Duplicate an org Environment, its rules, eligibility, overlays, grants and secrets
+         * @description Not copied, and listed in the answer: Policies that select the old
+         *     Environment and not the new one, the Projects whose Pipelines name the
+         *     old one (from Run history), and the OIDC subject cloud trust policies
+         *     match. Run and approval history and the Cache stay with the old
+         *     Environment, which is not changed.
+         *
+         *     The secret store is a separate store from the Environment's, so the two
+         *     cannot share a transaction. The secrets are copied first; the
+         *     Environment, its eligibility, overlays and grants are then created in
+         *     one transaction. If either step fails, the copied secrets are deleted, so
+         *     no partial Environment is left. A crash between the two leaves only
+         *     secrets under a name no Environment has, which no Run can resolve and
+         *     which a retry refuses (409) until an admin deletes them.
+         */
+        post: operations["duplicate_org_environment"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/orgs/{org}/environments/{env}/eligibility": {
         parameters: {
             query?: never;
@@ -2935,6 +2967,81 @@ export interface components {
              */
             ref: string;
         };
+        /** @description What a duplicate copied. */
+        DuplicateCopiedDto: {
+            /** @description Projects whose overlay was copied. */
+            overlays: string[];
+            /** @description Projects whose privilege grant was copied. */
+            privilege_grants: string[];
+            /** @description The EnvironmentProjectSecretScope secrets copied, with their values. */
+            secrets: components["schemas"]["DuplicatedSecretsDto"][];
+        };
+        /** @description What a duplicate left for an admin to do by hand. */
+        DuplicateNotCopiedDto: {
+            /**
+             * @description The same for the new Environment: a cloud trust policy matching
+             *     `old_oidc_subject` must also match this one before a Run here can
+             *     assume its role.
+             */
+            new_oidc_subject: string;
+            /** @description Other things the copy does not carry, one sentence each. */
+            notes: string[];
+            /**
+             * @description The OIDC subject a Run in the old Environment presents
+             *     (`*` for the repository and the ref).
+             */
+            old_oidc_subject: string;
+            /** @description Policies that apply to the old Environment and not to the new one. */
+            policies: components["schemas"]["DuplicatePolicyDto"][];
+            /**
+             * @description Projects whose Runs deployed into the old Environment (from Run
+             *     history): their Pipeline YAML names it, and deploys into the new one
+             *     only once it is changed.
+             */
+            projects_with_runs: string[];
+        };
+        /**
+         * @description `POST /v1/orgs/{org}/environments/{env}/duplicate`: the new
+         *     Environment's name and, optionally, its display name.
+         */
+        DuplicateOrgEnvironmentRequest: {
+            /**
+             * @description Omitted, empty or blank: what the old Environment shows, plus
+             *     " (copy)".
+             */
+            display_name?: string | null;
+            /**
+             * @description The new Environment's name: the key its pipelines will name. The
+             *     name rule of a created Environment applies.
+             */
+            name: string;
+        };
+        /**
+         * @description The answer to a duplicate: the new Environment, what was copied and the
+         *     checklist of what was not.
+         */
+        DuplicateOrgEnvironmentResponse: {
+            copied: components["schemas"]["DuplicateCopiedDto"];
+            environment: components["schemas"]["OrgEnvironmentDto"];
+            not_copied: components["schemas"]["DuplicateNotCopiedDto"];
+        };
+        /**
+         * @description A Policy a duplicate did not change: its `match.environments` selects
+         *     the old Environment and none of its patterns selects the new one.
+         */
+        DuplicatePolicyDto: {
+            /** @description Its `match.environments`. */
+            environments: string[];
+            id: string;
+            name: string;
+            /** @description The Project it is attached to; `null` for an org Policy. */
+            project?: string | null;
+        };
+        /** @description One Project's secrets the duplicate copied, by key. Never a value. */
+        DuplicatedSecretsDto: {
+            keys: string[];
+            project: string;
+        };
         /**
          * @description The rules admission enforces for one Project in one Environment: the
          *     baseline merged with the Project's overlay (ADR-0071 §3), computed by the
@@ -3459,11 +3566,14 @@ export interface components {
              */
             created_at: number;
             description: string;
+            /** @description What people see in place of the name; `null` shows the name. */
+            display_name?: string | null;
             /**
              * @description Which Projects may deploy here. Read-only here: written through
              *     `…/eligibility`.
              */
             eligibility: components["schemas"]["EnvironmentEligibilityDto"];
+            /** @description The key pipeline YAML and the OIDC subject use. Fixed once created. */
             name: string;
             org: string;
             /**
@@ -4094,6 +4204,8 @@ export interface components {
         ProjectEnvironmentDto: {
             /** @description The Environment's baseline, set by an org admin. */
             baseline: components["schemas"]["EnvironmentProtectionRulesDto"];
+            /** @description What people see in place of the name; `null` shows the name. */
+            display_name?: string | null;
             /** @description What admission enforces: the baseline merged with the overlay. */
             effective: components["schemas"]["EffectiveProtectionDto"];
             /**
@@ -4163,6 +4275,12 @@ export interface components {
         PutOrgEnvironmentRequest: {
             /** @description Free text; omitted = empty. */
             description?: string | null;
+            /**
+             * @description What people see in place of the name. Omitted, empty or blank shows
+             *     the name. Changing it never needs a step-up: the name, which pipelines
+             *     and cloud trust policies refer to, stays.
+             */
+            display_name?: string | null;
         };
         /**
          * @description `PUT /v1/orgs/{org}/plugins/{name}/connections/{slot}`: bind the slot's
@@ -6725,7 +6843,7 @@ export interface operations {
                     "application/json": components["schemas"]["OrgEnvironmentDto"];
                 };
             };
-            /** @description invalid name or description, or an unknown field */
+            /** @description invalid name, display name or description, or an unknown field */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -6786,6 +6904,71 @@ export interface operations {
                 content?: never;
             };
             /** @description project overlays or grants still pin the Environment */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    duplicate_org_environment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description the environment to copy */
+                env: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DuplicateOrgEnvironmentRequest"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DuplicateOrgEnvironmentResponse"];
+                };
+            };
+            /** @description invalid name or display name, or an unknown field */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an org admin, or no step-up — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
+            /** @description no such Environment, or not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description the new name is taken, or secrets already exist under it */
             409: {
                 headers: {
                     [name: string]: unknown;

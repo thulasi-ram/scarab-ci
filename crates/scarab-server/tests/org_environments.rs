@@ -92,6 +92,8 @@ async fn create_read_replace_and_delete_round_trip() {
         json!({
             "org": "acme",
             "name": "prod",
+            // No display name was sent: the name shows.
+            "display_name": null,
             "description": "the one prod",
             // ADR-0071 §1-2: a new Environment starts with the permissive
             // baseline and eligibility CLOSED — an empty list admits no

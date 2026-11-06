@@ -195,6 +195,15 @@ record. Read Breaking changes before you upgrade.
 
 ### Features
 
+- **Environment display name and Duplicate.** An Environment's name stays fixed: pipelines and
+  the OIDC subject (`…/env/<name>/…`) use it. It now has an optional display name, which lists,
+  headings and pickers show with the name beside it; changing it needs no step-up. **Duplicate**
+  (`POST /v1/orgs/{org}/environments/{env}/duplicate`, step-up every time) creates a new
+  Environment with the old one's baseline, eligibility, every project's overlay and privilege
+  grant, and its secrets with their values, and lists what it did not copy: the projects whose
+  Runs used it, the policies that name it, and the OIDC subject cloud trust policies match. The
+  old Environment is not changed. Migration 0079 adds the display name column (git-bug d002a0c).
+  [Environments](https://thulasi-ram.github.io/scarab-ci/usage/environments/#duplicate-an-environment)
 - **Runs after another pipeline.** `on: upstream: { pipeline: ci }` starts a Run when a Run
   of `ci` in the same repository finishes (`status:` takes `succeeded`, the default, and
   `failed`). The follow-up builds the same commit and runs on the same ref, so an

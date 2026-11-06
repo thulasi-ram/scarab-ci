@@ -171,6 +171,7 @@ impl World {
         pg.put_org_environment(&OrgEnvironment {
             org: ORG.into(),
             name: ENV.into(),
+            display_name: None,
             description: String::new(),
             protection: Default::default(),
             eligibility: EnvironmentProjectEligibility::AllProjects,

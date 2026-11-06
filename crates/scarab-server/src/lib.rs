@@ -10116,7 +10116,7 @@ fn secret_scope(
     }
 }
 
-fn secret_err(e: scarab_secrets::SecretError) -> ApiError {
+pub(crate) fn secret_err(e: scarab_secrets::SecretError) -> ApiError {
     use scarab_secrets::SecretError;
     match e {
         SecretError::NotFound => ApiError::NotFound,
@@ -12647,6 +12647,7 @@ impl utoipa::Modify for StepUpResponses {
         org_environments::get_org_environment,
         org_environments::put_org_environment,
         org_environments::delete_org_environment,
+        org_environments::duplicate_org_environment,
         org_environments::get_environment_eligibility,
         org_environments::put_environment_eligibility,
         org_environments::get_environment_protection,
@@ -12831,6 +12832,12 @@ impl utoipa::Modify for StepUpResponses {
         TokenSort,
         org_environments::OrgEnvironmentDto,
         org_environments::PutOrgEnvironmentRequest,
+        org_environments::DuplicateOrgEnvironmentRequest,
+        org_environments::DuplicateOrgEnvironmentResponse,
+        org_environments::DuplicateCopiedDto,
+        org_environments::DuplicatedSecretsDto,
+        org_environments::DuplicateNotCopiedDto,
+        org_environments::DuplicatePolicyDto,
         org_environments::EnvironmentEligibilityDto,
         org_environments::ProjectEnvironmentDto,
         org_environments::EnvironmentProtectionRulesDto,

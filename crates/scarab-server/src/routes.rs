@@ -326,6 +326,11 @@ pub(crate) fn governed_routes() -> Routes {
             &ops::ENVIRONMENT_DELETE,
             oe::delete_org_environment,
         )
+        .post(
+            "/v1/orgs/{org}/environments/{env}/duplicate",
+            &ops::ENVIRONMENT_DUPLICATE,
+            oe::duplicate_org_environment,
+        )
         .put(
             "/v1/orgs/{org}/environments/{env}/eligibility",
             &ops::ELIGIBILITY_PUT,

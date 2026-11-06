@@ -488,6 +488,9 @@ impl PolicyStore for FailingPolicies {
     async fn list(&self, _: &PolicyScope) -> Result<Vec<StoredPolicy>, PolicyStoreError> {
         unreachable!()
     }
+    async fn list_in_org(&self, _: &str) -> Result<Vec<StoredPolicy>, PolicyStoreError> {
+        unreachable!()
+    }
     async fn versions(&self, _: &str) -> Result<Vec<PolicyVersion>, PolicyStoreError> {
         unreachable!()
     }

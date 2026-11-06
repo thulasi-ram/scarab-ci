@@ -19,6 +19,12 @@ use crate::{EnvironmentProjectEligibility, EnvironmentProtectionRules};
 /// The longest OrgEnvironment description, in characters.
 pub const MAX_ORG_ENVIRONMENT_DESCRIPTION_CHARS: usize = 1000;
 
+/// The longest OrgEnvironment display name, in characters.
+pub const MAX_ORG_ENVIRONMENT_DISPLAY_NAME_CHARS: usize = 200;
+
+/// What a duplicate's display name ends with when the caller gives none.
+pub const DUPLICATE_DISPLAY_NAME_SUFFIX: &str = " (copy)";
+
 /// The longest PluginInstallation name: a DNS-1123 label (ADR-0072 names an
 /// installation the way Kubernetes names a label).
 pub const MAX_INSTALLATION_NAME_CHARS: usize = 63;
@@ -34,6 +40,11 @@ pub struct OrgEnvironment {
     /// The Environment's name, the key per-Project Environments share
     /// (exact, case-sensitive).
     pub name: String,
+    /// What people see in headings, lists and pickers in place of the name
+    /// (git-bug d002a0c). `None` shows the name. Editable, unlike the name,
+    /// which pipeline YAML and the OIDC subject (`…/env/<name>/…`) refer to
+    /// from outside Scarab.
+    pub display_name: Option<String>,
     /// Free text for people; never interpreted.
     pub description: String,
     /// The baseline protection rules every eligible Project's Deploy Runs
@@ -56,9 +67,13 @@ pub struct OrgEnvironment {
 
 impl OrgEnvironment {
     /// Check everything the type does not already guarantee: the name rule,
-    /// the description length and the eligibility patterns.
+    /// the display name rule, the description length and the eligibility
+    /// patterns.
     pub fn validate(&self) -> Result<(), OrgEnvironmentError> {
         validate_org_environment_name(&self.name)?;
+        if let Some(display_name) = &self.display_name {
+            validate_org_environment_display_name(display_name)?;
+        }
         if self.description.chars().count() > MAX_ORG_ENVIRONMENT_DESCRIPTION_CHARS {
             return Err(OrgEnvironmentError::Invalid(format!(
                 "description is longer than {MAX_ORG_ENVIRONMENT_DESCRIPTION_CHARS} characters"
@@ -66,6 +81,50 @@ impl OrgEnvironment {
         }
         self.eligibility.validate()
     }
+
+    /// What people see: the display name, or the name when there is none.
+    pub fn shown_name(&self) -> &str {
+        self.display_name.as_deref().unwrap_or(&self.name)
+    }
+}
+
+/// A display name as a caller sent it, normalised: trimmed, and an empty one
+/// read as none (show the name).
+pub fn normalize_display_name(display_name: Option<&str>) -> Option<String> {
+    display_name
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .map(str::to_string)
+}
+
+/// The display name rule: not empty or blank (none is `None`), no control
+/// characters, at most [`MAX_ORG_ENVIRONMENT_DISPLAY_NAME_CHARS`].
+pub fn validate_org_environment_display_name(
+    display_name: &str,
+) -> Result<(), OrgEnvironmentError> {
+    let invalid = |m: String| Err(OrgEnvironmentError::Invalid(m));
+    if display_name.trim().is_empty() {
+        return invalid("display name must not be blank; leave it out to show the name".into());
+    }
+    if display_name.chars().any(char::is_control) {
+        return invalid("display name must not contain control characters".into());
+    }
+    if display_name.chars().count() > MAX_ORG_ENVIRONMENT_DISPLAY_NAME_CHARS {
+        return invalid(format!(
+            "display name is longer than {MAX_ORG_ENVIRONMENT_DISPLAY_NAME_CHARS} characters"
+        ));
+    }
+    Ok(())
+}
+
+/// The display name a duplicate of `source` gets when the caller names
+/// none: what `source` shows, plus [`DUPLICATE_DISPLAY_NAME_SUFFIX`], cut so
+/// the whole stays within [`MAX_ORG_ENVIRONMENT_DISPLAY_NAME_CHARS`].
+pub fn duplicate_display_name(source: &OrgEnvironment) -> String {
+    let room =
+        MAX_ORG_ENVIRONMENT_DISPLAY_NAME_CHARS - DUPLICATE_DISPLAY_NAME_SUFFIX.chars().count();
+    let shown: String = source.shown_name().chars().take(room).collect();
+    format!("{shown}{DUPLICATE_DISPLAY_NAME_SUFFIX}")
 }
 
 /// The OrgEnvironment name rule: non-empty, no control characters, and not
@@ -125,13 +184,19 @@ impl OrgEnvironmentError {
     pub fn changed_concurrently() -> Self {
         Self::Conflict("changed concurrently; reload and retry".into())
     }
+
+    /// The [`Conflict`](Self::Conflict) a duplicate answers when its new
+    /// name is taken.
+    pub fn already_exists(org: &str, name: &str) -> Self {
+        Self::Conflict(format!("org `{org}` already has an environment `{name}`"))
+    }
 }
 
 /// Durable store for OrgEnvironments, keyed by `(org, name)`.
 #[async_trait]
 pub trait OrgEnvironmentStore: Send + Sync {
-    /// Create `env`, or replace the one with its `(org, name)` — its
-    /// description. On a replace the stored `created_at` is kept and
+    /// Create `env`, or replace the one with its `(org, name)` — its display
+    /// name and description. On a replace the stored `created_at` is kept and
     /// `env.created_at` ignored. `env.protection` and `env.eligibility` are
     /// **ignored** too: a new Environment starts permissive and with no
     /// eligible Project, a replace keeps what is stored, and the returned
@@ -175,6 +240,7 @@ mod tests {
         OrgEnvironment {
             org: "acme".into(),
             name: name.into(),
+            display_name: None,
             description: String::new(),
             protection: EnvironmentProtectionRules::default(),
             eligibility: EnvironmentProjectEligibility::default(),
@@ -213,6 +279,44 @@ mod tests {
                 "{name:?}"
             );
         }
+    }
+
+    #[test]
+    fn display_name_rule_and_normalisation() {
+        let mut e = env("prod");
+        e.display_name = Some("Production (EU)".into());
+        assert_eq!(e.validate(), Ok(()));
+        assert_eq!(e.shown_name(), "Production (EU)");
+        for bad in [
+            "",
+            "   ",
+            "Prod\n",
+            &"d".repeat(MAX_ORG_ENVIRONMENT_DISPLAY_NAME_CHARS + 1),
+        ] {
+            e.display_name = Some(bad.to_string());
+            assert!(
+                matches!(e.validate(), Err(OrgEnvironmentError::Invalid(_))),
+                "{bad:?}"
+            );
+        }
+        e.display_name = None;
+        assert_eq!(e.shown_name(), "prod");
+        assert_eq!(normalize_display_name(Some("  ")), None);
+        assert_eq!(normalize_display_name(Some(" EU ")), Some("EU".into()));
+        assert_eq!(normalize_display_name(None), None);
+    }
+
+    #[test]
+    fn a_duplicate_is_named_after_what_its_source_shows() {
+        let mut e = env("prod");
+        assert_eq!(duplicate_display_name(&e), "prod (copy)");
+        e.display_name = Some("Production".into());
+        assert_eq!(duplicate_display_name(&e), "Production (copy)");
+        e.display_name = Some("p".repeat(MAX_ORG_ENVIRONMENT_DISPLAY_NAME_CHARS));
+        let long = duplicate_display_name(&e);
+        assert_eq!(long.chars().count(), MAX_ORG_ENVIRONMENT_DISPLAY_NAME_CHARS);
+        assert!(long.ends_with(" (copy)"));
+        assert_eq!(validate_org_environment_display_name(&long), Ok(()));
     }
 
     #[test]
