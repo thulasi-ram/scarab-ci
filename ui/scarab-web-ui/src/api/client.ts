@@ -675,6 +675,22 @@ export async function deleteOrgEnvironment(org: string, env: string): Promise<vo
   }
 }
 
+/** A duplicate's answer: the new Environment, what was copied, and what was
+ *  not (the checklist). */
+export type DuplicateEnvironmentResult = components["schemas"]["DuplicateOrgEnvironmentResponse"];
+export type DuplicateEnvironmentRequest = components["schemas"]["DuplicateOrgEnvironmentRequest"];
+
+/** Copy an Environment under a new name (`POST …/environments/{env}/duplicate`),
+ *  org admins only, after a step-up. The old one is not changed. */
+export async function duplicateOrgEnvironment(
+  org: string,
+  env: string,
+  body: DuplicateEnvironmentRequest,
+): Promise<DuplicateEnvironmentResult> {
+  const res = await send(`${envPath(org, env)}/duplicate`, "POST", body);
+  return (await res.json()) as DuplicateEnvironmentResult;
+}
+
 /** The baseline PUT body. */
 export type PutProtectionRequest = components["schemas"]["PutEnvironmentProtectionRequest"];
 /** Which Projects may deploy into an Environment. */

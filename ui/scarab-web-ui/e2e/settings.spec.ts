@@ -62,7 +62,9 @@ test("an org the caller does not administer shows no org sections", async ({ pag
 test("an environment opens read-only and its Edit button opens the edit screen", async ({ page }) => {
   const errors = collectErrors(page);
   await page.goto("/orgs/acme/settings/environments");
-  await page.getByRole("link", { name: "production", exact: true }).click();
+  // The list shows the display name, with the name pipelines use beside it.
+  await expect(page.locator(".oenv-name", { hasText: "production" })).toBeVisible();
+  await page.getByRole("link", { name: "Production", exact: true }).click();
   await expect(page).toHaveURL(/\/orgs\/acme\/settings\/environments\/production$/);
 
   // The view: the record, and no way to change it from here.
@@ -80,7 +82,8 @@ test("an environment opens read-only and its Edit button opens the edit screen",
     "page",
   );
   await expect(nav.locator('[aria-current="page"]')).toHaveCount(1);
-  await expect(page.getByRole("heading", { level: 1 })).toHaveText(/Environments\s*production/);
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText(/Environments\s*Production$/);
+  await expect(page.locator(".page-sub")).toContainText("production");
 
   await view.getByRole("link", { name: "Edit", exact: true }).click();
   await expect(page).toHaveURL(/\/orgs\/acme\/settings\/environments\/production\/edit$/);
@@ -92,11 +95,12 @@ test("an environment opens read-only and its Edit button opens the edit screen",
     "page",
   );
   await expect(nav.locator('[aria-current="page"]')).toHaveCount(1);
-  await expect(page.getByRole("heading", { level: 1 })).toHaveText(/Environments\s*production\s*Edit/);
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText(/Environments\s*Production\s*Edit/);
   const edit = page.locator("section.page");
   await expect(edit.getByRole("textbox", { name: "description", exact: true })).toHaveValue(
     "customer-facing, eu-west-1 + us-east-1",
   );
+  await expect(edit.getByRole("textbox", { name: "Display name", exact: true })).toHaveValue("Production");
   await expect(edit.getByRole("textbox", { name: "Approvers", exact: true })).toHaveValue("ops-lead");
   await expect(edit.getByRole("checkbox", { name: /every project in acme/i })).toBeChecked();
   // Nothing changed yet, so there is nothing to save.
@@ -120,6 +124,38 @@ test("an environment opens read-only and its Edit button opens the edit screen",
   // Cancel goes back to the view without saving.
   await edit.getByRole("link", { name: "Cancel" }).click();
   await expect(page).toHaveURL(/\/orgs\/acme\/settings\/environments\/production$/);
+  expect(errors).toEqual([]);
+});
+
+test("duplicating an environment shows what was copied and what is left to do", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/orgs/acme/settings/environments/production");
+  await page.getByRole("button", { name: "Duplicate" }).click();
+  const dialog = page.getByRole("dialog");
+  const go = dialog.getByRole("button", { name: "Duplicate", exact: true });
+  const name = dialog.getByRole("textbox", { name: "New name" });
+  // A taken name cannot be sent.
+  await name.fill("qa");
+  await expect(dialog.getByText(/qa is already registered/)).toBeVisible();
+  await expect(go).toBeDisabled();
+  await name.fill("production-eu");
+  await expect(dialog.getByRole("textbox", { name: "Display name" })).toHaveAttribute(
+    "placeholder",
+    "Production (copy)",
+  );
+  await go.click();
+
+  // The result: the new environment, what was copied, then the checklist.
+  await expect(dialog.getByRole("heading", { name: "Created Production (copy) · production-eu" })).toBeVisible();
+  await expect(dialog.getByText("2 secrets with their values (scarab)")).toBeVisible();
+  await expect(dialog.getByText("Change the pipelines.")).toBeVisible();
+  await expect(dialog.getByText("Review the policies.")).toBeVisible();
+  await expect(dialog.getByText("Update cloud trust policies.")).toBeVisible();
+  await expect(dialog.getByText("scarab:org/acme/repo/*/env/production-eu/ref/*", { exact: false })).toBeVisible();
+
+  await dialog.getByRole("button", { name: "Open Production (copy)" }).click();
+  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/environments\/production-eu$/);
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText(/Environments\s*Production \(copy\)$/);
   expect(errors).toEqual([]);
 });
 

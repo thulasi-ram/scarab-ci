@@ -576,12 +576,14 @@ const gatesEventsBody = [
 ].join("");
 
 // ── Org-level Environments (ADR-0071) — Settings › Environments. production
-// has a baseline; qa still has the permissive one. Writes echo back and
-// persist nothing.
+// has a baseline and a display name; qa still has the permissive one and shows
+// its name. Writes echo back and persist nothing, except a duplicate, which is
+// kept for the page load.
 const orgEnvironments: OrgEnvironmentDto[] = [
   {
     org: "acme",
     name: "production",
+    display_name: "Production",
     description: "customer-facing, eu-west-1 + us-east-1",
     protection: {
       approvers: ["ops-lead"],
@@ -597,6 +599,7 @@ const orgEnvironments: OrgEnvironmentDto[] = [
   {
     org: "acme",
     name: "qa",
+    display_name: null,
     description: "",
     // Still the permissive baseline the migration gave it — the report flags it.
     protection: {
@@ -667,6 +670,7 @@ function projectEnvironments(project: string): ProjectEnvironmentDto[] {
       const overlay = overlays[env.name]?.[project];
       return {
         name: env.name,
+        display_name: env.display_name ?? null,
         eligible: eligible(env, project),
         baseline: env.protection,
         overlay: overlay ?? null,
@@ -1483,17 +1487,64 @@ function route(pathname: string, search: string, method: string, body = ""): Res
 
   // Org-level Environments (ADR-0071): list, one, and echoing writes.
   if (/^\/v1\/orgs\/[^/]+\/environments$/.test(p)) return json(orgEnvironments);
+  // Duplicate: the copy is kept for this page load, so "Open" lands on it.
+  if ((m = p.match(/^\/v1\/orgs\/([^/]+)\/environments\/([^/]+)\/duplicate$/)) && method === "POST") {
+    const old = decodeURIComponent(m[2]!);
+    const source = orgEnvironments.find((e) => e.name === old);
+    if (!source) return new Response("not found", { status: 404 });
+    const req = JSON.parse(body || "{}") as { name?: string; display_name?: string };
+    const name = req.name ?? "";
+    if (orgEnvironments.some((e) => e.name === name)) {
+      return new Response(`org \`acme\` already has an environment \`${name}\``, { status: 409 });
+    }
+    const copy: OrgEnvironmentDto = {
+      ...source,
+      name,
+      display_name: req.display_name?.trim() || `${source.display_name || source.name} (copy)`,
+      created_at: now,
+      updated_at: now,
+      updated_by: "a.kim",
+    };
+    orgEnvironments.push(copy);
+    overlays[name] = { ...(overlays[old] ?? {}) };
+    grants[name] = { ...(grants[old] ?? {}) };
+    return json(
+      {
+        environment: copy,
+        copied: {
+          overlays: Object.keys(overlays[old] ?? {}).sort(),
+          privilege_grants: Object.keys(grants[old] ?? {}).sort(),
+          secrets: [{ project: "scarab", keys: ["DATABASE_URL", "DEPLOY_TOKEN"] }],
+        },
+        not_copied: {
+          policies: [
+            { id: "pol-1", name: "no-friday-deploys", project: null, environments: [old] },
+          ],
+          projects_with_runs: ["scarab", "web-app"],
+          old_oidc_subject: `scarab:org/acme/repo/*/env/${old}/ref/*`,
+          new_oidc_subject: `scarab:org/acme/repo/*/env/${name}/ref/*`,
+          notes: [
+            `Run and approval history and the Cache stay with ${old}, which is not changed and stays until an admin deletes it.`,
+          ],
+        },
+      },
+      { status: 201 },
+    );
+  }
   if ((m = p.match(/^\/v1\/orgs\/([^/]+)\/environments\/([^/]+)$/))) {
     const name = decodeURIComponent(m[2]!);
     const found = orgEnvironments.find((e) => e.name === name);
     if (method === "DELETE") return new Response(null, { status: found ? 204 : 404 });
     if (method === "PUT") {
-      // The body is not visible here; echo the stored record (or a fresh one).
+      // Echo the stored record (or a fresh one) with the body's display name
+      // and description; nothing is stored.
+      const req = JSON.parse(body || "{}") as { display_name?: string | null; description?: string };
+      const written = { display_name: req.display_name ?? null, description: req.description ?? "" };
       return json(
-        found ?? {
+        found ? { ...found, ...written } : {
           org: decodeURIComponent(m[1]!),
           name,
-          description: "",
+          ...written,
           // A new Environment: permissive baseline, no eligible project.
           protection: {
             approvers: [],

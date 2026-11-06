@@ -9,7 +9,10 @@
 // deleting the Environment each ask for the exact name to be typed.
 //
 // The name cannot be changed: it is the key every pipeline's `environment:`
-// uses, and the server has no rename.
+// and the OIDC subject (`…/env/<name>/…`) use. The display name can: headings
+// show it, with the name beside it in mono. To move to another name, Duplicate
+// (on the view) copies the Environment, its rules, eligibility, overlays,
+// grants and secrets under the new name, and lists what it did not copy.
 //
 // Both render inside the settings frame, with Environments marked in the
 // sidebar, and each has its own URL to send as a link. The frame shows them
@@ -20,12 +23,15 @@ import { A, useNavigate, useParams } from "@solidjs/router";
 import {
   deleteOrgEnvironment,
   deletePrivilegeGrant,
+  duplicateOrgEnvironment,
   getOrgEnvironment,
   listEnvironmentProjects,
+  listOrgEnvironments,
   putEnvironmentEligibility,
   putEnvironmentProtection,
   putOrgEnvironment,
   putPrivilegeGrant,
+  type DuplicateEnvironmentResult,
   type OrgEnvironment,
 } from "../api/client";
 import {
@@ -37,11 +43,18 @@ import {
   type RulesForm,
 } from "../environment-overlays";
 import {
+  copiedSummary,
+  displayNameError,
+  duplicateChecklist,
   environmentEditHref,
   environmentHref,
+  environmentLabel,
   environmentsHref,
+  nameBeside,
   planSave,
   runSave,
+  shownName,
+  toDuplicateBody,
   toEditForm,
 } from "../org-environments";
 import { addToList } from "../identities";
@@ -52,6 +65,7 @@ import PrincipalSearch from "../components/PrincipalSearch";
 import FormSection from "../components/FormSection";
 import Icon from "../components/Icon";
 import ConfirmDestructive from "../components/ConfirmDestructive";
+import Modal, { ModalMessage } from "../components/Modal";
 import { Checkbox, Field, Input } from "../components/Field";
 
 /**
@@ -82,22 +96,40 @@ function useEnvironment(org: string, name: string) {
   return [env, refetch] as const;
 }
 
-/** The trail both pages share, at the top of the settings main column. */
-function Head(props: { org: string; name: string; edit?: boolean }) {
+/** The trail both pages share, at the top of the settings main column. It
+ *  shows the display name once the Environment has loaded, and the name
+ *  pipelines use beside the org below it. */
+function Head(props: { org: string; name: string; env?: OrgEnvironment | null; edit?: boolean }) {
+  const record = () => ({ name: props.name, display_name: props.env?.display_name });
+  const here = (): Crumb => ({
+    label: shownName(record()),
+    mono: nameBeside(record()) === null,
+  });
   const trail = (): Crumb[] =>
     props.edit
       ? [
           { label: "Environments", href: environmentsHref(props.org) },
-          { label: props.name, href: environmentHref(props.org, props.name), mono: true },
+          { ...here(), href: environmentHref(props.org, props.name) },
           { label: "Edit" },
         ]
-      : [{ label: "Environments", href: environmentsHref(props.org) }, { label: props.name, mono: true }];
+      : [{ label: "Environments", href: environmentsHref(props.org) }, here()];
   return (
     <SettingsCrumbs
       trail={trail()}
       sub={
         <>
-          <span class="mono">{props.org}</span> · {props.edit ? "edit an environment" : "where deploys land"}
+          <span class="mono">{props.org}</span>
+          <Show when={nameBeside(record())}>
+            {(name) => (
+              <>
+                {" · "}
+                <span class="mono" title="The name pipelines use">
+                  {name()}
+                </span>
+              </>
+            )}
+          </Show>{" "}
+          · {props.edit ? "edit an environment" : "where deploys land"}
         </>
       }
     />
@@ -145,9 +177,10 @@ export function EnvironmentView() {
 
 function View(props: { org: string; name: string }) {
   const [env] = useEnvironment(props.org, props.name);
+  const [duplicating, setDuplicating] = createSignal(false);
   return (
     <>
-      <Head org={props.org} name={props.name} />
+      <Head org={props.org} name={props.name} env={env()} />
       <Guard org={props.org} name={props.name} env={env()} loading={env.loading} error={env.error}>
         {(e) => (
           <>
@@ -155,7 +188,13 @@ function View(props: { org: string; name: string }) {
               <A href={environmentEditHref(props.org, e.name)} class="btn btn-primary btn-sm">
                 Edit
               </A>
+              <button class="btn btn-ghost btn-sm" onClick={() => setDuplicating(true)}>
+                <Icon icon="copy" size={14} /> Duplicate
+              </button>
             </div>
+            <Show when={duplicating()}>
+              <DuplicateDialog org={props.org} env={e} onClose={() => setDuplicating(false)} />
+            </Show>
             <Details env={e} />
             <ProjectsPanel org={props.org} env={e.name} />
           </>
@@ -181,6 +220,8 @@ function Details(props: { env: OrgEnvironment }) {
       <dl class="lib-facts">
         <dt>name</dt>
         <dd class="m">{props.env.name}</dd>
+        <dt>display name</dt>
+        <dd>{props.env.display_name || <span class="subtle">none: the name shows</span>}</dd>
         <dt>description</dt>
         <dd>{props.env.description || <span class="subtle">none</span>}</dd>
         <dt>approvers</dt>
@@ -283,7 +324,7 @@ function Edit(props: { org: string; name: string }) {
   const [env] = useEnvironment(props.org, props.name);
   return (
     <>
-      <Head org={props.org} name={props.name} edit />
+      <Head org={props.org} name={props.name} env={env()} edit />
       <Guard org={props.org} name={props.name} env={env()} loading={env.loading} error={env.error}>
         {(e) => <EditForm org={props.org} env={e} />}
       </Guard>
@@ -294,6 +335,7 @@ function Edit(props: { org: string; name: string }) {
 function EditForm(props: { org: string; env: OrgEnvironment }) {
   const nav = useNavigate();
   const initial = toEditForm(props.env);
+  const [displayName, setDisplayName] = createSignal(initial.displayName);
   const [description, setDescription] = createSignal(initial.description);
   const [baseline, setBaseline] = createSignal<RulesForm>(initial.baseline);
   const [allProjects, setAllProjects] = createSignal(initial.allProjects);
@@ -305,6 +347,7 @@ function EditForm(props: { org: string; env: OrgEnvironment }) {
 
   const plan = () =>
     planSave(props.env, {
+      displayName: displayName(),
       description: description(),
       baseline: baseline(),
       allProjects: allProjects(),
@@ -319,11 +362,11 @@ function EditForm(props: { org: string; env: OrgEnvironment }) {
     setError(null);
     try {
       const problem = await runSave(writes, {
-        // Re-read first: the description write would recreate an
+        // Re-read first: the details write would recreate an
         // Environment another admin deleted since this page loaded.
         stillThere: async () => (await getOrgEnvironment(props.org, props.env.name)) !== null,
         send: (w) =>
-          w.part === "description"
+          w.part === "details"
             ? putOrgEnvironment(props.org, props.env.name, w.body)
             : w.part === "baseline"
               ? putEnvironmentProtection(props.org, props.env.name, w.body)
@@ -350,11 +393,22 @@ function EditForm(props: { org: string; env: OrgEnvironment }) {
             <Input mono readOnly aria-label="name" value={props.env.name} onValue={() => {}} />
             <p class="f-help">
               The name pipelines put in <span class="mono">environment:</span>. It cannot be
-              changed: to use another name, create that environment and change the pipelines.
+              changed: to use another name, duplicate this environment and change the pipelines.
             </p>
           </FormSection>
 
-          <FormSection n={2} title="Description">
+          <FormSection n={2} title="Display name">
+            <Field
+              id="env-display-name"
+              label="Display name"
+              help="What lists and headings show, with the name beside it. Blank shows the name."
+              error={displayNameError(displayName())}
+            >
+              <Input placeholder={props.env.name} value={displayName()} onValue={setDisplayName} />
+            </Field>
+          </FormSection>
+
+          <FormSection n={3} title="Description">
             <Input
               id="env-description"
               aria-label="description"
@@ -364,7 +418,7 @@ function EditForm(props: { org: string; env: OrgEnvironment }) {
             />
           </FormSection>
 
-          <FormSection n={3} title="Baseline" note="Every project's deploys here obey these rules. A project can add to them for itself, never loosen them.">
+          <FormSection n={4} title="Baseline" note="Every project's deploys here obey these rules. A project can add to them for itself, never loosen them.">
             <Field id="env-approvers" label="Approvers" help="Every one must approve a deploy's gate, in every project. User ids, comma-separated.">
               <Input
                 mono
@@ -412,7 +466,7 @@ function EditForm(props: { org: string; env: OrgEnvironment }) {
             />
           </FormSection>
 
-          <FormSection n={4} title="Who may deploy">
+          <FormSection n={5} title="Who may deploy">
             <Checkbox
               checked={allProjects()}
               onChecked={setAllProjects}
@@ -698,5 +752,141 @@ function DeleteSection(props: { org: string; name: string }) {
         </div>
       </div>
     </div>
+  );
+}
+
+// ── Duplicate ────────────────────────────────────────────────────────────────
+
+/** Copy the Environment under a new name, then show what was copied and the
+ *  checklist of what was not. Asks for a step-up: it copies secrets and who
+ *  may deploy. */
+function DuplicateDialog(props: { org: string; env: OrgEnvironment; onClose: () => void }) {
+  const nav = useNavigate();
+  const [taken] = createResource(
+    () => props.org,
+    (org) => listOrgEnvironments(org).then((es) => (es ?? []).map((e) => e.name)).catch(() => []),
+  );
+  const [name, setName] = createSignal("");
+  const [displayName, setDisplayName] = createSignal("");
+  const [saving, setSaving] = createSignal(false);
+  const [error, setError] = createSignal<string | null>(null);
+  const [result, setResult] = createSignal<DuplicateEnvironmentResult | null>(null);
+  const built = () => toDuplicateBody(name(), displayName(), taken() ?? []);
+  const defaultShown = () => `${shownName(props.env)} (copy)`;
+
+  const save = async () => {
+    const body = built().body;
+    if (!body || saving()) return;
+    setSaving(true);
+    setError(null);
+    try {
+      setResult(await duplicateOrgEnvironment(props.org, props.env.name, body));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not duplicate the environment.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Show
+      when={result()}
+      fallback={
+        <Modal
+          eyebrow={`${props.org} · environments`}
+          title={`Duplicate ${environmentLabel(props.env)}`}
+          purpose="A new environment with this one's baseline, eligibility, project overlays, privilege grants and secrets. This one is not changed."
+          busy={saving()}
+          onClose={props.onClose}
+          after={{
+            label: "after duplicating",
+            value: "Pipelines still deploy into the old name until their environment: is changed.",
+          }}
+          footer={
+            <>
+              <Show when={error()}>
+                <ModalMessage>{error()}</ModalMessage>
+              </Show>
+              <button class="btn btn-ghost" type="button" onClick={props.onClose} disabled={saving()}>
+                Cancel
+              </button>
+              <button class="btn btn-primary" type="button" disabled={!!built().error || saving()} onClick={save}>
+                {saving() ? "Duplicating…" : "Duplicate"}
+              </button>
+            </>
+          }
+        >
+          <Field
+            id="dup-env-name"
+            label="New name"
+            required
+            help="Exactly the name pipelines will use; case matters. It cannot be changed later."
+            error={name() ? (built().error ?? null) : null}
+          >
+            <Input mono autofocus placeholder="prod-eu" value={name()} onValue={setName} />
+          </Field>
+          <Field
+            id="dup-env-display-name"
+            label="Display name"
+            help={`Blank shows "${defaultShown()}".`}
+            error={displayNameError(displayName())}
+          >
+            <Input placeholder={defaultShown()} value={displayName()} onValue={setDisplayName} />
+          </Field>
+        </Modal>
+      }
+    >
+      {(r) => <DuplicateResult org={props.org} old={props.env.name} result={r()} onClose={props.onClose} open={(n) => nav(environmentHref(props.org, n))} />}
+    </Show>
+  );
+}
+
+/** What a duplicate copied, and the checklist of what it did not. */
+function DuplicateResult(props: {
+  org: string;
+  old: string;
+  result: DuplicateEnvironmentResult;
+  onClose: () => void;
+  open: (name: string) => void;
+}) {
+  const created = () => props.result.environment;
+  return (
+    <Modal
+      size="wide"
+      eyebrow={`${props.org} · environments`}
+      title={`Created ${environmentLabel(created())}`}
+      purpose={`A copy of ${props.old}. ${props.old} is not changed.`}
+      onClose={props.onClose}
+      footer={
+        <>
+          <button class="btn btn-ghost" type="button" onClick={props.onClose}>
+            Close
+          </button>
+          <button class="btn btn-primary" type="button" onClick={() => props.open(created().name)}>
+            Open {shownName(created())}
+          </button>
+        </>
+      }
+    >
+      <div class="dup-result">
+        <h3 class="dup-h">Copied</h3>
+        <ul class="dup-list">
+          <For each={copiedSummary(props.result)}>{(line) => <li>{line}</li>}</For>
+        </ul>
+        <h3 class="dup-h">Not copied: to do</h3>
+        <ol class="dup-list dup-todo">
+          <For each={duplicateChecklist(props.old, props.result)}>
+            {(item) => (
+              <li>
+                <b>{item.title}.</b> {item.detail}
+                <Show when={item.items.length > 0}>
+                  <div class="dup-items mono">{item.items.join(", ")}</div>
+                </Show>
+              </li>
+            )}
+          </For>
+        </ol>
+      </div>
+    </Modal>
   );
 }

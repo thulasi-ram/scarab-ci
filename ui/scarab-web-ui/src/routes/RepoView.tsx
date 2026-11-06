@@ -52,6 +52,7 @@ import SecretMatrixEditor from "../components/SecretMatrixEditor";
 import Doodle from "../components/Doodle";
 import AsciiScene from "../components/AsciiScene";
 import { mergeRefused, runEnvironmentOptions, runListFilter } from "../runs-filter";
+import { environmentLabel, nameBeside, shownName } from "../org-environments";
 import { refusalSummary } from "../compile-errors";
 import { fireOutcome, pipelineShortName } from "../schedules";
 import ponderIdle from "../../../brand/ascii/generated/ponder-ponder.json";
@@ -194,13 +195,17 @@ export default function RepoView() {
   // The Project's Environments, for the Environment picker's options — the
   // loaded rows are already one Environment's once the filter is on. A caller
   // who can't read them still gets the Environments seen on runs.
-  const [projectEnvs] = createResource(
+  const [projectEnvRecords] = createResource(
     () => ({ org: org(), repo: repo() }),
-    (k) =>
-      listEnvironments(k.org, k.repo)
-        .then((es) => es.map((e) => e.name))
-        .catch(() => [] as string[]),
+    (k) => listEnvironments(k.org, k.repo).catch(() => [] as ProjectEnvironment[]),
   );
+  const projectEnvs = () => (projectEnvRecords() ?? []).map((e) => e.name);
+  /** The picker's label for an Environment name: its display name with the
+   *  name beside it, or the name alone (an Environment seen only on runs). */
+  const envLabel = (name: string) => {
+    const env = (projectEnvRecords() ?? []).find((e) => e.name === name);
+    return env ? environmentLabel(env) : name;
+  };
 
   /** `undefined` = closed; `""` = open with no Environment picked; a name =
    *  open on that Environment (its overlay prefilled). */
@@ -394,7 +399,7 @@ export default function RepoView() {
               searchPlaceholder="Search environments…"
               value={envFilter()}
               onChange={setEnvFilter}
-              options={environments().map((e) => ({ value: e, label: e }))}
+              options={environments().map((e) => ({ value: e, label: envLabel(e) }))}
             />
           </Show>
 
@@ -727,7 +732,17 @@ function EnvPanel(props: {
   return (
     <div class="panel env-panel">
       <div class="panel-h">
-        <span>{props.env.name}</span>
+        <span>
+          {shownName(props.env)}
+          <Show when={nameBeside(props.env)}>
+            {(name) => (
+              <span class="oenv-name mono" title="The name pipelines use">
+                {" "}
+                {name()}
+              </span>
+            )}
+          </Show>
+        </span>
         <span class="env-h-meta">
           <Show when={!props.env.eligible}>
             <span class="tok-role" title="An org admin withdrew this project's eligibility">
@@ -958,7 +973,7 @@ function EnvDialog(props: {
               <For each={choices()}>
                 {(env) => (
                   <option value={env.name}>
-                    {env.name}
+                    {environmentLabel(env)}
                     {env.overlay ? " (has overlay)" : ""}
                   </option>
                 )}
