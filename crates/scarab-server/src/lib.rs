@@ -1499,6 +1499,18 @@ pub struct StepStatusDto {
     /// its rendered inputs and its typed outputs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plugin_gate: Option<run_origin::PluginGateViewDto>,
+    /// This `manual` gate is an **Environment approval gate** (ADR-0078 §1):
+    /// a Step after it uses the Run's Environment's authority, so releasing
+    /// it needs the Environment's approvers and a step-up. Decided at Run
+    /// creation. A gate the Environment added has an `origin` link of kind
+    /// `environment`. Omitted when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub environment_approval_gate: bool,
+    /// A waiting Environment approval gate whose approvals are in: when the
+    /// Environment's wait timer runs out and the gate releases (Unix ms).
+    /// Absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_release_at: Option<i64>,
 }
 
 /// How a gate's wait resolved: its `GateResolved` journal entry.
@@ -1706,7 +1718,8 @@ impl From<DispatchError> for ApiError {
             | DispatchError::NotEligible { .. }
             | DispatchError::PolicyDenied { .. }
             | DispatchError::LibraryYanked(_)
-            | DispatchError::ForgeToken(_)) => ApiError::Denied(refused.to_string()),
+            | DispatchError::ForgeToken(_)
+            | DispatchError::MissingApprovalGate(_)) => ApiError::Denied(refused.to_string()),
             other => ApiError::BadRequest(other.to_string()),
         }
     }
@@ -2567,6 +2580,8 @@ async fn get_run(
             deploy,
             origin: origin_view.origin,
             plugin_gate: origin_view.plugin_gate,
+            environment_approval_gate: origin_view.environment_approval_gate,
+            approval_release_at: view.approval_release_at,
         });
     }
     Ok(Json(RunStatusResponse {
@@ -4953,7 +4968,8 @@ pub(crate) async fn trigger_runs_from_files(
             // Policies say.
             Admission::Refused(
                 ref refusal @ (AdmissionRefusal::EventField { ref messages }
-                | AdmissionRefusal::ForgeToken { ref messages }),
+                | AdmissionRefusal::ForgeToken { ref messages }
+                | AdmissionRefusal::MissingApprovalGate { ref messages }),
             ) => {
                 let reason = admission_refusal_message(refusal, &repo.owner, &repo.name);
                 tracing::warn!(
@@ -5147,6 +5163,10 @@ enum AdmissionRefusal {
     /// A Step asks for a forge credential it may not have (ADR-0076 §9), a
     /// PolicyInvariant like a yank.
     ForgeToken { messages: Vec<String> },
+    /// Steps use the Environment's authority with no `manual` gate upstream,
+    /// and the Environment, which has approvers, refuses such a Run instead
+    /// of adding a gate (missing-gate mode `refuse`, ADR-0078 §3).
+    MissingApprovalGate { messages: Vec<String> },
 }
 
 /// What admission fixed for a Run besides its governance (ADR-0076 §9),
@@ -5358,6 +5378,7 @@ async fn admit_and_create_run(
             AdmissionRefusal::LibraryYanked { messages } => ("yanked", messages),
             AdmissionRefusal::EventField { messages } => ("event_field", messages),
             AdmissionRefusal::ForgeToken { messages } => ("forge_token", messages),
+            AdmissionRefusal::MissingApprovalGate { messages } => ("approval_gate", messages),
         };
         if !kind.is_empty() {
             let message = admission_refusal_message(refusal, &repo.owner, &repo.name);
@@ -5450,6 +5471,14 @@ async fn admit_unrecorded(
         Ok(gov) => gov,
         Err(refusal) => return Ok(Admission::Refused(refusal)),
     };
+    // ADR-0078 §1-3: the Environment adds its approval gate (or refuses the
+    // Run), and every `manual` gate is marked an Environment approval gate
+    // or not — before anything below reads the Run's Steps, so the Policies
+    // and the stored Run see the gate.
+    let ir = &match environment_approval_ir(ir, &gov, excluded) {
+        Ok(ir) => ir,
+        Err(refusal) => return Ok(Admission::Refused(refusal)),
+    };
 
     // ADR-0076 §6: a yanked library version is a PolicyInvariant, checked
     // before (and whether or not) any Policy is consulted.
@@ -5537,6 +5566,65 @@ async fn admit_unrecorded(
     };
     persist_run_from_ir(db, &run, ir, event, path, &gov, excluded, params, &admitted, now).await?;
     Ok(Admission::Created(run))
+}
+
+/// `ir` as an Environment-governed Run stores it (ADR-0078 §1-3). Where the
+/// Environment has approvers and a Step uses its authority with no `manual`
+/// gate upstream, the Environment adds one gate in front of the earliest
+/// such Steps — or, in missing-gate mode `refuse`, the Run is refused with
+/// the YAML to add. Then every `manual` gate is marked with whether it is an
+/// Environment approval gate. An ungoverned Run is returned as it is.
+fn environment_approval_ir(
+    ir: &scarab_pipeline::PipelineIr,
+    gov: &RunGovernance,
+    excluded: &[String],
+) -> Result<scarab_pipeline::PipelineIr, AdmissionRefusal> {
+    use scarab_policy::approval_gate as ag;
+    let mut ir = ir.clone();
+    let RunGovernance::Governed { environment, .. } = gov else {
+        return Ok(ir);
+    };
+    if let Some(p) = gov.protection().filter(|p| !p.approvers.is_empty()) {
+        let settings = &p.approval_gate;
+        let mut with_gate = ir.clone();
+        if let Some(added) = ag::add_environment_approval_gate(
+            &mut with_gate,
+            environment,
+            settings.added_gate_expiry_s,
+            excluded,
+        ) {
+            if settings.missing_gate == scarab_project::MissingGateMode::Refuse {
+                let gate = with_gate.steps.iter().find(|s| s.id == added.id);
+                let needs = gate.map(|g| g.needs.0.join(", ")).unwrap_or_default();
+                let quote = |ids: &[String]| {
+                    ids.iter()
+                        .map(|i| format!("`{i}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                let missing = ag::steps_missing_approval_gate(&ir, excluded);
+                return Err(AdmissionRefusal::MissingApprovalGate {
+                    messages: vec![format!(
+                        "environment `{environment}` has approvers, and these Steps use its \
+                         authority with no `gate: manual` upstream: {}. It refuses such a Run \
+                         rather than add a gate: add `- {{ id: approve, gate: manual, needs: \
+                         [{needs}] }}` and put `approve` in the `needs` of {}",
+                        quote(&missing),
+                        quote(&added.fronts),
+                    )],
+                });
+            }
+            tracing::info!(
+                environment = %environment,
+                gate = %added.id,
+                fronts = ?added.fronts,
+                "the Environment added its approval gate to the Run"
+            );
+            ir = with_gate;
+        }
+    }
+    ag::mark_environment_approval_gates(&mut ir);
+    Ok(ir)
 }
 
 /// The admission checks a Run passes before its `run.create` Policies are
@@ -5939,6 +6027,10 @@ pub enum DispatchError {
     /// A Step asks for a forge credential it may not have (ADR-0076 §9).
     #[error("{}", forge_token_message(.0))]
     ForgeToken(Vec<String>),
+    /// Steps use the Environment's authority with no `manual` gate upstream,
+    /// and the Environment refuses such a Run (ADR-0078 §3).
+    #[error("{}", .0.join("; "))]
+    MissingApprovalGate(Vec<String>),
     #[error(transparent)]
     Db(DbError),
 }
@@ -5964,6 +6056,7 @@ fn admission_refusal_message(refusal: &AdmissionRefusal, org: &str, project: &st
         AdmissionRefusal::LibraryYanked { messages } => library_yanked_message(messages),
         AdmissionRefusal::EventField { messages } => event_field_message(messages),
         AdmissionRefusal::ForgeToken { messages } => forge_token_message(messages),
+        AdmissionRefusal::MissingApprovalGate { messages } => messages.join("; "),
     }
 }
 
@@ -6222,6 +6315,9 @@ pub async fn dispatch_run(
         AdmissionRefusal::LibraryYanked { messages } => DispatchError::LibraryYanked(messages),
         AdmissionRefusal::EventField { messages } => DispatchError::EventField(messages),
         AdmissionRefusal::ForgeToken { messages } => DispatchError::ForgeToken(messages),
+        AdmissionRefusal::MissingApprovalGate { messages } => {
+            DispatchError::MissingApprovalGate(messages)
+        }
     })
 }
 
@@ -9425,14 +9521,43 @@ fn gate_approvers(events: &[EventKind], step: &StepId) -> Vec<String> {
     scarab_engine::gate_approvers(events, step)
 }
 
+/// Whether `step` of `run` is an Environment approval gate (ADR-0078 §1), as
+/// Run creation marked it in the stored IR. A gate of a Run created before
+/// the mark existed counts as one: before ADR-0078 every `manual` gate of an
+/// Environment-governed Run needed the approvers.
+async fn is_environment_approval_gate(
+    st: &AppState,
+    run: &RunId,
+    step: &StepId,
+) -> Result<bool, ApiError> {
+    let ir = st.db.run_ir(run).await?;
+    let mark = ir
+        .as_ref()
+        .and_then(|ir| ir.get("steps"))
+        .and_then(|s| s.as_array())
+        .and_then(|steps| {
+            steps
+                .iter()
+                .find(|s| s.get("id").and_then(|i| i.as_str()) == Some(step.0.as_str()))
+        })
+        .and_then(|s| s.get("environment_approval_gate"))
+        .and_then(|m| m.as_bool());
+    Ok(mark != Some(false))
+}
+
 /// Approve a `manual` gate (ADR-0008, 0037). The authenticated principal's
-/// approval is recorded on the event log (append-only, idempotent). For a
-/// **deploy** run (one with a target environment), the gate is released only
-/// once the accumulated approvers satisfy the Environment's effective rules for
-/// the run's Project (ADR-0071 §3, `admits`); on release the deployment is
-/// written to the legacy history. If the Environment no longer exists or no
-/// longer admits the Project, the gate does not release (409). A plain gate (no
-/// environment) releases on the first approval. Authz'd as a write.
+/// approval is recorded on the event log (append-only, idempotent).
+///
+/// An **Environment approval gate** (ADR-0078 §1: a Step after it uses the
+/// Run's Environment's authority) releases only once the accumulated
+/// approvals satisfy the Environment's effective rules for the run's Project
+/// (ADR-0071 §3, `admits`) and its wait timer has run out on the gate's wait
+/// clock (§4). Approvals that complete the rules early are kept: the gate is
+/// released by the scheduler when the timer runs out. On release the
+/// deployment is written to the legacy history. Every other `manual` gate is
+/// a plain gate: it releases on the first approval, with no step-up. If the
+/// Environment no longer exists or no longer admits the Project, no gate of
+/// the Run releases (409). Authz'd as a write.
 #[utoipa::path(
     post,
     path = "/v1/runs/{id}/gates/{step}/approve",
@@ -9468,6 +9593,10 @@ async fn approve_gate(
     //    same snapshot then governs the release below, so the approval is
     //    judged and released under one set of rules.
     let ctx = st.db.run_deploy_context(&run).await.map_err(ApiError::Db)?;
+    // ADR-0078 §1: only an Environment approval gate needs the approvers
+    // and a step-up; a plain gate in the same Run releases on the first
+    // approval.
+    let approval_gate = ctx.is_some() && is_environment_approval_gate(&st, &run, &step).await?;
     // The approval stays recorded when the gate is held; it counts if the
     // Environment is restored.
     let governance = gate_release_governance(
@@ -9477,6 +9606,7 @@ async fn approve_gate(
     )
     .await;
     match (&ctx, &governance) {
+        _ if !approval_gate => guard.exempt("not an Environment approval gate"),
         (Some(c), Ok(Some(p))) if !p.approvers.is_empty() => {
             guard
                 .require(
@@ -9559,19 +9689,80 @@ async fn approve_gate(
     let approvers = gate_approvers(&st.db.events(&run).await.map_err(ApiError::Db)?, &step);
     let protection = governance?;
 
-    // 3. A protected deploy releases only when admits() passes over the
-    //    accumulated approvers (every required approver, and the ref still
-    //    allowed); an unprotected/plain gate releases now.
-    let admitted = match (&ctx, &protection) {
-        (Some(c), Some(p)) => p.admits(&c.git_ref, &approvers).is_ok(),
-        _ => true,
+    // 3. An Environment approval gate releases only when admits() passes
+    //    over the accumulated approvers (the required approvals, and the ref
+    //    still allowed), and its wait timer has run out; a plain gate
+    //    releases now.
+    let rules = match (&ctx, &protection) {
+        (Some(c), Some(p)) if approval_gate => Some((c, p)),
+        _ => None,
     };
-    if !admitted {
-        return Ok((
-            StatusCode::ACCEPTED,
-            Json(serde_json::json!({ "released": false, "approvals": approvers })),
-        )
-            .into_response());
+    if let Some((c, p)) = rules {
+        if p.admits(&c.git_ref, &approvers).is_err() {
+            return Ok((
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({ "released": false, "approvals": approvers })),
+            )
+                .into_response());
+        }
+        // ADR-0078 §4: the approvals are in. Record them with the approver
+        // set they met (what each launch behind the gate checks again) and
+        // when the wait timer, counted on the gate's wait clock, runs out.
+        let now = st.clock.now().await.0;
+        let wait_began = st
+            .db
+            .steps_of_run(&run)
+            .await
+            .map_err(ApiError::Db)?
+            .into_iter()
+            .find(|s| s.step == step)
+            .and_then(|s| {
+                s.attempts
+                    .last()
+                    .filter(|a| a.outcome == scarab_engine::AttemptOutcome::Running)
+                    .map(|a| a.started_at.0)
+            })
+            // No open wait yet: count from now, which only waits longer.
+            .unwrap_or(now);
+        let release_at =
+            wait_began.saturating_add(i64::from(p.effective_wait_timer_s()).saturating_mul(1000));
+        let (set, required) = p.approver_set();
+        let recorded = scarab_engine::environment_approval_met(
+            &st.db.events(&run).await.map_err(ApiError::Db)?,
+            &step,
+        );
+        if recorded
+            .as_ref()
+            .map(|r| (&r.approvers, r.required, r.release_at))
+            != Some((&set, required, release_at))
+        {
+            st.db
+                .append_event(&EventKind {
+                    version: EVENT_VERSION,
+                    run: run.clone(),
+                    kind: EventPayload::EnvironmentApprovalMet {
+                        step: step.clone(),
+                        approvers: set,
+                        required,
+                        release_at,
+                    },
+                    at: Timestamp(now),
+                })
+                .await
+                .map_err(ApiError::Db)?;
+        }
+        if now < release_at {
+            // The scheduler releases the gate when the timer runs out.
+            return Ok((
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({
+                    "released": false,
+                    "approvals": approvers,
+                    "releases_at": release_at,
+                })),
+            )
+                .into_response());
+        }
     }
 
     // 4. Finalize the gate and resume the run (exactly-once).
@@ -9606,7 +9797,7 @@ async fn approve_gate(
     //    ADR-0070 §1) — only on a real release (a no-op re-release writes no
     //    duplicate history record). Kept through ADR-0071: it is the record
     //    `GET …/environments/{name}/deployments` still serves.
-    if released {
+    if released && approval_gate {
         if let (Some(c), Some(store)) = (&ctx, st.environments.as_ref()) {
             let now = st.clock.now().await.0;
             store

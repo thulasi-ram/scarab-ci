@@ -863,6 +863,16 @@ pub struct StepSpec {
     /// the gate is reached.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugin_gate: Option<PluginGateSpec>,
+    /// For a `manual` gate of an Environment-governed Run, whether it is an
+    /// **Environment approval gate** (ADR-0078 §1): `Some(true)` when a Step
+    /// after it, through `needs`, uses the Environment's authority. Decided
+    /// once, at Run creation, and stored with the Run, so a rerun never
+    /// decides it again. Written only by Run creation, like
+    /// [`origin`](Self::origin): an authored one is a compile error. `None`
+    /// on every other Step, and on a gate of a Run created before the
+    /// decision existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment_approval_gate: Option<bool>,
 }
 
 /// What a `gate: plugin` node waits on (ADR-0076 §7).
@@ -1058,6 +1068,9 @@ pub enum OriginKind {
     Library,
     /// A plugin's gate (ADR-0076).
     Plugin,
+    /// The Environment approval gate an Environment added to the Run
+    /// (ADR-0078 §2): `name` is the Environment, `content_hash` is empty.
+    Environment,
 }
 
 /// One link of a compiled Step's [`origin`](StepSpec::origin).
@@ -2636,6 +2649,10 @@ fn inline_level(
             ("scope", step.scope.is_some()),
             ("guards", !step.guards.is_empty()),
             ("plugin_gate", step.plugin_gate.is_some()),
+            (
+                "environment_approval_gate",
+                step.environment_approval_gate.is_some(),
+            ),
         ] {
             if set {
                 let place = match stack.last() {

@@ -51,17 +51,23 @@ pub struct SecretInjectingExecutor {
     /// Installed libraries and yanks (ADR-0076 §6). `None` = no launch-time
     /// yank check (a hand-built executor; `main.rs` wires it).
     libraries: Option<Arc<dyn scarab_policy::library::LibraryStore>>,
+    /// What an approval's age is measured to at launch.
+    clock: Arc<dyn scarab_engine::Clock>,
 }
 
-/// Refuse when `run` is a deploy whose Environment is gone or no longer admits
-/// its Project (ADR-0071 §2); `Ok(())` for a run with no deploy context. Shared
-/// by the launch decorators, so each makes the check before it uses a
-/// credential.
+/// Refuse when `step`'s run is a deploy whose Environment is gone or no
+/// longer admits its Project (ADR-0071 §2), or when `step` uses the
+/// Environment's authority and its approval no longer holds
+/// ([`environment_approval_refusal`]); `Ok(())` for a run with no deploy
+/// context. Shared by the launch decorators, so each makes the check before
+/// it uses a credential. `now_ms` is what an approval's age is measured to.
 pub(crate) async fn ensure_deploy_still_admitted(
     db: &dyn Db,
     governance: &dyn scarab_project::EnvironmentGovernanceStore,
-    run: &scarab_engine::RunId,
+    step: &StepRun,
+    now_ms: i64,
 ) -> Result<(), ExecError> {
+    let run = &step.run;
     let Some(ctx) = db
         .run_deploy_context(run)
         .await
@@ -74,7 +80,14 @@ pub(crate) async fn ensure_deploy_still_admitted(
         .await
         .map_err(|e| ExecError::Other(format!("environment governance store: {e}")))?
     {
-        Some(g) if g.eligible => return Ok(()),
+        Some(g) if g.eligible => {
+            match environment_approval_refusal(db, &ctx, &g.effective_protection(), step, now_ms)
+                .await?
+            {
+                None => return Ok(()),
+                Some(refusal) => refusal,
+            }
+        }
         Some(_) => format!(
             "project `{}` is no longer eligible to deploy to environment `{}` in org `{}`; \
              its credentials are not released (ADR-0071)",
@@ -87,6 +100,133 @@ pub(crate) async fn ensure_deploy_still_admitted(
         ),
     };
     Err(ExecError::Refused(refusal))
+}
+
+/// The stored pipeline of `run`, or `None` for a Run that has none (one
+/// seeded by hand). One that does not decode is a refusal: what its Steps
+/// may do cannot be judged.
+async fn stored_pipeline(
+    db: &dyn Db,
+    run: &scarab_engine::RunId,
+) -> Result<Option<scarab_pipeline::PipelineIr>, ExecError> {
+    let Some(ir) = db
+        .run_ir(run)
+        .await
+        .map_err(|e| ExecError::Other(e.to_string()))?
+    else {
+        return Ok(None);
+    };
+    serde_json::from_value(ir).map(Some).map_err(|e| {
+        ExecError::Refused(format!(
+            "the Run's stored pipeline cannot be read ({e}), so whether this step may use its \
+             Environment's authority cannot be checked"
+        ))
+    })
+}
+
+/// Why `step` may not use its Environment's authority now (ADR-0078 §5,
+/// the launch-time re-check of ADR-0075 §3), or `None` when it may. Checked
+/// at every launch, reruns and retries included, of a Step that uses the
+/// Environment's authority in an Environment with approvers:
+///
+/// - an Environment approval gate is upstream of it and released;
+/// - the Run's symbolic ref is still allowed;
+/// - the approver set is the one recorded when the gate's approvals met the
+///   rules (a gate released before that record existed has none to compare);
+/// - the release is no older than the maximum approval age.
+///
+/// External, timer and plugin gates are never approval gates, so a Step
+/// behind only those is refused here whatever released them.
+pub(crate) async fn environment_approval_refusal(
+    db: &dyn Db,
+    ctx: &scarab_engine::DeployContext,
+    protection: &scarab_project::EffectiveProtection,
+    step: &StepRun,
+    now_ms: i64,
+) -> Result<Option<String>, ExecError> {
+    if protection.approvers.is_empty() {
+        return Ok(None);
+    }
+    let Some(ir) = stored_pipeline(db, &step.run).await? else {
+        return Ok(None);
+    };
+    let Some(spec) = ir.steps.iter().find(|s| s.id == step.step.0) else {
+        return Ok(None);
+    };
+    if !scarab_policy::run_create::uses_environment_authority(&ir, spec) {
+        return Ok(None);
+    }
+    let env = &ctx.environment;
+    let id = &step.step.0;
+    let gates = scarab_policy::approval_gate::upstream_approval_gates(&ir, id);
+    if gates.is_empty() {
+        return Ok(Some(format!(
+            "step `{id}` uses environment `{env}`'s authority, and no Environment approval gate \
+             is upstream of it: the Run was created before `{env}` had approvers, or no `gate: \
+             manual` guards the step; start a new Run so `{env}` can add its gate"
+        )));
+    }
+    if !protection.ref_allowed(&ctx.git_ref) {
+        return Ok(Some(format!(
+            "ref `{}` is no longer allowed to deploy to environment `{env}`",
+            ctx.git_ref
+        )));
+    }
+    let events = db
+        .events(&step.run)
+        .await
+        .map_err(|e| ExecError::Other(e.to_string()))?;
+    let max_age_ms = i64::from(protection.approval_gate.max_approval_age_s) * 1000;
+    for gate in gates {
+        let gate_id = scarab_engine::StepId(gate.id.clone());
+        let Some(released) = scarab_engine::gate_released_at(&events, &gate_id) else {
+            return Ok(Some(format!(
+                "Environment approval gate `{}` upstream of step `{id}` has not released",
+                gate.id
+            )));
+        };
+        let age_ms = now_ms.saturating_sub(released.0);
+        if age_ms > max_age_ms {
+            return Ok(Some(format!(
+                "Environment approval gate `{}` released {} s ago, longer than environment \
+                 `{env}`'s maximum approval age of {} s; rerun the gate to ask the approvers \
+                 again",
+                gate.id,
+                age_ms / 1000,
+                protection.approval_gate.max_approval_age_s
+            )));
+        }
+        if let Some(met) = scarab_engine::environment_approval_met(&events, &gate_id) {
+            if (met.approvers, met.required) != protection.approver_set() {
+                return Ok(Some(format!(
+                    "environment `{env}`'s approvers changed since Environment approval gate \
+                     `{}` released; rerun the gate to ask the approvers again",
+                    gate.id
+                )));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Whether `step` has a released Environment approval gate upstream — what
+/// decides, in an Environment with approvers, whether its OIDC subject names
+/// the Environment or `none` (ADR-0075 §3).
+async fn approval_gate_released_upstream(db: &dyn Db, step: &StepRun) -> Result<bool, ExecError> {
+    let Some(ir) = stored_pipeline(db, &step.run).await? else {
+        return Ok(false);
+    };
+    let gates = scarab_policy::approval_gate::upstream_approval_gates(&ir, &step.step.0);
+    if gates.is_empty() {
+        return Ok(false);
+    }
+    let events = db
+        .events(&step.run)
+        .await
+        .map_err(|e| ExecError::Other(e.to_string()))?;
+    Ok(gates.iter().any(|g| {
+        scarab_engine::gate_released_at(&events, &scarab_engine::StepId(g.id.clone())).is_some()
+    }))
 }
 
 /// Per-attempt OIDC token TTL (ADR-0015: short-lived by design — long enough
@@ -109,7 +249,15 @@ impl SecretInjectingExecutor {
             issuer_url: String::new(),
             governance: None,
             libraries: None,
+            clock: Arc::new(crate::SystemClock),
         }
+    }
+
+    /// Measure an approval's age at launch on `clock` (the server's own
+    /// clock; a system clock by default).
+    pub fn with_clock(mut self, clock: Arc<dyn scarab_engine::Clock>) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Refuse, at every launch, a step whose `origin` uses a library version
@@ -158,7 +306,8 @@ impl SecretInjectingExecutor {
     async fn ensure_still_admitted(&self, step: &StepRun) -> Result<(), ExecError> {
         match &self.governance {
             Some(governance) => {
-                ensure_deploy_still_admitted(self.db.as_ref(), governance.as_ref(), &step.run).await
+                let now = self.clock.now().await.0;
+                ensure_deploy_still_admitted(self.db.as_ref(), governance.as_ref(), step, now).await
             }
             None => Ok(()),
         }
@@ -200,7 +349,21 @@ impl SecretInjectingExecutor {
         };
         // The fork-PR downgrade (ADR-0015): a locked-out run's subject says
         // env `none` — no cloud trust policy for a real environment matches.
-        let env = if ctx.locked_out {
+        // So does a Step with no released Environment approval gate upstream
+        // in an Environment with approvers (ADR-0075 §3): it runs before the
+        // approval, and the cloud must not trust it as the Environment.
+        let before_approval = match &self.governance {
+            Some(governance) => {
+                let has_approvers = governance
+                    .deploy_governance(&ctx.org, &ctx.project, &ctx.environment)
+                    .await
+                    .map_err(|e| ExecError::Other(format!("environment governance store: {e}")))?
+                    .is_some_and(|g| !g.effective_protection().approvers.is_empty());
+                has_approvers && !approval_gate_released_upstream(self.db.as_ref(), step).await?
+            }
+            None => false,
+        };
+        let env = if ctx.locked_out || before_approval {
             "none"
         } else {
             &ctx.environment

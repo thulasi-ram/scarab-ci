@@ -19,6 +19,9 @@ use crate::{ApiError, AppState, GateResolutionDto};
 #[derive(Default)]
 pub(crate) struct StepGateView {
     pub gate_resolution: Option<GateResolutionDto>,
+    /// A waiting Environment approval gate whose approvals are in: when its
+    /// wait timer runs out and the scheduler releases it (Unix ms).
+    pub approval_release_at: Option<i64>,
 }
 
 /// A gate step whose wait is open: `Pending`, every need `Succeeded`, and its
@@ -59,7 +62,19 @@ pub(crate) async fn step_gate_views(
     if !steps.iter().any(StepRun::is_gate) {
         return Ok(views);
     }
-    for e in &st.db.events(run).await? {
+    let events = st.db.events(run).await?;
+    for gate in steps
+        .iter()
+        .filter(|s| s.gate_kind.as_deref() == Some("manual") && s.status == StepStatus::Pending)
+    {
+        if let Some(met) = scarab_engine::environment_approval_met(&events, &gate.step) {
+            views
+                .entry(gate.step.0.clone())
+                .or_default()
+                .approval_release_at = Some(met.release_at);
+        }
+    }
+    for e in &events {
         // `deployment` (ADR-0070) is only ever set on events from before
         // ADR-0074; the view does not show it.
         if let EventPayload::GateResolved {

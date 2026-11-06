@@ -1829,13 +1829,17 @@ export interface paths {
         put?: never;
         /**
          * Approve a `manual` gate (ADR-0008, 0037). The authenticated principal's
-         *     approval is recorded on the event log (append-only, idempotent). For a
-         *     **deploy** run (one with a target environment), the gate is released only
-         *     once the accumulated approvers satisfy the Environment's effective rules for
-         *     the run's Project (ADR-0071 §3, `admits`); on release the deployment is
-         *     written to the legacy history. If the Environment no longer exists or no
-         *     longer admits the Project, the gate does not release (409). A plain gate (no
-         *     environment) releases on the first approval. Authz'd as a write.
+         *     approval is recorded on the event log (append-only, idempotent).
+         * @description An **Environment approval gate** (ADR-0078 §1: a Step after it uses the
+         *     Run's Environment's authority) releases only once the accumulated
+         *     approvals satisfy the Environment's effective rules for the run's Project
+         *     (ADR-0071 §3, `admits`) and its wait timer has run out on the gate's wait
+         *     clock (§4). Approvals that complete the rules early are kept: the gate is
+         *     released by the scheduler when the timer runs out. On release the
+         *     deployment is written to the legacy history. Every other `manual` gate is
+         *     a plain gate: it releases on the first approval, with no step-up. If the
+         *     Environment no longer exists or no longer admits the Project, no gate of
+         *     the Run releases (409). Authz'd as a write.
          */
         post: operations["approve_gate"];
         delete?: never;
@@ -2441,6 +2445,34 @@ export interface components {
             use_count: number;
         };
         /**
+         * @description An Environment's settings for its Environment approval gate (ADR-0078
+         *     §3): the `manual` gate that has a Step using the Environment's
+         *     authority after it.
+         */
+        ApprovalGateRulesDto: {
+            /**
+             * Format: int32
+             * @description Seconds before the gate the Environment adds expires; absent = it
+             *     waits until approved or rejected.
+             */
+            added_gate_expiry_s?: number | null;
+            /**
+             * Format: int32
+             * @description Seconds an approval stays good for: a Step that uses the
+             *     Environment's authority is refused at launch once its approval gate
+             *     released longer ago than this. Default 86400 (24 hours).
+             */
+            max_approval_age_s: number;
+            /** @description `add` (default) or `refuse`. */
+            missing_gate_mode: components["schemas"]["MissingGateModeDto"];
+            /**
+             * Format: int32
+             * @description How many of the baseline's approvers must approve; absent = every
+             *     one. A Project overlay's approvers are each required as well.
+             */
+            required_approvals?: number | null;
+        };
+        /**
          * @description One artifact **version** in a run's list (ADR-0052, immutable per attempt
          *     by ADR-0056). `step`/`attempt` are the publishing provenance (empty
          *     strings on pre-ADR-0056 rows); `succeeded` is that attempt's verdict;
@@ -2947,10 +2979,16 @@ export interface components {
              *     `[tags/*]` intersect to `[]`, which would read as "any ref".
              */
             allowed_ref_layers: string[][];
+            /** @description The baseline's approval gate settings. */
+            approval_gate: components["schemas"]["ApprovalGateRulesDto"];
             /** @description Baseline approvers, then the overlay's not already listed — all required. */
             approvers: string[];
             require_reason: boolean;
-            /** Format: int32 */
+            /**
+             * Format: int32
+             * @description The longer of the two layers' wait timers. It does nothing when
+             *     `approvers` is empty.
+             */
             wait_timer_s: number;
         };
         /**
@@ -3042,13 +3080,20 @@ export interface components {
         EnvironmentProtectionRulesDto: {
             /** @description Ref globs a deploy's symbolic ref must match; empty = any ref. */
             allowed_refs: string[];
-            /** @description Principal ids; every one must approve (AND). */
+            approval_gate?: null | components["schemas"]["ApprovalGateRulesDto"];
+            /**
+             * @description Principal ids. Every one must approve (AND), unless the baseline's
+             *     `approval_gate.required_approvals` says how many of its own must.
+             */
             approvers: string[];
             /** @description A human dispatch must carry a reason (ADR-0057 §3). */
             require_reason: boolean;
             /**
              * Format: int32
-             * @description Seconds. Carried and merged, not yet enforced (git-bug 2b94989).
+             * @description Seconds: a minimum wait on the Environment approval gate, counted on
+             *     the gate's wait clock (ADR-0078 §4). It does nothing where the
+             *     effective approvers are empty; a client shows that from `approvers`
+             *     (here, or `effective.approvers` for a Project).
              */
             wait_timer_s: number;
         };
@@ -3439,6 +3484,12 @@ export interface components {
             publisher: string;
         };
         /**
+         * @description What Run creation does when a Step that uses the Environment's authority
+         *     has no `manual` gate upstream (ADR-0078 §3).
+         * @enum {string}
+         */
+        MissingGateModeDto: "add" | "refuse";
+        /**
          * @description What a human is asked to confirm: the server-rendered, redacted
          *     description of one operation (shown in the 403, on the confirm page and
          *     in the event log).
@@ -3526,7 +3577,10 @@ export interface components {
         OriginLinkDto: {
             /** @description SHA-256 of the library source (or of the plugin's approved manifest). */
             content_hash: string;
-            /** @description `file`, `library` or `plugin`. */
+            /**
+             * @description `file`, `library`, `plugin`, or `environment` for the gate an
+             *     Environment added to the Run (ADR-0078 §2).
+             */
             kind: string;
             /**
              * @description A repo-relative path (`file`), `<publisher>/<name>` (`library`) or the
@@ -4130,14 +4184,21 @@ export interface components {
             privileged_images?: components["schemas"]["ImageGrantDto"][];
         };
         /**
-         * @description A baseline (`…/protection`) body: the four rules, replaced whole. Every
-         *     field is optional and an omitted one takes the **permissive** default —
-         *     never the stored value — so `{}` resets the baseline to permissive.
+         * @description A baseline (`…/protection`) body: the four rules and the approval gate
+         *     settings, replaced whole. Every field is optional and an omitted one
+         *     takes its default — never the stored value — so `{}` resets the baseline
+         *     to permissive (and the approval gate settings to theirs).
          *     Unknown fields are refused, so the retired per-repo shape (`wait_timer`,
          *     `concurrency`) — and `deployment_concurrency`, which ADR-0074 removed — is
          *     a 400, not a silently ignored rule.
          */
         PutEnvironmentProtectionRequest: {
+            /**
+             * Format: int32
+             * @description Seconds before the gate the Environment adds expires; omitted = it
+             *     waits until approved or rejected.
+             */
+            added_gate_expiry_s?: number | null;
             /** @description Ref globs (`refs/heads/main`, `refs/tags/*`); empty = any ref. */
             allowed_refs?: string[];
             /**
@@ -4145,11 +4206,25 @@ export interface components {
              *     merged id is stored as the Principal it now is. All must approve.
              */
             approvers?: string[];
+            /**
+             * Format: int32
+             * @description Seconds an approval stays good for at launch; omitted = 86400.
+             */
+            max_approval_age_s?: number | null;
+            /** @description `add` (default) or `refuse` (ADR-0078 §3). */
+            missing_gate_mode?: components["schemas"]["MissingGateModeDto"];
             /** @description A human dispatch must carry a reason (ADR-0057 §3). Omitted = off. */
             require_reason?: boolean;
             /**
              * Format: int32
-             * @description Seconds. Carried and merged, not yet enforced (git-bug 2b94989).
+             * @description How many of `approvers` must approve, 1 to their number; omitted =
+             *     every one.
+             */
+            required_approvals?: number | null;
+            /**
+             * Format: int32
+             * @description Seconds: a minimum wait on the Environment approval gate (ADR-0078
+             *     §4). Refused (400) above 0 with no approvers.
              */
             wait_timer_s?: number;
         };
@@ -4867,6 +4942,13 @@ export interface components {
         };
         StepStatusDto: {
             /**
+             * Format: int64
+             * @description A waiting Environment approval gate whose approvals are in: when the
+             *     Environment's wait timer runs out and the gate releases (Unix ms).
+             *     Absent otherwise.
+             */
+            approval_release_at?: number | null;
+            /**
              * @description Per-attempt detail (ADR-0047) — the rerun/retry history in append order.
              *     `attempts` is the count; this is the list, so the UI can show retries (a
              *     failed attempt followed by a succeeding one — the durable-execution story)
@@ -4879,6 +4961,14 @@ export interface components {
              *     Run that deploys. Omitted when false.
              */
             deploy?: boolean;
+            /**
+             * @description This `manual` gate is an **Environment approval gate** (ADR-0078 §1):
+             *     a Step after it uses the Run's Environment's authority, so releasing
+             *     it needs the Environment's approvers and a step-up. Decided at Run
+             *     creation. A gate the Environment added has an `origin` link of kind
+             *     `environment`. Omitted when false.
+             */
+            environment_approval_gate?: boolean;
             /**
              * @description `manual`/`timer`/`external` if this step is a gate (ADR-0008), else
              *     absent. Gates launch no pod; a waiting

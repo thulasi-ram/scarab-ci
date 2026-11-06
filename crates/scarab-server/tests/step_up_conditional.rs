@@ -947,8 +947,8 @@ async fn governance_writes_read_the_environment_without_a_project_lens() {
 // Gate approval (hermetic)
 // ---------------------------------------------------------------------------
 
-/// A deploy into `prod` with an approval gate, and a plain pipeline with
-/// one.
+/// A deploy into `prod` with an approval gate (its `ship` uses prod's
+/// authority, ADR-0078 §1), and a plain pipeline with one.
 const DEPLOY_YAML: &str = r#"
 on:
   manual: {}
@@ -956,7 +956,19 @@ environment: prod
 steps:
   - { id: build, image: busybox, command: ["true"] }
   - { id: approve, gate: manual, needs: [build] }
-  - { id: ship, image: busybox, command: ["true"], needs: [approve] }
+  - { id: ship, image: busybox, command: ["true"], deploy: true, needs: [approve] }
+"#;
+
+/// A "QA signs off" gate in `prod` that guards nothing of prod's: a plain
+/// gate (ADR-0078 §1).
+const QA_YAML: &str = r#"
+on:
+  manual: {}
+environment: prod
+steps:
+  - { id: build, image: busybox, command: ["true"] }
+  - { id: approve, gate: manual, needs: [build] }
+  - { id: smoke, image: busybox, command: ["true"], needs: [approve] }
 "#;
 
 const PLAIN_YAML: &str = r#"
@@ -972,6 +984,7 @@ fn forge() -> FakeForge {
     FakeForge::new()
         .with_file(".scarab/deploy.yaml", DEPLOY_YAML)
         .with_file(".scarab/plain.yaml", PLAIN_YAML)
+        .with_file(".scarab/qa.yaml", QA_YAML)
         .with_commit(
             "refs/heads/main",
             "1234567890abcdef1234567890abcdef12345678",
@@ -1102,6 +1115,24 @@ async fn approving_a_gate_without_approvers_or_environment_is_exempt() {
     assert_eq!(st, StatusCode::ACCEPTED, "{b}");
     assert_eq!(gate_status(&h, &plain).await, StepStatus::Succeeded);
 
+    assert!(h.events_of("step_up.refused").is_empty());
+}
+
+/// ADR-0078 §1: in an Environment with approvers, a `manual` gate with no
+/// Step after it that uses the Environment's authority is a plain gate. Its
+/// approval needs no step-up and releases it at once.
+#[tokio::test]
+async fn approving_a_plain_gate_in_a_governed_run_is_exempt() {
+    let governance = prod_governance();
+    let h = gated(governance.clone());
+    let (s, _soft) = signed_in_admin(&h).await;
+    require_approvers(&governance, &["carol"]).await;
+    let run = at_gate(&h, &governance, "qa").await;
+
+    let (st, b) = h.cookie("POST", &approve_uri(&run), None, &s).await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{b}");
+    assert_eq!(b["released"], true, "{b}");
+    assert_eq!(gate_status(&h, &run).await, StepStatus::Succeeded);
     assert!(h.events_of("step_up.refused").is_empty());
 }
 

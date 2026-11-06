@@ -650,6 +650,7 @@ function effectiveOf(env: OrgEnvironmentDto, overlay: OverlayDto | undefined) {
     allowed_ref_layers: overlay ? [b.allowed_refs, overlay.allowed_refs] : [b.allowed_refs],
     wait_timer_s: Math.max(b.wait_timer_s, overlay?.wait_timer_s ?? 0),
     require_reason: b.require_reason || (overlay?.require_reason ?? false),
+    approval_gate: b.approval_gate ?? { missing_gate_mode: "add" as const, max_approval_age_s: 86400 },
   };
 }
 

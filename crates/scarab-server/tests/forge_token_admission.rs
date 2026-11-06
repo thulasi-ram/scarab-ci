@@ -485,12 +485,39 @@ async fn write_needs_an_environment_that_restricts_refs() {
 }
 
 /// Where the Environment has approvers, `write` needs a manual gate
-/// upstream, so an approver releases the Step first.
+/// upstream, so an approver releases the Step first. With none in the YAML
+/// the Environment adds one (ADR-0078 §2); in missing-gate mode `refuse`
+/// the Run is refused.
 #[tokio::test]
 async fn write_needs_a_manual_gate_where_the_environment_has_approvers() {
     let db = InMemoryDb::new();
     let gov = prod(&["refs/heads/main"], &["amy"]).await;
     let forge = minting(&[(".scarab/deploy.yaml", DEPLOY_WRITE_YAML)]);
+    let out = trigger(&db, &forge, AdmissionPorts::governance(Some(&gov)), &push()).await;
+    assert_eq!(out.runs.len(), 1, "{:?}", out.refused);
+    let tag = db
+        .steps_of_run(&out.runs[0])
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.step.0 == "tag")
+        .unwrap();
+    assert!(
+        tag.needs.contains(&StepId("environment-approval".into())),
+        "{:?}",
+        tag.needs
+    );
+
+    let mut refusing = gov
+        .org_environment("acme", "prod")
+        .await
+        .unwrap()
+        .unwrap()
+        .protection;
+    refusing.approval_gate.missing_gate = scarab_project::MissingGateMode::Refuse;
+    gov.put_environment_protection("acme", "prod", &refusing, "amy", 2)
+        .await
+        .unwrap();
     let reason =
         refused_reason(&trigger(&db, &forge, AdmissionPorts::governance(Some(&gov)), &push()).await);
     assert!(reason.contains("gate: manual"), "{reason}");
