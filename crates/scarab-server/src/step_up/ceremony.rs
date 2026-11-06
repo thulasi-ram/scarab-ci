@@ -509,6 +509,7 @@ pub(crate) async fn passkey_registration(
         created_session_hash: facts.id_hash.clone(),
         last_used_at: None,
         clone_suspected_at: None,
+        user_handle: None,
     };
     svc.passkeys.insert(&passkey).await.map_err(|e| match e {
         scarab_identity::IdentityError::Conflict(_) => {
@@ -839,11 +840,17 @@ async fn verify_assertion_once(
     }
     let alg = CoseAlgorithm::from_id(i64::from(passkey.alg))
         .ok_or_else(|| webauthn_refused(WebauthnError::StoredCredentialInconsistent))?;
-    let handle = svc
-        .passkeys
-        .user_handle(&subject, random_bytes())
-        .await
-        .map_err(store_err)?;
+    // A passkey a merge moved here answers with the handle it was created
+    // under (git-bug def16bd).
+    let handle = match passkey.user_handle.as_deref() {
+        Some(h) => <[u8; 32]>::try_from(h)
+            .map_err(|_| webauthn_refused(WebauthnError::StoredCredentialInconsistent))?,
+        None => svc
+            .passkeys
+            .user_handle(&subject, random_bytes())
+            .await
+            .map_err(store_err)?,
+    };
     let stored = StoredCredential {
         credential_id: passkey.credential_id.clone(),
         public_key_cose: passkey.public_key_cose.clone(),

@@ -205,6 +205,9 @@ record. Read Breaking changes before you upgrade.
   as `passkey.counter_regressed`. Once every passkey of a user is flagged, a fresh login no
   longer enrolls a new first passkey (a thief holding the forge account can make a fresh
   login): an Owner must reset the user's passkeys first, and a step-up refusal says so.
+- When one sign-in identity is merged into another Principal, the merged Principal's passkeys
+  now move to the surviving one, so the person can still confirm a step-up with them. Each
+  moved passkey keeps the WebAuthn user handle it was created under (migration 0079).
 - **Unpinning a Run's snapshots needs a step-up.** `DELETE /v1/runs/{id}/snapshots-pin`
   shortens how long the Run's snapshots are kept, so it now needs a step-up confirmation
   (window). Pinning does not.

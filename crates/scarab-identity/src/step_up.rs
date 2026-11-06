@@ -113,6 +113,11 @@ pub struct Passkey {
     /// Set once a counter went backwards (or the same count was presented
     /// twice). A flagged credential is never offered or accepted again.
     pub clone_suspected_at: Option<i64>,
+    /// The WebAuthn user handle the credential was created under, when it is
+    /// not its Principal's own: a passkey a merge moved from a folded
+    /// Principal (git-bug def16bd). `None`: the Principal's handle.
+    #[serde(default)]
+    pub user_handle: Option<Vec<u8>>,
 }
 
 /// What [`PasskeyStore::record_use`] did with an assertion's counter.

@@ -1355,6 +1355,7 @@ mod tests {
                 created_session_hash: "h".into(),
                 last_used_at: None,
                 clone_suspected_at: None,
+                user_handle: None,
             })
             .await
             .unwrap();

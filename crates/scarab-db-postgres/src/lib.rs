@@ -4532,6 +4532,9 @@ const MAX_PRINCIPAL_SUFFIX: u32 = 10_000;
 ///   the rank — a deliberate native downgrade is never undone by a merge;
 /// - **approver entries** in every environment of every org;
 /// - **API tokens** (`owner_subject`), so they stay capped by `into`'s roles;
+/// - **passkeys** (git-bug def16bd): a merge asserts the two ids are one
+///   person. Each keeps the user handle it was created under, which the
+///   authenticator still returns;
 /// - **sessions** of `from` are deleted;
 /// - `from` itself is marked `merged_into` and kept, so its id is never minted
 ///   again. History (event `by`, `approved_by`) is not rewritten.
@@ -4673,6 +4676,19 @@ async fn merge_principal(
         .map_err(identity_err)?;
     }
 
+    sqlx::query(
+        "UPDATE passkeys
+         SET principal_id = $2,
+             user_handle = COALESCE(
+                 passkeys.user_handle,
+                 (SELECT user_handle FROM passkey_users WHERE principal_id = $1))
+         WHERE principal_id = $1",
+    )
+    .bind(from)
+    .bind(into)
+    .execute(&mut **tx)
+    .await
+    .map_err(identity_err)?;
     sqlx::query("UPDATE api_tokens SET owner_subject = $2 WHERE owner_subject = $1")
         .bind(from)
         .bind(into)

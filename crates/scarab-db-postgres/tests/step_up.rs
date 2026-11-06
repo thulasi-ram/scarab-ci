@@ -34,6 +34,7 @@ fn passkey(id: &str, principal: &str, credential: &[u8], count: u32) -> Passkey 
         created_session_hash: "sess-enroll".into(),
         last_used_at: None,
         clone_suspected_at: None,
+        user_handle: None,
     }
 }
 

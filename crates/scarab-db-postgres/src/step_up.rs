@@ -200,7 +200,7 @@ async fn insert_security_event<'e, E: sqlx::PgExecutor<'e>>(
 
 const PASSKEY_COLUMNS: &str = "id, principal_id, credential_id, public_key_cose, alg, \
      sign_count, label, transports, aaguid, backup_eligible, backup_state, created_at, \
-     created_session_hash, last_used_at, clone_suspected_at";
+     created_session_hash, last_used_at, clone_suspected_at, user_handle";
 
 fn passkey_from_row(r: &sqlx::postgres::PgRow) -> Result<Passkey, IdentityError> {
     Ok(Passkey {
@@ -221,6 +221,7 @@ fn passkey_from_row(r: &sqlx::postgres::PgRow) -> Result<Passkey, IdentityError>
         created_session_hash: r.get("created_session_hash"),
         last_used_at: r.get("last_used_at"),
         clone_suspected_at: r.get("clone_suspected_at"),
+        user_handle: r.get("user_handle"),
     })
 }
 
@@ -288,8 +289,8 @@ impl PasskeyStore for PostgresDb {
             "INSERT INTO passkeys
                  (id, principal_id, credential_id, public_key_cose, alg, sign_count, label,
                   transports, aaguid, backup_eligible, backup_state, created_at,
-                  created_session_hash, last_used_at, clone_suspected_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+                  created_session_hash, last_used_at, clone_suspected_at, user_handle)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
         )
         .bind(&passkey.id)
         .bind(&passkey.principal)
@@ -306,6 +307,7 @@ impl PasskeyStore for PostgresDb {
         .bind(&passkey.created_session_hash)
         .bind(passkey.last_used_at)
         .bind(passkey.clone_suspected_at)
+        .bind(&passkey.user_handle)
         .execute(self.pool())
         .await
         .map_err(|e| match &e {

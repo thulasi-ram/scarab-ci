@@ -871,6 +871,33 @@ async fn an_owner_s_reset_of_a_merged_id_resets_the_live_principal() {
     tdb.cleanup().await;
 }
 
+/// git-bug def16bd: a merge asserts the two ids are one person, so the
+/// folded id's passkeys move to the survivor. bob, who never enrolled one,
+/// confirms with the passkey bobby enrolled; the authenticator still
+/// answers with bobby's user handle, and that is accepted for that passkey.
+#[tokio::test]
+async fn a_merge_moves_the_folded_id_s_passkeys_to_the_survivor() {
+    let Some((tdb, pg)) = pg().await else { return };
+    let (h, _) = merged_bob(&pg).await;
+    let bobby = h.browser_session(scoped("bobby")).await;
+    let mut soft = passkey();
+    h.enroll(&bobby, &mut soft, "bobby's key").await;
+    // bob has a user handle of his own, so the moved passkey's differs.
+    h.passkey_store.user_handle("bob", [9; 32]).await.unwrap();
+
+    fold_bobby_into_bob(&pg).await;
+    assert!(h.passkey_store.list("bobby").await.unwrap().is_empty());
+    let moved = h.passkey_store.list("bob").await.unwrap();
+    assert_eq!(moved.len(), 1, "{moved:?}");
+    assert_eq!(moved[0].label, "bobby's key");
+
+    let bob = h.browser_session(scoped("bob")).await;
+    let (_, me) = h.cookie("GET", "/v1/me/security", None, &bob).await;
+    assert_eq!(me["has_passkey"], true, "{me}");
+    h.open_window(&bob, &mut soft).await;
+    tdb.cleanup().await;
+}
+
 /// git-bug 0314275: a request a token raised for `bobby` before bobby was
 /// folded into bob is bob's to confirm (404 to anyone else) — and it RUNS:
 /// the merge moved the token to bob, and the replay acts for the confirmer.
