@@ -1,17 +1,24 @@
 //! ADR-0065 s1 — the keyed directory Cache's launch-time key resolution,
 //! driven over the in-memory store with a fake snapshot oracle (DST): the
-//! scheduler folds the key from the key files' blob hashes through the merged
-//! input roots (last-overlay-wins), fills the restore hints from the mapping,
-//! and — the licence for the whole feature — every failure mode DISABLES the
-//! cache for the attempt instead of failing or mis-keying it.
+//! scheduler folds the key from the Run's cache scope and the key files' blob
+//! hashes through the merged input roots (last-overlay-wins), fills the
+//! restore hints from the mapping, and — the licence for the whole feature —
+//! every failure mode DISABLES the cache for the attempt instead of failing or
+//! mis-keying it.
+//!
+//! Cache scopes (git-bug efcec77): an Environment-governed Run reads and
+//! writes only `env:<name>`; any other Run writes only its ref's scope and
+//! reads the default branch's on a miss. The scopes here come from
+//! [`CacheScope::for_run`], the derivation the server stamps at creation
+//! (`scarab-server/tests/cache_scope.rs` proves the stamping).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 
 use scarab_engine::ports::ExecState;
 use scarab_engine::{
-    cache_key, CacheConfig, Db, RunId, RunStatus, Scheduler, StepId, StepSpec, StepStatus,
-    Timestamp, WorkspaceSnapshots,
+    cache_key, rerun_step, CacheConfig, CacheScope, Db, RunId, RunStatus, Scheduler, StepId,
+    StepSpec, StepStatus, Timestamp, WorkspaceSnapshots,
 };
 use scarab_testkit::{FakeClock, FakeExecutor, InMemoryDb};
 
@@ -86,18 +93,39 @@ fn caching(dirs: &[&str], key_files: &[&str]) -> CacheConfig {
         key_files: key_files.iter().map(|s| s.to_string()).collect(),
         key: None,
         restore: Vec::new(),
+        fallback_key: None,
     }
+}
+
+/// The scope of an ungoverned push to `main`, the default branch.
+fn main_scope() -> CacheScope {
+    CacheScope::for_run(None, Some("refs/heads/main"), Some("main")).unwrap()
 }
 
 /// Two steps: `clone` (produces the input snapshot) → `build` (declares the
 /// cache). Returns the run and the ids.
 async fn seed(db: &InMemoryDb, cache: CacheConfig, project: Option<&str>) -> (RunId, StepId) {
-    let run = RunId("run-1".into());
+    seed_run(db, "run-1", cache, project, Some(main_scope())).await
+}
+
+/// [`seed`] for a named Run with an explicit cache scope (`None` = a Run
+/// stamped with no scope).
+async fn seed_run(
+    db: &InMemoryDb,
+    id: &str,
+    cache: CacheConfig,
+    project: Option<&str>,
+    scope: Option<CacheScope>,
+) -> (RunId, StepId) {
+    let run = RunId(id.into());
     let clone = StepId("clone".into());
     let build = StepId("build".into());
     db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
     if let Some(project) = project {
         db.set_run_scheduling(&run, project, 0).await.unwrap();
+    }
+    if let Some(scope) = scope {
+        db.set_run_cache_scope(&run, &scope).await.unwrap();
     }
     db.create_step_run(&run, &clone, Some(&spec(None)), &[], Timestamp(0))
         .await
@@ -139,6 +167,7 @@ async fn launch_resolves_the_key_and_restore_hints_through_the_oracle() {
 
     let expected_key = cache_key(
         "acme/web",
+        "refs/heads/main",
         &[("package-lock.json".to_string(), "blob-lock".to_string())],
     );
     // A prior save recorded the mapping — plus a row for a dir this step does
@@ -198,6 +227,7 @@ async fn the_key_resolves_last_overlay_wins_across_merged_inputs() {
     let build = StepId("build".into());
     db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
     db.set_run_scheduling(&run, "acme/web", 0).await.unwrap();
+    db.set_run_cache_scope(&run, &main_scope()).await.unwrap();
     for id in [&a, &b] {
         db.create_step_run(&run, id, Some(&spec(None)), &[], Timestamp(0))
             .await
@@ -229,7 +259,14 @@ async fn the_key_resolves_last_overlay_wins_across_merged_inputs() {
         .expect("cache resolved");
     assert_eq!(
         cache.key.as_deref(),
-        Some(cache_key("acme/web", &[("lock".to_string(), "blob-late".to_string())]).as_str()),
+        Some(
+            cache_key(
+                "acme/web",
+                "refs/heads/main",
+                &[("lock".to_string(), "blob-late".to_string())]
+            )
+            .as_str()
+        ),
         "the LAST overlay's blob hash owns the key file"
     );
 }
@@ -237,29 +274,47 @@ async fn the_key_resolves_last_overlay_wins_across_merged_inputs() {
 /// The disable arms, each of which must launch the step normally with the
 /// cache OFF (`key: None`, no restore) — never an error, never a mis-key:
 /// a key file absent from every input; a transient oracle failure; an
-/// untenanted run (no project namespace).
+/// untenanted run (no project namespace); a Run with no cache scope (no ref
+/// and no Environment, or created before scopes were stored).
 #[tokio::test]
 async fn every_unresolvable_key_disables_the_cache_and_never_fails_the_step() {
-    for (name, project, files, fail) in [
-        ("key file absent", Some("acme/web"), vec![], false),
+    for (name, project, scope, files, fail) in [
+        (
+            "key file absent",
+            Some("acme/web"),
+            Some(main_scope()),
+            vec![],
+            false,
+        ),
         (
             "oracle transient error",
             Some("acme/web"),
+            Some(main_scope()),
             vec![("root-clone", "package-lock.json", "blob-lock")],
             true,
         ),
         (
             "untenanted run",
             None,
+            Some(main_scope()),
+            vec![("root-clone", "package-lock.json", "blob-lock")],
+            false,
+        ),
+        (
+            "no cache scope",
+            Some("acme/web"),
+            None,
             vec![("root-clone", "package-lock.json", "blob-lock")],
             false,
         ),
     ] {
         let db = InMemoryDb::new();
-        let (run, _build) = seed(
+        let (run, _build) = seed_run(
             &db,
+            "run-1",
             caching(&["node_modules"], &["package-lock.json"]),
             project,
+            scope,
         )
         .await;
         let oracle = FakeOracle::with(&files);
@@ -327,70 +382,244 @@ async fn project_b_never_resolves_project_as_cache_rows() {
     );
 }
 
-/// PR-context write denial (dbe05e5 amendment #1, mandatory test): a step
-/// that succeeds WITH cache saves records nothing when the run originates
-/// from a pull request (fork or not), while the identical push-context run
-/// records the mapping. Reads are untouched (the restore hints still mint —
-/// covered by the launch tests above, which never consult the origin).
-#[tokio::test]
-async fn a_pr_context_run_never_writes_cache_entries_and_a_push_run_does() {
-    for (name, origin_kind, pr_number, expect_rows) in [
-        ("push context", "push", None, true),
-        ("PR context", "pull_request", Some(7), false),
-        // A PR-numbered origin under any kind is still a PR context.
-        ("stamped PR number", "push", Some(9), false),
-    ] {
-        let db = InMemoryDb::new();
-        let (run, build) = seed(
-            &db,
-            caching(&["node_modules"], &["package-lock.json"]),
-            Some("acme/web"),
-        )
-        .await;
-        db.set_run_origin(&run, origin_kind, None, None, None, pr_number, None)
-            .await
-            .unwrap();
-
-        let oracle = FakeOracle::with(&[("root-clone", "package-lock.json", "blob-lock")]);
-        let exec = FakeExecutor::new();
-        exec.set_output("clone", "root-clone");
-        exec.set_cache_saves(
-            "build",
-            scarab_engine::CacheSaves {
-                key: cache_key(
-                    "acme/web",
-                    &[("package-lock.json".to_string(), "blob-lock".to_string())],
-                ),
-                roots: std::collections::BTreeMap::from([(
-                    "node_modules".to_string(),
-                    "tree-saved".to_string(),
-                )]),
-            },
-        );
-        for _ in 0..2 {
-            exec.script_outcome(ExecState::Succeeded);
-        }
-        drive(&db, &run, &exec, &oracle).await;
-
-        let _ = &build;
-        let key = cache_key(
-            "acme/web",
-            &[("package-lock.json".to_string(), "blob-lock".to_string())],
-        );
-        let rows = db.cache_lookup("acme/web", &key).await.unwrap();
-        if expect_rows {
-            assert_eq!(
-                rows,
-                vec![("node_modules".to_string(), "tree-saved".to_string())],
-                "{name}: the save must be recorded"
-            );
-        } else {
-            assert!(
-                rows.is_empty(),
-                "{name}: a PR context must never write the mapping"
-            );
-        }
+/// One Run of the two-step pipeline under `scope`: `build` launches (with
+/// whatever restore the mapping gives it) and, on success, saves
+/// `node_modules` as `saved_root` under the key its launch carried. Returns
+/// the launched cache config.
+async fn run_once(db: &InMemoryDb, id: &str, scope: CacheScope, saved_root: &str) -> CacheConfig {
+    let (run, _build) = seed_run(
+        db,
+        id,
+        caching(&["node_modules"], &["package-lock.json"]),
+        Some("acme/web"),
+        Some(scope),
+    )
+    .await;
+    let oracle = FakeOracle::with(&[("root-clone", "package-lock.json", "blob-lock")]);
+    let exec = FakeExecutor::new();
+    exec.set_output("clone", "root-clone");
+    exec.set_cache_save_roots("build", &[("node_modules", saved_root)]);
+    for _ in 0..2 {
+        exec.script_outcome(ExecState::Succeeded);
     }
+    drive(db, &run, &exec, &oracle).await;
+    let handle = scarab_engine::ports::ExecHandle(format!("fake://{id}/build/a1"));
+    exec.launched_spec(&handle)
+        .and_then(|s| s.cache)
+        .expect("build launched with its cache config")
+}
+
+fn lock() -> Vec<(String, String)> {
+    vec![("package-lock.json".to_string(), "blob-lock".to_string())]
+}
+
+/// The `node_modules` row saved under `scope`'s key, if any.
+async fn saved(db: &InMemoryDb, scope: &str) -> Option<String> {
+    db.cache_lookup("acme/web", &cache_key("acme/web", scope, &lock()))
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|(dir, _)| dir == "node_modules")
+        .map(|(_, root)| root)
+}
+
+/// The poisoning this ticket closes (git-bug efcec77): a pull request saves
+/// its Cache, and an Environment-governed Run with the same key files does
+/// not restore it. The PR's save lands in its own scope (it is recorded,
+/// so the miss below is the scope working, not a save that never
+/// happened).
+#[tokio::test]
+async fn a_pull_request_save_is_never_restored_by_an_environment_run() {
+    let db = InMemoryDb::new();
+    let pr = CacheScope::for_run(None, Some("refs/pull/7/head"), Some("main")).unwrap();
+    run_once(&db, "run-pr", pr, "tree-from-pr").await;
+    assert_eq!(
+        saved(&db, "refs/pull/7/head").await.as_deref(),
+        Some("tree-from-pr"),
+        "a pull request saves under its own scope"
+    );
+    assert_eq!(
+        saved(&db, "refs/heads/main").await,
+        None,
+        "and never under main's"
+    );
+
+    let prod = CacheScope::for_run(Some("prod"), Some("refs/pull/7/head"), Some("main")).unwrap();
+    let cache = run_once(&db, "run-prod", prod, "tree-from-prod").await;
+    assert!(
+        cache.restore.is_empty(),
+        "the Environment Run must not restore the PR's entry: {:?}",
+        cache.restore
+    );
+    assert_eq!(cache.fallback_key, None);
+    assert_eq!(
+        cache.key.as_deref(),
+        Some(cache_key("acme/web", "env:prod", &lock()).as_str())
+    );
+    assert_eq!(
+        saved(&db, "env:prod").await.as_deref(),
+        Some("tree-from-prod")
+    );
+}
+
+/// A feature-branch Run with no entry of its own restores the default
+/// branch's, reads it from that key (`fallback_key`, which picks the Depot
+/// replica), and saves under its own scope only: `main`'s row still holds
+/// `main`'s tree afterwards. Its next Run hits its own scope, not `main`'s.
+#[tokio::test]
+async fn a_feature_branch_run_restores_the_default_branch_and_saves_under_its_own_scope() {
+    let db = InMemoryDb::new();
+    run_once(&db, "run-main", main_scope(), "tree-from-main").await;
+
+    let feature = CacheScope::for_run(None, Some("refs/heads/feat"), Some("main")).unwrap();
+    let cache = run_once(&db, "run-feat-1", feature.clone(), "tree-from-feat").await;
+    assert_eq!(
+        cache.restore,
+        vec![("node_modules".to_string(), "tree-from-main".to_string())],
+        "a miss in the Run's own scope falls back to the default branch's"
+    );
+    let main_key = cache_key("acme/web", "refs/heads/main", &lock());
+    let feat_key = cache_key("acme/web", "refs/heads/feat", &lock());
+    assert_eq!(cache.fallback_key.as_deref(), Some(main_key.as_str()));
+    assert_eq!(
+        cache.key.as_deref(),
+        Some(feat_key.as_str()),
+        "saves go to its own key"
+    );
+    assert_eq!(
+        saved(&db, "refs/heads/main").await.as_deref(),
+        Some("tree-from-main"),
+        "a fallback hit is never saved back under the default branch"
+    );
+    assert_eq!(
+        saved(&db, "refs/heads/feat").await.as_deref(),
+        Some("tree-from-feat")
+    );
+
+    let cache = run_once(&db, "run-feat-2", feature, "tree-from-feat-2").await;
+    assert_eq!(
+        cache.restore,
+        vec![("node_modules".to_string(), "tree-from-feat".to_string())],
+        "the Run's own scope wins once it has an entry"
+    );
+    assert_eq!(cache.fallback_key, None);
+}
+
+/// An Environment-governed Run does not fall back: with `main` holding an
+/// entry for the same key files, its first build is cold.
+#[tokio::test]
+async fn an_environment_run_does_not_fall_back_to_the_default_branch() {
+    let db = InMemoryDb::new();
+    run_once(&db, "run-main", main_scope(), "tree-from-main").await;
+
+    let prod = CacheScope::for_run(Some("prod"), Some("refs/heads/main"), Some("main")).unwrap();
+    let cache = run_once(&db, "run-prod", prod, "tree-from-prod").await;
+    assert!(cache.restore.is_empty(), "{:?}", cache.restore);
+    assert_eq!(cache.fallback_key, None);
+    assert_eq!(
+        saved(&db, "refs/heads/main").await.as_deref(),
+        Some("tree-from-main")
+    );
+}
+
+/// A rerun keys its Cache with the scope its Run was created with: the
+/// rerun attempt folds the same key as the first, restores the first
+/// attempt's save from the Run's own scope, and saves there again.
+#[tokio::test]
+async fn a_rerun_keeps_the_scope_its_run_started_with() {
+    let db = InMemoryDb::new();
+    let feature = CacheScope::for_run(None, Some("refs/heads/feat"), Some("main")).unwrap();
+    let (run, build) = seed_run(
+        &db,
+        "run-feat",
+        caching(&["node_modules"], &["package-lock.json"]),
+        Some("acme/web"),
+        Some(feature),
+    )
+    .await;
+    let oracle = FakeOracle::with(&[("root-clone", "package-lock.json", "blob-lock")]);
+    let exec = FakeExecutor::new();
+    exec.set_output("clone", "root-clone");
+    exec.set_cache_save_roots("build", &[("node_modules", "tree-a1")]);
+    for _ in 0..4 {
+        exec.script_outcome(ExecState::Succeeded);
+    }
+    drive(&db, &run, &exec, &oracle).await;
+
+    let clock = FakeClock::new(2_000);
+    rerun_step(&db, &clock, &run, &build, None)
+        .await
+        .expect("rerun");
+    drive(&db, &run, &exec, &oracle).await;
+
+    let feat_key = cache_key("acme/web", "refs/heads/feat", &lock());
+    let first = exec
+        .launched_spec(&scarab_engine::ports::ExecHandle(
+            "fake://run-feat/build/a1".into(),
+        ))
+        .and_then(|s| s.cache)
+        .expect("first attempt");
+    let rerun = exec
+        .launched_spec(&scarab_engine::ports::ExecHandle(
+            "fake://run-feat/build/a2".into(),
+        ))
+        .and_then(|s| s.cache)
+        .expect("rerun attempt");
+    assert_eq!(first.key.as_deref(), Some(feat_key.as_str()));
+    assert_eq!(
+        rerun.key, first.key,
+        "the rerun folds the same scope into its key"
+    );
+    assert_eq!(
+        rerun.restore,
+        vec![("node_modules".to_string(), "tree-a1".to_string())],
+        "and restores the first attempt's save from the Run's own scope"
+    );
+    assert_eq!(rerun.fallback_key, None);
+}
+
+/// The scope a Run gets from its Environment, ref and default branch.
+#[test]
+fn the_cache_scope_derives_from_the_environment_else_the_ref() {
+    let scope = |env, git_ref, default| CacheScope::for_run(env, git_ref, default);
+    let s = |own: &str, fallback: Option<&str>| {
+        Some(CacheScope {
+            own: own.into(),
+            fallback: fallback.map(str::to_string),
+        })
+    };
+    // An Environment wins over the ref and never falls back.
+    assert_eq!(
+        scope(Some("prod"), Some("refs/heads/feat"), Some("main")),
+        s("env:prod", None)
+    );
+    assert_eq!(scope(Some("prod"), None, None), s("env:prod", None));
+    // A ref reads its own scope, then the default branch's.
+    assert_eq!(
+        scope(None, Some("refs/pull/7/head"), Some("main")),
+        s("refs/pull/7/head", Some("refs/heads/main"))
+    );
+    assert_eq!(
+        scope(None, Some("refs/tags/v1"), Some("trunk")),
+        s("refs/tags/v1", Some("refs/heads/trunk"))
+    );
+    // The default branch itself, or an unknown default branch: no fallback.
+    assert_eq!(
+        scope(None, Some("refs/heads/main"), Some("main")),
+        s("refs/heads/main", None)
+    );
+    assert_eq!(
+        scope(None, Some("refs/heads/feat"), None),
+        s("refs/heads/feat", None)
+    );
+    assert_eq!(
+        scope(None, Some("refs/heads/feat"), Some("")),
+        s("refs/heads/feat", None)
+    );
+    // No ref, or a ref that is not a full `refs/…` name (which could spell
+    // `env:prod`): no scope, so the Cache is off.
+    assert_eq!(scope(None, None, Some("main")), None);
+    assert_eq!(scope(None, Some("env:prod"), Some("main")), None);
 }
 
 /// The key is project-salted AND the lookup is project-scoped: the same key
@@ -399,10 +628,27 @@ async fn a_pr_context_run_never_writes_cache_entries_and_a_push_run_does() {
 #[test]
 fn the_cache_key_is_project_salted_and_deterministic() {
     let pairs = vec![("lock".to_string(), "blob".to_string())];
-    let a = cache_key("acme/web", &pairs);
-    let b = cache_key("evil/web", &pairs);
-    assert_ne!(a, b, "two tenants with identical lockfiles fold different keys");
-    assert_eq!(a, cache_key("acme/web", &pairs), "deterministic");
+    let a = cache_key("acme/web", "refs/heads/main", &pairs);
+    let b = cache_key("evil/web", "refs/heads/main", &pairs);
+    assert_ne!(
+        a, b,
+        "two tenants with identical lockfiles fold different keys"
+    );
+    assert_eq!(
+        a,
+        cache_key("acme/web", "refs/heads/main", &pairs),
+        "deterministic"
+    );
+    // Two scopes of one project with identical lockfiles fold different
+    // keys (git-bug efcec77).
+    assert_ne!(a, cache_key("acme/web", "env:prod", &pairs));
+    assert_ne!(a, cache_key("acme/web", "refs/pull/7/head", &pairs));
+    // Length-prefixed: moving a boundary between project and scope must
+    // not collide.
+    assert_ne!(
+        cache_key("acme/web", "refs/heads/main", &pairs),
+        cache_key("acme/webr", "efs/heads/main", &pairs),
+    );
     // Order-independent over the pairs.
     let two = vec![
         ("b".to_string(), "2".to_string()),
@@ -410,11 +656,11 @@ fn the_cache_key_is_project_salted_and_deterministic() {
     ];
     let mut rev = two.clone();
     rev.reverse();
-    assert_eq!(cache_key("p", &two), cache_key("p", &rev));
+    assert_eq!(cache_key("p", "s", &two), cache_key("p", "s", &rev));
     // Length-prefixed: shifting a boundary between path and hash must not
     // collide.
     assert_ne!(
-        cache_key("p", &[("ab".to_string(), "c".to_string())]),
-        cache_key("p", &[("a".to_string(), "bc".to_string())]),
+        cache_key("p", "s", &[("ab".to_string(), "c".to_string())]),
+        cache_key("p", "s", &[("a".to_string(), "bc".to_string())]),
     );
 }
