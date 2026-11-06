@@ -192,6 +192,11 @@ record. Read Breaking changes before you upgrade.
   repositories on the same host through submodules, and over `http://` (#53).
 - A value from outside the Pipeline holding `$(SECRET_NAME)` was filled with that secret by
   Kubernetes (#52). Plugin Deployments and probe Pods are escaped the same way.
+- **Opening a debug shell needs a step-up.** A shell into a step Pod (`…/attach`, and a
+  debug Pod, `…/debug-pod`) reads the Pod's environment and acts with its credentials, but it
+  asked only for `Administer`. It now needs a step-up confirmation, as a secret write does: a
+  browser session's 5-minute window satisfies it. An API token or a session presented as
+  `Bearer` can no longer open one, since a WebSocket cannot be held for a confirmation.
 
 ### Features
 

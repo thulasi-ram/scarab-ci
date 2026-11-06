@@ -13,7 +13,8 @@
 //! - **Exempt** — tightening: never a step-up.
 //! - **NotGoverned** — not on ADR-0073 §3's list, with the reason.
 //!
-//! Every GET is [`READ`].
+//! Every GET is [`READ`], except the debug shell ([`STEP_ATTACH`],
+//! [`STEP_DEBUG_POD`]): a WebSocket upgrade that opens a shell in a step Pod.
 
 use scarab_identity::Role;
 use serde::Serialize;
@@ -1063,6 +1064,32 @@ pub static CONNECTION_UNBIND_REPO: Op = op(
     &[],
     &["path:id", "path:owner", "path:name"],
 );
+// The debug shell (git-bug 606102b): a WebSocket GET, governed like a write.
+// A shell into a step Pod reads its environment and acts with its
+// credentials. A WebSocket upgrade cannot be held and replayed, so no
+// machine caller can raise a request for it: browser sessions only.
+pub static STEP_ATTACH: Op = op(
+    "step.attach",
+    "Open a shell in a running step's Pod",
+    Class::CrownJewel(W),
+    "§3 a shell into a step Pod (git-bug 606102b)",
+    ADMIN,
+    OrgOf::Run,
+    &[],
+    &["path:id", "path:step"],
+)
+.browser_only();
+pub static STEP_DEBUG_POD: Op = op(
+    "step.debug_pod",
+    "Open a shell in a fresh Pod of a step",
+    Class::CrownJewel(W),
+    "§3 a shell into a step Pod (git-bug 606102b)",
+    ADMIN,
+    OrgOf::Run,
+    &[],
+    &["path:id", "path:step"],
+)
+.browser_only();
 
 // --- crown jewels, always ask ------------------------------------------------
 
@@ -1508,7 +1535,13 @@ mod tests {
         browser_only.dedup();
         assert_eq!(
             browser_only,
-            vec!["identity.link", "identity.unlink", "passkey.add"]
+            vec![
+                "identity.link",
+                "identity.unlink",
+                "passkey.add",
+                "step.attach",
+                "step.debug_pod"
+            ]
         );
         not_by_token.sort_unstable();
         assert_eq!(

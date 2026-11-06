@@ -2,7 +2,8 @@
 //! its Implementation notes).
 //!
 //! Every route is registered through [`Routes`], which takes the route's
-//! [`Op`] classification as an argument: a GET is [`ops::READ`]; a POST, PUT
+//! [`Op`] classification as an argument: a GET is [`ops::READ`] unless it
+//! names its op (the debug shell's WebSocket upgrade); a POST, PUT
 //! or DELETE cannot be registered without naming its `&'static Op`. So a new
 //! mutating route cannot exist without saying whether it is a crown jewel,
 //! and [`route_table`] is the complete, test-enumerable list the step-up
@@ -69,6 +70,16 @@ impl Routes {
         T: 'static,
     {
         self.add(Method::GET, path, &ops::READ, axum::routing::get(h))
+    }
+
+    /// A GET that is not a plain read: the debug shell's WebSocket upgrade,
+    /// which the guard governs by `op` like a write.
+    fn get_governed<H, T>(self, path: &'static str, op: &'static Op, h: H) -> Self
+    where
+        H: Handler<T, AppState>,
+        T: 'static,
+    {
+        self.add(Method::GET, path, op, axum::routing::get(h))
     }
 
     fn post<H, T>(self, path: &'static str, op: &'static Op, h: H) -> Self
@@ -263,8 +274,16 @@ pub(crate) fn governed_routes() -> Routes {
         .get("/v1/runs/{id}/steps/{step}/logs", get_step_logs)
         .get("/v1/runs/{id}/services", get_services)
         .get("/v1/runs/{id}/services/{service}/logs", get_service_logs)
-        .get("/v1/runs/{id}/steps/{step}/attach", attach_step)
-        .get("/v1/runs/{id}/steps/{step}/debug-pod", debug_pod_step)
+        .get_governed(
+            "/v1/runs/{id}/steps/{step}/attach",
+            &ops::STEP_ATTACH,
+            attach_step,
+        )
+        .get_governed(
+            "/v1/runs/{id}/steps/{step}/debug-pod",
+            &ops::STEP_DEBUG_POD,
+            debug_pod_step,
+        )
         .get("/v1/runs/{id}/steps/{step}/workspace", list_workspace)
         .get(
             "/v1/runs/{id}/steps/{step}/workspace/file",
