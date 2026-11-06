@@ -360,6 +360,9 @@ record. Read Breaking changes before you upgrade.
 - **The Depot did not start with named login providers.** With `scarab.oauth.providers` set,
   the chart gave the providers' client secrets to the server Deployment only, and the Depot
   StatefulSet refused to boot for want of them. Both get them now.
+- With two server replicas, a finished Run's commit status could end `pending`: one replica
+  posted the verdict while another re-posted the Run's earlier `pending`. A `pending` post is
+  now dropped whenever the Run has finished since, whatever state its verdict post is in.
 
 ### Tests
 

@@ -6980,12 +6980,14 @@ pub async fn drain_forge_statuses(
 ///
 /// - it is from an older generation than the run's current one — the run
 ///   was reopened since, and the newer generation's posts own the forge; or
-/// - it is a non-terminal post of the current generation, the run has
-///   settled in it, and that settle's terminal post is no longer pending
-///   (delivered, or dead-lettered): a run goes non-terminal → terminal once
-///   per generation, so the terminal post is the newer word. While the
-///   terminal post is still pending the non-terminal one is posted first —
-///   the ordinary in-order drain.
+/// - it is a non-terminal post of the current generation and the run has
+///   settled in it: a run goes non-terminal → terminal once per generation,
+///   so the terminal post is the newer word. This holds whatever state the
+///   terminal post's delivery is in. Asking whether the terminal post is
+///   still pending is check-then-act across replicas: replica A can have
+///   the forge accept the terminal post and not yet mark it dispatched
+///   while replica B sees it pending and posts `pending` after it (red team
+///   F9), leaving a settled Run's check pending for good.
 async fn status_post_superseded(
     db: &dyn Db,
     run: &RunId,
@@ -6999,14 +7001,10 @@ async fn status_post_superseded(
     if to.is_terminal() || generation != current {
         return Ok(false);
     }
-    match db.run_status(run).await? {
-        Some(settled) if settled.is_terminal() => Ok(!db
-            .outbox_key_pending(&scarab_engine::run_status_post_key(
-                run, generation, settled,
-            ))
-            .await?),
-        _ => Ok(false),
-    }
+    Ok(db
+        .run_status(run)
+        .await?
+        .is_some_and(|settled| settled.is_terminal()))
 }
 
 /// The commit-status context a Run posts under: `scarab/<pipeline>`, one per
