@@ -143,6 +143,19 @@ async fn apply_through(pool: &PgPool, last_version: i64) {
     }
 }
 
+/// Every migration after `version`, in order: what a database migrated
+/// through 0057 meets on the next upgrade, and the schema the store code
+/// reads (it selects columns later migrations added, such as 0079's
+/// `display_name`).
+async fn apply_after(pool: &PgPool, version: i64) {
+    for m in MIGRATOR.iter().filter(|m| m.version > version) {
+        sqlx::raw_sql(&m.sql)
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("apply migration {}: {e}", m.version));
+    }
+}
+
 async fn apply_0057(pool: &PgPool) {
     let m = MIGRATOR
         .iter()
@@ -287,6 +300,8 @@ async fn backfill_reproduces_the_pure_migration_and_is_a_no_op_the_second_time()
         "a second backfill changes nothing"
     );
 
+    // The store below reads today's schema.
+    apply_after(&pool, 57).await;
     let db = PostgresDb::with_pool(pool.clone());
 
     // The legacy rows are frozen, not dropped, and still read as legacy rules.
