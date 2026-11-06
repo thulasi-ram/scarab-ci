@@ -363,6 +363,11 @@ record. Read Breaking changes before you upgrade.
 - With two server replicas, a finished Run's commit status could end `pending`: one replica
   posted the verdict while another re-posted the Run's earlier `pending`. A `pending` post is
   now dropped whenever the Run has finished since, whatever state its verdict post is in.
+- A Run waiting on a gate whose dependents had all finished without it (a sibling Step
+  failed, so they were skipped) stayed Suspended until someone acted or the gate expired. The
+  gate now ends Skipped ("no longer needed") and the Run settles at once. A gate with no
+  dependents keeps waiting: its verdict is the Run's outcome. A rerun that makes a dependent
+  wait again puts the gate back to waiting.
 
 ### Tests
 
