@@ -165,20 +165,25 @@ async fn a_user_handle_is_minted_once_and_kept() {
 #[tokio::test]
 async fn the_counter_only_moves_forward_and_a_regression_flags_the_clone_forever() {
     let Some((tdb, db)) = db().await else { return };
-    PasskeyStore::insert(&db, &passkey("pk1", "amy", b"cred-1", 0))
+    // Not backup-eligible: a synced passkey's regression is not a clone.
+    let device_bound = |id: &str, cred: &[u8]| Passkey {
+        backup_eligible: false,
+        ..passkey(id, "amy", cred, 0)
+    };
+    PasskeyStore::insert(&db, &device_bound("pk1", b"cred-1"))
         .await
         .unwrap();
-    PasskeyStore::insert(&db, &passkey("pk2", "amy", b"cred-2", 0))
+    PasskeyStore::insert(&db, &device_bound("pk2", b"cred-2"))
         .await
         .unwrap();
 
     // 0/0 is accepted (platform passkeys keep no counter) and recorded.
     assert_eq!(
-        db.record_use("pk1", 0, true, 500).await.unwrap(),
+        db.record_use("pk1", 0, 0, true, 500).await.unwrap(),
         PasskeyUse::Recorded
     );
     assert_eq!(
-        db.record_use("pk1", 5, true, 600).await.unwrap(),
+        db.record_use("pk1", 0, 5, true, 600).await.unwrap(),
         PasskeyUse::Recorded
     );
     let stored = db.get_by_credential(b"cred-1").await.unwrap().unwrap();
@@ -188,7 +193,7 @@ async fn the_counter_only_moves_forward_and_a_regression_flags_the_clone_forever
 
     // Equal is not forward: a replayed counter flags the credential.
     assert_eq!(
-        db.record_use("pk1", 5, true, 700).await.unwrap(),
+        db.record_use("pk1", 5, 5, true, 700).await.unwrap(),
         PasskeyUse::CloneSuspected
     );
     let flagged = db.get_by_credential(b"cred-1").await.unwrap().unwrap();
@@ -198,7 +203,7 @@ async fn the_counter_only_moves_forward_and_a_regression_flags_the_clone_forever
     // ...and a flagged credential is never accepted again, even moving
     // forward; the first flag time stands.
     assert_eq!(
-        db.record_use("pk1", 9, true, 800).await.unwrap(),
+        db.record_use("pk1", 5, 9, true, 800).await.unwrap(),
         PasskeyUse::CloneSuspected
     );
     assert_eq!(
@@ -211,14 +216,14 @@ async fn the_counter_only_moves_forward_and_a_regression_flags_the_clone_forever
     );
 
     // A counter that drops to 0 after being non-zero is a clone too.
-    db.record_use("pk2", 3, false, 100).await.unwrap();
+    db.record_use("pk2", 0, 3, false, 100).await.unwrap();
     assert_eq!(
-        db.record_use("pk2", 0, false, 200).await.unwrap(),
+        db.record_use("pk2", 3, 0, false, 200).await.unwrap(),
         PasskeyUse::CloneSuspected
     );
 
     assert_eq!(
-        db.record_use("nope", 1, false, 1).await.unwrap(),
+        db.record_use("nope", 0, 1, false, 1).await.unwrap(),
         PasskeyUse::NotFound
     );
 
@@ -235,6 +240,63 @@ async fn the_counter_only_moves_forward_and_a_regression_flags_the_clone_forever
         vec!["bob".to_string()]
     );
 
+    tdb.cleanup().await;
+}
+
+/// git-bug 7c6338f: two genuine uses verified against the same stored
+/// count (4) land out of order (6, then 5). The second lost the CAS race, it
+/// was forward when verified, so it is recorded and the counter stays at
+/// 6, never flagged. The same count twice is a replay and still flags.
+#[tokio::test]
+async fn a_lost_counter_race_is_recorded_and_a_repeated_count_still_flags() {
+    let Some((tdb, db)) = db().await else { return };
+    PasskeyStore::insert(
+        &db,
+        &Passkey {
+            backup_eligible: false,
+            ..passkey("pk1", "amy", b"cred-1", 4)
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        db.record_use("pk1", 4, 6, false, 500).await.unwrap(),
+        PasskeyUse::Recorded
+    );
+    assert_eq!(
+        db.record_use("pk1", 4, 5, false, 510).await.unwrap(),
+        PasskeyUse::Recorded,
+        "a lost race is not a clone"
+    );
+    let stored = db.get_by_credential(b"cred-1").await.unwrap().unwrap();
+    assert_eq!(stored.sign_count, 6, "the counter never moves back");
+    assert_eq!(stored.last_used_at, Some(510));
+    assert_eq!(stored.clone_suspected_at, None);
+    // Verified against 4, presenting 6 again: an authenticator never repeats
+    // a count, so this is a replay.
+    assert_eq!(
+        db.record_use("pk1", 4, 6, false, 520).await.unwrap(),
+        PasskeyUse::CloneSuspected
+    );
+    tdb.cleanup().await;
+}
+
+/// git-bug 7c6338f: a backup-eligible (synced) passkey whose counter does
+/// not move is recorded, not flagged.
+#[tokio::test]
+async fn a_synced_passkeys_counter_regression_is_recorded_not_flagged() {
+    let Some((tdb, db)) = db().await else { return };
+    PasskeyStore::insert(&db, &passkey("pk1", "amy", b"cred-1", 7))
+        .await
+        .unwrap();
+    assert_eq!(
+        db.record_use("pk1", 7, 0, true, 500).await.unwrap(),
+        PasskeyUse::Recorded
+    );
+    let stored = db.get_by_credential(b"cred-1").await.unwrap().unwrap();
+    assert_eq!(stored.sign_count, 7);
+    assert_eq!(stored.last_used_at, Some(500));
+    assert_eq!(stored.clone_suspected_at, None);
     tdb.cleanup().await;
 }
 

@@ -107,7 +107,8 @@ fn round_trip(alg: SoftAlg, want: CoseAlgorithm) {
         ok,
         AssertionOk {
             new_count: 1,
-            backup_state: false
+            backup_state: false,
+            counter_regressed: false,
         }
     );
     s.sign_count = ok.new_count;
@@ -569,6 +570,26 @@ fn counter_regression_is_clone_suspected() {
     }
 }
 
+/// git-bug 7c6338f: a backup-eligible (synced) passkey's counter that does
+/// not move forward is reported, not refused as a clone.
+#[test]
+fn a_backup_eligible_counter_regression_is_reported_not_refused() {
+    let mut pk = SoftPasskey::new(SoftAlg::Es256);
+    pk.backup_eligible = true;
+    let c = register(&mut pk).unwrap();
+    let mut s = stored(&c);
+    s.sign_count = 7;
+    pk.counter = Counter::Fixed(0);
+    assert_eq!(
+        assert_once(&mut pk, &s),
+        Ok(AssertionOk {
+            new_count: 0,
+            backup_state: pk.backup_state,
+            counter_regressed: true,
+        })
+    );
+}
+
 #[test]
 fn zero_zero_counter_is_accepted() {
     let mut pk = SoftPasskey::new(SoftAlg::Es256);
@@ -581,7 +602,8 @@ fn zero_zero_counter_is_accepted() {
             assert_once(&mut pk, &s),
             Ok(AssertionOk {
                 new_count: 0,
-                backup_state: false
+                backup_state: false,
+                counter_regressed: false,
             })
         );
     }

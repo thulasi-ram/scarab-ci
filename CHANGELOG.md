@@ -197,6 +197,14 @@ record. Read Breaking changes before you upgrade.
   asked only for `Administer`. It now needs a step-up confirmation, as a secret write does: a
   browser session's 5-minute window satisfies it. An API token or a session presented as
   `Bearer` can no longer open one, since a WebSocket cannot be held for a confirmation.
+- **Passkey counter checks.** Two uses of one passkey verified at the same time could flag it
+  as a suspected clone when the later count landed first. A use whose count was ahead of the
+  stored one when it was checked, and differs from the count stored since, is now recorded;
+  the same count twice still flags. A synced passkey (backup-eligible), whose devices do not
+  share a counter, is no longer flagged when its counter does not move; the use is recorded
+  as `passkey.counter_regressed`. Once every passkey of a user is flagged, a fresh login no
+  longer enrolls a new first passkey (a thief holding the forge account can make a fresh
+  login): an Owner must reset the user's passkeys first, and a step-up refusal says so.
 - **Unpinning a Run's snapshots needs a step-up.** `DELETE /v1/runs/{id}/snapshots-pin`
   shortens how long the Run's snapshots are kept, so it now needs a step-up confirmation
   (window). Pinning does not.

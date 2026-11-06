@@ -320,23 +320,30 @@ impl PasskeyStore for PostgresDb {
     async fn record_use(
         &self,
         id: &str,
+        read_count: u32,
         new_count: u32,
         backup_state: bool,
         now_ms: i64,
     ) -> Result<PasskeyUse, IdentityError> {
         let new_count = i64::from(new_count);
-        // The counter CAS: forward, or 0/0 (platform passkeys that keep no
-        // counter), and never on a flagged credential.
+        // The counter CAS, never on a flagged credential: forward, or 0/0
+        // (platform passkeys that keep no counter), or a lost race with a
+        // concurrent use at another count, or a backup-eligible (synced)
+        // passkey. The counter never moves back.
         let recorded = sqlx::query(
-            "UPDATE passkeys SET sign_count = $2, backup_state = $3, last_used_at = $4
+            "UPDATE passkeys
+             SET sign_count = GREATEST(sign_count, $2), backup_state = $3, last_used_at = $4
              WHERE id = $1 AND clone_suspected_at IS NULL
-               AND (sign_count < $2 OR ($2 = 0 AND sign_count = 0))
+               AND (sign_count < $2 OR ($2 = 0 AND sign_count = 0)
+                    OR ($2 > $5 AND sign_count <> $2)
+                    OR backup_eligible)
              RETURNING id",
         )
         .bind(id)
         .bind(new_count)
         .bind(backup_state)
         .bind(now_ms)
+        .bind(i64::from(read_count))
         .fetch_optional(self.pool())
         .await
         .map_err(identity_err)?;

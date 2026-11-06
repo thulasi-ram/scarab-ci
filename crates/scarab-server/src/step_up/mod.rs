@@ -681,6 +681,10 @@ pub struct StepUpRefusal {
 const MSG_CONFIRM: &str = "This needs a step-up confirmation: confirm with your passkey.";
 const MSG_ENROLL: &str = "This needs a step-up confirmation, and you have no passkey yet: \
      enroll one first (from a browser login made in the last 5 minutes).";
+/// Every passkey of the caller is flagged as a suspected clone.
+pub(crate) const MSG_FLAGGED_RESET: &str = "This needs a step-up confirmation, and every passkey \
+     you had is flagged as possibly cloned. Ask an Owner of your Org to reset your passkeys, \
+     then enroll a new one.";
 const MSG_MACHINE: &str = "This needs a step-up confirmation by a human with a passkey. An API \
      token or a session presented as Bearer can never give one.";
 const MSG_REPLAY_MISMATCH: &str = "This is not the operation that was confirmed: a confirmed \
@@ -904,6 +908,24 @@ pub(crate) async fn require(
 
     let passkeys = svc.usable_passkeys(subject).await?;
     if passkeys.is_empty() {
+        // Flagged passkeys need an Owner reset, not a new first enrollment
+        // (git-bug 7c6338f).
+        if !svc
+            .passkeys
+            .list(subject)
+            .await
+            .map_err(store_err)?
+            .is_empty()
+        {
+            return refuse(
+                st,
+                op,
+                p,
+                refusal(MSG_FLAGGED_RESET, "enroll"),
+                "passkeys flagged",
+            )
+            .await;
+        }
         let mut r = refusal(MSG_ENROLL, "enroll");
         r.enroll_url = Some(ENROLL_URL.to_string());
         r.fresh_login_until = session.fresh_login_until.filter(|t| *t > now);

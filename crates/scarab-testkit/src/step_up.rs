@@ -104,6 +104,7 @@ impl PasskeyStore for InMemoryPasskeys {
     async fn record_use(
         &self,
         id: &str,
+        read_count: u32,
         new_count: u32,
         backup_state: bool,
         now_ms: i64,
@@ -113,8 +114,9 @@ impl PasskeyStore for InMemoryPasskeys {
             return Ok(PasskeyUse::NotFound);
         };
         let forward = p.sign_count < new_count || (new_count == 0 && p.sign_count == 0);
-        if p.clone_suspected_at.is_none() && forward {
-            p.sign_count = new_count;
+        let lost_race = new_count > read_count && p.sign_count != new_count;
+        if p.clone_suspected_at.is_none() && (forward || lost_race || p.backup_eligible) {
+            p.sign_count = p.sign_count.max(new_count);
             p.backup_state = backup_state;
             p.last_used_at = Some(now_ms);
             Ok(PasskeyUse::Recorded)
@@ -712,21 +714,48 @@ mod tests {
         pk.insert(&passkey("p1", 0)).await.unwrap();
         assert!(pk.insert(&passkey("p1", 0)).await.is_err());
         assert_eq!(
-            pk.record_use("p1", 0, false, 1).await.unwrap(),
+            pk.record_use("p1", 0, 0, false, 1).await.unwrap(),
             PasskeyUse::Recorded
         );
         assert_eq!(
-            pk.record_use("p1", 4, false, 2).await.unwrap(),
+            pk.record_use("p1", 0, 4, false, 2).await.unwrap(),
             PasskeyUse::Recorded
         );
         assert_eq!(
-            pk.record_use("p1", 4, false, 3).await.unwrap(),
+            pk.record_use("p1", 4, 4, false, 3).await.unwrap(),
             PasskeyUse::CloneSuspected
         );
         assert_eq!(
-            pk.record_use("p1", 9, false, 4).await.unwrap(),
+            pk.record_use("p1", 4, 9, false, 4).await.unwrap(),
             PasskeyUse::CloneSuspected,
             "flagged forever"
+        );
+        // A lost race (verified against 4, landing after 6) is recorded and
+        // the counter stays at 6; a synced passkey's regression is recorded
+        // (git-bug 7c6338f).
+        pk.insert(&passkey("p2", 4)).await.unwrap();
+        assert_eq!(
+            pk.record_use("p2", 4, 6, false, 5).await.unwrap(),
+            PasskeyUse::Recorded
+        );
+        assert_eq!(
+            pk.record_use("p2", 4, 5, false, 6).await.unwrap(),
+            PasskeyUse::Recorded
+        );
+        assert_eq!(
+            pk.record_use("p2", 4, 6, false, 7).await.unwrap(),
+            PasskeyUse::CloneSuspected,
+            "the same count twice is a replay"
+        );
+        pk.insert(&Passkey {
+            backup_eligible: true,
+            ..passkey("p3", 7)
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            pk.record_use("p3", 7, 0, true, 8).await.unwrap(),
+            PasskeyUse::Recorded
         );
         assert_eq!(pk.user_handle("amy", [1; 32]).await.unwrap(), [1; 32]);
         assert_eq!(pk.user_handle("amy", [2; 32]).await.unwrap(), [1; 32]);

@@ -110,8 +110,8 @@ pub struct Passkey {
     /// SHA-256 of the session that enrolled it.
     pub created_session_hash: String,
     pub last_used_at: Option<i64>,
-    /// Set once a counter went backwards (or a use lost the race). A flagged
-    /// credential is never offered or accepted again.
+    /// Set once a counter went backwards (or the same count was presented
+    /// twice). A flagged credential is never offered or accepted again.
     pub clone_suspected_at: Option<i64>,
 }
 
@@ -153,14 +153,25 @@ pub trait PasskeyStore: Send + Sync {
     /// is [`IdentityError::Conflict`].
     async fn insert(&self, passkey: &Passkey) -> Result<(), IdentityError>;
 
-    /// Record an accepted assertion, atomically:
-    /// the counter is accepted only if it moved forward (`stored < new`) or
-    /// both are 0, and only while the passkey is not flagged. Anything else
-    /// flags it (`clone_suspected_at = now`, kept if already set) and answers
-    /// [`PasskeyUse::CloneSuspected`].
+    /// Record an accepted assertion, atomically, only while the passkey is
+    /// not flagged. `read_count` is the stored counter the assertion was
+    /// verified against. The use is recorded, keeping the higher of the
+    /// stored and the new counter, when:
+    ///
+    /// - the counter moved forward (`stored < new`), or both are 0;
+    /// - it lost a race (git-bug 7c6338f): `new > read_count`, so it was
+    ///   forward when verified, and a concurrent use moved the stored
+    ///   counter on to a different value. Two uses with the same non-zero
+    ///   count are not a race (an authenticator never repeats one);
+    /// - the passkey is backup-eligible: a synced passkey's devices do not
+    ///   share a counter, so a counter that did not move is not a clone.
+    ///
+    /// Anything else flags it (`clone_suspected_at = now`, kept if already
+    /// set) and answers [`PasskeyUse::CloneSuspected`].
     async fn record_use(
         &self,
         id: &str,
+        read_count: u32,
         new_count: u32,
         backup_state: bool,
         now_ms: i64,
@@ -585,6 +596,9 @@ pub mod security_event_kind {
     pub const PASSKEY_RESET: &str = "passkey.reset";
     pub const PASSKEY_BREAK_GLASS_RESET: &str = "passkey.break_glass_reset";
     pub const PASSKEY_CLONE_SUSPECTED: &str = "passkey.clone_suspected";
+    /// A backup-eligible (synced) passkey presented a counter that did not
+    /// move forward: recorded, not flagged.
+    pub const PASSKEY_COUNTER_REGRESSED: &str = "passkey.counter_regressed";
     pub const GUARD_NOT_CONSULTED: &str = "guard.not_consulted";
     /// `scarab-server admin grant`: an operator seeded a role binding
     /// straight in the database.
@@ -601,6 +615,7 @@ pub mod security_event_kind {
         PASSKEY_RESET,
         PASSKEY_BREAK_GLASS_RESET,
         PASSKEY_CLONE_SUSPECTED,
+        PASSKEY_COUNTER_REGRESSED,
     ];
 }
 

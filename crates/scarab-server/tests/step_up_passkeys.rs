@@ -234,6 +234,70 @@ async fn a_counter_regression_flags_the_passkey() {
     assert_eq!(b["passkeys"][0]["clone_suspected"], true);
 }
 
+/// git-bug 7c6338f: once every passkey is flagged, a fresh login cannot
+/// enroll a new "first" one (a fresh forge login is what a thief holding
+/// the forge account can produce). Only an Owner reset clears the way.
+#[tokio::test]
+async fn a_flagged_passkey_needs_an_owner_reset_before_a_new_first_one() {
+    let h = harness();
+    let s = h.browser_session(owner("amy")).await;
+    let mut soft = passkey();
+    h.enroll(&s, &mut soft, "Laptop").await;
+    h.open_window(&s, &mut soft).await; // count 1
+    soft.counter = Counter::Fixed(1);
+    let (_, ch) = h.cookie("POST", "/v1/me/step-up/options", None, &s).await;
+    let (st, _) = h.answer(&s, &mut soft, &ch).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+
+    // The session's login is fresh, which used to be enough.
+    let (st, b) = h
+        .cookie(
+            "POST",
+            "/v1/me/passkeys/registration/options",
+            Some(json!({ "label": "New" })),
+            &s,
+        )
+        .await;
+    assert_eq!(
+        (st, b["code"].clone()),
+        (StatusCode::FORBIDDEN, json!("passkey_reset_required")),
+        "{b}"
+    );
+    let (_, me) = h.cookie("GET", "/v1/me/security", None, &s).await;
+    assert_eq!(me["can_enroll_first"], false, "{me}");
+    // A crown jewel says why, instead of offering enrollment.
+    let (st, b) = h.cookie("POST", "/v1/secrets", Some(secret(1)), &s).await;
+    assert!(is_step_up(st, &b), "{st} {b}");
+    assert!(b["message"].as_str().unwrap().contains("reset"), "{b}");
+    assert!(b.get("enroll_url").is_none_or(|u| u.is_null()), "{b}");
+
+    // An Owner reset removes the flagged passkey; then a first one enrolls.
+    h.passkeys.remove_all("amy").await.unwrap();
+    let mut fresh = passkey();
+    h.enroll(&s, &mut fresh, "New").await;
+}
+
+/// git-bug 7c6338f: a backup-eligible (synced) passkey whose counter does
+/// not move forward is recorded as `passkey.counter_regressed` and still
+/// confirms; it is not flagged.
+#[tokio::test]
+async fn a_synced_passkeys_counter_regression_is_recorded_not_flagged() {
+    let h = harness();
+    let s = h.browser_session(owner("amy")).await;
+    let mut soft = passkey();
+    soft.backup_eligible = true;
+    h.enroll(&s, &mut soft, "Phone").await;
+    h.open_window(&s, &mut soft).await; // count 1
+    h.open_window(&s, &mut soft).await; // count 2
+    soft.counter = Counter::Fixed(0);
+    h.open_window(&s, &mut soft).await;
+    let stored = h.passkeys.list("amy").await.unwrap();
+    assert_eq!(stored[0].clone_suspected_at, None);
+    assert_eq!(stored[0].sign_count, 2, "the counter never moves back");
+    assert!(h.events_of("passkey.clone_suspected").is_empty());
+    assert_eq!(h.events_of("passkey.counter_regressed").len(), 1);
+}
+
 /// Stored per Principal, with its label; `last_used_at` moves on assertion;
 /// a counter that stays 0 (a synced platform passkey) is fine.
 #[tokio::test]

@@ -37,7 +37,7 @@ use scarab_webauthn::{
 
 use super::{
     descriptors, event, random_bytes, random_id, sent_challenge, store_err, GuardCtx,
-    StepUpService, WebauthnChallengeDto,
+    StepUpService, WebauthnChallengeDto, MSG_FLAGGED_RESET,
 };
 use crate::{authenticate, ApiError, AppState, Caller, SessionFacts};
 
@@ -293,6 +293,9 @@ pub(crate) async fn me_security(
         .filter(|p| p.clone_suspected_at.is_none())
         .count() as u64;
     let has_passkey = usable_passkey_count > 0;
+    // A first passkey may be enrolled only by one who never had one: a
+    // flagged passkey needs an Owner reset first (git-bug 7c6338f).
+    let never_enrolled = passkeys.is_empty();
     // An API token is a narrowing of its owner (one scope, a ceiling): it
     // learns whether its human can confirm (the CLI's `security setup`
     // polls that), never the passkeys themselves (git-bug fe777ed). A
@@ -318,7 +321,7 @@ pub(crate) async fn me_security(
         },
         passkeys_hidden,
         window_expires_at,
-        can_enroll_first: !has_passkey && fresh_login_until.is_some_and(|t| t > now),
+        can_enroll_first: never_enrolled && fresh_login_until.is_some_and(|t| t > now),
         fresh_login_until,
         fresh_login_url,
     }))
@@ -357,7 +360,30 @@ pub(crate) async fn passkey_registration_options(
         )));
     }
     let all = svc.passkeys.list(subject).await.map_err(store_err)?;
-    if all.iter().all(|p| p.clone_suspected_at.is_some()) {
+    if !all.is_empty() && all.iter().all(|p| p.clone_suspected_at.is_some()) {
+        // Every passkey is flagged as a suspected clone (git-bug 7c6338f):
+        // only an Owner reset clears them. Otherwise a fresh forge login —
+        // which a thief holding the forge account can produce — would
+        // enroll a new "first" passkey.
+        let mut ev = event(
+            kind::STEP_UP_REFUSED,
+            subject,
+            caller.event_label(),
+            None,
+            now,
+        );
+        ev.op = Some(ctx.op.id.to_string());
+        ev.target = Some(label.clone());
+        ev.session_hash = Some(facts.id_hash.clone());
+        ev.detail = serde_json::json!({ "mode": "enroll", "reason": "passkeys flagged" });
+        svc.record_refusal(ev).await;
+        return Err(ceremony(
+            StatusCode::FORBIDDEN,
+            "passkey_reset_required",
+            MSG_FLAGGED_RESET,
+        ));
+    }
+    if all.is_empty() {
         // The FIRST usable passkey: a valid session is not enough (a stolen
         // one could enroll the thief's passkey), only a fresh browser login.
         if !facts.fresh_login_until.is_some_and(|t| t > now) {
@@ -825,19 +851,14 @@ async fn verify_assertion_once(
         sign_count: passkey.sign_count,
         backup_eligible: passkey.backup_eligible,
     };
-    let clone_event = |detail: serde_json::Value| {
-        let mut ev = event(
-            kind::PASSKEY_CLONE_SUSPECTED,
-            &subject,
-            caller.event_label(),
-            None,
-            now,
-        );
+    let passkey_event = |kind: &str, detail: serde_json::Value| {
+        let mut ev = event(kind, &subject, caller.event_label(), None, now);
         ev.passkey_id = Some(passkey.id.clone());
         ev.session_hash = Some(facts.id_hash.clone());
         ev.detail = detail;
         ev
     };
+    let clone_event = |detail| passkey_event(kind::PASSKEY_CLONE_SUSPECTED, detail);
     let ok = match scarab_webauthn::verify_assertion(svc.rp(), sent, &stored, &handle, &resp) {
         Ok(ok) => ok,
         Err(WebauthnError::CloneSuspected) => {
@@ -859,11 +880,31 @@ async fn verify_assertion_once(
         }
         Err(e) => return Err(webauthn_refused(e)),
     };
-    // The counter is accepted with a compare-and-swap: two racing
-    // assertions cannot both pass, and the loser is flagged.
+    // A synced passkey whose counter did not move is not taken as a clone
+    // (git-bug 7c6338f), but the use is evidence: record it.
+    if ok.counter_regressed {
+        svc.record(passkey_event(
+            kind::PASSKEY_COUNTER_REGRESSED,
+            serde_json::json!({
+                "stored_count": passkey.sign_count,
+                "presented_count": ok.new_count,
+                "backup_eligible": true,
+            }),
+        ))
+        .await;
+    }
+    // The counter is accepted with a compare-and-swap against the count it
+    // was verified with: a use that lost a race with a concurrent use at
+    // another count is recorded, the same count twice is flagged.
     match svc
         .passkeys
-        .record_use(&passkey.id, ok.new_count, ok.backup_state, now)
+        .record_use(
+            &passkey.id,
+            passkey.sign_count,
+            ok.new_count,
+            ok.backup_state,
+            now,
+        )
         .await
         .map_err(store_err)?
     {
