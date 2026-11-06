@@ -148,7 +148,7 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
         "DELETE",
         "/v1/runs/{id}/snapshots-pin",
         "run.snapshots_unpin",
-        "NG",
+        "CJ-W",
     ),
     ("POST", "/v1/runs/{id}/cancel", "run.cancel", "EX"),
     ("GET", "/v1/runs/{id}/artifacts", "read", "READ"),
@@ -840,6 +840,27 @@ async fn the_debug_shell_needs_a_step_up() {
     }
 }
 
+/// git-bug 9bbaa1d: deleting a Run's snapshot pin shortens how long its
+/// snapshots are kept, a loosening, so it needs a step-up; pinning them
+/// does not.
+#[tokio::test]
+async fn unpinning_snapshots_needs_a_step_up_and_pinning_does_not() {
+    let h = harness();
+    h.grant("amy", Scope::Org("acme".into()), Role::Owner).await;
+    let s = h.browser_session(owner("amy")).await;
+    let mut soft = passkey();
+    h.enroll(&s, &mut soft, "Laptop").await;
+    let uri = "/v1/runs/r1/snapshots-pin";
+    let (st, b) = h.cookie("DELETE", uri, None, &s).await;
+    assert_step_up(st, &b, "window");
+    assert_eq!(b["op"], "run.snapshots_unpin");
+    let (st, b) = h.cookie("POST", uri, None, &s).await;
+    assert!(!is_step_up(st, &b), "pinning is not governed: {st} {b}");
+    h.open_window(&s, &mut soft).await;
+    let (st, b) = h.cookie("DELETE", uri, None, &s).await;
+    assert!(!is_step_up(st, &b), "a live window satisfies it: {st} {b}");
+}
+
 /// `connection.resync` binds every reported repo through the same path as
 /// `connection.bind_repo`, so it needs the same window step-up: under
 /// enforcement an Owner without one is refused, exactly like bind_repo.
@@ -1045,7 +1066,7 @@ async fn exempt_and_ungoverned_routes_never_ask_for_a_step_up() {
         );
         checked += 1;
     }
-    assert_eq!(checked, 36, "the EX + NG mutating routes");
+    assert_eq!(checked, 35, "the EX + NG mutating routes");
     assert!(h.events_of("step_up.refused").is_empty());
 }
 

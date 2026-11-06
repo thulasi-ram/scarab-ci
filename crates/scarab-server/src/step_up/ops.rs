@@ -667,16 +667,6 @@ pub static SNAPSHOTS_PIN: Op = op(
     &[],
     &["path:id"],
 );
-pub static SNAPSHOTS_UNPIN: Op = op(
-    "run.snapshots_unpin",
-    "Unpin a run's snapshots",
-    Class::NotGoverned("returns to the declared retention, never below it"),
-    "§3 shortening retention (AMBIG: not below declared)",
-    MEMBER,
-    OrgOf::Run,
-    &[],
-    &["path:id"],
-);
 pub static GATE_RELEASE: Op = op(
     "gate.release_external",
     "Release an external or plugin gate",
@@ -1090,6 +1080,20 @@ pub static STEP_DEBUG_POD: Op = op(
     &["path:id", "path:step"],
 )
 .browser_only();
+
+// Deleting a snapshot pin shortens how long a Run's snapshots are kept: a
+// loosening, so a step-up (git-bug 9bbaa1d). Pinning extends it and is not
+// governed.
+pub static SNAPSHOTS_UNPIN: Op = op(
+    "run.snapshots_unpin",
+    "Unpin a run's snapshots",
+    Class::CrownJewel(W),
+    "§3 shortening retention (git-bug 9bbaa1d)",
+    MEMBER,
+    OrgOf::Run,
+    &[],
+    &["path:id"],
+);
 
 // --- crown jewels, always ask ------------------------------------------------
 

@@ -197,6 +197,9 @@ record. Read Breaking changes before you upgrade.
   asked only for `Administer`. It now needs a step-up confirmation, as a secret write does: a
   browser session's 5-minute window satisfies it. An API token or a session presented as
   `Bearer` can no longer open one, since a WebSocket cannot be held for a confirmation.
+- **Unpinning a Run's snapshots needs a step-up.** `DELETE /v1/runs/{id}/snapshots-pin`
+  shortens how long the Run's snapshots are kept, so it now needs a step-up confirmation
+  (window). Pinning does not.
 
 ### Features
 
