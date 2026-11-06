@@ -1646,6 +1646,9 @@ pub enum ApiError {
     /// says where it went (410). The per-repo environment writes, replaced by
     /// the org-level Environment (ADR-0071).
     Gone(String),
+    /// A conditional request's `If-Match` / `If-None-Match` did not hold
+    /// (412); the text says why.
+    PreconditionFailed(String),
     Db(DbError),
     /// `403 step_up_required` (ADR-0073 §5): a crown-jewel operation without
     /// a valid StepUpConfirmation. JSON body: [`step_up::StepUpRefusal`].
@@ -1727,6 +1730,7 @@ impl IntoResponse for ApiError {
             ApiError::Forbidden => (StatusCode::FORBIDDEN, "insufficient role").into_response(),
             ApiError::Denied(m) => (StatusCode::FORBIDDEN, m).into_response(),
             ApiError::Gone(m) => (StatusCode::GONE, m).into_response(),
+            ApiError::PreconditionFailed(m) => (StatusCode::PRECONDITION_FAILED, m).into_response(),
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m).into_response(),
             ApiError::Conflict(m) => (StatusCode::CONFLICT, m).into_response(),
             ApiError::NotImplemented(m) => (StatusCode::NOT_IMPLEMENTED, m).into_response(),

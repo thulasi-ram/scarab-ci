@@ -387,6 +387,12 @@ record. Read Breaking changes before you upgrade.
   gate now ends Skipped ("no longer needed") and the Run settles at once. A gate with no
   dependents keeps waiting: its verdict is the Run's outcome. A rerun that makes a dependent
   wait again puts the gate back to waiting.
+- Two admins writing one org Environment at the same time could get a 500 when Postgres
+  reported a deadlock (`40P01`) or a serialization failure (`40001`). Those are now a 409 that
+  says to retry. `PUT /v1/orgs/{org}/environments/{env}` takes `If-None-Match: *` (create
+  only) and `If-Match: <etag>` (replace only the Environment that was read), answers 412 when
+  either does not hold, and returns the Environment's `ETag`, as does its GET. Without either
+  header it creates or replaces as before.
 
 ### Tests
 

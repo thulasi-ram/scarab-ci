@@ -1756,6 +1756,14 @@
         "responses": {
           "200": {
             "description": "",
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "the Environment's entity tag, for `If-Match` on its PUT"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1804,6 +1812,30 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "description": "replace only the Environment whose `ETag` this is",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "description": "`*`: create only",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           }
         ],
         "requestBody": {
@@ -1819,6 +1851,14 @@
         "responses": {
           "200": {
             "description": "",
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "the Environment's entity tag as stored"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1828,13 +1868,19 @@
             }
           },
           "400": {
-            "description": "invalid name or description, or an unknown field"
+            "description": "invalid name or description, an unknown field, or a malformed precondition"
           },
           "403": {
             "description": "not an org admin"
           },
           "404": {
             "description": "org Environments not configured"
+          },
+          "409": {
+            "description": "a concurrent write won; retry"
+          },
+          "412": {
+            "description": "`If-Match` or `If-None-Match: *` did not hold; reload"
           }
         },
         "security": [
@@ -7177,8 +7223,21 @@
               }
             }
           },
+          "403": {
+            "description": "`step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. Or the caller's role is insufficient.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
           "404": {
             "description": "no such run"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
           }
         },
         "security": [

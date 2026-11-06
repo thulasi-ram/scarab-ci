@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 mod org_environment;
 pub use org_environment::{
     validate_org_environment_name, OrgEnvironment, OrgEnvironmentError, OrgEnvironmentStore,
-    MAX_INSTALLATION_NAME_CHARS, MAX_ORG_ENVIRONMENT_DESCRIPTION_CHARS,
+    WritePrecondition, MAX_INSTALLATION_NAME_CHARS, MAX_ORG_ENVIRONMENT_DESCRIPTION_CHARS,
 };
 
 /// The org-level Environment's governance model and its pure resolution

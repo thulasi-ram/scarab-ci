@@ -6677,6 +6677,8 @@ export interface operations {
         responses: {
             200: {
                 headers: {
+                    /** @description the Environment's entity tag, for `If-Match` on its PUT */
+                    ETag?: string;
                     [name: string]: unknown;
                 };
                 content: {
@@ -6702,7 +6704,12 @@ export interface operations {
     put_org_environment: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /** @description replace only the Environment whose `ETag` this is */
+                "If-Match"?: string | null;
+                /** @description `*`: create only */
+                "If-None-Match"?: string | null;
+            };
             path: {
                 /** @description org */
                 org: string;
@@ -6719,13 +6726,15 @@ export interface operations {
         responses: {
             200: {
                 headers: {
+                    /** @description the Environment's entity tag as stored */
+                    ETag?: string;
                     [name: string]: unknown;
                 };
                 content: {
                     "application/json": components["schemas"]["OrgEnvironmentDto"];
                 };
             };
-            /** @description invalid name or description, or an unknown field */
+            /** @description invalid name or description, an unknown field, or a malformed precondition */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -6741,6 +6750,20 @@ export interface operations {
             };
             /** @description org Environments not configured */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description a concurrent write won; retry */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description `If-Match` or `If-None-Match: *` did not hold; reload */
+            412: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -10477,8 +10500,24 @@ export interface operations {
                     "application/json": components["schemas"]["SnapshotRetentionDto"];
                 };
             };
+            /** @description `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. Or the caller's role is insufficient. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
             /** @description no such run */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
                 headers: {
                     [name: string]: unknown;
                 };
