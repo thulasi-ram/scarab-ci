@@ -4013,11 +4013,16 @@ code.c { font-family: var(--font-mono); font-size: var(--fs-sm); color: var(--co
 /* ---- Modal ---- */
 .dlg-scrim {
   position: fixed; inset: 0; z-index: 50;
-  display: flex; align-items: flex-start; justify-content: center;
-  padding: 10vh 16px 16px;
+  display: flex; flex-direction: column; align-items: center;
+  padding: 16px;
   background: rgba(10, 18, 14, 0.5); backdrop-filter: blur(2px);
   transition: opacity 0.18s var(--ease-out);
 }
+/* The dialog sits 10vh from the top. A dialog taller than the room left
+   below that eats the gap first (this spacer shrinks a thousand times faster
+   than the dialog), and only scrolls its body once the gap is gone, so a
+   form that fits the window is never cut off at the footer. */
+.dlg-scrim::before { content: ""; flex: 0 1000 calc(10vh - 16px); min-height: 0; }
 @starting-style { .dlg-scrim { opacity: 0; } }
 /* The three widths. Only Modal's `size` picks one. */
 .dlg-narrow { --dlg-w: 440px; }
@@ -4025,7 +4030,8 @@ code.c { font-family: var(--font-mono); font-size: var(--fs-sm); color: var(--co
 .dlg-wide { --dlg-w: 760px; }
 .dlg {
   position: relative; display: flex; flex-direction: column;
-  width: min(var(--dlg-w), 100%); max-height: min(84vh, 860px);
+  flex: 0 1 auto; min-height: 0;
+  width: min(var(--dlg-w), 100%); max-height: 860px;
   background: var(--emerald-elevated); border: 1px solid var(--border);
   border-radius: var(--radius-lg); overflow: hidden; outline: none;
   box-shadow: 0 24px 60px -28px rgba(10, 20, 14, 0.5);
@@ -4049,8 +4055,12 @@ code.c { font-family: var(--font-mono); font-size: var(--fs-sm); color: var(--co
 .dlg-b {
   flex: 1 1 auto; min-height: 0; overflow-y: auto;
   display: flex; flex-direction: column; gap: 16px; padding: 20px 24px;
-}
-/* A sectioned body: each section carries its own padding and rule. */
+  /* When the body scrolls, a shadow above the footer says there is more
+     below; the cover (attached to the content) hides it at the end. */
+  background:
+    linear-gradient(to top, var(--emerald-elevated) 50%, transparent) center bottom / 100% 28px no-repeat local,
+    linear-gradient(to top, rgba(0, 0, 0, 0.22), transparent) center bottom / 100% 14px no-repeat scroll;
+}/* A sectioned body: each section carries its own padding and rule. */
 .dlg-b:has(> .dlg-sec) { gap: 0; padding: 0; }
 .dlg-sec {
   display: grid; grid-template-columns: 112px minmax(0, 1fr); gap: 0 18px;
