@@ -1,11 +1,11 @@
-// The secret coverage matrix as an EDITOR (ADR-0060 part B).
+// The secret coverage matrix as an EDITOR.
 //
 // Rows are keys, columns are scopes: `Repository default` (the repo scope every
 // environment falls through to) then one per Environment. Clicking a cell edits
 // the value AT THAT SCOPE — so the same grid that shows you a gap is the thing
 // that fills it. Before this, an environment-scoped secret had no UI at all.
 //
-// Secrets are one key-addressed namespace resolved by scope (ADR-0037 §C), which
+// Secrets are one key-addressed namespace resolved by scope, which
 // is why this is one grid rather than a per-environment editor: the Environments
 // tab stays rules-only, and "does prod override the default?" is a question you
 // answer by looking along a row.
@@ -16,7 +16,7 @@
 //   ●  set here      a value at exactly this scope
 //   ○  inherited     none here; resolves from repo/org (the tooltip says which)
 //   –  unset         resolves to nothing
-//   ⊘  silenced      unset ON PURPOSE (ADR-0037 marker) — advisory, never blocks
+//   ⊘  silenced      unset ON PURPOSE (a marker) — advisory, never blocks
 import { createResource, createSignal, For, Show } from "solid-js";
 import {
   fetchSecretMatrix,
@@ -28,6 +28,8 @@ import {
   type SecretCellStatus,
 } from "../api/client";
 import Icon from "./Icon";
+import Modal, { ModalMessage } from "./Modal";
+import { Checkbox, Field, Input } from "./Field";
 
 const CELL: Record<SecretCellStatus, { glyph: string; label: string }> = {
   set: { glyph: "●", label: "set at this scope" },
@@ -205,77 +207,63 @@ function CellEditor(props: {
     isDefaultColumn() ? "the org-wide value, if any" : "the repository default";
 
   return (
-    <div class="modal-scrim" onClick={props.onClose}>
-      <div class="modal" onClick={(e) => e.stopPropagation()}>
-        <div class="panel-h">
-          <span>
-            {props.cell.key} · {columnLabel(props.cell.column)}
-          </span>
-        </div>
-        <div class="modal-body">
-          <p class="subtle cell-state">
-            <small>
-              <Show when={props.status === "set"}>
-                A value is set at this scope. Saving replaces it.
-              </Show>
-              <Show when={props.status === "inherited"}>
-                Currently inherited from the{" "}
-                {props.inheritedFrom === "org" ? "org" : "repository default"}. Saving
-                <b> overrides it here only</b>.
-              </Show>
-              <Show when={props.status === "unset" || props.status === "silenced"}>
-                Nothing resolves here today. Saving defines it at this scope.
-              </Show>
-            </small>
-          </p>
-          <div class="form-r">
-            <label>value</label>
-            <input
-              class="input mono"
-              type="password"
-              placeholder="value (write-only)"
-              value={value()}
-              onInput={(e) => setValue(e.currentTarget.value)}
-            />
-          </div>
+    <Modal
+      eyebrow={`${props.org}/${props.repo} · secrets`}
+      title={
+        <>
+          <span class="mono">{props.cell.key}</span> · {columnLabel(props.cell.column)}
+        </>
+      }
+      purpose={`Encrypted at rest, never displayed. Clearing here falls back to ${fallback()}.`}
+      busy={busy()}
+      onClose={props.onClose}
+      footer={
+        <>
           <Show when={error()}>
-            <p class="error">{error()}</p>
+            <ModalMessage>{error()}</ModalMessage>
           </Show>
-          <Show when={props.status !== "set" && props.status !== "inherited"}>
-            <label class="checkbox-inline secret-overwrite">
-              <input
-                type="checkbox"
-                checked={props.status === "silenced"}
-                disabled={busy()}
-                onChange={toggleSilenced}
-              />
-              <span>
-                Intentionally unset — silence this cell so the gap doesn't read as an
-                oversight. Advisory only.
-              </span>
-            </label>
-          </Show>
-        </div>
-        <div class="modal-foot">
-          <div class="modal-actions">
-            <button class="btn btn-primary" disabled={busy() || !value()} onClick={save}>
-              <Icon icon="key-round" size={14} />{" "}
-              {busy() ? "Saving…" : props.status === "set" ? "Replace" : "Set here"}
+          <Show when={props.status === "set"}>
+            <button class="btn btn-danger" type="button" disabled={busy()} onClick={clear}>
+              Clear here
             </button>
-            <Show when={props.status === "set"}>
-              <button class="btn btn-danger" disabled={busy()} onClick={clear}>
-                Clear here
-              </button>
-            </Show>
-            <button class="btn btn-ghost" onClick={props.onClose}>Cancel</button>
-          </div>
-          <p class="subtle modal-note">
-            <small>
-              Encrypted at rest, never displayed. Clearing here falls back to {fallback()}.
-            </small>
-          </p>
-        </div>
-      </div>
-    </div>
+            <span class="sp" />
+          </Show>
+          <button class="btn btn-ghost" type="button" onClick={props.onClose} disabled={busy()}>
+            Cancel
+          </button>
+          <button class="btn btn-primary" type="button" disabled={busy() || !value()} onClick={save}>
+            <Icon icon="key-round" size={14} />{" "}
+            {busy() ? "Saving…" : props.status === "set" ? "Replace" : "Set here"}
+          </button>
+        </>
+      }
+    >
+      <p class="dlg-text cell-state">
+        <Show when={props.status === "set"}>
+          A value is set at this scope. Saving replaces it.
+        </Show>
+        <Show when={props.status === "inherited"}>
+          Currently inherited from the{" "}
+          {props.inheritedFrom === "org" ? "org" : "repository default"}. Saving
+          <b> overrides it here only</b>.
+        </Show>
+        <Show when={props.status === "unset" || props.status === "silenced"}>
+          Nothing resolves here today. Saving defines it at this scope.
+        </Show>
+      </p>
+      <Field label="Value">
+        <Input mono autofocus type="password" placeholder="value (write-only)" value={value()} onValue={setValue} />
+      </Field>
+      <Show when={props.status !== "set" && props.status !== "inherited"}>
+        <Checkbox
+          tone="warn"
+          checked={props.status === "silenced"}
+          disabled={busy()}
+          onChecked={() => void toggleSilenced()}
+          label="Intentionally unset"
+          help="Silence this cell so the gap doesn't read as an oversight. Advisory only."
+        />
+      </Show>
+    </Modal>
   );
 }
