@@ -1382,6 +1382,10 @@ struct GateVerdict {
 struct GateSettings {
     /// `gate_expires_after`, seconds.
     expires_after_secs: Option<i64>,
+    /// A `manual` gate that may be an Environment approval gate (ADR-0078):
+    /// marked one, or of a Run created before the mark existed. Its
+    /// approvals may have met the rules with a wait timer still running.
+    environment_approval: bool,
 }
 
 /// The gate's open wait: its last Attempt while that Attempt is still
@@ -1438,6 +1442,63 @@ pub fn gate_approvers(events: &[EventKind], step: &StepId) -> Vec<String> {
         }
     }
     seen
+}
+
+/// What an Environment approval gate's current wait recorded when its
+/// approvals met the Environment's rules (ADR-0078 §4): see
+/// [`EventPayload::EnvironmentApprovalMet`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvironmentApproval {
+    pub approvers: Vec<String>,
+    pub required: Option<u32>,
+    /// Unix ms: the earliest the gate releases.
+    pub release_at: i64,
+}
+
+/// The latest [`EnvironmentApproval`] of gate `step` since its latest re-arm
+/// (so of its current wait, or of the wait that released it), by event
+/// position like [`gate_approvers`]. `None` when its approvals have not met
+/// the rules in that wait, or it released before this record existed.
+pub fn environment_approval_met(
+    events: &[EventKind],
+    step: &StepId,
+) -> Option<EnvironmentApproval> {
+    let from = events
+        .iter()
+        .rposition(|e| is_gate_rearm(&e.kind, step))
+        .map_or(0, |i| i + 1);
+    events[from..].iter().rev().find_map(|e| match &e.kind {
+        EventPayload::EnvironmentApprovalMet {
+            step: s,
+            approvers,
+            required,
+            release_at,
+        } if s == step => Some(EnvironmentApproval {
+            approvers: approvers.clone(),
+            required: *required,
+            release_at: *release_at,
+        }),
+        _ => None,
+    })
+}
+
+/// When gate `step` last passed: the time of its latest `GateResolved {
+/// passed: true }`, or of a `GateReleased` journalled before verdicts were.
+/// `None` when it never passed.
+pub fn gate_released_at(events: &[EventKind], step: &StepId) -> Option<Timestamp> {
+    events.iter().rev().find_map(|e| match &e.kind {
+        EventPayload::GateResolved {
+            step: s,
+            passed: true,
+            ..
+        }
+        | EventPayload::GateReleased { step: s }
+            if s == step =>
+        {
+            Some(e.at)
+        }
+        _ => None,
+    })
 }
 
 /// When gate `gate`'s current wait began — the per-gate clock start (slice b,
@@ -4342,9 +4403,28 @@ impl<'a> Scheduler<'a> {
                 .as_ref()
                 .and_then(|m| m.get(gate.step.0.as_str()).cloned())
                 .unwrap_or_default();
+            // An Environment approval gate whose approvals met the rules
+            // before its wait timer ran out (ADR-0078 §4): when it may
+            // release.
+            let approval_release_at = if gate_settings.environment_approval {
+                if events.is_none() {
+                    events = Some(self.db.events(run).await?);
+                }
+                environment_approval_met(events.as_deref().unwrap_or_default(), &gate.step)
+                    .map(|m| m.release_at)
+            } else {
+                None
+            };
             let now = self.clock.now().await;
             if let Some(mut verdict) = self
-                .gate_verdict(run, gate, &attempt, &gate_settings, now)
+                .gate_verdict(
+                    run,
+                    gate,
+                    &attempt,
+                    &gate_settings,
+                    approval_release_at,
+                    now,
+                )
                 .await?
             {
                 // A pass is the executor's to refuse (ADR-0076 §6: a gate
@@ -4382,7 +4462,10 @@ impl<'a> Scheduler<'a> {
     /// 1. The kind's own verdict first (so a timer that elapses at the same
     ///    instant as its deadline passes): `timer` passes at
     ///    `started_at + gate_after`. `manual` and `external` pass only by an
-    ///    explicit [`release_gate`]. A `deployment` gate — possible only in a
+    ///    explicit [`release_gate`] — except an Environment approval gate
+    ///    whose approvals already met the rules, which passes at
+    ///    `approval_release_at`, when its wait timer runs out (ADR-0078 §4).
+    ///    A `deployment` gate — possible only in a
     ///    Run created before ADR-0074 removed the Deployment record — fails
     ///    at once, its reason saying why: nothing can pass it any more.
     /// 2. Then **expiry**, for any kind with `gate_expires_after`: failed at
@@ -4393,10 +4476,20 @@ impl<'a> Scheduler<'a> {
         gate: &StepRun,
         attempt: &Attempt,
         settings: &GateSettings,
+        approval_release_at: Option<i64>,
         now: Timestamp,
     ) -> Result<Option<GateVerdict>, SchedulerError> {
         let started = attempt.started_at.0;
         match gate.gate_kind.as_deref() {
+            Some("manual") => {
+                if approval_release_at.is_some_and(|at| now.0 >= at) {
+                    return Ok(Some(GateVerdict {
+                        passed: true,
+                        reason: "approved; the Environment's wait timer ran out".to_string(),
+                        expired: false,
+                    }));
+                }
+            }
             Some("timer") => {
                 if let Some(wait_secs) = self.db.gate_timer_seconds(run, &gate.step).await? {
                     if now.0 >= started.saturating_add(wait_secs.saturating_mul(1000)) {
@@ -4568,6 +4661,9 @@ impl<'a> Scheduler<'a> {
                         .get("gate_expires_after")
                         .and_then(|t| t.as_u64())
                         .map(|secs| secs as i64),
+                    environment_approval: s.get("gate").and_then(|g| g.as_str()) == Some("manual")
+                        && s.get("environment_approval_gate").and_then(|m| m.as_bool())
+                            != Some(false),
                 };
                 Some((id.to_string(), settings))
             })

@@ -6,6 +6,7 @@
 import { For, Show, createEffect, createMemo, createResource, createSignal, on } from "solid-js";
 import { useSearchParams } from "@solidjs/router";
 import { listOrgSecurityEvents } from "../api/client";
+import { Field, Input, Select } from "./Field";
 import {
   emptyText,
   filterKey,
@@ -80,13 +81,8 @@ export default function EventLog(props: { org: string }) {
             apply(draft());
           }}
         >
-          <label class="field">
-            <span class="field-label">Kind</span>
-            <select
-              class="input"
-              value={view().kind}
-              onChange={(e) => apply(draft(e.currentTarget.value))}
-            >
+          <Field label="Kind">
+            <Select value={view().kind} onValue={(v) => apply(draft(v))}>
               <option value="">All events</option>
               <For each={EVENT_KINDS}>
                 {(k) => (
@@ -95,44 +91,20 @@ export default function EventLog(props: { org: string }) {
                   </option>
                 )}
               </For>
-            </select>
-          </label>
-          <label class="field">
-            <span class="field-label">Actor</span>
-            <input
-              class="input"
-              placeholder="subject, e.g. j.lee"
-              value={actor()}
-              onInput={(e) => setActor(e.currentTarget.value)}
-            />
-          </label>
-          <label class="field">
-            <span class="field-label">Target contains</span>
-            <input
-              class="input"
-              placeholder="Run id, project, secret"
-              value={target()}
-              onInput={(e) => setTarget(e.currentTarget.value)}
-            />
-          </label>
-          <label class="field">
-            <span class="field-label">From</span>
-            <input
-              class="input"
-              type="datetime-local"
-              value={from()}
-              onInput={(e) => setFrom(e.currentTarget.value)}
-            />
-          </label>
-          <label class="field">
-            <span class="field-label">To</span>
-            <input
-              class="input"
-              type="datetime-local"
-              value={to()}
-              onInput={(e) => setTo(e.currentTarget.value)}
-            />
-          </label>
+            </Select>
+          </Field>
+          <Field label="Actor">
+            <Input mono placeholder="subject, e.g. j.lee" value={actor()} onValue={setActor} />
+          </Field>
+          <Field label="Target contains">
+            <Input placeholder="Run id, project, secret" value={target()} onValue={setTarget} />
+          </Field>
+          <Field label="From">
+            <Input type="datetime-local" value={from()} onValue={setFrom} />
+          </Field>
+          <Field label="To">
+            <Input type="datetime-local" value={to()} onValue={setTo} />
+          </Field>
           <button class="btn btn-primary btn-sm" type="submit">
             Apply
           </button>

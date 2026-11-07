@@ -471,6 +471,7 @@ async fn busybox_runs_to_completion_and_relaunch_reattaches() {
         resources: Default::default(),
         k8s_overlay: None,
         oidc_token: None,
+        resolved_secrets: Default::default(),
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
@@ -539,6 +540,7 @@ async fn sleeping_step_is_killed_at_its_deadline() {
         resources: Default::default(),
         k8s_overlay: None,
         oidc_token: None,
+        resolved_secrets: Default::default(),
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
@@ -594,6 +596,7 @@ async fn log_stream_tails_pod_stdout() {
         resources: Default::default(),
         k8s_overlay: None,
         oidc_token: None,
+        resolved_secrets: Default::default(),
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
@@ -680,6 +683,7 @@ async fn workspace_flows_from_a_to_b_through_the_cas() {
         resources: Default::default(),
         k8s_overlay: None,
         oidc_token: None,
+        resolved_secrets: Default::default(),
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
@@ -893,6 +897,7 @@ async fn a_green_attempt_is_backed_by_a_durable_snapshot_at_the_instant_it_goes_
         resources: Default::default(),
         k8s_overlay: None,
         oidc_token: None,
+        resolved_secrets: Default::default(),
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
@@ -1072,6 +1077,7 @@ async fn a_missing_input_snapshot_fails_the_attempt_instead_of_hanging() {
         resources: Default::default(),
         k8s_overlay: None,
         oidc_token: None,
+        resolved_secrets: Default::default(),
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
@@ -1161,6 +1167,7 @@ async fn a_step_with_inputs_is_refused_when_no_workspace_service_is_configured()
         resources: Default::default(),
         k8s_overlay: None,
         oidc_token: None,
+        resolved_secrets: Default::default(),
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
@@ -1270,6 +1277,7 @@ async fn declared_outputs_publish_only_those_paths_through_the_cas() {
         resources: Default::default(),
         k8s_overlay: None,
         oidc_token: None,
+        resolved_secrets: Default::default(),
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
@@ -1417,6 +1425,7 @@ async fn clone_step_produces_a_source_workspace() {
         resources: Default::default(),
         k8s_overlay: None,
         oidc_token: None,
+        resolved_secrets: Default::default(),
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
@@ -1507,6 +1516,7 @@ async fn clone_step_produces_a_source_workspace() {
         resources: Default::default(),
         k8s_overlay: None,
         oidc_token: None,
+        resolved_secrets: Default::default(),
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
@@ -1580,6 +1590,7 @@ async fn clone_depth_full_exposes_history() {
         resources: Default::default(),
         k8s_overlay: None,
         oidc_token: None,
+        resolved_secrets: Default::default(),
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
@@ -1634,6 +1645,7 @@ async fn clone_depth_full_exposes_history() {
         resources: Default::default(),
         k8s_overlay: None,
         oidc_token: None,
+        resolved_secrets: Default::default(),
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
@@ -1706,6 +1718,7 @@ async fn clone_vanished_sha_fails_fast_with_source_unavailable() {
         resources: Default::default(),
         k8s_overlay: None,
         oidc_token: None,
+        resolved_secrets: Default::default(),
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
@@ -1817,6 +1830,7 @@ async fn build_step_builds_and_pushes_to_a_local_registry() {
         resources: Default::default(),
         k8s_overlay: None,
         oidc_token: None,
+        resolved_secrets: Default::default(),
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
@@ -1869,6 +1883,7 @@ async fn build_step_builds_and_pushes_to_a_local_registry() {
         resources: Default::default(),
         k8s_overlay: None,
         oidc_token: None,
+        resolved_secrets: Default::default(),
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
@@ -1979,6 +1994,7 @@ async fn results_sidecar_captures_a_named_result_end_to_end() {
         resources: Default::default(),
         k8s_overlay: None,
         oidc_token: None,
+        resolved_secrets: Default::default(),
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
@@ -2165,6 +2181,7 @@ async fn cancel_tears_down_a_running_pod() {
         resources: Default::default(),
         k8s_overlay: None,
         oidc_token: None,
+        resolved_secrets: Default::default(),
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
@@ -2263,6 +2280,7 @@ async fn artifacts_are_harvested_post_step() {
         resources: Default::default(),
         k8s_overlay: None,
         oidc_token: None,
+        resolved_secrets: Default::default(),
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
@@ -2347,6 +2365,7 @@ async fn artifacts_are_harvested_from_a_failed_step() {
         resources: Default::default(),
         k8s_overlay: None,
         oidc_token: None,
+        resolved_secrets: Default::default(),
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
@@ -2414,6 +2433,7 @@ fn busybox_spec(cmd: &str, run_as_root: bool) -> StepSpec {
         resources: Default::default(),
         k8s_overlay: None,
         oidc_token: None,
+        resolved_secrets: Default::default(),
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
@@ -2476,6 +2496,54 @@ async fn run_as_root_is_reflected_on_the_admitted_pod() {
     for h in [hr, hb] {
         exec.cancel(&h).await.expect("cleanup");
     }
+}
+
+/// LIVE step secrets (ADR-0014, git-bug bcf2c11): a secret is a file at
+/// `/scarab/secrets/<name>`, an `env: true` secret is also an env var, a
+/// file-only one is not, and the Pod the API server admitted holds neither
+/// value. The step itself checks what it sees and exits non-zero otherwise.
+#[tokio::test]
+#[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
+async fn step_secrets_are_files_and_never_in_the_admitted_pod() {
+    let ns = enter_tier();
+
+    let client = kube_client().await;
+    let exec = K8sExecutor::with_client(ns.clone(), client.clone());
+    use kube::api::Api;
+    let pods: Api<k8s_openapi::api::core::v1::Pod> = Api::namespaced(client, &ns);
+
+    let step = step_run_of(&unique_run("run-secrets"), "secrets");
+    let mut spec = busybox_spec(
+        "set -eu; \
+         test \"$(cat /scarab/secrets/DB_PASSWORD)\" = sekret-db-live; \
+         test \"$(cat \"$SCARAB_SECRETS/API_TOKEN\")\" = sekret-api-live; \
+         test \"$API_TOKEN\" = sekret-api-live; \
+         test -z \"${DB_PASSWORD:-}\"",
+        true,
+    );
+    spec.secrets = vec![
+        "DB_PASSWORD".into(),
+        scarab_pipeline::SecretRef::file_and_env("API_TOKEN"),
+    ];
+    spec.resolved_secrets = scarab_engine::ResolvedSecrets(vec![
+        ("DB_PASSWORD".into(), "sekret-db-live".into()),
+        ("API_TOKEN".into(), "sekret-api-live".into()),
+    ]);
+    let h = exec.launch(&step, &spec).await.expect("launch");
+    let admitted = serde_json::to_string(&pods.get(&h.0).await.expect("admitted pod")).unwrap();
+    for value in ["sekret-db-live", "sekret-api-live"] {
+        assert!(
+            !admitted.contains(value),
+            "{value} is in the admitted Pod: {admitted}"
+        );
+    }
+    let terminal = poll_to_terminal(&exec, &h, 90).await;
+    assert_eq!(
+        terminal,
+        Some(ExecState::Succeeded),
+        "the step read both files and only API_TOKEN from env"
+    );
+    exec.cancel(&h).await.expect("cleanup");
 }
 
 /// LIVE unpullable image (ADR-0047): a step whose image does not exist keeps
@@ -2703,6 +2771,7 @@ async fn fanin_collision_summary_survives_the_termination_log_as_uid_65532() {
         resources: Default::default(),
         k8s_overlay: None,
         oidc_token: None,
+        resolved_secrets: Default::default(),
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),

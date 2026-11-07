@@ -15,6 +15,7 @@ import {
   unlinkIdentity,
 } from "../api/client";
 import Icon from "./Icon";
+import ConfirmDestructive from "./ConfirmDestructive";
 import { canUnlink, linkNotice, linkable, providerName } from "../identities";
 
 export default function LinkedAccounts() {
@@ -38,21 +39,15 @@ export default function LinkedAccounts() {
     }
   };
 
+  // The account the confirm dialog is about to unlink. A refusal shows in
+  // the dialog.
+  const [unlinking, setUnlinking] = createSignal<{ provider: string; handle: string } | null>(null);
   const unlink = async (provider: string) => {
-    const name = providerName(providers() ?? [], provider);
-    if (
-      !window.confirm(
-        `Unlink your ${name} account?\n\nYou will no longer be able to sign in with it, and any roles that were imported from that forge account are removed with it.`,
-      )
-    )
-      return;
     setBusy(true);
     setError(null);
     try {
       await unlinkIdentity(provider);
       await refetch();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Could not unlink.");
     } finally {
       setBusy(false);
     }
@@ -110,7 +105,7 @@ export default function LinkedAccounts() {
                             ? undefined
                             : "Your only way to sign in — link another account first"
                         }
-                        onClick={() => unlink(i.provider)}
+                        onClick={() => setUnlinking({ provider: i.provider, handle: i.handle })}
                       >
                         unlink
                       </button>
@@ -135,6 +130,20 @@ export default function LinkedAccounts() {
                 )}
               </For>
             </div>
+          </Show>
+          <Show when={unlinking()}>
+            {(u) => (
+              <ConfirmDestructive
+                title={`Unlink your ${providerName(providers() ?? [], u().provider)} account?`}
+                purpose="You will no longer be able to sign in with it."
+                name={u().handle}
+                confirmLabel="Unlink account"
+                onConfirm={() => unlink(u().provider)}
+                onClose={() => setUnlinking(null)}
+              >
+                <p>Any roles that were imported from that forge account are removed with it.</p>
+              </ConfirmDestructive>
+            )}
           </Show>
           <p class="subtle">
             <small>

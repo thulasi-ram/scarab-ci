@@ -164,7 +164,55 @@ record. Read Breaking changes before you upgrade.
   check, require `scarab/<pipeline>` for each pipeline instead before you upgrade, or the rule
   waits for a status that is no longer posted.
 
+- **Deploys into an Environment with approvers now pause for approval when the pipeline has no
+  gate** (git-bug cd43bf3). Before, a Run that named such an Environment and had no `gate:
+  manual` gave its Steps the Environment's secrets and grants without asking anyone. Now the
+  Environment adds one `manual` gate, `environment-approval`, in front of the earliest Steps that
+  use its authority (declared `secrets:`, a governed grant or `k8s_overlay`, `forge_token: write`,
+  or `deploy: true`). Runs that deployed unasked start waiting for an approver on the day you
+  upgrade. An org admin can set an Environment to refuse such a Run instead (missing-gate mode
+  `refuse`), which names the gate to add. A `forge_token: write` Step is no longer refused at Run
+  creation for having no `manual` gate upstream; it gets the added gate like any other. See
+  [Environments](https://thulasi-ram.github.io/scarab-ci/usage/environments/#the-approval-gate).
+- **`manual` gates that guard no authority Step stop needing the approvers.** Only a gate with a
+  Step after it that uses the Environment's authority needs the Environment's approvers and a
+  step-up; any other `manual` gate in the Run releases on the first approval by anyone with write.
+- **The Environment's wait timer is enforced** (git-bug 2b94989): the approval gate releases when
+  its approvals are in and the timer has run out, counted from when its `needs` finished. An
+  approval given early counts. The API refuses a non-zero wait timer on an Environment with no
+  approvers; one stored before does nothing. The deployment history records each approval gate
+  once, when its approvals are in, so a gate the timer releases is listed too.
+- **A stale approval is refused at launch** (git-bug 220917f). Every launch of a Step that uses
+  the authority of an Environment with approvers, reruns and retries included, fails `Config`
+  when no released approval gate is upstream of it, the Run's ref is no longer allowed, the
+  approvers changed since the gate's approvals, or the gate released more than the Environment's
+  maximum approval age ago (24 hours by default). One released approval gate upstream that passes
+  these checks is enough. An external gate no longer hands over the
+  Environment's authority by its token alone. A Run created before its Environment had approvers
+  has no approval gate, so its authority Steps are refused once the Environment has approvers.
+  In such an Environment, a Step gets the Environment's OIDC subject only when an approval gate
+  upstream passes the same checks, whether or not it uses the authority otherwise; any other Step
+  gets `env=none`.
+- **Adding an approver needs a step-up when the approval gate needs a count** (`required_approvals`):
+  the new approver counts toward it. Where every approver must approve, adding one still needs
+  none.
+
+- **Step secrets are files, not environment variables.** A secret listed in `secrets:` is now
+  the file `/scarab/secrets/KEY` in the step's container (`$SCARAB_SECRETS` names the
+  directory), and `$KEY` is empty. To keep reading `$KEY`, list the secret as
+  `{ name: KEY, env: true }`; bare names and entries mix in one list. `scarab validate` warns
+  about a command that reads `$KEY` for a secret without `env: true`. A secret name must now be
+  a file name (letters, digits, `-`, `_`, `.`, not starting with `.`), and `forge-token` and
+  `forge-username` are refused (git-bug bcf2c11). Upgrade every server replica before a pipeline
+  uses `env: true`: a replica from an earlier version cannot read that entry in a stored Run.
+
 ### Security
+
+- Secret values were written into the step Pod's spec as literal environment values, where
+  anyone who can read Pods (and the Kubernetes audit log) could see them (git-bug bcf2c11).
+  They now live in a per-Pod Kubernetes Secret, deleted when the attempt ends, and reach the step
+  as files on a read-only in-memory volume; an `env: true` secret is a `secretKeyRef` to that
+  Secret.
 
 - A pull request could save a Cache that a Step in an Environment-governed Run then restored,
   so a deploy could ship bytes a pull request wrote (git-bug efcec77). Every Run now has a
@@ -210,6 +258,40 @@ record. Read Breaking changes before you upgrade.
 
 ### Features
 
+- **Environment display name and Duplicate.** An Environment's name stays fixed: pipelines and
+  the OIDC subject (`…/env/<name>/…`) use it. It now has an optional display name, which lists,
+  headings and pickers show with the name beside it; changing it needs no step-up. **Duplicate**
+  (`POST /v1/orgs/{org}/environments/{env}/duplicate`, under step-up) creates a new
+  Environment with the old one's baseline, eligibility, every project's overlay and privilege
+  grant, and its secrets with their values, and lists what it did not copy: the projects whose
+  Runs used it, the policies that name it, and the OIDC subject cloud trust policies match. The
+  old Environment is not changed. A second Duplicate to a name already being duplicated to is
+  refused (409) before it writes anything, and so is creating that name with
+  `PUT /v1/orgs/{org}/environments/{env}` while the Duplicate runs. A display name may not hold invisible bidi or
+  zero-width characters. Migration 0080 adds the display name column (git-bug d002a0c).
+  [Environments](https://thulasi-ram.github.io/scarab-ci/usage/environments/#duplicate-an-environment)
+- **Approval gate settings on the Environment page.** The edit page has an **Approval gate**
+  section: what to do when a pipeline has no approval gate (**Add an approval gate** or **Refuse
+  the run**), the added gate's expiry, how many approvers must approve, and the maximum approval
+  age. The wait timer is disabled while the Environment has no approvers, and an Environment
+  with a timer and no approvers shows a warning (git-bug cd43bf3, 2b94989).
+  [Environments](https://thulasi-ram.github.io/scarab-ci/usage/environments/#the-rules-it-holds)
+- **The Run page marks Environment approval gates.** Their gate card, DAG node and step pane say
+  **Environment approval gate** and name the Environment by its display name with its name in
+  brackets; the gate the Environment added says **added by** it. After the approvals are in, a
+  gate with a wait timer shows when it releases, and approving it says the approval was recorded
+  and when the gate releases. `GET /v1/runs/{id}` gains `environment` (`name`, `display_name`)
+  (git-bug cd43bf3, 2b94989).
+  [Environments](https://thulasi-ram.github.io/scarab-ci/usage/environments/#the-approval-gate)
+- **Environment page wording.** "Who may deploy" is now "Projects that may use <Environment>":
+  the list admits every Run that names the Environment, not only deploys. The "Projects" panel
+  is now "Project overlays and grants" (git-bug c2f97b4).
+  [Environments](https://thulasi-ram.github.io/scarab-ci/usage/environments/#view-and-edit-an-environment)
+- **Settings › Policies.** One read-only page per org lists its CEL Policies, with what each
+  applies to and how often it matched, denied and (in audit mode) would have denied in the
+  newest 200 decisions, the newest decisions, and the typed settings (each Environment's rules,
+  the library and plugin lists, API token scopes) with links to where each is edited (git-bug
+  c2f97b4). [Every rule in one place](https://thulasi-ram.github.io/scarab-ci/usage/environments/#every-rule-in-one-place)
 - **Runs after another pipeline.** `on: upstream: { pipeline: ci }` starts a Run when a Run
   of `ci` in the same repository finishes (`status:` takes `succeeded`, the default, and
   `failed`). The follow-up builds the same commit and runs on the same ref, so an
@@ -321,6 +403,16 @@ record. Read Breaking changes before you upgrade.
 
 ### Enhancement
 
+- **The Environment's approval-gate rules run in the policy engine.** The gate the Environment
+  adds (`run.create`), the release rules of an Environment approval gate (`gate.resolve`) and
+  the check at each launch (`step.admit`) are built-in rules of the engine. Each consultation
+  is recorded in the decision log, with the rule by name, even when no Policy is stored. Org and
+  Project Policies can now be saved at `gate.resolve` and `step.admit`, with `deny` rules only:
+  a denied approval answers 403 and is not recorded, and a denied launch fails the Step
+  `Config` (git-bug c2f97b4). A `step.admit` Policy applies to every launch its `match`
+  selects, in Runs that no Environment governs too. An approval that races another one is
+  checked again over both approvals, and a deny then answers 403 with the approval kept.
+  [Environments](https://thulasi-ram.github.io/scarab-ci/usage/environments/#the-approval-gate)
 - **Caches at more than one Depot replica.** Each Cache key has one home Depot replica, chosen
   by rendezvous hashing over the StatefulSet's ordinals, and a Step saves and restores the
   Cache there. Before, a Cache's saves and restores scattered over the replicas, so a restore

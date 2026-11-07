@@ -109,6 +109,7 @@ pub mod plugins;
 /// ADR-0075: the Policy API — org Policies, Project typed settings, the
 /// decision logs and the policy test API.
 pub mod policies;
+mod policy_checkpoints;
 pub mod retention;
 mod refused_runs;
 mod routes;
@@ -1137,6 +1138,10 @@ pub struct RunStatusResponse {
     /// launch: it reuses the Steps the Run was compiled with. Empty when none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub yanked_libraries: Vec<run_origin::RunYankDto>,
+    /// The Environment the Run names (its pipeline's `environment:`), with
+    /// its display name. Absent for a Run that names none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub environment: Option<run_origin::RunEnvironmentDto>,
 }
 
 /// The cold-tier retention promise over one Run's **Workspace Snapshots**
@@ -1499,6 +1504,20 @@ pub struct StepStatusDto {
     /// its rendered inputs and its typed outputs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plugin_gate: Option<run_origin::PluginGateViewDto>,
+    /// This `manual` gate is an **Environment approval gate** (ADR-0078 §1):
+    /// a Step after it uses the Run's Environment's authority, so releasing
+    /// it needs the Environment's approvers and a step-up. Decided at Run
+    /// creation. A gate the Environment added has an `origin` link of kind
+    /// `environment`. On a Run created before the mark was stored, every
+    /// `manual` gate of a Run that names an Environment is one, as the
+    /// approve handler judges it. Omitted when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub environment_approval_gate: bool,
+    /// A waiting Environment approval gate whose approvals are in: when the
+    /// Environment's wait timer runs out and the gate releases (Unix ms).
+    /// Absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_release_at: Option<i64>,
 }
 
 /// How a gate's wait resolved: its `GateResolved` journal entry.
@@ -1706,7 +1725,8 @@ impl From<DispatchError> for ApiError {
             | DispatchError::NotEligible { .. }
             | DispatchError::PolicyDenied { .. }
             | DispatchError::LibraryYanked(_)
-            | DispatchError::ForgeToken(_)) => ApiError::Denied(refused.to_string()),
+            | DispatchError::ForgeToken(_)
+            | DispatchError::MissingApprovalGate(_)) => ApiError::Denied(refused.to_string()),
             other => ApiError::BadRequest(other.to_string()),
         }
     }
@@ -1856,7 +1876,9 @@ async fn create_run(
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
-            secrets: step.secrets.clone(),
+            // File-only: an inline run has no deploy context, so no secret
+            // resolves for it anyway.
+            secrets: step.secrets.iter().map(|k| k.as_str().into()).collect(),
             run_as_root: admitted.run_as_root,
             add_capabilities: admitted.add_capabilities,
             privileged: admitted.privileged,
@@ -1874,6 +1896,7 @@ async fn create_run(
             resources: step.resources.clone(),
             k8s_overlay,
             oidc_token: None,
+            resolved_secrets: Default::default(),
             services: step.services.clone(),
             uses: step.uses.clone(),
             // The inline `POST /v1/runs` escape hatch takes steps directly (no
@@ -2532,8 +2555,13 @@ async fn get_run(
     // edges and address per-sidecar logs by index. A step with no stored spec
     // (e.g. a gate) carries empty vecs.
     let mut gate_views = run_gate_view::step_gate_views(&st, &run, &steps).await?;
-    let (mut origin_views, yanked_libraries) = run_origin::step_views(&st, &run, &steps).await?;
+    let run_origin::StepViews {
+        views: mut origin_views,
+        yanked: yanked_libraries,
+        environment,
+    } = run_origin::step_views(&st, &run, &steps).await?;
     let deploy_steps = st.db.deploy_steps_of_run(&run).await?;
+    let environment = run_origin::run_environment(&st, &run, environment).await?;
     let mut step_dtos = Vec::with_capacity(steps.len());
     for s in steps {
         let view = gate_views.remove(&s.step.0).unwrap_or_default();
@@ -2567,6 +2595,8 @@ async fn get_run(
             deploy,
             origin: origin_view.origin,
             plugin_gate: origin_view.plugin_gate,
+            environment_approval_gate: origin_view.environment_approval_gate,
+            approval_release_at: view.approval_release_at,
         });
     }
     Ok(Json(RunStatusResponse {
@@ -2580,6 +2610,7 @@ async fn get_run(
         origin_pr_base,
         snapshot_retention,
         yanked_libraries,
+        environment,
     }))
 }
 
@@ -4953,7 +4984,8 @@ pub(crate) async fn trigger_runs_from_files(
             // Policies say.
             Admission::Refused(
                 ref refusal @ (AdmissionRefusal::EventField { ref messages }
-                | AdmissionRefusal::ForgeToken { ref messages }),
+                | AdmissionRefusal::ForgeToken { ref messages }
+                | AdmissionRefusal::MissingApprovalGate { ref messages }),
             ) => {
                 let reason = admission_refusal_message(refusal, &repo.owner, &repo.name);
                 tracing::warn!(
@@ -5147,6 +5179,10 @@ enum AdmissionRefusal {
     /// A Step asks for a forge credential it may not have (ADR-0076 §9), a
     /// PolicyInvariant like a yank.
     ForgeToken { messages: Vec<String> },
+    /// Steps use the Environment's authority with no `manual` gate upstream,
+    /// and the Environment, which has approvers, refuses such a Run instead
+    /// of adding a gate (missing-gate mode `refuse`, ADR-0078 §3).
+    MissingApprovalGate { messages: Vec<String> },
 }
 
 /// What admission fixed for a Run besides its governance (ADR-0076 §9),
@@ -5410,6 +5446,7 @@ async fn admit_and_create_run(
             AdmissionRefusal::LibraryYanked { messages } => ("yanked", messages),
             AdmissionRefusal::EventField { messages } => ("event_field", messages),
             AdmissionRefusal::ForgeToken { messages } => ("forge_token", messages),
+            AdmissionRefusal::MissingApprovalGate { messages } => ("approval_gate", messages),
         };
         if !kind.is_empty() {
             let message = admission_refusal_message(refusal, &repo.owner, &repo.name);
@@ -5502,6 +5539,41 @@ async fn admit_unrecorded(
         Ok(gov) => gov,
         Err(refusal) => return Ok(Admission::Refused(refusal)),
     };
+    // ADR-0078 §1-3: the Environment adds its approval gate (or refuses the
+    // Run), and every `manual` gate is marked an Environment approval gate
+    // or not — before anything below reads the Run's Steps, so the Policies
+    // and the stored Run see the gate.
+    let (ir, gate_requirement) = match environment_approval_ir(ir, &gov, excluded) {
+        Ok(decided) => decided,
+        Err((refusal, result)) => {
+            // The engine's decision records the refusal in the org's decision
+            // log; the Run is refused as missing-gate mode `refuse` says,
+            // whatever else the decision holds.
+            if let Some(policies) = ports.policies {
+                let run = run_id_for(event, path);
+                let now = clock.now().await;
+                // Denied by the rule's own result: the refusal stays
+                // `MissingApprovalGate`, not a Policy refusal.
+                let _denied = consult_run_create(
+                    policies,
+                    &ports.links,
+                    event,
+                    ir,
+                    path,
+                    repo,
+                    &gov,
+                    &run,
+                    now,
+                    params,
+                    &serde_json::Map::new(),
+                    vec![result],
+                )
+                .await?;
+            }
+            return Ok(Admission::Refused(refusal));
+        }
+    };
+    let ir = &ir;
 
     // ADR-0076 §6: a yanked library version is a PolicyInvariant, checked
     // before (and whether or not) any Policy is consulted.
@@ -5536,7 +5608,6 @@ async fn admit_unrecorded(
     let write = match gov.protection() {
         Some(p) => forge_token::WriteGovernance {
             restricts_refs: !p.unrestricted_refs(),
-            has_approvers: !p.approvers.is_empty(),
         },
         None => forge_token::WriteGovernance::default(),
     };
@@ -5560,10 +5631,22 @@ async fn admit_unrecorded(
 
     let now = clock.now().await;
     let run = run_id_for(event, path);
+    let admitted = AdmittedFacts {
+        event: &facts,
+        trusted_only: &tokens.trusted_only,
+        cache_scope: run_cache_scope(forge, event, ir, &gov).await,
+    };
+    // Rendered before the Policies are consulted: a key that cannot be
+    // rendered refuses the Run before an allow decision naming it is
+    // recorded (git-bug bbc433e).
+    let concurrency_group = concurrency_group_key(ir, event, params, &admitted)?;
     // ADR-0075: the `run.create` Policies, after the Environment's ref and
     // reason checks and before anything is persisted (`persist_run_from_ir`
     // is not atomic, so a deny after it would leave a partial Run). The run
     // id is minted first so an allow decision names the Run it admitted.
+    // Nothing that can refuse the Run runs between the decision and the
+    // Run's first row (`begin_run_creation`); a write failure after that row
+    // ends the Run Failed, and the decision still names a real Run.
     if let Some(policies) = ports.policies {
         if let Err(refusal) = consult_run_create(
             policies,
@@ -5577,19 +5660,84 @@ async fn admit_unrecorded(
             now,
             params,
             &facts,
+            gate_requirement.into_iter().collect(),
         )
         .await?
         {
             return Ok(Admission::Refused(refusal));
         }
     }
-    let admitted = AdmittedFacts {
-        event: &facts,
-        trusted_only: &tokens.trusted_only,
-        cache_scope: run_cache_scope(forge, event, ir, &gov).await,
-    };
-    persist_run_from_ir(db, &run, ir, event, path, &gov, excluded, params, &admitted, now).await?;
+    persist_run_from_ir(
+        db,
+        &run,
+        ir,
+        event,
+        path,
+        &gov,
+        excluded,
+        params,
+        &admitted,
+        concurrency_group.as_deref(),
+        now,
+    )
+    .await?;
     Ok(Admission::Created(run))
+}
+
+/// `ir` as an Environment-governed Run stores it (ADR-0078 §1-3), decided by
+/// the engine's built-in gate requirement
+/// ([`gate_requirement`](scarab_policy::environment_rules::gate_requirement)).
+/// Where the Environment has approvers and a Step uses its authority with no
+/// `manual` gate upstream, the Environment adds one gate in front of the
+/// earliest such Steps — or, in missing-gate mode `refuse`, the Run is
+/// refused with the YAML to add. Then every `manual` gate is marked with
+/// whether it is an Environment approval gate. An ungoverned Run is
+/// returned as it is.
+///
+/// The rule's result, when it applies, goes into the Run's `run.create`
+/// decision; a refusal carries it, so the refused Run's decision records it.
+#[allow(clippy::result_large_err)]
+fn environment_approval_ir(
+    ir: &scarab_pipeline::PipelineIr,
+    gov: &RunGovernance,
+    excluded: &[String],
+) -> Result<
+    (
+        scarab_pipeline::PipelineIr,
+        Option<scarab_policy::evaluate::PolicyResult>,
+    ),
+    (AdmissionRefusal, scarab_policy::evaluate::PolicyResult),
+> {
+    let RunGovernance::Governed { environment, .. } = gov else {
+        return Ok((ir.clone(), None));
+    };
+    let decided = scarab_policy::environment_rules::gate_requirement(
+        ir,
+        environment,
+        gov.protection(),
+        excluded,
+    );
+    match (decided.refusal, decided.result) {
+        (Some(message), Some(result)) => Err((
+            AdmissionRefusal::MissingApprovalGate {
+                messages: vec![message],
+            },
+            result,
+        )),
+        (_, result) => {
+            if let Some(scarab_policy::evaluate::PolicyOutcome::GateAdded { gate, fronts }) =
+                result.as_ref().map(|r| &r.outcome)
+            {
+                tracing::info!(
+                    environment = %environment,
+                    gate = %gate,
+                    fronts = ?fronts,
+                    "the Environment added its approval gate to the Run"
+                );
+            }
+            Ok((decided.ir, result))
+        }
+    }
 }
 
 /// The admission checks a Run passes before its `run.create` Policies are
@@ -5774,6 +5922,9 @@ fn run_create_input(
 ///   admitted otherwise. The plugin default reads the gates from `ir`, so it
 ///   denies an unlisted plugin gate either way.
 /// - A store failure (loading or recording) is an error: no Run.
+/// - `builtins` are the results of the engine's built-in Environment rules
+///   for this Run ([`environment_approval_ir`]). When there is one, the
+///   decision is made and recorded even with no Policy stored.
 #[allow(clippy::too_many_arguments)]
 async fn consult_run_create(
     policies: &dyn scarab_policy::store::PolicyStore,
@@ -5787,9 +5938,10 @@ async fn consult_run_create(
     now: scarab_engine::Timestamp,
     params: Option<&std::collections::BTreeMap<String, serde_json::Value>>,
     event_facts: &serde_json::Map<String, serde_json::Value>,
+    builtins: Vec<scarab_policy::evaluate::PolicyResult>,
 ) -> Result<Result<(), AdmissionRefusal>, TriggerError> {
-    use scarab_policy::evaluate::{evaluate_stored, PolicyOutcome};
-    use scarab_policy::policy::{Checkpoint, Mode};
+    use scarab_policy::evaluate::evaluate_with_builtins;
+    use scarab_policy::policy::Checkpoint;
     use scarab_policy::run_create;
 
     let stored = policies
@@ -5797,8 +5949,9 @@ async fn consult_run_create(
         .await
         .map_err(policy_store_err)?;
     // A plugin gate is consulted with no Policy stored: the closed plugin
-    // default denies it until an org lists the plugin (ADR-0075 §7).
-    if stored.is_empty() && !run_create::has_plugin_gate(ir) {
+    // default denies it until an org lists the plugin (ADR-0075 §7). So is
+    // a Run a built-in Environment rule applies to (ADR-0078 §6).
+    if stored.is_empty() && !run_create::has_plugin_gate(ir) && builtins.is_empty() {
         return Ok(Ok(()));
     }
 
@@ -5819,13 +5972,14 @@ async fn consult_run_create(
     let plugin_gates = run_create::plugin_gates(ir);
     let decision = tokio::task::spawn_blocking(move || {
         let input = job.and_then(|(ir, facts)| run_create_input(&ir, facts));
-        evaluate_stored(
+        evaluate_with_builtins(
             Checkpoint::RunCreate,
             run_create::SCHEMA_VERSION,
             input.as_ref().map_err(String::as_str),
             Some(&plugin_gates),
             &ctx,
             &stored,
+            builtins,
         )
     })
     .await
@@ -5833,23 +5987,7 @@ async fn consult_run_create(
 
     let denied = decision.is_denied();
     // Each message with the Policy it came from, for the refusal.
-    let mut messages = Vec::new();
-    if denied {
-        for r in &decision.results {
-            if r.mode != Mode::Enforce {
-                continue;
-            }
-            match &r.outcome {
-                PolicyOutcome::Denied { messages: m } => {
-                    messages.extend(m.iter().map(|m| format!("policy `{}`: {m}", r.name)))
-                }
-                PolicyOutcome::Error { message } => {
-                    messages.push(format!("policy `{}`: {message}", r.name))
-                }
-                _ => {}
-            }
-        }
-    }
+    let messages = decision.attributed_messages();
     let record = scarab_policy::store::DecisionRecord {
         id: Uuid::now_v7().to_string(),
         org: repo.owner.clone(),
@@ -5992,6 +6130,10 @@ pub enum DispatchError {
     /// A Step asks for a forge credential it may not have (ADR-0076 §9).
     #[error("{}", forge_token_message(.0))]
     ForgeToken(Vec<String>),
+    /// Steps use the Environment's authority with no `manual` gate upstream,
+    /// and the Environment refuses such a Run (ADR-0078 §3).
+    #[error("{}", .0.join("; "))]
+    MissingApprovalGate(Vec<String>),
     #[error(transparent)]
     Db(DbError),
 }
@@ -6017,6 +6159,7 @@ fn admission_refusal_message(refusal: &AdmissionRefusal, org: &str, project: &st
         AdmissionRefusal::LibraryYanked { messages } => library_yanked_message(messages),
         AdmissionRefusal::EventField { messages } => event_field_message(messages),
         AdmissionRefusal::ForgeToken { messages } => forge_token_message(messages),
+        AdmissionRefusal::MissingApprovalGate { messages } => messages.join("; "),
     }
 }
 
@@ -6275,6 +6418,9 @@ pub async fn dispatch_run(
         AdmissionRefusal::LibraryYanked { messages } => DispatchError::LibraryYanked(messages),
         AdmissionRefusal::EventField { messages } => DispatchError::EventField(messages),
         AdmissionRefusal::ForgeToken { messages } => DispatchError::ForgeToken(messages),
+        AdmissionRefusal::MissingApprovalGate { messages } => {
+            DispatchError::MissingApprovalGate(messages)
+        }
     })
 }
 
@@ -6472,9 +6618,9 @@ async fn persist_run_from_ir(
     excluded: &[String],
     params: Option<&std::collections::BTreeMap<String, serde_json::Value>>,
     admitted: &AdmittedFacts<'_>,
+    concurrency_group: Option<&str>,
     now: Timestamp,
 ) -> Result<(), TriggerError> {
-    let concurrency_group = concurrency_group_key(ir, event, params, admitted)?;
     db.begin_run_creation(run, ir.ir_version, EVENT_VERSION, now)
         .await?;
     let written = write_run_from_ir(
@@ -6487,15 +6633,16 @@ async fn persist_run_from_ir(
         excluded,
         params,
         admitted,
-        concurrency_group.as_deref(),
+        concurrency_group,
         now,
     )
     .await;
     end_run_creation(db, run, now, written).await
 }
 
-/// The concurrency group's key for a Run of `ir`, rendered before any row
-/// of the Run is written ([`persist_run_from_ir`]).
+/// The concurrency group's key for a Run of `ir`, rendered before its
+/// `run.create` Policies are consulted and before any row of the Run is
+/// written ([`admit_unrecorded`]).
 fn concurrency_group_key(
     ir: &scarab_pipeline::PipelineIr,
     event: &scarab_forge::Event,
@@ -6878,6 +7025,7 @@ async fn write_run_from_ir(
                     TriggerError::Pipeline(format!("step `{}`: {}", step.id, v.join("; ")))
                 })?,
                 oidc_token: None,
+                resolved_secrets: Default::default(),
                 // Sidecar services (ADR-0058) co-locate in this executed step's Pod.
                 services: step.services.clone(),
                 // Shared-service opt-in (ADR-0058): the executor labels this Pod
@@ -9484,14 +9632,40 @@ fn gate_approvers(events: &[EventKind], step: &StepId) -> Vec<String> {
     scarab_engine::gate_approvers(events, step)
 }
 
+/// Whether `step` of `run`, a Run an Environment governs, is an Environment
+/// approval gate (ADR-0078 §1), as Run creation marked it in the stored IR
+/// ([`scarab_pipeline::StepSpec::counts_as_environment_approval_gate`]). A
+/// Run whose stored IR cannot be read, or that has no such Step, counts as
+/// one: fail-closed, the approvers are asked.
+async fn is_environment_approval_gate(
+    st: &AppState,
+    run: &RunId,
+    step: &StepId,
+) -> Result<bool, ApiError> {
+    let ir = st
+        .db
+        .run_ir(run)
+        .await?
+        .and_then(|ir| serde_json::from_value::<scarab_pipeline::PipelineIr>(ir).ok());
+    Ok(ir
+        .as_ref()
+        .and_then(|ir| ir.steps.iter().find(|s| s.id == step.0))
+        .is_none_or(|s| s.counts_as_environment_approval_gate()))
+}
+
 /// Approve a `manual` gate (ADR-0008, 0037). The authenticated principal's
-/// approval is recorded on the event log (append-only, idempotent). For a
-/// **deploy** run (one with a target environment), the gate is released only
-/// once the accumulated approvers satisfy the Environment's effective rules for
-/// the run's Project (ADR-0071 §3, `admits`); on release the deployment is
-/// written to the legacy history. If the Environment no longer exists or no
-/// longer admits the Project, the gate does not release (409). A plain gate (no
-/// environment) releases on the first approval. Authz'd as a write.
+/// approval is recorded on the event log (append-only, idempotent).
+///
+/// An **Environment approval gate** (ADR-0078 §1: a Step after it uses the
+/// Run's Environment's authority) releases only once the accumulated
+/// approvals satisfy the Environment's effective rules for the run's Project
+/// (ADR-0071 §3, `admits`) and its wait timer has run out on the gate's wait
+/// clock (§4). Approvals that complete the rules early are kept: the gate is
+/// released by the scheduler when the timer runs out. On release the
+/// deployment is written to the legacy history. Every other `manual` gate is
+/// a plain gate: it releases on the first approval, with no step-up. If the
+/// Environment no longer exists or no longer admits the Project, no gate of
+/// the Run releases (409). Authz'd as a write.
 #[utoipa::path(
     post,
     path = "/v1/runs/{id}/gates/{step}/approve",
@@ -9527,6 +9701,10 @@ async fn approve_gate(
     //    same snapshot then governs the release below, so the approval is
     //    judged and released under one set of rules.
     let ctx = st.db.run_deploy_context(&run).await.map_err(ApiError::Db)?;
+    // ADR-0078 §1: only an Environment approval gate needs the approvers
+    // and a step-up; a plain gate in the same Run releases on the first
+    // approval.
+    let approval_gate = ctx.is_some() && is_environment_approval_gate(&st, &run, &step).await?;
     // The approval stays recorded when the gate is held; it counts if the
     // Environment is restored.
     let governance = gate_release_governance(
@@ -9536,6 +9714,7 @@ async fn approve_gate(
     )
     .await;
     match (&ctx, &governance) {
+        _ if !approval_gate => guard.exempt("not an Environment approval gate"),
         (Some(c), Ok(Some(p))) if !p.approvers.is_empty() => {
             guard
                 .require(
@@ -9562,11 +9741,111 @@ async fn approve_gate(
     }
 
     // ADR-0076 §6: a gate inlined from a yanked library version neither
-    // takes an approval nor releases. Where `gate.resolve` (ADR-0075 §2)
-    // will be consulted.
+    // takes an approval nor releases.
     refuse_yanked_step(&st, &run, &step, "the gate cannot release").await?;
 
-    // 1. Record this principal's approval — append-only, no resume, idempotent
+    // 1. `gate.resolve` (ADR-0075 §2, ADR-0078 §6): one decision for this
+    //    approval, made by the engine before the approval is recorded. The
+    //    Environment's release rules are its built-in rule for an
+    //    Environment approval gate, under the rules resolved at 0.; the
+    //    org's and Project's `gate.resolve` Policies are evaluated next to
+    //    it. A deny refuses the approval; an unmet requirement holds the
+    //    gate.
+    // A held gate (its Environment's rules cannot be resolved) still takes
+    // the approval, and answers with the reason after recording it.
+    let (protection, held) = match governance {
+        Ok(p) => (p, None),
+        Err(e) => (None, Some(e)),
+    };
+    let rules = match (&ctx, &protection) {
+        (Some(c), Some(p)) if approval_gate => Some((c, p)),
+        _ => None,
+    };
+    let checkpoint = if rules.is_some() || st.policies.is_some() {
+        policy_checkpoints::GateResolveFacts::load(
+            st.db.as_ref(),
+            st.policies.as_deref(),
+            &run,
+            &step,
+            ctx.as_ref(),
+            approval_gate,
+        )
+        .await
+        .map_err(ApiError::Db)?
+        .filter(|f| rules.is_some() || f.has_policies())
+    } else {
+        None
+    };
+    let now = st.clock.now().await.0;
+    // When the gate's current wait began: what the wait timer counts from.
+    // No open wait yet: count from now, which only waits longer.
+    let wait_began = st
+        .db
+        .steps_of_run(&run)
+        .await
+        .map_err(ApiError::Db)?
+        .into_iter()
+        .find(|s| s.step == step)
+        .and_then(|s| {
+            s.attempts
+                .last()
+                .filter(|a| a.outcome == scarab_engine::AttemptOutcome::Running)
+                .map(|a| a.started_at.0)
+        })
+        .unwrap_or(now);
+    let release_rule = |approvals: &[String]| {
+        rules.map(|(c, p)| {
+            scarab_policy::environment_rules::gate_release(
+                scarab_policy::environment_rules::GateReleaseFacts {
+                    git_ref: &c.git_ref,
+                    protection: p,
+                    approvals,
+                    wait_began_ms: wait_began,
+                    now_ms: now,
+                },
+            )
+        })
+    };
+    let decide = |approvals: Vec<String>| {
+        let release = release_rule(&approvals);
+        let checkpoint = checkpoint.as_ref();
+        let subject = principal.subject.clone();
+        async move {
+            let decision = match checkpoint {
+                Some(f) => Some(
+                    f.decide(
+                        &subject,
+                        &approvals,
+                        now,
+                        release.as_ref().map(|r| r.result.clone()),
+                    )
+                    .await
+                    .map_err(ApiError::Db)?,
+                ),
+                None => None,
+            };
+            Ok::<_, ApiError>((approvals, release, decision))
+        }
+    };
+    let mut prospective = gate_approvers(&st.db.events(&run).await.map_err(ApiError::Db)?, &step);
+    if !prospective.contains(&principal.subject) {
+        prospective.push(principal.subject.clone());
+    }
+    let mut decided = decide(prospective).await?;
+    if let (Some(f), Some(decision)) = (&checkpoint, &decided.2) {
+        if decision.is_denied() {
+            let messages = decision.attributed_messages();
+            f.record(st.policies.as_deref(), decision.clone(), now)
+                .await
+                .map_err(ApiError::Db)?;
+            return Err(ApiError::Denied(format!(
+                "the approval is refused: {}",
+                messages.join("; ")
+            )));
+        }
+    }
+
+    // 2. Record this principal's approval — append-only, no resume, idempotent
     //    per (step, subject).
     match scarab_engine::record_gate_approval(
         st.db.as_ref(),
@@ -9611,29 +9890,100 @@ async fn approve_gate(
             .into_response());
     }
 
-    // 2. Gather the accumulated approvers; the governing Environment's rules
-    //    were resolved at 0., NOW rather than at Run creation: an admin's
-    //    change since — tightened rules, a withdrawn eligibility, a deleted
-    //    Environment — governs the release.
+    // 3. The accumulated approvers, as recorded; the governing Environment's
+    //    rules were resolved at 0., NOW rather than at Run creation: an
+    //    admin's change since — tightened rules, a withdrawn eligibility, a
+    //    deleted Environment — governs the release. Another approval recorded
+    //    since the decision was made changes the approvals: decide again.
     let approvers = gate_approvers(&st.db.events(&run).await.map_err(ApiError::Db)?, &step);
-    let protection = governance?;
-
-    // 3. A protected deploy releases only when admits() passes over the
-    //    accumulated approvers (every required approver, and the ref still
-    //    allowed); an unprotected/plain gate releases now.
-    let admitted = match (&ctx, &protection) {
-        (Some(c), Some(p)) => p.admits(&c.git_ref, &approvers).is_ok(),
-        _ => true,
-    };
-    if !admitted {
-        return Ok((
-            StatusCode::ACCEPTED,
-            Json(serde_json::json!({ "released": false, "approvals": approvers })),
-        )
-            .into_response());
+    if let Some(e) = held {
+        return Err(e);
+    }
+    if approvers != decided.0 {
+        decided = decide(approvers).await?;
+    }
+    let (approvers, release, decision) = decided;
+    if let (Some(f), Some(decision)) = (&checkpoint, decision) {
+        // A deny is enforced here as at 1.: a decision made again over
+        // approvals recorded since can deny where the first allowed (a
+        // Policy over who approved). The approval stays recorded, as on a
+        // held gate; the gate does not release.
+        let denied = decision.is_denied().then(|| decision.attributed_messages());
+        f.record(st.policies.as_deref(), decision, now)
+            .await
+            .map_err(ApiError::Db)?;
+        if let Some(messages) = denied {
+            return Err(ApiError::Denied(format!(
+                "approval recorded, but the gate does not release: {}",
+                messages.join("; ")
+            )));
+        }
     }
 
-    // 4. Finalize the gate and resume the run (exactly-once).
+    // 4. An Environment approval gate releases only when the release rule
+    //    passes: the required approvals are in, the ref is still allowed,
+    //    and the wait timer has run out. A plain gate releases now.
+    if let Some(release) = release {
+        let Some(met) = release.met else {
+            return Ok((
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({ "released": false, "approvals": approvers })),
+            )
+                .into_response());
+        };
+        // ADR-0078 §4: the approvals are in. Record them with the approver
+        // set they met (what each launch behind the gate checks again) and
+        // when the wait timer, counted on the gate's wait clock, runs out.
+        let recorded = scarab_engine::environment_approval_met(
+            &st.db.events(&run).await.map_err(ApiError::Db)?,
+            &step,
+        );
+        if recorded
+            .as_ref()
+            .map(|r| (&r.approvers, r.required, r.release_at))
+            != Some((&met.approvers, met.required, met.release_at))
+        {
+            st.db
+                .append_event(&EventKind {
+                    version: EVENT_VERSION,
+                    run: run.clone(),
+                    kind: EventPayload::EnvironmentApprovalMet {
+                        step: step.clone(),
+                        approvers: met.approvers,
+                        required: met.required,
+                        release_at: met.release_at,
+                    },
+                    at: Timestamp(now),
+                })
+                .await
+                .map_err(ApiError::Db)?;
+        }
+        // Record the deployment in the legacy approval history (ADR-0024,
+        // 0037, ADR-0070 §1), the record `GET …/environments/{name}/
+        // deployments` serves: once per wait, when its approvals first meet
+        // the rules. The scheduler, which releases the gate when the wait
+        // timer runs out, has no history store, so the record is written
+        // here whichever path releases the gate.
+        if recorded.is_none() {
+            if let Some((c, _)) = rules {
+                record_deployment(&st, c, &run, &approvers, now).await?;
+            }
+        }
+        if release.result.outcome != scarab_policy::evaluate::PolicyOutcome::Passed {
+            // The scheduler releases the gate when the timer runs out.
+            return Ok((
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({
+                    "released": false,
+                    "approvals": approvers,
+                    "releases_at": met.release_at,
+                })),
+            )
+                .into_response());
+        }
+    }
+
+    // 5. Finalize the gate and resume the run (exactly-once).
     match scarab_engine::release_gate(st.db.as_ref(), st.clock.as_ref(), &run, &step).await {
         Ok(()) => {}
         Err(RerunError::StepNotFound(_)) => return Err(ApiError::NotFound),
@@ -9661,25 +10011,14 @@ async fn approve_gate(
         .iter()
         .any(|s| s.step == step && s.status == StepStatus::Succeeded);
 
-    // 5. Record the deployment in the legacy approval history (ADR-0024, 0037,
-    //    ADR-0070 §1) — only on a real release (a no-op re-release writes no
-    //    duplicate history record). Kept through ADR-0071: it is the record
-    //    `GET …/environments/{name}/deployments` still serves.
-    if released {
-        if let (Some(c), Some(store)) = (&ctx, st.environments.as_ref()) {
+    // 6. An Environment approval gate judged by no Environment rules (no
+    //    governance store wired) records its deployment on a real release (a
+    //    no-op re-release writes no duplicate). One judged by them recorded
+    //    it at step 4, when its approvals met the rules.
+    if released && approval_gate && rules.is_none() {
+        if let Some(c) = &ctx {
             let now = st.clock.now().await.0;
-            store
-                .record_deployment(&scarab_project::Deployment {
-                    org: c.org.clone(),
-                    project: c.project.clone(),
-                    environment: c.environment.clone(),
-                    git_ref: c.git_ref.clone(),
-                    run: run.0.clone(),
-                    approved_by: approvers.clone(),
-                    at: now,
-                })
-                .await
-                .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+            record_deployment(&st, c, &run, &approvers, now).await?;
         }
     }
 
@@ -9688,6 +10027,32 @@ async fn approve_gate(
         Json(serde_json::json!({ "released": released, "approvals": approvers })),
     )
         .into_response())
+}
+
+/// Write one deploy of `run` to the legacy approval history, when a history
+/// store is wired.
+async fn record_deployment(
+    st: &AppState,
+    c: &scarab_engine::DeployContext,
+    run: &RunId,
+    approvers: &[String],
+    at: i64,
+) -> Result<(), ApiError> {
+    let Some(store) = st.environments.as_ref() else {
+        return Ok(());
+    };
+    store
+        .record_deployment(&scarab_project::Deployment {
+            org: c.org.clone(),
+            project: c.project.clone(),
+            environment: c.environment.clone(),
+            git_ref: c.git_ref.clone(),
+            run: run.0.clone(),
+            approved_by: approvers.to_vec(),
+            at,
+        })
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))
 }
 
 /// `POST /v1/runs/{id}/gates/{step}/reject` body: why the gate is failed.
@@ -10175,7 +10540,7 @@ fn secret_scope(
     }
 }
 
-fn secret_err(e: scarab_secrets::SecretError) -> ApiError {
+pub(crate) fn secret_err(e: scarab_secrets::SecretError) -> ApiError {
     use scarab_secrets::SecretError;
     match e {
         SecretError::NotFound => ApiError::NotFound,
@@ -12706,6 +13071,7 @@ impl utoipa::Modify for StepUpResponses {
         org_environments::get_org_environment,
         org_environments::put_org_environment,
         org_environments::delete_org_environment,
+        org_environments::duplicate_org_environment,
         org_environments::get_environment_eligibility,
         org_environments::put_environment_eligibility,
         org_environments::get_environment_protection,
@@ -12890,10 +13256,18 @@ impl utoipa::Modify for StepUpResponses {
         TokenSort,
         org_environments::OrgEnvironmentDto,
         org_environments::PutOrgEnvironmentRequest,
+        org_environments::DuplicateOrgEnvironmentRequest,
+        org_environments::DuplicateOrgEnvironmentResponse,
+        org_environments::DuplicateCopiedDto,
+        org_environments::DuplicatedSecretsDto,
+        org_environments::DuplicateNotCopiedDto,
+        org_environments::DuplicatePolicyDto,
         org_environments::EnvironmentEligibilityDto,
         org_environments::ProjectEnvironmentDto,
         org_environments::EnvironmentProtectionRulesDto,
         org_environments::EffectiveProtectionDto,
+        org_environments::ApprovalGateRulesDto,
+        org_environments::MissingGateModeDto,
         org_environments::EnvironmentProjectPrivilegeGrantDto,
         org_environments::ImageGrantDto,
         org_environments::PutEnvironmentProtectionRequest,
@@ -12927,6 +13301,7 @@ impl utoipa::Modify for StepUpResponses {
         libraries::YankImpactRunDto,
         run_origin::OriginLinkDto,
         run_origin::RunYankDto,
+        run_origin::RunEnvironmentDto,
         run_origin::GateOutputDto,
         run_origin::PluginGateViewDto,
         run_origin::BoundInputDto,

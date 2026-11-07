@@ -349,7 +349,7 @@ impl InMemoryDb {
     /// another — that commits between two of a caller's separate writes.
     /// Constructs the interleaving instead of scheduling it. Supported
     /// methods: `set_run_params`, `set_run_concurrency`,
-    /// `commit_step_transition`.
+    /// `commit_step_transition`, `append_event`.
     pub fn interleave_before_next(&self, method: &'static str, hook: DbHook) {
         *self.interleave.lock().unwrap() = Some((method, hook));
     }
@@ -1837,6 +1837,23 @@ impl Db for InMemoryDb {
         Ok(out)
     }
 
+    async fn projects_with_runs_in(
+        &self,
+        org: &str,
+        environment: &str,
+    ) -> Result<Vec<String>, DbError> {
+        let st = self.state.lock().unwrap();
+        let mut projects: Vec<String> = st
+            .run_deploy
+            .values()
+            .filter(|d| d.org == org && d.environment == environment)
+            .map(|d| d.project.clone())
+            .collect();
+        projects.sort();
+        projects.dedup();
+        Ok(projects)
+    }
+
     async fn events(&self, run: &RunId) -> Result<Vec<EventKind>, DbError> {
         Ok(self
             .state
@@ -2153,6 +2170,7 @@ impl Db for InMemoryDb {
     }
 
     async fn append_event(&self, event: &EventKind) -> Result<(), DbError> {
+        self.interleave_point("append_event").await;
         let mut st = self.state.lock().unwrap();
         take_event_append_failure(&mut st, std::slice::from_ref(event))?;
         st.events.push(event.clone());
@@ -4951,6 +4969,25 @@ impl SecretProvider for FakeSecrets {
             .unwrap()
             .remove(&(scope_key(scope), key.to_string()));
         Ok(())
+    }
+
+    async fn environment_secret_projects(
+        &self,
+        org: &str,
+        environment: &str,
+    ) -> Result<Vec<String>, SecretError> {
+        let mut projects: Vec<String> = self
+            .values
+            .lock()
+            .unwrap()
+            .keys()
+            .filter_map(|(s, _)| {
+                scarab_secrets::environment_project_of_scope_key(s, org, environment)
+            })
+            .collect();
+        projects.sort();
+        projects.dedup();
+        Ok(projects)
     }
 }
 

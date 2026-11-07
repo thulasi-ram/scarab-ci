@@ -28,13 +28,14 @@ pub use ports::{
 };
 pub use schedules::{ScheduleEntry, ScheduleFire, ScheduleStore};
 pub use scheduler::{
-    cancel_run_request, fail_run_creation, gate_approvers, pin_run_snapshots, plan_rerun,
-    record_gate_approval, reject_gate, release_gate, releases_plugin_gate, resolve_plugin_gate,
-    rerun_step, rerun_step_widened, retry_step, retry_step_widened, run_status_post_key,
-    unpin_run_snapshots, wait_began_at, AttemptTeardown, ExpiredInput, PlanReason, PlannedStep,
-    PluginGateError, PluginGateVerdict, RerunError, RerunPlan, Scheduler, SchedulerError,
-    Supervision, TeardownAttempt, TickHealth, CANCEL_ATTEMPT, CANCEL_RUN, LAUNCH_STEP,
-    MAX_DELIVERY_ATTEMPTS, RUN_FINISHED, RUN_STATUS_CHANGED, SUPERSEDE_TEARDOWN,
+    cancel_run_request, environment_approval_met, fail_run_creation, gate_approvers,
+    gate_released_at, pin_run_snapshots, plan_rerun, record_gate_approval, reject_gate,
+    release_gate, releases_plugin_gate, rerun_step, rerun_step_widened, resolve_plugin_gate,
+    retry_step, retry_step_widened, run_status_post_key, unpin_run_snapshots, wait_began_at,
+    AttemptTeardown, EnvironmentApproval, ExpiredInput, PlanReason, PlannedStep, PluginGateError,
+    PluginGateVerdict, RerunError, RerunPlan, Scheduler, SchedulerError, Supervision,
+    TeardownAttempt, TickHealth, CANCEL_ATTEMPT, CANCEL_RUN, LAUNCH_STEP, MAX_DELIVERY_ATTEMPTS,
+    RUN_FINISHED, RUN_STATUS_CHANGED, SUPERSEDE_TEARDOWN,
 };
 
 use serde::{Deserialize, Serialize};
@@ -657,11 +658,19 @@ pub struct StepSpec {
     pub image: String,
     pub command: Vec<String>,
     pub env: Vec<(String, String)>,
-    /// Secret keys the step wants injected at launch (ADR-0037). Resolved (with
-    /// inheritance) and merged into `env` by the launch path just before the Pod
-    /// starts — never persisted with a value. Empty for most steps.
+    /// The secrets the step declared (ADR-0014, 0037): each one a file under
+    /// `/scarab/secrets/`, and an environment variable too when its entry has
+    /// `env: true`. Resolved (with inheritance) by the launch path just before
+    /// the Pod starts into [`resolved_secrets`](Self::resolved_secrets) —
+    /// never persisted with a value. Empty for most steps.
     #[serde(default)]
-    pub secrets: Vec<String>,
+    pub secrets: Vec<scarab_pipeline::SecretRef>,
+    /// The values of [`secrets`](Self::secrets), resolved at LAUNCH —
+    /// **never serialized** (in-memory enrichment only, like
+    /// [`oidc_token`](Self::oidc_token)). The executor writes each one as a
+    /// file and never puts a value in a Pod spec or argv.
+    #[serde(skip)]
+    pub resolved_secrets: ResolvedSecrets,
     /// The privilege escalations **admitted** for this step (ADR-0039) — already
     /// authorized against the run's Environment whitelist and fork-lockout at run
     /// creation. The executor applies *exactly* these above the hardened baseline
@@ -769,6 +778,30 @@ pub struct StepSpec {
     /// needs, `matrix` its [`matrix_values`](Self::matrix_values).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<scarab_pipeline::Scope>,
+}
+
+/// A step's secret values for one launch, `(name, value)` in declared order.
+/// Its `Debug` prints the names only, so a logged [`StepSpec`] never carries
+/// a value.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct ResolvedSecrets(pub Vec<(String, String)>);
+
+impl ResolvedSecrets {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &(String, String)> {
+        self.0.iter()
+    }
+}
+
+impl std::fmt::Debug for ResolvedSecrets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(self.0.iter().map(|(k, _)| format!("{k}=<redacted>")))
+            .finish()
+    }
 }
 
 /// The launch context of a step's keyed directory Cache (ADR-0065 s1).
@@ -1219,6 +1252,28 @@ pub enum EventPayload {
     },
     GateReleased {
         step: StepId,
+    },
+    /// The approvals of an **Environment approval gate**'s current wait met
+    /// its Environment's rules (ADR-0078 §4). The server appends it when an
+    /// approval completes them; it does not release the gate by itself.
+    ///
+    /// - `release_at` (Unix ms) — the earliest the gate releases: its wait
+    ///   clock's start plus the Environment's wait timer. When that is
+    ///   already past, the server releases the gate at once; otherwise the
+    ///   scheduler does when it passes.
+    /// - `approvers`, `required` — the Environment's approver set (sorted)
+    ///   and required count at that moment. Every launch of a Step behind
+    ///   the gate that uses the Environment's authority compares the set it
+    ///   sees then against these, and is refused when they differ.
+    ///
+    /// **Forward-only**: a binary from before this variant cannot replay a
+    /// log that carries it.
+    EnvironmentApprovalMet {
+        step: StepId,
+        approvers: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        required: Option<u32>,
+        release_at: i64,
     },
     /// A step was skipped on restart because its inputs were unchanged — its
     /// prior output is carried forward rather than recomputed (ADR-0027). Surfaced

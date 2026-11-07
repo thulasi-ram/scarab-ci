@@ -1,4 +1,4 @@
-// Settings › Members (ADR-0049 roles, ADR-0069 identities): who holds which
+// Settings › Members: who holds which
 // role in the org, granting and revoking natively, and re-syncing a repo's
 // collaborators from its forge.
 //
@@ -18,6 +18,8 @@ import {
 } from "../api/client";
 import { memberRows } from "../identities";
 import Icon from "./Icon";
+import ConfirmDestructive from "./ConfirmDestructive";
+import { Field, Select } from "./Field";
 import PrincipalSearch from "./PrincipalSearch";
 
 const ROLES = ["viewer", "member", "admin", "owner"];
@@ -65,14 +67,19 @@ export default function Members(props: { org: string }) {
       setSubject("");
     });
 
-  const revoke = (s: string, p: string) => {
-    if (
-      !window.confirm(
-        `Revoke ${s}'s role on ${p || `all of ${props.org}`}?\n\nA native revoke is durable: a later forge re-sync will not give it back.`,
-      )
-    )
-      return;
-    void act(() => revokeRole(props.org, s, p || undefined));
+  // The role the confirm dialog is about to revoke. A refusal shows in the
+  // dialog.
+  const [revoking, setRevoking] = createSignal<{ subject: string; project: string } | null>(null);
+  const revoke = async (s: string, p: string) => {
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await revokeRole(props.org, s, p || undefined);
+      await refetch();
+    } finally {
+      setBusy(false);
+    }
   };
 
   const resync = () =>
@@ -137,7 +144,7 @@ export default function Members(props: { org: string }) {
                         <Show when={r.orgRole}>
                           <span>
                             <span class="tok-role">{r.orgRole}</span> all of {props.org}
-                            <button class="btn btn-ghost btn-sm" disabled={busy()} onClick={() => revoke(r.subject, "")}>
+                            <button class="btn btn-ghost btn-sm" disabled={busy()} onClick={() => setRevoking({ subject: r.subject, project: "" })}>
                               revoke
                             </button>
                           </span>
@@ -146,7 +153,7 @@ export default function Members(props: { org: string }) {
                           {(p) => (
                             <span>
                               <span class="tok-role">{p.role}</span> {p.project}
-                              <button class="btn btn-ghost btn-sm" disabled={busy()} onClick={() => revoke(r.subject, p.project)}>
+                              <button class="btn btn-ghost btn-sm" disabled={busy()} onClick={() => setRevoking({ subject: r.subject, project: p.project })}>
                                 revoke
                               </button>
                             </span>
@@ -159,21 +166,23 @@ export default function Members(props: { org: string }) {
               </ul>
             </Show>
 
-            <div class="form-r">
-              <label>grant</label>
+            <div class="f">
+              <div class="f-l">
+                <span class="f-lbl">Grant</span>
+              </div>
               <Show
                 when={subject()}
                 fallback={<PrincipalSearch org={props.org} onPick={setSubject} />}
               >
                 <div class="tok-life">
                   <span class="tok-scope mono">{subject()}</span>
-                  <select class="input" value={role()} onChange={(e) => setRole(e.currentTarget.value)}>
+                  <Select aria-label="role" value={role()} onValue={setRole}>
                     <For each={ROLES}>{(r) => <option value={r}>{r}</option>}</For>
-                  </select>
-                  <select class="input" value={project()} onChange={(e) => setProject(e.currentTarget.value)}>
+                  </Select>
+                  <Select aria-label="scope" value={project()} onValue={setProject}>
                     <option value="">all of {props.org}</option>
                     <For each={projects() ?? []}>{(p) => <option value={p}>{p}</option>}</For>
-                  </select>
+                  </Select>
                   <button class="btn btn-primary btn-sm" disabled={busy()} onClick={grant}>
                     grant
                   </button>
@@ -184,24 +193,32 @@ export default function Members(props: { org: string }) {
               </Show>
             </div>
 
-            <div class="form-r">
-              <label>re-sync from forge</label>
+            <Field
+              label="Re-sync from forge"
+              help="Seeds roles from the repository's forge collaborators — admin → admin, write → member, read → viewer — pinned to each person's forge account, and removes the forge-given role of anyone the forge no longer lists. Native grants and revokes made here are never touched."
+            >
               <div class="tok-life">
-                <select class="input" value={syncRepo()} onChange={(e) => setSyncRepo(e.currentTarget.value)}>
+                <Select value={syncRepo()} onValue={setSyncRepo}>
                   <option value="">choose a repository…</option>
                   <For each={projects() ?? []}>{(p) => <option value={p}>{p}</option>}</For>
-                </select>
+                </Select>
                 <button class="btn btn-ghost btn-sm" disabled={busy() || !syncRepo()} onClick={resync}>
                   <Icon icon="rotate-cw" size={13} /> re-sync
                 </button>
               </div>
-              <p class="fieldnote">
-                Seeds roles from the repository's forge collaborators — admin → admin, write →
-                member, read → viewer — pinned to each person's forge account, and removes the
-                forge-given role of anyone the forge no longer lists. Native grants and
-                revokes made here are never touched.
-              </p>
-            </div>
+            </Field>
+            <Show when={revoking()}>
+              {(r) => (
+                <ConfirmDestructive
+                  title={`Revoke ${r().subject}'s role on ${r().project || `all of ${props.org}`}?`}
+                  purpose="A native revoke is durable: a later forge re-sync will not give it back."
+                  name={r().subject}
+                  confirmLabel="Revoke role"
+                  onConfirm={() => revoke(r().subject, r().project)}
+                  onClose={() => setRevoking(null)}
+                />
+              )}
+            </Show>
           </Show>
         </Show>
       </div>

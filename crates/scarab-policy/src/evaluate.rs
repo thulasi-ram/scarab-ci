@@ -58,6 +58,12 @@ pub enum PolicyOutcome {
     WouldDeny { messages: Vec<String> },
     /// A rule could not be evaluated. In `enforce` mode this denies.
     Error { message: String },
+    /// A built-in Environment rule added the Environment's approval gate
+    /// `gate` in front of Steps `fronts` (ADR-0078 §2). Allows.
+    GateAdded { gate: String, fronts: Vec<String> },
+    /// A built-in rule's requirement is not met yet: a gate does not release
+    /// until it is (ADR-0075 §5). Neither allows nor denies the decision.
+    Requires { messages: Vec<String> },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,6 +107,37 @@ impl PolicyDecision {
             DecisionOutcome::Allow => &[],
             DecisionOutcome::Deny { messages } => messages,
         }
+    }
+
+    /// What enforced requirements still lack ([`PolicyOutcome::Requires`]);
+    /// empty when every requirement is met.
+    pub fn unmet_requirements(&self) -> Vec<String> {
+        self.results
+            .iter()
+            .filter(|r| r.mode == Mode::Enforce)
+            .flat_map(|r| match &r.outcome {
+                PolicyOutcome::Requires { messages } => messages.clone(),
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
+    /// The deny messages, each with the Policy or built-in rule it came
+    /// from, as a refusal shows them.
+    pub fn attributed_messages(&self) -> Vec<String> {
+        let mut messages = Vec::new();
+        for r in self.results.iter().filter(|r| r.mode == Mode::Enforce) {
+            match &r.outcome {
+                PolicyOutcome::Denied { messages: m } => {
+                    messages.extend(m.iter().map(|m| format!("policy `{}`: {m}", r.name)))
+                }
+                PolicyOutcome::Error { message } => {
+                    messages.push(format!("policy `{}`: {message}", r.name))
+                }
+                _ => {}
+            }
+        }
+        messages
     }
 }
 
@@ -207,6 +244,32 @@ pub fn evaluate_stored(
     ctx: &MatchContext,
     stored: &[StoredPolicy],
 ) -> PolicyDecision {
+    evaluate_with_builtins(
+        checkpoint,
+        schema_version,
+        input,
+        plugin_gates,
+        ctx,
+        stored,
+        Vec::new(),
+    )
+}
+
+/// [`evaluate_stored`], with the results of the built-in rules that apply
+/// to this consultation: the Environment's typed approval-gate settings
+/// (ADR-0078 §6, [`crate::environment_rules`]). They come first in the
+/// decision, are combined with the stored Policies' results as one more
+/// enforced Policy, and, being fixed in code, are not part of the
+/// PolicySetDigest.
+pub fn evaluate_with_builtins(
+    checkpoint: Checkpoint,
+    schema_version: u32,
+    input: Result<&Value, &str>,
+    plugin_gates: Option<&[PluginGate]>,
+    ctx: &MatchContext,
+    stored: &[StoredPolicy],
+    builtins: Vec<PolicyResult>,
+) -> PolicyDecision {
     let compiled: Vec<(&StoredPolicy, Result<PolicyIr, String>)> = stored
         .iter()
         .filter(|p| p.body.checkpoint == checkpoint)
@@ -245,7 +308,7 @@ pub fn evaluate_stored(
     .into_iter();
 
     let mut digest_set = Vec::with_capacity(compiled.len());
-    let mut results = Vec::with_capacity(compiled.len());
+    let mut results = builtins;
     for (p, ir) in compiled {
         match ir {
             Ok(ir) => {

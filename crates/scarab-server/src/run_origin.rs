@@ -34,6 +34,36 @@ use crate::{authorize_scoped, run_scope, ApiError, AppState};
 struct Ir {
     #[serde(default)]
     steps: Vec<IrStep>,
+    /// The Environment the Run names, if any.
+    #[serde(default)]
+    environment: Option<String>,
+    /// The same IR read as the pipeline crate's type, which the approve
+    /// handler reads too; `None` for an IR this release cannot read (a Run
+    /// created by a newer server).
+    #[serde(skip)]
+    typed: Option<scarab_pipeline::PipelineIr>,
+}
+
+impl Ir {
+    /// Whether `step` is an Environment approval gate, as the approve handler
+    /// judges it: in a Run that names an Environment,
+    /// [`scarab_pipeline::StepSpec::counts_as_environment_approval_gate`],
+    /// which counts a `manual` gate of a Run created before the mark existed.
+    /// Where the IR cannot be read as the pipeline type, the handler asks the
+    /// approvers, so every `manual` gate counts here too.
+    fn is_environment_approval_gate(&self, step: &IrStep) -> bool {
+        if self.environment.is_none() {
+            return false;
+        }
+        match &self.typed {
+            Some(ir) => ir
+                .steps
+                .iter()
+                .find(|s| s.id == step.id)
+                .is_some_and(|s| s.counts_as_environment_approval_gate()),
+            None => step.gate.as_deref() == Some("manual"),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -47,6 +77,8 @@ struct IrStep {
     gate_expires_after: Option<u64>,
     #[serde(default)]
     scope: Option<serde_json::Value>,
+    #[serde(default)]
+    gate: Option<String>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -79,22 +111,60 @@ fn string_type() -> String {
 }
 
 async fn read_ir(st: &AppState, run: &RunId) -> Result<Ir, ApiError> {
-    Ok(st
-        .db
-        .run_ir(run)
-        .await?
-        .and_then(|v| serde_json::from_value(v).ok())
-        .unwrap_or_default())
+    use serde::Deserialize as _;
+    let Some(raw) = st.db.run_ir(run).await? else {
+        return Ok(Ir::default());
+    };
+    let mut ir = Ir::deserialize(&raw).unwrap_or_default();
+    ir.typed = scarab_pipeline::PipelineIr::deserialize(&raw).ok();
+    Ok(ir)
+}
+
+/// The Environment a Run names (`name`, from [`step_views`]), with its
+/// display name when the org still has an Environment of that name. `None`
+/// for a Run that names none.
+pub(crate) async fn run_environment(
+    st: &AppState,
+    run: &RunId,
+    name: Option<String>,
+) -> Result<Option<RunEnvironmentDto>, ApiError> {
+    let Some(name) = name else {
+        return Ok(None);
+    };
+    let org = st.db.run_tenant(run).await?.map(|(org, _)| org);
+    // A display name is for show: a store that cannot answer leaves it out.
+    let display_name = match (org, st.environment_governance.as_ref()) {
+        (Some(org), Some(store)) => store
+            .org_environment(&org, &name)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|e| e.display_name),
+        _ => None,
+    };
+    Ok(Some(RunEnvironmentDto { name, display_name }))
 }
 
 // ---------------------------------------------------------------------------
 // DTOs
 // ---------------------------------------------------------------------------
 
+/// The Environment a Run names.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RunEnvironmentDto {
+    /// The name the pipeline's `environment:` uses.
+    pub name: String,
+    /// What headings show in its place; absent when it has none or the org
+    /// no longer has an Environment of that name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+}
+
 /// One link of a Step's invoke chain, outermost first.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct OriginLinkDto {
-    /// `file`, `library` or `plugin`.
+    /// `file`, `library`, `plugin`, or `environment` for the gate an
+    /// Environment added to the Run (ADR-0078 §2).
     pub kind: String,
     /// A repo-relative path (`file`), `<publisher>/<name>` (`library`) or the
     /// plugin installation and gate (`plugin`).
@@ -170,6 +240,9 @@ pub struct PluginGateViewDto {
 pub(crate) struct StepOriginView {
     pub origin: Vec<OriginLinkDto>,
     pub plugin_gate: Option<PluginGateViewDto>,
+    /// The gate is an Environment approval gate (ADR-0078 §1), as Run
+    /// creation decided and stored it.
+    pub environment_approval_gate: bool,
 }
 
 /// One input in the scope of a Step's invocation.
@@ -266,13 +339,13 @@ fn link(
     }
 }
 
-/// The origin and plugin-gate view of every step of `run`, by step id, and
-/// the Run's yanked library versions.
+/// The origin and plugin-gate view of every step of `run`, by step id, the
+/// Run's yanked library versions, and the Environment the Run names.
 pub(crate) async fn step_views(
     st: &AppState,
     run: &RunId,
     steps: &[StepRun],
-) -> Result<(HashMap<String, StepOriginView>, Vec<RunYankDto>), ApiError> {
+) -> Result<StepViews, ApiError> {
     let ir = read_ir(st, run).await?;
     let yanks = yanks_of(st, run, &ir).await?;
     let attempts: HashMap<&str, &StepRun> = steps.iter().map(|s| (s.step.0.as_str(), s)).collect();
@@ -302,17 +375,33 @@ pub(crate) async fn step_views(
             }
             None => None,
         };
-        if !origin.is_empty() || plugin_gate.is_some() {
+        let environment_approval_gate = ir.is_environment_approval_gate(s);
+        if !origin.is_empty() || plugin_gate.is_some() || environment_approval_gate {
             views.insert(
                 s.id.clone(),
                 StepOriginView {
                     origin,
                     plugin_gate,
+                    environment_approval_gate,
                 },
             );
         }
     }
-    Ok((views, yanked.into_values().collect()))
+    Ok(StepViews {
+        views,
+        yanked: yanked.into_values().collect(),
+        environment: ir.environment,
+    })
+}
+
+/// What [`step_views`] reads from a Run's stored IR.
+pub(crate) struct StepViews {
+    /// The origin and plugin-gate view of every step, by step id.
+    pub views: HashMap<String, StepOriginView>,
+    /// The Run's yanked library versions.
+    pub yanked: Vec<RunYankDto>,
+    /// The Environment the Run names, if any.
+    pub environment: Option<String>,
 }
 
 async fn plugin_gate_view(

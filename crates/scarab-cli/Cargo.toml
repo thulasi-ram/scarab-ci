@@ -13,6 +13,9 @@ clap = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 scarab-pipeline = { workspace = true }
+# `validate` names the Environment approval gates (ADR-0078) with the
+# server's own definition.
+scarab-policy = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
@@ -31,5 +34,3 @@ axum = { workspace = true }
 # pure computation over a lazy pool that never connects.
 scarab-secrets-postgres = { workspace = true }
 sqlx = { workspace = true }
-# `tests/validate.rs`: an org Policy stored in the in-memory PolicyStore.
-scarab-policy = { workspace = true }

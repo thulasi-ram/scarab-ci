@@ -112,6 +112,12 @@ pub fn schema_for(checkpoint: Checkpoint, version: u32) -> Option<Schema> {
         Checkpoint::RunCreate if version == crate::run_create::SCHEMA_VERSION => {
             Some(crate::run_create::schema())
         }
+        Checkpoint::GateResolve if version == crate::gate_resolve::SCHEMA_VERSION => {
+            Some(crate::gate_resolve::schema())
+        }
+        Checkpoint::StepAdmit if version == crate::step_admit::SCHEMA_VERSION => {
+            Some(crate::step_admit::schema())
+        }
         _ => None,
     }
 }
@@ -120,7 +126,8 @@ pub fn schema_for(checkpoint: Checkpoint, version: u32) -> Option<Schema> {
 pub fn schema_version(checkpoint: Checkpoint) -> Option<u32> {
     match checkpoint {
         Checkpoint::RunCreate => Some(crate::run_create::SCHEMA_VERSION),
-        _ => None,
+        Checkpoint::GateResolve => Some(crate::gate_resolve::SCHEMA_VERSION),
+        Checkpoint::StepAdmit => Some(crate::step_admit::SCHEMA_VERSION),
     }
 }
 
@@ -138,11 +145,21 @@ pub fn compile(policy: &Policy, level: Level) -> Result<PolicyIr, Vec<Diagnostic
         errors.push(Diagnostic::at(
             "checkpoint",
             format!(
-                "checkpoint `{}` is not yet supported; only `run.create` is consulted",
+                "checkpoint `{}` is not yet supported",
                 policy.checkpoint
             ),
         ));
         return Err(errors);
+    }
+    if policy.checkpoint != Checkpoint::RunCreate && !policy.match_.trigger_kinds.is_empty() {
+        // A Run's trigger is part of the `run.create` input only.
+        errors.push(Diagnostic::at(
+            "match.trigger_kinds",
+            format!(
+                "`trigger_kinds` is matched at `run.create` only, not at `{}`",
+                policy.checkpoint
+            ),
+        ));
     }
     let version = schema_version(policy.checkpoint).expect("a consulted checkpoint has a schema");
     let schema = schema_for(policy.checkpoint, version).expect("the current schema exists");
@@ -175,7 +192,19 @@ pub fn compile(policy: &Policy, level: Level) -> Result<PolicyIr, Vec<Diagnostic
             let mut patterns = PolicyPatterns::default();
             for (i, rule) in rules.iter().enumerate() {
                 let at = format!("rules[{i}]");
-                if !policy.checkpoint.allows(&rule.effect) {
+                if policy.checkpoint.allows(&rule.effect) && rule.effect != Effect::Deny {
+                    // ADR-0075 §5 allows both requirements at `gate.resolve`;
+                    // the evaluator does not apply them yet, and a rule it
+                    // cannot apply would deny every release.
+                    errors.push(Diagnostic::at(
+                        format!("{at}.effect"),
+                        format!(
+                            "`{}` is not built yet at `{}`; only `deny` is evaluated",
+                            rule.effect.name(),
+                            policy.checkpoint
+                        ),
+                    ));
+                } else if !policy.checkpoint.allows(&rule.effect) {
                     errors.push(Diagnostic::at(
                         format!("{at}.effect"),
                         format!(
