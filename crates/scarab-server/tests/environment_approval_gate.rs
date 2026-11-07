@@ -105,6 +105,22 @@ struct Stack {
     exec: Arc<FakeExecutor>,
     issuer: Arc<Rs256Issuer>,
     app: axum::Router,
+    /// The snapshot oracle the scheduler resolves cache key files through;
+    /// `None` turns every Cache off.
+    snapshots: Option<Arc<FilesOracle>>,
+}
+
+/// A snapshot oracle over fixed `(root, path) → blob hash` entries.
+struct FilesOracle(std::collections::HashMap<(String, String), String>);
+
+#[async_trait::async_trait]
+impl scarab_engine::ports::WorkspaceSnapshots for FilesOracle {
+    async fn snapshot_present(&self, _root: &str) -> bool {
+        true
+    }
+    async fn file_blob_hash(&self, root: &str, path: &str) -> Result<Option<String>, String> {
+        Ok(self.0.get(&(root.to_string(), path.to_string())).cloned())
+    }
 }
 
 impl Stack {
@@ -147,6 +163,7 @@ impl Stack {
             exec: Arc::new(FakeExecutor::new()),
             issuer: Arc::new(Rs256Issuer::generate("https://scarab.example").unwrap()),
             app,
+            snapshots: None,
         }
     }
 
@@ -208,6 +225,11 @@ impl Stack {
             self.clock.as_ref() as &dyn Clock,
             &exec,
             "sched",
+        )
+        .with_snapshots(
+            self.snapshots
+                .as_deref()
+                .map(|o| o as &dyn scarab_engine::ports::WorkspaceSnapshots),
         );
         for _ in 0..n {
             self.exec.script_outcome(ExecState::Succeeded);
@@ -1126,4 +1148,86 @@ async fn a_rerun_long_after_the_approval_gets_env_none_and_the_deploy_is_refused
     assert_eq!(s.status(&run, "ship").await, StepStatus::Failed);
     let (_, refusal) = latest_refusal(&s, &run, "ship").await;
     assert!(refusal.contains("is no longer allowed"), "{refusal}");
+}
+
+/// A gated Pipeline whose Steps before and after the gate both cache, keyed
+/// on `package-lock.json` from `src`'s output. `ship` uses the Environment's
+/// authority, which makes `approve` its approval gate.
+const GATED_WITH_CACHE: &str = r#"
+on:
+  manual: {}
+environment: prod
+steps:
+  - { id: src, image: busybox, command: ["true"] }
+  - id: build
+    image: busybox
+    command: ["true"]
+    needs: [src]
+    cache: { dirs: [node_modules], key: [package-lock.json] }
+  - { id: approve, gate: manual, needs: [build] }
+  - { id: ship, image: busybox, command: ["true"], deploy: true, needs: [approve] }
+  - id: cloud
+    image: busybox
+    command: ["true"]
+    needs: [approve, src]
+    cache: { dirs: [node_modules], key: [package-lock.json] }
+"#;
+
+/// The cache key `step`'s latest attempt launched with, and whether the
+/// Environment's resolution still rode along.
+async fn launched_cache(s: &Stack, run: &RunId, step: &str) -> (Option<String>, bool) {
+    let sr =
+        s.db.steps_of_run(run)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|x| x.step.0 == step)
+            .unwrap();
+    let cache = s
+        .exec
+        .launched_spec(&FakeExecutor::handle_for(&sr))
+        .and_then(|spec| spec.cache)
+        .expect("launched with a cache");
+    (cache.key, cache.approved.is_some())
+}
+
+/// git-bug 31a2533 (red team K2): a Step before the Environment approval
+/// gate reads and writes its ref's cache scope, never `env:prod`, so a push
+/// that names `prod` cannot fill what the approved deploy restores. A Step
+/// the approved gate admits uses `env:prod`, the same test that gives it
+/// the `env=prod` OIDC subject.
+#[tokio::test]
+async fn only_a_step_the_approved_gate_admits_uses_the_environments_cache_scope() {
+    let mut s = Stack::new(rules(&[ME])).await;
+    s.snapshots = Some(Arc::new(FilesOracle(
+        [(
+            ("root-src".to_string(), "package-lock.json".to_string()),
+            "blob-lock".to_string(),
+        )]
+        .into(),
+    )));
+    s.exec.set_output("src", "root-src");
+    let run = s.dispatch(GATED_WITH_CACHE).await.expect("admitted");
+    let project = s.db.run_project(&run).await.unwrap().expect("a project");
+    let lock = [("package-lock.json".to_string(), "blob-lock".to_string())];
+    let ref_key = scarab_engine::cache_key(&project, "refs/heads/main", &lock);
+    let env_key = scarab_engine::cache_key(&project, "env:prod", &lock);
+
+    s.tick(&run, 6).await;
+    assert_eq!(s.status(&run, "build").await, StepStatus::Succeeded);
+    assert_eq!(
+        launched_cache(&s, &run, "build").await,
+        (Some(ref_key), false),
+        "before the gate: the ref's scope, and the Environment's key is dropped"
+    );
+
+    let (status, body) = s.approve(&run, "approve").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    s.tick(&run, 6).await;
+    assert_eq!(s.status(&run, "cloud").await, StepStatus::Succeeded);
+    assert_eq!(
+        launched_cache(&s, &run, "cloud").await,
+        (Some(env_key), false),
+        "admitted by the approved gate: the Environment's scope"
+    );
 }

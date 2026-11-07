@@ -216,9 +216,12 @@ record. Read Breaking changes before you upgrade.
 
 - A pull request could save a Cache that a Step in an Environment-governed Run then restored,
   so a deploy could ship bytes a pull request wrote (git-bug efcec77). Every Run now has a
-  cache scope, fixed when the Run is created and kept by its reruns. A Run governed by an
-  Environment uses `env:<name>`: it reads and writes only that scope, so its first build is
-  cold. Any other Run uses its ref (`refs/heads/feat`, `refs/pull/7/head`): it writes only that
+  cache scope, fixed when the Run is created and kept by its reruns. In a Run governed by an
+  Environment, a Step that an approved Environment approval gate admits uses `env:<name>`: it
+  reads and writes only that scope, so its first build is cold. A Step before the gate uses the
+  Run's ref, so a push to any branch whose Pipeline names the Environment cannot write what the
+  next approved deploy restores (git-bug 31a2533). The test is the one that gives a Step the
+  `env=<name>` OIDC subject. Any other Run uses its ref (`refs/heads/feat`, `refs/pull/7/head`): it writes only that
   scope, and when that scope has no entry it reads the default branch's. A pull request never
   uses an Environment's scope, even when its Pipeline names the Environment and the Environment
   admits it: it uses its own ref like any other Run. A pull request reads `main`'s Cache and

@@ -854,33 +854,73 @@ pub struct CacheConfig {
     /// is never written back under it. `None` = the restore came from `key`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_key: Option<String>,
+    /// For a Step of an Environment-governed Run: the key and restore hints
+    /// under the Environment's scope (`env:<name>`). Launch-time only. The
+    /// launch uses them in place of `key` and `restore` only when an
+    /// approved Environment approval gate upstream admits the Step (the test
+    /// that gives it the `env=<name>` OIDC subject); see
+    /// [`use_approved_scope`](Self::use_approved_scope). Until then the Step
+    /// reads and writes its ref's scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved: Option<CacheResolution>,
+}
+
+/// A cache key resolved for one scope, with what to restore from it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheResolution {
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub restore: Vec<(String, String)>,
+}
+
+impl CacheConfig {
+    /// The Step is admitted by an approved Environment approval gate: read
+    /// and write the Environment's scope ([`approved`](Self::approved)), with
+    /// no fallback. A Step whose Run has no Environment scope keeps its own.
+    pub fn use_approved_scope(&mut self) {
+        if let Some(approved) = self.approved.take() {
+            self.key = Some(approved.key);
+            self.restore = approved.restore;
+            self.fallback_key = None;
+        }
+    }
 }
 
 /// A Run's **cache scope**: which Runs may write what this Run restores. Fixed
 /// when the Run is created and stored with it, so a rerun or retry reads and
 /// writes the scope its Run started with.
 ///
-/// - An Environment-governed Run uses `env:<name>`: it reads and writes only
-///   that scope, with no fallback, so nothing outside the Environment writes
-///   what its Steps restore.
+/// - A Step uses its Run's symbolic ref (`refs/heads/x`, `refs/pull/7/head`,
+///   `refs/tags/v1`): it writes only that scope and, on a miss, reads the
+///   default branch's (`refs/heads/<default>`). A pull request reads
+///   `main`'s Cache and never writes it.
+/// - In an Environment-governed Run, a Step that an approved Environment
+///   approval gate upstream admits uses `env:<name>` instead: it reads and
+///   writes only that scope, with no fallback. That is the test that gives
+///   a Step the `env=<name>` OIDC subject, so only Steps with the
+///   Environment's authority write what its Steps restore (git-bug
+///   31a2533). A Step before the gate uses the ref's scope.
 /// - A pull request never uses `env:<name>`, even when its Pipeline names an
 ///   Environment and the Environment admits it: the Pipeline is the pull
 ///   request's own YAML, so a fork could otherwise write what the next deploy
 ///   restores. It is scoped like any other Run.
-/// - Any other Run uses its symbolic ref (`refs/heads/x`,
-///   `refs/pull/7/head`, `refs/tags/v1`): it writes only that scope and, on a
-///   miss, reads the default branch's (`refs/heads/<default>`). A pull
-///   request reads `main`'s Cache and never writes it.
-/// - A Run with neither (an inline submission, a comment trigger) has no
-///   scope, and its Cache is off.
+/// - A Run with neither a ref nor an Environment (an inline submission, a
+///   comment trigger) has no scope, and its Cache is off.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheScope {
-    /// The scope this Run reads first and the only one it writes.
-    pub own: String,
+    /// The scope a Step reads first and the only one it writes, unless the
+    /// Environment's scope applies: the Run's symbolic ref. `None` when the
+    /// Run has no full ref; such a Step's Cache is off.
+    pub own: Option<String>,
     /// The scope read when `own` has no entry: the default branch's scope.
-    /// `None` for an Environment-governed Run, for a Run on the default
-    /// branch itself, and when the default branch was unknown at creation.
+    /// `None` for a Run on the default branch itself, and when the default
+    /// branch was unknown at creation.
     pub fallback: Option<String>,
+    /// `env:<name>` when an Environment governs the Run and it is not a pull
+    /// request: the scope of a Step an approved Environment approval gate
+    /// admits.
+    #[serde(default)]
+    pub environment: Option<String>,
 }
 
 impl CacheScope {
@@ -900,29 +940,37 @@ impl CacheScope {
         environment.filter(|_| !pull_request && !pull_request_ref)
     }
 
-    /// The scope for a Run governed by `environment` (unless it is a pull
-    /// request, see [`Self::environment_scope`]), else on `git_ref`. A ref
-    /// that is not a full `refs/…` name gives no scope: the two kinds of
-    /// scope must never spell the same string, and a git ref cannot contain
-    /// `:`. `default_branch` is the bare branch name (`main`).
+    /// The scope for a Run on `git_ref`, with `env:<name>` beside it when
+    /// `environment` governs the Run (unless it is a pull request, see
+    /// [`Self::environment_scope`]). A ref that is not a full `refs/…` name
+    /// gives no ref scope: the two kinds of scope must never spell the same
+    /// string, and a git ref cannot contain `:`. `default_branch` is the bare
+    /// branch name (`main`). `None` when there is neither.
     pub fn for_run(
         environment: Option<&str>,
         git_ref: Option<&str>,
         default_branch: Option<&str>,
         pull_request: bool,
     ) -> Option<Self> {
-        if let Some(env) = Self::environment_scope(environment, git_ref, pull_request) {
-            return Some(Self {
-                own: format!("env:{env}"),
-                fallback: None,
-            });
+        let environment =
+            Self::environment_scope(environment, git_ref, pull_request).map(|e| format!("env:{e}"));
+        let own = git_ref
+            .filter(|r| r.starts_with("refs/"))
+            .map(str::to_string);
+        if own.is_none() && environment.is_none() {
+            return None;
         }
-        let own = git_ref.filter(|r| r.starts_with("refs/"))?.to_string();
-        let fallback = default_branch
-            .filter(|b| !b.is_empty())
-            .map(|b| format!("refs/heads/{b}"))
-            .filter(|f| *f != own);
-        Some(Self { own, fallback })
+        let fallback = own.as_ref().and_then(|own| {
+            default_branch
+                .filter(|b| !b.is_empty())
+                .map(|b| format!("refs/heads/{b}"))
+                .filter(|f| f != own)
+        });
+        Some(Self {
+            own,
+            fallback,
+            environment,
+        })
     }
 }
 

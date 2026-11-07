@@ -100,27 +100,48 @@ async fn the_cache_scope_round_trips_through_the_run_row() {
 
     let pr = RunId("run-pr".into());
     let deploy = RunId("run-deploy".into());
+    let legacy = RunId("run-legacy".into());
     let unstamped = RunId("run-unstamped".into());
-    for run in [&pr, &deploy, &unstamped] {
+    for run in [&pr, &deploy, &legacy, &unstamped] {
         pg.create_run(run, 1, 1, Timestamp(0)).await.expect("run");
     }
     let pr_scope = CacheScope {
-        own: "refs/pull/41/head".into(),
+        own: Some("refs/pull/41/head".into()),
         fallback: Some("refs/heads/main".into()),
+        environment: None,
     };
+    // A governed Run: the ref's scope before its gate, the Environment's
+    // after (git-bug 31a2533).
     let deploy_scope = CacheScope {
-        own: "env:prod".into(),
-        fallback: None,
+        own: Some("refs/heads/release".into()),
+        fallback: Some("refs/heads/main".into()),
+        environment: Some("env:prod".into()),
     };
     pg.set_run_cache_scope(&pr, &pr_scope).await.expect("stamp");
     pg.set_run_cache_scope(&deploy, &deploy_scope)
         .await
         .expect("stamp");
+    // A governed Run stamped before migration 0083 kept `env:prod` as its
+    // only scope: it reads back as the Environment's scope with no ref scope,
+    // so its Steps before the gate get no Cache.
+    sqlx::query("UPDATE runs SET cache_scope = 'env:prod' WHERE id = $1")
+        .bind(&legacy.0)
+        .execute(&db.pool)
+        .await
+        .expect("legacy stamp");
 
     assert_eq!(pg.run_cache_scope(&pr).await.expect("pr"), Some(pr_scope));
     assert_eq!(
         pg.run_cache_scope(&deploy).await.expect("deploy"),
         Some(deploy_scope)
+    );
+    assert_eq!(
+        pg.run_cache_scope(&legacy).await.expect("legacy"),
+        Some(CacheScope {
+            own: None,
+            fallback: None,
+            environment: Some("env:prod".into()),
+        })
     );
     assert_eq!(
         pg.run_cache_scope(&unstamped).await.expect("unstamped"),

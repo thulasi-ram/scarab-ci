@@ -5211,16 +5211,17 @@ struct AdmittedFacts<'a> {
     cache_scope: Option<scarab_engine::CacheScope>,
 }
 
-/// The cache scope a new Run gets (git-bug efcec77): `env:<name>` when an
-/// Environment governs it and it is not a pull request, else its symbolic
-/// ref with the default branch's scope as the fallback read. A pull request
-/// (the event is one, or the Run is locked out as a fork) that names an
-/// Environment is scoped by its ref like an ungoverned Run, so it never
-/// writes what that Environment's Runs restore. The forge is asked for the
-/// default branch only when that fallback can matter: a Run scoped by its
-/// ref whose Pipeline declares a `cache:`. Asking is best-effort: a forge that cannot
-/// answer leaves the Run with no fallback (its first build on a new ref is
-/// cold), never a failed creation.
+/// The cache scope a new Run gets (git-bug efcec77, 31a2533): its symbolic
+/// ref with the default branch's scope as the fallback read, and
+/// `env:<name>` beside it when an Environment governs it and it is not a
+/// pull request. A Step uses `env:<name>` only once an approved Environment
+/// approval gate admits it. A pull request (the event is one, or the Run is
+/// locked out as a fork) that names an Environment gets no Environment
+/// scope, so it never writes what that Environment's Runs restore. The
+/// forge is asked for the default branch only when that fallback can
+/// matter: a Run with a ref whose Pipeline declares a `cache:`. Asking is
+/// best-effort: a forge that cannot answer leaves the Run with no fallback
+/// (its first build on a new ref is cold), never a failed creation.
 async fn run_cache_scope(
     forge: &dyn scarab_forge::ForgePort,
     event: &scarab_forge::Event,
@@ -5240,7 +5241,7 @@ async fn run_cache_scope(
     let environment =
         scarab_engine::CacheScope::environment_scope(environment, git_ref.as_deref(), pull_request);
     let mut default_branch = None;
-    if environment.is_none() && git_ref.is_some() && ir.steps.iter().any(|s| s.cache.is_some()) {
+    if git_ref.is_some() && ir.steps.iter().any(|s| s.cache.is_some()) {
         if let Some(repo) = event.repo() {
             match forge.default_branch(repo).await {
                 Ok(branch) => default_branch = Some(branch),
@@ -6508,6 +6509,7 @@ fn cache_config(step: &scarab_pipeline::StepSpec) -> Option<scarab_engine::Cache
         key: None,
         restore: Vec::new(),
         fallback_key: None,
+        approved: None,
     })
 }
 

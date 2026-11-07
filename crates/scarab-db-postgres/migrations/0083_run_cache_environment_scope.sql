@@ -1,0 +1,11 @@
+-- git-bug 31a2533: an Environment-governed Run keeps two cache scopes. A Step
+-- uses its ref's scope (`cache_scope`, with `cache_fallback_scope`) until an
+-- approved Environment approval gate admits it, and the Environment's scope
+-- (`cache_environment_scope`, `env:<name>`) after. Before this column, a
+-- governed Run stored `env:<name>` in `cache_scope`; the reader maps such a
+-- row to an Environment scope with no ref scope.
+ALTER TABLE runs ADD COLUMN cache_environment_scope TEXT;
+--
+-- Expand step (ADR-0003): a nullable column only. A server built before this
+-- migration refuses to boot against a database that has it; to roll back,
+-- delete row 83 from `_sqlx_migrations`. The column is harmless to old code.
