@@ -962,8 +962,10 @@ async fn a_secret_write_into_a_duplicates_target_is_409_and_none_is_lost() {
         }
     );
     assert_eq!(written, StatusCode::CONFLICT, "{written_body}");
+    // The Duplicate holds the name's claim, so the write is refused before
+    // it even looks for the Environment (git-bug 1a81c63).
     assert!(
-        written_body.to_string().contains("does not exist"),
+        written_body.to_string().contains("being changed"),
         "{written_body}"
     );
     assert_eq!(st, StatusCode::CREATED, "{b}");
@@ -1046,5 +1048,46 @@ async fn orphaned_secrets_lists_the_secrets_of_environments_that_do_not_exist() 
         json!([{ "environment": "staging", "project": "web", "keys": ["DB_PASSWORD"] }])
     );
 
+    f.tdb.cleanup().await;
+}
+
+/// git-bug 1a81c63: a secret write into an Environment and its delete each
+/// hold the Environment name's claim, so they cannot interleave (a write
+/// that saw the Environment, then a delete that saw no secret, would leave
+/// an orphan). While another holds the claim, both answer 409.
+#[tokio::test]
+async fn a_secret_write_and_an_environment_delete_take_the_name_claim() {
+    let Some(f) = fixture(|s| s).await else {
+        return;
+    };
+    let h = &f.h;
+    let (s, mut soft) = signed_in_admin(h).await;
+    h.open_window(&s, &mut soft).await;
+    let qa = "/v1/orgs/acme/environments/qa";
+    let (st, b) = h.cookie("PUT", qa, Some(json!({})), &s).await;
+    assert!(st.is_success(), "{st} {b}");
+    let write = json!({
+        "org": "acme", "repo": "web", "environment": "qa", "name": "TOKEN", "value": "t"
+    });
+
+    let held = scarab_project::EnvironmentGovernanceStore::claim_environment_name(
+        f.pg.as_ref(),
+        "acme",
+        "qa",
+    )
+    .await
+    .unwrap()
+    .expect("the claim is free");
+    let (st, b) = h
+        .cookie("POST", "/v1/secrets", Some(write.clone()), &s)
+        .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{b}");
+    let (st, b) = h.cookie("DELETE", qa, None, &s).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{b}");
+    assert!(b.to_string().contains("being changed"), "{b}");
+    drop(held);
+
+    let (st, b) = h.cookie("POST", "/v1/secrets", Some(write), &s).await;
+    assert_eq!(st, StatusCode::NO_CONTENT, "{b}");
     f.tdb.cleanup().await;
 }

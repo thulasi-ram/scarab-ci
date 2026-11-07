@@ -45,6 +45,15 @@ describe("openShellSocket", () => {
     ]);
   });
 
+  it("says why when the server cannot be reached, instead of hanging", async () => {
+    vi.stubGlobal("fetch", async () => {
+      throw new TypeError("Failed to fetch");
+    });
+    const opened = await openShellSocket("r1", "build", "attach");
+    expect(opened).toBe("Could not open the shell: Failed to fetch.");
+    expect(sockets).toEqual([]);
+  });
+
   it("opens no socket when the check is refused, and says why", async () => {
     probeStatus = 403;
     const opened = await openShellSocket("r1", "build", "attach");

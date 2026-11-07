@@ -558,6 +558,24 @@ pub(crate) async fn delete_org_environment(
     let scope = rbac_scope(&org, None);
     authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
     let store = st.org_environments.as_ref().ok_or(ApiError::NotFound)?;
+    // Held through the secret check and the delete: a secret write into
+    // this Environment takes the same claim, so it cannot land between the
+    // two (git-bug 1a81c63).
+    let _claim = match st.environment_governance.as_deref() {
+        Some(governance) => Some(
+            governance
+                .claim_environment_name(&org, &env)
+                .await
+                .map_err(org_environment_api_error)?
+                .ok_or_else(|| {
+                    ApiError::Conflict(format!(
+                        "environment `{env}` is being changed (created, duplicated or a \
+                         secret written); try again"
+                    ))
+                })?,
+        ),
+        None => None,
+    };
     if let Some(secrets) = st.secrets.as_ref() {
         // Fail closed: a store that cannot say whether the Environment holds
         // secrets does not delete it.

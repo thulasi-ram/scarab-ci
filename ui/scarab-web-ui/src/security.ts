@@ -53,6 +53,7 @@ export const EVENT_KINDS: readonly string[] = [
   "passkey.break_glass_reset",
   "passkey.clone_suspected",
   "passkey.removed_on_merge",
+  "passkey.moved_on_merge",
   "guard.not_consulted",
   "binding.operator_grant",
 ];

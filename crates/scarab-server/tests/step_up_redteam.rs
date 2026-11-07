@@ -817,6 +817,43 @@ async fn a_merge_needs_a_passkey_of_the_folded_principal_and_deletes_it() {
     tdb.cleanup().await;
 }
 
+/// git-bug 1a81c63: between the callback and the confirm, mallory let go of
+/// the sign-in. At confirm the link attaches it to amy and commits, so the
+/// answer is a success with nothing merged, not a 409 "start again" for a
+/// link that already happened.
+#[tokio::test]
+async fn a_confirm_after_the_sign_in_was_let_go_attaches_it_and_says_so() {
+    let Some((tdb, h, pg, mut mallory_key)) = merge_harness().await else {
+        return;
+    };
+    let (s, mut soft) = amy(&h).await;
+    h.open_window(&s, &mut soft).await;
+    let id = start_merge(&h, &s).await;
+    let uri = format!("/v1/me/identities/merges/{id}");
+    let (_, dto) = h.cookie("GET", &uri, None, &s).await;
+    sqlx::query("DELETE FROM principal_identities WHERE principal_id = 'mallory'")
+        .execute(&tdb.pool)
+        .await
+        .unwrap();
+
+    let cred = mallory_key.assert(&dto["public_key"], ORIGIN).unwrap();
+    let (st, b) = h
+        .cookie("POST", &uri, Some(json!({ "credential": cred })), &s)
+        .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(b, json!({ "merged": null, "removed_passkeys": 0 }));
+    let held = IdentityStore::identities_of(pg.as_ref(), "amy")
+        .await
+        .unwrap();
+    assert!(held.iter().any(|i| i.provider == "default"), "{held:?}");
+    assert_eq!(
+        passkey_owners(&h).await,
+        (1, 1),
+        "nothing merged or removed"
+    );
+    tdb.cleanup().await;
+}
+
 async fn mallory_passkey_ids(h: &Harness) -> Vec<String> {
     h.passkey_store
         .list("mallory")

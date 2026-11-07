@@ -129,14 +129,61 @@ export function pendingMergeId(search: string): string | null {
   return new URLSearchParams(search).get("identity_merge") || null;
 }
 
-/** What a confirmed merge did, in words. */
-export function mergedNotice(merged: string, removedPasskeys: number): Notice {
+/** What a confirmed merge did, in words. `merged` is `null` when the
+ * sign-in was linked without a merge: the other account let go of it after
+ * the link started. */
+export function mergedNotice(merged: string | null, removedPasskeys: number): Notice {
+  if (merged === null) {
+    return {
+      kind: "ok",
+      text: "Linked the account. It no longer belonged to another account, so nothing was merged.",
+    };
+  }
   const keys =
     removedPasskeys === 1 ? "Its passkey was deleted" : `Its ${removedPasskeys} passkeys were deleted`;
   return {
     kind: "ok",
     text: `Merged ${merged} into your account: its history, roles and tokens are now yours. ${keys}; add a passkey of yours under Security if you want to use that device here.`,
   };
+}
+
+/** The steps of confirming a merge, injected so the flow is testable. */
+export type MergeConfirmDeps = {
+  /** Sign the challenge with a passkey (the browser prompt). */
+  assert: (publicKey: unknown) => Promise<Record<string, unknown>>;
+  /** POST the assertion. */
+  confirm: (
+    id: string,
+    credential: Record<string, unknown>,
+  ) => Promise<{ merged?: string | null; removed_passkeys: number }>;
+  /** Load the merge again: called after a refused POST, which has spent the
+   * challenge, so the panel shows that the link must start again. */
+  reload: () => unknown;
+  /** A WebAuthn failure in words. */
+  webauthnError: (e: unknown) => string;
+};
+
+/** Confirm merge `id`: the notice to show, or the error. A dismissed passkey
+ * prompt spends nothing, so the same challenge can be tried again; a refused
+ * POST has spent it, so the merge is loaded again. */
+export async function confirmMerge(
+  id: string,
+  publicKey: unknown,
+  deps: MergeConfirmDeps,
+): Promise<{ notice: Notice } | { error: string }> {
+  let credential: Record<string, unknown>;
+  try {
+    credential = await deps.assert(publicKey);
+  } catch (e) {
+    return { error: deps.webauthnError(e) };
+  }
+  try {
+    const done = await deps.confirm(id, credential);
+    return { notice: mergedNotice(done.merged ?? null, done.removed_passkeys) };
+  } catch (e) {
+    await deps.reload();
+    return { error: e instanceof Error ? e.message : "The merge failed." };
+  }
 }
 
 export type MemberRow = {

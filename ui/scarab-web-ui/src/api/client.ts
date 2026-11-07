@@ -357,7 +357,14 @@ export async function openShellSocket(
   const path = `/v1/runs/${encodeURIComponent(runId)}/steps/${encodeURIComponent(step)}/${mode}`;
   const csrf = csrfToken();
   const init: RequestInit = { headers: csrf ? { "x-csrf-token": csrf } : {} };
-  const probe = await withStepUp(await fetch(path, init), () => fetch(path, init), stepUpCeremony);
+  let probe: Response;
+  try {
+    probe = await withStepUp(await fetch(path, init), () => fetch(path, init), stepUpCeremony);
+  } catch (e) {
+    // The server could not be reached, or the step-up ceremony failed: say
+    // so in the terminal instead of leaving it on "connecting".
+    return `Could not open the shell: ${e instanceof Error ? e.message : "the request failed"}.`;
+  }
   if (probe.status === 401) {
     setUnauthenticated(true);
     return "You are signed out.";
