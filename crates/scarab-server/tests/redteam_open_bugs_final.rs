@@ -26,8 +26,8 @@ use scarab_engine::ExecError;
 use scarab_engine::{
     cancel_run_request, rerun_step, Attempt, AttemptId, AttemptOutcome, Clock, Db, DeployContext,
     EventKind, EventPayload, OutboxId, OutboxMessage, RunId, RunStatus, Scheduler, ServiceStatus,
-    StepId, StepRun, StepSpec, StepStatus, Timestamp, CANCEL_ATTEMPT, CANCEL_RUN, EVENT_VERSION,
-    LAUNCH_STEP, MAX_DELIVERY_ATTEMPTS, RUN_STATUS_CHANGED,
+    StepId, StepRun, StepSpec, StepStatus, Timestamp, CANCEL_ATTEMPT, CANCEL_RUN, CANCEL_SERVICES,
+    EVENT_VERSION, LAUNCH_STEP, MAX_DELIVERY_ATTEMPTS, RUN_STATUS_CHANGED,
 };
 use scarab_forge::{ForgePort, StatusState};
 use scarab_project::{
@@ -625,7 +625,7 @@ async fn a_resent_cancel_enqueues_one_services_teardown(w: World) {
     );
     w.scheduler().cancel_run(&rid("rp")).await.unwrap();
     let rows =
-        w.db.claim_outbox("peek", Some(CANCEL_RUN), 100, 0)
+        w.db.claim_outbox("peek", Some(CANCEL_SERVICES), 100, 0)
             .await
             .unwrap();
     assert_eq!(rows.len(), 1, "{rows:?}");
@@ -638,13 +638,42 @@ async fn a_resent_cancel_enqueues_one_services_teardown(w: World) {
         .await
         .unwrap());
     let rows =
-        w.db.claim_outbox("peek", Some(CANCEL_RUN), 100, 0)
+        w.db.claim_outbox("peek", Some(CANCEL_SERVICES), 100, 0)
             .await
             .unwrap();
     assert_eq!(rows.len(), 1, "the second cancel's own row only: {rows:?}");
     w.finish().await;
 }
 both!(a_resent_cancel_enqueues_one_services_teardown);
+
+// ---------------------------------------------------------------------------
+// git-bug aaa559c (b) — a rolling upgrade. Replicas older than the
+// attempt-scoped cancel claim every `cancel_run` row and tear down each
+// Step's latest attempt. The services teardown a cancel writes rode that
+// kind (with a `services` payload), so an old replica draining it after a
+// rerun killed the rerun's live a2. It has its own kind now, which an old
+// replica never claims.
+// ---------------------------------------------------------------------------
+async fn an_old_replica_finds_no_services_teardown_under_its_cancel_kind(w: World) {
+    w.seed_plain("ru").await;
+    w.running_on("ru", "build", "a1").await;
+    assert!(cancel_run_request(&*w.db, &w.clock, &rid("ru"), None)
+        .await
+        .unwrap());
+
+    // The old replica claims before a new one drains. What it claims it
+    // drains later, when a rerun's a2 may be the latest attempt.
+    let old =
+        w.db.claim_outbox("old-replica", Some(CANCEL_RUN), 100, 0)
+            .await
+            .unwrap();
+    assert!(
+        old.is_empty(),
+        "an old replica would tear down the rerun's live a2 for these rows: {old:?}"
+    );
+    w.finish().await;
+}
+both!(an_old_replica_finds_no_services_teardown_under_its_cancel_kind);
 
 // ---------------------------------------------------------------------------
 // F7 — a step claimed (Running) but not yet minted when the cancel lands.
