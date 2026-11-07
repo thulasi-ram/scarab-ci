@@ -91,14 +91,21 @@ impl ScheduleStore for InMemorySchedules {
     async fn due_schedules(
         &self,
         before: Timestamp,
+        after: Option<&ScheduleEntry>,
         limit: u32,
     ) -> Result<Vec<ScheduleEntry>, DbError> {
+        let cursor = after.map(|e| (e.next_fire_at.0, key(e)));
         let mut due: Vec<ScheduleEntry> = self
             .entries
             .lock()
             .unwrap()
             .values()
             .filter(|e| e.next_fire_at.0 <= before.0)
+            .filter(|e| {
+                cursor
+                    .as_ref()
+                    .is_none_or(|c| (e.next_fire_at.0, key(e)) > *c)
+            })
             .cloned()
             .collect();
         due.sort_by_key(|e| (e.next_fire_at.0, key(e)));

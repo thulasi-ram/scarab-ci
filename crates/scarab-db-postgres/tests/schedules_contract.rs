@@ -40,6 +40,7 @@ contract_test!(
 );
 contract_test!(a_slot_is_claimed_once, claim);
 contract_test!(advancing_from_a_stale_slot_changes_nothing, advance);
+contract_test!(due_rows_are_read_a_page_at_a_time, due_pages);
 
 fn row(pipeline: &str, schedule: &str, next: i64) -> ScheduleEntry {
     ScheduleEntry {
@@ -111,7 +112,7 @@ async fn replace(store: &dyn ScheduleStore) {
             (".scarab/c.yaml", "@weekly", 300, "sha2"),
         ]
     );
-    let due = store.due_schedules(Timestamp(150), 10).await.unwrap();
+    let due = store.due_schedules(Timestamp(150), None, 10).await.unwrap();
     let due: Vec<(&str, i64)> = due
         .iter()
         .map(|r| (r.project.as_str(), r.next_fire_at.0))
@@ -228,4 +229,48 @@ async fn advance(store: &dyn ScheduleStore) {
         .advance_schedule(&r, Timestamp(200), Timestamp(300))
         .await
         .unwrap());
+}
+
+/// git-bug 237ab13: a caller pages through every due row by passing the last
+/// row it read; rows that tie on `next_fire_at` are neither skipped nor read
+/// twice across a page boundary.
+async fn due_pages(store: &dyn ScheduleStore) {
+    store
+        .replace_project_schedules(
+            "acme",
+            "app",
+            "sha1",
+            &[
+                row(".scarab/a.yaml", "@hourly", 100),
+                row(".scarab/b.yaml", "@hourly", 100),
+                row(".scarab/c.yaml", "@hourly", 100),
+                row(".scarab/d.yaml", "@daily", 200),
+                row(".scarab/e.yaml", "@weekly", 900),
+            ],
+        )
+        .await
+        .unwrap();
+    let mut read: Vec<String> = Vec::new();
+    let mut last: Option<ScheduleEntry> = None;
+    loop {
+        let page = store
+            .due_schedules(Timestamp(500), last.as_ref(), 2)
+            .await
+            .unwrap();
+        assert!(page.len() <= 2);
+        read.extend(page.iter().map(|r| r.pipeline.clone()));
+        match page.last() {
+            Some(r) if page.len() == 2 => last = Some(r.clone()),
+            _ => break,
+        }
+    }
+    assert_eq!(
+        read,
+        [
+            ".scarab/a.yaml",
+            ".scarab/b.yaml",
+            ".scarab/c.yaml",
+            ".scarab/d.yaml",
+        ]
+    );
 }

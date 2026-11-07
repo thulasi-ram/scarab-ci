@@ -74,10 +74,14 @@ pub trait ScheduleStore: Send + Sync {
         project: &str,
     ) -> Result<Vec<ScheduleEntry>, DbError>;
 
-    /// Rows due at or before `before`, soonest first, at most `limit`.
+    /// Rows due at or before `before`, at most `limit`, ordered by
+    /// `next_fire_at`, then org, project, pipeline and schedule. With `after`,
+    /// only the rows that come after that row in this order: the caller pages
+    /// through every due row by passing the last row of the previous page.
     async fn due_schedules(
         &self,
         before: Timestamp,
+        after: Option<&ScheduleEntry>,
         limit: u32,
     ) -> Result<Vec<ScheduleEntry>, DbError>;
 
