@@ -207,7 +207,7 @@ record. Read Breaking changes before you upgrade.
   login): an Owner must reset the user's passkeys first, and a step-up refusal says so.
 - When one sign-in identity is merged into another Principal, the merged Principal's passkeys
   now move to the surviving one, so the person can still confirm a step-up with them. Each
-  moved passkey keeps the WebAuthn user handle it was created under (migration 0079). Such a
+  moved passkey keeps the WebAuthn user handle it was created under (migration 0082). Such a
   merge needs a step-up confirmation for that action, not the 5-minute window: start it with
   `POST /v1/me/identities/link-moving-passkeys` (`identity.link_moving_passkeys`, always
   asks). A link started with `POST /v1/me/identities/link` that would move passkeys is refused

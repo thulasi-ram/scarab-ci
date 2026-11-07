@@ -8,7 +8,7 @@
 --
 -- Expand step (ADR-0003): one nullable column. A server built before this
 -- migration refuses to boot against a database that has it (sqlx reports
--- migration 79 as unknown); to roll back, delete row 79 from
+-- migration 82 as unknown); to roll back, delete row 82 from
 -- `_sqlx_migrations`. The column is harmless to the old code, but a passkey
 -- moved by a merge is then refused (user handle mismatch) until its old
 -- Principal's passkeys are reset.
