@@ -710,7 +710,14 @@ export interface paths {
         };
         /** One org Environment (ADR-0071) */
         get: operations["get_org_environment"];
-        /** Create or replace an org Environment (ADR-0071) */
+        /**
+         * Create or replace an org Environment (ADR-0071)
+         * @description A create takes the same claim on the name a Duplicate holds, and is
+         *     refused (409) while a Duplicate to that name is in progress: that
+         *     Duplicate has checked the name is free and may be writing secrets under
+         *     it, and its cleanup deletes what it wrote by name. A replace of an
+         *     existing Environment takes no claim.
+         */
         put: operations["put_org_environment"];
         post?: never;
         /**
@@ -748,8 +755,9 @@ export interface paths {
          *     no partial Environment is left. A crash between the two leaves only
          *     secrets under a name no Environment has, which no Run can resolve and
          *     which a retry refuses (409) until an admin deletes them. The new name is
-         *     claimed throughout, and a second Duplicate to it is refused (409) before
-         *     it writes anything, so two Duplicates never both write secrets under it.
+         *     claimed throughout: a second Duplicate to it is refused (409) before it
+         *     writes anything, and so is a create of it by the Environment PUT, so no
+         *     other Environment takes the name while this one's secrets are written.
          */
         post: operations["duplicate_org_environment"];
         delete?: never;
@@ -6866,6 +6874,13 @@ export interface operations {
                 };
                 content?: never;
             };
+            /** @description a create while a duplicate to the name is in progress */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     delete_org_environment: {
@@ -6970,7 +6985,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description the new name is taken, secrets already exist under it, or another duplicate to it is in progress */
+            /** @description the new name is taken, secrets already exist under it, or another duplicate to it or a create of it is in progress */
             409: {
                 headers: {
                     [name: string]: unknown;

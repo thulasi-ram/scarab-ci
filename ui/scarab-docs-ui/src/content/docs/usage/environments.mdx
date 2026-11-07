@@ -84,7 +84,8 @@ and the Cache stay with it. When the copy is made, the page lists what it did no
 If the copy fails part-way, nothing is left behind: the secrets are copied first and removed
 again if the Environment cannot be created. A name already in use, or secrets already stored
 under the new name, is refused (409). So is a second Duplicate to a name while the first is still
-running, before it writes anything.
+running, before it writes anything, and so is creating an Environment of that name while the
+Duplicate runs.
 
 ## The rules it holds
 

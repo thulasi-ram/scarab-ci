@@ -671,8 +671,9 @@ async fn a_second_duplicate_to_the_same_name_is_409_and_takes_no_secret() {
 }
 
 /// The Environment store refuses the copy after the secrets are written (a
-/// plain create took the name in between): the copied secrets are removed
-/// and the Environment that took the name is left as it was.
+/// write to the store that takes no claim took the name in between): the
+/// copied secrets are removed and the Environment that took the name is left
+/// as it was.
 #[tokio::test]
 async fn a_name_taken_after_the_secrets_are_copied_removes_them() {
     let Some((f, paused, resume)) = pausing_fixture().await else {
@@ -683,11 +684,58 @@ async fn a_name_taken_after_the_secrets_are_copied_removes_them() {
     h.open_window(&s, &mut soft).await;
     let uri = format!("{PROD}/duplicate");
 
-    let ((st, b), taken) = tokio::join!(
+    let ((st, b), ()) = tokio::join!(
         h.cookie("POST", &uri, Some(json!({ "name": "prod-eu" })), &s),
         async {
             paused.notified().await;
-            let taken = h
+            f.pg.put_org_environment(&OrgEnvironment {
+                org: "acme".into(),
+                name: "prod-eu".into(),
+                display_name: None,
+                description: "made by hand".into(),
+                protection: Default::default(),
+                eligibility: Default::default(),
+                created_at: 9,
+                updated_at: 9,
+                updated_by: "seed".into(),
+            })
+            .await
+            .unwrap();
+            resume.notify_one();
+        }
+    );
+    assert_eq!(st, StatusCode::CONFLICT, "{b}");
+    let (environment, _, secrets) = snapshot(&f, "prod-eu").await;
+    assert_eq!(
+        environment.map(|e| e.description).as_deref(),
+        Some("made by hand")
+    );
+    assert_eq!(secrets, vec![], "the copied secrets are removed");
+
+    f.tdb.cleanup().await;
+}
+
+/// A create of the new name by the Environment PUT while a Duplicate to it
+/// sits between its checks and its first secret write is refused (409), and
+/// the Duplicate goes ahead with every secret it copied. Without the claim
+/// on the create, the PUT takes the name, an admin writes a secret into the
+/// new Environment, and the Duplicate overwrites that key, fails on the
+/// taken name and its cleanup deletes the admin's secret.
+#[tokio::test]
+async fn a_create_during_a_duplicate_to_its_name_is_409_and_no_secret_is_lost() {
+    let Some((f, paused, resume)) = pausing_fixture().await else {
+        return;
+    };
+    let h = &f.h;
+    let (s, mut soft) = signed_in_admin(h).await;
+    h.open_window(&s, &mut soft).await;
+    let uri = format!("{PROD}/duplicate");
+
+    let ((st, b), (created, created_body)) = tokio::join!(
+        h.cookie("POST", &uri, Some(json!({ "name": "prod-eu" })), &s),
+        async {
+            paused.notified().await;
+            let answer = h
                 .cookie(
                     "PUT",
                     "/v1/orgs/acme/environments/prod-eu",
@@ -696,17 +744,98 @@ async fn a_name_taken_after_the_secrets_are_copied_removes_them() {
                 )
                 .await;
             resume.notify_one();
-            taken
+            answer
         }
     );
-    assert_eq!(taken.0, StatusCode::OK, "{}", taken.1);
-    assert_eq!(st, StatusCode::CONFLICT, "{b}");
+    assert_eq!(created, StatusCode::CONFLICT, "{created_body}");
+    assert!(
+        created_body
+            .to_string()
+            .contains("duplicate to environment `prod-eu`"),
+        "{created_body}"
+    );
+    assert_eq!(st, StatusCode::CREATED, "{b}");
     let (environment, _, secrets) = snapshot(&f, "prod-eu").await;
     assert_eq!(
         environment.map(|e| e.description).as_deref(),
-        Some("made by hand")
+        Some("the one prod"),
+        "the Duplicate's Environment, not the PUT's"
     );
-    assert_eq!(secrets, vec![], "the copied secrets are removed");
+    assert_eq!(
+        secrets,
+        vec![
+            ("api/DB_PASSWORD".to_string(), b"api-pw".to_vec()),
+            ("web/API_KEY".to_string(), b"web-key".to_vec()),
+            ("web/DB_PASSWORD".to_string(), b"web-pw".to_vec()),
+        ],
+        "every secret the Duplicate copied is there"
+    );
+
+    // The claim is released: the same PUT now replaces the new Environment.
+    let (st, b) = h
+        .cookie(
+            "PUT",
+            "/v1/orgs/acme/environments/prod-eu",
+            Some(json!({ "description": "made by hand" })),
+            &s,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(b["description"], "made by hand");
+
+    f.tdb.cleanup().await;
+}
+
+/// While the claim on a name is held, the PUT refuses to create that name
+/// (409) and still replaces an Environment that exists: only a create
+/// claims.
+#[tokio::test]
+async fn a_held_claim_refuses_a_create_and_not_a_replace() {
+    let Some(f) = fixture(|s| s).await else {
+        return;
+    };
+    let h = &f.h;
+    let (s, _soft) = signed_in_admin(h).await;
+
+    let held_new =
+        f.pg.claim_environment_name("acme", "prod-eu")
+            .await
+            .unwrap();
+    let held_existing = f.pg.claim_environment_name("acme", "prod").await.unwrap();
+    assert!(held_new.is_some() && held_existing.is_some());
+
+    let (st, b) = h
+        .cookie(
+            "PUT",
+            "/v1/orgs/acme/environments/prod-eu",
+            Some(json!({ "description": "new" })),
+            &s,
+        )
+        .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{b}");
+    assert_eq!(
+        f.pg.get_org_environment("acme", "prod-eu").await.unwrap(),
+        None
+    );
+
+    let (st, b) = h
+        .cookie("PUT", PROD, Some(json!({ "description": "replaced" })), &s)
+        .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(b["description"], "replaced");
+
+    // Released: the create goes ahead.
+    drop(held_new);
+    let (st, b) = h
+        .cookie(
+            "PUT",
+            "/v1/orgs/acme/environments/prod-eu",
+            Some(json!({ "description": "new" })),
+            &s,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    drop(held_existing);
 
     f.tdb.cleanup().await;
 }
