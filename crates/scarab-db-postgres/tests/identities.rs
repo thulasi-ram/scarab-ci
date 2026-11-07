@@ -176,8 +176,8 @@ async fn pin_mints_unclaimed_and_sign_in_claims_it() {
 #[tokio::test]
 async fn link_merges_a_claimed_single_identity_principal_with_its_tokens() {
     use scarab_identity::{
-        ApiToken, ApiTokenStore, IdentityError, LinkOutcome, Principal, Scope, Session,
-        SessionStore,
+        ApiToken, ApiTokenStore, IdentityError, LinkOutcome, MergePasskeys, Principal, Scope,
+        Session, SessionStore,
     };
     let Some(tdb) = fresh_db().await else {
         eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
@@ -232,11 +232,17 @@ async fn link_merges_a_claimed_single_identity_principal_with_its_tokens() {
     .await
     .unwrap();
 
-    let outcome = db.link(&ada, &ident("1001", "ada-gh"), 3).await.unwrap();
+    // The stray Principal holds no passkey, so a link that may not move
+    // passkeys still merges it.
+    let outcome = db
+        .link(&ada, &ident("1001", "ada-gh"), 3, MergePasskeys::Refuse)
+        .await
+        .unwrap();
     assert_eq!(
         outcome,
         LinkOutcome::Merged {
-            from: stray.clone()
+            from: stray.clone(),
+            moved_passkeys: vec![],
         }
     );
     assert_eq!(
@@ -248,12 +254,15 @@ async fn link_merges_a_claimed_single_identity_principal_with_its_tokens() {
     assert_eq!(db.aliases_of(&ada).await.unwrap(), vec![stray.clone()]);
     // Linking it again is a no-op, not a second merge.
     assert_eq!(
-        db.link(&ada, &ident("1001", "ada-gh"), 4).await.unwrap(),
+        db.link(&ada, &ident("1001", "ada-gh"), 4, MergePasskeys::Refuse)
+            .await
+            .unwrap(),
         LinkOutcome::AlreadyLinked
     );
     // A second GitHub account on the same Principal is refused.
     assert!(matches!(
-        db.link(&ada, &ident("3003", "ada-alt"), 5).await,
+        db.link(&ada, &ident("3003", "ada-alt"), 5, MergePasskeys::Refuse)
+            .await,
         Err(IdentityError::Conflict(_))
     ));
     tdb.cleanup().await;

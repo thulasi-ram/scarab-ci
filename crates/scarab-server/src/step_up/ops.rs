@@ -1141,6 +1141,21 @@ pub static PLUGIN_CONNECTION_PUT: Op = op(
     &["/credential"],
     &["path:org", "path:name", "path:slot"],
 );
+// A link whose merge moves the folded Principal's passkeys to the caller
+// (git-bug def16bd): a window would let a stolen session add the thief's
+// passkey to the victim's account, so it always asks. The plain
+// `identity.link` flow refuses such a merge at the callback.
+pub static IDENTITY_LINK_MOVING_PASSKEYS: Op = op(
+    "identity.link_moving_passkeys",
+    "Link a login identity and take its Principal's passkeys",
+    Class::CrownJewel(A),
+    "§3 identity links; §2 adding a passkey",
+    ANYONE,
+    OrgOf::None,
+    &[],
+    &["body:/provider"],
+)
+.browser_only();
 pub static PASSKEY_REMOVE: Op = op(
     "passkey.remove",
     "Remove a passkey",
@@ -1541,6 +1556,7 @@ mod tests {
             browser_only,
             vec![
                 "identity.link",
+                "identity.link_moving_passkeys",
                 "identity.unlink",
                 "passkey.add",
                 "step.attach",

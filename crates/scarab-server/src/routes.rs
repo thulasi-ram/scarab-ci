@@ -135,6 +135,11 @@ pub(crate) fn governed_routes() -> Routes {
             &ops::IDENTITY_LINK,
             begin_link_identity,
         )
+        .post(
+            "/v1/me/identities/link-moving-passkeys",
+            &ops::IDENTITY_LINK_MOVING_PASSKEYS,
+            begin_link_identity_moving_passkeys,
+        )
         .delete(
             "/v1/me/identities/{provider}",
             &ops::IDENTITY_UNLINK,

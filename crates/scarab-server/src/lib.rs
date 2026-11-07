@@ -7854,13 +7854,41 @@ pub struct LinkIdentityResponse {
 /// authorize URL and plants a one-shot state cookie bound to THIS session; the
 /// shared callback then attaches the proven account, or merges in a Principal
 /// whose only way in it was. Never by email.
+///
+/// A link that would fold in a Principal holding passkeys is refused at the
+/// callback (the merge would move them to the caller): it needs
+/// `POST /v1/me/identities/link-moving-passkeys`, which always asks.
 #[utoipa::path(post, path = "/v1/me/identities/link", summary = "Begin linking another sign-in account (ADR-0069)", request_body = LinkIdentityRequest, responses((status = 200, body = LinkIdentityResponse), (status = 403, description = "not a browser session")))]
 async fn begin_link_identity(
     State(st): State<AppState>,
     headers: HeaderMap,
     Json(req): Json<LinkIdentityRequest>,
 ) -> Result<Response, ApiError> {
-    let (sid, _) = link_session(&st, &headers, Action::Write).await?;
+    begin_link(&st, &headers, &req, false).await
+}
+
+/// Begin linking another provider's account, allowing the merge to move the
+/// folded Principal's passkeys to the caller (git-bug def16bd). The same
+/// flow as `POST /v1/me/identities/link`, but its step-up always asks: a
+/// window is not enough to add passkeys to an account.
+#[utoipa::path(post, path = "/v1/me/identities/link-moving-passkeys", summary = "Begin linking another sign-in account whose Principal holds passkeys (ADR-0069)", request_body = LinkIdentityRequest, responses((status = 200, body = LinkIdentityResponse), (status = 403, description = "not a browser session")))]
+async fn begin_link_identity_moving_passkeys(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<LinkIdentityRequest>,
+) -> Result<Response, ApiError> {
+    begin_link(&st, &headers, &req, true).await
+}
+
+/// The two link POSTs. `moves_passkeys`: the link binding lets the merge
+/// move passkeys.
+async fn begin_link(
+    st: &AppState,
+    headers: &HeaderMap,
+    req: &LinkIdentityRequest,
+    moves_passkeys: bool,
+) -> Result<Response, ApiError> {
+    let (sid, _) = link_session(st, headers, Action::Write).await?;
     st.identities.as_ref().ok_or(ApiError::NotFound)?;
     let provider = st
         .oauth_provider(Some(&req.provider))?
@@ -7872,7 +7900,13 @@ async fn begin_link_identity(
     // provider and the expiry too. Off: the bare session hash, as before —
     // the POST is unguarded then anyway.
     let link = match st.step_up.service() {
-        Some(svc) => svc.link_binding(&flow.state, &session_hash(&sid), &flow.provider, expires_at),
+        Some(svc) => svc.link_binding(
+            &flow.state,
+            &session_hash(&sid),
+            &flow.provider,
+            expires_at,
+            moves_passkeys,
+        ),
         None => session_hash(&sid),
     };
     let flow = flow.for_link(&link, expires_at);
@@ -7908,11 +7942,28 @@ async fn link_callback(
     // client input) — and the flow must not have outlived its step-up.
     let now = st.clock.now().await.0;
     let expires_at = flow.link_expires_at.unwrap_or(i64::MIN);
-    let expected = match st.step_up.service() {
-        Some(svc) => svc.link_binding(&flow.state, &session_hash(&sid), &flow.provider, expires_at),
+    // Which POST minted it decides whether the merge may move passkeys
+    // (git-bug def16bd). Step-up off: both bindings are the bare session
+    // hash (both POSTs are unguarded), so a flow of this session may.
+    let binding = |moves: bool| match st.step_up.service() {
+        Some(svc) => svc.link_binding(
+            &flow.state,
+            &session_hash(&sid),
+            &flow.provider,
+            expires_at,
+            moves,
+        ),
         None => session_hash(&sid),
     };
-    if now > expires_at || !scarab_identity::ct_eq(expected.as_bytes(), flow.link.as_bytes()) {
+    let matches =
+        |moves: bool| scarab_identity::ct_eq(binding(moves).as_bytes(), flow.link.as_bytes());
+    let passkeys = if matches(true) {
+        scarab_identity::MergePasskeys::Move
+    } else {
+        scarab_identity::MergePasskeys::Refuse
+    };
+    let minted = passkeys == scarab_identity::MergePasskeys::Move || matches(false);
+    if now > expires_at || !minted {
         if let Some(svc) = st.step_up.service() {
             let mut ev = step_up::event(
                 scarab_identity::security_event_kind::STEP_UP_REFUSED,
@@ -7947,12 +7998,48 @@ async fn link_callback(
             ApiError::Unauthorized
         })?;
     let now = st.clock.now().await.0;
-    let location = match store.link(&principal.subject, &identity, now).await {
-        Ok(scarab_identity::LinkOutcome::Merged { from }) => {
+    let location = match store
+        .link(&principal.subject, &identity, now, passkeys)
+        .await
+    {
+        Ok(scarab_identity::LinkOutcome::Merged {
+            from,
+            moved_passkeys,
+        }) => {
+            record_moved_passkeys(st, &principal.subject, &from, &moved_passkeys, &sid, now).await;
             format!(
                 "/settings/profile?identity_linked={}&merged={}",
                 flow.provider,
                 query_escape(&from)
+            )
+        }
+        Ok(scarab_identity::LinkOutcome::PasskeysWouldMove { from, passkeys }) => {
+            if let Some(svc) = st.step_up.service() {
+                let mut ev = step_up::event(
+                    scarab_identity::security_event_kind::STEP_UP_REFUSED,
+                    &principal.subject,
+                    "session:cookie".to_string(),
+                    None,
+                    now,
+                );
+                ev.op = Some("identity.link".to_string());
+                ev.session_hash = Some(session_hash(&sid));
+                ev.detail = serde_json::json!({
+                    "reason": "the merge would move passkeys; the link was confirmed by a window",
+                    "from": from,
+                    "passkeys": passkeys,
+                });
+                svc.record(ev).await;
+            }
+            let why = format!(
+                "that {} account is the only sign-in of `{from}`, who holds {passkeys} \
+                 passkey(s); merging moves them to you, so confirm this link with your passkey \
+                 (POST /v1/me/identities/link-moving-passkeys)",
+                flow.provider
+            );
+            format!(
+                "/settings/profile?identity_link_error={}",
+                query_escape(&why)
             )
         }
         Ok(_) => format!("/settings/profile?identity_linked={}", flow.provider),
@@ -7971,6 +8058,45 @@ async fn link_callback(
         resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
     }
     Ok(resp)
+}
+
+/// One `passkey.moved_on_merge` per passkey a link's merge moved from `from`
+/// to `into` (git-bug def16bd), through the security-event log. Best-effort:
+/// the merge has committed, and the always-ask confirmation of the link POST
+/// was recorded before it (`op.authorised`).
+async fn record_moved_passkeys(
+    st: &AppState,
+    into: &str,
+    from: &str,
+    moved: &[String],
+    sid: &str,
+    now: i64,
+) {
+    let Some(svc) = st.step_up.service() else {
+        if !moved.is_empty() {
+            tracing::info!(
+                from,
+                into,
+                passkeys = moved.len(),
+                "identity link: merge moved passkeys"
+            );
+        }
+        return;
+    };
+    for id in moved {
+        let mut ev = step_up::event(
+            scarab_identity::security_event_kind::PASSKEY_MOVED_ON_MERGE,
+            into,
+            "session:cookie".to_string(),
+            None,
+            now,
+        );
+        ev.op = Some("identity.link_moving_passkeys".to_string());
+        ev.passkey_id = Some(id.clone());
+        ev.session_hash = Some(session_hash(sid));
+        ev.detail = serde_json::json!({ "from": from, "into": into });
+        svc.record(ev).await;
+    }
 }
 
 /// Percent-encode a query value (everything but RFC 3986 unreserved).
@@ -12625,6 +12751,7 @@ impl utoipa::Modify for StepUpResponses {
         oauth_callback,
         auth_providers,
         begin_link_identity,
+        begin_link_identity_moving_passkeys,
         unlink_identity,
         logout,
         me,

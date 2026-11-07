@@ -6,6 +6,7 @@
 //! rest is the real router over the in-memory stores (Postgres where noted,
 //! skipped without `SCARAB_TEST_DATABASE_URL`).
 
+mod common;
 mod step_up_harness;
 
 use std::sync::Arc;
@@ -657,4 +658,130 @@ async fn the_pending_cap_is_per_credential_not_per_human() {
     assert_eq!(h.step_up.requests().len(), 20);
     // …but nothing ran.
     assert_eq!(secret_value(&secrets).await, None, "a parked request ran");
+}
+
+// ---------------------------------------------------------------------------
+// git-bug def16bd: a merge that moves passkeys needs an always-ask step-up
+// ---------------------------------------------------------------------------
+
+/// On Postgres (merges need it): amy (okta) is an Owner of acme with a
+/// passkey; mallory signed in once with the `default` forge account the stub
+/// provider proves (its only way in) and enrolled a passkey. A link of that
+/// account by amy folds mallory into amy.
+async fn merge_harness() -> Option<(common::TestDb, Harness, Arc<scarab_db_postgres::PostgresDb>)> {
+    let tdb = common::fresh_db().await?;
+    let pg = Arc::new(scarab_db_postgres::PostgresDb::with_pool(tdb.pool.clone()));
+    pg.migrate().await.unwrap();
+    for (provider, ext, handle) in [("okta", "amy-sub", "amy"), ("default", "666", "mallory")] {
+        let id = IdentityStore::sign_in(pg.as_ref(), &identity(provider, ext, handle), handle, T0)
+            .await
+            .unwrap();
+        assert_eq!(id, handle);
+    }
+    let base = stub_provider(json!({ "id": 666, "login": "mallory" })).await;
+    let provider = oauth_provider(&base, pg.clone() as Arc<dyn IdentityStore>);
+    let ids = pg.clone();
+    let h = harness_on(Backend::Pg(pg.clone()), move |st| {
+        st.with_oauth_login(provider)
+            .with_identities(ids as Arc<dyn IdentityStore>)
+    });
+    let mallory = h.browser_session(scoped("mallory")).await;
+    h.enroll(&mallory, &mut passkey(), "mallory's key").await;
+    Some((tdb, h, pg))
+}
+
+async fn passkey_owners(h: &Harness) -> (usize, usize) {
+    (
+        h.passkey_store.list("amy").await.unwrap().len(),
+        h.passkey_store.list("mallory").await.unwrap().len(),
+    )
+}
+
+/// A stolen session of amy inside its window cannot fold in a Principal
+/// that holds passkeys: the window-confirmed link is refused at the
+/// callback, nothing merges, and mallory's passkey stays mallory's. Before
+/// the fix the merge moved it to amy, with no event.
+#[tokio::test]
+async fn a_window_link_cannot_merge_in_a_principal_s_passkeys() {
+    let Some((tdb, h, pg)) = merge_harness().await else {
+        return;
+    };
+    let (s, mut soft) = amy(&h).await;
+    h.open_window(&s, &mut soft).await;
+
+    let cookie = begin_link(&h, &s).await;
+    let cb = link_callback(&h, &s, &cookie).await;
+    assert_eq!(cb.status(), StatusCode::FOUND);
+    let location = cb.headers()[axum::http::header::LOCATION]
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        location.starts_with("/settings/profile?identity_link_error="),
+        "{location}"
+    );
+    assert_eq!(passkey_owners(&h).await, (1, 1), "nothing moved");
+    let held = IdentityStore::identities_of(pg.as_ref(), "amy")
+        .await
+        .unwrap();
+    assert!(held.iter().all(|i| i.provider != "default"), "{held:?}");
+    let refused = h.events("step_up.refused").await;
+    assert!(
+        refused
+            .iter()
+            .any(|e| e.op.as_deref() == Some("identity.link") && e.detail["from"] == "mallory"),
+        "{refused:?}"
+    );
+    assert!(h.events("passkey.moved_on_merge").await.is_empty());
+    tdb.cleanup().await;
+}
+
+/// The link that may move passkeys always asks: amy's open window does not
+/// satisfy it (403 step_up_required, mode `action`). Confirmed for this
+/// action, the merge moves mallory's passkey to amy and records one
+/// `passkey.moved_on_merge` naming both Principals.
+#[tokio::test]
+async fn a_link_moving_passkeys_always_asks_and_records_each_move() {
+    let Some((tdb, h, _pg)) = merge_harness().await else {
+        return;
+    };
+    let (s, mut soft) = amy(&h).await;
+    h.open_window(&s, &mut soft).await;
+    let moving = mallory_passkey_ids(&h).await;
+    assert_eq!(moving.len(), 1);
+
+    let uri = "/v1/me/identities/link-moving-passkeys";
+    let body = json!({"provider": "default"});
+    let (st, b) = h.cookie("POST", uri, Some(body.clone()), &s).await;
+    assert_step_up(st, &b, "action");
+    let (st, conf) = h.answer(&s, &mut soft, &b["challenge"]).await;
+    assert_eq!(st, StatusCode::OK, "{conf}");
+    let resp = send_raw(&h, cookie_req("POST", uri, Some(body), &s)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let cookie = set_cookie(&resp, "scarab_oauth_state").expect("a link state cookie");
+
+    let cb = link_callback(&h, &s, &cookie).await;
+    assert_eq!(cb.status(), StatusCode::FOUND);
+    assert_eq!(
+        cb.headers()[axum::http::header::LOCATION],
+        "/settings/profile?identity_linked=default&merged=mallory"
+    );
+    assert_eq!(passkey_owners(&h).await, (2, 0));
+    let moved = h.events("passkey.moved_on_merge").await;
+    assert_eq!(moved.len(), 1, "{moved:?}");
+    assert_eq!(moved[0].subject, "amy");
+    assert_eq!(moved[0].passkey_id.as_deref(), Some(moving[0].as_str()));
+    assert_eq!(moved[0].detail["from"], "mallory");
+    assert_eq!(moved[0].detail["into"], "amy");
+    tdb.cleanup().await;
+}
+
+async fn mallory_passkey_ids(h: &Harness) -> Vec<String> {
+    h.passkey_store
+        .list("mallory")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|p| p.id)
+        .collect()
 }

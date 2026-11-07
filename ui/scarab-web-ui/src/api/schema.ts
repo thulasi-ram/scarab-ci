@@ -452,8 +452,30 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Begin linking another sign-in account (ADR-0069) */
+        /**
+         * Begin linking another sign-in account (ADR-0069)
+         * @description A link that would fold in a Principal holding passkeys is refused at the
+         *     callback (the merge would move them to the caller): it needs
+         *     `POST /v1/me/identities/link-moving-passkeys`, which always asks.
+         */
         post: operations["begin_link_identity"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/me/identities/link-moving-passkeys": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Begin linking another sign-in account whose Principal holds passkeys (ADR-0069) */
+        post: operations["begin_link_identity_moving_passkeys"];
         delete?: never;
         options?: never;
         head?: never;
@@ -5949,6 +5971,45 @@ export interface operations {
         };
     };
     begin_link_identity: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LinkIdentityRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LinkIdentityResponse"];
+                };
+            };
+            /** @description not a browser session — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    begin_link_identity_moving_passkeys: {
         parameters: {
             query?: never;
             header?: never;

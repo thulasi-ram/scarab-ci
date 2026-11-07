@@ -771,14 +771,21 @@ async fn merged_bob(pg: &Arc<PostgresDb>) -> (Harness, String) {
 }
 
 async fn fold_bobby_into_bob(pg: &PostgresDb) {
-    let outcome = IdentityStore::link(pg, "bob", &identity("forgejo", "f1", "bobby"), T0)
-        .await
-        .unwrap();
-    assert_eq!(
-        outcome,
-        scarab_identity::LinkOutcome::Merged {
-            from: "bobby".into()
-        }
+    let outcome = IdentityStore::link(
+        pg,
+        "bob",
+        &identity("forgejo", "f1", "bobby"),
+        T0,
+        scarab_identity::MergePasskeys::Move,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(
+            &outcome,
+            scarab_identity::LinkOutcome::Merged { from, .. } if from == "bobby"
+        ),
+        "{outcome:?}"
     );
 }
 

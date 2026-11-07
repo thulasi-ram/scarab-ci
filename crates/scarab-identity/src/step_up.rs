@@ -604,6 +604,10 @@ pub mod security_event_kind {
     /// A backup-eligible (synced) passkey presented a counter that did not
     /// move forward: recorded, not flagged.
     pub const PASSKEY_COUNTER_REGRESSED: &str = "passkey.counter_regressed";
+    /// An identity link folded another Principal into this one and moved
+    /// one of its passkeys here (git-bug def16bd). One per passkey; the
+    /// detail names both Principals.
+    pub const PASSKEY_MOVED_ON_MERGE: &str = "passkey.moved_on_merge";
     pub const GUARD_NOT_CONSULTED: &str = "guard.not_consulted";
     /// `scarab-server admin grant`: an operator seeded a role binding
     /// straight in the database.
@@ -621,6 +625,7 @@ pub mod security_event_kind {
         PASSKEY_BREAK_GLASS_RESET,
         PASSKEY_CLONE_SUSPECTED,
         PASSKEY_COUNTER_REGRESSED,
+        PASSKEY_MOVED_ON_MERGE,
     ];
 }
 

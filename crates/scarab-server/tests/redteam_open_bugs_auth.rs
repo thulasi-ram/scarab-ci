@@ -1142,9 +1142,15 @@ async fn rt_an_alias_reset_cannot_skip_the_every_org_owner_check() {
         .await;
     h.grant("bobby", Scope::Org("beta".into()), Role::Admin)
         .await;
-    IdentityStore::link(pg.as_ref(), "bob", &identity("forgejo", "f1", "bobby"), T0)
-        .await
-        .unwrap();
+    IdentityStore::link(
+        pg.as_ref(),
+        "bob",
+        &identity("forgejo", "f1", "bobby"),
+        T0,
+        scarab_identity::MergePasskeys::Move,
+    )
+    .await
+    .unwrap();
     let bob = h.browser_session(scoped("bob")).await;
     h.enroll(&bob, &mut passkey(), "bob's key").await;
 

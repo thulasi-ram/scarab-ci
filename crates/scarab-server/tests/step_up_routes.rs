@@ -40,6 +40,12 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
     ("GET", "/v1/me", "read", "READ"),
     ("POST", "/v1/me/identities/link", "identity.link", "CJ-W"),
     (
+        "POST",
+        "/v1/me/identities/link-moving-passkeys",
+        "identity.link_moving_passkeys",
+        "CJ-A",
+    ),
+    (
         "DELETE",
         "/v1/me/identities/{provider}",
         "identity.unlink",
