@@ -1107,6 +1107,15 @@ impl StepSpec {
         self.gate.is_some()
     }
 
+    /// In a Run an Environment governs, whether this Step is an
+    /// **Environment approval gate** (ADR-0078 §1): a `manual` gate that Run
+    /// creation marked one, or left unmarked. A gate is unmarked only in a
+    /// Run created before the mark existed, when every `manual` gate of a
+    /// governed Run needed the approvers, so it counts as one.
+    pub fn counts_as_environment_approval_gate(&self) -> bool {
+        self.gate.as_deref() == Some("manual") && self.environment_approval_gate != Some(false)
+    }
+
     /// Is this a build step (ADR-0018 rootless image build)?
     pub fn is_build(&self) -> bool {
         self.build.is_some()
@@ -8189,6 +8198,10 @@ mod tests {
         for field in [
             "scope: { inputs: run }",
             "guards: [{ caller_hops: 0, when: 'true' }]",
+            // An author who wrote `false` would turn an Environment
+            // approval gate into a plain gate, released with no approver.
+            "environment_approval_gate: false",
+            "environment_approval_gate: true",
         ] {
             let errs = errors(&format!("steps: [{{ id: a, image: busybox, {field} }}]"));
             let name = field.split(':').next().unwrap();
@@ -8212,6 +8225,9 @@ mod tests {
                 "{errs:?}"
             );
         }
+        let errs = errors("steps: [{ id: a, gate: manual, environment_approval_gate: false }]");
+        let refused = "step `a`: `environment_approval_gate` is written by the compiler";
+        assert!(errs.iter().any(|e| e.contains(refused)), "{errs:?}");
     }
 
     #[test]

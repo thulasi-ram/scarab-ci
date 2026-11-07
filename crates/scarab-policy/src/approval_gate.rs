@@ -62,7 +62,7 @@ pub fn upstream_approval_gates<'a>(ir: &'a PipelineIr, step: &str) -> Vec<&'a St
     ir.steps
         .iter()
         .filter(|s| seen.contains(s.id.as_str()))
-        .filter(|s| is_manual_gate(s) && s.environment_approval_gate != Some(false))
+        .filter(|s| s.counts_as_environment_approval_gate())
         .collect()
 }
 
@@ -115,14 +115,30 @@ pub fn mark_environment_approval_gates(ir: &mut PipelineIr) {
     }
 }
 
+/// The Steps of `ir` that never start: each one in `excluded` (a `when:`
+/// that is false, so the Step starts Skipped) and every Step downstream of
+/// one of them, which the scheduler skips because a need was skipped.
+fn dead_steps<'a>(ir: &'a PipelineIr, excluded: &[String]) -> BTreeSet<&'a str> {
+    let mut dead: BTreeSet<&str> = BTreeSet::new();
+    for s in ir.steps.iter().filter(|s| excluded.contains(&s.id)) {
+        dead.insert(s.id.as_str());
+        dead.extend(downstream(ir, &s.id));
+    }
+    dead
+}
+
 /// The Steps of `ir` that use the Environment's authority with no `manual`
-/// gate upstream, in Pipeline order. A Step in `excluded` (a `when:` that
-/// is false, so the Step starts Skipped) is left out.
+/// gate upstream, in Pipeline order. A Step that never starts is left out:
+/// one in `excluded` (a `when:` that is false, so the Step starts Skipped),
+/// and every Step downstream of one of them. The fronts the added gate goes
+/// in front of come from this list, so none of the gate's `needs` is a Step
+/// that never starts, which would skip the gate and every Step behind it.
 pub fn steps_missing_approval_gate(ir: &PipelineIr, excluded: &[String]) -> Vec<String> {
+    let dead = dead_steps(ir, excluded);
     ir.steps
         .iter()
         .filter(|s| uses_environment_authority(ir, s))
-        .filter(|s| !excluded.contains(&s.id))
+        .filter(|s| !dead.contains(s.id.as_str()))
         .filter(|s| !manual_gate_upstream(ir, &s.id))
         .map(|s| s.id.clone())
         .collect()
@@ -349,6 +365,32 @@ steps:
 "#);
         let added = add_environment_approval_gate(&mut taken, "prod", None, &[]).unwrap();
         assert_eq!(added.id, "environment-approval-3");
+    }
+
+    /// cd43bf3: a deploy branch whose build is excluded by its `when:` never
+    /// starts, so it gets no gate and lends the gate none of its `needs`.
+    /// Otherwise the gate would need a Skipped Step, be Skipped itself, and
+    /// skip the live branch's deploy with it.
+    #[test]
+    fn a_branch_behind_an_excluded_step_lends_the_gate_no_needs() {
+        let mut ir = ir(r#"
+environment: prod
+steps:
+  - { id: build-canary, image: busybox }
+  - { id: deploy-canary, image: busybox, deploy: true, needs: [build-canary] }
+  - { id: build, image: busybox }
+  - { id: deploy-main, image: busybox, deploy: true, needs: [build] }
+"#);
+        let excluded = vec!["build-canary".to_string()];
+        assert_eq!(
+            steps_missing_approval_gate(&ir, &excluded),
+            vec!["deploy-main".to_string()]
+        );
+        let added = add_environment_approval_gate(&mut ir, "prod", None, &excluded).unwrap();
+        assert_eq!(added.fronts, vec!["deploy-main".to_string()]);
+        assert_eq!(step(&ir, ADDED_GATE_ID).needs.0, vec!["build".to_string()]);
+        assert_eq!(needs(&ir, "deploy-canary"), vec!["build-canary"]);
+        assert_eq!(needs(&ir, "deploy-main"), vec!["build", ADDED_GATE_ID]);
     }
 
     #[test]

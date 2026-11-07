@@ -357,6 +357,42 @@ async fn approval_gate_setting_loosenings_need_a_step_up_and_mode_does_not() {
     g.tdb.cleanup().await;
 }
 
+/// cd43bf3: where only some of the approvers must approve, an added
+/// approver is one more principal who can make up the count, so adding one
+/// needs a step-up. That holds for the combined change too: `[amy]` with
+/// every approver required, to `[amy, eve]` with 1 required, keeps the count
+/// at 1 and lets `eve` release alone. Where every approver must approve,
+/// adding one tightens.
+#[tokio::test]
+async fn adding_an_approver_where_a_count_is_set_needs_a_step_up() {
+    let Some(g) = governed().await else { return };
+    let (h, pg) = (&g.h, &g.pg);
+    let (s, _soft) = signed_in_admin(h).await;
+    let uri = format!("{PROD}/protection");
+    let put = |body: Value| h.cookie("PUT", &uri, Some(body), &s);
+
+    seed_protection(pg, rules(&["amy"], &[])).await;
+    let (st, b) = put(json!({ "approvers": ["amy", "eve"], "required_approvals": 1 })).await;
+    assert_refused_for(st, &b, "environment.protection.put", "adds approver `eve`");
+    assert_eq!(
+        stored_protection(pg).await.approvers,
+        vec!["amy".to_string()]
+    );
+
+    let mut counted = rules(&["amy", "bob"], &[]);
+    counted.approval_gate.required_approvals = Some(1);
+    seed_protection(pg, counted).await;
+    let (st, b) = put(json!({ "approvers": ["amy", "bob", "eve"], "required_approvals": 1 })).await;
+    assert_refused_for(st, &b, "environment.protection.put", "adds approver `eve`");
+
+    // Every approver required: adding one tightens.
+    seed_protection(pg, rules(&["amy"], &[])).await;
+    let (st, b) = put(json!({ "approvers": ["amy", "eve"] })).await;
+    assert_ok(st, &b);
+
+    g.tdb.cleanup().await;
+}
+
 /// A wait timer is a minimum wait on the Environment approval gate
 /// (ADR-0078 §4), so the API refuses one where no approver would ever be
 /// asked: on a baseline with no approvers, and on an overlay whose

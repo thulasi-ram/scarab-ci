@@ -15,9 +15,9 @@
 //!   required count, the Run's ref is allowed, and the wait timer has run
 //!   out on the gate's wait clock.
 //! - `step.admit` ([`launch_recheck`]): at every launch of a Step that uses
-//!   the Environment's authority, an Environment approval gate upstream has
-//!   released, the ref is still allowed, the approver set is the one the
-//!   release recorded, and the release is within the maximum approval age.
+//!   the Environment's authority, the ref is still allowed and one
+//!   Environment approval gate upstream has released, with the approver set
+//!   its release recorded unchanged, within the maximum approval age.
 //!   A Step with no released approval gate upstream gets the `env=none`
 //!   OIDC subject.
 //!
@@ -265,10 +265,11 @@ pub struct LaunchCheck {
 
 /// The launch-time re-check at `step.admit` (ADR-0075 §3, ADR-0078 §5), at
 /// every launch, reruns and retries included. In an Environment with
-/// approvers, a Step that uses its authority is refused unless an
-/// Environment approval gate is upstream of it and released, the Run's ref
-/// is still allowed, each upstream release recorded the approver set the
-/// Environment has now, and none is older than the maximum approval age.
+/// approvers, a Step that uses its authority is refused unless the Run's
+/// ref is still allowed and an Environment approval gate upstream of it has
+/// released, recorded the approver set the Environment has now, and is no
+/// older than the maximum approval age. One such gate is enough; when none
+/// qualifies, the refusal is the one for the gate latest in the Pipeline.
 /// External, timer and plugin gates are never approval gates, so a Step
 /// behind only those is refused whatever released them.
 pub fn launch_recheck(f: LaunchFacts<'_>) -> LaunchCheck {
@@ -317,35 +318,42 @@ fn refusal(f: LaunchFacts<'_>) -> Option<String> {
         ));
     }
     let max_age_ms = i64::from(p.approval_gate.max_approval_age_s) * 1000;
-    for gate in f.approval_gates {
-        let Some(released) = gate.released_at else {
-            return Some(format!(
+    // One released approval gate upstream that passes every check admits
+    // the Step: an older gate further up (a QA sign-off a day ago) does not
+    // refuse a deploy a fresh approval released. When none passes, the
+    // reason given is that of the gate latest in the Pipeline.
+    let mut refusal = None;
+    for gate in f.approval_gates.iter().rev() {
+        let why = match gate.released_at {
+            None => format!(
                 "Environment approval gate `{}` upstream of step `{id}` has not released",
                 gate.gate
-            ));
-        };
-        let age_ms = f.now_ms.saturating_sub(released);
-        if age_ms > max_age_ms {
-            return Some(format!(
-                "Environment approval gate `{}` released {} s ago, longer than environment \
-                 `{env}`'s maximum approval age of {} s; rerun the gate to ask the approvers \
-                 again",
-                gate.gate,
-                age_ms / 1000,
-                p.approval_gate.max_approval_age_s
-            ));
-        }
-        if let Some(met) = &gate.met {
-            if *met != p.approver_set() {
-                return Some(format!(
-                    "environment `{env}`'s approvers changed since Environment approval gate \
-                     `{}` released; rerun the gate to ask the approvers again",
-                    gate.gate
-                ));
+            ),
+            Some(released) => {
+                let age_ms = f.now_ms.saturating_sub(released);
+                if age_ms > max_age_ms {
+                    format!(
+                        "Environment approval gate `{}` released {} s ago, longer than \
+                         environment `{env}`'s maximum approval age of {} s; rerun the gate to \
+                         ask the approvers again",
+                        gate.gate,
+                        age_ms / 1000,
+                        p.approval_gate.max_approval_age_s
+                    )
+                } else if gate.met.as_ref().is_some_and(|m| *m != p.approver_set()) {
+                    format!(
+                        "environment `{env}`'s approvers changed since Environment approval gate \
+                         `{}` released; rerun the gate to ask the approvers again",
+                        gate.gate
+                    )
+                } else {
+                    return None;
+                }
             }
-        }
+        };
+        refusal.get_or_insert(why);
     }
-    None
+    refusal
 }
 
 #[cfg(test)]
@@ -435,6 +443,51 @@ steps:
         assert!(
             none.result.is_none(),
             "no approvers: the rule does not apply"
+        );
+    }
+
+    /// c2f97b4 (C-06): one released, fresh approval gate upstream admits
+    /// the Step; an older gate further up does not refuse it. With none
+    /// qualifying, the refusal names the gate latest in the Pipeline.
+    #[test]
+    fn one_fresh_approval_gate_upstream_admits_the_step() {
+        let p = protection(&["amy"], false);
+        let day_ms = 24 * 3600 * 1000;
+        let now_ms = 3 * day_ms;
+        let gate = |id: &str, released_at| UpstreamGateFacts {
+            gate: id.to_string(),
+            released_at,
+            met: Some(p.approver_set()),
+        };
+        let check = |gates: &[UpstreamGateFacts]| {
+            launch_recheck(LaunchFacts {
+                environment: "prod",
+                git_ref: "refs/heads/main",
+                protection: &p,
+                step: "deploy",
+                uses_authority: Some(true),
+                approval_gates: gates,
+                now_ms,
+            })
+        };
+        let fresh = check(&[
+            gate("qa", Some(now_ms - 2 * day_ms)),
+            gate("prod-gate", Some(now_ms - 60_000)),
+        ]);
+        assert_eq!(fresh.refusal, None);
+        assert_eq!(fresh.result.unwrap().outcome, PolicyOutcome::Passed);
+
+        let stale = check(&[gate("qa", Some(now_ms - 60_000)), gate("prod-gate", None)]);
+        assert_eq!(stale.refusal, None, "the fresh QA gate is enough");
+
+        let none = check(&[
+            gate("qa", Some(now_ms - 2 * day_ms)),
+            gate("prod-gate", None),
+        ]);
+        let r = none.refusal.expect("no gate qualifies");
+        assert!(
+            r.contains("`prod-gate`") && r.contains("has not released"),
+            "{r}"
         );
     }
 }

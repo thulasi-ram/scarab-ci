@@ -47,7 +47,8 @@ fn covered(old: &[String], pattern: &str) -> bool {
 /// E1 — how replacing protection rules `old` with `new` loosens them (the
 /// baseline; an overlay is [`overlay_loosenings`]):
 ///
-/// - an approver dropped;
+/// - an approver dropped, or one added where only some of the approvers
+///   must approve (`required_approvals` set);
 /// - allowed refs widened: a restricted list made empty (any ref), or a new
 ///   glob no old one covers. An unrestricted (empty) list can only tighten;
 /// - a shorter wait timer;
@@ -110,6 +111,17 @@ fn approval_gate_loosenings(
             required(old),
             required(new)
         )));
+    }
+    // With a count, an added approver is one more principal who can make up
+    // that count, not one more who must approve.
+    if let Some(count) = n.required_approvals {
+        for a in &new.approvers {
+            if !old.approvers.contains(a) {
+                out.push(Loosening::new(format!(
+                    "adds approver `{a}`, and only {count} of the approvers must approve"
+                )));
+            }
+        }
     }
     if n.max_approval_age_s > o.max_approval_age_s {
         out.push(Loosening::new(format!(
@@ -212,5 +224,41 @@ mod tests {
         assert!(!glob_subsumes("refs/heads/main", "refs/heads/*"));
         assert!(!glob_subsumes("refs/heads/r*", "refs/heads/*"));
         assert!(!glob_subsumes("refs/tags/*", "refs/heads/main"));
+    }
+
+    fn rules(approvers: &[&str], required: Option<u32>) -> EnvironmentProtectionRules {
+        let mut r = EnvironmentProtectionRules {
+            approvers: approvers.iter().map(|a| a.to_string()).collect(),
+            ..Default::default()
+        };
+        r.approval_gate.required_approvals = required;
+        r
+    }
+
+    /// cd43bf3: with a count set, an added approver widens who can make up the
+    /// count, so it loosens. With every approver required it tightens.
+    #[test]
+    fn adding_an_approver_loosens_only_where_a_count_is_set() {
+        let added = |old, new| {
+            protection_loosenings(&old, &new)
+                .into_iter()
+                .map(|l| l.what)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            added(
+                rules(&["a", "b"], Some(1)),
+                rules(&["a", "b", "x"], Some(1))
+            ),
+            vec!["adds approver `x`, and only 1 of the approvers must approve".to_string()]
+        );
+        // `[a]` with every one required to `[a, b]` with 1 required: the
+        // count stays 1, and `b` alone can now release.
+        assert_eq!(
+            added(rules(&["a"], None), rules(&["a", "b"], Some(1))),
+            vec!["adds approver `b`, and only 1 of the approvers must approve".to_string()]
+        );
+        assert!(added(rules(&["a"], None), rules(&["a", "b"], None)).is_empty());
+        assert!(added(rules(&["a", "b"], Some(1)), rules(&["a", "b"], Some(2))).is_empty());
     }
 }
