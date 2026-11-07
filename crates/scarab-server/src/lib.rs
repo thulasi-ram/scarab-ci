@@ -5194,6 +5194,58 @@ struct AdmittedFacts<'a> {
     /// library is trusted, each with that library's content hash: they
     /// consume no workspace.
     trusted_only: &'a std::collections::BTreeMap<String, String>,
+    /// The Run's cache scope ([`run_cache_scope`]); `None` turns its Cache
+    /// off.
+    cache_scope: Option<scarab_engine::CacheScope>,
+}
+
+/// The cache scope a new Run gets (git-bug efcec77): `env:<name>` when an
+/// Environment governs it and it is not a pull request, else its symbolic
+/// ref with the default branch's scope as the fallback read. A pull request
+/// (the event is one, or the Run is locked out as a fork) that names an
+/// Environment is scoped by its ref like an ungoverned Run, so it never
+/// writes what that Environment's Runs restore. The forge is asked for the
+/// default branch only when that fallback can matter: a Run scoped by its
+/// ref whose Pipeline declares a `cache:`. Asking is best-effort: a forge that cannot
+/// answer leaves the Run with no fallback (its first build on a new ref is
+/// cold), never a failed creation.
+async fn run_cache_scope(
+    forge: &dyn scarab_forge::ForgePort,
+    event: &scarab_forge::Event,
+    ir: &scarab_pipeline::PipelineIr,
+    gov: &RunGovernance,
+) -> Option<scarab_engine::CacheScope> {
+    let (environment, locked_out) = match gov {
+        RunGovernance::Governed {
+            environment,
+            locked_out,
+            ..
+        } => (Some(environment.as_str()), *locked_out),
+        RunGovernance::Ungoverned => (None, false),
+    };
+    let pull_request = locked_out || event.trigger_kind() == scarab_forge::TriggerKind::PullRequest;
+    let git_ref = event.protection_ref();
+    let environment =
+        scarab_engine::CacheScope::environment_scope(environment, git_ref.as_deref(), pull_request);
+    let mut default_branch = None;
+    if environment.is_none() && git_ref.is_some() && ir.steps.iter().any(|s| s.cache.is_some()) {
+        if let Some(repo) = event.repo() {
+            match forge.default_branch(repo).await {
+                Ok(branch) => default_branch = Some(branch),
+                Err(e) => tracing::warn!(
+                    repo = %format!("{}/{}", repo.owner, repo.name),
+                    error = %e,
+                    "could not read the default branch: this Run's Cache has no fallback"
+                ),
+            }
+        }
+    }
+    scarab_engine::CacheScope::for_run(
+        environment,
+        git_ref.as_deref(),
+        default_branch.as_deref(),
+        pull_request,
+    )
 }
 
 /// The outcome of admitting one compiled pipeline (ADR-0037, ADR-0071 §2):
@@ -5582,6 +5634,7 @@ async fn admit_unrecorded(
     let admitted = AdmittedFacts {
         event: &facts,
         trusted_only: &tokens.trusted_only,
+        cache_scope: run_cache_scope(forge, event, ir, &gov).await,
     };
     // Rendered before the Policies are consulted: a key that cannot be
     // rendered refuses the Run before an allow decision naming it is
@@ -6430,6 +6483,7 @@ fn cache_config(step: &scarab_pipeline::StepSpec) -> Option<scarab_engine::Cache
         key_files: c.key.clone(),
         key: None,
         restore: Vec::new(),
+        fallback_key: None,
     })
 }
 
@@ -6741,6 +6795,11 @@ async fn write_run_from_ir(
     // The checked `event` values every launch renders (ADR-0076 §9), fixed
     // now so a rerun or retry renders the same ones.
     db.set_run_event_facts(run, admitted.event).await?;
+    // The cache scope, fixed now for the same reason: a rerun reads and
+    // writes the Cache its Run started with (git-bug efcec77).
+    if let Some(scope) = &admitted.cache_scope {
+        db.set_run_cache_scope(run, scope).await?;
+    }
     // ADR-0037: record the deploy context (repo + environment + git ref) so
     // gate-approval-time admission can look up the environment's protection
     // rules directly, without parsing the stored IR blob. Deploy runs only.

@@ -260,6 +260,9 @@ struct InMemoryState {
     /// `(project, key, dir) → (tree_root, saved_at, run, step, attempt)`.
     #[allow(clippy::type_complexity)]
     cache_entries: HashMap<(String, String, String), (String, Timestamp, RunId, StepId, AttemptId)>,
+    /// Per-run cache scope (mirrors the `cache_scope` and
+    /// `cache_fallback_scope` run columns).
+    run_cache_scope: HashMap<RunId, scarab_engine::CacheScope>,
     /// Per-run pipeline name (mirrors the `pipeline` run column).
     run_pipeline: HashMap<RunId, String>,
     /// Per-run Headline / trigger title (mirrors the `trigger_title` column).
@@ -1330,14 +1333,24 @@ impl Db for InMemoryDb {
             .and_then(|o| o.5.clone()))
     }
 
-    async fn run_pr_context(&self, run: &RunId) -> Result<bool, DbError> {
-        Ok(self
-            .state
+    async fn set_run_cache_scope(
+        &self,
+        run: &RunId,
+        scope: &scarab_engine::CacheScope,
+    ) -> Result<(), DbError> {
+        self.state
             .lock()
             .unwrap()
-            .run_origin
-            .get(run)
-            .is_some_and(|o| o.0 == "pull_request" || o.4.is_some()))
+            .run_cache_scope
+            .insert(run.clone(), scope.clone());
+        Ok(())
+    }
+
+    async fn run_cache_scope(
+        &self,
+        run: &RunId,
+    ) -> Result<Option<scarab_engine::CacheScope>, DbError> {
+        Ok(self.state.lock().unwrap().run_cache_scope.get(run).cloned())
     }
 
     async fn cache_record(
@@ -2682,6 +2695,10 @@ struct FakeExecState {
     /// Cache saves (ADR-0065 s1) each *step* reports on success, keyed by
     /// step id — what `Executor::cache_saves` answers.
     cache_saves: HashMap<String, scarab_engine::CacheSaves>,
+    /// Cache dir → saved root each *step* reports on success, saved under
+    /// the key its launch carried (as the k8s backend reads the key back off
+    /// the Pod it launched). [`FakeExecutor::set_cache_saves`] wins over it.
+    cache_save_roots: HashMap<String, std::collections::BTreeMap<String, String>>,
     /// step id — what `Executor::workspace_provisioning` answers (ticket
     /// 2e1a458): the scripted fan-in collision report a backend would read
     /// back from its fetcher at settle.
@@ -2844,6 +2861,20 @@ impl FakeExecutor {
             .unwrap()
             .cache_saves
             .insert(step.to_string(), saves);
+    }
+
+    /// The cache dirs `step` (by id) saves on success, as `dir → root`:
+    /// `Executor::cache_saves` answers them under the key the attempt was
+    /// launched with, and answers nothing for an attempt launched with its
+    /// cache off.
+    pub fn set_cache_save_roots(&self, step: &str, roots: &[(&str, &str)]) {
+        self.inner.lock().unwrap().cache_save_roots.insert(
+            step.to_string(),
+            roots
+                .iter()
+                .map(|(d, r)| (d.to_string(), r.to_string()))
+                .collect(),
+        );
     }
 
     /// Script the [`scarab_engine::ProvisioningReport`] that `step` (by id)
@@ -3187,7 +3218,22 @@ impl Executor for FakeExecutor {
         let Some((step, _)) = Self::step_and_attempt(handle) else {
             return Ok(None);
         };
-        Ok(self.inner.lock().unwrap().cache_saves.get(&step).cloned())
+        let st = self.inner.lock().unwrap();
+        if let Some(saves) = st.cache_saves.get(&step) {
+            return Ok(Some(saves.clone()));
+        }
+        let Some(roots) = st.cache_save_roots.get(&step) else {
+            return Ok(None);
+        };
+        let key = st
+            .launched_specs
+            .get(&handle.0)
+            .and_then(|spec| spec.cache.as_ref())
+            .and_then(|cache| cache.key.clone());
+        Ok(key.map(|key| scarab_engine::CacheSaves {
+            key,
+            roots: roots.clone(),
+        }))
     }
 
     async fn gate_refusal(
