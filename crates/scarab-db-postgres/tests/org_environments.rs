@@ -413,7 +413,7 @@ async fn preconditions_create_only_and_replace_only_what_was_read() {
         ..prod.clone()
     };
     let replaced = db
-        .put_org_environment_if(&edited, &WritePrecondition::Matches(read.clone()))
+        .put_org_environment_if(&edited, &WritePrecondition::Matches(vec![read.clone()]))
         .await
         .unwrap();
     assert_ne!(replaced.etag(), read);
@@ -424,7 +424,7 @@ async fn preconditions_create_only_and_replace_only_what_was_read() {
         ..prod.clone()
     };
     assert!(matches!(
-        db.put_org_environment_if(&stale, &WritePrecondition::Matches(read))
+        db.put_org_environment_if(&stale, &WritePrecondition::Matches(vec![read]))
             .await,
         Err(OrgEnvironmentError::PreconditionFailed(_))
     ));
@@ -440,7 +440,7 @@ async fn preconditions_create_only_and_replace_only_what_was_read() {
     assert!(matches!(
         db.put_org_environment_if(
             &org_environment("acme", "dev", 1_000),
-            &WritePrecondition::Matches(replaced.etag())
+            &WritePrecondition::Matches(vec![replaced.etag()])
         )
         .await,
         Err(OrgEnvironmentError::PreconditionFailed(_))

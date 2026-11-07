@@ -442,5 +442,35 @@ async fn the_put_honours_if_match_and_if_none_match() {
     assert_eq!(st, StatusCode::BAD_REQUEST);
     let (st, _) = call_with(&app, "PUT", uri, &[], body("v3")).await;
     assert_eq!(st, StatusCode::OK, "no precondition: replace as before");
+
+    // RFC 9110 If-Match: `*` holds for any stored Environment, a list holds
+    // when one of its tags is the stored one, and a weak tag never matches.
+    let (st, current) = call_with(&app, "PUT", uri, &[("if-match", "*")], body("v4")).await;
+    assert_eq!(st, StatusCode::OK, "`*`: the Environment exists");
+    let current = current.expect("an ETag");
+    let list = format!("{created}, {current}");
+    let (st, _) = call_with(&app, "PUT", uri, &[("if-match", &list)], body("v5")).await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "one of the listed tags is the stored one"
+    );
+    let (_, current) = call_with(&app, "GET", uri, &[], None).await;
+    let weak = format!("W/{}", current.expect("an ETag"));
+    let (st, _) = call_with(&app, "PUT", uri, &[("if-match", &weak)], body("weak")).await;
+    assert_eq!(
+        st,
+        StatusCode::PRECONDITION_FAILED,
+        "a weak tag never matches"
+    );
+    let (st, _) = call_with(
+        &app,
+        "PUT",
+        "/v1/orgs/acme/environments/none-yet",
+        &[("if-match", "*")],
+        body("x"),
+    )
+    .await;
+    assert_eq!(st, StatusCode::PRECONDITION_FAILED, "`*`: nothing stored");
     tdb.cleanup().await;
 }

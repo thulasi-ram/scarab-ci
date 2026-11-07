@@ -92,8 +92,9 @@ pub enum WritePrecondition {
     /// Create only: no Environment by that name may exist.
     Absent,
     /// Replace only: the stored Environment's [`OrgEnvironment::etag`] is
-    /// this one.
-    Matches(String),
+    /// one of these (HTTP `If-Match`, strong comparison). `*` matches any
+    /// stored Environment; a weak tag (`W/"…"`) never matches.
+    Matches(Vec<String>),
 }
 
 /// The OrgEnvironment name rule: non-empty, no control characters, and not

@@ -319,7 +319,14 @@ fn write_precondition(headers: &HeaderMap) -> Result<WritePrecondition, ApiError
         (None, Some(_)) => Err(ApiError::BadRequest(
             "`If-None-Match` takes only `*` here (create only)".into(),
         )),
-        (Some(m), None) => Ok(WritePrecondition::Matches(m)),
+        // A list of tags, or `*` (any stored Environment). Our tags never
+        // hold a comma, so splitting on it is exact.
+        (Some(m), None) => Ok(WritePrecondition::Matches(
+            m.split(',')
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect(),
+        )),
         (Some(_), Some(_)) => Err(ApiError::BadRequest(
             "send `If-Match` (replace) or `If-None-Match: *` (create), not both".into(),
         )),

@@ -123,7 +123,7 @@ impl OrgEnvironmentStore for PostgresDb {
             .map_err(org_environment_store_err)?;
         // `If-Match`: the stored Environment, locked, must be the one the
         // caller read; the lock holds until this transaction's write commits.
-        if let WritePrecondition::Matches(tag) = precondition {
+        if let WritePrecondition::Matches(tags) = precondition {
             let current = sqlx::query(&format!(
                 "SELECT {ORG_ENVIRONMENT_COLUMNS} FROM org_environments
                  WHERE org = $1 AND name = $2 FOR UPDATE"
@@ -140,7 +140,8 @@ impl OrgEnvironmentStore for PostgresDb {
                 )));
             };
             let patterns = eligible_project_patterns_of(&mut *tx, &env.org, &env.name).await?;
-            if &org_environment_from_row(&current, patterns)?.etag() != tag {
+            let stored = org_environment_from_row(&current, patterns)?.etag();
+            if !tags.iter().any(|t| t == "*" || *t == stored) {
                 return Err(OrgEnvironmentError::PreconditionFailed(format!(
                     "environment `{}` changed since it was read; reload and retry",
                     env.name
