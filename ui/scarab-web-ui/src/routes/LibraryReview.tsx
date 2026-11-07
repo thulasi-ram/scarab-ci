@@ -34,6 +34,7 @@ import {
   type SideCell,
 } from "../libraries";
 import Icon from "../components/Icon";
+import { Field, Input, Select } from "../components/Field";
 import { decodeParam, orgHref } from "../settings-nav";
 import { me } from "../session";
 import { SettingsCrumbs, SettingsFrame } from "./Settings";
@@ -212,22 +213,21 @@ function Review(props: { org: string }) {
             >
               <div class="secrets-body token-form">
                 <div class="form-r">
-                  <label>source</label>
-                  <input
-                    class="input mono"
-                    placeholder="github.com/acme/scarab-libs//deploy-helm.yaml@<commit>"
-                    value={form().source}
-                    onInput={(e) => set("source", e.currentTarget.value)}
-                  />
-                  <Show when={sourceError(form().source)}>
-                    <p class="error">{sourceError(form().source)}</p>
-                  </Show>
-                  <p class="fieldnote">
-                    A file in a git repository at a full commit id. A public repository on
-                    github.com or a Forgejo connection's host is read without credentials.
-                  </p>
+                  <Field
+                    label="Source"
+                    required
+                    error={sourceError(form().source)}
+                    help="A file in a git repository at a full commit id. A public repository on github.com or a Forgejo connection's host is read without credentials."
+                  >
+                    <Input
+                      mono
+                      placeholder="github.com/acme/scarab-libs//deploy-helm.yaml@<commit>"
+                      value={form().source}
+                      onValue={(v) => set("source", v)}
+                    />
+                  </Field>
                   <Show when={listed().length > 0}>
-                    <p class="fieldnote">
+                    <p class="f-help">
                       Listed in Scarab's release {listed()[0]!.release}, not installed here:
                     </p>
                     <div class="plg-caps">
@@ -245,9 +245,8 @@ function Review(props: { org: string }) {
                     </div>
                   </Show>
                 </div>
-                <div class="form-r">
-                  <label>connection (private repository)</label>
-                  <select class="input" value={form().connection} onChange={(e) => set("connection", e.currentTarget.value)}>
+                <Field label="Connection (private repository)">
+                  <Select value={form().connection} onValue={(v) => set("connection", v)}>
                     <option value="">none: read it anonymously</option>
                     <For each={connections() ?? []}>
                       {(c) => (
@@ -256,25 +255,29 @@ function Review(props: { org: string }) {
                         </option>
                       )}
                     </For>
-                  </select>
-                </div>
-                <div class="form-r">
-                  <label>publisher and name (optional)</label>
-                  <div class="plg-caps">
-                    <input
-                      class="input mono"
+                  </Select>
+                </Field>
+                <div class="f">
+                  <div class="f-l">
+                    <span class="f-lbl">Publisher and name (optional)</span>
+                  </div>
+                  <div class="lib-pair">
+                    <Input
+                      mono
+                      aria-label="publisher"
                       placeholder="the repository owner"
                       value={form().publisher}
-                      onInput={(e) => set("publisher", e.currentTarget.value)}
+                      onValue={(v) => set("publisher", v)}
                     />
-                    <input
-                      class="input mono"
+                    <Input
+                      mono
+                      aria-label="name"
                       placeholder="the file name"
                       value={form().name}
-                      onInput={(e) => set("name", e.currentTarget.value)}
+                      onValue={(v) => set("name", v)}
                     />
                   </div>
-                  <p class="fieldnote">
+                  <p class="f-help">
                     Pipelines name it{" "}
                     <span class="mono">
                       lib:{form().publisher || "<owner>"}/{form().name || "<file>"}

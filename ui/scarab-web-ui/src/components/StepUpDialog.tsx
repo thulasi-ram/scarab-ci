@@ -28,6 +28,7 @@ import {
 } from "../step-up";
 import { getAssertion, webauthnAvailable, webauthnErrorText } from "../webauthn";
 import Icon from "./Icon";
+import Modal, { ModalMessage } from "./Modal";
 
 export default function StepUpDialog() {
   return (
@@ -78,82 +79,70 @@ function StepUpModal(props: {
   };
 
   return (
-    <div class="modal-scrim" onClick={() => !busy() && props.settle(false)}>
-      <div
-        class="modal modal-wide"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="step-up-title"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div class="panel-h">
-          <span id="step-up-title">
-            <Icon icon="shield-check" size={13} /> {stepUpTitle(r())}
-          </span>
-        </div>
-        <div class="modal-body">
-          <dl class="step-up-summary">
-            <dt>operation</dt>
-            <dd>{r().summary.operation}</dd>
-            <Show when={r().summary.target}>
-              <dt>target</dt>
-              <dd class="mono">{r().summary.target}</dd>
-            </Show>
-            <Show when={r().summary.changes.length > 0}>
-              <dt>changes</dt>
-              <dd>
-                <ul class="step-up-changes mono">
-                  <For each={r().summary.changes}>{(c) => <li>{c}</li>}</For>
-                </ul>
-              </dd>
-            </Show>
-          </dl>
-          <p class="subtle modal-note">
-            <small>{stepUpScope(r())}</small>
-          </p>
-
-          <Show when={r().mode === "enroll"}>
-            <p class="tok-warn">
-              <Icon icon="alert-triangle" size={14} />
-              <span>
-                {r().message}
-                <Show when={!r().fresh_login_until}>
-                  {" "}Your login is older than 5 minutes, so enrolling starts with signing in
-                  again.
-                </Show>
-              </span>
-            </p>
-          </Show>
-          <Show when={r().mode !== "enroll" && !r().challenge}>
-            <p class="error">{r().message}</p>
-          </Show>
+    <Modal
+      icon="shield-check"
+      title={stepUpTitle(r())}
+      purpose={stepUpScope(r())}
+      busy={busy()}
+      onClose={() => props.settle(false)}
+      footer={
+        <>
           <Show when={error()}>
-            <p class="error">{error()}</p>
+            <ModalMessage>{error()}</ModalMessage>
           </Show>
-        </div>
-        <div class="modal-foot">
-          <div class="modal-actions">
-            <Show when={canConfirm()}>
-              <button class="btn btn-primary" disabled={busy()} onClick={confirm} autofocus>
-                <Icon icon="key-round" size={14} />{" "}
-                {busy() ? "Waiting for passkey…" : error() ? "Try again" : "Confirm with passkey"}
-              </button>
-            </Show>
-            <Show when={r().mode === "enroll"}>
-              <A
-                class="btn btn-primary"
-                href={r().enroll_url ?? "/settings/security?enroll=1"}
-                onClick={() => props.settle(false)}
-              >
-                <Icon icon="key-round" size={14} /> Enroll a passkey
-              </A>
-            </Show>
-            <button class="btn btn-ghost" disabled={busy()} onClick={() => props.settle(false)}>
-              Cancel
+          <button class="btn btn-ghost" type="button" disabled={busy()} onClick={() => props.settle(false)}>
+            Cancel
+          </button>
+          <Show when={canConfirm()}>
+            <button class="btn btn-primary" type="button" disabled={busy()} onClick={confirm} autofocus>
+              <Icon icon="key-round" size={14} />{" "}
+              {busy() ? "Waiting for passkey…" : error() ? "Try again" : "Confirm with passkey"}
             </button>
-          </div>
-        </div>
-      </div>
-    </div>
+          </Show>
+          <Show when={r().mode === "enroll"}>
+            <A
+              class="btn btn-primary"
+              href={r().enroll_url ?? "/settings/security?enroll=1"}
+              onClick={() => props.settle(false)}
+            >
+              <Icon icon="key-round" size={14} /> Enroll a passkey
+            </A>
+          </Show>
+        </>
+      }
+    >
+      <dl class="step-up-summary">
+        <dt>operation</dt>
+        <dd>{r().summary.operation}</dd>
+        <Show when={r().summary.target}>
+          <dt>target</dt>
+          <dd class="mono">{r().summary.target}</dd>
+        </Show>
+        <Show when={r().summary.changes.length > 0}>
+          <dt>changes</dt>
+          <dd>
+            <ul class="step-up-changes mono">
+              <For each={r().summary.changes}>{(c) => <li>{c}</li>}</For>
+            </ul>
+          </dd>
+        </Show>
+      </dl>
+
+      <Show when={r().mode === "enroll"}>
+        <p class="tok-warn">
+          <Icon icon="alert-triangle" size={14} />
+          <span>
+            {r().message}
+            <Show when={!r().fresh_login_until}>
+              {" "}Your login is older than 5 minutes, so enrolling starts with signing in
+              again.
+            </Show>
+          </span>
+        </p>
+      </Show>
+      <Show when={r().mode !== "enroll" && !r().challenge}>
+        <p class="error">{r().message}</p>
+      </Show>
+    </Modal>
   );
 }

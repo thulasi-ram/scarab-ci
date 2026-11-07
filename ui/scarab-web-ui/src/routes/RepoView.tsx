@@ -43,7 +43,9 @@ import RunNumber from "../components/RunNumber";
 import Icon from "../components/Icon";
 import SearchSelect from "../components/SearchSelect";
 import PrincipalSearch from "../components/PrincipalSearch";
-import FormSection from "../components/FormSection";
+import Modal, { ModalMessage, ModalSection } from "../components/Modal";
+import ConfirmDestructive from "../components/ConfirmDestructive";
+import { Checkbox, Field, Input, Select } from "../components/Field";
 import { addToList } from "../identities";
 import ScopedSecrets from "../components/ScopedSecrets";
 import SecretMatrixEditor from "../components/SecretMatrixEditor";
@@ -719,23 +721,8 @@ function EnvPanel(props: {
     listApprovalHistory(org, repo, name).catch(() => []),
   );
   const [error, setError] = createSignal<string | null>(null);
+  const [removing, setRemoving] = createSignal(false);
   const effective = () => props.env.effective;
-
-  const removeOverlay = async () => {
-    if (
-      !window.confirm(
-        `Remove ${props.repo}'s overlay on ${props.env.name}?\n\nIts deploys fall back to the org baseline.`,
-      )
-    )
-      return;
-    setError(null);
-    try {
-      await deleteEnvironmentOverlay(props.org, props.env.name, props.repo);
-      props.onChanged();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Could not remove the overlay.");
-    }
-  };
 
   return (
     <div class="panel env-panel">
@@ -790,7 +777,7 @@ function EnvPanel(props: {
                 </button>
               </Show>
               <Show when={props.env.overlay}>
-                <button class="btn btn-ghost btn-sm" onClick={removeOverlay}>
+                <button class="btn btn-ghost btn-sm" onClick={() => setRemoving(true)}>
                   remove
                 </button>
               </Show>
@@ -808,6 +795,29 @@ function EnvPanel(props: {
         </div>
         <Show when={error()}>
           <p class="error">{error()}</p>
+        </Show>
+        <Show when={removing()}>
+          <ConfirmDestructive
+            eyebrow={`${props.org}/${props.repo} · environments`}
+            title={`Remove ${props.repo}'s overlay on ${props.env.name}?`}
+            purpose="Its deploys there fall back to the org baseline."
+            name={props.env.name}
+            confirmLabel="Remove overlay"
+            onConfirm={async () => {
+              setError(null);
+              await deleteEnvironmentOverlay(props.org, props.env.name, props.repo);
+              props.onChanged();
+            }}
+            onClose={() => setRemoving(false)}
+          >
+            <Show when={props.env.overlay}>
+              {(o) => (
+                <p class="dlg-ctx">
+                  <span class="k">overlay now</span> {rulesSummary(o())}
+                </p>
+              )}
+            </Show>
+          </ConfirmDestructive>
         </Show>
         <div class="env-history">
           <div class="env-h-title mono">Approval history (legacy)</div>
@@ -895,115 +905,112 @@ function EnvDialog(props: {
     }
   };
 
+  const pickedEnv = () => (envs() ?? []).find((e) => e.name === picked());
+  const waitError = () => (picked() ? (built().error ?? null) : null);
+  // The footer's "after saving" line: the two layers a deploy must pass, as
+  // stored. The effective rules are the server's to compute, not merged here.
+  const afterSaving = () => {
+    const body = built().body;
+    if (!picked() || !body) return undefined;
+    return {
+      value: isPermissive(body)
+        ? `org baseline only: this overlay adds no rule`
+        : `org baseline, plus ${rulesSummary(body)}`,
+    };
+  };
+
   return (
-    <div class="modal-scrim" onClick={props.onClose}>
-      <div class="modal modal-tall" onClick={(e) => e.stopPropagation()}>
-        <div class="panel-h">
-          <span>Tighten for {props.repo}</span>
-        </div>
-        <div class="modal-body">
-          <FormSection n={1} title="Environment">
-            <Show
-              when={choices().length > 0}
-              fallback={
-                <p class="fieldnote">
-                  {envs.loading
-                    ? "loading…"
-                    : `${props.repo} may not deploy into any environment yet — an org admin makes it eligible under Settings › Environments.`}
-                </p>
-              }
-            >
-              <select
-                class="input mono"
-                aria-label="environment"
-                value={picked()}
-                onChange={(e) => setPicked(e.currentTarget.value)}
-              >
-                <option value="">environment…</option>
-                <For each={choices()}>
-                  {(env) => (
-                    <option value={env.name}>
-                      {env.name}
-                      {env.overlay ? " (has overlay)" : ""}
-                    </option>
-                  )}
-                </For>
-              </select>
-            </Show>
-          </FormSection>
-          <FormSection n={2} title="Extra approvers">
-            <input
-              class="input mono"
-              aria-label="extra approvers"
-              placeholder="comma-separated user ids (blank = none)"
-              value={approvers()}
-              onInput={(e) => setApprovers(e.currentTarget.value)}
-            />
-            {/* Approvers match a user id exactly and must name someone who
-                exists, so offer the search rather than leave people to guess
-                `github:alice` vs `alice`. */}
-            <PrincipalSearch
-              org={props.org}
-              placeholder="add an approver — find a user"
-              onPick={(id) => setApprovers(addToList(approvers(), id))}
-            />
-            <p class="fieldnote">Required in addition to the org baseline's approvers.</p>
-          </FormSection>
-          <FormSection n={3} title="Refs and timing">
-            <div class="form-r">
-              <label>allowed refs</label>
-              <input
-                class="input mono"
-                placeholder="comma-separated globs, e.g. refs/heads/main (blank = any)"
-                value={allowedRefs()}
-                onInput={(e) => setAllowedRefs(e.currentTarget.value)}
-              />
-              <p class="fieldnote">
-                A ref must match these <b>and</b> the baseline's. Use full refs —{" "}
-                <span class="mono">refs/heads/main</span>, not <span class="mono">main</span>.
-              </p>
-            </div>
-            <div class="form-r">
-              <label>wait timer (s)</label>
-              <input
-                class="input mono"
-                type="number"
-                min="0"
-                value={waitTimer()}
-                onInput={(e) => setWaitTimer(e.currentTarget.value)}
-              />
-              <p class="fieldnote">Recorded, not yet enforced.</p>
-            </div>
-            <label class="checkbox-inline">
-              <input
-                type="checkbox"
-                checked={requireReason()}
-                onInput={(e) => setRequireReason(e.currentTarget.checked)}
-              />
-              <span>manual and API dispatches must give a reason</span>
-            </label>
-          </FormSection>
-        </div>
-        <div class="modal-foot">
-          <Show when={problem() && picked()}>
-            <p class="error">{problem()}</p>
-          </Show>
+    <Modal
+      eyebrow={`${props.org}/${props.repo} · environments`}
+      title={picked() ? `Tighten ${picked()} for ${props.repo}` : `Tighten for ${props.repo}`}
+      purpose={`Rules set here apply only to ${props.repo}, and can only make its deploys stricter than the org baseline.`}
+      busy={saving()}
+      onClose={props.onClose}
+      after={afterSaving()}
+      footer={
+        <>
           <Show when={error()}>
-            <p class="error">{error()}</p>
+            <ModalMessage>{error()}</ModalMessage>
           </Show>
-          <div class="modal-actions">
-            <button class="btn btn-primary" disabled={!!problem() || saving()} onClick={save}>
-              <Icon icon="shield-check" size={14} /> {saving() ? "Saving…" : "Save overlay"}
-            </button>
-            <button class="btn btn-ghost" onClick={props.onClose}>Cancel</button>
-          </div>
-          <p class="subtle modal-note">
-            An overlay can only make {props.repo}'s deploys stricter than the org baseline.
-            Requires the Administer capability on this repo.
-          </p>
-        </div>
-      </div>
-    </div>
+          <button class="btn btn-ghost" type="button" onClick={props.onClose} disabled={saving()}>
+            Cancel
+          </button>
+          <button class="btn btn-primary" type="button" disabled={!!problem() || saving()} onClick={save}>
+            <Icon icon="shield-check" size={14} /> {saving() ? "Saving…" : "Save overlay"}
+          </button>
+        </>
+      }
+    >
+      <ModalSection n={1} title="Target">
+        <Show
+          when={choices().length > 0}
+          fallback={
+            <p class="dlg-text">
+              {envs.loading
+                ? "loading…"
+                : `${props.repo} may not deploy into any environment yet. An org admin makes it eligible under Settings › Environments.`}
+            </p>
+          }
+        >
+          <Field label="Environment" required help={`Environments ${props.repo} may deploy into.`}>
+            <Select mono value={picked()} onValue={setPicked}>
+              <option value="">environment…</option>
+              <For each={choices()}>
+                {(env) => (
+                  <option value={env.name}>
+                    {env.name}
+                    {env.overlay ? " (has overlay)" : ""}
+                  </option>
+                )}
+              </For>
+            </Select>
+          </Field>
+          <Show when={pickedEnv()}>
+            {(env) => (
+              <p class="dlg-ctx">
+                <span class="k">org baseline</span>{" "}
+                {isPermissive(env().baseline) ? "no rule yet" : rulesSummary(env().baseline)}
+              </p>
+            )}
+          </Show>
+        </Show>
+      </ModalSection>
+      <ModalSection n={2} title="Approvers">
+        <Field label="Extra approvers" help="Required in addition to the baseline's approvers. User ids, comma-separated.">
+          <Input mono value={approvers()} onValue={setApprovers} placeholder="none" />
+        </Field>
+        {/* Approvers match a user id exactly and must name someone who
+            exists, so offer the search rather than leave people to guess
+            `github:alice` vs `alice`. */}
+        <PrincipalSearch
+          org={props.org}
+          placeholder="Add an approver: find a user"
+          onPick={(id) => setApprovers(addToList(approvers(), id))}
+        />
+      </ModalSection>
+      <ModalSection n={3} title="Refs and timing">
+        <Field
+          label="Allowed refs"
+          help={
+            <>
+              A ref must match these and the baseline's. Use full refs:{" "}
+              <span class="mono">refs/heads/main</span>, not <span class="mono">main</span>.
+            </>
+          }
+        >
+          <Input mono value={allowedRefs()} onValue={setAllowedRefs} placeholder="blank allows any ref" />
+        </Field>
+        <Field label="Wait timer" help="Recorded, not yet enforced." error={waitError()}>
+          <Input mono inputmode="numeric" suffix="seconds" value={waitTimer()} onValue={setWaitTimer} />
+        </Field>
+        <Checkbox
+          checked={requireReason()}
+          onChecked={setRequireReason}
+          label="Require a reason"
+          help="Manual and API dispatches must give one."
+        />
+      </ModalSection>
+    </Modal>
   );
 }
 
