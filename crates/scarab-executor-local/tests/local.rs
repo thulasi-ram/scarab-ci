@@ -490,3 +490,33 @@ async fn secrets_are_files_and_env_only_when_asked() {
         "the secret files are removed once the step ended"
     );
 }
+
+/// A step whose process never starts leaves no secret files behind: no
+/// process will end to trigger the cleanup.
+#[tokio::test]
+async fn secret_files_are_removed_when_the_spawn_fails() {
+    let run = "r-secrets-spawn-fail";
+    let run_dir = std::env::temp_dir().join("scarab-local").join(run);
+    let _ = std::fs::remove_dir_all(&run_dir);
+    let exec = LocalExecutor::new();
+    let mut sp = spec(&["/nonexistent/scarab-no-such-program"]);
+    sp.secrets = vec!["DB_PASSWORD".into()];
+    sp.resolved_secrets = scarab_engine::ResolvedSecrets(vec![("DB_PASSWORD".into(), "pw".into())]);
+
+    assert!(exec.launch(&step(run, "deploy"), &sp).await.is_err());
+
+    let mut left = Vec::new();
+    let mut dirs = vec![run_dir];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path.ends_with("scarab/secrets") {
+                    left.push(path.clone());
+                }
+                dirs.push(path);
+            }
+        }
+    }
+    assert!(left.is_empty(), "secret files left behind: {left:?}");
+}

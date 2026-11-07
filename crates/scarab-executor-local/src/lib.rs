@@ -290,8 +290,10 @@ impl Executor for LocalExecutor {
         // an env var. A host process cannot mount at `/scarab/secrets`.
         let secrets_dir = Self::secrets_dir(&workdir);
         if !spec.resolved_secrets.is_empty() {
-            write_secret_files(&secrets_dir, spec)
-                .map_err(|e| ExecError::Launch(format!("secrets dir: {e}")))?;
+            if let Err(e) = write_secret_files(&secrets_dir, spec) {
+                let _ = std::fs::remove_dir_all(&secrets_dir);
+                return Err(ExecError::Launch(format!("secrets dir: {e}")));
+            }
         }
 
         let mut cmd = Command::new(program);
@@ -320,9 +322,15 @@ impl Executor for LocalExecutor {
             )
             .env("SCARAB_RESULTS", &results_dir);
 
-        let child = cmd
-            .spawn()
-            .map_err(|e| ExecError::Launch(format!("spawn `{program}`: {e}")))?;
+        let child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                // No process will end to trigger the cleanup: remove the
+                // secret files now.
+                let _ = std::fs::remove_dir_all(&secrets_dir);
+                return Err(ExecError::Launch(format!("spawn `{program}`: {e}")));
+            }
+        };
 
         // Kill-timer deadline (ADR-0047): the step's authored timeout or the
         // configured global default.
