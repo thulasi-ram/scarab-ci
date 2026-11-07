@@ -374,6 +374,15 @@ pub struct Deployment {
     pub at: i64,
 }
 
+/// The gate wait a [`Deployment`] record belongs to: the Environment
+/// approval gate Step and the Attempt that opened the wait. The history
+/// holds at most one record per wait (git-bug 1d06f2d).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalWait {
+    pub gate: String,
+    pub attempt: String,
+}
+
 /// Errors from the projects/environments store.
 #[derive(Debug, thiserror::Error)]
 pub enum ProjectError {
@@ -425,8 +434,14 @@ pub trait EnvironmentStore: Send + Sync {
         name: &str,
     ) -> Result<(), ProjectError>;
 
-    /// Append a deployment to an environment's history.
-    async fn record_deployment(&self, deployment: &Deployment) -> Result<(), ProjectError>;
+    /// Append a deployment to an environment's history. With `wait`, a
+    /// second record for the same wait (two approvals that met the rules at
+    /// once) is not written.
+    async fn record_deployment(
+        &self,
+        deployment: &Deployment,
+        wait: Option<&ApprovalWait>,
+    ) -> Result<(), ProjectError>;
 
     /// The deployment history for an environment, most recent first.
     async fn deployments(

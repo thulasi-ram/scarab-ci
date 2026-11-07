@@ -3621,12 +3621,22 @@ impl EnvironmentStore for PostgresDb {
         Ok(())
     }
 
-    async fn record_deployment(&self, d: &Deployment) -> Result<(), ProjectError> {
+    async fn record_deployment(
+        &self,
+        d: &Deployment,
+        wait: Option<&scarab_project::ApprovalWait>,
+    ) -> Result<(), ProjectError> {
         let approved =
             serde_json::to_value(&d.approved_by).map_err(|e| ProjectError::Store(e.to_string()))?;
+        // One row per gate wait (git-bug 1d06f2d): the unique index on
+        // (run_id, gate_step, gate_attempt) turns a racing second record
+        // into nothing. A record with no wait never collides.
         sqlx::query(
-            "INSERT INTO deployments (org, project, environment, git_ref, run_id, approved_by, at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            "INSERT INTO deployments
+                 (org, project, environment, git_ref, run_id, approved_by, at, gate_step,
+                  gate_attempt)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+             ON CONFLICT (run_id, gate_step, gate_attempt) DO NOTHING",
         )
         .bind(&d.org)
         .bind(&d.project)
@@ -3635,6 +3645,8 @@ impl EnvironmentStore for PostgresDb {
         .bind(&d.run)
         .bind(approved)
         .bind(d.at)
+        .bind(wait.map(|w| w.gate.as_str()))
+        .bind(wait.map(|w| w.attempt.as_str()))
         .execute(self.pool())
         .await
         .map_err(|e| ProjectError::Store(e.to_string()))?;

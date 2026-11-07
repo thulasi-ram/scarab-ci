@@ -804,6 +804,21 @@ async fn a_timer_released_gate_has_its_deployment_record() {
     assert_eq!(records.len(), 2, "{records:?}");
     assert_eq!(records[0].run, at_once.0);
 
+    // git-bug 1d06f2d: each record names the gate wait it belongs to, which
+    // is what makes a racing second record a no-op.
+    let keys: Vec<(String, Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT run_id, gate_step, gate_attempt FROM deployments ORDER BY at")
+            .fetch_all(&tdb.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        keys,
+        vec![
+            (run.0.clone(), Some("approve".into()), Some("a1".into())),
+            (at_once.0.clone(), Some("approve".into()), Some("a1".into())),
+        ]
+    );
+
     tdb.cleanup().await;
 }
 

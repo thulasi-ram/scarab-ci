@@ -10186,9 +10186,11 @@ async fn approve_gate(
         None
     };
     let now = st.clock.now().await.0;
-    // When the gate's current wait began: what the wait timer counts from.
-    // No open wait yet: count from now, which only waits longer.
-    let wait_began = st
+    // The gate's current wait: its open Attempt. When it began is what the
+    // wait timer counts from (no open wait yet: count from now, which only
+    // waits longer); its id keys the approval history to one record per wait
+    // (git-bug 1d06f2d).
+    let open_wait = st
         .db
         .steps_of_run(&run)
         .await
@@ -10199,9 +10201,13 @@ async fn approve_gate(
             s.attempts
                 .last()
                 .filter(|a| a.outcome == scarab_engine::AttemptOutcome::Running)
-                .map(|a| a.started_at.0)
-        })
-        .unwrap_or(now);
+                .map(|a| (a.started_at.0, a.id.0.clone()))
+        });
+    let wait_began = open_wait.as_ref().map_or(now, |(at, _)| *at);
+    let wait = open_wait.map(|(_, attempt)| scarab_project::ApprovalWait {
+        gate: step.0.clone(),
+        attempt,
+    });
     let release_rule = |approvals: &[String]| {
         rules.map(|(c, p)| {
             scarab_policy::environment_rules::gate_release(
@@ -10383,7 +10389,7 @@ async fn approve_gate(
         // here whichever path releases the gate.
         if recorded.is_none() {
             if let Some((c, _)) = rules {
-                record_deployment(&st, c, &run, &approvers, now).await?;
+                record_deployment(&st, c, &run, &approvers, now, wait.as_ref()).await?;
             }
         }
         if release.result.outcome != scarab_policy::evaluate::PolicyOutcome::Passed {
@@ -10435,7 +10441,7 @@ async fn approve_gate(
     if released && approval_gate && rules.is_none() {
         if let Some(c) = &ctx {
             let now = st.clock.now().await.0;
-            record_deployment(&st, c, &run, &approvers, now).await?;
+            record_deployment(&st, c, &run, &approvers, now, wait.as_ref()).await?;
         }
     }
 
@@ -10451,27 +10457,31 @@ async fn approve_gate(
 }
 
 /// Write one deploy of `run` to the legacy approval history, when a history
-/// store is wired.
+/// store is wired: at most one per gate `wait`.
 async fn record_deployment(
     st: &AppState,
     c: &scarab_engine::DeployContext,
     run: &RunId,
     approvers: &[String],
     at: i64,
+    wait: Option<&scarab_project::ApprovalWait>,
 ) -> Result<(), ApiError> {
     let Some(store) = st.environments.as_ref() else {
         return Ok(());
     };
     store
-        .record_deployment(&scarab_project::Deployment {
-            org: c.org.clone(),
-            project: c.project.clone(),
-            environment: c.environment.clone(),
-            git_ref: c.git_ref.clone(),
-            run: run.0.clone(),
-            approved_by: approvers.to_vec(),
-            at,
-        })
+        .record_deployment(
+            &scarab_project::Deployment {
+                org: c.org.clone(),
+                project: c.project.clone(),
+                environment: c.environment.clone(),
+                git_ref: c.git_ref.clone(),
+                run: run.0.clone(),
+                approved_by: approvers.to_vec(),
+                at,
+            },
+            wait,
+        )
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))
 }
