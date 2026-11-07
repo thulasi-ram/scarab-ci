@@ -528,7 +528,7 @@ async fn a_step_that_never_starts_fails_at_the_provisioning_deadline_not_as_a_ti
     exec.script_outcome(ExecState::Pending);
     tick(&db, &clock, &exec).await; // a1 launches; the Pod is Pending
 
-    let deadline_ms = i64::from(scarab_engine::DEFAULT_PROVISIONING_DEADLINE_SECS) * 1000;
+    let deadline_ms = i64::from(scarab_engine::PROVISIONING_DEADLINE_SECS) * 1000;
     clock.advance(deadline_ms - 1_000 - 1);
     tick(&db, &clock, &exec).await;
     assert_eq!(attempts(&db).await[0].failure, None, "inside the deadline");

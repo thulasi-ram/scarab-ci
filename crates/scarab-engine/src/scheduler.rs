@@ -53,7 +53,7 @@ const TIMEOUT_BACKSTOP_GRACE_MS: i64 = 60_000;
 /// auto-retry), not as a `Timeout`. The k8s executor adds the same number to
 /// the Pod's `activeDeadlineSeconds`, because one Pod deadline cannot be
 /// split into the two. One constant, read by both, so the two cannot drift.
-pub const DEFAULT_PROVISIONING_DEADLINE_SECS: u32 = 30 * 60;
+pub const PROVISIONING_DEADLINE_SECS: u32 = 30 * 60;
 use crate::{
     ports::WorkspaceSnapshots, Attempt, AttemptFrontier, AttemptId, AttemptOutcome, AttemptStamp,
     Clock, ConcurrencyPolicy, Db, DbError, EventKind, EventPayload, ExecError, Executor,
@@ -3800,8 +3800,7 @@ impl<'a> Scheduler<'a> {
                 }
             };
 
-            let state = self.executor.poll(&handle).await?;
-            match state {
+            match self.executor.poll(&handle).await? {
                 ExecState::Succeeded => {
                     // Record the output workspace snapshot (if the backend
                     // produced one) so dependents can materialize it, plus its
@@ -3920,9 +3919,9 @@ impl<'a> Scheduler<'a> {
                 // never-started infra failure, not a `Timeout`. The run
                 // budget is left as it is: `enforce_run_budget` sums the
                 // Run's own Running intervals, which is a different question.
-                running @ (ExecState::Pending | ExecState::Running) => {
+                observed @ (ExecState::Pending | ExecState::Running) => {
                     let now = self.clock.now().await;
-                    let execution_started = if running == ExecState::Running {
+                    let execution_started = if observed == ExecState::Running {
                         Some(
                             self.db
                                 .mark_attempt_execution_started(&run, &step, &attempt, now)
@@ -3947,7 +3946,7 @@ impl<'a> Scheduler<'a> {
                                 .iter()
                                 .find(|a| a.id == attempt)
                                 .map(|a| a.started_at);
-                            let deadline = i64::from(DEFAULT_PROVISIONING_DEADLINE_SECS) * 1000;
+                            let deadline = i64::from(PROVISIONING_DEADLINE_SECS) * 1000;
                             claimed.filter(|c| now.0 >= c.0 + deadline).map(|_| {
                                 (
                                     FailureKind::Infra {

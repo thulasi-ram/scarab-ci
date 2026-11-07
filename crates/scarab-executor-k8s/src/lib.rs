@@ -5663,10 +5663,14 @@ pub fn pod_state(pod: &Pod) -> ExecState {
             // container state (observed on k3s enforcing
             // activeDeadlineSeconds). Classifying that snapshot would misread
             // a timeout as never-started infra. A Failed phase never reverts,
-            // so defer: report Pending and classify on the next poll, when the
-            // settled status (e.g. `reason: DeadlineExceeded`) has landed. The
-            // engine's timeout backstop bounds the pathological
-            // never-settling case.
+            // so defer and classify on the next poll, when the settled status
+            // (e.g. `reason: DeadlineExceeded`) has landed. While deferring,
+            // report Running if the step container ever started and Pending
+            // only if it did not: the engine reads Pending as "the step has
+            // not started" and fails an attempt still Pending at its
+            // provisioning deadline as never started, which is auto-retried
+            // (git-bug cfb5edb). A step that ran must instead fall to its
+            // timeout, which is not.
             let reason = pod.status.as_ref().and_then(|s| s.reason.as_deref());
             // `ContainerStatusUnknown` means the kubelet could not locate the
             // container when the Pod was killed — its exit code (137) is
@@ -5675,7 +5679,11 @@ pub fn pod_state(pod: &Pod) -> ExecState {
                 step_terminated_reason(pod).as_deref() == Some("ContainerStatusUnknown");
             let no_verdict = exit_code.is_none() && step_terminated_reason(pod).is_none();
             if reason.is_none() && (no_verdict || synthetic) {
-                return ExecState::Pending;
+                return if step_container_started(pod) {
+                    ExecState::Running
+                } else {
+                    ExecState::Pending
+                };
             }
             let (class, cause) = classify_failed_pod(pod, exit_code);
             ExecState::Failed {
@@ -5855,7 +5863,7 @@ fn classify_failed_pod(pod: &Pod, exit_code: Option<i32>) -> (FailureClass, Opti
 /// The Pod's `activeDeadlineSeconds` for a step timeout of `timeout_secs`:
 /// the engine's provisioning deadline plus the timeout (git-bug cfb5edb).
 fn pod_deadline_secs(timeout_secs: u32) -> u32 {
-    timeout_secs.saturating_add(scarab_engine::DEFAULT_PROVISIONING_DEADLINE_SECS)
+    timeout_secs.saturating_add(scarab_engine::PROVISIONING_DEADLINE_SECS)
 }
 
 /// The class of a Pod killed at its `activeDeadlineSeconds`. The deadline
@@ -9448,9 +9456,7 @@ mod tests {
         let ps = pod.spec.as_ref().unwrap();
         assert_eq!(
             ps.active_deadline_seconds,
-            Some(i64::from(
-                120 + scarab_engine::DEFAULT_PROVISIONING_DEADLINE_SECS
-            )),
+            Some(i64::from(120 + scarab_engine::PROVISIONING_DEADLINE_SECS)),
             "the Pod deadline adds the provisioning deadline; the wsfetch windows do not"
         );
         let inits = ps.init_containers.as_ref().unwrap();
@@ -10883,7 +10889,7 @@ mod tests {
         assert_eq!(
             pod.spec.as_ref().unwrap().active_deadline_seconds,
             Some(i64::from(
-                DEFAULT_STEP_TIMEOUT_SECS + scarab_engine::DEFAULT_PROVISIONING_DEADLINE_SECS
+                DEFAULT_STEP_TIMEOUT_SECS + scarab_engine::PROVISIONING_DEADLINE_SECS
             )),
         );
         // Authored `timeout:` overrides it (ADR-0047).
@@ -10901,9 +10907,7 @@ mod tests {
         );
         assert_eq!(
             pod.spec.as_ref().unwrap().active_deadline_seconds,
-            Some(i64::from(
-                120 + scarab_engine::DEFAULT_PROVISIONING_DEADLINE_SECS
-            ))
+            Some(i64::from(120 + scarab_engine::PROVISIONING_DEADLINE_SECS))
         );
     }
 
@@ -11287,6 +11291,18 @@ mod tests {
             // enforcing activeDeadlineSeconds).
             let pod = failed_pod(None, None);
             assert_eq!(pod_state(&pod), ExecState::Pending);
+        }
+
+        /// git-bug cfb5edb: the same deferred snapshot of a step that DID run
+        /// (here the kubelet lost the container) reports Running, not
+        /// Pending. Pending tells the engine the step never started, and an
+        /// attempt still Pending at its provisioning deadline is retried
+        /// automatically as never started, so a step that ran would run
+        /// again.
+        #[test]
+        fn a_deferred_snapshot_of_a_step_that_ran_reports_running() {
+            let pod = failed_pod(None, Some(terminated(137, Some("ContainerStatusUnknown"))));
+            assert_eq!(pod_state(&pod), ExecState::Running);
         }
 
         #[test]

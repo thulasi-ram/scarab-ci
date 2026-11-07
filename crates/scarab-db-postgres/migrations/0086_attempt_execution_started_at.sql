@@ -8,4 +8,6 @@ ALTER TABLE attempts ADD COLUMN execution_started_at BIGINT;
 --
 -- Expand step (ADR-0003): a nullable column only. A server built before this
 -- migration refuses to boot against a database that has it; to roll back,
--- delete row 86 from `_sqlx_migrations`. The column is harmless to old code.
+-- delete row 86 from `_sqlx_migrations` and drop the column (leaving it makes
+-- the next roll-forward fail on ADD COLUMN). The column is harmless to old
+-- code.

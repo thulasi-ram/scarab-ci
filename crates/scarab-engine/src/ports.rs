@@ -217,7 +217,14 @@ pub enum FailureClass {
 /// Observed state of a launched execution when polled.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExecState {
+    /// The step's process has not started (scheduling, image pull, workspace
+    /// fetch). An executor reports this only when it has no evidence the
+    /// process ever started: the engine fails an attempt still Pending at
+    /// its provisioning deadline as never started, and retries it
+    /// automatically (git-bug cfb5edb).
     Pending,
+    /// The step's process has started, or did start and its verdict is not
+    /// readable yet.
     Running,
     Succeeded,
     /// Terminal failure, classified by the adapter (ADR-0047). `exit_code` is

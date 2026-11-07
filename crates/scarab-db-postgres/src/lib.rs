@@ -2255,10 +2255,20 @@ impl Db for PostgresDb {
         attempt: &AttemptId,
         at: Timestamp,
     ) -> Result<Timestamp, DbError> {
+        // Writes only while the column is NULL, so the poll of a Running
+        // attempt that is already stamped writes no new row version.
         let row = sqlx::query(
-            "UPDATE attempts SET execution_started_at = COALESCE(execution_started_at, $4)
+            "WITH stamped AS (
+                 UPDATE attempts SET execution_started_at = $4
+                 WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3
+                   AND execution_started_at IS NULL
+                 RETURNING execution_started_at
+             )
+             SELECT execution_started_at FROM stamped
+             UNION ALL
+             SELECT execution_started_at FROM attempts
              WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3
-             RETURNING execution_started_at",
+               AND NOT EXISTS (SELECT 1 FROM stamped)",
         )
         .bind(&run.0)
         .bind(&step.0)

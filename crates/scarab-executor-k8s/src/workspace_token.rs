@@ -99,7 +99,7 @@ pub const WORKSPACE_TOKEN_MAX_TTL_SECS: i64 = 24 * 60 * 60;
 
 const _: () = assert!(
     scarab_pipeline::MAX_STEP_TIMEOUT_SECS as i64
-        + scarab_engine::DEFAULT_PROVISIONING_DEADLINE_SECS as i64
+        + scarab_engine::PROVISIONING_DEADLINE_SECS as i64
         + WORKSPACE_TOKEN_GRACE_SECS
         <= WORKSPACE_TOKEN_MAX_TTL_SECS,
     "the validation-side step-timeout ceiling must leave the workspace token \
@@ -553,8 +553,8 @@ mod tests {
     /// valid pipeline. The cap only bites timeouts validation already refuses.
     #[test]
     fn the_maximal_valid_timeout_keeps_the_full_drain_grace() {
-        let ceiling = scarab_pipeline::MAX_STEP_TIMEOUT_SECS
-            + scarab_engine::DEFAULT_PROVISIONING_DEADLINE_SECS;
+        let ceiling =
+            scarab_pipeline::MAX_STEP_TIMEOUT_SECS + scarab_engine::PROVISIONING_DEADLINE_SECS;
         let exp = expiry_for(0, ceiling);
         assert_eq!(exp, i64::from(ceiling) + WORKSPACE_TOKEN_GRACE_SECS);
         assert!(exp <= WORKSPACE_TOKEN_MAX_TTL_SECS);
