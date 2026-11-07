@@ -76,6 +76,8 @@ An Environment's baseline protection rules are:
 - **Approval gate settings** (baseline only): what happens when a pipeline has no gate (add one, the
   default, or refuse the Run), the expiry of the gate the Environment adds, how many of the
   approvers must approve (default: every one), and the maximum approval age (default 24 hours).
+  Where only some of the approvers must approve, adding an approver needs a step-up, as removing
+  one does.
 
 A Project's admins can add a **tighten-only overlay** for their Project: more approvers (each one
 required, whatever the baseline's count), a narrower ref pattern, `require_reason`, a longer timer. An overlay can make that Project's Runs
