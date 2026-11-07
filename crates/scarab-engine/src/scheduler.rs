@@ -1898,6 +1898,22 @@ pub async fn cancel_run_request(
     Ok(true)
 }
 
+/// Whether the Run's latest operator cancel request still stands: no rerun
+/// or retry was requested after it (git-bug 0962583).
+fn cancel_request_stands(events: &[EventKind]) -> bool {
+    let mut stands = false;
+    for e in events {
+        match &e.kind {
+            EventPayload::RunCancelRequested { .. } => stands = true,
+            EventPayload::RunRerunRequested { .. } | EventPayload::StepRetryRequested { .. } => {
+                stands = false
+            }
+            _ => {}
+        }
+    }
+    stands
+}
+
 /// The [`CANCEL_ATTEMPT`] intent for one attempt of `step` whose unit must
 /// go: the driver tears down exactly that attempt's unit, until it is gone.
 ///
@@ -4244,7 +4260,18 @@ impl<'a> Scheduler<'a> {
         let outcome = if !dead.is_empty() {
             RunStatus::DeadLettered
         } else if failed {
-            RunStatus::Failed
+            // An operator cancel writes its request first, then each Step,
+            // then the Run (`cancel_run_request`). Interrupted before the
+            // Run's commit, it left Cancelled Steps that this pass could not
+            // tell from a failure, so the Run settled Failed and a re-sent
+            // cancel found it terminal (git-bug 0962583). A cancel request
+            // no rerun or retry has answered since finishes the cancel here.
+            let cancelled = steps.iter().any(|s| s.status == StepStatus::Cancelled);
+            if cancelled && cancel_request_stands(&self.db.events(run).await?) {
+                RunStatus::Cancelled
+            } else {
+                RunStatus::Failed
+            }
         } else {
             RunStatus::Succeeded
         };

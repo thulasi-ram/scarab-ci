@@ -499,8 +499,9 @@ async fn a_cancel_failing_after_its_intent_neither_kills_a_live_run_nor_orphans_
 // terminal (Ok(false)). An operator cancel ends as a red Failed run with a
 // failure commit status.
 // ---------------------------------------------------------------------------
+// Fixed (git-bug 0962583): `advance` settles a Run whose operator cancel
+// request still stands as Cancelled.
 #[tokio::test]
-#[ignore = "redteam: BROKE crash between cancel's step commits and its run commit — advance settles the run Failed, re-sent cancel is a no-op"]
 async fn a_cancel_interrupted_before_its_run_commit_still_ends_cancelled() {
     let w = World::inmemory().await;
     w.seed_deploy("ra", None).await;
