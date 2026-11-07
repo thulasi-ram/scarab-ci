@@ -37,6 +37,7 @@ pub(crate) fn org_environment_from_row(
     Ok(OrgEnvironment {
         org: row.get("org"),
         name,
+        display_name: row.get("display_name"),
         description: row.get("description"),
         protection,
         eligibility,
@@ -96,7 +97,7 @@ pub(crate) fn baseline_rules_from_row(
 }
 
 pub(crate) const ORG_ENVIRONMENT_COLUMNS: &str =
-    "org, name, description, created_at, updated_at, updated_by, \
+    "org, name, display_name, description, created_at, updated_at, updated_by, \
      approvers, allowed_refs, wait_timer_s, require_reason, eligible_all_projects, \
      missing_gate_mode, added_gate_expiry_s, required_approvals, max_approval_age_s";
 
@@ -143,9 +144,10 @@ impl OrgEnvironmentStore for PostgresDb {
             .map_err(org_environment_store_err)?;
         let stored_row = sqlx::query(&format!(
             "INSERT INTO org_environments
-                 (org, name, description, created_at, updated_at, updated_by)
-             VALUES ($1, $2, $3, $4, $5, $6)
+                 (org, name, display_name, description, created_at, updated_at, updated_by)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
              ON CONFLICT (org, name) DO UPDATE SET
+                 display_name = EXCLUDED.display_name,
                  description = EXCLUDED.description,
                  updated_at = EXCLUDED.updated_at,
                  updated_by = EXCLUDED.updated_by
@@ -153,6 +155,7 @@ impl OrgEnvironmentStore for PostgresDb {
         ))
         .bind(&env.org)
         .bind(&env.name)
+        .bind(&env.display_name)
         .bind(&env.description)
         .bind(env.created_at)
         .bind(env.updated_at)

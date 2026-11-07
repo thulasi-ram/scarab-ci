@@ -29,6 +29,7 @@ pub async fn seed_migrated_environment(
             .put_org_environment(&OrgEnvironment {
                 org: org.into(),
                 name: name.into(),
+                display_name: None,
                 description: String::new(),
                 protection: Default::default(),
                 eligibility: Default::default(),

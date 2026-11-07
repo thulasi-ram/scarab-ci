@@ -249,6 +249,12 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
         "CJ-W",
     ),
     (
+        "POST",
+        "/v1/orgs/{org}/environments/{env}/duplicate",
+        "environment.duplicate",
+        "CJ-W",
+    ),
+    (
         "PUT",
         "/v1/orgs/{org}/environments/{env}/eligibility",
         "environment.eligibility.put",
@@ -908,6 +914,9 @@ fn well_formed(r: &scarab_server::RouteEntry) -> (String, Option<Value>) {
             Some(json!({"content_hash": "a".repeat(64)}))
         }
         ("POST", "/v1/orgs/{org}/library-defaults/retry") => Some(json!({})),
+        ("POST", "/v1/orgs/{org}/environments/{env}/duplicate") => {
+            Some(json!({"name": "prod-copy"}))
+        }
         ("POST", "/v1/orgs/{org}/library-trust") => {
             Some(json!({"source": "github.com/acme/libs//push.yaml"}))
         }

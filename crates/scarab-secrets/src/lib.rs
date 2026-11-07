@@ -79,6 +79,26 @@ impl SecretScope {
     }
 }
 
+/// The Project of an `env:{org}/{project}/{environment}` scope key — the
+/// flat form both stores key an [`SecretScope::EnvironmentProject`] by — when
+/// it is `environment`'s in `org`; `None` for any other key. The Project is
+/// read as the part between the two: it must be non-empty and hold no `/`
+/// (a forge repository name never does), so a key of Environment `prod/eu`
+/// is never read as Project `web/prod` of Environment `eu`.
+pub fn environment_project_of_scope_key(
+    scope_key: &str,
+    org: &str,
+    environment: &str,
+) -> Option<String> {
+    let project = scope_key
+        .strip_prefix("env:")?
+        .strip_prefix(org)?
+        .strip_prefix('/')?
+        .strip_suffix(environment)?
+        .strip_suffix('/')?;
+    (!project.is_empty() && !project.contains('/')).then(|| project.to_string())
+}
+
 /// Errors from secret operations.
 #[derive(Debug, thiserror::Error)]
 pub enum SecretError {
@@ -103,6 +123,25 @@ pub trait SecretProvider: Send + Sync {
     async fn list_scoped(&self, scope: &SecretScope) -> Result<Vec<String>, SecretError>;
     /// Delete a secret at `scope`. Idempotent: deleting an absent key is Ok.
     async fn delete(&self, scope: &SecretScope, key: &str) -> Result<(), SecretError>;
+
+    /// The Projects holding at least one secret in their
+    /// [`SecretScope::EnvironmentProject`] of `environment` in `org`, sorted
+    /// — what duplicating an Environment copies (git-bug d002a0c). Project
+    /// names never contain `/` (they are forge repository names), which is
+    /// what lets a store read them back out of a flat scope key.
+    ///
+    /// A store that cannot enumerate its scopes answers
+    /// [`SecretError::Backend`], so a caller that needs the full list fails
+    /// rather than copying part of it.
+    async fn environment_secret_projects(
+        &self,
+        _org: &str,
+        _environment: &str,
+    ) -> Result<Vec<String>, SecretError> {
+        Err(SecretError::Backend(
+            "this secret store cannot list the projects holding secrets in an environment".into(),
+        ))
+    }
 
     /// Resolve `key` **with inheritance** (ADR-0014, 0037): try each scope in
     /// [`SecretScope::resolution_chain`] from most to least specific, returning
@@ -218,6 +257,22 @@ mod tests {
         async fn delete(&self, _: &SecretScope, _: &str) -> Result<(), SecretError> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn a_project_is_read_back_only_from_its_own_environment_scope_key() {
+        let of = environment_project_of_scope_key;
+        assert_eq!(of("env:acme/web/prod", "acme", "prod"), Some("web".into()));
+        assert_eq!(
+            of("env:acme/web/prod/eu", "acme", "prod/eu"),
+            Some("web".into())
+        );
+        // Environment `eu`'s key never matches a project holding `/`.
+        assert_eq!(of("env:acme/web/prod/eu", "acme", "eu"), None);
+        assert_eq!(of("env:acme/web/prod", "acme", "staging"), None);
+        assert_eq!(of("env:acmex/web/prod", "acme", "prod"), None);
+        assert_eq!(of("env:acme//prod", "acme", "prod"), None);
+        assert_eq!(of("repo:acme/prod", "acme", "prod"), None);
     }
 
     #[test]

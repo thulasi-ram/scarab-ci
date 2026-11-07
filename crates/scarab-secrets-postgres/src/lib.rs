@@ -640,6 +640,33 @@ impl SecretProvider for PostgresSecrets {
             .map_err(|e| SecretError::Backend(e.to_string()))?;
         Ok(())
     }
+
+    async fn environment_secret_projects(
+        &self,
+        org: &str,
+        environment: &str,
+    ) -> Result<Vec<String>, SecretError> {
+        // `starts_with`/`right` rather than LIKE: org and Environment names
+        // may hold `%` and `_`. The exact Project is read back in Rust.
+        let prefix = format!("env:{org}/");
+        let suffix = format!("/{environment}");
+        let scopes: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT scope FROM secrets
+             WHERE starts_with(scope, $1) AND right(scope, char_length($2)) = $2",
+        )
+        .bind(&prefix)
+        .bind(&suffix)
+        .fetch_all(self.pool())
+        .await
+        .map_err(|e| SecretError::Backend(e.to_string()))?;
+        let mut projects: Vec<String> = scopes
+            .iter()
+            .filter_map(|s| scarab_secrets::environment_project_of_scope_key(s, org, environment))
+            .collect();
+        projects.sort();
+        projects.dedup();
+        Ok(projects)
+    }
 }
 
 /// The version byte every [`Sealer`] seal from this adapter starts with.

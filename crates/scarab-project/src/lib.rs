@@ -19,8 +19,10 @@ use serde::{Deserialize, Serialize};
 /// legacy shape the migration reads.
 mod org_environment;
 pub use org_environment::{
+    duplicate_display_name, normalize_display_name, validate_org_environment_display_name,
     validate_org_environment_name, OrgEnvironment, OrgEnvironmentError, OrgEnvironmentStore,
-    MAX_INSTALLATION_NAME_CHARS, MAX_ORG_ENVIRONMENT_DESCRIPTION_CHARS,
+    DUPLICATE_DISPLAY_NAME_SUFFIX, MAX_INSTALLATION_NAME_CHARS,
+    MAX_ORG_ENVIRONMENT_DESCRIPTION_CHARS, MAX_ORG_ENVIRONMENT_DISPLAY_NAME_CHARS,
 };
 
 /// The org-level Environment's governance model and its pure resolution
@@ -32,9 +34,9 @@ pub use environment_governance::{
     effective_protection, migrate_legacy_environment, AllowedRefConstraint, ApprovalGateRules,
     DeployGovernance, EffectiveProtection, EnvironmentGovernanceStore,
     EnvironmentMigrationAcknowledgement, EnvironmentMigrationReport,
-    EnvironmentMigrationReportProject, EnvironmentProjectEligibility, EnvironmentProjectOverlay,
-    EnvironmentProjectPrivilegeGrant, EnvironmentProjectRecord, EnvironmentProtectionRules,
-    LegacyRuleField, MissingGateMode, DEFAULT_MAX_APPROVAL_AGE_S,
+    EnvironmentMigrationReportProject, EnvironmentNameClaim, EnvironmentProjectEligibility,
+    EnvironmentProjectOverlay, EnvironmentProjectPrivilegeGrant, EnvironmentProjectRecord,
+    EnvironmentProtectionRules, LegacyRuleField, MissingGateMode, DEFAULT_MAX_APPROVAL_AGE_S,
 };
 
 /// Which Environment governance edits loosen it (ADR-0073 §3): the pure,

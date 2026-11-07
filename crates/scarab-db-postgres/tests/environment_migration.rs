@@ -143,6 +143,19 @@ async fn apply_through(pool: &PgPool, last_version: i64) {
     }
 }
 
+/// Every migration after `version`, in order: what a database migrated
+/// through 0057 meets on the next upgrade, and the schema the store code
+/// reads (it selects columns later migrations added, such as 0080's
+/// `display_name`).
+async fn apply_after(pool: &PgPool, version: i64) {
+    for m in MIGRATOR.iter().filter(|m| m.version > version) {
+        sqlx::raw_sql(&m.sql)
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("apply migration {}: {e}", m.version));
+    }
+}
+
 async fn apply_0057(pool: &PgPool) {
     let m = MIGRATOR
         .iter()
@@ -287,14 +300,9 @@ async fn backfill_reproduces_the_pure_migration_and_is_a_no_op_the_second_time()
         "a second backfill changes nothing"
     );
 
-    // The store reads the schema as it is now: the migrations after 0057
-    // (0079 adds the approval gate settings to `org_environments`).
-    for m in MIGRATOR.iter().filter(|m| m.version > 57) {
-        sqlx::raw_sql(&m.sql)
-            .execute(&pool)
-            .await
-            .unwrap_or_else(|e| panic!("apply migration {}: {e}", m.version));
-    }
+    // The store below reads today's schema (0079 adds the approval gate
+    // settings, 0080 the display name).
+    apply_after(&pool, 57).await;
     let db = PostgresDb::with_pool(pool.clone());
 
     // The legacy rows are frozen, not dropped, and still read as legacy rules.

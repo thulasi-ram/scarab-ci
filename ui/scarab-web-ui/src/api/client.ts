@@ -675,6 +675,22 @@ export async function deleteOrgEnvironment(org: string, env: string): Promise<vo
   }
 }
 
+/** A duplicate's answer: the new Environment, what was copied, and what was
+ *  not (the checklist). */
+export type DuplicateEnvironmentResult = components["schemas"]["DuplicateOrgEnvironmentResponse"];
+export type DuplicateEnvironmentRequest = components["schemas"]["DuplicateOrgEnvironmentRequest"];
+
+/** Copy an Environment under a new name (`POST …/environments/{env}/duplicate`),
+ *  org admins only, after a step-up. The old one is not changed. */
+export async function duplicateOrgEnvironment(
+  org: string,
+  env: string,
+  body: DuplicateEnvironmentRequest,
+): Promise<DuplicateEnvironmentResult> {
+  const res = await send(`${envPath(org, env)}/duplicate`, "POST", body);
+  return (await res.json()) as DuplicateEnvironmentResult;
+}
+
 /** The baseline PUT body. */
 export type PutProtectionRequest = components["schemas"]["PutEnvironmentProtectionRequest"];
 /** Which Projects may deploy into an Environment. */
@@ -1467,13 +1483,14 @@ export async function cancelRun(id: string): Promise<void> {
  * path returns `{approvals, released}`, but the late/duplicate-approval branch
  * returns only `{released: true}`. Reading `.approvals.length` unguarded throws
  * on that second shape. */
-export type GateApproval = { approvals?: string[]; released: boolean };
+export type GateApproval = { approvals?: string[]; released: boolean; releases_at?: number | null };
 
-/** Approve a `manual` gate (ADR-0008/0037). Append-only and idempotent: the
+/** Approve a `manual` gate. Append-only and idempotent: the
  * principal's approval is RECORDED, and the gate releases only once the
  * accumulated approvers satisfy the target environment's protection rules — a
- * plain gate with no environment releases on the first approval. So `released:
- * false` is a normal outcome, not an error: it means "counted, quorum not met".
+ * plain gate releases on the first approval. So `released: false` is a normal
+ * outcome, not an error: it means "counted, quorum not met", or, with
+ * `releases_at`, "approvals in, the wait timer still runs".
  * 404 when the step is not a gate; 409 once it is no longer awaiting a decision
  * (a released or terminal gate cannot be reopened). `timer`/`external` gates are
  * NOT approvable — they release by other means. */
@@ -2009,5 +2026,34 @@ export async function confirmStepUpRequest(
   if (error || !data) {
     throw new HttpError(errorText(error) || "the confirmation failed", response.status, bodyText(error));
   }
+  return data;
+}
+
+// ── Org Policies ──────────────────────────────────────────────────────────────
+
+/** A stored org Policy (`GET /v1/orgs/{org}/policies`). */
+export type PolicyRecord = components["schemas"]["PolicyDto"];
+/** A page of the org's decision log, newest first. */
+export type PolicyDecisionPage = components["schemas"]["PolicyDecisionPageDto"];
+
+/** The org's own Policies, CEL and typed settings alike. `null` when the
+ *  server has no policy store (404). */
+export async function listOrgPolicies(org: string): Promise<PolicyRecord[] | null> {
+  const { data, error, response } = await api.GET("/v1/orgs/{org}/policies", {
+    params: { path: { org } },
+  });
+  if (response.status === 404) return null;
+  if (error || !data) throw new Error(errorText(error) || "failed to load the org's policies");
+  return data;
+}
+
+/** The newest `limit` decisions of the org's log (at most 200). `null` when
+ *  the server has no policy store (404). */
+export async function listOrgPolicyDecisions(org: string, limit = 200): Promise<PolicyDecisionPage | null> {
+  const { data, error, response } = await api.GET("/v1/orgs/{org}/policy-decisions", {
+    params: { path: { org }, query: { limit } },
+  });
+  if (response.status === 404) return null;
+  if (error || !data) throw new Error(errorText(error) || "failed to load the org's policy decisions");
   return data;
 }

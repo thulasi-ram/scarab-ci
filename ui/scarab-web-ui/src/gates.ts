@@ -161,9 +161,17 @@ export function rejectReasonError(reason: string): string | null {
 }
 
 /** The gate bar's hint for an open gate: what it is waiting for. */
-export function gateWaitHint(s: GateStatusLike, statusOf: (step: string) => string | undefined): string {
+export function gateWaitHint(
+  s: GateStatusLike & EnvironmentGateLike,
+  statusOf: (step: string) => string | undefined,
+): string {
   const blockers = gateBlockers(s, statusOf);
   if (blockers.length > 0) return `waiting on ${blockers.join(", ")}`;
+  if (isEnvironmentApprovalGate(s) || addedByEnvironment(s) !== null) {
+    return s.approval_release_at != null
+      ? "approvals in · waiting for the wait timer"
+      : "waiting for the environment's approvers";
+  }
   switch (s.gate) {
     case "timer":
       return "waiting for its timer";
@@ -174,6 +182,97 @@ export function gateWaitHint(s: GateStatusLike, statusOf: (step: string) => stri
     default:
       return "waiting for a decision";
   }
+}
+
+// --- Environment approval gates --------------------------------------------
+// In a Run that names an Environment, a `manual` gate with a Step after it
+// that uses the Environment's authority (its secrets, a privilege grant, a
+// k8s_overlay, a write forge token or the deploy mark) is an
+// Environment approval gate: it needs the Environment's approvers. Run
+// creation decides which gates are, and the server sends the mark on each
+// gate (`environment_approval_gate`). When the pipeline wrote no such gate,
+// the Environment added one: its origin is the Environment. Every other
+// `manual` gate is plain, released by anyone with write.
+
+/** The step fields these helpers read (`StepStatusDto`). */
+export type EnvironmentGateLike = GateLike & {
+  environment_approval_gate?: boolean | null;
+  /** Unix ms: the approvals are in and the wait timer runs out then. */
+  approval_release_at?: number | null;
+  origin?: readonly { kind: string; name: string }[] | null;
+};
+
+/** The Run's Environment (`RunEnvironmentDto`). */
+export type RunEnvironmentLike = { name: string; display_name?: string | null };
+
+/** Is this gate an Environment approval gate? */
+export function isEnvironmentApprovalGate(s: EnvironmentGateLike): boolean {
+  return s.gate === "manual" && s.environment_approval_gate === true;
+}
+
+/** The Environment that added this gate to the Run, by name, or `null` for
+ *  a gate the pipeline wrote. */
+export function addedByEnvironment(s: EnvironmentGateLike): string | null {
+  return s.origin?.find((o) => o.kind === "environment")?.name ?? null;
+}
+
+/** What to call Environment `name`: its display name with the name beside
+ *  it when the Run's Environment is that one and has a display name other
+ *  than the name, else the name. The name is always shown: anyone who edits
+ *  an Environment may set its display name, and it need not be unique, so an
+ *  approver reads the name to know which Environment the gate guards. */
+function environmentShown(name: string, env: RunEnvironmentLike | null | undefined): string {
+  const display = env && env.name === name ? env.display_name?.trim() : undefined;
+  return display && display !== name ? `${display} (${name})` : name;
+}
+
+/** "added by Production (production)" for the gate the Environment added,
+ *  else `null`. */
+export function addedByLabel(
+  s: EnvironmentGateLike,
+  env: RunEnvironmentLike | null | undefined,
+): string | null {
+  const added = addedByEnvironment(s);
+  return added === null ? null : `added by ${environmentShown(added, env)}`;
+}
+
+/** The label a gate carries on its card, its DAG node and its pane, or
+ *  `null` for a gate that is not an Environment approval gate:
+ *
+ *    Environment approval gate · Production (production)
+ *    Environment approval gate · added by Production (production)
+ */
+export function environmentGateLabel(
+  s: EnvironmentGateLike,
+  env: RunEnvironmentLike | null | undefined,
+): string | null {
+  const added = addedByLabel(s, env);
+  if (added !== null) return `Environment approval gate · ${added}`;
+  if (!isEnvironmentApprovalGate(s)) return null;
+  return env ? `Environment approval gate · ${environmentShown(env.name, env)}` : "Environment approval gate";
+}
+
+/** When the open approval gate releases, as ms from `now`, or `null` when no
+ *  wait timer is running (approvals not in yet, or the gate is settled). */
+export function approvalReleaseIn(s: EnvironmentGateLike, now: number): number | null {
+  if (!isGateOpen(s) || s.approval_release_at == null) return null;
+  return Math.max(0, s.approval_release_at - now);
+}
+
+/** What `POST …/gates/{step}/approve` answered (202). `releases_at` is set
+ *  when the approvals are in and the wait timer still runs. */
+export type GateApprovalLike = { released: boolean; approvals?: string[]; releases_at?: number | null };
+
+/** The note an approval leaves on the gate's card. A 202 that did not
+ *  release the gate is not a failure: the approval is recorded, and either
+ *  more approvals are needed or the wait timer still runs. */
+export function approvalNote(res: GateApprovalLike, time: (ms: number) => string): string {
+  if (res.released) return "released";
+  if (res.releases_at != null) {
+    return `approval recorded · the gate releases at ${time(res.releases_at)}, when the wait timer runs out`;
+  }
+  const n = res.approvals?.length ?? 0;
+  return `${n} approval${n === 1 ? "" : "s"} recorded · awaiting more`;
 }
 
 // --- The dashboard's action inbox (git-bug c489346) --------------------------

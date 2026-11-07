@@ -1,7 +1,8 @@
 // Org-level Environments: the Settings section where an org admin runs the
 // places deploys land in. Each Environment has:
 //
-//   - its description;
+//   - its display name (what lists and headings show; the name, which
+//     pipelines use, is fixed) and its description;
 //   - its BASELINE protection rules, which every project's Deploy Runs obey;
 //   - its ELIGIBILITY: all projects, or project-name patterns. An empty list
 //     admits no project: eligibility starts closed;
@@ -31,7 +32,14 @@ import {
   type OrgEnvironment,
 } from "../api/client";
 import { eligibilityLabel, isPermissive, reportBanner, rulesSummary } from "../environment-overlays";
-import { environmentHref, nameError, toPutBody } from "../org-environments";
+import {
+  displayNameError,
+  environmentHref,
+  nameBeside,
+  nameError,
+  shownName,
+  toPutBody,
+} from "../org-environments";
 import { relTime, absTime } from "../fmt";
 import Icon from "./Icon";
 import Modal, { ModalMessage } from "./Modal";
@@ -100,9 +108,9 @@ export default function OrgEnvironments(props: { org: string }) {
             <p class="subtle">
               <small>
                 <Icon icon="rocket" size={12} /> An org environment is the place deploys
-                land in, shared by every repository that deploys there. It decides who may
-                deploy (eligibility) and under which rules (the baseline); each repository
-                can only tighten those for itself.
+                land in, shared by every repository that deploys there. It decides which
+                projects may use it (eligibility) and under which rules (the baseline); each
+                repository can only tighten those for itself.
               </small>
             </p>
           </Show>
@@ -133,9 +141,20 @@ function EnvironmentRow(props: { org: string; env: OrgEnvironment }) {
     <li class="tok">
       <div class="tok-head">
         <Icon icon="rocket" size={15} />
-        <A href={environmentHref(props.org, env().name)} class="tok-name mono oenv-link">
-          {env().name}
+        <A
+          href={environmentHref(props.org, env().name)}
+          class="tok-name oenv-link"
+          classList={{ mono: nameBeside(env()) === null }}
+        >
+          {shownName(env())}
         </A>
+        <Show when={nameBeside(env())}>
+          {(name) => (
+            <span class="oenv-name mono" title="The name pipelines use">
+              {name()}
+            </span>
+          )}
+        </Show>
         <Show when={isPermissive(env().protection)}>
           <span class="tok-role" title="No org-wide rule protects this place yet, only each project's own overlay">
             permissive baseline
@@ -150,7 +169,7 @@ function EnvironmentRow(props: { org: string; env: OrgEnvironment }) {
           <Icon icon="shield-check" size={12} />
           {isPermissive(env().protection) ? "no baseline rule" : rulesSummary(env().protection)}
         </span>
-        <span title="Eligibility: which projects may deploy here">
+        <span title="Eligibility: the projects that may use it">
           <Icon icon="user" size={12} />
           {eligibilityLabel(env().eligibility)}
         </span>
@@ -163,9 +182,9 @@ function EnvironmentRow(props: { org: string; env: OrgEnvironment }) {
   );
 }
 
-/** Create an Environment: its name and description. The name is fixed once it
- *  exists: it is the key every pipeline's `environment:` names. The rest is
- *  set on its edit page. */
+/** Create an Environment: its name, display name and description. The name is
+ *  fixed once it exists: it is the key every pipeline's `environment:` names.
+ *  The rest is set on its edit page. */
 function CreateDialog(props: {
   org: string;
   /** Names already registered: a create must not silently replace one. */
@@ -174,6 +193,7 @@ function CreateDialog(props: {
   onCreated: (name: string) => void;
 }) {
   const [name, setName] = createSignal("");
+  const [displayName, setDisplayName] = createSignal("");
   const [description, setDescription] = createSignal("");
   const [saving, setSaving] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
@@ -183,10 +203,11 @@ function CreateDialog(props: {
     if (props.taken.includes(n)) return `${n} is already registered. Open it to change it.`;
     return nameError(n);
   };
+  const displayProblem = () => displayNameError(displayName());
 
   const save = async () => {
-    const body = toPutBody({ description: description() }).body;
-    if (nameProblem() || saving()) return;
+    const body = toPutBody({ displayName: displayName(), description: description() }).body;
+    if (nameProblem() || displayProblem() || saving()) return;
     setSaving(true);
     setError(null);
     try {
@@ -218,7 +239,12 @@ function CreateDialog(props: {
           <button class="btn btn-ghost" type="button" onClick={props.onClose} disabled={saving()}>
             Cancel
           </button>
-          <button class="btn btn-primary" type="button" disabled={!!nameProblem() || saving()} onClick={save}>
+          <button
+            class="btn btn-primary"
+            type="button"
+            disabled={!!nameProblem() || !!displayProblem() || saving()}
+            onClick={save}
+          >
             {saving() ? "Creating…" : "Create environment"}
           </button>
         </>
@@ -232,6 +258,14 @@ function CreateDialog(props: {
         error={name() ? nameProblem() : null}
       >
         <Input mono autofocus placeholder="production, staging, prod-eu" value={name()} onValue={setName} />
+      </Field>
+      <Field
+        id="new-env-display-name"
+        label="Display name"
+        help="What lists and headings show. Blank shows the name. Can be changed later."
+        error={displayProblem()}
+      >
+        <Input placeholder="Production (EU)" value={displayName()} onValue={setDisplayName} />
       </Field>
       <Field id="new-env-description" label="Description">
         <Input placeholder="what lands here, who runs it" value={description()} onValue={setDescription} />
