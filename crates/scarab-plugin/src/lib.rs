@@ -1069,7 +1069,8 @@ mod tests {
         m.gates.clear();
         assert!(matches!(m.validate(), Err(PluginError::InvalidManifest(_))));
         let mut m = with_wait_live();
-        m.capabilities.retain(|c| *c != PluginCapability::ResolveGates);
+        m.capabilities
+            .retain(|c| *c != PluginCapability::ResolveGates);
         assert!(matches!(m.validate(), Err(PluginError::InvalidManifest(_))));
     }
 
@@ -1077,12 +1078,22 @@ mod tests {
     fn a_gate_definition_is_named_bounded_and_typed() {
         type Mutation = Box<dyn Fn(&mut GateDefinition)>;
         let cases: Vec<(&str, Mutation)> = vec![
-            ("choice output", Box::new(|g| {
-                g.interface.outputs[0].r#type = scarab_pipeline::ParamType::Choice
-            })),
-            ("output name", Box::new(|g| g.interface.outputs[0].name = "a b".into())),
-            ("description", Box::new(|g| g.description = "two\nlines".into())),
-            ("input name", Box::new(|g| g.interface.inputs[0].name = "1app".into())),
+            (
+                "choice output",
+                Box::new(|g| g.interface.outputs[0].r#type = scarab_pipeline::ParamType::Choice),
+            ),
+            (
+                "output name",
+                Box::new(|g| g.interface.outputs[0].name = "a b".into()),
+            ),
+            (
+                "description",
+                Box::new(|g| g.description = "two\nlines".into()),
+            ),
+            (
+                "input name",
+                Box::new(|g| g.interface.inputs[0].name = "1app".into()),
+            ),
         ];
         for (what, mutate) in cases {
             let mut m = with_wait_live();

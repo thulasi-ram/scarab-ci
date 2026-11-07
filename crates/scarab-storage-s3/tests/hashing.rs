@@ -198,7 +198,10 @@ async fn a_re_ingest_at_a_new_wall_clock_keeps_the_content_identity() {
     build_fixture_at(&second, MTIME_MS + 10_000);
 
     let a = cas.ingest(first.to_str().unwrap()).await.expect("ingest a");
-    let b = cas.ingest(second.to_str().unwrap()).await.expect("ingest b");
+    let b = cas
+        .ingest(second.to_str().unwrap())
+        .await
+        .expect("ingest b");
 
     // The address moves, and that is not the bug: these ARE different bytes.
     assert_ne!(
@@ -215,7 +218,8 @@ async fn a_re_ingest_at_a_new_wall_clock_keeps_the_content_identity() {
          with the wall clock nothing is ever skipped (git-bug 945b1f4)"
     );
     assert_eq!(
-        a.comparison().0, ROOT_IDENTITY,
+        a.comparison().0,
+        ROOT_IDENTITY,
         "and the identity is the independently-derived one, not merely stable"
     );
 
@@ -259,11 +263,8 @@ async fn the_content_identity_moves_for_every_change_that_is_not_a_timestamp() {
             set_mtime_at(&root.join("a.txt"), MTIME_MS);
         }),
         ("a file's mode", |root| {
-            std::fs::set_permissions(
-                root.join("a.txt"),
-                std::fs::Permissions::from_mode(0o600),
-            )
-            .expect("chmod");
+            std::fs::set_permissions(root.join("a.txt"), std::fs::Permissions::from_mode(0o600))
+                .expect("chmod");
         }),
         ("a file's name", |root| {
             std::fs::rename(root.join("a.txt"), root.join("z.txt")).expect("rename");

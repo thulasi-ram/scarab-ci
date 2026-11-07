@@ -747,7 +747,6 @@ impl Executor for SecretInjectingExecutor {
         self.inner.output_identity(handle).await
     }
 
-
     async fn results(
         &self,
         handle: &ExecHandle,

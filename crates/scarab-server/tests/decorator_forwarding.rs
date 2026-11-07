@@ -112,10 +112,7 @@ async fn the_production_decorator_stack_forwards_identity() {
         secrets,
         logs,
     ));
-    let stack = ForgeCredentialExecutor::new(
-        secret_layer,
-        Arc::new(FakeForge::new()),
-    );
+    let stack = ForgeCredentialExecutor::new(secret_layer, Arc::new(FakeForge::new()));
 
     let handle = scarab_engine::ports::ExecHandle("fake://r1/s1/a1".into());
     assert_eq!(

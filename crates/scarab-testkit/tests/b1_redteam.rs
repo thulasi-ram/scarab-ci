@@ -129,9 +129,14 @@ async fn a_downstream_gate_clock_does_not_fall_back_to_run_start_after_an_upstre
     assert_eq!(run_status(&db).await, RunStatus::Suspended);
 
     clock.advance(600_000); // t = 601000
-    db.record_step_transition(&run_id(), &id("g1"), StepStatus::Pending, StepStatus::Succeeded)
-        .await
-        .unwrap();
+    db.record_step_transition(
+        &run_id(),
+        &id("g1"),
+        StepStatus::Pending,
+        StepStatus::Succeeded,
+    )
+    .await
+    .unwrap();
     tick(&db, &clock, &exec).await;
     tick(&db, &clock, &exec).await;
 

@@ -850,15 +850,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // delivered as files on tmpfs.
             let executor: Arc<dyn Executor> = Arc::new(
                 scarab_server::forge_token::ForgeCredentialExecutor::new(executor, forge.clone())
-                // Build-step registry auth (ADR-0018): scoped REGISTRY_AUTH
-                // secret first, forge-derived credential as fallback.
-                .with_secrets(secrets.clone())
-                // A yanked library Step is refused before its forge
-                // credential or registry auth is asked for (ADR-0076 §6).
-                .with_libraries(db.clone(), pg.clone())
-                // So is a deploy Step whose Environment no longer admits
-                // its Project (ADR-0071 §2).
-                .with_environment_governance(db.clone(), pg.clone()),
+                    // Build-step registry auth (ADR-0018): scoped REGISTRY_AUTH
+                    // secret first, forge-derived credential as fallback.
+                    .with_secrets(secrets.clone())
+                    // A yanked library Step is refused before its forge
+                    // credential or registry auth is asked for (ADR-0076 §6).
+                    .with_libraries(db.clone(), pg.clone())
+                    // So is a deploy Step whose Environment no longer admits
+                    // its Project (ADR-0071 §2).
+                    .with_environment_governance(db.clone(), pg.clone()),
             );
             // Local host processes finish instantly, so re-poll them quickly; k8s
             // Pods take time, so the default window avoids thundering re-claims.
@@ -1175,7 +1175,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ));
         // A dev token stands for both audiences: a host-process plugin has
         // no projected tokens to tell apart.
-        state = state.with_plugin_tokens(dev.clone()).with_plugin_api_tokens(dev);
+        state = state
+            .with_plugin_tokens(dev.clone())
+            .with_plugin_api_tokens(dev);
     }
     // The plugin runtime (ADR-0072 §9): only with SCARAB_PLUGINS=on, in a
     // role that serves the broker, and with a cluster to run Plugins in. The

@@ -419,7 +419,6 @@ impl Executor for LocalExecutor {
 
     // `output` uses the port default (`None`): no workspace CAS locally (ADR-0036).
 
-
     /// Read the step's named results (ADR-0041) from its results dir: every
     /// `<name>.json` file becomes result `<name>` with the file's parsed JSON
     /// value. An absent dir (the step emitted nothing) yields an empty map; a

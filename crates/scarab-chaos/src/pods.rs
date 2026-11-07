@@ -55,7 +55,10 @@ impl PodView {
         let md = &p["metadata"];
         let label = |k: &str| md["labels"][k].as_str().map(str::to_string);
         let mut containers = Vec::new();
-        for (key, init) in [("initContainerStatuses", true), ("containerStatuses", false)] {
+        for (key, init) in [
+            ("initContainerStatuses", true),
+            ("containerStatuses", false),
+        ] {
             for c in p["status"][key].as_array().into_iter().flatten() {
                 let (state, body) = c["state"]
                     .as_object()
@@ -85,7 +88,10 @@ impl PodView {
             step: label("scarab.io/step"),
             attempt: label("scarab.io/attempt"),
             component: label("app.kubernetes.io/component"),
-            phase: p["status"]["phase"].as_str().unwrap_or("Unknown").to_string(),
+            phase: p["status"]["phase"]
+                .as_str()
+                .unwrap_or("Unknown")
+                .to_string(),
             ready,
             deleting: !md["deletionTimestamp"].is_null(),
             has_root: md["annotations"][ROOT_ANNOTATION].is_string(),
@@ -109,18 +115,24 @@ pub fn drain_in_flight(p: &PodView) -> bool {
     let step_done_ok = p
         .container(STEP_CONTAINER)
         .is_some_and(|c| c.state == "terminated" && c.exit_code == Some(0));
-    let egress_running = p.container(EGRESS_CONTAINER).is_some_and(|c| c.state == "running");
+    let egress_running = p
+        .container(EGRESS_CONTAINER)
+        .is_some_and(|c| c.state == "running");
     step_done_ok && egress_running && !p.has_root && !p.deleting
 }
 
 /// The fetcher is pulling the step's inputs.
 pub fn feed_in_flight(p: &PodView) -> bool {
-    p.container(INIT_CONTAINER).is_some_and(|c| c.state == "running") && !p.deleting
+    p.container(INIT_CONTAINER)
+        .is_some_and(|c| c.state == "running")
+        && !p.deleting
 }
 
 /// The step container is running (rank 4's trigger: a Run is in flight).
 pub fn step_running(p: &PodView) -> bool {
-    p.container(STEP_CONTAINER).is_some_and(|c| c.state == "running") && !p.deleting
+    p.container(STEP_CONTAINER)
+        .is_some_and(|c| c.state == "running")
+        && !p.deleting
 }
 
 /// One line of `pods.jsonl`.
@@ -184,7 +196,8 @@ pub async fn watch(
         if *stop.borrow() {
             return Ok(());
         }
-        let list = match tokio::time::timeout(LIST_TIMEOUT, pods.list(&ListParams::default())).await {
+        let list = match tokio::time::timeout(LIST_TIMEOUT, pods.list(&ListParams::default())).await
+        {
             Ok(Ok(l)) => l,
             Ok(Err(e)) => {
                 eprintln!("scarab-chaos: pod list failed ({e}); retrying");
@@ -218,14 +231,21 @@ pub async fn watch(
             }
             *map = seen;
         }
-        let stream = match tokio::time::timeout(LIST_TIMEOUT, pods.watch(&WatchParams::default().timeout(240), &rv)).await {
+        let stream = match tokio::time::timeout(
+            LIST_TIMEOUT,
+            pods.watch(&WatchParams::default().timeout(240), &rv),
+        )
+        .await
+        {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
                 eprintln!("scarab-chaos: pod watch failed to start ({e}); re-listing");
                 continue;
             }
             Err(_) => {
-                eprintln!("scarab-chaos: pod watch took over {LIST_TIMEOUT:?} to start; re-listing");
+                eprintln!(
+                    "scarab-chaos: pod watch took over {LIST_TIMEOUT:?} to start; re-listing"
+                );
                 continue;
             }
         };
@@ -280,7 +300,9 @@ mod tests {
             annotations.insert(ROOT_ANNOTATION.into(), "abc".into());
         }
         let state = |s: &str, exit: Option<i64>| match s {
-            "terminated" => serde_json::json!({"terminated": {"exitCode": exit, "startedAt": "2026-11-01T00:00:00Z", "finishedAt": "2026-11-01T00:00:05Z"}}),
+            "terminated" => {
+                serde_json::json!({"terminated": {"exitCode": exit, "startedAt": "2026-11-01T00:00:00Z", "finishedAt": "2026-11-01T00:00:05Z"}})
+            }
             "running" => serde_json::json!({"running": {"startedAt": "2026-11-01T00:00:00Z"}}),
             _ => serde_json::json!({"waiting": {"reason": "PodInitializing"}}),
         };
@@ -324,11 +346,31 @@ mod tests {
 
     #[test]
     fn the_drain_window_is_step_exited_zero_and_no_root_yet() {
-        assert!(drain_in_flight(&pod("terminated", Some(0), "running", false)));
+        assert!(drain_in_flight(&pod(
+            "terminated",
+            Some(0),
+            "running",
+            false
+        )));
         assert!(!drain_in_flight(&pod("running", None, "running", false)));
-        assert!(!drain_in_flight(&pod("terminated", Some(1), "running", false)));
-        assert!(!drain_in_flight(&pod("terminated", Some(0), "running", true)));
-        assert!(!drain_in_flight(&pod("terminated", Some(0), "terminated", false)));
+        assert!(!drain_in_flight(&pod(
+            "terminated",
+            Some(1),
+            "running",
+            false
+        )));
+        assert!(!drain_in_flight(&pod(
+            "terminated",
+            Some(0),
+            "running",
+            true
+        )));
+        assert!(!drain_in_flight(&pod(
+            "terminated",
+            Some(0),
+            "terminated",
+            false
+        )));
     }
 
     #[test]

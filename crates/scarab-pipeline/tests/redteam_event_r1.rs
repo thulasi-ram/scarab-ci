@@ -31,18 +31,53 @@ fn rt_every_bad_value_fails_its_check() {
     let long = "a".repeat(100_000);
     let mut bad: Vec<(&str, Value)> = Vec::new();
     for v in [
-        "a;b", "a$b", "a`b`", "a b", "a\nb", "a\0b", "a\tb", "a\\b", "a'b", "a\"b", "a|b",
-        "a&b", "a>b", "a*b", "a?b", "a[b]", "a~b", "a^b", "v1^{}", "a@{1}", "a:b",
-        "feat\u{0430}", // Cyrillic a
+        "a;b",
+        "a$b",
+        "a`b`",
+        "a b",
+        "a\nb",
+        "a\0b",
+        "a\tb",
+        "a\\b",
+        "a'b",
+        "a\"b",
+        "a|b",
+        "a&b",
+        "a>b",
+        "a*b",
+        "a?b",
+        "a[b]",
+        "a~b",
+        "a^b",
+        "v1^{}",
+        "a@{1}",
+        "a:b",
+        "feat\u{0430}",  // Cyrillic a
         "feat\u{ff0f}x", // fullwidth solidus
         "feat\u{200b}",  // zero-width space
-        "a..b", "..", "a//b", "-x", "--upload-pack=touch /tmp/p", "", "a\rb",
+        "a..b",
+        "..",
+        "a//b",
+        "-x",
+        "--upload-pack=touch /tmp/p",
+        "",
+        "a\rb",
     ] {
         for f in ["ref", "branch", "tag"] {
             bad.push((f, json!(v)));
         }
     }
-    for v in ["-x", "a/b", "a b", "a;b", "", "\u{0430}cme", "a\nb", ".", ".."] {
+    for v in [
+        "-x",
+        "a/b",
+        "a b",
+        "a;b",
+        "",
+        "\u{0430}cme",
+        "a\nb",
+        ".",
+        "..",
+    ] {
         bad.push(("repo.owner", json!(v)));
         bad.push(("repo.name", json!(v)));
     }
@@ -58,7 +93,10 @@ fn rt_every_bad_value_fails_its_check() {
         ("run", json!("a b")),
         ("repo.clone_url", json!("https://github.com/a/b.git\n")),
         ("repo.clone_url", json!("ext::sh -c id")),
-        ("repo.clone_url", json!("https://github.com/a/b.git --upload-pack=x")),
+        (
+            "repo.clone_url",
+            json!("https://github.com/a/b.git --upload-pack=x"),
+        ),
         ("repo.clone_url", json!("ssh://git@github.com/a/b.git")),
     ]);
     let passed: Vec<String> = bad
@@ -66,7 +104,10 @@ fn rt_every_bad_value_fails_its_check() {
         .filter(|(f, v)| check_value(f, v).is_ok())
         .map(|(f, v)| format!("{f} = {v}"))
         .collect();
-    assert!(passed.is_empty(), "values that passed their check: {passed:?}");
+    assert!(
+        passed.is_empty(),
+        "values that passed their check: {passed:?}"
+    );
     // Not a value the shell or git reads specially, but nothing bounds it.
     let _ = long;
 }
@@ -76,7 +117,10 @@ fn rt_every_bad_value_fails_its_check() {
 #[test]
 fn rt_a_very_long_ref_value_is_refused() {
     let long = format!("feat/{}", "a".repeat(100_000));
-    assert!(check_value("branch", &json!(long)).is_err(), "a 100 kB branch passes its check");
+    assert!(
+        check_value("branch", &json!(long)).is_err(),
+        "a 100 kB branch passes its check"
+    );
 }
 
 /// ATTACK: CEL forms that read `event` around the field allowlist. Each must
@@ -85,7 +129,11 @@ fn rt_a_very_long_ref_value_is_refused() {
 fn rt_cel_tricks_reading_event_are_compile_errors() {
     let libs = Libraries::default();
     // Control: the harness compiles an allowlisted read.
-    assert!(compile(&reads_env("event.sha"), &libs).is_ok(), "{:?}", compile(&reads_env("event.sha"), &libs));
+    assert!(
+        compile(&reads_env("event.sha"), &libs).is_ok(),
+        "{:?}",
+        compile(&reads_env("event.sha"), &libs)
+    );
     assert!(compile(&reads_env("event['sha']"), &libs).is_ok());
     let mut admitted = Vec::new();
     for expr in [
@@ -142,7 +190,12 @@ fn rt_a_bad_branch_read_only_by_when_never_reaches_the_facts() {
 fn rt_a_concurrency_group_may_not_read_an_unreadable_event_field() {
     let libs = Libraries::default();
     let mut admitted = Vec::new();
-    for group in ["${{ event.body }}", "${{ event.actor }}", "${{ event }}", "g-${{ event['body'] }}"] {
+    for group in [
+        "${{ event.body }}",
+        "${{ event.actor }}",
+        "${{ event }}",
+        "g-${{ event['body'] }}",
+    ] {
         let yaml = format!(
             "on: {{ comment: {{}} }}\nconcurrency: {{ group: \"{group}\", policy: cancel-in-progress }}\nsteps: [{{ id: s, image: busybox }}]\n"
         );
@@ -174,7 +227,12 @@ fn installed(name: &str, content: &str) -> Libraries {
 /// refused at compile.
 #[test]
 fn rt_a_permissive_validate_does_not_let_a_caller_script_a_token_step() {
-    for validate in ["true", "value.size() > 0", "value.matches('.*')", "value == value"] {
+    for validate in [
+        "true",
+        "value.size() > 0",
+        "value.matches('.*')",
+        "value == value",
+    ] {
         let lib = format!(
             r#"kind: library
 interface:

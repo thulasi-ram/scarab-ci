@@ -135,7 +135,9 @@ fn run_wsfetch_fetch(
 /// executor reads back as `terminated.message`.
 #[tokio::test(flavor = "multi_thread")]
 async fn last_declared_root_wins_and_the_collision_is_loud_on_every_rung() {
-    let Some(h) = Harness::start().await else { return };
+    let Some(h) = Harness::start().await else {
+        return;
+    };
 
     let root_b = h
         .seed(|p| {
@@ -193,8 +195,7 @@ async fn last_declared_root_wins_and_the_collision_is_loud_on_every_rung() {
     );
     // Rung 2: the termination log carries the bounded JSON summary.
     let msg = std::fs::read_to_string(&tlog).expect("termination log written");
-    let summary =
-        scarab_workspace_client::parse_termination_summary(&msg).expect("summary parses");
+    let summary = scarab_workspace_client::parse_termination_summary(&msg).expect("summary parses");
     assert_eq!(summary.collisions, 1);
     assert_eq!(summary.sample.len(), 1);
     assert_eq!(summary.sample[0].p, "shared.txt");
@@ -237,7 +238,9 @@ async fn last_declared_root_wins_and_the_collision_is_loud_on_every_rung() {
 /// executor surfaces it on the Config verdict.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_type_conflict_exits_5_with_nothing_written() {
-    let Some(h) = Harness::start().await else { return };
+    let Some(h) = Harness::start().await else {
+        return;
+    };
 
     let root_file = h
         .seed(|p| {

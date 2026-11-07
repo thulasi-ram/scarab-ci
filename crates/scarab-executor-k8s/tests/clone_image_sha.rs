@@ -107,7 +107,10 @@ impl Fixture {
             )
             .env("SCARAB_CLONE_SHA", sha)
             .env("SCARAB_CLONE_DEPTH", depth)
-            .env("SCARAB_CLONE_TOKEN_FILE", self.dir.path().join("forge-token"))
+            .env(
+                "SCARAB_CLONE_TOKEN_FILE",
+                self.dir.path().join("forge-token"),
+            )
             .env(
                 "SCARAB_CLONE_USERNAME_FILE",
                 self.dir.path().join("forge-username"),

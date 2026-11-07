@@ -293,7 +293,8 @@ async fn the_org_log_shows_its_org_and_members_only_on_postgres() {
 async fn a_confirmation_stays_in_its_own_org(backend: Backend) {
     let h = harness_on(backend, |st| st);
     let (amy, mut soft) = member(&h, "amy", "big", Role::Admin).await;
-    h.grant("amy", Scope::Org("tiny".into()), Role::Viewer).await;
+    h.grant("amy", Scope::Org("tiny".into()), Role::Viewer)
+        .await;
     h.grant("tom", Scope::Org("tiny".into()), Role::Admin).await;
     let tom = h.browser_session(scoped("tom")).await;
 
@@ -662,10 +663,7 @@ async fn an_org_owner_cannot_reset_an_install_owner_by_id() {
     let h = harness_with(|st| st.with_oauth_login(provider_with_owners(&["root"])));
     let (st, b) = mallory_resets_root(&h).await;
     assert_eq!(st, StatusCode::FORBIDDEN, "{b}");
-    assert!(
-        b.as_str().unwrap().contains("install-wide owner"),
-        "{b}"
-    );
+    assert!(b.as_str().unwrap().contains("install-wide owner"), "{b}");
     assert_eq!(h.passkey_store.list("root").await.unwrap().len(), 1);
     assert!(h.events("passkey.reset").await.is_empty());
 }
@@ -1135,7 +1133,9 @@ async fn the_operator_grant_is_idempotent_and_recorded() {
     assert!(err.starts_with(NO_PRINCIPAL), "{err}");
     assert!(err.contains("sign in"), "{err}");
     assert_eq!(
-        RbacStore::role_of(pg.as_ref(), "github:bob", &acme).await.unwrap(),
+        RbacStore::role_of(pg.as_ref(), "github:bob", &acme)
+            .await
+            .unwrap(),
         None
     );
     // An unknown role is refused before anything is read.
@@ -1175,7 +1175,9 @@ async fn the_operator_grant_is_idempotent_and_recorded() {
         }
     );
     assert_eq!(
-        RbacStore::role_of(pg.as_ref(), "github:alice", &acme).await.unwrap(),
+        RbacStore::role_of(pg.as_ref(), "github:alice", &acme)
+            .await
+            .unwrap(),
         Some(Role::Member)
     );
     let events = grants().await;
@@ -1236,7 +1238,9 @@ async fn the_operator_grant_is_idempotent_and_recorded() {
         }
     );
     assert_eq!(
-        RbacStore::role_of(pg.as_ref(), "github:alice", &acme).await.unwrap(),
+        RbacStore::role_of(pg.as_ref(), "github:alice", &acme)
+            .await
+            .unwrap(),
         Some(Role::Admin)
     );
     let events = grants().await;
@@ -1715,7 +1719,12 @@ async fn an_unrecorded_request_confirmation_runs_nothing() {
     assert!(is_step_up(st, &b), "{st} {b}");
     let id = b["request_id"].as_str().expect("a request").to_string();
     let (st, ch) = h
-        .cookie("POST", &format!("/v1/step-up/requests/{id}/options"), None, &amy)
+        .cookie(
+            "POST",
+            &format!("/v1/step-up/requests/{id}/options"),
+            None,
+            &amy,
+        )
         .await;
     assert_eq!(st, StatusCode::OK, "{ch}");
     let cred = soft.assert(&ch["public_key"], ORIGIN).unwrap();
@@ -1808,7 +1817,10 @@ async fn all_pages(h: &Harness, s: &Sess, uri: &str) -> (Vec<String>, usize) {
         ids.extend(ids_of(&page));
         match page["next_cursor"].as_str() {
             Some(c) => {
-                assert!(!page["events"].as_array().unwrap().is_empty(), "a cursor after an empty page");
+                assert!(
+                    !page["events"].as_array().unwrap().is_empty(),
+                    "a cursor after an empty page"
+                );
                 cursor = Some(c.to_string());
             }
             None => break,
@@ -1826,21 +1838,92 @@ async fn all_pages(h: &Harness, s: &Sess, uri: &str) -> (Vec<String>, usize) {
 async fn the_event_log_pages_by_cursor_and_filters(backend: Backend) {
     let h = harness_on(backend, |st| st);
     h.grant("amy", Scope::Org("acme".into()), Role::Owner).await;
-    h.grant("cat", Scope::Org("acme".into()), Role::Member).await;
+    h.grant("cat", Scope::Org("acme".into()), Role::Member)
+        .await;
     let amy = h.browser_session(scoped("amy")).await;
 
     // (id, org, at, kind, subject, target), appended oldest first.
     let seeds: Vec<(&str, Option<&str>, i64, &str, &str, &str)> = vec![
-        ("a1", Some("acme"), 1_000, "op.authorised", "amy", "acme/web/DB_PASSWORD"),
-        ("b1", Some("beta"), 1_500, "op.authorised", "amy", "acme/web/DB_PASSWORD"),
-        ("a2", Some("acme"), 2_000, "step_up.refused", "cat", "acme/api/TOKEN"),
-        ("a3", Some("acme"), 3_000, "op.authorised", "cat", "run-7f3a/deploy"),
-        ("o1", None, 3_500, "step_up.confirmed", "amy", "acme/web/HIDDEN"),
-        ("a4", Some("acme"), 4_000, "step_up.refused", "amy", "acme/web/API_KEY"),
-        ("b2", Some("beta"), 4_500, "step_up.refused", "cat", "acme/web/X"),
-        ("a5", Some("acme"), 5_000, "step_up.refused", "cat", "run-7f3a/build"),
-        ("a6", Some("acme"), 6_000, "op.authorised", "amy", "acme/api/DB_PASSWORD"),
-        ("a7", Some("acme"), 7_000, "step_up.refused", "cat", "acme/web/DB_PASSWORD"),
+        (
+            "a1",
+            Some("acme"),
+            1_000,
+            "op.authorised",
+            "amy",
+            "acme/web/DB_PASSWORD",
+        ),
+        (
+            "b1",
+            Some("beta"),
+            1_500,
+            "op.authorised",
+            "amy",
+            "acme/web/DB_PASSWORD",
+        ),
+        (
+            "a2",
+            Some("acme"),
+            2_000,
+            "step_up.refused",
+            "cat",
+            "acme/api/TOKEN",
+        ),
+        (
+            "a3",
+            Some("acme"),
+            3_000,
+            "op.authorised",
+            "cat",
+            "run-7f3a/deploy",
+        ),
+        (
+            "o1",
+            None,
+            3_500,
+            "step_up.confirmed",
+            "amy",
+            "acme/web/HIDDEN",
+        ),
+        (
+            "a4",
+            Some("acme"),
+            4_000,
+            "step_up.refused",
+            "amy",
+            "acme/web/API_KEY",
+        ),
+        (
+            "b2",
+            Some("beta"),
+            4_500,
+            "step_up.refused",
+            "cat",
+            "acme/web/X",
+        ),
+        (
+            "a5",
+            Some("acme"),
+            5_000,
+            "step_up.refused",
+            "cat",
+            "run-7f3a/build",
+        ),
+        (
+            "a6",
+            Some("acme"),
+            6_000,
+            "op.authorised",
+            "amy",
+            "acme/api/DB_PASSWORD",
+        ),
+        (
+            "a7",
+            Some("acme"),
+            7_000,
+            "step_up.refused",
+            "cat",
+            "acme/web/DB_PASSWORD",
+        ),
     ];
     for (id, org, at, kind, subject, target) in &seeds {
         h.log
@@ -1864,7 +1947,9 @@ async fn the_event_log_pages_by_cursor_and_filters(backend: Backend) {
     let base = "/v1/orgs/acme/security/events";
 
     // The whole log in one page, then three at a time: the same rows.
-    let (st, whole) = h.cookie("GET", &format!("{base}?limit=200"), None, &amy).await;
+    let (st, whole) = h
+        .cookie("GET", &format!("{base}?limit=200"), None, &amy)
+        .await;
     assert_eq!(st, StatusCode::OK, "{whole}");
     assert!(whole["next_cursor"].is_null(), "one page holds it all");
     let whole = ids_of(&whole);
@@ -1883,7 +1968,10 @@ async fn the_event_log_pages_by_cursor_and_filters(backend: Backend) {
             "kind=step_up.refused",
             expect(&|s| s.1 == Some("acme") && s.3 == "step_up.refused"),
         ),
-        ("actor=cat", expect(&|s| s.1 == Some("acme") && s.4 == "cat")),
+        (
+            "actor=cat",
+            expect(&|s| s.1 == Some("acme") && s.4 == "cat"),
+        ),
         (
             "kind=step_up.refused&actor=cat",
             expect(&|s| s.1 == Some("acme") && s.3 == "step_up.refused" && s.4 == "cat"),
@@ -1910,14 +1998,26 @@ async fn the_event_log_pages_by_cursor_and_filters(backend: Backend) {
     }
 
     // The older `before` pages the same as the cursor.
-    let (_, p1) = h.cookie("GET", &format!("{base}?limit=3"), None, &amy).await;
+    let (_, p1) = h
+        .cookie("GET", &format!("{base}?limit=3"), None, &amy)
+        .await;
     let before = p1["next_before"].as_i64().expect("a next page");
     let cursor = p1["next_cursor"].as_str().expect("a next page").to_string();
     let (_, by_before) = h
-        .cookie("GET", &format!("{base}?limit=3&before={before}"), None, &amy)
+        .cookie(
+            "GET",
+            &format!("{base}?limit=3&before={before}"),
+            None,
+            &amy,
+        )
         .await;
     let (_, by_cursor) = h
-        .cookie("GET", &format!("{base}?limit=3&cursor={cursor}"), None, &amy)
+        .cookie(
+            "GET",
+            &format!("{base}?limit=3&cursor={cursor}"),
+            None,
+            &amy,
+        )
         .await;
     assert_eq!(ids_of(&by_before), ids_of(&by_cursor));
 

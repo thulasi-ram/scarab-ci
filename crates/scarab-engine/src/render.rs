@@ -117,7 +117,10 @@ fn known_ir_version(ir: Option<&serde_json::Value>) -> Result<(), String> {
 }
 
 /// The compiled IR entry of `step` in `run`'s stored Pipeline.
-pub(crate) fn ir_step<'a>(ir: &'a serde_json::Value, step: &StepId) -> Option<&'a serde_json::Value> {
+pub(crate) fn ir_step<'a>(
+    ir: &'a serde_json::Value,
+    step: &StepId,
+) -> Option<&'a serde_json::Value> {
     ir.get("steps")?
         .as_array()?
         .iter()

@@ -28,7 +28,11 @@ fn app(sync: &str, health: &str, op: Option<Value>) -> Application {
 }
 
 fn deployment(images: &[&str], init: &[&str]) -> Value {
-    let c = |v: &[&str]| v.iter().map(|i| json!({ "name": "c", "image": i })).collect::<Vec<_>>();
+    let c = |v: &[&str]| {
+        v.iter()
+            .map(|i| json!({ "name": "c", "image": i }))
+            .collect::<Vec<_>>()
+    };
     json!({
         "apiVersion": "apps/v1",
         "kind": "Deployment",
@@ -42,7 +46,13 @@ fn managed(items: Vec<Value>) -> ManagedResources {
 }
 
 /// A managed resource whose target (git) state is `target`, live is `live`.
-fn diff(group: &str, kind: &str, target: Option<&Value>, live: Option<&Value>, hook: bool) -> Value {
+fn diff(
+    group: &str,
+    kind: &str,
+    target: Option<&Value>,
+    live: Option<&Value>,
+    hook: bool,
+) -> Value {
     json!({
         "group": group,
         "kind": kind,
@@ -65,22 +75,45 @@ fn is_pass(j: &Judgement) -> bool {
 #[test]
 fn the_image_is_matched_exactly_never_as_a_substring_or_prefix() {
     // Control: the exact image in a Deployment's target passes, with the revision.
-    let ok = managed(vec![diff("apps", "Deployment", Some(&deployment(&[IMAGE], &[])), None, false)]);
-    assert_eq!(judge(&live_app(), &ok, IMAGE), Judgement::Pass { revision: REV.into() });
+    let ok = managed(vec![diff(
+        "apps",
+        "Deployment",
+        Some(&deployment(&[IMAGE], &[])),
+        None,
+        false,
+    )]);
+    assert_eq!(
+        judge(&live_app(), &ok, IMAGE),
+        Judgement::Pass {
+            revision: REV.into()
+        }
+    );
     for (target, wanted) in [
         ("ghcr.io/acme/web:1.4.2-evil", IMAGE),
         ("ghcr.io/acme/web:1.4.2", "ghcr.io/acme/web:1.4"),
         ("ghcr.io/acme/web:1.4.2", "acme/web:1.4.2"),
         ("evil.io/ghcr.io/acme/web:1.4.2", IMAGE),
         ("ghcr.io/acme/web:1.4.2@sha256:0000", IMAGE),
-        ("ghcr.io/acme/web@sha256:0000", "ghcr.io/acme/web@sha256:000"),
+        (
+            "ghcr.io/acme/web@sha256:0000",
+            "ghcr.io/acme/web@sha256:000",
+        ),
         ("ghcr.io/acme/web:1.4.2", ""),
         ("ghcr.io/acme/web:1.4.2", " ghcr.io/acme/web:1.4.2"),
         ("ghcr.io/acme/web:1.4.2", "GHCR.IO/acme/web:1.4.2"),
     ] {
-        let m = managed(vec![diff("apps", "Deployment", Some(&deployment(&[target], &[])), None, false)]);
+        let m = managed(vec![diff(
+            "apps",
+            "Deployment",
+            Some(&deployment(&[target], &[])),
+            None,
+            false,
+        )]);
         let j = judge(&live_app(), &m, wanted);
-        assert!(!is_pass(&j), "target {target:?} vs wanted {wanted:?}: {j:?}");
+        assert!(
+            !is_pass(&j),
+            "target {target:?} vs wanted {wanted:?}: {j:?}"
+        );
     }
     // Several images: the input is one reference, not the joined version.
     let m = managed(vec![diff(
@@ -109,18 +142,41 @@ fn only_the_target_pod_templates_of_real_workloads_count() {
     });
     for (what, items) in [
         // Only in the live state: what runs now, not what git says.
-        ("live only", vec![diff("apps", "Deployment", None, Some(&with_image), false)]),
+        (
+            "live only",
+            vec![diff("apps", "Deployment", None, Some(&with_image), false)],
+        ),
         // A hook Job (by flag, and by annotation).
-        ("hook flag", vec![diff("batch", "Job", Some(&with_image), None, true)]),
-        ("hook annotation", vec![diff("apps", "Deployment", Some(&hooked), None, false)]),
+        (
+            "hook flag",
+            vec![diff("batch", "Job", Some(&with_image), None, true)],
+        ),
+        (
+            "hook annotation",
+            vec![diff("apps", "Deployment", Some(&hooked), None, false)],
+        ),
         // A kind that has no pod template, however its JSON is shaped.
-        ("configmap", vec![diff("", "ConfigMap", Some(&config_map), None, false)]),
+        (
+            "configmap",
+            vec![diff("", "ConfigMap", Some(&config_map), None, false)],
+        ),
         // A CRD that borrows the name `Deployment` in another group.
-        ("other group", vec![diff("evil.io", "Deployment", Some(&with_image), None, false)]),
+        (
+            "other group",
+            vec![diff(
+                "evil.io",
+                "Deployment",
+                Some(&with_image),
+                None,
+                false,
+            )],
+        ),
         // A targetState that is a string holding JSON twice, or not an object.
         (
             "double-encoded",
-            vec![json!({ "group": "apps", "kind": "Deployment", "targetState": with_image.to_string().replace('"', "\\\""), "hook": false })],
+            vec![
+                json!({ "group": "apps", "kind": "Deployment", "targetState": with_image.to_string().replace('"', "\\\""), "hook": false }),
+            ],
         ),
     ] {
         let j = judge(&live_app(), &managed(items), IMAGE);
@@ -130,9 +186,16 @@ fn only_the_target_pod_templates_of_real_workloads_count() {
 
 #[test]
 fn not_live_is_never_a_pass_even_at_the_image() {
-    let m = managed(vec![diff("apps", "Deployment", Some(&deployment(&[IMAGE], &[])), None, false)]);
+    let m = managed(vec![diff(
+        "apps",
+        "Deployment",
+        Some(&deployment(&[IMAGE], &[])),
+        None,
+        false,
+    )]);
     let running = json!({ "phase": "Running", "operation": { "sync": { "revision": REV } } });
-    let terminating = json!({ "phase": "Terminating", "operation": { "sync": { "revision": REV } } });
+    let terminating =
+        json!({ "phase": "Terminating", "operation": { "sync": { "revision": REV } } });
     for (what, a) in [
         ("out of sync", app("OutOfSync", "Healthy", None)),
         ("unknown sync", app("Unknown", "Healthy", None)),
@@ -143,9 +206,15 @@ fn not_live_is_never_a_pass_even_at_the_image() {
         ("degraded", app("Synced", "Degraded", None)),
         ("missing", app("Synced", "Missing", None)),
         ("suspended", app("Synced", "Suspended", None)),
-        ("no status", serde_json::from_value(json!({ "metadata": { "name": "web" } })).unwrap()),
+        (
+            "no status",
+            serde_json::from_value(json!({ "metadata": { "name": "web" } })).unwrap(),
+        ),
         ("operation running", app("Synced", "Healthy", Some(running))),
-        ("operation terminating", app("Synced", "Healthy", Some(terminating))),
+        (
+            "operation terminating",
+            app("Synced", "Healthy", Some(terminating)),
+        ),
     ] {
         let j = judge(&a, &m, IMAGE);
         assert!(!is_pass(&j), "{what}: {j:?}");
@@ -154,7 +223,13 @@ fn not_live_is_never_a_pass_even_at_the_image() {
 
 #[test]
 fn a_failed_sync_of_the_current_revision_fails_the_gate() {
-    let m = managed(vec![diff("apps", "Deployment", Some(&deployment(&[IMAGE], &[])), None, false)]);
+    let m = managed(vec![diff(
+        "apps",
+        "Deployment",
+        Some(&deployment(&[IMAGE], &[])),
+        None,
+        false,
+    )]);
     let failed = json!({
         "phase": "Failed",
         "message": "hook migrate failed",

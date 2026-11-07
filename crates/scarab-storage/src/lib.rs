@@ -406,19 +406,14 @@ pub fn content_identity_of(entries: &[TreeEntry]) -> Result<TreeHash, StorageErr
 /// and the alternative is the same walk anyway — a wholly-selected sub-tree is
 /// kept by hash without being descended into, so its identity is not in hand.
 /// The no-`outputs:` path never calls this: `ingest` folds the identity for free.
-pub async fn content_identity(
-    cas: &dyn Cas,
-    root: &TreeHash,
-) -> Result<TreeHash, StorageError> {
+pub async fn content_identity(cas: &dyn Cas, root: &TreeHash) -> Result<TreeHash, StorageError> {
     let entries = cas.tree_entries(root).await?;
     let mut resolved = Vec::with_capacity(entries.len());
     for entry in entries {
         let target = match &entry.target {
             // A sub-tree contributes its IDENTITY, so a nested mtime cannot
             // reach the root through a child's hash.
-            TreeTarget::Tree(sub) => {
-                TreeTarget::Tree(Box::pin(content_identity(cas, sub)).await?)
-            }
+            TreeTarget::Tree(sub) => TreeTarget::Tree(Box::pin(content_identity(cas, sub)).await?),
             blob => blob.clone(),
         };
         resolved.push(TreeEntry { target, ..entry });
@@ -632,11 +627,7 @@ mod tests {
     /// buggy chunk loop would diverge.
     #[test]
     fn sha256_hex_reader_matches_the_one_shot_digest() {
-        for data in [
-            Vec::new(),
-            b"abc".to_vec(),
-            vec![0xabu8; 64 * 1024 + 17],
-        ] {
+        for data in [Vec::new(), b"abc".to_vec(), vec![0xabu8; 64 * 1024 + 17]] {
             let mut cursor = std::io::Cursor::new(&data);
             assert_eq!(
                 sha256_hex_reader(&mut cursor).expect("in-memory read"),
@@ -699,8 +690,14 @@ mod tests {
         let hex = "a".repeat(64);
         let tagged = tagged_address(HashAlgo::Sha256, &hex);
         assert_eq!(tagged, format!("sha256:{hex}"));
-        assert_eq!(parse_address(&hex).unwrap(), (HashAlgo::Sha256, hex.as_str()));
-        assert_eq!(parse_address(&tagged).unwrap(), (HashAlgo::Sha256, hex.as_str()));
+        assert_eq!(
+            parse_address(&hex).unwrap(),
+            (HashAlgo::Sha256, hex.as_str())
+        );
+        assert_eq!(
+            parse_address(&tagged).unwrap(),
+            (HashAlgo::Sha256, hex.as_str())
+        );
     }
 
     /// An unknown tag errors rather than falling through as SHA-256 — filing

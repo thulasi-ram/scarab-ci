@@ -88,7 +88,10 @@ mod tests {
         assert_eq!(cfg.api_token_file, None);
         let cfg = Config::from_lookup(env(&[
             ("SCARAB_BROKER_URL", "http://10.0.0.1:8090"),
-            ("SCARAB_API_TOKEN_FILE", "/var/run/secrets/scarab/broker/api-token"),
+            (
+                "SCARAB_API_TOKEN_FILE",
+                "/var/run/secrets/scarab/broker/api-token",
+            ),
         ]))
         .unwrap();
         assert_eq!(

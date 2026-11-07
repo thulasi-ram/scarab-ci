@@ -30,7 +30,9 @@ use scarab_policy::library::{
     content_hash, LibraryStore, LibraryVersion, LibraryYank, NewInstallation, Replaces,
 };
 use scarab_server::plugins::PluginPolicy;
-use scarab_server::{broker, router, trigger_runs_from_event, AdmissionPorts, AppState, LogService};
+use scarab_server::{
+    broker, router, trigger_runs_from_event, AdmissionPorts, AppState, LogService,
+};
 use scarab_testkit::{
     FakeAuthenticator, FakeClock, FakeExecutor, FakeForge, InMemoryLibraries, InMemoryObjectStore,
     InMemorySessions,
@@ -260,7 +262,11 @@ async fn release(
     call(
         app,
         "POST",
-        &format!("/v1/runs/{}/gates/{}/release", run.0, step.replace('/', "%2F")),
+        &format!(
+            "/v1/runs/{}/gates/{}/release",
+            run.0,
+            step.replace('/', "%2F")
+        ),
         Some(token),
         Some(body),
     )
@@ -325,12 +331,22 @@ async fn a_plugin_lists_only_the_waits_that_name_it_in_its_own_org() {
     assert_eq!(page["gates"], json!([]));
 
     // Only the caller's open waits are listed.
-    for q in ["/v1/orgs/acme/gates?releaser=me", "/v1/orgs/acme/gates?pending=true"] {
+    for q in [
+        "/v1/orgs/acme/gates?releaser=me",
+        "/v1/orgs/acme/gates?pending=true",
+    ] {
         let (status, _) = call(&w.public, "GET", q, Some(&w.prod), None).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{q}");
     }
     // No token, or a token that proves nothing.
-    let (status, _) = call(&w.public, "GET", "/v1/orgs/acme/gates?pending=true&releaser=me", None, None).await;
+    let (status, _) = call(
+        &w.public,
+        "GET",
+        "/v1/orgs/acme/gates?pending=true&releaser=me",
+        None,
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     let (status, _) = pending(&w.public, "acme", "not-a-token", "").await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -356,7 +372,11 @@ async fn a_plugin_releases_its_own_gate_with_typed_outputs() {
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
     // Outputs are what the gate declares, of their types.
-    for outputs in [json!({}), json!({ "revision": 7 }), json!({ "revision": "a", "x": 1 })] {
+    for outputs in [
+        json!({}),
+        json!({ "revision": 7 }),
+        json!({ "revision": "a", "x": 1 }),
+    ] {
         let (status, body) = release(
             &w.broker,
             &w.run,
@@ -367,7 +387,10 @@ async fn a_plugin_releases_its_own_gate_with_typed_outputs() {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{outputs}: {body}");
     }
-    assert_eq!(status_of(w.pg.as_ref(), &w.run, "live").await, StepStatus::Pending);
+    assert_eq!(
+        status_of(w.pg.as_ref(), &w.run, "live").await,
+        StepStatus::Pending
+    );
 
     let (status, body) = release(
         &w.broker,
@@ -378,21 +401,26 @@ async fn a_plugin_releases_its_own_gate_with_typed_outputs() {
     )
     .await;
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
-    assert_eq!(status_of(w.pg.as_ref(), &w.run, "live").await, StepStatus::Succeeded);
+    assert_eq!(
+        status_of(w.pg.as_ref(), &w.run, "live").await,
+        StepStatus::Succeeded
+    );
     // The outputs are the gate's results, read downstream.
-    let results = w.pg.step_results(&w.run, &StepId("live".into())).await.unwrap();
+    let results =
+        w.pg.step_results(&w.run, &StepId("live".into()))
+            .await
+            .unwrap();
     assert_eq!(results.get("revision"), Some(&json!("abc123")));
     // Journalled by the plugin.
-    let by = w
-        .pg
-        .events(&w.run)
-        .await
-        .unwrap()
-        .into_iter()
-        .find_map(|e| match e.kind {
-            EventPayload::GateResolved { step, by, .. } if step.0 == "live" => by,
-            _ => None,
-        });
+    let by =
+        w.pg.events(&w.run)
+            .await
+            .unwrap()
+            .into_iter()
+            .find_map(|e| match e.kind {
+                EventPayload::GateResolved { step, by, .. } if step.0 == "live" => by,
+                _ => None,
+            });
     assert_eq!(by.as_deref(), Some("plugin:argocd-prod"));
     // Exactly once.
     let (status, _) = release(
@@ -408,7 +436,14 @@ async fn a_plugin_releases_its_own_gate_with_typed_outputs() {
     assert_eq!(page["gates"], json!([]));
     // The Run page's view of the gate: who released it, its expiry, the
     // inputs rendered when it was reached, and its typed output's value.
-    let (status, run) = call(&w.public, "GET", &format!("/v1/runs/{}", w.run.0), None, None).await;
+    let (status, run) = call(
+        &w.public,
+        "GET",
+        &format!("/v1/runs/{}", w.run.0),
+        None,
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{run}");
     let live = run["steps"]
         .as_array()
@@ -427,7 +462,10 @@ async fn a_plugin_releases_its_own_gate_with_typed_outputs() {
         600_000
     );
     assert_eq!(g["inputs"]["app"], "web");
-    assert_eq!(g["outputs"], json!([{ "name": "revision", "type": "string", "value": "abc123" }]));
+    assert_eq!(
+        g["outputs"],
+        json!([{ "name": "revision", "type": "string", "value": "abc123" }])
+    );
     assert_eq!(live["origin"][0]["kind"], "plugin");
     w.tdb.cleanup().await;
 }
@@ -457,8 +495,14 @@ async fn a_plugin_fails_its_gate_only_with_a_reason() {
     )
     .await;
     assert_eq!(status, StatusCode::ACCEPTED);
-    assert_eq!(status_of(w.pg.as_ref(), &w.run, "live").await, StepStatus::Failed);
-    let attempts = w.pg.attempts_of_step(&w.run, &StepId("live".into())).await.unwrap();
+    assert_eq!(
+        status_of(w.pg.as_ref(), &w.run, "live").await,
+        StepStatus::Failed
+    );
+    let attempts =
+        w.pg.attempts_of_step(&w.run, &StepId("live".into()))
+            .await
+            .unwrap();
     assert_eq!(
         attempts.last().unwrap().failure_detail.as_deref(),
         Some("rejected by plugin:argocd-prod: sync failed: hook migrate failed")
@@ -484,7 +528,14 @@ async fn a_plugin_cannot_release_a_manual_gate_another_installation_s_or_another
     let (status, _) = release(&w.broker, &w.run, "approve", &w.prod, pass("a1")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     // The same installation name in another org.
-    let (status, _) = release(&w.public, &w.run, "live", &w.other_org_prod, pass(&live_attempt)).await;
+    let (status, _) = release(
+        &w.public,
+        &w.run,
+        "live",
+        &w.other_org_prod,
+        pass(&live_attempt),
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     for step in ["stage", "approve", "live"] {
         assert_eq!(
@@ -504,7 +555,8 @@ async fn a_plugin_cannot_release_a_manual_gate_another_installation_s_or_another
             roles: vec![],
         },
     ));
-    let st = state(w.pg.clone(), w.clock.clone()).with_auth(auth, Arc::new(InMemorySessions::new()));
+    let st =
+        state(w.pg.clone(), w.clock.clone()).with_auth(auth, Arc::new(InMemorySessions::new()));
     let (status, _) = call(
         &router(st),
         "POST",
@@ -514,7 +566,10 @@ async fn a_plugin_cannot_release_a_manual_gate_another_installation_s_or_another
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert_eq!(status_of(w.pg.as_ref(), &w.run, "approve").await, StepStatus::Pending);
+    assert_eq!(
+        status_of(w.pg.as_ref(), &w.run, "approve").await,
+        StepStatus::Pending
+    );
     w.tdb.cleanup().await;
 }
 
@@ -536,7 +591,10 @@ async fn an_expired_wait_cannot_be_released() {
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert!(body.to_string().contains("expired"), "{body}");
-    assert_ne!(status_of(w.pg.as_ref(), &w.run, "live").await, StepStatus::Succeeded);
+    assert_ne!(
+        status_of(w.pg.as_ref(), &w.run, "live").await,
+        StepStatus::Succeeded
+    );
     w.tdb.cleanup().await;
 }
 
@@ -557,7 +615,14 @@ async fn a_killed_installation_lists_and_resolves_nothing() {
     let (status, _) = pending(&w.broker, "acme", &w.prod, "").await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     // The Run page says the gate's plugin is killed.
-    let (_, run) = call(&w.public, "GET", &format!("/v1/runs/{}", w.run.0), None, None).await;
+    let (_, run) = call(
+        &w.public,
+        "GET",
+        &format!("/v1/runs/{}", w.run.0),
+        None,
+        None,
+    )
+    .await;
     let live = run["steps"]
         .as_array()
         .unwrap()
@@ -576,9 +641,20 @@ async fn inputs_that_do_not_render_fail_the_gate_with_the_reason() {
     let Some(w) = world(PIPELINE, None, false).await else {
         return;
     };
-    assert_eq!(status_of(w.pg.as_ref(), &w.run, "live").await, StepStatus::Failed);
-    let attempts = w.pg.attempts_of_step(&w.run, &StepId("live".into())).await.unwrap();
-    let detail = attempts.last().unwrap().failure_detail.clone().unwrap_or_default();
+    assert_eq!(
+        status_of(w.pg.as_ref(), &w.run, "live").await,
+        StepStatus::Failed
+    );
+    let attempts =
+        w.pg.attempts_of_step(&w.run, &StepId("live".into()))
+            .await
+            .unwrap();
+    let detail = attempts
+        .last()
+        .unwrap()
+        .failure_detail
+        .clone()
+        .unwrap_or_default();
     assert!(detail.contains("its inputs do not render"), "{detail}");
     // A gate with no rendered inputs is never listed.
     let (_, page) = pending(&w.broker, "acme", &w.prod, "").await;
@@ -679,7 +755,10 @@ async fn a_gate_from_a_yanked_library_version_does_not_release() {
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert!(body.to_string().contains("pins a broken wait"), "{body}");
-    assert_eq!(status_of(w.pg.as_ref(), &w.run, "ship/live").await, StepStatus::Pending);
+    assert_eq!(
+        status_of(w.pg.as_ref(), &w.run, "ship/live").await,
+        StepStatus::Pending
+    );
     w.tdb.cleanup().await;
 }
 
@@ -698,7 +777,10 @@ async fn a_person_can_reject_a_plugin_gate_but_not_pass_it() {
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(status_of(w.pg.as_ref(), &w.run, "live").await, StepStatus::Pending);
+    assert_eq!(
+        status_of(w.pg.as_ref(), &w.run, "live").await,
+        StepStatus::Pending
+    );
     // A writer may fail it sooner, with a reason.
     let (status, body) = call(
         &w.public,
@@ -709,6 +791,9 @@ async fn a_person_can_reject_a_plugin_gate_but_not_pass_it() {
     )
     .await;
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
-    assert_eq!(status_of(w.pg.as_ref(), &w.run, "live").await, StepStatus::Failed);
+    assert_eq!(
+        status_of(w.pg.as_ref(), &w.run, "live").await,
+        StepStatus::Failed
+    );
     w.tdb.cleanup().await;
 }

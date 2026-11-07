@@ -199,7 +199,10 @@ fn survived_outside_value_through_cel_operators_is_outside() {
             }
         }
     }
-    assert!(launched.is_empty(), "outside `-` value launched: {launched:#?}");
+    assert!(
+        launched.is_empty(),
+        "outside `-` value launched: {launched:#?}"
+    );
 }
 
 /// The same expressions in a library, two levels from the Run parameter,
@@ -226,14 +229,19 @@ fn survived_outside_value_two_library_levels_down_is_outside() {
         );
         let yaml = "interface: { inputs: [{ name: ref, type: string }] }\nsteps: [{ id: c, invoke: file:l1.yaml, with: { a: \"${{ inputs.ref }}\" } }]\n";
         let libs = files(&[("l1.yaml", &l1), ("l2.yaml", &l2)]);
-        let Ok(ir) = compile(yaml, &libs) else { continue };
+        let Ok(ir) = compile(yaml, &libs) else {
+            continue;
+        };
         if let Ok(r) = launch(step(&ir, "c/n/s"), json!({ "ref": EVIL }), json!({})) {
             if r.command[3].starts_with('-') {
                 launched.push((l1_with, l2_arg, r.command[3].clone()));
             }
         }
     }
-    assert!(launched.is_empty(), "outside `-` value launched: {launched:#?}");
+    assert!(
+        launched.is_empty(),
+        "outside `-` value launched: {launched:#?}"
+    );
 }
 
 /// A library's matrix value that holds `${{ inputs.v }}` (an outside
@@ -285,11 +293,18 @@ fn dash_dash_exemption_does_not_cover_forwarded_arguments() {
         &["yarn", "test", "--", "${{ inputs.p }}"][..],
     ] {
         let ir = run_level(cmd);
-        if let Ok(r) = launch(step(&ir, "s"), json!({ "p": "--config=/tmp/evil.js" }), json!({})) {
+        if let Ok(r) = launch(
+            step(&ir, "s"),
+            json!({ "p": "--config=/tmp/evil.js" }),
+            json!({}),
+        ) {
             launched.push(r.command);
         }
     }
-    assert!(launched.is_empty(), "outside `-` value forwarded past `--`: {launched:#?}");
+    assert!(
+        launched.is_empty(),
+        "outside `-` value forwarded past `--`: {launched:#?}"
+    );
 }
 
 /// Preview and launch with the same Run parameters agree on whether the
@@ -340,16 +355,31 @@ fn an_outside_value_in_a_re_split_argument_is_refused() {
     let mut launched = Vec::new();
     for (cmd, value) in [
         (&["env", "-S", "git fetch origin ${{ inputs.p }}"][..], EVIL),
-        (&["ssh", "deploy@prod", "cd app && git checkout ${{ inputs.p }}"][..], "main; id"),
-        (&["su", "-c", "git checkout ${{ inputs.p }}"][..], "main; id"),
-        (&["flock", "/tmp/l", "-c", "git checkout ${{ inputs.p }}"][..], "main; id"),
+        (
+            &[
+                "ssh",
+                "deploy@prod",
+                "cd app && git checkout ${{ inputs.p }}",
+            ][..],
+            "main; id",
+        ),
+        (
+            &["su", "-c", "git checkout ${{ inputs.p }}"][..],
+            "main; id",
+        ),
+        (
+            &["flock", "/tmp/l", "-c", "git checkout ${{ inputs.p }}"][..],
+            "main; id",
+        ),
     ] {
         let cmd_yaml: Vec<String> = cmd.iter().map(|c| q(c)).collect();
         let yaml = format!(
             "interface: {{ inputs: [{{ name: p, type: string }}] }}\nsteps: [{{ id: s, image: busybox, command: [{}] }}]\n",
             cmd_yaml.join(", ")
         );
-        let Ok(ir) = compile(&yaml, &Libraries::default()) else { continue };
+        let Ok(ir) = compile(&yaml, &Libraries::default()) else {
+            continue;
+        };
         if let Ok(r) = launch(step(&ir, "s"), json!({ "p": value }), json!({})) {
             launched.push(r.command);
         }
@@ -377,7 +407,10 @@ fn an_outside_value_may_not_name_the_program() {
             launched.push(r.command);
         }
     }
-    assert!(launched.is_empty(), "outside value chose the program: {launched:#?}");
+    assert!(
+        launched.is_empty(),
+        "outside value chose the program: {launched:#?}"
+    );
 }
 
 // ================================================== 3. script check
@@ -512,11 +545,17 @@ fn script_check_sees_other_interpreters() {
 fn survived_script_check_classifies_these_as_outside() {
     // A Pipeline input with a default that the dispatcher may override.
     let yaml = "interface: { inputs: [{ name: p, type: string, required: false, default: safe }] }\nsteps: [{ id: s, image: busybox, command: [sh, -c, \"echo ${{ inputs.p }}\"] }]\n";
-    assert!(compile(yaml, &Libraries::default()).is_err(), "default-able Run param");
+    assert!(
+        compile(yaml, &Libraries::default()).is_err(),
+        "default-able Run param"
+    );
     // A library input bound to `${{ outputs.b.v }}` by its caller.
     let lib = "kind: library\ninterface: { inputs: [{ name: v, type: string }] }\nsteps: [{ id: s, image: busybox, command: [sh, -c, \"echo ${{ inputs.v }}\"] }]\n";
     let yaml = "steps:\n  - { id: b, image: busybox, results: [v] }\n  - { id: c, invoke: file:l.yaml, needs: [b], with: { v: \"${{ outputs.b.v }}\" } }\n";
-    assert!(compile(yaml, &files(&[("l.yaml", lib)])).is_err(), "result via with:");
+    assert!(
+        compile(yaml, &files(&[("l.yaml", lib)])).is_err(),
+        "result via with:"
+    );
     // Two levels, the outer one by CEL over a Run parameter.
     let l1 = "kind: library\ninterface: { inputs: [{ name: a, type: string }] }\nsteps: [{ id: n, invoke: file:l.yaml, with: { v: \"pre-${{ inputs.a + '' }}\" } }]\n";
     let yaml = "interface: { inputs: [{ name: p, type: string }] }\nsteps: [{ id: c, invoke: file:l1.yaml, with: { a: \"${{ inputs.p }}\" } }]\n";
@@ -548,12 +587,24 @@ fn survived_yaml_alias_expansion_is_bounded() {
     }
     yaml.push_str("steps: [{ id: s, image: busybox, env: [[A, *a9]] }]\n");
     let (r, took) = timed(|| compile(&yaml, &Libraries::default()));
-    eprintln!("billion laughs: {} B -> {:?} in {took:?}", yaml.len(), r.as_ref().map(|_| ()));
+    eprintln!(
+        "billion laughs: {} B -> {:?} in {took:?}",
+        yaml.len(),
+        r.as_ref().map(|_| ())
+    );
     assert!(took < Duration::from_secs(3), "{took:?}");
     // The same in a library.
     let lib = format!("kind: library\n{yaml}");
-    let (r, took) = timed(|| compile("steps: [{ id: c, invoke: file:l.yaml }]\n", &files(&[("l.yaml", &lib)])));
-    eprintln!("billion laughs (library): {:?} in {took:?}", r.as_ref().map(|_| ()));
+    let (r, took) = timed(|| {
+        compile(
+            "steps: [{ id: c, invoke: file:l.yaml }]\n",
+            &files(&[("l.yaml", &lib)]),
+        )
+    });
+    eprintln!(
+        "billion laughs (library): {:?} in {took:?}",
+        r.as_ref().map(|_| ())
+    );
     assert!(took < Duration::from_secs(3), "{took:?}");
 }
 
@@ -610,7 +661,9 @@ fn compile_time_is_bounded_for_a_long_matrix_exclude_list() {
     eprintln!(
         "{} B source, 65536 combinations x 48 excludes: {:?} in {took:?}",
         yaml.len(),
-        r.as_ref().map(|ir| ir.steps.len()).map_err(|e| e[0].chars().take(80).collect::<String>())
+        r.as_ref()
+            .map(|ir| ir.steps.len())
+            .map_err(|e| e[0].chars().take(80).collect::<String>())
     );
     assert!(took < Duration::from_secs(3), "{took:?}");
 }
@@ -621,7 +674,11 @@ fn rss() -> u64 {
         .args(["-o", "rss=", "-p", &std::process::id().to_string()])
         .output()
         .expect("ps");
-    String::from_utf8_lossy(&out.stdout).trim().parse::<u64>().unwrap_or(0) * 1024
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<u64>()
+        .unwrap_or(0)
+        * 1024
 }
 
 /// The most this process's RSS rose above its start while `f` ran,
@@ -659,15 +716,23 @@ fn compile_memory_is_bounded_for_a_matrix_of_long_values() {
     for d in 0..16 {
         dims.push_str(&format!("d{d}: [a{v}, b{v}], "));
     }
-    let yaml = format!("steps: [{{ id: s, image: busybox, matrix: {{ dimensions: {{ {dims} }} }} }}]\n");
+    let yaml =
+        format!("steps: [{{ id: s, image: busybox, matrix: {{ dimensions: {{ {dims} }} }} }}]\n");
     let ((r, took), grew) = peak_rss_growth(|| timed(|| compile(&yaml, &Libraries::default())));
     eprintln!(
         "{} B source -> RSS +{} MB, {:?} in {took:?}",
         yaml.len(),
         grew >> 20,
-        r.as_ref().map(|ir| ir.steps.len()).map_err(|e| e[0].chars().take(80).collect::<String>())
+        r.as_ref()
+            .map(|ir| ir.steps.len())
+            .map_err(|e| e[0].chars().take(80).collect::<String>())
     );
-    assert!(grew < 256 << 20, "a {} B Pipeline grew RSS by {} MB", yaml.len(), grew >> 20);
+    assert!(
+        grew < 256 << 20,
+        "a {} B Pipeline grew RSS by {} MB",
+        yaml.len(),
+        grew >> 20
+    );
 }
 
 /// A library input with a long `options` list and a `validate:`, bound by
@@ -687,7 +752,12 @@ fn survived_long_options_list_per_binding_is_capped_and_fast() {
     let yaml = "interface: { inputs: [{ name: p, type: string }] }\nsteps: [{ id: c, invoke: file:l.yaml, with: { v: \"${{ inputs.p }}\" } }]\n";
     let (r, took) = timed(|| compile(yaml, &files(&[("l.yaml", &lib)])));
     let out = r.as_ref().map(|ir| serde_json::to_vec(ir).unwrap().len());
-    eprintln!("{} B library -> {:?} in {took:?}", lib.len(), out.as_ref().map_err(|e| e[0].chars().take(80).collect::<String>()));
+    eprintln!(
+        "{} B library -> {:?} in {took:?}",
+        lib.len(),
+        out.as_ref()
+            .map_err(|e| e[0].chars().take(80).collect::<String>())
+    );
     assert!(took < Duration::from_secs(5), "{took:?}");
     if let Ok(n) = out {
         assert!(n <= 16 << 20, "{n}");

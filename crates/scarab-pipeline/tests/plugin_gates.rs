@@ -226,7 +226,11 @@ fn a_gate_output_is_refused_in_a_command_at_launch() {
             vec!["git".to_string(), reference.to_string()],
             vec![reference.to_string()],
             vec!["git".to_string(), format!("--rev={reference}")],
-            vec!["sh".to_string(), "-c".to_string(), format!("echo {reference}")],
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                format!("echo {reference}"),
+            ],
         ] {
             let err = launch(revision, &command, &[]).unwrap_err();
             assert!(

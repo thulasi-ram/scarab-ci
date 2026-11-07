@@ -397,11 +397,7 @@ fn parse_message(msg: &str) -> Result<WorkspaceClaims, WorkspaceTokenError> {
 /// Claims for a Step Pod: `read` scope, fenced, limited to the snapshot roots
 /// the step actually inherits. `roots` is sorted here so the caller cannot make
 /// the message depend on collection order.
-pub fn step_claims(
-    fence: Fence,
-    exp: i64,
-    mut roots: Vec<String>,
-) -> WorkspaceClaims {
+pub fn step_claims(fence: Fence, exp: i64, mut roots: Vec<String>) -> WorkspaceClaims {
     roots.sort();
     roots.dedup();
     WorkspaceClaims {
@@ -523,7 +519,10 @@ mod tests {
             "wsv2.abc.sha256=00",
             "wsv1.abc.sha256=00.extra",
         ] {
-            assert!(verify(SECRET, bad, 0).is_err(), "{bad:?} should be an error");
+            assert!(
+                verify(SECRET, bad, 0).is_err(),
+                "{bad:?} should be an error"
+            );
         }
     }
 
@@ -600,8 +599,12 @@ mod tests {
     /// leaving them out of `may_read_tree` (the restore's `/flat` 403s).
     #[test]
     fn cache_roots_round_trip_and_are_readable_but_not_required() {
-        let claims = step_claims(fence(), 2_000, vec!["in1".into()])
-            .with_cache_roots(vec!["c2".into(), "in1".into(), "c1".into(), "c2".into()]);
+        let claims = step_claims(fence(), 2_000, vec!["in1".into()]).with_cache_roots(vec![
+            "c2".into(),
+            "in1".into(),
+            "c1".into(),
+            "c2".into(),
+        ]);
         // An input that is also a cache root stays required only.
         assert_eq!(claims.cache_roots, vec!["c1".to_string(), "c2".to_string()]);
         let out = verify(SECRET, &mint(SECRET, &claims), 0).expect("verifies");
@@ -628,8 +631,8 @@ mod tests {
     /// A Pod cannot widen its cache claim either.
     #[test]
     fn tampering_with_the_cache_roots_claim_fails_the_mac() {
-        let claims = step_claims(fence(), 2_000, vec!["aaa".into()])
-            .with_cache_roots(vec!["ccc".into()]);
+        let claims =
+            step_claims(fence(), 2_000, vec!["aaa".into()]).with_cache_roots(vec!["ccc".into()]);
         let token = mint(SECRET, &claims);
         let forged = message(&WorkspaceClaims {
             cache_roots: vec!["ccc".into(), "secret-tree".into()],

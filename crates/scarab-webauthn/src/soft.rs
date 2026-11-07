@@ -246,11 +246,7 @@ impl SoftPasskey {
     }
 
     /// The COSE_Key (RFC 9052 §7) for `key`, with `alg` as written.
-    fn cose_key(
-        key: &Key,
-        alg: i64,
-        tamper: Option<KeyTamper>,
-    ) -> Result<Vec<u8>, SoftError> {
+    fn cose_key(key: &Key, alg: i64, tamper: Option<KeyTamper>) -> Result<Vec<u8>, SoftError> {
         let tamper = |mut a: Vec<u8>, mut b: Vec<u8>| {
             if let Some(f) = tamper {
                 f(&mut a, &mut b);

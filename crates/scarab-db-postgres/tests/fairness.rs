@@ -83,7 +83,11 @@ async fn no_project_cap_by_default() {
     let sched = Scheduler::new(&db, &clock, &exec, "sched-1");
     admit_pass(&sched, &db).await;
     for id in ["a", "b", "c"] {
-        assert_eq!(status(&db, id).await, RunStatus::Running, "{id} admits with no cap");
+        assert_eq!(
+            status(&db, id).await,
+            RunStatus::Running,
+            "{id} admits with no cap"
+        );
     }
     tdb.cleanup().await;
 }
@@ -106,7 +110,11 @@ async fn a_suspended_run_does_not_count_toward_the_project_cap() {
     let sched = Scheduler::new(&db, &clock, &exec, "sched-1").with_project_run_cap(1);
     admit_pass(&sched, &db).await;
     assert_eq!(status(&db, "waiting").await, RunStatus::Running);
-    assert_eq!(status(&db, "next").await, RunStatus::Pending, "the cap of 1 holds");
+    assert_eq!(
+        status(&db, "next").await,
+        RunStatus::Pending,
+        "the cap of 1 holds"
+    );
     // The running run now waits on a gate.
     db.commit_run_transition(
         None,

@@ -169,7 +169,9 @@ async fn drain_and_record(
 /// presence (the GET would 404 the moment the sweep ran).
 #[tokio::test(flavor = "multi_thread")]
 async fn an_evicted_durable_snapshot_reads_back_from_its_pack_and_reheals_warm() {
-    let Some(h) = Harness::start().await else { return };
+    let Some(h) = Harness::start().await else {
+        return;
+    };
     let ws = tempfile::tempdir().unwrap();
     build_outputs(ws.path());
 
@@ -213,7 +215,9 @@ async fn an_evicted_durable_snapshot_reads_back_from_its_pack_and_reheals_warm()
 /// arrive, byte-complete.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_eviction_mid_stream_does_not_tear_the_read() {
-    let Some(h) = Harness::start().await else { return };
+    let Some(h) = Harness::start().await else {
+        return;
+    };
 
     // Big enough for many 64 KiB chunks, so "mid-stream" is real.
     let big: Vec<u8> = (0..4 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
@@ -235,7 +239,10 @@ async fn an_eviction_mid_stream_does_not_tear_the_read() {
         .expect("first chunk")
         .expect("body is not empty");
     got.extend_from_slice(&first);
-    assert!(got.len() < big.len(), "the read must genuinely be mid-stream");
+    assert!(
+        got.len() < big.len(),
+        "the read must genuinely be mid-stream"
+    );
 
     // The race: the sweep wins the directory entry while the stream holds
     // the inode.
@@ -248,7 +255,11 @@ async fn an_eviction_mid_stream_does_not_tear_the_read() {
     while let Some(chunk) = resp.chunk().await.expect("continue the stream") {
         got.extend_from_slice(&chunk);
     }
-    assert_eq!(got.len(), big.len(), "the stream must complete, not truncate");
+    assert_eq!(
+        got.len(),
+        big.len(),
+        "the stream must complete, not truncate"
+    );
     assert_eq!(
         scarab_storage::sha256_hex(&got),
         hash.0,
@@ -264,7 +275,9 @@ async fn an_eviction_mid_stream_does_not_tear_the_read() {
 /// by the keyed-Cache work and is deliberately NOT depended on here.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_evicted_cache_only_tree_is_an_honest_have_miss_and_feed_404() {
-    let Some(h) = Harness::start().await else { return };
+    let Some(h) = Harness::start().await else {
+        return;
+    };
 
     // The control plane's fenceless warm leg: explicit cache-only PUTs.
     let cc = h.browse_client().cache_only_cas();
@@ -309,7 +322,10 @@ async fn an_evicted_cache_only_tree_is_an_honest_have_miss_and_feed_404() {
     // The feed of that tree: an honest NotFound at both reads, so a consumer
     // treats it as the miss it is instead of retrying a 500 forever.
     assert!(
-        matches!(h.browse_client().flat(&tree).await, Err(StorageError::NotFound)),
+        matches!(
+            h.browse_client().flat(&tree).await,
+            Err(StorageError::NotFound)
+        ),
         "the flat walk of an evicted cache-only tree must 404"
     );
     assert!(
@@ -332,7 +348,9 @@ async fn an_evicted_cache_only_tree_is_an_honest_have_miss_and_feed_404() {
 /// wastefully re-upload everything the moment the sweep ran.
 #[tokio::test(flavor = "multi_thread")]
 async fn have_then_evict_then_drain_still_commits_on_the_index_not_on_warm() {
-    let Some(h) = Harness::start().await else { return };
+    let Some(h) = Harness::start().await else {
+        return;
+    };
     let ws = tempfile::tempdir().unwrap();
     build_outputs(ws.path());
 

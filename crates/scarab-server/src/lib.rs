@@ -83,12 +83,13 @@ use scarab_identity::{Action, Principal, Session};
 /// not part of the public API.
 pub mod broker;
 pub mod broker_proxy;
-pub mod forge_token;
 pub mod config;
 pub mod connections_config;
 pub mod converged;
 pub mod depot_expiry;
+pub mod followups;
 pub mod forge_router;
+pub mod forge_token;
 pub mod infra_observer;
 pub mod libraries;
 pub mod library_fetch;
@@ -99,25 +100,24 @@ pub mod oauth;
 pub mod oidc;
 /// ADR-0071: the minimal org-level Environment — its admin/read API.
 pub mod org_environments;
-/// ADR-0072 §9: the plugin runtime's leased reconcile loop — namespace
-/// baseline, isolation probe, one workload per installation.
-pub mod plugin_runtime;
 /// ADR-0072: PluginInstallations — the first-party catalog, install,
 /// uninstall and the kill switch.
 pub mod plugin_gates;
+/// ADR-0072 §9: the plugin runtime's leased reconcile loop — namespace
+/// baseline, isolation probe, one workload per installation.
+pub mod plugin_runtime;
 pub mod plugins;
 /// ADR-0075: the Policy API — org Policies, Project typed settings, the
 /// decision logs and the policy test API.
 pub mod policies;
 mod policy_checkpoints;
-pub mod retention;
 mod refused_runs;
+pub mod retention;
 mod routes;
-pub mod run_origin;
-pub mod schedules;
-pub mod followups;
 /// Slice b, criterion 5: the Run page's gate resolution per step.
 mod run_gate_view;
+pub mod run_origin;
+pub mod schedules;
 pub use routes::{route_table, RouteEntry};
 pub mod secret_executor;
 pub mod step_up;
@@ -2181,7 +2181,9 @@ async fn list_pipelines(
                 },
             },
             // A file that vanished between list and read → skip it.
-            Err(scarab_forge::ForgeError::Api(_) | scarab_forge::ForgeError::NotFound(_)) => continue,
+            Err(scarab_forge::ForgeError::Api(_) | scarab_forge::ForgeError::NotFound(_)) => {
+                continue
+            }
             Err(e) => return Err(ApiError::BadRequest(e.to_string())),
         };
         pipelines.push(entry);
@@ -2315,8 +2317,8 @@ async fn pipeline_interface(
         let (_, yaml) = read_named_pipeline(forge, &repo, &sha, &name).await?;
         let installed =
             installed_libraries(st.libraries.as_deref(), st.plugins.as_deref(), &repo.owner)
-            .await
-            .map_err(DispatchError::Db)?;
+                .await
+                .map_err(DispatchError::Db)?;
         let ir = prefetch_libs_and_compile(forge, &repo, &sha, &yaml, &installed).await?;
         Ok::<_, DispatchError>(PipelineInterfaceResponse {
             sha,
@@ -5061,7 +5063,9 @@ async fn prefetch_libs_and_compile(
                 worklist.extend(scarab_pipeline::invoke_refs(&src));
                 libs.insert(lib_path, src);
             }
-            Err(scarab_forge::ForgeError::Api(_) | scarab_forge::ForgeError::NotFound(_)) => continue,
+            Err(scarab_forge::ForgeError::Api(_) | scarab_forge::ForgeError::NotFound(_)) => {
+                continue
+            }
             Err(e) => return Err(TriggerError::Forge(e)),
         }
     }
@@ -5444,8 +5448,9 @@ async fn admit_and_create_run(
     if let (Admission::Refused(refusal), Some(repo)) = (&admission, event.repo()) {
         let (kind, messages): (&str, &[String]) = match refusal {
             AdmissionRefusal::RefNotAllowed => ("", &[]),
-            AdmissionRefusal::UnknownEnvironment { .. }
-            | AdmissionRefusal::NotEligible { .. } => ("environment", &[]),
+            AdmissionRefusal::UnknownEnvironment { .. } | AdmissionRefusal::NotEligible { .. } => {
+                ("environment", &[])
+            }
             AdmissionRefusal::PolicyDenied { messages, .. } => ("policy", messages),
             AdmissionRefusal::LibraryYanked { messages } => ("yanked", messages),
             AdmissionRefusal::EventField { messages } => ("event_field", messages),
@@ -5457,7 +5462,11 @@ async fn admit_and_create_run(
             let errors: Vec<CompileErrorDto> = if messages.is_empty() {
                 vec![CompileErrorDto::other(message.clone())]
             } else {
-                messages.iter().cloned().map(CompileErrorDto::other).collect()
+                messages
+                    .iter()
+                    .cloned()
+                    .map(CompileErrorDto::other)
+                    .collect()
             };
             record_refusal(db, clock, event, path, kind, message, &errors).await;
         }
@@ -5606,7 +5615,9 @@ async fn admit_unrecorded(
     let facts = match forge_token::event_facts(event, clone_url.as_deref(), ir) {
         Ok(facts) => facts,
         Err(messages) => {
-            return Ok(Admission::Refused(AdmissionRefusal::EventField { messages }))
+            return Ok(Admission::Refused(AdmissionRefusal::EventField {
+                messages,
+            }))
         }
     };
     let write = match gov.protection() {
@@ -6168,7 +6179,10 @@ fn admission_refusal_message(refusal: &AdmissionRefusal, org: &str, project: &st
 }
 
 fn event_field_message(messages: &[String]) -> String {
-    format!("this Run reads a trigger value it cannot use: {}", messages.join("; "))
+    format!(
+        "this Run reads a trigger value it cannot use: {}",
+        messages.join("; ")
+    )
 }
 
 fn forge_token_message(messages: &[String]) -> String {
@@ -6270,7 +6284,9 @@ async fn read_named_pipeline(
                 let yaml = String::from_utf8(bytes).map_err(|_| DispatchError::NotUtf8)?;
                 return Ok((candidate, yaml));
             }
-            Err(scarab_forge::ForgeError::Api(_) | scarab_forge::ForgeError::NotFound(_)) => continue,
+            Err(scarab_forge::ForgeError::Api(_) | scarab_forge::ForgeError::NotFound(_)) => {
+                continue
+            }
             Err(e) => return Err(DispatchError::Forge(e)),
         }
     }
@@ -8251,7 +8267,10 @@ async fn link_callback(
         }
         Ok(_) => format!("/settings/profile?identity_linked={}", flow.provider),
         Err(scarab_identity::IdentityError::Conflict(why)) => {
-            format!("/settings/profile?identity_link_error={}", query_escape(&why))
+            format!(
+                "/settings/profile?identity_link_error={}",
+                query_escape(&why)
+            )
         }
         Err(e) => return Err(ApiError::BadRequest(e.to_string())),
     };

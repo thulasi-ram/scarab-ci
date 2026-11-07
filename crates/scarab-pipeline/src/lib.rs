@@ -931,7 +931,9 @@ pub fn check_gate_outputs(
     declared: &[OutputSpec],
     got: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<BTreeMap<String, serde_json::Value>, String> {
-    let size = serde_json::to_vec(got).map(|v| v.len()).unwrap_or(usize::MAX);
+    let size = serde_json::to_vec(got)
+        .map(|v| v.len())
+        .unwrap_or(usize::MAX);
     if size > MAX_GATE_OUTPUT_BYTES {
         return Err(format!(
             "the outputs are {size} bytes; at most {MAX_GATE_OUTPUT_BYTES} are kept"
@@ -1036,8 +1038,7 @@ pub fn validate_gate_interface(iface: &Interface, what: &str, diagnostics: &mut 
     for o in &iface.outputs {
         let name_ok = !o.name.is_empty()
             && o.name.len() <= 64
-            && o
-                .name
+            && o.name
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
         if !name_ok {
@@ -3462,15 +3463,13 @@ fn bind_with(
                 with_reads.extend(reads);
                 BoundValue::Template(raw.clone())
             }
-            Some(raw) => {
-                match params::resolve_one(p, &serde_json::Value::String(raw.clone())) {
-                    Ok(v) => BoundValue::Literal(v),
-                    Err(e) => {
-                        unresolved.push(format!("`{}`: {e}", p.name));
-                        continue;
-                    }
+            Some(raw) => match params::resolve_one(p, &serde_json::Value::String(raw.clone())) {
+                Ok(v) => BoundValue::Literal(v),
+                Err(e) => {
+                    unresolved.push(format!("`{}`: {e}", p.name));
+                    continue;
                 }
-            }
+            },
             None => match &p.default {
                 Some(d) => match params::resolve_one(p, d) {
                     Ok(v) => BoundValue::Literal(v),
@@ -4074,7 +4073,12 @@ fn validate_interface(
         }
     }
 
-    check_with(step, &format!("library `{key}`"), &iface.inputs, diagnostics);
+    check_with(
+        step,
+        &format!("library `{key}`"),
+        &iface.inputs,
+        diagnostics,
+    );
     // Each exposed output must name a real library step.
     let lib_ids: BTreeSet<&str> = lib.steps.iter().map(|s| s.id.as_str()).collect();
     for out in &iface.outputs {
@@ -4941,7 +4945,9 @@ fn command_values(ir: &PipelineIr) -> Vec<String> {
                     cel::reads(expr).ok()?.into_iter().find_map(|r| {
                         let name = r.first.filter(|_| r.var == "inputs")?;
                         match &bindings.get(&name)?.value {
-                            BoundValue::Template(t) if sources.input(&name) == scope::Source::Free => {
+                            BoundValue::Template(t)
+                                if sources.input(&name) == scope::Source::Free =>
+                            {
                                 Some((name, t.clone()))
                             }
                             _ => None,
@@ -4953,9 +4959,7 @@ fn command_values(ir: &PipelineIr) -> Vec<String> {
                         let (invoke, own) = step.id.rsplit_once('/').unwrap_or(("", &step.id));
                         (
                             format!("library `{}`, step `{own}`", lib.name),
-                            format!(
-                                ", which step `{invoke}` binds with `with.{name}: {template}`",
-                            ),
+                            format!(", which step `{invoke}` binds with `with.{name}: {template}`",),
                         )
                     }
                     _ => (format!("step `{}`", step.id), String::new()),
@@ -5903,8 +5907,7 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                     continue;
                 };
                 for r in reads {
-                    if matches!(r.var.as_str(), "inputs" | "event") || !seen.insert(r.var.clone())
-                    {
+                    if matches!(r.var.as_str(), "inputs" | "event") || !seen.insert(r.var.clone()) {
                         continue;
                     }
                     diagnostics.push(if r.var == "outputs" {
@@ -6858,7 +6861,8 @@ mod tests {
         );
         assert_eq!(cron_schedules(&many), ["@hourly", "30 6 * * mon"]);
         // The schedule survives the IR's own round trip (a Run stores it).
-        let back: PipelineIr = serde_json::from_value(serde_json::to_value(&many).unwrap()).unwrap();
+        let back: PipelineIr =
+            serde_json::from_value(serde_json::to_value(&many).unwrap()).unwrap();
         assert_eq!(cron_schedules(&back), cron_schedules(&many));
         assert!(cron_schedules(&compile("steps: [{ id: a, image: busybox }]")).is_empty());
     }
@@ -6872,7 +6876,9 @@ mod tests {
             steps: [{ id: a }]
             "#;
         assert_eq!(cron_schedules_of(yaml), ["0 2 * * *", "@hourly"]);
-        assert!(cron_schedules_of("kind: library\non: { cron: { schedule: \"@daily\" } }").is_empty());
+        assert!(
+            cron_schedules_of("kind: library\non: { cron: { schedule: \"@daily\" } }").is_empty()
+        );
         assert!(cron_schedules_of(": not yaml").is_empty());
         assert!(cron_schedules_of("on: { push: {} }").is_empty());
     }
@@ -6881,10 +6887,22 @@ mod tests {
     fn a_cron_trigger_without_a_valid_schedule_fails_at_submit() {
         for (on, says) in [
             ("{ cron: {} }", "trigger `cron`: needs a `schedule`"),
-            (r#"{ cron: { schedule: "0 25 * * *" } }"#, "hour: `25` is outside 0-23"),
-            (r#"{ cron: { schedule: ["@daily", "@daily"] } }"#, "listed twice"),
-            (r#"{ cron: { schedule: "*/2 * * * *" } }"#, "at most every 5 minutes"),
-            (r#"{ push: { schedule: "@daily" } }"#, "`schedule` belongs to `on: cron:`"),
+            (
+                r#"{ cron: { schedule: "0 25 * * *" } }"#,
+                "hour: `25` is outside 0-23",
+            ),
+            (
+                r#"{ cron: { schedule: ["@daily", "@daily"] } }"#,
+                "listed twice",
+            ),
+            (
+                r#"{ cron: { schedule: "*/2 * * * *" } }"#,
+                "at most every 5 minutes",
+            ),
+            (
+                r#"{ push: { schedule: "@daily" } }"#,
+                "`schedule` belongs to `on: cron:`",
+            ),
         ] {
             let diags = errors(&format!("on: {on}\nsteps: [{{ id: a, image: busybox }}]"));
             assert!(diags.iter().any(|d| d.contains(says)), "{on}: {diags:?}");
@@ -6900,8 +6918,14 @@ mod tests {
                 "{ upstream: { pipeline: ci, status: cancelled } }",
                 "status `cancelled` is not one of succeeded, failed",
             ),
-            ("{ push: { pipeline: ci } }", "`pipeline` belongs to `on: upstream:`"),
-            ("{ push: { status: failed } }", "`status` belongs to `on: upstream:`"),
+            (
+                "{ push: { pipeline: ci } }",
+                "`pipeline` belongs to `on: upstream:`",
+            ),
+            (
+                "{ push: { status: failed } }",
+                "`status` belongs to `on: upstream:`",
+            ),
         ] {
             let diags = errors(&format!("on: {on}\nsteps: [{{ id: a, image: busybox }}]"));
             assert!(diags.iter().any(|d| d.contains(says)), "{on}: {diags:?}");
@@ -6925,9 +6949,7 @@ mod tests {
               - { id: a, image: busybox }
             "#,
         );
-        let ctx = |pipeline: &str, status: &str, branch: &str| {
-            json!({ "event": { "pipeline": pipeline, "status": status, "branch": branch } })
-        };
+        let ctx = |pipeline: &str, status: &str, branch: &str| json!({ "event": { "pipeline": pipeline, "status": status, "branch": branch } });
         assert!(matches_trigger(&ir, "upstream", &ctx("ci", "succeeded", "main")).unwrap());
         // Another pipeline, a failure (the default is successes only), and
         // the `when:` all still apply.
@@ -8189,10 +8211,26 @@ mod tests {
             )
         };
         for (command, at, shown) in [
-            (r#"[git, checkout, "${{ inputs.ref }}"]"#, 2, "${{ inputs.ref }}"),
-            (r#"[deploy, "--ref=${{ inputs.ref }}"]"#, 1, "${{ inputs.ref }}"),
-            (r#"[echo, "${{ outputs.build.url }}"]"#, 1, "${{ outputs.build.url }}"),
-            (r#"[echo, "${{ size(inputs.ref) }}"]"#, 1, "${{ size(inputs.ref) }}"),
+            (
+                r#"[git, checkout, "${{ inputs.ref }}"]"#,
+                2,
+                "${{ inputs.ref }}",
+            ),
+            (
+                r#"[deploy, "--ref=${{ inputs.ref }}"]"#,
+                1,
+                "${{ inputs.ref }}",
+            ),
+            (
+                r#"[echo, "${{ outputs.build.url }}"]"#,
+                1,
+                "${{ outputs.build.url }}",
+            ),
+            (
+                r#"[echo, "${{ size(inputs.ref) }}"]"#,
+                1,
+                "${{ size(inputs.ref) }}",
+            ),
         ] {
             let errs = errors(&pipeline(command));
             let found: Vec<&String> = errs.iter().filter(|e| e.contains("`command[")).collect();
@@ -8224,7 +8262,10 @@ mod tests {
                  steps: [{{ id: c, invoke: file:l.yaml, with: {with} }}]"
             )
         };
-        let errs = errors_with(&caller(r#"{ v: "${{ inputs.ref }}", k: "${{ inputs.n }}" }"#), &files);
+        let errs = errors_with(
+            &caller(r#"{ v: "${{ inputs.ref }}", k: "${{ inputs.n }}" }"#),
+            &files,
+        );
         assert_eq!(
             errs.iter().filter(|e| e.contains("`command[")).collect::<Vec<_>>(),
             [&"library `l.yaml`, step `a`: `command[1]` reads `${{ inputs.v }}`, which step `c` \
@@ -9474,8 +9515,8 @@ mod tests {
         ] {
             let errs = errors(yaml);
             assert!(
-                errs.iter()
-                    .any(|e| e.contains("step `checkout`") && e.contains("invoke: lib:thulasi-ram/clone")),
+                errs.iter().any(|e| e.contains("step `checkout`")
+                    && e.contains("invoke: lib:thulasi-ram/clone")),
                 "{errs:?}"
             );
         }
@@ -9519,9 +9560,17 @@ mod tests {
     #[test]
     fn forge_token_is_for_a_step_that_runs_an_image() {
         let errs = errors("steps: [{ id: g, gate: manual, forge_token: read }]");
-        assert!(errs.iter().any(|e| e.contains("`forge_token` is only valid")), "{errs:?}");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("`forge_token` is only valid")),
+            "{errs:?}"
+        );
         let errs = errors(r#"steps: [{ id: b, build: { image: "a/b:1" }, forge_token: read }]"#);
-        assert!(errs.iter().any(|e| e.contains("`forge_token` is only valid")), "{errs:?}");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("`forge_token` is only valid")),
+            "{errs:?}"
+        );
         let ir = compile("steps: [{ id: push, image: alpine/git, forge_token: write }]");
         assert_eq!(ir.steps[0].forge_token, Some(ForgeToken::Write));
         let errs = library_errors(
@@ -9543,11 +9592,17 @@ mod tests {
         let errs = errors(
             r#"steps: [{ id: g, image: alpine/git, command: [git, "${{ event.sha }}"], forge_token: read }]"#,
         );
-        assert!(errs.iter().any(|e| e.contains("`command[1]` holds")), "{errs:?}");
+        assert!(
+            errs.iter().any(|e| e.contains("`command[1]` holds")),
+            "{errs:?}"
+        );
         let errs = errors(
             r#"steps: [{ id: g, image: alpine/git, cache: { dirs: [d], key: [k] }, forge_token: read }]"#,
         );
-        assert!(errs.iter().any(|e| e.contains("`cache` is not allowed")), "{errs:?}");
+        assert!(
+            errs.iter().any(|e| e.contains("`cache` is not allowed")),
+            "{errs:?}"
+        );
         // The same values through `env:` compile.
         compile(
             r#"steps: [{ id: g, image: alpine/git, env: [[SCARAB_S, "${{ event.sha }}"]], forge_token: read }]"#,
@@ -9556,12 +9611,20 @@ mod tests {
 
     #[test]
     fn a_templated_env_value_of_a_forge_token_step_reaches_only_a_scarab_name() {
-        for name in ["S", "PATH", "GIT_SSH_COMMAND", "scarab_x", "SCARAB_", "SCARAB_a"] {
+        for name in [
+            "S",
+            "PATH",
+            "GIT_SSH_COMMAND",
+            "scarab_x",
+            "SCARAB_",
+            "SCARAB_a",
+        ] {
             let errs = errors(&format!(
                 r#"steps: [{{ id: g, image: alpine/git, env: [["{name}", "${{{{ event.sha }}}}"]], forge_token: read }}]"#
             ));
             assert!(
-                errs.iter().any(|e| e.contains(&format!("env `{name}` holds"))),
+                errs.iter()
+                    .any(|e| e.contains(&format!("env `{name}` holds"))),
                 "{name}: {errs:?}"
             );
         }
@@ -9570,12 +9633,15 @@ mod tests {
                 r#"steps: [{{ id: g, image: alpine/git, env: [["{name}", "${{{{ event.sha }}}}"]], forge_token: read }}]"#
             ));
             assert!(
-                errs.iter().any(|e| e.contains(&format!("Scarab sets `{name}`"))),
+                errs.iter()
+                    .any(|e| e.contains(&format!("Scarab sets `{name}`"))),
                 "{name}: {errs:?}"
             );
         }
         // A literal value on any name is the author's, and compiles.
-        compile(r#"steps: [{ id: g, image: alpine/git, env: [[GIT_TERMINAL_PROMPT, "0"]], forge_token: read }]"#);
+        compile(
+            r#"steps: [{ id: g, image: alpine/git, env: [[GIT_TERMINAL_PROMPT, "0"]], forge_token: read }]"#,
+        );
         // Without `forge_token` the rule does not apply.
         compile(r#"steps: [{ id: g, image: alpine/git, env: [[S, "${{ event.sha }}"]] }]"#);
     }
@@ -9607,10 +9673,14 @@ mod tests {
             &libraries,
         );
         assert!(
-            errs.iter().any(|e| e.contains("input `url` reaches step `git`")),
+            errs.iter()
+                .any(|e| e.contains("input `url` reaches step `git`")),
             "{errs:?}"
         );
-        assert!(!errs.iter().any(|e| e.contains("input `depth`")), "{errs:?}");
+        assert!(
+            !errs.iter().any(|e| e.contains("input `depth`")),
+            "{errs:?}"
+        );
         assert!(!errs.iter().any(|e| e.contains("input `lfs`")), "{errs:?}");
     }
 
@@ -9622,14 +9692,17 @@ mod tests {
             ("event", "whole"),
             ("event.repo", "whole"),
         ] {
-            let yaml = format!("steps: [{{ id: a, image: busybox, env: [[X, \"${{{{ {field} }}}}\"]] }}]");
+            let yaml =
+                format!("steps: [{{ id: a, image: busybox, env: [[X, \"${{{{ {field} }}}}\"]] }}]");
             let errs = errors(&yaml);
             assert!(
-                errs.iter().any(|e| e.contains("step `a`") && e.contains(want)),
+                errs.iter()
+                    .any(|e| e.contains("step `a`") && e.contains(want)),
                 "{field}: {errs:?}"
             );
         }
-        let ir = compile(r#"steps: [{ id: a, image: busybox, env: [[B, "${{ event.branch }}"]] }]"#);
+        let ir =
+            compile(r#"steps: [{ id: a, image: busybox, env: [[B, "${{ event.branch }}"]] }]"#);
         assert_eq!(event::reads(&ir), BTreeSet::from(["branch".to_string()]));
     }
 
@@ -9642,7 +9715,8 @@ mod tests {
         .unwrap();
         let git = &ir.steps[0];
         let sha = "a".repeat(40);
-        let event = json!({ "sha": sha, "repo": { "clone_url": "https://github.com/acme/web.git" } });
+        let event =
+            json!({ "sha": sha, "repo": { "clone_url": "https://github.com/acme/web.git" } });
         let r = render(
             Templates {
                 image: &git.image,
@@ -9668,7 +9742,10 @@ mod tests {
 
     /// Render `command` of a Pipeline-file Step at launch, against stored
     /// `event` values.
-    fn launch_with_event(command: &[&str], event: serde_json::Value) -> Result<Vec<String>, String> {
+    fn launch_with_event(
+        command: &[&str],
+        event: serde_json::Value,
+    ) -> Result<Vec<String>, String> {
         let command: Vec<String> = command.iter().map(|c| c.to_string()).collect();
         render(
             Templates {
@@ -9707,7 +9784,8 @@ mod tests {
             ));
             let want = format!("`command[3]` reads `${{{{ event.{field} }}}}`");
             assert!(
-                errs.iter().any(|e| e.contains("step `a`") && e.contains(&want)),
+                errs.iter()
+                    .any(|e| e.contains("step `a`") && e.contains(&want)),
                 "{field}: {errs:?}"
             );
         }
@@ -9731,7 +9809,10 @@ mod tests {
         for (template, event) in [
             ("${{ event.branch }}", json!({ "branch": "main" })),
             ("${{ event.ref }}", json!({ "ref": "refs/heads/main" })),
-            ("x-${{ event.repo.clone_url }}", json!({ "repo": { "clone_url": "https://h/a.git" } })),
+            (
+                "x-${{ event.repo.clone_url }}",
+                json!({ "repo": { "clone_url": "https://h/a.git" } }),
+            ),
         ] {
             let err = launch_with_event(&["git", "fetch", template], event).unwrap_err();
             assert!(err.starts_with("`command[2]`"), "{template}: {err}");
@@ -9782,21 +9863,77 @@ mod tests {
         let bad_sha = "the text `0123456789ABCDEF0123456789ABCDEF01234567`";
         for (command, event, what) in [
             (&cmd[..], json!({ "sha": sha.to_uppercase() }), bad_sha),
-            (&cmd[..], json!({ "sha": "--upload-pack=touch /tmp/x" }), "which is not a commit SHA"),
-            (&cmd[..], json!({ "sha": "main" }), "which is not a commit SHA"),
-            (&cmd[..], json!({ "sha": &sha[..39] }), "which is not a commit SHA"),
-            (&cmd[..], json!({ "sha": format!("{sha}0") }), "which is not a commit SHA"),
-            (&cmd[..], json!({ "sha": 12345 }), "the number `12345`, which is not a commit SHA"),
-            (&cmd[..], json!({ "sha": null }), "null, which is not a commit SHA"),
-            (&["x", "y", "${{ event.number }}"], json!({ "number": "7" }), "not a whole number"),
-            (&["x", "y", "${{ event.number }}"], json!({ "number": 1.5 }), "not a whole number"),
-            (&["x", "y", "${{ event.issue }}"], json!({ "issue": -1 }), "not a whole number"),
-            (&["x", "y", "${{ event.fork }}"], json!({ "fork": "true" }), "not true or false"),
-            (&["x", "y", "${{ event.kind }}"], json!({ "kind": "-x" }), "not a trigger kind"),
-            (&["x", "y", "${{ event.kind }}"], json!({ "kind": "nightly" }), "not a trigger kind"),
+            (
+                &cmd[..],
+                json!({ "sha": "--upload-pack=touch /tmp/x" }),
+                "which is not a commit SHA",
+            ),
+            (
+                &cmd[..],
+                json!({ "sha": "main" }),
+                "which is not a commit SHA",
+            ),
+            (
+                &cmd[..],
+                json!({ "sha": &sha[..39] }),
+                "which is not a commit SHA",
+            ),
+            (
+                &cmd[..],
+                json!({ "sha": format!("{sha}0") }),
+                "which is not a commit SHA",
+            ),
+            (
+                &cmd[..],
+                json!({ "sha": 12345 }),
+                "the number `12345`, which is not a commit SHA",
+            ),
+            (
+                &cmd[..],
+                json!({ "sha": null }),
+                "null, which is not a commit SHA",
+            ),
+            (
+                &["x", "y", "${{ event.number }}"],
+                json!({ "number": "7" }),
+                "not a whole number",
+            ),
+            (
+                &["x", "y", "${{ event.number }}"],
+                json!({ "number": 1.5 }),
+                "not a whole number",
+            ),
+            (
+                &["x", "y", "${{ event.issue }}"],
+                json!({ "issue": -1 }),
+                "not a whole number",
+            ),
+            (
+                &["x", "y", "${{ event.fork }}"],
+                json!({ "fork": "true" }),
+                "not true or false",
+            ),
+            (
+                &["x", "y", "${{ event.kind }}"],
+                json!({ "kind": "-x" }),
+                "not a trigger kind",
+            ),
+            (
+                &["x", "y", "${{ event.kind }}"],
+                json!({ "kind": "nightly" }),
+                "not a trigger kind",
+            ),
             // Text built from a fixed field is not of a fixed shape.
-            (&["x", "y", "${{ event.sha + 'x' }}"], json!({ "sha": sha }), "text that is not"),
-            (&["x", "y", "${{ event.kind + '' }}"], json!({ "kind": "push" }), "text that is not"),
+            (
+                &["x", "y", "${{ event.sha + 'x' }}"],
+                json!({ "sha": sha }),
+                "text that is not",
+            ),
+            (
+                &["x", "y", "${{ event.kind + '' }}"],
+                json!({ "kind": "push" }),
+                "text that is not",
+            ),
         ] {
             let err = launch_with_event(command, event).unwrap_err();
             assert!(
@@ -9814,7 +9951,11 @@ mod tests {
     /// Run creation's preview applies the same check to the stored values.
     #[test]
     fn a_preview_checks_the_event_values_it_knows() {
-        let command = vec!["git".to_string(), "checkout".to_string(), "${{ event.sha }}".to_string()];
+        let command = vec![
+            "git".to_string(),
+            "checkout".to_string(),
+            "${{ event.sha }}".to_string(),
+        ];
         let preview = |event: serde_json::Value| {
             render(
                 Templates {
@@ -10252,7 +10393,9 @@ mod tests {
             .expect("the repo's own .scarab/ci.yaml must compile to IR");
 
         assert!(
-            ir.steps.iter().any(|s| s.origin.iter().any(is_clone_library)),
+            ir.steps
+                .iter()
+                .any(|s| s.origin.iter().any(is_clone_library)),
             "checks out the repository"
         );
 
@@ -10312,7 +10455,9 @@ mod tests {
 
         // A few features must have survived compilation.
         assert!(
-            ir.steps.iter().any(|s| s.origin.iter().any(is_clone_library)),
+            ir.steps
+                .iter()
+                .any(|s| s.origin.iter().any(is_clone_library)),
             "checks out the repository"
         );
         assert!(
@@ -10691,7 +10836,10 @@ mod tests {
             r#"[{ id: a, image: busybox }, { id: b, image: busybox, needs: [a], env: [[V, "${{ outputs.a.v }}"]] }]"#,
             r#"[{ id: a, image: busybox, matrix: { dimensions: { os: [l, m] } } }, { id: b, image: busybox, needs: [a], env: [[V, "${{ outputs.a.v }}"]] }]"#,
         ] {
-            assert!(compile_yaml(&format!("steps: {steps}\n")).is_ok(), "{steps}");
+            assert!(
+                compile_yaml(&format!("steps: {steps}\n")).is_ok(),
+                "{steps}"
+            );
         }
     }
 
@@ -10853,4 +11001,3 @@ mod tests {
         );
     }
 }
-

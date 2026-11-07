@@ -87,9 +87,14 @@ async fn a_depot_outage_never_widens_the_plan_over_the_strict_handle() {
     let oracle = CasSnapshots(strict);
     let snapshots: &dyn WorkspaceSnapshots = &oracle;
 
-    let plan = plan_rerun(&db as &dyn Db, Some(snapshots), &run, &StepId("test".into()))
-        .await
-        .unwrap();
+    let plan = plan_rerun(
+        &db as &dyn Db,
+        Some(snapshots),
+        &run,
+        &StepId("test".into()),
+    )
+    .await
+    .unwrap();
     assert!(
         !plan.is_widened(),
         "a warm-leg ERROR is not proof of expiry — the plan must not widen"
@@ -116,9 +121,14 @@ async fn the_fall_through_handle_would_launder_the_same_outage_into_expired() {
     let oracle = CasSnapshots(fall_through);
     let snapshots: &dyn WorkspaceSnapshots = &oracle;
 
-    let plan = plan_rerun(&db as &dyn Db, Some(snapshots), &run, &StepId("test".into()))
-        .await
-        .unwrap();
+    let plan = plan_rerun(
+        &db as &dyn Db,
+        Some(snapshots),
+        &run,
+        &StepId("test".into()),
+    )
+    .await
+    .unwrap();
     assert!(
         plan.is_widened(),
         "documented hazard: fall-through turns the outage into a definitive absence"

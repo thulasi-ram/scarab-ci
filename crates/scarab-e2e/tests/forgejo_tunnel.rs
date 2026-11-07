@@ -122,7 +122,9 @@ async fn a_private_repo_clones_with_the_forge_token_and_nothing_else_gets_it() {
 
     // `ci`: the private repository was cloned with the token, and a later Step
     // read a file from the checkout.
-    let ci = runs.get("ci").unwrap_or_else(|| panic!("no `ci` Run: {runs:?}"));
+    let ci = runs
+        .get("ci")
+        .unwrap_or_else(|| panic!("no `ci` Run: {runs:?}"));
     let rs = wait_for_terminal(&http, &base, ci, Duration::from_secs(300)).await;
     let text = logs(&http, &base, ci).await;
     assert_eq!(rs.status, "succeeded", "`ci` run {ci}; logs: {text}");
@@ -133,7 +135,9 @@ async fn a_private_repo_clones_with_the_forge_token_and_nothing_else_gets_it() {
 
     // `sub`: the submodule is another private repository on the same host,
     // fetched with no credential, so the clone fails.
-    let sub = runs.get("sub").unwrap_or_else(|| panic!("no `sub` Run: {runs:?}"));
+    let sub = runs
+        .get("sub")
+        .unwrap_or_else(|| panic!("no `sub` Run: {runs:?}"));
     let rs = wait_for_terminal(&http, &base, sub, Duration::from_secs(300)).await;
     let text = logs(&http, &base, sub).await;
     assert_eq!(rs.status, "failed", "`sub` run {sub}; logs: {text}");

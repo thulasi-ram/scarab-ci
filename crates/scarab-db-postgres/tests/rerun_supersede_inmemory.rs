@@ -7,9 +7,9 @@
 
 use scarab_engine::ports::ExecHandle;
 use scarab_engine::{
-    cancel_run_request, rerun_step, retry_step, Attempt, AttemptId, AttemptOutcome, Db,
-    EventPayload, FailureKind, OutboxId, OutboxMessage, RerunError, RunId, RunStatus, Scheduler,
-    StepId, StepSpec, StepStatus, AttemptTeardown, TeardownAttempt, Timestamp, LAUNCH_STEP,
+    cancel_run_request, rerun_step, retry_step, Attempt, AttemptId, AttemptOutcome,
+    AttemptTeardown, Db, EventPayload, FailureKind, OutboxId, OutboxMessage, RerunError, RunId,
+    RunStatus, Scheduler, StepId, StepSpec, StepStatus, TeardownAttempt, Timestamp, LAUNCH_STEP,
     MAX_DELIVERY_ATTEMPTS, SUPERSEDE_TEARDOWN,
 };
 use scarab_testkit::{FakeClock, FakeExecutor, InMemoryDb};

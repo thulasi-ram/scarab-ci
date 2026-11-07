@@ -90,7 +90,10 @@ async fn app() -> axum::Router {
             .with_credential("globexadmin-code", scoped("globexadmin")),
     );
     let rbac = Arc::new(InMemoryRbac::new());
-    for (subject, org, name) in [("webadmin", "acme", "web"), ("globexadmin", "globex", "api")] {
+    for (subject, org, name) in [
+        ("webadmin", "acme", "web"),
+        ("globexadmin", "globex", "api"),
+    ] {
         rbac.grant(
             &Binding {
                 subject: subject.into(),
@@ -183,7 +186,10 @@ async fn a_repo_admin_sees_the_orgs_key_names_but_no_values() {
     assert_eq!(token["inherited_from"], serde_json::json!({ "": "org" }));
 
     for value in [ORG_TOKEN_VALUE, ORG_URL_VALUE, REPO_URL_VALUE] {
-        assert!(!body.contains(value), "a value leaked into the matrix: {body}");
+        assert!(
+            !body.contains(value),
+            "a value leaked into the matrix: {body}"
+        );
     }
 }
 
@@ -200,7 +206,10 @@ async fn a_repo_key_the_org_also_defines_is_marked_as_overriding_it() {
     assert_eq!(url["status"], serde_json::json!({ "": "set" }));
     assert_eq!(url["overrides"], serde_json::json!({ "": "org" }));
     // A key only the org holds hides nothing.
-    assert_eq!(row(&m, "REGISTRY_TOKEN")["overrides"], serde_json::json!({}));
+    assert_eq!(
+        row(&m, "REGISTRY_TOKEN")["overrides"],
+        serde_json::json!({})
+    );
 }
 
 #[tokio::test]
@@ -216,6 +225,12 @@ async fn an_admin_of_another_org_sees_none_of_its_keys() {
     // Their own repo's matrix inherits from their own org, which holds nothing.
     let (status, body) = matrix(&app, &session, "globex", "api").await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert!(!body.contains("REGISTRY_TOKEN"), "acme's key reached globex: {body}");
-    assert!(!body.contains("API_URL"), "acme's key reached globex: {body}");
+    assert!(
+        !body.contains("REGISTRY_TOKEN"),
+        "acme's key reached globex: {body}"
+    );
+    assert!(
+        !body.contains("API_URL"),
+        "acme's key reached globex: {body}"
+    );
 }

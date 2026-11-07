@@ -1760,7 +1760,10 @@ mod tests {
             "permissions": { "contents": "read", "statuses": "write", "metadata": "read" },
             "events": ["push", "pull_request"]
         }));
-        assert_eq!(caps.permissions.get("statuses").map(String::as_str), Some("write"));
+        assert_eq!(
+            caps.permissions.get("statuses").map(String::as_str),
+            Some("write")
+        );
         assert!(caps.events.contains("push") && caps.events.contains("pull_request"));
 
         // The silent-failure shape: an App with no event subscription. GitHub

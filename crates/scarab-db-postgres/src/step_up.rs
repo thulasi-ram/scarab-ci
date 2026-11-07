@@ -54,12 +54,11 @@ impl PostgresDb {
     /// passkey" counts (ADR-0073 §8). Bootstrap owners come from config and
     /// are the caller's to add.
     pub async fn admin_subjects(&self) -> Result<BTreeSet<String>, IdentityError> {
-        let rows = sqlx::query(
-            "SELECT DISTINCT subject, role FROM rbac_bindings WHERE role IS NOT NULL",
-        )
-        .fetch_all(self.pool())
-        .await
-        .map_err(identity_err)?;
+        let rows =
+            sqlx::query("SELECT DISTINCT subject, role FROM rbac_bindings WHERE role IS NOT NULL")
+                .fetch_all(self.pool())
+                .await
+                .map_err(identity_err)?;
         Ok(rows
             .into_iter()
             .filter(|r| {

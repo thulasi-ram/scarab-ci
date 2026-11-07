@@ -230,7 +230,10 @@ async fn moved_ciphertext_fails_on_the_other_row() {
         Err(SecretError::Backend(_))
     ));
     // The original row is untouched and still opens.
-    let got = secrets.get(&repo_scope("app"), "DEPLOY_TOKEN").await.unwrap();
+    let got = secrets
+        .get(&repo_scope("app"), "DEPLOY_TOKEN")
+        .await
+        .unwrap();
     assert_eq!(got.value, b"prod-secret".to_vec());
 
     tdb.cleanup().await;
@@ -257,7 +260,9 @@ async fn legacy_no_aad_row_still_decrypts() {
         let cipher = Aes256Gcm::new_from_slice(key).unwrap();
         let mut nonce = [0u8; 12];
         rand::rngs::OsRng.fill_bytes(&mut nonce);
-        let ct = cipher.encrypt(Nonce::from_slice(&nonce), plaintext).unwrap();
+        let ct = cipher
+            .encrypt(Nonce::from_slice(&nonce), plaintext)
+            .unwrap();
         (ct, nonce.to_vec())
     };
     let mut data_key = [0u8; 32];
@@ -335,7 +340,9 @@ fn legacy_seal(key: &[u8; 32], plaintext: &[u8]) -> (Vec<u8>, Vec<u8>) {
     let cipher = Aes256Gcm::new_from_slice(key).unwrap();
     let mut nonce = [0u8; 12];
     rand::rngs::OsRng.fill_bytes(&mut nonce);
-    let ct = cipher.encrypt(Nonce::from_slice(&nonce), plaintext).unwrap();
+    let ct = cipher
+        .encrypt(Nonce::from_slice(&nonce), plaintext)
+        .unwrap();
     (ct, nonce.to_vec())
 }
 
@@ -366,7 +373,10 @@ async fn new_write_stamps_the_active_fingerprint() {
     .fetch_one(&tdb.pool)
     .await
     .unwrap();
-    assert_eq!(row.get::<Option<String>, _>("key_id"), Some(fingerprint(&k1)));
+    assert_eq!(
+        row.get::<Option<String>, _>("key_id"),
+        Some(fingerprint(&k1))
+    );
     assert!(row.get::<bool, _>("stamped_at"));
 
     tdb.cleanup().await;
@@ -401,10 +411,20 @@ async fn rotation_rewraps_on_read_and_restamps() {
     assert_eq!(got.value, b"rotate-me".to_vec());
 
     let after = fetch_sealed(&tdb.pool, "repo:acme/app", "R").await;
-    assert_eq!(after.key_id, Some(fingerprint(&k2)), "restamped to the active key");
+    assert_eq!(
+        after.key_id,
+        Some(fingerprint(&k2)),
+        "restamped to the active key"
+    );
     assert_ne!(after.wrapped_key, before.wrapped_key, "data key re-wrapped");
-    assert_eq!(after.ciphertext, before.ciphertext, "value ciphertext never moves");
-    assert_eq!(after.value_nonce, before.value_nonce, "value seal untouched");
+    assert_eq!(
+        after.ciphertext, before.ciphertext,
+        "value ciphertext never moves"
+    );
+    assert_eq!(
+        after.value_nonce, before.value_nonce,
+        "value seal untouched"
+    );
 
     // The old key can now be dropped entirely.
     let only_new = PostgresSecrets::with_master(tdb.pool.clone(), k2);
@@ -503,10 +523,20 @@ async fn post_aad_null_row_gets_stamp_only_rewrap() {
     assert_eq!(got.value, b"null-stamped".to_vec());
 
     let after = fetch_sealed(&tdb.pool, "repo:acme/app", "N").await;
-    assert_eq!(after.key_id, Some(fingerprint(&k2)), "stamped to the active key");
+    assert_eq!(
+        after.key_id,
+        Some(fingerprint(&k2)),
+        "stamped to the active key"
+    );
     assert_ne!(after.wrapped_key, before.wrapped_key);
-    assert_eq!(after.ciphertext, before.ciphertext, "value untouched on the AAD arm");
-    assert_eq!(after.value_nonce, before.value_nonce, "value untouched on the AAD arm");
+    assert_eq!(
+        after.ciphertext, before.ciphertext,
+        "value untouched on the AAD arm"
+    );
+    assert_eq!(
+        after.value_nonce, before.value_nonce,
+        "value untouched on the AAD arm"
+    );
 
     tdb.cleanup().await;
 }
@@ -544,8 +574,14 @@ async fn failure_taxonomy_is_distinguishable() {
     let without_k1 = PostgresSecrets::with_master(tdb.pool.clone(), k2);
     let err = without_k1.get(&repo_scope("app"), "S").await.unwrap_err();
     let msg = err.to_string();
-    assert!(msg.contains(&fingerprint(&k1)), "names the row's key: {msg}");
-    assert!(msg.contains(&fingerprint(&k2)), "names the configured set: {msg}");
+    assert!(
+        msg.contains(&fingerprint(&k1)),
+        "names the row's key: {msg}"
+    );
+    assert!(
+        msg.contains(&fingerprint(&k2)),
+        "names the configured set: {msg}"
+    );
     assert!(msg.contains("not configured"), "{msg}");
 
     // 2. Right key configured, but the stamped row's wrapped_key is corrupt
@@ -561,8 +597,14 @@ async fn failure_taxonomy_is_distinguishable() {
     let err = writer.get(&repo_scope("app"), "S").await.unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("corrupt") || msg.contains("tampered"), "{msg}");
-    assert!(msg.contains(&fingerprint(&k1)), "names the stamped key: {msg}");
-    assert!(!msg.contains("not configured"), "distinct from taxonomy 1: {msg}");
+    assert!(
+        msg.contains(&fingerprint(&k1)),
+        "names the stamped key: {msg}"
+    );
+    assert!(
+        !msg.contains("not configured"),
+        "distinct from taxonomy 1: {msg}"
+    );
 
     // 3. A legacy NULL row sealed under a key nobody configures any more.
     let k3 = [53u8; 32];
@@ -584,8 +626,14 @@ async fn failure_taxonomy_is_distinguishable() {
     let err = writer.get(&repo_scope("app"), "L").await.unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("pre-rotation master key is absent"), "{msg}");
-    assert!(msg.contains("corrupt"), "GCM cannot distinguish — the error says so: {msg}");
-    assert!(msg.contains(&fingerprint(&k1)), "names the configured set: {msg}");
+    assert!(
+        msg.contains("corrupt"),
+        "GCM cannot distinguish — the error says so: {msg}"
+    );
+    assert!(
+        msg.contains(&fingerprint(&k1)),
+        "names the configured set: {msg}"
+    );
 
     tdb.cleanup().await;
 }
@@ -637,14 +685,16 @@ async fn rewrap_cas_loses_to_a_concurrent_put() {
         .unwrap();
     assert_eq!(outcome, RewrapOutcome::LostRace);
     let after = fetch_sealed(&tdb.pool, "repo:acme/app", "C").await;
-    assert_eq!(after.wrapped_key, winner.wrapped_key, "winner not clobbered");
+    assert_eq!(
+        after.wrapped_key, winner.wrapped_key,
+        "winner not clobbered"
+    );
     assert_eq!(after.ciphertext, winner.ciphertext, "winner not clobbered");
     let got = rotated.get(&repo_scope("app"), "C").await.unwrap();
     assert_eq!(got.value, b"second".to_vec());
 
     tdb.cleanup().await;
 }
-
 
 /// The boot sweep rewraps rows nobody ever reads, upgrades legacy rows whole,
 /// counts-and-skips an unreadable row (never an error), and reports what is
@@ -740,7 +790,10 @@ async fn sweep_rewraps_unread_rows_and_skips_unreadable() {
         b"legacy-value".to_vec()
     );
     let orphan_after = fetch_sealed(&tdb.pool, "repo:acme/app", "GONE").await;
-    assert_eq!(orphan_after.wrapped_key, orphan_before.wrapped_key, "skipped, not touched");
+    assert_eq!(
+        orphan_after.wrapped_key, orphan_before.wrapped_key,
+        "skipped, not touched"
+    );
     assert_eq!(orphan_after.key_id, None);
 
     // A second sweep is idempotent: nothing left to do but the orphan.
@@ -758,4 +811,3 @@ async fn sweep_rewraps_unread_rows_and_skips_unreadable() {
 
     tdb.cleanup().await;
 }
-

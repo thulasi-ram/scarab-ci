@@ -686,7 +686,9 @@ impl OAuthAuthenticator {
             Some(k) => k,
             None => {
                 self.refresh_jwks(issuer).await?;
-                self.cached_jwk(kid).await.ok_or(IdentityError::AuthFailed)?
+                self.cached_jwk(kid)
+                    .await
+                    .ok_or(IdentityError::AuthFailed)?
             }
         };
         let key =
@@ -856,7 +858,10 @@ mod tests {
     #[test]
     fn login_flow_round_trips_through_one_cookie() {
         let flow = LoginFlow::generate();
-        assert_eq!(LoginFlow::from_cookie(&flow.to_cookie()), Some(flow.clone()));
+        assert_eq!(
+            LoginFlow::from_cookie(&flow.to_cookie()),
+            Some(flow.clone())
+        );
         assert_eq!(flow.verifier(), Some(flow.verifier.as_str()));
         assert_eq!(flow.nonce(), Some(flow.nonce.as_str()));
         // Every component is high-entropy base64url, so `.` stays a separator.
@@ -897,7 +902,10 @@ mod tests {
         assert_eq!(back, flow);
         // Without a provider either, the next still rides in the 6th part.
         let bare = LoginFlow::generate().with_next("/x");
-        assert_eq!(LoginFlow::from_cookie(&bare.to_cookie()), Some(bare.clone()));
+        assert_eq!(
+            LoginFlow::from_cookie(&bare.to_cookie()),
+            Some(bare.clone())
+        );
 
         for bad in [
             "https://evil.example/",
@@ -950,7 +958,10 @@ mod tests {
             vec![Role::Owner]
         );
         // The stored identity is still the stable `sub`, never the email.
-        assert_eq!(auth.principal_from(&verified).unwrap().subject, "8f3c-opaque");
+        assert_eq!(
+            auth.principal_from(&verified).unwrap().subject,
+            "8f3c-opaque"
+        );
 
         for unverified in [
             serde_json::json!({ "sub": "s", "email": "ada@example.com", "email_verified": false }),

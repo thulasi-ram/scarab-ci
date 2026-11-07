@@ -233,8 +233,14 @@ pub(crate) fn governed_routes() -> Routes {
         )
         .get("/v1/repos", list_projects)
         .get("/v1/repos/{org}/{repo}/runs", list_repo_runs)
-        .get("/v1/repos/{org}/{repo}/refused-runs", refused_runs::list_refused_runs)
-        .get("/v1/repos/{org}/{repo}/schedules", crate::schedules::list_schedules)
+        .get(
+            "/v1/repos/{org}/{repo}/refused-runs",
+            refused_runs::list_refused_runs,
+        )
+        .get(
+            "/v1/repos/{org}/{repo}/schedules",
+            crate::schedules::list_schedules,
+        )
         .post("/v1/runs", &ops::RUN_CREATE, create_run)
         .get("/v1/runs", list_runs)
         .get("/v1/runs/{id}", get_run)
@@ -260,7 +266,10 @@ pub(crate) fn governed_routes() -> Routes {
         // The rerun PREVIEW (ADR-0061 s5): what the rerun would actually execute,
         // read before the button is pressed so a widened scope is never a surprise.
         .get("/v1/runs/{id}/steps/{step}/rerun-plan", rerun_plan)
-        .get("/v1/runs/{id}/steps/{step}/origin", run_origin::get_step_origin)
+        .get(
+            "/v1/runs/{id}/steps/{step}/origin",
+            run_origin::get_step_origin,
+        )
         // The manual Workspace-Snapshot pin (ADR-0061 s5) — one resource, two
         // verbs, because pin and unpin are the same fact in two states.
         .post(
@@ -478,7 +487,10 @@ pub(crate) fn governed_routes() -> Routes {
         )
         // ADR-0076: org-installed libraries, yanks, first-party defaults.
         .get("/v1/orgs/{org}/libraries", lib::list_libraries)
-        .get("/v1/orgs/{org}/library-yanks/{hash}/impact", lib::get_yank_impact)
+        .get(
+            "/v1/orgs/{org}/library-yanks/{hash}/impact",
+            lib::get_yank_impact,
+        )
         .post(
             "/v1/orgs/{org}/libraries/fetch",
             &ops::LIBRARY_FETCH,
@@ -521,7 +533,10 @@ pub(crate) fn governed_routes() -> Routes {
         )
         .get("/v1/orgs/{org}/plugin-catalog", plugins::plugin_catalog)
         .get("/v1/orgs/{org}/plugins", plugins::list_plugins)
-        .get("/v1/orgs/{org}/gates", crate::plugin_gates::list_pending_gates)
+        .get(
+            "/v1/orgs/{org}/gates",
+            crate::plugin_gates::list_pending_gates,
+        )
         .post(
             "/v1/orgs/{org}/plugins",
             &ops::PLUGIN_INSTALL,

@@ -7,8 +7,8 @@
 use std::collections::BTreeMap;
 
 use scarab_pipeline::{
-    check_gate_outputs, compile_with_libraries, render, render_inputs, Facts, Interface, Libraries, OutputSpec,
-    ParamSpec, ParamType, PipelineError, PipelineIr, PluginGateDef, Templates,
+    check_gate_outputs, compile_with_libraries, render, render_inputs, Facts, Interface, Libraries,
+    OutputSpec, ParamSpec, ParamType, PipelineError, PipelineIr, PluginGateDef, Templates,
 };
 use serde_json::{json, Map, Value};
 
@@ -154,8 +154,20 @@ fn a_plugin_invoke_carries_nothing_that_runs_or_changes_when_it_passes() {
 
 #[test]
 fn an_expiry_is_positive_and_fits() {
-    for v in ["0", "-1", "4294967296", "4294967295", "2592001", "1e9", "\"600\"", "600.5"] {
-        let yaml = pipeline("", "").replace("gate_expires_after: 600", &format!("gate_expires_after: {v}"));
+    for v in [
+        "0",
+        "-1",
+        "4294967296",
+        "4294967295",
+        "2592001",
+        "1e9",
+        "\"600\"",
+        "600.5",
+    ] {
+        let yaml = pipeline("", "").replace(
+            "gate_expires_after: 600",
+            &format!("gate_expires_after: {v}"),
+        );
         let errs = refused(&yaml);
         assert!(!errs.is_empty(), "{v}");
     }
@@ -199,12 +211,27 @@ steps:
         let live = ir.steps.iter().find(|s| s.id == "live").unwrap();
         // Every fact a wait could hold.
         let results = BTreeMap::from([
-            ("bump".to_string(), BTreeMap::from([("image".to_string(), json!("i")), ("nope".to_string(), json!("n"))])),
-            ("after".to_string(), BTreeMap::from([("x".to_string(), json!("x"))])),
-            ("live".to_string(), BTreeMap::from([("revision".to_string(), json!("r"))])),
+            (
+                "bump".to_string(),
+                BTreeMap::from([
+                    ("image".to_string(), json!("i")),
+                    ("nope".to_string(), json!("n")),
+                ]),
+            ),
+            (
+                "after".to_string(),
+                BTreeMap::from([("x".to_string(), json!("x"))]),
+            ),
+            (
+                "live".to_string(),
+                BTreeMap::from([("revision".to_string(), json!("r"))]),
+            ),
         ]);
         let params = BTreeMap::from([("ARGO_TOKEN".to_string(), json!("p"))]);
-        let event = json!({ "secrets": { "ARGO_TOKEN": "e" } }).as_object().unwrap().clone();
+        let event = json!({ "secrets": { "ARGO_TOKEN": "e" } })
+            .as_object()
+            .unwrap()
+            .clone();
         let rendered = render_inputs(live.scope.as_ref().unwrap(), &params, &results, &event);
         if rendered.is_ok() {
             leaked.push(format!("{with} -> {rendered:?}"));
@@ -218,9 +245,15 @@ steps:
 #[test]
 fn inputs_that_read_a_secret_env_or_an_undeclared_result_are_refused_at_compile() {
     for (with, want) in [
-        (r#"{ app: "${{ secrets.ARGO_TOKEN }}", image: x }"#, "reads `secrets`"),
+        (
+            r#"{ app: "${{ secrets.ARGO_TOKEN }}", image: x }"#,
+            "reads `secrets`",
+        ),
         (r#"{ app: "x-${{ env.HOME }}", image: x }"#, "reads `env`"),
-        (r#"{ app: "${{ outputs.bump.nope }}", image: x }"#, "does not declare"),
+        (
+            r#"{ app: "${{ outputs.bump.nope }}", image: x }"#,
+            "does not declare",
+        ),
     ] {
         let yaml = format!(
             "steps:\n  - {{ id: bump, image: alpine, results: [image] }}\n  - id: live\n    \

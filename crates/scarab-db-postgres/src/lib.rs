@@ -1470,13 +1470,12 @@ impl Db for PostgresDb {
     }
 
     async fn count_running_runs(&self, project: &str) -> Result<u32, DbError> {
-        let row = sqlx::query(
-            "SELECT count(*) AS n FROM runs WHERE status = 'running' AND project = $1",
-        )
-        .bind(project)
-        .fetch_one(self.pool())
-        .await
-        .map_err(db_err)?;
+        let row =
+            sqlx::query("SELECT count(*) AS n FROM runs WHERE status = 'running' AND project = $1")
+                .bind(project)
+                .fetch_one(self.pool())
+                .await
+                .map_err(db_err)?;
         Ok(row.get::<i64, _>("n") as u32)
     }
 

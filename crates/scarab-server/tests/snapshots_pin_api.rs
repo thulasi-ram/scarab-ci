@@ -21,7 +21,10 @@ use scarab_testkit::{FakeClock, InMemoryDb, InMemoryObjectStore};
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 
 fn state(db: Arc<InMemoryDb>, clock: Arc<FakeClock>) -> AppState {
-    let logs = Arc::new(LogService::new(Arc::new(InMemoryObjectStore::new()), db.clone()));
+    let logs = Arc::new(LogService::new(
+        Arc::new(InMemoryObjectStore::new()),
+        db.clone(),
+    ));
     // 7 days, deliberately NOT the default: the API must quote the deployment's
     // window, not a constant baked into a DTO.
     AppState::new(db, clock, logs).with_snapshot_retention_days(7)
@@ -180,7 +183,8 @@ async fn pin_then_unpin_round_trips_and_is_audited() {
     let wr = body_json(resp).await;
     assert_eq!(wr["pinned"], true);
     assert_eq!(
-        wr["pinned_at"], 2 * DAY_MS,
+        wr["pinned_at"],
+        2 * DAY_MS,
         "the pin records WHEN — the audit half"
     );
     assert!(
@@ -348,16 +352,19 @@ async fn a_widened_rerun_plan_names_the_consumer_and_the_producer_over_the_wire(
     }
 
     let cas_dir = tempfile::tempdir().unwrap();
-    let cas: Arc<dyn scarab_storage::Cas> = Arc::new(
-        scarab_storage_s3::S3Storage::local(cas_dir.path().to_str().unwrap()).unwrap(),
-    );
+    let cas: Arc<dyn scarab_storage::Cas> =
+        Arc::new(scarab_storage_s3::S3Storage::local(cas_dir.path().to_str().unwrap()).unwrap());
     // `clone`'s snapshot is really there; `build`'s really is not. So rerunning
     // `test` has to walk back exactly one step — far enough to be non-empty,
     // short enough that "the whole chain" would be a visibly different answer.
     let live = {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("src.txt"), b"cloned").unwrap();
-        cas.ingest(dir.path().to_str().unwrap()).await.unwrap().root.0
+        cas.ingest(dir.path().to_str().unwrap())
+            .await
+            .unwrap()
+            .root
+            .0
     };
     const SWEPT: &str = "1111111111111111111111111111111111111111111111111111111111111111";
     db.set_step_output(

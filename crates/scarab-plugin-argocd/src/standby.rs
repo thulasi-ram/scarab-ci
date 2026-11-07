@@ -72,7 +72,9 @@ pub async fn run(cfg: Config, mut stop: watch::Receiver<bool>) -> Result<(), Str
                         tracing::info!(released = ?r.released, failed = ?r.failed, "argocd: gates answered");
                     }
                 }
-                Err(e) => tracing::warn!(error = %e, status = ?e.status(), "argocd: gate pass failed"),
+                Err(e) => {
+                    tracing::warn!(error = %e, status = ?e.status(), "argocd: gate pass failed")
+                }
             }
         }
         tokio::select! {

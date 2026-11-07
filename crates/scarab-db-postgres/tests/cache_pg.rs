@@ -46,12 +46,11 @@ async fn cache_rows_are_project_scoped_and_upserts_refresh_in_place() {
             .is_empty(),
         "project B must never resolve project A's rows, same key string or not"
     );
-    assert!(
-        pg.cache_lookup("acme/web", "key-2")
-            .await
-            .expect("other-key lookup")
-            .is_empty()
-    );
+    assert!(pg
+        .cache_lookup("acme/web", "key-2")
+        .await
+        .expect("other-key lookup")
+        .is_empty());
 
     // Upsert refresh: same (project, key, dir), newer save → replaced, still
     // one row.
@@ -80,7 +79,10 @@ async fn cache_rows_are_project_scoped_and_upserts_refresh_in_place() {
     .fetch_one(&db.pool)
     .await
     .expect("row");
-    assert_eq!(saved_at, 2_000, "saved_at refreshes — the eviction-evidence clock");
+    assert_eq!(
+        saved_at, 2_000,
+        "saved_at refreshes — the eviction-evidence clock"
+    );
     assert_eq!(attempt, "a2", "provenance follows the refresh");
 
     db.cleanup().await;

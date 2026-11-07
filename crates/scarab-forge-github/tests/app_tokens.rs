@@ -35,7 +35,6 @@ impl Reply {
     fn ok(body: &str) -> Self {
         Self::new(StatusCode::OK, body)
     }
-
 }
 
 /// What the stub saw — the wire observation the assertions are made against.
@@ -173,7 +172,10 @@ async fn a_write_mint_asks_for_contents_write_on_one_repository() {
     let seen = stub.seen();
     assert_eq!(seen[1].path, "/app/installations/77/access_tokens");
     let body: serde_json::Value = serde_json::from_str(&seen[1].body).unwrap();
-    assert_eq!(body["permissions"], serde_json::json!({ "contents": "write" }));
+    assert_eq!(
+        body["permissions"],
+        serde_json::json!({ "contents": "write" })
+    );
     assert_eq!(body["repositories"], serde_json::json!(["web"]));
 }
 
@@ -191,7 +193,10 @@ async fn a_read_mint_asks_for_contents_read() {
         .unwrap();
     assert_eq!(cred.token, "ghs_read");
     let body: serde_json::Value = serde_json::from_str(&stub.seen()[1].body).unwrap();
-    assert_eq!(body["permissions"], serde_json::json!({ "contents": "read" }));
+    assert_eq!(
+        body["permissions"],
+        serde_json::json!({ "contents": "read" })
+    );
 }
 
 #[tokio::test]

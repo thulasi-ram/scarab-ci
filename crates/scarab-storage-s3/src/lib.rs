@@ -488,7 +488,9 @@ impl S3Storage {
         let hash_ns = elapsed_ns(t);
         let len = bytes.len() as u64;
         let t = Instant::now();
-        let uploaded = self.put_if_absent(&format!("{prefix}/{hash}"), bytes).await?;
+        let uploaded = self
+            .put_if_absent(&format!("{prefix}/{hash}"), bytes)
+            .await?;
         Ok((
             hash,
             Stored {
@@ -526,10 +528,8 @@ impl S3Storage {
         // --- Phase 2: blobs, concurrently. -----------------------------------
         // Every file and symlink in the whole tree at once: this is the pass that
         // used to be one strictly-serial round-trip per file.
-        let mut hashes: Vec<Vec<Option<BlobHash>>> = arena
-            .iter()
-            .map(|d| vec![None; d.entries.len()])
-            .collect();
+        let mut hashes: Vec<Vec<Option<BlobHash>>> =
+            arena.iter().map(|d| vec![None; d.entries.len()]).collect();
         let mut jobs: Vec<(usize, usize, BlobSource)> = Vec::new();
         for (d, dir) in arena.iter().enumerate() {
             for (e, entry) in dir.entries.iter().enumerate() {
@@ -595,7 +595,9 @@ impl S3Storage {
                     entries.push(match entry {
                         WalkEntry::Symlink { name, .. } => TreeEntry::symlink(
                             name.clone(),
-                            hashes[i][e].clone().ok_or_else(|| missing("a symlink blob"))?,
+                            hashes[i][e]
+                                .clone()
+                                .ok_or_else(|| missing("a symlink blob"))?,
                         ),
                         WalkEntry::Blob {
                             name,
@@ -618,9 +620,7 @@ impl S3Storage {
                         } => TreeEntry {
                             name: name.clone(),
                             target: TreeTarget::Tree(
-                                trees[*idx]
-                                    .clone()
-                                    .ok_or_else(|| missing("a sub-tree"))?,
+                                trees[*idx].clone().ok_or_else(|| missing("a sub-tree"))?,
                             ),
                             mode: Some(*mode),
                             mtime_ms: *mtime_ms,
@@ -965,8 +965,11 @@ impl Cas for S3Storage {
                 let mut restore = mode;
                 if let Some(cur) = pre {
                     if cur & 0o700 != 0o700 {
-                        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(cur | 0o700))
-                            .map_err(io_err)?;
+                        std::fs::set_permissions(
+                            &dir,
+                            std::fs::Permissions::from_mode(cur | 0o700),
+                        )
+                        .map_err(io_err)?;
                         // With no recorded mode, put back exactly what was there.
                         restore = restore.or(Some(cur));
                     }

@@ -232,7 +232,6 @@ async fn a_real_forgejo_repo_onboards_and_its_push_becomes_a_run() {
 const NOTIFY_SOURCE: &str =
     "github.com/thulasi-ram/scarab-ci//.scarab/lib/notify.yaml@edd63788668ca551d4871f2a0856c0dc56783493";
 
-
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs the kind release and a seeded Forgejo; run `just test e2e`"]
 async fn an_installed_library_runs_and_a_yank_refuses_its_rerun() {
@@ -246,8 +245,7 @@ async fn an_installed_library_runs_and_a_yank_refuses_its_rerun() {
     let name = env("SCARAB_TEST_FORGEJO_LIBRARY_REPO");
     let repo = format!("{owner}/{name}");
 
-    let (org, project) =
-        connect_and_bind(&http, &base, &server_side, &token, &owner, &name).await;
+    let (org, project) = connect_and_bind(&http, &base, &server_side, &token, &owner, &name).await;
 
     // --- 1. fetch and install lib:thulasi-ram/notify ------------------------
     let fetched = json_ok(
@@ -262,7 +260,9 @@ async fn an_installed_library_runs_and_a_yank_refuses_its_rerun() {
     assert_eq!(fetched["publisher"], "thulasi-ram", "{fetched:#}");
     assert_eq!(fetched["name"], "notify", "{fetched:#}");
     let hash = fetched["content_hash"].as_str().expect("hash").to_string();
-    let current = fetched["current"]["content_hash"].as_str().map(str::to_string);
+    let current = fetched["current"]["content_hash"]
+        .as_str()
+        .map(str::to_string);
     if current.as_deref() != Some(hash.as_str()) {
         json_ok(
             http.put(format!("{base}/v1/orgs/{org}/libraries/thulasi-ram/notify"))
@@ -303,7 +303,10 @@ async fn an_installed_library_runs_and_a_yank_refuses_its_rerun() {
     let before = run_ids(&http, &base, &org, &project).await;
     push_file(&http, &forgejo, &token, &repo, None).await;
     let on_main = new_runs_on(&http, &base, &org, &project, &before, "refs/heads/main", 2).await;
-    let ci_run = on_main.get("ci").unwrap_or_else(|| panic!("no `ci` Run: {on_main:?}")).clone();
+    let ci_run = on_main
+        .get("ci")
+        .unwrap_or_else(|| panic!("no `ci` Run: {on_main:?}"))
+        .clone();
     for (pipeline, id) in &on_main {
         let rs = wait_for_terminal(&http, &base, id, Duration::from_secs(240)).await;
         assert_eq!(rs.status, "succeeded", "pipeline `{pipeline}` run {id}");
@@ -341,7 +344,10 @@ async fn an_installed_library_runs_and_a_yank_refuses_its_rerun() {
     assert_eq!(refused["git_ref"], branch_ref.as_str(), "{refused:#}");
     assert_eq!(refused["reason_kind"], "event_field", "{refused:#}");
     assert!(
-        refused["message"].as_str().unwrap_or_default().contains(';'),
+        refused["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(';'),
         "the refusal names the character: {refused:#}"
     );
     let rs = wait_for_terminal(&http, &base, &on_branch["ci"], Duration::from_secs(240)).await;
@@ -366,7 +372,10 @@ async fn an_installed_library_runs_and_a_yank_refuses_its_rerun() {
         .expect("POST rerun");
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
-    assert!(status.is_success(), "the Rerun is accepted ({status}): {body}");
+    assert!(
+        status.is_success(),
+        "the Rerun is accepted ({status}): {body}"
+    );
     let rs = wait_for_run(
         &http,
         &base,

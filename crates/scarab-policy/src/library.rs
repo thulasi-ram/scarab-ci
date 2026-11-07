@@ -441,7 +441,10 @@ mod tests {
             trust_key("github.com/acme/libs//ci/git.yaml@0123abcd"),
             "github.com/acme/libs//ci/git.yaml"
         );
-        assert_eq!(trust_key("github.com/acme/libs//git.yaml"), "github.com/acme/libs//git.yaml");
+        assert_eq!(
+            trust_key("github.com/acme/libs//git.yaml"),
+            "github.com/acme/libs//git.yaml"
+        );
     }
 
     #[test]
@@ -464,7 +467,10 @@ mod tests {
             "clone",
             "git.example.com/mirrors/scarab-ci//libs/checkout.yaml@1111"
         )));
-        assert!(!is_first_party_clone(&v(false, "clone", src)), "not first-party");
+        assert!(
+            !is_first_party_clone(&v(false, "clone", src)),
+            "not first-party"
+        );
         assert!(
             !is_first_party_clone(&v(true, "deploy", src)),
             "another first-party library, fetched from a path named clone.yaml"

@@ -114,13 +114,34 @@ fn clean() -> Facts {
             creating: false,
         }],
         events: vec![
-            ev(1, serde_json::json!({"AttemptStarted": {"step": "produce", "attempt": "a1"}})),
-            ev(2, serde_json::json!({"AttemptFinished": {"step": "produce", "attempt": "a1", "failure": null}})),
-            ev(2, serde_json::json!({"StepTransitioned": {"step": "produce", "from": "Running", "to": "Succeeded"}})),
-            ev(3, serde_json::json!({"AttemptStarted": {"step": "consume", "attempt": "a1"}})),
-            ev(4, serde_json::json!({"AttemptFinished": {"step": "consume", "attempt": "a1", "failure": null}})),
-            ev(4, serde_json::json!({"StepTransitioned": {"step": "consume", "from": "Running", "to": "Succeeded"}})),
-            ev(5, serde_json::json!({"RunTransitioned": {"from": "Running", "to": "Succeeded"}})),
+            ev(
+                1,
+                serde_json::json!({"AttemptStarted": {"step": "produce", "attempt": "a1"}}),
+            ),
+            ev(
+                2,
+                serde_json::json!({"AttemptFinished": {"step": "produce", "attempt": "a1", "failure": null}}),
+            ),
+            ev(
+                2,
+                serde_json::json!({"StepTransitioned": {"step": "produce", "from": "Running", "to": "Succeeded"}}),
+            ),
+            ev(
+                3,
+                serde_json::json!({"AttemptStarted": {"step": "consume", "attempt": "a1"}}),
+            ),
+            ev(
+                4,
+                serde_json::json!({"AttemptFinished": {"step": "consume", "attempt": "a1", "failure": null}}),
+            ),
+            ev(
+                4,
+                serde_json::json!({"StepTransitioned": {"step": "consume", "from": "Running", "to": "Succeeded"}}),
+            ),
+            ev(
+                5,
+                serde_json::json!({"RunTransitioned": {"from": "Running", "to": "Succeeded"}}),
+            ),
         ],
         attempts: vec![
             att("produce", "succeeded", Some("sha256:produce")),
@@ -144,7 +165,13 @@ fn clean() -> Facts {
 #[test]
 fn the_clean_scenario_passes() {
     let v = evaluate(&clean());
-    assert_eq!(v.outcome, Outcome::Pass, "{:?} {:?}", v.findings, v.inconclusive);
+    assert_eq!(
+        v.outcome,
+        Outcome::Pass,
+        "{:?} {:?}",
+        v.findings,
+        v.inconclusive
+    );
 }
 
 // --- exercised ---------------------------------------------------------------
@@ -194,12 +221,19 @@ fn a_dead_lettered_run_fails_w1() {
     let mut f = clean();
     f.runs[0].status = "dead_lettered".into();
     f.events.pop();
-    f.events.push(ev(5, serde_json::json!({"RunTransitioned": {"from": "Running", "to": "DeadLettered"}})));
+    f.events.push(ev(
+        5,
+        serde_json::json!({"RunTransitioned": {"from": "Running", "to": "DeadLettered"}}),
+    ));
     let v = evaluate(&f);
     assert_eq!(v.outcome, Outcome::Fail);
     let w1: Vec<&Finding> = v.findings.iter().filter(|x| x.invariant == "W1").collect();
     assert_eq!(w1.len(), 1, "{:?}", v.findings);
-    assert!(w1[0].detail.contains("run r ended dead_lettered"), "{}", w1[0].detail);
+    assert!(
+        w1[0].detail.contains("run r ended dead_lettered"),
+        "{}",
+        w1[0].detail
+    );
 }
 
 /// Red team: the producer is green with no output snapshot, the consumer's
@@ -209,15 +243,37 @@ fn a_lost_workspace_and_a_failed_run_fail_w1() {
     let mut f = clean();
     f.runs[0].status = "failed".into();
     f.events.pop();
-    f.events.push(ev(5, serde_json::json!({"RunTransitioned": {"from": "Running", "to": "Failed"}})));
-    f.attempts = vec![att("produce", "succeeded", None), att("consume", "failed", None)];
-    f.steps = vec![step_row("produce", "succeeded", None), step_row("consume", "failed", None)];
+    f.events.push(ev(
+        5,
+        serde_json::json!({"RunTransitioned": {"from": "Running", "to": "Failed"}}),
+    ));
+    f.attempts = vec![
+        att("produce", "succeeded", None),
+        att("consume", "failed", None),
+    ];
+    f.steps = vec![
+        step_row("produce", "succeeded", None),
+        step_row("consume", "failed", None),
+    ];
     f.snapshots.clear();
     let v = evaluate(&f);
     assert_eq!(v.outcome, Outcome::Fail);
-    let details: Vec<&str> = v.findings.iter().filter(|x| x.invariant == "W1").map(|x| x.detail.as_str()).collect();
-    assert!(details.iter().any(|d| d.contains("ended failed")), "{details:?}");
-    assert!(details.iter().any(|d| d.contains("step produce attempt a1 is succeeded with no output snapshot")), "{details:?}");
+    let details: Vec<&str> = v
+        .findings
+        .iter()
+        .filter(|x| x.invariant == "W1")
+        .map(|x| x.detail.as_str())
+        .collect();
+    assert!(
+        details.iter().any(|d| d.contains("ended failed")),
+        "{details:?}"
+    );
+    assert!(
+        details
+            .iter()
+            .any(|d| d.contains("step produce attempt a1 is succeeded with no output snapshot")),
+        "{details:?}"
+    );
 }
 
 // --- minimums ------------------------------------------------------------------
@@ -236,7 +292,13 @@ fn an_invariant_below_its_minimum_is_inconclusive() {
     f.pod_records.pop();
     let v = evaluate(&f);
     assert_eq!(v.outcome, Outcome::Inconclusive);
-    assert!(v.inconclusive.iter().any(|w| w.starts_with("I1a looked at 1, below its minimum of 2")), "{:?}", v.inconclusive);
+    assert!(
+        v.inconclusive
+            .iter()
+            .any(|w| w.starts_with("I1a looked at 1, below its minimum of 2")),
+        "{:?}",
+        v.inconclusive
+    );
 }
 
 /// Fewer Runs than the workload submits: T1 and I3 are below their minimum.
@@ -246,7 +308,13 @@ fn fewer_runs_than_the_workload_is_inconclusive() {
     f.expected_runs = 3;
     let v = evaluate(&f);
     assert_eq!(v.outcome, Outcome::Inconclusive);
-    assert!(v.inconclusive.iter().any(|w| w.starts_with("T1 looked at 1")), "{:?}", v.inconclusive);
+    assert!(
+        v.inconclusive
+            .iter()
+            .any(|w| w.starts_with("T1 looked at 1")),
+        "{:?}",
+        v.inconclusive
+    );
 }
 
 /// A green Attempt's snapshot that was never walked: I4 checked nothing.
@@ -256,7 +324,13 @@ fn i4_over_nothing_is_inconclusive() {
     f.snapshots.clear();
     let v = evaluate(&f);
     assert_eq!(v.outcome, Outcome::Inconclusive);
-    assert!(v.inconclusive.iter().any(|w| w.starts_with("I4 looked at 0")), "{:?}", v.inconclusive);
+    assert!(
+        v.inconclusive
+            .iter()
+            .any(|w| w.starts_with("I4 looked at 0")),
+        "{:?}",
+        v.inconclusive
+    );
 }
 
 // --- I1b / I1c over the journal ---------------------------------------------------
@@ -266,7 +340,13 @@ fn i4_over_nothing_is_inconclusive() {
 #[test]
 fn an_overlap_with_an_unseen_first_attempt_fails_i1b() {
     let mut f = clean();
-    f.events.insert(0, ev(0, serde_json::json!({"AttemptStarted": {"step": "produce", "attempt": "a0"}})));
+    f.events.insert(
+        0,
+        ev(
+            0,
+            serde_json::json!({"AttemptStarted": {"step": "produce", "attempt": "a0"}}),
+        ),
+    );
     f.attempts.push(AttemptRow {
         attempt: "a0".into(),
         outcome: Some("failed".into()),
@@ -277,12 +357,20 @@ fn an_overlap_with_an_unseen_first_attempt_fails_i1b() {
     assert_eq!(v.outcome, Outcome::Fail);
     let i1b: Vec<&Finding> = v.findings.iter().filter(|x| x.invariant == "I1b").collect();
     assert_eq!(i1b.len(), 1, "{:?}", v.findings);
-    assert!(i1b[0].detail.contains("a0's was never seen"), "{}", i1b[0].detail);
+    assert!(
+        i1b[0].detail.contains("a0's was never seen"),
+        "{}",
+        i1b[0].detail
+    );
     // Journalled ended before a1 started: allowed, nothing to report.
     f.events[0].seq = -1;
     f.events.insert(1, ev(0, serde_json::json!({"AttemptFinished": {"step": "produce", "attempt": "a0", "failure": "step"}})));
     let v = evaluate(&f);
-    assert!(!v.findings.iter().any(|x| x.invariant == "I1b"), "{:?}", v.findings);
+    assert!(
+        !v.findings.iter().any(|x| x.invariant == "I1b"),
+        "{:?}",
+        v.findings
+    );
 }
 
 /// Red team: two AttemptStarted for an Attempt that has no `attempts` row.
@@ -291,12 +379,18 @@ fn an_overlap_with_an_unseen_first_attempt_fails_i1b() {
 fn a_duplicate_attempt_started_without_a_row_fails_i1c() {
     let mut f = clean();
     for seq in [6, 7] {
-        f.events.push(ev(seq, serde_json::json!({"AttemptStarted": {"step": "consume", "attempt": "a9"}})));
+        f.events.push(ev(
+            seq,
+            serde_json::json!({"AttemptStarted": {"step": "consume", "attempt": "a9"}}),
+        ));
     }
     let v = evaluate(&f);
     assert_eq!(v.outcome, Outcome::Fail);
     assert!(
-        v.findings.iter().any(|x| x.invariant == "I1c" && x.detail.contains("attempt a9: 2 AttemptStarted events")),
+        v.findings
+            .iter()
+            .any(|x| x.invariant == "I1c"
+                && x.detail.contains("attempt a9: 2 AttemptStarted events")),
         "{:?}",
         v.findings
     );
@@ -333,25 +427,46 @@ fn a_kill_of_the_claim_holder_mid_drain_passes() {
     f.kind = Some(Kind::KillServer);
     f.faults = vec![kill("claim-holder", true)];
     let v = evaluate(&f);
-    assert_eq!(v.outcome, Outcome::Pass, "{:?} {:?}", v.findings, v.inconclusive);
+    assert_eq!(
+        v.outcome,
+        Outcome::Pass,
+        "{:?} {:?}",
+        v.findings,
+        v.inconclusive
+    );
 }
 
 /// The kill hit the replica that did not hold the claim, or the restart
 /// that shows the SIGKILL took effect was never seen: not a test of rank 2.
 #[test]
 fn a_kill_of_the_peer_or_an_unconfirmed_kill_is_inconclusive() {
-    for (role, delivered, want) in [("peer", true, "the victim was the peer"), ("unknown", true, "the victim was the unknown"), ("claim-holder", false, "did not take effect")] {
+    for (role, delivered, want) in [
+        ("peer", true, "the victim was the peer"),
+        ("unknown", true, "the victim was the unknown"),
+        ("claim-holder", false, "did not take effect"),
+    ] {
         let mut f = clean();
         f.kind = Some(Kind::KillServer);
         f.faults = vec![kill(role, delivered)];
         let v = evaluate(&f);
         assert_eq!(v.outcome, Outcome::Inconclusive, "{role} {delivered}");
-        assert!(v.inconclusive.iter().any(|w| w.contains(want)), "{:?}", v.inconclusive);
+        assert!(
+            v.inconclusive.iter().any(|w| w.contains(want)),
+            "{:?}",
+            v.inconclusive
+        );
     }
     // Outside the drain window is inconclusive as for rank 1.
     let mut f = clean();
     f.kind = Some(Kind::KillServer);
-    f.faults = vec![Fault { landing: Some(Landing { class: "after-window".into(), window_start_ms: Some(1), window_end_ms: Some(2) }), ..kill("claim-holder", true) }];
+    f.faults = vec![Fault {
+        landing: Some(Landing {
+            class: "after-window".into(),
+            window_start_ms: Some(1),
+            window_end_ms: Some(2),
+        }),
+        ..kill("claim-holder", true)
+    }];
     assert_eq!(evaluate(&f).outcome, Outcome::Inconclusive);
 }
 
@@ -385,7 +500,13 @@ fn a_leader_stopped_past_the_ttl_with_a_term_bump_passes() {
     f.kind = Some(Kind::StopLeader);
     f.faults = vec![stop("leader", 31_000, (Some(4), Some(5), Some(5)))];
     let v = evaluate(&f);
-    assert_eq!(v.outcome, Outcome::Pass, "{:?} {:?}", v.findings, v.inconclusive);
+    assert_eq!(
+        v.outcome,
+        Outcome::Pass,
+        "{:?} {:?}",
+        v.findings,
+        v.inconclusive
+    );
     assert_eq!(v.checked["L1"], 1);
     // On a schema with no term column L1 checks nothing, and that is not a
     // reason to withhold the verdict.
@@ -401,9 +522,18 @@ fn a_takeover_without_a_term_bump_fails_l1() {
     f.faults = vec![stop("leader", 31_000, (Some(4), Some(4), Some(4)))];
     let v = evaluate(&f);
     assert_eq!(v.outcome, Outcome::Fail);
-    assert!(v.findings.iter().any(|x| x.invariant == "L1" && x.detail.contains("term 4 -> 4")), "{:?}", v.findings);
+    assert!(
+        v.findings
+            .iter()
+            .any(|x| x.invariant == "L1" && x.detail.contains("term 4 -> 4")),
+        "{:?}",
+        v.findings
+    );
     f.faults = vec![stop("leader", 31_000, (Some(4), Some(5), Some(3)))];
-    assert!(evaluate(&f).findings.iter().any(|x| x.invariant == "L1" && x.detail.contains("went back")));
+    assert!(evaluate(&f)
+        .findings
+        .iter()
+        .any(|x| x.invariant == "L1" && x.detail.contains("went back")));
 }
 
 /// Stopped for less than the TTL, or restarted by the kubelet before the
@@ -419,7 +549,11 @@ fn a_stop_that_did_not_outlast_the_lease_is_inconclusive() {
         f.faults = vec![stop(role, ms, (Some(1), Some(2), Some(2)))];
         let v = evaluate(&f);
         assert_eq!(v.outcome, Outcome::Inconclusive, "{role}");
-        assert!(v.inconclusive.iter().any(|w| w.contains(want)), "{role}: {:?}", v.inconclusive);
+        assert!(
+            v.inconclusive.iter().any(|w| w.contains(want)),
+            "{role}: {:?}",
+            v.inconclusive
+        );
     }
 }
 
@@ -433,7 +567,11 @@ fn a_stopped_leader_never_taken_over_fails_l2() {
     f.faults = vec![stop("leader-no-takeover", 61_000, (Some(1), None, Some(1)))];
     let v = evaluate(&f);
     assert_eq!(v.outcome, Outcome::Fail, "{:?}", v.inconclusive);
-    assert!(v.findings.iter().any(|x| x.invariant == "L2"), "{:?}", v.findings);
+    assert!(
+        v.findings.iter().any(|x| x.invariant == "L2"),
+        "{:?}",
+        v.findings
+    );
     f.faults = vec![stop("leader", 31_000, (Some(1), Some(2), Some(2)))];
     let v = evaluate(&f);
     assert_eq!((v.outcome, v.checked["L2"]), (Outcome::Pass, 1));
@@ -454,7 +592,11 @@ fn two_replicas_needs_both_replicas_to_have_claimed_launches() {
     f.launch_claimers = ["scarab-server-a".to_string()].into();
     let v = evaluate(&f);
     assert_eq!(v.outcome, Outcome::Inconclusive);
-    assert!(v.inconclusive[0].contains("1 replica(s) drove"), "{:?}", v.inconclusive);
+    assert!(
+        v.inconclusive[0].contains("1 replica(s) drove"),
+        "{:?}",
+        v.inconclusive
+    );
     f.launch_claimers.insert("scarab-server-b".into());
     let v = evaluate(&f);
     assert_eq!(v.outcome, Outcome::Pass, "{:?}", v.inconclusive);

@@ -551,9 +551,7 @@ async fn the_token_s_scope_and_ceiling_narrow_the_replay() {
     assert!(h.step_up.requests().is_empty(), "no request for it: {b}");
 
     let own = json!({"org": "acme", "repo": "web", "name": "DB_PASSWORD", "value": "v"});
-    let (st, b) = h
-        .bearer("POST", "/v1/secrets", Some(own), &project)
-        .await;
+    let (st, b) = h.bearer("POST", "/v1/secrets", Some(own), &project).await;
     assert_step_up(st, &b, "window");
     let id = b["request_id"].as_str().expect("a request id").to_string();
     let (st, done) = confirm(&h, &amy, &mut soft, &id).await;
@@ -1052,10 +1050,7 @@ async fn a_request_cannot_be_widened() {
 /// A world with `acme/prod` governed in memory, its baseline
 /// `{approvers:[amy], allowed_refs:[main]}`; and the store, to change it
 /// behind the request's back.
-async fn governed() -> (
-    Harness,
-    Arc<scarab_testkit::InMemoryEnvironmentGovernance>,
-) {
+async fn governed() -> (Harness, Arc<scarab_testkit::InMemoryEnvironmentGovernance>) {
     use scarab_project::{
         EnvironmentGovernanceStore, EnvironmentProjectEligibility, EnvironmentProtectionRules,
     };
@@ -1216,7 +1211,12 @@ async fn a_request_shows_the_query_it_runs_with() {
     let (amy, _soft) = amy_in_browser(&h).await;
     let token = pat(&h, "t1", Scope::Org("acme".into()), Role::Admin).await;
     let (st, b) = h
-        .bearer("DELETE", "/v1/connections/gh?unbind_repos=true", None, &token)
+        .bearer(
+            "DELETE",
+            "/v1/connections/gh?unbind_repos=true",
+            None,
+            &token,
+        )
         .await;
     assert!(is_step_up(st, &b), "{st} {b}");
     let id = b["request_id"].as_str().expect("a request").to_string();

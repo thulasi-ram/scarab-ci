@@ -21,8 +21,8 @@ mod org_environment;
 pub use org_environment::{
     duplicate_display_name, normalize_display_name, validate_org_environment_display_name,
     validate_org_environment_name, OrgEnvironment, OrgEnvironmentError, OrgEnvironmentStore,
-    DUPLICATE_DISPLAY_NAME_SUFFIX, MAX_INSTALLATION_NAME_CHARS,
-    MAX_ORG_ENVIRONMENT_DESCRIPTION_CHARS, MAX_ORG_ENVIRONMENT_DISPLAY_NAME_CHARS, WritePrecondition,
+    WritePrecondition, DUPLICATE_DISPLAY_NAME_SUFFIX, MAX_INSTALLATION_NAME_CHARS,
+    MAX_ORG_ENVIRONMENT_DESCRIPTION_CHARS, MAX_ORG_ENVIRONMENT_DISPLAY_NAME_CHARS,
 };
 
 /// The org-level Environment's governance model and its pure resolution

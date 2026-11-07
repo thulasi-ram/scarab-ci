@@ -317,7 +317,10 @@ fn operation_tags_cover_every_operation() {
     );
     // No empty sidebar sections: a declared group must have members.
     let unused: Vec<&&str> = declared.iter().filter(|t| !used.contains(**t)).collect();
-    assert!(unused.is_empty(), "declared groups with no operations: {unused:?}");
+    assert!(
+        unused.is_empty(),
+        "declared groups with no operations: {unused:?}"
+    );
 }
 
 /// The UI can never be framed (ADR-0073 §6 click-jacking): the step-up

@@ -729,11 +729,17 @@ mod tests {
     fn an_invalid_registry_refuses_the_boot() {
         for (profiles, why) in [
             (
-                vec![profile("a", true, None, None), profile("a", false, None, None)],
+                vec![
+                    profile("a", true, None, None),
+                    profile("a", false, None, None),
+                ],
                 "duplicate name",
             ),
             (
-                vec![profile("a", true, None, None), profile("b", true, None, None)],
+                vec![
+                    profile("a", true, None, None),
+                    profile("b", true, None, None),
+                ],
                 "two defaults",
             ),
             (vec![profile("", false, None, None)], "empty name"),
@@ -766,7 +772,11 @@ mod tests {
         .expect("valid registry");
         assert_eq!(reg.pack_ttl_secs(Some("short")), days_secs(9));
         assert_eq!(reg.pack_ttl_secs(Some("keep")), days_secs(90));
-        assert_eq!(reg.pack_ttl_secs(Some("nope")), days_secs(90), "unknown → default");
+        assert_eq!(
+            reg.pack_ttl_secs(Some("nope")),
+            days_secs(90),
+            "unknown → default"
+        );
         assert_eq!(reg.pack_ttl_secs(None), days_secs(90), "unnamed → default");
         // `short` leaves workspace unset → flat 7d backs its floor check.
         assert_eq!(reg.ttls_of(Some("short")).workspace_ttl_secs, days_secs(7));

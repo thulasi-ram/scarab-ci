@@ -1598,7 +1598,10 @@ mod tests {
 
     #[test]
     fn a_library_upgrade_names_the_library_and_the_version_change() {
-        let (old, new) = ("5d1e0c7a9b3f".repeat(5) + "abcd", "0c4e7b2a91f5".repeat(5) + "abcd");
+        let (old, new) = (
+            "5d1e0c7a9b3f".repeat(5) + "abcd",
+            "0c4e7b2a91f5".repeat(5) + "abcd",
+        );
         let mut i = input(json!({ "content_hash": new, "replaces": old }));
         i.params = vec![
             ("org".into(), "acme".into()),
@@ -1609,11 +1612,18 @@ mod tests {
         assert_eq!(s.operation, "Install or upgrade a library");
         assert_eq!(s.target, "lib:acme/deploy-helm in acme");
         assert_eq!(s.changes[0], "version = 5d1e0c7a9b3f → 0c4e7b2a91f5");
-        assert!(s.changes.contains(&format!("content_hash = {new}")), "{:?}", s.changes);
+        assert!(
+            s.changes.contains(&format!("content_hash = {new}")),
+            "{:?}",
+            s.changes
+        );
 
         i.body = json!({ "content_hash": new });
         let s = LIBRARY_INSTALL.summary(&i);
-        assert_eq!(s.changes[0], "version = 0c4e7b2a91f5 (nothing installed before)");
+        assert_eq!(
+            s.changes[0],
+            "version = 0c4e7b2a91f5 (nothing installed before)"
+        );
 
         let mut u = input(Value::Null);
         u.params = vec![("org".into(), "acme".into()), ("hash".into(), old.clone())];

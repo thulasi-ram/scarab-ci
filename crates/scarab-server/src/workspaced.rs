@@ -425,7 +425,9 @@ pub async fn run(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
                 s3.bucket.clone(),
                 &s3.endpoint,
                 &s3.region,
-                s3.static_keys.as_ref().map(|(a, s)| (a.as_str(), s.as_str())),
+                s3.static_keys
+                    .as_ref()
+                    .map(|(a, s)| (a.as_str(), s.as_str())),
             )?,
             StoreConfig::LocalDir(dir) => S3Storage::local(dir)?,
         }
@@ -492,7 +494,9 @@ pub async fn run(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
         map.values().cloned().collect()
     };
     for session in sessions {
-        let Ok(mut guard) = session.try_lock() else { continue };
+        let Ok(mut guard) = session.try_lock() else {
+            continue;
+        };
         if let Some(writer) = guard.open.take() {
             writer.abort().await;
         }
@@ -657,8 +661,7 @@ fn router_and_state(
             let mut pending_rowless: HashSet<String> = HashSet::new();
             loop {
                 pack_reclaim_pass(&state, &mut pending_rowless).await;
-                tokio::time::sleep(std::time::Duration::from_secs(PACK_RECLAIM_SWEEP_SECS))
-                    .await;
+                tokio::time::sleep(std::time::Duration::from_secs(PACK_RECLAIM_SWEEP_SECS)).await;
             }
         });
     }
@@ -697,7 +700,9 @@ async fn seal_idle_packs_once(state: &WorkspaceState, linger: std::time::Duratio
     };
     let cutoff_ms = now_ms() - i64::try_from(linger.as_millis()).unwrap_or(i64::MAX);
     for (key, session) in sessions {
-        let Ok(mut guard) = session.try_lock() else { continue };
+        let Ok(mut guard) = session.try_lock() else {
+            continue;
+        };
         if guard.aborted || guard.open.is_none() || guard.last_touched_ms > cutoff_ms {
             continue;
         }
@@ -803,7 +808,9 @@ async fn sweep_residue_once(state: &WorkspaceState) {
     };
     let cutoff_ms = (now - FENCE_RESIDUE_TTL_SECS) * 1000;
     for (key, session) in stale {
-        let Ok(mut guard) = session.try_lock() else { continue };
+        let Ok(mut guard) = session.try_lock() else {
+            continue;
+        };
         if guard.aborted || guard.last_touched_ms >= cutoff_ms {
             continue;
         }
@@ -963,9 +970,7 @@ async fn pack_reclaim_pass(state: &WorkspaceState, pending_rowless: &mut HashSet
             // skip set is that pass's deletions, so bytes outlive pointers by
             // at least one cadence even for rows deleted seconds ago.
             let skip: HashSet<String> = pack_keys.into_iter().collect();
-            match reclaim_orphan_packs_once(&state.db, &state.cold, &skip, pending_rowless)
-                .await
-            {
+            match reclaim_orphan_packs_once(&state.db, &state.cold, &skip, pending_rowless).await {
                 Ok((0, _)) => {}
                 Ok((objects, bytes)) => {
                     PACK_RECLAIM_ORPHAN_OBJECTS.fetch_add(objects, Ordering::Relaxed);
@@ -1042,11 +1047,10 @@ pub async fn reclaim_stale_staging_once(
     db: &sqlx::PgPool,
 ) -> Result<(u64, Vec<String>), sqlx::Error> {
     let mut tx = db.begin().await?;
-    let cutoff: i64 =
-        sqlx::query_scalar("SELECT EXTRACT(EPOCH FROM now())::bigint - $1")
-            .bind(PACK_RECLAIM_STALE_SECS)
-            .fetch_one(&mut *tx)
-            .await?;
+    let cutoff: i64 = sqlx::query_scalar("SELECT EXTRACT(EPOCH FROM now())::bigint - $1")
+        .bind(PACK_RECLAIM_STALE_SECS)
+        .fetch_one(&mut *tx)
+        .await?;
 
     // Step 1 — LOCK the doomed pack rows (`FOR UPDATE`) before touching any
     // member row. This is what makes the slice-0 interleaving argument hold
@@ -1097,12 +1101,11 @@ pub async fn reclaim_stale_staging_once(
     // Steps 2 and 3 — members first, then the packs themselves, both keyed by
     // the exact locked set (never by re-evaluating the predicate: the locks
     // are on these rows).
-    let member_rows =
-        sqlx::query("DELETE FROM depot_pack_members WHERE pack_key = ANY($1)")
-            .bind(&doomed)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
+    let member_rows = sqlx::query("DELETE FROM depot_pack_members WHERE pack_key = ANY($1)")
+        .bind(&doomed)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
     // `AND NOT committed` is redundant under the FOR UPDATE locks — nothing
     // can have flipped these rows — and stays anyway: the stop line above is
     // enforced mechanically in every DELETE, not by an argument.
@@ -1335,7 +1338,10 @@ enum WsError {
     /// (ticket 52ef3aa, enforce mode). Carries the blob and the fence so the
     /// 403 body is actionable at the client's exit-3 stderr (amendment F2a) —
     /// naming them discloses nothing the caller did not already present.
-    BlobForbidden { blob: String, fence: String },
+    BlobForbidden {
+        blob: String,
+        fence: String,
+    },
     /// A valid token whose **scope** may not drive this operation. Distinct from
     /// [`Forbidden`](WsError::Forbidden) because the refusal is about what kind of
     /// caller this is, not which snapshot it asked for. Its users today: the
@@ -1446,11 +1452,9 @@ fn authenticate(state: &WorkspaceState, headers: &HeaderMap) -> Result<Workspace
         // token is logged except which check failed — a forged token must not
         // be able to write arbitrary text into our logs.
         match &e {
-            WorkspaceTokenError::Expired { exp, now } => tracing::warn!(
-                exp,
-                now,
-                "workspace service: 401 — workspace token expired"
-            ),
+            WorkspaceTokenError::Expired { exp, now } => {
+                tracing::warn!(exp, now, "workspace service: 401 — workspace token expired")
+            }
             other => tracing::warn!(
                 reason = %other,
                 "workspace service: 401 — workspace token rejected"
@@ -1511,17 +1515,13 @@ fn fence_key(fence: &Fence) -> String {
 /// database failing, never a miss (same rule as [`warm_has`]). Every address
 /// in a row is normalized bare hex — [`valid_address`] runs at the handler
 /// edge, so tagged spellings never reach here.
-async fn read_ledger(
-    state: &WorkspaceState,
-    fence: &Fence,
-) -> Result<HashSet<String>, WsError> {
-    let rows: Vec<String> = sqlx::query_scalar(
-        "SELECT tree_address FROM depot_fence_writes WHERE fence_key = $1",
-    )
-    .bind(fence_key(fence))
-    .fetch_all(&state.db)
-    .await
-    .map_err(|e| fence_rows_error("read ledger", e))?;
+async fn read_ledger(state: &WorkspaceState, fence: &Fence) -> Result<HashSet<String>, WsError> {
+    let rows: Vec<String> =
+        sqlx::query_scalar("SELECT tree_address FROM depot_fence_writes WHERE fence_key = $1")
+            .bind(fence_key(fence))
+            .fetch_all(&state.db)
+            .await
+            .map_err(|e| fence_rows_error("read ledger", e))?;
     Ok(rows.into_iter().collect())
 }
 
@@ -1536,11 +1536,7 @@ async fn read_ledger(
 /// upload volume. A failure fails the PUT — the client's re-PUT is
 /// idempotent, and a tree stored without its ledger row would 422 that
 /// fence's own drain record later, which is the worse diagnosis.
-async fn ledger_append(
-    state: &WorkspaceState,
-    fence: &Fence,
-    hash: &str,
-) -> Result<(), WsError> {
+async fn ledger_append(state: &WorkspaceState, fence: &Fence, hash: &str) -> Result<(), WsError> {
     sqlx::query(
         "INSERT INTO depot_fence_writes (fence_key, tree_address, written_at) \
          VALUES ($1, $2, $3) ON CONFLICT (fence_key, tree_address) \
@@ -1619,7 +1615,11 @@ async fn authorize_tree(
 /// also used to build a `PathBuf`, and "the router probably prevents it" is not
 /// how a path-traversal guard should read.
 fn valid_hash(hash: &str) -> Result<(), WsError> {
-    if hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+    if hash.len() == 64
+        && hash
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
         Ok(())
     } else {
         Err(WsError::BadRequest(
@@ -1638,8 +1638,8 @@ fn valid_hash(hash: &str) -> Result<(), WsError> {
 /// unknown tag (`blake3:`) is a 400, fail-closed — never filed under a
 /// SHA-256 key its bytes do not hash to.
 fn valid_address(address: &str) -> Result<String, WsError> {
-    let (_algo, hex) = scarab_storage::parse_address(address)
-        .map_err(|e| WsError::BadRequest(e.to_string()))?;
+    let (_algo, hex) =
+        scarab_storage::parse_address(address).map_err(|e| WsError::BadRequest(e.to_string()))?;
     valid_hash(hex)?;
     Ok(hex.to_string())
 }
@@ -1696,9 +1696,8 @@ fn mode_from_u8(raw: u8) -> BlobAuthzMode {
 /// could not complete a REQUIRED root — which is the caller's 500, never a
 /// 403 (amendment F3). `String` rather than [`WsError`] because
 /// [`futures::future::Shared`] requires `Clone`.
-type BlobWalkShared = futures::future::Shared<
-    futures::future::BoxFuture<'static, Result<Arc<BlobClosure>, String>>,
->;
+type BlobWalkShared =
+    futures::future::Shared<futures::future::BoxFuture<'static, Result<Arc<BlobClosure>, String>>>;
 
 /// What one fallback walk proved.
 #[derive(Debug, PartialEq, Eq)]
@@ -1853,13 +1852,7 @@ impl BlobAllowlist {
     /// token's entry. Over [`BLOB_AUTHZ_MAX_ENTRY_BLOBS`] the entry is
     /// dropped instead of cached (F4); over [`BlobAllowInner::cap_bytes`]
     /// least-recent OTHER entries are evicted.
-    fn grant(
-        &self,
-        key: [u8; 32],
-        exp: i64,
-        granted_roots: &[String],
-        blobs: Vec<[u8; 32]>,
-    ) {
+    fn grant(&self, key: [u8; 32], exp: i64, granted_roots: &[String], blobs: Vec<[u8; 32]>) {
         self.grant_with_unwalkable(key, exp, granted_roots, &[], blobs);
     }
 
@@ -2008,10 +2001,8 @@ async fn walk_blob_closure(
 ) -> Result<Vec<[u8; 32]>, String> {
     let mut blobs: Vec<[u8; 32]> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    let mut queue: std::collections::VecDeque<TreeHash> = roots
-        .iter()
-        .map(|r| TreeHash(r.clone()))
-        .collect();
+    let mut queue: std::collections::VecDeque<TreeHash> =
+        roots.iter().map(|r| TreeHash(r.clone())).collect();
     while let Some(tree) = queue.pop_front() {
         if !seen.insert(tree.0.clone()) {
             continue;
@@ -2021,8 +2012,7 @@ async fn walk_blob_closure(
                 "blob-authz closure walk could not complete at tree {}: {}",
                 tree.0,
                 match e {
-                    WsError::NotFound =>
-                        "not in warm, the pack index, or cold".to_string(),
+                    WsError::NotFound => "not in warm, the pack index, or cold".to_string(),
                     WsError::Backend(m) => m,
                     other => format!("{other:?}"),
                 }
@@ -2117,7 +2107,10 @@ async fn singleflight_walk(
         if let Some((id, shared)) = inflight.get(&key) {
             (*id, shared.clone())
         } else {
-            let id = state.blob_allow.next_walk_id.fetch_add(1, Ordering::Relaxed);
+            let id = state
+                .blob_allow
+                .next_walk_id
+                .fetch_add(1, Ordering::Relaxed);
             let owned_state = state.clone();
             let roots = claims.roots.clone();
             let cache_roots = claims.cache_roots.clone();
@@ -2127,11 +2120,13 @@ async fn singleflight_walk(
                 #[cfg(test)]
                 {
                     let gate = {
-                        let mut slot =
-                            BLOB_WALK_GATE.lock().unwrap_or_else(PoisonError::into_inner);
+                        let mut slot = BLOB_WALK_GATE
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner);
                         match slot.take() {
-                            Some((k, arrived, proceed)) if k == gate_key =>
-                                Some((arrived, proceed)),
+                            Some((k, arrived, proceed)) if k == gate_key => {
+                                Some((arrived, proceed))
+                            }
                             other => {
                                 *slot = other;
                                 None
@@ -2143,10 +2138,7 @@ async fn singleflight_walk(
                         let _ = proceed.await;
                     }
                 }
-                owned_state
-                    .blob_allow
-                    .walks
-                    .fetch_add(1, Ordering::Relaxed);
+                owned_state.blob_allow.walks.fetch_add(1, Ordering::Relaxed);
                 walk_token_closure(&owned_state, roots, cache_roots)
                     .await
                     .map(Arc::new)
@@ -2214,14 +2206,9 @@ async fn authorize_blob(
     // Completeness is judged over EVERY claimed root, cache roots included:
     // an entry that has not seen a cache root cannot deny a blob under it.
     let claimed: Vec<String> = claims.claimed_roots().map(String::from).collect();
-    match state
-        .blob_allow
-        .lookup(&key, &blob, &claimed, now_secs())
-    {
+    match state.blob_allow.lookup(&key, &blob, &claimed, now_secs()) {
         BlobAllowVerdict::Allowed => return Ok(()),
-        BlobAllowVerdict::DeniedComplete => {
-            return blob_authz_deny(state, claims, hash, mode)
-        }
+        BlobAllowVerdict::DeniedComplete => return blob_authz_deny(state, claims, hash, mode),
         BlobAllowVerdict::Miss => {}
     }
 
@@ -2230,9 +2217,9 @@ async fn authorize_blob(
     let closure = singleflight_walk(state, key, claims)
         .await
         .map_err(WsError::Backend)?; // F3: an incomplete REQUIRED walk is a 500.
-    // Granted for the roots that walked — a cache root this replica could
-    // not walk is not among them (git-bug 2a79b73), and is recorded as
-    // unwalkable so the entry is complete and the next denial needs no walk.
+                                     // Granted for the roots that walked — a cache root this replica could
+                                     // not walk is not among them (git-bug 2a79b73), and is recorded as
+                                     // unwalkable so the entry is complete and the next denial needs no walk.
     state.blob_allow.grant_with_unwalkable(
         key,
         claims.exp,
@@ -2914,20 +2901,15 @@ async fn get_flat(
     // scope proves `hash` is in the token's roots CLAIM. Browse never seeds
     // (it bypasses the gate, and its empty roots claim would read as a
     // complete-and-empty closure).
-    if state.blob_allow.mode() != BlobAuthzMode::Off
-        && matches!(claims.scope, Scope::Read)
-    {
+    if state.blob_allow.mode() != BlobAuthzMode::Off && matches!(claims.scope, Scope::Read) {
         if let Some(key) = blob_authz_key(&headers) {
             // All-or-nothing: a manifest blob that failed to decode (cannot
             // happen for addresses `put_tree` validated) must not leave a
             // HOLE in an entry that then claims completeness for this root —
             // that would wrongly deny the missing blob under enforce. Skip
             // the seed instead; the fallback walk stays the safety net.
-            let blobs: Option<Vec<[u8; 32]>> = manifest
-                .entries
-                .iter()
-                .map(|e| hex32(&e.blob.0))
-                .collect();
+            let blobs: Option<Vec<[u8; 32]>> =
+                manifest.entries.iter().map(|e| hex32(&e.blob.0)).collect();
             if let Some(blobs) = blobs {
                 state
                     .blob_allow
@@ -3149,9 +3131,7 @@ async fn durable_present_of<'a, 'c>(
     bares: impl Iterator<Item = &'a str>,
     caller_fence: Option<&str>,
 ) -> Result<HashSet<String>, WsError> {
-    let tagged: Vec<String> = bares
-        .map(|h| tagged_address(HashAlgo::Sha256, h))
-        .collect();
+    let tagged: Vec<String> = bares.map(|h| tagged_address(HashAlgo::Sha256, h)).collect();
     if tagged.is_empty() {
         return Ok(HashSet::new());
     }
@@ -3458,8 +3438,7 @@ impl PackSession {
         let Some(writer) = self.open.take() else {
             return Ok(());
         };
-        let addresses: Vec<String> =
-            writer.members().iter().map(|m| m.address.clone()).collect();
+        let addresses: Vec<String> = writer.members().iter().map(|m| m.address.clone()).collect();
         match writer.finish().await {
             Ok(finished) => {
                 if let Err(e) = stage_pack_rows(&self.db, &self.fence_key, &finished).await {
@@ -3538,7 +3517,12 @@ async fn pack_append(
     let session = pack_session(state, &key);
     let mut session = session.lock().await;
     session
-        .append(&state.cold, kind, tagged_address(HashAlgo::Sha256, hex), data)
+        .append(
+            &state.cold,
+            kind,
+            tagged_address(HashAlgo::Sha256, hex),
+            data,
+        )
         .await
         .map_err(|e| {
             WsError::Backend(format!(
@@ -3627,11 +3611,13 @@ async fn seal_fence_packs(
     // seals — the backstop for a seal whose row staging failed.
     let mut packs: BTreeMap<String, CommitPackEntry> = staged_body_packs(&state.db, &key).await?;
     for p in &sealed {
-        packs.entry(p.key.clone()).or_insert_with(|| CommitPackEntry {
-            key: p.key.clone(),
-            bytes: p.bytes,
-            members: p.members.clone(),
-        });
+        packs
+            .entry(p.key.clone())
+            .or_insert_with(|| CommitPackEntry {
+                key: p.key.clone(),
+                bytes: p.bytes,
+                members: p.members.clone(),
+            });
     }
     if packs.is_empty() {
         return Ok((sealed, None));
@@ -3870,7 +3856,9 @@ async fn read_packed(
     };
     let (offset, len) = (
         u64::try_from(offset).map_err(|_| {
-            WsError::Backend(format!("pack row for {hex} has a negative offset ({offset})"))
+            WsError::Backend(format!(
+                "pack row for {hex} has a negative offset ({offset})"
+            ))
         })?,
         u64::try_from(len).map_err(|_| {
             WsError::Backend(format!("pack row for {hex} has a negative length ({len})"))
@@ -3891,7 +3879,11 @@ async fn read_packed(
         PackMemberKind::Blob => "blobs",
         PackMemberKind::Tree => "trees",
     };
-    if let Err(e) = state.warm.put(&format!("{prefix}/{hex}"), bytes.clone()).await {
+    if let Err(e) = state
+        .warm
+        .put(&format!("{prefix}/{hex}"), bytes.clone())
+        .await
+    {
         // Backfill is an optimisation; a full or briefly-broken warm volume
         // must not fail a read the pack just answered correctly.
         tracing::warn!(hex, error = %e, "warm backfill from a pack failed (read still served)");
@@ -3937,10 +3929,7 @@ async fn tree_bytes_via_pack_then_loose(
 /// the size index; the loose cold arm has always been a full download), then
 /// the loose read. Index outage handled as everywhere else: loose still
 /// tried, only a loose miss surfaces the index error.
-async fn blob_size_via_pack_then_loose(
-    state: &WorkspaceState,
-    hex: &str,
-) -> Result<u64, WsError> {
+async fn blob_size_via_pack_then_loose(state: &WorkspaceState, hex: &str) -> Result<u64, WsError> {
     match pack_member_of(state, PackMemberKind::Blob, hex).await {
         Ok(Some((_, _, len))) => u64::try_from(len).map_err(|_| {
             WsError::Backend(format!("pack row for {hex} has a negative length ({len})"))
@@ -4220,9 +4209,8 @@ async fn validate_drain_closure(
                      from the pack index"
                 )));
             };
-            let entries: Vec<TreeEntry> = serde_json::from_slice(&bytes).map_err(|e| {
-                WsError::Backend(format!("tree {tree} does not parse: {e}"))
-            })?;
+            let entries: Vec<TreeEntry> = serde_json::from_slice(&bytes)
+                .map_err(|e| WsError::Backend(format!("tree {tree} does not parse: {e}")))?;
             for entry in entries {
                 match entry.target {
                     TreeTarget::Blob(blob) => {
@@ -4281,8 +4269,8 @@ async fn validate_drain_closure(
     )
     .buffer_unordered(VALIDATE_CLOSURE_CONCURRENCY);
     while let Some(joined) = probes.next().await {
-        let missing = joined
-            .map_err(|e| WsError::Backend(format!("a closure stat task died: {e}")))??;
+        let missing =
+            joined.map_err(|e| WsError::Backend(format!("a closure stat task died: {e}")))??;
         if let Some(blob) = missing {
             return Ok(ClosureVerdict::Missing(format!(
                 "blob {blob} is neither in the warm tier nor durable in the pack index"
@@ -4483,7 +4471,10 @@ async fn post_drain(
     // ordering exists to make impossible. Error records seal nothing — the
     // session stays open for the retried drain.
     let (sealed, commit) = if record.error.is_none() {
-        let effective = record.pruned_root.clone().unwrap_or_else(|| record.root.clone());
+        let effective = record
+            .pruned_root
+            .clone()
+            .unwrap_or_else(|| record.root.clone());
         seal_fence_packs(&state, &fence, &record.root, &effective).await?
     } else {
         (Vec::new(), None)
@@ -4503,7 +4494,9 @@ async fn post_drain(
     // precisely because the ingest may not have happened.
     if record.error.is_none() {
         let caller = fence_key(&fence);
-        let (trees, blobs) = closure.as_ref().expect("success records were validated above");
+        let (trees, blobs) = closure
+            .as_ref()
+            .expect("success records were validated above");
         let sealed_addresses: HashSet<&str> = sealed
             .iter()
             .flat_map(|p| p.members.iter().map(|m| m.address.as_str()))
@@ -4586,7 +4579,9 @@ async fn post_drain(
         // flip-first means the reclaimer blocks on the row locks, re-evaluates
         // `NOT committed`, and skips. Members this POST itself sealed were
         // inserted above on this same transaction, so they are visible.
-        let (trees, blobs) = closure.as_ref().expect("success records were validated above");
+        let (trees, blobs) = closure
+            .as_ref()
+            .expect("success records were validated above");
 
         // ONE tagged Vec for the whole closure (git-bug ec294b7, audit A4):
         // `depot_pack_members.address` is stored TAGGED (`sha256:<hex>`,
@@ -4729,11 +4724,7 @@ async fn healthz() -> &'static str {
 /// boot (`boot_probe_cold`, ADR-0067 part 1), and a per-scrape write against a
 /// real bucket would be cost without signal.
 async fn readyz(State(state): State<WorkspaceState>) -> Response {
-    if let Err(e) = state
-        .warm
-        .put("readyz/probe", b"ready".to_vec())
-        .await
-    {
+    if let Err(e) = state.warm.put("readyz/probe", b"ready".to_vec()).await {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             format!("warm tier not writable: {e}"),
@@ -5135,8 +5126,7 @@ pub async fn warm_evict_once(
     let mut victims: Vec<(bool, WarmObject)> = candidates
         .into_iter()
         .map(|o| {
-            let is_durable =
-                !degraded && durable.contains(&(o.kind.as_str(), o.hex.clone()));
+            let is_durable = !degraded && durable.contains(&(o.kind.as_str(), o.hex.clone()));
             (is_durable, o)
         })
         .collect();
@@ -5153,7 +5143,9 @@ pub async fn warm_evict_once(
             // A2: re-lstat the PATH immediately before the unlink — skip
             // whatever vanished, changed shape, or was re-warmed since the
             // scan ([`relstat_victim`]).
-            let Some(len) = relstat_victim(&o.path, min_age) else { continue };
+            let Some(len) = relstat_victim(&o.path, min_age) else {
+                continue;
+            };
             if std::fs::remove_file(&o.path).is_ok() {
                 used = used.saturating_sub(len);
                 let (bytes, count) = if is_durable {
@@ -5265,7 +5257,9 @@ mod tests {
             let n = COUNTER.fetch_add(1, Ordering::SeqCst);
             let dbname = format!("scarab_ws_test_{}_{}", std::process::id(), n);
 
-            let admin = sqlx::PgPool::connect(&admin_url).await.expect("connect admin db");
+            let admin = sqlx::PgPool::connect(&admin_url)
+                .await
+                .expect("connect admin db");
             sqlx::query(&format!("DROP DATABASE IF EXISTS {dbname} WITH (FORCE)"))
                 .execute(&admin)
                 .await
@@ -5307,11 +5301,10 @@ mod tests {
                 };
                 rt.block_on(async {
                     if let Ok(admin) = sqlx::PgPool::connect(&admin_url).await {
-                        let _ = sqlx::query(&format!(
-                            "DROP DATABASE IF EXISTS {dbname} WITH (FORCE)"
-                        ))
-                        .execute(&admin)
-                        .await;
+                        let _ =
+                            sqlx::query(&format!("DROP DATABASE IF EXISTS {dbname} WITH (FORCE)"))
+                                .execute(&admin)
+                                .await;
                         admin.close().await;
                     }
                 });
@@ -5442,7 +5435,10 @@ mod tests {
         let age = std::time::SystemTime::now()
             .duration_since(bumped)
             .unwrap_or_default();
-        assert!(age < grain, "the bumped mtime must read as recent, got {age:?}");
+        assert!(
+            age < grain,
+            "the bumped mtime must read as recent, got {age:?}"
+        );
 
         // Within the grain: no write — the mtime must not move again.
         assert!(
@@ -5468,7 +5464,9 @@ mod tests {
     /// fire-and-forget off the response path on purpose.
     #[tokio::test]
     async fn a_blob_get_refreshes_the_warm_lru_key() {
-        let Some(h) = DepotHarness::start().await else { return };
+        let Some(h) = DepotHarness::start().await else {
+            return;
+        };
 
         let blob = b"recency-keyed content".to_vec();
         let hash = hash_hex(&blob);
@@ -5476,11 +5474,8 @@ mod tests {
         assert!(status.is_success(), "seed blob: {body}");
 
         let path = warm_blob_path(&h.state, &hash);
-        filetime::set_file_mtime(
-            &path,
-            filetime::FileTime::from_unix_time(1_000_000_000, 0),
-        )
-        .unwrap();
+        filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(1_000_000_000, 0))
+            .unwrap();
 
         let (status, _) = h.call("GET", &format!("/v1/cas/blobs/{hash}"), None).await;
         assert!(status.is_success(), "the warm hit itself");
@@ -5571,7 +5566,9 @@ mod tests {
     /// granting more than its closure (the foreign blob stops being a 403).
     #[tokio::test]
     async fn a_cache_root_grants_its_closure_and_an_unwalkable_one_does_not_fail_the_walk() {
-        let Some(h) = DepotHarness::start().await else { return };
+        let Some(h) = DepotHarness::start().await else {
+            return;
+        };
         h.state.blob_allow.set_mode(BlobAuthzMode::Enforce);
 
         // A cache tree in THIS replica's warm tier.
@@ -5598,23 +5595,37 @@ mod tests {
 
         // Walkable cache root: its blob reads, a foreign blob does not.
         let token = mint(
-            &workspace_token::step_claims(fence.clone(), i64::MAX / 2, vec![h.parent.root.0.clone()])
-                .with_cache_roots(vec![cache.root.0.clone()]),
+            &workspace_token::step_claims(
+                fence.clone(),
+                i64::MAX / 2,
+                vec![h.parent.root.0.clone()],
+            )
+            .with_cache_roots(vec![cache.root.0.clone()]),
         );
         let (status, body) = h
             .call_as(&token, "GET", &format!("/v1/cas/blobs/{cached_blob}"), None)
             .await;
-        assert!(status.is_success(), "a blob under the cache root reads: {body}");
+        assert!(
+            status.is_success(),
+            "a blob under the cache root reads: {body}"
+        );
         let (status, _) = h
             .call_as(&token, "GET", &format!("/v1/cas/blobs/{foreign}"), None)
             .await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "a cache root grants only its closure");
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a cache root grants only its closure"
+        );
 
         // Unwalkable cache root: the required input still reads, the
         // foreign blob is still refused, and nothing is a 500.
         let token = mint(
             &workspace_token::step_claims(
-                Fence { run: "run-cache-authz-2".into(), ..fence.clone() },
+                Fence {
+                    run: "run-cache-authz-2".into(),
+                    ..fence.clone()
+                },
                 i64::MAX / 2,
                 vec![h.parent.root.0.clone()],
             )
@@ -5631,7 +5642,11 @@ mod tests {
         let (status, _) = h
             .call_as(&token, "GET", &format!("/v1/cas/blobs/{foreign}"), None)
             .await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "still no read outside the claim");
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "still no read outside the claim"
+        );
 
         // The same root as a REQUIRED root (the pre-`cache_roots` token
         // shape): an incomplete walk is still the 500 it always was (F3).
@@ -5657,24 +5672,39 @@ mod tests {
     /// no cache roots. Found by the red team on the review stack.
     #[tokio::test]
     async fn an_unwalkable_cache_root_does_not_rewalk_on_every_denied_get() {
-        let Some(h) = DepotHarness::start().await else { return };
+        let Some(h) = DepotHarness::start().await else {
+            return;
+        };
         h.state.blob_allow.set_mode(BlobAuthzMode::Enforce);
         let foreign = seed_foreign_blob(&h).await;
-        let fence = Fence { run: "run-rt-walk".into(), step: "build".into(), attempt: "a1".into() };
+        let fence = Fence {
+            run: "run-rt-walk".into(),
+            step: "build".into(),
+            attempt: "a1".into(),
+        };
         let plain = workspace_token::mint(
             b"export-secret",
-            &workspace_token::step_claims(fence.clone(), i64::MAX / 2, vec![h.parent.root.0.clone()]),
+            &workspace_token::step_claims(
+                fence.clone(),
+                i64::MAX / 2,
+                vec![h.parent.root.0.clone()],
+            ),
         );
         let w0 = h.state.blob_allow.walks.load(Ordering::Relaxed);
         for _ in 0..5 {
-            let (s, _) = h.call_as(&plain, "GET", &format!("/v1/cas/blobs/{foreign}"), None).await;
+            let (s, _) = h
+                .call_as(&plain, "GET", &format!("/v1/cas/blobs/{foreign}"), None)
+                .await;
             assert_eq!(s, StatusCode::FORBIDDEN);
         }
         let plain_walks = h.state.blob_allow.walks.load(Ordering::Relaxed) - w0;
         let cached = workspace_token::mint(
             b"export-secret",
             &workspace_token::step_claims(
-                Fence { run: "run-rt-walk-2".into(), ..fence },
+                Fence {
+                    run: "run-rt-walk-2".into(),
+                    ..fence
+                },
                 i64::MAX / 2,
                 vec![h.parent.root.0.clone()],
             )
@@ -5682,11 +5712,16 @@ mod tests {
         );
         let w1 = h.state.blob_allow.walks.load(Ordering::Relaxed);
         for _ in 0..5 {
-            let (s, _) = h.call_as(&cached, "GET", &format!("/v1/cas/blobs/{foreign}"), None).await;
+            let (s, _) = h
+                .call_as(&cached, "GET", &format!("/v1/cas/blobs/{foreign}"), None)
+                .await;
             assert_eq!(s, StatusCode::FORBIDDEN);
         }
         let cached_walks = h.state.blob_allow.walks.load(Ordering::Relaxed) - w1;
-        assert_eq!(plain_walks, 1, "a plain token walks once, then denies from its entry");
+        assert_eq!(
+            plain_walks, 1,
+            "a plain token walks once, then denies from its entry"
+        );
         assert_eq!(
             cached_walks, plain_walks,
             "an unwalkable cache root must not re-walk on every denied GET"
@@ -5701,7 +5736,9 @@ mod tests {
     /// and the bypass is deliberate, not an oversight.
     #[tokio::test]
     async fn enforce_gates_get_head_and_range_to_the_roots_closure() {
-        let Some(h) = DepotHarness::start().await else { return };
+        let Some(h) = DepotHarness::start().await else {
+            return;
+        };
         h.state.blob_allow.set_mode(BlobAuthzMode::Enforce);
 
         let fenced = h.step_token("run-authz", "build", "a1");
@@ -5754,7 +5791,9 @@ mod tests {
     /// follow it — the fetch sequence — check a binary search and never walk.
     #[tokio::test]
     async fn the_flat_piggyback_seeds_the_allowlist_so_the_hot_path_never_walks() {
-        let Some(h) = DepotHarness::start().await else { return };
+        let Some(h) = DepotHarness::start().await else {
+            return;
+        };
         h.state.blob_allow.set_mode(BlobAuthzMode::Enforce);
 
         let fenced = h.step_token("run-piggyback", "build", "a1");
@@ -5790,7 +5829,9 @@ mod tests {
     /// assertion and reopen the ledger→blob escalation.
     #[tokio::test]
     async fn a_ledgered_tree_naming_a_foreign_blob_authorizes_neither_the_blob_nor_flat() {
-        let Some(h) = DepotHarness::start().await else { return };
+        let Some(h) = DepotHarness::start().await else {
+            return;
+        };
         h.state.blob_allow.set_mode(BlobAuthzMode::Enforce);
 
         let foreign = seed_foreign_blob(&h).await;
@@ -5815,7 +5856,12 @@ mod tests {
 
         // The ledger vouches for the exact bytes the fence uploaded…
         let (status, _) = h
-            .call_as(&attacker, "GET", &format!("/v1/cas/trees/{}", tree_hash.0), None)
+            .call_as(
+                &attacker,
+                "GET",
+                &format!("/v1/cas/trees/{}", tree_hash.0),
+                None,
+            )
             .await;
         assert!(
             status.is_success(),
@@ -5848,7 +5894,9 @@ mod tests {
     /// weather, never a terminal denial.
     #[tokio::test]
     async fn an_incomplete_walk_is_a_500_and_only_a_complete_walk_denies() {
-        let Some(h) = DepotHarness::start().await else { return };
+        let Some(h) = DepotHarness::start().await else {
+            return;
+        };
         h.state.blob_allow.set_mode(BlobAuthzMode::Enforce);
         let foreign = seed_foreign_blob(&h).await;
 
@@ -5877,7 +5925,9 @@ mod tests {
     /// untouched. Off computes NOTHING — no walk, no counter.
     #[tokio::test]
     async fn log_mode_counts_would_denies_and_off_mode_does_no_work() {
-        let Some(h) = DepotHarness::start().await else { return };
+        let Some(h) = DepotHarness::start().await else {
+            return;
+        };
         // The harness default IS the shipped default (log) — asserted, since
         // the rollout story depends on it.
         assert_eq!(h.state.blob_allow.mode(), BlobAuthzMode::Log);
@@ -5894,7 +5944,10 @@ mod tests {
             "…but it counts what enforce WOULD have refused"
         );
         assert_eq!(
-            h.state.blob_allow.would_deny_enforce.load(Ordering::Relaxed),
+            h.state
+                .blob_allow
+                .would_deny_enforce
+                .load(Ordering::Relaxed),
             0
         );
         let walks_after_log = h.state.blob_allow.walks.load(Ordering::Relaxed);
@@ -5928,15 +5981,12 @@ mod tests {
     /// consulted for a credential that no longer verifies.
     #[tokio::test]
     async fn an_evicted_entry_rebuilds_and_an_expired_token_dies_at_authenticate() {
-        let Some(h) = DepotHarness::start().await else { return };
+        let Some(h) = DepotHarness::start().await else {
+            return;
+        };
         h.state.blob_allow.set_mode(BlobAuthzMode::Enforce);
         // Small enough that two parent-closure entries cannot coexist.
-        h.state
-            .blob_allow
-            .inner
-            .lock()
-            .unwrap()
-            .cap_bytes = 64;
+        h.state.blob_allow.inner.lock().unwrap().cap_bytes = 64;
 
         let inside = in_closure_blob();
         let t1 = h.step_token("run-evict-1", "build", "a1");
@@ -5983,7 +6033,9 @@ mod tests {
     /// closure while the walk counter reads ONE.
     #[tokio::test]
     async fn concurrent_misses_on_one_token_share_one_walk() {
-        let Some(h) = DepotHarness::start().await else { return };
+        let Some(h) = DepotHarness::start().await else {
+            return;
+        };
         h.state.blob_allow.set_mode(BlobAuthzMode::Enforce);
 
         let run = "run-singleflight";
@@ -6029,7 +6081,9 @@ mod tests {
         let (r1, r2) = (r1.expect("walk result"), r2.expect("walk result"));
         assert_eq!(r1, r2, "both callers hold the same closure");
         assert!(
-            r1.blobs.binary_search(&hex32(&in_closure_blob()).unwrap()).is_ok(),
+            r1.blobs
+                .binary_search(&hex32(&in_closure_blob()).unwrap())
+                .is_ok(),
             "and it is the real closure"
         );
         assert_eq!(
@@ -6092,14 +6146,25 @@ mod tests {
         let absent = [2u8; 32];
 
         // The piggyback seeded root A only.
-        list.grant(key, i64::MAX / 2, std::slice::from_ref(&root_a), vec![in_entry]);
+        list.grant(
+            key,
+            i64::MAX / 2,
+            std::slice::from_ref(&root_a),
+            vec![in_entry],
+        );
 
         assert!(
-            matches!(list.lookup(&key, &in_entry, &claimed, 0), BlobAllowVerdict::Allowed),
+            matches!(
+                list.lookup(&key, &in_entry, &claimed, 0),
+                BlobAllowVerdict::Allowed
+            ),
             "membership answers regardless of completeness"
         );
         assert!(
-            matches!(list.lookup(&key, &absent, &claimed, 0), BlobAllowVerdict::Miss),
+            matches!(
+                list.lookup(&key, &absent, &claimed, 0),
+                BlobAllowVerdict::Miss
+            ),
             "an entry covering only [A] of a claim [A, B] must MISS an absent \
              blob — it could live under B, and only a complete walk may deny (F3)"
         );
@@ -6127,9 +6192,17 @@ mod tests {
         let input = [1u8; 32];
         let cached = [3u8; 32];
 
-        list.grant(key, i64::MAX / 2, std::slice::from_ref(&required), vec![input]);
+        list.grant(
+            key,
+            i64::MAX / 2,
+            std::slice::from_ref(&required),
+            vec![input],
+        );
         assert!(
-            matches!(list.lookup(&key, &cached, &claimed, 0), BlobAllowVerdict::Miss),
+            matches!(
+                list.lookup(&key, &cached, &claimed, 0),
+                BlobAllowVerdict::Miss
+            ),
             "a cache root no walk has tried must not count toward completeness"
         );
 
@@ -6141,14 +6214,25 @@ mod tests {
             vec![input],
         );
         assert!(
-            matches!(list.lookup(&key, &cached, &claimed, 0), BlobAllowVerdict::DeniedComplete),
+            matches!(
+                list.lookup(&key, &cached, &claimed, 0),
+                BlobAllowVerdict::DeniedComplete
+            ),
             "an unwalkable cache root completes the entry and grants nothing"
         );
 
         // The Cache tree reaches this replica and a /flat on it seeds it.
-        list.grant(key, i64::MAX / 2, std::slice::from_ref(&cache), vec![cached]);
+        list.grant(
+            key,
+            i64::MAX / 2,
+            std::slice::from_ref(&cache),
+            vec![cached],
+        );
         assert!(
-            matches!(list.lookup(&key, &cached, &claimed, 0), BlobAllowVerdict::Allowed),
+            matches!(
+                list.lookup(&key, &cached, &claimed, 0),
+                BlobAllowVerdict::Allowed
+            ),
             "a root that walked later is a grant"
         );
     }
@@ -6188,7 +6272,9 @@ mod tests {
     /// low-water mark (`used <= low` fails).
     #[tokio::test]
     async fn the_sweep_evicts_committed_durable_first_and_stops_at_low_water() {
-        let Some(h) = DepotHarness::start().await else { return };
+        let Some(h) = DepotHarness::start().await else {
+            return;
+        };
 
         // A committed-durable megabyte: fenced PUTs, then the drain record
         // that seals and commits the fence's pack.
@@ -6205,7 +6291,11 @@ mod tests {
             .await;
         assert!(status.is_success(), "seed big blob: {body}");
         let (status, body) = h
-            .put_raw_as(&fence, &format!("/v1/cas/trees/{}", tree_hash.0), tree_bytes)
+            .put_raw_as(
+                &fence,
+                &format!("/v1/cas/trees/{}", tree_hash.0),
+                tree_bytes,
+            )
             .await;
         assert!(status.is_success(), "seed tree: {body}");
         let (status, body) = h
@@ -6273,7 +6363,9 @@ mod tests {
     /// outside `blobs/`/`trees/` — is never a candidate at all.
     #[tokio::test]
     async fn the_floor_the_hex_filter_and_the_probe_survive_a_zero_budget() {
-        let Some(h) = DepotHarness::start().await else { return };
+        let Some(h) = DepotHarness::start().await else {
+            return;
+        };
 
         let scratch = b"fresh scratch under the floor".to_vec();
         let scratch_hash = hash_hex(&scratch);
@@ -6288,7 +6380,11 @@ mod tests {
             .put("readyz/probe", b"ready".to_vec())
             .await
             .expect("probe");
-        let staging = h.state.warm_dir.join("blobs").join(format!("{}#3", "a".repeat(64)));
+        let staging = h
+            .state
+            .warm_dir
+            .join("blobs")
+            .join(format!("{}#3", "a".repeat(64)));
         let stray = h.state.warm_dir.join("trees").join("not-a-hash.tmp");
         std::fs::write(&staging, b"half-renamed staging file").unwrap();
         std::fs::write(&stray, b"operator debris").unwrap();
@@ -6319,7 +6415,10 @@ mod tests {
             !warm_blob_path(&h.state, &scratch_hash).exists(),
             "past the floor, a cache-only blob under a zero budget is evicted"
         );
-        assert!(staging.exists(), "a staging temp name fails the 64-hex filter");
+        assert!(
+            staging.exists(),
+            "a staging temp name fails the 64-hex filter"
+        );
         assert!(stray.exists(), "stray garbage fails the 64-hex filter");
         assert!(probe.exists(), "readyz/ is outside both content prefixes");
     }
@@ -6329,7 +6428,9 @@ mod tests {
     /// The counter is the operator's evidence the ordering was blind.
     #[tokio::test]
     async fn a_classify_failure_degrades_to_pure_lru_not_to_skip() {
-        let Some(h) = DepotHarness::start().await else { return };
+        let Some(h) = DepotHarness::start().await else {
+            return;
+        };
 
         let scratch = b"evict me even blind".to_vec();
         let scratch_hash = hash_hex(&scratch);
@@ -6374,11 +6475,8 @@ mod tests {
         let floor = std::time::Duration::from_secs(WARM_EVICT_MIN_AGE_SECS);
 
         // Cold at walk time AND at unlink time: evictable, length answered.
-        filetime::set_file_mtime(
-            &path,
-            filetime::FileTime::from_unix_time(1_000_000_000, 0),
-        )
-        .unwrap();
+        filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(1_000_000_000, 0))
+            .unwrap();
         assert_eq!(
             relstat_victim(&path, floor),
             Some(12),
@@ -6477,7 +6575,9 @@ mod tests {
     async fn a_put_writes_warm_only_and_never_a_loose_cold_object() {
         use scarab_storage::ObjectStore;
 
-        let Some(h) = DepotHarness::start().await else { return };
+        let Some(h) = DepotHarness::start().await else {
+            return;
+        };
 
         // A NEW blob and a NEW tree naming it, canonicalised exactly as the
         // client's linked `scarab_storage` would — PUT under a FENCED token,
@@ -6540,7 +6640,6 @@ mod tests {
         );
     }
 
-
     /// The canonicalisation-skew tripwire at its new home, the Depot's tree PUT.
     ///
     /// The body is valid JSON, hashes to the address it is PUT under, and parses
@@ -6554,7 +6653,9 @@ mod tests {
     /// `put_tree` leg would later re-file under a different address.
     #[tokio::test]
     async fn a_tree_put_that_is_not_in_canonical_form_is_refused_as_skew() {
-        let Some(h) = DepotHarness::start().await else { return };
+        let Some(h) = DepotHarness::start().await else {
+            return;
+        };
         let entries = vec![TreeEntry::new(
             "a.txt",
             TreeTarget::Blob(BlobHash("aa".repeat(32))),
@@ -6574,9 +6675,7 @@ mod tests {
         );
 
         let hash = hash_hex(&skewed);
-        let (status, body) = h
-            .put_raw(&format!("/v1/cas/trees/{hash}"), skewed)
-            .await;
+        let (status, body) = h.put_raw(&format!("/v1/cas/trees/{hash}"), skewed).await;
         assert_eq!(
             status,
             StatusCode::BAD_REQUEST,
@@ -6670,7 +6769,9 @@ mod tests {
     /// drain would silently publish nothing durable).
     #[tokio::test]
     async fn the_durability_matrix_splits_by_fence_and_refuses_fenceless_durable() {
-        let Some(h) = DepotHarness::start().await else { return };
+        let Some(h) = DepotHarness::start().await else {
+            return;
+        };
         let browse = h.token.clone();
 
         let blob = b"labelled at the door".to_vec();
@@ -6794,7 +6895,9 @@ mod tests {
     /// the token's own fence and the OTHER fence's 403 assertion fails.
     #[tokio::test]
     async fn a_fenced_tree_put_is_ledgered_and_authorizes_that_fences_own_read_back() {
-        let Some(h) = DepotHarness::start().await else { return };
+        let Some(h) = DepotHarness::start().await else {
+            return;
+        };
         let token = h.step_token("r1", "build", "a1");
 
         let blob = b"the drain wrote this".to_vec();
@@ -6809,12 +6912,21 @@ mod tests {
             .await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
         let (status, body) = h
-            .put_raw_as(&token, &format!("/v1/cas/trees/{}", tree_hash.0), tree_bytes)
+            .put_raw_as(
+                &token,
+                &format!("/v1/cas/trees/{}", tree_hash.0),
+                tree_bytes,
+            )
             .await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
 
         let (status, body) = h
-            .call_as(&token, "GET", &format!("/v1/cas/trees/{}", tree_hash.0), None)
+            .call_as(
+                &token,
+                "GET",
+                &format!("/v1/cas/trees/{}", tree_hash.0),
+                None,
+            )
             .await;
         assert_eq!(
             status,
@@ -6824,7 +6936,12 @@ mod tests {
 
         let other = h.step_token("r2", "build", "a1");
         let (status, _) = h
-            .call_as(&other, "GET", &format!("/v1/cas/trees/{}", tree_hash.0), None)
+            .call_as(
+                &other,
+                "GET",
+                &format!("/v1/cas/trees/{}", tree_hash.0),
+                None,
+            )
             .await;
         assert_eq!(
             status,
@@ -6846,7 +6963,9 @@ mod tests {
     /// 200 over content this fence never wrote.
     #[tokio::test]
     async fn a_ledgered_parent_naming_a_foreign_tree_gets_single_reads_but_never_flat() {
-        let Some(h) = DepotHarness::start().await else { return };
+        let Some(h) = DepotHarness::start().await else {
+            return;
+        };
 
         // A foreign fence's content: a blob and the tree naming it.
         let foreign = h.step_token("r0", "seed", "a1");
@@ -6958,7 +7077,9 @@ mod tests {
     /// Mutation killed: a future append-on-have in the `/have` handler.
     #[tokio::test]
     async fn a_have_probe_never_appends_the_ledger() {
-        let Some(h) = DepotHarness::start().await else { return };
+        let Some(h) = DepotHarness::start().await else {
+            return;
+        };
 
         // Foreign content, present in warm.
         let foreign = h.step_token("r0", "seed", "a1");
@@ -7030,7 +7151,9 @@ mod tests {
     /// and this cross-fence hash-naming answers 200.
     #[tokio::test]
     async fn a_drain_record_naming_an_unledgered_root_is_refused_naming_it() {
-        let Some(h) = DepotHarness::start().await else { return };
+        let Some(h) = DepotHarness::start().await else {
+            return;
+        };
         let token = h.step_token("r1", "build", "a1");
         let (status, body) = h
             .call_as(
@@ -7055,7 +7178,9 @@ mod tests {
     /// Depot cannot serve.
     #[tokio::test]
     async fn a_drain_record_with_an_incomplete_blob_closure_is_refused() {
-        let Some(h) = DepotHarness::start().await else { return };
+        let Some(h) = DepotHarness::start().await else {
+            return;
+        };
         let token = h.step_token("r1", "build", "a1");
 
         let missing_blob = hash_hex(b"never uploaded");
@@ -7065,7 +7190,11 @@ mod tests {
         )])
         .expect("canonical tree");
         let (status, body) = h
-            .put_raw_as(&token, &format!("/v1/cas/trees/{}", tree_hash.0), tree_bytes)
+            .put_raw_as(
+                &token,
+                &format!("/v1/cas/trees/{}", tree_hash.0),
+                tree_bytes,
+            )
             .await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
 
@@ -7139,8 +7268,7 @@ mod tests {
         let mut ledger: HashSet<String> = HashSet::new();
         let mut files = 0usize;
         let mut seed_tree = |entries: Vec<TreeEntry>| -> TreeHash {
-            let (hash, bytes) =
-                scarab_storage::canonical_tree(entries).expect("canonical tree");
+            let (hash, bytes) = scarab_storage::canonical_tree(entries).expect("canonical tree");
             std::fs::write(warm.join("trees").join(&hash.0), &bytes).expect("write tree");
             ledger.insert(hash.0.clone());
             hash
@@ -7206,7 +7334,9 @@ mod tests {
     /// record commits over durable evidence that does not exist.
     #[tokio::test]
     async fn closure_validation_verdict_is_identical_across_warm_durable_and_missing_blobs() {
-        let Some(h) = DepotHarness::start().await else { return };
+        let Some(h) = DepotHarness::start().await else {
+            return;
+        };
         let warm = h.tmp.path().join("warm");
         std::fs::create_dir_all(warm.join("blobs")).expect("mkdir blobs");
         std::fs::create_dir_all(warm.join("trees")).expect("mkdir trees");
@@ -7239,8 +7369,7 @@ mod tests {
 
         let mut ledger: HashSet<String> = HashSet::new();
         let mut seed_tree = |entries: Vec<TreeEntry>| -> TreeHash {
-            let (hash, bytes) =
-                scarab_storage::canonical_tree(entries).expect("canonical tree");
+            let (hash, bytes) = scarab_storage::canonical_tree(entries).expect("canonical tree");
             std::fs::write(warm.join("trees").join(&hash.0), &bytes).expect("write tree");
             ledger.insert(hash.0.clone());
             hash
@@ -7301,7 +7430,9 @@ mod tests {
     /// stranding the retried drain that finally worked.
     #[tokio::test]
     async fn a_success_record_is_write_once_and_an_error_record_is_overwritable() {
-        let Some(h) = DepotHarness::start().await else { return };
+        let Some(h) = DepotHarness::start().await else {
+            return;
+        };
 
         // Fence 1: success, then a stale retry.
         let f1 = h.step_token("r1", "build", "a1");
@@ -7360,7 +7491,9 @@ mod tests {
     async fn a_drain_record_is_browse_read_only_and_survives_a_restart() {
         use tower::ServiceExt;
 
-        let Some(h) = DepotHarness::start().await else { return };
+        let Some(h) = DepotHarness::start().await else {
+            return;
+        };
         let f1 = h.step_token("r1", "build", "a1");
         let root = seed_fenced_snapshot(&h, &f1).await;
         let (status, body) = h
@@ -7426,7 +7559,9 @@ mod tests {
     async fn a_restart_that_lost_the_pack_session_refuses_the_success_record() {
         use tower::ServiceExt;
 
-        let Some(h) = DepotHarness::start().await else { return };
+        let Some(h) = DepotHarness::start().await else {
+            return;
+        };
         let f1 = h.step_token("r1", "build", "a1");
         let root = seed_fenced_snapshot(&h, &f1).await;
 
@@ -7506,7 +7641,9 @@ mod tests {
     async fn a_reclaim_between_the_gate_and_the_record_txn_is_caught_inside_the_txn() {
         use tower::ServiceExt;
 
-        let Some(h) = DepotHarness::start().await else { return };
+        let Some(h) = DepotHarness::start().await else {
+            return;
+        };
         let fence = Fence {
             run: "r-race".into(),
             step: "build".into(),
@@ -7519,7 +7656,12 @@ mod tests {
         // Seal the open pack so its rows are STAGED (committed = FALSE) — the
         // state a Depot restart leaves behind.
         let session = pack_session(&h.state, &key);
-        session.lock().await.seal_open().await.expect("seal the open pack");
+        session
+            .lock()
+            .await
+            .seal_open()
+            .await
+            .expect("seal the open pack");
         let staged: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM depot_packs WHERE fence_key = $1 AND NOT committed",
         )
@@ -7615,13 +7757,15 @@ mod tests {
             .await
             .expect("read the (absent) drain record");
         assert!(record.is_none(), "a refused record must not be persisted");
-        let rows: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM depot_packs WHERE fence_key = $1")
-                .bind(&key)
-                .fetch_one(&reopened.db)
-                .await
-                .expect("count pack rows");
-        assert_eq!(rows, 0, "the rolled-back transaction must persist no pack rows");
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM depot_packs WHERE fence_key = $1")
+            .bind(&key)
+            .fetch_one(&reopened.db)
+            .await
+            .expect("count pack rows");
+        assert_eq!(
+            rows, 0,
+            "the rolled-back transaction must persist no pack rows"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -7647,7 +7791,9 @@ mod tests {
     /// break the dedup bookkeeping (full-closure keying keeps it recorded).
     #[tokio::test]
     async fn a_drain_that_dedups_against_a_foreign_committed_pack_records_a_borrow_edge() {
-        let Some(h) = DepotHarness::start().await else { return };
+        let Some(h) = DepotHarness::start().await else {
+            return;
+        };
 
         // Fence A: the owner — a full success drain, packs committed.
         let ta = h.step_token("ra", "build", "a1");
@@ -7656,16 +7802,21 @@ mod tests {
             .call_as(&ta, "POST", "/v1/drains", Some(drain_record_body(&root)))
             .await;
         assert_eq!(status, StatusCode::OK, "A's drain must succeed: {body}");
-        let fa = fence_key(&Fence { run: "ra".into(), step: "build".into(), attempt: "a1".into() });
+        let fa = fence_key(&Fence {
+            run: "ra".into(),
+            step: "build".into(),
+            attempt: "a1".into(),
+        });
 
         // A's own drain reached into no foreign pack: no edges, and never a
         // self-edge.
-        let a_edges: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM depot_fence_borrows WHERE borrower_fence = $1")
-                .bind(&fa)
-                .fetch_one(&h.state.db)
-                .await
-                .expect("count A's edges");
+        let a_edges: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM depot_fence_borrows WHERE borrower_fence = $1",
+        )
+        .bind(&fa)
+        .fetch_one(&h.state.db)
+        .await
+        .expect("count A's edges");
         assert_eq!(a_edges, 0, "the first drain borrows from nobody");
 
         // Fence B: PUTs ONLY the tree (the ledger demands that much of the
@@ -7688,9 +7839,17 @@ mod tests {
         let (status, body) = h
             .call_as(&tb, "POST", "/v1/drains", Some(drain_record_body(&root)))
             .await;
-        assert_eq!(status, StatusCode::OK, "B's deduping drain must succeed: {body}");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "B's deduping drain must succeed: {body}"
+        );
 
-        let fb = fence_key(&Fence { run: "rb".into(), step: "build".into(), attempt: "a1".into() });
+        let fb = fence_key(&Fence {
+            run: "rb".into(),
+            step: "build".into(),
+            attempt: "a1".into(),
+        });
         let edges: Vec<(String, String)> = sqlx::query_as(
             "SELECT owner_fence, run FROM depot_fence_borrows WHERE borrower_fence = $1",
         )
@@ -7729,7 +7888,9 @@ mod tests {
     /// residue accretes without bound.
     #[tokio::test]
     async fn the_record_sweep_spares_exactly_the_post_epoch_success_records() {
-        let Some(h) = DepotHarness::start().await else { return };
+        let Some(h) = DepotHarness::start().await else {
+            return;
+        };
         let db = &h.state.db;
         let now = now_secs();
 
@@ -7741,7 +7902,9 @@ mod tests {
             "have_hits": 0, "ingest_ms": 0, "prune_ms": 0,
             "error": { "kind": "Ingest", "detail": "the depot hung up" }
         });
-        let (status, body) = h.call_as(&te, "POST", "/v1/drains", Some(error_record)).await;
+        let (status, body) = h
+            .call_as(&te, "POST", "/v1/drains", Some(error_record))
+            .await;
         assert_eq!(status, StatusCode::OK, "error record deposits: {body}");
 
         // ... and two SUCCESS records, one to land after the epoch, one before.
@@ -7754,11 +7917,21 @@ mod tests {
             assert_eq!(status, StatusCode::OK, "{run}'s drain must succeed: {body}");
         }
 
-        let fe = fence_key(&Fence { run: "re".into(), step: "build".into(), attempt: "a1".into() });
-        let fpost =
-            fence_key(&Fence { run: "rs-post".into(), step: "build".into(), attempt: "a1".into() });
-        let fpre =
-            fence_key(&Fence { run: "rs-pre".into(), step: "build".into(), attempt: "a1".into() });
+        let fe = fence_key(&Fence {
+            run: "re".into(),
+            step: "build".into(),
+            attempt: "a1".into(),
+        });
+        let fpost = fence_key(&Fence {
+            run: "rs-post".into(),
+            step: "build".into(),
+            attempt: "a1".into(),
+        });
+        let fpre = fence_key(&Fence {
+            run: "rs-pre".into(),
+            step: "build".into(),
+            attempt: "a1".into(),
+        });
 
         // Construct the timeline: epoch three TTLs ago; the error and the
         // post-epoch success two TTLs ago (expired, at/after the epoch); the
@@ -7788,12 +7961,13 @@ mod tests {
             let key = key.to_string();
             let db = db.clone();
             async move {
-                let n: i64 =
-                    sqlx::query_scalar("SELECT count(*) FROM depot_drain_records WHERE fence_key = $1")
-                        .bind(&key)
-                        .fetch_one(&db)
-                        .await
-                        .expect("count records");
+                let n: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM depot_drain_records WHERE fence_key = $1",
+                )
+                .bind(&key)
+                .fetch_one(&db)
+                .await
+                .expect("count records");
                 n
             }
         };
@@ -7832,7 +8006,9 @@ mod tests {
     async fn an_owner_expiry_inside_the_gate_txn_window_is_caught_and_leaves_no_edge() {
         use tower::ServiceExt;
 
-        let Some(h) = DepotHarness::start().await else { return };
+        let Some(h) = DepotHarness::start().await else {
+            return;
+        };
 
         // Fence A: the owner — a full success drain, packs committed.
         let ta = h.step_token("ra", "build", "a1");
@@ -7841,7 +8017,11 @@ mod tests {
             .call_as(&ta, "POST", "/v1/drains", Some(drain_record_body(&root)))
             .await;
         assert_eq!(status, StatusCode::OK, "A's drain must succeed: {body}");
-        let fa = fence_key(&Fence { run: "ra".into(), step: "build".into(), attempt: "a1".into() });
+        let fa = fence_key(&Fence {
+            run: "ra".into(),
+            step: "build".into(),
+            attempt: "a1".into(),
+        });
 
         // Fence B: tree PUT only — the blob's durable copy is A's pack.
         let tb = h.step_token("rb", "build", "a1");
@@ -7856,7 +8036,11 @@ mod tests {
             .put_raw_as(&tb, &format!("/v1/cas/trees/{}", tree_hash.0), tree_bytes)
             .await;
         assert!(status.is_success(), "B's tree PUT: {body}");
-        let fb = fence_key(&Fence { run: "rb".into(), step: "build".into(), attempt: "a1".into() });
+        let fb = fence_key(&Fence {
+            run: "rb".into(),
+            step: "build".into(),
+            attempt: "a1".into(),
+        });
 
         // Arm the window with the committed-expiry DELETE shape on A —
         // members, then packs, committed included: that is what expiry does.
@@ -7918,21 +8102,29 @@ mod tests {
             "an owner expiry inside the window must be caught by the closure-wide \
              in-txn re-check: {body}"
         );
-        assert!(body.contains(&blob_hash), "the refusal names the lost blob: {body}");
+        assert!(
+            body.contains(&blob_hash),
+            "the refusal names the lost blob: {body}"
+        );
 
         let record = read_drain_record(
             &h.state,
-            &Fence { run: "rb".into(), step: "build".into(), attempt: "a1".into() },
+            &Fence {
+                run: "rb".into(),
+                step: "build".into(),
+                attempt: "a1".into(),
+            },
         )
         .await
         .expect("read the (absent) drain record");
         assert!(record.is_none(), "a refused record must not be persisted");
-        let edges: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM depot_fence_borrows WHERE borrower_fence = $1")
-                .bind(&fb)
-                .fetch_one(&h.state.db)
-                .await
-                .expect("count B's edges");
+        let edges: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM depot_fence_borrows WHERE borrower_fence = $1",
+        )
+        .bind(&fb)
+        .fetch_one(&h.state.db)
+        .await
+        .expect("count B's edges");
         assert_eq!(
             edges, 0,
             "the rolled-back transaction must leave no edge naming a dead owner"
@@ -7958,7 +8150,9 @@ mod tests {
     /// re-driven re-check sees the absence — the 422 verdict.
     #[tokio::test]
     async fn the_share_lock_serializes_record_and_expiry_in_both_orders() {
-        let Some(h) = DepotHarness::start().await else { return };
+        let Some(h) = DepotHarness::start().await else {
+            return;
+        };
         let db = &h.state.db;
 
         // Fence A: the committed owner every closure below stands on.
@@ -7968,7 +8162,11 @@ mod tests {
             .call_as(&ta, "POST", "/v1/drains", Some(drain_record_body(&root)))
             .await;
         assert_eq!(status, StatusCode::OK, "A's drain must succeed: {body}");
-        let fa = fence_key(&Fence { run: "ra".into(), step: "build".into(), attempt: "a1".into() });
+        let fa = fence_key(&Fence {
+            run: "ra".into(),
+            step: "build".into(),
+            attempt: "a1".into(),
+        });
 
         // The borrower's closure, in the ONE tagged form (audit A4).
         let blob_hash = hash_hex(b"drained output");
@@ -7976,7 +8174,11 @@ mod tests {
             tagged_address(HashAlgo::Sha256, &root),
             tagged_address(HashAlgo::Sha256, &blob_hash),
         ];
-        let fb = fence_key(&Fence { run: "rb".into(), step: "build".into(), attempt: "a1".into() });
+        let fb = fence_key(&Fence {
+            run: "rb".into(),
+            step: "build".into(),
+            attempt: "a1".into(),
+        });
         let for_update_victim = "SELECT pack_key FROM depot_packs WHERE fence_key = $1 FOR UPDATE";
         let borrower_check = "SELECT EXISTS ( \
              SELECT 1 FROM depot_fence_borrows b \
@@ -8009,7 +8211,10 @@ mod tests {
              FOR SHARE OF p — an immediate success means the share lock is gone \
              and expiry can delete under a committing record"
         );
-        expiry_tx.rollback().await.expect("roll back the timed-out expiry txn");
+        expiry_tx
+            .rollback()
+            .await
+            .expect("roll back the timed-out expiry txn");
 
         // The record txn commits its edge and its record atomically.
         record_borrow_edges(&mut record_tx, &fb, "rb", &closure_tagged, now_secs())
@@ -8051,7 +8256,11 @@ mod tests {
         // --- Order 2: expiry-first ------------------------------------------
         // A second borrower, so the surviving edge from order 1 is not what
         // the borrower check would find.
-        let fc = fence_key(&Fence { run: "rc".into(), step: "build".into(), attempt: "a1".into() });
+        let fc = fence_key(&Fence {
+            run: "rc".into(),
+            step: "build".into(),
+            attempt: "a1".into(),
+        });
         let mut expiry_tx = db.begin().await.expect("begin the expiry txn");
         let doomed: Vec<String> = sqlx::query_scalar(for_update_victim)
             .bind(&fa)
@@ -8072,7 +8281,10 @@ mod tests {
             "the re-check must BLOCK while expiry holds FOR UPDATE on the owner's \
              rows — proceeding here would validate against rows mid-deletion"
         );
-        record_tx.rollback().await.expect("roll back the timed-out record txn");
+        record_tx
+            .rollback()
+            .await
+            .expect("roll back the timed-out record txn");
 
         // Expiry completes its deletion (members, then packs, by the locked set).
         sqlx::query("DELETE FROM depot_pack_members WHERE pack_key = ANY($1)")
@@ -8130,8 +8342,8 @@ mod tests {
                 registry,
                 crate::depot_expiry::EXPIRY_BATCH,
             )
-                .await
-                .expect("expiry pass")
+            .await
+            .expect("expiry pass")
             {
                 crate::depot_expiry::ExpiryPass::Ran { expired } => return expired,
                 crate::depot_expiry::ExpiryPass::LockBusy => tokio::task::yield_now().await,
@@ -8177,11 +8389,20 @@ mod tests {
             .await;
         assert!(status.is_success(), "expiry seed blob: {body}");
         let (status, body) = h
-            .put_raw_as(&token, &format!("/v1/cas/trees/{}", tree_hash.0), tree_bytes)
+            .put_raw_as(
+                &token,
+                &format!("/v1/cas/trees/{}", tree_hash.0),
+                tree_bytes,
+            )
             .await;
         assert!(status.is_success(), "expiry seed tree: {body}");
         let (status, body) = h
-            .call_as(&token, "POST", "/v1/drains", Some(drain_record_body(&tree_hash.0)))
+            .call_as(
+                &token,
+                "POST",
+                "/v1/drains",
+                Some(drain_record_body(&tree_hash.0)),
+            )
             .await;
         assert_eq!(status, StatusCode::OK, "expiry drain must succeed: {body}");
         fence_key(&Fence {
@@ -8200,12 +8421,13 @@ mod tests {
                 .fetch_one(db)
                 .await
                 .expect("count records");
-        let borrows: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM depot_fence_borrows WHERE borrower_fence = $1")
-                .bind(fence)
-                .fetch_one(db)
-                .await
-                .expect("count borrows");
+        let borrows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM depot_fence_borrows WHERE borrower_fence = $1",
+        )
+        .bind(fence)
+        .fetch_one(db)
+        .await
+        .expect("count borrows");
         (packs, members, records, borrows)
     }
 
@@ -8221,7 +8443,9 @@ mod tests {
     /// bytes anywhere and the bucket count drops.
     #[tokio::test]
     async fn expiry_deletes_exactly_the_terminal_past_ttl_unpinned_fence_and_no_bytes() {
-        let Some(h) = DepotHarness::start().await else { return };
+        let Some(h) = DepotHarness::start().await else {
+            return;
+        };
         let db = &h.state.db;
 
         let fa = expiry_drain(&h, "xa", "a").await; // terminal, old → expires
@@ -8233,8 +8457,16 @@ mod tests {
         seed_run(db, "xc", "failed", 60, false).await;
         seed_run(db, "xd", "cancelled", 3600, true).await;
 
-        let bucket_before = h.cold.list_objects("packs/").await.expect("list packs").len();
-        assert!(bucket_before > 0, "the drains left pack bytes in the bucket");
+        let bucket_before = h
+            .cold
+            .list_objects("packs/")
+            .await
+            .expect("list packs")
+            .len();
+        assert!(
+            bucket_before > 0,
+            "the drains left pack bytes in the bucket"
+        );
 
         let expired = expire_now(db, &expiry_ttls()).await;
         assert_eq!(expired, 1, "exactly the one eligible fence expires");
@@ -8255,7 +8487,12 @@ mod tests {
                 "fence with {why} must survive the pass"
             );
         }
-        let bucket_after = h.cold.list_objects("packs/").await.expect("list packs").len();
+        let bucket_after = h
+            .cold
+            .list_objects("packs/")
+            .await
+            .expect("list packs")
+            .len();
         assert_eq!(
             bucket_after, bucket_before,
             "expiry deletes POINTERS only — the bytes are the rowless reclaimer's"
@@ -8277,7 +8514,9 @@ mod tests {
     /// forever behind a dead borrower.
     #[tokio::test]
     async fn a_borrowed_victim_survives_until_its_borrower_expires() {
-        let Some(h) = DepotHarness::start().await else { return };
+        let Some(h) = DepotHarness::start().await else {
+            return;
+        };
         let db = &h.state.db;
 
         // A owns; B publishes the same root having PUT only the tree — its
@@ -8288,7 +8527,11 @@ mod tests {
             .call_as(&ta, "POST", "/v1/drains", Some(drain_record_body(&root)))
             .await;
         assert_eq!(status, StatusCode::OK, "A's drain: {body}");
-        let fa = fence_key(&Fence { run: "ba".into(), step: "build".into(), attempt: "a1".into() });
+        let fa = fence_key(&Fence {
+            run: "ba".into(),
+            step: "build".into(),
+            attempt: "a1".into(),
+        });
 
         let tb = h.step_token("bb", "build", "a1");
         let blob_hash = hash_hex(b"drained output");
@@ -8305,7 +8548,11 @@ mod tests {
             .call_as(&tb, "POST", "/v1/drains", Some(drain_record_body(&root)))
             .await;
         assert_eq!(status, StatusCode::OK, "B's deduping drain: {body}");
-        let fb = fence_key(&Fence { run: "bb".into(), step: "build".into(), attempt: "a1".into() });
+        let fb = fence_key(&Fence {
+            run: "bb".into(),
+            step: "build".into(),
+            attempt: "a1".into(),
+        });
 
         // Both runs terminal and past TTL: A is gated only by B's liveness.
         seed_run(db, "ba", "succeeded", 3600, false).await;
@@ -8313,11 +8560,13 @@ mod tests {
         // Candidate order is by posted_at: put A FIRST, so pass 1 proves the
         // borrower prefilter (git-bug 5cde838) keeps the borrowed owner out
         // of the window even from the window's front — B still expires.
-        sqlx::query("UPDATE depot_drain_records SET posted_at = posted_at - 10 WHERE fence_key = $1")
-            .bind(&fa)
-            .execute(db)
-            .await
-            .expect("order the candidates");
+        sqlx::query(
+            "UPDATE depot_drain_records SET posted_at = posted_at - 10 WHERE fence_key = $1",
+        )
+        .bind(&fa)
+        .execute(db)
+        .await
+        .expect("order the candidates");
 
         let pass1 = expire_now(db, &expiry_ttls()).await;
         assert_eq!(pass1, 1, "pass 1 expires only the borrower B");
@@ -8345,7 +8594,9 @@ mod tests {
     /// pre-epoch victim on the next pass.
     #[tokio::test]
     async fn the_reachability_floor_gates_pre_epoch_victims_only() {
-        let Some(h) = DepotHarness::start().await else { return };
+        let Some(h) = DepotHarness::start().await else {
+            return;
+        };
         let db = &h.state.db;
         let epoch: i64 = sqlx::query_scalar("SELECT epoch FROM depot_borrow_tracking_epoch")
             .fetch_one(db)
@@ -8404,7 +8655,9 @@ mod tests {
     /// borrower-checked transaction — once it drains.
     #[tokio::test]
     async fn the_recordless_arm_waits_for_the_same_floor_then_frees() {
-        let Some(h) = DepotHarness::start().await else { return };
+        let Some(h) = DepotHarness::start().await else {
+            return;
+        };
         let db = &h.state.db;
         let epoch: i64 = sqlx::query_scalar("SELECT epoch FROM depot_borrow_tracking_epoch")
             .fetch_one(db)
@@ -8434,18 +8687,19 @@ mod tests {
             .expect("make the holder pre-epoch");
 
         let pass1 = expire_now(db, &expiry_ttls()).await;
-        assert_eq!(pass1, 0, "the recordless arm never runs while the floor holds");
+        assert_eq!(
+            pass1, 0,
+            "the recordless arm never runs while the floor holds"
+        );
         let (packs, members) = pack_rows_of(db, &f).await;
         assert!(packs > 0 && members > 0, "the recordless fence survives");
 
         // Drain the floor: the holder finishes and ages out.
-        sqlx::query(
-            "UPDATE runs SET status = 'succeeded', updated_at = $1 WHERE id = 'rlhold'",
-        )
-        .bind((now_secs() - 3600) * 1000)
-        .execute(db)
-        .await
-        .expect("terminate and age the holder");
+        sqlx::query("UPDATE runs SET status = 'succeeded', updated_at = $1 WHERE id = 'rlhold'")
+            .bind((now_secs() - 3600) * 1000)
+            .execute(db)
+            .await
+            .expect("terminate and age the holder");
 
         let pass2 = expire_now(db, &expiry_ttls()).await;
         assert_eq!(pass2, 1, "the floor drained; the recordless debris goes");
@@ -8459,7 +8713,9 @@ mod tests {
     /// place the fence survives; without it, the same fence expires.
     #[tokio::test]
     async fn the_in_txn_re_read_catches_a_rerun_flipping_the_run_non_terminal() {
-        let Some(h) = DepotHarness::start().await else { return };
+        let Some(h) = DepotHarness::start().await else {
+            return;
+        };
         let db = &h.state.db;
 
         let f = expiry_drain(&h, "rrf", "reread").await;
@@ -8472,13 +8728,18 @@ mod tests {
             "UPDATE runs SET status = 'running' WHERE id = 'rrf'".to_string(),
         ));
         let expired = expire_now(db, &expiry_ttls()).await;
-        *crate::depot_expiry::TEST_INJECT_IN_VICTIM_TXN.lock().unwrap() = None;
+        *crate::depot_expiry::TEST_INJECT_IN_VICTIM_TXN
+            .lock()
+            .unwrap() = None;
         assert_eq!(
             expired, 0,
             "the re-read must see the rerun's flip and refuse the deletion"
         );
         let (packs, _, records, _) = expiry_rows_of(db, &f).await;
-        assert!(packs > 0 && records > 0, "every row family survives the skip");
+        assert!(
+            packs > 0 && records > 0,
+            "every row family survives the skip"
+        );
 
         // The skip rolled the (injected) flip back with the transaction, so
         // the same fence is still nominable — and without the hook it goes.
@@ -8494,7 +8755,9 @@ mod tests {
     /// that must NOT be processed.
     #[tokio::test]
     async fn a_deadlock_aborts_the_whole_pass_and_deletes_nothing() {
-        let Some(h) = DepotHarness::start().await else { return };
+        let Some(h) = DepotHarness::start().await else {
+            return;
+        };
         let db = &h.state.db;
 
         let f1 = expiry_drain(&h, "dl1", "dead1").await;
@@ -8502,11 +8765,13 @@ mod tests {
         seed_run(db, "dl1", "succeeded", 3600, false).await;
         seed_run(db, "dl2", "succeeded", 3600, false).await;
         // Deterministic order: f1 nominates first.
-        sqlx::query("UPDATE depot_drain_records SET posted_at = posted_at - 10 WHERE fence_key = $1")
-            .bind(&f1)
-            .execute(db)
-            .await
-            .expect("order the candidates");
+        sqlx::query(
+            "UPDATE depot_drain_records SET posted_at = posted_at - 10 WHERE fence_key = $1",
+        )
+        .bind(&f1)
+        .execute(db)
+        .await
+        .expect("order the candidates");
 
         *crate::depot_expiry::TEST_INJECT_IN_VICTIM_TXN
             .lock()
@@ -8517,11 +8782,16 @@ mod tests {
                 .to_string(),
         ));
         let expired = expire_now(db, &expiry_ttls()).await;
-        *crate::depot_expiry::TEST_INJECT_IN_VICTIM_TXN.lock().unwrap() = None;
+        *crate::depot_expiry::TEST_INJECT_IN_VICTIM_TXN
+            .lock()
+            .unwrap() = None;
         assert_eq!(expired, 0, "the pass aborted before deleting anything");
         for fence in [&f1, &f2] {
             let (packs, _, records, _) = expiry_rows_of(db, fence).await;
-            assert!(packs > 0 && records > 0, "no fence lost a row to the aborted pass");
+            assert!(
+                packs > 0 && records > 0,
+                "no fence lost a row to the aborted pass"
+            );
         }
     }
 
@@ -8534,7 +8804,9 @@ mod tests {
     /// edge and SKIPS the victim.
     #[tokio::test]
     async fn the_expiry_pass_blocks_on_a_committing_record_and_honours_its_edge() {
-        let Some(h) = DepotHarness::start().await else { return };
+        let Some(h) = DepotHarness::start().await else {
+            return;
+        };
         let db = &h.state.db;
 
         // The victim: committed owner, terminal old run — fully eligible.
@@ -8544,7 +8816,11 @@ mod tests {
             .call_as(&ta, "POST", "/v1/drains", Some(drain_record_body(&root)))
             .await;
         assert_eq!(status, StatusCode::OK, "A's drain: {body}");
-        let fa = fence_key(&Fence { run: "iva".into(), step: "build".into(), attempt: "a1".into() });
+        let fa = fence_key(&Fence {
+            run: "iva".into(),
+            step: "build".into(),
+            attempt: "a1".into(),
+        });
         seed_run(db, "iva", "succeeded", 3600, false).await;
 
         // The record txn takes its share locks (the drain path's re-check).
@@ -8553,12 +8829,19 @@ mod tests {
             tagged_address(HashAlgo::Sha256, &root),
             tagged_address(HashAlgo::Sha256, &blob_hash),
         ];
-        let fb = fence_key(&Fence { run: "ivb".into(), step: "build".into(), attempt: "a1".into() });
+        let fb = fence_key(&Fence {
+            run: "ivb".into(),
+            step: "build".into(),
+            attempt: "a1".into(),
+        });
         let mut record_tx = db.begin().await.expect("begin the record txn");
         let present = recheck_closure_present(&mut record_tx, &closure_tagged, &fb)
             .await
             .expect("the re-check under share locks");
-        assert!(present.contains(&root), "precondition: durable via A's pack");
+        assert!(
+            present.contains(&root),
+            "precondition: durable via A's pack"
+        );
 
         // The real pass, spawned: it must BLOCK on the held share locks.
         let pass = {
@@ -8623,7 +8906,10 @@ mod tests {
             }
         };
         crate::depot_expiry::RetentionRegistry::new(
-            vec![profile("short", false, Some(1)), profile("keep", true, Some(30))],
+            vec![
+                profile("short", false, Some(1)),
+                profile("keep", true, Some(30)),
+            ],
             crate::depot_expiry::ExpiryTtls {
                 pack_ttl_secs: 30 * 24 * 3600,
                 workspace_ttl_secs: 24 * 3600,
@@ -8657,7 +8943,9 @@ mod tests {
     /// go too.
     #[tokio::test]
     async fn per_run_retention_profiles_change_candidacy() {
-        let Some(h) = DepotHarness::start().await else { return };
+        let Some(h) = DepotHarness::start().await else {
+            return;
+        };
         let db = &h.state.db;
 
         let fa = expiry_drain(&h, "pa", "prof-a").await; // short → expires
@@ -8670,13 +8958,15 @@ mod tests {
         set_run_profile(db, "pa", "short").await;
         set_run_profile(db, "pc", "no-such-profile").await;
 
-        let expired =
-            expire_now(db, &expiry_profiles()).await;
+        let expired = expire_now(db, &expiry_profiles()).await;
         assert_eq!(expired, 1, "only the short-profile run is past ITS TTL");
         assert_eq!(expiry_rows_of(db, &fa).await, (0, 0, 0, 0));
         for (fence, why) in [(&fb, "default profile"), (&fc, "unknown → default")] {
             let (packs, _, records, _) = expiry_rows_of(db, fence).await;
-            assert!(packs > 0 && records > 0, "the {why} run's fence must survive");
+            assert!(
+                packs > 0 && records > 0,
+                "the {why} run's fence must survive"
+            );
         }
     }
 
@@ -8686,7 +8976,9 @@ mod tests {
     /// copy-forward compaction later.
     #[tokio::test]
     async fn a_short_ttl_owner_pinned_by_a_long_ttl_borrower_stays() {
-        let Some(h) = DepotHarness::start().await else { return };
+        let Some(h) = DepotHarness::start().await else {
+            return;
+        };
         let db = &h.state.db;
 
         // Owner A (short TTL, past it) and deduping borrower B (default 30d
@@ -8697,7 +8989,11 @@ mod tests {
             .call_as(&ta, "POST", "/v1/drains", Some(drain_record_body(&root)))
             .await;
         assert_eq!(status, StatusCode::OK, "A's drain: {body}");
-        let fa = fence_key(&Fence { run: "ka".into(), step: "build".into(), attempt: "a1".into() });
+        let fa = fence_key(&Fence {
+            run: "ka".into(),
+            step: "build".into(),
+            attempt: "a1".into(),
+        });
 
         let tb = h.step_token("kb", "build", "a1");
         let blob_hash = hash_hex(b"drained output");
@@ -8714,15 +9010,18 @@ mod tests {
             .call_as(&tb, "POST", "/v1/drains", Some(drain_record_body(&root)))
             .await;
         assert_eq!(status, StatusCode::OK, "B's deduping drain: {body}");
-        let fb = fence_key(&Fence { run: "kb".into(), step: "build".into(), attempt: "a1".into() });
+        let fb = fence_key(&Fence {
+            run: "kb".into(),
+            step: "build".into(),
+            attempt: "a1".into(),
+        });
 
         let two_days = 2 * 24 * 3600;
         seed_run(db, "ka", "succeeded", two_days, false).await;
         seed_run(db, "kb", "succeeded", two_days, false).await;
         set_run_profile(db, "ka", "short").await;
 
-        let expired =
-            expire_now(db, &expiry_profiles()).await;
+        let expired = expire_now(db, &expiry_profiles()).await;
         assert_eq!(expired, 0, "the borrower's record pins the short-TTL owner");
         for (fence, who) in [(&fa, "owner"), (&fb, "borrower")] {
             let (packs, _, records, _) = expiry_rows_of(db, fence).await;
@@ -8746,7 +9045,9 @@ mod tests {
     /// verdict) and the blockers expire too.
     #[tokio::test]
     async fn a_window_of_long_ttl_blockers_cannot_starve_a_victim_behind_them() {
-        let Some(h) = DepotHarness::start().await else { return };
+        let Some(h) = DepotHarness::start().await else {
+            return;
+        };
         let db = &h.state.db;
 
         // The victim: a real drained fence on the 1d `short` profile, 2 days
@@ -8827,7 +9128,9 @@ mod tests {
     /// living record anyway.
     #[tokio::test]
     async fn a_window_of_borrowed_blockers_cannot_starve_a_victim_behind_them() {
-        let Some(h) = DepotHarness::start().await else { return };
+        let Some(h) = DepotHarness::start().await else {
+            return;
+        };
         let db = &h.state.db;
 
         // The victim: a real drained fence, terminal an hour — genuinely past
@@ -8928,7 +9231,9 @@ mod tests {
     /// the `skipped.bump()` on the decline and the counter assertion fails.
     #[tokio::test]
     async fn a_borrower_arriving_inside_the_victim_txn_is_caught_and_counted() {
-        let Some(h) = DepotHarness::start().await else { return };
+        let Some(h) = DepotHarness::start().await else {
+            return;
+        };
         let db = &h.state.db;
 
         let f = expiry_drain(&h, "lbw", "late-borrow").await;
@@ -8960,7 +9265,9 @@ mod tests {
         ));
         let skipped_before = crate::metrics::depot_expiry_skipped_candidates();
         let expired = expire_now(db, &expiry_ttls()).await;
-        *crate::depot_expiry::TEST_INJECT_IN_VICTIM_TXN.lock().unwrap() = None;
+        *crate::depot_expiry::TEST_INJECT_IN_VICTIM_TXN
+            .lock()
+            .unwrap() = None;
         assert_eq!(
             expired, 0,
             "the in-txn borrower re-check must catch the late edge and refuse \
@@ -8973,7 +9280,10 @@ mod tests {
             "a nominated-then-borrowed victim must count as a skipped candidate"
         );
         let (packs, _, records, _) = expiry_rows_of(db, &f).await;
-        assert!(packs > 0 && records > 0, "every row family survives the skip");
+        assert!(
+            packs > 0 && records > 0,
+            "every row family survives the skip"
+        );
 
         // The skip rolled the (injected) edge back with the transaction, so
         // the same fence is still nominable — and without the hook it goes.
@@ -8995,7 +9305,9 @@ mod tests {
     /// is 0 here — the one direction none of the live-borrower tests can see.
     #[tokio::test]
     async fn a_dangling_edge_without_a_borrower_record_does_not_hide_the_owner() {
-        let Some(h) = DepotHarness::start().await else { return };
+        let Some(h) = DepotHarness::start().await else {
+            return;
+        };
         let db = &h.state.db;
 
         let f = expiry_drain(&h, "dang", "dangling-edge").await;
@@ -9032,7 +9344,12 @@ mod tests {
             attempt: attempt.into(),
         });
         let session = pack_session(&h.state, &key);
-        session.lock().await.seal_open().await.expect("seal the open pack");
+        session
+            .lock()
+            .await
+            .seal_open()
+            .await
+            .expect("seal the open pack");
         key
     }
 
@@ -9117,7 +9434,9 @@ mod tests {
     /// anything.
     #[tokio::test]
     async fn the_row_pass_deletes_exactly_the_stale_and_quiet_staging() {
-        let Some(h) = DepotHarness::start().await else { return };
+        let Some(h) = DepotHarness::start().await else {
+            return;
+        };
         let db = &h.state.db;
 
         // A — stale, quiet, recordless.
@@ -9131,7 +9450,11 @@ mod tests {
             .call_as(&tb, "POST", "/v1/drains", Some(drain_record_body(&root_b)))
             .await;
         assert_eq!(status, StatusCode::OK, "B's drain must succeed: {body}");
-        let fb = fence_key(&Fence { run: "rb".into(), step: "build".into(), attempt: "a1".into() });
+        let fb = fence_key(&Fence {
+            run: "rb".into(),
+            step: "build".into(),
+            attempt: "a1".into(),
+        });
         backdate(db, &fb, true, true, true).await;
 
         // C — staged and fresh.
@@ -9148,7 +9471,11 @@ mod tests {
             .call_as(&te, "POST", "/v1/drains", Some(drain_record_body(&root_e)))
             .await;
         assert_eq!(status, StatusCode::OK, "E's drain must succeed: {body}");
-        let fe = fence_key(&Fence { run: "re".into(), step: "build".into(), attempt: "a1".into() });
+        let fe = fence_key(&Fence {
+            run: "re".into(),
+            step: "build".into(),
+            attempt: "a1".into(),
+        });
         sqlx::query(
             "UPDATE depot_packs SET committed = FALSE \
              WHERE fence_key = $1 AND kind = 'body'",
@@ -9168,26 +9495,48 @@ mod tests {
         let (status, body) = h
             .call_as(&tf, "POST", "/v1/drains", Some(error_record))
             .await;
-        assert_eq!(status, StatusCode::OK, "F's error record must deposit: {body}");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "F's error record must deposit: {body}"
+        );
         backdate(db, &ff, true, true, true).await;
 
         let (a_before, _) = pack_rows_of(db, &fa).await;
         assert!(a_before > 0, "precondition: A has staged rows");
 
-        let (member_rows, deleted) =
-            reclaim_stale_staging_once(&h.state.db).await.expect("the row pass");
+        let (member_rows, deleted) = reclaim_stale_staging_once(&h.state.db)
+            .await
+            .expect("the row pass");
 
         assert!(member_rows > 0, "A's and F's member rows were deleted");
-        assert_eq!(pack_rows_of(db, &fa).await, (0, 0), "A: stale quiet staging goes");
-        assert_eq!(pack_rows_of(db, &ff).await, (0, 0), "F: an old error record protects nothing");
+        assert_eq!(
+            pack_rows_of(db, &fa).await,
+            (0, 0),
+            "A: stale quiet staging goes"
+        );
+        assert_eq!(
+            pack_rows_of(db, &ff).await,
+            (0, 0),
+            "F: an old error record protects nothing"
+        );
         let (b_packs, b_members) = pack_rows_of(db, &fb).await;
-        assert!(b_packs > 0 && b_members > 0, "B: committed rows are untouchable at any age");
+        assert!(
+            b_packs > 0 && b_members > 0,
+            "B: committed rows are untouchable at any age"
+        );
         let (c_packs, _) = pack_rows_of(db, &fc).await;
         assert!(c_packs > 0, "C: fresh staging stays");
         let (d_packs, _) = pack_rows_of(db, &fd).await;
-        assert!(d_packs > 0, "D: a fresh ledger keeps stale-looking staging alive");
+        assert!(
+            d_packs > 0,
+            "D: a fresh ledger keeps stale-looking staging alive"
+        );
         let (e_packs, _) = pack_rows_of(db, &fe).await;
-        assert!(e_packs > 0, "E: a success record protects even an un-flipped row");
+        assert!(
+            e_packs > 0,
+            "E: a success record protects even an un-flipped row"
+        );
         for key in &deleted {
             let gone: i64 =
                 sqlx::query_scalar("SELECT count(*) FROM depot_packs WHERE pack_key = $1")
@@ -9195,7 +9544,10 @@ mod tests {
                     .fetch_one(db)
                     .await
                     .expect("check deleted key");
-            assert_eq!(gone, 0, "every returned skip-set key really is deleted: {key}");
+            assert_eq!(
+                gone, 0,
+                "every returned skip-set key really is deleted: {key}"
+            );
         }
         assert!(
             !deleted.is_empty(),
@@ -9211,7 +9563,9 @@ mod tests {
     /// as rowless and delete the world.
     #[tokio::test]
     async fn a_database_error_aborts_the_row_pass_with_nothing_deleted() {
-        let Some(h) = DepotHarness::start().await else { return };
+        let Some(h) = DepotHarness::start().await else {
+            return;
+        };
         let fa = seed_and_seal(&h, "rerr", "build", "a1").await;
         backdate(&h.state.db, &fa, true, true, false).await;
 
@@ -9220,7 +9574,10 @@ mod tests {
         let dead_pool = sqlx::PgPool::connect(&url).await.expect("second pool");
         dead_pool.close().await;
         let result = reclaim_stale_staging_once(&dead_pool).await;
-        assert!(result.is_err(), "a pool that cannot answer must abort the pass");
+        assert!(
+            result.is_err(),
+            "a pool that cannot answer must abort the pass"
+        );
         let (packs, members) = pack_rows_of(&h.state.db, &fa).await;
         assert!(
             packs > 0 && members > 0,
@@ -9277,7 +9634,9 @@ mod tests {
     /// young object dies.
     #[tokio::test]
     async fn the_byte_scan_deletes_old_rowless_objects_only_on_the_second_look() {
-        let Some(h) = DepotHarness::start().await else { return };
+        let Some(h) = DepotHarness::start().await else {
+            return;
+        };
         let db = &h.state.db;
 
         let orphan = format!("packs/{}/dead-000001.pack", "1".repeat(64));
@@ -9307,11 +9666,13 @@ mod tests {
         let skip = HashSet::new();
         let mut pending = HashSet::new();
 
-        let (deleted, _) =
-            reclaim_orphan_packs_once(db, &h.state.cold, &skip, &mut pending)
-                .await
-                .expect("first scan");
-        assert_eq!(deleted, 0, "the FIRST look at a rowless object never deletes");
+        let (deleted, _) = reclaim_orphan_packs_once(db, &h.state.cold, &skip, &mut pending)
+            .await
+            .expect("first scan");
+        assert_eq!(
+            deleted, 0,
+            "the FIRST look at a rowless object never deletes"
+        );
         assert!(pending.contains(&orphan) && pending.contains(&orphan_commit));
         assert!(
             !pending.contains(&young) && !pending.contains(&rowed),
@@ -9322,17 +9683,25 @@ mod tests {
             "a live fence's object is not pending-rowless"
         );
 
-        let (deleted, bytes) =
-            reclaim_orphan_packs_once(db, &h.state.cold, &skip, &mut pending)
-                .await
-                .expect("second scan");
+        let (deleted, bytes) = reclaim_orphan_packs_once(db, &h.state.cold, &skip, &mut pending)
+            .await
+            .expect("second scan");
         assert_eq!(deleted, 2, "the second look deletes both true orphans");
         assert!(bytes > 0, "and reports their bytes");
         assert!(!cold_has(&h, &orphan).await, "the orphan body pack is gone");
-        assert!(!cold_has(&h, &orphan_commit).await, "the orphan commit.pack is gone");
+        assert!(
+            !cold_has(&h, &orphan_commit).await,
+            "the orphan commit.pack is gone"
+        );
         assert!(cold_has(&h, &young).await, "young rowless bytes stay");
-        assert!(cold_has(&h, &rowed).await, "rowed bytes are untouchable at any age");
-        assert!(cold_has(&h, &live_orphan).await, "a live fence keeps its rowless object");
+        assert!(
+            cold_has(&h, &rowed).await,
+            "rowed bytes are untouchable at any age"
+        );
+        assert!(
+            cold_has(&h, &live_orphan).await,
+            "a live fence keeps its rowless object"
+        );
 
         // Fail-closed: with a database that cannot answer, the scan is an
         // Err and deletes nothing — even for an object it has already seen
@@ -9359,29 +9728,38 @@ mod tests {
     /// die one cadence early (the second pass's deletion count trips).
     #[tokio::test]
     async fn a_row_pass_deletion_keeps_its_bytes_for_a_full_cadence() {
-        let Some(h) = DepotHarness::start().await else { return };
+        let Some(h) = DepotHarness::start().await else {
+            return;
+        };
         let db = &h.state.db;
 
         let fa = seed_and_seal(&h, "rcad", "build", "a1").await;
         backdate(db, &fa, true, true, false).await;
         // The sealed pack's object is fresh on disk; make it old so ONLY the
         // skip set and the pending map are keeping it alive.
-        let (member_rows, keys) =
-            reclaim_stale_staging_once(db).await.expect("row pass");
-        assert!(member_rows > 0 && keys.len() == 1, "A's staging died: {keys:?}");
+        let (member_rows, keys) = reclaim_stale_staging_once(db).await.expect("row pass");
+        assert!(
+            member_rows > 0 && keys.len() == 1,
+            "A's staging died: {keys:?}"
+        );
         let pack_object = keys[0].clone();
-        assert!(cold_has(&h, &pack_object).await, "the sealed pack object exists");
+        assert!(
+            cold_has(&h, &pack_object).await,
+            "the sealed pack object exists"
+        );
         backdate_pack_object(&h, &pack_object);
 
         // Pass 1 (same pass as the row deletions): the skip set protects.
         let skip: HashSet<String> = keys.into_iter().collect();
         let mut pending = HashSet::new();
-        let (deleted, _) =
-            reclaim_orphan_packs_once(db, &h.state.cold, &skip, &mut pending)
-                .await
-                .expect("scan 1");
+        let (deleted, _) = reclaim_orphan_packs_once(db, &h.state.cold, &skip, &mut pending)
+            .await
+            .expect("scan 1");
         assert_eq!(deleted, 0);
-        assert!(cold_has(&h, &pack_object).await, "skip-set bytes survive their pass");
+        assert!(
+            cold_has(&h, &pack_object).await,
+            "skip-set bytes survive their pass"
+        );
         assert!(
             !pending.contains(&pack_object),
             "a skipped object is not even observed rowless yet"
@@ -9393,7 +9771,10 @@ mod tests {
                 .await
                 .expect("scan 2");
         assert_eq!(deleted, 0);
-        assert!(cold_has(&h, &pack_object).await, "first-seen bytes survive one more pass");
+        assert!(
+            cold_has(&h, &pack_object).await,
+            "first-seen bytes survive one more pass"
+        );
 
         // Pass 3: second consecutive rowless observation — now it goes.
         let (deleted, _) =
@@ -9401,7 +9782,10 @@ mod tests {
                 .await
                 .expect("scan 3");
         assert_eq!(deleted, 1);
-        assert!(!cold_has(&h, &pack_object).await, "reclaimed two full cadences after its rows");
+        assert!(
+            !cold_has(&h, &pack_object).await,
+            "reclaimed two full cadences after its rows"
+        );
     }
 
     /// The parent Workspace Snapshot's contents, as `(path, bytes)` plus one symlink
@@ -9751,4 +10135,3 @@ mod tests {
         );
     }
 }
-

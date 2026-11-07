@@ -184,7 +184,9 @@ fn set_paused_node(node: Option<String>) {
 
 /// `docker unpause <node>`, blocking, logged.
 fn unpause_blocking(node: &str, why: &str) {
-    let res = std::process::Command::new("docker").args(["unpause", node]).output();
+    let res = std::process::Command::new("docker")
+        .args(["unpause", node])
+        .output();
     eprintln!("scarab-chaos: {why}: docker unpause {node}: {res:?}");
 }
 

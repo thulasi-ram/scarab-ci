@@ -35,7 +35,10 @@ use clap::{Parser, Subcommand};
 use scarab_chaos::{check, env, nemesis, pods, scenario};
 
 #[derive(Parser)]
-#[command(name = "scarab-chaos", about = "ADR-0077 fault scenarios and invariant checker")]
+#[command(
+    name = "scarab-chaos",
+    about = "ADR-0077 fault scenarios and invariant checker"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -160,8 +163,11 @@ async fn check_dir(conn: &Conn, file: &Path) -> Result<check::Outcome, String> {
         .map(|c| scarab_chaos::cache::summary_lines(c, &fault_pods))
         .unwrap_or_default();
     let out = dir.join("verdict.json");
-    std::fs::write(&out, serde_json::to_string_pretty(&v).map_err(|e| e.to_string())? + "\n")
-        .map_err(|e| format!("{}: {e}", out.display()))?;
+    std::fs::write(
+        &out,
+        serde_json::to_string_pretty(&v).map_err(|e| e.to_string())? + "\n",
+    )
+    .map_err(|e| format!("{}: {e}", out.display()))?;
     let landing = s
         .faults
         .iter()
@@ -170,8 +176,14 @@ async fn check_dir(conn: &Conn, file: &Path) -> Result<check::Outcome, String> {
                 "{} {} at +{} ms after trigger, landed {}",
                 f.action,
                 f.pod,
-                f.trigger.as_ref().map(|t| f.fired_at_ms - t.observed_at_ms).unwrap_or(0),
-                f.landing.as_ref().map(|l| l.class.as_str()).unwrap_or("no window")
+                f.trigger
+                    .as_ref()
+                    .map(|t| f.fired_at_ms - t.observed_at_ms)
+                    .unwrap_or(0),
+                f.landing
+                    .as_ref()
+                    .map(|l| l.class.as_str())
+                    .unwrap_or("no window")
             );
             if let Some(sig) = &f.signal {
                 line += &format!(
@@ -180,7 +192,10 @@ async fn check_dir(conn: &Conn, file: &Path) -> Result<check::Outcome, String> {
                 );
             }
             if let Some(role) = &f.victim_role {
-                line += &format!("; victim: {role}, chosen by {}", f.target_basis.as_deref().unwrap_or("?"));
+                line += &format!(
+                    "; victim: {role}, chosen by {}",
+                    f.target_basis.as_deref().unwrap_or("?")
+                );
             }
             if let Some(p) = &f.pause {
                 line += &format!(
@@ -197,7 +212,12 @@ async fn check_dir(conn: &Conn, file: &Path) -> Result<check::Outcome, String> {
             if let Some(l) = &f.lease {
                 line += &format!(
                     "; lease {} (term {:?}) -> {:?} (term {:?}), after resume {:?} (term {:?})",
-                    l.owner_before, l.term_before, l.owner_after, l.term_after, l.owner_after_resume, l.term_after_resume
+                    l.owner_before,
+                    l.term_before,
+                    l.owner_after,
+                    l.term_after,
+                    l.owner_after_resume,
+                    l.term_after_resume
                 );
             }
             line
@@ -210,10 +230,18 @@ async fn check_dir(conn: &Conn, file: &Path) -> Result<check::Outcome, String> {
         s.kind.as_str(),
         s.seed,
         s.runs,
-        if landing.is_empty() { "none fired".to_string() } else { landing }
+        if landing.is_empty() {
+            "none fired".to_string()
+        } else {
+            landing
+        }
     );
     for (inv, n) in &v.checked {
-        let fails = v.findings.iter().filter(|f| &f.invariant == inv && f.severity == check::Severity::Fail).count();
+        let fails = v
+            .findings
+            .iter()
+            .filter(|f| &f.invariant == inv && f.severity == check::Severity::Fail)
+            .count();
         let state = match (fails, *n, inv.as_str()) {
             (0, 0, "I1b") => "not exercised (no retry in this scenario; not counted)".to_string(),
             (0, 0, _) => "not exercised".to_string(),
@@ -234,7 +262,12 @@ async fn check_dir(conn: &Conn, file: &Path) -> Result<check::Outcome, String> {
     for why in &v.inconclusive {
         println!("  inconclusive: {why}");
     }
-    println!("VERDICT {} {} ({})", v.outcome.as_str(), s.kind.as_str(), out.display());
+    println!(
+        "VERDICT {} {} ({})",
+        v.outcome.as_str(),
+        s.kind.as_str(),
+        out.display()
+    );
     Ok(v.outcome)
 }
 
@@ -251,7 +284,13 @@ async fn main_inner() -> Result<check::Outcome, String> {
         } => {
             let conn = connect().await?;
             refuse_leftovers(&conn).await?;
-            let s = scenario::Scenario::new(kind, seed, scenario::Workload::default(), server_replicas, depot_replicas);
+            let s = scenario::Scenario::new(
+                kind,
+                seed,
+                scenario::Workload::default(),
+                server_replicas,
+                depot_replicas,
+            );
             let dir = nemesis::run_dir(&out_root, kind, seed, false);
             nemesis::run(&conn.stack, s, &dir).await?;
             check_dir(&conn, &dir.join("scenario.json")).await

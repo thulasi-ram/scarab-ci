@@ -83,8 +83,8 @@ pub(crate) async fn authenticate(
         tracing::warn!(namespace = %sa.namespace, "gate api: token from outside the plugin namespace");
         return Err(ApiError::Unauthorized);
     }
-    let id = installation_id_of_service_account(&sa.service_account)
-        .ok_or(ApiError::Unauthorized)?;
+    let id =
+        installation_id_of_service_account(&sa.service_account).ok_or(ApiError::Unauthorized)?;
     let store = st.plugins.as_deref().ok_or(ApiError::Unauthorized)?;
     let installation = store
         .installation_by_id(id)
@@ -211,11 +211,12 @@ pub async fn list_pending_gates(
         .map_err(ApiError::Db)?;
     let more = waits.len() > limit as usize;
     waits.truncate(limit as usize);
-    let next = more.then(|| waits.last().map(|w| encode_cursor(&w.key()))).flatten();
+    let next = more
+        .then(|| waits.last().map(|w| encode_cursor(&w.key())))
+        .flatten();
     // The gate's name and expiry live in the Run's Pipeline; read each Run's
     // once per page.
-    let mut irs: std::collections::BTreeMap<String, Option<serde_json::Value>> =
-        Default::default();
+    let mut irs: std::collections::BTreeMap<String, Option<serde_json::Value>> = Default::default();
     let mut gates = Vec::with_capacity(waits.len());
     for w in waits {
         if !irs.contains_key(&w.run.0) {

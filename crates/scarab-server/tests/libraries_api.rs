@@ -743,15 +743,24 @@ async fn first_party_content_is_stored_under_the_manifest_name() {
         FakeForge::new(),
         InMemoryLibraries::new(),
     );
-    h.http.serve(&raw("mirrors", "copies", C1, "x/checkout.yaml"), CLONE_V1);
+    h.http
+        .serve(&raw("mirrors", "copies", C1, "x/checkout.yaml"), CLONE_V1);
     let source = format!("github.com/mirrors/copies//x/checkout.yaml@{C1}");
     let (st, b) = fetch(&h, json!({ "source": source, "name": "deploy" })).await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
     assert!(b.to_string().contains("thulasi-ram/clone"), "{b}");
     let (st, b) = fetch(&h, json!({ "source": source })).await;
     assert_eq!(st, StatusCode::OK, "{b}");
-    assert_eq!((b["publisher"].as_str(), b["name"].as_str()), (Some("thulasi-ram"), Some("clone")));
-    let v = h.store.version("acme", &content_hash(CLONE_V1)).await.unwrap().unwrap();
+    assert_eq!(
+        (b["publisher"].as_str(), b["name"].as_str()),
+        (Some("thulasi-ram"), Some("clone"))
+    );
+    let v = h
+        .store
+        .version("acme", &content_hash(CLONE_V1))
+        .await
+        .unwrap()
+        .unwrap();
     assert!(scarab_policy::library::is_first_party_clone(&v), "{v:?}");
 }
 

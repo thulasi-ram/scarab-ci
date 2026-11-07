@@ -35,9 +35,7 @@ impl FakeOracle {
         Self {
             files: files
                 .iter()
-                .map(|(root, path, hash)| {
-                    ((root.to_string(), path.to_string()), hash.to_string())
-                })
+                .map(|(root, path, hash)| ((root.to_string(), path.to_string()), hash.to_string()))
                 .collect(),
             fail: Mutex::new(false),
         }
@@ -149,7 +147,10 @@ async fn drive(db: &InMemoryDb, run: &RunId, exec: &FakeExecutor, oracle: &dyn W
     for _ in 0..6 {
         sched.tick(run).await.expect("tick");
     }
-    assert_eq!(db.run_status(run).await.unwrap(), Some(RunStatus::Succeeded));
+    assert_eq!(
+        db.run_status(run).await.unwrap(),
+        Some(RunStatus::Succeeded)
+    );
 }
 
 /// The happy path: the key folds from the key file's blob hash (as resolved
@@ -163,7 +164,12 @@ async fn drive(db: &InMemoryDb, run: &RunId, exec: &FakeExecutor, oracle: &dyn W
 #[tokio::test]
 async fn launch_resolves_the_key_and_restore_hints_through_the_oracle() {
     let db = InMemoryDb::new();
-    let (run, build) = seed(&db, caching(&["node_modules"], &["package-lock.json"]), Some("acme/web")).await;
+    let (run, build) = seed(
+        &db,
+        caching(&["node_modules"], &["package-lock.json"]),
+        Some("acme/web"),
+    )
+    .await;
     let oracle = FakeOracle::with(&[("root-clone", "package-lock.json", "blob-lock")]);
 
     let expected_key = cache_key(
@@ -244,7 +250,10 @@ async fn the_key_resolves_last_overlay_wins_across_merged_inputs() {
     .await
     .unwrap();
 
-    let oracle = FakeOracle::with(&[("root-a", "lock", "blob-early"), ("root-b", "lock", "blob-late")]);
+    let oracle = FakeOracle::with(&[
+        ("root-a", "lock", "blob-early"),
+        ("root-b", "lock", "blob-late"),
+    ]);
     let exec = FakeExecutor::new();
     exec.set_output("a", "root-a");
     exec.set_output("b", "root-b");
@@ -378,7 +387,10 @@ async fn project_b_never_resolves_project_as_cache_rows() {
         vec![("node_modules".to_string(), "tree-a".to_string())]
     );
     assert!(
-        db.cache_lookup("evil/web", "key-1").await.unwrap().is_empty(),
+        db.cache_lookup("evil/web", "key-1")
+            .await
+            .unwrap()
+            .is_empty(),
         "another project must not resolve the row, same key string or not"
     );
 }

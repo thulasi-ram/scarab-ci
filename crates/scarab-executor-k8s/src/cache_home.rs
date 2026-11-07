@@ -128,7 +128,10 @@ mod tests {
                 moved += 1;
             }
         }
-        assert!((350..=650).contains(&moved), "about a quarter should move: {moved}");
+        assert!(
+            (350..=650).contains(&moved),
+            "about a quarter should move: {moved}"
+        );
     }
 
     #[test]

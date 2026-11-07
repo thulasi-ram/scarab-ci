@@ -207,7 +207,9 @@ fn run_wsfetch_fetch(
 /// is real, not a skipped sleep.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_depot_restart_mid_init_delays_the_fetch_instead_of_failing_it() {
-    let Some(h) = Harness::start().await else { return };
+    let Some(h) = Harness::start().await else {
+        return;
+    };
 
     // Seed a snapshot through the healthy path.
     let source = tempfile::tempdir().unwrap();
@@ -277,7 +279,9 @@ async fn a_depot_restart_mid_init_delays_the_fetch_instead_of_failing_it() {
 /// minimum and the test stays fast.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_outage_longer_than_the_window_exits_transient_not_missing_inputs() {
-    let Some(h) = Harness::start().await else { return };
+    let Some(h) = Harness::start().await else {
+        return;
+    };
     let source = tempfile::tempdir().unwrap();
     std::fs::write(source.path().join("f.txt"), b"x").unwrap();
     let snapshot = h
@@ -341,7 +345,9 @@ async fn an_outage_longer_than_the_window_exits_transient_not_missing_inputs() {
 /// names root B, so the client got past root A.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_mid_fetch_403_exits_denied_without_consuming_the_retry_window() {
-    let Some(h) = Harness::start().await else { return };
+    let Some(h) = Harness::start().await else {
+        return;
+    };
 
     let source_a = tempfile::tempdir().unwrap();
     std::fs::write(source_a.path().join("granted.txt"), b"reachable").unwrap();
@@ -430,7 +436,9 @@ async fn a_mid_fetch_403_exits_denied_without_consuming_the_retry_window() {
 /// burning three attempts on content that cannot come back.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_live_depot_404_exits_missing_inputs_without_burning_the_window() {
-    let Some(h) = Harness::start().await else { return };
+    let Some(h) = Harness::start().await else {
+        return;
+    };
 
     let absent_root = "ab".repeat(32); // valid shape, never ingested
     let token_dir = tempfile::tempdir().unwrap();
