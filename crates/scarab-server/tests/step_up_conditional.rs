@@ -143,6 +143,7 @@ fn environment(name: &str) -> OrgEnvironment {
     OrgEnvironment {
         org: "acme".into(),
         name: name.into(),
+        display_name: None,
         description: String::new(),
         protection: Default::default(),
         eligibility: Default::default(),
@@ -753,6 +754,26 @@ impl EnvironmentGovernanceStore for RacingGovernance {
     ) -> Result<Vec<DeployGovernance>, OrgEnvironmentError> {
         self.inner
             .project_environment_governance(org, project)
+            .await
+    }
+    async fn claim_environment_name(
+        &self,
+        org: &str,
+        name: &str,
+    ) -> Result<Option<scarab_project::EnvironmentNameClaim>, OrgEnvironmentError> {
+        self.inner.claim_environment_name(org, name).await
+    }
+    async fn duplicate_environment(
+        &self,
+        org: &str,
+        from: &str,
+        to: &str,
+        display_name: Option<&str>,
+        updated_by: &str,
+        updated_at: i64,
+    ) -> Result<OrgEnvironment, OrgEnvironmentError> {
+        self.inner
+            .duplicate_environment(org, from, to, display_name, updated_by, updated_at)
             .await
     }
     async fn put_environment_protection_expecting(

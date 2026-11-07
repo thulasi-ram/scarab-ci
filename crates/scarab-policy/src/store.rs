@@ -189,6 +189,10 @@ pub trait PolicyStore: Send + Sync {
     /// The live Policies attached at exactly `scope`, by name (bytewise).
     async fn list(&self, scope: &PolicyScope) -> Result<Vec<StoredPolicy>, PolicyStoreError>;
 
+    /// Every live Policy in `org` at any level: the Org's first, then each
+    /// Project's, by Project and then by name (bytewise).
+    async fn list_in_org(&self, org: &str) -> Result<Vec<StoredPolicy>, PolicyStoreError>;
+
     /// Every version of a Policy, oldest first; empty when there is none.
     async fn versions(&self, id: &str) -> Result<Vec<PolicyVersion>, PolicyStoreError>;
 

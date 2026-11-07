@@ -41,6 +41,7 @@ import Libraries from "../components/Libraries";
 import ScopedSecrets from "../components/ScopedSecrets";
 import { MyApiTokens, OrgApiTokens } from "../components/ApiTokens";
 import OrgSecurity from "../components/OrgSecurity";
+import OrgPolicies from "../components/OrgPolicies";
 import EventLog from "../components/EventLog";
 import Icon from "../components/Icon";
 
@@ -341,6 +342,8 @@ function orgBody(id: string, org: string): JSX.Element {
           </p>
         </>
       );
+    case "policies":
+      return <OrgPolicies org={org} />;
     case "tokens":
       return <OrgApiTokens org={org} />;
     case "security":

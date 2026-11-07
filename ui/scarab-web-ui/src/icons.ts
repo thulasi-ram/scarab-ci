@@ -47,6 +47,7 @@ import {
   FileCode,
   Trash2,
   X,
+  Copy,
 } from "lucide";
 
 // IconNode = Array<[tagName, attributes]>.
@@ -99,6 +100,8 @@ const ICONS: Record<string, IconNode> = {
   "file-code": FileCode as IconNode,
   "trash-2": Trash2 as IconNode,
   x: X as IconNode,
+  // Duplicating an Environment.
+  copy: Copy as IconNode,
 };
 
 export function iconNode(name: string): IconNode | undefined {

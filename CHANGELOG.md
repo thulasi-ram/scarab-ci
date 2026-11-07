@@ -228,6 +228,40 @@ record. Read Breaking changes before you upgrade.
 
 ### Features
 
+- **Environment display name and Duplicate.** An Environment's name stays fixed: pipelines and
+  the OIDC subject (`…/env/<name>/…`) use it. It now has an optional display name, which lists,
+  headings and pickers show with the name beside it; changing it needs no step-up. **Duplicate**
+  (`POST /v1/orgs/{org}/environments/{env}/duplicate`, under step-up) creates a new
+  Environment with the old one's baseline, eligibility, every project's overlay and privilege
+  grant, and its secrets with their values, and lists what it did not copy: the projects whose
+  Runs used it, the policies that name it, and the OIDC subject cloud trust policies match. The
+  old Environment is not changed. A second Duplicate to a name already being duplicated to is
+  refused (409) before it writes anything, and so is creating that name with
+  `PUT /v1/orgs/{org}/environments/{env}` while the Duplicate runs. A display name may not hold invisible bidi or
+  zero-width characters. Migration 0080 adds the display name column (git-bug d002a0c).
+  [Environments](https://thulasi-ram.github.io/scarab-ci/usage/environments/#duplicate-an-environment)
+- **Approval gate settings on the Environment page.** The edit page has an **Approval gate**
+  section: what to do when a pipeline has no approval gate (**Add an approval gate** or **Refuse
+  the run**), the added gate's expiry, how many approvers must approve, and the maximum approval
+  age. The wait timer is disabled while the Environment has no approvers, and an Environment
+  with a timer and no approvers shows a warning (git-bug cd43bf3, 2b94989).
+  [Environments](https://thulasi-ram.github.io/scarab-ci/usage/environments/#the-rules-it-holds)
+- **The Run page marks Environment approval gates.** Their gate card, DAG node and step pane say
+  **Environment approval gate** and name the Environment by its display name with its name in
+  brackets; the gate the Environment added says **added by** it. After the approvals are in, a
+  gate with a wait timer shows when it releases, and approving it says the approval was recorded
+  and when the gate releases. `GET /v1/runs/{id}` gains `environment` (`name`, `display_name`)
+  (git-bug cd43bf3, 2b94989).
+  [Environments](https://thulasi-ram.github.io/scarab-ci/usage/environments/#the-approval-gate)
+- **Environment page wording.** "Who may deploy" is now "Projects that may use <Environment>":
+  the list admits every Run that names the Environment, not only deploys. The "Projects" panel
+  is now "Project overlays and grants" (git-bug c2f97b4).
+  [Environments](https://thulasi-ram.github.io/scarab-ci/usage/environments/#view-and-edit-an-environment)
+- **Settings › Policies.** One read-only page per org lists its CEL Policies, with what each
+  applies to and how often it matched, denied and (in audit mode) would have denied in the
+  newest 200 decisions, the newest decisions, and the typed settings (each Environment's rules,
+  the library and plugin lists, API token scopes) with links to where each is edited (git-bug
+  c2f97b4). [Every rule in one place](https://thulasi-ram.github.io/scarab-ci/usage/environments/#every-rule-in-one-place)
 - **Runs after another pipeline.** `on: upstream: { pipeline: ci }` starts a Run when a Run
   of `ci` in the same repository finishes (`status:` takes `succeeded`, the default, and
   `failed`). The follow-up builds the same commit and runs on the same ref, so an

@@ -3383,6 +3383,13 @@ h1, .crumb-head, .run-title {
 .oenv-report-h .btn { margin-left: auto; }
 .oenv-report-projects { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; }
 .oenv-desc { font-size: var(--fs-sm); color: var(--sage); }
+/* The name pipelines use, beside an Environment's display name. */
+.oenv-name { font-size: var(--fs-sm); color: var(--muted-sage); }
+/* A duplicate's result: what was copied, then the checklist of what was not. */
+.dup-result { display: flex; flex-direction: column; gap: 8px; }
+.dup-h { margin: 4px 0 0; font-family: var(--font-mono); font-size: var(--fs-xs); font-weight: 400; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted-sage); }
+.dup-list { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 6px; font-size: var(--fs-md); }
+.dup-items { margin-top: 2px; font-size: var(--fs-sm); color: var(--sage); overflow-wrap: anywhere; }
 .oenv-rows { display: grid; gap: 6px; }
 .oenv-row { display: grid; grid-template-columns: 1fr 1fr auto auto; gap: 6px; align-items: center; }
 @media (max-width: 560px) {
@@ -4045,3 +4052,15 @@ code.c { font-family: var(--font-mono); font-size: var(--fs-sm); color: var(--co
   display: inline-flex; align-items: center; gap: 6px; padding: 8px 16px;
   border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
 }
+
+/* A warning on an Environment's page: a wait timer with no approvers. */
+.env-warn { margin: 0 0 12px; }
+
+/* An Environment approval gate: its label on the gate bar and the step pane. */
+.gate-env { font-size: var(--fs-xs); color: var(--copper); white-space: nowrap; }
+.gate-status.gate-env-line { color: var(--copper); }
+
+/* Settings › Policies */
+.pol-h { font-size: var(--fs-sm); font-weight: 600; margin: 14px 0 6px; }
+.pol-facts { margin: 6px 0 0; }
+.tok-role.pol-denied { color: var(--danger); border-color: var(--danger); }

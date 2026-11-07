@@ -312,6 +312,9 @@ impl PolicyStore for NoRecord {
     async fn list(&self, a: &PolicyScope) -> Result<Vec<StoredPolicy>, PolicyStoreError> {
         self.0.list(a).await
     }
+    async fn list_in_org(&self, a: &str) -> Result<Vec<StoredPolicy>, PolicyStoreError> {
+        self.0.list_in_org(a).await
+    }
     async fn versions(&self, a: &str) -> Result<Vec<PolicyVersion>, PolicyStoreError> {
         self.0.versions(a).await
     }

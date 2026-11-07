@@ -845,3 +845,48 @@ contract_test!(
     refused_runs_contract,
     refused_runs_list_per_project_newest_first
 );
+
+/// The Projects whose Runs deployed into an Environment, from Run history
+/// (git-bug d002a0c): one name per Project, sorted, any status, only that
+/// Environment's and only that org's.
+async fn projects_with_runs_in_reads_run_history(db: &dyn Db) {
+    let deploy = |org: &str, project: &str, environment: &str| scarab_engine::DeployContext {
+        org: org.into(),
+        project: project.into(),
+        environment: environment.into(),
+        git_ref: "refs/heads/main".into(),
+        locked_out: false,
+    };
+    for (id, ctx) in [
+        ("r1", Some(deploy("acme", "web", "prod"))),
+        ("r2", Some(deploy("acme", "api", "prod"))),
+        ("r3", Some(deploy("acme", "web", "prod"))),
+        ("r4", Some(deploy("acme", "jobs", "staging"))),
+        ("r5", Some(deploy("globex", "web2", "prod"))),
+        ("r6", None),
+    ] {
+        let run = RunId(id.into());
+        db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
+        if let Some(ctx) = ctx {
+            db.set_run_deploy_context(&run, &ctx).await.unwrap();
+        }
+    }
+    assert_eq!(
+        db.projects_with_runs_in("acme", "prod").await.unwrap(),
+        ["api", "web"]
+    );
+    assert_eq!(
+        db.projects_with_runs_in("acme", "staging").await.unwrap(),
+        ["jobs"]
+    );
+    assert!(db
+        .projects_with_runs_in("acme", "nowhere")
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+contract_test!(
+    projects_with_runs_in_contract,
+    projects_with_runs_in_reads_run_history
+);
