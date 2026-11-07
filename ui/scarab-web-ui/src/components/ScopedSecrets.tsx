@@ -1,7 +1,7 @@
-// Secret CRUD at ONE scope (ADR-0014): list names, add, delete. Values are
+// Secret CRUD at ONE scope: list names, add, delete. Values are
 // write-only — the API never returns them, so there is nothing to reveal.
 //
-// Scope-agnostic on purpose (ADR-0060 part B): the same panel serves the repo
+// Scope-agnostic on purpose: the same panel serves the repo
 // scope in the Project's Secrets tab and the org scope in global Settings. The
 // scope is the caller's business; this component only renders what it is given
 // and says so in its header.
@@ -19,6 +19,8 @@ import {
 } from "../api/client";
 import { secretKeyNote, secretKeyRows } from "../secret-keys";
 import Icon from "./Icon";
+import Modal, { ModalMessage } from "./Modal";
+import { Checkbox, Field, Input } from "./Field";
 
 export default function ScopedSecrets(props: {
   /** The scope to read and write. Changing it refetches. */
@@ -141,8 +143,10 @@ export function NewSecretDialog(props: {
 
   const exists = () => props.existing.includes(name().trim());
   const blocked = () => exists() && !overwrite();
-  let nameRef: HTMLInputElement | undefined;
-  createEffect(() => nameRef?.focus());
+  const where = () =>
+    [props.scope.repo ? `${props.scope.org}/${props.scope.repo}` : props.scope.org, props.scope.environment]
+      .filter(Boolean)
+      .join(" · ");
 
   const save = async () => {
     const n = name().trim();
@@ -161,62 +165,49 @@ export function NewSecretDialog(props: {
   };
 
   return (
-    <div class="modal-scrim" onClick={props.onClose}>
-      <div class="modal" onClick={(e) => e.stopPropagation()}>
-        <div class="panel-h"><span>New secret</span></div>
-        <div class="modal-body">
-          <div class="form-r">
-            <label>name</label>
-            <input
-              ref={nameRef}
-              class="input mono"
-              placeholder="NAME"
-              value={name()}
-              onInput={(e) => setName(e.currentTarget.value)}
-            />
-          </div>
-          <div class="form-r">
-            <label>value</label>
-            <input
-              class="input mono"
-              type="password"
-              placeholder="value (write-only)"
-              value={value()}
-              onInput={(e) => setValue(e.currentTarget.value)}
-            />
-          </div>
-          <Show when={exists()}>
-            <label class="checkbox-inline secret-overwrite">
-              <input
-                type="checkbox"
-                checked={overwrite()}
-                onChange={(e) => setOverwrite(e.currentTarget.checked)}
-              />
-              <span>
-                <code class="mono">{name().trim()}</code> already exists — overwrite it
-              </span>
-            </label>
-          </Show>
+    <Modal
+      eyebrow={`${where()} · secrets`}
+      title="New secret"
+      purpose="Encrypted at rest, never displayed — overwrite but never read back."
+      busy={saving()}
+      onClose={props.onClose}
+      footer={
+        <>
           <Show when={error()}>
-            <p class="error">{error()}</p>
+            <ModalMessage>{error()}</ModalMessage>
           </Show>
-        </div>
-        <div class="modal-foot">
-          <div class="modal-actions">
-            <button
-              class="btn btn-primary"
-              disabled={saving() || !name().trim() || blocked()}
-              onClick={save}
-            >
-              <Icon icon="plus" size={14} /> {saving() ? "Saving…" : "Save"}
-            </button>
-            <button class="btn btn-ghost" onClick={props.onClose}>Cancel</button>
-          </div>
-          <p class="subtle modal-note">
-            <small>Encrypted at rest, never displayed — overwrite but never read back.</small>
-          </p>
-        </div>
-      </div>
-    </div>
+          <button class="btn btn-ghost" type="button" onClick={props.onClose} disabled={saving()}>
+            Cancel
+          </button>
+          <button
+            class="btn btn-primary"
+            type="button"
+            disabled={saving() || !name().trim() || blocked()}
+            onClick={save}
+          >
+            <Icon icon="plus" size={14} /> {saving() ? "Saving…" : "Save"}
+          </button>
+        </>
+      }
+    >
+      <Field label="Name" required>
+        <Input mono autofocus placeholder="NAME" value={name()} onValue={setName} />
+      </Field>
+      <Field label="Value">
+        <Input mono type="password" placeholder="value (write-only)" value={value()} onValue={setValue} />
+      </Field>
+      <Show when={exists()}>
+        <Checkbox
+          tone="warn"
+          checked={overwrite()}
+          onChecked={setOverwrite}
+          label={
+            <>
+              <code class="mono">{name().trim()}</code> already exists — overwrite it
+            </>
+          }
+        />
+      </Show>
+    </Modal>
   );
 }

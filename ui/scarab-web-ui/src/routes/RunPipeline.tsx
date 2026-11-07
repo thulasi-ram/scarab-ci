@@ -1,4 +1,4 @@
-// Run-Pipeline flow (ADR-0043 "World B") — repo → ref → catalog → pipeline →
+// Run-Pipeline flow — repo → ref → catalog → pipeline →
 // typed parameter form → dispatch. One ref threads through; the catalog resolves
 // it to a concrete SHA that the interface read and the dispatch pin to, so the
 // form and the run see byte-identical config (no branch-moved skew). Client
@@ -18,10 +18,11 @@ import {
   type ParamSpec,
 } from "../params";
 import Icon from "../components/Icon";
+import { Checkbox, Input } from "../components/Field";
 import SearchSelect from "../components/SearchSelect";
 import Doodle from "../components/Doodle";
 
-// Re-run hands the prior run's frozen params through router state (ADR-0043 §6).
+// Re-run hands the prior run's frozen params through router state.
 // The run-status API carries params but not the pipeline/ref, so the launcher
 // re-picks those and the prior params reconcile against whatever interface is
 // selected.
@@ -62,7 +63,7 @@ export default function RunPipeline() {
   const [formError, setFormError] = createSignal<string | null>(null);
   const [dropped, setDropped] = createSignal<string[]>([]);
   const [submitting, setSubmitting] = createSignal(false);
-  // Optional dispatch reason (ADR-0057 §3) — free text, stamped as the run
+  // Optional dispatch reason — free text, stamped as the run
   // Headline. Not a pipeline parameter (it rides the dispatch, not the IR), so
   // it lives outside the typed param form and is never validated client-side.
   const [reason, setReason] = createSignal("");
@@ -163,7 +164,7 @@ export default function RunPipeline() {
         pipeline: name,
         params: toRequestParams(i.inputs, values()),
         kind: "manual",
-        // Optional (ADR-0057): omitted when blank; the endpoint stamps it as the
+        // Optional: omitted when blank; the endpoint stamps it as the
         // run Headline and never requires it here (requiredness is an
         // Environment ProtectionRule at admission).
         ...(trimmedReason ? { reason: trimmedReason } : {}),
@@ -208,12 +209,11 @@ export default function RunPipeline() {
             <label class="field rp-ref-field">
               <span class="field-label">branch / tag / sha</span>
               <div class="rp-combo">
-                <input
-                  class="input"
+                <Input
+                  mono
                   value={ref()}
-                  autocomplete="off"
-                  onInput={(e) => {
-                    setRef(e.currentTarget.value);
+                  onValue={(v) => {
+                    setRef(v);
                     setRefOpen(true);
                     setRefHi(0);
                   }}
@@ -347,7 +347,7 @@ export default function RunPipeline() {
                           <b>{dropped().join(", ")}</b>
                         </p>
                       </Show>
-                      {/* Optional dispatch reason (ADR-0057) — free text, stamped
+                      {/* Optional dispatch reason — free text, stamped
                           as the run Headline. Not a pipeline parameter, so it sits
                           above the typed form and is never client-validated. */}
                       <div class="field rp-field">
@@ -355,11 +355,10 @@ export default function RunPipeline() {
                           <span class="mono">reason</span>
                           <span class="rp-opt">optional</span>
                         </span>
-                        <input
-                          class="input"
-                          type="text"
+                        <Input
+                          aria-label="reason"
                           value={reason()}
-                          onInput={(e) => setReason(e.currentTarget.value)}
+                          onValue={setReason}
                           placeholder="why are you running this? (shown as the run headline)"
                         />
                         <span class="rp-help">
@@ -411,7 +410,7 @@ export default function RunPipeline() {
   );
 }
 
-// ---- one bounded widget per ParamType (ADR-0043 §2) -----------------------
+// ---- one bounded widget per ParamType ---------------------------------------
 
 function Field(props: {
   spec: ParamSpec;
@@ -434,14 +433,11 @@ function Field(props: {
       </span>
 
       <Show when={spec.type === "boolean"}>
-        <label class="rp-check">
-          <input
-            type="checkbox"
-            checked={boolValue()}
-            onChange={(e) => props.onChange(e.currentTarget.checked)}
-          />
-          <span class="mono">{boolValue() ? "true" : "false"}</span>
-        </label>
+        <Checkbox
+          checked={boolValue()}
+          onChecked={(v) => props.onChange(v)}
+          label={<span class="mono">{boolValue() ? "true" : "false"}</span>}
+        />
       </Show>
 
       <Show when={spec.type === "choice"}>
@@ -456,21 +452,23 @@ function Field(props: {
       </Show>
 
       <Show when={spec.type === "number"}>
-        <input
-          class="input"
-          type="number"
+        <Input
+          mono
+          aria-label={spec.name}
+          inputmode="decimal"
+          invalid={!!props.error}
           value={strValue()}
-          onInput={(e) => props.onChange(e.currentTarget.value)}
+          onValue={(v) => props.onChange(v)}
           placeholder={spec.required ? "" : String(spec.default ?? "")}
         />
       </Show>
 
       <Show when={spec.type === "string"}>
-        <input
-          class="input"
-          type="text"
+        <Input
+          aria-label={spec.name}
+          invalid={!!props.error}
           value={strValue()}
-          onInput={(e) => props.onChange(e.currentTarget.value)}
+          onValue={(v) => props.onChange(v)}
           placeholder={spec.required ? spec.name : String(spec.default ?? "")}
         />
       </Show>
