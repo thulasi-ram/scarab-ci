@@ -7,7 +7,10 @@
 // settings are rules with a form of their own next to the feature they govern:
 // an Environment's rules, the library and plugin lists, API token scopes. The
 // page lists those read-only, each with a link to where it is edited.
+import type { components } from "./api/schema";
 import { orgHref } from "./settings-nav";
+
+type Schemas = components["schemas"];
 
 /** An authored Policy as the server serialises it (`PolicyDto.policy`). */
 export type PolicyBody = {
@@ -24,27 +27,17 @@ export type PolicyBody = {
   setting?: Record<string, Record<string, string[]>>;
 };
 
-/** A stored Policy (`PolicyDto`), as far as the page reads it. */
-export type StoredPolicyLike = {
-  id: string;
-  name: string;
-  level: string;
-  project?: string | null;
-  version: number;
-  updated_at: number;
-  deleted: boolean;
-  policy: PolicyBody;
-};
+/** A stored Policy (`PolicyDto`), its authored body read as {@link PolicyBody}
+ *  (the schema leaves it opaque). */
+export type StoredPolicyLike = Omit<Schemas["PolicyDto"], "policy"> & { policy: PolicyBody };
 
-/** One Policy's part in a recorded decision. */
-export type PolicyResultLike = { policy_id: string; outcome: { kind: string } };
+/** One Policy's part in a recorded decision. `mode` is the Policy's mode
+ *  when the decision was made. */
+export type PolicyResultLike = { policy_id: string; mode?: string; outcome: { kind: string } };
 
-/** A recorded decision (`PolicyDecisionRecordDto`), as far as the page reads it. */
-export type DecisionRecordLike = {
-  id: string;
-  at: number;
-  project?: string | null;
-  run_id?: string | null;
+/** A recorded decision (`PolicyDecisionRecordDto`), its `decision` read as far
+ *  as the page reads it (the schema leaves it opaque). */
+export type DecisionRecordLike = Omit<Schemas["PolicyDecisionRecordDto"], "decision"> & {
   decision: { checkpoint?: string; results?: PolicyResultLike[]; outcome?: { kind: string; messages?: string[] } };
 };
 
@@ -52,9 +45,10 @@ export type DecisionRecordLike = {
 export type PolicyCounts = {
   /** Its `match` selected the consultation. */
   matched: number;
-  /** It denied (enforce mode), or its rule failed and so denied. */
+  /** It denied (enforce mode), or its rule failed in enforce mode and so
+   *  denied. */
   denied: number;
-  /** In audit mode, it would have denied. */
+  /** In audit mode, it would have denied, or its rule failed. */
   wouldDeny: number;
 };
 
@@ -70,8 +64,11 @@ export function policyCounts(decisions: readonly DecisionRecordLike[]): Map<stri
       if (!kind || kind === "not_matched") continue;
       const c = { ...(out.get(r.policy_id) ?? ZERO) };
       c.matched += 1;
-      if (kind === "denied" || kind === "error") c.denied += 1;
-      if (kind === "would_deny") c.wouldDeny += 1;
+      // A rule that fails denies in enforce mode only; in audit mode it is
+      // recorded, as a would-deny is.
+      const audit = r.mode === "audit";
+      if (kind === "denied" || (kind === "error" && !audit)) c.denied += 1;
+      if (kind === "would_deny" || (kind === "error" && audit)) c.wouldDeny += 1;
       out.set(r.policy_id, c);
     }
   }

@@ -16,6 +16,7 @@ import {
   listOrgEnvironments,
   listOrgPolicies,
   listOrgPolicyDecisions,
+  type PolicyDecisionPage,
   type PolicyRecord,
 } from "../api/client";
 import { isPermissive, rulesSummary } from "../environment-overlays";
@@ -29,6 +30,7 @@ import {
   policyCounts,
   typedSettingRows,
   type DecisionRecordLike,
+  type PolicyBody,
   type StoredPolicyLike,
 } from "../policies";
 import { orgHref } from "../settings-nav";
@@ -38,17 +40,22 @@ import Icon from "./Icon";
 /** How many of the newest decisions the page lists. */
 const RECENT = 10;
 
-const asStored = (ps: readonly PolicyRecord[]) => ps as unknown as StoredPolicyLike[];
-const asDecisions = (ds: readonly unknown[]) => ds as DecisionRecordLike[];
+// The schema leaves a Policy's body and a decision opaque; these read only
+// those fields as the shapes `policies.ts` names.
+const asStored = (ps: readonly PolicyRecord[]): StoredPolicyLike[] =>
+  ps.map((p) => ({ ...p, policy: p.policy as unknown as PolicyBody }));
+const asDecisions = (ds: PolicyDecisionPage["decisions"]): DecisionRecordLike[] =>
+  ds.map((d) => ({ ...d, decision: d.decision as unknown as DecisionRecordLike["decision"] }));
 
 export default function OrgPolicies(props: { org: string }) {
   const [policies] = createResource(() => props.org, listOrgPolicies);
-  const [decisions] = createResource(() => props.org, (org) => listOrgPolicyDecisions(org).catch(() => null));
+  const [decisions] = createResource(() => props.org, (org) => listOrgPolicyDecisions(org));
   const [environments] = createResource(() => props.org, (org) => listOrgEnvironments(org).catch(() => null));
 
   const stored = () => asStored(policies() ?? []);
   const cel = () => stored().filter(isCelPolicy).sort((a, b) => a.name.localeCompare(b.name));
-  const log = () => asDecisions(decisions()?.decisions ?? []);
+  // An errored resource throws when read, so the error is checked first.
+  const log = () => (decisions.error ? [] : asDecisions(decisions()?.decisions ?? []));
   const counts = () => policyCounts(log());
   const settings = () => typedSettingRows(props.org, stored());
 
@@ -132,7 +139,13 @@ export default function OrgPolicies(props: { org: string }) {
         <div class="secrets-body">
           <Show
             when={log().length > 0}
-            fallback={<p class="empty">{decisions.loading ? "loading…" : "No decisions recorded yet."}</p>}
+            fallback={
+              decisions.error ? (
+                <p class="error">Could not load the decision log.</p>
+              ) : (
+                <p class="empty">{decisions.loading ? "loading…" : "No decisions recorded yet."}</p>
+              )
+            }
           >
             <ul class="tok-list" aria-label="Recent decisions">
               <For each={log().slice(0, RECENT)}>
