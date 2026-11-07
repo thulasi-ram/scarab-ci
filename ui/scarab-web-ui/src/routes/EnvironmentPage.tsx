@@ -260,7 +260,7 @@ function Details(props: { env: OrgEnvironment }) {
             </>
           )}
         </For>
-        <dt>who may deploy</dt>
+        <dt>projects that may use {shownName(props.env)}</dt>
         <dd class="m">{eligibilityLabel(props.env.eligibility)}</dd>
         <dt>last changed</dt>
         <dd>
@@ -288,7 +288,7 @@ function ProjectsPanel(props: {
   return (
     <div class="panel">
       <div class="panel-h">
-        <span>Projects</span>
+        <span>Project overlays and grants</span>
       </div>
       <div class="secrets-body">
         <Show when={!projects.loading || projects()} fallback={<p class="empty">loading…</p>}>
@@ -592,7 +592,7 @@ function EditForm(props: { org: string; env: OrgEnvironment }) {
             </Field>
           </FormSection>
 
-          <FormSection n={6} title="Who may deploy">
+          <FormSection n={6} title={`Projects that may use ${shownName(props.env)}`}>
             <Checkbox
               checked={allProjects()}
               onChecked={setAllProjects}
@@ -884,8 +884,8 @@ function DeleteSection(props: { org: string; name: string }) {
 // ── Duplicate ────────────────────────────────────────────────────────────────
 
 /** Copy the Environment under a new name, then show what was copied and the
- *  checklist of what was not. Asks for a step-up: it copies secrets and who
- *  may deploy. */
+ *  checklist of what was not. Asks for a step-up: it copies secrets and the
+ *  projects that may use it. */
 function DuplicateDialog(props: { org: string; env: OrgEnvironment; onClose: () => void }) {
   const nav = useNavigate();
   const [taken] = createResource(

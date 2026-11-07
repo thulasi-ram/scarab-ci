@@ -404,7 +404,7 @@ export function planSave(
 export const PART_LABEL: Record<EnvironmentWrite["part"], string> = {
   details: "display name and description",
   baseline: "baseline",
-  eligibility: "list of projects that may deploy",
+  eligibility: "list of projects that may use it",
 };
 
 /** What a Save says when the Environment is gone before its first write. */
@@ -498,7 +498,7 @@ export function copiedSummary(r: DuplicateResultLike): string[] {
   const n = (count: number, one: string, many: string) => `${count} ${count === 1 ? one : many}`;
   const secretCount = r.copied.secrets.reduce((sum, s) => sum + s.keys.length, 0);
   return [
-    "baseline rules and who may deploy",
+    "baseline rules and the projects that may use it",
     n(r.copied.overlays.length, "project overlay", "project overlays"),
     n(r.copied.privilege_grants.length, "privilege grant", "privilege grants"),
     `${n(secretCount, "secret", "secrets")} with their values${

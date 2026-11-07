@@ -101,7 +101,7 @@ describe("duplicate", () => {
 
   it("summarises what was copied, never a value", () => {
     expect(copiedSummary(result)).toEqual([
-      "baseline rules and who may deploy",
+      "baseline rules and the projects that may use it",
       "1 project overlay",
       "1 privilege grant",
       "3 secrets with their values (api, web)",
@@ -490,7 +490,7 @@ describe("runSave", () => {
       },
     });
     expect(problem).toBe(
-      "Could not save the list of projects that may deploy: pattern list is empty. The display name and description saved.",
+      "Could not save the list of projects that may use it: pattern list is empty. The display name and description saved.",
     );
   });
 

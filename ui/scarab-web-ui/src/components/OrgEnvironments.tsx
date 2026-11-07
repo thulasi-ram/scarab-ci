@@ -108,9 +108,9 @@ export default function OrgEnvironments(props: { org: string }) {
             <p class="subtle">
               <small>
                 <Icon icon="rocket" size={12} /> An org environment is the place deploys
-                land in, shared by every repository that deploys there. It decides who may
-                deploy (eligibility) and under which rules (the baseline); each repository
-                can only tighten those for itself.
+                land in, shared by every repository that deploys there. It decides which
+                projects may use it (eligibility) and under which rules (the baseline); each
+                repository can only tighten those for itself.
               </small>
             </p>
           </Show>
@@ -169,7 +169,7 @@ function EnvironmentRow(props: { org: string; env: OrgEnvironment }) {
           <Icon icon="shield-check" size={12} />
           {isPermissive(env().protection) ? "no baseline rule" : rulesSummary(env().protection)}
         </span>
-        <span title="Eligibility: which projects may deploy here">
+        <span title="Eligibility: the projects that may use it">
           <Icon icon="user" size={12} />
           {eligibilityLabel(env().eligibility)}
         </span>

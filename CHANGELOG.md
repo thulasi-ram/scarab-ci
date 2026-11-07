@@ -242,6 +242,10 @@ record. Read Breaking changes before you upgrade.
   releases. `GET /v1/runs/{id}` gains `environment` (`name`, `display_name`) (git-bug cd43bf3,
   2b94989).
   [Environments](https://thulasi-ram.github.io/scarab-ci/usage/environments/#the-approval-gate)
+- **Environment page wording.** "Who may deploy" is now "Projects that may use <Environment>":
+  the list admits every Run that names the Environment, not only deploys. The "Projects" panel
+  is now "Project overlays and grants" (git-bug c2f97b4).
+  [Environments](https://thulasi-ram.github.io/scarab-ci/usage/environments/#view-and-edit-an-environment)
 - **Runs after another pipeline.** `on: upstream: { pipeline: ci }` starts a Run when a Run
   of `ci` in the same repository finishes (`status:` takes `succeeded`, the default, and
   `failed`). The follow-up builds the same commit and runs on the same ref, so an

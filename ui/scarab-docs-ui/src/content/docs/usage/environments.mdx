@@ -47,8 +47,8 @@ Org admins create Environments and edit their eligibility and rules, under the o
 ## View and edit an Environment
 
 Each Environment has a read-only page, `/orgs/<org>/settings/environments/<name>`: its display
-name, description, the baseline, which projects may deploy, and each project's overlay and
-privilege grant. Its **Edit** button opens `…/<name>/edit`, where you change the display name,
+name, description, the baseline, **Projects that may use** it, and, under **Project overlays and
+grants**, each project's overlay and privilege grant. Its **Edit** button opens `…/<name>/edit`, where you change the display name,
 the description, the baseline and eligibility (one **Save** sends only the parts you changed),
 each project's privilege grant, and delete the Environment. Deleting it, or withdrawing a grant,
 asks you to type the Environment's name.
@@ -67,7 +67,7 @@ change it at any time without a step-up.
 
 To move to another name, use **Duplicate** on the Environment's page. It asks for the new name and,
 optionally, a display name (blank uses the old one's with " (copy)" added), and needs a step-up
-every time, because it copies secrets and who may deploy. The new Environment gets:
+every time, because it copies secrets and the projects that may use it. The new Environment gets:
 
 - the baseline protection rules and eligibility;
 - every project's overlay and privilege grant;

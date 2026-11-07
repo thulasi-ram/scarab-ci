@@ -70,6 +70,9 @@ test("an environment opens read-only and its Edit button opens the edit screen",
   // The view: the record, and no way to change it from here.
   const view = page.locator("section.page");
   await expect(view.getByText("customer-facing, eu-west-1 + us-east-1")).toBeVisible();
+  await expect(view.getByText("projects that may use Production")).toBeVisible();
+  await expect(view.getByText("Project overlays and grants")).toBeVisible();
+  await expect(view.getByText(/who may deploy/i)).toHaveCount(0);
   await expect(view.getByRole("textbox")).toHaveCount(0);
   await expect(view.getByRole("checkbox")).toHaveCount(0);
   await expect(view.getByRole("button", { name: /delete|withdraw|grant|save/i })).toHaveCount(0);
@@ -103,6 +106,7 @@ test("an environment opens read-only and its Edit button opens the edit screen",
   await expect(edit.getByRole("textbox", { name: "Display name", exact: true })).toHaveValue("Production");
   await expect(edit.getByRole("textbox", { name: "Approvers", exact: true })).toHaveValue("ops-lead");
   await expect(edit.getByRole("checkbox", { name: /every project in acme/i })).toBeChecked();
+  await expect(edit.getByRole("heading", { name: /Projects that may use Production/ })).toBeVisible();
   // Nothing changed yet, so there is nothing to save.
   await expect(edit.getByRole("button", { name: "Save", exact: true })).toBeDisabled();
   await edit.getByRole("textbox", { name: "description", exact: true }).fill("customer-facing, eu-west-1");

@@ -689,7 +689,7 @@ function RepoEnvironments(props: {
           when={(envs()?.length ?? 0) > 0}
           fallback={
             <p class="empty">
-              This project may not deploy into any environment yet. Environments are
+              This project may not use any environment yet. Environments are
               org-level: an org admin creates one and makes {props.repo} eligible for it
               under Settings › Environments.
             </p>
@@ -972,11 +972,11 @@ function EnvDialog(props: {
             <p class="dlg-text">
               {envs.loading
                 ? "loading…"
-                : `${props.repo} may not deploy into any environment yet. An org admin makes it eligible under Settings › Environments.`}
+                : `${props.repo} may not use any environment yet. An org admin makes it eligible under Settings › Environments.`}
             </p>
           }
         >
-          <Field label="Environment" required help={`Environments ${props.repo} may deploy into.`}>
+          <Field label="Environment" required help={`Environments ${props.repo} may use.`}>
             <Select mono value={picked()} onValue={setPicked}>
               <option value="">environment…</option>
               <For each={choices()}>
