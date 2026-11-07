@@ -223,12 +223,16 @@ pub trait PolicyStore: Send + Sync {
     /// decision id and whether the Run's row was written; when it was not,
     /// the caller writes it next, as before. A store that also holds the
     /// Runs (Postgres) writes both; the default records the decision only.
+    ///
+    /// "Holds the Runs" means the same database the caller's Run store
+    /// reads. The server wires one Postgres for both; a caller that pairs
+    /// stores differently finds no row in its Run store and writes it there
+    /// (`persist_run_from_ir` checks), losing only the shared transaction.
     async fn record_run_create_decision(
         &self,
         record: &DecisionRecord,
-        run: &RunCreationRow,
+        _run: &RunCreationRow,
     ) -> Result<(String, bool), PolicyStoreError> {
-        let _ = run;
         Ok((self.record_decision(record).await?, false))
     }
 

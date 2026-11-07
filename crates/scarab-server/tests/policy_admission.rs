@@ -704,3 +704,126 @@ async fn postgres_a_decision_that_cannot_be_written_creates_no_run() {
     assert!(pg.list_runs(100).await.unwrap().is_empty());
     tdb.cleanup().await;
 }
+
+// ---------------------------------------------------------------------------
+// RED TEAM (PR #124, git-bug bbc433e) — attacks on the decision + Run-row
+// transaction.
+// ---------------------------------------------------------------------------
+
+fn rt_record(run: &str, id: &str) -> DecisionRecord {
+    use scarab_policy::evaluate::PolicyDecision;
+    DecisionRecord {
+        id: id.into(),
+        org: "acme".into(),
+        project: Some("web".into()),
+        run_id: Some(run.into()),
+        step_id: None,
+        attempt: None,
+        decision: PolicyDecision {
+            checkpoint: Checkpoint::RunCreate,
+            schema_version: 1,
+            input: json!({}),
+            policy_set_digest: "d".into(),
+            outcome: DecisionOutcome::Allow,
+            results: vec![],
+        },
+        at: 1,
+    }
+}
+
+/// A duplicate run id (upstream follow-ups have derived ids; a redelivery
+/// racing the first admission). The Run row exists already: the decision
+/// must not be left behind naming it a second time.
+#[tokio::test]
+async fn postgres_a_duplicate_run_id_leaves_no_second_decision() {
+    let Some(tdb) = common::fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let pg = Arc::new(scarab_db_postgres::PostgresDb::with_pool(tdb.pool.clone()));
+    pg.migrate().await.unwrap();
+    let run = RunId("01890000-0000-7000-8000-000000000001".into());
+    pg.begin_run_creation(&run, 2, 1, scarab_engine::Timestamp(1))
+        .await
+        .unwrap();
+    let row = scarab_policy::store::RunCreationRow {
+        run_id: run.0.clone(),
+        ir_version: 2,
+        event_schema_version: 1,
+        created_at: 1,
+    };
+    let err = pg
+        .record_run_create_decision(&rt_record(&run.0, "dec-2"), &row)
+        .await
+        .expect_err("the Run row exists");
+    eprintln!("duplicate run id error: {err}");
+    assert!(
+        pg.decision("dec-2").await.unwrap().is_none(),
+        "orphan decision"
+    );
+    tdb.cleanup().await;
+}
+
+/// An audit Policy on Postgres with a concurrency group: the Run row comes
+/// from the decision's transaction, so `persist_run_from_ir` skips
+/// `begin_run_creation`. The Run must still be fully created: steps, its
+/// concurrency group, and out of `creating`.
+#[tokio::test]
+async fn postgres_an_audit_run_with_a_concurrency_group_is_complete() {
+    let Some(tdb) = common::fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let pg = Arc::new(scarab_db_postgres::PostgresDb::with_pool(tdb.pool.clone()));
+    pg.migrate().await.unwrap();
+    add(pg.as_ref(), "pol-1", org(), deny_local_library("audit")).await;
+    let ci = CI_YAML.replace("steps:", "concurrency: { group: \"deploy-main\" }\nsteps:");
+    let outcome = push_with(pg.as_ref(), pg.as_ref(), &forge_with(&ci))
+        .await
+        .unwrap();
+    let run = &outcome.runs[0];
+    let steps = pg.steps_of_run(run).await.unwrap();
+    assert!(!steps.is_empty(), "no steps written");
+    assert_eq!(
+        pg.run_concurrency(run).await.unwrap().map(|(g, _)| g),
+        Some("acme/web:deploy-main".to_string())
+    );
+    let creating: bool = sqlx::query_scalar("SELECT creating FROM runs WHERE id = $1")
+        .bind(&run.0)
+        .fetch_one(&tdb.pool)
+        .await
+        .unwrap();
+    assert!(
+        !creating,
+        "the Run is left `creating`, invisible to the scheduler"
+    );
+    assert_eq!(pg.decisions_for_run(&run.0).await.unwrap().len(), 1);
+    tdb.cleanup().await;
+}
+
+/// The admission assumes "the store that holds the decision holds the Runs"
+/// whenever `record_run_create_decision` says it wrote the Run row. Wire a
+/// Postgres PolicyStore beside a different `Db` (here the in-memory one) and
+/// the Run row lands in the policy store's database while every other write
+/// of the Run goes to `db`, which never got its row.
+#[tokio::test]
+async fn a_policy_store_that_is_not_the_run_store_still_creates_the_run() {
+    let Some(tdb) = common::fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let pg = Arc::new(scarab_db_postgres::PostgresDb::with_pool(tdb.pool.clone()));
+    pg.migrate().await.unwrap();
+    add(pg.as_ref(), "pol-1", org(), deny_local_library("audit")).await;
+    let db = InMemoryDb::new();
+    let result = push_with(&db, pg.as_ref(), &forge()).await;
+    let in_db = db.list_runs(100).await.unwrap();
+    let in_pg = pg.list_runs(100).await.unwrap();
+    tdb.cleanup().await;
+    assert!(
+        matches!(&result, Ok(o) if o.runs.len() == 1) && in_db.len() == 1,
+        "result {result:?}; runs in db: {}; runs in the policy store's database: {}",
+        in_db.len(),
+        in_pg.len()
+    );
+}

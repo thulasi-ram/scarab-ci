@@ -6671,8 +6671,9 @@ async fn persist_run_from_ir(
     now: Timestamp,
 ) -> Result<(), TriggerError> {
     // The Run's first row may already be written, in its `run.create`
-    // decision's transaction (git-bug bbc433e).
-    if !run_row_written {
+    // decision's transaction (git-bug bbc433e). Written to a database this
+    // `db` does not read (stores paired differently), it is written here.
+    if !run_row_written || db.run_status(run).await?.is_none() {
         db.begin_run_creation(run, ir.ir_version, EVENT_VERSION, now)
             .await?;
     }
