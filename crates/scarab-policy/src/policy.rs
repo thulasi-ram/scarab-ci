@@ -57,10 +57,14 @@ impl Checkpoint {
         Checkpoint::ALL.into_iter().find(|c| c.as_str() == s)
     }
 
-    /// Whether the engine consults this checkpoint yet. Only `run.create` is
-    /// built; a Policy naming another is refused when saved.
+    /// Whether the engine consults this checkpoint. All three are built: a
+    /// Policy naming one that a later version adds would be refused when
+    /// saved.
     pub fn is_consulted(self) -> bool {
-        self == Checkpoint::RunCreate
+        matches!(
+            self,
+            Checkpoint::RunCreate | Checkpoint::GateResolve | Checkpoint::StepAdmit
+        )
     }
 
     /// Whether `effect` is allowed here (ADR-0075 §5): `run.create` and

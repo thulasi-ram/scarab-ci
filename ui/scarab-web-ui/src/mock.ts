@@ -49,6 +49,9 @@ const RICH_RUN_ID = "0190f8a2000071fb8c0099887766ccdd";
 // state — waiting, passed, failed with a reason. At
 // /acme/edge-gateway/runs/<id>.
 const GATES_RUN_ID = "0190f8a2000071fb8c00d3e9107a1616";
+// The ENVIRONMENT GATE run: a deploy into production with a plain QA gate
+// and the approval gate production added. /acme/scarab/runs/<id>.
+const ENV_GATE_RUN_ID = "0190f8a2000071fb8c00e7a9b0c1d2e3";
 
 // ── /v1/me ────────────────────────────────────────────────────────────────
 // An Owner of the one implicit org (ADR-0060), so the Settings gear renders.
@@ -575,19 +578,200 @@ const gatesEventsBody = [
   }),
 ].join("");
 
+// ── the ENVIRONMENT GATE run ────────────────────────────────────────────────
+//   build ✓ → qa (plain manual gate, waiting) → smoke
+//         ✓ → environment-approval (added by production, waiting) → ship (deploy)
+// Approving `qa` releases it. Approving `environment-approval` records the
+// approval and answers that the wait timer releases it in five minutes.
+const envGate = (id: string, approval: boolean, extra: Record<string, unknown> = {}) => ({
+  id,
+  status: "pending",
+  attempts: 1,
+  needs: ["build"],
+  gate: "manual",
+  ...(approval ? { environment_approval_gate: true } : {}),
+  attempt_list: [{ id: "a1", started_at: ago(3 * min), failed: false, outcome: "running" }],
+  ...extra,
+});
+const envGateRunStatus: RunStatusDto = {
+  id: ENV_GATE_RUN_ID,
+  status: "suspended",
+  run_number: 152,
+  pipeline: "deploy",
+  trigger_title: "Deploy 7c1e2d4 to production",
+  origin_pr_base: null,
+  params: {},
+  snapshot_retention: { retention_days: 14, expired: false, pinned: false },
+  environment: { name: "production", display_name: "Production" },
+  steps: [
+    {
+      id: "build",
+      status: "succeeded",
+      attempts: 1,
+      needs: [],
+      attempt_list: [{ id: "a1", started_at: ago(5 * min), failed: false, outcome: "succeeded" }],
+    },
+    envGate("qa", false),
+    { id: "smoke", status: "pending", attempts: 0, needs: ["qa"], attempt_list: [] },
+    envGate("environment-approval", true, {
+      origin: [{ kind: "environment", name: "production", content_hash: "" }],
+    }),
+    {
+      id: "ship",
+      status: "pending",
+      attempts: 0,
+      deploy: true,
+      needs: ["build", "environment-approval"],
+      attempt_list: [],
+    },
+  ],
+};
+const egv = sse(ENV_GATE_RUN_ID);
+const envGateEventsBody = [
+  egv(ago(5 * min + 5000), {
+    Raw: {
+      trigger: {
+        event: {
+          kind: "manual",
+          actor: "a.kim",
+          branch: "main",
+          ref: "refs/heads/main",
+          sha: "7c1e2d4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d",
+          repo: { owner: "acme", name: "scarab" },
+        },
+      },
+    },
+  }),
+  egv(ago(5 * min), { AttemptStarted: { step: "build", attempt: "a1" } }),
+  egv(ago(3 * min + 10000), { AttemptFinished: { step: "build", attempt: "a1" } }),
+  egv(ago(3 * min + 9000), { StepTransitioned: { step: "build", from: "running", to: "succeeded" } }),
+  ...["qa", "environment-approval"].map((g) =>
+    egv(ago(3 * min), { AttemptStarted: { step: g, attempt: "a1" } }),
+  ),
+].join("");
+
+// ── Org Policies — Settings › Policies. Two CEL Policies (one in audit
+// mode), one library list, one deleted Policy the page leaves out, and a
+// decision log the counts come from.
+const orgPolicy = (
+  id: string,
+  policy: Record<string, unknown>,
+  extra: { deleted?: boolean; version?: number } = {},
+) => ({
+  id,
+  level: "org",
+  org: "acme",
+  name: policy.name as string,
+  version: extra.version ?? 1,
+  policy,
+  content_hash: "9f2c".padEnd(64, "0"),
+  created_at: ago(30 * 24 * 60 * min),
+  updated_at: ago(2 * 24 * 60 * min),
+  deleted: extra.deleted ?? false,
+});
+const orgPolicies = [
+  orgPolicy(
+    "pol-1",
+    {
+      name: "no-friday-deploys",
+      checkpoint: "run.create",
+      match: { projects: [], except_projects: [], environments: ["production"], trigger_kinds: [] },
+      mode: "enforce",
+      rules: [{ when: "now.weekday == 5", effect: "deny", message: "No deploys to production on Fridays." }],
+    },
+    { version: 3 },
+  ),
+  orgPolicy("pol-2", {
+    name: "release-from-main",
+    checkpoint: "run.create",
+    match: { projects: ["web-*"], except_projects: ["web-legacy"], environments: [], trigger_kinds: [] },
+    mode: "audit",
+    rules: [{ when: "trigger.ref != 'refs/heads/main'", effect: "deny", message: "Release from main." }],
+  }),
+  orgPolicy("pol-3", {
+    name: "approved-libraries",
+    checkpoint: "run.create",
+    match: { projects: [], except_projects: [], environments: [], trigger_kinds: [] },
+    mode: "enforce",
+    setting: { libraries_allowed: { sources: ["github.com/thulasi-ram/*", "github.com/acme/*"] } },
+  }),
+  orgPolicy(
+    "pol-4",
+    {
+      name: "old-rule",
+      checkpoint: "run.create",
+      match: { projects: [], except_projects: [], environments: [], trigger_kinds: [] },
+      mode: "enforce",
+      rules: [{ when: "false", effect: "deny", message: "never" }],
+    },
+    { deleted: true, version: 2 },
+  ),
+];
+const policyResult = (policy_id: string, kind: string) => ({
+  policy_id,
+  version: 1,
+  name: policy_id,
+  level: "org",
+  mode: policy_id === "pol-2" ? "audit" : "enforce",
+  outcome: kind === "denied" || kind === "would_deny" ? { kind, messages: ["…"] } : { kind },
+});
+const policyDecision = (
+  id: string,
+  at: number,
+  project: string,
+  results: [string, string][],
+  denied?: string,
+) => ({
+  id,
+  org: "acme",
+  project,
+  run_id: denied ? null : `0190f8a2000071fb8c00${id.padStart(12, "0")}`,
+  step_id: null,
+  attempt: null,
+  at,
+  decision: {
+    checkpoint: "run.create",
+    schema_version: 1,
+    input: {},
+    policy_set_digest: "ab12".padEnd(64, "0"),
+    results: results.map(([p, k]) => policyResult(p, k)),
+    outcome: denied ? { kind: "deny", messages: [denied] } : { kind: "allow" },
+  },
+});
+const policyDecisions = [
+  policyDecision("d4", ago(20 * min), "web-app", [["pol-1", "not_matched"], ["pol-2", "would_deny"], ["pol-3", "passed"]]),
+  policyDecision(
+    "d3",
+    ago(2 * 60 * min),
+    "scarab",
+    [["pol-1", "denied"], ["pol-2", "not_matched"], ["pol-3", "passed"]],
+    "no-friday-deploys: No deploys to production on Fridays.",
+  ),
+  policyDecision("d2", ago(26 * 60 * min), "web-app", [["pol-1", "passed"], ["pol-2", "passed"], ["pol-3", "passed"]]),
+  policyDecision("d1", ago(50 * 60 * min), "scarab", [["pol-1", "passed"], ["pol-2", "not_matched"], ["pol-3", "passed"]]),
+];
+
 // ── Org-level Environments (ADR-0071) — Settings › Environments. production
-// has a baseline; qa still has the permissive one. Writes echo back and
-// persist nothing.
+// has a baseline and a display name; qa still has the permissive one and shows
+// its name. Writes echo back and persist nothing, except a duplicate, which is
+// kept for the page load.
 const orgEnvironments: OrgEnvironmentDto[] = [
   {
     org: "acme",
     name: "production",
+    display_name: "Production",
     description: "customer-facing, eu-west-1 + us-east-1",
     protection: {
       approvers: ["ops-lead"],
       allowed_refs: ["refs/heads/main"],
       wait_timer_s: 0,
       require_reason: false,
+      // The gate it adds to a pipeline that wrote none fails after a day.
+      approval_gate: {
+        missing_gate_mode: "add",
+        added_gate_expiry_s: 86400,
+        max_approval_age_s: 86400,
+      },
     },
     eligibility: { all_projects: true, projects: [] },
     created_at: ago(40 * 24 * 60 * min),
@@ -597,6 +781,7 @@ const orgEnvironments: OrgEnvironmentDto[] = [
   {
     org: "acme",
     name: "qa",
+    display_name: null,
     description: "",
     // Still the permissive baseline the migration gave it — the report flags it.
     protection: {
@@ -608,6 +793,24 @@ const orgEnvironments: OrgEnvironmentDto[] = [
     eligibility: { all_projects: false, projects: ["scarab", "web-*"] },
     created_at: ago(2 * 60 * min),
     updated_at: ago(2 * 60 * min),
+    updated_by: "j.lee",
+  },
+  {
+    // A wait timer saved before the timer needed approvers: it does nothing,
+    // and its pages say so.
+    org: "acme",
+    name: "staging",
+    display_name: "Staging",
+    description: "pre-release checks, eu-west-1",
+    protection: {
+      approvers: [],
+      allowed_refs: [],
+      wait_timer_s: 600,
+      require_reason: false,
+    },
+    eligibility: { all_projects: false, projects: ["web-*"] },
+    created_at: ago(20 * 24 * 60 * min),
+    updated_at: ago(20 * 24 * 60 * min),
     updated_by: "j.lee",
   },
 ];
@@ -650,6 +853,7 @@ function effectiveOf(env: OrgEnvironmentDto, overlay: OverlayDto | undefined) {
     allowed_ref_layers: overlay ? [b.allowed_refs, overlay.allowed_refs] : [b.allowed_refs],
     wait_timer_s: Math.max(b.wait_timer_s, overlay?.wait_timer_s ?? 0),
     require_reason: b.require_reason || (overlay?.require_reason ?? false),
+    approval_gate: b.approval_gate ?? { missing_gate_mode: "add" as const, max_approval_age_s: 86400 },
   };
 }
 
@@ -667,6 +871,7 @@ function projectEnvironments(project: string): ProjectEnvironmentDto[] {
       const overlay = overlays[env.name]?.[project];
       return {
         name: env.name,
+        display_name: env.display_name ?? null,
         eligible: eligible(env, project),
         baseline: env.protection,
         overlay: overlay ?? null,
@@ -1483,17 +1688,66 @@ function route(pathname: string, search: string, method: string, body = ""): Res
 
   // Org-level Environments (ADR-0071): list, one, and echoing writes.
   if (/^\/v1\/orgs\/[^/]+\/environments$/.test(p)) return json(orgEnvironments);
+  if (/^\/v1\/orgs\/[^/]+\/policies$/.test(p) && method === "GET") return json(orgPolicies);
+  if (/^\/v1\/orgs\/[^/]+\/policy-decisions$/.test(p)) return json({ decisions: policyDecisions, next: null });
+  // Duplicate: the copy is kept for this page load, so "Open" lands on it.
+  if ((m = p.match(/^\/v1\/orgs\/([^/]+)\/environments\/([^/]+)\/duplicate$/)) && method === "POST") {
+    const old = decodeURIComponent(m[2]!);
+    const source = orgEnvironments.find((e) => e.name === old);
+    if (!source) return new Response("not found", { status: 404 });
+    const req = JSON.parse(body || "{}") as { name?: string; display_name?: string };
+    const name = req.name ?? "";
+    if (orgEnvironments.some((e) => e.name === name)) {
+      return new Response(`org \`acme\` already has an environment \`${name}\``, { status: 409 });
+    }
+    const copy: OrgEnvironmentDto = {
+      ...source,
+      name,
+      display_name: req.display_name?.trim() || `${source.display_name || source.name} (copy)`,
+      created_at: now,
+      updated_at: now,
+      updated_by: "a.kim",
+    };
+    orgEnvironments.push(copy);
+    overlays[name] = { ...(overlays[old] ?? {}) };
+    grants[name] = { ...(grants[old] ?? {}) };
+    return json(
+      {
+        environment: copy,
+        copied: {
+          overlays: Object.keys(overlays[old] ?? {}).sort(),
+          privilege_grants: Object.keys(grants[old] ?? {}).sort(),
+          secrets: [{ project: "scarab", keys: ["DATABASE_URL", "DEPLOY_TOKEN"] }],
+        },
+        not_copied: {
+          policies: [
+            { id: "pol-1", name: "no-friday-deploys", project: null, environments: [old] },
+          ],
+          projects_with_runs: ["scarab", "web-app"],
+          old_oidc_subject: `scarab:org/acme/repo/*/env/${old}/ref/*`,
+          new_oidc_subject: `scarab:org/acme/repo/*/env/${name}/ref/*`,
+          notes: [
+            `Run and approval history and the Cache stay with ${old}, which is not changed and stays until an admin deletes it.`,
+          ],
+        },
+      },
+      { status: 201 },
+    );
+  }
   if ((m = p.match(/^\/v1\/orgs\/([^/]+)\/environments\/([^/]+)$/))) {
     const name = decodeURIComponent(m[2]!);
     const found = orgEnvironments.find((e) => e.name === name);
     if (method === "DELETE") return new Response(null, { status: found ? 204 : 404 });
     if (method === "PUT") {
-      // The body is not visible here; echo the stored record (or a fresh one).
+      // Echo the stored record (or a fresh one) with the body's display name
+      // and description; nothing is stored.
+      const req = JSON.parse(body || "{}") as { display_name?: string | null; description?: string };
+      const written = { display_name: req.display_name ?? null, description: req.description ?? "" };
       return json(
-        found ?? {
+        found ? { ...found, ...written } : {
           org: decodeURIComponent(m[1]!),
           name,
-          description: "",
+          ...written,
           // A new Environment: permissive baseline, no eligible project.
           protection: {
             approvers: [],
@@ -1516,7 +1770,27 @@ function route(pathname: string, search: string, method: string, body = ""): Res
     const env = orgEnvironments.find((e) => e.name === decodeURIComponent(m![1]!));
     if (!env) return new Response("not found", { status: 404 });
     if (m[2] === "projects") return json(environmentProjects(env));
-    if (m[2] === "protection") return json(method === "PUT" ? env : env.protection);
+    if (m[2] === "protection") {
+      if (method !== "PUT") return json(env.protection);
+      // The baseline PUT replaces it whole: keep it for the page load, so
+      // the view after a Save shows what was sent.
+      const req = JSON.parse(body || "{}") as Record<string, unknown>;
+      const num = (k: string) => (typeof req[k] === "number" ? (req[k] as number) : null);
+      env.protection = {
+        approvers: (req.approvers as string[] | undefined) ?? [],
+        allowed_refs: (req.allowed_refs as string[] | undefined) ?? [],
+        wait_timer_s: num("wait_timer_s") ?? 0,
+        require_reason: req.require_reason === true,
+        approval_gate: {
+          missing_gate_mode: req.missing_gate_mode === "refuse" ? "refuse" : "add",
+          added_gate_expiry_s: num("added_gate_expiry_s"),
+          required_approvals: num("required_approvals"),
+          max_approval_age_s: num("max_approval_age_s") ?? 86400,
+        },
+      };
+      env.updated_at = now;
+      return json(env);
+    }
     return json(env.eligibility);
   }
   if (
@@ -1679,6 +1953,30 @@ function route(pathname: string, search: string, method: string, body = ""): Res
     });
   if (p === `/v1/runs/${GATES_RUN_ID}/artifacts`) return json([]);
   if (p === `/v1/runs/${GATES_RUN_ID}/services`) return json([]);
+  // the ENVIRONMENT GATE run
+  if (p === `/v1/runs/${ENV_GATE_RUN_ID}`) return json(envGateRunStatus);
+  if (p === `/v1/runs/${ENV_GATE_RUN_ID}/events`)
+    return new Response(envGateEventsBody, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  if (p === `/v1/runs/${ENV_GATE_RUN_ID}/artifacts`) return json([]);
+  if (p === `/v1/runs/${ENV_GATE_RUN_ID}/services`) return json([]);
+  if (method === "POST" && (m = p.match(/^\/v1\/runs\/([^/]+)\/gates\/([^/]+)\/approve$/))) {
+    const step = envGateRunStatus.steps.find((s) => s.id === decodeURIComponent(m![2]!));
+    if (m[1] !== ENV_GATE_RUN_ID || !step) return json({ released: true }, { status: 202 });
+    if (!step.environment_approval_gate) {
+      // A plain gate: the first approval by anyone with write releases it.
+      step.status = "succeeded";
+      return json({ released: true, approvals: ["a.kim"] }, { status: 202 });
+    }
+    // The approvals are in; the wait timer releases the gate later.
+    step.approval_release_at = Date.now() + 5 * min;
+    return json(
+      { released: false, approvals: ["a.kim"], releases_at: step.approval_release_at },
+      { status: 202 },
+    );
+  }
   // Reject a gate (ADR-0070 §9): the fixture is static, so it only answers.
   if (method === "POST" && /^\/v1\/runs\/[^/]+\/gates\/[^/]+\/reject$/.test(p)) {
     return json({ rejected: true }, { status: 202 });

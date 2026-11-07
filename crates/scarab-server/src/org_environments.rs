@@ -28,11 +28,15 @@ use axum::{Extension, Json};
 use scarab_engine::DbError;
 use scarab_identity::Action;
 use scarab_project::{
+    duplicate_display_name, normalize_display_name, validate_org_environment_display_name,
+    validate_org_environment_name,
+};
+use scarab_project::{
     eligibility_loosenings, overlay_loosenings, privilege_grant_loosenings, protection_loosenings,
     DeployGovernance, EffectiveProtection, EnvironmentGovernanceStore, EnvironmentMigrationReport,
     EnvironmentMigrationReportProject, EnvironmentProjectEligibility, EnvironmentProjectOverlay,
     EnvironmentProjectPrivilegeGrant, EnvironmentProjectRecord, EnvironmentProtectionRules,
-    ImageGrant, Loosening, OrgEnvironment, OrgEnvironmentError, ProtectionRules,
+    ImageGrant, Loosening, MissingGateMode, OrgEnvironment, OrgEnvironmentError, ProtectionRules,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -44,7 +48,10 @@ use crate::step_up::GuardCtx;
 #[derive(Debug, Serialize, ToSchema)]
 pub struct OrgEnvironmentDto {
     pub org: String,
+    /// The key pipeline YAML and the OIDC subject use. Fixed once created.
     pub name: String,
+    /// What people see in place of the name; `null` shows the name.
+    pub display_name: Option<String>,
     pub description: String,
     /// The baseline every Project's Deploy Runs obey. Read-only here:
     /// written through `…/protection`, never by the whole-Environment PUT.
@@ -65,6 +72,7 @@ impl From<&OrgEnvironment> for OrgEnvironmentDto {
         Self {
             org: e.org.clone(),
             name: e.name.clone(),
+            display_name: e.display_name.clone(),
             description: e.description.clone(),
             protection: (&e.protection).into(),
             eligibility: (&e.eligibility).into(),
@@ -83,6 +91,11 @@ impl From<&OrgEnvironment> for OrgEnvironmentDto {
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PutOrgEnvironmentRequest {
+    /// What people see in place of the name. Omitted, empty or blank shows
+    /// the name. Changing it never needs a step-up: the name, which pipelines
+    /// and cloud trust policies refer to, stays.
+    #[serde(default)]
+    pub display_name: Option<String>,
     /// Free text; omitted = empty.
     #[serde(default)]
     pub description: Option<String>,
@@ -92,23 +105,105 @@ pub struct PutOrgEnvironmentRequest {
 /// Project's overlay (ADR-0071 §1, §3).
 #[derive(Debug, Serialize, ToSchema)]
 pub struct EnvironmentProtectionRulesDto {
-    /// Principal ids; every one must approve (AND).
+    /// Principal ids. Every one must approve (AND), unless the baseline's
+    /// `approval_gate.required_approvals` says how many of its own must.
     pub approvers: Vec<String>,
     /// Ref globs a deploy's symbolic ref must match; empty = any ref.
     pub allowed_refs: Vec<String>,
-    /// Seconds. Carried and merged, not yet enforced (git-bug 2b94989).
+    /// Seconds: a minimum wait on the Environment approval gate, counted on
+    /// the gate's wait clock (ADR-0078 §4). It does nothing where the
+    /// effective approvers are empty; a client shows that from `approvers`
+    /// (here, or `effective.approvers` for a Project).
     pub wait_timer_s: u32,
     /// A human dispatch must carry a reason (ADR-0057 §3).
     pub require_reason: bool,
+    /// The Environment approval gate's settings (ADR-0078 §3). Present on a
+    /// baseline only: an overlay has none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_gate: Option<ApprovalGateRulesDto>,
 }
 
 impl From<&EnvironmentProtectionRules> for EnvironmentProtectionRulesDto {
+    /// A baseline's rules, approval gate settings included.
     fn from(r: &EnvironmentProtectionRules) -> Self {
+        Self {
+            approval_gate: Some((&r.approval_gate).into()),
+            ..Self::overlay(r)
+        }
+    }
+}
+
+impl EnvironmentProtectionRulesDto {
+    /// An overlay's rules: the four it has, no approval gate settings.
+    pub(crate) fn overlay(r: &EnvironmentProtectionRules) -> Self {
         Self {
             approvers: r.approvers.clone(),
             allowed_refs: r.allowed_refs.clone(),
             wait_timer_s: r.wait_timer_s,
             require_reason: r.require_reason,
+            approval_gate: None,
+        }
+    }
+}
+
+/// What Run creation does when a Step that uses the Environment's authority
+/// has no `manual` gate upstream (ADR-0078 §3).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MissingGateModeDto {
+    /// Add one Environment approval gate in front of those Steps.
+    #[default]
+    Add,
+    /// Refuse the Run, naming the Steps and the YAML to add.
+    Refuse,
+}
+
+impl From<MissingGateMode> for MissingGateModeDto {
+    fn from(m: MissingGateMode) -> Self {
+        match m {
+            MissingGateMode::Add => Self::Add,
+            MissingGateMode::Refuse => Self::Refuse,
+        }
+    }
+}
+
+impl From<MissingGateModeDto> for MissingGateMode {
+    fn from(m: MissingGateModeDto) -> Self {
+        match m {
+            MissingGateModeDto::Add => Self::Add,
+            MissingGateModeDto::Refuse => Self::Refuse,
+        }
+    }
+}
+
+/// An Environment's settings for its Environment approval gate (ADR-0078
+/// §3): the `manual` gate that has a Step using the Environment's
+/// authority after it.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ApprovalGateRulesDto {
+    /// `add` (default) or `refuse`.
+    pub missing_gate_mode: MissingGateModeDto,
+    /// Seconds before the gate the Environment adds expires; absent = it
+    /// waits until approved or rejected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub added_gate_expiry_s: Option<u32>,
+    /// How many of the baseline's approvers must approve; absent = every
+    /// one. A Project overlay's approvers are each required as well.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required_approvals: Option<u32>,
+    /// Seconds an approval stays good for: a Step that uses the
+    /// Environment's authority is refused at launch once its approval gate
+    /// released longer ago than this. Default 86400 (24 hours).
+    pub max_approval_age_s: u32,
+}
+
+impl From<&scarab_project::ApprovalGateRules> for ApprovalGateRulesDto {
+    fn from(r: &scarab_project::ApprovalGateRules) -> Self {
+        Self {
+            missing_gate_mode: r.missing_gate.into(),
+            added_gate_expiry_s: r.added_gate_expiry_s,
+            required_approvals: r.required_approvals,
+            max_approval_age_s: r.max_approval_age_s,
         }
     }
 }
@@ -124,8 +219,12 @@ pub struct EffectiveProtectionDto {
     /// **every** non-empty layer. Never pre-intersected — `[main]` and
     /// `[tags/*]` intersect to `[]`, which would read as "any ref".
     pub allowed_ref_layers: Vec<Vec<String>>,
+    /// The longer of the two layers' wait timers. It does nothing when
+    /// `approvers` is empty.
     pub wait_timer_s: u32,
     pub require_reason: bool,
+    /// The baseline's approval gate settings.
+    pub approval_gate: ApprovalGateRulesDto,
 }
 
 impl From<&EffectiveProtection> for EffectiveProtectionDto {
@@ -135,6 +234,7 @@ impl From<&EffectiveProtection> for EffectiveProtectionDto {
             allowed_ref_layers: e.allowed_refs.layers().to_vec(),
             wait_timer_s: e.wait_timer_s,
             require_reason: e.require_reason,
+            approval_gate: (&e.approval_gate).into(),
         }
     }
 }
@@ -186,6 +286,8 @@ impl From<&EnvironmentProjectPrivilegeGrant> for EnvironmentProjectPrivilegeGran
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ProjectEnvironmentDto {
     pub name: String,
+    /// What people see in place of the name; `null` shows the name.
+    pub display_name: Option<String>,
     /// Whether this Project may deploy here now (EnvironmentProjectEligibility).
     /// `false` only for an Environment the Project still holds an overlay or
     /// grant in after an admin made it ineligible.
@@ -204,9 +306,13 @@ impl From<&DeployGovernance> for ProjectEnvironmentDto {
     fn from(g: &DeployGovernance) -> Self {
         Self {
             name: g.environment.name.clone(),
+            display_name: g.environment.display_name.clone(),
             eligible: g.eligible,
             baseline: (&g.environment.protection).into(),
-            overlay: g.overlay.as_ref().map(|o| (&o.rules).into()),
+            overlay: g
+                .overlay
+                .as_ref()
+                .map(|o| EnvironmentProtectionRulesDto::overlay(&o.rules)),
             effective: (&g.effective_protection()).into(),
             privilege_grant: g.privilege_grant.as_ref().map(Into::into),
         }
@@ -284,8 +390,15 @@ pub(crate) async fn get_org_environment(
     Ok(Json((&environment).into()))
 }
 
-/// Create or replace an Environment: its description. Administer on the Org
+/// Create or replace an Environment: its display name and description.
+/// Administer on the Org
 /// (ADR-0071 §7: org admins administer Environments).
+///
+/// A create takes the same claim on the name a Duplicate holds, and is
+/// refused (409) while a Duplicate to that name is in progress: that
+/// Duplicate has checked the name is free and may be writing secrets under
+/// it, and its cleanup deletes what it wrote by name. A replace of an
+/// existing Environment takes no claim.
 #[utoipa::path(
     put,
     path = "/v1/orgs/{org}/environments/{env}",
@@ -297,9 +410,10 @@ pub(crate) async fn get_org_environment(
     summary = "Create or replace an org Environment (ADR-0071)",
     responses(
         (status = 200, body = OrgEnvironmentDto),
-        (status = 400, description = "invalid name or description, or an unknown field"),
+        (status = 400, description = "invalid name, display name or description, or an unknown field"),
         (status = 403, description = "not an org admin"),
-        (status = 404, description = "org Environments not configured")
+        (status = 404, description = "org Environments not configured"),
+        (status = 409, description = "a create while a duplicate to the name is in progress")
     )
 )]
 pub(crate) async fn put_org_environment(
@@ -315,6 +429,7 @@ pub(crate) async fn put_org_environment(
     let environment = OrgEnvironment {
         org,
         name: env,
+        display_name: normalize_display_name(body.display_name.as_deref()),
         description: body.description.unwrap_or_default(),
         // Ignored by the store (it keeps or defaults the stored ones): the
         // baseline and the eligibility have their own writes, ADR-0071 §1-2.
@@ -326,6 +441,30 @@ pub(crate) async fn put_org_environment(
         updated_by: principal.subject,
     };
     environment.validate().map_err(org_environment_api_error)?;
+    // Held to the end of this function, through the write. Only a create
+    // claims: a Duplicate never writes under a name that exists.
+    let _claim = match st.environment_governance.as_deref() {
+        Some(governance)
+            if store
+                .get_org_environment(&environment.org, &environment.name)
+                .await
+                .map_err(org_environment_api_error)?
+                .is_none() =>
+        {
+            let Some(claim) = governance
+                .claim_environment_name(&environment.org, &environment.name)
+                .await
+                .map_err(org_environment_api_error)?
+            else {
+                return Err(ApiError::Conflict(format!(
+                    "a duplicate to environment `{}` is in progress; retry when it has finished",
+                    environment.name
+                )));
+            };
+            Some(claim)
+        }
+        _ => None,
+    };
     crate::note_org(&st, &environment.org).await?;
     let stored = store
         .put_org_environment(&environment)
@@ -370,6 +509,380 @@ pub(crate) async fn delete_org_environment(
     } else {
         Err(ApiError::NotFound)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Duplicate (git-bug d002a0c).
+// ---------------------------------------------------------------------------
+
+/// `POST /v1/orgs/{org}/environments/{env}/duplicate`: the new
+/// Environment's name and, optionally, its display name.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DuplicateOrgEnvironmentRequest {
+    /// The new Environment's name: the key its pipelines will name. The
+    /// name rule of a created Environment applies.
+    pub name: String,
+    /// Omitted, empty or blank: what the old Environment shows, plus
+    /// " (copy)".
+    #[serde(default)]
+    pub display_name: Option<String>,
+}
+
+/// One Project's secrets the duplicate copied, by key. Never a value.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DuplicatedSecretsDto {
+    pub project: String,
+    pub keys: Vec<String>,
+}
+
+/// What a duplicate copied.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DuplicateCopiedDto {
+    /// Projects whose overlay was copied.
+    pub overlays: Vec<String>,
+    /// Projects whose privilege grant was copied.
+    pub privilege_grants: Vec<String>,
+    /// The EnvironmentProjectSecretScope secrets copied, with their values.
+    pub secrets: Vec<DuplicatedSecretsDto>,
+}
+
+/// A Policy a duplicate did not change: its `match.environments` selects
+/// the old Environment and none of its patterns selects the new one.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DuplicatePolicyDto {
+    pub id: String,
+    pub name: String,
+    /// The Project it is attached to; `null` for an org Policy.
+    pub project: Option<String>,
+    /// Its `match.environments`.
+    pub environments: Vec<String>,
+}
+
+/// What a duplicate left for an admin to do by hand.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DuplicateNotCopiedDto {
+    /// Policies that apply to the old Environment and not to the new one.
+    pub policies: Vec<DuplicatePolicyDto>,
+    /// Projects whose Runs named the old Environment (from Run history):
+    /// their Pipeline YAML names it, and runs in the new one only once it is
+    /// changed.
+    pub projects_with_runs: Vec<String>,
+    /// The OIDC subject a Run in the old Environment presents
+    /// (`*` for the repository and the ref).
+    pub old_oidc_subject: String,
+    /// The same for the new Environment: a cloud trust policy matching
+    /// `old_oidc_subject` must also match this one before a Run here can
+    /// assume its role.
+    pub new_oidc_subject: String,
+    /// Other things the copy does not carry, one sentence each.
+    pub notes: Vec<String>,
+}
+
+/// The answer to a duplicate: the new Environment, what was copied and the
+/// checklist of what was not.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DuplicateOrgEnvironmentResponse {
+    pub environment: OrgEnvironmentDto,
+    pub copied: DuplicateCopiedDto,
+    pub not_copied: DuplicateNotCopiedDto,
+}
+
+/// The OIDC subject pattern of an Environment's Runs: every repository and
+/// every ref (`scarab:org/<org>/repo/<repo>/env/<env>/ref/<ref>`).
+fn oidc_subject_pattern(org: &str, env: &str) -> String {
+    format!("scarab:org/{org}/repo/*/env/{env}/ref/*")
+}
+
+/// Whether a Duplicate copies the secrets of a scope. The match lists every
+/// [`scarab_secrets::SecretScope`], so a new scope (an org-wide Environment
+/// scope, say) does not compile here until someone decides whether a
+/// Duplicate copies it, and [`environment_secrets`] reads it.
+fn copied_by_duplicate(scope: &scarab_secrets::SecretScope) -> bool {
+    match scope {
+        scarab_secrets::SecretScope::EnvironmentProject { .. } => true,
+        scarab_secrets::SecretScope::Org { .. } | scarab_secrets::SecretScope::Repo { .. } => false,
+    }
+}
+
+/// Every secret in `env`'s EnvironmentProjectSecretScopes, value included,
+/// by Project and key.
+async fn environment_secrets(
+    secrets: &dyn scarab_secrets::SecretProvider,
+    org: &str,
+    env: &str,
+) -> Result<Vec<(String, scarab_secrets::Secret)>, ApiError> {
+    let mut out = Vec::new();
+    for project in secrets
+        .environment_secret_projects(org, env)
+        .await
+        .map_err(crate::secret_err)?
+    {
+        let scope = scarab_secrets::SecretScope::EnvironmentProject {
+            org: org.to_string(),
+            project: project.clone(),
+            environment: env.to_string(),
+        };
+        debug_assert!(copied_by_duplicate(&scope));
+        let mut keys = secrets
+            .list_scoped(&scope)
+            .await
+            .map_err(crate::secret_err)?;
+        keys.sort();
+        for key in keys {
+            let secret = secrets.get(&scope, &key).await.map_err(crate::secret_err)?;
+            out.push((project.clone(), secret));
+        }
+    }
+    Ok(out)
+}
+
+/// Delete what a failed duplicate wrote to the secret store. Best effort:
+/// a key that cannot be deleted is logged by name, never by value.
+async fn remove_copied_secrets(
+    secrets: &dyn scarab_secrets::SecretProvider,
+    written: &[scarab_secrets::SecretScope],
+    keys: &[String],
+) {
+    for (scope, key) in written.iter().zip(keys) {
+        if let Err(e) = secrets.delete(scope, key).await {
+            tracing::error!(
+                scope = ?scope,
+                key = %key,
+                "duplicate environment: could not remove a copied secret after a failure: {e}"
+            );
+        }
+    }
+}
+
+/// Create a new Environment as a copy of `env`: its description, baseline
+/// protection rules, eligibility, every Project's overlay and privilege
+/// grant, and its EnvironmentProjectSecretScope secrets with their values.
+/// Administer on the Org, and a step-up (an open window is enough): it
+/// copies secrets and who may deploy.
+///
+/// Not copied, and listed in the answer: Policies that select the old
+/// Environment and not the new one, the Projects whose Pipelines name the
+/// old one (from Run history), and the OIDC subject cloud trust policies
+/// match. Run and approval history and the Cache stay with the old
+/// Environment, which is not changed.
+///
+/// The secret store is a separate store from the Environment's, so the two
+/// cannot share a transaction. The secrets are copied first; the
+/// Environment, its eligibility, overlays and grants are then created in
+/// one transaction. If either step fails, the copied secrets are deleted, so
+/// no partial Environment is left. A crash between the two leaves only
+/// secrets under a name no Environment has, which no Run can resolve and
+/// which a retry refuses (409) until an admin deletes them. The new name is
+/// claimed throughout: a second Duplicate to it is refused (409) before it
+/// writes anything, and so is a create of it by the Environment PUT, so no
+/// other Environment takes the name while this one's secrets are written.
+#[utoipa::path(
+    post,
+    path = "/v1/orgs/{org}/environments/{env}/duplicate",
+    params(
+        ("org" = String, Path, description = "org"),
+        ("env" = String, Path, description = "the environment to copy")
+    ),
+    request_body = DuplicateOrgEnvironmentRequest,
+    summary = "Duplicate an org Environment, its rules, eligibility, overlays, grants and secrets",
+    responses(
+        (status = 201, body = DuplicateOrgEnvironmentResponse),
+        (status = 400, description = "invalid name or display name, or an unknown field"),
+        (status = 403, description = "not an org admin, or no step-up"),
+        (status = 404, description = "no such Environment, or not configured"),
+        (status = 409, description = "the new name is taken, secrets already exist under it, or another duplicate to it or a create of it is in progress")
+    )
+)]
+pub(crate) async fn duplicate_org_environment(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((org, env)): Path<(String, String)>,
+    Json(body): Json<DuplicateOrgEnvironmentRequest>,
+) -> Result<(StatusCode, Json<DuplicateOrgEnvironmentResponse>), ApiError> {
+    let scope = rbac_scope(&org, None);
+    let principal = authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
+    let store = governance_store(&st)?;
+    let new_name = body.name;
+    validate_org_environment_name(&new_name).map_err(org_environment_api_error)?;
+    let source = stored_environment(store, &org, &env).await?;
+    let display_name = match normalize_display_name(body.display_name.as_deref()) {
+        Some(d) => d,
+        None => duplicate_display_name(&source),
+    };
+    validate_org_environment_display_name(&display_name).map_err(org_environment_api_error)?;
+    // Held to the end of this function: from the checks below through the
+    // secret writes, the Environment's transaction and any cleanup. A second
+    // Duplicate to the same name is refused here, before it writes anything,
+    // and a create of the name by the PUT is refused while this is held, so
+    // the cleanup never deletes secrets another Environment of the name
+    // holds.
+    let Some(_claim) = store
+        .claim_environment_name(&org, &new_name)
+        .await
+        .map_err(org_environment_api_error)?
+    else {
+        return Err(ApiError::Conflict(format!(
+            "another duplicate to environment `{new_name}`, or a create of it, is in progress"
+        )));
+    };
+    if store
+        .org_environment(&org, &new_name)
+        .await
+        .map_err(org_environment_api_error)?
+        .is_some()
+    {
+        return Err(org_environment_api_error(
+            OrgEnvironmentError::already_exists(&org, &new_name),
+        ));
+    }
+
+    // Every read happens before the first write, so a failed read changes
+    // nothing.
+    let projects = store
+        .environment_projects(&org, &env)
+        .await
+        .map_err(org_environment_api_error)?;
+    let to_copy = match st.secrets.as_deref() {
+        Some(secrets) => {
+            let left = secrets
+                .environment_secret_projects(&org, &new_name)
+                .await
+                .map_err(crate::secret_err)?;
+            if !left.is_empty() {
+                return Err(ApiError::Conflict(format!(
+                    "secrets for environment `{new_name}` already exist (projects: {}), left \
+                     from an earlier environment of that name; delete them first",
+                    left.join(", ")
+                )));
+            }
+            environment_secrets(secrets, &org, &env).await?
+        }
+        None => Vec::new(),
+    };
+    let policies = match st.policies.as_deref() {
+        Some(policies) => policies
+            .list_in_org(&org)
+            .await
+            .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?
+            .into_iter()
+            .filter(|p| {
+                let envs = &p.body.match_.environments;
+                let selects = |name: &str| {
+                    envs.iter()
+                        .any(|g| scarab_policy::policy::glob_matches(g, name))
+                };
+                selects(&env) && !selects(&new_name)
+            })
+            .map(|p| DuplicatePolicyDto {
+                project: p.scope.project().map(str::to_string),
+                environments: p.body.match_.environments.clone(),
+                id: p.id,
+                name: p.name,
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    let projects_with_runs = st.db.projects_with_runs_in(&org, &env).await?;
+
+    // The secrets first (a separate store), then the Environment in one
+    // transaction; either failing removes the copied secrets.
+    let mut written_scopes = Vec::with_capacity(to_copy.len());
+    let mut written_keys = Vec::with_capacity(to_copy.len());
+    if let Some(secrets) = st.secrets.as_deref() {
+        for (project, secret) in &to_copy {
+            let scope = scarab_secrets::SecretScope::EnvironmentProject {
+                org: org.clone(),
+                project: project.clone(),
+                environment: new_name.clone(),
+            };
+            let key = secret.key.clone();
+            if let Err(e) = secrets.put(&scope, secret.clone()).await {
+                remove_copied_secrets(secrets, &written_scopes, &written_keys).await;
+                return Err(crate::secret_err(e));
+            }
+            written_scopes.push(scope);
+            written_keys.push(key);
+        }
+    }
+    let now = st.clock.now().await.0;
+    let created = match store
+        .duplicate_environment(
+            &org,
+            &env,
+            &new_name,
+            Some(&display_name),
+            &principal.subject,
+            now,
+        )
+        .await
+    {
+        Ok(created) => created,
+        Err(e) => {
+            if let Some(secrets) = st.secrets.as_deref() {
+                remove_copied_secrets(secrets, &written_scopes, &written_keys).await;
+            }
+            return Err(org_environment_api_error(e));
+        }
+    };
+    tracing::info!(
+        org = %org,
+        from = %env,
+        to = %new_name,
+        by = %principal.subject,
+        secrets = to_copy.len(),
+        "environment duplicated"
+    );
+
+    let mut secrets_by_project: Vec<DuplicatedSecretsDto> = Vec::new();
+    for (project, secret) in &to_copy {
+        match secrets_by_project.last_mut() {
+            Some(last) if &last.project == project => last.keys.push(secret.key.clone()),
+            _ => secrets_by_project.push(DuplicatedSecretsDto {
+                project: project.clone(),
+                keys: vec![secret.key.clone()],
+            }),
+        }
+    }
+    let copied = DuplicateCopiedDto {
+        overlays: projects
+            .iter()
+            .filter(|r| r.overlay.is_some())
+            .map(|r| r.project.clone())
+            .collect(),
+        privilege_grants: projects
+            .iter()
+            .filter(|r| r.privilege_grant.is_some())
+            .map(|r| r.project.clone())
+            .collect(),
+        secrets: secrets_by_project,
+    };
+    let not_copied = DuplicateNotCopiedDto {
+        policies,
+        projects_with_runs,
+        old_oidc_subject: oidc_subject_pattern(&org, &env),
+        new_oidc_subject: oidc_subject_pattern(&org, &new_name),
+        notes: vec![
+            format!(
+                "Run and approval history and the Cache stay with {env}, which is not changed \
+                 and stays until an admin deletes it."
+            ),
+            "Only Environment secrets set per Project are copied: org-wide Environment secrets \
+             are not built yet."
+                .to_string(),
+            "PluginConnections are not scoped to an Environment yet, so none is copied or \
+             listed."
+                .to_string(),
+        ],
+    };
+    Ok((
+        StatusCode::CREATED,
+        Json(DuplicateOrgEnvironmentResponse {
+            environment: (&created).into(),
+            copied,
+            not_copied,
+        }),
+    ))
 }
 
 /// Which Projects may run Deploy Runs into an Environment (ADR-0071 §2):
@@ -544,9 +1057,10 @@ async fn step_up_unless_tightening(
         .await
 }
 
-/// A baseline (`…/protection`) body: the four rules, replaced whole. Every
-/// field is optional and an omitted one takes the **permissive** default —
-/// never the stored value — so `{}` resets the baseline to permissive.
+/// A baseline (`…/protection`) body: the four rules and the approval gate
+/// settings, replaced whole. Every field is optional and an omitted one
+/// takes its default — never the stored value — so `{}` resets the baseline
+/// to permissive (and the approval gate settings to theirs).
 /// Unknown fields are refused, so the retired per-repo shape (`wait_timer`,
 /// `concurrency`) — and `deployment_concurrency`, which ADR-0074 removed — is
 /// a 400, not a silently ignored rule.
@@ -560,12 +1074,27 @@ pub struct PutEnvironmentProtectionRequest {
     /// Ref globs (`refs/heads/main`, `refs/tags/*`); empty = any ref.
     #[serde(default)]
     pub allowed_refs: Vec<String>,
-    /// Seconds. Carried and merged, not yet enforced (git-bug 2b94989).
+    /// Seconds: a minimum wait on the Environment approval gate (ADR-0078
+    /// §4). Refused (400) above 0 with no approvers.
     #[serde(default)]
     pub wait_timer_s: u32,
     /// A human dispatch must carry a reason (ADR-0057 §3). Omitted = off.
     #[serde(default)]
     pub require_reason: bool,
+    /// `add` (default) or `refuse` (ADR-0078 §3).
+    #[serde(default)]
+    pub missing_gate_mode: MissingGateModeDto,
+    /// Seconds before the gate the Environment adds expires; omitted = it
+    /// waits until approved or rejected.
+    #[serde(default)]
+    pub added_gate_expiry_s: Option<u32>,
+    /// How many of `approvers` must approve, 1 to their number; omitted =
+    /// every one.
+    #[serde(default)]
+    pub required_approvals: Option<u32>,
+    /// Seconds an approval stays good for at launch; omitted = 86400.
+    #[serde(default)]
+    pub max_approval_age_s: Option<u32>,
 }
 
 /// A Project overlay (`…/projects/{project}/overlay`) body: the baseline's
@@ -651,6 +1180,26 @@ async fn checked_rules(
     wait_timer_s: u32,
     require_reason: bool,
 ) -> Result<EnvironmentProtectionRules, ApiError> {
+    checked_rules_with_gate(
+        st,
+        approvers,
+        allowed_refs,
+        wait_timer_s,
+        require_reason,
+        Default::default(),
+    )
+    .await
+}
+
+/// [`checked_rules`] with the approval gate settings a baseline carries.
+async fn checked_rules_with_gate(
+    st: &AppState,
+    approvers: Vec<String>,
+    allowed_refs: Vec<String>,
+    wait_timer_s: u32,
+    require_reason: bool,
+    approval_gate: scarab_project::ApprovalGateRules,
+) -> Result<EnvironmentProtectionRules, ApiError> {
     if allowed_refs.iter().any(|r| r.trim().is_empty()) {
         return Err(ApiError::BadRequest(
             "an allowed ref must not be empty".into(),
@@ -667,12 +1216,35 @@ async fn checked_rules(
             resolved.push(principal);
         }
     }
+    approval_gate
+        .validate(&resolved)
+        .map_err(org_environment_api_error)?;
     Ok(EnvironmentProtectionRules {
         approvers: resolved,
         allowed_refs,
         wait_timer_s,
         require_reason,
+        approval_gate,
     })
+}
+
+/// A wait timer is a minimum wait on the Environment approval gate
+/// (ADR-0078 §4), so it needs approvers: refuse a non-zero one where the
+/// effective approvers (`approvers`) are empty. Stored data from before this
+/// check keeps a timer with no approvers; it is read back and does nothing.
+fn refuse_wait_timer_without_approvers(
+    wait_timer_s: u32,
+    approvers: &[String],
+) -> Result<(), ApiError> {
+    if wait_timer_s > 0 && approvers.is_empty() {
+        return Err(ApiError::BadRequest(
+            "a wait timer needs approvers: it is a minimum wait on the Environment's approval \
+             gate, and an Environment with no approvers has none; add an approver or set the \
+             wait timer to 0"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 /// An Environment's baseline protection rules. Read on the Org.
@@ -735,14 +1307,23 @@ pub(crate) async fn put_environment_protection(
     let scope = rbac_scope(&org, None);
     let principal = authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
     let store = governance_store(&st)?;
-    let rules = checked_rules(
+    let rules = checked_rules_with_gate(
         &st,
         body.approvers,
         body.allowed_refs,
         body.wait_timer_s,
         body.require_reason,
+        scarab_project::ApprovalGateRules {
+            missing_gate: body.missing_gate_mode.into(),
+            added_gate_expiry_s: body.added_gate_expiry_s,
+            required_approvals: body.required_approvals,
+            max_approval_age_s: body
+                .max_approval_age_s
+                .unwrap_or(scarab_project::DEFAULT_MAX_APPROVAL_AGE_S),
+        },
     )
     .await?;
+    refuse_wait_timer_without_approvers(rules.wait_timer_s, &rules.approvers)?;
     // ADR-0073 §3 rule E1: loosening the baseline is a crown jewel.
     let current = stored_environment(store, &org, &env).await?;
     step_up_unless_tightening(
@@ -887,6 +1468,15 @@ pub(crate) async fn put_environment_project_overlay(
         body.require_reason,
     )
     .await?;
+    let effective_approvers: Vec<String> = governance
+        .environment
+        .protection
+        .approvers
+        .iter()
+        .chain(&rules.approvers)
+        .cloned()
+        .collect();
+    refuse_wait_timer_without_approvers(rules.wait_timer_s, &effective_approvers)?;
     let overlay = EnvironmentProjectOverlay {
         org,
         environment: env,

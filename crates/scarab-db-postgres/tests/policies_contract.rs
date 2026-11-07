@@ -297,6 +297,13 @@ async fn effective_policies(s: &dyn PolicyStore) {
         ids(s.list(&project("acme", "web")).await.unwrap()),
         ["p-web"]
     );
+    // Every live Policy of the org at any level: the Org's by name, then each
+    // Project's (what an Environment duplicate checks).
+    assert_eq!(
+        ids(s.list_in_org("acme").await.unwrap()),
+        ["o-a", "o-step", "o-z", "p-api", "p-web"]
+    );
+    assert_eq!(ids(s.list_in_org("other").await.unwrap()), ["other"]);
 }
 
 fn record(id: &str, run: Option<&str>, at: i64, deny: bool) -> DecisionRecord {

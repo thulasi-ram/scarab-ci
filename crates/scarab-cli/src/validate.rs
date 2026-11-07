@@ -17,6 +17,11 @@
 //! `--server` has no default and no environment variable: a `SCARAB_SERVER`
 //! in the environment never turns an offline check into a network call.
 //!
+//! For a Pipeline that names an Environment, it also says which `manual`
+//! gates would be Environment approval gates and where the Environment
+//! would add one (ADR-0078). Both depend on the Environment having
+//! approvers, a server setting it does not read, and the output says so.
+//!
 //! Exit codes: 0 compiles (and, with `--server`, the Policies allow); 1 a
 //! compile error offline, a deny, or a failed request; 2 a usage error, a
 //! file that cannot be read, or (with `--server`) a compile error.
@@ -240,6 +245,7 @@ pub async fn run(args: ValidateArgs) -> i32 {
         return match compile(&sources) {
             Ok(ir) => {
                 println!("ok: {} step(s), ir v{}", ir.steps.len(), ir.ir_version);
+                print_approval_gates(&ir);
                 print_warnings(&ir);
                 0
             }
@@ -262,6 +268,7 @@ pub async fn run(args: ValidateArgs) -> i32 {
         Err(()) => return 2,
     };
     println!("ok: {} step(s), ir v{}", ir.steps.len(), ir.ir_version);
+    print_approval_gates(&ir);
     print_warnings(&ir);
 
     let dir = file_dir(&args.file);
@@ -338,6 +345,67 @@ pub async fn run(args: ValidateArgs) -> i32 {
         Err(code) => return code,
     };
     print_answer(&answer, &args.event, &git_ref)
+}
+
+/// Say, for a Pipeline that names an Environment, which `manual` gates would
+/// be Environment approval gates and where the Environment would add one
+/// (ADR-0078 §1-2). Both depend on the Environment having approvers, which
+/// is server state this check does not read.
+fn print_approval_gates(ir: &scarab_pipeline::PipelineIr) {
+    use scarab_policy::approval_gate as ag;
+    let s = crate::security::sanitize;
+    let Some(env) = &ir.environment else {
+        return;
+    };
+    let env = s(env);
+    let approval: Vec<String> = ag::environment_approval_gates(ir);
+    for gate in ir
+        .steps
+        .iter()
+        .filter(|g| g.gate.as_deref() == Some("manual"))
+    {
+        if approval.contains(&gate.id) {
+            println!(
+                "gate `{}`: an Environment approval gate (a Step after it uses `{env}`'s \
+                 authority); if `{env}` has approvers, they release it",
+                s(&gate.id)
+            );
+        } else {
+            println!(
+                "gate `{}`: a plain gate (no Step after it uses `{env}`'s authority); anyone \
+                 with write releases it",
+                s(&gate.id)
+            );
+        }
+    }
+    let mut with_gate = ir.clone();
+    if let Some(added) = ag::add_environment_approval_gate(&mut with_gate, &env, None, &[]) {
+        let needs = with_gate
+            .steps
+            .iter()
+            .find(|g| g.id == added.id)
+            .map(|g| {
+                g.needs
+                    .0
+                    .iter()
+                    .map(|n| s(n))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        let fronts: Vec<String> = added.fronts.iter().map(|f| format!("`{}`", s(f))).collect();
+        println!(
+            "if `{env}` has approvers, it adds gate `{}` (needs: [{needs}]) in front of {}, \
+             which use its authority with no `gate: manual` upstream; in missing-gate mode \
+             `refuse` it refuses the Run instead",
+            s(&added.id),
+            fronts.join(", ")
+        );
+    }
+    println!(
+        "note: whether `{env}` has approvers, and its missing-gate mode, are server settings \
+         this check does not read"
+    );
 }
 
 /// Whether a rule reading input field `f` gets an answer that depends on

@@ -2,15 +2,20 @@
 // them. Pure — no DOM, no fetch — so the Settings panel and its tests agree on
 // what a form sends.
 //
-// The whole-Environment PUT carries only its description; protection,
-// eligibility and privilege grants each have their own write. The PUT is a
-// FULL replace, so `toPutBody` always sends every field.
+// The whole-Environment PUT carries its display name and description;
+// protection, eligibility and privilege grants each have their own write. The
+// PUT is a FULL replace, so `toPutBody` always sends every field.
+//
+// The name is fixed once created: pipeline YAML and the OIDC subject
+// (`…/env/<name>/…`) use it. The display name is what headings, lists and
+// pickers show; where the name matters it is shown beside it in mono.
 //
 // The server enforces every rule here; mirroring them only lets the form say
 // what is wrong before the round trip. Where the two could disagree the server
 // wins, and its 400/409 text is shown verbatim.
 import {
   rulesToForm,
+  splitList,
   toEligibilityBody,
   toProtectionBody,
   type EligibilityLike,
@@ -22,11 +27,13 @@ import { orgHref } from "./settings-nav";
 
 /** The editable fields. The name is the URL, not the body. */
 export type OrgEnvironmentForm = {
+  displayName: string;
   description: string;
 };
 
-/** What the PUT carries. */
+/** What the PUT carries. `display_name: null` shows the name. */
 export type OrgEnvironmentBody = {
+  display_name: string | null;
   description: string;
 };
 
@@ -34,8 +41,44 @@ export type OrgEnvironmentBody = {
  *  `OrgEnvironment` satisfies it without this module importing the schema. */
 export type OrgEnvironmentLike = {
   name: string;
+  display_name?: string | null;
   description: string;
 };
+
+type Built<T> = { body: T; error?: undefined } | { body?: undefined; error: string };
+
+/** The longest display name the server accepts, in characters. */
+export const MAX_DISPLAY_NAME = 200;
+
+/** What people see for an Environment: its display name, or its name. */
+export function shownName(env: { name: string; display_name?: string | null }): string {
+  return env.display_name?.trim() || env.name;
+}
+
+/** The name, when it should be shown beside the display name (in mono):
+ *  `null` when there is no display name or it is the name. */
+export function nameBeside(env: { name: string; display_name?: string | null }): string | null {
+  return shownName(env) === env.name ? null : env.name;
+}
+
+/** One line for a picker option or a plain-text label: "Production (EU) · prod",
+ *  or the name alone. */
+export function environmentLabel(env: { name: string; display_name?: string | null }): string {
+  const beside = nameBeside(env);
+  return beside === null ? env.name : `${shownName(env)} · ${beside}`;
+}
+
+/** Why `displayName` cannot be saved, or `null`. Blank is fine: it shows the
+ *  name. */
+export function displayNameError(displayName: string): string | null {
+  if (/[\u0000-\u001f\u007f-\u009f]/.test(displayName)) {
+    return "A display name cannot contain control characters.";
+  }
+  if ([...displayName.trim()].length > MAX_DISPLAY_NAME) {
+    return `A display name is at most ${MAX_DISPLAY_NAME} characters.`;
+  }
+  return null;
+}
 
 /** Why `name` cannot name an Environment, or `null` if it can — the server's
  *  rule, checked on the name exactly as typed (never trimmed: the name is the
@@ -50,9 +93,12 @@ export function nameError(name: string): string | null {
   return null;
 }
 
-/** The PUT body for `form`. The description is trimmed. */
+/** The PUT body for `form`. Both are trimmed; a blank display name is
+ *  `null` (show the name). */
 export function toPutBody(form: OrgEnvironmentForm): { body: OrgEnvironmentBody } {
-  return { body: { description: form.description.trim() } };
+  return {
+    body: { display_name: form.displayName.trim() || null, description: form.description.trim() },
+  };
 }
 
 // ── The Environment's own pages ──────────────────────────────────────────────
@@ -79,10 +125,192 @@ export const environmentEditHref = (org: string, name: string) => `${environment
  *  and spaces included, as everywhere else the name is used. */
 export const confirmsName = (typed: string, name: string) => name.length > 0 && typed === name;
 
-/** What the edit page holds: the description, the baseline, eligibility. */
+// ── The Environment approval gate ────────────────────────────────────────────
+//
+// An Environment with approvers asks them on its approval gate: a `manual`
+// gate with a Step after it that uses the Environment's authority (its
+// secrets, a privilege grant, a k8s_overlay, a write forge token or the
+// deploy mark). When a pipeline has no such gate, the Environment adds one to
+// the Run, or refuses the Run (its missing-gate mode). The baseline also sets
+// the added gate's expiry, how many approvers must approve, and how long an
+// approval stays good for. These settings are the baseline's alone: a
+// project overlay has none.
+
+/** What Run creation does when no `manual` gate guards the Environment's
+ *  Steps. */
+export type MissingGateMode = "add" | "refuse";
+
+/** The approval gate settings as the server serialises them. */
+export type ApprovalGateLike = {
+  missing_gate_mode: MissingGateMode;
+  /** Seconds; absent: the added gate waits until approved or rejected. */
+  added_gate_expiry_s?: number | null;
+  /** Absent: every approver must approve. */
+  required_approvals?: number | null;
+  max_approval_age_s: number;
+};
+
+/** The server's default maximum approval age: 24 hours. */
+export const DEFAULT_MAX_APPROVAL_AGE_S = 24 * 60 * 60;
+
+/** The settings of a baseline that has never set them. */
+export const DEFAULT_APPROVAL_GATE: ApprovalGateLike = {
+  missing_gate_mode: "add",
+  max_approval_age_s: DEFAULT_MAX_APPROVAL_AGE_S,
+};
+
+/** The approval gate settings as the form holds them: strings, possibly
+ *  half typed. Blank means the default. */
+export type ApprovalGateForm = {
+  missingGateMode: MissingGateMode;
+  /** Seconds; blank: no expiry. */
+  addedGateExpiryS: string;
+  /** Blank: every approver. */
+  requiredApprovals: string;
+  /** Seconds; blank: 24 hours. */
+  maxApprovalAgeS: string;
+};
+
+/** The form for stored settings (or the defaults). */
+export function approvalGateToForm(g?: ApprovalGateLike | null): ApprovalGateForm {
+  const gate = g ?? DEFAULT_APPROVAL_GATE;
+  return {
+    missingGateMode: gate.missing_gate_mode,
+    addedGateExpiryS: gate.added_gate_expiry_s != null ? String(gate.added_gate_expiry_s) : "",
+    requiredApprovals: gate.required_approvals != null ? String(gate.required_approvals) : "",
+    maxApprovalAgeS: String(gate.max_approval_age_s),
+  };
+}
+
+/** The baseline PUT body (`…/environments/{env}/protection`): the four rules
+ *  and the approval gate settings, flat. The PUT replaces the whole
+ *  baseline, so every field is always sent. */
+export type BaselineBody = ProtectionBody & {
+  missing_gate_mode: MissingGateMode;
+  added_gate_expiry_s: number | null;
+  required_approvals: number | null;
+  max_approval_age_s: number;
+};
+
+/** A duration in seconds in words: "24 hours", "1 hour 30 minutes",
+ *  "45 seconds". */
+export function durationText(seconds: number): string {
+  if (seconds <= 0) return "0 seconds";
+  const units: [number, string][] = [
+    [3600, "hour"],
+    [60, "minute"],
+    [1, "second"],
+  ];
+  const parts: string[] = [];
+  let left = seconds;
+  for (const [size, name] of units) {
+    const n = Math.floor(left / size);
+    if (n > 0) {
+      parts.push(`${n} ${name}${n === 1 ? "" : "s"}`);
+      left -= n * size;
+    }
+    if (parts.length === 2) break;
+  }
+  return parts.join(" ");
+}
+
+/** A whole number of seconds above 0, or `null` for blank; `undefined` when
+ *  it does not parse. */
+function positiveSeconds(raw: string): number | null | undefined {
+  const t = raw.trim();
+  if (t === "") return null;
+  const n = Number(t);
+  return Number.isInteger(n) && n > 0 ? n : undefined;
+}
+
+/** Why the required approvals cannot be saved, or `null`. `approvers` is the
+ *  number of baseline approvers the form names. */
+export function requiredApprovalsError(raw: string, approvers: number): string | null {
+  const t = raw.trim();
+  if (t === "") return null;
+  if (approvers === 0) return "Add approvers first.";
+  const n = Number(t);
+  if (!Number.isInteger(n) || n < 1 || n > approvers) {
+    return approvers === 1
+      ? "With one approver, the only count is 1."
+      : `A whole number from 1 to ${approvers}, the number of approvers.`;
+  }
+  return null;
+}
+
+/** The baseline body for the form's rules and approval gate settings, or the
+ *  first reason it cannot be sent.
+ *
+ *  The wait timer counts on the approval gate, so it needs approvers: with
+ *  none, the body carries 0 (the server refuses anything else). */
+export function toBaselineBody(rules: RulesForm, gate: ApprovalGateForm): Built<BaselineBody> {
+  const protection = toProtectionBody(rules);
+  if (protection.error !== undefined) return { error: protection.error };
+  const p = protection.body;
+  const required = requiredApprovalsError(gate.requiredApprovals, p.approvers.length);
+  if (required !== null) return { error: `Required approvals: ${required}` };
+  const expiry = positiveSeconds(gate.addedGateExpiryS);
+  if (expiry === undefined) {
+    return { error: "The added gate's expiry must be a whole number of seconds above 0, or blank." };
+  }
+  const maxAge = positiveSeconds(gate.maxApprovalAgeS);
+  if (maxAge === undefined) {
+    return { error: "The maximum approval age must be a whole number of seconds above 0." };
+  }
+  const requiredN = gate.requiredApprovals.trim() === "" ? null : Number(gate.requiredApprovals.trim());
+  return {
+    body: {
+      ...p,
+      wait_timer_s: p.approvers.length === 0 ? 0 : p.wait_timer_s,
+      missing_gate_mode: gate.missingGateMode,
+      added_gate_expiry_s: expiry,
+      required_approvals: requiredN,
+      max_approval_age_s: maxAge ?? DEFAULT_MAX_APPROVAL_AGE_S,
+    },
+  };
+}
+
+/** The warning an Environment with a wait timer and no approvers shows, or
+ *  `null`. The timer waits on the approval gate, which needs approvers. */
+export function idleTimerWarning(rules: { approvers: readonly string[]; wait_timer_s: number }): string | null {
+  if (rules.approvers.length > 0 || rules.wait_timer_s <= 0) return null;
+  return `The ${durationText(rules.wait_timer_s)} wait timer does nothing until this environment has approvers: it waits on the approval gate, which only an environment with approvers has.`;
+}
+
+/** The approval gate settings in words, one line per setting, for the
+ *  read-only view. */
+export function approvalGateFacts(
+  gate: ApprovalGateLike | null | undefined,
+  approvers: number,
+): { label: string; value: string }[] {
+  const g = gate ?? DEFAULT_APPROVAL_GATE;
+  const required =
+    g.required_approvals == null
+      ? approvers === 1
+        ? "the approver"
+        : "every approver"
+      : `${g.required_approvals} of ${approvers}`;
+  return [
+    {
+      label: "missing gate",
+      value: g.missing_gate_mode === "add" ? "add an approval gate to the run" : "refuse the run",
+    },
+    { label: "approvals needed", value: required },
+    {
+      label: "added gate expiry",
+      value: g.added_gate_expiry_s != null ? durationText(g.added_gate_expiry_s) : "none: waits for a decision",
+    },
+    { label: "max approval age", value: durationText(g.max_approval_age_s) },
+  ];
+}
+
+/** What the edit page holds: the display name, the description, the
+ *  baseline and its approval gate settings, eligibility. */
 export type EnvironmentEditForm = {
+  displayName: string;
   description: string;
   baseline: RulesForm;
+  gate: ApprovalGateForm;
   allProjects: boolean;
   /** Comma-separated project-name patterns. */
   patterns: string;
@@ -91,25 +319,31 @@ export type EnvironmentEditForm = {
 /** The stored record as the edit page reads it. Structural, like
  *  `OrgEnvironmentLike`. */
 export type EditableEnvironmentLike = OrgEnvironmentLike & {
-  protection: RulesLike;
+  protection: RulesLike & { approval_gate?: ApprovalGateLike | null };
   eligibility: EligibilityLike;
 };
 
 /** The edit form for a stored Environment. */
 export function toEditForm(env: EditableEnvironmentLike): EnvironmentEditForm {
   return {
+    displayName: env.display_name ?? "",
     description: env.description,
     baseline: rulesToForm(env.protection),
+    gate: approvalGateToForm(env.protection.approval_gate),
     allProjects: env.eligibility.all_projects,
     patterns: (env.eligibility.projects ?? []).join(", "),
   };
 }
 
+/** Does the form name any approver? The wait timer and the required
+ *  approvals need one. */
+export const formHasApprovers = (form: RulesForm) => splitList(form.approvers).length > 0;
+
 /** One write a Save makes. Each part has its own endpoint, so a Save sends
  *  only the parts that changed — an unchanged baseline is never re-sent. */
 export type EnvironmentWrite =
-  | { part: "description"; body: OrgEnvironmentBody }
-  | { part: "baseline"; body: ProtectionBody }
+  | { part: "details"; body: OrgEnvironmentBody }
+  | { part: "baseline"; body: BaselineBody }
   | { part: "eligibility"; body: { all_projects: boolean; projects: string[] } };
 
 const sameList = (a: readonly string[], b: readonly string[]) =>
@@ -117,7 +351,7 @@ const sameList = (a: readonly string[], b: readonly string[]) =>
 
 /**
  * The writes that turn `env` into `form`, in the order they are sent
- * (description, baseline, eligibility), or the error that stops the Save
+ * (display name and description, baseline, eligibility), or the error that stops the Save
  * before any is sent. Compared on the bodies the server would store, so
  * re-ordering spaces or commas alone sends nothing.
  */
@@ -125,25 +359,37 @@ export function planSave(
   env: EditableEnvironmentLike,
   form: EnvironmentEditForm,
 ): { writes: EnvironmentWrite[]; error?: undefined } | { writes?: undefined; error: string } {
-  const protection = toProtectionBody(form.baseline);
+  const displayProblem = displayNameError(form.displayName);
+  if (displayProblem !== null) return { error: displayProblem };
+  const protection = toBaselineBody(form.baseline, form.gate);
   if (protection.error !== undefined) return { error: protection.error };
   const eligibility = toEligibilityBody(form.allProjects, form.patterns);
   if (eligibility.error !== undefined) return { error: eligibility.error };
 
   const writes: EnvironmentWrite[] = [];
-  const description = toPutBody({ description: form.description }).body;
-  // The stored value is compared trimmed too: one stored with edge spaces
+  const details = toPutBody({ displayName: form.displayName, description: form.description }).body;
+  // The stored values are compared trimmed too: one stored with edge spaces
   // (set through the API) is not a change the form made.
-  if (description.description !== env.description.trim()) {
-    writes.push({ part: "description", body: description });
+  if (
+    details.description !== env.description.trim() ||
+    details.display_name !== (env.display_name?.trim() || null)
+  ) {
+    writes.push({ part: "details", body: details });
   }
   const p = protection.body;
   const was = env.protection;
+  const wasGate = was.approval_gate ?? DEFAULT_APPROVAL_GATE;
   if (
     !sameList(p.approvers, was.approvers) ||
     !sameList(p.allowed_refs, was.allowed_refs) ||
-    p.wait_timer_s !== was.wait_timer_s ||
-    p.require_reason !== was.require_reason
+    // With no approvers the timer is not editable and the body carries 0;
+    // a stored timer alone is not a change the form made.
+    (p.approvers.length > 0 && p.wait_timer_s !== was.wait_timer_s) ||
+    p.require_reason !== was.require_reason ||
+    p.missing_gate_mode !== wasGate.missing_gate_mode ||
+    p.added_gate_expiry_s !== (wasGate.added_gate_expiry_s ?? null) ||
+    p.required_approvals !== (wasGate.required_approvals ?? null) ||
+    p.max_approval_age_s !== wasGate.max_approval_age_s
   ) {
     writes.push({ part: "baseline", body: p });
   }
@@ -157,9 +403,9 @@ export function planSave(
 
 /** How each part is named when a Save reports what did or did not save. */
 export const PART_LABEL: Record<EnvironmentWrite["part"], string> = {
-  description: "description",
+  details: "display name and description",
   baseline: "baseline",
-  eligibility: "list of projects that may deploy",
+  eligibility: "list of projects that may use it",
 };
 
 /** What a Save says when the Environment is gone before its first write. */
@@ -169,7 +415,7 @@ export const DELETED_ELSEWHERE = "This environment was deleted by someone else."
  * Send a Save's `writes` in order, and say what went wrong, or `null`.
  *
  * Before the first write it asks `stillThere` whether the Environment still
- * exists. The description write is a create-or-replace, so a Save on a page
+ * exists. The details write is a create-or-replace, so a Save on a page
  * opened before another admin deleted the Environment would otherwise bring
  * it back with the default baseline and eligibility, and the delete would be
  * lost. A missing Environment stops the Save with nothing sent.
@@ -202,4 +448,95 @@ export async function runSave(
     }
   }
   return null;
+}
+
+// ── Duplicate ────────────────────────────────────────────────────────────────
+//
+// `POST …/environments/<name>/duplicate` creates a new Environment with the
+// old one's baseline, eligibility, every project's overlay and grant, and its
+// secrets with their values. The old one is not changed. The answer lists
+// what was not copied, which the page shows as a checklist.
+
+/** What the duplicate POST carries. No display name: the server uses the old
+ *  one's plus " (copy)". */
+export type DuplicateBody = { name: string; display_name?: string };
+
+/** The duplicate body, or why it cannot be sent. `taken` are the names
+ *  already registered in the org. */
+export function toDuplicateBody(
+  name: string,
+  displayName: string,
+  taken: readonly string[],
+): { body: DuplicateBody; error?: undefined } | { body?: undefined; error: string } {
+  const problem = nameError(name);
+  if (problem !== null) return { error: problem };
+  if (taken.includes(name)) return { error: `${name} is already registered. Pick another name.` };
+  const displayProblem = displayNameError(displayName);
+  if (displayProblem !== null) return { error: displayProblem };
+  const shown = displayName.trim();
+  return { body: shown ? { name, display_name: shown } : { name } };
+}
+
+/** The parts of the duplicate's answer the checklist reads (structural). */
+export type DuplicateResultLike = {
+  environment: { name: string };
+  copied: {
+    overlays: string[];
+    privilege_grants: string[];
+    secrets: { project: string; keys: string[] }[];
+  };
+  not_copied: {
+    policies: { id: string; name: string; project?: string | null; environments: string[] }[];
+    projects_with_runs: string[];
+    old_oidc_subject: string;
+    new_oidc_subject: string;
+    notes: string[];
+  };
+};
+
+/** One line of the "what was copied" summary. */
+export function copiedSummary(r: DuplicateResultLike): string[] {
+  const n = (count: number, one: string, many: string) => `${count} ${count === 1 ? one : many}`;
+  const secretCount = r.copied.secrets.reduce((sum, s) => sum + s.keys.length, 0);
+  return [
+    "baseline rules and the projects that may use it",
+    n(r.copied.overlays.length, "project overlay", "project overlays"),
+    n(r.copied.privilege_grants.length, "privilege grant", "privilege grants"),
+    `${n(secretCount, "secret", "secrets")} with their values${
+      r.copied.secrets.length > 0 ? ` (${r.copied.secrets.map((s) => s.project).join(", ")})` : ""
+    }`,
+  ];
+}
+
+/** One item to do by hand after a duplicate. `items` are the names it is about
+ *  (shown in mono); empty when the item is a single instruction. */
+export type ChecklistItem = { title: string; detail: string; items: string[] };
+
+/** The checklist of what the duplicate did not copy, in the order to work
+ *  through it. Policies and projects appear only when there are some; the
+ *  OIDC subject always does, since Scarab cannot see cloud trust policies. */
+export function duplicateChecklist(old: string, r: DuplicateResultLike): ChecklistItem[] {
+  const fresh = r.environment.name;
+  const out: ChecklistItem[] = [];
+  if (r.not_copied.projects_with_runs.length > 0) {
+    out.push({
+      title: "Change the pipelines",
+      detail: `These projects deployed into ${old}. Their pipelines deploy into ${fresh} only once their environment: says ${fresh}.`,
+      items: r.not_copied.projects_with_runs,
+    });
+  }
+  if (r.not_copied.policies.length > 0) {
+    out.push({
+      title: "Review the policies",
+      detail: `These policies apply to ${old} and not to ${fresh}.`,
+      items: r.not_copied.policies.map((p) => (p.project ? `${p.project} / ${p.name}` : p.name)),
+    });
+  }
+  out.push({
+    title: "Update cloud trust policies",
+    detail: `A cloud role that trusts ${r.not_copied.old_oidc_subject} must also trust ${r.not_copied.new_oidc_subject} before a run in ${fresh} can assume it.`,
+    items: [],
+  });
+  for (const note of r.not_copied.notes) out.push({ title: "Note", detail: note, items: [] });
+  return out;
 }

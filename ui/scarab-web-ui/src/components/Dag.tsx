@@ -43,6 +43,10 @@ export type DagStep = {
   /** The invoke chain this Step was inlined through (ADR-0076): a Step from
    * a library is drawn inside a box per invocation. */
   origin?: OriginLink[] | null;
+  /** An Environment approval gate: its approvers release it. */
+  approvalGate?: boolean;
+  /** For the gate the Environment added to the Run: "added by <Environment>". */
+  addedBy?: string | null;
 };
 
 /** A pipeline-level SHARED service (ADR-0058) — a PEER node in the services lane
@@ -376,7 +380,7 @@ export default function Dag(props: {
     // status: "waiting on argocd/web (in progress)", "failed: <reason>".
     if (s.note) return s.note.text;
     if (isGateOpen(s)) {
-      return `gate · ${s.gate}`;
+      return s.approvalGate ? "gate · approval" : `gate · ${s.gate}`;
     }
     // Finished steps show how long they took (from the event log).
     if (s.durationMs != null && (s.status === "succeeded" || s.status === "failed")) {
@@ -426,6 +430,13 @@ export default function Dag(props: {
           </span>
           <Show when={plugin()}>
             {(o) => <span class="dnode-origin">plugin:{o().name.split("/")[0]}</span>}
+          </Show>
+          <Show when={s.addedBy}>
+            {(label) => (
+              <span class="dnode-origin" title="Not in the pipeline file: the environment added this approval gate">
+                {label()}
+              </span>
+            )}
           </Show>
         </span>
         <Show when={s.attempts > 1}>

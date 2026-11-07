@@ -34,18 +34,114 @@ use crate::{
 /// tightens nothing holds.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EnvironmentProtectionRules {
-    /// Principals who must **all** approve a deploy (AND, like
-    /// [`ProtectionRules::approvers`]).
+    /// Principals who approve a deploy. Every one must approve (AND, like
+    /// [`ProtectionRules::approvers`]) unless the baseline's
+    /// [`ApprovalGateRules::required_approvals`] says how many.
     pub approvers: Vec<String>,
     /// Ref globs (`*` wildcards) a deploy's symbolic ref must match. Empty
     /// means **any** ref — which is why two layers are never intersected
     /// (see [`AllowedRefConstraint`]).
     pub allowed_refs: Vec<String>,
-    /// A mandatory wait (seconds). Carried and merged, **not enforced** in
-    /// c-full (git-bug 2b94989): nothing ever read the ADR-0037 one either.
+    /// A minimum wait (seconds) on the Environment approval gate, counted
+    /// on the gate's own wait clock (ADR-0078 §4). It applies only with
+    /// approvers: an Environment with none ignores it.
     pub wait_timer_s: u32,
     /// A human dispatch (`manual`/`api`) must carry a reason (ADR-0057 §3).
     pub require_reason: bool,
+    /// The Environment approval gate's settings (ADR-0078 §3). **Baseline
+    /// only**: an overlay holds the default here, stores nothing for it, and
+    /// [`effective_protection`] reads the baseline's alone.
+    pub approval_gate: ApprovalGateRules,
+}
+
+/// The default maximum approval age, in seconds: 24 hours (ADR-0078 §3).
+pub const DEFAULT_MAX_APPROVAL_AGE_S: u32 = 24 * 60 * 60;
+
+/// What an Environment with approvers does at Run creation when a Step that
+/// uses its authority has no `manual` gate upstream (ADR-0078 §3).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MissingGateMode {
+    /// Add one Environment approval gate to the Run (the default).
+    #[default]
+    Add,
+    /// Refuse the Run, naming the Steps and the YAML to add.
+    Refuse,
+}
+
+impl MissingGateMode {
+    /// The wire and column name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Add => "add",
+            Self::Refuse => "refuse",
+        }
+    }
+
+    /// The mode a wire or column name names; `None` for anything else.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "add" => Some(Self::Add),
+            "refuse" => Some(Self::Refuse),
+            _ => None,
+        }
+    }
+}
+
+/// An Environment's settings for its **Environment approval gate**
+/// (ADR-0078 §3), set on the baseline only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalGateRules {
+    /// Add a gate, or refuse the Run, when an authority Step has no
+    /// `manual` gate upstream.
+    pub missing_gate: MissingGateMode,
+    /// The expiry (seconds) of the gate the Environment adds; `None` waits
+    /// until someone approves or rejects it. An authored gate keeps its own.
+    pub added_gate_expiry_s: Option<u32>,
+    /// How many of the baseline's approvers must approve; `None` means every
+    /// one of them (the rule before ADR-0078). A Project overlay's approvers
+    /// are always each required, so an overlay still only tightens.
+    pub required_approvals: Option<u32>,
+    /// The longest (seconds) an approval stays good for: a Step launched
+    /// later than this after its approval gate released is refused.
+    pub max_approval_age_s: u32,
+}
+
+impl Default for ApprovalGateRules {
+    fn default() -> Self {
+        Self {
+            missing_gate: MissingGateMode::Add,
+            added_gate_expiry_s: None,
+            required_approvals: None,
+            max_approval_age_s: DEFAULT_MAX_APPROVAL_AGE_S,
+        }
+    }
+}
+
+impl ApprovalGateRules {
+    /// Check the settings against the baseline's `approvers`: a count of at
+    /// least one and at most the number of approvers, and a non-zero expiry
+    /// and maximum age.
+    pub fn validate(&self, approvers: &[String]) -> Result<(), OrgEnvironmentError> {
+        let invalid = |m: String| Err(OrgEnvironmentError::Invalid(m));
+        if let Some(n) = self.required_approvals {
+            if n == 0 {
+                return invalid("required approvals must be at least 1".into());
+            }
+            if n as usize > approvers.len() {
+                return invalid(format!(
+                    "required approvals is {n}, but the baseline lists {} approver(s)",
+                    approvers.len()
+                ));
+            }
+        }
+        if self.added_gate_expiry_s == Some(0) {
+            return invalid("the added gate's expiry must be at least 1 second".into());
+        }
+        if self.max_approval_age_s == 0 {
+            return invalid("the maximum approval age must be at least 1 second".into());
+        }
+        Ok(())
+    }
 }
 
 /// One Project's **tighten-only** overlay over one Environment's baseline
@@ -206,11 +302,17 @@ impl AllowedRefConstraint {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffectiveProtection {
     /// Every baseline approver, then every overlay approver not already
-    /// listed — all required (AND).
+    /// listed. Who must approve is [`EffectiveProtection::approval_violations`]'s.
     pub approvers: Vec<String>,
+    /// The baseline's approvers: the pool `required_approvals` counts from.
+    pub baseline_approvers: Vec<String>,
+    /// The overlay's approvers: each one required, whatever the count.
+    pub overlay_approvers: Vec<String>,
     pub allowed_refs: AllowedRefConstraint,
     pub wait_timer_s: u32,
     pub require_reason: bool,
+    /// The baseline's approval gate settings (an overlay has none).
+    pub approval_gate: ApprovalGateRules,
 }
 
 /// Fold an Environment's `baseline` and one Project's `overlay` into the rules admission enforces (ADR-0071
@@ -255,9 +357,14 @@ pub fn effective_protection(
 
     EffectiveProtection {
         approvers,
+        baseline_approvers: baseline.approvers.clone(),
+        overlay_approvers: overlay_rules
+            .map(|r| r.approvers.clone())
+            .unwrap_or_default(),
         allowed_refs,
         wait_timer_s,
         require_reason,
+        approval_gate: baseline.approval_gate.clone(),
     }
 }
 
@@ -295,16 +402,69 @@ impl EffectiveProtection {
         if !self.ref_allowed(git_ref) {
             violations.push(format!("ref `{git_ref}` is not allowed to deploy here"));
         }
-        for approver in &self.approvers {
-            if !approvals.iter().any(|a| a == approver) {
-                violations.push(format!("missing required approval from `{approver}`"));
-            }
-        }
+        violations.extend(self.approval_violations(approvals));
         if violations.is_empty() {
             Ok(())
         } else {
             Err(violations)
         }
+    }
+
+    /// What `approvals` still lack (empty = enough). With no
+    /// `required_approvals`, every approver must approve. With `n`, `n` of
+    /// the baseline's approvers must, and every overlay approver as well.
+    pub fn approval_violations(&self, approvals: &[String]) -> Vec<String> {
+        let approved = |who: &String| approvals.iter().any(|a| a == who);
+        let missing = |who: &String| format!("missing required approval from `{who}`");
+        let Some(n) = self.approval_gate.required_approvals else {
+            return self
+                .approvers
+                .iter()
+                .filter(|a| !approved(a))
+                .map(missing)
+                .collect();
+        };
+        let mut violations: Vec<String> = self
+            .overlay_approvers
+            .iter()
+            .filter(|a| !approved(a))
+            .map(missing)
+            .collect();
+        let have = self
+            .baseline_approvers
+            .iter()
+            .filter(|a| approved(a))
+            .count();
+        let need = (n as usize).min(self.baseline_approvers.len());
+        if have < need {
+            violations.push(format!(
+                "needs {need} approval(s) from {}; has {have}",
+                self.baseline_approvers
+                    .iter()
+                    .map(|a| format!("`{a}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        violations
+    }
+
+    /// The wait timer that applies: none without approvers (ADR-0078 §4).
+    pub fn effective_wait_timer_s(&self) -> u32 {
+        if self.approvers.is_empty() {
+            0
+        } else {
+            self.wait_timer_s
+        }
+    }
+
+    /// The approver set an Environment approval gate's release is recorded
+    /// with, and every launch compares against: the approvers, sorted, and
+    /// how many of the baseline's are required.
+    pub fn approver_set(&self) -> (Vec<String>, Option<u32>) {
+        let mut approvers = self.approvers.clone();
+        approvers.sort();
+        (approvers, self.approval_gate.required_approvals)
     }
 
     /// The `require_reason` guardrail (ADR-0057 §3), with
@@ -362,6 +522,7 @@ pub fn migrate_legacy_environment(
             allowed_refs: old.allowed_refs.clone(),
             wait_timer_s: old.wait_timer,
             require_reason: old.require_reason,
+            approval_gate: ApprovalGateRules::default(),
         },
     };
     let grant = (!old.privileged_images.is_empty() || old.permit_k8s_overlay).then(|| {
@@ -608,6 +769,30 @@ impl EnvironmentMigrationReport {
     }
 }
 
+/// An exclusive claim on one Environment name in one org, from
+/// [`EnvironmentGovernanceStore::claim_environment_name`]. It holds whatever
+/// the store needs to keep the claim (a Postgres transaction holding an
+/// advisory lock, a set entry); dropping it releases the claim.
+pub struct EnvironmentNameClaim {
+    /// Never read: it is kept only so that dropping the claim drops it.
+    _held: Box<dyn std::any::Any + Send>,
+}
+
+impl EnvironmentNameClaim {
+    /// A claim kept by `held`, released when `held` is dropped.
+    pub fn new(held: impl std::any::Any + Send) -> Self {
+        Self {
+            _held: Box::new(held),
+        }
+    }
+}
+
+impl std::fmt::Debug for EnvironmentNameClaim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("EnvironmentNameClaim")
+    }
+}
+
 /// Durable store for the governance half of org-level Environments (ADR-0071
 /// §2, §3, §8): baseline protection, eligibility, per-Project overlays and
 /// privilege grants. The Environment itself (name, description) is the [`OrgEnvironmentStore`](crate::OrgEnvironmentStore)'s.
@@ -790,6 +975,46 @@ pub trait EnvironmentGovernanceStore: Send + Sync {
         environment: &str,
         project: &str,
     ) -> Result<bool, OrgEnvironmentError>;
+
+    /// Claim Environment name `name` in `org` for one Duplicate, which writes
+    /// to the secret store first and creates the Environment after (the two
+    /// cannot share a transaction). While the claim is held, a second claim
+    /// on the same name answers `None`, so two Duplicates to one name never
+    /// both write secrets under it and one's cleanup never deletes what the
+    /// other's Environment relies on. Dropping the claim releases it,
+    /// whether the Duplicate succeeded, failed or was abandoned.
+    ///
+    /// The claim excludes other claims only. The server's create of an
+    /// Environment takes it too, so a create and a Duplicate to one name
+    /// exclude each other; a caller that writes the store without it can
+    /// still take the name, which [`duplicate_environment`](Self::duplicate_environment)
+    /// answers with [`OrgEnvironmentError::Conflict`].
+    async fn claim_environment_name(
+        &self,
+        org: &str,
+        name: &str,
+    ) -> Result<Option<EnvironmentNameClaim>, OrgEnvironmentError>;
+
+    /// Create Environment `to` in `org` as a copy of `from` (git-bug
+    /// d002a0c): its description, its baseline protection rules (every
+    /// field), its eligibility, and every Project's overlay and privilege
+    /// grant — all in **one** transaction, so a failure leaves no partial
+    /// copy. The copy shows `display_name` and is stamped created and
+    /// updated by `updated_by` at `updated_at`. `from` is not changed.
+    ///
+    /// [`OrgEnvironmentError::NotFound`] when `from` does not exist;
+    /// [`OrgEnvironmentError::Conflict`] when `to` already does (nothing
+    /// changed either way); [`OrgEnvironmentError::Invalid`] for a name or
+    /// display name the rules refuse. Returns the copy as stored.
+    async fn duplicate_environment(
+        &self,
+        org: &str,
+        from: &str,
+        to: &str,
+        display_name: Option<&str>,
+        updated_by: &str,
+        updated_at: i64,
+    ) -> Result<OrgEnvironment, OrgEnvironmentError>;
 
     /// Every Project holding an overlay or a privilege grant in
     /// `environment`, by Project name, with its eligibility now — what the
@@ -1032,6 +1257,7 @@ mod tests {
         let env = OrgEnvironment {
             org: "acme".into(),
             name: "prod".into(),
+            display_name: None,
             description: String::new(),
             protection: EnvironmentProtectionRules::default(),
             eligibility: EnvironmentProjectEligibility::Projects(strings(&["pay*"])),
@@ -1133,6 +1359,7 @@ mod tests {
                     allowed_refs: strings(&["main"]),
                     wait_timer_s: 90,
                     require_reason: true,
+                    approval_gate: ApprovalGateRules::default(),
                 },
             }
         );
@@ -1256,6 +1483,7 @@ mod tests {
                 allowed_refs,
                 wait_timer_s,
                 require_reason,
+                approval_gate: ApprovalGateRules::default(),
             },
         )
     }
@@ -1460,6 +1688,30 @@ mod tests {
             prop_assert!(!e.admits_protection_ref(Some(&r)));
             prop_assert!(e.admits(&r, &approvals).is_err());
         }
+    }
+
+    /// cd43bf3: with `required_approvals = Some(n)`, n of the baseline's
+    /// approvers must approve, and every overlay approver as well.
+    #[test]
+    fn n_of_the_baseline_approvers_and_every_overlay_approver() {
+        let mut baseline = rules(&["amy", "bob", "cid"], &[]);
+        baseline.approval_gate.required_approvals = Some(2);
+        let p = effective_protection(&baseline, Some(&overlay(rules(&["olga"], &[]))));
+        let approvals = |who: &[&str]| p.approval_violations(&strings(who));
+
+        assert_eq!(
+            approvals(&["amy", "bob"]),
+            vec!["missing required approval from `olga`".to_string()],
+            "two of the baseline without the overlay approver hold"
+        );
+        assert!(approvals(&["amy", "bob", "olga"]).is_empty());
+        assert!(approvals(&["bob", "cid", "olga"]).is_empty());
+        assert_eq!(
+            approvals(&["amy", "olga"]),
+            vec!["needs 2 approval(s) from `amy`, `bob`, `cid`; has 1".to_string()]
+        );
+        // The overlay approver does not count toward the baseline's two.
+        assert!(!approvals(&["amy", "olga", "zed"]).is_empty());
     }
 }
 

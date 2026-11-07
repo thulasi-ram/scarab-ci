@@ -101,3 +101,39 @@ test("run-detail walkthrough: DAG, versions, activity, gate, tries, artifacts", 
   await expect(page.getByText("build@a3")).toBeVisible();
   await expect(page.getByText("of record", { exact: true })).toBeVisible();
 });
+
+// The ENVIRONMENT GATE run in src/mock.ts: a deploy into production with a
+// plain QA gate and the approval gate production added.
+const ENV_GATE_RUN_ID = "0190f8a2000071fb8c00e7a9b0c1d2e3";
+
+test("an environment approval gate says so, names who added it, and its wait timer", async ({ page }) => {
+  await page.goto(`/acme/scarab/runs/${ENV_GATE_RUN_ID}`);
+  await expect(page.getByRole("heading", { name: /#152/ })).toBeVisible();
+
+  // The DAG: the added gate is an approval gate, added by production.
+  const added = page.getByRole("button", { name: /^environment-approval/ });
+  await expect(added).toContainText("gate · approval");
+  await expect(added).toContainText("added by Production");
+  await expect(page.getByRole("button", { name: /^qa/ })).toContainText("gate · manual");
+
+  // The gate cards: the approval gate names the environment; the plain one
+  // says nothing of its approvers.
+  const bar = page.locator(".gate-bar");
+  const approvalRow = bar.locator(".gate-row", { hasText: "environment-approval" });
+  const qaRow = bar.locator(".gate-row", { hasText: /^\s*qa/ });
+  await expect(approvalRow).toContainText("Environment approval gate · added by Production (production)");
+  await expect(approvalRow).toContainText("waiting for the environment's approvers");
+  await expect(qaRow).toContainText("waiting for a decision");
+  await expect(qaRow).not.toContainText(/approver|Environment/);
+
+  // Approving records the approval and says when the wait timer releases it.
+  await approvalRow.getByRole("button", { name: "Approve" }).click();
+  await expect(approvalRow).toContainText(/approval recorded · the gate releases at .+, when the wait timer runs out/);
+  await expect(approvalRow).not.toContainText(/fail/);
+  await expect(approvalRow.locator(".gate-clock")).toContainText(/releases at .+ · in \d+:\d\d/);
+  await expect(approvalRow).toContainText("approvals in · waiting for the wait timer");
+
+  // The step pane names the gate too.
+  await added.click();
+  await expect(page.locator(".gate-env-line")).toContainText("Environment approval gate · added by Production (production)");
+});

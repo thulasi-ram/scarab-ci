@@ -322,3 +322,43 @@ async fn scarab_server_in_the_environment_does_not_contact_a_server() {
         other => panic!("the CLI connected to SCARAB_SERVER: {other:?}"),
     }
 }
+
+/// ADR-0078: for a Pipeline that names an Environment, offline validate
+/// says which `manual` gates are Environment approval gates and where the
+/// Environment would add one, and that both depend on server settings.
+#[tokio::test(flavor = "multi_thread")]
+async fn offline_validate_names_the_environment_approval_gates() {
+    let dir = repo();
+    std::fs::write(
+        dir.join(".scarab/deploy.yaml"),
+        r#"
+on:
+  push: {}
+environment: prod
+steps:
+  - { id: build, image: busybox, command: ["true"] }
+  - { id: qa, gate: manual, needs: [build] }
+  - { id: smoke, image: busybox, command: ["true"], needs: [qa] }
+  - { id: approve, gate: manual, needs: [build] }
+  - { id: migrate, image: busybox, secrets: [DB], needs: [approve] }
+  - { id: ship, image: busybox, command: ["true"], deploy: true, needs: [build] }
+"#,
+    )
+    .unwrap();
+    let out = output(scarab(&dir, &["validate", ".scarab/deploy.yaml"])).await;
+    let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
+    assert_eq!(out.status.code(), Some(0), "{stdout}{stderr}");
+    for line in [
+        "gate `qa`: a plain gate",
+        "gate `approve`: an Environment approval gate",
+        "if `prod` has approvers, it adds gate `environment-approval` (needs: [build]) in front \
+         of `ship`",
+        "server settings this check does not read",
+    ] {
+        assert!(stdout.contains(line), "want `{line}` in:\n{stdout}");
+    }
+
+    // A Pipeline that names no Environment says nothing about gates.
+    let out = output(scarab(&dir, &["validate", ".scarab/plain.yaml"])).await;
+    assert!(!text(&out.stdout).contains("gate"), "{}", text(&out.stdout));
+}

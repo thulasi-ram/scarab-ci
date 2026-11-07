@@ -2957,6 +2957,7 @@ dependencies = [
  "chrono",
  "regex",
  "scarab-pipeline",
+ "scarab-project",
  "serde",
  "serde_json",
  "sha2",

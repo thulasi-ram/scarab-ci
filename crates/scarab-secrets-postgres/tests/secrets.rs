@@ -77,6 +77,78 @@ async fn store_fetch_ciphertext_at_rest_and_scoping() {
     tdb.cleanup().await;
 }
 
+/// The Projects holding secrets in one Environment (git-bug d002a0c): read
+/// back from the flat scope keys, exact on the org and the Environment —
+/// `%` and `_` in a name are not wildcards, and Environment `prod/eu`'s
+/// secrets are not Environment `eu`'s.
+#[tokio::test]
+async fn environment_secret_projects_reads_exactly_one_environment() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let secrets = PostgresSecrets::with_master(tdb.pool.clone(), [7u8; 32]);
+    secrets.migrate().await.unwrap();
+    let env = |org: &str, project: &str, environment: &str| SecretScope::EnvironmentProject {
+        org: org.into(),
+        project: project.into(),
+        environment: environment.into(),
+    };
+    for scope in [
+        env("acme", "web", "prod"),
+        env("acme", "api", "prod"),
+        env("acme", "web", "prod/eu"),
+        env("acme", "jobs", "p_od"),
+        env("acm%", "web", "prod"),
+        repo_scope("prod"),
+    ] {
+        for key in ["A", "B"] {
+            secrets
+                .put(
+                    &scope,
+                    Secret {
+                        key: key.into(),
+                        value: b"v".to_vec(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+    }
+    assert_eq!(
+        secrets
+            .environment_secret_projects("acme", "prod")
+            .await
+            .unwrap(),
+        ["api", "web"]
+    );
+    assert_eq!(
+        secrets
+            .environment_secret_projects("acme", "prod/eu")
+            .await
+            .unwrap(),
+        ["web"]
+    );
+    assert!(secrets
+        .environment_secret_projects("acme", "eu")
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(secrets
+        .environment_secret_projects("acme", "p%od")
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        secrets
+            .environment_secret_projects("acm%", "prod")
+            .await
+            .unwrap(),
+        ["web"]
+    );
+    tdb.cleanup().await;
+}
+
 /// A provider with the wrong master key cannot decrypt what another wrote —
 /// the value is protected by the master key, not just the database.
 #[tokio::test]

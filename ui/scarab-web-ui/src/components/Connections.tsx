@@ -1,12 +1,11 @@
-// Forge connections (ADR-0060 part C) — the Settings section that answers "is my
+// Forge connections — the Settings section that answers "is my
 // forge still wired up, and what does it cover?"
 //
 // A connection is the thing that makes a repo a Project: `ForgeConnection`
 // resolves a forge coordinate to a governed Project, and a Project *is* that
-// binding (ADR-0046). So this list is the whole footprint of Scarab's reach.
+// binding. So this list is the whole footprint of Scarab's reach.
 //
-// The surface is **asymmetric by forge**, and that asymmetry is the design
-// (ADR-0060 part C):
+// The surface is **asymmetric by forge**, and that asymmetry is the design:
 //
 // - **GitHub is observe-only.** Installing the App *is* registration — there is
 //   no API for Scarab to install it, uninstall it, or change which repos it
@@ -27,7 +26,7 @@
 // the URL. A connection that serves no org yet ("unassigned") is listed to a
 // global admin in a panel of its own, on every org's page, because no org's
 // list includes it.
-import { createResource, createSignal, For, Show } from "solid-js";
+import { createResource, createSignal, For, Show, type JSX } from "solid-js";
 import { useNavigate } from "@solidjs/router";
 import {
   assignConnectionOrg,
@@ -51,10 +50,12 @@ import {
   unassignedConnections,
 } from "../connections";
 import { relTime } from "../fmt";
-import { confirmsName } from "../org-environments";
 import { me, refetchMe } from "../session";
 import { FIRST_ORG_SECTION, orgHref } from "../settings-nav";
 import FormSection from "./FormSection";
+import Modal, { ModalMessage, ModalSection } from "./Modal";
+import ConfirmDestructive from "./ConfirmDestructive";
+import { Field, Input } from "./Field";
 import Icon from "./Icon";
 
 /** Where a connection's own management lives, when the forge has such a page. */
@@ -122,19 +123,14 @@ export default function Connections(props: { org: string }) {
           </Show>
         </div>
         <Show when={adding()}>
-          <div class="modal-scrim" onClick={() => setAdding(false)}>
-            <div class="modal modal-tall" onClick={(e) => e.stopPropagation()}>
-              <div class="panel-h"><span>Add Forgejo connection</span></div>
-              <ForgejoConnectionForm
-                org={props.org}
-                onSaved={() => {
-                  reload();
-                  setAdding(false);
-                }}
-                onCancel={() => setAdding(false)}
-              />
-            </div>
-          </div>
+          <ForgejoConnectionForm
+            org={props.org}
+            onSaved={() => {
+              reload();
+              setAdding(false);
+            }}
+            onCancel={() => setAdding(false)}
+          />
         </Show>
       </div>
 
@@ -210,7 +206,7 @@ export function ConnectForge() {
  *
  * With `org`, the org is fixed (the org page it was opened from) and shown
  * read-only; without it, the caller names a new org. With `onCancel` it is a
- * dialog's content: the sections in `.modal-body`, the actions in `.modal-foot`.
+ * dialog: the same sections in a Modal, the actions in its footer.
  */
 function ForgejoConnectionForm(props: {
   org?: string;
@@ -247,78 +243,54 @@ function ForgejoConnectionForm(props: {
     }
   };
 
+  // A dialog's sections are ModalSections; on a page they are FormSections.
+  const Sec = (p: { n: number; title: string; children: JSX.Element }) =>
+    props.onCancel ? <ModalSection {...p} /> : <FormSection {...p} />;
+
   const sections = (
     <>
-      <FormSection n={1} title="Organization">
+      <Sec n={1} title="Organization">
         <Show
           when={props.org}
           fallback={
-            <>
-              <label for="conn-org">forge account that owns the repositories</label>
-              <input
-                id="conn-org"
-                class="input mono"
-                placeholder="acme"
-                value={newOrg()}
-                onInput={(e) => setNewOrg(e.currentTarget.value)}
-              />
-              <Show when={newOrg().trim() !== "" && orgProblem()}>
-                <p class="fieldnote">{orgProblem()}</p>
-              </Show>
-            </>
+            <Field
+              id="conn-org"
+              label="Forge account that owns the repositories"
+              required
+              error={newOrg().trim() !== "" ? orgProblem() : null}
+            >
+              <Input mono placeholder="acme" value={newOrg()} onValue={setNewOrg} />
+            </Field>
           }
         >
-          <div class="input input-static mono" aria-label="Organization">
-            {props.org}
-          </div>
-          <p class="fieldnote">The connection binds only repositories owned by this account.</p>
-        </Show>
-      </FormSection>
-      <FormSection n={2} title="Forgejo instance">
-        <label for="conn-url">instance URL</label>
-        <input
-          id="conn-url"
-          class="input mono"
-          placeholder="https://codeberg.org"
-          value={baseUrl()}
-          onInput={(e) => setBaseUrl(e.currentTarget.value)}
-        />
-      </FormSection>
-      <FormSection n={3} title="Access token">
-        <label for="conn-token">token</label>
-        <input
-          id="conn-token"
-          class="input"
-          type="password"
-          placeholder="token (write-only)"
-          value={token()}
-          onInput={(e) => setToken(e.currentTarget.value)}
-        />
-        <p class="fieldnote">
-          It needs repository read and webhook administration on the repositories you intend to
-          build. It is stored encrypted and never displayed again.
-        </p>
-      </FormSection>
-    </>
-  );
-  const actions = (
-    <>
-      <Show when={error()}>
-        <p class="error">{error()}</p>
-      </Show>
-      <div class="modal-actions">
-        <button class="btn btn-primary" disabled={saving() || !ready()} onClick={save}>
-          <Icon icon="plus" size={14} /> {saving() ? "Connecting…" : "Add connection"}
-        </button>
-        <Show when={props.onCancel}>
-          {(cancel) => (
-            <button class="btn btn-ghost" onClick={() => cancel()()}>
-              Cancel
-            </button>
+          {(o) => (
+            <Field label="Organization" help="The connection binds only repositories owned by this account.">
+              <Input mono readOnly value={o()} onValue={() => {}} />
+            </Field>
           )}
         </Show>
-      </div>
+      </Sec>
+      <Sec n={2} title="Forgejo instance">
+        <Field id="conn-url" label="Instance URL" required>
+          <Input mono placeholder="https://codeberg.org" value={baseUrl()} onValue={setBaseUrl} />
+        </Field>
+      </Sec>
+      <Sec n={3} title="Access token">
+        <Field
+          id="conn-token"
+          label="Token"
+          required
+          help="It needs repository read and webhook administration on the repositories you intend to build. It is stored encrypted and never displayed again."
+        >
+          <Input type="password" placeholder="token (write-only)" value={token()} onValue={setToken} />
+        </Field>
+      </Sec>
     </>
+  );
+  const add = (
+    <button class="btn btn-primary" type="button" disabled={saving() || !ready()} onClick={save}>
+      <Icon icon="plus" size={14} /> {saving() ? "Connecting…" : "Add connection"}
+    </button>
   );
 
   return (
@@ -327,12 +299,35 @@ function ForgejoConnectionForm(props: {
       fallback={
         <div class="conn-form">
           {sections}
-          {actions}
+          <Show when={error()}>
+            <p class="error">{error()}</p>
+          </Show>
+          <div class="modal-actions">{add}</div>
         </div>
       }
     >
-      <div class="modal-body">{sections}</div>
-      <div class="modal-foot">{actions}</div>
+      {(cancel) => (
+        <Modal
+          eyebrow={`${props.org} · connections`}
+          title="Add Forgejo connection"
+          purpose="Connect a Forgejo or Codeberg instance. Its repositories become projects once you add them."
+          busy={saving()}
+          onClose={() => cancel()()}
+          footer={
+            <>
+              <Show when={error()}>
+                <ModalMessage>{error()}</ModalMessage>
+              </Show>
+              <button class="btn btn-ghost" type="button" onClick={() => cancel()()} disabled={saving()}>
+                Cancel
+              </button>
+              {add}
+            </>
+          }
+        >
+          {sections}
+        </Modal>
+      )}
     </Show>
   );
 }
@@ -386,22 +381,17 @@ function ConnectionRow(props: { conn: Connection; onChanged: () => void }) {
   };
 
   // Unbinding removes the Project, so it takes that repo's environments, secrets
-  // and access grants with it. Say so before doing it.
-  const removeRepo = async (org: string, project: string, owner: string, name: string) => {
-    if (
-      !window.confirm(
-        `Remove ${org}/${project} from Scarab?\n\nIts project — including environments, secrets and access grants — is removed with it. The repository itself and its webhook are untouched.`,
-      )
-    )
-      return;
+  // and access grants with it. The confirm says so; a refusal shows in it.
+  const [removingRepo, setRemovingRepo] = createSignal<
+    { org: string; project: string; owner: string; name: string } | null
+  >(null);
+  const removeRepo = async (owner: string, name: string) => {
     setBusy(true);
     setNote(null);
     setError(null);
     try {
       await unbindRepo(c().id, owner, name);
       props.onChanged();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Could not remove the repository.");
     } finally {
       setBusy(false);
     }
@@ -409,17 +399,15 @@ function ConnectionRow(props: { conn: Connection; onChanged: () => void }) {
 
   // Removing a connection removes the Projects it serves — a Project *is* the
   // binding — so the server refuses unless we acknowledge that explicitly. The
-  // confirm names what goes and asks for the connection's id to be typed.
+  // confirm names what goes and asks for the connection's id to be typed; a
+  // refusal shows in it.
   const remove = async () => {
     setBusy(true);
     setNote(null);
     setError(null);
     try {
       await deleteConnection(c().id, c().projects.length > 0);
-      setRemoving(false);
       props.onChanged();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Could not remove the connection.");
     } finally {
       setBusy(false);
     }
@@ -430,8 +418,8 @@ function ConnectionRow(props: { conn: Connection; onChanged: () => void }) {
       <div class="conn-head">
         <span class="conn-kind mono">{c().kind}</span>
         <code class="mono conn-base">{c().base_url}</code>
-        {/* Config-owned connections are read-only here on purpose (ADR-0060 part
-            D): the `connections:` block is authoritative, so an edit made here
+        {/* Config-owned connections are read-only here on purpose: the
+            `connections:` block is authoritative, so an edit made here
             would be silently reverted on the next boot. The tag names the source
             so the change has an obvious home. */}
         <Show when={c().managed_by_config}>
@@ -534,7 +522,7 @@ function ConnectionRow(props: { conn: Connection; onChanged: () => void }) {
                     class="btn btn-danger btn-sm"
                     disabled={busy()}
                     title="Remove this repository's project from Scarab"
-                    onClick={() => removeRepo(p.org, p.project, p.owner, p.name)}
+                    onClick={() => setRemovingRepo({ org: p.org, project: p.project, owner: p.owner, name: p.name })}
                   >
                     Remove
                   </button>
@@ -566,12 +554,21 @@ function ConnectionRow(props: { conn: Connection; onChanged: () => void }) {
       </Show>
 
       <Show when={removing()}>
-        <RemoveConnection
-          conn={c()}
-          busy={busy()}
-          onConfirm={remove}
-          onCancel={() => setRemoving(false)}
-        />
+        <RemoveConnection conn={c()} onConfirm={remove} onClose={() => setRemoving(false)} />
+      </Show>
+      <Show when={removingRepo()}>
+        {(r) => (
+          <ConfirmDestructive
+            title={`Remove ${r().org}/${r().project} from Scarab?`}
+            purpose="Its project — including environments, secrets and access grants — is removed with it."
+            name={`${r().org}/${r().project}`}
+            confirmLabel="Remove repository"
+            onConfirm={() => removeRepo(r().owner, r().name)}
+            onClose={() => setRemovingRepo(null)}
+          >
+            <p>The repository itself and its webhook are untouched.</p>
+          </ConfirmDestructive>
+        )}
       </Show>
 
       <Show when={note()}>
@@ -601,18 +598,20 @@ function ConnectionRow(props: { conn: Connection; onChanged: () => void }) {
  */
 function RemoveConnection(props: {
   conn: Connection;
-  busy: boolean;
-  onConfirm: () => void;
-  onCancel: () => void;
+  onConfirm: () => Promise<void>;
+  onClose: () => void;
 }) {
-  const [typed, setTyped] = createSignal("");
   const projects = () => props.conn.projects;
-  const ok = () => confirmsName(typed(), props.conn.id) && !props.busy;
   return (
-    <div class="typed-confirm">
+    <ConfirmDestructive
+      title={`Remove the ${props.conn.kind} connection?`}
+      purpose={<span class="mono">{props.conn.base_url}</span>}
+      name={props.conn.id}
+      confirmLabel="Remove connection"
+      onConfirm={props.onConfirm}
+      onClose={props.onClose}
+    >
       <p>
-        Remove the {props.conn.kind} connection to{" "}
-        <span class="mono">{props.conn.base_url}</span>?{" "}
         <Show when={projects().length > 0} fallback="It serves no projects.">
           This also removes {projects().length}{" "}
           {projects().length === 1 ? "project" : "projects"} (
@@ -620,30 +619,7 @@ function RemoveConnection(props: {
           with their environments, secrets and access grants.
         </Show>
       </p>
-      <label>
-        <span>
-          Type <b class="mono">{props.conn.id}</b> to confirm
-        </span>
-        <input
-          class="input mono"
-          aria-label={`Type ${props.conn.id} to confirm`}
-          value={typed()}
-          onInput={(e) => setTyped(e.currentTarget.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && ok()) props.onConfirm();
-          }}
-          autofocus
-        />
-      </label>
-      <div class="modal-actions">
-        <button class="btn btn-danger btn-sm" disabled={!ok()} onClick={() => props.onConfirm()}>
-          {props.busy ? "Removing…" : "Remove connection"}
-        </button>
-        <button class="btn btn-ghost btn-sm" onClick={() => props.onCancel()}>
-          Cancel
-        </button>
-      </div>
-    </div>
+    </ConfirmDestructive>
   );
 }
 
@@ -683,23 +659,19 @@ function AssignConnection(props: {
         Which organization does <span class="mono">{props.conn.id}</span> serve? Its admins then
         manage it, and it binds only repositories that organization owns.
       </p>
-      <label>
-        <span>organization</span>
-        <input
-          class="input mono"
+      <Field label="Organization" error={org().trim() !== "" ? problem() : null}>
+        <Input
+          mono
           aria-label="Organization to assign"
           placeholder="acme"
           value={org()}
-          onInput={(e) => setOrg(e.currentTarget.value)}
+          onValue={setOrg}
           onKeyDown={(e) => {
             if (e.key === "Enter") void save();
           }}
           autofocus
         />
-      </label>
-      <Show when={org().trim() !== "" && problem()}>
-        <p class="fieldnote">{problem()}</p>
-      </Show>
+      </Field>
       <Show when={error()}>
         <p class="error">{error()}</p>
       </Show>
@@ -827,7 +799,7 @@ function PreflightGap(props: { gap: CapabilityRequirement; muted?: boolean }) {
 
 /**
  * Bring repos on a connection under governance. Binding **creates the Project**
- * (there is no `projects` table — a Project is the binding, ADR-0046), which is
+ * (there is no `projects` table — a Project is the binding), which is
  * why this dialog is the Forgejo onboarding flow and not a convenience.
  *
  * The pick-list comes from the forge, so nobody types `owner/name`. When the
@@ -881,109 +853,99 @@ function AddRepoDialog(props: {
   const typing = () => !avail.loading && avail() == null;
 
   return (
-    <div class="modal-scrim" onClick={props.onClose}>
-      <div class="modal modal-tall" onClick={(e) => e.stopPropagation()}>
-        <div class="panel-h"><span>Add repository</span></div>
-        <div class="modal-body">
-          <Show when={avail.error}>
-            <p class="error">Could not ask the forge which repositories it can see.</p>
+    <Modal
+      eyebrow={`${org()} · ${props.conn.id}`}
+      title="Add repository"
+      purpose="Adding a repository creates its project and registers a webhook, so pushes start runs."
+      busy={busy() != null}
+      onClose={props.onClose}
+      footer={
+        <>
+          <Show when={error()}>
+            <ModalMessage>{error()}</ModalMessage>
           </Show>
-          <Show when={!avail.loading} fallback={<p class="empty">asking the forge…</p>}>
-            {/* `null` = this adapter cannot enumerate. Fall back to typing it. */}
-            <Show
-              when={avail() != null}
-              fallback={
+          <button class="btn btn-ghost" type="button" onClick={props.onClose}>
+            Cancel
+          </button>
+          <Show when={typing()}>
+            <button class="btn btn-primary" type="button" disabled={busy() != null} onClick={addTyped}>
+              <Icon icon="plus" size={14} /> Add
+            </button>
+          </Show>
+        </>
+      }
+    >
+      <Show when={avail.error}>
+        <p class="error">Could not ask the forge which repositories it can see.</p>
+      </Show>
+      <Show when={!avail.loading} fallback={<p class="empty">asking the forge…</p>}>
+        {/* `null` = this adapter cannot enumerate. Fall back to typing it. */}
+        <Show
+          when={avail() != null}
+          fallback={
+            <Field
+              label="Repository"
+              required
+              help={
                 <>
-                  <p class="subtle">
-                    <small>
-                      This forge cannot list its repositories, so name one directly. It must be
-                      owned by <span class="mono">{org()}</span>.
-                    </small>
-                  </p>
-                  <div class="form-r">
-                    <label>repository</label>
-                    <input
-                      class="input mono"
-                      placeholder={`${org()}/name`}
-                      value={manualRepo()}
-                      onInput={(e) => setManualRepo(e.currentTarget.value)}
-                    />
-                  </div>
+                  This forge cannot list its repositories, so name one directly. It must be owned
+                  by <span class="mono">{org()}</span>.
                 </>
               }
             >
-              <Show
-                when={pick().offered.length > 0}
-                fallback={
-                  <p class="empty">
+              <Input mono autofocus placeholder={`${org()}/name`} value={manualRepo()} onValue={setManualRepo} />
+            </Field>
+          }
+        >
+          <Show
+            when={pick().offered.length > 0}
+            fallback={
+              <p class="empty">
+                <Show
+                  when={pick().hidden > 0}
+                  fallback="This connection's token does not reach any repository. Check its scopes on the forge."
+                >
+                  This connection's token reaches no repository owned by{" "}
+                  <span class="mono">{org()}</span>.
+                </Show>
+              </p>
+            }
+          >
+            <ul class="secret-list">
+              <For each={pick().offered}>
+                {(r) => (
+                  <li class="secret-row">
+                    <Icon icon="git-branch" size={14} />
+                    <code class="mono">
+                      {r.owner}/{r.name}
+                    </code>
                     <Show
-                      when={pick().hidden > 0}
-                      fallback="This connection's token does not reach any repository. Check its scopes on the forge."
+                      when={!r.bound}
+                      fallback={<span class="subtle"><small>already added</small></span>}
                     >
-                      This connection's token reaches no repository owned by{" "}
-                      <span class="mono">{org()}</span>.
+                      <button
+                        class="btn btn-primary btn-sm"
+                        disabled={busy() != null}
+                        onClick={() => add(r.owner, r.name)}
+                      >
+                        {busy() === `${r.owner}/${r.name}` ? "Adding…" : "Add"}
+                      </button>
                     </Show>
-                  </p>
-                }
-              >
-                <ul class="secret-list">
-                  <For each={pick().offered}>
-                    {(r) => (
-                      <li class="secret-row">
-                        <Icon icon="git-branch" size={14} />
-                        <code class="mono">
-                          {r.owner}/{r.name}
-                        </code>
-                        <Show
-                          when={!r.bound}
-                          fallback={<span class="subtle"><small>already added</small></span>}
-                        >
-                          <button
-                            class="btn btn-primary btn-sm"
-                            disabled={busy() != null}
-                            onClick={() => add(r.owner, r.name)}
-                          >
-                            {busy() === `${r.owner}/${r.name}` ? "Adding…" : "Add"}
-                          </button>
-                        </Show>
-                      </li>
-                    )}
-                  </For>
-                </ul>
-              </Show>
-            </Show>
+                  </li>
+                )}
+              </For>
+            </ul>
           </Show>
-          <Show when={pick().hidden > 0}>
-            <p class="subtle">
-              <small>
-                {pick().hidden} {pick().hidden === 1 ? "repository" : "repositories"} the token
-                reaches {pick().hidden === 1 ? "is" : "are"} owned by other accounts and not
-                listed. This connection binds only repositories owned by{" "}
-                <span class="mono">{org()}</span>.
-              </small>
-            </p>
-          </Show>
-          <p class="subtle modal-note">
-            <small>
-              Adding a repository creates its project and registers a webhook, so pushes
-              start runs.
-            </small>
-          </p>
-        </div>
-        <div class="modal-foot">
-          <Show when={error()}>
-            <p class="error">{error()}</p>
-          </Show>
-          <div class="modal-actions">
-            <Show when={typing()}>
-              <button class="btn btn-primary" disabled={busy() != null} onClick={addTyped}>
-                <Icon icon="plus" size={14} /> Add
-              </button>
-            </Show>
-            <button class="btn btn-ghost" onClick={props.onClose}>Cancel</button>
-          </div>
-        </div>
-      </div>
-    </div>
+        </Show>
+      </Show>
+      <Show when={pick().hidden > 0}>
+        <p class="f-help">
+          {pick().hidden} {pick().hidden === 1 ? "repository" : "repositories"} the token
+          reaches {pick().hidden === 1 ? "is" : "are"} owned by other accounts and not
+          listed. This connection binds only repositories owned by{" "}
+          <span class="mono">{org()}</span>.
+        </p>
+      </Show>
+    </Modal>
   );
 }

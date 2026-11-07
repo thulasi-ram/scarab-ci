@@ -866,6 +866,16 @@ pub struct StepSpec {
     /// the gate is reached.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugin_gate: Option<PluginGateSpec>,
+    /// For a `manual` gate of an Environment-governed Run, whether it is an
+    /// **Environment approval gate** (ADR-0078 §1): `Some(true)` when a Step
+    /// after it, through `needs`, uses the Environment's authority. Decided
+    /// once, at Run creation, and stored with the Run, so a rerun never
+    /// decides it again. Written only by Run creation, like
+    /// [`origin`](Self::origin): an authored one is a compile error. `None`
+    /// on every other Step, and on a gate of a Run created before the
+    /// decision existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment_approval_gate: Option<bool>,
 }
 
 /// What a `gate: plugin` node waits on (ADR-0076 §7).
@@ -1061,6 +1071,9 @@ pub enum OriginKind {
     Library,
     /// A plugin's gate (ADR-0076).
     Plugin,
+    /// The Environment approval gate an Environment added to the Run
+    /// (ADR-0078 §2): `name` is the Environment, `content_hash` is empty.
+    Environment,
 }
 
 /// One link of a compiled Step's [`origin`](StepSpec::origin).
@@ -1095,6 +1108,15 @@ impl StepSpec {
     /// Is this an image-less gate step (a durable suspend point)?
     pub fn is_gate(&self) -> bool {
         self.gate.is_some()
+    }
+
+    /// In a Run an Environment governs, whether this Step is an
+    /// **Environment approval gate** (ADR-0078 §1): a `manual` gate that Run
+    /// creation marked one, or left unmarked. A gate is unmarked only in a
+    /// Run created before the mark existed, when every `manual` gate of a
+    /// governed Run needed the approvers, so it counts as one.
+    pub fn counts_as_environment_approval_gate(&self) -> bool {
+        self.gate.as_deref() == Some("manual") && self.environment_approval_gate != Some(false)
     }
 
     /// Is this a build step (ADR-0018 rootless image build)?
@@ -2769,6 +2791,10 @@ fn inline_level(
             ("scope", step.scope.is_some()),
             ("guards", !step.guards.is_empty()),
             ("plugin_gate", step.plugin_gate.is_some()),
+            (
+                "environment_approval_gate",
+                step.environment_approval_gate.is_some(),
+            ),
         ] {
             if set {
                 let place = match stack.last() {
@@ -5222,11 +5248,12 @@ fn validate_results(step: &StepSpec, diagnostics: &mut Vec<String>) {
     }
 }
 
-/// Every `${{ outputs.<step>.<name> }}` read of a Step that declares
-/// `results:` must name a declared result (ADR-0070 §7, kept by ADR-0074 §3),
-/// so a typo fails the Pipeline check instead of the reading Step at launch.
-/// A Step that declares nothing keeps the open ADR-0041 map and is not
-/// checked. A read names a Step through the reader's scope (ADR-0076): a
+/// Every `${{ outputs.<step>.<name> }}` read names a Step among the
+/// reader's own `needs` (the only results a Step reads at launch, git-bug
+/// 4c2d1f6), and a read of a Step that declares `results:` must name a
+/// declared result (ADR-0070 §7, kept by ADR-0074 §3), so a typo fails the
+/// Pipeline check instead of the reading Step at launch. A Step that
+/// declares nothing keeps the open ADR-0041 map: any name it publishes. A read names a Step through the reader's scope (ADR-0076): a
 /// library Step's `outputs.b` is its own library's `b`, never a Step of the
 /// same name elsewhere.
 fn validate_output_reads(ir: &PipelineIr, diagnostics: &mut Vec<String>) {
@@ -5243,9 +5270,6 @@ fn validate_output_reads(ir: &PipelineIr, diagnostics: &mut Vec<String>) {
             None => (!s.results.is_empty()).then(|| (s.id.as_str(), s.results.clone())),
         })
         .collect();
-    if declared.is_empty() {
-        return;
-    }
     // `with:` templates already checked, by the invoke Step that wrote them:
     // every Step a library inlines carries its invocation's bindings.
     let mut bindings_seen: BTreeSet<(&str, &str)> = BTreeSet::new();
@@ -5287,7 +5311,34 @@ fn validate_output_reads(ir: &PipelineIr, diagnostics: &mut Vec<String>) {
                         continue;
                     };
                     let step = match view {
-                        None => name.clone(),
+                        None => {
+                            // Ids as written: the read must name a Step of
+                            // this Pipeline among the reader's own `needs`,
+                            // the only results a Step can read at launch
+                            // (git-bug 4c2d1f6). A matrixed Step is named by
+                            // its authored id; its instances are `id[…]`.
+                            let is = |id: &str| {
+                                id == name
+                                    || id
+                                        .strip_prefix(name.as_str())
+                                        .is_some_and(|r| r.starts_with('['))
+                            };
+                            if !ir.steps.iter().any(|s| is(&s.id)) {
+                                diagnostics.push(format!(
+                                    "step `{reader}`: reads `outputs.{name}.{field}`, which is \
+                                     not a Step of this Pipeline"
+                                ));
+                                continue;
+                            }
+                            if !t.needs.0.iter().any(|n| is(n)) {
+                                diagnostics.push(format!(
+                                    "step `{reader}`: reads `outputs.{name}.{field}` but does \
+                                     not `needs: [{name}]`"
+                                ));
+                                continue;
+                            }
+                            name.clone()
+                        }
                         Some(outputs) => match outputs.get(&name) {
                             Some(OutputSource::Step(id)) => id.clone(),
                             Some(OutputSource::Invoke(exposed)) => match exposed.get(&field) {
@@ -8507,6 +8558,10 @@ mod tests {
         for field in [
             "scope: { inputs: run }",
             "guards: [{ caller_hops: 0, when: 'true' }]",
+            // An author who wrote `false` would turn an Environment
+            // approval gate into a plain gate, released with no approver.
+            "environment_approval_gate: false",
+            "environment_approval_gate: true",
         ] {
             let errs = errors(&format!("steps: [{{ id: a, image: busybox, {field} }}]"));
             let name = field.split(':').next().unwrap();
@@ -8530,6 +8585,9 @@ mod tests {
                 "{errs:?}"
             );
         }
+        let errs = errors("steps: [{ id: a, gate: manual, environment_approval_gate: false }]");
+        let refused = "step `a`: `environment_approval_gate` is written by the compiler";
+        assert!(errs.iter().any(|e| e.contains(refused)), "{errs:?}");
     }
 
     #[test]
@@ -10600,6 +10658,43 @@ mod tests {
         );
     }
 
+    /// git-bug 4c2d1f6: a Step renders with the results of its own `needs`
+    /// only, so a read of any other Step failed the reading Step at launch.
+    /// It is a compile error: a Step that is not among `needs` (not even
+    /// through a Step it needs), or no Step at all. Whatever surface the
+    /// read sits in, and whether or not the producer declares `results:`.
+    #[test]
+    fn a_read_of_a_step_outside_needs_is_a_compile_error() {
+        for (steps, want) in [
+            (
+                r#"[{ id: a, image: busybox }, { id: b, image: busybox, env: [[V, "${{ outputs.a.v }}"]] }]"#,
+                "step `b`: reads `outputs.a.v` but does not `needs: [a]`",
+            ),
+            (
+                r#"[{ id: a, image: busybox, results: [v] }, { id: m, image: busybox, needs: [a] }, { id: b, image: busybox, needs: [m], env: [[V, "${{ outputs.a.v }}"]] }]"#,
+                "step `b`: reads `outputs.a.v` but does not `needs: [a]`",
+            ),
+            (
+                r#"[{ id: a, image: busybox }, { id: b, image: busybox, needs: [a], env: [[V, "${{ outputs.ghost.v }}"]] }]"#,
+                "step `b`: reads `outputs.ghost.v`, which is not a Step of this Pipeline",
+            ),
+            (
+                r#"[{ id: a, image: "reg/${{ outputs.ghost.v }}" }]"#,
+                "step `a`: reads `outputs.ghost.v`, which is not a Step of this Pipeline",
+            ),
+        ] {
+            let ds = errors(&format!("steps: {steps}\n"));
+            assert!(ds.iter().any(|d| d == want), "{steps}: {ds:?}");
+        }
+        // Reading a Step it needs compiles, a matrixed one by its authored id.
+        for steps in [
+            r#"[{ id: a, image: busybox }, { id: b, image: busybox, needs: [a], env: [[V, "${{ outputs.a.v }}"]] }]"#,
+            r#"[{ id: a, image: busybox, matrix: { dimensions: { os: [l, m] } } }, { id: b, image: busybox, needs: [a], env: [[V, "${{ outputs.a.v }}"]] }]"#,
+        ] {
+            assert!(compile_yaml(&format!("steps: {steps}\n")).is_ok(), "{steps}");
+        }
+    }
+
     #[test]
     fn a_read_of_an_undeclared_result_is_a_compile_error() {
         for surface in [
@@ -10758,3 +10853,4 @@ mod tests {
         );
     }
 }
+

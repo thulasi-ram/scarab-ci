@@ -10,16 +10,16 @@
 //!
 //! [`with_migrated_legacy_environment`]: InMemoryEnvironmentGovernance::with_migrated_legacy_environment
 
-use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use scarab_project::{
     migrate_legacy_environment, DeployGovernance, Environment, EnvironmentGovernanceStore,
     EnvironmentMigrationAcknowledgement, EnvironmentMigrationReport,
-    EnvironmentMigrationReportProject, EnvironmentProjectEligibility, EnvironmentProjectOverlay,
-    EnvironmentProjectPrivilegeGrant, EnvironmentProjectRecord, EnvironmentProtectionRules,
-    OrgEnvironment, OrgEnvironmentError, ProtectionRules,
+    EnvironmentMigrationReportProject, EnvironmentNameClaim, EnvironmentProjectEligibility,
+    EnvironmentProjectOverlay, EnvironmentProjectPrivilegeGrant, EnvironmentProjectRecord,
+    EnvironmentProtectionRules, OrgEnvironment, OrgEnvironmentError, ProtectionRules,
 };
 
 type EnvironmentKey = (String, String);
@@ -50,6 +50,21 @@ struct State {
 #[derive(Default)]
 pub struct InMemoryEnvironmentGovernance {
     state: Mutex<State>,
+    /// The names a Duplicate holds a claim on, as the Postgres store's
+    /// advisory locks.
+    claims: Arc<Mutex<BTreeSet<EnvironmentKey>>>,
+}
+
+/// One held name claim: removed from the set when dropped.
+struct HeldClaim {
+    claims: Arc<Mutex<BTreeSet<EnvironmentKey>>>,
+    key: EnvironmentKey,
+}
+
+impl Drop for HeldClaim {
+    fn drop(&mut self) {
+        self.claims.lock().unwrap().remove(&self.key);
+    }
 }
 
 /// Eligibility as stored: patterns sorted (and, for comparison, deduped).
@@ -82,6 +97,7 @@ fn new_environment(
     OrgEnvironment {
         org: org.to_string(),
         name: name.to_string(),
+        display_name: None,
         description: String::new(),
         protection: EnvironmentProtectionRules::default(),
         eligibility,
@@ -364,7 +380,11 @@ impl EnvironmentGovernanceStore for InMemoryEnvironmentGovernance {
                 return Err(OrgEnvironmentError::changed_concurrently());
             }
         }
-        state.overlays.insert(key, overlay.clone());
+        // An overlay has no approval gate settings (ADR-0078 §3): Postgres
+        // stores none for it and reads back the default, so this does too.
+        let mut overlay = overlay.clone();
+        overlay.rules.approval_gate = Default::default();
+        state.overlays.insert(key, overlay);
         Ok(())
     }
 
@@ -436,6 +456,87 @@ impl EnvironmentGovernanceStore for InMemoryEnvironmentGovernance {
                 project.to_string(),
             ))
             .is_some())
+    }
+
+    async fn claim_environment_name(
+        &self,
+        org: &str,
+        name: &str,
+    ) -> Result<Option<EnvironmentNameClaim>, OrgEnvironmentError> {
+        let key = (org.to_string(), name.to_string());
+        if !self.claims.lock().unwrap().insert(key.clone()) {
+            return Ok(None);
+        }
+        Ok(Some(EnvironmentNameClaim::new(HeldClaim {
+            claims: self.claims.clone(),
+            key,
+        })))
+    }
+
+    async fn duplicate_environment(
+        &self,
+        org: &str,
+        from: &str,
+        to: &str,
+        display_name: Option<&str>,
+        updated_by: &str,
+        updated_at: i64,
+    ) -> Result<OrgEnvironment, OrgEnvironmentError> {
+        // One lock: the copy is all or nothing, as Postgres' transaction.
+        let mut state = self.state.lock().unwrap();
+        let source = state
+            .environments
+            .get(&(org.to_string(), from.to_string()))
+            .ok_or_else(|| not_found(org, from))?
+            .clone();
+        let copy = OrgEnvironment {
+            name: to.to_string(),
+            display_name: display_name.map(str::to_string),
+            created_at: updated_at,
+            updated_at,
+            updated_by: updated_by.to_string(),
+            ..source
+        };
+        copy.validate()?;
+        if state
+            .environments
+            .contains_key(&(org.to_string(), to.to_string()))
+        {
+            return Err(OrgEnvironmentError::already_exists(org, to));
+        }
+        let in_source = |(o, e, _): &ProjectKey| o == org && e == from;
+        let overlays: Vec<EnvironmentProjectOverlay> = state
+            .overlays
+            .iter()
+            .filter(|(k, _)| in_source(k))
+            .map(|(_, o)| EnvironmentProjectOverlay {
+                environment: to.to_string(),
+                ..o.clone()
+            })
+            .collect();
+        let grants: Vec<EnvironmentProjectPrivilegeGrant> = state
+            .grants
+            .iter()
+            .filter(|(k, _)| in_source(k))
+            .map(|(_, g)| EnvironmentProjectPrivilegeGrant {
+                environment: to.to_string(),
+                ..g.clone()
+            })
+            .collect();
+        for o in overlays {
+            state
+                .overlays
+                .insert((o.org.clone(), o.environment.clone(), o.project.clone()), o);
+        }
+        for g in grants {
+            state
+                .grants
+                .insert((g.org.clone(), g.environment.clone(), g.project.clone()), g);
+        }
+        state
+            .environments
+            .insert((org.to_string(), to.to_string()), copy.clone());
+        Ok(copy)
     }
 
     async fn environment_projects(

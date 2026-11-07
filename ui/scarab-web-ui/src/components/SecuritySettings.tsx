@@ -1,4 +1,4 @@
-// Account → Security (ADR-0073): your passkeys, adding and removing one, and
+// Account → Security: your passkeys, adding and removing one, and
 // your own security events.
 //
 // - A FIRST passkey needs a browser login from the last 5 minutes; an older
@@ -25,6 +25,8 @@ import { absTime, relTime } from "../fmt";
 import { passkeyBadges, passkeyLabel, shouldAutoEnroll, wantsEnroll } from "../security";
 import { createPasskey, webauthnAvailable, webauthnErrorText } from "../webauthn";
 import Icon from "./Icon";
+import ConfirmDestructive from "./ConfirmDestructive";
+import { Input } from "./Field";
 import SecurityEventTable from "./SecurityEventTable";
 
 export default function SecuritySettings() {
@@ -84,13 +86,10 @@ export default function SecuritySettings() {
     }
   };
 
+  // The passkey being removed: the confirm dialog is open while set. A
+  // refusal (a cancelled step-up included) shows in the dialog.
+  const [removing, setRemoving] = createSignal<Passkey | null>(null);
   const remove = async (p: Passkey) => {
-    if (
-      !window.confirm(
-        `Remove the passkey "${p.label}"?\n\nIt can no longer confirm anything. If it is your last one, every crown-jewel change is refused until you enroll another.`,
-      )
-    )
-      return;
     setBusy(true);
     setError(null);
     setNotice(null);
@@ -99,8 +98,6 @@ export default function SecuritySettings() {
       setNotice(`Passkey "${p.label}" removed.`);
       await refetch();
       await loadEvents();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Could not remove the passkey.");
     } finally {
       setBusy(false);
     }
@@ -203,7 +200,7 @@ export default function SecuritySettings() {
                             <button
                               class="btn btn-danger btn-sm tok-revoke"
                               disabled={busy()}
-                              onClick={() => remove(p)}
+                              onClick={() => setRemoving(p)}
                             >
                               remove
                             </button>
@@ -227,12 +224,12 @@ export default function SecuritySettings() {
                 </Show>
 
                 <div class="secrets-actions sec-add">
-                  <input
-                    class="input"
+                  <Input
+                    aria-label="Passkey name"
                     placeholder="Name it (MacBook Touch ID, YubiKey…)"
                     maxLength={64}
                     value={label()}
-                    onInput={(e) => setLabel(e.currentTarget.value)}
+                    onValue={setLabel}
                   />
                   <button class="btn btn-primary btn-sm" disabled={busy()} onClick={() => enroll()}>
                     <Icon icon="plus" size={14} /> {busy() ? "Working…" : "Add passkey"}
@@ -247,6 +244,24 @@ export default function SecuritySettings() {
                 </p>
               </Show>
             </>
+          )}
+        </Show>
+
+        <Show when={removing()}>
+          {(p) => (
+            <ConfirmDestructive
+              title={`Remove the passkey "${p().label}"?`}
+              purpose="It can no longer confirm anything."
+              name={p().label}
+              confirmLabel="Remove passkey"
+              onConfirm={() => remove(p())}
+              onClose={() => setRemoving(null)}
+            >
+              <p>
+                If it is your last one, every crown-jewel change is refused until you enroll
+                another.
+              </p>
+            </ConfirmDestructive>
           )}
         </Show>
 
