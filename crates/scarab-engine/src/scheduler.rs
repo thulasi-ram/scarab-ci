@@ -79,13 +79,15 @@ pub const RUN_FINISHED: &str = "run_finished";
 pub const CANCEL_RUN: &str = "cancel_run";
 
 /// Outbox message kind: tear down a cancelled Run's shared services
-/// (ADR-0058), written by the Run's `→ Cancelled` commit. Its own kind, not
-/// [`CANCEL_RUN`] with a `services` payload (git-bug aaa559c): during a
-/// rolling upgrade, replicas older than the attempt-scoped cancel claim
-/// every `cancel_run` row and tear down each Step's latest attempt, which
-/// after a rerun is the rerun's live one. They never claim this kind. A
-/// `cancel_run` row with a `services` payload, written before this kind
-/// existed, is still drained the same way.
+/// (ADR-0058), written by the Run's `→ Cancelled` commit. It used to be a
+/// [`CANCEL_RUN`] row; it has its own kind because, during a rolling
+/// upgrade, replicas older than the attempt-scoped cancel claim every
+/// `cancel_run` row and tear down each Step's latest attempt, which after a
+/// rerun is the rerun's live one (git-bug aaa559c). They never claim this
+/// kind. The payload keeps its `services` field so one drain body serves
+/// both kinds: `cancel_run` rows written before this kind existed are still
+/// drained. That `cancel_run` claim can go once no binary older than this
+/// one runs and no such row is pending.
 pub const CANCEL_SERVICES: &str = "cancel_services";
 
 /// Outbox message kind: tear down the units of named Attempts a cancel
@@ -3126,7 +3128,8 @@ impl<'a> Scheduler<'a> {
     /// Drain cancel-teardown intents (ADR-0054): every [`CANCEL_ATTEMPT`]
     /// tears down exactly the attempts it names
     /// ([`drain_attempt_teardowns`](Self::drain_attempt_teardowns)), and
-    /// every [`CANCEL_SERVICES`] (and a legacy [`CANCEL_RUN`]) the cancelled Run's shared services (ADR-0058),
+    /// every [`CANCEL_SERVICES`] (and a legacy [`CANCEL_RUN`]) the cancelled
+    /// Run's shared services (ADR-0058),
     /// which are not steps and so are reached by no attempt intent and by no
     /// later tick. A message is retired only once everything it names reached
     /// the desired end state; a genuinely failed teardown is retried rather
