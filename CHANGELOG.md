@@ -262,7 +262,16 @@ record. Read Breaking changes before you upgrade.
   debug Pod, `…/debug-pod`) reads the Pod's environment and acts with its credentials, but it
   asked only for `Administer`. It now needs a step-up confirmation, as a secret write does: a
   browser session's 5-minute window satisfies it. An API token or a session presented as
-  `Bearer` can no longer open one, since a WebSocket cannot be held for a confirmation.
+  `Bearer` can no longer open one, since a WebSocket cannot be held for a confirmation. A
+  browser's WebSocket cannot send `x-csrf-token`, so the web UI sends the session's CSRF token
+  as the `scarab.csrf.<token>` subprotocol, and the server answers with `scarab.v1`. Before it
+  opens the socket, the UI makes a plain `GET` of the same URL, which asks for the window when
+  the session has none (git-bug aeba20a).
+- A secret value that is not UTF-8 (a keystore, a binary key) reached the Step changed: it was
+  read as text and invalid bytes were replaced. Values are now bytes from the store to the
+  file; the per-Pod Kubernetes Secret uses `data`. An `env: true` secret must be UTF-8 text,
+  and a Step whose `env: true` secret is not fails with a configuration error that names it
+  (git-bug c1f61c9).
 - **Passkey counter checks.** Two uses of one passkey verified at the same time could flag it
   as a suspected clone when the later count landed first. A use whose count was ahead of the
   stored one when it was checked, and differs from the count stored since, is now recorded;
@@ -430,6 +439,16 @@ record. Read Breaking changes before you upgrade.
 
 ### Enhancement
 
+- `PUT /v1/orgs/{org}/environments/{env}/protection` takes the approval gate settings under
+  `approval_gate` (`missing_gate_mode`, `added_gate_expiry_s`, `required_approvals`,
+  `max_approval_age_s`), the shape its `GET` returns, so a client can send back what it read.
+  The same fields at the top level are refused (git-bug 16c48e1).
+- `POST /v1/runs/{id}/gates/{step}/approve` answers with a typed body (`released`,
+  `approvals`, `releases_at`) described in the OpenAPI spec, which also lists its 403.
+- The `run.create` and `step.admit` Policy inputs list a Step's `env: true` secrets as
+  `step.env_secrets`. Decisions recorded earlier lack it, so read it as
+  `has(step.env_secrets) && 'NAME' in step.env_secrets`.
+
 - **The Environment's approval-gate rules run in the policy engine.** The gate the Environment
   adds (`run.create`), the release rules of an Environment approval gate (`gate.resolve`) and
   the check at each launch (`step.admit`) are built-in rules of the engine. Each consultation
@@ -531,6 +550,11 @@ record. Read Breaking changes before you upgrade.
   Environment view and edit pages.
 
 ### Misc
+
+- `rust-toolchain.toml` names an exact Rust release (1.97.0) and `rustfmt.toml` pins the style
+  edition, so what `cargo fmt --check` accepts no longer changes with each Rust release. The
+  workspace is formatted, and CI (`openapi-drift`), `just check all` and the dogfood `lint`
+  step check it (git-bug 0b78f43).
 
 - `just stack up dogfood` signs in with GitHub instead of running dev-insecure: identity store,
   role bindings, API tokens and passkey step-up, as a real install. It needs
