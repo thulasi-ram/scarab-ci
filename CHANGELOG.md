@@ -168,7 +168,8 @@ record. Read Breaking changes before you upgrade.
   use its authority (declared `secrets:`, a governed grant or `k8s_overlay`, `forge_token: write`,
   or `deploy: true`). Runs that deployed unasked start waiting for an approver on the day you
   upgrade. An org admin can set an Environment to refuse such a Run instead (missing-gate mode
-  `refuse`), which names the gate to add. See
+  `refuse`), which names the gate to add. A `forge_token: write` Step is no longer refused at Run
+  creation for having no `manual` gate upstream; it gets the added gate like any other. See
   [Environments](https://thulasi-ram.github.io/scarab-ci/usage/environments/#the-approval-gate).
 - **`manual` gates that guard no authority Step stop needing the approvers.** Only a gate with a
   Step after it that uses the Environment's authority needs the Environment's approvers and a

@@ -5513,7 +5513,6 @@ async fn admit_unrecorded(
     let write = match gov.protection() {
         Some(p) => forge_token::WriteGovernance {
             restricts_refs: !p.unrestricted_refs(),
-            has_approvers: !p.approvers.is_empty(),
         },
         None => forge_token::WriteGovernance::default(),
     };
