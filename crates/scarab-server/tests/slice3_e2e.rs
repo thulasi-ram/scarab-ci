@@ -105,14 +105,19 @@ async fn push_webhook_runs_pipeline_posts_checks_and_login_authorizes() {
     let run = RunId(run_id.clone());
 
     // 2. The converged driver runs it to success and posts statuses back.
+    // The first pass runs with nothing scripted, so the step is still
+    // running when that pass posts the start status: a `pending` post the
+    // driver drains only after the Run settled is dropped (git-bug 1074fde).
     let exec: Arc<FakeExecutor> = Arc::new(FakeExecutor::new());
-    for _ in 0..4 {
-        exec.script_outcome(ExecState::Succeeded);
-    }
     let exec_dyn: Arc<dyn Executor> = exec.clone();
     let supervision = scarab_engine::Supervision::new();
     let health = scarab_engine::TickHealth::new();
-    for _ in 0..10 {
+    for pass in 0..10 {
+        if pass == 1 {
+            for _ in 0..4 {
+                exec.script_outcome(ExecState::Succeeded);
+            }
+        }
         converged::tick_once(
             &db_dyn,
             &clock_dyn,
@@ -122,7 +127,9 @@ async fn push_webhook_runs_pipeline_posts_checks_and_login_authorizes() {
             None,
             None,
             "e2e",
-            30_000,
+            // Re-claim at once: the launch intent the first pass polled is
+            // polled again on the next pass, not after a 30 s lease.
+            0,
             3_600_000,
             None,
             "http://scarab.test",
