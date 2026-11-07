@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use sqlx::Row;
 
 use scarab_project::{
-    EnvironmentProjectEligibility, EnvironmentProtectionRules, OrgEnvironment, OrgEnvironmentError,
-    OrgEnvironmentStore,
+    ApprovalGateRules, EnvironmentProjectEligibility, EnvironmentProtectionRules, MissingGateMode,
+    OrgEnvironment, OrgEnvironmentError, OrgEnvironmentStore,
 };
 
 use crate::PostgresDb;
@@ -25,7 +25,7 @@ pub(crate) fn org_environment_from_row(
     eligible_project_patterns: Vec<String>,
 ) -> Result<OrgEnvironment, OrgEnvironmentError> {
     let name: String = row.get("name");
-    let protection = protection_rules_from_row(row, &name)?;
+    let protection = baseline_rules_from_row(row, &name)?;
     // The flag wins over any list: the eligibility write clears the list
     // when it sets the flag, so both present is a hand-edited row, and
     // reading it as "all" is what the flag literally says.
@@ -48,7 +48,9 @@ pub(crate) fn org_environment_from_row(
 
 /// The four protection rules from a row carrying them as columns — an
 /// `org_environments` baseline or an `environment_project_overlays` overlay
-/// (one shape, ADR-0071 §1, §3). `what` names the row in an error.
+/// (one shape, ADR-0071 §1, §3) — with the default approval gate settings,
+/// which an overlay never has ([`baseline_rules_from_row`] reads a
+/// baseline's). `what` names the row in an error.
 pub(crate) fn protection_rules_from_row(
     row: &sqlx::postgres::PgRow,
     what: &str,
@@ -61,12 +63,42 @@ pub(crate) fn protection_rules_from_row(
         allowed_refs: row.get("allowed_refs"),
         wait_timer_s,
         require_reason: row.get("require_reason"),
+        approval_gate: ApprovalGateRules::default(),
+    })
+}
+
+/// A baseline's rules from its `org_environments` row: the four rules an
+/// overlay shares ([`protection_rules_from_row`]) and the approval gate's
+/// settings, which only a baseline has (ADR-0078 §3, migration 0079).
+pub(crate) fn baseline_rules_from_row(
+    row: &sqlx::postgres::PgRow,
+    what: &str,
+) -> Result<EnvironmentProtectionRules, OrgEnvironmentError> {
+    let unreadable =
+        |field: &str| OrgEnvironmentError::Store(format!("`{what}` holds an unreadable {field}"));
+    let positive = |v: Option<i32>, field: &str| -> Result<Option<u32>, OrgEnvironmentError> {
+        v.map(|v| u32::try_from(v).map_err(|_| unreadable(field)))
+            .transpose()
+    };
+    let missing_gate = MissingGateMode::parse(&row.get::<String, _>("missing_gate_mode"))
+        .ok_or_else(|| unreadable("missing-gate mode"))?;
+    let max_approval_age_s =
+        positive(Some(row.get("max_approval_age_s")), "maximum approval age")?.unwrap_or_default();
+    Ok(EnvironmentProtectionRules {
+        approval_gate: ApprovalGateRules {
+            missing_gate,
+            added_gate_expiry_s: positive(row.get("added_gate_expiry_s"), "added gate expiry")?,
+            required_approvals: positive(row.get("required_approvals"), "required approvals")?,
+            max_approval_age_s,
+        },
+        ..protection_rules_from_row(row, what)?
     })
 }
 
 pub(crate) const ORG_ENVIRONMENT_COLUMNS: &str =
     "org, name, description, created_at, updated_at, updated_by, \
-     approvers, allowed_refs, wait_timer_s, require_reason, eligible_all_projects";
+     approvers, allowed_refs, wait_timer_s, require_reason, eligible_all_projects, \
+     missing_gate_mode, added_gate_expiry_s, required_approvals, max_approval_age_s";
 
 /// One Environment's eligible project patterns, sorted, read with `executor`.
 pub(crate) async fn eligible_project_patterns_of<'e, E>(

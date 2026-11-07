@@ -485,12 +485,39 @@ async fn write_needs_an_environment_that_restricts_refs() {
 }
 
 /// Where the Environment has approvers, `write` needs a manual gate
-/// upstream, so an approver releases the Step first.
+/// upstream, so an approver releases the Step first. With none in the YAML
+/// the Environment adds one (ADR-0078 §2); in missing-gate mode `refuse`
+/// the Run is refused.
 #[tokio::test]
 async fn write_needs_a_manual_gate_where_the_environment_has_approvers() {
     let db = InMemoryDb::new();
     let gov = prod(&["refs/heads/main"], &["amy"]).await;
     let forge = minting(&[(".scarab/deploy.yaml", DEPLOY_WRITE_YAML)]);
+    let out = trigger(&db, &forge, AdmissionPorts::governance(Some(&gov)), &push()).await;
+    assert_eq!(out.runs.len(), 1, "{:?}", out.refused);
+    let tag = db
+        .steps_of_run(&out.runs[0])
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.step.0 == "tag")
+        .unwrap();
+    assert!(
+        tag.needs.contains(&StepId("environment-approval".into())),
+        "{:?}",
+        tag.needs
+    );
+
+    let mut refusing = gov
+        .org_environment("acme", "prod")
+        .await
+        .unwrap()
+        .unwrap()
+        .protection;
+    refusing.approval_gate.missing_gate = scarab_project::MissingGateMode::Refuse;
+    gov.put_environment_protection("acme", "prod", &refusing, "amy", 2)
+        .await
+        .unwrap();
     let reason =
         refused_reason(&trigger(&db, &forge, AdmissionPorts::governance(Some(&gov)), &push()).await);
     assert!(reason.contains("gate: manual"), "{reason}");
@@ -498,6 +525,97 @@ async fn write_needs_a_manual_gate_where_the_environment_has_approvers() {
     let forge = minting(&[(".scarab/deploy.yaml", GATED_WRITE_YAML)]);
     let out = trigger(&db, &forge, AdmissionPorts::governance(Some(&gov)), &push()).await;
     assert_eq!(out.runs.len(), 1, "{:?}", out.refused);
+}
+
+/// A `write` Step excluded by its `when:` (`event.kind` is `push`).
+const EXCLUDED_WRITE_YAML: &str = r#"
+on:
+  push: {}
+environment: prod
+steps:
+  - { id: build, image: busybox }
+  - { id: tag, image: alpine/git, forge_token: write, when: "event.kind == 'manual'" }
+"#;
+
+/// cd43bf3: `forge_token: write` has no gate check of its own at Run
+/// creation; the Environment's added gate and the launch re-check cover it.
+/// A `write` Step that its `when:` excludes never starts, so the Run is
+/// admitted with no gate. A `write` Step with no approval gate upstream (a
+/// Run created before its Environment had approvers) is refused at launch,
+/// and no token is minted.
+#[tokio::test]
+async fn write_with_no_approval_is_refused_at_launch_and_an_excluded_one_is_admitted() {
+    let db = Arc::new(InMemoryDb::new());
+    let gov = Arc::new(prod(&["refs/heads/main"], &["amy"]).await);
+    let forge = minting(&[(".scarab/deploy.yaml", EXCLUDED_WRITE_YAML)]);
+    let out = trigger(
+        db.as_ref(),
+        &forge,
+        AdmissionPorts::governance(Some(gov.as_ref())),
+        &push(),
+    )
+    .await;
+    assert_eq!(out.runs.len(), 1, "{:?}", out.refused);
+    let ids: Vec<String> = db
+        .steps_of_run(&out.runs[0])
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|s| s.step.0)
+        .collect();
+    assert_eq!(ids, vec!["build".to_string(), "tag".to_string()], "no gate");
+
+    // Created while `prod` had no approvers: no gate.
+    let with_approvers = without_approvers(&gov).await;
+    let forge = Arc::new(minting(&[(".scarab/deploy.yaml", DEPLOY_WRITE_YAML)]));
+    let out = trigger(
+        db.as_ref(),
+        forge.as_ref(),
+        AdmissionPorts::governance(Some(gov.as_ref())),
+        &push(),
+    )
+    .await;
+    assert_eq!(out.runs.len(), 1, "{:?}", out.refused);
+    let run = out.runs[0].clone();
+    gov.put_environment_protection("acme", "prod", &with_approvers, "amy", 3)
+        .await
+        .unwrap();
+
+    let inner = Arc::new(FakeExecutor::new());
+    let exec = ForgeCredentialExecutor::new(inner.clone(), forge.clone())
+        .with_environment_governance(db.clone() as Arc<dyn Db>, gov.clone());
+    let clock = FakeClock::new(1_000);
+    let sched = Scheduler::new(db.as_ref(), &clock as &dyn Clock, &exec, "sched");
+    for _ in 0..4 {
+        sched.tick(&run).await.unwrap();
+    }
+    assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Failed));
+    let attempts = db
+        .attempts_of_step(&run, &StepId("tag".into()))
+        .await
+        .unwrap();
+    let refusal = attempts[0].failure_detail.clone().unwrap_or_default();
+    assert!(
+        refusal.contains("no Environment approval gate is upstream"),
+        "{refusal}"
+    );
+    assert_eq!(forge.credential_calls(), 0, "no token minted");
+}
+
+/// Take `prod`'s approvers away; the rules as they were.
+async fn without_approvers(gov: &InMemoryEnvironmentGovernance) -> EnvironmentProtectionRules {
+    let before = gov
+        .org_environment("acme", "prod")
+        .await
+        .unwrap()
+        .unwrap()
+        .protection;
+    let mut open = before.clone();
+    open.approvers.clear();
+    gov.put_environment_protection("acme", "prod", &open, "amy", 2)
+        .await
+        .unwrap();
+    before
 }
 
 /// Each launch mints a credential, a rerun included, and the token of the
