@@ -19,7 +19,7 @@ use scarab_project::{
     EnvironmentMigrationAcknowledgement, EnvironmentMigrationReport,
     EnvironmentMigrationReportProject, EnvironmentNameClaim, EnvironmentProjectEligibility,
     EnvironmentProjectOverlay, EnvironmentProjectPrivilegeGrant, EnvironmentProjectRecord,
-    EnvironmentProtectionRules, OrgEnvironment, OrgEnvironmentError, ProtectionRules,
+    EnvironmentProtectionRules, ImageGrant, OrgEnvironment, OrgEnvironmentError, ProtectionRules,
 };
 
 type EnvironmentKey = (String, String);
@@ -65,6 +65,33 @@ impl Drop for HeldClaim {
     fn drop(&mut self) {
         self.claims.lock().unwrap().remove(&self.key);
     }
+}
+
+/// What an overlay write compares: every field but the key, which names the
+/// row. The pattern lists every field, so a new one fails to compile here
+/// until it is either compared or named as key.
+fn overlay_values(o: &EnvironmentProjectOverlay) -> &EnvironmentProtectionRules {
+    let EnvironmentProjectOverlay {
+        org: _,
+        environment: _,
+        project: _,
+        rules,
+    } = o;
+    rules
+}
+
+/// What a privilege-grant write compares: every field but the key, which
+/// names the row. The pattern lists every field, so a new one fails to
+/// compile here until it is either compared or named as key.
+fn grant_values(g: &EnvironmentProjectPrivilegeGrant) -> (&Vec<ImageGrant>, bool) {
+    let EnvironmentProjectPrivilegeGrant {
+        org: _,
+        environment: _,
+        project: _,
+        privileged_images,
+        permit_k8s_overlay,
+    } = g;
+    (privileged_images, *permit_k8s_overlay)
 }
 
 /// Eligibility as stored: patterns sorted (and, for comparison, deduped).
@@ -375,8 +402,7 @@ impl EnvironmentGovernanceStore for InMemoryEnvironmentGovernance {
             overlay.project.clone(),
         );
         if let Some(expected) = expected {
-            let stored = state.overlays.get(&key).map(|o| &o.rules);
-            if stored != expected.map(|o| &o.rules) {
+            if state.overlays.get(&key).map(overlay_values) != expected.map(overlay_values) {
                 return Err(OrgEnvironmentError::changed_concurrently());
             }
         }
@@ -427,11 +453,7 @@ impl EnvironmentGovernanceStore for InMemoryEnvironmentGovernance {
             grant.project.clone(),
         );
         if let Some(expected) = expected {
-            let stored = state
-                .grants
-                .get(&key)
-                .map(|g| (&g.privileged_images, g.permit_k8s_overlay));
-            if stored != expected.map(|g| (&g.privileged_images, g.permit_k8s_overlay)) {
+            if state.grants.get(&key).map(grant_values) != expected.map(grant_values) {
                 return Err(OrgEnvironmentError::changed_concurrently());
             }
         }

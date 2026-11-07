@@ -5,6 +5,8 @@
 //!
 //! [`deploy_governance`]: EnvironmentGovernanceStore::deploy_governance
 
+use std::sync::LazyLock;
+
 use async_trait::async_trait;
 use sqlx::Row;
 
@@ -55,8 +57,109 @@ fn wait_timer_column(rules: &EnvironmentProtectionRules) -> Result<i32, OrgEnvir
     })
 }
 
-const OVERLAY_COLUMNS: &str = "org, environment, project, approvers, allowed_refs, \
-     wait_timer_s, require_reason";
+/// A per-Project governance table. Its rows are keyed by `(org,
+/// environment, project)` and end in `updated_at, updated_by`; the value
+/// columns sit between. Every statement on the table is built from that one
+/// list, so a value column cannot be written by one statement and left out
+/// of another's compare.
+struct ProjectTable {
+    /// The key and value columns, for a `SELECT`.
+    columns: String,
+    /// Insert, or match nothing when the Project already has a row.
+    insert_if_absent: String,
+    /// Update when every value column still holds the expected value.
+    update_if_unchanged: String,
+    /// Insert, or replace the Project's row.
+    upsert: String,
+}
+
+impl ProjectTable {
+    /// Placeholders: the key is `$1..$3`, the new values follow, then
+    /// `updated_at` and `updated_by`; `update_if_unchanged` takes the
+    /// expected values after those.
+    fn new(table: &str, values: &[&str]) -> Self {
+        let n = values.len();
+        let list = values.join(", ");
+        let written = || values.iter().copied().chain(["updated_at", "updated_by"]);
+        let placeholders = (1..=n + 5)
+            .map(|i| format!("${i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let insert = format!(
+            "INSERT INTO {table} (org, environment, project, {list}, updated_at, updated_by) \
+             VALUES ({placeholders}) ON CONFLICT (org, environment, project) DO"
+        );
+        let excluded = written()
+            .map(|c| format!("{c} = EXCLUDED.{c}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let set = written()
+            .enumerate()
+            .map(|(i, c)| format!("{c} = ${}", i + 4))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let unchanged: String = values
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!(" AND {c} = ${}", i + n + 6))
+            .collect();
+        Self {
+            columns: format!("org, environment, project, {list}"),
+            insert_if_absent: format!("{insert} NOTHING"),
+            update_if_unchanged: format!(
+                "UPDATE {table} SET {set} \
+                 WHERE org = $1 AND environment = $2 AND project = $3{unchanged}"
+            ),
+            upsert: format!("{insert} UPDATE SET {excluded}"),
+        }
+    }
+}
+
+type PgQuery<'q> = sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>;
+
+/// `environment_project_overlays`: an overlay's rules, minus the approval
+/// gate settings, which only a baseline stores.
+static OVERLAYS: LazyLock<ProjectTable> = LazyLock::new(|| {
+    ProjectTable::new(
+        "environment_project_overlays",
+        &[
+            "approvers",
+            "allowed_refs",
+            "wait_timer_s",
+            "require_reason",
+        ],
+    )
+});
+
+/// Bind `rules` as the values of [`OVERLAYS`], in its column order.
+fn bind_overlay_rules<'q>(
+    q: PgQuery<'q>,
+    rules: &'q EnvironmentProtectionRules,
+    wait_timer_s: i32,
+) -> PgQuery<'q> {
+    q.bind(&rules.approvers)
+        .bind(&rules.allowed_refs)
+        .bind(wait_timer_s)
+        .bind(rules.require_reason)
+}
+
+/// One of the [`OVERLAYS`] writes with `overlay`'s key, rules and the
+/// update stamp bound.
+fn overlay_write<'q>(
+    sql: &'q str,
+    overlay: &'q EnvironmentProjectOverlay,
+    wait_timer_s: i32,
+    updated_by: &'q str,
+    updated_at: i64,
+) -> PgQuery<'q> {
+    let q = sqlx::query(sql)
+        .bind(&overlay.org)
+        .bind(&overlay.environment)
+        .bind(&overlay.project);
+    bind_overlay_rules(q, &overlay.rules, wait_timer_s)
+        .bind(updated_at)
+        .bind(updated_by)
+}
 
 fn overlay_from_row(
     row: &sqlx::postgres::PgRow,
@@ -74,7 +177,41 @@ fn overlay_from_row(
     })
 }
 
-const GRANT_COLUMNS: &str = "org, environment, project, privileged_images, permit_k8s_overlay";
+/// `environment_project_privilege_grants`.
+static GRANTS: LazyLock<ProjectTable> = LazyLock::new(|| {
+    ProjectTable::new(
+        "environment_project_privilege_grants",
+        &["privileged_images", "permit_k8s_overlay"],
+    )
+});
+
+/// Bind a grant's values (`images` is its whitelist as JSON) as the values
+/// of [`GRANTS`], in its column order.
+fn bind_grant_values<'q>(
+    q: PgQuery<'q>,
+    images: &'q serde_json::Value,
+    permit_k8s_overlay: bool,
+) -> PgQuery<'q> {
+    q.bind(images).bind(permit_k8s_overlay)
+}
+
+/// One of the [`GRANTS`] writes with `grant`'s key, values and the update
+/// stamp bound.
+fn grant_write<'q>(
+    sql: &'q str,
+    grant: &'q EnvironmentProjectPrivilegeGrant,
+    images: &'q serde_json::Value,
+    updated_by: &'q str,
+    updated_at: i64,
+) -> PgQuery<'q> {
+    let q = sqlx::query(sql)
+        .bind(&grant.org)
+        .bind(&grant.environment)
+        .bind(&grant.project);
+    bind_grant_values(q, images, grant.permit_k8s_overlay)
+        .bind(updated_at)
+        .bind(updated_by)
+}
 
 fn grant_from_row(
     row: &sqlx::postgres::PgRow,
@@ -182,7 +319,8 @@ async fn migration_report_lines(
     let mut overlays: std::collections::HashMap<(String, String), EnvironmentProjectOverlay> =
         std::collections::HashMap::new();
     for row in sqlx::query(&format!(
-        "SELECT {OVERLAY_COLUMNS} FROM environment_project_overlays WHERE org = $1"
+        "SELECT {} FROM environment_project_overlays WHERE org = $1",
+        OVERLAYS.columns
     ))
     .bind(org)
     .fetch_all(&mut **tx)
@@ -341,8 +479,9 @@ impl EnvironmentGovernanceStore for PostgresDb {
         };
         let env = stored_environment(&mut tx, &row, org, environment).await?;
         let overlay = sqlx::query(&format!(
-            "SELECT {OVERLAY_COLUMNS} FROM environment_project_overlays
-             WHERE org = $1 AND environment = $2 AND project = $3"
+            "SELECT {} FROM environment_project_overlays
+             WHERE org = $1 AND environment = $2 AND project = $3",
+            OVERLAYS.columns
         ))
         .bind(org)
         .bind(environment)
@@ -354,8 +493,9 @@ impl EnvironmentGovernanceStore for PostgresDb {
         .map(overlay_from_row)
         .transpose()?;
         let grant = sqlx::query(&format!(
-            "SELECT {GRANT_COLUMNS} FROM environment_project_privilege_grants
-             WHERE org = $1 AND environment = $2 AND project = $3"
+            "SELECT {} FROM environment_project_privilege_grants
+             WHERE org = $1 AND environment = $2 AND project = $3",
+            GRANTS.columns
         ))
         .bind(org)
         .bind(environment)
@@ -386,8 +526,9 @@ impl EnvironmentGovernanceStore for PostgresDb {
         let mut overlays: std::collections::HashMap<String, EnvironmentProjectOverlay> =
             std::collections::HashMap::new();
         for row in sqlx::query(&format!(
-            "SELECT {OVERLAY_COLUMNS} FROM environment_project_overlays
-             WHERE org = $1 AND project = $2"
+            "SELECT {} FROM environment_project_overlays
+             WHERE org = $1 AND project = $2",
+            OVERLAYS.columns
         ))
         .bind(org)
         .bind(project)
@@ -401,8 +542,9 @@ impl EnvironmentGovernanceStore for PostgresDb {
         let mut grants: std::collections::HashMap<String, EnvironmentProjectPrivilegeGrant> =
             std::collections::HashMap::new();
         for row in sqlx::query(&format!(
-            "SELECT {GRANT_COLUMNS} FROM environment_project_privilege_grants
-             WHERE org = $1 AND project = $2"
+            "SELECT {} FROM environment_project_privilege_grants
+             WHERE org = $1 AND project = $2",
+            GRANTS.columns
         ))
         .bind(org)
         .bind(project)
@@ -581,22 +723,13 @@ impl EnvironmentGovernanceStore for PostgresDb {
             // update-if-unchanged. Either matches nothing when a concurrent
             // write got there first.
             Some(None) => {
-                let inserted = sqlx::query(
-                    "INSERT INTO environment_project_overlays
-                         (org, environment, project, approvers, allowed_refs, wait_timer_s,
-                          require_reason, updated_at, updated_by)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                     ON CONFLICT (org, environment, project) DO NOTHING",
+                let inserted = overlay_write(
+                    &OVERLAYS.insert_if_absent,
+                    overlay,
+                    wait_timer_s,
+                    updated_by,
+                    updated_at,
                 )
-                .bind(&overlay.org)
-                .bind(&overlay.environment)
-                .bind(&overlay.project)
-                .bind(&overlay.rules.approvers)
-                .bind(&overlay.rules.allowed_refs)
-                .bind(wait_timer_s)
-                .bind(overlay.rules.require_reason)
-                .bind(updated_at)
-                .bind(updated_by)
                 .execute(self.pool())
                 .await
                 .map_err(|e| write_err(e, &overlay.org, &overlay.environment))?
@@ -609,27 +742,17 @@ impl EnvironmentGovernanceStore for PostgresDb {
             }
             Some(Some(old)) => {
                 let old_wait_timer_s = wait_timer_column(&old.rules)?;
-                let updated = sqlx::query(
-                    "UPDATE environment_project_overlays SET
-                         approvers = $4, allowed_refs = $5, wait_timer_s = $6,
-                         require_reason = $7, updated_at = $8, updated_by = $9
-                     WHERE org = $1 AND environment = $2 AND project = $3
-                       AND approvers = $10 AND allowed_refs = $11 AND wait_timer_s = $12
-                       AND require_reason = $13",
+                let updated = bind_overlay_rules(
+                    overlay_write(
+                        &OVERLAYS.update_if_unchanged,
+                        overlay,
+                        wait_timer_s,
+                        updated_by,
+                        updated_at,
+                    ),
+                    &old.rules,
+                    old_wait_timer_s,
                 )
-                .bind(&overlay.org)
-                .bind(&overlay.environment)
-                .bind(&overlay.project)
-                .bind(&overlay.rules.approvers)
-                .bind(&overlay.rules.allowed_refs)
-                .bind(wait_timer_s)
-                .bind(overlay.rules.require_reason)
-                .bind(updated_at)
-                .bind(updated_by)
-                .bind(&old.rules.approvers)
-                .bind(&old.rules.allowed_refs)
-                .bind(old_wait_timer_s)
-                .bind(old.rules.require_reason)
                 .execute(self.pool())
                 .await
                 .map_err(org_environment_store_err)?
@@ -641,28 +764,13 @@ impl EnvironmentGovernanceStore for PostgresDb {
                 };
             }
         }
-        sqlx::query(
-            "INSERT INTO environment_project_overlays
-                 (org, environment, project, approvers, allowed_refs, wait_timer_s, require_reason,
-                  updated_at, updated_by)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-             ON CONFLICT (org, environment, project) DO UPDATE SET
-                 approvers = EXCLUDED.approvers,
-                 allowed_refs = EXCLUDED.allowed_refs,
-                 wait_timer_s = EXCLUDED.wait_timer_s,
-                 require_reason = EXCLUDED.require_reason,
-                 updated_at = EXCLUDED.updated_at,
-                 updated_by = EXCLUDED.updated_by",
+        overlay_write(
+            &OVERLAYS.upsert,
+            overlay,
+            wait_timer_s,
+            updated_by,
+            updated_at,
         )
-        .bind(&overlay.org)
-        .bind(&overlay.environment)
-        .bind(&overlay.project)
-        .bind(&overlay.rules.approvers)
-        .bind(&overlay.rules.allowed_refs)
-        .bind(wait_timer_s)
-        .bind(overlay.rules.require_reason)
-        .bind(updated_at)
-        .bind(updated_by)
         .execute(self.pool())
         .await
         .map_err(|e| write_err(e, &overlay.org, &overlay.environment))?;
@@ -702,20 +810,13 @@ impl EnvironmentGovernanceStore for PostgresDb {
             None => {}
             // ADR-0073 §3, as for overlays: one conditional statement each.
             Some(None) => {
-                let inserted = sqlx::query(
-                    "INSERT INTO environment_project_privilege_grants
-                         (org, environment, project, privileged_images, permit_k8s_overlay,
-                          updated_at, updated_by)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7)
-                     ON CONFLICT (org, environment, project) DO NOTHING",
+                let inserted = grant_write(
+                    &GRANTS.insert_if_absent,
+                    grant,
+                    &images,
+                    updated_by,
+                    updated_at,
                 )
-                .bind(&grant.org)
-                .bind(&grant.environment)
-                .bind(&grant.project)
-                .bind(&images)
-                .bind(grant.permit_k8s_overlay)
-                .bind(updated_at)
-                .bind(updated_by)
                 .execute(self.pool())
                 .await
                 .map_err(|e| write_err(e, &grant.org, &grant.environment))?
@@ -731,22 +832,17 @@ impl EnvironmentGovernanceStore for PostgresDb {
                 // same type, so equal values are equal documents.
                 let old_images = serde_json::to_value(&old.privileged_images)
                     .map_err(|e| OrgEnvironmentError::Store(e.to_string()))?;
-                let updated = sqlx::query(
-                    "UPDATE environment_project_privilege_grants SET
-                         privileged_images = $4, permit_k8s_overlay = $5,
-                         updated_at = $6, updated_by = $7
-                     WHERE org = $1 AND environment = $2 AND project = $3
-                       AND privileged_images = $8 AND permit_k8s_overlay = $9",
+                let updated = bind_grant_values(
+                    grant_write(
+                        &GRANTS.update_if_unchanged,
+                        grant,
+                        &images,
+                        updated_by,
+                        updated_at,
+                    ),
+                    &old_images,
+                    old.permit_k8s_overlay,
                 )
-                .bind(&grant.org)
-                .bind(&grant.environment)
-                .bind(&grant.project)
-                .bind(&images)
-                .bind(grant.permit_k8s_overlay)
-                .bind(updated_at)
-                .bind(updated_by)
-                .bind(&old_images)
-                .bind(old.permit_k8s_overlay)
                 .execute(self.pool())
                 .await
                 .map_err(org_environment_store_err)?
@@ -758,27 +854,10 @@ impl EnvironmentGovernanceStore for PostgresDb {
                 };
             }
         }
-        sqlx::query(
-            "INSERT INTO environment_project_privilege_grants
-                 (org, environment, project, privileged_images, permit_k8s_overlay,
-                  updated_at, updated_by)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
-             ON CONFLICT (org, environment, project) DO UPDATE SET
-                 privileged_images = EXCLUDED.privileged_images,
-                 permit_k8s_overlay = EXCLUDED.permit_k8s_overlay,
-                 updated_at = EXCLUDED.updated_at,
-                 updated_by = EXCLUDED.updated_by",
-        )
-        .bind(&grant.org)
-        .bind(&grant.environment)
-        .bind(&grant.project)
-        .bind(images)
-        .bind(grant.permit_k8s_overlay)
-        .bind(updated_at)
-        .bind(updated_by)
-        .execute(self.pool())
-        .await
-        .map_err(|e| write_err(e, &grant.org, &grant.environment))?;
+        grant_write(&GRANTS.upsert, grant, &images, updated_by, updated_at)
+            .execute(self.pool())
+            .await
+            .map_err(|e| write_err(e, &grant.org, &grant.environment))?;
         Ok(())
     }
 
@@ -939,8 +1018,9 @@ impl EnvironmentGovernanceStore for PostgresDb {
         };
         let env = stored_environment(&mut tx, &row, org, environment).await?;
         let overlays = sqlx::query(&format!(
-            "SELECT {OVERLAY_COLUMNS} FROM environment_project_overlays
-             WHERE org = $1 AND environment = $2"
+            "SELECT {} FROM environment_project_overlays
+             WHERE org = $1 AND environment = $2",
+            OVERLAYS.columns
         ))
         .bind(org)
         .bind(environment)
@@ -951,8 +1031,9 @@ impl EnvironmentGovernanceStore for PostgresDb {
         .map(overlay_from_row)
         .collect::<Result<Vec<_>, _>>()?;
         let grants = sqlx::query(&format!(
-            "SELECT {GRANT_COLUMNS} FROM environment_project_privilege_grants
-             WHERE org = $1 AND environment = $2"
+            "SELECT {} FROM environment_project_privilege_grants
+             WHERE org = $1 AND environment = $2",
+            GRANTS.columns
         ))
         .bind(org)
         .bind(environment)
