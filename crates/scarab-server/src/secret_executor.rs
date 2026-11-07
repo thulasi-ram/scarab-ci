@@ -352,7 +352,12 @@ fn step_admit_input(
             id: s.id.clone(),
             image: s.image.clone(),
             deploy: s.deploy || ir.deploy,
-            secrets: rc::capped(s.secrets.clone(), &what, "secrets").map_err(|e| e.to_string())?,
+            secrets: rc::capped(
+                s.secrets.iter().map(|r| r.name.clone()).collect(),
+                &what,
+                "secrets",
+            )
+            .map_err(|e| e.to_string())?,
             forge_token: s.forge_token.map(|t| match t {
                 scarab_pipeline::ForgeToken::Read => rc::ForgeToken::Read,
                 scarab_pipeline::ForgeToken::Write => rc::ForgeToken::Write,
