@@ -35,7 +35,9 @@ use scarab_plugin_argocd::broker::Broker;
 use scarab_plugin_argocd::gates::GateApi;
 use scarab_plugin_argocd::standby;
 use scarab_server::plugins::PluginPolicy;
-use scarab_server::{broker, router, trigger_runs_from_event, AdmissionPorts, AppState, LogService};
+use scarab_server::{
+    broker, router, trigger_runs_from_event, AdmissionPorts, AppState, LogService,
+};
 use scarab_testkit::{FakeClock, FakeExecutor, FakeForge, FakeSecrets, InMemoryObjectStore};
 
 const REPO: &str = "ghcr.io/thulasi-ram/scarab-plugin-argocd";
@@ -221,7 +223,12 @@ impl World {
     async fn drive(&self) {
         let exec = FakeExecutor::new();
         exec.script_outcome(ExecState::Succeeded);
-        let sched = Scheduler::new(self.pg.as_ref(), self.clock.as_ref() as &dyn Clock, &exec, "s");
+        let sched = Scheduler::new(
+            self.pg.as_ref(),
+            self.clock.as_ref() as &dyn Clock,
+            &exec,
+            "s",
+        );
         for _ in 0..4 {
             sched.tick(&self.run).await.unwrap();
         }
@@ -253,7 +260,8 @@ async fn wait_live_releases_the_gate_once_argo_reports_the_image_live() {
     let key = format!("{}/live", w.run.0);
 
     // Argo has not synced it yet: the wait stays open.
-    w.fake.put_app("argocd", "payments-api", spec("OutOfSync", "Healthy", None));
+    w.fake
+        .put_app("argocd", "payments-api", spec("OutOfSync", "Healthy", None));
     let report = standby::gates_once(&w.broker, &w.api).await.unwrap();
     assert_eq!(report.waiting, [key.clone()], "{report:?}");
     assert_eq!(w.status("live").await, StepStatus::Pending);
@@ -266,11 +274,15 @@ async fn wait_live_releases_the_gate_once_argo_reports_the_image_live() {
     assert_eq!(report.waiting, [key.clone()], "{report:?}");
 
     // Live at the image: released with the synced revision.
-    w.fake.put_app("argocd", "payments-api", spec("Synced", "Healthy", None));
+    w.fake
+        .put_app("argocd", "payments-api", spec("Synced", "Healthy", None));
     let report = standby::gates_once(&w.broker, &w.api).await.unwrap();
     assert_eq!(report.released, [key], "{report:?}");
     assert_eq!(w.status("live").await, StepStatus::Succeeded);
-    let results = w.pg.step_results(&w.run, &StepId("live".into())).await.unwrap();
+    let results =
+        w.pg.step_results(&w.run, &StepId("live".into()))
+            .await
+            .unwrap();
     assert_eq!(results.get("revision"), Some(&json!(REVISION)));
 
     // Nothing left to answer; the dependent runs.
@@ -300,9 +312,20 @@ async fn wait_live_fails_the_gate_when_argo_gives_up() {
     let report = standby::gates_once(&w.broker, &w.api).await.unwrap();
     assert_eq!(report.failed, [format!("{}/live", w.run.0)], "{report:?}");
     assert_eq!(w.status("live").await, StepStatus::Failed);
-    let attempts = w.pg.attempts_of_step(&w.run, &StepId("live".into())).await.unwrap();
-    let detail = attempts.last().unwrap().failure_detail.clone().unwrap_or_default();
-    assert!(detail.starts_with("rejected by plugin:argocd-prod: sync failed"), "{detail}");
+    let attempts =
+        w.pg.attempts_of_step(&w.run, &StepId("live".into()))
+            .await
+            .unwrap();
+    let detail = attempts
+        .last()
+        .unwrap()
+        .failure_detail
+        .clone()
+        .unwrap_or_default();
+    assert!(
+        detail.starts_with("rejected by plugin:argocd-prod: sync failed"),
+        "{detail}"
+    );
     w.finish().await;
 }
 
@@ -313,14 +336,35 @@ async fn wait_live_fails_the_gate_when_argo_gives_up() {
 async fn wait_live_fails_an_app_that_is_not_an_application_name() {
     for app in ["..", ".", "a/b"] {
         let pipeline = PIPELINE.replace("app: payments-api", &format!("app: \"{app}\""));
-        let Some(w) = world_with(&pipeline).await else { return };
+        let Some(w) = world_with(&pipeline).await else {
+            return;
+        };
         let report = standby::gates_once(&w.broker, &w.api).await.unwrap();
-        assert_eq!(report.failed, [format!("{}/live", w.run.0)], "{app}: {report:?}");
+        assert_eq!(
+            report.failed,
+            [format!("{}/live", w.run.0)],
+            "{app}: {report:?}"
+        );
         assert_eq!(w.status("live").await, StepStatus::Failed, "{app}");
-        let attempts = w.pg.attempts_of_step(&w.run, &StepId("live".into())).await.unwrap();
-        let detail = attempts.last().unwrap().failure_detail.clone().unwrap_or_default();
-        assert!(detail.contains("is not an Argo CD Application name"), "{app}: {detail}");
-        assert!(w.fake.requests().is_empty(), "{app}: {:?}", w.fake.requests());
+        let attempts =
+            w.pg.attempts_of_step(&w.run, &StepId("live".into()))
+                .await
+                .unwrap();
+        let detail = attempts
+            .last()
+            .unwrap()
+            .failure_detail
+            .clone()
+            .unwrap_or_default();
+        assert!(
+            detail.contains("is not an Argo CD Application name"),
+            "{app}: {detail}"
+        );
+        assert!(
+            w.fake.requests().is_empty(),
+            "{app}: {:?}",
+            w.fake.requests()
+        );
         w.finish().await;
     }
 }

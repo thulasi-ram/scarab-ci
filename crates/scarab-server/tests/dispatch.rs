@@ -286,7 +286,10 @@ async fn a_dispatched_run_carries_its_project() {
     )
     .await
     .expect("dispatch");
-    assert_eq!(db.run_project(&run).await.unwrap().as_deref(), Some("acme/web"));
+    assert_eq!(
+        db.run_project(&run).await.unwrap().as_deref(),
+        Some("acme/web")
+    );
 }
 
 // --- opt-in gate --------------------------------------------------------------
@@ -1486,7 +1489,6 @@ async fn rerun_and_retry_of_a_creation_failed_run_are_refused() {
     assert!(exec.launches.lock().unwrap().is_empty(), "nothing launched");
     assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Failed));
 }
-
 
 /// A dispatch pins the commit the forge resolves the ref to, and that SHA
 /// later reaches `git fetch` in the clone container as an argument. A forge

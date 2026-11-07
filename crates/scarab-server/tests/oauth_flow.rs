@@ -357,7 +357,10 @@ async fn callback(app: &axum::Router, flow: &Flow, code: &str) -> axum::response
     app.clone()
         .oneshot(
             Request::builder()
-                .uri(format!("/v1/auth/callback?code={code}&state={}", flow.state))
+                .uri(format!(
+                    "/v1/auth/callback?code={code}&state={}",
+                    flow.state
+                ))
                 .header("cookie", cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -448,7 +451,10 @@ async fn full_browser_login_flow_lands_a_session_with_csrf() {
         location.contains(&format!("state={}", flow.state)),
         "{location}"
     );
-    assert!(location.contains("code_challenge_method=S256"), "{location}");
+    assert!(
+        location.contains("code_challenge_method=S256"),
+        "{location}"
+    );
     // Plain OAuth2 mode verifies no id_token, so it sends no nonce to check.
     assert!(!location.contains("nonce="), "{location}");
 
@@ -576,7 +582,10 @@ async fn pkce_challenge_is_sent_and_the_verifier_round_trips() {
         location.contains(&format!("code_challenge={expected}")),
         "challenge must be S256(verifier): {location}"
     );
-    assert!(location.contains("code_challenge_method=S256"), "{location}");
+    assert!(
+        location.contains("code_challenge_method=S256"),
+        "{location}"
+    );
     assert!(
         !location.contains(&flow.verifier),
         "the verifier itself must never leave the server: {location}"
@@ -597,7 +606,9 @@ async fn pkce_challenge_is_sent_and_the_verifier_round_trips() {
 #[tokio::test]
 async fn the_login_callback_is_on_the_ui_url() {
     let p = provider(None).await;
-    let app = app_with(&p, vec![], false, |st| st.with_ui_url("http://localhost:8080/"));
+    let app = app_with(&p, vec![], false, |st| {
+        st.with_ui_url("http://localhost:8080/")
+    });
 
     let (location, flow) = begin_login(&app).await;
     let sent = form_field(location.split_once('?').unwrap().1, "redirect_uri")
@@ -617,7 +628,9 @@ async fn the_login_callback_is_on_the_ui_url() {
 #[tokio::test]
 async fn a_login_on_another_loopback_name_goes_to_the_ui_url_first() {
     let p = provider(None).await;
-    let app = app_with(&p, vec![], false, |st| st.with_ui_url("http://localhost:8080"));
+    let app = app_with(&p, vec![], false, |st| {
+        st.with_ui_url("http://localhost:8080")
+    });
     let login_at = |host: &'static str| {
         let app = app.clone();
         async move {
@@ -650,7 +663,10 @@ async fn a_login_on_another_loopback_name_goes_to_the_ui_url_first() {
         let resp = login_at(same).await;
         assert_eq!(resp.status(), StatusCode::FOUND, "{same}");
         let location = resp.headers()["location"].to_str().unwrap();
-        assert!(location.starts_with(&format!("{}/authorize?", p.base)), "{same}: {location}");
+        assert!(
+            location.starts_with(&format!("{}/authorize?", p.base)),
+            "{same}: {location}"
+        );
         assert!(cookie_from(&resp, "scarab_oauth_state").is_some(), "{same}");
     }
 }
@@ -703,7 +719,10 @@ async fn token_exchange_replays_the_authorize_redirect_uri() {
     let (location, flow) = begin_login(&app).await;
     let sent = form_field(location.split_once('?').unwrap().1, "redirect_uri")
         .expect("authorize redirect carries redirect_uri");
-    assert_eq!(sent, "https%3A%2F%2Fscarab.example.com%2Fv1%2Fauth%2Fcallback");
+    assert_eq!(
+        sent,
+        "https%3A%2F%2Fscarab.example.com%2Fv1%2Fauth%2Fcallback"
+    );
 
     let resp = callback(&app, &flow, "good-code").await;
     assert_eq!(resp.status(), StatusCode::FOUND);

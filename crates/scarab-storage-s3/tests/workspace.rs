@@ -111,10 +111,7 @@ async fn declared_outputs_publish_only_those_paths() {
     let pruned = prune_tree(
         &cas,
         &full.root,
-        &[
-            "dist".to_string(),
-            "reports/junit/results.xml".to_string(),
-        ],
+        &["dist".to_string(), "reports/junit/results.xml".to_string()],
     )
     .await
     .expect("prune to the declared outputs");
@@ -126,7 +123,10 @@ async fn declared_outputs_publish_only_those_paths() {
 
     // Declared paths arrive, whole subtrees included.
     assert_eq!(std::fs::read(b_work.join("dist/app")).unwrap(), b"binary");
-    assert_eq!(std::fs::read(b_work.join("dist/inner/lib")).unwrap(), b"lib");
+    assert_eq!(
+        std::fs::read(b_work.join("dist/inner/lib")).unwrap(),
+        b"lib"
+    );
     assert_eq!(
         std::fs::read(b_work.join("reports/junit/results.xml")).unwrap(),
         b"<xml/>"

@@ -83,12 +83,13 @@ use scarab_identity::{Action, Principal, Session};
 /// not part of the public API.
 pub mod broker;
 pub mod broker_proxy;
-pub mod forge_token;
 pub mod config;
 pub mod connections_config;
 pub mod converged;
 pub mod depot_expiry;
+pub mod followups;
 pub mod forge_router;
+pub mod forge_token;
 pub mod infra_observer;
 pub mod libraries;
 pub mod library_fetch;
@@ -99,25 +100,24 @@ pub mod oauth;
 pub mod oidc;
 /// ADR-0071: the minimal org-level Environment — its admin/read API.
 pub mod org_environments;
-/// ADR-0072 §9: the plugin runtime's leased reconcile loop — namespace
-/// baseline, isolation probe, one workload per installation.
-pub mod plugin_runtime;
 /// ADR-0072: PluginInstallations — the first-party catalog, install,
 /// uninstall and the kill switch.
 pub mod plugin_gates;
+/// ADR-0072 §9: the plugin runtime's leased reconcile loop — namespace
+/// baseline, isolation probe, one workload per installation.
+pub mod plugin_runtime;
 pub mod plugins;
 /// ADR-0075: the Policy API — org Policies, Project typed settings, the
 /// decision logs and the policy test API.
 pub mod policies;
 mod policy_checkpoints;
-pub mod retention;
 mod refused_runs;
+pub mod retention;
 mod routes;
-pub mod run_origin;
-pub mod schedules;
-pub mod followups;
 /// Slice b, criterion 5: the Run page's gate resolution per step.
 mod run_gate_view;
+pub mod run_origin;
+pub mod schedules;
 pub use routes::{route_table, RouteEntry};
 pub mod secret_executor;
 pub mod step_up;
@@ -2181,7 +2181,9 @@ async fn list_pipelines(
                 },
             },
             // A file that vanished between list and read → skip it.
-            Err(scarab_forge::ForgeError::Api(_) | scarab_forge::ForgeError::NotFound(_)) => continue,
+            Err(scarab_forge::ForgeError::Api(_) | scarab_forge::ForgeError::NotFound(_)) => {
+                continue
+            }
             Err(e) => return Err(ApiError::BadRequest(e.to_string())),
         };
         pipelines.push(entry);
@@ -2315,8 +2317,8 @@ async fn pipeline_interface(
         let (_, yaml) = read_named_pipeline(forge, &repo, &sha, &name).await?;
         let installed =
             installed_libraries(st.libraries.as_deref(), st.plugins.as_deref(), &repo.owner)
-            .await
-            .map_err(DispatchError::Db)?;
+                .await
+                .map_err(DispatchError::Db)?;
         let ir = prefetch_libs_and_compile(forge, &repo, &sha, &yaml, &installed).await?;
         Ok::<_, DispatchError>(PipelineInterfaceResponse {
             sha,
@@ -4317,7 +4319,9 @@ async fn attach_step(
         .attach(&sr)
         .await
         .map_err(|e| ApiError::BadRequest(format!("attach failed: {e}")))?;
-    Ok(ws.on_upgrade(move |socket| bridge_attach(socket, io)))
+    Ok(ws
+        .protocols([WS_PROTOCOL])
+        .on_upgrade(move |socket| bridge_attach(socket, io)))
 }
 
 /// Pump bytes both ways between a WebSocket and an attached step shell until
@@ -4398,38 +4402,40 @@ async fn debug_pod_step(
     // ADR-0076 §6: a debug Pod runs the Step's image, so a Step inlined from
     // a yanked library version gets none, as a launch would not.
     refuse_yanked_step(&st, &run, &step, "no debug Pod starts").await?;
-    Ok(ws.on_upgrade(move |mut socket| async move {
-        let _ = socket
-            .send(Message::Text(
-                "provisioning debug pod (re-materializing workspace)…\r\n".into(),
-            ))
-            .await;
-        match launcher
-            .launch_debug(&sr, &image, snapshot.as_deref(), 3600)
-            .await
-        {
-            Ok(dp) => {
-                match launcher.attach_debug(&dp.name).await {
-                    Ok(io) => {
-                        let _ = socket.send(Message::Text("\r\n".into())).await;
-                        bridge_attach(socket, io).await;
+    Ok(ws
+        .protocols([WS_PROTOCOL])
+        .on_upgrade(move |mut socket| async move {
+            let _ = socket
+                .send(Message::Text(
+                    "provisioning debug pod (re-materializing workspace)…\r\n".into(),
+                ))
+                .await;
+            match launcher
+                .launch_debug(&sr, &image, snapshot.as_deref(), 3600)
+                .await
+            {
+                Ok(dp) => {
+                    match launcher.attach_debug(&dp.name).await {
+                        Ok(io) => {
+                            let _ = socket.send(Message::Text("\r\n".into())).await;
+                            bridge_attach(socket, io).await;
+                        }
+                        Err(e) => {
+                            let _ = socket
+                                .send(Message::Text(format!("attach failed: {e}\r\n").into()))
+                                .await;
+                        }
                     }
-                    Err(e) => {
-                        let _ = socket
-                            .send(Message::Text(format!("attach failed: {e}\r\n").into()))
-                            .await;
-                    }
+                    // Throwaway: tear the reproduction Pod down when the shell ends.
+                    let _ = launcher.teardown_debug(&dp.name).await;
                 }
-                // Throwaway: tear the reproduction Pod down when the shell ends.
-                let _ = launcher.teardown_debug(&dp.name).await;
+                Err(e) => {
+                    let _ = socket
+                        .send(Message::Text(format!("debug pod failed: {e}\r\n").into()))
+                        .await;
+                }
             }
-            Err(e) => {
-                let _ = socket
-                    .send(Message::Text(format!("debug pod failed: {e}\r\n").into()))
-                    .await;
-            }
-        }
-    }))
+        }))
 }
 
 /// What a debug Pod reproduces of a finished step: the step, the image it ran
@@ -5061,7 +5067,9 @@ async fn prefetch_libs_and_compile(
                 worklist.extend(scarab_pipeline::invoke_refs(&src));
                 libs.insert(lib_path, src);
             }
-            Err(scarab_forge::ForgeError::Api(_) | scarab_forge::ForgeError::NotFound(_)) => continue,
+            Err(scarab_forge::ForgeError::Api(_) | scarab_forge::ForgeError::NotFound(_)) => {
+                continue
+            }
             Err(e) => return Err(TriggerError::Forge(e)),
         }
     }
@@ -5203,16 +5211,17 @@ struct AdmittedFacts<'a> {
     cache_scope: Option<scarab_engine::CacheScope>,
 }
 
-/// The cache scope a new Run gets (git-bug efcec77): `env:<name>` when an
-/// Environment governs it and it is not a pull request, else its symbolic
-/// ref with the default branch's scope as the fallback read. A pull request
-/// (the event is one, or the Run is locked out as a fork) that names an
-/// Environment is scoped by its ref like an ungoverned Run, so it never
-/// writes what that Environment's Runs restore. The forge is asked for the
-/// default branch only when that fallback can matter: a Run scoped by its
-/// ref whose Pipeline declares a `cache:`. Asking is best-effort: a forge that cannot
-/// answer leaves the Run with no fallback (its first build on a new ref is
-/// cold), never a failed creation.
+/// The cache scope a new Run gets (git-bug efcec77, 31a2533): its symbolic
+/// ref with the default branch's scope as the fallback read, and
+/// `env:<name>` beside it when an Environment governs it and it is not a
+/// pull request. A Step uses `env:<name>` only once an approved Environment
+/// approval gate admits it. A pull request (the event is one, or the Run is
+/// locked out as a fork) that names an Environment gets no Environment
+/// scope, so it never writes what that Environment's Runs restore. The
+/// forge is asked for the default branch only when that fallback can
+/// matter: a Run with a ref whose Pipeline declares a `cache:`. Asking is
+/// best-effort: a forge that cannot answer leaves the Run with no fallback
+/// (its first build on a new ref is cold), never a failed creation.
 async fn run_cache_scope(
     forge: &dyn scarab_forge::ForgePort,
     event: &scarab_forge::Event,
@@ -5232,7 +5241,7 @@ async fn run_cache_scope(
     let environment =
         scarab_engine::CacheScope::environment_scope(environment, git_ref.as_deref(), pull_request);
     let mut default_branch = None;
-    if environment.is_none() && git_ref.is_some() && ir.steps.iter().any(|s| s.cache.is_some()) {
+    if git_ref.is_some() && ir.steps.iter().any(|s| s.cache.is_some()) {
         if let Some(repo) = event.repo() {
             match forge.default_branch(repo).await {
                 Ok(branch) => default_branch = Some(branch),
@@ -5444,8 +5453,9 @@ async fn admit_and_create_run(
     if let (Admission::Refused(refusal), Some(repo)) = (&admission, event.repo()) {
         let (kind, messages): (&str, &[String]) = match refusal {
             AdmissionRefusal::RefNotAllowed => ("", &[]),
-            AdmissionRefusal::UnknownEnvironment { .. }
-            | AdmissionRefusal::NotEligible { .. } => ("environment", &[]),
+            AdmissionRefusal::UnknownEnvironment { .. } | AdmissionRefusal::NotEligible { .. } => {
+                ("environment", &[])
+            }
             AdmissionRefusal::PolicyDenied { messages, .. } => ("policy", messages),
             AdmissionRefusal::LibraryYanked { messages } => ("yanked", messages),
             AdmissionRefusal::EventField { messages } => ("event_field", messages),
@@ -5457,7 +5467,11 @@ async fn admit_and_create_run(
             let errors: Vec<CompileErrorDto> = if messages.is_empty() {
                 vec![CompileErrorDto::other(message.clone())]
             } else {
-                messages.iter().cloned().map(CompileErrorDto::other).collect()
+                messages
+                    .iter()
+                    .cloned()
+                    .map(CompileErrorDto::other)
+                    .collect()
             };
             record_refusal(db, clock, event, path, kind, message, &errors).await;
         }
@@ -5606,7 +5620,9 @@ async fn admit_unrecorded(
     let facts = match forge_token::event_facts(event, clone_url.as_deref(), ir) {
         Ok(facts) => facts,
         Err(messages) => {
-            return Ok(Admission::Refused(AdmissionRefusal::EventField { messages }))
+            return Ok(Admission::Refused(AdmissionRefusal::EventField {
+                messages,
+            }))
         }
     };
     let write = match gov.protection() {
@@ -6168,7 +6184,10 @@ fn admission_refusal_message(refusal: &AdmissionRefusal, org: &str, project: &st
 }
 
 fn event_field_message(messages: &[String]) -> String {
-    format!("this Run reads a trigger value it cannot use: {}", messages.join("; "))
+    format!(
+        "this Run reads a trigger value it cannot use: {}",
+        messages.join("; ")
+    )
 }
 
 fn forge_token_message(messages: &[String]) -> String {
@@ -6270,7 +6289,9 @@ async fn read_named_pipeline(
                 let yaml = String::from_utf8(bytes).map_err(|_| DispatchError::NotUtf8)?;
                 return Ok((candidate, yaml));
             }
-            Err(scarab_forge::ForgeError::Api(_) | scarab_forge::ForgeError::NotFound(_)) => continue,
+            Err(scarab_forge::ForgeError::Api(_) | scarab_forge::ForgeError::NotFound(_)) => {
+                continue
+            }
             Err(e) => return Err(DispatchError::Forge(e)),
         }
     }
@@ -6488,6 +6509,7 @@ fn cache_config(step: &scarab_pipeline::StepSpec) -> Option<scarab_engine::Cache
         key: None,
         restore: Vec::new(),
         fallback_key: None,
+        approved: None,
     })
 }
 
@@ -8062,40 +8084,18 @@ pub struct LinkIdentityResponse {
 /// shared callback then attaches the proven account, or merges in a Principal
 /// whose only way in it was. Never by email.
 ///
-/// A link that would fold in a Principal holding passkeys is refused at the
-/// callback (the merge would move them to the caller): it needs
-/// `POST /v1/me/identities/link-moving-passkeys`, which always asks.
+/// A merge of a Principal that holds passkeys also needs one of its passkeys
+/// (ADR-0079 §2): the callback sends the browser to confirm it
+/// (`…/merges/{id}`), and nothing changes until then.
 #[utoipa::path(post, path = "/v1/me/identities/link", summary = "Begin linking another sign-in account (ADR-0069)", request_body = LinkIdentityRequest, responses((status = 200, body = LinkIdentityResponse), (status = 403, description = "not a browser session")))]
 async fn begin_link_identity(
     State(st): State<AppState>,
     headers: HeaderMap,
     Json(req): Json<LinkIdentityRequest>,
 ) -> Result<Response, ApiError> {
-    begin_link(&st, &headers, &req, false).await
-}
-
-/// Begin linking another provider's account, allowing the merge to move the
-/// folded Principal's passkeys to the caller (git-bug def16bd). The same
-/// flow as `POST /v1/me/identities/link`, but its step-up always asks: a
-/// window is not enough to add passkeys to an account.
-#[utoipa::path(post, path = "/v1/me/identities/link-moving-passkeys", summary = "Begin linking another sign-in account whose Principal holds passkeys (ADR-0069)", request_body = LinkIdentityRequest, responses((status = 200, body = LinkIdentityResponse), (status = 403, description = "not a browser session")))]
-async fn begin_link_identity_moving_passkeys(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-    Json(req): Json<LinkIdentityRequest>,
-) -> Result<Response, ApiError> {
-    begin_link(&st, &headers, &req, true).await
-}
-
-/// The two link POSTs. `moves_passkeys`: the link binding lets the merge
-/// move passkeys.
-async fn begin_link(
-    st: &AppState,
-    headers: &HeaderMap,
-    req: &LinkIdentityRequest,
-    moves_passkeys: bool,
-) -> Result<Response, ApiError> {
-    let (sid, _) = link_session(st, headers, Action::Write).await?;
+    let (sid, _) = link_session(&st, &headers, Action::Write).await?;
+    let st = &st;
+    let req = &req;
     st.identities.as_ref().ok_or(ApiError::NotFound)?;
     let provider = st
         .oauth_provider(Some(&req.provider))?
@@ -8107,13 +8107,7 @@ async fn begin_link(
     // provider and the expiry too. Off: the bare session hash, as before —
     // the POST is unguarded then anyway.
     let link = match st.step_up.service() {
-        Some(svc) => svc.link_binding(
-            &flow.state,
-            &session_hash(&sid),
-            &flow.provider,
-            expires_at,
-            moves_passkeys,
-        ),
+        Some(svc) => svc.link_binding(&flow.state, &session_hash(&sid), &flow.provider, expires_at),
         None => session_hash(&sid),
     };
     let flow = flow.for_link(&link, expires_at);
@@ -8149,27 +8143,13 @@ async fn link_callback(
     // client input) — and the flow must not have outlived its step-up.
     let now = st.clock.now().await.0;
     let expires_at = flow.link_expires_at.unwrap_or(i64::MIN);
-    // Which POST minted it decides whether the merge may move passkeys
-    // (git-bug def16bd). Step-up off: both bindings are the bare session
-    // hash (both POSTs are unguarded), so a flow of this session may.
-    let binding = |moves: bool| match st.step_up.service() {
-        Some(svc) => svc.link_binding(
-            &flow.state,
-            &session_hash(&sid),
-            &flow.provider,
-            expires_at,
-            moves,
-        ),
+    // Step-up off: the binding is the bare session hash (the POST is
+    // unguarded then).
+    let binding = match st.step_up.service() {
+        Some(svc) => svc.link_binding(&flow.state, &session_hash(&sid), &flow.provider, expires_at),
         None => session_hash(&sid),
     };
-    let matches =
-        |moves: bool| scarab_identity::ct_eq(binding(moves).as_bytes(), flow.link.as_bytes());
-    let passkeys = if matches(true) {
-        scarab_identity::MergePasskeys::Move
-    } else {
-        scarab_identity::MergePasskeys::Refuse
-    };
-    let minted = passkeys == scarab_identity::MergePasskeys::Move || matches(false);
+    let minted = scarab_identity::ct_eq(binding.as_bytes(), flow.link.as_bytes());
     if now > expires_at || !minted {
         if let Some(svc) = st.step_up.service() {
             let mut ev = step_up::event(
@@ -8206,52 +8186,41 @@ async fn link_callback(
         })?;
     let now = st.clock.now().await.0;
     let location = match store
-        .link(&principal.subject, &identity, now, passkeys)
+        .link(
+            &principal.subject,
+            &identity,
+            now,
+            &scarab_identity::FoldedPasskey::Unproven,
+        )
         .await
     {
         Ok(scarab_identity::LinkOutcome::Merged {
             from,
-            moved_passkeys,
+            removed_passkeys,
         }) => {
-            record_moved_passkeys(st, &principal.subject, &from, &moved_passkeys, &sid, now).await;
+            record_removed_passkeys(st, &principal.subject, &from, &removed_passkeys, &sid, now)
+                .await;
             format!(
                 "/settings/profile?identity_linked={}&merged={}",
                 flow.provider,
                 query_escape(&from)
             )
         }
-        Ok(scarab_identity::LinkOutcome::PasskeysWouldMove { from, passkeys }) => {
-            if let Some(svc) = st.step_up.service() {
-                let mut ev = step_up::event(
-                    scarab_identity::security_event_kind::STEP_UP_REFUSED,
-                    &principal.subject,
-                    "session:cookie".to_string(),
-                    None,
-                    now,
-                );
-                ev.op = Some("identity.link".to_string());
-                ev.session_hash = Some(session_hash(&sid));
-                ev.detail = serde_json::json!({
-                    "reason": "the merge would move passkeys; the link was confirmed by a window",
-                    "from": from,
-                    "passkeys": passkeys,
-                });
-                svc.record(ev).await;
+        Ok(scarab_identity::LinkOutcome::NeedsFoldedPasskey { from }) => {
+            match start_identity_merge(st, &sid, &principal.subject, &from, &identity, now).await {
+                Ok(id) => format!("/settings/profile?identity_merge={}", query_escape(&id)),
+                Err(why) => format!(
+                    "/settings/profile?identity_link_error={}",
+                    query_escape(&why)
+                ),
             }
-            let why = format!(
-                "that {} account is the only sign-in of `{from}`, who holds {passkeys} \
-                 passkey(s); merging moves them to you, so confirm this link with your passkey \
-                 (POST /v1/me/identities/link-moving-passkeys)",
-                flow.provider
-            );
+        }
+        Ok(_) => format!("/settings/profile?identity_linked={}", flow.provider),
+        Err(scarab_identity::IdentityError::Conflict(why)) => {
             format!(
                 "/settings/profile?identity_link_error={}",
                 query_escape(&why)
             )
-        }
-        Ok(_) => format!("/settings/profile?identity_linked={}", flow.provider),
-        Err(scarab_identity::IdentityError::Conflict(why)) => {
-            format!("/settings/profile?identity_link_error={}", query_escape(&why))
         }
         Err(e) => return Err(ApiError::BadRequest(e.to_string())),
     };
@@ -8267,42 +8236,307 @@ async fn link_callback(
     Ok(resp)
 }
 
-/// One `passkey.moved_on_merge` per passkey a link's merge moved from `from`
-/// to `into` (git-bug def16bd), through the security-event log. Best-effort:
-/// the merge has committed, and the always-ask confirmation of the link POST
-/// was recorded before it (`op.authorised`).
-async fn record_moved_passkeys(
+/// One `passkey.removed_on_merge` per passkey of `from` a link's merge
+/// deleted (ADR-0079 §3), through the security-event log. Best-effort: the
+/// merge has committed.
+async fn record_removed_passkeys(
     st: &AppState,
     into: &str,
     from: &str,
-    moved: &[String],
+    removed: &[String],
     sid: &str,
     now: i64,
 ) {
     let Some(svc) = st.step_up.service() else {
-        if !moved.is_empty() {
+        if !removed.is_empty() {
             tracing::info!(
                 from,
                 into,
-                passkeys = moved.len(),
-                "identity link: merge moved passkeys"
+                passkeys = removed.len(),
+                "identity link: merge removed passkeys"
             );
         }
         return;
     };
-    for id in moved {
+    for id in removed {
         let mut ev = step_up::event(
-            scarab_identity::security_event_kind::PASSKEY_MOVED_ON_MERGE,
+            scarab_identity::security_event_kind::PASSKEY_REMOVED_ON_MERGE,
             into,
             "session:cookie".to_string(),
             None,
             now,
         );
-        ev.op = Some("identity.link_moving_passkeys".to_string());
+        ev.op = Some("identity.merge_confirm".to_string());
         ev.passkey_id = Some(id.clone());
         ev.session_hash = Some(session_hash(sid));
         ev.detail = serde_json::json!({ "from": from, "into": into });
         svc.record(ev).await;
+    }
+}
+
+/// The proven sign-in a `merge` challenge carries until the merge is
+/// confirmed (ADR-0079 §2): stored in the challenge's summary, bound to the
+/// session that completed the OAuth round-trip.
+#[derive(Debug, Serialize, Deserialize)]
+struct PendingMerge {
+    from: String,
+    identity: scarab_identity::ProviderIdentity,
+}
+
+/// What the passkey assertion of a merge commits to: the folded Principal
+/// and the sign-in that proved it. Each part is length-prefixed.
+fn merge_digest(from: &str, identity: &scarab_identity::ProviderIdentity) -> [u8; 32] {
+    use sha2::Digest as _;
+    let mut h = sha2::Sha256::new();
+    for part in [
+        "identity.merge",
+        from,
+        identity.provider.as_str(),
+        identity.external_id.as_str(),
+    ] {
+        h.update((part.len() as u32).to_be_bytes());
+        h.update(part.as_bytes());
+    }
+    h.finalize().into()
+}
+
+/// The callback found that the sign-in is the only one of `from`, who holds
+/// passkeys: mint a `merge` challenge for this session that only a passkey
+/// of `from` can answer, and return its id. `Err` is the reason shown to
+/// the person when no such passkey can answer.
+async fn start_identity_merge(
+    st: &AppState,
+    sid: &str,
+    into: &str,
+    from: &str,
+    identity: &scarab_identity::ProviderIdentity,
+    now: i64,
+) -> Result<String, String> {
+    let Some(svc) = st.step_up.service() else {
+        return Err(format!(
+            "that {} account is the only sign-in of `{from}`, which holds passkeys; merging it \
+             needs one of them, and passkeys are off on this server, so an admin must merge it",
+            identity.provider
+        ));
+    };
+    let usable = svc
+        .usable_passkeys(from)
+        .await
+        .map_err(|_| format!("could not read `{from}`'s passkeys; try the link again"))?;
+    if usable.is_empty() {
+        return Err(format!(
+            "`{from}` holds passkeys that can no longer be used (suspected clones); an Owner \
+             must reset them before it can be merged into you"
+        ));
+    }
+    let pending = PendingMerge {
+        from: from.to_string(),
+        identity: identity.clone(),
+    };
+    let (row, _) = svc
+        .mint_challenge(
+            into,
+            &session_hash(sid),
+            scarab_identity::ChallengePurpose::Merge,
+            Some(merge_digest(from, identity)),
+            None,
+            None,
+            serde_json::to_value(&pending).ok(),
+            now,
+        )
+        .await
+        .map_err(|_| "could not start the merge; try the link again".to_string())?;
+    Ok(row.id)
+}
+
+/// A merge waiting for a passkey of the Principal it folds in.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct IdentityMergeDto {
+    pub id: String,
+    /// The Principal that would be folded into the caller.
+    pub from: String,
+    /// The sign-in that proved it: its provider and handle.
+    pub provider: String,
+    pub handle: String,
+    /// How many usable passkeys `from` holds; one of them must answer.
+    pub passkeys: usize,
+    /// `PublicKeyCredentialRequestOptionsJSON`, allowing only `from`'s
+    /// passkeys.
+    #[schema(value_type = Object)]
+    pub public_key: serde_json::Value,
+    pub expires_at: i64,
+}
+
+/// The pending merge `id` of this session.
+async fn pending_merge(
+    st: &AppState,
+    headers: &HeaderMap,
+    id: &str,
+) -> Result<(scarab_identity::WebauthnChallenge, PendingMerge), ApiError> {
+    let svc = step_up::ceremony::service(st)?;
+    let (caller, facts) = step_up::ceremony::browser_session(st, headers, Action::Read).await?;
+    let now = st.clock.now().await.0;
+    let row = svc
+        .challenges
+        .peek(id, &facts.id_hash, now)
+        .await
+        .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?
+        .filter(|r| {
+            r.purpose == scarab_identity::ChallengePurpose::Merge
+                && r.principal == caller.principal.subject
+        })
+        .ok_or(ApiError::NotFound)?;
+    let pending = row
+        .summary
+        .clone()
+        .and_then(|v| serde_json::from_value::<PendingMerge>(v).ok())
+        .ok_or(ApiError::NotFound)?;
+    Ok((row, pending))
+}
+
+/// A merge started by an identity link that folds in a Principal holding
+/// passkeys (ADR-0079 §2): who it folds in, and the WebAuthn options that
+/// only that Principal's passkeys can answer. 404 once used or expired.
+#[utoipa::path(
+    get,
+    path = "/v1/me/identities/merges/{id}",
+    params(("id" = String, Path, description = "the merge id from the link callback")),
+    summary = "A merge waiting for the merged account's passkey (ADR-0079)",
+    responses(
+        (status = 200, body = IdentityMergeDto),
+        (status = 403, description = "not a browser session"),
+        (status = 404, description = "no such pending merge in this session, used, or expired")
+    )
+)]
+async fn identity_merge(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<IdentityMergeDto>, ApiError> {
+    let svc = step_up::ceremony::service(&st)?;
+    let (row, pending) = pending_merge(&st, &headers, &id).await?;
+    let passkeys = svc.usable_passkeys(&pending.from).await?;
+    let sent = step_up::sent_challenge(&row).ok_or(ApiError::NotFound)?;
+    Ok(Json(IdentityMergeDto {
+        id: row.id.clone(),
+        from: pending.from,
+        provider: pending.identity.provider,
+        handle: pending.identity.handle,
+        passkeys: passkeys.len(),
+        public_key: scarab_webauthn::request_options(
+            svc.rp(),
+            &sent,
+            &step_up::descriptors(&passkeys),
+        ),
+        expires_at: row.expires_at,
+    }))
+}
+
+/// `POST /v1/me/identities/merges/{id}` body.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ConfirmIdentityMergeRequest {
+    /// The browser's `AuthenticationResponseJSON`, from a passkey of the
+    /// Principal being merged in.
+    #[schema(value_type = Object)]
+    pub credential: serde_json::Value,
+}
+
+/// What a confirmed merge did.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct IdentityMergedDto {
+    /// The Principal folded into the caller.
+    pub merged: String,
+    /// How many of its passkeys the merge deleted.
+    pub removed_passkeys: usize,
+}
+
+/// Confirm merge `id` with a passkey of the Principal it folds in (ADR-0079
+/// §2). The challenge is spent before the assertion is checked. On success
+/// the Principal is folded into the caller and its passkeys are deleted
+/// (§3).
+#[utoipa::path(
+    post,
+    path = "/v1/me/identities/merges/{id}",
+    params(("id" = String, Path, description = "the merge id from the link callback")),
+    request_body = ConfirmIdentityMergeRequest,
+    summary = "Confirm a merge with the merged account's passkey (ADR-0079)",
+    responses(
+        (status = 200, body = IdentityMergedDto),
+        (status = 400, description = "the merge is unknown, used, expired or another session's, or the passkey is not one of the merged account's (`code` names the check)"),
+        (status = 403, description = "not a browser session"),
+        (status = 409, description = "the sign-in or the merged account changed since the merge was started")
+    )
+)]
+async fn confirm_identity_merge(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<ConfirmIdentityMergeRequest>,
+) -> Result<Json<IdentityMergedDto>, ApiError> {
+    let svc = step_up::ceremony::service(&st)?;
+    let store = st.identities.as_ref().ok_or(ApiError::NotFound)?;
+    let (caller, facts) = step_up::ceremony::browser_session(&st, &headers, Action::Write).await?;
+    let now = st.clock.now().await.0;
+    let (row, sent) = step_up::ceremony::consume(
+        &svc,
+        &id,
+        &caller,
+        &facts,
+        &[scarab_identity::ChallengePurpose::Merge],
+        now,
+    )
+    .await?;
+    let pending = row
+        .summary
+        .and_then(|v| serde_json::from_value::<PendingMerge>(v).ok())
+        .ok_or(ApiError::NotFound)?;
+    let passkey = step_up::ceremony::verify_assertion_of(
+        &svc,
+        &caller,
+        &facts,
+        &pending.from,
+        &sent,
+        req.credential,
+        now,
+    )
+    .await?;
+    let sid = facts.id.0.clone();
+    match store
+        .link(
+            &caller.principal.subject,
+            &pending.identity,
+            now,
+            &scarab_identity::FoldedPasskey::Proven(passkey.id),
+        )
+        .await
+    {
+        Ok(scarab_identity::LinkOutcome::Merged {
+            from,
+            removed_passkeys,
+        }) => {
+            record_removed_passkeys(
+                &st,
+                &caller.principal.subject,
+                &from,
+                &removed_passkeys,
+                &sid,
+                now,
+            )
+            .await;
+            Ok(Json(IdentityMergedDto {
+                merged: from,
+                removed_passkeys: removed_passkeys.len(),
+            }))
+        }
+        Ok(scarab_identity::LinkOutcome::NeedsFoldedPasskey { from }) => Err(ApiError::Conflict(
+            format!("that passkey no longer belongs to `{from}`; start the link again"),
+        )),
+        Ok(_) => Err(ApiError::Conflict(format!(
+            "the {} sign-in is no longer `{}`'s only one; start the link again",
+            pending.identity.provider, pending.from
+        ))),
+        Err(scarab_identity::IdentityError::Conflict(why)) => Err(ApiError::Conflict(why)),
+        Err(e) => Err(ApiError::BadRequest(e.to_string())),
     }
 }
 
@@ -9599,8 +9833,7 @@ async fn authenticate(
     // browser send the cookie, but it can never read the token. Bearer
     // requests (API/CLI) carry the credential explicitly; no CSRF surface.
     if action != Action::Read && via == AuthVia::Cookie {
-        let presented = headers.get("x-csrf-token").and_then(|v| v.to_str().ok());
-        if !session.csrf_matches(presented) {
+        if !session.csrf_matches(presented_csrf(headers)) {
             return Err(ApiError::Forbidden);
         }
     }
@@ -9615,6 +9848,38 @@ async fn authenticate(
         via: Some(via),
         session: Some(facts),
     })
+}
+
+/// The subprotocol the debug shell's WebSocket speaks. The server selects it,
+/// never the CSRF entry, so the token is not echoed back.
+pub const WS_PROTOCOL: &str = "scarab.v1";
+
+/// The prefix of the `Sec-WebSocket-Protocol` entry that carries a browser's
+/// CSRF token on a WebSocket handshake: `scarab.csrf.<token>`.
+pub const WS_CSRF_PROTOCOL_PREFIX: &str = "scarab.csrf.";
+
+/// The CSRF token a cookie request presents: the `x-csrf-token` header, or on
+/// a WebSocket handshake, which cannot carry custom headers from a browser,
+/// a `scarab.csrf.<token>` entry of `Sec-WebSocket-Protocol`. A cross-site
+/// page can set neither: it cannot read the token, and a page sets the
+/// subprotocol list only through the WebSocket API with values it knows.
+fn presented_csrf(headers: &HeaderMap) -> Option<&str> {
+    if let Some(v) = headers.get("x-csrf-token") {
+        return v.to_str().ok();
+    }
+    let websocket = headers
+        .get(axum::http::header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
+    if !websocket {
+        return None;
+    }
+    headers
+        .get_all(axum::http::header::SEC_WEBSOCKET_PROTOCOL)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .find_map(|p| p.trim().strip_prefix(WS_CSRF_PROTOCOL_PREFIX))
 }
 
 /// Authenticate a `scarab_pat_…` bearer (ADR-0049 amendment): hash it, load the
@@ -9781,6 +10046,21 @@ async fn is_environment_approval_gate(
         .is_none_or(|s| s.counts_as_environment_approval_gate()))
 }
 
+/// The answer to a gate approval.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct GateApprovalDto {
+    /// The gate has released (now or before this approval).
+    pub released: bool,
+    /// The approvers recorded on the gate so far. Absent when the gate had
+    /// already released.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approvals: Option<Vec<String>>,
+    /// When the gate releases (epoch ms): the approvals are in and the
+    /// Environment's wait timer is still running. Absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub releases_at: Option<i64>,
+}
+
 /// Approve a `manual` gate (ADR-0008, 0037). The authenticated principal's
 /// approval is recorded on the event log (append-only, idempotent).
 ///
@@ -9802,7 +10082,8 @@ async fn is_environment_approval_gate(
         ("step" = String, Path, description = "gate step id")
     ),
     responses(
-        (status = 202, description = "approval recorded (released or awaiting more approvals)"),
+        (status = 202, body = GateApprovalDto, description = "approval recorded: the gate released, or it waits for more approvals or for its wait timer"),
+        (status = 403, description = "the caller may not approve (insufficient role), a step-up is required (`step_up_required`, JSON), or a `gate.resolve` Policy refused the approval or holds the gate (plain text naming the Policy)"),
         (status = 404, description = "no such run or gate"),
         (status = 409, description = "not an approvable gate (not a manual gate, not pending, or not reached yet), or the run's Environment no longer exists or no longer admits its project")
     )
@@ -9905,9 +10186,11 @@ async fn approve_gate(
         None
     };
     let now = st.clock.now().await.0;
-    // When the gate's current wait began: what the wait timer counts from.
-    // No open wait yet: count from now, which only waits longer.
-    let wait_began = st
+    // The gate's current wait: its open Attempt. When it began is what the
+    // wait timer counts from (no open wait yet: count from now, which only
+    // waits longer); its id keys the approval history to one record per wait
+    // (git-bug 1d06f2d).
+    let open_wait = st
         .db
         .steps_of_run(&run)
         .await
@@ -9918,9 +10201,13 @@ async fn approve_gate(
             s.attempts
                 .last()
                 .filter(|a| a.outcome == scarab_engine::AttemptOutcome::Running)
-                .map(|a| a.started_at.0)
-        })
-        .unwrap_or(now);
+                .map(|a| (a.started_at.0, a.id.0.clone()))
+        });
+    let wait_began = open_wait.as_ref().map_or(now, |(at, _)| *at);
+    let wait = open_wait.map(|(_, attempt)| scarab_project::ApprovalWait {
+        gate: step.0.clone(),
+        attempt,
+    });
     let release_rule = |approvals: &[String]| {
         rules.map(|(c, p)| {
             scarab_policy::environment_rules::gate_release(
@@ -10013,7 +10300,11 @@ async fn approve_gate(
     if released_already {
         return Ok((
             StatusCode::ACCEPTED,
-            Json(serde_json::json!({ "released": true })),
+            Json(GateApprovalDto {
+                released: true,
+                approvals: None,
+                releases_at: None,
+            }),
         )
             .into_response());
     }
@@ -10055,7 +10346,11 @@ async fn approve_gate(
         let Some(met) = release.met else {
             return Ok((
                 StatusCode::ACCEPTED,
-                Json(serde_json::json!({ "released": false, "approvals": approvers })),
+                Json(GateApprovalDto {
+                    released: false,
+                    approvals: Some(approvers),
+                    releases_at: None,
+                }),
             )
                 .into_response());
         };
@@ -10094,18 +10389,18 @@ async fn approve_gate(
         // here whichever path releases the gate.
         if recorded.is_none() {
             if let Some((c, _)) = rules {
-                record_deployment(&st, c, &run, &approvers, now).await?;
+                record_deployment(&st, c, &run, &approvers, now, wait.as_ref()).await?;
             }
         }
         if release.result.outcome != scarab_policy::evaluate::PolicyOutcome::Passed {
             // The scheduler releases the gate when the timer runs out.
             return Ok((
                 StatusCode::ACCEPTED,
-                Json(serde_json::json!({
-                    "released": false,
-                    "approvals": approvers,
-                    "releases_at": met.release_at,
-                })),
+                Json(GateApprovalDto {
+                    released: false,
+                    approvals: Some(approvers),
+                    releases_at: Some(met.release_at),
+                }),
             )
                 .into_response());
         }
@@ -10146,39 +10441,47 @@ async fn approve_gate(
     if released && approval_gate && rules.is_none() {
         if let Some(c) = &ctx {
             let now = st.clock.now().await.0;
-            record_deployment(&st, c, &run, &approvers, now).await?;
+            record_deployment(&st, c, &run, &approvers, now, wait.as_ref()).await?;
         }
     }
 
     Ok((
         StatusCode::ACCEPTED,
-        Json(serde_json::json!({ "released": released, "approvals": approvers })),
+        Json(GateApprovalDto {
+            released,
+            approvals: Some(approvers),
+            releases_at: None,
+        }),
     )
         .into_response())
 }
 
 /// Write one deploy of `run` to the legacy approval history, when a history
-/// store is wired.
+/// store is wired: at most one per gate `wait`.
 async fn record_deployment(
     st: &AppState,
     c: &scarab_engine::DeployContext,
     run: &RunId,
     approvers: &[String],
     at: i64,
+    wait: Option<&scarab_project::ApprovalWait>,
 ) -> Result<(), ApiError> {
     let Some(store) = st.environments.as_ref() else {
         return Ok(());
     };
     store
-        .record_deployment(&scarab_project::Deployment {
-            org: c.org.clone(),
-            project: c.project.clone(),
-            environment: c.environment.clone(),
-            git_ref: c.git_ref.clone(),
-            run: run.0.clone(),
-            approved_by: approvers.to_vec(),
-            at,
-        })
+        .record_deployment(
+            &scarab_project::Deployment {
+                org: c.org.clone(),
+                project: c.project.clone(),
+                environment: c.environment.clone(),
+                git_ref: c.git_ref.clone(),
+                run: run.0.clone(),
+                approved_by: approvers.to_vec(),
+                at,
+            },
+            wait,
+        )
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))
 }
@@ -10686,7 +10989,8 @@ pub(crate) fn secret_err(e: scarab_secrets::SecretError) -> ApiError {
     request_body = PutSecretRequest,
     responses(
         (status = 204, description = "secret stored"),
-        (status = 404, description = "secrets not configured")
+        (status = 404, description = "secrets not configured"),
+        (status = 409, description = "an Environment-scoped secret whose Environment does not exist")
     )
 )]
 async fn put_secret(
@@ -10703,6 +11007,29 @@ async fn put_secret(
     }
     note_org(&st, &req.org).await?;
     let scope = secret_scope(req.org, req.repo, req.environment)?;
+    // An Environment secret lives only while its Environment does (git-bug
+    // 52964b4): no secret under a name with no Environment, which also
+    // keeps a write out of a Duplicate's target until the Duplicate has
+    // created it. Deleting the Environment is refused while it holds any.
+    if let (
+        scarab_secrets::SecretScope::EnvironmentProject {
+            org, environment, ..
+        },
+        Some(envs),
+    ) = (&scope, st.org_environments.as_ref())
+    {
+        let exists = envs
+            .get_org_environment(org, environment)
+            .await
+            .map_err(org_environments::org_environment_api_error)?
+            .is_some();
+        if !exists {
+            return Err(ApiError::Conflict(format!(
+                "environment `{environment}` does not exist in `{org}`: create it before \
+                 setting its secrets"
+            )));
+        }
+    }
     secrets
         .put(
             &scope,
@@ -12681,16 +13008,15 @@ pub async fn connection_credential(
 /// Resolve a step's scoped secrets and prepare them for injection (ADR-0014,
 /// 0013): fetch each `key` at `scope` from `provider`, **register its value with
 /// the log redactor** so it can never appear in stored or streamed logs, and
-/// return the values as `(key, value)` env pairs for the Pod. The launch path
-/// merges these into the step's env (an executor detail; the live Pod wiring is
-/// k8s/`build_pod`).
+/// return the values as `(key, value)` pairs, the value bytes as stored. The
+/// executor writes each one as a file under `/scarab/secrets/`.
 pub async fn resolve_step_secrets(
     provider: &dyn scarab_secrets::SecretProvider,
     logs: &LogService,
     scope: &scarab_secrets::SecretScope,
     keys: &[String],
     locked_out: bool,
-) -> Result<Vec<(String, String)>, scarab_secrets::SecretError> {
+) -> Result<Vec<(String, Vec<u8>)>, scarab_secrets::SecretError> {
     // Fork-PR lockout (ADR-0015): untrusted runs get NO secrets, so we never
     // even read them from the provider.
     if locked_out {
@@ -12702,10 +13028,7 @@ pub async fn resolve_step_secrets(
         // (ADR-0037); the exact scope is tried first, so exact hits are unchanged.
         let secret = provider.resolve(scope, key).await?;
         logs.register_secret(&secret.value);
-        env.push((
-            key.clone(),
-            String::from_utf8_lossy(&secret.value).into_owned(),
-        ));
+        env.push((key.clone(), secret.value));
     }
     Ok(env)
 }
@@ -13175,7 +13498,8 @@ impl utoipa::Modify for StepUpResponses {
         oauth_callback,
         auth_providers,
         begin_link_identity,
-        begin_link_identity_moving_passkeys,
+        identity_merge,
+        confirm_identity_merge,
         unlink_identity,
         logout,
         me,
@@ -13200,6 +13524,7 @@ impl utoipa::Modify for StepUpResponses {
         org_environments::get_org_environment,
         org_environments::put_org_environment,
         org_environments::delete_org_environment,
+        org_environments::list_orphaned_secrets,
         org_environments::duplicate_org_environment,
         org_environments::get_environment_eligibility,
         org_environments::put_environment_eligibility,
@@ -13376,6 +13701,9 @@ impl utoipa::Modify for StepUpResponses {
         AuthProviderDto,
         LinkIdentityRequest,
         LinkIdentityResponse,
+        IdentityMergeDto,
+        ConfirmIdentityMergeRequest,
+        IdentityMergedDto,
         PrincipalDto,
         PrincipalIdentityDto,
         MintTokenRequest,
@@ -13384,6 +13712,7 @@ impl utoipa::Modify for StepUpResponses {
         ApiTokenDto,
         TokenSort,
         org_environments::OrgEnvironmentDto,
+        org_environments::OrphanedSecretsDto,
         org_environments::PutOrgEnvironmentRequest,
         org_environments::DuplicateOrgEnvironmentRequest,
         org_environments::DuplicateOrgEnvironmentResponse,
@@ -13400,6 +13729,8 @@ impl utoipa::Modify for StepUpResponses {
         org_environments::EnvironmentProjectPrivilegeGrantDto,
         org_environments::ImageGrantDto,
         org_environments::PutEnvironmentProtectionRequest,
+        org_environments::PutApprovalGateRules,
+        GateApprovalDto,
         org_environments::PutEnvironmentProjectOverlayRequest,
         org_environments::EnvironmentProjectOverlayDto,
         org_environments::PutEnvironmentProjectPrivilegeGrantRequest,

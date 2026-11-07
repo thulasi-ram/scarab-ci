@@ -13,7 +13,8 @@ pub const KIND_CONTEXT: &str = "kind-scarab-dev";
 /// whose context does not point at a loopback API server: kind publishes its
 /// API on 127.0.0.1, a remote cluster never is.
 pub async fn kube_client(kubeconfig: &Path) -> Result<kube::Client, String> {
-    let kc = Kubeconfig::read_from(kubeconfig).map_err(|e| format!("{}: {e}", kubeconfig.display()))?;
+    let kc =
+        Kubeconfig::read_from(kubeconfig).map_err(|e| format!("{}: {e}", kubeconfig.display()))?;
     let ctx = kc
         .contexts
         .iter()
@@ -105,8 +106,12 @@ impl Api {
         if !status.is_success() {
             return Err(format!("POST /v1/runs: {status}: {text}"));
         }
-        let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("{e}: {text}"))?;
-        v["id"].as_str().map(str::to_string).ok_or_else(|| format!("no id in {text}"))
+        let v: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| format!("{e}: {text}"))?;
+        v["id"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| format!("no id in {text}"))
     }
 
     /// `POST /v1/runs/{id}/cancel`. 409 (already terminal) is not an error.
@@ -121,12 +126,19 @@ impl Api {
         if status.is_success() || status == reqwest::StatusCode::CONFLICT {
             return Ok(());
         }
-        Err(format!("cancel run {id}: {status}: {}", resp.text().await.unwrap_or_default()))
+        Err(format!(
+            "cancel run {id}: {status}: {}",
+            resp.text().await.unwrap_or_default()
+        ))
     }
 
     /// A send whose non-2xx answer is an `Err` naming `what`; the body as
     /// JSON (`null` when empty).
-    async fn json(&self, what: &str, req: reqwest::RequestBuilder) -> Result<serde_json::Value, String> {
+    async fn json(
+        &self,
+        what: &str,
+        req: reqwest::RequestBuilder,
+    ) -> Result<serde_json::Value, String> {
         let resp = req.send().await.map_err(|e| format!("{what}: {e}"))?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -152,7 +164,10 @@ impl Api {
     ) -> Result<String, String> {
         let want = base_url.trim_end_matches('/');
         let list = self
-            .json("GET /v1/connections", self.http.get(format!("{}/v1/connections", self.base)))
+            .json(
+                "GET /v1/connections",
+                self.http.get(format!("{}/v1/connections", self.base)),
+            )
             .await?;
         for c in list.as_array().into_iter().flatten() {
             let (Some(id), Some(url)) = (c["id"].as_str(), c["base_url"].as_str()) else {
@@ -161,8 +176,10 @@ impl Api {
             if url.trim_end_matches('/') == want {
                 self.json(
                     "DELETE /v1/connections/{id}",
-                    self.http
-                        .delete(format!("{}/v1/connections/{id}?unbind_repos=true", self.base)),
+                    self.http.delete(format!(
+                        "{}/v1/connections/{id}?unbind_repos=true",
+                        self.base
+                    )),
                 )
                 .await?;
             }
@@ -183,7 +200,12 @@ impl Api {
 
     /// Bind `owner/name` to connection `conn` without a webhook (the probe is
     /// dispatched, never pushed). Returns the (org, project) the bind made.
-    pub async fn bind_repo(&self, conn: &str, owner: &str, name: &str) -> Result<(String, String), String> {
+    pub async fn bind_repo(
+        &self,
+        conn: &str,
+        owner: &str,
+        name: &str,
+    ) -> Result<(String, String), String> {
         let bound = self
             .json(
                 "bind repo",
@@ -237,8 +259,12 @@ impl Api {
         if !status.is_success() {
             return Err(format!("GET run {id}: {status}: {text}"));
         }
-        let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("{e}: {text}"))?;
-        v["status"].as_str().map(str::to_string).ok_or_else(|| format!("no status in {text}"))
+        let v: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| format!("{e}: {text}"))?;
+        v["status"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| format!("no status in {text}"))
     }
 }
 

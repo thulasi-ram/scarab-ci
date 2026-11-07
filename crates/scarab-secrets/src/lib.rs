@@ -99,6 +99,20 @@ pub fn environment_project_of_scope_key(
     (!project.is_empty() && !project.contains('/')).then(|| project.to_string())
 }
 
+/// The `(project, environment)` of a [`SecretScope::EnvironmentProject`]
+/// scope key in `org`, or `None` for any other key. The Project is the part
+/// up to the first `/` after the org (a forge repository name holds none);
+/// the Environment is the rest.
+pub fn environment_scope_of_scope_key(scope_key: &str, org: &str) -> Option<(String, String)> {
+    let (project, environment) = scope_key
+        .strip_prefix("env:")?
+        .strip_prefix(org)?
+        .strip_prefix('/')?
+        .split_once('/')?;
+    (!project.is_empty() && !environment.is_empty())
+        .then(|| (project.to_string(), environment.to_string()))
+}
+
 /// Errors from secret operations.
 #[derive(Debug, thiserror::Error)]
 pub enum SecretError {
@@ -140,6 +154,20 @@ pub trait SecretProvider: Send + Sync {
     ) -> Result<Vec<String>, SecretError> {
         Err(SecretError::Backend(
             "this secret store cannot list the projects holding secrets in an environment".into(),
+        ))
+    }
+
+    /// Every [`SecretScope::EnvironmentProject`] of `org` holding at least
+    /// one secret, as `(project, environment)`, sorted. What finds secrets
+    /// left under an Environment that no longer exists (git-bug 52964b4).
+    /// A store that cannot enumerate its scopes answers
+    /// [`SecretError::Backend`].
+    async fn environment_secret_scopes(
+        &self,
+        _org: &str,
+    ) -> Result<Vec<(String, String)>, SecretError> {
+        Err(SecretError::Backend(
+            "this secret store cannot list its environment scopes".into(),
         ))
     }
 

@@ -68,7 +68,10 @@ impl Helper {
             .env("GIT_ASKPASS", self.askpass())
             .env("SCARAB_CLONE_URL", clone_url)
             .env("SCARAB_CLONE_TOKEN_FILE", self.dir.path().join("token"))
-            .env("SCARAB_CLONE_USERNAME_FILE", self.dir.path().join("username"));
+            .env(
+                "SCARAB_CLONE_USERNAME_FILE",
+                self.dir.path().join("username"),
+            );
         cmd
     }
 
@@ -105,7 +108,10 @@ impl Helper {
             .env("PATH", std::env::var("PATH").unwrap_or_default())
             .env("SCARAB_CLONE_URL", clone_url)
             .env("SCARAB_CLONE_TOKEN_FILE", self.dir.path().join("token"))
-            .env("SCARAB_CLONE_USERNAME_FILE", self.dir.path().join("username"))
+            .env(
+                "SCARAB_CLONE_USERNAME_FILE",
+                self.dir.path().join("username"),
+            )
             .stderr(Stdio::null())
             .output()
             .unwrap();

@@ -629,7 +629,7 @@ async fn approve_gate_releases_while_the_project_stays_eligible() {
 /// resolved for it.
 #[derive(Default)]
 struct RecordingExec {
-    launched: Mutex<Option<Vec<(String, String)>>>,
+    launched: Mutex<Option<Vec<(String, Vec<u8>)>>>,
 }
 
 #[async_trait]
@@ -778,7 +778,7 @@ async fn secret_launch_rechecks_eligibility_and_releases_nothing_to_an_ineligibl
             result.expect("an eligible project's step launches");
             assert!(launched
                 .unwrap()
-                .contains(&("TOKEN".to_string(), "s3cr3t".to_string())));
+                .contains(&("TOKEN".to_string(), b"s3cr3t".to_vec())));
         } else {
             let err = result.expect_err("an ineligible project's step must not launch");
             // `Refused`, not `Launch`: the scheduler turns only a refusal into a

@@ -18,7 +18,7 @@ use axum::http::{Request, StatusCode};
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
-use scarab_engine::ports::ExecState;
+use scarab_engine::ports::{ExecState, Executor};
 use scarab_engine::{Clock, Db, RunId, Scheduler, StepStatus};
 use scarab_forge::RepoRef;
 use scarab_policy::evaluate::{DecisionOutcome, PolicyOutcome};
@@ -154,12 +154,14 @@ impl Stack {
         .await
     }
 
-    async fn tick(&self, run: &RunId, n: usize) {
+    /// The launch path: `SecretInjectingExecutor` with the governance, the
+    /// Policies and this clock, over the fake executor.
+    fn launcher(&self) -> SecretInjectingExecutor {
         let logs = Arc::new(LogService::new(
             Arc::new(InMemoryObjectStore::new()),
             self.db.clone(),
         ));
-        let exec = SecretInjectingExecutor::new(
+        SecretInjectingExecutor::new(
             self.exec.clone(),
             self.db.clone() as Arc<dyn Db>,
             Arc::new(FakeSecrets::new()),
@@ -167,7 +169,32 @@ impl Stack {
         )
         .with_environment_governance(self.governance.clone())
         .with_policies(self.policies.clone())
-        .with_clock(self.clock.clone());
+        .with_clock(self.clock.clone())
+    }
+
+    /// Store a `step.admit` deny Policy named `name` that refuses when
+    /// `when` holds.
+    async fn step_admit_policy(&self, name: &str, when: &str) {
+        self.policies
+            .create(&NewPolicy {
+                id: format!("p-{name}"),
+                scope: PolicyScope::Org { org: "acme".into() },
+                body: Policy::from_json(json!({
+                    "name": name,
+                    "checkpoint": "step.admit",
+                    "rules": [{ "when": when, "effect": "deny", "message": "not you" }],
+                }))
+                .expect("a valid Policy"),
+                author: "admin".into(),
+                reason: "test".into(),
+                at: 1,
+            })
+            .await
+            .expect("saved");
+    }
+
+    async fn tick(&self, run: &RunId, n: usize) {
+        let exec = self.launcher();
         let sched = Scheduler::new(
             self.db.as_ref(),
             self.clock.as_ref() as &dyn Clock,
@@ -505,6 +532,80 @@ async fn a_step_admit_policy_denies_what_the_recheck_allows() {
         &PolicyOutcome::Passed,
         "the re-check alone admits it"
     );
+}
+
+/// X7: `step.env_secrets` names the secrets that are also environment
+/// variables, so a Policy can refuse those and leave file-only secrets be.
+#[tokio::test]
+async fn a_step_admit_policy_sees_which_secrets_are_env_vars() {
+    let s = Stack::new(rules(&[ME])).await;
+    s.deny_policy(
+        "step.admit",
+        "has(step.env_secrets) && 'TOKEN' in step.env_secrets",
+    )
+    .await;
+    let run = s
+        .dispatch(
+            r#"
+on:
+  manual: {}
+steps:
+  - { id: files, image: busybox, command: ["true"], secrets: [TOKEN] }
+  - { id: envs, image: busybox, command: ["true"], needs: [files], secrets: [{ name: TOKEN, env: true }] }
+"#,
+        )
+        .await
+        .expect("admitted");
+    s.tick(&run, 6).await;
+    assert_eq!(s.status(&run, "files").await, StepStatus::Succeeded);
+    assert_eq!(s.status(&run, "envs").await, StepStatus::Failed);
+    let envs = s.admits(&run, "envs").await;
+    assert_eq!(
+        envs[0].decision.input["step"]["env_secrets"],
+        serde_json::json!(["TOKEN"])
+    );
+}
+
+/// git-bug 7c2514a (ADR-0075 §3): one Attempt, one decision. A redelivered
+/// launch of the same Attempt (a crash between the decision and the Pod, a
+/// lease takeover) acts on the decision recorded first, not on a new one
+/// made under a Policy stored since. The next Attempt is decided afresh.
+#[tokio::test]
+async fn a_redelivered_launch_acts_on_the_first_recorded_decision() {
+    let s = Stack::new(rules(&[ME])).await;
+    s.step_admit_policy("not-yet", "step.image == 'nope'").await;
+    let run = s.dispatch(UNGOVERNED).await.expect("admitted");
+    s.tick(&run, 6).await;
+    assert_eq!(s.status(&run, "test").await, StepStatus::Succeeded);
+    let first = s.admits(&run, "test").await;
+    assert_eq!(first.len(), 1, "{first:?}");
+    assert!(!first[0].decision.is_denied());
+
+    // A Policy that refuses `test` is stored after its launch was decided.
+    s.step_admit_policy("now-no", "step.image == 'alpine'")
+        .await;
+    let sr =
+        s.db.steps_of_run(&run)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|x| x.step.0 == "test")
+            .unwrap();
+    let spec = s
+        .exec
+        .launched_spec(&FakeExecutor::handle_for(&sr))
+        .expect("launched once");
+    s.launcher()
+        .launch(&sr, &spec)
+        .await
+        .expect("the redelivered launch acts on the recorded allow");
+    let after = s.admits(&run, "test").await;
+    assert_eq!(
+        after.len(),
+        1,
+        "no second decision for the Attempt: {after:?}"
+    );
+    assert!(!after[0].decision.is_denied());
 }
 
 /// A Run no Environment governs: ordinary CI.

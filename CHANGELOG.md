@@ -216,9 +216,12 @@ record. Read Breaking changes before you upgrade.
 
 - A pull request could save a Cache that a Step in an Environment-governed Run then restored,
   so a deploy could ship bytes a pull request wrote (git-bug efcec77). Every Run now has a
-  cache scope, fixed when the Run is created and kept by its reruns. A Run governed by an
-  Environment uses `env:<name>`: it reads and writes only that scope, so its first build is
-  cold. Any other Run uses its ref (`refs/heads/feat`, `refs/pull/7/head`): it writes only that
+  cache scope, fixed when the Run is created and kept by its reruns. In a Run governed by an
+  Environment, a Step that an approved Environment approval gate admits uses `env:<name>`: it
+  reads and writes only that scope, so its first build is cold. A Step before the gate uses the
+  Run's ref, so a push to any branch whose Pipeline names the Environment cannot write what the
+  next approved deploy restores (git-bug 31a2533). The test is the one that gives a Step the
+  `env=<name>` OIDC subject. Any other Run uses its ref (`refs/heads/feat`, `refs/pull/7/head`): it writes only that
   scope, and when that scope has no entry it reads the default branch's. A pull request never
   uses an Environment's scope, even when its Pipeline names the Environment and the Environment
   admits it: it uses its own ref like any other Run. A pull request reads `main`'s Cache and
@@ -259,7 +262,23 @@ record. Read Breaking changes before you upgrade.
   debug Pod, `…/debug-pod`) reads the Pod's environment and acts with its credentials, but it
   asked only for `Administer`. It now needs a step-up confirmation, as a secret write does: a
   browser session's 5-minute window satisfies it. An API token or a session presented as
-  `Bearer` can no longer open one, since a WebSocket cannot be held for a confirmation.
+  `Bearer` can no longer open one, since a WebSocket cannot be held for a confirmation. A
+  browser's WebSocket cannot send `x-csrf-token`, so the web UI sends the session's CSRF token
+  as the `scarab.csrf.<token>` subprotocol, and the server answers with `scarab.v1`. Before it
+  opens the socket, the UI makes a plain `GET` of the same URL, which asks for the window when
+  the session has none (git-bug aeba20a).
+- An Environment secret could be written under a name with no Environment, outlive its
+  Environment, and be picked up by a later Environment of the same name; one written into a
+  Duplicate's target while the Duplicate ran was overwritten or deleted by it (git-bug
+  52964b4). `POST /v1/secrets` now answers 409 for an Environment that does not exist, and
+  deleting an Environment answers 409 while any Project holds a secret in it. `GET
+  /v1/orgs/{org}/secrets/orphaned` lists, by name, the secrets already left under Environment
+  names that no longer exist, so an admin can delete them.
+- A secret value that is not UTF-8 (a keystore, a binary key) reached the Step changed: it was
+  read as text and invalid bytes were replaced. Values are now bytes from the store to the
+  file; the per-Pod Kubernetes Secret uses `data`. An `env: true` secret must be UTF-8 text,
+  and a Step whose `env: true` secret is not fails with a configuration error that names it
+  (git-bug c1f61c9).
 - **Passkey counter checks.** Two uses of one passkey verified at the same time could flag it
   as a suspected clone when the later count landed first. A use whose count was ahead of the
   stored one when it was checked, and differs from the count stored since, is now recorded;
@@ -268,14 +287,16 @@ record. Read Breaking changes before you upgrade.
   as `passkey.counter_regressed`. Once every passkey of a user is flagged, a fresh login no
   longer enrolls a new first passkey (a thief holding the forge account can make a fresh
   login): an Owner must reset the user's passkeys first, and a step-up refusal says so.
-- When one sign-in identity is merged into another Principal, the merged Principal's passkeys
-  now move to the surviving one, so the person can still confirm a step-up with them. Each
-  moved passkey keeps the WebAuthn user handle it was created under (migration 0082). Such a
-  merge needs a step-up confirmation for that action, not the 5-minute window: start it with
-  `POST /v1/me/identities/link-moving-passkeys` (`identity.link_moving_passkeys`, always
-  asks). A link started with `POST /v1/me/identities/link` that would move passkeys is refused
-  at the callback and changes nothing. Each moved passkey is recorded as a
-  `passkey.moved_on_merge` security event naming both Principals.
+- **Merging in an account that has passkeys needs one of its passkeys.** Linking a sign-in that
+  is the only way into another Principal folds that Principal into yours: its roles, approver
+  entries and tokens become yours. Someone who controlled only that forge login could take
+  them over, confirming with their own passkey (git-bug bbb5204, ADR-0079). When the folded
+  Principal holds any passkey, the link's callback now changes nothing and sends you to
+  confirm the merge with one of that Principal's passkeys (`GET` and `POST
+  /v1/me/identities/merges/{id}`, migration 0084); Settings → Profile asks for it. A Principal
+  with no passkey merges as before. A merge deletes the folded Principal's passkeys instead
+  of moving them, and records each as a `passkey.removed_on_merge` security event naming
+  both Principals.
 - **Unpinning a Run's snapshots needs a step-up.** `DELETE /v1/runs/{id}/snapshots-pin`
   shortens how long the Run's snapshots are kept, so it now needs a step-up confirmation
   (window). Pinning does not.
@@ -427,6 +448,16 @@ record. Read Breaking changes before you upgrade.
 
 ### Enhancement
 
+- `PUT /v1/orgs/{org}/environments/{env}/protection` takes the approval gate settings under
+  `approval_gate` (`missing_gate_mode`, `added_gate_expiry_s`, `required_approvals`,
+  `max_approval_age_s`), the shape its `GET` returns, so a client can send back what it read.
+  The same fields at the top level are refused (git-bug 16c48e1).
+- `POST /v1/runs/{id}/gates/{step}/approve` answers with a typed body (`released`,
+  `approvals`, `releases_at`) described in the OpenAPI spec, which also lists its 403.
+- The `run.create` and `step.admit` Policy inputs list a Step's `env: true` secrets as
+  `step.env_secrets`. Decisions recorded earlier lack it, so read it as
+  `has(step.env_secrets) && 'NAME' in step.env_secrets`.
+
 - **The Environment's approval-gate rules run in the policy engine.** The gate the Environment
   adds (`run.create`), the release rules of an Environment approval gate (`gate.resolve`) and
   the check at each launch (`step.admit`) are built-in rules of the engine. Each consultation
@@ -436,6 +467,12 @@ record. Read Breaking changes before you upgrade.
   `Config` (git-bug c2f97b4). A `step.admit` Policy applies to every launch its `match`
   selects, in Runs that no Environment governs too. An approval that races another one is
   checked again over both approvals, and a deny then answers 403 with the approval kept.
+  `step.admit` decides once per Attempt: a launch of the same Attempt delivered again (after a
+  crash between the decision and the Pod) acts on the decision recorded first, including
+  whether an approval admitted the Step (its OIDC subject and cache scope), so a Policy
+  stored or an approval aged out in between applies from the next Attempt (git-bug 7c2514a).
+  Decisions were recorded under attempt 1 for every Attempt, and the `step.attempt` a Policy
+  reads was always 1; both now use the Attempt's own number.
   [Environments](https://thulasi-ram.github.io/scarab-ci/usage/environments/#the-approval-gate)
 - **Caches at more than one Depot replica.** Each Cache key has one home Depot replica, chosen
   by rendezvous hashing over the StatefulSet's ordinals, and a Step saves and restores the
@@ -498,7 +535,13 @@ record. Read Breaking changes before you upgrade.
   failed, so they were skipped) stayed Suspended until someone acted or the gate expired. The
   gate now ends Skipped ("no longer needed") and the Run settles at once. A gate with no
   dependents keeps waiting: its verdict is the Run's outcome. A rerun that makes a dependent
-  wait again puts the gate back to waiting.
+  wait again puts the gate back to waiting. The skip applies only once a Step of the Run has
+  failed or been cancelled: a gate whose dependents `when:` excluded is a sign-off, so it waits
+  for someone instead of being skipped before its own `needs` run (git-bug 0130969).
+- Two approvals that met an Environment's rules at the same moment each wrote a record to the
+  approval history (`GET /v1/repos/{org}/{repo}/environments/{name}/deployments`), so it showed
+  one approval twice. A record now names the gate wait it belongs to, and the history holds at
+  most one per wait; a rerun of the gate still gets its own (git-bug 1d06f2d, migration 0085).
 - Two admins writing one org Environment at the same time could get a 500 when Postgres
   reported a deadlock (`40P01`) or a serialization failure (`40001`). Those are now a 409 that
   says to retry. `PUT /v1/orgs/{org}/environments/{env}` takes `If-None-Match: *` (create
@@ -528,6 +571,11 @@ record. Read Breaking changes before you upgrade.
   Environment view and edit pages.
 
 ### Misc
+
+- `rust-toolchain.toml` names an exact Rust release (1.97.0) and `rustfmt.toml` pins the style
+  edition, so what `cargo fmt --check` accepts no longer changes with each Rust release. The
+  workspace is formatted, and CI (`openapi-drift`), `just check all` and the dogfood `lint`
+  step check it (git-bug 0b78f43).
 
 - `just stack up dogfood` signs in with GitHub instead of running dev-insecure: identity store,
   role bindings, API tokens and passkey step-up, as a real install. It needs

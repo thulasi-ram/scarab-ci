@@ -12,8 +12,8 @@ use scarab_engine::{
 };
 use scarab_forge::{ForgeKind, RepoRef};
 use scarab_pipeline::ForgeToken;
-use scarab_server::forge_token::{clone_url, ForgeCredentialExecutor};
 use scarab_policy::library::{content_hash, LibraryStore, LibraryVersion, TrustedSource};
+use scarab_server::forge_token::{clone_url, ForgeCredentialExecutor};
 use scarab_testkit::{FakeExecutor, FakeForge, InMemoryDb, InMemoryLibraries};
 
 fn step_run(id: &str) -> StepRun {
@@ -146,7 +146,11 @@ async fn a_minted_token_is_revoked_when_the_attempt_ends() {
         assert!(forge.revoked().is_empty());
         inner.script_outcome(end.clone());
         assert_eq!(exec.poll(&handle).await.unwrap(), end);
-        assert_eq!(forge.revoked(), vec![token.clone()], "revoked once at the end");
+        assert_eq!(
+            forge.revoked(),
+            vec![token.clone()],
+            "revoked once at the end"
+        );
         // A later poll revokes nothing more.
         let _ = exec.poll(&handle).await;
         assert_eq!(forge.revoked().len(), 1);
@@ -204,10 +208,7 @@ async fn a_long_lived_token_is_handed_over_and_never_revoked() {
     spec.forge_token.as_mut().unwrap().trusted_library = Some(trusted_library(&libs).await);
     let exec = ForgeCredentialExecutor::new(inner.clone(), forge.clone())
         .with_libraries(Arc::new(InMemoryDb::new()), libs.clone());
-    let handle = exec
-        .launch(&step_run("checkout/git"), &spec)
-        .await
-        .unwrap();
+    let handle = exec.launch(&step_run("checkout/git"), &spec).await.unwrap();
     assert!(inner
         .launched_spec(&handle)
         .unwrap()
@@ -218,10 +219,16 @@ async fn a_long_lived_token_is_handed_over_and_never_revoked() {
     assert!(inner.holds_forge_credential(&handle));
     inner.script_outcome(ExecState::Succeeded);
     exec.poll(&handle).await.unwrap();
-    assert!(forge.revoked().is_empty(), "the connection's own token is not revoked");
+    assert!(
+        forge.revoked().is_empty(),
+        "the connection's own token is not revoked"
+    );
     // The unit no longer holds it once the Attempt ends (on k8s: the token
     // Secret is deleted, though the Pod is kept).
-    assert!(!inner.holds_forge_credential(&handle), "a kept unit still holds the token");
+    assert!(
+        !inner.holds_forge_credential(&handle),
+        "a kept unit still holds the token"
+    );
 }
 
 /// A Run stored with an `http://` clone URL (before Run creation refused
@@ -229,7 +236,8 @@ async fn a_long_lived_token_is_handed_over_and_never_revoked() {
 #[tokio::test]
 async fn a_launch_for_a_run_with_an_http_clone_url_mints_nothing() {
     let db = Arc::new(InMemoryDb::new());
-    let facts = serde_json::json!({ "repo": { "clone_url": "http://git.example.com/acme/web.git" } });
+    let facts =
+        serde_json::json!({ "repo": { "clone_url": "http://git.example.com/acme/web.git" } });
     db.set_run_event_facts(&RunId("r1".into()), facts.as_object().unwrap())
         .await
         .unwrap();
@@ -273,7 +281,11 @@ async fn a_launch_after_the_trust_is_removed_mints_nothing() {
     let handle = exec.launch(&step_run("push"), &write).await.unwrap();
     let launched = inner.launched_spec(&handle).unwrap().forge_token.unwrap();
     assert_eq!(launched.access, ForgeToken::Read);
-    assert!(!launched.credential.unwrap().token.starts_with("fake-write-token"));
+    assert!(!launched
+        .credential
+        .unwrap()
+        .token
+        .starts_with("fake-write-token"));
 }
 
 #[tokio::test]
@@ -360,8 +372,7 @@ async fn scoped_registry_auth_secret_takes_precedence_over_forge_derived() {
             token: "derived".into(),
         },
     ));
-    let exec = ForgeCredentialExecutor::new(inner.clone(), forge)
-        .with_secrets(secrets);
+    let exec = ForgeCredentialExecutor::new(inner.clone(), forge).with_secrets(secrets);
     let handle = exec
         .launch(&step_run("image"), &build_spec("ghcr.io/acme/web:1"))
         .await

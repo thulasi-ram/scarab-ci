@@ -40,10 +40,7 @@ fn spec(command: Vec<&str>) -> StepSpec {
 /// A run with `producer` and `consumer` (which needs it). The consumer runs
 /// `echo` with `consumer_env`: a value from outside the Pipeline (a result,
 /// a Run parameter) reaches a Step as an env value (ADR-0076, 2026-10-30).
-async fn seed_two_step(
-    db: &InMemoryDb,
-    consumer_env: &[(&str, &str)],
-) -> (RunId, StepId, StepId) {
+async fn seed_two_step(db: &InMemoryDb, consumer_env: &[(&str, &str)]) -> (RunId, StepId, StepId) {
     let run = RunId("run-1".into());
     let producer = StepId("producer".into());
     let consumer = StepId("consumer".into());
@@ -418,7 +415,10 @@ async fn a_parameter_or_result_holding_a_template_stays_text() {
                 "SCARAB_PARAM_P".to_string(),
                 "${{ outputs.producer.secret }}".to_string()
             ),
-            ("P".to_string(), "${{ outputs.producer.secret }}".to_string()),
+            (
+                "P".to_string(),
+                "${{ outputs.producer.secret }}".to_string()
+            ),
             ("V".to_string(), "${{ inputs.p }}".to_string()),
         ]
     );

@@ -278,28 +278,88 @@ async fn step_admit(
     })
     .await
     .map_err(|e| ExecError::Other(e.to_string()))?;
-    let denied = decision.is_denied();
-    let messages = decision.attributed_messages();
+    let attempt = attempt_number(step);
     let record = scarab_policy::store::DecisionRecord {
         id: uuid::Uuid::now_v7().to_string(),
         org: org.to_string(),
         project: Some(project.to_string()),
         run_id: Some(step.run.0.clone()),
         step_id: Some(id.clone()),
-        attempt: Some(step.attempts.len() as u32),
+        attempt: Some(attempt),
         decision,
         at: now_ms,
     };
-    match policies.record_decision(&record).await {
-        Ok(_) | Err(scarab_policy::store::PolicyStoreError::Conflict) => {}
+    // One Attempt, one decision (ADR-0075 §3, git-bug 7c2514a): the first
+    // decision recorded for the Attempt wins. A redelivered launch (a crash
+    // between the decision and the Pod, a lease takeover) finds it and acts
+    // on it, so a policy changed in between applies from the next Attempt
+    // and the record is what the launch did.
+    let acted = match policies.record_decision(&record).await {
+        Ok(_) => record.decision,
+        Err(scarab_policy::store::PolicyStoreError::Conflict) => policies
+            .decisions_for_run(&step.run.0)
+            .await
+            .map_err(|e| ExecError::Other(format!("policy store: {e}")))?
+            .into_iter()
+            .find(|r| {
+                r.decision.checkpoint == Checkpoint::StepAdmit
+                    && r.step_id.as_deref() == Some(id.as_str())
+                    && r.attempt == Some(attempt)
+            })
+            .map(|r| r.decision)
+            .ok_or_else(|| {
+                ExecError::Other(format!(
+                    "policy store: the step.admit decision of step `{id}` attempt {attempt} \
+                     is recorded but cannot be read"
+                ))
+            })?,
         Err(e) => return Err(ExecError::Other(format!("policy store: {e}"))),
-    }
-    match check.refusal {
-        // The built-in rule's own words, as the Step's failure has said them.
+    };
+    // Whether an approval admits the Step is part of the decision too: the
+    // recorded value, so a redelivery keeps the OIDC subject and cache scope
+    // the first launch had. A record from before the field fell back to this
+    // launch's own check.
+    let admission = StepAdmission {
+        before_approval: acted
+            .results
+            .iter()
+            .find(|r| r.policy_id == scarab_policy::environment_rules::LAUNCH_RECHECK_ID)
+            .and_then(|r| r.before_approval)
+            .unwrap_or(admission.before_approval),
+    };
+    match step_admit_refusal(&acted) {
         Some(r) => Err(ExecError::Refused(r)),
-        None if denied => Err(ExecError::Refused(messages.join("; "))),
         None => Ok(admission),
     }
+}
+
+/// The number of the Attempt being launched, from 1. The `StepRun` a launch
+/// receives carries only that Attempt (the scheduler rebuilds it fenced to
+/// the one it launches), so its id says which it is, not the list's length.
+fn attempt_number(step: &StepRun) -> u32 {
+    step.current_attempt()
+        .and_then(|a| a.id.number())
+        .unwrap_or(step.attempts.len() as u32)
+}
+
+/// Why a `step.admit` decision refuses the launch, or `None`: the built-in
+/// re-check's own words first, as the Step's failure has said them, else
+/// each enforced Policy's attributed message.
+fn step_admit_refusal(decision: &scarab_policy::evaluate::PolicyDecision) -> Option<String> {
+    use scarab_policy::evaluate::PolicyOutcome;
+    let builtin = decision.results.iter().find_map(|r| match &r.outcome {
+        PolicyOutcome::Denied { messages }
+            if r.policy_id == scarab_policy::environment_rules::LAUNCH_RECHECK_ID =>
+        {
+            Some(messages.join("; "))
+        }
+        _ => None,
+    });
+    builtin.or_else(|| {
+        decision
+            .is_denied()
+            .then(|| decision.attributed_messages().join("; "))
+    })
 }
 
 /// The `step.admit` input of one launch; an `Err` names what does not fit
@@ -358,6 +418,18 @@ fn step_admit_input(
                 "secrets",
             )
             .map_err(|e| e.to_string())?,
+            env_secrets: Some(
+                rc::capped(
+                    s.secrets
+                        .iter()
+                        .filter(|r| r.env)
+                        .map(|r| r.name.clone())
+                        .collect(),
+                    &what,
+                    "secrets",
+                )
+                .map_err(|e| e.to_string())?,
+            ),
             forge_token: s.forge_token.map(|t| match t {
                 scarab_pipeline::ForgeToken::Read => rc::ForgeToken::Read,
                 scarab_pipeline::ForgeToken::Write => rc::ForgeToken::Write,
@@ -365,7 +437,7 @@ fn step_admit_input(
             uses_environment_authority: rc::uses_environment_authority(ir, s),
             origin: rc::origin_of(&s.origin, &what).map_err(|e| e.to_string())?,
         },
-        attempt: step.attempts.len() as u64,
+        attempt: u64::from(attempt_number(step)),
         run: sa::AdmittedRun {
             id: step.run.0.clone(),
             r#ref: governed.map(|(ctx, _)| ctx.git_ref.clone()),
@@ -599,16 +671,35 @@ impl Executor for SecretInjectingExecutor {
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         let oidc_token = self.mint_oidc_token(step, admission, now_ms).await?;
-        let base;
-        let spec = if let Some(token) = oidc_token {
-            base = StepSpec {
+        let mut base = None;
+        if let Some(token) = oidc_token {
+            base = Some(StepSpec {
                 oidc_token: Some(token),
                 ..spec.clone()
-            };
-            &base
-        } else {
-            spec
-        };
+            });
+        }
+        // The Environment's cache scope (git-bug 31a2533) follows the OIDC
+        // subject: a Step uses `env:<name>` only when it would get
+        // `env=<name>`, an approved Environment approval gate upstream
+        // admitting it. Any other Step keeps its ref's scope. The scheduler
+        // resolved both; the Environment's is dropped unless it applies.
+        if spec.cache.as_ref().is_some_and(|c| c.approved.is_some()) {
+            let governed = self
+                .db
+                .run_deploy_context(&step.run)
+                .await
+                .map_err(|e| ExecError::Other(e.to_string()))?
+                .is_some_and(|ctx| !ctx.locked_out);
+            let s = base.get_or_insert_with(|| spec.clone());
+            if let Some(cache) = s.cache.as_mut() {
+                if governed && !admission.before_approval {
+                    cache.use_approved_scope();
+                } else {
+                    cache.approved = None;
+                }
+            }
+        }
+        let spec = base.as_ref().unwrap_or(spec);
         // No declared secrets → nothing further to inject.
         if spec.secrets.is_empty() {
             return self.inner.launch(step, spec).await;
@@ -647,6 +738,12 @@ impl Executor for SecretInjectingExecutor {
         // as a file and never writes a value into the Pod spec (ADR-0014).
         let mut spec = spec.clone();
         spec.resolved_secrets = scarab_engine::ResolvedSecrets(resolved);
+        if let Some(name) = spec.resolved_secrets.first_non_text_env(&spec.secrets) {
+            return Err(ExecError::Refused(format!(
+                "secret `{name}` is not UTF-8 text, so it cannot be an environment variable: \
+                 remove `env: true` and read the file $SCARAB_SECRETS/{name}"
+            )));
+        }
         self.inner.launch(step, &spec).await
     }
 
@@ -746,7 +843,6 @@ impl Executor for SecretInjectingExecutor {
         // as `results`/`artifacts` below.
         self.inner.output_identity(handle).await
     }
-
 
     async fn results(
         &self,

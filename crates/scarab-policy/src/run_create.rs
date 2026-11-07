@@ -150,6 +150,11 @@ policy_struct! {
         pub grants: Capped<String, MAX_GRANTS>,
         pub k8s_overlay: bool,
         pub secrets: Capped<String, MAX_SECRETS>,
+        /// The names in `secrets` whose entry has `env: true`: each is an
+        /// environment variable of the Step as well as a file. Absent from
+        /// inputs recorded before it existed, so a rule reads it as
+        /// `has(step.env_secrets) && 'NAME' in step.env_secrets`.
+        pub env_secrets: Option<Capped<String, MAX_SECRETS>>,
         pub placement_profiles: Capped<String, MAX_PLACEMENT_PROFILES>,
         pub deploy: bool,
         pub forge_token: Option<ForgeToken>,
@@ -509,6 +514,15 @@ pub fn input_from_pipeline(
                 &what,
                 "secrets",
             )?,
+            env_secrets: Some(capped(
+                s.secrets
+                    .iter()
+                    .filter(|x| x.env)
+                    .map(|x| x.name.clone())
+                    .collect(),
+                &what,
+                "secrets",
+            )?),
             placement_profiles: capped(s.placement_profiles.clone(), &what, "placement profiles")?,
             deploy: s.deploy || ir.deploy,
             forge_token: s.forge_token.map(|t| match t {

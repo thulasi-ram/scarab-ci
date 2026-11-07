@@ -813,7 +813,10 @@ scarab-wsfetch: cache restore skipped (source wins) dir=deps — the workspace a
         let home = "http://scarab-workspace-1.scarab.svc:8080";
         let other_replica = [fault("delete-pod", "scarab-workspace-0")];
         let server = [fault("kill-server", "scarab-7d9f-abcde")];
-        assert_eq!(c1(&recorded("hit", home), &other_replica), C1::Checked(Ok(())));
+        assert_eq!(
+            c1(&recorded("hit", home), &other_replica),
+            C1::Checked(Ok(()))
+        );
         assert_eq!(c1(&recorded("hit", home), &server), C1::Checked(Ok(())));
         assert_eq!(c1(&recorded("hit", home), &[]), C1::Checked(Ok(())));
 
@@ -822,10 +825,16 @@ scarab-wsfetch: cache restore skipped (source wins) dir=deps — the workspace a
             matches!(&miss, C1::Checked(Err(d)) if d.contains("home replica 1") && d.contains("restore miss")),
             "{miss:?}"
         );
-        let elsewhere = c1(&recorded("hit", "http://scarab-workspace-0.scarab.svc:8080"), &[]);
+        let elsewhere = c1(
+            &recorded("hit", "http://scarab-workspace-0.scarab.svc:8080"),
+            &[],
+        );
         assert!(matches!(elsewhere, C1::Checked(Err(_))), "{elsewhere:?}");
         let none = c1(&recorded("none", home), &[]);
-        assert!(matches!(none, C1::Checked(Err(_))), "no restore offered after a saved seed: {none:?}");
+        assert!(
+            matches!(none, C1::Checked(Err(_))),
+            "no restore offered after a saved seed: {none:?}"
+        );
     }
 
     /// C1's not-exercised side: a failed seed, a fault on the home (a Pod
@@ -835,8 +844,14 @@ scarab-wsfetch: cache restore skipped (source wins) dir=deps — the workspace a
     fn c1_is_not_exercised_when_the_home_was_hit_or_the_seed_failed() {
         let home = "http://scarab-workspace-1.scarab.svc:8080";
         let ne = |r: C1| matches!(r, C1::NotExercised(_));
-        assert!(ne(c1(&recorded("miss", home), &[fault("delete-pod", "scarab-workspace-1")])));
-        assert!(ne(c1(&recorded("miss", home), &[fault("pause-node", "scarab-dev-control-plane")])));
+        assert!(ne(c1(
+            &recorded("miss", home),
+            &[fault("delete-pod", "scarab-workspace-1")]
+        )));
+        assert!(ne(c1(
+            &recorded("miss", home),
+            &[fault("pause-node", "scarab-dev-control-plane")]
+        )));
 
         let mut seed_failed = recorded("miss", home);
         seed_failed.seed_status = Some("failed".into());
@@ -865,6 +880,9 @@ scarab-wsfetch: cache restore skipped (source wins) dir=deps — the workspace a
             owner: "scarab".into(),
         };
         let shown = format!("{fj:?}");
-        assert!(!shown.contains("s3cr3t-token") && shown.contains("<redacted>"), "{shown}");
+        assert!(
+            !shown.contains("s3cr3t-token") && shown.contains("<redacted>"),
+            "{shown}"
+        );
     }
 }

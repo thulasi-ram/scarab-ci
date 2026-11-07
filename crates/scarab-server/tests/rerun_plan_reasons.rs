@@ -166,14 +166,9 @@ async fn an_ordinary_rerun_plan_names_target_and_cascade() {
             .map(String::from)
             .collect(),
     );
-    let plan = plan_rerun(
-        &db as &dyn Db,
-        Some(&oracle),
-        &run,
-        &StepId("push".into()),
-    )
-    .await
-    .unwrap();
+    let plan = plan_rerun(&db as &dyn Db, Some(&oracle), &run, &StepId("push".into()))
+        .await
+        .unwrap();
     assert!(!plan.is_widened());
     let order: Vec<(&str, PlanReason)> = plan
         .steps
@@ -218,14 +213,9 @@ async fn a_shared_expired_producer_is_one_regenerate_root_not_two() {
     // left+right roots (present) — then nothing widens. Target `left` instead:
     // its consumed root-base is gone → base regenerates, and base's OTHER
     // descendant `right` joins as RegenerateCascade.
-    let plan = plan_rerun(
-        &*db as &dyn Db,
-        Some(&oracle),
-        &run,
-        &StepId("left".into()),
-    )
-    .await
-    .unwrap();
+    let plan = plan_rerun(&*db as &dyn Db, Some(&oracle), &run, &StepId("left".into()))
+        .await
+        .unwrap();
     let regenerates: Vec<&str> = plan
         .steps
         .iter()

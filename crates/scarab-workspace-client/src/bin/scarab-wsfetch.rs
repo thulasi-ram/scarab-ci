@@ -103,10 +103,10 @@ use std::os::unix::fs::PermissionsExt;
 
 use scarab_storage::{PruneError, StorageError, TreeHash};
 use scarab_workspace_client::{
-    exclude_paths, fold_manifests, termination_summary, CacheSaveRoute, DrainErrorKind, DrainErrorRecord,
-    DrainPostOutcome, DrainRecord, FanInReport, IngestReport, MemoCas, WorkspaceClient,
-    EXIT_FETCH_CONFIG, EXIT_FETCH_DENIED, EXIT_FETCH_INPUT_CONFLICT, EXIT_FETCH_MISSING_INPUTS,
-    EXIT_FETCH_TRANSIENT, STEP_TIMEOUT_ENV,
+    exclude_paths, fold_manifests, termination_summary, CacheSaveRoute, DrainErrorKind,
+    DrainErrorRecord, DrainPostOutcome, DrainRecord, FanInReport, IngestReport, MemoCas,
+    WorkspaceClient, EXIT_FETCH_CONFIG, EXIT_FETCH_DENIED, EXIT_FETCH_INPUT_CONFLICT,
+    EXIT_FETCH_MISSING_INPUTS, EXIT_FETCH_TRANSIENT, STEP_TIMEOUT_ENV,
 };
 
 /// The env var naming the tmpfs file holding the workspace token. Must agree
@@ -240,8 +240,8 @@ fn main() {
 ///   `activeDeadlineSeconds` / deletion (SIGKILL) is the backstop, and a
 ///   second clock in this loop would just race the control plane's.
 fn hold(args: &[String]) -> ! {
-    let marker = flag_value(args, "--marker")
-        .unwrap_or_else(|| DEFAULT_EGRESS_DONE_MARKER.to_string());
+    let marker =
+        flag_value(args, "--marker").unwrap_or_else(|| DEFAULT_EGRESS_DONE_MARKER.to_string());
     // Safety: single-threaded, before anything else — setting a disposition
     // to SIG_IGN (not a handler fn) is async-signal-trivial.
     unsafe {
@@ -644,8 +644,7 @@ async fn fetch(
             let attempt = match &manifests {
                 Some(m) => client.materialize_flat(&m[i], target).await,
                 None => {
-                    scarab_storage::Cas::materialize(&client, &TreeHash(root.clone()), target)
-                        .await
+                    scarab_storage::Cas::materialize(&client, &TreeHash(root.clone()), target).await
                 }
             };
             let err = match attempt {
@@ -744,13 +743,7 @@ async fn fetch(
 /// source snapshots already produced a non-empty dir here, and a cache must
 /// never clobber source-derived content — validation makes this unreachable
 /// for well-formed pipelines, and the backstop holds even when it is not).
-async fn restore_cache(
-    client: &WorkspaceClient,
-    from: &str,
-    target: &str,
-    dir: &str,
-    root: &str,
-) {
+async fn restore_cache(client: &WorkspaceClient, from: &str, target: &str, dir: &str, root: &str) {
     let at = std::path::Path::new(target).join(dir);
     match dir_absent_or_empty(&at) {
         Ok(true) => {}
@@ -785,9 +778,7 @@ async fn restore_cache(
             // one is only slow. Best-effort removal — a leftover empty dir
             // is harmless.
             let _ = std::fs::remove_dir_all(&at);
-            println!(
-                "scarab-wsfetch: cache restore miss dir={dir} root={root} from={from}: {e}"
-            );
+            println!("scarab-wsfetch: cache restore miss dir={dir} root={root} from={from}: {e}");
         }
     }
 }
@@ -1117,7 +1108,11 @@ async fn run_drain(
                     .drain_ingest_report_with_cache_home(workspace, outputs, cache_dirs, home)
                     .await
             }
-            None => client.drain_ingest_report(workspace, outputs, cache_dirs).await,
+            None => {
+                client
+                    .drain_ingest_report(workspace, outputs, cache_dirs)
+                    .await
+            }
         };
         let err = match attempt {
             Ok(r) => break r,
@@ -1487,18 +1482,27 @@ mod tests {
         );
         // Inside the armed window the sleep is capped to what remains…
         assert_eq!(
-            win.next_delay(first_failure + Duration::from_secs(4), Duration::from_secs(10)),
+            win.next_delay(
+                first_failure + Duration::from_secs(4),
+                Duration::from_secs(10)
+            ),
             Some(Duration::from_secs(1)),
             "the sleep never overshoots the armed deadline"
         );
         // …and once the armed deadline passes, the window is exhausted. Still
         // ONE window per leg: arming happened exactly once.
         assert_eq!(
-            win.next_delay(first_failure + Duration::from_secs(5), Duration::from_secs(1)),
+            win.next_delay(
+                first_failure + Duration::from_secs(5),
+                Duration::from_secs(1)
+            ),
             None
         );
         assert_eq!(
-            win.next_delay(first_failure + Duration::from_secs(60), Duration::from_secs(1)),
+            win.next_delay(
+                first_failure + Duration::from_secs(60),
+                Duration::from_secs(1)
+            ),
             None,
             "a later failure must not re-arm a second window"
         );
@@ -1655,7 +1659,14 @@ mod tests {
         std::fs::write(ws.join("node_modules/index.js"), b"from the source").expect("file");
 
         let target = ws.to_str().expect("utf-8");
-        restore_cache(&dead, "http://dead", target, "node_modules", &"a".repeat(64)).await;
+        restore_cache(
+            &dead,
+            "http://dead",
+            target,
+            "node_modules",
+            &"a".repeat(64),
+        )
+        .await;
         assert_eq!(
             std::fs::read(ws.join("node_modules/index.js")).expect("still there"),
             b"from the source",
@@ -1689,11 +1700,15 @@ mod tests {
                 assert!(detail.contains("dist"), "{detail}");
                 assert!(detail.contains("(declared: dist, report.xml)"), "{detail}");
             }
-            PruneVerdict::Transient(d) => panic!("MissingPath must be OutputContract, got Transient({d})"),
+            PruneVerdict::Transient(d) => {
+                panic!("MissingPath must be OutputContract, got Transient({d})")
+            }
         }
         match classify_prune(PruneError::UnsafePath("../escape".into()), &declared) {
             PruneVerdict::OutputContract(_) => {}
-            PruneVerdict::Transient(d) => panic!("UnsafePath must be OutputContract, got Transient({d})"),
+            PruneVerdict::Transient(d) => {
+                panic!("UnsafePath must be OutputContract, got Transient({d})")
+            }
         }
         match classify_prune(
             PruneError::Storage(StorageError::Backend("connection refused".into())),

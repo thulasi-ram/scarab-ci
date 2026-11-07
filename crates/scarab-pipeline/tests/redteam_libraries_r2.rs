@@ -219,9 +219,11 @@ fn bracket_read_of_an_invoke_output_through_with() {
             .collect();
         let launched = launch(a, json!({}), serde_json::Value::Object(outs));
         assert_eq!(
-            launched, "IMG-of-x/img",
+            launched,
+            "IMG-of-x/img",
             "u/a command {:?} needs {:?}",
-            probes(a), a.needs.0
+            probes(a),
+            a.needs.0
         );
     }
 }

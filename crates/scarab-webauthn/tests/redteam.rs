@@ -62,8 +62,7 @@ const SWA_NONE_RS256_ATT: &str =
     "o2NmbXRkbm9uZWdhdHRTdG10oGhhdXRoRGF0YVkBZz3cRxDpwIiyKduonVYyILs59yKa_0ZbCmVrGvuaivigRQAAAABgKLAXsdRMArSzr82vyWuyACCQZe_hElYt5dHDxh_dPbYrcar8YZ4O_04piYAcubRiWqQBAwM5AQAgWQEA8X6V649G2vwB99CSf_luwR0jj7oDg_GhA3TQSnNYIwfQJldxT5dmi9H8IjjCrTP28iNuKl29hc3Mowux1FZB0bc5AEJ2oV3JCOMGP9NZKGmOosF7iBN2GtGY7Nomcs-ruBv2mxp1nTm6mv5B8XNwh0e18uTA5AJCsl-k6lNLYB2XBIQ3fy2-TjSQ8IOMLypWQbWWBJXzLmepaJ6EWe6kf_NaxpA2chWsaekZcr8xG6OIo3iGh0Mpags_qBZtN4n2TDn0R2LheLk4yQ0R_oOAVtX963Yuw0x5NYSZyMNSMi_1RSEPTYn5AILmIzQskglDaWJYtnjKz4QLuXWCRRYyDSFDAQAB";
 const SWA_NONE_RS256_CDJ: &str =
     "eyJjaGFsbGVuZ2UiOiJwWVozVlgyeWI4ZFM5eXBsTnhKQ2hpWGhQR0JrOGdaelRBeUoyaVU1eDFrIiwiY2xpZW50RXh0ZW5zaW9ucyI6e30sImhhc2hBbGdvcml0aG0iOiJTSEEtMjU2Iiwib3JpZ2luIjoiaHR0cHM6Ly9kZXYuZG9udG5lZWRhLnB3IiwidHlwZSI6IndlYmF1dGhuLmNyZWF0ZSJ9";
-const SWA_NONE_RS256_ID: &str =
-    "kGXv4RJWLeXRw8Yf3T22K3Gq_GGeDv9OKYmAHLm0Ylo";
+const SWA_NONE_RS256_ID: &str = "kGXv4RJWLeXRw8Yf3T22K3Gq_GGeDv9OKYmAHLm0Ylo";
 const SWA_PACKED_ATT: &str =
     "o2NmbXRmcGFja2VkZ2F0dFN0bXSiY2FsZyZjc2lnWEcwRQIhANvrPZMUFrl_rvlgRqz6lCPlF6B4y885FYUCCrhrzAYXAiAb4dQKXbP3IimsTTadkwXQlrRVdxzlbmPXt847-Oh6r2hhdXRoRGF0YVjhPdxHEOnAiLIp26idVjIguzn3Ipr_RlsKZWsa-5qK-KBFXsOO-a3OAAI1vMYKZIsLJfHwVQMAXQGE4WNXLCDWOCa2x8hpqk5dZy_xdc4wBd4UgCJ4M_JAHI7oJgDDVb8WUcKqRB_mzRxwCL9vdTl-ZKPXg3_-Zrt1Adgb7EnK9ivqaTOKMDqRrKsIObWYJaqpsSJtUKUBAgMmIAEhWCBKMVVaivqCBpqqAxMjuCo5jMeUdh3jDOC0EF4fLBNNTyJYILc7rqDDeX1pwCLrl3ZX7IThrtZNwKQVLQyfHiorqP-n";
 const SWA_PACKED_CDJ: &str =
@@ -74,28 +73,21 @@ const SWA_ANDROID_ATT: &str =
     "o2NmbXRkbm9uZWdhdHRTdG10oGhhdXRoRGF0YVkBag11_MVj_ad52y40PupImIh1i3hUnUk6T9vqHNlqoxzExQAAAAAAAAAAAAAAAAAAAAAAAAAAABAT8-SjjA3UFcTbdLR-03d5pQECAyYgASFYIJIkX8fs9wjKUv5HWBUop--6ig4Szsxj8gBgJJmaX-_5IlggJ5XVdjUfCMlVlUZuHJRxCLFLzZCeK8Fg3l6OLfAIHnKhbGRldmljZVB1YktleaVjZHBrWE2lAQIDJiABIVggmRqr7Z3kJxqe3q2IBvncltbczQxHYlOlUQSJ7IN5vlsiWCCglzz97bt54n_vTudIFnP7MxJQTdylQ0z9I0MdatKe2mNzaWdYRzBFAiEA77OAdL0VuMgs8J-H-8b7PHFp6k8YBrfpCTc3QwI0W3oCICtxEwQHMaDnJ9M41IVChjzmWICqeeXqdArIzNlDR5iOZW5vbmNlQGVzY29wZUEAZmFhZ3VpZFAAAAAAAAAAAAAAAAAAAAAA";
 const SWA_ANDROID_CDJ: &str =
     "eyJ0eXBlIjoid2ViYXV0aG4uY3JlYXRlIiwiY2hhbGxlbmdlIjoiQXJrcmxfRnhfTXZjSl9lSXFDVFE3LXRiRVNJU1IxNC1weVBSaDBLLTFBOCIsIm9yaWdpbiI6ImFuZHJvaWQ6YXBrLWtleS1oYXNoOmd4N3NxX3B4aHhocklRZEx5ZkcwcHhLd2lKN2hPazJESlE0eHZLZDQzOFEiLCJhbmRyb2lkUGFja2FnZU5hbWUiOiJjb20uZmlkby5leGFtcGxlLmZpZG8yYXBpZXhhbXBsZSJ9";
-const SWA_ANDROID_ID: &str =
-    "E_Pko4wN1BXE23S0ftN3eQ";
-const WRS_HELLO_REG_CHALLENGE: &str =
-    "FQky0FqnmV5KYqFU96E9aApSIRtjXiKcVFUf8Am8iDQ";
-const WRS_HELLO_ID: &str =
-    "KwlEDOBCBc9P1YU3NWihYLCeY-I9KGMhPap9vwHbVoI";
+const SWA_ANDROID_ID: &str = "E_Pko4wN1BXE23S0ftN3eQ";
+const WRS_HELLO_REG_CHALLENGE: &str = "FQky0FqnmV5KYqFU96E9aApSIRtjXiKcVFUf8Am8iDQ";
+const WRS_HELLO_ID: &str = "KwlEDOBCBc9P1YU3NWihYLCeY-I9KGMhPap9vwHbVoI";
 const WRS_HELLO_ATT: &str =
     "o2NmbXRkbm9uZWdhdHRTdG10oGhhdXRoRGF0YVkBZ2wpgejnsqySxmYA_6D63eOJKMSO0N1z9i_GRS2layobRQAAAAAAAAAAAAAAAAAAAAAAAAAAACArCUQM4EIFz0_VhTc1aKFgsJ5j4j0oYyE9qn2_AdtWgqQBAwM5AQAgWQEApqOD6WFAiM9vJ1BQ5hMuOwz3l3GnnYzG46if0-hwdNE2lBqcOFg4G3Rm7VhjUUFPhfLAGRwtdIOB_blbI4EjwSxAVleJLBNK70iy8wvDh8LYbT5UrBC2UoyqAf9bUElkAXU9lLNfx6nk9K5FNrkPawUAbpsc83IgsNxdxKyeFgOaEpQUhF6mLRgbCP9sH-bEen3w19t2UOCSXFDbW9NYLRyFh1P01B15hGi9A2IqtAr56DuszG1AzotM9-YoJEdPC4tU05l9bGw3w80FWvhIKl4oiMFZA2ZtHkF1TGeWBCybaM9-XBChr9939ql_SA1TgQykZiqNrWaMNDkrcwzuWSFDAQAB";
 const WRS_HELLO_REG_CDJ: &str =
     "eyJ0eXBlIjoid2ViYXV0aG4uY3JlYXRlIiwiY2hhbGxlbmdlIjoiRlFreTBGcW5tVjVLWXFGVTk2RTlhQXBTSVJ0alhpS2NWRlVmOEFtOGlEUSIsIm9yaWdpbiI6Imh0dHBzOi8vZXRvb2xzLWRldi5leGFtcGxlLmNvbTo4MDgwIiwiY3Jvc3NPcmlnaW4iOmZhbHNlfQ";
-const WRS_HELLO_AUTH_CHALLENGE: &str =
-    "vXR-a0od0rVjsq3WptR82x2pCToaG3j2V62p0vGZlr0";
-const WRS_HELLO_AUTH_DATA: &str =
-    "bCmB6OeyrJLGZgD_oPrd44koxI7Q3XP2L8ZFLaVrKhsFAAAAAQ";
+const WRS_HELLO_AUTH_CHALLENGE: &str = "vXR-a0od0rVjsq3WptR82x2pCToaG3j2V62p0vGZlr0";
+const WRS_HELLO_AUTH_DATA: &str = "bCmB6OeyrJLGZgD_oPrd44koxI7Q3XP2L8ZFLaVrKhsFAAAAAQ";
 const WRS_HELLO_AUTH_CDJ: &str =
     "eyJ0eXBlIjoid2ViYXV0aG4uZ2V0IiwiY2hhbGxlbmdlIjoidlhSLWEwb2QwclZqc3EzV3B0UjgyeDJwQ1RvYUczajJWNjJwMHZHWmxyMCIsIm9yaWdpbiI6Imh0dHBzOi8vZXRvb2xzLWRldi5leGFtcGxlLmNvbTo4MDgwIiwiY3Jvc3NPcmlnaW4iOmZhbHNlfQ";
 const WRS_HELLO_SIG: &str =
     "Tf2YU7jGBRBEM7IF5BSUqLYDyTuitWDdQ4jmPfwAJvSPYmQO4t_qOkgJ5r4AvbBlrLCSGd11Tw2wY9DThw889Wrow9clRojGGbqc4k3YVWSLSUmt0vR0VGy0inMPu4zGbtpO7mOD0uXyuIXbsetgu49S81h41rZ2WMad6VPOpbtvU9NEk4mwHK0kQlfh_MNltSx3xjDSury-FE4OMUOQg0xVRl-CiYSoIcRxUzsmLgGna8io8gZqjct7yzJFrQa3dXblvCd4vDA2dd8PmXoEGNo4-62mcfDnrxUc5PgKAUneNDlIMyyDzgTzQmQ9ce3dc7Ylux36Z7JoRZkv1EzI8g";
-const WRS_TOUCHID_CHALLENGE: &str =
-    "bCE-p6LqJD-w56E6Kel1ndL0exzCZCJEIAG38GThtjA";
-const WRS_TOUCHID_ID: &str =
-    "AWtT-NSYHNmZjP2R9JAbBmwf3sWMxs_L4_O2XoIvI8HY-rGPjA";
+const WRS_TOUCHID_CHALLENGE: &str = "bCE-p6LqJD-w56E6Kel1ndL0exzCZCJEIAG38GThtjA";
+const WRS_TOUCHID_ID: &str = "AWtT-NSYHNmZjP2R9JAbBmwf3sWMxs_L4_O2XoIvI8HY-rGPjA";
 const WRS_TOUCHID_ATT: &str =
     "o2NmbXRmcGFja2VkZ2F0dFN0bXSiY2FsZyZjc2lnWEgwRgIhAOpCgJUKTloGtzqjcnCSL8ywG1baTYd5WChecwfd-A0lAiEAuz9KEXKBM--RgNh1J7-CBu9PD1A6NBIYOa59xvguirFoYXV0aERhdGFYqUmWDeWIDoxodDQXD2R2YFuP5K65ooYyx5lc87qDHZdjRWJM2x-tzgACNbzGCmSLCyXx8FUDACUBa1P41Jgc2ZmM_ZH0kBsGbB_exYzGz8vj87Zegi8jwdj6sY-MpQECAyYgASFYII__M-4cJoL1GDCkdTFmjmcZLv2J5BDcgxHlNKVL4NrtIlggc5greCirh25w_RyOmgkJlV7-k-smBNca2TP1l5TAjak";
 const WRS_TOUCHID_CDJ: &str =
@@ -181,8 +173,8 @@ impl Es256Key {
     fn new() -> Self {
         let rng = SystemRandom::new();
         let doc = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
-        let kp = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, doc.as_ref(), &rng)
-            .unwrap();
+        let kp =
+            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, doc.as_ref(), &rng).unwrap();
         Self { kp, rng }
     }
 
@@ -407,7 +399,9 @@ fn genuine_packed_registration_verifies() {
         &challenge,
         &registration(SWA_PACKED_CRED_ID, SWA_PACKED_ATT, SWA_PACKED_CDJ),
     )
-    .expect("a genuine packed-attestation registration must verify (attStmt is untrusted, not refused)");
+    .expect(
+        "a genuine packed-attestation registration must verify (attStmt is untrusted, not refused)",
+    );
     assert_eq!(cred.alg, CoseAlgorithm::Es256);
     assert!(cred.sign_count > 0);
 }
@@ -706,9 +700,9 @@ fn cose_key_with_extra_labels_binds_only_the_top_level_point() {
     nested.extend([0x22, 0x58, 0x20]);
     nested.extend(&oy);
     let extra = vec![
-        (vec![0x02], cbor_bytes(b"kid")),     // kid
-        (vec![0x04], vec![0x81, 0x02]),        // key_ops [verify]
-        (vec![0x19, 0x03, 0xe8], nested),      // label 1000: {-2: x', -3: y'}
+        (vec![0x02], cbor_bytes(b"kid")), // kid
+        (vec![0x04], vec![0x81, 0x02]),   // key_ops [verify]
+        (vec![0x19, 0x03, 0xe8], nested), // label 1000: {-2: x', -3: y'}
     ];
     let cose = cose_ec2(&x, &y, &extra);
     let ao = attestation_object("none", &[0xa0], &reg_auth_data(UP_UV_AT, &cose, &[]));
@@ -727,7 +721,12 @@ fn cose_key_with_extra_labels_binds_only_the_top_level_point() {
     };
     let get = client_data("webauthn.get", &CHALLENGE, ORIGIN);
     assert_eq!(
-        assert_with(&smuggled, &stored, &auth_data(RP_ID, UP_UV, 1), get.as_bytes()),
+        assert_with(
+            &smuggled,
+            &stored,
+            &auth_data(RP_ID, UP_UV, 1),
+            get.as_bytes()
+        ),
         Err(WebauthnError::SignatureInvalid),
         "the key hidden in an unknown label must not verify"
     );
@@ -769,7 +768,10 @@ fn attestation_object_with_a_duplicate_key_is_refused() {
     ao.extend(cbor_bytes(&ad));
     let cdj = client_data("webauthn.create", &CHALLENGE, ORIGIN);
     let r = verify_registration(&rp(), &CHALLENGE, &crafted_registration(&ao, &cdj));
-    assert!(r.is_err(), "duplicate attestationObject key accepted: {r:?}");
+    assert!(
+        r.is_err(),
+        "duplicate attestationObject key accepted: {r:?}"
+    );
 }
 
 /// fmt "none" carrying a non-empty attStmt (an attestation claim smuggled
@@ -808,7 +810,10 @@ fn ed_flag_without_extensions_is_refused() {
         &auth_data(RP_ID, UP_UV | 0x80, 1),
         get.as_bytes(),
     );
-    assert!(r.is_err(), "assertion: ED with no extensions accepted: {r:?}");
+    assert!(
+        r.is_err(),
+        "assertion: ED with no extensions accepted: {r:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -820,7 +825,10 @@ fn ed_flag_without_extensions_is_refused() {
 #[test]
 fn client_data_with_a_bom_is_refused() {
     let k = Es256Key::new();
-    let cdj = format!("\u{feff}{}", client_data("webauthn.get", &CHALLENGE, ORIGIN));
+    let cdj = format!(
+        "\u{feff}{}",
+        client_data("webauthn.get", &CHALLENGE, ORIGIN)
+    );
     let r = assert_with(
         &k,
         &stored_es256(&k, 0),
@@ -847,7 +855,10 @@ fn client_data_with_a_duplicate_challenge_is_refused() {
             &auth_data(RP_ID, UP_UV, 1),
             cdj.as_bytes(),
         );
-        assert!(r.is_err(), "duplicate challenge ({first} then {second}) accepted");
+        assert!(
+            r.is_err(),
+            "duplicate challenge ({first} then {second}) accepted"
+        );
     }
 }
 
@@ -856,7 +867,10 @@ fn client_data_with_a_duplicate_challenge_is_refused() {
 fn client_data_with_a_duplicate_origin_is_refused() {
     let k = Es256Key::new();
     let ch = b64(&CHALLENGE);
-    for (first, second) in [(ORIGIN, "https://evil.example"), ("https://evil.example", ORIGIN)] {
+    for (first, second) in [
+        (ORIGIN, "https://evil.example"),
+        ("https://evil.example", ORIGIN),
+    ] {
         let cdj = format!(
             r#"{{"type":"webauthn.get","challenge":"{ch}","origin":"{first}","origin":"{second}"}}"#
         );
@@ -866,7 +880,10 @@ fn client_data_with_a_duplicate_origin_is_refused() {
             &auth_data(RP_ID, UP_UV, 1),
             cdj.as_bytes(),
         );
-        assert!(r.is_err(), "duplicate origin ({first} then {second}) accepted");
+        assert!(
+            r.is_err(),
+            "duplicate origin ({first} then {second}) accepted"
+        );
     }
 }
 
@@ -928,7 +945,8 @@ fn client_data_cross_origin_variants_are_refused() {
         r#","crossOrigin":1"#.to_string(),
         format!(r#","topOrigin":"{ORIGIN}""#),
     ] {
-        let cdj = format!(r#"{{"type":"webauthn.get","challenge":"{ch}","origin":"{ORIGIN}"{tail}}}"#);
+        let cdj =
+            format!(r#"{{"type":"webauthn.get","challenge":"{ch}","origin":"{ORIGIN}"{tail}}}"#);
         let r = assert_with(
             &k,
             &stored_es256(&k, 0),
@@ -944,7 +962,12 @@ fn client_data_cross_origin_variants_are_refused() {
 #[test]
 fn client_data_type_confusion_is_refused() {
     let k = Es256Key::new();
-    for ty in ["webauthn.create", "WebAuthn.Get", "webauthn.get ", "payment.get"] {
+    for ty in [
+        "webauthn.create",
+        "WebAuthn.Get",
+        "webauthn.get ",
+        "payment.get",
+    ] {
         let cdj = client_data(ty, &CHALLENGE, ORIGIN);
         let r = assert_with(
             &k,

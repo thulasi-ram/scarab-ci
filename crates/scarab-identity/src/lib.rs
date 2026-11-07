@@ -535,33 +535,33 @@ pub enum LinkOutcome {
     Attached,
     /// It already was the caller's.
     AlreadyLinked,
-    /// It was the ONLY identity of Principal `from` — so proving it proved
-    /// `from` outright — and `from` was folded into the caller: its bindings,
-    /// approver entries and tokens now name the caller, its sessions are gone,
-    /// and its id is kept (`merged_into`) so it can never be minted again.
-    /// `moved_passkeys`: the ids of `from`'s passkeys, which now belong to
-    /// the caller (git-bug def16bd).
+    /// It was the ONLY identity of Principal `from`, and `from` was folded
+    /// into the caller: its bindings, approver entries and tokens now name
+    /// the caller, its sessions are gone, and its id is kept (`merged_into`)
+    /// so it can never be minted again. `removed_passkeys`: the ids of
+    /// `from`'s passkeys, deleted by the merge (ADR-0079 §3: a passkey is
+    /// registered for one Principal and never moves).
     Merged {
         from: String,
-        moved_passkeys: Vec<String>,
+        removed_passkeys: Vec<String>,
     },
-    /// The merge would move `from`'s passkeys to the caller, and the link
-    /// was started under [`MergePasskeys::Refuse`]: nothing changed. A merge
-    /// that moves passkeys needs a confirmation bound to it, not a window.
-    PasskeysWouldMove { from: String, passkeys: usize },
+    /// `from` holds passkeys, and the link carried no proof from one of
+    /// them ([`FoldedPasskey::Unproven`]): nothing changed. Proving the
+    /// sign-in proves control of the identity, not the right to move
+    /// `from`'s Scarab authority (ADR-0079 §1, §2).
+    NeedsFoldedPasskey { from: String },
 }
 
-/// Whether a link may fold in a Principal that holds passkeys
-/// ([`IdentityStore::link`]). A merge moves them to the caller, so a
-/// window-confirmed link must not: a stolen session inside its window would
-/// add the thief's passkey to the victim's account.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MergePasskeys {
-    /// A merge that would move passkeys changes nothing and answers
-    /// [`LinkOutcome::PasskeysWouldMove`].
-    Refuse,
-    /// A merge moves them.
-    Move,
+/// What a link has proven about the Principal it may fold in
+/// ([`IdentityStore::link`], ADR-0079 §2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FoldedPasskey {
+    /// Nothing beyond the OAuth round-trip: a merge of a Principal that
+    /// holds any passkey answers [`LinkOutcome::NeedsFoldedPasskey`].
+    Unproven,
+    /// An assertion from passkey `id` was verified. The merge proceeds only
+    /// if that passkey belongs to the Principal being folded in.
+    Proven(String),
 }
 
 /// Can `s` stand in a minted id as-is? Deliberately narrow: no `:` (it would
@@ -654,15 +654,16 @@ pub trait IdentityStore: Send + Sync {
     /// Principal whose only identity it is → merge that one into `principal`,
     /// atomically; held by a Principal with other identities, or `principal`
     /// already holding a different account on this provider → `Conflict`.
-    /// A merge that would move passkeys is made only under
-    /// [`MergePasskeys::Move`], decided in the same transaction as the
-    /// merge. Never matches anything by email.
+    /// A merge of a Principal that holds any passkey (a flagged one too) is
+    /// made only under [`FoldedPasskey::Proven`] with one of its passkeys,
+    /// decided in the same transaction as the merge (ADR-0079 §2). Never
+    /// matches anything by email.
     async fn link(
         &self,
         principal: &str,
         identity: &ProviderIdentity,
         now_ms: i64,
-        passkeys: MergePasskeys,
+        folded: &FoldedPasskey,
     ) -> Result<LinkOutcome, IdentityError>;
     /// Detach `principal`'s identity on `provider`. Refuses (`Conflict`) to
     /// remove the last one — that would leave a Principal nobody can sign in

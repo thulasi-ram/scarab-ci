@@ -60,8 +60,14 @@ async fn trust(store: &dyn LibraryStore) {
     assert_eq!(store.trust_source(&t("amy", 1)).await.unwrap(), t("amy", 1));
     // Trusting again keeps the first record.
     assert_eq!(store.trust_source(&t("bob", 2)).await.unwrap(), t("amy", 1));
-    assert_eq!(store.trusted_sources("acme").await.unwrap(), vec![t("amy", 1)]);
-    assert!(store.trusted_sources("globex").await.unwrap().is_empty(), "per org");
+    assert_eq!(
+        store.trusted_sources("acme").await.unwrap(),
+        vec![t("amy", 1)]
+    );
+    assert!(
+        store.trusted_sources("globex").await.unwrap().is_empty(),
+        "per org"
+    );
     assert_eq!(
         store
             .untrust_source("acme", "github.com/acme/libs//push.yaml")

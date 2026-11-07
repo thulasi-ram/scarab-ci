@@ -244,10 +244,12 @@ describe("planSave", () => {
             allowed_refs: ["refs/heads/main"],
             wait_timer_s: 30,
             require_reason: true,
-            missing_gate_mode: "add",
-            added_gate_expiry_s: null,
-            required_approvals: null,
-            max_approval_age_s: 86400,
+            approval_gate: {
+              missing_gate_mode: "add",
+              added_gate_expiry_s: null,
+              required_approvals: null,
+              max_approval_age_s: 86400,
+            },
           },
         },
       ],
@@ -345,10 +347,12 @@ describe("planSave: approval gate settings", () => {
           allowed_refs: [],
           wait_timer_s: 0,
           require_reason: false,
-          missing_gate_mode: "refuse",
-          added_gate_expiry_s: 3600,
-          required_approvals: null,
-          max_approval_age_s: 86400,
+          approval_gate: {
+            missing_gate_mode: "refuse",
+            added_gate_expiry_s: 3600,
+            required_approvals: null,
+            max_approval_age_s: 86400,
+          },
         },
       },
     ]);
@@ -388,9 +392,7 @@ describe("toBaselineBody", () => {
   it("takes blank as the default: no expiry, every approver, 24 hours", () => {
     expect(toBaselineBody(rules, gate).body).toMatchObject({
       wait_timer_s: 60,
-      added_gate_expiry_s: null,
-      required_approvals: null,
-      max_approval_age_s: 86400,
+      approval_gate: { added_gate_expiry_s: null, required_approvals: null, max_approval_age_s: 86400 },
     });
   });
 

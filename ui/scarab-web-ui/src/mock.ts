@@ -1776,16 +1776,18 @@ function route(pathname: string, search: string, method: string, body = ""): Res
       // the view after a Save shows what was sent.
       const req = JSON.parse(body || "{}") as Record<string, unknown>;
       const num = (k: string) => (typeof req[k] === "number" ? (req[k] as number) : null);
+      const gate = (req.approval_gate ?? {}) as Record<string, unknown>;
+      const gateNum = (k: string) => (typeof gate[k] === "number" ? (gate[k] as number) : null);
       env.protection = {
         approvers: (req.approvers as string[] | undefined) ?? [],
         allowed_refs: (req.allowed_refs as string[] | undefined) ?? [],
         wait_timer_s: num("wait_timer_s") ?? 0,
         require_reason: req.require_reason === true,
         approval_gate: {
-          missing_gate_mode: req.missing_gate_mode === "refuse" ? "refuse" : "add",
-          added_gate_expiry_s: num("added_gate_expiry_s"),
-          required_approvals: num("required_approvals"),
-          max_approval_age_s: num("max_approval_age_s") ?? 86400,
+          missing_gate_mode: gate.missing_gate_mode === "refuse" ? "refuse" : "add",
+          added_gate_expiry_s: gateNum("added_gate_expiry_s"),
+          required_approvals: gateNum("required_approvals"),
+          max_approval_age_s: gateNum("max_approval_age_s") ?? 86400,
         },
       };
       env.updated_at = now;

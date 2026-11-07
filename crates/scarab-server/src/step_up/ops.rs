@@ -1151,21 +1151,19 @@ pub static PLUGIN_CONNECTION_PUT: Op = op(
     &["/credential"],
     &["path:org", "path:name", "path:slot"],
 );
-// A link whose merge moves the folded Principal's passkeys to the caller
-// (git-bug def16bd): a window would let a stolen session add the thief's
-// passkey to the victim's account, so it always asks. The plain
-// `identity.link` flow refuses such a merge at the callback.
-pub static IDENTITY_LINK_MOVING_PASSKEYS: Op = op(
-    "identity.link_moving_passkeys",
-    "Link a login identity and take its Principal's passkeys",
-    Class::CrownJewel(A),
-    "§3 identity links; §2 adding a passkey",
+// The second half of a link that folds in a Principal holding passkeys
+// (ADR-0079 §2): the request is itself a passkey ceremony, answered by a
+// passkey of the folded Principal, like `step_up.confirm`.
+pub static IDENTITY_MERGE_CONFIRM: Op = op(
+    "identity.merge_confirm",
+    "Confirm an identity merge with the merged account's passkey",
+    Class::Ceremony,
+    "§3 identity links; ADR-0079 §2",
     ANYONE,
     OrgOf::None,
     &[],
-    &["body:/provider"],
-)
-.browser_only();
+    &[],
+);
 pub static PASSKEY_REMOVE: Op = op(
     "passkey.remove",
     "Remove a passkey",
@@ -1566,7 +1564,6 @@ mod tests {
             browser_only,
             vec![
                 "identity.link",
-                "identity.link_moving_passkeys",
                 "identity.unlink",
                 "passkey.add",
                 "step.attach",
@@ -1598,7 +1595,10 @@ mod tests {
 
     #[test]
     fn a_library_upgrade_names_the_library_and_the_version_change() {
-        let (old, new) = ("5d1e0c7a9b3f".repeat(5) + "abcd", "0c4e7b2a91f5".repeat(5) + "abcd");
+        let (old, new) = (
+            "5d1e0c7a9b3f".repeat(5) + "abcd",
+            "0c4e7b2a91f5".repeat(5) + "abcd",
+        );
         let mut i = input(json!({ "content_hash": new, "replaces": old }));
         i.params = vec![
             ("org".into(), "acme".into()),
@@ -1609,11 +1609,18 @@ mod tests {
         assert_eq!(s.operation, "Install or upgrade a library");
         assert_eq!(s.target, "lib:acme/deploy-helm in acme");
         assert_eq!(s.changes[0], "version = 5d1e0c7a9b3f → 0c4e7b2a91f5");
-        assert!(s.changes.contains(&format!("content_hash = {new}")), "{:?}", s.changes);
+        assert!(
+            s.changes.contains(&format!("content_hash = {new}")),
+            "{:?}",
+            s.changes
+        );
 
         i.body = json!({ "content_hash": new });
         let s = LIBRARY_INSTALL.summary(&i);
-        assert_eq!(s.changes[0], "version = 0c4e7b2a91f5 (nothing installed before)");
+        assert_eq!(
+            s.changes[0],
+            "version = 0c4e7b2a91f5 (nothing installed before)"
+        );
 
         let mut u = input(Value::Null);
         u.params = vec![("org".into(), "acme".into()), ("hash".into(), old.clone())];

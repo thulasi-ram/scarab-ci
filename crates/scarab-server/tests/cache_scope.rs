@@ -1,7 +1,8 @@
-//! The cache scope a Run is created with (git-bug efcec77), through the real
-//! webhook trigger path: an Environment-governed Run gets `env:<name>` and no
-//! fallback, unless it is a pull request; any other Run gets its symbolic ref and, as its fallback read,
-//! the default branch's scope the forge reports at creation. The scheduler's
+//! The cache scope a Run is created with (git-bug efcec77, 31a2533), through
+//! the real webhook trigger path: every Run gets its symbolic ref and, as its
+//! fallback read, the default branch's scope the forge reports at creation;
+//! an Environment-governed Run that is not a pull request also gets
+//! `env:<name>`, which a Step uses once an approved approval gate admits it. The scheduler's
 //! side (the key folds the scope, the restore falls back, the save never
 //! does) is proved in `scarab-db-postgres/tests/cache_inmemory.rs`.
 //!
@@ -143,8 +144,9 @@ async fn an_ungoverned_run_is_scoped_by_its_ref_with_the_default_branch_as_fallb
     assert_eq!(
         feature,
         Some(CacheScope {
-            own: "refs/heads/feat/x".into(),
+            own: Some("refs/heads/feat/x".into()),
             fallback: Some("refs/heads/trunk".into()),
+            environment: None,
         })
     );
 
@@ -152,8 +154,9 @@ async fn an_ungoverned_run_is_scoped_by_its_ref_with_the_default_branch_as_fallb
     assert_eq!(
         pr,
         Some(CacheScope {
-            own: "refs/pull/7/head".into(),
+            own: Some("refs/pull/7/head".into()),
             fallback: Some("refs/heads/trunk".into()),
+            environment: None,
         })
     );
 
@@ -161,18 +164,20 @@ async fn an_ungoverned_run_is_scoped_by_its_ref_with_the_default_branch_as_fallb
     assert_eq!(
         default,
         Some(CacheScope {
-            own: "refs/heads/trunk".into(),
+            own: Some("refs/heads/trunk".into()),
             fallback: None,
+            environment: None,
         })
     );
 }
 
-/// An Environment-governed Run reads and writes only `env:<name>`: no
-/// fallback, even though the forge knows the default branch and the Run is
-/// on a feature branch. Its first build is cold rather than restoring bytes
-/// a Run outside the Environment wrote.
+/// An Environment-governed Run keeps its ref's scope, with the default
+/// branch as fallback, and `env:<name>` beside it (git-bug 31a2533): a Step
+/// uses `env:prod` only once an approved approval gate admits it, so a push
+/// to a feature branch naming `prod` cannot write what the next deploy
+/// restores from a Step before the gate.
 #[tokio::test]
-async fn an_environment_governed_run_is_scoped_by_the_environment_with_no_fallback() {
+async fn an_environment_governed_run_keeps_its_ref_scope_beside_the_environment() {
     let forge = FakeForge::new().with_file(".scarab/deploy.yaml", DEPLOY_YAML);
     forge.set_default_branch("trunk");
     let db = InMemoryDb::new();
@@ -182,8 +187,9 @@ async fn an_environment_governed_run_is_scoped_by_the_environment_with_no_fallba
     assert_eq!(
         scope,
         Some(CacheScope {
-            own: "env:prod".into(),
-            fallback: None,
+            own: Some("refs/heads/feat/x".into()),
+            fallback: Some("refs/heads/trunk".into()),
+            environment: Some("env:prod".into()),
         })
     );
 }
@@ -210,8 +216,9 @@ async fn a_fork_pull_request_naming_the_environment_is_scoped_by_its_ref() {
     assert_eq!(
         scope,
         Some(CacheScope {
-            own: "refs/pull/7/head".into(),
+            own: Some("refs/pull/7/head".into()),
             fallback: Some("refs/heads/trunk".into()),
+            environment: None,
         })
     );
 }

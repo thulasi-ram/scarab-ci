@@ -9,11 +9,17 @@ default:
     cargo check --workspace
 
 # What CI checks besides the test suites: `cargo check`, then the contract gate
-# (the CI `openapi-drift` job), the chart guard (a step of the CI `chart`
+# (the CI `openapi-drift` job: rustfmt, then spec and client drift), the chart guard (a step of the CI `chart`
 # job) and the chart render check, in that order; the first failure stops it.
 # The chart recipes need helm + yq v4.
-[doc('cargo check, then the openapi-drift, chart-immutable and chart-render gates')]
-all: default _openapi-drift _chart-immutable _chart-render
+[doc('cargo check, then the fmt, openapi-drift, chart-immutable and chart-render gates')]
+all: default _fmt _openapi-drift _chart-immutable _chart-render
+
+# Formatting gate (a step of the CI `openapi-drift` job). The rustfmt version is
+# pinned by rust-toolchain.toml and the style edition by rustfmt.toml.
+[private]
+_fmt:
+    cargo fmt --all -- --check || { echo "error: run 'cargo fmt --all' and commit the result" >&2; exit 1; }
 
 # Contract gate (mirrors the CI `openapi-drift` job, ADR-0054): regenerate the
 # OpenAPI spec and the generated TS client, then fail if either differs from

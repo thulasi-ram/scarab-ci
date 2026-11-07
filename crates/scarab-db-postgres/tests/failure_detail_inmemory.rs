@@ -12,9 +12,7 @@
 //! end-to-end assertion notices.
 
 use scarab_engine::ports::{ExecState, FailureClass};
-use scarab_engine::{
-    Db, EventPayload, FailureKind, RunId, Scheduler, StepId, StepSpec, Timestamp,
-};
+use scarab_engine::{Db, EventPayload, FailureKind, RunId, Scheduler, StepId, StepSpec, Timestamp};
 use scarab_testkit::{FakeClock, FakeExecutor, InMemoryDb};
 
 const CAUSE: &str = "cold tier refused: connection refused (flush: depot 503)";

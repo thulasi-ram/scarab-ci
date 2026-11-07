@@ -73,8 +73,7 @@ async fn a_dispatch_parameter_with_a_leading_dash_does_not_reach_argv() {
     }
     let mut reached = Vec::new();
     for step in ["p", "c/s"] {
-        let launched =
-            exec.launched_spec(&ExecHandle(format!("fake://{}/{step}/a1", run.0)));
+        let launched = exec.launched_spec(&ExecHandle(format!("fake://{}/{step}/a1", run.0)));
         if let Some(spec) = launched {
             if spec.command.iter().any(|a| a == evil) {
                 reached.push((step, spec.command));
@@ -89,7 +88,10 @@ async fn a_dispatch_parameter_with_a_leading_dash_does_not_reach_argv() {
             .unwrap();
         eprintln!("{step}: {:?}", s.status);
     }
-    assert!(reached.is_empty(), "outside `-` value launched in argv: {reached:?}");
+    assert!(
+        reached.is_empty(),
+        "outside `-` value launched in argv: {reached:?}"
+    );
 }
 
 /// A commit SHA is a fixed shape (ADR-0076, 2026-10-30): `${{ event.sha }}`

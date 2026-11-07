@@ -454,9 +454,9 @@ export interface paths {
         put?: never;
         /**
          * Begin linking another sign-in account (ADR-0069)
-         * @description A link that would fold in a Principal holding passkeys is refused at the
-         *     callback (the merge would move them to the caller): it needs
-         *     `POST /v1/me/identities/link-moving-passkeys`, which always asks.
+         * @description A merge of a Principal that holds passkeys also needs one of its passkeys
+         *     (ADR-0079 §2): the callback sends the browser to confirm it
+         *     (`…/merges/{id}`), and nothing changes until then.
          */
         post: operations["begin_link_identity"];
         delete?: never;
@@ -465,17 +465,18 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/v1/me/identities/link-moving-passkeys": {
+    "/v1/me/identities/merges/{id}": {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        /** A merge waiting for the merged account's passkey (ADR-0079) */
+        get: operations["identity_merge"];
         put?: never;
-        /** Begin linking another sign-in account whose Principal holds passkeys (ADR-0069) */
-        post: operations["begin_link_identity_moving_passkeys"];
+        /** Confirm a merge with the merged account's passkey (ADR-0079) */
+        post: operations["confirm_identity_merge"];
         delete?: never;
         options?: never;
         head?: never;
@@ -745,7 +746,9 @@ export interface paths {
         /**
          * Delete an org Environment (ADR-0071)
          * @description Refused (409) while any Project holds an overlay or privilege grant in
-         *     it (ADR-0071 §3, §8: those are never dropped as a side effect).
+         *     it (ADR-0071 §3, §8: those are never dropped as a side effect), and while
+         *     any Project holds a secret in it (git-bug 52964b4): a secret never
+         *     outlives its Environment, and is never dropped as a side effect either.
          */
         delete: operations["delete_org_environment"];
         options?: never;
@@ -1388,6 +1391,23 @@ export interface paths {
         };
         /** A Project typed setting's version history (ADR-0075 §11) */
         get: operations["list_project_policy_versions"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/secrets/orphaned": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Secrets under Environment names that no longer exist */
+        get: operations["list_orphaned_secrets"];
         put?: never;
         post?: never;
         delete?: never;
@@ -2768,6 +2788,14 @@ export interface components {
             /** @description The commit the Pipeline was read at. */
             sha?: string | null;
         };
+        /** @description `POST /v1/me/identities/merges/{id}` body. */
+        ConfirmIdentityMergeRequest: {
+            /**
+             * @description The browser's `AuthenticationResponseJSON`, from a passkey of the
+             *     Principal being merged in.
+             */
+            credential: Record<string, never>;
+        };
         /**
          * @description One registered forge connection, as global Settings renders it (ADR-0060).
          *
@@ -3297,6 +3325,22 @@ export interface components {
             security_fix: boolean;
             source: string;
         };
+        /** @description The answer to a gate approval. */
+        GateApprovalDto: {
+            /**
+             * @description The approvers recorded on the gate so far. Absent when the gate had
+             *     already released.
+             */
+            approvals?: string[] | null;
+            /** @description The gate has released (now or before this approval). */
+            released: boolean;
+            /**
+             * Format: int64
+             * @description When the gate releases (epoch ms): the approvals are in and the
+             *     Environment's wait timer is still running. Absent otherwise.
+             */
+            releases_at?: number | null;
+        };
         /**
          * @description A gate a plugin resolves: a Pipeline waits on it with `invoke:
          *     plugin:<installation>/<name>`.
@@ -3348,6 +3392,31 @@ export interface components {
         GrantedPermissionDto: {
             level: string;
             name: string;
+        };
+        /** @description A merge waiting for a passkey of the Principal it folds in. */
+        IdentityMergeDto: {
+            /** Format: int64 */
+            expires_at: number;
+            /** @description The Principal that would be folded into the caller. */
+            from: string;
+            handle: string;
+            id: string;
+            /** @description How many usable passkeys `from` holds; one of them must answer. */
+            passkeys: number;
+            /** @description The sign-in that proved it: its provider and handle. */
+            provider: string;
+            /**
+             * @description `PublicKeyCredentialRequestOptionsJSON`, allowing only `from`'s
+             *     passkeys.
+             */
+            public_key: Record<string, never>;
+        };
+        /** @description What a confirmed merge did. */
+        IdentityMergedDto: {
+            /** @description The Principal folded into the caller. */
+            merged: string;
+            /** @description How many of its passkeys the merge deleted. */
+            removed_passkeys: number;
         };
         /** @description One entry of a privilege whitelist (ADR-0039). */
         ImageGrantDto: {
@@ -3733,6 +3802,15 @@ export interface components {
             source?: string | null;
             /** @description The version is yanked in the Run's org now. */
             yanked?: boolean;
+        };
+        /**
+         * @description Secrets one Project holds under an Environment name that has no
+         *     Environment. Names only, never values.
+         */
+        OrphanedSecretsDto: {
+            environment: string;
+            keys: string[];
+            project: string;
         };
         /** @description One of the caller's passkeys. */
         PasskeyDto: {
@@ -4305,6 +4383,31 @@ export interface components {
             privilege_grant?: null | components["schemas"]["EnvironmentProjectPrivilegeGrantDto"];
         };
         /**
+         * @description The approval gate settings of a baseline `PUT` (ADR-0078). Each omitted
+         *     field takes its default.
+         */
+        PutApprovalGateRules: {
+            /**
+             * Format: int32
+             * @description Seconds before the gate the Environment adds expires; omitted = it
+             *     waits until approved or rejected.
+             */
+            added_gate_expiry_s?: number | null;
+            /**
+             * Format: int32
+             * @description Seconds an approval stays good for at launch; omitted = 86400.
+             */
+            max_approval_age_s?: number | null;
+            /** @description `add` (default) or `refuse` (ADR-0078 §3). */
+            missing_gate_mode?: components["schemas"]["MissingGateModeDto"];
+            /**
+             * Format: int32
+             * @description How many of `approvers` must approve, 1 to their number; omitted =
+             *     every one.
+             */
+            required_approvals?: number | null;
+        };
+        /**
          * @description A Project overlay (`…/projects/{project}/overlay`) body: the baseline's
          *     four rules, which can only **tighten** (ADR-0071 §3). Replaced whole,
          *     omitted = permissive default, unknown fields refused — as for the
@@ -4337,34 +4440,20 @@ export interface components {
          *     a 400, not a silently ignored rule.
          */
         PutEnvironmentProtectionRequest: {
-            /**
-             * Format: int32
-             * @description Seconds before the gate the Environment adds expires; omitted = it
-             *     waits until approved or rejected.
-             */
-            added_gate_expiry_s?: number | null;
             /** @description Ref globs (`refs/heads/main`, `refs/tags/*`); empty = any ref. */
             allowed_refs?: string[];
+            /**
+             * @description The approval gate settings, in the shape `GET` returns them under
+             *     `protection.approval_gate`. Omitted = every default.
+             */
+            approval_gate?: components["schemas"]["PutApprovalGateRules"];
             /**
              * @description Principal ids (ADR-0069): each must name an existing Principal; a
              *     merged id is stored as the Principal it now is. All must approve.
              */
             approvers?: string[];
-            /**
-             * Format: int32
-             * @description Seconds an approval stays good for at launch; omitted = 86400.
-             */
-            max_approval_age_s?: number | null;
-            /** @description `add` (default) or `refuse` (ADR-0078 §3). */
-            missing_gate_mode?: components["schemas"]["MissingGateModeDto"];
             /** @description A human dispatch must carry a reason (ADR-0057 §3). Omitted = off. */
             require_reason?: boolean;
-            /**
-             * Format: int32
-             * @description How many of `approvers` must approve, 1 to their number; omitted =
-             *     every one.
-             */
-            required_approvals?: number | null;
             /**
              * Format: int32
              * @description Seconds: a minimum wait on the Environment approval gate (ADR-0078
@@ -6240,16 +6329,55 @@ export interface operations {
             };
         };
     };
-    begin_link_identity_moving_passkeys: {
+    identity_merge: {
         parameters: {
             query?: never;
             header?: never;
-            path?: never;
+            path: {
+                /** @description the merge id from the link callback */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IdentityMergeDto"];
+                };
+            };
+            /** @description not a browser session */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such pending merge in this session, used, or expired */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    confirm_identity_merge: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description the merge id from the link callback */
+                id: string;
+            };
             cookie?: never;
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["LinkIdentityRequest"];
+                "application/json": components["schemas"]["ConfirmIdentityMergeRequest"];
             };
         };
         responses: {
@@ -6258,20 +6386,25 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["LinkIdentityResponse"];
+                    "application/json": components["schemas"]["IdentityMergedDto"];
                 };
             };
-            /** @description not a browser session — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            /** @description the merge is unknown, used, expired or another session's, or the passkey is not one of the merged account's (`code` names the check) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a browser session */
             403: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content: {
-                    "application/json": components["schemas"]["StepUpRefusal"];
-                };
+                content?: never;
             };
-            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
-            429: {
+            /** @description the sign-in or the merged account changed since the merge was started */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -7100,7 +7233,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description project overlays or grants still pin the Environment */
+            /** @description project overlays, grants or secrets still pin the Environment */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -9594,6 +9727,42 @@ export interface operations {
             };
         };
     };
+    list_orphaned_secrets: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrphanedSecretsDto"][];
+                };
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description secrets or Environments not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     org_security_events: {
         parameters: {
             query?: {
@@ -10544,14 +10713,16 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description approval recorded (released or awaiting more approvals) */
+            /** @description approval recorded: the gate released, or it waits for more approvals or for its wait timer */
             202: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": components["schemas"]["GateApprovalDto"];
+                };
             };
-            /** @description `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. Or the caller's role is insufficient. */
+            /** @description the caller may not approve (insufficient role), a step-up is required (`step_up_required`, JSON), or a `gate.resolve` Policy refused the approval or holds the gate (plain text naming the Policy) */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -11376,6 +11547,13 @@ export interface operations {
             };
             /** @description secrets not configured */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an Environment-scoped secret whose Environment does not exist */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

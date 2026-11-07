@@ -4537,7 +4537,7 @@ impl scarab_identity::IdentityStore for InMemoryIdentities {
         principal: &str,
         identity: &scarab_identity::ProviderIdentity,
         now_ms: i64,
-        _passkeys: scarab_identity::MergePasskeys,
+        _folded: &scarab_identity::FoldedPasskey,
     ) -> Result<scarab_identity::LinkOutcome, IdentityError> {
         let mut st = self.inner.lock().unwrap();
         let key = (identity.provider.clone(), identity.external_id.clone());
@@ -4989,6 +4989,22 @@ impl SecretProvider for FakeSecrets {
         projects.sort();
         projects.dedup();
         Ok(projects)
+    }
+
+    async fn environment_secret_scopes(
+        &self,
+        org: &str,
+    ) -> Result<Vec<(String, String)>, SecretError> {
+        let mut out: Vec<(String, String)> = self
+            .values
+            .lock()
+            .unwrap()
+            .keys()
+            .filter_map(|(s, _)| scarab_secrets::environment_scope_of_scope_key(s, org))
+            .collect();
+        out.sort();
+        out.dedup();
+        Ok(out)
     }
 }
 

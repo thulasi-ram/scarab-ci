@@ -4113,44 +4113,60 @@ impl<'a> Scheduler<'a> {
             // never receives — cache off for the attempt, never an error.
             return;
         }
-        let key = crate::cache_key(&project, &scope.own, &resolved);
-        // The Run's own scope first, then the fallback scope (the default
-        // branch's) on a miss. All or nothing per scope: the restore reads
-        // one key, so it reads one Depot replica (that key's home). Lookup
-        // failures degrade to a cold cache (key still set, so the save side
-        // records under it and the next attempt hits).
-        let mut candidates = vec![key.clone()];
-        if let Some(fallback) = &scope.fallback {
-            candidates.push(crate::cache_key(&project, fallback, &resolved));
-        }
-        let mut restore: Vec<(String, String)> = Vec::new();
-        let mut fallback_key = None;
-        for (i, candidate) in candidates.into_iter().enumerate() {
-            let rows = self
-                .db
-                .cache_lookup(&project, &candidate)
+        // What a scope's key restores: every authored dir it holds an entry
+        // for. Lookup failures degrade to a cold cache (key still set, so the
+        // save side records under it and the next attempt hits).
+        let (db, project_name, dirs) = (self.db, project.as_str(), &cache.dirs);
+        let lookup = |key: String| async move {
+            let rows = db
+                .cache_lookup(project_name, &key)
                 .await
                 .unwrap_or_default();
-            restore = cache
-                .dirs
-                .iter()
+            dirs.iter()
                 .filter_map(|dir| {
                     rows.iter()
                         .find(|(d, _)| d == dir)
                         .map(|(_, root)| (dir.clone(), root.clone()))
                 })
-                .collect();
-            if !restore.is_empty() {
-                if i > 0 {
-                    fallback_key = Some(candidate);
+                .collect::<Vec<_>>()
+        };
+        // The Run's own (ref) scope first, then the fallback scope (the
+        // default branch's) on a miss. All or nothing per scope: the restore
+        // reads one key, so it reads one Depot replica (that key's home).
+        let mut own = None;
+        if let Some(own_scope) = &scope.own {
+            let key = crate::cache_key(&project, own_scope, &resolved);
+            let mut restore = lookup(key.clone()).await;
+            let mut fallback_key = None;
+            if restore.is_empty() {
+                if let Some(fallback) = &scope.fallback {
+                    let candidate = crate::cache_key(&project, fallback, &resolved);
+                    restore = lookup(candidate.clone()).await;
+                    if !restore.is_empty() {
+                        fallback_key = Some(candidate);
+                    }
                 }
-                break;
             }
+            own = Some((key, restore, fallback_key));
         }
+        // The Environment's scope (git-bug 31a2533): resolved beside the
+        // ref's, and used only once the launch finds the Step admitted by an
+        // approved Environment approval gate. No fallback.
+        let approved = match &scope.environment {
+            Some(env_scope) => {
+                let key = crate::cache_key(&project, env_scope, &resolved);
+                let restore = lookup(key.clone()).await;
+                Some(crate::CacheResolution { key, restore })
+            }
+            None => None,
+        };
         if let Some(cache) = &mut spec.cache {
-            cache.key = Some(key);
-            cache.restore = restore;
-            cache.fallback_key = fallback_key;
+            if let Some((key, restore, fallback_key)) = own {
+                cache.key = Some(key);
+                cache.restore = restore;
+                cache.fallback_key = fallback_key;
+            }
+            cache.approved = approved;
         }
     }
 
@@ -4497,13 +4513,15 @@ impl<'a> Scheduler<'a> {
 
     /// Gates whose verdict can no longer change the Run (git-bug 2c37802).
     ///
-    /// - A `Pending` gate (waiting, or not yet reached) with at least one
-    ///   dependent, all of them terminal, ends `Skipped` with the reason
-    ///   [`GATE_NO_LONGER_NEEDED`]; its open wait, if any, is closed
-    ///   `Cancelled`. The dependents can only be terminal without the gate
-    ///   (a sibling failed, a dependent was cancelled), so no approval can
-    ///   matter. A leaf gate (no dependents) keeps waiting: its verdict is
-    ///   the Run's outcome.
+    /// - In a Run that already has a failure (a Step `Failed` or
+    ///   `Cancelled`), a `Pending` gate (waiting, or not yet reached) with at
+    ///   least one dependent, all of them terminal, ends `Skipped` with the
+    ///   reason [`GATE_NO_LONGER_NEEDED`]; its open wait, if any, is closed
+    ///   `Cancelled`. No approval can matter, so the Run settles Failed at
+    ///   once. A leaf gate (no dependents) keeps waiting: its verdict is the
+    ///   Run's outcome. So does a gate whose dependents are terminal only
+    ///   because `when:` excluded them, in a Run with no failure: it is a
+    ///   sign-off, and someone is asked (git-bug 0130969).
     /// - A gate skipped that way goes back to `Pending` once a dependent is
     ///   no longer terminal (a rerun of the failed sibling re-armed it), so
     ///   the dependent waits on the gate again instead of being skipped for
@@ -4514,6 +4532,9 @@ impl<'a> Scheduler<'a> {
         if !steps.iter().any(StepRun::is_gate) {
             return Ok(());
         }
+        let run_has_failure = steps
+            .iter()
+            .any(|s| matches!(s.status, StepStatus::Failed | StepStatus::Cancelled));
         let mut events: Option<Vec<EventKind>> = None;
         for gate in steps.iter().filter(|s| s.is_gate()) {
             let mut dependents = steps.iter().filter(|s| s.needs.contains(&gate.step));
@@ -4523,7 +4544,7 @@ impl<'a> Scheduler<'a> {
             let all_finished =
                 first.status.is_terminal() && dependents.all(|d| d.status.is_terminal());
             match gate.status {
-                StepStatus::Pending if all_finished => {
+                StepStatus::Pending if all_finished && run_has_failure => {
                     let now = self.clock.now().await;
                     let cancelled = AttemptStamp::Outcome(AttemptOutcome::Cancelled);
                     let stamp = open_gate_attempt(gate).map(|a| (&a.id, &cancelled));

@@ -52,6 +52,7 @@ export const EVENT_KINDS: readonly string[] = [
   "passkey.reset",
   "passkey.break_glass_reset",
   "passkey.clone_suspected",
+  "passkey.removed_on_merge",
   "guard.not_consulted",
   "binding.operator_grant",
 ];
@@ -70,6 +71,8 @@ const KIND_LABELS: Record<string, string> = {
   "passkey.reset": "Passkeys reset",
   "passkey.break_glass_reset": "Passkeys reset (break-glass)",
   "passkey.clone_suspected": "Passkey clone suspected",
+  "passkey.removed_on_merge": "Passkey deleted by an account merge",
+  "passkey.moved_on_merge": "Passkey moved by an account merge",
   "guard.not_consulted": "Guard not consulted",
   "binding.operator_grant": "Role granted by an operator",
 };
@@ -87,7 +90,8 @@ export function eventTone(kind: string): "danger" | "warn" | "ok" | "plain" {
     kind === "request.failed" ||
     kind === "passkey.reset" ||
     kind === "passkey.break_glass_reset" ||
-    kind === "passkey.removed"
+    kind === "passkey.removed" ||
+    kind === "passkey.removed_on_merge"
   )
     return "warn";
   if (kind === "step_up.confirmed" || kind === "op.completed" || kind === "request.executed")

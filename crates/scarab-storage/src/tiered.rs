@@ -138,7 +138,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::{
-    BlobHash, Cas, ObjectStore, Snapshot, StoredObject, StorageError, TreeEntry, TreeHash,
+    BlobHash, Cas, ObjectStore, Snapshot, StorageError, StoredObject, TreeEntry, TreeHash,
 };
 
 /// Writes that reached cold but not warm. Each one is a durable snapshot with a
@@ -601,7 +601,10 @@ mod tests {
                 return Err(StorageError::Backend(m.clone()));
             }
             let key = Self::key(data);
-            self.blobs.lock().unwrap().insert(key.clone(), data.to_vec());
+            self.blobs
+                .lock()
+                .unwrap()
+                .insert(key.clone(), data.to_vec());
             Ok(BlobHash(key))
         }
 
@@ -765,7 +768,8 @@ mod tests {
 
         // `Unreachable` is what the HTTP adapter produces when the service is
         // down: a `Backend` error on every verb, not a `NotFound`.
-        let tiered = TieredCas::new(Arc::new(Unreachable), cold.clone()).fall_through_on_warm_error();
+        let tiered =
+            TieredCas::new(Arc::new(Unreachable), cold.clone()).fall_through_on_warm_error();
         assert_eq!(tiered.get_blob(&blob).await.unwrap(), b"in the archive");
         assert_eq!(tiered.tree_entries(&root).await.unwrap().len(), 1);
         // And it is NOT silent: this is a down data plane, not a cache miss.
@@ -891,7 +895,9 @@ mod tests {
 
     #[test]
     fn enospc_is_recognised_in_the_shapes_adapters_actually_produce() {
-        assert!(looks_full("Generic LocalFileSystem error: No space left on device"));
+        assert!(looks_full(
+            "Generic LocalFileSystem error: No space left on device"
+        ));
         assert!(looks_full("io error: os error 28"));
         assert!(looks_full("QuotaExceeded"));
         assert!(!looks_full("connection refused"));

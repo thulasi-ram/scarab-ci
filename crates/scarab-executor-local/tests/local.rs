@@ -491,6 +491,48 @@ async fn secrets_are_files_and_env_only_when_asked() {
     );
 }
 
+/// A secret that is not UTF-8 is written to its file byte for byte
+/// (git-bug c1f61c9).
+#[tokio::test]
+async fn a_binary_secret_file_holds_the_stored_bytes() {
+    let exec = LocalExecutor::new();
+    let s = step("r-secret-bytes", "deploy");
+    let mut sp = spec(&[
+        "sh",
+        "-c",
+        "printf '\"%s\"' \"$(od -An -tx1 \"$SCARAB_SECRETS/KEYSTORE\" | tr -d ' \\n')\" \
+         > \"$SCARAB_RESULTS/hex.json\"",
+    ]);
+    sp.secrets = vec!["KEYSTORE".into()];
+    sp.resolved_secrets = scarab_engine::ResolvedSecrets(vec![(
+        "KEYSTORE".into(),
+        vec![0x00, 0xff, 0xfe, 0x80, 0x0a],
+    )]);
+    let handle = exec.launch(&s, &sp).await.unwrap();
+    assert_eq!(drive(&exec, &handle).await, ExecState::Succeeded);
+    let results = exec.results(&handle).await.unwrap();
+    assert_eq!(results["hex"], "00fffe800a");
+}
+
+/// An `env: true` secret that is not UTF-8 is refused before the process
+/// starts: an environment variable cannot carry it unchanged.
+#[tokio::test]
+async fn a_binary_secret_marked_env_true_is_refused() {
+    let exec = LocalExecutor::new();
+    let mut sp = spec(&["true"]);
+    sp.secrets = vec![scarab_pipeline::SecretRef::file_and_env("KEYSTORE")];
+    sp.resolved_secrets =
+        scarab_engine::ResolvedSecrets(vec![("KEYSTORE".into(), vec![0xff, 0xfe])]);
+    let err = exec
+        .launch(&step("r-secret-bytes-env", "deploy"), &sp)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, scarab_engine::ExecError::Refused(m) if m.contains("KEYSTORE")),
+        "{err:?}"
+    );
+}
+
 /// A step whose process never starts leaves no secret files behind: no
 /// process will end to trigger the cleanup.
 #[tokio::test]

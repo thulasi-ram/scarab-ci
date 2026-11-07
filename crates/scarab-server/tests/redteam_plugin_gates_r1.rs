@@ -20,19 +20,17 @@ use tower::ServiceExt;
 use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
 use scarab_engine::ports::ExecState;
-use scarab_engine::{
-    AttemptId, Clock, Db, GateResolution, RunId, Scheduler, StepId, StepStatus,
-};
+use scarab_engine::{AttemptId, Clock, Db, GateResolution, RunId, Scheduler, StepId, StepStatus};
 use scarab_forge::{Event, RepoRef};
 use scarab_plugin::{PluginTokenVerifier, TokenRejected, VerifiedServiceAccount};
 use scarab_policy::library::{
     content_hash, LibraryStore, LibraryVersion, LibraryYank, NewInstallation, Replaces,
 };
 use scarab_server::plugins::PluginPolicy;
-use scarab_server::{broker, router, trigger_runs_from_event, AdmissionPorts, AppState, LogService};
-use scarab_testkit::{
-    FakeClock, FakeExecutor, FakeForge, InMemoryLibraries, InMemoryObjectStore,
+use scarab_server::{
+    broker, router, trigger_runs_from_event, AdmissionPorts, AppState, LogService,
 };
+use scarab_testkit::{FakeClock, FakeExecutor, FakeForge, InMemoryLibraries, InMemoryObjectStore};
 
 const CLOCK_START_MS: i64 = 1_000_000;
 const REPO: &str = "ghcr.io/thulasi-ram/scarab-plugin-argocd";
@@ -292,7 +290,12 @@ async fn world(
 async fn tick(w: &World) {
     let exec = FakeExecutor::new();
     exec.script_outcome(ExecState::Succeeded);
-    let sched = Scheduler::new(w.pg.as_ref(), w.clock.as_ref() as &dyn Clock, &exec, "sched");
+    let sched = Scheduler::new(
+        w.pg.as_ref(),
+        w.clock.as_ref() as &dyn Clock,
+        &exec,
+        "sched",
+    );
     for _ in 0..3 {
         sched.tick(&w.run).await.unwrap();
     }
@@ -319,7 +322,11 @@ async fn release(
     call(
         app,
         "POST",
-        &format!("/v1/runs/{}/gates/{}/release", run.0, step.replace('/', "%2F")),
+        &format!(
+            "/v1/runs/{}/gates/{}/release",
+            run.0,
+            step.replace('/', "%2F")
+        ),
         Some(token),
         Some(body),
     )
@@ -385,7 +392,10 @@ async fn a_broker_token_is_not_a_gate_api_token_nor_the_reverse() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(status_of(w.pg.as_ref(), &w.run, "live").await, StepStatus::Pending);
+    assert_eq!(
+        status_of(w.pg.as_ref(), &w.run, "live").await,
+        StepStatus::Pending
+    );
     w.tdb.cleanup().await;
 }
 
@@ -419,7 +429,10 @@ async fn a_token_review_naming_another_namespace_or_service_account_proves_nothi
         let (status, _) = release(&app, &w.run, "live", "anything", pass("a1")).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{ns}/{sa}");
     }
-    assert_eq!(status_of(w.pg.as_ref(), &w.run, "live").await, StepStatus::Pending);
+    assert_eq!(
+        status_of(w.pg.as_ref(), &w.run, "live").await,
+        StepStatus::Pending
+    );
     w.tdb.cleanup().await;
 }
 
@@ -437,7 +450,10 @@ async fn header_confusion_on_the_public_release_route_never_passes_a_plugin_gate
     let public = router(st);
     let cases: Vec<Vec<(&str, &str)>> = vec![
         // Both headers: the external path, which takes external gates only.
-        vec![("authorization", &bearer), ("x-scarab-gate-token", "sha256=00")],
+        vec![
+            ("authorization", &bearer),
+            ("x-scarab-gate-token", "sha256=00"),
+        ],
         // An empty external token beside the plugin's bearer.
         vec![("authorization", &bearer), ("x-scarab-gate-token", "")],
         // A malformed external token alone.
@@ -471,7 +487,14 @@ async fn an_uninstalled_installation_s_token_and_name_do_not_come_back() {
     let Some(w) = world(PIPELINE, None, true).await else {
         return;
     };
-    let (status, body) = call(&w.public, "DELETE", "/v1/orgs/acme/plugins/argocd-prod", None, None).await;
+    let (status, body) = call(
+        &w.public,
+        "DELETE",
+        "/v1/orgs/acme/plugins/argocd-prod",
+        None,
+        None,
+    )
+    .await;
     assert!(status.is_success(), "{status} {body}");
     // The old token proves nothing now.
     let (status, _) = pending(&w.broker, "acme", &w.prod, "").await;
@@ -506,7 +529,11 @@ async fn a_plugin_cannot_release_an_external_timer_or_manual_gate_of_its_run() {
                 json!({ "attempt": "a1", "passed": false, "reason": "no" })
             };
             let (status, resp) = release(&w.broker, &w.run, step, &w.prod, body).await;
-            assert_eq!(status, StatusCode::NOT_FOUND, "{step} passed={passed}: {resp}");
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "{step} passed={passed}: {resp}"
+            );
         }
     }
     for step in ["ext", "later", "approve", "after"] {
@@ -613,7 +640,11 @@ async fn ownership_is_decided_before_the_environment_hold() {
     let (_, page) = pending(&app, "acme", &w.prod, "").await;
     let attempt = attempt_of(&page, "live");
     let (status, body) = release(&app, &w.run, "live", &w.prod, pass(&attempt)).await;
-    assert_eq!(status, StatusCode::CONFLICT, "the caller's own gate is held: {body}");
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "the caller's own gate is held: {body}"
+    );
     for step in ["stage", "approve", "ext", "later", "bump", "nope"] {
         let (status, body) = release(&app, &w.run, step, &w.prod, pass(&attempt)).await;
         assert!(
@@ -622,7 +653,10 @@ async fn ownership_is_decided_before_the_environment_hold() {
         );
         assert_eq!(status, StatusCode::NOT_FOUND, "{step}: {body}");
     }
-    assert_eq!(status_of(w.pg.as_ref(), &w.run, "live").await, StepStatus::Pending);
+    assert_eq!(
+        status_of(w.pg.as_ref(), &w.run, "live").await,
+        StepStatus::Pending
+    );
     w.tdb.cleanup().await;
 }
 
@@ -648,13 +682,22 @@ async fn a_crafted_cursor_never_widens_the_list() {
     }
     // Another org's caller with the same cursors still sees only its own.
     for c in &cursors {
-        let (_, page) = pending(&w.broker, "other", &w.other_org_prod, &format!("&after={c}")).await;
+        let (_, page) = pending(
+            &w.broker,
+            "other",
+            &w.other_org_prod,
+            &format!("&after={c}"),
+        )
+        .await;
         assert_eq!(page["gates"], json!([]), "{c}");
     }
     // Junk is a 400, never a 500.
     for junk in ["%00", "e30", "W10", "bnVsbA", &"A".repeat(10_000)] {
         let (status, _) = pending(&w.broker, "acme", &w.prod, &format!("&after={junk}")).await;
-        assert!(status.is_client_error() || status == StatusCode::OK, "{junk}: {status}");
+        assert!(
+            status.is_client_error() || status == StatusCode::OK,
+            "{junk}: {status}"
+        );
     }
     w.tdb.cleanup().await;
 }
@@ -675,8 +718,16 @@ async fn a_cancelled_run_s_gate_is_neither_listed_nor_released() {
     assert_eq!(page["gates"], json!([]), "{page}");
     let (status, body) = release(&w.broker, &w.run, "live", &w.prod, pass(&attempt)).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_ne!(status_of(w.pg.as_ref(), &w.run, "live").await, StepStatus::Succeeded);
-    assert!(w.pg.step_results(&w.run, &StepId("live".into())).await.unwrap().is_empty());
+    assert_ne!(
+        status_of(w.pg.as_ref(), &w.run, "live").await,
+        StepStatus::Succeeded
+    );
+    assert!(w
+        .pg
+        .step_results(&w.run, &StepId("live".into()))
+        .await
+        .unwrap()
+        .is_empty());
     w.tdb.cleanup().await;
 }
 
@@ -710,16 +761,25 @@ async fn a_release_landing_after_a_person_s_reject_takes_nothing() {
         fence: Some(AttemptId(attempt.clone())),
         legacy_started_at: now,
         at: now,
-        outputs: Some([("revision".to_string(), json!("evil"))].into_iter().collect()),
+        outputs: Some(
+            [("revision".to_string(), json!("evil"))]
+                .into_iter()
+                .collect(),
+        ),
     };
-    let took = w
-        .pg
-        .resolve_gate_wait(&w.run, &StepId("live".into()), &late)
-        .await
-        .unwrap();
+    let took =
+        w.pg.resolve_gate_wait(&w.run, &StepId("live".into()), &late)
+            .await
+            .unwrap();
     assert!(took.is_none(), "a stale release was taken: {took:?}");
-    assert_eq!(status_of(w.pg.as_ref(), &w.run, "live").await, StepStatus::Failed);
-    let results = w.pg.step_results(&w.run, &StepId("live".into())).await.unwrap();
+    assert_eq!(
+        status_of(w.pg.as_ref(), &w.run, "live").await,
+        StepStatus::Failed
+    );
+    let results =
+        w.pg.step_results(&w.run, &StepId("live".into()))
+            .await
+            .unwrap();
     assert!(results.get("revision").is_none(), "{results:?}");
     // And over HTTP, the plugin's own answer is a 409.
     let (status, _) = release(&w.broker, &w.run, "live", &w.prod, pass(&attempt)).await;
@@ -763,7 +823,10 @@ async fn an_answer_to_the_wait_before_a_retry_is_dropped() {
     assert_ne!(first, second, "{page}");
     let (status, body) = release(&w.broker, &w.run, "live", &w.prod, pass(&first)).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(status_of(w.pg.as_ref(), &w.run, "live").await, StepStatus::Pending);
+    assert_eq!(
+        status_of(w.pg.as_ref(), &w.run, "live").await,
+        StepStatus::Pending
+    );
     let (status, body) = release(&w.broker, &w.run, "live", &w.prod, pass(&second)).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
     w.tdb.cleanup().await;
@@ -786,7 +849,10 @@ async fn the_expiry_boundary_is_exact_and_the_scheduler_agrees() {
     tick(&w).await;
     let (_, page) = pending(&w.broker, "acme", &w.prod, "").await;
     assert_eq!(page["gates"], json!([]), "{page}");
-    assert_eq!(status_of(w.pg.as_ref(), &w.run, "live").await, StepStatus::Failed);
+    assert_eq!(
+        status_of(w.pg.as_ref(), &w.run, "live").await,
+        StepStatus::Failed
+    );
     w.tdb.cleanup().await;
 }
 
@@ -797,7 +863,14 @@ async fn a_killed_installation_cannot_release_and_its_gate_still_expires() {
     };
     let (_, page) = pending(&w.broker, "acme", &w.prod, "").await;
     let attempt = attempt_of(&page, "live");
-    let (status, _) = call(&w.public, "POST", "/v1/orgs/acme/plugins/argocd-prod/kill", None, Some(json!({}))).await;
+    let (status, _) = call(
+        &w.public,
+        "POST",
+        "/v1/orgs/acme/plugins/argocd-prod/kill",
+        None,
+        Some(json!({})),
+    )
+    .await;
     assert!(status.is_success());
     for passed in [true, false] {
         let body = if passed {
@@ -808,10 +881,16 @@ async fn a_killed_installation_cannot_release_and_its_gate_still_expires() {
         let (status, _) = release(&w.broker, &w.run, "live", &w.prod, body).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "passed={passed}");
     }
-    assert_eq!(status_of(w.pg.as_ref(), &w.run, "live").await, StepStatus::Pending);
+    assert_eq!(
+        status_of(w.pg.as_ref(), &w.run, "live").await,
+        StepStatus::Pending
+    );
     w.clock.advance(600_000);
     tick(&w).await;
-    assert_eq!(status_of(w.pg.as_ref(), &w.run, "live").await, StepStatus::Failed);
+    assert_eq!(
+        status_of(w.pg.as_ref(), &w.run, "live").await,
+        StepStatus::Failed
+    );
     w.tdb.cleanup().await;
 }
 
@@ -891,7 +970,10 @@ async fn a_nul_in_an_output_is_a_client_error_not_a_server_error() {
     )
     .await;
     assert!(status.is_client_error(), "got {status} {body}");
-    assert_eq!(status_of(w.pg.as_ref(), &w.run, "live").await, StepStatus::Pending);
+    assert_eq!(
+        status_of(w.pg.as_ref(), &w.run, "live").await,
+        StepStatus::Pending
+    );
     w.tdb.cleanup().await;
 }
 
@@ -923,7 +1005,10 @@ async fn control_characters_are_stored_as_data_and_the_64kib_cap_counts_bytes() 
     )
     .await;
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
-    let results = w.pg.step_results(&w.run, &StepId("live".into())).await.unwrap();
+    let results =
+        w.pg.step_results(&w.run, &StepId("live".into()))
+            .await
+            .unwrap();
     assert_eq!(results.get("revision"), Some(&json!(at)));
     w.tdb.cleanup().await;
 }

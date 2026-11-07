@@ -144,10 +144,7 @@ pub fn compile(policy: &Policy, level: Level) -> Result<PolicyIr, Vec<Diagnostic
     if !policy.checkpoint.is_consulted() {
         errors.push(Diagnostic::at(
             "checkpoint",
-            format!(
-                "checkpoint `{}` is not yet supported",
-                policy.checkpoint
-            ),
+            format!("checkpoint `{}` is not yet supported", policy.checkpoint),
         ));
         return Err(errors);
     }

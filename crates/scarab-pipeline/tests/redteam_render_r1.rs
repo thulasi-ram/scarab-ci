@@ -157,7 +157,10 @@ fn survived_values_holding_templates_reach_every_rendered_field_as_text() {
     let outs = json!({ "b": { "v": evil } });
     let r = launch(step(&ir, "c/s"), params.clone(), outs.clone()).unwrap();
     assert!(!all_text(&r).contains("LEAKED"), "{r:?}");
-    assert_eq!([env(&r, "C0"), env(&r, "C1"), env(&r, "C2")], [evil, "x", evil]);
+    assert_eq!(
+        [env(&r, "C0"), env(&r, "C1"), env(&r, "C2")],
+        [evil, "x", evil]
+    );
     let d = ir
         .steps
         .iter()
@@ -168,7 +171,10 @@ fn survived_values_holding_templates_reach_every_rendered_field_as_text() {
     let r = launch(d, params.clone(), outs.clone()).unwrap();
     assert!(!r.command.concat().contains("LEAKED"), "{r:?}");
     assert_eq!(r.command, ["echo", evil]);
-    assert_eq!([env(&r, "C0"), env(&r, "C1"), env(&r, "C2")], [evil, evil, evil]);
+    assert_eq!(
+        [env(&r, "C0"), env(&r, "C1"), env(&r, "C2")],
+        [evil, evil, evil]
+    );
     // The same value as an image is refused, never rendered again.
     let mut spec = d.clone();
     spec.image = "${{ inputs.p }}".into();
@@ -195,7 +201,15 @@ fn survived_guards_at_three_levels_read_their_own_scope() {
     let ex = excluded_steps_with_params(&ir, &json!({}), &map(json!({ "flag": "L1" }))).unwrap();
     let mut ex: Vec<&str> = ex.iter().map(String::as_str).collect();
     ex.sort();
-    assert_eq!(ex, ["top/go/no/s3"], "{:#?}", ir.steps.iter().map(|s| (&s.id, &s.guards)).collect::<Vec<_>>());
+    assert_eq!(
+        ex,
+        ["top/go/no/s3"],
+        "{:#?}",
+        ir.steps
+            .iter()
+            .map(|s| (&s.id, &s.guards))
+            .collect::<Vec<_>>()
+    );
     // A Run parameter that is not `L1` turns off everything under l1's invoke.
     let ex = excluded_steps_with_params(&ir, &json!({}), &map(json!({ "flag": "L1x" }))).unwrap();
     assert_eq!(ex.len(), 3, "{ex:?}");
@@ -206,7 +220,12 @@ fn survived_guards_at_three_levels_read_their_own_scope() {
 /// value.
 #[test]
 fn survived_library_cannot_read_event_secrets_or_caller_names() {
-    for expr in ["event.branch", "secrets.TOKEN", "caller.inputs.secret", "inputs.secret"] {
+    for expr in [
+        "event.branch",
+        "secrets.TOKEN",
+        "caller.inputs.secret",
+        "inputs.secret",
+    ] {
         let lib = format!(
             "kind: library\ninterface: {{ inputs: [{{ name: v, type: string }}] }}\nsteps: [{{ id: s, image: busybox, command: [\"${{{{ {expr} }}}}\"] }}]\n"
         );
@@ -230,11 +249,26 @@ fn survived_template_bindings_are_typed_and_validated_at_launch() {
     let cases: &[(&str, Value)] = &[
         // number input, validate < 100: a u64 past i64, a huge float, a
         // numeric string past i64, a bool, a list.
-        ("{ name: n, type: number, validate: \"value < 100\" }", json!(18446744073709551615u64)),
-        ("{ name: n, type: number, validate: \"value < 100\" }", json!(1e300)),
-        ("{ name: n, type: number, validate: \"value < 100\" }", json!("99999999999999999999")),
-        ("{ name: n, type: number, validate: \"value < 100\" }", json!(true)),
-        ("{ name: n, type: number, validate: \"value < 100\" }", json!([1])),
+        (
+            "{ name: n, type: number, validate: \"value < 100\" }",
+            json!(18446744073709551615u64),
+        ),
+        (
+            "{ name: n, type: number, validate: \"value < 100\" }",
+            json!(1e300),
+        ),
+        (
+            "{ name: n, type: number, validate: \"value < 100\" }",
+            json!("99999999999999999999"),
+        ),
+        (
+            "{ name: n, type: number, validate: \"value < 100\" }",
+            json!(true),
+        ),
+        (
+            "{ name: n, type: number, validate: \"value < 100\" }",
+            json!([1]),
+        ),
         // string input: a map, a list, a bool, null.
         ("{ name: n, type: string }", json!({ "a": 1 })),
         ("{ name: n, type: string }", json!(["--x"])),
@@ -246,7 +280,10 @@ fn survived_template_bindings_are_typed_and_validated_at_launch() {
         // boolean from a number.
         ("{ name: n, type: boolean }", json!(1)),
         // string with validate refusing a leading dash.
-        ("{ name: n, type: string, validate: \"!value.startsWith('-')\" }", json!("--upload-pack=x")),
+        (
+            "{ name: n, type: string, validate: \"!value.startsWith('-')\" }",
+            json!("--upload-pack=x"),
+        ),
     ];
     for (spec, value) in cases {
         let lib = format!(
@@ -273,7 +310,13 @@ fn survived_a_templated_name_cannot_change_a_literal_digest() {
     );
     let ir = ok(&yaml, &Libraries::default());
     let s = step(&ir, "s");
-    let pre = preview_image(&s.image, s.scope.as_ref(), &s.matrix_values, &BTreeMap::new(), &serde_json::Map::new());
+    let pre = preview_image(
+        &s.image,
+        s.scope.as_ref(),
+        &s.matrix_values,
+        &BTreeMap::new(),
+        &serde_json::Map::new(),
+    );
     assert!(pre.contains("${{"), "{pre}");
     for n in [
         "evil.io/x",
@@ -339,7 +382,13 @@ fn survived_preview_and_launch_agree_on_known_values() {
     let ir = ok(yaml, &files(&[("l.yaml", lib)]));
     let params = map(json!({ "d": "sha256:fff" }));
     for s in &ir.steps {
-        let pre = preview_image(&s.image, s.scope.as_ref(), &s.matrix_values, &params, &serde_json::Map::new());
+        let pre = preview_image(
+            &s.image,
+            s.scope.as_ref(),
+            &s.matrix_values,
+            &params,
+            &serde_json::Map::new(),
+        );
         let at = launch(s, json!({ "d": "sha256:fff" }), json!({}))
             .map(|r| r.image)
             .unwrap_or_else(|e| e);
@@ -363,9 +412,17 @@ fn a_run_parameter_with_a_leading_dash_is_refused_in_argv() {
     };
     // Refused when the Pipeline compiles...
     let e = compile(&yaml(r#", "${{ inputs.ref }}""#), &Libraries::default()).unwrap_err();
-    assert!(e.iter().any(|e| e.contains("`command[3]` reads `${{ inputs.ref }}`")), "{e:?}");
+    assert!(
+        e.iter()
+            .any(|e| e.contains("`command[3]` reads `${{ inputs.ref }}`")),
+        "{e:?}"
+    );
     // ...and at launch, for an IR that skipped the compiler.
-    let ir = raw(ok(&yaml(""), &Libraries::default()), "s", "${{ inputs.ref }}");
+    let ir = raw(
+        ok(&yaml(""), &Libraries::default()),
+        "s",
+        "${{ inputs.ref }}",
+    );
     let r = launch(
         step(&ir, "s"),
         json!({ "ref": "--upload-pack=touch /tmp/pwned" }),
@@ -386,12 +443,17 @@ fn a_run_parameter_with_a_leading_dash_is_refused_through_a_library() {
     let yaml = "interface: { inputs: [{ name: ref, type: string }] }\nsteps: [{ id: c, invoke: file:l.yaml, with: { r: \"${{ inputs.ref }}\" } }]\n";
     let e = compile(yaml, &files(&[("l.yaml", lib)])).unwrap_err();
     assert!(
-        e.iter().any(|e| e.contains("`command[3]` reads `${{ inputs.r }}`, which step `c` binds")),
+        e.iter()
+            .any(|e| e.contains("`command[3]` reads `${{ inputs.r }}`, which step `c` binds")),
         "{e:?}"
     );
     // An IR that skipped the compiler.
     let lib = "kind: library\ninterface: { inputs: [{ name: r, type: string }] }\nsteps: [{ id: s, image: alpine/git, command: [git, fetch, origin] }]\n";
-    let ir = raw(ok(yaml, &files(&[("l.yaml", lib)])), "c/s", "${{ inputs.r }}");
+    let ir = raw(
+        ok(yaml, &files(&[("l.yaml", lib)])),
+        "c/s",
+        "${{ inputs.r }}",
+    );
     let r = launch(
         step(&ir, "c/s"),
         json!({ "ref": "--upload-pack=touch /tmp/pwned" }),
@@ -468,10 +530,11 @@ fn a_library_script_reading_a_run_parameter_through_with_is_outside() {
     // An error fails the compile, which runs `validate`.
     let refused = compile(yaml, &files(&[("l.yaml", lib)])).is_err();
     // Same severity as the Pipeline-level form.
-    let direct = script_findings(r#"[sh, -c, "echo ${{ inputs.p }}"]"#).1.is_err();
+    let direct = script_findings(r#"[sh, -c, "echo ${{ inputs.p }}"]"#)
+        .1
+        .is_err();
     assert_eq!(
-        refused,
-        direct,
+        refused, direct,
         "a Run parameter reaches a library script at a different severity than in the Pipeline"
     );
     assert!(refused, "outside value through `with:` in `sh -c` compiled");
@@ -485,8 +548,14 @@ fn a_library_script_reading_a_run_parameter_through_with_is_outside() {
 fn survived_hand_crafted_guards_fail_closed() {
     let origin = json!([{ "kind": "file", "name": "l.yaml", "source": "x", "content_hash": "h" }]);
     for (guards, scope) in [
-        (json!([{ "caller_hops": usize::MAX, "when": "true" }]), json!({ "inputs": "run" })),
-        (json!([{ "caller_hops": 3, "when": "true" }]), json!({ "inputs": "run" })),
+        (
+            json!([{ "caller_hops": usize::MAX, "when": "true" }]),
+            json!({ "inputs": "run" }),
+        ),
+        (
+            json!([{ "caller_hops": 3, "when": "true" }]),
+            json!({ "inputs": "run" }),
+        ),
         (json!([{ "caller_hops": 0, "when": "true" }]), Value::Null),
     ] {
         let ir = json!({
@@ -530,8 +599,8 @@ fn survived_deep_stored_caller_chains() {
         // Dropping a 1000-deep `Value` recurses too; this is the test's
         // own value, not one production builds.
         std::mem::forget(spec);
-        let parsed = serde_json::from_str::<Value>(&text)
-            .and_then(serde_json::from_value::<StepSpec>);
+        let parsed =
+            serde_json::from_str::<Value>(&text).and_then(serde_json::from_value::<StepSpec>);
         let Ok(spec) = parsed else {
             continue;
         };
@@ -607,7 +676,11 @@ fn survived_guard_storm_is_bounded() {
     let t = Instant::now();
     let ex = excluded_steps_with_params(&ir, &json!({}), &map(json!({ "f": "y" }))).unwrap();
     let took = t.elapsed();
-    eprintln!("{} steps, {} excluded, guards evaluated in {took:?}", ir.steps.len(), ex.len());
+    eprintln!(
+        "{} steps, {} excluded, guards evaluated in {took:?}",
+        ir.steps.len(),
+        ex.len()
+    );
     assert!(ex.is_empty());
     assert!(took.as_secs() < 30, "guards took {took:?}");
 }
@@ -636,5 +709,8 @@ fn compiled_ir_at_the_step_cap_is_bounded() {
     let took = t.elapsed();
     let out = serde_json::to_vec(&ir).unwrap().len();
     eprintln!("source {src} B -> IR {out} B in {took:?}");
-    assert!(out < 64 << 20, "a {src} B source compiled to a {out} B IR in {took:?}");
+    assert!(
+        out < 64 << 20,
+        "a {src} B source compiled to a {out} B IR in {took:?}"
+    );
 }

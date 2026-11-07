@@ -536,9 +536,13 @@ impl K8sExecutor {
             .unwrap_or(0);
         let exp = workspace_token::expiry_for(
             now,
-            spec.timeout_seconds.unwrap_or(self.default_step_timeout_secs),
+            spec.timeout_seconds
+                .unwrap_or(self.default_step_timeout_secs),
         );
-        workspace_token::mint(&fetch.token_secret, &step_token_claims(step, spec, attempt, exp))
+        workspace_token::mint(
+            &fetch.token_secret,
+            &step_token_claims(step, spec, attempt, exp),
+        )
     }
 
     /// Upsert the per-Pod Secret carrying a Step's forge credential (ADR-0076
@@ -894,9 +898,7 @@ impl K8sExecutor {
                                 (None, Some(line)) => format!("{cause}; the helper said: {line}"),
                                 _ => cause,
                             };
-                            return Err(self
-                                .drain_failure(pods, &name, &annotations, cause)
-                                .await)
+                            return Err(self.drain_failure(pods, &name, &annotations, cause).await);
                         }
                     };
                     // Two coordinates leave this leg (ADR-0061 s8), both now
@@ -1524,7 +1526,10 @@ impl K8sExecutor {
         }
         let line = helper_last_line(&stderr_buf, &stdout_buf);
         if let Err(e) = proc.join().await {
-            return (DrainExecOutcome::StatusLost(format!("exec join: {e}")), line);
+            return (
+                DrainExecOutcome::StatusLost(format!("exec join: {e}")),
+                line,
+            );
         }
         let status = match status {
             Some(fut) => fut.await,
@@ -1534,7 +1539,10 @@ impl K8sExecutor {
             // The frame can legitimately be torn down with the container (see
             // `exec_with_stdin`) — the record decides; absent one this is
             // indeterminate, never fatal.
-            return (DrainExecOutcome::StatusLost("no status frame".to_string()), line);
+            return (
+                DrainExecOutcome::StatusLost("no status frame".to_string()),
+                line,
+            );
         };
         if status.status.as_deref() == Some("Success") {
             return (DrainExecOutcome::Exit(0), line);
@@ -1742,7 +1750,13 @@ fn mounted_forge_credential(
             .as_ref()
             .and_then(|d| d.get(key))
             .and_then(|b| String::from_utf8(b.0.clone()).ok())
-            .or_else(|| secret.string_data.as_ref().and_then(|d| d.get(key)).cloned())
+            .or_else(|| {
+                secret
+                    .string_data
+                    .as_ref()
+                    .and_then(|d| d.get(key))
+                    .cloned()
+            })
     };
     let annotation = |key: &str| -> Option<String> {
         secret
@@ -1789,7 +1803,9 @@ enum DriveErr {
     /// `Infra { never_started: false }` WITH this cause, through the normal
     /// Failed path (author-gated `retry:` applies), never as a step-budget
     /// timeout.
-    EvidenceLost { cause: String },
+    EvidenceLost {
+        cause: String,
+    },
 }
 
 impl std::fmt::Display for DriveErr {
@@ -1822,7 +1838,6 @@ enum DrainVerdict {
     /// Fail the Attempt now, with the last cause.
     EvidenceLost,
 }
-
 
 fn drain_failure_verdict(first_failure_ms: Option<i64>, now_ms: i64) -> DrainVerdict {
     match first_failure_ms {
@@ -1870,9 +1885,7 @@ fn select_drain_anchor(
     key: &str,
     now_ms: i64,
 ) -> (i64, Option<String>) {
-    fallback.retain(|k, t| {
-        k == key || now_ms.saturating_sub(*t) <= 2 * WS_DRAIN_ESCALATION_MS
-    });
+    fallback.retain(|k, t| k == key || now_ms.saturating_sub(*t) <= 2 * WS_DRAIN_ESCALATION_MS);
     match annotation_anchor {
         Ok(first) => (first, None),
         Err(patch_err) => {
@@ -1889,9 +1902,9 @@ fn select_drain_anchor(
 /// the cause must name both.
 fn evidence_lost_cause(cause: String, anchor_err: Option<String>) -> String {
     match anchor_err {
-        Some(e) => format!(
-            "{cause} — and the failure anchor could not be recorded on the Pod: {e}"
-        ),
+        Some(e) => {
+            format!("{cause} — and the failure anchor could not be recorded on the Pod: {e}")
+        }
         None => cause,
     }
 }
@@ -2034,18 +2047,18 @@ fn classify_drain(
              fast either way."
                 .to_string(),
         ),
-        DrainExecOutcome::Exit(code) => DrainDecision::Transient(format!(
-            "drain helper exited {code} with no record posted"
-        )),
+        DrainExecOutcome::Exit(code) => {
+            DrainDecision::Transient(format!("drain helper exited {code} with no record posted"))
+        }
         DrainExecOutcome::Failure(msg) => DrainDecision::Transient(format!(
             "drain exec reported failure with no record posted: {msg}"
         )),
         DrainExecOutcome::StatusLost(msg) => DrainDecision::Transient(format!(
             "drain exec status lost and no record posted: {msg}"
         )),
-        DrainExecOutcome::StartFailed(msg) => DrainDecision::Transient(format!(
-            "drain exec failed to start: {msg}"
-        )),
+        DrainExecOutcome::StartFailed(msg) => {
+            DrainDecision::Transient(format!("drain exec failed to start: {msg}"))
+        }
     }
 }
 
@@ -2455,9 +2468,8 @@ const RESULTS_DRAIN_SLACK_SECS: i64 = 300;
 /// ceiling belongs to a node that stopped reporting (red team R3 on git-bug
 /// `f02588d`). No `finishedAt`, or a broken clock (`i64::MIN`), → never.
 fn sidecar_reporting_ceiling_passed(pod: &Pod, now_secs: i64) -> bool {
-    step_terminated_finished_at(pod).is_some_and(|finished| {
-        now_secs >= finished.saturating_add(results_drain_bound_secs(pod))
-    })
+    step_terminated_finished_at(pod)
+        .is_some_and(|finished| now_secs >= finished.saturating_add(results_drain_bound_secs(pod)))
 }
 
 /// How long after its drain could begin ([`results_drain_began_at`]) a
@@ -2737,8 +2749,12 @@ impl Executor for K8sExecutor {
         // empty) is the whole point — an empty workspace does not fail, it
         // produces a wrong answer, and a wrong answer in the durable record is
         // the one thing this product may not do (CONTEXT.md §2).
-        workspace_feed_is_satisfiable(spec, self.workspace_cas.is_some(), self.workspace_fetch.as_ref())
-            .map_err(ExecError::Launch)?;
+        workspace_feed_is_satisfiable(
+            spec,
+            self.workspace_cas.is_some(),
+            self.workspace_fetch.as_ref(),
+        )
+        .map_err(ExecError::Launch)?;
 
         // Re-attach: if the Pod already exists (a prior launch we may not have
         // observed completing), adopt it instead of creating a duplicate.
@@ -2769,7 +2785,8 @@ impl Executor for K8sExecutor {
         let pod = apply_placement(pod, spec, &self.placement).map_err(ExecError::Launch)?;
         match pods.create(&PostParams::default(), &pod).await {
             Ok(created) => {
-                self.ensure_step_secrets(&name, &created, step, spec).await?;
+                self.ensure_step_secrets(&name, &created, step, spec)
+                    .await?;
                 Ok(ExecHandle(name))
             }
             // A concurrent launcher (or a re-drive) won the create race — the
@@ -3014,7 +3031,6 @@ impl Executor for K8sExecutor {
                 .cloned()
         }))
     }
-
 
     /// The step's cache saves (ADR-0065 s1): the launch-stamped key plus the
     /// drain-reported dir → subtree-root map, both off Pod annotations
@@ -3918,7 +3934,14 @@ fn step_secrets_secret(
             }),
             ..Default::default()
         },
-        string_data: Some(spec.resolved_secrets.iter().cloned().collect()),
+        // `data`, not `stringData`: a value is bytes and reaches the file
+        // unchanged.
+        data: Some(
+            spec.resolved_secrets
+                .iter()
+                .map(|(k, v)| (k.clone(), k8s_openapi::ByteString(v.clone())))
+                .collect(),
+        ),
         ..Default::default()
     })
 }
@@ -5616,8 +5639,7 @@ pub fn pod_state(pod: &Pod) -> ExecState {
             // run Failed, Rerun/Retry named) and env/skew is `Config`.
             if let Some((fetch_exit, fetch_message)) = workspace_fetch_failed(pod) {
                 if exit_code.is_none() {
-                    let (class, cause) =
-                        classify_fetch_exit(fetch_exit, fetch_message.as_deref());
+                    let (class, cause) = classify_fetch_exit(fetch_exit, fetch_message.as_deref());
                     return ExecState::Failed {
                         exit_code: None,
                         class,
@@ -7799,10 +7821,7 @@ mod tests {
             );
         }
         if snapshotted {
-            annotations.insert(
-                ANNOTATION_WS_ROOT.to_string(),
-                "a".repeat(64),
-            );
+            annotations.insert(ANNOTATION_WS_ROOT.to_string(), "a".repeat(64));
         }
         Pod {
             metadata: ObjectMeta {
@@ -8577,9 +8596,10 @@ mod tests {
         match settled_state(&frozen(false), true, finished + bound) {
             ExecState::Failed {
                 exit_code: None,
-                class: FailureClass::Infra {
-                    never_started: false,
-                },
+                class:
+                    FailureClass::Infra {
+                        never_started: false,
+                    },
                 cause: Some(cause),
             } => assert!(cause.contains("workspace snapshot lost"), "{cause}"),
             other => panic!("expected the lost-snapshot infra failure, got {other:?}"),
@@ -8596,10 +8616,8 @@ mod tests {
             ExecState::Running
         );
         // Without a results sidecar at all, the same.
-        let mut bare = step_finished_at(
-            settling_pod_with("Running", 0, true, true, false),
-            finished,
-        );
+        let mut bare =
+            step_finished_at(settling_pod_with("Running", 0, true, true, false), finished);
         bare.spec.as_mut().unwrap().termination_grace_period_seconds = Some(grace);
         assert_eq!(
             settled_state(&bare, true, finished + bound - 1),
@@ -8685,9 +8703,11 @@ mod tests {
             "pod-stray-stale".to_string(),
             now - 2 * WS_DRAIN_ESCALATION_MS - 1,
         );
-        let (first, anchor_err) =
-            select_drain_anchor(Ok(5_000), &mut map, "pod-a", now);
-        assert_eq!(first, 5_000, "the durable annotation anchor is authoritative");
+        let (first, anchor_err) = select_drain_anchor(Ok(5_000), &mut map, "pod-a", now);
+        assert_eq!(
+            first, 5_000,
+            "the durable annotation anchor is authoritative"
+        );
         assert_eq!(anchor_err, None, "no anchor failure to report");
         assert_eq!(
             map.get("pod-a"),
@@ -8775,9 +8795,11 @@ mod tests {
         map.insert("pod-stray-stale".to_string(), stale);
         map.insert("pod-stray-fresh".to_string(), fresh);
         map.insert("pod-a".to_string(), stale);
-        let (first, _) =
-            select_drain_anchor(Err("patch denied".into()), &mut map, "pod-a", now);
-        assert_eq!(first, stale, "the current key survives the prune, however old");
+        let (first, _) = select_drain_anchor(Err("patch denied".into()), &mut map, "pod-a", now);
+        assert_eq!(
+            first, stale,
+            "the current key survives the prune, however old"
+        );
         assert!(
             !map.contains_key("pod-stray-stale"),
             "a stray older than 2x the window is pruned"
@@ -9295,8 +9317,15 @@ mod tests {
     #[test]
     fn the_egress_helper_pins_root_and_keeps_dac() {
         let egress = egress_of(&drain_shape_pod());
-        let sc = egress.security_context.as_ref().expect("pinned, not defaulted");
-        assert_eq!(sc.run_as_user, Some(0), "root-read is the drain's privilege");
+        let sc = egress
+            .security_context
+            .as_ref()
+            .expect("pinned, not defaulted");
+        assert_eq!(
+            sc.run_as_user,
+            Some(0),
+            "root-read is the drain's privilege"
+        );
         assert_eq!(sc.run_as_non_root, Some(false));
         assert!(
             sc.capabilities.is_none(),
@@ -9502,11 +9531,18 @@ mod tests {
             helper_last_line(stderr, b"ingest done\n").as_deref(),
             Some("scarab-wsfetch: drain: record POST still incomplete after 10000ms \u{2014} handing over: 422 drain_state_incomplete")
         );
-        assert_eq!(helper_last_line(b"", b"only stdout\n").as_deref(), Some("only stdout"));
+        assert_eq!(
+            helper_last_line(b"", b"only stdout\n").as_deref(),
+            Some("only stdout")
+        );
         assert_eq!(helper_last_line(b"\n  \n", b""), None);
         let long = "\u{e9}".repeat(HELPER_LINE_MAX + 50);
         let got = helper_last_line(long.as_bytes(), b"").unwrap();
-        assert_eq!(got.chars().count(), HELPER_LINE_MAX + 1, "bounded, with an ellipsis");
+        assert_eq!(
+            got.chars().count(),
+            HELPER_LINE_MAX + 1,
+            "bounded, with an ellipsis"
+        );
     }
 
     fn error_record(
@@ -9599,10 +9635,7 @@ mod tests {
             DrainExecOutcome::Failure("oom-killed".into()),
         ] {
             assert!(
-                matches!(
-                    classify_drain(None, &exec),
-                    DrainDecision::Transient(_)
-                ),
+                matches!(classify_drain(None, &exec), DrainDecision::Transient(_)),
                 "{exec:?} must re-drive, bounded by the escalation clock"
             );
         }
@@ -9631,8 +9664,7 @@ mod tests {
         match classify_drain(None, &DrainExecOutcome::Exit(0)) {
             DrainDecision::FatalConfig(cause) => {
                 assert!(
-                    cause.contains("stale-binary signature")
-                        && cause.contains("drain subcommand"),
+                    cause.contains("stale-binary signature") && cause.contains("drain subcommand"),
                     "the cause must name the stale helper image: {cause}"
                 );
                 assert!(
@@ -9764,7 +9796,10 @@ mod tests {
             get("SCARAB_WORKSPACE_TOKEN_FILE").as_deref(),
             Some("/scarab/secrets/workspace-token")
         );
-        assert_eq!(get("SCARAB_WORKSPACE_TARGET").as_deref(), Some("/workspace"));
+        assert_eq!(
+            get("SCARAB_WORKSPACE_TARGET").as_deref(),
+            Some("/workspace")
+        );
 
         // THE INVARIANT (ADR-0061 D1.4): the token itself is nowhere in the Pod
         // spec — not in the fetcher's env, not in the step's, not in an annotation.
@@ -10030,7 +10065,11 @@ mod tests {
             "the exit-5 cause must carry the message naming path + both roots: {cause}"
         );
         let (class, cause) = classify_fetch_exit(wc::EXIT_FETCH_INPUT_CONFLICT, None);
-        assert_eq!(class, FailureClass::Config, "exit 5 is Config even without a message");
+        assert_eq!(
+            class,
+            FailureClass::Config,
+            "exit 5 is Config even without a message"
+        );
         assert!(cause.contains("inputs:"), "{cause}");
         // PINNED default: 137 (OOM/SIGKILL of the fetcher) and unknown codes
         // stay never-started infra.
@@ -10273,7 +10312,10 @@ mod tests {
             .expect("the fetcher init container (needs: means inputs to restore)");
         let fsc = fetcher.security_context.as_ref().unwrap();
         assert_eq!(fsc.run_as_user, Some(65532));
-        assert_eq!(fsc.run_as_group, None, "primary gid comes from the image (65532)");
+        assert_eq!(
+            fsc.run_as_group, None,
+            "primary gid comes from the image (65532)"
+        );
         assert!(
             psc.supplemental_groups
                 .as_ref()
@@ -10316,11 +10358,14 @@ mod tests {
         );
         let ps = pod.spec.as_ref().unwrap();
         let c = &ps.containers[0];
-        assert_eq!(c.image.as_deref(), Some("ghcr.io/acme/scarab-clone@sha256:abc"));
+        assert_eq!(
+            c.image.as_deref(),
+            Some("ghcr.io/acme/scarab-clone@sha256:abc")
+        );
         let env = c.env.as_ref().unwrap();
         assert!(
-            env.iter().all(|e| e.value.as_deref() != Some("sekret-token")
-                && !e.name.contains("TOKEN")),
+            env.iter()
+                .all(|e| e.value.as_deref() != Some("sekret-token") && !e.name.contains("TOKEN")),
             "no env var carries or names the forge token: {env:?}"
         );
         let m = c
@@ -10352,7 +10397,9 @@ mod tests {
                 .all(|m| m.name != FORGE_SECRETS_VOLUME));
         }
         // The token is in no part of the Pod spec.
-        assert!(!serde_json::to_string(&pod).unwrap().contains("sekret-token"));
+        assert!(!serde_json::to_string(&pod)
+            .unwrap()
+            .contains("sekret-token"));
 
         // No credential minted: no volume.
         spec.forge_token.as_mut().unwrap().credential = None;
@@ -10458,9 +10505,10 @@ mod tests {
         // The Secret the volume and the reference name holds every value.
         let secret = step_secrets_secret("scarab-x", "ns", &Pod::default(), &spec).unwrap();
         assert_eq!(secret.metadata.name.as_deref(), Some("scarab-x-secrets"));
-        let data = secret.string_data.unwrap();
-        assert_eq!(data["DB_PASSWORD"], "sekret-db-pw");
-        assert_eq!(data["ARGOCD_AUTH_TOKEN"], "sekret-argo");
+        assert!(secret.string_data.is_none(), "values are bytes, in `data`");
+        let data = secret.data.unwrap();
+        assert_eq!(data["DB_PASSWORD"].0, b"sekret-db-pw");
+        assert_eq!(data["ARGOCD_AUTH_TOKEN"].0, b"sekret-argo");
 
         // Nothing resolved (no deploy context, a locked-out Run): no Secret,
         // so no volume or reference to one that would never exist.
@@ -10645,13 +10693,19 @@ mod tests {
             "SCARAB_CACHE_ROOTS",
             "SCARAB_SECRETS",
         ] {
-            assert!(names.iter().any(|n| n == expected), "{expected} not set: {names:?}");
+            assert!(
+                names.iter().any(|n| n == expected),
+                "{expected} not set: {names:?}"
+            );
         }
         let unknown: Vec<_> = names
             .iter()
             .filter(|n| !scarab_pipeline::scarab_sets_env(n))
             .collect();
-        assert!(unknown.is_empty(), "add these to scarab_pipeline::SCARAB_SET_ENV: {unknown:?}");
+        assert!(
+            unknown.is_empty(),
+            "add these to scarab_pipeline::SCARAB_SET_ENV: {unknown:?}"
+        );
     }
 
     /// git-bug 2a79b73: the launch-resolved cache restore roots ride the
@@ -10676,7 +10730,9 @@ mod tests {
         assert_eq!(claims.cache_roots, vec!["tree-c".to_string()]);
         // No cache: no cache claim, so the token keeps the old wire form.
         spec.cache = None;
-        assert!(step_token_claims(&step, &spec, "a1".into(), 10).cache_roots.is_empty());
+        assert!(step_token_claims(&step, &spec, "a1".into(), 10)
+            .cache_roots
+            .is_empty());
     }
 
     /// git-bug 12e2f6b: with more than one Depot replica, the fetch init
@@ -10731,8 +10787,14 @@ mod tests {
         );
         let got = home_env(&fetch, &spec);
         let names: Vec<&str> = got.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names, vec![WORKSPACE_INIT_CONTAINER, WORKSPACE_EGRESS_CONTAINER]);
-        assert!(got.iter().all(|(_, v)| v.as_deref() == Some(want.as_str())), "{got:?}");
+        assert_eq!(
+            names,
+            vec![WORKSPACE_INIT_CONTAINER, WORKSPACE_EGRESS_CONTAINER]
+        );
+        assert!(
+            got.iter().all(|(_, v)| v.as_deref() == Some(want.as_str())),
+            "{got:?}"
+        );
 
         // git-bug efcec77: a restore found under the default branch's key
         // reads from that key's home, while the drain still saves to the
@@ -11373,8 +11435,7 @@ mod tests {
         fn the_framed_command_emits_the_sentinel_only_on_success() {
             let framed = framed_command("tar -cf - -C /workspace .", "__mark__");
             assert_eq!(
-                framed,
-                "tar -cf - -C /workspace . && printf '%s' '__mark__'",
+                framed, "tar -cf - -C /workspace . && printf '%s' '__mark__'",
                 "the payload command must gate the sentinel"
             );
             assert!(!framed.contains(';'), "`;` would run printf regardless");

@@ -40,7 +40,9 @@ pub fn pause_floor_secs() -> u64 {
 
 /// A recorded grace, or the Kubernetes default.
 pub fn grace_or_default(grace_secs: Option<i64>) -> u64 {
-    grace_secs.and_then(|g| u64::try_from(g).ok()).unwrap_or(DEFAULT_GRACE_SECS)
+    grace_secs
+        .and_then(|g| u64::try_from(g).ok())
+        .unwrap_or(DEFAULT_GRACE_SECS)
 }
 
 /// How long `pause-node` freezes the node for a producer Pod whose
@@ -133,7 +135,10 @@ impl Kind {
 
     /// Whether the victim is a server replica (else a Depot replica).
     pub fn targets_servers(self) -> bool {
-        matches!(self, Kind::KillServer | Kind::StopLeader | Kind::TwoReplicas)
+        matches!(
+            self,
+            Kind::KillServer | Kind::StopLeader | Kind::TwoReplicas
+        )
     }
 
     /// The seeded delay range after the trigger, in ms. Measured 2026-11-01
@@ -232,9 +237,19 @@ pub struct Plan {
 }
 
 impl Plan {
-    pub fn from_seed(kind: Kind, seed: u64, workload: &Workload, server_replicas: u32, depot_replicas: u32) -> Plan {
+    pub fn from_seed(
+        kind: Kind,
+        seed: u64,
+        workload: &Workload,
+        server_replicas: u32,
+        depot_replicas: u32,
+    ) -> Plan {
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-        let victims = if kind.targets_servers() { server_replicas } else { depot_replicas };
+        let victims = if kind.targets_servers() {
+            server_replicas
+        } else {
+            depot_replicas
+        };
         Plan {
             target_run: rng.gen_range(0..workload.runs.max(1)),
             delay_ms: rng.gen_range(kind.delay_range_ms()),
@@ -424,7 +439,13 @@ pub struct Scenario {
 }
 
 impl Scenario {
-    pub fn new(kind: Kind, seed: u64, workload: Workload, server_replicas: u32, depot_replicas: u32) -> Self {
+    pub fn new(
+        kind: Kind,
+        seed: u64,
+        workload: Workload,
+        server_replicas: u32,
+        depot_replicas: u32,
+    ) -> Self {
         let plan = Plan::from_seed(kind, seed, &workload, server_replicas, depot_replicas);
         Self::with_plan(kind, seed, workload, plan, server_replicas, depot_replicas)
     }
@@ -480,7 +501,11 @@ impl Scenario {
         let s: Scenario =
             serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
         if s.format != FORMAT {
-            return Err(format!("{}: format {} (expected {FORMAT})", path.display(), s.format));
+            return Err(format!(
+                "{}: format {} (expected {FORMAT})",
+                path.display(),
+                s.format
+            ));
         }
         if let Some(p) = s
             .faults
@@ -559,7 +584,10 @@ mod tests {
             // The victim ordinal ranges over the replicas the scenario faults.
             let k = Plan::from_seed(Kind::KillServer, seed, &w, 3, 1);
             assert!(k.victim_ordinal < 3 && k.hold_ms <= HOLD_MAX_MS);
-            assert_eq!(Plan::from_seed(Kind::MidFeed, seed, &w, 3, 1).victim_ordinal, 0);
+            assert_eq!(
+                Plan::from_seed(Kind::MidFeed, seed, &w, 3, 1).victim_ordinal,
+                0
+            );
         }
         // Different seeds explore different plans.
         let plans: std::collections::HashSet<_> = (0..50)
@@ -582,7 +610,10 @@ mod tests {
         let back = Scenario::read(&path).unwrap();
         assert_eq!(back, s);
         let r = back.replay(path.to_str().unwrap());
-        assert_eq!((r.plan.clone(), r.quiesce_bound_secs), (s.plan.clone(), s.quiesce_bound_secs));
+        assert_eq!(
+            (r.plan.clone(), r.quiesce_bound_secs),
+            (s.plan.clone(), s.quiesce_bound_secs)
+        );
         // The replay writes the recorded probe pipeline, with nothing observed.
         assert_eq!(
             r.cache.as_ref().map(|c| c.pipeline_yaml.as_str()),
@@ -597,7 +628,9 @@ mod tests {
     /// reads, and replays with the same plan.
     #[test]
     fn an_old_scenario_file_still_reads() {
-        let mut v = serde_json::to_value(Scenario::new(Kind::MidDrain, 3, Workload::default(), 2, 2)).unwrap();
+        let mut v =
+            serde_json::to_value(Scenario::new(Kind::MidDrain, 3, Workload::default(), 2, 2))
+                .unwrap();
         v["plan"].as_object_mut().unwrap().remove("hold_ms");
         v["faults"] = serde_json::json!([{
             "action": "delete-pod", "pod": "scarab-workspace-0", "pod_uid": null, "grace_seconds": 0,
@@ -621,7 +654,10 @@ mod tests {
             resumed_at_ms: Some(40_000),
             ..Default::default()
         });
-        assert_eq!(s.quiesce_deadline_ms(), 40_000 + (s.quiesce_bound_secs as i64) * 1000);
+        assert_eq!(
+            s.quiesce_deadline_ms(),
+            40_000 + (s.quiesce_bound_secs as i64) * 1000
+        );
     }
 
     #[test]
@@ -642,10 +678,18 @@ mod tests {
         assert_eq!(Kind::PauseNode.target_step(), "produce");
         assert!(Kind::PauseNode.has_fault() && !Kind::PauseNode.targets_servers());
         assert_eq!(pause_floor_secs(), 30);
-        assert_eq!(pause_secs(Some(600)), 240, "a workspace Pod: capped at 240 s");
+        assert_eq!(
+            pause_secs(Some(600)),
+            240,
+            "a workspace Pod: capped at 240 s"
+        );
         assert_eq!(pause_secs(Some(300)), 180, "grace - 120 s");
         assert!(pause_secs(Some(600)) > pause_floor_secs() && pause_secs(Some(600)) < 600);
-        assert_eq!(pause_secs(None), 0, "the 30 s default grace leaves no freeze to test");
+        assert_eq!(
+            pause_secs(None),
+            0,
+            "the 30 s default grace leaves no freeze to test"
+        );
         assert_eq!(pause_secs(Some(i64::MAX)), MAX_PAUSE_SECS);
         assert_eq!(pause_secs(Some(-5)), 0);
         let w = Workload::default();
@@ -672,7 +716,10 @@ mod tests {
         });
         let back: Scenario = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(back, s);
-        assert_eq!(s.quiesce_deadline_ms(), 241_000 + (s.quiesce_bound_secs as i64) * 1000);
+        assert_eq!(
+            s.quiesce_deadline_ms(),
+            241_000 + (s.quiesce_bound_secs as i64) * 1000
+        );
 
         // A file that planned a pause above the maximum is refused, so a
         // replay never pauses the node that long; at the maximum it reads.

@@ -65,11 +65,19 @@ fn push_to(r#ref: &str) -> Event {
 fn long_lived(files: &[(&str, &str)]) -> FakeForge {
     files
         .iter()
-        .fold(FakeForge::new(), |f, (path, yaml)| f.with_file(*path, *yaml))
+        .fold(FakeForge::new(), |f, (path, yaml)| {
+            f.with_file(*path, *yaml)
+        })
         .with_commit("refs/heads/main", SHA)
 }
 
-async fn install_in(libs: &InMemoryLibraries, org: &str, content: &str, source: &str, first_party: bool) {
+async fn install_in(
+    libs: &InMemoryLibraries,
+    org: &str,
+    content: &str,
+    source: &str,
+    first_party: bool,
+) {
     libs.put_version(&LibraryVersion {
         org: org.into(),
         content_hash: content_hash(content),
@@ -150,8 +158,10 @@ async fn rt2_an_old_shape_stored_spec_fails_closed_on_a_long_lived_connection() 
     assert!(!f.read_only && f.trusted_library.is_none());
     let inner = Arc::new(FakeExecutor::new());
     let forge = Arc::new(FakeForge::new());
-    let exec = ForgeCredentialExecutor::new(inner.clone(), forge.clone())
-        .with_libraries(Arc::new(InMemoryDb::new()), Arc::new(InMemoryLibraries::new()));
+    let exec = ForgeCredentialExecutor::new(inner.clone(), forge.clone()).with_libraries(
+        Arc::new(InMemoryDb::new()),
+        Arc::new(InMemoryLibraries::new()),
+    );
     let got = exec.launch(&step_run("r1", "checkout/git"), &spec).await;
     assert!(got.is_err(), "launched: {got:?}");
     assert_eq!(forge.credential_calls(), 0, "a long-lived token was minted");
@@ -217,7 +227,11 @@ async fn rt2_a_yanked_clone_version_mints_nothing_on_rerun() {
     let exec = ForgeCredentialExecutor::new(inner.clone(), forge.clone())
         .with_libraries(db.clone(), libs.clone());
     drive(db.as_ref(), &inner, &exec, &run).await;
-    assert_eq!(forge.credential_calls(), 0, "a yanked version received the token");
+    assert_eq!(
+        forge.credential_calls(),
+        0,
+        "a yanked version received the token"
+    );
 }
 
 /// A forge whose `mints_repo_tokens` says yes (the repository was on a
@@ -235,7 +249,12 @@ impl ForgePort for SwappedBetweenCalls {
     async fn read_file_at_ref(&self, r: &RepoRef, x: &str, p: &str) -> Result<Vec<u8>, ForgeError> {
         self.0.read_file_at_ref(r, x, p).await
     }
-    async fn list_dir_at_ref(&self, r: &RepoRef, x: &str, d: &str) -> Result<Vec<String>, ForgeError> {
+    async fn list_dir_at_ref(
+        &self,
+        r: &RepoRef,
+        x: &str,
+        d: &str,
+    ) -> Result<Vec<String>, ForgeError> {
         self.0.list_dir_at_ref(r, x, d).await
     }
     async fn list_refs(&self, r: &RepoRef, q: Option<&str>) -> Result<Vec<ForgeRef>, ForgeError> {
@@ -278,7 +297,10 @@ impl ForgePort for SwappedBetweenCalls {
 async fn rt2_a_connection_swapped_between_the_check_and_the_mint_hands_over_nothing() {
     let spec = spec_from(serde_json::json!({ "access": "read", "owner": "acme", "name": "web" }));
     let inner = Arc::new(FakeExecutor::new());
-    let exec = ForgeCredentialExecutor::new(inner.clone(), Arc::new(SwappedBetweenCalls(FakeForge::new())));
+    let exec = ForgeCredentialExecutor::new(
+        inner.clone(),
+        Arc::new(SwappedBetweenCalls(FakeForge::new())),
+    );
     let launched = exec.launch(&step_run("r1", "tag"), &spec).await;
     let cred = launched
         .ok()
@@ -300,8 +322,15 @@ async fn rt2_a_connection_swapped_between_the_check_and_the_mint_hands_over_noth
 #[tokio::test]
 async fn rt2_an_inline_api_run_cannot_store_a_forge_token() {
     let db = Arc::new(InMemoryDb::new());
-    let logs = Arc::new(LogService::new(Arc::new(InMemoryObjectStore::new()), db.clone()));
-    let app = router(AppState::new(db.clone(), Arc::new(FakeClock::new(1_000)), logs));
+    let logs = Arc::new(LogService::new(
+        Arc::new(InMemoryObjectStore::new()),
+        db.clone(),
+    ));
+    let app = router(AppState::new(
+        db.clone(),
+        Arc::new(FakeClock::new(1_000)),
+        logs,
+    ));
     let body = serde_json::json!({
         "pipeline": {
             "ir_version": 1,
@@ -330,7 +359,9 @@ async fn rt2_an_inline_api_run_cannot_store_a_forge_token() {
     if resp.status() != StatusCode::CREATED {
         return; // refused outright: secure
     }
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let id = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["id"]
         .as_str()
         .unwrap()
@@ -383,7 +414,10 @@ async fn rt2_a_non_boolean_result_for_a_boolean_input_mints_nothing() {
     let exec = ForgeCredentialExecutor::new(inner.clone(), forge.clone());
     drive(db.as_ref(), &inner, &exec, &run).await;
     let h = ExecHandle(format!("fake://{}/checkout/git/a1", run.0));
-    assert!(inner.launched_spec(&h).is_none(), "launched with submodules `true; id`");
+    assert!(
+        inner.launched_spec(&h).is_none(),
+        "launched with submodules `true; id`"
+    );
     assert_eq!(forge.credential_calls(), 0);
 }
 
@@ -407,7 +441,12 @@ async fn rt2_concurrent_launches_of_one_attempt_leave_no_live_token() {
     inner.script_outcome(ExecState::Succeeded);
     let _ = exec.poll(&h).await.unwrap();
     assert_eq!(forge.credential_calls(), 2);
-    assert_eq!(forge.revoked().len(), 2, "a minted token is still live: {:?}", forge.revoked());
+    assert_eq!(
+        forge.revoked().len(),
+        2,
+        "a minted token is still live: {:?}",
+        forge.revoked()
+    );
 }
 
 /// ATTACK: two server replicas. Replica A launches the Attempt and mints
@@ -421,7 +460,10 @@ async fn rt2_a_token_minted_on_one_replica_is_revoked_when_another_sees_the_end(
     let forge = Arc::new(FakeForge::new().with_minted_tokens());
     let replica_a = ForgeCredentialExecutor::new(inner.clone(), forge.clone());
     let replica_b = ForgeCredentialExecutor::new(inner.clone(), forge.clone());
-    let h = replica_a.launch(&step_run("r1", "tag"), &spec).await.unwrap();
+    let h = replica_a
+        .launch(&step_run("r1", "tag"), &spec)
+        .await
+        .unwrap();
     inner.script_outcome(ExecState::Succeeded);
     let _ = replica_b.poll(&h).await.unwrap();
     assert_eq!(
@@ -447,7 +489,12 @@ concurrency: { group: "deploy-${{ event.branch }}", policy: cancel-in-progress }
 steps:
   - { id: s, image: busybox }
 "#;
-    for bad in ["refs/heads/x$(id)", "refs/heads/a b", "refs/heads/-rf", "refs/heads/../../x"] {
+    for bad in [
+        "refs/heads/x$(id)",
+        "refs/heads/a b",
+        "refs/heads/-rf",
+        "refs/heads/../../x",
+    ] {
         let db = InMemoryDb::new();
         let forge = long_lived(&[(".scarab/ci.yaml", yaml)]).with_commit(bad, SHA);
         let out = trigger_runs_from_event(
@@ -459,7 +506,11 @@ steps:
         )
         .await;
         if let Ok(out) = out {
-            assert!(out.runs.is_empty(), "`{bad}`: a Run was created: {:?}", out.runs);
+            assert!(
+                out.runs.is_empty(),
+                "`{bad}`: a Run was created: {:?}",
+                out.runs
+            );
         }
     }
 }
@@ -530,9 +581,16 @@ fn challenge_server() -> (u16, Arc<Mutex<Vec<(String, Option<String>)>>>) {
 #[ignore = "fixed off main: fix/clone-askpass-path"]
 fn rt2_the_clone_token_does_not_answer_for_another_repository_on_the_forge() {
     let dir = tempfile::tempdir().unwrap();
-    let askpass_src = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docker/clone/scarab-askpass");
+    let askpass_src = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docker/clone/scarab-askpass"
+    );
     let askpass = dir.path().join("askpass");
-    std::fs::write(&askpass, format!("#!/bin/sh\nexec sh '{askpass_src}' \"$@\"\n")).unwrap();
+    std::fs::write(
+        &askpass,
+        format!("#!/bin/sh\nexec sh '{askpass_src}' \"$@\"\n"),
+    )
+    .unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

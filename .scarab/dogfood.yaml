@@ -132,9 +132,9 @@ steps:
     security:
       run_as_root: true
     timeout: 900
-    # `rust-toolchain.toml` pins `channel = "stable"`, which the official image
-    # does not ship under that name — so EVERY cargo invocation makes rustup sync
-    # the channel manifest over the network. Colima's egress DNS is flaky enough
+    # `rust-toolchain.toml` pins an exact release, which the official image ships
+    # only when its own version matches — otherwise the first cargo invocation
+    # makes rustup download that toolchain over the network. Colima's egress DNS is flaky enough
     # that a1 fails and a2 succeeds, so retry the network, exactly as `test` does.
     retry:
       on: failure
@@ -152,11 +152,11 @@ steps:
       - |
         set -euxo pipefail
         mkdir -p /scarab/artifacts
-        # Scoped to crates that ARE rustfmt-clean: this workspace as a whole is
-        # not, and a repo-wide `cargo fmt` would churn ~90 unrelated files.
+        # The whole workspace is rustfmt-clean; rust-toolchain.toml pins the
+        # rustfmt that defines "clean". Clippy stays scoped to two crates.
         # `tee` so the report is a published artifact, not just scrollback;
         # `pipefail` above keeps the step's verdict the CHECK's, not tee's.
-        cargo fmt -p scarab-identity -p scarab-pipeline -- --check 2>&1 | tee /scarab/artifacts/fmt.log
+        cargo fmt --all -- --check 2>&1 | tee /scarab/artifacts/fmt.log
         cargo clippy -p scarab-identity -p scarab-pipeline 2>&1 | tee /scarab/artifacts/clippy.log
     # ARTIFACTS OF RECORD (ADR-0052): globs over what the step wrote to
     # /scarab/artifacts/. Browse them at /v1/runs/{id}/artifacts.

@@ -291,9 +291,15 @@ async fn seed_run_with_workspace(
         .unwrap()
         .root
         .0;
-    db.set_step_output(&run, &StepId("s1".into()), &AttemptId("a1".into()), &root, None)
-        .await
-        .unwrap();
+    db.set_step_output(
+        &run,
+        &StepId("s1".into()),
+        &AttemptId("a1".into()),
+        &root,
+        None,
+    )
+    .await
+    .unwrap();
     root
 }
 
@@ -589,9 +595,15 @@ async fn seed_live_run_with_dir(
     let root = warm.ingest(dir.to_str().unwrap()).await.unwrap().root.0;
     let cold_root = cold.ingest(dir.to_str().unwrap()).await.unwrap().root.0;
     assert_eq!(root, cold_root, "content addressing: same dir, same root");
-    db.set_step_output(&run, &StepId("s1".into()), &AttemptId("a1".into()), &root, None)
-        .await
-        .unwrap();
+    db.set_step_output(
+        &run,
+        &StepId("s1".into()),
+        &AttemptId("a1".into()),
+        &root,
+        None,
+    )
+    .await
+    .unwrap();
     root
 }
 
@@ -650,7 +662,10 @@ async fn cas_gc_detects_reachable_objects_missing_from_cold_only() {
     // The torn state: run B's top-level blob and its inner tree vanish from
     // COLD ONLY. Warm keeps them, so the mark walk (and every read) stays
     // green — before the residue diff, this pass reported nothing at all.
-    let entries = tiered.tree_entries(&TreeHash(root_b.clone())).await.unwrap();
+    let entries = tiered
+        .tree_entries(&TreeHash(root_b.clone()))
+        .await
+        .unwrap();
     let torn_blob = entries
         .iter()
         .find_map(|e| match &e.target {
@@ -665,8 +680,14 @@ async fn cas_gc_detects_reachable_objects_missing_from_cold_only() {
             _ => None,
         })
         .expect("root B has an inner tree");
-    cold_store.delete(&format!("blobs/{torn_blob}")).await.unwrap();
-    cold_store.delete(&format!("trees/{torn_tree}")).await.unwrap();
+    cold_store
+        .delete(&format!("blobs/{torn_blob}"))
+        .await
+        .unwrap();
+    cold_store
+        .delete(&format!("trees/{torn_tree}"))
+        .await
+        .unwrap();
 
     let db: Arc<dyn Db> = Arc::new(pg);
     let now_ms = std::time::SystemTime::now()
@@ -712,7 +733,10 @@ async fn cas_gc_detects_reachable_objects_missing_from_cold_only() {
         report.suppressed_residue.is_empty(),
         "a root older than grace is alarmed, not suppressed"
     );
-    assert_eq!(report.swept, 0, "everything is reachable — detection deletes nothing");
+    assert_eq!(
+        report.swept, 0,
+        "everything is reachable — detection deletes nothing"
+    );
     // The operator-visible counter: gauge-like, SET by this pass.
     assert_eq!(scarab_server::metrics::cas_gc_cold_residue(), 2);
     assert_eq!(scarab_server::metrics::cas_gc_cold_residue_suppressed(), 0);
@@ -791,7 +815,10 @@ async fn residue_under_a_fresh_root_is_suppressed_not_alarmed() {
             _ => None,
         })
         .unwrap();
-    cold_store.delete(&format!("blobs/{torn_blob}")).await.unwrap();
+    cold_store
+        .delete(&format!("blobs/{torn_blob}"))
+        .await
+        .unwrap();
 
     let db: Arc<dyn Db> = Arc::new(pg);
     let now_ms = std::time::SystemTime::now()
@@ -881,7 +908,10 @@ async fn residue_gauges_are_zeroed_on_a_non_leader_pass() {
             _ => None,
         })
         .unwrap();
-    cold_store.delete(&format!("blobs/{torn_blob}")).await.unwrap();
+    cold_store
+        .delete(&format!("blobs/{torn_blob}"))
+        .await
+        .unwrap();
 
     let db: Arc<dyn Db> = Arc::new(pg);
     let now_ms = std::time::SystemTime::now()
@@ -896,18 +926,34 @@ async fn residue_gauges_are_zeroed_on_a_non_leader_pass() {
     };
 
     // Leader pass: real residue, and the leader gauge says these numbers live.
-    let report = sweep_cas(&db, &tiered, &cold_store, &clock, "gc-gauge-leader", cfg, None)
-        .await
-        .unwrap();
+    let report = sweep_cas(
+        &db,
+        &tiered,
+        &cold_store,
+        &clock,
+        "gc-gauge-leader",
+        cfg,
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(report.residue.len(), 1, "the leader pass detects the tear");
     assert_eq!(scarab_server::metrics::cas_gc_cold_residue(), 1);
     assert_eq!(scarab_server::metrics::cas_gc_leader(), 1);
 
     // A second sweeper id while the lease is held (the ADR-0050 trick): its
     // pass is NOT the leader, asserts nothing, and must zero the gauges.
-    let report = sweep_cas(&db, &tiered, &cold_store, &clock, "gc-gauge-follower", cfg, None)
-        .await
-        .unwrap();
+    let report = sweep_cas(
+        &db,
+        &tiered,
+        &cold_store,
+        &clock,
+        "gc-gauge-follower",
+        cfg,
+        None,
+    )
+    .await
+    .unwrap();
     assert!(report.residue.is_empty(), "a non-leader reports nothing");
     assert_eq!(
         scarab_server::metrics::cas_gc_cold_residue(),
@@ -964,7 +1010,10 @@ async fn a_pinned_run_survives_a_sweep_that_would_otherwise_collect_it() {
         &cas,
         "pin-kept",
         true,
-        &[("evidence.txt", "the thing being investigated"), ("shared.txt", "same-bytes")],
+        &[
+            ("evidence.txt", "the thing being investigated"),
+            ("shared.txt", "same-bytes"),
+        ],
     )
     .await;
     let unpinned_root = seed_run_with_workspace(
@@ -1046,7 +1095,10 @@ async fn a_pinned_run_survives_a_sweep_that_would_otherwise_collect_it() {
     )
     .await
     .unwrap();
-    assert!(report.swept > 0, "the unpinned expired workspace was collected");
+    assert!(
+        report.swept > 0,
+        "the unpinned expired workspace was collected"
+    );
 
     let out = tempfile::tempdir().unwrap();
     cas.materialize(
@@ -1079,7 +1131,10 @@ async fn a_pinned_run_survives_a_sweep_that_would_otherwise_collect_it() {
             .unwrap()
     );
     let r = db.run_snapshot_retention(&pinned).await.unwrap().unwrap();
-    assert!(r.pinned_at.is_none() && r.pinned_by.is_none(), "the pin is released");
+    assert!(
+        r.pinned_at.is_none() && r.pinned_by.is_none(),
+        "the pin is released"
+    );
     sweep_cas(
         &db,
         &cas,
@@ -1225,7 +1280,10 @@ async fn an_expired_input_widens_a_rerun_back_to_clone_instead_of_failing() {
     )
     .await
     .unwrap();
-    assert!(report.swept > 0, "the expired run's snapshots were collected");
+    assert!(
+        report.swept > 0,
+        "the expired run's snapshots were collected"
+    );
 
     let oracle = CasSnapshots(cas.clone());
     let snapshots: &dyn scarab_engine::WorkspaceSnapshots = &oracle;
@@ -1258,8 +1316,9 @@ async fn an_expired_input_widens_a_rerun_back_to_clone_instead_of_failing() {
         "the run restarts from clone — the phrase the affordance says out loud"
     );
     assert!(
-        plan.expired.iter().any(|e| e.consumer == test
-            && e.produced_by == StepId("build".into())),
+        plan.expired
+            .iter()
+            .any(|e| e.consumer == test && e.produced_by == StepId("build".into())),
         "the diagnostic names which step's snapshot went missing, not just that one did"
     );
     // The per-step WHY (git-bug 4afaa3e), on the REAL widened fixture: both
@@ -1279,7 +1338,11 @@ async fn an_expired_input_widens_a_rerun_back_to_clone_instead_of_failing() {
     assert_eq!(
         reasons,
         vec![
-            ("clone", scarab_engine::PlanReason::Regenerate, Some("build")),
+            (
+                "clone",
+                scarab_engine::PlanReason::Regenerate,
+                Some("build")
+            ),
             ("build", scarab_engine::PlanReason::Regenerate, Some("test")),
             ("test", scarab_engine::PlanReason::Target, None),
         ],
@@ -1472,15 +1535,17 @@ async fn the_retention_promise_is_keyed_on_updated_at_not_created_at() {
     // The fixture's whole point, asserted rather than assumed: if these two ever
     // coincide, every assertion below stops distinguishing the two columns and
     // this test degenerates into the in-memory one.
-    let (created, updated): (i64, i64) = sqlx::query_as(
-        "SELECT created_at, updated_at FROM runs WHERE id = 'promise-terminal'",
-    )
-    .fetch_one(&tdb.pool)
-    .await
-    .unwrap();
+    let (created, updated): (i64, i64) =
+        sqlx::query_as("SELECT created_at, updated_at FROM runs WHERE id = 'promise-terminal'")
+            .fetch_one(&tdb.pool)
+            .await
+            .unwrap();
     assert_eq!(created, CREATED);
     assert_eq!(updated, SETTLED);
-    assert_ne!(created, updated, "the fixture must keep the two columns apart");
+    assert_ne!(
+        created, updated,
+        "the fixture must keep the two columns apart"
+    );
 
     // Two days after settling: inside a 7-day window.
     let now = SETTLED + 2 * DAY_MS;
@@ -1491,8 +1556,7 @@ async fn the_retention_promise_is_keyed_on_updated_at_not_created_at() {
         db.clone(),
     ));
     let app = scarab_server::router(
-        scarab_server::AppState::new(db, clock, logs)
-            .with_snapshot_retention_days(WINDOW_DAYS),
+        scarab_server::AppState::new(db, clock, logs).with_snapshot_retention_days(WINDOW_DAYS),
     );
 
     let retention_of = |id: &'static str| {
@@ -1651,7 +1715,10 @@ async fn torn_fixture(
             _ => None,
         })
         .unwrap();
-    cold_store.delete(&format!("blobs/{torn_blob}")).await.unwrap();
+    cold_store
+        .delete(&format!("blobs/{torn_blob}"))
+        .await
+        .unwrap();
 
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

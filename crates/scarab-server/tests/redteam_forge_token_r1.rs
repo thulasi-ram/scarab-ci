@@ -71,7 +71,9 @@ fn pr(fork: bool) -> Event {
 fn long_lived(files: &[(&str, &str)]) -> FakeForge {
     files
         .iter()
-        .fold(FakeForge::new(), |f, (path, yaml)| f.with_file(*path, *yaml))
+        .fold(FakeForge::new(), |f, (path, yaml)| {
+            f.with_file(*path, *yaml)
+        })
         .with_commit("refs/heads/main", SHA)
         .with_commit("refs/heads/feature", SHA)
 }
@@ -212,7 +214,10 @@ async fn rt_rerun_after_the_connection_turns_long_lived_must_not_hand_repo_code_
     let inner = Arc::new(FakeExecutor::new());
     let exec = ForgeCredentialExecutor::new(inner.clone(), Arc::new(app));
     drive(&db, &inner, &exec, &run).await;
-    assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Succeeded));
+    assert_eq!(
+        db.run_status(&run).await.unwrap(),
+        Some(RunStatus::Succeeded)
+    );
 
     // The connection is now long-lived (Forgejo / GitHub PAT).
     let pat = Arc::new(long_lived(&[(".scarab/ci.yaml", OWN_STEP_YAML)]));
@@ -223,7 +228,10 @@ async fn rt_rerun_after_the_connection_turns_long_lived_must_not_hand_repo_code_
         .await
         .unwrap();
     drive(&db, &inner2, &exec2, &run).await;
-    let attempts = db.attempts_of_step(&run, &StepId("tag".into())).await.unwrap();
+    let attempts = db
+        .attempts_of_step(&run, &StepId("tag".into()))
+        .await
+        .unwrap();
     let last = attempts.last().unwrap().id.0.clone();
     let launched = inner2.launched_spec(&handle(&run, "tag", &last));
     let got = launched
@@ -255,11 +263,26 @@ async fn rt_a_file_library_forge_token_step_is_refused_on_a_long_lived_connectio
     let yaml = "on: { push: {} }\nsteps: [{ id: g, invoke: file:.scarab/lib/clone.yaml }]\n";
     // The file is even byte-identical to the first-party clone library.
     for content in [FILE_LIB, CLONE] {
-        let forge = long_lived(&[(".scarab/ci.yaml", yaml), (".scarab/lib/clone.yaml", content)]);
-        let out = trigger(&db, &forge, AdmissionPorts::default().with_libraries(&libs), &push()).await;
-        assert!(out.runs.is_empty(), "a `file:` library Step got a long-lived token: {:?}", out.runs);
+        let forge = long_lived(&[
+            (".scarab/ci.yaml", yaml),
+            (".scarab/lib/clone.yaml", content),
+        ]);
+        let out = trigger(
+            &db,
+            &forge,
+            AdmissionPorts::default().with_libraries(&libs),
+            &push(),
+        )
+        .await;
         assert!(
-            out.refused.iter().any(|r| r.reason.contains("never receive it")),
+            out.runs.is_empty(),
+            "a `file:` library Step got a long-lived token: {:?}",
+            out.runs
+        );
+        assert!(
+            out.refused
+                .iter()
+                .any(|r| r.reason.contains("never receive it")),
             "refused for the token, not something else: {:?}",
             out.refused
         );
@@ -282,7 +305,16 @@ steps:
 async fn rt_an_untrusted_copy_is_refused_even_when_another_org_holds_it_first_party() {
     let db = InMemoryDb::new();
     let libs = InMemoryLibraries::new();
-    install_in(&libs, "other", "thulasi-ram", "clone", CLONE, CLONE_SOURCE, true).await;
+    install_in(
+        &libs,
+        "other",
+        "thulasi-ram",
+        "clone",
+        CLONE,
+        CLONE_SOURCE,
+        true,
+    )
+    .await;
     install(
         &libs,
         "thulasi-ram",
@@ -293,9 +325,21 @@ async fn rt_an_untrusted_copy_is_refused_even_when_another_org_holds_it_first_pa
     )
     .await;
     let forge = long_lived(&[(".scarab/ci.yaml", CHECKOUT_YAML)]);
-    let out = trigger(&db, &forge, AdmissionPorts::default().with_libraries(&libs), &push()).await;
+    let out = trigger(
+        &db,
+        &forge,
+        AdmissionPorts::default().with_libraries(&libs),
+        &push(),
+    )
+    .await;
     assert!(out.runs.is_empty(), "admitted: {:?}", out.runs);
-    assert!(out.refused.iter().any(|r| r.reason.contains("step `checkout/git`")), "{:?}", out.refused);
+    assert!(
+        out.refused
+            .iter()
+            .any(|r| r.reason.contains("step `checkout/git`")),
+        "{:?}",
+        out.refused
+    );
 }
 
 /// A library from a source the org trusts, whose image comes from an input
@@ -341,7 +385,10 @@ steps:
     {
         Ok(out) => out,
         Err(e) => {
-            assert!(e.to_string().contains("`image`"), "refused for its image: {e}");
+            assert!(
+                e.to_string().contains("`image`"),
+                "refused for its image: {e}"
+            );
             return;
         }
     };
@@ -380,7 +427,13 @@ async fn rt_the_invoke_step_carries_nothing_that_shapes_the_token_pod() {
     let libs = InMemoryLibraries::new();
     install(&libs, "thulasi-ram", "clone", CLONE, CLONE_SOURCE, true).await;
     let forge = long_lived(&[(".scarab/ci.yaml", CLONE_WITH_ENV)]);
-    let out = trigger(&db, &forge, AdmissionPorts::default().with_libraries(&libs), &push()).await;
+    let out = trigger(
+        &db,
+        &forge,
+        AdmissionPorts::default().with_libraries(&libs),
+        &push(),
+    )
+    .await;
     assert_eq!(out.runs.len(), 1, "{:?}", out.refused);
     let run = out.runs[0].clone();
     let spec = db
@@ -388,7 +441,11 @@ async fn rt_the_invoke_step_carries_nothing_that_shapes_the_token_pod() {
         .await
         .unwrap()
         .unwrap();
-    assert!(spec.placement_profiles.is_empty(), "{:?}", spec.placement_profiles);
+    assert!(
+        spec.placement_profiles.is_empty(),
+        "{:?}",
+        spec.placement_profiles
+    );
     assert!(spec.k8s_overlay.is_none());
     assert!(spec.services.is_empty() && spec.uses.is_empty() && spec.secrets.is_empty());
     assert!(
@@ -418,12 +475,20 @@ async fn rt_a_repo_result_failing_validate_fails_the_token_step_before_any_mint(
     let libs = InMemoryLibraries::new();
     install(&libs, "thulasi-ram", "clone", CLONE, CLONE_SOURCE, true).await;
     let forge = Arc::new(long_lived(&[(".scarab/ci.yaml", PREP_THEN_CLONE)]));
-    let out = trigger(&db, &forge, AdmissionPorts::default().with_libraries(&libs), &push()).await;
+    let out = trigger(
+        &db,
+        &forge,
+        AdmissionPorts::default().with_libraries(&libs),
+        &push(),
+    )
+    .await;
     assert_eq!(out.runs.len(), 1, "{:?}", out.refused);
     let run = out.runs[0].clone();
     // Empty explicit inputs: nothing `prep` wrote is in /workspace.
     assert_eq!(
-        db.step_inputs(&run, &StepId("checkout/git".into())).await.unwrap(),
+        db.step_inputs(&run, &StepId("checkout/git".into()))
+            .await
+            .unwrap(),
         Some(vec![])
     );
     let inner = Arc::new(FakeExecutor::new());
@@ -443,7 +508,9 @@ async fn rt_a_repo_result_failing_validate_fails_the_token_step_before_any_mint(
         .map(|s| s.status);
     assert_ne!(status, Some(StepStatus::Succeeded));
     assert!(
-        inner.launched_spec(&handle(&run, "checkout/git", "a1")).is_none(),
+        inner
+            .launched_spec(&handle(&run, "checkout/git", "a1"))
+            .is_none(),
         "the token Step launched with a depth that fails its validate"
     );
     assert_eq!(forge.credential_calls(), 0, "no credential minted");
@@ -481,7 +548,13 @@ async fn rt_first_party_content_that_is_not_clone_is_not_trusted_by_its_file_nam
     .await;
     let yaml = "on: { push: {} }\nsteps: [{ id: d, invoke: lib:thulasi-ram/deploy }]\n";
     let forge = long_lived(&[(".scarab/ci.yaml", yaml)]);
-    let out = trigger(&db, &forge, AdmissionPorts::default().with_libraries(&libs), &push()).await;
+    let out = trigger(
+        &db,
+        &forge,
+        AdmissionPorts::default().with_libraries(&libs),
+        &push(),
+    )
+    .await;
     assert!(
         out.runs.is_empty(),
         "a first-party library other than clone was trusted with the long-lived token because \
@@ -524,10 +597,18 @@ async fn rt_look_alike_sources_do_not_match_a_trusted_source() {
         .await;
         trust(&libs, "github.com/acme/libs//pusher.yaml").await;
         let forge = long_lived(&[(".scarab/ci.yaml", yaml)]);
-        let out = trigger(&db, &forge, AdmissionPorts::default().with_libraries(&libs), &push()).await;
+        let out = trigger(
+            &db,
+            &forge,
+            AdmissionPorts::default().with_libraries(&libs),
+            &push(),
+        )
+        .await;
         assert!(out.runs.is_empty(), "`{source}` matched the trusted source");
         assert!(
-            out.refused.iter().any(|r| r.reason.contains("step `s/git`")),
+            out.refused
+                .iter()
+                .any(|r| r.reason.contains("step `s/git`")),
             "`{source}`: refused for the token, not something else: {:?}",
             out.refused
         );
@@ -652,7 +733,12 @@ async fn rt_a_skipped_gate_does_not_release_a_write_step() {
     )
     .await;
     let out = res.expect("compiles");
-    assert_eq!(out.runs.len(), 1, "control: the gated Run is admitted: {:?}", out.refused);
+    assert_eq!(
+        out.runs.len(),
+        1,
+        "control: the gated Run is admitted: {:?}",
+        out.refused
+    );
     for run in &out.runs {
         let inner = Arc::new(FakeExecutor::new());
         let exec = ForgeCredentialExecutor::new(inner.clone(), forge.clone());
@@ -729,19 +815,33 @@ async fn rt_a_stored_clone_spec_fails_clearly_and_mints_nothing() {
     });
     let spec: scarab_engine::StepSpec = serde_json::from_value(old).expect("old spec decodes");
     assert!(spec.forge_token.is_none());
-    db.create_step_run(&run, &StepId("checkout".into()), Some(&spec), &[], Timestamp(0))
-        .await
-        .unwrap();
+    db.create_step_run(
+        &run,
+        &StepId("checkout".into()),
+        Some(&spec),
+        &[],
+        Timestamp(0),
+    )
+    .await
+    .unwrap();
     let forge = Arc::new(FakeForge::new().with_minted_tokens());
     let inner = Arc::new(FakeExecutor::new());
     let exec = ForgeCredentialExecutor::new(inner.clone(), forge.clone());
     drive(&db, &inner, &exec, &run).await;
-    assert!(inner.launched_spec(&handle(&run, "checkout", "a1")).is_none());
+    assert!(inner
+        .launched_spec(&handle(&run, "checkout", "a1"))
+        .is_none());
     assert_eq!(forge.credential_calls(), 0);
-    let attempts = db.attempts_of_step(&run, &StepId("checkout".into())).await.unwrap();
+    let attempts = db
+        .attempts_of_step(&run, &StepId("checkout".into()))
+        .await
+        .unwrap();
     let detail = attempts
         .first()
         .and_then(|a| a.failure_detail.clone())
         .unwrap_or_default();
-    assert!(detail.contains("clone"), "failure names the removed kind: {detail:?}");
+    assert!(
+        detail.contains("clone"),
+        "failure names the removed kind: {detail:?}"
+    );
 }

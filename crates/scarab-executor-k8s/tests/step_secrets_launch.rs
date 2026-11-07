@@ -156,6 +156,21 @@ fn step() -> StepRun {
     }
 }
 
+/// The per-Pod Secret carries the values in `data` (base64 of the bytes as
+/// stored), never `stringData`, which must be text.
+fn assert_secret_data(secret: &Value) {
+    use base64::Engine as _;
+    let b64 = |v: &[u8]| base64::engine::general_purpose::STANDARD.encode(v);
+    assert_eq!(secret.get("stringData"), None, "{secret:#}");
+    assert_eq!(
+        secret["data"],
+        json!({
+            "KUBECONFIG_DATA": b64(b"sekret-kubeconfig\xff\x00"),
+            "ARGOCD_AUTH_TOKEN": b64(b"sekret-argo-token"),
+        })
+    );
+}
+
 fn spec() -> StepSpec {
     StepSpec {
         image: "argoproj/argocd".into(),
@@ -166,7 +181,11 @@ fn spec() -> StepSpec {
             scarab_pipeline::SecretRef::file_and_env("ARGOCD_AUTH_TOKEN"),
         ],
         resolved_secrets: ResolvedSecrets(vec![
-            ("KUBECONFIG_DATA".into(), "sekret-kubeconfig".into()),
+            // Not UTF-8: the Secret must carry the bytes (git-bug c1f61c9).
+            (
+                "KUBECONFIG_DATA".into(),
+                b"sekret-kubeconfig\xff\x00".to_vec(),
+            ),
             ("ARGOCD_AUTH_TOKEN".into(), "sekret-argo-token".into()),
         ]),
         run_as_root: false,
@@ -232,10 +251,7 @@ async fn launch_puts_secret_values_in_a_per_pod_secret_and_none_in_the_pod() {
         .iter()
         .find(|s| s["metadata"]["name"] == format!("{pod_name}-secrets").as_str())
         .unwrap_or_else(|| panic!("the per-Pod Secret was created: {:#?}", seen.secrets));
-    assert_eq!(
-        secret["stringData"],
-        json!({ "KUBECONFIG_DATA": "sekret-kubeconfig", "ARGOCD_AUTH_TOKEN": "sekret-argo-token" })
-    );
+    assert_secret_data(secret);
     let owner = &secret["metadata"]["ownerReferences"][0];
     assert_eq!(
         (owner["kind"].as_str(), owner["uid"].as_str()),
@@ -290,10 +306,7 @@ async fn a_redrive_replaces_the_per_pod_secret_owned_by_the_live_pod() {
         .iter()
         .find(|(n, _)| *n == name)
         .unwrap_or_else(|| panic!("{name} was replaced: {:#?}", seen.replaced));
-    assert_eq!(
-        secret["stringData"],
-        json!({ "KUBECONFIG_DATA": "sekret-kubeconfig", "ARGOCD_AUTH_TOKEN": "sekret-argo-token" })
-    );
+    assert_secret_data(secret);
     let owner = &secret["metadata"]["ownerReferences"][0];
     assert_eq!(
         (owner["kind"].as_str(), owner["uid"].as_str()),

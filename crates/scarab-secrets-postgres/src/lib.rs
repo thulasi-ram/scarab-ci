@@ -74,8 +74,7 @@ impl MasterKeySet {
     pub fn new(keys: Vec<[u8; 32]>) -> Result<Self, SecretError> {
         if keys.is_empty() {
             return Err(SecretError::Backend(
-                "master key set is empty — at least one key (the active writer) is required"
-                    .into(),
+                "master key set is empty — at least one key (the active writer) is required".into(),
             ));
         }
         let mut out: Vec<(String, [u8; 32])> = Vec::with_capacity(keys.len());
@@ -296,14 +295,19 @@ impl PostgresSecrets {
                         self.keys.configured_list()
                     )));
                 };
-                let dk = decrypt(&self.keys.keys[idx].1, &row.key_nonce, &row.wrapped_key, &aad)
-                    .map_err(|_| {
-                        SecretError::Backend(format!(
-                            "secret {scope_text}/{key} fails authentication under its stamped \
+                let dk = decrypt(
+                    &self.keys.keys[idx].1,
+                    &row.key_nonce,
+                    &row.wrapped_key,
+                    &aad,
+                )
+                .map_err(|_| {
+                    SecretError::Backend(format!(
+                        "secret {scope_text}/{key} fails authentication under its stamped \
                              master key {fp} — the row is corrupt or was tampered with \
                              (stamped rows are always AAD-bound, so a wrong key is ruled out)"
-                        ))
-                    })?;
+                    ))
+                })?;
                 Ok((key32(dk)?, idx, WrapArm::Aad))
             }
             None => {
@@ -503,12 +507,13 @@ impl PostgresSecrets {
             }
         }
         // What is still under a non-active key AFTER the pass — the gauge.
-        let remaining = sqlx::query("SELECT count(*) AS n FROM secrets WHERE key_id IS DISTINCT FROM $1")
-            .bind(&active_fp)
-            .fetch_one(self.pool())
-            .await
-            .map_err(|e| SecretError::Backend(e.to_string()))?
-            .get::<i64, _>("n");
+        let remaining =
+            sqlx::query("SELECT count(*) AS n FROM secrets WHERE key_id IS DISTINCT FROM $1")
+                .bind(&active_fp)
+                .fetch_one(self.pool())
+                .await
+                .map_err(|e| SecretError::Backend(e.to_string()))?
+                .get::<i64, _>("n");
         summary.remaining = remaining.max(0) as u64;
         Ok(summary)
     }
@@ -667,6 +672,26 @@ impl SecretProvider for PostgresSecrets {
         projects.dedup();
         Ok(projects)
     }
+
+    async fn environment_secret_scopes(
+        &self,
+        org: &str,
+    ) -> Result<Vec<(String, String)>, SecretError> {
+        let prefix = format!("env:{org}/");
+        let scopes: Vec<String> =
+            sqlx::query_scalar("SELECT DISTINCT scope FROM secrets WHERE starts_with(scope, $1)")
+                .bind(&prefix)
+                .fetch_all(self.pool())
+                .await
+                .map_err(|e| SecretError::Backend(e.to_string()))?;
+        let mut out: Vec<(String, String)> = scopes
+            .iter()
+            .filter_map(|s| scarab_secrets::environment_scope_of_scope_key(s, org))
+            .collect();
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
 }
 
 /// The version byte every [`Sealer`] seal from this adapter starts with.
@@ -811,7 +836,13 @@ fn encrypt(
     let nonce_bytes: [u8; 12] = random_bytes();
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ciphertext = cipher
-        .encrypt(nonce, Payload { msg: plaintext, aad })
+        .encrypt(
+            nonce,
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .map_err(|_| SecretError::Backend("encryption failed".into()))?;
     Ok((ciphertext, nonce_bytes.to_vec()))
 }
@@ -828,7 +859,13 @@ fn decrypt(
     let cipher = Aes256Gcm::new_from_slice(key)
         .map_err(|e| SecretError::Backend(format!("cipher init: {e}")))?;
     cipher
-        .decrypt(Nonce::from_slice(nonce), Payload { msg: ciphertext, aad })
+        .decrypt(
+            Nonce::from_slice(nonce),
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
         .map_err(|_| SecretError::Backend("decryption failed".into()))
 }
 
@@ -858,7 +895,10 @@ mod tests {
 
         // Legacy rows were sealed with no AAD — the empty-AAD open is that path.
         let (legacy_ct, legacy_nonce) = encrypt(&key, b"old", b"").unwrap();
-        assert_eq!(decrypt(&key, &legacy_nonce, &legacy_ct, b"").unwrap(), b"old");
+        assert_eq!(
+            decrypt(&key, &legacy_nonce, &legacy_ct, b"").unwrap(),
+            b"old"
+        );
         assert!(decrypt(&key, &legacy_nonce, &legacy_ct, &aad).is_err());
     }
 
@@ -975,7 +1015,9 @@ mod tests {
     fn fingerprint_is_derived_and_stable() {
         let a = fingerprint(&[1u8; 32]);
         assert_eq!(a.len(), 16);
-        assert!(a.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(a
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
         assert_eq!(a, fingerprint(&[1u8; 32]));
         assert_ne!(a, fingerprint(&[2u8; 32]));
     }

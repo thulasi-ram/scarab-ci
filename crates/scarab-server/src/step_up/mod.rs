@@ -372,26 +372,17 @@ impl StepUpService {
     /// the provider the guarded POST was asked for and the flow's expiry, so
     /// it can be minted only by the guarded link POST, cannot be moved to
     /// another flow, session or provider, and dies with its step-up.
-    /// `moves_passkeys` (git-bug def16bd): the flow was started by the
-    /// always-ask `identity.link_moving_passkeys`, so its merge may move
-    /// passkeys; it adds a fifth part, `passkeys:move`, so the two bindings
-    /// differ and a window-started flow keeps the binding it had before.
     pub(crate) fn link_binding(
         &self,
         state: &str,
         session_hash: &str,
         provider: &str,
         expires_at: i64,
-        moves_passkeys: bool,
     ) -> String {
         let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&self.link_key)
             .expect("HMAC accepts any key length");
         let expires_at = expires_at.to_string();
-        let mut parts = vec![state, session_hash, provider, expires_at.as_str()];
-        if moves_passkeys {
-            parts.push("passkeys:move");
-        }
-        for part in parts {
+        for part in [state, session_hash, provider, expires_at.as_str()] {
             mac.update(&(part.len() as u32).to_be_bytes());
             mac.update(part.as_bytes());
         }
@@ -870,7 +861,10 @@ pub(crate) async fn require(
     if let Some(authority) = requests::replay_authority() {
         if authority.op_id == op.id
             && authority.digest.as_slice() == p.digest.as_slice()
-            && summary.changes.iter().all(|c| authority.changes.contains(c))
+            && summary
+                .changes
+                .iter()
+                .all(|c| authority.changes.contains(c))
         {
             return Ok(Some(authority.confirmation_id.clone()));
         }
@@ -1217,7 +1211,14 @@ mod tests {
     fn a_closed_window_keeps_the_distinct_targets_it_suppressed() {
         let l = StepUpRefusalLimiter::default();
         let r = |target: &str, at| {
-            let mut e = refusal("acme", "amy", "session:cookie", "secret.put", "no_window", at);
+            let mut e = refusal(
+                "acme",
+                "amy",
+                "session:cookie",
+                "secret.put",
+                "no_window",
+                at,
+            );
             e.target = Some(target.into());
             e
         };
@@ -1247,7 +1248,16 @@ mod tests {
     #[test]
     fn a_clock_step_back_opens_a_new_window() {
         let l = StepUpRefusalLimiter::default();
-        let r = |at| refusal("acme", "amy", "session:cookie", "secret.put", "no_window", at);
+        let r = |at| {
+            refusal(
+                "acme",
+                "amy",
+                "session:cookie",
+                "secret.put",
+                "no_window",
+                at,
+            )
+        };
         let t = 10 * REFUSAL_WINDOW_MS;
         for _ in 0..REFUSALS_PER_WINDOW {
             assert_eq!(admit_one(&l, r(t)), Some(0));
@@ -1264,7 +1274,16 @@ mod tests {
     #[test]
     fn reordering_within_the_skew_allowance_stays_in_the_window() {
         let l = StepUpRefusalLimiter::default();
-        let r = |at| refusal("acme", "amy", "session:cookie", "secret.put", "no_window", at);
+        let r = |at| {
+            refusal(
+                "acme",
+                "amy",
+                "session:cookie",
+                "secret.put",
+                "no_window",
+                at,
+            )
+        };
         let t = 10 * REFUSAL_WINDOW_MS;
         for _ in 0..REFUSALS_PER_WINDOW {
             assert_eq!(admit_one(&l, r(t)), Some(0));

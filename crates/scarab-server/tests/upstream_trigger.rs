@@ -84,7 +84,14 @@ impl World {
         let sched = Scheduler::new(&self.db, &self.clock, &self.exec, "sched");
         for _ in 0..10 {
             sched.tick(run).await.unwrap();
-            if self.db.run_status(run).await.unwrap().unwrap().is_terminal() {
+            if self
+                .db
+                .run_status(run)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_terminal()
+            {
                 return;
             }
         }
@@ -140,9 +147,17 @@ async fn a_finished_run_starts_its_follow_up_at_the_same_commit() {
     assert_eq!(deploy.len(), 1);
     let d = &deploy[0];
     assert_eq!(d.trigger_kind.as_deref(), Some("upstream"));
-    assert_eq!(d.sha.as_deref(), Some(SHA), "the follow-up builds ci's commit");
+    assert_eq!(
+        d.sha.as_deref(),
+        Some(SHA),
+        "the follow-up builds ci's commit"
+    );
     assert_eq!(d.git_ref.as_deref(), Some("refs/heads/main"));
-    assert_eq!(d.actor.as_deref(), Some("octocat"), "the chain keeps its actor");
+    assert_eq!(
+        d.actor.as_deref(),
+        Some("octocat"),
+        "the chain keeps its actor"
+    );
 
     // The message is retired: a second drain starts nothing.
     assert_eq!(w.drain().await, 0);
@@ -186,7 +201,10 @@ steps:
     let runs = w.start(&push()).await;
     w.finish(&runs[0], failed()).await;
     assert_eq!(w.drain().await, 1);
-    assert!(w.runs_of("deploy").await.is_empty(), "deploy follows successes");
+    assert!(
+        w.runs_of("deploy").await.is_empty(),
+        "deploy follows successes"
+    );
     assert_eq!(w.runs_of("page").await.len(), 1);
 }
 
@@ -236,7 +254,10 @@ steps:
     w.finish(&b[0].run, ExecState::Succeeded).await;
     assert_eq!(w.drain().await, 0, "a is already in the chain");
     assert_eq!(w.runs_of("a").await.len(), 1);
-    let refused = w.db.refused_runs_for_tenant("acme", "app", 10).await.unwrap();
+    let refused =
+        w.db.refused_runs_for_tenant("acme", "app", 10)
+            .await
+            .unwrap();
     assert_eq!(refused.len(), 1);
     assert_eq!(refused[0].reason_kind, "upstream");
     assert!(
@@ -262,11 +283,20 @@ async fn a_rerun_that_finishes_again_starts_the_follow_up_again() {
     .unwrap();
     w.finish(&ci, ExecState::Succeeded).await;
     assert_eq!(w.drain().await, 1);
-    scarab_engine::rerun_step(&w.db, &w.clock, &ci, &scarab_engine::StepId("build".into()), None)
-        .await
-        .unwrap();
+    scarab_engine::rerun_step(
+        &w.db,
+        &w.clock,
+        &ci,
+        &scarab_engine::StepId("build".into()),
+        None,
+    )
+    .await
+    .unwrap();
     w.finish(&ci, ExecState::Succeeded).await;
-    assert_eq!(w.db.run_status(&ci).await.unwrap(), Some(RunStatus::Succeeded));
+    assert_eq!(
+        w.db.run_status(&ci).await.unwrap(),
+        Some(RunStatus::Succeeded)
+    );
     assert_eq!(w.drain().await, 1, "the Rerun's success is new news");
     assert_eq!(w.runs_of("deploy").await.len(), 2);
 }
@@ -293,9 +323,13 @@ steps:
         actor: String::new(),
         chain: vec!["ci".into()],
     };
-    let older = w.start(&event("0190a1b2-c3d4-7e5f-8a9b-000000000001")).await;
+    let older = w
+        .start(&event("0190a1b2-c3d4-7e5f-8a9b-000000000001"))
+        .await;
     w.clock.advance(1_000);
-    let newer = w.start(&event("0190a1b2-c3d4-7e5f-8a9b-000000000002")).await;
+    let newer = w
+        .start(&event("0190a1b2-c3d4-7e5f-8a9b-000000000002"))
+        .await;
     assert_eq!((older.len(), newer.len()), (1, 1));
     assert_eq!(w.db.superseded_by(&newer[0]).await.unwrap(), older);
 }

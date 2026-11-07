@@ -261,7 +261,7 @@ export function approvalReleaseIn(s: EnvironmentGateLike, now: number): number |
 
 /** What `POST …/gates/{step}/approve` answered (202). `releases_at` is set
  *  when the approvals are in and the wait timer still runs. */
-export type GateApprovalLike = { released: boolean; approvals?: string[]; releases_at?: number | null };
+export type GateApprovalLike = { released: boolean; approvals?: string[] | null; releases_at?: number | null };
 
 /** The note an approval leaves on the gate's card. A 202 that did not
  *  release the gate is not a failure: the approval is recorded, and either

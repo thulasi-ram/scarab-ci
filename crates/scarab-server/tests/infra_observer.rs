@@ -47,9 +47,13 @@ async fn harness() -> Harness {
 
     db.create_run(&run, 1, 1, clock.now().await).await.unwrap();
     db.seed_step(&run, &step_id, StepStatus::Running, None);
-    db.record_attempt(&run, &step_id, &running_attempt(&attempt, clock.now().await))
-        .await
-        .unwrap();
+    db.record_attempt(
+        &run,
+        &step_id,
+        &running_attempt(&attempt, clock.now().await),
+    )
+    .await
+    .unwrap();
     // The handle is how the observer addresses the backend; the fake keys its
     // scripted conditions off the step id encoded in it.
     db.set_attempt_handle(
@@ -84,7 +88,9 @@ async fn harness() -> Harness {
 }
 
 /// Every `StepInfraCondition` on the run, in append order.
-async fn conditions(db: &Arc<InMemoryDb>) -> Vec<(String, Option<String>, Option<i64>, Option<u32>)> {
+async fn conditions(
+    db: &Arc<InMemoryDb>,
+) -> Vec<(String, Option<String>, Option<i64>, Option<u32>)> {
     db.events(&RunId("r1".into()))
         .await
         .unwrap()
@@ -202,7 +208,11 @@ async fn a_cleared_condition_is_closed_with_its_duration() {
 
     let events = conditions(&h.db).await;
     assert_eq!(events.len(), 2, "one onset, one close — got {events:?}");
-    assert_eq!(events[1].2, Some(4 * POLL_MS), "the close carries how long it held");
+    assert_eq!(
+        events[1].2,
+        Some(4 * POLL_MS),
+        "the close carries how long it held"
+    );
     assert_eq!(
         events[1].3,
         Some(4),
@@ -235,7 +245,11 @@ async fn a_changed_message_under_the_same_reason_opens_a_new_episode() {
 
     let events = conditions(&h.db).await;
     assert_eq!(events.len(), 3, "onset, close, onset — got {events:?}");
-    assert_eq!(events[1].2, Some(POLL_MS), "the first episode is closed out");
+    assert_eq!(
+        events[1].2,
+        Some(POLL_MS),
+        "the first episode is closed out"
+    );
     assert_eq!(
         events[2].1.as_deref(),
         Some("3 node(s) had untolerated taint {gpu: true}"),

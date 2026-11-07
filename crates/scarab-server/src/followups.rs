@@ -230,10 +230,7 @@ async fn upstream_event(db: &dyn Db, msg: &OutboxMessage) -> Result<Option<Event
 }
 
 /// The trigger context (`event`) a Run was created from, and its actor.
-async fn trigger_of(
-    db: &dyn Db,
-    run: &RunId,
-) -> Result<Option<(Value, Option<String>)>, DbError> {
+async fn trigger_of(db: &dyn Db, run: &RunId) -> Result<Option<(Value, Option<String>)>, DbError> {
     for e in db.events(run).await? {
         if let EventPayload::Raw(v) = &e.kind {
             if v["trigger"]["event"].is_object() {

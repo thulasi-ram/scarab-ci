@@ -810,7 +810,13 @@ mod tests {
             .filter_map(|v| v.projected.as_ref())
             .flat_map(|p| p.sources.as_ref().unwrap())
             .filter_map(|s| s.service_account_token.as_ref())
-            .map(|t| (t.audience.clone().unwrap(), t.path.clone(), t.expiration_seconds))
+            .map(|t| {
+                (
+                    t.audience.clone().unwrap(),
+                    t.path.clone(),
+                    t.expiration_seconds,
+                )
+            })
             .collect();
         assert_eq!(
             audiences,

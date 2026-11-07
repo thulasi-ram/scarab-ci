@@ -54,12 +54,11 @@ impl PostgresDb {
     /// passkey" counts (ADR-0073 §8). Bootstrap owners come from config and
     /// are the caller's to add.
     pub async fn admin_subjects(&self) -> Result<BTreeSet<String>, IdentityError> {
-        let rows = sqlx::query(
-            "SELECT DISTINCT subject, role FROM rbac_bindings WHERE role IS NOT NULL",
-        )
-        .fetch_all(self.pool())
-        .await
-        .map_err(identity_err)?;
+        let rows =
+            sqlx::query("SELECT DISTINCT subject, role FROM rbac_bindings WHERE role IS NOT NULL")
+                .fetch_all(self.pool())
+                .await
+                .map_err(identity_err)?;
         Ok(rows
             .into_iter()
             .filter(|r| {
@@ -475,6 +474,27 @@ impl ChallengeStore for PostgresDb {
             "UPDATE webauthn_challenges SET consumed_at = $3
              WHERE id = $1 AND session_hash = $2 AND consumed_at IS NULL AND expires_at > $3
              RETURNING {CHALLENGE_COLUMNS}"
+        ))
+        .bind(id)
+        .bind(session_hash)
+        .bind(now_ms)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(identity_err)?
+        .as_ref()
+        .map(challenge_from_row)
+        .transpose()
+    }
+
+    async fn peek(
+        &self,
+        id: &str,
+        session_hash: &str,
+        now_ms: i64,
+    ) -> Result<Option<WebauthnChallenge>, IdentityError> {
+        sqlx::query(&format!(
+            "SELECT {CHALLENGE_COLUMNS} FROM webauthn_challenges
+             WHERE id = $1 AND session_hash = $2 AND consumed_at IS NULL AND expires_at > $3"
         ))
         .bind(id)
         .bind(session_hash)

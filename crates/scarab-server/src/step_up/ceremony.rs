@@ -780,7 +780,23 @@ pub(crate) async fn verify_assertion(
     credential: serde_json::Value,
     now: i64,
 ) -> Result<Passkey, ApiError> {
-    let verified = verify_assertion_once(svc, caller, facts, sent, credential, now).await;
+    let owner = caller.principal.subject.clone();
+    verify_assertion_of(svc, caller, facts, &owner, sent, credential, now).await
+}
+
+/// [`verify_assertion`] for a passkey of `owner`, who need not be the
+/// caller: an identity merge proves a passkey of the Principal it folds in
+/// (ADR-0079 §2). The checks and the evidence recorded are the same.
+pub(crate) async fn verify_assertion_of(
+    svc: &StepUpService,
+    caller: &Caller,
+    facts: &SessionFacts,
+    owner: &str,
+    sent: &[u8; 32],
+    credential: serde_json::Value,
+    now: i64,
+) -> Result<Passkey, ApiError> {
+    let verified = verify_assertion_once(svc, caller, facts, owner, sent, credential, now).await;
     // A failed assertion is a refusal too (git-bug 69e06b5). A suspected
     // clone records its own evidence (`passkey.clone_suspected` on
     // detection, a refusal naming the passkey on each later use); a store
@@ -797,23 +813,23 @@ async fn verify_assertion_once(
     svc: &StepUpService,
     caller: &Caller,
     facts: &SessionFacts,
+    owner: &str,
     sent: &[u8; 32],
     credential: serde_json::Value,
     now: i64,
 ) -> Result<Passkey, ApiError> {
-    let subject = caller.principal.subject.clone();
+    let subject = owner.to_string();
     let resp: AuthenticationResponseJson = serde_json::from_value(credential)
         .map_err(|_| webauthn_refused(WebauthnError::MalformedResponse))?;
     let raw_id = URL_SAFE_NO_PAD
         .decode(resp.raw_id.as_bytes())
         .map_err(|_| webauthn_refused(WebauthnError::MalformedResponse))?;
-    let unknown = || {
-        ceremony(
-            StatusCode::BAD_REQUEST,
-            "unknown_credential",
-            "that passkey is not one of yours",
-        )
+    let not_yours = if subject == caller.principal.subject {
+        "that passkey is not one of yours".to_string()
+    } else {
+        format!("that passkey is not one of `{subject}`'s")
     };
+    let unknown = || ceremony(StatusCode::BAD_REQUEST, "unknown_credential", &not_yours);
     let passkey = svc
         .passkeys
         .get_by_credential(&raw_id)

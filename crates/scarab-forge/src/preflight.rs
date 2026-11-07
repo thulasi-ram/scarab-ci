@@ -317,10 +317,11 @@ mod tests {
         caps.events.clear();
         let gaps = missing(ForgeKind::GitHub, &caps);
         let names: Vec<&str> = gaps.iter().map(|r| r.name).collect();
-        assert_eq!(names, vec!["push", "pull_request", "release", "issue_comment"]);
-        assert!(gaps
-            .iter()
-            .all(|r| r.kind == CapabilityKind::Event));
+        assert_eq!(
+            names,
+            vec!["push", "pull_request", "release", "issue_comment"]
+        );
+        assert!(gaps.iter().all(|r| r.kind == CapabilityKind::Event));
         assert!(is_degraded(ForgeKind::GitHub, &caps));
     }
 
@@ -340,10 +341,12 @@ mod tests {
         // The nastier shape of the same bug: the grant exists, at a level that
         // still 403s every post.
         let mut caps = healthy_github();
-        caps.permissions
-            .insert("statuses".into(), "read".into());
+        caps.permissions.insert("statuses".into(), "read".into());
         let gaps = missing(ForgeKind::GitHub, &caps);
-        assert_eq!(gaps.iter().map(|r| r.name).collect::<Vec<_>>(), vec!["statuses"]);
+        assert_eq!(
+            gaps.iter().map(|r| r.name).collect::<Vec<_>>(),
+            vec!["statuses"]
+        );
     }
 
     #[test]

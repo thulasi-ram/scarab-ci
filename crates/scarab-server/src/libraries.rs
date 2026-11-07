@@ -1278,9 +1278,7 @@ pub(crate) async fn yank_impact(
             .steps_of_run(&run)
             .await?
             .into_iter()
-            .filter(|s| {
-                s.status == scarab_engine::StepStatus::Running && using.contains(&s.step.0)
-            })
+            .filter(|s| s.status == scarab_engine::StepStatus::Running && using.contains(&s.step.0))
             .map(|s| s.step.0)
             .collect();
         running += running_steps.len();

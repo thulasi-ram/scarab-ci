@@ -331,6 +331,45 @@ async function send(path: string, method: string, body?: unknown): Promise<Respo
   return res;
 }
 
+/** The subprotocols the debug shell's WebSocket offers. A browser cannot
+ * send `x-csrf-token` on a WebSocket handshake, so the CSRF token rides as
+ * the `scarab.csrf.<token>` entry; the server answers with `scarab.v1`. */
+export function shellProtocols(csrf: string | undefined): string[] {
+  return csrf ? ["scarab.v1", `scarab.csrf.${csrf}`] : ["scarab.v1"];
+}
+
+/**
+ * Open the debug shell's WebSocket: `attach` (the live step Pod) or
+ * `debug-pod` (a fresh Pod of a finished step). Returns the socket, or the
+ * reason it cannot open.
+ *
+ * Both are crown jewels that need a step-up window, and a refused WebSocket
+ * handshake tells the page nothing. So a plain GET of the same URL goes
+ * first, through the usual step-up retry: the server asks for the window
+ * there, and the human confirms it. That GET carries no upgrade headers, so
+ * the server never opens a shell for it.
+ */
+export async function openShellSocket(
+  runId: string,
+  step: string,
+  mode: "attach" | "debug-pod",
+): Promise<WebSocket | string> {
+  const path = `/v1/runs/${encodeURIComponent(runId)}/steps/${encodeURIComponent(step)}/${mode}`;
+  const csrf = csrfToken();
+  const init: RequestInit = { headers: csrf ? { "x-csrf-token": csrf } : {} };
+  const probe = await withStepUp(await fetch(path, init), () => fetch(path, init), stepUpCeremony);
+  if (probe.status === 401) {
+    setUnauthenticated(true);
+    return "You are signed out.";
+  }
+  if (probe.status === 403) {
+    const text = await probe.text().catch(() => "");
+    return errorMessage(text, "You may not open a shell here: it needs Administer and a step-up.");
+  }
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  return new WebSocket(`${proto}://${location.host}${path}`, shellProtocols(csrf));
+}
+
 /** The configured login providers (`GET /v1/auth/providers`) — readable before
  * sign-in. Best-effort: an older server without the route yields `[]`, which
  * the sign-in page treats as "one provider, the default". */
@@ -347,6 +386,35 @@ export async function beginLinkIdentity(provider: string): Promise<string> {
   const res = await send("/v1/me/identities/link", "POST", { provider });
   const body = (await res.json()) as components["schemas"]["LinkIdentityResponse"];
   return body.authorize_url;
+}
+
+/** A merge waiting for a passkey of the account it folds in
+ * (`GET /v1/me/identities/merges/{id}`). */
+export type IdentityMerge = components["schemas"]["IdentityMergeDto"];
+
+export async function getIdentityMerge(id: string): Promise<IdentityMerge> {
+  const { data, error, response } = await api.GET("/v1/me/identities/merges/{id}", {
+    params: { path: { id } },
+  });
+  if (error || !data) {
+    if (response.status === 404) throw new Error("This merge has expired or was already used. Link the account again.");
+    throw new Error(errorText(error) || `could not load the merge (${response.status})`);
+  }
+  return data;
+}
+
+/** Confirm a merge with the merged account's passkey
+ * (`POST /v1/me/identities/merges/{id}`). */
+export async function confirmIdentityMerge(
+  id: string,
+  credential: Record<string, unknown>,
+): Promise<components["schemas"]["IdentityMergedDto"]> {
+  const { data, error, response } = await api.POST("/v1/me/identities/merges/{id}", {
+    params: { path: { id } },
+    body: { credential: credential as Record<string, never> },
+  });
+  if (error || !data) throw new Error(errorText(error) || `the merge failed (${response.status})`);
+  return data;
 }
 
 /** Unlink this person's account on `provider` (`DELETE /v1/me/identities/…`);
@@ -1478,12 +1546,8 @@ export async function cancelRun(id: string): Promise<void> {
 }
 
 /** The approvals recorded on a manual gate, and whether they released it.
- *
- * `approvals` is OPTIONAL on purpose: the handler emits two shapes. The normal
- * path returns `{approvals, released}`, but the late/duplicate-approval branch
- * returns only `{released: true}`. Reading `.approvals.length` unguarded throws
- * on that second shape. */
-export type GateApproval = { approvals?: string[]; released: boolean; releases_at?: number | null };
+ * `approvals` is absent when the gate had already released. */
+export type GateApproval = components["schemas"]["GateApprovalDto"];
 
 /** Approve a `manual` gate. Append-only and idempotent: the
  * principal's approval is RECORDED, and the gate releases only once the
@@ -1498,12 +1562,8 @@ export async function approveGate(id: string, step: string): Promise<GateApprova
   const { data, error } = await api.POST("/v1/runs/{id}/gates/{step}/approve", {
     params: { path: { id, step } },
   });
-  if (error) throw new Error(`failed to approve gate ${step}`);
-  // `as unknown` is required, not sloppiness: the 202 declares no response body
-  // in the OpenAPI spec (the handler returns an ad-hoc `Json(json!(…))` rather
-  // than a ToSchema DTO), so the generated type for `data` is `undefined`.
-  // Worth fixing at source, which would also settle the two-shapes wrinkle above.
-  return data as unknown as GateApproval;
+  if (error || !data) throw new Error(`failed to approve gate ${step}`);
+  return data;
 }
 
 /** Reject a waiting gate — fail it with a reason (`POST …/gates/{step}/reject`,

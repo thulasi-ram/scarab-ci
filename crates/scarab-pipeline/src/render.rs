@@ -155,9 +155,7 @@ pub fn render(
             let sources = InputSources::of(scope, declared);
             let command = arguments(templates.command, &sources, false, |expr| {
                 Ok(known.as_ref().and_then(|(ctx, k)| {
-                    k.covers(expr)
-                        .then(|| cel::eval(expr, ctx).ok())
-                        .flatten()
+                    k.covers(expr).then(|| cel::eval(expr, ctx).ok()).flatten()
                 }))
             })?;
             // An image the launch refuses is not known: a policy must not
@@ -399,7 +397,7 @@ pub(crate) fn guard_holds(
         None,
         Mode::Guard,
     )
-        .map_err(crate::PipelineError::Cel)?;
+    .map_err(crate::PipelineError::Cel)?;
     let mut ctx = bound.ctx;
     ctx.remove("outputs");
     cel::eval_bool(expr, &Value::Object(ctx))
@@ -521,12 +519,9 @@ fn bind(
                 None
             } else if mode == Mode::Preview {
                 // A preview renders what it can and leaves the rest.
-                scope
-                    .caller
-                    .as_deref()
-                    .and_then(|c| {
-                        bind(Some(c), &BTreeMap::new(), params, event, results, mode).ok()
-                    })
+                scope.caller.as_deref().and_then(|c| {
+                    bind(Some(c), &BTreeMap::new(), params, event, results, mode).ok()
+                })
             } else {
                 let caller = scope.caller.as_deref().ok_or_else(|| {
                     "a caller's `with:` value has no caller scope to render in".to_string()
@@ -966,8 +961,15 @@ mod tests {
         .unwrap_err();
         assert!(e.contains("no caller scope"), "{e}");
         // A preview never fails: what it cannot render stays as written.
-        let p =
-            |image: &str| preview_image(image, Some(&scope), &BTreeMap::new(), &BTreeMap::new(), &serde_json::Map::new());
+        let p = |image: &str| {
+            preview_image(
+                image,
+                Some(&scope),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &serde_json::Map::new(),
+            )
+        };
         assert_eq!(p("app:${{ inputs.v }}"), "app:${{ inputs.v }}");
         assert_eq!(
             p("app:${{ event.x }}-${{ 1 + }}"),
@@ -1001,7 +1003,13 @@ mod tests {
         ]);
         let params = map(json!({ "d": "sha256:def" }));
         let p = |image: &str, scope: Option<&Scope>| {
-            preview_image(image, scope, &BTreeMap::new(), &params, &serde_json::Map::new())
+            preview_image(
+                image,
+                scope,
+                &BTreeMap::new(),
+                &params,
+                &serde_json::Map::new(),
+            )
         };
         assert_eq!(p("img@${{ inputs.lit }}", Some(&scope)), "img@sha256:abc");
         // A caller's template that reads a launch parameter is known; one
@@ -1048,27 +1056,67 @@ mod tests {
         for (command, scope, at, shown) in [
             (&["git", "${{ inputs.p }}"][..], None, 1, "${{ inputs.p }}"),
             (&["--ref=${{ inputs.p }}"], None, 0, "${{ inputs.p }}"),
-            (&["sh", "-c", "x ${{ inputs.p }}"], None, 2, "${{ inputs.p }}"),
-            (&["x", "${{ inputs.undeclared }}"], None, 1, "${{ inputs.undeclared }}"),
+            (
+                &["sh", "-c", "x ${{ inputs.p }}"],
+                None,
+                2,
+                "${{ inputs.p }}",
+            ),
+            (
+                &["x", "${{ inputs.undeclared }}"],
+                None,
+                1,
+                "${{ inputs.undeclared }}",
+            ),
             // A result, even a number or a boolean: results have no type.
             (&["x", "${{ outputs.a.v }}"], None, 1, "${{ outputs.a.v }}"),
-            (&["x", "${{ outputs.a.flag }}"], None, 1, "${{ outputs.a.flag }}"),
+            (
+                &["x", "${{ outputs.a.flag }}"],
+                None,
+                1,
+                "${{ outputs.a.flag }}",
+            ),
             // Computed from free text, or from everything.
-            (&["x", "${{ size(inputs.p) }}"], None, 1, "${{ size(inputs.p) }}"),
-            (&["x", "${{ size(inputs) }}"], None, 1, "${{ size(inputs) }}"),
+            (
+                &["x", "${{ size(inputs.p) }}"],
+                None,
+                1,
+                "${{ size(inputs.p) }}",
+            ),
+            (
+                &["x", "${{ size(inputs) }}"],
+                None,
+                1,
+                "${{ size(inputs) }}",
+            ),
             // An event field that is not of a fixed shape (`event.sha` is,
             // see `a_fixed_event_value_reaches_a_command_checked_at_launch` in lib.rs).
-            (&["x", "${{ event.branch }}"], None, 1, "${{ event.branch }}"),
-            (&["x", "${{ event.sha + event.ref }}"], None, 1, "${{ event.sha + event.ref }}"),
+            (
+                &["x", "${{ event.branch }}"],
+                None,
+                1,
+                "${{ event.branch }}",
+            ),
+            (
+                &["x", "${{ event.sha + event.ref }}"],
+                None,
+                1,
+                "${{ event.sha + event.ref }}",
+            ),
             // A library's string input bound to a caller's number: the
             // library declared free text.
-            (&["x", "${{ inputs.s }}"], Some(&scope), 1, "${{ inputs.s }}"),
+            (
+                &["x", "${{ inputs.s }}"],
+                Some(&scope),
+                1,
+                "${{ inputs.s }}",
+            ),
         ] {
-            let e = launch_declared(&declared, command, scope, &matrix, &params, &res)
-                .unwrap_err();
+            let e = launch_declared(&declared, command, scope, &matrix, &params, &res).unwrap_err();
             assert!(
-                e.starts_with(&format!("`command[{at}]`: `{shown}` reads a value from outside"))
-                    && e.contains("pass it in `env:`"),
+                e.starts_with(&format!(
+                    "`command[{at}]`: `{shown}` reads a value from outside"
+                )) && e.contains("pass it in `env:`"),
                 "{command:?}: {e}"
             );
             // The preview refuses it too, known or not.
@@ -1138,28 +1186,54 @@ mod tests {
         .unwrap();
         assert_eq!(r.command, ["deploy", "eu", "n=3", "true", "false", "eu"]);
         assert_eq!(
-            run(&["x", "${{ inputs.n }}"], json!({ "n": 1.5 })).unwrap().command,
+            run(&["x", "${{ inputs.n }}"], json!({ "n": 1.5 }))
+                .unwrap()
+                .command,
             ["x", "1.5"]
         );
         // What does not fit its shape is refused at launch, naming it.
         for (command, params, what) in [
             // A sign: `-1` is an option once a program reads it.
-            (&["x", "${{ inputs.n }}"][..], json!({ "n": -1 }), "the number `-1`"),
-            (&["x", "${{ inputs.n - 10 }}"], json!({ "n": 3 }), "the number `-7`"),
-            (&["x", "${{ inputs.n }}"], json!({ "n": 1e300 }), "the number `1e+300`"),
+            (
+                &["x", "${{ inputs.n }}"][..],
+                json!({ "n": -1 }),
+                "the number `-1`",
+            ),
+            (
+                &["x", "${{ inputs.n - 10 }}"],
+                json!({ "n": 3 }),
+                "the number `-7`",
+            ),
+            (
+                &["x", "${{ inputs.n }}"],
+                json!({ "n": 1e300 }),
+                "the number `1e+300`",
+            ),
             // A value the Pipeline did not list (a parameter that skipped
             // Run creation's check).
-            (&["x", "${{ inputs.region }}"], json!({ "region": "--x" }), "text that is not"),
+            (
+                &["x", "${{ inputs.region }}"],
+                json!({ "region": "--x" }),
+                "text that is not",
+            ),
             // Text built from a choice is not a listed value.
             (
                 &["x", "${{ inputs.region + '-x' }}"],
                 json!({ "region": "eu" }),
                 "text that is not",
             ),
-            (&["x", "${{ inputs.b ? 'a' : 'b' }}"], json!({ "b": true }), "text that is not"),
+            (
+                &["x", "${{ inputs.b ? 'a' : 'b' }}"],
+                json!({ "b": true }),
+                "text that is not",
+            ),
             (&["x", "${{ [inputs.n] }}"], json!({ "n": 1 }), "a list"),
             (&["x", "${{ {'a': inputs.n} }}"], json!({ "n": 1 }), "a map"),
-            (&["x", "${{ inputs.b ? null : 1 }}"], json!({ "b": true }), "null"),
+            (
+                &["x", "${{ inputs.b ? null : 1 }}"],
+                json!({ "b": true }),
+                "null",
+            ),
         ] {
             let e = run(command, params).unwrap_err();
             assert!(
@@ -1198,11 +1272,16 @@ mod tests {
             )
         };
         assert_eq!(
-            lib(json!({ "a": { "n": "4", "w": "us-east" } })).unwrap().command,
+            lib(json!({ "a": { "n": "4", "w": "us-east" } }))
+                .unwrap()
+                .command,
             ["x", "4", "us-east"]
         );
         let e = lib(json!({ "a": { "n": "4", "w": "ap" } })).unwrap_err();
-        assert!(e.contains("input `where`") && e.contains("allowed choices"), "{e}");
+        assert!(
+            e.contains("input `where`") && e.contains("allowed choices"),
+            "{e}"
+        );
         let e = lib(json!({ "a": { "n": -2, "w": "eu" } })).unwrap_err();
         assert!(e.contains("the number `-2`"), "{e}");
 
@@ -1224,7 +1303,10 @@ mod tests {
                 },
             )
         };
-        assert_eq!(preview(json!({})).unwrap().command, ["x", "${{ inputs.n }}"]);
+        assert_eq!(
+            preview(json!({})).unwrap().command,
+            ["x", "${{ inputs.n }}"]
+        );
         let e = run(&["x", "${{ inputs.n }}"], json!({ "n": -1 })).unwrap_err();
         let command = vec!["x".to_string(), "${{ inputs.n }}".to_string()];
         let p = render(

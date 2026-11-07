@@ -87,7 +87,9 @@ fn fork_pr() -> Event {
 fn long_lived(files: &[(&str, &str)]) -> FakeForge {
     files
         .iter()
-        .fold(FakeForge::new(), |f, (path, yaml)| f.with_file(*path, *yaml))
+        .fold(FakeForge::new(), |f, (path, yaml)| {
+            f.with_file(*path, *yaml)
+        })
         .with_commit("refs/heads/main", SHA)
 }
 
@@ -190,10 +192,17 @@ async fn a_repositorys_own_forge_token_step_on_a_long_lived_connection_is_refuse
     let db = InMemoryDb::new();
     let libs = with_first_party_clone().await;
     let forge = long_lived(&[(".scarab/ci.yaml", OWN_STEP_YAML)]);
-    let out = trigger(&db, &forge, AdmissionPorts::default().with_libraries(&libs), &push()).await;
+    let out = trigger(
+        &db,
+        &forge,
+        AdmissionPorts::default().with_libraries(&libs),
+        &push(),
+    )
+    .await;
     let reason = refused_reason(&out);
     assert!(
-        reason.contains("step `tag`") && reason.contains("a repository's own Steps never receive it"),
+        reason.contains("step `tag`")
+            && reason.contains("a repository's own Steps never receive it"),
         "{reason}"
     );
     assert_eq!(forge.credential_calls(), 0);
@@ -201,9 +210,18 @@ async fn a_repositorys_own_forge_token_step_on_a_long_lived_connection_is_refuse
     // The same Step on a GitHub App connection, which mints a short-lived
     // repository token: admitted.
     let forge = minting(&[(".scarab/ci.yaml", OWN_STEP_YAML)]);
-    let out = trigger(&db, &forge, AdmissionPorts::default().with_libraries(&libs), &push()).await;
+    let out = trigger(
+        &db,
+        &forge,
+        AdmissionPorts::default().with_libraries(&libs),
+        &push(),
+    )
+    .await;
     assert_eq!(out.runs.len(), 1, "{:?}", out.refused);
-    assert_eq!(stored_token(&db, &out.runs[0], "tag").await, Some(ForgeToken::Read));
+    assert_eq!(
+        stored_token(&db, &out.runs[0], "tag").await,
+        Some(ForgeToken::Read)
+    );
 }
 
 /// The trusted first-party clone library's Step on a long-lived connection:
@@ -225,13 +243,19 @@ async fn the_first_party_clone_step_gets_the_credential_and_no_env_carries_it() 
     assert_eq!(out.runs.len(), 1, "{:?}", out.refused);
     let run = out.runs[0].clone();
     let git = StepId("checkout/git".into());
-    assert_eq!(stored_token(&db, &run, "checkout/git").await, Some(ForgeToken::Read));
+    assert_eq!(
+        stored_token(&db, &run, "checkout/git").await,
+        Some(ForgeToken::Read)
+    );
     // Trusted only for a long-lived token: it consumes no workspace, so no
     // file `prep` wrote is in /workspace while the token is mounted.
     assert_eq!(db.step_inputs(&run, &git).await.unwrap(), Some(vec![]));
     let facts = db.run_event_facts(&run).await.unwrap();
     assert_eq!(facts["sha"], SHA);
-    assert_eq!(facts["repo"]["clone_url"], "https://github.com/acme/web.git");
+    assert_eq!(
+        facts["repo"]["clone_url"],
+        "https://github.com/acme/web.git"
+    );
 
     let inner = Arc::new(FakeExecutor::new());
     // Each launch on a long-lived connection checks the org still trusts
@@ -245,7 +269,10 @@ async fn the_first_party_clone_step_gets_the_credential_and_no_env_carries_it() 
         sched.tick(&run).await.unwrap();
     }
     let attempts = db.attempts_of_step(&run, &git).await.unwrap();
-    let handle = ExecHandle(format!("fake://{}/checkout/git/{}", run.0, attempts[0].id.0));
+    let handle = ExecHandle(format!(
+        "fake://{}/checkout/git/{}",
+        run.0, attempts[0].id.0
+    ));
     let spec = inner.launched_spec(&handle).expect("checkout/git launched");
     let cred = spec
         .forge_token
@@ -317,7 +344,13 @@ async fn a_clone_copy_that_is_not_first_party_is_refused_a_long_lived_token() {
     )
     .await;
     let forge = long_lived(&[(".scarab/ci.yaml", CHECKOUT_YAML)]);
-    let out = trigger(&db, &forge, AdmissionPorts::default().with_libraries(&libs), &push()).await;
+    let out = trigger(
+        &db,
+        &forge,
+        AdmissionPorts::default().with_libraries(&libs),
+        &push(),
+    )
+    .await;
     assert!(refused_reason(&out).contains("step `checkout/git`"));
 }
 
@@ -341,11 +374,18 @@ steps:
 async fn trust_follows_the_source_across_upgrades() {
     let db = InMemoryDb::new();
     let libs = InMemoryLibraries::new();
-    let at = |commit: char| format!("github.com/acme/libs//pusher.yaml@{}", commit.to_string().repeat(40));
+    let at = |commit: char| {
+        format!(
+            "github.com/acme/libs//pusher.yaml@{}",
+            commit.to_string().repeat(40)
+        )
+    };
     install(&libs, "acme", "pusher", PUSHER, &at('1'), false).await;
     let forge = long_lived(&[(".scarab/ci.yaml", PUSHER_YAML)]);
     let ports = || AdmissionPorts::default().with_libraries(&libs);
-    assert!(refused_reason(&trigger(&db, &forge, ports(), &push()).await).contains("step `sync/git`"));
+    assert!(
+        refused_reason(&trigger(&db, &forge, ports(), &push()).await).contains("step `sync/git`")
+    );
 
     libs.trust_source(&TrustedSource {
         org: "acme".into(),
@@ -376,14 +416,18 @@ async fn trust_follows_the_source_across_upgrades() {
         false,
     )
     .await;
-    assert!(refused_reason(&trigger(&db, &forge, ports(), &push()).await).contains("step `sync/git`"));
+    assert!(
+        refused_reason(&trigger(&db, &forge, ports(), &push()).await).contains("step `sync/git`")
+    );
 
     // Untrusting refuses again.
     install(&libs, "acme", "pusher", &v2, &at('2'), false).await;
     libs.untrust_source("acme", "github.com/acme/libs//pusher.yaml")
         .await
         .unwrap();
-    assert!(refused_reason(&trigger(&db, &forge, ports(), &push()).await).contains("step `sync/git`"));
+    assert!(
+        refused_reason(&trigger(&db, &forge, ports(), &push()).await).contains("step `sync/git`")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -405,7 +449,10 @@ async fn a_fork_pull_request_gets_read_even_if_write_is_asked() {
     let forge = minting(&[(".scarab/ci.yaml", WRITE_YAML)]);
     let out = trigger(&db, &forge, AdmissionPorts::default(), &fork_pr()).await;
     assert_eq!(out.runs.len(), 1, "{:?}", out.refused);
-    assert_eq!(stored_token(&db, &out.runs[0], "tag").await, Some(ForgeToken::Read));
+    assert_eq!(
+        stored_token(&db, &out.runs[0], "tag").await,
+        Some(ForgeToken::Read)
+    );
 }
 
 /// `write` on a Forgejo or PAT connection: refused, whoever asks.
@@ -473,15 +520,31 @@ async fn write_needs_an_environment_that_restricts_refs() {
     // Governed, but any ref may deploy.
     let forge = minting(&[(".scarab/deploy.yaml", DEPLOY_WRITE_YAML)]);
     let open = prod(&[], &[]).await;
-    let reason =
-        refused_reason(&trigger(&db, &forge, AdmissionPorts::governance(Some(&open)), &push()).await);
+    let reason = refused_reason(
+        &trigger(
+            &db,
+            &forge,
+            AdmissionPorts::governance(Some(&open)),
+            &push(),
+        )
+        .await,
+    );
     assert!(reason.contains("restricts the refs"), "{reason}");
 
     // Governed, refs restricted, no approvers: admitted with `write`.
     let main_only = prod(&["refs/heads/main"], &[]).await;
-    let out = trigger(&db, &forge, AdmissionPorts::governance(Some(&main_only)), &push()).await;
+    let out = trigger(
+        &db,
+        &forge,
+        AdmissionPorts::governance(Some(&main_only)),
+        &push(),
+    )
+    .await;
     assert_eq!(out.runs.len(), 1, "{:?}", out.refused);
-    assert_eq!(stored_token(&db, &out.runs[0], "tag").await, Some(ForgeToken::Write));
+    assert_eq!(
+        stored_token(&db, &out.runs[0], "tag").await,
+        Some(ForgeToken::Write)
+    );
 }
 
 /// Where the Environment has approvers, `write` needs a manual gate
@@ -518,8 +581,9 @@ async fn write_needs_a_manual_gate_where_the_environment_has_approvers() {
     gov.put_environment_protection("acme", "prod", &refusing, "amy", 2)
         .await
         .unwrap();
-    let reason =
-        refused_reason(&trigger(&db, &forge, AdmissionPorts::governance(Some(&gov)), &push()).await);
+    let reason = refused_reason(
+        &trigger(&db, &forge, AdmissionPorts::governance(Some(&gov)), &push()).await,
+    );
     assert!(reason.contains("gate: manual"), "{reason}");
 
     let forge = minting(&[(".scarab/deploy.yaml", GATED_WRITE_YAML)]);
@@ -624,7 +688,13 @@ async fn without_approvers(gov: &InMemoryEnvironmentGovernance) -> EnvironmentPr
 async fn a_rerun_mints_again() {
     let db = Arc::new(InMemoryDb::new());
     let forge = Arc::new(minting(&[(".scarab/ci.yaml", OWN_STEP_YAML)]));
-    let out = trigger(db.as_ref(), forge.as_ref(), AdmissionPorts::default(), &push()).await;
+    let out = trigger(
+        db.as_ref(),
+        forge.as_ref(),
+        AdmissionPorts::default(),
+        &push(),
+    )
+    .await;
     let run = out.runs[0].clone();
     let inner = Arc::new(FakeExecutor::new());
     let exec = ForgeCredentialExecutor::new(inner.clone(), forge.clone());
@@ -634,18 +704,31 @@ async fn a_rerun_mints_again() {
     for _ in 0..4 {
         sched.tick(&run).await.unwrap();
     }
-    assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Succeeded));
+    assert_eq!(
+        db.run_status(&run).await.unwrap(),
+        Some(RunStatus::Succeeded)
+    );
     assert_eq!(forge.credential_calls(), 1);
     assert_eq!(forge.revoked().len(), 1, "revoked when the Attempt ended");
 
-    scarab_engine::rerun_step(db.as_ref(), &clock, &run, &StepId("tag".into()), Some("amy".into()))
-        .await
-        .unwrap();
+    scarab_engine::rerun_step(
+        db.as_ref(),
+        &clock,
+        &run,
+        &StepId("tag".into()),
+        Some("amy".into()),
+    )
+    .await
+    .unwrap();
     inner.script_outcome(ExecState::Succeeded);
     for _ in 0..4 {
         sched.tick(&run).await.unwrap();
     }
-    assert_eq!(forge.credential_calls(), 2, "the rerun's Attempt minted its own");
+    assert_eq!(
+        forge.credential_calls(),
+        2,
+        "the rerun's Attempt minted its own"
+    );
     let revoked = forge.revoked();
     assert_eq!(revoked.len(), 2);
     assert_ne!(revoked[0], revoked[1]);
@@ -679,12 +762,20 @@ async fn a_bad_branch_refuses_only_the_pipelines_that_read_it() {
         (".scarab/b.yaml", READS_SHA_ONLY),
     ])
     .with_commit("refs/heads/x;id", SHA);
-    let out = trigger(&db, &forge, AdmissionPorts::default(), &push_to("refs/heads/x;id")).await;
+    let out = trigger(
+        &db,
+        &forge,
+        AdmissionPorts::default(),
+        &push_to("refs/heads/x;id"),
+    )
+    .await;
     assert_eq!(out.runs.len(), 1, "{:?}", out.refused);
     assert_eq!(out.refused.len(), 1);
     assert_eq!(out.refused[0].pipeline, ".scarab/a.yaml");
     assert!(
-        out.refused[0].reason.contains("`${{ event.branch }}` does not accept")
+        out.refused[0]
+            .reason
+            .contains("`${{ event.branch }}` does not accept")
             && out.refused[0].reason.contains("contains `;`"),
         "{}",
         out.refused[0].reason
@@ -708,7 +799,13 @@ async fn reading_event_sha_on_a_trigger_without_one_refuses_the_run() {
         repo: repo(),
         tag: "v1".into(),
     };
-    let out = trigger(&db, &forge, AdmissionPorts::default().with_libraries(&libs), &tag).await;
+    let out = trigger(
+        &db,
+        &forge,
+        AdmissionPorts::default().with_libraries(&libs),
+        &tag,
+    )
+    .await;
     let reason = refused_reason(&out);
     assert!(
         reason.contains("`${{ event.sha }}`, which a `tag` trigger does not have"),
@@ -722,8 +819,17 @@ async fn a_clone_step_fails_naming_the_library() {
     let db = InMemoryDb::new();
     let yaml = "on: { push: {} }\nsteps: [{ id: checkout, clone: {} }]\n";
     let forge = long_lived(&[(".scarab/ci.yaml", yaml)]);
-    let err = trigger_runs_from_event(&forge, &db, &FakeClock::new(1), AdmissionPorts::default(), &push())
-        .await
-        .unwrap_err();
-    assert!(err.to_string().contains("invoke: lib:thulasi-ram/clone"), "{err}");
+    let err = trigger_runs_from_event(
+        &forge,
+        &db,
+        &FakeClock::new(1),
+        AdmissionPorts::default(),
+        &push(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("invoke: lib:thulasi-ram/clone"),
+        "{err}"
+    );
 }

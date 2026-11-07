@@ -1630,10 +1630,7 @@ mod tests {
                 },
                 TriggerKind::Comment,
             ),
-            (
-                cron("0 * * * *"),
-                TriggerKind::Cron,
-            ),
+            (cron("0 * * * *"), TriggerKind::Cron),
             (
                 Event::Manual {
                     actor: "u".into(),
@@ -1702,10 +1699,7 @@ mod tests {
             Some("alice")
         );
         // Internally-originated events have no forge principal.
-        assert_eq!(
-            cron("0 * * * *").actor(),
-            None
-        );
+        assert_eq!(cron("0 * * * *").actor(), None);
         // An empty stored login (payload had no sender) reads as None, not "".
         assert_eq!(
             Event::Push {

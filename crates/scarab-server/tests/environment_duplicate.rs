@@ -927,3 +927,124 @@ async fn the_display_name_is_edited_without_a_step_up() {
 
     f.tdb.cleanup().await;
 }
+
+/// git-bug 52964b4: an Environment secret needs its Environment. A secret
+/// written into a Duplicate's target while the Duplicate runs is refused
+/// (the target does not exist until the Duplicate creates it), so the
+/// Duplicate neither overwrites nor deletes an admin's secret.
+#[tokio::test]
+async fn a_secret_write_into_a_duplicates_target_is_409_and_none_is_lost() {
+    let Some((f, paused, resume)) = pausing_fixture().await else {
+        return;
+    };
+    let h = &f.h;
+    let (s, mut soft) = signed_in_admin(h).await;
+    h.open_window(&s, &mut soft).await;
+    let uri = format!("{PROD}/duplicate");
+
+    let ((st, b), (written, written_body)) = tokio::join!(
+        h.cookie("POST", &uri, Some(json!({ "name": "prod-eu" })), &s),
+        async {
+            paused.notified().await;
+            let answer = h
+                .cookie(
+                    "POST",
+                    "/v1/secrets",
+                    Some(json!({
+                        "org": "acme", "repo": "web", "environment": "prod-eu",
+                        "name": "DB_PASSWORD", "value": "hand-written"
+                    })),
+                    &s,
+                )
+                .await;
+            resume.notify_one();
+            answer
+        }
+    );
+    assert_eq!(written, StatusCode::CONFLICT, "{written_body}");
+    assert!(
+        written_body.to_string().contains("does not exist"),
+        "{written_body}"
+    );
+    assert_eq!(st, StatusCode::CREATED, "{b}");
+    let (_, _, secrets) = snapshot(&f, "prod-eu").await;
+    assert_eq!(
+        secrets,
+        vec![
+            ("api/DB_PASSWORD".to_string(), b"api-pw".to_vec()),
+            ("web/API_KEY".to_string(), b"web-key".to_vec()),
+            ("web/DB_PASSWORD".to_string(), b"web-pw".to_vec()),
+        ]
+    );
+
+    f.tdb.cleanup().await;
+}
+
+/// git-bug 52964b4: a secret under a name with no Environment is refused,
+/// and an Environment that holds secrets is not deleted (409, naming the
+/// Project) until they are, so no secret outlives its Environment or waits
+/// for a later Environment of the same name.
+#[tokio::test]
+async fn an_environment_secret_lives_only_while_its_environment_does() {
+    let Some(f) = fixture(|s| s).await else {
+        return;
+    };
+    let h = &f.h;
+    let (s, mut soft) = signed_in_admin(h).await;
+    h.open_window(&s, &mut soft).await;
+    let write = |environment: &str| {
+        json!({
+            "org": "acme", "repo": "web", "environment": environment,
+            "name": "TOKEN", "value": "t"
+        })
+    };
+
+    let (st, b) = h.cookie("POST", "/v1/secrets", Some(write("qa")), &s).await;
+    assert_eq!(st, StatusCode::CONFLICT, "no `qa` yet: {b}");
+
+    let qa = "/v1/orgs/acme/environments/qa";
+    let (st, b) = h.cookie("PUT", qa, Some(json!({})), &s).await;
+    assert!(st.is_success(), "{st} {b}");
+    let (st, b) = h.cookie("POST", "/v1/secrets", Some(write("qa")), &s).await;
+    assert_eq!(st, StatusCode::NO_CONTENT, "{b}");
+
+    let (st, b) = h.cookie("DELETE", qa, None, &s).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{b}");
+    assert!(b.to_string().contains("`web`"), "{b}");
+
+    let (st, b) = h
+        .cookie(
+            "DELETE",
+            "/v1/secrets?org=acme&repo=web&environment=qa&name=TOKEN",
+            None,
+            &s,
+        )
+        .await;
+    assert_eq!(st, StatusCode::NO_CONTENT, "{b}");
+    let (st, b) = h.cookie("DELETE", qa, None, &s).await;
+    assert_eq!(st, StatusCode::NO_CONTENT, "{b}");
+
+    f.tdb.cleanup().await;
+}
+
+/// git-bug 52964b4: secrets already left under a name with no Environment
+/// (here `web`'s under `staging`) are listed by name, so an admin can
+/// delete them. Live Environments' secrets are not listed.
+#[tokio::test]
+async fn orphaned_secrets_lists_the_secrets_of_environments_that_do_not_exist() {
+    let Some(f) = fixture(|s| s).await else {
+        return;
+    };
+    let h = &f.h;
+    let (s, _soft) = signed_in_admin(h).await;
+    let (st, b) = h
+        .cookie("GET", "/v1/orgs/acme/secrets/orphaned", None, &s)
+        .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(
+        b,
+        json!([{ "environment": "staging", "project": "web", "keys": ["DB_PASSWORD"] }])
+    );
+
+    f.tdb.cleanup().await;
+}

@@ -874,7 +874,7 @@
           "Auth & Identity"
         ],
         "summary": "Begin linking another sign-in account (ADR-0069)",
-        "description": "A link that would fold in a Principal holding passkeys is refused at the\ncallback (the merge would move them to the caller): it needs\n`POST /v1/me/identities/link-moving-passkeys`, which always asks.",
+        "description": "A merge of a Principal that holds passkeys also needs one of its passkeys\n(ADR-0079 §2): the callback sends the browser to confirm it\n(`…/merges/{id}`), and nothing changes until then.",
         "operationId": "begin_link_identity",
         "requestBody": {
           "content": {
@@ -921,18 +921,73 @@
         ]
       }
     },
-    "/v1/me/identities/link-moving-passkeys": {
+    "/v1/me/identities/merges/{id}": {
+      "get": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "A merge waiting for the merged account's passkey (ADR-0079)",
+        "operationId": "identity_merge",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "the merge id from the link callback",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IdentityMergeDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "not a browser session"
+          },
+          "404": {
+            "description": "no such pending merge in this session, used, or expired"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      },
       "post": {
         "tags": [
           "Auth & Identity"
         ],
-        "summary": "Begin linking another sign-in account whose Principal holds passkeys (ADR-0069)",
-        "operationId": "begin_link_identity_moving_passkeys",
+        "summary": "Confirm a merge with the merged account's passkey (ADR-0079)",
+        "operationId": "confirm_identity_merge",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "the merge id from the link callback",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/LinkIdentityRequest"
+                "$ref": "#/components/schemas/ConfirmIdentityMergeRequest"
               }
             }
           },
@@ -944,23 +999,19 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/LinkIdentityResponse"
+                  "$ref": "#/components/schemas/IdentityMergedDto"
                 }
               }
             }
+          },
+          "400": {
+            "description": "the merge is unknown, used, expired or another session's, or the passkey is not one of the merged account's (`code` names the check)"
           },
           "403": {
-            "description": "not a browser session — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/StepUpRefusal"
-                }
-              }
-            }
+            "description": "not a browser session"
           },
-          "429": {
-            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
+          "409": {
+            "description": "the sign-in or the merged account changed since the merge was started"
           }
         },
         "security": [
@@ -1951,7 +2002,7 @@
           "Environments"
         ],
         "summary": "Delete an org Environment (ADR-0071)",
-        "description": "Refused (409) while any Project holds an overlay or privilege grant in\nit (ADR-0071 §3, §8: those are never dropped as a side effect).",
+        "description": "Refused (409) while any Project holds an overlay or privilege grant in\nit (ADR-0071 §3, §8: those are never dropped as a side effect), and while\nany Project holds a secret in it (git-bug 52964b4): a secret never\noutlives its Environment, and is never dropped as a side effect either.",
         "operationId": "delete_org_environment",
         "parameters": [
           {
@@ -1991,7 +2042,7 @@
             "description": "no such Environment, or not configured"
           },
           "409": {
-            "description": "project overlays or grants still pin the Environment"
+            "description": "project overlays, grants or secrets still pin the Environment"
           },
           "429": {
             "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
@@ -5359,6 +5410,55 @@
         ]
       }
     },
+    "/v1/orgs/{org}/secrets/orphaned": {
+      "get": {
+        "tags": [
+          "Secrets"
+        ],
+        "summary": "Secrets under Environment names that no longer exist",
+        "operationId": "list_orphaned_secrets",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/OrphanedSecretsDto"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "not an org admin"
+          },
+          "404": {
+            "description": "secrets or Environments not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
     "/v1/orgs/{org}/security/events": {
       "get": {
         "tags": [
@@ -6940,10 +7040,17 @@
         ],
         "responses": {
           "202": {
-            "description": "approval recorded (released or awaiting more approvals)"
+            "description": "approval recorded: the gate released, or it waits for more approvals or for its wait timer",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GateApprovalDto"
+                }
+              }
+            }
           },
           "403": {
-            "description": "`step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. Or the caller's role is insufficient.",
+            "description": "the caller may not approve (insufficient role), a step-up is required (`step_up_required`, JSON), or a `gate.resolve` Policy refused the approval or holds the gate (plain text naming the Policy)",
             "content": {
               "application/json": {
                 "schema": {
@@ -8160,6 +8267,9 @@
           "404": {
             "description": "secrets not configured"
           },
+          "409": {
+            "description": "an Environment-scoped secret whose Environment does not exist"
+          },
           "429": {
             "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
           }
@@ -9086,6 +9196,19 @@
               "null"
             ],
             "description": "The commit the Pipeline was read at."
+          }
+        }
+      },
+      "ConfirmIdentityMergeRequest": {
+        "type": "object",
+        "description": "`POST /v1/me/identities/merges/{id}` body.",
+        "required": [
+          "credential"
+        ],
+        "properties": {
+          "credential": {
+            "type": "object",
+            "description": "The browser's `AuthenticationResponseJSON`, from a passkey of the\nPrincipal being merged in."
           }
         }
       },
@@ -10094,6 +10217,37 @@
           }
         }
       },
+      "GateApprovalDto": {
+        "type": "object",
+        "description": "The answer to a gate approval.",
+        "required": [
+          "released"
+        ],
+        "properties": {
+          "approvals": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The approvers recorded on the gate so far. Absent when the gate had\nalready released."
+          },
+          "released": {
+            "type": "boolean",
+            "description": "The gate has released (now or before this approval)."
+          },
+          "releases_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When the gate releases (epoch ms): the approvals are in and the\nEnvironment's wait timer is still running. Absent otherwise."
+          }
+        }
+      },
       "GateDefinitionDto": {
         "type": "object",
         "description": "A gate a plugin resolves: a Pipeline waits on it with `invoke:\nplugin:<installation>/<name>`.",
@@ -10223,6 +10377,67 @@
           },
           "name": {
             "type": "string"
+          }
+        }
+      },
+      "IdentityMergeDto": {
+        "type": "object",
+        "description": "A merge waiting for a passkey of the Principal it folds in.",
+        "required": [
+          "id",
+          "from",
+          "provider",
+          "handle",
+          "passkeys",
+          "public_key",
+          "expires_at"
+        ],
+        "properties": {
+          "expires_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "from": {
+            "type": "string",
+            "description": "The Principal that would be folded into the caller."
+          },
+          "handle": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "passkeys": {
+            "type": "integer",
+            "description": "How many usable passkeys `from` holds; one of them must answer.",
+            "minimum": 0
+          },
+          "provider": {
+            "type": "string",
+            "description": "The sign-in that proved it: its provider and handle."
+          },
+          "public_key": {
+            "type": "object",
+            "description": "`PublicKeyCredentialRequestOptionsJSON`, allowing only `from`'s\npasskeys."
+          }
+        }
+      },
+      "IdentityMergedDto": {
+        "type": "object",
+        "description": "What a confirmed merge did.",
+        "required": [
+          "merged",
+          "removed_passkeys"
+        ],
+        "properties": {
+          "merged": {
+            "type": "string",
+            "description": "The Principal folded into the caller."
+          },
+          "removed_passkeys": {
+            "type": "integer",
+            "description": "How many of its passkeys the merge deleted.",
+            "minimum": 0
           }
         }
       },
@@ -11019,6 +11234,29 @@
           "yanked": {
             "type": "boolean",
             "description": "The version is yanked in the Run's org now."
+          }
+        }
+      },
+      "OrphanedSecretsDto": {
+        "type": "object",
+        "description": "Secrets one Project holds under an Environment name that has no\nEnvironment. Names only, never values.",
+        "required": [
+          "environment",
+          "project",
+          "keys"
+        ],
+        "properties": {
+          "environment": {
+            "type": "string"
+          },
+          "keys": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "project": {
+            "type": "string"
           }
         }
       },
@@ -12272,6 +12510,44 @@
           }
         }
       },
+      "PutApprovalGateRules": {
+        "type": "object",
+        "description": "The approval gate settings of a baseline `PUT` (ADR-0078). Each omitted\nfield takes its default.",
+        "properties": {
+          "added_gate_expiry_s": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Seconds before the gate the Environment adds expires; omitted = it\nwaits until approved or rejected.",
+            "minimum": 0
+          },
+          "max_approval_age_s": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Seconds an approval stays good for at launch; omitted = 86400.",
+            "minimum": 0
+          },
+          "missing_gate_mode": {
+            "$ref": "#/components/schemas/MissingGateModeDto",
+            "description": "`add` (default) or `refuse` (ADR-0078 §3)."
+          },
+          "required_approvals": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "How many of `approvers` must approve, 1 to their number; omitted =\nevery one.",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
       "PutEnvironmentProjectOverlayRequest": {
         "type": "object",
         "description": "A Project overlay (`…/projects/{project}/overlay`) body: the baseline's\nfour rules, which can only **tighten** (ADR-0071 §3). Replaced whole,\nomitted = permissive default, unknown fields refused — as for the\nbaseline.",
@@ -12321,21 +12597,16 @@
         "type": "object",
         "description": "A baseline (`…/protection`) body: the four rules and the approval gate\nsettings, replaced whole. Every field is optional and an omitted one\ntakes its default — never the stored value — so `{}` resets the baseline\nto permissive (and the approval gate settings to theirs).\nUnknown fields are refused, so the retired per-repo shape (`wait_timer`,\n`concurrency`) — and `deployment_concurrency`, which ADR-0074 removed — is\na 400, not a silently ignored rule.",
         "properties": {
-          "added_gate_expiry_s": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int32",
-            "description": "Seconds before the gate the Environment adds expires; omitted = it\nwaits until approved or rejected.",
-            "minimum": 0
-          },
           "allowed_refs": {
             "type": "array",
             "items": {
               "type": "string"
             },
             "description": "Ref globs (`refs/heads/main`, `refs/tags/*`); empty = any ref."
+          },
+          "approval_gate": {
+            "$ref": "#/components/schemas/PutApprovalGateRules",
+            "description": "The approval gate settings, in the shape `GET` returns them under\n`protection.approval_gate`. Omitted = every default."
           },
           "approvers": {
             "type": "array",
@@ -12344,31 +12615,9 @@
             },
             "description": "Principal ids (ADR-0069): each must name an existing Principal; a\nmerged id is stored as the Principal it now is. All must approve."
           },
-          "max_approval_age_s": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int32",
-            "description": "Seconds an approval stays good for at launch; omitted = 86400.",
-            "minimum": 0
-          },
-          "missing_gate_mode": {
-            "$ref": "#/components/schemas/MissingGateModeDto",
-            "description": "`add` (default) or `refuse` (ADR-0078 §3)."
-          },
           "require_reason": {
             "type": "boolean",
             "description": "A human dispatch must carry a reason (ADR-0057 §3). Omitted = off."
-          },
-          "required_approvals": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int32",
-            "description": "How many of `approvers` must approve, 1 to their number; omitted =\nevery one.",
-            "minimum": 0
           },
           "wait_timer_s": {
             "type": "integer",
