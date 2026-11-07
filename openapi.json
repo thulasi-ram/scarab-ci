@@ -6815,7 +6815,8 @@
         "tags": [
           "Runs"
         ],
-        "summary": "Approve a `manual` gate (ADR-0008, 0037). The authenticated principal's\napproval is recorded on the event log (append-only, idempotent). For a\n**deploy** run (one with a target environment), the gate is released only\nonce the accumulated approvers satisfy the Environment's effective rules for\nthe run's Project (ADR-0071 §3, `admits`); on release the deployment is\nwritten to the legacy history. If the Environment no longer exists or no\nlonger admits the Project, the gate does not release (409). A plain gate (no\nenvironment) releases on the first approval. Authz'd as a write.",
+        "summary": "Approve a `manual` gate (ADR-0008, 0037). The authenticated principal's\napproval is recorded on the event log (append-only, idempotent).",
+        "description": "An **Environment approval gate** (ADR-0078 §1: a Step after it uses the\nRun's Environment's authority) releases only once the accumulated\napprovals satisfy the Environment's effective rules for the run's Project\n(ADR-0071 §3, `admits`) and its wait timer has run out on the gate's wait\nclock (§4). Approvals that complete the rules early are kept: the gate is\nreleased by the scheduler when the timer runs out. On release the\ndeployment is written to the legacy history. Every other `manual` gate is\na plain gate: it releases on the first approval, with no step-up. If the\nEnvironment no longer exists or no longer admits the Project, no gate of\nthe Run releases (409). Authz'd as a write.",
         "operationId": "approve_gate",
         "parameters": [
           {
@@ -8532,6 +8533,44 @@
           }
         }
       },
+      "ApprovalGateRulesDto": {
+        "type": "object",
+        "description": "An Environment's settings for its Environment approval gate (ADR-0078\n§3): the `manual` gate that has a Step using the Environment's\nauthority after it.",
+        "required": [
+          "missing_gate_mode",
+          "max_approval_age_s"
+        ],
+        "properties": {
+          "added_gate_expiry_s": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Seconds before the gate the Environment adds expires; absent = it\nwaits until approved or rejected.",
+            "minimum": 0
+          },
+          "max_approval_age_s": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Seconds an approval stays good for: a Step that uses the\nEnvironment's authority is refused at launch once its approval gate\nreleased longer ago than this. Default 86400 (24 hours).",
+            "minimum": 0
+          },
+          "missing_gate_mode": {
+            "$ref": "#/components/schemas/MissingGateModeDto",
+            "description": "`add` (default) or `refuse`."
+          },
+          "required_approvals": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "How many of the baseline's approvers must approve; absent = every\none. A Project overlay's approvers are each required as well.",
+            "minimum": 0
+          }
+        }
+      },
       "ArtifactDto": {
         "type": "object",
         "description": "One artifact **version** in a run's list (ADR-0052, immutable per attempt\nby ADR-0056). `step`/`attempt` are the publishing provenance (empty\nstrings on pre-ADR-0056 rows); `succeeded` is that attempt's verdict;\n`of_record` marks the version the bare name-addressed download resolves\nto — the latest successful version of that name.",
@@ -9482,7 +9521,8 @@
           "approvers",
           "allowed_ref_layers",
           "wait_timer_s",
-          "require_reason"
+          "require_reason",
+          "approval_gate"
         ],
         "properties": {
           "allowed_ref_layers": {
@@ -9494,6 +9534,10 @@
               }
             },
             "description": "One list per layer (baseline first, then overlay): a ref must match\n**every** non-empty layer. Never pre-intersected — `[main]` and\n`[tags/*]` intersect to `[]`, which would read as \"any ref\"."
+          },
+          "approval_gate": {
+            "$ref": "#/components/schemas/ApprovalGateRulesDto",
+            "description": "The baseline's approval gate settings."
           },
           "approvers": {
             "type": "array",
@@ -9508,6 +9552,7 @@
           "wait_timer_s": {
             "type": "integer",
             "format": "int32",
+            "description": "The longer of the two layers' wait timers. It does nothing when\n`approvers` is empty.",
             "minimum": 0
           }
         }
@@ -9749,12 +9794,23 @@
             },
             "description": "Ref globs a deploy's symbolic ref must match; empty = any ref."
           },
+          "approval_gate": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ApprovalGateRulesDto",
+                "description": "The Environment approval gate's settings (ADR-0078 §3). Present on a\nbaseline only: an overlay has none."
+              }
+            ]
+          },
           "approvers": {
             "type": "array",
             "items": {
               "type": "string"
             },
-            "description": "Principal ids; every one must approve (AND)."
+            "description": "Principal ids. Every one must approve (AND), unless the baseline's\n`approval_gate.required_approvals` says how many of its own must."
           },
           "require_reason": {
             "type": "boolean",
@@ -9763,7 +9819,7 @@
           "wait_timer_s": {
             "type": "integer",
             "format": "int32",
-            "description": "Seconds. Carried and merged, not yet enforced (git-bug 2b94989).",
+            "description": "Seconds: a minimum wait on the Environment approval gate, counted on\nthe gate's wait clock (ADR-0078 §4). It does nothing where the\neffective approvers are empty; a client shows that from `approvers`\n(here, or `effective.approvers` for a Project).",
             "minimum": 0
           }
         }
@@ -10621,6 +10677,14 @@
           }
         }
       },
+      "MissingGateModeDto": {
+        "type": "string",
+        "description": "What Run creation does when a Step that uses the Environment's authority\nhas no `manual` gate upstream (ADR-0078 §3).",
+        "enum": [
+          "add",
+          "refuse"
+        ]
+      },
       "OpSummary": {
         "type": "object",
         "description": "What a human is asked to confirm: the server-rendered, redacted\ndescription of one operation (shown in the 403, on the confirm page and\nin the event log).",
@@ -10826,7 +10890,7 @@
           },
           "kind": {
             "type": "string",
-            "description": "`file`, `library` or `plugin`."
+            "description": "`file`, `library`, `plugin`, or `environment` for the gate an\nEnvironment added to the Run (ADR-0078 §2)."
           },
           "name": {
             "type": "string",
@@ -12142,8 +12206,17 @@
       },
       "PutEnvironmentProtectionRequest": {
         "type": "object",
-        "description": "A baseline (`…/protection`) body: the four rules, replaced whole. Every\nfield is optional and an omitted one takes the **permissive** default —\nnever the stored value — so `{}` resets the baseline to permissive.\nUnknown fields are refused, so the retired per-repo shape (`wait_timer`,\n`concurrency`) — and `deployment_concurrency`, which ADR-0074 removed — is\na 400, not a silently ignored rule.",
+        "description": "A baseline (`…/protection`) body: the four rules and the approval gate\nsettings, replaced whole. Every field is optional and an omitted one\ntakes its default — never the stored value — so `{}` resets the baseline\nto permissive (and the approval gate settings to theirs).\nUnknown fields are refused, so the retired per-repo shape (`wait_timer`,\n`concurrency`) — and `deployment_concurrency`, which ADR-0074 removed — is\na 400, not a silently ignored rule.",
         "properties": {
+          "added_gate_expiry_s": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Seconds before the gate the Environment adds expires; omitted = it\nwaits until approved or rejected.",
+            "minimum": 0
+          },
           "allowed_refs": {
             "type": "array",
             "items": {
@@ -12158,14 +12231,36 @@
             },
             "description": "Principal ids (ADR-0069): each must name an existing Principal; a\nmerged id is stored as the Principal it now is. All must approve."
           },
+          "max_approval_age_s": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Seconds an approval stays good for at launch; omitted = 86400.",
+            "minimum": 0
+          },
+          "missing_gate_mode": {
+            "$ref": "#/components/schemas/MissingGateModeDto",
+            "description": "`add` (default) or `refuse` (ADR-0078 §3)."
+          },
           "require_reason": {
             "type": "boolean",
             "description": "A human dispatch must carry a reason (ADR-0057 §3). Omitted = off."
           },
+          "required_approvals": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "How many of `approvers` must approve, 1 to their number; omitted =\nevery one.",
+            "minimum": 0
+          },
           "wait_timer_s": {
             "type": "integer",
             "format": "int32",
-            "description": "Seconds. Carried and merged, not yet enforced (git-bug 2b94989).",
+            "description": "Seconds: a minimum wait on the Environment approval gate (ADR-0078\n§4). Refused (400) above 0 with no approvers.",
             "minimum": 0
           }
         },
@@ -13452,6 +13547,14 @@
           "attempts"
         ],
         "properties": {
+          "approval_release_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "A waiting Environment approval gate whose approvals are in: when the\nEnvironment's wait timer runs out and the gate releases (Unix ms).\nAbsent otherwise."
+          },
           "attempt_list": {
             "type": "array",
             "items": {
@@ -13466,6 +13569,10 @@
           "deploy": {
             "type": "boolean",
             "description": "This Step is marked `deploy: true` (ADR-0074 §2) — the Step of a deploy\nRun that deploys. Omitted when false."
+          },
+          "environment_approval_gate": {
+            "type": "boolean",
+            "description": "This `manual` gate is an **Environment approval gate** (ADR-0078 §1):\na Step after it uses the Run's Environment's authority, so releasing\nit needs the Environment's approvers and a step-up. Decided at Run\ncreation. A gate the Environment added has an `origin` link of kind\n`environment`. Omitted when false."
           },
           "gate": {
             "type": [

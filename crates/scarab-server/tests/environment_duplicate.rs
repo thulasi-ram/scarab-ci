@@ -24,9 +24,9 @@ use scarab_identity::{Role, Scope};
 use scarab_policy::policy::Policy;
 use scarab_policy::store::{NewPolicy, PolicyScope, PolicyStore};
 use scarab_project::{
-    EnvironmentGovernanceStore, EnvironmentProjectEligibility, EnvironmentProjectOverlay,
-    EnvironmentProjectPrivilegeGrant, EnvironmentProtectionRules, ImageGrant, OrgEnvironment,
-    OrgEnvironmentStore,
+    ApprovalGateRules, EnvironmentGovernanceStore, EnvironmentProjectEligibility, EnvironmentProjectOverlay,
+    EnvironmentProjectPrivilegeGrant, EnvironmentProtectionRules, ImageGrant, MissingGateMode,
+    OrgEnvironment, OrgEnvironmentStore,
 };
 use scarab_secrets::{Secret, SecretError, SecretProvider, SecretScope};
 use scarab_testkit::{FakeSecrets, InMemoryPolicies};
@@ -118,6 +118,12 @@ async fn fixture(
             allowed_refs: vec!["refs/heads/main".into()],
             wait_timer_s: 30,
             require_reason: true,
+            approval_gate: ApprovalGateRules {
+                missing_gate: MissingGateMode::Refuse,
+                added_gate_expiry_s: Some(3600),
+                required_approvals: Some(1),
+                max_approval_age_s: 600,
+            },
         },
         "seed",
         2,
@@ -341,7 +347,13 @@ async fn a_duplicate_copies_rules_eligibility_projects_and_secret_values() {
             "approvers": ["amy"],
             "allowed_refs": ["refs/heads/main"],
             "wait_timer_s": 30,
-            "require_reason": true
+            "require_reason": true,
+            "approval_gate": {
+                "missing_gate_mode": "refuse",
+                "added_gate_expiry_s": 3600,
+                "required_approvals": 1,
+                "max_approval_age_s": 600
+            }
         })
     );
     assert_eq!(

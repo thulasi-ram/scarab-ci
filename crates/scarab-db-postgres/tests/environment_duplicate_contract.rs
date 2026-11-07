@@ -10,9 +10,9 @@ mod common;
 use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
 use scarab_project::{
-    EnvironmentGovernanceStore, EnvironmentProjectEligibility, EnvironmentProjectOverlay,
+    ApprovalGateRules, EnvironmentGovernanceStore, EnvironmentProjectEligibility, EnvironmentProjectOverlay,
     EnvironmentProjectPrivilegeGrant, EnvironmentProtectionRules, ImageGrant, OrgEnvironment,
-    OrgEnvironmentError, OrgEnvironmentStore,
+    MissingGateMode, OrgEnvironmentError, OrgEnvironmentStore,
 };
 use scarab_testkit::InMemoryEnvironmentGovernance;
 
@@ -41,6 +41,12 @@ async fn seed(s: &dyn EnvironmentGovernanceStore) {
             allowed_refs: vec!["refs/heads/main".into()],
             wait_timer_s: 30,
             require_reason: true,
+            approval_gate: ApprovalGateRules {
+                missing_gate: MissingGateMode::Refuse,
+                added_gate_expiry_s: Some(3600),
+                required_approvals: Some(1),
+                max_approval_age_s: 600,
+            },
         },
         "seed",
         2,
@@ -66,6 +72,7 @@ async fn seed(s: &dyn EnvironmentGovernanceStore) {
                 allowed_refs: vec!["refs/tags/*".into()],
                 wait_timer_s: 60,
                 require_reason: false,
+                approval_gate: ApprovalGateRules::default(),
             },
         },
         "seed",
@@ -121,6 +128,16 @@ async fn duplicate_copies_everything_and_leaves_the_source(s: &dyn EnvironmentGo
             ..before.clone()
         },
         "the baseline, eligibility and description are the source's"
+    );
+    assert_eq!(
+        copy.protection.approval_gate,
+        ApprovalGateRules {
+            missing_gate: MissingGateMode::Refuse,
+            added_gate_expiry_s: Some(3600),
+            required_approvals: Some(1),
+            max_approval_age_s: 600,
+        },
+        "the approval gate settings are copied"
     );
     assert_eq!(
         s.org_environment("acme", "prod-eu").await.unwrap(),

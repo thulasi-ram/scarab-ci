@@ -211,7 +211,9 @@ pub async fn forge_token_refusals(
                 ));
                 continue;
             }
-            if write.has_approvers && !has_manual_gate_upstream(ir, &step.id) {
+            if write.has_approvers
+                && !scarab_policy::approval_gate::manual_gate_upstream(ir, &step.id)
+            {
                 out.refusals.push(format!(
                     "step `{}` asks for `forge_token: write`, which uses the Environment's \
                      authority, and the Environment has approvers: put a `gate: manual` in its \
@@ -281,28 +283,6 @@ async fn trusted_sources(libraries: &dyn LibraryStore, org: &str) -> Result<BTre
         .collect())
 }
 
-/// Whether a `gate: manual` is upstream of `step` through `needs`.
-fn has_manual_gate_upstream(ir: &PipelineIr, step: &str) -> bool {
-    let by_id: HashMap<&str, &scarab_pipeline::StepSpec> =
-        ir.steps.iter().map(|s| (s.id.as_str(), s)).collect();
-    let mut seen: BTreeSet<&str> = BTreeSet::new();
-    let mut stack: Vec<&str> = by_id
-        .get(step)
-        .map(|s| s.needs.0.iter().map(String::as_str).collect())
-        .unwrap_or_default();
-    while let Some(id) = stack.pop() {
-        if !seen.insert(id) {
-            continue;
-        }
-        let Some(s) = by_id.get(id) else { continue };
-        if s.gate.as_deref() == Some("manual") {
-            return true;
-        }
-        stack.extend(s.needs.0.iter().map(String::as_str));
-    }
-    false
-}
-
 /// An [`Executor`] decorator that mints a Step's forge credential when it
 /// launches and revokes it when its Attempt ends (see the module docs), and
 /// resolves a build Step's registry auth (ADR-0018: the scoped
@@ -328,6 +308,8 @@ pub struct ForgeCredentialExecutor {
     /// ([`Executor::take_forge_credential`]), so a control plane that did
     /// not mint it, or restarted since, still revokes it.
     minted: Mutex<HashMap<String, Vec<(RepoRef, String)>>>,
+    /// What an approval's age is measured to at launch (ADR-0078 §5).
+    clock: Arc<dyn scarab_engine::Clock>,
 }
 
 impl ForgeCredentialExecutor {
@@ -339,6 +321,7 @@ impl ForgeCredentialExecutor {
             libraries: None,
             governance: None,
             minted: Mutex::new(HashMap::new()),
+            clock: Arc::new(crate::SystemClock),
         }
     }
 
@@ -498,6 +481,13 @@ impl ForgeCredentialExecutor {
         self
     }
 
+    /// Measure an approval's age at launch on `clock` (a system clock by
+    /// default).
+    pub fn with_clock(mut self, clock: Arc<dyn scarab_engine::Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
     /// Enable scoped `REGISTRY_AUTH` resolution for build steps (ADR-0018).
     pub fn with_secrets(mut self, secrets: Arc<dyn scarab_secrets::SecretProvider>) -> Self {
         self.secrets = Some(secrets);
@@ -602,7 +592,8 @@ impl Executor for ForgeCredentialExecutor {
                 crate::secret_executor::ensure_deploy_still_admitted(
                     db.as_ref(),
                     governance.as_ref(),
-                    &step.run,
+                    step,
+                    self.clock.now().await.0,
                 )
                 .await?;
             }

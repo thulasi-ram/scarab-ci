@@ -17,8 +17,8 @@ use scarab_project::{
 };
 
 use crate::org_environments::{
-    eligible_project_patterns_of, org_environment_from_row, org_environment_store_err,
-    protection_rules_from_row, ORG_ENVIRONMENT_COLUMNS,
+    baseline_rules_from_row, eligible_project_patterns_of, org_environment_from_row,
+    org_environment_store_err, protection_rules_from_row, ORG_ENVIRONMENT_COLUMNS,
 };
 use crate::PostgresDb;
 
@@ -449,14 +449,30 @@ impl EnvironmentGovernanceStore for PostgresDb {
             // take anyway, so nothing can change between this compare and
             // the write.
             let row = lock_environment(&mut tx, org, environment).await?;
-            if &protection_rules_from_row(&row, environment)? != expected {
+            if &baseline_rules_from_row(&row, environment)? != expected {
                 return Err(OrgEnvironmentError::changed_concurrently());
             }
         }
+        let gate = &protection.approval_gate;
+        let column = |v: u32, what: &str| {
+            i32::try_from(v).map_err(|_| {
+                OrgEnvironmentError::Invalid(format!("{what} must be at most {} seconds", i32::MAX))
+            })
+        };
+        let added_gate_expiry_s = gate
+            .added_gate_expiry_s
+            .map(|v| column(v, "the added gate's expiry"))
+            .transpose()?;
+        let required_approvals = gate
+            .required_approvals
+            .map(|v| column(v, "required approvals"))
+            .transpose()?;
+        let max_approval_age_s = column(gate.max_approval_age_s, "the maximum approval age")?;
         let row = sqlx::query(&format!(
             "UPDATE org_environments SET
                  approvers = $3, allowed_refs = $4, wait_timer_s = $5, require_reason = $6,
-                 updated_at = $7, updated_by = $8
+                 updated_at = $7, updated_by = $8, missing_gate_mode = $9,
+                 added_gate_expiry_s = $10, required_approvals = $11, max_approval_age_s = $12
              WHERE org = $1 AND name = $2
              RETURNING {ORG_ENVIRONMENT_COLUMNS}"
         ))
@@ -468,6 +484,10 @@ impl EnvironmentGovernanceStore for PostgresDb {
         .bind(protection.require_reason)
         .bind(updated_at)
         .bind(updated_by)
+        .bind(gate.missing_gate.as_str())
+        .bind(added_gate_expiry_s)
+        .bind(required_approvals)
+        .bind(max_approval_age_s)
         .fetch_optional(&mut *tx)
         .await
         .map_err(org_environment_store_err)?

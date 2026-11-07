@@ -51,7 +51,12 @@ fn covered(old: &[String], pattern: &str) -> bool {
 /// - allowed refs widened: a restricted list made empty (any ref), or a new
 ///   glob no old one covers. An unrestricted (empty) list can only tighten;
 /// - a shorter wait timer;
-/// - `require_reason` switched off.
+/// - `require_reason` switched off;
+/// - the approval gate's settings (ADR-0078 §3): fewer required approvals,
+///   a longer maximum approval age, or a longer or removed expiry on the
+///   gate the Environment adds. Switching between adding a gate and
+///   refusing the Run is never one: both keep the authority behind an
+///   approval.
 pub fn protection_loosenings(
     old: &EnvironmentProtectionRules,
     new: &EnvironmentProtectionRules,
@@ -81,6 +86,43 @@ pub fn protection_loosenings(
     }
     if old.require_reason && !new.require_reason {
         out.push(Loosening::new("no longer requires a reason"));
+    }
+    out.extend(approval_gate_loosenings(old, new));
+    out
+}
+
+/// The approval-gate part of [`protection_loosenings`].
+fn approval_gate_loosenings(
+    old: &EnvironmentProtectionRules,
+    new: &EnvironmentProtectionRules,
+) -> Vec<Loosening> {
+    let (o, n) = (&old.approval_gate, &new.approval_gate);
+    let mut out = Vec::new();
+    // `None` requires every approver of its own list.
+    let required = |r: &EnvironmentProtectionRules| {
+        r.approval_gate
+            .required_approvals
+            .map_or(r.approvers.len(), |n| n as usize)
+    };
+    if o.required_approvals != n.required_approvals && required(new) < required(old) {
+        out.push(Loosening::new(format!(
+            "lowers the approvals an approval gate needs from {} to {}",
+            required(old),
+            required(new)
+        )));
+    }
+    if n.max_approval_age_s > o.max_approval_age_s {
+        out.push(Loosening::new(format!(
+            "raises the maximum approval age from {} s to {} s",
+            o.max_approval_age_s, n.max_approval_age_s
+        )));
+    }
+    match (o.added_gate_expiry_s, n.added_gate_expiry_s) {
+        (Some(_), None) => out.push(Loosening::new("removes the added gate's expiry")),
+        (Some(a), Some(b)) if b > a => out.push(Loosening::new(format!(
+            "lengthens the added gate's expiry from {a} s to {b} s"
+        ))),
+        _ => {}
     }
     out
 }

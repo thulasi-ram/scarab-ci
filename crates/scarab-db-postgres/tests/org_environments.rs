@@ -139,8 +139,9 @@ async fn two_orgs_with_the_same_name_are_independent() {
 #[tokio::test]
 async fn an_expecting_write_refuses_when_the_stored_value_moved() {
     use scarab_project::{
-        EnvironmentGovernanceStore, EnvironmentProjectEligibility, EnvironmentProjectOverlay,
-        EnvironmentProjectPrivilegeGrant, EnvironmentProtectionRules, ImageGrant,
+        ApprovalGateRules, EnvironmentGovernanceStore, EnvironmentProjectEligibility,
+        EnvironmentProjectOverlay, EnvironmentProjectPrivilegeGrant, EnvironmentProtectionRules,
+        ImageGrant, MissingGateMode,
     };
 
     let Some((tdb, db)) = migrated().await else {
@@ -158,16 +159,40 @@ async fn an_expecting_write_refuses_when_the_stored_value_moved() {
         .unwrap();
 
     // Baseline protection.
+    // Every approval gate setting off its default, so each column is
+    // written and read back (migration 0079).
     let strict = EnvironmentProtectionRules {
-        approvers: vec!["amy".into()],
+        approvers: vec!["amy".into(), "bob".into()],
         allowed_refs: vec!["refs/heads/main".into()],
         wait_timer_s: 5,
         require_reason: true,
+        approval_gate: ApprovalGateRules {
+            missing_gate: MissingGateMode::Refuse,
+            added_gate_expiry_s: Some(3600),
+            required_approvals: Some(1),
+            max_approval_age_s: 600,
+        },
     };
     let permissive = EnvironmentProtectionRules::default();
     db.put_environment_protection_expecting("acme", "prod", &strict, Some(&permissive), "amy", 4)
         .await
         .unwrap();
+    // An expectation that differs from what is stored in an approval gate
+    // setting alone is a conflict too: a step-up judged against it would
+    // be judged against the wrong rules.
+    let mut stale = strict.clone();
+    stale.approval_gate.max_approval_age_s = 60;
+    conflict(
+        db.put_environment_protection_expecting(
+            "acme",
+            "prod",
+            &permissive,
+            Some(&stale),
+            "amy",
+            5,
+        )
+        .await,
+    );
     conflict(
         db.put_environment_protection_expecting(
             "acme",

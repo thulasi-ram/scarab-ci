@@ -103,7 +103,10 @@ async fn create_read_replace_and_delete_round_trip() {
                 "approvers": [],
                 "allowed_refs": [],
                 "wait_timer_s": 0,
-                "require_reason": false
+                "require_reason": false,
+                // ADR-0078 §3: add a gate when one is missing; approvals
+                // good for 24 hours.
+                "approval_gate": { "missing_gate_mode": "add", "max_approval_age_s": 86400 }
             },
             "eligibility": { "all_projects": false, "projects": [] },
             "created_at": CLOCK_START_MS,

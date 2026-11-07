@@ -249,6 +249,173 @@ async fn protection_loosening_needs_a_step_up_and_tightening_does_not() {
     g.tdb.cleanup().await;
 }
 
+/// The Environment approval gate's settings (ADR-0078 §3) on the baseline:
+/// fewer required approvals, a longer maximum approval age, and a removed or
+/// longer expiry on the added gate each loosen; switching the missing-gate
+/// mode between `refuse` and `add` does not (both keep the authority behind
+/// an approval). What is stored reads back through `GET …/protection`.
+#[tokio::test]
+async fn approval_gate_setting_loosenings_need_a_step_up_and_mode_does_not() {
+    let Some(g) = governed().await else { return };
+    let (h, pg) = (&g.h, &g.pg);
+    let (s, mut soft) = signed_in_admin(h).await;
+    let uri = format!("{PROD}/protection");
+    let put = |body: Value| h.cookie("PUT", &uri, Some(body), &s);
+    let strict = || {
+        json!({
+            "approvers": ["amy", "bob"],
+            "missing_gate_mode": "refuse",
+            "added_gate_expiry_s": 600,
+            "required_approvals": 2,
+            "max_approval_age_s": 3600,
+        })
+    };
+    let with = |k: &str, v: Value| {
+        let mut b = strict();
+        b[k] = v;
+        b
+    };
+
+    // Seeding the strict settings tightens everything: no step-up.
+    seed_protection(pg, rules(&["amy", "bob"], &[])).await;
+    let (st, b) = put(strict()).await;
+    assert_ok(st, &b);
+    let (st, b) = h.cookie("GET", &uri, None, &s).await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(
+        b["approval_gate"],
+        json!({
+            "missing_gate_mode": "refuse",
+            "added_gate_expiry_s": 600,
+            "required_approvals": 2,
+            "max_approval_age_s": 3600,
+        }),
+        "{b}"
+    );
+
+    let (st, b) = put(with("required_approvals", json!(1))).await;
+    assert_refused_for(
+        st,
+        &b,
+        "environment.protection.put",
+        "lowers the approvals an approval gate needs from 2 to 1",
+    );
+    let (st, b) = put(with("max_approval_age_s", json!(7200))).await;
+    assert_refused_for(
+        st,
+        &b,
+        "environment.protection.put",
+        "raises the maximum approval age",
+    );
+    let mut no_expiry = strict();
+    no_expiry
+        .as_object_mut()
+        .unwrap()
+        .remove("added_gate_expiry_s");
+    let (st, b) = put(no_expiry).await;
+    assert_refused_for(
+        st,
+        &b,
+        "environment.protection.put",
+        "removes the added gate's expiry",
+    );
+    let (st, b) = put(with("added_gate_expiry_s", json!(1200))).await;
+    assert_refused_for(
+        st,
+        &b,
+        "environment.protection.put",
+        "lengthens the added gate's expiry",
+    );
+    assert_eq!(
+        stored_protection(pg).await.approval_gate.max_approval_age_s,
+        3600,
+        "nothing refused was written"
+    );
+
+    // `refuse` → `add` is not a loosening.
+    let (st, b) = put(with("missing_gate_mode", json!("add"))).await;
+    assert_ok(st, &b);
+    assert_eq!(
+        stored_protection(pg).await.approval_gate.missing_gate,
+        scarab_project::MissingGateMode::Add
+    );
+
+    // A count above the approvers, or of 0, is refused outright.
+    for n in [0, 3] {
+        let (st, b) = put(with("required_approvals", json!(n))).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{n}: {b}");
+    }
+
+    // With a window open, a loosening goes through.
+    h.open_window(&s, &mut soft).await;
+    let (st, b) = put(with("required_approvals", json!(1))).await;
+    assert_ok(st, &b);
+    assert_eq!(
+        stored_protection(pg).await.approval_gate.required_approvals,
+        Some(1)
+    );
+
+    g.tdb.cleanup().await;
+}
+
+/// A wait timer is a minimum wait on the Environment approval gate
+/// (ADR-0078 §4), so the API refuses one where no approver would ever be
+/// asked: on a baseline with no approvers, and on an overlay whose
+/// baseline and own approvers are both empty. A timer that was stored
+/// before stays readable.
+#[tokio::test]
+async fn a_wait_timer_needs_approvers() {
+    let Some(g) = governed().await else { return };
+    let (h, pg) = (&g.h, &g.pg);
+    let (s, _soft) = signed_in_admin(h).await;
+    let uri = format!("{PROD}/protection");
+
+    let (st, b) = h
+        .cookie("PUT", &uri, Some(json!({ "wait_timer_s": 60 })), &s)
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+    assert!(
+        b.to_string().contains("a wait timer needs approvers"),
+        "{b}"
+    );
+    let (st, b) = h
+        .cookie(
+            "PUT",
+            &uri,
+            Some(json!({ "wait_timer_s": 60, "approvers": ["amy"] })),
+            &s,
+        )
+        .await;
+    assert_ok(st, &b);
+
+    // An overlay: refused while neither layer has an approver.
+    seed_protection(pg, rules(&[], &[])).await;
+    let overlay = format!("{PROD}/projects/web/overlay");
+    let (st, b) = h
+        .cookie("PUT", &overlay, Some(json!({ "wait_timer_s": 60 })), &s)
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+    let (st, b) = h
+        .cookie(
+            "PUT",
+            &overlay,
+            Some(json!({ "wait_timer_s": 60, "approvers": ["amy"] })),
+            &s,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+
+    // Stored before the check: read back as stored.
+    let mut legacy = rules(&[], &[]);
+    legacy.wait_timer_s = 30;
+    seed_protection(pg, legacy).await;
+    let (st, b) = h.cookie("GET", &uri, None, &s).await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(b["wait_timer_s"], 30, "{b}");
+
+    g.tdb.cleanup().await;
+}
+
 /// E2: from "every project" to a list tightens; to "every project", or a
 /// pattern the old list does not cover, loosens.
 #[tokio::test]
@@ -794,8 +961,8 @@ async fn governance_writes_read_the_environment_without_a_project_lens() {
 // Gate approval (hermetic)
 // ---------------------------------------------------------------------------
 
-/// A deploy into `prod` with an approval gate, and a plain pipeline with
-/// one.
+/// A deploy into `prod` with an approval gate (its `ship` uses prod's
+/// authority, ADR-0078 §1), and a plain pipeline with one.
 const DEPLOY_YAML: &str = r#"
 on:
   manual: {}
@@ -803,7 +970,19 @@ environment: prod
 steps:
   - { id: build, image: busybox, command: ["true"] }
   - { id: approve, gate: manual, needs: [build] }
-  - { id: ship, image: busybox, command: ["true"], needs: [approve] }
+  - { id: ship, image: busybox, command: ["true"], deploy: true, needs: [approve] }
+"#;
+
+/// A "QA signs off" gate in `prod` that guards nothing of prod's: a plain
+/// gate (ADR-0078 §1).
+const QA_YAML: &str = r#"
+on:
+  manual: {}
+environment: prod
+steps:
+  - { id: build, image: busybox, command: ["true"] }
+  - { id: approve, gate: manual, needs: [build] }
+  - { id: smoke, image: busybox, command: ["true"], needs: [approve] }
 "#;
 
 const PLAIN_YAML: &str = r#"
@@ -819,6 +998,7 @@ fn forge() -> FakeForge {
     FakeForge::new()
         .with_file(".scarab/deploy.yaml", DEPLOY_YAML)
         .with_file(".scarab/plain.yaml", PLAIN_YAML)
+        .with_file(".scarab/qa.yaml", QA_YAML)
         .with_commit(
             "refs/heads/main",
             "1234567890abcdef1234567890abcdef12345678",
@@ -949,6 +1129,24 @@ async fn approving_a_gate_without_approvers_or_environment_is_exempt() {
     assert_eq!(st, StatusCode::ACCEPTED, "{b}");
     assert_eq!(gate_status(&h, &plain).await, StepStatus::Succeeded);
 
+    assert!(h.events_of("step_up.refused").is_empty());
+}
+
+/// ADR-0078 §1: in an Environment with approvers, a `manual` gate with no
+/// Step after it that uses the Environment's authority is a plain gate. Its
+/// approval needs no step-up and releases it at once.
+#[tokio::test]
+async fn approving_a_plain_gate_in_a_governed_run_is_exempt() {
+    let governance = prod_governance();
+    let h = gated(governance.clone());
+    let (s, _soft) = signed_in_admin(&h).await;
+    require_approvers(&governance, &["carol"]).await;
+    let run = at_gate(&h, &governance, "qa").await;
+
+    let (st, b) = h.cookie("POST", &approve_uri(&run), None, &s).await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{b}");
+    assert_eq!(b["released"], true, "{b}");
+    assert_eq!(gate_status(&h, &run).await, StepStatus::Succeeded);
     assert!(h.events_of("step_up.refused").is_empty());
 }
 

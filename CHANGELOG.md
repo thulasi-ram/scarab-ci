@@ -161,6 +161,31 @@ record. Read Breaking changes before you upgrade.
   check, require `scarab/<pipeline>` for each pipeline instead before you upgrade, or the rule
   waits for a status that is no longer posted.
 
+- **Deploys into an Environment with approvers now pause for approval when the pipeline has no
+  gate** (git-bug cd43bf3). Before, a Run that named such an Environment and had no `gate:
+  manual` gave its Steps the Environment's secrets and grants without asking anyone. Now the
+  Environment adds one `manual` gate, `environment-approval`, in front of the earliest Steps that
+  use its authority (declared `secrets:`, a governed grant or `k8s_overlay`, `forge_token: write`,
+  or `deploy: true`). Runs that deployed unasked start waiting for an approver on the day you
+  upgrade. An org admin can set an Environment to refuse such a Run instead (missing-gate mode
+  `refuse`), which names the gate to add. See
+  [Environments](https://thulasi-ram.github.io/scarab-ci/usage/environments/#the-approval-gate).
+- **`manual` gates that guard no authority Step stop needing the approvers.** Only a gate with a
+  Step after it that uses the Environment's authority needs the Environment's approvers and a
+  step-up; any other `manual` gate in the Run releases on the first approval by anyone with write.
+- **The Environment's wait timer is enforced** (git-bug 2b94989): the approval gate releases when
+  its approvals are in and the timer has run out, counted from when its `needs` finished. An
+  approval given early counts. The API refuses a non-zero wait timer on an Environment with no
+  approvers; one stored before does nothing.
+- **A stale approval is refused at launch** (git-bug 220917f). Every launch of a Step that uses
+  the authority of an Environment with approvers, reruns and retries included, fails `Config`
+  when no released approval gate is upstream of it, the Run's ref is no longer allowed, the
+  approvers changed since the gate's approvals, or the gate released more than the Environment's
+  maximum approval age ago (24 hours by default). An external gate no longer hands over the
+  Environment's authority by its token alone. A Run created before its Environment had approvers
+  has no approval gate, so its authority Steps are refused once the Environment has approvers.
+  In such an Environment, Steps before the approval gate get the `env=none` OIDC subject.
+
 ### Security
 
 - An admin of one org could list, delete, re-sync and bind repos through another org's forge
@@ -202,7 +227,7 @@ record. Read Breaking changes before you upgrade.
   Environment with the old one's baseline, eligibility, every project's overlay and privilege
   grant, and its secrets with their values, and lists what it did not copy: the projects whose
   Runs used it, the policies that name it, and the OIDC subject cloud trust policies match. The
-  old Environment is not changed. Migration 0079 adds the display name column (git-bug d002a0c).
+  old Environment is not changed. Migration 0080 adds the display name column (git-bug d002a0c).
   [Environments](https://thulasi-ram.github.io/scarab-ci/usage/environments/#duplicate-an-environment)
 - **Runs after another pipeline.** `on: upstream: { pipeline: ci }` starts a Run when a Run
   of `ci` in the same repository finishes (`status:` takes `succeeded`, the default, and

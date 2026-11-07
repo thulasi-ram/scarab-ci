@@ -145,7 +145,7 @@ async fn apply_through(pool: &PgPool, last_version: i64) {
 
 /// Every migration after `version`, in order: what a database migrated
 /// through 0057 meets on the next upgrade, and the schema the store code
-/// reads (it selects columns later migrations added, such as 0079's
+/// reads (it selects columns later migrations added, such as 0080's
 /// `display_name`).
 async fn apply_after(pool: &PgPool, version: i64) {
     for m in MIGRATOR.iter().filter(|m| m.version > version) {
@@ -300,7 +300,8 @@ async fn backfill_reproduces_the_pure_migration_and_is_a_no_op_the_second_time()
         "a second backfill changes nothing"
     );
 
-    // The store below reads today's schema.
+    // The store below reads today's schema (0079 adds the approval gate
+    // settings, 0080 the display name).
     apply_after(&pool, 57).await;
     let db = PostgresDb::with_pool(pool.clone());
 
