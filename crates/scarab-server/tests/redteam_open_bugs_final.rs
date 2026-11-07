@@ -473,6 +473,42 @@ async fn a_unit_created_by_a_failed_launch_is_torn_down_after_a_cancel(w: World)
 both!(a_unit_created_by_a_failed_launch_is_torn_down_after_a_cancel);
 
 // ---------------------------------------------------------------------------
+// F1b (git-bug d1b5f72) — the same created-then-failed launch, but on every
+// delivery, so the launch intent is dead-lettered as poison and the Run with
+// it. The intent is dead-lettered before `dead_letter_run`, so its `launch:`
+// key is no longer pending; the CANCEL_ATTEMPT that `dead_letter_run` writes
+// found no handle and retired as "gone", and the unit ran on.
+// ---------------------------------------------------------------------------
+async fn a_unit_created_by_a_poison_launch_is_torn_down_when_the_run_dead_letters(w: World) {
+    w.seed_plain("rd").await;
+    w.admit("rd").await;
+    let h = handle("rd", "build", "a1");
+
+    let seam = SeamExec::new(w.exec.clone());
+    *seam.create_then_fail.lock().unwrap() = MAX_DELIVERY_ATTEMPTS;
+    let s = Scheduler::new(&*w.db, &w.clock, &seam, "sched").with_outbox_visibility_ms(0);
+    for _ in 0..MAX_DELIVERY_ATTEMPTS {
+        s.reconcile().await.unwrap();
+    }
+    assert!(w.launched(&h), "precondition: the unit was created");
+    assert_eq!(
+        w.run_status("rd").await,
+        RunStatus::DeadLettered,
+        "precondition: the poison launch dead-lettered the Run"
+    );
+
+    w.ticks(5).await;
+    assert!(
+        w.torn_down(&h),
+        "rd's a1 unit (created by launches that then errored) was never torn down after \
+         the Run dead-lettered (cancelled: {:?})",
+        w.exec.cancelled_handles()
+    );
+    w.finish().await;
+}
+both!(a_unit_created_by_a_poison_launch_is_torn_down_when_the_run_dead_letters);
+
+// ---------------------------------------------------------------------------
 // F2 — the round-3 claim: a cancel landing while a launch is IN FLIGHT. The
 // drain sees no handle but a pending `launch:` key → `Launching` (retried);
 // the launch records its handle, sees it is unwanted, finds the attempt
