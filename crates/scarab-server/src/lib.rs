@@ -5581,6 +5581,7 @@ async fn admit_unrecorded(
                     repo,
                     &gov,
                     &run,
+                    false,
                     now,
                     params,
                     &serde_json::Map::new(),
@@ -5664,11 +5665,13 @@ async fn admit_unrecorded(
     // reason checks and before anything is persisted (`persist_run_from_ir`
     // is not atomic, so a deny after it would leave a partial Run). The run
     // id is minted first so an allow decision names the Run it admitted.
-    // Nothing that can refuse the Run runs between the decision and the
-    // Run's first row (`begin_run_creation`); a write failure after that row
-    // ends the Run Failed, and the decision still names a real Run.
+    // An allow decision and the Run's first row are written in one
+    // transaction where the store holds both (git-bug bbc433e), so neither
+    // exists without the other; a write failure after that row ends the Run
+    // Failed, and the decision still names a real Run.
+    let mut run_row_written = false;
     if let Some(policies) = ports.policies {
-        if let Err(refusal) = consult_run_create(
+        match consult_run_create(
             policies,
             &ports.links,
             event,
@@ -5677,6 +5680,7 @@ async fn admit_unrecorded(
             repo,
             &gov,
             &run,
+            true,
             now,
             params,
             &facts,
@@ -5684,12 +5688,14 @@ async fn admit_unrecorded(
         )
         .await?
         {
-            return Ok(Admission::Refused(refusal));
+            Ok(written) => run_row_written = written,
+            Err(refusal) => return Ok(Admission::Refused(refusal)),
         }
     }
     persist_run_from_ir(
         db,
         &run,
+        run_row_written,
         ir,
         event,
         path,
@@ -5933,7 +5939,9 @@ fn run_create_input(
 ///   ([`plugins_closed_default`](scarab_policy::evaluate::plugins_closed_default))
 ///   unless an org-level, enforced `plugins_allowed` setting lists it.
 /// - Otherwise the decision is recorded: an allow with `run`, a deny with no
-///   Run (the org's decision log). A deny is an
+///   Run (the org's decision log). With `creates_run`, an allow is recorded
+///   with the Run's first row where the store can (git-bug bbc433e); the
+///   result says whether that row was written. A deny is an
 ///   [`AdmissionRefusal::PolicyDenied`] whose messages name their Policy.
 /// - A stored Policy that no longer compiles denies when enforced and
 ///   matched ([`evaluate_stored`](scarab_policy::evaluate::evaluate_stored)).
@@ -5955,11 +5963,12 @@ async fn consult_run_create(
     repo: &scarab_forge::RepoRef,
     gov: &RunGovernance,
     run: &RunId,
+    creates_run: bool,
     now: scarab_engine::Timestamp,
     params: Option<&std::collections::BTreeMap<String, serde_json::Value>>,
     event_facts: &serde_json::Map<String, serde_json::Value>,
     builtins: Vec<scarab_policy::evaluate::PolicyResult>,
-) -> Result<Result<(), AdmissionRefusal>, TriggerError> {
+) -> Result<Result<bool, AdmissionRefusal>, TriggerError> {
     use scarab_policy::evaluate::evaluate_with_builtins;
     use scarab_policy::policy::Checkpoint;
     use scarab_policy::run_create;
@@ -5972,7 +5981,7 @@ async fn consult_run_create(
     // default denies it until an org lists the plugin (ADR-0075 §7). So is
     // a Run a built-in Environment rule applies to (ADR-0078 §6).
     if stored.is_empty() && !run_create::has_plugin_gate(ir) && builtins.is_empty() {
-        return Ok(Ok(()));
+        return Ok(Ok(false));
     }
 
     let linked = links.principal_of(event, repo).await?;
@@ -6018,6 +6027,19 @@ async fn consult_run_create(
         decision,
         at: now.0,
     };
+    if !denied && creates_run {
+        let row = scarab_policy::store::RunCreationRow {
+            run_id: run.0.clone(),
+            ir_version: ir.ir_version,
+            event_schema_version: EVENT_VERSION,
+            created_at: now.0,
+        };
+        let (_, written) = policies
+            .record_run_create_decision(&record, &row)
+            .await
+            .map_err(policy_store_err)?;
+        return Ok(Ok(written));
+    }
     let decision_id = policies
         .record_decision(&record)
         .await
@@ -6028,7 +6050,7 @@ async fn consult_run_create(
             messages,
         }));
     }
-    Ok(Ok(()))
+    Ok(Ok(false))
 }
 
 /// Which trigger a dispatch opts into: a human [`Manual`](DispatchKind::Manual)
@@ -6637,6 +6659,7 @@ fn k8s_overlay_reserved_keys(overlay: &serde_json::Value) -> Vec<String> {
 async fn persist_run_from_ir(
     db: &dyn Db,
     run: &RunId,
+    run_row_written: bool,
     ir: &scarab_pipeline::PipelineIr,
     event: &scarab_forge::Event,
     pipeline: &str,
@@ -6647,8 +6670,12 @@ async fn persist_run_from_ir(
     concurrency_group: Option<&str>,
     now: Timestamp,
 ) -> Result<(), TriggerError> {
-    db.begin_run_creation(run, ir.ir_version, EVENT_VERSION, now)
-        .await?;
+    // The Run's first row may already be written, in its `run.create`
+    // decision's transaction (git-bug bbc433e).
+    if !run_row_written {
+        db.begin_run_creation(run, ir.ir_version, EVENT_VERSION, now)
+            .await?;
+    }
     let written = write_run_from_ir(
         db,
         run,

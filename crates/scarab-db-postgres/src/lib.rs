@@ -307,19 +307,9 @@ impl Db for PostgresDb {
         event_schema_version: u32,
         at: Timestamp,
     ) -> Result<(), DbError> {
-        sqlx::query(
-            "INSERT INTO runs (id, status, ir_version, event_schema_version, created_at, updated_at,
-                               creating)
-             VALUES ($1, $2, $3, $4, $5, $5, TRUE)",
-        )
-        .bind(&run.0)
-        .bind(run_status_str(RunStatus::Pending))
-        .bind(ir_version as i32)
-        .bind(event_schema_version as i32)
-        .bind(at.0)
-        .execute(self.pool())
-        .await
-        .map_err(db_err)?;
+        insert_creating_run(self.pool(), &run.0, ir_version, event_schema_version, at.0)
+            .await
+            .map_err(db_err)?;
         Ok(())
     }
 
@@ -3763,6 +3753,34 @@ impl scarab_project::SecretCoverageStore for PostgresDb {
 // Kept explicit (rather than leaning on serde) so the on-disk vocabulary is
 // visible and independent of Rust identifier spelling.
 // ---------------------------------------------------------------------------
+
+/// The first row of a Run whose creation has begun (`creating = TRUE`):
+/// [`Db::begin_run_creation`], and the `run.create` decision's transaction
+/// (git-bug bbc433e).
+pub(crate) async fn insert_creating_run<'e, E>(
+    executor: E,
+    run_id: &str,
+    ir_version: u32,
+    event_schema_version: u32,
+    at: i64,
+) -> Result<(), sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query(
+        "INSERT INTO runs (id, status, ir_version, event_schema_version, created_at, updated_at,
+                           creating)
+         VALUES ($1, $2, $3, $4, $5, $5, TRUE)",
+    )
+    .bind(run_id)
+    .bind(run_status_str(RunStatus::Pending))
+    .bind(ir_version as i32)
+    .bind(event_schema_version as i32)
+    .bind(at)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
 
 fn run_status_str(s: RunStatus) -> &'static str {
     match s {

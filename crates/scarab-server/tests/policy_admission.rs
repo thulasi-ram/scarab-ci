@@ -637,3 +637,70 @@ async fn postgres_records_the_refusal_in_the_org_log_and_the_audit_with_its_run(
     ));
     tdb.cleanup().await;
 }
+
+/// Make every insert into `table` fail, in the throwaway database.
+async fn refuse_inserts(pool: &sqlx::PgPool, table: &str) {
+    sqlx::query(&format!(
+        "CREATE FUNCTION refuse_{table}() RETURNS trigger LANGUAGE plpgsql AS
+         $$ BEGIN RAISE EXCEPTION 'refused by the test'; END $$"
+    ))
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(&format!(
+        "CREATE TRIGGER refuse_{table} BEFORE INSERT ON {table}
+         FOR EACH ROW EXECUTE FUNCTION refuse_{table}()"
+    ))
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// git-bug bbc433e: the allow decision was recorded, and then the Run's
+/// first row written separately, so a failure between the two left a
+/// decision naming a Run that was never created. Both are one transaction
+/// now: when the Run's row cannot be written, no decision is left.
+#[tokio::test]
+async fn postgres_a_run_that_cannot_be_written_leaves_no_allow_decision() {
+    let Some(tdb) = common::fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let pg = Arc::new(scarab_db_postgres::PostgresDb::with_pool(tdb.pool.clone()));
+    pg.migrate().await.unwrap();
+    // An audit Policy: the Run is allowed and the decision recorded with it.
+    add(pg.as_ref(), "pol-1", org(), deny_local_library("audit")).await;
+    refuse_inserts(&tdb.pool, "runs").await;
+
+    let result = push_with(pg.as_ref(), pg.as_ref(), &forge()).await;
+    assert!(
+        matches!(&result, Ok(o) if o.runs.is_empty()) || result.is_err(),
+        "{result:?}"
+    );
+    assert!(
+        pg.org_decisions("acme", 0, None).await.unwrap().is_empty(),
+        "an allow decision names a Run that was never created"
+    );
+    tdb.cleanup().await;
+}
+
+/// The other half of the same transaction: when the decision cannot be
+/// recorded, no Run is created.
+#[tokio::test]
+async fn postgres_a_decision_that_cannot_be_written_creates_no_run() {
+    let Some(tdb) = common::fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let pg = Arc::new(scarab_db_postgres::PostgresDb::with_pool(tdb.pool.clone()));
+    pg.migrate().await.unwrap();
+    add(pg.as_ref(), "pol-1", org(), deny_local_library("audit")).await;
+    refuse_inserts(&tdb.pool, "policy_decisions").await;
+
+    let err = push_with(pg.as_ref(), pg.as_ref(), &forge())
+        .await
+        .expect_err("fail closed");
+    assert!(err.to_string().contains("refused by the test"), "{err}");
+    assert!(pg.list_runs(100).await.unwrap().is_empty());
+    tdb.cleanup().await;
+}

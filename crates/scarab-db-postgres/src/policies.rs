@@ -17,7 +17,7 @@ use scarab_policy::evaluate::{DecisionOutcome, PolicyDecision, PolicyResult};
 use scarab_policy::policy::{Checkpoint, Policy};
 use scarab_policy::store::{
     decision_page_limit, DecisionCursor, DecisionRecord, NewPolicy, PolicyChange, PolicyScope,
-    PolicyStore, PolicyStoreError, PolicyVersion, StoredPolicy,
+    PolicyStore, PolicyStoreError, PolicyVersion, RunCreationRow, StoredPolicy,
 };
 
 use crate::PostgresDb;
@@ -378,39 +378,28 @@ impl PolicyStore for PostgresDb {
     }
 
     async fn record_decision(&self, record: &DecisionRecord) -> Result<String, PolicyStoreError> {
-        let d = &record.decision;
-        let results = serde_json::to_value(&d.results)
-            .map_err(|e| PolicyStoreError::Invalid(e.to_string()))?;
-        let outcome = match d.outcome {
-            DecisionOutcome::Allow => "allow",
-            DecisionOutcome::Deny { .. } => "deny",
-        };
-        sqlx::query(&format!(
-            "INSERT INTO policy_decisions ({DECISION_COLUMNS}) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)"
-        ))
-        .bind(&record.id)
-        .bind(&record.org)
-        .bind(&record.project)
-        .bind(&record.run_id)
-        .bind(&record.step_id)
-        .bind(record.attempt.map(i64::from))
-        .bind(d.checkpoint.as_str())
-        .bind(i32::try_from(d.schema_version).unwrap_or(i32::MAX))
-        .bind(&d.input)
-        .bind(&d.policy_set_digest)
-        .bind(outcome)
-        .bind(serde_json::json!(d.messages()))
-        .bind(&results)
-        .bind(record.at)
-        .execute(self.pool())
-        .await
-        .map_err(|e| match violated_index(&e) {
-            // The step.admit index, or the primary key: recorded already.
-            Some(_) => PolicyStoreError::Conflict,
-            None => store_err(e),
-        })?;
+        insert_decision(self.pool(), record).await?;
         Ok(record.id.clone())
+    }
+
+    async fn record_run_create_decision(
+        &self,
+        record: &DecisionRecord,
+        run: &RunCreationRow,
+    ) -> Result<(String, bool), PolicyStoreError> {
+        let mut tx = self.pool().begin().await.map_err(store_err)?;
+        insert_decision(&mut *tx, record).await?;
+        crate::insert_creating_run(
+            &mut *tx,
+            &run.run_id,
+            run.ir_version,
+            run.event_schema_version,
+            run.created_at,
+        )
+        .await
+        .map_err(store_err)?;
+        tx.commit().await.map_err(store_err)?;
+        Ok((record.id.clone(), true))
     }
 
     async fn decision(&self, id: &str) -> Result<Option<DecisionRecord>, PolicyStoreError> {
@@ -459,4 +448,48 @@ impl PolicyStore for PostgresDb {
         .map_err(store_err)?;
         rows.iter().map(decision_from_row).collect()
     }
+}
+
+/// One `policy_decisions` row. [`PolicyStoreError::Conflict`] when the
+/// `step.admit` index or the primary key says it is recorded already.
+async fn insert_decision<'e, E>(
+    executor: E,
+    record: &DecisionRecord,
+) -> Result<(), PolicyStoreError>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let d = &record.decision;
+    let results =
+        serde_json::to_value(&d.results).map_err(|e| PolicyStoreError::Invalid(e.to_string()))?;
+    let outcome = match d.outcome {
+        DecisionOutcome::Allow => "allow",
+        DecisionOutcome::Deny { .. } => "deny",
+    };
+    sqlx::query(&format!(
+        "INSERT INTO policy_decisions ({DECISION_COLUMNS}) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)"
+    ))
+    .bind(&record.id)
+    .bind(&record.org)
+    .bind(&record.project)
+    .bind(&record.run_id)
+    .bind(&record.step_id)
+    .bind(record.attempt.map(i64::from))
+    .bind(d.checkpoint.as_str())
+    .bind(i32::try_from(d.schema_version).unwrap_or(i32::MAX))
+    .bind(&d.input)
+    .bind(&d.policy_set_digest)
+    .bind(outcome)
+    .bind(serde_json::json!(d.messages()))
+    .bind(&results)
+    .bind(record.at)
+    .execute(executor)
+    .await
+    .map_err(|e| match violated_index(&e) {
+        // The step.admit index, or the primary key: recorded already.
+        Some(_) => PolicyStoreError::Conflict,
+        None => store_err(e),
+    })?;
+    Ok(())
 }

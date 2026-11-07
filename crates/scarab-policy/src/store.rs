@@ -217,6 +217,21 @@ pub trait PolicyStore: Send + Sync {
     /// when a `step.admit` decision for the same Attempt exists.
     async fn record_decision(&self, record: &DecisionRecord) -> Result<String, PolicyStoreError>;
 
+    /// Records a `run.create` allow decision and, where the store can, the
+    /// first row of the Run it admits (`run`) in the same transaction
+    /// (git-bug bbc433e), so neither exists without the other. Returns the
+    /// decision id and whether the Run's row was written; when it was not,
+    /// the caller writes it next, as before. A store that also holds the
+    /// Runs (Postgres) writes both; the default records the decision only.
+    async fn record_run_create_decision(
+        &self,
+        record: &DecisionRecord,
+        run: &RunCreationRow,
+    ) -> Result<(String, bool), PolicyStoreError> {
+        let _ = run;
+        Ok((self.record_decision(record).await?, false))
+    }
+
     /// One recorded decision by id.
     async fn decision(&self, id: &str) -> Result<Option<DecisionRecord>, PolicyStoreError>;
 
@@ -235,6 +250,17 @@ pub trait PolicyStore: Send + Sync {
         limit: usize,
         before: Option<&DecisionCursor>,
     ) -> Result<Vec<DecisionRecord>, PolicyStoreError>;
+}
+
+/// The first row of a Run, as `Db::begin_run_creation` writes it: the Run
+/// exists but is still being created, so nothing schedules it until its
+/// creation finishes, and the creation sweep ends it if it never does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunCreationRow {
+    pub run_id: String,
+    pub ir_version: u32,
+    pub event_schema_version: u32,
+    pub created_at: i64,
 }
 
 /// A page size as stores apply it.
