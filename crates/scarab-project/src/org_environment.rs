@@ -97,8 +97,27 @@ pub fn normalize_display_name(display_name: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Invisible characters that change how text around them reads: bidi
+/// embeddings, overrides and isolates, zero-width spaces and joiners, the
+/// word joiner and its kin, the byte order mark and the soft hyphen. A
+/// display name holding one could show as another Environment's name.
+fn is_invisible_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+    )
+}
+
 /// The display name rule: not empty or blank (none is `None`), no control
-/// characters, at most [`MAX_ORG_ENVIRONMENT_DISPLAY_NAME_CHARS`].
+/// characters, no invisible bidi or zero-width characters, at most
+/// [`MAX_ORG_ENVIRONMENT_DISPLAY_NAME_CHARS`].
 pub fn validate_org_environment_display_name(
     display_name: &str,
 ) -> Result<(), OrgEnvironmentError> {
@@ -108,6 +127,11 @@ pub fn validate_org_environment_display_name(
     }
     if display_name.chars().any(char::is_control) {
         return invalid("display name must not contain control characters".into());
+    }
+    if display_name.chars().any(is_invisible_format_char) {
+        return invalid(
+            "display name must not contain invisible bidi or zero-width characters".into(),
+        );
     }
     if display_name.chars().count() > MAX_ORG_ENVIRONMENT_DISPLAY_NAME_CHARS {
         return invalid(format!(
@@ -291,6 +315,9 @@ mod tests {
             "",
             "   ",
             "Prod\n",
+            "Prod\u{202E}",
+            "Pro\u{200B}d",
+            "\u{2066}prod\u{2069}",
             &"d".repeat(MAX_ORG_ENVIRONMENT_DISPLAY_NAME_CHARS + 1),
         ] {
             e.display_name = Some(bad.to_string());
