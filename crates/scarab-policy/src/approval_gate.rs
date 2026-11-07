@@ -62,7 +62,7 @@ pub fn upstream_approval_gates<'a>(ir: &'a PipelineIr, step: &str) -> Vec<&'a St
     ir.steps
         .iter()
         .filter(|s| seen.contains(s.id.as_str()))
-        .filter(|s| is_manual_gate(s) && s.environment_approval_gate != Some(false))
+        .filter(|s| s.counts_as_environment_approval_gate())
         .collect()
 }
 

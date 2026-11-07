@@ -9521,28 +9521,25 @@ fn gate_approvers(events: &[EventKind], step: &StepId) -> Vec<String> {
     scarab_engine::gate_approvers(events, step)
 }
 
-/// Whether `step` of `run` is an Environment approval gate (ADR-0078 §1), as
-/// Run creation marked it in the stored IR. A gate of a Run created before
-/// the mark existed counts as one: before ADR-0078 every `manual` gate of an
-/// Environment-governed Run needed the approvers.
+/// Whether `step` of `run`, a Run an Environment governs, is an Environment
+/// approval gate (ADR-0078 §1), as Run creation marked it in the stored IR
+/// ([`scarab_pipeline::StepSpec::counts_as_environment_approval_gate`]). A
+/// Run whose stored IR cannot be read, or that has no such Step, counts as
+/// one: fail-closed, the approvers are asked.
 async fn is_environment_approval_gate(
     st: &AppState,
     run: &RunId,
     step: &StepId,
 ) -> Result<bool, ApiError> {
-    let ir = st.db.run_ir(run).await?;
-    let mark = ir
+    let ir = st
+        .db
+        .run_ir(run)
+        .await?
+        .and_then(|ir| serde_json::from_value::<scarab_pipeline::PipelineIr>(ir).ok());
+    Ok(ir
         .as_ref()
-        .and_then(|ir| ir.get("steps"))
-        .and_then(|s| s.as_array())
-        .and_then(|steps| {
-            steps
-                .iter()
-                .find(|s| s.get("id").and_then(|i| i.as_str()) == Some(step.0.as_str()))
-        })
-        .and_then(|s| s.get("environment_approval_gate"))
-        .and_then(|m| m.as_bool());
-    Ok(mark != Some(false))
+        .and_then(|ir| ir.steps.iter().find(|s| s.id == step.0))
+        .is_none_or(|s| s.counts_as_environment_approval_gate()))
 }
 
 /// Approve a `manual` gate (ADR-0008, 0037). The authenticated principal's

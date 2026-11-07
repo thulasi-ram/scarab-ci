@@ -1107,6 +1107,15 @@ impl StepSpec {
         self.gate.is_some()
     }
 
+    /// In a Run an Environment governs, whether this Step is an
+    /// **Environment approval gate** (ADR-0078 §1): a `manual` gate that Run
+    /// creation marked one, or left unmarked. A gate is unmarked only in a
+    /// Run created before the mark existed, when every `manual` gate of a
+    /// governed Run needed the approvers, so it counts as one.
+    pub fn counts_as_environment_approval_gate(&self) -> bool {
+        self.gate.as_deref() == Some("manual") && self.environment_approval_gate != Some(false)
+    }
+
     /// Is this a build step (ADR-0018 rootless image build)?
     pub fn is_build(&self) -> bool {
         self.build.is_some()
