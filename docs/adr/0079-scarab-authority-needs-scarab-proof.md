@@ -67,17 +67,19 @@ proof does it accept, and whose?
 
 ### 2. Self-service merge (ADR-0069 §6, amended)
 
-- **The folded Principal holds a usable passkey.** The merge also needs an
-  assertion from one of the folded Principal's passkeys, in the same flow as the
-  link, next to the surviving Principal's always-ask step-up. Without it, the link
-  changes nothing.
-- **The folded Principal holds no usable passkey.** Unchanged: the OAuth round-trip
+- **The folded Principal holds any passkey**, a flagged one included. The merge
+  also needs an assertion from one of the folded Principal's passkeys, in the same
+  flow as the link. The surviving Principal's proof is the window step-up the link
+  already asks for. Without the assertion, the link changes nothing.
+- **The folded Principal holds no passkey.** Unchanged: the OAuth round-trip
   is enough. Whoever controls that sign-in could already sign in as that Principal
   and enroll its first passkey (ADR-0073 §2), so the merge gives away nothing the
   login did not. This covers the common onboarding case: a Principal created by
   forge import that nobody has signed in as.
-- **The folded Principal's passkeys are lost.** An Owner resets them (the existing
-  `passkey.reset`); the merge then proceeds as above.
+- **The folded Principal's passkeys are lost or all flagged.** An Owner resets
+  them (the existing `passkey.reset`); the merge then proceeds as above. A flagged
+  passkey counts as held: otherwise the merge would skip the rule that an Owner
+  resets flagged passkeys before a fresh login can enroll a new one (ADR-0073 §2).
 
 ### 3. Passkeys are not moved
 
