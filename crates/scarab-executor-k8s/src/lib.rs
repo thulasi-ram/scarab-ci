@@ -3934,7 +3934,14 @@ fn step_secrets_secret(
             }),
             ..Default::default()
         },
-        string_data: Some(spec.resolved_secrets.iter().cloned().collect()),
+        // `data`, not `stringData`: a value is bytes and reaches the file
+        // unchanged.
+        data: Some(
+            spec.resolved_secrets
+                .iter()
+                .map(|(k, v)| (k.clone(), k8s_openapi::ByteString(v.clone())))
+                .collect(),
+        ),
         ..Default::default()
     })
 }
@@ -10498,9 +10505,10 @@ mod tests {
         // The Secret the volume and the reference name holds every value.
         let secret = step_secrets_secret("scarab-x", "ns", &Pod::default(), &spec).unwrap();
         assert_eq!(secret.metadata.name.as_deref(), Some("scarab-x-secrets"));
-        let data = secret.string_data.unwrap();
-        assert_eq!(data["DB_PASSWORD"], "sekret-db-pw");
-        assert_eq!(data["ARGOCD_AUTH_TOKEN"], "sekret-argo");
+        assert!(secret.string_data.is_none(), "values are bytes, in `data`");
+        let data = secret.data.unwrap();
+        assert_eq!(data["DB_PASSWORD"].0, b"sekret-db-pw");
+        assert_eq!(data["ARGOCD_AUTH_TOKEN"].0, b"sekret-argo");
 
         // Nothing resolved (no deploy context, a locked-out Run): no Secret,
         // so no volume or reference to one that would never exist.

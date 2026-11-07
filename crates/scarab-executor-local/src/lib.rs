@@ -135,7 +135,7 @@ fn write_secret_files(dir: &std::path::Path, spec: &StepSpec) -> std::io::Result
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        options.open(dir.join(name))?.write_all(value.as_bytes())?;
+        options.open(dir.join(name))?.write_all(value)?;
     }
     Ok(())
 }
@@ -307,6 +307,12 @@ impl Executor for LocalExecutor {
             cmd.env("SCARAB_SECRETS", &secrets_dir);
             for (key, value) in spec.resolved_secrets.iter() {
                 if spec.secrets.iter().any(|s| s.env && &s.name == key) {
+                    let Ok(value) = std::str::from_utf8(value) else {
+                        let _ = std::fs::remove_dir_all(&secrets_dir);
+                        return Err(ExecError::Refused(format!(
+                            "secret `{key}` is not UTF-8 text, so it cannot be an environment variable"
+                        )));
+                    };
                     cmd.env(key, value);
                 }
             }

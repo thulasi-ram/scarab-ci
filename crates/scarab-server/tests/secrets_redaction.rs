@@ -27,7 +27,7 @@ async fn injected_secret_is_redacted_from_stored_and_streamed_logs() {
     let env = resolve_step_secrets(&secrets, &logs, &scope(), &["TOKEN".to_string()], false)
         .await
         .unwrap();
-    assert_eq!(env, vec![("TOKEN".to_string(), "sup3r-s3cret".to_string())]);
+    assert_eq!(env, vec![("TOKEN".to_string(), b"sup3r-s3cret".to_vec())]);
 
     let (run, step, attempt) = (
         RunId("run-1".into()),
