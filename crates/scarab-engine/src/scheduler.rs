@@ -1668,6 +1668,40 @@ async fn cancel_open_gate_attempt(db: &dyn Db, run: &RunId, step: &StepRun) -> R
     Ok(())
 }
 
+/// The reason journalled on `StepSkipped` for a gate whose dependents have all
+/// finished, so its verdict can no longer change the Run (git-bug 2c37802).
+pub const GATE_NO_LONGER_NEEDED: &str = "no longer needed: every step that needs it has finished";
+
+/// Whether gate `step`'s current `Skipped` is the "no longer needed" skip:
+/// its latest move to `Skipped` is the one journalled with a `StepSkipped`
+/// carrying [`GATE_NO_LONGER_NEEDED`], and no re-arm follows it. A re-arm is
+/// a transition to `Pending`, or a rerun whose `invalidated` names the gate.
+/// A later skip without a `StepSkipped` (a dead upstream) is not this skip.
+fn skipped_as_unneeded(events: &[EventKind], step: &StepId) -> bool {
+    // The unneeded skip journals `StepSkipped` and then its transition, so a
+    // transition to `Skipped` is that skip only when the step's previous
+    // event is that `StepSkipped`.
+    let mut skipped_without_reason = false;
+    for e in events.iter().rev() {
+        match &e.kind {
+            EventPayload::StepSkipped { step: s, reason } if s == step => {
+                return reason == GATE_NO_LONGER_NEEDED;
+            }
+            EventPayload::StepTransitioned { step: s, to, .. } if s == step => {
+                if skipped_without_reason || *to != StepStatus::Skipped {
+                    return false;
+                }
+                skipped_without_reason = true;
+            }
+            EventPayload::RunRerunRequested { invalidated, .. } if invalidated.contains(step) => {
+                return false;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Suspend predicate (slice b, criterion 3): the run may suspend iff at least
 /// one step is **waiting** — a gate that is Pending with every need
 /// Succeeded — no step is `Ready`/`Running`, and every other non-terminal
@@ -2700,6 +2734,11 @@ impl<'a> Scheduler<'a> {
         // own timer / `gate_expires_after`. Before any promotion, so a gate
         // that resolves now unblocks (or Skips) its dependents this same pass.
         self.evaluate_waiting_gates(leader, run).await?;
+        // A gate whose dependents have all finished can no longer change the
+        // Run's outcome: it ends Skipped, so the Run settles now rather than
+        // suspending on it. Before the suspend check below, which would
+        // otherwise return early on that very wait.
+        self.settle_unneeded_gates(run).await?;
 
         // A suspended run is one whose only outstanding work is gate waits.
         // It reopens as soon as that stops being true — a gate resolved, a
@@ -4456,6 +4495,90 @@ impl<'a> Scheduler<'a> {
         Ok(())
     }
 
+    /// Gates whose verdict can no longer change the Run (git-bug 2c37802).
+    ///
+    /// - A `Pending` gate (waiting, or not yet reached) with at least one
+    ///   dependent, all of them terminal, ends `Skipped` with the reason
+    ///   [`GATE_NO_LONGER_NEEDED`]; its open wait, if any, is closed
+    ///   `Cancelled`. The dependents can only be terminal without the gate
+    ///   (a sibling failed, a dependent was cancelled), so no approval can
+    ///   matter. A leaf gate (no dependents) keeps waiting: its verdict is
+    ///   the Run's outcome.
+    /// - A gate skipped that way goes back to `Pending` once a dependent is
+    ///   no longer terminal (a rerun of the failed sibling re-armed it), so
+    ///   the dependent waits on the gate again instead of being skipped for
+    ///   a gate nobody refused. A gate `Skipped` for any other reason (a dead
+    ///   upstream, a `when:` exclusion) is left alone.
+    async fn settle_unneeded_gates(&self, run: &RunId) -> Result<(), SchedulerError> {
+        let steps = self.db.steps_of_run(run).await?;
+        if !steps.iter().any(StepRun::is_gate) {
+            return Ok(());
+        }
+        let mut events: Option<Vec<EventKind>> = None;
+        for gate in steps.iter().filter(|s| s.is_gate()) {
+            let mut dependents = steps.iter().filter(|s| s.needs.contains(&gate.step));
+            let Some(first) = dependents.next() else {
+                continue; // a leaf gate: its verdict is the outcome
+            };
+            let all_finished =
+                first.status.is_terminal() && dependents.all(|d| d.status.is_terminal());
+            match gate.status {
+                StepStatus::Pending if all_finished => {
+                    let now = self.clock.now().await;
+                    let cancelled = AttemptStamp::Outcome(AttemptOutcome::Cancelled);
+                    let stamp = open_gate_attempt(gate).map(|a| (&a.id, &cancelled));
+                    let journal = [
+                        EventPayload::StepSkipped {
+                            step: gate.step.clone(),
+                            reason: GATE_NO_LONGER_NEEDED.to_string(),
+                        },
+                        EventPayload::StepTransitioned {
+                            step: gate.step.clone(),
+                            from: StepStatus::Pending,
+                            to: StepStatus::Skipped,
+                        },
+                    ]
+                    .map(|kind| event(run, kind, now));
+                    // Fenced on the Attempt read: a wait opened or closed
+                    // since is a Conflict, and the next pass decides again.
+                    match self
+                        .db
+                        .commit_step_transition(
+                            run,
+                            &gate.step,
+                            StepStatus::Pending,
+                            StepStatus::Skipped,
+                            AttemptFrontier::Is(gate.attempts.last().map(|a| &a.id)),
+                            stamp,
+                            &journal,
+                            &[],
+                        )
+                        .await
+                    {
+                        Ok(()) | Err(DbError::Conflict) => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+                StepStatus::Skipped if !all_finished => {
+                    if events.is_none() {
+                        events = Some(self.db.events(run).await?);
+                    }
+                    if skipped_as_unneeded(events.as_deref().unwrap_or_default(), &gate.step) {
+                        self.transition_step(
+                            run,
+                            &gate.step,
+                            StepStatus::Skipped,
+                            StepStatus::Pending,
+                        )
+                        .await?;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     /// The decision, if any, for a waiting gate at `now` — measured from ITS
     /// Attempt's frozen `started_at`, never from the run's suspension.
     ///
@@ -5535,5 +5658,60 @@ fn event(run: &RunId, kind: EventPayload, at: Timestamp) -> EventKind {
         run: run.clone(),
         kind,
         at,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ev(kind: EventPayload) -> EventKind {
+        event(&RunId("r".into()), kind, Timestamp(0))
+    }
+
+    fn unneeded_skip(gate: &StepId) -> [EventKind; 2] {
+        [
+            ev(EventPayload::StepSkipped {
+                step: gate.clone(),
+                reason: GATE_NO_LONGER_NEEDED.to_string(),
+            }),
+            ev(EventPayload::StepTransitioned {
+                step: gate.clone(),
+                from: StepStatus::Pending,
+                to: StepStatus::Skipped,
+            }),
+        ]
+    }
+
+    /// Review CC-5 (git-bug 2c37802): a rerun re-arms the gate through
+    /// `RunRerunRequested` alone, and a dead upstream then skips it with no
+    /// `StepSkipped`. That latest skip is not the "no longer needed" one, so
+    /// the gate is not re-armed for it (a spurious Skipped→Pending pair).
+    #[test]
+    fn only_the_latest_skip_counts_as_unneeded() {
+        let gate = StepId("approve".into());
+        let mut events = unneeded_skip(&gate).to_vec();
+        assert!(skipped_as_unneeded(&events, &gate));
+
+        events.push(ev(EventPayload::RunRerunRequested {
+            target: StepId("build".into()),
+            invalidated: vec![StepId("build".into()), gate.clone()],
+            by: None,
+            widened: vec![],
+        }));
+        assert!(!skipped_as_unneeded(&events, &gate), "a rerun re-armed it");
+
+        events.push(ev(EventPayload::StepTransitioned {
+            step: gate.clone(),
+            from: StepStatus::Pending,
+            to: StepStatus::Skipped,
+        }));
+        assert!(
+            !skipped_as_unneeded(&events, &gate),
+            "a dead upstream skipped it"
+        );
+
+        events.extend(unneeded_skip(&gate));
+        assert!(skipped_as_unneeded(&events, &gate));
     }
 }

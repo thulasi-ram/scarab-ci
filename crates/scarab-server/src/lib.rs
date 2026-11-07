@@ -1665,6 +1665,9 @@ pub enum ApiError {
     /// says where it went (410). The per-repo environment writes, replaced by
     /// the org-level Environment (ADR-0071).
     Gone(String),
+    /// A conditional request's `If-Match` / `If-None-Match` did not hold
+    /// (412); the text says why.
+    PreconditionFailed(String),
     Db(DbError),
     /// `403 step_up_required` (ADR-0073 §5): a crown-jewel operation without
     /// a valid StepUpConfirmation. JSON body: [`step_up::StepUpRefusal`].
@@ -1747,6 +1750,7 @@ impl IntoResponse for ApiError {
             ApiError::Forbidden => (StatusCode::FORBIDDEN, "insufficient role").into_response(),
             ApiError::Denied(m) => (StatusCode::FORBIDDEN, m).into_response(),
             ApiError::Gone(m) => (StatusCode::GONE, m).into_response(),
+            ApiError::PreconditionFailed(m) => (StatusCode::PRECONDITION_FAILED, m).into_response(),
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m).into_response(),
             ApiError::Conflict(m) => (StatusCode::CONFLICT, m).into_response(),
             ApiError::NotImplemented(m) => (StatusCode::NOT_IMPLEMENTED, m).into_response(),
@@ -7187,12 +7191,14 @@ pub async fn drain_forge_statuses(
 ///
 /// - it is from an older generation than the run's current one — the run
 ///   was reopened since, and the newer generation's posts own the forge; or
-/// - it is a non-terminal post of the current generation, the run has
-///   settled in it, and that settle's terminal post is no longer pending
-///   (delivered, or dead-lettered): a run goes non-terminal → terminal once
-///   per generation, so the terminal post is the newer word. While the
-///   terminal post is still pending the non-terminal one is posted first —
-///   the ordinary in-order drain.
+/// - it is a non-terminal post of the current generation and the run has
+///   settled in it: a run goes non-terminal → terminal once per generation,
+///   so the terminal post is the newer word. This holds whatever state the
+///   terminal post's delivery is in. Asking whether the terminal post is
+///   still pending is check-then-act across replicas: replica A can have
+///   the forge accept the terminal post and not yet mark it dispatched
+///   while replica B sees it pending and posts `pending` after it (red team
+///   F9), leaving a settled Run's check pending for good.
 async fn status_post_superseded(
     db: &dyn Db,
     run: &RunId,
@@ -7206,14 +7212,10 @@ async fn status_post_superseded(
     if to.is_terminal() || generation != current {
         return Ok(false);
     }
-    match db.run_status(run).await? {
-        Some(settled) if settled.is_terminal() => Ok(!db
-            .outbox_key_pending(&scarab_engine::run_status_post_key(
-                run, generation, settled,
-            ))
-            .await?),
-        _ => Ok(false),
-    }
+    Ok(db
+        .run_status(run)
+        .await?
+        .is_some_and(|settled| settled.is_terminal()))
 }
 
 /// The commit-status context a Run posts under: `scarab/<pipeline>`, one per
@@ -8059,13 +8061,41 @@ pub struct LinkIdentityResponse {
 /// authorize URL and plants a one-shot state cookie bound to THIS session; the
 /// shared callback then attaches the proven account, or merges in a Principal
 /// whose only way in it was. Never by email.
+///
+/// A link that would fold in a Principal holding passkeys is refused at the
+/// callback (the merge would move them to the caller): it needs
+/// `POST /v1/me/identities/link-moving-passkeys`, which always asks.
 #[utoipa::path(post, path = "/v1/me/identities/link", summary = "Begin linking another sign-in account (ADR-0069)", request_body = LinkIdentityRequest, responses((status = 200, body = LinkIdentityResponse), (status = 403, description = "not a browser session")))]
 async fn begin_link_identity(
     State(st): State<AppState>,
     headers: HeaderMap,
     Json(req): Json<LinkIdentityRequest>,
 ) -> Result<Response, ApiError> {
-    let (sid, _) = link_session(&st, &headers, Action::Write).await?;
+    begin_link(&st, &headers, &req, false).await
+}
+
+/// Begin linking another provider's account, allowing the merge to move the
+/// folded Principal's passkeys to the caller (git-bug def16bd). The same
+/// flow as `POST /v1/me/identities/link`, but its step-up always asks: a
+/// window is not enough to add passkeys to an account.
+#[utoipa::path(post, path = "/v1/me/identities/link-moving-passkeys", summary = "Begin linking another sign-in account whose Principal holds passkeys (ADR-0069)", request_body = LinkIdentityRequest, responses((status = 200, body = LinkIdentityResponse), (status = 403, description = "not a browser session")))]
+async fn begin_link_identity_moving_passkeys(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<LinkIdentityRequest>,
+) -> Result<Response, ApiError> {
+    begin_link(&st, &headers, &req, true).await
+}
+
+/// The two link POSTs. `moves_passkeys`: the link binding lets the merge
+/// move passkeys.
+async fn begin_link(
+    st: &AppState,
+    headers: &HeaderMap,
+    req: &LinkIdentityRequest,
+    moves_passkeys: bool,
+) -> Result<Response, ApiError> {
+    let (sid, _) = link_session(st, headers, Action::Write).await?;
     st.identities.as_ref().ok_or(ApiError::NotFound)?;
     let provider = st
         .oauth_provider(Some(&req.provider))?
@@ -8077,12 +8107,18 @@ async fn begin_link_identity(
     // provider and the expiry too. Off: the bare session hash, as before —
     // the POST is unguarded then anyway.
     let link = match st.step_up.service() {
-        Some(svc) => svc.link_binding(&flow.state, &session_hash(&sid), &flow.provider, expires_at),
+        Some(svc) => svc.link_binding(
+            &flow.state,
+            &session_hash(&sid),
+            &flow.provider,
+            expires_at,
+            moves_passkeys,
+        ),
         None => session_hash(&sid),
     };
     let flow = flow.for_link(&link, expires_at);
     let mut resp = Json(LinkIdentityResponse {
-        authorize_url: provider.authorize_redirect(&oauth_callback_url(&st), &flow),
+        authorize_url: provider.authorize_redirect(&oauth_callback_url(st), &flow),
     })
     .into_response();
     let cookie = format!(
@@ -8113,11 +8149,28 @@ async fn link_callback(
     // client input) — and the flow must not have outlived its step-up.
     let now = st.clock.now().await.0;
     let expires_at = flow.link_expires_at.unwrap_or(i64::MIN);
-    let expected = match st.step_up.service() {
-        Some(svc) => svc.link_binding(&flow.state, &session_hash(&sid), &flow.provider, expires_at),
+    // Which POST minted it decides whether the merge may move passkeys
+    // (git-bug def16bd). Step-up off: both bindings are the bare session
+    // hash (both POSTs are unguarded), so a flow of this session may.
+    let binding = |moves: bool| match st.step_up.service() {
+        Some(svc) => svc.link_binding(
+            &flow.state,
+            &session_hash(&sid),
+            &flow.provider,
+            expires_at,
+            moves,
+        ),
         None => session_hash(&sid),
     };
-    if now > expires_at || !scarab_identity::ct_eq(expected.as_bytes(), flow.link.as_bytes()) {
+    let matches =
+        |moves: bool| scarab_identity::ct_eq(binding(moves).as_bytes(), flow.link.as_bytes());
+    let passkeys = if matches(true) {
+        scarab_identity::MergePasskeys::Move
+    } else {
+        scarab_identity::MergePasskeys::Refuse
+    };
+    let minted = passkeys == scarab_identity::MergePasskeys::Move || matches(false);
+    if now > expires_at || !minted {
         if let Some(svc) = st.step_up.service() {
             let mut ev = step_up::event(
                 scarab_identity::security_event_kind::STEP_UP_REFUSED,
@@ -8152,12 +8205,48 @@ async fn link_callback(
             ApiError::Unauthorized
         })?;
     let now = st.clock.now().await.0;
-    let location = match store.link(&principal.subject, &identity, now).await {
-        Ok(scarab_identity::LinkOutcome::Merged { from }) => {
+    let location = match store
+        .link(&principal.subject, &identity, now, passkeys)
+        .await
+    {
+        Ok(scarab_identity::LinkOutcome::Merged {
+            from,
+            moved_passkeys,
+        }) => {
+            record_moved_passkeys(st, &principal.subject, &from, &moved_passkeys, &sid, now).await;
             format!(
                 "/settings/profile?identity_linked={}&merged={}",
                 flow.provider,
                 query_escape(&from)
+            )
+        }
+        Ok(scarab_identity::LinkOutcome::PasskeysWouldMove { from, passkeys }) => {
+            if let Some(svc) = st.step_up.service() {
+                let mut ev = step_up::event(
+                    scarab_identity::security_event_kind::STEP_UP_REFUSED,
+                    &principal.subject,
+                    "session:cookie".to_string(),
+                    None,
+                    now,
+                );
+                ev.op = Some("identity.link".to_string());
+                ev.session_hash = Some(session_hash(&sid));
+                ev.detail = serde_json::json!({
+                    "reason": "the merge would move passkeys; the link was confirmed by a window",
+                    "from": from,
+                    "passkeys": passkeys,
+                });
+                svc.record(ev).await;
+            }
+            let why = format!(
+                "that {} account is the only sign-in of `{from}`, who holds {passkeys} \
+                 passkey(s); merging moves them to you, so confirm this link with your passkey \
+                 (POST /v1/me/identities/link-moving-passkeys)",
+                flow.provider
+            );
+            format!(
+                "/settings/profile?identity_link_error={}",
+                query_escape(&why)
             )
         }
         Ok(_) => format!("/settings/profile?identity_linked={}", flow.provider),
@@ -8176,6 +8265,45 @@ async fn link_callback(
         resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
     }
     Ok(resp)
+}
+
+/// One `passkey.moved_on_merge` per passkey a link's merge moved from `from`
+/// to `into` (git-bug def16bd), through the security-event log. Best-effort:
+/// the merge has committed, and the always-ask confirmation of the link POST
+/// was recorded before it (`op.authorised`).
+async fn record_moved_passkeys(
+    st: &AppState,
+    into: &str,
+    from: &str,
+    moved: &[String],
+    sid: &str,
+    now: i64,
+) {
+    let Some(svc) = st.step_up.service() else {
+        if !moved.is_empty() {
+            tracing::info!(
+                from,
+                into,
+                passkeys = moved.len(),
+                "identity link: merge moved passkeys"
+            );
+        }
+        return;
+    };
+    for id in moved {
+        let mut ev = step_up::event(
+            scarab_identity::security_event_kind::PASSKEY_MOVED_ON_MERGE,
+            into,
+            "session:cookie".to_string(),
+            None,
+            now,
+        );
+        ev.op = Some("identity.link_moving_passkeys".to_string());
+        ev.passkey_id = Some(id.clone());
+        ev.session_hash = Some(session_hash(sid));
+        ev.detail = serde_json::json!({ "from": from, "into": into });
+        svc.record(ev).await;
+    }
 }
 
 /// Percent-encode a query value (everything but RFC 3986 unreserved).
@@ -13047,6 +13175,7 @@ impl utoipa::Modify for StepUpResponses {
         oauth_callback,
         auth_providers,
         begin_link_identity,
+        begin_link_identity_moving_passkeys,
         unlink_identity,
         logout,
         me,

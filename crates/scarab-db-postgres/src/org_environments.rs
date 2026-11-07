@@ -7,13 +7,24 @@ use sqlx::Row;
 
 use scarab_project::{
     ApprovalGateRules, EnvironmentProjectEligibility, EnvironmentProtectionRules, MissingGateMode,
-    OrgEnvironment, OrgEnvironmentError, OrgEnvironmentStore,
+    OrgEnvironment, OrgEnvironmentError, OrgEnvironmentStore, WritePrecondition,
 };
 
 use crate::PostgresDb;
 
+/// A store error as an [`OrgEnvironmentError`]. A deadlock (`40P01`, two
+/// admins writing the same rows in opposite orders) and a serialization
+/// failure (`40001`, under a non-default isolation level) mean a concurrent
+/// write won and nothing was stored: a retryable
+/// [`Conflict`](OrgEnvironmentError::Conflict), answered 409, never a 500
+/// (git-bug 66cce00).
 pub(crate) fn org_environment_store_err(e: sqlx::Error) -> OrgEnvironmentError {
-    OrgEnvironmentError::Store(e.to_string())
+    match &e {
+        sqlx::Error::Database(d) if matches!(d.code().as_deref(), Some("40P01" | "40001")) => {
+            OrgEnvironmentError::changed_concurrently()
+        }
+        _ => OrgEnvironmentError::Store(e.to_string()),
+    }
 }
 
 /// Build an [`OrgEnvironment`] from its `org_environments` row (selected with
@@ -124,9 +135,10 @@ where
 
 #[async_trait]
 impl OrgEnvironmentStore for PostgresDb {
-    async fn put_org_environment(
+    async fn put_org_environment_if(
         &self,
         env: &OrgEnvironment,
+        precondition: &WritePrecondition,
     ) -> Result<OrgEnvironment, OrgEnvironmentError> {
         // The server validates too; checking here keeps the store's contract
         // ("refuses an invalid env") true for every caller.
@@ -142,15 +154,49 @@ impl OrgEnvironmentStore for PostgresDb {
             .begin()
             .await
             .map_err(org_environment_store_err)?;
+        // `If-Match`: the stored Environment, locked, must be the one the
+        // caller read; the lock holds until this transaction's write commits.
+        if let WritePrecondition::Matches(tags) = precondition {
+            let current = sqlx::query(&format!(
+                "SELECT {ORG_ENVIRONMENT_COLUMNS} FROM org_environments
+                 WHERE org = $1 AND name = $2 FOR UPDATE"
+            ))
+            .bind(&env.org)
+            .bind(&env.name)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(org_environment_store_err)?;
+            let Some(current) = current else {
+                return Err(OrgEnvironmentError::PreconditionFailed(format!(
+                    "environment `{}` no longer exists; reload",
+                    env.name
+                )));
+            };
+            let patterns = eligible_project_patterns_of(&mut *tx, &env.org, &env.name).await?;
+            let stored = org_environment_from_row(&current, patterns)?.etag();
+            if !tags.iter().any(|t| t == "*" || *t == stored) {
+                return Err(OrgEnvironmentError::PreconditionFailed(format!(
+                    "environment `{}` changed since it was read; reload and retry",
+                    env.name
+                )));
+            }
+        }
+        // `If-None-Match: *`: create only.
+        let on_conflict = match precondition {
+            WritePrecondition::Absent => "DO NOTHING",
+            _ => {
+                "DO UPDATE SET
+                 display_name = EXCLUDED.display_name,
+                 description = EXCLUDED.description,
+                 updated_at = EXCLUDED.updated_at,
+                 updated_by = EXCLUDED.updated_by"
+            }
+        };
         let stored_row = sqlx::query(&format!(
             "INSERT INTO org_environments
                  (org, name, display_name, description, created_at, updated_at, updated_by)
              VALUES ($1, $2, $3, $4, $5, $6, $7)
-             ON CONFLICT (org, name) DO UPDATE SET
-                 display_name = EXCLUDED.display_name,
-                 description = EXCLUDED.description,
-                 updated_at = EXCLUDED.updated_at,
-                 updated_by = EXCLUDED.updated_by
+             ON CONFLICT (org, name) {on_conflict}
              RETURNING {ORG_ENVIRONMENT_COLUMNS}"
         ))
         .bind(&env.org)
@@ -160,9 +206,15 @@ impl OrgEnvironmentStore for PostgresDb {
         .bind(env.created_at)
         .bind(env.updated_at)
         .bind(&env.updated_by)
-        .fetch_one(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await
-        .map_err(org_environment_store_err)?;
+        .map_err(org_environment_store_err)?
+        .ok_or_else(|| {
+            OrgEnvironmentError::PreconditionFailed(format!(
+                "environment `{}` already exists",
+                env.name
+            ))
+        })?;
         let eligible_project_patterns =
             eligible_project_patterns_of(&mut *tx, &env.org, &env.name).await?;
         tx.commit().await.map_err(org_environment_store_err)?;

@@ -12,7 +12,7 @@ mod common;
 
 use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
-use scarab_project::{OrgEnvironment, OrgEnvironmentError, OrgEnvironmentStore};
+use scarab_project::{OrgEnvironment, OrgEnvironmentError, OrgEnvironmentStore, WritePrecondition};
 
 fn org_environment(org: &str, name: &str, at: i64) -> OrgEnvironment {
     OrgEnvironment {
@@ -338,5 +338,138 @@ async fn an_expecting_write_refuses_when_the_stored_value_moved() {
         .await
         .unwrap();
 
+    tdb.cleanup().await;
+}
+
+/// git-bug 66cce00: a write that loses to a concurrent one at the database
+/// (a serialization failure `40001`, or a deadlock `40P01`) is a retryable
+/// [`OrgEnvironmentError::Conflict`], not a store failure (a 500). The
+/// interleaving is constructed, not raced: tx1 holds the row, the store's
+/// write (on a pool whose transactions run SERIALIZABLE) blocks on it,
+/// then tx1 commits under it.
+#[tokio::test]
+async fn a_write_that_loses_a_serialization_race_is_a_conflict() {
+    let Some((tdb, db)) = migrated().await else {
+        return;
+    };
+    db.put_org_environment(&org_environment("acme", "prod", 1_000))
+        .await
+        .unwrap();
+    let rr_options = tdb
+        .pool
+        .connect_options()
+        .as_ref()
+        .clone()
+        .options([("default_transaction_isolation", "serializable")]);
+    let rr_pool = sqlx::PgPool::connect_with(rr_options).await.unwrap();
+    let rr = std::sync::Arc::new(PostgresDb::with_pool(rr_pool.clone()));
+
+    let mut tx1 = tdb.pool.begin().await.unwrap();
+    sqlx::query(
+        "UPDATE org_environments SET description = 'tx1' WHERE org = 'acme' AND name = 'prod'",
+    )
+    .execute(&mut *tx1)
+    .await
+    .unwrap();
+    let write = tokio::spawn({
+        let rr = rr.clone();
+        async move {
+            rr.put_org_environment(&org_environment("acme", "prod", 2_000))
+                .await
+        }
+    });
+    // Wait until the store's write is blocked on tx1's row lock.
+    let mut blocked = false;
+    for _ in 0..200 {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity
+             WHERE wait_event_type = 'Lock' AND query LIKE '%INSERT INTO org_environments%'",
+        )
+        .fetch_one(&tdb.pool)
+        .await
+        .unwrap();
+        if n > 0 {
+            blocked = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(blocked, "the store's write never blocked on tx1's row lock");
+    tx1.commit().await.unwrap();
+
+    let lost = write.await.unwrap();
+    assert!(
+        matches!(lost, Err(OrgEnvironmentError::Conflict(_))),
+        "{lost:?}"
+    );
+    assert_eq!(
+        db.get_org_environment("acme", "prod")
+            .await
+            .unwrap()
+            .unwrap()
+            .description,
+        "tx1",
+        "nothing of the losing write is stored"
+    );
+    rr_pool.close().await;
+    tdb.cleanup().await;
+}
+
+/// git-bug 66cce00: `If-None-Match: *` creates only; `If-Match` replaces only
+/// the Environment whose tag the caller read, checked under the row lock.
+#[tokio::test]
+async fn preconditions_create_only_and_replace_only_what_was_read() {
+    let Some((tdb, db)) = migrated().await else {
+        return;
+    };
+    let prod = org_environment("acme", "prod", 1_000);
+    let created = db
+        .put_org_environment_if(&prod, &WritePrecondition::Absent)
+        .await
+        .unwrap();
+    assert!(matches!(
+        db.put_org_environment_if(&prod, &WritePrecondition::Absent)
+            .await,
+        Err(OrgEnvironmentError::PreconditionFailed(_))
+    ));
+    let read = created.etag();
+    let edited = OrgEnvironment {
+        description: "edited".into(),
+        updated_at: 2_000,
+        ..prod.clone()
+    };
+    let replaced = db
+        .put_org_environment_if(&edited, &WritePrecondition::Matches(vec![read.clone()]))
+        .await
+        .unwrap();
+    assert_ne!(replaced.etag(), read);
+    // A second writer still holding the first tag loses, and stores nothing.
+    let stale = OrgEnvironment {
+        description: "stale".into(),
+        updated_at: 3_000,
+        ..prod.clone()
+    };
+    assert!(matches!(
+        db.put_org_environment_if(&stale, &WritePrecondition::Matches(vec![read]))
+            .await,
+        Err(OrgEnvironmentError::PreconditionFailed(_))
+    ));
+    assert_eq!(
+        db.get_org_environment("acme", "prod")
+            .await
+            .unwrap()
+            .unwrap()
+            .description,
+        "edited"
+    );
+    // A tag for an Environment that is gone fails too.
+    assert!(matches!(
+        db.put_org_environment_if(
+            &org_environment("acme", "dev", 1_000),
+            &WritePrecondition::Matches(vec![replaced.etag()])
+        )
+        .await,
+        Err(OrgEnvironmentError::PreconditionFailed(_))
+    ));
     tdb.cleanup().await;
 }

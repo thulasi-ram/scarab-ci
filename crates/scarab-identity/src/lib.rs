@@ -539,7 +539,29 @@ pub enum LinkOutcome {
     /// `from` outright — and `from` was folded into the caller: its bindings,
     /// approver entries and tokens now name the caller, its sessions are gone,
     /// and its id is kept (`merged_into`) so it can never be minted again.
-    Merged { from: String },
+    /// `moved_passkeys`: the ids of `from`'s passkeys, which now belong to
+    /// the caller (git-bug def16bd).
+    Merged {
+        from: String,
+        moved_passkeys: Vec<String>,
+    },
+    /// The merge would move `from`'s passkeys to the caller, and the link
+    /// was started under [`MergePasskeys::Refuse`]: nothing changed. A merge
+    /// that moves passkeys needs a confirmation bound to it, not a window.
+    PasskeysWouldMove { from: String, passkeys: usize },
+}
+
+/// Whether a link may fold in a Principal that holds passkeys
+/// ([`IdentityStore::link`]). A merge moves them to the caller, so a
+/// window-confirmed link must not: a stolen session inside its window would
+/// add the thief's passkey to the victim's account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergePasskeys {
+    /// A merge that would move passkeys changes nothing and answers
+    /// [`LinkOutcome::PasskeysWouldMove`].
+    Refuse,
+    /// A merge moves them.
+    Move,
 }
 
 /// Can `s` stand in a minted id as-is? Deliberately narrow: no `:` (it would
@@ -632,12 +654,15 @@ pub trait IdentityStore: Send + Sync {
     /// Principal whose only identity it is → merge that one into `principal`,
     /// atomically; held by a Principal with other identities, or `principal`
     /// already holding a different account on this provider → `Conflict`.
-    /// Never matches anything by email.
+    /// A merge that would move passkeys is made only under
+    /// [`MergePasskeys::Move`], decided in the same transaction as the
+    /// merge. Never matches anything by email.
     async fn link(
         &self,
         principal: &str,
         identity: &ProviderIdentity,
         now_ms: i64,
+        passkeys: MergePasskeys,
     ) -> Result<LinkOutcome, IdentityError>;
     /// Detach `principal`'s identity on `provider`. Refuses (`Conflict`) to
     /// remove the last one — that would leave a Principal nobody can sign in

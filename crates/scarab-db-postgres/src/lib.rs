@@ -4569,6 +4569,10 @@ const MAX_PRINCIPAL_SUFFIX: u32 = 10_000;
 ///   the rank — a deliberate native downgrade is never undone by a merge;
 /// - **approver entries** in every environment of every org;
 /// - **API tokens** (`owner_subject`), so they stay capped by `into`'s roles;
+/// - **passkeys** (git-bug def16bd): a merge asserts the two ids are one
+///   person. Each keeps the user handle it was created under, which the
+///   authenticator still returns. Their ids are returned, so the caller can
+///   refuse the merge (and roll back) or record each move;
 /// - **sessions** of `from` are deleted;
 /// - `from` itself is marked `merged_into` and kept, so its id is never minted
 ///   again. History (event `by`, `approved_by`) is not rewritten.
@@ -4576,7 +4580,7 @@ async fn merge_principal(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     from: &str,
     into: &str,
-) -> Result<(), scarab_identity::IdentityError> {
+) -> Result<Vec<String>, scarab_identity::IdentityError> {
     let rows = sqlx::query(
         "SELECT org, project, role, origin, imported_via FROM rbac_bindings
          WHERE subject = $1 FOR UPDATE",
@@ -4710,6 +4714,23 @@ async fn merge_principal(
         .map_err(identity_err)?;
     }
 
+    // The ids are the rows this UPDATE moved, so a passkey enrolled for
+    // `from` while the link ran is either moved and counted, or not moved.
+    let mut moved_passkeys: Vec<String> = sqlx::query_scalar(
+        "UPDATE passkeys
+         SET principal_id = $2,
+             user_handle = COALESCE(
+                 passkeys.user_handle,
+                 (SELECT user_handle FROM passkey_users WHERE principal_id = $1))
+         WHERE principal_id = $1
+         RETURNING id",
+    )
+    .bind(from)
+    .bind(into)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(identity_err)?;
+    moved_passkeys.sort();
     sqlx::query("UPDATE api_tokens SET owner_subject = $2 WHERE owner_subject = $1")
         .bind(from)
         .bind(into)
@@ -4727,7 +4748,7 @@ async fn merge_principal(
         .execute(&mut **tx)
         .await
         .map_err(identity_err)?;
-    Ok(())
+    Ok(moved_passkeys)
 }
 
 impl PostgresDb {
@@ -4901,6 +4922,7 @@ impl scarab_identity::IdentityStore for PostgresDb {
         principal: &str,
         identity: &scarab_identity::ProviderIdentity,
         now_ms: i64,
+        passkeys: scarab_identity::MergePasskeys,
     ) -> Result<scarab_identity::LinkOutcome, scarab_identity::IdentityError> {
         let conflict = |m: String| scarab_identity::IdentityError::Conflict(m);
         let mut tx = self.pool().begin().await.map_err(identity_err)?;
@@ -4968,7 +4990,15 @@ impl scarab_identity::IdentityStore for PostgresDb {
                         identity.provider
                     )));
                 }
-                merge_principal(&mut tx, &from, principal).await?;
+                let moved_passkeys = merge_principal(&mut tx, &from, principal).await?;
+                if !moved_passkeys.is_empty() && passkeys == scarab_identity::MergePasskeys::Refuse
+                {
+                    tx.rollback().await.map_err(identity_err)?;
+                    return Ok(scarab_identity::LinkOutcome::PasskeysWouldMove {
+                        from,
+                        passkeys: moved_passkeys.len(),
+                    });
+                }
                 sqlx::query(
                     "UPDATE principal_identities
                      SET principal_id = $3, handle = $4, email = $5, email_verified = $6,
@@ -4985,7 +5015,10 @@ impl scarab_identity::IdentityStore for PostgresDb {
                 .execute(&mut *tx)
                 .await
                 .map_err(identity_err)?;
-                scarab_identity::LinkOutcome::Merged { from }
+                scarab_identity::LinkOutcome::Merged {
+                    from,
+                    moved_passkeys,
+                }
             }
         };
         tx.commit().await.map_err(identity_err)?;
