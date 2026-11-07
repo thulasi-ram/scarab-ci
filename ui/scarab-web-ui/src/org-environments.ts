@@ -183,13 +183,16 @@ export function approvalGateToForm(g?: ApprovalGateLike | null): ApprovalGateFor
 }
 
 /** The baseline PUT body (`…/environments/{env}/protection`): the four rules
- *  and the approval gate settings, flat. The PUT replaces the whole
- *  baseline, so every field is always sent. */
+ *  and the approval gate settings under `approval_gate`, the shape GET
+ *  returns. The PUT replaces the whole baseline, so every field is always
+ *  sent. */
 export type BaselineBody = ProtectionBody & {
-  missing_gate_mode: MissingGateMode;
-  added_gate_expiry_s: number | null;
-  required_approvals: number | null;
-  max_approval_age_s: number;
+  approval_gate: {
+    missing_gate_mode: MissingGateMode;
+    added_gate_expiry_s: number | null;
+    required_approvals: number | null;
+    max_approval_age_s: number;
+  };
 };
 
 /** A duration in seconds in words: "24 hours", "1 hour 30 minutes",
@@ -262,10 +265,12 @@ export function toBaselineBody(rules: RulesForm, gate: ApprovalGateForm): Built<
     body: {
       ...p,
       wait_timer_s: p.approvers.length === 0 ? 0 : p.wait_timer_s,
-      missing_gate_mode: gate.missingGateMode,
-      added_gate_expiry_s: expiry,
-      required_approvals: requiredN,
-      max_approval_age_s: maxAge ?? DEFAULT_MAX_APPROVAL_AGE_S,
+      approval_gate: {
+        missing_gate_mode: gate.missingGateMode,
+        added_gate_expiry_s: expiry,
+        required_approvals: requiredN,
+        max_approval_age_s: maxAge ?? DEFAULT_MAX_APPROVAL_AGE_S,
+      },
     },
   };
 }
@@ -386,10 +391,10 @@ export function planSave(
     // a stored timer alone is not a change the form made.
     (p.approvers.length > 0 && p.wait_timer_s !== was.wait_timer_s) ||
     p.require_reason !== was.require_reason ||
-    p.missing_gate_mode !== wasGate.missing_gate_mode ||
-    p.added_gate_expiry_s !== (wasGate.added_gate_expiry_s ?? null) ||
-    p.required_approvals !== (wasGate.required_approvals ?? null) ||
-    p.max_approval_age_s !== wasGate.max_approval_age_s
+    p.approval_gate.missing_gate_mode !== wasGate.missing_gate_mode ||
+    p.approval_gate.added_gate_expiry_s !== (wasGate.added_gate_expiry_s ?? null) ||
+    p.approval_gate.required_approvals !== (wasGate.required_approvals ?? null) ||
+    p.approval_gate.max_approval_age_s !== wasGate.max_approval_age_s
   ) {
     writes.push({ part: "baseline", body: p });
   }

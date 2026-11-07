@@ -53,6 +53,7 @@ fn step(id: &str) -> Step {
         grants: strings(&[]),
         k8s_overlay: false,
         secrets: strings(&[]),
+        env_secrets: None,
         placement_profiles: strings(&[]),
         deploy: false,
         forge_token: Some(ForgeToken::Read),

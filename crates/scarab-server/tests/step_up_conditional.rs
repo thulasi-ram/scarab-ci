@@ -264,15 +264,17 @@ async fn approval_gate_setting_loosenings_need_a_step_up_and_mode_does_not() {
     let strict = || {
         json!({
             "approvers": ["amy", "bob"],
-            "missing_gate_mode": "refuse",
-            "added_gate_expiry_s": 600,
-            "required_approvals": 2,
-            "max_approval_age_s": 3600,
+            "approval_gate": {
+                "missing_gate_mode": "refuse",
+                "added_gate_expiry_s": 600,
+                "required_approvals": 2,
+                "max_approval_age_s": 3600,
+            },
         })
     };
     let with = |k: &str, v: Value| {
         let mut b = strict();
-        b[k] = v;
+        b["approval_gate"][k] = v;
         b
     };
 
@@ -292,6 +294,10 @@ async fn approval_gate_setting_loosenings_need_a_step_up_and_mode_does_not() {
         }),
         "{b}"
     );
+    // FIT-7: what GET returns, PUT takes back unchanged (no step-up: it
+    // changes nothing).
+    let (st, b) = put(b).await;
+    assert_ok(st, &b);
 
     let (st, b) = put(with("required_approvals", json!(1))).await;
     assert_refused_for(
@@ -308,7 +314,7 @@ async fn approval_gate_setting_loosenings_need_a_step_up_and_mode_does_not() {
         "raises the maximum approval age",
     );
     let mut no_expiry = strict();
-    no_expiry
+    no_expiry["approval_gate"]
         .as_object_mut()
         .unwrap()
         .remove("added_gate_expiry_s");
@@ -373,7 +379,9 @@ async fn adding_an_approver_where_a_count_is_set_needs_a_step_up() {
     let put = |body: Value| h.cookie("PUT", &uri, Some(body), &s);
 
     seed_protection(pg, rules(&["amy"], &[])).await;
-    let (st, b) = put(json!({ "approvers": ["amy", "eve"], "required_approvals": 1 })).await;
+    let (st, b) =
+        put(json!({ "approvers": ["amy", "eve"], "approval_gate": { "required_approvals": 1 } }))
+            .await;
     assert_refused_for(st, &b, "environment.protection.put", "adds approver `eve`");
     assert_eq!(
         stored_protection(pg).await.approvers,
@@ -383,7 +391,10 @@ async fn adding_an_approver_where_a_count_is_set_needs_a_step_up() {
     let mut counted = rules(&["amy", "bob"], &[]);
     counted.approval_gate.required_approvals = Some(1);
     seed_protection(pg, counted).await;
-    let (st, b) = put(json!({ "approvers": ["amy", "bob", "eve"], "required_approvals": 1 })).await;
+    let (st, b) = put(
+        json!({ "approvers": ["amy", "bob", "eve"], "approval_gate": { "required_approvals": 1 } }),
+    )
+    .await;
     assert_refused_for(st, &b, "environment.protection.put", "adds approver `eve`");
 
     // Every approver required: adding one tightens.

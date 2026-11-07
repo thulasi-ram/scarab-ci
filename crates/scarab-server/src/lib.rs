@@ -9835,6 +9835,21 @@ async fn is_environment_approval_gate(
         .is_none_or(|s| s.counts_as_environment_approval_gate()))
 }
 
+/// The answer to a gate approval.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct GateApprovalDto {
+    /// The gate has released (now or before this approval).
+    pub released: bool,
+    /// The approvers recorded on the gate so far. Absent when the gate had
+    /// already released.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approvals: Option<Vec<String>>,
+    /// When the gate releases (epoch ms): the approvals are in and the
+    /// Environment's wait timer is still running. Absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub releases_at: Option<i64>,
+}
+
 /// Approve a `manual` gate (ADR-0008, 0037). The authenticated principal's
 /// approval is recorded on the event log (append-only, idempotent).
 ///
@@ -9856,7 +9871,8 @@ async fn is_environment_approval_gate(
         ("step" = String, Path, description = "gate step id")
     ),
     responses(
-        (status = 202, description = "approval recorded (released or awaiting more approvals)"),
+        (status = 202, body = GateApprovalDto, description = "approval recorded: the gate released, or it waits for more approvals or for its wait timer"),
+        (status = 403, description = "the caller may not approve (insufficient role), a step-up is required (`step_up_required`, JSON), or a `gate.resolve` Policy refused the approval or holds the gate (plain text naming the Policy)"),
         (status = 404, description = "no such run or gate"),
         (status = 409, description = "not an approvable gate (not a manual gate, not pending, or not reached yet), or the run's Environment no longer exists or no longer admits its project")
     )
@@ -10067,7 +10083,11 @@ async fn approve_gate(
     if released_already {
         return Ok((
             StatusCode::ACCEPTED,
-            Json(serde_json::json!({ "released": true })),
+            Json(GateApprovalDto {
+                released: true,
+                approvals: None,
+                releases_at: None,
+            }),
         )
             .into_response());
     }
@@ -10109,7 +10129,11 @@ async fn approve_gate(
         let Some(met) = release.met else {
             return Ok((
                 StatusCode::ACCEPTED,
-                Json(serde_json::json!({ "released": false, "approvals": approvers })),
+                Json(GateApprovalDto {
+                    released: false,
+                    approvals: Some(approvers),
+                    releases_at: None,
+                }),
             )
                 .into_response());
         };
@@ -10155,11 +10179,11 @@ async fn approve_gate(
             // The scheduler releases the gate when the timer runs out.
             return Ok((
                 StatusCode::ACCEPTED,
-                Json(serde_json::json!({
-                    "released": false,
-                    "approvals": approvers,
-                    "releases_at": met.release_at,
-                })),
+                Json(GateApprovalDto {
+                    released: false,
+                    approvals: Some(approvers),
+                    releases_at: Some(met.release_at),
+                }),
             )
                 .into_response());
         }
@@ -10206,7 +10230,11 @@ async fn approve_gate(
 
     Ok((
         StatusCode::ACCEPTED,
-        Json(serde_json::json!({ "released": released, "approvals": approvers })),
+        Json(GateApprovalDto {
+            released,
+            approvals: Some(approvers),
+            releases_at: None,
+        }),
     )
         .into_response())
 }
@@ -13450,6 +13478,8 @@ impl utoipa::Modify for StepUpResponses {
         org_environments::EnvironmentProjectPrivilegeGrantDto,
         org_environments::ImageGrantDto,
         org_environments::PutEnvironmentProtectionRequest,
+        org_environments::PutApprovalGateRules,
+        GateApprovalDto,
         org_environments::PutEnvironmentProjectOverlayRequest,
         org_environments::EnvironmentProjectOverlayDto,
         org_environments::PutEnvironmentProjectPrivilegeGrantRequest,
