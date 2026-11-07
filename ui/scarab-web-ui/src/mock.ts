@@ -590,6 +590,12 @@ const orgEnvironments: OrgEnvironmentDto[] = [
       allowed_refs: ["refs/heads/main"],
       wait_timer_s: 0,
       require_reason: false,
+      // The gate it adds to a pipeline that wrote none fails after a day.
+      approval_gate: {
+        missing_gate_mode: "add",
+        added_gate_expiry_s: 86400,
+        max_approval_age_s: 86400,
+      },
     },
     eligibility: { all_projects: true, projects: [] },
     created_at: ago(40 * 24 * 60 * min),
@@ -611,6 +617,24 @@ const orgEnvironments: OrgEnvironmentDto[] = [
     eligibility: { all_projects: false, projects: ["scarab", "web-*"] },
     created_at: ago(2 * 60 * min),
     updated_at: ago(2 * 60 * min),
+    updated_by: "j.lee",
+  },
+  {
+    // A wait timer saved before the timer needed approvers: it does nothing,
+    // and its pages say so.
+    org: "acme",
+    name: "staging",
+    display_name: "Staging",
+    description: "pre-release checks, eu-west-1",
+    protection: {
+      approvers: [],
+      allowed_refs: [],
+      wait_timer_s: 600,
+      require_reason: false,
+    },
+    eligibility: { all_projects: false, projects: ["web-*"] },
+    created_at: ago(20 * 24 * 60 * min),
+    updated_at: ago(20 * 24 * 60 * min),
     updated_by: "j.lee",
   },
 ];
@@ -1568,7 +1592,27 @@ function route(pathname: string, search: string, method: string, body = ""): Res
     const env = orgEnvironments.find((e) => e.name === decodeURIComponent(m![1]!));
     if (!env) return new Response("not found", { status: 404 });
     if (m[2] === "projects") return json(environmentProjects(env));
-    if (m[2] === "protection") return json(method === "PUT" ? env : env.protection);
+    if (m[2] === "protection") {
+      if (method !== "PUT") return json(env.protection);
+      // The baseline PUT replaces it whole: keep it for the page load, so
+      // the view after a Save shows what was sent.
+      const req = JSON.parse(body || "{}") as Record<string, unknown>;
+      const num = (k: string) => (typeof req[k] === "number" ? (req[k] as number) : null);
+      env.protection = {
+        approvers: (req.approvers as string[] | undefined) ?? [],
+        allowed_refs: (req.allowed_refs as string[] | undefined) ?? [],
+        wait_timer_s: num("wait_timer_s") ?? 0,
+        require_reason: req.require_reason === true,
+        approval_gate: {
+          missing_gate_mode: req.missing_gate_mode === "refuse" ? "refuse" : "add",
+          added_gate_expiry_s: num("added_gate_expiry_s"),
+          required_approvals: num("required_approvals"),
+          max_approval_age_s: num("max_approval_age_s") ?? 86400,
+        },
+      };
+      env.updated_at = now;
+      return json(env);
+    }
     return json(env.eligibility);
   }
   if (

@@ -4052,3 +4052,6 @@ code.c { font-family: var(--font-mono); font-size: var(--fs-sm); color: var(--co
   display: inline-flex; align-items: center; gap: 6px; padding: 8px 16px;
   border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
 }
+
+/* A warning on an Environment's page: a wait timer with no approvers. */
+.env-warn { margin: 0 0 12px; }

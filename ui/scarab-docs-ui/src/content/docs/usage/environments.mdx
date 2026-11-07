@@ -105,6 +105,14 @@ An Environment's baseline protection rules are:
   default, or refuse the Run), the expiry of the gate the Environment adds, how many of the
   approvers must approve (default: every one), and the maximum approval age (default 24 hours).
 
+On the edit page these settings are in the **Approval gate** section: **When a pipeline has no
+approval gate** (**Add an approval gate** or **Refuse the Run**), **Added gate expiry** (blank: no
+expiry), **Required approvals** (1 to the number of approvers; blank: every one) and **Maximum
+approval age**, all in seconds. The **Wait timer** field is disabled while the Environment has no
+approvers, and an Environment with a timer and no approvers shows a warning that the timer does
+nothing until approvers are added. Lowering the count, raising the age, or lengthening or removing
+the expiry loosens the baseline and needs a step-up.
+
 A Project's admins can add a **tighten-only overlay** for their Project: more approvers (each one
 required, whatever the baseline's count), a narrower ref pattern, `require_reason`, a longer timer. An overlay can make that Project's Runs
 stricter than the org baseline, never looser.

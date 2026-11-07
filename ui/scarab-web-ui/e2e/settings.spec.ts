@@ -127,6 +127,55 @@ test("an environment opens read-only and its Edit button opens the edit screen",
   expect(errors).toEqual([]);
 });
 
+test("an environment's approval gate settings save and show on its page", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/orgs/acme/settings/environments/production");
+  const view = page.locator("section.page");
+  await expect(view.getByText("add an approval gate to the run")).toBeVisible();
+  await expect(view.getByText("the approver", { exact: true })).toBeVisible();
+
+  await view.getByRole("link", { name: "Edit", exact: true }).click();
+  const edit = page.locator("section.page");
+  const mode = edit.getByRole("combobox", { name: "When a pipeline has no approval gate" });
+  await expect(mode).toHaveValue("add");
+  await expect(edit.getByRole("textbox", { name: "Added gate expiry" })).toHaveValue("86400");
+  await expect(edit.getByRole("textbox", { name: "Maximum approval age" })).toHaveValue("86400");
+  // One approver: a count above it cannot be saved.
+  const required = edit.getByRole("textbox", { name: "Required approvals" });
+  await required.fill("2");
+  await expect(edit.getByRole("alert")).toContainText("With one approver, the only count is 1.");
+  await expect(edit.getByRole("button", { name: "Save", exact: true })).toBeDisabled();
+  await required.fill("1");
+  await mode.selectOption("refuse");
+  await edit.getByRole("button", { name: "Save", exact: true }).click();
+
+  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/environments\/production$/);
+  await expect(view.getByText("refuse the run")).toBeVisible();
+  await expect(view.getByText("1 of 1")).toBeVisible();
+  expect(errors).toEqual([]);
+});
+
+test("a wait timer with no approvers is disabled and its environment warns", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/orgs/acme/settings/environments/staging");
+  const view = page.locator("section.page");
+  await expect(view.getByRole("status")).toContainText(
+    "The 10 minutes wait timer does nothing until this environment has approvers",
+  );
+
+  await page.goto("/orgs/acme/settings/environments/staging/edit");
+  const edit = page.locator("section.page");
+  const wait = edit.getByRole("textbox", { name: "Wait timer" });
+  await expect(wait).toBeDisabled();
+  await expect(edit.getByText(/Needs approvers: the timer waits on the approval gate/)).toBeVisible();
+  await expect(edit.getByRole("textbox", { name: "Required approvals" })).toBeDisabled();
+  // An approver turns both on.
+  await edit.getByRole("textbox", { name: "Approvers", exact: true }).fill("ops-lead");
+  await expect(wait).toBeEnabled();
+  await expect(edit.getByRole("textbox", { name: "Required approvals" })).toBeEnabled();
+  expect(errors).toEqual([]);
+});
+
 test("duplicating an environment shows what was copied and what is left to do", async ({ page }) => {
   const errors = collectErrors(page);
   await page.goto("/orgs/acme/settings/environments/production");

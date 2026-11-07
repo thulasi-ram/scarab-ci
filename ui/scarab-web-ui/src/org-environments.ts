@@ -15,6 +15,7 @@
 // wins, and its 400/409 text is shown verbatim.
 import {
   rulesToForm,
+  splitList,
   toEligibilityBody,
   toProtectionBody,
   type EligibilityLike,
@@ -43,6 +44,8 @@ export type OrgEnvironmentLike = {
   display_name?: string | null;
   description: string;
 };
+
+type Built<T> = { body: T; error?: undefined } | { body?: undefined; error: string };
 
 /** The longest display name the server accepts, in characters. */
 export const MAX_DISPLAY_NAME = 200;
@@ -122,12 +125,191 @@ export const environmentEditHref = (org: string, name: string) => `${environment
  *  and spaces included, as everywhere else the name is used. */
 export const confirmsName = (typed: string, name: string) => name.length > 0 && typed === name;
 
+// ── The Environment approval gate ────────────────────────────────────────────
+//
+// An Environment with approvers asks them on its approval gate: a `manual`
+// gate with a Step after it that uses the Environment's secrets, grants or
+// deploy mark. When a pipeline has no such gate, the Environment adds one to
+// the Run, or refuses the Run (its missing-gate mode). The baseline also sets
+// the added gate's expiry, how many approvers must approve, and how long an
+// approval stays good for. These settings are the baseline's alone: a
+// project overlay has none.
+
+/** What Run creation does when no `manual` gate guards the Environment's
+ *  Steps. */
+export type MissingGateMode = "add" | "refuse";
+
+/** The approval gate settings as the server serialises them. */
+export type ApprovalGateLike = {
+  missing_gate_mode: MissingGateMode;
+  /** Seconds; absent: the added gate waits until approved or rejected. */
+  added_gate_expiry_s?: number | null;
+  /** Absent: every approver must approve. */
+  required_approvals?: number | null;
+  max_approval_age_s: number;
+};
+
+/** The server's default maximum approval age: 24 hours. */
+export const DEFAULT_MAX_APPROVAL_AGE_S = 24 * 60 * 60;
+
+/** The settings of a baseline that has never set them. */
+export const DEFAULT_APPROVAL_GATE: ApprovalGateLike = {
+  missing_gate_mode: "add",
+  max_approval_age_s: DEFAULT_MAX_APPROVAL_AGE_S,
+};
+
+/** The approval gate settings as the form holds them: strings, possibly
+ *  half typed. Blank means the default. */
+export type ApprovalGateForm = {
+  missingGateMode: MissingGateMode;
+  /** Seconds; blank: no expiry. */
+  addedGateExpiryS: string;
+  /** Blank: every approver. */
+  requiredApprovals: string;
+  /** Seconds; blank: 24 hours. */
+  maxApprovalAgeS: string;
+};
+
+/** The form for stored settings (or the defaults). */
+export function approvalGateToForm(g?: ApprovalGateLike | null): ApprovalGateForm {
+  const gate = g ?? DEFAULT_APPROVAL_GATE;
+  return {
+    missingGateMode: gate.missing_gate_mode,
+    addedGateExpiryS: gate.added_gate_expiry_s != null ? String(gate.added_gate_expiry_s) : "",
+    requiredApprovals: gate.required_approvals != null ? String(gate.required_approvals) : "",
+    maxApprovalAgeS: String(gate.max_approval_age_s),
+  };
+}
+
+/** The baseline PUT body (`…/environments/{env}/protection`): the four rules
+ *  and the approval gate settings, flat. The PUT replaces the whole
+ *  baseline, so every field is always sent. */
+export type BaselineBody = ProtectionBody & {
+  missing_gate_mode: MissingGateMode;
+  added_gate_expiry_s: number | null;
+  required_approvals: number | null;
+  max_approval_age_s: number;
+};
+
+/** A duration in seconds in words: "24 hours", "1 hour 30 minutes",
+ *  "45 seconds". */
+export function durationText(seconds: number): string {
+  if (seconds <= 0) return "0 seconds";
+  const units: [number, string][] = [
+    [3600, "hour"],
+    [60, "minute"],
+    [1, "second"],
+  ];
+  const parts: string[] = [];
+  let left = seconds;
+  for (const [size, name] of units) {
+    const n = Math.floor(left / size);
+    if (n > 0) {
+      parts.push(`${n} ${name}${n === 1 ? "" : "s"}`);
+      left -= n * size;
+    }
+    if (parts.length === 2) break;
+  }
+  return parts.join(" ");
+}
+
+/** A whole number of seconds above 0, or `null` for blank; `undefined` when
+ *  it does not parse. */
+function positiveSeconds(raw: string): number | null | undefined {
+  const t = raw.trim();
+  if (t === "") return null;
+  const n = Number(t);
+  return Number.isInteger(n) && n > 0 ? n : undefined;
+}
+
+/** Why the required approvals cannot be saved, or `null`. `approvers` is the
+ *  number of baseline approvers the form names. */
+export function requiredApprovalsError(raw: string, approvers: number): string | null {
+  const t = raw.trim();
+  if (t === "") return null;
+  if (approvers === 0) return "Add approvers first.";
+  const n = Number(t);
+  if (!Number.isInteger(n) || n < 1 || n > approvers) {
+    return approvers === 1
+      ? "With one approver, the only count is 1."
+      : `A whole number from 1 to ${approvers}, the number of approvers.`;
+  }
+  return null;
+}
+
+/** The baseline body for the form's rules and approval gate settings, or the
+ *  first reason it cannot be sent.
+ *
+ *  The wait timer counts on the approval gate, so it needs approvers: with
+ *  none, the body carries 0 (the server refuses anything else). */
+export function toBaselineBody(rules: RulesForm, gate: ApprovalGateForm): Built<BaselineBody> {
+  const protection = toProtectionBody(rules);
+  if (protection.error !== undefined) return { error: protection.error };
+  const p = protection.body;
+  const required = requiredApprovalsError(gate.requiredApprovals, p.approvers.length);
+  if (required !== null) return { error: `Required approvals: ${required}` };
+  const expiry = positiveSeconds(gate.addedGateExpiryS);
+  if (expiry === undefined) {
+    return { error: "The added gate's expiry must be a whole number of seconds above 0, or blank." };
+  }
+  const maxAge = positiveSeconds(gate.maxApprovalAgeS);
+  if (maxAge === undefined) {
+    return { error: "The maximum approval age must be a whole number of seconds above 0." };
+  }
+  const requiredN = gate.requiredApprovals.trim() === "" ? null : Number(gate.requiredApprovals.trim());
+  return {
+    body: {
+      ...p,
+      wait_timer_s: p.approvers.length === 0 ? 0 : p.wait_timer_s,
+      missing_gate_mode: gate.missingGateMode,
+      added_gate_expiry_s: expiry,
+      required_approvals: requiredN,
+      max_approval_age_s: maxAge ?? DEFAULT_MAX_APPROVAL_AGE_S,
+    },
+  };
+}
+
+/** The warning an Environment with a wait timer and no approvers shows, or
+ *  `null`. The timer waits on the approval gate, which needs approvers. */
+export function idleTimerWarning(rules: { approvers: readonly string[]; wait_timer_s: number }): string | null {
+  if (rules.approvers.length > 0 || rules.wait_timer_s <= 0) return null;
+  return `The ${durationText(rules.wait_timer_s)} wait timer does nothing until this environment has approvers: it waits on the approval gate, which only an environment with approvers has.`;
+}
+
+/** The approval gate settings in words, one line per setting, for the
+ *  read-only view. */
+export function approvalGateFacts(
+  gate: ApprovalGateLike | null | undefined,
+  approvers: number,
+): { label: string; value: string }[] {
+  const g = gate ?? DEFAULT_APPROVAL_GATE;
+  const required =
+    g.required_approvals == null
+      ? approvers === 1
+        ? "the approver"
+        : "every approver"
+      : `${g.required_approvals} of ${approvers}`;
+  return [
+    {
+      label: "missing gate",
+      value: g.missing_gate_mode === "add" ? "add an approval gate to the run" : "refuse the run",
+    },
+    { label: "approvals needed", value: required },
+    {
+      label: "added gate expiry",
+      value: g.added_gate_expiry_s != null ? durationText(g.added_gate_expiry_s) : "none: waits for a decision",
+    },
+    { label: "max approval age", value: durationText(g.max_approval_age_s) },
+  ];
+}
+
 /** What the edit page holds: the display name, the description, the
- *  baseline, eligibility. */
+ *  baseline and its approval gate settings, eligibility. */
 export type EnvironmentEditForm = {
   displayName: string;
   description: string;
   baseline: RulesForm;
+  gate: ApprovalGateForm;
   allProjects: boolean;
   /** Comma-separated project-name patterns. */
   patterns: string;
@@ -136,7 +318,7 @@ export type EnvironmentEditForm = {
 /** The stored record as the edit page reads it. Structural, like
  *  `OrgEnvironmentLike`. */
 export type EditableEnvironmentLike = OrgEnvironmentLike & {
-  protection: RulesLike;
+  protection: RulesLike & { approval_gate?: ApprovalGateLike | null };
   eligibility: EligibilityLike;
 };
 
@@ -146,16 +328,21 @@ export function toEditForm(env: EditableEnvironmentLike): EnvironmentEditForm {
     displayName: env.display_name ?? "",
     description: env.description,
     baseline: rulesToForm(env.protection),
+    gate: approvalGateToForm(env.protection.approval_gate),
     allProjects: env.eligibility.all_projects,
     patterns: (env.eligibility.projects ?? []).join(", "),
   };
 }
 
+/** Does the form name any approver? The wait timer and the required
+ *  approvals need one. */
+export const formHasApprovers = (form: RulesForm) => splitList(form.approvers).length > 0;
+
 /** One write a Save makes. Each part has its own endpoint, so a Save sends
  *  only the parts that changed — an unchanged baseline is never re-sent. */
 export type EnvironmentWrite =
   | { part: "details"; body: OrgEnvironmentBody }
-  | { part: "baseline"; body: ProtectionBody }
+  | { part: "baseline"; body: BaselineBody }
   | { part: "eligibility"; body: { all_projects: boolean; projects: string[] } };
 
 const sameList = (a: readonly string[], b: readonly string[]) =>
@@ -173,7 +360,7 @@ export function planSave(
 ): { writes: EnvironmentWrite[]; error?: undefined } | { writes?: undefined; error: string } {
   const displayProblem = displayNameError(form.displayName);
   if (displayProblem !== null) return { error: displayProblem };
-  const protection = toProtectionBody(form.baseline);
+  const protection = toBaselineBody(form.baseline, form.gate);
   if (protection.error !== undefined) return { error: protection.error };
   const eligibility = toEligibilityBody(form.allProjects, form.patterns);
   if (eligibility.error !== undefined) return { error: eligibility.error };
@@ -190,11 +377,18 @@ export function planSave(
   }
   const p = protection.body;
   const was = env.protection;
+  const wasGate = was.approval_gate ?? DEFAULT_APPROVAL_GATE;
   if (
     !sameList(p.approvers, was.approvers) ||
     !sameList(p.allowed_refs, was.allowed_refs) ||
-    p.wait_timer_s !== was.wait_timer_s ||
-    p.require_reason !== was.require_reason
+    // With no approvers the timer is not editable and the body carries 0;
+    // a stored timer alone is not a change the form made.
+    (p.approvers.length > 0 && p.wait_timer_s !== was.wait_timer_s) ||
+    p.require_reason !== was.require_reason ||
+    p.missing_gate_mode !== wasGate.missing_gate_mode ||
+    p.added_gate_expiry_s !== (wasGate.added_gate_expiry_s ?? null) ||
+    p.required_approvals !== (wasGate.required_approvals ?? null) ||
+    p.max_approval_age_s !== wasGate.max_approval_age_s
   ) {
     writes.push({ part: "baseline", body: p });
   }

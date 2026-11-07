@@ -43,8 +43,14 @@ import {
   type RulesForm,
 } from "../environment-overlays";
 import {
+  approvalGateFacts,
   copiedSummary,
   displayNameError,
+  durationText,
+  formHasApprovers,
+  idleTimerWarning,
+  requiredApprovalsError,
+  type ApprovalGateForm,
   duplicateChecklist,
   environmentEditHref,
   environmentHref,
@@ -66,7 +72,8 @@ import FormSection from "../components/FormSection";
 import Icon from "../components/Icon";
 import ConfirmDestructive from "../components/ConfirmDestructive";
 import Modal, { ModalMessage } from "../components/Modal";
-import { Checkbox, Field, Input } from "../components/Field";
+import { Checkbox, Field, Input, Select } from "../components/Field";
+import { splitList } from "../environment-overlays";
 
 /**
  * The settings frame around one Environment's page, with the org and name
@@ -208,6 +215,14 @@ function Details(props: { env: OrgEnvironment }) {
   const rules = () => props.env.protection;
   const list = (xs: readonly string[], none: string) => (xs.length > 0 ? xs.join(", ") : none);
   return (
+    <>
+    <Show when={idleTimerWarning(rules())}>
+      {(w) => (
+        <p class="tok-warn env-warn" role="status">
+          <Icon icon="alert-triangle" size={14} /> {w()}
+        </p>
+      )}
+    </Show>
     <div class="panel">
       <div class="panel-h">
         <span>Environment</span>
@@ -229,9 +244,22 @@ function Details(props: { env: OrgEnvironment }) {
         <dt>allowed refs</dt>
         <dd class="m">{list(rules().allowed_refs, "any ref")}</dd>
         <dt>wait timer</dt>
-        <dd class="m">{rules().wait_timer_s}s</dd>
+        <dd>
+          {rules().wait_timer_s > 0 ? durationText(rules().wait_timer_s) : "none"}
+          <Show when={rules().approvers.length > 0 && rules().wait_timer_s > 0}>
+            <span class="subtle"> after the approvals are in</span>
+          </Show>
+        </dd>
         <dt>reason</dt>
         <dd>{rules().require_reason ? "manual and API dispatches must give one" : "not required"}</dd>
+        <For each={approvalGateFacts(rules().approval_gate, rules().approvers.length)}>
+          {(f) => (
+            <>
+              <dt>{f.label}</dt>
+              <dd>{f.value}</dd>
+            </>
+          )}
+        </For>
         <dt>who may deploy</dt>
         <dd class="m">{eligibilityLabel(props.env.eligibility)}</dd>
         <dt>last changed</dt>
@@ -241,6 +269,7 @@ function Details(props: { env: OrgEnvironment }) {
         </dd>
       </dl>
     </div>
+    </>
   );
 }
 
@@ -338,18 +367,23 @@ function EditForm(props: { org: string; env: OrgEnvironment }) {
   const [displayName, setDisplayName] = createSignal(initial.displayName);
   const [description, setDescription] = createSignal(initial.description);
   const [baseline, setBaseline] = createSignal<RulesForm>(initial.baseline);
+  const [gate, setGate] = createSignal<ApprovalGateForm>(initial.gate);
   const [allProjects, setAllProjects] = createSignal(initial.allProjects);
   const [patterns, setPatterns] = createSignal(initial.patterns);
   const [saving, setSaving] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
   const [grantsEpoch, setGrantsEpoch] = createSignal(0);
   const setRule = (patch: Partial<RulesForm>) => setBaseline((b) => ({ ...b, ...patch }));
+  const setGateField = (patch: Partial<ApprovalGateForm>) => setGate((g) => ({ ...g, ...patch }));
+  const hasApprovers = () => formHasApprovers(baseline());
+  const approverCount = () => splitList(baseline().approvers).length;
 
   const plan = () =>
     planSave(props.env, {
       displayName: displayName(),
       description: description(),
       baseline: baseline(),
+      gate: gate(),
       allProjects: allProjects(),
       patterns: patterns(),
     });
@@ -419,7 +453,7 @@ function EditForm(props: { org: string; env: OrgEnvironment }) {
           </FormSection>
 
           <FormSection n={4} title="Baseline" note="Every project's deploys here obey these rules. A project can add to them for itself, never loosen them.">
-            <Field id="env-approvers" label="Approvers" help="Every one must approve a deploy's gate, in every project. User ids, comma-separated.">
+            <Field id="env-approvers" label="Approvers" help="Who approves this environment's approval gate, in every project. User ids, comma-separated.">
               <Input
                 mono
                 placeholder="none"
@@ -449,15 +483,32 @@ function EditForm(props: { org: string; env: OrgEnvironment }) {
                 onValue={(v) => setRule({ allowedRefs: v })}
               />
             </Field>
-            <Field id="env-wait" label="Wait timer" help="Recorded, not yet enforced.">
+            <Field
+              id="env-wait"
+              label="Wait timer"
+              help={
+                hasApprovers()
+                  ? "A minimum wait on the approval gate, counted from when the gate is reached. Approvals given early count when it runs out."
+                  : "Needs approvers: the timer waits on the approval gate, which only an environment with approvers has."
+              }
+            >
               <Input
                 mono
                 inputmode="numeric"
                 suffix="seconds"
-                value={baseline().waitTimerS}
+                disabled={!hasApprovers()}
+                value={hasApprovers() ? baseline().waitTimerS : "0"}
                 onValue={(v) => setRule({ waitTimerS: v })}
               />
             </Field>
+            <Show when={idleTimerWarning(props.env.protection)}>
+              {(w) => (
+                <p class="tok-warn env-warn" role="status">
+                  <Icon icon="alert-triangle" size={14} /> {w()} Saving the baseline without approvers
+                  sets it to 0.
+                </p>
+              )}
+            </Show>
             <Checkbox
               checked={baseline().requireReason}
               onChecked={(v) => setRule({ requireReason: v })}
@@ -466,7 +517,82 @@ function EditForm(props: { org: string; env: OrgEnvironment }) {
             />
           </FormSection>
 
-          <FormSection n={5} title="Who may deploy">
+          <FormSection
+            n={5}
+            title="Approval gate"
+            note="A manual gate with a step after it that uses this environment's secrets, privilege grants or deploy mark. Only these gates need the approvers. They apply once the environment has approvers."
+          >
+            <Field
+              id="env-missing-gate"
+              label="When a pipeline has no approval gate"
+              help={
+                gate().missingGateMode === "add"
+                  ? "Scarab adds one manual gate to the run, in front of the first steps that use this environment."
+                  : "The run is refused, naming the steps and the YAML to add."
+              }
+            >
+              <Select
+                value={gate().missingGateMode}
+                onValue={(v) => setGateField({ missingGateMode: v === "refuse" ? "refuse" : "add" })}
+              >
+                <option value="add">Add an approval gate</option>
+                <option value="refuse">Refuse the Run</option>
+              </Select>
+            </Field>
+            <Field
+              id="env-added-expiry"
+              label="Added gate expiry"
+              help={
+                gate().addedGateExpiryS.trim()
+                  ? "The gate Scarab adds fails if no one approves it in this time. A gate the pipeline wrote keeps its own expiry."
+                  : "Blank: the added gate waits until someone approves or rejects it."
+              }
+            >
+              <Input
+                mono
+                inputmode="numeric"
+                suffix="seconds"
+                placeholder="no expiry"
+                value={gate().addedGateExpiryS}
+                onValue={(v) => setGateField({ addedGateExpiryS: v })}
+              />
+            </Field>
+            <Field
+              id="env-required-approvals"
+              label="Required approvals"
+              error={requiredApprovalsError(gate().requiredApprovals, approverCount())}
+              help={
+                hasApprovers()
+                  ? `How many of the ${approverCount()} approvers must approve. Blank: every one. A project's own approvers are each required as well.`
+                  : "Needs approvers."
+              }
+            >
+              <Input
+                mono
+                inputmode="numeric"
+                placeholder={hasApprovers() ? `every approver (${approverCount()})` : "no approvers"}
+                disabled={!hasApprovers()}
+                value={gate().requiredApprovals}
+                onValue={(v) => setGateField({ requiredApprovals: v })}
+              />
+            </Field>
+            <Field
+              id="env-max-age"
+              label="Maximum approval age"
+              help="A step that uses this environment is refused at launch once its approval gate released longer ago than this. Blank: 24 hours (86400)."
+            >
+              <Input
+                mono
+                inputmode="numeric"
+                suffix="seconds"
+                placeholder="86400"
+                value={gate().maxApprovalAgeS}
+                onValue={(v) => setGateField({ maxApprovalAgeS: v })}
+              />
+            </Field>
+          </FormSection>
+
+          <FormSection n={6} title="Who may deploy">
             <Checkbox
               checked={allProjects()}
               onChecked={setAllProjects}

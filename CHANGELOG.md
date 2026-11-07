@@ -229,6 +229,12 @@ record. Read Breaking changes before you upgrade.
   Runs used it, the policies that name it, and the OIDC subject cloud trust policies match. The
   old Environment is not changed. Migration 0080 adds the display name column (git-bug d002a0c).
   [Environments](https://thulasi-ram.github.io/scarab-ci/usage/environments/#duplicate-an-environment)
+- **Approval gate settings on the Environment page.** The edit page has an **Approval gate**
+  section: what to do when a pipeline has no approval gate (**Add an approval gate** or **Refuse
+  the Run**), the added gate's expiry, how many approvers must approve, and the maximum approval
+  age. The wait timer is disabled while the Environment has no approvers, and an Environment
+  with a timer and no approvers shows a warning (git-bug cd43bf3, 2b94989).
+  [Environments](https://thulasi-ram.github.io/scarab-ci/usage/environments/#the-rules-it-holds)
 - **Runs after another pipeline.** `on: upstream: { pipeline: ci }` starts a Run when a Run
   of `ci` in the same repository finishes (`status:` takes `succeeded`, the default, and
   `failed`). The follow-up builds the same commit and runs on the same ref, so an

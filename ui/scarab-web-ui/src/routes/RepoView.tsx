@@ -764,7 +764,16 @@ function EnvPanel(props: {
           <span class="dotsep">·</span> {refLayersLabel(effective().allowed_ref_layers)}
           <Show when={effective().wait_timer_s > 0}>
             <span class="dotsep">·</span>{" "}
-            <span title="Carried, not yet enforced">{effective().wait_timer_s}s wait</span>
+            <span
+              title={
+                effective().approvers.length > 0
+                  ? "A minimum wait on the approval gate, after the approvals are in"
+                  : "Does nothing: the timer needs approvers"
+              }
+            >
+              {effective().wait_timer_s}s wait
+              {effective().approvers.length > 0 ? "" : " (no approvers: does nothing)"}
+            </span>
           </Show>
           <Show when={effective().require_reason}>
             <span class="dotsep">·</span> reason required
@@ -1015,7 +1024,7 @@ function EnvDialog(props: {
         >
           <Input mono value={allowedRefs()} onValue={setAllowedRefs} placeholder="blank allows any ref" />
         </Field>
-        <Field label="Wait timer" help="Recorded, not yet enforced." error={waitError()}>
+        <Field label="Wait timer" help="A minimum wait on the approval gate. The longer of this and the baseline's applies, and only when there are approvers." error={waitError()}>
           <Input mono inputmode="numeric" suffix="seconds" value={waitTimer()} onValue={setWaitTimer} />
         </Field>
         <Checkbox

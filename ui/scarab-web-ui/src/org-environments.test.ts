@@ -1,7 +1,12 @@
 import { describe, it, expect } from "vitest";
 import { decodeParam } from "./settings-nav";
 import {
+  approvalGateFacts,
   confirmsName,
+  durationText,
+  idleTimerWarning,
+  requiredApprovalsError,
+  toBaselineBody,
   copiedSummary,
   displayNameError,
   duplicateChecklist,
@@ -239,6 +244,10 @@ describe("planSave", () => {
             allowed_refs: ["refs/heads/main"],
             wait_timer_s: 30,
             require_reason: true,
+            missing_gate_mode: "add",
+            added_gate_expiry_s: null,
+            required_approvals: null,
+            max_approval_age_s: 86400,
           },
         },
       ],
@@ -279,6 +288,164 @@ describe("planSave", () => {
     const plan = planSave(stored, form);
     expect(plan.writes).toBeUndefined();
     expect(plan.error).toMatch(/wait timer/);
+  });
+});
+
+describe("planSave: approval gate settings", () => {
+  const stored: EditableEnvironmentLike = {
+    name: "prod",
+    description: "",
+    protection: {
+      approvers: ["a.kim", "j.lee"],
+      allowed_refs: [],
+      wait_timer_s: 0,
+      require_reason: false,
+      approval_gate: {
+        missing_gate_mode: "add",
+        added_gate_expiry_s: 3600,
+        required_approvals: 1,
+        max_approval_age_s: 86400,
+      },
+    },
+    eligibility: { all_projects: true, projects: [] },
+  };
+
+  it("reads the stored settings into the form and sends nothing unchanged", () => {
+    const form = toEditForm(stored);
+    expect(form.gate).toEqual({
+      missingGateMode: "add",
+      addedGateExpiryS: "3600",
+      requiredApprovals: "1",
+      maxApprovalAgeS: "86400",
+    });
+    expect(planSave(stored, form)).toEqual({ writes: [] });
+  });
+
+  it("treats a baseline with no settings as the defaults", () => {
+    const bare = { ...stored, protection: { ...stored.protection, approval_gate: null } };
+    const form = toEditForm(bare);
+    expect(form.gate).toEqual({
+      missingGateMode: "add",
+      addedGateExpiryS: "",
+      requiredApprovals: "",
+      maxApprovalAgeS: "86400",
+    });
+    expect(planSave(bare, form)).toEqual({ writes: [] });
+  });
+
+  it("sends the whole baseline, every setting included, when one setting changes", () => {
+    const form = toEditForm(stored);
+    form.gate.missingGateMode = "refuse";
+    form.gate.requiredApprovals = "";
+    expect(planSave(stored, form).writes).toEqual([
+      {
+        part: "baseline",
+        body: {
+          approvers: ["a.kim", "j.lee"],
+          allowed_refs: [],
+          wait_timer_s: 0,
+          require_reason: false,
+          missing_gate_mode: "refuse",
+          added_gate_expiry_s: 3600,
+          required_approvals: null,
+          max_approval_age_s: 86400,
+        },
+      },
+    ]);
+  });
+
+  it("refuses a required count above the number of approvers", () => {
+    const form = toEditForm(stored);
+    form.gate.requiredApprovals = "3";
+    expect(planSave(stored, form).error).toMatch(/from 1 to 2/);
+  });
+
+  it("refuses a required count with no approvers", () => {
+    const form = toEditForm(stored);
+    form.baseline.approvers = "";
+    expect(planSave(stored, form).error).toMatch(/Add approvers first/);
+  });
+
+  it("does not resend a timer the form cannot edit, and sends 0 with the baseline", () => {
+    // An Environment saved before the timer needed approvers.
+    const timerOnly: EditableEnvironmentLike = {
+      ...stored,
+      protection: { approvers: [], allowed_refs: [], wait_timer_s: 300, require_reason: false },
+    };
+    const form = toEditForm(timerOnly);
+    expect(planSave(timerOnly, form)).toEqual({ writes: [] });
+    form.baseline.requireReason = true;
+    const w = planSave(timerOnly, form).writes?.[0];
+    expect(w?.part).toBe("baseline");
+    expect(w?.body).toMatchObject({ wait_timer_s: 0, require_reason: true });
+  });
+});
+
+describe("toBaselineBody", () => {
+  const rules = { approvers: "a.kim", allowedRefs: "", waitTimerS: "60", requireReason: false };
+  const gate = { missingGateMode: "add" as const, addedGateExpiryS: "", requiredApprovals: "", maxApprovalAgeS: "" };
+
+  it("takes blank as the default: no expiry, every approver, 24 hours", () => {
+    expect(toBaselineBody(rules, gate).body).toMatchObject({
+      wait_timer_s: 60,
+      added_gate_expiry_s: null,
+      required_approvals: null,
+      max_approval_age_s: 86400,
+    });
+  });
+
+  it("refuses an expiry or maximum age that is not a whole number above 0", () => {
+    expect(toBaselineBody(rules, { ...gate, addedGateExpiryS: "0" }).error).toMatch(/expiry/);
+    expect(toBaselineBody(rules, { ...gate, maxApprovalAgeS: "1.5" }).error).toMatch(/maximum approval age/);
+  });
+});
+
+describe("requiredApprovalsError", () => {
+  it("accepts blank and 1 to the number of approvers", () => {
+    expect(requiredApprovalsError("", 0)).toBeNull();
+    expect(requiredApprovalsError("2", 2)).toBeNull();
+    expect(requiredApprovalsError("0", 2)).toMatch(/from 1 to 2/);
+    expect(requiredApprovalsError("1", 0)).toMatch(/Add approvers first/);
+  });
+});
+
+describe("idleTimerWarning", () => {
+  it("warns only for a timer with no approvers", () => {
+    expect(idleTimerWarning({ approvers: [], wait_timer_s: 300 })).toMatch(
+      /5 minutes wait timer does nothing until this environment has approvers/,
+    );
+    expect(idleTimerWarning({ approvers: ["a.kim"], wait_timer_s: 300 })).toBeNull();
+    expect(idleTimerWarning({ approvers: [], wait_timer_s: 0 })).toBeNull();
+  });
+});
+
+describe("durationText", () => {
+  it("names at most two units", () => {
+    expect(durationText(86400)).toBe("24 hours");
+    expect(durationText(5400)).toBe("1 hour 30 minutes");
+    expect(durationText(45)).toBe("45 seconds");
+    expect(durationText(90061)).toBe("25 hours 1 minute");
+  });
+});
+
+describe("approvalGateFacts", () => {
+  it("says every approver, or n of m", () => {
+    const facts = (g: Parameters<typeof approvalGateFacts>[0], n: number) =>
+      Object.fromEntries(approvalGateFacts(g, n).map((f) => [f.label, f.value]));
+    expect(facts(null, 2)).toEqual({
+      "missing gate": "add an approval gate to the run",
+      "approvals needed": "every approver",
+      "added gate expiry": "none: waits for a decision",
+      "max approval age": "24 hours",
+    });
+    expect(
+      facts({ missing_gate_mode: "refuse", required_approvals: 1, added_gate_expiry_s: 7200, max_approval_age_s: 3600 }, 3),
+    ).toEqual({
+      "missing gate": "refuse the run",
+      "approvals needed": "1 of 3",
+      "added gate expiry": "2 hours",
+      "max approval age": "1 hour",
+    });
   });
 });
 
