@@ -454,9 +454,9 @@ export interface paths {
         put?: never;
         /**
          * Begin linking another sign-in account (ADR-0069)
-         * @description A link that would fold in a Principal holding passkeys is refused at the
-         *     callback (the merge would move them to the caller): it needs
-         *     `POST /v1/me/identities/link-moving-passkeys`, which always asks.
+         * @description A merge of a Principal that holds passkeys also needs one of its passkeys
+         *     (ADR-0079 §2): the callback sends the browser to confirm it
+         *     (`…/merges/{id}`), and nothing changes until then.
          */
         post: operations["begin_link_identity"];
         delete?: never;
@@ -465,17 +465,18 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/v1/me/identities/link-moving-passkeys": {
+    "/v1/me/identities/merges/{id}": {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        /** A merge waiting for the merged account's passkey (ADR-0079) */
+        get: operations["identity_merge"];
         put?: never;
-        /** Begin linking another sign-in account whose Principal holds passkeys (ADR-0069) */
-        post: operations["begin_link_identity_moving_passkeys"];
+        /** Confirm a merge with the merged account's passkey (ADR-0079) */
+        post: operations["confirm_identity_merge"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2787,6 +2788,14 @@ export interface components {
             /** @description The commit the Pipeline was read at. */
             sha?: string | null;
         };
+        /** @description `POST /v1/me/identities/merges/{id}` body. */
+        ConfirmIdentityMergeRequest: {
+            /**
+             * @description The browser's `AuthenticationResponseJSON`, from a passkey of the
+             *     Principal being merged in.
+             */
+            credential: Record<string, never>;
+        };
         /**
          * @description One registered forge connection, as global Settings renders it (ADR-0060).
          *
@@ -3383,6 +3392,31 @@ export interface components {
         GrantedPermissionDto: {
             level: string;
             name: string;
+        };
+        /** @description A merge waiting for a passkey of the Principal it folds in. */
+        IdentityMergeDto: {
+            /** Format: int64 */
+            expires_at: number;
+            /** @description The Principal that would be folded into the caller. */
+            from: string;
+            handle: string;
+            id: string;
+            /** @description How many usable passkeys `from` holds; one of them must answer. */
+            passkeys: number;
+            /** @description The sign-in that proved it: its provider and handle. */
+            provider: string;
+            /**
+             * @description `PublicKeyCredentialRequestOptionsJSON`, allowing only `from`'s
+             *     passkeys.
+             */
+            public_key: Record<string, never>;
+        };
+        /** @description What a confirmed merge did. */
+        IdentityMergedDto: {
+            /** @description The Principal folded into the caller. */
+            merged: string;
+            /** @description How many of its passkeys the merge deleted. */
+            removed_passkeys: number;
         };
         /** @description One entry of a privilege whitelist (ADR-0039). */
         ImageGrantDto: {
@@ -6295,16 +6329,55 @@ export interface operations {
             };
         };
     };
-    begin_link_identity_moving_passkeys: {
+    identity_merge: {
         parameters: {
             query?: never;
             header?: never;
-            path?: never;
+            path: {
+                /** @description the merge id from the link callback */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IdentityMergeDto"];
+                };
+            };
+            /** @description not a browser session */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such pending merge in this session, used, or expired */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    confirm_identity_merge: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description the merge id from the link callback */
+                id: string;
+            };
             cookie?: never;
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["LinkIdentityRequest"];
+                "application/json": components["schemas"]["ConfirmIdentityMergeRequest"];
             };
         };
         responses: {
@@ -6313,20 +6386,25 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["LinkIdentityResponse"];
+                    "application/json": components["schemas"]["IdentityMergedDto"];
                 };
             };
-            /** @description not a browser session — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            /** @description the merge is unknown, used, expired or another session's, or the passkey is not one of the merged account's (`code` names the check) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a browser session */
             403: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content: {
-                    "application/json": components["schemas"]["StepUpRefusal"];
-                };
+                content?: never;
             };
-            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
-            429: {
+            /** @description the sign-in or the merged account changed since the merge was started */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

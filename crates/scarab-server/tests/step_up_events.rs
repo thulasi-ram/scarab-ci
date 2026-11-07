@@ -774,7 +774,7 @@ async fn fold_bobby_into_bob(pg: &PostgresDb) {
         "bob",
         &identity("forgejo", "f1", "bobby"),
         T0,
-        scarab_identity::MergePasskeys::Move,
+        &scarab_identity::FoldedPasskey::Unproven,
     )
     .await
     .unwrap();
@@ -876,30 +876,49 @@ async fn an_owner_s_reset_of_a_merged_id_resets_the_live_principal() {
     tdb.cleanup().await;
 }
 
-/// git-bug def16bd: a merge asserts the two ids are one person, so the
-/// folded id's passkeys move to the survivor. bob, who never enrolled one,
-/// confirms with the passkey bobby enrolled; the authenticator still
-/// answers with bobby's user handle, and that is accepted for that passkey.
+/// ADR-0079 (reverses def16bd): a passkey is registered for one Principal
+/// and never moves. Folding in bobby, who holds one, needs proof from it;
+/// the merge then deletes it, and bob holds no passkey of bobby's.
 #[tokio::test]
-async fn a_merge_moves_the_folded_id_s_passkeys_to_the_survivor() {
+async fn a_merge_deletes_the_folded_id_s_passkeys_once_one_proves_it() {
     let Some((tdb, pg)) = pg().await else { return };
     let (h, _) = merged_bob(&pg).await;
     let bobby = h.browser_session(scoped("bobby")).await;
-    let mut soft = passkey();
-    h.enroll(&bobby, &mut soft, "bobby's key").await;
-    // bob has a user handle of his own, so the moved passkey's differs.
-    h.passkey_store.user_handle("bob", [9; 32]).await.unwrap();
+    h.enroll(&bobby, &mut passkey(), "bobby's key").await;
+    let key = h.passkey_store.list("bobby").await.unwrap()[0].id.clone();
+    let link = |proof: scarab_identity::FoldedPasskey| {
+        let pg = pg.clone();
+        async move {
+            IdentityStore::link(
+                pg.as_ref(),
+                "bob",
+                &identity("forgejo", "f1", "bobby"),
+                T0,
+                &proof,
+            )
+            .await
+            .unwrap()
+        }
+    };
 
-    fold_bobby_into_bob(&pg).await;
+    assert_eq!(
+        link(scarab_identity::FoldedPasskey::Unproven).await,
+        scarab_identity::LinkOutcome::NeedsFoldedPasskey {
+            from: "bobby".into()
+        }
+    );
+    assert_eq!(
+        link(scarab_identity::FoldedPasskey::Proven(key.clone())).await,
+        scarab_identity::LinkOutcome::Merged {
+            from: "bobby".into(),
+            removed_passkeys: vec![key],
+        }
+    );
     assert!(h.passkey_store.list("bobby").await.unwrap().is_empty());
-    let moved = h.passkey_store.list("bob").await.unwrap();
-    assert_eq!(moved.len(), 1, "{moved:?}");
-    assert_eq!(moved[0].label, "bobby's key");
-
+    assert!(h.passkey_store.list("bob").await.unwrap().is_empty());
     let bob = h.browser_session(scoped("bob")).await;
     let (_, me) = h.cookie("GET", "/v1/me/security", None, &bob).await;
-    assert_eq!(me["has_passkey"], true, "{me}");
-    h.open_window(&bob, &mut soft).await;
+    assert_eq!(me["has_passkey"], false, "{me}");
     tdb.cleanup().await;
 }
 

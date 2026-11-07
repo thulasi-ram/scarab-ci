@@ -1147,7 +1147,7 @@ async fn rt_an_alias_reset_cannot_skip_the_every_org_owner_check() {
         "bob",
         &identity("forgejo", "f1", "bobby"),
         T0,
-        scarab_identity::MergePasskeys::Move,
+        &scarab_identity::FoldedPasskey::Unproven,
     )
     .await
     .unwrap();

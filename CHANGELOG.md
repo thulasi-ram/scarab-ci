@@ -287,14 +287,16 @@ record. Read Breaking changes before you upgrade.
   as `passkey.counter_regressed`. Once every passkey of a user is flagged, a fresh login no
   longer enrolls a new first passkey (a thief holding the forge account can make a fresh
   login): an Owner must reset the user's passkeys first, and a step-up refusal says so.
-- When one sign-in identity is merged into another Principal, the merged Principal's passkeys
-  now move to the surviving one, so the person can still confirm a step-up with them. Each
-  moved passkey keeps the WebAuthn user handle it was created under (migration 0082). Such a
-  merge needs a step-up confirmation for that action, not the 5-minute window: start it with
-  `POST /v1/me/identities/link-moving-passkeys` (`identity.link_moving_passkeys`, always
-  asks). A link started with `POST /v1/me/identities/link` that would move passkeys is refused
-  at the callback and changes nothing. Each moved passkey is recorded as a
-  `passkey.moved_on_merge` security event naming both Principals.
+- **Merging in an account that has passkeys needs one of its passkeys.** Linking a sign-in that
+  is the only way into another Principal folds that Principal into yours: its roles, approver
+  entries and tokens become yours. Someone who controlled only that forge login could take
+  them over, confirming with their own passkey (git-bug bbb5204, ADR-0079). When the folded
+  Principal holds any passkey, the link's callback now changes nothing and sends you to
+  confirm the merge with one of that Principal's passkeys (`GET` and `POST
+  /v1/me/identities/merges/{id}`, migration 0084); Settings → Profile asks for it. A Principal
+  with no passkey merges as before. A merge deletes the folded Principal's passkeys instead
+  of moving them, and records each as a `passkey.removed_on_merge` security event naming
+  both Principals.
 - **Unpinning a Run's snapshots needs a step-up.** `DELETE /v1/runs/{id}/snapshots-pin`
   shortens how long the Run's snapshots are kept, so it now needs a step-up confirmation
   (window). Pinning does not.

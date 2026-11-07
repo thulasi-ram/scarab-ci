@@ -135,10 +135,11 @@ pub(crate) fn governed_routes() -> Routes {
             &ops::IDENTITY_LINK,
             begin_link_identity,
         )
+        .get("/v1/me/identities/merges/{id}", identity_merge)
         .post(
-            "/v1/me/identities/link-moving-passkeys",
-            &ops::IDENTITY_LINK_MOVING_PASSKEYS,
-            begin_link_identity_moving_passkeys,
+            "/v1/me/identities/merges/{id}",
+            &ops::IDENTITY_MERGE_CONFIRM,
+            confirm_identity_merge,
         )
         .delete(
             "/v1/me/identities/{provider}",

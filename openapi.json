@@ -874,7 +874,7 @@
           "Auth & Identity"
         ],
         "summary": "Begin linking another sign-in account (ADR-0069)",
-        "description": "A link that would fold in a Principal holding passkeys is refused at the\ncallback (the merge would move them to the caller): it needs\n`POST /v1/me/identities/link-moving-passkeys`, which always asks.",
+        "description": "A merge of a Principal that holds passkeys also needs one of its passkeys\n(ADR-0079 §2): the callback sends the browser to confirm it\n(`…/merges/{id}`), and nothing changes until then.",
         "operationId": "begin_link_identity",
         "requestBody": {
           "content": {
@@ -921,18 +921,73 @@
         ]
       }
     },
-    "/v1/me/identities/link-moving-passkeys": {
+    "/v1/me/identities/merges/{id}": {
+      "get": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "A merge waiting for the merged account's passkey (ADR-0079)",
+        "operationId": "identity_merge",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "the merge id from the link callback",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IdentityMergeDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "not a browser session"
+          },
+          "404": {
+            "description": "no such pending merge in this session, used, or expired"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      },
       "post": {
         "tags": [
           "Auth & Identity"
         ],
-        "summary": "Begin linking another sign-in account whose Principal holds passkeys (ADR-0069)",
-        "operationId": "begin_link_identity_moving_passkeys",
+        "summary": "Confirm a merge with the merged account's passkey (ADR-0079)",
+        "operationId": "confirm_identity_merge",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "the merge id from the link callback",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/LinkIdentityRequest"
+                "$ref": "#/components/schemas/ConfirmIdentityMergeRequest"
               }
             }
           },
@@ -944,23 +999,19 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/LinkIdentityResponse"
+                  "$ref": "#/components/schemas/IdentityMergedDto"
                 }
               }
             }
+          },
+          "400": {
+            "description": "the merge is unknown, used, expired or another session's, or the passkey is not one of the merged account's (`code` names the check)"
           },
           "403": {
-            "description": "not a browser session — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/StepUpRefusal"
-                }
-              }
-            }
+            "description": "not a browser session"
           },
-          "429": {
-            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
+          "409": {
+            "description": "the sign-in or the merged account changed since the merge was started"
           }
         },
         "security": [
@@ -9148,6 +9199,19 @@
           }
         }
       },
+      "ConfirmIdentityMergeRequest": {
+        "type": "object",
+        "description": "`POST /v1/me/identities/merges/{id}` body.",
+        "required": [
+          "credential"
+        ],
+        "properties": {
+          "credential": {
+            "type": "object",
+            "description": "The browser's `AuthenticationResponseJSON`, from a passkey of the\nPrincipal being merged in."
+          }
+        }
+      },
       "ConnectionDto": {
         "type": "object",
         "description": "One registered forge connection, as global Settings renders it (ADR-0060).\n\nCarries the credential's **handle and whether it resolves** — never the\nmaterial. A connection is the unit an operator reasons about (\"is my GitHub\nApp still wired up?\"), so the DTO answers that without becoming a way to read\na secret back.",
@@ -10313,6 +10377,67 @@
           },
           "name": {
             "type": "string"
+          }
+        }
+      },
+      "IdentityMergeDto": {
+        "type": "object",
+        "description": "A merge waiting for a passkey of the Principal it folds in.",
+        "required": [
+          "id",
+          "from",
+          "provider",
+          "handle",
+          "passkeys",
+          "public_key",
+          "expires_at"
+        ],
+        "properties": {
+          "expires_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "from": {
+            "type": "string",
+            "description": "The Principal that would be folded into the caller."
+          },
+          "handle": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "passkeys": {
+            "type": "integer",
+            "description": "How many usable passkeys `from` holds; one of them must answer.",
+            "minimum": 0
+          },
+          "provider": {
+            "type": "string",
+            "description": "The sign-in that proved it: its provider and handle."
+          },
+          "public_key": {
+            "type": "object",
+            "description": "`PublicKeyCredentialRequestOptionsJSON`, allowing only `from`'s\npasskeys."
+          }
+        }
+      },
+      "IdentityMergedDto": {
+        "type": "object",
+        "description": "What a confirmed merge did.",
+        "required": [
+          "merged",
+          "removed_passkeys"
+        ],
+        "properties": {
+          "merged": {
+            "type": "string",
+            "description": "The Principal folded into the caller."
+          },
+          "removed_passkeys": {
+            "type": "integer",
+            "description": "How many of its passkeys the merge deleted.",
+            "minimum": 0
           }
         }
       },

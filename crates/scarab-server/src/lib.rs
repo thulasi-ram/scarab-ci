@@ -8084,40 +8084,18 @@ pub struct LinkIdentityResponse {
 /// shared callback then attaches the proven account, or merges in a Principal
 /// whose only way in it was. Never by email.
 ///
-/// A link that would fold in a Principal holding passkeys is refused at the
-/// callback (the merge would move them to the caller): it needs
-/// `POST /v1/me/identities/link-moving-passkeys`, which always asks.
+/// A merge of a Principal that holds passkeys also needs one of its passkeys
+/// (ADR-0079 §2): the callback sends the browser to confirm it
+/// (`…/merges/{id}`), and nothing changes until then.
 #[utoipa::path(post, path = "/v1/me/identities/link", summary = "Begin linking another sign-in account (ADR-0069)", request_body = LinkIdentityRequest, responses((status = 200, body = LinkIdentityResponse), (status = 403, description = "not a browser session")))]
 async fn begin_link_identity(
     State(st): State<AppState>,
     headers: HeaderMap,
     Json(req): Json<LinkIdentityRequest>,
 ) -> Result<Response, ApiError> {
-    begin_link(&st, &headers, &req, false).await
-}
-
-/// Begin linking another provider's account, allowing the merge to move the
-/// folded Principal's passkeys to the caller (git-bug def16bd). The same
-/// flow as `POST /v1/me/identities/link`, but its step-up always asks: a
-/// window is not enough to add passkeys to an account.
-#[utoipa::path(post, path = "/v1/me/identities/link-moving-passkeys", summary = "Begin linking another sign-in account whose Principal holds passkeys (ADR-0069)", request_body = LinkIdentityRequest, responses((status = 200, body = LinkIdentityResponse), (status = 403, description = "not a browser session")))]
-async fn begin_link_identity_moving_passkeys(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-    Json(req): Json<LinkIdentityRequest>,
-) -> Result<Response, ApiError> {
-    begin_link(&st, &headers, &req, true).await
-}
-
-/// The two link POSTs. `moves_passkeys`: the link binding lets the merge
-/// move passkeys.
-async fn begin_link(
-    st: &AppState,
-    headers: &HeaderMap,
-    req: &LinkIdentityRequest,
-    moves_passkeys: bool,
-) -> Result<Response, ApiError> {
-    let (sid, _) = link_session(st, headers, Action::Write).await?;
+    let (sid, _) = link_session(&st, &headers, Action::Write).await?;
+    let st = &st;
+    let req = &req;
     st.identities.as_ref().ok_or(ApiError::NotFound)?;
     let provider = st
         .oauth_provider(Some(&req.provider))?
@@ -8129,13 +8107,7 @@ async fn begin_link(
     // provider and the expiry too. Off: the bare session hash, as before —
     // the POST is unguarded then anyway.
     let link = match st.step_up.service() {
-        Some(svc) => svc.link_binding(
-            &flow.state,
-            &session_hash(&sid),
-            &flow.provider,
-            expires_at,
-            moves_passkeys,
-        ),
+        Some(svc) => svc.link_binding(&flow.state, &session_hash(&sid), &flow.provider, expires_at),
         None => session_hash(&sid),
     };
     let flow = flow.for_link(&link, expires_at);
@@ -8171,27 +8143,13 @@ async fn link_callback(
     // client input) — and the flow must not have outlived its step-up.
     let now = st.clock.now().await.0;
     let expires_at = flow.link_expires_at.unwrap_or(i64::MIN);
-    // Which POST minted it decides whether the merge may move passkeys
-    // (git-bug def16bd). Step-up off: both bindings are the bare session
-    // hash (both POSTs are unguarded), so a flow of this session may.
-    let binding = |moves: bool| match st.step_up.service() {
-        Some(svc) => svc.link_binding(
-            &flow.state,
-            &session_hash(&sid),
-            &flow.provider,
-            expires_at,
-            moves,
-        ),
+    // Step-up off: the binding is the bare session hash (the POST is
+    // unguarded then).
+    let binding = match st.step_up.service() {
+        Some(svc) => svc.link_binding(&flow.state, &session_hash(&sid), &flow.provider, expires_at),
         None => session_hash(&sid),
     };
-    let matches =
-        |moves: bool| scarab_identity::ct_eq(binding(moves).as_bytes(), flow.link.as_bytes());
-    let passkeys = if matches(true) {
-        scarab_identity::MergePasskeys::Move
-    } else {
-        scarab_identity::MergePasskeys::Refuse
-    };
-    let minted = passkeys == scarab_identity::MergePasskeys::Move || matches(false);
+    let minted = scarab_identity::ct_eq(binding.as_bytes(), flow.link.as_bytes());
     if now > expires_at || !minted {
         if let Some(svc) = st.step_up.service() {
             let mut ev = step_up::event(
@@ -8228,48 +8186,34 @@ async fn link_callback(
         })?;
     let now = st.clock.now().await.0;
     let location = match store
-        .link(&principal.subject, &identity, now, passkeys)
+        .link(
+            &principal.subject,
+            &identity,
+            now,
+            &scarab_identity::FoldedPasskey::Unproven,
+        )
         .await
     {
         Ok(scarab_identity::LinkOutcome::Merged {
             from,
-            moved_passkeys,
+            removed_passkeys,
         }) => {
-            record_moved_passkeys(st, &principal.subject, &from, &moved_passkeys, &sid, now).await;
+            record_removed_passkeys(st, &principal.subject, &from, &removed_passkeys, &sid, now)
+                .await;
             format!(
                 "/settings/profile?identity_linked={}&merged={}",
                 flow.provider,
                 query_escape(&from)
             )
         }
-        Ok(scarab_identity::LinkOutcome::PasskeysWouldMove { from, passkeys }) => {
-            if let Some(svc) = st.step_up.service() {
-                let mut ev = step_up::event(
-                    scarab_identity::security_event_kind::STEP_UP_REFUSED,
-                    &principal.subject,
-                    "session:cookie".to_string(),
-                    None,
-                    now,
-                );
-                ev.op = Some("identity.link".to_string());
-                ev.session_hash = Some(session_hash(&sid));
-                ev.detail = serde_json::json!({
-                    "reason": "the merge would move passkeys; the link was confirmed by a window",
-                    "from": from,
-                    "passkeys": passkeys,
-                });
-                svc.record(ev).await;
+        Ok(scarab_identity::LinkOutcome::NeedsFoldedPasskey { from }) => {
+            match start_identity_merge(st, &sid, &principal.subject, &from, &identity, now).await {
+                Ok(id) => format!("/settings/profile?identity_merge={}", query_escape(&id)),
+                Err(why) => format!(
+                    "/settings/profile?identity_link_error={}",
+                    query_escape(&why)
+                ),
             }
-            let why = format!(
-                "that {} account is the only sign-in of `{from}`, who holds {passkeys} \
-                 passkey(s); merging moves them to you, so confirm this link with your passkey \
-                 (POST /v1/me/identities/link-moving-passkeys)",
-                flow.provider
-            );
-            format!(
-                "/settings/profile?identity_link_error={}",
-                query_escape(&why)
-            )
         }
         Ok(_) => format!("/settings/profile?identity_linked={}", flow.provider),
         Err(scarab_identity::IdentityError::Conflict(why)) => {
@@ -8292,42 +8236,307 @@ async fn link_callback(
     Ok(resp)
 }
 
-/// One `passkey.moved_on_merge` per passkey a link's merge moved from `from`
-/// to `into` (git-bug def16bd), through the security-event log. Best-effort:
-/// the merge has committed, and the always-ask confirmation of the link POST
-/// was recorded before it (`op.authorised`).
-async fn record_moved_passkeys(
+/// One `passkey.removed_on_merge` per passkey of `from` a link's merge
+/// deleted (ADR-0079 §3), through the security-event log. Best-effort: the
+/// merge has committed.
+async fn record_removed_passkeys(
     st: &AppState,
     into: &str,
     from: &str,
-    moved: &[String],
+    removed: &[String],
     sid: &str,
     now: i64,
 ) {
     let Some(svc) = st.step_up.service() else {
-        if !moved.is_empty() {
+        if !removed.is_empty() {
             tracing::info!(
                 from,
                 into,
-                passkeys = moved.len(),
-                "identity link: merge moved passkeys"
+                passkeys = removed.len(),
+                "identity link: merge removed passkeys"
             );
         }
         return;
     };
-    for id in moved {
+    for id in removed {
         let mut ev = step_up::event(
-            scarab_identity::security_event_kind::PASSKEY_MOVED_ON_MERGE,
+            scarab_identity::security_event_kind::PASSKEY_REMOVED_ON_MERGE,
             into,
             "session:cookie".to_string(),
             None,
             now,
         );
-        ev.op = Some("identity.link_moving_passkeys".to_string());
+        ev.op = Some("identity.merge_confirm".to_string());
         ev.passkey_id = Some(id.clone());
         ev.session_hash = Some(session_hash(sid));
         ev.detail = serde_json::json!({ "from": from, "into": into });
         svc.record(ev).await;
+    }
+}
+
+/// The proven sign-in a `merge` challenge carries until the merge is
+/// confirmed (ADR-0079 §2): stored in the challenge's summary, bound to the
+/// session that completed the OAuth round-trip.
+#[derive(Debug, Serialize, Deserialize)]
+struct PendingMerge {
+    from: String,
+    identity: scarab_identity::ProviderIdentity,
+}
+
+/// What the passkey assertion of a merge commits to: the folded Principal
+/// and the sign-in that proved it. Each part is length-prefixed.
+fn merge_digest(from: &str, identity: &scarab_identity::ProviderIdentity) -> [u8; 32] {
+    use sha2::Digest as _;
+    let mut h = sha2::Sha256::new();
+    for part in [
+        "identity.merge",
+        from,
+        identity.provider.as_str(),
+        identity.external_id.as_str(),
+    ] {
+        h.update((part.len() as u32).to_be_bytes());
+        h.update(part.as_bytes());
+    }
+    h.finalize().into()
+}
+
+/// The callback found that the sign-in is the only one of `from`, who holds
+/// passkeys: mint a `merge` challenge for this session that only a passkey
+/// of `from` can answer, and return its id. `Err` is the reason shown to
+/// the person when no such passkey can answer.
+async fn start_identity_merge(
+    st: &AppState,
+    sid: &str,
+    into: &str,
+    from: &str,
+    identity: &scarab_identity::ProviderIdentity,
+    now: i64,
+) -> Result<String, String> {
+    let Some(svc) = st.step_up.service() else {
+        return Err(format!(
+            "that {} account is the only sign-in of `{from}`, which holds passkeys; merging it \
+             needs one of them, and passkeys are off on this server, so an admin must merge it",
+            identity.provider
+        ));
+    };
+    let usable = svc
+        .usable_passkeys(from)
+        .await
+        .map_err(|_| format!("could not read `{from}`'s passkeys; try the link again"))?;
+    if usable.is_empty() {
+        return Err(format!(
+            "`{from}` holds passkeys that can no longer be used (suspected clones); an Owner \
+             must reset them before it can be merged into you"
+        ));
+    }
+    let pending = PendingMerge {
+        from: from.to_string(),
+        identity: identity.clone(),
+    };
+    let (row, _) = svc
+        .mint_challenge(
+            into,
+            &session_hash(sid),
+            scarab_identity::ChallengePurpose::Merge,
+            Some(merge_digest(from, identity)),
+            None,
+            None,
+            serde_json::to_value(&pending).ok(),
+            now,
+        )
+        .await
+        .map_err(|_| "could not start the merge; try the link again".to_string())?;
+    Ok(row.id)
+}
+
+/// A merge waiting for a passkey of the Principal it folds in.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct IdentityMergeDto {
+    pub id: String,
+    /// The Principal that would be folded into the caller.
+    pub from: String,
+    /// The sign-in that proved it: its provider and handle.
+    pub provider: String,
+    pub handle: String,
+    /// How many usable passkeys `from` holds; one of them must answer.
+    pub passkeys: usize,
+    /// `PublicKeyCredentialRequestOptionsJSON`, allowing only `from`'s
+    /// passkeys.
+    #[schema(value_type = Object)]
+    pub public_key: serde_json::Value,
+    pub expires_at: i64,
+}
+
+/// The pending merge `id` of this session.
+async fn pending_merge(
+    st: &AppState,
+    headers: &HeaderMap,
+    id: &str,
+) -> Result<(scarab_identity::WebauthnChallenge, PendingMerge), ApiError> {
+    let svc = step_up::ceremony::service(st)?;
+    let (caller, facts) = step_up::ceremony::browser_session(st, headers, Action::Read).await?;
+    let now = st.clock.now().await.0;
+    let row = svc
+        .challenges
+        .peek(id, &facts.id_hash, now)
+        .await
+        .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?
+        .filter(|r| {
+            r.purpose == scarab_identity::ChallengePurpose::Merge
+                && r.principal == caller.principal.subject
+        })
+        .ok_or(ApiError::NotFound)?;
+    let pending = row
+        .summary
+        .clone()
+        .and_then(|v| serde_json::from_value::<PendingMerge>(v).ok())
+        .ok_or(ApiError::NotFound)?;
+    Ok((row, pending))
+}
+
+/// A merge started by an identity link that folds in a Principal holding
+/// passkeys (ADR-0079 §2): who it folds in, and the WebAuthn options that
+/// only that Principal's passkeys can answer. 404 once used or expired.
+#[utoipa::path(
+    get,
+    path = "/v1/me/identities/merges/{id}",
+    params(("id" = String, Path, description = "the merge id from the link callback")),
+    summary = "A merge waiting for the merged account's passkey (ADR-0079)",
+    responses(
+        (status = 200, body = IdentityMergeDto),
+        (status = 403, description = "not a browser session"),
+        (status = 404, description = "no such pending merge in this session, used, or expired")
+    )
+)]
+async fn identity_merge(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<IdentityMergeDto>, ApiError> {
+    let svc = step_up::ceremony::service(&st)?;
+    let (row, pending) = pending_merge(&st, &headers, &id).await?;
+    let passkeys = svc.usable_passkeys(&pending.from).await?;
+    let sent = step_up::sent_challenge(&row).ok_or(ApiError::NotFound)?;
+    Ok(Json(IdentityMergeDto {
+        id: row.id.clone(),
+        from: pending.from,
+        provider: pending.identity.provider,
+        handle: pending.identity.handle,
+        passkeys: passkeys.len(),
+        public_key: scarab_webauthn::request_options(
+            svc.rp(),
+            &sent,
+            &step_up::descriptors(&passkeys),
+        ),
+        expires_at: row.expires_at,
+    }))
+}
+
+/// `POST /v1/me/identities/merges/{id}` body.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ConfirmIdentityMergeRequest {
+    /// The browser's `AuthenticationResponseJSON`, from a passkey of the
+    /// Principal being merged in.
+    #[schema(value_type = Object)]
+    pub credential: serde_json::Value,
+}
+
+/// What a confirmed merge did.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct IdentityMergedDto {
+    /// The Principal folded into the caller.
+    pub merged: String,
+    /// How many of its passkeys the merge deleted.
+    pub removed_passkeys: usize,
+}
+
+/// Confirm merge `id` with a passkey of the Principal it folds in (ADR-0079
+/// §2). The challenge is spent before the assertion is checked. On success
+/// the Principal is folded into the caller and its passkeys are deleted
+/// (§3).
+#[utoipa::path(
+    post,
+    path = "/v1/me/identities/merges/{id}",
+    params(("id" = String, Path, description = "the merge id from the link callback")),
+    request_body = ConfirmIdentityMergeRequest,
+    summary = "Confirm a merge with the merged account's passkey (ADR-0079)",
+    responses(
+        (status = 200, body = IdentityMergedDto),
+        (status = 400, description = "the merge is unknown, used, expired or another session's, or the passkey is not one of the merged account's (`code` names the check)"),
+        (status = 403, description = "not a browser session"),
+        (status = 409, description = "the sign-in or the merged account changed since the merge was started")
+    )
+)]
+async fn confirm_identity_merge(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<ConfirmIdentityMergeRequest>,
+) -> Result<Json<IdentityMergedDto>, ApiError> {
+    let svc = step_up::ceremony::service(&st)?;
+    let store = st.identities.as_ref().ok_or(ApiError::NotFound)?;
+    let (caller, facts) = step_up::ceremony::browser_session(&st, &headers, Action::Write).await?;
+    let now = st.clock.now().await.0;
+    let (row, sent) = step_up::ceremony::consume(
+        &svc,
+        &id,
+        &caller,
+        &facts,
+        &[scarab_identity::ChallengePurpose::Merge],
+        now,
+    )
+    .await?;
+    let pending = row
+        .summary
+        .and_then(|v| serde_json::from_value::<PendingMerge>(v).ok())
+        .ok_or(ApiError::NotFound)?;
+    let passkey = step_up::ceremony::verify_assertion_of(
+        &svc,
+        &caller,
+        &facts,
+        &pending.from,
+        &sent,
+        req.credential,
+        now,
+    )
+    .await?;
+    let sid = facts.id.0.clone();
+    match store
+        .link(
+            &caller.principal.subject,
+            &pending.identity,
+            now,
+            &scarab_identity::FoldedPasskey::Proven(passkey.id),
+        )
+        .await
+    {
+        Ok(scarab_identity::LinkOutcome::Merged {
+            from,
+            removed_passkeys,
+        }) => {
+            record_removed_passkeys(
+                &st,
+                &caller.principal.subject,
+                &from,
+                &removed_passkeys,
+                &sid,
+                now,
+            )
+            .await;
+            Ok(Json(IdentityMergedDto {
+                merged: from,
+                removed_passkeys: removed_passkeys.len(),
+            }))
+        }
+        Ok(scarab_identity::LinkOutcome::NeedsFoldedPasskey { from }) => Err(ApiError::Conflict(
+            format!("that passkey no longer belongs to `{from}`; start the link again"),
+        )),
+        Ok(_) => Err(ApiError::Conflict(format!(
+            "the {} sign-in is no longer `{}`'s only one; start the link again",
+            pending.identity.provider, pending.from
+        ))),
+        Err(scarab_identity::IdentityError::Conflict(why)) => Err(ApiError::Conflict(why)),
+        Err(e) => Err(ApiError::BadRequest(e.to_string())),
     }
 }
 
@@ -13279,7 +13488,8 @@ impl utoipa::Modify for StepUpResponses {
         oauth_callback,
         auth_providers,
         begin_link_identity,
-        begin_link_identity_moving_passkeys,
+        identity_merge,
+        confirm_identity_merge,
         unlink_identity,
         logout,
         me,
@@ -13481,6 +13691,9 @@ impl utoipa::Modify for StepUpResponses {
         AuthProviderDto,
         LinkIdentityRequest,
         LinkIdentityResponse,
+        IdentityMergeDto,
+        ConfirmIdentityMergeRequest,
+        IdentityMergedDto,
         PrincipalDto,
         PrincipalIdentityDto,
         MintTokenRequest,

@@ -372,26 +372,17 @@ impl StepUpService {
     /// the provider the guarded POST was asked for and the flow's expiry, so
     /// it can be minted only by the guarded link POST, cannot be moved to
     /// another flow, session or provider, and dies with its step-up.
-    /// `moves_passkeys` (git-bug def16bd): the flow was started by the
-    /// always-ask `identity.link_moving_passkeys`, so its merge may move
-    /// passkeys; it adds a fifth part, `passkeys:move`, so the two bindings
-    /// differ and a window-started flow keeps the binding it had before.
     pub(crate) fn link_binding(
         &self,
         state: &str,
         session_hash: &str,
         provider: &str,
         expires_at: i64,
-        moves_passkeys: bool,
     ) -> String {
         let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&self.link_key)
             .expect("HMAC accepts any key length");
         let expires_at = expires_at.to_string();
-        let mut parts = vec![state, session_hash, provider, expires_at.as_str()];
-        if moves_passkeys {
-            parts.push("passkeys:move");
-        }
-        for part in parts {
+        for part in [state, session_hash, provider, expires_at.as_str()] {
             mac.update(&(part.len() as u32).to_be_bytes());
             mac.update(part.as_bytes());
         }

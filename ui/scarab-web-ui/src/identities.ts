@@ -122,6 +122,23 @@ export function linkNotice(search: string, providers: ProviderLike[]): Notice | 
   };
 }
 
+/** The merge the link callback asks the person to confirm (`identity_merge`),
+ * or `null`. Set when the linked sign-in is the only one of an account that
+ * holds passkeys: one of that account's passkeys must confirm the merge. */
+export function pendingMergeId(search: string): string | null {
+  return new URLSearchParams(search).get("identity_merge") || null;
+}
+
+/** What a confirmed merge did, in words. */
+export function mergedNotice(merged: string, removedPasskeys: number): Notice {
+  const keys =
+    removedPasskeys === 1 ? "Its passkey was deleted" : `Its ${removedPasskeys} passkeys were deleted`;
+  return {
+    kind: "ok",
+    text: `Merged ${merged} into your account: its history, roles and tokens are now yours. ${keys}; add a passkey of yours under Security if you want to use that device here.`,
+  };
+}
+
 export type MemberRow = {
   subject: string;
   display: string;

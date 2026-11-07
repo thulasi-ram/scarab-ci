@@ -486,6 +486,27 @@ impl ChallengeStore for PostgresDb {
         .transpose()
     }
 
+    async fn peek(
+        &self,
+        id: &str,
+        session_hash: &str,
+        now_ms: i64,
+    ) -> Result<Option<WebauthnChallenge>, IdentityError> {
+        sqlx::query(&format!(
+            "SELECT {CHALLENGE_COLUMNS} FROM webauthn_challenges
+             WHERE id = $1 AND session_hash = $2 AND consumed_at IS NULL AND expires_at > $3"
+        ))
+        .bind(id)
+        .bind(session_hash)
+        .bind(now_ms)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(identity_err)?
+        .as_ref()
+        .map(challenge_from_row)
+        .transpose()
+    }
+
     async fn reap_expired(&self, now_ms: i64) -> Result<u64, IdentityError> {
         Ok(
             sqlx::query("DELETE FROM webauthn_challenges WHERE expires_at <= $1")

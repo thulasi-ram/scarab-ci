@@ -215,6 +215,10 @@ pub enum ChallengePurpose {
     Action,
     /// Confirm one StepUpConfirmationRequest.
     Request,
+    /// Prove a passkey of the Principal an identity link would fold in
+    /// (ADR-0079 §2). Minted for the surviving Principal's session; the
+    /// assertion must come from a passkey of the folded one.
+    Merge,
 }
 
 impl ChallengePurpose {
@@ -224,6 +228,7 @@ impl ChallengePurpose {
             Self::Window => "window",
             Self::Action => "action",
             Self::Request => "request",
+            Self::Merge => "merge",
         }
     }
 
@@ -233,6 +238,7 @@ impl ChallengePurpose {
             "window" => Self::Window,
             "action" => Self::Action,
             "request" => Self::Request,
+            "merge" => Self::Merge,
             _ => return None,
         })
     }
@@ -280,6 +286,16 @@ pub trait ChallengeStore: Send + Sync {
     /// `session_hash` is returned (and marked consumed). Anything else —
     /// unknown, used, expired, another session's — is `None`.
     async fn consume(
+        &self,
+        id: &str,
+        session_hash: &str,
+        now_ms: i64,
+    ) -> Result<Option<WebauthnChallenge>, IdentityError>;
+
+    /// Read challenge `id` without consuming it: the same filter as
+    /// [`consume`](Self::consume) (unconsumed, unexpired, minted for
+    /// `session_hash`), and nothing is marked.
+    async fn peek(
         &self,
         id: &str,
         session_hash: &str,
@@ -605,9 +621,14 @@ pub mod security_event_kind {
     /// move forward: recorded, not flagged.
     pub const PASSKEY_COUNTER_REGRESSED: &str = "passkey.counter_regressed";
     /// An identity link folded another Principal into this one and moved
-    /// one of its passkeys here (git-bug def16bd). One per passkey; the
-    /// detail names both Principals.
+    /// one of its passkeys here (git-bug def16bd). No longer written: a
+    /// merge deletes the folded Principal's passkeys (ADR-0079 §3). Kept so
+    /// older events still read.
     pub const PASSKEY_MOVED_ON_MERGE: &str = "passkey.moved_on_merge";
+    /// An identity link folded another Principal into this one and deleted
+    /// one of its passkeys (ADR-0079 §3). One per passkey; the detail names
+    /// both Principals.
+    pub const PASSKEY_REMOVED_ON_MERGE: &str = "passkey.removed_on_merge";
     pub const GUARD_NOT_CONSULTED: &str = "guard.not_consulted";
     /// `scarab-server admin grant`: an operator seeded a role binding
     /// straight in the database.
@@ -626,6 +647,7 @@ pub mod security_event_kind {
         PASSKEY_CLONE_SUSPECTED,
         PASSKEY_COUNTER_REGRESSED,
         PASSKEY_MOVED_ON_MERGE,
+        PASSKEY_REMOVED_ON_MERGE,
     ];
 }
 

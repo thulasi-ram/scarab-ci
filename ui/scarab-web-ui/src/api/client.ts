@@ -388,6 +388,35 @@ export async function beginLinkIdentity(provider: string): Promise<string> {
   return body.authorize_url;
 }
 
+/** A merge waiting for a passkey of the account it folds in
+ * (`GET /v1/me/identities/merges/{id}`). */
+export type IdentityMerge = components["schemas"]["IdentityMergeDto"];
+
+export async function getIdentityMerge(id: string): Promise<IdentityMerge> {
+  const { data, error, response } = await api.GET("/v1/me/identities/merges/{id}", {
+    params: { path: { id } },
+  });
+  if (error || !data) {
+    if (response.status === 404) throw new Error("This merge has expired or was already used. Link the account again.");
+    throw new Error(errorText(error) || `could not load the merge (${response.status})`);
+  }
+  return data;
+}
+
+/** Confirm a merge with the merged account's passkey
+ * (`POST /v1/me/identities/merges/{id}`). */
+export async function confirmIdentityMerge(
+  id: string,
+  credential: Record<string, unknown>,
+): Promise<components["schemas"]["IdentityMergedDto"]> {
+  const { data, error, response } = await api.POST("/v1/me/identities/merges/{id}", {
+    params: { path: { id } },
+    body: { credential: credential as Record<string, never> },
+  });
+  if (error || !data) throw new Error(errorText(error) || `the merge failed (${response.status})`);
+  return data;
+}
+
 /** Unlink this person's account on `provider` (`DELETE /v1/me/identities/…`);
  * the roles imported through it go with it. */
 export async function unlinkIdentity(provider: string): Promise<void> {

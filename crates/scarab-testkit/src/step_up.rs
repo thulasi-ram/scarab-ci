@@ -221,6 +221,21 @@ impl ChallengeStore for InMemoryChallenges {
         Ok(Some(c.clone()))
     }
 
+    async fn peek(
+        &self,
+        id: &str,
+        session_hash: &str,
+        now_ms: i64,
+    ) -> Result<Option<WebauthnChallenge>, IdentityError> {
+        let rows = self.challenges.lock().unwrap();
+        Ok(rows
+            .get(id)
+            .filter(|c| {
+                c.session_hash == session_hash && c.consumed_at.is_none() && c.expires_at > now_ms
+            })
+            .cloned())
+    }
+
     async fn reap_expired(&self, now_ms: i64) -> Result<u64, IdentityError> {
         let mut rows = self.challenges.lock().unwrap();
         let before = rows.len();

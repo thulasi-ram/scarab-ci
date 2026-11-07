@@ -1,5 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
+  mergedNotice,
+  pendingMergeId,
   addToList,
   canUnlink,
   linkNotice,
@@ -119,5 +121,19 @@ describe("addToList", () => {
     expect(addToList("", "github:alice")).toBe("github:alice");
     expect(addToList("a ,b", "github:alice")).toBe("a, b, github:alice");
     expect(addToList("github:alice", "github:alice")).toBe("github:alice");
+  });
+});
+
+describe("the merge a link asks to confirm", () => {
+  it("reads the merge id from the callback's redirect", () => {
+    expect(pendingMergeId("")).toBeNull();
+    expect(pendingMergeId("?identity_linked=default")).toBeNull();
+    expect(pendingMergeId("?identity_merge=ch-1")).toBe("ch-1");
+  });
+
+  it("says the merged account's passkeys were deleted, not moved", () => {
+    expect(mergedNotice("github:ada", 1).text).toContain("Its passkey was deleted");
+    expect(mergedNotice("github:ada", 2).text).toContain("Its 2 passkeys were deleted");
+    expect(mergedNotice("github:ada", 1).kind).toBe("ok");
   });
 });

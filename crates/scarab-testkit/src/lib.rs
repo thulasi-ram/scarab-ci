@@ -4537,7 +4537,7 @@ impl scarab_identity::IdentityStore for InMemoryIdentities {
         principal: &str,
         identity: &scarab_identity::ProviderIdentity,
         now_ms: i64,
-        _passkeys: scarab_identity::MergePasskeys,
+        _folded: &scarab_identity::FoldedPasskey,
     ) -> Result<scarab_identity::LinkOutcome, IdentityError> {
         let mut st = self.inner.lock().unwrap();
         let key = (identity.provider.clone(), identity.external_id.clone());

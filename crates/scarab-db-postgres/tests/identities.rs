@@ -176,7 +176,7 @@ async fn pin_mints_unclaimed_and_sign_in_claims_it() {
 #[tokio::test]
 async fn link_merges_a_claimed_single_identity_principal_with_its_tokens() {
     use scarab_identity::{
-        ApiToken, ApiTokenStore, IdentityError, LinkOutcome, MergePasskeys, Principal, Scope,
+        ApiToken, ApiTokenStore, FoldedPasskey, IdentityError, LinkOutcome, Principal, Scope,
         Session, SessionStore,
     };
     let Some(tdb) = fresh_db().await else {
@@ -232,17 +232,17 @@ async fn link_merges_a_claimed_single_identity_principal_with_its_tokens() {
     .await
     .unwrap();
 
-    // The stray Principal holds no passkey, so a link that may not move
-    // passkeys still merges it.
+    // The stray Principal holds no passkey, so the OAuth round-trip alone
+    // merges it (ADR-0079 §2).
     let outcome = db
-        .link(&ada, &ident("1001", "ada-gh"), 3, MergePasskeys::Refuse)
+        .link(&ada, &ident("1001", "ada-gh"), 3, &FoldedPasskey::Unproven)
         .await
         .unwrap();
     assert_eq!(
         outcome,
         LinkOutcome::Merged {
             from: stray.clone(),
-            moved_passkeys: vec![],
+            removed_passkeys: vec![],
         }
     );
     assert_eq!(
@@ -254,17 +254,103 @@ async fn link_merges_a_claimed_single_identity_principal_with_its_tokens() {
     assert_eq!(db.aliases_of(&ada).await.unwrap(), vec![stray.clone()]);
     // Linking it again is a no-op, not a second merge.
     assert_eq!(
-        db.link(&ada, &ident("1001", "ada-gh"), 4, MergePasskeys::Refuse)
+        db.link(&ada, &ident("1001", "ada-gh"), 4, &FoldedPasskey::Unproven)
             .await
             .unwrap(),
         LinkOutcome::AlreadyLinked
     );
     // A second GitHub account on the same Principal is refused.
     assert!(matches!(
-        db.link(&ada, &ident("3003", "ada-alt"), 5, MergePasskeys::Refuse)
+        db.link(&ada, &ident("3003", "ada-alt"), 5, &FoldedPasskey::Unproven)
             .await,
         Err(IdentityError::Conflict(_))
     ));
+    tdb.cleanup().await;
+}
+
+/// ADR-0079 §2-3 (git-bug bbb5204): folding in a Principal that holds a
+/// passkey needs proof from one of ITS passkeys. Without it, or with a
+/// passkey of anyone else (the caller's own), nothing changes. With it, the
+/// merge happens and the folded Principal's passkeys are deleted, never
+/// moved to the caller.
+#[tokio::test]
+async fn a_merge_of_a_principal_with_passkeys_needs_one_of_its_passkeys() {
+    use scarab_identity::{FoldedPasskey, LinkOutcome};
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = PostgresDb::with_pool(tdb.pool.clone());
+    db.migrate().await.unwrap();
+    let okta = ProviderIdentity {
+        provider: "okta".into(),
+        ..ident("00u-mallory", "mallory@example.com")
+    };
+    let mallory = db
+        .sign_in(&okta, "okta:mallory@example.com", 1)
+        .await
+        .unwrap();
+    let ada = db
+        .sign_in(&ident("1001", "ada"), "github:ada", 2)
+        .await
+        .unwrap();
+    for (id, owner, cred) in [("pk-m", &mallory, 1u8), ("pk-a", &ada, 2u8)] {
+        sqlx::query(
+            "INSERT INTO passkeys (id, principal_id, credential_id, public_key_cose, alg,
+                 sign_count, label, created_at, created_session_hash)
+             VALUES ($1, $2, $3, '\\x00', -7, 0, 'key', 1, 'h')",
+        )
+        .bind(id)
+        .bind(owner)
+        .bind(vec![cred])
+        .execute(&tdb.pool)
+        .await
+        .unwrap();
+    }
+    let owners = || async {
+        sqlx::query_as::<_, (String, String)>("SELECT id, principal_id FROM passkeys ORDER BY id")
+            .fetch_all(&tdb.pool)
+            .await
+            .unwrap()
+    };
+    // Mallory, holding Ada's GitHub sign-in, links it.
+    let gh_ada = ident("1001", "ada");
+    for proof in [
+        FoldedPasskey::Unproven,
+        FoldedPasskey::Proven("pk-m".into()),
+        FoldedPasskey::Proven("no-such".into()),
+    ] {
+        assert_eq!(
+            db.link(&mallory, &gh_ada, 3, &proof).await.unwrap(),
+            LinkOutcome::NeedsFoldedPasskey { from: ada.clone() },
+            "{proof:?}"
+        );
+    }
+    assert_eq!(
+        owners().await,
+        vec![
+            ("pk-a".to_string(), ada.clone()),
+            ("pk-m".to_string(), mallory.clone())
+        ],
+        "nothing changed"
+    );
+    assert_eq!(db.aliases_of(&mallory).await.unwrap(), Vec::<String>::new());
+
+    // With a passkey of Ada's: merged, and Ada's passkey is deleted.
+    assert_eq!(
+        db.link(&mallory, &gh_ada, 4, &FoldedPasskey::Proven("pk-a".into()))
+            .await
+            .unwrap(),
+        LinkOutcome::Merged {
+            from: ada.clone(),
+            removed_passkeys: vec!["pk-a".into()],
+        }
+    );
+    assert_eq!(
+        owners().await,
+        vec![("pk-m".to_string(), mallory.clone())],
+        "deleted, not moved"
+    );
     tdb.cleanup().await;
 }
 
