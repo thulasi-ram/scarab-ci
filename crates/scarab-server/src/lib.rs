@@ -9747,6 +9747,15 @@ async fn approve_gate(
                 .await
                 .map_err(ApiError::Db)?;
         }
+        // Record the deployment in the legacy approval history (ADR-0024,
+        // 0037, ADR-0070 §1), the record `GET …/environments/{name}/
+        // deployments` serves: once per wait, when its approvals first meet
+        // the rules. The scheduler, which releases the gate when the wait
+        // timer runs out, has no history store, so the record is written
+        // here whichever path releases the gate.
+        if recorded.is_none() {
+            record_deployment(&st, c, &run, &approvers, now).await?;
+        }
         if now < release_at {
             // The scheduler releases the gate when the timer runs out.
             return Ok((
@@ -9789,25 +9798,14 @@ async fn approve_gate(
         .iter()
         .any(|s| s.step == step && s.status == StepStatus::Succeeded);
 
-    // 5. Record the deployment in the legacy approval history (ADR-0024, 0037,
-    //    ADR-0070 §1) — only on a real release (a no-op re-release writes no
-    //    duplicate history record). Kept through ADR-0071: it is the record
-    //    `GET …/environments/{name}/deployments` still serves.
-    if released && approval_gate {
-        if let (Some(c), Some(store)) = (&ctx, st.environments.as_ref()) {
+    // 5. An Environment approval gate judged by no Environment rules (no
+    //    governance store wired) records its deployment on a real release (a
+    //    no-op re-release writes no duplicate). One judged by them recorded
+    //    it at step 3, when its approvals met the rules.
+    if released && approval_gate && rules.is_none() {
+        if let Some(c) = &ctx {
             let now = st.clock.now().await.0;
-            store
-                .record_deployment(&scarab_project::Deployment {
-                    org: c.org.clone(),
-                    project: c.project.clone(),
-                    environment: c.environment.clone(),
-                    git_ref: c.git_ref.clone(),
-                    run: run.0.clone(),
-                    approved_by: approvers.clone(),
-                    at: now,
-                })
-                .await
-                .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+            record_deployment(&st, c, &run, &approvers, now).await?;
         }
     }
 
@@ -9816,6 +9814,32 @@ async fn approve_gate(
         Json(serde_json::json!({ "released": released, "approvals": approvers })),
     )
         .into_response())
+}
+
+/// Write one deploy of `run` to the legacy approval history, when a history
+/// store is wired.
+async fn record_deployment(
+    st: &AppState,
+    c: &scarab_engine::DeployContext,
+    run: &RunId,
+    approvers: &[String],
+    at: i64,
+) -> Result<(), ApiError> {
+    let Some(store) = st.environments.as_ref() else {
+        return Ok(());
+    };
+    store
+        .record_deployment(&scarab_project::Deployment {
+            org: c.org.clone(),
+            project: c.project.clone(),
+            environment: c.environment.clone(),
+            git_ref: c.git_ref.clone(),
+            run: run.0.clone(),
+            approved_by: approvers.to_vec(),
+            at,
+        })
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))
 }
 
 /// `POST /v1/runs/{id}/gates/{step}/reject` body: why the gate is failed.

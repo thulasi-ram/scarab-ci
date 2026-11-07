@@ -177,12 +177,14 @@ record. Read Breaking changes before you upgrade.
 - **The Environment's wait timer is enforced** (git-bug 2b94989): the approval gate releases when
   its approvals are in and the timer has run out, counted from when its `needs` finished. An
   approval given early counts. The API refuses a non-zero wait timer on an Environment with no
-  approvers; one stored before does nothing.
+  approvers; one stored before does nothing. The deployment history records each approval gate
+  once, when its approvals are in, so a gate the timer releases is listed too.
 - **A stale approval is refused at launch** (git-bug 220917f). Every launch of a Step that uses
   the authority of an Environment with approvers, reruns and retries included, fails `Config`
   when no released approval gate is upstream of it, the Run's ref is no longer allowed, the
   approvers changed since the gate's approvals, or the gate released more than the Environment's
-  maximum approval age ago (24 hours by default). An external gate no longer hands over the
+  maximum approval age ago (24 hours by default). One released approval gate upstream that passes
+  these checks is enough. An external gate no longer hands over the
   Environment's authority by its token alone. A Run created before its Environment had approvers
   has no approval gate, so its authority Steps are refused once the Environment has approvers.
   In such an Environment, Steps before the approval gate get the `env=none` OIDC subject.

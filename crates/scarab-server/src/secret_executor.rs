@@ -129,11 +129,11 @@ async fn stored_pipeline(
 /// at every launch, reruns and retries included, of a Step that uses the
 /// Environment's authority in an Environment with approvers:
 ///
-/// - an Environment approval gate is upstream of it and released;
 /// - the Run's symbolic ref is still allowed;
-/// - the approver set is the one recorded when the gate's approvals met the
-///   rules (a gate released before that record existed has none to compare);
-/// - the release is no older than the maximum approval age.
+/// - an Environment approval gate upstream of it has released, with the
+///   approver set recorded when its approvals met the rules unchanged (a
+///   gate released before that record existed has none to compare), no
+///   longer ago than the maximum approval age. One such gate is enough.
 ///
 /// External, timer and plugin gates are never approval gates, so a Step
 /// behind only those is refused here whatever released them.
@@ -177,36 +177,46 @@ pub(crate) async fn environment_approval_refusal(
         .await
         .map_err(|e| ExecError::Other(e.to_string()))?;
     let max_age_ms = i64::from(protection.approval_gate.max_approval_age_s) * 1000;
-    for gate in gates {
+    // One released approval gate upstream that passes every check admits
+    // the Step: an older gate further up (a QA sign-off a day ago) does not
+    // refuse a deploy a fresh approval released. When none passes, the
+    // reason given is that of the gate latest in the Pipeline.
+    let mut refusal = None;
+    for gate in gates.iter().rev() {
         let gate_id = scarab_engine::StepId(gate.id.clone());
-        let Some(released) = scarab_engine::gate_released_at(&events, &gate_id) else {
-            return Ok(Some(format!(
+        let why = match scarab_engine::gate_released_at(&events, &gate_id) {
+            None => format!(
                 "Environment approval gate `{}` upstream of step `{id}` has not released",
                 gate.id
-            )));
-        };
-        let age_ms = now_ms.saturating_sub(released.0);
-        if age_ms > max_age_ms {
-            return Ok(Some(format!(
-                "Environment approval gate `{}` released {} s ago, longer than environment \
-                 `{env}`'s maximum approval age of {} s; rerun the gate to ask the approvers \
-                 again",
-                gate.id,
-                age_ms / 1000,
-                protection.approval_gate.max_approval_age_s
-            )));
-        }
-        if let Some(met) = scarab_engine::environment_approval_met(&events, &gate_id) {
-            if (met.approvers, met.required) != protection.approver_set() {
-                return Ok(Some(format!(
-                    "environment `{env}`'s approvers changed since Environment approval gate \
-                     `{}` released; rerun the gate to ask the approvers again",
-                    gate.id
-                )));
+            ),
+            Some(released) => {
+                let age_ms = now_ms.saturating_sub(released.0);
+                let met = scarab_engine::environment_approval_met(&events, &gate_id);
+                if age_ms > max_age_ms {
+                    format!(
+                        "Environment approval gate `{}` released {} s ago, longer than \
+                         environment `{env}`'s maximum approval age of {} s; rerun the gate to \
+                         ask the approvers again",
+                        gate.id,
+                        age_ms / 1000,
+                        protection.approval_gate.max_approval_age_s
+                    )
+                } else if met
+                    .is_some_and(|m| (m.approvers, m.required) != protection.approver_set())
+                {
+                    format!(
+                        "environment `{env}`'s approvers changed since Environment approval gate \
+                         `{}` released; rerun the gate to ask the approvers again",
+                        gate.id
+                    )
+                } else {
+                    return Ok(None);
+                }
             }
-        }
+        };
+        refusal.get_or_insert(why);
     }
-    Ok(None)
+    Ok(refusal)
 }
 
 /// Whether `step` has a released Environment approval gate upstream — what

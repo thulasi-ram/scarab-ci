@@ -16,6 +16,8 @@
 //!
 //! Hermetic: in-memory Db, governance and forge, a fake clock and executor.
 
+mod common;
+
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -28,7 +30,7 @@ use scarab_engine::{Clock, Db, FailureKind, RunId, RunStatus, Scheduler, StepId,
 use scarab_forge::RepoRef;
 use scarab_project::{
     ApprovalGateRules, EnvironmentGovernanceStore, EnvironmentProjectEligibility,
-    EnvironmentProtectionRules, MissingGateMode,
+    EnvironmentProtectionRules, EnvironmentStore, MissingGateMode,
 };
 use scarab_server::{
     dispatch_run, router, AppState, DispatchError, DispatchKind, LogService,
@@ -107,6 +109,14 @@ impl Stack {
     /// `prod` in `acme`, every Project eligible, with `protection` as its
     /// baseline.
     async fn new(protection: EnvironmentProtectionRules) -> Self {
+        Self::with_history(protection, None).await
+    }
+
+    /// [`Stack::new`], with `history` as the legacy deployment history.
+    async fn with_history(
+        protection: EnvironmentProtectionRules,
+        history: Option<Arc<dyn EnvironmentStore>>,
+    ) -> Self {
         let governance = Arc::new(InMemoryEnvironmentGovernance::new().with_environment(
             "acme",
             "prod",
@@ -122,10 +132,12 @@ impl Stack {
             Arc::new(InMemoryObjectStore::new()),
             db.clone(),
         ));
-        let app = router(
-            AppState::new(db.clone(), clock.clone(), logs)
-                .with_environment_governance(governance.clone()),
-        );
+        let mut state = AppState::new(db.clone(), clock.clone(), logs)
+            .with_environment_governance(governance.clone());
+        if let Some(history) = history {
+            state = state.with_environments(history);
+        }
+        let app = router(state);
         Self {
             db,
             clock,
@@ -528,4 +540,334 @@ async fn the_mark_is_stored_in_the_runs_pipeline() {
     assert_eq!(mark("approve"), Some(json!(true)));
     assert_eq!(mark("qa"), Some(json!(false)));
     assert_eq!(mark("build"), None);
+}
+
+/// The latest attempt's Config refusal of `step`, and how many attempts it
+/// has.
+async fn latest_refusal(s: &Stack, run: &RunId, step: &str) -> (usize, String) {
+    let attempts =
+        s.db.attempts_of_step(run, &StepId(step.into()))
+            .await
+            .unwrap();
+    let last = attempts.last().expect("an attempt");
+    assert_eq!(last.failure, Some(FailureKind::Config), "{attempts:?}");
+    (
+        attempts.len(),
+        last.failure_detail.clone().unwrap_or_default(),
+    )
+}
+
+/// How many times gate `step` of `run` passed.
+async fn releases(s: &Stack, run: &RunId, step: &str) -> usize {
+    s.db.events(run)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|e| {
+            matches!(
+                &e.kind,
+                scarab_engine::EventPayload::GateResolved { step: g, passed: true, .. }
+                    if g.0 == step
+            )
+        })
+        .count()
+}
+
+/// cd43bf3: two deploy branches, and one branch's build is excluded by its
+/// `when:`. That branch never starts, so the gate goes in front of the live
+/// branch only, does not need the excluded build, and the live deploy waits
+/// for the approval and then runs. Were the excluded build among the gate's
+/// `needs`, the scheduler would skip the gate and the live deploy with it.
+#[tokio::test]
+async fn an_excluded_branch_does_not_skip_the_gate_of_the_live_one() {
+    const TWO_BRANCHES: &str = r#"
+on:
+  manual: {}
+environment: prod
+steps:
+  - { id: build-canary, image: busybox, command: ["true"], when: "event.kind == 'push'" }
+  - { id: deploy-canary, image: busybox, command: ["true"], deploy: true, needs: [build-canary] }
+  - { id: build, image: busybox, command: ["true"] }
+  - { id: deploy-main, image: busybox, command: ["true"], deploy: true, needs: [build] }
+"#;
+    let s = Stack::new(rules(&[ME])).await;
+    let run = s.dispatch(TWO_BRANCHES).await.expect("admitted");
+    let steps = s.db.steps_of_run(&run).await.unwrap();
+    let needs = |id: &str| {
+        steps
+            .iter()
+            .find(|st| st.step.0 == id)
+            .unwrap()
+            .needs
+            .clone()
+    };
+    assert_eq!(needs("environment-approval"), vec![StepId("build".into())]);
+    assert_eq!(needs("deploy-canary"), vec![StepId("build-canary".into())]);
+    assert_eq!(
+        needs("deploy-main"),
+        vec![
+            StepId("build".into()),
+            StepId("environment-approval".into())
+        ]
+    );
+
+    s.tick(&run, 6).await;
+    assert_eq!(s.status(&run, "deploy-canary").await, StepStatus::Skipped);
+    assert_eq!(
+        s.status(&run, "environment-approval").await,
+        StepStatus::Pending
+    );
+    assert_eq!(s.status(&run, "deploy-main").await, StepStatus::Pending);
+
+    let (status, body) = s.approve(&run, "environment-approval").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["released"], true, "{body}");
+    s.tick(&run, 4).await;
+    assert_eq!(s.status(&run, "deploy-main").await, StepStatus::Succeeded);
+}
+
+/// 2b94989: a gate the scheduler releases when the wait timer runs out has its
+/// deployment record, written once, when its approvals met the rules. A
+/// gate an approval releases at once also has exactly one.
+#[tokio::test]
+async fn a_timer_released_gate_has_its_deployment_record() {
+    let Some(tdb) = common::fresh_db().await else {
+        return;
+    };
+    let pg = Arc::new(scarab_db_postgres::PostgresDb::with_pool(tdb.pool.clone()));
+    pg.migrate().await.unwrap();
+    let mut protection = rules(&[ME]);
+    protection.wait_timer_s = 60;
+    let s = Stack::with_history(protection, Some(pg.clone() as Arc<dyn EnvironmentStore>)).await;
+    let history = || pg.deployments("acme", "web", "prod");
+
+    let run = s.dispatch(GATED).await.expect("admitted");
+    s.tick(&run, 6).await;
+    let (status, body) = s.approve(&run, "approve").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["released"], false, "{body}");
+    // A second approval while the timer runs writes no second record.
+    s.approve(&run, "approve").await;
+    s.clock.advance(60_000);
+    s.tick(&run, 4).await;
+    assert_eq!(s.status(&run, "approve").await, StepStatus::Succeeded);
+    assert_eq!(releases(&s, &run, "approve").await, 1);
+    let records = history().await.unwrap();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].run, run.0);
+    assert_eq!(records[0].approved_by, vec![ME.to_string()]);
+    assert_eq!(records[0].git_ref, "refs/heads/main");
+
+    // No timer: the approval releases the gate, and one record is written.
+    s.set_protection(rules(&[ME])).await;
+    let at_once = approved(&s).await;
+    let records = history().await.unwrap();
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(records[0].run, at_once.0);
+
+    tdb.cleanup().await;
+}
+
+/// 220917f: one released approval gate upstream that passes every check is
+/// enough. A QA approval gate released longer ago than the maximum approval
+/// age does not refuse a deploy that a fresh approval released.
+#[tokio::test]
+async fn an_old_qa_approval_and_a_fresh_deploy_approval_admit_the_step() {
+    const QA_THEN_PROD: &str = r#"
+on:
+  manual: {}
+environment: prod
+steps:
+  - { id: build, image: busybox, command: ["true"] }
+  - { id: qa-gate, gate: manual, needs: [build] }
+  - { id: smoke, image: busybox, command: ["true"], needs: [qa-gate] }
+  - { id: prod-gate, gate: manual, needs: [smoke] }
+  - { id: deploy, image: busybox, command: ["true"], deploy: true, needs: [prod-gate] }
+"#;
+    let mut protection = rules(&[ME]);
+    protection.approval_gate.max_approval_age_s = 3_600;
+    let s = Stack::new(protection).await;
+    let run = s.dispatch(QA_THEN_PROD).await.expect("admitted");
+    for gate in ["qa-gate", "prod-gate"] {
+        assert_eq!(
+            s.step_dto(&run, gate).await["environment_approval_gate"],
+            true,
+            "{gate}"
+        );
+    }
+    s.tick(&run, 6).await;
+    let (_, body) = s.approve(&run, "qa-gate").await;
+    assert_eq!(body["released"], true, "{body}");
+    s.tick(&run, 6).await;
+    assert_eq!(s.status(&run, "smoke").await, StepStatus::Succeeded);
+
+    s.clock.advance(3_601_000);
+    let (_, body) = s.approve(&run, "prod-gate").await;
+    assert_eq!(body["released"], true, "{body}");
+    s.tick(&run, 4).await;
+    assert_eq!(s.status(&run, "deploy").await, StepStatus::Succeeded);
+}
+
+/// cd43bf3: with `required_approvals`, n of the baseline's approvers release
+/// the gate; fewer hold it.
+#[tokio::test]
+async fn two_of_three_baseline_approvers_release_the_gate() {
+    let mut protection = rules(&[ME, "carol", "dave"]);
+    protection.approval_gate.required_approvals = Some(2);
+    let s = Stack::new(protection).await;
+    let run = s.dispatch(GATED).await.expect("admitted");
+    s.tick(&run, 6).await;
+
+    let (_, body) = s.approve(&run, "approve").await;
+    assert_eq!(body["released"], false, "1 of 2: {body}");
+    scarab_engine::record_gate_approval(
+        s.db.as_ref(),
+        s.clock.as_ref(),
+        &run,
+        &StepId("approve".into()),
+        "carol",
+    )
+    .await
+    .unwrap();
+    let (_, body) = s.approve(&run, "approve").await;
+    assert_eq!(body["released"], true, "2 of 2: {body}");
+    s.tick(&run, 4).await;
+    assert_eq!(s.status(&run, "ship").await, StepStatus::Succeeded);
+}
+
+/// 220917f: a retry passes through the launch re-check. The approvers changed
+/// since the gate released, so the deploy is refused, and a retry is
+/// refused again; once the approvers are back, a retry runs.
+#[tokio::test]
+async fn a_retry_is_checked_again_at_launch() {
+    let s = Stack::new(rules(&[ME])).await;
+    let run = approved(&s).await;
+    s.set_protection(rules(&[ME, "carol"])).await;
+    s.tick(&run, 4).await;
+    assert_eq!(s.status(&run, "ship").await, StepStatus::Failed);
+
+    let ship = StepId("ship".into());
+    scarab_engine::retry_step(s.db.as_ref(), s.clock.as_ref(), &run, &ship, None)
+        .await
+        .unwrap();
+    s.tick(&run, 4).await;
+    assert_eq!(s.status(&run, "ship").await, StepStatus::Failed);
+    let (attempts, refusal) = latest_refusal(&s, &run, "ship").await;
+    assert_eq!(attempts, 2);
+    assert!(refusal.contains("approvers changed"), "{refusal}");
+
+    s.set_protection(rules(&[ME])).await;
+    scarab_engine::retry_step(s.db.as_ref(), s.clock.as_ref(), &run, &ship, None)
+        .await
+        .unwrap();
+    s.tick(&run, 4).await;
+    assert_eq!(s.status(&run, "ship").await, StepStatus::Succeeded);
+}
+
+/// 220917f: a rerun of the deploy passes through the launch re-check and no
+/// gate release: once the approval is older than the maximum approval age,
+/// the rerun is refused.
+#[tokio::test]
+async fn a_rerun_on_a_stale_approval_is_refused() {
+    let mut protection = rules(&[ME]);
+    protection.approval_gate.max_approval_age_s = 3_600;
+    let s = Stack::new(protection).await;
+    let run = approved(&s).await;
+    s.tick(&run, 4).await;
+    assert_eq!(s.status(&run, "ship").await, StepStatus::Succeeded);
+
+    s.clock.advance(3_601_000);
+    scarab_engine::rerun_step(
+        s.db.as_ref(),
+        s.clock.as_ref(),
+        &run,
+        &StepId("ship".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    s.tick(&run, 4).await;
+    assert_eq!(s.status(&run, "ship").await, StepStatus::Failed);
+    let (_, refusal) = latest_refusal(&s, &run, "ship").await;
+    assert!(
+        refusal.contains("maximum approval age of 3600 s"),
+        "{refusal}"
+    );
+}
+
+/// 220917f: a Run created before the mark existed has unmarked gates. Its
+/// `manual` gate counts as an Environment approval gate: approving it needs
+/// the Environment's approvers, and a release from before the approvals were
+/// recorded with their approver set (no record to compare) admits the
+/// deploy.
+#[tokio::test]
+async fn a_run_from_before_the_mark_counts_its_manual_gate_as_an_approval_gate() {
+    let s = Stack::new(rules(&["carol"])).await;
+    let run = s.dispatch(GATED).await.expect("admitted");
+    let mut ir = s.db.run_ir(&run).await.unwrap().unwrap();
+    for st in ir["steps"].as_array_mut().unwrap() {
+        st.as_object_mut()
+            .unwrap()
+            .remove("environment_approval_gate");
+    }
+    s.db.store_run_ir(&run, &ir).await.unwrap();
+    s.tick(&run, 6).await;
+
+    let (status, body) = s.approve(&run, "approve").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["released"], false, "carol must approve: {body}");
+
+    // Released as the server did before approvals were recorded with their
+    // approver set.
+    scarab_engine::release_gate(
+        s.db.as_ref(),
+        s.clock.as_ref(),
+        &run,
+        &StepId("approve".into()),
+    )
+    .await
+    .unwrap();
+    s.tick(&run, 4).await;
+    assert_eq!(s.status(&run, "ship").await, StepStatus::Succeeded);
+}
+
+/// 220917f: two approvals racing on a gate that needs both. Both are recorded,
+/// and the gate is released once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_racing_approvals_are_both_recorded_and_release_once() {
+    let s = Arc::new(Stack::new(rules(&[ME, "carol"])).await);
+    let run = s.dispatch(GATED).await.expect("admitted");
+    s.tick(&run, 6).await;
+
+    let carol = {
+        let (s, run) = (s.clone(), run.clone());
+        tokio::spawn(async move {
+            scarab_engine::record_gate_approval(
+                s.db.as_ref(),
+                s.clock.as_ref(),
+                &run,
+                &StepId("approve".into()),
+                "carol",
+            )
+            .await
+            .unwrap();
+            s.approve(&run, "approve").await
+        })
+    };
+    let me = {
+        let (s, run) = (s.clone(), run.clone());
+        tokio::spawn(async move { s.approve(&run, "approve").await })
+    };
+    let (carol, me) = (carol.await.unwrap(), me.await.unwrap());
+    assert_eq!(carol.0, StatusCode::ACCEPTED, "{}", carol.1);
+    assert_eq!(me.0, StatusCode::ACCEPTED, "{}", me.1);
+
+    let approvals =
+        scarab_engine::gate_approvers(&s.db.events(&run).await.unwrap(), &StepId("approve".into()));
+    assert!(
+        approvals.contains(&ME.to_string()) && approvals.contains(&"carol".to_string()),
+        "{approvals:?}"
+    );
+    assert_eq!(s.status(&run, "approve").await, StepStatus::Succeeded);
+    assert_eq!(releases(&s, &run, "approve").await, 1);
 }
