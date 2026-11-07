@@ -1612,19 +1612,29 @@ async fn cancel_open_gate_attempt(db: &dyn Db, run: &RunId, step: &StepRun) -> R
 pub const GATE_NO_LONGER_NEEDED: &str = "no longer needed: every step that needs it has finished";
 
 /// Whether gate `step`'s current `Skipped` is the "no longer needed" skip:
-/// its latest `StepSkipped` carries [`GATE_NO_LONGER_NEEDED`] and no re-arm
-/// to `Pending` follows it.
+/// its latest move to `Skipped` is the one journalled with a `StepSkipped`
+/// carrying [`GATE_NO_LONGER_NEEDED`], and no re-arm follows it. A re-arm is
+/// a transition to `Pending`, or a rerun whose `invalidated` names the gate.
+/// A later skip without a `StepSkipped` (a dead upstream) is not this skip.
 fn skipped_as_unneeded(events: &[EventKind], step: &StepId) -> bool {
+    // The unneeded skip journals `StepSkipped` and then its transition, so a
+    // transition to `Skipped` is that skip only when the step's previous
+    // event is that `StepSkipped`.
+    let mut skipped_without_reason = false;
     for e in events.iter().rev() {
         match &e.kind {
             EventPayload::StepSkipped { step: s, reason } if s == step => {
                 return reason == GATE_NO_LONGER_NEEDED;
             }
-            EventPayload::StepTransitioned {
-                step: s,
-                to: StepStatus::Pending,
-                ..
-            } if s == step => return false,
+            EventPayload::StepTransitioned { step: s, to, .. } if s == step => {
+                if skipped_without_reason || *to != StepStatus::Skipped {
+                    return false;
+                }
+                skipped_without_reason = true;
+            }
+            EventPayload::RunRerunRequested { invalidated, .. } if invalidated.contains(step) => {
+                return false;
+            }
             _ => {}
         }
     }
@@ -5529,5 +5539,60 @@ fn event(run: &RunId, kind: EventPayload, at: Timestamp) -> EventKind {
         run: run.clone(),
         kind,
         at,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ev(kind: EventPayload) -> EventKind {
+        event(&RunId("r".into()), kind, Timestamp(0))
+    }
+
+    fn unneeded_skip(gate: &StepId) -> [EventKind; 2] {
+        [
+            ev(EventPayload::StepSkipped {
+                step: gate.clone(),
+                reason: GATE_NO_LONGER_NEEDED.to_string(),
+            }),
+            ev(EventPayload::StepTransitioned {
+                step: gate.clone(),
+                from: StepStatus::Pending,
+                to: StepStatus::Skipped,
+            }),
+        ]
+    }
+
+    /// Review CC-5 (git-bug 2c37802): a rerun re-arms the gate through
+    /// `RunRerunRequested` alone, and a dead upstream then skips it with no
+    /// `StepSkipped`. That latest skip is not the "no longer needed" one, so
+    /// the gate is not re-armed for it (a spurious Skipped→Pending pair).
+    #[test]
+    fn only_the_latest_skip_counts_as_unneeded() {
+        let gate = StepId("approve".into());
+        let mut events = unneeded_skip(&gate).to_vec();
+        assert!(skipped_as_unneeded(&events, &gate));
+
+        events.push(ev(EventPayload::RunRerunRequested {
+            target: StepId("build".into()),
+            invalidated: vec![StepId("build".into()), gate.clone()],
+            by: None,
+            widened: vec![],
+        }));
+        assert!(!skipped_as_unneeded(&events, &gate), "a rerun re-armed it");
+
+        events.push(ev(EventPayload::StepTransitioned {
+            step: gate.clone(),
+            from: StepStatus::Pending,
+            to: StepStatus::Skipped,
+        }));
+        assert!(
+            !skipped_as_unneeded(&events, &gate),
+            "a dead upstream skipped it"
+        );
+
+        events.extend(unneeded_skip(&gate));
+        assert!(skipped_as_unneeded(&events, &gate));
     }
 }
