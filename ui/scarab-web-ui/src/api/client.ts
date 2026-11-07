@@ -2028,3 +2028,32 @@ export async function confirmStepUpRequest(
   }
   return data;
 }
+
+// ── Org Policies ──────────────────────────────────────────────────────────────
+
+/** A stored org Policy (`GET /v1/orgs/{org}/policies`). */
+export type PolicyRecord = components["schemas"]["PolicyDto"];
+/** A page of the org's decision log, newest first. */
+export type PolicyDecisionPage = components["schemas"]["PolicyDecisionPageDto"];
+
+/** The org's own Policies, CEL and typed settings alike. `null` when the
+ *  server has no policy store (404). */
+export async function listOrgPolicies(org: string): Promise<PolicyRecord[] | null> {
+  const { data, error, response } = await api.GET("/v1/orgs/{org}/policies", {
+    params: { path: { org } },
+  });
+  if (response.status === 404) return null;
+  if (error || !data) throw new Error(errorText(error) || "failed to load the org's policies");
+  return data;
+}
+
+/** The newest `limit` decisions of the org's log (at most 200). `null` when
+ *  the server has no policy store (404). */
+export async function listOrgPolicyDecisions(org: string, limit = 200): Promise<PolicyDecisionPage | null> {
+  const { data, error, response } = await api.GET("/v1/orgs/{org}/policy-decisions", {
+    params: { path: { org }, query: { limit } },
+  });
+  if (response.status === 404) return null;
+  if (error || !data) throw new Error(errorText(error) || "failed to load the org's policy decisions");
+  return data;
+}

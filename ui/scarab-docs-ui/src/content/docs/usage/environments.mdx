@@ -168,6 +168,21 @@ maximum approval age. An `external`, `timer` or `plugin` gate is never an approv
 behind only those is refused at launch. Steps with no released approval gate upstream get the
 `env=none` OIDC subject.
 
+## Every rule in one place
+
+**Settings › Policies** (`/orgs/<org>/settings/policies`) lists the org's rules read-only:
+
+- each CEL Policy, with its checkpoint, its mode, **Applies to projects** (its
+  `match.projects`, with any `except_projects`), the Environments it matches, and how often it
+  matched, denied and, in `audit` mode, would have denied in the newest 200 decisions of the
+  decision log (`GET /v1/orgs/{org}/policy-decisions`);
+- the newest decisions, with the deny messages;
+- the typed settings, each with a link to where it is edited: every Environment's rules, the
+  library and plugin lists, and API token scopes.
+
+CEL Policies are written with the policy API (`POST /v1/orgs/{org}/policies`); the page does not
+edit them.
+
 ## Scoped secrets
 
 An Environment has two secret scopes: one shared by every eligible Project, and one per Project

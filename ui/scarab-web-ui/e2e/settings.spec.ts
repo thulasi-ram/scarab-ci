@@ -20,9 +20,9 @@ test("an admin lands on their org's settings and every section opens at its own 
   const nav = page.getByRole("navigation", { name: "Settings" });
   const links = nav.getByRole("link");
   const count = await links.count();
-  // Your account (4) + Organization settings (9) + Server administration (1)
+  // Your account (4) + Organization settings (10) + Server administration (1)
   // for the fixture's admin, who is a global admin.
-  expect(count).toBe(14);
+  expect(count).toBe(15);
 
   const seen = new Set<string>();
   for (let i = 0; i < count; i++) {
@@ -177,6 +177,47 @@ test("a wait timer with no approvers is disabled and its environment warns", asy
   await edit.getByRole("textbox", { name: "Approvers", exact: true }).fill("ops-lead");
   await expect(wait).toBeEnabled();
   await expect(edit.getByRole("textbox", { name: "Required approvals" })).toBeEnabled();
+  expect(errors).toEqual([]);
+});
+
+test("the Policies page lists CEL policies with their counts and the typed settings read-only", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/orgs/acme/settings/policies");
+  await expect(page.getByRole("heading", { level: 1, name: "Policies", exact: true })).toBeVisible();
+
+  // CEL policies: live ones only, with what they apply to and their counts.
+  const cel = page.getByRole("list", { name: "CEL policies" });
+  await expect(cel.getByRole("listitem")).toHaveCount(2);
+  const friday = cel.getByRole("listitem").filter({ hasText: "no-friday-deploys" });
+  await expect(friday).toContainText("Applies to projects");
+  await expect(friday).toContainText("all projects");
+  await expect(friday).toContainText("3 matched · 1 denied");
+  const release = cel.getByRole("listitem").filter({ hasText: "release-from-main" });
+  await expect(release).toContainText("audit");
+  await expect(release).toContainText("web-*, except web-legacy");
+  await expect(release).toContainText("2 matched · 0 denied · 1 would have denied");
+  await expect(cel).not.toContainText("old-rule");
+
+  // The decision log's newest entries.
+  const recent = page.getByRole("list", { name: "Recent decisions" });
+  await expect(recent.getByRole("listitem")).toHaveCount(4);
+  await expect(recent).toContainText("No deploys to production on Fridays.");
+
+  // Typed settings, read-only, each linking to where it is edited.
+  const envs = page.getByRole("list", { name: "Environment rules" });
+  await expect(envs.getByRole("listitem").filter({ hasText: "Production" })).toContainText(
+    "adds an approval gate when missing",
+  );
+  const lists = page.getByRole("list", { name: "Library and plugin lists" });
+  await expect(lists).toContainText("Libraries allowed");
+  await expect(lists).toContainText("github.com/thulasi-ram/*");
+  await expect(page.locator("section.page").getByRole("textbox")).toHaveCount(0);
+  await lists.getByRole("link", { name: "Libraries" }).click();
+  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/libraries$/);
+
+  await page.goto("/orgs/acme/settings/policies");
+  await envs.getByRole("listitem").filter({ hasText: "Production" }).getByRole("link", { name: "Edit" }).click();
+  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/environments\/production\/edit$/);
   expect(errors).toEqual([]);
 });
 

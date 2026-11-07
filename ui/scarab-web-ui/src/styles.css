@@ -4059,3 +4059,8 @@ code.c { font-family: var(--font-mono); font-size: var(--fs-sm); color: var(--co
 /* An Environment approval gate: its label on the gate bar and the step pane. */
 .gate-env { font-size: var(--fs-xs); color: var(--copper); white-space: nowrap; }
 .gate-status.gate-env-line { color: var(--copper); }
+
+/* Settings › Policies */
+.pol-h { font-size: var(--fs-sm); font-weight: 600; margin: 14px 0 6px; }
+.pol-facts { margin: 6px 0 0; }
+.tok-role.pol-denied { color: var(--danger); border-color: var(--danger); }
