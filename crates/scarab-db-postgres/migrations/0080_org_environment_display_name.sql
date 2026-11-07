@@ -7,7 +7,7 @@
 --
 -- Expand step (ADR-0003): one nullable column. A server built before this
 -- migration refuses to boot against a database that has it (sqlx reports
--- migration 79 as unknown); to roll back, delete row 79 from
+-- migration 80 as unknown); to roll back, delete row 80 from
 -- `_sqlx_migrations`. The column is harmless to the old code.
 ALTER TABLE org_environments
     ADD COLUMN display_name TEXT NULL CHECK (display_name IS NULL OR display_name <> '');
