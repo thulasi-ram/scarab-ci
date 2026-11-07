@@ -71,7 +71,7 @@ const DEFAULT_BACKOFF_MS: i64 = 60_000;
 /// made again, never reused.
 const REUSE_MAX_AGE_MS: i64 = CHECK_EARLY_MS + 2 * TICK_MS as i64;
 /// Due rows read per page; a tick reads every page.
-const DUE_BATCH: u32 = 500;
+pub const DUE_BATCH: u32 = 500;
 /// How long fired slots are kept: the schedules list shows the last one.
 const FIRES_KEPT_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 /// How often old fired slots are pruned.
@@ -446,10 +446,9 @@ impl CronScheduler {
                 tracing::warn!("cron: pruning old fires failed: {e}");
             }
         }
-        // Every due row, a page at a time (git-bug 237ab13). One capped read
-        // left the rows past the cap for a later tick, and the rows of
-        // projects this tick skips (in flight, waiting to retry) still took
-        // places in it, so with enough of those the rest fired late.
+        // Every due row, read a page at a time so no one query is unbounded,
+        // before any is grouped: a project's rows can span pages (git-bug
+        // 237ab13).
         let before = Timestamp(now + CHECK_EARLY_MS);
         let mut due: Vec<ScheduleEntry> = Vec::new();
         loop {

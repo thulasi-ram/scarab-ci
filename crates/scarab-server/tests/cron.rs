@@ -269,16 +269,16 @@ async fn slots_missed_while_the_server_was_down_fire_once() {
     assert_eq!(h.rows().await[0].1, T0 + 3 * 60 * MIN + 15 * MIN);
 }
 
-/// git-bug 237ab13: a tick read at most 500 due rows, so when more were due
+/// git-bug 237ab13: a tick read one page of due rows, so when more were due
 /// the ones after them in the order fired a tick or more late.
 #[tokio::test]
-async fn a_slot_past_the_first_500_due_rows_fires_in_the_same_tick() {
+async fn a_slot_past_the_first_page_of_due_rows_fires_in_the_same_tick() {
     let h = H::new(&hourly("\"0 * * * *\""));
     h.push("main", SHA1).await;
     let eleven = T0 + 30 * MIN;
-    // 500 rows of another org's project, due at the same minute, sort ahead
+    // A full page of another org's rows, due at the same minute, sorts ahead
     // of acme/app ("aaa" < "acme").
-    let ahead: Vec<ScheduleEntry> = (0..500)
+    let ahead: Vec<ScheduleEntry> = (0..schedules::DUE_BATCH)
         .map(|i| ScheduleEntry {
             org: "aaa".into(),
             project: "app".into(),
