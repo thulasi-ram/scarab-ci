@@ -57,6 +57,7 @@ async fn crash_mid_run_resumes_and_runs_step_exactly_once() {
         resources: Default::default(),
         k8s_overlay: None,
         oidc_token: None,
+        resolved_secrets: Default::default(),
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),

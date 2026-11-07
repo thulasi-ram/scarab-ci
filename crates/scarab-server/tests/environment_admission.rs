@@ -625,7 +625,8 @@ async fn approve_gate_releases_while_the_project_stays_eligible() {
 
 // --- Secret launch ---------------------------------------------------------------
 
-/// An inner executor that records whether it was launched.
+/// An inner executor that records whether it was launched, and the secrets
+/// resolved for it.
 #[derive(Default)]
 struct RecordingExec {
     launched: Mutex<Option<Vec<(String, String)>>>,
@@ -667,7 +668,7 @@ impl Executor for RecordingExec {
         Ok(None)
     }
     async fn launch(&self, _step: &StepRun, spec: &StepSpec) -> Result<ExecHandle, ExecError> {
-        *self.launched.lock().unwrap() = Some(spec.env.clone());
+        *self.launched.lock().unwrap() = Some(spec.resolved_secrets.0.clone());
         Ok(ExecHandle("h".into()))
     }
     async fn poll(&self, _h: &ExecHandle) -> Result<ExecState, ExecError> {
@@ -716,6 +717,7 @@ fn secret_step() -> (StepRun, StepSpec) {
         resources: Default::default(),
         k8s_overlay: None,
         oidc_token: None,
+        resolved_secrets: Default::default(),
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),

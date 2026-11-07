@@ -148,7 +148,7 @@ async fn create_run_preserves_every_step_spec_field_to_the_executor() {
         ),
         (
             "secrets",
-            spec.secrets == vec!["db-pass".to_string(), "api-key".to_string()],
+            spec.secrets == vec!["db-pass".into(), "api-key".into()],
             format!("{:?}", spec.secrets),
         ),
         // The escaped-bug field: security.run_as_root is self-service on an

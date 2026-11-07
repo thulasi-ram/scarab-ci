@@ -1365,17 +1365,36 @@ impl Db for PostgresDb {
         Ok(())
     }
 
-    async fn run_pr_context(&self, run: &RunId) -> Result<bool, DbError> {
-        let row =
-            sqlx::query("SELECT origin_trigger_kind, origin_pr_number FROM runs WHERE id = $1")
-                .bind(&run.0)
-                .fetch_optional(self.pool())
-                .await
-                .map_err(db_err)?;
-        Ok(row.is_some_and(|r| {
-            r.get::<Option<String>, _>("origin_trigger_kind")
-                .is_some_and(|k| k == "pull_request")
-                || r.get::<Option<i64>, _>("origin_pr_number").is_some()
+    async fn set_run_cache_scope(
+        &self,
+        run: &RunId,
+        scope: &scarab_engine::CacheScope,
+    ) -> Result<(), DbError> {
+        sqlx::query("UPDATE runs SET cache_scope = $2, cache_fallback_scope = $3 WHERE id = $1")
+            .bind(&run.0)
+            .bind(&scope.own)
+            .bind(scope.fallback.as_deref())
+            .execute(self.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn run_cache_scope(
+        &self,
+        run: &RunId,
+    ) -> Result<Option<scarab_engine::CacheScope>, DbError> {
+        let row = sqlx::query("SELECT cache_scope, cache_fallback_scope FROM runs WHERE id = $1")
+            .bind(&run.0)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(row.and_then(|r| {
+            let own = r.get::<Option<String>, _>("cache_scope")?;
+            Some(scarab_engine::CacheScope {
+                own,
+                fallback: r.get::<Option<String>, _>("cache_fallback_scope"),
+            })
         }))
     }
 
@@ -1785,6 +1804,24 @@ impl Db for PostgresDb {
         .await
         .map_err(db_err)?;
         rows.into_iter().map(run_summary_from_row).collect()
+    }
+
+    async fn projects_with_runs_in(
+        &self,
+        org: &str,
+        environment: &str,
+    ) -> Result<Vec<String>, DbError> {
+        sqlx::query_scalar(
+            "SELECT deploy_project FROM runs
+             WHERE deploy_org = $1 AND deploy_environment = $2 AND deploy_project IS NOT NULL
+             GROUP BY deploy_project
+             ORDER BY deploy_project COLLATE \"C\"",
+        )
+        .bind(org)
+        .bind(environment)
+        .fetch_all(self.pool())
+        .await
+        .map_err(db_err)
     }
 
     async fn record_refused_run(&self, r: &scarab_engine::RefusedRun) -> Result<(), DbError> {

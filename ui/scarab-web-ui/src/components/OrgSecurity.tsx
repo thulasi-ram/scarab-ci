@@ -12,6 +12,7 @@ import { getOrgSecuritySummary, listBindings, resetMemberPasskeys } from "../api
 import { canResetPasskeys, postureText, resetCandidates } from "../security";
 import { orgHref } from "../settings-nav";
 import Icon from "./Icon";
+import ConfirmDestructive from "./ConfirmDestructive";
 import SecurityEventTable from "./SecurityEventTable";
 
 export default function OrgSecurity(props: { org: string }) {
@@ -20,13 +21,10 @@ export default function OrgSecurity(props: { org: string }) {
 
   const [resetMsg, setResetMsg] = createSignal<{ ok: boolean; text: string } | null>(null);
   const [resetting, setResetting] = createSignal<string | null>(null);
+  // The member whose passkeys the confirm dialog is about to reset. A refusal
+  // (a cancelled step-up included) shows in the dialog.
+  const [confirming, setConfirming] = createSignal<string | null>(null);
   const reset = async (subject: string) => {
-    if (
-      !window.confirm(
-        `Reset every passkey ${subject} holds?\n\nThey can no longer confirm anything until they enroll a new passkey from a fresh login, and any open step-up window of theirs closes now. You will be asked to confirm this with your own passkey.`,
-      )
-    )
-      return;
     setResetting(subject);
     setResetMsg(null);
     try {
@@ -36,8 +34,6 @@ export default function OrgSecurity(props: { org: string }) {
         text: `Reset ${r.subject}: ${r.removed} passkey${r.removed === 1 ? "" : "s"} removed, ${r.windows_revoked} confirmation${r.windows_revoked === 1 ? "" : "s"} revoked.`,
       });
       await refetchSummary();
-    } catch (e) {
-      setResetMsg({ ok: false, text: e instanceof Error ? e.message : "Could not reset." });
     } finally {
       setResetting(null);
     }
@@ -102,7 +98,7 @@ export default function OrgSecurity(props: { org: string }) {
                             <button
                               class="btn btn-danger btn-sm tok-revoke"
                               disabled={resetting() !== null}
-                              onClick={() => reset(m.subject)}
+                              onClick={() => setConfirming(m.subject)}
                             >
                               {resetting() === m.subject ? "resetting…" : "reset passkeys"}
                             </button>
@@ -120,6 +116,22 @@ export default function OrgSecurity(props: { org: string }) {
                 </p>
               </Show>
             </>
+          )}
+        </Show>
+
+        <Show when={confirming()}>
+          {(subject) => (
+            <ConfirmDestructive
+              title={`Reset every passkey ${subject()} holds?`}
+              purpose="They can no longer confirm anything until they enroll a new passkey from a fresh login."
+              name={subject()}
+              confirmLabel="Reset passkeys"
+              onConfirm={() => reset(subject())}
+              onClose={() => setConfirming(null)}
+            >
+              <p>Any open step-up window of theirs closes now.</p>
+              <p>You will be asked to confirm this with your own passkey.</p>
+            </ConfirmDestructive>
           )}
         </Show>
 

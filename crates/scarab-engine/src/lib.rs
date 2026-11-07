@@ -28,13 +28,14 @@ pub use ports::{
 };
 pub use schedules::{ScheduleEntry, ScheduleFire, ScheduleStore};
 pub use scheduler::{
-    cancel_run_request, fail_run_creation, gate_approvers, pin_run_snapshots, plan_rerun,
-    record_gate_approval, reject_gate, release_gate, releases_plugin_gate, resolve_plugin_gate,
-    rerun_step, rerun_step_widened, retry_step, retry_step_widened, run_status_post_key,
-    unpin_run_snapshots, wait_began_at, AttemptTeardown, ExpiredInput, PlanReason, PlannedStep,
-    PluginGateError, PluginGateVerdict, RerunError, RerunPlan, Scheduler, SchedulerError,
-    Supervision, TeardownAttempt, TickHealth, CANCEL_ATTEMPT, CANCEL_RUN, GATE_NO_LONGER_NEEDED,
-    LAUNCH_STEP, MAX_DELIVERY_ATTEMPTS, RUN_FINISHED, RUN_STATUS_CHANGED, SUPERSEDE_TEARDOWN,
+    cancel_run_request, environment_approval_met, fail_run_creation, gate_approvers,
+    gate_released_at, pin_run_snapshots, plan_rerun, record_gate_approval, reject_gate,
+    release_gate, releases_plugin_gate, rerun_step, rerun_step_widened, resolve_plugin_gate,
+    retry_step, retry_step_widened, run_status_post_key, unpin_run_snapshots, wait_began_at,
+    AttemptTeardown, EnvironmentApproval, ExpiredInput, PlanReason, PlannedStep, PluginGateError,
+    PluginGateVerdict, RerunError, RerunPlan, Scheduler, SchedulerError, Supervision,
+    TeardownAttempt, TickHealth, CANCEL_ATTEMPT, CANCEL_RUN, GATE_NO_LONGER_NEEDED, LAUNCH_STEP, MAX_DELIVERY_ATTEMPTS,
+    RUN_FINISHED, RUN_STATUS_CHANGED, SUPERSEDE_TEARDOWN,
 };
 
 use serde::{Deserialize, Serialize};
@@ -657,11 +658,19 @@ pub struct StepSpec {
     pub image: String,
     pub command: Vec<String>,
     pub env: Vec<(String, String)>,
-    /// Secret keys the step wants injected at launch (ADR-0037). Resolved (with
-    /// inheritance) and merged into `env` by the launch path just before the Pod
-    /// starts — never persisted with a value. Empty for most steps.
+    /// The secrets the step declared (ADR-0014, 0037): each one a file under
+    /// `/scarab/secrets/`, and an environment variable too when its entry has
+    /// `env: true`. Resolved (with inheritance) by the launch path just before
+    /// the Pod starts into [`resolved_secrets`](Self::resolved_secrets) —
+    /// never persisted with a value. Empty for most steps.
     #[serde(default)]
-    pub secrets: Vec<String>,
+    pub secrets: Vec<scarab_pipeline::SecretRef>,
+    /// The values of [`secrets`](Self::secrets), resolved at LAUNCH —
+    /// **never serialized** (in-memory enrichment only, like
+    /// [`oidc_token`](Self::oidc_token)). The executor writes each one as a
+    /// file and never puts a value in a Pod spec or argv.
+    #[serde(skip)]
+    pub resolved_secrets: ResolvedSecrets,
     /// The privilege escalations **admitted** for this step (ADR-0039) — already
     /// authorized against the run's Environment whitelist and fork-lockout at run
     /// creation. The executor applies *exactly* these above the hardened baseline
@@ -771,6 +780,30 @@ pub struct StepSpec {
     pub scope: Option<scarab_pipeline::Scope>,
 }
 
+/// A step's secret values for one launch, `(name, value)` in declared order.
+/// Its `Debug` prints the names only, so a logged [`StepSpec`] never carries
+/// a value.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct ResolvedSecrets(pub Vec<(String, String)>);
+
+impl ResolvedSecrets {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &(String, String)> {
+        self.0.iter()
+    }
+}
+
+impl std::fmt::Debug for ResolvedSecrets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(self.0.iter().map(|(k, _)| format!("{k}=<redacted>")))
+            .finish()
+    }
+}
+
 /// The launch context of a step's keyed directory Cache (ADR-0065 s1).
 ///
 /// `dirs`/`key_files` come from the authored `cache:` (already validated by
@@ -800,6 +833,83 @@ pub struct CacheConfig {
     /// order. Empty = nothing to restore (a cold key, or the cache disabled).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub restore: Vec<(String, String)>,
+    /// The key `restore` was found under when it is not `key`: the default
+    /// branch's key, read because the Run's own scope missed (see
+    /// [`CacheScope`]). It picks the Depot replica the restore reads from.
+    /// Saves always go to `key`, so a restore read from the default branch
+    /// is never written back under it. `None` = the restore came from `key`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_key: Option<String>,
+}
+
+/// A Run's **cache scope**: which Runs may write what this Run restores. Fixed
+/// when the Run is created and stored with it, so a rerun or retry reads and
+/// writes the scope its Run started with.
+///
+/// - An Environment-governed Run uses `env:<name>`: it reads and writes only
+///   that scope, with no fallback, so nothing outside the Environment writes
+///   what its Steps restore.
+/// - A pull request never uses `env:<name>`, even when its Pipeline names an
+///   Environment and the Environment admits it: the Pipeline is the pull
+///   request's own YAML, so a fork could otherwise write what the next deploy
+///   restores. It is scoped like any other Run.
+/// - Any other Run uses its symbolic ref (`refs/heads/x`,
+///   `refs/pull/7/head`, `refs/tags/v1`): it writes only that scope and, on a
+///   miss, reads the default branch's (`refs/heads/<default>`). A pull
+///   request reads `main`'s Cache and never writes it.
+/// - A Run with neither (an inline submission, a comment trigger) has no
+///   scope, and its Cache is off.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheScope {
+    /// The scope this Run reads first and the only one it writes.
+    pub own: String,
+    /// The scope read when `own` has no entry: the default branch's scope.
+    /// `None` for an Environment-governed Run, for a Run on the default
+    /// branch itself, and when the default branch was unknown at creation.
+    pub fallback: Option<String>,
+}
+
+impl CacheScope {
+    /// The Environment whose scope a Run uses: `environment`, unless the Run
+    /// is a pull request. `pull_request` is true when the event is a pull
+    /// request or the Run is locked out of secrets as a fork; a `git_ref`
+    /// naming a pull or merge request's head (`refs/pull/…`,
+    /// `refs/merge-requests/…`) counts too, which covers a dispatch on a pull
+    /// request's ref and a follow-up of a pull request's Run.
+    pub fn environment_scope<'a>(
+        environment: Option<&'a str>,
+        git_ref: Option<&str>,
+        pull_request: bool,
+    ) -> Option<&'a str> {
+        let pull_request_ref = git_ref
+            .is_some_and(|r| r.starts_with("refs/pull/") || r.starts_with("refs/merge-requests/"));
+        environment.filter(|_| !pull_request && !pull_request_ref)
+    }
+
+    /// The scope for a Run governed by `environment` (unless it is a pull
+    /// request, see [`Self::environment_scope`]), else on `git_ref`. A ref
+    /// that is not a full `refs/…` name gives no scope: the two kinds of
+    /// scope must never spell the same string, and a git ref cannot contain
+    /// `:`. `default_branch` is the bare branch name (`main`).
+    pub fn for_run(
+        environment: Option<&str>,
+        git_ref: Option<&str>,
+        default_branch: Option<&str>,
+        pull_request: bool,
+    ) -> Option<Self> {
+        if let Some(env) = Self::environment_scope(environment, git_ref, pull_request) {
+            return Some(Self {
+                own: format!("env:{env}"),
+                fallback: None,
+            });
+        }
+        let own = git_ref.filter(|r| r.starts_with("refs/"))?.to_string();
+        let fallback = default_branch
+            .filter(|b| !b.is_empty())
+            .map(|b| format!("refs/heads/{b}"))
+            .filter(|f| *f != own);
+        Some(Self { own, fallback })
+    }
 }
 
 /// One settled Step's **cache saves** (ADR-0065 s1), read back from the
@@ -1142,6 +1252,28 @@ pub enum EventPayload {
     },
     GateReleased {
         step: StepId,
+    },
+    /// The approvals of an **Environment approval gate**'s current wait met
+    /// its Environment's rules (ADR-0078 §4). The server appends it when an
+    /// approval completes them; it does not release the gate by itself.
+    ///
+    /// - `release_at` (Unix ms) — the earliest the gate releases: its wait
+    ///   clock's start plus the Environment's wait timer. When that is
+    ///   already past, the server releases the gate at once; otherwise the
+    ///   scheduler does when it passes.
+    /// - `approvers`, `required` — the Environment's approver set (sorted)
+    ///   and required count at that moment. Every launch of a Step behind
+    ///   the gate that uses the Environment's authority compares the set it
+    ///   sees then against these, and is refused when they differ.
+    ///
+    /// **Forward-only**: a binary from before this variant cannot replay a
+    /// log that carries it.
+    EnvironmentApprovalMet {
+        step: StepId,
+        approvers: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        required: Option<u32>,
+        release_at: i64,
     },
     /// A step was skipped on restart because its inputs were unchanged — its
     /// prior output is carried forward rather than recomputed (ADR-0027). Surfaced
@@ -1506,19 +1638,21 @@ pub fn workspace_input_steps(
         .collect()
 }
 
-/// Fold the **cache key** (ADR-0065 s1): sha256 over the project and the
-/// sorted `(key-file path, blob hash)` pairs, length-prefixed so no crafted
-/// path/hash pair can collide with another encoding. The blob hashes come
+/// Fold the **cache key** (ADR-0065 s1): sha256 over the project, the Run's
+/// cache `scope` ([`CacheScope`]) and the sorted `(key-file path, blob hash)`
+/// pairs, length-prefixed so no crafted path/hash pair can collide with
+/// another encoding. The blob hashes come
 /// from the input snapshots' tree entries (no content reads) — resolved by
 /// the caller through the merged input roots, last-overlay-wins. Deterministic
 /// by construction, so launch and settle agree on the key without persisting
 /// it: the same inputs always fold the same key.
-pub fn cache_key(project: &str, resolved: &[(String, String)]) -> String {
+pub fn cache_key(project: &str, scope: &str, resolved: &[(String, String)]) -> String {
     use sha2::{Digest, Sha256};
     let mut pairs: Vec<&(String, String)> = resolved.iter().collect();
     pairs.sort();
     let mut hasher = Sha256::new();
     hasher.update(format!("{}:{}\n", project.len(), project));
+    hasher.update(format!("{}:{}\n", scope.len(), scope));
     for (path, blob) in pairs {
         hasher.update(format!(
             "{}:{}\n{}:{}\n",

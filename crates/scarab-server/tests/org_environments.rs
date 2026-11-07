@@ -92,6 +92,8 @@ async fn create_read_replace_and_delete_round_trip() {
         json!({
             "org": "acme",
             "name": "prod",
+            // No display name was sent: the name shows.
+            "display_name": null,
             "description": "the one prod",
             // ADR-0071 §1-2: a new Environment starts with the permissive
             // baseline and eligibility CLOSED — an empty list admits no
@@ -101,7 +103,10 @@ async fn create_read_replace_and_delete_round_trip() {
                 "approvers": [],
                 "allowed_refs": [],
                 "wait_timer_s": 0,
-                "require_reason": false
+                "require_reason": false,
+                // ADR-0078 §3: add a gate when one is missing; approvals
+                // good for 24 hours.
+                "approval_gate": { "missing_gate_mode": "add", "max_approval_age_s": 86400 }
             },
             "eligibility": { "all_projects": false, "projects": [] },
             "created_at": CLOCK_START_MS,

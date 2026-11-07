@@ -732,7 +732,14 @@ export interface paths {
         };
         /** One org Environment (ADR-0071) */
         get: operations["get_org_environment"];
-        /** Create or replace an org Environment (ADR-0071) */
+        /**
+         * Create or replace an org Environment (ADR-0071)
+         * @description A create takes the same claim on the name a Duplicate holds, and is
+         *     refused (409) while a Duplicate to that name is in progress: that
+         *     Duplicate has checked the name is free and may be writing secrets under
+         *     it, and its cleanup deletes what it wrote by name. A replace of an
+         *     existing Environment takes no claim.
+         */
         put: operations["put_org_environment"];
         post?: never;
         /**
@@ -741,6 +748,41 @@ export interface paths {
          *     it (ADR-0071 §3, §8: those are never dropped as a side effect).
          */
         delete: operations["delete_org_environment"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/environments/{env}/duplicate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Duplicate an org Environment, its rules, eligibility, overlays, grants and secrets
+         * @description Not copied, and listed in the answer: Policies that select the old
+         *     Environment and not the new one, the Projects whose Pipelines name the
+         *     old one (from Run history), and the OIDC subject cloud trust policies
+         *     match. Run and approval history and the Cache stay with the old
+         *     Environment, which is not changed.
+         *
+         *     The secret store is a separate store from the Environment's, so the two
+         *     cannot share a transaction. The secrets are copied first; the
+         *     Environment, its eligibility, overlays and grants are then created in
+         *     one transaction. If either step fails, the copied secrets are deleted, so
+         *     no partial Environment is left. A crash between the two leaves only
+         *     secrets under a name no Environment has, which no Run can resolve and
+         *     which a retry refuses (409) until an admin deletes them. The new name is
+         *     claimed throughout: a second Duplicate to it is refused (409) before it
+         *     writes anything, and so is a create of it by the Environment PUT, so no
+         *     other Environment takes the name while this one's secrets are written.
+         */
+        post: operations["duplicate_org_environment"];
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -1851,13 +1893,17 @@ export interface paths {
         put?: never;
         /**
          * Approve a `manual` gate (ADR-0008, 0037). The authenticated principal's
-         *     approval is recorded on the event log (append-only, idempotent). For a
-         *     **deploy** run (one with a target environment), the gate is released only
-         *     once the accumulated approvers satisfy the Environment's effective rules for
-         *     the run's Project (ADR-0071 §3, `admits`); on release the deployment is
-         *     written to the legacy history. If the Environment no longer exists or no
-         *     longer admits the Project, the gate does not release (409). A plain gate (no
-         *     environment) releases on the first approval. Authz'd as a write.
+         *     approval is recorded on the event log (append-only, idempotent).
+         * @description An **Environment approval gate** (ADR-0078 §1: a Step after it uses the
+         *     Run's Environment's authority) releases only once the accumulated
+         *     approvals satisfy the Environment's effective rules for the run's Project
+         *     (ADR-0071 §3, `admits`) and its wait timer has run out on the gate's wait
+         *     clock (§4). Approvals that complete the rules early are kept: the gate is
+         *     released by the scheduler when the timer runs out. On release the
+         *     deployment is written to the legacy history. Every other `manual` gate is
+         *     a plain gate: it releases on the first approval, with no step-up. If the
+         *     Environment no longer exists or no longer admits the Project, no gate of
+         *     the Run releases (409). Authz'd as a write.
          */
         post: operations["approve_gate"];
         delete?: never;
@@ -2463,6 +2509,34 @@ export interface components {
             use_count: number;
         };
         /**
+         * @description An Environment's settings for its Environment approval gate (ADR-0078
+         *     §3): the `manual` gate that has a Step using the Environment's
+         *     authority after it.
+         */
+        ApprovalGateRulesDto: {
+            /**
+             * Format: int32
+             * @description Seconds before the gate the Environment adds expires; absent = it
+             *     waits until approved or rejected.
+             */
+            added_gate_expiry_s?: number | null;
+            /**
+             * Format: int32
+             * @description Seconds an approval stays good for: a Step that uses the
+             *     Environment's authority is refused at launch once its approval gate
+             *     released longer ago than this. Default 86400 (24 hours).
+             */
+            max_approval_age_s: number;
+            /** @description `add` (default) or `refuse`. */
+            missing_gate_mode: components["schemas"]["MissingGateModeDto"];
+            /**
+             * Format: int32
+             * @description How many of the baseline's approvers must approve; absent = every
+             *     one. A Project overlay's approvers are each required as well.
+             */
+            required_approvals?: number | null;
+        };
+        /**
          * @description One artifact **version** in a run's list (ADR-0052, immutable per attempt
          *     by ADR-0056). `step`/`attempt` are the publishing provenance (empty
          *     strings on pre-ADR-0056 rows); `succeeded` is that attempt's verdict;
@@ -2957,6 +3031,81 @@ export interface components {
              */
             ref: string;
         };
+        /** @description What a duplicate copied. */
+        DuplicateCopiedDto: {
+            /** @description Projects whose overlay was copied. */
+            overlays: string[];
+            /** @description Projects whose privilege grant was copied. */
+            privilege_grants: string[];
+            /** @description The EnvironmentProjectSecretScope secrets copied, with their values. */
+            secrets: components["schemas"]["DuplicatedSecretsDto"][];
+        };
+        /** @description What a duplicate left for an admin to do by hand. */
+        DuplicateNotCopiedDto: {
+            /**
+             * @description The same for the new Environment: a cloud trust policy matching
+             *     `old_oidc_subject` must also match this one before a Run here can
+             *     assume its role.
+             */
+            new_oidc_subject: string;
+            /** @description Other things the copy does not carry, one sentence each. */
+            notes: string[];
+            /**
+             * @description The OIDC subject a Run in the old Environment presents
+             *     (`*` for the repository and the ref).
+             */
+            old_oidc_subject: string;
+            /** @description Policies that apply to the old Environment and not to the new one. */
+            policies: components["schemas"]["DuplicatePolicyDto"][];
+            /**
+             * @description Projects whose Runs named the old Environment (from Run history):
+             *     their Pipeline YAML names it, and runs in the new one only once it is
+             *     changed.
+             */
+            projects_with_runs: string[];
+        };
+        /**
+         * @description `POST /v1/orgs/{org}/environments/{env}/duplicate`: the new
+         *     Environment's name and, optionally, its display name.
+         */
+        DuplicateOrgEnvironmentRequest: {
+            /**
+             * @description Omitted, empty or blank: what the old Environment shows, plus
+             *     " (copy)".
+             */
+            display_name?: string | null;
+            /**
+             * @description The new Environment's name: the key its pipelines will name. The
+             *     name rule of a created Environment applies.
+             */
+            name: string;
+        };
+        /**
+         * @description The answer to a duplicate: the new Environment, what was copied and the
+         *     checklist of what was not.
+         */
+        DuplicateOrgEnvironmentResponse: {
+            copied: components["schemas"]["DuplicateCopiedDto"];
+            environment: components["schemas"]["OrgEnvironmentDto"];
+            not_copied: components["schemas"]["DuplicateNotCopiedDto"];
+        };
+        /**
+         * @description A Policy a duplicate did not change: its `match.environments` selects
+         *     the old Environment and none of its patterns selects the new one.
+         */
+        DuplicatePolicyDto: {
+            /** @description Its `match.environments`. */
+            environments: string[];
+            id: string;
+            name: string;
+            /** @description The Project it is attached to; `null` for an org Policy. */
+            project?: string | null;
+        };
+        /** @description One Project's secrets the duplicate copied, by key. Never a value. */
+        DuplicatedSecretsDto: {
+            keys: string[];
+            project: string;
+        };
         /**
          * @description The rules admission enforces for one Project in one Environment: the
          *     baseline merged with the Project's overlay (ADR-0071 §3), computed by the
@@ -2969,10 +3118,16 @@ export interface components {
              *     `[tags/*]` intersect to `[]`, which would read as "any ref".
              */
             allowed_ref_layers: string[][];
+            /** @description The baseline's approval gate settings. */
+            approval_gate: components["schemas"]["ApprovalGateRulesDto"];
             /** @description Baseline approvers, then the overlay's not already listed — all required. */
             approvers: string[];
             require_reason: boolean;
-            /** Format: int32 */
+            /**
+             * Format: int32
+             * @description The longer of the two layers' wait timers. It does nothing when
+             *     `approvers` is empty.
+             */
             wait_timer_s: number;
         };
         /**
@@ -3064,13 +3219,20 @@ export interface components {
         EnvironmentProtectionRulesDto: {
             /** @description Ref globs a deploy's symbolic ref must match; empty = any ref. */
             allowed_refs: string[];
-            /** @description Principal ids; every one must approve (AND). */
+            approval_gate?: null | components["schemas"]["ApprovalGateRulesDto"];
+            /**
+             * @description Principal ids. Every one must approve (AND), unless the baseline's
+             *     `approval_gate.required_approvals` says how many of its own must.
+             */
             approvers: string[];
             /** @description A human dispatch must carry a reason (ADR-0057 §3). */
             require_reason: boolean;
             /**
              * Format: int32
-             * @description Seconds. Carried and merged, not yet enforced (git-bug 2b94989).
+             * @description Seconds: a minimum wait on the Environment approval gate, counted on
+             *     the gate's wait clock (ADR-0078 §4). It does nothing where the
+             *     effective approvers are empty; a client shows that from `approvers`
+             *     (here, or `effective.approvers` for a Project).
              */
             wait_timer_s: number;
         };
@@ -3461,6 +3623,12 @@ export interface components {
             publisher: string;
         };
         /**
+         * @description What Run creation does when a Step that uses the Environment's authority
+         *     has no `manual` gate upstream (ADR-0078 §3).
+         * @enum {string}
+         */
+        MissingGateModeDto: "add" | "refuse";
+        /**
          * @description What a human is asked to confirm: the server-rendered, redacted
          *     description of one operation (shown in the 403, on the confirm page and
          *     in the event log).
@@ -3481,11 +3649,14 @@ export interface components {
              */
             created_at: number;
             description: string;
+            /** @description What people see in place of the name; `null` shows the name. */
+            display_name?: string | null;
             /**
              * @description Which Projects may deploy here. Read-only here: written through
              *     `…/eligibility`.
              */
             eligibility: components["schemas"]["EnvironmentEligibilityDto"];
+            /** @description The key pipeline YAML and the OIDC subject use. Fixed once created. */
             name: string;
             org: string;
             /**
@@ -3548,7 +3719,10 @@ export interface components {
         OriginLinkDto: {
             /** @description SHA-256 of the library source (or of the plugin's approved manifest). */
             content_hash: string;
-            /** @description `file`, `library` or `plugin`. */
+            /**
+             * @description `file`, `library`, `plugin`, or `environment` for the gate an
+             *     Environment added to the Run (ADR-0078 §2).
+             */
             kind: string;
             /**
              * @description A repo-relative path (`file`), `<publisher>/<name>` (`library`) or the
@@ -4116,6 +4290,8 @@ export interface components {
         ProjectEnvironmentDto: {
             /** @description The Environment's baseline, set by an org admin. */
             baseline: components["schemas"]["EnvironmentProtectionRulesDto"];
+            /** @description What people see in place of the name; `null` shows the name. */
+            display_name?: string | null;
             /** @description What admission enforces: the baseline merged with the overlay. */
             effective: components["schemas"]["EffectiveProtectionDto"];
             /**
@@ -4152,14 +4328,21 @@ export interface components {
             privileged_images?: components["schemas"]["ImageGrantDto"][];
         };
         /**
-         * @description A baseline (`…/protection`) body: the four rules, replaced whole. Every
-         *     field is optional and an omitted one takes the **permissive** default —
-         *     never the stored value — so `{}` resets the baseline to permissive.
+         * @description A baseline (`…/protection`) body: the four rules and the approval gate
+         *     settings, replaced whole. Every field is optional and an omitted one
+         *     takes its default — never the stored value — so `{}` resets the baseline
+         *     to permissive (and the approval gate settings to theirs).
          *     Unknown fields are refused, so the retired per-repo shape (`wait_timer`,
          *     `concurrency`) — and `deployment_concurrency`, which ADR-0074 removed — is
          *     a 400, not a silently ignored rule.
          */
         PutEnvironmentProtectionRequest: {
+            /**
+             * Format: int32
+             * @description Seconds before the gate the Environment adds expires; omitted = it
+             *     waits until approved or rejected.
+             */
+            added_gate_expiry_s?: number | null;
             /** @description Ref globs (`refs/heads/main`, `refs/tags/*`); empty = any ref. */
             allowed_refs?: string[];
             /**
@@ -4167,11 +4350,25 @@ export interface components {
              *     merged id is stored as the Principal it now is. All must approve.
              */
             approvers?: string[];
+            /**
+             * Format: int32
+             * @description Seconds an approval stays good for at launch; omitted = 86400.
+             */
+            max_approval_age_s?: number | null;
+            /** @description `add` (default) or `refuse` (ADR-0078 §3). */
+            missing_gate_mode?: components["schemas"]["MissingGateModeDto"];
             /** @description A human dispatch must carry a reason (ADR-0057 §3). Omitted = off. */
             require_reason?: boolean;
             /**
              * Format: int32
-             * @description Seconds. Carried and merged, not yet enforced (git-bug 2b94989).
+             * @description How many of `approvers` must approve, 1 to their number; omitted =
+             *     every one.
+             */
+            required_approvals?: number | null;
+            /**
+             * Format: int32
+             * @description Seconds: a minimum wait on the Environment approval gate (ADR-0078
+             *     §4). Refused (400) above 0 with no approvers.
              */
             wait_timer_s?: number;
         };
@@ -4185,6 +4382,12 @@ export interface components {
         PutOrgEnvironmentRequest: {
             /** @description Free text; omitted = empty. */
             description?: string | null;
+            /**
+             * @description What people see in place of the name. Omitted, empty or blank shows
+             *     the name. Changing it never needs a step-up: the name, which pipelines
+             *     and cloud trust policies refer to, stays.
+             */
+            display_name?: string | null;
         };
         /**
          * @description `PUT /v1/orgs/{org}/plugins/{name}/connections/{slot}`: bind the slot's
@@ -4391,11 +4594,22 @@ export interface components {
              */
             reads: string[];
         };
+        /** @description The Environment a Run names. */
+        RunEnvironmentDto: {
+            /**
+             * @description What headings show in its place; absent when it has none or the org
+             *     no longer has an Environment of that name.
+             */
+            display_name?: string | null;
+            /** @description The name the pipeline's `environment:` uses. */
+            name: string;
+        };
         /** @description `GET /v1/runs` body: the most recent runs, newest first. */
         RunListResponse: {
             runs: components["schemas"]["RunSummaryDto"][];
         };
         RunStatusResponse: {
+            environment?: null | components["schemas"]["RunEnvironmentDto"];
             id: string;
             /**
              * @description The PR **base** branch (ADR-0057) — the branch a `pull_request` run
@@ -4889,6 +5103,13 @@ export interface components {
         };
         StepStatusDto: {
             /**
+             * Format: int64
+             * @description A waiting Environment approval gate whose approvals are in: when the
+             *     Environment's wait timer runs out and the gate releases (Unix ms).
+             *     Absent otherwise.
+             */
+            approval_release_at?: number | null;
+            /**
              * @description Per-attempt detail (ADR-0047) — the rerun/retry history in append order.
              *     `attempts` is the count; this is the list, so the UI can show retries (a
              *     failed attempt followed by a succeeding one — the durable-execution story)
@@ -4901,6 +5122,16 @@ export interface components {
              *     Run that deploys. Omitted when false.
              */
             deploy?: boolean;
+            /**
+             * @description This `manual` gate is an **Environment approval gate** (ADR-0078 §1):
+             *     a Step after it uses the Run's Environment's authority, so releasing
+             *     it needs the Environment's approvers and a step-up. Decided at Run
+             *     creation. A gate the Environment added has an `origin` link of kind
+             *     `environment`. On a Run created before the mark was stored, every
+             *     `manual` gate of a Run that names an Environment is one, as the
+             *     approve handler judges it. Omitted when false.
+             */
+            environment_approval_gate?: boolean;
             /**
              * @description `manual`/`timer`/`external` if this step is a gate (ADR-0008), else
              *     absent. Gates launch no pod; a waiting
@@ -6795,7 +7026,7 @@ export interface operations {
                     "application/json": components["schemas"]["OrgEnvironmentDto"];
                 };
             };
-            /** @description invalid name or description, an unknown field, or a malformed precondition */
+            /** @description invalid name, display name or description, an unknown field, or a malformed precondition */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -6816,7 +7047,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description a concurrent write won; retry */
+            /** @description a create while a duplicate to the name is in progress, or a concurrent write won; retry */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -6870,6 +7101,71 @@ export interface operations {
                 content?: never;
             };
             /** @description project overlays or grants still pin the Environment */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    duplicate_org_environment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description the environment to copy */
+                env: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DuplicateOrgEnvironmentRequest"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DuplicateOrgEnvironmentResponse"];
+                };
+            };
+            /** @description invalid name or display name, or an unknown field */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an org admin, or no step-up — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
+            /** @description no such Environment, or not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description the new name is taken, secrets already exist under it, or another duplicate to it or a create of it is in progress */
             409: {
                 headers: {
                     [name: string]: unknown;

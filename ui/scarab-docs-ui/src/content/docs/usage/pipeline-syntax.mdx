@@ -240,7 +240,8 @@ the Run's launch parameters (see [Reuse: `invoke`](#reuse-invoke)).
 
 The step contract is an OCI `image` plus a `command`; everything else is a modifier. `env` is a list
 of `[NAME, VALUE]` pairs; `artifacts` publishes globs of files the step wrote to `/scarab/artifacts/`.
-A step names the secrets it needs with `secrets: [KEY, ...]` (resolution and scoping is covered under
+A step names the secrets it needs with `secrets: [KEY, ...]`; each one is a file,
+`/scarab/secrets/KEY` (resolution, scoping and the env form are covered under
 [Environments & gates](#environments--gates)).
 
 ```yaml
@@ -698,8 +699,20 @@ A top-level `environment:` puts the pipeline's runs under that environment's gov
 checked against its protection rules at admission, get its scoped secrets, and are never cancelled
 by newest-wins. It does not mark them as deploys; for that, see
 [Deploys: `deploy: true`](#deploys-deploy-true). **Secrets** a step needs are named with
-`secrets: [KEY, ...]`; each key is resolved against the run's scope and made available to the step
-under the same name (a run from a fork's pull request is locked out and receives none).
+`secrets: [KEY, ...]`; each key is resolved against the run's scope (a run from a fork's pull
+request is locked out and receives none).
+
+Each secret is a file, `/scarab/secrets/KEY`, on a read-only in-memory volume in the step's
+container; `$SCARAB_SECRETS` names the directory. The values come from a Kubernetes Secret for the
+step's Pod, deleted when the step's attempt ends. The local executor has no container: it writes
+the files to disk, in a directory under the step's working directory that only its own user can
+read, sets `$SCARAB_SECRETS` to that directory, and removes it when the step's process ends.
+
+A secret is not an environment variable unless its entry says so: write
+`{ name: KEY, env: true }` in the same list, and the step also gets the environment variable `KEY`.
+Kubernetes fills that variable from the Pod's own Secret, so the value is never written into the
+Pod spec. Prefer the file: every process the step starts inherits its environment, and many tools
+print their environment when they fail.
 
 ```yaml
 environment: prod
@@ -707,9 +720,18 @@ environment: prod
 steps:
   - id: ship
     image: deployer
-    secrets: [DEPLOY_TOKEN]
-    command: ["./deploy.sh"]
+    secrets:
+      - DEPLOY_KEY                       # only the file /scarab/secrets/DEPLOY_KEY
+      - { name: DEPLOY_TOKEN, env: true } # the file, and $DEPLOY_TOKEN
+    command: ["sh", "-c", "./deploy.sh --key-file /scarab/secrets/DEPLOY_KEY"]
 ```
+
+A secret's name is its file name: letters, digits, `-`, `_` and `.`, not starting with `.`.
+`forge-token` and `forge-username` are taken by the [forge credential](#forge-credentials-forge_token).
+A name with `env: true` must also be an environment variable name, and not one the step's `env:`
+or Scarab already sets. `scarab validate` warns when a step's command reads `$KEY` or `${KEY}`
+for a secret listed without `env: true`, since that variable is empty when the step runs. It reads
+only the step's `command`: a script file the command runs is not checked.
 
 **Gates** are durable suspend points with no image: `gate: manual` is an approval, `gate: timer` waits
 `gate_after` seconds, `gate: external` releases via API/webhook. Placed before a deploy step, a

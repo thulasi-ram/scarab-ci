@@ -1846,6 +1846,7 @@
           "Environments"
         ],
         "summary": "Create or replace an org Environment (ADR-0071)",
+        "description": "A create takes the same claim on the name a Duplicate holds, and is\nrefused (409) while a Duplicate to that name is in progress: that\nDuplicate has checked the name is free and may be writing secrets under\nit, and its cleanup deletes what it wrote by name. A replace of an\nexisting Environment takes no claim.",
         "operationId": "put_org_environment",
         "parameters": [
           {
@@ -1921,7 +1922,7 @@
             }
           },
           "400": {
-            "description": "invalid name or description, an unknown field, or a malformed precondition"
+            "description": "invalid name, display name or description, an unknown field, or a malformed precondition"
           },
           "403": {
             "description": "not an org admin"
@@ -1930,7 +1931,7 @@
             "description": "org Environments not configured"
           },
           "409": {
-            "description": "a concurrent write won; retry"
+            "description": "a create while a duplicate to the name is in progress, or a concurrent write won; retry"
           },
           "412": {
             "description": "`If-Match` or `If-None-Match: *` did not hold; reload"
@@ -1991,6 +1992,88 @@
           },
           "409": {
             "description": "project overlays or grants still pin the Environment"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/environments/{env}/duplicate": {
+      "post": {
+        "tags": [
+          "Environments"
+        ],
+        "summary": "Duplicate an org Environment, its rules, eligibility, overlays, grants and secrets",
+        "description": "Not copied, and listed in the answer: Policies that select the old\nEnvironment and not the new one, the Projects whose Pipelines name the\nold one (from Run history), and the OIDC subject cloud trust policies\nmatch. Run and approval history and the Cache stay with the old\nEnvironment, which is not changed.\n\nThe secret store is a separate store from the Environment's, so the two\ncannot share a transaction. The secrets are copied first; the\nEnvironment, its eligibility, overlays and grants are then created in\none transaction. If either step fails, the copied secrets are deleted, so\nno partial Environment is left. A crash between the two leaves only\nsecrets under a name no Environment has, which no Run can resolve and\nwhich a retry refuses (409) until an admin deletes them. The new name is\nclaimed throughout: a second Duplicate to it is refused (409) before it\nwrites anything, and so is a create of it by the Environment PUT, so no\nother Environment takes the name while this one's secrets are written.",
+        "operationId": "duplicate_org_environment",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "description": "the environment to copy",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DuplicateOrgEnvironmentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DuplicateOrgEnvironmentResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "invalid name or display name, or an unknown field"
+          },
+          "403": {
+            "description": "not an org admin, or no step-up — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such Environment, or not configured"
+          },
+          "409": {
+            "description": "the new name is taken, secrets already exist under it, or another duplicate to it or a create of it is in progress"
           },
           "429": {
             "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
@@ -6832,7 +6915,8 @@
         "tags": [
           "Runs"
         ],
-        "summary": "Approve a `manual` gate (ADR-0008, 0037). The authenticated principal's\napproval is recorded on the event log (append-only, idempotent). For a\n**deploy** run (one with a target environment), the gate is released only\nonce the accumulated approvers satisfy the Environment's effective rules for\nthe run's Project (ADR-0071 §3, `admits`); on release the deployment is\nwritten to the legacy history. If the Environment no longer exists or no\nlonger admits the Project, the gate does not release (409). A plain gate (no\nenvironment) releases on the first approval. Authz'd as a write.",
+        "summary": "Approve a `manual` gate (ADR-0008, 0037). The authenticated principal's\napproval is recorded on the event log (append-only, idempotent).",
+        "description": "An **Environment approval gate** (ADR-0078 §1: a Step after it uses the\nRun's Environment's authority) releases only once the accumulated\napprovals satisfy the Environment's effective rules for the run's Project\n(ADR-0071 §3, `admits`) and its wait timer has run out on the gate's wait\nclock (§4). Approvals that complete the rules early are kept: the gate is\nreleased by the scheduler when the timer runs out. On release the\ndeployment is written to the legacy history. Every other `manual` gate is\na plain gate: it releases on the first approval, with no step-up. If the\nEnvironment no longer exists or no longer admits the Project, no gate of\nthe Run releases (409). Authz'd as a write.",
         "operationId": "approve_gate",
         "parameters": [
           {
@@ -8562,6 +8646,44 @@
           }
         }
       },
+      "ApprovalGateRulesDto": {
+        "type": "object",
+        "description": "An Environment's settings for its Environment approval gate (ADR-0078\n§3): the `manual` gate that has a Step using the Environment's\nauthority after it.",
+        "required": [
+          "missing_gate_mode",
+          "max_approval_age_s"
+        ],
+        "properties": {
+          "added_gate_expiry_s": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Seconds before the gate the Environment adds expires; absent = it\nwaits until approved or rejected.",
+            "minimum": 0
+          },
+          "max_approval_age_s": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Seconds an approval stays good for: a Step that uses the\nEnvironment's authority is refused at launch once its approval gate\nreleased longer ago than this. Default 86400 (24 hours).",
+            "minimum": 0
+          },
+          "missing_gate_mode": {
+            "$ref": "#/components/schemas/MissingGateModeDto",
+            "description": "`add` (default) or `refuse`."
+          },
+          "required_approvals": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "How many of the baseline's approvers must approve; absent = every\none. A Project overlay's approvers are each required as well.",
+            "minimum": 0
+          }
+        }
+      },
       "ArtifactDto": {
         "type": "object",
         "description": "One artifact **version** in a run's list (ADR-0052, immutable per attempt\nby ADR-0056). `step`/`attempt` are the publishing provenance (empty\nstrings on pre-ADR-0056 rows); `succeeded` is that attempt's verdict;\n`of_record` marks the version the bare name-addressed download resolves\nto — the latest successful version of that name.",
@@ -9340,6 +9462,171 @@
           }
         }
       },
+      "DuplicateCopiedDto": {
+        "type": "object",
+        "description": "What a duplicate copied.",
+        "required": [
+          "overlays",
+          "privilege_grants",
+          "secrets"
+        ],
+        "properties": {
+          "overlays": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Projects whose overlay was copied."
+          },
+          "privilege_grants": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Projects whose privilege grant was copied."
+          },
+          "secrets": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DuplicatedSecretsDto"
+            },
+            "description": "The EnvironmentProjectSecretScope secrets copied, with their values."
+          }
+        }
+      },
+      "DuplicateNotCopiedDto": {
+        "type": "object",
+        "description": "What a duplicate left for an admin to do by hand.",
+        "required": [
+          "policies",
+          "projects_with_runs",
+          "old_oidc_subject",
+          "new_oidc_subject",
+          "notes"
+        ],
+        "properties": {
+          "new_oidc_subject": {
+            "type": "string",
+            "description": "The same for the new Environment: a cloud trust policy matching\n`old_oidc_subject` must also match this one before a Run here can\nassume its role."
+          },
+          "notes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Other things the copy does not carry, one sentence each."
+          },
+          "old_oidc_subject": {
+            "type": "string",
+            "description": "The OIDC subject a Run in the old Environment presents\n(`*` for the repository and the ref)."
+          },
+          "policies": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DuplicatePolicyDto"
+            },
+            "description": "Policies that apply to the old Environment and not to the new one."
+          },
+          "projects_with_runs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Projects whose Runs named the old Environment (from Run history):\ntheir Pipeline YAML names it, and runs in the new one only once it is\nchanged."
+          }
+        }
+      },
+      "DuplicateOrgEnvironmentRequest": {
+        "type": "object",
+        "description": "`POST /v1/orgs/{org}/environments/{env}/duplicate`: the new\nEnvironment's name and, optionally, its display name.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "display_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Omitted, empty or blank: what the old Environment shows, plus\n\" (copy)\"."
+          },
+          "name": {
+            "type": "string",
+            "description": "The new Environment's name: the key its pipelines will name. The\nname rule of a created Environment applies."
+          }
+        },
+        "additionalProperties": false
+      },
+      "DuplicateOrgEnvironmentResponse": {
+        "type": "object",
+        "description": "The answer to a duplicate: the new Environment, what was copied and the\nchecklist of what was not.",
+        "required": [
+          "environment",
+          "copied",
+          "not_copied"
+        ],
+        "properties": {
+          "copied": {
+            "$ref": "#/components/schemas/DuplicateCopiedDto"
+          },
+          "environment": {
+            "$ref": "#/components/schemas/OrgEnvironmentDto"
+          },
+          "not_copied": {
+            "$ref": "#/components/schemas/DuplicateNotCopiedDto"
+          }
+        }
+      },
+      "DuplicatePolicyDto": {
+        "type": "object",
+        "description": "A Policy a duplicate did not change: its `match.environments` selects\nthe old Environment and none of its patterns selects the new one.",
+        "required": [
+          "id",
+          "name",
+          "environments"
+        ],
+        "properties": {
+          "environments": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Its `match.environments`."
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "project": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The Project it is attached to; `null` for an org Policy."
+          }
+        }
+      },
+      "DuplicatedSecretsDto": {
+        "type": "object",
+        "description": "One Project's secrets the duplicate copied, by key. Never a value.",
+        "required": [
+          "project",
+          "keys"
+        ],
+        "properties": {
+          "keys": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "project": {
+            "type": "string"
+          }
+        }
+      },
       "EffectiveProtectionDto": {
         "type": "object",
         "description": "The rules admission enforces for one Project in one Environment: the\nbaseline merged with the Project's overlay (ADR-0071 §3), computed by the\nserver so no client re-implements the merge.",
@@ -9347,7 +9634,8 @@
           "approvers",
           "allowed_ref_layers",
           "wait_timer_s",
-          "require_reason"
+          "require_reason",
+          "approval_gate"
         ],
         "properties": {
           "allowed_ref_layers": {
@@ -9359,6 +9647,10 @@
               }
             },
             "description": "One list per layer (baseline first, then overlay): a ref must match\n**every** non-empty layer. Never pre-intersected — `[main]` and\n`[tags/*]` intersect to `[]`, which would read as \"any ref\"."
+          },
+          "approval_gate": {
+            "$ref": "#/components/schemas/ApprovalGateRulesDto",
+            "description": "The baseline's approval gate settings."
           },
           "approvers": {
             "type": "array",
@@ -9373,6 +9665,7 @@
           "wait_timer_s": {
             "type": "integer",
             "format": "int32",
+            "description": "The longer of the two layers' wait timers. It does nothing when\n`approvers` is empty.",
             "minimum": 0
           }
         }
@@ -9614,12 +9907,23 @@
             },
             "description": "Ref globs a deploy's symbolic ref must match; empty = any ref."
           },
+          "approval_gate": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ApprovalGateRulesDto",
+                "description": "The Environment approval gate's settings (ADR-0078 §3). Present on a\nbaseline only: an overlay has none."
+              }
+            ]
+          },
           "approvers": {
             "type": "array",
             "items": {
               "type": "string"
             },
-            "description": "Principal ids; every one must approve (AND)."
+            "description": "Principal ids. Every one must approve (AND), unless the baseline's\n`approval_gate.required_approvals` says how many of its own must."
           },
           "require_reason": {
             "type": "boolean",
@@ -9628,7 +9932,7 @@
           "wait_timer_s": {
             "type": "integer",
             "format": "int32",
-            "description": "Seconds. Carried and merged, not yet enforced (git-bug 2b94989).",
+            "description": "Seconds: a minimum wait on the Environment approval gate, counted on\nthe gate's wait clock (ADR-0078 §4). It does nothing where the\neffective approvers are empty; a client shows that from `approvers`\n(here, or `effective.approvers` for a Project).",
             "minimum": 0
           }
         }
@@ -10486,6 +10790,14 @@
           }
         }
       },
+      "MissingGateModeDto": {
+        "type": "string",
+        "description": "What Run creation does when a Step that uses the Environment's authority\nhas no `manual` gate upstream (ADR-0078 §3).",
+        "enum": [
+          "add",
+          "refuse"
+        ]
+      },
       "OpSummary": {
         "type": "object",
         "description": "What a human is asked to confirm: the server-rendered, redacted\ndescription of one operation (shown in the 403, on the confirm page and\nin the event log).",
@@ -10534,12 +10846,20 @@
           "description": {
             "type": "string"
           },
+          "display_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "What people see in place of the name; `null` shows the name."
+          },
           "eligibility": {
             "$ref": "#/components/schemas/EnvironmentEligibilityDto",
             "description": "Which Projects may deploy here. Read-only here: written through\n`…/eligibility`."
           },
           "name": {
-            "type": "string"
+            "type": "string",
+            "description": "The key pipeline YAML and the OIDC subject use. Fixed once created."
           },
           "org": {
             "type": "string"
@@ -10683,7 +11003,7 @@
           },
           "kind": {
             "type": "string",
-            "description": "`file`, `library` or `plugin`."
+            "description": "`file`, `library`, `plugin`, or `environment` for the gate an\nEnvironment added to the Run (ADR-0078 §2)."
           },
           "name": {
             "type": "string",
@@ -11910,6 +12230,13 @@
             "$ref": "#/components/schemas/EnvironmentProtectionRulesDto",
             "description": "The Environment's baseline, set by an org admin."
           },
+          "display_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "What people see in place of the name; `null` shows the name."
+          },
           "effective": {
             "$ref": "#/components/schemas/EffectiveProtectionDto",
             "description": "What admission enforces: the baseline merged with the overlay."
@@ -11992,8 +12319,17 @@
       },
       "PutEnvironmentProtectionRequest": {
         "type": "object",
-        "description": "A baseline (`…/protection`) body: the four rules, replaced whole. Every\nfield is optional and an omitted one takes the **permissive** default —\nnever the stored value — so `{}` resets the baseline to permissive.\nUnknown fields are refused, so the retired per-repo shape (`wait_timer`,\n`concurrency`) — and `deployment_concurrency`, which ADR-0074 removed — is\na 400, not a silently ignored rule.",
+        "description": "A baseline (`…/protection`) body: the four rules and the approval gate\nsettings, replaced whole. Every field is optional and an omitted one\ntakes its default — never the stored value — so `{}` resets the baseline\nto permissive (and the approval gate settings to theirs).\nUnknown fields are refused, so the retired per-repo shape (`wait_timer`,\n`concurrency`) — and `deployment_concurrency`, which ADR-0074 removed — is\na 400, not a silently ignored rule.",
         "properties": {
+          "added_gate_expiry_s": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Seconds before the gate the Environment adds expires; omitted = it\nwaits until approved or rejected.",
+            "minimum": 0
+          },
           "allowed_refs": {
             "type": "array",
             "items": {
@@ -12008,14 +12344,36 @@
             },
             "description": "Principal ids (ADR-0069): each must name an existing Principal; a\nmerged id is stored as the Principal it now is. All must approve."
           },
+          "max_approval_age_s": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Seconds an approval stays good for at launch; omitted = 86400.",
+            "minimum": 0
+          },
+          "missing_gate_mode": {
+            "$ref": "#/components/schemas/MissingGateModeDto",
+            "description": "`add` (default) or `refuse` (ADR-0078 §3)."
+          },
           "require_reason": {
             "type": "boolean",
             "description": "A human dispatch must carry a reason (ADR-0057 §3). Omitted = off."
           },
+          "required_approvals": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "How many of `approvers` must approve, 1 to their number; omitted =\nevery one.",
+            "minimum": 0
+          },
           "wait_timer_s": {
             "type": "integer",
             "format": "int32",
-            "description": "Seconds. Carried and merged, not yet enforced (git-bug 2b94989).",
+            "description": "Seconds: a minimum wait on the Environment approval gate (ADR-0078\n§4). Refused (400) above 0 with no approvers.",
             "minimum": 0
           }
         },
@@ -12031,6 +12389,13 @@
               "null"
             ],
             "description": "Free text; omitted = empty."
+          },
+          "display_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "What people see in place of the name. Omitted, empty or blank shows\nthe name. Changing it never needs a step-up: the name, which pipelines\nand cloud trust policies refer to, stays."
           }
         },
         "additionalProperties": false
@@ -12432,6 +12797,26 @@
           }
         }
       },
+      "RunEnvironmentDto": {
+        "type": "object",
+        "description": "The Environment a Run names.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "display_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "What headings show in its place; absent when it has none or the org\nno longer has an Environment of that name."
+          },
+          "name": {
+            "type": "string",
+            "description": "The name the pipeline's `environment:` uses."
+          }
+        }
+      },
       "RunListResponse": {
         "type": "object",
         "description": "`GET /v1/runs` body: the most recent runs, newest first.",
@@ -12456,6 +12841,17 @@
           "snapshot_retention"
         ],
         "properties": {
+          "environment": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RunEnvironmentDto",
+                "description": "The Environment the Run names (its pipeline's `environment:`), with\nits display name. Absent for a Run that names none."
+              }
+            ]
+          },
           "id": {
             "type": "string"
           },
@@ -13295,6 +13691,14 @@
           "attempts"
         ],
         "properties": {
+          "approval_release_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "A waiting Environment approval gate whose approvals are in: when the\nEnvironment's wait timer runs out and the gate releases (Unix ms).\nAbsent otherwise."
+          },
           "attempt_list": {
             "type": "array",
             "items": {
@@ -13309,6 +13713,10 @@
           "deploy": {
             "type": "boolean",
             "description": "This Step is marked `deploy: true` (ADR-0074 §2) — the Step of a deploy\nRun that deploys. Omitted when false."
+          },
+          "environment_approval_gate": {
+            "type": "boolean",
+            "description": "This `manual` gate is an **Environment approval gate** (ADR-0078 §1):\na Step after it uses the Run's Environment's authority, so releasing\nit needs the Environment's approvers and a step-up. Decided at Run\ncreation. A gate the Environment added has an `origin` link of kind\n`environment`. On a Run created before the mark was stored, every\n`manual` gate of a Run that names an Environment is one, as the\napprove handler judges it. Omitted when false."
           },
           "gate": {
             "type": [

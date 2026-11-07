@@ -101,12 +101,22 @@ pub struct WorkspaceFetch {
 }
 
 impl WorkspaceFetch {
-    /// The Step's Cache home URL, when its cache key resolved and the Depot
-    /// has more than one replica. Restore hints come from the same key the
-    /// drain saves under, so a save and a later restore of that key ask the
-    /// same replica.
-    fn cache_home_url(&self, spec: &StepSpec) -> Option<String> {
+    /// The home URL the drain saves the Step's Cache to: the home of the
+    /// Step's own key, when it resolved and the Depot has more than one
+    /// replica. A later restore of that key asks the same replica.
+    fn cache_save_home_url(&self, spec: &StepSpec) -> Option<String> {
         let key = spec.cache.as_ref()?.key.as_ref()?;
+        self.cache_home.as_ref()?.url_for(key)
+    }
+
+    /// The home URL the fetcher restores the Step's Cache from: the home of
+    /// the key the restore hints were found under. That is the Step's own
+    /// key, or the default branch's key when the Run's own scope missed
+    /// (`fallback_key`), whose entries were saved to a different replica.
+    fn cache_restore_home_url(&self, spec: &StepSpec) -> Option<String> {
+        let cache = spec.cache.as_ref()?;
+        let own = cache.key.as_ref()?;
+        let key = cache.fallback_key.as_ref().unwrap_or(own);
         self.cache_home.as_ref()?.url_for(key)
     }
 }
@@ -385,6 +395,7 @@ impl K8sExecutor {
         spec: &StepSpec,
     ) -> Result<(), ExecError> {
         self.ensure_forge_token_secret(pod_name, pod, spec).await?;
+        self.ensure_step_secrets_secret(pod_name, pod, spec).await?;
         self.ensure_registry_secret(pod_name, pod, spec).await?;
         self.ensure_oidc_secret(pod_name, pod, spec).await?;
         self.ensure_workspace_secret(pod_name, pod, step, spec)
@@ -561,6 +572,39 @@ impl K8sExecutor {
                 .map(|_| ())
                 .map_err(|e| ExecError::Launch(format!("forge token secret: {e}"))),
             Err(e) => Err(ExecError::Launch(format!("forge token secret: {e}"))),
+        }
+    }
+
+    /// Upsert the per-Pod Secret carrying a Step's own secret values
+    /// (ADR-0014), mounted read-only on tmpfs at `/scarab/secrets/<name>`.
+    /// Deleted when the Attempt ends, beside the forge credential
+    /// ([`Executor::take_forge_credential`]), and owner-referenced to the Pod
+    /// so it is garbage-collected with it if that delete is missed. A
+    /// re-drive replaces it with the values resolved for that launch.
+    async fn ensure_step_secrets_secret(
+        &self,
+        pod_name: &str,
+        pod: &Pod,
+        spec: &StepSpec,
+    ) -> Result<(), ExecError> {
+        let Some(secret) = step_secrets_secret(pod_name, &self.namespace, pod, spec) else {
+            return Ok(());
+        };
+        let client = self.client.clone().ok_or(ExecError::Unavailable)?;
+        let secrets: Api<k8s_openapi::api::core::v1::Secret> =
+            Api::namespaced(client, &self.namespace);
+        match secrets.create(&PostParams::default(), &secret).await {
+            Ok(_) => Ok(()),
+            Err(kube::Error::Api(ae)) if ae.code == 409 => secrets
+                .replace(
+                    &step_secrets_secret_name(pod_name),
+                    &PostParams::default(),
+                    &secret,
+                )
+                .await
+                .map(|_| ())
+                .map_err(|e| ExecError::Launch(format!("step secrets: {e}"))),
+            Err(e) => Err(ExecError::Launch(format!("step secrets: {e}"))),
         }
     }
 
@@ -3022,6 +3066,12 @@ impl Executor for K8sExecutor {
     /// kept Pod no longer leaves a long-lived token in etcd, and the caller
     /// revokes a minted one whichever replica minted it. Gone already
     /// (taken, or collected with its Pod): `Ok(None)`.
+    ///
+    /// The Pod's `<pod>-secrets` Secret, which holds the Step's own secret
+    /// values, is deleted here too, for the same reason: a kept Pod would
+    /// otherwise keep them in etcd. A failed delete is logged and does not
+    /// stop the forge credential from being taken; the owner reference still
+    /// removes the Secret with the Pod.
     async fn take_forge_credential(
         &self,
         handle: &ExecHandle,
@@ -3029,6 +3079,22 @@ impl Executor for K8sExecutor {
         let client = self.client.clone().ok_or(ExecError::Unavailable)?;
         let secrets: Api<k8s_openapi::api::core::v1::Secret> =
             Api::namespaced(client, &self.namespace);
+        match secrets
+            .delete(
+                &step_secrets_secret_name(&handle.0),
+                &DeleteParams::default(),
+            )
+            .await
+        {
+            // 404: the Step had no secrets, or the Secret was deleted already.
+            Ok(_) => {}
+            Err(kube::Error::Api(ae)) if ae.code == 404 => {}
+            Err(e) => tracing::warn!(
+                unit = %handle.0,
+                error = %e,
+                "deleting the step secrets Secret failed; it is removed with its Pod"
+            ),
+        }
         let name = forge_token_secret_name(&handle.0);
         let Some(secret) = secrets
             .get_opt(&name)
@@ -3757,11 +3823,105 @@ pub fn pod_name(step: &StepRun) -> String {
 /// Where a Step's forge credential is mounted (ADR-0076 §9): a per-Pod k8s
 /// Secret volume (tmpfs on the node), read-only, on the Step container only.
 /// The token is never in env, a URL or argv.
-pub const FORGE_SECRETS_MOUNT_PATH: &str = "/scarab/secrets";
+pub const FORGE_SECRETS_MOUNT_PATH: &str = scarab_pipeline::SECRETS_DIR;
 const FORGE_SECRETS_VOLUME: &str = "scarab-forge-token";
-/// The file names the token and the username live under.
-pub const FORGE_TOKEN_KEY: &str = "forge-token";
-pub const FORGE_USERNAME_KEY: &str = "forge-username";
+/// The file names the token and the username live under. The Pipeline check
+/// refuses a Step secret with either name (`RESERVED_SECRET_FILES`), so a
+/// Step's own secrets can share the directory.
+pub const FORGE_TOKEN_KEY: &str = scarab_pipeline::FORGE_TOKEN_FILE;
+pub const FORGE_USERNAME_KEY: &str = scarab_pipeline::FORGE_USERNAME_FILE;
+/// The volume carrying a Step's own secrets (ADR-0014) at
+/// [`FORGE_SECRETS_MOUNT_PATH`]: the per-Pod `<pod>-secrets` Secret, and the
+/// forge credential's Secret beside it when the Step has one (a projected
+/// volume, since one path takes one mount).
+const STEP_SECRETS_VOLUME: &str = "scarab-secrets";
+/// The env var that names the secrets directory, set when it is mounted.
+pub const SECRETS_DIR_ENV: &str = "SCARAB_SECRETS";
+
+/// The per-Pod Secret holding a Step's own secret values (ADR-0014).
+fn step_secrets_secret_name(pod_name: &str) -> String {
+    format!("{pod_name}-secrets")
+}
+
+/// The volume at [`FORGE_SECRETS_MOUNT_PATH`] for a Step with its own
+/// secrets: the `<pod>-secrets` Secret, projected together with the forge
+/// credential's Secret when the Step also has one. The Pipeline check keeps
+/// the two key sets apart (`RESERVED_SECRET_FILES`).
+fn step_secrets_volume(pod_name: &str, with_forge_credential: bool) -> Volume {
+    use k8s_openapi::api::core::v1::{ProjectedVolumeSource, SecretProjection, VolumeProjection};
+    let project = |secret: String| VolumeProjection {
+        secret: Some(SecretProjection {
+            name: secret,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mut sources = vec![project(step_secrets_secret_name(pod_name))];
+    if with_forge_credential {
+        sources.push(project(forge_token_secret_name(pod_name)));
+    }
+    Volume {
+        name: STEP_SECRETS_VOLUME.to_string(),
+        projected: Some(ProjectedVolumeSource {
+            sources: Some(sources),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// The env var `key` of an `env: true` secret: a reference the kubelet
+/// resolves from the per-Pod Secret, never the value.
+fn step_secret_env(pod_name: &str, key: &str) -> EnvVar {
+    use k8s_openapi::api::core::v1::{EnvVarSource, SecretKeySelector};
+    EnvVar {
+        name: key.to_string(),
+        value: None,
+        value_from: Some(EnvVarSource {
+            secret_key_ref: Some(SecretKeySelector {
+                name: step_secrets_secret_name(pod_name),
+                key: key.to_string(),
+                optional: None,
+            }),
+            ..Default::default()
+        }),
+    }
+}
+
+/// The per-Pod Secret holding a Step's resolved secret values (ADR-0014),
+/// one key per secret. `None` when the launch resolved none (no deploy
+/// context, a locked-out Run, or no `secrets:`): then no volume or env var
+/// refers to it either.
+fn step_secrets_secret(
+    pod_name: &str,
+    namespace: &str,
+    pod: &Pod,
+    spec: &StepSpec,
+) -> Option<k8s_openapi::api::core::v1::Secret> {
+    if spec.resolved_secrets.is_empty() {
+        return None;
+    }
+    Some(k8s_openapi::api::core::v1::Secret {
+        metadata: ObjectMeta {
+            name: Some(step_secrets_secret_name(pod_name)),
+            namespace: Some(namespace.to_string()),
+            owner_references: pod.metadata.uid.clone().map(|uid| {
+                vec![
+                    k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+                        api_version: "v1".into(),
+                        kind: "Pod".into(),
+                        name: pod_name.to_string(),
+                        uid,
+                        ..Default::default()
+                    },
+                ]
+            }),
+            ..Default::default()
+        },
+        string_data: Some(spec.resolved_secrets.iter().cloned().collect()),
+        ..Default::default()
+    })
+}
 
 /// The in-Pod workspace root (ADR-0007/0008): steps run here; the clone step
 /// and every producer write here; the snapshot covers it (incl. `.git`).
@@ -4265,12 +4425,18 @@ pub fn build_pod(
     // Secret volume on the Step container — never env, a URL or argv. The
     // image and command are the Step's own; Run creation decided this Step
     // may hold the credential.
-    let mut forge_token_volume: Option<Volume> = None;
-    if spec
+    //
+    // The Step's own secrets (ADR-0014) are files in the same directory,
+    // from the per-Pod `<pod>-secrets` Secret: one file per secret, and an
+    // env var only for an `env: true` secret, read from that Secret by the
+    // kubelet (`secretKeyRef`). No value is ever in the Pod spec.
+    let has_forge_credential = spec
         .forge_token
         .as_ref()
-        .is_some_and(|f| f.credential.is_some())
-    {
+        .is_some_and(|f| f.credential.is_some());
+    let has_step_secrets = !spec.resolved_secrets.is_empty();
+    let mut forge_token_volume: Option<Volume> = None;
+    if has_forge_credential && !has_step_secrets {
         step_mounts.push(VolumeMount {
             name: FORGE_SECRETS_VOLUME.to_string(),
             mount_path: FORGE_SECRETS_MOUNT_PATH.to_string(),
@@ -4284,6 +4450,26 @@ pub fn build_pod(
                 ..Default::default()
             }),
             ..Default::default()
+        });
+    } else if has_step_secrets {
+        step_mounts.push(VolumeMount {
+            name: STEP_SECRETS_VOLUME.to_string(),
+            mount_path: FORGE_SECRETS_MOUNT_PATH.to_string(),
+            read_only: Some(true),
+            ..Default::default()
+        });
+        forge_token_volume = Some(step_secrets_volume(name, has_forge_credential));
+        for (key, _) in spec.resolved_secrets.iter() {
+            if spec.secrets.iter().any(|s| s.env && &s.name == key) {
+                env.push(step_secret_env(name, key));
+            }
+        }
+    }
+    if forge_token_volume.is_some() {
+        env.push(EnvVar {
+            name: SECRETS_DIR_ENV.to_string(),
+            value: Some(FORGE_SECRETS_MOUNT_PATH.to_string()),
+            value_from: None,
         });
     }
     let (image, command) = (spec.image.clone(), spec.command.clone());
@@ -4501,7 +4687,7 @@ pub fn build_pod(
                     fetch,
                     &spec.workspace_inputs,
                     cache_restore,
-                    fetch.cache_home_url(spec).as_deref(),
+                    fetch.cache_restore_home_url(spec).as_deref(),
                     &ws,
                     // The same resolved number `activeDeadlineSeconds` gets
                     // below — the retry window is a fraction of THIS deadline.
@@ -4563,7 +4749,7 @@ pub fn build_pod(
             // (git-bug 12e2f6b) — only when the key resolved and dirs are
             // declared, the same condition the drain's --cache-dirs carries.
             if spec.cache.as_ref().is_some_and(|c| !c.dirs.is_empty()) {
-                if let Some(url) = fetch.cache_home_url(spec) {
+                if let Some(url) = fetch.cache_save_home_url(spec) {
                     egress_env.push(env_var(workspace_token::WORKSPACE_CACHE_URL_ENV, &url));
                 }
             }
@@ -6074,6 +6260,7 @@ mod tests {
             resources: Default::default(),
             k8s_overlay: None,
             oidc_token: None,
+            resolved_secrets: Default::default(),
             services: vec![],
             uses: vec![],
             matrix_values: Default::default(),
@@ -6290,6 +6477,7 @@ mod tests {
             resources: Default::default(),
             k8s_overlay: None,
             oidc_token: None,
+            resolved_secrets: Default::default(),
             services: vec![],
             uses: vec![],
             matrix_values: Default::default(),
@@ -10188,6 +10376,180 @@ mod tests {
             .all(|v| v.name != FORGE_SECRETS_VOLUME));
     }
 
+    /// ADR-0014 (git-bug bcf2c11): a Step's own secrets reach it as files
+    /// at `/scarab/secrets/<name>` from a per-Pod Secret, and as env only
+    /// for an `env: true` secret, through `secretKeyRef`. No resolved value
+    /// is anywhere in the Pod spec.
+    #[test]
+    fn build_pod_mounts_step_secrets_as_files_and_never_puts_a_value_in_the_spec() {
+        let step = step_with_attempt("run-1", "deploy", "a1");
+        let mut spec = busybox();
+        spec.secrets = vec![
+            "DB_PASSWORD".into(),
+            scarab_pipeline::SecretRef::file_and_env("ARGOCD_AUTH_TOKEN"),
+        ];
+        spec.resolved_secrets = scarab_engine::ResolvedSecrets(vec![
+            ("DB_PASSWORD".into(), "sekret-db-pw".into()),
+            ("ARGOCD_AUTH_TOKEN".into(), "sekret-argo".into()),
+        ]);
+        let pod = build_pod(
+            "scarab-x",
+            "ns",
+            &step,
+            &spec,
+            None,
+            DEFAULT_STEP_TIMEOUT_SECS,
+            false,
+            None,
+        );
+        let json = serde_json::to_string(&pod).unwrap();
+        for value in ["sekret-db-pw", "sekret-argo"] {
+            assert!(!json.contains(value), "{value} is in the Pod spec: {json}");
+        }
+        let ps = pod.spec.as_ref().unwrap();
+        let c = &ps.containers[0];
+        let m = c
+            .volume_mounts
+            .iter()
+            .flatten()
+            .find(|m| m.name == STEP_SECRETS_VOLUME)
+            .expect("secrets volume mounted");
+        assert_eq!(m.mount_path, "/scarab/secrets");
+        assert_eq!(m.read_only, Some(true));
+        let v = ps
+            .volumes
+            .iter()
+            .flatten()
+            .find(|v| v.name == STEP_SECRETS_VOLUME)
+            .unwrap();
+        let sources = v.projected.as_ref().unwrap().sources.as_ref().unwrap();
+        let names: Vec<&str> = sources
+            .iter()
+            .map(|p| p.secret.as_ref().unwrap().name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            ["scarab-x-secrets"],
+            "no forge credential: one source"
+        );
+
+        let env = c.env.as_ref().unwrap();
+        assert!(
+            env.iter().all(|e| e.name != "DB_PASSWORD"),
+            "file only: {env:?}"
+        );
+        let argo = env.iter().find(|e| e.name == "ARGOCD_AUTH_TOKEN").unwrap();
+        assert_eq!(argo.value, None);
+        let r = argo
+            .value_from
+            .as_ref()
+            .unwrap()
+            .secret_key_ref
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            (r.name.as_str(), r.key.as_str()),
+            ("scarab-x-secrets", "ARGOCD_AUTH_TOKEN")
+        );
+        assert!(env
+            .iter()
+            .any(|e| e.name == "SCARAB_SECRETS" && e.value.as_deref() == Some("/scarab/secrets")));
+
+        // The Secret the volume and the reference name holds every value.
+        let secret = step_secrets_secret("scarab-x", "ns", &Pod::default(), &spec).unwrap();
+        assert_eq!(secret.metadata.name.as_deref(), Some("scarab-x-secrets"));
+        let data = secret.string_data.unwrap();
+        assert_eq!(data["DB_PASSWORD"], "sekret-db-pw");
+        assert_eq!(data["ARGOCD_AUTH_TOKEN"], "sekret-argo");
+
+        // Nothing resolved (no deploy context, a locked-out Run): no Secret,
+        // so no volume or reference to one that would never exist.
+        spec.resolved_secrets = Default::default();
+        assert!(step_secrets_secret("scarab-x", "ns", &Pod::default(), &spec).is_none());
+        let pod = build_pod(
+            "scarab-x",
+            "ns",
+            &step,
+            &spec,
+            None,
+            DEFAULT_STEP_TIMEOUT_SECS,
+            false,
+            None,
+        );
+        let ps = pod.spec.as_ref().unwrap();
+        assert!(ps
+            .volumes
+            .iter()
+            .flatten()
+            .all(|v| v.name != STEP_SECRETS_VOLUME));
+        assert!(ps.containers[0]
+            .env
+            .iter()
+            .flatten()
+            .all(|e| e.value_from.is_none()));
+    }
+
+    /// A Step with a forge credential and its own secrets gets both in
+    /// `/scarab/secrets`: one projected volume over the two Secrets.
+    #[test]
+    fn step_secrets_and_a_forge_credential_share_the_secrets_directory() {
+        use scarab_engine::{ForgeCredential, ForgeTokenConfig};
+        let step = step_with_attempt("run-1", "push", "a1");
+        let mut spec = busybox();
+        spec.forge_token = Some(ForgeTokenConfig {
+            access: scarab_pipeline::ForgeToken::Write,
+            owner: "acme".into(),
+            name: "web".into(),
+            read_only: false,
+            trusted_library: None,
+            credential: Some(ForgeCredential {
+                username: "x-access-token".into(),
+                token: "sekret-token".into(),
+                minted: true,
+            }),
+        });
+        spec.secrets = vec!["NPM_TOKEN".into()];
+        spec.resolved_secrets =
+            scarab_engine::ResolvedSecrets(vec![("NPM_TOKEN".into(), "sekret-npm".into())]);
+        let pod = build_pod(
+            "scarab-x",
+            "ns",
+            &step,
+            &spec,
+            None,
+            DEFAULT_STEP_TIMEOUT_SECS,
+            false,
+            None,
+        );
+        let json = serde_json::to_string(&pod).unwrap();
+        assert!(!json.contains("sekret-token") && !json.contains("sekret-npm"));
+        let ps = pod.spec.as_ref().unwrap();
+        let mounts: Vec<&str> = ps.containers[0]
+            .volume_mounts
+            .iter()
+            .flatten()
+            .filter(|m| m.mount_path == "/scarab/secrets")
+            .map(|m| m.name.as_str())
+            .collect();
+        assert_eq!(mounts, [STEP_SECRETS_VOLUME], "one mount at the path");
+        let v = ps
+            .volumes
+            .iter()
+            .flatten()
+            .find(|v| v.name == STEP_SECRETS_VOLUME)
+            .unwrap();
+        let names: Vec<&str> = v
+            .projected
+            .as_ref()
+            .unwrap()
+            .sources
+            .iter()
+            .flatten()
+            .map(|p| p.secret.as_ref().unwrap().name.as_str())
+            .collect();
+        assert_eq!(names, ["scarab-x-secrets", "scarab-x-token"]);
+    }
+
     /// The forge-token Secret carries what a control plane that did not
     /// mint the token needs to revoke it: the repository and whether it was
     /// minted, as annotations the Step does not see. Read back the way the
@@ -10243,6 +10605,8 @@ mod tests {
         spec.env.clear();
         spec.workspace_inputs = vec!["tree-a".into()];
         spec.oidc_token = Some("jwt".into());
+        spec.secrets = vec!["TOKEN".into()];
+        spec.resolved_secrets = scarab_engine::ResolvedSecrets(vec![("TOKEN".into(), "v".into())]);
         spec.artifacts = vec!["dist/*".into()];
         spec.cache = Some(scarab_engine::CacheConfig {
             dirs: vec!["target".into()],
@@ -10275,7 +10639,12 @@ mod tests {
             .map(|e| e.name.clone())
             .filter(|n| n.starts_with("SCARAB_"))
             .collect();
-        for expected in ["SCARAB_RESULTS", "SCARAB_OIDC_TOKEN_FILE", "SCARAB_CACHE_ROOTS"] {
+        for expected in [
+            "SCARAB_RESULTS",
+            "SCARAB_OIDC_TOKEN_FILE",
+            "SCARAB_CACHE_ROOTS",
+            "SCARAB_SECRETS",
+        ] {
             assert!(names.iter().any(|n| n == expected), "{expected} not set: {names:?}");
         }
         let unknown: Vec<_> = names
@@ -10364,6 +10733,27 @@ mod tests {
         let names: Vec<&str> = got.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, vec![WORKSPACE_INIT_CONTAINER, WORKSPACE_EGRESS_CONTAINER]);
         assert!(got.iter().all(|(_, v)| v.as_deref() == Some(want.as_str())), "{got:?}");
+
+        // git-bug efcec77: a restore found under the default branch's key
+        // reads from that key's home, while the drain still saves to the
+        // home of the Step's own key.
+        let fallback = (0..)
+            .map(|i| format!("fallback-key-{i}"))
+            .find(|k| cache_home::home_ordinal(k, 3) != cache_home::home_ordinal("cache-key-1", 3))
+            .unwrap();
+        let mut from_fallback = spec.clone();
+        from_fallback.cache.as_mut().unwrap().fallback_key = Some(fallback.clone());
+        let fallback_home = format!(
+            "http://scarab-workspace-{}.ns.svc",
+            cache_home::home_ordinal(&fallback, 3)
+        );
+        assert_eq!(
+            home_env(&fetch, &from_fallback),
+            vec![
+                (WORKSPACE_INIT_CONTAINER.to_string(), Some(fallback_home)),
+                (WORKSPACE_EGRESS_CONTAINER.to_string(), Some(want.clone())),
+            ]
+        );
 
         // One Depot replica: no home, no env.
         let mut one = sample_fetch();

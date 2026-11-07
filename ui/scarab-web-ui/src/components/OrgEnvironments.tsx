@@ -1,7 +1,8 @@
 // Org-level Environments: the Settings section where an org admin runs the
 // places deploys land in. Each Environment has:
 //
-//   - its description;
+//   - its display name (what lists and headings show; the name, which
+//     pipelines use, is fixed) and its description;
 //   - its BASELINE protection rules, which every project's Deploy Runs obey;
 //   - its ELIGIBILITY: all projects, or project-name patterns. An empty list
 //     admits no project: eligibility starts closed;
@@ -20,8 +21,7 @@
 //
 // Every server refusal (400/409) is shown verbatim: it is the answer to "why
 // will this not save".
-import { createResource, createSignal, For, onCleanup, onMount, Show } from "solid-js";
-import { Portal } from "solid-js/web";
+import { createResource, createSignal, For, Show } from "solid-js";
 import { A, useNavigate } from "@solidjs/router";
 import {
   acknowledgeMigrationReport,
@@ -32,9 +32,18 @@ import {
   type OrgEnvironment,
 } from "../api/client";
 import { eligibilityLabel, isPermissive, reportBanner, rulesSummary } from "../environment-overlays";
-import { environmentHref, nameError, toPutBody } from "../org-environments";
+import {
+  displayNameError,
+  environmentHref,
+  nameBeside,
+  nameError,
+  shownName,
+  toPutBody,
+} from "../org-environments";
 import { relTime, absTime } from "../fmt";
 import Icon from "./Icon";
+import Modal, { ModalMessage } from "./Modal";
+import { Field, Input } from "./Field";
 
 export default function OrgEnvironments(props: { org: string }) {
   const nav = useNavigate();
@@ -99,9 +108,9 @@ export default function OrgEnvironments(props: { org: string }) {
             <p class="subtle">
               <small>
                 <Icon icon="rocket" size={12} /> An org environment is the place deploys
-                land in, shared by every repository that deploys there. It decides who may
-                deploy (eligibility) and under which rules (the baseline); each repository
-                can only tighten those for itself.
+                land in, shared by every repository that deploys there. It decides which
+                projects may use it (eligibility) and under which rules (the baseline); each
+                repository can only tighten those for itself.
               </small>
             </p>
           </Show>
@@ -109,20 +118,16 @@ export default function OrgEnvironments(props: { org: string }) {
       </div>
 
       <Show when={creating()}>
-        {/* Portalled, as Plugins' install dialog: in-panel, it rendered under
-            the panels after this one (each is its own stacking context). */}
-        <Portal>
-          <CreateDialog
-            org={props.org}
-            taken={rows().map((e) => e.name)}
-            onClose={() => setCreating(false)}
-            onCreated={(name) => {
-              setCreating(false);
-              setEpoch((e) => e + 1);
-              nav(environmentHref(props.org, name));
-            }}
-          />
-        </Portal>
+        <CreateDialog
+          org={props.org}
+          taken={rows().map((e) => e.name)}
+          onClose={() => setCreating(false)}
+          onCreated={(name) => {
+            setCreating(false);
+            setEpoch((e) => e + 1);
+            nav(environmentHref(props.org, name));
+          }}
+        />
       </Show>
     </div>
   );
@@ -136,9 +141,20 @@ function EnvironmentRow(props: { org: string; env: OrgEnvironment }) {
     <li class="tok">
       <div class="tok-head">
         <Icon icon="rocket" size={15} />
-        <A href={environmentHref(props.org, env().name)} class="tok-name mono oenv-link">
-          {env().name}
+        <A
+          href={environmentHref(props.org, env().name)}
+          class="tok-name oenv-link"
+          classList={{ mono: nameBeside(env()) === null }}
+        >
+          {shownName(env())}
         </A>
+        <Show when={nameBeside(env())}>
+          {(name) => (
+            <span class="oenv-name mono" title="The name pipelines use">
+              {name()}
+            </span>
+          )}
+        </Show>
         <Show when={isPermissive(env().protection)}>
           <span class="tok-role" title="No org-wide rule protects this place yet, only each project's own overlay">
             permissive baseline
@@ -153,7 +169,7 @@ function EnvironmentRow(props: { org: string; env: OrgEnvironment }) {
           <Icon icon="shield-check" size={12} />
           {isPermissive(env().protection) ? "no baseline rule" : rulesSummary(env().protection)}
         </span>
-        <span title="Eligibility: which projects may deploy here">
+        <span title="Eligibility: the projects that may use it">
           <Icon icon="user" size={12} />
           {eligibilityLabel(env().eligibility)}
         </span>
@@ -166,9 +182,9 @@ function EnvironmentRow(props: { org: string; env: OrgEnvironment }) {
   );
 }
 
-/** Create an Environment: its name and description. The name is fixed once it
- *  exists: it is the key every pipeline's `environment:` names. The rest is
- *  set on its edit page. */
+/** Create an Environment: its name, display name and description. The name is
+ *  fixed once it exists: it is the key every pipeline's `environment:` names.
+ *  The rest is set on its edit page. */
 function CreateDialog(props: {
   org: string;
   /** Names already registered: a create must not silently replace one. */
@@ -177,27 +193,21 @@ function CreateDialog(props: {
   onCreated: (name: string) => void;
 }) {
   const [name, setName] = createSignal("");
+  const [displayName, setDisplayName] = createSignal("");
   const [description, setDescription] = createSignal("");
   const [saving, setSaving] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
-
-  onMount(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") props.onClose();
-    };
-    document.addEventListener("keydown", onKey);
-    onCleanup(() => document.removeEventListener("keydown", onKey));
-  });
 
   const nameProblem = () => {
     const n = name();
     if (props.taken.includes(n)) return `${n} is already registered. Open it to change it.`;
     return nameError(n);
   };
+  const displayProblem = () => displayNameError(displayName());
 
   const save = async () => {
-    const body = toPutBody({ description: description() }).body;
-    if (nameProblem() || saving()) return;
+    const body = toPutBody({ displayName: displayName(), description: description() }).body;
+    if (nameProblem() || displayProblem() || saving()) return;
     setSaving(true);
     setError(null);
     try {
@@ -211,60 +221,56 @@ function CreateDialog(props: {
   };
 
   return (
-    <div class="modal-scrim" onClick={props.onClose}>
-      <div class="modal modal-tall" onClick={(e) => e.stopPropagation()}>
-        <div class="panel-h">
-          <span>New environment</span>
-        </div>
-        <div class="modal-body">
-          <div class="form-r">
-            <label for="new-env-name">name</label>
-            <input
-              id="new-env-name"
-              class="input mono"
-              placeholder="production, staging, prod-eu"
-              value={name()}
-              onInput={(e) => setName(e.currentTarget.value)}
-              autofocus
-            />
-            <p class="fieldnote">
-              Exactly the name pipelines use; case matters. It cannot be changed later.
-            </p>
-          </div>
-
-          <div class="form-r">
-            <label for="new-env-description">description</label>
-            <input
-              id="new-env-description"
-              class="input"
-              placeholder="what lands here, who runs it"
-              value={description()}
-              onInput={(e) => setDescription(e.currentTarget.value)}
-            />
-          </div>
-          <p class="fieldnote">
-            A new environment has no baseline rule and admits no project. Set both on its page.
-          </p>
-        </div>
-
-        <div class="modal-foot">
-          <Show when={name() && nameProblem()}>
-            <p class="error">{nameProblem()}</p>
-          </Show>
+    <Modal
+      eyebrow={`${props.org} · environments`}
+      title="New environment"
+      purpose="A place deploys land, under the name pipelines use for it."
+      busy={saving()}
+      onClose={props.onClose}
+      after={{
+        label: "after creating",
+        value: "A new environment has no baseline rule and admits no project. Set both on its page.",
+      }}
+      footer={
+        <>
           <Show when={error()}>
-            <p class="error">{error()}</p>
+            <ModalMessage>{error()}</ModalMessage>
           </Show>
-          <div class="modal-actions">
-            <button class="btn btn-primary" disabled={!!nameProblem() || saving()} onClick={save}>
-              {saving() ? "Creating…" : "Create environment"}
-            </button>
-            <button class="btn btn-ghost" onClick={props.onClose}>
-              Cancel
-            </button>
-          </div>
-        </div>
-      </div>
-    </div>
+          <button class="btn btn-ghost" type="button" onClick={props.onClose} disabled={saving()}>
+            Cancel
+          </button>
+          <button
+            class="btn btn-primary"
+            type="button"
+            disabled={!!nameProblem() || !!displayProblem() || saving()}
+            onClick={save}
+          >
+            {saving() ? "Creating…" : "Create environment"}
+          </button>
+        </>
+      }
+    >
+      <Field
+        id="new-env-name"
+        label="Name"
+        required
+        help="Exactly the name pipelines use; case matters. It cannot be changed later."
+        error={name() ? nameProblem() : null}
+      >
+        <Input mono autofocus placeholder="production, staging, prod-eu" value={name()} onValue={setName} />
+      </Field>
+      <Field
+        id="new-env-display-name"
+        label="Display name"
+        help="What lists and headings show. Blank shows the name. Can be changed later."
+        error={displayProblem()}
+      >
+        <Input placeholder="Production (EU)" value={displayName()} onValue={setDisplayName} />
+      </Field>
+      <Field id="new-env-description" label="Description">
+        <Input placeholder="what lands here, who runs it" value={description()} onValue={setDescription} />
+      </Field>
+    </Modal>
   );
 }
 

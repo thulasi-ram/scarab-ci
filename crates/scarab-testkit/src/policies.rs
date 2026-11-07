@@ -163,6 +163,18 @@ impl PolicyStore for InMemoryPolicies {
         Ok(out)
     }
 
+    async fn list_in_org(&self, org: &str) -> Result<Vec<StoredPolicy>, PolicyStoreError> {
+        let st = self.state.lock().unwrap();
+        let mut out: Vec<StoredPolicy> = st
+            .policies
+            .values()
+            .filter(|p| !p.deleted && p.scope.org() == org)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| (a.scope.project(), &a.name).cmp(&(b.scope.project(), &b.name)));
+        Ok(out)
+    }
+
     async fn versions(&self, id: &str) -> Result<Vec<PolicyVersion>, PolicyStoreError> {
         Ok(self
             .state

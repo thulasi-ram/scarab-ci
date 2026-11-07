@@ -980,6 +980,16 @@ pub static ENVIRONMENT_DELETE: Op = op(
     &[],
     &["path:org", "path:env"],
 );
+pub static ENVIRONMENT_DUPLICATE: Op = op(
+    "environment.duplicate",
+    "Duplicate an Environment",
+    Class::CrownJewel(W),
+    "§3 secret writes; EnvironmentProjectEligibility (copies both)",
+    ADMIN,
+    OrgOf::Path("org"),
+    &[],
+    &["path:org", "path:env"],
+);
 pub static OVERLAY_DELETE: Op = op(
     "environment.overlay.delete",
     "Delete a project's Environment overlay",
@@ -1196,8 +1206,8 @@ pub static ENVIRONMENT_PUT: Op = op(
     "environment.put",
     "Write an Environment",
     Class::NotGoverned(
-        "a name and a description; the deployment sources it once governed (E3) went with \
-         ADR-0074",
+        "a name, a display name and a description; the deployment sources it once governed \
+         (E3) went with ADR-0074",
     ),
     "§3 not on the list",
     ADMIN,

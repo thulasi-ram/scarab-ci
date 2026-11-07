@@ -1,14 +1,14 @@
 //! ADR-0065 s1 — the `cache_entries` mapping against REAL Postgres (the
 //! adapter's SQL is the thing under test; the in-memory twin proves the
 //! engine, this proves the store): project scoping, the upsert refresh, and
-//! the PR-context predicate over the origin columns. Skips cleanly when
+//! the Run's cache scope columns. Skips cleanly when
 //! `SCARAB_TEST_DATABASE_URL` is unset.
 
 mod common;
 
 use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
-use scarab_engine::{AttemptId, Db, RunId, StepId, Timestamp};
+use scarab_engine::{AttemptId, CacheScope, Db, RunId, StepId, Timestamp};
 
 /// Tenancy isolation at the SQL grain (dbe05e5 mandatory test): project B
 /// never resolves project A's rows; the upsert refreshes in place (one row
@@ -86,41 +86,49 @@ async fn cache_rows_are_project_scoped_and_upserts_refresh_in_place() {
     db.cleanup().await;
 }
 
-/// The PR-context predicate over the real origin columns (dbe05e5 amendment
-/// #1): pull_request kind OR a stamped PR number ⇒ true; a push with neither
-/// ⇒ false; an unstamped/unknown run ⇒ false (nothing to deny writes FOR —
-/// such runs are untenanted and never reach the upsert anyway).
+/// The cache scope round-trips through the real `runs` columns (git-bug
+/// efcec77): a ref scope with its default-branch fallback, an Environment
+/// scope with none, and no scope at all for a Run that was never stamped
+/// (its Cache is off) or does not exist.
 #[tokio::test]
-async fn run_pr_context_reads_the_origin_columns() {
+async fn the_cache_scope_round_trips_through_the_run_row() {
     let Some(db) = fresh_db().await else { return };
     let pg = PostgresDb::with_pool(db.pool.clone());
     pg.migrate().await.expect("migrate");
 
-    let push = RunId("run-push".into());
     let pr = RunId("run-pr".into());
-    let odd = RunId("run-odd".into());
-    for run in [&push, &pr, &odd] {
+    let deploy = RunId("run-deploy".into());
+    let unstamped = RunId("run-unstamped".into());
+    for run in [&pr, &deploy, &unstamped] {
         pg.create_run(run, 1, 1, Timestamp(0)).await.expect("run");
     }
-    pg.set_run_origin(&push, "push", Some("dev"), Some("main"), Some("abc"), None, None)
+    let pr_scope = CacheScope {
+        own: "refs/pull/41/head".into(),
+        fallback: Some("refs/heads/main".into()),
+    };
+    let deploy_scope = CacheScope {
+        own: "env:prod".into(),
+        fallback: None,
+    };
+    pg.set_run_cache_scope(&pr, &pr_scope).await.expect("stamp");
+    pg.set_run_cache_scope(&deploy, &deploy_scope)
         .await
-        .expect("origin");
-    pg.set_run_origin(&pr, "pull_request", Some("dev"), None, Some("abc"), Some(41), None)
-        .await
-        .expect("origin");
-    // A defensive shape: some other kind, but a PR number stamped.
-    pg.set_run_origin(&odd, "manual", None, None, None, Some(9), None)
-        .await
-        .expect("origin");
+        .expect("stamp");
 
-    assert!(!pg.run_pr_context(&push).await.expect("push"));
-    assert!(pg.run_pr_context(&pr).await.expect("pr"));
-    assert!(pg.run_pr_context(&odd).await.expect("odd"));
-    assert!(
-        !pg.run_pr_context(&RunId("never-created".into()))
+    assert_eq!(pg.run_cache_scope(&pr).await.expect("pr"), Some(pr_scope));
+    assert_eq!(
+        pg.run_cache_scope(&deploy).await.expect("deploy"),
+        Some(deploy_scope)
+    );
+    assert_eq!(
+        pg.run_cache_scope(&unstamped).await.expect("unstamped"),
+        None
+    );
+    assert_eq!(
+        pg.run_cache_scope(&RunId("never-created".into()))
             .await
             .expect("absent"),
-        "an unknown run is not a PR context (and never reaches the upsert)"
+        None
     );
 
     db.cleanup().await;

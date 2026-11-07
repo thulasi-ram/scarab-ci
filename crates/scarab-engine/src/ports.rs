@@ -757,13 +757,19 @@ pub trait Db: Send + Sync {
         key: &str,
     ) -> Result<Vec<(String, String)>, DbError>;
 
-    /// Was this run triggered in a **pull-request context** (any PR, fork or
-    /// not — from the ADR-0057 origin facts)? Gates cache-entry WRITES
-    /// (dbe05e5 amendment #1): push rights already imply pipeline-edit
-    /// rights, so branch-push writes add no capability, but a PR head — even
-    /// a same-repo one — must not poison the mapping other runs restore from.
-    /// Reads stay allowed for every context, forks included.
-    async fn run_pr_context(&self, run: &RunId) -> Result<bool, DbError>;
+    /// Stamp the Run's [`crate::CacheScope`], once at creation, beside the
+    /// origin facts it is derived from. Fixed for the life of the Run, so a
+    /// rerun or retry keys its Cache as the first launch did.
+    async fn set_run_cache_scope(
+        &self,
+        run: &RunId,
+        scope: &crate::CacheScope,
+    ) -> Result<(), DbError>;
+
+    /// The Run's cache scope, or `None` when it has none (no ref and no
+    /// Environment, a Run created before scopes were stored, or an unknown
+    /// Run). A Run with no scope has its Cache off.
+    async fn run_cache_scope(&self, run: &RunId) -> Result<Option<crate::CacheScope>, DbError>;
 
     /// How many runs are in-flight (started, not terminal). With `project`,
     /// scoped to that project (fairness cap); without, the global count
@@ -921,6 +927,16 @@ pub trait Db: Send + Sync {
         filter: &RunListFilter,
         limit: u32,
     ) -> Result<Vec<RunSummary>, DbError>;
+
+    /// The Projects of `org` whose Runs named `environment` — every Run
+    /// carrying that deploy context, whatever its status — sorted.
+    /// Read from Run history, so it names the Projects whose Pipeline YAML
+    /// named the Environment, including ones no longer eligible for it.
+    async fn projects_with_runs_in(
+        &self,
+        org: &str,
+        environment: &str,
+    ) -> Result<Vec<String>, DbError>;
 
     /// Record a refused Run creation (ADR-0076).
     async fn record_refused_run(&self, refused: &crate::RefusedRun) -> Result<(), DbError>;
@@ -1598,7 +1614,9 @@ pub trait Executor: Send + Sync {
     /// whichever replica minted it, and a long-lived token does not stay
     /// stored for as long as the unit is kept. On k8s that is the per-Pod
     /// token Secret. `Ok(None)`: the unit holds none, or it was taken
-    /// already. A backend that never mounts one answers `Ok(None)`.
+    /// already. A backend that never mounts one answers `Ok(None)`. A
+    /// backend also removes the unit's other stored secret values here: on
+    /// k8s, the per-Pod Secret that holds the Step's own secrets.
     ///
     /// **Deliberately REQUIRED — no default**, for the reason spelled out on
     /// [`workspace_provisioning`](Self::workspace_provisioning): a decorator
