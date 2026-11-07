@@ -922,11 +922,11 @@ pub trait Db: Send + Sync {
         limit: u32,
     ) -> Result<Vec<RunSummary>, DbError>;
 
-    /// The Projects of `org` whose Runs deployed into `environment` — every
-    /// Run carrying that deploy context, whatever its status — sorted.
+    /// The Projects of `org` whose Runs named `environment` — every Run
+    /// carrying that deploy context, whatever its status — sorted.
     /// Read from Run history, so it names the Projects whose Pipeline YAML
     /// named the Environment, including ones no longer eligible for it.
-    async fn projects_deploying_to(
+    async fn projects_with_runs_in(
         &self,
         org: &str,
         environment: &str,

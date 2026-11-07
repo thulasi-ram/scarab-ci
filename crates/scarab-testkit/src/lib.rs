@@ -1824,7 +1824,7 @@ impl Db for InMemoryDb {
         Ok(out)
     }
 
-    async fn projects_deploying_to(
+    async fn projects_with_runs_in(
         &self,
         org: &str,
         environment: &str,

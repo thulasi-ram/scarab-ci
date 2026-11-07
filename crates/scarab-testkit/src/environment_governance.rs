@@ -10,16 +10,16 @@
 //!
 //! [`with_migrated_legacy_environment`]: InMemoryEnvironmentGovernance::with_migrated_legacy_environment
 
-use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use scarab_project::{
     migrate_legacy_environment, DeployGovernance, Environment, EnvironmentGovernanceStore,
     EnvironmentMigrationAcknowledgement, EnvironmentMigrationReport,
-    EnvironmentMigrationReportProject, EnvironmentProjectEligibility, EnvironmentProjectOverlay,
-    EnvironmentProjectPrivilegeGrant, EnvironmentProjectRecord, EnvironmentProtectionRules,
-    OrgEnvironment, OrgEnvironmentError, ProtectionRules,
+    EnvironmentMigrationReportProject, EnvironmentNameClaim, EnvironmentProjectEligibility,
+    EnvironmentProjectOverlay, EnvironmentProjectPrivilegeGrant, EnvironmentProjectRecord,
+    EnvironmentProtectionRules, OrgEnvironment, OrgEnvironmentError, ProtectionRules,
 };
 
 type EnvironmentKey = (String, String);
@@ -50,6 +50,21 @@ struct State {
 #[derive(Default)]
 pub struct InMemoryEnvironmentGovernance {
     state: Mutex<State>,
+    /// The names a Duplicate holds a claim on, as the Postgres store's
+    /// advisory locks.
+    claims: Arc<Mutex<BTreeSet<EnvironmentKey>>>,
+}
+
+/// One held name claim: removed from the set when dropped.
+struct HeldClaim {
+    claims: Arc<Mutex<BTreeSet<EnvironmentKey>>>,
+    key: EnvironmentKey,
+}
+
+impl Drop for HeldClaim {
+    fn drop(&mut self) {
+        self.claims.lock().unwrap().remove(&self.key);
+    }
 }
 
 /// Eligibility as stored: patterns sorted (and, for comparison, deduped).
@@ -441,6 +456,21 @@ impl EnvironmentGovernanceStore for InMemoryEnvironmentGovernance {
                 project.to_string(),
             ))
             .is_some())
+    }
+
+    async fn claim_environment_name(
+        &self,
+        org: &str,
+        name: &str,
+    ) -> Result<Option<EnvironmentNameClaim>, OrgEnvironmentError> {
+        let key = (org.to_string(), name.to_string());
+        if !self.claims.lock().unwrap().insert(key.clone()) {
+            return Ok(None);
+        }
+        Ok(Some(EnvironmentNameClaim::new(HeldClaim {
+            claims: self.claims.clone(),
+            key,
+        })))
     }
 
     async fn duplicate_environment(

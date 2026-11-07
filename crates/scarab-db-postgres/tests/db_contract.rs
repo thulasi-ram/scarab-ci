@@ -849,7 +849,7 @@ contract_test!(
 /// The Projects whose Runs deployed into an Environment, from Run history
 /// (git-bug d002a0c): one name per Project, sorted, any status, only that
 /// Environment's and only that org's.
-async fn projects_deploying_to_reads_run_history(db: &dyn Db) {
+async fn projects_with_runs_in_reads_run_history(db: &dyn Db) {
     let deploy = |org: &str, project: &str, environment: &str| scarab_engine::DeployContext {
         org: org.into(),
         project: project.into(),
@@ -872,21 +872,21 @@ async fn projects_deploying_to_reads_run_history(db: &dyn Db) {
         }
     }
     assert_eq!(
-        db.projects_deploying_to("acme", "prod").await.unwrap(),
+        db.projects_with_runs_in("acme", "prod").await.unwrap(),
         ["api", "web"]
     );
     assert_eq!(
-        db.projects_deploying_to("acme", "staging").await.unwrap(),
+        db.projects_with_runs_in("acme", "staging").await.unwrap(),
         ["jobs"]
     );
     assert!(db
-        .projects_deploying_to("acme", "nowhere")
+        .projects_with_runs_in("acme", "nowhere")
         .await
         .unwrap()
         .is_empty());
 }
 
 contract_test!(
-    projects_deploying_to_contract,
-    projects_deploying_to_reads_run_history
+    projects_with_runs_in_contract,
+    projects_with_runs_in_reads_run_history
 );

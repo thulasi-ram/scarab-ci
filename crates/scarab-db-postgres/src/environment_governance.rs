@@ -11,9 +11,9 @@ use sqlx::Row;
 use scarab_project::{
     validate_org_environment_display_name, validate_org_environment_name, DeployGovernance,
     EnvironmentGovernanceStore, EnvironmentMigrationAcknowledgement, EnvironmentMigrationReport,
-    EnvironmentMigrationReportProject, EnvironmentProjectEligibility, EnvironmentProjectOverlay,
-    EnvironmentProjectPrivilegeGrant, EnvironmentProjectRecord, EnvironmentProtectionRules,
-    ImageGrant, OrgEnvironment, OrgEnvironmentError, ProtectionRules,
+    EnvironmentMigrationReportProject, EnvironmentNameClaim, EnvironmentProjectEligibility,
+    EnvironmentProjectOverlay, EnvironmentProjectPrivilegeGrant, EnvironmentProjectRecord,
+    EnvironmentProtectionRules, ImageGrant, OrgEnvironment, OrgEnvironmentError, ProtectionRules,
 };
 
 use crate::org_environments::{
@@ -801,6 +801,33 @@ impl EnvironmentGovernanceStore for PostgresDb {
         .rows_affected();
         Ok(deleted > 0)
     }
+    async fn claim_environment_name(
+        &self,
+        org: &str,
+        name: &str,
+    ) -> Result<Option<EnvironmentNameClaim>, OrgEnvironmentError> {
+        // A transaction-scoped advisory lock, so every server replica sees
+        // the same claim. The key is a 64-bit hash of the org and the name
+        // (length-prefixed, so no two pairs share a string); a collision
+        // costs a spurious 409, never a lost write. `try` rather than wait:
+        // a waiter would hold a pooled connection the holder may need.
+        // Dropping the transaction rolls it back when its connection goes
+        // back to the pool, which releases the lock.
+        let mut tx = self
+            .pool()
+            .begin()
+            .await
+            .map_err(org_environment_store_err)?;
+        let key = format!("scarab environment name {}:{org}{name}", org.len());
+        let locked: bool =
+            sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0))")
+                .bind(key)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(org_environment_store_err)?;
+        Ok(locked.then(|| EnvironmentNameClaim::new(tx)))
+    }
+
     async fn duplicate_environment(
         &self,
         org: &str,

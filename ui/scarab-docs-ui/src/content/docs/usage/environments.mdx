@@ -61,17 +61,18 @@ and the OIDC subject a Run presents to a cloud provider contains it
 
 The **display name** is what lists, headings and pickers show, with the name beside it, for
 example *Production (EU) · prod*. It is optional (blank shows the name) and an org admin can
-change it at any time without a step-up.
+change it at any time without a step-up. It may not hold control characters, or invisible bidi
+or zero-width characters that would make it read as another name.
 
 ## Duplicate an Environment
 
 To move to another name, use **Duplicate** on the Environment's page. It asks for the new name and,
-optionally, a display name (blank uses the old one's with " (copy)" added), and needs a step-up
-every time, because it copies secrets and the projects that may use it. The new Environment gets:
+optionally, a display name (blank uses the old one's with " (copy)" added), and needs a step-up,
+because it copies secrets and the projects that may use it. The new Environment gets:
 
 - the baseline protection rules and eligibility;
 - every project's overlay and privilege grant;
-- the Environment's secrets, with their values.
+- the Environment's secrets set per project, with their values.
 
 The old Environment is not changed; it stays until an admin deletes it. Run and approval history
 and the Cache stay with it. When the copy is made, the page lists what it did not copy:
@@ -82,7 +83,8 @@ and the Cache stay with it. When the copy is made, the page lists what it did no
 
 If the copy fails part-way, nothing is left behind: the secrets are copied first and removed
 again if the Environment cannot be created. A name already in use, or secrets already stored
-under the new name, is refused (409).
+under the new name, is refused (409). So is a second Duplicate to a name while the first is still
+running, before it writes anything.
 
 ## The rules it holds
 

@@ -1913,7 +1913,7 @@
           "Environments"
         ],
         "summary": "Duplicate an org Environment, its rules, eligibility, overlays, grants and secrets",
-        "description": "Not copied, and listed in the answer: Policies that select the old\nEnvironment and not the new one, the Projects whose Pipelines name the\nold one (from Run history), and the OIDC subject cloud trust policies\nmatch. Run and approval history and the Cache stay with the old\nEnvironment, which is not changed.\n\nThe secret store is a separate store from the Environment's, so the two\ncannot share a transaction. The secrets are copied first; the\nEnvironment, its eligibility, overlays and grants are then created in\none transaction. If either step fails, the copied secrets are deleted, so\nno partial Environment is left. A crash between the two leaves only\nsecrets under a name no Environment has, which no Run can resolve and\nwhich a retry refuses (409) until an admin deletes them.",
+        "description": "Not copied, and listed in the answer: Policies that select the old\nEnvironment and not the new one, the Projects whose Pipelines name the\nold one (from Run history), and the OIDC subject cloud trust policies\nmatch. Run and approval history and the Cache stay with the old\nEnvironment, which is not changed.\n\nThe secret store is a separate store from the Environment's, so the two\ncannot share a transaction. The secrets are copied first; the\nEnvironment, its eligibility, overlays and grants are then created in\none transaction. If either step fails, the copied secrets are deleted, so\nno partial Environment is left. A crash between the two leaves only\nsecrets under a name no Environment has, which no Run can resolve and\nwhich a retry refuses (409) until an admin deletes them. The new name is\nclaimed throughout, and a second Duplicate to it is refused (409) before\nit writes anything, so two Duplicates never both write secrets under it.",
         "operationId": "duplicate_org_environment",
         "parameters": [
           {
@@ -1973,7 +1973,7 @@
             "description": "no such Environment, or not configured"
           },
           "409": {
-            "description": "the new name is taken, or secrets already exist under it"
+            "description": "the new name is taken, secrets already exist under it, or another duplicate to it is in progress"
           },
           "429": {
             "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
@@ -9419,7 +9419,7 @@
             "items": {
               "type": "string"
             },
-            "description": "Projects whose Runs deployed into the old Environment (from Run\nhistory): their Pipeline YAML names it, and deploys into the new one\nonly once it is changed."
+            "description": "Projects whose Runs named the old Environment (from Run history):\ntheir Pipeline YAML names it, and runs in the new one only once it is\nchanged."
           }
         }
       },
