@@ -393,6 +393,12 @@ pub(crate) async fn get_org_environment(
 /// Create or replace an Environment: its display name and description.
 /// Administer on the Org
 /// (ADR-0071 §7: org admins administer Environments).
+///
+/// A create takes the same claim on the name a Duplicate holds, and is
+/// refused (409) while a Duplicate to that name is in progress: that
+/// Duplicate has checked the name is free and may be writing secrets under
+/// it, and its cleanup deletes what it wrote by name. A replace of an
+/// existing Environment takes no claim.
 #[utoipa::path(
     put,
     path = "/v1/orgs/{org}/environments/{env}",
@@ -406,7 +412,8 @@ pub(crate) async fn get_org_environment(
         (status = 200, body = OrgEnvironmentDto),
         (status = 400, description = "invalid name, display name or description, or an unknown field"),
         (status = 403, description = "not an org admin"),
-        (status = 404, description = "org Environments not configured")
+        (status = 404, description = "org Environments not configured"),
+        (status = 409, description = "a create while a duplicate to the name is in progress")
     )
 )]
 pub(crate) async fn put_org_environment(
@@ -434,6 +441,30 @@ pub(crate) async fn put_org_environment(
         updated_by: principal.subject,
     };
     environment.validate().map_err(org_environment_api_error)?;
+    // Held to the end of this function, through the write. Only a create
+    // claims: a Duplicate never writes under a name that exists.
+    let _claim = match st.environment_governance.as_deref() {
+        Some(governance)
+            if store
+                .get_org_environment(&environment.org, &environment.name)
+                .await
+                .map_err(org_environment_api_error)?
+                .is_none() =>
+        {
+            let Some(claim) = governance
+                .claim_environment_name(&environment.org, &environment.name)
+                .await
+                .map_err(org_environment_api_error)?
+            else {
+                return Err(ApiError::Conflict(format!(
+                    "a duplicate to environment `{}` is in progress; retry when it has finished",
+                    environment.name
+                )));
+            };
+            Some(claim)
+        }
+        _ => None,
+    };
     crate::note_org(&st, &environment.org).await?;
     let stored = store
         .put_org_environment(&environment)
@@ -643,8 +674,9 @@ async fn remove_copied_secrets(
 /// no partial Environment is left. A crash between the two leaves only
 /// secrets under a name no Environment has, which no Run can resolve and
 /// which a retry refuses (409) until an admin deletes them. The new name is
-/// claimed throughout, and a second Duplicate to it is refused (409) before
-/// it writes anything, so two Duplicates never both write secrets under it.
+/// claimed throughout: a second Duplicate to it is refused (409) before it
+/// writes anything, and so is a create of it by the Environment PUT, so no
+/// other Environment takes the name while this one's secrets are written.
 #[utoipa::path(
     post,
     path = "/v1/orgs/{org}/environments/{env}/duplicate",
@@ -659,7 +691,7 @@ async fn remove_copied_secrets(
         (status = 400, description = "invalid name or display name, or an unknown field"),
         (status = 403, description = "not an org admin, or no step-up"),
         (status = 404, description = "no such Environment, or not configured"),
-        (status = 409, description = "the new name is taken, secrets already exist under it, or another duplicate to it is in progress")
+        (status = 409, description = "the new name is taken, secrets already exist under it, or another duplicate to it or a create of it is in progress")
     )
 )]
 pub(crate) async fn duplicate_org_environment(
@@ -682,7 +714,8 @@ pub(crate) async fn duplicate_org_environment(
     // Held to the end of this function: from the checks below through the
     // secret writes, the Environment's transaction and any cleanup. A second
     // Duplicate to the same name is refused here, before it writes anything,
-    // so a loser's cleanup never deletes secrets the winner's Environment
+    // and a create of the name by the PUT is refused while this is held, so
+    // the cleanup never deletes secrets another Environment of the name
     // holds.
     let Some(_claim) = store
         .claim_environment_name(&org, &new_name)
@@ -690,7 +723,7 @@ pub(crate) async fn duplicate_org_environment(
         .map_err(org_environment_api_error)?
     else {
         return Err(ApiError::Conflict(format!(
-            "another duplicate to environment `{new_name}` is in progress"
+            "another duplicate to environment `{new_name}`, or a create of it, is in progress"
         )));
     };
     if store

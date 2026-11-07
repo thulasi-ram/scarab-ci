@@ -984,8 +984,10 @@ pub trait EnvironmentGovernanceStore: Send + Sync {
     /// other's Environment relies on. Dropping the claim releases it,
     /// whether the Duplicate succeeded, failed or was abandoned.
     ///
-    /// The claim excludes other claims only: a plain create of `name` does
-    /// not take it, which [`duplicate_environment`](Self::duplicate_environment)
+    /// The claim excludes other claims only. The server's create of an
+    /// Environment takes it too, so a create and a Duplicate to one name
+    /// exclude each other; a caller that writes the store without it can
+    /// still take the name, which [`duplicate_environment`](Self::duplicate_environment)
     /// answers with [`OrgEnvironmentError::Conflict`].
     async fn claim_environment_name(
         &self,

@@ -234,7 +234,8 @@ record. Read Breaking changes before you upgrade.
   grant, and its secrets with their values, and lists what it did not copy: the projects whose
   Runs used it, the policies that name it, and the OIDC subject cloud trust policies match. The
   old Environment is not changed. A second Duplicate to a name already being duplicated to is
-  refused (409) before it writes anything. A display name may not hold invisible bidi or
+  refused (409) before it writes anything, and so is creating that name with
+  `PUT /v1/orgs/{org}/environments/{env}` while the Duplicate runs. A display name may not hold invisible bidi or
   zero-width characters. Migration 0080 adds the display name column (git-bug d002a0c).
   [Environments](https://thulasi-ram.github.io/scarab-ci/usage/environments/#duplicate-an-environment)
 - **Approval gate settings on the Environment page.** The edit page has an **Approval gate**
