@@ -443,9 +443,9 @@ pub struct DuplicatePolicyDto {
 pub struct DuplicateNotCopiedDto {
     /// Policies that apply to the old Environment and not to the new one.
     pub policies: Vec<DuplicatePolicyDto>,
-    /// Projects whose Runs deployed into the old Environment (from Run
-    /// history): their Pipeline YAML names it, and deploys into the new one
-    /// only once it is changed.
+    /// Projects whose Runs named the old Environment (from Run history):
+    /// their Pipeline YAML names it, and runs in the new one only once it is
+    /// changed.
     pub projects_with_runs: Vec<String>,
     /// The OIDC subject a Run in the old Environment presents
     /// (`*` for the repository and the ref).
@@ -473,6 +473,17 @@ fn oidc_subject_pattern(org: &str, env: &str) -> String {
     format!("scarab:org/{org}/repo/*/env/{env}/ref/*")
 }
 
+/// Whether a Duplicate copies the secrets of a scope. The match lists every
+/// [`scarab_secrets::SecretScope`], so a new scope (an org-wide Environment
+/// scope, say) does not compile here until someone decides whether a
+/// Duplicate copies it, and [`environment_secrets`] reads it.
+fn copied_by_duplicate(scope: &scarab_secrets::SecretScope) -> bool {
+    match scope {
+        scarab_secrets::SecretScope::EnvironmentProject { .. } => true,
+        scarab_secrets::SecretScope::Org { .. } | scarab_secrets::SecretScope::Repo { .. } => false,
+    }
+}
+
 /// Every secret in `env`'s EnvironmentProjectSecretScopes, value included,
 /// by Project and key.
 async fn environment_secrets(
@@ -491,6 +502,7 @@ async fn environment_secrets(
             project: project.clone(),
             environment: env.to_string(),
         };
+        debug_assert!(copied_by_duplicate(&scope));
         let mut keys = secrets
             .list_scoped(&scope)
             .await
@@ -525,8 +537,8 @@ async fn remove_copied_secrets(
 /// Create a new Environment as a copy of `env`: its description, baseline
 /// protection rules, eligibility, every Project's overlay and privilege
 /// grant, and its EnvironmentProjectSecretScope secrets with their values.
-/// Administer on the Org, and a step-up every time: it copies secrets and
-/// who may deploy.
+/// Administer on the Org, and a step-up (an open window is enough): it
+/// copies secrets and who may deploy.
 ///
 /// Not copied, and listed in the answer: Policies that select the old
 /// Environment and not the new one, the Projects whose Pipelines name the
@@ -540,7 +552,9 @@ async fn remove_copied_secrets(
 /// one transaction. If either step fails, the copied secrets are deleted, so
 /// no partial Environment is left. A crash between the two leaves only
 /// secrets under a name no Environment has, which no Run can resolve and
-/// which a retry refuses (409) until an admin deletes them.
+/// which a retry refuses (409) until an admin deletes them. The new name is
+/// claimed throughout, and a second Duplicate to it is refused (409) before
+/// it writes anything, so two Duplicates never both write secrets under it.
 #[utoipa::path(
     post,
     path = "/v1/orgs/{org}/environments/{env}/duplicate",
@@ -555,7 +569,7 @@ async fn remove_copied_secrets(
         (status = 400, description = "invalid name or display name, or an unknown field"),
         (status = 403, description = "not an org admin, or no step-up"),
         (status = 404, description = "no such Environment, or not configured"),
-        (status = 409, description = "the new name is taken, or secrets already exist under it")
+        (status = 409, description = "the new name is taken, secrets already exist under it, or another duplicate to it is in progress")
     )
 )]
 pub(crate) async fn duplicate_org_environment(
@@ -575,6 +589,20 @@ pub(crate) async fn duplicate_org_environment(
         None => duplicate_display_name(&source),
     };
     validate_org_environment_display_name(&display_name).map_err(org_environment_api_error)?;
+    // Held to the end of this function: from the checks below through the
+    // secret writes, the Environment's transaction and any cleanup. A second
+    // Duplicate to the same name is refused here, before it writes anything,
+    // so a loser's cleanup never deletes secrets the winner's Environment
+    // holds.
+    let Some(_claim) = store
+        .claim_environment_name(&org, &new_name)
+        .await
+        .map_err(org_environment_api_error)?
+    else {
+        return Err(ApiError::Conflict(format!(
+            "another duplicate to environment `{new_name}` is in progress"
+        )));
+    };
     if store
         .org_environment(&org, &new_name)
         .await
@@ -632,7 +660,7 @@ pub(crate) async fn duplicate_org_environment(
             .collect(),
         None => Vec::new(),
     };
-    let projects_with_runs = st.db.projects_deploying_to(&org, &env).await?;
+    let projects_with_runs = st.db.projects_with_runs_in(&org, &env).await?;
 
     // The secrets first (a separate store), then the Environment in one
     // transaction; either failing removes the copied secrets.
@@ -711,10 +739,18 @@ pub(crate) async fn duplicate_org_environment(
         projects_with_runs,
         old_oidc_subject: oidc_subject_pattern(&org, &env),
         new_oidc_subject: oidc_subject_pattern(&org, &new_name),
-        notes: vec![format!(
-            "Run and approval history and the Cache stay with {env}, which is not changed and \
-             stays until an admin deletes it."
-        )],
+        notes: vec![
+            format!(
+                "Run and approval history and the Cache stay with {env}, which is not changed \
+                 and stays until an admin deletes it."
+            ),
+            "Only Environment secrets set per Project are copied: org-wide Environment secrets \
+             are not built yet."
+                .to_string(),
+            "PluginConnections are not scoped to an Environment yet, so none is copied or \
+             listed."
+                .to_string(),
+        ],
     };
     Ok((
         StatusCode::CREATED,

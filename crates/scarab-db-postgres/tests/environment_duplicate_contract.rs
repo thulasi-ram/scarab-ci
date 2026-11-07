@@ -217,6 +217,37 @@ async fn a_taken_name_or_a_missing_source_changes_nothing(s: &dyn EnvironmentGov
     );
 }
 
+/// A claim on a name excludes a second claim on that name in that org, and
+/// no other; dropping it releases it. Postgres releases it when the
+/// connection goes back to the pool, a moment after the drop, so the last
+/// check waits for it.
+async fn a_claim_excludes_a_second_until_dropped(s: &dyn EnvironmentGovernanceStore) {
+    let first = s
+        .claim_environment_name("acme", "prod-eu")
+        .await
+        .unwrap()
+        .expect("the first claim");
+    assert!(s
+        .claim_environment_name("acme", "prod-eu")
+        .await
+        .unwrap()
+        .is_none());
+    let other_name = s.claim_environment_name("acme", "prod-us").await.unwrap();
+    let other_org = s.claim_environment_name("beta", "prod-eu").await.unwrap();
+    assert!(other_name.is_some() && other_org.is_some());
+
+    drop(first);
+    let mut again = None;
+    for _ in 0..100 {
+        again = s.claim_environment_name("acme", "prod-eu").await.unwrap();
+        if again.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(again.is_some(), "the claim is released once dropped");
+}
+
 macro_rules! contract_test {
     ($name:ident, $contract:ident) => {
         mod $name {
@@ -256,6 +287,94 @@ contract_test!(
     duplicate_onto_a_taken_name_changes_nothing,
     a_taken_name_or_a_missing_source_changes_nothing
 );
+contract_test!(
+    a_name_claim_is_exclusive,
+    a_claim_excludes_a_second_until_dropped
+);
+
+/// The Postgres duplicate copies every column of these tables, a column a
+/// later migration adds included; the in-memory store copies the struct's
+/// fields. A new column fails this test until someone decides whether a
+/// Duplicate carries it (an acknowledgement or a version should not), seeds
+/// it in `seed` above so the contract shows both stores agree, and adds it
+/// here.
+#[tokio::test]
+async fn duplicate_knows_every_copied_column() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = PostgresDb::with_pool(tdb.pool.clone());
+    db.migrate().await.unwrap();
+    let known: &[(&str, &[&str])] = &[
+        (
+            "org_environments",
+            &[
+                "allowed_refs",
+                "approvers",
+                "created_at",
+                "description",
+                "display_name",
+                "eligible_all_projects",
+                "name",
+                "org",
+                "require_reason",
+                "updated_at",
+                "updated_by",
+                "wait_timer_s",
+            ],
+        ),
+        (
+            "environment_project_eligibility",
+            &["environment", "org", "project_pattern"],
+        ),
+        (
+            "environment_project_overlays",
+            &[
+                "allowed_refs",
+                "approvers",
+                "environment",
+                "org",
+                "project",
+                "require_reason",
+                "updated_at",
+                "updated_by",
+                "wait_timer_s",
+            ],
+        ),
+        (
+            "environment_project_privilege_grants",
+            &[
+                "environment",
+                "org",
+                "permit_k8s_overlay",
+                "privileged_images",
+                "project",
+                "updated_at",
+                "updated_by",
+            ],
+        ),
+    ];
+    let mut stored_all = Vec::new();
+    let mut known_all = Vec::new();
+    for (table, columns) in known {
+        let mut stored: Vec<String> = sqlx::query_scalar(
+            "SELECT column_name::text FROM information_schema.columns
+             WHERE table_schema = current_schema() AND table_name = $1",
+        )
+        .bind(table)
+        .fetch_all(&tdb.pool)
+        .await
+        .unwrap();
+        stored.sort();
+        let mut columns: Vec<String> = columns.iter().map(|c| c.to_string()).collect();
+        columns.sort();
+        stored_all.push((table.to_string(), stored));
+        known_all.push((table.to_string(), columns));
+    }
+    tdb.cleanup().await;
+    assert_eq!(stored_all, known_all);
+}
 
 /// The display name round-trips and a replace without one clears it (the
 /// whole-Environment PUT is a full replace).

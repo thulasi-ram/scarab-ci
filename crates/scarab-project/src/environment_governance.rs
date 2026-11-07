@@ -628,6 +628,25 @@ impl EnvironmentMigrationReport {
 /// [`OrgEnvironmentError::Conflict`] — so a concurrent change can never slip
 /// a loosening past a write that was judged a tightening. `None` writes
 /// unconditionally, exactly as the plain form (which is that, provided).
+/// An exclusive claim on one Environment name in one org, from
+/// [`EnvironmentGovernanceStore::claim_environment_name`]. It holds whatever
+/// the store needs to keep the claim (a Postgres transaction holding an
+/// advisory lock, a set entry); dropping it releases the claim.
+pub struct EnvironmentNameClaim(Box<dyn std::any::Any + Send>);
+
+impl EnvironmentNameClaim {
+    /// A claim kept by `held`, released when `held` is dropped.
+    pub fn new(held: impl std::any::Any + Send) -> Self {
+        Self(Box::new(held))
+    }
+}
+
+impl std::fmt::Debug for EnvironmentNameClaim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("EnvironmentNameClaim")
+    }
+}
+
 #[async_trait]
 pub trait EnvironmentGovernanceStore: Send + Sync {
     /// The Environment — baseline and eligibility included — read in one
@@ -790,6 +809,23 @@ pub trait EnvironmentGovernanceStore: Send + Sync {
         environment: &str,
         project: &str,
     ) -> Result<bool, OrgEnvironmentError>;
+
+    /// Claim Environment name `name` in `org` for one Duplicate, which writes
+    /// to the secret store first and creates the Environment after (the two
+    /// cannot share a transaction). While the claim is held, a second claim
+    /// on the same name answers `None`, so two Duplicates to one name never
+    /// both write secrets under it and one's cleanup never deletes what the
+    /// other's Environment relies on. Dropping the claim releases it,
+    /// whether the Duplicate succeeded, failed or was abandoned.
+    ///
+    /// The claim excludes other claims only: a plain create of `name` does
+    /// not take it, which [`duplicate_environment`](Self::duplicate_environment)
+    /// answers with [`OrgEnvironmentError::Conflict`].
+    async fn claim_environment_name(
+        &self,
+        org: &str,
+        name: &str,
+    ) -> Result<Option<EnvironmentNameClaim>, OrgEnvironmentError>;
 
     /// Create Environment `to` in `org` as a copy of `from` (git-bug
     /// d002a0c): its description, its baseline protection rules (every

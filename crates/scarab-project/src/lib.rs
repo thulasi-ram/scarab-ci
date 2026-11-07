@@ -33,9 +33,9 @@ mod environment_governance;
 pub use environment_governance::{
     effective_protection, migrate_legacy_environment, AllowedRefConstraint, DeployGovernance,
     EffectiveProtection, EnvironmentGovernanceStore, EnvironmentMigrationAcknowledgement,
-    EnvironmentMigrationReport, EnvironmentMigrationReportProject, EnvironmentProjectEligibility,
-    EnvironmentProjectOverlay, EnvironmentProjectPrivilegeGrant, EnvironmentProjectRecord,
-    EnvironmentProtectionRules, LegacyRuleField,
+    EnvironmentMigrationReport, EnvironmentMigrationReportProject, EnvironmentNameClaim,
+    EnvironmentProjectEligibility, EnvironmentProjectOverlay, EnvironmentProjectPrivilegeGrant,
+    EnvironmentProjectRecord, EnvironmentProtectionRules, LegacyRuleField,
 };
 
 /// Which Environment governance edits loosen it (ADR-0073 §3): the pure,

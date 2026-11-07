@@ -553,6 +553,13 @@ impl EnvironmentGovernanceStore for RacingGovernance {
             .project_environment_governance(org, project)
             .await
     }
+    async fn claim_environment_name(
+        &self,
+        org: &str,
+        name: &str,
+    ) -> Result<Option<scarab_project::EnvironmentNameClaim>, OrgEnvironmentError> {
+        self.inner.claim_environment_name(org, name).await
+    }
     async fn duplicate_environment(
         &self,
         org: &str,

@@ -16,6 +16,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use axum::http::StatusCode;
 use serde_json::{json, Value};
+use tokio::sync::Notify;
 
 use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
@@ -78,6 +79,67 @@ impl SecretProvider for FailingWrites {
             .environment_secret_projects(org, environment)
             .await
     }
+}
+
+/// A secret store whose first write waits until the test lets it go: the
+/// Duplicate making it has passed its checks and holds its claim on the new
+/// name, and has written nothing yet. The test hook that puts a second
+/// request between one Duplicate's checks and its Environment's
+/// transaction.
+struct PausingWrites {
+    inner: Arc<FakeSecrets>,
+    writes: AtomicUsize,
+    /// Notified when the first write arrives.
+    paused: Arc<Notify>,
+    /// Lets the first write go on.
+    resume: Arc<Notify>,
+}
+
+#[async_trait]
+impl SecretProvider for PausingWrites {
+    async fn get(&self, scope: &SecretScope, key: &str) -> Result<Secret, SecretError> {
+        self.inner.get(scope, key).await
+    }
+    async fn put(&self, scope: &SecretScope, secret: Secret) -> Result<(), SecretError> {
+        if self.writes.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.paused.notify_one();
+            self.resume.notified().await;
+        }
+        self.inner.put(scope, secret).await
+    }
+    async fn list_scoped(&self, scope: &SecretScope) -> Result<Vec<String>, SecretError> {
+        self.inner.list_scoped(scope).await
+    }
+    async fn delete(&self, scope: &SecretScope, key: &str) -> Result<(), SecretError> {
+        self.inner.delete(scope, key).await
+    }
+    async fn environment_secret_projects(
+        &self,
+        org: &str,
+        environment: &str,
+    ) -> Result<Vec<String>, SecretError> {
+        self.inner
+            .environment_secret_projects(org, environment)
+            .await
+    }
+}
+
+/// A fixture whose secret store is [`PausingWrites`], with its two
+/// signals.
+async fn pausing_fixture() -> Option<(Fixture, Arc<Notify>, Arc<Notify>)> {
+    let paused = Arc::new(Notify::new());
+    let resume = Arc::new(Notify::new());
+    let (p, r) = (paused.clone(), resume.clone());
+    let f = fixture(move |inner| {
+        Arc::new(PausingWrites {
+            inner,
+            writes: AtomicUsize::new(0),
+            paused: p,
+            resume: r,
+        })
+    })
+    .await?;
+    Some((f, paused, resume))
 }
 
 struct Fixture {
@@ -308,7 +370,7 @@ async fn a_duplicate_copies_rules_eligibility_projects_and_secret_values() {
     let before = snapshot(&f, "prod").await;
     let uri = format!("{PROD}/duplicate");
 
-    // A step-up every time: no window, no copy.
+    // A step-up: no open window, no copy.
     let (st, b) = h
         .cookie("POST", &uri, Some(json!({ "name": "prod-eu" })), &s)
         .await;
@@ -545,6 +607,138 @@ async fn a_failure_part_way_leaves_no_copy() {
     assert_eq!(secrets, vec![], "no secret left behind");
     assert!(f.pg.environment_projects("acme", "prod-eu").await.is_err());
     assert_eq!(snapshot(&f, "prod").await, prod);
+
+    f.tdb.cleanup().await;
+}
+
+/// Two Duplicates to one new name, the second sent while the first sits
+/// between its checks and its first secret write: the second is refused
+/// before it writes anything, and the first's Environment keeps every
+/// secret it copied. Without the claim the second wins, and the first's
+/// cleanup deletes the secrets the second's Environment holds.
+#[tokio::test]
+async fn a_second_duplicate_to_the_same_name_is_409_and_takes_no_secret() {
+    let Some((f, paused, resume)) = pausing_fixture().await else {
+        return;
+    };
+    let h = &f.h;
+    let (s, mut soft) = signed_in_admin(h).await;
+    h.open_window(&s, &mut soft).await;
+    let uri = format!("{PROD}/duplicate");
+
+    let ((first, first_body), (second, second_body)) = tokio::join!(
+        h.cookie("POST", &uri, Some(json!({ "name": "prod-eu" })), &s),
+        async {
+            paused.notified().await;
+            let answer = h
+                .cookie(
+                    "POST",
+                    &uri,
+                    Some(json!({ "name": "prod-eu", "display_name": "Second" })),
+                    &s,
+                )
+                .await;
+            resume.notify_one();
+            answer
+        }
+    );
+    assert_eq!(first, StatusCode::CREATED, "{first_body}");
+    assert_eq!(second, StatusCode::CONFLICT, "{second_body}");
+
+    let (environment, _, secrets) = snapshot(&f, "prod-eu").await;
+    assert_eq!(
+        environment.and_then(|e| e.display_name).as_deref(),
+        Some("Production (copy)"),
+        "the first Duplicate's Environment"
+    );
+    assert_eq!(
+        secrets,
+        vec![
+            ("api/DB_PASSWORD".to_string(), b"api-pw".to_vec()),
+            ("web/API_KEY".to_string(), b"web-key".to_vec()),
+            ("web/DB_PASSWORD".to_string(), b"web-pw".to_vec()),
+        ],
+        "every secret the answer lists is there"
+    );
+
+    // The claim is released: a third Duplicate to another name goes ahead.
+    let (st, b) = h
+        .cookie("POST", &uri, Some(json!({ "name": "prod-us" })), &s)
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{b}");
+
+    f.tdb.cleanup().await;
+}
+
+/// The Environment store refuses the copy after the secrets are written (a
+/// plain create took the name in between): the copied secrets are removed
+/// and the Environment that took the name is left as it was.
+#[tokio::test]
+async fn a_name_taken_after_the_secrets_are_copied_removes_them() {
+    let Some((f, paused, resume)) = pausing_fixture().await else {
+        return;
+    };
+    let h = &f.h;
+    let (s, mut soft) = signed_in_admin(h).await;
+    h.open_window(&s, &mut soft).await;
+    let uri = format!("{PROD}/duplicate");
+
+    let ((st, b), taken) = tokio::join!(
+        h.cookie("POST", &uri, Some(json!({ "name": "prod-eu" })), &s),
+        async {
+            paused.notified().await;
+            let taken = h
+                .cookie(
+                    "PUT",
+                    "/v1/orgs/acme/environments/prod-eu",
+                    Some(json!({ "description": "made by hand" })),
+                    &s,
+                )
+                .await;
+            resume.notify_one();
+            taken
+        }
+    );
+    assert_eq!(taken.0, StatusCode::OK, "{}", taken.1);
+    assert_eq!(st, StatusCode::CONFLICT, "{b}");
+    let (environment, _, secrets) = snapshot(&f, "prod-eu").await;
+    assert_eq!(
+        environment.map(|e| e.description).as_deref(),
+        Some("made by hand")
+    );
+    assert_eq!(secrets, vec![], "the copied secrets are removed");
+
+    f.tdb.cleanup().await;
+}
+
+/// An admin of another org may not duplicate this org's Environment.
+#[tokio::test]
+async fn an_admin_of_another_org_is_403() {
+    let Some(f) = fixture(|s| s).await else {
+        return;
+    };
+    let h = &f.h;
+    h.grant("zed", Scope::Org("other".into()), Role::Owner)
+        .await;
+    let s = h.browser_session(scoped("zed")).await;
+    let mut soft = passkey();
+    h.enroll(&s, &mut soft, "Laptop").await;
+    h.open_window(&s, &mut soft).await;
+
+    let (st, b) = h
+        .cookie(
+            "POST",
+            &format!("{PROD}/duplicate"),
+            Some(json!({ "name": "prod-eu" })),
+            &s,
+        )
+        .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{b}");
+    assert_eq!(snapshot(&f, "prod-eu").await.2, vec![]);
+    assert_eq!(
+        f.pg.get_org_environment("acme", "prod-eu").await.unwrap(),
+        None
+    );
 
     f.tdb.cleanup().await;
 }

@@ -747,7 +747,9 @@ export interface paths {
          *     one transaction. If either step fails, the copied secrets are deleted, so
          *     no partial Environment is left. A crash between the two leaves only
          *     secrets under a name no Environment has, which no Run can resolve and
-         *     which a retry refuses (409) until an admin deletes them.
+         *     which a retry refuses (409) until an admin deletes them. The new name is
+         *     claimed throughout, and a second Duplicate to it is refused (409) before
+         *     it writes anything, so two Duplicates never both write secrets under it.
          */
         post: operations["duplicate_org_environment"];
         delete?: never;
@@ -2994,9 +2996,9 @@ export interface components {
             /** @description Policies that apply to the old Environment and not to the new one. */
             policies: components["schemas"]["DuplicatePolicyDto"][];
             /**
-             * @description Projects whose Runs deployed into the old Environment (from Run
-             *     history): their Pipeline YAML names it, and deploys into the new one
-             *     only once it is changed.
+             * @description Projects whose Runs named the old Environment (from Run history):
+             *     their Pipeline YAML names it, and runs in the new one only once it is
+             *     changed.
              */
             projects_with_runs: string[];
         };
@@ -6968,7 +6970,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description the new name is taken, or secrets already exist under it */
+            /** @description the new name is taken, secrets already exist under it, or another duplicate to it is in progress */
             409: {
                 headers: {
                     [name: string]: unknown;
