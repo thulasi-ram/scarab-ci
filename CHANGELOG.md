@@ -84,7 +84,7 @@ record. Read Breaking changes before you upgrade.
   upgraded.
 - **Caches start cold.** Cache keys now include the Run's cache scope (see Security), so no
   Cache saved before the upgrade is restored after it. Each Cache fills again on its first
-  build. Migration `0079_run_cache_scope.sql` adds the scope to `runs`.
+  build. Migration `0081_run_cache_scope.sql` adds the scope to `runs`.
 - **A forge connection serves one org** (git-bug 19b0a45). Every repository bound through a
   connection must be owned by its org.
   - `POST /v1/connections` needs an `org` field. Only a global admin creates an org's first

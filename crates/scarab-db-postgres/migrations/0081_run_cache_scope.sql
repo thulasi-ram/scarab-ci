@@ -13,7 +13,7 @@
 --
 -- Expand step (ADR-0003): nullable columns only. A server built before this
 -- migration refuses to boot against a database that has it (sqlx reports
--- migration 79 as unknown); to roll back, delete row 79 from
+-- migration 81 as unknown); to roll back, delete row 81 from
 -- `_sqlx_migrations`. The columns are harmless to the old code.
 ALTER TABLE runs ADD COLUMN cache_scope TEXT;
 ALTER TABLE runs ADD COLUMN cache_fallback_scope TEXT;
