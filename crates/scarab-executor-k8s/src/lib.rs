@@ -101,12 +101,22 @@ pub struct WorkspaceFetch {
 }
 
 impl WorkspaceFetch {
-    /// The Step's Cache home URL, when its cache key resolved and the Depot
-    /// has more than one replica. Restore hints come from the same key the
-    /// drain saves under, so a save and a later restore of that key ask the
-    /// same replica.
-    fn cache_home_url(&self, spec: &StepSpec) -> Option<String> {
+    /// The home URL the drain saves the Step's Cache to: the home of the
+    /// Step's own key, when it resolved and the Depot has more than one
+    /// replica. A later restore of that key asks the same replica.
+    fn cache_save_home_url(&self, spec: &StepSpec) -> Option<String> {
         let key = spec.cache.as_ref()?.key.as_ref()?;
+        self.cache_home.as_ref()?.url_for(key)
+    }
+
+    /// The home URL the fetcher restores the Step's Cache from: the home of
+    /// the key the restore hints were found under. That is the Step's own
+    /// key, or the default branch's key when the Run's own scope missed
+    /// (`fallback_key`), whose entries were saved to a different replica.
+    fn cache_restore_home_url(&self, spec: &StepSpec) -> Option<String> {
+        let cache = spec.cache.as_ref()?;
+        let own = cache.key.as_ref()?;
+        let key = cache.fallback_key.as_ref().unwrap_or(own);
         self.cache_home.as_ref()?.url_for(key)
     }
 }
@@ -4677,7 +4687,7 @@ pub fn build_pod(
                     fetch,
                     &spec.workspace_inputs,
                     cache_restore,
-                    fetch.cache_home_url(spec).as_deref(),
+                    fetch.cache_restore_home_url(spec).as_deref(),
                     &ws,
                     // The same resolved number `activeDeadlineSeconds` gets
                     // below — the retry window is a fraction of THIS deadline.
@@ -4739,7 +4749,7 @@ pub fn build_pod(
             // (git-bug 12e2f6b) — only when the key resolved and dirs are
             // declared, the same condition the drain's --cache-dirs carries.
             if spec.cache.as_ref().is_some_and(|c| !c.dirs.is_empty()) {
-                if let Some(url) = fetch.cache_home_url(spec) {
+                if let Some(url) = fetch.cache_save_home_url(spec) {
                     egress_env.push(env_var(workspace_token::WORKSPACE_CACHE_URL_ENV, &url));
                 }
             }
@@ -10701,6 +10711,27 @@ mod tests {
         let names: Vec<&str> = got.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, vec![WORKSPACE_INIT_CONTAINER, WORKSPACE_EGRESS_CONTAINER]);
         assert!(got.iter().all(|(_, v)| v.as_deref() == Some(want.as_str())), "{got:?}");
+
+        // git-bug efcec77: a restore found under the default branch's key
+        // reads from that key's home, while the drain still saves to the
+        // home of the Step's own key.
+        let fallback = (0..)
+            .map(|i| format!("fallback-key-{i}"))
+            .find(|k| cache_home::home_ordinal(k, 3) != cache_home::home_ordinal("cache-key-1", 3))
+            .unwrap();
+        let mut from_fallback = spec.clone();
+        from_fallback.cache.as_mut().unwrap().fallback_key = Some(fallback.clone());
+        let fallback_home = format!(
+            "http://scarab-workspace-{}.ns.svc",
+            cache_home::home_ordinal(&fallback, 3)
+        );
+        assert_eq!(
+            home_env(&fetch, &from_fallback),
+            vec![
+                (WORKSPACE_INIT_CONTAINER.to_string(), Some(fallback_home)),
+                (WORKSPACE_EGRESS_CONTAINER.to_string(), Some(want.clone())),
+            ]
+        );
 
         // One Depot replica: no home, no env.
         let mut one = sample_fetch();

@@ -82,6 +82,9 @@ record. Read Breaking changes before you upgrade.
   upgrade an older Depot refuses a newer server's workspace token when the token carries cache
   roots, so a Step with a Cache restore can fail with a Transient error until both are
   upgraded.
+- **Caches start cold.** Cache keys now include the Run's cache scope (see Security), so no
+  Cache saved before the upgrade is restored after it. Each Cache fills again on its first
+  build. Migration `0081_run_cache_scope.sql` adds the scope to `runs`.
 - **A forge connection serves one org** (git-bug 19b0a45). Every repository bound through a
   connection must be owned by its org.
   - `POST /v1/connections` needs an `org` field. Only a global admin creates an org's first
@@ -211,6 +214,18 @@ record. Read Breaking changes before you upgrade.
   as files on a read-only in-memory volume; an `env: true` secret is a `secretKeyRef` to that
   Secret.
 
+- A pull request could save a Cache that a Step in an Environment-governed Run then restored,
+  so a deploy could ship bytes a pull request wrote (git-bug efcec77). Every Run now has a
+  cache scope, fixed when the Run is created and kept by its reruns. A Run governed by an
+  Environment uses `env:<name>`: it reads and writes only that scope, so its first build is
+  cold. Any other Run uses its ref (`refs/heads/feat`, `refs/pull/7/head`): it writes only that
+  scope, and when that scope has no entry it reads the default branch's. A pull request never
+  uses an Environment's scope, even when its Pipeline names the Environment and the Environment
+  admits it: it uses its own ref like any other Run. A pull request reads `main`'s Cache and
+  never writes it. Pull requests, which saved nothing before, now save to their own scope. A Run
+  with no ref (a comment trigger) has its Cache off. The server asks the forge for the default
+  branch when it creates a Run that declares a `cache:`; when the forge does not answer, that
+  Run reads only its own scope.
 - An admin of one org could list, delete, re-sync and bind repos through another org's forge
   connections, and an API token scoped to one org could do the same (git-bug 19b0a45). Each
   connection now belongs to an org, and its routes need `Administer` on that org; another

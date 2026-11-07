@@ -757,13 +757,19 @@ pub trait Db: Send + Sync {
         key: &str,
     ) -> Result<Vec<(String, String)>, DbError>;
 
-    /// Was this run triggered in a **pull-request context** (any PR, fork or
-    /// not — from the ADR-0057 origin facts)? Gates cache-entry WRITES
-    /// (dbe05e5 amendment #1): push rights already imply pipeline-edit
-    /// rights, so branch-push writes add no capability, but a PR head — even
-    /// a same-repo one — must not poison the mapping other runs restore from.
-    /// Reads stay allowed for every context, forks included.
-    async fn run_pr_context(&self, run: &RunId) -> Result<bool, DbError>;
+    /// Stamp the Run's [`crate::CacheScope`], once at creation, beside the
+    /// origin facts it is derived from. Fixed for the life of the Run, so a
+    /// rerun or retry keys its Cache as the first launch did.
+    async fn set_run_cache_scope(
+        &self,
+        run: &RunId,
+        scope: &crate::CacheScope,
+    ) -> Result<(), DbError>;
+
+    /// The Run's cache scope, or `None` when it has none (no ref and no
+    /// Environment, a Run created before scopes were stored, or an unknown
+    /// Run). A Run with no scope has its Cache off.
+    async fn run_cache_scope(&self, run: &RunId) -> Result<Option<crate::CacheScope>, DbError>;
 
     /// How many runs are in-flight (started, not terminal). With `project`,
     /// scoped to that project (fairness cap); without, the global count

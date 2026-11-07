@@ -3898,12 +3898,11 @@ impl<'a> Scheduler<'a> {
     /// here may fail the step: a save is an optimisation hint, and the drain
     /// already treats cache-only bytes as unpromised.
     ///
-    /// Write scope (dbe05e5 amendment #1): DENIED for any pull-request
-    /// context, fork or not — a PR head must not poison the mapping other
-    /// runs restore from, while push/tag/manual writes add no capability
-    /// (push rights already imply pipeline-edit rights). An error answering
-    /// the PR question fails CLOSED for the write. Reads stay open to every
-    /// context, forks included.
+    /// Write scope: the save lands under the key the launch folded, which
+    /// carries the Run's own [`crate::CacheScope`] — never the default
+    /// branch's scope a fallback restore read from. That is what lets a pull
+    /// request save at all: it writes only `refs/pull/<n>/head`, which no
+    /// other ref's Run and no Environment-governed Run reads.
     async fn record_cache_saves(
         &self,
         run: &RunId,
@@ -3917,12 +3916,6 @@ impl<'a> Scheduler<'a> {
         };
         if saves.key.is_empty() || saves.roots.is_empty() {
             return;
-        }
-        match self.db.run_pr_context(run).await {
-            Ok(false) => {}
-            // PR context, or unanswerable: no write. Fail-closed is safe —
-            // the only cost is a cold cache.
-            _ => return,
         }
         let project = match self.db.run_project(run).await {
             Ok(Some(p)) if !p.is_empty() => p,
@@ -4023,9 +4016,14 @@ impl<'a> Scheduler<'a> {
     }
 
     /// Launch-time cache enrichment (ADR-0065 s1): fold the cache key from
-    /// the key files' blob hashes (resolved through the merged input roots,
-    /// last-overlay-wins — the same order the workspace materialises in) and
-    /// fill `spec.cache.{key, restore}` from the `cache_entries` mapping.
+    /// the Run's cache scope and the key files' blob hashes (resolved through
+    /// the merged input roots, last-overlay-wins — the same order the
+    /// workspace materialises in) and fill `spec.cache.{key, restore}` from
+    /// the `cache_entries` mapping. When the Run's own scope has no entry for
+    /// any declared dir and the scope names a fallback (the default
+    /// branch's), the restore comes from the fallback's key instead, named in
+    /// `fallback_key`; `key` stays the Run's own, so the save never lands in
+    /// the default branch's scope.
     ///
     /// **Best-effort by principle**: every early return below leaves the
     /// cache DISABLED for this attempt (`key: None`, no restore) — a missing
@@ -4045,6 +4043,13 @@ impl<'a> Scheduler<'a> {
         // stays off rather than sharing a global one across tenants.
         let project = match self.db.run_project(run).await {
             Ok(Some(p)) if !p.is_empty() => p,
+            _ => return,
+        };
+        // No scope (no ref and no Environment, or a Run created before
+        // scopes were stored), or a failed read: the cache stays off. A Run
+        // must never fall into some other scope's entries.
+        let scope = match self.db.run_cache_scope(run).await {
+            Ok(Some(scope)) => scope,
             _ => return,
         };
         let mut resolved: Vec<(String, String)> = Vec::new();
@@ -4069,26 +4074,44 @@ impl<'a> Scheduler<'a> {
             // never receives — cache off for the attempt, never an error.
             return;
         }
-        let key = crate::cache_key(&project, &resolved);
-        // Lookup failures degrade to a cold cache (key still set, so the
-        // save side records under it and the next attempt hits).
-        let rows = self
-            .db
-            .cache_lookup(&project, &key)
-            .await
-            .unwrap_or_default();
-        let restore: Vec<(String, String)> = cache
-            .dirs
-            .iter()
-            .filter_map(|dir| {
-                rows.iter()
-                    .find(|(d, _)| d == dir)
-                    .map(|(_, root)| (dir.clone(), root.clone()))
-            })
-            .collect();
+        let key = crate::cache_key(&project, &scope.own, &resolved);
+        // The Run's own scope first, then the fallback scope (the default
+        // branch's) on a miss. All or nothing per scope: the restore reads
+        // one key, so it reads one Depot replica (that key's home). Lookup
+        // failures degrade to a cold cache (key still set, so the save side
+        // records under it and the next attempt hits).
+        let mut candidates = vec![key.clone()];
+        if let Some(fallback) = &scope.fallback {
+            candidates.push(crate::cache_key(&project, fallback, &resolved));
+        }
+        let mut restore: Vec<(String, String)> = Vec::new();
+        let mut fallback_key = None;
+        for (i, candidate) in candidates.into_iter().enumerate() {
+            let rows = self
+                .db
+                .cache_lookup(&project, &candidate)
+                .await
+                .unwrap_or_default();
+            restore = cache
+                .dirs
+                .iter()
+                .filter_map(|dir| {
+                    rows.iter()
+                        .find(|(d, _)| d == dir)
+                        .map(|(_, root)| (dir.clone(), root.clone()))
+                })
+                .collect();
+            if !restore.is_empty() {
+                if i > 0 {
+                    fallback_key = Some(candidate);
+                }
+                break;
+            }
+        }
         if let Some(cache) = &mut spec.cache {
             cache.key = Some(key);
             cache.restore = restore;
+            cache.fallback_key = fallback_key;
         }
     }
 

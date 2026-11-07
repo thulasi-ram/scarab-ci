@@ -833,6 +833,83 @@ pub struct CacheConfig {
     /// order. Empty = nothing to restore (a cold key, or the cache disabled).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub restore: Vec<(String, String)>,
+    /// The key `restore` was found under when it is not `key`: the default
+    /// branch's key, read because the Run's own scope missed (see
+    /// [`CacheScope`]). It picks the Depot replica the restore reads from.
+    /// Saves always go to `key`, so a restore read from the default branch
+    /// is never written back under it. `None` = the restore came from `key`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_key: Option<String>,
+}
+
+/// A Run's **cache scope**: which Runs may write what this Run restores. Fixed
+/// when the Run is created and stored with it, so a rerun or retry reads and
+/// writes the scope its Run started with.
+///
+/// - An Environment-governed Run uses `env:<name>`: it reads and writes only
+///   that scope, with no fallback, so nothing outside the Environment writes
+///   what its Steps restore.
+/// - A pull request never uses `env:<name>`, even when its Pipeline names an
+///   Environment and the Environment admits it: the Pipeline is the pull
+///   request's own YAML, so a fork could otherwise write what the next deploy
+///   restores. It is scoped like any other Run.
+/// - Any other Run uses its symbolic ref (`refs/heads/x`,
+///   `refs/pull/7/head`, `refs/tags/v1`): it writes only that scope and, on a
+///   miss, reads the default branch's (`refs/heads/<default>`). A pull
+///   request reads `main`'s Cache and never writes it.
+/// - A Run with neither (an inline submission, a comment trigger) has no
+///   scope, and its Cache is off.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheScope {
+    /// The scope this Run reads first and the only one it writes.
+    pub own: String,
+    /// The scope read when `own` has no entry: the default branch's scope.
+    /// `None` for an Environment-governed Run, for a Run on the default
+    /// branch itself, and when the default branch was unknown at creation.
+    pub fallback: Option<String>,
+}
+
+impl CacheScope {
+    /// The Environment whose scope a Run uses: `environment`, unless the Run
+    /// is a pull request. `pull_request` is true when the event is a pull
+    /// request or the Run is locked out of secrets as a fork; a `git_ref`
+    /// naming a pull or merge request's head (`refs/pull/…`,
+    /// `refs/merge-requests/…`) counts too, which covers a dispatch on a pull
+    /// request's ref and a follow-up of a pull request's Run.
+    pub fn environment_scope<'a>(
+        environment: Option<&'a str>,
+        git_ref: Option<&str>,
+        pull_request: bool,
+    ) -> Option<&'a str> {
+        let pull_request_ref = git_ref
+            .is_some_and(|r| r.starts_with("refs/pull/") || r.starts_with("refs/merge-requests/"));
+        environment.filter(|_| !pull_request && !pull_request_ref)
+    }
+
+    /// The scope for a Run governed by `environment` (unless it is a pull
+    /// request, see [`Self::environment_scope`]), else on `git_ref`. A ref
+    /// that is not a full `refs/…` name gives no scope: the two kinds of
+    /// scope must never spell the same string, and a git ref cannot contain
+    /// `:`. `default_branch` is the bare branch name (`main`).
+    pub fn for_run(
+        environment: Option<&str>,
+        git_ref: Option<&str>,
+        default_branch: Option<&str>,
+        pull_request: bool,
+    ) -> Option<Self> {
+        if let Some(env) = Self::environment_scope(environment, git_ref, pull_request) {
+            return Some(Self {
+                own: format!("env:{env}"),
+                fallback: None,
+            });
+        }
+        let own = git_ref.filter(|r| r.starts_with("refs/"))?.to_string();
+        let fallback = default_branch
+            .filter(|b| !b.is_empty())
+            .map(|b| format!("refs/heads/{b}"))
+            .filter(|f| *f != own);
+        Some(Self { own, fallback })
+    }
 }
 
 /// One settled Step's **cache saves** (ADR-0065 s1), read back from the
@@ -1561,19 +1638,21 @@ pub fn workspace_input_steps(
         .collect()
 }
 
-/// Fold the **cache key** (ADR-0065 s1): sha256 over the project and the
-/// sorted `(key-file path, blob hash)` pairs, length-prefixed so no crafted
-/// path/hash pair can collide with another encoding. The blob hashes come
+/// Fold the **cache key** (ADR-0065 s1): sha256 over the project, the Run's
+/// cache `scope` ([`CacheScope`]) and the sorted `(key-file path, blob hash)`
+/// pairs, length-prefixed so no crafted path/hash pair can collide with
+/// another encoding. The blob hashes come
 /// from the input snapshots' tree entries (no content reads) — resolved by
 /// the caller through the merged input roots, last-overlay-wins. Deterministic
 /// by construction, so launch and settle agree on the key without persisting
 /// it: the same inputs always fold the same key.
-pub fn cache_key(project: &str, resolved: &[(String, String)]) -> String {
+pub fn cache_key(project: &str, scope: &str, resolved: &[(String, String)]) -> String {
     use sha2::{Digest, Sha256};
     let mut pairs: Vec<&(String, String)> = resolved.iter().collect();
     pairs.sort();
     let mut hasher = Sha256::new();
     hasher.update(format!("{}:{}\n", project.len(), project));
+    hasher.update(format!("{}:{}\n", scope.len(), scope));
     for (path, blob) in pairs {
         hasher.update(format!(
             "{}:{}\n{}:{}\n",
