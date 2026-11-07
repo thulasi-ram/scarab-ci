@@ -4513,13 +4513,15 @@ impl<'a> Scheduler<'a> {
 
     /// Gates whose verdict can no longer change the Run (git-bug 2c37802).
     ///
-    /// - A `Pending` gate (waiting, or not yet reached) with at least one
-    ///   dependent, all of them terminal, ends `Skipped` with the reason
-    ///   [`GATE_NO_LONGER_NEEDED`]; its open wait, if any, is closed
-    ///   `Cancelled`. The dependents can only be terminal without the gate
-    ///   (a sibling failed, a dependent was cancelled), so no approval can
-    ///   matter. A leaf gate (no dependents) keeps waiting: its verdict is
-    ///   the Run's outcome.
+    /// - In a Run that already has a failure (a Step `Failed` or
+    ///   `Cancelled`), a `Pending` gate (waiting, or not yet reached) with at
+    ///   least one dependent, all of them terminal, ends `Skipped` with the
+    ///   reason [`GATE_NO_LONGER_NEEDED`]; its open wait, if any, is closed
+    ///   `Cancelled`. No approval can matter, so the Run settles Failed at
+    ///   once. A leaf gate (no dependents) keeps waiting: its verdict is the
+    ///   Run's outcome. So does a gate whose dependents are terminal only
+    ///   because `when:` excluded them, in a Run with no failure: it is a
+    ///   sign-off, and someone is asked (git-bug 0130969).
     /// - A gate skipped that way goes back to `Pending` once a dependent is
     ///   no longer terminal (a rerun of the failed sibling re-armed it), so
     ///   the dependent waits on the gate again instead of being skipped for
@@ -4530,6 +4532,9 @@ impl<'a> Scheduler<'a> {
         if !steps.iter().any(StepRun::is_gate) {
             return Ok(());
         }
+        let run_has_failure = steps
+            .iter()
+            .any(|s| matches!(s.status, StepStatus::Failed | StepStatus::Cancelled));
         let mut events: Option<Vec<EventKind>> = None;
         for gate in steps.iter().filter(|s| s.is_gate()) {
             let mut dependents = steps.iter().filter(|s| s.needs.contains(&gate.step));
@@ -4539,7 +4544,7 @@ impl<'a> Scheduler<'a> {
             let all_finished =
                 first.status.is_terminal() && dependents.all(|d| d.status.is_terminal());
             match gate.status {
-                StepStatus::Pending if all_finished => {
+                StepStatus::Pending if all_finished && run_has_failure => {
                     let now = self.clock.now().await;
                     let cancelled = AttemptStamp::Outcome(AttemptOutcome::Cancelled);
                     let stamp = open_gate_attempt(gate).map(|a| (&a.id, &cancelled));

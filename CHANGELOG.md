@@ -520,7 +520,9 @@ record. Read Breaking changes before you upgrade.
   failed, so they were skipped) stayed Suspended until someone acted or the gate expired. The
   gate now ends Skipped ("no longer needed") and the Run settles at once. A gate with no
   dependents keeps waiting: its verdict is the Run's outcome. A rerun that makes a dependent
-  wait again puts the gate back to waiting.
+  wait again puts the gate back to waiting. The skip applies only once a Step of the Run has
+  failed or been cancelled: a gate whose dependents `when:` excluded is a sign-off, so it waits
+  for someone instead of being skipped before its own `needs` run (git-bug 0130969).
 - Two admins writing one org Environment at the same time could get a 500 when Postgres
   reported a deadlock (`40P01`) or a serialization failure (`40001`). Those are now a 409 that
   says to retry. `PUT /v1/orgs/{org}/environments/{env}` takes `If-None-Match: *` (create
