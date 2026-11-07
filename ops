@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":5,"timestamp":1794050398,"nonce":"M0e5R1h0e9YYNLDqOoUBMA5qrvU=","added":["area:ui","area:identity","type:feat"],"removed":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1794056629,"nonce":"ay8cao5yT7lEXjNAmT18cLs2pEY=","message":"Held 2026-11-07: depends on the owner's call on bbb5204, which may change or remove POST /v1/me/identities/link-moving-passkeys.","files":null}]}
