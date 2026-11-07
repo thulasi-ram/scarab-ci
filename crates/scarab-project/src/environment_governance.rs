@@ -608,6 +608,30 @@ impl EnvironmentMigrationReport {
     }
 }
 
+/// An exclusive claim on one Environment name in one org, from
+/// [`EnvironmentGovernanceStore::claim_environment_name`]. It holds whatever
+/// the store needs to keep the claim (a Postgres transaction holding an
+/// advisory lock, a set entry); dropping it releases the claim.
+pub struct EnvironmentNameClaim {
+    /// Never read: it is kept only so that dropping the claim drops it.
+    _held: Box<dyn std::any::Any + Send>,
+}
+
+impl EnvironmentNameClaim {
+    /// A claim kept by `held`, released when `held` is dropped.
+    pub fn new(held: impl std::any::Any + Send) -> Self {
+        Self {
+            _held: Box::new(held),
+        }
+    }
+}
+
+impl std::fmt::Debug for EnvironmentNameClaim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("EnvironmentNameClaim")
+    }
+}
+
 /// Durable store for the governance half of org-level Environments (ADR-0071
 /// §2, §3, §8): baseline protection, eligibility, per-Project overlays and
 /// privilege grants. The Environment itself (name, description) is the [`OrgEnvironmentStore`](crate::OrgEnvironmentStore)'s.
@@ -628,25 +652,6 @@ impl EnvironmentMigrationReport {
 /// [`OrgEnvironmentError::Conflict`] — so a concurrent change can never slip
 /// a loosening past a write that was judged a tightening. `None` writes
 /// unconditionally, exactly as the plain form (which is that, provided).
-/// An exclusive claim on one Environment name in one org, from
-/// [`EnvironmentGovernanceStore::claim_environment_name`]. It holds whatever
-/// the store needs to keep the claim (a Postgres transaction holding an
-/// advisory lock, a set entry); dropping it releases the claim.
-pub struct EnvironmentNameClaim(Box<dyn std::any::Any + Send>);
-
-impl EnvironmentNameClaim {
-    /// A claim kept by `held`, released when `held` is dropped.
-    pub fn new(held: impl std::any::Any + Send) -> Self {
-        Self(Box::new(held))
-    }
-}
-
-impl std::fmt::Debug for EnvironmentNameClaim {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("EnvironmentNameClaim")
-    }
-}
-
 #[async_trait]
 pub trait EnvironmentGovernanceStore: Send + Sync {
     /// The Environment — baseline and eligibility included — read in one
