@@ -1,6 +1,7 @@
 //! The `step.admit` PolicyCheckpoint's input (ADR-0075 §2, §3): consulted at
-//! every launch of a Step of an Environment-governed Run, before any
-//! credential is used or the Pod is created. Only `deny` is evaluated.
+//! every launch of a Step, before any credential is used or the Pod is
+//! created. Only `deny` is evaluated. In a Run no Environment governs, the
+//! Environment's fields are absent and no built-in rule applies.
 //!
 //! The Environment's launch-time re-check (allowed refs, the approver set
 //! recorded at release, the maximum approval age) and the `env=none` OIDC
@@ -33,9 +34,10 @@ policy_struct! {
 policy_struct! {
     pub struct AdmittedRun {
         pub id: String,
-        /// The Run's symbolic ref.
-        pub r#ref: String,
-        pub environment: String,
+        /// The Run's symbolic ref, when it is Environment-governed.
+        pub r#ref: Option<String>,
+        /// The Run's Environment, when one governs it.
+        pub environment: Option<String>,
     }
 }
 
@@ -70,7 +72,8 @@ policy_struct! {
         /// The Attempt being launched, from 1.
         pub attempt: u64,
         pub run: AdmittedRun,
-        pub environment: EnvironmentNow,
+        /// The Run's Environment as it is now; absent when none governs it.
+        pub environment: Option<EnvironmentNow>,
         /// The Environment approval gates upstream of the Step, in Pipeline
         /// order.
         pub approvals: Capped<UpstreamApproval, MAX_GATES>,

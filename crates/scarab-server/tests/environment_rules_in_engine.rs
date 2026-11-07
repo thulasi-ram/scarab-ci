@@ -506,3 +506,63 @@ async fn a_step_admit_policy_denies_what_the_recheck_allows() {
         "the re-check alone admits it"
     );
 }
+
+/// A Run no Environment governs: ordinary CI.
+const UNGOVERNED: &str = r#"
+on:
+  manual: {}
+steps:
+  - { id: build, image: busybox, command: ["true"] }
+  - { id: test, image: alpine, command: ["true"], needs: [build] }
+"#;
+
+/// `step.admit` (S4): a CEL Policy applies to every launch its `match`
+/// selects, in a Run no Environment governs as well. The built-in re-check
+/// does not apply there, and nothing is recorded when no Policy is stored.
+#[tokio::test]
+async fn a_step_admit_policy_applies_to_a_run_no_environment_governs() {
+    let s = Stack::new(rules(&[ME])).await;
+    let before = s.dispatch(UNGOVERNED).await.expect("admitted");
+    s.tick(&before, 6).await;
+    assert_eq!(s.status(&before, "test").await, StepStatus::Succeeded);
+    assert!(
+        s.decisions(&before, Checkpoint::StepAdmit).await.is_empty(),
+        "no Policy stored: nothing to decide or record"
+    );
+
+    s.deny_policy(
+        "step.admit",
+        "step.image == 'alpine' && !has(run.environment)",
+    )
+    .await;
+    let run = s.dispatch(UNGOVERNED).await.expect("admitted");
+    s.tick(&run, 6).await;
+    assert_eq!(s.status(&run, "build").await, StepStatus::Succeeded);
+    assert_eq!(s.status(&run, "test").await, StepStatus::Failed);
+    let refusal = s.failure(&run, "test").await;
+    assert!(
+        refusal.contains("policy `no-step-admit`: not you"),
+        "{refusal}"
+    );
+    let build = s.admits(&run, "build").await;
+    assert_eq!(build.len(), 1, "{build:?}");
+    assert!(!build[0].decision.is_denied());
+    let test = s.admits(&run, "test").await;
+    assert_eq!(test.len(), 1, "{test:?}");
+    assert!(test[0].decision.is_denied());
+    assert!(
+        test[0]
+            .decision
+            .results
+            .iter()
+            .all(|r| !r.policy_id.starts_with("builtin:")),
+        "no built-in rule in a Run no Environment governs: {:?}",
+        test[0].decision.results
+    );
+    assert_eq!(test[0].decision.input["run"]["id"], run.0.as_str());
+    assert!(test[0]
+        .decision
+        .input
+        .get("environment")
+        .is_none_or(Value::is_null));
+}
