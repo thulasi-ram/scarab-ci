@@ -3045,7 +3045,8 @@ impl<'a> Scheduler<'a> {
                     // longer pending, so the attempt teardown that
                     // `dead_letter_run` writes would find no handle, retire
                     // as "gone" and leave the unit running. Record the
-                    // deterministic handle first. Best-effort, like the rest
+                    // deterministic handle first, with a teardown of its
+                    // own. Best-effort, like the rest
                     // of the dead-letter (ADR-0059): a failure is reported in
                     // the diagnostic, never a reason to skip the dead-letter.
                     if let Err(adopt) = self.adopt_unit_of_poison_launch(&msg).await {
@@ -3553,9 +3554,13 @@ impl<'a> Scheduler<'a> {
     }
 
     /// Record the unit of a launch intent about to be dead-lettered as poison
-    /// (git-bug d1b5f72), when no handle is stored yet. See
-    /// [`adopt_unit_of_refused_launch`](Self::adopt_unit_of_refused_launch):
-    /// the same gap, reached by exhausting deliveries instead of by a refusal.
+    /// (git-bug d1b5f72), when no handle is stored yet, and owe its teardown.
+    /// See [`adopt_unit_of_refused_launch`](Self::adopt_unit_of_refused_launch),
+    /// which this calls: the same gap, reached by exhausting deliveries
+    /// instead of by a refusal. That also enqueues the attempt's `:launch`
+    /// CANCEL_ATTEMPT; `dead_letter_run` then writes the attempt's own one
+    /// too, and the second cancel of a unit already gone costs one idempotent
+    /// call.
     async fn adopt_unit_of_poison_launch(&self, msg: &OutboxMessage) -> Result<(), SchedulerError> {
         let intent: LaunchIntent = serde_json::from_value(msg.payload.clone())
             .map_err(|e| SchedulerError::BadPayload(e.to_string()))?;
