@@ -37,6 +37,33 @@ struct Ir {
     /// The Environment the Run names, if any.
     #[serde(default)]
     environment: Option<String>,
+    /// The same IR read as the pipeline crate's type, which the approve
+    /// handler reads too; `None` for an IR this release cannot read (a Run
+    /// created by a newer server).
+    #[serde(skip)]
+    typed: Option<scarab_pipeline::PipelineIr>,
+}
+
+impl Ir {
+    /// Whether `step` is an Environment approval gate, as the approve handler
+    /// judges it: in a Run that names an Environment,
+    /// [`scarab_pipeline::StepSpec::counts_as_environment_approval_gate`],
+    /// which counts a `manual` gate of a Run created before the mark existed.
+    /// Where the IR cannot be read as the pipeline type, the handler asks the
+    /// approvers, so every `manual` gate counts here too.
+    fn is_environment_approval_gate(&self, step: &IrStep) -> bool {
+        if self.environment.is_none() {
+            return false;
+        }
+        match &self.typed {
+            Some(ir) => ir
+                .steps
+                .iter()
+                .find(|s| s.id == step.id)
+                .is_some_and(|s| s.counts_as_environment_approval_gate()),
+            None => step.gate.as_deref() == Some("manual"),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -51,22 +78,7 @@ struct IrStep {
     #[serde(default)]
     scope: Option<serde_json::Value>,
     #[serde(default)]
-    environment_approval_gate: Option<bool>,
-    #[serde(default)]
     gate: Option<String>,
-}
-
-impl IrStep {
-    /// Whether this Step is an Environment approval gate, as the approve
-    /// handler judges it: the mark Run creation stored, or, on a Run created
-    /// before the mark existed, every `manual` gate of a Run that names an
-    /// Environment (the rule before ADR-0078).
-    fn is_environment_approval_gate(&self, run_environment: Option<&str>) -> bool {
-        match self.environment_approval_gate {
-            Some(mark) => mark,
-            None => run_environment.is_some() && self.gate.as_deref() == Some("manual"),
-        }
-    }
 }
 
 #[derive(Deserialize, Clone)]
@@ -99,21 +111,24 @@ fn string_type() -> String {
 }
 
 async fn read_ir(st: &AppState, run: &RunId) -> Result<Ir, ApiError> {
-    Ok(st
-        .db
-        .run_ir(run)
-        .await?
-        .and_then(|v| serde_json::from_value(v).ok())
-        .unwrap_or_default())
+    use serde::Deserialize as _;
+    let Some(raw) = st.db.run_ir(run).await? else {
+        return Ok(Ir::default());
+    };
+    let mut ir = Ir::deserialize(&raw).unwrap_or_default();
+    ir.typed = scarab_pipeline::PipelineIr::deserialize(&raw).ok();
+    Ok(ir)
 }
 
-/// The Environment a Run names, with its display name when the org still
-/// has an Environment of that name. `None` for a Run that names none.
+/// The Environment a Run names (`name`, from [`step_views`]), with its
+/// display name when the org still has an Environment of that name. `None`
+/// for a Run that names none.
 pub(crate) async fn run_environment(
     st: &AppState,
     run: &RunId,
+    name: Option<String>,
 ) -> Result<Option<RunEnvironmentDto>, ApiError> {
-    let Some(name) = read_ir(st, run).await?.environment else {
+    let Some(name) = name else {
         return Ok(None);
     };
     let org = st.db.run_tenant(run).await?.map(|(org, _)| org);
@@ -324,13 +339,13 @@ fn link(
     }
 }
 
-/// The origin and plugin-gate view of every step of `run`, by step id, and
-/// the Run's yanked library versions.
+/// The origin and plugin-gate view of every step of `run`, by step id, the
+/// Run's yanked library versions, and the Environment the Run names.
 pub(crate) async fn step_views(
     st: &AppState,
     run: &RunId,
     steps: &[StepRun],
-) -> Result<(HashMap<String, StepOriginView>, Vec<RunYankDto>), ApiError> {
+) -> Result<StepViews, ApiError> {
     let ir = read_ir(st, run).await?;
     let yanks = yanks_of(st, run, &ir).await?;
     let attempts: HashMap<&str, &StepRun> = steps.iter().map(|s| (s.step.0.as_str(), s)).collect();
@@ -360,7 +375,7 @@ pub(crate) async fn step_views(
             }
             None => None,
         };
-        let environment_approval_gate = s.is_environment_approval_gate(ir.environment.as_deref());
+        let environment_approval_gate = ir.is_environment_approval_gate(s);
         if !origin.is_empty() || plugin_gate.is_some() || environment_approval_gate {
             views.insert(
                 s.id.clone(),
@@ -372,7 +387,21 @@ pub(crate) async fn step_views(
             );
         }
     }
-    Ok((views, yanked.into_values().collect()))
+    Ok(StepViews {
+        views,
+        yanked: yanked.into_values().collect(),
+        environment: ir.environment,
+    })
+}
+
+/// What [`step_views`] reads from a Run's stored IR.
+pub(crate) struct StepViews {
+    /// The origin and plugin-gate view of every step, by step id.
+    pub views: HashMap<String, StepOriginView>,
+    /// The Run's yanked library versions.
+    pub yanked: Vec<RunYankDto>,
+    /// The Environment the Run names, if any.
+    pub environment: Option<String>,
 }
 
 async fn plugin_gate_view(

@@ -2551,9 +2551,13 @@ async fn get_run(
     // edges and address per-sidecar logs by index. A step with no stored spec
     // (e.g. a gate) carries empty vecs.
     let mut gate_views = run_gate_view::step_gate_views(&st, &run, &steps).await?;
-    let (mut origin_views, yanked_libraries) = run_origin::step_views(&st, &run, &steps).await?;
+    let run_origin::StepViews {
+        views: mut origin_views,
+        yanked: yanked_libraries,
+        environment,
+    } = run_origin::step_views(&st, &run, &steps).await?;
     let deploy_steps = st.db.deploy_steps_of_run(&run).await?;
-    let environment = run_origin::run_environment(&st, &run).await?;
+    let environment = run_origin::run_environment(&st, &run, environment).await?;
     let mut step_dtos = Vec::with_capacity(steps.len());
     for s in steps {
         let view = gate_views.remove(&s.step.0).unwrap_or_default();
