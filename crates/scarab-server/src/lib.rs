@@ -5164,10 +5164,13 @@ struct AdmittedFacts<'a> {
 }
 
 /// The cache scope a new Run gets (git-bug efcec77): `env:<name>` when an
-/// Environment governs it, else its symbolic ref with the default branch's
-/// scope as the fallback read. The forge is asked for the default branch
-/// only when that fallback can matter: an ungoverned Run with a ref whose
-/// Pipeline declares a `cache:`. Asking is best-effort: a forge that cannot
+/// Environment governs it and it is not a pull request, else its symbolic
+/// ref with the default branch's scope as the fallback read. A pull request
+/// (the event is one, or the Run is locked out as a fork) that names an
+/// Environment is scoped by its ref like an ungoverned Run, so it never
+/// writes what that Environment's Runs restore. The forge is asked for the
+/// default branch only when that fallback can matter: a Run scoped by its
+/// ref whose Pipeline declares a `cache:`. Asking is best-effort: a forge that cannot
 /// answer leaves the Run with no fallback (its first build on a new ref is
 /// cold), never a failed creation.
 async fn run_cache_scope(
@@ -5176,11 +5179,18 @@ async fn run_cache_scope(
     ir: &scarab_pipeline::PipelineIr,
     gov: &RunGovernance,
 ) -> Option<scarab_engine::CacheScope> {
-    let environment = match gov {
-        RunGovernance::Governed { environment, .. } => Some(environment.as_str()),
-        RunGovernance::Ungoverned => None,
+    let (environment, locked_out) = match gov {
+        RunGovernance::Governed {
+            environment,
+            locked_out,
+            ..
+        } => (Some(environment.as_str()), *locked_out),
+        RunGovernance::Ungoverned => (None, false),
     };
+    let pull_request = locked_out || event.trigger_kind() == scarab_forge::TriggerKind::PullRequest;
     let git_ref = event.protection_ref();
+    let environment =
+        scarab_engine::CacheScope::environment_scope(environment, git_ref.as_deref(), pull_request);
     let mut default_branch = None;
     if environment.is_none() && git_ref.is_some() && ir.steps.iter().any(|s| s.cache.is_some()) {
         if let Some(repo) = event.repo() {
@@ -5194,7 +5204,12 @@ async fn run_cache_scope(
             }
         }
     }
-    scarab_engine::CacheScope::for_run(environment, git_ref.as_deref(), default_branch.as_deref())
+    scarab_engine::CacheScope::for_run(
+        environment,
+        git_ref.as_deref(),
+        default_branch.as_deref(),
+        pull_request,
+    )
 }
 
 /// The outcome of admitting one compiled pipeline (ADR-0037, ADR-0071 §2):

@@ -99,7 +99,7 @@ fn caching(dirs: &[&str], key_files: &[&str]) -> CacheConfig {
 
 /// The scope of an ungoverned push to `main`, the default branch.
 fn main_scope() -> CacheScope {
-    CacheScope::for_run(None, Some("refs/heads/main"), Some("main")).unwrap()
+    CacheScope::for_run(None, Some("refs/heads/main"), Some("main"), false).unwrap()
 }
 
 /// Two steps: `clone` (produces the input snapshot) → `build` (declares the
@@ -423,28 +423,31 @@ async fn saved(db: &InMemoryDb, scope: &str) -> Option<String> {
         .map(|(_, root)| root)
 }
 
-/// The poisoning this ticket closes (git-bug efcec77): a pull request saves
-/// its Cache, and an Environment-governed Run with the same key files does
-/// not restore it. The PR's save lands in its own scope (it is recorded,
-/// so the miss below is the scope working, not a save that never
-/// happened).
+/// The poisoning this ticket closes (git-bug efcec77): a pull request whose
+/// own YAML names the Environment (so the Environment governs it) saves its
+/// Cache, and an Environment Run on `main` with the same key files does not
+/// restore it. The PR's save lands in its own ref scope (it is recorded, so
+/// the miss below is the scope working, not a save that never happened).
 #[tokio::test]
-async fn a_pull_request_save_is_never_restored_by_an_environment_run() {
+async fn a_pull_request_naming_the_environment_never_writes_what_an_environment_run_restores() {
     let db = InMemoryDb::new();
-    let pr = CacheScope::for_run(None, Some("refs/pull/7/head"), Some("main")).unwrap();
+    let pr =
+        CacheScope::for_run(Some("prod"), Some("refs/pull/7/head"), Some("main"), true).unwrap();
     run_once(&db, "run-pr", pr, "tree-from-pr").await;
     assert_eq!(
         saved(&db, "refs/pull/7/head").await.as_deref(),
         Some("tree-from-pr"),
-        "a pull request saves under its own scope"
+        "a pull request saves under its own ref scope"
     );
     assert_eq!(
-        saved(&db, "refs/heads/main").await,
+        saved(&db, "env:prod").await,
         None,
-        "and never under main's"
+        "and never under the Environment's"
     );
+    assert_eq!(saved(&db, "refs/heads/main").await, None, "or main's");
 
-    let prod = CacheScope::for_run(Some("prod"), Some("refs/pull/7/head"), Some("main")).unwrap();
+    let prod =
+        CacheScope::for_run(Some("prod"), Some("refs/heads/main"), Some("main"), false).unwrap();
     let cache = run_once(&db, "run-prod", prod, "tree-from-prod").await;
     assert!(
         cache.restore.is_empty(),
@@ -471,7 +474,7 @@ async fn a_feature_branch_run_restores_the_default_branch_and_saves_under_its_ow
     let db = InMemoryDb::new();
     run_once(&db, "run-main", main_scope(), "tree-from-main").await;
 
-    let feature = CacheScope::for_run(None, Some("refs/heads/feat"), Some("main")).unwrap();
+    let feature = CacheScope::for_run(None, Some("refs/heads/feat"), Some("main"), false).unwrap();
     let cache = run_once(&db, "run-feat-1", feature.clone(), "tree-from-feat").await;
     assert_eq!(
         cache.restore,
@@ -512,7 +515,8 @@ async fn an_environment_run_does_not_fall_back_to_the_default_branch() {
     let db = InMemoryDb::new();
     run_once(&db, "run-main", main_scope(), "tree-from-main").await;
 
-    let prod = CacheScope::for_run(Some("prod"), Some("refs/heads/main"), Some("main")).unwrap();
+    let prod =
+        CacheScope::for_run(Some("prod"), Some("refs/heads/main"), Some("main"), false).unwrap();
     let cache = run_once(&db, "run-prod", prod, "tree-from-prod").await;
     assert!(cache.restore.is_empty(), "{:?}", cache.restore);
     assert_eq!(cache.fallback_key, None);
@@ -528,7 +532,7 @@ async fn an_environment_run_does_not_fall_back_to_the_default_branch() {
 #[tokio::test]
 async fn a_rerun_keeps_the_scope_its_run_started_with() {
     let db = InMemoryDb::new();
-    let feature = CacheScope::for_run(None, Some("refs/heads/feat"), Some("main")).unwrap();
+    let feature = CacheScope::for_run(None, Some("refs/heads/feat"), Some("main"), false).unwrap();
     let (run, build) = seed_run(
         &db,
         "run-feat",
@@ -581,7 +585,7 @@ async fn a_rerun_keeps_the_scope_its_run_started_with() {
 /// The scope a Run gets from its Environment, ref and default branch.
 #[test]
 fn the_cache_scope_derives_from_the_environment_else_the_ref() {
-    let scope = |env, git_ref, default| CacheScope::for_run(env, git_ref, default);
+    let scope = |env, git_ref, default| CacheScope::for_run(env, git_ref, default, false);
     let s = |own: &str, fallback: Option<&str>| {
         Some(CacheScope {
             own: own.into(),
@@ -594,6 +598,29 @@ fn the_cache_scope_derives_from_the_environment_else_the_ref() {
         s("env:prod", None)
     );
     assert_eq!(scope(Some("prod"), None, None), s("env:prod", None));
+    // A pull request never gets the Environment's scope: not on a pull or
+    // merge request ref, and not when the event is a pull request or a
+    // locked-out fork (`pull_request`). It is scoped by its ref instead.
+    assert_eq!(
+        scope(Some("prod"), Some("refs/pull/7/head"), Some("main")),
+        s("refs/pull/7/head", Some("refs/heads/main"))
+    );
+    assert_eq!(
+        scope(
+            Some("prod"),
+            Some("refs/merge-requests/7/head"),
+            Some("main")
+        ),
+        s("refs/merge-requests/7/head", Some("refs/heads/main"))
+    );
+    assert_eq!(
+        CacheScope::for_run(Some("prod"), Some("refs/heads/feat"), Some("main"), true),
+        s("refs/heads/feat", Some("refs/heads/main"))
+    );
+    assert_eq!(
+        CacheScope::for_run(Some("prod"), None, Some("main"), true),
+        None
+    );
     // A ref reads its own scope, then the default branch's.
     assert_eq!(
         scope(None, Some("refs/pull/7/head"), Some("main")),

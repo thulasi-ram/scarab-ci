@@ -171,11 +171,13 @@ record. Read Breaking changes before you upgrade.
   cache scope, fixed when the Run is created and kept by its reruns. A Run governed by an
   Environment uses `env:<name>`: it reads and writes only that scope, so its first build is
   cold. Any other Run uses its ref (`refs/heads/feat`, `refs/pull/7/head`): it writes only that
-  scope, and when that scope has no entry it reads the default branch's. A pull request reads
-  `main`'s Cache and never writes it. Pull requests, which saved nothing before, now save to
-  their own scope. A Run with no ref (a comment trigger) has its Cache off. The server asks the
-  forge for the default branch when it creates a Run that declares a `cache:`; when the forge
-  does not answer, that Run reads only its own scope.
+  scope, and when that scope has no entry it reads the default branch's. A pull request never
+  uses an Environment's scope, even when its Pipeline names the Environment and the Environment
+  admits it: it uses its own ref like any other Run. A pull request reads `main`'s Cache and
+  never writes it. Pull requests, which saved nothing before, now save to their own scope. A Run
+  with no ref (a comment trigger) has its Cache off. The server asks the forge for the default
+  branch when it creates a Run that declares a `cache:`; when the forge does not answer, that
+  Run reads only its own scope.
 - An admin of one org could list, delete, re-sync and bind repos through another org's forge
   connections, and an API token scoped to one org could do the same (git-bug 19b0a45). Each
   connection now belongs to an org, and its routes need `Administer` on that org; another

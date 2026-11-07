@@ -816,6 +816,10 @@ pub struct CacheConfig {
 /// - An Environment-governed Run uses `env:<name>`: it reads and writes only
 ///   that scope, with no fallback, so nothing outside the Environment writes
 ///   what its Steps restore.
+/// - A pull request never uses `env:<name>`, even when its Pipeline names an
+///   Environment and the Environment admits it: the Pipeline is the pull
+///   request's own YAML, so a fork could otherwise write what the next deploy
+///   restores. It is scoped like any other Run.
 /// - Any other Run uses its symbolic ref (`refs/heads/x`,
 ///   `refs/pull/7/head`, `refs/tags/v1`): it writes only that scope and, on a
 ///   miss, reads the default branch's (`refs/heads/<default>`). A pull
@@ -833,16 +837,34 @@ pub struct CacheScope {
 }
 
 impl CacheScope {
-    /// The scope for a Run governed by `environment`, else on `git_ref`. A
-    /// ref that is not a full `refs/…` name gives no scope: the two kinds of
+    /// The Environment whose scope a Run uses: `environment`, unless the Run
+    /// is a pull request. `pull_request` is true when the event is a pull
+    /// request or the Run is locked out of secrets as a fork; a `git_ref`
+    /// naming a pull or merge request's head (`refs/pull/…`,
+    /// `refs/merge-requests/…`) counts too, which covers a dispatch on a pull
+    /// request's ref and a follow-up of a pull request's Run.
+    pub fn environment_scope<'a>(
+        environment: Option<&'a str>,
+        git_ref: Option<&str>,
+        pull_request: bool,
+    ) -> Option<&'a str> {
+        let pull_request_ref = git_ref
+            .is_some_and(|r| r.starts_with("refs/pull/") || r.starts_with("refs/merge-requests/"));
+        environment.filter(|_| !pull_request && !pull_request_ref)
+    }
+
+    /// The scope for a Run governed by `environment` (unless it is a pull
+    /// request, see [`Self::environment_scope`]), else on `git_ref`. A ref
+    /// that is not a full `refs/…` name gives no scope: the two kinds of
     /// scope must never spell the same string, and a git ref cannot contain
     /// `:`. `default_branch` is the bare branch name (`main`).
     pub fn for_run(
         environment: Option<&str>,
         git_ref: Option<&str>,
         default_branch: Option<&str>,
+        pull_request: bool,
     ) -> Option<Self> {
-        if let Some(env) = environment {
+        if let Some(env) = Self::environment_scope(environment, git_ref, pull_request) {
             return Some(Self {
                 own: format!("env:{env}"),
                 fallback: None,

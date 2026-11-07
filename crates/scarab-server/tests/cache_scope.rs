@@ -1,6 +1,6 @@
 //! The cache scope a Run is created with (git-bug efcec77), through the real
 //! webhook trigger path: an Environment-governed Run gets `env:<name>` and no
-//! fallback; any other Run gets its symbolic ref and, as its fallback read,
+//! fallback, unless it is a pull request; any other Run gets its symbolic ref and, as its fallback read,
 //! the default branch's scope the forge reports at creation. The scheduler's
 //! side (the key folds the scope, the restore falls back, the save never
 //! does) is proved in `scarab-db-postgres/tests/cache_inmemory.rs`.
@@ -35,6 +35,19 @@ steps:
 const DEPLOY_YAML: &str = r#"
 on:
   push: {}
+environment: prod
+steps:
+  - id: build
+    image: busybox
+    command: ["true"]
+    cache: { dirs: [node_modules], key: [package-lock.json] }
+"#;
+
+/// A deploy Pipeline that also runs on pull requests: a fork's own copy of
+/// it names `prod`, and `prod` (empty `allowed_refs`) admits the PR.
+const PR_DEPLOY_YAML: &str = r#"
+on:
+  pull_request: {}
 environment: prod
 steps:
   - id: build
@@ -171,6 +184,34 @@ async fn an_environment_governed_run_is_scoped_by_the_environment_with_no_fallba
         Some(CacheScope {
             own: "env:prod".into(),
             fallback: None,
+        })
+    );
+}
+
+/// A fork pull request whose own YAML names `prod`, which `prod` admits, is
+/// scoped by its pull request ref with the default branch as fallback, like
+/// an ungoverned Run: it never writes `env:prod`, which the next deploy
+/// restores, and never reads it either.
+#[tokio::test]
+async fn a_fork_pull_request_naming_the_environment_is_scoped_by_its_ref() {
+    let forge = FakeForge::new().with_file(".scarab/deploy.yaml", PR_DEPLOY_YAML);
+    forge.set_default_branch("trunk");
+    let db = InMemoryDb::new();
+    let envs = prod();
+
+    let (run, scope) = scope_of(&forge, &db, Some(&envs), &pull_request(7)).await;
+    let ctx = db
+        .run_deploy_context(&run)
+        .await
+        .unwrap()
+        .expect("the Environment governs the Run");
+    assert_eq!(ctx.environment, "prod");
+    assert!(ctx.locked_out, "a fork is locked out of prod's secrets");
+    assert_eq!(
+        scope,
+        Some(CacheScope {
+            own: "refs/pull/7/head".into(),
+            fallback: Some("refs/heads/trunk".into()),
         })
     );
 }
