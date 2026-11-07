@@ -37,7 +37,6 @@ import {
   type RulesForm,
 } from "../environment-overlays";
 import {
-  confirmsName,
   environmentEditHref,
   environmentHref,
   environmentsHref,
@@ -52,6 +51,8 @@ import { absTime, relTime } from "../fmt";
 import PrincipalSearch from "../components/PrincipalSearch";
 import FormSection from "../components/FormSection";
 import Icon from "../components/Icon";
+import ConfirmDestructive from "../components/ConfirmDestructive";
+import { Checkbox, Field, Input } from "../components/Field";
 
 /**
  * The settings frame around one Environment's page, with the org and name
@@ -346,103 +347,92 @@ function EditForm(props: { org: string; env: OrgEnvironment }) {
         </div>
         <div class="secrets-body token-form">
           <FormSection n={1} title="Name">
-            <div class="input input-static mono">{props.env.name}</div>
-            <p class="fieldnote">
+            <Input mono readOnly aria-label="name" value={props.env.name} onValue={() => {}} />
+            <p class="f-help">
               The name pipelines put in <span class="mono">environment:</span>. It cannot be
               changed: to use another name, create that environment and change the pipelines.
             </p>
           </FormSection>
 
           <FormSection n={2} title="Description">
-            <input
+            <Input
               id="env-description"
-              class="input"
               aria-label="description"
               placeholder="what lands here, who runs it"
               value={description()}
-              onInput={(e) => setDescription(e.currentTarget.value)}
+              onValue={setDescription}
             />
           </FormSection>
 
           <FormSection n={3} title="Baseline" note="Every project's deploys here obey these rules. A project can add to them for itself, never loosen them.">
-            <div class="form-r">
-              <label for="env-approvers">approvers</label>
-              <input
-                id="env-approvers"
-                class="input mono"
-                placeholder="comma-separated user ids (blank = none)"
+            <Field id="env-approvers" label="Approvers" help="Every one must approve a deploy's gate, in every project. User ids, comma-separated.">
+              <Input
+                mono
+                placeholder="none"
                 value={baseline().approvers}
-                onInput={(e) => setRule({ approvers: e.currentTarget.value })}
+                onValue={(v) => setRule({ approvers: v })}
               />
-              <PrincipalSearch
-                org={props.org}
-                placeholder="add an approver: find a user"
-                onPick={(id) => setRule({ approvers: addToList(baseline().approvers, id) })}
-              />
-              <p class="fieldnote">Every one must approve a deploy's gate, in every project.</p>
-            </div>
-            <div class="form-r">
-              <label for="env-refs">allowed refs</label>
-              <input
-                id="env-refs"
-                class="input mono"
-                placeholder="refs/heads/main, refs/tags/* (blank = any ref)"
+            </Field>
+            <PrincipalSearch
+              org={props.org}
+              placeholder="Add an approver: find a user"
+              onPick={(id) => setRule({ approvers: addToList(baseline().approvers, id) })}
+            />
+            <Field
+              id="env-refs"
+              label="Allowed refs"
+              help={
+                <>
+                  Full refs, comma-separated, e.g. <span class="mono">refs/heads/main</span>,{" "}
+                  <span class="mono">refs/tags/*</span>.
+                </>
+              }
+            >
+              <Input
+                mono
+                placeholder="blank allows any ref"
                 value={baseline().allowedRefs}
-                onInput={(e) => setRule({ allowedRefs: e.currentTarget.value })}
+                onValue={(v) => setRule({ allowedRefs: v })}
               />
-            </div>
-            <div class="form-r">
-              <label for="env-wait">wait timer (s)</label>
-              <input
-                id="env-wait"
-                class="input mono"
-                type="number"
-                min="0"
+            </Field>
+            <Field id="env-wait" label="Wait timer" help="Recorded, not yet enforced.">
+              <Input
+                mono
+                inputmode="numeric"
+                suffix="seconds"
                 value={baseline().waitTimerS}
-                onInput={(e) => setRule({ waitTimerS: e.currentTarget.value })}
+                onValue={(v) => setRule({ waitTimerS: v })}
               />
-              <p class="fieldnote">Recorded, not yet enforced.</p>
-            </div>
-            <div class="form-r">
-              <label class="checkbox-inline">
-                <input
-                  type="checkbox"
-                  checked={baseline().requireReason}
-                  onInput={(e) => setRule({ requireReason: e.currentTarget.checked })}
-                />
-                <span>manual and API dispatches must give a reason</span>
-              </label>
-            </div>
+            </Field>
+            <Checkbox
+              checked={baseline().requireReason}
+              onChecked={(v) => setRule({ requireReason: v })}
+              label="Require a reason"
+              help="Manual and API dispatches must give one."
+            />
           </FormSection>
 
           <FormSection n={4} title="Who may deploy">
-            <div class="form-r">
-              <label class="checkbox-inline">
-                <input
-                  type="checkbox"
-                  checked={allProjects()}
-                  onInput={(e) => setAllProjects(e.currentTarget.checked)}
-                />
-                <span>every project in {props.org}</span>
-              </label>
-            </div>
+            <Checkbox
+              checked={allProjects()}
+              onChecked={setAllProjects}
+              label={`Every project in ${props.org}`}
+            />
             <Show when={!allProjects()}>
-              <div class="form-r">
-                <label for="env-projects">projects</label>
-                <input
-                  id="env-projects"
-                  class="input mono"
-                  placeholder="payments, team-a-*"
-                  value={patterns()}
-                  onInput={(e) => setPatterns(e.currentTarget.value)}
-                />
-                <p class="fieldnote">
-                  Project (repository) names; <span class="mono">*</span> matches anything. Empty
-                  admits no project: a pipeline naming {props.env.name} is refused.
-                </p>
-              </div>
+              <Field
+                id="env-projects"
+                label="Projects"
+                help={
+                  <>
+                    Project (repository) names; <span class="mono">*</span> matches anything. Empty
+                    admits no project: a pipeline naming {props.env.name} is refused.
+                  </>
+                }
+              >
+                <Input mono placeholder="payments, team-a-*" value={patterns()} onValue={setPatterns} />
+              </Field>
             </Show>
-            <p class="fieldnote">
+            <p class="f-help">
               Takes effect for the next run, the next gate approval and the next step that would
               receive this environment's secrets.
             </p>
@@ -482,77 +472,36 @@ function EditForm(props: { org: string; env: OrgEnvironment }) {
   );
 }
 
-/** Ask for `name` typed exactly before `run`; a button until opened. */
+/** A button that asks for `name` typed exactly, in a dialog, before `run`. */
 function TypedConfirm(props: {
   name: string;
   /** What the opening button says. */
   label: string;
+  /** The dialog's question. */
+  title: string;
+  /** One line: what happens as a result. */
+  purpose: string;
   /** What the confirming button says. */
   confirm: string;
   run: () => Promise<void>;
 }) {
   const [open, setOpen] = createSignal(false);
-  const [typed, setTyped] = createSignal("");
-  const [busy, setBusy] = createSignal(false);
-  const [error, setError] = createSignal<string | null>(null);
-  const go = async () => {
-    if (!confirmsName(typed(), props.name) || busy()) return;
-    setBusy(true);
-    setError(null);
-    try {
-      await props.run();
-      setOpen(false);
-      setTyped("");
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "The server refused it.");
-    } finally {
-      setBusy(false);
-    }
-  };
   return (
-    <Show
-      when={open()}
-      fallback={
-        <button class="btn btn-danger btn-sm" onClick={() => setOpen(true)}>
-          {props.label}
-        </button>
-      }
-    >
-      <div class="typed-confirm">
-        <label>
-          Type <b class="mono">{props.name}</b> to confirm
-          <input
-            class="input mono"
-            aria-label={`Type ${props.name} to confirm`}
-            value={typed()}
-            onInput={(e) => setTyped(e.currentTarget.value)}
-            autofocus
-          />
-        </label>
-        <div class="modal-actions">
-          <button
-            class="btn btn-danger btn-sm"
-            disabled={!confirmsName(typed(), props.name) || busy()}
-            onClick={go}
-          >
-            {props.confirm}
-          </button>
-          <button
-            class="btn btn-ghost btn-sm"
-            onClick={() => {
-              setOpen(false);
-              setTyped("");
-              setError(null);
-            }}
-          >
-            Cancel
-          </button>
-        </div>
-        <Show when={error()}>
-          <p class="error">{error()}</p>
-        </Show>
-      </div>
-    </Show>
+    <>
+      <button class="btn btn-danger btn-sm" onClick={() => setOpen(true)}>
+        {props.label}
+      </button>
+      <Show when={open()}>
+        <ConfirmDestructive
+          title={props.title}
+          purpose={props.purpose}
+          name={props.name}
+          confirmLabel={props.confirm}
+          onConfirm={props.run}
+          onClose={() => setOpen(false)}
+        />
+      </Show>
+    </>
   );
 }
 
@@ -624,6 +573,8 @@ function GrantsSection(props: { org: string; env: string; epoch: number; onChang
               <TypedConfirm
                 name={p.project}
                 label="withdraw"
+                title={`Withdraw ${p.project}'s privilege grant on ${props.env}?`}
+                purpose={`${p.project}'s steps here can no longer use the privileges it gave.`}
                 confirm="Withdraw grant"
                 run={async () => {
                   await deletePrivilegeGrant(props.org, props.env, p.project);
@@ -640,48 +591,42 @@ function GrantsSection(props: { org: string; env: string; epoch: number; onChang
           <span>Grant privileges</span>
         </div>
         <div class="secrets-body token-form">
-          <p class="fieldnote">
+          <p class="f-help">
             Saved per project, apart from the form above. Saving replaces the project's whole
             grant.
           </p>
-          <div class="form-r">
-            <label for="env-grant-project">project</label>
-            <input
-              id="env-grant-project"
-              class="input mono"
-              placeholder="project (repository) name"
-              value={project()}
-              onInput={(e) => setProject(e.currentTarget.value)}
-            />
-          </div>
-          <div class="form-r">
-            <label>image digests</label>
+          <Field id="env-grant-project" label="Project">
+            <Input mono placeholder="project (repository) name" value={project()} onValue={setProject} />
+          </Field>
+          <div class="f">
+            <div class="f-l">
+              <span class="f-lbl">Image digests</span>
+            </div>
             <div class="oenv-rows">
               <For each={rows()}>
                 {(row, i) => (
                   <div class="oenv-row">
-                    <input
-                      class="input mono"
+                    <Input
+                      mono
                       aria-label="image digest"
                       placeholder="sha256:…"
                       value={row.digest}
-                      onInput={(e) => setRow(i(), { digest: e.currentTarget.value })}
+                      onValue={(v) => setRow(i(), { digest: v })}
                     />
-                    <input
-                      class="input mono"
+                    <Input
+                      mono
                       aria-label="capabilities"
                       placeholder="capabilities (NET_ADMIN, …)"
                       value={row.capabilities}
-                      onInput={(e) => setRow(i(), { capabilities: e.currentTarget.value })}
+                      onValue={(v) => setRow(i(), { capabilities: v })}
                     />
-                    <label class="checkbox-inline" title="May run as a privileged container">
-                      <input
-                        type="checkbox"
+                    <span title="May run as a privileged container">
+                      <Checkbox
                         checked={row.privileged}
-                        onInput={(e) => setRow(i(), { privileged: e.currentTarget.checked })}
+                        onChecked={(v) => setRow(i(), { privileged: v })}
+                        label="privileged"
                       />
-                      <span class="subtle">privileged</span>
-                    </label>
+                    </span>
                     <button
                       class="btn btn-ghost btn-sm"
                       title="Remove this image"
@@ -698,21 +643,16 @@ function GrantsSection(props: { org: string; env: string; epoch: number; onChang
                 </button>
               </div>
             </div>
-            <p class="fieldnote">
+            <p class="f-help">
               A step may use a granted privilege only with an image pinned to one of these digests
               (<span class="mono">repo@sha256:…</span>).
             </p>
           </div>
-          <div class="form-r">
-            <label class="checkbox-inline">
-              <input
-                type="checkbox"
-                checked={permitOverlay()}
-                onInput={(e) => setPermitOverlay(e.currentTarget.checked)}
-              />
-              <span>this project's steps here may set a raw k8s_overlay</span>
-            </label>
-          </div>
+          <Checkbox
+            checked={permitOverlay()}
+            onChecked={setPermitOverlay}
+            label="This project's steps here may set a raw k8s_overlay"
+          />
           <Show when={problem() && project().trim()}>
             <p class="error">{problem()}</p>
           </Show>
@@ -747,6 +687,8 @@ function DeleteSection(props: { org: string; name: string }) {
           <TypedConfirm
             name={props.name}
             label="Delete environment"
+            title={`Delete ${props.name}?`}
+            purpose={`Pipelines naming ${props.name} are refused until an environment of that name exists again.`}
             confirm="Delete environment"
             run={async () => {
               await deleteOrgEnvironment(props.org, props.name);

@@ -15,8 +15,7 @@
 // their source could not be read, the empty state says what is missing, and
 // the admin can retry, point at a mirror, or paste a copy (checked against
 // the manifest's hash).
-import { createResource, createSignal, For, onCleanup, onMount, Show } from "solid-js";
-import { Portal } from "solid-js/web";
+import { createResource, createSignal, For, Show } from "solid-js";
 import { A, useNavigate } from "@solidjs/router";
 import {
   listLibraries,
@@ -42,6 +41,9 @@ import {
 import { relTime, absTime } from "../fmt";
 import Doodle from "./Doodle";
 import Icon from "./Icon";
+import Modal, { ModalMessage } from "./Modal";
+import ConfirmDestructive from "./ConfirmDestructive";
+import { Checkbox, Field, Input, Textarea } from "./Field";
 
 export default function Libraries(props: { org: string }) {
   const nav = useNavigate();
@@ -71,15 +73,16 @@ export default function Libraries(props: { org: string }) {
     }
   };
 
-  const remove = (l: LibraryInstallation) => {
-    const id = `lib:${l.publisher}/${l.name}`;
-    if (
-      !window.confirm(
-        `Remove ${id}?\n\nPipelines that invoke it stop compiling until it is installed again. Runs already created keep the Steps they were compiled with.`,
-      )
-    )
-      return;
-    void act(() => removeLibrary(props.org, l.publisher, l.name), `Could not remove ${id}.`, `${id} is removed.`);
+  // The library the confirm dialog is about to remove. A refusal shows in the
+  // dialog.
+  const [removing, setRemoving] = createSignal<LibraryInstallation | null>(null);
+  const libId = (l: LibraryInstallation) => `lib:${l.publisher}/${l.name}`;
+  const remove = async (l: LibraryInstallation) => {
+    setError(null);
+    setNotice(null);
+    await removeLibrary(props.org, l.publisher, l.name);
+    setNotice(`${libId(l)} is removed.`);
+    reload();
   };
 
   const unyank = (hash: string) =>
@@ -183,7 +186,7 @@ export default function Libraries(props: { org: string }) {
                         onUpgrade={(source) =>
                           nav(reviewHref(props.org, { source: source ?? l.source, publisher: l.publisher, name: l.name }))
                         }
-                        onRemove={() => remove(l)}
+                        onRemove={() => setRemoving(l)}
                         onYank={() => setYanking(l)}
                         onUnyank={() => unyank(l.content_hash)}
                       />
@@ -257,20 +260,33 @@ export default function Libraries(props: { org: string }) {
 
       <Show when={yanking()}>
         {(l) => (
-          <Portal>
-            <YankDialog
-              org={props.org}
-              library={l()}
-              onClose={() => setYanking(null)}
-              onYanked={(msg, upgrade) => {
-                setYanking(null);
-                setError(null);
-                setNotice(msg);
-                reload();
-                if (upgrade) nav(reviewHref(props.org, { source: upgrade, publisher: l().publisher, name: l().name }));
-              }}
-            />
-          </Portal>
+          <YankDialog
+            org={props.org}
+            library={l()}
+            onClose={() => setYanking(null)}
+            onYanked={(msg, upgrade) => {
+              setYanking(null);
+              setError(null);
+              setNotice(msg);
+              reload();
+              if (upgrade) nav(reviewHref(props.org, { source: upgrade, publisher: l().publisher, name: l().name }));
+            }}
+          />
+        )}
+      </Show>
+      <Show when={removing()}>
+        {(l) => (
+          <ConfirmDestructive
+            eyebrow={`${props.org} · libraries`}
+            title={`Remove ${libId(l())}?`}
+            purpose="Pipelines that invoke it stop compiling until it is installed again."
+            name={libId(l())}
+            confirmLabel="Remove library"
+            onConfirm={() => remove(l())}
+            onClose={() => setRemoving(null)}
+          >
+            <p>Runs already created keep the Steps they were compiled with.</p>
+          </ConfirmDestructive>
         )}
       </Show>
     </div>
@@ -446,44 +462,44 @@ function MissingDefaults(props: { org: string; libs: OrgLibraries; onDone: (msg:
       </details>
       <Show when={pane() === "mirror"}>
         <div class="lib-pane">
-          <label>mirror of Scarab's repository</label>
-          <div class="row">
-            <input
-              class="input mono"
-              placeholder="git.example.com/mirrors/scarab-ci"
-              value={mirror()}
-              onInput={(e) => setMirror(e.currentTarget.value)}
-            />
-            <button
-              class="btn btn-primary btn-sm"
-              disabled={busy() || mirror().trim() === ""}
-              onClick={() => void retry("mirror")}
-            >
-              <Icon icon="rotate-cw" size={14} /> Read from mirror
-            </button>
-          </div>
-          <p class="fieldnote" style={{ margin: 0 }}>
-            Each file is read at the same path and commit, and must have the hash the release lists.
-          </p>
+          <Field
+            label="Mirror of Scarab's repository"
+            help="Each file is read at the same path and commit, and must have the hash the release lists."
+          >
+            <div class="row">
+              <Input
+                mono
+                placeholder="git.example.com/mirrors/scarab-ci"
+                value={mirror()}
+                onValue={setMirror}
+              />
+              <button
+                class="btn btn-primary btn-sm"
+                disabled={busy() || mirror().trim() === ""}
+                onClick={() => void retry("mirror")}
+              >
+                <Icon icon="rotate-cw" size={14} /> Read from mirror
+              </button>
+            </div>
+          </Field>
         </div>
       </Show>
       <Show when={pane() === "paste"}>
         <div class="lib-pane">
           <For each={named()}>
             {(m) => (
-              <>
-                <label class="mono">{missingLabel(m)}</label>
-                <textarea
-                  class="input mono"
+              <Field plainLabel label={<span class="mono">{missingLabel(m)}</span>}>
+                <Textarea
+                  mono
                   rows={2}
                   placeholder={`paste the file from the ${release() ?? "release"}`}
                   value={copies()[`${m.publisher}/${m.name}`] ?? ""}
-                  onInput={(e) => setCopies((c) => ({ ...c, [`${m.publisher}/${m.name}`]: e.currentTarget.value }))}
+                  onValue={(v) => setCopies((c) => ({ ...c, [`${m.publisher}/${m.name}`]: v }))}
                 />
-              </>
+              </Field>
             )}
           </For>
-          <p class="fieldnote" style={{ margin: 0 }}>
+          <p class="f-help" style={{ margin: 0 }}>
             Scarab checks each pasted file against the hash the release lists before it installs it.
           </p>
           <div>
@@ -515,22 +531,13 @@ function YankDialog(props: {
   const [upgrade, setUpgrade] = createSignal(!!l().update);
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
+  const [reasonError, setReasonError] = createSignal<string | null>(null);
   const runs = () => impact()?.runs ?? [];
-
-  onMount(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") props.onClose();
-    };
-    document.addEventListener("keydown", onKey);
-    onCleanup(() => document.removeEventListener("keydown", onKey));
-  });
 
   const submit = async () => {
     const problem = yankReasonError(reason());
-    if (problem) {
-      setError(problem);
-      return;
-    }
+    setReasonError(problem);
+    if (problem) return;
     setBusy(true);
     setError(null);
     try {
@@ -549,102 +556,108 @@ function YankDialog(props: {
   };
 
   return (
-    <div class="modal-scrim" onClick={props.onClose}>
-      <div class="modal modal-wide" onClick={(e) => e.stopPropagation()}>
-        <div class="panel-h">
-          <span>
-            <Icon icon="ban" size={13} /> Yank lib:{l().publisher}/{l().name} {shortHash(l().content_hash)}
-          </span>
-        </div>
-        <div class="modal-body">
-          <div class="yk-impact">
-            <Show when={!impact.loading} fallback={<div class="yk-count subtle">Counting the Runs that use it…</div>}>
-              <Show when={impact()} fallback={<div class="yk-count subtle">Could not count the Runs that use it.</div>}>
-                {(i) => (
-                  <div class="yk-count">
-                    {yankImpactLine(i())}
-                    <Show when={runs().length > 0}>
-                      <span class="runs">
-                        <For each={runs()}>
-                          {(r, k) => (
-                            <>
-                              {k() > 0 ? " · " : ""}
-                              <A href={`/${props.org}/${r.project}/runs/${r.id}`}>{impactRunLabel(r)}</A>
-                              {r.running_steps.length > 0 ? ` (${r.running_steps.join(", ")} running)` : ""}
-                            </>
-                          )}
-                        </For>
-                      </span>
-                    </Show>
-                  </div>
-                )}
-              </Show>
-            </Show>
-            <ul class="yk-lines">
-              <li>
-                <span>
-                  {cancel() && runs().length > 0
-                    ? "The Runs above are cancelled, and their running Steps stop."
-                    : "A Step that is running finishes."}
-                </span>
-              </li>
-              <li>
-                <span>
-                  A later Step from this version fails as a config error, and Steps that need it do not
-                  run. Gates from this version cannot be approved; a timer gate fails.
-                </span>
-              </li>
-              <li>
-                <span>New Runs and Reruns that use this version are refused.</span>
-              </li>
-            </ul>
-            <Show when={runs().length > 0}>
-              <label class="checkbox-inline">
-                <input type="checkbox" checked={cancel()} onChange={(e) => setCancel(e.currentTarget.checked)} />
-                <span>Cancel {runs().length === 1 ? "this Run" : `these ${runs().length} Runs`} now</span>
-              </label>
-            </Show>
-          </div>
-          <div class="form-r">
-            <label>reason (shown with every refusal)</label>
-            <textarea
-              class="input"
-              rows={3}
-              value={reason()}
-              onInput={(e) => setReason(e.currentTarget.value)}
-              ref={(el) => queueMicrotask(() => el.focus())}
-            />
-            <p class="fieldnote">
-              Required. Other orgs on this server are not affected. Yanking asks for no passkey;
-              lifting a yank does.
-            </p>
-          </div>
-          <Show when={l().update}>
-            {(u) => (
-              <label class="checkbox-inline">
-                <input type="checkbox" checked={upgrade()} onChange={(e) => setUpgrade(e.currentTarget.checked)} />
-                <span>
-                  then review the upgrade to <span class="lib-hash">{shortHash(u().content_hash)}</span> (
-                  {u().release}; asks for your passkey)
-                </span>
-              </label>
+    <Modal
+      size="wide"
+      icon="ban"
+      eyebrow={`${props.org} · libraries`}
+      title={
+        <>
+          Yank lib:{l().publisher}/{l().name} <span class="mono">{shortHash(l().content_hash)}</span>
+        </>
+      }
+      purpose="Stop this version from running in this org."
+      busy={busy()}
+      onClose={props.onClose}
+      footer={
+        <>
+          <Show when={error()}>
+            <ModalMessage>{error()}</ModalMessage>
+          </Show>
+          <button class="btn btn-ghost" type="button" onClick={props.onClose} disabled={busy()}>
+            Cancel
+          </button>
+          <button
+            class="btn btn-danger"
+            type="button"
+            disabled={busy() || reason().trim() === ""}
+            onClick={() => void submit()}
+          >
+            <Icon icon="ban" size={14} /> {busy() ? "Yanking…" : yankButtonLabel(cancel(), runs().length)}
+          </button>
+        </>
+      }
+    >
+      <div class="yk-impact">
+        <Show when={!impact.loading} fallback={<div class="yk-count subtle">Counting the Runs that use it…</div>}>
+          <Show when={impact()} fallback={<div class="yk-count subtle">Could not count the Runs that use it.</div>}>
+            {(i) => (
+              <div class="yk-count">
+                {yankImpactLine(i())}
+                <Show when={runs().length > 0}>
+                  <span class="runs">
+                    <For each={runs()}>
+                      {(r, k) => (
+                        <>
+                          {k() > 0 ? " · " : ""}
+                          <A href={`/${props.org}/${r.project}/runs/${r.id}`}>{impactRunLabel(r)}</A>
+                          {r.running_steps.length > 0 ? ` (${r.running_steps.join(", ")} running)` : ""}
+                        </>
+                      )}
+                    </For>
+                  </span>
+                </Show>
+              </div>
             )}
           </Show>
-          <Show when={error()}>
-            <p class="error">{error()}</p>
-          </Show>
-        </div>
-        <div class="modal-foot">
-          <div class="modal-actions">
-            <button class="btn btn-danger" disabled={busy() || reason().trim() === ""} onClick={() => void submit()}>
-              <Icon icon="ban" size={14} /> {busy() ? "Yanking…" : yankButtonLabel(cancel(), runs().length)}
-            </button>
-            <button class="btn btn-ghost" onClick={props.onClose}>
-              Cancel
-            </button>
-          </div>
-        </div>
+        </Show>
+        <ul class="yk-lines">
+          <li>
+            <span>
+              {cancel() && runs().length > 0
+                ? "The Runs above are cancelled, and their running Steps stop."
+                : "A Step that is running finishes."}
+            </span>
+          </li>
+          <li>
+            <span>
+              A later Step from this version fails as a config error, and Steps that need it do not
+              run. Gates from this version cannot be approved; a timer gate fails.
+            </span>
+          </li>
+          <li>
+            <span>New Runs and Reruns that use this version are refused.</span>
+          </li>
+        </ul>
+        <Show when={runs().length > 0}>
+          <Checkbox
+            checked={cancel()}
+            onChecked={setCancel}
+            label={`Cancel ${runs().length === 1 ? "this Run" : `these ${runs().length} Runs`} now`}
+          />
+        </Show>
       </div>
-    </div>
+      <Field
+        label="Reason"
+        required
+        help="Shown with every refusal. Other orgs on this server are not affected. Yanking asks for no passkey; lifting a yank does."
+        error={reasonError()}
+      >
+        <Textarea rows={3} autofocus value={reason()} onValue={setReason} />
+      </Field>
+      <Show when={l().update}>
+        {(u) => (
+          <Checkbox
+            checked={upgrade()}
+            onChecked={setUpgrade}
+            label={
+              <>
+                Then review the upgrade to <span class="lib-hash">{shortHash(u().content_hash)}</span>
+              </>
+            }
+            help={`${u().release}; asks for your passkey.`}
+          />
+        )}
+      </Show>
+    </Modal>
   );
 }

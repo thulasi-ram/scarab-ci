@@ -5536,10 +5536,21 @@ async fn admit_unrecorded(
 
     let now = clock.now().await;
     let run = run_id_for(event, path);
+    let admitted = AdmittedFacts {
+        event: &facts,
+        trusted_only: &tokens.trusted_only,
+    };
+    // Rendered before the Policies are consulted: a key that cannot be
+    // rendered refuses the Run before an allow decision naming it is
+    // recorded (git-bug bbc433e).
+    let concurrency_group = concurrency_group_key(ir, event, params, &admitted)?;
     // ADR-0075: the `run.create` Policies, after the Environment's ref and
     // reason checks and before anything is persisted (`persist_run_from_ir`
     // is not atomic, so a deny after it would leave a partial Run). The run
     // id is minted first so an allow decision names the Run it admitted.
+    // Nothing that can refuse the Run runs between the decision and the
+    // Run's first row (`begin_run_creation`); a write failure after that row
+    // ends the Run Failed, and the decision still names a real Run.
     if let Some(policies) = ports.policies {
         if let Err(refusal) = consult_run_create(
             policies,
@@ -5559,11 +5570,20 @@ async fn admit_unrecorded(
             return Ok(Admission::Refused(refusal));
         }
     }
-    let admitted = AdmittedFacts {
-        event: &facts,
-        trusted_only: &tokens.trusted_only,
-    };
-    persist_run_from_ir(db, &run, ir, event, path, &gov, excluded, params, &admitted, now).await?;
+    persist_run_from_ir(
+        db,
+        &run,
+        ir,
+        event,
+        path,
+        &gov,
+        excluded,
+        params,
+        &admitted,
+        concurrency_group.as_deref(),
+        now,
+    )
+    .await?;
     Ok(Admission::Created(run))
 }
 
@@ -6513,9 +6533,9 @@ async fn persist_run_from_ir(
     excluded: &[String],
     params: Option<&std::collections::BTreeMap<String, serde_json::Value>>,
     admitted: &AdmittedFacts<'_>,
+    concurrency_group: Option<&str>,
     now: Timestamp,
 ) -> Result<(), TriggerError> {
-    let concurrency_group = concurrency_group_key(ir, event, params, admitted)?;
     db.begin_run_creation(run, ir.ir_version, EVENT_VERSION, now)
         .await?;
     let written = write_run_from_ir(
@@ -6528,15 +6548,16 @@ async fn persist_run_from_ir(
         excluded,
         params,
         admitted,
-        concurrency_group.as_deref(),
+        concurrency_group,
         now,
     )
     .await;
     end_run_creation(db, run, now, written).await
 }
 
-/// The concurrency group's key for a Run of `ir`, rendered before any row
-/// of the Run is written ([`persist_run_from_ir`]).
+/// The concurrency group's key for a Run of `ir`, rendered before its
+/// `run.create` Policies are consulted and before any row of the Run is
+/// written ([`admit_unrecorded`]).
 fn concurrency_group_key(
     ir: &scarab_pipeline::PipelineIr,
     event: &scarab_forge::Event,

@@ -20,8 +20,7 @@
 //
 // Every server refusal (400/409) is shown verbatim: it is the answer to "why
 // will this not save".
-import { createResource, createSignal, For, onCleanup, onMount, Show } from "solid-js";
-import { Portal } from "solid-js/web";
+import { createResource, createSignal, For, Show } from "solid-js";
 import { A, useNavigate } from "@solidjs/router";
 import {
   acknowledgeMigrationReport,
@@ -35,6 +34,8 @@ import { eligibilityLabel, isPermissive, reportBanner, rulesSummary } from "../e
 import { environmentHref, nameError, toPutBody } from "../org-environments";
 import { relTime, absTime } from "../fmt";
 import Icon from "./Icon";
+import Modal, { ModalMessage } from "./Modal";
+import { Field, Input } from "./Field";
 
 export default function OrgEnvironments(props: { org: string }) {
   const nav = useNavigate();
@@ -109,20 +110,16 @@ export default function OrgEnvironments(props: { org: string }) {
       </div>
 
       <Show when={creating()}>
-        {/* Portalled, as Plugins' install dialog: in-panel, it rendered under
-            the panels after this one (each is its own stacking context). */}
-        <Portal>
-          <CreateDialog
-            org={props.org}
-            taken={rows().map((e) => e.name)}
-            onClose={() => setCreating(false)}
-            onCreated={(name) => {
-              setCreating(false);
-              setEpoch((e) => e + 1);
-              nav(environmentHref(props.org, name));
-            }}
-          />
-        </Portal>
+        <CreateDialog
+          org={props.org}
+          taken={rows().map((e) => e.name)}
+          onClose={() => setCreating(false)}
+          onCreated={(name) => {
+            setCreating(false);
+            setEpoch((e) => e + 1);
+            nav(environmentHref(props.org, name));
+          }}
+        />
       </Show>
     </div>
   );
@@ -181,14 +178,6 @@ function CreateDialog(props: {
   const [saving, setSaving] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
 
-  onMount(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") props.onClose();
-    };
-    document.addEventListener("keydown", onKey);
-    onCleanup(() => document.removeEventListener("keydown", onKey));
-  });
-
   const nameProblem = () => {
     const n = name();
     if (props.taken.includes(n)) return `${n} is already registered. Open it to change it.`;
@@ -211,60 +200,43 @@ function CreateDialog(props: {
   };
 
   return (
-    <div class="modal-scrim" onClick={props.onClose}>
-      <div class="modal modal-tall" onClick={(e) => e.stopPropagation()}>
-        <div class="panel-h">
-          <span>New environment</span>
-        </div>
-        <div class="modal-body">
-          <div class="form-r">
-            <label for="new-env-name">name</label>
-            <input
-              id="new-env-name"
-              class="input mono"
-              placeholder="production, staging, prod-eu"
-              value={name()}
-              onInput={(e) => setName(e.currentTarget.value)}
-              autofocus
-            />
-            <p class="fieldnote">
-              Exactly the name pipelines use; case matters. It cannot be changed later.
-            </p>
-          </div>
-
-          <div class="form-r">
-            <label for="new-env-description">description</label>
-            <input
-              id="new-env-description"
-              class="input"
-              placeholder="what lands here, who runs it"
-              value={description()}
-              onInput={(e) => setDescription(e.currentTarget.value)}
-            />
-          </div>
-          <p class="fieldnote">
-            A new environment has no baseline rule and admits no project. Set both on its page.
-          </p>
-        </div>
-
-        <div class="modal-foot">
-          <Show when={name() && nameProblem()}>
-            <p class="error">{nameProblem()}</p>
-          </Show>
+    <Modal
+      eyebrow={`${props.org} · environments`}
+      title="New environment"
+      purpose="A place deploys land, under the name pipelines use for it."
+      busy={saving()}
+      onClose={props.onClose}
+      after={{
+        label: "after creating",
+        value: "A new environment has no baseline rule and admits no project. Set both on its page.",
+      }}
+      footer={
+        <>
           <Show when={error()}>
-            <p class="error">{error()}</p>
+            <ModalMessage>{error()}</ModalMessage>
           </Show>
-          <div class="modal-actions">
-            <button class="btn btn-primary" disabled={!!nameProblem() || saving()} onClick={save}>
-              {saving() ? "Creating…" : "Create environment"}
-            </button>
-            <button class="btn btn-ghost" onClick={props.onClose}>
-              Cancel
-            </button>
-          </div>
-        </div>
-      </div>
-    </div>
+          <button class="btn btn-ghost" type="button" onClick={props.onClose} disabled={saving()}>
+            Cancel
+          </button>
+          <button class="btn btn-primary" type="button" disabled={!!nameProblem() || saving()} onClick={save}>
+            {saving() ? "Creating…" : "Create environment"}
+          </button>
+        </>
+      }
+    >
+      <Field
+        id="new-env-name"
+        label="Name"
+        required
+        help="Exactly the name pipelines use; case matters. It cannot be changed later."
+        error={name() ? nameProblem() : null}
+      >
+        <Input mono autofocus placeholder="production, staging, prod-eu" value={name()} onValue={setName} />
+      </Field>
+      <Field id="new-env-description" label="Description">
+        <Input placeholder="what lands here, who runs it" value={description()} onValue={setDescription} />
+      </Field>
+    </Modal>
   );
 }
 
