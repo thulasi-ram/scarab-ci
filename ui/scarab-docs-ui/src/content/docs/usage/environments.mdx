@@ -106,6 +106,8 @@ An Environment's baseline protection rules are:
 - **Approval gate settings** (baseline only): what happens when a pipeline has no gate (add one, the
   default, or refuse the Run), the expiry of the gate the Environment adds, how many of the
   approvers must approve (default: every one), and the maximum approval age (default 24 hours).
+  Where only some of the approvers must approve, adding an approver needs a step-up, as removing
+  one does.
 
 On the edit page these settings are in the **Approval gate** section: **When a pipeline has no
 approval gate** (**Add an approval gate** or **Refuse the Run**), **Added gate expiry** (blank: no
@@ -149,6 +151,8 @@ When a pipeline has no `manual` gate in front of a Step that uses the authority,
 **adds one**: a `manual` gate with the id `environment-approval` (with `-2`, `-3`, … appended if the
 pipeline uses that id), in front of the earliest such Steps, with their `needs` combined. Its
 origin names the Environment. It works like any other gate: approve, reject, expiry and rerun.
+A Step that never starts, because its `when:` is false or a Step it needs is excluded that way,
+gets no gate and adds none of its `needs` to the gate.
 With `deploy: true` on the whole pipeline the added gate comes first, before the build.
 
 ```yaml
@@ -163,10 +167,11 @@ To keep every wait in the YAML, set the Environment's missing-gate mode to **ref
 such a Step is refused, and the refusal names the Steps and the gate to add.
 
 Every launch of a Step that uses the authority checks the approval again, reruns and retries
-included. The launch is refused (the Step fails `Config` with the reason) when no released approval
-gate is upstream of it, when the Run's ref is no longer in the allowed refs, when the approver set
-has changed since the gate's approvals were given, or when the gate released longer ago than the
-maximum approval age. An `external`, `timer` or `plugin` gate is never an approval gate, so a Step
+included. The launch is refused (the Step fails `Config` with the reason) when the Run's ref is no
+longer in the allowed refs, or when no approval gate upstream of it has released with the approver
+set unchanged since its approvals were given and no longer ago than the maximum approval age. One
+such gate is enough: a QA approval gate released two days ago does not refuse a deploy whose own
+approval gate released a minute ago. An `external`, `timer` or `plugin` gate is never an approval gate, so a Step
 behind only those is refused at launch. Steps with no released approval gate upstream get the
 `env=none` OIDC subject.
 

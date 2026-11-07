@@ -26,8 +26,10 @@
 //!   never reads the token.
 //! - A fork pull request always gets `read`.
 //! - `write` needs a forge that mints a write token, and by default a Run
-//!   governed by an Environment that restricts refs; where that Environment
-//!   has approvers, a manual gate upstream of the Step.
+//!   governed by an Environment that restricts refs. Where that Environment
+//!   has approvers, `write` uses its authority: the Environment adds its
+//!   approval gate in front of the Step, and every launch checks the
+//!   approval again (`secret_executor::environment_approval_refusal`).
 //!
 //! The Run's `event` values are fixed here too ([`event_facts`]), including
 //! `event.repo.clone_url`, computed from the connection registry.
@@ -119,8 +121,6 @@ pub struct WriteGovernance {
     /// The Run is governed by an Environment whose effective allowed refs
     /// are not empty.
     pub restricts_refs: bool,
-    /// That Environment has approvers.
-    pub has_approvers: bool,
 }
 
 /// What Run creation decided about a Run's forge credentials.
@@ -202,22 +202,15 @@ pub async fn forge_token_refusals(
             out.trusted_only.insert(step.id.clone(), hash);
         }
         if access == ForgeToken::Write {
+            // Where the Environment has approvers, `write` uses its
+            // authority like a secret does: the Environment adds its
+            // approval gate in front of the Step (or refuses the Run), and
+            // each launch checks the approval again. No check here.
             if !write.restricts_refs {
                 out.refusals.push(format!(
                     "step `{}` asks for `forge_token: write`, which is allowed only in a Run \
                      governed by an Environment that restricts the refs it deploys from \
                      (non-empty allowed refs)",
-                    step.id
-                ));
-                continue;
-            }
-            if write.has_approvers
-                && !scarab_policy::approval_gate::manual_gate_upstream(ir, &step.id)
-            {
-                out.refusals.push(format!(
-                    "step `{}` asks for `forge_token: write`, which uses the Environment's \
-                     authority, and the Environment has approvers: put a `gate: manual` in its \
-                     `needs` so an approver releases it first",
                     step.id
                 ));
             }
