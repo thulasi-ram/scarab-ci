@@ -25,9 +25,9 @@ use scarab_identity::{Role, Scope};
 use scarab_policy::policy::Policy;
 use scarab_policy::store::{NewPolicy, PolicyScope, PolicyStore};
 use scarab_project::{
-    ApprovalGateRules, EnvironmentGovernanceStore, EnvironmentProjectEligibility, EnvironmentProjectOverlay,
-    EnvironmentProjectPrivilegeGrant, EnvironmentProtectionRules, ImageGrant, MissingGateMode,
-    OrgEnvironment, OrgEnvironmentStore,
+    ApprovalGateRules, EnvironmentGovernanceStore, EnvironmentProjectEligibility,
+    EnvironmentProjectOverlay, EnvironmentProjectPrivilegeGrant, EnvironmentProtectionRules,
+    ImageGrant, MissingGateMode, OrgEnvironment, OrgEnvironmentStore,
 };
 use scarab_secrets::{Secret, SecretError, SecretProvider, SecretScope};
 use scarab_testkit::{FakeSecrets, InMemoryPolicies};

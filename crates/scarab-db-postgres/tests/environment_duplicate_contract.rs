@@ -10,9 +10,9 @@ mod common;
 use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
 use scarab_project::{
-    ApprovalGateRules, EnvironmentGovernanceStore, EnvironmentProjectEligibility, EnvironmentProjectOverlay,
-    EnvironmentProjectPrivilegeGrant, EnvironmentProtectionRules, ImageGrant, OrgEnvironment,
-    MissingGateMode, OrgEnvironmentError, OrgEnvironmentStore,
+    ApprovalGateRules, EnvironmentGovernanceStore, EnvironmentProjectEligibility,
+    EnvironmentProjectOverlay, EnvironmentProjectPrivilegeGrant, EnvironmentProtectionRules,
+    ImageGrant, MissingGateMode, OrgEnvironment, OrgEnvironmentError, OrgEnvironmentStore,
 };
 use scarab_testkit::InMemoryEnvironmentGovernance;
 
