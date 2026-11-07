@@ -17,6 +17,9 @@ async-trait = { workspace = true }
 # pipeline's (`scarab_pipeline::cel`), so a `when:` and a Policy rule are
 # held to one measured limit. A pure crate.
 scarab-pipeline = { workspace = true }
+# The Environment's typed approval-gate settings (`EffectiveProtection`),
+# which the built-in Environment rules evaluate (ADR-0078 §6). A pure crate.
+scarab-project = { workspace = true }
 # Admitted per ADR-0031 (I/O-free library, listed for pure crates in the
 # root manifest): a Policy's content hash and the PolicySetDigest (ADR-0075
 # §9, §11) are SHA-256 over canonical JSON, domain facts a decision records.

@@ -229,7 +229,7 @@ pub struct CapExceeded(pub String);
 
 /// `items` as a capped list, or the refusal naming `owner`, the list's `noun`
 /// and the cap.
-fn capped<T, const N: usize>(
+pub fn capped<T, const N: usize>(
     items: Vec<T>,
     owner: &dyn Fn() -> String,
     noun: &str,
@@ -246,7 +246,7 @@ fn cap_message(owner: &dyn Fn() -> String, len: usize, noun: &str, cap: usize) -
     ))
 }
 
-fn origin_of(
+pub fn origin_of(
     chain: &[scarab_pipeline::OriginEntry],
     owner: &dyn Fn() -> String,
 ) -> Result<Capped<Origin, MAX_ORIGIN>, CapExceeded> {
@@ -267,7 +267,7 @@ fn origin_of(
     capped(links, owner, "links in its origin chain")
 }
 
-fn gate_kind(step: &scarab_pipeline::StepSpec) -> Result<GateKind, CapExceeded> {
+pub fn gate_kind(step: &scarab_pipeline::StepSpec) -> Result<GateKind, CapExceeded> {
     match step.gate.as_deref() {
         Some("manual") => Ok(GateKind::Manual),
         Some("timer") => Ok(GateKind::Timer),
