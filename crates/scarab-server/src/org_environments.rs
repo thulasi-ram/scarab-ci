@@ -532,7 +532,9 @@ pub(crate) async fn put_org_environment(
 /// Delete an Environment and its eligibility. Administer on the Org.
 ///
 /// Refused (409) while any Project holds an overlay or privilege grant in
-/// it (ADR-0071 §3, §8: those are never dropped as a side effect).
+/// it (ADR-0071 §3, §8: those are never dropped as a side effect), and while
+/// any Project holds a secret in it (git-bug 52964b4): a secret never
+/// outlives its Environment, and is never dropped as a side effect either.
 #[utoipa::path(
     delete,
     path = "/v1/orgs/{org}/environments/{env}",
@@ -545,7 +547,7 @@ pub(crate) async fn put_org_environment(
         (status = 204, description = "deleted"),
         (status = 403, description = "not an org admin"),
         (status = 404, description = "no such Environment, or not configured"),
-        (status = 409, description = "project overlays or grants still pin the Environment")
+        (status = 409, description = "project overlays, grants or secrets still pin the Environment")
     )
 )]
 pub(crate) async fn delete_org_environment(
@@ -556,6 +558,28 @@ pub(crate) async fn delete_org_environment(
     let scope = rbac_scope(&org, None);
     authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
     let store = st.org_environments.as_ref().ok_or(ApiError::NotFound)?;
+    if let Some(secrets) = st.secrets.as_ref() {
+        // Fail closed: a store that cannot say whether the Environment holds
+        // secrets does not delete it.
+        let projects = secrets
+            .environment_secret_projects(&org, &env)
+            .await
+            .map_err(|e| {
+                ApiError::Conflict(format!(
+                    "cannot check environment `{env}` for secrets, so it is not deleted: {e}"
+                ))
+            })?;
+        if !projects.is_empty() {
+            return Err(ApiError::Conflict(format!(
+                "environment `{env}` still holds secrets of project(s) {}: delete them first",
+                projects
+                    .iter()
+                    .map(|p| format!("`{p}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+    }
     if store
         .delete_org_environment(&org, &env)
         .await
@@ -565,6 +589,74 @@ pub(crate) async fn delete_org_environment(
     } else {
         Err(ApiError::NotFound)
     }
+}
+
+/// Secrets one Project holds under an Environment name that has no
+/// Environment. Names only, never values.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct OrphanedSecretsDto {
+    pub environment: String,
+    pub project: String,
+    pub keys: Vec<String>,
+}
+
+/// List the secrets left under Environment names that no longer exist
+/// (git-bug 52964b4): written before an Environment had to exist, or left
+/// when one was deleted before deleting refused. Names only. Delete each
+/// with `DELETE /v1/secrets`. Administer on the Org.
+#[utoipa::path(
+    get,
+    path = "/v1/orgs/{org}/secrets/orphaned",
+    params(("org" = String, Path, description = "org")),
+    summary = "Secrets under Environment names that no longer exist",
+    responses(
+        (status = 200, body = Vec<OrphanedSecretsDto>),
+        (status = 403, description = "not an org admin"),
+        (status = 404, description = "secrets or Environments not configured")
+    )
+)]
+pub(crate) async fn list_orphaned_secrets(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(org): Path<String>,
+) -> Result<Json<Vec<OrphanedSecretsDto>>, ApiError> {
+    let scope = rbac_scope(&org, None);
+    authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
+    let secrets = st.secrets.as_ref().ok_or(ApiError::NotFound)?;
+    let store = st.org_environments.as_ref().ok_or(ApiError::NotFound)?;
+    let live: std::collections::BTreeSet<String> = store
+        .list_org_environments(&org)
+        .await
+        .map_err(org_environment_api_error)?
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    let mut out = Vec::new();
+    for (project, environment) in secrets
+        .environment_secret_scopes(&org)
+        .await
+        .map_err(crate::secret_err)?
+    {
+        if live.contains(&environment) {
+            continue;
+        }
+        let keys = secrets
+            .list_scoped(&scarab_secrets::SecretScope::EnvironmentProject {
+                org: org.clone(),
+                project: project.clone(),
+                environment: environment.clone(),
+            })
+            .await
+            .map_err(crate::secret_err)?;
+        if !keys.is_empty() {
+            out.push(OrphanedSecretsDto {
+                environment,
+                project,
+                keys,
+            });
+        }
+    }
+    Ok(Json(out))
 }
 
 // ---------------------------------------------------------------------------

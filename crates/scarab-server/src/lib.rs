@@ -10770,7 +10770,8 @@ pub(crate) fn secret_err(e: scarab_secrets::SecretError) -> ApiError {
     request_body = PutSecretRequest,
     responses(
         (status = 204, description = "secret stored"),
-        (status = 404, description = "secrets not configured")
+        (status = 404, description = "secrets not configured"),
+        (status = 409, description = "an Environment-scoped secret whose Environment does not exist")
     )
 )]
 async fn put_secret(
@@ -10787,6 +10788,29 @@ async fn put_secret(
     }
     note_org(&st, &req.org).await?;
     let scope = secret_scope(req.org, req.repo, req.environment)?;
+    // An Environment secret lives only while its Environment does (git-bug
+    // 52964b4): no secret under a name with no Environment, which also
+    // keeps a write out of a Duplicate's target until the Duplicate has
+    // created it. Deleting the Environment is refused while it holds any.
+    if let (
+        scarab_secrets::SecretScope::EnvironmentProject {
+            org, environment, ..
+        },
+        Some(envs),
+    ) = (&scope, st.org_environments.as_ref())
+    {
+        let exists = envs
+            .get_org_environment(org, environment)
+            .await
+            .map_err(org_environments::org_environment_api_error)?
+            .is_some();
+        if !exists {
+            return Err(ApiError::Conflict(format!(
+                "environment `{environment}` does not exist in `{org}`: create it before \
+                 setting its secrets"
+            )));
+        }
+    }
     secrets
         .put(
             &scope,
@@ -13280,6 +13304,7 @@ impl utoipa::Modify for StepUpResponses {
         org_environments::get_org_environment,
         org_environments::put_org_environment,
         org_environments::delete_org_environment,
+        org_environments::list_orphaned_secrets,
         org_environments::duplicate_org_environment,
         org_environments::get_environment_eligibility,
         org_environments::put_environment_eligibility,
@@ -13464,6 +13489,7 @@ impl utoipa::Modify for StepUpResponses {
         ApiTokenDto,
         TokenSort,
         org_environments::OrgEnvironmentDto,
+        org_environments::OrphanedSecretsDto,
         org_environments::PutOrgEnvironmentRequest,
         org_environments::DuplicateOrgEnvironmentRequest,
         org_environments::DuplicateOrgEnvironmentResponse,

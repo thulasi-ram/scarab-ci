@@ -267,6 +267,13 @@ record. Read Breaking changes before you upgrade.
   as the `scarab.csrf.<token>` subprotocol, and the server answers with `scarab.v1`. Before it
   opens the socket, the UI makes a plain `GET` of the same URL, which asks for the window when
   the session has none (git-bug aeba20a).
+- An Environment secret could be written under a name with no Environment, outlive its
+  Environment, and be picked up by a later Environment of the same name; one written into a
+  Duplicate's target while the Duplicate ran was overwritten or deleted by it (git-bug
+  52964b4). `POST /v1/secrets` now answers 409 for an Environment that does not exist, and
+  deleting an Environment answers 409 while any Project holds a secret in it. `GET
+  /v1/orgs/{org}/secrets/orphaned` lists, by name, the secrets already left under Environment
+  names that no longer exist, so an admin can delete them.
 - A secret value that is not UTF-8 (a keystore, a binary key) reached the Step changed: it was
   read as text and invalid bytes were replaced. Values are now bytes from the store to the
   file; the per-Pod Kubernetes Secret uses `data`. An `env: true` secret must be UTF-8 text,

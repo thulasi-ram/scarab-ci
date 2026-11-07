@@ -4990,6 +4990,22 @@ impl SecretProvider for FakeSecrets {
         projects.dedup();
         Ok(projects)
     }
+
+    async fn environment_secret_scopes(
+        &self,
+        org: &str,
+    ) -> Result<Vec<(String, String)>, SecretError> {
+        let mut out: Vec<(String, String)> = self
+            .values
+            .lock()
+            .unwrap()
+            .keys()
+            .filter_map(|(s, _)| scarab_secrets::environment_scope_of_scope_key(s, org))
+            .collect();
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
 }
 
 #[cfg(test)]

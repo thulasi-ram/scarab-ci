@@ -745,7 +745,9 @@ export interface paths {
         /**
          * Delete an org Environment (ADR-0071)
          * @description Refused (409) while any Project holds an overlay or privilege grant in
-         *     it (ADR-0071 §3, §8: those are never dropped as a side effect).
+         *     it (ADR-0071 §3, §8: those are never dropped as a side effect), and while
+         *     any Project holds a secret in it (git-bug 52964b4): a secret never
+         *     outlives its Environment, and is never dropped as a side effect either.
          */
         delete: operations["delete_org_environment"];
         options?: never;
@@ -1388,6 +1390,23 @@ export interface paths {
         };
         /** A Project typed setting's version history (ADR-0075 §11) */
         get: operations["list_project_policy_versions"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/secrets/orphaned": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Secrets under Environment names that no longer exist */
+        get: operations["list_orphaned_secrets"];
         put?: never;
         post?: never;
         delete?: never;
@@ -3749,6 +3768,15 @@ export interface components {
             source?: string | null;
             /** @description The version is yanked in the Run's org now. */
             yanked?: boolean;
+        };
+        /**
+         * @description Secrets one Project holds under an Environment name that has no
+         *     Environment. Names only, never values.
+         */
+        OrphanedSecretsDto: {
+            environment: string;
+            keys: string[];
+            project: string;
         };
         /** @description One of the caller's passkeys. */
         PasskeyDto: {
@@ -7127,7 +7155,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description project overlays or grants still pin the Environment */
+            /** @description project overlays, grants or secrets still pin the Environment */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -9621,6 +9649,42 @@ export interface operations {
             };
         };
     };
+    list_orphaned_secrets: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrphanedSecretsDto"][];
+                };
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description secrets or Environments not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     org_security_events: {
         parameters: {
             query?: {
@@ -11405,6 +11469,13 @@ export interface operations {
             };
             /** @description secrets not configured */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an Environment-scoped secret whose Environment does not exist */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

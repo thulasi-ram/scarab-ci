@@ -1951,7 +1951,7 @@
           "Environments"
         ],
         "summary": "Delete an org Environment (ADR-0071)",
-        "description": "Refused (409) while any Project holds an overlay or privilege grant in\nit (ADR-0071 §3, §8: those are never dropped as a side effect).",
+        "description": "Refused (409) while any Project holds an overlay or privilege grant in\nit (ADR-0071 §3, §8: those are never dropped as a side effect), and while\nany Project holds a secret in it (git-bug 52964b4): a secret never\noutlives its Environment, and is never dropped as a side effect either.",
         "operationId": "delete_org_environment",
         "parameters": [
           {
@@ -1991,7 +1991,7 @@
             "description": "no such Environment, or not configured"
           },
           "409": {
-            "description": "project overlays or grants still pin the Environment"
+            "description": "project overlays, grants or secrets still pin the Environment"
           },
           "429": {
             "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
@@ -5359,6 +5359,55 @@
         ]
       }
     },
+    "/v1/orgs/{org}/secrets/orphaned": {
+      "get": {
+        "tags": [
+          "Secrets"
+        ],
+        "summary": "Secrets under Environment names that no longer exist",
+        "operationId": "list_orphaned_secrets",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/OrphanedSecretsDto"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "not an org admin"
+          },
+          "404": {
+            "description": "secrets or Environments not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
     "/v1/orgs/{org}/security/events": {
       "get": {
         "tags": [
@@ -8166,6 +8215,9 @@
           },
           "404": {
             "description": "secrets not configured"
+          },
+          "409": {
+            "description": "an Environment-scoped secret whose Environment does not exist"
           },
           "429": {
             "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
@@ -11057,6 +11109,29 @@
           "yanked": {
             "type": "boolean",
             "description": "The version is yanked in the Run's org now."
+          }
+        }
+      },
+      "OrphanedSecretsDto": {
+        "type": "object",
+        "description": "Secrets one Project holds under an Environment name that has no\nEnvironment. Names only, never values.",
+        "required": [
+          "environment",
+          "project",
+          "keys"
+        ],
+        "properties": {
+          "environment": {
+            "type": "string"
+          },
+          "keys": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "project": {
+            "type": "string"
           }
         }
       },

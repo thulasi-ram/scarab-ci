@@ -672,6 +672,26 @@ impl SecretProvider for PostgresSecrets {
         projects.dedup();
         Ok(projects)
     }
+
+    async fn environment_secret_scopes(
+        &self,
+        org: &str,
+    ) -> Result<Vec<(String, String)>, SecretError> {
+        let prefix = format!("env:{org}/");
+        let scopes: Vec<String> =
+            sqlx::query_scalar("SELECT DISTINCT scope FROM secrets WHERE starts_with(scope, $1)")
+                .bind(&prefix)
+                .fetch_all(self.pool())
+                .await
+                .map_err(|e| SecretError::Backend(e.to_string()))?;
+        let mut out: Vec<(String, String)> = scopes
+            .iter()
+            .filter_map(|s| scarab_secrets::environment_scope_of_scope_key(s, org))
+            .collect();
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
 }
 
 /// The version byte every [`Sealer`] seal from this adapter starts with.
