@@ -895,6 +895,11 @@ side effect that is neither will fire twice.
   retry: { on: failure, max: 3 }
 ```
 
+The timeout counts from when the step's process starts running. Waiting for a node, pulling
+the image and fetching the workspace do not count against it. They have their own limit of
+30 minutes: a step that has not started running by then fails as never started, says what it
+was waiting for, and is retried automatically.
+
 Re-execution that a person starts is modelled as **Takes**: a *rerun* re-executes a run from
 the top, a *retry* resumes from a failed step, and an earlier attempt becomes *superseded* or
 *shadowed* by the newer one. The UI shows these in a run's history. You don't write anything

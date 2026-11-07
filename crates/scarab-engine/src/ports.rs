@@ -1111,6 +1111,26 @@ pub trait Db: Send + Sync {
         attempt: &AttemptId,
     ) -> Result<Option<String>, DbError>;
 
+    /// Record that the attempt's step process was first seen running at `at`
+    /// (git-bug cfb5edb). The first write wins; later calls change nothing.
+    /// Returns the stored time.
+    async fn mark_attempt_execution_started(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        at: Timestamp,
+    ) -> Result<Timestamp, DbError>;
+
+    /// When the attempt's step process was first seen running, or `None`
+    /// when it has not been yet (or the attempt predates the record).
+    async fn attempt_execution_started(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<Option<Timestamp>, DbError>;
+
     /// Record the classified failure on a finished attempt (ADR-0047). Also
     /// stamps the attempt's [`AttemptOutcome::Failed`] outcome, so `failure` and
     /// `outcome` never diverge. `detail` is the executor's human-readable cause

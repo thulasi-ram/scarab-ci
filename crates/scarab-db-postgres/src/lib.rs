@@ -2248,6 +2248,52 @@ impl Db for PostgresDb {
         Ok(row.and_then(|r| r.get::<Option<String>, _>("handle")))
     }
 
+    async fn mark_attempt_execution_started(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        at: Timestamp,
+    ) -> Result<Timestamp, DbError> {
+        let row = sqlx::query(
+            "UPDATE attempts SET execution_started_at = COALESCE(execution_started_at, $4)
+             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3
+             RETURNING execution_started_at",
+        )
+        .bind(&run.0)
+        .bind(&step.0)
+        .bind(&attempt.0)
+        .bind(at.0)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(row
+            .and_then(|r| r.get::<Option<i64>, _>("execution_started_at"))
+            .map(Timestamp)
+            .unwrap_or(at))
+    }
+
+    async fn attempt_execution_started(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<Option<Timestamp>, DbError> {
+        let row = sqlx::query(
+            "SELECT execution_started_at FROM attempts
+             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3",
+        )
+        .bind(&run.0)
+        .bind(&step.0)
+        .bind(&attempt.0)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(row
+            .and_then(|r| r.get::<Option<i64>, _>("execution_started_at"))
+            .map(Timestamp))
+    }
+
     async fn set_attempt_failure(
         &self,
         run: &RunId,
