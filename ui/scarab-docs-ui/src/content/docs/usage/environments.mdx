@@ -182,6 +182,23 @@ when an approval gate upstream passes the same checks; otherwise it gets `env=no
 still launches. A rerun of it after the approval passed the maximum age, the approvers changed or
 the ref was taken out of the allowed refs gets `env=none`.
 
+The policy engine applies these rules, next to the org's and the Project's Policies. Each rule
+shows in the decision log under its own name:
+
+| Checkpoint | Rule | What it decides |
+|---|---|---|
+| `run.create` | `environment-approval-gate` | the gate the Environment adds, or the refusal in missing-gate mode refuse |
+| `gate.resolve` | `environment-approval-release` | whether an approval releases the gate: the approvers, how many, the wait timer |
+| `step.admit` | `environment-approval-recheck` | the check at each launch above |
+
+An org Policy at `gate.resolve` or `step.admit` can deny where these rules allow, for example
+an approval by the person who started the Run. A denied approval is not recorded and answers
+403; a denied launch fails the Step `Config` with the Policy's message. At these two checkpoints
+a Policy can only `deny`, and cannot match on `trigger_kinds`. A `step.admit` Policy applies to
+every launch its `match` selects, including Steps of Runs that no Environment governs. In those
+Runs `run.ref`, `run.environment` and `environment` are absent: test `has(run.environment)` or
+`environment != null` before reading them.
+
 ## Every rule in one place
 
 **Settings › Policies** (`/orgs/<org>/settings/policies`) lists the org's rules read-only:

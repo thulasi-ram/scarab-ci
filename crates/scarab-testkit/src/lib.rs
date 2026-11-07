@@ -346,7 +346,7 @@ impl InMemoryDb {
     /// another — that commits between two of a caller's separate writes.
     /// Constructs the interleaving instead of scheduling it. Supported
     /// methods: `set_run_params`, `set_run_concurrency`,
-    /// `commit_step_transition`.
+    /// `commit_step_transition`, `append_event`.
     pub fn interleave_before_next(&self, method: &'static str, hook: DbHook) {
         *self.interleave.lock().unwrap() = Some((method, hook));
     }
@@ -2157,6 +2157,7 @@ impl Db for InMemoryDb {
     }
 
     async fn append_event(&self, event: &EventKind) -> Result<(), DbError> {
+        self.interleave_point("append_event").await;
         let mut st = self.state.lock().unwrap();
         take_event_append_failure(&mut st, std::slice::from_ref(event))?;
         st.events.push(event.clone());

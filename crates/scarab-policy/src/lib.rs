@@ -13,7 +13,10 @@
 //!   PolicyInvariant.
 //! - [`schema`]: a checkpoint's typed input schema, generated from the Rust
 //!   types that build the input ([`policy_struct!`], [`policy_enum!`]).
-//! - [`run_create`]: the `run.create` checkpoint's input.
+//! - [`run_create`], [`gate_resolve`], [`step_admit`]: each checkpoint's
+//!   input.
+//! - [`environment_rules`]: the Environment's approval-gate settings as
+//!   built-in rules at each checkpoint (ADR-0078 §6).
 //! - [`check`]: the type checker over the AST `cel` 0.15 parses, with the
 //!   `has()` guard warning, literal regexes and the static cost bound. It and
 //!   every evaluation run on a large-stack thread.
@@ -23,11 +26,14 @@
 
 pub mod approval_gate;
 pub mod check;
+pub mod environment_rules;
 pub mod eval;
 pub mod evaluate;
+pub mod gate_resolve;
 pub mod ir;
 pub mod library;
 pub mod policy;
 pub mod run_create;
 pub mod schema;
+pub mod step_admit;
 pub mod store;

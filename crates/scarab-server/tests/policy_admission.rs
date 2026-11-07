@@ -537,6 +537,35 @@ async fn a_policy_store_failure_creates_no_run() {
     assert!(db.list_runs(100).await.unwrap().is_empty());
 }
 
+/// git-bug bbc433e: a concurrency group that cannot be rendered refuses the
+/// Run before the `run.create` Policies are consulted, so no allow decision
+/// names a Run that was never created.
+#[tokio::test]
+async fn a_concurrency_group_that_cannot_render_records_no_decision() {
+    let db = InMemoryDb::new();
+    let policies = InMemoryPolicies::new();
+    add(&policies, "pol-1", org(), deny_local_library("audit")).await;
+    let ci = CI_YAML.replace(
+        "steps:",
+        "concurrency: { group: \"deploy-${{ inputs.missing }}\" }\nsteps:",
+    );
+
+    let result = push_with(&db, &policies, &forge_with(&ci)).await;
+    assert!(
+        matches!(&result, Ok(o) if o.runs.is_empty()) || result.is_err(),
+        "{result:?}"
+    );
+    assert!(db.list_runs(100).await.unwrap().is_empty());
+    assert!(
+        policies
+            .org_decisions("acme", 0, None)
+            .await
+            .unwrap()
+            .is_empty(),
+        "no decision names a Run that was never created"
+    );
+}
+
 /// A stored Policy the current checker refuses (here: CEL saved at the
 /// Project level, which only typed settings may use) denies, naming it.
 #[tokio::test]

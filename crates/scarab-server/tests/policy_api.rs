@@ -315,7 +315,12 @@ async fn a_project_takes_typed_settings_only_and_unconsulted_checkpoints_are_ref
         .cookie("POST", uri, Some(json!({ "policy": later })), &s)
         .await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
-    assert!(b.as_str().unwrap().contains("not yet supported"), "{b}");
+    assert!(
+        b.as_str()
+            .unwrap()
+            .contains("compiles to `run.create`, not `step.admit`"),
+        "{b}"
+    );
 
     let created = create(&h, &s, uri, blocked_setting()).await;
     assert_eq!(created["level"], "project");
