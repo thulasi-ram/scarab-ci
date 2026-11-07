@@ -187,7 +187,9 @@ record. Read Breaking changes before you upgrade.
   these checks is enough. An external gate no longer hands over the
   Environment's authority by its token alone. A Run created before its Environment had approvers
   has no approval gate, so its authority Steps are refused once the Environment has approvers.
-  In such an Environment, Steps before the approval gate get the `env=none` OIDC subject.
+  In such an Environment, a Step gets the Environment's OIDC subject only when an approval gate
+  upstream passes the same checks, whether or not it uses the authority otherwise; any other Step
+  gets `env=none`.
 - **Adding an approver needs a step-up when the approval gate needs a count** (`required_approvals`):
   the new approver counts toward it. Where every approver must approve, adding one still needs
   none.
