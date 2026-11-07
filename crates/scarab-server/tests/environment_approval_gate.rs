@@ -529,3 +529,78 @@ async fn the_mark_is_stored_in_the_runs_pipeline() {
     assert_eq!(mark("qa"), Some(json!(false)));
     assert_eq!(mark("build"), None);
 }
+
+/// The Run page reads the Run's Environment, with its display name, from
+/// `GET /v1/runs/{id}`; a Run that names none has no `environment`.
+#[tokio::test]
+async fn the_run_names_its_environment_with_its_display_name() {
+    let s = Stack::new(rules(&[ME])).await;
+    // A copy of prod with a display name.
+    s.governance
+        .duplicate_environment(
+            "acme",
+            "prod",
+            "prod-eu",
+            Some("Production (EU)"),
+            "seed",
+            1,
+        )
+        .await
+        .unwrap();
+    let run = s
+        .dispatch(&GATED.replace("environment: prod", "environment: prod-eu"))
+        .await
+        .expect("admitted");
+    let (status, body) = s.call("GET", &format!("/v1/runs/{}", run.0)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["environment"],
+        json!({ "name": "prod-eu", "display_name": "Production (EU)" })
+    );
+    let run = s.dispatch(GATED).await.expect("admitted");
+    let (_, body) = s.call("GET", &format!("/v1/runs/{}", run.0)).await;
+    assert_eq!(body["environment"], json!({ "name": "prod" }));
+
+    let plain = s
+        .dispatch(
+            r#"
+on:
+  manual: {}
+steps:
+  - { id: build, image: busybox, command: ["true"] }
+"#,
+        )
+        .await
+        .expect("admitted");
+    let (_, body) = s.call("GET", &format!("/v1/runs/{}", plain.0)).await;
+    assert!(body.get("environment").is_none(), "{body}");
+}
+
+/// A Run created before Run creation stored the mark: the approve handler
+/// treats each of its `manual` gates as an approval gate, so the Run page
+/// is told the same.
+#[tokio::test]
+async fn a_gate_of_a_run_created_before_the_mark_reads_as_an_approval_gate() {
+    let s = Stack::new(rules(&[ME])).await;
+    let run = s.dispatch(TWO_GATES).await.expect("admitted");
+    let mut ir = s.db.run_ir(&run).await.unwrap().unwrap();
+    for step in ir["steps"].as_array_mut().unwrap() {
+        step.as_object_mut()
+            .unwrap()
+            .remove("environment_approval_gate");
+    }
+    s.db.store_run_ir(&run, &ir).await.unwrap();
+
+    for gate in ["qa", "approve"] {
+        assert_eq!(
+            s.step_dto(&run, gate).await["environment_approval_gate"],
+            true,
+            "{gate}"
+        );
+    }
+    assert!(s
+        .step_dto(&run, "build")
+        .await
+        .get("environment_approval_gate")
+        .is_none());
+}

@@ -138,7 +138,10 @@ An Environment approval gate is a `gate: manual` with a Step after it, through `
 the Environment's authority. Only these gates need the Environment's approvers and a step-up. Any
 other `manual` gate in the Run is a plain gate: anyone with write on the Project releases it with
 one approval. Which gates are approval gates is decided when the Run is created and stored with it;
-the Run page marks them, and `scarab validate` lists them.
+the Run page marks them, and `scarab validate` lists them. On the Run page an approval gate reads
+**Environment approval gate** with the Environment's display name, the gate the Environment added
+reads **added by** the Environment, and once the approvals are in, a gate with a wait timer shows
+when it releases.
 
 When a pipeline has no `manual` gate in front of a Step that uses the authority, the Environment
 **adds one**: a `manual` gate with the id `environment-approval` (with `-2`, `-3`, … appended if the

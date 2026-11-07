@@ -12684,6 +12684,26 @@
           }
         }
       },
+      "RunEnvironmentDto": {
+        "type": "object",
+        "description": "The Environment a Run names.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "display_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "What headings show in its place; absent when it has none or the org\nno longer has an Environment of that name."
+          },
+          "name": {
+            "type": "string",
+            "description": "The name the pipeline's `environment:` uses."
+          }
+        }
+      },
       "RunListResponse": {
         "type": "object",
         "description": "`GET /v1/runs` body: the most recent runs, newest first.",
@@ -12708,6 +12728,17 @@
           "snapshot_retention"
         ],
         "properties": {
+          "environment": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RunEnvironmentDto",
+                "description": "The Environment the Run names (its pipeline's `environment:`), with\nits display name. Absent for a Run that names none."
+              }
+            ]
+          },
           "id": {
             "type": "string"
           },
@@ -13572,7 +13603,7 @@
           },
           "environment_approval_gate": {
             "type": "boolean",
-            "description": "This `manual` gate is an **Environment approval gate** (ADR-0078 §1):\na Step after it uses the Run's Environment's authority, so releasing\nit needs the Environment's approvers and a step-up. Decided at Run\ncreation. A gate the Environment added has an `origin` link of kind\n`environment`. Omitted when false."
+            "description": "This `manual` gate is an **Environment approval gate** (ADR-0078 §1):\na Step after it uses the Run's Environment's authority, so releasing\nit needs the Environment's approvers and a step-up. Decided at Run\ncreation. A gate the Environment added has an `origin` link of kind\n`environment`. On a Run created before the mark was stored, every\n`manual` gate of a Run that names an Environment is one, as the\napprove handler judges it. Omitted when false."
           },
           "gate": {
             "type": [

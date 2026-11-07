@@ -235,6 +235,13 @@ record. Read Breaking changes before you upgrade.
   age. The wait timer is disabled while the Environment has no approvers, and an Environment
   with a timer and no approvers shows a warning (git-bug cd43bf3, 2b94989).
   [Environments](https://thulasi-ram.github.io/scarab-ci/usage/environments/#the-rules-it-holds)
+- **The Run page marks Environment approval gates.** Their gate card, DAG node and step pane say
+  **Environment approval gate** and name the Environment by its display name; the gate the
+  Environment added says **added by** it. After the approvals are in, a gate with a wait timer
+  shows when it releases, and approving it says the approval was recorded and when the gate
+  releases. `GET /v1/runs/{id}` gains `environment` (`name`, `display_name`) (git-bug cd43bf3,
+  2b94989).
+  [Environments](https://thulasi-ram.github.io/scarab-ci/usage/environments/#the-approval-gate)
 - **Runs after another pipeline.** `on: upstream: { pipeline: ci }` starts a Run when a Run
   of `ci` in the same repository finishes (`status:` takes `succeeded`, the default, and
   `failed`). The follow-up builds the same commit and runs on the same ref, so an

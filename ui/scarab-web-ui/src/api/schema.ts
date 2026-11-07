@@ -4562,11 +4562,22 @@ export interface components {
              */
             reads: string[];
         };
+        /** @description The Environment a Run names. */
+        RunEnvironmentDto: {
+            /**
+             * @description What headings show in its place; absent when it has none or the org
+             *     no longer has an Environment of that name.
+             */
+            display_name?: string | null;
+            /** @description The name the pipeline's `environment:` uses. */
+            name: string;
+        };
         /** @description `GET /v1/runs` body: the most recent runs, newest first. */
         RunListResponse: {
             runs: components["schemas"]["RunSummaryDto"][];
         };
         RunStatusResponse: {
+            environment?: null | components["schemas"]["RunEnvironmentDto"];
             id: string;
             /**
              * @description The PR **base** branch (ADR-0057) — the branch a `pull_request` run
@@ -5084,7 +5095,9 @@ export interface components {
              *     a Step after it uses the Run's Environment's authority, so releasing
              *     it needs the Environment's approvers and a step-up. Decided at Run
              *     creation. A gate the Environment added has an `origin` link of kind
-             *     `environment`. Omitted when false.
+             *     `environment`. On a Run created before the mark was stored, every
+             *     `manual` gate of a Run that names an Environment is one, as the
+             *     approve handler judges it. Omitted when false.
              */
             environment_approval_gate?: boolean;
             /**

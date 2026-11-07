@@ -4055,3 +4055,7 @@ code.c { font-family: var(--font-mono); font-size: var(--fs-sm); color: var(--co
 
 /* A warning on an Environment's page: a wait timer with no approvers. */
 .env-warn { margin: 0 0 12px; }
+
+/* An Environment approval gate: its label on the gate bar and the step pane. */
+.gate-env { font-size: var(--fs-xs); color: var(--copper); white-space: nowrap; }
+.gate-status.gate-env-line { color: var(--copper); }

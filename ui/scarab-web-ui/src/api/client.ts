@@ -1483,13 +1483,14 @@ export async function cancelRun(id: string): Promise<void> {
  * path returns `{approvals, released}`, but the late/duplicate-approval branch
  * returns only `{released: true}`. Reading `.approvals.length` unguarded throws
  * on that second shape. */
-export type GateApproval = { approvals?: string[]; released: boolean };
+export type GateApproval = { approvals?: string[]; released: boolean; releases_at?: number | null };
 
-/** Approve a `manual` gate (ADR-0008/0037). Append-only and idempotent: the
+/** Approve a `manual` gate. Append-only and idempotent: the
  * principal's approval is RECORDED, and the gate releases only once the
  * accumulated approvers satisfy the target environment's protection rules — a
- * plain gate with no environment releases on the first approval. So `released:
- * false` is a normal outcome, not an error: it means "counted, quorum not met".
+ * plain gate releases on the first approval. So `released: false` is a normal
+ * outcome, not an error: it means "counted, quorum not met", or, with
+ * `releases_at`, "approvals in, the wait timer still runs".
  * 404 when the step is not a gate; 409 once it is no longer awaiting a decision
  * (a released or terminal gate cannot be reopened). `timer`/`external` gates are
  * NOT approvable — they release by other means. */

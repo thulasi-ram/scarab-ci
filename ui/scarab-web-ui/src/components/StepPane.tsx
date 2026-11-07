@@ -28,7 +28,7 @@ import {
   ofRecordIndexOf,
 } from "../attempts";
 import { levelOf } from "../logs";
-import type { GateStatus } from "../gates";
+import { approvalReleaseIn, type GateStatus } from "../gates";
 import { clock, clockLow, expiryPercent, isYankRefusal, originParts, pluginGateState } from "../run-origin";
 import { shortHash } from "../libraries";
 import { absTime } from "../fmt";
@@ -95,6 +95,9 @@ export default function StepPane(props: {
   pipeline?: string | null;
   /** The page's clock tick, for a plugin gate's expiry countdown. */
   now?: number;
+  /** For an Environment approval gate: "Environment approval gate · <Environment>"
+   * (gates.ts `environmentGateLabel`). `null` for any other step. */
+  gateLabel?: string | null;
 }) {
   const [tab, setTab] = createSignal<Tab>("logs");
   // A plugin gate (ADR-0076 §7) opens on its Gate tab; any other step never
@@ -428,6 +431,22 @@ export default function StepPane(props: {
                 <span class="cs-ver">{props.versionLabel}</span>
               </Show>
             </div>
+            <Show when={props.gateLabel}>
+              {(label) => (
+                <div class="gate-status gate-env-line">
+                  {label()}
+                  <Show when={approvalReleaseIn(s(), props.now ?? Date.now())}>
+                    {(left) => (
+                      <>
+                        {" · approvals in, releases at "}
+                        <span class="mono">{new Date(s().approval_release_at!).toLocaleTimeString()}</span>
+                        {` (in ${clock(left())})`}
+                      </>
+                    )}
+                  </Show>
+                </div>
+              )}
+            </Show>
             <Show when={props.gateStatus}>
               {(g) => (
                 <div class={`gate-status ${g().tone}`} role="status">

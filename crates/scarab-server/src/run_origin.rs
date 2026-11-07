@@ -34,6 +34,9 @@ use crate::{authorize_scoped, run_scope, ApiError, AppState};
 struct Ir {
     #[serde(default)]
     steps: Vec<IrStep>,
+    /// The Environment the Run names, if any.
+    #[serde(default)]
+    environment: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -49,6 +52,21 @@ struct IrStep {
     scope: Option<serde_json::Value>,
     #[serde(default)]
     environment_approval_gate: Option<bool>,
+    #[serde(default)]
+    gate: Option<String>,
+}
+
+impl IrStep {
+    /// Whether this Step is an Environment approval gate, as the approve
+    /// handler judges it: the mark Run creation stored, or, on a Run created
+    /// before the mark existed, every `manual` gate of a Run that names an
+    /// Environment (the rule before ADR-0078).
+    fn is_environment_approval_gate(&self, run_environment: Option<&str>) -> bool {
+        match self.environment_approval_gate {
+            Some(mark) => mark,
+            None => run_environment.is_some() && self.gate.as_deref() == Some("manual"),
+        }
+    }
 }
 
 #[derive(Deserialize, Clone)]
@@ -89,9 +107,43 @@ async fn read_ir(st: &AppState, run: &RunId) -> Result<Ir, ApiError> {
         .unwrap_or_default())
 }
 
+/// The Environment a Run names, with its display name when the org still
+/// has an Environment of that name. `None` for a Run that names none.
+pub(crate) async fn run_environment(
+    st: &AppState,
+    run: &RunId,
+) -> Result<Option<RunEnvironmentDto>, ApiError> {
+    let Some(name) = read_ir(st, run).await?.environment else {
+        return Ok(None);
+    };
+    let org = st.db.run_tenant(run).await?.map(|(org, _)| org);
+    // A display name is for show: a store that cannot answer leaves it out.
+    let display_name = match (org, st.environment_governance.as_ref()) {
+        (Some(org), Some(store)) => store
+            .org_environment(&org, &name)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|e| e.display_name),
+        _ => None,
+    };
+    Ok(Some(RunEnvironmentDto { name, display_name }))
+}
+
 // ---------------------------------------------------------------------------
 // DTOs
 // ---------------------------------------------------------------------------
+
+/// The Environment a Run names.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RunEnvironmentDto {
+    /// The name the pipeline's `environment:` uses.
+    pub name: String,
+    /// What headings show in its place; absent when it has none or the org
+    /// no longer has an Environment of that name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+}
 
 /// One link of a Step's invoke chain, outermost first.
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -308,7 +360,7 @@ pub(crate) async fn step_views(
             }
             None => None,
         };
-        let environment_approval_gate = s.environment_approval_gate == Some(true);
+        let environment_approval_gate = s.is_environment_approval_gate(ir.environment.as_deref());
         if !origin.is_empty() || plugin_gate.is_some() || environment_approval_gate {
             views.insert(
                 s.id.clone(),

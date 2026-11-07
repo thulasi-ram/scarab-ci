@@ -15,6 +15,11 @@ import {
   inboxRuns,
   inboxVerb,
   inboxDetail,
+  addedByEnvironment,
+  approvalNote,
+  approvalReleaseIn,
+  environmentGateLabel,
+  isEnvironmentApprovalGate,
 } from "./gates";
 import { mockRuns } from "./mock";
 
@@ -297,5 +302,56 @@ describe("inbox row text", () => {
     const r = { status: "suspended" };
     expect(inboxVerb(r)).toBe("approve");
     expect(inboxDetail(r)).toBe("suspended on a gate · waiting for a decision");
+  });
+});
+
+describe("Environment approval gates", () => {
+  const prod = { name: "production", display_name: "Production" };
+  const authored = { ...gate("approve", "pending", "manual", ["build"]), environment_approval_gate: true };
+  const added = {
+    ...gate("environment-approval", "pending", "manual", ["build"]),
+    environment_approval_gate: true,
+    origin: [{ kind: "environment", name: "production" }],
+  };
+  const plain = { ...gate("qa", "pending", "manual", ["build"]), environment_approval_gate: false };
+  const statusOf = (s: string) => (s === "build" ? "succeeded" : "pending");
+
+  it("names the Environment by its display name, and the one that added a gate", () => {
+    expect(environmentGateLabel(authored, prod)).toBe("Environment approval gate · Production");
+    expect(environmentGateLabel(added, prod)).toBe("Environment approval gate · added by Production");
+    expect(environmentGateLabel(authored, { name: "production" })).toBe(
+      "Environment approval gate · production",
+    );
+    expect(addedByEnvironment(added)).toBe("production");
+    expect(addedByEnvironment(authored)).toBeNull();
+  });
+
+  it("gives a plain gate no label and no mention of approvers", () => {
+    expect(isEnvironmentApprovalGate(plain)).toBe(false);
+    expect(environmentGateLabel(plain, prod)).toBeNull();
+    expect(gateWaitHint(plain, statusOf)).toBe("waiting for a decision");
+    expect(gateWaitHint(authored, statusOf)).toBe("waiting for the environment's approvers");
+  });
+
+  it("only a manual gate is one, whatever the mark says", () => {
+    expect(isEnvironmentApprovalGate({ ...authored, gate: "external" })).toBe(false);
+  });
+
+  it("counts down to the release once the approvals are in, and not after", () => {
+    const timed = { ...added, approval_release_at: 10_000 };
+    expect(approvalReleaseIn(added, 0)).toBeNull();
+    expect(approvalReleaseIn(timed, 4_000)).toBe(6_000);
+    expect(approvalReleaseIn(timed, 12_000)).toBe(0);
+    expect(approvalReleaseIn({ ...timed, status: "succeeded" }, 4_000)).toBeNull();
+    expect(gateWaitHint(timed, statusOf)).toBe("approvals in · waiting for the wait timer");
+  });
+
+  it("words a 202 that did not release the gate as recorded, never as failed", () => {
+    const at = (ms: number) => `t${ms}`;
+    expect(approvalNote({ released: true }, at)).toBe("released");
+    expect(approvalNote({ released: false, approvals: ["a"], releases_at: 99 }, at)).toBe(
+      "approval recorded · the gate releases at t99, when the wait timer runs out",
+    );
+    expect(approvalNote({ released: false, approvals: ["a"] }, at)).toBe("1 approval recorded · awaiting more");
   });
 });

@@ -49,6 +49,9 @@ const RICH_RUN_ID = "0190f8a2000071fb8c0099887766ccdd";
 // state — waiting, passed, failed with a reason. At
 // /acme/edge-gateway/runs/<id>.
 const GATES_RUN_ID = "0190f8a2000071fb8c00d3e9107a1616";
+// The ENVIRONMENT GATE run: a deploy into production with a plain QA gate
+// and the approval gate production added. /acme/scarab/runs/<id>.
+const ENV_GATE_RUN_ID = "0190f8a2000071fb8c00e7a9b0c1d2e3";
 
 // ── /v1/me ────────────────────────────────────────────────────────────────
 // An Owner of the one implicit org (ADR-0060), so the Settings gear renders.
@@ -573,6 +576,78 @@ const gatesEventsBody = [
       reason: "ImagePullBackOff: sha-a1b2c3d not found in registry",
     },
   }),
+].join("");
+
+// ── the ENVIRONMENT GATE run ────────────────────────────────────────────────
+//   build ✓ → qa (plain manual gate, waiting) → smoke
+//         ✓ → environment-approval (added by production, waiting) → ship (deploy)
+// Approving `qa` releases it. Approving `environment-approval` records the
+// approval and answers that the wait timer releases it in five minutes.
+const envGate = (id: string, approval: boolean, extra: Record<string, unknown> = {}) => ({
+  id,
+  status: "pending",
+  attempts: 1,
+  needs: ["build"],
+  gate: "manual",
+  ...(approval ? { environment_approval_gate: true } : {}),
+  attempt_list: [{ id: "a1", started_at: ago(3 * min), failed: false, outcome: "running" }],
+  ...extra,
+});
+const envGateRunStatus: RunStatusDto = {
+  id: ENV_GATE_RUN_ID,
+  status: "suspended",
+  run_number: 152,
+  pipeline: "deploy",
+  trigger_title: "Deploy 7c1e2d4 to production",
+  origin_pr_base: null,
+  params: {},
+  snapshot_retention: { retention_days: 14, expired: false, pinned: false },
+  environment: { name: "production", display_name: "Production" },
+  steps: [
+    {
+      id: "build",
+      status: "succeeded",
+      attempts: 1,
+      needs: [],
+      attempt_list: [{ id: "a1", started_at: ago(5 * min), failed: false, outcome: "succeeded" }],
+    },
+    envGate("qa", false),
+    { id: "smoke", status: "pending", attempts: 0, needs: ["qa"], attempt_list: [] },
+    envGate("environment-approval", true, {
+      origin: [{ kind: "environment", name: "production", content_hash: "" }],
+    }),
+    {
+      id: "ship",
+      status: "pending",
+      attempts: 0,
+      deploy: true,
+      needs: ["build", "environment-approval"],
+      attempt_list: [],
+    },
+  ],
+};
+const egv = sse(ENV_GATE_RUN_ID);
+const envGateEventsBody = [
+  egv(ago(5 * min + 5000), {
+    Raw: {
+      trigger: {
+        event: {
+          kind: "manual",
+          actor: "a.kim",
+          branch: "main",
+          ref: "refs/heads/main",
+          sha: "7c1e2d4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d",
+          repo: { owner: "acme", name: "scarab" },
+        },
+      },
+    },
+  }),
+  egv(ago(5 * min), { AttemptStarted: { step: "build", attempt: "a1" } }),
+  egv(ago(3 * min + 10000), { AttemptFinished: { step: "build", attempt: "a1" } }),
+  egv(ago(3 * min + 9000), { StepTransitioned: { step: "build", from: "running", to: "succeeded" } }),
+  ...["qa", "environment-approval"].map((g) =>
+    egv(ago(3 * min), { AttemptStarted: { step: g, attempt: "a1" } }),
+  ),
 ].join("");
 
 // ── Org-level Environments (ADR-0071) — Settings › Environments. production
@@ -1775,6 +1850,30 @@ function route(pathname: string, search: string, method: string, body = ""): Res
     });
   if (p === `/v1/runs/${GATES_RUN_ID}/artifacts`) return json([]);
   if (p === `/v1/runs/${GATES_RUN_ID}/services`) return json([]);
+  // the ENVIRONMENT GATE run
+  if (p === `/v1/runs/${ENV_GATE_RUN_ID}`) return json(envGateRunStatus);
+  if (p === `/v1/runs/${ENV_GATE_RUN_ID}/events`)
+    return new Response(envGateEventsBody, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  if (p === `/v1/runs/${ENV_GATE_RUN_ID}/artifacts`) return json([]);
+  if (p === `/v1/runs/${ENV_GATE_RUN_ID}/services`) return json([]);
+  if (method === "POST" && (m = p.match(/^\/v1\/runs\/([^/]+)\/gates\/([^/]+)\/approve$/))) {
+    const step = envGateRunStatus.steps.find((s) => s.id === decodeURIComponent(m![2]!));
+    if (m[1] !== ENV_GATE_RUN_ID || !step) return json({ released: true }, { status: 202 });
+    if (!step.environment_approval_gate) {
+      // A plain gate: the first approval by anyone with write releases it.
+      step.status = "succeeded";
+      return json({ released: true, approvals: ["a.kim"] }, { status: 202 });
+    }
+    // The approvals are in; the wait timer releases the gate later.
+    step.approval_release_at = Date.now() + 5 * min;
+    return json(
+      { released: false, approvals: ["a.kim"], releases_at: step.approval_release_at },
+      { status: 202 },
+    );
+  }
   // Reject a gate (ADR-0070 §9): the fixture is static, so it only answers.
   if (method === "POST" && /^\/v1\/runs\/[^/]+\/gates\/[^/]+\/reject$/.test(p)) {
     return json({ rejected: true }, { status: 202 });

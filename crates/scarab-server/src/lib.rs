@@ -1137,6 +1137,10 @@ pub struct RunStatusResponse {
     /// launch: it reuses the Steps the Run was compiled with. Empty when none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub yanked_libraries: Vec<run_origin::RunYankDto>,
+    /// The Environment the Run names (its pipeline's `environment:`), with
+    /// its display name. Absent for a Run that names none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub environment: Option<run_origin::RunEnvironmentDto>,
 }
 
 /// The cold-tier retention promise over one Run's **Workspace Snapshots**
@@ -1503,7 +1507,9 @@ pub struct StepStatusDto {
     /// a Step after it uses the Run's Environment's authority, so releasing
     /// it needs the Environment's approvers and a step-up. Decided at Run
     /// creation. A gate the Environment added has an `origin` link of kind
-    /// `environment`. Omitted when false.
+    /// `environment`. On a Run created before the mark was stored, every
+    /// `manual` gate of a Run that names an Environment is one, as the
+    /// approve handler judges it. Omitted when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub environment_approval_gate: bool,
     /// A waiting Environment approval gate whose approvals are in: when the
@@ -2547,6 +2553,7 @@ async fn get_run(
     let mut gate_views = run_gate_view::step_gate_views(&st, &run, &steps).await?;
     let (mut origin_views, yanked_libraries) = run_origin::step_views(&st, &run, &steps).await?;
     let deploy_steps = st.db.deploy_steps_of_run(&run).await?;
+    let environment = run_origin::run_environment(&st, &run).await?;
     let mut step_dtos = Vec::with_capacity(steps.len());
     for s in steps {
         let view = gate_views.remove(&s.step.0).unwrap_or_default();
@@ -2595,6 +2602,7 @@ async fn get_run(
         origin_pr_base,
         snapshot_retention,
         yanked_libraries,
+        environment,
     }))
 }
 
@@ -13068,6 +13076,7 @@ impl utoipa::Modify for StepUpResponses {
         libraries::YankImpactRunDto,
         run_origin::OriginLinkDto,
         run_origin::RunYankDto,
+        run_origin::RunEnvironmentDto,
         run_origin::GateOutputDto,
         run_origin::PluginGateViewDto,
         run_origin::BoundInputDto,

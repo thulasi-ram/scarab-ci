@@ -50,6 +50,11 @@ import { stripTries as stripTriesOf } from "../attempts";
 import {
   actionableGateIds,
   actionableGates,
+  addedByEnvironment,
+  addedByLabel,
+  approvalNote,
+  approvalReleaseIn,
+  environmentGateLabel,
   gateBlockers,
   gateStatus,
   gateWaitHint,
@@ -108,6 +113,8 @@ export default function RunDetail() {
     const at = s.plugin_gate?.expires_at;
     return at != null ? at - nowTick() : null;
   };
+  /** The Environment the Run names, with its display name. */
+  const runEnv = () => run()?.environment ?? null;
   const [events, setEvents] = createSignal<RunEvent[]>([]);
   const [live, setLive] = createSignal(true);
   const [sel, setSel] = createSignal<string | null>(null);
@@ -313,7 +320,12 @@ export default function RunDetail() {
               : null) ??
             (s.plugin_gate && gateLeft(s) != null && ["pending", "ready"].includes(s.status)
               ? { tone: "waiting" as const, text: `${clock(gateLeft(s)!)} left` }
+              : null) ??
+            (approvalReleaseIn(s, nowTick()) != null
+              ? { tone: "waiting" as const, text: `releases in ${clock(approvalReleaseIn(s, nowTick())!)}` }
               : null)),
+        approvalGate: environmentGateLabel(s, runEnv()) !== null,
+        addedBy: addedByLabel(s, runEnv()),
         runningSince:
           !tv && s.status === "running"
             ? s.attempt_list?.[s.attempt_list.length - 1]?.started_at ?? null
@@ -609,14 +621,12 @@ export default function RunDetail() {
     setApproving(step);
     try {
       const res = await approveGate(id(), step);
-      // `released: false` is normal — the approval counted but quorum is not
-      // met. Saying so beats a silently unchanged gate.
-      const n = res.approvals?.length ?? 0;
+      // `released: false` is normal: the approval counted, and either more
+      // approvals are needed or the wait timer still runs. Saying so beats a
+      // silently unchanged gate.
       setGateNotes({
         ...gateNotes(),
-        [step]: res.released
-          ? "released"
-          : `${n} approval${n === 1 ? "" : "s"} recorded · awaiting more`,
+        [step]: approvalNote(res, (ms) => new Date(ms).toLocaleTimeString()),
       });
       setLive(true);
       await refresh();
@@ -764,9 +774,32 @@ export default function RunDetail() {
                           <Icon icon="shield-check" size={13} />
                           <span class="gate-step mono">{g().id}</span>
                           <span class="gate-kind mono">{g().gate}</span>
+                          <Show when={environmentGateLabel(g(), runEnv())}>
+                            {(label) => (
+                              <span
+                                class="gate-env"
+                                title={
+                                  addedByEnvironment(g()) !== null
+                                    ? "The pipeline has no approval gate here: the environment added this one. Its approvers release it."
+                                    : "A step after this gate uses the environment's secrets, grants or deploy mark: its approvers release it."
+                                }
+                              >
+                                {label()}
+                              </span>
+                            )}
+                          </Show>
                           <span class="gate-hint" title={gateWaitHint(g(), statusOf)}>
                             {gateWaitHint(g(), statusOf)}
                           </span>
+                          <Show when={approvalReleaseIn(g(), nowTick())}>
+                            {(left) => (
+                              <span class="gate-clock">
+                                releases at{" "}
+                                <b class="mono">{new Date(g().approval_release_at!).toLocaleTimeString()}</b> · in{" "}
+                                <b class="mono">{clock(left())}</b>
+                              </span>
+                            )}
+                          </Show>
                           <Show when={g().plugin_gate}>
                             {(pg) => (
                               <>
@@ -1309,6 +1342,11 @@ export default function RunDetail() {
                       }
                       pipeline={r().pipeline ?? null}
                       now={nowTick()}
+                      gateLabel={
+                        !timeTraveling() && selectedStep()
+                          ? environmentGateLabel(selectedStep()!, runEnv())
+                          : null
+                      }
                     />
                   }
                 >
