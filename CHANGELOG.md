@@ -194,7 +194,22 @@ record. Read Breaking changes before you upgrade.
   the new approver counts toward it. Where every approver must approve, adding one still needs
   none.
 
+- **Step secrets are files, not environment variables.** A secret listed in `secrets:` is now
+  the file `/scarab/secrets/KEY` in the step's container (`$SCARAB_SECRETS` names the
+  directory), and `$KEY` is empty. To keep reading `$KEY`, list the secret as
+  `{ name: KEY, env: true }`; bare names and entries mix in one list. `scarab validate` warns
+  about a command that reads `$KEY` for a secret without `env: true`. A secret name must now be
+  a file name (letters, digits, `-`, `_`, `.`, not starting with `.`), and `forge-token` and
+  `forge-username` are refused (git-bug bcf2c11). Upgrade every server replica before a pipeline
+  uses `env: true`: a replica from an earlier version cannot read that entry in a stored Run.
+
 ### Security
+
+- Secret values were written into the step Pod's spec as literal environment values, where
+  anyone who can read Pods (and the Kubernetes audit log) could see them (git-bug bcf2c11).
+  They now live in a per-Pod Kubernetes Secret, deleted when the attempt ends, and reach the step
+  as files on a read-only in-memory volume; an `env: true` secret is a `secretKeyRef` to that
+  Secret.
 
 - An admin of one org could list, delete, re-sync and bind repos through another org's forge
   connections, and an API token scoped to one org could do the same (git-bug 19b0a45). Each

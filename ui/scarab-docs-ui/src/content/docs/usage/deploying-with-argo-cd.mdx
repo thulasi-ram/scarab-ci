@@ -33,7 +33,8 @@ steps:
   - id: live
     needs: [bump]
     image: registry.example.com/ci/argocd-jq:v2.13.0   # see "The image" below
-    secrets: [ARGOCD_AUTH_TOKEN]
+    secrets:
+      - { name: ARGOCD_AUTH_TOKEN, env: true }   # the argocd CLI reads it from the environment
     env:
       - [ARGOCD_SERVER, argocd.example.com]
       - [APP, payments-api]

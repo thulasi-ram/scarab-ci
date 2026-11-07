@@ -1608,7 +1608,9 @@ pub trait Executor: Send + Sync {
     /// whichever replica minted it, and a long-lived token does not stay
     /// stored for as long as the unit is kept. On k8s that is the per-Pod
     /// token Secret. `Ok(None)`: the unit holds none, or it was taken
-    /// already. A backend that never mounts one answers `Ok(None)`.
+    /// already. A backend that never mounts one answers `Ok(None)`. A
+    /// backend also removes the unit's other stored secret values here: on
+    /// k8s, the per-Pod Secret that holds the Step's own secrets.
     ///
     /// **Deliberately REQUIRED — no default**, for the reason spelled out on
     /// [`workspace_provisioning`](Self::workspace_provisioning): a decorator
