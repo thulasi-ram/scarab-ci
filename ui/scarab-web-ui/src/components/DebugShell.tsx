@@ -1,5 +1,6 @@
 // Debug shell — an interactive TTY into a RUNNING step's Pod (the debug
-// surface). Opens a WebSocket to the server's attach endpoint and bridges it to
+// surface). Opens a WebSocket to the server's attach endpoint (after the
+// step-up check in `openShellSocket`) and bridges it to
 // an xterm terminal: keystrokes → the Pod's shell stdin, shell output → the
 // terminal. Only meaningful while the step is running (a terminal step's Pod is
 // gone). Rendered as a modal overlay.
@@ -7,6 +8,7 @@ import { onMount, onCleanup } from "solid-js";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
+import { openShellSocket } from "../api/client";
 
 export default function DebugShell(props: {
   runId: string;
@@ -19,6 +21,7 @@ export default function DebugShell(props: {
   let host: HTMLDivElement | undefined;
   let term: Terminal | undefined;
   let ws: WebSocket | undefined;
+  let closed = false;
 
   onMount(() => {
     // xterm draws on a canvas, so it takes colours, not CSS variables: read
@@ -42,18 +45,32 @@ export default function DebugShell(props: {
     fit.fit();
     term = t;
 
-    const proto = location.protocol === "https:" ? "wss" : "ws";
-    const path = props.mode === "debug-pod" ? "debug-pod" : "attach";
-    const url = `${proto}://${location.host}/v1/runs/${encodeURIComponent(props.runId)}/steps/${encodeURIComponent(props.step)}/${path}`;
-    const sock = new WebSocket(url);
-    sock.binaryType = "arraybuffer";
-    ws = sock;
-
     t.writeln(
       props.mode === "debug-pod"
         ? `\x1b[2m reproducing ${props.step} in a fresh pod…\x1b[0m`
         : `\x1b[2m connecting to ${props.step}…\x1b[0m`,
     );
+    void connect(t);
+
+    const onResize = () => fit.fit();
+    window.addEventListener("resize", onResize);
+    onCleanup(() => window.removeEventListener("resize", onResize));
+  });
+
+  // The socket opens after the step-up check, which may show a dialog.
+  async function connect(t: Terminal) {
+    const opened = await openShellSocket(props.runId, props.step, props.mode);
+    if (closed) {
+      if (typeof opened !== "string") opened.close();
+      return;
+    }
+    if (typeof opened === "string") {
+      t.writeln(`\r\n\x1b[31m — ${opened} —\x1b[0m`);
+      return;
+    }
+    const sock = opened;
+    sock.binaryType = "arraybuffer";
+    ws = sock;
     sock.onopen = () => t.writeln("\x1b[2m attached — type below (Ctrl-D to end)\x1b[0m\r\n");
     sock.onmessage = (e) => {
       const data =
@@ -68,13 +85,10 @@ export default function DebugShell(props: {
     t.onData((d) => {
       if (sock.readyState === WebSocket.OPEN) sock.send(d);
     });
-
-    const onResize = () => fit.fit();
-    window.addEventListener("resize", onResize);
-    onCleanup(() => window.removeEventListener("resize", onResize));
-  });
+  }
 
   onCleanup(() => {
+    closed = true;
     ws?.close();
     term?.dispose();
   });

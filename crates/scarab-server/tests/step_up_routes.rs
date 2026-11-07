@@ -867,6 +867,74 @@ async fn the_debug_shell_needs_a_step_up() {
     }
 }
 
+/// The status of a WebSocket handshake to `path` on `app`, served on a
+/// loopback socket so the upgrade is real. `protocols` is the
+/// `Sec-WebSocket-Protocol` list a browser's `new WebSocket(url, protocols)`
+/// sends; a browser cannot send `x-csrf-token` on a handshake.
+async fn ws_handshake(app: axum::Router, path: &str, s: &Sess, protocols: Option<&str>) -> u16 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut conn = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let protocols = protocols
+        .map(|p| format!("Sec-WebSocket-Protocol: {p}\r\n"))
+        .unwrap_or_default();
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
+         Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+         Origin: {ORIGIN}\r\nCookie: scarab_session={}\r\n{protocols}\r\n",
+        s.id
+    );
+    conn.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = vec![0u8; 1024];
+    let n = conn.read(&mut buf).await.unwrap();
+    let head = String::from_utf8_lossy(&buf[..n]);
+    head.split_whitespace().nth(1).unwrap().parse().unwrap()
+}
+
+/// git-bug aeba20a: a browser's WebSocket cannot send `x-csrf-token`, so the
+/// debug shell presents the session's CSRF token as a `scarab.csrf.<token>`
+/// subprotocol. Without it, or with another token, a cookie handshake is
+/// refused; with it, the request reaches the handler, which answers 404
+/// because this server has no attacher.
+#[tokio::test]
+async fn the_debug_shell_handshake_carries_its_csrf_token_as_a_subprotocol() {
+    let h = harness();
+    h.grant("amy", Scope::Org("acme".into()), Role::Owner).await;
+    let s = h.browser_session(owner("amy")).await;
+    let mut soft = passkey();
+    h.enroll(&s, &mut soft, "Laptop").await;
+    h.open_window(&s, &mut soft).await;
+    for path in [
+        "/v1/runs/r1/steps/build/attach",
+        "/v1/runs/r1/steps/build/debug-pod",
+    ] {
+        let good = format!("scarab.v1, scarab.csrf.{}", s.csrf);
+        assert_eq!(
+            ws_handshake(h.app.clone(), path, &s, None).await,
+            403,
+            "{path}"
+        );
+        assert_eq!(
+            ws_handshake(
+                h.app.clone(),
+                path,
+                &s,
+                Some("scarab.v1, scarab.csrf.not-the-token")
+            )
+            .await,
+            403,
+            "{path}"
+        );
+        assert_eq!(
+            ws_handshake(h.app.clone(), path, &s, Some(&good)).await,
+            404,
+            "{path}"
+        );
+    }
+}
+
 /// git-bug 9bbaa1d: deleting a Run's snapshot pin shortens how long its
 /// snapshots are kept, a loosening, so it needs a step-up; pinning them
 /// does not.
