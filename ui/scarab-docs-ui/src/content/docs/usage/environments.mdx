@@ -131,8 +131,13 @@ longer in the allowed refs, or when no approval gate upstream of it has released
 set unchanged since its approvals were given and no longer ago than the maximum approval age. One
 such gate is enough: a QA approval gate released two days ago does not refuse a deploy whose own
 approval gate released a minute ago. An `external`, `timer` or `plugin` gate is never an approval gate, so a Step
-behind only those is refused at launch. Steps with no released approval gate upstream get the
-`env=none` OIDC subject.
+behind only those is refused at launch.
+
+The OIDC subject `env=<name>` is authority too: a cloud role that trusts it trusts the Step as the
+Environment. So any Step, whether it uses the authority otherwise or not, gets `env=<name>` only
+when an approval gate upstream passes the same checks; otherwise it gets `env=none`. Such a Step
+still launches. A rerun of it after the approval passed the maximum age, the approvers changed or
+the ref was taken out of the allowed refs gets `env=none`.
 
 The policy engine applies these rules, next to the org's and the Project's Policies. Each rule
 shows in the decision log under its own name:
