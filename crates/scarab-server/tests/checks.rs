@@ -33,7 +33,11 @@ fn push() -> Event {
 }
 
 /// Retire the `run_finished` messages (no pipeline here follows another).
-async fn drain_followups_once(forge: &dyn scarab_forge::ForgePort, db: &InMemoryDb, clock: &FakeClock) {
+async fn drain_followups_once(
+    forge: &dyn scarab_forge::ForgePort,
+    db: &InMemoryDb,
+    clock: &FakeClock,
+) {
     let started = scarab_server::followups::drain_followups(
         forge,
         db,

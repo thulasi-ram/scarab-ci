@@ -55,7 +55,9 @@ async fn api_token_lifecycle_put_lookup_list_touch_revoke() {
             2_000,
         )
     };
-    db.put(&org_tok, &api_token_hash("scarab_pat_org")).await.unwrap();
+    db.put(&org_tok, &api_token_hash("scarab_pat_org"))
+        .await
+        .unwrap();
     db.put(&proj_tok, &api_token_hash("scarab_pat_proj"))
         .await
         .unwrap();
@@ -65,7 +67,9 @@ async fn api_token_lifecycle_put_lookup_list_touch_revoke() {
         Some(org_tok.clone())
     );
     assert_eq!(
-        db.by_hash(&api_token_hash("scarab_pat_proj")).await.unwrap(),
+        db.by_hash(&api_token_hash("scarab_pat_proj"))
+            .await
+            .unwrap(),
         Some(proj_tok.clone())
     );
     // The plaintext itself is not a key into anything.

@@ -199,16 +199,24 @@ async fn measure(files: usize, runs: usize) -> Row {
         let reader = h.step_client(&[&snap.root.0]);
         let out = tempfile::tempdir().unwrap();
         let t = Instant::now();
-        Cas::materialize(&reader, &TreeHash(snap.root.0.clone()), out.path().to_str().unwrap())
-            .await
-            .unwrap();
+        Cas::materialize(
+            &reader,
+            &TreeHash(snap.root.0.clone()),
+            out.path().to_str().unwrap(),
+        )
+        .await
+        .unwrap();
         row.materialize.push(t.elapsed().as_millis());
 
         let out2 = tempfile::tempdir().unwrap();
         let t = Instant::now();
-        Cas::materialize(&reader, &TreeHash(snap.root.0.clone()), out2.path().to_str().unwrap())
-            .await
-            .unwrap();
+        Cas::materialize(
+            &reader,
+            &TreeHash(snap.root.0.clone()),
+            out2.path().to_str().unwrap(),
+        )
+        .await
+        .unwrap();
         row.materialize_refetch.push(t.elapsed().as_millis());
 
         // The manifest half of the feed, alone.
@@ -220,9 +228,7 @@ async fn measure(files: usize, runs: usize) -> Row {
         let probe = &manifest.entries[..100.min(manifest.entries.len())];
         let t = Instant::now();
         for e in probe {
-            let _ = reader.get_blob(&e.blob)
-                .await
-                .unwrap();
+            let _ = reader.get_blob(&e.blob).await.unwrap();
         }
         row.serial_get_us
             .push(t.elapsed().as_micros() / probe.len() as u128);
@@ -321,7 +327,9 @@ async fn what_the_eager_feed_costs_today() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(3);
-    println!("\n8.19 MB workspace, uniform file sizes, {runs} runs, loopback HTTP, local-disk Depot");
+    println!(
+        "\n8.19 MB workspace, uniform file sizes, {runs} runs, loopback HTTP, local-disk Depot"
+    );
     println!("| files | leg | mean | min–max | per-file |");
     println!("|---|---|---|---|---|");
     for files in [250usize, 2000] {

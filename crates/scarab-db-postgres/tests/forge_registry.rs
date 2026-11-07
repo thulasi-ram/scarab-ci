@@ -132,8 +132,12 @@ async fn registration_and_resolution_round_trip() {
     assert_eq!(kept.project, "api");
 
     // Unbind is idempotent and removes resolution.
-    db.unbind_repo("gh-acme", &repo("acme", "api")).await.unwrap();
-    db.unbind_repo("gh-acme", &repo("acme", "api")).await.unwrap();
+    db.unbind_repo("gh-acme", &repo("acme", "api"))
+        .await
+        .unwrap();
+    db.unbind_repo("gh-acme", &repo("acme", "api"))
+        .await
+        .unwrap();
     assert!(db.resolve(&repo("acme", "api")).await.unwrap().is_none());
 
     // Deleting a connection cascades its bindings.

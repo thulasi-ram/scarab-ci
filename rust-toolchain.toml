@@ -1,3 +1,6 @@
 [toolchain]
-channel = "stable"
+# An exact release, not `stable`: rustfmt ships with the toolchain, so a moving
+# channel moves what `cargo fmt --check` calls formatted. Bump this on purpose,
+# then run `cargo fmt --all` and commit the result with the bump.
+channel = "1.97.0"
 components = ["rustfmt", "clippy"]

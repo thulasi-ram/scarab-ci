@@ -268,7 +268,10 @@ struct WorkspaceFixture {
 /// Only ever called once the tier is opted in, so a partial S3 config is a
 /// wiring bug and panics ([`tier_var`]) — never a silent skip.
 fn depot_cold_store() -> std::sync::Arc<scarab_storage_s3::S3Storage> {
-    match std::env::var("SCARAB_S3_BUCKET").ok().filter(|v| !v.is_empty()) {
+    match std::env::var("SCARAB_S3_BUCKET")
+        .ok()
+        .filter(|v| !v.is_empty())
+    {
         Some(bucket) => {
             let endpoint = std::env::var("SCARAB_S3_ENDPOINT").unwrap_or_default();
             let region =
@@ -289,9 +292,7 @@ fn depot_cold_store() -> std::sync::Arc<scarab_storage_s3::S3Storage> {
             let dir = std::env::var("SCARAB_OBJECT_DIR")
                 .ok()
                 .filter(|v| !v.is_empty())
-                .unwrap_or_else(|| {
-                    format!("{}/../../.scarab/objects", env!("CARGO_MANIFEST_DIR"))
-                });
+                .unwrap_or_else(|| format!("{}/../../.scarab/objects", env!("CARGO_MANIFEST_DIR")));
             std::sync::Arc::new(
                 scarab_storage_s3::S3Storage::local(&dir).expect("cold store handle (local dir)"),
             )
@@ -398,7 +399,10 @@ fn clone_credential() -> Option<scarab_engine::ForgeCredential> {
 /// the clone image, the clone's env, and a forge credential.
 fn clone_env(sha: &str, depth: &str) -> Vec<(String, String)> {
     [
-        ("SCARAB_CLONE_URL", "https://github.com/thulasi-ram/scarab-ci.git"),
+        (
+            "SCARAB_CLONE_URL",
+            "https://github.com/thulasi-ram/scarab-ci.git",
+        ),
         ("SCARAB_CLONE_SHA", sha),
         ("SCARAB_CLONE_DEPTH", depth),
         ("SCARAB_CLONE_SUBMODULES", "false"),
@@ -2569,7 +2573,9 @@ async fn image_pull_failure_fails_the_attempt_fast() {
     let h = exec.launch(&step, &spec).await.expect("launch doomed step");
     let terminal = poll_to_terminal(&exec, &h, 120).await;
     match terminal {
-        Some(ExecState::Failed { exit_code, class, .. }) => {
+        Some(ExecState::Failed {
+            exit_code, class, ..
+        }) => {
             assert_eq!(exit_code, None, "the step process never ran");
             assert_eq!(
                 class,

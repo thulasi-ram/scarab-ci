@@ -696,11 +696,10 @@ async fn an_attempt_minted_after_its_cancel_is_not_left_running(w: World) {
     )
     .await
     .unwrap();
-    let claimed = w
-        .db
-        .claim_ready_steps(&lead(&*w.db).await, 10, &launch_a1)
-        .await
-        .unwrap();
+    let claimed =
+        w.db.claim_ready_steps(&lead(&*w.db).await, 10, &launch_a1)
+            .await
+            .unwrap();
     assert!(claimed.iter().any(|s| s.step == id("build")));
     assert!(cancel_run_request(&*w.db, &w.clock, &rid("rp"), None)
         .await

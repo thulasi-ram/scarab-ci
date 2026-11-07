@@ -72,7 +72,10 @@ mod tests {
     fn parses_the_shapes_the_kubelet_writes() {
         assert_eq!(parse_rfc3339_ms("1970-01-01T00:00:00Z"), Some(0));
         // 2026-11-01T06:36:24Z, checked with `date -u -d @1793514984`.
-        assert_eq!(parse_rfc3339_ms("2026-11-01T06:36:24Z"), Some(1_793_514_984_000));
+        assert_eq!(
+            parse_rfc3339_ms("2026-11-01T06:36:24Z"),
+            Some(1_793_514_984_000)
+        );
         assert_eq!(
             parse_rfc3339_ms("2026-11-01T06:36:24.5Z"),
             Some(1_793_514_984_500)

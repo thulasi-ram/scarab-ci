@@ -152,7 +152,8 @@ impl InfraObserver {
 
             // Onset: the first time this fence reported this condition.
             (None, Some(condition)) => {
-                self.append_onset(run, step, attempt, &condition, now).await?;
+                self.append_onset(run, step, attempt, &condition, now)
+                    .await?;
                 self.held.lock().unwrap().insert(
                     fence,
                     Held {
@@ -186,7 +187,8 @@ impl InfraObserver {
                     // so the log reads as a sequence rather than a smear
                     // ("Unschedulable for 2m" → "ImagePullBackOff").
                     self.append_close(run, step, attempt, &held, now).await?;
-                    self.append_onset(run, step, attempt, &condition, now).await?;
+                    self.append_onset(run, step, attempt, &condition, now)
+                        .await?;
                     self.held.lock().unwrap().insert(
                         fence,
                         Held {

@@ -554,10 +554,22 @@ mod tests {
     #[test]
     fn a_path_is_a_variable_and_constant_members_only() {
         let p = |e: &str| path(e);
-        assert_eq!(p("inputs.region"), Some(vec!["inputs".into(), "region".into()]));
-        assert_eq!(p("inputs['region']"), Some(vec!["inputs".into(), "region".into()]));
+        assert_eq!(
+            p("inputs.region"),
+            Some(vec!["inputs".into(), "region".into()])
+        );
+        assert_eq!(
+            p("inputs['region']"),
+            Some(vec!["inputs".into(), "region".into()])
+        );
         assert_eq!(p(".inputs"), Some(vec!["inputs".into()]));
-        for e in ["inputs.region + ''", "inputs[k]", "size(inputs)", "'x'", "1 +"] {
+        for e in [
+            "inputs.region + ''",
+            "inputs[k]",
+            "size(inputs)",
+            "'x'",
+            "1 +",
+        ] {
             assert_eq!(p(e), None, "{e}");
         }
     }

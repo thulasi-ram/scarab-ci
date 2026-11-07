@@ -12,9 +12,7 @@ use std::sync::Arc;
 use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
 use scarab_engine::{Db, RunId, StepId, StepRun};
-use scarab_executor_k8s::{
-    build_pod, image_artifact, DEFAULT_STEP_TIMEOUT_SECS,
-};
+use scarab_executor_k8s::{build_pod, image_artifact, DEFAULT_STEP_TIMEOUT_SECS};
 use scarab_identity::{Claims, OidcIssuer};
 use scarab_secrets::{Secret, SecretProvider, SecretScope};
 use scarab_secrets_postgres::PostgresSecrets;

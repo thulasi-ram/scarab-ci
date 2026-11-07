@@ -240,7 +240,11 @@ fn inputs(gate: &PendingGate) -> Option<(&str, &str)> {
 
 /// One pass: answer every open `wait-live` wait in `org` that Argo has
 /// decided. A wait for a gate this plugin does not know is left alone.
-pub async fn resolve_pass(broker: &Broker, api: &GateApi, org: &str) -> Result<PassReport, BrokerError> {
+pub async fn resolve_pass(
+    broker: &Broker,
+    api: &GateApi,
+    org: &str,
+) -> Result<PassReport, BrokerError> {
     let mut report = PassReport::default();
     for gate in api.pending(org).await? {
         let key = format!("{}/{}", gate.run, gate.step);
@@ -248,7 +252,9 @@ pub async fn resolve_pass(broker: &Broker, api: &GateApi, org: &str) -> Result<P
             continue;
         }
         let Some((app, image)) = inputs(&gate) else {
-            report.errors.push(format!("{key}: no `app` or `image` input"));
+            report
+                .errors
+                .push(format!("{key}: no `app` or `image` input"));
             continue;
         };
         // `.` and `..` survive percent-encoding and a URL resolves them, so

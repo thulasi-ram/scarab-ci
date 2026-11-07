@@ -194,7 +194,10 @@ async fn crash_resume_completes_exactly_once() {
 
     // --- SIGKILL mid-step-1 from the node; the kubelet restarts it ----------
     let before = server_container();
-    assert!(before.ready, "the server must be ready before the kill: {before:?}");
+    assert!(
+        before.ready,
+        "the server must be ready before the kill: {before:?}"
+    );
     kill_server_from_node(&before).await;
     let (after, last) = wait_restarted(&before).await;
     eprintln!(
@@ -202,7 +205,10 @@ async fn crash_resume_completes_exactly_once() {
         after.pod, after.uid, before.restarts, after.restarts, before.container_id, after.container_id
     );
     // The same Pod (a restart, not a replacement) with a new container.
-    assert_eq!(after.uid, before.uid, "the kill must restart the container, not replace the Pod");
+    assert_eq!(
+        after.uid, before.uid,
+        "the kill must restart the container, not replace the Pod"
+    );
     assert_ne!(after.container_id, before.container_id);
     assert!(
         last["signal"] == 9 || last["exitCode"] == 137,
@@ -233,7 +239,10 @@ async fn crash_resume_completes_exactly_once() {
     let started = events_of_kind(&evs, "AttemptStarted");
     for step in ["slow", "second"] {
         let n = started.iter().filter(|p| p["step"] == *step).count();
-        assert_eq!(n, 1, "expected exactly one AttemptStarted for `{step}`, got {n}");
+        assert_eq!(
+            n, 1,
+            "expected exactly one AttemptStarted for `{step}`, got {n}"
+        );
     }
 
     // The restarted control plane RE-ADOPTED the in-flight attempt — the
@@ -265,6 +274,12 @@ async fn crash_resume_completes_exactly_once() {
 
     // And the logs prove both steps really ran (once).
     let text = logs(&client, &base, &run).await;
-    assert!(text.contains("slow step done"), "missing step-1 log; got: {text}");
-    assert!(text.contains("second step done"), "missing step-2 log; got: {text}");
+    assert!(
+        text.contains("slow step done"),
+        "missing step-1 log; got: {text}"
+    );
+    assert!(
+        text.contains("second step done"),
+        "missing step-2 log; got: {text}"
+    );
 }

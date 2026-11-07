@@ -30,7 +30,10 @@ const START: i64 = 1_000;
 const DEADLINE_MS: i64 = 60_000;
 
 fn app(db: Arc<InMemoryDb>, clock: Arc<FakeClock>) -> axum::Router {
-    let logs = Arc::new(LogService::new(Arc::new(InMemoryObjectStore::new()), db.clone()));
+    let logs = Arc::new(LogService::new(
+        Arc::new(InMemoryObjectStore::new()),
+        db.clone(),
+    ));
     router(AppState::new(db, clock, logs))
 }
 
@@ -171,7 +174,11 @@ async fn a_persistently_failing_run_dead_letters_at_the_bound() {
             _ => None,
         })
         .collect();
-    assert_eq!(reasons.len(), 1, "exactly one dead-letter event: {reasons:?}");
+    assert_eq!(
+        reasons.len(),
+        1,
+        "exactly one dead-letter event: {reasons:?}"
+    );
     assert!(
         reasons[0].contains("ADR-0059") && reasons[0].contains("scheduler tick failed"),
         "the diagnostic must distinguish a stuck TICK from a step dead-letter: {}",

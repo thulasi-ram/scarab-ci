@@ -135,7 +135,6 @@ async fn reclaim_connections_where(
     }
 }
 
-
 /// Creates the connection and binds `owner/name`; returns (org, project).
 pub async fn connect_and_bind(
     http: &reqwest::Client,
@@ -194,7 +193,9 @@ pub async fn push_file(
         body["new_branch"] = serde_json::Value::String(b.to_string());
     }
     let resp = http
-        .post(format!("{forgejo}/api/v1/repos/{repo}/contents/pushes/{stamp}.txt"))
+        .post(format!(
+            "{forgejo}/api/v1/repos/{repo}/contents/pushes/{stamp}.txt"
+        ))
         .header("authorization", format!("token {token}"))
         .json(&body)
         .send()

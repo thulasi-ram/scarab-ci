@@ -387,9 +387,9 @@ pub fn facts(
         match get(fields, field) {
             Some(v) => match check_value(field, v) {
                 Ok(()) => put(&mut out, field, v.clone()),
-                Err(why) if reads.contains(field) => refusals.push(format!(
-                    "`${{{{ event.{field} }}}}` does not accept {why}"
-                )),
+                Err(why) if reads.contains(field) => {
+                    refusals.push(format!("`${{{{ event.{field} }}}}` does not accept {why}"))
+                }
                 Err(_) => {}
             },
             None if reads.contains(field) => refusals.push(format!(
@@ -494,7 +494,8 @@ mod tests {
 
     #[test]
     fn a_field_the_trigger_lacks_refuses_a_pipeline_that_reads_it() {
-        let fields = obj(json!({ "kind": "tag", "tag": "v1", "repo": { "owner": "a", "name": "b" } }));
+        let fields =
+            obj(json!({ "kind": "tag", "tag": "v1", "repo": { "owner": "a", "name": "b" } }));
         let refused = facts(&fields, "tag", &BTreeSet::from(["sha".to_string()])).unwrap_err();
         assert_eq!(
             refused,
@@ -515,10 +516,22 @@ mod tests {
         for (t, want) in [
             ("${{ event }}", "reads `event` whole"),
             ("${{ event.repo }}", "reads `event.repo` whole"),
-            ("${{ event.actor }}", "`event.actor`, which a template may not read"),
-            ("${{ event.body }}", "`event.body`, which a template may not read"),
-            ("${{ event.schedule }}", "`event.schedule`, which a template may not read"),
-            ("${{ event.message }}", "`event.message`, which a template may not read"),
+            (
+                "${{ event.actor }}",
+                "`event.actor`, which a template may not read",
+            ),
+            (
+                "${{ event.body }}",
+                "`event.body`, which a template may not read",
+            ),
+            (
+                "${{ event.schedule }}",
+                "`event.schedule`, which a template may not read",
+            ),
+            (
+                "${{ event.message }}",
+                "`event.message`, which a template may not read",
+            ),
             ("${{ event.nope }}", "not a field a template may read"),
             ("${{ size(event) > 0 }}", "reads `event` whole"),
         ] {

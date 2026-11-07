@@ -406,7 +406,12 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
     ("GET", "/v1/orgs/{org}/policy-decisions", "read", "READ"),
     ("GET", "/v1/runs/{id}/policy-decisions", "read", "READ"),
     ("GET", "/v1/orgs/{org}/libraries", "read", "READ"),
-    ("GET", "/v1/orgs/{org}/library-yanks/{hash}/impact", "read", "READ"),
+    (
+        "GET",
+        "/v1/orgs/{org}/library-yanks/{hash}/impact",
+        "read",
+        "READ",
+    ),
     ("GET", "/v1/runs/{id}/steps/{step}/origin", "read", "READ"),
     (
         "POST",
@@ -439,8 +444,18 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
         "library.defaults_retry",
         "CJ-W",
     ),
-    ("POST", "/v1/orgs/{org}/library-trust", "library.trust", "CJ-W"),
-    ("DELETE", "/v1/orgs/{org}/library-trust", "library.untrust", "EX"),
+    (
+        "POST",
+        "/v1/orgs/{org}/library-trust",
+        "library.trust",
+        "CJ-W",
+    ),
+    (
+        "DELETE",
+        "/v1/orgs/{org}/library-trust",
+        "library.untrust",
+        "EX",
+    ),
     ("GET", "/v1/orgs/{org}/plugin-catalog", "read", "READ"),
     ("GET", "/v1/orgs/{org}/plugins", "read", "READ"),
     // ADR-0076 §7: a plugin's open gate waits; the handler takes only its
@@ -977,9 +992,9 @@ fn well_formed(r: &scarab_server::RouteEntry) -> (String, Option<Value>) {
         ("PUT", "/v1/orgs/{org}/plugins/{name}/connections/{slot}") => {
             Some(json!({"base_url": "https://argo.example", "credential": "c"}))
         }
-        ("POST", "/v1/connections") => {
-            Some(json!({"org": "acme", "kind": "github", "base_url": "https://github.com", "credential": "c"}))
-        }
+        ("POST", "/v1/connections") => Some(
+            json!({"org": "acme", "kind": "github", "base_url": "https://github.com", "credential": "c"}),
+        ),
         ("POST", "/v1/connections/{id}/repos") => Some(json!({"owner": "acme", "name": "web"})),
         ("PUT", "/v1/connections/{id}/org") => Some(json!({"org": "acme"})),
         ("PUT", "/v1/orgs/{org}/libraries/{publisher}/{name}") => {

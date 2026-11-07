@@ -360,7 +360,13 @@ async fn lead(db: &dyn Db) -> scarab_engine::LeaderTerm {
 async fn scenario_release_after_mint(db: &dyn Db, run: &RunId) {
     seed_reached_gate(db, run).await;
     let a1 = db
-        .open_gate_wait(&lead(db).await, run, &id("approve"), Timestamp(2_000), Timestamp(3_000))
+        .open_gate_wait(
+            &lead(db).await,
+            run,
+            &id("approve"),
+            Timestamp(2_000),
+            Timestamp(3_000),
+        )
         .await
         .unwrap()
         .expect("a Pending gate opens its wait");
@@ -369,7 +375,13 @@ async fn scenario_release_after_mint(db: &dyn Db, run: &RunId) {
     assert_eq!(a1.started_at, Timestamp(2_000));
     // Asking again while it waits returns the same wait and writes nothing.
     let again = db
-        .open_gate_wait(&lead(db).await, run, &id("approve"), Timestamp(2_500), Timestamp(3_500))
+        .open_gate_wait(
+            &lead(db).await,
+            run,
+            &id("approve"),
+            Timestamp(2_500),
+            Timestamp(3_500),
+        )
         .await
         .unwrap();
     assert_eq!(again.map(|a| a.id), Some(AttemptId("a1".into())));
@@ -406,7 +418,13 @@ async fn scenario_mint_after_release(db: &dyn Db, run: &RunId) {
     );
 
     let late = db
-        .open_gate_wait(&lead(db).await, run, &id("approve"), Timestamp(2_000), Timestamp(5_000))
+        .open_gate_wait(
+            &lead(db).await,
+            run,
+            &id("approve"),
+            Timestamp(2_000),
+            Timestamp(5_000),
+        )
         .await
         .unwrap();
     assert_eq!(late, None, "a resolved gate opens no wait");
@@ -420,10 +438,16 @@ async fn scenario_mint_after_release(db: &dyn Db, run: &RunId) {
 /// `false` and does not append its event.
 async fn scenario_superseded_fence(db: &dyn Db, run: &RunId) {
     seed_reached_gate(db, run).await;
-    db.open_gate_wait(&lead(db).await, run, &id("approve"), Timestamp(2_000), Timestamp(3_000))
-        .await
-        .unwrap()
-        .unwrap();
+    db.open_gate_wait(
+        &lead(db).await,
+        run,
+        &id("approve"),
+        Timestamp(2_000),
+        Timestamp(3_000),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     let a1 = AttemptId("a1".into());
     assert!(db
         .close_running_attempt(run, &id("approve"), &a1, AttemptOutcome::Superseded, None)
@@ -473,10 +497,16 @@ async fn scenario_superseded_fence(db: &dyn Db, run: &RunId) {
 /// and a later mint attempt finds the gate cancelled and writes nothing.
 async fn scenario_cancel_after_mint(db: &dyn Db, run: &RunId) {
     seed_reached_gate(db, run).await;
-    db.open_gate_wait(&lead(db).await, run, &id("approve"), Timestamp(2_000), Timestamp(3_000))
-        .await
-        .unwrap()
-        .unwrap();
+    db.open_gate_wait(
+        &lead(db).await,
+        run,
+        &id("approve"),
+        Timestamp(2_000),
+        Timestamp(3_000),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     let clock = FakeClock::new(4_000);
     assert!(cancel_run_request(db, &clock, run, Some("alice".into()))
         .await
@@ -486,7 +516,13 @@ async fn scenario_cancel_after_mint(db: &dyn Db, run: &RunId) {
     assert_eq!(gate.attempts.len(), 1);
     assert_eq!(gate.attempts[0].outcome, AttemptOutcome::Cancelled);
     let late = db
-        .open_gate_wait(&lead(db).await, run, &id("approve"), Timestamp(2_000), Timestamp(5_000))
+        .open_gate_wait(
+            &lead(db).await,
+            run,
+            &id("approve"),
+            Timestamp(2_000),
+            Timestamp(5_000),
+        )
         .await
         .unwrap();
     assert_eq!(late, None);
@@ -497,10 +533,16 @@ async fn scenario_cancel_after_mint(db: &dyn Db, run: &RunId) {
 /// nothing at all.
 async fn scenario_losing_resolver_writes_nothing(db: &dyn Db, run: &RunId) {
     seed_reached_gate(db, run).await;
-    db.open_gate_wait(&lead(db).await, run, &id("approve"), Timestamp(2_000), Timestamp(3_000))
-        .await
-        .unwrap()
-        .unwrap();
+    db.open_gate_wait(
+        &lead(db).await,
+        run,
+        &id("approve"),
+        Timestamp(2_000),
+        Timestamp(3_000),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     let first = db
         .resolve_gate_wait(run, &id("approve"), &resolution(false, Some("a1"), 4_000))
         .await
@@ -536,10 +578,16 @@ async fn scenario_losing_resolver_writes_nothing(db: &dyn Db, run: &RunId) {
 /// a log replay (the UI's Takes view) does not leave it `running` forever.
 async fn scenario_released_gate_journals_its_transition(db: &dyn Db, run: &RunId) {
     seed_reached_gate(db, run).await;
-    db.open_gate_wait(&lead(db).await, run, &id("approve"), Timestamp(2_000), Timestamp(3_000))
-        .await
-        .unwrap()
-        .unwrap();
+    db.open_gate_wait(
+        &lead(db).await,
+        run,
+        &id("approve"),
+        Timestamp(2_000),
+        Timestamp(3_000),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     db.resolve_gate_wait(run, &id("approve"), &resolution(true, Some("a1"), 4_000))
         .await
         .unwrap()

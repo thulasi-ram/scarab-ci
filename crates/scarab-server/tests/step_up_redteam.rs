@@ -322,7 +322,10 @@ async fn a_stepped_up_identity_link_still_completes() {
         cb.headers()[axum::http::header::LOCATION],
         "/settings/profile?identity_linked=default"
     );
-    assert!(has_default_identity(&ids).await, "the identity was not attached");
+    assert!(
+        has_default_identity(&ids).await,
+        "the identity was not attached"
+    );
 }
 
 /// A legitimately minted link component is bound to its flow's `state` and
@@ -334,7 +337,11 @@ async fn a_link_binding_cannot_be_transplanted() {
     let (a, mut soft) = amy(&h).await;
     h.open_window(&a, &mut soft).await;
     let minted = begin_link(&h, &a).await;
-    let binding = minted.split('.').nth(4).expect("a link component").to_string();
+    let binding = minted
+        .split('.')
+        .nth(4)
+        .expect("a link component")
+        .to_string();
     assert!(!binding.is_empty());
 
     // (1) Onto a plain login's state, in the same session.
@@ -351,13 +358,19 @@ async fn a_link_binding_cannot_be_transplanted() {
     let plain = set_cookie(&login, "scarab_oauth_state").expect("a state cookie");
     let cb = link_callback(&h, &a, &format!("{plain}.{binding}")).await;
     assert_eq!(cb.status(), StatusCode::UNAUTHORIZED);
-    assert!(!has_default_identity(&ids).await, "attached via another state");
+    assert!(
+        !has_default_identity(&ids).await,
+        "attached via another state"
+    );
 
     // (2) The genuine cookie, from session B of the same human.
     let b = h.browser_session(owner("amy")).await;
     let cb = link_callback(&h, &b, &minted).await;
     assert_eq!(cb.status(), StatusCode::UNAUTHORIZED);
-    assert!(!has_default_identity(&ids).await, "attached via another session");
+    assert!(
+        !has_default_identity(&ids).await,
+        "attached via another session"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -397,7 +410,8 @@ async fn a_window_is_closed_at_exactly_its_expiry() {
     let (s, mut soft) = amy(&h).await;
     // bob exists as a Principal (a binding), so the inside-window write
     // cannot be a vacuous 404.
-    h.grant("bob", Scope::Org("acme".into()), Role::Viewer).await;
+    h.grant("bob", Scope::Org("acme".into()), Role::Viewer)
+        .await;
     h.open_window(&s, &mut soft).await;
 
     let body = json!({"subject": "bob", "role": "member"});
@@ -544,7 +558,11 @@ async fn another_admin_cannot_see_or_confirm_a_request() {
             &bob,
         )
         .await;
-    assert_eq!(st, StatusCode::NOT_FOUND, "bob got a challenge for amy's request: {b}");
+    assert_eq!(
+        st,
+        StatusCode::NOT_FOUND,
+        "bob got a challenge for amy's request: {b}"
+    );
 
     // …nor confirm it with an assertion over a challenge of his own.
     let (st, ch) = h.cookie("POST", "/v1/me/step-up/options", None, &bob).await;
@@ -558,7 +576,11 @@ async fn another_admin_cannot_see_or_confirm_a_request() {
             &bob,
         )
         .await;
-    assert_eq!(st, StatusCode::NOT_FOUND, "bob confirmed amy's request: {b}");
+    assert_eq!(
+        st,
+        StatusCode::NOT_FOUND,
+        "bob confirmed amy's request: {b}"
+    );
     assert_eq!(secret_value(&secrets).await, None, "the secret was written");
 }
 
@@ -567,13 +589,11 @@ async fn another_admin_cannot_see_or_confirm_a_request() {
 // ---------------------------------------------------------------------------
 
 async fn governed_in_memory() -> (Harness, Arc<InMemoryEnvironmentGovernance>) {
-    let gov = Arc::new(
-        InMemoryEnvironmentGovernance::new().with_environment(
-            "acme",
-            "prod",
-            EnvironmentProjectEligibility::AllProjects,
-        ),
-    );
+    let gov = Arc::new(InMemoryEnvironmentGovernance::new().with_environment(
+        "acme",
+        "prod",
+        EnvironmentProjectEligibility::AllProjects,
+    ));
     let wired = gov.clone();
     let h = harness_with(move |st| {
         st.with_environment_governance(wired.clone() as Arc<dyn EnvironmentGovernanceStore>)

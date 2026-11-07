@@ -39,9 +39,15 @@ async fn members_range_read_back_exactly_and_the_footer_is_the_index() {
     let c = br#"[{"name":"x"}]"#.to_vec();
 
     let mut w = store.open_pack("packs/f1/000001.pack").await.expect("open");
-    w.append(PackMemberKind::Blob, tagged(&a), &a).await.expect("append a");
-    w.append(PackMemberKind::Blob, tagged(&b), &b).await.expect("append b");
-    w.append(PackMemberKind::Tree, tagged(&c), &c).await.expect("append c");
+    w.append(PackMemberKind::Blob, tagged(&a), &a)
+        .await
+        .expect("append a");
+    w.append(PackMemberKind::Blob, tagged(&b), &b)
+        .await
+        .expect("append b");
+    w.append(PackMemberKind::Tree, tagged(&c), &c)
+        .await
+        .expect("append c");
     let finished = w.finish().await.expect("finish");
 
     assert_eq!(finished.key, "packs/f1/000001.pack");
@@ -122,19 +128,32 @@ async fn a_member_larger_than_one_part_survives_the_part_boundary() {
     let small = b"after the big one".to_vec();
 
     let mut w = store.open_pack("packs/f3/000001.pack").await.expect("open");
-    w.append(PackMemberKind::Blob, tagged(&big), &big).await.expect("big");
+    w.append(PackMemberKind::Blob, tagged(&big), &big)
+        .await
+        .expect("big");
     w.append(PackMemberKind::Blob, tagged(&small), &small)
         .await
         .expect("small");
     let finished = w.finish().await.expect("finish");
 
     let got_big = store
-        .get_range(&finished.key, finished.members[0].offset, finished.members[0].len)
+        .get_range(
+            &finished.key,
+            finished.members[0].offset,
+            finished.members[0].len,
+        )
         .await
         .expect("range big");
-    assert_eq!(got_big, big, "the multi-part member must reassemble byte-exactly");
+    assert_eq!(
+        got_big, big,
+        "the multi-part member must reassemble byte-exactly"
+    );
     let got_small = store
-        .get_range(&finished.key, finished.members[1].offset, finished.members[1].len)
+        .get_range(
+            &finished.key,
+            finished.members[1].offset,
+            finished.members[1].len,
+        )
         .await
         .expect("range small");
     assert_eq!(got_small, small);

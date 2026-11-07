@@ -53,7 +53,9 @@ async fn stub(user: serde_json::Value) -> Stub {
                 // Authentik's strictness (RFC 6749 §4.1.3): the exchange must
                 // replay the authorize request's redirect_uri, or the client is
                 // refused before the code is even looked at.
-                if !body.contains("redirect_uri=https%3A%2F%2Fscarab.example.com%2Fv1%2Fauth%2Fcallback") {
+                if !body.contains(
+                    "redirect_uri=https%3A%2F%2Fscarab.example.com%2Fv1%2Fauth%2Fcallback",
+                ) {
                     return (
                         StatusCode::UNAUTHORIZED,
                         axum::Json(serde_json::json!({ "error": "invalid_client" })),
@@ -452,7 +454,10 @@ async fn linking_proves_and_merges_an_imported_account_without_email() {
     .await;
     assert_eq!(resp.status(), StatusCode::FOUND);
     let loc = resp.headers()["location"].to_str().unwrap().to_string();
-    assert!(loc.starts_with("/settings/profile?identity_link_error="), "{loc}");
+    assert!(
+        loc.starts_with("/settings/profile?identity_link_error="),
+        "{loc}"
+    );
     assert_eq!(
         pg.principal("bob").await.unwrap().unwrap().merged_into,
         None

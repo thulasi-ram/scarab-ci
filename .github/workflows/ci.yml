@@ -321,6 +321,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # Formatting is a contract too: rust-toolchain.toml pins the rustfmt that
+      # defines it, and rustfmt.toml pins the style edition.
+      - name: Fail on unformatted Rust
+        run: cargo fmt --all -- --check
       # Full-route coverage is asserted by the test suite
       # (step_up_routes.rs::route_table_equals_the_openapi_spec); this job gates DRIFT:
       # the committed openapi.json must equal the generated one.

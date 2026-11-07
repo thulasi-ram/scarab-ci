@@ -435,14 +435,11 @@ fn cache_home_from_env(
             .ok()
             .filter(|n| *n > 0)
             .ok_or_else(|| {
-                ConfigError::InvalidWorkspaceCacheHome(format!(
-                    "SCARAB_WORKSPACE_REPLICAS={raw:?}"
-                ))
+                ConfigError::InvalidWorkspaceCacheHome(format!("SCARAB_WORKSPACE_REPLICAS={raw:?}"))
             })?,
         None => 1,
     };
-    let Some(template) = env("SCARAB_WORKSPACE_HOME_URL_TEMPLATE").filter(|v| !v.is_empty())
-    else {
+    let Some(template) = env("SCARAB_WORKSPACE_HOME_URL_TEMPLATE").filter(|v| !v.is_empty()) else {
         return Ok(None);
     };
     if !template.contains(ORDINAL_PLACEHOLDER) {
@@ -773,8 +770,7 @@ fn step_up_public_url_ok(public_url: &str) -> bool {
     let Ok(rp) = scarab_webauthn::RelyingParty::from_public_url(public_url, "Scarab") else {
         return false;
     };
-    rp.origin().starts_with("https://")
-        || matches!(rp.rp_id(), "localhost" | "127.0.0.1" | "::1")
+    rp.origin().starts_with("https://") || matches!(rp.rp_id(), "localhost" | "127.0.0.1" | "::1")
 }
 
 /// The broker listener's default address (ADR-0072 §11).
@@ -1659,17 +1655,16 @@ impl Config {
 
         // ADR-0061 s2's CAS-leg parallelism. Read here, not in the adapter: an
         // ambient env read there could neither fail the boot nor be reported.
-        let cas_concurrency = match env(scarab_storage_s3::CAS_CONCURRENCY_ENV)
-            .filter(|v| !v.trim().is_empty())
-        {
-            Some(v) => v
-                .trim()
-                .parse::<usize>()
-                .ok()
-                .filter(|n| *n > 0)
-                .ok_or(ConfigError::InvalidCasConcurrency)?,
-            None => scarab_storage_s3::DEFAULT_CAS_CONCURRENCY,
-        };
+        let cas_concurrency =
+            match env(scarab_storage_s3::CAS_CONCURRENCY_ENV).filter(|v| !v.trim().is_empty()) {
+                Some(v) => v
+                    .trim()
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|n| *n > 0)
+                    .ok_or(ConfigError::InvalidCasConcurrency)?,
+                None => scarab_storage_s3::DEFAULT_CAS_CONCURRENCY,
+            };
 
         // Declarative connections (ADR-0060 part D). Parsed, validated AND
         // credential-resolved here: the whole point of the block is that a boot
@@ -1694,15 +1689,15 @@ impl Config {
                     .unwrap_or_else(|| "./.scarab/workspace-cas".into()),
                 fetcher_image: env("SCARAB_WSFETCH_IMAGE")
                     .filter(|v| !v.is_empty())
-                    .unwrap_or_else(|| {
-                        scarab_executor_k8s::DEFAULT_WSFETCH_IMAGE.to_string()
-                    }),
+                    .unwrap_or_else(|| scarab_executor_k8s::DEFAULT_WSFETCH_IMAGE.to_string()),
                 warm_budget_bytes: match env("SCARAB_WORKSPACE_WARM_BUDGET_BYTES")
                     .filter(|v| !v.is_empty())
                 {
-                    Some(raw) => Some(raw.trim().parse::<u64>().map_err(|_| {
-                        ConfigError::InvalidWorkspaceWarmBudget(raw.clone())
-                    })?),
+                    Some(raw) => Some(
+                        raw.trim()
+                            .parse::<u64>()
+                            .map_err(|_| ConfigError::InvalidWorkspaceWarmBudget(raw.clone()))?,
+                    ),
                     None => None,
                 },
                 // Helper container resources (ticket 16a7768 item 1),
@@ -1711,14 +1706,12 @@ impl Config {
                 // keeps the pre-ticket Pod shape byte for byte — no limits,
                 // no derived budget env; the wsfetch binary's own 256 MiB
                 // transfer budget still bounds memory, without a kill.
-                helper_cpu_millis: helper_axis(env("SCARAB_WSFETCH_CPU_MILLIS"), None)
-                    .map_err(|raw| {
-                        ConfigError::InvalidWsfetchResource("SCARAB_WSFETCH_CPU_MILLIS", raw)
-                    })?,
-                helper_memory_mib: helper_axis(env("SCARAB_WSFETCH_MEMORY_MIB"), None)
-                    .map_err(|raw| {
-                        ConfigError::InvalidWsfetchResource("SCARAB_WSFETCH_MEMORY_MIB", raw)
-                    })?,
+                helper_cpu_millis: helper_axis(env("SCARAB_WSFETCH_CPU_MILLIS"), None).map_err(
+                    |raw| ConfigError::InvalidWsfetchResource("SCARAB_WSFETCH_CPU_MILLIS", raw),
+                )?,
+                helper_memory_mib: helper_axis(env("SCARAB_WSFETCH_MEMORY_MIB"), None).map_err(
+                    |raw| ConfigError::InvalidWsfetchResource("SCARAB_WSFETCH_MEMORY_MIB", raw),
+                )?,
                 // Blob-read authorization (ticket 52ef3aa). Unset/blank = the
                 // rollout default (`log`); garbage refuses the boot rather
                 // than silently running a *less* enforcing mode than asked.
@@ -1727,8 +1720,9 @@ impl Config {
                     .filter(|v| !v.is_empty())
                 {
                     None => BlobAuthzMode::Log,
-                    Some(raw) => BlobAuthzMode::parse(&raw)
-                        .ok_or(ConfigError::InvalidBlobAuthzMode(raw))?,
+                    Some(raw) => {
+                        BlobAuthzMode::parse(&raw).ok_or(ConfigError::InvalidBlobAuthzMode(raw))?
+                    }
                 },
                 cache_home: cache_home_from_env(&env)?,
             }),
@@ -1747,16 +1741,15 @@ impl Config {
         });
 
         // Hoisted: the pack-retention default and floor below need the value.
-        let retention_workspace_days = match env("SCARAB_RETENTION_WORKSPACE_DAYS")
-            .filter(|v| !v.is_empty())
-        {
-            Some(v) => v
-                .parse::<u32>()
-                .ok()
-                .filter(|d| *d > 0)
-                .ok_or(ConfigError::InvalidRetention)?,
-            None => 14,
-        };
+        let retention_workspace_days =
+            match env("SCARAB_RETENTION_WORKSPACE_DAYS").filter(|v| !v.is_empty()) {
+                Some(v) => v
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|d| *d > 0)
+                    .ok_or(ConfigError::InvalidRetention)?,
+                None => 14,
+            };
 
         let plugins = PluginsConfig::resolve(&env, dev_insecure, &cli.addr, &cli.namespace)?;
 
@@ -1823,8 +1816,7 @@ impl Config {
                 None => 90,
             },
             retention_workspace_days,
-            retention_pack_days: match env("SCARAB_RETENTION_PACK_DAYS").filter(|v| !v.is_empty())
-            {
+            retention_pack_days: match env("SCARAB_RETENTION_PACK_DAYS").filter(|v| !v.is_empty()) {
                 Some(v) => v
                     .parse::<u32>()
                     .ok()
@@ -2486,9 +2478,8 @@ mod tests {
     fn the_workspace_role_requires_postgres_but_not_a_kek() {
         let mut no_db = cli(None);
         no_db.role = Role::Workspace;
-        let ws_env = |k: &str| {
-            (k == "SCARAB_WORKSPACE_TOKEN_SECRET").then(|| "ws-secret".to_string())
-        };
+        let ws_env =
+            |k: &str| (k == "SCARAB_WORKSPACE_TOKEN_SECRET").then(|| "ws-secret".to_string());
         assert_eq!(
             Config::resolve_from(&no_db, ws_env).unwrap_err(),
             ConfigError::MissingDatabaseUrl,
@@ -2626,7 +2617,8 @@ mod tests {
         let ws = |extra: &'static [(&'static str, &'static str)]| {
             let mut base = vec![("SCARAB_WORKSPACE_TOKEN_SECRET", "s3cret")];
             base.extend_from_slice(extra);
-            let leaked: &'static [(&'static str, &'static str)] = Box::leak(base.into_boxed_slice());
+            let leaked: &'static [(&'static str, &'static str)] =
+                Box::leak(base.into_boxed_slice());
             Config::resolve_from(&cli(Some("postgres://l/scarab")), dev_env(leaked))
                 .unwrap()
                 .workspace
@@ -2673,7 +2665,11 @@ mod tests {
                 .workspace
                 .unwrap()
         };
-        assert_eq!(ws(&[]).blob_authz, BlobAuthzMode::Log, "the rollout default");
+        assert_eq!(
+            ws(&[]).blob_authz,
+            BlobAuthzMode::Log,
+            "the rollout default"
+        );
         assert_eq!(
             ws(&[("SCARAB_DEPOT_BLOB_AUTHZ", "off")]).blob_authz,
             BlobAuthzMode::Off
@@ -2734,8 +2730,14 @@ mod tests {
         let t = "http://scarab-workspace-{ordinal}.ns.svc".to_string();
         let home = |pairs: Vec<(&'static str, String)>| cache_home_from_env(&key_env(pairs));
         assert_eq!(home(vec![]).unwrap(), None);
-        assert_eq!(home(vec![("SCARAB_WORKSPACE_HOME_URL_TEMPLATE", t.clone())]).unwrap(), None);
-        assert_eq!(home(vec![("SCARAB_WORKSPACE_REPLICAS", "3".into())]).unwrap(), None);
+        assert_eq!(
+            home(vec![("SCARAB_WORKSPACE_HOME_URL_TEMPLATE", t.clone())]).unwrap(),
+            None
+        );
+        assert_eq!(
+            home(vec![("SCARAB_WORKSPACE_REPLICAS", "3".into())]).unwrap(),
+            None
+        );
         let got = home(vec![
             ("SCARAB_WORKSPACE_REPLICAS", "3".into()),
             ("SCARAB_WORKSPACE_HOME_URL_TEMPLATE", t.clone()),
@@ -2745,7 +2747,10 @@ mod tests {
         assert_eq!(got.replicas, 3);
         assert!(home(vec![
             ("SCARAB_WORKSPACE_REPLICAS", "3".into()),
-            ("SCARAB_WORKSPACE_HOME_URL_TEMPLATE", "http://one.ns.svc".into()),
+            (
+                "SCARAB_WORKSPACE_HOME_URL_TEMPLATE",
+                "http://one.ns.svc".into()
+            ),
         ])
         .is_err());
         assert!(home(vec![("SCARAB_WORKSPACE_REPLICAS", "two".into())]).is_err());
@@ -2757,7 +2762,10 @@ mod tests {
             if k == "SCARAB_DEV_INSECURE" {
                 return Some("1".to_string());
             }
-            pairs.iter().find(|(key, _)| *key == k).map(|(_, v)| v.clone())
+            pairs
+                .iter()
+                .find(|(key, _)| *key == k)
+                .map(|(_, v)| v.clone())
         }
     }
 
@@ -2788,7 +2796,11 @@ mod tests {
             if list.trim().is_empty() {
                 continue;
             }
-            assert_eq!(got.unwrap_err(), ConfigError::InvalidMasterKeys, "list={list:?}");
+            assert_eq!(
+                got.unwrap_err(),
+                ConfigError::InvalidMasterKeys,
+                "list={list:?}"
+            );
         }
     }
 
@@ -2804,7 +2816,10 @@ mod tests {
         assert_eq!(err, ConfigError::DuplicateMasterKey(fp(1)));
         let msg = err.to_string();
         assert!(msg.contains(&fp(1)), "{msg}");
-        assert!(!msg.contains(&b64_key(1)), "no key material in errors: {msg}");
+        assert!(
+            !msg.contains(&b64_key(1)),
+            "no key material in errors: {msg}"
+        );
     }
 
     /// Both vars, legacy names a NON-active member: the list is authoritative,
@@ -2813,7 +2828,10 @@ mod tests {
     #[test]
     fn legacy_var_naming_a_nonactive_member_boots_with_a_warning() {
         let env = key_env(vec![
-            ("SCARAB_MASTER_KEYS", format!("{},{}", b64_key(2), b64_key(1))),
+            (
+                "SCARAB_MASTER_KEYS",
+                format!("{},{}", b64_key(2), b64_key(1)),
+            ),
             ("SCARAB_MASTER_KEY", b64_key(1)),
         ]);
         let cfg = Config::resolve_from(&cli(Some("postgres://l/scarab")), env).unwrap();
@@ -2821,14 +2839,20 @@ mod tests {
         let warnings = cfg.boot_warnings().join("\n");
         assert!(warnings.contains("drop SCARAB_MASTER_KEY"), "{warnings}");
         assert!(warnings.contains(&fp(1)), "{warnings}");
-        assert!(warnings.contains(&fp(2)), "names the actual writer: {warnings}");
+        assert!(
+            warnings.contains(&fp(2)),
+            "names the actual writer: {warnings}"
+        );
     }
 
     /// Both vars, legacy names the ACTIVE member: harmless redundancy, no warn.
     #[test]
     fn legacy_var_naming_the_active_member_is_silent() {
         let env = key_env(vec![
-            ("SCARAB_MASTER_KEYS", format!("{},{}", b64_key(2), b64_key(1))),
+            (
+                "SCARAB_MASTER_KEYS",
+                format!("{},{}", b64_key(2), b64_key(1)),
+            ),
             ("SCARAB_MASTER_KEY", b64_key(2)),
         ]);
         let cfg = Config::resolve_from(&cli(Some("postgres://l/scarab")), env).unwrap();
@@ -2841,7 +2865,10 @@ mod tests {
     #[test]
     fn legacy_var_outside_the_list_refuses_naming_both_fingerprints() {
         let env = key_env(vec![
-            ("SCARAB_MASTER_KEYS", format!("{},{}", b64_key(2), b64_key(1))),
+            (
+                "SCARAB_MASTER_KEYS",
+                format!("{},{}", b64_key(2), b64_key(1)),
+            ),
             ("SCARAB_MASTER_KEY", b64_key(3)),
         ]);
         let err = Config::resolve_from(&cli(Some("postgres://l/scarab")), env).unwrap_err();
@@ -2853,8 +2880,14 @@ mod tests {
             }
         );
         let msg = err.to_string();
-        assert!(msg.contains(&fp(3)) && msg.contains(&fp(2)) && msg.contains(&fp(1)), "{msg}");
-        assert!(!msg.contains(&b64_key(3)), "no key material in errors: {msg}");
+        assert!(
+            msg.contains(&fp(3)) && msg.contains(&fp(2)) && msg.contains(&fp(1)),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains(&b64_key(3)),
+            "no key material in errors: {msg}"
+        );
     }
 
     /// The single legacy var still works: it is a one-key list.
@@ -2864,7 +2897,10 @@ mod tests {
         let cfg = Config::resolve_from(&cli(Some("postgres://l/scarab")), env).unwrap();
         assert_eq!(cfg.master_keys, Some(vec![[7u8; 32]]));
         let report = cfg.startup_report().join("\n");
-        assert!(report.contains(&format!("active={} decrypt-only=[]", fp(7))), "{report}");
+        assert!(
+            report.contains(&format!("active={} decrypt-only=[]", fp(7))),
+            "{report}"
+        );
     }
 
     #[test]
@@ -3759,7 +3795,9 @@ connections:
         let unset = resolve(vec![]).expect("a production config boots");
         assert_eq!(unset.step_up, StepUpMode::Enforce, "unset = enforce");
         assert_eq!(
-            resolve(vec![("SCARAB_STEP_UP", "  ".into())]).unwrap().step_up,
+            resolve(vec![("SCARAB_STEP_UP", "  ".into())])
+                .unwrap()
+                .step_up,
             StepUpMode::Enforce,
             "blank = enforce"
         );
@@ -3843,16 +3881,25 @@ connections:
 
         let default = resolve(vec![]).unwrap();
         assert_eq!(default.ui_url, "https://ci.example.com");
-        let trailing =
-            resolve(vec![("SCARAB_PUBLIC_URL", "https://ci.example.com/".into())]).unwrap();
-        assert_eq!(trailing.ui_url, "https://ci.example.com", "no trailing slash");
+        let trailing = resolve(vec![(
+            "SCARAB_PUBLIC_URL",
+            "https://ci.example.com/".into(),
+        )])
+        .unwrap();
+        assert_eq!(
+            trailing.ui_url, "https://ci.example.com",
+            "no trailing slash"
+        );
         assert!(default.startup_report().contains(
             &"ui url: the public url (login callback, passkeys, confirmation links)".to_string()
         ));
 
         let local = resolve(vec![("SCARAB_UI_URL", "http://localhost:8080/".into())]).unwrap();
         assert_eq!(local.ui_url, "http://localhost:8080");
-        assert_eq!(local.public_url, "https://ci.example.com", "webhooks stay public");
+        assert_eq!(
+            local.public_url, "https://ci.example.com",
+            "webhooks stay public"
+        );
         let report = local.startup_report();
         assert!(
             report.contains(
@@ -3872,7 +3919,9 @@ connections:
 
         // A blank value is unset.
         assert_eq!(
-            resolve(vec![("SCARAB_UI_URL", "  ".into())]).unwrap().ui_url,
+            resolve(vec![("SCARAB_UI_URL", "  ".into())])
+                .unwrap()
+                .ui_url,
             "https://ci.example.com"
         );
     }
@@ -3938,7 +3987,10 @@ connections:
         const FIVE: &[(&str, &str)] = &[
             ("SCARAB_OAUTH_CLIENT_ID", "cid"),
             ("SCARAB_OAUTH_CLIENT_SECRET", "sekret"),
-            ("SCARAB_OAUTH_AUTHORIZE_URL", "https://idp.example/authorize"),
+            (
+                "SCARAB_OAUTH_AUTHORIZE_URL",
+                "https://idp.example/authorize",
+            ),
             ("SCARAB_OAUTH_TOKEN_URL", "https://idp.example/token"),
             ("SCARAB_OAUTH_USERINFO_URL", "https://idp.example/userinfo"),
             ("SCARAB_OAUTH_OWNERS", " ada@example.com ,8f3c-opaque "),
@@ -3946,7 +3998,10 @@ connections:
         const WITH_ISSUER: &[(&str, &str)] = &[
             ("SCARAB_OAUTH_CLIENT_ID", "cid"),
             ("SCARAB_OAUTH_CLIENT_SECRET", "sekret"),
-            ("SCARAB_OAUTH_AUTHORIZE_URL", "https://idp.example/authorize"),
+            (
+                "SCARAB_OAUTH_AUTHORIZE_URL",
+                "https://idp.example/authorize",
+            ),
             ("SCARAB_OAUTH_TOKEN_URL", "https://idp.example/token"),
             ("SCARAB_OAUTH_USERINFO_URL", "https://idp.example/userinfo"),
             ("SCARAB_OAUTH_ISSUER", "https://dex.example/"),
@@ -4225,7 +4280,10 @@ connections:
         // A principal is mandatory.
         assert!(Cli::try_parse_from(["scarab-server", "admin", "reset-passkeys"]).is_err());
         // No subcommand: serve, as before.
-        assert_eq!(Cli::try_parse_from(["scarab-server"]).unwrap().command, None);
+        assert_eq!(
+            Cli::try_parse_from(["scarab-server"]).unwrap().command,
+            None
+        );
     }
 
     /// `scarab-server admin grant`: org, subject and role are mandatory.

@@ -103,7 +103,10 @@ pub fn event_facts(
     let mut fields = event.template_fields();
     if let Some(url) = clone_url {
         if let Some(serde_json::Value::Object(r)) = fields.get_mut("repo") {
-            r.insert("clone_url".into(), serde_json::Value::String(url.to_string()));
+            r.insert(
+                "clone_url".into(),
+                serde_json::Value::String(url.to_string()),
+            );
         }
     }
     let reads = scarab_pipeline::event::reads(ir);
@@ -152,8 +155,11 @@ pub async fn forge_token_refusals(
     write: WriteGovernance,
 ) -> Result<ForgeTokenAdmission, String> {
     let mut out = ForgeTokenAdmission::default();
-    let asking: Vec<&scarab_pipeline::StepSpec> =
-        ir.steps.iter().filter(|s| s.forge_token.is_some()).collect();
+    let asking: Vec<&scarab_pipeline::StepSpec> = ir
+        .steps
+        .iter()
+        .filter(|s| s.forge_token.is_some())
+        .collect();
     if asking.is_empty() {
         return Ok(out);
     }
@@ -240,9 +246,11 @@ async fn trusted_library_step(
     let Some(libraries) = libraries else {
         return Ok(None);
     };
-    Ok(library_trusted(libraries, org, &link.content_hash, trusted_sources)
-        .await?
-        .then(|| link.content_hash.clone()))
+    Ok(
+        library_trusted(libraries, org, &link.content_hash, trusted_sources)
+            .await?
+            .then(|| link.content_hash.clone()),
+    )
 }
 
 /// Whether the org trusts the library version `hash` with long-lived forge
@@ -266,7 +274,10 @@ async fn library_trusted(
 }
 
 /// The org's trusted sources, as [`library_trusted`] reads them.
-async fn trusted_sources(libraries: &dyn LibraryStore, org: &str) -> Result<BTreeSet<String>, String> {
+async fn trusted_sources(
+    libraries: &dyn LibraryStore,
+    org: &str,
+) -> Result<BTreeSet<String>, String> {
     Ok(libraries
         .trusted_sources(org)
         .await
@@ -752,7 +763,6 @@ impl Executor for ForgeCredentialExecutor {
         // failure shape). Same forward-or-drop hazard as `artifacts` below.
         self.inner.output_identity(handle).await
     }
-
 
     async fn results(
         &self,

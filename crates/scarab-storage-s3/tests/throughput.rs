@@ -110,7 +110,10 @@ async fn cas_leg_throughput_by_concurrency() {
             format!("s3 @ {endpoint}")
         }
     );
-    println!("{:>11} | {:>12} | {:>12} | {:>13}", "concurrency", "cold ingest", "warm ingest", "materialize");
+    println!(
+        "{:>11} | {:>12} | {:>12} | {:>13}",
+        "concurrency", "cold ingest", "warm ingest", "materialize"
+    );
     println!("{:->11}-+-{:->12}-+-{:->12}-+-{:->13}", "", "", "", "");
 
     for (run, limit) in limits.iter().enumerate() {
@@ -134,15 +137,26 @@ async fn cas_leg_throughput_by_concurrency() {
         // Salt by run index (not by limit, so re-ordering the limits list does not
         // change which run is cold) and by pid (so a re-invocation is cold too).
         let src = temp_dir("src");
-        build(&src, files, bytes, run + 1_000_000 * std::process::id() as usize);
+        build(
+            &src,
+            files,
+            bytes,
+            run + 1_000_000 * std::process::id() as usize,
+        );
         let out = temp_dir("out");
 
         let t = Instant::now();
-        let snap = cas.ingest(src.to_str().unwrap()).await.expect("cold ingest");
+        let snap = cas
+            .ingest(src.to_str().unwrap())
+            .await
+            .expect("cold ingest");
         let cold = t.elapsed().as_millis();
 
         let t = Instant::now();
-        let again = cas.ingest(src.to_str().unwrap()).await.expect("warm ingest");
+        let again = cas
+            .ingest(src.to_str().unwrap())
+            .await
+            .expect("warm ingest");
         let warm = t.elapsed().as_millis();
         assert_eq!(snap.root, again.root, "a warm ingest must be the same tree");
 

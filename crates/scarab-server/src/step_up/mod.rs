@@ -870,7 +870,10 @@ pub(crate) async fn require(
     if let Some(authority) = requests::replay_authority() {
         if authority.op_id == op.id
             && authority.digest.as_slice() == p.digest.as_slice()
-            && summary.changes.iter().all(|c| authority.changes.contains(c))
+            && summary
+                .changes
+                .iter()
+                .all(|c| authority.changes.contains(c))
         {
             return Ok(Some(authority.confirmation_id.clone()));
         }
@@ -1217,7 +1220,14 @@ mod tests {
     fn a_closed_window_keeps_the_distinct_targets_it_suppressed() {
         let l = StepUpRefusalLimiter::default();
         let r = |target: &str, at| {
-            let mut e = refusal("acme", "amy", "session:cookie", "secret.put", "no_window", at);
+            let mut e = refusal(
+                "acme",
+                "amy",
+                "session:cookie",
+                "secret.put",
+                "no_window",
+                at,
+            );
             e.target = Some(target.into());
             e
         };
@@ -1247,7 +1257,16 @@ mod tests {
     #[test]
     fn a_clock_step_back_opens_a_new_window() {
         let l = StepUpRefusalLimiter::default();
-        let r = |at| refusal("acme", "amy", "session:cookie", "secret.put", "no_window", at);
+        let r = |at| {
+            refusal(
+                "acme",
+                "amy",
+                "session:cookie",
+                "secret.put",
+                "no_window",
+                at,
+            )
+        };
         let t = 10 * REFUSAL_WINDOW_MS;
         for _ in 0..REFUSALS_PER_WINDOW {
             assert_eq!(admit_one(&l, r(t)), Some(0));
@@ -1264,7 +1283,16 @@ mod tests {
     #[test]
     fn reordering_within_the_skew_allowance_stays_in_the_window() {
         let l = StepUpRefusalLimiter::default();
-        let r = |at| refusal("acme", "amy", "session:cookie", "secret.put", "no_window", at);
+        let r = |at| {
+            refusal(
+                "acme",
+                "amy",
+                "session:cookie",
+                "secret.put",
+                "no_window",
+                at,
+            )
+        };
         let t = 10 * REFUSAL_WINDOW_MS;
         for _ in 0..REFUSALS_PER_WINDOW {
             assert_eq!(admit_one(&l, r(t)), Some(0));

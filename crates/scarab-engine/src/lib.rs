@@ -19,14 +19,13 @@
 
 pub mod ports;
 pub mod render;
-pub mod schedules;
 pub mod scheduler;
+pub mod schedules;
 
 pub use ports::{
-    Clock, Db, Executor, LeaderTerm, LogChunks, SnapshotRetention, StepLaunch,
-    WorkspaceSnapshots, LEADER_TX_BOUND_MS, SCHEDULER_LEASE,
+    Clock, Db, Executor, LeaderTerm, LogChunks, SnapshotRetention, StepLaunch, WorkspaceSnapshots,
+    LEADER_TX_BOUND_MS, SCHEDULER_LEASE,
 };
-pub use schedules::{ScheduleEntry, ScheduleFire, ScheduleStore};
 pub use scheduler::{
     cancel_run_request, environment_approval_met, fail_run_creation, gate_approvers,
     gate_released_at, pin_run_snapshots, plan_rerun, record_gate_approval, reject_gate,
@@ -34,9 +33,10 @@ pub use scheduler::{
     retry_step, retry_step_widened, run_status_post_key, unpin_run_snapshots, wait_began_at,
     AttemptTeardown, EnvironmentApproval, ExpiredInput, PlanReason, PlannedStep, PluginGateError,
     PluginGateVerdict, RerunError, RerunPlan, Scheduler, SchedulerError, Supervision,
-    TeardownAttempt, TickHealth, CANCEL_ATTEMPT, CANCEL_RUN, GATE_NO_LONGER_NEEDED, LAUNCH_STEP, MAX_DELIVERY_ATTEMPTS,
-    RUN_FINISHED, RUN_STATUS_CHANGED, SUPERSEDE_TEARDOWN,
+    TeardownAttempt, TickHealth, CANCEL_ATTEMPT, CANCEL_RUN, GATE_NO_LONGER_NEEDED, LAUNCH_STEP,
+    MAX_DELIVERY_ATTEMPTS, RUN_FINISHED, RUN_STATUS_CHANGED, SUPERSEDE_TEARDOWN,
 };
+pub use schedules::{ScheduleEntry, ScheduleFire, ScheduleStore};
 
 use serde::{Deserialize, Serialize};
 

@@ -48,14 +48,27 @@ fn rt2_each_bound_holds_at_its_edge() {
     for (field, max, c) in cases {
         let at: String = std::iter::repeat(c).take(max).collect();
         let over: String = std::iter::repeat(c).take(max + 1).collect();
-        assert!(check_value(field, &json!(at)).is_ok(), "{field} at {max} refused");
-        assert!(check_value(field, &json!(over)).is_err(), "{field} at {} accepted", max + 1);
+        assert!(
+            check_value(field, &json!(at)).is_ok(),
+            "{field} at {max} refused"
+        );
+        assert!(
+            check_value(field, &json!(over)).is_err(),
+            "{field} at {} accepted",
+            max + 1
+        );
     }
     for field in ["ref", "tag"] {
         let at = format!("refs/{}", "a".repeat(250));
         assert_eq!(at.len(), 255);
-        assert!(check_value(field, &json!(at)).is_ok(), "{field} at 255 refused");
-        assert!(check_value(field, &json!(format!("{at}a"))).is_err(), "{field} at 256 accepted");
+        assert!(
+            check_value(field, &json!(at)).is_ok(),
+            "{field} at 255 refused"
+        );
+        assert!(
+            check_value(field, &json!(format!("{at}a"))).is_err(),
+            "{field} at 256 accepted"
+        );
     }
     let url = |n: usize| format!("https://git.example.com/{}", "a".repeat(n - 24));
     assert_eq!(url(2048).len(), 2048);
@@ -68,7 +81,12 @@ fn rt2_each_bound_holds_at_its_edge() {
 /// message that cuts the value at 40 characters. Refused, never a panic.
 #[test]
 fn rt2_multi_byte_values_at_the_edge_are_refused_without_a_panic() {
-    for (field, max) in [("kind", 32), ("run", 64), ("repo.owner", 100), ("branch", 255)] {
+    for (field, max) in [
+        ("kind", 32),
+        ("run", 64),
+        ("repo.owner", 100),
+        ("branch", 255),
+    ] {
         // `é` is two bytes: max/2 + 1 characters is just over in bytes.
         let v: String = "é".repeat(max / 2 + 1);
         assert!(v.chars().count() <= max && v.len() > max);
@@ -76,7 +94,10 @@ fn rt2_multi_byte_values_at_the_edge_are_refused_without_a_panic() {
         assert!(matches!(r, Ok(Err(_))), "{field}: {r:?}");
         // Under the byte limit too: refused for its characters.
         let short: String = "é".repeat(2);
-        assert!(check_value(field, &json!(short)).is_err(), "{field} accepted non-ASCII");
+        assert!(
+            check_value(field, &json!(short)).is_err(),
+            "{field} accepted non-ASCII"
+        );
         // A 4-byte character placed where the 40-character cut lands.
         let mixed = format!("{}{}", "a".repeat(39), "𝔵".repeat(60));
         let r = std::panic::catch_unwind(|| check_value(field, &json!(mixed)));

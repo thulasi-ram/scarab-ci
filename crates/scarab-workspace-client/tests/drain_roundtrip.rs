@@ -199,7 +199,9 @@ fn build_workspace(root: &std::path::Path) {
 /// equality is the only place the two constructions meet.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_helper_prune_root_equals_the_control_plane_prune_root() {
-    let Some(h) = Harness::start().await else { return };
+    let Some(h) = Harness::start().await else {
+        return;
+    };
     let ws = tempfile::tempdir().unwrap();
     build_workspace(ws.path());
     let declared = vec!["src/deep".to_string(), "plain.txt".to_string()];
@@ -251,7 +253,9 @@ async fn the_helper_prune_root_equals_the_control_plane_prune_root() {
 /// 403 against a fence token that has no ledger read grant yet.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_seeded_memo_serves_the_prune_walk_with_zero_http_tree_gets() {
-    let Some(h) = Harness::start().await else { return };
+    let Some(h) = Harness::start().await else {
+        return;
+    };
     let ws = tempfile::tempdir().unwrap();
     build_workspace(ws.path());
     let declared = vec!["src".to_string()];
@@ -310,7 +314,9 @@ async fn the_seeded_memo_serves_the_prune_walk_with_zero_http_tree_gets() {
 /// works, not against a router that never dedups.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_drain_re_puts_every_closure_tree_even_when_warm_already_has_them() {
-    let Some(h) = Harness::start().await else { return };
+    let Some(h) = Harness::start().await else {
+        return;
+    };
     let ws = tempfile::tempdir().unwrap();
     build_workspace(ws.path());
     let path = ws.path().to_str().unwrap();
@@ -395,7 +401,9 @@ async fn a_drain_re_puts_every_closure_tree_even_when_warm_already_has_them() {
 /// persisted. The equality at the bottom is byte-for-byte the posted struct.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_drain_record_round_trips_ingest_prune_record_get() {
-    let Some(h) = Harness::start().await else { return };
+    let Some(h) = Harness::start().await else {
+        return;
+    };
     let ws = tempfile::tempdir().unwrap();
     build_workspace(ws.path());
     let declared = vec!["src".to_string()];
@@ -466,7 +474,9 @@ async fn a_drain_record_round_trips_ingest_prune_record_get() {
 /// never be read" loop-to-dead-letter this addressing exists to prevent.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_drain_record_for_a_step_id_containing_a_slash_round_trips() {
-    let Some(h) = Harness::start().await else { return };
+    let Some(h) = Harness::start().await else {
+        return;
+    };
     let ws = tempfile::tempdir().unwrap();
     build_workspace(ws.path());
 
@@ -523,7 +533,9 @@ async fn a_drain_record_for_a_step_id_containing_a_slash_round_trips() {
 /// B regresses to 404 — the replica-independence part 4 paid for).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_drain_recorded_through_one_replica_is_readable_through_another() {
-    let Some(a) = Harness::start().await else { return };
+    let Some(a) = Harness::start().await else {
+        return;
+    };
     let b = a.replica().await;
 
     // The whole drain happens against replica A: tree/blob PUTs (bodies land
@@ -564,7 +576,10 @@ async fn a_drain_recorded_through_one_replica_is_readable_through_another() {
         .await
         .expect("get the drain record through replica B")
         .expect("the record must exist through EITHER replica — it is a row, not a file");
-    assert_eq!(got, rec, "replica B must hand back exactly what A persisted");
+    assert_eq!(
+        got, rec,
+        "replica B must hand back exactly what A persisted"
+    );
 
     // The write ledger crosses replicas too: on B, the owning fence's
     // single-tree GET is AUTHORIZED by the shared ledger row, and since
@@ -666,7 +681,9 @@ async fn a_pruned_drain_packs_its_closure_and_a_cold_replica_serves_every_addres
     use scarab_storage::content::ContentSource;
     use scarab_storage::{BlobHash, Cas};
 
-    let Some(a) = Harness::start().await else { return };
+    let Some(a) = Harness::start().await else {
+        return;
+    };
     let ws = tempfile::tempdir().unwrap();
     build_workspace(ws.path());
     let declared = vec!["src".to_string(), "plain.txt".to_string()];
@@ -756,9 +773,10 @@ async fn a_pruned_drain_packs_its_closure_and_a_cold_replica_serves_every_addres
     // published address must answer through it — ranged reads into the packs.
     let b = a.replica().await;
     let reader = b.browse_client();
-    let entries = reader.tree_entries(&pruned).await.expect(
-        "the pruned root must be readable through a replica that never held it warm",
-    );
+    let entries = reader
+        .tree_entries(&pruned)
+        .await
+        .expect("the pruned root must be readable through a replica that never held it warm");
     assert!(!entries.is_empty());
     let range = reader
         .read_range(&BlobHash(kept_blob.clone()), 0, 4)
@@ -770,7 +788,12 @@ async fn a_pruned_drain_packs_its_closure_and_a_cold_replica_serves_every_addres
     let manifest = reader.flat(&pruned).await.expect("/flat through replica B");
     for entry in &manifest.entries {
         let bytes = reader.get_blob(&entry.blob).await.expect("blob via B");
-        assert_eq!(bytes.len() as u64, entry.size, "size index vs bytes: {}", entry.path);
+        assert_eq!(
+            bytes.len() as u64,
+            entry.size,
+            "size index vs bytes: {}",
+            entry.path
+        );
     }
 
     // There is no second pass left to carry anything (ADR-0067 part 4): the
@@ -810,7 +833,9 @@ async fn a_pruned_drain_packs_its_closure_and_a_cold_replica_serves_every_addres
 /// `missing_blobs` and never pack).
 #[tokio::test(flavor = "multi_thread")]
 async fn have_answers_the_durable_index_identically_across_replicas() {
-    let Some(a) = Harness::start().await else { return };
+    let Some(a) = Harness::start().await else {
+        return;
+    };
     let ws = tempfile::tempdir().unwrap();
     build_workspace(ws.path());
     let declared = vec!["src".to_string(), "plain.txt".to_string()];
@@ -866,7 +891,10 @@ async fn have_answers_the_durable_index_identically_across_replicas() {
     // scratch blob is still durable-missing. Warm presence must not be able
     // to impersonate durability.
     let on_a = ask(a.base.clone(), browse.clone()).await;
-    assert_eq!(on_a["missing_blobs"], serde_json::json!([junk_blob.clone()]));
+    assert_eq!(
+        on_a["missing_blobs"],
+        serde_json::json!([junk_blob.clone()])
+    );
     assert_eq!(on_a["missing_warm"], serde_json::json!([]));
 
     // Router B: empty warm, same database. The durable answer is identical;
@@ -913,7 +941,9 @@ async fn have_answers_the_durable_index_identically_across_replicas() {
 async fn pack_bytes_land_strictly_before_any_index_row() {
     use scarab_storage::{ObjectStore as _, StorageError};
 
-    let Some(h) = Harness::start_with_linger(None).await else { return };
+    let Some(h) = Harness::start_with_linger(None).await else {
+        return;
+    };
     let ws = tempfile::tempdir().unwrap();
     build_workspace(ws.path());
     // One member over the 64 MiB pack cap: appended mid-drain, it seals (and
@@ -1075,14 +1105,21 @@ async fn pack_bytes_land_strictly_before_any_index_row() {
         .expect("the sealed pack's footer index reads back off the bucket alone");
     assert!(!index.is_empty());
     let in_rows = member_rows_for(&h.pool, index[0].address.trim_start_matches("sha256:")).await;
-    assert!(in_rows > 0, "footer and index rows must agree on membership");
+    assert!(
+        in_rows > 0,
+        "footer and index rows must agree on membership"
+    );
     h.cold_store
         .get(&format!("packs/{fence_key}/commit.pack"))
         .await
         .expect("the commit pack exists once the drain is recorded");
     // And now — only now — the staged blob is durable to everyone.
     let on_browse = ask_have(browse, h.base.clone(), big_hash.clone()).await;
-    assert_eq!(on_browse["missing_blobs"], serde_json::json!([]), "{on_browse}");
+    assert_eq!(
+        on_browse["missing_blobs"],
+        serde_json::json!([]),
+        "{on_browse}"
+    );
 }
 
 /// The durability label is validated at the door: a value that is neither
@@ -1090,7 +1127,9 @@ async fn pack_bytes_land_strictly_before_any_index_row() {
 /// promise — and both real values are accepted.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unknown_durability_label_is_refused_at_the_door() {
-    let Some(h) = Harness::start().await else { return };
+    let Some(h) = Harness::start().await else {
+        return;
+    };
     let data = b"labelled bytes".to_vec();
     let hash = scarab_storage::sha256_hex(&data);
     let token = workspace_token::mint(
@@ -1150,7 +1189,9 @@ async fn a_scattered_drain_commits_through_one_replica() {
     use scarab_storage::{BlobHash, Cas as _};
 
     let linger = Some(std::time::Duration::from_millis(250));
-    let Some(a) = Harness::start_with_linger(linger).await else { return };
+    let Some(a) = Harness::start_with_linger(linger).await else {
+        return;
+    };
     let b = a.replica_with_linger(linger).await;
 
     let ws = tempfile::tempdir().unwrap();
@@ -1198,7 +1239,10 @@ async fn a_scattered_drain_commits_through_one_replica() {
     .fetch_one(&a.pool)
     .await
     .expect("the staged pack row");
-    assert!(!committed, "staged, not committed — no record POST has happened");
+    assert!(
+        !committed,
+        "staged, not committed — no record POST has happened"
+    );
 
     // The committed predicate, cross-caller: a fenceless /have must not see it.
     let browse = workspace_token::mint(SECRET, &workspace_token::browse_claims(far_future()));
@@ -1320,7 +1364,9 @@ async fn a_drain_whose_puts_all_landed_elsewhere_commits_through_a_cold_replica(
     use scarab_storage::ObjectStore as _;
 
     let linger = Some(std::time::Duration::from_millis(250));
-    let Some(a) = Harness::start_with_linger(linger).await else { return };
+    let Some(a) = Harness::start_with_linger(linger).await else {
+        return;
+    };
     let b = a.replica_with_linger(linger).await;
 
     let ws = tempfile::tempdir().unwrap();
@@ -1379,7 +1425,10 @@ async fn a_drain_whose_puts_all_landed_elsewhere_commits_through_a_cold_replica(
     .fetch_one(&a.pool)
     .await
     .expect("count uncommitted");
-    assert_eq!(uncommitted, 0, "the record transaction must flip the whole fence");
+    assert_eq!(
+        uncommitted, 0,
+        "the record transaction must flip the whole fence"
+    );
     a.cold_store
         .get(&format!("packs/{fence_key}/commit.pack"))
         .await
@@ -1411,7 +1460,9 @@ async fn a_mid_flight_scattered_drain_survives_both_reclaim_passes() {
     use std::collections::HashSet;
 
     let linger = Some(std::time::Duration::from_millis(250));
-    let Some(a) = Harness::start_with_linger(linger).await else { return };
+    let Some(a) = Harness::start_with_linger(linger).await else {
+        return;
+    };
     let b = a.replica_with_linger(linger).await;
 
     let ws = tempfile::tempdir().unwrap();
@@ -1575,13 +1626,14 @@ fn build_cached_workspace(root: &std::path::Path) {
 /// report (the save side has nothing to record).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cache_dir_is_excluded_from_the_publish_and_never_packs() {
-    let Some(h) = Harness::start().await else { return };
+    let Some(h) = Harness::start().await else {
+        return;
+    };
     let ws = tempfile::tempdir().unwrap();
     build_cached_workspace(ws.path());
     let cache_dirs = vec!["node_modules".to_string()];
-    let cache_blob = scarab_storage::sha256_hex(
-        b"module.exports = cache-only bytes, unique to the cache dir",
-    );
+    let cache_blob =
+        scarab_storage::sha256_hex(b"module.exports = cache-only bytes, unique to the cache dir");
     let durable_blob = scarab_storage::sha256_hex(b"fn main() {}");
 
     let helper = h.fence_client_for("run-c1", "build", "a1");
@@ -1648,11 +1700,11 @@ async fn a_cache_dir_is_excluded_from_the_publish_and_never_packs() {
     let restored = tempfile::tempdir().unwrap();
     scarab_storage::Cas::materialize(
         &h.browse_client(),
-            &TreeHash(cache_root.clone()),
-            restored.path().to_str().unwrap(),
-        )
-        .await
-        .expect("the cache subtree restores from warm");
+        &TreeHash(cache_root.clone()),
+        restored.path().to_str().unwrap(),
+    )
+    .await
+    .expect("the cache subtree restores from warm");
     assert!(restored.path().join("leftpad/index.js").exists());
 }
 
@@ -1667,7 +1719,9 @@ async fn a_cache_dir_is_excluded_from_the_publish_and_never_packs() {
 /// wave it through).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_forged_cache_root_422s_the_whole_drain() {
-    let Some(h) = Harness::start().await else { return };
+    let Some(h) = Harness::start().await else {
+        return;
+    };
     let ws = tempfile::tempdir().unwrap();
     build_cached_workspace(ws.path());
 
@@ -1682,7 +1736,11 @@ async fn a_forged_cache_root_422s_the_whole_drain() {
         .post_drain_record(&DrainRecord {
             root: foreign_tree.clone(),
             pruned_root: None,
-            identity: foreign_report.snapshot.identity.as_ref().map(|t| t.0.clone()),
+            identity: foreign_report
+                .snapshot
+                .identity
+                .as_ref()
+                .map(|t| t.0.clone()),
             files: foreign_report.files,
             tree_bytes: foreign_report.tree_bytes,
             blobs_uploaded: foreign_report.blobs_uploaded,
@@ -1716,10 +1774,7 @@ async fn a_forged_cache_root_422s_the_whole_drain() {
         have_hits: report.have_hits,
         ingest_ms: 1,
         prune_ms: 0,
-        cache_roots: std::collections::BTreeMap::from([(
-            "node_modules".to_string(),
-            foreign_tree,
-        )]),
+        cache_roots: std::collections::BTreeMap::from([("node_modules".to_string(), foreign_tree)]),
         error: None,
     };
     let err = helper
@@ -1755,7 +1810,9 @@ async fn a_forged_cache_root_422s_the_whole_drain() {
 /// and the identical re-saved cache root. Slower, never wrong.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_wiped_warm_tier_degrades_to_a_miss_and_the_rerun_publishes_identically() {
-    let Some(h) = Harness::start().await else { return };
+    let Some(h) = Harness::start().await else {
+        return;
+    };
     let ws = tempfile::tempdir().unwrap();
     build_cached_workspace(ws.path());
     let cache_dirs = vec!["node_modules".to_string()];
@@ -1780,13 +1837,10 @@ async fn a_wiped_warm_tier_degrades_to_a_miss_and_the_rerun_publishes_identicall
                 .await
                 .expect("drain ingest");
             let memo = MemoCas::new(&helper, report.trees);
-            let excluded = scarab_workspace_client::exclude_paths(
-                &memo,
-                &report.snapshot.root,
-                &cache_dirs,
-            )
-            .await
-            .expect("exclusion");
+            let excluded =
+                scarab_workspace_client::exclude_paths(&memo, &report.snapshot.root, &cache_dirs)
+                    .await
+                    .expect("exclusion");
             let identity = scarab_storage::content_identity(&memo, &excluded)
                 .await
                 .expect("identity");
@@ -1836,11 +1890,11 @@ async fn a_wiped_warm_tier_degrades_to_a_miss_and_the_rerun_publishes_identicall
     let restored = tempfile::tempdir().unwrap();
     scarab_storage::Cas::materialize(
         &h.browse_client(),
-            &TreeHash(cache_root_1.clone()),
-            restored.path().to_str().unwrap(),
-        )
-        .await
-        .expect_err("a wiped warm tier must miss — cache-only content is unpromised");
+        &TreeHash(cache_root_1.clone()),
+        restored.path().to_str().unwrap(),
+    )
+    .await
+    .expect_err("a wiped warm tier must miss — cache-only content is unpromised");
 
     // Run 2, identical content (the step rebuilt node_modules from scratch):
     // the drain succeeds and publishes the IDENTICAL identity.
@@ -1854,7 +1908,6 @@ async fn a_wiped_warm_tier_degrades_to_a_miss_and_the_rerun_publishes_identicall
         "identical cache content re-saves the identical root (the mapping refresh)"
     );
 }
-
 
 /// Ticket e140121: a **Depot restart mid-drain** is survivable by re-driving
 /// the whole leg from scratch — the design's "session-lost is NOT
@@ -1883,7 +1936,9 @@ async fn a_wiped_warm_tier_degrades_to_a_miss_and_the_rerun_publishes_identicall
 /// exit 12 laps).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_depot_restart_mid_drain_re_drives_from_scratch_and_a_lost_2xx_is_posted() {
-    let Some(a) = Harness::start().await else { return };
+    let Some(a) = Harness::start().await else {
+        return;
+    };
     let ws = tempfile::tempdir().unwrap();
     build_workspace(ws.path());
 
@@ -2061,11 +2116,17 @@ fn consumer_client(base: &str, input: &str, cache_root: &str, legacy: bool) -> W
 /// root inside `roots` keeps today's behaviour, the 500.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cache_on_one_replica_does_not_fail_a_required_fetch_on_another() {
-    let Some(a) = Harness::start().await else { return };
+    let Some(a) = Harness::start().await else {
+        return;
+    };
     let b = a.replica().await;
     let (input, cache_root, route) =
         drain_cached_workspace(&a.fence_client_for("run-producer", "build", "a1"), None).await;
-    assert_eq!(route, CacheSaveRoute::Service, "no home: replicaCount 1 behaviour");
+    assert_eq!(
+        route,
+        CacheSaveRoute::Service,
+        "no home: replicaCount 1 behaviour"
+    );
 
     // `/flat` on A, blob GETs on B: the scatter, constructed.
     let manifest = consumer_client(&a.base, &input, &cache_root, false)
@@ -2109,11 +2170,17 @@ async fn a_cache_on_one_replica_does_not_fail_a_required_fetch_on_another() {
     // A pre-fix token (the cache root as a required root) on B: still 500.
     let legacy = consumer_client(&b.base, &input, &cache_root, true);
     let err = legacy
-        .materialize_flat(&manifest, tempfile::tempdir().unwrap().path().to_str().unwrap())
+        .materialize_flat(
+            &manifest,
+            tempfile::tempdir().unwrap().path().to_str().unwrap(),
+        )
         .await
         .expect_err("a required root that cannot be walked keeps the F3 500");
     assert!(
-        matches!(err, scarab_storage::StorageError::Status { status: 500, .. }),
+        matches!(
+            err,
+            scarab_storage::StorageError::Status { status: 500, .. }
+        ),
         "expected the walk's 500, got {err:?}"
     );
 }
@@ -2124,9 +2191,13 @@ async fn restore(
     root: &str,
 ) -> Result<tempfile::TempDir, scarab_storage::StorageError> {
     let dir = tempfile::tempdir().unwrap();
-    scarab_storage::Cas::materialize(client, &TreeHash(root.to_string()), dir.path().to_str().unwrap())
-        .await
-        .map(|()| dir)
+    scarab_storage::Cas::materialize(
+        client,
+        &TreeHash(root.to_string()),
+        dir.path().to_str().unwrap(),
+    )
+    .await
+    .map(|()| dir)
 }
 
 /// A base URL nothing listens on — a home replica that is down.
@@ -2149,7 +2220,9 @@ async fn dead_base() -> String {
 /// home (the record's durable-presence gate or B's input read fails).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cache_saved_to_its_home_restores_from_its_home() {
-    let Some(a) = Harness::start().await else { return };
+    let Some(a) = Harness::start().await else {
+        return;
+    };
     let b = a.replica().await;
     let c = a.replica().await;
     let producer = |base: &str| {
@@ -2173,25 +2246,34 @@ async fn a_cache_saved_to_its_home_restores_from_its_home() {
         drain_cached_workspace(&producer(&a.base), Some(&producer(&c.base))).await;
     assert_eq!(route, CacheSaveRoute::Home);
 
-    let hit = restore(&consumer_client(&c.base, &input, &cache_root, false), &cache_root)
-        .await
-        .expect("a restore from the home is a hit");
+    let hit = restore(
+        &consumer_client(&c.base, &input, &cache_root, false),
+        &cache_root,
+    )
+    .await
+    .expect("a restore from the home is a hit");
     assert_eq!(
         std::fs::read(hit.path().join("leftpad/index.js")).unwrap(),
         b"module.exports = cache-only bytes, unique to the cache dir"
     );
     for (name, other) in [("A", &a), ("B", &b)] {
         assert!(
-            restore(&consumer_client(&other.base, &input, &cache_root, false), &cache_root)
-                .await
-                .is_err(),
+            restore(
+                &consumer_client(&other.base, &input, &cache_root, false),
+                &cache_root
+            )
+            .await
+            .is_err(),
             "replica {name} is not the home and must not hold the cache"
         );
     }
     // The published input is durable: any replica serves it.
-    let got = restore(&consumer_client(&b.base, &input, &cache_root, false), &input)
-        .await
-        .expect("the input reads from any replica");
+    let got = restore(
+        &consumer_client(&b.base, &input, &cache_root, false),
+        &input,
+    )
+    .await
+    .expect("the input reads from any replica");
     assert!(got.path().join("src/main.rs").exists());
 
     // The home gone (down, or remapped by a scale change): a clean miss,
@@ -2207,7 +2289,9 @@ async fn a_cache_saved_to_its_home_restores_from_its_home() {
 /// the home misses.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unreachable_home_falls_back_to_the_service_and_the_drain_succeeds() {
-    let Some(a) = Harness::start().await else { return };
+    let Some(a) = Harness::start().await else {
+        return;
+    };
     let producer = a.fence_client_for("run-fallback", "build", "a1");
     let home = WorkspaceClient::new(
         dead_base().await,
@@ -2229,7 +2313,10 @@ async fn an_unreachable_home_falls_back_to_the_service_and_the_drain_succeeds() 
         matches!(route, CacheSaveRoute::FellBack(_)),
         "the drain must say the save missed its home: {route:?}"
     );
-    restore(&consumer_client(&a.base, &input, &cache_root, false), &cache_root)
-        .await
-        .expect("the fallback save is on the service replica");
+    restore(
+        &consumer_client(&a.base, &input, &cache_root, false),
+        &cache_root,
+    )
+    .await
+    .expect("the fallback save is on the service replica");
 }

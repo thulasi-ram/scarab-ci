@@ -168,11 +168,8 @@ fn production_executor(
     forge: Arc<FakeForge>,
 ) -> ForgeCredentialExecutor {
     let secret: Arc<dyn Executor> = Arc::new(secret_executor(db, libs.clone(), inner));
-    ForgeCredentialExecutor::new(
-        secret,
-        forge as Arc<dyn ForgePort>,
-    )
-    .with_libraries(db.clone() as Arc<dyn Db>, libs)
+    ForgeCredentialExecutor::new(secret, forge as Arc<dyn ForgePort>)
+        .with_libraries(db.clone() as Arc<dyn Db>, libs)
 }
 
 async fn tick_prod(

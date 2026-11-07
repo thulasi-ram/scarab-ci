@@ -242,9 +242,8 @@ async fn every_mutating_endpoint_refuses_a_config_owned_connection() {
     let app = app(db.clone(), CredentialOverrides::from_specs(&specs), None).await;
     let token = login(&app).await;
 
-    let bearer = |r: axum::http::request::Builder| {
-        r.header("authorization", format!("Bearer {token}"))
-    };
+    let bearer =
+        |r: axum::http::request::Builder| r.header("authorization", format!("Bearer {token}"));
     // Each of these would write to a row whose contents the `connections:` block
     // owns. `available-repos` is deliberately absent: it only reads.
     let writes: Vec<(&str, Request<Body>)> = vec![
@@ -310,11 +309,9 @@ async fn every_mutating_endpoint_refuses_a_config_owned_connection() {
     let res = app
         .clone()
         .oneshot(
-            bearer(Request::get(
-                "/v1/connections/forgejo-main/available-repos",
-            ))
-            .body(Body::empty())
-            .unwrap(),
+            bearer(Request::get("/v1/connections/forgejo-main/available-repos"))
+                .body(Body::empty())
+                .unwrap(),
         )
         .await
         .unwrap();

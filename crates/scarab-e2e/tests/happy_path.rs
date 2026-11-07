@@ -56,9 +56,16 @@ async fn fake_forgejo() -> String {
                 .unwrap()
         }
     }
-    async fn fallback(State(()): State<()>, req: axum::extract::Request) -> axum::response::Response {
+    async fn fallback(
+        State(()): State<()>,
+        req: axum::extract::Request,
+    ) -> axum::response::Response {
         // Status posts etc.: acknowledge. Unknown GETs: a forge-API miss.
-        let status = if req.method() == axum::http::Method::GET { 404 } else { 200 };
+        let status = if req.method() == axum::http::Method::GET {
+            404
+        } else {
+            200
+        };
         axum::response::Response::builder()
             .status(status)
             .body(axum::body::Body::from("{}"))

@@ -59,7 +59,11 @@ async fn cancel_mid_run_tears_down_the_pod() {
 
     // Durable half: the run terminates as `cancelled`, nothing else.
     let rs = wait_for_terminal(&http, &base, &run, Duration::from_secs(120)).await;
-    assert_eq!(rs.status, "cancelled", "expected `cancelled`, got `{}`", rs.status);
+    assert_eq!(
+        rs.status, "cancelled",
+        "expected `cancelled`, got `{}`",
+        rs.status
+    );
 
     // Cluster half: the Pod disappears. Graceful deletion (SIGTERM → grace →
     // SIGKILL) means this is legitimately not instant — but it must converge.

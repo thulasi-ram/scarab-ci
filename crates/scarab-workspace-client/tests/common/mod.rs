@@ -86,11 +86,9 @@ impl Drop for TestPg {
             };
             rt.block_on(async {
                 if let Ok(admin) = PgPool::connect(&admin_url).await {
-                    let _ = sqlx::query(&format!(
-                        "DROP DATABASE IF EXISTS {dbname} WITH (FORCE)"
-                    ))
-                    .execute(&admin)
-                    .await;
+                    let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS {dbname} WITH (FORCE)"))
+                        .execute(&admin)
+                        .await;
                     admin.close().await;
                 }
             });

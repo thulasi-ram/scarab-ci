@@ -323,7 +323,11 @@ async fn listing_needs_administer_on_the_org() {
     // A Viewer may not — connections span every Project, so this is org-level.
     let viewer = login(&h.app, "viewer-code").await;
     for uri in ["/v1/connections", "/v1/connections/gh/resync"] {
-        let method = if uri.ends_with("resync") { "POST" } else { "GET" };
+        let method = if uri.ends_with("resync") {
+            "POST"
+        } else {
+            "GET"
+        };
         let resp = h
             .app
             .clone()
@@ -369,21 +373,26 @@ async fn resync_binds_a_repo_whose_webhook_was_missed() {
         .collect();
     bound.sort();
     assert_eq!(bound, vec!["acme/api", "acme/ops"]);
-    assert_eq!(result["confirmed"], 1, "the already-bound repo is confirmed");
+    assert_eq!(
+        result["confirmed"], 1,
+        "the already-bound repo is confirmed"
+    );
 
     // The healed repos are real Projects now — they resolve, and they appear on
     // the Repos page, which is the whole point.
     for name in ["api", "ops"] {
-        let resolved = h
-            .db
-            .resolve(&RepoRef {
+        let resolved =
+            h.db.resolve(&RepoRef {
                 owner: "acme".into(),
                 name: name.into(),
             })
             .await
             .unwrap()
             .expect("bound repo resolves to a Project");
-        assert_eq!((resolved.org.as_str(), resolved.project.as_str()), ("acme", name));
+        assert_eq!(
+            (resolved.org.as_str(), resolved.project.as_str()),
+            ("acme", name)
+        );
     }
     let repos = body_bytes(
         h.app
@@ -595,7 +604,10 @@ async fn preflight_names_the_trigger_events_an_unsubscribed_app_is_missing() {
     // Each gap says what silently breaks, not just what is absent.
     let push = missing.iter().find(|g| g["name"] == "push").unwrap();
     assert!(
-        push["why"].as_str().unwrap().contains("no push starts a run"),
+        push["why"]
+            .as_str()
+            .unwrap()
+            .contains("no push starts a run"),
         "{push}"
     );
 }
@@ -651,7 +663,10 @@ async fn preflight_says_unknown_rather_than_healthy_when_it_cannot_look() {
         .iter()
         .map(|r| r["name"].as_str().unwrap())
         .collect();
-    assert!(required.contains(&"statuses") && required.contains(&"push"), "{required:?}");
+    assert!(
+        required.contains(&"statuses") && required.contains(&"push"),
+        "{required:?}"
+    );
 }
 
 #[tokio::test]

@@ -303,7 +303,10 @@ impl<'h> CacheRouter<'h> {
     fn label_of(&self, hash: &str) -> Option<Label> {
         match self.plan.label_of(hash) {
             Some(Label::CacheOnly)
-                if self.home.as_ref().is_some_and(|(_, set)| set.contains(hash)) =>
+                if self
+                    .home
+                    .as_ref()
+                    .is_some_and(|(_, set)| set.contains(hash)) =>
             {
                 Some(Label::CacheDir)
             }
@@ -611,9 +614,7 @@ impl WorkspaceClient {
         // same token cannot heal a denial, so callers must be able to stop
         // waiting without string-sniffing a `Backend` message (401 and 503
         // used to be indistinguishable here).
-        if status == reqwest::StatusCode::UNAUTHORIZED
-            || status == reqwest::StatusCode::FORBIDDEN
-        {
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
             return StorageError::Denied(format!("workspace service {status}: {body}"));
         }
         // Everything else keeps its status on the error (e140121 review fix):
@@ -1997,11 +1998,7 @@ fn safe_join(root: &std::path::Path, path: &str) -> Result<std::path::PathBuf, S
 }
 
 /// Write one file (or symlink) and restore its metadata.
-fn write_entry(
-    root: &std::path::Path,
-    entry: &FlatEntry,
-    data: &[u8],
-) -> Result<(), StorageError> {
+fn write_entry(root: &std::path::Path, entry: &FlatEntry, data: &[u8]) -> Result<(), StorageError> {
     let target = safe_join(root, &entry.path)?;
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent).map_err(io_err)?;
@@ -2013,8 +2010,7 @@ fn write_entry(
     if std::fs::symlink_metadata(&target).is_ok() {
         std::fs::remove_file(&target).map_err(io_err)?;
     }
-    let is_symlink =
-        matches!(entry.mode, Some(m) if m & 0o170_000 == scarab_storage::MODE_SYMLINK);
+    let is_symlink = matches!(entry.mode, Some(m) if m & 0o170_000 == scarab_storage::MODE_SYMLINK);
     if is_symlink {
         // The blob's content IS the link target path.
         let dest = std::path::Path::new(std::ffi::OsStr::from_bytes(data));
@@ -2221,7 +2217,11 @@ fn subtree_root_of(
     dir: &str,
 ) -> Result<Option<String>, StorageError> {
     let mut tree = root.to_string();
-    for comp in dir.trim_end_matches('/').split('/').filter(|c| !c.is_empty()) {
+    for comp in dir
+        .trim_end_matches('/')
+        .split('/')
+        .filter(|c| !c.is_empty())
+    {
         let entries = memo.entries_of(&tree)?;
         match entries.into_iter().find(|e| e.name == comp) {
             Some(TreeEntry {
@@ -2778,7 +2778,10 @@ mod tests {
             manifest(vec![file("shared", "aaaa", 0o644)], vec![]),
         ])
         .expect("no type conflict");
-        assert!(r.collisions.is_empty(), "identical duplicate must be silent");
+        assert!(
+            r.collisions.is_empty(),
+            "identical duplicate must be silent"
+        );
 
         // Same blob, differing MODE: still a collision (F7) — the merged
         // workspace's permission bits depend on order, so it is order-derived

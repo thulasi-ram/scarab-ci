@@ -22,8 +22,7 @@ use scarab_server::step_up::StepUpService;
 use scarab_server::{router, AppState, LogService};
 use scarab_testkit::{
     FakeAuthenticator, FakeClock, FakeSecrets, InMemoryChallenges, InMemoryDb, InMemoryObjectStore,
-    InMemoryPasskeys, InMemoryRbac, InMemorySecurityEvents, InMemorySessions,
-    InMemoryStepUp,
+    InMemoryPasskeys, InMemoryRbac, InMemorySecurityEvents, InMemorySessions, InMemoryStepUp,
 };
 use scarab_webauthn::soft::{SoftAlg, SoftPasskey};
 use scarab_webauthn::RelyingParty;
@@ -401,7 +400,10 @@ async fn setup_names_the_login_provider_when_there_is_no_default() {
         .trim()
         .to_string();
     assert!(url.contains("provider=okta"), "{url}");
-    assert!(url.contains("next=/settings/security%3Fenroll%3D1"), "{url}");
+    assert!(
+        url.contains("next=/settings/security%3Fenroll%3D1"),
+        "{url}"
+    );
     // Following it reaches Okta, not a 400.
     let resp = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())

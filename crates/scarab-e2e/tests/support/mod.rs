@@ -81,7 +81,9 @@ pub fn pod_host() -> String {
     std::env::var("SCARAB_E2E_POD_HOST")
         .ok()
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| panic!("SCARAB_E2E_POD_HOST unset: `just test e2e` probes it from a Pod"))
+        .unwrap_or_else(|| {
+            panic!("SCARAB_E2E_POD_HOST unset: `just test e2e` probes it from a Pod")
+        })
 }
 
 /// Path to the `scarab` CLI binary (the happy-path scenario dispatches
@@ -188,7 +190,10 @@ pub async fn run_status(client: &reqwest::Client, base: &str, id: &str) -> RunSt
         .expect("GET /v1/runs/{id}");
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
-    assert!(status.is_success(), "GET run {id} failed ({status}): {body}");
+    assert!(
+        status.is_success(),
+        "GET run {id} failed ({status}): {body}"
+    );
     serde_json::from_str(&body).unwrap_or_else(|e| panic!("bad run response ({e}): {body}"))
 }
 

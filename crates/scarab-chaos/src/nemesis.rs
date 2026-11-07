@@ -64,7 +64,8 @@ pub async fn run(stack: &Stack, mut scenario: Scenario, dir: &Path) -> Result<Sc
             scenario.server_replicas
         ));
     }
-    let servers = wait_servers_ready(&pods_api, &stack.release, scenario.server_replicas as usize).await?;
+    let servers =
+        wait_servers_ready(&pods_api, &stack.release, scenario.server_replicas as usize).await?;
     let depots = wait_depots_ready(&views, scenario.depot_replicas as usize).await?;
     log(&format!(
         "{} seed {}: servers {:?}; Depot replicas {:?}; plan {:?}",
@@ -132,23 +133,46 @@ pub async fn run(stack: &Stack, mut scenario: Scenario, dir: &Path) -> Result<Sc
         };
         match wait_trigger(stack, &views, &scenario.runs, &target_run, kind, &holds).await {
             None => {
-                scenario
-                    .notes
-                    .push(format!("trigger never held on run {target_run}; no fault fired"));
+                scenario.notes.push(format!(
+                    "trigger never held on run {target_run}; no fault fired"
+                ));
                 log("trigger never held; no fault fired");
             }
             Some(t) => {
-                log(&format!("trigger on {} ({}); firing in {} ms", t.pod, t.condition, scenario.plan.delay_ms));
+                log(&format!(
+                    "trigger on {} ({}); firing in {} ms",
+                    t.pod, t.condition, scenario.plan.delay_ms
+                ));
                 tokio::time::sleep(Duration::from_millis(scenario.plan.delay_ms)).await;
                 let fault = match kind {
-                    Kind::MidDrain | Kind::MidFeed => delete_depot(stack, &pods_api, &views, t, &scenario, &holds).await?,
+                    Kind::MidDrain | Kind::MidFeed => {
+                        delete_depot(stack, &pods_api, &views, t, &scenario, &holds).await?
+                    }
                     Kind::KillServer => {
-                        crate::servers::kill_server(stack, &Node::from_env(), &views, &t, &scenario.plan, &holds).await?
+                        crate::servers::kill_server(
+                            stack,
+                            &Node::from_env(),
+                            &views,
+                            &t,
+                            &scenario.plan,
+                            &holds,
+                        )
+                        .await?
                     }
                     Kind::StopLeader => {
-                        crate::servers::stop_leader(stack, &Node::from_env(), &views, &t, &scenario.plan, &holds).await?
+                        crate::servers::stop_leader(
+                            stack,
+                            &Node::from_env(),
+                            &views,
+                            &t,
+                            &scenario.plan,
+                            &holds,
+                        )
+                        .await?
                     }
-                    Kind::PauseNode => pause_node(stack, &pods_api, &views, t, &Node::from_env(), &holds).await?,
+                    Kind::PauseNode => {
+                        pause_node(stack, &pods_api, &views, t, &Node::from_env(), &holds).await?
+                    }
                     Kind::TwoReplicas => unreachable!("two-replicas has no fault"),
                 };
                 scenario.faults.push(fault);
@@ -170,9 +194,10 @@ pub async fn run(stack: &Stack, mut scenario: Scenario, dir: &Path) -> Result<Sc
             break;
         }
         if now_ms() > deadline_ms {
-            scenario
-                .notes
-                .push(format!("quiesce bound ({} s) ran out", scenario.quiesce_bound_secs));
+            scenario.notes.push(format!(
+                "quiesce bound ({} s) ran out",
+                scenario.quiesce_bound_secs
+            ));
             log("quiesce bound ran out");
             break;
         }
@@ -193,7 +218,12 @@ pub async fn run(stack: &Stack, mut scenario: Scenario, dir: &Path) -> Result<Sc
     let since = ((now_ms() - scenario.started_at_ms) / 1000 + 60).max(60);
     let mut needles: Vec<String> = records
         .iter()
-        .filter(|r| r.pod.run.as_ref().is_some_and(|x| scenario.runs.contains(x)))
+        .filter(|r| {
+            r.pod
+                .run
+                .as_ref()
+                .is_some_and(|x| scenario.runs.contains(x))
+        })
         .map(|r| r.pod.name.clone())
         .collect();
     for f in &scenario.faults {
@@ -204,7 +234,11 @@ pub async fn run(stack: &Stack, mut scenario: Scenario, dir: &Path) -> Result<Sc
     }
     needles.sort();
     needles.dedup();
-    let needles: Vec<&str> = needles.iter().map(String::as_str).filter(|n| !n.is_empty()).collect();
+    let needles: Vec<&str> = needles
+        .iter()
+        .map(String::as_str)
+        .filter(|n| !n.is_empty())
+        .collect();
     let text = release_log_lines(&pods_api, since, &needles).await;
     let _ = std::fs::write(dir.join(RELEASE_LOG), text);
     if let Some(t) = scenario.faults.iter().find_map(|f| f.trigger.as_ref()) {
@@ -267,7 +301,11 @@ pub fn window(kind: Kind, records: &[pods::PodRecord], uid: &str) -> (Option<i64
                 .iter()
                 .filter_map(|r| r.pod.container(pods::STEP_CONTAINER)?.finished_at_ms)
                 .min();
-            let end = of_pod.iter().filter(|r| r.pod.has_root).map(|r| r.at_ms).min();
+            let end = of_pod
+                .iter()
+                .filter(|r| r.pod.has_root)
+                .map(|r| r.at_ms)
+                .min();
             (start, end)
         }
         Kind::MidFeed => {
@@ -326,8 +364,15 @@ async fn delete_depot(
     scenario: &Scenario,
     holds: &impl Fn(&PodView) -> bool,
 ) -> Result<Fault, String> {
-    let victim = format!("{}-workspace-{}", stack.release, scenario.plan.victim_ordinal);
-    let held = views.lock().expect("views lock").get(&t.pod_uid).is_some_and(holds);
+    let victim = format!(
+        "{}-workspace-{}",
+        stack.release, scenario.plan.victim_ordinal
+    );
+    let held = views
+        .lock()
+        .expect("views lock")
+        .get(&t.pod_uid)
+        .is_some_and(holds);
     let fence_rows = match (&t.attempt, scenario.kind) {
         (Some(a), Kind::MidDrain) => fence_pack_rows(&stack.pg, &t.run, &t.step, a).await,
         _ => None,
@@ -462,13 +507,22 @@ fn restart_forwards() {
         return;
     };
     for f in files.split(':').filter(|f| !f.is_empty()) {
-        let pid = std::fs::read_to_string(f).ok().and_then(|t| crate::node::parse_pid(&t));
+        let pid = std::fs::read_to_string(f)
+            .ok()
+            .and_then(|t| crate::node::parse_pid(&t));
         match pid {
             Some(pid) => {
-                let res = std::process::Command::new("kill").arg(pid.to_string()).output();
-                log(&format!("restarting the port-forward in {f} (PID {pid}): {:?}", res.map(|o| o.status)));
+                let res = std::process::Command::new("kill")
+                    .arg(pid.to_string())
+                    .output();
+                log(&format!(
+                    "restarting the port-forward in {f} (PID {pid}): {:?}",
+                    res.map(|o| o.status)
+                ));
             }
-            None => log(&format!("{f} holds no PID; its port-forward is not restarted")),
+            None => log(&format!(
+                "{f} holds no PID; its port-forward is not restarted"
+            )),
         }
     }
 }
@@ -483,7 +537,11 @@ async fn wait_reachable(stack: &Stack, pods_api: &KubeApi<Pod>) -> Result<(), St
             sqlx::query_scalar::<_, i32>("SELECT 1").fetch_one(&stack.pg),
         )
         .await;
-        let kube = tokio::time::timeout(Duration::from_secs(20), pods_api.list(&ListParams::default().limit(1))).await;
+        let kube = tokio::time::timeout(
+            Duration::from_secs(20),
+            pods_api.list(&ListParams::default().limit(1)),
+        )
+        .await;
         match (pg, kube) {
             (Ok(Ok(_)), Ok(Ok(_))) => {
                 log("Postgres and the kube API answer again");
@@ -540,11 +598,20 @@ async fn wait_depots_ready(views: &Views, want: usize) -> Result<Vec<String>, St
 
 /// Wait until exactly `want` server Pods of the release (the Deployment, not
 /// the Depot) are ready and not being deleted.
-async fn wait_servers_ready(pods: &KubeApi<Pod>, release: &str, want: usize) -> Result<Vec<String>, String> {
-    let lp = ListParams::default().labels(&format!("app.kubernetes.io/name=scarab,app.kubernetes.io/instance={release}"));
+async fn wait_servers_ready(
+    pods: &KubeApi<Pod>,
+    release: &str,
+    want: usize,
+) -> Result<Vec<String>, String> {
+    let lp = ListParams::default().labels(&format!(
+        "app.kubernetes.io/name=scarab,app.kubernetes.io/instance={release}"
+    ));
     let mut ready = Vec::new();
     for _ in 0..240 {
-        let list = pods.list(&lp).await.map_err(|e| format!("list server Pods: {e}"))?;
+        let list = pods
+            .list(&lp)
+            .await
+            .map_err(|e| format!("list server Pods: {e}"))?;
         ready = list
             .items
             .iter()
@@ -563,7 +630,9 @@ async fn wait_servers_ready(pods: &KubeApi<Pod>, release: &str, want: usize) -> 
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    Err(format!("expected {want} ready server Pods within 120 s; ready: {ready:?}"))
+    Err(format!(
+        "expected {want} ready server Pods within 120 s; ready: {ready:?}"
+    ))
 }
 
 async fn all_terminal(stack: &Stack, runs: &[String]) -> bool {
@@ -577,7 +646,12 @@ async fn all_terminal(stack: &Stack, runs: &[String]) -> bool {
 }
 
 /// `depot_packs` rows staged for the drain fence of (run, step, attempt).
-pub(crate) async fn fence_pack_rows(pg: &sqlx::PgPool, run: &str, step: &str, attempt: &str) -> Option<i64> {
+pub(crate) async fn fence_pack_rows(
+    pg: &sqlx::PgPool,
+    run: &str,
+    step: &str,
+    attempt: &str,
+) -> Option<i64> {
     let fence = scarab_workspace_client::drain_fence_key(run, step, attempt);
     sqlx::query_scalar::<_, i64>("SELECT count(*) FROM depot_packs WHERE fence_key = $1")
         .bind(fence)
@@ -605,7 +679,10 @@ async fn release_log_lines(pods: &KubeApi<Pod>, since_secs: i64, needles: &[&str
         };
         match pods.logs(&name, &lp).await {
             Ok(text) => {
-                for line in text.lines().filter(|l| needles.iter().any(|n| l.contains(n))) {
+                for line in text
+                    .lines()
+                    .filter(|l| needles.iter().any(|n| l.contains(n)))
+                {
                     out.push_str(&format!("{name}: {line}\n"));
                 }
             }

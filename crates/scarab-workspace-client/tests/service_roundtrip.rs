@@ -148,7 +148,8 @@ fn build_fixture(root: &std::path::Path) {
     std::os::unix::fs::symlink("src", root.join("link-to-dir")).unwrap();
 
     // A distinctly old mtime, so "was it preserved?" cannot accidentally pass.
-    let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(1_500_000_000_000);
+    let old =
+        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(1_500_000_000_000);
     let file = std::fs::File::options()
         .write(true)
         .open(root.join("plain.txt"))
@@ -180,7 +181,9 @@ fn mode_of(path: &std::path::Path) -> u32 {
 /// restore path — and it needs its own test, which is this one.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_snapshot_round_trips_through_the_service_with_metadata_intact() {
-    let Some(h) = Harness::start().await else { return };
+    let Some(h) = Harness::start().await else {
+        return;
+    };
     let source = tempfile::tempdir().unwrap();
     build_fixture(source.path());
 
@@ -259,7 +262,9 @@ async fn a_snapshot_round_trips_through_the_service_with_metadata_intact() {
 /// forked and a snapshot written one way is invisible the other way.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_snapshot_written_through_the_service_has_the_same_root_as_one_written_direct() {
-    let Some(h) = Harness::start().await else { return };
+    let Some(h) = Harness::start().await else {
+        return;
+    };
     let source = tempfile::tempdir().unwrap();
     build_fixture(source.path());
 
@@ -295,7 +300,8 @@ async fn a_snapshot_written_through_the_service_has_the_same_root_as_one_written
          assertion above while proving nothing"
     );
     assert_ne!(
-        via_service.identity.as_ref(), Some(&via_service.root),
+        via_service.identity.as_ref(),
+        Some(&via_service.root),
         "the fixture must record mtimes, or identity and root coincide and this \
          test degenerates into the one above"
     );
@@ -304,7 +310,9 @@ async fn a_snapshot_written_through_the_service_has_the_same_root_as_one_written
 /// `have` reports MISSING, and it reports it correctly in both directions.
 #[tokio::test(flavor = "multi_thread")]
 async fn have_reports_exactly_what_is_missing() {
-    let Some(h) = Harness::start().await else { return };
+    let Some(h) = Harness::start().await else {
+        return;
+    };
     let client = h.browse_client();
 
     // A browse PUT is unfenced: it seeds warm and joins no pack, so it is
@@ -373,7 +381,10 @@ async fn have_reports_exactly_what_is_missing() {
         serde_json::json!([root.0.clone(), absent_tree.0.clone()]),
         "an unpacked warm tree is durable-missing too"
     );
-    assert_eq!(body["missing_warm"], serde_json::json!([absent_tree.0.clone()]));
+    assert_eq!(
+        body["missing_warm"],
+        serde_json::json!([absent_tree.0.clone()])
+    );
 }
 
 /// `/flat` returns the WHOLE subtree in one call — the endpoint the entire
@@ -381,7 +392,9 @@ async fn have_reports_exactly_what_is_missing() {
 /// round trip per directory.
 #[tokio::test(flavor = "multi_thread")]
 async fn flat_returns_the_whole_subtree_in_one_call() {
-    let Some(h) = Harness::start().await else { return };
+    let Some(h) = Harness::start().await else {
+        return;
+    };
     let source = tempfile::tempdir().unwrap();
     build_fixture(source.path());
     let snapshot = h
@@ -414,7 +427,10 @@ async fn flat_returns_the_whole_subtree_in_one_call() {
     let dirs: Vec<&str> = manifest.dirs.iter().map(|d| d.path.as_str()).collect();
     assert!(dirs.contains(&"empty"), "{dirs:?}");
     let src = dirs.iter().position(|d| *d == "src").expect("src");
-    let deep = dirs.iter().position(|d| *d == "src/deep").expect("src/deep");
+    let deep = dirs
+        .iter()
+        .position(|d| *d == "src/deep")
+        .expect("src/deep");
     assert!(src < deep, "parents must come before children: {dirs:?}");
 
     // Sizes are present and real — they are not in a TreeEntry, so the service
@@ -439,7 +455,9 @@ async fn flat_returns_the_whole_subtree_in_one_call() {
 /// halves — the read succeeds, and afterwards warm can answer on its own.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cold_only_snapshot_is_served_and_backfills_the_warm_tier() {
-    let Some(h) = Harness::start().await else { return };
+    let Some(h) = Harness::start().await else {
+        return;
+    };
     let source = tempfile::tempdir().unwrap();
     build_fixture(source.path());
 
@@ -500,7 +518,9 @@ async fn a_cold_only_snapshot_is_served_and_backfills_the_warm_tier() {
 /// path rather than in the response.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_body_that_does_not_hash_to_its_address_is_rejected() {
-    let Some(h) = Harness::start().await else { return };
+    let Some(h) = Harness::start().await else {
+        return;
+    };
     let wrong = "a".repeat(64);
     let resp = h
         .raw()
@@ -516,7 +536,9 @@ async fn a_body_that_does_not_hash_to_its_address_is_rejected() {
 /// PUT is idempotent: 201 the first time, 200 when the service already had it.
 #[tokio::test(flavor = "multi_thread")]
 async fn put_is_idempotent_and_says_which_happened() {
-    let Some(h) = Harness::start().await else { return };
+    let Some(h) = Harness::start().await else {
+        return;
+    };
     let body = b"idempotent".to_vec();
     let hash = {
         use sha2::Digest;
@@ -549,7 +571,9 @@ async fn put_is_idempotent_and_says_which_happened() {
 /// identity; the alternative is one object forked under two warm keys.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_tagged_address_names_the_same_object_as_its_bare_form() {
-    let Some(h) = Harness::start().await else { return };
+    let Some(h) = Harness::start().await else {
+        return;
+    };
     let body = b"tagged and bare are one object".to_vec();
     let hash = {
         use sha2::Digest;
@@ -589,7 +613,11 @@ async fn a_tagged_address_names_the_same_object_as_its_bare_form() {
         .send()
         .await
         .unwrap();
-    assert_eq!(again.status(), 200, "tagged PUT hits the bare-stored object");
+    assert_eq!(
+        again.status(),
+        200,
+        "tagged PUT hits the bare-stored object"
+    );
 
     // `/have` under the tagged spelling agrees the object is present, and a
     // missing address comes back AS THE CLIENT SPELLED IT, so the caller can
@@ -640,7 +668,11 @@ async fn a_tagged_address_names_the_same_object_as_its_bare_form() {
         .send()
         .await
         .unwrap();
-    assert_eq!(tree.status(), 200, "tagged tree GET finds the bare-stored tree");
+    assert_eq!(
+        tree.status(),
+        200,
+        "tagged tree GET finds the bare-stored tree"
+    );
 }
 
 /// An unknown algorithm tag is a 400 at the door, never a miss and never a
@@ -648,7 +680,9 @@ async fn a_tagged_address_names_the_same_object_as_its_bare_form() {
 /// part 12 — `blake3:` is the intended follow-up, not an accepted input).
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unknown_algorithm_tag_is_a_400() {
-    let Some(h) = Harness::start().await else { return };
+    let Some(h) = Harness::start().await else {
+        return;
+    };
     let addr = format!("blake3:{}", "a".repeat(64));
     for url in [
         format!("{}/v1/cas/blobs/{addr}", h.base),
@@ -678,7 +712,9 @@ async fn an_unknown_algorithm_tag_is_a_400() {
 /// that does not name the root is 403, which is a different fact.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_token_is_actually_enforced() {
-    let Some(h) = Harness::start().await else { return };
+    let Some(h) = Harness::start().await else {
+        return;
+    };
     let source = tempfile::tempdir().unwrap();
     build_fixture(source.path());
     let snapshot = h
@@ -747,7 +783,9 @@ async fn the_token_is_actually_enforced() {
 /// address they were fetched by.
 #[tokio::test(flavor = "multi_thread")]
 async fn tree_bytes_come_back_verbatim() {
-    let Some(h) = Harness::start().await else { return };
+    let Some(h) = Harness::start().await else {
+        return;
+    };
     let client = h.browse_client();
     let blob = client.put_blob(b"x").await.unwrap();
     let root = client
@@ -799,7 +837,9 @@ async fn tree_bytes_come_back_verbatim() {
 /// a range read must transfer the range, and a size must not transfer content.
 #[tokio::test(flavor = "multi_thread")]
 async fn ranged_reads_and_sizes_work_without_transferring_the_whole_blob() {
-    let Some(h) = Harness::start().await else { return };
+    let Some(h) = Harness::start().await else {
+        return;
+    };
     let client = h.browse_client();
     let body: Vec<u8> = (0u8..=255).cycle().take(100_000).collect();
     let hash = client.put_blob(&body).await.unwrap();
@@ -815,7 +855,11 @@ async fn ranged_reads_and_sizes_work_without_transferring_the_whole_blob() {
     assert_eq!(tail.len(), 10);
 
     // Past the end is empty, not an error.
-    assert!(client.read_range(&hash, 200_000, 16).await.unwrap().is_empty());
+    assert!(client
+        .read_range(&hash, 200_000, 16)
+        .await
+        .unwrap()
+        .is_empty());
 
     // Zero length asks for nothing and costs nothing.
     assert!(client.read_range(&hash, 0, 0).await.unwrap().is_empty());
@@ -826,7 +870,9 @@ async fn ranged_reads_and_sizes_work_without_transferring_the_whole_blob() {
 /// tier is empty" and silently falling through.
 #[tokio::test(flavor = "multi_thread")]
 async fn absent_is_not_found_and_unreachable_is_not_absent() {
-    let Some(h) = Harness::start().await else { return };
+    let Some(h) = Harness::start().await else {
+        return;
+    };
     let client = h.browse_client();
     assert!(matches!(
         client
@@ -838,7 +884,8 @@ async fn absent_is_not_found_and_unreachable_is_not_absent() {
     // Nothing listens here.
     let dead = WorkspaceClient::new("http://127.0.0.1:1", h.browse_token());
     assert!(matches!(
-        dead.get_blob(&scarab_storage::BlobHash("e".repeat(64))).await,
+        dead.get_blob(&scarab_storage::BlobHash("e".repeat(64)))
+            .await,
         Err(scarab_storage::StorageError::Backend(_))
     ));
 }
@@ -847,7 +894,9 @@ async fn absent_is_not_found_and_unreachable_is_not_absent() {
 /// plane's DB check — this role has no database at all.
 #[tokio::test(flavor = "multi_thread")]
 async fn healthz_and_readyz_answer_without_a_database() {
-    let Some(h) = Harness::start().await else { return };
+    let Some(h) = Harness::start().await else {
+        return;
+    };
     let raw = h.raw();
     assert_eq!(
         raw.get(format!("{}/healthz", h.base))
@@ -883,7 +932,9 @@ async fn healthz_and_readyz_answer_without_a_database() {
 /// service's filesystem.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_malformed_hash_is_rejected_before_anything_touches_the_filesystem() {
-    let Some(h) = Harness::start().await else { return };
+    let Some(h) = Harness::start().await else {
+        return;
+    };
     for bad in ["short", &"A".repeat(64), &"g".repeat(64)] {
         let resp = h
             .raw()
@@ -899,7 +950,9 @@ async fn a_malformed_hash_is_rejected_before_anything_touches_the_filesystem() {
 /// The cap exists so one request cannot ask about an unbounded set.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_oversized_have_batch_is_refused() {
-    let Some(h) = Harness::start().await else { return };
+    let Some(h) = Harness::start().await else {
+        return;
+    };
     let blobs: Vec<String> = (0..10_001).map(|i| format!("{i:064x}")).collect();
     let resp = h
         .raw()
@@ -919,7 +972,9 @@ async fn an_oversized_have_batch_is_refused() {
 async fn a_later_snapshot_can_overlay_a_read_only_file_and_a_symlink() {
     use std::os::unix::fs::PermissionsExt;
 
-    let Some(h) = Harness::start().await else { return };
+    let Some(h) = Harness::start().await else {
+        return;
+    };
     let client = h.browse_client();
 
     let first_src = tempfile::tempdir().unwrap();
@@ -1010,7 +1065,9 @@ async fn a_directory_with_no_recorded_mode_is_restored_not_left_widened() {
     use scarab_storage::{TreeEntry, TreeTarget};
     use std::os::unix::fs::PermissionsExt;
 
-    let Some(h) = Harness::start().await else { return };
+    let Some(h) = Harness::start().await else {
+        return;
+    };
     let writer = h.browse_client();
 
     // A synthetic tree, built through `put_tree`/`put_blob` rather than `ingest`:

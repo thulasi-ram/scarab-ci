@@ -303,7 +303,10 @@ pub fn drain_spans(log: &str) -> Vec<DrainSpan> {
 pub fn lost_node_verdicts(events: &[EventRow]) -> (usize, Vec<Finding>) {
     let mut n = 0;
     let mut out = Vec::new();
-    for e in events.iter().filter(|e| event_kind(&e.payload) == "AttemptFinished") {
+    for e in events
+        .iter()
+        .filter(|e| event_kind(&e.payload) == "AttemptFinished")
+    {
         n += 1;
         let body = e.payload.as_object().and_then(|m| m.values().next());
         let failure = body.and_then(|b| b.get("failure")).filter(|f| !f.is_null());
@@ -342,10 +345,17 @@ pub fn lost_node_verdicts(events: &[EventRow]) -> (usize, Vec<Finding>) {
 /// lines of an earlier scenario's Pods.
 pub fn second_drain_drivers(log: &str, pods: &BTreeSet<String>) -> (usize, Vec<Finding>) {
     let mut out = Vec::new();
-    let spans: Vec<DrainSpan> = drain_spans(log).into_iter().filter(|s| pods.contains(&s.pod)).collect();
+    let spans: Vec<DrainSpan> = drain_spans(log)
+        .into_iter()
+        .filter(|s| pods.contains(&s.pod))
+        .collect();
     for (i, a) in spans.iter().enumerate() {
         for b in &spans[i + 1..] {
-            if a.pod == b.pod && a.replica != b.replica && a.start_ms < b.end_ms && b.start_ms < a.end_ms {
+            if a.pod == b.pod
+                && a.replica != b.replica
+                && a.start_ms < b.end_ms
+                && b.start_ms < a.end_ms
+            {
                 out.push(fail(
                     "D1",
                     format!(
@@ -357,7 +367,8 @@ pub fn second_drain_drivers(log: &str, pods: &BTreeSet<String>) -> (usize, Vec<F
         }
     }
     for line in log.lines() {
-        if line.contains(DRAIN_RECORD_POST_FAILED) && pods.iter().any(|p| line.contains(p.as_str())) {
+        if line.contains(DRAIN_RECORD_POST_FAILED) && pods.iter().any(|p| line.contains(p.as_str()))
+        {
             out.push(Finding {
                 invariant: "D1".into(),
                 severity: Severity::Info,
@@ -448,7 +459,12 @@ struct PodLife {
 /// counted from N+1's start. `until` is N's container finish, else the
 /// moment its object was gone (the last moment it could be seen), else the
 /// last record of the run (it was still running when recording stopped).
-fn i1b_overrun(life: &PodLife, end: Option<i64>, start_b: i64, last_record_ms: i64) -> Option<(i64, i64, i64)> {
+fn i1b_overrun(
+    life: &PodLife,
+    end: Option<i64>,
+    start_b: i64,
+    last_record_ms: i64,
+) -> Option<(i64, i64, i64)> {
     let grace = life.grace_secs.unwrap_or(DEFAULT_GRACE_SECS);
     let bound_ms = (grace + I1B_SLACK_SECS) * 1000;
     let anchor = life.removal_ms.unwrap_or(start_b);
@@ -467,7 +483,12 @@ pub fn exercised(kind: Kind, faults: &[Fault]) -> Vec<String> {
     if !kind.has_fault() {
         return faults
             .iter()
-            .map(|x| format!("{} {} fired in a scenario that has no fault", x.action, x.pod))
+            .map(|x| {
+                format!(
+                    "{} {} fired in a scenario that has no fault",
+                    x.action, x.pod
+                )
+            })
             .collect();
     }
     if faults.is_empty() {
@@ -476,11 +497,17 @@ pub fn exercised(kind: Kind, faults: &[Fault]) -> Vec<String> {
     let mut why = Vec::new();
     for x in faults {
         if !x.condition_held_at_fire {
-            why.push(format!("{} {}: the trigger condition no longer held when it fired", x.action, x.pod));
+            why.push(format!(
+                "{} {}: the trigger condition no longer held when it fired",
+                x.action, x.pod
+            ));
         }
         if let Some(w) = kind.window() {
             match &x.landing {
-                None => why.push(format!("{} {}: where it landed is unknown", x.action, x.pod)),
+                None => why.push(format!(
+                    "{} {}: where it landed is unknown",
+                    x.action, x.pod
+                )),
                 Some(l) if l.class != w.as_str() => why.push(format!(
                     "{} {}: landed {}, outside the {} window",
                     x.action,
@@ -572,7 +599,11 @@ pub fn minimums(runs: usize, checked: &BTreeMap<String, usize>) -> Vec<String> {
     let want = [
         ("T1", runs, "one per scenario Run"),
         ("I3", runs, "one per scenario Run"),
-        ("I1a", attempts, "the Pod of every Attempt, as the watcher saw it"),
+        (
+            "I1a",
+            attempts,
+            "the Pod of every Attempt, as the watcher saw it",
+        ),
         ("I1c", attempts, "every Step of every Run"),
         ("I5", runs + attempts, "every Run row and Step row"),
         ("I4", attempts, "every green Attempt's snapshot, read back"),
@@ -603,7 +634,10 @@ pub fn evaluate(f: &Facts) -> Verdict {
         if set.len() > 1 {
             findings.push(fail(
                 "I1a",
-                format!("run {run} step {step} attempt {att} had {} Pod UIDs: {set:?}", set.len()),
+                format!(
+                    "run {run} step {step} attempt {att} had {} Pod UIDs: {set:?}",
+                    set.len()
+                ),
             ));
         }
     }
@@ -612,15 +646,16 @@ pub fn evaluate(f: &Facts) -> Verdict {
     // unless the earlier one was journalled finished or superseded, or its
     // Pod was gone, before the later one started; and then only within the
     // bound (`I1B_SLACK_SECS`).
-    let mut intervals: BTreeMap<(String, String), BTreeMap<String, Interval>> =
-        BTreeMap::new();
+    let mut intervals: BTreeMap<(String, String), BTreeMap<String, Interval>> = BTreeMap::new();
     let mut lives: HashMap<(String, String, String), PodLife> = HashMap::new();
     let last_record_ms = f.pod_records.iter().map(|r| r.at_ms).max().unwrap_or(0);
     for r in &f.pod_records {
         let (Some(run), Some(step), Some(att)) = (&r.pod.run, &r.pod.step, &r.pod.attempt) else {
             continue;
         };
-        let life = lives.entry((run.clone(), step.clone(), att.clone())).or_default();
+        let life = lives
+            .entry((run.clone(), step.clone(), att.clone()))
+            .or_default();
         let gone = r.event == "deleted";
         if gone {
             life.gone_ms = Some(life.gone_ms.map_or(r.at_ms, |x| x.min(r.at_ms)));
@@ -631,7 +666,9 @@ pub fn evaluate(f: &Facts) -> Verdict {
         if r.pod.grace_secs.is_some() {
             life.grace_secs = r.pod.grace_secs;
         }
-        let Some(c) = r.pod.container(pods::STEP_CONTAINER) else { continue };
+        let Some(c) = r.pod.container(pods::STEP_CONTAINER) else {
+            continue;
+        };
         let e = intervals
             .entry((run.clone(), step.clone()))
             .or_default()
@@ -652,7 +689,10 @@ pub fn evaluate(f: &Facts) -> Verdict {
         if event_kind(&e.payload) != "AttemptStarted" {
             continue;
         }
-        if let (Some(step), Some(att)) = (event_field(&e.payload, "step"), event_field(&e.payload, "attempt")) {
+        if let (Some(step), Some(att)) = (
+            event_field(&e.payload, "step"),
+            event_field(&e.payload, "attempt"),
+        ) {
             intervals
                 .entry((e.run.clone(), step.into()))
                 .or_default()
@@ -749,7 +789,10 @@ pub fn evaluate(f: &Facts) -> Verdict {
     let mut steps_seen = 0;
     let mut by_step: BTreeMap<(String, String), Vec<&AttemptRow>> = BTreeMap::new();
     for a in &f.attempts {
-        by_step.entry((a.run.clone(), a.step.clone())).or_default().push(a);
+        by_step
+            .entry((a.run.clone(), a.step.clone()))
+            .or_default()
+            .push(a);
     }
     for ((run, step), atts) in &by_step {
         steps_seen += 1;
@@ -759,7 +802,13 @@ pub fn evaluate(f: &Facts) -> Verdict {
             .map(|a| a.attempt.as_str())
             .collect();
         if green.len() > 1 {
-            findings.push(fail("I1c", format!("run {run} step {step}: {} succeeded Attempts {green:?}", green.len())));
+            findings.push(fail(
+                "I1c",
+                format!(
+                    "run {run} step {step}: {} succeeded Attempts {green:?}",
+                    green.len()
+                ),
+            ));
         }
         if let Some(s) = f.steps.iter().find(|s| s.run == *run && s.step == *step) {
             if s.status == "succeeded" {
@@ -781,13 +830,21 @@ pub fn evaluate(f: &Facts) -> Verdict {
         if kind != "AttemptStarted" && kind != "AttemptFinished" {
             continue;
         }
-        if let (Some(step), Some(att)) = (event_field(&e.payload, "step"), event_field(&e.payload, "attempt")) {
-            *per_attempt.entry((e.run.clone(), step.into(), att.into(), kind)).or_default() += 1;
+        if let (Some(step), Some(att)) = (
+            event_field(&e.payload, "step"),
+            event_field(&e.payload, "attempt"),
+        ) {
+            *per_attempt
+                .entry((e.run.clone(), step.into(), att.into(), kind))
+                .or_default() += 1;
         }
     }
     for ((run, step, att, kind), n) in &per_attempt {
         if *n > 1 {
-            findings.push(fail("I1c", format!("run {run} step {step} attempt {att}: {n} {kind} events")));
+            findings.push(fail(
+                "I1c",
+                format!("run {run} step {step} attempt {att}: {n} {kind} events"),
+            ));
         }
     }
     checked.insert("I1c".into(), steps_seen);
@@ -806,7 +863,13 @@ pub fn evaluate(f: &Facts) -> Verdict {
             ([one], true) => {
                 let to = event_field(&one.payload, "to").unwrap_or_default();
                 if status_token(to) != r.status {
-                    findings.push(fail("T1", format!("run {}: journal says {to}, runs.status says {}", r.id, r.status)));
+                    findings.push(fail(
+                        "T1",
+                        format!(
+                            "run {}: journal says {to}, runs.status says {}",
+                            r.id, r.status
+                        ),
+                    ));
                 }
             }
             (many, _) => findings.push(fail(
@@ -815,7 +878,9 @@ pub fn evaluate(f: &Facts) -> Verdict {
                     "run {}: {} terminal RunTransitioned events ({:?}), runs.status {}",
                     r.id,
                     many.len(),
-                    many.iter().map(|e| event_field(&e.payload, "to")).collect::<Vec<_>>(),
+                    many.iter()
+                        .map(|e| event_field(&e.payload, "to"))
+                        .collect::<Vec<_>>(),
                     r.status
                 ),
             )),
@@ -840,7 +905,10 @@ pub fn evaluate(f: &Facts) -> Verdict {
             .unwrap_or_else(|| "pending".into());
         if folded != r.status {
             let terminal = |s: &str| crate::env::TERMINAL_RUN_STATUSES.contains(&s);
-            let detail = format!("run {}: the journal folds to {folded}, runs.status is {}", r.id, r.status);
+            let detail = format!(
+                "run {}: the journal folds to {folded}, runs.status is {}",
+                r.id, r.status
+            );
             findings.push(if terminal(&folded) || terminal(&r.status) {
                 fail("I5", detail)
             } else {
@@ -858,7 +926,9 @@ pub fn evaluate(f: &Facts) -> Verdict {
             .max_by_key(|e| e.seq)
             .map(|e| match event_kind(&e.payload) {
                 "StepSkipped" => "skipped".to_string(),
-                _ => event_field(&e.payload, "to").unwrap_or_default().to_ascii_lowercase(),
+                _ => event_field(&e.payload, "to")
+                    .unwrap_or_default()
+                    .to_ascii_lowercase(),
             })
             .unwrap_or_else(|| "pending".into());
         if folded != s.status {
@@ -879,7 +949,10 @@ pub fn evaluate(f: &Facts) -> Verdict {
     // I3: terminal within the bound.
     for r in &f.runs {
         if !crate::env::TERMINAL_RUN_STATUSES.contains(&r.status.as_str()) {
-            findings.push(fail("I3", format!("run {} is still {} after the quiesce bound", r.id, r.status)));
+            findings.push(fail(
+                "I3",
+                format!("run {} is still {} after the quiesce bound", r.id, r.status),
+            ));
             continue;
         }
         let at = f
@@ -893,13 +966,20 @@ pub fn evaluate(f: &Facts) -> Verdict {
             if at > f.quiesce_deadline_ms {
                 findings.push(fail(
                     "I3",
-                    format!("run {} became terminal {} ms after the quiesce bound", r.id, at - f.quiesce_deadline_ms),
+                    format!(
+                        "run {} became terminal {} ms after the quiesce bound",
+                        r.id,
+                        at - f.quiesce_deadline_ms
+                    ),
                 ));
             }
         }
     }
     for r in f.runs.iter().filter(|r| r.creating) {
-        findings.push(fail("I3", format!("run {} still has creating = TRUE", r.id)));
+        findings.push(fail(
+            "I3",
+            format!("run {} still has creating = TRUE", r.id),
+        ));
     }
     checked.insert("I3".into(), f.runs.len());
 
@@ -909,7 +989,10 @@ pub fn evaluate(f: &Facts) -> Verdict {
         if crate::env::TERMINAL_RUN_STATUSES.contains(&r.status.as_str()) {
             w1 += 1;
             if r.status != "succeeded" {
-                findings.push(fail("W1", format!("run {} ended {}, not succeeded", r.id, r.status)));
+                findings.push(fail(
+                    "W1",
+                    format!("run {} ended {}, not succeeded", r.id, r.status),
+                ));
             }
         }
     }
@@ -934,7 +1017,10 @@ pub fn evaluate(f: &Facts) -> Verdict {
         for p in &s.problems {
             findings.push(fail(
                 "I4",
-                format!("run {} step {} attempt {} root {}: {p}", s.run, s.step, s.attempt, s.root),
+                format!(
+                    "run {} step {} attempt {} root {}: {p}",
+                    s.run, s.step, s.attempt, s.root
+                ),
             ));
         }
     }
@@ -946,11 +1032,17 @@ pub fn evaluate(f: &Facts) -> Verdict {
             "Pod" => {
                 let phase = o.phase.as_deref().unwrap_or("Unknown");
                 if phase != "Succeeded" && phase != "Failed" {
-                    findings.push(fail("I8", format!("Pod {} of run {:?} is {phase} after quiesce", o.name, o.run)));
+                    findings.push(fail(
+                        "I8",
+                        format!("Pod {} of run {:?} is {phase} after quiesce", o.name, o.run),
+                    ));
                 }
             }
             "Secret" => findings.push(fail("I8", format!("Secret {} outlives its Pod", o.name))),
-            kind => findings.push(fail("I8", format!("{kind} {} of run {:?} remains after quiesce", o.name, o.run))),
+            kind => findings.push(fail(
+                "I8",
+                format!("{kind} {} of run {:?} remains after quiesce", o.name, o.run),
+            )),
         }
     }
     // What I8 looked at is every scenario Run's leftovers; finding none is
@@ -983,9 +1075,15 @@ pub fn evaluate(f: &Facts) -> Verdict {
                 Ok(size) if *size == p.bytes as u64 => {}
                 Ok(size) => findings.push(fail(
                     "I10",
-                    format!("pack {}: object is {size} bytes, row says {}", p.pack_key, p.bytes),
+                    format!(
+                        "pack {}: object is {size} bytes, row says {}",
+                        p.pack_key, p.bytes
+                    ),
                 )),
-                Err(e) => findings.push(fail("I10", format!("committed pack {} has no object: {e}", p.pack_key))),
+                Err(e) => findings.push(fail(
+                    "I10",
+                    format!("committed pack {} has no object: {e}", p.pack_key),
+                )),
             }
         }
     }
@@ -1002,19 +1100,32 @@ pub fn evaluate(f: &Facts) -> Verdict {
             if *after != l.owner_before && ta <= tb {
                 findings.push(fail(
                     "L1",
-                    format!("the scheduler lease passed from {} to {after} with term {tb} -> {ta}", l.owner_before),
+                    format!(
+                        "the scheduler lease passed from {} to {after} with term {tb} -> {ta}",
+                        l.owner_before
+                    ),
                 ));
             }
         }
         if let (Some(ta), Some(tr)) = (l.term_after, l.term_after_resume) {
             if tr < ta {
-                findings.push(fail("L1", format!("the scheduler lease's term went back from {ta} to {tr} after the resume")));
+                findings.push(fail(
+                    "L1",
+                    format!(
+                        "the scheduler lease's term went back from {ta} to {tr} after the resume"
+                    ),
+                ));
             }
         }
-        if l.owner_after.is_some() && l.owner_after_resume.as_deref() == Some(l.owner_before.as_str()) {
+        if l.owner_after.is_some()
+            && l.owner_after_resume.as_deref() == Some(l.owner_before.as_str())
+        {
             findings.push(warn(
                 "L1",
-                format!("the resumed replica {} holds the scheduler lease again 10 s after its resume", l.owner_before),
+                format!(
+                    "the resumed replica {} holds the scheduler lease again 10 s after its resume",
+                    l.owner_before
+                ),
             ));
         }
     }
@@ -1061,7 +1172,12 @@ pub fn evaluate(f: &Facts) -> Verdict {
     // 068cc0b).
     let mut d1_unread = None;
     if f.kind == Some(Kind::TwoReplicas) {
-        let pods: BTreeSet<String> = f.pod_records.iter().filter(|r| r.pod.run.is_some()).map(|r| r.pod.name.clone()).collect();
+        let pods: BTreeSet<String> = f
+            .pod_records
+            .iter()
+            .filter(|r| r.pod.run.is_some())
+            .map(|r| r.pod.name.clone())
+            .collect();
         match &f.release_log {
             Some(log) => {
                 let (n, found) = second_drain_drivers(log, &pods);
@@ -1069,12 +1185,18 @@ pub fn evaluate(f: &Facts) -> Verdict {
                 // What D1 looked at: the drains of the scenario's Pods.
                 checked.insert("D1".into(), n);
                 if n == 0 {
-                    d1_unread = Some("D1: release-log.txt has no drain ws-timing line for a scenario Pod".to_string());
+                    d1_unread = Some(
+                        "D1: release-log.txt has no drain ws-timing line for a scenario Pod"
+                            .to_string(),
+                    );
                 }
             }
             None => {
                 checked.insert("D1".into(), 0);
-                d1_unread = Some("D1: release-log.txt was not written, so no release log line was read".to_string());
+                d1_unread = Some(
+                    "D1: release-log.txt was not written, so no release log line was read"
+                        .to_string(),
+                );
             }
         }
     }
@@ -1086,7 +1208,11 @@ pub fn evaluate(f: &Facts) -> Verdict {
             crate::cache::C1::Checked(r) => {
                 checked.insert("C1".into(), 1);
                 if let Err(detail) = r {
-                    findings.push(Finding { invariant: "C1".into(), severity: Severity::Fail, detail });
+                    findings.push(Finding {
+                        invariant: "C1".into(),
+                        severity: Severity::Fail,
+                        detail,
+                    });
                 }
             }
             crate::cache::C1::NotExercised(why) => {
@@ -1168,7 +1294,11 @@ fn db_err(e: sqlx::Error) -> String {
     format!("postgres: {e}")
 }
 
-pub async fn gather(src: &Sources<'_>, scenario: &Scenario, pod_records: Vec<PodRecord>) -> Result<Facts, String> {
+pub async fn gather(
+    src: &Sources<'_>,
+    scenario: &Scenario,
+    pod_records: Vec<PodRecord>,
+) -> Result<Facts, String> {
     let runs = &scenario.runs;
     // Only the scenario's own step Pods: the namespace also holds Pods of
     // earlier Runs and other modes.
@@ -1194,7 +1324,11 @@ pub async fn gather(src: &Sources<'_>, scenario: &Scenario, pod_records: Vec<Pod
     .await
     .map_err(db_err)?
     {
-        f.runs.push(RunRow { id, status, creating });
+        f.runs.push(RunRow {
+            id,
+            status,
+            creating,
+        });
     }
     for id in runs {
         if !f.runs.iter().any(|r| &r.id == id) {
@@ -1213,7 +1347,12 @@ pub async fn gather(src: &Sources<'_>, scenario: &Scenario, pod_records: Vec<Pod
     .await
     .map_err(db_err)?
     {
-        f.events.push(EventRow { run, seq, at, payload });
+        f.events.push(EventRow {
+            run,
+            seq,
+            at,
+            payload,
+        });
     }
     for (run, step, attempt, outcome, output_snapshot) in
         sqlx::query_as::<_, (String, String, String, Option<String>, Option<String>)>(
@@ -1304,7 +1443,12 @@ pub async fn gather(src: &Sources<'_>, scenario: &Scenario, pod_records: Vec<Pod
     for a in &f.attempts {
         if a.outcome.as_deref() == Some("succeeded") {
             if let Some(root) = &a.output_snapshot {
-                roots.push((a.run.clone(), a.step.clone(), a.attempt.clone(), root.clone()));
+                roots.push((
+                    a.run.clone(),
+                    a.step.clone(),
+                    a.attempt.clone(),
+                    root.clone(),
+                ));
             }
         }
     }
@@ -1324,18 +1468,30 @@ pub async fn gather(src: &Sources<'_>, scenario: &Scenario, pod_records: Vec<Pod
 
     // I8: what still exists for the scenario's Runs.
     let pods_api: KubeApi<Pod> = KubeApi::namespaced(src.kube.clone(), src.namespace);
-    let all_pods = pods_api.list(&ListParams::default()).await.map_err(|e| format!("list pods: {e}"))?;
+    let all_pods = pods_api
+        .list(&ListParams::default())
+        .await
+        .map_err(|e| format!("list pods: {e}"))?;
     let scenario_runs: HashSet<&str> = runs.iter().map(String::as_str).collect();
     let mut scenario_pod_names = HashSet::new();
     for r in &f.pod_records {
-        if r.pod.run.as_deref().is_some_and(|x| scenario_runs.contains(x)) {
+        if r.pod
+            .run
+            .as_deref()
+            .is_some_and(|x| scenario_runs.contains(x))
+        {
             scenario_pod_names.insert(r.pod.name.clone());
         }
     }
     for p in &all_pods.items {
         let name = p.metadata.name.clone().unwrap_or_default();
         f.live_pod_names.insert(name.clone());
-        let run = p.metadata.labels.as_ref().and_then(|l| l.get("scarab.io/run")).cloned();
+        let run = p
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|l| l.get("scarab.io/run"))
+            .cloned();
         if run.as_deref().is_some_and(|x| scenario_runs.contains(x)) {
             f.live.push(LiveObject {
                 kind: "Pod".into(),
@@ -1347,8 +1503,18 @@ pub async fn gather(src: &Sources<'_>, scenario: &Scenario, pod_records: Vec<Pod
     }
     let lp = ListParams::default().labels("scarab.io/run");
     let svcs: KubeApi<Service> = KubeApi::namespaced(src.kube.clone(), src.namespace);
-    for s in svcs.list(&lp).await.map_err(|e| format!("list services: {e}"))?.items {
-        let run = s.metadata.labels.as_ref().and_then(|l| l.get("scarab.io/run")).cloned();
+    for s in svcs
+        .list(&lp)
+        .await
+        .map_err(|e| format!("list services: {e}"))?
+        .items
+    {
+        let run = s
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|l| l.get("scarab.io/run"))
+            .cloned();
         if run.as_deref().is_some_and(|x| scenario_runs.contains(x)) {
             f.live.push(LiveObject {
                 kind: "Service".into(),
@@ -1359,8 +1525,18 @@ pub async fn gather(src: &Sources<'_>, scenario: &Scenario, pod_records: Vec<Pod
         }
     }
     let nps: KubeApi<NetworkPolicy> = KubeApi::namespaced(src.kube.clone(), src.namespace);
-    for n in nps.list(&lp).await.map_err(|e| format!("list networkpolicies: {e}"))?.items {
-        let run = n.metadata.labels.as_ref().and_then(|l| l.get("scarab.io/run")).cloned();
+    for n in nps
+        .list(&lp)
+        .await
+        .map_err(|e| format!("list networkpolicies: {e}"))?
+        .items
+    {
+        let run = n
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|l| l.get("scarab.io/run"))
+            .cloned();
         if run.as_deref().is_some_and(|x| scenario_runs.contains(x)) {
             f.live.push(LiveObject {
                 kind: "NetworkPolicy".into(),
@@ -1373,7 +1549,12 @@ pub async fn gather(src: &Sources<'_>, scenario: &Scenario, pod_records: Vec<Pod
     // Per-Pod workspace Secrets (`<pod>-workspace`, owned by the Pod): one
     // whose Pod is gone has outlived it.
     let secrets: KubeApi<Secret> = KubeApi::namespaced(src.kube.clone(), src.namespace);
-    for s in secrets.list(&ListParams::default()).await.map_err(|e| format!("list secrets: {e}"))?.items {
+    for s in secrets
+        .list(&ListParams::default())
+        .await
+        .map_err(|e| format!("list secrets: {e}"))?
+        .items
+    {
         let name = s.metadata.name.unwrap_or_default();
         if let Some(pod) = name.strip_suffix("-workspace") {
             if scenario_pod_names.contains(pod) && !f.live_pod_names.contains(pod) {
@@ -1405,7 +1586,10 @@ async fn members(pg: &sqlx::PgPool, kind: &str, hex: &str) -> Result<Vec<MemberR
          FROM depot_pack_members m JOIN depot_packs p ON p.pack_key = m.pack_key \
          WHERE m.address = $1 AND m.kind = $2",
     )
-    .bind(scarab_storage::tagged_address(scarab_storage::HashAlgo::Sha256, hex))
+    .bind(scarab_storage::tagged_address(
+        scarab_storage::HashAlgo::Sha256,
+        hex,
+    ))
     .bind(kind)
     .fetch_all(pg)
     .await
@@ -1422,8 +1606,14 @@ async fn members(pg: &sqlx::PgPool, kind: &str, hex: &str) -> Result<Vec<MemberR
         .collect())
 }
 
-async fn read_member(bucket: &object_store::aws::AmazonS3, m: &MemberRow) -> Result<Vec<u8>, String> {
-    let (off, len) = (u64::try_from(m.offset).map_err(|e| e.to_string())?, u64::try_from(m.len).map_err(|e| e.to_string())?);
+async fn read_member(
+    bucket: &object_store::aws::AmazonS3,
+    m: &MemberRow,
+) -> Result<Vec<u8>, String> {
+    let (off, len) = (
+        u64::try_from(m.offset).map_err(|e| e.to_string())?,
+        u64::try_from(m.len).map_err(|e| e.to_string())?,
+    );
     bucket
         .get_range(&ObjPath::from(m.pack_key.as_str()), off..off + len)
         .await
@@ -1433,13 +1623,20 @@ async fn read_member(bucket: &object_store::aws::AmazonS3, m: &MemberRow) -> Res
 
 /// Pick the committed member this snapshot may read: one in its own fence's
 /// pack, or in a fence it has a borrow edge to (git-bug ec294b7).
-fn pick<'m>(rows: &'m [MemberRow], own: &str, borrows: &HashSet<String>) -> Result<&'m MemberRow, String> {
+fn pick<'m>(
+    rows: &'m [MemberRow],
+    own: &str,
+    borrows: &HashSet<String>,
+) -> Result<&'m MemberRow, String> {
     let committed: Vec<&MemberRow> = rows.iter().filter(|m| m.committed).collect();
     if committed.is_empty() {
         return Err(if rows.is_empty() {
             "in no pack".into()
         } else {
-            format!("only in uncommitted packs {:?}", rows.iter().map(|m| &m.pack_key).collect::<Vec<_>>())
+            format!(
+                "only in uncommitted packs {:?}",
+                rows.iter().map(|m| &m.pack_key).collect::<Vec<_>>()
+            )
         });
     }
     committed
@@ -1480,7 +1677,9 @@ async fn walk_snapshot(
     .map_err(db_err)?
     .into_iter()
     .collect();
-    let root_hex = scarab_storage::parse_address(root).map(|(_, h)| h.to_string()).unwrap_or_else(|_| root.to_string());
+    let root_hex = scarab_storage::parse_address(root)
+        .map(|(_, h)| h.to_string())
+        .unwrap_or_else(|_| root.to_string());
 
     // Trees first, one level at a time; blobs collected and read after.
     let mut trees = vec![root_hex];
@@ -1507,7 +1706,10 @@ async fn walk_snapshot(
             }
         };
         if scarab_storage::sha256_hex(&bytes) != hex {
-            out.problems.push(format!("tree {hex}: bytes at {}[{}..+{}] hash to something else", m.pack_key, m.offset, m.len));
+            out.problems.push(format!(
+                "tree {hex}: bytes at {}[{}..+{}] hash to something else",
+                m.pack_key, m.offset, m.len
+            ));
             continue;
         }
         out.bytes += bytes.len() as u64;
@@ -1550,7 +1752,14 @@ async fn walk_snapshot(
             let key = (m.pack_key.clone(), m.offset, m.len);
             match read_member(src.bucket, &m).await {
                 Ok(b) if scarab_storage::sha256_hex(&b) == hex => (key, Ok(()), b.len() as u64),
-                Ok(_) => (key, Err(format!("blob {hex}: bytes at {}[{}..+{}] hash to something else", m.pack_key, m.offset, m.len)), 0),
+                Ok(_) => (
+                    key,
+                    Err(format!(
+                        "blob {hex}: bytes at {}[{}..+{}] hash to something else",
+                        m.pack_key, m.offset, m.len
+                    )),
+                    0,
+                ),
                 Err(e) => (key, Err(format!("blob {hex}: {e}")), 0),
             }
         })
@@ -1601,7 +1810,12 @@ mod tests {
                 containers: vec![ContainerView {
                     name: pods::STEP_CONTAINER.into(),
                     init: false,
-                    state: if end.is_some() { "terminated" } else { "running" }.into(),
+                    state: if end.is_some() {
+                        "terminated"
+                    } else {
+                        "running"
+                    }
+                    .into(),
                     started_at_ms: Some(start),
                     finished_at_ms: end,
                     exit_code: end.map(|_| 0),
@@ -1620,10 +1834,26 @@ mod tests {
                 creating: false,
             }],
             events: vec![
-                ev("r", 1, serde_json::json!({"AttemptStarted": {"step": "s", "attempt": "a1"}})),
-                ev("r", 2, serde_json::json!({"AttemptFinished": {"step": "s", "attempt": "a1", "failure": null}})),
-                ev("r", 3, serde_json::json!({"StepTransitioned": {"step": "s", "from": "Running", "to": "Succeeded"}})),
-                ev("r", 4, serde_json::json!({"RunTransitioned": {"from": "Running", "to": "Succeeded"}})),
+                ev(
+                    "r",
+                    1,
+                    serde_json::json!({"AttemptStarted": {"step": "s", "attempt": "a1"}}),
+                ),
+                ev(
+                    "r",
+                    2,
+                    serde_json::json!({"AttemptFinished": {"step": "s", "attempt": "a1", "failure": null}}),
+                ),
+                ev(
+                    "r",
+                    3,
+                    serde_json::json!({"StepTransitioned": {"step": "s", "from": "Running", "to": "Succeeded"}}),
+                ),
+                ev(
+                    "r",
+                    4,
+                    serde_json::json!({"RunTransitioned": {"from": "Running", "to": "Succeeded"}}),
+                ),
             ],
             attempts: vec![AttemptRow {
                 run: "r".into(),
@@ -1671,13 +1901,21 @@ mod tests {
     fn overlapping_attempts_fail_i1b_unless_the_first_was_journalled_ended() {
         let mut f = base();
         f.pod_records.push(pod_rec("u2", "a2", 15, Some(40)));
-        f.events.push(ev("r", 5, serde_json::json!({"AttemptStarted": {"step": "s", "attempt": "a2"}})));
+        f.events.push(ev(
+            "r",
+            5,
+            serde_json::json!({"AttemptStarted": {"step": "s", "attempt": "a2"}}),
+        ));
         // a1 is journalled finished at seq 2, before a2 started at seq 5: allowed.
         let v = evaluate(&f);
         assert!(failed(&v).is_empty(), "{:?}", v.findings);
-        assert!(v.findings.iter().any(|x| x.invariant == "I1b" && x.severity == Severity::Warn));
+        assert!(v
+            .findings
+            .iter()
+            .any(|x| x.invariant == "I1b" && x.severity == Severity::Warn));
         // Without the journal entry it is a double effect.
-        f.events.retain(|e| event_kind(&e.payload) != "AttemptFinished");
+        f.events
+            .retain(|e| event_kind(&e.payload) != "AttemptFinished");
         assert!(failed(&evaluate(&f)).contains(&"I1b"));
     }
 
@@ -1686,13 +1924,20 @@ mod tests {
     /// 500. a1's step container finishing at `end` decides the verdict.
     fn i1b_bound_facts(end: i64) -> Facts {
         let mut f = base();
-        f.pod_records = vec![pod_rec("u1", "a1", 10, None), pod_rec("u2", "a2", 500, Some(70_000))];
+        f.pod_records = vec![
+            pod_rec("u1", "a1", 10, None),
+            pod_rec("u2", "a2", 500, Some(70_000)),
+        ];
         let mut deleting = pod_rec("u1", "a1", 10, None);
         deleting.at_ms = 1_000;
         deleting.pod.deleting = true;
         f.pod_records.push(deleting);
         f.pod_records.push(pod_rec("u1", "a1", 10, Some(end)));
-        f.events.push(ev("r", 5, serde_json::json!({"AttemptStarted": {"step": "s", "attempt": "a2"}})));
+        f.events.push(ev(
+            "r",
+            5,
+            serde_json::json!({"AttemptStarted": {"step": "s", "attempt": "a2"}}),
+        ));
         f
     }
 
@@ -1700,14 +1945,21 @@ mod tests {
     fn i1b_allows_an_overlap_up_to_the_grace_period_plus_30_s_after_removal() {
         let v = evaluate(&i1b_bound_facts(1_000 + 60_000));
         assert!(failed(&v).is_empty(), "{:?}", v.findings);
-        assert!(v.findings.iter().any(|x| x.invariant == "I1b" && x.severity == Severity::Warn));
+        assert!(v
+            .findings
+            .iter()
+            .any(|x| x.invariant == "I1b" && x.severity == Severity::Warn));
     }
 
     #[test]
     fn i1b_fails_an_overlap_past_the_grace_period_plus_30_s_after_removal() {
         let v = evaluate(&i1b_bound_facts(1_000 + 60_001));
         assert_eq!(failed(&v), vec!["I1b"], "{:?}", v.findings);
-        assert!(v.findings[0].detail.contains("past the bound of 60000 ms"), "{}", v.findings[0].detail);
+        assert!(
+            v.findings[0].detail.contains("past the bound of 60000 ms"),
+            "{}",
+            v.findings[0].detail
+        );
     }
 
     /// The bound uses the Pod's own grace period: at 600 s the same overrun
@@ -1731,7 +1983,8 @@ mod tests {
     #[test]
     fn i1b_allows_a_start_after_the_pod_is_gone() {
         let mut f = i1b_bound_facts(30_000);
-        f.events.retain(|e| event_kind(&e.payload) != "AttemptFinished");
+        f.events
+            .retain(|e| event_kind(&e.payload) != "AttemptFinished");
         assert_eq!(failed(&evaluate(&f)), vec!["I1b"]);
         let mut gone = pod_rec("u1", "a1", 10, None);
         gone.at_ms = 400;
@@ -1754,7 +2007,11 @@ mod tests {
     #[test]
     fn two_terminal_transitions_fail_t1_and_a_late_one_fails_i3() {
         let mut f = base();
-        f.events.push(ev("r", 9, serde_json::json!({"RunTransitioned": {"from": "Succeeded", "to": "Failed"}})));
+        f.events.push(ev(
+            "r",
+            9,
+            serde_json::json!({"RunTransitioned": {"from": "Succeeded", "to": "Failed"}}),
+        ));
         assert!(failed(&evaluate(&f)).contains(&"T1"));
         let mut f = base();
         f.quiesce_deadline_ms = 2;
@@ -1773,13 +2030,20 @@ mod tests {
         // The step row went terminal with no journalled transition
         // (git-bug 586187a: the CAS and its event in separate writes).
         let mut f = base();
-        f.events.retain(|e| event_kind(&e.payload) != "StepTransitioned");
+        f.events
+            .retain(|e| event_kind(&e.payload) != "StepTransitioned");
         let v = evaluate(&f);
         assert_eq!(failed(&v), vec!["I5"], "{:?}", v.findings);
-        assert!(v.findings[0].detail.contains("folds to pending, step_runs.status is succeeded"));
+        assert!(v.findings[0]
+            .detail
+            .contains("folds to pending, step_runs.status is succeeded"));
         // The journal says Failed, the row says succeeded.
         let mut f = base();
-        f.events[2] = ev("r", 3, serde_json::json!({"StepTransitioned": {"step": "s", "from": "Running", "to": "Failed"}}));
+        f.events[2] = ev(
+            "r",
+            3,
+            serde_json::json!({"StepTransitioned": {"step": "s", "from": "Running", "to": "Failed"}}),
+        );
         assert_eq!(failed(&evaluate(&f)), vec!["I5"]);
         // A later rerun's transition wins the fold: Succeeded, then
         // re-armed to Pending, while the row says pending.
@@ -1848,10 +2112,20 @@ mod tests {
         f.kind = Some(Kind::PauseNode);
         f.expected_runs = 1;
         let v = evaluate(&f);
-        assert!(!v.findings.iter().any(|x| x.invariant == "N1"), "{:?}", v.findings);
+        assert!(
+            !v.findings.iter().any(|x| x.invariant == "N1"),
+            "{:?}",
+            v.findings
+        );
         assert_eq!(v.checked.get("N1"), Some(&1));
         // One Attempt, below the workload's two per Run.
-        assert!(v.inconclusive.iter().any(|w| w.starts_with("N1 looked at 1")), "{:?}", v.inconclusive);
+        assert!(
+            v.inconclusive
+                .iter()
+                .any(|w| w.starts_with("N1 looked at 1")),
+            "{:?}",
+            v.inconclusive
+        );
 
         let lost = "workspace snapshot lost: the step exited 0 but its egress sidecar died before the drain \
                     recorded a root — the emptyDir is gone and the snapshot can never be produced (ADR-0061 part 4)";
@@ -1863,7 +2137,10 @@ mod tests {
         ));
         let v = evaluate(&f);
         assert!(failed(&v).contains(&"N1"), "{:?}", v.findings);
-        assert!(v.findings.iter().any(|x| x.invariant == "N1" && x.detail.contains("attempt a0")));
+        assert!(v
+            .findings
+            .iter()
+            .any(|x| x.invariant == "N1" && x.detail.contains("attempt a0")));
 
         let mut f = base();
         f.kind = Some(Kind::PauseNode);
@@ -1875,7 +2152,10 @@ mod tests {
         ));
         let v = evaluate(&f);
         assert!(!failed(&v).contains(&"N1"));
-        assert!(v.findings.iter().any(|x| x.invariant == "N1" && x.severity == Severity::Warn));
+        assert!(v
+            .findings
+            .iter()
+            .any(|x| x.invariant == "N1" && x.severity == Severity::Warn));
         // N1 is pause-node's own: another scenario does not run it.
         f.kind = Some(Kind::MidDrain);
         assert!(!evaluate(&f).checked.contains_key("N1"));
@@ -1903,12 +2183,23 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert_eq!(exercised(Kind::PauseNode, &[fault(true, 240)]), Vec::<String>::new());
-        assert!(exercised(Kind::PauseNode, &[fault(false, 240)])[0].contains("did not report the node paused"));
-        assert!(exercised(Kind::PauseNode, &[fault(true, 30)])[0].contains("not past the 30 s lease TTL"));
-        assert!(exercised(Kind::PauseNode, &[fault(true, 600)])[0].contains("not short of the Pod's 600 s grace"));
+        assert_eq!(
+            exercised(Kind::PauseNode, &[fault(true, 240)]),
+            Vec::<String>::new()
+        );
+        assert!(exercised(Kind::PauseNode, &[fault(false, 240)])[0]
+            .contains("did not report the node paused"));
+        assert!(exercised(Kind::PauseNode, &[fault(true, 30)])[0]
+            .contains("not past the 30 s lease TTL"));
+        assert!(exercised(Kind::PauseNode, &[fault(true, 600)])[0]
+            .contains("not short of the Pod's 600 s grace"));
         let mut late = fault(true, 240);
-        late.landing = Some(crate::scenario::classify(Kind::MidDrain, 0, Some(-10), Some(-1)));
+        late.landing = Some(crate::scenario::classify(
+            Kind::MidDrain,
+            0,
+            Some(-10),
+            Some(-1),
+        ));
         assert!(exercised(Kind::PauseNode, &[late])[0].contains("landed after-window"));
     }
 
@@ -1939,7 +2230,9 @@ mod tests {
         assert!(!failed(&v).contains(&"D1"), "{:?}", v.findings);
         assert_eq!(v.checked.get("D1"), Some(&2));
         assert!(
-            v.findings.iter().any(|x| x.invariant == "D1" && x.severity == Severity::Info && x.detail.contains("exited 12")),
+            v.findings.iter().any(|x| x.invariant == "D1"
+                && x.severity == Severity::Info
+                && x.detail.contains("exited 12")),
             "{:?}",
             v.findings
         );
@@ -1963,21 +2256,42 @@ mod tests {
         assert!(!failed(&evaluate(&f)).contains(&"D1"));
         f.release_log = Some(format!(
             "{}\n{}\n",
-            drain("scarab-x1", "p-other", "2026-11-01T14:18:05.000000Z", "5000"),
-            drain("scarab-x2", "p-other", "2026-11-01T14:18:08.000000Z", "4000"),
+            drain(
+                "scarab-x1",
+                "p-other",
+                "2026-11-01T14:18:05.000000Z",
+                "5000"
+            ),
+            drain(
+                "scarab-x2",
+                "p-other",
+                "2026-11-01T14:18:08.000000Z",
+                "4000"
+            ),
         ));
         let v = evaluate(&f);
         assert!(!failed(&v).contains(&"D1"));
-        assert!(v.inconclusive.iter().any(|w| w.starts_with("D1:")), "no drain of a scenario Pod read: {:?}", v.inconclusive);
+        assert!(
+            v.inconclusive.iter().any(|w| w.starts_with("D1:")),
+            "no drain of a scenario Pod read: {:?}",
+            v.inconclusive
+        );
 
         // A numeric total_ms reads too.
-        let spans = drain_spans(&drain("r", "p", "2026-11-01T00:00:01Z", "1000").replace(r#""total_ms":"1000""#, r#""total_ms":1000"#));
+        let spans = drain_spans(
+            &drain("r", "p", "2026-11-01T00:00:01Z", "1000")
+                .replace(r#""total_ms":"1000""#, r#""total_ms":1000"#),
+        );
         assert_eq!(spans[0].start_ms + 1000, spans[0].end_ms);
 
         // No log at all: D1 read nothing, which is not a pass.
         f.release_log = None;
         let v = evaluate(&f);
-        assert!(v.inconclusive.iter().any(|w| w.starts_with("D1:")), "{:?}", v.inconclusive);
+        assert!(
+            v.inconclusive.iter().any(|w| w.starts_with("D1:")),
+            "{:?}",
+            v.inconclusive
+        );
         // D1 is two-replicas' own.
         f.kind = Some(Kind::MidDrain);
         assert!(!evaluate(&f).checked.contains_key("D1"));
@@ -1994,9 +2308,18 @@ mod tests {
         };
         let none = HashSet::new();
         assert!(pick(&[], "own", &none).unwrap_err().contains("no pack"));
-        assert!(pick(&[row("own", false)], "own", &none).unwrap_err().contains("uncommitted"));
-        assert_eq!(pick(&[row("x", true), row("own", true)], "own", &none).unwrap().fence_key, "own");
-        assert!(pick(&[row("x", true)], "own", &none).unwrap_err().contains("borrows"));
+        assert!(pick(&[row("own", false)], "own", &none)
+            .unwrap_err()
+            .contains("uncommitted"));
+        assert_eq!(
+            pick(&[row("x", true), row("own", true)], "own", &none)
+                .unwrap()
+                .fence_key,
+            "own"
+        );
+        assert!(pick(&[row("x", true)], "own", &none)
+            .unwrap_err()
+            .contains("borrows"));
         let b: HashSet<String> = ["x".to_string()].into();
         assert_eq!(pick(&[row("x", true)], "own", &b).unwrap().fence_key, "x");
     }

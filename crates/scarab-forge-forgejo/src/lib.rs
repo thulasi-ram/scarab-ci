@@ -458,7 +458,10 @@ impl ForgejoForge {
     /// A GET through the [`EtagCache`](scarab_forge::conditional::EtagCache):
     /// sends the kept `ETag` as `If-None-Match` and serves the kept body on a
     /// `304`. Returns the status (a `304` reads as `200`) and the body.
-    async fn get_conditional(&self, url: &str) -> Result<(reqwest::StatusCode, Vec<u8>), ForgeError> {
+    async fn get_conditional(
+        &self,
+        url: &str,
+    ) -> Result<(reqwest::StatusCode, Vec<u8>), ForgeError> {
         let cached = self.etags.get(url);
         let etag = cached.as_ref().map(|(tag, _)| tag.clone());
         let resp = self
