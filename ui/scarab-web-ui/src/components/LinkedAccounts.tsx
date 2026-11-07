@@ -20,9 +20,9 @@ import Icon from "./Icon";
 import ConfirmDestructive from "./ConfirmDestructive";
 import {
   canUnlink,
+  confirmMerge as runMergeConfirm,
   linkNotice,
   linkable,
-  mergedNotice,
   pendingMergeId,
   providerName,
   type Notice,
@@ -44,24 +44,26 @@ export default function LinkedAccounts() {
   // The link landed on an account that holds passkeys: one of ITS passkeys
   // must confirm the merge, or nothing changes.
   const mergeId = () => (merged() ? null : pendingMergeId(location.search));
-  const [merge] = createResource(mergeId, getIdentityMerge);
+  const [merge, { refetch: reloadMerge }] = createResource(mergeId, getIdentityMerge);
   const [mergeError, setMergeError] = createSignal<string | null>(null);
   const confirmMerge = async () => {
     const m = merge();
     if (!m) return;
     setBusy(true);
     setMergeError(null);
-    try {
-      const credential = await getAssertion(m.public_key);
-      const done = await confirmIdentityMerge(m.id, credential);
-      setMerged(mergedNotice(done.merged, done.removed_passkeys));
+    const outcome = await runMergeConfirm(m.id, m.public_key, {
+      assert: getAssertion,
+      confirm: confirmIdentityMerge,
+      reload: reloadMerge,
+      webauthnError: webauthnErrorText,
+    });
+    if ("notice" in outcome) {
+      setMerged(outcome.notice);
       await refetch();
-    } catch (e) {
-      const name = (e as { name?: string } | null)?.name;
-      setMergeError(name ? webauthnErrorText(e) : e instanceof Error ? e.message : "The merge failed.");
-    } finally {
-      setBusy(false);
+    } else {
+      setMergeError(outcome.error);
     }
+    setBusy(false);
   };
 
   const link = async (provider: string) => {

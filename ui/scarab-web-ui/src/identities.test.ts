@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+  confirmMerge,
   mergedNotice,
   pendingMergeId,
   addToList,
@@ -135,5 +136,51 @@ describe("the merge a link asks to confirm", () => {
     expect(mergedNotice("github:ada", 1).text).toContain("Its passkey was deleted");
     expect(mergedNotice("github:ada", 2).text).toContain("Its 2 passkeys were deleted");
     expect(mergedNotice("github:ada", 1).kind).toBe("ok");
+  });
+});
+
+describe("confirming a merge", () => {
+  const deps = (over: Partial<Parameters<typeof confirmMerge>[2]> = {}) => {
+    const calls = { reload: 0 };
+    return {
+      calls,
+      deps: {
+        assert: async () => ({ id: "cred" }),
+        confirm: async () => ({ merged: "github:ada", removed_passkeys: 1 }),
+        reload: () => {
+          calls.reload++;
+        },
+        webauthnError: () => "The passkey prompt was dismissed or timed out.",
+        ...over,
+      },
+    };
+  };
+
+  it("a refused POST has spent the challenge, so the merge is loaded again", async () => {
+    const { calls, deps: d } = deps({
+      confirm: async () => {
+        throw new Error("that passkey is not one of `github:ada`'s");
+      },
+    });
+    const out = await confirmMerge("m1", {}, d);
+    expect(out).toEqual({ error: "that passkey is not one of `github:ada`'s" });
+    expect(calls.reload).toBe(1);
+  });
+
+  it("a dismissed prompt spends nothing: no reload, the same challenge can be tried again", async () => {
+    const { calls, deps: d } = deps({
+      assert: async () => {
+        throw Object.assign(new Error("x"), { name: "NotAllowedError" });
+      },
+    });
+    const out = await confirmMerge("m1", {}, d);
+    expect(out).toEqual({ error: "The passkey prompt was dismissed or timed out." });
+    expect(calls.reload).toBe(0);
+  });
+
+  it("a sign-in linked without a merge says so", async () => {
+    const { deps: d } = deps({ confirm: async () => ({ merged: null, removed_passkeys: 0 }) });
+    const out = await confirmMerge("m1", {}, d);
+    expect("notice" in out && out.notice.text).toContain("nothing was merged");
   });
 });

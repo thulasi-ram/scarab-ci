@@ -354,6 +354,63 @@ async fn a_merge_of_a_principal_with_passkeys_needs_one_of_its_passkeys() {
     tdb.cleanup().await;
 }
 
+/// git-bug 1a81c63: a passkey enrolled for the folded Principal after the
+/// merge read its passkeys (a row lock does not hold back an INSERT) would
+/// be deleted by the merge without the proof ADR-0079 §2 asks for. The
+/// interleaving is built, not raced: a statement trigger on an UPDATE the
+/// merge always makes before its DELETE inserts the passkey inside the
+/// merge's transaction. The merge then changes nothing.
+#[tokio::test]
+async fn a_passkey_enrolled_during_a_merge_stops_it() {
+    use scarab_identity::{FoldedPasskey, LinkOutcome};
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = PostgresDb::with_pool(tdb.pool.clone());
+    db.migrate().await.unwrap();
+    let okta = ProviderIdentity {
+        provider: "okta".into(),
+        ..ident("00u-mallory", "mallory@example.com")
+    };
+    let mallory = db
+        .sign_in(&okta, "okta:mallory@example.com", 1)
+        .await
+        .unwrap();
+    let ada = db
+        .sign_in(&ident("1001", "ada"), "github:ada", 2)
+        .await
+        .unwrap();
+    sqlx::query(&format!(
+        "CREATE FUNCTION enroll_mid_merge() RETURNS trigger AS $$ BEGIN
+           INSERT INTO passkeys (id, principal_id, credential_id, public_key_cose, alg,
+               sign_count, label, created_at, created_session_hash)
+           VALUES ('pk-late', '{ada}', '\\x09', '\\x00', -7, 0, 'late', 1, 'h')
+           ON CONFLICT DO NOTHING;
+           RETURN NULL;
+         END $$ LANGUAGE plpgsql"
+    ))
+    .execute(&tdb.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER enroll_mid_merge AFTER UPDATE ON org_environments
+         FOR EACH STATEMENT EXECUTE FUNCTION enroll_mid_merge()",
+    )
+    .execute(&tdb.pool)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        db.link(&mallory, &ident("1001", "ada"), 3, &FoldedPasskey::Unproven)
+            .await
+            .unwrap(),
+        LinkOutcome::NeedsFoldedPasskey { from: ada.clone() }
+    );
+    assert_eq!(db.aliases_of(&mallory).await.unwrap(), Vec::<String>::new());
+    tdb.cleanup().await;
+}
+
 /// `resolve_principal` follows merges to the live Principal — and a merge
 /// chain that loops (a corrupt row; no code path writes one) is an error after
 /// a bounded walk, never a hang on the request that typed the subject.

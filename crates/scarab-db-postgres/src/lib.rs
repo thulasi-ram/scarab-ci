@@ -5013,9 +5013,9 @@ impl scarab_identity::IdentityStore for PostgresDb {
                 }
                 // ADR-0079 §2: folding in a Principal that holds any passkey
                 // (a flagged one too) needs an assertion from one of them.
-                // Read under the merge's transaction: rows locked here, so a
-                // passkey enrolled for `from` meanwhile waits for this
-                // decision.
+                // A row lock does not hold back an INSERT, so a passkey
+                // enrolled for `from` after this read is caught below, where
+                // the merge's DELETE sees it.
                 let held_passkeys: Vec<String> = sqlx::query_scalar(
                     "SELECT id FROM passkeys WHERE principal_id = $1 FOR UPDATE",
                 )
@@ -5032,6 +5032,16 @@ impl scarab_identity::IdentityStore for PostgresDb {
                     return Ok(scarab_identity::LinkOutcome::NeedsFoldedPasskey { from });
                 }
                 let removed_passkeys = merge_principal(&mut tx, &from, principal).await?;
+                // The DELETE removed a passkey the check did not see (enrolled
+                // in between): the decision above was made without it, so
+                // nothing changes (git-bug 1a81c63).
+                if removed_passkeys
+                    .iter()
+                    .any(|id| !held_passkeys.contains(id))
+                {
+                    tx.rollback().await.map_err(identity_err)?;
+                    return Ok(scarab_identity::LinkOutcome::NeedsFoldedPasskey { from });
+                }
                 sqlx::query(
                     "UPDATE principal_identities
                      SET principal_id = $3, handle = $4, email = $5, email_verified = $6,

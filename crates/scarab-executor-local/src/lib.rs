@@ -304,16 +304,18 @@ impl Executor for LocalExecutor {
             .envs(std::env::vars()) // inherit PATH etc. for a usable dev shell
             .envs(spec.env.iter().map(|(k, v)| (k.clone(), v.clone())));
         if !spec.resolved_secrets.is_empty() {
+            // The same rule the launch decorator applies: an `env: true`
+            // secret must be text.
+            if let Some(name) = spec.resolved_secrets.first_non_text_env(&spec.secrets) {
+                let _ = std::fs::remove_dir_all(&secrets_dir);
+                return Err(ExecError::Refused(format!(
+                    "secret `{name}` is not UTF-8 text, so it cannot be an environment variable"
+                )));
+            }
             cmd.env("SCARAB_SECRETS", &secrets_dir);
             for (key, value) in spec.resolved_secrets.iter() {
                 if spec.secrets.iter().any(|s| s.env && &s.name == key) {
-                    let Ok(value) = std::str::from_utf8(value) else {
-                        let _ = std::fs::remove_dir_all(&secrets_dir);
-                        return Err(ExecError::Refused(format!(
-                            "secret `{key}` is not UTF-8 text, so it cannot be an environment variable"
-                        )));
-                    };
-                    cmd.env(key, value);
+                    cmd.env(key, String::from_utf8_lossy(value).as_ref());
                 }
             }
         }

@@ -3413,8 +3413,12 @@ export interface components {
         };
         /** @description What a confirmed merge did. */
         IdentityMergedDto: {
-            /** @description The Principal folded into the caller. */
-            merged: string;
+            /**
+             * @description The Principal folded into the caller; `null` when the sign-in was
+             *     attached without a merge (its Principal let go of it since the link
+             *     started) or already was the caller's.
+             */
+            merged?: string | null;
             /** @description How many of its passkeys the merge deleted. */
             removed_passkeys: number;
         };

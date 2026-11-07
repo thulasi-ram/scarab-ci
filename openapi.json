@@ -10426,13 +10426,15 @@
         "type": "object",
         "description": "What a confirmed merge did.",
         "required": [
-          "merged",
           "removed_passkeys"
         ],
         "properties": {
           "merged": {
-            "type": "string",
-            "description": "The Principal folded into the caller."
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The Principal folded into the caller; `null` when the sign-in was\nattached without a merge (its Principal let go of it since the link\nstarted) or already was the caller's."
           },
           "removed_passkeys": {
             "type": "integer",

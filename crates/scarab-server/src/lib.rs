@@ -8444,8 +8444,10 @@ pub struct ConfirmIdentityMergeRequest {
 /// What a confirmed merge did.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct IdentityMergedDto {
-    /// The Principal folded into the caller.
-    pub merged: String,
+    /// The Principal folded into the caller; `null` when the sign-in was
+    /// attached without a merge (its Principal let go of it since the link
+    /// started) or already was the caller's.
+    pub merged: Option<String>,
     /// How many of its passkeys the merge deleted.
     pub removed_passkeys: usize,
 }
@@ -8524,17 +8526,22 @@ async fn confirm_identity_merge(
             )
             .await;
             Ok(Json(IdentityMergedDto {
-                merged: from,
+                merged: Some(from),
                 removed_passkeys: removed_passkeys.len(),
             }))
         }
+        // The folded Principal let go of the sign-in since the callback: the
+        // link attached it (committed), or it already was the caller's.
+        // Either way the sign-in is the caller's now (git-bug 1a81c63).
+        Ok(
+            scarab_identity::LinkOutcome::Attached | scarab_identity::LinkOutcome::AlreadyLinked,
+        ) => Ok(Json(IdentityMergedDto {
+            merged: None,
+            removed_passkeys: 0,
+        })),
         Ok(scarab_identity::LinkOutcome::NeedsFoldedPasskey { from }) => Err(ApiError::Conflict(
             format!("that passkey no longer belongs to `{from}`; start the link again"),
         )),
-        Ok(_) => Err(ApiError::Conflict(format!(
-            "the {} sign-in is no longer `{}`'s only one; start the link again",
-            pending.identity.provider, pending.from
-        ))),
         Err(scarab_identity::IdentityError::Conflict(why)) => Err(ApiError::Conflict(why)),
         Err(e) => Err(ApiError::BadRequest(e.to_string())),
     }
@@ -11011,6 +11018,28 @@ async fn put_secret(
     // 52964b4): no secret under a name with no Environment, which also
     // keeps a write out of a Duplicate's target until the Duplicate has
     // created it. Deleting the Environment is refused while it holds any.
+    // The check and the write hold the Environment name's claim, which a
+    // delete takes too, so the two cannot interleave (git-bug 1a81c63).
+    let _claim = match (&scope, st.environment_governance.as_deref()) {
+        (
+            scarab_secrets::SecretScope::EnvironmentProject {
+                org, environment, ..
+            },
+            Some(governance),
+        ) => Some(
+            governance
+                .claim_environment_name(org, environment)
+                .await
+                .map_err(org_environments::org_environment_api_error)?
+                .ok_or_else(|| {
+                    ApiError::Conflict(format!(
+                        "environment `{environment}` is being changed (created, duplicated or \
+                         deleted); try again"
+                    ))
+                })?,
+        ),
+        _ => None,
+    };
     if let (
         scarab_secrets::SecretScope::EnvironmentProject {
             org, environment, ..

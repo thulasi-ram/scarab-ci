@@ -589,18 +589,14 @@ impl SecretInjectingExecutor {
     async fn mint_oidc_token(
         &self,
         step: &StepRun,
+        ctx: Option<&scarab_engine::DeployContext>,
         admission: StepAdmission,
         now_ms: i64,
     ) -> Result<Option<String>, ExecError> {
         let Some((issuer, audience)) = &self.oidc else {
             return Ok(None);
         };
-        let Some(ctx) = self
-            .db
-            .run_deploy_context(&step.run)
-            .await
-            .map_err(|e| ExecError::Other(e.to_string()))?
-        else {
+        let Some(ctx) = ctx else {
             return Ok(None);
         };
         // The fork-PR downgrade (ADR-0015): a locked-out run's subject says
@@ -670,7 +666,16 @@ impl Executor for SecretInjectingExecutor {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        let oidc_token = self.mint_oidc_token(step, admission, now_ms).await?;
+        // The Run's deploy context, read once for the token, the cache scope
+        // and the secrets below.
+        let ctx = self
+            .db
+            .run_deploy_context(&step.run)
+            .await
+            .map_err(|e| ExecError::Other(e.to_string()))?;
+        let oidc_token = self
+            .mint_oidc_token(step, ctx.as_ref(), admission, now_ms)
+            .await?;
         let mut base = None;
         if let Some(token) = oidc_token {
             base = Some(StepSpec {
@@ -684,12 +689,7 @@ impl Executor for SecretInjectingExecutor {
         // admitting it. Any other Step keeps its ref's scope. The scheduler
         // resolved both; the Environment's is dropped unless it applies.
         if spec.cache.as_ref().is_some_and(|c| c.approved.is_some()) {
-            let governed = self
-                .db
-                .run_deploy_context(&step.run)
-                .await
-                .map_err(|e| ExecError::Other(e.to_string()))?
-                .is_some_and(|ctx| !ctx.locked_out);
+            let governed = ctx.as_ref().is_some_and(|ctx| !ctx.locked_out);
             let s = base.get_or_insert_with(|| spec.clone());
             if let Some(cache) = s.cache.as_mut() {
                 if governed && !admission.before_approval {
@@ -706,11 +706,6 @@ impl Executor for SecretInjectingExecutor {
         }
         // Env-scoped secrets resolve against the run's deploy context. A run
         // without one (ordinary CI) has no scope here, so it gets none.
-        let ctx = self
-            .db
-            .run_deploy_context(&step.run)
-            .await
-            .map_err(|e| ExecError::Other(e.to_string()))?;
         let Some(ctx) = ctx else {
             return self.inner.launch(step, spec).await;
         };
