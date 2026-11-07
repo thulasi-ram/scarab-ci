@@ -238,7 +238,9 @@ impl Stack {
             .unwrap();
         (
             status,
-            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+            // A plain-text error (a 409's reason) is kept as a string.
+            serde_json::from_slice(&bytes)
+                .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into())),
         )
     }
 
@@ -908,6 +910,13 @@ async fn a_run_from_before_the_mark_counts_its_manual_gate_as_an_approval_gate()
 
 /// 220917f: two approvals racing on a gate that needs both. Both are recorded,
 /// and the gate is released once.
+///
+/// The stack's requests are all `anonymous` (ME), so carol's approval is
+/// recorded through the engine and her side then sends ME's approval again
+/// to have the handler judge the gate. Whichever request comes second may
+/// arrive after the first released the gate: that duplicate gets the
+/// documented 409 ("not awaiting approval"), and the gate is not released
+/// twice.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_racing_approvals_are_both_recorded_and_release_once() {
     let s = Arc::new(Stack::new(rules(&[ME, "carol"])).await);
@@ -933,9 +942,21 @@ async fn two_racing_approvals_are_both_recorded_and_release_once() {
         let (s, run) = (s.clone(), run.clone());
         tokio::spawn(async move { s.approve(&run, "approve").await })
     };
-    let (carol, me) = (carol.await.unwrap(), me.await.unwrap());
-    assert_eq!(carol.0, StatusCode::ACCEPTED, "{}", carol.1);
-    assert_eq!(me.0, StatusCode::ACCEPTED, "{}", me.1);
+    let answers = [carol.await.unwrap(), me.await.unwrap()];
+    for (status, body) in &answers {
+        assert!(
+            *status == StatusCode::ACCEPTED
+                || (*status == StatusCode::CONFLICT
+                    && body.to_string().contains("not awaiting approval")),
+            "{status} {body}"
+        );
+    }
+    assert!(
+        answers
+            .iter()
+            .any(|(status, _)| *status == StatusCode::ACCEPTED),
+        "{answers:?}"
+    );
 
     let approvals =
         scarab_engine::gate_approvers(&s.db.events(&run).await.unwrap(), &StepId("approve".into()));
