@@ -373,3 +373,109 @@ async fn unwired_store_is_404() {
         assert_eq!(status, StatusCode::NOT_FOUND, "{method} {uri}");
     }
 }
+
+/// A request with extra headers; the status and the `ETag` it answers.
+async fn call_with(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    headers: &[(&str, &str)],
+    body: Option<Value>,
+) -> (StatusCode, Option<String>) {
+    let mut req = Request::builder().method(method).uri(uri);
+    for (k, v) in headers {
+        req = req.header(*k, *v);
+    }
+    let req = match body {
+        Some(b) => req
+            .header("content-type", "application/json")
+            .body(Body::from(b.to_string())),
+        None => req.body(Body::empty()),
+    }
+    .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let etag = resp
+        .headers()
+        .get("etag")
+        .map(|v| v.to_str().unwrap().to_string());
+    (resp.status(), etag)
+}
+
+/// git-bug 66cce00: the full-replace PUT takes `If-None-Match: *` (create
+/// only) and `If-Match` (replace only what was read), so an admin working
+/// from a stale page cannot overwrite another admin's edit. A refused
+/// precondition is 412. Without either header the PUT creates or replaces,
+/// as before.
+#[tokio::test]
+async fn the_put_honours_if_match_and_if_none_match() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let pg = Arc::new(PostgresDb::with_pool(tdb.pool.clone()));
+    pg.migrate().await.unwrap();
+    let app = open_app(pg, Arc::new(FakeClock::new(CLOCK_START_MS)));
+    let uri = "/v1/orgs/acme/environments/prod";
+    let body = |d: &str| Some(json!({ "description": d }));
+
+    let (st, created) = call_with(&app, "PUT", uri, &[("if-none-match", "*")], body("v1")).await;
+    assert_eq!(st, StatusCode::OK);
+    let created = created.expect("an ETag");
+    let (st, _) = call_with(&app, "PUT", uri, &[("if-none-match", "*")], body("again")).await;
+    assert_eq!(st, StatusCode::PRECONDITION_FAILED, "create only");
+
+    let (st, read) = call_with(&app, "GET", uri, &[], None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(read.as_deref(), Some(created.as_str()));
+    let (st, edited) = call_with(&app, "PUT", uri, &[("if-match", &created)], body("v2")).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_ne!(edited.as_deref(), Some(created.as_str()));
+    // A second admin still holding the first tag.
+    let (st, _) = call_with(&app, "PUT", uri, &[("if-match", &created)], body("stale")).await;
+    assert_eq!(st, StatusCode::PRECONDITION_FAILED);
+    let (_, got) = call(&app, "GET", uri, None, None).await;
+    assert_eq!(got["description"], "v2");
+
+    let (st, _) = call_with(
+        &app,
+        "PUT",
+        uri,
+        &[("if-match", &created), ("if-none-match", "*")],
+        body("both"),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = call_with(&app, "PUT", uri, &[], body("v3")).await;
+    assert_eq!(st, StatusCode::OK, "no precondition: replace as before");
+
+    // RFC 9110 If-Match: `*` holds for any stored Environment, a list holds
+    // when one of its tags is the stored one, and a weak tag never matches.
+    let (st, current) = call_with(&app, "PUT", uri, &[("if-match", "*")], body("v4")).await;
+    assert_eq!(st, StatusCode::OK, "`*`: the Environment exists");
+    let current = current.expect("an ETag");
+    let list = format!("{created}, {current}");
+    let (st, _) = call_with(&app, "PUT", uri, &[("if-match", &list)], body("v5")).await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "one of the listed tags is the stored one"
+    );
+    let (_, current) = call_with(&app, "GET", uri, &[], None).await;
+    let weak = format!("W/{}", current.expect("an ETag"));
+    let (st, _) = call_with(&app, "PUT", uri, &[("if-match", &weak)], body("weak")).await;
+    assert_eq!(
+        st,
+        StatusCode::PRECONDITION_FAILED,
+        "a weak tag never matches"
+    );
+    let (st, _) = call_with(
+        &app,
+        "PUT",
+        "/v1/orgs/acme/environments/none-yet",
+        &[("if-match", "*")],
+        body("x"),
+    )
+    .await;
+    assert_eq!(st, StatusCode::PRECONDITION_FAILED, "`*`: nothing stored");
+    tdb.cleanup().await;
+}

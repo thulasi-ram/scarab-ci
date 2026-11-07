@@ -856,10 +856,7 @@ async fn two_replicas_cannot_leave_a_settled_runs_check_pending(w: World) {
     );
     w.finish().await;
 }
-both!(
-    two_replicas_cannot_leave_a_settled_runs_check_pending,
-    ignore = "redteam: BROKE F9 — status_post_superseded is check-then-act across replicas"
-);
+both!(two_replicas_cannot_leave_a_settled_runs_check_pending);
 
 // ---------------------------------------------------------------------------
 // F10 — R2-E5's own shape on one replica, plus a cancel: the Running post

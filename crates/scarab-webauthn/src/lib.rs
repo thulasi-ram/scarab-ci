@@ -526,13 +526,16 @@ pub struct StoredCredential {
 }
 
 /// A passed assertion. The caller persists `new_count` with a
-/// compare-and-swap (ADR-0073: `… WHERE sign_count < $new OR ($new = 0 AND
-/// sign_count = 0)`), because this check alone cannot see a racing
-/// assertion.
+/// compare-and-swap against the count it verified with, because this check
+/// alone cannot see a racing assertion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AssertionOk {
     pub new_count: u32,
     pub backup_state: bool,
+    /// The counter did not move forward, on a backup-eligible (synced)
+    /// credential. Synced passkeys share one key across devices and
+    /// commonly report 0, so this is recorded and not taken as a clone.
+    pub counter_regressed: bool,
 }
 
 /// Decode a base64url (no padding, canonical) field, refusing its text when
@@ -826,15 +829,20 @@ pub fn verify_assertion(
     // §7.2 step 21: signature counter. Only after the signature verified,
     // so a forged response cannot get a credential flagged as cloned.
     // Both zero = an authenticator without a counter (common for synced
-    // passkeys): accepted. Otherwise the counter must strictly increase.
+    // passkeys): accepted. Otherwise the counter must strictly increase,
+    // except on a backup-eligible credential: a synced passkey's devices do
+    // not share a counter (and most report 0), so a counter that did not
+    // move is reported to the caller, never refused (git-bug 7c6338f).
     let both_zero = ad.sign_count == 0 && stored.sign_count == 0;
-    if !both_zero && ad.sign_count <= stored.sign_count {
+    let counter_regressed = !both_zero && ad.sign_count <= stored.sign_count;
+    if counter_regressed && !stored.backup_eligible {
         return Err(WebauthnError::CloneSuspected);
     }
 
     Ok(AssertionOk {
         new_count: ad.sign_count,
         backup_state: ad.has(flag::BS),
+        counter_regressed,
     })
 }
 

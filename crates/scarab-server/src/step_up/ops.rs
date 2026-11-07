@@ -13,7 +13,8 @@
 //! - **Exempt** — tightening: never a step-up.
 //! - **NotGoverned** — not on ADR-0073 §3's list, with the reason.
 //!
-//! Every GET is [`READ`].
+//! Every GET is [`READ`], except the debug shell ([`STEP_ATTACH`],
+//! [`STEP_DEBUG_POD`]): a WebSocket upgrade that opens a shell in a step Pod.
 
 use scarab_identity::Role;
 use serde::Serialize;
@@ -666,16 +667,6 @@ pub static SNAPSHOTS_PIN: Op = op(
     &[],
     &["path:id"],
 );
-pub static SNAPSHOTS_UNPIN: Op = op(
-    "run.snapshots_unpin",
-    "Unpin a run's snapshots",
-    Class::NotGoverned("returns to the declared retention, never below it"),
-    "§3 shortening retention (AMBIG: not below declared)",
-    MEMBER,
-    OrgOf::Run,
-    &[],
-    &["path:id"],
-);
 pub static GATE_RELEASE: Op = op(
     "gate.release_external",
     "Release an external or plugin gate",
@@ -1073,6 +1064,46 @@ pub static CONNECTION_UNBIND_REPO: Op = op(
     &[],
     &["path:id", "path:owner", "path:name"],
 );
+// The debug shell (git-bug 606102b): a WebSocket GET, governed like a write.
+// A shell into a step Pod reads its environment and acts with its
+// credentials. A WebSocket upgrade cannot be held and replayed, so no
+// machine caller can raise a request for it: browser sessions only.
+pub static STEP_ATTACH: Op = op(
+    "step.attach",
+    "Open a shell in a running step's Pod",
+    Class::CrownJewel(W),
+    "§3 a shell into a step Pod (git-bug 606102b)",
+    ADMIN,
+    OrgOf::Run,
+    &[],
+    &["path:id", "path:step"],
+)
+.browser_only();
+pub static STEP_DEBUG_POD: Op = op(
+    "step.debug_pod",
+    "Open a shell in a fresh Pod of a step",
+    Class::CrownJewel(W),
+    "§3 a shell into a step Pod (git-bug 606102b)",
+    ADMIN,
+    OrgOf::Run,
+    &[],
+    &["path:id", "path:step"],
+)
+.browser_only();
+
+// Deleting a snapshot pin shortens how long a Run's snapshots are kept: a
+// loosening, so a step-up (git-bug 9bbaa1d). Pinning extends it and is not
+// governed.
+pub static SNAPSHOTS_UNPIN: Op = op(
+    "run.snapshots_unpin",
+    "Unpin a run's snapshots",
+    Class::CrownJewel(W),
+    "§3 shortening retention (git-bug 9bbaa1d)",
+    MEMBER,
+    OrgOf::Run,
+    &[],
+    &["path:id"],
+);
 
 // --- crown jewels, always ask ------------------------------------------------
 
@@ -1120,6 +1151,21 @@ pub static PLUGIN_CONNECTION_PUT: Op = op(
     &["/credential"],
     &["path:org", "path:name", "path:slot"],
 );
+// A link whose merge moves the folded Principal's passkeys to the caller
+// (git-bug def16bd): a window would let a stolen session add the thief's
+// passkey to the victim's account, so it always asks. The plain
+// `identity.link` flow refuses such a merge at the callback.
+pub static IDENTITY_LINK_MOVING_PASSKEYS: Op = op(
+    "identity.link_moving_passkeys",
+    "Link a login identity and take its Principal's passkeys",
+    Class::CrownJewel(A),
+    "§3 identity links; §2 adding a passkey",
+    ANYONE,
+    OrgOf::None,
+    &[],
+    &["body:/provider"],
+)
+.browser_only();
 pub static PASSKEY_REMOVE: Op = op(
     "passkey.remove",
     "Remove a passkey",
@@ -1518,7 +1564,14 @@ mod tests {
         browser_only.dedup();
         assert_eq!(
             browser_only,
-            vec!["identity.link", "identity.unlink", "passkey.add"]
+            vec![
+                "identity.link",
+                "identity.link_moving_passkeys",
+                "identity.unlink",
+                "passkey.add",
+                "step.attach",
+                "step.debug_pod"
+            ]
         );
         not_by_token.sort_unstable();
         assert_eq!(

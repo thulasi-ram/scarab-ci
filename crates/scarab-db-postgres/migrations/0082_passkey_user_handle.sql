@@ -1,0 +1,15 @@
+-- A passkey moved to another Principal by a merge (git-bug def16bd).
+--
+-- `passkeys.user_handle`: the WebAuthn user handle the credential was created
+-- under, when that is not its Principal's own. A merge (ADR-0069 §6) moves
+-- the folded Principal's passkeys to the survivor; the authenticator still
+-- returns the old Principal's handle, so the passkey carries it. NULL (every
+-- passkey enrolled by its own Principal): the Principal's handle.
+--
+-- Expand step (ADR-0003): one nullable column. A server built before this
+-- migration refuses to boot against a database that has it (sqlx reports
+-- migration 82 as unknown); to roll back, delete row 82 from
+-- `_sqlx_migrations`. The column is harmless to the old code, but a passkey
+-- moved by a merge is then refused (user handle mismatch) until its old
+-- Principal's passkeys are reset.
+ALTER TABLE passkeys ADD COLUMN user_handle BYTEA;

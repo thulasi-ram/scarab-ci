@@ -34,7 +34,7 @@ pub use scheduler::{
     retry_step, retry_step_widened, run_status_post_key, unpin_run_snapshots, wait_began_at,
     AttemptTeardown, EnvironmentApproval, ExpiredInput, PlanReason, PlannedStep, PluginGateError,
     PluginGateVerdict, RerunError, RerunPlan, Scheduler, SchedulerError, Supervision,
-    TeardownAttempt, TickHealth, CANCEL_ATTEMPT, CANCEL_RUN, LAUNCH_STEP, MAX_DELIVERY_ATTEMPTS,
+    TeardownAttempt, TickHealth, CANCEL_ATTEMPT, CANCEL_RUN, GATE_NO_LONGER_NEEDED, LAUNCH_STEP, MAX_DELIVERY_ATTEMPTS,
     RUN_FINISHED, RUN_STATUS_CHANGED, SUPERSEDE_TEARDOWN,
 };
 

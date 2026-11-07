@@ -5,6 +5,7 @@
 //! 1. A mutating request on a (method, path) the table does not know is
 //!    refused 500 — fail-closed at runtime, whatever the tests missed.
 //! 2. Reads, ceremonies, tightenings and ungoverned routes pass untouched.
+//!    A GET registered as a crown jewel (the debug shell) is not a read.
 //! 3. With step-up off (dev-insecure, hand-built test states) everything
 //!    passes; a conditional route still gets a [`GuardCtx`] that answers
 //!    "off".
@@ -53,16 +54,34 @@ pub(crate) async fn guard(State(st): State<AppState>, req: Request, next: Next) 
 #[doc(hidden)]
 pub async fn guard_with(table: &[RouteEntry], st: AppState, req: Request, next: Next) -> Response {
     let method = req.method().clone();
-    if matches!(method, Method::GET | Method::HEAD | Method::OPTIONS) {
-        return next.run(req).await;
-    }
     let matched = req
         .extensions()
         .get::<MatchedPath>()
         .map(|m| m.as_str().to_owned());
+    if matches!(method, Method::GET | Method::HEAD | Method::OPTIONS) {
+        // A read passes, except a GET registered as a crown jewel (the debug
+        // shell's WebSocket upgrade, git-bug 606102b). HEAD is served by the
+        // GET route, so it is governed the same way.
+        let governed = method != Method::OPTIONS
+            && matched.as_deref().is_some_and(|m| {
+                table.iter().any(|e| {
+                    e.method == Method::GET
+                        && e.path == m
+                        && matches!(e.op.class, Class::CrownJewel(_))
+                })
+            });
+        if !governed {
+            return next.run(req).await;
+        }
+    }
+    let lookup = if method == Method::HEAD {
+        Method::GET
+    } else {
+        method.clone()
+    };
     let entry = matched
         .as_deref()
-        .and_then(|m| table.iter().find(|e| e.method == method && e.path == m));
+        .and_then(|m| table.iter().find(|e| e.method == lookup && e.path == m));
     let Some(entry) = entry else {
         tracing::error!(
             method = %method,

@@ -504,6 +504,158 @@ async fn gate_with_a_dead_dependency_is_skipped_so_the_run_settles() {
     );
 }
 
+/// `build` → `approve` (manual gate) → `deploy`, and `build` → `test` →
+/// `deploy`. With `leaf`, `approve` has no dependent: `deploy` needs `test`
+/// alone.
+async fn seed_gate_beside_a_sibling(db: &InMemoryDb, leaf: bool) {
+    let at = Timestamp(1_000);
+    let id = |s: &str| StepId(s.into());
+    db.create_run(&run_id(), 1, 1, at).await.unwrap();
+    db.create_step_run(&run_id(), &id("build"), Some(&spec()), &[], at)
+        .await
+        .unwrap();
+    db.create_step_run(&run_id(), &id("approve"), None, &[id("build")], at)
+        .await
+        .unwrap();
+    db.set_step_gate(&run_id(), &id("approve"), "manual", None)
+        .await
+        .unwrap();
+    db.create_step_run(&run_id(), &id("test"), Some(&spec()), &[id("build")], at)
+        .await
+        .unwrap();
+    let deploy_needs = if leaf {
+        vec![id("test")]
+    } else {
+        vec![id("approve"), id("test")]
+    };
+    db.create_step_run(&run_id(), &id("deploy"), Some(&spec()), &deploy_needs, at)
+        .await
+        .unwrap();
+    db.store_run_ir(
+        &run_id(),
+        &serde_json::json!({ "ir_version": 1, "steps": [
+            { "id": "build", "image": "img" },
+            { "id": "approve", "gate": "manual", "needs": ["build"] },
+            { "id": "test", "image": "img", "needs": ["build"] },
+            { "id": "deploy", "image": "img", "needs": deploy_needs },
+        ]}),
+    )
+    .await
+    .unwrap();
+}
+
+fn step_of<'a>(steps: &'a [scarab_engine::StepRun], id: &str) -> &'a scarab_engine::StepRun {
+    steps.iter().find(|s| s.step.0 == id).unwrap()
+}
+
+/// git-bug 2c37802: `test` fails while `approve` waits, so `deploy` is
+/// Skipped and no verdict on `approve` can change the Run. The gate ends
+/// Skipped ("no longer needed") and the Run settles Failed at once, instead
+/// of staying Suspended until someone acts or the gate expires.
+#[tokio::test]
+async fn a_waiting_gate_whose_dependents_all_finished_is_skipped_so_the_run_settles() {
+    let (db, clock, exec) = (
+        InMemoryDb::new(),
+        FakeClock::new(1_000),
+        FakeExecutor::new(),
+    );
+    seed_gate_beside_a_sibling(&db, false).await;
+    exec.script_outcome(ExecState::Succeeded); // build
+    exec.script_outcome(failed(FailureClass::Step)); // test
+    for _ in 0..6 {
+        tick(&db, &clock, &exec).await;
+    }
+
+    let steps = db.steps_of_run(&run_id()).await.unwrap();
+    assert_eq!(step_of(&steps, "test").status, StepStatus::Failed);
+    assert_eq!(step_of(&steps, "deploy").status, StepStatus::Skipped);
+    let gate = step_of(&steps, "approve");
+    assert_eq!(gate.status, StepStatus::Skipped, "{steps:?}");
+    assert_eq!(
+        gate.attempts.last().map(|a| a.outcome),
+        Some(AttemptOutcome::Cancelled),
+        "the gate's wait is closed, not left running: {:?}",
+        gate.attempts
+    );
+    assert!(events(&db).await.iter().any(|e| matches!(e,
+        EventPayload::StepSkipped { step, reason }
+            if step.0 == "approve" && reason == scarab_engine::GATE_NO_LONGER_NEEDED)));
+    assert_eq!(
+        db.run_status(&run_id()).await.unwrap(),
+        Some(RunStatus::Failed),
+        "the Run settles on its verdict instead of waiting on a gate that cannot change it"
+    );
+}
+
+/// A gate with no dependents keeps waiting after a sibling fails: its
+/// verdict is the Run's outcome.
+#[tokio::test]
+async fn a_leaf_gate_keeps_waiting_after_a_sibling_fails() {
+    let (db, clock, exec) = (
+        InMemoryDb::new(),
+        FakeClock::new(1_000),
+        FakeExecutor::new(),
+    );
+    seed_gate_beside_a_sibling(&db, true).await;
+    exec.script_outcome(ExecState::Succeeded); // build
+    exec.script_outcome(failed(FailureClass::Step)); // test
+    for _ in 0..6 {
+        tick(&db, &clock, &exec).await;
+    }
+    let steps = db.steps_of_run(&run_id()).await.unwrap();
+    assert_eq!(step_of(&steps, "deploy").status, StepStatus::Skipped);
+    assert_eq!(step_of(&steps, "approve").status, StepStatus::Pending);
+    assert_eq!(
+        db.run_status(&run_id()).await.unwrap(),
+        Some(RunStatus::Suspended)
+    );
+}
+
+/// A rerun of the failed sibling re-arms `deploy`; the gate skipped as no
+/// longer needed goes back to waiting, so `deploy` waits on it again rather
+/// than being skipped for a gate nobody refused.
+#[tokio::test]
+async fn a_rerun_of_the_failed_sibling_reopens_the_skipped_gate() {
+    let (db, clock, exec) = (
+        InMemoryDb::new(),
+        FakeClock::new(1_000),
+        FakeExecutor::new(),
+    );
+    seed_gate_beside_a_sibling(&db, false).await;
+    exec.script_outcome(ExecState::Succeeded); // build
+    exec.script_outcome(failed(FailureClass::Step)); // test
+    for _ in 0..6 {
+        tick(&db, &clock, &exec).await;
+    }
+    assert_eq!(
+        db.run_status(&run_id()).await.unwrap(),
+        Some(RunStatus::Failed)
+    );
+
+    rerun_step(&db, &clock, &run_id(), &StepId("test".into()), None)
+        .await
+        .unwrap();
+    exec.script_outcome(ExecState::Succeeded); // test, again
+    for _ in 0..6 {
+        tick(&db, &clock, &exec).await;
+    }
+    let steps = db.steps_of_run(&run_id()).await.unwrap();
+    assert_eq!(step_of(&steps, "test").status, StepStatus::Succeeded);
+    assert_eq!(step_of(&steps, "deploy").status, StepStatus::Pending);
+    let gate = step_of(&steps, "approve");
+    assert_eq!(gate.status, StepStatus::Pending, "{steps:?}");
+    assert_eq!(
+        gate.attempts.last().map(|a| a.outcome),
+        Some(AttemptOutcome::Running),
+        "a new wait is open: {:?}",
+        gate.attempts
+    );
+    assert_eq!(
+        db.run_status(&run_id()).await.unwrap(),
+        Some(RunStatus::Suspended)
+    );
+}
+
 /// Regression (ADR-0056): the active-time budget is per-Take. A run that
 /// exhausts its budget in one Take gets a FRESH ceiling on Rerun — prior-Take
 /// active time does not carry over — while the ceiling still applies within the

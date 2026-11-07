@@ -40,6 +40,12 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
     ("GET", "/v1/me", "read", "READ"),
     ("POST", "/v1/me/identities/link", "identity.link", "CJ-W"),
     (
+        "POST",
+        "/v1/me/identities/link-moving-passkeys",
+        "identity.link_moving_passkeys",
+        "CJ-A",
+    ),
+    (
         "DELETE",
         "/v1/me/identities/{provider}",
         "identity.unlink",
@@ -148,7 +154,7 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
         "DELETE",
         "/v1/runs/{id}/snapshots-pin",
         "run.snapshots_unpin",
-        "NG",
+        "CJ-W",
     ),
     ("POST", "/v1/runs/{id}/cancel", "run.cancel", "EX"),
     ("GET", "/v1/runs/{id}/artifacts", "read", "READ"),
@@ -161,12 +167,17 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
         "read",
         "READ",
     ),
-    ("GET", "/v1/runs/{id}/steps/{step}/attach", "read", "READ"),
+    (
+        "GET",
+        "/v1/runs/{id}/steps/{step}/attach",
+        "step.attach",
+        "CJ-W",
+    ),
     (
         "GET",
         "/v1/runs/{id}/steps/{step}/debug-pod",
-        "read",
-        "READ",
+        "step.debug_pod",
+        "CJ-W",
     ),
     (
         "GET",
@@ -597,10 +608,15 @@ fn the_route_table_is_exactly_the_reviewed_classification() {
         a.len(),
         "a (method, path) is registered twice"
     );
-    // Every mutating route names a non-READ op; every GET is READ.
+    // Every mutating route names a non-READ op; every GET is READ but the
+    // debug shell's WebSocket upgrades (git-bug 606102b).
+    const GOVERNED_GETS: [&str; 2] = [
+        "/v1/runs/{id}/steps/{step}/attach",
+        "/v1/runs/{id}/steps/{step}/debug-pod",
+    ];
     for r in route_table() {
         assert_eq!(
-            r.method == axum::http::Method::GET,
+            r.method == axum::http::Method::GET && !GOVERNED_GETS.contains(&r.path),
             matches!(r.op.class, Class::Read),
             "{} {} is {:?}",
             r.method,
@@ -801,6 +817,62 @@ async fn every_crown_jewel_needs_a_step_up_even_for_an_owner() {
     assert!(refused.iter().all(|e| e.caller == "session:cookie"));
 }
 
+/// git-bug 606102b: the debug shell is a GET (a WebSocket upgrade) but a
+/// crown jewel: a shell into a step Pod reads its environment and acts with
+/// its credentials. An Owner is asked for a window step-up, for GET and for
+/// HEAD (which the GET route serves); with a live window the guard lets the
+/// request through to the handler.
+#[tokio::test]
+async fn the_debug_shell_needs_a_step_up() {
+    let h = harness();
+    h.grant("amy", Scope::Org("acme".into()), Role::Owner).await;
+    let s = h.browser_session(owner("amy")).await;
+    let mut soft = passkey();
+    h.enroll(&s, &mut soft, "Laptop").await;
+    let shells = [
+        ("/v1/runs/r1/steps/build/attach", "step.attach"),
+        ("/v1/runs/r1/steps/build/debug-pod", "step.debug_pod"),
+    ];
+    for (uri, op) in shells {
+        for method in ["GET", "HEAD"] {
+            let (st, b) = h.send(cookie_req(method, uri, None, &s)).await;
+            if method == "GET" {
+                assert_step_up(st, &b, "window");
+                assert_eq!(b["op"], op, "{b}");
+            } else {
+                // A HEAD response has no body to read the code from.
+                assert_eq!(st, StatusCode::FORBIDDEN, "{method} {uri}");
+            }
+        }
+    }
+    h.open_window(&s, &mut soft).await;
+    for (uri, _) in shells {
+        let (st, b) = h.cookie("GET", uri, None, &s).await;
+        assert!(!is_step_up(st, &b), "a live window satisfies it: {st} {b}");
+    }
+}
+
+/// git-bug 9bbaa1d: deleting a Run's snapshot pin shortens how long its
+/// snapshots are kept, a loosening, so it needs a step-up; pinning them
+/// does not.
+#[tokio::test]
+async fn unpinning_snapshots_needs_a_step_up_and_pinning_does_not() {
+    let h = harness();
+    h.grant("amy", Scope::Org("acme".into()), Role::Owner).await;
+    let s = h.browser_session(owner("amy")).await;
+    let mut soft = passkey();
+    h.enroll(&s, &mut soft, "Laptop").await;
+    let uri = "/v1/runs/r1/snapshots-pin";
+    let (st, b) = h.cookie("DELETE", uri, None, &s).await;
+    assert_step_up(st, &b, "window");
+    assert_eq!(b["op"], "run.snapshots_unpin");
+    let (st, b) = h.cookie("POST", uri, None, &s).await;
+    assert!(!is_step_up(st, &b), "pinning is not governed: {st} {b}");
+    h.open_window(&s, &mut soft).await;
+    let (st, b) = h.cookie("DELETE", uri, None, &s).await;
+    assert!(!is_step_up(st, &b), "a live window satisfies it: {st} {b}");
+}
+
 /// `connection.resync` binds every reported repo through the same path as
 /// `connection.bind_repo`, so it needs the same window step-up: under
 /// enforcement an Owner without one is refused, exactly like bind_repo.
@@ -921,6 +993,7 @@ fn well_formed(r: &scarab_server::RouteEntry) -> (String, Option<Value>) {
             Some(json!({"source": "github.com/acme/libs//push.yaml"}))
         }
         ("DELETE", _)
+        | ("GET", _)
         | ("POST", "/v1/connections/{id}/resync")
         | ("POST", "/v1/orgs/{org}/plugins/{name}/enable")
         | ("POST", "/v1/orgs/{org}/members/{subject}/passkeys/reset") => None,
@@ -960,6 +1033,18 @@ async fn min_role_is_exactly_the_lowest_role_the_handler_accepts() {
         h.grant(&under, Scope::Org("acme".into()), below).await;
         let s = h.browser_session(scoped(&under)).await;
         let (st, b) = h.cookie(r.method.as_str(), &uri, body, &s).await;
+        if r.method == axum::http::Method::GET {
+            // The debug shell: its handler's WebSocket extractor refuses a
+            // request that is not an upgrade before the handler's role
+            // check runs, so only "not asked for a step-up" is visible here.
+            assert!(
+                !is_step_up(st, &b),
+                "{} {} at {below:?}: {b}",
+                r.method,
+                r.path
+            );
+            continue;
+        }
         assert_eq!(
             (st, b.clone()),
             (
@@ -996,7 +1081,7 @@ async fn exempt_and_ungoverned_routes_never_ask_for_a_step_up() {
         );
         checked += 1;
     }
-    assert_eq!(checked, 36, "the EX + NG mutating routes");
+    assert_eq!(checked, 35, "the EX + NG mutating routes");
     assert!(h.events_of("step_up.refused").is_empty());
 }
 

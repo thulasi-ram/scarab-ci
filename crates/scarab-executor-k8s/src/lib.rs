@@ -6073,7 +6073,11 @@ fn terminal_waiting_class(pod: &Pod) -> Option<(FailureClass, String)> {
             continue;
         };
         if WAITING_CONFIG.contains(&reason) {
-            return Some((FailureClass::Config, render_cause(reason, w.message.as_deref())));
+            let cause = render_cause(reason, w.message.as_deref());
+            return Some((
+                FailureClass::Config,
+                with_config_hint(cause, w.message.as_deref()),
+            ));
         }
         if WAITING_IMAGE_PULL.contains(&reason) {
             pull = Some((
@@ -6086,6 +6090,24 @@ fn terminal_waiting_class(pod: &Pod) -> Option<(FailureClass, String)> {
     }
     pull
 }
+
+/// What a step author should change, appended to a config rejection the kubelet
+/// words for an operator. A step runs `runAsNonRoot` with no user id of its own
+/// (the restricted baseline), and the image's user is never overridden: the
+/// kubelet refuses an image whose `USER` is a name, since it cannot check that
+/// the name is not root (git-bug c87bc8e).
+fn with_config_hint(cause: String, message: Option<&str>) -> String {
+    if message.is_some_and(|m| m.contains("non-numeric user")) {
+        return format!("{cause} — {NUMERIC_USER_HINT}");
+    }
+    cause
+}
+
+/// The hint for an image whose `USER` is a name.
+pub const NUMERIC_USER_HINT: &str = "steps run as non-root, and the kubelet can check only a \
+     numeric user: build the image with a numeric non-zero USER (for example `USER 65532`), \
+     use an image that has one, or set `security: { run_as_root: true }` where the Environment \
+     grants it";
 
 /// Container `waiting` reasons the kubelet can never recover from on its own.
 const WAITING_CONFIG: &[&str] = &[
@@ -10834,6 +10856,38 @@ mod tests {
                 "{reason} is a permanent config rejection, and names itself"
             );
         }
+
+        // git-bug c87bc8e: an image whose USER is a name fails under the
+        // non-root baseline. The failure keeps the kubelet's words and says
+        // what to change: a numeric user. The image's user is not overridden.
+        let named_user = "container has runAsNonRoot and image has non-numeric user \
+                          (curl_user), cannot verify user is non-root (pod: \"scarab-x\", \
+                          container: step)";
+        let ExecState::Failed { class, cause, .. } = pod_state(&waiting_with(
+            "CreateContainerConfigError",
+            Some(named_user),
+        )) else {
+            panic!("a named USER is a terminal failure");
+        };
+        assert_eq!(class, FailureClass::Config);
+        assert_eq!(
+            cause.as_deref(),
+            Some(
+                format!("CreateContainerConfigError: {named_user} — {NUMERIC_USER_HINT}").as_str()
+            )
+        );
+        assert!(NUMERIC_USER_HINT.contains("numeric"));
+        // Any other config rejection carries no such hint.
+        let ExecState::Failed { cause, .. } = pod_state(&waiting_with(
+            "CreateContainerConfigError",
+            Some("secret \"db\" not found"),
+        )) else {
+            panic!("terminal");
+        };
+        assert_eq!(
+            cause.as_deref(),
+            Some("CreateContainerConfigError: secret \"db\" not found")
+        );
 
         // Image-pull failures may be a transient registry/network blip: the main
         // process never ran, so never-started infra — safe to bounded-auto-retry.

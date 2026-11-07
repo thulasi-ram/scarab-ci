@@ -372,17 +372,26 @@ impl StepUpService {
     /// the provider the guarded POST was asked for and the flow's expiry, so
     /// it can be minted only by the guarded link POST, cannot be moved to
     /// another flow, session or provider, and dies with its step-up.
+    /// `moves_passkeys` (git-bug def16bd): the flow was started by the
+    /// always-ask `identity.link_moving_passkeys`, so its merge may move
+    /// passkeys; it adds a fifth part, `passkeys:move`, so the two bindings
+    /// differ and a window-started flow keeps the binding it had before.
     pub(crate) fn link_binding(
         &self,
         state: &str,
         session_hash: &str,
         provider: &str,
         expires_at: i64,
+        moves_passkeys: bool,
     ) -> String {
         let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&self.link_key)
             .expect("HMAC accepts any key length");
         let expires_at = expires_at.to_string();
-        for part in [state, session_hash, provider, expires_at.as_str()] {
+        let mut parts = vec![state, session_hash, provider, expires_at.as_str()];
+        if moves_passkeys {
+            parts.push("passkeys:move");
+        }
+        for part in parts {
             mac.update(&(part.len() as u32).to_be_bytes());
             mac.update(part.as_bytes());
         }
@@ -681,6 +690,10 @@ pub struct StepUpRefusal {
 const MSG_CONFIRM: &str = "This needs a step-up confirmation: confirm with your passkey.";
 const MSG_ENROLL: &str = "This needs a step-up confirmation, and you have no passkey yet: \
      enroll one first (from a browser login made in the last 5 minutes).";
+/// Every passkey of the caller is flagged as a suspected clone.
+pub(crate) const MSG_FLAGGED_RESET: &str = "This needs a step-up confirmation, and every passkey \
+     you had is flagged as possibly cloned. Ask an Owner of your Org to reset your passkeys, \
+     then enroll a new one.";
 const MSG_MACHINE: &str = "This needs a step-up confirmation by a human with a passkey. An API \
      token or a session presented as Bearer can never give one.";
 const MSG_REPLAY_MISMATCH: &str = "This is not the operation that was confirmed: a confirmed \
@@ -904,6 +917,24 @@ pub(crate) async fn require(
 
     let passkeys = svc.usable_passkeys(subject).await?;
     if passkeys.is_empty() {
+        // Flagged passkeys need an Owner reset, not a new first enrollment
+        // (git-bug 7c6338f).
+        if !svc
+            .passkeys
+            .list(subject)
+            .await
+            .map_err(store_err)?
+            .is_empty()
+        {
+            return refuse(
+                st,
+                op,
+                p,
+                refusal(MSG_FLAGGED_RESET, "enroll"),
+                "passkeys flagged",
+            )
+            .await;
+        }
         let mut r = refusal(MSG_ENROLL, "enroll");
         r.enroll_url = Some(ENROLL_URL.to_string());
         r.fresh_login_until = session.fresh_login_until.filter(|t| *t > now);
@@ -1333,6 +1364,7 @@ mod tests {
                 created_session_hash: "h".into(),
                 last_used_at: None,
                 clone_suspected_at: None,
+                user_handle: None,
             })
             .await
             .unwrap();

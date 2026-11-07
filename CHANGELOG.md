@@ -255,6 +255,30 @@ record. Read Breaking changes before you upgrade.
   repositories on the same host through submodules, and over `http://` (#53).
 - A value from outside the Pipeline holding `$(SECRET_NAME)` was filled with that secret by
   Kubernetes (#52). Plugin Deployments and probe Pods are escaped the same way.
+- **Opening a debug shell needs a step-up.** A shell into a step Pod (`…/attach`, and a
+  debug Pod, `…/debug-pod`) reads the Pod's environment and acts with its credentials, but it
+  asked only for `Administer`. It now needs a step-up confirmation, as a secret write does: a
+  browser session's 5-minute window satisfies it. An API token or a session presented as
+  `Bearer` can no longer open one, since a WebSocket cannot be held for a confirmation.
+- **Passkey counter checks.** Two uses of one passkey verified at the same time could flag it
+  as a suspected clone when the later count landed first. A use whose count was ahead of the
+  stored one when it was checked, and differs from the count stored since, is now recorded;
+  the same count twice still flags. A synced passkey (backup-eligible), whose devices do not
+  share a counter, is no longer flagged when its counter does not move; the use is recorded
+  as `passkey.counter_regressed`. Once every passkey of a user is flagged, a fresh login no
+  longer enrolls a new first passkey (a thief holding the forge account can make a fresh
+  login): an Owner must reset the user's passkeys first, and a step-up refusal says so.
+- When one sign-in identity is merged into another Principal, the merged Principal's passkeys
+  now move to the surviving one, so the person can still confirm a step-up with them. Each
+  moved passkey keeps the WebAuthn user handle it was created under (migration 0082). Such a
+  merge needs a step-up confirmation for that action, not the 5-minute window: start it with
+  `POST /v1/me/identities/link-moving-passkeys` (`identity.link_moving_passkeys`, always
+  asks). A link started with `POST /v1/me/identities/link` that would move passkeys is refused
+  at the callback and changes nothing. Each moved passkey is recorded as a
+  `passkey.moved_on_merge` security event naming both Principals.
+- **Unpinning a Run's snapshots needs a step-up.** `DELETE /v1/runs/{id}/snapshots-pin`
+  shortens how long the Run's snapshots are kept, so it now needs a step-up confirmation
+  (window). Pinning does not.
 
 ### Features
 
@@ -467,6 +491,23 @@ record. Read Breaking changes before you upgrade.
 - **The Depot did not start with named login providers.** With `scarab.oauth.providers` set,
   the chart gave the providers' client secrets to the server Deployment only, and the Depot
   StatefulSet refused to boot for want of them. Both get them now.
+- With two server replicas, a finished Run's commit status could end `pending`: one replica
+  posted the verdict while another re-posted the Run's earlier `pending`. A `pending` post is
+  now dropped whenever the Run has finished since, whatever state its verdict post is in.
+- A Run waiting on a gate whose dependents had all finished without it (a sibling Step
+  failed, so they were skipped) stayed Suspended until someone acted or the gate expired. The
+  gate now ends Skipped ("no longer needed") and the Run settles at once. A gate with no
+  dependents keeps waiting: its verdict is the Run's outcome. A rerun that makes a dependent
+  wait again puts the gate back to waiting.
+- Two admins writing one org Environment at the same time could get a 500 when Postgres
+  reported a deadlock (`40P01`) or a serialization failure (`40001`). Those are now a 409 that
+  says to retry. `PUT /v1/orgs/{org}/environments/{env}` takes `If-None-Match: *` (create
+  only) and `If-Match: <etag>` (replace only the Environment that was read), answers 412 when
+  either does not hold, and returns the Environment's `ETag`, as does its GET. Without either
+  header it creates or replaces as before.
+- A Step whose image sets `USER` to a name failed with only `CreateContainerConfigError`.
+  The failure now says to use a numeric user: Steps run as non-root, and the kubelet can
+  check only a numeric one. Scarab does not override the image's user.
 
 ### Tests
 

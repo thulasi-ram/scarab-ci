@@ -37,6 +37,7 @@ use scarab_project::{
     EnvironmentMigrationReportProject, EnvironmentProjectEligibility, EnvironmentProjectOverlay,
     EnvironmentProjectPrivilegeGrant, EnvironmentProjectRecord, EnvironmentProtectionRules,
     ImageGrant, Loosening, MissingGateMode, OrgEnvironment, OrgEnvironmentError, ProtectionRules,
+    WritePrecondition,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -328,6 +329,7 @@ pub(crate) fn org_environment_api_error(e: OrgEnvironmentError) -> ApiError {
         in_use @ OrgEnvironmentError::InUse(_) => ApiError::Conflict(in_use.to_string()),
         // ADR-0073 §3: an `…_expecting` write lost to a concurrent change.
         OrgEnvironmentError::Conflict(m) => ApiError::Conflict(m),
+        OrgEnvironmentError::PreconditionFailed(m) => ApiError::PreconditionFailed(m),
         OrgEnvironmentError::Store(m) => ApiError::Db(DbError::Other(m)),
     }
 }
@@ -369,7 +371,9 @@ pub(crate) async fn list_org_environments(
     ),
     summary = "One org Environment (ADR-0071)",
     responses(
-        (status = 200, body = OrgEnvironmentDto),
+        (status = 200, body = OrgEnvironmentDto, headers(
+            ("ETag" = String, description = "the Environment's entity tag, for `If-Match` on its PUT")
+        )),
         (status = 403, description = "no Read on the org"),
         (status = 404, description = "no such Environment, or not configured")
     )
@@ -378,7 +382,7 @@ pub(crate) async fn get_org_environment(
     State(st): State<AppState>,
     headers: HeaderMap,
     Path((org, env)): Path<(String, String)>,
-) -> Result<Json<OrgEnvironmentDto>, ApiError> {
+) -> Result<(HeaderMap, Json<OrgEnvironmentDto>), ApiError> {
     let scope = rbac_scope(&org, None);
     authorize_scoped(&st, &headers, Action::Read, Some(&scope)).await?;
     let store = st.org_environments.as_ref().ok_or(ApiError::NotFound)?;
@@ -387,7 +391,53 @@ pub(crate) async fn get_org_environment(
         .await
         .map_err(org_environment_api_error)?
         .ok_or(ApiError::NotFound)?;
-    Ok(Json((&environment).into()))
+    Ok((etag_header(&environment), Json((&environment).into())))
+}
+
+/// The `ETag` response header for `env`.
+fn etag_header(env: &OrgEnvironment) -> HeaderMap {
+    let mut h = HeaderMap::new();
+    if let Ok(v) = axum::http::HeaderValue::from_str(&env.etag()) {
+        h.insert(axum::http::header::ETAG, v);
+    }
+    h
+}
+
+/// The whole-Environment PUT's precondition (git-bug 66cce00): `If-None-Match:
+/// *` creates only, `If-Match: <etag>` replaces only the Environment the
+/// client read. Neither: create or replace, as before. Both, or an
+/// `If-None-Match` other than `*`, is refused 400.
+fn write_precondition(headers: &HeaderMap) -> Result<WritePrecondition, ApiError> {
+    let header = |name: axum::http::HeaderName| -> Result<Option<String>, ApiError> {
+        headers
+            .get(&name)
+            .map(|v| {
+                v.to_str()
+                    .map(|s| s.trim().to_string())
+                    .map_err(|_| ApiError::BadRequest(format!("`{name}` is not text")))
+            })
+            .transpose()
+    };
+    let if_match = header(axum::http::header::IF_MATCH)?;
+    let if_none_match = header(axum::http::header::IF_NONE_MATCH)?;
+    match (if_match, if_none_match) {
+        (None, None) => Ok(WritePrecondition::Any),
+        (None, Some(n)) if n == "*" => Ok(WritePrecondition::Absent),
+        (None, Some(_)) => Err(ApiError::BadRequest(
+            "`If-None-Match` takes only `*` here (create only)".into(),
+        )),
+        // A list of tags, or `*` (any stored Environment). Our tags never
+        // hold a comma, so splitting on it is exact.
+        (Some(m), None) => Ok(WritePrecondition::Matches(
+            m.split(',')
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect(),
+        )),
+        (Some(_), Some(_)) => Err(ApiError::BadRequest(
+            "send `If-Match` (replace) or `If-None-Match: *` (create), not both".into(),
+        )),
+    }
 }
 
 /// Create or replace an Environment: its display name and description.
@@ -402,18 +452,23 @@ pub(crate) async fn get_org_environment(
 #[utoipa::path(
     put,
     path = "/v1/orgs/{org}/environments/{env}",
-    params(
-        ("org" = String, Path, description = "org"),
-        ("env" = String, Path, description = "environment name")
-    ),
     request_body = PutOrgEnvironmentRequest,
     summary = "Create or replace an org Environment (ADR-0071)",
+    params(
+        ("org" = String, Path, description = "org"),
+        ("env" = String, Path, description = "environment name"),
+        ("If-Match" = Option<String>, Header, description = "replace only the Environment whose `ETag` this is"),
+        ("If-None-Match" = Option<String>, Header, description = "`*`: create only")
+    ),
     responses(
-        (status = 200, body = OrgEnvironmentDto),
-        (status = 400, description = "invalid name, display name or description, or an unknown field"),
+        (status = 200, body = OrgEnvironmentDto, headers(
+            ("ETag" = String, description = "the Environment's entity tag as stored")
+        )),
+        (status = 400, description = "invalid name, display name or description, an unknown field, or a malformed precondition"),
         (status = 403, description = "not an org admin"),
         (status = 404, description = "org Environments not configured"),
-        (status = 409, description = "a create while a duplicate to the name is in progress")
+        (status = 409, description = "a create while a duplicate to the name is in progress, or a concurrent write won; retry"),
+        (status = 412, description = "`If-Match` or `If-None-Match: *` did not hold; reload")
     )
 )]
 pub(crate) async fn put_org_environment(
@@ -421,9 +476,10 @@ pub(crate) async fn put_org_environment(
     headers: HeaderMap,
     Path((org, env)): Path<(String, String)>,
     Json(body): Json<PutOrgEnvironmentRequest>,
-) -> Result<Json<OrgEnvironmentDto>, ApiError> {
+) -> Result<(HeaderMap, Json<OrgEnvironmentDto>), ApiError> {
     let scope = rbac_scope(&org, None);
     let principal = authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
+    let precondition = write_precondition(&headers)?;
     let store = st.org_environments.as_ref().ok_or(ApiError::NotFound)?;
     let now = st.clock.now().await.0;
     let environment = OrgEnvironment {
@@ -467,10 +523,10 @@ pub(crate) async fn put_org_environment(
     };
     crate::note_org(&st, &environment.org).await?;
     let stored = store
-        .put_org_environment(&environment)
+        .put_org_environment_if(&environment, &precondition)
         .await
         .map_err(org_environment_api_error)?;
-    Ok(Json((&stored).into()))
+    Ok((etag_header(&stored), Json((&stored).into())))
 }
 
 /// Delete an Environment and its eligibility. Administer on the Org.

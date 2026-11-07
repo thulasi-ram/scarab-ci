@@ -66,7 +66,7 @@ async fn run_start_and_success_post_pending_then_success() {
     let db = InMemoryDb::new();
     let clock = FakeClock::new(1_000);
 
-    // Trigger a run from a push; then drive it to success.
+    // Trigger a run from a push; start it, drain, then drive it to success.
     let run = trigger_run_from_event(
         forge.as_ref(),
         &db,
@@ -78,7 +78,26 @@ async fn run_start_and_success_post_pending_then_success() {
     .unwrap()
     .pop()
     .expect("push starts a run");
+    // Unscripted, the fake executor reports the step Running.
     let exec = FakeExecutor::new();
+    Scheduler::new(&db, &clock, &exec, "sched-1")
+        .with_outbox_visibility_ms(0)
+        .tick(&run)
+        .await
+        .unwrap();
+    assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Running));
+    // Running -> pending while the run is in flight.
+    let started = drain_forge_statuses(
+        forge.as_ref(),
+        &db,
+        "drainer",
+        32,
+        30_000,
+        "http://scarab.test",
+    )
+    .await
+    .unwrap();
+    assert_eq!(started, 1);
     exec.script_outcome(ExecState::Succeeded);
     drive(&db, &clock, &exec, &run).await;
     assert_eq!(
@@ -86,8 +105,7 @@ async fn run_start_and_success_post_pending_then_success() {
         Some(RunStatus::Succeeded)
     );
 
-    // Drain status notifications to the forge: Running -> pending, then
-    // Succeeded -> success, in order.
+    // Then Succeeded -> success.
     let posted = drain_forge_statuses(
         forge.as_ref(),
         &db,
@@ -98,7 +116,7 @@ async fn run_start_and_success_post_pending_then_success() {
     )
     .await
     .unwrap();
-    assert_eq!(posted, 2);
+    assert_eq!(posted, 1);
     let states: Vec<StatusState> = forge.statuses().iter().map(|s| s.state).collect();
     assert_eq!(states, vec![StatusState::Pending, StatusState::Success]);
     assert!(forge.statuses().iter().all(|s| s.context == "scarab/ci"));
@@ -213,8 +231,10 @@ async fn run_failure_posts_failure_status() {
     )
     .await
     .unwrap();
+    // The run settled before the drain, so its `Running` post is retired
+    // unposted: the verdict is the newer word (git-bug 1074fde).
     let states: Vec<StatusState> = forge.statuses().iter().map(|s| s.state).collect();
-    assert_eq!(states, vec![StatusState::Pending, StatusState::Failure]);
+    assert_eq!(states, vec![StatusState::Failure]);
 }
 
 #[tokio::test]
@@ -286,18 +306,19 @@ async fn rejected_status_posts_are_retried_then_dead_lettered_not_silently_dropp
     );
 
     // …and every rejection is COUNTED, so a broken App is visible on /metrics
-    // instead of only in a log line nobody is grepping (ba921db). Two messages
-    // (pending, success) × MAX_DELIVERY_ATTEMPTS rejections each, then both
-    // retired as poison.
+    // instead of only in a log line nobody is grepping (ba921db). The run
+    // settled before the first drain, so its `Running` post is retired
+    // unposted (git-bug 1074fde); the verdict takes MAX_DELIVERY_ATTEMPTS
+    // rejections, then is retired as poison.
     let attempts = u64::from(scarab_engine::MAX_DELIVERY_ATTEMPTS);
     assert_eq!(
         scarab_server::metrics::forge_status_failures() - failures_before,
-        2 * attempts,
+        attempts,
         "each rejected post increments the failure counter"
     );
     assert_eq!(
         scarab_server::metrics::forge_status_dead_lettered() - dead_before,
-        2,
+        1,
         "each poisoned status message increments the dead-letter counter"
     );
 }
@@ -306,8 +327,8 @@ async fn rejected_status_posts_are_retried_then_dead_lettered_not_silently_dropp
 /// run's `Running` post can fail at the forge, its terminal post land, and
 /// the `Running` post be redelivered after its lease — leaving a finished
 /// Run's required check `pending` for good. A non-terminal post whose run
-/// has since settled, and whose terminal post is already delivered, is
-/// retired unposted; the in-order drain above still posts both.
+/// has since settled in the same generation is retired unposted, whatever
+/// state its terminal post is in (git-bug 1074fde).
 #[tokio::test]
 async fn a_redelivered_start_post_never_lands_after_the_runs_verdict() {
     let healthy = Arc::new(FakeForge::new().with_file(".scarab/ci.yaml", CI_YAML));

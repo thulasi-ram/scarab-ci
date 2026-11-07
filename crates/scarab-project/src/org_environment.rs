@@ -86,6 +86,21 @@ impl OrgEnvironment {
     pub fn shown_name(&self) -> &str {
         self.display_name.as_deref().unwrap_or(&self.name)
     }
+
+    /// The entity tag of this Environment as stored: a digest of every
+    /// field, so any change to it (its description, its baseline, its
+    /// eligibility) gives a different tag. The whole-Environment PUT checks
+    /// `If-Match` against it (git-bug 66cce00). Stable within one build;
+    /// after an upgrade a client holding an older tag reloads once.
+    pub fn etag(&self) -> String {
+        // FNV-1a, 64-bit: a change detector, not a security boundary.
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in format!("{self:?}").bytes() {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+        format!("\"{h:016x}\"")
+    }
 }
 
 /// A display name as a caller sent it, normalised: trimmed, and an empty one
@@ -151,6 +166,20 @@ pub fn duplicate_display_name(source: &OrgEnvironment) -> String {
     format!("{shown}{DUPLICATE_DISPLAY_NAME_SUFFIX}")
 }
 
+/// What a whole-Environment write requires of the stored Environment
+/// (git-bug 66cce00): HTTP's `If-None-Match: *` and `If-Match`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WritePrecondition {
+    /// No requirement: create or replace.
+    Any,
+    /// Create only: no Environment by that name may exist.
+    Absent,
+    /// Replace only: the stored Environment's [`OrgEnvironment::etag`] is
+    /// one of these (HTTP `If-Match`, strong comparison). `*` matches any
+    /// stored Environment; a weak tag (`W/"…"`) never matches.
+    Matches(Vec<String>),
+}
+
 /// The OrgEnvironment name rule: non-empty, no control characters, and not
 /// `.` or `..`. Nothing else — no length cap, and `/` and whitespace are
 /// allowed — because a pipeline's `environment:` and a per-Project
@@ -197,6 +226,11 @@ pub enum OrgEnvironmentError {
     /// stored; the caller reloads and decides again.
     #[error("{0}")]
     Conflict(String),
+    /// A [`WritePrecondition`] did not hold: the Environment exists (create
+    /// only), or is gone or changed since the caller read it. Nothing was
+    /// stored.
+    #[error("{0}")]
+    PreconditionFailed(String),
     /// The backing store failed, or held a row this binary cannot read.
     #[error("org environment store: {0}")]
     Store(String),
@@ -231,6 +265,18 @@ pub trait OrgEnvironmentStore: Send + Sync {
     async fn put_org_environment(
         &self,
         env: &OrgEnvironment,
+    ) -> Result<OrgEnvironment, OrgEnvironmentError> {
+        self.put_org_environment_if(env, &WritePrecondition::Any)
+            .await
+    }
+
+    /// [`put_org_environment`](Self::put_org_environment), only while
+    /// `precondition` holds, checked and written atomically. A failed check
+    /// is [`OrgEnvironmentError::PreconditionFailed`]; nothing changes then.
+    async fn put_org_environment_if(
+        &self,
+        env: &OrgEnvironment,
+        precondition: &WritePrecondition,
     ) -> Result<OrgEnvironment, OrgEnvironmentError>;
 
     /// One OrgEnvironment.
