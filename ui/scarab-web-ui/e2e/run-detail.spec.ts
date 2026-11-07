@@ -121,7 +121,7 @@ test("an environment approval gate says so, names who added it, and its wait tim
   const bar = page.locator(".gate-bar");
   const approvalRow = bar.locator(".gate-row", { hasText: "environment-approval" });
   const qaRow = bar.locator(".gate-row", { hasText: /^\s*qa/ });
-  await expect(approvalRow).toContainText("Environment approval gate · added by Production");
+  await expect(approvalRow).toContainText("Environment approval gate · added by Production (production)");
   await expect(approvalRow).toContainText("waiting for the environment's approvers");
   await expect(qaRow).toContainText("waiting for a decision");
   await expect(qaRow).not.toContainText(/approver|Environment/);
@@ -135,5 +135,5 @@ test("an environment approval gate says so, names who added it, and its wait tim
 
   // The step pane names the gate too.
   await added.click();
-  await expect(page.locator(".gate-env-line")).toContainText("Environment approval gate · added by Production");
+  await expect(page.locator(".gate-env-line")).toContainText("Environment approval gate · added by Production (production)");
 });

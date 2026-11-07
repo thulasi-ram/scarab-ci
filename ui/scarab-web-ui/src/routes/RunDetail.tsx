@@ -781,7 +781,7 @@ export default function RunDetail() {
                                 title={
                                   addedByEnvironment(g()) !== null
                                     ? "The pipeline has no approval gate here: the environment added this one. Its approvers release it."
-                                    : "A step after this gate uses the environment's secrets, grants or deploy mark: its approvers release it."
+                                    : "A step after this gate uses the environment's authority (its secrets, a privilege grant, a k8s_overlay, a write forge token or the deploy mark): its approvers release it."
                                 }
                               >
                                 {label()}

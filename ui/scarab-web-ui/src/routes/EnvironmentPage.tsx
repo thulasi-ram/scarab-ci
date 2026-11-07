@@ -520,7 +520,7 @@ function EditForm(props: { org: string; env: OrgEnvironment }) {
           <FormSection
             n={5}
             title="Approval gate"
-            note="A manual gate with a step after it that uses this environment's secrets, privilege grants or deploy mark. Only these gates need the approvers. They apply once the environment has approvers."
+            note="A manual gate with a step after it that uses this environment's authority: its secrets, a privilege grant, a k8s_overlay, a write forge token or the deploy mark. Only these gates need the approvers. They apply once the environment has approvers."
           >
             <Field
               id="env-missing-gate"
@@ -536,7 +536,7 @@ function EditForm(props: { org: string; env: OrgEnvironment }) {
                 onValue={(v) => setGateField({ missingGateMode: v === "refuse" ? "refuse" : "add" })}
               >
                 <option value="add">Add an approval gate</option>
-                <option value="refuse">Refuse the Run</option>
+                <option value="refuse">Refuse the run</option>
               </Select>
             </Field>
             <Field

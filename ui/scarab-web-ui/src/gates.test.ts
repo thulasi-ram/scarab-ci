@@ -316,9 +316,18 @@ describe("Environment approval gates", () => {
   const plain = { ...gate("qa", "pending", "manual", ["build"]), environment_approval_gate: false };
   const statusOf = (s: string) => (s === "build" ? "succeeded" : "pending");
 
-  it("names the Environment by its display name, and the one that added a gate", () => {
-    expect(environmentGateLabel(authored, prod)).toBe("Environment approval gate · Production");
-    expect(environmentGateLabel(added, prod)).toBe("Environment approval gate · added by Production");
+  it("names the Environment by its display name and its name, and the one that added a gate", () => {
+    expect(environmentGateLabel(authored, prod)).toBe("Environment approval gate · Production (production)");
+    expect(environmentGateLabel(added, prod)).toBe(
+      "Environment approval gate · added by Production (production)",
+    );
+    // A display name cannot pass prod off as another Environment.
+    expect(environmentGateLabel(authored, { name: "production", display_name: "Staging" })).toBe(
+      "Environment approval gate · Staging (production)",
+    );
+    expect(environmentGateLabel(authored, { name: "production", display_name: "production" })).toBe(
+      "Environment approval gate · production",
+    );
     expect(environmentGateLabel(authored, { name: "production" })).toBe(
       "Environment approval gate · production",
     );

@@ -239,16 +239,16 @@ record. Read Breaking changes before you upgrade.
   [Environments](https://thulasi-ram.github.io/scarab-ci/usage/environments/#duplicate-an-environment)
 - **Approval gate settings on the Environment page.** The edit page has an **Approval gate**
   section: what to do when a pipeline has no approval gate (**Add an approval gate** or **Refuse
-  the Run**), the added gate's expiry, how many approvers must approve, and the maximum approval
+  the run**), the added gate's expiry, how many approvers must approve, and the maximum approval
   age. The wait timer is disabled while the Environment has no approvers, and an Environment
   with a timer and no approvers shows a warning (git-bug cd43bf3, 2b94989).
   [Environments](https://thulasi-ram.github.io/scarab-ci/usage/environments/#the-rules-it-holds)
 - **The Run page marks Environment approval gates.** Their gate card, DAG node and step pane say
-  **Environment approval gate** and name the Environment by its display name; the gate the
-  Environment added says **added by** it. After the approvals are in, a gate with a wait timer
-  shows when it releases, and approving it says the approval was recorded and when the gate
-  releases. `GET /v1/runs/{id}` gains `environment` (`name`, `display_name`) (git-bug cd43bf3,
-  2b94989).
+  **Environment approval gate** and name the Environment by its display name with its name in
+  brackets; the gate the Environment added says **added by** it. After the approvals are in, a
+  gate with a wait timer shows when it releases, and approving it says the approval was recorded
+  and when the gate releases. `GET /v1/runs/{id}` gains `environment` (`name`, `display_name`)
+  (git-bug cd43bf3, 2b94989).
   [Environments](https://thulasi-ram.github.io/scarab-ci/usage/environments/#the-approval-gate)
 - **Environment page wording.** "Who may deploy" is now "Projects that may use <Environment>":
   the list admits every Run that names the Environment, not only deploys. The "Projects" panel
@@ -258,7 +258,7 @@ record. Read Breaking changes before you upgrade.
   applies to and how often it matched, denied and (in audit mode) would have denied in the
   newest 200 decisions, the newest decisions, and the typed settings (each Environment's rules,
   the library and plugin lists, API token scopes) with links to where each is edited (git-bug
-  c2f97b4). [Environments](https://thulasi-ram.github.io/scarab-ci/usage/environments/#every-rule-in-one-place)
+  c2f97b4). [Every rule in one place](https://thulasi-ram.github.io/scarab-ci/usage/environments/#every-rule-in-one-place)
 - **Runs after another pipeline.** `on: upstream: { pipeline: ci }` starts a Run when a Run
   of `ci` in the same repository finishes (`status:` takes `succeeded`, the default, and
   `failed`). The follow-up builds the same commit and runs on the same ref, so an

@@ -186,7 +186,8 @@ export function gateWaitHint(
 
 // --- Environment approval gates --------------------------------------------
 // In a Run that names an Environment, a `manual` gate with a Step after it
-// that uses the Environment's secrets, grants or deploy mark is an
+// that uses the Environment's authority (its secrets, a privilege grant, a
+// k8s_overlay, a write forge token or the deploy mark) is an
 // Environment approval gate: it needs the Environment's approvers. Run
 // creation decides which gates are, and the server sends the mark on each
 // gate (`environment_approval_gate`). When the pipeline wrote no such gate,
@@ -215,19 +216,18 @@ export function addedByEnvironment(s: EnvironmentGateLike): string | null {
   return s.origin?.find((o) => o.kind === "environment")?.name ?? null;
 }
 
-/** What to call Environment `name`: its display name when the Run's
- *  Environment is that one and has one, else the name. */
+/** What to call Environment `name`: its display name with the name beside
+ *  it when the Run's Environment is that one and has a display name other
+ *  than the name, else the name. The name is always shown: anyone who edits
+ *  an Environment may set its display name, and it need not be unique, so an
+ *  approver reads the name to know which Environment the gate guards. */
 function environmentShown(name: string, env: RunEnvironmentLike | null | undefined): string {
-  return env && env.name === name && env.display_name?.trim() ? env.display_name.trim() : name;
+  const display = env && env.name === name ? env.display_name?.trim() : undefined;
+  return display && display !== name ? `${display} (${name})` : name;
 }
 
-/** The label a gate carries on its card, its DAG node and its pane, or
- *  `null` for a gate that is not an Environment approval gate:
- *
- *    Environment approval gate · Production
- *    Environment approval gate · added by Production
- */
-/** "added by Production" for the gate the Environment added, else `null`. */
+/** "added by Production (production)" for the gate the Environment added,
+ *  else `null`. */
 export function addedByLabel(
   s: EnvironmentGateLike,
   env: RunEnvironmentLike | null | undefined,
@@ -236,6 +236,12 @@ export function addedByLabel(
   return added === null ? null : `added by ${environmentShown(added, env)}`;
 }
 
+/** The label a gate carries on its card, its DAG node and its pane, or
+ *  `null` for a gate that is not an Environment approval gate:
+ *
+ *    Environment approval gate · Production (production)
+ *    Environment approval gate · added by Production (production)
+ */
 export function environmentGateLabel(
   s: EnvironmentGateLike,
   env: RunEnvironmentLike | null | undefined,

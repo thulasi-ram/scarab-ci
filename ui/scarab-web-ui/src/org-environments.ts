@@ -128,8 +128,9 @@ export const confirmsName = (typed: string, name: string) => name.length > 0 && 
 // ── The Environment approval gate ────────────────────────────────────────────
 //
 // An Environment with approvers asks them on its approval gate: a `manual`
-// gate with a Step after it that uses the Environment's secrets, grants or
-// deploy mark. When a pipeline has no such gate, the Environment adds one to
+// gate with a Step after it that uses the Environment's authority (its
+// secrets, a privilege grant, a k8s_overlay, a write forge token or the
+// deploy mark). When a pipeline has no such gate, the Environment adds one to
 // the Run, or refuses the Run (its missing-gate mode). The baseline also sets
 // the added gate's expiry, how many approvers must approve, and how long an
 // approval stays good for. These settings are the baseline's alone: a
