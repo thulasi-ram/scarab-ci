@@ -7911,7 +7911,7 @@ async fn begin_link(
     };
     let flow = flow.for_link(&link, expires_at);
     let mut resp = Json(LinkIdentityResponse {
-        authorize_url: provider.authorize_redirect(&oauth_callback_url(&st), &flow),
+        authorize_url: provider.authorize_redirect(&oauth_callback_url(st), &flow),
     })
     .into_response();
     let cookie = format!(
