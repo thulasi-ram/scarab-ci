@@ -30,6 +30,7 @@ fn spec(uses: &[&str]) -> StepSpec {
         resources: Default::default(),
         k8s_overlay: None,
         oidc_token: None,
+        resolved_secrets: Default::default(),
         services: Vec::new(),
         uses: uses.iter().map(|s| s.to_string()).collect(),
         matrix_values: Default::default(),

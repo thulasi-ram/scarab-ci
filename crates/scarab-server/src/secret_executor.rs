@@ -6,8 +6,10 @@
 //! only ids travel. This decorator bridges that: it wraps the real [`Executor`],
 //! and just before `launch` it resolves the step's declared secret keys against
 //! the run's deploy-context scope (`env → repo → org` inheritance), registers the
-//! values with the redactor, and merges them into `spec.env`. Resolved values are
-//! never persisted — they exist only in the launch call.
+//! values with the redactor, and hands them to the executor in
+//! `spec.resolved_secrets`, which mounts each one as a file under
+//! `/scarab/secrets/`. Resolved values are never persisted — they exist only in
+//! the launch call.
 //!
 //! A fork-PR run (its deploy context's `locked_out` flag) receives no secrets. A
 //! run without a deploy context (ordinary CI) resolves nothing here.
@@ -34,8 +36,8 @@ use scarab_secrets::{SecretProvider, SecretScope};
 
 use crate::{resolve_step_secrets, LogService};
 
-/// Wraps an [`Executor`], injecting a step's declared secrets into its env at
-/// launch time — and, when the OIDC issuer is configured, minting the
+/// Wraps an [`Executor`], resolving a step's declared secrets at launch
+/// time — and, when the OIDC issuer is configured, minting the
 /// per-attempt federation token (ADR-0015).
 pub struct SecretInjectingExecutor {
     inner: Arc<dyn Executor>,
@@ -350,7 +352,12 @@ fn step_admit_input(
             id: s.id.clone(),
             image: s.image.clone(),
             deploy: s.deploy || ir.deploy,
-            secrets: rc::capped(s.secrets.clone(), &what, "secrets").map_err(|e| e.to_string())?,
+            secrets: rc::capped(
+                s.secrets.iter().map(|r| r.name.clone()).collect(),
+                &what,
+                "secrets",
+            )
+            .map_err(|e| e.to_string())?,
             forge_token: s.forge_token.map(|t| match t {
                 scarab_pipeline::ForgeToken::Read => rc::ForgeToken::Read,
                 scarab_pipeline::ForgeToken::Write => rc::ForgeToken::Write,
@@ -625,18 +632,21 @@ impl Executor for SecretInjectingExecutor {
         };
         // Resolve (with inheritance), register each value with the redactor, and
         // honor the fork-PR lockout — all inside `resolve_step_secrets`.
+        let keys: Vec<String> = spec.secrets.iter().map(|s| s.name.clone()).collect();
         let resolved = resolve_step_secrets(
             self.secrets.as_ref(),
             &self.logs,
             &scope,
-            &spec.secrets,
+            &keys,
             ctx.locked_out,
         )
         .await
         .map_err(|e| ExecError::Other(e.to_string()))?;
 
+        // The values ride the launch copy only. The executor mounts each one
+        // as a file and never writes a value into the Pod spec (ADR-0014).
         let mut spec = spec.clone();
-        spec.env.extend(resolved);
+        spec.resolved_secrets = scarab_engine::ResolvedSecrets(resolved);
         self.inner.launch(step, &spec).await
     }
 

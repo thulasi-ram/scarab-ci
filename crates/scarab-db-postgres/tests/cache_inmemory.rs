@@ -73,6 +73,7 @@ fn spec(cache: Option<CacheConfig>) -> StepSpec {
         resources: Default::default(),
         k8s_overlay: None,
         oidc_token: None,
+        resolved_secrets: Default::default(),
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),

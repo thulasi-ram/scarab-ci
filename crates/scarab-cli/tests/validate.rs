@@ -153,6 +153,32 @@ async fn offline_validate_reads_invoked_libraries_from_the_repository() {
     assert!(stderr.contains("`.scarab/lib/deploy.yaml`"), "{stderr}");
 }
 
+/// git-bug bcf2c11: a secret is a file unless its entry says `env: true`,
+/// so `scarab validate` warns about a command that reads it as `$NAME`.
+/// The Pipeline is still valid: the exit code stays 0.
+#[tokio::test(flavor = "multi_thread")]
+async fn offline_validate_warns_when_a_command_reads_a_file_only_secret() {
+    let dir = repo();
+    std::fs::write(
+        dir.join(".scarab/secrets.yaml"),
+        "on:\n  push: {}\nsteps:\n  - id: deploy\n    image: busybox\n    secrets: [ARGOCD_AUTH_TOKEN, { name: NPM_TOKEN, env: true }]\n    command: [sh, -c, 'argocd login --auth-token \"$ARGOCD_AUTH_TOKEN\" && npm publish # $NPM_TOKEN']\n",
+    )
+    .unwrap();
+    let out = output(scarab(&dir, &["validate", ".scarab/secrets.yaml"])).await;
+    let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
+    assert_eq!(out.status.code(), Some(0), "{stdout}{stderr}");
+    let warnings: Vec<&str> = stdout
+        .lines()
+        .filter(|l| l.starts_with("warning:"))
+        .collect();
+    assert_eq!(warnings.len(), 1, "{stdout}");
+    assert!(
+        warnings[0].contains("`$ARGOCD_AUTH_TOKEN`")
+            && warnings[0].contains("{ name: ARGOCD_AUTH_TOKEN, env: true }"),
+        "{stdout}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn server_dry_run_allows_a_pipeline_without_the_library() {
     let base = serve().await;

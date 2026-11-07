@@ -227,6 +227,14 @@ fn repo_path(file: &str, root: &Path) -> String {
     }
 }
 
+/// Warnings that do not fail the check: a Step command that reads a secret
+/// as `$NAME` when the secret is a file only (ADR-0014).
+fn print_warnings(ir: &scarab_pipeline::PipelineIr) {
+    for w in scarab_pipeline::secret_env_warnings(ir) {
+        println!("warning: {w}");
+    }
+}
+
 pub async fn run(args: ValidateArgs) -> i32 {
     let Some(server) = args.server.clone() else {
         // Offline: compile only.
@@ -238,6 +246,7 @@ pub async fn run(args: ValidateArgs) -> i32 {
             Ok(ir) => {
                 println!("ok: {} step(s), ir v{}", ir.steps.len(), ir.ir_version);
                 print_approval_gates(&ir);
+                print_warnings(&ir);
                 0
             }
             Err(()) => 1,
@@ -260,6 +269,7 @@ pub async fn run(args: ValidateArgs) -> i32 {
     };
     println!("ok: {} step(s), ir v{}", ir.steps.len(), ir.ir_version);
     print_approval_gates(&ir);
+    print_warnings(&ir);
 
     let dir = file_dir(&args.file);
     if args.pr.is_some() && args.event != "pull_request" {

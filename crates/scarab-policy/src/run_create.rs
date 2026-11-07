@@ -504,7 +504,11 @@ pub fn input_from_pipeline(
             digest,
             grants: capped(grants, &what, "grants")?,
             k8s_overlay: s.k8s_overlay.is_some(),
-            secrets: capped(s.secrets.clone(), &what, "secrets")?,
+            secrets: capped(
+                s.secrets.iter().map(|x| x.name.clone()).collect(),
+                &what,
+                "secrets",
+            )?,
             placement_profiles: capped(s.placement_profiles.clone(), &what, "placement profiles")?,
             deploy: s.deploy || ir.deploy,
             forge_token: s.forge_token.map(|t| match t {
