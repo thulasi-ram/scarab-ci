@@ -51,6 +51,7 @@ fn builtin(id: &str, name: &str, outcome: PolicyOutcome) -> PolicyResult {
         level: Level::Org,
         mode: Mode::Enforce,
         outcome,
+        before_approval: None,
     }
 }
 
@@ -299,12 +300,10 @@ pub fn launch_recheck(f: LaunchFacts<'_>) -> LaunchCheck {
             messages: vec![r.clone()],
         },
     };
+    let mut result = builtin(LAUNCH_RECHECK_ID, "environment-approval-recheck", outcome);
+    result.before_approval = Some(before_approval);
     LaunchCheck {
-        result: Some(builtin(
-            LAUNCH_RECHECK_ID,
-            "environment-approval-recheck",
-            outcome,
-        )),
+        result: Some(result),
         refusal,
         before_approval,
     }

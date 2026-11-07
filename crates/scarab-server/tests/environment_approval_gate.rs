@@ -104,6 +104,8 @@ struct Stack {
     governance: Arc<InMemoryEnvironmentGovernance>,
     exec: Arc<FakeExecutor>,
     issuer: Arc<Rs256Issuer>,
+    /// Where the launch records its `step.admit` decisions.
+    policies: Arc<scarab_testkit::InMemoryPolicies>,
     app: axum::Router,
     /// The snapshot oracle the scheduler resolves cache key files through;
     /// `None` turns every Cache off.
@@ -162,6 +164,7 @@ impl Stack {
             governance,
             exec: Arc::new(FakeExecutor::new()),
             issuer: Arc::new(Rs256Issuer::generate("https://scarab.example").unwrap()),
+            policies: Arc::new(scarab_testkit::InMemoryPolicies::new()),
             app,
             snapshots: None,
         }
@@ -203,23 +206,7 @@ impl Stack {
     /// (`SecretInjectingExecutor` with the governance, this clock and OIDC
     /// minting on), every launched step succeeding.
     async fn tick(&self, run: &RunId, n: usize) {
-        let logs = Arc::new(LogService::new(
-            Arc::new(InMemoryObjectStore::new()),
-            self.db.clone(),
-        ));
-        let exec = SecretInjectingExecutor::new(
-            self.exec.clone(),
-            self.db.clone() as Arc<dyn Db>,
-            Arc::new(FakeSecrets::new()),
-            logs,
-        )
-        .with_environment_governance(self.governance.clone())
-        .with_oidc(
-            self.issuer.clone(),
-            "https://scarab.example",
-            "sts.example.com",
-        )
-        .with_clock(self.clock.clone());
+        let exec = self.launcher();
         let sched = Scheduler::new(
             self.db.as_ref(),
             self.clock.as_ref() as &dyn Clock,
@@ -235,6 +222,29 @@ impl Stack {
             self.exec.script_outcome(ExecState::Succeeded);
             sched.tick(run).await.unwrap();
         }
+    }
+
+    /// The launch path: `SecretInjectingExecutor` with the governance, the
+    /// decision store, this clock and OIDC minting on.
+    fn launcher(&self) -> SecretInjectingExecutor {
+        let logs = Arc::new(LogService::new(
+            Arc::new(InMemoryObjectStore::new()),
+            self.db.clone(),
+        ));
+        SecretInjectingExecutor::new(
+            self.exec.clone(),
+            self.db.clone() as Arc<dyn Db>,
+            Arc::new(FakeSecrets::new()),
+            logs,
+        )
+        .with_environment_governance(self.governance.clone())
+        .with_policies(self.policies.clone())
+        .with_oidc(
+            self.issuer.clone(),
+            "https://scarab.example",
+            "sts.example.com",
+        )
+        .with_clock(self.clock.clone())
     }
 
     async fn status(&self, run: &RunId, step: &str) -> StepStatus {
@@ -1086,6 +1096,38 @@ async fn a_fresh_approval_keeps_the_environments_oidc_subject() {
     let run = cloud_approved(&s).await;
     s.clock.advance(60_000);
     assert_eq!(rerun_cloud(&s, &run).await.as_deref(), Some(ENV_PROD));
+}
+
+/// git-bug 7c2514a: whether the approval admitted a Step is part of its
+/// Attempt's one `step.admit` decision. A launch of the same Attempt
+/// delivered again after the approval aged out keeps the `env=prod` subject
+/// the first launch had; a rerun (a new Attempt) gets `env=none`, below.
+#[tokio::test]
+async fn a_redelivered_launch_keeps_the_recorded_approval() {
+    let mut protection = rules(&[ME]);
+    protection.approval_gate.max_approval_age_s = 3_600;
+    let s = Stack::new(protection).await;
+    let run = cloud_approved(&s).await;
+    s.clock.advance(2 * 3_600_000);
+
+    let sr =
+        s.db.steps_of_run(&run)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|x| x.step.0 == "cloud")
+            .unwrap();
+    let spec = s
+        .exec
+        .launched_spec(&FakeExecutor::handle_for(&sr))
+        .expect("launched once");
+    scarab_engine::ports::Executor::launch(&s.launcher(), &sr, &spec)
+        .await
+        .expect("the redelivered launch is admitted");
+    assert_eq!(
+        s.oidc_subject(&run, "cloud").await.as_deref(),
+        Some(ENV_PROD)
+    );
 }
 
 /// Review round 2 (red team): once the approval is older than the maximum

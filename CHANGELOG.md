@@ -458,6 +458,12 @@ record. Read Breaking changes before you upgrade.
   `Config` (git-bug c2f97b4). A `step.admit` Policy applies to every launch its `match`
   selects, in Runs that no Environment governs too. An approval that races another one is
   checked again over both approvals, and a deny then answers 403 with the approval kept.
+  `step.admit` decides once per Attempt: a launch of the same Attempt delivered again (after a
+  crash between the decision and the Pod) acts on the decision recorded first, including
+  whether an approval admitted the Step (its OIDC subject and cache scope), so a Policy
+  stored or an approval aged out in between applies from the next Attempt (git-bug 7c2514a).
+  Decisions were recorded under attempt 1 for every Attempt, and the `step.attempt` a Policy
+  reads was always 1; both now use the Attempt's own number.
   [Environments](https://thulasi-ram.github.io/scarab-ci/usage/environments/#the-approval-gate)
 - **Caches at more than one Depot replica.** Each Cache key has one home Depot replica, chosen
   by rendezvous hashing over the StatefulSet's ordinals, and a Step saves and restores the

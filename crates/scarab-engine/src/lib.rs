@@ -62,6 +62,14 @@ pub struct StepId(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AttemptId(pub String);
 
+impl AttemptId {
+    /// The Attempt's number within its Step, from 1: the scheduler mints
+    /// ids as `a<n>`. `None` for an id of another shape.
+    pub fn number(&self) -> Option<u32> {
+        self.0.strip_prefix('a')?.parse().ok()
+    }
+}
+
 /// A logical timestamp in unix milliseconds. Kept as a plain integer so the
 /// domain crate need not depend on `chrono`/`time` (infra-adjacent) — the
 /// [`Clock`] port is the only source of "now".

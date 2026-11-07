@@ -74,6 +74,13 @@ pub struct PolicyResult {
     pub level: Level,
     pub mode: Mode,
     pub outcome: PolicyOutcome,
+    /// Set only by the built-in launch-time re-check at `step.admit`: no
+    /// Environment approval gate upstream admits the Step, so its OIDC
+    /// subject is `env=none` and its Cache uses the ref's scope. Recorded so
+    /// a redelivered launch of the same Attempt acts on it too (git-bug
+    /// 7c2514a). Absent from every other result and from older records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_approval: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -375,6 +382,7 @@ fn result_of(p: &PolicyIr, outcome: PolicyOutcome) -> PolicyResult {
         level: p.level,
         mode: p.mode,
         outcome,
+        before_approval: None,
     }
 }
 
@@ -578,6 +586,7 @@ fn plugin_default(
         level: Level::Org,
         mode: Mode::Enforce,
         outcome,
+        before_approval: None,
     })
 }
 
