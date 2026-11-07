@@ -1038,7 +1038,7 @@ async fn raise_request_counts_and_inserts_under_the_human_s_lock() {
     tdb.cleanup().await;
 }
 
-/// git-bug 6856659: `delete_for_passkey` revokes exactly the standing
+/// git-bug 6856659: `delete_standing_confirmations_for_passkey` revokes exactly the standing
 /// step-ups that passkey signed — windows and unconsumed action
 /// confirmations, in every session — and nothing another passkey signed.
 #[tokio::test]
@@ -1061,7 +1061,12 @@ async fn delete_for_passkey_revokes_only_what_it_signed() {
     ] {
         db.put_confirmation(&c).await.unwrap();
     }
-    assert_eq!(db.delete_for_passkey("pk-gone").await.unwrap(), 3);
+    assert_eq!(
+        db.delete_standing_confirmations_for_passkey("pk-gone")
+            .await
+            .unwrap(),
+        3
+    );
     assert_eq!(
         db.live_window("s1", "amy", 20).await.unwrap().map(|w| w.0),
         Some("other".to_string())
@@ -1072,6 +1077,11 @@ async fn delete_for_passkey_revokes_only_what_it_signed() {
         .await
         .unwrap()
         .is_none());
-    assert_eq!(db.delete_for_passkey("pk-gone").await.unwrap(), 0);
+    assert_eq!(
+        db.delete_standing_confirmations_for_passkey("pk-gone")
+            .await
+            .unwrap(),
+        0
+    );
     tdb.cleanup().await;
 }

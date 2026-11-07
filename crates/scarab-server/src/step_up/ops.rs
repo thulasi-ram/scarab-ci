@@ -17,7 +17,7 @@
 //! [`STEP_DEBUG_POD`]): a WebSocket upgrade that opens a shell in a step Pod.
 
 use scarab_identity::Role;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 /// Which confirmation a crown jewel needs (ADR-0073 §4).
@@ -186,12 +186,56 @@ impl OpInput {
 /// in the event log).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct OpSummary {
+    // Stored inside challenge and request contexts: a new field needs
+    // `#[serde(default)]`, or the rows written before it no longer read
+    // (and `#[schema(required = true)]`, which the default would otherwise
+    // drop from the API schema).
     /// What is being done ("Write a secret").
+    #[serde(default, deserialize_with = "stored_string")]
+    #[schema(required = true)]
     pub operation: String,
     /// What it is done to ("acme/web/prod/DB_PASSWORD").
+    #[serde(default, deserialize_with = "stored_string")]
+    #[schema(required = true)]
     pub target: String,
     /// What changes, one line each. Redacted fields read `(hidden)`.
+    #[serde(default, deserialize_with = "stored_strings")]
+    #[schema(required = true)]
     pub changes: Vec<String>,
+}
+
+/// A stored string field: any value that is not a string reads as `""`, so
+/// one odd key in a stored context blanks only itself.
+pub(crate) fn stored_string<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    Ok(match Value::deserialize(d)? {
+        Value::String(s) => s,
+        _ => String::new(),
+    })
+}
+
+/// [`stored_string`] for an optional field: anything but a string is `None`.
+pub(crate) fn stored_opt_string<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<Option<String>, D::Error> {
+    Ok(match Value::deserialize(d)? {
+        Value::String(s) => Some(s),
+        _ => None,
+    })
+}
+
+/// A stored list of strings: the elements that are strings, in order. A
+/// value that is not a list reads as empty.
+pub(crate) fn stored_strings<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    Ok(match Value::deserialize(d)? {
+        Value::Array(a) => a
+            .into_iter()
+            .filter_map(|v| match v {
+                Value::String(s) => Some(s),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    })
 }
 
 /// Who, besides a human in a browser, an operation can ever be performed by

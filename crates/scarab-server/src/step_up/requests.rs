@@ -227,15 +227,19 @@ struct SealedRequest {
 /// What a StepUpConfirmationRequest keeps as its `summary`: what would run
 /// (redacted) and who asked. Written once, when the request is raised; read
 /// by the confirm page and by the confirm endpoint.
+///
+/// Each field reads on its own: a stored key that is missing or not the
+/// expected type leaves only that field empty.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct RequestContext {
+pub(crate) struct StepUpConfirmationRequestContext {
     #[serde(flatten)]
     pub(crate) summary: OpSummary,
     /// Who asked: `API token “ci-bot” (<id>)` or `a CLI session (Bearer)`.
+    #[serde(default, deserialize_with = "super::ops::stored_string")]
     pub(crate) requester: String,
 }
 
-impl RequestContext {
+impl StepUpConfirmationRequestContext {
     /// The JSON a request row stores.
     fn to_value(&self) -> serde_json::Value {
         serde_json::to_value(self).expect("a request context serializes")
@@ -244,7 +248,13 @@ impl RequestContext {
     /// The context `r` was raised with. `None` if its `summary` does not
     /// read as one.
     fn of(r: &StepUpConfirmationRequest) -> Option<Self> {
-        serde_json::from_value(r.summary.clone()).ok()
+        match serde_json::from_value(r.summary.clone()) {
+            Ok(context) => Some(context),
+            Err(e) => {
+                tracing::warn!(request = %r.id, error = %e, "a request's stored summary does not read");
+                None
+            }
+        }
     }
 }
 
@@ -334,7 +344,7 @@ pub(crate) async fn raise<T>(
         query: p.query.clone(),
         sealed: Some(sealed),
         action_digest: p.digest.to_vec(),
-        summary: RequestContext {
+        summary: StepUpConfirmationRequestContext {
             summary: summary.clone(),
             requester: label.clone(),
         }
@@ -509,7 +519,7 @@ pub struct StepUpRequestDto {
 
 impl StepUpRequestDto {
     fn new(r: &StepUpConfirmationRequest, now: i64) -> Self {
-        let context = RequestContext::of(r).unwrap_or_default();
+        let context = StepUpConfirmationRequestContext::of(r).unwrap_or_default();
         Self {
             id: r.id.clone(),
             op: r.op.clone(),
@@ -816,7 +826,7 @@ pub(crate) async fn confirm_request(
         .put_confirmation(&confirmation)
         .await
         .map_err(store_err)?;
-    let context = RequestContext::of(&r);
+    let context = StepUpConfirmationRequestContext::of(&r);
     let requested_by = context
         .as_ref()
         .map(|c| c.requester.clone())

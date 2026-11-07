@@ -757,7 +757,10 @@ impl StepUpStore for PostgresDb {
         .rows_affected())
     }
 
-    async fn delete_for_passkey(&self, passkey_id: &str) -> Result<u64, IdentityError> {
+    async fn delete_standing_confirmations_for_passkey(
+        &self,
+        passkey_id: &str,
+    ) -> Result<u64, IdentityError> {
         Ok(sqlx::query(
             "DELETE FROM step_up_confirmations
              WHERE passkey_id = $1

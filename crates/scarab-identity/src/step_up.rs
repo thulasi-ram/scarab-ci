@@ -87,6 +87,7 @@ pub enum LoginKind {
 }
 
 impl LoginKind {
+    /// The string it is stored and serialized as.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Browser => "browser",
@@ -97,7 +98,7 @@ impl LoginKind {
 
     /// The kind a stored string names; anything unknown is
     /// [`Unrecorded`](Self::Unrecorded).
-    pub fn parse(s: &str) -> Self {
+    pub fn from_stored(s: &str) -> Self {
         match s {
             "browser" => Self::Browser,
             "api" => Self::Api,
@@ -108,7 +109,7 @@ impl LoginKind {
 
 impl From<String> for LoginKind {
     fn from(s: String) -> Self {
-        Self::parse(&s)
+        Self::from_stored(&s)
     }
 }
 
@@ -580,7 +581,10 @@ pub trait StepUpStore: Send + Sync {
     /// — every window and every unconsumed action confirmation it signed,
     /// in every session (the passkey was removed, or flagged as a suspected
     /// clone). Returns how many.
-    async fn delete_for_passkey(&self, passkey_id: &str) -> Result<u64, IdentityError>;
+    async fn delete_standing_confirmations_for_passkey(
+        &self,
+        passkey_id: &str,
+    ) -> Result<u64, IdentityError>;
 
     /// Record a new request (state `Pending`) only if its requester holds
     /// fewer than `caps.per_requester` and its human (`for_human`) fewer than

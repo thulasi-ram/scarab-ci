@@ -271,7 +271,7 @@ impl InMemoryStepUp {
         Self::default()
     }
 
-    /// Fault injection: while `on`, every `delete_for_passkey` fails, so a
+    /// Fault injection: while `on`, every `delete_standing_confirmations_for_passkey` fails, so a
     /// test can prove a half-done passkey removal can be finished by a retry.
     pub fn fail_passkey_revokes(&self, on: bool) {
         self.failing_passkey_revokes.store(on, Ordering::SeqCst);
@@ -425,7 +425,10 @@ impl StepUpStore for InMemoryStepUp {
         Ok((before - state.confirmations.len()) as u64)
     }
 
-    async fn delete_for_passkey(&self, passkey_id: &str) -> Result<u64, IdentityError> {
+    async fn delete_standing_confirmations_for_passkey(
+        &self,
+        passkey_id: &str,
+    ) -> Result<u64, IdentityError> {
         if self.failing_passkey_revokes.load(Ordering::SeqCst) {
             return Err(IdentityError::Conflict(
                 "the step-up store is unreachable (injected)".into(),

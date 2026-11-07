@@ -1371,3 +1371,53 @@ async fn a_request_the_guard_and_the_handler_both_authenticate_counts_once() {
     assert_eq!(v[0]["id"], "v1", "{v}");
     assert_eq!(v[0]["use_count"], 1, "{v}");
 }
+
+// ---------------------------------------------------------------------------
+// A stored request `summary` that is not exactly the shape `raise` writes
+// today: each key reads on its own, so one missing or odd key blanks only
+// itself and the confirm page still shows the rest.
+// ---------------------------------------------------------------------------
+async fn a_partial_stored_summary_still_renders(sql_edit: &str) {
+    let Some((tdb, pg)) = pg().await else { return };
+    let (h, _secrets) = world(Backend::Pg(pg)).await;
+    let (amy, _soft) = amy_in_browser(&h).await;
+    let token = pat(&h, "t1", Scope::Org("acme".into()), Role::Admin).await;
+    let id = raise(&h, &token, "S3CR3T-v1").await;
+    sqlx::query(&format!(
+        "UPDATE step_up_requests SET summary = {sql_edit} WHERE id = $1"
+    ))
+    .bind(&id)
+    .execute(&tdb.pool)
+    .await
+    .unwrap();
+    let (st, seen) = h
+        .cookie("GET", &format!("/v1/step-up/requests/{id}"), None, &amy)
+        .await;
+    tdb.cleanup().await;
+    assert_eq!(st, StatusCode::OK, "{seen}");
+    assert_eq!(
+        seen["summary"]["target"], "acme/DB_PASSWORD",
+        "after `{sql_edit}` the confirm page shows: {seen}"
+    );
+}
+
+#[tokio::test]
+async fn a_stored_summary_without_requester_still_shows_its_target() {
+    a_partial_stored_summary_still_renders("summary - 'requester'").await;
+}
+
+#[tokio::test]
+async fn a_stored_summary_with_a_non_string_change_still_shows_its_target() {
+    a_partial_stored_summary_still_renders(
+        "jsonb_set(summary, '{changes}', summary->'changes' || 'null'::jsonb)",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_stored_summary_with_extra_keys_still_shows_its_target() {
+    a_partial_stored_summary_still_renders(
+        "summary || '{\"legacy\": 1, \"operation_v0\": \"x\"}'::jsonb",
+    )
+    .await;
+}

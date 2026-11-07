@@ -693,7 +693,7 @@ async fn rt_removing_another_humans_passkey_id_revokes_nothing() {
 }
 
 /// ATTACK: removing k1 must not revoke the window k2 opened (over-revoke).
-/// SURVIVES: delete_for_passkey is keyed by the passkey id.
+/// SURVIVES: delete_standing_confirmations_for_passkey is keyed by the passkey id.
 #[tokio::test]
 async fn rt_removing_one_passkey_keeps_the_other_passkeys_window() {
     let h = harness();

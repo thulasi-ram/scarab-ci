@@ -631,15 +631,22 @@ pub(crate) fn event(
 /// `summary`: the operation, the Org the guard resolved for it, and what the
 /// human is asked to confirm. The confirm endpoint reads it back, so the
 /// `step_up.confirmed` event lands in that Org's log and names the operation.
+///
+/// Each field reads on its own: a stored key that is missing or not the
+/// expected type leaves only that field empty (`None`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct ChallengeContext {
-    /// The operation id (`secret.put`).
-    pub(crate) op: String,
+pub(crate) struct StepUpChallengeContext {
+    /// The operation id (`secret.put`). Always written.
+    #[serde(default, deserialize_with = "ops::stored_opt_string")]
+    pub(crate) op: Option<String>,
+    #[serde(default, deserialize_with = "ops::stored_opt_string")]
     pub(crate) org: Option<String>,
-    pub(crate) summary: OpSummary,
+    /// Always written.
+    #[serde(default)]
+    pub(crate) summary: Option<OpSummary>,
 }
 
-impl ChallengeContext {
+impl StepUpChallengeContext {
     /// The JSON a challenge row stores.
     pub(crate) fn to_value(&self) -> serde_json::Value {
         serde_json::to_value(self).expect("a challenge context serializes")
@@ -648,9 +655,14 @@ impl ChallengeContext {
     /// The context `row` was minted with. `None` for a challenge minted
     /// without one (a window opened from the Security page).
     pub(crate) fn of(row: &WebauthnChallenge) -> Option<Self> {
-        row.summary
-            .clone()
-            .and_then(|v| serde_json::from_value(v).ok())
+        let stored = row.summary.clone()?;
+        match serde_json::from_value(stored) {
+            Ok(context) => Some(context),
+            Err(e) => {
+                tracing::warn!(challenge = %row.id, error = %e, "a challenge's stored context does not read");
+                None
+            }
+        }
     }
 }
 
@@ -1024,10 +1036,10 @@ pub(crate) async fn require(
             None,
             None,
             Some(
-                ChallengeContext {
-                    op: op.id.to_string(),
+                StepUpChallengeContext {
+                    op: Some(op.id.to_string()),
                     org: p.org.clone(),
-                    summary: summary.clone(),
+                    summary: Some(summary.clone()),
                 }
                 .to_value(),
             ),
