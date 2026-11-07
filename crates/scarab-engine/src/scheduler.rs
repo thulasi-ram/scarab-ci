@@ -4113,44 +4113,60 @@ impl<'a> Scheduler<'a> {
             // never receives — cache off for the attempt, never an error.
             return;
         }
-        let key = crate::cache_key(&project, &scope.own, &resolved);
-        // The Run's own scope first, then the fallback scope (the default
-        // branch's) on a miss. All or nothing per scope: the restore reads
-        // one key, so it reads one Depot replica (that key's home). Lookup
-        // failures degrade to a cold cache (key still set, so the save side
-        // records under it and the next attempt hits).
-        let mut candidates = vec![key.clone()];
-        if let Some(fallback) = &scope.fallback {
-            candidates.push(crate::cache_key(&project, fallback, &resolved));
-        }
-        let mut restore: Vec<(String, String)> = Vec::new();
-        let mut fallback_key = None;
-        for (i, candidate) in candidates.into_iter().enumerate() {
-            let rows = self
-                .db
-                .cache_lookup(&project, &candidate)
+        // What a scope's key restores: every authored dir it holds an entry
+        // for. Lookup failures degrade to a cold cache (key still set, so the
+        // save side records under it and the next attempt hits).
+        let (db, project_name, dirs) = (self.db, project.as_str(), &cache.dirs);
+        let lookup = |key: String| async move {
+            let rows = db
+                .cache_lookup(project_name, &key)
                 .await
                 .unwrap_or_default();
-            restore = cache
-                .dirs
-                .iter()
+            dirs.iter()
                 .filter_map(|dir| {
                     rows.iter()
                         .find(|(d, _)| d == dir)
                         .map(|(_, root)| (dir.clone(), root.clone()))
                 })
-                .collect();
-            if !restore.is_empty() {
-                if i > 0 {
-                    fallback_key = Some(candidate);
+                .collect::<Vec<_>>()
+        };
+        // The Run's own (ref) scope first, then the fallback scope (the
+        // default branch's) on a miss. All or nothing per scope: the restore
+        // reads one key, so it reads one Depot replica (that key's home).
+        let mut own = None;
+        if let Some(own_scope) = &scope.own {
+            let key = crate::cache_key(&project, own_scope, &resolved);
+            let mut restore = lookup(key.clone()).await;
+            let mut fallback_key = None;
+            if restore.is_empty() {
+                if let Some(fallback) = &scope.fallback {
+                    let candidate = crate::cache_key(&project, fallback, &resolved);
+                    restore = lookup(candidate.clone()).await;
+                    if !restore.is_empty() {
+                        fallback_key = Some(candidate);
+                    }
                 }
-                break;
             }
+            own = Some((key, restore, fallback_key));
         }
+        // The Environment's scope (git-bug 31a2533): resolved beside the
+        // ref's, and used only once the launch finds the Step admitted by an
+        // approved Environment approval gate. No fallback.
+        let approved = match &scope.environment {
+            Some(env_scope) => {
+                let key = crate::cache_key(&project, env_scope, &resolved);
+                let restore = lookup(key.clone()).await;
+                Some(crate::CacheResolution { key, restore })
+            }
+            None => None,
+        };
         if let Some(cache) = &mut spec.cache {
-            cache.key = Some(key);
-            cache.restore = restore;
-            cache.fallback_key = fallback_key;
+            if let Some((key, restore, fallback_key)) = own {
+                cache.key = Some(key);
+                cache.restore = restore;
+                cache.fallback_key = fallback_key;
+            }
+            cache.approved = approved;
         }
     }
 

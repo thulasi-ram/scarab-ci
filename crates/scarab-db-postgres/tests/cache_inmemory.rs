@@ -17,8 +17,8 @@ use std::sync::Mutex;
 
 use scarab_engine::ports::ExecState;
 use scarab_engine::{
-    cache_key, rerun_step, CacheConfig, CacheScope, Db, RunId, RunStatus, Scheduler, StepId,
-    StepSpec, StepStatus, Timestamp, WorkspaceSnapshots,
+    cache_key, rerun_step, CacheConfig, CacheResolution, CacheScope, Db, RunId, RunStatus,
+    Scheduler, StepId, StepSpec, StepStatus, Timestamp, WorkspaceSnapshots,
 };
 use scarab_testkit::{FakeClock, FakeExecutor, InMemoryDb};
 
@@ -93,6 +93,7 @@ fn caching(dirs: &[&str], key_files: &[&str]) -> CacheConfig {
         key: None,
         restore: Vec::new(),
         fallback_key: None,
+        approved: None,
     }
 }
 
@@ -459,22 +460,18 @@ async fn a_pull_request_naming_the_environment_never_writes_what_an_environment_
     );
     assert_eq!(saved(&db, "refs/heads/main").await, None, "or main's");
 
+    // The Environment's resolution, which a Step the approved gate admits
+    // launches with (git-bug 31a2533), restores nothing the PR wrote.
     let prod =
         CacheScope::for_run(Some("prod"), Some("refs/heads/main"), Some("main"), false).unwrap();
     let cache = run_once(&db, "run-prod", prod, "tree-from-prod").await;
-    assert!(
-        cache.restore.is_empty(),
-        "the Environment Run must not restore the PR's entry: {:?}",
-        cache.restore
-    );
-    assert_eq!(cache.fallback_key, None);
     assert_eq!(
-        cache.key.as_deref(),
-        Some(cache_key("acme/web", "env:prod", &lock()).as_str())
-    );
-    assert_eq!(
-        saved(&db, "env:prod").await.as_deref(),
-        Some("tree-from-prod")
+        cache.approved,
+        Some(CacheResolution {
+            key: cache_key("acme/web", "env:prod", &lock()),
+            restore: vec![],
+        }),
+        "the Environment Run must not restore the PR's entry"
     );
 }
 
@@ -521,22 +518,36 @@ async fn a_feature_branch_run_restores_the_default_branch_and_saves_under_its_ow
     assert_eq!(cache.fallback_key, None);
 }
 
-/// An Environment-governed Run does not fall back: with `main` holding an
-/// entry for the same key files, its first build is cold.
+/// The Environment's scope does not fall back: with `main` holding an entry
+/// for the same key files, a Step the approved gate admits restores nothing.
+/// A Step of the same Run before the gate uses `main`'s scope, its ref's,
+/// and restores that entry (git-bug 31a2533). Without a launch decision the
+/// scheduler hands the ref's resolution by default; the Environment's rides
+/// beside it.
 #[tokio::test]
-async fn an_environment_run_does_not_fall_back_to_the_default_branch() {
+async fn the_environment_scope_does_not_fall_back_to_the_default_branch() {
     let db = InMemoryDb::new();
     run_once(&db, "run-main", main_scope(), "tree-from-main").await;
 
     let prod =
         CacheScope::for_run(Some("prod"), Some("refs/heads/main"), Some("main"), false).unwrap();
     let cache = run_once(&db, "run-prod", prod, "tree-from-prod").await;
-    assert!(cache.restore.is_empty(), "{:?}", cache.restore);
-    assert_eq!(cache.fallback_key, None);
     assert_eq!(
-        saved(&db, "refs/heads/main").await.as_deref(),
-        Some("tree-from-main")
+        cache.key.as_deref(),
+        Some(cache_key("acme/web", "refs/heads/main", &lock()).as_str())
     );
+    assert_eq!(
+        cache.restore,
+        vec![("node_modules".to_string(), "tree-from-main".to_string())]
+    );
+    assert_eq!(
+        cache.approved,
+        Some(CacheResolution {
+            key: cache_key("acme/web", "env:prod", &lock()),
+            restore: vec![],
+        })
+    );
+    assert_eq!(saved(&db, "env:prod").await, None, "nothing wrote env:prod");
 }
 
 /// A rerun keys its Cache with the scope its Run was created with: the
@@ -597,20 +608,36 @@ async fn a_rerun_keeps_the_scope_its_run_started_with() {
 
 /// The scope a Run gets from its Environment, ref and default branch.
 #[test]
-fn the_cache_scope_derives_from_the_environment_else_the_ref() {
+fn the_cache_scope_derives_from_the_ref_with_the_environment_beside_it() {
     let scope = |env, git_ref, default| CacheScope::for_run(env, git_ref, default, false);
     let s = |own: &str, fallback: Option<&str>| {
         Some(CacheScope {
-            own: own.into(),
+            own: Some(own.into()),
             fallback: fallback.map(str::to_string),
+            environment: None,
         })
     };
-    // An Environment wins over the ref and never falls back.
+    // An Environment's scope sits beside the ref's (git-bug 31a2533): a Step
+    // uses it only once an approved approval gate admits it, and every other
+    // Step uses the ref's scope and its fallback.
     assert_eq!(
         scope(Some("prod"), Some("refs/heads/feat"), Some("main")),
-        s("env:prod", None)
+        Some(CacheScope {
+            own: Some("refs/heads/feat".into()),
+            fallback: Some("refs/heads/main".into()),
+            environment: Some("env:prod".into()),
+        })
     );
-    assert_eq!(scope(Some("prod"), None, None), s("env:prod", None));
+    // No ref: only the Environment's scope; Steps before the gate get no
+    // Cache.
+    assert_eq!(
+        scope(Some("prod"), None, None),
+        Some(CacheScope {
+            own: None,
+            fallback: None,
+            environment: Some("env:prod".into()),
+        })
+    );
     // A pull request never gets the Environment's scope: not on a pull or
     // merge request ref, and not when the event is a pull request or a
     // locked-out fork (`pull_request`). It is scoped by its ref instead.

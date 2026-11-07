@@ -1370,13 +1370,17 @@ impl Db for PostgresDb {
         run: &RunId,
         scope: &scarab_engine::CacheScope,
     ) -> Result<(), DbError> {
-        sqlx::query("UPDATE runs SET cache_scope = $2, cache_fallback_scope = $3 WHERE id = $1")
-            .bind(&run.0)
-            .bind(&scope.own)
-            .bind(scope.fallback.as_deref())
-            .execute(self.pool())
-            .await
-            .map_err(db_err)?;
+        sqlx::query(
+            "UPDATE runs SET cache_scope = $2, cache_fallback_scope = $3, \
+             cache_environment_scope = $4 WHERE id = $1",
+        )
+        .bind(&run.0)
+        .bind(scope.own.as_deref())
+        .bind(scope.fallback.as_deref())
+        .bind(scope.environment.as_deref())
+        .execute(self.pool())
+        .await
+        .map_err(db_err)?;
         Ok(())
     }
 
@@ -1384,16 +1388,29 @@ impl Db for PostgresDb {
         &self,
         run: &RunId,
     ) -> Result<Option<scarab_engine::CacheScope>, DbError> {
-        let row = sqlx::query("SELECT cache_scope, cache_fallback_scope FROM runs WHERE id = $1")
-            .bind(&run.0)
-            .fetch_optional(self.pool())
-            .await
-            .map_err(db_err)?;
+        let row = sqlx::query(
+            "SELECT cache_scope, cache_fallback_scope, cache_environment_scope \
+             FROM runs WHERE id = $1",
+        )
+        .bind(&run.0)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(db_err)?;
         Ok(row.and_then(|r| {
-            let own = r.get::<Option<String>, _>("cache_scope")?;
+            let mut own = r.get::<Option<String>, _>("cache_scope");
+            let mut environment = r.get::<Option<String>, _>("cache_environment_scope");
+            // A Run stored before 0083 kept `env:<name>` as its only scope:
+            // its Steps before the gate get no Cache rather than that scope.
+            if environment.is_none() && own.as_deref().is_some_and(|o| o.starts_with("env:")) {
+                environment = own.take();
+            }
+            if own.is_none() && environment.is_none() {
+                return None;
+            }
             Some(scarab_engine::CacheScope {
                 own,
                 fallback: r.get::<Option<String>, _>("cache_fallback_scope"),
+                environment,
             })
         }))
     }

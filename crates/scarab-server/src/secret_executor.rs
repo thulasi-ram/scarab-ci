@@ -611,16 +611,35 @@ impl Executor for SecretInjectingExecutor {
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         let oidc_token = self.mint_oidc_token(step, admission, now_ms).await?;
-        let base;
-        let spec = if let Some(token) = oidc_token {
-            base = StepSpec {
+        let mut base = None;
+        if let Some(token) = oidc_token {
+            base = Some(StepSpec {
                 oidc_token: Some(token),
                 ..spec.clone()
-            };
-            &base
-        } else {
-            spec
-        };
+            });
+        }
+        // The Environment's cache scope (git-bug 31a2533) follows the OIDC
+        // subject: a Step uses `env:<name>` only when it would get
+        // `env=<name>`, an approved Environment approval gate upstream
+        // admitting it. Any other Step keeps its ref's scope. The scheduler
+        // resolved both; the Environment's is dropped unless it applies.
+        if spec.cache.as_ref().is_some_and(|c| c.approved.is_some()) {
+            let governed = self
+                .db
+                .run_deploy_context(&step.run)
+                .await
+                .map_err(|e| ExecError::Other(e.to_string()))?
+                .is_some_and(|ctx| !ctx.locked_out);
+            let s = base.get_or_insert_with(|| spec.clone());
+            if let Some(cache) = s.cache.as_mut() {
+                if governed && !admission.before_approval {
+                    cache.use_approved_scope();
+                } else {
+                    cache.approved = None;
+                }
+            }
+        }
+        let spec = base.as_ref().unwrap_or(spec);
         // No declared secrets → nothing further to inject.
         if spec.secrets.is_empty() {
             return self.inner.launch(step, spec).await;
