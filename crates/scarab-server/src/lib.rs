@@ -12700,16 +12700,15 @@ pub async fn connection_credential(
 /// Resolve a step's scoped secrets and prepare them for injection (ADR-0014,
 /// 0013): fetch each `key` at `scope` from `provider`, **register its value with
 /// the log redactor** so it can never appear in stored or streamed logs, and
-/// return the values as `(key, value)` env pairs for the Pod. The launch path
-/// merges these into the step's env (an executor detail; the live Pod wiring is
-/// k8s/`build_pod`).
+/// return the values as `(key, value)` pairs, the value bytes as stored. The
+/// executor writes each one as a file under `/scarab/secrets/`.
 pub async fn resolve_step_secrets(
     provider: &dyn scarab_secrets::SecretProvider,
     logs: &LogService,
     scope: &scarab_secrets::SecretScope,
     keys: &[String],
     locked_out: bool,
-) -> Result<Vec<(String, String)>, scarab_secrets::SecretError> {
+) -> Result<Vec<(String, Vec<u8>)>, scarab_secrets::SecretError> {
     // Fork-PR lockout (ADR-0015): untrusted runs get NO secrets, so we never
     // even read them from the provider.
     if locked_out {
@@ -12721,10 +12720,7 @@ pub async fn resolve_step_secrets(
         // (ADR-0037); the exact scope is tried first, so exact hits are unchanged.
         let secret = provider.resolve(scope, key).await?;
         logs.register_secret(&secret.value);
-        env.push((
-            key.clone(),
-            String::from_utf8_lossy(&secret.value).into_owned(),
-        ));
+        env.push((key.clone(), secret.value));
     }
     Ok(env)
 }

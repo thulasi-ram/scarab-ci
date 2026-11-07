@@ -63,5 +63,5 @@ async fn fork_pr_is_locked_out_of_secrets_and_gets_env_none() {
     let env = resolve_step_secrets(&secrets, &logs, &scope(), &keys, trusted.secrets_locked_out)
         .await
         .unwrap();
-    assert_eq!(env, vec![("TOKEN".to_string(), "top-secret".to_string())]);
+    assert_eq!(env, vec![("TOKEN".to_string(), b"top-secret".to_vec())]);
 }

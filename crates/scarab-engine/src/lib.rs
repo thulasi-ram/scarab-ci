@@ -781,18 +781,32 @@ pub struct StepSpec {
 }
 
 /// A step's secret values for one launch, `(name, value)` in declared order.
-/// Its `Debug` prints the names only, so a logged [`StepSpec`] never carries
-/// a value.
+/// A value is bytes, as stored: a secret file carries them unchanged. Its
+/// `Debug` prints the names only, so a logged [`StepSpec`] never carries a
+/// value.
 #[derive(Clone, Default, PartialEq, Eq)]
-pub struct ResolvedSecrets(pub Vec<(String, String)>);
+pub struct ResolvedSecrets(pub Vec<(String, Vec<u8>)>);
 
 impl ResolvedSecrets {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &(String, String)> {
+    pub fn iter(&self) -> impl Iterator<Item = &(String, Vec<u8>)> {
         self.0.iter()
+    }
+
+    /// The first secret that `secrets` marks `env: true` whose value is not
+    /// UTF-8 text. An environment variable cannot carry it unchanged, so the
+    /// launch refuses it; the file can.
+    pub fn first_non_text_env(&self, secrets: &[scarab_pipeline::SecretRef]) -> Option<&str> {
+        self.0
+            .iter()
+            .find(|(name, value)| {
+                secrets.iter().any(|s| s.env && &s.name == name)
+                    && std::str::from_utf8(value).is_err()
+            })
+            .map(|(name, _)| name.as_str())
     }
 }
 

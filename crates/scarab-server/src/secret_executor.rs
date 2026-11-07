@@ -647,6 +647,12 @@ impl Executor for SecretInjectingExecutor {
         // as a file and never writes a value into the Pod spec (ADR-0014).
         let mut spec = spec.clone();
         spec.resolved_secrets = scarab_engine::ResolvedSecrets(resolved);
+        if let Some(name) = spec.resolved_secrets.first_non_text_env(&spec.secrets) {
+            return Err(ExecError::Refused(format!(
+                "secret `{name}` is not UTF-8 text, so it cannot be an environment variable: \
+                 remove `env: true` and read the file $SCARAB_SECRETS/{name}"
+            )));
+        }
         self.inner.launch(step, &spec).await
     }
 

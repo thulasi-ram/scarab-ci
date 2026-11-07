@@ -20,7 +20,7 @@ use scarab_testkit::{FakeSecrets, InMemoryDb, InMemoryObjectStore};
 #[derive(Default)]
 struct CapturingExec {
     last_env: Mutex<Option<Vec<(String, String)>>>,
-    last_secrets: Mutex<Option<Vec<(String, String)>>>,
+    last_secrets: Mutex<Option<Vec<(String, Vec<u8>)>>>,
 }
 #[async_trait]
 impl Executor for CapturingExec {
@@ -134,7 +134,7 @@ async fn launched_env(exec: &CapturingExec) -> Vec<(String, String)> {
         .clone()
         .expect("inner executor was launched")
 }
-async fn launched_secrets(exec: &CapturingExec) -> Vec<(String, String)> {
+async fn launched_secrets(exec: &CapturingExec) -> Vec<(String, Vec<u8>)> {
     exec.last_secrets
         .lock()
         .unwrap()
@@ -185,7 +185,7 @@ async fn injects_env_scoped_secret_with_repo_inheritance() {
     );
     assert_eq!(
         launched_secrets(&inner).await,
-        vec![("TOKEN".to_string(), "s3cr3t".to_string())],
+        vec![("TOKEN".to_string(), b"s3cr3t".to_vec())],
         "inherited repo secret resolved for the executor to mount"
     );
 }
@@ -734,4 +734,89 @@ steps:
             assert_eq!((before.as_str(), after.as_str()), (none, env));
         }
     }
+}
+
+fn prod_context() -> DeployContext {
+    DeployContext {
+        org: "acme".into(),
+        project: "web".into(),
+        environment: "prod".into(),
+        git_ref: "refs/heads/main".into(),
+        locked_out: false,
+    }
+}
+
+/// A secret that is not UTF-8 (a keystore, a binary key) reaches the
+/// executor byte for byte: the file the Step reads is what was stored
+/// (git-bug c1f61c9).
+#[tokio::test]
+async fn a_binary_secret_reaches_the_executor_unchanged() {
+    let db = Arc::new(InMemoryDb::new());
+    db.set_run_deploy_context(&RunId("r1".into()), &prod_context())
+        .await
+        .unwrap();
+    let value: &[u8] = &[0x00, 0xff, 0xfe, b'k', 0x80, b'\n'];
+    let secrets: Arc<dyn SecretProvider> = Arc::new(FakeSecrets::new().with_secret(
+        &SecretScope::EnvironmentProject {
+            org: "acme".into(),
+            project: "web".into(),
+            environment: "prod".into(),
+        },
+        "TOKEN",
+        value,
+    ));
+    let inner = Arc::new(CapturingExec::default());
+    let exec = SecretInjectingExecutor::new(
+        inner.clone(),
+        db.clone() as Arc<dyn Db>,
+        secrets,
+        logs(db.clone()),
+    );
+
+    exec.launch(&step("r1"), &spec_with_secret()).await.unwrap();
+
+    assert_eq!(
+        launched_secrets(&inner).await,
+        vec![("TOKEN".to_string(), value.to_vec())]
+    );
+}
+
+/// An `env: true` secret must be text: an environment variable cannot carry
+/// arbitrary bytes. The launch is refused with the reason, and the executor
+/// never starts.
+#[tokio::test]
+async fn a_binary_secret_marked_env_true_is_refused() {
+    let db = Arc::new(InMemoryDb::new());
+    db.set_run_deploy_context(&RunId("r1".into()), &prod_context())
+        .await
+        .unwrap();
+    let secrets: Arc<dyn SecretProvider> = Arc::new(FakeSecrets::new().with_secret(
+        &SecretScope::EnvironmentProject {
+            org: "acme".into(),
+            project: "web".into(),
+            environment: "prod".into(),
+        },
+        "TOKEN",
+        &[0xff, 0xfe],
+    ));
+    let inner = Arc::new(CapturingExec::default());
+    let exec = SecretInjectingExecutor::new(
+        inner.clone(),
+        db.clone() as Arc<dyn Db>,
+        secrets,
+        logs(db.clone()),
+    );
+    let mut spec = spec_with_secret();
+    spec.secrets = vec![scarab_pipeline::SecretRef::file_and_env("TOKEN")];
+
+    let err = exec.launch(&step("r1"), &spec).await.unwrap_err();
+
+    assert!(
+        matches!(&err, ExecError::Refused(m) if m.contains("TOKEN") && m.contains("UTF-8")),
+        "{err:?}"
+    );
+    assert!(
+        inner.last_secrets.lock().unwrap().is_none(),
+        "the executor was not launched"
+    );
 }

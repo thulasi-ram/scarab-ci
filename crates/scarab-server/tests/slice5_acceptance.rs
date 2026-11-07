@@ -68,7 +68,7 @@ async fn secret_used_not_logged_oidc_verifies_and_build_produces_digest() {
     .unwrap();
     assert_eq!(
         env,
-        vec![("DEPLOY_TOKEN".to_string(), "prod-token-xyz".to_string())]
+        vec![("DEPLOY_TOKEN".to_string(), b"prod-token-xyz".to_vec())]
     );
 
     let (run, step, attempt) = (
