@@ -32,6 +32,7 @@ use scarab_project::{
     ApprovalGateRules, EnvironmentGovernanceStore, EnvironmentProjectEligibility,
     EnvironmentProtectionRules, EnvironmentStore, MissingGateMode,
 };
+use scarab_server::oidc::{verify, Rs256Issuer};
 use scarab_server::{
     dispatch_run, router, AppState, DispatchError, DispatchKind, LogService,
     SecretInjectingExecutor,
@@ -102,6 +103,7 @@ struct Stack {
     clock: Arc<FakeClock>,
     governance: Arc<InMemoryEnvironmentGovernance>,
     exec: Arc<FakeExecutor>,
+    issuer: Arc<Rs256Issuer>,
     app: axum::Router,
 }
 
@@ -143,6 +145,7 @@ impl Stack {
             clock,
             governance,
             exec: Arc::new(FakeExecutor::new()),
+            issuer: Arc::new(Rs256Issuer::generate("https://scarab.example").unwrap()),
             app,
         }
     }
@@ -180,8 +183,8 @@ impl Stack {
     }
 
     /// Tick the run `n` times through the launch re-check
-    /// (`SecretInjectingExecutor` with the governance and this clock), every
-    /// launched step succeeding.
+    /// (`SecretInjectingExecutor` with the governance, this clock and OIDC
+    /// minting on), every launched step succeeding.
     async fn tick(&self, run: &RunId, n: usize) {
         let logs = Arc::new(LogService::new(
             Arc::new(InMemoryObjectStore::new()),
@@ -194,6 +197,11 @@ impl Stack {
             logs,
         )
         .with_environment_governance(self.governance.clone())
+        .with_oidc(
+            self.issuer.clone(),
+            "https://scarab.example",
+            "sts.example.com",
+        )
         .with_clock(self.clock.clone());
         let sched = Scheduler::new(
             self.db.as_ref(),
@@ -259,6 +267,28 @@ impl Stack {
             .find(|s| s["id"] == step)
             .cloned()
             .unwrap_or_else(|| panic!("no step `{step}` in {body}"))
+    }
+
+    /// The `sub` claim of the OIDC token `step`'s latest attempt launched
+    /// with; `None` when it never launched.
+    async fn oidc_subject(&self, run: &RunId, step: &str) -> Option<String> {
+        let sr = self
+            .db
+            .steps_of_run(run)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.step.0 == step)?;
+        let spec = self.exec.launched_spec(&FakeExecutor::handle_for(&sr))?;
+        let jwks = self.issuer.jwks();
+        let claims = verify(
+            &spec.oidc_token?,
+            jwks["keys"][0]["n"].as_str().unwrap(),
+            jwks["keys"][0]["e"].as_str().unwrap(),
+            "sts.example.com",
+        )
+        .expect("verifies");
+        claims["sub"].as_str().map(str::to_string)
     }
 
     /// The Config refusal of `step`'s only attempt.
@@ -966,4 +996,134 @@ async fn two_racing_approvals_are_both_recorded_and_release_once() {
     );
     assert_eq!(s.status(&run, "approve").await, StepStatus::Succeeded);
     assert_eq!(releases(&s, &run, "approve").await, 1);
+}
+
+/// A deploy behind an approval gate, and `cloud`, also behind it: a Step
+/// with no secret, no grant and no `deploy:` mark (a cloud CLI that assumes
+/// a role with the Run's OIDC token). It does not use the Environment's
+/// authority by itself, but its OIDC subject can.
+const GATED_WITH_CLOUD: &str = r#"
+on:
+  manual: {}
+environment: prod
+steps:
+  - { id: build, image: busybox, command: ["true"] }
+  - { id: approve, gate: manual, needs: [build] }
+  - { id: ship, image: busybox, command: ["true"], deploy: true, needs: [approve] }
+  - { id: cloud, image: busybox, command: ["true"], needs: [approve] }
+"#;
+
+const ENV_PROD: &str = "scarab:org/acme/repo/web/env/prod/ref/refs/heads/main";
+const ENV_NONE: &str = "scarab:org/acme/repo/web/env/none/ref/refs/heads/main";
+
+/// Run [`GATED_WITH_CLOUD`] through its approval: `build`
+/// before the gate gets `env=none`, and `cloud` after it gets `env=prod`.
+async fn cloud_approved(s: &Stack) -> RunId {
+    let run = s.dispatch(GATED_WITH_CLOUD).await.expect("admitted");
+    s.tick(&run, 6).await;
+    assert_eq!(
+        s.oidc_subject(&run, "build").await.as_deref(),
+        Some(ENV_NONE)
+    );
+    let (status, body) = s.approve(&run, "approve").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["released"], true, "{body}");
+    s.tick(&run, 6).await;
+    assert_eq!(s.status(&run, "cloud").await, StepStatus::Succeeded);
+    assert_eq!(
+        s.oidc_subject(&run, "cloud").await.as_deref(),
+        Some(ENV_PROD)
+    );
+    run
+}
+
+/// Rerun `cloud`, tick, and return the OIDC subject the rerun launched
+/// with. The rerun is not refused: `cloud` does not use the Environment's
+/// authority, so only its subject depends on the approval.
+async fn rerun_cloud(s: &Stack, run: &RunId) -> Option<String> {
+    scarab_engine::rerun_step(
+        s.db.as_ref(),
+        s.clock.as_ref(),
+        run,
+        &StepId("cloud".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    s.tick(run, 4).await;
+    assert_eq!(s.status(run, "cloud").await, StepStatus::Succeeded);
+    s.oidc_subject(run, "cloud").await
+}
+
+/// Review round 2 (red team): the OIDC subject is checked as an authority
+/// Step's launch is. A rerun of `cloud` within the maximum approval age,
+/// with the approvers and refs unchanged, keeps `env=prod`.
+#[tokio::test]
+async fn a_fresh_approval_keeps_the_environments_oidc_subject() {
+    let s = Stack::new(rules(&[ME])).await;
+    let run = cloud_approved(&s).await;
+    s.clock.advance(60_000);
+    assert_eq!(rerun_cloud(&s, &run).await.as_deref(), Some(ENV_PROD));
+}
+
+/// Review round 2 (red team): once the approval is older than the maximum
+/// approval age, a rerun of `cloud` gets `env=none`.
+#[tokio::test]
+async fn a_stale_approval_gives_the_oidc_subject_env_none() {
+    let mut protection = rules(&[ME]);
+    protection.approval_gate.max_approval_age_s = 3_600;
+    let s = Stack::new(protection).await;
+    let run = cloud_approved(&s).await;
+    s.clock.advance(3_601_000);
+    assert_eq!(rerun_cloud(&s, &run).await.as_deref(), Some(ENV_NONE));
+}
+
+/// Review round 2 (red team): once the approvers changed since the gate
+/// released, a rerun of `cloud` gets `env=none`.
+#[tokio::test]
+async fn changed_approvers_give_the_oidc_subject_env_none() {
+    let s = Stack::new(rules(&[ME])).await;
+    let run = cloud_approved(&s).await;
+    s.set_protection(rules(&[ME, "carol"])).await;
+    assert_eq!(rerun_cloud(&s, &run).await.as_deref(), Some(ENV_NONE));
+}
+
+/// Review round 2 (red team): once the Run's ref is no longer allowed, a
+/// rerun of `cloud` gets `env=none`.
+#[tokio::test]
+async fn a_disallowed_ref_gives_the_oidc_subject_env_none() {
+    let s = Stack::new(rules(&[ME])).await;
+    let run = cloud_approved(&s).await;
+    let mut protection = rules(&[ME]);
+    protection.allowed_refs = vec!["refs/heads/release".into()];
+    s.set_protection(protection).await;
+    assert_eq!(rerun_cloud(&s, &run).await.as_deref(), Some(ENV_NONE));
+}
+
+/// Review round 2 (red team), the attack as found: 48 h after the approval
+/// (default maximum age 24 h), with the approvers changed and the ref
+/// disallowed, the rerun of `ship` is refused and the rerun of `cloud`
+/// launches with `env=none`.
+#[tokio::test]
+async fn a_rerun_long_after_the_approval_gets_env_none_and_the_deploy_is_refused() {
+    let s = Stack::new(rules(&[ME])).await;
+    let run = cloud_approved(&s).await;
+    assert_eq!(s.status(&run, "ship").await, StepStatus::Succeeded);
+    s.clock.advance(48 * 3_600_000);
+    let mut protection = rules(&["carol"]);
+    protection.allowed_refs = vec!["refs/heads/release".into()];
+    s.set_protection(protection).await;
+    scarab_engine::rerun_step(
+        s.db.as_ref(),
+        s.clock.as_ref(),
+        &run,
+        &StepId("ship".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(rerun_cloud(&s, &run).await.as_deref(), Some(ENV_NONE));
+    assert_eq!(s.status(&run, "ship").await, StepStatus::Failed);
+    let (_, refusal) = latest_refusal(&s, &run, "ship").await;
+    assert!(refusal.contains("is no longer allowed"), "{refusal}");
 }
