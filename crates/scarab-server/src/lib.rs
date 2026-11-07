@@ -4319,7 +4319,9 @@ async fn attach_step(
         .attach(&sr)
         .await
         .map_err(|e| ApiError::BadRequest(format!("attach failed: {e}")))?;
-    Ok(ws.on_upgrade(move |socket| bridge_attach(socket, io)))
+    Ok(ws
+        .protocols([WS_PROTOCOL])
+        .on_upgrade(move |socket| bridge_attach(socket, io)))
 }
 
 /// Pump bytes both ways between a WebSocket and an attached step shell until
@@ -4400,38 +4402,40 @@ async fn debug_pod_step(
     // ADR-0076 §6: a debug Pod runs the Step's image, so a Step inlined from
     // a yanked library version gets none, as a launch would not.
     refuse_yanked_step(&st, &run, &step, "no debug Pod starts").await?;
-    Ok(ws.on_upgrade(move |mut socket| async move {
-        let _ = socket
-            .send(Message::Text(
-                "provisioning debug pod (re-materializing workspace)…\r\n".into(),
-            ))
-            .await;
-        match launcher
-            .launch_debug(&sr, &image, snapshot.as_deref(), 3600)
-            .await
-        {
-            Ok(dp) => {
-                match launcher.attach_debug(&dp.name).await {
-                    Ok(io) => {
-                        let _ = socket.send(Message::Text("\r\n".into())).await;
-                        bridge_attach(socket, io).await;
+    Ok(ws
+        .protocols([WS_PROTOCOL])
+        .on_upgrade(move |mut socket| async move {
+            let _ = socket
+                .send(Message::Text(
+                    "provisioning debug pod (re-materializing workspace)…\r\n".into(),
+                ))
+                .await;
+            match launcher
+                .launch_debug(&sr, &image, snapshot.as_deref(), 3600)
+                .await
+            {
+                Ok(dp) => {
+                    match launcher.attach_debug(&dp.name).await {
+                        Ok(io) => {
+                            let _ = socket.send(Message::Text("\r\n".into())).await;
+                            bridge_attach(socket, io).await;
+                        }
+                        Err(e) => {
+                            let _ = socket
+                                .send(Message::Text(format!("attach failed: {e}\r\n").into()))
+                                .await;
+                        }
                     }
-                    Err(e) => {
-                        let _ = socket
-                            .send(Message::Text(format!("attach failed: {e}\r\n").into()))
-                            .await;
-                    }
+                    // Throwaway: tear the reproduction Pod down when the shell ends.
+                    let _ = launcher.teardown_debug(&dp.name).await;
                 }
-                // Throwaway: tear the reproduction Pod down when the shell ends.
-                let _ = launcher.teardown_debug(&dp.name).await;
+                Err(e) => {
+                    let _ = socket
+                        .send(Message::Text(format!("debug pod failed: {e}\r\n").into()))
+                        .await;
+                }
             }
-            Err(e) => {
-                let _ = socket
-                    .send(Message::Text(format!("debug pod failed: {e}\r\n").into()))
-                    .await;
-            }
-        }
-    }))
+        }))
 }
 
 /// What a debug Pod reproduces of a finished step: the step, the image it ran
@@ -9618,8 +9622,7 @@ async fn authenticate(
     // browser send the cookie, but it can never read the token. Bearer
     // requests (API/CLI) carry the credential explicitly; no CSRF surface.
     if action != Action::Read && via == AuthVia::Cookie {
-        let presented = headers.get("x-csrf-token").and_then(|v| v.to_str().ok());
-        if !session.csrf_matches(presented) {
+        if !session.csrf_matches(presented_csrf(headers)) {
             return Err(ApiError::Forbidden);
         }
     }
@@ -9634,6 +9637,38 @@ async fn authenticate(
         via: Some(via),
         session: Some(facts),
     })
+}
+
+/// The subprotocol the debug shell's WebSocket speaks. The server selects it,
+/// never the CSRF entry, so the token is not echoed back.
+pub const WS_PROTOCOL: &str = "scarab.v1";
+
+/// The prefix of the `Sec-WebSocket-Protocol` entry that carries a browser's
+/// CSRF token on a WebSocket handshake: `scarab.csrf.<token>`.
+pub const WS_CSRF_PROTOCOL_PREFIX: &str = "scarab.csrf.";
+
+/// The CSRF token a cookie request presents: the `x-csrf-token` header, or on
+/// a WebSocket handshake, which cannot carry custom headers from a browser,
+/// a `scarab.csrf.<token>` entry of `Sec-WebSocket-Protocol`. A cross-site
+/// page can set neither: it cannot read the token, and a page sets the
+/// subprotocol list only through the WebSocket API with values it knows.
+fn presented_csrf(headers: &HeaderMap) -> Option<&str> {
+    if let Some(v) = headers.get("x-csrf-token") {
+        return v.to_str().ok();
+    }
+    let websocket = headers
+        .get(axum::http::header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
+    if !websocket {
+        return None;
+    }
+    headers
+        .get_all(axum::http::header::SEC_WEBSOCKET_PROTOCOL)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .find_map(|p| p.trim().strip_prefix(WS_CSRF_PROTOCOL_PREFIX))
 }
 
 /// Authenticate a `scarab_pat_…` bearer (ADR-0049 amendment): hash it, load the
