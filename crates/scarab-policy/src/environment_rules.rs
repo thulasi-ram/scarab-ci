@@ -18,8 +18,9 @@
 //!   the Environment's authority, the ref is still allowed and one
 //!   Environment approval gate upstream has released, with the approver set
 //!   its release recorded unchanged, within the maximum approval age.
-//!   A Step with no released approval gate upstream gets the `env=none`
-//!   OIDC subject.
+//!   Any Step, authority or not, that no such gate admits gets the
+//!   `env=none` OIDC subject: the subject is itself authority over the
+//!   Environment's cloud roles.
 //!
 //! A built-in rule's result names it by a `builtin:` id, as the plugin
 //! default's does ([`PLUGINS_DEFAULT_ID`](crate::evaluate::PLUGINS_DEFAULT_ID)).
@@ -257,9 +258,12 @@ pub struct LaunchCheck {
     pub result: Option<PolicyResult>,
     /// Why the Step may not use the Environment's authority now.
     pub refusal: Option<String>,
-    /// No Environment approval gate upstream has released, in an
-    /// Environment with approvers: the Step's OIDC subject is `env=none`
-    /// (ADR-0075 §3).
+    /// No Environment approval gate upstream admits the Step now, in an
+    /// Environment with approvers: none has released, or none that did
+    /// passes the checks an authority Step's launch makes (the ref, the
+    /// approver set, the maximum approval age). The Step's OIDC subject is
+    /// `env=none` (ADR-0075 §3); the Step is refused only when it uses the
+    /// Environment's authority.
     pub before_approval: bool,
 }
 
@@ -272,6 +276,11 @@ pub struct LaunchCheck {
 /// qualifies, the refusal is the one for the gate latest in the Pipeline.
 /// External, timer and plugin gates are never approval gates, so a Step
 /// behind only those is refused whatever released them.
+///
+/// The same test decides every Step's OIDC subject, whether or not the Step
+/// uses the authority otherwise: a cloud role trusts `env=<name>`, so a
+/// Step that no qualifying gate admits launches with `env=none`
+/// ([`LaunchCheck::before_approval`]).
 pub fn launch_recheck(f: LaunchFacts<'_>) -> LaunchCheck {
     let p = f.protection;
     if p.approvers.is_empty() {
@@ -281,10 +290,9 @@ pub fn launch_recheck(f: LaunchFacts<'_>) -> LaunchCheck {
             before_approval: false,
         };
     }
-    let before_approval = !f.approval_gates.iter().any(|g| g.released_at.is_some());
-    let refusal = (f.uses_authority == Some(true))
-        .then(|| refusal(f))
-        .flatten();
+    let unqualified = refusal(f);
+    let before_approval = unqualified.is_some();
+    let refusal = unqualified.filter(|_| f.uses_authority == Some(true));
     let outcome = match &refusal {
         None => PolicyOutcome::Passed,
         Some(r) => PolicyOutcome::Denied {
@@ -489,5 +497,70 @@ steps:
             r.contains("`prod-gate`") && r.contains("has not released"),
             "{r}"
         );
+    }
+
+    /// Review round 2 (red team): a Step that does not use the
+    /// Environment's authority is never refused, but it gets the
+    /// Environment's OIDC subject only when an approval gate upstream
+    /// passes the checks an authority Step's launch makes: released, within
+    /// the maximum approval age, the approver set unchanged, the ref still
+    /// allowed.
+    #[test]
+    fn the_oidc_subject_needs_a_qualifying_gate_for_any_step() {
+        let p = protection(&["amy"], false);
+        let day_ms = 24 * 3600 * 1000;
+        let now_ms = 3 * day_ms;
+        let gate = |released_at, met: (Vec<String>, Option<u32>)| {
+            vec![UpstreamGateFacts {
+                gate: "approve".to_string(),
+                released_at,
+                met: Some(met),
+            }]
+        };
+        let check = |p: &EffectiveProtection, git_ref, gates: &[UpstreamGateFacts]| {
+            launch_recheck(LaunchFacts {
+                environment: "prod",
+                git_ref,
+                protection: p,
+                step: "cloud",
+                uses_authority: Some(false),
+                approval_gates: gates,
+                now_ms,
+            })
+        };
+        let main = "refs/heads/main";
+        let fresh = gate(Some(now_ms - 60_000), p.approver_set());
+        let ok = check(&p, main, &fresh);
+        assert_eq!((ok.refusal, ok.before_approval), (None, false), "fresh");
+
+        let mut cases = vec![
+            ("unreleased", check(&p, main, &gate(None, p.approver_set()))),
+            (
+                "stale",
+                check(&p, main, &gate(Some(now_ms - 2 * day_ms), p.approver_set())),
+            ),
+            (
+                "approvers changed",
+                check(
+                    &p,
+                    main,
+                    &gate(Some(now_ms - 60_000), (vec!["bo".into()], None)),
+                ),
+            ),
+            ("no gate", check(&p, main, &[])),
+        ];
+        let release_only = scarab_project::effective_protection(
+            &EnvironmentProtectionRules {
+                approvers: vec!["amy".into()],
+                allowed_refs: vec!["refs/heads/release".into()],
+                ..Default::default()
+            },
+            None,
+        );
+        cases.push(("ref disallowed", check(&release_only, main, &fresh)));
+        for (case, c) in cases {
+            assert!(c.before_approval, "{case}: the subject is env=none");
+            assert_eq!(c.refusal, None, "{case}: the Step is not refused");
+        }
     }
 }

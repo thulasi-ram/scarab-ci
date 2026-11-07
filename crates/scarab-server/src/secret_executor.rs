@@ -62,9 +62,10 @@ pub struct SecretInjectingExecutor {
 /// What the launch decorators learn from a Step's admission.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct StepAdmission {
-    /// No Environment approval gate upstream of the Step has released, in an
-    /// Environment with approvers: its OIDC subject is `env=none`
-    /// (ADR-0075 §3).
+    /// No Environment approval gate upstream of the Step admits it now, in
+    /// an Environment with approvers (none released, or none that did is
+    /// within the maximum approval age, with the approver set unchanged, on
+    /// a ref still allowed): its OIDC subject is `env=none` (ADR-0075 §3).
     pub(crate) before_approval: bool,
 }
 
@@ -525,10 +526,11 @@ impl SecretInjectingExecutor {
         };
         // The fork-PR downgrade (ADR-0015): a locked-out run's subject says
         // env `none` — no cloud trust policy for a real environment matches.
-        // So does a Step with no released Environment approval gate upstream
-        // in an Environment with approvers (ADR-0075 §3): it runs before the
-        // approval, and the cloud must not trust it as the Environment. The
-        // `step.admit` decision says which ([`StepAdmission`]).
+        // So does a Step that no Environment approval gate upstream admits
+        // now, in an Environment with approvers (ADR-0075 §3): before the
+        // approval, or after it went stale, the approvers changed or the ref
+        // was disallowed, the cloud must not trust it as the Environment.
+        // The `step.admit` decision says which ([`StepAdmission`]).
         let env = if ctx.locked_out || admission.before_approval {
             "none"
         } else {
