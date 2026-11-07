@@ -4212,6 +4212,9 @@ impl<'a> Scheduler<'a> {
     /// - **`Failed`** — code produced a failing *verdict*: a `Step` failure
     ///   (incl. an exhausted opt-in retry), a `Timeout`, or a cancelled step.
     ///   The developer signal.
+    /// - **`Cancelled`** — a step is cancelled and the Run's latest operator
+    ///   cancel request still stands (no rerun or retry since): a cancel
+    ///   whose own Run commit never landed (git-bug 0962583).
     /// - **`DeadLettered`** — the system could not obtain a verdict: infra
     ///   retries exhausted or a lost execution. The operator signal, with
     ///   diagnostics on the event log.
@@ -4261,11 +4264,9 @@ impl<'a> Scheduler<'a> {
             RunStatus::DeadLettered
         } else if failed {
             // An operator cancel writes its request first, then each Step,
-            // then the Run (`cancel_run_request`). Interrupted before the
-            // Run's commit, it left Cancelled Steps that this pass could not
-            // tell from a failure, so the Run settled Failed and a re-sent
-            // cancel found it terminal (git-bug 0962583). A cancel request
-            // no rerun or retry has answered since finishes the cancel here.
+            // then the Run (`cancel_run_request`). A Cancelled Step under a
+            // request no rerun or retry has answered since is that cancel,
+            // interrupted before its Run commit: finish it (git-bug 0962583).
             let cancelled = steps.iter().any(|s| s.status == StepStatus::Cancelled);
             if cancelled && cancel_request_stands(&self.db.events(run).await?) {
                 RunStatus::Cancelled
