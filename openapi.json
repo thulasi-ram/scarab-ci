@@ -6940,10 +6940,17 @@
         ],
         "responses": {
           "202": {
-            "description": "approval recorded (released or awaiting more approvals)"
+            "description": "approval recorded: the gate released, or it waits for more approvals or for its wait timer",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GateApprovalDto"
+                }
+              }
+            }
           },
           "403": {
-            "description": "`step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. Or the caller's role is insufficient.",
+            "description": "the caller may not approve (insufficient role), a step-up is required (`step_up_required`, JSON), or a `gate.resolve` Policy refused the approval or holds the gate (plain text naming the Policy)",
             "content": {
               "application/json": {
                 "schema": {
@@ -10094,6 +10101,37 @@
           }
         }
       },
+      "GateApprovalDto": {
+        "type": "object",
+        "description": "The answer to a gate approval.",
+        "required": [
+          "released"
+        ],
+        "properties": {
+          "approvals": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The approvers recorded on the gate so far. Absent when the gate had\nalready released."
+          },
+          "released": {
+            "type": "boolean",
+            "description": "The gate has released (now or before this approval)."
+          },
+          "releases_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When the gate releases (epoch ms): the approvals are in and the\nEnvironment's wait timer is still running. Absent otherwise."
+          }
+        }
+      },
       "GateDefinitionDto": {
         "type": "object",
         "description": "A gate a plugin resolves: a Pipeline waits on it with `invoke:\nplugin:<installation>/<name>`.",
@@ -12272,6 +12310,44 @@
           }
         }
       },
+      "PutApprovalGateRules": {
+        "type": "object",
+        "description": "The approval gate settings of a baseline `PUT` (ADR-0078). Each omitted\nfield takes its default.",
+        "properties": {
+          "added_gate_expiry_s": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Seconds before the gate the Environment adds expires; omitted = it\nwaits until approved or rejected.",
+            "minimum": 0
+          },
+          "max_approval_age_s": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Seconds an approval stays good for at launch; omitted = 86400.",
+            "minimum": 0
+          },
+          "missing_gate_mode": {
+            "$ref": "#/components/schemas/MissingGateModeDto",
+            "description": "`add` (default) or `refuse` (ADR-0078 §3)."
+          },
+          "required_approvals": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "How many of `approvers` must approve, 1 to their number; omitted =\nevery one.",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
       "PutEnvironmentProjectOverlayRequest": {
         "type": "object",
         "description": "A Project overlay (`…/projects/{project}/overlay`) body: the baseline's\nfour rules, which can only **tighten** (ADR-0071 §3). Replaced whole,\nomitted = permissive default, unknown fields refused — as for the\nbaseline.",
@@ -12321,21 +12397,16 @@
         "type": "object",
         "description": "A baseline (`…/protection`) body: the four rules and the approval gate\nsettings, replaced whole. Every field is optional and an omitted one\ntakes its default — never the stored value — so `{}` resets the baseline\nto permissive (and the approval gate settings to theirs).\nUnknown fields are refused, so the retired per-repo shape (`wait_timer`,\n`concurrency`) — and `deployment_concurrency`, which ADR-0074 removed — is\na 400, not a silently ignored rule.",
         "properties": {
-          "added_gate_expiry_s": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int32",
-            "description": "Seconds before the gate the Environment adds expires; omitted = it\nwaits until approved or rejected.",
-            "minimum": 0
-          },
           "allowed_refs": {
             "type": "array",
             "items": {
               "type": "string"
             },
             "description": "Ref globs (`refs/heads/main`, `refs/tags/*`); empty = any ref."
+          },
+          "approval_gate": {
+            "$ref": "#/components/schemas/PutApprovalGateRules",
+            "description": "The approval gate settings, in the shape `GET` returns them under\n`protection.approval_gate`. Omitted = every default."
           },
           "approvers": {
             "type": "array",
@@ -12344,31 +12415,9 @@
             },
             "description": "Principal ids (ADR-0069): each must name an existing Principal; a\nmerged id is stored as the Principal it now is. All must approve."
           },
-          "max_approval_age_s": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int32",
-            "description": "Seconds an approval stays good for at launch; omitted = 86400.",
-            "minimum": 0
-          },
-          "missing_gate_mode": {
-            "$ref": "#/components/schemas/MissingGateModeDto",
-            "description": "`add` (default) or `refuse` (ADR-0078 §3)."
-          },
           "require_reason": {
             "type": "boolean",
             "description": "A human dispatch must carry a reason (ADR-0057 §3). Omitted = off."
-          },
-          "required_approvals": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int32",
-            "description": "How many of `approvers` must approve, 1 to their number; omitted =\nevery one.",
-            "minimum": 0
           },
           "wait_timer_s": {
             "type": "integer",

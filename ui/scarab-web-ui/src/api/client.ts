@@ -1517,12 +1517,8 @@ export async function cancelRun(id: string): Promise<void> {
 }
 
 /** The approvals recorded on a manual gate, and whether they released it.
- *
- * `approvals` is OPTIONAL on purpose: the handler emits two shapes. The normal
- * path returns `{approvals, released}`, but the late/duplicate-approval branch
- * returns only `{released: true}`. Reading `.approvals.length` unguarded throws
- * on that second shape. */
-export type GateApproval = { approvals?: string[]; released: boolean; releases_at?: number | null };
+ * `approvals` is absent when the gate had already released. */
+export type GateApproval = components["schemas"]["GateApprovalDto"];
 
 /** Approve a `manual` gate. Append-only and idempotent: the
  * principal's approval is RECORDED, and the gate releases only once the
@@ -1537,12 +1533,8 @@ export async function approveGate(id: string, step: string): Promise<GateApprova
   const { data, error } = await api.POST("/v1/runs/{id}/gates/{step}/approve", {
     params: { path: { id, step } },
   });
-  if (error) throw new Error(`failed to approve gate ${step}`);
-  // `as unknown` is required, not sloppiness: the 202 declares no response body
-  // in the OpenAPI spec (the handler returns an ad-hoc `Json(json!(…))` rather
-  // than a ToSchema DTO), so the generated type for `data` is `undefined`.
-  // Worth fixing at source, which would also settle the two-shapes wrinkle above.
-  return data as unknown as GateApproval;
+  if (error || !data) throw new Error(`failed to approve gate ${step}`);
+  return data;
 }
 
 /** Reject a waiting gate — fail it with a reason (`POST …/gates/{step}/reject`,

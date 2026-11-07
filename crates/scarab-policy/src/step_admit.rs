@@ -24,6 +24,11 @@ policy_struct! {
         pub image: String,
         pub deploy: bool,
         pub secrets: Capped<String, MAX_SECRETS>,
+        /// The names in `secrets` whose entry has `env: true`: each is an
+        /// environment variable of the Step as well as a file. Absent from
+        /// inputs recorded before it existed, so a rule reads it as
+        /// `has(step.env_secrets) && 'NAME' in step.env_secrets`.
+        pub env_secrets: Option<Capped<String, MAX_SECRETS>>,
         pub forge_token: Option<ForgeToken>,
         /// The Step uses the Environment's authority (ADR-0075 §5).
         pub uses_environment_authority: bool,

@@ -71,6 +71,25 @@ steps:
     assert_eq!(step(2)["digest"], "sha256:abc");
 }
 
+/// X7: a Policy can tell a secret that is also an environment variable
+/// (`env: true`) from one that is only a file.
+#[test]
+fn env_secrets_lists_the_env_true_entries() {
+    let ir = scarab_pipeline::compile_yaml(
+        "steps:\n  - { id: s, image: busybox, secrets: [DB_URL, { name: TOKEN, env: true }] }\n",
+    )
+    .unwrap();
+    let input = serde_json::to_value(input_from_pipeline(&ir, facts()).unwrap()).unwrap();
+    assert_eq!(
+        input["steps"][0]["secrets"],
+        serde_json::json!(["DB_URL", "TOKEN"])
+    );
+    assert_eq!(
+        input["steps"][0]["env_secrets"],
+        serde_json::json!(["TOKEN"])
+    );
+}
+
 #[test]
 fn a_list_over_its_cap_names_the_cap() {
     let secrets: Vec<String> = (0..=MAX_SECRETS).map(|i| format!("S{i}")).collect();

@@ -3297,6 +3297,22 @@ export interface components {
             security_fix: boolean;
             source: string;
         };
+        /** @description The answer to a gate approval. */
+        GateApprovalDto: {
+            /**
+             * @description The approvers recorded on the gate so far. Absent when the gate had
+             *     already released.
+             */
+            approvals?: string[] | null;
+            /** @description The gate has released (now or before this approval). */
+            released: boolean;
+            /**
+             * Format: int64
+             * @description When the gate releases (epoch ms): the approvals are in and the
+             *     Environment's wait timer is still running. Absent otherwise.
+             */
+            releases_at?: number | null;
+        };
         /**
          * @description A gate a plugin resolves: a Pipeline waits on it with `invoke:
          *     plugin:<installation>/<name>`.
@@ -4305,6 +4321,31 @@ export interface components {
             privilege_grant?: null | components["schemas"]["EnvironmentProjectPrivilegeGrantDto"];
         };
         /**
+         * @description The approval gate settings of a baseline `PUT` (ADR-0078). Each omitted
+         *     field takes its default.
+         */
+        PutApprovalGateRules: {
+            /**
+             * Format: int32
+             * @description Seconds before the gate the Environment adds expires; omitted = it
+             *     waits until approved or rejected.
+             */
+            added_gate_expiry_s?: number | null;
+            /**
+             * Format: int32
+             * @description Seconds an approval stays good for at launch; omitted = 86400.
+             */
+            max_approval_age_s?: number | null;
+            /** @description `add` (default) or `refuse` (ADR-0078 §3). */
+            missing_gate_mode?: components["schemas"]["MissingGateModeDto"];
+            /**
+             * Format: int32
+             * @description How many of `approvers` must approve, 1 to their number; omitted =
+             *     every one.
+             */
+            required_approvals?: number | null;
+        };
+        /**
          * @description A Project overlay (`…/projects/{project}/overlay`) body: the baseline's
          *     four rules, which can only **tighten** (ADR-0071 §3). Replaced whole,
          *     omitted = permissive default, unknown fields refused — as for the
@@ -4337,34 +4378,20 @@ export interface components {
          *     a 400, not a silently ignored rule.
          */
         PutEnvironmentProtectionRequest: {
-            /**
-             * Format: int32
-             * @description Seconds before the gate the Environment adds expires; omitted = it
-             *     waits until approved or rejected.
-             */
-            added_gate_expiry_s?: number | null;
             /** @description Ref globs (`refs/heads/main`, `refs/tags/*`); empty = any ref. */
             allowed_refs?: string[];
+            /**
+             * @description The approval gate settings, in the shape `GET` returns them under
+             *     `protection.approval_gate`. Omitted = every default.
+             */
+            approval_gate?: components["schemas"]["PutApprovalGateRules"];
             /**
              * @description Principal ids (ADR-0069): each must name an existing Principal; a
              *     merged id is stored as the Principal it now is. All must approve.
              */
             approvers?: string[];
-            /**
-             * Format: int32
-             * @description Seconds an approval stays good for at launch; omitted = 86400.
-             */
-            max_approval_age_s?: number | null;
-            /** @description `add` (default) or `refuse` (ADR-0078 §3). */
-            missing_gate_mode?: components["schemas"]["MissingGateModeDto"];
             /** @description A human dispatch must carry a reason (ADR-0057 §3). Omitted = off. */
             require_reason?: boolean;
-            /**
-             * Format: int32
-             * @description How many of `approvers` must approve, 1 to their number; omitted =
-             *     every one.
-             */
-            required_approvals?: number | null;
             /**
              * Format: int32
              * @description Seconds: a minimum wait on the Environment approval gate (ADR-0078
@@ -10544,14 +10571,16 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description approval recorded (released or awaiting more approvals) */
+            /** @description approval recorded: the gate released, or it waits for more approvals or for its wait timer */
             202: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": components["schemas"]["GateApprovalDto"];
+                };
             };
-            /** @description `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. Or the caller's role is insufficient. */
+            /** @description the caller may not approve (insufficient role), a step-up is required (`step_up_required`, JSON), or a `gate.resolve` Policy refused the approval or holds the gate (plain text naming the Policy) */
             403: {
                 headers: {
                     [name: string]: unknown;

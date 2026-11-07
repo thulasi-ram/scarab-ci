@@ -1137,6 +1137,17 @@ pub struct PutEnvironmentProtectionRequest {
     /// A human dispatch must carry a reason (ADR-0057 §3). Omitted = off.
     #[serde(default)]
     pub require_reason: bool,
+    /// The approval gate settings, in the shape `GET` returns them under
+    /// `protection.approval_gate`. Omitted = every default.
+    #[serde(default)]
+    pub approval_gate: PutApprovalGateRules,
+}
+
+/// The approval gate settings of a baseline `PUT` (ADR-0078). Each omitted
+/// field takes its default.
+#[derive(Debug, Default, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PutApprovalGateRules {
     /// `add` (default) or `refuse` (ADR-0078 §3).
     #[serde(default)]
     pub missing_gate_mode: MissingGateModeDto,
@@ -1370,10 +1381,11 @@ pub(crate) async fn put_environment_protection(
         body.wait_timer_s,
         body.require_reason,
         scarab_project::ApprovalGateRules {
-            missing_gate: body.missing_gate_mode.into(),
-            added_gate_expiry_s: body.added_gate_expiry_s,
-            required_approvals: body.required_approvals,
+            missing_gate: body.approval_gate.missing_gate_mode.into(),
+            added_gate_expiry_s: body.approval_gate.added_gate_expiry_s,
+            required_approvals: body.approval_gate.required_approvals,
             max_approval_age_s: body
+                .approval_gate
                 .max_approval_age_s
                 .unwrap_or(scarab_project::DEFAULT_MAX_APPROVAL_AGE_S),
         },

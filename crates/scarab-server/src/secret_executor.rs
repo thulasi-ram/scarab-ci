@@ -358,6 +358,18 @@ fn step_admit_input(
                 "secrets",
             )
             .map_err(|e| e.to_string())?,
+            env_secrets: Some(
+                rc::capped(
+                    s.secrets
+                        .iter()
+                        .filter(|r| r.env)
+                        .map(|r| r.name.clone())
+                        .collect(),
+                    &what,
+                    "secrets",
+                )
+                .map_err(|e| e.to_string())?,
+            ),
             forge_token: s.forge_token.map(|t| match t {
                 scarab_pipeline::ForgeToken::Read => rc::ForgeToken::Read,
                 scarab_pipeline::ForgeToken::Write => rc::ForgeToken::Write,

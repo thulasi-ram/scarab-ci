@@ -507,6 +507,38 @@ async fn a_step_admit_policy_denies_what_the_recheck_allows() {
     );
 }
 
+/// X7: `step.env_secrets` names the secrets that are also environment
+/// variables, so a Policy can refuse those and leave file-only secrets be.
+#[tokio::test]
+async fn a_step_admit_policy_sees_which_secrets_are_env_vars() {
+    let s = Stack::new(rules(&[ME])).await;
+    s.deny_policy(
+        "step.admit",
+        "has(step.env_secrets) && 'TOKEN' in step.env_secrets",
+    )
+    .await;
+    let run = s
+        .dispatch(
+            r#"
+on:
+  manual: {}
+steps:
+  - { id: files, image: busybox, command: ["true"], secrets: [TOKEN] }
+  - { id: envs, image: busybox, command: ["true"], needs: [files], secrets: [{ name: TOKEN, env: true }] }
+"#,
+        )
+        .await
+        .expect("admitted");
+    s.tick(&run, 6).await;
+    assert_eq!(s.status(&run, "files").await, StepStatus::Succeeded);
+    assert_eq!(s.status(&run, "envs").await, StepStatus::Failed);
+    let envs = s.admits(&run, "envs").await;
+    assert_eq!(
+        envs[0].decision.input["step"]["env_secrets"],
+        serde_json::json!(["TOKEN"])
+    );
+}
+
 /// A Run no Environment governs: ordinary CI.
 const UNGOVERNED: &str = r#"
 on:
