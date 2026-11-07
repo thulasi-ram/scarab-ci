@@ -8,7 +8,7 @@
 //!   them with `--run-ignored all`.
 //!
 //! Classical, per ADR-0017: the in-memory twins or a real Postgres
-//! (`fresh_db`; skipped without `SCARAB_TEST_DATABASE_URL`); the one fake is
+//! (`fresh_pg`; skipped without `SCARAB_TEST_DATABASE_URL`); the one fake is
 //! the authenticator (a software passkey).
 
 mod common;
@@ -21,8 +21,7 @@ use axum::http::{Request, StatusCode};
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
-use common::fresh_db;
-use scarab_db_postgres::PostgresDb;
+use common::fresh_pg;
 use scarab_identity::{
     api_token_hash, ApiToken, ApiTokenStore, IdentityStore, PasskeyStore, ProviderIdentity, Role,
     Scope, Session, SessionStore, LOGIN_KIND_BROWSER,
@@ -43,13 +42,6 @@ const DAY: i64 = 24 * 60 * MIN;
 // ---------------------------------------------------------------------------
 // Fixtures
 // ---------------------------------------------------------------------------
-
-async fn pg() -> Option<(common::TestDb, Arc<PostgresDb>)> {
-    let tdb = fresh_db().await?;
-    let pg = Arc::new(PostgresDb::with_pool(tdb.pool.clone()));
-    pg.migrate().await.unwrap();
-    Some((tdb, pg))
-}
 
 /// An API token of amy's; returns its plaintext.
 async fn pat(h: &Harness, id: &str, scope: Scope, role: Role) -> String {
@@ -197,7 +189,7 @@ async fn rt_project_token_raises_an_org_scope_request_it_can_never_run() {
         .await;
     assert_eq!(st, StatusCode::FORBIDDEN, "{b}");
     assert!(
-        h.step_up.requests().is_empty(),
+        h.mem_step_up().requests().is_empty(),
         "a request was raised for a write the token can never perform: {b}"
     );
     assert_eq!(b["code"], "outside_token_scope", "{b}");
@@ -269,7 +261,7 @@ async fn rt_a_member_ceiling_token_raises_no_admin_request() {
         .await;
     assert_eq!(st, StatusCode::FORBIDDEN, "{b}");
     assert!(!is_step_up(st, &b), "{b}");
-    assert!(h.step_up.requests().is_empty());
+    assert!(h.mem_step_up().requests().is_empty());
 }
 
 /// ATTACK: an Org token addresses its Org by a case, whitespace or type
@@ -315,7 +307,7 @@ async fn rt_org_spelling_variants_never_raise_a_request() {
     let (st, b) = h.send(req).await;
     assert!(st.is_client_error(), "{st} {b}");
     assert!(
-        h.step_up.requests().len() <= 1,
+        h.mem_step_up().requests().len() <= 1,
         "at most the one ambiguous request"
     );
 }
@@ -329,7 +321,9 @@ async fn rt_org_spelling_variants_never_raise_a_request() {
 /// advisory lock serializes count-then-insert — exactly 20 are pending.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn rt_concurrent_raises_never_exceed_the_per_human_cap_on_pg() {
-    let Some((tdb, pg)) = pg().await else { return };
+    let Some((tdb, pg)) = fresh_pg().await else {
+        return;
+    };
     let h = harness_on(Backend::Pg(pg.clone()), |st| st);
     h.grant("amy", Scope::Org("acme".into()), Role::Owner).await;
     let mut tokens = Vec::new();
@@ -391,12 +385,12 @@ async fn rt_the_body_cap_holds_at_its_boundary() {
         .bearer("POST", "/v1/secrets", Some(body(limit + 1)), &token)
         .await;
     assert_eq!(st, StatusCode::PAYLOAD_TOO_LARGE, "{b}");
-    assert!(h.step_up.requests().is_empty());
+    assert!(h.mem_step_up().requests().is_empty());
     let (st, b) = h
         .bearer("POST", "/v1/secrets", Some(body(limit)), &token)
         .await;
     assert!(is_step_up(st, &b), "{st} {b}");
-    assert_eq!(h.step_up.requests().len(), 1);
+    assert_eq!(h.mem_step_up().requests().len(), 1);
 }
 
 /// ATTACK: the per-op cap bounds only the BODY; the raw query string and
@@ -423,7 +417,7 @@ async fn rt_a_huge_query_string_is_bounded_by_the_uri_limit() {
         .await;
     assert!(is_step_up(st, &b), "{st} {b}");
     let parked = h
-        .step_up
+        .mem_step_up()
         .requests()
         .iter()
         .map(|r| r.query.len() + r.path.len())
@@ -670,7 +664,7 @@ async fn rt_reusing_a_clone_flagged_passkey_leaves_no_evidence() {
 async fn rt_removing_another_humans_passkey_id_revokes_nothing() {
     let h = harness();
     let (bob, mut bob_key) = member(&h, "bob", "acme", Role::Owner).await;
-    let bob_pk = h.passkeys.list("bob").await.unwrap()[0].id.clone();
+    let bob_pk = h.mem_passkeys().list("bob").await.unwrap()[0].id.clone();
     h.open_window(&bob, &mut bob_key).await;
     let (st, _) = h
         .cookie("POST", "/v1/secrets", Some(secret("acme", "B1")), &bob)
@@ -685,7 +679,7 @@ async fn rt_removing_another_humans_passkey_id_revokes_nothing() {
     let (st, b) = h.cookie("DELETE", &uri, None, &amy).await;
     assert_eq!(st, StatusCode::NOT_FOUND, "{b}");
 
-    assert_eq!(h.passkeys.list("bob").await.unwrap().len(), 1);
+    assert_eq!(h.mem_passkeys().list("bob").await.unwrap().len(), 1);
     let (st, b) = h
         .cookie("POST", "/v1/secrets", Some(secret("acme", "B2")), &bob)
         .await;
@@ -740,7 +734,7 @@ async fn rt_removing_a_gone_or_bogus_passkey_is_a_clean_404() {
         .await;
     assert_eq!(st, StatusCode::NO_CONTENT, "the window was not revoked");
     assert!(h
-        .passkeys
+        .mem_passkeys()
         .list("amy")
         .await
         .unwrap()
@@ -762,7 +756,7 @@ async fn rt_removing_a_gone_or_bogus_passkey_is_a_clean_404() {
 async fn rt_an_org_admin_token_reads_its_owners_passkeys_through_the_org_log() {
     let h = harness();
     let (_amy, _) = amy_in_browser(&h).await;
-    let pk = h.passkeys.list("amy").await.unwrap()[0].clone();
+    let pk = h.mem_passkeys().list("amy").await.unwrap()[0].clone();
     let token = pat(&h, "ta", Scope::Org("acme".into()), Role::Admin).await;
     let (st, me) = h.bearer("GET", "/v1/me/security", None, &token).await;
     assert_eq!(st, StatusCode::OK, "{me}");
@@ -812,7 +806,9 @@ async fn rt_a_sibling_token_cannot_read_another_tokens_request() {
 /// hashes what it is given, so the stored columns are not credentials.
 #[tokio::test]
 async fn rt_the_stored_session_columns_ride_nothing() {
-    let Some((tdb, pg)) = pg().await else { return };
+    let Some((tdb, pg)) = fresh_pg().await else {
+        return;
+    };
     let sessions = pg.clone();
     let h = harness_with(move |st| {
         st.with_auth(
@@ -1128,7 +1124,9 @@ fn identity(provider: &str, external_id: &str, handle: &str) -> ProviderIdentity
 /// refused, beta not named, bob's passkey kept.
 #[tokio::test]
 async fn rt_an_alias_reset_cannot_skip_the_every_org_owner_check() {
-    let Some((tdb, pg)) = pg().await else { return };
+    let Some((tdb, pg)) = fresh_pg().await else {
+        return;
+    };
     let ids = pg.clone();
     let h = harness_on(Backend::Pg(pg.clone()), move |st| {
         st.with_identities(ids as Arc<dyn IdentityStore>)

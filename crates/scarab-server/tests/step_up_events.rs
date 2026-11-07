@@ -7,7 +7,7 @@
 //! the operator's break-glass straight at the database.
 //!
 //! The Org view joins live role bindings, so the visibility test runs on the
-//! in-memory stores AND on a real Postgres (`fresh_db`; skipped without
+//! in-memory stores AND on a real Postgres (`fresh_pg`; skipped without
 //! `SCARAB_TEST_DATABASE_URL`); the break-glass is Postgres-only.
 
 mod common;
@@ -18,7 +18,7 @@ use std::sync::Arc;
 use axum::http::StatusCode;
 use serde_json::{json, Value};
 
-use common::fresh_db;
+use common::{fresh_db, fresh_pg};
 use scarab_db_postgres::{BindingRow, PostgresDb};
 use scarab_identity::{
     api_token_hash, ApiToken, ApiTokenStore, Binding, BindingOrigin, IdentityStore, PasskeyStore,
@@ -32,13 +32,6 @@ use scarab_webauthn::soft::SoftPasskey;
 use step_up_harness::*;
 
 const HOUR: i64 = 60 * 60 * 1000;
-
-async fn pg() -> Option<(common::TestDb, Arc<PostgresDb>)> {
-    let tdb = fresh_db().await?;
-    let pg = Arc::new(PostgresDb::with_pool(tdb.pool.clone()));
-    pg.migrate().await.unwrap();
-    Some((tdb, pg))
-}
 
 fn secret(org: &str, value: &str) -> Value {
     json!({"org": org, "name": "DB_PASSWORD", "value": value})
@@ -280,7 +273,9 @@ async fn the_org_log_shows_its_org_and_members_only_in_memory() {
 
 #[tokio::test]
 async fn the_org_log_shows_its_org_and_members_only_on_postgres() {
-    let Some((tdb, pg)) = pg().await else { return };
+    let Some((tdb, pg)) = fresh_pg().await else {
+        return;
+    };
     the_org_log_shows_its_org_and_members_only(Backend::Pg(pg)).await;
     tdb.cleanup().await;
 }
@@ -358,7 +353,9 @@ async fn a_confirmation_stays_in_its_own_org_in_memory() {
 
 #[tokio::test]
 async fn a_confirmation_stays_in_its_own_org_on_postgres() {
-    let Some((tdb, pg)) = pg().await else { return };
+    let Some((tdb, pg)) = fresh_pg().await else {
+        return;
+    };
     a_confirmation_stays_in_its_own_org(Backend::Pg(pg)).await;
     tdb.cleanup().await;
 }
@@ -854,7 +851,9 @@ async fn an_api_token_does_not_read_its_owner_s_passkeys_or_history() {
 /// was used verbatim: the alias belongs to no Org any more, so 404.)
 #[tokio::test]
 async fn an_owner_s_reset_of_a_merged_id_resets_the_live_principal() {
-    let Some((tdb, pg)) = pg().await else { return };
+    let Some((tdb, pg)) = fresh_pg().await else {
+        return;
+    };
     let (h, _) = merged_bob(&pg).await;
     fold_bobby_into_bob(&pg).await;
     let (amy, mut soft) = member(&h, "amy", "acme", Role::Owner).await;
@@ -881,7 +880,9 @@ async fn an_owner_s_reset_of_a_merged_id_resets_the_live_principal() {
 /// the merge then deletes it, and bob holds no passkey of bobby's.
 #[tokio::test]
 async fn a_merge_deletes_the_folded_id_s_passkeys_once_one_proves_it() {
-    let Some((tdb, pg)) = pg().await else { return };
+    let Some((tdb, pg)) = fresh_pg().await else {
+        return;
+    };
     let (h, _) = merged_bob(&pg).await;
     let bobby = h.browser_session(scoped("bobby")).await;
     h.enroll(&bobby, &mut passkey(), "bobby's key").await;
@@ -927,7 +928,9 @@ async fn a_merge_deletes_the_folded_id_s_passkeys_once_one_proves_it() {
 /// the merge moved the token to bob, and the replay acts for the confirmer.
 #[tokio::test]
 async fn a_request_for_a_merged_id_is_confirmed_by_its_live_principal() {
-    let Some((tdb, pg)) = pg().await else { return };
+    let Some((tdb, pg)) = fresh_pg().await else {
+        return;
+    };
     let (h, token) = merged_bob(&pg).await;
     let (st, b) = h
         .bearer("POST", "/v1/secrets", Some(secret("acme", "v")), &token)
@@ -997,7 +1000,9 @@ fn session_hash(id: &str) -> String {
 /// migrating it.
 #[tokio::test]
 async fn the_break_glass_resets_and_is_recorded() {
-    let Some((tdb, pg)) = pg().await else { return };
+    let Some((tdb, pg)) = fresh_pg().await else {
+        return;
+    };
     let h = harness_on(Backend::Pg(pg.clone()), |st| st);
     // amy is a Principal (she signed in once).
     let amy_id = IdentityStore::sign_in(
@@ -1101,7 +1106,9 @@ async fn the_break_glass_resets_and_is_recorded() {
 /// Principal holds with a message a script can recognise.
 #[tokio::test]
 async fn the_operator_grant_is_idempotent_and_recorded() {
-    let Some((tdb, pg)) = pg().await else { return };
+    let Some((tdb, pg)) = fresh_pg().await else {
+        return;
+    };
     let alice = IdentityStore::sign_in(
         pg.as_ref(),
         &ProviderIdentity {
@@ -1336,7 +1343,9 @@ async fn operator_grants(pg: &PostgresDb) -> usize {
 /// Project keeps that change. Nothing is written or recorded in those cases.
 #[tokio::test]
 async fn the_if_absent_grant_leaves_existing_bindings_alone() {
-    let Some((tdb, pg)) = pg().await else { return };
+    let Some((tdb, pg)) = fresh_pg().await else {
+        return;
+    };
     let op = operator();
     let acme = Scope::Org("acme".into());
     let alice = signed_in(&pg, "alice", "7").await;
@@ -1444,7 +1453,9 @@ async fn the_if_absent_grant_leaves_existing_bindings_alone() {
 /// it is, like any other row.
 #[tokio::test]
 async fn a_grant_over_an_imported_role_makes_it_native() {
-    let Some((tdb, pg)) = pg().await else { return };
+    let Some((tdb, pg)) = fresh_pg().await else {
+        return;
+    };
     let op = operator();
     let dave = signed_in(&pg, "dave", "10").await;
     RbacStore::grant(
@@ -1507,7 +1518,9 @@ async fn a_grant_over_an_imported_role_makes_it_native() {
 /// write fails, the log does not show a grant that was not made.
 #[tokio::test]
 async fn a_failed_operator_grant_records_nothing() {
-    let Some((tdb, pg)) = pg().await else { return };
+    let Some((tdb, pg)) = fresh_pg().await else {
+        return;
+    };
     let alice = signed_in(&pg, "alice", "7").await;
     sqlx::query(
         "CREATE FUNCTION refuse_binding() RETURNS trigger LANGUAGE plpgsql AS
@@ -1547,7 +1560,9 @@ async fn a_failed_operator_grant_records_nothing() {
 /// and for an `--if-absent` that found a binding, and 1 for other refusals.
 #[tokio::test]
 async fn the_grant_command_exits_3_for_someone_who_never_signed_in() {
-    let Some((tdb, pg)) = pg().await else { return };
+    let Some((tdb, pg)) = fresh_pg().await else {
+        return;
+    };
     let alice = signed_in(&pg, "alice", "7").await;
     let url = tdb.url();
     let run = |subject: &str, role: &str, extra: &[&str]| {
@@ -1662,10 +1677,10 @@ async fn an_unrecorded_step_up_opens_no_window() {
     let (amy, mut soft) = member(&h, "amy", "acme", Role::Owner).await;
     let (st, ch) = h.cookie("POST", "/v1/me/step-up/options", None, &amy).await;
     assert_eq!(st, StatusCode::OK, "{ch}");
-    h.events.fail_appends(true);
+    h.mem_events().fail_appends(true);
     let (st, b) = h.answer(&amy, &mut soft, &ch).await;
     assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE, "{b}");
-    h.events.fail_appends(false);
+    h.mem_events().fail_appends(false);
     let (st, b) = h
         .cookie("POST", "/v1/secrets", Some(secret("acme", "v")), &amy)
         .await;
@@ -1689,7 +1704,7 @@ async fn an_unrecorded_enrollment_leaves_no_passkey() {
     assert_eq!(st, StatusCode::OK, "{opts}");
     let mut soft = passkey();
     let cred = soft.register(&opts["public_key"], ORIGIN).unwrap();
-    h.events.fail_appends(true);
+    h.mem_events().fail_appends(true);
     let (st, b) = h
         .cookie(
             "POST",
@@ -1699,7 +1714,7 @@ async fn an_unrecorded_enrollment_leaves_no_passkey() {
         )
         .await;
     assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE, "{b}");
-    h.events.fail_appends(false);
+    h.mem_events().fail_appends(false);
     let (st, me) = h.cookie("GET", "/v1/me/security", None, &s).await;
     assert_eq!(st, StatusCode::OK, "{me}");
     assert_eq!(me["passkeys"], json!([]), "{me}");
@@ -1747,7 +1762,7 @@ async fn an_unrecorded_request_confirmation_runs_nothing() {
         .await;
     assert_eq!(st, StatusCode::OK, "{ch}");
     let cred = soft.assert(&ch["public_key"], ORIGIN).unwrap();
-    h.events.fail_appends(true);
+    h.mem_events().fail_appends(true);
     let (st, done) = h
         .cookie(
             "POST",
@@ -1756,7 +1771,7 @@ async fn an_unrecorded_request_confirmation_runs_nothing() {
             &amy,
         )
         .await;
-    h.events.fail_appends(false);
+    h.mem_events().fail_appends(false);
     assert_eq!(st, StatusCode::OK, "{done}");
     assert_eq!(done["state"], "failed", "{done}");
     assert_eq!(acme_secret(&secrets).await, None, "the secret was written");
@@ -1769,11 +1784,11 @@ async fn an_unrecorded_authorisation_runs_nothing() {
     let (h, secrets) = with_secrets();
     let (amy, mut soft) = member(&h, "amy", "acme", Role::Owner).await;
     h.open_window(&amy, &mut soft).await;
-    h.events.fail_appends(true);
+    h.mem_events().fail_appends(true);
     let (st, b) = h
         .cookie("POST", "/v1/secrets", Some(secret("acme", "v")), &amy)
         .await;
-    h.events.fail_appends(false);
+    h.mem_events().fail_appends(false);
     assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE, "{b}");
     assert_eq!(acme_secret(&secrets).await, None, "the secret was written");
 }
@@ -2058,7 +2073,9 @@ async fn the_event_log_pages_by_cursor_and_filters_in_memory() {
 
 #[tokio::test]
 async fn the_event_log_pages_by_cursor_and_filters_on_postgres() {
-    let Some((tdb, pg)) = pg().await else { return };
+    let Some((tdb, pg)) = fresh_pg().await else {
+        return;
+    };
     the_event_log_pages_by_cursor_and_filters(Backend::Pg(pg)).await;
     tdb.cleanup().await;
 }

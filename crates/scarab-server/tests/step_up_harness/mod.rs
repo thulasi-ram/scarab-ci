@@ -40,20 +40,28 @@ pub struct Harness {
     /// The engine `Db` the app serves: a test drives Runs on it.
     pub db: Arc<InMemoryDb>,
     pub clock: Arc<FakeClock>,
+    /// The session and token stores the app uses under both backends.
     pub sessions: Arc<InMemorySessions>,
-    pub rbac: Arc<InMemoryRbac>,
     pub tokens: Arc<InMemoryApiTokens>,
-    pub passkeys: Arc<InMemoryPasskeys>,
-    pub step_up: Arc<InMemoryStepUp>,
-    pub events: Arc<InMemorySecurityEvents>,
-    /// The stores the app ACTUALLY uses — the in-memory ones above, or
-    /// Postgres under [`Backend::Pg`].
+    /// The in-memory stores behind the `dyn` fields below, `None` under
+    /// [`Backend::Pg`], where the app never touches them: an assertion
+    /// against an empty in-memory store there would pass whatever the app
+    /// did. Read them through [`Harness::mem_rbac`] and its siblings.
+    pub rbac: Option<Arc<InMemoryRbac>>,
+    pub passkeys: Option<Arc<InMemoryPasskeys>>,
+    pub step_up: Option<Arc<InMemoryStepUp>>,
+    pub events: Option<Arc<InMemorySecurityEvents>>,
+    /// The stores the app uses: the in-memory ones above, or Postgres
+    /// under [`Backend::Pg`].
     pub rbac_store: Arc<dyn RbacStore>,
     pub passkey_store: Arc<dyn PasskeyStore>,
     pub challenge_store: Arc<dyn ChallengeStore>,
     pub requests: Arc<dyn StepUpStore>,
     pub log: Arc<dyn SecurityEventLog>,
 }
+
+const MEMORY_ONLY: &str =
+    "an in-memory store of a Backend::Pg harness: the app does not use it; assert through the dyn store";
 
 /// Where the step-up stores (and the role bindings the Org log joins) live.
 pub enum Backend {
@@ -105,28 +113,28 @@ pub fn harness_on(backend: Backend, extra: impl FnOnce(AppState) -> AppState) ->
             .with_credential("bob-code", scoped("bob")),
     );
     let sessions = Arc::new(InMemorySessions::new());
-    let rbac = Arc::new(InMemoryRbac::new());
     let tokens = Arc::new(InMemoryApiTokens::new());
-    let passkeys = Arc::new(InMemoryPasskeys::new());
-    let step_up = Arc::new(InMemoryStepUp::new());
-    let events = Arc::new(InMemorySecurityEvents::new().with_rbac(rbac.clone()));
-    let challenges = Arc::new(InMemoryChallenges::new());
     #[allow(clippy::type_complexity)]
-    let (rbac_store, passkey_store, challenge_store, requests, log): (
+    let (mem, rbac_store, passkey_store, challenge_store, requests, log): (
+        Option<MemStores>,
         Arc<dyn RbacStore>,
         Arc<dyn PasskeyStore>,
         Arc<dyn ChallengeStore>,
         Arc<dyn StepUpStore>,
         Arc<dyn SecurityEventLog>,
     ) = match backend {
-        Backend::Memory => (
-            rbac.clone(),
-            passkeys.clone(),
-            challenges,
-            step_up.clone(),
-            events.clone(),
-        ),
-        Backend::Pg(pg) => (pg.clone(), pg.clone(), pg.clone(), pg.clone(), pg),
+        Backend::Memory => {
+            let m = MemStores::new();
+            (
+                Some(m.clone()),
+                m.rbac,
+                m.passkeys,
+                Arc::new(InMemoryChallenges::new()),
+                m.step_up,
+                m.events,
+            )
+        }
+        Backend::Pg(pg) => (None, pg.clone(), pg.clone(), pg.clone(), pg.clone(), pg),
     };
     let rp = RelyingParty::from_public_url(PUBLIC_URL, "Scarab").unwrap();
     let st = AppState::new(db.clone(), clock.clone(), logs)
@@ -148,16 +156,37 @@ pub fn harness_on(backend: Backend, extra: impl FnOnce(AppState) -> AppState) ->
         db,
         clock,
         sessions,
-        rbac,
         tokens,
-        passkeys,
-        step_up,
-        events,
+        rbac: mem.as_ref().map(|m| m.rbac.clone()),
+        passkeys: mem.as_ref().map(|m| m.passkeys.clone()),
+        step_up: mem.as_ref().map(|m| m.step_up.clone()),
+        events: mem.map(|m| m.events),
         rbac_store,
         passkey_store,
         challenge_store,
         requests,
         log,
+    }
+}
+
+/// The in-memory stores [`Backend::Memory`] wires in.
+#[derive(Clone)]
+struct MemStores {
+    rbac: Arc<InMemoryRbac>,
+    passkeys: Arc<InMemoryPasskeys>,
+    step_up: Arc<InMemoryStepUp>,
+    events: Arc<InMemorySecurityEvents>,
+}
+
+impl MemStores {
+    fn new() -> Self {
+        let rbac = Arc::new(InMemoryRbac::new());
+        Self {
+            events: Arc::new(InMemorySecurityEvents::new().with_rbac(rbac.clone())),
+            rbac,
+            passkeys: Arc::new(InMemoryPasskeys::new()),
+            step_up: Arc::new(InMemoryStepUp::new()),
+        }
     }
 }
 
@@ -332,9 +361,35 @@ impl Harness {
         all
     }
 
+    /// The in-memory RBAC store. Panics under [`Backend::Pg`].
+    #[track_caller]
+    pub fn mem_rbac(&self) -> &Arc<InMemoryRbac> {
+        self.rbac.as_ref().expect(MEMORY_ONLY)
+    }
+
+    /// The in-memory passkey store. Panics under [`Backend::Pg`].
+    #[track_caller]
+    pub fn mem_passkeys(&self) -> &Arc<InMemoryPasskeys> {
+        self.passkeys.as_ref().expect(MEMORY_ONLY)
+    }
+
+    /// The in-memory step-up store. Panics under [`Backend::Pg`].
+    #[track_caller]
+    pub fn mem_step_up(&self) -> &Arc<InMemoryStepUp> {
+        self.step_up.as_ref().expect(MEMORY_ONLY)
+    }
+
+    /// The in-memory event log. Panics under [`Backend::Pg`]; use
+    /// [`Harness::events`] to read the log on either backend.
+    #[track_caller]
+    pub fn mem_events(&self) -> &Arc<InMemorySecurityEvents> {
+        self.events.as_ref().expect(MEMORY_ONLY)
+    }
+
     /// The in-memory log only ([`Backend::Memory`]).
+    #[track_caller]
     pub fn events_of(&self, kind: &str) -> Vec<scarab_identity::SecurityEvent> {
-        self.events
+        self.mem_events()
             .all()
             .into_iter()
             .filter(|e| e.kind == kind)

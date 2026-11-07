@@ -217,7 +217,7 @@ async fn a_counter_regression_flags_the_passkey() {
         (st, b["code"].clone()),
         (StatusCode::FORBIDDEN, json!("clone_suspected"))
     );
-    let flagged = h.passkeys.list("amy").await.unwrap();
+    let flagged = h.mem_passkeys().list("amy").await.unwrap();
     assert!(flagged[0].clone_suspected_at.is_some());
     assert_eq!(h.events_of("passkey.clone_suspected").len(), 1);
 
@@ -272,7 +272,7 @@ async fn a_flagged_passkey_needs_an_owner_reset_before_a_new_first_one() {
     assert!(b.get("enroll_url").is_none_or(|u| u.is_null()), "{b}");
 
     // An Owner reset removes the flagged passkey; then a first one enrolls.
-    h.passkeys.remove_all("amy").await.unwrap();
+    h.mem_passkeys().remove_all("amy").await.unwrap();
     let mut fresh = passkey();
     h.enroll(&s, &mut fresh, "New").await;
 }
@@ -291,7 +291,7 @@ async fn a_synced_passkeys_counter_regression_is_recorded_not_flagged() {
     h.open_window(&s, &mut soft).await; // count 2
     soft.counter = Counter::Fixed(0);
     h.open_window(&s, &mut soft).await;
-    let stored = h.passkeys.list("amy").await.unwrap();
+    let stored = h.mem_passkeys().list("amy").await.unwrap();
     assert_eq!(stored[0].clone_suspected_at, None);
     assert_eq!(stored[0].sign_count, 2, "the counter never moves back");
     assert!(h.events_of("passkey.clone_suspected").is_empty());
@@ -310,11 +310,11 @@ async fn a_passkey_is_stored_with_its_label_and_last_use() {
     assert_eq!(dto["label"], "MacBook Touch ID");
     assert_eq!(dto["last_used_at"], serde_json::Value::Null);
 
-    let stored = h.passkeys.list("amy").await.unwrap();
+    let stored = h.mem_passkeys().list("amy").await.unwrap();
     assert_eq!(stored.len(), 1);
     assert_eq!(stored[0].principal, "amy");
     assert_eq!(stored[0].label, "MacBook Touch ID");
-    assert!(h.passkeys.list("bob").await.unwrap().is_empty());
+    assert!(h.mem_passkeys().list("bob").await.unwrap().is_empty());
 
     h.clock.advance(MIN);
     h.open_window(&s, &mut soft).await;
@@ -435,23 +435,23 @@ async fn a_passkey_removal_whose_revoke_fails_can_be_retried_to_completion() {
     let (st, b) = h.cookie("DELETE", &uri, None, &s).await;
     assert_step_up(st, &b, "action");
     h.answer(&s, &mut k2, &b["challenge"]).await;
-    h.step_up.fail_passkey_revokes(true);
+    h.mem_step_up().fail_passkey_revokes(true);
     let (st, b) = h.cookie("DELETE", &uri, None, &s).await;
     assert!(st.is_server_error(), "{st} {b}");
     let ids =
         |list: Vec<scarab_identity::Passkey>| list.into_iter().map(|p| p.id).collect::<Vec<_>>();
     assert!(
-        ids(h.passkeys.list("amy").await.unwrap()).contains(&k1_id),
+        ids(h.mem_passkeys().list("amy").await.unwrap()).contains(&k1_id),
         "a failed revoke leaves the passkey for a retry"
     );
 
-    h.step_up.fail_passkey_revokes(false);
+    h.mem_step_up().fail_passkey_revokes(false);
     let (st, b) = h.cookie("DELETE", &uri, None, &s).await;
     assert_step_up(st, &b, "action");
     h.answer(&s, &mut k2, &b["challenge"]).await;
     let (st, b) = h.cookie("DELETE", &uri, None, &s).await;
     assert_eq!(st, StatusCode::NO_CONTENT, "the retry finishes: {b}");
-    assert!(!ids(h.passkeys.list("amy").await.unwrap()).contains(&k1_id));
+    assert!(!ids(h.mem_passkeys().list("amy").await.unwrap()).contains(&k1_id));
     let (st, b) = h.cookie("POST", "/v1/secrets", Some(secret(1)), &s).await;
     assert_step_up(st, &b, "window");
     let removed = h.events_of("passkey.removed");
@@ -466,8 +466,8 @@ async fn a_passkey_removal_whose_revoke_fails_can_be_retried_to_completion() {
 async fn a_passkey_removed_mid_assertion_opens_no_window() {
     let h = harness();
     let (s, mut k1, _k2, k1_id) = amy_with_two_passkeys(&h).await;
-    let passkeys = h.passkeys.clone();
-    h.step_up.before_next_put_confirmation(move || {
+    let passkeys = h.mem_passkeys().clone();
+    h.mem_step_up().before_next_put_confirmation(move || {
         let removed = futures::executor::block_on(passkeys.remove("amy", &k1_id)).unwrap();
         assert!(removed);
     });
@@ -481,7 +481,7 @@ async fn a_passkey_removed_mid_assertion_opens_no_window() {
     let (st, b) = h.cookie("POST", "/v1/secrets", Some(secret(1)), &s).await;
     assert_step_up(st, &b, "window");
     assert!(
-        h.step_up
+        h.mem_step_up()
             .confirmations()
             .iter()
             .all(|c| c.kind != scarab_identity::ConfirmationKind::Window),

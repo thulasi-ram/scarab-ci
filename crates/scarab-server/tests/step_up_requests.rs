@@ -6,7 +6,7 @@
 //!
 //! The scenarios that hinge on the store's atomicity (the pending →
 //! executing compare-and-swap, the sealed body cleared on settling) run on
-//! the in-memory stores AND on a real Postgres (`fresh_db`; skipped without
+//! the in-memory stores AND on a real Postgres (`fresh_pg`; skipped without
 //! `SCARAB_TEST_DATABASE_URL`). The secret store is the one wrapped
 //! collaborator: it counts writes and can hold one at its door, which is how
 //! the concurrent-confirm test constructs its interleaving instead of
@@ -25,8 +25,7 @@ use serde_json::{json, Value};
 use tokio::sync::{Notify, Semaphore};
 use tower::ServiceExt;
 
-use common::fresh_db;
-use scarab_db_postgres::PostgresDb;
+use common::fresh_pg;
 use scarab_identity::{
     api_token_hash, ApiToken, ApiTokenStore, Principal, RequestState, Role, Scope, SessionStore,
     StepUpRequest, StepUpRequestPendingCaps, StepUpRequestRaiseOutcome, StepUpRequester,
@@ -109,13 +108,6 @@ async fn world(backend: Backend) -> (Harness, Arc<Secrets>) {
     let h = harness_on(backend, move |st| st.with_secrets(wired));
     h.grant("amy", Scope::Org("acme".into()), Role::Owner).await;
     (h, secrets)
-}
-
-async fn pg() -> Option<(common::TestDb, Arc<PostgresDb>)> {
-    let tdb = fresh_db().await?;
-    let pg = Arc::new(PostgresDb::with_pool(tdb.pool.clone()));
-    pg.migrate().await.unwrap();
-    Some((tdb, pg))
 }
 
 /// amy in her browser, with a passkey.
@@ -418,7 +410,9 @@ async fn a_token_s_request_runs_once_for_its_human_only_in_memory() {
 
 #[tokio::test]
 async fn a_token_s_request_runs_once_for_its_human_only_on_postgres() {
-    let Some((tdb, pg)) = pg().await else { return };
+    let Some((tdb, pg)) = fresh_pg().await else {
+        return;
+    };
     a_token_s_request_runs_once_for_its_human_only(Backend::Pg(pg)).await;
     tdb.cleanup().await;
 }
@@ -464,7 +458,9 @@ async fn two_concurrent_confirms_run_it_once_in_memory() {
 
 #[tokio::test]
 async fn two_concurrent_confirms_run_it_once_on_postgres() {
-    let Some((tdb, pg)) = pg().await else { return };
+    let Some((tdb, pg)) = fresh_pg().await else {
+        return;
+    };
     two_concurrent_confirms_run_it_once(Backend::Pg(pg)).await;
     tdb.cleanup().await;
 }
@@ -499,7 +495,9 @@ async fn an_expired_request_is_gone_in_memory() {
 
 #[tokio::test]
 async fn an_expired_request_is_gone_on_postgres() {
-    let Some((tdb, pg)) = pg().await else { return };
+    let Some((tdb, pg)) = fresh_pg().await else {
+        return;
+    };
     an_expired_request_is_gone(Backend::Pg(pg)).await;
     tdb.cleanup().await;
 }
@@ -531,7 +529,7 @@ async fn the_token_s_scope_and_ceiling_narrow_the_replay() {
             Value::String("insufficient role".into())
         )
     );
-    assert!(h.step_up.requests().is_empty(), "no request for it");
+    assert!(h.mem_step_up().requests().is_empty(), "no request for it");
 
     let project = pat(
         &h,
@@ -548,7 +546,10 @@ async fn the_token_s_scope_and_ceiling_narrow_the_replay() {
         .await;
     assert_eq!(st, StatusCode::FORBIDDEN, "{b}");
     assert_eq!(b["code"], "outside_token_scope", "{b}");
-    assert!(h.step_up.requests().is_empty(), "no request for it: {b}");
+    assert!(
+        h.mem_step_up().requests().is_empty(),
+        "no request for it: {b}"
+    );
 
     let own = json!({"org": "acme", "repo": "web", "name": "DB_PASSWORD", "value": "v"});
     let (st, b) = h.bearer("POST", "/v1/secrets", Some(own), &project).await;
@@ -683,7 +684,7 @@ async fn a_plugin_subject_never_raises_a_request() {
     assert_step_up(st, &b, "window");
     assert!(b.get("confirmation_url").is_none(), "{b}");
     assert!(b.get("request_id").is_none(), "{b}");
-    assert!(h.step_up.requests().is_empty());
+    assert!(h.mem_step_up().requests().is_empty());
     assert!(h.events("request.raised").await.is_empty());
     let refused = h.events("step_up.refused").await;
     assert_eq!(refused.last().unwrap().detail["reason"], "plugin");
@@ -702,7 +703,7 @@ async fn the_eleventh_pending_request_is_429() {
         .bearer("POST", "/v1/secrets", Some(secret("v10")), &token)
         .await;
     assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{b}");
-    assert_eq!(h.step_up.requests().len(), 10);
+    assert_eq!(h.mem_step_up().requests().len(), 10);
     let refused = h.events("step_up.refused").await;
     assert_eq!(
         refused.last().unwrap().detail["reason"],
@@ -732,7 +733,7 @@ async fn at_most_twenty_requests_wait_for_one_human_across_credentials() {
         .bearer("POST", "/v1/secrets", Some(secret("t3")), &third)
         .await;
     assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{b}");
-    assert_eq!(h.step_up.requests().len(), 20);
+    assert_eq!(h.mem_step_up().requests().len(), 20);
     let refused = h.events("step_up.refused").await;
     assert_eq!(
         refused.last().unwrap().detail["reason"],
@@ -757,14 +758,14 @@ async fn a_body_over_the_op_s_cap_raises_no_request() {
         .await;
     assert_eq!(st, StatusCode::PAYLOAD_TOO_LARGE, "{st}");
     assert_eq!(b["code"], "request_body_too_large", "{b}");
-    assert!(h.step_up.requests().is_empty());
+    assert!(h.mem_step_up().requests().is_empty());
     let refused = h.events("step_up.refused").await;
     assert_eq!(
         refused.last().unwrap().detail["reason"],
         "request body too large"
     );
     raise(&h, &token, &"y".repeat(100 * 1024)).await;
-    assert_eq!(h.step_up.requests().len(), 1);
+    assert_eq!(h.mem_step_up().requests().len(), 1);
 
     // binding.put keeps the 64 KiB default.
     let (st, b) = h
@@ -776,7 +777,7 @@ async fn a_body_over_the_op_s_cap_raises_no_request() {
         )
         .await;
     assert_eq!(st, StatusCode::PAYLOAD_TOO_LARGE, "{b}");
-    assert_eq!(h.step_up.requests().len(), 1);
+    assert_eq!(h.mem_step_up().requests().len(), 1);
 }
 
 /// Refusals are rate-limited per (subject, caller, operation, reason) (git-bug
@@ -972,7 +973,7 @@ async fn a_request_the_requester_could_never_execute_is_not_raised() {
         assert_eq!(b["code"], code, "{method} {uri}: {b}");
         assert!(b.get("request_id").is_none(), "{method} {uri}: {b}");
         assert!(
-            h.step_up.requests().is_empty(),
+            h.mem_step_up().requests().is_empty(),
             "{method} {uri} raised a request"
         );
         let refused = h.events("step_up.refused").await;
@@ -988,7 +989,7 @@ async fn a_request_the_requester_could_never_execute_is_not_raised() {
     assert_step_up(st, &b, "action");
     assert!(b["request_id"].is_string(), "{b}");
     raise(&h, &token, "v").await;
-    assert_eq!(h.step_up.requests().len(), 2);
+    assert_eq!(h.mem_step_up().requests().len(), 2);
 }
 
 /// A request runs exactly what was raised: a challenge for another request
@@ -1269,7 +1270,10 @@ async fn a_token_raises_no_request_for_another_orgs_connection() {
         .await;
     assert_eq!(st, StatusCode::FORBIDDEN, "{b}");
     assert_eq!(b["code"], "outside_token_scope", "{b}");
-    assert!(h.step_up.requests().is_empty(), "a request was raised: {b}");
+    assert!(
+        h.mem_step_up().requests().is_empty(),
+        "a request was raised: {b}"
+    );
 }
 
 /// Retention: expired challenges and confirmations go, an expired request's
@@ -1292,15 +1296,15 @@ async fn retention_reaps_step_up_rows_but_never_events() {
     let row = stored(&h, &waiting).await;
     assert!(row.sealed.is_none());
     assert!(
-        h.step_up.confirmations().is_empty(),
+        h.mem_step_up().confirmations().is_empty(),
         "expired confirmations go"
     );
-    assert_eq!(h.step_up.requests().len(), 2);
+    assert_eq!(h.mem_step_up().requests().len(), 2);
 
     // +31 days: both requests go.
     h.clock.advance(31 * DAY);
     sweep(&h).await;
-    assert!(h.step_up.requests().is_empty());
+    assert!(h.mem_step_up().requests().is_empty());
     assert_eq!(
         all_events(&h).await,
         events_before,

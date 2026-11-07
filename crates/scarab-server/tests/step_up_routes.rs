@@ -1025,7 +1025,7 @@ async fn a_refusal_never_echoes_a_secret_value() {
             "{b}"
         );
     }
-    let log = format!("{:?}", h.events.all());
+    let log = format!("{:?}", h.mem_events().all());
     assert!(!log.contains("S3CR3T"), "an event recorded a secret: {log}");
     // The secret's target is still legible.
     let (_, b) = h
