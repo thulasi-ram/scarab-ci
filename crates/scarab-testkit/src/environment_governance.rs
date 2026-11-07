@@ -364,7 +364,11 @@ impl EnvironmentGovernanceStore for InMemoryEnvironmentGovernance {
                 return Err(OrgEnvironmentError::changed_concurrently());
             }
         }
-        state.overlays.insert(key, overlay.clone());
+        // An overlay has no approval gate settings (ADR-0078 §3): Postgres
+        // stores none for it and reads back the default, so this does too.
+        let mut overlay = overlay.clone();
+        overlay.rules.approval_gate = Default::default();
+        state.overlays.insert(key, overlay);
         Ok(())
     }
 

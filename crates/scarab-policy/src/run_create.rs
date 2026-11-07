@@ -63,6 +63,7 @@ policy_enum! {
         File => "file",
         Library => "library",
         Plugin => "plugin",
+        Environment => "environment",
     }
 }
 
@@ -256,6 +257,7 @@ fn origin_of(
                 scarab_pipeline::OriginKind::File => OriginKind::File,
                 scarab_pipeline::OriginKind::Library => OriginKind::Library,
                 scarab_pipeline::OriginKind::Plugin => OriginKind::Plugin,
+                scarab_pipeline::OriginKind::Environment => OriginKind::Environment,
             },
             name: o.name.clone(),
             source: o.source.clone(),

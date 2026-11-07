@@ -32,7 +32,7 @@ use scarab_project::{
     DeployGovernance, EffectiveProtection, EnvironmentGovernanceStore, EnvironmentMigrationReport,
     EnvironmentMigrationReportProject, EnvironmentProjectEligibility, EnvironmentProjectOverlay,
     EnvironmentProjectPrivilegeGrant, EnvironmentProjectRecord, EnvironmentProtectionRules,
-    ImageGrant, Loosening, OrgEnvironment, OrgEnvironmentError, ProtectionRules,
+    ImageGrant, Loosening, MissingGateMode, OrgEnvironment, OrgEnvironmentError, ProtectionRules,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -92,23 +92,105 @@ pub struct PutOrgEnvironmentRequest {
 /// Project's overlay (ADR-0071 §1, §3).
 #[derive(Debug, Serialize, ToSchema)]
 pub struct EnvironmentProtectionRulesDto {
-    /// Principal ids; every one must approve (AND).
+    /// Principal ids. Every one must approve (AND), unless the baseline's
+    /// `approval_gate.required_approvals` says how many of its own must.
     pub approvers: Vec<String>,
     /// Ref globs a deploy's symbolic ref must match; empty = any ref.
     pub allowed_refs: Vec<String>,
-    /// Seconds. Carried and merged, not yet enforced (git-bug 2b94989).
+    /// Seconds: a minimum wait on the Environment approval gate, counted on
+    /// the gate's wait clock (ADR-0078 §4). It does nothing where the
+    /// effective approvers are empty; a client shows that from `approvers`
+    /// (here, or `effective.approvers` for a Project).
     pub wait_timer_s: u32,
     /// A human dispatch must carry a reason (ADR-0057 §3).
     pub require_reason: bool,
+    /// The Environment approval gate's settings (ADR-0078 §3). Present on a
+    /// baseline only: an overlay has none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_gate: Option<ApprovalGateRulesDto>,
 }
 
 impl From<&EnvironmentProtectionRules> for EnvironmentProtectionRulesDto {
+    /// A baseline's rules, approval gate settings included.
     fn from(r: &EnvironmentProtectionRules) -> Self {
+        Self {
+            approval_gate: Some((&r.approval_gate).into()),
+            ..Self::overlay(r)
+        }
+    }
+}
+
+impl EnvironmentProtectionRulesDto {
+    /// An overlay's rules: the four it has, no approval gate settings.
+    pub(crate) fn overlay(r: &EnvironmentProtectionRules) -> Self {
         Self {
             approvers: r.approvers.clone(),
             allowed_refs: r.allowed_refs.clone(),
             wait_timer_s: r.wait_timer_s,
             require_reason: r.require_reason,
+            approval_gate: None,
+        }
+    }
+}
+
+/// What Run creation does when a Step that uses the Environment's authority
+/// has no `manual` gate upstream (ADR-0078 §3).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MissingGateModeDto {
+    /// Add one Environment approval gate in front of those Steps.
+    #[default]
+    Add,
+    /// Refuse the Run, naming the Steps and the YAML to add.
+    Refuse,
+}
+
+impl From<MissingGateMode> for MissingGateModeDto {
+    fn from(m: MissingGateMode) -> Self {
+        match m {
+            MissingGateMode::Add => Self::Add,
+            MissingGateMode::Refuse => Self::Refuse,
+        }
+    }
+}
+
+impl From<MissingGateModeDto> for MissingGateMode {
+    fn from(m: MissingGateModeDto) -> Self {
+        match m {
+            MissingGateModeDto::Add => Self::Add,
+            MissingGateModeDto::Refuse => Self::Refuse,
+        }
+    }
+}
+
+/// An Environment's settings for its Environment approval gate (ADR-0078
+/// §3): the `manual` gate that has a Step using the Environment's
+/// authority after it.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ApprovalGateRulesDto {
+    /// `add` (default) or `refuse`.
+    pub missing_gate_mode: MissingGateModeDto,
+    /// Seconds before the gate the Environment adds expires; absent = it
+    /// waits until approved or rejected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub added_gate_expiry_s: Option<u32>,
+    /// How many of the baseline's approvers must approve; absent = every
+    /// one. A Project overlay's approvers are each required as well.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required_approvals: Option<u32>,
+    /// Seconds an approval stays good for: a Step that uses the
+    /// Environment's authority is refused at launch once its approval gate
+    /// released longer ago than this. Default 86400 (24 hours).
+    pub max_approval_age_s: u32,
+}
+
+impl From<&scarab_project::ApprovalGateRules> for ApprovalGateRulesDto {
+    fn from(r: &scarab_project::ApprovalGateRules) -> Self {
+        Self {
+            missing_gate_mode: r.missing_gate.into(),
+            added_gate_expiry_s: r.added_gate_expiry_s,
+            required_approvals: r.required_approvals,
+            max_approval_age_s: r.max_approval_age_s,
         }
     }
 }
@@ -124,8 +206,12 @@ pub struct EffectiveProtectionDto {
     /// **every** non-empty layer. Never pre-intersected — `[main]` and
     /// `[tags/*]` intersect to `[]`, which would read as "any ref".
     pub allowed_ref_layers: Vec<Vec<String>>,
+    /// The longer of the two layers' wait timers. It does nothing when
+    /// `approvers` is empty.
     pub wait_timer_s: u32,
     pub require_reason: bool,
+    /// The baseline's approval gate settings.
+    pub approval_gate: ApprovalGateRulesDto,
 }
 
 impl From<&EffectiveProtection> for EffectiveProtectionDto {
@@ -135,6 +221,7 @@ impl From<&EffectiveProtection> for EffectiveProtectionDto {
             allowed_ref_layers: e.allowed_refs.layers().to_vec(),
             wait_timer_s: e.wait_timer_s,
             require_reason: e.require_reason,
+            approval_gate: (&e.approval_gate).into(),
         }
     }
 }
@@ -206,7 +293,10 @@ impl From<&DeployGovernance> for ProjectEnvironmentDto {
             name: g.environment.name.clone(),
             eligible: g.eligible,
             baseline: (&g.environment.protection).into(),
-            overlay: g.overlay.as_ref().map(|o| (&o.rules).into()),
+            overlay: g
+                .overlay
+                .as_ref()
+                .map(|o| EnvironmentProtectionRulesDto::overlay(&o.rules)),
             effective: (&g.effective_protection()).into(),
             privilege_grant: g.privilege_grant.as_ref().map(Into::into),
         }
@@ -544,9 +634,10 @@ async fn step_up_unless_tightening(
         .await
 }
 
-/// A baseline (`…/protection`) body: the four rules, replaced whole. Every
-/// field is optional and an omitted one takes the **permissive** default —
-/// never the stored value — so `{}` resets the baseline to permissive.
+/// A baseline (`…/protection`) body: the four rules and the approval gate
+/// settings, replaced whole. Every field is optional and an omitted one
+/// takes its default — never the stored value — so `{}` resets the baseline
+/// to permissive (and the approval gate settings to theirs).
 /// Unknown fields are refused, so the retired per-repo shape (`wait_timer`,
 /// `concurrency`) — and `deployment_concurrency`, which ADR-0074 removed — is
 /// a 400, not a silently ignored rule.
@@ -560,12 +651,27 @@ pub struct PutEnvironmentProtectionRequest {
     /// Ref globs (`refs/heads/main`, `refs/tags/*`); empty = any ref.
     #[serde(default)]
     pub allowed_refs: Vec<String>,
-    /// Seconds. Carried and merged, not yet enforced (git-bug 2b94989).
+    /// Seconds: a minimum wait on the Environment approval gate (ADR-0078
+    /// §4). Refused (400) above 0 with no approvers.
     #[serde(default)]
     pub wait_timer_s: u32,
     /// A human dispatch must carry a reason (ADR-0057 §3). Omitted = off.
     #[serde(default)]
     pub require_reason: bool,
+    /// `add` (default) or `refuse` (ADR-0078 §3).
+    #[serde(default)]
+    pub missing_gate_mode: MissingGateModeDto,
+    /// Seconds before the gate the Environment adds expires; omitted = it
+    /// waits until approved or rejected.
+    #[serde(default)]
+    pub added_gate_expiry_s: Option<u32>,
+    /// How many of `approvers` must approve, 1 to their number; omitted =
+    /// every one.
+    #[serde(default)]
+    pub required_approvals: Option<u32>,
+    /// Seconds an approval stays good for at launch; omitted = 86400.
+    #[serde(default)]
+    pub max_approval_age_s: Option<u32>,
 }
 
 /// A Project overlay (`…/projects/{project}/overlay`) body: the baseline's
@@ -651,6 +757,26 @@ async fn checked_rules(
     wait_timer_s: u32,
     require_reason: bool,
 ) -> Result<EnvironmentProtectionRules, ApiError> {
+    checked_rules_with_gate(
+        st,
+        approvers,
+        allowed_refs,
+        wait_timer_s,
+        require_reason,
+        Default::default(),
+    )
+    .await
+}
+
+/// [`checked_rules`] with the approval gate settings a baseline carries.
+async fn checked_rules_with_gate(
+    st: &AppState,
+    approvers: Vec<String>,
+    allowed_refs: Vec<String>,
+    wait_timer_s: u32,
+    require_reason: bool,
+    approval_gate: scarab_project::ApprovalGateRules,
+) -> Result<EnvironmentProtectionRules, ApiError> {
     if allowed_refs.iter().any(|r| r.trim().is_empty()) {
         return Err(ApiError::BadRequest(
             "an allowed ref must not be empty".into(),
@@ -667,12 +793,35 @@ async fn checked_rules(
             resolved.push(principal);
         }
     }
+    approval_gate
+        .validate(&resolved)
+        .map_err(org_environment_api_error)?;
     Ok(EnvironmentProtectionRules {
         approvers: resolved,
         allowed_refs,
         wait_timer_s,
         require_reason,
+        approval_gate,
     })
+}
+
+/// A wait timer is a minimum wait on the Environment approval gate
+/// (ADR-0078 §4), so it needs approvers: refuse a non-zero one where the
+/// effective approvers (`approvers`) are empty. Stored data from before this
+/// check keeps a timer with no approvers; it is read back and does nothing.
+fn refuse_wait_timer_without_approvers(
+    wait_timer_s: u32,
+    approvers: &[String],
+) -> Result<(), ApiError> {
+    if wait_timer_s > 0 && approvers.is_empty() {
+        return Err(ApiError::BadRequest(
+            "a wait timer needs approvers: it is a minimum wait on the Environment's approval \
+             gate, and an Environment with no approvers has none; add an approver or set the \
+             wait timer to 0"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 /// An Environment's baseline protection rules. Read on the Org.
@@ -735,14 +884,23 @@ pub(crate) async fn put_environment_protection(
     let scope = rbac_scope(&org, None);
     let principal = authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
     let store = governance_store(&st)?;
-    let rules = checked_rules(
+    let rules = checked_rules_with_gate(
         &st,
         body.approvers,
         body.allowed_refs,
         body.wait_timer_s,
         body.require_reason,
+        scarab_project::ApprovalGateRules {
+            missing_gate: body.missing_gate_mode.into(),
+            added_gate_expiry_s: body.added_gate_expiry_s,
+            required_approvals: body.required_approvals,
+            max_approval_age_s: body
+                .max_approval_age_s
+                .unwrap_or(scarab_project::DEFAULT_MAX_APPROVAL_AGE_S),
+        },
     )
     .await?;
+    refuse_wait_timer_without_approvers(rules.wait_timer_s, &rules.approvers)?;
     // ADR-0073 §3 rule E1: loosening the baseline is a crown jewel.
     let current = stored_environment(store, &org, &env).await?;
     step_up_unless_tightening(
@@ -887,6 +1045,15 @@ pub(crate) async fn put_environment_project_overlay(
         body.require_reason,
     )
     .await?;
+    let effective_approvers: Vec<String> = governance
+        .environment
+        .protection
+        .approvers
+        .iter()
+        .chain(&rules.approvers)
+        .cloned()
+        .collect();
+    refuse_wait_timer_without_approvers(rules.wait_timer_s, &effective_approvers)?;
     let overlay = EnvironmentProjectOverlay {
         org,
         environment: env,

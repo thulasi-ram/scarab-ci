@@ -1308,6 +1308,10 @@ async fn pipeline_input(
         Err(crate::TriggerError::Db(e)) => return Err(ApiError::Db(e)),
         Err(e) => return Err(ApiError::Db(DbError::Other(e.to_string()))),
     };
+    // As admission does: the gate the Environment adds is part of the Run
+    // its Policies see (ADR-0078 §2), and missing-gate mode `refuse` refuses.
+    let ir = crate::environment_approval_ir(&ir, &gov, &[])
+        .map_err(|refusal| refused(crate::admission_refusal_message(&refusal, org, &repo.name)))?;
 
     let path = p.path.unwrap_or_else(|| ".scarab/ci.yaml".to_string());
     let now = st.clock.now().await.0;

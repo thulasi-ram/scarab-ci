@@ -28,13 +28,14 @@ pub use ports::{
 };
 pub use schedules::{ScheduleEntry, ScheduleFire, ScheduleStore};
 pub use scheduler::{
-    cancel_run_request, fail_run_creation, gate_approvers, pin_run_snapshots, plan_rerun,
-    record_gate_approval, reject_gate, release_gate, releases_plugin_gate, resolve_plugin_gate,
-    rerun_step, rerun_step_widened, retry_step, retry_step_widened, run_status_post_key,
-    unpin_run_snapshots, wait_began_at, AttemptTeardown, ExpiredInput, PlanReason, PlannedStep,
-    PluginGateError, PluginGateVerdict, RerunError, RerunPlan, Scheduler, SchedulerError,
-    Supervision, TeardownAttempt, TickHealth, CANCEL_ATTEMPT, CANCEL_RUN, LAUNCH_STEP,
-    MAX_DELIVERY_ATTEMPTS, RUN_FINISHED, RUN_STATUS_CHANGED, SUPERSEDE_TEARDOWN,
+    cancel_run_request, environment_approval_met, fail_run_creation, gate_approvers,
+    gate_released_at, pin_run_snapshots, plan_rerun, record_gate_approval, reject_gate,
+    release_gate, releases_plugin_gate, rerun_step, rerun_step_widened, resolve_plugin_gate,
+    retry_step, retry_step_widened, run_status_post_key, unpin_run_snapshots, wait_began_at,
+    AttemptTeardown, EnvironmentApproval, ExpiredInput, PlanReason, PlannedStep, PluginGateError,
+    PluginGateVerdict, RerunError, RerunPlan, Scheduler, SchedulerError, Supervision,
+    TeardownAttempt, TickHealth, CANCEL_ATTEMPT, CANCEL_RUN, LAUNCH_STEP, MAX_DELIVERY_ATTEMPTS,
+    RUN_FINISHED, RUN_STATUS_CHANGED, SUPERSEDE_TEARDOWN,
 };
 
 use serde::{Deserialize, Serialize};
@@ -1142,6 +1143,28 @@ pub enum EventPayload {
     },
     GateReleased {
         step: StepId,
+    },
+    /// The approvals of an **Environment approval gate**'s current wait met
+    /// its Environment's rules (ADR-0078 §4). The server appends it when an
+    /// approval completes them; it does not release the gate by itself.
+    ///
+    /// - `release_at` (Unix ms) — the earliest the gate releases: its wait
+    ///   clock's start plus the Environment's wait timer. When that is
+    ///   already past, the server releases the gate at once; otherwise the
+    ///   scheduler does when it passes.
+    /// - `approvers`, `required` — the Environment's approver set (sorted)
+    ///   and required count at that moment. Every launch of a Step behind
+    ///   the gate that uses the Environment's authority compares the set it
+    ///   sees then against these, and is refused when they differ.
+    ///
+    /// **Forward-only**: a binary from before this variant cannot replay a
+    /// log that carries it.
+    EnvironmentApprovalMet {
+        step: StepId,
+        approvers: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        required: Option<u32>,
+        release_at: i64,
     },
     /// A step was skipped on restart because its inputs were unchanged — its
     /// prior output is carried forward rather than recomputed (ADR-0027). Surfaced

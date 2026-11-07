@@ -21,6 +21,7 @@
 //!   one checked `when` with `cel` 0.15 (`matches()` compiled once per
 //!   pattern per evaluation); [`evaluate`](mod@evaluate) is its caller.
 
+pub mod approval_gate;
 pub mod check;
 pub mod eval;
 pub mod evaluate;

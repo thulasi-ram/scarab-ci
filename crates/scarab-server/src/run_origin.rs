@@ -47,6 +47,8 @@ struct IrStep {
     gate_expires_after: Option<u64>,
     #[serde(default)]
     scope: Option<serde_json::Value>,
+    #[serde(default)]
+    environment_approval_gate: Option<bool>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -94,7 +96,8 @@ async fn read_ir(st: &AppState, run: &RunId) -> Result<Ir, ApiError> {
 /// One link of a Step's invoke chain, outermost first.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct OriginLinkDto {
-    /// `file`, `library` or `plugin`.
+    /// `file`, `library`, `plugin`, or `environment` for the gate an
+    /// Environment added to the Run (ADR-0078 §2).
     pub kind: String,
     /// A repo-relative path (`file`), `<publisher>/<name>` (`library`) or the
     /// plugin installation and gate (`plugin`).
@@ -170,6 +173,9 @@ pub struct PluginGateViewDto {
 pub(crate) struct StepOriginView {
     pub origin: Vec<OriginLinkDto>,
     pub plugin_gate: Option<PluginGateViewDto>,
+    /// The gate is an Environment approval gate (ADR-0078 §1), as Run
+    /// creation decided and stored it.
+    pub environment_approval_gate: bool,
 }
 
 /// One input in the scope of a Step's invocation.
@@ -302,12 +308,14 @@ pub(crate) async fn step_views(
             }
             None => None,
         };
-        if !origin.is_empty() || plugin_gate.is_some() {
+        let environment_approval_gate = s.environment_approval_gate == Some(true);
+        if !origin.is_empty() || plugin_gate.is_some() || environment_approval_gate {
             views.insert(
                 s.id.clone(),
                 StepOriginView {
                     origin,
                     plugin_gate,
+                    environment_approval_gate,
                 },
             );
         }
