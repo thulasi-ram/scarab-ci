@@ -589,9 +589,12 @@ impl Executor for ForgeCredentialExecutor {
         if spec.build.is_some() || spec.forge_token.is_some() {
             self.ensure_not_yanked(step).await?;
             if let Some((db, governance)) = &self.governance {
+                // The `step.admit` decision is recorded by SecretInjecting;
+                // the Environment's re-check is made here as well.
                 crate::secret_executor::ensure_deploy_still_admitted(
                     db.as_ref(),
                     governance.as_ref(),
+                    None,
                     step,
                     self.clock.now().await.0,
                 )

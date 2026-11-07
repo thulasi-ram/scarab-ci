@@ -331,6 +331,14 @@ record. Read Breaking changes before you upgrade.
 
 ### Enhancement
 
+- **The Environment's approval-gate rules run in the policy engine.** The gate the Environment
+  adds (`run.create`), the release rules of an Environment approval gate (`gate.resolve`) and
+  the check at each launch (`step.admit`) are built-in rules of the engine. Each consultation
+  is recorded in the decision log, with the rule by name, even when no Policy is stored. Org and
+  Project Policies can now be saved at `gate.resolve` and `step.admit`, with `deny` rules only:
+  a denied approval answers 403 and is not recorded, and a denied launch fails the Step
+  `Config` (git-bug c2f97b4).
+  [Environments](https://thulasi-ram.github.io/scarab-ci/usage/environments/#the-approval-gate)
 - **Caches at more than one Depot replica.** Each Cache key has one home Depot replica, chosen
   by rendezvous hashing over the StatefulSet's ordinals, and a Step saves and restores the
   Cache there. Before, a Cache's saves and restores scattered over the replicas, so a restore

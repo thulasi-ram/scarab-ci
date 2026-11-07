@@ -831,7 +831,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Environment's credentials would be used.
                     .with_environment_governance(pg.clone())
                     // ADR-0076 §6: a yanked library version never launches.
-                    .with_libraries(pg.clone());
+                    .with_libraries(pg.clone())
+                    // ADR-0075 §3: the `step.admit` decision at each launch,
+                    // recorded once per Attempt.
+                    .with_policies(pg.clone());
             // Per-attempt OIDC federation tokens (ADR-0015), tmpfs-delivered.
             if let (Some(issuer), Some(oidc_cfg)) = (oidc_issuer.clone(), &config.oidc) {
                 secret_exec = secret_exec.with_oidc(

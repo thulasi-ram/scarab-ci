@@ -109,6 +109,7 @@ pub mod plugins;
 /// ADR-0075: the Policy API — org Policies, Project typed settings, the
 /// decision logs and the policy test API.
 pub mod policies;
+mod policy_checkpoints;
 pub mod retention;
 mod refused_runs;
 mod routes;
@@ -5475,10 +5476,37 @@ async fn admit_unrecorded(
     // Run), and every `manual` gate is marked an Environment approval gate
     // or not — before anything below reads the Run's Steps, so the Policies
     // and the stored Run see the gate.
-    let ir = &match environment_approval_ir(ir, &gov, excluded) {
-        Ok(ir) => ir,
-        Err(refusal) => return Ok(Admission::Refused(refusal)),
+    let (ir, gate_requirement) = match environment_approval_ir(ir, &gov, excluded) {
+        Ok(decided) => decided,
+        Err((refusal, result)) => {
+            // The engine's decision records the refusal in the org's decision
+            // log; the Run is refused as missing-gate mode `refuse` says,
+            // whatever else the decision holds.
+            if let Some(policies) = ports.policies {
+                let run = run_id_for(event, path);
+                let now = clock.now().await;
+                // Denied by the rule's own result: the refusal stays
+                // `MissingApprovalGate`, not a Policy refusal.
+                let _denied = consult_run_create(
+                    policies,
+                    &ports.links,
+                    event,
+                    ir,
+                    path,
+                    repo,
+                    &gov,
+                    &run,
+                    now,
+                    params,
+                    &serde_json::Map::new(),
+                    vec![result],
+                )
+                .await?;
+            }
+            return Ok(Admission::Refused(refusal));
+        }
     };
+    let ir = &ir;
 
     // ADR-0076 §6: a yanked library version is a PolicyInvariant, checked
     // before (and whether or not) any Policy is consulted.
@@ -5554,6 +5582,7 @@ async fn admit_unrecorded(
             now,
             params,
             &facts,
+            gate_requirement.into_iter().collect(),
         )
         .await?
         {
@@ -5568,63 +5597,60 @@ async fn admit_unrecorded(
     Ok(Admission::Created(run))
 }
 
-/// `ir` as an Environment-governed Run stores it (ADR-0078 §1-3). Where the
-/// Environment has approvers and a Step uses its authority with no `manual`
-/// gate upstream, the Environment adds one gate in front of the earliest
-/// such Steps — or, in missing-gate mode `refuse`, the Run is refused with
-/// the YAML to add. Then every `manual` gate is marked with whether it is an
-/// Environment approval gate. An ungoverned Run is returned as it is.
+/// `ir` as an Environment-governed Run stores it (ADR-0078 §1-3), decided by
+/// the engine's built-in gate requirement
+/// ([`gate_requirement`](scarab_policy::environment_rules::gate_requirement)).
+/// Where the Environment has approvers and a Step uses its authority with no
+/// `manual` gate upstream, the Environment adds one gate in front of the
+/// earliest such Steps — or, in missing-gate mode `refuse`, the Run is
+/// refused with the YAML to add. Then every `manual` gate is marked with
+/// whether it is an Environment approval gate. An ungoverned Run is
+/// returned as it is.
+///
+/// The rule's result, when it applies, goes into the Run's `run.create`
+/// decision; a refusal carries it, so the refused Run's decision records it.
+#[allow(clippy::result_large_err)]
 fn environment_approval_ir(
     ir: &scarab_pipeline::PipelineIr,
     gov: &RunGovernance,
     excluded: &[String],
-) -> Result<scarab_pipeline::PipelineIr, AdmissionRefusal> {
-    use scarab_policy::approval_gate as ag;
-    let mut ir = ir.clone();
+) -> Result<
+    (
+        scarab_pipeline::PipelineIr,
+        Option<scarab_policy::evaluate::PolicyResult>,
+    ),
+    (AdmissionRefusal, scarab_policy::evaluate::PolicyResult),
+> {
     let RunGovernance::Governed { environment, .. } = gov else {
-        return Ok(ir);
+        return Ok((ir.clone(), None));
     };
-    if let Some(p) = gov.protection().filter(|p| !p.approvers.is_empty()) {
-        let settings = &p.approval_gate;
-        let mut with_gate = ir.clone();
-        if let Some(added) = ag::add_environment_approval_gate(
-            &mut with_gate,
-            environment,
-            settings.added_gate_expiry_s,
-            excluded,
-        ) {
-            if settings.missing_gate == scarab_project::MissingGateMode::Refuse {
-                let gate = with_gate.steps.iter().find(|s| s.id == added.id);
-                let needs = gate.map(|g| g.needs.0.join(", ")).unwrap_or_default();
-                let quote = |ids: &[String]| {
-                    ids.iter()
-                        .map(|i| format!("`{i}`"))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                };
-                let missing = ag::steps_missing_approval_gate(&ir, excluded);
-                return Err(AdmissionRefusal::MissingApprovalGate {
-                    messages: vec![format!(
-                        "environment `{environment}` has approvers, and these Steps use its \
-                         authority with no `gate: manual` upstream: {}. It refuses such a Run \
-                         rather than add a gate: add `- {{ id: approve, gate: manual, needs: \
-                         [{needs}] }}` and put `approve` in the `needs` of {}",
-                        quote(&missing),
-                        quote(&added.fronts),
-                    )],
-                });
+    let decided = scarab_policy::environment_rules::gate_requirement(
+        ir,
+        environment,
+        gov.protection(),
+        excluded,
+    );
+    match (decided.refusal, decided.result) {
+        (Some(message), Some(result)) => Err((
+            AdmissionRefusal::MissingApprovalGate {
+                messages: vec![message],
+            },
+            result,
+        )),
+        (_, result) => {
+            if let Some(scarab_policy::evaluate::PolicyOutcome::GateAdded { gate, fronts }) =
+                result.as_ref().map(|r| &r.outcome)
+            {
+                tracing::info!(
+                    environment = %environment,
+                    gate = %gate,
+                    fronts = ?fronts,
+                    "the Environment added its approval gate to the Run"
+                );
             }
-            tracing::info!(
-                environment = %environment,
-                gate = %added.id,
-                fronts = ?added.fronts,
-                "the Environment added its approval gate to the Run"
-            );
-            ir = with_gate;
+            Ok((decided.ir, result))
         }
     }
-    ag::mark_environment_approval_gates(&mut ir);
-    Ok(ir)
 }
 
 /// The admission checks a Run passes before its `run.create` Policies are
@@ -5809,6 +5835,9 @@ fn run_create_input(
 ///   admitted otherwise. The plugin default reads the gates from `ir`, so it
 ///   denies an unlisted plugin gate either way.
 /// - A store failure (loading or recording) is an error: no Run.
+/// - `builtins` are the results of the engine's built-in Environment rules
+///   for this Run ([`environment_approval_ir`]). When there is one, the
+///   decision is made and recorded even with no Policy stored.
 #[allow(clippy::too_many_arguments)]
 async fn consult_run_create(
     policies: &dyn scarab_policy::store::PolicyStore,
@@ -5822,9 +5851,10 @@ async fn consult_run_create(
     now: scarab_engine::Timestamp,
     params: Option<&std::collections::BTreeMap<String, serde_json::Value>>,
     event_facts: &serde_json::Map<String, serde_json::Value>,
+    builtins: Vec<scarab_policy::evaluate::PolicyResult>,
 ) -> Result<Result<(), AdmissionRefusal>, TriggerError> {
-    use scarab_policy::evaluate::{evaluate_stored, PolicyOutcome};
-    use scarab_policy::policy::{Checkpoint, Mode};
+    use scarab_policy::evaluate::evaluate_with_builtins;
+    use scarab_policy::policy::Checkpoint;
     use scarab_policy::run_create;
 
     let stored = policies
@@ -5832,8 +5862,9 @@ async fn consult_run_create(
         .await
         .map_err(policy_store_err)?;
     // A plugin gate is consulted with no Policy stored: the closed plugin
-    // default denies it until an org lists the plugin (ADR-0075 §7).
-    if stored.is_empty() && !run_create::has_plugin_gate(ir) {
+    // default denies it until an org lists the plugin (ADR-0075 §7). So is
+    // a Run a built-in Environment rule applies to (ADR-0078 §6).
+    if stored.is_empty() && !run_create::has_plugin_gate(ir) && builtins.is_empty() {
         return Ok(Ok(()));
     }
 
@@ -5854,13 +5885,14 @@ async fn consult_run_create(
     let plugin_gates = run_create::plugin_gates(ir);
     let decision = tokio::task::spawn_blocking(move || {
         let input = job.and_then(|(ir, facts)| run_create_input(&ir, facts));
-        evaluate_stored(
+        evaluate_with_builtins(
             Checkpoint::RunCreate,
             run_create::SCHEMA_VERSION,
             input.as_ref().map_err(String::as_str),
             Some(&plugin_gates),
             &ctx,
             &stored,
+            builtins,
         )
     })
     .await
@@ -5868,23 +5900,7 @@ async fn consult_run_create(
 
     let denied = decision.is_denied();
     // Each message with the Policy it came from, for the refusal.
-    let mut messages = Vec::new();
-    if denied {
-        for r in &decision.results {
-            if r.mode != Mode::Enforce {
-                continue;
-            }
-            match &r.outcome {
-                PolicyOutcome::Denied { messages: m } => {
-                    messages.extend(m.iter().map(|m| format!("policy `{}`: {m}", r.name)))
-                }
-                PolicyOutcome::Error { message } => {
-                    messages.push(format!("policy `{}`: {message}", r.name))
-                }
-                _ => {}
-            }
-        }
-    }
+    let messages = decision.attributed_messages();
     let record = scarab_policy::store::DecisionRecord {
         id: Uuid::now_v7().to_string(),
         org: repo.owner.clone(),
@@ -9633,11 +9649,111 @@ async fn approve_gate(
     }
 
     // ADR-0076 §6: a gate inlined from a yanked library version neither
-    // takes an approval nor releases. Where `gate.resolve` (ADR-0075 §2)
-    // will be consulted.
+    // takes an approval nor releases.
     refuse_yanked_step(&st, &run, &step, "the gate cannot release").await?;
 
-    // 1. Record this principal's approval — append-only, no resume, idempotent
+    // 1. `gate.resolve` (ADR-0075 §2, ADR-0078 §6): one decision for this
+    //    approval, made by the engine before the approval is recorded. The
+    //    Environment's release rules are its built-in rule for an
+    //    Environment approval gate, under the rules resolved at 0.; the
+    //    org's and Project's `gate.resolve` Policies are evaluated next to
+    //    it. A deny refuses the approval; an unmet requirement holds the
+    //    gate.
+    // A held gate (its Environment's rules cannot be resolved) still takes
+    // the approval, and answers with the reason after recording it.
+    let (protection, held) = match governance {
+        Ok(p) => (p, None),
+        Err(e) => (None, Some(e)),
+    };
+    let rules = match (&ctx, &protection) {
+        (Some(c), Some(p)) if approval_gate => Some((c, p)),
+        _ => None,
+    };
+    let checkpoint = if rules.is_some() || st.policies.is_some() {
+        policy_checkpoints::GateResolveFacts::load(
+            st.db.as_ref(),
+            st.policies.as_deref(),
+            &run,
+            &step,
+            ctx.as_ref(),
+            approval_gate,
+        )
+        .await
+        .map_err(ApiError::Db)?
+        .filter(|f| rules.is_some() || f.has_policies())
+    } else {
+        None
+    };
+    let now = st.clock.now().await.0;
+    // When the gate's current wait began: what the wait timer counts from.
+    // No open wait yet: count from now, which only waits longer.
+    let wait_began = st
+        .db
+        .steps_of_run(&run)
+        .await
+        .map_err(ApiError::Db)?
+        .into_iter()
+        .find(|s| s.step == step)
+        .and_then(|s| {
+            s.attempts
+                .last()
+                .filter(|a| a.outcome == scarab_engine::AttemptOutcome::Running)
+                .map(|a| a.started_at.0)
+        })
+        .unwrap_or(now);
+    let release_rule = |approvals: &[String]| {
+        rules.map(|(c, p)| {
+            scarab_policy::environment_rules::gate_release(
+                scarab_policy::environment_rules::GateReleaseFacts {
+                    git_ref: &c.git_ref,
+                    protection: p,
+                    approvals,
+                    wait_began_ms: wait_began,
+                    now_ms: now,
+                },
+            )
+        })
+    };
+    let decide = |approvals: Vec<String>| {
+        let release = release_rule(&approvals);
+        let checkpoint = checkpoint.as_ref();
+        let subject = principal.subject.clone();
+        async move {
+            let decision = match checkpoint {
+                Some(f) => Some(
+                    f.decide(
+                        &subject,
+                        &approvals,
+                        now,
+                        release.as_ref().map(|r| r.result.clone()),
+                    )
+                    .await
+                    .map_err(ApiError::Db)?,
+                ),
+                None => None,
+            };
+            Ok::<_, ApiError>((approvals, release, decision))
+        }
+    };
+    let mut prospective = gate_approvers(&st.db.events(&run).await.map_err(ApiError::Db)?, &step);
+    if !prospective.contains(&principal.subject) {
+        prospective.push(principal.subject.clone());
+    }
+    let mut decided = decide(prospective).await?;
+    if let (Some(f), Some(decision)) = (&checkpoint, &decided.2) {
+        if decision.is_denied() {
+            let messages = decision.attributed_messages();
+            f.record(st.policies.as_deref(), decision.clone(), now)
+                .await
+                .map_err(ApiError::Db)?;
+            return Err(ApiError::Denied(format!(
+                "the approval is refused: {}",
+                messages.join("; ")
+            )));
+        }
+    }
+
+    // 2. Record this principal's approval — append-only, no resume, idempotent
     //    per (step, subject).
     match scarab_engine::record_gate_approval(
         st.db.as_ref(),
@@ -9682,51 +9798,39 @@ async fn approve_gate(
             .into_response());
     }
 
-    // 2. Gather the accumulated approvers; the governing Environment's rules
-    //    were resolved at 0., NOW rather than at Run creation: an admin's
-    //    change since — tightened rules, a withdrawn eligibility, a deleted
-    //    Environment — governs the release.
+    // 3. The accumulated approvers, as recorded; the governing Environment's
+    //    rules were resolved at 0., NOW rather than at Run creation: an
+    //    admin's change since — tightened rules, a withdrawn eligibility, a
+    //    deleted Environment — governs the release. Another approval recorded
+    //    since the decision was made changes the approvals: decide again.
     let approvers = gate_approvers(&st.db.events(&run).await.map_err(ApiError::Db)?, &step);
-    let protection = governance?;
+    if let Some(e) = held {
+        return Err(e);
+    }
+    if approvers != decided.0 {
+        decided = decide(approvers).await?;
+    }
+    let (approvers, release, decision) = decided;
+    if let (Some(f), Some(decision)) = (&checkpoint, decision) {
+        f.record(st.policies.as_deref(), decision, now)
+            .await
+            .map_err(ApiError::Db)?;
+    }
 
-    // 3. An Environment approval gate releases only when admits() passes
-    //    over the accumulated approvers (the required approvals, and the ref
-    //    still allowed), and its wait timer has run out; a plain gate
-    //    releases now.
-    let rules = match (&ctx, &protection) {
-        (Some(c), Some(p)) if approval_gate => Some((c, p)),
-        _ => None,
-    };
-    if let Some((c, p)) = rules {
-        if p.admits(&c.git_ref, &approvers).is_err() {
+    // 4. An Environment approval gate releases only when the release rule
+    //    passes: the required approvals are in, the ref is still allowed,
+    //    and the wait timer has run out. A plain gate releases now.
+    if let Some(release) = release {
+        let Some(met) = release.met else {
             return Ok((
                 StatusCode::ACCEPTED,
                 Json(serde_json::json!({ "released": false, "approvals": approvers })),
             )
                 .into_response());
-        }
+        };
         // ADR-0078 §4: the approvals are in. Record them with the approver
         // set they met (what each launch behind the gate checks again) and
         // when the wait timer, counted on the gate's wait clock, runs out.
-        let now = st.clock.now().await.0;
-        let wait_began = st
-            .db
-            .steps_of_run(&run)
-            .await
-            .map_err(ApiError::Db)?
-            .into_iter()
-            .find(|s| s.step == step)
-            .and_then(|s| {
-                s.attempts
-                    .last()
-                    .filter(|a| a.outcome == scarab_engine::AttemptOutcome::Running)
-                    .map(|a| a.started_at.0)
-            })
-            // No open wait yet: count from now, which only waits longer.
-            .unwrap_or(now);
-        let release_at =
-            wait_began.saturating_add(i64::from(p.effective_wait_timer_s()).saturating_mul(1000));
-        let (set, required) = p.approver_set();
         let recorded = scarab_engine::environment_approval_met(
             &st.db.events(&run).await.map_err(ApiError::Db)?,
             &step,
@@ -9734,7 +9838,7 @@ async fn approve_gate(
         if recorded
             .as_ref()
             .map(|r| (&r.approvers, r.required, r.release_at))
-            != Some((&set, required, release_at))
+            != Some((&met.approvers, met.required, met.release_at))
         {
             st.db
                 .append_event(&EventKind {
@@ -9742,30 +9846,30 @@ async fn approve_gate(
                     run: run.clone(),
                     kind: EventPayload::EnvironmentApprovalMet {
                         step: step.clone(),
-                        approvers: set,
-                        required,
-                        release_at,
+                        approvers: met.approvers,
+                        required: met.required,
+                        release_at: met.release_at,
                     },
                     at: Timestamp(now),
                 })
                 .await
                 .map_err(ApiError::Db)?;
         }
-        if now < release_at {
+        if release.result.outcome != scarab_policy::evaluate::PolicyOutcome::Passed {
             // The scheduler releases the gate when the timer runs out.
             return Ok((
                 StatusCode::ACCEPTED,
                 Json(serde_json::json!({
                     "released": false,
                     "approvals": approvers,
-                    "releases_at": release_at,
+                    "releases_at": met.release_at,
                 })),
             )
                 .into_response());
         }
     }
 
-    // 4. Finalize the gate and resume the run (exactly-once).
+    // 5. Finalize the gate and resume the run (exactly-once).
     match scarab_engine::release_gate(st.db.as_ref(), st.clock.as_ref(), &run, &step).await {
         Ok(()) => {}
         Err(RerunError::StepNotFound(_)) => return Err(ApiError::NotFound),
@@ -9793,7 +9897,7 @@ async fn approve_gate(
         .iter()
         .any(|s| s.step == step && s.status == StepStatus::Succeeded);
 
-    // 5. Record the deployment in the legacy approval history (ADR-0024, 0037,
+    // 6. Record the deployment in the legacy approval history (ADR-0024, 0037,
     //    ADR-0070 §1) — only on a real release (a no-op re-release writes no
     //    duplicate history record). Kept through ADR-0071: it is the record
     //    `GET …/environments/{name}/deployments` still serves.

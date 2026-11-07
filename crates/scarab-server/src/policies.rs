@@ -1310,8 +1310,9 @@ async fn pipeline_input(
     };
     // As admission does: the gate the Environment adds is part of the Run
     // its Policies see (ADR-0078 §2), and missing-gate mode `refuse` refuses.
-    let ir = crate::environment_approval_ir(&ir, &gov, &[])
-        .map_err(|refusal| refused(crate::admission_refusal_message(&refusal, org, &repo.name)))?;
+    let (ir, _) = crate::environment_approval_ir(&ir, &gov, &[]).map_err(|(refusal, _)| {
+        refused(crate::admission_refusal_message(&refusal, org, &repo.name))
+    })?;
 
     let path = p.path.unwrap_or_else(|| ".scarab/ci.yaml".to_string());
     let now = st.clock.now().await.0;

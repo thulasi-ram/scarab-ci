@@ -53,27 +53,42 @@ pub struct SecretInjectingExecutor {
     libraries: Option<Arc<dyn scarab_policy::library::LibraryStore>>,
     /// What an approval's age is measured to at launch.
     clock: Arc<dyn scarab_engine::Clock>,
+    /// The `step.admit` Policies (ADR-0075 §3) and where decisions are
+    /// recorded. `None` = the Environment's built-in re-check only, nothing
+    /// recorded.
+    policies: Option<Arc<dyn scarab_policy::store::PolicyStore>>,
+}
+
+/// What the launch decorators learn from a Step's admission.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct StepAdmission {
+    /// No Environment approval gate upstream of the Step has released, in an
+    /// Environment with approvers: its OIDC subject is `env=none`
+    /// (ADR-0075 §3).
+    pub(crate) before_approval: bool,
 }
 
 /// Refuse when `step`'s run is a deploy whose Environment is gone or no
-/// longer admits its Project (ADR-0071 §2), or when `step` uses the
-/// Environment's authority and its approval no longer holds
-/// ([`environment_approval_refusal`]); `Ok(())` for a run with no deploy
-/// context. Shared by the launch decorators, so each makes the check before
-/// it uses a credential. `now_ms` is what an approval's age is measured to.
+/// longer admits its Project (ADR-0071 §2), or when the `step.admit`
+/// decision denies it ([`step_admit`]): the Environment's launch-time
+/// re-check, then the org's and Project's `step.admit` Policies when
+/// `policies` is wired. A run with no deploy context is admitted. Shared by
+/// the launch decorators, so each makes the check before it uses a
+/// credential. `now_ms` is what an approval's age is measured to.
 pub(crate) async fn ensure_deploy_still_admitted(
     db: &dyn Db,
     governance: &dyn scarab_project::EnvironmentGovernanceStore,
+    policies: Option<&dyn scarab_policy::store::PolicyStore>,
     step: &StepRun,
     now_ms: i64,
-) -> Result<(), ExecError> {
+) -> Result<StepAdmission, ExecError> {
     let run = &step.run;
     let Some(ctx) = db
         .run_deploy_context(run)
         .await
         .map_err(|e| ExecError::Other(e.to_string()))?
     else {
-        return Ok(());
+        return Ok(StepAdmission::default());
     };
     let refusal = match governance
         .deploy_governance(&ctx.org, &ctx.project, &ctx.environment)
@@ -81,12 +96,7 @@ pub(crate) async fn ensure_deploy_still_admitted(
         .map_err(|e| ExecError::Other(format!("environment governance store: {e}")))?
     {
         Some(g) if g.eligible => {
-            match environment_approval_refusal(db, &ctx, &g.effective_protection(), step, now_ms)
-                .await?
-            {
-                None => return Ok(()),
-                Some(refusal) => refusal,
-            }
+            return step_admit(db, policies, &ctx, &g.effective_protection(), step, now_ms).await
         }
         Some(_) => format!(
             "project `{}` is no longer eligible to deploy to environment `{}` in org `{}`; \
@@ -124,109 +134,208 @@ async fn stored_pipeline(
     })
 }
 
-/// Why `step` may not use its Environment's authority now (ADR-0078 §5,
-/// the launch-time re-check of ADR-0075 §3), or `None` when it may. Checked
-/// at every launch, reruns and retries included, of a Step that uses the
-/// Environment's authority in an Environment with approvers:
-///
-/// - an Environment approval gate is upstream of it and released;
-/// - the Run's symbolic ref is still allowed;
-/// - the approver set is the one recorded when the gate's approvals met the
-///   rules (a gate released before that record existed has none to compare);
-/// - the release is no older than the maximum approval age.
-///
-/// External, timer and plugin gates are never approval gates, so a Step
-/// behind only those is refused here whatever released them.
-pub(crate) async fn environment_approval_refusal(
+/// The `step.admit` decision for one launch of `step` (ADR-0075 §3,
+/// ADR-0078 §6), made by the engine: its built-in launch-time re-check
+/// ([`launch_recheck`](scarab_policy::environment_rules::launch_recheck))
+/// and, when `policies` is wired, the `step.admit` Policies of the Run's
+/// org and Project. The decision is recorded once per Attempt
+/// (insert-if-absent); a launch that finds one already recorded acts on its
+/// own, as every launch did before.
+async fn step_admit(
     db: &dyn Db,
+    policies: Option<&dyn scarab_policy::store::PolicyStore>,
     ctx: &scarab_engine::DeployContext,
     protection: &scarab_project::EffectiveProtection,
     step: &StepRun,
     now_ms: i64,
-) -> Result<Option<String>, ExecError> {
-    if protection.approvers.is_empty() {
-        return Ok(None);
-    }
-    let Some(ir) = stored_pipeline(db, &step.run).await? else {
-        return Ok(None);
+) -> Result<StepAdmission, ExecError> {
+    use scarab_policy::environment_rules::{launch_recheck, LaunchFacts, UpstreamGateFacts};
+    use scarab_policy::policy::Checkpoint;
+
+    let stored = match policies {
+        Some(p) => p
+            .effective(&ctx.org, Some(&ctx.project), Checkpoint::StepAdmit)
+            .await
+            .map_err(|e| ExecError::Other(format!("policy store: {e}")))?,
+        None => Vec::new(),
     };
-    let Some(spec) = ir.steps.iter().find(|s| s.id == step.step.0) else {
-        return Ok(None);
-    };
-    if !scarab_policy::run_create::uses_environment_authority(&ir, spec) {
-        return Ok(None);
+    // Nothing applies: no approvers, no Policy. The stored pipeline is not
+    // read, as it was not before.
+    if protection.approvers.is_empty() && stored.is_empty() {
+        return Ok(StepAdmission::default());
     }
-    let env = &ctx.environment;
+    let ir = stored_pipeline(db, &step.run).await?;
     let id = &step.step.0;
-    let gates = scarab_policy::approval_gate::upstream_approval_gates(&ir, id);
-    if gates.is_empty() {
-        return Ok(Some(format!(
-            "step `{id}` uses environment `{env}`'s authority, and no Environment approval gate \
-             is upstream of it: the Run was created before `{env}` had approvers, or no `gate: \
-             manual` guards the step; start a new Run so `{env}` can add its gate"
-        )));
-    }
-    if !protection.ref_allowed(&ctx.git_ref) {
-        return Ok(Some(format!(
-            "ref `{}` is no longer allowed to deploy to environment `{env}`",
-            ctx.git_ref
-        )));
-    }
-    let events = db
-        .events(&step.run)
-        .await
-        .map_err(|e| ExecError::Other(e.to_string()))?;
-    let max_age_ms = i64::from(protection.approval_gate.max_approval_age_s) * 1000;
-    for gate in gates {
-        let gate_id = scarab_engine::StepId(gate.id.clone());
-        let Some(released) = scarab_engine::gate_released_at(&events, &gate_id) else {
-            return Ok(Some(format!(
-                "Environment approval gate `{}` upstream of step `{id}` has not released",
-                gate.id
-            )));
+    let spec = ir
+        .as_ref()
+        .and_then(|ir| ir.steps.iter().find(|s| s.id == *id).map(|s| (ir, s)));
+    let gates: Vec<UpstreamGateFacts> = match &ir {
+        Some(ir) => {
+            let gates = scarab_policy::approval_gate::upstream_approval_gates(ir, id);
+            let events = if gates.is_empty() {
+                Vec::new()
+            } else {
+                db.events(&step.run)
+                    .await
+                    .map_err(|e| ExecError::Other(e.to_string()))?
+            };
+            gates
+                .iter()
+                .map(|g| {
+                    let gate = scarab_engine::StepId(g.id.clone());
+                    UpstreamGateFacts {
+                        gate: g.id.clone(),
+                        released_at: scarab_engine::gate_released_at(&events, &gate).map(|t| t.0),
+                        met: scarab_engine::environment_approval_met(&events, &gate)
+                            .map(|m| (m.approvers, m.required)),
+                    }
+                })
+                .collect()
+        }
+        None => Vec::new(),
+    };
+    let check = launch_recheck(LaunchFacts {
+        environment: &ctx.environment,
+        git_ref: &ctx.git_ref,
+        protection,
+        step: id,
+        uses_authority: spec
+            .map(|(ir, s)| scarab_policy::run_create::uses_environment_authority(ir, s)),
+        approval_gates: &gates,
+        now_ms,
+    });
+    let admission = StepAdmission {
+        before_approval: check.before_approval,
+    };
+    let Some(policies) = policies.filter(|_| check.result.is_some() || !stored.is_empty()) else {
+        return match check.refusal {
+            Some(r) => Err(ExecError::Refused(r)),
+            None => Ok(admission),
         };
-        let age_ms = now_ms.saturating_sub(released.0);
-        if age_ms > max_age_ms {
-            return Ok(Some(format!(
-                "Environment approval gate `{}` released {} s ago, longer than environment \
-                 `{env}`'s maximum approval age of {} s; rerun the gate to ask the approvers \
-                 again",
-                gate.id,
-                age_ms / 1000,
-                protection.approval_gate.max_approval_age_s
-            )));
-        }
-        if let Some(met) = scarab_engine::environment_approval_met(&events, &gate_id) {
-            if (met.approvers, met.required) != protection.approver_set() {
-                return Ok(Some(format!(
-                    "environment `{env}`'s approvers changed since Environment approval gate \
-                     `{}` released; rerun the gate to ask the approvers again",
-                    gate.id
-                )));
-            }
-        }
+    };
+    let input = step_admit_input(ctx, protection, step, spec, &gates, now_ms);
+    let match_ctx = scarab_policy::evaluate::MatchContext {
+        project: ctx.project.clone(),
+        environment: Some(ctx.environment.clone()),
+        // `match.trigger_kinds` is refused outside `run.create`, so this is
+        // never read.
+        trigger_kind: scarab_policy::run_create::TriggerKind::Manual,
+    };
+    let builtins: Vec<_> = check.result.into_iter().collect();
+    let decision = tokio::task::spawn_blocking(move || {
+        scarab_policy::evaluate::evaluate_with_builtins(
+            Checkpoint::StepAdmit,
+            scarab_policy::step_admit::SCHEMA_VERSION,
+            input.as_ref().map_err(String::as_str),
+            None,
+            &match_ctx,
+            &stored,
+            builtins,
+        )
+    })
+    .await
+    .map_err(|e| ExecError::Other(e.to_string()))?;
+    let denied = decision.is_denied();
+    let messages = decision.attributed_messages();
+    let record = scarab_policy::store::DecisionRecord {
+        id: uuid::Uuid::now_v7().to_string(),
+        org: ctx.org.clone(),
+        project: Some(ctx.project.clone()),
+        run_id: Some(step.run.0.clone()),
+        step_id: Some(id.clone()),
+        attempt: Some(step.attempts.len() as u32),
+        decision,
+        at: now_ms,
+    };
+    match policies.record_decision(&record).await {
+        Ok(_) | Err(scarab_policy::store::PolicyStoreError::Conflict) => {}
+        Err(e) => return Err(ExecError::Other(format!("policy store: {e}"))),
     }
-    Ok(None)
+    match check.refusal {
+        // The built-in rule's own words, as the Step's failure has said them.
+        Some(r) => Err(ExecError::Refused(r)),
+        None if denied => Err(ExecError::Refused(messages.join("; "))),
+        None => Ok(admission),
+    }
 }
 
-/// Whether `step` has a released Environment approval gate upstream — what
-/// decides, in an Environment with approvers, whether its OIDC subject names
-/// the Environment or `none` (ADR-0075 §3).
-async fn approval_gate_released_upstream(db: &dyn Db, step: &StepRun) -> Result<bool, ExecError> {
-    let Some(ir) = stored_pipeline(db, &step.run).await? else {
-        return Ok(false);
+/// The `step.admit` input of one launch; an `Err` names what does not fit
+/// the schema, which denies when a Policy applies.
+fn step_admit_input(
+    ctx: &scarab_engine::DeployContext,
+    protection: &scarab_project::EffectiveProtection,
+    step: &StepRun,
+    spec: Option<(&scarab_pipeline::PipelineIr, &scarab_pipeline::StepSpec)>,
+    gates: &[scarab_policy::environment_rules::UpstreamGateFacts],
+    now_ms: i64,
+) -> Result<serde_json::Value, String> {
+    use scarab_policy::run_create as rc;
+    use scarab_policy::schema::{Capped, Timestamp};
+    use scarab_policy::step_admit as sa;
+
+    let (ir, s) = spec.ok_or_else(|| {
+        format!(
+            "step `{}` is not in the Run's stored pipeline, so a step.admit Policy cannot check it",
+            step.step.0
+        )
+    })?;
+    let what = || format!("Step `{}`", s.id);
+    let time =
+        |ms: i64| Timestamp::from_unix_millis(ms).ok_or(format!("the time {ms} is out of range"));
+    let approvals = gates
+        .iter()
+        .map(|g| {
+            let (approvers, required) = g.met.clone().unwrap_or_default();
+            Ok(sa::UpstreamApproval {
+                gate: g.gate.clone(),
+                released_at: g.released_at.map(time).transpose()?,
+                approvers: Capped::new(approvers)
+                    .ok_or_else(|| format!("gate `{}` lists too many approvers", g.gate))?,
+                required: required.map(u64::from),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let input = sa::StepAdmitInput {
+        org: rc::Org {
+            name: ctx.org.clone(),
+        },
+        project: rc::Project {
+            name: ctx.project.clone(),
+        },
+        step: sa::AdmittedStep {
+            id: s.id.clone(),
+            image: s.image.clone(),
+            deploy: s.deploy || ir.deploy,
+            secrets: rc::capped(s.secrets.clone(), &what, "secrets").map_err(|e| e.to_string())?,
+            forge_token: s.forge_token.map(|t| match t {
+                scarab_pipeline::ForgeToken::Read => rc::ForgeToken::Read,
+                scarab_pipeline::ForgeToken::Write => rc::ForgeToken::Write,
+            }),
+            uses_environment_authority: rc::uses_environment_authority(ir, s),
+            origin: rc::origin_of(&s.origin, &what).map_err(|e| e.to_string())?,
+        },
+        attempt: step.attempts.len() as u64,
+        run: sa::AdmittedRun {
+            id: step.run.0.clone(),
+            r#ref: ctx.git_ref.clone(),
+            environment: ctx.environment.clone(),
+        },
+        environment: sa::EnvironmentNow {
+            has_approvers: !protection.approvers.is_empty(),
+            ref_allowed: protection.ref_allowed(&ctx.git_ref),
+            max_approval_age_s: u64::from(protection.approval_gate.max_approval_age_s),
+        },
+        approvals: Capped::new(approvals).ok_or("too many approval gates upstream")?,
+        time: time(now_ms)?,
     };
-    let gates = scarab_policy::approval_gate::upstream_approval_gates(&ir, &step.step.0);
-    if gates.is_empty() {
-        return Ok(false);
-    }
-    let events = db
-        .events(&step.run)
-        .await
-        .map_err(|e| ExecError::Other(e.to_string()))?;
-    Ok(gates.iter().any(|g| {
-        scarab_engine::gate_released_at(&events, &scarab_engine::StepId(g.id.clone())).is_some()
-    }))
+    let value = serde_json::to_value(input).map_err(|e| e.to_string())?;
+    scarab_policy::schema::check_string_lengths(&sa::schema(), &value).map_err(|e| {
+        format!(
+            "`{}` is {} bytes, more than the {} a step.admit Policy can check",
+            e.path, e.len, e.max
+        )
+    })?;
+    Ok(value)
 }
 
 /// Per-attempt OIDC token TTL (ADR-0015: short-lived by design — long enough
@@ -250,7 +359,15 @@ impl SecretInjectingExecutor {
             governance: None,
             libraries: None,
             clock: Arc::new(crate::SystemClock),
+            policies: None,
         }
+    }
+
+    /// Consult the `step.admit` Policies at every launch of a Step of an
+    /// Environment-governed Run, and record each launch's decision.
+    pub fn with_policies(mut self, policies: Arc<dyn scarab_policy::store::PolicyStore>) -> Self {
+        self.policies = Some(policies);
+        self
     }
 
     /// Measure an approval's age at launch on `clock` (the server's own
@@ -303,13 +420,28 @@ impl SecretInjectingExecutor {
     /// no longer admits its Project. A refusal is [`ExecError::Refused`]: the
     /// scheduler fails the step (`Config`, with this reason) and nothing —
     /// credential, privilege grant, Pod — is used.
-    async fn ensure_still_admitted(&self, step: &StepRun) -> Result<(), ExecError> {
+    ///
+    /// `consult` decides whether the `step.admit` Policies are consulted and
+    /// the decision recorded: at a Step's launch, not when a gate passes.
+    async fn ensure_still_admitted(
+        &self,
+        step: &StepRun,
+        consult: bool,
+    ) -> Result<StepAdmission, ExecError> {
         match &self.governance {
             Some(governance) => {
                 let now = self.clock.now().await.0;
-                ensure_deploy_still_admitted(self.db.as_ref(), governance.as_ref(), step, now).await
+                let policies = self.policies.as_deref().filter(|_| consult);
+                ensure_deploy_still_admitted(
+                    self.db.as_ref(),
+                    governance.as_ref(),
+                    policies,
+                    step,
+                    now,
+                )
+                .await
             }
-            None => Ok(()),
+            None => Ok(StepAdmission::default()),
         }
     }
 
@@ -334,6 +466,7 @@ impl SecretInjectingExecutor {
     async fn mint_oidc_token(
         &self,
         step: &StepRun,
+        admission: StepAdmission,
         now_ms: i64,
     ) -> Result<Option<String>, ExecError> {
         let Some((issuer, audience)) = &self.oidc else {
@@ -351,19 +484,9 @@ impl SecretInjectingExecutor {
         // env `none` — no cloud trust policy for a real environment matches.
         // So does a Step with no released Environment approval gate upstream
         // in an Environment with approvers (ADR-0075 §3): it runs before the
-        // approval, and the cloud must not trust it as the Environment.
-        let before_approval = match &self.governance {
-            Some(governance) => {
-                let has_approvers = governance
-                    .deploy_governance(&ctx.org, &ctx.project, &ctx.environment)
-                    .await
-                    .map_err(|e| ExecError::Other(format!("environment governance store: {e}")))?
-                    .is_some_and(|g| !g.effective_protection().approvers.is_empty());
-                has_approvers && !approval_gate_released_upstream(self.db.as_ref(), step).await?
-            }
-            None => false,
-        };
-        let env = if ctx.locked_out || before_approval {
+        // approval, and the cloud must not trust it as the Environment. The
+        // `step.admit` decision says which ([`StepAdmission`]).
+        let env = if ctx.locked_out || admission.before_approval {
             "none"
         } else {
             &ctx.environment
@@ -416,14 +539,14 @@ impl Executor for SecretInjectingExecutor {
         // at Run creation; gating only credential use let a revoked Project's
         // privileged rerun launch indefinitely. A run with no deploy context
         // (ordinary CI) returns early inside the check.
-        self.ensure_still_admitted(step).await?;
+        let admission = self.ensure_still_admitted(step, true).await?;
         // Per-attempt OIDC token (ADR-0015): minted fresh on every launch,
         // in memory only — the k8s executor delivers it via a tmpfs file.
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        let oidc_token = self.mint_oidc_token(step, now_ms).await?;
+        let oidc_token = self.mint_oidc_token(step, admission, now_ms).await?;
         let base;
         let spec = if let Some(token) = oidc_token {
             base = StepSpec {
@@ -504,7 +627,7 @@ impl Executor for SecretInjectingExecutor {
         // admits the Project — the check the API's release and approve routes
         // make (git-bug 492a603). Then whatever the wrapped executor says.
         let refused = match self.ensure_not_yanked(gate).await {
-            Ok(()) => self.ensure_still_admitted(gate).await,
+            Ok(()) => self.ensure_still_admitted(gate, false).await.map(|_| ()),
             Err(e) => Err(e),
         };
         match refused {

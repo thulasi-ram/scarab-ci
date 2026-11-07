@@ -134,18 +134,37 @@ fn an_effect_the_checkpoint_does_not_allow_is_refused() {
 }
 
 #[test]
-fn unknown_and_unbuilt_checkpoints() {
+fn unknown_checkpoints() {
     let unknown = Policy::from_json(json!({ "name": "p", "checkpoint": "run.start", "rules": [] }));
     assert!(unknown.unwrap_err().contains("unknown variant `run.start`"));
-    for cp in ["step.admit", "gate.resolve"] {
-        let p = json!({ "name": "p", "checkpoint": cp,
-            "rules": [{ "when": "true", "effect": "deny", "message": "m" }] });
-        assert_error(
-            p,
-            Level::Org,
-            &format!("checkpoint `{cp}` is not yet supported"),
-        );
-    }
+}
+
+/// `step.admit` is consulted (ADR-0078 §6): a deny over its input compiles.
+#[test]
+fn step_admit_takes_denies() {
+    let deny = json!({ "name": "p", "checkpoint": "step.admit", "rules": [
+        { "when": "step.uses_environment_authority && approvals.exists(a, a.gate == 'approve')",
+          "effect": "deny", "message": "m" }] });
+    assert!(compile(&policy(deny), Level::Org).is_ok());
+}
+
+/// `gate.resolve` is consulted (ADR-0078 §6): a deny over its input
+/// compiles; the two requirements it allows are not evaluated yet, so
+/// they are refused, and so is a `match` on trigger kinds, which only
+/// `run.create` sees.
+#[test]
+fn gate_resolve_takes_denies_only() {
+    let deny = json!({ "name": "p", "checkpoint": "gate.resolve", "rules": [
+        { "when": "actor.principal == 'amy' && gate.environment_approval_gate",
+          "effect": "deny", "message": "m" }] });
+    assert!(compile(&policy(deny), Level::Org).is_ok());
+    let step_up = json!({ "name": "p", "checkpoint": "gate.resolve", "rules": [
+        { "when": "true", "effect": "require_step_up", "message": "m" }] });
+    assert_error(step_up, Level::Org, "`require_step_up` is not built yet");
+    let by_trigger = json!({ "name": "p", "checkpoint": "gate.resolve",
+        "match": { "trigger_kinds": ["push"] },
+        "rules": [{ "when": "true", "effect": "deny", "message": "m" }] });
+    assert_error(by_trigger, Level::Org, "matched at `run.create` only");
 }
 
 #[test]
