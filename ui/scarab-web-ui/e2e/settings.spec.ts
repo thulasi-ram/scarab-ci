@@ -97,22 +97,25 @@ test("an environment opens read-only and its Edit button opens the edit screen",
   await expect(edit.getByRole("textbox", { name: "description", exact: true })).toHaveValue(
     "customer-facing, eu-west-1 + us-east-1",
   );
-  await expect(edit.getByRole("textbox", { name: "approvers", exact: true })).toHaveValue("ops-lead");
-  await expect(edit.getByRole("checkbox", { name: /every project in acme/ })).toBeChecked();
+  await expect(edit.getByRole("textbox", { name: "Approvers", exact: true })).toHaveValue("ops-lead");
+  await expect(edit.getByRole("checkbox", { name: /every project in acme/i })).toBeChecked();
   // Nothing changed yet, so there is nothing to save.
   await expect(edit.getByRole("button", { name: "Save", exact: true })).toBeDisabled();
   await edit.getByRole("textbox", { name: "description", exact: true }).fill("customer-facing, eu-west-1");
   await expect(edit.getByRole("button", { name: "Save", exact: true })).toBeEnabled();
 
-  // Delete asks for the exact name before it is allowed.
+  // Delete asks, in a dialog, for the exact name before it is allowed.
   await edit.getByRole("button", { name: "Delete environment" }).click();
-  const confirm = edit.getByRole("textbox", { name: "Type production to confirm" });
-  const go = edit.getByRole("button", { name: "Delete environment" });
+  const dialog = page.getByRole("dialog");
+  const confirm = dialog.getByRole("textbox", { name: "Type production to confirm" });
+  const go = dialog.getByRole("button", { name: "Delete environment" });
   await expect(go).toBeDisabled();
   await confirm.fill("Production");
   await expect(go).toBeDisabled();
   await confirm.fill("production");
   await expect(go).toBeEnabled();
+  await page.keyboard.press("Escape");
+  await expect(dialog).toHaveCount(0);
 
   // Cancel goes back to the view without saving.
   await edit.getByRole("link", { name: "Cancel" }).click();
@@ -180,14 +183,16 @@ test("Connections lists the org's connections and, for a global admin, the unass
   await page_.getByRole("button", { name: "Add repository" }).click();
   await expect(page.getByText("acme/terraform-modules")).toBeVisible();
   await expect(page.getByText("globex/shared-ci")).toHaveCount(0);
-  await page.locator(".modal-scrim").click({ position: { x: 5, y: 5 } });
+  await page.locator(".dlg-scrim").click({ position: { x: 5, y: 5 } });
+  await expect(page.getByRole("dialog")).toHaveCount(0);
 
   // Removing a connection asks for its id typed exactly.
   const row = page_.locator("li.conn", { hasText: "forgejo-7f3a91c2" });
   await row.getByRole("button", { name: "Remove", exact: true }).first().click();
-  const go = row.getByRole("button", { name: "Remove connection" });
+  const dialog = page.getByRole("dialog");
+  const go = dialog.getByRole("button", { name: "Remove connection" });
   await expect(go).toBeDisabled();
-  await row.getByRole("textbox", { name: "Type forgejo-7f3a91c2 to confirm" }).fill("forgejo-7f3a91c2");
+  await dialog.getByRole("textbox", { name: "Type forgejo-7f3a91c2 to confirm" }).fill("forgejo-7f3a91c2");
   await expect(go).toBeEnabled();
   expect(errors).toEqual([]);
 });
@@ -266,9 +271,10 @@ test("a token minted under Your account shows in the org's list", async ({ page 
 
   // Revoking asks for the token's name typed exactly.
   await row.getByRole("button", { name: "Revoke", exact: true }).click();
-  const go = page_.getByRole("button", { name: "Revoke token" });
+  const dialog = page.getByRole("dialog");
+  const go = dialog.getByRole("button", { name: "Revoke token" });
   await expect(go).toBeDisabled();
-  await page_.getByRole("textbox", { name: "Type e2e laptop to confirm" }).fill("e2e laptop");
+  await dialog.getByRole("textbox", { name: "Type e2e laptop to confirm" }).fill("e2e laptop");
   await expect(go).toBeEnabled();
   expect(errors).toEqual([]);
 });

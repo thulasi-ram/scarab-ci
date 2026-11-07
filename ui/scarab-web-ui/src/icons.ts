@@ -45,6 +45,8 @@ import {
   Check,
   CircleX,
   FileCode,
+  Trash2,
+  X,
 } from "lucide";
 
 // IconNode = Array<[tagName, attributes]>.
@@ -85,16 +87,18 @@ const ICONS: Record<string, IconNode> = {
   sun: Sun as IconNode,
   moon: Moon as IconNode,
   user: User as IconNode,
-  // The Workspace-Snapshot retention affordances (ADR-0061 s5): the manual pin
+  // The Workspace-Snapshot retention affordances: the manual pin
   // and the cold tier's time bound.
   pin: Pin as IconNode,
   "pin-off": PinOff as IconNode,
   clock: Clock as IconNode,
-  // ADR-0076: yanks, check lists and the invoke chain.
+  // Libraries: yanks, check lists and the invoke chain.
   ban: Ban as IconNode,
   check: Check as IconNode,
   "circle-x": CircleX as IconNode,
   "file-code": FileCode as IconNode,
+  "trash-2": Trash2 as IconNode,
+  x: X as IconNode,
 };
 
 export function iconNode(name: string): IconNode | undefined {
