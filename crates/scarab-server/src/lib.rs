@@ -9808,9 +9808,20 @@ async fn approve_gate(
     }
     let (approvers, release, decision) = decided;
     if let (Some(f), Some(decision)) = (&checkpoint, decision) {
+        // A deny is enforced here as at 1.: a decision made again over
+        // approvals recorded since can deny where the first allowed (a
+        // Policy over who approved). The approval stays recorded, as on a
+        // held gate; the gate does not release.
+        let denied = decision.is_denied().then(|| decision.attributed_messages());
         f.record(st.policies.as_deref(), decision, now)
             .await
             .map_err(ApiError::Db)?;
+        if let Some(messages) = denied {
+            return Err(ApiError::Denied(format!(
+                "approval recorded, but the gate does not release: {}",
+                messages.join("; ")
+            )));
+        }
     }
 
     // 4. An Environment approval gate releases only when the release rule

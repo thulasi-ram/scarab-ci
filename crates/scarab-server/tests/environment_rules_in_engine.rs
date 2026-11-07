@@ -349,6 +349,64 @@ async fn a_gate_resolve_policy_denies_what_the_release_rule_allows() {
     );
 }
 
+/// `gate.resolve` (C-05): an approval recorded between this approval's
+/// decision and its own record makes the server decide again, and a deny in
+/// that second decision is enforced like the first. Here `carol` approves
+/// while `anonymous`'s approval is in flight: the decision over `anonymous`
+/// alone allows, the one over both denies. The interleaving is constructed:
+/// carol's approval is appended just before anonymous's.
+#[tokio::test]
+async fn a_racing_approval_cannot_slip_past_a_gate_resolve_deny() {
+    let s = Stack::new(rules(&[ME])).await;
+    s.deny_policy("gate.resolve", "'carol' in approvals").await;
+    let run = s.dispatch(GATED).await.expect("admitted");
+    s.tick(&run, 4).await;
+    assert_eq!(s.status(&run, "approve").await, StepStatus::Pending);
+
+    let gate = scarab_engine::StepId("approve".into());
+    let (db, r) = (s.db.clone(), run.clone());
+    s.db.interleave_before_next(
+        "append_event",
+        Box::new(move || {
+            Box::pin(async move {
+                db.append_event(&scarab_engine::EventKind {
+                    version: scarab_engine::EVENT_VERSION,
+                    run: r,
+                    kind: scarab_engine::EventPayload::GateApproved {
+                        step: scarab_engine::StepId("approve".into()),
+                        by: "carol".into(),
+                    },
+                    at: scarab_engine::Timestamp(1_000),
+                })
+                .await
+                .unwrap();
+            })
+        }),
+    );
+
+    let (status, body) = s.approve(&run, "approve").await;
+    assert!(!s.db.interleave_armed(), "carol's approval was appended");
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(
+        body.as_str()
+            .unwrap()
+            .contains("policy `no-gate-resolve`: not you"),
+        "{body}"
+    );
+    // Both approvals are recorded: the first decision (over `anonymous`
+    // alone) allowed, so the request reached the second.
+    let approvals = scarab_engine::gate_approvers(&s.db.events(&run).await.unwrap(), &gate);
+    assert_eq!(approvals, vec!["carol".to_string(), ME.to_string()]);
+    assert_eq!(s.status(&run, "approve").await, StepStatus::Pending);
+    let decisions = s.decisions(&run, Checkpoint::GateResolve).await;
+    assert_eq!(decisions.len(), 1, "{decisions:?}");
+    assert!(decisions[0].decision.is_denied());
+    assert_eq!(
+        decisions[0].decision.input["approvals"],
+        json!(["carol", ME])
+    );
+}
+
 impl Stack {
     /// The `step.admit` decisions recorded for `step`.
     async fn admits(&self, run: &RunId, step: &str) -> Vec<DecisionRecord> {
