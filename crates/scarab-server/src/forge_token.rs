@@ -29,7 +29,7 @@
 //!   governed by an Environment that restricts refs. Where that Environment
 //!   has approvers, `write` uses its authority: the Environment adds its
 //!   approval gate in front of the Step, and every launch checks the
-//!   approval again (`secret_executor::environment_approval_refusal`).
+//!   approval again (`scarab_policy::environment_rules::launch_recheck`).
 //!
 //! The Run's `event` values are fixed here too ([`event_facts`]), including
 //! `event.repo.clone_url`, computed from the connection registry.
@@ -582,9 +582,12 @@ impl Executor for ForgeCredentialExecutor {
         if spec.build.is_some() || spec.forge_token.is_some() {
             self.ensure_not_yanked(step).await?;
             if let Some((db, governance)) = &self.governance {
+                // The `step.admit` decision is recorded by SecretInjecting;
+                // the Environment's re-check is made here as well.
                 crate::secret_executor::ensure_deploy_still_admitted(
                     db.as_ref(),
                     governance.as_ref(),
+                    None,
                     step,
                     self.clock.now().await.0,
                 )
