@@ -1624,6 +1624,30 @@ mod tests {
             prop_assert!(e.admits(&r, &approvals).is_err());
         }
     }
+
+    /// cd43bf3: with `required_approvals = Some(n)`, n of the baseline's
+    /// approvers must approve, and every overlay approver as well.
+    #[test]
+    fn n_of_the_baseline_approvers_and_every_overlay_approver() {
+        let mut baseline = rules(&["amy", "bob", "cid"], &[]);
+        baseline.approval_gate.required_approvals = Some(2);
+        let p = effective_protection(&baseline, Some(&overlay(rules(&["olga"], &[]))));
+        let approvals = |who: &[&str]| p.approval_violations(&strings(who));
+
+        assert_eq!(
+            approvals(&["amy", "bob"]),
+            vec!["missing required approval from `olga`".to_string()],
+            "two of the baseline without the overlay approver hold"
+        );
+        assert!(approvals(&["amy", "bob", "olga"]).is_empty());
+        assert!(approvals(&["bob", "cid", "olga"]).is_empty());
+        assert_eq!(
+            approvals(&["amy", "olga"]),
+            vec!["needs 2 approval(s) from `amy`, `bob`, `cid`; has 1".to_string()]
+        );
+        // The overlay approver does not count toward the baseline's two.
+        assert!(!approvals(&["amy", "olga", "zed"]).is_empty());
+    }
 }
 
 #[cfg(test)]
