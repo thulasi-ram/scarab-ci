@@ -567,7 +567,9 @@ impl K8sExecutor {
 
     /// Upsert the per-Pod Secret carrying a Step's own secret values
     /// (ADR-0014), mounted read-only on tmpfs at `/scarab/secrets/<name>`.
-    /// Owner-referenced to the Pod, so it is garbage-collected with it. A
+    /// Deleted when the Attempt ends, beside the forge credential
+    /// ([`Executor::take_forge_credential`]), and owner-referenced to the Pod
+    /// so it is garbage-collected with it if that delete is missed. A
     /// re-drive replaces it with the values resolved for that launch.
     async fn ensure_step_secrets_secret(
         &self,
@@ -3054,6 +3056,12 @@ impl Executor for K8sExecutor {
     /// kept Pod no longer leaves a long-lived token in etcd, and the caller
     /// revokes a minted one whichever replica minted it. Gone already
     /// (taken, or collected with its Pod): `Ok(None)`.
+    ///
+    /// The Pod's `<pod>-secrets` Secret, which holds the Step's own secret
+    /// values, is deleted here too, for the same reason: a kept Pod would
+    /// otherwise keep them in etcd. A failed delete is logged and does not
+    /// stop the forge credential from being taken; the owner reference still
+    /// removes the Secret with the Pod.
     async fn take_forge_credential(
         &self,
         handle: &ExecHandle,
@@ -3061,6 +3069,22 @@ impl Executor for K8sExecutor {
         let client = self.client.clone().ok_or(ExecError::Unavailable)?;
         let secrets: Api<k8s_openapi::api::core::v1::Secret> =
             Api::namespaced(client, &self.namespace);
+        match secrets
+            .delete(
+                &step_secrets_secret_name(&handle.0),
+                &DeleteParams::default(),
+            )
+            .await
+        {
+            // 404: the Step had no secrets, or the Secret was deleted already.
+            Ok(_) => {}
+            Err(kube::Error::Api(ae)) if ae.code == 404 => {}
+            Err(e) => tracing::warn!(
+                unit = %handle.0,
+                error = %e,
+                "deleting the step secrets Secret failed; it is removed with its Pod"
+            ),
+        }
         let name = forge_token_secret_name(&handle.0);
         let Some(secret) = secrets
             .get_opt(&name)
