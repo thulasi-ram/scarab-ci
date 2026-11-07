@@ -36,8 +36,8 @@ use scarab_webauthn::{
 };
 
 use super::{
-    descriptors, event, random_bytes, random_id, sent_challenge, store_err, GuardCtx,
-    StepUpService, WebauthnChallengeDto, MSG_FLAGGED_RESET,
+    descriptors, event, random_bytes, random_id, sent_challenge, store_err, ChallengeContext,
+    GuardCtx, StepUpService, WebauthnChallengeDto, MSG_FLAGGED_RESET,
 };
 use crate::{authenticate, ApiError, AppState, Caller, SessionFacts};
 
@@ -713,42 +713,25 @@ pub(crate) async fn step_up_confirm(
         expires_at: now + STEP_UP_WINDOW_MS,
         consumed_at: None,
     };
-    let op = row
-        .summary
-        .as_ref()
-        .and_then(|s| s.get("op"))
-        .and_then(|o| o.as_str())
-        .map(str::to_string);
-    let target = row
-        .summary
-        .as_ref()
-        .and_then(|s| s.pointer("/summary/target"))
-        .and_then(|o| o.as_str())
-        .map(str::to_string);
     // The Org the guard resolved for the operation it was confirmed for, so
     // the confirmation lands in that Org's log and no other.
-    let org = row
-        .summary
-        .as_ref()
-        .and_then(|s| s.get("org"))
-        .and_then(|o| o.as_str())
-        .map(str::to_string);
+    let context = ChallengeContext::of(&row);
     let mut ev = event(
         kind::STEP_UP_CONFIRMED,
         &subject,
         caller.event_label(),
-        org,
+        context.as_ref().and_then(|c| c.org.clone()),
         now,
     );
-    ev.op = op;
-    ev.target = target;
+    ev.op = context.as_ref().map(|c| c.op.clone());
+    ev.target = context.as_ref().map(|c| c.summary.target.clone());
     ev.confirmation_id = Some(confirmation.id.clone());
     ev.passkey_id = Some(passkey.id.clone());
     ev.session_hash = Some(facts.id_hash.clone());
     ev.detail = serde_json::json!({
         "kind": kind_.as_str(),
         "expires_at": confirmation.expires_at,
-        "summary": row.summary.as_ref().and_then(|s| s.get("summary")),
+        "summary": context.map(|c| c.summary),
     });
     // Logged, or not made: a confirmation that cannot be recorded is never
     // stored, so no window or action confirmation exists unlogged.

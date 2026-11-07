@@ -27,7 +27,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use hmac::{Hmac, Mac};
 use rand::RngCore;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use utoipa::ToSchema;
 
@@ -627,6 +627,33 @@ pub(crate) fn event(
     }
 }
 
+/// What a window or action challenge minted by [`require`] keeps as its
+/// `summary`: the operation, the Org the guard resolved for it, and what the
+/// human is asked to confirm. The confirm endpoint reads it back, so the
+/// `step_up.confirmed` event lands in that Org's log and names the operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ChallengeContext {
+    /// The operation id (`secret.put`).
+    pub(crate) op: String,
+    pub(crate) org: Option<String>,
+    pub(crate) summary: OpSummary,
+}
+
+impl ChallengeContext {
+    /// The JSON a challenge row stores.
+    pub(crate) fn to_value(&self) -> serde_json::Value {
+        serde_json::to_value(self).expect("a challenge context serializes")
+    }
+
+    /// The context `row` was minted with. `None` for a challenge minted
+    /// without one (a window opened from the Security page).
+    pub(crate) fn of(row: &WebauthnChallenge) -> Option<Self> {
+        row.summary
+            .clone()
+            .and_then(|v| serde_json::from_value(v).ok())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The refusal (403 step_up_required)
 // ---------------------------------------------------------------------------
@@ -728,6 +755,39 @@ pub(crate) struct Prepared {
     pub(crate) body: Bytes,
 }
 
+impl Prepared {
+    /// A fresh event about this request: its caller, Org and session, the
+    /// operation `op` and what it acts on (`target`).
+    pub(crate) fn event(&self, kind: &str, op: &Op, target: &str, now: i64) -> SecurityEvent {
+        let mut ev = event(
+            kind,
+            &self.caller.principal.subject,
+            self.caller.event_label(),
+            self.org.clone(),
+            now,
+        );
+        ev.op = Some(op.id.to_string());
+        ev.target = Some(target.to_string());
+        ev.session_hash = self.caller.session.as_ref().map(|s| s.id_hash.clone());
+        ev
+    }
+
+    /// [`event`](Self::event) for a `step_up.refused`, its detail naming the
+    /// step-up `mode` and the `reason`. A caller adds any other detail.
+    pub(crate) fn refused_event(
+        &self,
+        op: &Op,
+        target: &str,
+        mode: &str,
+        reason: &str,
+        now: i64,
+    ) -> SecurityEvent {
+        let mut ev = self.event(kind::STEP_UP_REFUSED, op, target, now);
+        ev.detail = serde_json::json!({ "mode": mode, "reason": reason });
+        ev
+    }
+}
+
 /// Inserted into a Conditional route's request by the guard; the handler
 /// answers it with [`require`](GuardCtx::require) or
 /// [`exempt`](GuardCtx::exempt) before it writes. A 2xx answer with the
@@ -801,17 +861,8 @@ pub(crate) async fn authorise(
 ) -> Result<Option<String>, ApiError> {
     let confirmation = require(st, op, p, summary).await?;
     let now = st.clock.now().await.0;
-    let mut ev = event(
-        kind::OP_AUTHORISED,
-        &p.caller.principal.subject,
-        p.caller.event_label(),
-        p.org.clone(),
-        now,
-    );
-    ev.op = Some(op.id.to_string());
-    ev.target = Some(summary.target.clone());
+    let mut ev = p.event(kind::OP_AUTHORISED, op, &summary.target, now);
     ev.confirmation_id = confirmation.clone();
-    ev.session_hash = p.caller.session.as_ref().map(|s| s.id_hash.clone());
     ev.detail = serde_json::json!({ "summary": summary });
     if let Err(e) = p.svc.events.append(&ev).await {
         tracing::error!(error = %e, op = op.id, "op.authorised could not be recorded; refusing");
@@ -972,7 +1023,14 @@ pub(crate) async fn require(
             digest,
             None,
             None,
-            Some(serde_json::json!({ "op": op.id, "org": p.org, "summary": summary })),
+            Some(
+                ChallengeContext {
+                    op: op.id.to_string(),
+                    org: p.org.clone(),
+                    summary: summary.clone(),
+                }
+                .to_value(),
+            ),
             now,
         )
         .await?;
@@ -1007,17 +1065,7 @@ pub(crate) async fn refuse_with<T>(
     request_id: Option<String>,
 ) -> Result<T, ApiError> {
     let now = st.clock.now().await.0;
-    let mut ev = event(
-        kind::STEP_UP_REFUSED,
-        &p.caller.principal.subject,
-        p.caller.event_label(),
-        p.org.clone(),
-        now,
-    );
-    ev.op = Some(op.id.to_string());
-    ev.target = Some(refusal.summary.target.clone());
-    ev.session_hash = p.caller.session.as_ref().map(|s| s.id_hash.clone());
-    ev.detail = serde_json::json!({ "mode": refusal.mode, "reason": reason });
+    let mut ev = p.refused_event(op, &refusal.summary.target, refusal.mode, reason, now);
     match request_id {
         // Linked to the request it raised: always recorded (bounded by the
         // pending caps, and the request's evidence).
@@ -1041,17 +1089,7 @@ async fn refuse_unrequestable<T>(
     why: requests::Unrequestable,
 ) -> Result<T, ApiError> {
     let now = st.clock.now().await.0;
-    let mut ev = event(
-        kind::STEP_UP_REFUSED,
-        &p.caller.principal.subject,
-        p.caller.event_label(),
-        p.org.clone(),
-        now,
-    );
-    ev.op = Some(op.id.to_string());
-    ev.target = Some(p.summary.target.clone());
-    ev.session_hash = p.caller.session.as_ref().map(|s| s.id_hash.clone());
-    ev.detail = serde_json::json!({ "mode": mode.as_str(), "reason": why.code() });
+    let ev = p.refused_event(op, &p.summary.target, mode.as_str(), why.code(), now);
     p.svc.record_refusal(ev).await;
     Err(ApiError::Ceremony {
         status: axum::http::StatusCode::FORBIDDEN,

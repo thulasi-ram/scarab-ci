@@ -34,7 +34,7 @@ use serde_json::Value;
 use scarab_identity::{security_event_kind as kind, Action, Scope};
 
 use super::ops::{self, Class, Op, OpInput, OrgOf, ProjectOf};
-use super::{event, GuardCtx, Prepared, Ticket};
+use super::{GuardCtx, Prepared, Ticket};
 use crate::{authenticate, route_table, run_scope, AppState, Caller, RouteEntry};
 
 /// The body limit the guard buffers within: axum's default
@@ -283,17 +283,8 @@ async fn completed(
     status: StatusCode,
 ) {
     let now = st.clock.now().await.0;
-    let mut ev = event(
-        kind::OP_COMPLETED,
-        &p.caller.principal.subject,
-        p.caller.event_label(),
-        p.org.clone(),
-        now,
-    );
-    ev.op = Some(op.id.to_string());
-    ev.target = Some(p.summary.target.clone());
+    let mut ev = p.event(kind::OP_COMPLETED, op, &p.summary.target, now);
     ev.confirmation_id = confirmation;
-    ev.session_hash = p.caller.session.as_ref().map(|s| s.id_hash.clone());
     ev.detail = serde_json::json!({ "status": status.as_u16() });
     p.svc.record(ev).await;
 }
@@ -317,16 +308,7 @@ async fn tripwire(st: &AppState, ctx: &GuardCtx, p: Option<&Prepared>, status: S
     );
     if let Some(p) = p {
         let now = st.clock.now().await.0;
-        let mut ev = event(
-            kind::GUARD_NOT_CONSULTED,
-            &p.caller.principal.subject,
-            p.caller.event_label(),
-            p.org.clone(),
-            now,
-        );
-        ev.op = Some(ctx.op.id.to_string());
-        ev.target = Some(p.summary.target.clone());
-        ev.session_hash = p.caller.session.as_ref().map(|s| s.id_hash.clone());
+        let mut ev = p.event(kind::GUARD_NOT_CONSULTED, ctx.op, &p.summary.target, now);
         ev.detail = serde_json::json!({ "status": status.as_u16() });
         p.svc.record(ev).await;
     }

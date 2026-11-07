@@ -222,6 +222,30 @@ struct SealedRequest {
     session_id: Option<String>,
 }
 
+/// What a StepUpConfirmationRequest keeps as its `summary`: what would run
+/// (redacted) and who asked. Written once, when the request is raised; read
+/// by the confirm page and by the confirm endpoint.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RequestContext {
+    #[serde(flatten)]
+    pub(crate) summary: OpSummary,
+    /// Who asked: `API token “ci-bot” (<id>)` or `a CLI session (Bearer)`.
+    pub(crate) requester: String,
+}
+
+impl RequestContext {
+    /// The JSON a request row stores.
+    fn to_value(&self) -> serde_json::Value {
+        serde_json::to_value(self).expect("a request context serializes")
+    }
+
+    /// The context `r` was raised with. `None` if its `summary` does not
+    /// read as one.
+    fn of(r: &StepUpRequest) -> Option<Self> {
+        serde_json::from_value(r.summary.clone()).ok()
+    }
+}
+
 fn aad(id: &str) -> Vec<u8> {
     format!("step-up-request:{id}").into_bytes()
 }
@@ -251,22 +275,15 @@ pub(crate) async fn raise<T>(
     // The sealed body is parked until the request settles or is reaped:
     // bounded per operation, well under the guard's limit.
     if p.body.len() > op.max_request_body {
-        let mut ev = event(
-            kind::STEP_UP_REFUSED,
-            &human,
-            caller.event_label(),
-            p.org.clone(),
+        let mut ev = p.refused_event(
+            op,
+            &summary.target,
+            refusal.mode,
+            "request body too large",
             now,
         );
-        ev.op = Some(op.id.to_string());
-        ev.target = Some(summary.target.clone());
-        ev.session_hash = caller.session.as_ref().map(|s| s.id_hash.clone());
-        ev.detail = serde_json::json!({
-            "mode": refusal.mode,
-            "reason": "request body too large",
-            "bytes": p.body.len(),
-            "limit": op.max_request_body,
-        });
+        ev.detail["bytes"] = p.body.len().into();
+        ev.detail["limit"] = op.max_request_body.into();
         svc.record_refusal(ev).await;
         return Err(super::ceremony::ceremony(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -311,12 +328,11 @@ pub(crate) async fn raise<T>(
         query: p.query.clone(),
         sealed: Some(sealed),
         action_digest: p.digest.to_vec(),
-        summary: serde_json::json!({
-            "operation": summary.operation,
-            "target": summary.target,
-            "changes": summary.changes,
-            "requester": label,
-        }),
+        summary: RequestContext {
+            summary: summary.clone(),
+            requester: label.clone(),
+        }
+        .to_value(),
         for_human: human.clone(),
         requester: requester.clone(),
         session_role_cap,
@@ -357,36 +373,14 @@ pub(crate) async fn raise<T>(
         )),
     };
     if let Some((pending, reason, message)) = full {
-        let mut ev = event(
-            kind::STEP_UP_REFUSED,
-            &human,
-            caller.event_label(),
-            p.org.clone(),
-            now,
-        );
-        ev.op = Some(op.id.to_string());
-        ev.target = Some(summary.target.clone());
-        ev.session_hash = caller.session.as_ref().map(|s| s.id_hash.clone());
-        ev.detail = serde_json::json!({
-            "mode": refusal.mode,
-            "reason": reason,
-            "pending": pending,
-        });
+        let mut ev = p.refused_event(op, &summary.target, refusal.mode, reason, now);
+        ev.detail["pending"] = pending.into();
         svc.record_refusal(ev).await;
         return Err(ApiError::TooManyRequests(message));
     }
 
-    let mut ev = event(
-        kind::REQUEST_RAISED,
-        &human,
-        caller.event_label(),
-        p.org.clone(),
-        now,
-    );
-    ev.op = Some(op.id.to_string());
-    ev.target = Some(summary.target.clone());
+    let mut ev = p.event(kind::REQUEST_RAISED, op, &summary.target, now);
     ev.request_id = Some(id.clone());
-    ev.session_hash = caller.session.as_ref().map(|s| s.id_hash.clone());
     ev.detail = serde_json::json!({
         "requested_via": requester.via(),
         "requested_by": label,
@@ -509,32 +503,12 @@ pub struct StepUpRequestDto {
 
 impl StepUpRequestDto {
     fn new(r: &StepUpRequest, now: i64) -> Self {
-        let text = |k: &str| {
-            r.summary
-                .get(k)
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string()
-        };
-        let changes = r
-            .summary
-            .get("changes")
-            .and_then(|c| c.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let context = RequestContext::of(r).unwrap_or_default();
         Self {
             id: r.id.clone(),
             op: r.op.clone(),
-            summary: OpSummary {
-                operation: text("operation"),
-                target: text("target"),
-                changes,
-            },
-            requested_by: text("requester"),
+            summary: context.summary,
+            requested_by: context.requester,
             requested_via: r.requester.via().to_string(),
             for_human: r.for_human.clone(),
             org: r.org.clone(),
@@ -836,17 +810,12 @@ pub(crate) async fn confirm_request(
         .put_confirmation(&confirmation)
         .await
         .map_err(store_err)?;
-    let requested_by = r
-        .summary
-        .get("requester")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-    let target = r
-        .summary
-        .get("target")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
+    let context = RequestContext::of(&r);
+    let requested_by = context
+        .as_ref()
+        .map(|c| c.requester.clone())
+        .unwrap_or_default();
+    let target = context.as_ref().map(|c| c.summary.target.clone());
 
     let mut ev = event(
         kind::STEP_UP_CONFIRMED,
@@ -928,16 +897,7 @@ pub(crate) async fn confirm_request(
                 confirmation_id: confirmation_id.clone(),
                 op_id: r.op.clone(),
                 digest: r.action_digest.clone(),
-                changes: r
-                    .summary
-                    .get("changes")
-                    .and_then(|c| c.as_array())
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|v| v.as_str().map(str::to_string))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
+                changes: context.map(|c| c.summary.changes).unwrap_or_default(),
                 requester,
                 // The confirmer: proven (above) to be the request's human
                 // or the live Principal it was merged into — whom a merge

@@ -17,7 +17,7 @@
 //! [`STEP_DEBUG_POD`]): a WebSocket upgrade that opens a shell in a step Pod.
 
 use scarab_identity::Role;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Which confirmation a crown jewel needs (ADR-0073 §4).
@@ -184,7 +184,7 @@ impl OpInput {
 /// What a human is asked to confirm: the server-rendered, redacted
 /// description of one operation (shown in the 403, on the confirm page and
 /// in the event log).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct OpSummary {
     /// What is being done ("Write a secret").
     pub operation: String,
