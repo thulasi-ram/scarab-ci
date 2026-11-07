@@ -15,8 +15,7 @@ use serde_json::{json, Value};
 
 use scarab_forge::{ForgeConnection, ForgeConnectionStore, ForgeKind, RepoRef};
 use scarab_identity::{
-    Binding, BindingOrigin, Principal, RbacStore, Role, Scope, Session, SessionStore,
-    LOGIN_KIND_API, LOGIN_KIND_BROWSER,
+    Binding, BindingOrigin, LoginKind, Principal, RbacStore, Role, Scope, Session, SessionStore,
 };
 use scarab_server::step_up::StepUpService;
 use scarab_server::{router, AppState, LogService};
@@ -139,16 +138,16 @@ async fn serve_with(enforce: bool, extra: impl FnOnce(AppState) -> AppState) -> 
 }
 
 impl Server {
-    async fn session(&self, principal: Principal, login_kind: &str) -> Sess {
+    async fn session(&self, principal: Principal, login_kind: LoginKind) -> Sess {
         let n = next_id();
         let csrf = format!("csrf-{n}");
         let s = Session {
-            id: format!("sess-{}-{login_kind}-{n}", principal.subject),
+            id: format!("sess-{}-{}-{n}", principal.subject, login_kind.as_str()),
             principal,
             expires_at: T0 + DAY,
             csrf_hash: scarab_identity::csrf_hash(&csrf),
             created_at: T0,
-            login_kind: login_kind.to_string(),
+            login_kind,
         };
         self.sessions.put(&s).await.unwrap();
         Sess { id: s.id, csrf }
@@ -156,7 +155,7 @@ impl Server {
 
     /// A CLI session of `subject` (an API login, presented as Bearer).
     async fn cli(&self, subject: &str) -> Sess {
-        self.session(scoped(subject), LOGIN_KIND_API).await
+        self.session(scoped(subject), LoginKind::Api).await
     }
 
     async fn grant(&self, subject: &str, role: Role) {
@@ -191,7 +190,7 @@ impl Server {
     /// Enroll a software passkey for `subject` through the real ceremony,
     /// from a browser login that completed just now.
     async fn enroll(&self, subject: &str, label: &str) {
-        let s = self.session(scoped(subject), LOGIN_KIND_BROWSER).await;
+        let s = self.session(scoped(subject), LoginKind::Browser).await;
         let (st, opts) = self
             .cookie(
                 "/v1/me/passkeys/registration/options",

@@ -7810,7 +7810,7 @@ async fn login(
     let now = st.clock.now().await.0;
     // An API/CLI exchange: never a fresh browser login (ADR-0073 §2), even
     // though it also sets the browser cookies.
-    let (session, csrf) = mint_session(principal.clone(), now, scarab_identity::LOGIN_KIND_API);
+    let (session, csrf) = mint_session(principal.clone(), now, scarab_identity::LoginKind::Api);
     sessions
         .put(&session)
         .await
@@ -7831,14 +7831,18 @@ async fn login(
 
 /// Mint a fresh [`Session`] (opaque id + CSRF token, 24h TTL), stamped with
 /// when the login completed and how (ADR-0073 §2): `login_kind` is
-/// [`scarab_identity::LOGIN_KIND_BROWSER`] for the OAuth callback and
-/// [`scarab_identity::LOGIN_KIND_API`] for the API/CLI exchange — only a
+/// [`scarab_identity::LoginKind::Browser`] for the OAuth callback and
+/// [`scarab_identity::LoginKind::Api`] for the API/CLI exchange — only a
 /// fresh browser login may enroll a first passkey.
 ///
 /// Returns the CSRF token beside the session: the session keeps only its hash
 /// (git-bug 51d6bcb), so this is the one place the plaintext exists — for the
 /// cookie and the login response.
-fn mint_session(principal: Principal, now_ms: i64, login_kind: &str) -> (Session, String) {
+fn mint_session(
+    principal: Principal,
+    now_ms: i64,
+    login_kind: scarab_identity::LoginKind,
+) -> (Session, String) {
     let csrf = Uuid::new_v4().to_string();
     let session = Session {
         id: Uuid::new_v4().to_string(),
@@ -7846,7 +7850,7 @@ fn mint_session(principal: Principal, now_ms: i64, login_kind: &str) -> (Session
         expires_at: now_ms + SESSION_TTL_MS,
         csrf_hash: scarab_identity::csrf_hash(&csrf),
         created_at: now_ms,
-        login_kind: login_kind.to_string(),
+        login_kind,
     };
     (session, csrf)
 }
@@ -8012,7 +8016,7 @@ async fn oauth_callback(
         ApiError::Unauthorized
     })?;
     let now = st.clock.now().await.0;
-    let (session, csrf) = mint_session(principal, now, scarab_identity::LOGIN_KIND_BROWSER);
+    let (session, csrf) = mint_session(principal, now, scarab_identity::LoginKind::Browser);
     sessions.put(&session).await.map_err(|e| {
         tracing::warn!(error = %e, "OAuth callback: could not store the new session");
         ApiError::Unauthorized

@@ -24,8 +24,8 @@ use tower::ServiceExt;
 use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
 use scarab_identity::{
-    api_token_hash, ApiToken, ApiTokenStore, IdentityStore, PasskeyStore, ProviderIdentity, Role,
-    Scope, Session, SessionStore, LOGIN_KIND_BROWSER,
+    api_token_hash, ApiToken, ApiTokenStore, IdentityStore, LoginKind, PasskeyStore,
+    ProviderIdentity, Role, Scope, Session, SessionStore,
 };
 use scarab_secrets::{Secret, SecretProvider, SecretScope};
 use scarab_server::{router, AppState, LogService};
@@ -833,7 +833,7 @@ async fn rt_the_stored_session_columns_ride_nothing() {
             expires_at: now + DAY,
             csrf_hash: scarab_identity::csrf_hash(&real.csrf),
             created_at: now,
-            login_kind: LOGIN_KIND_BROWSER.into(),
+            login_kind: LoginKind::Browser,
         },
     )
     .await
@@ -893,7 +893,7 @@ async fn rt_csrf_edge_inputs_are_refused() {
         expires_at: now + DAY,
         csrf_hash: String::new(),
         created_at: now,
-        login_kind: LOGIN_KIND_BROWSER.into(),
+        login_kind: LoginKind::Browser,
     };
     h.sessions.put(&tokenless).await.unwrap();
     let real = h.browser_session(owner("amy")).await;

@@ -15,10 +15,11 @@ use async_trait::async_trait;
 use sqlx::Row;
 
 use scarab_identity::{
-    BeginExecution, ChallengePurpose, ChallengeStore, ConfirmationKind, IdentityError, Passkey,
-    PasskeyStore, PasskeyUse, RequestState, SecurityEvent, SecurityEventFilter, SecurityEventLog,
-    StepUpConfirmation, StepUpRequest, StepUpRequestPendingCaps, StepUpRequestRaiseOutcome,
-    StepUpRequester, StepUpStore, WebauthnChallenge,
+    ChallengePurpose, ChallengeStore, ConfirmationKind, IdentityError, OrgSecurityEventLog,
+    Passkey, PasskeyStore, PasskeyUse, SecurityEvent, SecurityEventFilter, StepUpConfirmation,
+    StepUpConfirmationRequest, StepUpConfirmationRequestBeginOutcome,
+    StepUpConfirmationRequestPendingCaps, StepUpConfirmationRequestRaiseOutcome,
+    StepUpConfirmationRequestState, StepUpConfirmationRequester, StepUpStore, WebauthnChallenge,
 };
 
 use crate::{identity_err, role_from_str, role_str, PostgresDb};
@@ -528,14 +529,14 @@ const REQUEST_COLUMNS: &str = "id, org, op, method, path, query, sealed, action_
      expires_at, state, confirmed_by, confirmed_at, confirmation_id, executed_at, \
      result_status, result_summary";
 
-fn request_from_row(r: &sqlx::postgres::PgRow) -> Result<StepUpRequest, IdentityError> {
+fn request_from_row(r: &sqlx::postgres::PgRow) -> Result<StepUpConfirmationRequest, IdentityError> {
     let requester = match r.get::<String, _>("requested_via").as_str() {
-        "api_token" => StepUpRequester::ApiToken {
+        "api_token" => StepUpConfirmationRequester::ApiToken {
             id: r
                 .get::<Option<String>, _>("api_token_id")
                 .ok_or_else(|| unreadable("request requester"))?,
         },
-        "bearer_session" => StepUpRequester::BearerSession {
+        "bearer_session" => StepUpConfirmationRequester::BearerSession {
             session_hash: r
                 .get::<Option<String>, _>("session_hash")
                 .ok_or_else(|| unreadable("request requester"))?,
@@ -548,7 +549,7 @@ fn request_from_row(r: &sqlx::postgres::PgRow) -> Result<StepUpRequest, Identity
         .get::<Option<String>, _>("session_role_cap")
         .map(|s| role_from_str(&s).ok_or_else(|| unreadable("request role cap")))
         .transpose()?;
-    Ok(StepUpRequest {
+    Ok(StepUpConfirmationRequest {
         id: r.get("id"),
         org: r.get("org"),
         op: r.get("op"),
@@ -563,7 +564,7 @@ fn request_from_row(r: &sqlx::postgres::PgRow) -> Result<StepUpRequest, Identity
         session_role_cap,
         created_at: r.get("created_at"),
         expires_at: r.get("expires_at"),
-        state: RequestState::parse(&r.get::<String, _>("state"))
+        state: StepUpConfirmationRequestState::parse(&r.get::<String, _>("state"))
             .ok_or_else(|| unreadable("request state"))?,
         confirmed_by: r.get("confirmed_by"),
         confirmed_at: r.get("confirmed_at"),
@@ -583,11 +584,13 @@ pub fn step_up_request_lock_key(for_human: &str) -> String {
 /// Insert one StepUpConfirmationRequest row.
 async fn insert_request<'e, E: sqlx::PgExecutor<'e>>(
     ex: E,
-    r: &StepUpRequest,
+    r: &StepUpConfirmationRequest,
 ) -> Result<(), IdentityError> {
     let (api_token_id, session_hash) = match &r.requester {
-        StepUpRequester::ApiToken { id } => (Some(id.as_str()), None),
-        StepUpRequester::BearerSession { session_hash } => (None, Some(session_hash.as_str())),
+        StepUpConfirmationRequester::ApiToken { id } => (Some(id.as_str()), None),
+        StepUpConfirmationRequester::BearerSession { session_hash } => {
+            (None, Some(session_hash.as_str()))
+        }
     };
     sqlx::query(
         "INSERT INTO step_up_requests
@@ -738,7 +741,10 @@ impl StepUpStore for PostgresDb {
         .map_err(identity_err)
     }
 
-    async fn delete_windows_for(&self, principal: &str) -> Result<u64, IdentityError> {
+    async fn delete_standing_confirmations_for(
+        &self,
+        principal: &str,
+    ) -> Result<u64, IdentityError> {
         Ok(sqlx::query(
             "DELETE FROM step_up_confirmations
              WHERE principal_id = $1
@@ -766,10 +772,10 @@ impl StepUpStore for PostgresDb {
 
     async fn raise_request(
         &self,
-        r: &StepUpRequest,
-        caps: StepUpRequestPendingCaps,
+        r: &StepUpConfirmationRequest,
+        caps: StepUpConfirmationRequestPendingCaps,
         now_ms: i64,
-    ) -> Result<StepUpRequestRaiseOutcome, IdentityError> {
+    ) -> Result<StepUpConfirmationRequestRaiseOutcome, IdentityError> {
         let mut tx = self.pool().begin().await.map_err(identity_err)?;
         // Every raise for one human runs its count-then-insert under one
         // transaction-scoped advisory lock, so concurrent raises (from any
@@ -780,8 +786,10 @@ impl StepUpStore for PostgresDb {
             .await
             .map_err(identity_err)?;
         let (column, key) = match &r.requester {
-            StepUpRequester::ApiToken { id } => ("api_token_id", id),
-            StepUpRequester::BearerSession { session_hash } => ("session_hash", session_hash),
+            StepUpConfirmationRequester::ApiToken { id } => ("api_token_id", id),
+            StepUpConfirmationRequester::BearerSession { session_hash } => {
+                ("session_hash", session_hash)
+            }
         };
         let by_requester: i64 = sqlx::query_scalar(&format!(
             "SELECT count(*) FROM step_up_requests
@@ -795,7 +803,7 @@ impl StepUpStore for PostgresDb {
         .map_err(identity_err)?;
         let by_requester = by_requester.max(0) as u64;
         if by_requester >= caps.per_requester {
-            return Ok(StepUpRequestRaiseOutcome::RequesterFull {
+            return Ok(StepUpConfirmationRequestRaiseOutcome::RequesterFull {
                 pending: by_requester,
             });
         }
@@ -810,14 +818,17 @@ impl StepUpStore for PostgresDb {
         .map_err(identity_err)?;
         let for_human = for_human.max(0) as u64;
         if for_human >= caps.per_human {
-            return Ok(StepUpRequestRaiseOutcome::HumanFull { pending: for_human });
+            return Ok(StepUpConfirmationRequestRaiseOutcome::HumanFull { pending: for_human });
         }
         insert_request(&mut *tx, r).await?;
         tx.commit().await.map_err(identity_err)?;
-        Ok(StepUpRequestRaiseOutcome::Raised)
+        Ok(StepUpConfirmationRequestRaiseOutcome::Raised)
     }
 
-    async fn get_request(&self, id: &str) -> Result<Option<StepUpRequest>, IdentityError> {
+    async fn get_request(
+        &self,
+        id: &str,
+    ) -> Result<Option<StepUpConfirmationRequest>, IdentityError> {
         sqlx::query(&format!(
             "SELECT {REQUEST_COLUMNS} FROM step_up_requests WHERE id = $1"
         ))
@@ -836,7 +847,7 @@ impl StepUpStore for PostgresDb {
         confirmed_by: &str,
         confirmation_id: &str,
         now_ms: i64,
-    ) -> Result<BeginExecution, IdentityError> {
+    ) -> Result<StepUpConfirmationRequestBeginOutcome, IdentityError> {
         // The pending → executing CAS. A second caller blocks on the row
         // lock, then re-evaluates `state = 'pending'` against the committed
         // row and matches nothing.
@@ -854,7 +865,9 @@ impl StepUpStore for PostgresDb {
         .await
         .map_err(identity_err)?;
         if let Some(row) = begun {
-            return Ok(BeginExecution::Begun(Box::new(request_from_row(&row)?)));
+            return Ok(StepUpConfirmationRequestBeginOutcome::Begun(Box::new(
+                request_from_row(&row)?,
+            )));
         }
         // Lost: say why, from what is stored now.
         let Some(row) = sqlx::query("SELECT state, expires_at FROM step_up_requests WHERE id = $1")
@@ -863,21 +876,21 @@ impl StepUpStore for PostgresDb {
             .await
             .map_err(identity_err)?
         else {
-            return Ok(BeginExecution::NotFound);
+            return Ok(StepUpConfirmationRequestBeginOutcome::NotFound);
         };
-        let state = RequestState::parse(&row.get::<String, _>("state"))
+        let state = StepUpConfirmationRequestState::parse(&row.get::<String, _>("state"))
             .ok_or_else(|| unreadable("request state"))?;
-        Ok(if state == RequestState::Pending {
-            BeginExecution::Expired
+        Ok(if state == StepUpConfirmationRequestState::Pending {
+            StepUpConfirmationRequestBeginOutcome::Expired
         } else {
-            BeginExecution::NotPending(state)
+            StepUpConfirmationRequestBeginOutcome::NotPending(state)
         })
     }
 
     async fn finish_request(
         &self,
         id: &str,
-        state: RequestState,
+        state: StepUpConfirmationRequestState,
         result_status: Option<i32>,
         result_summary: Option<&str>,
         now_ms: i64,
@@ -908,12 +921,14 @@ impl StepUpStore for PostgresDb {
 
     async fn pending_count(
         &self,
-        requester: &StepUpRequester,
+        requester: &StepUpConfirmationRequester,
         now_ms: i64,
     ) -> Result<u64, IdentityError> {
         let (column, key) = match requester {
-            StepUpRequester::ApiToken { id } => ("api_token_id", id),
-            StepUpRequester::BearerSession { session_hash } => ("session_hash", session_hash),
+            StepUpConfirmationRequester::ApiToken { id } => ("api_token_id", id),
+            StepUpConfirmationRequester::BearerSession { session_hash } => {
+                ("session_hash", session_hash)
+            }
         };
         let n: i64 = sqlx::query_scalar(&format!(
             "SELECT count(*) FROM step_up_requests
@@ -1005,7 +1020,7 @@ fn event_from_row(r: &sqlx::postgres::PgRow) -> SecurityEvent {
 }
 
 #[async_trait]
-impl SecurityEventLog for PostgresDb {
+impl OrgSecurityEventLog for PostgresDb {
     async fn append(&self, e: &SecurityEvent) -> Result<i64, IdentityError> {
         insert_security_event(self.pool(), e)
             .await

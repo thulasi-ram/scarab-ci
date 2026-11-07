@@ -15,7 +15,7 @@ use tower::ServiceExt;
 use std::sync::Arc;
 
 use scarab_db_postgres::PostgresDb;
-use scarab_identity::{IdentityStore, ProviderIdentity, LOGIN_KIND_API};
+use scarab_identity::{IdentityStore, LoginKind, ProviderIdentity};
 use scarab_server::config::OAuthConfig;
 use scarab_server::oauth::OAuthAuthenticator;
 use scarab_server::AppState;
@@ -114,7 +114,7 @@ async fn the_first_passkey_needs_a_fresh_browser_login() {
 #[tokio::test]
 async fn an_api_login_can_never_enroll_the_first_passkey() {
     let h = harness();
-    let s = h.session(owner("amy"), LOGIN_KIND_API).await;
+    let s = h.session(owner("amy"), LoginKind::Api).await;
     let (st, b) = registration_options(&h, &s).await;
     assert_eq!(
         (st, b["code"].clone()),
@@ -240,7 +240,7 @@ fn provider(id: &str, unqualified: bool) -> Arc<OAuthAuthenticator> {
 /// The fresh-login refusal for `subject`'s API session, and what following
 /// its `login_url` answers.
 async fn fresh_login_for(h: &Harness, subject: &str) -> (String, StatusCode, String) {
-    let s = h.session(owner(subject), LOGIN_KIND_API).await;
+    let s = h.session(owner(subject), LoginKind::Api).await;
     let (st, b) = registration_options(h, &s).await;
     assert_eq!(st, StatusCode::FORBIDDEN, "{b}");
     assert_eq!(b["code"], "fresh_login_required", "{b}");
@@ -344,7 +344,7 @@ async fn me_security_names_the_callers_fresh_login_url() {
         st.with_oauth_login(provider("gitea", false))
             .with_oauth_login(provider("okta", false))
     });
-    let s = h.session(owner("okta:amy"), LOGIN_KIND_API).await;
+    let s = h.session(owner("okta:amy"), LoginKind::Api).await;
     let (st, me) = h.cookie("GET", "/v1/me/security", None, &s).await;
     assert_eq!(st, StatusCode::OK, "{me}");
     let url = me["fresh_login_url"].as_str().expect("named");

@@ -41,25 +41,26 @@ pub const MAX_PENDING_STEP_UP_REQUESTS_PER_HUMAN: u64 = 20;
 /// The caps [`StepUpStore::raise_request`] enforces, counted atomically with
 /// the insert.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StepUpRequestPendingCaps {
+pub struct StepUpConfirmationRequestPendingCaps {
     /// Live requests one requester (a token, a Bearer session) may hold.
     pub per_requester: u64,
     /// Live requests one human (`for_human`) may have waiting.
     pub per_human: u64,
 }
 
-impl StepUpRequestPendingCaps {
+impl StepUpConfirmationRequestPendingCaps {
     /// [`MAX_PENDING_STEP_UP_REQUESTS`] and
     /// [`MAX_PENDING_STEP_UP_REQUESTS_PER_HUMAN`].
-    pub const DEFAULT: StepUpRequestPendingCaps = StepUpRequestPendingCaps {
-        per_requester: MAX_PENDING_STEP_UP_REQUESTS,
-        per_human: MAX_PENDING_STEP_UP_REQUESTS_PER_HUMAN,
-    };
+    pub const DEFAULT: StepUpConfirmationRequestPendingCaps =
+        StepUpConfirmationRequestPendingCaps {
+            per_requester: MAX_PENDING_STEP_UP_REQUESTS,
+            per_human: MAX_PENDING_STEP_UP_REQUESTS_PER_HUMAN,
+        };
 }
 
 /// What [`StepUpStore::raise_request`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StepUpRequestRaiseOutcome {
+pub enum StepUpConfirmationRequestRaiseOutcome {
     /// Recorded, pending.
     Raised,
     /// Not recorded: the requester already holds `pending` live requests.
@@ -68,13 +69,54 @@ pub enum StepUpRequestRaiseOutcome {
     HumanFull { pending: u64 },
 }
 
-/// [`Session::login_kind`](crate::Session::login_kind) for a login completed
-/// by the browser OAuth callback.
-pub const LOGIN_KIND_BROWSER: &str = "browser";
+/// How the login behind a [`Session`](crate::Session) happened
+/// ([`Session::login_kind`](crate::Session::login_kind)). Stored and
+/// serialized as the strings `browser`, `api` and `""`; any other stored
+/// string reads as [`Unrecorded`](Self::Unrecorded).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(from = "String", into = "&'static str")]
+pub enum LoginKind {
+    /// Completed by the browser OAuth callback.
+    Browser,
+    /// Minted by the API/CLI login exchange. It can never enroll a first
+    /// passkey.
+    Api,
+    /// A session from before logins were recorded (`""`). Never fresh.
+    #[default]
+    Unrecorded,
+}
 
-/// [`Session::login_kind`](crate::Session::login_kind) for a session minted
-/// by the API/CLI login exchange. It can never enroll a first passkey.
-pub const LOGIN_KIND_API: &str = "api";
+impl LoginKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Browser => "browser",
+            Self::Api => "api",
+            Self::Unrecorded => "",
+        }
+    }
+
+    /// The kind a stored string names; anything unknown is
+    /// [`Unrecorded`](Self::Unrecorded).
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "browser" => Self::Browser,
+            "api" => Self::Api,
+            _ => Self::Unrecorded,
+        }
+    }
+}
+
+impl From<String> for LoginKind {
+    fn from(s: String) -> Self {
+        Self::parse(&s)
+    }
+}
+
+impl From<LoginKind> for &'static str {
+    fn from(k: LoginKind) -> Self {
+        k.as_str()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Passkeys
@@ -361,14 +403,14 @@ pub struct StepUpConfirmation {
 /// Who raised a StepUpConfirmationRequest.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "via")]
-pub enum StepUpRequester {
+pub enum StepUpConfirmationRequester {
     /// An issued API token, by its id.
     ApiToken { id: String },
     /// A session presented as `Bearer`, by the SHA-256 of its id.
     BearerSession { session_hash: String },
 }
 
-impl StepUpRequester {
+impl StepUpConfirmationRequester {
     /// The `requested_via` column value.
     pub fn via(&self) -> &'static str {
         match self {
@@ -379,10 +421,10 @@ impl StepUpRequester {
 }
 
 /// Where a StepUpConfirmationRequest stands. **Expired** is not a state: it is
-/// `Pending` past `expires_at`, computed on read ([`StepUpRequest::is_expired`]).
+/// `Pending` past `expires_at`, computed on read ([`StepUpConfirmationRequest::is_expired`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum RequestState {
+pub enum StepUpConfirmationRequestState {
     Pending,
     /// Confirmed; the replay is running.
     Executing,
@@ -390,7 +432,7 @@ pub enum RequestState {
     Failed,
 }
 
-impl RequestState {
+impl StepUpConfirmationRequestState {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
@@ -419,7 +461,7 @@ impl RequestState {
 /// (an API token, or a session presented as Bearer) made, parked for the
 /// human it acts for to confirm with a passkey.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StepUpRequest {
+pub struct StepUpConfirmationRequest {
     /// 128-bit random, URL-safe.
     pub id: String,
     pub org: Option<String>,
@@ -436,12 +478,12 @@ pub struct StepUpRequest {
     pub summary: serde_json::Value,
     /// The human who must confirm.
     pub for_human: String,
-    pub requester: StepUpRequester,
+    pub requester: StepUpConfirmationRequester,
     /// The role cap a Bearer session's replay is held to.
     pub session_role_cap: Option<Role>,
     pub created_at: i64,
     pub expires_at: i64,
-    pub state: RequestState,
+    pub state: StepUpConfirmationRequestState,
     pub confirmed_by: Option<String>,
     pub confirmed_at: Option<i64>,
     pub confirmation_id: Option<String>,
@@ -450,10 +492,10 @@ pub struct StepUpRequest {
     pub result_summary: Option<String>,
 }
 
-impl StepUpRequest {
+impl StepUpConfirmationRequest {
     /// Pending, and past its expiry: nobody may confirm it any more.
     pub fn is_expired(&self, now_ms: i64) -> bool {
-        self.state == RequestState::Pending && self.expires_at <= now_ms
+        self.state == StepUpConfirmationRequestState::Pending && self.expires_at <= now_ms
     }
 
     /// The state as shown: `expired` for a pending request past its expiry.
@@ -468,15 +510,15 @@ impl StepUpRequest {
 
 /// What [`StepUpStore::begin_execution`] found.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BeginExecution {
+pub enum StepUpConfirmationRequestBeginOutcome {
     /// This caller moved it pending → executing; it alone replays it.
-    Begun(Box<StepUpRequest>),
+    Begun(Box<StepUpConfirmationRequest>),
     /// No such request.
     NotFound,
     /// Pending, but past its expiry.
     Expired,
     /// Already executing or terminal (someone else confirmed it).
-    NotPending(RequestState),
+    NotPending(StepUpConfirmationRequestState),
 }
 
 /// Durable store of StepUpConfirmations and StepUpConfirmationRequests.
@@ -529,7 +571,10 @@ pub trait StepUpStore: Send + Sync {
     /// Delete `principal`'s standing step-up authority — every window and
     /// every unconsumed action confirmation, in every session (a passkey
     /// reset). Returns how many.
-    async fn delete_windows_for(&self, principal: &str) -> Result<u64, IdentityError>;
+    async fn delete_standing_confirmations_for(
+        &self,
+        principal: &str,
+    ) -> Result<u64, IdentityError>;
 
     /// Delete the standing step-up authority made with passkey `passkey_id`
     /// — every window and every unconsumed action confirmation it signed,
@@ -544,23 +589,26 @@ pub trait StepUpStore: Send + Sync {
     /// can never together exceed the caps.
     async fn raise_request(
         &self,
-        request: &StepUpRequest,
-        caps: StepUpRequestPendingCaps,
+        request: &StepUpConfirmationRequest,
+        caps: StepUpConfirmationRequestPendingCaps,
         now_ms: i64,
-    ) -> Result<StepUpRequestRaiseOutcome, IdentityError>;
+    ) -> Result<StepUpConfirmationRequestRaiseOutcome, IdentityError>;
 
-    async fn get_request(&self, id: &str) -> Result<Option<StepUpRequest>, IdentityError>;
+    async fn get_request(
+        &self,
+        id: &str,
+    ) -> Result<Option<StepUpConfirmationRequest>, IdentityError>;
 
     /// Move request `id` pending → executing, atomically and only if it has
     /// not expired, stamping who confirmed it. Exactly one of any number of
-    /// concurrent callers gets [`BeginExecution::Begun`].
+    /// concurrent callers gets [`StepUpConfirmationRequestBeginOutcome::Begun`].
     async fn begin_execution(
         &self,
         id: &str,
         confirmed_by: &str,
         confirmation_id: &str,
         now_ms: i64,
-    ) -> Result<BeginExecution, IdentityError>;
+    ) -> Result<StepUpConfirmationRequestBeginOutcome, IdentityError>;
 
     /// Settle an executing request as `state` (`Executed` or `Failed`),
     /// recording the result and **clearing the sealed body**. `false` if it
@@ -568,7 +616,7 @@ pub trait StepUpStore: Send + Sync {
     async fn finish_request(
         &self,
         id: &str,
-        state: RequestState,
+        state: StepUpConfirmationRequestState,
         result_status: Option<i32>,
         result_summary: Option<&str>,
         now_ms: i64,
@@ -577,7 +625,7 @@ pub trait StepUpStore: Send + Sync {
     /// How many live (pending, unexpired) requests `requester` holds.
     async fn pending_count(
         &self,
-        requester: &StepUpRequester,
+        requester: &StepUpConfirmationRequester,
         now_ms: i64,
     ) -> Result<u64, IdentityError>;
 
@@ -677,7 +725,7 @@ pub struct SecurityEvent {
     pub detail: serde_json::Value,
 }
 
-/// Which events [`SecurityEventLog::list`] returns, newest first.
+/// Which events [`OrgSecurityEventLog::list`] returns, newest first.
 ///
 /// - `org: Some(o)` — the **Org log**: events of `o`, plus Org-less events
 ///   about anyone who holds a live binding in `o` (read at query time).
@@ -708,7 +756,7 @@ pub struct SecurityEventFilter {
 
 /// The append-only OrgSecurityEventLog. There is no update and no delete.
 #[async_trait]
-pub trait SecurityEventLog: Send + Sync {
+pub trait OrgSecurityEventLog: Send + Sync {
     /// Append `event`; returns its assigned `seq`.
     async fn append(&self, event: &SecurityEvent) -> Result<i64, IdentityError>;
 
@@ -738,19 +786,23 @@ mod tests {
             assert_eq!(ConfirmationKind::parse(k.as_str()), Some(k));
         }
         for s in [
-            RequestState::Pending,
-            RequestState::Executing,
-            RequestState::Executed,
-            RequestState::Failed,
+            StepUpConfirmationRequestState::Pending,
+            StepUpConfirmationRequestState::Executing,
+            StepUpConfirmationRequestState::Executed,
+            StepUpConfirmationRequestState::Failed,
         ] {
-            assert_eq!(RequestState::parse(s.as_str()), Some(s));
+            assert_eq!(StepUpConfirmationRequestState::parse(s.as_str()), Some(s));
         }
-        assert_eq!(RequestState::parse("expired"), None, "expired is computed");
+        assert_eq!(
+            StepUpConfirmationRequestState::parse("expired"),
+            None,
+            "expired is computed"
+        );
     }
 
     #[test]
     fn a_request_is_expired_only_while_pending_and_past_expiry() {
-        let mut r = StepUpRequest {
+        let mut r = StepUpConfirmationRequest {
             id: "r".into(),
             org: None,
             op: "secret.put".into(),
@@ -761,11 +813,11 @@ mod tests {
             action_digest: vec![0; 32],
             summary: serde_json::json!({}),
             for_human: "amy".into(),
-            requester: StepUpRequester::ApiToken { id: "t".into() },
+            requester: StepUpConfirmationRequester::ApiToken { id: "t".into() },
             session_role_cap: None,
             created_at: 0,
             expires_at: 1_000,
-            state: RequestState::Pending,
+            state: StepUpConfirmationRequestState::Pending,
             confirmed_by: None,
             confirmed_at: None,
             confirmation_id: None,
@@ -776,7 +828,7 @@ mod tests {
         assert!(!r.is_expired(999));
         assert!(r.is_expired(1_000), "expiry is exclusive at the instant");
         assert_eq!(r.state_label(1_000), "expired");
-        r.state = RequestState::Executed;
+        r.state = StepUpConfirmationRequestState::Executed;
         assert!(!r.is_expired(5_000), "a settled request never expires");
         assert_eq!(r.state_label(5_000), "executed");
     }

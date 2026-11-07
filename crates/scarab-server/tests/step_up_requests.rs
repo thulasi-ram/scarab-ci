@@ -28,9 +28,10 @@ use tower::ServiceExt;
 use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
 use scarab_identity::{
-    api_token_hash, ApiToken, ApiTokenStore, Principal, RequestState, Role, Scope, SessionStore,
-    StepUpRequest, StepUpRequestPendingCaps, StepUpRequestRaiseOutcome, StepUpRequester,
-    LOGIN_KIND_API,
+    api_token_hash, ApiToken, ApiTokenStore, LoginKind, Principal, Role, Scope, SessionStore,
+    StepUpConfirmationRequest, StepUpConfirmationRequestPendingCaps,
+    StepUpConfirmationRequestRaiseOutcome, StepUpConfirmationRequestState,
+    StepUpConfirmationRequester,
 };
 use scarab_secrets::{Sealer, Secret, SecretError, SecretProvider, SecretScope};
 use scarab_testkit::FakeSecrets;
@@ -225,7 +226,7 @@ async fn all_events(h: &Harness) -> Vec<scarab_identity::SecurityEvent> {
         .unwrap()
 }
 
-async fn stored(h: &Harness, id: &str) -> StepUpRequest {
+async fn stored(h: &Harness, id: &str) -> StepUpConfirmationRequest {
     h.requests.get_request(id).await.unwrap().expect("stored")
 }
 
@@ -246,9 +247,12 @@ async fn a_token_s_request_runs_once_for_its_human_only(backend: Backend) {
 
     // Stored: pending, sealed (the value is not readable at rest), redacted.
     let row = stored(&h, &id).await;
-    assert_eq!(row.state, RequestState::Pending);
+    assert_eq!(row.state, StepUpConfirmationRequestState::Pending);
     assert_eq!(row.for_human, "amy");
-    assert_eq!(row.requester, StepUpRequester::ApiToken { id: "t1".into() });
+    assert_eq!(
+        row.requester,
+        StepUpConfirmationRequester::ApiToken { id: "t1".into() }
+    );
     assert_eq!(row.org.as_deref(), Some("acme"));
     let sealed = row.sealed.clone().expect("sealed while pending");
     assert!(!String::from_utf8_lossy(&sealed).contains("S3CR3T"));
@@ -318,7 +322,7 @@ async fn a_token_s_request_runs_once_for_its_human_only(backend: Backend) {
 
     // The record: settled, who confirmed, no body.
     let row = stored(&h, &id).await;
-    assert_eq!(row.state, RequestState::Executed);
+    assert_eq!(row.state, StepUpConfirmationRequestState::Executed);
     assert_eq!(row.confirmed_by.as_deref(), Some("amy"));
     assert_eq!(row.result_status, Some(204));
     assert!(
@@ -489,7 +493,10 @@ async fn an_expired_request_is_gone(backend: Backend) {
     let (st, _) = options(&h, &amy, &id).await;
     assert_eq!(st, StatusCode::GONE);
     assert_eq!(secrets.puts(), 0);
-    assert_eq!(stored(&h, &id).await.state, RequestState::Pending);
+    assert_eq!(
+        stored(&h, &id).await.state,
+        StepUpConfirmationRequestState::Pending
+    );
 }
 
 #[tokio::test]
@@ -623,12 +630,12 @@ async fn an_owner_token_is_never_satisfied_by_its_human_s_window() {
 async fn a_bearer_session_s_request_runs_and_a_logged_out_one_does_not() {
     let (h, secrets) = world(Backend::Memory).await;
     let (amy, mut soft) = amy_in_browser(&h).await;
-    let cli = h.session(owner("amy"), LOGIN_KIND_API).await;
+    let cli = h.session(owner("amy"), LoginKind::Api).await;
     let id = raise(&h, &cli.id, "from-the-cli").await;
     let row = stored(&h, &id).await;
     assert!(matches!(
         row.requester,
-        StepUpRequester::BearerSession { .. }
+        StepUpConfirmationRequester::BearerSession { .. }
     ));
     assert_eq!(row.session_role_cap, Some(Role::Owner));
     let (st, polled) = h
@@ -674,7 +681,7 @@ async fn a_plugin_subject_never_raises_a_request() {
                 display_name: None,
                 roles: vec![],
             },
-            LOGIN_KIND_API,
+            LoginKind::Api,
         )
         .await;
     let (st, b) = h
@@ -919,7 +926,7 @@ async fn a_request_the_requester_could_never_execute_is_not_raised() {
     let (h, _) = world(Backend::Memory).await;
     h.grant("amy", Scope::Org("beta".into()), Role::Owner).await;
     let token = pat(&h, "t1", Scope::Org("acme".into()), Role::Owner).await;
-    let cli = h.session(owner("amy"), LOGIN_KIND_API).await;
+    let cli = h.session(owner("amy"), LoginKind::Api).await;
     let mint = json!({"name": "next", "role": "admin", "expires_in_days": 1});
     let beta_secret = json!({"org": "beta", "name": "DB_PASSWORD", "value": "v"});
     let cases: Vec<(&str, &str, Option<Value>, &str, &str)> = vec![
@@ -1025,7 +1032,7 @@ async fn a_request_cannot_be_widened() {
             .seal(plain.to_string().as_bytes(), b"step-up-request:forged")
             .unwrap(),
     );
-    let uncapped = StepUpRequestPendingCaps {
+    let uncapped = StepUpConfirmationRequestPendingCaps {
         per_requester: u64::MAX,
         per_human: u64::MAX,
     };
@@ -1035,7 +1042,7 @@ async fn a_request_cannot_be_widened() {
         .await
         .unwrap();
     assert!(
-        matches!(raised, StepUpRequestRaiseOutcome::Raised),
+        matches!(raised, StepUpConfirmationRequestRaiseOutcome::Raised),
         "{raised:?}"
     );
     let (st, done) = confirm(&h, &amy, &mut soft, "forged").await;
@@ -1142,7 +1149,10 @@ async fn a_replay_cannot_apply_a_loosening_the_human_never_saw() {
     let (st, done) = confirm(&h, &amy, &mut soft, &id).await;
     assert_eq!(st, StatusCode::OK, "{done}");
     assert_eq!(done["state"], "failed", "{done}");
-    assert_eq!(stored(&h, &id).await.state, RequestState::Failed);
+    assert_eq!(
+        stored(&h, &id).await.state,
+        StepUpConfirmationRequestState::Failed
+    );
     let now = protection(&gov).await;
     assert!(now.approvers.contains(&"bob".to_string()), "{now:?}");
     assert_eq!(now.allowed_refs, vec!["main".to_string()]);
@@ -1334,7 +1344,7 @@ async fn a_member_s_own_events_and_the_request_records_stay_theirs() {
         .await;
     assert_eq!(st, StatusCode::NOT_FOUND);
     // amy's own Bearer session is not her browser: no view for it either.
-    let cli = h.session(owner("amy"), LOGIN_KIND_API).await;
+    let cli = h.session(owner("amy"), LoginKind::Api).await;
     let (st, _) = h
         .bearer("GET", &format!("/v1/step-up/requests/{id}"), None, &cli.id)
         .await;

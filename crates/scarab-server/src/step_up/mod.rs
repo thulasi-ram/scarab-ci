@@ -32,8 +32,8 @@ use sha2::Sha256;
 use utoipa::ToSchema;
 
 use scarab_identity::{
-    security_event_kind as kind, ChallengePurpose, ChallengeStore, Passkey, PasskeyStore,
-    SecurityEvent, SecurityEventLog, StepUpStore, WebauthnChallenge, WEBAUTHN_CHALLENGE_TTL_MS,
+    security_event_kind as kind, ChallengePurpose, ChallengeStore, OrgSecurityEventLog, Passkey,
+    PasskeyStore, SecurityEvent, StepUpStore, WebauthnChallenge, WEBAUTHN_CHALLENGE_TTL_MS,
 };
 use scarab_secrets::Sealer;
 use scarab_webauthn::{CredentialDescriptor, RelyingParty};
@@ -87,7 +87,7 @@ pub struct StepUpService {
     pub passkeys: Arc<dyn PasskeyStore>,
     pub challenges: Arc<dyn ChallengeStore>,
     pub confirmations: Arc<dyn StepUpStore>,
-    pub events: Arc<dyn SecurityEventLog>,
+    pub events: Arc<dyn OrgSecurityEventLog>,
     /// Seals a StepUpConfirmationRequest's body at rest (ADR-0073 C5).
     pub sealer: Arc<dyn Sealer>,
     digest_key: [u8; 32],
@@ -333,7 +333,7 @@ impl StepUpService {
         passkeys: Arc<dyn PasskeyStore>,
         challenges: Arc<dyn ChallengeStore>,
         confirmations: Arc<dyn StepUpStore>,
-        events: Arc<dyn SecurityEventLog>,
+        events: Arc<dyn OrgSecurityEventLog>,
         sealer: Arc<dyn Sealer>,
         rp: RelyingParty,
     ) -> Self {

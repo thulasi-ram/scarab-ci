@@ -18,8 +18,8 @@ use axum::routing::{get, post};
 use serde_json::{json, Value};
 
 use scarab_identity::{
-    api_token_hash, ApiToken, ApiTokenStore, IdentityStore, ProviderIdentity, Role, Scope, Session,
-    SessionStore, LOGIN_KIND_BROWSER, STEP_UP_WINDOW_MS, WEBAUTHN_CHALLENGE_TTL_MS,
+    api_token_hash, ApiToken, ApiTokenStore, IdentityStore, LoginKind, ProviderIdentity, Role,
+    Scope, Session, SessionStore, STEP_UP_WINDOW_MS, WEBAUTHN_CHALLENGE_TTL_MS,
 };
 use scarab_project::{
     EnvironmentGovernanceStore, EnvironmentProjectEligibility, EnvironmentProtectionRules,
@@ -474,7 +474,7 @@ async fn a_pre_upgrade_session_cannot_enroll_the_first_passkey() {
         expires_at: h.now().await + DAY,
         csrf_hash: scarab_identity::csrf_hash(&csrf),
         created_at: 0,
-        login_kind: LOGIN_KIND_BROWSER.to_string(),
+        login_kind: LoginKind::Browser,
     };
     h.sessions.put(&sess).await.unwrap();
     let s = Sess {

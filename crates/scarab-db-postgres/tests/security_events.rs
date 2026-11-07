@@ -7,8 +7,8 @@ mod common;
 use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
 use scarab_identity::{
-    security_event_kind as kind, Binding, BindingOrigin, RbacStore, Role, Scope, SecurityEvent,
-    SecurityEventFilter, SecurityEventLog,
+    security_event_kind as kind, Binding, BindingOrigin, OrgSecurityEventLog, RbacStore, Role,
+    Scope, SecurityEvent, SecurityEventFilter,
 };
 
 fn event(id: &str, org: Option<&str>, kind: &str, subject: &str) -> SecurityEvent {
@@ -49,7 +49,7 @@ async fn the_log_refuses_every_update_and_delete() {
 
     let e = event("e1", Some("acme"), kind::STEP_UP_CONFIRMED, "amy");
     let seq = db.append(&e).await.unwrap();
-    let got = SecurityEventLog::list(&db, &filter()).await.unwrap();
+    let got = OrgSecurityEventLog::list(&db, &filter()).await.unwrap();
     assert_eq!(got, vec![SecurityEvent { seq, ..e }], "round-trips whole");
 
     for statement in [
@@ -68,7 +68,7 @@ async fn the_log_refuses_every_update_and_delete() {
         );
     }
     assert_eq!(
-        SecurityEventLog::list(&db, &filter()).await.unwrap()[0].kind,
+        OrgSecurityEventLog::list(&db, &filter()).await.unwrap()[0].kind,
         kind::STEP_UP_CONFIRMED,
         "nothing changed"
     );
@@ -147,7 +147,7 @@ async fn an_org_sees_its_events_and_its_members_passkey_events_only() {
         db.append(&e).await.unwrap();
     }
 
-    let acme = SecurityEventLog::list(
+    let acme = OrgSecurityEventLog::list(
         &db,
         &SecurityEventFilter {
             org: Some("acme".into()),
@@ -162,7 +162,7 @@ async fn an_org_sees_its_events_and_its_members_passkey_events_only() {
         "newest first"
     );
 
-    let globex = SecurityEventLog::list(
+    let globex = OrgSecurityEventLog::list(
         &db,
         &SecurityEventFilter {
             org: Some("globex".into()),
@@ -174,7 +174,7 @@ async fn an_org_sees_its_events_and_its_members_passkey_events_only() {
     assert_eq!(ids(&globex), vec!["bob-enrolled", "globex-op"]);
 
     // The own log: everything about one subject, Org or not.
-    let amy = SecurityEventLog::list(
+    let amy = OrgSecurityEventLog::list(
         &db,
         &SecurityEventFilter {
             subject: Some("amy".into()),
@@ -187,12 +187,15 @@ async fn an_org_sees_its_events_and_its_members_passkey_events_only() {
 
     // Install-wide: all of it.
     assert_eq!(
-        SecurityEventLog::list(&db, &filter()).await.unwrap().len(),
+        OrgSecurityEventLog::list(&db, &filter())
+            .await
+            .unwrap()
+            .len(),
         9
     );
 
     // Kinds, keyset pagination and the limit narrow any view.
-    let enrolled = SecurityEventLog::list(
+    let enrolled = OrgSecurityEventLog::list(
         &db,
         &SecurityEventFilter {
             kinds: vec![kind::PASSKEY_ENROLLED.into()],
@@ -210,7 +213,7 @@ async fn an_org_sees_its_events_and_its_members_passkey_events_only() {
             "amy-enrolled"
         ]
     );
-    let page = SecurityEventLog::list(
+    let page = OrgSecurityEventLog::list(
         &db,
         &SecurityEventFilter {
             org: Some("acme".into()),
@@ -278,7 +281,7 @@ async fn the_time_range_and_target_filters_narrow_every_page() {
     };
     let dbr = &db;
     let list =
-        |f: SecurityEventFilter| async move { SecurityEventLog::list(dbr, &f).await.unwrap() };
+        |f: SecurityEventFilter| async move { OrgSecurityEventLog::list(dbr, &f).await.unwrap() };
 
     let ranged = list(acme(SecurityEventFilter {
         from_at: Some(2_000),

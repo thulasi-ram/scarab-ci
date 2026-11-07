@@ -14,9 +14,9 @@ use tower::ServiceExt;
 
 use scarab_db_postgres::PostgresDb;
 use scarab_identity::{
-    Binding, BindingOrigin, ChallengeStore, PasskeyStore, Principal, RbacStore, Role, Scope,
-    SecurityEvent, SecurityEventFilter, SecurityEventLog, Session, SessionStore, StepUpStore,
-    LOGIN_KIND_BROWSER,
+    Binding, BindingOrigin, ChallengeStore, LoginKind, OrgSecurityEventLog, PasskeyStore,
+    Principal, RbacStore, Role, Scope, SecurityEvent, SecurityEventFilter, Session, SessionStore,
+    StepUpStore,
 };
 use scarab_server::step_up::StepUpService;
 use scarab_server::{router, AppState, LogService};
@@ -52,7 +52,7 @@ pub struct Harness {
     pub passkey_store: Arc<dyn PasskeyStore>,
     pub challenge_store: Arc<dyn ChallengeStore>,
     pub requests: Arc<dyn StepUpStore>,
-    pub log: Arc<dyn SecurityEventLog>,
+    pub log: Arc<dyn OrgSecurityEventLog>,
 }
 
 /// Where the step-up stores (and the role bindings the Org log joins) live.
@@ -117,7 +117,7 @@ pub fn harness_on(backend: Backend, extra: impl FnOnce(AppState) -> AppState) ->
         Arc<dyn PasskeyStore>,
         Arc<dyn ChallengeStore>,
         Arc<dyn StepUpStore>,
-        Arc<dyn SecurityEventLog>,
+        Arc<dyn OrgSecurityEventLog>,
     ) = match backend {
         Backend::Memory => (
             rbac.clone(),
@@ -184,10 +184,10 @@ impl Harness {
 
     /// A session for `principal` whose (browser) login completed now.
     pub async fn browser_session(&self, principal: Principal) -> Sess {
-        self.session(principal, LOGIN_KIND_BROWSER).await
+        self.session(principal, LoginKind::Browser).await
     }
 
-    pub async fn session(&self, principal: Principal, login_kind: &str) -> Sess {
+    pub async fn session(&self, principal: Principal, login_kind: LoginKind) -> Sess {
         let now = self.now().await;
         let csrf = uuid::Uuid::new_v4().to_string();
         let s = Session {
@@ -196,7 +196,7 @@ impl Harness {
             expires_at: now + 24 * 60 * 60 * 1000,
             csrf_hash: scarab_identity::csrf_hash(&csrf),
             created_at: now,
-            login_kind: login_kind.to_string(),
+            login_kind,
         };
         self.sessions.put(&s).await.unwrap();
         Sess { id: s.id, csrf }
