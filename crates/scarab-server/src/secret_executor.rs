@@ -127,16 +127,8 @@ async fn stored_pipeline(
 /// Why `step` may not use its Environment's authority now (ADR-0078 §5,
 /// the launch-time re-check of ADR-0075 §3), or `None` when it may. Checked
 /// at every launch, reruns and retries included, of a Step that uses the
-/// Environment's authority in an Environment with approvers:
-///
-/// - the Run's symbolic ref is still allowed;
-/// - an Environment approval gate upstream of it has released, with the
-///   approver set recorded when its approvals met the rules unchanged (a
-///   gate released before that record existed has none to compare), no
-///   longer ago than the maximum approval age. One such gate is enough.
-///
-/// External, timer and plugin gates are never approval gates, so a Step
-/// behind only those is refused here whatever released them.
+/// Environment's authority in an Environment with approvers; what is
+/// checked is [`approval_refusal`].
 pub(crate) async fn environment_approval_refusal(
     db: &dyn Db,
     ctx: &scarab_engine::DeployContext,
@@ -156,9 +148,34 @@ pub(crate) async fn environment_approval_refusal(
     if !scarab_policy::run_create::uses_environment_authority(&ir, spec) {
         return Ok(None);
     }
+    approval_refusal(db, ctx, protection, &ir, step, now_ms).await
+}
+
+/// Why no Environment approval gate upstream of `step` admits it now, or
+/// `None` when one does:
+///
+/// - the Run's symbolic ref is still allowed;
+/// - an Environment approval gate upstream of it has released, with the
+///   approver set recorded when its approvals met the rules unchanged (a
+///   gate released before that record existed has none to compare), no
+///   longer ago than the maximum approval age. One such gate is enough.
+///
+/// External, timer and plugin gates are never approval gates, so a Step
+/// behind only those has none here whatever released them. The same test
+/// decides whether a Step's OIDC subject names the Environment
+/// ([`oidc_names_environment`]), whether or not the Step uses the
+/// Environment's authority otherwise.
+async fn approval_refusal(
+    db: &dyn Db,
+    ctx: &scarab_engine::DeployContext,
+    protection: &scarab_project::EffectiveProtection,
+    ir: &scarab_pipeline::PipelineIr,
+    step: &StepRun,
+    now_ms: i64,
+) -> Result<Option<String>, ExecError> {
     let env = &ctx.environment;
     let id = &step.step.0;
-    let gates = scarab_policy::approval_gate::upstream_approval_gates(&ir, id);
+    let gates = scarab_policy::approval_gate::upstream_approval_gates(ir, id);
     if gates.is_empty() {
         return Ok(Some(format!(
             "step `{id}` uses environment `{env}`'s authority, and no Environment approval gate \
@@ -219,24 +236,39 @@ pub(crate) async fn environment_approval_refusal(
     Ok(refusal)
 }
 
-/// Whether `step` has a released Environment approval gate upstream — what
-/// decides, in an Environment with approvers, whether its OIDC subject names
-/// the Environment or `none` (ADR-0075 §3).
-async fn approval_gate_released_upstream(db: &dyn Db, step: &StepRun) -> Result<bool, ExecError> {
+/// Whether `step`'s OIDC subject names its Environment rather than `none`
+/// (ADR-0075 §3, ADR-0078). In an Environment with approvers the subject
+/// is itself authority: a cloud role trusts `env=<name>`. So a Step gets it
+/// only when an Environment approval gate upstream admits it now, by the
+/// checks an authority Step's launch makes ([`approval_refusal`]): a
+/// released gate, within the maximum approval age, with the approver set
+/// unchanged, on a ref still allowed. Otherwise the Step still launches,
+/// with `env=none`. An Environment with no approvers names itself; one the
+/// store no longer has does not.
+async fn oidc_names_environment(
+    db: &dyn Db,
+    governance: &dyn scarab_project::EnvironmentGovernanceStore,
+    ctx: &scarab_engine::DeployContext,
+    step: &StepRun,
+    now_ms: i64,
+) -> Result<bool, ExecError> {
+    let Some(g) = governance
+        .deploy_governance(&ctx.org, &ctx.project, &ctx.environment)
+        .await
+        .map_err(|e| ExecError::Other(format!("environment governance store: {e}")))?
+    else {
+        return Ok(false);
+    };
+    let protection = g.effective_protection();
+    if protection.approvers.is_empty() {
+        return Ok(true);
+    }
     let Some(ir) = stored_pipeline(db, &step.run).await? else {
         return Ok(false);
     };
-    let gates = scarab_policy::approval_gate::upstream_approval_gates(&ir, &step.step.0);
-    if gates.is_empty() {
-        return Ok(false);
-    }
-    let events = db
-        .events(&step.run)
-        .await
-        .map_err(|e| ExecError::Other(e.to_string()))?;
-    Ok(gates.iter().any(|g| {
-        scarab_engine::gate_released_at(&events, &scarab_engine::StepId(g.id.clone())).is_some()
-    }))
+    Ok(approval_refusal(db, ctx, &protection, &ir, step, now_ms)
+        .await?
+        .is_none())
 }
 
 /// Per-attempt OIDC token TTL (ADR-0015: short-lived by design — long enough
@@ -359,21 +391,19 @@ impl SecretInjectingExecutor {
         };
         // The fork-PR downgrade (ADR-0015): a locked-out run's subject says
         // env `none` — no cloud trust policy for a real environment matches.
-        // So does a Step with no released Environment approval gate upstream
-        // in an Environment with approvers (ADR-0075 §3): it runs before the
-        // approval, and the cloud must not trust it as the Environment.
-        let before_approval = match &self.governance {
+        // So does a Step that no Environment approval gate upstream admits
+        // now, in an Environment with approvers (ADR-0075 §3): before the
+        // approval, or after it went stale, the approvers changed or the ref
+        // was disallowed, the cloud must not trust it as the Environment.
+        let unapproved = match &self.governance {
             Some(governance) => {
-                let has_approvers = governance
-                    .deploy_governance(&ctx.org, &ctx.project, &ctx.environment)
-                    .await
-                    .map_err(|e| ExecError::Other(format!("environment governance store: {e}")))?
-                    .is_some_and(|g| !g.effective_protection().approvers.is_empty());
-                has_approvers && !approval_gate_released_upstream(self.db.as_ref(), step).await?
+                let now = self.clock.now().await.0;
+                !oidc_names_environment(self.db.as_ref(), governance.as_ref(), &ctx, step, now)
+                    .await?
             }
             None => false,
         };
-        let env = if ctx.locked_out || before_approval {
+        let env = if ctx.locked_out || unapproved {
             "none"
         } else {
             &ctx.environment

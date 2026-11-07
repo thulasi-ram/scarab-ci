@@ -679,7 +679,10 @@ steps:
             logs(db.clone()),
         )
         .with_environment_governance(governance)
-        .with_oidc(issuer.clone(), "https://scarab.example", "sts.example.com");
+        .with_oidc(issuer.clone(), "https://scarab.example", "sts.example.com")
+        // The release below is at 0: measure its age from 1 s later, well
+        // within the maximum approval age.
+        .with_clock(Arc::new(scarab_testkit::FakeClock::new(1_000)));
 
         let mut build = step("r1");
         build.step = StepId("build".into());
