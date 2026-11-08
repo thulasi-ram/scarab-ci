@@ -194,7 +194,9 @@ async fn harness_with(adjust: impl FnOnce(AppState) -> AppState) -> Option<Harne
             },
         )
         .with_plugin_tokens(Arc::new(FakeTokenReview))
-        .with_secrets(secrets.clone());
+        .with_secrets(secrets.clone())
+        // The fake upstream listens on 127.0.0.1.
+        .with_broker_upstream_loopback_allowed(true);
     let st = adjust(st);
     let (broker, journal) = broker::router_with_journal(st.clone());
     Some(Harness {
@@ -1445,6 +1447,41 @@ async fn a_bound_credential_is_read_once_and_a_rebind_replaces_it() {
             format!("Bearer {ARGO_TOKEN}"),
             "Bearer argo-token-rotated".to_string(),
         ]
+    );
+    h.finish().await;
+}
+
+/// git-bug 4711823 (4): a destination that is, or resolves only to, an
+/// address the broker does not connect to is refused (502) and journaled,
+/// and nothing reaches it. The fake upstream listens on 127.0.0.1, here
+/// with loopback refused as in production: bound by IP literal (checked
+/// before any connection) and by a name that resolves to it (checked in
+/// the resolver, on the address the connection would use).
+#[tokio::test]
+async fn a_destination_on_loopback_or_link_local_is_refused_and_never_reached() {
+    let Some(h) = harness_with(|st| st.with_broker_upstream_loopback_allowed(false)).await else {
+        return;
+    };
+    let (up, base) = spawn_upstream().await;
+    let (id, token) = install(&h).await;
+    let port = base.rsplit(':').next().unwrap().trim_end_matches('/');
+    for destination in [base.clone(), format!("http://localhost:{port}")] {
+        assert_eq!(
+            bind(&h, &destination).await.0,
+            StatusCode::OK,
+            "{destination}"
+        );
+        let (status, _, body) = send(&h.broker, plugin_get(&token, "/api/version")).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{destination}: {body}");
+        assert!(body.contains("does not connect to"), "{body}");
+    }
+    assert!(up.seen().is_empty(), "nothing reached the upstream");
+    let refused = journal(&h.pg, &id, 2).await;
+    assert!(
+        refused
+            .iter()
+            .all(|e| e.denied_reason.as_deref() == Some("destination denied")),
+        "{refused:?}"
     );
     h.finish().await;
 }

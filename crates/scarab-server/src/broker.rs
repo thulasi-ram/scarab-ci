@@ -91,8 +91,11 @@ pub fn router_with_journal(state: AppState) -> (Router, Option<broker_proxy::Bro
         .clone()
         .or_else(|| state.plugins.clone())
         .map(|store| {
-            let (proxy, journal) =
-                broker_proxy::BrokerProxy::spawn_with_drain(store, state.broker_journal_queue);
+            let (proxy, journal) = broker_proxy::BrokerProxy::spawn_with_drain(
+                store,
+                state.broker_journal_queue,
+                state.broker_upstream_loopback_allowed,
+            );
             drain = journal;
             Router::new()
                 .route(&broker_proxy::route_path(), any(broker_proxy::proxy))

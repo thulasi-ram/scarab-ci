@@ -244,6 +244,10 @@ pub struct AppState {
     /// the read proxy and its writer (ADR-0072 §5). Full, the proxy refuses
     /// to forward (503) rather than forward what it cannot journal.
     pub broker_journal_queue: usize,
+    /// Whether the read proxy may connect to a loopback address. Off: a
+    /// bound destination that is or resolves to loopback is refused. Only a
+    /// test whose fake upstream listens on 127.0.0.1 turns it on.
+    pub broker_upstream_loopback_allowed: bool,
     /// Proves who calls the broker (ADR-0072 §11): TokenReview in production
     /// (slice d2), static dev tokens under `SCARAB_DEV_INSECURE`. `None` makes
     /// every authenticated broker call a 401 — nothing proven, nothing taken.
@@ -375,6 +379,7 @@ impl AppState {
             plugins: None,
             broker_plugins: None,
             broker_journal_queue: broker_proxy::JOURNAL_QUEUE,
+            broker_upstream_loopback_allowed: false,
             plugin_tokens: None,
             plugin_api_tokens: None,
             plugin_policy: Arc::new(plugins::PluginPolicy::off()),
@@ -555,6 +560,14 @@ impl AppState {
     /// "journal full" without thousands of requests.
     pub fn with_broker_journal_queue(mut self, entries: usize) -> Self {
         self.broker_journal_queue = entries;
+        self
+    }
+
+    /// Let the read proxy connect to loopback addresses (default: refused).
+    /// For a test whose fake upstream listens on 127.0.0.1; never set by
+    /// configuration.
+    pub fn with_broker_upstream_loopback_allowed(mut self, allowed: bool) -> Self {
+        self.broker_upstream_loopback_allowed = allowed;
         self
     }
 

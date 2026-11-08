@@ -47,6 +47,7 @@
 //!   never a clean end the Plugin could take for the whole response.
 
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -178,6 +179,8 @@ pub struct BrokerProxy {
     /// Bound credentials by `credential_ref`, so a request does not read
     /// the secret store each time.
     credentials: Mutex<IdleCache<Arc<Vec<u8>>>>,
+    /// Whether upstream connections may go to loopback (tests only).
+    loopback_allowed: bool,
 }
 
 /// Why a request was refused before anything else ran.
@@ -339,14 +342,16 @@ impl BrokerProxy {
     /// there is no writer, and the proxy refuses every request (503): it
     /// never forwards what it cannot journal.
     pub fn spawn(store: Arc<dyn PluginStore>, journal_queue: usize) -> Arc<Self> {
-        Self::spawn_with_drain(store, journal_queue).0
+        Self::spawn_with_drain(store, journal_queue, false).0
     }
 
     /// [`spawn`](Self::spawn), and the handle that writes the queued
-    /// journal at shutdown (`None` without a runtime).
+    /// journal at shutdown (`None` without a runtime). `loopback_allowed`
+    /// lets upstream connections go to loopback, for a test's fake upstream.
     pub fn spawn_with_drain(
         store: Arc<dyn PluginStore>,
         journal_queue: usize,
+        loopback_allowed: bool,
     ) -> (Arc<Self>, Option<BrokerJournalDrain>) {
         let mut drain = None;
         let journal = tokio::runtime::Handle::try_current().ok().map(|rt| {
@@ -369,6 +374,7 @@ impl BrokerProxy {
             total: Arc::new(Semaphore::new(PROXY_CONCURRENCY_TOTAL)),
             clients: Mutex::new(IdleCache::new(CLIENT_IDLE)),
             credentials: Mutex::new(IdleCache::new(CREDENTIAL_IDLE)),
+            loopback_allowed,
         });
         (proxy, drain)
     }
@@ -466,7 +472,7 @@ impl BrokerProxy {
         if let Some(client) = clients.get(&key, now) {
             return Ok(client);
         }
-        let client = upstream_client(ca_pem)?;
+        let client = upstream_client_with(ca_pem, self.loopback_allowed)?;
         clients.insert(key, client.clone(), now);
         Ok(client)
     }
@@ -576,10 +582,21 @@ pub(crate) async fn take_permit(
 /// — with a CA — that CA as the ONLY trust anchor. There is no skip-verify.
 /// Also what the admin API uses to check a CA before binding it.
 pub(crate) fn upstream_client(ca_pem: Option<&str>) -> Result<reqwest::Client, String> {
+    upstream_client_with(ca_pem, false)
+}
+
+/// [`upstream_client`], resolving through [`UpstreamResolver`]: it connects
+/// only to the addresses it resolved, and never to a link-local address
+/// (or to loopback, unless `loopback_allowed`).
+fn upstream_client_with(
+    ca_pem: Option<&str>,
+    loopback_allowed: bool,
+) -> Result<reqwest::Client, String> {
     let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
-        .connect_timeout(UPSTREAM_CONNECT_TIMEOUT);
+        .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
+        .dns_resolver(UpstreamResolver { loopback_allowed });
     if let Some(pem) = ca_pem {
         let certs = reqwest::Certificate::from_pem_bundle(pem.as_bytes())
             .map_err(|e| format!("the CA is not PEM certificates: {e}"))?;
@@ -591,6 +608,105 @@ pub(crate) fn upstream_client(ca_pem: Option<&str>) -> Result<reqwest::Client, S
     builder
         .build()
         .map_err(|e| format!("cannot build a TLS client with this CA: {e}"))
+}
+
+/// AWS's instance metadata service on IPv6 (an address in the private
+/// fd00::/8 range, so not caught by the link-local rule).
+const AWS_METADATA_V6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254);
+
+/// May the broker connect to `ip`? Never to link-local (169.254.0.0/16 and
+/// fe80::/10, where cloud metadata services answer), the unspecified,
+/// broadcast or multicast addresses, or AWS's IPv6 metadata address; to
+/// loopback only when `loopback_allowed`. Private ranges are allowed: the
+/// upstream is usually in the same cluster. An IPv4-mapped IPv6 address is
+/// judged as its IPv4 address.
+fn upstream_address_allowed(ip: IpAddr, loopback_allowed: bool) -> bool {
+    let ip = match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        v4 => v4,
+    };
+    match ip {
+        IpAddr::V4(v4) => {
+            !(v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || (v4.is_loopback() && !loopback_allowed))
+        }
+        IpAddr::V6(v6) => {
+            !((v6.segments()[0] & 0xffc0) == 0xfe80
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || v6 == AWS_METADATA_V6
+                || (v6.is_loopback() && !loopback_allowed))
+        }
+    }
+}
+
+/// A destination the broker will not connect to.
+#[derive(Debug)]
+struct DeniedDestination(String);
+
+impl std::fmt::Display for DeniedDestination {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} is or resolves only to addresses the broker does not connect to \
+             (link-local, loopback or metadata)",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for DeniedDestination {}
+
+/// Resolves a bound host once for each new connection, and hands the
+/// connector only the addresses [`upstream_address_allowed`] accepts, so
+/// the address checked is the address connected to: no second lookup a
+/// DNS answer could change in between.
+#[derive(Debug, Clone, Copy)]
+struct UpstreamResolver {
+    loopback_allowed: bool,
+}
+
+impl reqwest::dns::Resolve for UpstreamResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let loopback_allowed = self.loopback_allowed;
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let kept: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
+                .await?
+                .filter(|a| upstream_address_allowed(a.ip(), loopback_allowed))
+                .collect();
+            if kept.is_empty() {
+                return Err(Box::new(DeniedDestination(host)) as _);
+            }
+            Ok(Box::new(kept.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+/// Did `e` come from a [`DeniedDestination`]?
+fn denied_destination(e: &reqwest::Error) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(s) = source {
+        if s.is::<DeniedDestination>() {
+            return true;
+        }
+        source = s.source();
+    }
+    false
+}
+
+fn denied_destination_refusal(slot: &str) -> Refusal {
+    Refusal::new(
+        StatusCode::BAD_GATEWAY,
+        "destination denied",
+        format!(
+            "connection `{slot}`: its destination is or resolves only to addresses the broker \
+             does not connect to"
+        ),
+    )
 }
 
 /// Drain the journal queue into the store, a batch per round trip, until
@@ -1106,6 +1222,19 @@ async fn send_upstream(
             format!("broker: {e}"),
         )
     })?;
+    // An IP literal never reaches the resolver: check it here.
+    if let Some(ip) = url.host_str().and_then(|h| {
+        h.trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<IpAddr>()
+            .ok()
+    }) {
+        if !upstream_address_allowed(ip, proxy.loopback_allowed) {
+            tracing::warn!(installation = %installation_id, slot = %slot.name, %ip,
+                "broker: the bound destination is an address the broker does not connect to");
+            return Err(denied_destination_refusal(&slot.name));
+        }
+    }
     let client = proxy.client(connection.ca_pem.as_deref()).map_err(|e| {
         Refusal::new(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1125,6 +1254,12 @@ async fn send_upstream(
     .await
     {
         Ok(Ok(resp)) => Ok((connection, credential, resp)),
+        Ok(Err(e)) if denied_destination(&e) => {
+            tracing::warn!(installation = %installation_id, slot = %slot.name, error = %e,
+                "broker: the bound destination resolves only to addresses the broker does not \
+                 connect to");
+            Err(denied_destination_refusal(&slot.name))
+        }
         Ok(Err(e)) => {
             // The error text names the bound URL: an operator's business,
             // not the Plugin's.
@@ -1390,6 +1525,42 @@ async fn send_error(tx: &mpsc::Sender<Result<Bytes, std::io::Error>>, why: &str)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// git-bug 4711823 (4): which addresses the broker connects to.
+    #[test]
+    fn the_broker_never_connects_to_link_local_or_loopback() {
+        let cases: [(&str, bool); 16] = [
+            ("169.254.169.254", false), // cloud metadata
+            ("169.254.0.1", false),
+            ("fe80::1", false),
+            ("febf::1", false),
+            ("::ffff:169.254.169.254", false),
+            ("fd00:ec2::254", false), // AWS metadata over IPv6
+            ("0.0.0.0", false),
+            ("::", false),
+            ("255.255.255.255", false),
+            ("224.0.0.1", false),
+            ("127.0.0.1", false),
+            ("::1", false),
+            ("::ffff:127.0.0.1", false),
+            ("10.0.0.5", true), // in-cluster upstreams are private
+            ("192.168.1.10", true),
+            ("fd12:3456::1", true),
+        ];
+        for (ip, allowed) in cases {
+            assert_eq!(
+                upstream_address_allowed(ip.parse().unwrap(), false),
+                allowed,
+                "{ip}"
+            );
+        }
+        assert!(upstream_address_allowed("127.0.0.1".parse().unwrap(), true));
+        assert!(upstream_address_allowed("8.8.8.8".parse().unwrap(), false));
+        assert!(!upstream_address_allowed(
+            "169.254.169.254".parse().unwrap(),
+            true
+        ));
+    }
 
     /// git-bug 4711823 (6): an installation with nothing in flight leaves
     /// the permit map when another takes a permit; one with a permit out
