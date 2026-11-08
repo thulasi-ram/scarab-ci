@@ -150,7 +150,11 @@ impl K8sPluginRuntime {
     /// - the broker peer must be configured;
     /// - it must hold no NetworkPolicy but the baseline's: policies are
     ///   additive, so a stray allow-all would silently undo the deny;
-    /// - then the baseline policies are server-side-applied, deny first.
+    /// - then the baseline policies are server-side-applied, deny first;
+    /// - and each is read back as stored: a spec that still differs from the
+    ///   one applied (a mutating webhook, another controller) refuses the
+    ///   baseline, since what the namespace enforces is then not what the
+    ///   probe and the runtime reason about (git-bug da0af59).
     pub async fn ensure_baseline(&self) -> Result<(), RuntimeError> {
         let ns = &self.config.namespace;
         let namespace = Api::<Namespace>::all(self.client.clone())
@@ -206,10 +210,17 @@ impl K8sPluginRuntime {
         }
         for np in &wanted {
             let name = np.metadata.name.as_deref().unwrap_or_default();
-            policies
+            let stored = policies
                 .patch(name, &Self::apply_params(), &Patch::Apply(np))
                 .await
                 .map_err(kube_err)?;
+            if policy_spec_drifted(np, &stored) {
+                return Err(RuntimeError::BaselineRefused(format!(
+                    "NetworkPolicy `{name}` in namespace `{ns}` is stored with a spec other than \
+                     the one the runtime applied (a mutating webhook or another controller \
+                     changed it); what the namespace enforces is then not what was checked"
+                )));
+            }
         }
         Ok(())
     }
@@ -720,6 +731,42 @@ async fn finished_log(pods: &Api<Pod>, name: &str) -> Result<String, String> {
     }
 }
 
+/// Does the policy the API server stored differ from the one applied? Both
+/// specs are compared as JSON after removing what the server fills in on
+/// its own (a null or an empty list, a missing port protocol it defaults to
+/// TCP), so only a real change counts. An empty object is kept: an empty
+/// `namespaceSelector` in a peer means every namespace, not this one.
+fn policy_spec_drifted(applied: &NetworkPolicy, stored: &NetworkPolicy) -> bool {
+    fn normal(np: &NetworkPolicy) -> serde_json::Value {
+        let mut v = serde_json::to_value(&np.spec).unwrap_or(serde_json::Value::Null);
+        tidy(&mut v);
+        v
+    }
+    fn tidy(v: &mut serde_json::Value) {
+        match v {
+            serde_json::Value::Object(map) => {
+                if map.contains_key("port") && !map.contains_key("protocol") {
+                    map.insert("protocol".into(), "TCP".into());
+                }
+                for child in map.values_mut() {
+                    tidy(child);
+                }
+                map.retain(|_, child| !is_empty(child));
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(tidy),
+            _ => {}
+        }
+    }
+    fn is_empty(v: &serde_json::Value) -> bool {
+        match v {
+            serde_json::Value::Null => true,
+            serde_json::Value::Array(a) => a.is_empty(),
+            _ => false,
+        }
+    }
+    normal(applied) != normal(stored)
+}
+
 /// Stopped means the token is revoked (no ServiceAccount) and nothing is
 /// scheduled: no Deployment (`None`), or one whose replicas are zero. A
 /// Deployment with no replicas field runs one.
@@ -834,6 +881,82 @@ mod tests {
             probe_pod_created_at("no-creation-time", None),
         ];
         assert_eq!(stale_probe_pods(&pods, now), vec!["abandoned".to_string()]);
+    }
+
+    /// git-bug da0af59 (3): a stored policy that differs from the applied
+    /// one is drift; what the API server fills in on its own is not.
+    #[test]
+    fn a_stored_policy_that_differs_from_the_applied_one_is_drift() {
+        let applied = objects::probe_control_egress_policy("scarab-plugins");
+        assert!(!policy_spec_drifted(&applied, &applied.clone()));
+
+        // The server's own filling-in: an empty ingress list, a protocol
+        // left out where it defaults to TCP.
+        let mut filled = applied.clone();
+        let spec = filled.spec.as_mut().unwrap();
+        spec.ingress = Some(vec![]);
+        let mut tcp_defaulted = applied.clone();
+        for rule in tcp_defaulted
+            .spec
+            .as_mut()
+            .unwrap()
+            .egress
+            .iter_mut()
+            .flatten()
+        {
+            for port in rule.ports.iter_mut().flatten() {
+                if port.protocol.as_deref() == Some("TCP") {
+                    port.protocol = None;
+                }
+            }
+        }
+        assert!(!policy_spec_drifted(&applied, &filled));
+        assert!(!policy_spec_drifted(&applied, &tcp_defaulted));
+
+        // A webhook that widens it: an extra allow-all egress rule.
+        let mut widened = applied.clone();
+        widened
+            .spec
+            .as_mut()
+            .unwrap()
+            .egress
+            .get_or_insert_with(Vec::new)
+            .push(Default::default());
+        assert!(policy_spec_drifted(&applied, &widened));
+
+        // A webhook that widens an existing peer to every namespace: an
+        // empty namespaceSelector beside its pod selector, which the
+        // comparison must not drop as "empty".
+        let mut same_namespace = applied.clone();
+        same_namespace
+            .spec
+            .as_mut()
+            .unwrap()
+            .egress
+            .as_mut()
+            .unwrap()[0]
+            .to
+            .as_mut()
+            .unwrap()[0]
+            .namespace_selector = None;
+        let mut every_namespace = same_namespace.clone();
+        every_namespace
+            .spec
+            .as_mut()
+            .unwrap()
+            .egress
+            .as_mut()
+            .unwrap()[0]
+            .to
+            .as_mut()
+            .unwrap()[0]
+            .namespace_selector = Some(Default::default());
+        assert!(policy_spec_drifted(&same_namespace, &every_namespace));
+
+        // A webhook that drops Egress from the policy types.
+        let mut narrowed = applied.clone();
+        narrowed.spec.as_mut().unwrap().policy_types = Some(vec!["Ingress".into()]);
+        assert!(policy_spec_drifted(&applied, &narrowed));
     }
 
     /// git-bug da0af59 (11): only a revoked token with nothing scheduled
