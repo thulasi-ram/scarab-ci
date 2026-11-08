@@ -402,9 +402,13 @@ tunnel out. Plugins are handed the broker by IP instead (the runtime resolves
 the broker Service to its ClusterIP every pass). Before any plugin starts, and
 every 6 h, the runtime runs an isolation probe in the namespace. On a cluster
 whose CNI ignores NetworkPolicy the probe fails and the plugin stays down, its
-installation showing `probe_failed` and why. Each plugin Pod then re-checks its
-own network in an `isolation-self-check` initContainer (the probe image) before
-the plugin starts, on whichever node it landed: the broker reachable; the API
+installation showing `probe_failed` and why. A probe that cannot tell (its Pods
+did not run, say) starts nothing and runs again on the next pass; a plugin
+already running keeps running until 6 h after the last probe that passed, and
+is then held as `probe_failed` too, until a probe passes. Each plugin Pod also
+re-checks its own network in an `isolation-self-check` initContainer (the probe
+image) before the plugin starts, on whichever node it landed: the broker
+reachable; the API
 server, the internet, `169.254.169.254` and DNS not. Until that passes the
 plugin does not run. The probe's control Pod (never a plugin) uses the cluster
 DNS, which must be the usual `kube-system` Pods labelled `k8s-app=kube-dns`.
