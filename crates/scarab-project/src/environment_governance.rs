@@ -772,17 +772,49 @@ impl EnvironmentMigrationReport {
 /// An exclusive claim on one Environment name in one org, from
 /// [`EnvironmentGovernanceStore::claim_environment_name`]. It holds whatever
 /// the store needs to keep the claim (a Postgres transaction holding an
-/// advisory lock, a set entry); dropping it releases the claim.
+/// advisory lock, a set entry).
+///
+/// [`release`](Self::release) frees the claim and returns once another
+/// claim on the name can succeed. Dropping it also frees the claim, but a
+/// store may finish that after the drop returns: Postgres rolls a dropped
+/// transaction back only when its connection goes back to the pool. A
+/// request that answers while its claim is still held makes the caller's
+/// next request on the name a spurious 409, so a handler releases before it
+/// answers, and the drop is for a request that is abandoned.
 pub struct EnvironmentNameClaim {
-    /// Never read: it is kept only so that dropping the claim drops it.
-    _held: Box<dyn std::any::Any + Send>,
+    /// Frees the claim. Dropping it unrun drops what it captured, which
+    /// frees the claim too.
+    release: Option<ReleaseClaim>,
 }
 
+type ReleaseClaim =
+    Box<dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send>;
+
 impl EnvironmentNameClaim {
-    /// A claim kept by `held`, released when `held` is dropped.
+    /// A claim kept by `held` and released by dropping it, for a store
+    /// whose drop frees the claim before it returns.
     pub fn new(held: impl std::any::Any + Send) -> Self {
+        Self::released_by(move || async move { drop(held) })
+    }
+
+    /// A claim released by running `release`, which returns once the claim
+    /// is free. Dropping the claim unreleased drops `release`, and what it
+    /// captured must free the claim on drop.
+    pub fn released_by<F, Fut>(release: F) -> Self
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
         Self {
-            _held: Box::new(held),
+            release: Some(Box::new(move || Box::pin(release()))),
+        }
+    }
+
+    /// Free the claim. When this returns, another claim on the name
+    /// succeeds.
+    pub async fn release(mut self) {
+        if let Some(release) = self.release.take() {
+            release().await;
         }
     }
 }

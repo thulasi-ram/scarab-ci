@@ -1382,7 +1382,9 @@ async fn a_request_the_guard_and_the_handler_both_authenticate_counts_once() {
 // itself and the confirm page still shows the rest.
 // ---------------------------------------------------------------------------
 async fn a_partial_stored_summary_still_renders(sql_edit: &str) {
-    let Some((tdb, pg)) = pg().await else { return };
+    let Some((tdb, pg)) = fresh_pg().await else {
+        return;
+    };
     let (h, _secrets) = world(Backend::Pg(pg)).await;
     let (amy, _soft) = amy_in_browser(&h).await;
     let token = pat(&h, "t1", Scope::Org("acme".into()), Role::Admin).await;

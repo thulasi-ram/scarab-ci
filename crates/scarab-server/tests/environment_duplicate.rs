@@ -837,7 +837,7 @@ async fn a_held_claim_refuses_a_create_and_not_a_replace() {
     assert_eq!(b["description"], "replaced");
 
     // Released: the create goes ahead.
-    drop(held_new);
+    held_new.unwrap().release().await;
     let (st, b) = h
         .cookie(
             "PUT",
@@ -847,7 +847,7 @@ async fn a_held_claim_refuses_a_create_and_not_a_replace() {
         )
         .await;
     assert_eq!(st, StatusCode::OK, "{b}");
-    drop(held_existing);
+    held_existing.unwrap().release().await;
 
     f.tdb.cleanup().await;
 }
@@ -1085,9 +1085,76 @@ async fn a_secret_write_and_an_environment_delete_take_the_name_claim() {
     let (st, b) = h.cookie("DELETE", qa, None, &s).await;
     assert_eq!(st, StatusCode::CONFLICT, "{b}");
     assert!(b.to_string().contains("being changed"), "{b}");
-    drop(held);
+    held.release().await;
 
     let (st, b) = h.cookie("POST", "/v1/secrets", Some(write), &s).await;
     assert_eq!(st, StatusCode::NO_CONTENT, "{b}");
+    f.tdb.cleanup().await;
+}
+
+/// git-bug 86fa83c: a request that takes an Environment name's claim
+/// answers only once the claim is free, so the caller's next request on
+/// the name never meets a spurious 409. The claim was a dropped Postgres
+/// transaction, rolled back a moment after the answer; on a loaded CI
+/// runner the next request came first. Each round claims the name straight
+/// after the answer, with no wait, which fails when an answer can beat the
+/// release.
+#[tokio::test]
+async fn a_request_answers_after_its_name_claim_is_free() {
+    let Some(f) = fixture(|s| s).await else {
+        return;
+    };
+    let h = &f.h;
+    let (s, mut soft) = signed_in_admin(h).await;
+    h.open_window(&s, &mut soft).await;
+    let free_now = |name: &'static str| {
+        let pg = f.pg.clone();
+        async move {
+            pg.claim_environment_name("acme", name)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("`{name}` was still claimed after the answer"))
+                .release()
+                .await;
+        }
+    };
+
+    // A create claims.
+    let (st, b) = h
+        .cookie("PUT", "/v1/orgs/acme/environments/qa", Some(json!({})), &s)
+        .await;
+    assert!(st.is_success(), "{st} {b}");
+    free_now("qa").await;
+
+    // A secret write into an Environment claims, every time.
+    for round in 0..20 {
+        let write = json!({
+            "org": "acme", "repo": "web", "environment": "qa",
+            "name": format!("TOKEN_{round}"), "value": "t"
+        });
+        let (st, b) = h.cookie("POST", "/v1/secrets", Some(write), &s).await;
+        assert_eq!(st, StatusCode::NO_CONTENT, "round {round}: {b}");
+        free_now("qa").await;
+    }
+
+    // A delete claims, also when it refuses (the secrets above pin `qa`).
+    let (st, b) = h
+        .cookie("DELETE", "/v1/orgs/acme/environments/qa", None, &s)
+        .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{b}");
+    free_now("qa").await;
+
+    // A Duplicate claims its new name.
+    let (st, b) = h
+        .cookie(
+            "POST",
+            &format!("{PROD}/duplicate"),
+            Some(json!({ "name": "prod-eu" })),
+            &s,
+        )
+        .await;
+    assert!(st.is_success(), "{st} {b}");
+    free_now("prod-eu").await;
+
     f.tdb.cleanup().await;
 }
