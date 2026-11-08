@@ -133,9 +133,9 @@ pub const CREDENTIAL_MAX_AGE: Duration = Duration::from_secs(60);
 /// The Plugin's headers that may travel upstream — content negotiation,
 /// conditional reads and an identifying agent, nothing that could change
 /// what the upstream does or as whom. (No `Range` or `Cache-Control`: the
-/// Argo CD reporter needs neither. No `Accept-Encoding`: the broker reads
-/// every response body for the credential, and cannot read a compressed
-/// one.)
+/// Argo CD reporter needs neither. No `Accept-Encoding`, deliberately: the
+/// broker reads every response body for the credential, and cannot read a
+/// compressed one.)
 pub const REQUEST_HEADERS: [&str; 5] = [
     "accept",
     "accept-language",
@@ -1334,9 +1334,10 @@ async fn send_upstream(
     .await
     {
         Ok(Ok(resp)) => {
-            // The body is read for the credential, which a compressed body
-            // would hide. The broker asks for none (no Accept-Encoding goes
-            // upstream), so an encoded body is an upstream ignoring that.
+            // Deliberate: no Accept-Encoding goes upstream and an encoded
+            // body is refused, because the broker reads every body for the
+            // credential and cannot read a compressed one. An encoded body
+            // here is an upstream that ignored the missing header.
             if response_is_encoded(resp.headers()) {
                 tracing::warn!(installation = %installation_id, slot = %slot.name,
                     "broker: the upstream encoded its response; refused");
