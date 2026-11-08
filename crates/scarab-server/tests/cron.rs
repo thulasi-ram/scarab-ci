@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use scarab_engine::{Db, RunSummary, ScheduleStore};
+use scarab_engine::{Db, RunSummary, ScheduleEntry, ScheduleStore};
 use scarab_forge::{Event, RepoRef};
 use scarab_server::schedules::{self, CronScheduler};
 use scarab_server::{AppState, LogService};
@@ -267,6 +267,41 @@ async fn slots_missed_while_the_server_was_down_fire_once() {
     h.tick_at(T0 + 3 * 60 * MIN + 6_000).await;
     assert_eq!(h.runs().await.len(), 1);
     assert_eq!(h.rows().await[0].1, T0 + 3 * 60 * MIN + 15 * MIN);
+}
+
+/// git-bug 237ab13: a tick read one page of due rows, so when more were due
+/// the ones after them in the order fired a tick or more late.
+#[tokio::test]
+async fn a_slot_past_the_first_page_of_due_rows_fires_in_the_same_tick() {
+    let h = H::new(&hourly("\"0 * * * *\""));
+    h.push("main", SHA1).await;
+    let eleven = T0 + 30 * MIN;
+    // A full page of another org's rows, due at the same minute, sorts ahead
+    // of acme/app ("aaa" < "acme").
+    let ahead: Vec<ScheduleEntry> = (0..schedules::DUE_BATCH)
+        .map(|i| ScheduleEntry {
+            org: "aaa".into(),
+            project: "app".into(),
+            pipeline: format!(".scarab/p{i:03}.yaml"),
+            schedule: "0 * * * *".into(),
+            next_fire_at: scarab_engine::Timestamp(eleven),
+            source_sha: SHA1.into(),
+        })
+        .collect();
+    h.store
+        .replace_project_schedules("aaa", "app", SHA1, &ahead)
+        .await
+        .unwrap();
+
+    h.tick_at(eleven + 2_000).await;
+    let fired: Vec<_> = h
+        .store
+        .fires()
+        .into_iter()
+        .filter(|f| f.org == "acme")
+        .collect();
+    assert_eq!(fired.len(), 1, "acme/app's slot fired in the first tick");
+    assert_eq!(fired[0].outcome, "run");
 }
 
 #[tokio::test]
