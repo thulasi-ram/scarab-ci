@@ -28,14 +28,14 @@ export default defineConfig({
     starlight({
       title: 'Scarab',
       tagline: 'A CI engine for Kubernetes — forge-native, on a durable core.',
-      // The beetle mark (ui/brand): ink on light, cream on dark.
+      // The beetle mark (ui/brand): ink and gold on light, cream and gold on dark.
       logo: {
-        light: './src/assets/brand/scarab-square-ink.svg',
-        dark: './src/assets/brand/scarab-square-cream.svg',
+        light: './src/assets/brand/scarab.svg',
+        dark: './src/assets/brand/scarab-dark.svg',
         alt: 'Scarab',
       },
-      // Brand favicon (ui/brand/favicon): theme-aware SVG (ink on light,
-      // cream on dark) with .ico + apple-touch fallbacks. Starlight
+      // Brand favicon (ui/brand/favicon): theme-aware one-colour SVG (ink on
+      // light, cream on dark) with .ico + apple-touch fallbacks. Starlight
       // renders the `head` links first and its own `favicon` link last, and
       // browsers that read SVG favicons use the last matching link. So the
       // SVG is the `favicon` and the .ico goes in `head` with a fixed size

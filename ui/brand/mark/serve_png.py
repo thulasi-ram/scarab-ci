@@ -18,7 +18,7 @@ import urllib.parse
 import webbrowser
 
 BRAND = os.path.realpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
-ALLOWED = ('icons/ink/', 'icons/cream/', 'icons/tile/', 'icons/tile-emerald/', 'favicon/')
+ALLOWED = ('icons/light/', 'icons/dark/', 'icons/tile/', 'favicon/')
 
 class Handler(http.server.SimpleHTTPRequestHandler):
     saved = 0

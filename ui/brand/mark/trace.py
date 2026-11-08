@@ -1,80 +1,103 @@
 #!/usr/bin/env python3
-"""Trace the beetle artwork (source.png) into the two master paths of the mark.
+"""Trace the side-view beetle artwork (source.png) into the mark's three masters.
 
     python3 ui/brand/mark/trace.py
 
 Needs numpy, opencv-python-headless and pillow, plus the `potrace` binary.
 `generate.py` (standard library only) builds every logo and favicon SVG from
-the two masters this writes, so run this only when the artwork or the cuts
+the masters this writes, so run this only when the artwork or the edits below
 change:
 
-  plates.svg  the mark: the silhouette with uniform cuts between the plates
-  bold.svg    the small-size mark: the silhouette grown by BOLD units, no cuts,
-              for 16 to 32 px
+  armour.svg  the dark parts: shell rim, head and horn, legs
+  fill.svg    the gold parts: wing case, horn band, abdomen
+  mono.svg    the two merged, for one-colour use
 
-Steps: average the artwork with its mirror image so the two halves match
-exactly, threshold the silhouette, draw the plate and joint cuts below (left
-half, mirrored), trace with potrace, and write one absolute path per master in
-a 320 x 480 box.
+Edits made to the artwork, in order:
+  * classify every pixel as background, armour (navy) or fill (gold);
+  * close the triangle on the head and the eye;
+  * cut a slit into the head instead: an arc at a constant distance inside the
+    head's top edge, widest near the shoulder and pointed at both ends, like
+    the shine line on the wing case;
+  * replace the legs: same pose, tapering to a segmented foot with a small
+    hooked claw (the drawn legs ended in boot shapes);
+  * rebuild the abdomen as one convex shape so the new legs sit on it, with a
+    GAP-wide moat around every part drawn over another.
+
+Each master is one absolute path in a 480 x 328 box, the beetle centred and
+464 units wide.
 """
-import json, os, re, subprocess, sys, tempfile
+import math, os, re, subprocess, tempfile
 import numpy as np, cv2
 from PIL import Image
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-AXIS_SRC = 439      # x of the beetle's axis in source.png
-PAD = 60            # margin added around the artwork
-F = 4               # supersampling for the trace
-CUT = 8             # cut width, source pixels
-BOLD = 6            # growth of the small-size mark, source pixels
-SMOOTH = 2          # radius of the opening that smooths the outline, source pixels
+F = 6                    # supersampling
+GAP = 3.2                # moat between overlapping parts, source pixels
+SLIT = dict(x0=283, x1=354, inset=8.5, width=5.28)
+# Legs: (chain of (x, y, width), ankle, toe, direction). Source pixels.
+LEGS = [([(192, 256, 19), (160, 292, 15), (140, 312, 11)], (140, 312), (100, 323), -1),
+        ([(277, 234, 19), (268, 274, 15), (246, 310, 11)], (246, 310), (208, 323), -1),
+        ([(321, 227, 19), (350, 262, 15), (382, 306, 11)], (382, 306), (420, 323), 1)]
+BOX_W, BOX_H, MARK_W = 480, 328, 464
 
-# Cuts on the left half, in padded-canvas pixels (axis at x = 499). Each is
-# mirrored to the right half.
-CUTS = {
-    'horn':    [[425, 410], [457, 487], [499, 508]],
-    'lobe':    [[368, 450], [398, 556], [462, 620], [482, 627], [499, 627]],
-    'elytra':  [[300, 622], [380, 608], [445, 642], [499, 700]],
-    'suture':  [[499, 700], [499, 1060]],
-    'strip':   [[310, 680], [362, 742], [380, 852], [300, 935]],
-    'panel':   [[380, 852], [460, 940], [482, 1012], [499, 1040]],
-    'fl_claw': [[230, 323], [285, 333]],
-    'fl_knee': [[245, 505], [296, 482]],
-    'ml_claw': [[150, 782], [210, 790]],
-    'ml_knee': [[245, 632], [258, 695]],
-    'hl_knee': [[225, 852], [280, 880]],
-    'hl_claw': [[268, 1042], [305, 1022]],
-}
+def keep_large(m, area):
+    n, lab, st, cen = cv2.connectedComponentsWithStats(m.astype(np.uint8), 8)
+    return [(lab == i, cen[i] / F) for i in range(1, n) if st[i, 4] >= area]
 
-def keep_large(m, min_area):
-    n, lab, st, _ = cv2.connectedComponentsWithStats(m.astype(np.uint8), 8)
-    keep = np.zeros(n, bool); keep[1:] = st[1:, cv2.CC_STAT_AREA] >= min_area
-    return keep[lab]
+def disk(r):
+    r = max(1, int(round(r))); return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
 
-def silhouette():
-    g = np.array(Image.open(os.path.join(HERE, 'source.png')).convert('L')).astype(np.float32)
-    h, w = g.shape
-    cw = 2 * max(AXIS_SRC, w - AXIS_SRC) + 2 * PAD
-    canvas = np.full((h + 2 * PAD, cw), 255, np.float32)
-    off = cw // 2 - AXIS_SRC
-    canvas[PAD:PAD + h, off:off + w] = g
-    sym = (canvas + canvas[:, ::-1]) / 2                     # exact mirror symmetry
-    up = cv2.resize(sym, None, fx=F, fy=F, interpolation=cv2.INTER_CUBIC)
-    up = cv2.GaussianBlur(up, (0, 0), 3)
-    sil = keep_large(up < 150, 4000)
-    sil = ~keep_large(~sil, 800)
-    # Shave the knuckle bumps the painted outline left on the legs: an opening
-    # removes anything narrower than 2 * SMOOTH source pixels.
-    r = SMOOTH * F
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
-    sil = cv2.morphologyEx(sil.astype(np.uint8), cv2.MORPH_OPEN, k) > 0
-    return sil, cw / 2
+def P(x, y): return (int(round(x * F)), int(round(y * F)))
+
+def classify():
+    im = np.array(Image.open(os.path.join(HERE, 'source.png')).convert('RGB')).astype(np.float32)
+    up = cv2.GaussianBlur(cv2.resize(im, None, fx=F, fy=F, interpolation=cv2.INTER_CUBIC), (0, 0), 1.5)
+    ref = [(240, 240, 240), (30, 38, 66), (208, 162, 82)]   # background, armour, fill
+    return np.stack([((up - np.array(c, np.float32)) ** 2).sum(-1) for c in ref], -1).argmin(-1)
+
+def holes(m):
+    inv = (~m).astype(np.uint8)
+    cv2.floodFill(inv, np.zeros((m.shape[0] + 2, m.shape[1] + 2), np.uint8), (0, 0), 0)
+    return inv > 0
+
+def slit_polygon(armour):
+    xs = np.arange(274, 372, 1.0); ys = []
+    for x in xs:
+        col = np.nonzero(armour[int(60 * F):int(160 * F), int(x * F)])[0]
+        ys.append(col[0] / F + 60)
+    c = np.polyfit(xs, ys, 3); f = np.poly1d(c); df = f.deriv()
+    outer, inner = [], []
+    for s in np.linspace(0, 1, 41):
+        x = SLIT['x0'] + (SLIT['x1'] - SLIT['x0']) * s; y = f(x); d = df(x); L = math.hypot(1, d); nx, ny = -d / L, 1 / L
+        w = SLIT['width'] * (math.sin(math.pi * s) ** 0.7) * (1 - 0.35 * s)
+        outer.append((x + nx * SLIT['inset'], y + ny * SLIT['inset']))
+        inner.append((x + nx * (SLIT['inset'] + w), y + ny * (SLIT['inset'] + w)))
+    return outer + inner[::-1]
+
+def legs_mask(shape):
+    m = np.zeros(shape, np.uint8); cuts = np.zeros(shape, np.uint8)
+    def quad(a, b):
+        (x0, y0, w0), (x1, y1, w1) = a, b
+        dx, dy = x1 - x0, y1 - y0; L = math.hypot(dx, dy); nx, ny = -dy / L, dx / L
+        cv2.fillPoly(m, [np.array([P(x0 + nx * w0 / 2, y0 + ny * w0 / 2), P(x1 + nx * w1 / 2, y1 + ny * w1 / 2),
+                                   P(x1 - nx * w1 / 2, y1 - ny * w1 / 2), P(x0 - nx * w0 / 2, y0 - ny * w0 / 2)])], 1)
+    for chain, ankle, toe, d in LEGS:
+        for a, b in zip(chain, chain[1:]): quad(a, b)
+        for x, y, w in chain: cv2.circle(m, P(x, y), int(w / 2 * F), 1, -1)
+        quad((*ankle, 8.5), (*toe, 4.6))                        # foot
+        dx, dy = toe[0] - ankle[0], toe[1] - ankle[1]; L = math.hypot(dx, dy); nx, ny = -dy / L, dx / L
+        for t in (1 / 3, 2 / 3):                                 # foot segments
+            cx, cy = ankle[0] + dx * t, ankle[1] + dy * t; w = 8.5 + (4.6 - 8.5) * t + 2
+            cv2.line(cuts, P(cx - nx * w / 2, cy - ny * w / 2), P(cx + nx * w / 2, cy + ny * w / 2), 1, int(1.6 * F))
+        x, y = toe                                               # hooked claw
+        cv2.fillPoly(m, [np.array([P(x, y - 3), P(x + d * 8, y - 1.6), P(x + d * 12, y + 3.4), P(x + d * 7, y + 1.8), P(x, y + 3)])], 1)
+    return (m > 0) & ~(cuts > 0)
 
 def trace(mask):
     with tempfile.TemporaryDirectory() as t:
         pbm, out = os.path.join(t, 'm.pbm'), os.path.join(t, 'm.svg')
         Image.fromarray(np.where(mask, 0, 255).astype(np.uint8)).save(pbm)
-        subprocess.run(['potrace', '-s', '--flat', '-a', '1.0', '-O', '1.2', '-t', '40', '-u', '4', pbm, '-o', out], check=True)
+        subprocess.run(['potrace', '-s', '--flat', '-a', '1.0', '-O', '0.8', '-t', '30', '-u', '4', pbm, '-o', out], check=True)
         raw = open(out).read()
     vb_h = float(re.search(r'viewBox="0 0 [\d.]+ ([\d.]+)"', raw).group(1))
     sc = float(re.search(r'scale\(([\d.]+),', raw).group(1))
@@ -85,42 +108,55 @@ def trace(mask):
         if cmd in 'Zz': segs.append(['Z']); cx, cy = sx, sy; continue
         n = 6 if cmd in 'Cc' else 2
         v = [float(x) for x in toks[i:i + n]]; i += n
-        if cmd.islower():
-            v = [v[k] + (cx if k % 2 == 0 else cy) for k in range(n)]
+        if cmd.islower(): v = [v[k] + (cx if k % 2 == 0 else cy) for k in range(n)]
         cx, cy = v[-2], v[-1]
         if cmd in 'Mm': sx, sy = cx, cy; segs.append(['M'] + v); cmd = 'L' if cmd == 'M' else 'l'
         else: segs.append([cmd.upper()] + v)
-    # potrace units -> canvas pixels (y flipped)
     return [[s[0]] + [s[k] * sc / F if k % 2 == 1 else (vb_h - s[k] * sc) / F for k in range(1, len(s))] for s in segs]
 
-def write_master(name, segs, axis):
-    ys = [s[k] for s in segs for k in range(2, len(s), 2)]
-    y0, y1 = min(ys), max(ys)
-    s = 464 / (y1 - y0)                                   # 464 tall in a 320 x 480 box, centred
-    tx, ty = 160 - axis * s, 240 - (y0 + y1) / 2 * s
+def write(name, segs, fit):
+    s, tx, ty = fit
     fmt = lambda v: f'{v:.2f}'.rstrip('0').rstrip('.')
     parts = []
     for seg in segs:
         if seg[0] == 'Z': parts.append('Z'); continue
-        pts = [fmt(seg[k] * s + (tx if k % 2 == 1 else ty)) for k in range(1, len(seg))]
-        parts.append(seg[0] + ' '.join(pts))
+        parts.append(seg[0] + ' '.join(fmt(seg[k] * s + (tx if k % 2 == 1 else ty)) for k in range(1, len(seg))))
     d = ' '.join(parts).replace(' -', '-')
-    svg = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 480">'
-           f'<path fill-rule="evenodd" d="{d}"/></svg>\n')
+    svg = f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {BOX_W} {BOX_H}"><path fill-rule="evenodd" d="{d}"/></svg>\n'
     open(os.path.join(HERE, name), 'w').write(svg)
     print(f'wrote mark/{name} ({len(svg)} bytes)')
 
 def main():
-    sil, axis = silhouette()
-    cut = np.zeros(sil.shape, np.uint8)
-    for pts in CUTS.values():
-        for side in (1, -1):
-            p = np.array([[(axis + side * (x - axis)) * F, y * F] for x, y in pts], np.float32)
-            cv2.polylines(cut, [np.round(p * 16).astype(np.int32)], False, 255, CUT * F, cv2.LINE_AA, shift=4)
-    write_master('plates.svg', trace(keep_large(sil & (cut < 128), 3000)), axis)
-    r = BOLD * F
-    bold = cv2.dilate(sil.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))) > 0
-    write_master('bold.svg', trace(bold), axis)
+    lab = classify()
+    armour_all = lab == 1
+    fill_all = cv2.morphologyEx((lab == 2).astype(np.uint8), cv2.MORPH_OPEN, disk(5)) > 0   # drop anti-alias fringe
+    body = np.zeros_like(armour_all)
+    for m, c in keep_large(armour_all, 3000):
+        if c[1] <= 255: body |= m                         # the drawn legs (lower components) are dropped
+    gold, belly = np.zeros_like(body), np.zeros_like(body)
+    for m, c in keep_large(fill_all, 3000):
+        (belly if c[1] > 230 and c[0] < 330 else gold).__ior__(m)
+    hull = cv2.convexHull(np.column_stack(np.nonzero(belly))[:, ::-1].astype(np.int32))
+    abdomen = np.zeros(body.shape, np.uint8); cv2.fillPoly(abdomen, [hull], 1); abdomen = abdomen > 0
+    hl = holes(body)
+    eye = np.zeros_like(body)
+    for m, c in keep_large(hl, 500):
+        if abs(c[0] - 315) < 25 and abs(c[1] - 135) < 25: body |= m      # close the triangle on the head
+        if abs(c[0] - 382) < 15 and abs(c[1] - 204) < 15: body |= m; eye |= m
+    gold &= ~cv2.dilate(eye.astype(np.uint8), disk(2 * F)).astype(bool)    # no eye
+    slit = np.zeros(body.shape, np.uint8)
+    cv2.fillPoly(slit, [np.array([P(x, y) for x, y in slit_polygon(body)])], 1)
+    body &= ~(slit > 0)
+    legs = legs_mask(body.shape)
+    moat = lambda m: cv2.dilate(m.astype(np.uint8), disk(GAP * F)) > 0
+    armour = (body & ~moat(legs)) | legs
+    fill = (gold & ~moat(legs)) | (abdomen & ~moat(body | gold | legs))
+    mono = cv2.morphologyEx((armour | fill).astype(np.uint8), cv2.MORPH_CLOSE, disk(4)) > 0
+    segs = {n: trace(m) for n, m in (('armour', armour), ('fill', fill), ('mono', mono))}
+    xs = [s[k] for s in segs['mono'] for k in range(1, len(s), 2)]; ys = [s[k] for s in segs['mono'] for k in range(2, len(s), 2)]
+    sc = MARK_W / (max(xs) - min(xs))
+    fit = (sc, BOX_W / 2 - (min(xs) + max(xs)) / 2 * sc, BOX_H / 2 - (min(ys) + max(ys)) / 2 * sc)
+    for n in segs: write(f'{n}.svg', segs[n], fit)
 
 if __name__ == '__main__':
     main()

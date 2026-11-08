@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
-"""Generate the Scarab mark's logo and favicon SVGs from the two traced masters.
+"""Generate the Scarab mark's logo and favicon SVGs from the three traced masters.
 
     python3 ui/brand/mark/generate.py           write the SVGs
     python3 ui/brand/mark/generate.py --check   fail if the SVGs on disk differ
     python3 ui/brand/mark/generate.py --ico     build favicon.ico from the favicon PNGs
 
-Standard library only. The masters, `plates.svg` (the mark) and `bold.svg`
-(the small-size mark), are written by trace.py from source.png. Each holds one
-absolute path in a 320 x 480 box with the beetle centred at (160, 240) and 464
-units tall. This script scales that path into each output; the PNGs are then
-rendered from the outputs by serve_png.py.
+Standard library only. The masters (`armour.svg`, `fill.svg`, `mono.svg`) are
+written by trace.py from source.png. Each holds one absolute path in a 480 x 328
+box with the beetle centred and 464 units wide. This script scales those paths
+into each output; the PNGs are then rendered from the outputs by serve_png.py.
 """
 import os
 import re
@@ -19,28 +18,25 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 BRAND = os.path.realpath(os.path.join(HERE, '..'))
 
-INK, CREAM, EMERALD, GOLD, NIGHT = '#111418', '#f4f1ea', '#1f9e74', '#c9a94e', '#0b0c0e'
-MASTER_H = 464
+INK, CREAM, GOLD, NAVY, NIGHT = '#272a31', '#f4f1ea', '#c9a94e', '#1e2642', '#0b0c0e'
+MASTER_W, MASTER_CX, MASTER_CY = 464, 240, 164
 
 
 def master(name):
-    text = open(os.path.join(HERE, name)).read()
-    return re.search(r' d="([^"]+)"', text).group(1)
+    return re.search(r' d="([^"]+)"', open(os.path.join(HERE, name)).read()).group(1)
 
 
-def place(d, height, cx, cy):
-    """Scale a master path to `height` units with the beetle centred on (cx, cy)."""
-    k = height / MASTER_H
-    nums = iter(range(10 ** 9))
+def place(d, width, cx, cy):
+    """Scale a master path to `width` units with the beetle centred on (cx, cy)."""
+    k = width / MASTER_W
+    n = iter(range(10 ** 9))
 
     def num(m):
         v = float(m.group(0))
-        v = (v - 160) * k + cx if next(nums) % 2 == 0 else (v - 240) * k + cy
+        v = (v - MASTER_CX) * k + cx if next(n) % 2 == 0 else (v - MASTER_CY) * k + cy
         return f'{v:.1f}'.rstrip('0').rstrip('.')
 
-    out = []
-    for cmd, args in re.findall(r'([MLCZ])([^MLCZ]*)', d):
-        out.append(cmd + re.sub(r'-?\d+(?:\.\d+)?', num, args).strip())
+    out = [cmd + re.sub(r'-?\d+(?:\.\d+)?', num, args).strip() for cmd, args in re.findall(r'([MLCZ])([^MLCZ]*)', d)]
     return ' '.join(out).replace(' -', '-')
 
 
@@ -55,25 +51,29 @@ def path(d, fill, cls=''):
 
 
 def outputs():
-    plates, bold = master('plates.svg'), master('bold.svg')
-    tight = place(plates, 464, 160, 240)        # 320 x 480, a little margin round the beetle
-    square = place(plates, 480, 256, 256)       # 512 square
-    tile = place(plates, 392, 256, 256)         # 512 square on an opaque background
-    small = place(bold, 496, 256, 256)          # 512 square, for 16 to 32 px
-    small_tile = place(bold, 432, 256, 256)
-    out = {}
-    for name, col in (('ink', INK), ('cream', CREAM), ('emerald', EMERALD), ('gold', GOLD)):
-        out[f'logo/scarab-{name}.svg'] = svg('0 0 320 480', path(tight, col))
-        out[f'logo/scarab-square-{name}.svg'] = svg('0 0 512 512', path(square, col))
-        out[f'logo/scarab-small-{name}.svg'] = svg('0 0 512 512', path(small, col))
-    out['logo/scarab-tile.svg'] = svg('0 0 512 512', f'<rect width="512" height="512" fill="{NIGHT}"/>' + path(tile, CREAM))
-    out['logo/scarab-tile-emerald.svg'] = svg('0 0 512 512', f'<rect width="512" height="512" fill="{EMERALD}"/>' + path(tile, INK))
-    out['logo/scarab-small-tile.svg'] = svg('0 0 512 512', f'<rect width="512" height="512" fill="{NIGHT}"/>' + path(small_tile, CREAM))
-    out['logo/scarab-small-tile-emerald.svg'] = svg('0 0 512 512', f'<rect width="512" height="512" fill="{EMERALD}"/>' + path(small_tile, INK))
-    # Browser tab icon: the small-size mark, ink on a light tab and cream on a dark one.
-    out['favicon/favicon.svg'] = svg('0 0 512 512',
-        '<style>path{fill:' + INK + '}@media (prefers-color-scheme:dark){path{fill:' + CREAM + '}}</style>'
-        f'<path fill-rule="evenodd" d="{small}"/>')
+    A, F, M = master('armour.svg'), master('fill.svg'), master('mono.svg')
+    tight = lambda d: place(d, 464, 240, 164)        # 480 x 328
+    square = lambda d: place(d, 480, 256, 256)       # 512 square, for square slots
+    small = lambda d: place(d, 504, 256, 256)        # 512 square, edge to edge, for 16 to 32 px
+    tile = lambda d: place(d, 400, 256, 262)         # 512 square on an opaque background
+    two = lambda f, a, ink, gold: path(f(a), ink) + path(f(F), gold)
+    out = {
+        'logo/scarab.svg': svg('0 0 480 328', two(tight, A, INK, GOLD)),
+        'logo/scarab-dark.svg': svg('0 0 480 328', two(tight, A, CREAM, GOLD)),
+        'logo/scarab-navy.svg': svg('0 0 480 328', two(tight, A, NAVY, GOLD)),
+        'logo/scarab-mono-ink.svg': svg('0 0 480 328', path(tight(M), INK)),
+        'logo/scarab-mono-cream.svg': svg('0 0 480 328', path(tight(M), CREAM)),
+        'logo/scarab-square.svg': svg('0 0 512 512', two(square, A, INK, GOLD)),
+        'logo/scarab-square-dark.svg': svg('0 0 512 512', two(square, A, CREAM, GOLD)),
+        'logo/scarab-small-ink.svg': svg('0 0 512 512', path(small(M), INK)),
+        'logo/scarab-small-cream.svg': svg('0 0 512 512', path(small(M), CREAM)),
+        'logo/scarab-tile.svg': svg('0 0 512 512', f'<rect width="512" height="512" fill="{NIGHT}"/>' + two(tile, A, CREAM, GOLD)),
+        'logo/scarab-small-tile.svg': svg('0 0 512 512', f'<rect width="512" height="512" fill="{NIGHT}"/>' + path(place(M, 440, 256, 262), CREAM)),
+        # Browser tab icon: one colour, ink on a light tab and cream on a dark one.
+        'favicon/favicon.svg': svg('0 0 512 512',
+            '<style>path{fill:' + INK + '}@media (prefers-color-scheme:dark){path{fill:' + CREAM + '}}</style>'
+            f'<path fill-rule="evenodd" d="{small(M)}"/>'),
+    }
     return out
 
 

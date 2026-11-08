@@ -1,8 +1,8 @@
 <div align="center">
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="ui/brand/logo/scarab-square-cream.svg">
-  <img alt="The Scarab mark: a horned beetle seen from above" src="ui/brand/logo/scarab-square-ink.svg" width="132" height="132">
+  <source media="(prefers-color-scheme: dark)" srcset="ui/brand/logo/scarab-dark.svg">
+  <img alt="The Scarab mark: a rhinoceros beetle seen from the side" src="ui/brand/logo/scarab.svg" width="190" height="130">
 </picture>
 
 # Scarab

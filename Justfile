@@ -93,10 +93,10 @@ docs what="" *args:
       *) echo "usage: just docs [build | screenshots [check]]" >&2; exit 2 ;;
     esac
 
-# `just brand` regenerates the beetle mark's SVGs in ui/brand from the two
+# `just brand` regenerates the beetle mark's SVGs in ui/brand from the three
 # traced masters in ui/brand/mark (generate.py, python3, standard library only).
 # `just brand check` fails if the SVGs on disk differ from what the generator
-# produces. `just brand png` re-renders the 47 PNG icons in a browser: it opens
+# produces. `just brand png` re-renders the 37 PNG icons in a browser: it opens
 # a tab that draws each SVG at every size, serve_png.py saves the files and
 # exits when the page reports it is done, then favicon.ico is rebuilt from the
 # favicon PNGs. Re-tracing the masters from the artwork (mark/trace.py) needs
