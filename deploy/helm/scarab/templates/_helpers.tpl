@@ -3,6 +3,15 @@
 {{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
+{{/*
+  Which Scarab release owns the plugin namespace: `<release namespace>.<release
+  name>`, a label value. The runtime refuses a plugin namespace stamped for
+  another release, so two releases never sweep each other's plugins.
+*/}}
+{{- define "scarab.pluginOwner" -}}
+{{- printf "%s.%s" .Release.Namespace .Release.Name | trunc 63 | trimSuffix "-" | trimSuffix "." -}}
+{{- end -}}
+
 {{/* Fully qualified app name. */}}
 {{- define "scarab.fullname" -}}
 {{- if .Values.fullnameOverride -}}

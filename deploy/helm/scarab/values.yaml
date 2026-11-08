@@ -546,7 +546,8 @@ plugins:
   namespace: scarab-plugins
   # Render the namespace (with its Pod Security labels). Set false if you
   # create it yourself — it must carry
-  # pod-security.kubernetes.io/enforce=restricted.
+  # pod-security.kubernetes.io/enforce=restricted and
+  # scarab.io/plugin-runtime-owner=<release namespace>.<release name>.
   createNamespace: true
   # The broker listener's port (SCARAB_BROKER_ADDR) and its Service port —
   # the same number, so the NetworkPolicy port and the URL agree.

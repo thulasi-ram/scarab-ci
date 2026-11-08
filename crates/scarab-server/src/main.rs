@@ -1232,6 +1232,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         probe_image: config.plugins.probe_image.clone().unwrap_or_else(|| {
                             scarab_plugin_k8s::probe::DEFAULT_PROBE_IMAGE.to_string()
                         }),
+                        owner: config.plugins.owner.clone(),
                     },
                 );
                 plugin_runtime_handle = Some(

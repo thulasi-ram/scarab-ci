@@ -1,7 +1,7 @@
 //! [`K8sPluginRuntime`]: the plugin namespace's baseline, the isolation probe,
 //! and one workload per PluginInstallation (ADR-0072 §9).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use k8s_openapi::api::apps::v1::Deployment;
@@ -17,7 +17,8 @@ use scarab_plugin::{installation_id_of_service_account, PluginInstallation};
 use crate::objects::{self, LABEL_PROBE};
 use crate::probe::{self, ProbeReport};
 use crate::{
-    BrokerPeer, BrokerUrl, FIELD_MANAGER, LABEL_INSTALLATION, PSA_ENFORCE_LABEL, PSA_RESTRICTED,
+    BrokerPeer, BrokerUrl, FIELD_MANAGER, LABEL_INSTALLATION, LABEL_OWNER, PSA_ENFORCE_LABEL,
+    PSA_RESTRICTED,
 };
 
 /// How long the canary may take to accept connections (an image pull on a
@@ -51,6 +52,10 @@ pub struct PluginRuntimeConfig {
     pub broker_port: u16,
     /// The isolation probe's image (`SCARAB_PLUGIN_PROBE_IMAGE`).
     pub probe_image: String,
+    /// The release this runtime is (`SCARAB_PLUGIN_OWNER`), as stamped on
+    /// the namespace under [`LABEL_OWNER`]. `None` = not configured: the
+    /// baseline refuses, and nothing starts.
+    pub owner: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -129,6 +134,19 @@ impl K8sPluginRuntime {
         &self.config
     }
 
+    /// `object` with this release's owner stamp ([`LABEL_OWNER`]) added to
+    /// its labels, as everything the runtime applies carries it.
+    fn stamped<K: kube::Resource>(&self, mut object: K) -> K {
+        if let Some(owner) = &self.config.owner {
+            object
+                .meta_mut()
+                .labels
+                .get_or_insert_with(BTreeMap::new)
+                .insert(LABEL_OWNER.to_string(), owner.clone());
+        }
+        object
+    }
+
     fn namespaced<K>(&self) -> Api<K>
     where
         K: kube::Resource<Scope = k8s_openapi::NamespaceResourceScope>,
@@ -172,6 +190,15 @@ impl K8sPluginRuntime {
             .labels
             .as_ref()
             .and_then(|l| l.get(PSA_ENFORCE_LABEL));
+        check_namespace_owner(
+            ns,
+            namespace
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get(LABEL_OWNER)),
+            self.config.owner.as_deref(),
+        )?;
         if level.map(String::as_str) != Some(PSA_RESTRICTED) {
             return Err(RuntimeError::BaselineRefused(format!(
                 "namespace `{ns}` must enforce Pod Security level `{PSA_RESTRICTED}` \
@@ -210,6 +237,7 @@ impl K8sPluginRuntime {
         }
         for np in &wanted {
             let name = np.metadata.name.as_deref().unwrap_or_default();
+            let np = &self.stamped(np.clone());
             let stored = policies
                 .patch(name, &Self::apply_params(), &Patch::Apply(np))
                 .await
@@ -378,17 +406,20 @@ impl K8sPluginRuntime {
                 return Err(RuntimeError::Storage(why));
             }
         }
-        let sa = objects::service_account(&self.config.namespace, installation);
+        let sa = self.stamped(objects::service_account(
+            &self.config.namespace,
+            installation,
+        ));
         self.namespaced::<ServiceAccount>()
             .patch(&name, &Self::apply_params(), &Patch::Apply(&sa))
             .await
             .map_err(kube_err)?;
-        let deployment = objects::deployment(
+        let deployment = self.stamped(objects::deployment(
             &self.config.namespace,
             installation,
             pod_broker_url,
             &self.config.probe_image,
-        );
+        ));
         self.namespaced::<Deployment>()
             .patch(&name, &Self::apply_params(), &Patch::Apply(&deployment))
             .await
@@ -492,9 +523,12 @@ impl K8sPluginRuntime {
     }
 
     /// Every installation id something of ours still exists for — a
-    /// Deployment or a ServiceAccount carrying the installation label.
+    /// Deployment or a ServiceAccount carrying the installation label and
+    /// this release's owner stamp (or none, from before the stamp). Another
+    /// release's objects are never ours to sweep.
     pub async fn workload_ids(&self) -> Result<BTreeSet<String>, RuntimeError> {
         let lp = ListParams::default().labels(LABEL_INSTALLATION);
+        let owner = self.config.owner.as_deref();
         let mut ids = BTreeSet::new();
         for d in self
             .namespaced::<Deployment>()
@@ -503,7 +537,9 @@ impl K8sPluginRuntime {
             .map_err(kube_err)?
             .items
         {
-            ids.extend(id_of(d.metadata.name.as_deref()));
+            if owned_by(d.metadata.labels.as_ref(), owner) {
+                ids.extend(id_of(d.metadata.name.as_deref()));
+            }
         }
         for sa in self
             .namespaced::<ServiceAccount>()
@@ -512,7 +548,9 @@ impl K8sPluginRuntime {
             .map_err(kube_err)?
             .items
         {
-            ids.extend(id_of(sa.metadata.name.as_deref()));
+            if owned_by(sa.metadata.labels.as_ref(), owner) {
+                ids.extend(id_of(sa.metadata.name.as_deref()));
+            }
         }
         Ok(ids)
     }
@@ -731,6 +769,46 @@ async fn finished_log(pods: &Api<Pod>, name: &str) -> Result<String, String> {
     }
 }
 
+/// May this runtime use namespace `ns`, stamped `stamp`? Only when it knows
+/// which release it is and the namespace is stamped for that release: two
+/// releases sharing one plugin namespace would sweep each other's
+/// workloads, so a namespace stamped for another release, or not stamped,
+/// is refused (git-bug da0af59).
+fn check_namespace_owner(
+    ns: &str,
+    stamp: Option<&String>,
+    owner: Option<&str>,
+) -> Result<(), RuntimeError> {
+    let Some(owner) = owner else {
+        return Err(RuntimeError::BaselineRefused(
+            "SCARAB_PLUGIN_OWNER is not set, so the runtime cannot tell its plugin namespace \
+             from another release's"
+                .into(),
+        ));
+    };
+    match stamp.map(String::as_str) {
+        Some(s) if s == owner => Ok(()),
+        Some(other) => Err(RuntimeError::BaselineRefused(format!(
+            "namespace `{ns}` belongs to Scarab release `{other}` ({LABEL_OWNER}); this release \
+             is `{owner}`, and two releases cannot share a plugin namespace"
+        ))),
+        None => Err(RuntimeError::BaselineRefused(format!(
+            "namespace `{ns}` has no {LABEL_OWNER} label; label it {LABEL_OWNER}={owner} (the \
+             chart's plugins.createNamespace does)"
+        ))),
+    }
+}
+
+/// Is an object with `labels` this release's to sweep: stamped for `owner`,
+/// or not stamped at all (written before the stamp existed, and the
+/// namespace check guarantees the namespace is this release's)?
+fn owned_by(labels: Option<&BTreeMap<String, String>>, owner: Option<&str>) -> bool {
+    match labels.and_then(|l| l.get(LABEL_OWNER)) {
+        None => true,
+        Some(stamp) => Some(stamp.as_str()) == owner,
+    }
+}
+
 /// Does the policy the API server stored differ from the one applied? Both
 /// specs are compared as JSON after removing what the server fills in on
 /// its own (a null or an empty list, a missing port protocol it defaults to
@@ -881,6 +959,53 @@ mod tests {
             probe_pod_created_at("no-creation-time", None),
         ];
         assert_eq!(stale_probe_pods(&pods, now), vec!["abandoned".to_string()]);
+    }
+
+    /// git-bug da0af59 (4): a namespace is usable only when stamped for this
+    /// release; objects are swept only when stamped for it, or not at all.
+    #[test]
+    fn a_namespace_and_its_objects_belong_to_one_release() {
+        let mine = "scarab.prod".to_string();
+        let theirs = "scarab-staging.scarab".to_string();
+        assert!(check_namespace_owner("p", Some(&mine), Some("scarab.prod")).is_ok());
+        for (stamp, owner, says) in [
+            (
+                Some(&theirs),
+                Some("scarab.prod"),
+                "belongs to Scarab release",
+            ),
+            (
+                None,
+                Some("scarab.prod"),
+                "has no scarab.io/plugin-runtime-owner",
+            ),
+            (Some(&mine), None, "SCARAB_PLUGIN_OWNER is not set"),
+        ] {
+            let err = check_namespace_owner("p", stamp, owner)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(says), "{err}");
+        }
+
+        let labels = |stamp: Option<&str>| {
+            let mut l = BTreeMap::from([(LABEL_INSTALLATION.to_string(), "1".to_string())]);
+            if let Some(s) = stamp {
+                l.insert(LABEL_OWNER.to_string(), s.to_string());
+            }
+            l
+        };
+        assert!(owned_by(
+            Some(&labels(Some("scarab.prod"))),
+            Some("scarab.prod")
+        ));
+        assert!(
+            owned_by(Some(&labels(None)), Some("scarab.prod")),
+            "from before the stamp"
+        );
+        assert!(!owned_by(
+            Some(&labels(Some("scarab-staging.scarab"))),
+            Some("scarab.prod")
+        ));
     }
 
     /// git-bug da0af59 (3): a stored policy that differs from the applied

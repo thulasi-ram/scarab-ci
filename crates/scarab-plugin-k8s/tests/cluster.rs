@@ -150,6 +150,7 @@ impl Fixture {
                 }),
                 broker_port: BROKER_PORT,
                 probe_image: probe_image(),
+                owner: Some(TEST_OWNER.to_string()),
             },
         )
     }
@@ -168,6 +169,9 @@ impl Fixture {
     }
 }
 
+/// The release the test runtime is, as stamped on its namespaces.
+const TEST_OWNER: &str = "scarab-kube-tests.plugin-k8s";
+
 fn namespace(name: &str, psa_enforce: &str) -> Namespace {
     Namespace {
         metadata: ObjectMeta {
@@ -178,6 +182,10 @@ fn namespace(name: &str, psa_enforce: &str) -> Namespace {
                     psa_enforce.to_string(),
                 ),
                 ("scarab.io/test".to_string(), "plugin-k8s".to_string()),
+                (
+                    scarab_plugin_k8s::LABEL_OWNER.to_string(),
+                    TEST_OWNER.to_string(),
+                ),
             ])),
             ..Default::default()
         },
