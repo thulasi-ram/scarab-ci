@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1794088038,"nonce":"0LMVfOn5ucfPj+E5tvKE1CI/T7o=","message":"Fix in PR #123 (open, gated: full suite + just check all; reviewed by three lenses + red team on 2026-11-08). Close when it merges.","files":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1794113289,"nonce":"/cZjEB7absftBvZXzSqovoRB0bY=","message":"Shipped: PR #123 merged to main.","files":null}]}
