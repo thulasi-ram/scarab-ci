@@ -68,6 +68,13 @@ const RETRY_AFTER_BUSY_SECS: u64 = 5;
 
 /// The router the broker listener serves.
 pub fn router(state: AppState) -> Router {
+    router_with_journal(state).0
+}
+
+/// [`router`], and the handle that writes the read proxy's queued journal
+/// at shutdown (`None` when the proxy is off).
+pub fn router_with_journal(state: AppState) -> (Router, Option<broker_proxy::BrokerJournalDrain>) {
+    let mut drain = None;
     let reads = Router::new()
         .route(&format!("{BROKER_PREFIX}/whoami"), get(whoami))
         .route_layer(axum::middleware::from_fn_with_state(
@@ -84,16 +91,16 @@ pub fn router(state: AppState) -> Router {
         .clone()
         .or_else(|| state.plugins.clone())
         .map(|store| {
+            let (proxy, journal) =
+                broker_proxy::BrokerProxy::spawn_with_drain(store, state.broker_journal_queue);
+            drain = journal;
             Router::new()
                 .route(&broker_proxy::route_path(), any(broker_proxy::proxy))
                 .route_layer(axum::middleware::from_fn_with_state(
                     state.clone(),
                     authenticate_plugin_for_proxy,
                 ))
-                .layer(Extension(broker_proxy::BrokerProxy::spawn(
-                    store,
-                    state.broker_journal_queue,
-                )))
+                .layer(Extension(proxy))
         })
         .unwrap_or_default();
     // The gate API a plugin calls (ADR-0076 §7): the public API's own paths
@@ -109,7 +116,7 @@ pub fn router(state: AppState) -> Router {
             "/v1/runs/{id}/gates/{step}/release",
             axum::routing::post(crate::plugin_gates::release_on_broker),
         );
-    Router::new()
+    let router = Router::new()
         // Unauthenticated: the reachability probe (the isolation probe,
         // slice d2) must not need a token.
         .route(&format!("{BROKER_PREFIX}/healthz"), get(healthz))
@@ -121,7 +128,8 @@ pub fn router(state: AppState) -> Router {
         // Outermost, so the response it rewrites already carries its
         // request id.
         .layer(axum::middleware::from_fn(scrub_internal_errors))
-        .with_state(state)
+        .with_state(state);
+    (router, drain)
 }
 
 /// The registry as the broker reaches it: its own pool when one is wired.

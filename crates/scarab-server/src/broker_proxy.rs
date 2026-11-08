@@ -59,7 +59,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Extension;
 use futures::StreamExt;
 use sha2::{Digest, Sha256};
-use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 
 use scarab_plugin::{
     match_read_request, rule_label, BrokerJournalEntry, BrokerJournalPhase, ConnectionSlot,
@@ -232,15 +232,45 @@ impl<V: Clone> IdleCache<V> {
     }
 }
 
+/// Stops the journal writer at shutdown, once it has written what is
+/// queued. Dropping it stops nothing: the writer then runs until the proxy
+/// is gone.
+pub struct BrokerJournalDrain {
+    stop: oneshot::Sender<()>,
+    writer: tokio::task::JoinHandle<()>,
+}
+
+impl BrokerJournalDrain {
+    /// Write every journal entry queued so far, then stop the writer. An
+    /// entry queued after this is called is not written. Waits at most
+    /// `limit`; `false` if the writer had not finished by then.
+    pub async fn finish(self, limit: Duration) -> bool {
+        let _ = self.stop.send(());
+        tokio::time::timeout(limit, self.writer).await.is_ok()
+    }
+}
+
 impl BrokerProxy {
     /// A proxy over `store`, with a `journal_queue`-entry journal queue and
     /// its writer spawned on the current Tokio runtime. Without a runtime
     /// there is no writer, and the proxy refuses every request (503): it
     /// never forwards what it cannot journal.
     pub fn spawn(store: Arc<dyn PluginStore>, journal_queue: usize) -> Arc<Self> {
+        Self::spawn_with_drain(store, journal_queue).0
+    }
+
+    /// [`spawn`](Self::spawn), and the handle that writes the queued
+    /// journal at shutdown (`None` without a runtime).
+    pub fn spawn_with_drain(
+        store: Arc<dyn PluginStore>,
+        journal_queue: usize,
+    ) -> (Arc<Self>, Option<BrokerJournalDrain>) {
+        let mut drain = None;
         let journal = tokio::runtime::Handle::try_current().ok().map(|rt| {
             let (tx, rx) = mpsc::channel(journal_queue.max(2));
-            rt.spawn(write_journal(store.clone(), rx));
+            let (stop, stopped) = oneshot::channel();
+            let writer = rt.spawn(write_journal(store.clone(), rx, stopped));
+            drain = Some(BrokerJournalDrain { stop, writer });
             tx
         });
         if journal.is_none() {
@@ -248,13 +278,14 @@ impl BrokerProxy {
                 "broker: no Tokio runtime for the journal writer; the read proxy is off"
             );
         }
-        Arc::new(Self {
+        let proxy = Arc::new(Self {
             store,
             journal,
             refusals_unjournaled: AtomicU64::new(0),
             permits: Mutex::new(InstallationPermits::default()),
             clients: Mutex::new(IdleCache::new(CLIENT_IDLE)),
-        })
+        });
+        (proxy, drain)
     }
 
     fn try_permit(&self, installation_id: &str) -> Option<OwnedSemaphorePermit> {
@@ -425,31 +456,72 @@ pub(crate) fn upstream_client(ca_pem: Option<&str>) -> Result<reqwest::Client, S
         .map_err(|e| format!("cannot build a TLS client with this CA: {e}"))
 }
 
-/// Drain the journal queue into the store, a batch per round trip. A
-/// failed write is retried once; then the batch is logged as lost.
-async fn write_journal(store: Arc<dyn PluginStore>, mut rx: mpsc::Receiver<BrokerJournalEntry>) {
+/// Drain the journal queue into the store, a batch per round trip, until
+/// the proxy is gone or `stop` fires. On `stop` the queue is closed and
+/// what it holds is written before the writer returns; a dropped `stop`
+/// changes nothing.
+async fn write_journal(
+    store: Arc<dyn PluginStore>,
+    mut rx: mpsc::Receiver<BrokerJournalEntry>,
+    mut stop: oneshot::Receiver<()>,
+) {
     let mut batch = Vec::with_capacity(JOURNAL_BATCH);
-    while let Some(first) = rx.recv().await {
+    let mut stoppable = true;
+    loop {
+        let first = tokio::select! {
+            stopped = &mut stop, if stoppable => {
+                if stopped.is_ok() {
+                    break;
+                }
+                stoppable = false;
+                continue;
+            }
+            next = rx.recv() => match next {
+                Some(entry) => entry,
+                None => return,
+            },
+        };
         batch.push(first);
-        while batch.len() < JOURNAL_BATCH {
-            match rx.try_recv() {
-                Ok(entry) => batch.push(entry),
-                Err(_) => break,
-            }
-        }
-        if let Err(first) = store.append_broker_journal(&batch).await {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            if let Err(again) = store.append_broker_journal(&batch).await {
-                tracing::error!(
-                    lost = batch.len(),
-                    first = %first,
-                    error = %again,
-                    "broker: journal write failed twice; entries lost"
-                );
-            }
-        }
-        batch.clear();
+        fill_batch(&mut rx, &mut batch);
+        write_batch(store.as_ref(), &mut batch).await;
     }
+    // Shutdown: refuse new entries (a reserved slot may still send its
+    // one), then write what the queue holds.
+    rx.close();
+    loop {
+        fill_batch(&mut rx, &mut batch);
+        if batch.is_empty() {
+            return;
+        }
+        write_batch(store.as_ref(), &mut batch).await;
+    }
+}
+
+/// Top `batch` up from the queue without waiting.
+fn fill_batch(rx: &mut mpsc::Receiver<BrokerJournalEntry>, batch: &mut Vec<BrokerJournalEntry>) {
+    while batch.len() < JOURNAL_BATCH {
+        match rx.try_recv() {
+            Ok(entry) => batch.push(entry),
+            Err(_) => break,
+        }
+    }
+}
+
+/// Write `batch` and empty it. A failed write is retried once; then the
+/// batch is logged as lost.
+async fn write_batch(store: &dyn PluginStore, batch: &mut Vec<BrokerJournalEntry>) {
+    if let Err(first) = store.append_broker_journal(batch).await {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        if let Err(again) = store.append_broker_journal(batch).await {
+            tracing::error!(
+                lost = batch.len(),
+                first = %first,
+                error = %again,
+                "broker: journal write failed twice; entries lost"
+            );
+        }
+    }
+    batch.clear();
 }
 
 /// One request's journal rows in the making.

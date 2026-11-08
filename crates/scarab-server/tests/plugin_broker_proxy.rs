@@ -161,6 +161,7 @@ struct Harness {
     secrets: Arc<FakeSecrets>,
     public: axum::Router,
     broker: axum::Router,
+    journal: Option<scarab_server::broker_proxy::BrokerJournalDrain>,
 }
 
 async fn harness() -> Option<Harness> {
@@ -195,12 +196,14 @@ async fn harness_with(adjust: impl FnOnce(AppState) -> AppState) -> Option<Harne
         .with_plugin_tokens(Arc::new(FakeTokenReview))
         .with_secrets(secrets.clone());
     let st = adjust(st);
+    let (broker, journal) = broker::router_with_journal(st.clone());
     Some(Harness {
         tdb,
         pg,
         secrets,
-        public: router(st.clone()),
-        broker: broker::router(st),
+        public: router(st),
+        broker,
+        journal,
     })
 }
 
@@ -1129,5 +1132,177 @@ async fn under_enforced_step_up_the_read_proxy_is_unchanged() {
         &format!("Bearer {ARGO_TOKEN}"),
         "the bound credential is injected, as without step-up"
     );
+    h.finish().await;
+}
+
+/// The Postgres plugin store, with journal writes held until the test
+/// lets them through: entries then pile up in the broker's queue.
+struct HeldJournal {
+    inner: Arc<dyn scarab_plugin::PluginStore>,
+    open: Arc<tokio::sync::Semaphore>,
+}
+
+#[async_trait::async_trait]
+impl scarab_plugin::PluginStore for HeldJournal {
+    async fn install(
+        &self,
+        installation: &scarab_plugin::PluginInstallation,
+    ) -> Result<scarab_plugin::PluginInstallation, scarab_plugin::PluginStoreError> {
+        self.inner.install(installation).await
+    }
+    async fn installation(
+        &self,
+        org: &str,
+        name: &str,
+    ) -> Result<Option<scarab_plugin::PluginInstallation>, scarab_plugin::PluginStoreError> {
+        self.inner.installation(org, name).await
+    }
+    async fn installation_by_id(
+        &self,
+        id: &str,
+    ) -> Result<Option<scarab_plugin::PluginInstallation>, scarab_plugin::PluginStoreError> {
+        self.inner.installation_by_id(id).await
+    }
+    async fn installations(
+        &self,
+        org: &str,
+    ) -> Result<Vec<scarab_plugin::PluginInstallation>, scarab_plugin::PluginStoreError> {
+        self.inner.installations(org).await
+    }
+    async fn all_installations(
+        &self,
+    ) -> Result<Vec<scarab_plugin::PluginInstallation>, scarab_plugin::PluginStoreError> {
+        self.inner.all_installations().await
+    }
+    async fn set_installation_state(
+        &self,
+        org: &str,
+        name: &str,
+        state: scarab_plugin::InstallationState,
+        by: &str,
+        at: i64,
+    ) -> Result<Option<scarab_plugin::PluginInstallation>, scarab_plugin::PluginStoreError> {
+        self.inner
+            .set_installation_state(org, name, state, by, at)
+            .await
+    }
+    async fn set_installation_storage(
+        &self,
+        org: &str,
+        name: &str,
+        storage: Option<&scarab_plugin::PluginStorage>,
+        expected: Option<&scarab_plugin::PluginStorage>,
+    ) -> Result<Option<scarab_plugin::PluginInstallation>, scarab_plugin::PluginStoreError> {
+        self.inner
+            .set_installation_storage(org, name, storage, expected)
+            .await
+    }
+    async fn set_runtime_status(
+        &self,
+        id: &str,
+        decided_in: scarab_plugin::InstallationState,
+        status: scarab_plugin::RuntimeStatus,
+        message: &str,
+        probe_passed_at: Option<i64>,
+    ) -> Result<bool, scarab_plugin::PluginStoreError> {
+        self.inner
+            .set_runtime_status(id, decided_in, status, message, probe_passed_at)
+            .await
+    }
+    async fn uninstall(
+        &self,
+        org: &str,
+        name: &str,
+        by: &str,
+        at: i64,
+    ) -> Result<Option<scarab_plugin::PluginUninstall>, scarab_plugin::PluginStoreError> {
+        self.inner.uninstall(org, name, by, at).await
+    }
+    async fn put_connection(
+        &self,
+        connection: &scarab_plugin::PluginConnection,
+    ) -> Result<Option<String>, scarab_plugin::PluginStoreError> {
+        self.inner.put_connection(connection).await
+    }
+    async fn connections(
+        &self,
+        installation_id: &str,
+    ) -> Result<Vec<scarab_plugin::PluginConnection>, scarab_plugin::PluginStoreError> {
+        self.inner.connections(installation_id).await
+    }
+    async fn connection(
+        &self,
+        installation_id: &str,
+        slot: &str,
+    ) -> Result<Option<scarab_plugin::PluginConnection>, scarab_plugin::PluginStoreError> {
+        self.inner.connection(installation_id, slot).await
+    }
+    async fn delete_connection(
+        &self,
+        installation_id: &str,
+        slot: &str,
+    ) -> Result<Option<scarab_plugin::PluginConnection>, scarab_plugin::PluginStoreError> {
+        self.inner.delete_connection(installation_id, slot).await
+    }
+    async fn append_broker_journal(
+        &self,
+        entries: &[BrokerJournalEntry],
+    ) -> Result<(), scarab_plugin::PluginStoreError> {
+        let _open = self.open.acquire().await.expect("never closed");
+        self.inner.append_broker_journal(entries).await
+    }
+    async fn broker_journal(
+        &self,
+        installation_id: &str,
+        limit: usize,
+    ) -> Result<Vec<BrokerJournalEntry>, scarab_plugin::PluginStoreError> {
+        self.inner.broker_journal(installation_id, limit).await
+    }
+    async fn prune_broker_journal(
+        &self,
+        started_before: i64,
+    ) -> Result<u64, scarab_plugin::PluginStoreError> {
+        self.inner.prune_broker_journal(started_before).await
+    }
+}
+
+/// git-bug 4711823 (1): at shutdown the journal writer writes every entry
+/// queued so far before it stops, with the broker still serving. Without
+/// the drain a rollout lost whatever the queue held. Journal writes are
+/// held while the refusals arrive, so nearly all of them are still queued
+/// when the drain starts.
+#[tokio::test]
+async fn shutdown_writes_the_journal_entries_still_queued() {
+    let open = Arc::new(tokio::sync::Semaphore::new(0));
+    let gate = open.clone();
+    let Some(mut h) = harness_with(move |st| {
+        let held = HeldJournal {
+            inner: st.plugins.clone().expect("plugins are on"),
+            open: gate,
+        };
+        st.with_broker_plugin_store(Arc::new(held))
+    })
+    .await
+    else {
+        return;
+    };
+    let (id, token) = install(&h).await;
+    const REFUSED: usize = 300;
+    for _ in 0..REFUSED {
+        let req = Request::builder()
+            .method("GET")
+            .uri("/_scarab/plugin/v1/connections/vault/v1/secret")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(send(&h.broker, req).await.0, StatusCode::NOT_FOUND);
+    }
+    let drain = h.journal.take().expect("the read proxy is on");
+    let finished = tokio::spawn(drain.finish(Duration::from_secs(10)));
+    open.add_permits(1_000);
+    assert!(finished.await.unwrap(), "the writer finished");
+    // Read once, no waiting: everything queued before the drain is written.
+    let written = h.pg.broker_journal(&id, REFUSED + 10).await.unwrap();
+    assert_eq!(written.len(), REFUSED);
     h.finish().await;
 }

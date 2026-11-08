@@ -1261,6 +1261,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // those Pods, and a scheduler or executor has no business accepting
     // plugin traffic.
     let mut broker_handle: Option<tokio::task::JoinHandle<()>> = None;
+    let mut broker_journal: Option<scarab_server::broker_proxy::BrokerJournalDrain> = None;
     if config.plugins.enabled && config.role.serves_broker() {
         // Its own small pool (red-team F-1): a plugin flood exhausts THIS
         // one — answered 503 — never the pool the API, the engine and an
@@ -1270,11 +1271,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .acquire_timeout(scarab_server::broker::BROKER_POOL_ACQUIRE_TIMEOUT)
             .connect_lazy(&database_url)
             .map_err(|e| format!("broker pool: {e}"))?;
-        let broker = scarab_server::broker::router(
+        let (broker, journal) = scarab_server::broker::router_with_journal(
             state
                 .clone()
                 .with_broker_plugin_store(Arc::new(PostgresDb::with_pool(broker_pool))),
         );
+        broker_journal = journal;
         let listener = tokio::net::TcpListener::bind(&config.plugins.broker_addr).await?;
         println!("broker listening on {}", config.plugins.broker_addr);
         broker_handle = Some(tokio::spawn(async move {
@@ -1348,6 +1350,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(handle) = broker_handle {
         // It got the same signal; give it its own drain, then stop waiting.
         let _ = tokio::time::timeout(Duration::from_secs(10), handle).await;
+    }
+    // Write the broker journal entries still queued (git-bug 4711823): on a
+    // rollout they were lost with the process.
+    if let Some(journal) = broker_journal {
+        if !journal.finish(Duration::from_secs(5)).await {
+            tracing::warn!("shutdown: the broker journal was not written within 5s");
+        }
     }
     if let Some(handle) = driver_handle {
         tracing::info!("shutdown: stopping the converged driver");
