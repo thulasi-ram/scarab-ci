@@ -44,7 +44,10 @@ stop_forwards() {
 # VM's, and the host is `host.docker.internal`. Rather than guess per
 # platform, a one-shot listener on the host is asked for from a real Pod and
 # the first candidate that answers wins. The listener binds 0.0.0.0 for the
-# few seconds of the probe; the tests' own listeners do the same.
+# few seconds of the probe; the tests' own listeners do the same. The Pod also
+# reports the IPv4 address the winner resolved to (`pod_host_ip`): a name such
+# as host.docker.internal resolves only inside the cluster, and a NetworkPolicy
+# ipBlock needs the address.
 probe_pod_host() {
   local port pid cands gw pod phase
   port="$(free_port)"
@@ -69,7 +72,7 @@ http.server.HTTPServer(("0.0.0.0", int(sys.argv[1])), H).serve_forever()
   pod="pod-host-probe-$$"
   kc delete pod "$pod" -n "$ns" --ignore-not-found >/dev/null 2>&1 || true
   kc run "$pod" -n "$ns" --image=busybox:1.36 --restart=Never --command -- sh -c \
-    "for h in $cands; do if wget -q -T 4 -O /dev/null http://\$h:$port/; then echo POD_HOST=\$h; exit 0; fi; done; echo POD_HOST=none" \
+    "for h in $cands; do if wget -q -T 4 -O /dev/null http://\$h:$port/; then echo POD_HOST=\$h; echo POD_HOST_IP=\$(nslookup \$h 2>/dev/null | awk '/^Name:/{n=1} n && /^Address/ && \$NF ~ /^[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+\$/ {print \$NF; exit}'); exit 0; fi; done; echo POD_HOST=none" \
     >/dev/null
   for _ in $(seq 1 60); do
     phase="$(kc get pod "$pod" -n "$ns" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
@@ -77,6 +80,9 @@ http.server.HTTPServer(("0.0.0.0", int(sys.argv[1])), H).serve_forever()
     sleep 1
   done
   pod_host="$(kc logs "$pod" -n "$ns" 2>/dev/null | sed -n 's/^POD_HOST=//p' | tr -d '\r' | head -n 1 || true)"
+  pod_host_ip="$(kc logs "$pod" -n "$ns" 2>/dev/null | sed -n 's/^POD_HOST_IP=//p' | tr -d '\r' | head -n 1 || true)"
+  # An address needs no resolving.
+  case "$pod_host" in *[!0-9.]*|'') ;; *) pod_host_ip="$pod_host" ;; esac
   kc delete pod "$pod" -n "$ns" --ignore-not-found --wait=false >/dev/null 2>&1 || true
   kill "$pid" 2>/dev/null || true
   case "$pod_host" in

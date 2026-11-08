@@ -146,6 +146,9 @@ export SCARAB_E2E_KUBECONFIG="$kubeconfig"
 export SCARAB_E2E_NAMESPACE="$ns"
 export SCARAB_E2E_KIND_NODE="$node"
 export SCARAB_E2E_POD_HOST="$pod_host"
+# The same host as an IPv4 address, as the Pod resolved it ("" if it did not):
+# what a NetworkPolicy ipBlock names.
+export SCARAB_E2E_POD_HOST_IP="${pod_host_ip:-}"
 
 export KUBECONFIG="$kubeconfig"
 export SCARAB_TEST_KUBE=1

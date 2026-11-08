@@ -341,18 +341,24 @@ async fn the_isolation_probe_passes_on_this_cluster() {
 
 /// git-bug da0af59 (12): a `cidr:` broker peer, as a broker outside the
 /// cluster (the server running on the host) is named. The broker here is
-/// the test process itself, serving healthz on the host address a Pod
-/// reaches (`SCARAB_E2E_POD_HOST`, probed from a Pod by `just test e2e`);
-/// the peer is that address as a /32. The isolation probe must pass: the
-/// plugin-labelled Pod reaches the broker through the ipBlock allowance,
-/// and still nothing else.
+/// the test process itself, serving healthz on the host as a Pod reaches it
+/// (`SCARAB_E2E_POD_HOST_IP`: the address a Pod resolved for the host, probed
+/// by `just test e2e`). With that address as the /32 peer the isolation probe
+/// passes: the plugin-labelled Pod reaches the broker through the ipBlock
+/// allowance, and still nothing else. With another /32 it fails on the
+/// broker, so the ipBlock rule is what lets it through, not an exemption of
+/// host traffic.
 #[tokio::test]
 #[ignore]
 async fn a_cidr_peer_lets_a_plugin_reach_a_broker_outside_the_cluster() {
     enter_tier();
-    let pod_host = std::env::var("SCARAB_E2E_POD_HOST").expect(
-        "SCARAB_E2E_POD_HOST: the host address a Pod reaches; `just test e2e` probes and sets it",
-    );
+    let host = std::env::var("SCARAB_E2E_POD_HOST_IP")
+        .ok()
+        .filter(|h| h.parse::<std::net::Ipv4Addr>().is_ok())
+        .expect(
+            "SCARAB_E2E_POD_HOST_IP: the IPv4 address a Pod reaches the host at; `just test e2e` \
+             probes and sets it",
+        );
     let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
@@ -372,24 +378,38 @@ async fn a_cidr_peer_lets_a_plugin_reach_a_broker_outside_the_cluster() {
         }
     });
     with_fixture(|f| async move {
-        let runtime = K8sPluginRuntime::new(
-            f.client.clone(),
-            PluginRuntimeConfig {
-                namespace: f.plugins_ns.clone(),
-                broker_url: format!("http://{pod_host}:{port}"),
-                broker_peer: Some(
-                    BrokerPeer::parse(&format!("cidr:{pod_host}/32"))
-                        .expect("the pod host is an IPv4 address"),
-                ),
-                broker_port: port,
-                probe_image: probe_image(),
-                owner: Some(TEST_OWNER.to_string()),
-            },
+        let runtime_with_peer = |peer: &str| {
+            K8sPluginRuntime::new(
+                f.client.clone(),
+                PluginRuntimeConfig {
+                    namespace: f.plugins_ns.clone(),
+                    broker_url: format!("http://{host}:{port}"),
+                    broker_peer: Some(BrokerPeer::parse(peer).expect("a cidr peer")),
+                    broker_port: port,
+                    probe_image: probe_image(),
+                    owner: Some(TEST_OWNER.to_string()),
+                },
+            )
+        };
+
+        // Another address entirely (TEST-NET-1): the broker is unreached.
+        let elsewhere = runtime_with_peer("cidr:192.0.2.1/32");
+        elsewhere.ensure_baseline().await.expect("baseline");
+        let url = elsewhere.pod_broker_url().await.expect("broker URL");
+        let report = elsewhere.probe_isolation(&url).await;
+        assert_eq!(
+            report.verdict,
+            scarab_plugin_k8s::ProbeVerdict::Failed,
+            "{}",
+            report.message()
         );
-        runtime.ensure_baseline().await.expect("baseline");
-        let pod_broker_url = runtime.pod_broker_url().await.expect("broker URL");
-        assert_eq!(pod_broker_url, format!("http://{pod_host}:{port}"));
-        let report = runtime.probe_isolation(&pod_broker_url).await;
+        assert!(report.message().contains("broker"), "{}", report.message());
+
+        let here = runtime_with_peer(&format!("cidr:{host}/32"));
+        here.ensure_baseline().await.expect("baseline");
+        let url = here.pod_broker_url().await.expect("broker URL");
+        assert_eq!(url, format!("http://{host}:{port}"));
+        let report = here.probe_isolation(&url).await;
         assert!(report.passed(), "{}", report.message());
     })
     .await;
