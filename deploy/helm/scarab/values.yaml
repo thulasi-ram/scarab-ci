@@ -541,7 +541,7 @@ workspace:
 # ignores NetworkPolicy fails it — the plugin then stays down, with the reason
 # on its installation (runtime_status probe_failed). A probe that cannot tell
 # (its Pods did not run, say) starts nothing and runs again on the next pass;
-# a plugin already running keeps running until 6 h after the last probe that
+# a plugin already running keeps running until 12 h after the last probe that
 # passed, and is then held the same way.
 plugins:
   enabled: false

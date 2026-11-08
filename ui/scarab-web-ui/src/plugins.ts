@@ -121,7 +121,7 @@ const RUNTIME: Record<string, Badge> = {
     label: "probe failed",
     tone: "danger",
     title:
-      "Held by the isolation probe: it failed (this cluster does not enforce the plugin's NetworkPolicy), or none has passed for 6 hours. The message says which.",
+      "Held by the isolation probe: it failed (this cluster does not enforce the plugin's NetworkPolicy), or none has passed for 12 hours. The message says which.",
   },
   error: { label: "error", tone: "danger", title: "The plugin runtime could not run it." },
   stopped: { label: "stopped", tone: "muted", title: "Not running." },

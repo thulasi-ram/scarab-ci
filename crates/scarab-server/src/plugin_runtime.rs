@@ -22,8 +22,9 @@
 //!    nothing runs on a cluster that does not enforce the policy.
 //!    An inconclusive probe (it could not tell) starts nothing and is run
 //!    again next pass; a workload already running keeps running until its
-//!    last passed probe is [`INCONCLUSIVE_HOLD_AFTER_MS`] old, and is then
-//!    held as a failed probe holds it.
+//!    last passed probe is [`INCONCLUSIVE_HOLD_AFTER_MS`] old (the re-probe
+//!    age plus [`INCONCLUSIVE_GRACE_MS`]), and is then held as a failed
+//!    probe holds it.
 //! 3. **Each installation.** Killed → stopped (scaled to zero, its
 //!    ServiceAccount — and with it every token — deleted). Enabled with a
 //!    passed probe → applied, and its status read back from the cluster.
@@ -61,12 +62,16 @@ pub const RECONCILE_INTERVAL: Duration = Duration::from_secs(15);
 /// A passed probe is trusted this long; a CNI can change under a running
 /// cluster.
 pub const PROBE_MAX_AGE_MS: i64 = 6 * 60 * 60 * 1000;
-/// How long an inconclusive probe keeps a Plugin running under the last
-/// probe that passed for it. Past this, no probe has proven the namespace
-/// for that long, and the Plugin is held as a failed probe holds it, until a
-/// probe passes. Measured from the installation's `probe_passed_at`, which
-/// the store keeps, so a server restart does not reset it.
-pub const INCONCLUSIVE_HOLD_AFTER_MS: i64 = 6 * 60 * 60 * 1000;
+/// How long probes may stay inconclusive after a passed probe falls due for
+/// its re-probe ([`PROBE_MAX_AGE_MS`]) before running Plugins are held.
+pub const INCONCLUSIVE_GRACE_MS: i64 = 6 * 60 * 60 * 1000;
+/// How old the last passed probe may be while probes are inconclusive: the
+/// re-probe age plus the grace, so a scheduled re-probe that cannot tell
+/// does not hold anything at once. Past this the Plugin is held as a failed
+/// probe holds it, until a probe passes. Measured from the installation's
+/// `probe_passed_at`, which the store keeps, so a server restart does not
+/// reset it.
+pub const INCONCLUSIVE_HOLD_AFTER_MS: i64 = PROBE_MAX_AGE_MS + INCONCLUSIVE_GRACE_MS;
 /// How soon a FAILED probe is tried again — without an operator action. An
 /// enable resets the installation, which probes at once.
 pub const PROBE_FAILED_RETRY_MS: i64 = 5 * 60 * 1000;
@@ -223,7 +228,10 @@ pub fn decide(
             Some(earlier) if now.saturating_sub(earlier) >= INCONCLUSIVE_HOLD_AFTER_MS => {
                 Decision::Hold {
                     status: RuntimeStatus::ProbeFailed,
-                    message: format!("held: no isolation probe has passed for 6h ({why})"),
+                    message: format!(
+                        "held: no isolation probe has passed for {}h ({why})",
+                        INCONCLUSIVE_HOLD_AFTER_MS / (60 * 60 * 1000)
+                    ),
                 }
             }
             Some(earlier) => Decision::Run {
@@ -551,7 +559,7 @@ impl PluginRuntimeLoop {
             ProbeVerdict::Inconclusive => tracing::warn!(
                 findings = %report.message(),
                 "plugin runtime: isolation probe inconclusive; running plugins keep running \
-                 until 6h after the last passed probe, none starts, probing again next pass"
+                 until 12h after their last passed probe, none starts, probing again next pass"
             ),
         }
         self.isolation = Isolation {
@@ -812,15 +820,22 @@ mod tests {
     }
 
     /// An inconclusive probe keeps a Plugin running only while its last
-    /// passed probe is under 6 h old; past that the Plugin is held as a
-    /// failed probe holds it, further inconclusive probes leave the hold,
-    /// and a passed probe releases it.
+    /// passed probe is under 12 h old (the 6 h re-probe age plus 6 h of
+    /// grace); past that the Plugin is held as a failed probe holds it,
+    /// further inconclusive probes leave the hold, and a passed probe
+    /// releases it.
     #[test]
-    fn inconclusive_probes_hold_a_plugin_six_hours_after_the_last_pass() {
+    fn inconclusive_probes_hold_a_plugin_twelve_hours_after_the_last_pass() {
         let passed_at = 100 * HOUR_MS;
         let plugin = running(passed_at);
 
-        // Inside the window: today's behaviour, it keeps running.
+        // The scheduled re-probe at 6 h cannot tell: it keeps running.
+        let due = passed_at + PROBE_MAX_AGE_MS;
+        assert!(matches!(
+            decide(&plugin, &ready(), &inconclusive(due), due),
+            Decision::Run { .. }
+        ));
+        // Inside the window: it keeps running.
         let within = passed_at + INCONCLUSIVE_HOLD_AFTER_MS - 1;
         assert_eq!(
             decide(&plugin, &ready(), &inconclusive(within), within),
@@ -830,17 +845,17 @@ mod tests {
             }
         );
 
-        // Six hours without a pass: held.
+        // Twelve hours without a pass: held.
         let past = passed_at + INCONCLUSIVE_HOLD_AFTER_MS;
         let Decision::Hold { status, message } =
             decide(&plugin, &ready(), &inconclusive(past), past)
         else {
-            panic!("expected a hold six hours after the last passed probe");
+            panic!("expected a hold twelve hours after the last passed probe");
         };
         assert_eq!(status, RuntimeStatus::ProbeFailed);
         assert_eq!(
             message,
-            "held: no isolation probe has passed for 6h \
+            "held: no isolation probe has passed for 12h \
              (isolation probe inconclusive: the probe could not run)"
         );
 

@@ -404,7 +404,7 @@ every 6 h, the runtime runs an isolation probe in the namespace. On a cluster
 whose CNI ignores NetworkPolicy the probe fails and the plugin stays down, its
 installation showing `probe_failed` and why. A probe that cannot tell (its Pods
 did not run, say) starts nothing and runs again on the next pass; a plugin
-already running keeps running until 6 h after the last probe that passed, and
+already running keeps running until 12 h after the last probe that passed, and
 is then held as `probe_failed` too, until a probe passes. Each plugin Pod also
 re-checks its own network in an `isolation-self-check` initContainer (the probe
 image) before the plugin starts, on whichever node it landed: the broker
