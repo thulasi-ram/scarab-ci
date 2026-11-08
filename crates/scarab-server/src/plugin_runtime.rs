@@ -459,6 +459,24 @@ impl PluginRuntimeLoop {
         };
     }
 
+    /// Stop the installation's workload, unless it is already down: a
+    /// killed or held installation is visited every pass, and its stop is a
+    /// ServiceAccount delete and a Deployment patch (git-bug da0af59).
+    async fn stop_unless_stopped(&self, installation_id: &str) -> Result<(), String> {
+        if self
+            .runtime
+            .is_stopped(installation_id)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            return Ok(());
+        }
+        self.runtime
+            .stop(installation_id)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     async fn reconcile_installation(
         &self,
         installation: &PluginInstallation,
@@ -468,10 +486,7 @@ impl PluginRuntimeLoop {
             match decide(installation, baseline, &self.isolation) {
                 Decision::Wait => return Ok(()),
                 Decision::Stop => {
-                    self.runtime
-                        .stop(&installation.id)
-                        .await
-                        .map_err(|e| e.to_string())?;
+                    self.stop_unless_stopped(&installation.id).await?;
                     (
                         RuntimeStatus::Stopped,
                         String::new(),
@@ -479,10 +494,7 @@ impl PluginRuntimeLoop {
                     )
                 }
                 Decision::Hold { status, message } => {
-                    self.runtime
-                        .stop(&installation.id)
-                        .await
-                        .map_err(|e| e.to_string())?;
+                    self.stop_unless_stopped(&installation.id).await?;
                     (status, message, None)
                 }
                 Decision::Run {

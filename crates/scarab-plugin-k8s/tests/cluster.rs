@@ -518,7 +518,9 @@ async fn a_workload_is_admitted_stopped_and_uninstalled() {
             vec![INSTALLATION_ID.to_string()]
         );
 
+        assert!(!runtime.is_stopped(INSTALLATION_ID).await.unwrap());
         runtime.stop(INSTALLATION_ID).await.expect("stop");
+        assert!(runtime.is_stopped(INSTALLATION_ID).await.unwrap());
         assert_eq!(
             runtime
                 .workload_state(&installation(&probe_image()))

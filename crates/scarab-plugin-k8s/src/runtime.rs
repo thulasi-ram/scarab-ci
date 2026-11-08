@@ -422,6 +422,29 @@ impl K8sPluginRuntime {
         }
     }
 
+    /// Is the installation's workload already stopped: no ServiceAccount,
+    /// and no Deployment or one at zero replicas? Two reads, so a pass over
+    /// a killed or held installation that is already down writes nothing,
+    /// while one someone scaled back up or re-created is stopped again
+    /// (git-bug da0af59).
+    pub async fn is_stopped(&self, installation_id: &str) -> Result<bool, RuntimeError> {
+        let name = objects::workload_name(installation_id);
+        let service_account = self
+            .namespaced::<ServiceAccount>()
+            .get_opt(&name)
+            .await
+            .map_err(kube_err)?;
+        let deployment = self
+            .namespaced::<Deployment>()
+            .get_opt(&name)
+            .await
+            .map_err(kube_err)?;
+        Ok(already_stopped(
+            service_account.is_some(),
+            deployment.map(|d| d.spec.and_then(|s| s.replicas)),
+        ))
+    }
+
     /// Scale the Deployment `name` to zero; a missing one is fine.
     async fn scale_to_zero(&self, name: &str) -> Result<(), RuntimeError> {
         // A merge patch, not an apply: an apply of `{replicas: 0}` alone
@@ -697,6 +720,13 @@ async fn finished_log(pods: &Api<Pod>, name: &str) -> Result<String, String> {
     }
 }
 
+/// Stopped means the token is revoked (no ServiceAccount) and nothing is
+/// scheduled: no Deployment (`None`), or one whose replicas are zero. A
+/// Deployment with no replicas field runs one.
+fn already_stopped(service_account: bool, deployment_replicas: Option<Option<i32>>) -> bool {
+    !service_account && deployment_replicas.map_or(true, |r| r == Some(0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -804,5 +834,23 @@ mod tests {
             probe_pod_created_at("no-creation-time", None),
         ];
         assert_eq!(stale_probe_pods(&pods, now), vec!["abandoned".to_string()]);
+    }
+
+    /// git-bug da0af59 (11): only a revoked token with nothing scheduled
+    /// counts as stopped; anything else is stopped again.
+    #[test]
+    fn stopped_means_no_service_account_and_nothing_scheduled() {
+        assert!(already_stopped(false, None));
+        assert!(already_stopped(false, Some(Some(0))));
+        assert!(
+            !already_stopped(true, Some(Some(0))),
+            "the token still verifies"
+        );
+        assert!(!already_stopped(false, Some(Some(1))), "scaled back up");
+        assert!(
+            !already_stopped(false, Some(None)),
+            "no replicas field runs one"
+        );
+        assert!(!already_stopped(true, None));
     }
 }
