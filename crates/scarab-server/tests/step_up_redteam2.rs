@@ -895,7 +895,7 @@ async fn an_unlogged_request_confirmation_cannot_be_retried_into_running() {
     let (st, ch) = h.cookie("POST", &options, None, &amy).await;
     assert_eq!(st, StatusCode::OK, "{ch}");
     let cred = soft.assert(&ch["public_key"], ORIGIN).unwrap();
-    h.events.fail_appends(true);
+    h.mem_events().fail_appends(true);
     let (_, first) = h
         .cookie(
             "POST",
@@ -904,7 +904,7 @@ async fn an_unlogged_request_confirmation_cannot_be_retried_into_running() {
             &amy,
         )
         .await;
-    h.events.fail_appends(false);
+    h.mem_events().fail_appends(false);
     assert_ne!(first["state"], "executed", "{first}");
 
     let (st, ch) = h.cookie("POST", &options, None, &amy).await;

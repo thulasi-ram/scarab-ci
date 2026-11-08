@@ -675,7 +675,7 @@ async fn the_pending_cap_is_per_credential_not_per_human() {
         raise(&h, "POST", "/v1/secrets", secret(&format!("b{i}")), &t2).await;
     }
     // 20 pending for one human — the cap did not stop the second credential.
-    assert_eq!(h.step_up.requests().len(), 20);
+    assert_eq!(h.mem_step_up().requests().len(), 20);
     // …but nothing ran.
     assert_eq!(secret_value(&secrets).await, None, "a parked request ran");
 }

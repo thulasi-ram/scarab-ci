@@ -1040,12 +1040,12 @@ async fn r2_project_token_requests_exactly_its_own_project() {
         json!({"org": "acme", "repo": ["web"], "name": "K", "value": "v"}),
         json!({"org": "beta", "repo": "web", "name": "K", "value": "v"}),
     ] {
-        let before = h.step_up.requests().len();
+        let before = h.mem_step_up().requests().len();
         let (st, b) = h
             .bearer("POST", "/v1/secrets", Some(body.clone()), &t)
             .await;
         assert!(!raised(st, &b), "{body} raised: {b}");
-        assert_eq!(h.step_up.requests().len(), before, "{body}");
+        assert_eq!(h.mem_step_up().requests().len(), before, "{body}");
     }
     let (st, b) = h
         .bearer("DELETE", "/v1/secrets?org=acme&repo=web&name=K", None, &t)
@@ -1239,7 +1239,7 @@ async fn r2_a_token_reads_no_passkey_after_clone_evidence() {
         assert_eq!(st, StatusCode::FORBIDDEN, "{b}");
     }
     let pk = h
-        .passkeys
+        .mem_passkeys()
         .list("amy")
         .await
         .unwrap()

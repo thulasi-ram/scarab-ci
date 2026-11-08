@@ -77,6 +77,15 @@ pub async fn fresh_db() -> Option<TestDb> {
     })
 }
 
+/// [`fresh_db`], migrated, with a `PostgresDb` over its pool.
+#[allow(dead_code)]
+pub async fn fresh_pg() -> Option<(TestDb, std::sync::Arc<scarab_db_postgres::PostgresDb>)> {
+    let tdb = fresh_db().await?;
+    let pg = std::sync::Arc::new(scarab_db_postgres::PostgresDb::with_pool(tdb.pool.clone()));
+    pg.migrate().await.unwrap();
+    Some((tdb, pg))
+}
+
 /// Replace the database path in a connection URL, preserving query params.
 fn swap_db(url: &str, dbname: &str) -> String {
     let (base, query) = match url.split_once('?') {
