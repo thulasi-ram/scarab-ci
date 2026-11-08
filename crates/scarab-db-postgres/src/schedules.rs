@@ -88,16 +88,27 @@ impl ScheduleStore for PostgresDb {
     async fn due_schedules(
         &self,
         before: Timestamp,
+        after: Option<&ScheduleEntry>,
         limit: u32,
     ) -> Result<Vec<ScheduleEntry>, DbError> {
+        // `$3 IS NULL` reads the first page; otherwise the row comparison
+        // starts after the cursor, in the ORDER BY's own order.
         let rows = sqlx::query(
             "SELECT org, project, pipeline, schedule, next_fire_at, source_sha
              FROM pipeline_schedules WHERE next_fire_at <= $1
+               AND ($3::bigint IS NULL
+                    OR (next_fire_at, org, project, pipeline, schedule)
+                       > ($3, $4, $5, $6, $7))
              ORDER BY next_fire_at, org, project, pipeline, schedule
              LIMIT $2",
         )
         .bind(before.0)
         .bind(limit as i64)
+        .bind(after.map(|e| e.next_fire_at.0))
+        .bind(after.map(|e| e.org.as_str()))
+        .bind(after.map(|e| e.project.as_str()))
+        .bind(after.map(|e| e.pipeline.as_str()))
+        .bind(after.map(|e| e.schedule.as_str()))
         .fetch_all(self.pool())
         .await
         .map_err(db_err)?;

@@ -798,13 +798,16 @@ async fn a_late_launch_teardown_in_a_live_run_spares_the_sibling(w: World) {
     // rerun (both descend from a_x) — that is the late-launch case. What
     // must never happen is a CANCEL_RUN: the run is live.
     assert_eq!(w.run_status("rl").await, RunStatus::Running);
-    let kinds: Vec<String> =
-        w.db.claim_outbox("peek", Some(scarab_engine::CANCEL_RUN), 100, 0)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|m| m.idempotency_key)
-            .collect();
+    let mut kinds: Vec<String> = Vec::new();
+    for kind in [scarab_engine::CANCEL_RUN, scarab_engine::CANCEL_SERVICES] {
+        kinds.extend(
+            w.db.claim_outbox("peek", Some(kind), 100, 0)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|m| m.idempotency_key),
+        );
+    }
     assert!(
         kinds.is_empty(),
         "a Run-wide cancel in a live run: {kinds:?}"

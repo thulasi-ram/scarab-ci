@@ -88,6 +88,18 @@ pub const RUN_FINISHED: &str = "run_finished";
 /// "every step's latest attempt" at drain time killed a rerun's live `a2`).
 pub const CANCEL_RUN: &str = "cancel_run";
 
+/// Outbox message kind: tear down a cancelled Run's shared services
+/// (ADR-0058), written by the Run's `→ Cancelled` commit. It used to be a
+/// [`CANCEL_RUN`] row; it has its own kind because, during a rolling
+/// upgrade, replicas older than the attempt-scoped cancel claim every
+/// `cancel_run` row and tear down each Step's latest attempt, which after a
+/// rerun is the rerun's live one (git-bug aaa559c). They never claim this
+/// kind. The payload keeps its `services` field so one drain body serves
+/// both kinds: `cancel_run` rows written before this kind existed are still
+/// drained. That `cancel_run` claim can go once no binary older than this
+/// one runs and no such row is pending.
+pub const CANCEL_SERVICES: &str = "cancel_services";
+
 /// Outbox message kind: tear down the units of named Attempts a cancel
 /// stopped (ADR-0054). Each step's `→ Cancelled` commit writes one naming
 /// exactly the in-flight Attempt it stamped `Cancelled`, keyed by that
@@ -1846,7 +1858,7 @@ pub async fn record_gate_approval(
 /// Cancel a run from the API (ADR-0054): drive its non-terminal steps and
 /// the run itself to `Cancelled` durably, release its concurrency slot, and
 /// leave the driver an attempt-scoped [`CANCEL_ATTEMPT`] per in-flight unit
-/// (SIGTERM + grace — the executor's `cancel`) and a [`CANCEL_RUN`] for the
+/// (SIGTERM + grace — the executor's `cancel`) and a [`CANCEL_SERVICES`] for the
 /// Run's shared services. Returns `Ok(false)` when the run is unknown or
 /// already terminal (nothing to do).
 pub async fn cancel_run_request(
@@ -1867,7 +1879,7 @@ pub async fn cancel_run_request(
     // team A3), and names exactly what that transition stops (red team
     // R2-E1): each Step's `→ Cancelled` carries the [`CANCEL_ATTEMPT`] of the
     // in-flight Attempt it stamps `Cancelled` ([`cancel_step`]), the Run's
-    // `→ Cancelled` the [`CANCEL_RUN`] of its shared services. An intent is
+    // `→ Cancelled` the [`CANCEL_SERVICES`] of its shared services. An intent is
     // what gets a cancelled Step's unit torn down (git-bug f22056d), so no
     // Step may go `Cancelled` without its own (review MED1); nor may
     // one exist without its transition (a cancel that then failed must not
@@ -1908,6 +1920,22 @@ pub async fn cancel_run_request(
     Ok(true)
 }
 
+/// Whether the Run's latest operator cancel request still stands: no rerun
+/// or retry was requested after it (git-bug 0962583).
+fn cancel_request_stands(events: &[EventKind]) -> bool {
+    let mut stands = false;
+    for e in events {
+        match &e.kind {
+            EventPayload::RunCancelRequested { .. } => stands = true,
+            EventPayload::RunRerunRequested { .. } | EventPayload::StepRetryRequested { .. } => {
+                stands = false
+            }
+            _ => {}
+        }
+    }
+    stands
+}
+
 /// The [`CANCEL_ATTEMPT`] intent for one attempt of `step` whose unit must
 /// go: the driver tears down exactly that attempt's unit, until it is gone.
 ///
@@ -1939,7 +1967,7 @@ fn cancel_attempt_intent(
     }
 }
 
-/// The [`CANCEL_RUN`] intent of a Run's `→ Cancelled` commit: tear down its
+/// The [`CANCEL_SERVICES`] intent of a Run's `→ Cancelled` commit: tear down its
 /// shared services (ADR-0058), which no Attempt names. It names no step
 /// unit and the drain touches none.
 ///
@@ -1972,7 +2000,7 @@ fn cancel_services_intent_through(run: &RunId, through_take: i64, now: Timestamp
     OutboxMessage {
         id: crate::OutboxId(0),
         run: run.clone(),
-        kind: CANCEL_RUN.to_string(),
+        kind: CANCEL_SERVICES.to_string(),
         payload: serde_json::json!({ "services": true, "through_take": through_take }),
         idempotency_key: format!("cancel:{}:services:{:016x}", run.0, nonce.finish()),
         at: now,
@@ -3044,16 +3072,29 @@ impl<'a> Scheduler<'a> {
             if let Err(e) = outcome {
                 let failures = self.db.record_outbox_failure(msg.id).await?;
                 if failures >= MAX_DELIVERY_ATTEMPTS {
+                    let mut reason = format!(
+                        "outbox message `{}` (id {}) exceeded {MAX_DELIVERY_ATTEMPTS} \
+                         failed deliveries — poison; last error: {e}",
+                        msg.kind, msg.id.0
+                    );
+                    // Each failed delivery may have created the unit and then
+                    // failed before its handle was recorded (git-bug d1b5f72).
+                    // Once the intent is dead-lettered its `launch:` key is no
+                    // longer pending, so the attempt teardown that
+                    // `dead_letter_run` writes would find no handle, retire
+                    // as "gone" and leave the unit running. Record the
+                    // deterministic handle first, with a teardown of its
+                    // own. Best-effort, like the rest
+                    // of the dead-letter (ADR-0059): a failure is reported in
+                    // the diagnostic, never a reason to skip the dead-letter.
+                    if let Err(adopt) = self.adopt_unit_of_poison_launch(&msg).await {
+                        reason.push_str(&format!(
+                            " (recording the launch's unit also failed, a step Pod may \
+                             be orphaned: {adopt})"
+                        ));
+                    }
                     self.db.dead_letter_outbox(msg.id).await?;
-                    self.dead_letter_run(
-                        &msg.run,
-                        format!(
-                            "outbox message `{}` (id {}) exceeded {MAX_DELIVERY_ATTEMPTS} \
-                             failed deliveries — poison; last error: {e}",
-                            msg.kind, msg.id.0
-                        ),
-                    )
-                    .await?;
+                    self.dead_letter_run(&msg.run, reason).await?;
                 }
             }
         }
@@ -3126,7 +3167,8 @@ impl<'a> Scheduler<'a> {
     /// Drain cancel-teardown intents (ADR-0054): every [`CANCEL_ATTEMPT`]
     /// tears down exactly the attempts it names
     /// ([`drain_attempt_teardowns`](Self::drain_attempt_teardowns)), and
-    /// every [`CANCEL_RUN`] the cancelled Run's shared services (ADR-0058),
+    /// every [`CANCEL_SERVICES`] (and a legacy [`CANCEL_RUN`]) the cancelled
+    /// Run's shared services (ADR-0058),
     /// which are not steps and so are reached by no attempt intent and by no
     /// later tick. A message is retired only once everything it names reached
     /// the desired end state; a genuinely failed teardown is retried rather
@@ -3138,15 +3180,28 @@ impl<'a> Scheduler<'a> {
     /// otherwise tear down the rerun's fresh, live attempt.
     pub async fn reconcile_cancellations(&self) -> Result<(), SchedulerError> {
         self.drain_attempt_teardowns(CANCEL_ATTEMPT).await?;
-        let msgs = self
+        // The services intent's own kind first, then `cancel_run`: an older
+        // binary's null-payload cancel, or a services row written before
+        // CANCEL_SERVICES existed (git-bug aaa559c). One body serves both.
+        let mut msgs = self
             .db
             .claim_outbox(
                 &self.owner,
-                Some(CANCEL_RUN),
+                Some(CANCEL_SERVICES),
                 self.cfg.outbox_batch,
                 self.cfg.outbox_visibility_ms,
             )
             .await?;
+        msgs.extend(
+            self.db
+                .claim_outbox(
+                    &self.owner,
+                    Some(CANCEL_RUN),
+                    self.cfg.outbox_batch,
+                    self.cfg.outbox_visibility_ms,
+                )
+                .await?,
+        );
         for msg in msgs {
             // Per-MESSAGE fault isolation (ADR-0059): the body's own `?` sites
             // (the db reads) would otherwise abort the whole tick for every run,
@@ -3548,6 +3603,32 @@ impl<'a> Scheduler<'a> {
             .set_attempt_handle(run, step, attempt, &handle.0)
             .await?;
         self.enqueue_late_launch_teardown(run, step, attempt).await
+    }
+
+    /// Record the unit of a launch intent about to be dead-lettered as poison
+    /// (git-bug d1b5f72), when no handle is stored yet, and owe its teardown.
+    /// See [`adopt_unit_of_refused_launch`](Self::adopt_unit_of_refused_launch),
+    /// which this calls: the same gap, reached by exhausting deliveries
+    /// instead of by a refusal. That also enqueues the attempt's `:launch`
+    /// CANCEL_ATTEMPT; `dead_letter_run` then writes the attempt's own one
+    /// too, and the second cancel of a unit already gone costs one idempotent
+    /// call.
+    async fn adopt_unit_of_poison_launch(&self, msg: &OutboxMessage) -> Result<(), SchedulerError> {
+        let intent: LaunchIntent = serde_json::from_value(msg.payload.clone())
+            .map_err(|e| SchedulerError::BadPayload(e.to_string()))?;
+        let run = RunId(intent.run);
+        let step = StepId(intent.step);
+        let attempt = AttemptId(intent.attempt);
+        if self
+            .db
+            .attempt_handle(&run, &step, &attempt)
+            .await?
+            .is_some()
+        {
+            return Ok(());
+        }
+        self.adopt_unit_of_refused_launch(&run, &step, &attempt)
+            .await
     }
 
     /// Process one launch intent: launch-or-adopt, poll, settle. Extracted so
@@ -4238,6 +4319,9 @@ impl<'a> Scheduler<'a> {
     /// - **`Failed`** — code produced a failing *verdict*: a `Step` failure
     ///   (incl. an exhausted opt-in retry), a `Timeout`, or a cancelled step.
     ///   The developer signal.
+    /// - **`Cancelled`** — a step is cancelled and the Run's latest operator
+    ///   cancel request still stands (no rerun or retry since): a cancel
+    ///   whose own Run commit never landed (git-bug 0962583).
     /// - **`DeadLettered`** — the system could not obtain a verdict: infra
     ///   retries exhausted or a lost execution. The operator signal, with
     ///   diagnostics on the event log.
@@ -4286,7 +4370,16 @@ impl<'a> Scheduler<'a> {
         let outcome = if !dead.is_empty() {
             RunStatus::DeadLettered
         } else if failed {
-            RunStatus::Failed
+            // An operator cancel writes its request first, then each Step,
+            // then the Run (`cancel_run_request`). A Cancelled Step under a
+            // request no rerun or retry has answered since is that cancel,
+            // interrupted before its Run commit: finish it (git-bug 0962583).
+            let cancelled = steps.iter().any(|s| s.status == StepStatus::Cancelled);
+            if cancelled && cancel_request_stands(&self.db.events(run).await?) {
+                RunStatus::Cancelled
+            } else {
+                RunStatus::Failed
+            }
         } else {
             RunStatus::Succeeded
         };
@@ -4350,7 +4443,7 @@ impl<'a> Scheduler<'a> {
         // The same teardown an operator cancel leaves (review fit-F3), never
         // a supersession: a cancel is not a Superseded attempt (CONTEXT.md).
         // Each step's commit carries the [`CANCEL_ATTEMPT`] of the attempt it
-        // stamps, the Run's the [`CANCEL_RUN`] of its shared services
+        // stamps, the Run's the [`CANCEL_SERVICES`] of its shared services
         // ([`cancel_run_request`] says why). The best-effort cancel below
         // only ASKS each unit to stop; an intent re-cancels until its unit is
         // GONE (git-bug f22056d) — so an inline cancel that fails is retried

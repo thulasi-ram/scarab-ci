@@ -70,8 +70,8 @@ const DEFAULT_BACKOFF_MS: i64 = 60_000;
 /// check older than this (the leader stalled, or the database was down) is
 /// made again, never reused.
 const REUSE_MAX_AGE_MS: i64 = CHECK_EARLY_MS + 2 * TICK_MS as i64;
-/// Due rows read per tick.
-const DUE_BATCH: u32 = 500;
+/// Due rows read per page; a tick reads every page.
+pub const DUE_BATCH: u32 = 500;
 /// How long fired slots are kept: the schedules list shows the last one.
 const FIRES_KEPT_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 /// How often old fired slots are pruned.
@@ -446,10 +446,22 @@ impl CronScheduler {
                 tracing::warn!("cron: pruning old fires failed: {e}");
             }
         }
-        let due = store
-            .due_schedules(Timestamp(now + CHECK_EARLY_MS), DUE_BATCH)
-            .await
-            .map_err(|e| e.to_string())?;
+        // Every due row, read a page at a time so no one query is unbounded,
+        // before any is grouped: a project's rows can span pages (git-bug
+        // 237ab13).
+        let before = Timestamp(now + CHECK_EARLY_MS);
+        let mut due: Vec<ScheduleEntry> = Vec::new();
+        loop {
+            let page = store
+                .due_schedules(before, due.last(), DUE_BATCH)
+                .await
+                .map_err(|e| e.to_string())?;
+            let last_page = page.len() < DUE_BATCH as usize;
+            due.extend(page);
+            if last_page {
+                break;
+            }
+        }
         let mut groups: BTreeMap<ProjectKey, Vec<ScheduleEntry>> = BTreeMap::new();
         for row in due {
             groups

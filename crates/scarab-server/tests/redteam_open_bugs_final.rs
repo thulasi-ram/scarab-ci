@@ -26,8 +26,8 @@ use scarab_engine::ExecError;
 use scarab_engine::{
     cancel_run_request, rerun_step, Attempt, AttemptId, AttemptOutcome, Clock, Db, DeployContext,
     EventKind, EventPayload, OutboxId, OutboxMessage, RunId, RunStatus, Scheduler, ServiceStatus,
-    StepId, StepRun, StepSpec, StepStatus, Timestamp, CANCEL_ATTEMPT, CANCEL_RUN, EVENT_VERSION,
-    LAUNCH_STEP, MAX_DELIVERY_ATTEMPTS, RUN_STATUS_CHANGED,
+    StepId, StepRun, StepSpec, StepStatus, Timestamp, CANCEL_ATTEMPT, CANCEL_RUN, CANCEL_SERVICES,
+    EVENT_VERSION, LAUNCH_STEP, MAX_DELIVERY_ATTEMPTS, RUN_STATUS_CHANGED,
 };
 use scarab_forge::{ForgePort, StatusState};
 use scarab_project::{
@@ -473,6 +473,42 @@ async fn a_unit_created_by_a_failed_launch_is_torn_down_after_a_cancel(w: World)
 both!(a_unit_created_by_a_failed_launch_is_torn_down_after_a_cancel);
 
 // ---------------------------------------------------------------------------
+// F1b (git-bug d1b5f72) — the same created-then-failed launch, but on every
+// delivery, so the launch intent is dead-lettered as poison and the Run with
+// it. The intent is dead-lettered before `dead_letter_run`, so its `launch:`
+// key is no longer pending; the CANCEL_ATTEMPT that `dead_letter_run` writes
+// found no handle and retired as "gone", and the unit ran on.
+// ---------------------------------------------------------------------------
+async fn a_unit_created_by_a_poison_launch_is_torn_down_when_the_run_dead_letters(w: World) {
+    w.seed_plain("rd").await;
+    w.admit("rd").await;
+    let h = handle("rd", "build", "a1");
+
+    let seam = SeamExec::new(w.exec.clone());
+    *seam.create_then_fail.lock().unwrap() = MAX_DELIVERY_ATTEMPTS;
+    let s = Scheduler::new(&*w.db, &w.clock, &seam, "sched").with_outbox_visibility_ms(0);
+    for _ in 0..MAX_DELIVERY_ATTEMPTS {
+        s.reconcile().await.unwrap();
+    }
+    assert!(w.launched(&h), "precondition: the unit was created");
+    assert_eq!(
+        w.run_status("rd").await,
+        RunStatus::DeadLettered,
+        "precondition: the poison launch dead-lettered the Run"
+    );
+
+    w.ticks(5).await;
+    assert!(
+        w.torn_down(&h),
+        "rd's a1 unit (created by launches that then errored) was never torn down after \
+         the Run dead-lettered (cancelled: {:?})",
+        w.exec.cancelled_handles()
+    );
+    w.finish().await;
+}
+both!(a_unit_created_by_a_poison_launch_is_torn_down_when_the_run_dead_letters);
+
+// ---------------------------------------------------------------------------
 // F2 — the round-3 claim: a cancel landing while a launch is IN FLIGHT. The
 // drain sees no handle but a pending `launch:` key → `Launching` (retried);
 // the launch records its handle, sees it is unwanted, finds the attempt
@@ -625,7 +661,7 @@ async fn a_resent_cancel_enqueues_one_services_teardown(w: World) {
     );
     w.scheduler().cancel_run(&rid("rp")).await.unwrap();
     let rows =
-        w.db.claim_outbox("peek", Some(CANCEL_RUN), 100, 0)
+        w.db.claim_outbox("peek", Some(CANCEL_SERVICES), 100, 0)
             .await
             .unwrap();
     assert_eq!(rows.len(), 1, "{rows:?}");
@@ -638,13 +674,42 @@ async fn a_resent_cancel_enqueues_one_services_teardown(w: World) {
         .await
         .unwrap());
     let rows =
-        w.db.claim_outbox("peek", Some(CANCEL_RUN), 100, 0)
+        w.db.claim_outbox("peek", Some(CANCEL_SERVICES), 100, 0)
             .await
             .unwrap();
     assert_eq!(rows.len(), 1, "the second cancel's own row only: {rows:?}");
     w.finish().await;
 }
 both!(a_resent_cancel_enqueues_one_services_teardown);
+
+// ---------------------------------------------------------------------------
+// git-bug aaa559c (b) — a rolling upgrade. Replicas older than the
+// attempt-scoped cancel claim every `cancel_run` row and tear down each
+// Step's latest attempt. The services teardown a cancel writes rode that
+// kind (with a `services` payload), so an old replica draining it after a
+// rerun killed the rerun's live a2. It has its own kind now, which an old
+// replica never claims.
+// ---------------------------------------------------------------------------
+async fn an_old_replica_finds_no_services_teardown_under_its_cancel_kind(w: World) {
+    w.seed_plain("ru").await;
+    w.running_on("ru", "build", "a1").await;
+    assert!(cancel_run_request(&*w.db, &w.clock, &rid("ru"), None)
+        .await
+        .unwrap());
+
+    // The old replica claims before a new one drains. What it claims it
+    // drains later, when a rerun's a2 may be the latest attempt.
+    let old =
+        w.db.claim_outbox("old-replica", Some(CANCEL_RUN), 100, 0)
+            .await
+            .unwrap();
+    assert!(
+        old.is_empty(),
+        "an old replica would tear down the rerun's live a2 for these rows: {old:?}"
+    );
+    w.finish().await;
+}
+both!(an_old_replica_finds_no_services_teardown_under_its_cancel_kind);
 
 // ---------------------------------------------------------------------------
 // F7 — a step claimed (Running) but not yet minted when the cancel lands.
