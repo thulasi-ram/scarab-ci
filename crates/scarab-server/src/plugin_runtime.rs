@@ -20,6 +20,10 @@
 //!    [`PROBE_FAILED_RETRY_MS`] while the last one failed. A failed probe
 //!    stops every workload and marks enabled installations `probe_failed`:
 //!    nothing runs on a cluster that does not enforce the policy.
+//!    An inconclusive probe (it could not tell) starts nothing and is run
+//!    again next pass; a workload already running keeps running until its
+//!    last passed probe is [`INCONCLUSIVE_HOLD_AFTER_MS`] old, and is then
+//!    held as a failed probe holds it.
 //! 3. **Each installation.** Killed → stopped (scaled to zero, its
 //!    ServiceAccount — and with it every token — deleted). Enabled with a
 //!    passed probe → applied, and its status read back from the cluster.
@@ -57,6 +61,12 @@ pub const RECONCILE_INTERVAL: Duration = Duration::from_secs(15);
 /// A passed probe is trusted this long; a CNI can change under a running
 /// cluster.
 pub const PROBE_MAX_AGE_MS: i64 = 6 * 60 * 60 * 1000;
+/// How long an inconclusive probe keeps a Plugin running under the last
+/// probe that passed for it. Past this, no probe has proven the namespace
+/// for that long, and the Plugin is held as a failed probe holds it, until a
+/// probe passes. Measured from the installation's `probe_passed_at`, which
+/// the store keeps, so a server restart does not reset it.
+pub const INCONCLUSIVE_HOLD_AFTER_MS: i64 = 6 * 60 * 60 * 1000;
 /// How soon a FAILED probe is tried again — without an operator action. An
 /// enable resets the installation, which probes at once.
 pub const PROBE_FAILED_RETRY_MS: i64 = 5 * 60 * 1000;
@@ -72,8 +82,10 @@ pub struct Isolation {
     /// `None` = passed (or inconclusive); `Some(why)` = failed.
     pub failure: Option<String>,
     /// `Some(why)` = the last probe could not tell (git-bug da0af59): what
-    /// runs under an earlier passed probe keeps running, nothing new
-    /// starts, and the next pass probes again.
+    /// runs under a probe that passed less than
+    /// [`INCONCLUSIVE_HOLD_AFTER_MS`] ago keeps running, what runs under an
+    /// older one is held, nothing new starts, and the next pass probes
+    /// again.
     pub inconclusive: Option<String>,
     /// What the last probe saw that does not decide the verdict (a reached
     /// kubelet), shown on a running Plugin's status (git-bug da0af59).
@@ -174,14 +186,16 @@ pub enum Decision {
 }
 
 /// Decide one installation from the namespace baseline and the isolation
-/// result. Killed always stops — even when the cluster is flaky, since a
-/// stop is the safe direction; nothing enabled runs without both a baseline
-/// and a passed probe; and a baseline that could not be checked changes
-/// nothing.
+/// result at `now` (Unix-ms). Killed always stops — even when the cluster
+/// is flaky, since a stop is the safe direction; nothing enabled runs
+/// without both a baseline and a passed probe (one at most
+/// [`INCONCLUSIVE_HOLD_AFTER_MS`] old while the probe is inconclusive); and
+/// a baseline that could not be checked changes nothing.
 pub fn decide(
     installation: &PluginInstallation,
     baseline: &Baseline,
     isolation: &Isolation,
+    now: i64,
 ) -> Decision {
     if installation.state == InstallationState::Killed {
         return Decision::Stop;
@@ -198,12 +212,20 @@ pub fn decide(
     };
     if let (None, Some(why)) = (&isolation.failure, &isolation.inconclusive) {
         // Proves nothing: a workload running under an earlier passed probe
-        // keeps running under it; nothing new starts; and a hold stays as
-        // it is, with its definite finding, until a probe passes.
+        // keeps running under it, for a while; nothing new starts; and a
+        // hold stays as it is, with its finding, until a probe passes.
         if installation.held_by_the_runtime() {
             return Decision::Wait;
         }
         return match installation.probe_passed_at {
+            // No probe has passed for too long: hold it as a failed probe
+            // would. A passed probe releases it the same way.
+            Some(earlier) if now.saturating_sub(earlier) >= INCONCLUSIVE_HOLD_AFTER_MS => {
+                Decision::Hold {
+                    status: RuntimeStatus::ProbeFailed,
+                    message: format!("held: no isolation probe has passed for 6h ({why})"),
+                }
+            }
             Some(earlier) => Decision::Run {
                 probe_passed_at: earlier,
                 pod_broker_url: pod_broker_url.clone(),
@@ -452,8 +474,14 @@ impl PluginRuntimeLoop {
             return Ok(());
         }
 
+        // After the probe: it can take minutes, and the hold below measures
+        // from the last passed probe.
+        let now = self.clock.now().await.0;
         for installation in &installations {
-            if let Err(e) = self.reconcile_installation(installation, &baseline).await {
+            if let Err(e) = self
+                .reconcile_installation(installation, &baseline, now)
+                .await
+            {
                 tracing::warn!(
                     installation = %installation.id,
                     org = %installation.org,
@@ -522,8 +550,8 @@ impl PluginRuntimeLoop {
             ),
             ProbeVerdict::Inconclusive => tracing::warn!(
                 findings = %report.message(),
-                "plugin runtime: isolation probe inconclusive; running plugins keep running, \
-                 none starts, probing again next pass"
+                "plugin runtime: isolation probe inconclusive; running plugins keep running \
+                 until 6h after the last passed probe, none starts, probing again next pass"
             ),
         }
         self.isolation = Isolation {
@@ -556,9 +584,10 @@ impl PluginRuntimeLoop {
         &self,
         installation: &PluginInstallation,
         baseline: &Baseline,
+        now: i64,
     ) -> Result<(), String> {
         let (status, message, probe_passed_at) =
-            match decide(installation, baseline, &self.isolation) {
+            match decide(installation, baseline, &self.isolation, now) {
                 Decision::Wait => return Ok(()),
                 Decision::Stop => {
                     self.stop_unless_stopped(&installation.id).await?;
@@ -700,7 +729,7 @@ mod tests {
     fn an_inconclusive_probe_keeps_running_plugins_and_starts_none() {
         let now = 100 * HOUR_MS;
         assert_eq!(
-            decide(&running(now - HOUR_MS), &ready(), &inconclusive(now)),
+            decide(&running(now - HOUR_MS), &ready(), &inconclusive(now), now),
             Decision::Run {
                 probe_passed_at: now - HOUR_MS,
                 pod_broker_url: "http://10.96.0.20:8090".into(),
@@ -708,13 +737,13 @@ mod tests {
         );
         let fresh = installation(InstallationState::Enabled);
         assert_eq!(
-            decide(&fresh, &ready(), &inconclusive(now)),
+            decide(&fresh, &ready(), &inconclusive(now), now),
             Decision::Defer {
                 message: "isolation probe inconclusive: the probe could not run".into()
             }
         );
         assert!(matches!(
-            decide(&running(now - HOUR_MS), &ready(), &failed(now)),
+            decide(&running(now - HOUR_MS), &ready(), &failed(now), now),
             Decision::Hold {
                 status: RuntimeStatus::ProbeFailed,
                 ..
@@ -724,7 +753,8 @@ mod tests {
             decide(
                 &installation(InstallationState::Killed),
                 &ready(),
-                &inconclusive(now)
+                &inconclusive(now),
+                now
             ),
             Decision::Stop
         );
@@ -766,13 +796,76 @@ mod tests {
         let mut held = installation(InstallationState::Enabled);
         held.runtime_status = RuntimeStatus::ProbeFailed;
         held.probe_passed_at = None;
-        assert_eq!(decide(&held, &ready(), &inconclusive(now)), Decision::Wait);
+        assert_eq!(
+            decide(&held, &ready(), &inconclusive(now), now),
+            Decision::Wait
+        );
         held.runtime_status = RuntimeStatus::Error;
-        assert_eq!(decide(&held, &ready(), &inconclusive(now)), Decision::Wait);
+        assert_eq!(
+            decide(&held, &ready(), &inconclusive(now), now),
+            Decision::Wait
+        );
         assert!(matches!(
-            decide(&held, &ready(), &passed(now)),
+            decide(&held, &ready(), &passed(now), now),
             Decision::Run { .. }
         ));
+    }
+
+    /// An inconclusive probe keeps a Plugin running only while its last
+    /// passed probe is under 6 h old; past that the Plugin is held as a
+    /// failed probe holds it, further inconclusive probes leave the hold,
+    /// and a passed probe releases it.
+    #[test]
+    fn inconclusive_probes_hold_a_plugin_six_hours_after_the_last_pass() {
+        let passed_at = 100 * HOUR_MS;
+        let plugin = running(passed_at);
+
+        // Inside the window: today's behaviour, it keeps running.
+        let within = passed_at + INCONCLUSIVE_HOLD_AFTER_MS - 1;
+        assert_eq!(
+            decide(&plugin, &ready(), &inconclusive(within), within),
+            Decision::Run {
+                probe_passed_at: passed_at,
+                pod_broker_url: "http://10.96.0.20:8090".into(),
+            }
+        );
+
+        // Six hours without a pass: held.
+        let past = passed_at + INCONCLUSIVE_HOLD_AFTER_MS;
+        let Decision::Hold { status, message } =
+            decide(&plugin, &ready(), &inconclusive(past), past)
+        else {
+            panic!("expected a hold six hours after the last passed probe");
+        };
+        assert_eq!(status, RuntimeStatus::ProbeFailed);
+        assert_eq!(
+            message,
+            "held: no isolation probe has passed for 6h \
+             (isolation probe inconclusive: the probe could not run)"
+        );
+
+        // What the pass records for a hold: stopped, the probe cleared.
+        let held = PluginInstallation {
+            runtime_status: status,
+            runtime_message: message,
+            probe_passed_at: None,
+            ..plugin
+        };
+        assert!(held.held_by_the_runtime());
+        let later = past + HOUR_MS;
+        assert_eq!(
+            decide(&held, &ready(), &inconclusive(later), later),
+            Decision::Wait
+        );
+
+        // A passed probe releases it, as it releases a failed-probe hold.
+        assert_eq!(
+            decide(&held, &ready(), &passed(later), later),
+            Decision::Run {
+                probe_passed_at: later,
+                pod_broker_url: "http://10.96.0.20:8090".into(),
+            }
+        );
     }
 
     #[test]
@@ -837,7 +930,8 @@ mod tests {
                 decide(
                     &installation(InstallationState::Killed),
                     &ready(),
-                    &isolation
+                    &isolation,
+                    1
                 ),
                 Decision::Stop
             );
@@ -850,7 +944,8 @@ mod tests {
                 decide(
                     &installation(InstallationState::Killed),
                     &baseline,
-                    &passed(1)
+                    &passed(1),
+                    1
                 ),
                 Decision::Stop
             );
@@ -864,12 +959,15 @@ mod tests {
     fn a_transient_kubernetes_error_leaves_running_plugins_alone() {
         let baseline = Baseline::classify(Err(RuntimeError::Kube("503".into())));
         assert!(matches!(baseline, Baseline::Unavailable(_)));
-        assert_eq!(decide(&running(1), &baseline, &passed(1)), Decision::Wait);
+        assert_eq!(
+            decide(&running(1), &baseline, &passed(1), 1),
+            Decision::Wait
+        );
         // Only a refusal holds.
         let refused =
             Baseline::classify(Err(RuntimeError::BaselineRefused("not restricted".into())));
         assert!(matches!(
-            decide(&running(1), &refused, &passed(1)),
+            decide(&running(1), &refused, &passed(1), 1),
             Decision::Hold {
                 status: RuntimeStatus::Error,
                 ..
@@ -881,7 +979,10 @@ mod tests {
             "`scarab-broker`: timeout".into(),
         )));
         assert!(matches!(unresolved, Baseline::Unavailable(_)));
-        assert_eq!(decide(&running(1), &unresolved, &passed(1)), Decision::Wait);
+        assert_eq!(
+            decide(&running(1), &unresolved, &passed(1), 1),
+            Decision::Wait
+        );
     }
 
     #[test]
@@ -891,7 +992,8 @@ mod tests {
             decide(
                 &enabled,
                 &Baseline::Refused("not restricted".into()),
-                &passed(1)
+                &passed(1),
+                1
             ),
             Decision::Hold {
                 status: RuntimeStatus::Error,
@@ -899,18 +1001,18 @@ mod tests {
             }
         );
         assert!(matches!(
-            decide(&enabled, &ready(), &failed(1)),
+            decide(&enabled, &ready(), &failed(1), 1),
             Decision::Hold {
                 status: RuntimeStatus::ProbeFailed,
                 ..
             }
         ));
         assert_eq!(
-            decide(&enabled, &ready(), &Isolation::default()),
+            decide(&enabled, &ready(), &Isolation::default(), 1),
             Decision::Wait
         );
         assert_eq!(
-            decide(&enabled, &ready(), &passed(7)),
+            decide(&enabled, &ready(), &passed(7), 1),
             Decision::Run {
                 probe_passed_at: 7,
                 pod_broker_url: "http://10.96.0.20:8090".into()
