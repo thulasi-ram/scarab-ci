@@ -3034,16 +3034,29 @@ impl<'a> Scheduler<'a> {
             if let Err(e) = outcome {
                 let failures = self.db.record_outbox_failure(msg.id).await?;
                 if failures >= MAX_DELIVERY_ATTEMPTS {
+                    let mut reason = format!(
+                        "outbox message `{}` (id {}) exceeded {MAX_DELIVERY_ATTEMPTS} \
+                         failed deliveries — poison; last error: {e}",
+                        msg.kind, msg.id.0
+                    );
+                    // Each failed delivery may have created the unit and then
+                    // failed before its handle was recorded (git-bug d1b5f72).
+                    // Once the intent is dead-lettered its `launch:` key is no
+                    // longer pending, so the attempt teardown that
+                    // `dead_letter_run` writes would find no handle, retire
+                    // as "gone" and leave the unit running. Record the
+                    // deterministic handle first, with a teardown of its
+                    // own. Best-effort, like the rest
+                    // of the dead-letter (ADR-0059): a failure is reported in
+                    // the diagnostic, never a reason to skip the dead-letter.
+                    if let Err(adopt) = self.adopt_unit_of_poison_launch(&msg).await {
+                        reason.push_str(&format!(
+                            " (recording the launch's unit also failed, a step Pod may \
+                             be orphaned: {adopt})"
+                        ));
+                    }
                     self.db.dead_letter_outbox(msg.id).await?;
-                    self.dead_letter_run(
-                        &msg.run,
-                        format!(
-                            "outbox message `{}` (id {}) exceeded {MAX_DELIVERY_ATTEMPTS} \
-                             failed deliveries — poison; last error: {e}",
-                            msg.kind, msg.id.0
-                        ),
-                    )
-                    .await?;
+                    self.dead_letter_run(&msg.run, reason).await?;
                 }
             }
         }
@@ -3538,6 +3551,32 @@ impl<'a> Scheduler<'a> {
             .set_attempt_handle(run, step, attempt, &handle.0)
             .await?;
         self.enqueue_late_launch_teardown(run, step, attempt).await
+    }
+
+    /// Record the unit of a launch intent about to be dead-lettered as poison
+    /// (git-bug d1b5f72), when no handle is stored yet, and owe its teardown.
+    /// See [`adopt_unit_of_refused_launch`](Self::adopt_unit_of_refused_launch),
+    /// which this calls: the same gap, reached by exhausting deliveries
+    /// instead of by a refusal. That also enqueues the attempt's `:launch`
+    /// CANCEL_ATTEMPT; `dead_letter_run` then writes the attempt's own one
+    /// too, and the second cancel of a unit already gone costs one idempotent
+    /// call.
+    async fn adopt_unit_of_poison_launch(&self, msg: &OutboxMessage) -> Result<(), SchedulerError> {
+        let intent: LaunchIntent = serde_json::from_value(msg.payload.clone())
+            .map_err(|e| SchedulerError::BadPayload(e.to_string()))?;
+        let run = RunId(intent.run);
+        let step = StepId(intent.step);
+        let attempt = AttemptId(intent.attempt);
+        if self
+            .db
+            .attempt_handle(&run, &step, &attempt)
+            .await?
+            .is_some()
+        {
+            return Ok(());
+        }
+        self.adopt_unit_of_refused_launch(&run, &step, &attempt)
+            .await
     }
 
     /// Process one launch intent: launch-or-adopt, poll, settle. Extracted so
