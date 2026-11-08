@@ -1577,3 +1577,43 @@ async fn a_body_holding_the_credential_is_cut_and_a_compressed_one_refused() {
     );
     h.finish().await;
 }
+
+/// git-bug 4711823 (1, red team): a read forwarded before the drain, whose
+/// upstream answers after the drain began, still gets its journal row. Its
+/// slot was reserved before the queue closed; the credential has already
+/// gone upstream.
+#[tokio::test]
+async fn shutdown_writes_the_row_of_a_read_still_waiting_on_its_upstream() {
+    let Some(mut h) = harness().await else {
+        return;
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut s, _) = listener.accept().await.unwrap();
+        let _ = s.read(&mut [0u8; 4096]).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let _ = s
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}")
+            .await;
+    });
+    let (id, token) = install(&h).await;
+    assert_eq!(bind(&h, &base).await.0, StatusCode::OK);
+    let broker = h.broker.clone();
+    let read = tokio::spawn(async move { send(&broker, plugin_get(&token, "/api/version")).await });
+    // The slot is reserved and the request is upstream; no row yet.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let drain = h.journal.take().expect("the read proxy is on");
+    assert!(
+        drain.finish(Duration::from_secs(10)).await,
+        "the writer finished"
+    );
+    assert_eq!(read.await.unwrap().0, StatusCode::OK);
+    let rows = h.pg.broker_journal(&id, 10).await.unwrap();
+    assert!(
+        rows.iter().any(|e| e.phase == BrokerJournalPhase::Head),
+        "the forwarded read has a head row: {rows:?}"
+    );
+    h.finish().await;
+}

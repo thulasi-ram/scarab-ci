@@ -389,17 +389,19 @@ impl BrokerProxy {
         (proxy, drain)
     }
 
+    /// The broker-wide permit first, so a request the broker is too busy
+    /// for spends none of its installation's budget.
     fn try_permit(&self, installation_id: &str) -> Result<ProxyPermit, Limit> {
-        let own = self
-            .permits
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .try_take(installation_id, Instant::now())?;
         let total = self
             .total
             .clone()
             .try_acquire_owned()
             .map_err(|_| Limit::Total)?;
+        let own = self
+            .permits
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .try_take(installation_id, Instant::now())?;
         Ok(ProxyPermit(Arc::new((own, total))))
     }
 
@@ -458,8 +460,15 @@ impl BrokerProxy {
         let Some(tx) = &self.journal else {
             return;
         };
-        if let Err(e) = tx.try_send(entry) {
-            tracing::error!(error = %e, "broker: journal queue full; an end row was dropped");
+        match tx.try_send(entry) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Closed(_)) => tracing::info!(
+                "broker: the journal was closed for shutdown; an open stream's end row was not \
+                 written"
+            ),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::error!("broker: journal queue full; an end row was dropped")
+            }
         }
     }
 
@@ -628,11 +637,26 @@ const AWS_METADATA_V6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0
 /// fe80::/10, where cloud metadata services answer), the unspecified,
 /// broadcast or multicast addresses, or AWS's IPv6 metadata address; to
 /// loopback only when `loopback_allowed`. Private ranges are allowed: the
-/// upstream is usually in the same cluster. An IPv4-mapped IPv6 address is
-/// judged as its IPv4 address.
+/// upstream is usually in the same cluster. An IPv6 address that carries an
+/// IPv4 address a translator would reach (IPv4-mapped `::ffff:0:0/96`, the
+/// NAT64 prefixes `64:ff9b::/96` and `64:ff9b:1::/48`, the IPv4 address in
+/// the last 32 bits) is judged as that IPv4 address; the deprecated
+/// IPv4-compatible `::/96` is refused outright.
 fn upstream_address_allowed(ip: IpAddr, loopback_allowed: bool) -> bool {
     let ip = match ip {
-        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            let last32 = || std::net::Ipv4Addr::from(((s[6] as u32) << 16) | s[7] as u32);
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                IpAddr::V4(v4)
+            } else if s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] || s[..3] == [0x64, 0xff9b, 1] {
+                IpAddr::V4(last32())
+            } else if s[..6] == [0; 6] && !v6.is_loopback() && !v6.is_unspecified() {
+                return false;
+            } else {
+                ip
+            }
+        }
         v4 => v4,
     };
     match ip {
@@ -748,14 +772,16 @@ async fn write_journal(
         fill_batch(&mut rx, &mut batch);
         write_batch(store.as_ref(), &mut batch).await;
     }
-    // Shutdown: refuse new entries (a reserved slot may still send its
-    // one), then write what the queue holds.
+    // Shutdown: refuse new entries, then write what the queue holds. A
+    // read that reserved its slot before the close (it may be waiting on
+    // its upstream, credential already sent) still sends its row: `recv`
+    // returns `None` only once the queue is empty and every reserved slot
+    // has sent or been dropped. `try_recv` would answer `Empty` while one
+    // is outstanding, and that row would be lost.
     rx.close();
-    loop {
+    while let Some(entry) = rx.recv().await {
+        batch.push(entry);
         fill_batch(&mut rx, &mut batch);
-        if batch.is_empty() {
-            return;
-        }
         write_batch(store.as_ref(), &mut batch).await;
     }
 }
@@ -1267,11 +1293,7 @@ async fn send_upstream(
             // The body is read for the credential, which a compressed body
             // would hide. The broker asks for none (no Accept-Encoding goes
             // upstream), so an encoded body is an upstream ignoring that.
-            let encoded = resp
-                .headers()
-                .get(header::CONTENT_ENCODING)
-                .is_some_and(|v| !v.as_bytes().eq_ignore_ascii_case(b"identity"));
-            if encoded {
+            if response_is_encoded(resp.headers()) {
                 tracing::warn!(installation = %installation_id, slot = %slot.name,
                     "broker: the upstream encoded its response; refused");
                 return Err(Refusal::new(
@@ -1570,6 +1592,19 @@ impl Pump {
     }
 }
 
+/// Does the response declare any coding but `identity`, in any of its
+/// `Content-Encoding` headers or any comma-separated value of one? A value
+/// that is not text counts as a coding.
+fn response_is_encoded(headers: &HeaderMap) -> bool {
+    headers.get_all(header::CONTENT_ENCODING).iter().any(|v| {
+        v.to_str().map_or(true, |v| {
+            v.split(',')
+                .map(str::trim)
+                .any(|coding| !coding.is_empty() && !coding.eq_ignore_ascii_case("identity"))
+        })
+    })
+}
+
 /// Add `chunk` to what was `held` back and return what may go to the
 /// Plugin, or `None` if the credential is in it. What is held back is the
 /// longest tail that is a start of the credential, so a credential split
@@ -1645,10 +1680,30 @@ mod tests {
         assert!(held.is_empty());
     }
 
+    /// git-bug 4711823 (3): every Content-Encoding header and every value
+    /// in one is checked.
+    #[test]
+    fn every_content_encoding_value_is_checked() {
+        let headers = |values: &[&'static str]| {
+            let mut h = HeaderMap::new();
+            for v in values {
+                h.append(header::CONTENT_ENCODING, HeaderValue::from_static(v));
+            }
+            h
+        };
+        assert!(!response_is_encoded(&headers(&[])));
+        assert!(!response_is_encoded(&headers(&["identity"])));
+        assert!(!response_is_encoded(&headers(&["Identity"])));
+        assert!(response_is_encoded(&headers(&["gzip"])));
+        assert!(response_is_encoded(&headers(&["identity", "gzip"])));
+        assert!(response_is_encoded(&headers(&["identity, gzip"])));
+        assert!(response_is_encoded(&headers(&["br"])));
+    }
+
     /// git-bug 4711823 (4): which addresses the broker connects to.
     #[test]
     fn the_broker_never_connects_to_link_local_or_loopback() {
-        let cases: [(&str, bool); 16] = [
+        let cases: [(&str, bool); 21] = [
             ("169.254.169.254", false), // cloud metadata
             ("169.254.0.1", false),
             ("fe80::1", false),
@@ -1665,6 +1720,11 @@ mod tests {
             ("10.0.0.5", true), // in-cluster upstreams are private
             ("192.168.1.10", true),
             ("fd12:3456::1", true),
+            ("64:ff9b::a9fe:a9fe", false),   // NAT64 → 169.254.169.254
+            ("64:ff9b:1::a9fe:a9fe", false), // local-use NAT64 prefix
+            ("::a9fe:a9fe", false),          // IPv4-compatible (deprecated)
+            ("::10.0.0.5", false),
+            ("64:ff9b::a00:5", true), // NAT64 → 10.0.0.5
         ];
         for (ip, allowed) in cases {
             assert_eq!(
