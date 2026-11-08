@@ -11051,8 +11051,9 @@ async fn put_secret(
     // keeps a write out of a Duplicate's target until the Duplicate has
     // created it. Deleting the Environment is refused while it holds any.
     // The check and the write hold the Environment name's claim, which a
-    // delete takes too, so the two cannot interleave (git-bug 1a81c63).
-    let _claim = match (&scope, st.environment_governance.as_deref()) {
+    // delete takes too, so the two cannot interleave (git-bug 1a81c63). It
+    // is released before the answer.
+    let claim = match (&scope, st.environment_governance.as_deref()) {
         (
             scarab_secrets::SecretScope::EnvironmentProject {
                 org, environment, ..
@@ -11072,35 +11073,40 @@ async fn put_secret(
         ),
         _ => None,
     };
-    if let (
-        scarab_secrets::SecretScope::EnvironmentProject {
-            org, environment, ..
-        },
-        Some(envs),
-    ) = (&scope, st.org_environments.as_ref())
-    {
-        let exists = envs
-            .get_org_environment(org, environment)
-            .await
-            .map_err(org_environments::org_environment_api_error)?
-            .is_some();
-        if !exists {
-            return Err(ApiError::Conflict(format!(
-                "environment `{environment}` does not exist in `{org}`: create it before \
-                 setting its secrets"
-            )));
-        }
-    }
-    secrets
-        .put(
-            &scope,
-            scarab_secrets::Secret {
-                key: req.name,
-                value: req.value.into_bytes(),
+    let written = async {
+        if let (
+            scarab_secrets::SecretScope::EnvironmentProject {
+                org, environment, ..
             },
-        )
-        .await
-        .map_err(secret_err)?;
+            Some(envs),
+        ) = (&scope, st.org_environments.as_ref())
+        {
+            let exists = envs
+                .get_org_environment(org, environment)
+                .await
+                .map_err(org_environments::org_environment_api_error)?
+                .is_some();
+            if !exists {
+                return Err(ApiError::Conflict(format!(
+                    "environment `{environment}` does not exist in `{org}`: create it before \
+                     setting its secrets"
+                )));
+            }
+        }
+        secrets
+            .put(
+                &scope,
+                scarab_secrets::Secret {
+                    key: req.name,
+                    value: req.value.into_bytes(),
+                },
+            )
+            .await
+            .map_err(secret_err)
+    }
+    .await;
+    org_environments::release_claim(claim).await;
+    written?;
     Ok(StatusCode::NO_CONTENT)
 }
 

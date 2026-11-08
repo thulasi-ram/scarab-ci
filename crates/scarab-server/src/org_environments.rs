@@ -34,10 +34,10 @@ use scarab_project::{
 use scarab_project::{
     eligibility_loosenings, overlay_loosenings, privilege_grant_loosenings, protection_loosenings,
     DeployGovernance, EffectiveProtection, EnvironmentGovernanceStore, EnvironmentMigrationReport,
-    EnvironmentMigrationReportProject, EnvironmentProjectEligibility, EnvironmentProjectOverlay,
-    EnvironmentProjectPrivilegeGrant, EnvironmentProjectRecord, EnvironmentProtectionRules,
-    ImageGrant, Loosening, MissingGateMode, OrgEnvironment, OrgEnvironmentError, ProtectionRules,
-    WritePrecondition,
+    EnvironmentMigrationReportProject, EnvironmentNameClaim, EnvironmentProjectEligibility,
+    EnvironmentProjectOverlay, EnvironmentProjectPrivilegeGrant, EnvironmentProjectRecord,
+    EnvironmentProtectionRules, ImageGrant, Loosening, MissingGateMode, OrgEnvironment,
+    OrgEnvironmentError, ProtectionRules, WritePrecondition,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -497,9 +497,9 @@ pub(crate) async fn put_org_environment(
         updated_by: principal.subject,
     };
     environment.validate().map_err(org_environment_api_error)?;
-    // Held to the end of this function, through the write. Only a create
+    // Held through the write and released before the answer. Only a create
     // claims: a Duplicate never writes under a name that exists.
-    let _claim = match st.environment_governance.as_deref() {
+    let claim = match st.environment_governance.as_deref() {
         Some(governance)
             if store
                 .get_org_environment(&environment.org, &environment.name)
@@ -521,12 +521,26 @@ pub(crate) async fn put_org_environment(
         }
         _ => None,
     };
-    crate::note_org(&st, &environment.org).await?;
-    let stored = store
-        .put_org_environment_if(&environment, &precondition)
-        .await
-        .map_err(org_environment_api_error)?;
+    let stored = async {
+        crate::note_org(&st, &environment.org).await?;
+        store
+            .put_org_environment_if(&environment, &precondition)
+            .await
+            .map_err(org_environment_api_error)
+    }
+    .await;
+    release_claim(claim).await;
+    let stored = stored?;
     Ok((etag_header(&stored), Json((&stored).into())))
+}
+
+/// Free a handler's claim on an Environment name, and wait until it is
+/// free, before the handler answers: a caller's next request on the name
+/// must not find it still held. See [`EnvironmentNameClaim`].
+pub(crate) async fn release_claim(claim: Option<EnvironmentNameClaim>) {
+    if let Some(claim) = claim {
+        claim.release().await;
+    }
 }
 
 /// Delete an Environment and its eligibility. Administer on the Org.
@@ -555,13 +569,28 @@ pub(crate) async fn delete_org_environment(
     headers: HeaderMap,
     Path((org, env)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
+    let mut claim = None;
+    let answer = delete_org_environment_holding(st, headers, org, env, &mut claim).await;
+    release_claim(claim).await;
+    answer
+}
+
+/// [`delete_org_environment`], keeping the claim it takes in `claim` for
+/// the caller to release.
+async fn delete_org_environment_holding(
+    st: AppState,
+    headers: HeaderMap,
+    org: String,
+    env: String,
+    claim: &mut Option<EnvironmentNameClaim>,
+) -> Result<StatusCode, ApiError> {
     let scope = rbac_scope(&org, None);
     authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
     let store = st.org_environments.as_ref().ok_or(ApiError::NotFound)?;
     // Held through the secret check and the delete: a secret write into
     // this Environment takes the same claim, so it cannot land between the
     // two (git-bug 1a81c63).
-    let _claim = match st.environment_governance.as_deref() {
+    *claim = match st.environment_governance.as_deref() {
         Some(governance) => Some(
             governance
                 .claim_environment_name(&org, &env)
@@ -866,6 +895,22 @@ pub(crate) async fn duplicate_org_environment(
     Path((org, env)): Path<(String, String)>,
     Json(body): Json<DuplicateOrgEnvironmentRequest>,
 ) -> Result<(StatusCode, Json<DuplicateOrgEnvironmentResponse>), ApiError> {
+    let mut claim = None;
+    let answer = duplicate_org_environment_holding(st, headers, org, env, body, &mut claim).await;
+    release_claim(claim).await;
+    answer
+}
+
+/// [`duplicate_org_environment`], keeping the claim it takes in `claim`
+/// for the caller to release.
+async fn duplicate_org_environment_holding(
+    st: AppState,
+    headers: HeaderMap,
+    org: String,
+    env: String,
+    body: DuplicateOrgEnvironmentRequest,
+    claim: &mut Option<EnvironmentNameClaim>,
+) -> Result<(StatusCode, Json<DuplicateOrgEnvironmentResponse>), ApiError> {
     let scope = rbac_scope(&org, None);
     let principal = authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
     let store = governance_store(&st)?;
@@ -878,12 +923,13 @@ pub(crate) async fn duplicate_org_environment(
     };
     validate_org_environment_display_name(&display_name).map_err(org_environment_api_error)?;
     // Held to the end of this function: from the checks below through the
-    // secret writes, the Environment's transaction and any cleanup. A second
+    // secret writes, the Environment's transaction and any cleanup. The
+    // caller releases it before answering. A second
     // Duplicate to the same name is refused here, before it writes anything,
     // and a create of the name by the PUT is refused while this is held, so
     // the cleanup never deletes secrets another Environment of the name
     // holds.
-    let Some(_claim) = store
+    let Some(held) = store
         .claim_environment_name(&org, &new_name)
         .await
         .map_err(org_environment_api_error)?
@@ -892,6 +938,7 @@ pub(crate) async fn duplicate_org_environment(
             "another duplicate to environment `{new_name}`, or a create of it, is in progress"
         )));
     };
+    *claim = Some(held);
     if store
         .org_environment(&org, &new_name)
         .await

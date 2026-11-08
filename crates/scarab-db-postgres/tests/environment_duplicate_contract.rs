@@ -265,6 +265,23 @@ async fn a_claim_excludes_a_second_until_dropped(s: &dyn EnvironmentGovernanceSt
     assert!(again.is_some(), "the claim is released once dropped");
 }
 
+/// git-bug 86fa83c: when `release` returns, a second claim on the name
+/// succeeds at once, with no wait. A server answers a request only after
+/// releasing its claim, so the caller's next request on the name never
+/// finds it held. Postgres frees a merely dropped claim a moment after the
+/// drop; repeating the release and the re-claim catches a release that
+/// returns before the claim is free.
+async fn a_claim_is_free_when_its_release_returns(s: &dyn EnvironmentGovernanceStore) {
+    for round in 0..500 {
+        let claim = s
+            .claim_environment_name("acme", "prod-eu")
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("round {round}: the claim was not free after its release"));
+        claim.release().await;
+    }
+}
+
 macro_rules! contract_test {
     ($name:ident, $contract:ident) => {
         mod $name {
@@ -307,6 +324,10 @@ contract_test!(
 contract_test!(
     a_name_claim_is_exclusive,
     a_claim_excludes_a_second_until_dropped
+);
+contract_test!(
+    a_released_claim_is_free_at_once,
+    a_claim_is_free_when_its_release_returns
 );
 
 /// The Postgres duplicate copies every column of these tables, a column a
@@ -431,5 +452,43 @@ async fn display_name_round_trips_on_postgres() {
         .await,
         Err(OrgEnvironmentError::Invalid(_))
     ));
+    tdb.cleanup().await;
+}
+
+/// git-bug 86fa83c: when `release` returns, Postgres holds no advisory lock
+/// for the claim. A claim that is merely dropped is rolled back later, by a
+/// task sqlx starts when the connection goes back to the pool, so right
+/// after the drop the lock is still held. The lock table is read on a
+/// connection set aside before the claims, in this test's own database.
+#[tokio::test]
+async fn postgres_a_released_claim_leaves_no_lock_held() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = PostgresDb::with_pool(tdb.pool.clone());
+    db.migrate().await.unwrap();
+    let mut watcher = tdb.pool.acquire().await.unwrap();
+    for round in 0..200 {
+        let claim = db
+            .claim_environment_name("acme", "prod-eu")
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("round {round}: the name was still claimed"));
+        claim.release().await;
+        let held: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_locks
+             WHERE locktype = 'advisory' AND granted
+               AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+        )
+        .fetch_one(&mut *watcher)
+        .await
+        .unwrap();
+        assert_eq!(
+            held, 0,
+            "round {round}: the claim's lock outlived its release"
+        );
+    }
+    drop(watcher);
     tdb.cleanup().await;
 }

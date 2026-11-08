@@ -890,8 +890,10 @@ impl EnvironmentGovernanceStore for PostgresDb {
         // (length-prefixed, so no two pairs share a string); a collision
         // costs a spurious 409, never a lost write. `try` rather than wait:
         // a waiter would hold a pooled connection the holder may need.
-        // Dropping the transaction rolls it back when its connection goes
-        // back to the pool, which releases the lock.
+        // Releasing rolls the transaction back and waits for it, which
+        // frees the lock. A dropped claim drops the transaction, which sqlx
+        // rolls back when its connection goes back to the pool, a moment
+        // later.
         let mut tx = self
             .pool()
             .begin()
@@ -904,7 +906,15 @@ impl EnvironmentGovernanceStore for PostgresDb {
                 .fetch_one(&mut *tx)
                 .await
                 .map_err(org_environment_store_err)?;
-        Ok(locked.then(|| EnvironmentNameClaim::new(tx)))
+        Ok(locked.then(|| {
+            EnvironmentNameClaim::released_by(move || async move {
+                // A failed rollback leaves a connection sqlx will not reuse;
+                // closing it ends the session, which frees the lock too.
+                if let Err(e) = tx.rollback().await {
+                    tracing::warn!(error = %e, "releasing an environment name claim");
+                }
+            })
+        }))
     }
 
     async fn duplicate_environment(
