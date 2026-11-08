@@ -99,3 +99,6 @@ libc = "0.2"
 # ADR-0073 tests: a software passkey (a true external — the authenticator).
 scarab-webauthn = { workspace = true, features = ["soft-authenticator"] }
 tempfile = { workspace = true }
+# `tokio::time::pause`/`advance`: a test moves the broker's cache clock past
+# CREDENTIAL_MAX_AGE without waiting a minute.
+tokio = { workspace = true, features = ["test-util"] }

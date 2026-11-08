@@ -31,8 +31,10 @@ use scarab_plugin::{
     BrokerJournalEntry, BrokerJournalPhase, PluginStore, PluginTokenVerifier, TokenRejected,
     VerifiedServiceAccount,
 };
-use scarab_secrets::{SecretProvider, SecretScope};
-use scarab_server::broker_proxy::{KILL_RECHECK_INTERVAL, PROXY_CONCURRENCY_PER_INSTALLATION};
+use scarab_secrets::{Secret, SecretProvider, SecretScope};
+use scarab_server::broker_proxy::{
+    CREDENTIAL_MAX_AGE, KILL_RECHECK_INTERVAL, PROXY_CONCURRENCY_PER_INSTALLATION,
+};
 use scarab_server::plugins::{PluginPolicy, PLUGIN_CONNECTION_CREDENTIALS_ORG};
 use scarab_server::{broker, router, AppState, LogService};
 use scarab_testkit::{FakeClock, FakeSecrets, InMemoryDb, InMemoryObjectStore};
@@ -1478,6 +1480,89 @@ async fn a_bound_credential_is_read_once_and_a_rebind_replaces_it() {
             format!("Bearer {ARGO_TOKEN}"),
             "Bearer argo-token-rotated".to_string(),
         ]
+    );
+    h.finish().await;
+}
+
+/// Move Tokio's clock (the broker's cache clock) forward by `by`, then let
+/// it run in real time again from there.
+async fn skip_ahead(by: Duration) {
+    tokio::time::pause();
+    tokio::time::advance(by).await;
+    tokio::time::resume();
+}
+
+/// A secret rotated or deleted in the store itself, not through a re-bind,
+/// stops being sent once the cached value is [`CREDENTIAL_MAX_AGE`] old: a
+/// rotated one is read and sent, a deleted one refused (409, journaled
+/// `credential missing`) and nothing reaches the upstream. Before that age
+/// the cached value is sent, without reading the store again.
+#[tokio::test]
+async fn a_credential_changed_in_the_store_is_read_again_after_its_max_age() {
+    let Some(h) = harness().await else {
+        return;
+    };
+    let (up, base) = spawn_upstream().await;
+    let (id, token) = install(&h).await;
+    assert_eq!(bind(&h, &base).await.0, StatusCode::OK);
+    let (status, _, body) = send(&h.broker, plugin_get(&token, "/api/version")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Rotated out of band: same key, new value.
+    let key = h.secrets.list_scoped(&plugin_scope()).await.unwrap()[0].clone();
+    h.secrets
+        .put(
+            &plugin_scope(),
+            Secret {
+                key: key.clone(),
+                value: b"argo-token-rotated-in-the-store".to_vec(),
+            },
+        )
+        .await
+        .unwrap();
+    skip_ahead(CREDENTIAL_MAX_AGE - Duration::from_secs(2)).await;
+    let (status, _, body) = send(&h.broker, plugin_get(&token, "/api/version")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    skip_ahead(Duration::from_secs(3)).await;
+    let (status, _, body) = send(&h.broker, plugin_get(&token, "/api/version")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        up.seen().last().unwrap().headers["authorization"],
+        "Bearer argo-token-rotated-in-the-store",
+        "past the max age the store is read again"
+    );
+
+    // Deleted out of band.
+    h.secrets.delete(&plugin_scope(), &key).await.unwrap();
+    let (status, _, body) = send(&h.broker, plugin_get(&token, "/api/version")).await;
+    assert_eq!(status, StatusCode::OK, "still within the max age: {body}");
+    skip_ahead(CREDENTIAL_MAX_AGE + Duration::from_secs(1)).await;
+    let (status, _, body) = send(&h.broker, plugin_get(&token, "/api/version")).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("has no credential"), "{body}");
+
+    let sent: Vec<String> = up
+        .seen()
+        .iter()
+        .map(|s| s.headers["authorization"].to_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        sent,
+        [
+            format!("Bearer {ARGO_TOKEN}"),
+            // Within the max age: the cached value, the store not read.
+            format!("Bearer {ARGO_TOKEN}"),
+            "Bearer argo-token-rotated-in-the-store".to_string(),
+            "Bearer argo-token-rotated-in-the-store".to_string(),
+        ],
+        "nothing reached the upstream after the deletion"
+    );
+    let entries = journal_until(&h.pg, &id, |e| e.iter().any(|e| e.status == Some(409))).await;
+    let refused: Vec<_> = entries.iter().filter(|e| e.status == Some(409)).collect();
+    assert_eq!(refused.len(), 1, "{entries:#?}");
+    assert_eq!(
+        refused[0].denied_reason.as_deref(),
+        Some("credential missing")
     );
     h.finish().await;
 }
