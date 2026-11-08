@@ -13,8 +13,8 @@ import { me } from "./session";
 import { getOrgSecuritySummary } from "./api/client";
 import { bannerText } from "./security";
 import { orgHref } from "./settings-nav";
-import glyphInk from "./assets/brand/scarab-square-ink.svg";
-import glyphCream from "./assets/brand/scarab-square-cream.svg";
+import glyphInk from "./assets/brand/scarab.svg";
+import glyphCream from "./assets/brand/scarab-dark.svg";
 
 export default function Layout(props: ParentProps) {
   // Step-up posture for callers who administer an Org: a crown
@@ -27,9 +27,9 @@ export default function Layout(props: ParentProps) {
     <div class="app">
       <nav class="topbar">
         <A href="/" class="brand" end>
-          {/* The beetle mark (ui/brand): ink on the light theme, cream on the dark one. */}
-          <img class="brand-emblem brand-emblem--light" src={glyphInk} alt="" width={40} height={40} />
-          <img class="brand-emblem brand-emblem--dark" src={glyphCream} alt="" width={40} height={40} />
+          {/* The beetle mark (ui/brand): ink and gold on the light theme, cream and gold on the dark one. */}
+          <img class="brand-emblem brand-emblem--light" src={glyphInk} alt="" width={44} height={30} />
+          <img class="brand-emblem brand-emblem--dark" src={glyphCream} alt="" width={44} height={30} />
           <span>Scarab</span>
         </A>
         <span class="topbar-spacer" />
