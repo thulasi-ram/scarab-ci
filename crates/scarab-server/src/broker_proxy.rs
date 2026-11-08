@@ -100,6 +100,9 @@ const RETRY_AFTER_TOO_MANY_SECS: u64 = 1;
 const RETRY_AFTER_BUSY_SECS: u64 = 5;
 /// Response chunks buffered between the upstream and the Plugin.
 const STREAM_BUFFER_CHUNKS: usize = 16;
+/// An upstream client unused this long is dropped; the next request for its
+/// CA builds a new one.
+const CLIENT_IDLE: Duration = Duration::from_secs(10 * 60);
 
 /// The Plugin's headers that may travel upstream — content negotiation,
 /// conditional reads and an identifying agent, nothing that could change
@@ -154,8 +157,79 @@ pub struct BrokerProxy {
     journal: Option<mpsc::Sender<BrokerJournalEntry>>,
     /// Refusals not journaled because the queue was over half full.
     refusals_unjournaled: AtomicU64,
-    permits: Mutex<HashMap<String, Arc<Semaphore>>>,
-    clients: Mutex<HashMap<String, reqwest::Client>>,
+    permits: Mutex<InstallationPermits>,
+    clients: Mutex<IdleCache<reqwest::Client>>,
+}
+
+/// Each installation's in-flight permits. An installation with nothing in
+/// flight is dropped from the map whenever another takes a permit, so an
+/// uninstalled or idle installation costs nothing.
+#[derive(Default)]
+struct InstallationPermits {
+    by_installation: HashMap<String, Arc<Semaphore>>,
+}
+
+impl InstallationPermits {
+    /// One of `installation_id`'s permits, or `None` at the limit. The
+    /// permit is taken while the map is held, so no permit is ever taken
+    /// from a semaphore the map has just dropped (which would let a second
+    /// semaphore hand out a second set of permits).
+    fn try_take(&mut self, installation_id: &str) -> Option<OwnedSemaphorePermit> {
+        self.by_installation.retain(|id, permits| {
+            id == installation_id
+                || permits.available_permits() < PROXY_CONCURRENCY_PER_INSTALLATION
+        });
+        self.by_installation
+            .entry(installation_id.to_string())
+            .or_insert_with(|| Arc::new(Semaphore::new(PROXY_CONCURRENCY_PER_INSTALLATION)))
+            .clone()
+            .try_acquire_owned()
+            .ok()
+    }
+
+    #[cfg(test)]
+    fn tracked(&self) -> usize {
+        self.by_installation.len()
+    }
+}
+
+/// Values by key, each dropped once it has gone unused for `idle`. Stale
+/// entries go whenever a value is inserted.
+struct IdleCache<V> {
+    idle: Duration,
+    entries: HashMap<String, (V, Instant)>,
+}
+
+impl<V: Clone> IdleCache<V> {
+    fn new(idle: Duration) -> Self {
+        Self {
+            idle,
+            entries: HashMap::new(),
+        }
+    }
+
+    fn get(&mut self, key: &str, now: Instant) -> Option<V> {
+        let idle = self.idle;
+        match self.entries.get_mut(key) {
+            Some((value, used)) if now.saturating_duration_since(*used) < idle => {
+                *used = now;
+                Some(value.clone())
+            }
+            _ => None,
+        }
+    }
+
+    fn insert(&mut self, key: String, value: V, now: Instant) {
+        let idle = self.idle;
+        self.entries
+            .retain(|_, (_, used)| now.saturating_duration_since(*used) < idle);
+        self.entries.insert(key, (value, now));
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 impl BrokerProxy {
@@ -178,22 +252,16 @@ impl BrokerProxy {
             store,
             journal,
             refusals_unjournaled: AtomicU64::new(0),
-            permits: Mutex::new(HashMap::new()),
-            clients: Mutex::new(HashMap::new()),
+            permits: Mutex::new(InstallationPermits::default()),
+            clients: Mutex::new(IdleCache::new(CLIENT_IDLE)),
         })
     }
 
     fn try_permit(&self, installation_id: &str) -> Option<OwnedSemaphorePermit> {
-        let semaphore = {
-            let mut map = self
-                .permits
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            map.entry(installation_id.to_string())
-                .or_insert_with(|| Arc::new(Semaphore::new(PROXY_CONCURRENCY_PER_INSTALLATION)))
-                .clone()
-        };
-        semaphore.try_acquire_owned().ok()
+        self.permits
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .try_take(installation_id)
     }
 
     /// A slot in the journal queue, held until the request's row is sent
@@ -245,15 +313,16 @@ impl BrokerProxy {
                     .collect()
             },
         );
+        let now = Instant::now();
         let mut clients = self
             .clients
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(client) = clients.get(&key) {
-            return Ok(client.clone());
+        if let Some(client) = clients.get(&key, now) {
+            return Ok(client);
         }
         let client = upstream_client(ca_pem)?;
-        clients.insert(key, client.clone());
+        clients.insert(key, client.clone(), now);
         Ok(client)
     }
 
@@ -1106,6 +1175,55 @@ async fn send_error(tx: &mpsc::Sender<Result<Bytes, std::io::Error>>, why: &str)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// git-bug 4711823 (6): an installation with nothing in flight leaves
+    /// the permit map when another takes a permit; one with a permit out
+    /// stays, and its limit holds.
+    #[test]
+    fn idle_installations_leave_the_permit_map() {
+        let mut permits = InstallationPermits::default();
+        let a = permits.try_take("a").expect("a's first permit");
+        drop(permits.try_take("b").expect("b's first permit"));
+        assert_eq!(permits.tracked(), 2, "a holds a permit, b was just used");
+
+        drop(permits.try_take("c").expect("c's first permit"));
+        assert_eq!(permits.tracked(), 2, "b had nothing in flight: dropped");
+
+        drop(a);
+        drop(permits.try_take("d").expect("d's first permit"));
+        assert_eq!(permits.tracked(), 1, "only d, just used, is left");
+
+        let held: Vec<_> = (0..PROXY_CONCURRENCY_PER_INSTALLATION)
+            .map(|_| permits.try_take("e").expect("within e's limit"))
+            .collect();
+        drop(permits.try_take("f"));
+        assert!(
+            permits.try_take("e").is_none(),
+            "e's limit survives pruning"
+        );
+        drop(held);
+    }
+
+    /// git-bug 4711823 (6): a cached value unused for its idle time goes
+    /// when the next value is inserted, and a used one stays.
+    #[test]
+    fn an_idle_cache_drops_what_went_unused() {
+        let start = Instant::now();
+        let mut cache = IdleCache::new(Duration::from_secs(60));
+        cache.insert("old".into(), 1, start);
+        cache.insert("used".into(), 2, start);
+        assert_eq!(cache.get("used", start + Duration::from_secs(50)), Some(2));
+
+        cache.insert("new".into(), 3, start + Duration::from_secs(70));
+        assert_eq!(cache.len(), 2, "`old` went unused for 70s: dropped");
+        assert_eq!(cache.get("old", start + Duration::from_secs(70)), None);
+        assert_eq!(cache.get("used", start + Duration::from_secs(70)), Some(2));
+        assert_eq!(
+            cache.get("new", start + Duration::from_secs(200)),
+            None,
+            "an entry past its idle time is not served even before it is dropped"
+        );
+    }
     use axum::http::header::HeaderName;
     use scarab_plugin::PluginConnectionAuthScheme;
 
