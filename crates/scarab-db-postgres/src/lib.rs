@@ -43,9 +43,9 @@ mod org_environments;
 mod plugins;
 /// `PolicyStore` (ADR-0075): Policies, their versions, and PolicyDecisions.
 mod policies;
-/// Step-up confirmation (ADR-0073): `PasskeyStore`, `ChallengeStore`,
-/// `StepUpStore` and the append-only `SecurityEventLog`.
 mod schedules;
+/// Step-up confirmation (ADR-0073): `PasskeyStore`, `ChallengeStore`,
+/// `StepUpStore` and the append-only `OrgSecurityEventLog`.
 mod step_up;
 pub use step_up::{step_up_request_lock_key, BindingRow};
 
@@ -4320,7 +4320,7 @@ impl scarab_identity::SessionStore for PostgresDb {
         .bind(&session.csrf_hash)
         .bind(session.expires_at)
         .bind(session.created_at)
-        .bind(&session.login_kind)
+        .bind(session.login_kind.as_str())
         .execute(self.pool())
         .await
         .map_err(|e| scarab_identity::IdentityError::Issuance(e.to_string()))?;
@@ -4348,7 +4348,9 @@ impl scarab_identity::SessionStore for PostgresDb {
             csrf_hash: row.get::<String, _>("csrf"),
             expires_at: row.get::<i64, _>("expires_at"),
             created_at: row.get::<i64, _>("created_at"),
-            login_kind: row.get::<String, _>("login_kind"),
+            login_kind: scarab_identity::LoginKind::from_stored(
+                &row.get::<String, _>("login_kind"),
+            ),
         }))
     }
 

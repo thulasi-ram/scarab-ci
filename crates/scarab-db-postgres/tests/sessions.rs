@@ -21,7 +21,7 @@ fn session(id: &str, subject: &str, expires_at: i64) -> Session {
         expires_at,
         csrf_hash: csrf_hash(&format!("csrf-{id}")),
         created_at: 1_000,
-        login_kind: scarab_identity::LOGIN_KIND_BROWSER.into(),
+        login_kind: scarab_identity::LoginKind::Browser,
     }
 }
 
@@ -57,7 +57,7 @@ async fn session_lifecycle_put_get_refresh_delete() {
     // ADR-0073: the login stamp round-trips, and a refresh keeps whatever
     // the caller puts (the server re-puts the session it read).
     assert_eq!(got.created_at, 1_000);
-    assert_eq!(got.login_kind, "browser");
+    assert_eq!(got.login_kind.as_str(), "browser");
     assert_eq!(
         got.fresh_login_until(),
         Some(1_000 + scarab_identity::FRESH_LOGIN_MS)
@@ -92,7 +92,7 @@ async fn a_pre_upgrade_session_row_reads_as_never_fresh() {
     .unwrap();
     let got = db.get("old").await.unwrap().expect("stored");
     assert_eq!(got.created_at, 0);
-    assert_eq!(got.login_kind, "");
+    assert_eq!(got.login_kind.as_str(), "");
     assert_eq!(got.fresh_login_until(), None);
 
     tdb.cleanup().await;

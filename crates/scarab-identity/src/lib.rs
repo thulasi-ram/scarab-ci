@@ -15,13 +15,13 @@ use serde::{Deserialize, Serialize};
 /// confirmations, requests and the OrgSecurityEventLog.
 mod step_up;
 pub use step_up::{
-    security_event_kind, BeginExecution, ChallengePurpose, ChallengeStore, ConfirmationKind,
-    Passkey, PasskeyStore, PasskeyUse, RequestState, SecurityEvent, SecurityEventFilter,
-    SecurityEventLog, StepUpConfirmation, StepUpRequest, StepUpRequestPendingCaps,
-    StepUpRequestRaiseOutcome, StepUpRequester, StepUpStore, WebauthnChallenge, FRESH_LOGIN_MS,
-    LOGIN_KIND_API, LOGIN_KIND_BROWSER, MAX_PENDING_STEP_UP_REQUESTS,
-    MAX_PENDING_STEP_UP_REQUESTS_PER_HUMAN, STEP_UP_REQUEST_TTL_MS, STEP_UP_WINDOW_MS,
-    WEBAUTHN_CHALLENGE_TTL_MS,
+    security_event_kind, ChallengePurpose, ChallengeStore, ConfirmationKind, LoginKind,
+    OrgSecurityEventLog, Passkey, PasskeyStore, PasskeyUse, SecurityEvent, SecurityEventFilter,
+    StepUpConfirmation, StepUpConfirmationRequest, StepUpConfirmationRequestBeginOutcome,
+    StepUpConfirmationRequestPendingCaps, StepUpConfirmationRequestRaiseOutcome,
+    StepUpConfirmationRequestState, StepUpConfirmationRequester, StepUpStore, WebauthnChallenge,
+    FRESH_LOGIN_MS, MAX_PENDING_STEP_UP_REQUESTS, MAX_PENDING_STEP_UP_REQUESTS_PER_HUMAN,
+    STEP_UP_REQUEST_TTL_MS, STEP_UP_WINDOW_MS, WEBAUTHN_CHALLENGE_TTL_MS,
 };
 
 /// An authenticated principal (a human user or a machine identity).
@@ -219,11 +219,11 @@ pub struct Session {
     /// "fresh".
     #[serde(default)]
     pub created_at: i64,
-    /// How the login happened: [`LOGIN_KIND_BROWSER`] (the OAuth callback)
-    /// or [`LOGIN_KIND_API`] (the API/CLI exchange). `""` = from before this
-    /// was recorded, never fresh.
+    /// How the login happened: [`LoginKind::Browser`] (the OAuth callback)
+    /// or [`LoginKind::Api`] (the API/CLI exchange). `Unrecorded` (`""`) =
+    /// from before this was recorded, never fresh.
     #[serde(default)]
-    pub login_kind: String,
+    pub login_kind: LoginKind,
 }
 
 /// Never prints the session id (a bearer secret) or the CSRF hash.
@@ -281,7 +281,7 @@ impl Session {
     /// thing that may enroll a first passkey (ADR-0073 §2). `None` for an
     /// API-exchange login and for a session from before logins were stamped.
     pub fn fresh_login_until(&self) -> Option<i64> {
-        (self.login_kind == LOGIN_KIND_BROWSER && self.created_at > 0)
+        (self.login_kind == LoginKind::Browser && self.created_at > 0)
             .then(|| self.created_at + FRESH_LOGIN_MS)
     }
 }
@@ -875,7 +875,7 @@ mod tests {
             expires_at: 1_000,
             csrf_hash: String::new(),
             created_at: 0,
-            login_kind: String::new(),
+            login_kind: LoginKind::Unrecorded,
         };
         assert!(s.is_valid(999));
         assert!(!s.is_valid(1_000));
@@ -897,7 +897,7 @@ mod tests {
             expires_at: 1_000,
             csrf_hash: csrf_hash("the-csrf-token"),
             created_at: 0,
-            login_kind: String::new(),
+            login_kind: LoginKind::Unrecorded,
         };
         assert_eq!(s.csrf_hash.len(), 64);
         assert!(s.csrf_matches(Some("the-csrf-token")));
@@ -915,7 +915,7 @@ mod tests {
 
     #[test]
     fn only_a_stamped_browser_login_is_ever_fresh() {
-        let s = |created_at: i64, kind: &str| Session {
+        let s = |created_at: i64, kind: LoginKind| Session {
             id: "sid".into(),
             principal: Principal {
                 subject: "alice".into(),
@@ -925,15 +925,19 @@ mod tests {
             expires_at: i64::MAX,
             csrf_hash: String::new(),
             created_at,
-            login_kind: kind.into(),
+            login_kind: kind,
         };
         assert_eq!(
-            s(1_000, LOGIN_KIND_BROWSER).fresh_login_until(),
+            s(1_000, LoginKind::Browser).fresh_login_until(),
             Some(1_000 + FRESH_LOGIN_MS)
         );
-        assert_eq!(s(1_000, LOGIN_KIND_API).fresh_login_until(), None);
-        assert_eq!(s(1_000, "").fresh_login_until(), None, "pre-upgrade");
-        assert_eq!(s(0, LOGIN_KIND_BROWSER).fresh_login_until(), None);
+        assert_eq!(s(1_000, LoginKind::Api).fresh_login_until(), None);
+        assert_eq!(
+            s(1_000, LoginKind::Unrecorded).fresh_login_until(),
+            None,
+            "pre-upgrade"
+        );
+        assert_eq!(s(0, LoginKind::Browser).fresh_login_until(), None);
     }
 
     #[test]
@@ -945,7 +949,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(old.created_at, 0);
-        assert_eq!(old.login_kind, "");
+        assert_eq!(old.login_kind, LoginKind::Unrecorded);
         assert_eq!(old.fresh_login_until(), None);
     }
 

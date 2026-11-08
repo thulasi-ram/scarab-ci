@@ -21,8 +21,9 @@ use serde_json::{json, Value};
 use common::fresh_db;
 use scarab_db_postgres::{BindingRow, PostgresDb};
 use scarab_identity::{
-    api_token_hash, ApiToken, ApiTokenStore, Binding, BindingOrigin, IdentityStore, PasskeyStore,
-    ProviderIdentity, RbacStore, Role, Scope, SecurityEventFilter, SecurityEventLog, StepUpStore,
+    api_token_hash, ApiToken, ApiTokenStore, Binding, BindingOrigin, IdentityStore,
+    OrgSecurityEventLog, PasskeyStore, ProviderIdentity, RbacStore, Role, Scope,
+    SecurityEventFilter, StepUpStore,
 };
 use scarab_server::step_up::admin::{
     grant_role, reset_passkeys, OperatorGrant, OperatorInfo, NO_PRINCIPAL,
@@ -835,7 +836,7 @@ async fn an_api_token_does_not_read_its_owner_s_passkeys_or_history() {
     assert!(b.get("events").is_none(), "{b}");
 
     let cli = h
-        .session(scoped("amy"), scarab_identity::LOGIN_KIND_API)
+        .session(scoped("amy"), scarab_identity::LoginKind::Api)
         .await;
     let (st, me) = h.bearer("GET", "/v1/me/security", None, &cli.id).await;
     assert_eq!(st, StatusCode::OK, "{me}");
@@ -1039,7 +1040,7 @@ async fn the_break_glass_resets_and_is_recorded() {
             .unwrap()
     );
 
-    let events = SecurityEventLog::list(
+    let events = OrgSecurityEventLog::list(
         pg.as_ref(),
         &SecurityEventFilter {
             kinds: vec!["passkey.break_glass_reset".into()],
@@ -1124,7 +1125,7 @@ async fn the_operator_grant_is_idempotent_and_recorded() {
     };
     let acme = Scope::Org("acme".into());
     let grants = || async {
-        SecurityEventLog::list(
+        OrgSecurityEventLog::list(
             pg.as_ref(),
             &SecurityEventFilter {
                 kinds: vec!["binding.operator_grant".into()],
@@ -1317,7 +1318,7 @@ fn operator() -> OperatorInfo {
 }
 
 async fn operator_grants(pg: &PostgresDb) -> usize {
-    SecurityEventLog::list(
+    OrgSecurityEventLog::list(
         pg,
         &SecurityEventFilter {
             kinds: vec!["binding.operator_grant".into()],

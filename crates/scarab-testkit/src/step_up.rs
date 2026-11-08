@@ -13,10 +13,11 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use scarab_identity::{
-    BeginExecution, ChallengeStore, ConfirmationKind, IdentityError, Passkey, PasskeyStore,
-    PasskeyUse, RbacStore, RequestState, SecurityEvent, SecurityEventFilter, SecurityEventLog,
-    StepUpConfirmation, StepUpRequest, StepUpRequestPendingCaps, StepUpRequestRaiseOutcome,
-    StepUpRequester, StepUpStore, WebauthnChallenge,
+    ChallengeStore, ConfirmationKind, IdentityError, OrgSecurityEventLog, Passkey, PasskeyStore,
+    PasskeyUse, RbacStore, SecurityEvent, SecurityEventFilter, StepUpConfirmation,
+    StepUpConfirmationRequest, StepUpConfirmationRequestBeginOutcome,
+    StepUpConfirmationRequestPendingCaps, StepUpConfirmationRequestRaiseOutcome,
+    StepUpConfirmationRequestState, StepUpConfirmationRequester, StepUpStore, WebauthnChallenge,
 };
 
 // ---------------------------------------------------------------------------
@@ -251,7 +252,7 @@ impl ChallengeStore for InMemoryChallenges {
 #[derive(Default)]
 struct StepUpState {
     confirmations: Vec<StepUpConfirmation>,
-    requests: HashMap<String, StepUpRequest>,
+    requests: HashMap<String, StepUpConfirmationRequest>,
 }
 
 /// A test's hook run as the next [`StepUpStore::put_confirmation`] starts.
@@ -270,7 +271,7 @@ impl InMemoryStepUp {
         Self::default()
     }
 
-    /// Fault injection: while `on`, every `delete_for_passkey` fails, so a
+    /// Fault injection: while `on`, every `delete_standing_confirmations_for_passkey` fails, so a
     /// test can prove a half-done passkey removal can be finished by a retry.
     pub fn fail_passkey_revokes(&self, on: bool) {
         self.failing_passkey_revokes.store(on, Ordering::SeqCst);
@@ -289,7 +290,7 @@ impl InMemoryStepUp {
     }
 
     /// Every request recorded, in no particular order (a test's view).
-    pub fn requests(&self) -> Vec<StepUpRequest> {
+    pub fn requests(&self) -> Vec<StepUpConfirmationRequest> {
         self.state
             .lock()
             .unwrap()
@@ -300,7 +301,10 @@ impl InMemoryStepUp {
     }
 }
 
-fn requester_matches(r: &StepUpRequest, requester: &StepUpRequester) -> bool {
+fn requester_matches(
+    r: &StepUpConfirmationRequest,
+    requester: &StepUpConfirmationRequester,
+) -> bool {
     &r.requester == requester
 }
 
@@ -407,7 +411,10 @@ impl StepUpStore for InMemoryStepUp {
         }))
     }
 
-    async fn delete_windows_for(&self, principal: &str) -> Result<u64, IdentityError> {
+    async fn delete_standing_confirmations_for(
+        &self,
+        principal: &str,
+    ) -> Result<u64, IdentityError> {
         let mut state = self.state.lock().unwrap();
         let before = state.confirmations.len();
         state.confirmations.retain(|c| {
@@ -418,7 +425,10 @@ impl StepUpStore for InMemoryStepUp {
         Ok((before - state.confirmations.len()) as u64)
     }
 
-    async fn delete_for_passkey(&self, passkey_id: &str) -> Result<u64, IdentityError> {
+    async fn delete_standing_confirmations_for_passkey(
+        &self,
+        passkey_id: &str,
+    ) -> Result<u64, IdentityError> {
         if self.failing_passkey_revokes.load(Ordering::SeqCst) {
             return Err(IdentityError::Conflict(
                 "the step-up store is unreachable (injected)".into(),
@@ -436,12 +446,14 @@ impl StepUpStore for InMemoryStepUp {
 
     async fn raise_request(
         &self,
-        request: &StepUpRequest,
-        caps: StepUpRequestPendingCaps,
+        request: &StepUpConfirmationRequest,
+        caps: StepUpConfirmationRequestPendingCaps,
         now_ms: i64,
-    ) -> Result<StepUpRequestRaiseOutcome, IdentityError> {
+    ) -> Result<StepUpConfirmationRequestRaiseOutcome, IdentityError> {
         let mut state = self.state.lock().unwrap();
-        let live = |r: &&StepUpRequest| r.state == RequestState::Pending && r.expires_at > now_ms;
+        let live = |r: &&StepUpConfirmationRequest| {
+            r.state == StepUpConfirmationRequestState::Pending && r.expires_at > now_ms
+        };
         let by_requester = state
             .requests
             .values()
@@ -449,7 +461,7 @@ impl StepUpStore for InMemoryStepUp {
             .filter(|r| requester_matches(r, &request.requester))
             .count() as u64;
         if by_requester >= caps.per_requester {
-            return Ok(StepUpRequestRaiseOutcome::RequesterFull {
+            return Ok(StepUpConfirmationRequestRaiseOutcome::RequesterFull {
                 pending: by_requester,
             });
         }
@@ -460,7 +472,7 @@ impl StepUpStore for InMemoryStepUp {
             .filter(|r| r.for_human == request.for_human)
             .count() as u64;
         if for_human >= caps.per_human {
-            return Ok(StepUpRequestRaiseOutcome::HumanFull { pending: for_human });
+            return Ok(StepUpConfirmationRequestRaiseOutcome::HumanFull { pending: for_human });
         }
         if state.requests.contains_key(&request.id) {
             return Err(IdentityError::Conflict(format!(
@@ -469,10 +481,13 @@ impl StepUpStore for InMemoryStepUp {
             )));
         }
         state.requests.insert(request.id.clone(), request.clone());
-        Ok(StepUpRequestRaiseOutcome::Raised)
+        Ok(StepUpConfirmationRequestRaiseOutcome::Raised)
     }
 
-    async fn get_request(&self, id: &str) -> Result<Option<StepUpRequest>, IdentityError> {
+    async fn get_request(
+        &self,
+        id: &str,
+    ) -> Result<Option<StepUpConfirmationRequest>, IdentityError> {
         Ok(self.state.lock().unwrap().requests.get(id).cloned())
     }
 
@@ -482,28 +497,30 @@ impl StepUpStore for InMemoryStepUp {
         confirmed_by: &str,
         confirmation_id: &str,
         now_ms: i64,
-    ) -> Result<BeginExecution, IdentityError> {
+    ) -> Result<StepUpConfirmationRequestBeginOutcome, IdentityError> {
         let mut state = self.state.lock().unwrap();
         let Some(r) = state.requests.get_mut(id) else {
-            return Ok(BeginExecution::NotFound);
+            return Ok(StepUpConfirmationRequestBeginOutcome::NotFound);
         };
-        if r.state != RequestState::Pending {
-            return Ok(BeginExecution::NotPending(r.state));
+        if r.state != StepUpConfirmationRequestState::Pending {
+            return Ok(StepUpConfirmationRequestBeginOutcome::NotPending(r.state));
         }
         if r.expires_at <= now_ms {
-            return Ok(BeginExecution::Expired);
+            return Ok(StepUpConfirmationRequestBeginOutcome::Expired);
         }
-        r.state = RequestState::Executing;
+        r.state = StepUpConfirmationRequestState::Executing;
         r.confirmed_by = Some(confirmed_by.to_string());
         r.confirmation_id = Some(confirmation_id.to_string());
         r.confirmed_at = Some(now_ms);
-        Ok(BeginExecution::Begun(Box::new(r.clone())))
+        Ok(StepUpConfirmationRequestBeginOutcome::Begun(Box::new(
+            r.clone(),
+        )))
     }
 
     async fn finish_request(
         &self,
         id: &str,
-        state: RequestState,
+        state: StepUpConfirmationRequestState,
         result_status: Option<i32>,
         result_summary: Option<&str>,
         now_ms: i64,
@@ -518,7 +535,7 @@ impl StepUpStore for InMemoryStepUp {
         let Some(r) = guard.requests.get_mut(id) else {
             return Ok(false);
         };
-        if r.state != RequestState::Executing {
+        if r.state != StepUpConfirmationRequestState::Executing {
             return Ok(false);
         }
         r.state = state;
@@ -531,7 +548,7 @@ impl StepUpStore for InMemoryStepUp {
 
     async fn pending_count(
         &self,
-        requester: &StepUpRequester,
+        requester: &StepUpConfirmationRequester,
         now_ms: i64,
     ) -> Result<u64, IdentityError> {
         Ok(self
@@ -542,7 +559,7 @@ impl StepUpStore for InMemoryStepUp {
             .values()
             .filter(|r| {
                 requester_matches(r, requester)
-                    && r.state == RequestState::Pending
+                    && r.state == StepUpConfirmationRequestState::Pending
                     && r.expires_at > now_ms
             })
             .count() as u64)
@@ -557,7 +574,7 @@ impl StepUpStore for InMemoryStepUp {
             .values()
             .filter(|r| {
                 r.org.as_deref() == Some(org)
-                    && r.state == RequestState::Pending
+                    && r.state == StepUpConfirmationRequestState::Pending
                     && r.expires_at > now_ms
             })
             .count() as u64)
@@ -569,9 +586,10 @@ impl StepUpStore for InMemoryStepUp {
         state.confirmations.retain(|c| c.expires_at > now_ms);
         let stuck = now_ms - scarab_identity::STEP_UP_REQUEST_TTL_MS;
         for r in state.requests.values_mut() {
-            let expired = r.state == RequestState::Pending && r.expires_at <= now_ms;
-            let left_executing =
-                r.state == RequestState::Executing && r.confirmed_at.is_some_and(|t| t <= stuck);
+            let expired =
+                r.state == StepUpConfirmationRequestState::Pending && r.expires_at <= now_ms;
+            let left_executing = r.state == StepUpConfirmationRequestState::Executing
+                && r.confirmed_at.is_some_and(|t| t <= stuck);
             if expired || left_executing {
                 r.sealed = None;
             }
@@ -579,8 +597,9 @@ impl StepUpStore for InMemoryStepUp {
         state.requests.retain(|_, r| {
             let settled_long_ago =
                 r.state.is_terminal() && r.executed_at.is_some_and(|t| t < older_than_ms);
-            let expired_long_ago = r.state == RequestState::Pending && r.expires_at < older_than_ms;
-            let stuck_long_ago = r.state == RequestState::Executing
+            let expired_long_ago =
+                r.state == StepUpConfirmationRequestState::Pending && r.expires_at < older_than_ms;
+            let stuck_long_ago = r.state == StepUpConfirmationRequestState::Executing
                 && r.confirmed_at.is_some_and(|t| t < older_than_ms);
             !(settled_long_ago || expired_long_ago || stuck_long_ago)
         });
@@ -592,7 +611,7 @@ impl StepUpStore for InMemoryStepUp {
 // OrgSecurityEventLog
 // ---------------------------------------------------------------------------
 
-/// An in-memory, append-only [`SecurityEventLog`]. The Org view needs Org
+/// An in-memory, append-only [`OrgSecurityEventLog`]. The Org view needs Org
 /// membership: wire the same [`RbacStore`] the server reads
 /// ([`with_rbac`](Self::with_rbac)); without one, an Org view holds only
 /// that Org's own events.
@@ -627,7 +646,7 @@ impl InMemorySecurityEvents {
 }
 
 #[async_trait]
-impl SecurityEventLog for InMemorySecurityEvents {
+impl OrgSecurityEventLog for InMemorySecurityEvents {
     async fn append(&self, event: &SecurityEvent) -> Result<i64, IdentityError> {
         if self.failing.load(Ordering::SeqCst) {
             return Err(IdentityError::Conflict(

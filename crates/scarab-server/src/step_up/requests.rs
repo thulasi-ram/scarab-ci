@@ -46,9 +46,11 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use scarab_identity::{
-    security_event_kind as kind, Action, BeginExecution, ChallengePurpose, ConfirmationKind,
-    Principal, RequestState, Role, StepUpConfirmation, StepUpRequest, StepUpRequestPendingCaps,
-    StepUpRequestRaiseOutcome, StepUpRequester, STEP_UP_REQUEST_TTL_MS, STEP_UP_WINDOW_MS,
+    security_event_kind as kind, Action, ChallengePurpose, ConfirmationKind, Principal, Role,
+    StepUpConfirmation, StepUpConfirmationRequest, StepUpConfirmationRequestBeginOutcome,
+    StepUpConfirmationRequestPendingCaps, StepUpConfirmationRequestRaiseOutcome,
+    StepUpConfirmationRequestState, StepUpConfirmationRequester, STEP_UP_REQUEST_TTL_MS,
+    STEP_UP_WINDOW_MS,
 };
 
 use super::ceremony::{
@@ -127,14 +129,14 @@ pub(crate) fn replay_authority() -> Option<Arc<ReplayAuthority>> {
 /// The requester a machine caller raises a request as: an API token by id,
 /// a Bearer session by its hash. `None` for anyone else (a browser, or the
 /// dev-insecure synthetic caller), who never raises one.
-pub(crate) fn requester_of(caller: &Caller) -> Option<StepUpRequester> {
+pub(crate) fn requester_of(caller: &Caller) -> Option<StepUpConfirmationRequester> {
     if let Some(token) = &caller.grant {
-        return Some(StepUpRequester::ApiToken {
+        return Some(StepUpConfirmationRequester::ApiToken {
             id: token.id.clone(),
         });
     }
     match (&caller.via, &caller.session) {
-        (Some(AuthVia::Bearer), Some(s)) => Some(StepUpRequester::BearerSession {
+        (Some(AuthVia::Bearer), Some(s)) => Some(StepUpConfirmationRequester::BearerSession {
             session_hash: s.id_hash.clone(),
         }),
         _ => None,
@@ -222,6 +224,40 @@ struct SealedRequest {
     session_id: Option<String>,
 }
 
+/// What a StepUpConfirmationRequest keeps as its `summary`: what would run
+/// (redacted) and who asked. Written once, when the request is raised; read
+/// by the confirm page and by the confirm endpoint.
+///
+/// Each field reads on its own: a stored key that is missing or not the
+/// expected type leaves only that field empty.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct StepUpConfirmationRequestContext {
+    #[serde(flatten)]
+    pub(crate) summary: OpSummary,
+    /// Who asked: `API token “ci-bot” (<id>)` or `a CLI session (Bearer)`.
+    #[serde(default, deserialize_with = "super::ops::stored_string")]
+    pub(crate) requester: String,
+}
+
+impl StepUpConfirmationRequestContext {
+    /// The JSON a request row stores.
+    fn to_value(&self) -> serde_json::Value {
+        serde_json::to_value(self).expect("a request context serializes")
+    }
+
+    /// The context `r` was raised with. `None` if its `summary` does not
+    /// read as one.
+    fn of(r: &StepUpConfirmationRequest) -> Option<Self> {
+        match serde_json::from_value(r.summary.clone()) {
+            Ok(context) => Some(context),
+            Err(e) => {
+                tracing::warn!(request = %r.id, error = %e, "a request's stored summary does not read");
+                None
+            }
+        }
+    }
+}
+
 fn aad(id: &str) -> Vec<u8> {
     format!("step-up-request:{id}").into_bytes()
 }
@@ -240,7 +276,7 @@ pub(crate) async fn raise<T>(
     op: &'static Op,
     p: &Prepared,
     summary: &OpSummary,
-    requester: StepUpRequester,
+    requester: StepUpConfirmationRequester,
     mut refusal: StepUpRefusal,
 ) -> Result<T, ApiError> {
     let svc = &p.svc;
@@ -251,22 +287,15 @@ pub(crate) async fn raise<T>(
     // The sealed body is parked until the request settles or is reaped:
     // bounded per operation, well under the guard's limit.
     if p.body.len() > op.max_request_body {
-        let mut ev = event(
-            kind::STEP_UP_REFUSED,
-            &human,
-            caller.event_label(),
-            p.org.clone(),
+        let mut ev = p.refused_event(
+            op,
+            &summary.target,
+            refusal.mode,
+            "request body too large",
             now,
         );
-        ev.op = Some(op.id.to_string());
-        ev.target = Some(summary.target.clone());
-        ev.session_hash = caller.session.as_ref().map(|s| s.id_hash.clone());
-        ev.detail = serde_json::json!({
-            "mode": refusal.mode,
-            "reason": "request body too large",
-            "bytes": p.body.len(),
-            "limit": op.max_request_body,
-        });
+        ev.detail["bytes"] = p.body.len().into();
+        ev.detail["limit"] = op.max_request_body.into();
         svc.record_refusal(ev).await;
         return Err(super::ceremony::ceremony(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -283,8 +312,10 @@ pub(crate) async fn raise<T>(
 
     let id = random_id();
     let session_id = match &requester {
-        StepUpRequester::BearerSession { .. } => caller.session.as_ref().map(|s| s.id.0.clone()),
-        StepUpRequester::ApiToken { .. } => None,
+        StepUpConfirmationRequester::BearerSession { .. } => {
+            caller.session.as_ref().map(|s| s.id.0.clone())
+        }
+        StepUpConfirmationRequester::ApiToken { .. } => None,
     };
     let plaintext = serde_json::to_vec(&SealedRequest {
         body: STANDARD.encode(&p.body),
@@ -298,11 +329,13 @@ pub(crate) async fn raise<T>(
     })?;
     let label = requester_label(caller);
     let session_role_cap = match &requester {
-        StepUpRequester::BearerSession { .. } => caller.principal.roles.iter().copied().max(),
-        StepUpRequester::ApiToken { .. } => None,
+        StepUpConfirmationRequester::BearerSession { .. } => {
+            caller.principal.roles.iter().copied().max()
+        }
+        StepUpConfirmationRequester::ApiToken { .. } => None,
     };
     let expires_at = now + STEP_UP_REQUEST_TTL_MS;
-    let row = StepUpRequest {
+    let row = StepUpConfirmationRequest {
         id: id.clone(),
         org: p.org.clone(),
         op: op.id.to_string(),
@@ -311,18 +344,17 @@ pub(crate) async fn raise<T>(
         query: p.query.clone(),
         sealed: Some(sealed),
         action_digest: p.digest.to_vec(),
-        summary: serde_json::json!({
-            "operation": summary.operation,
-            "target": summary.target,
-            "changes": summary.changes,
-            "requester": label,
-        }),
+        summary: StepUpConfirmationRequestContext {
+            summary: summary.clone(),
+            requester: label.clone(),
+        }
+        .to_value(),
         for_human: human.clone(),
         requester: requester.clone(),
         session_role_cap,
         created_at: now,
         expires_at,
-        state: RequestState::Pending,
+        state: StepUpConfirmationRequestState::Pending,
         confirmed_by: None,
         confirmed_at: None,
         confirmation_id: None,
@@ -334,12 +366,12 @@ pub(crate) async fn raise<T>(
     // per human across every credential acting for them.
     let full = match svc
         .confirmations
-        .raise_request(&row, StepUpRequestPendingCaps::DEFAULT, now)
+        .raise_request(&row, StepUpConfirmationRequestPendingCaps::DEFAULT, now)
         .await
         .map_err(store_err)?
     {
-        StepUpRequestRaiseOutcome::Raised => None,
-        StepUpRequestRaiseOutcome::RequesterFull { pending } => Some((
+        StepUpConfirmationRequestRaiseOutcome::Raised => None,
+        StepUpConfirmationRequestRaiseOutcome::RequesterFull { pending } => Some((
             pending,
             "too many pending confirmation requests",
             format!(
@@ -347,7 +379,7 @@ pub(crate) async fn raise<T>(
                  waiting for {human}; confirm them, or let them expire (5 minutes), first"
             ),
         )),
-        StepUpRequestRaiseOutcome::HumanFull { pending } => Some((
+        StepUpConfirmationRequestRaiseOutcome::HumanFull { pending } => Some((
             pending,
             "too many pending confirmation requests for this human",
             format!(
@@ -357,36 +389,14 @@ pub(crate) async fn raise<T>(
         )),
     };
     if let Some((pending, reason, message)) = full {
-        let mut ev = event(
-            kind::STEP_UP_REFUSED,
-            &human,
-            caller.event_label(),
-            p.org.clone(),
-            now,
-        );
-        ev.op = Some(op.id.to_string());
-        ev.target = Some(summary.target.clone());
-        ev.session_hash = caller.session.as_ref().map(|s| s.id_hash.clone());
-        ev.detail = serde_json::json!({
-            "mode": refusal.mode,
-            "reason": reason,
-            "pending": pending,
-        });
+        let mut ev = p.refused_event(op, &summary.target, refusal.mode, reason, now);
+        ev.detail["pending"] = pending.into();
         svc.record_refusal(ev).await;
         return Err(ApiError::TooManyRequests(message));
     }
 
-    let mut ev = event(
-        kind::REQUEST_RAISED,
-        &human,
-        caller.event_label(),
-        p.org.clone(),
-        now,
-    );
-    ev.op = Some(op.id.to_string());
-    ev.target = Some(summary.target.clone());
+    let mut ev = p.event(kind::REQUEST_RAISED, op, &summary.target, now);
     ev.request_id = Some(id.clone());
-    ev.session_hash = caller.session.as_ref().map(|s| s.id_hash.clone());
     ev.detail = serde_json::json!({
         "requested_via": requester.via(),
         "requested_by": label,
@@ -508,33 +518,13 @@ pub struct StepUpRequestDto {
 }
 
 impl StepUpRequestDto {
-    fn new(r: &StepUpRequest, now: i64) -> Self {
-        let text = |k: &str| {
-            r.summary
-                .get(k)
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string()
-        };
-        let changes = r
-            .summary
-            .get("changes")
-            .and_then(|c| c.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
+    fn new(r: &StepUpConfirmationRequest, now: i64) -> Self {
+        let context = StepUpConfirmationRequestContext::of(r).unwrap_or_default();
         Self {
             id: r.id.clone(),
             op: r.op.clone(),
-            summary: OpSummary {
-                operation: text("operation"),
-                target: text("target"),
-                changes,
-            },
-            requested_by: text("requester"),
+            summary: context.summary,
+            requested_by: context.requester,
             requested_via: r.requester.via().to_string(),
             for_human: r.for_human.clone(),
             org: r.org.clone(),
@@ -590,7 +580,7 @@ async fn load_as_human(
     svc: &StepUpService,
     id: &str,
     caller: &Caller,
-) -> Result<StepUpRequest, ApiError> {
+) -> Result<StepUpConfirmationRequest, ApiError> {
     let found = svc.confirmations.get_request(id).await.map_err(store_err)?;
     match found {
         Some(r) if is_for_human(st, &caller.principal.subject, &r.for_human).await => Ok(r),
@@ -613,7 +603,7 @@ async fn probe_refused(
     svc: &StepUpService,
     id: &str,
     caller: &Caller,
-    found: Option<&StepUpRequest>,
+    found: Option<&StepUpConfirmationRequest>,
 ) -> ApiError {
     let now = st.clock.now().await.0;
     super::ceremony::record_ceremony_refusal(svc, caller, "request_not_found", Some(id), now).await;
@@ -638,7 +628,7 @@ async fn probe_refused(
 }
 
 /// 410 once expired, 409 once confirmed.
-fn confirmable(r: &StepUpRequest, now: i64) -> Result<(), ApiError> {
+fn confirmable(r: &StepUpConfirmationRequest, now: i64) -> Result<(), ApiError> {
     if r.is_expired(now) {
         return Err(ApiError::Gone(
             "this confirmation request expired (5 minutes); run the operation again to raise a \
@@ -646,7 +636,7 @@ fn confirmable(r: &StepUpRequest, now: i64) -> Result<(), ApiError> {
                 .into(),
         ));
     }
-    if r.state != RequestState::Pending {
+    if r.state != StepUpConfirmationRequestState::Pending {
         return Err(ApiError::Conflict(format!(
             "this confirmation request was already confirmed (it is {})",
             r.state.as_str()
@@ -806,14 +796,14 @@ pub(crate) async fn confirm_request(
         .await
         .map_err(store_err)?
     {
-        BeginExecution::Begun(r) => *r,
-        BeginExecution::NotFound => return Err(ApiError::NotFound),
-        BeginExecution::Expired => {
+        StepUpConfirmationRequestBeginOutcome::Begun(r) => *r,
+        StepUpConfirmationRequestBeginOutcome::NotFound => return Err(ApiError::NotFound),
+        StepUpConfirmationRequestBeginOutcome::Expired => {
             return Err(ApiError::Gone(
                 "this confirmation request expired (5 minutes)".into(),
             ))
         }
-        BeginExecution::NotPending(state) => {
+        StepUpConfirmationRequestBeginOutcome::NotPending(state) => {
             return Err(ApiError::Conflict(format!(
                 "this confirmation request was already confirmed (it is {})",
                 state.as_str()
@@ -836,17 +826,12 @@ pub(crate) async fn confirm_request(
         .put_confirmation(&confirmation)
         .await
         .map_err(store_err)?;
-    let requested_by = r
-        .summary
-        .get("requester")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-    let target = r
-        .summary
-        .get("target")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
+    let context = StepUpConfirmationRequestContext::of(&r);
+    let requested_by = context
+        .as_ref()
+        .map(|c| c.requester.clone())
+        .unwrap_or_default();
+    let target = context.as_ref().map(|c| c.summary.target.clone());
 
     let mut ev = event(
         kind::STEP_UP_CONFIRMED,
@@ -914,10 +899,14 @@ pub(crate) async fn confirm_request(
                 .decode(s.body.as_bytes())
                 .map_err(|e| format!("the sealed request is unreadable: {e}"))?;
             let requester = match &r.requester {
-                StepUpRequester::ApiToken { id } => ReplayRequester::ApiToken(id.clone()),
-                StepUpRequester::BearerSession { .. } => ReplayRequester::BearerSession(
-                    SessionSecret(s.session_id.ok_or("the sealed request lost its session")?),
-                ),
+                StepUpConfirmationRequester::ApiToken { id } => {
+                    ReplayRequester::ApiToken(id.clone())
+                }
+                StepUpConfirmationRequester::BearerSession { .. } => {
+                    ReplayRequester::BearerSession(SessionSecret(
+                        s.session_id.ok_or("the sealed request lost its session")?,
+                    ))
+                }
             };
             Ok((body, requester))
         });
@@ -928,16 +917,7 @@ pub(crate) async fn confirm_request(
                 confirmation_id: confirmation_id.clone(),
                 op_id: r.op.clone(),
                 digest: r.action_digest.clone(),
-                changes: r
-                    .summary
-                    .get("changes")
-                    .and_then(|c| c.as_array())
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|v| v.as_str().map(str::to_string))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
+                changes: context.map(|c| c.summary.changes).unwrap_or_default(),
                 requester,
                 // The confirmer: proven (above) to be the request's human
                 // or the live Principal it was merged into — whom a merge
@@ -955,8 +935,8 @@ pub(crate) async fn confirm_request(
         Err(why) => (None, serde_json::Value::String(why.clone()), Some(why)),
     };
     let state = match failure {
-        None => RequestState::Executed,
-        Some(_) => RequestState::Failed,
+        None => StepUpConfirmationRequestState::Executed,
+        Some(_) => StepUpConfirmationRequestState::Failed,
     };
     let result_status = status.map(|s| i32::from(s.as_u16()));
     let result_summary = match (&status, &failure) {
@@ -976,7 +956,7 @@ pub(crate) async fn confirm_request(
     }
     let mut ev = event(
         match state {
-            RequestState::Executed => kind::REQUEST_EXECUTED,
+            StepUpConfirmationRequestState::Executed => kind::REQUEST_EXECUTED,
             _ => kind::REQUEST_FAILED,
         },
         &r.for_human,
@@ -1018,7 +998,7 @@ fn cut(s: &str, max: usize) -> String {
 async fn replay(
     st: &AppState,
     authority: ReplayAuthority,
-    r: &StepUpRequest,
+    r: &StepUpConfirmationRequest,
     body: Vec<u8>,
 ) -> (StatusCode, Bytes) {
     use tower::ServiceExt;

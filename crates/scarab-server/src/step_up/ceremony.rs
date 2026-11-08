@@ -37,7 +37,7 @@ use scarab_webauthn::{
 
 use super::{
     descriptors, event, random_bytes, random_id, sent_challenge, store_err, GuardCtx,
-    StepUpService, WebauthnChallengeDto, MSG_FLAGGED_RESET,
+    StepUpChallengeContext, StepUpService, WebauthnChallengeDto, MSG_FLAGGED_RESET,
 };
 use crate::{authenticate, ApiError, AppState, Caller, SessionFacts};
 
@@ -582,7 +582,7 @@ pub(crate) async fn remove_passkey(
     // a failure leaves the passkey in place and a retry finishes the job.
     let mut revoked = svc
         .confirmations
-        .delete_for_passkey(&id)
+        .delete_standing_confirmations_for_passkey(&id)
         .await
         .map_err(store_err)?;
     if !svc
@@ -596,7 +596,10 @@ pub(crate) async fn remove_passkey(
     // And again: a confirmation an assertion inserted between the revoke and
     // the removal goes too (an insert after the removal revokes itself — see
     // `put_confirmation_while_usable`).
-    let late = svc.confirmations.delete_for_passkey(&id).await;
+    let late = svc
+        .confirmations
+        .delete_standing_confirmations_for_passkey(&id)
+        .await;
     revoked += late.as_ref().copied().unwrap_or(0);
     let now = st.clock.now().await.0;
     let mut ev = event(
@@ -713,42 +716,28 @@ pub(crate) async fn step_up_confirm(
         expires_at: now + STEP_UP_WINDOW_MS,
         consumed_at: None,
     };
-    let op = row
-        .summary
-        .as_ref()
-        .and_then(|s| s.get("op"))
-        .and_then(|o| o.as_str())
-        .map(str::to_string);
-    let target = row
-        .summary
-        .as_ref()
-        .and_then(|s| s.pointer("/summary/target"))
-        .and_then(|o| o.as_str())
-        .map(str::to_string);
     // The Org the guard resolved for the operation it was confirmed for, so
     // the confirmation lands in that Org's log and no other.
-    let org = row
-        .summary
-        .as_ref()
-        .and_then(|s| s.get("org"))
-        .and_then(|o| o.as_str())
-        .map(str::to_string);
+    let context = StepUpChallengeContext::of(&row);
     let mut ev = event(
         kind::STEP_UP_CONFIRMED,
         &subject,
         caller.event_label(),
-        org,
+        context.as_ref().and_then(|c| c.org.clone()),
         now,
     );
-    ev.op = op;
-    ev.target = target;
+    ev.op = context.as_ref().and_then(|c| c.op.clone());
+    ev.target = context
+        .as_ref()
+        .and_then(|c| c.summary.as_ref())
+        .map(|s| s.target.clone());
     ev.confirmation_id = Some(confirmation.id.clone());
     ev.passkey_id = Some(passkey.id.clone());
     ev.session_hash = Some(facts.id_hash.clone());
     ev.detail = serde_json::json!({
         "kind": kind_.as_str(),
         "expires_at": confirmation.expires_at,
-        "summary": row.summary.as_ref().and_then(|s| s.get("summary")),
+        "summary": context.and_then(|c| c.summary),
     });
     // Logged, or not made: a confirmation that cannot be recorded is never
     // stored, so no window or action confirmation exists unlogged.
@@ -891,7 +880,7 @@ async fn verify_assertion_once(
                 .map_err(store_err)?;
             let revoked = svc
                 .confirmations
-                .delete_for_passkey(&passkey.id)
+                .delete_standing_confirmations_for_passkey(&passkey.id)
                 .await
                 .map_err(store_err)?;
             svc.record(clone_event(serde_json::json!({
@@ -935,7 +924,7 @@ async fn verify_assertion_once(
         PasskeyUse::CloneSuspected => {
             let revoked = svc
                 .confirmations
-                .delete_for_passkey(&passkey.id)
+                .delete_standing_confirmations_for_passkey(&passkey.id)
                 .await
                 .map_err(store_err)?;
             svc.record(clone_event(serde_json::json!({
@@ -953,7 +942,7 @@ async fn verify_assertion_once(
 
 /// Store a window or action confirmation `passkey` just signed — only while
 /// that passkey is still the caller's and unflagged. Removal and the clone
-/// flag each revoke (`delete_for_passkey`) AFTER they change the passkey, so
+/// flag each revoke (`delete_standing_confirmations_for_passkey`) AFTER they change the passkey, so
 /// re-reading it after the insert closes the race with a concurrent removal
 /// or flag: either their revoke sees this row, or this re-read sees their
 /// change and revokes it here. Never a standing window for a passkey that
@@ -981,7 +970,7 @@ async fn put_confirmation_while_usable(
         return Ok(());
     }
     svc.confirmations
-        .delete_for_passkey(&passkey.id)
+        .delete_standing_confirmations_for_passkey(&passkey.id)
         .await
         .map_err(store_err)?;
     Err(ceremony(

@@ -11,10 +11,11 @@ use std::time::Duration;
 use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
 use scarab_identity::{
-    BeginExecution, ChallengePurpose, ChallengeStore, ConfirmationKind, IdentityError, Passkey,
-    PasskeyStore, PasskeyUse, RequestState, Role, StepUpConfirmation, StepUpRequest,
-    StepUpRequestPendingCaps, StepUpRequestRaiseOutcome, StepUpRequester, StepUpStore,
-    WebauthnChallenge, STEP_UP_WINDOW_MS,
+    ChallengePurpose, ChallengeStore, ConfirmationKind, IdentityError, Passkey, PasskeyStore,
+    PasskeyUse, Role, StepUpConfirmation, StepUpConfirmationRequest,
+    StepUpConfirmationRequestBeginOutcome, StepUpConfirmationRequestPendingCaps,
+    StepUpConfirmationRequestRaiseOutcome, StepUpConfirmationRequestState,
+    StepUpConfirmationRequester, StepUpStore, WebauthnChallenge, STEP_UP_WINDOW_MS,
 };
 
 fn passkey(id: &str, principal: &str, credential: &[u8], count: u32) -> Passkey {
@@ -76,8 +77,12 @@ fn confirmation(
     }
 }
 
-fn request(id: &str, requester: StepUpRequester, expires_at: i64) -> StepUpRequest {
-    StepUpRequest {
+fn request(
+    id: &str,
+    requester: StepUpConfirmationRequester,
+    expires_at: i64,
+) -> StepUpConfirmationRequest {
+    StepUpConfirmationRequest {
         id: id.into(),
         org: Some("acme".into()),
         op: "secret.put".into(),
@@ -92,7 +97,7 @@ fn request(id: &str, requester: StepUpRequester, expires_at: i64) -> StepUpReque
         session_role_cap: Some(Role::Admin),
         created_at: 0,
         expires_at,
-        state: RequestState::Pending,
+        state: StepUpConfirmationRequestState::Pending,
         confirmed_by: None,
         confirmed_at: None,
         confirmation_id: None,
@@ -102,8 +107,8 @@ fn request(id: &str, requester: StepUpRequester, expires_at: i64) -> StepUpReque
     }
 }
 
-fn token(id: &str) -> StepUpRequester {
-    StepUpRequester::ApiToken { id: id.into() }
+fn token(id: &str) -> StepUpConfirmationRequester {
+    StepUpConfirmationRequester::ApiToken { id: id.into() }
 }
 
 async fn db() -> Option<(common::TestDb, PostgresDb)> {
@@ -508,7 +513,10 @@ async fn deleting_standing_authority_spares_spent_and_request_confirmations() {
     db.put_confirmation(&other).await.unwrap();
 
     // w1, w2 and the unspent a2.
-    assert_eq!(db.delete_windows_for("amy").await.unwrap(), 3);
+    assert_eq!(
+        db.delete_standing_confirmations_for("amy").await.unwrap(),
+        3
+    );
     assert!(!db.has_window("sess-a", "amy", 1).await.unwrap());
     assert_eq!(
         db.consume_action("sess-a", "amy", &d, 3).await.unwrap(),
@@ -524,13 +532,13 @@ async fn deleting_standing_authority_spares_spent_and_request_confirmations() {
 
 /// Store `r` as-is: the only write a request has is the capped
 /// `raise_request`, so a test seeds through it with caps nothing reaches.
-async fn seed_request(db: &PostgresDb, r: &StepUpRequest) -> Result<(), IdentityError> {
-    let caps = StepUpRequestPendingCaps {
+async fn seed_request(db: &PostgresDb, r: &StepUpConfirmationRequest) -> Result<(), IdentityError> {
+    let caps = StepUpConfirmationRequestPendingCaps {
         per_requester: u64::MAX,
         per_human: u64::MAX,
     };
     match db.raise_request(r, caps, 0).await? {
-        StepUpRequestRaiseOutcome::Raised => Ok(()),
+        StepUpConfirmationRequestRaiseOutcome::Raised => Ok(()),
         other => panic!("uncapped raise refused: {other:?}"),
     }
 }
@@ -543,14 +551,14 @@ async fn a_request_round_trips_and_settles_once_dropping_its_sealed_body() {
     assert_eq!(db.get_request("r1").await.unwrap(), Some(r.clone()));
     assert_eq!(db.get_request("nope").await.unwrap(), None);
 
-    let BeginExecution::Begun(begun) = db
+    let StepUpConfirmationRequestBeginOutcome::Begun(begun) = db
         .begin_execution("r1", "amy", "conf-1", 100)
         .await
         .unwrap()
     else {
         panic!("a pending, live request begins");
     };
-    assert_eq!(begun.state, RequestState::Executing);
+    assert_eq!(begun.state, StepUpConfirmationRequestState::Executing);
     assert_eq!(begun.confirmed_by.as_deref(), Some("amy"));
     assert_eq!(begun.confirmation_id.as_deref(), Some("conf-1"));
     assert_eq!(begun.confirmed_at, Some(100));
@@ -559,18 +567,26 @@ async fn a_request_round_trips_and_settles_once_dropping_its_sealed_body() {
         db.begin_execution("r1", "amy", "conf-2", 101)
             .await
             .unwrap(),
-        BeginExecution::NotPending(RequestState::Executing)
+        StepUpConfirmationRequestBeginOutcome::NotPending(
+            StepUpConfirmationRequestState::Executing
+        )
     );
 
     assert!(matches!(
-        db.finish_request("r1", RequestState::Pending, None, None, 200)
-            .await,
+        db.finish_request(
+            "r1",
+            StepUpConfirmationRequestState::Pending,
+            None,
+            None,
+            200
+        )
+        .await,
         Err(IdentityError::Conflict(_))
     ));
     assert!(db
         .finish_request(
             "r1",
-            RequestState::Executed,
+            StepUpConfirmationRequestState::Executed,
             Some(201),
             Some("created"),
             200
@@ -578,32 +594,38 @@ async fn a_request_round_trips_and_settles_once_dropping_its_sealed_body() {
         .await
         .unwrap());
     let done = db.get_request("r1").await.unwrap().unwrap();
-    assert_eq!(done.state, RequestState::Executed);
+    assert_eq!(done.state, StepUpConfirmationRequestState::Executed);
     assert_eq!(done.sealed, None, "the parked body is gone once settled");
     assert_eq!(done.result_status, Some(201));
     assert_eq!(done.result_summary.as_deref(), Some("created"));
     assert_eq!(done.executed_at, Some(200));
     assert!(
-        !db.finish_request("r1", RequestState::Failed, Some(500), None, 300)
-            .await
-            .unwrap(),
+        !db.finish_request(
+            "r1",
+            StepUpConfirmationRequestState::Failed,
+            Some(500),
+            None,
+            300
+        )
+        .await
+        .unwrap(),
         "settled once"
     );
     assert_eq!(
         db.begin_execution("r1", "amy", "conf-3", 400)
             .await
             .unwrap(),
-        BeginExecution::NotPending(RequestState::Executed)
+        StepUpConfirmationRequestBeginOutcome::NotPending(StepUpConfirmationRequestState::Executed)
     );
     assert_eq!(
         db.begin_execution("nope", "amy", "c", 1).await.unwrap(),
-        BeginExecution::NotFound
+        StepUpConfirmationRequestBeginOutcome::NotFound
     );
 
     // A Bearer-session requester round-trips too.
     let s = request(
         "r2",
-        StepUpRequester::BearerSession {
+        StepUpConfirmationRequester::BearerSession {
             session_hash: "sess-h".into(),
         },
         5_000,
@@ -622,11 +644,15 @@ async fn an_expired_request_cannot_begin() {
         .unwrap();
     assert_eq!(
         db.begin_execution("r1", "amy", "c", 5_000).await.unwrap(),
-        BeginExecution::Expired,
+        StepUpConfirmationRequestBeginOutcome::Expired,
         "expiry is exclusive at the instant"
     );
     let r = db.get_request("r1").await.unwrap().unwrap();
-    assert_eq!(r.state, RequestState::Pending, "nothing was stamped");
+    assert_eq!(
+        r.state,
+        StepUpConfirmationRequestState::Pending,
+        "nothing was stamped"
+    );
     assert_eq!(r.confirmed_by, None);
     assert!(r.is_expired(5_000));
     tdb.cleanup().await;
@@ -683,10 +709,14 @@ async fn two_concurrent_confirmers_begin_a_request_exactly_once() {
     }
     let begun = outcomes
         .iter()
-        .filter(|o| matches!(o, BeginExecution::Begun(_)))
+        .filter(|o| matches!(o, StepUpConfirmationRequestBeginOutcome::Begun(_)))
         .count();
     assert_eq!(begun, 1, "exactly one confirmer executes: {outcomes:?}");
-    assert!(outcomes.contains(&BeginExecution::NotPending(RequestState::Executing)));
+    assert!(
+        outcomes.contains(&StepUpConfirmationRequestBeginOutcome::NotPending(
+            StepUpConfirmationRequestState::Executing
+        ))
+    );
 
     tdb.cleanup().await;
 }
@@ -694,7 +724,7 @@ async fn two_concurrent_confirmers_begin_a_request_exactly_once() {
 #[tokio::test]
 async fn pending_count_counts_only_this_requesters_live_pending_requests() {
     let Some((tdb, db)) = db().await else { return };
-    let session = StepUpRequester::BearerSession {
+    let session = StepUpConfirmationRequester::BearerSession {
         session_hash: "t1".into(),
     };
     seed_request(&db, &request("r1", token("t1"), 5_000))
@@ -827,9 +857,15 @@ async fn reaping_drops_dead_rows_and_dead_bodies_only() {
     db.begin_execution("old", "amy", "c2", cutoff - 2)
         .await
         .unwrap();
-    db.finish_request("old", RequestState::Executed, Some(204), None, cutoff - 1)
-        .await
-        .unwrap();
+    db.finish_request(
+        "old",
+        StepUpConfirmationRequestState::Executed,
+        Some(204),
+        None,
+        cutoff - 1,
+    )
+    .await
+    .unwrap();
     // Expired before the cutoff: gone.
     seed_request(&db, &request("ancient", token("t1"), cutoff - 1))
         .await
@@ -901,34 +937,34 @@ async fn schema_version_reads_the_applied_migrations() {
 #[tokio::test]
 async fn raise_request_caps_per_requester_and_per_human() {
     let Some((tdb, db)) = db().await else { return };
-    let caps = StepUpRequestPendingCaps {
+    let caps = StepUpConfirmationRequestPendingCaps {
         per_requester: 2,
         per_human: 3,
     };
-    let raise = |id: &str, requester: StepUpRequester| {
+    let raise = |id: &str, requester: StepUpConfirmationRequester| {
         let r = request(id, requester, 5_000);
         let db = &db;
         async move { db.raise_request(&r, caps, 10).await.unwrap() }
     };
     assert_eq!(
         raise("r1", token("t1")).await,
-        StepUpRequestRaiseOutcome::Raised
+        StepUpConfirmationRequestRaiseOutcome::Raised
     );
     assert_eq!(
         raise("r2", token("t1")).await,
-        StepUpRequestRaiseOutcome::Raised
+        StepUpConfirmationRequestRaiseOutcome::Raised
     );
     assert_eq!(
         raise("r3", token("t1")).await,
-        StepUpRequestRaiseOutcome::RequesterFull { pending: 2 }
+        StepUpConfirmationRequestRaiseOutcome::RequesterFull { pending: 2 }
     );
     assert_eq!(
         raise("r4", token("t2")).await,
-        StepUpRequestRaiseOutcome::Raised
+        StepUpConfirmationRequestRaiseOutcome::Raised
     );
     assert_eq!(
         raise("r5", token("t3")).await,
-        StepUpRequestRaiseOutcome::HumanFull { pending: 3 }
+        StepUpConfirmationRequestRaiseOutcome::HumanFull { pending: 3 }
     );
     // An expired request does not count; nor does a settled one.
     seed_request(&db, &request("old", token("t9"), 5))
@@ -937,14 +973,14 @@ async fn raise_request_caps_per_requester_and_per_human() {
     db.begin_execution("r1", "amy", "c", 10).await.unwrap();
     assert_eq!(
         raise("r6", token("t3")).await,
-        StepUpRequestRaiseOutcome::Raised
+        StepUpConfirmationRequestRaiseOutcome::Raised
     );
     // Another human is not affected.
     let mut bob = request("b1", token("tb"), 5_000);
     bob.for_human = "bob".into();
     assert_eq!(
         db.raise_request(&bob, caps, 10).await.unwrap(),
-        StepUpRequestRaiseOutcome::Raised
+        StepUpConfirmationRequestRaiseOutcome::Raised
     );
     for id in ["r3", "r5"] {
         assert!(db.get_request(id).await.unwrap().is_none(), "{id}");
@@ -961,7 +997,7 @@ async fn raise_request_caps_per_requester_and_per_human() {
 async fn raise_request_counts_and_inserts_under_the_human_s_lock() {
     let Some((tdb, db)) = db().await else { return };
     let db = std::sync::Arc::new(db);
-    let caps = StepUpRequestPendingCaps {
+    let caps = StepUpConfirmationRequestPendingCaps {
         per_requester: 10,
         per_human: 3,
     };
@@ -996,13 +1032,13 @@ async fn raise_request_counts_and_inserts_under_the_human_s_lock() {
     lock.commit().await.unwrap();
     assert_eq!(
         racer.await.unwrap(),
-        StepUpRequestRaiseOutcome::HumanFull { pending: 3 }
+        StepUpConfirmationRequestRaiseOutcome::HumanFull { pending: 3 }
     );
     assert!(db.get_request("racer").await.unwrap().is_none());
     tdb.cleanup().await;
 }
 
-/// git-bug 6856659: `delete_for_passkey` revokes exactly the standing
+/// git-bug 6856659: `delete_standing_confirmations_for_passkey` revokes exactly the standing
 /// step-ups that passkey signed — windows and unconsumed action
 /// confirmations, in every session — and nothing another passkey signed.
 #[tokio::test]
@@ -1025,7 +1061,12 @@ async fn delete_for_passkey_revokes_only_what_it_signed() {
     ] {
         db.put_confirmation(&c).await.unwrap();
     }
-    assert_eq!(db.delete_for_passkey("pk-gone").await.unwrap(), 3);
+    assert_eq!(
+        db.delete_standing_confirmations_for_passkey("pk-gone")
+            .await
+            .unwrap(),
+        3
+    );
     assert_eq!(
         db.live_window("s1", "amy", 20).await.unwrap().map(|w| w.0),
         Some("other".to_string())
@@ -1036,6 +1077,11 @@ async fn delete_for_passkey_revokes_only_what_it_signed() {
         .await
         .unwrap()
         .is_none());
-    assert_eq!(db.delete_for_passkey("pk-gone").await.unwrap(), 0);
+    assert_eq!(
+        db.delete_standing_confirmations_for_passkey("pk-gone")
+            .await
+            .unwrap(),
+        0
+    );
     tdb.cleanup().await;
 }

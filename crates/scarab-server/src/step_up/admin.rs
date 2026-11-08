@@ -28,7 +28,7 @@ use utoipa::ToSchema;
 
 use scarab_db_postgres::{BindingRow, PostgresDb};
 use scarab_identity::{
-    security_event_kind as kind, Action, Binding, PasskeyStore, Role, Scope, SecurityEventLog,
+    security_event_kind as kind, Action, Binding, OrgSecurityEventLog, PasskeyStore, Role, Scope,
     StepUpStore,
 };
 
@@ -122,7 +122,7 @@ pub(crate) async fn reset_member_passkeys(
     let removed = svc.passkeys.remove_all(&subject).await.map_err(store_err)?;
     let windows_revoked = svc
         .confirmations
-        .delete_windows_for(&subject)
+        .delete_standing_confirmations_for(&subject)
         .await
         .map_err(store_err)?;
     let now = st.clock.now().await.0;
@@ -293,7 +293,7 @@ pub async fn reset_passkeys(
         "os_user": operator.os_user,
         "removed": held,
     });
-    SecurityEventLog::append(db, &ev).await.map_err(|e| {
+    OrgSecurityEventLog::append(db, &ev).await.map_err(|e| {
         format!(
             "the reset could not be recorded in the security event log, so nothing was \
              removed: {e}"
@@ -302,7 +302,7 @@ pub async fn reset_passkeys(
     let removed = PasskeyStore::remove_all(db, &subject)
         .await
         .map_err(|e| format!("could not remove the passkeys of `{subject}`: {e}"))?;
-    let windows_revoked = StepUpStore::delete_windows_for(db, &subject)
+    let windows_revoked = StepUpStore::delete_standing_confirmations_for(db, &subject)
         .await
         .map_err(|e| format!("could not revoke the step-ups of `{subject}`: {e}"))?;
     Ok(PasskeyResetDto {
