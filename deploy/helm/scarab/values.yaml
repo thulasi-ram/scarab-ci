@@ -549,6 +549,12 @@ plugins:
   # pod-security.kubernetes.io/enforce=restricted and
   # scarab.io/plugin-runtime-owner=<release namespace>.<release name>.
   createNamespace: true
+  # Which release owns the plugin namespace (SCARAB_PLUGIN_OWNER, the
+  # scarab.io/plugin-runtime-owner label). "" = <release namespace>.<release
+  # name>. A label value: at most 63 characters, unique to this release. Set
+  # it when the default is longer than that (the chart then refuses to
+  # render rather than truncate two releases into one owner).
+  owner: ""
   # A NetworkPolicy on the scarab-server Pods: the broker port only from
   # plugin workloads in the plugin namespace; the API port stays open to
   # every source. Needs a CNI that enforces NetworkPolicy (plugins already

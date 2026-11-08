@@ -9,7 +9,11 @@
   another release, so two releases never sweep each other's plugins.
 */}}
 {{- define "scarab.pluginOwner" -}}
-{{- printf "%s.%s" .Release.Namespace .Release.Name | trunc 63 | trimSuffix "-" | trimSuffix "." -}}
+{{- $owner := .Values.plugins.owner | default (printf "%s.%s" .Release.Namespace .Release.Name) -}}
+{{- if gt (len $owner) 63 -}}
+{{- fail (printf "the plugin owner %q is longer than 63 characters, the most a label value holds; truncating could give two releases the same owner, so set plugins.owner to a shorter name unique to this release" $owner) -}}
+{{- end -}}
+{{- $owner -}}
 {{- end -}}
 
 {{/* Fully qualified app name. */}}

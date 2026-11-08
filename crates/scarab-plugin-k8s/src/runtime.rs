@@ -283,8 +283,8 @@ impl K8sPluginRuntime {
     }
 
     /// Run the isolation probe (see [`crate::probe`]). Never an `Err`: a
-    /// probe that cannot finish is a FAILED probe, and the Plugin does not
-    /// start. Its Pods are deleted afterwards, pass or fail, and so are any a
+    /// probe that cannot finish is an INCONCLUSIVE probe, and no new Plugin
+    /// starts on it. Its Pods are deleted afterwards, pass or fail, and so are any a
     /// crashed earlier probe left behind — but only ones past their deadline,
     /// never another manager's probe still in flight.
     ///

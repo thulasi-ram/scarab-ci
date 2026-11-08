@@ -75,6 +75,9 @@ pub struct Isolation {
     /// runs under an earlier passed probe keeps running, nothing new
     /// starts, and the next pass probes again.
     pub inconclusive: Option<String>,
+    /// What the last probe saw that does not decide the verdict (a reached
+    /// kubelet), shown on a running Plugin's status (git-bug da0af59).
+    pub notes: Vec<String>,
 }
 
 /// Whether this pass must run the isolation probe.
@@ -220,6 +223,20 @@ pub fn decide(
             pod_broker_url: pod_broker_url.clone(),
         },
         (None, None) => Decision::Wait,
+    }
+}
+
+/// A running Plugin's status message carries the last probe's notes (a
+/// reached kubelet), so an operator sees them; any other status keeps its
+/// own message.
+fn with_notes(
+    (status, message): (RuntimeStatus, String),
+    isolation: &Isolation,
+) -> (RuntimeStatus, String) {
+    if status == RuntimeStatus::Running && message.is_empty() && !isolation.notes.is_empty() {
+        (status, format!("note: {}", isolation.notes.join("; ")))
+    } else {
+        (status, message)
     }
 }
 
@@ -495,7 +512,10 @@ impl PluginRuntimeLoop {
         let report = self.runtime.probe_isolation(pod_broker_url).await;
         let finished = self.clock.now().await.0;
         match report.verdict {
-            ProbeVerdict::Passed => tracing::info!("plugin runtime: isolation probe passed"),
+            ProbeVerdict::Passed => tracing::info!(
+                result = %report.message(),
+                "plugin runtime: isolation probe passed"
+            ),
             ProbeVerdict::Failed => tracing::error!(
                 findings = %report.message(),
                 "plugin runtime: isolation probe FAILED; no plugin runs"
@@ -510,6 +530,7 @@ impl PluginRuntimeLoop {
             probed_at: Some(finished),
             failure: (report.verdict == ProbeVerdict::Failed).then(|| report.message()),
             inconclusive: (report.verdict == ProbeVerdict::Inconclusive).then(|| report.message()),
+            notes: report.notes.clone(),
         };
     }
 
@@ -564,7 +585,7 @@ impl PluginRuntimeLoop {
                         // pass does not take it for a fresh install and
                         // re-probe.
                         Ok(()) => match self.runtime.workload_state(installation).await {
-                            Ok(state) => running_status(&state),
+                            Ok(state) => with_notes(running_status(&state), &self.isolation),
                             Err(e) => (RuntimeStatus::Pending, format!("state unknown: {e}")),
                         },
                         Err(e) => (RuntimeStatus::Error, e.to_string()),
@@ -650,6 +671,7 @@ mod tests {
             probed_at: Some(at),
             failure: None,
             inconclusive: None,
+            notes: Vec::new(),
         }
     }
 
@@ -658,6 +680,7 @@ mod tests {
             probed_at: Some(at),
             failure: Some("isolation probe failed: NetworkPolicy is NOT enforced".into()),
             inconclusive: None,
+            notes: Vec::new(),
         }
     }
 
@@ -666,6 +689,7 @@ mod tests {
             probed_at: Some(at),
             failure: None,
             inconclusive: Some("isolation probe inconclusive: the probe could not run".into()),
+            notes: Vec::new(),
         }
     }
 
@@ -709,6 +733,29 @@ mod tests {
             &inconclusive(now),
             &[running(now - HOUR_MS)]
         ));
+    }
+
+    /// git-bug da0af59 (9, red team): a probe's note reaches a running
+    /// Plugin's message; other statuses keep theirs.
+    #[test]
+    fn a_probe_note_reaches_a_running_plugins_message() {
+        let mut noted = passed(1);
+        noted.notes = vec!["a plugin-labelled Pod reached the kubelet".into()];
+        assert_eq!(
+            with_notes((RuntimeStatus::Running, String::new()), &noted),
+            (
+                RuntimeStatus::Running,
+                "note: a plugin-labelled Pod reached the kubelet".to_string()
+            )
+        );
+        assert_eq!(
+            with_notes((RuntimeStatus::Error, "CrashLoopBackOff".into()), &noted),
+            (RuntimeStatus::Error, "CrashLoopBackOff".to_string())
+        );
+        assert_eq!(
+            with_notes((RuntimeStatus::Running, String::new()), &passed(1)),
+            (RuntimeStatus::Running, String::new())
+        );
     }
 
     /// git-bug da0af59 (6, red team): an inconclusive retry leaves a hold
