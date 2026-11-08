@@ -14,13 +14,18 @@
 //!    Plugin is. It MUST reach the broker's `healthz` (the one allowance
 //!    works), and MUST FAIL to reach the canary, the API server
 //!    (`$KUBERNETES_SERVICE_HOST`, always injected by the kubelet),
-//!    `1.1.1.1:443` (the internet), the cloud metadata service
-//!    (`169.254.169.254:80`), and MUST get no DNS answer at all — the
-//!    cluster resolver forwards any name upstream, so DNS would be a tunnel
-//!    out. A Plugin needs no DNS: it is handed the broker as an IP.
+//!    `1.1.1.1:443` and `[2606:4700:4700::1111]:443` (the internet, over
+//!    IPv4 and IPv6), the cloud metadata service (`169.254.169.254:80`),
+//!    and MUST get no DNS answer at all — the cluster resolver forwards any
+//!    name upstream, so DNS would be a tunnel out. A Plugin needs no DNS: it
+//!    is handed the broker as an IP. It also dials the kubelet on its own
+//!    node (`:10250`); a CNI may leave node addresses outside NetworkPolicy,
+//!    so a reached kubelet is a note in the message, not a failure.
 //!
-//! Any deviation fails the probe and no Plugin starts — including a probe
-//! that cannot finish. A cluster whose CNI ignores NetworkPolicy lets the
+//! A plugin-side deviation fails the probe and no Plugin starts. A probe
+//! that cannot tell (a control-side deviation, a check that never reported,
+//! a probe that cannot finish) is inconclusive: what already runs keeps
+//! running, nothing new starts, and the runtime probes again. A cluster whose CNI ignores NetworkPolicy lets the
 //! plugin-labelled Pod reach the canary, and fails here, loudly, rather than
 //! running Plugins unprotected.
 //!
@@ -48,8 +53,8 @@
 use std::collections::BTreeMap;
 
 use k8s_openapi::api::core::v1::{
-    Container, EmptyDirVolumeSource, EnvVar, Pod, PodSpec, Probe, ResourceRequirements,
-    TCPSocketAction, Volume, VolumeMount,
+    Container, EmptyDirVolumeSource, EnvVar, EnvVarSource, ObjectFieldSelector, Pod, PodSpec,
+    Probe, ResourceRequirements, TCPSocketAction, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -73,6 +78,17 @@ pub const DEFAULT_PROBE_IMAGE: &str =
 
 /// The address the internet check dials.
 pub const PROBE_INTERNET_ADDR: (&str, u16) = ("1.1.1.1", 443);
+
+/// The address the IPv6 internet check dials (Cloudflare's resolver, like
+/// [`PROBE_INTERNET_ADDR`]). On an IPv4-only cluster it is unreached by
+/// construction, which is the answer wanted.
+pub const PROBE_INTERNET6_ADDR: (&str, u16) = ("2606:4700:4700::1111", 443);
+
+/// The kubelet's port, dialed on the probe Pod's own node. Advisory only: a
+/// CNI may leave traffic to node addresses outside NetworkPolicy, and the
+/// kubelet authenticates every call, so a reached kubelet is reported, not
+/// a failure (git-bug da0af59).
+pub const PROBE_KUBELET_PORT: u16 = 10250;
 
 /// The cloud metadata service (AWS, GCP, Azure, OpenStack all answer here):
 /// node credentials, if a Plugin can reach it.
@@ -126,6 +142,9 @@ pub enum ProbeCheck {
     ApiServer,
     /// Plugin-labelled Pod → 1.1.1.1:443. MUST NOT be reached.
     Internet,
+    /// Plugin-labelled Pod → [2606:4700:4700::1111]:443. MUST NOT be
+    /// reached.
+    Internet6,
     /// Plugin-labelled Pod → 169.254.169.254:80. MUST NOT be reached.
     Metadata,
 }
@@ -138,6 +157,7 @@ impl ProbeCheck {
             ProbeCheck::Broker => "broker",
             ProbeCheck::ApiServer => "apiserver",
             ProbeCheck::Internet => "internet",
+            ProbeCheck::Internet6 => "internet6",
             ProbeCheck::Metadata => "metadata",
         }
     }
@@ -174,6 +194,9 @@ impl ProbeCheck {
             }
             ProbeCheck::ApiServer => "a plugin-labelled Pod reached the Kubernetes API server",
             ProbeCheck::Internet => "a plugin-labelled Pod reached 1.1.1.1:443 (the internet)",
+            ProbeCheck::Internet6 => {
+                "a plugin-labelled Pod reached [2606:4700:4700::1111]:443 (the internet over IPv6)"
+            }
             ProbeCheck::Metadata => {
                 "a plugin-labelled Pod reached the cloud metadata service (169.254.169.254:80)"
             }
@@ -186,14 +209,18 @@ const CONTROL_SIDE_CHECKS: [ProbeCheck; 2] = [
     ProbeCheck::ControlResolves,
 ];
 
-const PLUGIN_SIDE_CHECKS: [ProbeCheck; 6] = [
+const PLUGIN_SIDE_CHECKS: [ProbeCheck; 7] = [
     ProbeCheck::Broker,
     ProbeCheck::Dns,
     ProbeCheck::Canary,
     ProbeCheck::ApiServer,
     ProbeCheck::Internet,
+    ProbeCheck::Internet6,
     ProbeCheck::Metadata,
 ];
+
+/// The advisory check's wire name: reported in `notes`, never a finding.
+const KUBELET_CHECK: &str = "kubelet";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProbeVerdict {
@@ -214,6 +241,9 @@ pub enum ProbeVerdict {
 pub struct ProbeReport {
     pub verdict: ProbeVerdict,
     pub findings: Vec<String>,
+    /// What the probe saw that does not decide the verdict (a reached
+    /// kubelet), for the operator.
+    pub notes: Vec<String>,
 }
 
 impl ProbeReport {
@@ -228,11 +258,21 @@ impl ProbeReport {
         Self {
             verdict: ProbeVerdict::Inconclusive,
             findings: vec![format!("the probe could not run: {}", why.into())],
+            notes: Vec::new(),
         }
     }
 
     /// One line for `runtime_message`.
     pub fn message(&self) -> String {
+        let verdict = self.verdict_message();
+        if self.notes.is_empty() {
+            verdict
+        } else {
+            format!("{verdict} (note: {})", self.notes.join("; "))
+        }
+    }
+
+    fn verdict_message(&self) -> String {
         match self.verdict {
             ProbeVerdict::Passed => "isolation probe passed".to_string(),
             ProbeVerdict::Failed => {
@@ -303,9 +343,18 @@ pub fn assess(control_log: &str, plugin_log: &str) -> ProbeReport {
         ProbeVerdict::Passed
     };
     failures.extend(unknowns);
+    let notes = match plugin.get(KUBELET_CHECK) {
+        Some(true) => vec![format!(
+            "a plugin-labelled Pod reached the kubelet on its node (:{PROBE_KUBELET_PORT}); this \
+             CNI leaves node addresses outside NetworkPolicy, and the kubelet authenticates \
+             every call"
+        )],
+        _ => Vec::new(),
+    };
     ProbeReport {
         verdict,
         findings: failures,
+        notes,
     }
 }
 
@@ -437,6 +486,7 @@ pub fn canary_pod(namespace: &str, nonce: &str, image: &str) -> Pod {
 ///   because a pass is one consistent look at the Pod's network.
 pub fn plugin_check_fns() -> String {
     let (internet_host, internet_port) = PROBE_INTERNET_ADDR;
+    let (internet6_host, internet6_port) = PROBE_INTERNET6_ADDR;
     let (metadata_host, metadata_port) = PROBE_METADATA_ADDR;
     format!(
         r#"reach() {{ if nc -z -w 3 "$2" "$3" >/dev/null 2>&1; then echo "SCARAB_PROBE $1 reached"; else echo "SCARAB_PROBE $1 unreached"; fi; }}
@@ -454,12 +504,14 @@ plugin_checks() {{
   resolves dns {dns_name}
   if [ -z "$KUBERNETES_SERVICE_HOST" ]; then echo "SCARAB_PROBE apiserver unknown"; else reach apiserver "$KUBERNETES_SERVICE_HOST" "$KUBERNETES_SERVICE_PORT"; fi
   reach internet {internet_host} {internet_port}
+  reach internet6 {internet6_host} {internet6_port}
   reach metadata {metadata_host} {metadata_port}
   if [ -n "$CANARY_IP" ]; then reach canary "$CANARY_IP" {canary_port}; fi
+  if [ -n "$HOST_IP" ]; then reach kubelet "$HOST_IP" {kubelet_port}; fi
 }}
 isolated() {{
   case "$1" in *"SCARAB_PROBE broker reached"*) ;; *) return 1 ;; esac
-  for c in dns apiserver internet metadata ${{CANARY_IP:+canary}}; do
+  for c in dns apiserver internet internet6 metadata ${{CANARY_IP:+canary}}; do
     case "$1" in *"SCARAB_PROBE $c unreached"*) ;; *) return 1 ;; esac
   done
 }}
@@ -475,6 +527,7 @@ until_isolated() {{
 "#,
         dns_name = PROBE_DNS_NAME,
         canary_port = PROBE_CANARY_PORT,
+        kubelet_port = PROBE_KUBELET_PORT,
     )
 }
 
@@ -556,6 +609,19 @@ until_isolated {deadline}
             env: Some(vec![
                 env("CANARY_IP", canary_ip),
                 env("BROKER_URL", broker_url.trim_end_matches('/')),
+                // The node this Pod runs on, for the advisory kubelet check
+                // (the namespace probe only; a Plugin's self-check has none).
+                EnvVar {
+                    name: "HOST_IP".to_string(),
+                    value_from: Some(EnvVarSource {
+                        field_ref: Some(ObjectFieldSelector {
+                            field_path: "status.hostIP".to_string(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
             ]),
             ..Default::default()
         },
@@ -624,7 +690,8 @@ mod tests {
     const CONTROL_OK: &str = "SCARAB_PROBE canary reached\nSCARAB_PROBE dns reached\n";
     const PLUGIN_OK: &str = "SCARAB_PROBE broker reached\nSCARAB_PROBE dns unreached\n\
         SCARAB_PROBE apiserver unreached\nSCARAB_PROBE internet unreached\n\
-        SCARAB_PROBE metadata unreached\nSCARAB_PROBE canary unreached\n";
+        SCARAB_PROBE internet6 unreached\nSCARAB_PROBE metadata unreached\n\
+        SCARAB_PROBE canary unreached\nSCARAB_PROBE kubelet unreached\n";
 
     /// The script as `sh` receives it: the Pod carries every `$` as `$$`
     /// (git-bug 4b6cb01), and the kubelet reduces each pair to one.
@@ -673,7 +740,7 @@ mod tests {
 
     #[test]
     fn every_forbidden_destination_fails_the_probe() {
-        for check in ["dns", "apiserver", "internet", "metadata"] {
+        for check in ["dns", "apiserver", "internet", "internet6", "metadata"] {
             let leaky =
                 PLUGIN_OK.replace(&format!("{check} unreached"), &format!("{check} reached"));
             assert!(!assess(CONTROL_OK, &leaky).passed(), "{check}");
@@ -683,6 +750,32 @@ mod tests {
         assert!(assess(CONTROL_OK, &resolving)
             .message()
             .contains("DNS is a tunnel out"));
+    }
+
+    /// git-bug da0af59 (9): the internet over IPv6 is checked like over
+    /// IPv4; a reached kubelet is a note, never a finding.
+    #[test]
+    fn ipv6_is_checked_and_a_reached_kubelet_is_only_a_note() {
+        let v6 = PLUGIN_OK.replace("internet6 unreached", "internet6 reached");
+        let report = assess(CONTROL_OK, &v6);
+        assert_eq!(report.verdict, ProbeVerdict::Failed);
+        assert!(report.message().contains("over IPv6"), "{report:?}");
+
+        let kubelet = PLUGIN_OK.replace("kubelet unreached", "kubelet reached");
+        let report = assess(CONTROL_OK, &kubelet);
+        assert_eq!(report.verdict, ProbeVerdict::Passed, "{report:?}");
+        assert!(report.findings.is_empty());
+        assert!(
+            report
+                .message()
+                .starts_with("isolation probe passed (note:"),
+            "{report:?}"
+        );
+
+        // A probe Pod without the kubelet line (a self-check has no
+        // HOST_IP) is still a pass.
+        let no_kubelet = PLUGIN_OK.replace("SCARAB_PROBE kubelet unreached\n", "");
+        assert!(assess(CONTROL_OK, &no_kubelet).passed());
     }
 
     #[test]
@@ -788,11 +881,15 @@ mod tests {
             "resolves dns example.com.",
             "reach apiserver \"$KUBERNETES_SERVICE_HOST\"",
             "reach internet 1.1.1.1 443",
+            "reach internet6 2606:4700:4700::1111 443",
             "reach metadata 169.254.169.254 80",
             "reach canary \"$CANARY_IP\" 8080",
+            // Advisory, and only where the namespace probe sets HOST_IP.
+            "if [ -n \"$HOST_IP\" ]; then reach kubelet \"$HOST_IP\" 10250; fi",
             // Every forbidden destination, the canary included where it is
-            // set, must be positively unreached in one pass.
-            "for c in dns apiserver internet metadata ${CANARY_IP:+canary}",
+            // set, must be positively unreached in one pass; the kubelet is
+            // not among them.
+            "for c in dns apiserver internet internet6 metadata ${CANARY_IP:+canary}",
         ] {
             assert!(script.contains(needle), "{needle} missing from {script}");
         }
