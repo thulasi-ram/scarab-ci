@@ -35,6 +35,13 @@
 //!   `Grpc-Metadata-Token`, Kubernetes' `Impersonate-User`), and gets back
 //!   only [`RESPONSE_HEADERS`] — never a session or anything carrying the
 //!   credential;
+//! - **response bodies are read for the credential**: a body that holds it
+//!   is cut before the chunk that completes it, however the chunks split
+//!   it, and no `Accept-Encoding` goes upstream so a body is never
+//!   compressed past reading (a compressed one is refused);
+//! - **destinations are pinned**: the bound host is resolved once per
+//!   connection and only an address that is not link-local or loopback is
+//!   connected to;
 //! - **no request body** (a read carries none) and **no redirects** — a 3xx
 //!   is handed back, never followed, so an upstream cannot bounce the
 //!   credential elsewhere;
@@ -106,6 +113,8 @@ const MAX_JOURNAL_QUERY_CHARS: usize = 2048;
 const MAX_JOURNAL_SLOT_CHARS: usize = 63;
 const RETRY_AFTER_TOO_MANY_SECS: u64 = 1;
 const RETRY_AFTER_BUSY_SECS: u64 = 5;
+/// Why a stream is cut when the upstream's body holds the credential.
+const CREDENTIAL_IN_BODY: &str = "cut: the upstream response held the credential";
 /// Response chunks buffered between the upstream and the Plugin.
 const STREAM_BUFFER_CHUNKS: usize = 16;
 /// An upstream client unused this long is dropped; the next request for its
@@ -119,10 +128,11 @@ const CREDENTIAL_IDLE: Duration = Duration::from_secs(15 * 60);
 /// The Plugin's headers that may travel upstream — content negotiation,
 /// conditional reads and an identifying agent, nothing that could change
 /// what the upstream does or as whom. (No `Range` or `Cache-Control`: the
-/// Argo CD reporter needs neither.)
-pub const REQUEST_HEADERS: [&str; 6] = [
+/// Argo CD reporter needs neither. No `Accept-Encoding`: the broker reads
+/// every response body for the credential, and cannot read a compressed
+/// one.)
+pub const REQUEST_HEADERS: [&str; 5] = [
     "accept",
-    "accept-encoding",
     "accept-language",
     "if-none-match",
     "if-modified-since",
@@ -1145,7 +1155,6 @@ pub(crate) async fn proxy(
 
     let status = upstream.status();
     let response_headers = forwardable_response_headers(upstream.headers(), credential.as_bytes());
-    drop(credential);
     journal_slot.send(draft.head(status));
 
     let cut = Arc::new(AtomicBool::new(false));
@@ -1155,6 +1164,7 @@ pub(crate) async fn proxy(
         installation_id: installation.id.clone(),
         slot: slot.name.clone(),
         credential_ref: connection.credential_ref.clone(),
+        credential: credential.into_bytes(),
         cut: cut.clone(),
         unreadable: AtomicU32::new(0),
     };
@@ -1253,7 +1263,29 @@ async fn send_upstream(
     )
     .await
     {
-        Ok(Ok(resp)) => Ok((connection, credential, resp)),
+        Ok(Ok(resp)) => {
+            // The body is read for the credential, which a compressed body
+            // would hide. The broker asks for none (no Accept-Encoding goes
+            // upstream), so an encoded body is an upstream ignoring that.
+            let encoded = resp
+                .headers()
+                .get(header::CONTENT_ENCODING)
+                .is_some_and(|v| !v.as_bytes().eq_ignore_ascii_case(b"identity"));
+            if encoded {
+                tracing::warn!(installation = %installation_id, slot = %slot.name,
+                    "broker: the upstream encoded its response; refused");
+                return Err(Refusal::new(
+                    StatusCode::BAD_GATEWAY,
+                    "encoded body",
+                    format!(
+                        "connection `{}`: the upstream compressed its response, which the broker \
+                         cannot check; the broker asks for none",
+                        slot.name
+                    ),
+                ));
+            }
+            Ok((connection, credential, resp))
+        }
         Ok(Err(e)) if denied_destination(&e) => {
             tracing::warn!(installation = %installation_id, slot = %slot.name, error = %e,
                 "broker: the bound destination resolves only to addresses the broker does not \
@@ -1387,6 +1419,9 @@ struct Pump {
     installation_id: String,
     slot: String,
     credential_ref: String,
+    /// The bound credential: a body that holds it is cut before the chunk
+    /// that completes it ([`scan_for_credential`]).
+    credential: Vec<u8>,
     /// Set before the sender drops when the stream did not simply end: the
     /// Plugin's body then ends in an error ([`body_stream`]).
     cut: Arc<AtomicBool>,
@@ -1409,6 +1444,9 @@ impl Pump {
         );
         recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut bytes = 0u64;
+        // The tail of what arrived that could be the start of the
+        // credential: held back until the next chunk shows it is not.
+        let mut held = Vec::new();
         let end = loop {
             tokio::select! {
                 _ = recheck.tick() => {
@@ -1418,7 +1456,21 @@ impl Pump {
                 }
                 _ = tx.closed() => break None,
                 next = body.next() => match next {
-                    None => break None,
+                    None => {
+                        // The body ended, so what was held back is not the
+                        // credential.
+                        if held.is_empty() {
+                            break None;
+                        }
+                        let rest = Bytes::from(std::mem::take(&mut held));
+                        let len = rest.len() as u64;
+                        match self.deliver(&tx, rest, &mut recheck).await {
+                            Ok(()) => bytes += len,
+                            Err(Some(why)) => break Some(why),
+                            Err(None) => {}
+                        }
+                        break None;
+                    }
                     Some(Err(e)) => {
                         tracing::warn!(installation = %self.installation_id, slot = %self.slot,
                             error = %e, "broker: upstream body failed mid-stream");
@@ -1427,8 +1479,15 @@ impl Pump {
                         break Some("upstream body error");
                     }
                     Some(Ok(chunk)) => {
-                        let len = chunk.len() as u64;
-                        match self.deliver(&tx, chunk, &mut recheck).await {
+                        let Some(ready) = scan_for_credential(&mut held, &chunk, &self.credential)
+                        else {
+                            break Some(self.cut(&tx, CREDENTIAL_IN_BODY).await);
+                        };
+                        if ready.is_empty() {
+                            continue;
+                        }
+                        let len = ready.len() as u64;
+                        match self.deliver(&tx, ready, &mut recheck).await {
                             Ok(()) => bytes += len,
                             Err(Some(why)) => break Some(why),
                             // The Plugin went away.
@@ -1511,6 +1570,26 @@ impl Pump {
     }
 }
 
+/// Add `chunk` to what was `held` back and return what may go to the
+/// Plugin, or `None` if the credential is in it. What is held back is the
+/// longest tail that is a start of the credential, so a credential split
+/// across chunks is caught and no part of it is sent first; any other tail
+/// goes at once, so a watch stream's events are not delayed.
+fn scan_for_credential(held: &mut Vec<u8>, chunk: &[u8], credential: &[u8]) -> Option<Bytes> {
+    held.extend_from_slice(chunk);
+    if contains(held, credential) {
+        held.clear();
+        return None;
+    }
+    let longest = credential.len().saturating_sub(1).min(held.len());
+    let keep = (1..=longest)
+        .rev()
+        .find(|&k| held.ends_with(&credential[..k]))
+        .unwrap_or(0);
+    let ready: Vec<u8> = held.drain(..held.len() - keep).collect();
+    Some(Bytes::from(ready))
+}
+
 /// Tell a Plugin that is reading why its body ends. Waits briefly for room;
 /// a Plugin that stopped reading may not get this message, but its body still
 /// ends in an error once it drains the buffer ([`body_stream`]).
@@ -1525,6 +1604,46 @@ async fn send_error(tx: &mpsc::Sender<Result<Bytes, std::io::Error>>, why: &str)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// git-bug 4711823 (3): a credential in the body is caught however the
+    /// chunks split it, and no part of it is handed on first; a tail that
+    /// only looks like its start is handed on once the next chunk shows it
+    /// is not.
+    #[test]
+    fn a_credential_in_the_body_is_caught_across_chunks() {
+        let credential = b"argo-api-token-s3cr3t";
+        let body = b"{\"token\":\"argo-api-token-s3cr3t\"}";
+        for split in 1..body.len() {
+            for second in split..body.len() {
+                let mut held = Vec::new();
+                let mut sent = Vec::new();
+                let mut caught = false;
+                for chunk in [&body[..split], &body[split..second], &body[second..]] {
+                    match scan_for_credential(&mut held, chunk, credential) {
+                        Some(ready) => sent.extend_from_slice(&ready),
+                        None => {
+                            caught = true;
+                            break;
+                        }
+                    }
+                }
+                assert!(caught, "split at {split} and {second}");
+                assert!(
+                    b"{\"token\":\"".starts_with(&sent),
+                    "split at {split} and {second}: sent {:?}",
+                    String::from_utf8_lossy(&sent)
+                );
+            }
+        }
+
+        // `argo-` might start the credential; `argo-cd` does not.
+        let mut held = Vec::new();
+        let first = scan_for_credential(&mut held, b"{\"app\":\"argo-", credential).unwrap();
+        assert_eq!(&first[..], b"{\"app\":\"");
+        let second = scan_for_credential(&mut held, b"cd\"}\n", credential).unwrap();
+        assert_eq!(&second[..], b"argo-cd\"}\n");
+        assert!(held.is_empty());
+    }
 
     /// git-bug 4711823 (4): which addresses the broker connects to.
     #[test]
@@ -1740,16 +1859,11 @@ mod tests {
         let out = forwardable_request_headers(&h);
         let names: Vec<&str> = out.keys().map(HeaderName::as_str).collect();
         // `accept-language` is allowlisted, but this request's `Connection`
-        // marked it hop-by-hop.
+        // marked it hop-by-hop. `accept-encoding` is not: a compressed body
+        // could not be read for the credential.
         assert_eq!(
             names,
-            vec![
-                "accept",
-                "accept-encoding",
-                "if-none-match",
-                "if-modified-since",
-                "user-agent"
-            ]
+            vec!["accept", "if-none-match", "if-modified-since", "user-agent"]
         );
     }
 

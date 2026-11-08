@@ -90,6 +90,29 @@ async fn upstream_handler(State(up): State<Upstream>, req: AxumRequest) -> Respo
     let path = req.uri().path().to_string();
     match path.as_str() {
         "/api/version" => "v2.13.0".into_response(),
+        // A response that echoes the bound credential, split across two
+        // chunks, after a first chunk that is clean.
+        "/api/v1/applications" if path_and_query.contains("projects=echo") => {
+            let token = req
+                .headers()
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+                .unwrap_or_default()
+                .to_string();
+            let (head, tail) = token.split_at(token.len() / 2);
+            let chunks: Vec<Result<axum::body::Bytes, std::io::Error>> = vec![
+                Ok(axum::body::Bytes::from_static(b"{\"items\":[]}\n")),
+                Ok(axum::body::Bytes::from(format!("{{\"token\":\"{head}"))),
+                Ok(axum::body::Bytes::from(format!("{tail}\"}}"))),
+            ];
+            Body::from_stream(futures::stream::iter(chunks)).into_response()
+        }
+        "/api/v1/applications" if path_and_query.contains("projects=gzip") => (
+            [("content-encoding", "gzip")],
+            vec![0x1f_u8, 0x8b, 0x08, 0x00],
+        )
+            .into_response(),
         "/api/v1/applications" => (
             [
                 ("content-type", "application/json"),
@@ -1482,6 +1505,75 @@ async fn a_destination_on_loopback_or_link_local_is_refused_and_never_reached() 
             .iter()
             .all(|e| e.denied_reason.as_deref() == Some("destination denied")),
         "{refused:?}"
+    );
+    h.finish().await;
+}
+
+/// git-bug 4711823 (3): a response body that holds the bound credential is
+/// cut before any part of it reaches the Plugin, and the stream ends in an
+/// error; the cut is journaled. A compressed body, which could not be read
+/// for it, is refused; the Plugin's Accept-Encoding never goes upstream.
+#[tokio::test]
+async fn a_body_holding_the_credential_is_cut_and_a_compressed_one_refused() {
+    let Some(h) = harness().await else {
+        return;
+    };
+    let (up, base) = spawn_upstream().await;
+    let (id, token) = install(&h).await;
+    assert_eq!(bind(&h, &base).await.0, StatusCode::OK);
+
+    let resp = h
+        .broker
+        .clone()
+        .oneshot(plugin_get(&token, "/api/v1/applications?projects=echo"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mut body = resp.into_body().into_data_stream();
+    let mut delivered = Vec::new();
+    let mut ended_in_error = false;
+    while let Some(next) = tokio::time::timeout(Duration::from_secs(10), body.next())
+        .await
+        .expect("the stream ended")
+    {
+        match next {
+            Ok(chunk) => delivered.extend_from_slice(&chunk),
+            Err(_) => {
+                ended_in_error = true;
+                break;
+            }
+        }
+    }
+    assert!(ended_in_error, "a cut stream ends in an error");
+    let delivered = String::from_utf8_lossy(&delivered).to_string();
+    assert!(delivered.starts_with("{\"items\":[]}\n"), "{delivered}");
+    let half = &ARGO_TOKEN[..ARGO_TOKEN.len() / 2];
+    assert!(
+        !delivered.contains(half),
+        "no part of the credential: {delivered}"
+    );
+    let ends = journal_until(&h.pg, &id, |e| rows(e, BrokerJournalPhase::End).len() == 1).await;
+    assert_eq!(
+        rows(&ends, BrokerJournalPhase::End)[0]
+            .denied_reason
+            .as_deref(),
+        Some("cut: the upstream response held the credential")
+    );
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/_scarab/plugin/v1/connections/argocd/api/v1/applications?projects=gzip")
+        .header("authorization", format!("Bearer {token}"))
+        .header("accept-encoding", "gzip")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _, body) = send(&h.broker, req).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert!(body.contains("compressed"), "{body}");
+    let last = up.seen().pop().unwrap();
+    assert!(
+        last.headers.get("accept-encoding").is_none(),
+        "the Plugin's Accept-Encoding stays behind"
     );
     h.finish().await;
 }
