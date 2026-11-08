@@ -39,6 +39,7 @@ use std::time::Duration;
 
 use scarab_engine::{Clock, Db};
 use scarab_plugin::{InstallationState, PluginInstallation, PluginStore, RuntimeStatus};
+use scarab_plugin_k8s::probe::ProbeVerdict;
 use scarab_plugin_k8s::{K8sPluginRuntime, RuntimeError, WorkloadState};
 
 /// The lease gating the loop to one replica at a time.
@@ -68,8 +69,12 @@ const MAX_RUNTIME_MESSAGE_CHARS: usize = 1024;
 pub struct Isolation {
     /// When the last probe finished (Unix-ms); `None` = none since boot.
     pub probed_at: Option<i64>,
-    /// `None` = passed; `Some(why)` = failed.
+    /// `None` = passed (or inconclusive); `Some(why)` = failed.
     pub failure: Option<String>,
+    /// `Some(why)` = the last probe could not tell (git-bug da0af59): what
+    /// runs under an earlier passed probe keeps running, nothing new
+    /// starts, and the next pass probes again.
+    pub inconclusive: Option<String>,
 }
 
 /// Whether this pass must run the isolation probe.
@@ -96,7 +101,7 @@ pub fn probe_due(now: i64, isolation: &Isolation, installations: &[PluginInstall
     let fresh = enabled
         .iter()
         .any(|i| i.probe_passed_at.is_none() && i.runtime_status != RuntimeStatus::ProbeFailed);
-    if fresh {
+    if fresh || isolation.inconclusive.is_some() {
         return true;
     }
     isolation.failure.is_some() && age >= PROBE_FAILED_RETRY_MS
@@ -153,6 +158,10 @@ pub enum Decision {
         probe_passed_at: i64,
         pod_broker_url: String,
     },
+    /// Not started, nor stopped: the last probe was inconclusive and this
+    /// installation has no earlier passed probe to run under. Record
+    /// `pending` with why; the next pass probes again.
+    Defer { message: String },
     /// Leave it as it is, and write nothing: the cluster could not be asked
     /// this pass ([`Baseline::Unavailable`]), or there is no probe result
     /// yet. (The second is defensive: [`probe_due`] forces a probe whenever
@@ -184,6 +193,19 @@ pub fn decide(
         }
         Baseline::Unavailable(_) => return Decision::Wait,
     };
+    if let (None, Some(why)) = (&isolation.failure, &isolation.inconclusive) {
+        // Proves nothing: a workload running under an earlier passed probe
+        // keeps running under it; nothing new starts.
+        return match installation.probe_passed_at {
+            Some(earlier) => Decision::Run {
+                probe_passed_at: earlier,
+                pod_broker_url: pod_broker_url.clone(),
+            },
+            None => Decision::Defer {
+                message: why.clone(),
+            },
+        };
+    }
     match (&isolation.failure, isolation.probed_at) {
         (Some(why), _) => Decision::Hold {
             status: RuntimeStatus::ProbeFailed,
@@ -468,17 +490,22 @@ impl PluginRuntimeLoop {
         }
         let report = self.runtime.probe_isolation(pod_broker_url).await;
         let finished = self.clock.now().await.0;
-        if report.passed() {
-            tracing::info!("plugin runtime: isolation probe passed");
-        } else {
-            tracing::error!(
+        match report.verdict {
+            ProbeVerdict::Passed => tracing::info!("plugin runtime: isolation probe passed"),
+            ProbeVerdict::Failed => tracing::error!(
                 findings = %report.message(),
                 "plugin runtime: isolation probe FAILED; no plugin runs"
-            );
+            ),
+            ProbeVerdict::Inconclusive => tracing::warn!(
+                findings = %report.message(),
+                "plugin runtime: isolation probe inconclusive; running plugins keep running, \
+                 none starts, probing again next pass"
+            ),
         }
         self.isolation = Isolation {
             probed_at: Some(finished),
-            failure: (!report.passed()).then(|| report.message()),
+            failure: (report.verdict == ProbeVerdict::Failed).then(|| report.message()),
+            inconclusive: (report.verdict == ProbeVerdict::Inconclusive).then(|| report.message()),
         };
     }
 
@@ -520,6 +547,7 @@ impl PluginRuntimeLoop {
                     self.stop_unless_stopped(&installation.id).await?;
                     (status, message, None)
                 }
+                Decision::Defer { message } => (RuntimeStatus::Pending, message, None),
                 Decision::Run {
                     probe_passed_at,
                     pod_broker_url,
@@ -617,6 +645,7 @@ mod tests {
         Isolation {
             probed_at: Some(at),
             failure: None,
+            inconclusive: None,
         }
     }
 
@@ -624,7 +653,58 @@ mod tests {
         Isolation {
             probed_at: Some(at),
             failure: Some("isolation probe failed: NetworkPolicy is NOT enforced".into()),
+            inconclusive: None,
         }
+    }
+
+    fn inconclusive(at: i64) -> Isolation {
+        Isolation {
+            probed_at: Some(at),
+            failure: None,
+            inconclusive: Some("isolation probe inconclusive: the probe could not run".into()),
+        }
+    }
+
+    /// git-bug da0af59 (6): an inconclusive probe keeps a workload running
+    /// under its earlier passed probe, starts nothing new, holds nothing,
+    /// and is retried on the next pass; a failed one still holds.
+    #[test]
+    fn an_inconclusive_probe_keeps_running_plugins_and_starts_none() {
+        let now = 100 * HOUR_MS;
+        assert_eq!(
+            decide(&running(now - HOUR_MS), &ready(), &inconclusive(now)),
+            Decision::Run {
+                probe_passed_at: now - HOUR_MS,
+                pod_broker_url: "http://10.96.0.20:8090".into(),
+            }
+        );
+        let fresh = installation(InstallationState::Enabled);
+        assert_eq!(
+            decide(&fresh, &ready(), &inconclusive(now)),
+            Decision::Defer {
+                message: "isolation probe inconclusive: the probe could not run".into()
+            }
+        );
+        assert!(matches!(
+            decide(&running(now - HOUR_MS), &ready(), &failed(now)),
+            Decision::Hold {
+                status: RuntimeStatus::ProbeFailed,
+                ..
+            }
+        ));
+        assert_eq!(
+            decide(
+                &installation(InstallationState::Killed),
+                &ready(),
+                &inconclusive(now)
+            ),
+            Decision::Stop
+        );
+        assert!(probe_due(
+            now + 1,
+            &inconclusive(now),
+            &[running(now - HOUR_MS)]
+        ));
     }
 
     #[test]

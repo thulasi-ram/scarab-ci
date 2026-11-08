@@ -198,10 +198,18 @@ const PLUGIN_SIDE_CHECKS: [ProbeCheck; 6] = [
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProbeVerdict {
     Passed,
+    /// A plugin-labelled Pod did what it must not, or could not do what it
+    /// must (reach the broker): the namespace does not isolate.
     Failed,
+    /// The probe could not tell: the control Pod could not do what it is
+    /// allowed, a check never reported, or the probe could not run. It
+    /// proves nothing either way (git-bug da0af59).
+    Inconclusive,
 }
 
-/// The probe's outcome: passed only with no finding at all.
+/// The probe's outcome: passed only with no finding at all; failed when any
+/// finding is a plugin-side check that came out wrong; inconclusive when
+/// every finding is one the probe could not tell.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProbeReport {
     pub verdict: ProbeVerdict,
@@ -214,10 +222,11 @@ impl ProbeReport {
     }
 
     /// A probe that could not run to the end — a Pod that never started, a
-    /// timeout, an API error. Fail closed: it is a failed probe.
+    /// timeout, an API error. It proves nothing: inconclusive. Nothing new
+    /// starts on it, and the runtime tries again.
     pub fn could_not_run(why: impl Into<String>) -> Self {
         Self {
-            verdict: ProbeVerdict::Failed,
+            verdict: ProbeVerdict::Inconclusive,
             findings: vec![format!("the probe could not run: {}", why.into())],
         }
     }
@@ -228,6 +237,9 @@ impl ProbeReport {
             ProbeVerdict::Passed => "isolation probe passed".to_string(),
             ProbeVerdict::Failed => {
                 format!("isolation probe failed: {}", self.findings.join("; "))
+            }
+            ProbeVerdict::Inconclusive => {
+                format!("isolation probe inconclusive: {}", self.findings.join("; "))
             }
         }
     }
@@ -256,35 +268,44 @@ fn parse_log(log: &str) -> BTreeMap<String, bool> {
 }
 
 /// Judge the two probe logs. Every check must report and come out as
-/// expected; a missing report is a failure (the Pod did not finish its
-/// script, or a check could not tell), never a pass.
+/// expected. A plugin-side check that came out wrong fails the probe; a
+/// control-side one that did, or a check that never reported (the Pod did
+/// not finish its script, or a check could not tell), makes it inconclusive
+/// — never a pass.
 pub fn assess(control_log: &str, plugin_log: &str) -> ProbeReport {
     let control = parse_log(control_log);
     let plugin = parse_log(plugin_log);
-    let mut findings = Vec::new();
-    let mut judge = |check: ProbeCheck, seen: &BTreeMap<String, bool>, pod: &str| match seen
-        .get(check.wire())
-    {
-        Some(&reached) if reached == check.must_reach() => {}
-        Some(_) => findings.push(check.deviation().to_string()),
-        None => findings.push(format!(
-            "the {pod} Pod never reported its `{}` check",
-            check.wire()
-        )),
-    };
+    let mut failures = Vec::new();
+    let mut unknowns = Vec::new();
+    let mut judge =
+        |check: ProbeCheck, seen: &BTreeMap<String, bool>, pod: &str, side_fails| match seen
+            .get(check.wire())
+        {
+            Some(&reached) if reached == check.must_reach() => {}
+            Some(_) if side_fails => failures.push(check.deviation().to_string()),
+            Some(_) => unknowns.push(check.deviation().to_string()),
+            None => unknowns.push(format!(
+                "the {pod} Pod never reported its `{}` check",
+                check.wire()
+            )),
+        };
     for check in CONTROL_SIDE_CHECKS {
-        judge(check, &control, "control");
+        judge(check, &control, "control", false);
     }
     for check in PLUGIN_SIDE_CHECKS {
-        judge(check, &plugin, "plugin-labelled");
+        judge(check, &plugin, "plugin-labelled", true);
     }
+    let verdict = if !failures.is_empty() {
+        ProbeVerdict::Failed
+    } else if !unknowns.is_empty() {
+        ProbeVerdict::Inconclusive
+    } else {
+        ProbeVerdict::Passed
+    };
+    failures.extend(unknowns);
     ProbeReport {
-        verdict: if findings.is_empty() {
-            ProbeVerdict::Passed
-        } else {
-            ProbeVerdict::Failed
-        },
-        findings,
+        verdict,
+        findings: failures,
     }
 }
 
@@ -679,25 +700,42 @@ mod tests {
             "SCARAB_PROBE canary reached\nSCARAB_PROBE dns unreached\n",
         ] {
             let report = assess(control, PLUGIN_OK);
-            assert!(!report.passed());
+            assert_eq!(report.verdict, ProbeVerdict::Inconclusive, "{report:?}");
             assert!(report.message().contains("inconclusive"), "{report:?}");
         }
+        // A plugin-side leak still fails, whatever the control says.
+        let leaky = PLUGIN_OK.replace("canary unreached", "canary reached");
+        let report = assess(
+            "SCARAB_PROBE canary unreached\nSCARAB_PROBE dns reached\n",
+            &leaky,
+        );
+        assert_eq!(report.verdict, ProbeVerdict::Failed, "{report:?}");
     }
 
+    /// git-bug da0af59 (6): a check that never reported, could not tell,
+    /// or a probe that could not run proves nothing: inconclusive, never a
+    /// pass.
     #[test]
-    fn a_check_that_never_reported_or_could_not_tell_is_a_failure() {
+    fn a_check_that_never_reported_or_could_not_tell_is_inconclusive() {
         let truncated: String = PLUGIN_OK.lines().take(2).collect::<Vec<_>>().join("\n");
         let report = assess(CONTROL_OK, &truncated);
-        assert!(!report.passed());
+        assert_eq!(report.verdict, ProbeVerdict::Inconclusive);
         assert!(report.message().contains("never reported its `apiserver`"));
         // `unknown` (no KUBERNETES_SERVICE_HOST, an nslookup that said
         // nothing recognisable) is not a pass — even after an earlier line.
         for check in ["apiserver", "dns"] {
             let unknown = format!("{PLUGIN_OK}SCARAB_PROBE {check} unknown\n");
-            assert!(!assess(CONTROL_OK, &unknown).passed(), "{check}");
+            assert_eq!(
+                assess(CONTROL_OK, &unknown).verdict,
+                ProbeVerdict::Inconclusive,
+                "{check}"
+            );
         }
-        assert!(!assess("", "").passed());
-        assert!(!ProbeReport::could_not_run("timeout").passed());
+        assert_eq!(assess("", "").verdict, ProbeVerdict::Inconclusive);
+        assert_eq!(
+            ProbeReport::could_not_run("timeout").verdict,
+            ProbeVerdict::Inconclusive
+        );
     }
 
     #[test]
