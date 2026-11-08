@@ -39,12 +39,13 @@ use std::time::Duration;
 
 use scarab_engine::{Clock, Db};
 use scarab_plugin::{InstallationState, PluginInstallation, PluginStore, RuntimeStatus};
+use scarab_plugin_k8s::probe::ProbeVerdict;
 use scarab_plugin_k8s::{K8sPluginRuntime, RuntimeError, WorkloadState};
 
 /// The lease gating the loop to one replica at a time.
 pub const PLUGIN_RUNTIME_LEASE: &str = "plugin-runtime";
-/// Short, so a restarted or crashed leader is replaced within a minute (the
-/// lease is not released on shutdown). A pass can run far longer — a probe
+/// Short, so a crashed leader is replaced within a minute (a clean shutdown
+/// releases the lease at once). A pass can run far longer — a probe
 /// alone is bounded at 5 minutes — so while a pass runs the lease is renewed
 /// in the background every [`LEASE_RENEW_INTERVAL`], and re-checked before
 /// anything is held or stopped on the probe's strength.
@@ -68,8 +69,15 @@ const MAX_RUNTIME_MESSAGE_CHARS: usize = 1024;
 pub struct Isolation {
     /// When the last probe finished (Unix-ms); `None` = none since boot.
     pub probed_at: Option<i64>,
-    /// `None` = passed; `Some(why)` = failed.
+    /// `None` = passed (or inconclusive); `Some(why)` = failed.
     pub failure: Option<String>,
+    /// `Some(why)` = the last probe could not tell (git-bug da0af59): what
+    /// runs under an earlier passed probe keeps running, nothing new
+    /// starts, and the next pass probes again.
+    pub inconclusive: Option<String>,
+    /// What the last probe saw that does not decide the verdict (a reached
+    /// kubelet), shown on a running Plugin's status (git-bug da0af59).
+    pub notes: Vec<String>,
 }
 
 /// Whether this pass must run the isolation probe.
@@ -96,7 +104,7 @@ pub fn probe_due(now: i64, isolation: &Isolation, installations: &[PluginInstall
     let fresh = enabled
         .iter()
         .any(|i| i.probe_passed_at.is_none() && i.runtime_status != RuntimeStatus::ProbeFailed);
-    if fresh {
+    if fresh || isolation.inconclusive.is_some() {
         return true;
     }
     isolation.failure.is_some() && age >= PROBE_FAILED_RETRY_MS
@@ -153,6 +161,10 @@ pub enum Decision {
         probe_passed_at: i64,
         pod_broker_url: String,
     },
+    /// Not started, nor stopped: the last probe was inconclusive and this
+    /// installation has no earlier passed probe to run under. Record
+    /// `pending` with why; the next pass probes again.
+    Defer { message: String },
     /// Leave it as it is, and write nothing: the cluster could not be asked
     /// this pass ([`Baseline::Unavailable`]), or there is no probe result
     /// yet. (The second is defensive: [`probe_due`] forces a probe whenever
@@ -184,6 +196,23 @@ pub fn decide(
         }
         Baseline::Unavailable(_) => return Decision::Wait,
     };
+    if let (None, Some(why)) = (&isolation.failure, &isolation.inconclusive) {
+        // Proves nothing: a workload running under an earlier passed probe
+        // keeps running under it; nothing new starts; and a hold stays as
+        // it is, with its definite finding, until a probe passes.
+        if installation.held_by_the_runtime() {
+            return Decision::Wait;
+        }
+        return match installation.probe_passed_at {
+            Some(earlier) => Decision::Run {
+                probe_passed_at: earlier,
+                pod_broker_url: pod_broker_url.clone(),
+            },
+            None => Decision::Defer {
+                message: why.clone(),
+            },
+        };
+    }
     match (&isolation.failure, isolation.probed_at) {
         (Some(why), _) => Decision::Hold {
             status: RuntimeStatus::ProbeFailed,
@@ -194,6 +223,20 @@ pub fn decide(
             pod_broker_url: pod_broker_url.clone(),
         },
         (None, None) => Decision::Wait,
+    }
+}
+
+/// A running Plugin's status message carries the last probe's notes (a
+/// reached kubelet), so an operator sees them; any other status keeps its
+/// own message.
+fn with_notes(
+    (status, message): (RuntimeStatus, String),
+    isolation: &Isolation,
+) -> (RuntimeStatus, String) {
+    if status == RuntimeStatus::Running && message.is_empty() && !isolation.notes.is_empty() {
+        (status, format!("note: {}", isolation.notes.join("; ")))
+    } else {
+        (status, message)
     }
 }
 
@@ -292,14 +335,36 @@ impl PluginRuntimeLoop {
         }
     }
 
-    /// Run a pass every [`RECONCILE_INTERVAL`], forever.
-    pub fn spawn(mut self) -> tokio::task::JoinHandle<()> {
+    /// Run a pass every [`RECONCILE_INTERVAL`] until `stop` resolves, then
+    /// release the lease so another replica takes over at once rather than
+    /// after the TTL (git-bug da0af59). A pass under way when `stop`
+    /// resolves is abandoned; the next leader starts its own.
+    pub fn spawn_until(
+        mut self,
+        stop: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
+            tokio::pin!(stop);
             loop {
-                if let Err(e) = self.reconcile_once().await {
-                    tracing::warn!(error = %e, "plugin runtime: reconcile pass failed");
+                tokio::select! {
+                    _ = &mut stop => break,
+                    result = self.reconcile_once() => {
+                        if let Err(e) = result {
+                            tracing::warn!(error = %e, "plugin runtime: reconcile pass failed");
+                        }
+                    }
                 }
-                tokio::time::sleep(RECONCILE_INTERVAL).await;
+                tokio::select! {
+                    _ = &mut stop => break,
+                    _ = tokio::time::sleep(RECONCILE_INTERVAL) => {}
+                }
+            }
+            if let Err(e) = self
+                .db
+                .release_lease(PLUGIN_RUNTIME_LEASE, &self.owner)
+                .await
+            {
+                tracing::warn!(error = %e, "plugin runtime: could not release the lease");
             }
         })
     }
@@ -437,6 +502,7 @@ impl PluginRuntimeLoop {
                 .set_runtime_status(
                     &i.id,
                     InstallationState::Enabled,
+                    i.state_version,
                     RuntimeStatus::Probing,
                     "isolation probe running",
                     i.probe_passed_at,
@@ -445,18 +511,45 @@ impl PluginRuntimeLoop {
         }
         let report = self.runtime.probe_isolation(pod_broker_url).await;
         let finished = self.clock.now().await.0;
-        if report.passed() {
-            tracing::info!("plugin runtime: isolation probe passed");
-        } else {
-            tracing::error!(
+        match report.verdict {
+            ProbeVerdict::Passed => tracing::info!(
+                result = %report.message(),
+                "plugin runtime: isolation probe passed"
+            ),
+            ProbeVerdict::Failed => tracing::error!(
                 findings = %report.message(),
                 "plugin runtime: isolation probe FAILED; no plugin runs"
-            );
+            ),
+            ProbeVerdict::Inconclusive => tracing::warn!(
+                findings = %report.message(),
+                "plugin runtime: isolation probe inconclusive; running plugins keep running, \
+                 none starts, probing again next pass"
+            ),
         }
         self.isolation = Isolation {
             probed_at: Some(finished),
-            failure: (!report.passed()).then(|| report.message()),
+            failure: (report.verdict == ProbeVerdict::Failed).then(|| report.message()),
+            inconclusive: (report.verdict == ProbeVerdict::Inconclusive).then(|| report.message()),
+            notes: report.notes.clone(),
         };
+    }
+
+    /// Stop the installation's workload, unless it is already down: a
+    /// killed or held installation is visited every pass, and its stop is a
+    /// ServiceAccount delete and a Deployment patch (git-bug da0af59).
+    async fn stop_unless_stopped(&self, installation_id: &str) -> Result<(), String> {
+        if self
+            .runtime
+            .is_stopped(installation_id)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            return Ok(());
+        }
+        self.runtime
+            .stop(installation_id)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     async fn reconcile_installation(
@@ -468,10 +561,7 @@ impl PluginRuntimeLoop {
             match decide(installation, baseline, &self.isolation) {
                 Decision::Wait => return Ok(()),
                 Decision::Stop => {
-                    self.runtime
-                        .stop(&installation.id)
-                        .await
-                        .map_err(|e| e.to_string())?;
+                    self.stop_unless_stopped(&installation.id).await?;
                     (
                         RuntimeStatus::Stopped,
                         String::new(),
@@ -479,12 +569,10 @@ impl PluginRuntimeLoop {
                     )
                 }
                 Decision::Hold { status, message } => {
-                    self.runtime
-                        .stop(&installation.id)
-                        .await
-                        .map_err(|e| e.to_string())?;
+                    self.stop_unless_stopped(&installation.id).await?;
                     (status, message, None)
                 }
+                Decision::Defer { message } => (RuntimeStatus::Pending, message, None),
                 Decision::Run {
                     probe_passed_at,
                     pod_broker_url,
@@ -497,7 +585,7 @@ impl PluginRuntimeLoop {
                         // pass does not take it for a fresh install and
                         // re-probe.
                         Ok(()) => match self.runtime.workload_state(installation).await {
-                            Ok(state) => running_status(&state),
+                            Ok(state) => with_notes(running_status(&state), &self.isolation),
                             Err(e) => (RuntimeStatus::Pending, format!("state unknown: {e}")),
                         },
                         Err(e) => (RuntimeStatus::Error, e.to_string()),
@@ -514,6 +602,7 @@ impl PluginRuntimeLoop {
                 .set_runtime_status(
                     &installation.id,
                     installation.state,
+                    installation.state_version,
                     status,
                     &message,
                     probe_passed_at,
@@ -551,6 +640,7 @@ mod tests {
             manifest_sha256: "0".repeat(64),
             config: BTreeMap::new(),
             state,
+            state_version: 0,
             runtime_status: RuntimeStatus::Pending,
             runtime_message: String::new(),
             probe_passed_at: None,
@@ -580,6 +670,8 @@ mod tests {
         Isolation {
             probed_at: Some(at),
             failure: None,
+            inconclusive: None,
+            notes: Vec::new(),
         }
     }
 
@@ -587,7 +679,100 @@ mod tests {
         Isolation {
             probed_at: Some(at),
             failure: Some("isolation probe failed: NetworkPolicy is NOT enforced".into()),
+            inconclusive: None,
+            notes: Vec::new(),
         }
+    }
+
+    fn inconclusive(at: i64) -> Isolation {
+        Isolation {
+            probed_at: Some(at),
+            failure: None,
+            inconclusive: Some("isolation probe inconclusive: the probe could not run".into()),
+            notes: Vec::new(),
+        }
+    }
+
+    /// git-bug da0af59 (6): an inconclusive probe keeps a workload running
+    /// under its earlier passed probe, starts nothing new, holds nothing,
+    /// and is retried on the next pass; a failed one still holds.
+    #[test]
+    fn an_inconclusive_probe_keeps_running_plugins_and_starts_none() {
+        let now = 100 * HOUR_MS;
+        assert_eq!(
+            decide(&running(now - HOUR_MS), &ready(), &inconclusive(now)),
+            Decision::Run {
+                probe_passed_at: now - HOUR_MS,
+                pod_broker_url: "http://10.96.0.20:8090".into(),
+            }
+        );
+        let fresh = installation(InstallationState::Enabled);
+        assert_eq!(
+            decide(&fresh, &ready(), &inconclusive(now)),
+            Decision::Defer {
+                message: "isolation probe inconclusive: the probe could not run".into()
+            }
+        );
+        assert!(matches!(
+            decide(&running(now - HOUR_MS), &ready(), &failed(now)),
+            Decision::Hold {
+                status: RuntimeStatus::ProbeFailed,
+                ..
+            }
+        ));
+        assert_eq!(
+            decide(
+                &installation(InstallationState::Killed),
+                &ready(),
+                &inconclusive(now)
+            ),
+            Decision::Stop
+        );
+        assert!(probe_due(
+            now + 1,
+            &inconclusive(now),
+            &[running(now - HOUR_MS)]
+        ));
+    }
+
+    /// git-bug da0af59 (9, red team): a probe's note reaches a running
+    /// Plugin's message; other statuses keep theirs.
+    #[test]
+    fn a_probe_note_reaches_a_running_plugins_message() {
+        let mut noted = passed(1);
+        noted.notes = vec!["a plugin-labelled Pod reached the kubelet".into()];
+        assert_eq!(
+            with_notes((RuntimeStatus::Running, String::new()), &noted),
+            (
+                RuntimeStatus::Running,
+                "note: a plugin-labelled Pod reached the kubelet".to_string()
+            )
+        );
+        assert_eq!(
+            with_notes((RuntimeStatus::Error, "CrashLoopBackOff".into()), &noted),
+            (RuntimeStatus::Error, "CrashLoopBackOff".to_string())
+        );
+        assert_eq!(
+            with_notes((RuntimeStatus::Running, String::new()), &passed(1)),
+            (RuntimeStatus::Running, String::new())
+        );
+    }
+
+    /// git-bug da0af59 (6, red team): an inconclusive retry leaves a hold
+    /// as it is; only a passed probe lifts it.
+    #[test]
+    fn an_inconclusive_probe_does_not_lift_a_hold() {
+        let now = 100 * HOUR_MS;
+        let mut held = installation(InstallationState::Enabled);
+        held.runtime_status = RuntimeStatus::ProbeFailed;
+        held.probe_passed_at = None;
+        assert_eq!(decide(&held, &ready(), &inconclusive(now)), Decision::Wait);
+        held.runtime_status = RuntimeStatus::Error;
+        assert_eq!(decide(&held, &ready(), &inconclusive(now)), Decision::Wait);
+        assert!(matches!(
+            decide(&held, &ready(), &passed(now)),
+            Decision::Run { .. }
+        ));
     }
 
     #[test]

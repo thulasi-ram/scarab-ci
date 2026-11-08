@@ -5,6 +5,10 @@
   plugin in a namespace that does not enforce `restricted` — so this is where
   the level is set, by the operator's release, not by the runtime.
 
+  `scarab.io/plugin-runtime-owner` names the release the namespace belongs to;
+  the runtime refuses a namespace stamped for another release, or not at all.
+  A namespace you create yourself (createNamespace: false) needs this label.
+
   `helm.sh/resource-policy: keep`: uninstalling the release does not delete
   the namespace, so `helm uninstall` cannot take running plugin state with it
   by surprise; delete it yourself once the plugins are uninstalled.
@@ -19,6 +23,7 @@ metadata:
     pod-security.kubernetes.io/enforce-version: latest
     pod-security.kubernetes.io/audit: restricted
     pod-security.kubernetes.io/warn: restricted
+    scarab.io/plugin-runtime-owner: {{ include "scarab.pluginOwner" . | quote }}
   annotations:
     helm.sh/resource-policy: keep
 {{- end }}

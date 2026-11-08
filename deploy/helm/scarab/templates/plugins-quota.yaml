@@ -1,0 +1,50 @@
+{{- if .Values.plugins.enabled -}}
+{{- /*
+  What every plugin together may take from the cluster (git-bug da0af59): a
+  ResourceQuota on the plugin namespace, and a LimitRange that gives a
+  container without resources (the isolation probe's Pods) defaults, so the
+  quota admits it, and caps what any one container may ask for. Plugin Pods
+  set their own requests and limits (50m/64Mi, at most 500m/256Mi).
+
+  A process limit per Pod is the kubelet's to set (`podPidsLimit`), not the
+  chart's: see plugins.quota in values.yaml.
+*/ -}}
+{{- with .Values.plugins.quota }}
+{{- if .enabled }}
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: scarab-plugins
+  namespace: {{ $.Values.plugins.namespace }}
+  labels:
+    {{- include "scarab.labels" $ | nindent 4 }}
+spec:
+  hard:
+    pods: {{ .pods | quote }}
+    requests.cpu: {{ .requestsCpu | quote }}
+    requests.memory: {{ .requestsMemory | quote }}
+    limits.cpu: {{ .limitsCpu | quote }}
+    limits.memory: {{ .limitsMemory | quote }}
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: scarab-plugins
+  namespace: {{ $.Values.plugins.namespace }}
+  labels:
+    {{- include "scarab.labels" $ | nindent 4 }}
+spec:
+  limits:
+    - type: Container
+      defaultRequest:
+        cpu: {{ .containerDefaultRequestCpu | quote }}
+        memory: {{ .containerDefaultRequestMemory | quote }}
+      default:
+        cpu: {{ .containerDefaultLimitCpu | quote }}
+        memory: {{ .containerDefaultLimitMemory | quote }}
+      max:
+        cpu: {{ .containerMaxCpu | quote }}
+        memory: {{ .containerMaxMemory | quote }}
+{{- end }}
+{{- end }}
+{{- end }}

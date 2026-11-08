@@ -208,6 +208,11 @@ See `deploy/helm/scarab/README.md` and `values.yaml` for every value.
 `plugins.enabled` (default `false`) turns on the plugin runtime: a shared plugin namespace, the
 CredentialBroker and the RBAC they need. No built plugin capability acts on Scarab yet (ADR-0074),
 so you don't need it to run pipelines or deploys; leave it off unless you are working on a plugin.
+The chart creates the plugin namespace (`plugins.createNamespace`) and labels it with the release
+it belongs to. If you create the namespace yourself, give it the labels
+`pod-security.kubernetes.io/enforce=restricted` and
+`scarab.io/plugin-runtime-owner=<release namespace>.<release name>`. Scarab runs no plugin in a
+namespace labelled for another release, so two releases can't share one plugin namespace.
 A plugin that needs storage brings its own: you create a PersistentVolumeClaim in the plugin
 namespace and the plugin runtime mounts it. Scarab doesn't provision, back up or read that
 volume, and its data is outside what Scarab keeps.

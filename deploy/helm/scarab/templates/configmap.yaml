@@ -165,6 +165,7 @@ data:
   SCARAB_BROKER_ADDR: {{ printf "0.0.0.0:%d" (int .Values.plugins.brokerPort) | quote }}
   SCARAB_PLUGIN_NAMESPACE: {{ .Values.plugins.namespace | quote }}
   SCARAB_PLUGIN_BROKER_URL: {{ printf "http://%s-broker.%s.svc:%d" (include "scarab.fullname" .) .Release.Namespace (int .Values.plugins.brokerPort) | quote }}
+  SCARAB_PLUGIN_OWNER: {{ include "scarab.pluginOwner" . | quote }}
   SCARAB_PLUGIN_BROKER_PEER: {{ printf "pods:%s:app.kubernetes.io/name=%s,app.kubernetes.io/instance=%s" .Release.Namespace (include "scarab.name" .) .Release.Name | quote }}
   {{- with .Values.plugins.probeImage }}
   SCARAB_PLUGIN_PROBE_IMAGE: {{ . | quote }}

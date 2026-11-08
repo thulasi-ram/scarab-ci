@@ -1322,6 +1322,7 @@ fn plugin_installation() -> scarab_plugin::PluginInstallation {
         manifest_sha256: "0".repeat(64),
         config: Default::default(),
         state: scarab_plugin::InstallationState::Enabled,
+        state_version: 0,
         runtime_status: scarab_plugin::RuntimeStatus::Pending,
         runtime_message: String::new(),
         probe_passed_at: None,

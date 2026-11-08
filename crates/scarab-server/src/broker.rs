@@ -303,6 +303,18 @@ async fn caller(st: &AppState, id: &str) -> Result<PluginCaller, BrokerError> {
         ))
         .into());
     }
+    // The runtime scales a held Plugin to zero, but a Pod still running, or
+    // inside its termination grace, must not keep using the broker (git-bug
+    // da0af59). Pending and Probing pass: the runtime starts the Pod before
+    // it records Running.
+    if installation.held_by_the_runtime() {
+        return Err(ApiError::Denied(format!(
+            "plugin installation `{}` is held by the plugin runtime ({})",
+            installation.name,
+            installation.runtime_status.as_str()
+        ))
+        .into());
+    }
     Ok(PluginCaller(installation))
 }
 

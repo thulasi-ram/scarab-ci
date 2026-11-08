@@ -78,6 +78,8 @@ pub const STORAGE_VOLUME: &str = "storage";
 /// The CPU ceiling of every container in a Plugin Pod: a spinning (or
 /// compromised) Plugin gets half a core, never the node.
 pub const PLUGIN_CPU_LIMIT: &str = "500m";
+/// How long a stopping Plugin Pod gets before the kubelet kills it.
+pub const PLUGIN_TERMINATION_GRACE_SECS: i64 = 5;
 
 /// The name of an installation's ServiceAccount AND Deployment:
 /// `plugin-<id>`. Keyed by id (never the name), so a reinstall under a new id
@@ -470,6 +472,9 @@ pub fn deployment(
         });
     }
     let mut pod_spec = PodSpec {
+        // A killed or held Plugin is gone within seconds, not the default
+        // 30 (git-bug da0af59).
+        termination_grace_period_seconds: Some(PLUGIN_TERMINATION_GRACE_SECS),
         service_account_name: Some(name.clone()),
         automount_service_account_token: Some(false),
         enable_service_links: Some(false),
@@ -636,6 +641,7 @@ mod tests {
                 "https://argo.example".to_string(),
             )]),
             state: InstallationState::Enabled,
+            state_version: 0,
             runtime_status: RuntimeStatus::Pending,
             runtime_message: String::new(),
             probe_passed_at: None,
@@ -712,6 +718,10 @@ mod tests {
         assert_eq!(pod.automount_service_account_token, Some(false));
         assert_eq!(pod.enable_service_links, Some(false));
         assert_eq!(pod.host_network, None);
+        assert_eq!(
+            pod.termination_grace_period_seconds,
+            Some(PLUGIN_TERMINATION_GRACE_SECS)
+        );
         let labels = spec
             .template
             .metadata

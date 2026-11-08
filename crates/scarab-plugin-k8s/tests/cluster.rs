@@ -150,6 +150,7 @@ impl Fixture {
                 }),
                 broker_port: BROKER_PORT,
                 probe_image: probe_image(),
+                owner: Some(TEST_OWNER.to_string()),
             },
         )
     }
@@ -168,6 +169,9 @@ impl Fixture {
     }
 }
 
+/// The release the test runtime is, as stamped on its namespaces.
+const TEST_OWNER: &str = "scarab-kube-tests.plugin-k8s";
+
 fn namespace(name: &str, psa_enforce: &str) -> Namespace {
     Namespace {
         metadata: ObjectMeta {
@@ -178,6 +182,10 @@ fn namespace(name: &str, psa_enforce: &str) -> Namespace {
                     psa_enforce.to_string(),
                 ),
                 ("scarab.io/test".to_string(), "plugin-k8s".to_string()),
+                (
+                    scarab_plugin_k8s::LABEL_OWNER.to_string(),
+                    TEST_OWNER.to_string(),
+                ),
             ])),
             ..Default::default()
         },
@@ -331,6 +339,82 @@ async fn the_isolation_probe_passes_on_this_cluster() {
     .await;
 }
 
+/// git-bug da0af59 (12): a `cidr:` broker peer, as a broker outside the
+/// cluster (the server running on the host) is named. The broker here is
+/// the test process itself, serving healthz on the host as a Pod reaches it
+/// (`SCARAB_E2E_POD_HOST_IP`: the address a Pod resolved for the host, probed
+/// by `just test e2e`). With that address as the /32 peer the isolation probe
+/// passes: the plugin-labelled Pod reaches the broker through the ipBlock
+/// allowance, and still nothing else. With another /32 it fails on the
+/// broker, so the ipBlock rule is what lets it through, not an exemption of
+/// host traffic.
+#[tokio::test]
+#[ignore]
+async fn a_cidr_peer_lets_a_plugin_reach_a_broker_outside_the_cluster() {
+    enter_tier();
+    let host = std::env::var("SCARAB_E2E_POD_HOST_IP")
+        .ok()
+        .filter(|h| h.parse::<std::net::Ipv4Addr>().is_ok())
+        .expect(
+            "SCARAB_E2E_POD_HOST_IP: the IPv4 address a Pod reaches the host at; `just test e2e` \
+             probes and sets it",
+        );
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        loop {
+            let Ok((mut conn, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let _ = conn.read(&mut [0u8; 2048]).await;
+                let _ = conn
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                    )
+                    .await;
+            });
+        }
+    });
+    with_fixture(|f| async move {
+        let runtime_with_peer = |peer: &str| {
+            K8sPluginRuntime::new(
+                f.client.clone(),
+                PluginRuntimeConfig {
+                    namespace: f.plugins_ns.clone(),
+                    broker_url: format!("http://{host}:{port}"),
+                    broker_peer: Some(BrokerPeer::parse(peer).expect("a cidr peer")),
+                    broker_port: port,
+                    probe_image: probe_image(),
+                    owner: Some(TEST_OWNER.to_string()),
+                },
+            )
+        };
+
+        // Another address entirely (TEST-NET-1): the broker is unreached.
+        let elsewhere = runtime_with_peer("cidr:192.0.2.1/32");
+        elsewhere.ensure_baseline().await.expect("baseline");
+        let url = elsewhere.pod_broker_url().await.expect("broker URL");
+        let report = elsewhere.probe_isolation(&url).await;
+        assert_eq!(
+            report.verdict,
+            scarab_plugin_k8s::ProbeVerdict::Failed,
+            "{}",
+            report.message()
+        );
+        assert!(report.message().contains("broker"), "{}", report.message());
+
+        let here = runtime_with_peer(&format!("cidr:{host}/32"));
+        here.ensure_baseline().await.expect("baseline");
+        let url = here.pod_broker_url().await.expect("broker URL");
+        assert_eq!(url, format!("http://{host}:{port}"));
+        let report = here.probe_isolation(&url).await;
+        assert!(report.passed(), "{}", report.message());
+    })
+    .await;
+}
+
 /// The probe's negative case, for real: with the egress policies gone a
 /// plugin-labelled Pod reaches the canary, and the probe FAILS — saying
 /// NetworkPolicy is not enforced, rather than passing an open namespace.
@@ -438,6 +522,7 @@ fn installation(image: &str) -> PluginInstallation {
         manifest_sha256: "f".repeat(64),
         config: BTreeMap::new(),
         state: InstallationState::Enabled,
+        state_version: 0,
         runtime_status: RuntimeStatus::Pending,
         runtime_message: String::new(),
         probe_passed_at: None,
@@ -518,7 +603,9 @@ async fn a_workload_is_admitted_stopped_and_uninstalled() {
             vec![INSTALLATION_ID.to_string()]
         );
 
+        assert!(!runtime.is_stopped(INSTALLATION_ID).await.unwrap());
         runtime.stop(INSTALLATION_ID).await.expect("stop");
+        assert!(runtime.is_stopped(INSTALLATION_ID).await.unwrap());
         assert_eq!(
             runtime
                 .workload_state(&installation(&probe_image()))

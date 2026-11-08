@@ -57,6 +57,7 @@ fn installation(org: &str, name: &str, id: &str) -> PluginInstallation {
         manifest_sha256: "0".repeat(64),
         config: BTreeMap::new(),
         state: InstallationState::Enabled,
+        state_version: 0,
         runtime_status: RuntimeStatus::Pending,
         runtime_message: String::new(),
         probe_passed_at: None,

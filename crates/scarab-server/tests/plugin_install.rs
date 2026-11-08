@@ -21,7 +21,10 @@ use tower::ServiceExt;
 use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
 use scarab_identity::{Binding, BindingOrigin, Principal, RbacStore, Role, Scope};
-use scarab_plugin::{PluginTokenVerifier, TokenRejected, VerifiedServiceAccount};
+use scarab_plugin::{
+    InstallationState, PluginStore, PluginTokenVerifier, RuntimeStatus, TokenRejected,
+    VerifiedServiceAccount,
+};
 use scarab_server::plugins::PluginPolicy;
 use scarab_server::{broker, router, AppState, LogService};
 use scarab_testkit::{
@@ -260,6 +263,77 @@ async fn a_kill_refuses_the_very_next_request_and_enable_restores_it() {
     assert_eq!(status, StatusCode::OK);
     let (status, _) = whoami(&apps, Some(&token)).await;
     assert_eq!(status, StatusCode::OK);
+    tdb.cleanup().await;
+}
+
+/// git-bug da0af59 (8): an installation the plugin runtime has held (its
+/// isolation probe failed, or the runtime refused it) is refused by the
+/// broker, though its state is still Enabled; a later Running restores it.
+#[tokio::test]
+async fn the_broker_refuses_an_installation_the_runtime_held() {
+    let Some((tdb, pg)) = migrated().await else {
+        return;
+    };
+    let apps = apps(pg.clone());
+    let token = install(&apps.public, "acme", "argocd").await;
+    let id = token.strip_prefix("tok-").unwrap().to_string();
+    assert_eq!(whoami(&apps, Some(&token)).await.0, StatusCode::OK);
+
+    for held in [RuntimeStatus::ProbeFailed, RuntimeStatus::Error] {
+        assert!(pg
+            .set_runtime_status(&id, InstallationState::Enabled, 0, held, "held", None)
+            .await
+            .unwrap());
+        let (status, body) = whoami(&apps, Some(&token)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{held:?}: {body}");
+        assert!(
+            body.to_string().contains("held by the plugin runtime"),
+            "{body}"
+        );
+    }
+    assert!(pg
+        .set_runtime_status(
+            &id,
+            InstallationState::Enabled,
+            0,
+            RuntimeStatus::Running,
+            "",
+            Some(1)
+        )
+        .await
+        .unwrap());
+    assert_eq!(whoami(&apps, Some(&token)).await.0, StatusCode::OK);
+    tdb.cleanup().await;
+}
+
+/// git-bug da0af59 (8, red team): a workload that is merely failing (a
+/// crash loop, an image pull, a quota refusal) records `error` with the
+/// probe that let it run. It was never held, and the broker serves it.
+#[tokio::test]
+async fn a_failing_workload_is_not_a_held_installation() {
+    let Some((tdb, pg)) = migrated().await else {
+        return;
+    };
+    let apps = apps(pg.clone());
+    let token = install(&apps.public, "acme", "argocd").await;
+    let id = token.strip_prefix("tok-").unwrap().to_string();
+    assert!(pg
+        .set_runtime_status(
+            &id,
+            InstallationState::Enabled,
+            0,
+            RuntimeStatus::Error,
+            "CrashLoopBackOff: back-off 40s restarting failed container",
+            Some(1),
+        )
+        .await
+        .unwrap());
+    let (status, body) = whoami(&apps, Some(&token)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a crash-looping Pod was never held: {body}"
+    );
     tdb.cleanup().await;
 }
 

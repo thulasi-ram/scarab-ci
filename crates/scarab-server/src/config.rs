@@ -69,6 +69,7 @@
 //! | `SCARAB_BROKER_ADDR` | env | the CredentialBroker's own listener (ADR-0072 §11), separate from the API so plugins never reach the public surface; default `0.0.0.0:8090`. Only bound with `SCARAB_PLUGINS=on` |
 //! | `SCARAB_PLUGIN_NAMESPACE` | env | the one shared namespace Plugins run in (ADR-0072 §9); default `scarab-plugins`. A broker caller's ServiceAccount must be in it. Never `SCARAB_NAMESPACE`, `default` or `kube-*` (refused at boot) |
 //! | `SCARAB_PLUGIN_BROKER_URL` | env | the broker URL the runtime injects into every Plugin Pod (`SCARAB_BROKER_URL`); default `http://scarab-broker:8090`. Plugins have no DNS, so a host NAME is resolved by the runtime every pass and injected as an IP |
+//! | `SCARAB_PLUGIN_OWNER` | env | which Scarab release this is, `<release namespace>.<release name>` (a label value): stamped on the plugin namespace (`scarab.io/plugin-runtime-owner`) and on everything the runtime creates. The runtime refuses a namespace stamped for another release, or not stamped. Unset = the runtime refuses its baseline and no Plugin runs. The chart sets it |
 //! | `SCARAB_PLUGIN_BROKER_PEER` | env | how the `plugin-egress` NetworkPolicy names the broker: `pods:<namespace>:<k=v,…>` or `cidr:<ip>/<prefix>` (at most a /24). Unset = the runtime refuses its baseline and no Plugin runs |
 //! | `SCARAB_PLUGIN_PROBE_IMAGE` | env | the isolation-probe and per-Pod self-check image (ADR-0072 §9); default `busybox:1.36.1` pinned by digest. Pin an override by digest too |
 //! | `SCARAB_PLUGIN_ARGOCD_REPO` | env | the repository the first-party Argo CD plugin installs from; default `ghcr.io/thulasi-ram/scarab-plugin-argocd`. An install must pin it by `@sha256:` digest |
@@ -798,6 +799,11 @@ pub struct PluginsConfig {
     pub broker_peer: Option<String>,
     /// `None` = the runtime's default probe image (busybox).
     pub probe_image: Option<String>,
+    /// `SCARAB_PLUGIN_OWNER`: which Scarab release this is
+    /// (`<release namespace>.<release name>`), stamped on the plugin
+    /// namespace and on everything the runtime creates. Validated as a
+    /// label value. `None` = unset: the runtime refuses its baseline.
+    pub owner: Option<String>,
     /// The repository the first-party Argo CD catalog entry installs from.
     pub argocd_repo: String,
     /// Dev only: accept `<repo>:<tag>` for a first-party install.
@@ -875,6 +881,16 @@ impl PluginsConfig {
         // cannot take apart would refuse every pass, so refuse boot instead.
         if let Err(e) = scarab_plugin_k8s::BrokerUrl::parse(&broker_url) {
             return Err(invalid(format!("SCARAB_PLUGIN_BROKER_URL: {e}")));
+        }
+        let owner = set("SCARAB_PLUGIN_OWNER");
+        if let Some(owner) = &owner {
+            if !scarab_plugin_k8s::valid_label_value(owner) {
+                return Err(invalid(format!(
+                    "SCARAB_PLUGIN_OWNER must be a Kubernetes label value (at most 63 \
+                     characters: letters, digits, '-', '_' and '.', starting and ending with a \
+                     letter or digit), got {owner:?}"
+                )));
+            }
         }
         let broker_peer = set("SCARAB_PLUGIN_BROKER_PEER");
         if let Some(peer) = &broker_peer {
@@ -956,6 +972,7 @@ impl PluginsConfig {
             broker_url,
             broker_peer,
             probe_image: set("SCARAB_PLUGIN_PROBE_IMAGE"),
+            owner,
             argocd_repo,
             dev_allow_tag,
             dev_tokens,
@@ -971,6 +988,7 @@ impl PluginsConfig {
             broker_url: "http://scarab-broker:8090".into(),
             broker_peer: None,
             probe_image: None,
+            owner: None,
             argocd_repo: DEFAULT_PLUGIN_ARGOCD_REPO.into(),
             dev_allow_tag: false,
             dev_tokens: Vec::new(),

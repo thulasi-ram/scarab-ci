@@ -60,6 +60,12 @@ pub const LABEL_PLUGIN_WORKLOAD: &str = "scarab.io/plugin-workload";
 /// The installation id an object belongs to. The reconcile loop lists
 /// Deployments by it to find workloads whose installation is gone.
 pub const LABEL_INSTALLATION: &str = "scarab.io/plugin-installation";
+/// The Scarab release a plugin namespace, and everything the runtime puts
+/// in it, belongs to (`SCARAB_PLUGIN_OWNER`, `<release namespace>.<release
+/// name>`). The runtime refuses a namespace stamped for another release, and
+/// its orphan sweep removes only objects stamped for its own (or for none:
+/// written before the stamp existed, in a namespace that is its own).
+pub const LABEL_OWNER: &str = "scarab.io/plugin-runtime-owner";
 /// `app.kubernetes.io/managed-by` on everything this runtime creates.
 pub const LABEL_MANAGED_BY: &str = "app.kubernetes.io/managed-by";
 pub const MANAGED_BY: &str = "scarab";
@@ -245,6 +251,18 @@ impl BrokerUrl {
     }
 }
 
+/// A Kubernetes label value: at most 63 characters of letters, digits,
+/// `-`, `_` and `.`, starting and ending with a letter or digit.
+pub fn valid_label_value(s: &str) -> bool {
+    let edge = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric());
+    !s.is_empty()
+        && s.len() <= 63
+        && edge(s.chars().next())
+        && edge(s.chars().last())
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
 /// Characters a label key or value may hold (the key may carry a
 /// `prefix/`). Shape only; the API server has the last word.
 fn is_label_text(s: &str) -> bool {
@@ -256,6 +274,16 @@ fn is_label_text(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_label_value_is_checked_for_shape() {
+        for ok in ["scarab.prod", "a", "scarab-staging.scarab_1"] {
+            assert!(valid_label_value(ok), "{ok}");
+        }
+        for bad in ["", "scarab/prod", ".scarab", "scarab.", &"a".repeat(64)] {
+            assert!(!valid_label_value(bad), "{bad}");
+        }
+    }
 
     #[test]
     fn a_pods_peer_names_a_namespace_and_labels() {

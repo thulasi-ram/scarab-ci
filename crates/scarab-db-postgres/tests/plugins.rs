@@ -58,6 +58,7 @@ fn installation(org: &str, name: &str, id: &str) -> PluginInstallation {
         manifest_sha256: "0".repeat(64),
         config: BTreeMap::new(),
         state: InstallationState::Enabled,
+        state_version: 0,
         runtime_status: RuntimeStatus::Pending,
         runtime_message: String::new(),
         probe_passed_at: None,
@@ -190,6 +191,7 @@ async fn runtime_status_is_written_only_in_the_state_it_was_decided_in() {
         .set_runtime_status(
             "0000000001",
             InstallationState::Enabled,
+            0,
             RuntimeStatus::Running,
             "",
             Some(2_000)
@@ -205,6 +207,7 @@ async fn runtime_status_is_written_only_in_the_state_it_was_decided_in() {
         .set_runtime_status(
             "0000000001",
             InstallationState::Enabled,
+            0,
             RuntimeStatus::Running,
             "",
             Some(2_000)
@@ -221,6 +224,7 @@ async fn runtime_status_is_written_only_in_the_state_it_was_decided_in() {
         .set_runtime_status(
             "0000000001",
             InstallationState::Killed,
+            1,
             RuntimeStatus::Stopped,
             "",
             Some(2_000)
@@ -242,10 +246,31 @@ async fn runtime_status_is_written_only_in_the_state_it_was_decided_in() {
         (RuntimeStatus::Pending, "", None),
         "a re-enabled installation is probed again before it starts"
     );
+    // git-bug da0af59: a pass that read `enabled` before the kill, and
+    // writes after the re-enable, finds the state as it read it but not the
+    // version: the probe the enable cleared does not come back.
+    assert_eq!(enabled.state_version, 2, "killed, then enabled");
+    assert!(!db
+        .set_runtime_status(
+            "0000000001",
+            InstallationState::Enabled,
+            0,
+            RuntimeStatus::Running,
+            "",
+            Some(2_000)
+        )
+        .await
+        .unwrap());
+    let after = db.installation_by_id("0000000001").await.unwrap().unwrap();
+    assert_eq!(
+        (after.runtime_status, after.probe_passed_at),
+        (RuntimeStatus::Pending, None)
+    );
     // Enabling one already enabled resets nothing.
     db.set_runtime_status(
         "0000000002",
         InstallationState::Enabled,
+        0,
         RuntimeStatus::Running,
         "",
         Some(5_000),

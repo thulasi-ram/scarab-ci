@@ -546,8 +546,41 @@ plugins:
   namespace: scarab-plugins
   # Render the namespace (with its Pod Security labels). Set false if you
   # create it yourself — it must carry
-  # pod-security.kubernetes.io/enforce=restricted.
+  # pod-security.kubernetes.io/enforce=restricted and
+  # scarab.io/plugin-runtime-owner=<release namespace>.<release name>.
   createNamespace: true
+  # Which release owns the plugin namespace (SCARAB_PLUGIN_OWNER, the
+  # scarab.io/plugin-runtime-owner label). "" = <release namespace>.<release
+  # name>. A label value: at most 63 characters, unique to this release. Set
+  # it when the default is longer than that (the chart then refuses to
+  # render rather than truncate two releases into one owner).
+  owner: ""
+  # A NetworkPolicy on the scarab-server Pods: the broker port only from
+  # plugin workloads in the plugin namespace; the API port stays open to
+  # every source. Needs a CNI that enforces NetworkPolicy (plugins already
+  # do). Off only if another policy already governs these Pods.
+  brokerIngressPolicy: true
+  # What every plugin together may take: a ResourceQuota on the plugin
+  # namespace, and a LimitRange with container defaults (the isolation
+  # probe's Pods set none) and a per-container cap. A plugin Pod asks for
+  # 50m/64Mi and at most 500m/256Mi; the probe adds three short-lived Pods.
+  #
+  # A process limit per Pod is not a namespace setting: set the kubelet's
+  # `podPidsLimit` (e.g. 1024) on nodes that run plugins, so a plugin cannot
+  # exhaust a node's process IDs.
+  quota:
+    enabled: true
+    pods: 30
+    requestsCpu: "2"
+    requestsMemory: 2Gi
+    limitsCpu: "10"
+    limitsMemory: 8Gi
+    containerDefaultRequestCpu: 10m
+    containerDefaultRequestMemory: 16Mi
+    containerDefaultLimitCpu: 500m
+    containerDefaultLimitMemory: 128Mi
+    containerMaxCpu: "1"
+    containerMaxMemory: 1Gi
   # The broker listener's port (SCARAB_BROKER_ADDR) and its Service port —
   # the same number, so the NetworkPolicy port and the URL agree.
   brokerPort: 8090

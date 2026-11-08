@@ -1402,6 +1402,12 @@ pub trait Db: Send + Sync {
     /// briefly: past a short bound it reports the holder unchanged and the
     /// caller tries again next tick.
     async fn lease(&self, resource: &str, owner: &str, ttl_ms: i64) -> Result<Lease, DbError>;
+
+    /// Give up `owner`'s lease over `resource` at once, so a peer takes it
+    /// over on its next request instead of after the TTL; its takeover
+    /// starts the next term, as any takeover does. A lease `owner` does not
+    /// hold is left alone. For a holder shutting down cleanly.
+    async fn release_lease(&self, resource: &str, owner: &str) -> Result<(), DbError>;
 }
 
 /// A best-effort **live tail** of a running unit's combined stdout/stderr, pulled
