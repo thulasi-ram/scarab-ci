@@ -15,8 +15,8 @@
 // who is at the other end. With SEVERAL (ADR-0069) the person has to choose,
 // so each gets a button naming it — the default one first.
 import { For, createResource } from "solid-js";
-import markInk from "./assets/brand/scarab-halftone-ink.svg";
-import markCream from "./assets/brand/scarab-halftone.svg";
+import markInk from "./assets/brand/scarab-square-ink.svg";
+import markCream from "./assets/brand/scarab-square-cream.svg";
 import { listAuthProviders } from "./api/client";
 import { loginChoices } from "./identities";
 
@@ -28,8 +28,8 @@ export default function Login() {
   return (
     <div class="login">
       <div class="login-card">
-        <img class="login-emblem login-emblem--light" src={markInk} alt="" width={96} height={96} />
-        <img class="login-emblem login-emblem--dark" src={markCream} alt="" width={96} height={96} />
+        <img class="login-emblem login-emblem--light" src={markInk} alt="" width={72} height={72} />
+        <img class="login-emblem login-emblem--dark" src={markCream} alt="" width={72} height={72} />
         <h1 class="login-title">Scarab</h1>
         <p class="login-sub">
           A run is durable state. Sign in to see them.

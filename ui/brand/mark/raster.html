@@ -1,0 +1,45 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Rendering Scarab icons</title>
+<body style="font:14px system-ui;padding:24px">
+<p id="msg">Rendering…</p>
+<script>
+// Draws each SVG onto a canvas at every size and posts the PNG to serve_png.py.
+// At 32 px and below the small-size mark (thicker, no cuts) is used.
+const SIZES = [16, 32, 48, 64, 128, 180, 192, 256, 512, 1024];
+const SMALL = 32;
+
+const load = (src) => { const i = new Image(); i.src = src; return i.decode().then(() => i); };
+
+async function save(img, path, size) {
+  const c = document.createElement('canvas'); c.width = c.height = size;
+  const g = c.getContext('2d'); g.imageSmoothingQuality = 'high'; g.drawImage(img, 0, 0, size, size);
+  const blob = await new Promise((r) => c.toBlob(r, 'image/png'));
+  const res = await fetch('/save?path=' + path, { method: 'POST', body: blob });
+  if (!res.ok) throw new Error('save refused: ' + path);
+}
+
+(async () => {
+  const sets = {
+    ink: ['scarab-square-ink', 'scarab-small-ink'],
+    cream: ['scarab-square-cream', 'scarab-small-cream'],
+    tile: ['scarab-tile', 'scarab-small-tile'],
+    'tile-emerald': ['scarab-tile-emerald', 'scarab-small-tile-emerald'],
+  };
+  let n = 0;
+  for (const [dir, [big, small]] of Object.entries(sets)) {
+    const b = await load(`/logo/${big}.svg`), s = await load(`/logo/${small}.svg`);
+    for (const size of SIZES) { await save(size <= SMALL ? s : b, `icons/${dir}/icon-${size}.png`, size); n++; }
+  }
+  // Fallback favicons: the small-size mark in emerald, which reads on light and dark tabs.
+  const emerald = await load('/logo/scarab-small-emerald.svg');
+  for (const s of [16, 32, 48, 64]) { await save(emerald, `favicon/favicon-${s}.png`, s); n++; }
+  const tile = await load('/logo/scarab-tile.svg');
+  for (const [path, s] of [['apple-touch-icon.png', 180], ['icon-192.png', 192], ['icon-512.png', 512]]) {
+    await save(tile, 'favicon/' + path, s); n++;
+  }
+  await fetch('/done', { method: 'POST' });
+  document.getElementById('msg').textContent = `Done: ${n} PNGs saved. You can close this tab.`;
+  document.title = 'done';
+})().catch((e) => { document.getElementById('msg').textContent = 'Failed: ' + e.message; document.title = 'failed'; });
+</script>

@@ -93,23 +93,24 @@ docs what="" *args:
       *) echo "usage: just docs [build | screenshots [check]]" >&2; exit 2 ;;
     esac
 
-# `just brand` regenerates the halftone mark's SVGs in ui/brand from
-# ui/brand/halftone/generate.py (python3, standard library only).
+# `just brand` regenerates the beetle mark's SVGs in ui/brand from the two
+# traced masters in ui/brand/mark (generate.py, python3, standard library only).
 # `just brand check` fails if the SVGs on disk differ from what the generator
-# produces. `just brand png` re-renders the 37 PNG icons in a browser: it opens
+# produces. `just brand png` re-renders the 47 PNG icons in a browser: it opens
 # a tab that draws each SVG at every size, serve_png.py saves the files and
 # exits when the page reports it is done, then favicon.ico is rebuilt from the
-# favicon PNGs.
-[doc('Regenerate the halftone mark SVGs; `check` compares them; `png` re-renders the PNG icons')]
+# favicon PNGs. Re-tracing the masters from the artwork (mark/trace.py) needs
+# numpy, opencv and pillow plus potrace, so it is not a recipe step.
+[doc('Regenerate the beetle mark SVGs; `check` compares them; `png` re-renders the PNG icons')]
 brand what="":
     #!/usr/bin/env bash
     set -euo pipefail
     case "{{what}}" in
-      "") python3 ui/brand/halftone/generate.py ;;
-      check) python3 ui/brand/halftone/generate.py --check ;;
+      "") python3 ui/brand/mark/generate.py ;;
+      check) python3 ui/brand/mark/generate.py --check ;;
       png)
-        python3 ui/brand/halftone/serve_png.py
-        python3 ui/brand/halftone/generate.py --ico
+        python3 ui/brand/mark/serve_png.py
+        python3 ui/brand/mark/generate.py --ico
         ;;
       *) echo "usage: just brand [check | png]" >&2; exit 2 ;;
     esac
