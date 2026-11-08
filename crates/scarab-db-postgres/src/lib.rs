@@ -3019,6 +3019,29 @@ impl Db for PostgresDb {
         Ok(cleared as u32)
     }
 
+    async fn release_lease(&self, resource: &str, owner: &str) -> Result<(), DbError> {
+        // Expire it, keeping owner and term: the next lease() by anyone is
+        // a takeover of an expired lease, which starts the next term. The
+        // row is guarded on its owner, so a lease already taken over is not
+        // touched. Bounded like a takeover, should this owner still be
+        // inside one of its own fenced transactions.
+        let mut tx = self.pool().begin().await.map_err(db_err)?;
+        sqlx::query(&format!("SET LOCAL lock_timeout = '{TAKEOVER_WAIT}'"))
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        sqlx::query(
+            "UPDATE leases SET expires_at = (extract(epoch from now()) * 1000)::bigint - 1
+             WHERE resource = $1 AND owner = $2",
+        )
+        .bind(resource)
+        .bind(owner)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)
+    }
+
     async fn lease(&self, resource: &str, owner: &str, ttl_ms: i64) -> Result<Lease, DbError> {
         // Read first, without a lock. Only the holder's renewal and the
         // takeover of an EXPIRED lease write the row, so a follower that finds

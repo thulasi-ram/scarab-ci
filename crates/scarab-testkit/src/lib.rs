@@ -2652,6 +2652,16 @@ impl Db for InMemoryDb {
         Ok(cleared)
     }
 
+    async fn release_lease(&self, resource: &str, owner: &str) -> Result<(), DbError> {
+        let mut st = self.state.lock().unwrap();
+        if let Some((holder, expires, _)) = st.leases.get_mut(resource) {
+            if holder == owner {
+                *expires = std::time::Instant::now();
+            }
+        }
+        Ok(())
+    }
+
     async fn lease(&self, resource: &str, owner: &str, ttl_ms: i64) -> Result<Lease, DbError> {
         // Real lease semantics (the PG adapter's contract): the holder renews
         // and keeps its term; a peer only takes over an EXPIRED lease, and the

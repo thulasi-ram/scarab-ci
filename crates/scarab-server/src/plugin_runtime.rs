@@ -43,8 +43,8 @@ use scarab_plugin_k8s::{K8sPluginRuntime, RuntimeError, WorkloadState};
 
 /// The lease gating the loop to one replica at a time.
 pub const PLUGIN_RUNTIME_LEASE: &str = "plugin-runtime";
-/// Short, so a restarted or crashed leader is replaced within a minute (the
-/// lease is not released on shutdown). A pass can run far longer — a probe
+/// Short, so a crashed leader is replaced within a minute (a clean shutdown
+/// releases the lease at once). A pass can run far longer — a probe
 /// alone is bounded at 5 minutes — so while a pass runs the lease is renewed
 /// in the background every [`LEASE_RENEW_INTERVAL`], and re-checked before
 /// anything is held or stopped on the probe's strength.
@@ -292,14 +292,36 @@ impl PluginRuntimeLoop {
         }
     }
 
-    /// Run a pass every [`RECONCILE_INTERVAL`], forever.
-    pub fn spawn(mut self) -> tokio::task::JoinHandle<()> {
+    /// Run a pass every [`RECONCILE_INTERVAL`] until `stop` resolves, then
+    /// release the lease so another replica takes over at once rather than
+    /// after the TTL (git-bug da0af59). A pass under way when `stop`
+    /// resolves is abandoned; the next leader starts its own.
+    pub fn spawn_until(
+        mut self,
+        stop: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
+            tokio::pin!(stop);
             loop {
-                if let Err(e) = self.reconcile_once().await {
-                    tracing::warn!(error = %e, "plugin runtime: reconcile pass failed");
+                tokio::select! {
+                    _ = &mut stop => break,
+                    result = self.reconcile_once() => {
+                        if let Err(e) = result {
+                            tracing::warn!(error = %e, "plugin runtime: reconcile pass failed");
+                        }
+                    }
                 }
-                tokio::time::sleep(RECONCILE_INTERVAL).await;
+                tokio::select! {
+                    _ = &mut stop => break,
+                    _ = tokio::time::sleep(RECONCILE_INTERVAL) => {}
+                }
+            }
+            if let Err(e) = self
+                .db
+                .release_lease(PLUGIN_RUNTIME_LEASE, &self.owner)
+                .await
+            {
+                tracing::warn!(error = %e, "plugin runtime: could not release the lease");
             }
         })
     }

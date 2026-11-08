@@ -1185,6 +1185,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // role that serves the broker, and with a cluster to run Plugins in. The
     // reconcile loop runs under the `plugin-runtime` lease, so with several
     // api replicas exactly one of them manages the workloads.
+    let mut plugin_runtime_handle: Option<tokio::task::JoinHandle<()>> = None;
     if config.plugins.enabled && config.role.serves_broker() {
         match scarab_plugin_k8s::default_client().await {
             Ok(client) => {
@@ -1233,14 +1234,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }),
                     },
                 );
-                scarab_server::plugin_runtime::PluginRuntimeLoop::new(
-                    db.clone(),
-                    pg.clone(),
-                    Arc::new(runtime),
-                    clock.clone(),
-                    replica_id.clone(),
-                )
-                .spawn();
+                plugin_runtime_handle = Some(
+                    scarab_server::plugin_runtime::PluginRuntimeLoop::new(
+                        db.clone(),
+                        pg.clone(),
+                        Arc::new(runtime),
+                        clock.clone(),
+                        replica_id.clone(),
+                    )
+                    .spawn_until(shutdown_signal()),
+                );
                 tracing::info!(
                     namespace = %config.plugins.namespace,
                     "plugin runtime: reconcile loop started (lease {})",
@@ -1369,6 +1372,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // It got the same signal and runs its own bounded drain, then writes
         // its journal (git-bug 4711823); wait for that, then stop waiting.
         let _ = tokio::time::timeout(Duration::from_secs(30), handle).await;
+    }
+    if let Some(handle) = plugin_runtime_handle {
+        // It got the same signal and releases its lease (git-bug da0af59).
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
     }
     if let Some(handle) = driver_handle {
         tracing::info!("shutdown: stopping the converged driver");

@@ -330,6 +330,32 @@ async fn lease_grant_renew_and_takeover(db: &dyn Db) {
 
 contract_test!(lease_semantics, lease_grant_renew_and_takeover);
 
+/// git-bug da0af59 (5): a released lease is taken over at once, in the next
+/// term; a release by a non-holder changes nothing.
+async fn a_released_lease_is_taken_over_at_once(db: &dyn Db) {
+    let ttl = 60_000_i64;
+    let first = db.lease("plugin-runtime", "a", ttl).await.unwrap();
+    assert_eq!(first.owner, "a");
+
+    db.release_lease("plugin-runtime", "b").await.unwrap();
+    assert_eq!(
+        db.lease("plugin-runtime", "b", ttl).await.unwrap().owner,
+        "a",
+        "only the holder can release"
+    );
+
+    db.release_lease("plugin-runtime", "a").await.unwrap();
+    let taken = db.lease("plugin-runtime", "b", ttl).await.unwrap();
+    assert_eq!(taken.owner, "b", "taken over without waiting out the TTL");
+    assert_eq!(
+        taken.term,
+        first.term + 1,
+        "a takeover starts the next term"
+    );
+}
+
+contract_test!(lease_release, a_released_lease_is_taken_over_at_once);
+
 // ---------------------------------------------------------------------------
 // 5. Outbox: exactly-once enqueue on the idempotency key; a claim hides the
 //    message from other drainers for its visibility window (and an expired
