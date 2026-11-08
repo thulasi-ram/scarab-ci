@@ -5,7 +5,7 @@
 <p id="msg">Rendering…</p>
 <script>
 // Draws each SVG onto a canvas at every size and posts the PNG to serve_png.py.
-// At 32 px and below the small-size mark (thicker, no cuts) is used.
+// At 32 px and below the one-colour mark is used: the two tones blur together there.
 const SIZES = [16, 32, 48, 64, 128, 180, 192, 256, 512, 1024];
 const SMALL = 32;
 
@@ -21,19 +21,18 @@ async function save(img, path, size) {
 
 (async () => {
   const sets = {
-    ink: ['scarab-square-ink', 'scarab-small-ink'],
-    cream: ['scarab-square-cream', 'scarab-small-cream'],
+    light: ['scarab-square', 'scarab-small-ink'],
+    dark: ['scarab-square-dark', 'scarab-small-cream'],
     tile: ['scarab-tile', 'scarab-small-tile'],
-    'tile-emerald': ['scarab-tile-emerald', 'scarab-small-tile-emerald'],
   };
   let n = 0;
   for (const [dir, [big, small]] of Object.entries(sets)) {
     const b = await load(`/logo/${big}.svg`), s = await load(`/logo/${small}.svg`);
     for (const size of SIZES) { await save(size <= SMALL ? s : b, `icons/${dir}/icon-${size}.png`, size); n++; }
   }
-  // Fallback favicons: the small-size mark in emerald, which reads on light and dark tabs.
-  const emerald = await load('/logo/scarab-small-emerald.svg');
-  for (const s of [16, 32, 48, 64]) { await save(emerald, `favicon/favicon-${s}.png`, s); n++; }
+  // Fallback favicons: the one-colour mark in ink (most tabs are light).
+  const ink = await load('/logo/scarab-small-ink.svg');
+  for (const s of [16, 32, 48, 64]) { await save(ink, `favicon/favicon-${s}.png`, s); n++; }
   const tile = await load('/logo/scarab-tile.svg');
   for (const [path, s] of [['apple-touch-icon.png', 180], ['icon-192.png', 192], ['icon-512.png', 512]]) {
     await save(tile, 'favicon/' + path, s); n++;
