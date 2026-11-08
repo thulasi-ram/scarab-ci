@@ -514,6 +514,53 @@ contract_test!(
 );
 
 // ---------------------------------------------------------------------------
+// git-bug cfb5edb: when an attempt's step process was first seen running. The
+// first write wins, so a later poll cannot move the start of the timeout.
+// ---------------------------------------------------------------------------
+
+async fn attempt_execution_start_keeps_the_first_write(db: &dyn Db) {
+    let run = RunId("exec-run".into());
+    let step = StepId("e".into());
+    seed_run_and_step(db, &run, &step).await;
+    let a1 = AttemptId("a1".into());
+    db.record_attempt(&run, &step, &attempt("a1", 100))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        db.attempt_execution_started(&run, &step, &a1)
+            .await
+            .unwrap(),
+        None,
+        "not seen running yet"
+    );
+    assert_eq!(
+        db.mark_attempt_execution_started(&run, &step, &a1, Timestamp(500))
+            .await
+            .unwrap(),
+        Timestamp(500)
+    );
+    assert_eq!(
+        db.mark_attempt_execution_started(&run, &step, &a1, Timestamp(900))
+            .await
+            .unwrap(),
+        Timestamp(500),
+        "a later poll returns the first time"
+    );
+    assert_eq!(
+        db.attempt_execution_started(&run, &step, &a1)
+            .await
+            .unwrap(),
+        Some(Timestamp(500))
+    );
+}
+
+contract_test!(
+    attempt_execution_start,
+    attempt_execution_start_keeps_the_first_write
+);
+
+// ---------------------------------------------------------------------------
 // Results ingest (ADR-0042; review safety S1): externally POSTed results land
 // only on the step's RUNNING FRONTIER attempt; a superseded attempt's, or a
 // late one after the step settled, is a Conflict that writes nothing.

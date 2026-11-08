@@ -1,0 +1,13 @@
+-- git-bug cfb5edb: when an attempt's step process was first seen running.
+-- `started_at` is the claim, before the unit exists, so a step's `timeout:`
+-- measured from it billed the wait for a node, the image pull and the
+-- workspace fetch. The timeout is now measured from this column, and an
+-- attempt still NULL here past the provisioning deadline fails as never
+-- started instead of as a timeout.
+ALTER TABLE attempts ADD COLUMN execution_started_at BIGINT;
+--
+-- Expand step (ADR-0003): a nullable column only. A server built before this
+-- migration refuses to boot against a database that has it; to roll back,
+-- delete row 86 from `_sqlx_migrations` and drop the column (leaving it makes
+-- the next roll-forward fail on ADD COLUMN). The column is harmless to old
+-- code.

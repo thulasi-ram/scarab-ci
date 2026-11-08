@@ -459,6 +459,106 @@ async fn engine_backstop_times_out_a_hung_step() {
     assert_eq!(a[0].failure, Some(FailureKind::Timeout));
 }
 
+/// A Run whose one step has an authored `timeout:` of 5s.
+async fn seed_with_timeout(db: &InMemoryDb) {
+    let at = Timestamp(1_000);
+    db.create_run(&run_id(), 1, 1, at).await.unwrap();
+    db.create_step_run(&run_id(), &step_id(), Some(&spec()), &[], at)
+        .await
+        .unwrap();
+    db.store_run_ir(
+        &run_id(),
+        &serde_json::json!({ "ir_version": 1,
+            "steps": [{ "id": STEP, "image": "img", "timeout": 5 }] }),
+    )
+    .await
+    .unwrap();
+}
+
+/// git-bug cfb5edb: the timeout was measured from the attempt's claim, so a
+/// step that waited ten minutes for a node failed as `Timeout` before its
+/// process ever ran. It is measured from the first poll that sees the
+/// process running.
+#[tokio::test]
+async fn waiting_for_a_node_does_not_use_up_the_step_timeout() {
+    let (db, clock, exec) = (
+        InMemoryDb::new(),
+        FakeClock::new(1_000),
+        FakeExecutor::new(),
+    );
+    seed_with_timeout(&db).await;
+    exec.script_outcome(ExecState::Pending);
+    exec.script_outcome(ExecState::Pending);
+    tick(&db, &clock, &exec).await; // a1 launches; the Pod is Pending
+
+    // Ten minutes of waiting for a node: far past the 5s timeout + grace.
+    clock.advance(10 * 60_000);
+    tick(&db, &clock, &exec).await;
+    let a = attempts(&db).await;
+    assert_eq!(a.len(), 1);
+    assert_eq!(a[0].failure, None, "a step that never ran did not time out");
+
+    tick(&db, &clock, &exec).await; // the process is running now
+    clock.advance(5_000 + 60_000 - 1);
+    tick(&db, &clock, &exec).await;
+    assert_eq!(attempts(&db).await[0].failure, None, "inside its timeout");
+
+    clock.advance(2);
+    for _ in 0..2 {
+        tick(&db, &clock, &exec).await;
+    }
+    let a = attempts(&db).await;
+    assert_eq!(a.len(), 1);
+    assert_eq!(a[0].failure, Some(FailureKind::Timeout));
+}
+
+/// git-bug cfb5edb: an attempt that never gets its process running fails at
+/// the provisioning deadline as never-started infra, which says why and is
+/// auto-retried — not as a `Timeout`.
+#[tokio::test]
+async fn a_step_that_never_starts_fails_at_the_provisioning_deadline_not_as_a_timeout() {
+    let (db, clock, exec) = (
+        InMemoryDb::new(),
+        FakeClock::new(1_000),
+        FakeExecutor::new(),
+    );
+    seed_with_timeout(&db).await;
+    exec.script_outcome(ExecState::Pending);
+    exec.script_outcome(ExecState::Pending);
+    exec.script_outcome(ExecState::Pending);
+    tick(&db, &clock, &exec).await; // a1 launches; the Pod is Pending
+
+    let deadline_ms = i64::from(scarab_engine::PROVISIONING_DEADLINE_SECS) * 1000;
+    clock.advance(deadline_ms - 1_000 - 1);
+    tick(&db, &clock, &exec).await;
+    assert_eq!(attempts(&db).await[0].failure, None, "inside the deadline");
+
+    clock.advance(1_000 + 1);
+    tick(&db, &clock, &exec).await;
+    let a = attempts(&db).await;
+    assert_eq!(
+        a[0].failure,
+        Some(FailureKind::Infra {
+            never_started: true
+        })
+    );
+    let detail = a[0].failure_detail.as_deref().unwrap_or_default();
+    assert!(
+        detail.contains("did not start running within 30 minutes"),
+        "{detail}"
+    );
+    assert!(
+        exec.cancelled_handles().contains(&handle(1).0),
+        "the Pending unit is torn down"
+    );
+    tick(&db, &clock, &exec).await;
+    assert_eq!(
+        attempts(&db).await.len(),
+        2,
+        "never-started is auto-retried"
+    );
+}
+
 #[tokio::test]
 async fn re_adoption_after_a_crash_reuses_the_fence_and_consumes_no_budget() {
     let (db, clock, exec) = (

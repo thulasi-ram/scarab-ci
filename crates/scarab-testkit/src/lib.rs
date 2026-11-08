@@ -220,6 +220,7 @@ struct InMemoryState {
     /// Per-(run, step, attempt) launch handle — the durable "launch happened"
     /// marker (ADR-0047).
     attempt_handles: HashMap<(RunId, StepId, AttemptId), String>,
+    attempt_execution_started: HashMap<(RunId, StepId, AttemptId), Timestamp>,
     /// Per-run concurrency group + policy.
     concurrency: HashMap<RunId, (String, ConcurrencyPolicy)>,
     /// The single slot holder per concurrency group.
@@ -2072,6 +2073,37 @@ impl Db for InMemoryDb {
             .attempt_handles
             .get(&(run.clone(), step.clone(), attempt.clone()))
             .cloned())
+    }
+
+    async fn mark_attempt_execution_started(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        at: Timestamp,
+    ) -> Result<Timestamp, DbError> {
+        Ok(*self
+            .state
+            .lock()
+            .unwrap()
+            .attempt_execution_started
+            .entry((run.clone(), step.clone(), attempt.clone()))
+            .or_insert(at))
+    }
+
+    async fn attempt_execution_started(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<Option<Timestamp>, DbError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .attempt_execution_started
+            .get(&(run.clone(), step.clone(), attempt.clone()))
+            .copied())
     }
 
     async fn set_attempt_failure(

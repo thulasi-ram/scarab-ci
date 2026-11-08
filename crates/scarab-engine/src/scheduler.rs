@@ -44,6 +44,16 @@ pub const MAX_DELIVERY_ATTEMPTS: u32 = 10;
 /// only fires when the backend could not enforce (hung kubelet, lost node),
 /// and the grace keeps the two from racing in the normal case.
 const TIMEOUT_BACKSTOP_GRACE_MS: i64 = 60_000;
+
+/// How long an attempt may take, from its claim, to get its step process
+/// running (git-bug cfb5edb): the wait for a node, the image pull and the
+/// workspace fetch. A step's `timeout:` is measured from when the process
+/// was first seen running, so waiting for infrastructure does not use it up;
+/// an attempt that never gets there fails as never started (bounded
+/// auto-retry), not as a `Timeout`. The k8s executor adds the same number to
+/// the Pod's `activeDeadlineSeconds`, because one Pod deadline cannot be
+/// split into the two. One constant, read by both, so the two cannot drift.
+pub const PROVISIONING_DEADLINE_SECS: u32 = 30 * 60;
 use crate::{
     ports::WorkspaceSnapshots, Attempt, AttemptFrontier, AttemptId, AttemptOutcome, AttemptStamp,
     Clock, ConcurrencyPolicy, Db, DbError, EventKind, EventPayload, ExecError, Executor,
@@ -3979,33 +3989,65 @@ impl<'a> Scheduler<'a> {
                 }
                 // Not terminal yet: leave the intent claimed; the lease expires
                 // and a later reconcile re-polls (adopting via the stored
-                // handle). No duplicate effect. Engine-side timeout backstop
-                // (ADR-0047): if the attempt has outlived its deadline (plus
-                // grace) and the backend hasn't enforced it, cancel
-                // best-effort and settle as Timeout.
-                ExecState::Pending | ExecState::Running => {
-                    let started_at = self
-                        .db
-                        .attempts_of_step(&run, &step)
-                        .await?
-                        .iter()
-                        .find(|a| a.id == attempt)
-                        .map(|a| a.started_at);
-                    if let Some(started_at) = started_at {
-                        let timeout_ms = self.step_timeout_ms(&run, &step).await?;
-                        let now = self.clock.now().await;
-                        if now.0 >= started_at.0 + timeout_ms + TIMEOUT_BACKSTOP_GRACE_MS {
-                            let _ = self.executor.cancel(&handle).await;
-                            self.settle_failed_attempt(
-                                &run,
-                                &step,
-                                &attempt,
-                                FailureKind::Timeout,
-                                None,
-                            )
-                            .await?;
-                            self.db.mark_dispatched(msg.id).await?;
+                // handle). No duplicate effect.
+                //
+                // Engine-side deadlines (ADR-0047, git-bug cfb5edb). The
+                // attempt's `started_at` is its claim, before the unit exists,
+                // so the step's `timeout:` is measured from the first poll
+                // that saw the process running instead: waiting for a node,
+                // an image or the workspace fetch does not use it up. Until
+                // then the provisioning deadline applies, and missing it is a
+                // never-started infra failure, not a `Timeout`. The run
+                // budget is left as it is: `enforce_run_budget` sums the
+                // Run's own Running intervals, which is a different question.
+                observed @ (ExecState::Pending | ExecState::Running) => {
+                    let now = self.clock.now().await;
+                    let execution_started = if observed == ExecState::Running {
+                        Some(
+                            self.db
+                                .mark_attempt_execution_started(&run, &step, &attempt, now)
+                                .await?,
+                        )
+                    } else {
+                        self.db
+                            .attempt_execution_started(&run, &step, &attempt)
+                            .await?
+                    };
+                    let verdict = match execution_started {
+                        Some(began) => {
+                            let timeout_ms = self.step_timeout_ms(&run, &step).await?;
+                            (now.0 >= began.0 + timeout_ms + TIMEOUT_BACKSTOP_GRACE_MS)
+                                .then_some((FailureKind::Timeout, None))
                         }
+                        None => {
+                            let claimed = self
+                                .db
+                                .attempts_of_step(&run, &step)
+                                .await?
+                                .iter()
+                                .find(|a| a.id == attempt)
+                                .map(|a| a.started_at);
+                            let deadline = i64::from(PROVISIONING_DEADLINE_SECS) * 1000;
+                            claimed.filter(|c| now.0 >= c.0 + deadline).map(|_| {
+                                (
+                                    FailureKind::Infra {
+                                        never_started: true,
+                                    },
+                                    Some(format!(
+                                        "the step did not start running within {} minutes of \
+                                         being launched (waiting for a node, pulling the image \
+                                         or fetching the workspace); its timeout was not used",
+                                        deadline / 60_000
+                                    )),
+                                )
+                            })
+                        }
+                    };
+                    if let Some((kind, cause)) = verdict {
+                        let _ = self.executor.cancel(&handle).await;
+                        self.settle_failed_attempt(&run, &step, &attempt, kind, cause)
+                            .await?;
+                        self.db.mark_dispatched(msg.id).await?;
                     }
                 }
             }

@@ -34,8 +34,8 @@ pub use scheduler::{
     AttemptTeardown, EnvironmentApproval, ExpiredInput, PlanReason, PlannedStep, PluginGateError,
     PluginGateVerdict, RerunError, RerunPlan, Scheduler, SchedulerError, Supervision,
     TeardownAttempt, TickHealth, CANCEL_ATTEMPT, CANCEL_RUN, CANCEL_SERVICES,
-    GATE_NO_LONGER_NEEDED, LAUNCH_STEP, MAX_DELIVERY_ATTEMPTS, RUN_FINISHED, RUN_STATUS_CHANGED,
-    SUPERSEDE_TEARDOWN,
+    GATE_NO_LONGER_NEEDED, LAUNCH_STEP, MAX_DELIVERY_ATTEMPTS, PROVISIONING_DEADLINE_SECS,
+    RUN_FINISHED, RUN_STATUS_CHANGED, SUPERSEDE_TEARDOWN,
 };
 pub use schedules::{ScheduleEntry, ScheduleFire, ScheduleStore};
 

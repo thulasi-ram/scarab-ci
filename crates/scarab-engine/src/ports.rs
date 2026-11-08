@@ -217,7 +217,14 @@ pub enum FailureClass {
 /// Observed state of a launched execution when polled.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExecState {
+    /// The step's process has not started (scheduling, image pull, workspace
+    /// fetch). An executor reports this only when it has no evidence the
+    /// process ever started: the engine fails an attempt still Pending at
+    /// its provisioning deadline as never started, and retries it
+    /// automatically (git-bug cfb5edb).
     Pending,
+    /// The step's process has started, or did start and its verdict is not
+    /// readable yet.
     Running,
     Succeeded,
     /// Terminal failure, classified by the adapter (ADR-0047). `exit_code` is
@@ -1110,6 +1117,26 @@ pub trait Db: Send + Sync {
         step: &StepId,
         attempt: &AttemptId,
     ) -> Result<Option<String>, DbError>;
+
+    /// Record that the attempt's step process was first seen running at `at`
+    /// (git-bug cfb5edb). The first write wins; later calls change nothing.
+    /// Returns the stored time.
+    async fn mark_attempt_execution_started(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        at: Timestamp,
+    ) -> Result<Timestamp, DbError>;
+
+    /// When the attempt's step process was first seen running, or `None`
+    /// when it has not been yet (or the attempt predates the record).
+    async fn attempt_execution_started(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<Option<Timestamp>, DbError>;
 
     /// Record the classified failure on a finished attempt (ADR-0047). Also
     /// stamps the attempt's [`AttemptOutcome::Failed`] outcome, so `failure` and
