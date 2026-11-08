@@ -48,7 +48,7 @@ const ARGOCD_MANIFEST_JSON: &str = include_str!("../../scarab-plugin-argocd/mani
 pub const PLUGIN_CONNECTION_CREDENTIALS_ORG: &str = "_plugin_connections";
 
 /// [`PLUGIN_CONNECTION_CREDENTIALS_ORG`] as a secret scope.
-pub(crate) fn plugin_connection_secret_scope() -> scarab_secrets::SecretScope {
+pub fn plugin_connection_secret_scope() -> scarab_secrets::SecretScope {
     scarab_secrets::SecretScope::Org {
         org: PLUGIN_CONNECTION_CREDENTIALS_ORG.to_string(),
     }

@@ -536,6 +536,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }),
             // The CredentialBroker journal (ADR-0072 §5): its retention window.
             Some(pg.clone() as Arc<dyn scarab_plugin::PluginStore>),
+            // Orphaned PluginConnection credentials (git-bug 4711823).
+            Some(secrets.clone()),
             // Step-up rows (ADR-0073): expired challenges and confirmations,
             // settled requests after 30 days. Never the security event log.
             Some((
@@ -1270,7 +1272,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .acquire_timeout(scarab_server::broker::BROKER_POOL_ACQUIRE_TIMEOUT)
             .connect_lazy(&database_url)
             .map_err(|e| format!("broker pool: {e}"))?;
-        let broker = scarab_server::broker::router(
+        let (broker, broker_journal) = scarab_server::broker::router_with_journal(
             state
                 .clone()
                 .with_broker_plugin_store(Arc::new(PostgresDb::with_pool(broker_pool))),
@@ -1278,11 +1280,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let listener = tokio::net::TcpListener::bind(&config.plugins.broker_addr).await?;
         println!("broker listening on {}", config.plugins.broker_addr);
         broker_handle = Some(tokio::spawn(async move {
-            if let Err(e) = axum::serve(listener, broker)
-                .with_graceful_shutdown(shutdown_signal())
-                .await
-            {
-                tracing::error!(error = %e, "broker listener failed");
+            // Its own drain, bounded: 10s after the signal the broker
+            // journal is written (git-bug 4711823) whether or not every
+            // connection has closed, and whatever the public API's drain is
+            // doing. A watch stream still open then loses only its end row.
+            let served = axum::serve(listener, broker).with_graceful_shutdown(shutdown_signal());
+            let drain_window = async {
+                shutdown_signal().await;
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            };
+            tokio::select! {
+                served = served => {
+                    if let Err(e) = served {
+                        tracing::error!(error = %e, "broker listener failed");
+                    }
+                }
+                _ = drain_window => {}
+            }
+            if let Some(journal) = broker_journal {
+                // Long enough for a read still waiting on its upstream's
+                // response head to send its row.
+                if !journal.finish(Duration::from_secs(15)).await {
+                    tracing::warn!("shutdown: the broker journal was not written within 15s");
+                }
             }
         }));
     }
@@ -1346,8 +1366,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     scarab_server::flush_api_token_uses(&token_uses_state).await;
     served?;
     if let Some(handle) = broker_handle {
-        // It got the same signal; give it its own drain, then stop waiting.
-        let _ = tokio::time::timeout(Duration::from_secs(10), handle).await;
+        // It got the same signal and runs its own bounded drain, then writes
+        // its journal (git-bug 4711823); wait for that, then stop waiting.
+        let _ = tokio::time::timeout(Duration::from_secs(30), handle).await;
     }
     if let Some(handle) = driver_handle {
         tracing::info!("shutdown: stopping the converged driver");

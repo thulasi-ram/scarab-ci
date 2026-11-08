@@ -90,6 +90,29 @@ async fn upstream_handler(State(up): State<Upstream>, req: AxumRequest) -> Respo
     let path = req.uri().path().to_string();
     match path.as_str() {
         "/api/version" => "v2.13.0".into_response(),
+        // A response that echoes the bound credential, split across two
+        // chunks, after a first chunk that is clean.
+        "/api/v1/applications" if path_and_query.contains("projects=echo") => {
+            let token = req
+                .headers()
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+                .unwrap_or_default()
+                .to_string();
+            let (head, tail) = token.split_at(token.len() / 2);
+            let chunks: Vec<Result<axum::body::Bytes, std::io::Error>> = vec![
+                Ok(axum::body::Bytes::from_static(b"{\"items\":[]}\n")),
+                Ok(axum::body::Bytes::from(format!("{{\"token\":\"{head}"))),
+                Ok(axum::body::Bytes::from(format!("{tail}\"}}"))),
+            ];
+            Body::from_stream(futures::stream::iter(chunks)).into_response()
+        }
+        "/api/v1/applications" if path_and_query.contains("projects=gzip") => (
+            [("content-encoding", "gzip")],
+            vec![0x1f_u8, 0x8b, 0x08, 0x00],
+        )
+            .into_response(),
         "/api/v1/applications" => (
             [
                 ("content-type", "application/json"),
@@ -161,6 +184,7 @@ struct Harness {
     secrets: Arc<FakeSecrets>,
     public: axum::Router,
     broker: axum::Router,
+    journal: Option<scarab_server::broker_proxy::BrokerJournalDrain>,
 }
 
 async fn harness() -> Option<Harness> {
@@ -193,14 +217,18 @@ async fn harness_with(adjust: impl FnOnce(AppState) -> AppState) -> Option<Harne
             },
         )
         .with_plugin_tokens(Arc::new(FakeTokenReview))
-        .with_secrets(secrets.clone());
+        .with_secrets(secrets.clone())
+        // The fake upstream listens on 127.0.0.1.
+        .with_broker_upstream_loopback_allowed(true);
     let st = adjust(st);
+    let (broker, journal) = broker::router_with_journal(st.clone());
     Some(Harness {
         tdb,
         pg,
         secrets,
-        public: router(st.clone()),
-        broker: broker::router(st),
+        public: router(st),
+        broker,
+        journal,
     })
 }
 
@@ -1128,6 +1156,464 @@ async fn under_enforced_step_up_the_read_proxy_is_unchanged() {
         seen[0].headers.get("authorization").unwrap(),
         &format!("Bearer {ARGO_TOKEN}"),
         "the bound credential is injected, as without step-up"
+    );
+    h.finish().await;
+}
+
+/// The Postgres plugin store, with journal writes held until the test
+/// lets them through: entries then pile up in the broker's queue.
+struct HeldJournal {
+    inner: Arc<dyn scarab_plugin::PluginStore>,
+    open: Arc<tokio::sync::Semaphore>,
+}
+
+#[async_trait::async_trait]
+impl scarab_plugin::PluginStore for HeldJournal {
+    async fn install(
+        &self,
+        installation: &scarab_plugin::PluginInstallation,
+    ) -> Result<scarab_plugin::PluginInstallation, scarab_plugin::PluginStoreError> {
+        self.inner.install(installation).await
+    }
+    async fn installation(
+        &self,
+        org: &str,
+        name: &str,
+    ) -> Result<Option<scarab_plugin::PluginInstallation>, scarab_plugin::PluginStoreError> {
+        self.inner.installation(org, name).await
+    }
+    async fn installation_by_id(
+        &self,
+        id: &str,
+    ) -> Result<Option<scarab_plugin::PluginInstallation>, scarab_plugin::PluginStoreError> {
+        self.inner.installation_by_id(id).await
+    }
+    async fn installations(
+        &self,
+        org: &str,
+    ) -> Result<Vec<scarab_plugin::PluginInstallation>, scarab_plugin::PluginStoreError> {
+        self.inner.installations(org).await
+    }
+    async fn all_installations(
+        &self,
+    ) -> Result<Vec<scarab_plugin::PluginInstallation>, scarab_plugin::PluginStoreError> {
+        self.inner.all_installations().await
+    }
+    async fn set_installation_state(
+        &self,
+        org: &str,
+        name: &str,
+        state: scarab_plugin::InstallationState,
+        by: &str,
+        at: i64,
+    ) -> Result<Option<scarab_plugin::PluginInstallation>, scarab_plugin::PluginStoreError> {
+        self.inner
+            .set_installation_state(org, name, state, by, at)
+            .await
+    }
+    async fn set_installation_storage(
+        &self,
+        org: &str,
+        name: &str,
+        storage: Option<&scarab_plugin::PluginStorage>,
+        expected: Option<&scarab_plugin::PluginStorage>,
+    ) -> Result<Option<scarab_plugin::PluginInstallation>, scarab_plugin::PluginStoreError> {
+        self.inner
+            .set_installation_storage(org, name, storage, expected)
+            .await
+    }
+    async fn set_runtime_status(
+        &self,
+        id: &str,
+        decided_in: scarab_plugin::InstallationState,
+        status: scarab_plugin::RuntimeStatus,
+        message: &str,
+        probe_passed_at: Option<i64>,
+    ) -> Result<bool, scarab_plugin::PluginStoreError> {
+        self.inner
+            .set_runtime_status(id, decided_in, status, message, probe_passed_at)
+            .await
+    }
+    async fn uninstall(
+        &self,
+        org: &str,
+        name: &str,
+        by: &str,
+        at: i64,
+    ) -> Result<Option<scarab_plugin::PluginUninstall>, scarab_plugin::PluginStoreError> {
+        self.inner.uninstall(org, name, by, at).await
+    }
+    async fn put_connection(
+        &self,
+        connection: &scarab_plugin::PluginConnection,
+    ) -> Result<Option<String>, scarab_plugin::PluginStoreError> {
+        self.inner.put_connection(connection).await
+    }
+    async fn connections(
+        &self,
+        installation_id: &str,
+    ) -> Result<Vec<scarab_plugin::PluginConnection>, scarab_plugin::PluginStoreError> {
+        self.inner.connections(installation_id).await
+    }
+    async fn connection(
+        &self,
+        installation_id: &str,
+        slot: &str,
+    ) -> Result<Option<scarab_plugin::PluginConnection>, scarab_plugin::PluginStoreError> {
+        self.inner.connection(installation_id, slot).await
+    }
+    async fn delete_connection(
+        &self,
+        installation_id: &str,
+        slot: &str,
+    ) -> Result<Option<scarab_plugin::PluginConnection>, scarab_plugin::PluginStoreError> {
+        self.inner.delete_connection(installation_id, slot).await
+    }
+    async fn append_broker_journal(
+        &self,
+        entries: &[BrokerJournalEntry],
+    ) -> Result<(), scarab_plugin::PluginStoreError> {
+        let _open = self.open.acquire().await.expect("never closed");
+        self.inner.append_broker_journal(entries).await
+    }
+    async fn broker_journal(
+        &self,
+        installation_id: &str,
+        limit: usize,
+    ) -> Result<Vec<BrokerJournalEntry>, scarab_plugin::PluginStoreError> {
+        self.inner.broker_journal(installation_id, limit).await
+    }
+    async fn prune_broker_journal(
+        &self,
+        started_before: i64,
+    ) -> Result<u64, scarab_plugin::PluginStoreError> {
+        self.inner.prune_broker_journal(started_before).await
+    }
+}
+
+/// git-bug 4711823 (1): at shutdown the journal writer writes every entry
+/// queued so far before it stops, with the broker still serving. Without
+/// the drain a rollout lost whatever the queue held. Journal writes are
+/// held while the refusals arrive, so nearly all of them are still queued
+/// when the drain starts.
+#[tokio::test]
+async fn shutdown_writes_the_journal_entries_still_queued() {
+    let open = Arc::new(tokio::sync::Semaphore::new(0));
+    let gate = open.clone();
+    let Some(mut h) = harness_with(move |st| {
+        let held = HeldJournal {
+            inner: st.plugins.clone().expect("plugins are on"),
+            open: gate,
+        };
+        st.with_broker_plugin_store(Arc::new(held))
+    })
+    .await
+    else {
+        return;
+    };
+    let (id, token) = install(&h).await;
+    const REFUSED: usize = 300;
+    for _ in 0..REFUSED {
+        let req = Request::builder()
+            .method("GET")
+            .uri("/_scarab/plugin/v1/connections/vault/v1/secret")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(send(&h.broker, req).await.0, StatusCode::NOT_FOUND);
+    }
+    let drain = h.journal.take().expect("the read proxy is on");
+    let finished = tokio::spawn(drain.finish(Duration::from_secs(10)));
+    open.add_permits(1_000);
+    assert!(finished.await.unwrap(), "the writer finished");
+    // Read once, no waiting: everything queued before the drain is written.
+    let written = h.pg.broker_journal(&id, REFUSED + 10).await.unwrap();
+    assert_eq!(written.len(), REFUSED);
+    h.finish().await;
+}
+
+/// git-bug 4711823 (5): a `pc-*` credential no binding names is deleted
+/// once it has stayed unreferenced for the grace period across sweeps; the
+/// bound credential, a key just written (a bind in progress) and keys of
+/// other shapes are kept.
+#[tokio::test]
+async fn an_orphaned_connection_credential_is_swept_after_its_grace() {
+    use scarab_engine::Clock;
+    use scarab_server::retention::{
+        sweep_orphaned_connection_secrets, OrphanedConnectionSecrets,
+        ORPHANED_CONNECTION_SECRET_GRACE_MS,
+    };
+    let Some(h) = harness().await else {
+        return;
+    };
+    install(&h).await;
+    assert_eq!(bind(&h, "https://argo.acme.test").await.0, StatusCode::OK);
+    let bound = h.secrets.list_scoped(&plugin_scope()).await.unwrap();
+    assert_eq!(bound.len(), 1, "{bound:?}");
+    for key in ["pc-orphan", "not-a-connection-credential"] {
+        h.secrets
+            .put(
+                &plugin_scope(),
+                scarab_secrets::Secret {
+                    key: key.into(),
+                    value: b"x".to_vec(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    let db: Arc<dyn scarab_engine::Db> = Arc::new(InMemoryDb::new());
+    let fake = Arc::new(FakeClock::new(CLOCK_START_MS));
+    let clock: Arc<dyn Clock> = fake.clone();
+    let mut seen = OrphanedConnectionSecrets::default();
+    let n = sweep_orphaned_connection_secrets(
+        &db,
+        h.pg.as_ref(),
+        h.secrets.as_ref(),
+        &clock,
+        "replica-a",
+        &mut seen,
+    )
+    .await
+    .unwrap();
+    assert_eq!(n, 0, "first seen now: not yet");
+
+    fake.advance(ORPHANED_CONNECTION_SECRET_GRACE_MS - 1);
+    // A bind in progress: its secret is written, its binding not yet.
+    h.secrets
+        .put(
+            &plugin_scope(),
+            scarab_secrets::Secret {
+                key: "pc-binding".into(),
+                value: b"y".to_vec(),
+            },
+        )
+        .await
+        .unwrap();
+    let n = sweep_orphaned_connection_secrets(
+        &db,
+        h.pg.as_ref(),
+        h.secrets.as_ref(),
+        &clock,
+        "replica-a",
+        &mut seen,
+    )
+    .await
+    .unwrap();
+    assert_eq!(n, 0, "one millisecond short of the grace");
+
+    fake.advance(1);
+    let n = sweep_orphaned_connection_secrets(
+        &db,
+        h.pg.as_ref(),
+        h.secrets.as_ref(),
+        &clock,
+        "replica-a",
+        &mut seen,
+    )
+    .await
+    .unwrap();
+    assert_eq!(n, 1, "the orphan, after its grace");
+    let mut left = h.secrets.list_scoped(&plugin_scope()).await.unwrap();
+    left.sort();
+    let mut want = vec![
+        bound[0].clone(),
+        "not-a-connection-credential".to_string(),
+        "pc-binding".to_string(),
+    ];
+    want.sort();
+    assert_eq!(left, want);
+    h.finish().await;
+}
+
+/// git-bug 4711823 (2): the broker reads a bound credential from the secret
+/// store once and keeps it for its credential_ref; a re-bind mints a new
+/// ref, so the new credential is read and sent from the next request on.
+#[tokio::test]
+async fn a_bound_credential_is_read_once_and_a_rebind_replaces_it() {
+    let Some(h) = harness().await else {
+        return;
+    };
+    let (up, base) = spawn_upstream().await;
+    let (_, token) = install(&h).await;
+    assert_eq!(bind(&h, &base).await.0, StatusCode::OK);
+    let (status, _, body) = send(&h.broker, plugin_get(&token, "/api/version")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // The secret store loses the credential: the cached one is still sent.
+    let key = h.secrets.list_scoped(&plugin_scope()).await.unwrap()[0].clone();
+    h.secrets.delete(&plugin_scope(), &key).await.unwrap();
+    let (status, _, body) = send(&h.broker, plugin_get(&token, "/api/version")).await;
+    assert_eq!(status, StatusCode::OK, "served from the cache: {body}");
+
+    let (status, body) = admin(
+        &h.public,
+        "PUT",
+        "/v1/orgs/acme/plugins/argo/connections/argocd",
+        Some(json!({ "base_url": base, "credential": "argo-token-rotated" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, _, body) = send(&h.broker, plugin_get(&token, "/api/version")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let sent: Vec<String> = up
+        .seen()
+        .iter()
+        .map(|s| s.headers["authorization"].to_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        sent,
+        [
+            format!("Bearer {ARGO_TOKEN}"),
+            format!("Bearer {ARGO_TOKEN}"),
+            "Bearer argo-token-rotated".to_string(),
+        ]
+    );
+    h.finish().await;
+}
+
+/// git-bug 4711823 (4): a destination that is, or resolves only to, an
+/// address the broker does not connect to is refused (502) and journaled,
+/// and nothing reaches it. The fake upstream listens on 127.0.0.1, here
+/// with loopback refused as in production: bound by IP literal (checked
+/// before any connection) and by a name that resolves to it (checked in
+/// the resolver, on the address the connection would use).
+#[tokio::test]
+async fn a_destination_on_loopback_or_link_local_is_refused_and_never_reached() {
+    let Some(h) = harness_with(|st| st.with_broker_upstream_loopback_allowed(false)).await else {
+        return;
+    };
+    let (up, base) = spawn_upstream().await;
+    let (id, token) = install(&h).await;
+    let port = base.rsplit(':').next().unwrap().trim_end_matches('/');
+    for destination in [base.clone(), format!("http://localhost:{port}")] {
+        assert_eq!(
+            bind(&h, &destination).await.0,
+            StatusCode::OK,
+            "{destination}"
+        );
+        let (status, _, body) = send(&h.broker, plugin_get(&token, "/api/version")).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{destination}: {body}");
+        assert!(body.contains("does not connect to"), "{body}");
+    }
+    assert!(up.seen().is_empty(), "nothing reached the upstream");
+    let refused = journal(&h.pg, &id, 2).await;
+    assert!(
+        refused
+            .iter()
+            .all(|e| e.denied_reason.as_deref() == Some("destination denied")),
+        "{refused:?}"
+    );
+    h.finish().await;
+}
+
+/// git-bug 4711823 (3): a response body that holds the bound credential is
+/// cut before any part of it reaches the Plugin, and the stream ends in an
+/// error; the cut is journaled. A compressed body, which could not be read
+/// for it, is refused; the Plugin's Accept-Encoding never goes upstream.
+#[tokio::test]
+async fn a_body_holding_the_credential_is_cut_and_a_compressed_one_refused() {
+    let Some(h) = harness().await else {
+        return;
+    };
+    let (up, base) = spawn_upstream().await;
+    let (id, token) = install(&h).await;
+    assert_eq!(bind(&h, &base).await.0, StatusCode::OK);
+
+    let resp = h
+        .broker
+        .clone()
+        .oneshot(plugin_get(&token, "/api/v1/applications?projects=echo"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mut body = resp.into_body().into_data_stream();
+    let mut delivered = Vec::new();
+    let mut ended_in_error = false;
+    while let Some(next) = tokio::time::timeout(Duration::from_secs(10), body.next())
+        .await
+        .expect("the stream ended")
+    {
+        match next {
+            Ok(chunk) => delivered.extend_from_slice(&chunk),
+            Err(_) => {
+                ended_in_error = true;
+                break;
+            }
+        }
+    }
+    assert!(ended_in_error, "a cut stream ends in an error");
+    let delivered = String::from_utf8_lossy(&delivered).to_string();
+    assert!(delivered.starts_with("{\"items\":[]}\n"), "{delivered}");
+    let half = &ARGO_TOKEN[..ARGO_TOKEN.len() / 2];
+    assert!(
+        !delivered.contains(half),
+        "no part of the credential: {delivered}"
+    );
+    let ends = journal_until(&h.pg, &id, |e| rows(e, BrokerJournalPhase::End).len() == 1).await;
+    assert_eq!(
+        rows(&ends, BrokerJournalPhase::End)[0]
+            .denied_reason
+            .as_deref(),
+        Some("cut: the upstream response held the credential")
+    );
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/_scarab/plugin/v1/connections/argocd/api/v1/applications?projects=gzip")
+        .header("authorization", format!("Bearer {token}"))
+        .header("accept-encoding", "gzip")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _, body) = send(&h.broker, req).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert!(body.contains("compressed"), "{body}");
+    let last = up.seen().pop().unwrap();
+    assert!(
+        last.headers.get("accept-encoding").is_none(),
+        "the Plugin's Accept-Encoding stays behind"
+    );
+    h.finish().await;
+}
+
+/// git-bug 4711823 (1, red team): a read forwarded before the drain, whose
+/// upstream answers after the drain began, still gets its journal row. Its
+/// slot was reserved before the queue closed; the credential has already
+/// gone upstream.
+#[tokio::test]
+async fn shutdown_writes_the_row_of_a_read_still_waiting_on_its_upstream() {
+    let Some(mut h) = harness().await else {
+        return;
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut s, _) = listener.accept().await.unwrap();
+        let _ = s.read(&mut [0u8; 4096]).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let _ = s
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}")
+            .await;
+    });
+    let (id, token) = install(&h).await;
+    assert_eq!(bind(&h, &base).await.0, StatusCode::OK);
+    let broker = h.broker.clone();
+    let read = tokio::spawn(async move { send(&broker, plugin_get(&token, "/api/version")).await });
+    // The slot is reserved and the request is upstream; no row yet.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let drain = h.journal.take().expect("the read proxy is on");
+    assert!(
+        drain.finish(Duration::from_secs(10)).await,
+        "the writer finished"
+    );
+    assert_eq!(read.await.unwrap().0, StatusCode::OK);
+    let rows = h.pg.broker_journal(&id, 10).await.unwrap();
+    assert!(
+        rows.iter().any(|e| e.phase == BrokerJournalPhase::Head),
+        "the forwarded read has a head row: {rows:?}"
     );
     h.finish().await;
 }

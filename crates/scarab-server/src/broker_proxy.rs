@@ -35,6 +35,13 @@
 //!   `Grpc-Metadata-Token`, Kubernetes' `Impersonate-User`), and gets back
 //!   only [`RESPONSE_HEADERS`] — never a session or anything carrying the
 //!   credential;
+//! - **response bodies are read for the credential**: a body that holds it
+//!   is cut before the chunk that completes it, however the chunks split
+//!   it, and no `Accept-Encoding` goes upstream so a body is never
+//!   compressed past reading (a compressed one is refused);
+//! - **destinations are pinned**: the bound host is resolved once per
+//!   connection and only an address that is not link-local or loopback is
+//!   connected to;
 //! - **no request body** (a read carries none) and **no redirects** — a 3xx
 //!   is handed back, never followed, so an upstream cannot bounce the
 //!   credential elsewhere;
@@ -47,6 +54,7 @@
 //!   never a clean end the Plugin could take for the whole response.
 
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -59,7 +67,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Extension;
 use futures::StreamExt;
 use sha2::{Digest, Sha256};
-use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 
 use scarab_plugin::{
     match_read_request, rule_label, BrokerJournalEntry, BrokerJournalPhase, ConnectionSlot,
@@ -82,6 +90,13 @@ pub const KILL_RECHECK_UNREADABLE_TO_CUT: u32 = 2;
 /// Proxied requests one installation may have in flight in this process. A
 /// reporter needs one long watch stream plus a few short reads.
 pub const PROXY_CONCURRENCY_PER_INSTALLATION: usize = 16;
+/// Proxied requests one installation may start per minute in this process,
+/// refilled evenly (a token bucket of this size). A reporter's steady
+/// traffic is a few reads a second.
+pub const PROXY_REQUESTS_PER_MINUTE_PER_INSTALLATION: u32 = 600;
+/// Proxied requests every installation together may have in flight in this
+/// process.
+pub const PROXY_CONCURRENCY_TOTAL: usize = 256;
 /// The journal queue between requests and the writer (the default of
 /// [`AppState::broker_journal_queue`]).
 pub const JOURNAL_QUEUE: usize = 4096;
@@ -98,16 +113,26 @@ const MAX_JOURNAL_QUERY_CHARS: usize = 2048;
 const MAX_JOURNAL_SLOT_CHARS: usize = 63;
 const RETRY_AFTER_TOO_MANY_SECS: u64 = 1;
 const RETRY_AFTER_BUSY_SECS: u64 = 5;
+/// Why a stream is cut when the upstream's body holds the credential.
+const CREDENTIAL_IN_BODY: &str = "cut: the upstream response held the credential";
 /// Response chunks buffered between the upstream and the Plugin.
 const STREAM_BUFFER_CHUNKS: usize = 16;
+/// An upstream client unused this long is dropped; the next request for its
+/// CA builds a new one.
+const CLIENT_IDLE: Duration = Duration::from_secs(10 * 60);
+/// A bound credential unused this long is dropped from memory. Credential
+/// refs are never reused (a re-bind mints a new one), so a cached value is
+/// never stale; this only bounds how long an unused one stays in memory.
+const CREDENTIAL_IDLE: Duration = Duration::from_secs(15 * 60);
 
 /// The Plugin's headers that may travel upstream — content negotiation,
 /// conditional reads and an identifying agent, nothing that could change
 /// what the upstream does or as whom. (No `Range` or `Cache-Control`: the
-/// Argo CD reporter needs neither.)
-pub const REQUEST_HEADERS: [&str; 6] = [
+/// Argo CD reporter needs neither. No `Accept-Encoding`: the broker reads
+/// every response body for the credential, and cannot read a compressed
+/// one.)
+pub const REQUEST_HEADERS: [&str; 5] = [
     "accept",
-    "accept-encoding",
     "accept-language",
     "if-none-match",
     "if-modified-since",
@@ -141,10 +166,13 @@ pub fn route_path() -> String {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct UpstreamResponse;
 
-/// One of an installation's [`PROXY_CONCURRENCY_PER_INSTALLATION`] permits,
-/// taken in authentication and held until the response stream ends.
+/// One of an installation's [`PROXY_CONCURRENCY_PER_INSTALLATION`] permits
+/// and one of the broker's [`PROXY_CONCURRENCY_TOTAL`], taken in
+/// authentication and held until the response stream ends.
 #[derive(Clone)]
-pub(crate) struct ProxyPermit(#[allow(dead_code)] Arc<OwnedSemaphorePermit>);
+pub(crate) struct ProxyPermit(
+    #[allow(dead_code)] Arc<(OwnedSemaphorePermit, OwnedSemaphorePermit)>,
+);
 
 /// What the proxy route shares across requests: the registry on the
 /// broker's pool, the journal queue, the per-installation permits and the
@@ -154,8 +182,168 @@ pub struct BrokerProxy {
     journal: Option<mpsc::Sender<BrokerJournalEntry>>,
     /// Refusals not journaled because the queue was over half full.
     refusals_unjournaled: AtomicU64,
-    permits: Mutex<HashMap<String, Arc<Semaphore>>>,
-    clients: Mutex<HashMap<String, reqwest::Client>>,
+    permits: Mutex<InstallationPermits>,
+    /// The broker-wide in-flight limit.
+    total: Arc<Semaphore>,
+    clients: Mutex<IdleCache<reqwest::Client>>,
+    /// Bound credentials by `credential_ref`, so a request does not read
+    /// the secret store each time.
+    credentials: Mutex<IdleCache<Arc<Vec<u8>>>>,
+    /// Whether upstream connections may go to loopback (tests only).
+    loopback_allowed: bool,
+}
+
+/// Why a request was refused before anything else ran.
+#[derive(Debug, PartialEq, Eq)]
+enum Limit {
+    /// The installation's in-flight limit.
+    Concurrency,
+    /// The installation's per-minute limit.
+    Rate,
+    /// The broker-wide in-flight limit.
+    Total,
+}
+
+/// Each installation's in-flight permits and request budget. An
+/// installation with nothing in flight and a full budget is dropped from
+/// the map whenever another takes a permit, so an uninstalled or idle
+/// installation costs nothing.
+#[derive(Default)]
+struct InstallationPermits {
+    by_installation: HashMap<String, InstallationGate>,
+}
+
+struct InstallationGate {
+    in_flight: Arc<Semaphore>,
+    budget: RequestBudget,
+}
+
+/// A token bucket: [`PROXY_REQUESTS_PER_MINUTE_PER_INSTALLATION`] requests,
+/// refilled evenly over a minute.
+struct RequestBudget {
+    tokens: f64,
+    at: Instant,
+}
+
+impl RequestBudget {
+    const SIZE: f64 = PROXY_REQUESTS_PER_MINUTE_PER_INSTALLATION as f64;
+
+    fn full(now: Instant) -> Self {
+        Self {
+            tokens: Self::SIZE,
+            at: now,
+        }
+    }
+
+    fn refill(&mut self, now: Instant) {
+        let elapsed = now.saturating_duration_since(self.at).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * Self::SIZE / 60.0).min(Self::SIZE);
+        self.at = now;
+    }
+}
+
+impl InstallationPermits {
+    /// One of `installation_id`'s permits, taken from its budget. The
+    /// permit is taken while the map is held, so no permit is ever taken
+    /// from a semaphore the map has just dropped (which would let a second
+    /// semaphore hand out a second set of permits). A request refused for
+    /// concurrency spends no budget.
+    fn try_take(
+        &mut self,
+        installation_id: &str,
+        now: Instant,
+    ) -> Result<OwnedSemaphorePermit, Limit> {
+        self.by_installation.retain(|id, gate| {
+            gate.budget.refill(now);
+            id == installation_id
+                || gate.in_flight.available_permits() < PROXY_CONCURRENCY_PER_INSTALLATION
+                || gate.budget.tokens < RequestBudget::SIZE
+        });
+        let gate = self
+            .by_installation
+            .entry(installation_id.to_string())
+            .or_insert_with(|| InstallationGate {
+                in_flight: Arc::new(Semaphore::new(PROXY_CONCURRENCY_PER_INSTALLATION)),
+                budget: RequestBudget::full(now),
+            });
+        gate.budget.refill(now);
+        if gate.budget.tokens < 1.0 {
+            return Err(Limit::Rate);
+        }
+        let permit = gate
+            .in_flight
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Limit::Concurrency)?;
+        gate.budget.tokens -= 1.0;
+        Ok(permit)
+    }
+
+    #[cfg(test)]
+    fn tracked(&self) -> usize {
+        self.by_installation.len()
+    }
+}
+
+/// Values by key, each dropped once it has gone unused for `idle`. Stale
+/// entries go whenever a value is inserted.
+struct IdleCache<V> {
+    idle: Duration,
+    entries: HashMap<String, (V, Instant)>,
+}
+
+impl<V: Clone> IdleCache<V> {
+    fn new(idle: Duration) -> Self {
+        Self {
+            idle,
+            entries: HashMap::new(),
+        }
+    }
+
+    fn get(&mut self, key: &str, now: Instant) -> Option<V> {
+        let idle = self.idle;
+        match self.entries.get_mut(key) {
+            Some((value, used)) if now.saturating_duration_since(*used) < idle => {
+                *used = now;
+                Some(value.clone())
+            }
+            _ => None,
+        }
+    }
+
+    fn insert(&mut self, key: String, value: V, now: Instant) {
+        let idle = self.idle;
+        self.entries
+            .retain(|_, (_, used)| now.saturating_duration_since(*used) < idle);
+        self.entries.insert(key, (value, now));
+    }
+
+    fn remove(&mut self, key: &str) {
+        self.entries.remove(key);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// Stops the journal writer at shutdown, once it has written what is
+/// queued. Dropping it stops nothing: the writer then runs until the proxy
+/// is gone.
+pub struct BrokerJournalDrain {
+    stop: oneshot::Sender<()>,
+    writer: tokio::task::JoinHandle<()>,
+}
+
+impl BrokerJournalDrain {
+    /// Write every journal entry queued so far, then stop the writer. An
+    /// entry queued after this is called is not written. Waits at most
+    /// `limit`; `false` if the writer had not finished by then.
+    pub async fn finish(self, limit: Duration) -> bool {
+        let _ = self.stop.send(());
+        tokio::time::timeout(limit, self.writer).await.is_ok()
+    }
 }
 
 impl BrokerProxy {
@@ -164,9 +352,23 @@ impl BrokerProxy {
     /// there is no writer, and the proxy refuses every request (503): it
     /// never forwards what it cannot journal.
     pub fn spawn(store: Arc<dyn PluginStore>, journal_queue: usize) -> Arc<Self> {
+        Self::spawn_with_drain(store, journal_queue, false).0
+    }
+
+    /// [`spawn`](Self::spawn), and the handle that writes the queued
+    /// journal at shutdown (`None` without a runtime). `loopback_allowed`
+    /// lets upstream connections go to loopback, for a test's fake upstream.
+    pub fn spawn_with_drain(
+        store: Arc<dyn PluginStore>,
+        journal_queue: usize,
+        loopback_allowed: bool,
+    ) -> (Arc<Self>, Option<BrokerJournalDrain>) {
+        let mut drain = None;
         let journal = tokio::runtime::Handle::try_current().ok().map(|rt| {
             let (tx, rx) = mpsc::channel(journal_queue.max(2));
-            rt.spawn(write_journal(store.clone(), rx));
+            let (stop, stopped) = oneshot::channel();
+            let writer = rt.spawn(write_journal(store.clone(), rx, stopped));
+            drain = Some(BrokerJournalDrain { stop, writer });
             tx
         });
         if journal.is_none() {
@@ -174,26 +376,55 @@ impl BrokerProxy {
                 "broker: no Tokio runtime for the journal writer; the read proxy is off"
             );
         }
-        Arc::new(Self {
+        let proxy = Arc::new(Self {
             store,
             journal,
             refusals_unjournaled: AtomicU64::new(0),
-            permits: Mutex::new(HashMap::new()),
-            clients: Mutex::new(HashMap::new()),
-        })
+            permits: Mutex::new(InstallationPermits::default()),
+            total: Arc::new(Semaphore::new(PROXY_CONCURRENCY_TOTAL)),
+            clients: Mutex::new(IdleCache::new(CLIENT_IDLE)),
+            credentials: Mutex::new(IdleCache::new(CREDENTIAL_IDLE)),
+            loopback_allowed,
+        });
+        (proxy, drain)
     }
 
-    fn try_permit(&self, installation_id: &str) -> Option<OwnedSemaphorePermit> {
-        let semaphore = {
-            let mut map = self
-                .permits
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            map.entry(installation_id.to_string())
-                .or_insert_with(|| Arc::new(Semaphore::new(PROXY_CONCURRENCY_PER_INSTALLATION)))
-                .clone()
-        };
-        semaphore.try_acquire_owned().ok()
+    /// The broker-wide permit first, so a request the broker is too busy
+    /// for spends none of its installation's budget.
+    fn try_permit(&self, installation_id: &str) -> Result<ProxyPermit, Limit> {
+        let total = self
+            .total
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Limit::Total)?;
+        let own = self
+            .permits
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .try_take(installation_id, Instant::now())?;
+        Ok(ProxyPermit(Arc::new((own, total))))
+    }
+
+    fn cached_credential(&self, credential_ref: &str) -> Option<Arc<Vec<u8>>> {
+        self.credentials
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(credential_ref, Instant::now())
+    }
+
+    fn cache_credential(&self, credential_ref: &str, value: Arc<Vec<u8>>) {
+        self.credentials
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(credential_ref.to_string(), value, Instant::now());
+    }
+
+    /// Drop a credential whose binding is gone (re-bound or unbound).
+    fn forget_credential(&self, credential_ref: &str) {
+        self.credentials
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(credential_ref);
     }
 
     /// A slot in the journal queue, held until the request's row is sent
@@ -229,8 +460,15 @@ impl BrokerProxy {
         let Some(tx) = &self.journal else {
             return;
         };
-        if let Err(e) = tx.try_send(entry) {
-            tracing::error!(error = %e, "broker: journal queue full; an end row was dropped");
+        match tx.try_send(entry) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Closed(_)) => tracing::info!(
+                "broker: the journal was closed for shutdown; an open stream's end row was not \
+                 written"
+            ),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::error!("broker: journal queue full; an end row was dropped")
+            }
         }
     }
 
@@ -245,15 +483,16 @@ impl BrokerProxy {
                     .collect()
             },
         );
+        let now = Instant::now();
         let mut clients = self
             .clients
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(client) = clients.get(&key) {
-            return Ok(client.clone());
+        if let Some(client) = clients.get(&key, now) {
+            return Ok(client);
         }
-        let client = upstream_client(ca_pem)?;
-        clients.insert(key, client.clone());
+        let client = upstream_client_with(ca_pem, self.loopback_allowed)?;
+        clients.insert(key, client.clone(), now);
         Ok(client)
     }
 
@@ -280,9 +519,12 @@ impl BrokerProxy {
         }
         match self.store.connection(installation_id, slot).await {
             Ok(Some(c)) if c.credential_ref == credential_ref => Ok(()),
-            Ok(_) => Err(Recheck::Decided(
-                "cut: the connection was re-bound or unbound",
-            )),
+            Ok(_) => {
+                self.forget_credential(credential_ref);
+                Err(Recheck::Decided(
+                    "cut: the connection was re-bound or unbound",
+                ))
+            }
             Err(_) => Err(Recheck::Unreadable("cut: the connection could not be read")),
         }
     }
@@ -298,8 +540,10 @@ enum Recheck {
 }
 
 /// Take one of the installation's proxy permits, before anything reads the
-/// store or a secret (`broker::authenticate`). Over the limit, the request
-/// (`method uri_path`) is refused (429) — journaled like any refusal.
+/// store or a secret (`broker::authenticate`). Over the installation's
+/// in-flight or per-minute limit the request (`method uri_path`) is refused
+/// with a 429, over the broker-wide limit with a 503 — journaled like any
+/// refusal.
 pub(crate) async fn take_permit(
     st: &AppState,
     proxy: &BrokerProxy,
@@ -307,9 +551,10 @@ pub(crate) async fn take_permit(
     method: &str,
     uri_path: &str,
 ) -> Result<ProxyPermit, Response> {
-    if let Some(permit) = proxy.try_permit(installation_id) {
-        return Ok(ProxyPermit(Arc::new(permit)));
-    }
+    let limit = match proxy.try_permit(installation_id) {
+        Ok(permit) => return Ok(permit),
+        Err(limit) => limit,
+    };
     let started = Instant::now();
     let (slot, path) = split_connection_path(uri_path).unwrap_or(("", String::new()));
     let draft = Draft::new(
@@ -320,15 +565,32 @@ pub(crate) async fn take_permit(
         st.clock.now().await.0,
         started,
     );
-    let refusal = Refusal::new(
-        StatusCode::TOO_MANY_REQUESTS,
-        "concurrency",
-        format!(
-            "at most {PROXY_CONCURRENCY_PER_INSTALLATION} broker requests per installation at \
-             once"
-        ),
-    )
-    .retry_after(RETRY_AFTER_TOO_MANY_SECS);
+    let refusal = match limit {
+        Limit::Concurrency => Refusal::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "concurrency",
+            format!(
+                "at most {PROXY_CONCURRENCY_PER_INSTALLATION} broker requests per installation \
+                 at once"
+            ),
+        )
+        .retry_after(RETRY_AFTER_TOO_MANY_SECS),
+        Limit::Rate => Refusal::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate",
+            format!(
+                "at most {PROXY_REQUESTS_PER_MINUTE_PER_INSTALLATION} broker requests per \
+                 installation per minute"
+            ),
+        )
+        .retry_after(RETRY_AFTER_TOO_MANY_SECS),
+        Limit::Total => Refusal::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "broker busy",
+            "the broker is busy; retry",
+        )
+        .retry_after(RETRY_AFTER_BUSY_SECS),
+    };
     proxy.journal_refusal(draft.refused(refusal.status, refusal.reason));
     Err(refusal.respond())
 }
@@ -339,10 +601,21 @@ pub(crate) async fn take_permit(
 /// — with a CA — that CA as the ONLY trust anchor. There is no skip-verify.
 /// Also what the admin API uses to check a CA before binding it.
 pub(crate) fn upstream_client(ca_pem: Option<&str>) -> Result<reqwest::Client, String> {
+    upstream_client_with(ca_pem, false)
+}
+
+/// [`upstream_client`], resolving through [`UpstreamResolver`]: it connects
+/// only to the addresses it resolved, and never to a link-local address
+/// (or to loopback, unless `loopback_allowed`).
+fn upstream_client_with(
+    ca_pem: Option<&str>,
+    loopback_allowed: bool,
+) -> Result<reqwest::Client, String> {
     let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
-        .connect_timeout(UPSTREAM_CONNECT_TIMEOUT);
+        .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
+        .dns_resolver(UpstreamResolver { loopback_allowed });
     if let Some(pem) = ca_pem {
         let certs = reqwest::Certificate::from_pem_bundle(pem.as_bytes())
             .map_err(|e| format!("the CA is not PEM certificates: {e}"))?;
@@ -356,31 +629,188 @@ pub(crate) fn upstream_client(ca_pem: Option<&str>) -> Result<reqwest::Client, S
         .map_err(|e| format!("cannot build a TLS client with this CA: {e}"))
 }
 
-/// Drain the journal queue into the store, a batch per round trip. A
-/// failed write is retried once; then the batch is logged as lost.
-async fn write_journal(store: Arc<dyn PluginStore>, mut rx: mpsc::Receiver<BrokerJournalEntry>) {
-    let mut batch = Vec::with_capacity(JOURNAL_BATCH);
-    while let Some(first) = rx.recv().await {
-        batch.push(first);
-        while batch.len() < JOURNAL_BATCH {
-            match rx.try_recv() {
-                Ok(entry) => batch.push(entry),
-                Err(_) => break,
+/// AWS's instance metadata service on IPv6 (an address in the private
+/// fd00::/8 range, so not caught by the link-local rule).
+const AWS_METADATA_V6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254);
+
+/// May the broker connect to `ip`? Never to link-local (169.254.0.0/16 and
+/// fe80::/10, where cloud metadata services answer), the unspecified,
+/// broadcast or multicast addresses, or AWS's IPv6 metadata address; to
+/// loopback only when `loopback_allowed`. Private ranges are allowed: the
+/// upstream is usually in the same cluster. An IPv6 address that carries an
+/// IPv4 address a translator would reach (IPv4-mapped `::ffff:0:0/96`, the
+/// NAT64 prefixes `64:ff9b::/96` and `64:ff9b:1::/48`, the IPv4 address in
+/// the last 32 bits) is judged as that IPv4 address; the deprecated
+/// IPv4-compatible `::/96` is refused outright.
+fn upstream_address_allowed(ip: IpAddr, loopback_allowed: bool) -> bool {
+    let ip = match ip {
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            let last32 = || std::net::Ipv4Addr::from(((s[6] as u32) << 16) | s[7] as u32);
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                IpAddr::V4(v4)
+            } else if s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] || s[..3] == [0x64, 0xff9b, 1] {
+                IpAddr::V4(last32())
+            } else if s[..6] == [0; 6] && !v6.is_loopback() && !v6.is_unspecified() {
+                return false;
+            } else {
+                ip
             }
         }
-        if let Err(first) = store.append_broker_journal(&batch).await {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            if let Err(again) = store.append_broker_journal(&batch).await {
-                tracing::error!(
-                    lost = batch.len(),
-                    first = %first,
-                    error = %again,
-                    "broker: journal write failed twice; entries lost"
-                );
-            }
+        v4 => v4,
+    };
+    match ip {
+        IpAddr::V4(v4) => {
+            !(v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || (v4.is_loopback() && !loopback_allowed))
         }
-        batch.clear();
+        IpAddr::V6(v6) => {
+            !((v6.segments()[0] & 0xffc0) == 0xfe80
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || v6 == AWS_METADATA_V6
+                || (v6.is_loopback() && !loopback_allowed))
+        }
     }
+}
+
+/// A destination the broker will not connect to.
+#[derive(Debug)]
+struct DeniedDestination(String);
+
+impl std::fmt::Display for DeniedDestination {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} is or resolves only to addresses the broker does not connect to \
+             (link-local, loopback or metadata)",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for DeniedDestination {}
+
+/// Resolves a bound host once for each new connection, and hands the
+/// connector only the addresses [`upstream_address_allowed`] accepts, so
+/// the address checked is the address connected to: no second lookup a
+/// DNS answer could change in between.
+#[derive(Debug, Clone, Copy)]
+struct UpstreamResolver {
+    loopback_allowed: bool,
+}
+
+impl reqwest::dns::Resolve for UpstreamResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let loopback_allowed = self.loopback_allowed;
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let kept: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
+                .await?
+                .filter(|a| upstream_address_allowed(a.ip(), loopback_allowed))
+                .collect();
+            if kept.is_empty() {
+                return Err(Box::new(DeniedDestination(host)) as _);
+            }
+            Ok(Box::new(kept.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+/// Did `e` come from a [`DeniedDestination`]?
+fn denied_destination(e: &reqwest::Error) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(s) = source {
+        if s.is::<DeniedDestination>() {
+            return true;
+        }
+        source = s.source();
+    }
+    false
+}
+
+fn denied_destination_refusal(slot: &str) -> Refusal {
+    Refusal::new(
+        StatusCode::BAD_GATEWAY,
+        "destination denied",
+        format!(
+            "connection `{slot}`: its destination is or resolves only to addresses the broker \
+             does not connect to"
+        ),
+    )
+}
+
+/// Drain the journal queue into the store, a batch per round trip, until
+/// the proxy is gone or `stop` fires. On `stop` the queue is closed and
+/// what it holds is written before the writer returns; a dropped `stop`
+/// changes nothing.
+async fn write_journal(
+    store: Arc<dyn PluginStore>,
+    mut rx: mpsc::Receiver<BrokerJournalEntry>,
+    mut stop: oneshot::Receiver<()>,
+) {
+    let mut batch = Vec::with_capacity(JOURNAL_BATCH);
+    let mut stoppable = true;
+    loop {
+        let first = tokio::select! {
+            stopped = &mut stop, if stoppable => {
+                if stopped.is_ok() {
+                    break;
+                }
+                stoppable = false;
+                continue;
+            }
+            next = rx.recv() => match next {
+                Some(entry) => entry,
+                None => return,
+            },
+        };
+        batch.push(first);
+        fill_batch(&mut rx, &mut batch);
+        write_batch(store.as_ref(), &mut batch).await;
+    }
+    // Shutdown: refuse new entries, then write what the queue holds. A
+    // read that reserved its slot before the close (it may be waiting on
+    // its upstream, credential already sent) still sends its row: `recv`
+    // returns `None` only once the queue is empty and every reserved slot
+    // has sent or been dropped. `try_recv` would answer `Empty` while one
+    // is outstanding, and that row would be lost.
+    rx.close();
+    while let Some(entry) = rx.recv().await {
+        batch.push(entry);
+        fill_batch(&mut rx, &mut batch);
+        write_batch(store.as_ref(), &mut batch).await;
+    }
+}
+
+/// Top `batch` up from the queue without waiting.
+fn fill_batch(rx: &mut mpsc::Receiver<BrokerJournalEntry>, batch: &mut Vec<BrokerJournalEntry>) {
+    while batch.len() < JOURNAL_BATCH {
+        match rx.try_recv() {
+            Ok(entry) => batch.push(entry),
+            Err(_) => break,
+        }
+    }
+}
+
+/// Write `batch` and empty it. A failed write is retried once; then the
+/// batch is logged as lost.
+async fn write_batch(store: &dyn PluginStore, batch: &mut Vec<BrokerJournalEntry>) {
+    if let Err(first) = store.append_broker_journal(batch).await {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        if let Err(again) = store.append_broker_journal(batch).await {
+            tracing::error!(
+                lost = batch.len(),
+                first = %first,
+                error = %again,
+                "broker: journal write failed twice; entries lost"
+            );
+        }
+    }
+    batch.clear();
 }
 
 /// One request's journal rows in the making.
@@ -751,7 +1181,6 @@ pub(crate) async fn proxy(
 
     let status = upstream.status();
     let response_headers = forwardable_response_headers(upstream.headers(), credential.as_bytes());
-    drop(credential);
     journal_slot.send(draft.head(status));
 
     let cut = Arc::new(AtomicBool::new(false));
@@ -761,6 +1190,7 @@ pub(crate) async fn proxy(
         installation_id: installation.id.clone(),
         slot: slot.name.clone(),
         credential_ref: connection.credential_ref.clone(),
+        credential: credential.into_bytes(),
         cut: cut.clone(),
         unreadable: AtomicU32::new(0),
     };
@@ -828,6 +1258,19 @@ async fn send_upstream(
             format!("broker: {e}"),
         )
     })?;
+    // An IP literal never reaches the resolver: check it here.
+    if let Some(ip) = url.host_str().and_then(|h| {
+        h.trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<IpAddr>()
+            .ok()
+    }) {
+        if !upstream_address_allowed(ip, proxy.loopback_allowed) {
+            tracing::warn!(installation = %installation_id, slot = %slot.name, %ip,
+                "broker: the bound destination is an address the broker does not connect to");
+            return Err(denied_destination_refusal(&slot.name));
+        }
+    }
     let client = proxy.client(connection.ca_pem.as_deref()).map_err(|e| {
         Refusal::new(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -846,7 +1289,31 @@ async fn send_upstream(
     )
     .await
     {
-        Ok(Ok(resp)) => Ok((connection, credential, resp)),
+        Ok(Ok(resp)) => {
+            // The body is read for the credential, which a compressed body
+            // would hide. The broker asks for none (no Accept-Encoding goes
+            // upstream), so an encoded body is an upstream ignoring that.
+            if response_is_encoded(resp.headers()) {
+                tracing::warn!(installation = %installation_id, slot = %slot.name,
+                    "broker: the upstream encoded its response; refused");
+                return Err(Refusal::new(
+                    StatusCode::BAD_GATEWAY,
+                    "encoded body",
+                    format!(
+                        "connection `{}`: the upstream compressed its response, which the broker \
+                         cannot check; the broker asks for none",
+                        slot.name
+                    ),
+                ));
+            }
+            Ok((connection, credential, resp))
+        }
+        Ok(Err(e)) if denied_destination(&e) => {
+            tracing::warn!(installation = %installation_id, slot = %slot.name, error = %e,
+                "broker: the bound destination resolves only to addresses the broker does not \
+                 connect to");
+            Err(denied_destination_refusal(&slot.name))
+        }
         Ok(Err(e)) => {
             // The error text names the bound URL: an operator's business,
             // not the Plugin's.
@@ -916,6 +1383,9 @@ async fn bound_credential(
                 .retry_after(RETRY_AFTER_BUSY_SECS));
             }
         };
+        if let Some(credential) = proxy.cached_credential(&connection.credential_ref) {
+            return Ok((connection, credential.as_ref().clone()));
+        }
         let Some(secrets) = st.secrets.as_deref() else {
             // A misconfiguration, not the Plugin's business: scrubbed to a
             // request id on the way out.
@@ -932,7 +1402,10 @@ async fn bound_credential(
             )
             .await
         {
-            Ok(secret) => return Ok((connection, secret.value)),
+            Ok(secret) => {
+                proxy.cache_credential(&connection.credential_ref, Arc::new(secret.value.clone()));
+                return Ok((connection, secret.value));
+            }
             Err(scarab_secrets::SecretError::NotFound) if !reread => reread = true,
             Err(scarab_secrets::SecretError::NotFound) => {
                 tracing::error!(
@@ -968,6 +1441,9 @@ struct Pump {
     installation_id: String,
     slot: String,
     credential_ref: String,
+    /// The bound credential: a body that holds it is cut before the chunk
+    /// that completes it ([`scan_for_credential`]).
+    credential: Vec<u8>,
     /// Set before the sender drops when the stream did not simply end: the
     /// Plugin's body then ends in an error ([`body_stream`]).
     cut: Arc<AtomicBool>,
@@ -990,6 +1466,9 @@ impl Pump {
         );
         recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut bytes = 0u64;
+        // The tail of what arrived that could be the start of the
+        // credential: held back until the next chunk shows it is not.
+        let mut held = Vec::new();
         let end = loop {
             tokio::select! {
                 _ = recheck.tick() => {
@@ -999,7 +1478,21 @@ impl Pump {
                 }
                 _ = tx.closed() => break None,
                 next = body.next() => match next {
-                    None => break None,
+                    None => {
+                        // The body ended, so what was held back is not the
+                        // credential.
+                        if held.is_empty() {
+                            break None;
+                        }
+                        let rest = Bytes::from(std::mem::take(&mut held));
+                        let len = rest.len() as u64;
+                        match self.deliver(&tx, rest, &mut recheck).await {
+                            Ok(()) => bytes += len,
+                            Err(Some(why)) => break Some(why),
+                            Err(None) => {}
+                        }
+                        break None;
+                    }
                     Some(Err(e)) => {
                         tracing::warn!(installation = %self.installation_id, slot = %self.slot,
                             error = %e, "broker: upstream body failed mid-stream");
@@ -1008,8 +1501,15 @@ impl Pump {
                         break Some("upstream body error");
                     }
                     Some(Ok(chunk)) => {
-                        let len = chunk.len() as u64;
-                        match self.deliver(&tx, chunk, &mut recheck).await {
+                        let Some(ready) = scan_for_credential(&mut held, &chunk, &self.credential)
+                        else {
+                            break Some(self.cut(&tx, CREDENTIAL_IN_BODY).await);
+                        };
+                        if ready.is_empty() {
+                            continue;
+                        }
+                        let len = ready.len() as u64;
+                        match self.deliver(&tx, ready, &mut recheck).await {
                             Ok(()) => bytes += len,
                             Err(Some(why)) => break Some(why),
                             // The Plugin went away.
@@ -1092,6 +1592,39 @@ impl Pump {
     }
 }
 
+/// Does the response declare any coding but `identity`, in any of its
+/// `Content-Encoding` headers or any comma-separated value of one? A value
+/// that is not text counts as a coding.
+fn response_is_encoded(headers: &HeaderMap) -> bool {
+    headers.get_all(header::CONTENT_ENCODING).iter().any(|v| {
+        v.to_str().map_or(true, |v| {
+            v.split(',')
+                .map(str::trim)
+                .any(|coding| !coding.is_empty() && !coding.eq_ignore_ascii_case("identity"))
+        })
+    })
+}
+
+/// Add `chunk` to what was `held` back and return what may go to the
+/// Plugin, or `None` if the credential is in it. What is held back is the
+/// longest tail that is a start of the credential, so a credential split
+/// across chunks is caught and no part of it is sent first; any other tail
+/// goes at once, so a watch stream's events are not delayed.
+fn scan_for_credential(held: &mut Vec<u8>, chunk: &[u8], credential: &[u8]) -> Option<Bytes> {
+    held.extend_from_slice(chunk);
+    if contains(held, credential) {
+        held.clear();
+        return None;
+    }
+    let longest = credential.len().saturating_sub(1).min(held.len());
+    let keep = (1..=longest)
+        .rev()
+        .find(|&k| held.ends_with(&credential[..k]))
+        .unwrap_or(0);
+    let ready: Vec<u8> = held.drain(..held.len() - keep).collect();
+    Some(Bytes::from(ready))
+}
+
 /// Tell a Plugin that is reading why its body ends. Waits briefly for room;
 /// a Plugin that stopped reading may not get this message, but its body still
 /// ends in an error once it drains the buffer ([`body_stream`]).
@@ -1106,6 +1639,206 @@ async fn send_error(tx: &mpsc::Sender<Result<Bytes, std::io::Error>>, why: &str)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// git-bug 4711823 (3): a credential in the body is caught however the
+    /// chunks split it, and no part of it is handed on first; a tail that
+    /// only looks like its start is handed on once the next chunk shows it
+    /// is not.
+    #[test]
+    fn a_credential_in_the_body_is_caught_across_chunks() {
+        let credential = b"argo-api-token-s3cr3t";
+        let body = b"{\"token\":\"argo-api-token-s3cr3t\"}";
+        for split in 1..body.len() {
+            for second in split..body.len() {
+                let mut held = Vec::new();
+                let mut sent = Vec::new();
+                let mut caught = false;
+                for chunk in [&body[..split], &body[split..second], &body[second..]] {
+                    match scan_for_credential(&mut held, chunk, credential) {
+                        Some(ready) => sent.extend_from_slice(&ready),
+                        None => {
+                            caught = true;
+                            break;
+                        }
+                    }
+                }
+                assert!(caught, "split at {split} and {second}");
+                assert!(
+                    b"{\"token\":\"".starts_with(&sent),
+                    "split at {split} and {second}: sent {:?}",
+                    String::from_utf8_lossy(&sent)
+                );
+            }
+        }
+
+        // `argo-` might start the credential; `argo-cd` does not.
+        let mut held = Vec::new();
+        let first = scan_for_credential(&mut held, b"{\"app\":\"argo-", credential).unwrap();
+        assert_eq!(&first[..], b"{\"app\":\"");
+        let second = scan_for_credential(&mut held, b"cd\"}\n", credential).unwrap();
+        assert_eq!(&second[..], b"argo-cd\"}\n");
+        assert!(held.is_empty());
+    }
+
+    /// git-bug 4711823 (3): every Content-Encoding header and every value
+    /// in one is checked.
+    #[test]
+    fn every_content_encoding_value_is_checked() {
+        let headers = |values: &[&'static str]| {
+            let mut h = HeaderMap::new();
+            for v in values {
+                h.append(header::CONTENT_ENCODING, HeaderValue::from_static(v));
+            }
+            h
+        };
+        assert!(!response_is_encoded(&headers(&[])));
+        assert!(!response_is_encoded(&headers(&["identity"])));
+        assert!(!response_is_encoded(&headers(&["Identity"])));
+        assert!(response_is_encoded(&headers(&["gzip"])));
+        assert!(response_is_encoded(&headers(&["identity", "gzip"])));
+        assert!(response_is_encoded(&headers(&["identity, gzip"])));
+        assert!(response_is_encoded(&headers(&["br"])));
+    }
+
+    /// git-bug 4711823 (4): which addresses the broker connects to.
+    #[test]
+    fn the_broker_never_connects_to_link_local_or_loopback() {
+        let cases: [(&str, bool); 21] = [
+            ("169.254.169.254", false), // cloud metadata
+            ("169.254.0.1", false),
+            ("fe80::1", false),
+            ("febf::1", false),
+            ("::ffff:169.254.169.254", false),
+            ("fd00:ec2::254", false), // AWS metadata over IPv6
+            ("0.0.0.0", false),
+            ("::", false),
+            ("255.255.255.255", false),
+            ("224.0.0.1", false),
+            ("127.0.0.1", false),
+            ("::1", false),
+            ("::ffff:127.0.0.1", false),
+            ("10.0.0.5", true), // in-cluster upstreams are private
+            ("192.168.1.10", true),
+            ("fd12:3456::1", true),
+            ("64:ff9b::a9fe:a9fe", false),   // NAT64 → 169.254.169.254
+            ("64:ff9b:1::a9fe:a9fe", false), // local-use NAT64 prefix
+            ("::a9fe:a9fe", false),          // IPv4-compatible (deprecated)
+            ("::10.0.0.5", false),
+            ("64:ff9b::a00:5", true), // NAT64 → 10.0.0.5
+        ];
+        for (ip, allowed) in cases {
+            assert_eq!(
+                upstream_address_allowed(ip.parse().unwrap(), false),
+                allowed,
+                "{ip}"
+            );
+        }
+        assert!(upstream_address_allowed("127.0.0.1".parse().unwrap(), true));
+        assert!(upstream_address_allowed("8.8.8.8".parse().unwrap(), false));
+        assert!(!upstream_address_allowed(
+            "169.254.169.254".parse().unwrap(),
+            true
+        ));
+    }
+
+    /// git-bug 4711823 (6): an installation with nothing in flight leaves
+    /// the permit map when another takes a permit; one with a permit out
+    /// stays, and its limit holds.
+    #[test]
+    fn idle_installations_leave_the_permit_map() {
+        // A minute apart, so each installation's budget is full again.
+        let t0 = Instant::now();
+        let t = |minutes: u64| t0 + Duration::from_secs(60 * minutes);
+        let mut permits = InstallationPermits::default();
+        let a = permits.try_take("a", t(0)).expect("a's first permit");
+        drop(permits.try_take("b", t(1)).expect("b's first permit"));
+        assert_eq!(permits.tracked(), 2, "a holds a permit, b was just used");
+
+        drop(permits.try_take("c", t(2)).expect("c's first permit"));
+        assert_eq!(permits.tracked(), 2, "b had nothing in flight: dropped");
+
+        drop(a);
+        drop(permits.try_take("d", t(3)).expect("d's first permit"));
+        assert_eq!(permits.tracked(), 1, "only d, just used, is left");
+
+        let held: Vec<_> = (0..PROXY_CONCURRENCY_PER_INSTALLATION)
+            .map(|_| permits.try_take("e", t(4)).expect("within e's limit"))
+            .collect();
+        drop(permits.try_take("f", t(4)));
+        assert_eq!(
+            permits.try_take("e", t(4)).err(),
+            Some(Limit::Concurrency),
+            "e's limit survives pruning"
+        );
+        drop(held);
+    }
+
+    /// git-bug 4711823 (2): an installation may start
+    /// PROXY_REQUESTS_PER_MINUTE_PER_INSTALLATION requests in a burst, then
+    /// one more each tenth of a second; another installation's budget is
+    /// its own; a request refused for concurrency spends nothing.
+    #[test]
+    fn an_installation_starts_at_most_its_requests_per_minute() {
+        let t0 = Instant::now();
+        let mut permits = InstallationPermits::default();
+        for n in 0..PROXY_REQUESTS_PER_MINUTE_PER_INSTALLATION {
+            drop(
+                permits
+                    .try_take("a", t0)
+                    .unwrap_or_else(|l| panic!("request {n}: {l:?}")),
+            );
+        }
+        assert_eq!(permits.try_take("a", t0).err(), Some(Limit::Rate));
+        assert!(permits.try_take("b", t0).is_ok(), "b's budget is its own");
+
+        let tick =
+            Duration::from_millis(60_000 / PROXY_REQUESTS_PER_MINUTE_PER_INSTALLATION as u64);
+        drop(permits.try_take("a", t0 + tick).expect("refilled by one"));
+        assert_eq!(permits.try_take("a", t0 + tick).err(), Some(Limit::Rate));
+
+        // At the in-flight limit, refusals spend no budget: c is left one
+        // request once it holds every permit, and still has it after.
+        let t1 = t0 + Duration::from_secs(120);
+        let spare = PROXY_REQUESTS_PER_MINUTE_PER_INSTALLATION as usize
+            - PROXY_CONCURRENCY_PER_INSTALLATION
+            - 1;
+        for _ in 0..spare {
+            drop(permits.try_take("c", t1).expect("within c's budget"));
+        }
+        let held: Vec<_> = (0..PROXY_CONCURRENCY_PER_INSTALLATION)
+            .map(|_| permits.try_take("c", t1).expect("within c's limit"))
+            .collect();
+        for _ in 0..1000 {
+            assert_eq!(permits.try_take("c", t1).err(), Some(Limit::Concurrency));
+        }
+        drop(held);
+        assert!(
+            permits.try_take("c", t1).is_ok(),
+            "c's last request was not spent"
+        );
+        assert_eq!(permits.try_take("c", t1).err(), Some(Limit::Rate));
+    }
+
+    /// git-bug 4711823 (6): a cached value unused for its idle time goes
+    /// when the next value is inserted, and a used one stays.
+    #[test]
+    fn an_idle_cache_drops_what_went_unused() {
+        let start = Instant::now();
+        let mut cache = IdleCache::new(Duration::from_secs(60));
+        cache.insert("old".into(), 1, start);
+        cache.insert("used".into(), 2, start);
+        assert_eq!(cache.get("used", start + Duration::from_secs(50)), Some(2));
+
+        cache.insert("new".into(), 3, start + Duration::from_secs(70));
+        assert_eq!(cache.len(), 2, "`old` went unused for 70s: dropped");
+        assert_eq!(cache.get("old", start + Duration::from_secs(70)), None);
+        assert_eq!(cache.get("used", start + Duration::from_secs(70)), Some(2));
+        assert_eq!(
+            cache.get("new", start + Duration::from_secs(200)),
+            None,
+            "an entry past its idle time is not served even before it is dropped"
+        );
+    }
     use axum::http::header::HeaderName;
     use scarab_plugin::PluginConnectionAuthScheme;
 
@@ -1186,16 +1919,11 @@ mod tests {
         let out = forwardable_request_headers(&h);
         let names: Vec<&str> = out.keys().map(HeaderName::as_str).collect();
         // `accept-language` is allowlisted, but this request's `Connection`
-        // marked it hop-by-hop.
+        // marked it hop-by-hop. `accept-encoding` is not: a compressed body
+        // could not be read for the credential.
         assert_eq!(
             names,
-            vec![
-                "accept",
-                "accept-encoding",
-                "if-none-match",
-                "if-modified-since",
-                "user-agent"
-            ]
+            vec!["accept", "if-none-match", "if-modified-since", "user-agent"]
         );
     }
 
