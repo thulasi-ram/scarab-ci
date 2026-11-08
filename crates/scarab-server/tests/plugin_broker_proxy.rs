@@ -1306,3 +1306,98 @@ async fn shutdown_writes_the_journal_entries_still_queued() {
     assert_eq!(written.len(), REFUSED);
     h.finish().await;
 }
+
+/// git-bug 4711823 (5): a `pc-*` credential no binding names is deleted
+/// once it has stayed unreferenced for the grace period across sweeps; the
+/// bound credential, a key just written (a bind in progress) and keys of
+/// other shapes are kept.
+#[tokio::test]
+async fn an_orphaned_connection_credential_is_swept_after_its_grace() {
+    use scarab_engine::Clock;
+    use scarab_server::retention::{
+        sweep_orphaned_connection_secrets, OrphanedConnectionSecrets,
+        ORPHANED_CONNECTION_SECRET_GRACE_MS,
+    };
+    let Some(h) = harness().await else {
+        return;
+    };
+    install(&h).await;
+    assert_eq!(bind(&h, "https://argo.acme.test").await.0, StatusCode::OK);
+    let bound = h.secrets.list_scoped(&plugin_scope()).await.unwrap();
+    assert_eq!(bound.len(), 1, "{bound:?}");
+    for key in ["pc-orphan", "not-a-connection-credential"] {
+        h.secrets
+            .put(
+                &plugin_scope(),
+                scarab_secrets::Secret {
+                    key: key.into(),
+                    value: b"x".to_vec(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    let db: Arc<dyn scarab_engine::Db> = Arc::new(InMemoryDb::new());
+    let fake = Arc::new(FakeClock::new(CLOCK_START_MS));
+    let clock: Arc<dyn Clock> = fake.clone();
+    let mut seen = OrphanedConnectionSecrets::default();
+    let n = sweep_orphaned_connection_secrets(
+        &db,
+        h.pg.as_ref(),
+        h.secrets.as_ref(),
+        &clock,
+        "replica-a",
+        &mut seen,
+    )
+    .await
+    .unwrap();
+    assert_eq!(n, 0, "first seen now: not yet");
+
+    fake.advance(ORPHANED_CONNECTION_SECRET_GRACE_MS - 1);
+    // A bind in progress: its secret is written, its binding not yet.
+    h.secrets
+        .put(
+            &plugin_scope(),
+            scarab_secrets::Secret {
+                key: "pc-binding".into(),
+                value: b"y".to_vec(),
+            },
+        )
+        .await
+        .unwrap();
+    let n = sweep_orphaned_connection_secrets(
+        &db,
+        h.pg.as_ref(),
+        h.secrets.as_ref(),
+        &clock,
+        "replica-a",
+        &mut seen,
+    )
+    .await
+    .unwrap();
+    assert_eq!(n, 0, "one millisecond short of the grace");
+
+    fake.advance(1);
+    let n = sweep_orphaned_connection_secrets(
+        &db,
+        h.pg.as_ref(),
+        h.secrets.as_ref(),
+        &clock,
+        "replica-a",
+        &mut seen,
+    )
+    .await
+    .unwrap();
+    assert_eq!(n, 1, "the orphan, after its grace");
+    let mut left = h.secrets.list_scoped(&plugin_scope()).await.unwrap();
+    left.sort();
+    let mut want = vec![
+        bound[0].clone(),
+        "not-a-connection-credential".to_string(),
+        "pc-binding".to_string(),
+    ];
+    want.sort();
+    assert_eq!(left, want);
+    h.finish().await;
+}

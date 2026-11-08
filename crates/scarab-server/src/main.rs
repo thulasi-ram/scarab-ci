@@ -536,6 +536,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }),
             // The CredentialBroker journal (ADR-0072 §5): its retention window.
             Some(pg.clone() as Arc<dyn scarab_plugin::PluginStore>),
+            // Orphaned PluginConnection credentials (git-bug 4711823).
+            Some(secrets.clone()),
             // Step-up rows (ADR-0073): expired challenges and confirmations,
             // settled requests after 30 days. Never the security event log.
             Some((

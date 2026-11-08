@@ -106,6 +106,90 @@ pub async fn sweep_plugin_broker_journal(
         .map_err(|e| e.to_string())
 }
 
+/// How long a `pc-*` connection credential must stay unreferenced before
+/// [`sweep_orphaned_connection_secrets`] deletes it: far longer than a bind
+/// takes between writing the secret and writing the binding that names it.
+pub const ORPHANED_CONNECTION_SECRET_GRACE_MS: i64 = 10 * 60 * 1000;
+
+/// The `pc-*` keys a sweep found unreferenced, each with when it was first
+/// found so. Kept by the sweeper loop from one pass to the next.
+#[derive(Debug, Default)]
+pub struct OrphanedConnectionSecrets {
+    first_seen: std::collections::HashMap<String, i64>,
+}
+
+/// Delete PluginConnection credentials no binding names (git-bug 4711823):
+/// a crash between a bind's secret write and its binding, or between an
+/// unbind, re-bind or uninstall and its secret delete, leaves one in the
+/// secret store for good. A key is deleted only once it has been
+/// unreferenced on every pass for [`ORPHANED_CONNECTION_SECRET_GRACE_MS`],
+/// so a bind in progress (secret written, binding not yet) is never
+/// touched. Under the same leader lease as the log sweep; returns how many
+/// it deleted.
+pub async fn sweep_orphaned_connection_secrets(
+    db: &Arc<dyn Db>,
+    plugins: &dyn scarab_plugin::PluginStore,
+    secrets: &dyn scarab_secrets::SecretProvider,
+    clock: &Arc<dyn Clock>,
+    owner: &str,
+    seen: &mut OrphanedConnectionSecrets,
+) -> Result<u64, String> {
+    let lease = db
+        .lease(RETENTION_LEASE, owner, RETENTION_LEASE_TTL_MS)
+        .await
+        .map_err(|e| e.to_string())?;
+    if lease.owner != owner {
+        // Another replica sweeps; what this one saw may be stale by the
+        // time it leads again.
+        seen.first_seen.clear();
+        return Ok(0);
+    }
+    let scope = crate::plugins::plugin_connection_secret_scope();
+    // The keys first, then the bindings: a bind that lands between the two
+    // reads is seen bound.
+    let keys = secrets
+        .list_scoped(&scope)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut bound = std::collections::HashSet::new();
+    for installation in plugins
+        .all_installations()
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        for connection in plugins
+            .connections(&installation.id)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            bound.insert(connection.credential_ref);
+        }
+    }
+    let orphans: std::collections::HashSet<String> = keys
+        .into_iter()
+        .filter(|k| k.starts_with("pc-") && !bound.contains(k))
+        .collect();
+    seen.first_seen.retain(|k, _| orphans.contains(k));
+    let now = clock.now().await.0;
+    let mut deleted = 0u64;
+    for key in orphans {
+        let first = *seen.first_seen.entry(key.clone()).or_insert(now);
+        if now - first < ORPHANED_CONNECTION_SECRET_GRACE_MS {
+            continue;
+        }
+        match secrets.delete(&scope, &key).await {
+            Ok(()) | Err(scarab_secrets::SecretError::NotFound) => {
+                seen.first_seen.remove(&key);
+                deleted += 1;
+                tracing::info!(credential_ref = %key, "retention: deleted an orphaned plugin connection credential");
+            }
+            Err(e) => tracing::warn!(credential_ref = %key, error = %e,
+                "retention: could not delete an orphaned plugin connection credential"),
+        }
+    }
+    Ok(deleted)
+}
+
 /// How long a settled — or expired — StepUpConfirmationRequest row is kept
 /// (ADR-0073 §6). Its evidence lives on in the OrgSecurityEventLog, which no
 /// sweep ever touches.
@@ -694,10 +778,12 @@ pub fn spawn_sweeper(
     gc: GcConfig,
     depot: Option<Arc<dyn DepotDurableIndex>>,
     plugins: Option<Arc<dyn scarab_plugin::PluginStore>>,
+    connection_secrets: Option<Arc<dyn scarab_secrets::SecretProvider>>,
     step_up: Option<StepUpStores>,
     interval: std::time::Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let mut orphans = OrphanedConnectionSecrets::default();
         loop {
             match sweep_retention(&db, &store, &clock, &owner, cfg).await {
                 Ok(0) => {}
@@ -709,6 +795,27 @@ pub fn spawn_sweeper(
                     Ok(0) => {}
                     Ok(n) => tracing::info!(entries = n, "retention: pruned broker journal"),
                     Err(e) => tracing::warn!(error = %e, "broker journal prune failed"),
+                }
+                if let Some(secrets) = &connection_secrets {
+                    match sweep_orphaned_connection_secrets(
+                        &db,
+                        plugins.as_ref(),
+                        secrets.as_ref(),
+                        &clock,
+                        &owner,
+                        &mut orphans,
+                    )
+                    .await
+                    {
+                        Ok(0) => {}
+                        Ok(n) => tracing::info!(
+                            credentials = n,
+                            "retention: deleted orphaned plugin connection credentials"
+                        ),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "plugin connection credential sweep failed")
+                        }
+                    }
                 }
             }
             if let Some((challenges, step_up)) = &step_up {
