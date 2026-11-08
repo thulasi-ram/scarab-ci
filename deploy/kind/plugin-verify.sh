@@ -8,8 +8,9 @@
 #   install the plugin through the API → bind its connection → wait for the
 #   isolation probe and the Pod →
 #   wait until the Pod has read Argo CD through the broker's read proxy (its
-#   standby check) → kill switch: the broker answers 403 and the workload is
-#   scaled to zero.
+#   standby check) → a Pod that is no plugin workload cannot reach the broker
+#   port → kill switch: the broker answers 403 and the workload is scaled to
+#   zero.
 #
 # What it proves that the contract test cannot: the image runs under the
 # restricted profile on a read-only root, the projected token verifies through
@@ -167,6 +168,40 @@ assert seen, "no request reached the fake Argo CD"
 assert not bad, bad
 print("    ok: %d requests, all authorized" % len(seen))
 ' || fail "a request reached Argo without the credential"
+
+# --- 5b. the broker port refuses a Pod that is no plugin workload ------------
+# The chart's broker-ingress NetworkPolicy (git-bug da0af59): only plugin
+# workloads in the plugin namespace reach the broker port; the API port stays
+# open to everyone. A throwaway Pod in the release namespace dials both on the
+# server Service's ClusterIPs (by IP, so no DNS policy is in the way): the API
+# must answer (the network works), the broker must not.
+step "the broker port refuses a Pod that is no plugin workload"
+reach_image="$(kc -n "$plugins_ns" get deploy "plugin-$id" -o jsonpath='{.spec.template.spec.initContainers[0].image}')"
+api_ip="$(kc -n "$ns" get svc "$release" -o jsonpath='{.spec.clusterIP}')"
+api_port="$(kc -n "$ns" get svc "$release" -o jsonpath='{.spec.ports[0].port}')"
+broker_ip="$(kc -n "$ns" get svc "$release-broker" -o jsonpath='{.spec.clusterIP}')"
+reach() {
+  local pod="broker-reach-$RANDOM" url="$1" verdict
+  kc -n "$ns" run "$pod" --restart=Never --image="$reach_image" --overrides='{
+    "spec": {
+      "securityContext": {"runAsNonRoot": true, "runAsUser": 65534, "seccompProfile": {"type": "RuntimeDefault"}},
+      "containers": [{
+        "name": "'"$pod"'", "image": "'"$reach_image"'",
+        "command": ["sh", "-c", "if wget -q -T 5 -O- '"$url"' >/dev/null 2>&1; then echo reached; else echo unreached; fi"],
+        "securityContext": {"allowPrivilegeEscalation": false, "capabilities": {"drop": ["ALL"]}}
+      }]
+    }}' >/dev/null
+  kc -n "$ns" wait --for=jsonpath='{.status.phase}'=Succeeded "pod/$pod" --timeout=90s >/dev/null \
+    || { kc -n "$ns" delete pod "$pod" --wait=false >/dev/null 2>&1; fail "the reach Pod for $url did not finish"; }
+  verdict="$(kc -n "$ns" logs "$pod" | tail -1)"
+  kc -n "$ns" delete pod "$pod" --wait=false >/dev/null 2>&1 || true
+  echo "$verdict"
+}
+[ "$(reach "http://$api_ip:$api_port/healthz")" = reached ] \
+  || fail "a Pod in $ns could not reach the API port: the check proves nothing"
+[ "$(reach "http://$broker_ip:8090/_scarab/plugin/v1/healthz")" = unreached ] \
+  || fail "a Pod in $ns that is no plugin workload reached the broker port"
+echo "    ok: the API port answers it, the broker port does not"
 
 # --- 6. kill switch ------------------------------------------------------------
 step "kill switch"

@@ -1,0 +1,47 @@
+{{- if and .Values.plugins.enabled .Values.plugins.brokerIngressPolicy -}}
+{{- /*
+  Who may reach the CredentialBroker's port (git-bug da0af59): only Pods the
+  plugin runtime labels as plugin workloads (`scarab.io/plugin-workload`,
+  plugins and the isolation probe's plugin-side Pod), in the plugin
+  namespace. The broker authenticates every call with TokenReview, so this
+  is a second wall, not the first.
+
+  The policy selects only scarab-server Pods (the Data Depot's carry another
+  name label). A NetworkPolicy that selects a Pod drops every ingress it does
+  not allow, so the API port (`http`) stays open to every source, as before.
+  Ports are named, so they follow the Deployment's. Kubelet probes and
+  `kubectl port-forward` are not subject to NetworkPolicy.
+
+  It needs a CNI that enforces NetworkPolicy, as plugins already do. It does
+  not by itself stop a Pod in this namespace from carrying the server's
+  labels and so becoming a broker endpoint; k8s_overlay refuses those labels
+  on step Pods.
+*/ -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "scarab.fullname" . }}-broker-ingress
+  labels:
+    {{- include "scarab.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "scarab.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - port: http
+          protocol: TCP
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.plugins.namespace }}
+          podSelector:
+            matchExpressions:
+              - key: scarab.io/plugin-workload
+                operator: Exists
+      ports:
+        - port: broker
+          protocol: TCP
+{{- end }}
