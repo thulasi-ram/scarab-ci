@@ -195,7 +195,11 @@ pub fn decide(
     };
     if let (None, Some(why)) = (&isolation.failure, &isolation.inconclusive) {
         // Proves nothing: a workload running under an earlier passed probe
-        // keeps running under it; nothing new starts.
+        // keeps running under it; nothing new starts; and a hold stays as
+        // it is, with its definite finding, until a probe passes.
+        if installation.held_by_the_runtime() {
+            return Decision::Wait;
+        }
         return match installation.probe_passed_at {
             Some(earlier) => Decision::Run {
                 probe_passed_at: earlier,
@@ -704,6 +708,23 @@ mod tests {
             now + 1,
             &inconclusive(now),
             &[running(now - HOUR_MS)]
+        ));
+    }
+
+    /// git-bug da0af59 (6, red team): an inconclusive retry leaves a hold
+    /// as it is; only a passed probe lifts it.
+    #[test]
+    fn an_inconclusive_probe_does_not_lift_a_hold() {
+        let now = 100 * HOUR_MS;
+        let mut held = installation(InstallationState::Enabled);
+        held.runtime_status = RuntimeStatus::ProbeFailed;
+        held.probe_passed_at = None;
+        assert_eq!(decide(&held, &ready(), &inconclusive(now)), Decision::Wait);
+        held.runtime_status = RuntimeStatus::Error;
+        assert_eq!(decide(&held, &ready(), &inconclusive(now)), Decision::Wait);
+        assert!(matches!(
+            decide(&held, &ready(), &passed(now)),
+            Decision::Run { .. }
         ));
     }
 

@@ -505,7 +505,7 @@ impl BrokerProxy {
         credential_ref: &str,
     ) -> Result<(), Recheck> {
         match self.store.installation_by_id(installation_id).await {
-            Ok(Some(i)) if crate::broker::held_by_the_runtime(&i) => {
+            Ok(Some(i)) if i.held_by_the_runtime() => {
                 return Err(Recheck::Decided(
                     "cut: the plugin runtime held the installation",
                 ))

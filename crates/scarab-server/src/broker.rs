@@ -42,8 +42,7 @@ use sha2::{Digest, Sha256};
 
 use scarab_plugin::{
     installation_id_of_service_account, InstallationState, PluginCapability, PluginInstallation,
-    PluginStore, PluginStoreError, PluginTokenVerifier, RuntimeStatus, TokenRejected,
-    VerifiedServiceAccount,
+    PluginStore, PluginStoreError, PluginTokenVerifier, TokenRejected, VerifiedServiceAccount,
 };
 
 use super::{ApiError, AppState};
@@ -304,7 +303,11 @@ async fn caller(st: &AppState, id: &str) -> Result<PluginCaller, BrokerError> {
         ))
         .into());
     }
-    if held_by_the_runtime(&installation) {
+    // The runtime scales a held Plugin to zero, but a Pod still running, or
+    // inside its termination grace, must not keep using the broker (git-bug
+    // da0af59). Pending and Probing pass: the runtime starts the Pod before
+    // it records Running.
+    if installation.held_by_the_runtime() {
         return Err(ApiError::Denied(format!(
             "plugin installation `{}` is held by the plugin runtime ({})",
             installation.name,
@@ -313,18 +316,6 @@ async fn caller(st: &AppState, id: &str) -> Result<PluginCaller, BrokerError> {
         .into());
     }
     Ok(PluginCaller(installation))
-}
-
-/// Has the plugin runtime held this installation: its isolation probe
-/// failed, or the runtime refused to run it? The runtime scales a held
-/// Plugin to zero, but a Pod still running, or still inside its termination
-/// grace, must not keep using the broker (git-bug da0af59). Pending and
-/// Probing pass: the runtime starts the Pod before it records Running.
-pub(crate) fn held_by_the_runtime(installation: &PluginInstallation) -> bool {
-    matches!(
-        installation.runtime_status,
-        RuntimeStatus::ProbeFailed | RuntimeStatus::Error
-    )
 }
 
 /// Every 500 the broker would send becomes `internal error; request id <id>`

@@ -664,6 +664,19 @@ pub struct PluginInstallation {
 }
 
 impl PluginInstallation {
+    /// Has the plugin runtime held this installation: its isolation probe
+    /// failed, or the runtime refused to run it (a hold records `error` and
+    /// clears the probe)? Not a workload that is merely failing (a crash
+    /// loop, an image pull, a refused apply): those record `error` but keep
+    /// the probe that let them run, and are not held (git-bug da0af59).
+    pub fn held_by_the_runtime(&self) -> bool {
+        match self.runtime_status {
+            RuntimeStatus::ProbeFailed => true,
+            RuntimeStatus::Error => self.probe_passed_at.is_none(),
+            _ => false,
+        }
+    }
+
     /// The identity this installation acts under.
     pub fn principal(&self) -> PluginPrincipal {
         PluginPrincipal::of(&self.name)

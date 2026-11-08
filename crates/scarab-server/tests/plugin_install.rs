@@ -306,6 +306,37 @@ async fn the_broker_refuses_an_installation_the_runtime_held() {
     tdb.cleanup().await;
 }
 
+/// git-bug da0af59 (8, red team): a workload that is merely failing (a
+/// crash loop, an image pull, a quota refusal) records `error` with the
+/// probe that let it run. It was never held, and the broker serves it.
+#[tokio::test]
+async fn a_failing_workload_is_not_a_held_installation() {
+    let Some((tdb, pg)) = migrated().await else {
+        return;
+    };
+    let apps = apps(pg.clone());
+    let token = install(&apps.public, "acme", "argocd").await;
+    let id = token.strip_prefix("tok-").unwrap().to_string();
+    assert!(pg
+        .set_runtime_status(
+            &id,
+            InstallationState::Enabled,
+            0,
+            RuntimeStatus::Error,
+            "CrashLoopBackOff: back-off 40s restarting failed container",
+            Some(1),
+        )
+        .await
+        .unwrap());
+    let (status, body) = whoami(&apps, Some(&token)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a crash-looping Pod was never held: {body}"
+    );
+    tdb.cleanup().await;
+}
+
 #[tokio::test]
 async fn only_a_first_party_plugin_pinned_by_digest_installs() {
     let Some((tdb, pg)) = migrated().await else {
