@@ -1910,6 +1910,22 @@ pub async fn cancel_run_request(
     Ok(true)
 }
 
+/// Whether the Run's latest operator cancel request still stands: no rerun
+/// or retry was requested after it (git-bug 0962583).
+fn cancel_request_stands(events: &[EventKind]) -> bool {
+    let mut stands = false;
+    for e in events {
+        match &e.kind {
+            EventPayload::RunCancelRequested { .. } => stands = true,
+            EventPayload::RunRerunRequested { .. } | EventPayload::StepRetryRequested { .. } => {
+                stands = false
+            }
+            _ => {}
+        }
+    }
+    stands
+}
+
 /// The [`CANCEL_ATTEMPT`] intent for one attempt of `step` whose unit must
 /// go: the driver tears down exactly that attempt's unit, until it is gone.
 ///
@@ -4261,6 +4277,9 @@ impl<'a> Scheduler<'a> {
     /// - **`Failed`** — code produced a failing *verdict*: a `Step` failure
     ///   (incl. an exhausted opt-in retry), a `Timeout`, or a cancelled step.
     ///   The developer signal.
+    /// - **`Cancelled`** — a step is cancelled and the Run's latest operator
+    ///   cancel request still stands (no rerun or retry since): a cancel
+    ///   whose own Run commit never landed (git-bug 0962583).
     /// - **`DeadLettered`** — the system could not obtain a verdict: infra
     ///   retries exhausted or a lost execution. The operator signal, with
     ///   diagnostics on the event log.
@@ -4309,7 +4328,16 @@ impl<'a> Scheduler<'a> {
         let outcome = if !dead.is_empty() {
             RunStatus::DeadLettered
         } else if failed {
-            RunStatus::Failed
+            // An operator cancel writes its request first, then each Step,
+            // then the Run (`cancel_run_request`). A Cancelled Step under a
+            // request no rerun or retry has answered since is that cancel,
+            // interrupted before its Run commit: finish it (git-bug 0962583).
+            let cancelled = steps.iter().any(|s| s.status == StepStatus::Cancelled);
+            if cancelled && cancel_request_stands(&self.db.events(run).await?) {
+                RunStatus::Cancelled
+            } else {
+                RunStatus::Failed
+            }
         } else {
             RunStatus::Succeeded
         };
