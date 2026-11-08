@@ -82,6 +82,13 @@ pub const KILL_RECHECK_UNREADABLE_TO_CUT: u32 = 2;
 /// Proxied requests one installation may have in flight in this process. A
 /// reporter needs one long watch stream plus a few short reads.
 pub const PROXY_CONCURRENCY_PER_INSTALLATION: usize = 16;
+/// Proxied requests one installation may start per minute in this process,
+/// refilled evenly (a token bucket of this size). A reporter's steady
+/// traffic is a few reads a second.
+pub const PROXY_REQUESTS_PER_MINUTE_PER_INSTALLATION: u32 = 600;
+/// Proxied requests every installation together may have in flight in this
+/// process.
+pub const PROXY_CONCURRENCY_TOTAL: usize = 256;
 /// The journal queue between requests and the writer (the default of
 /// [`AppState::broker_journal_queue`]).
 pub const JOURNAL_QUEUE: usize = 4096;
@@ -103,6 +110,10 @@ const STREAM_BUFFER_CHUNKS: usize = 16;
 /// An upstream client unused this long is dropped; the next request for its
 /// CA builds a new one.
 const CLIENT_IDLE: Duration = Duration::from_secs(10 * 60);
+/// A bound credential unused this long is dropped from memory. Credential
+/// refs are never reused (a re-bind mints a new one), so a cached value is
+/// never stale; this only bounds how long an unused one stays in memory.
+const CREDENTIAL_IDLE: Duration = Duration::from_secs(15 * 60);
 
 /// The Plugin's headers that may travel upstream — content negotiation,
 /// conditional reads and an identifying agent, nothing that could change
@@ -144,10 +155,13 @@ pub fn route_path() -> String {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct UpstreamResponse;
 
-/// One of an installation's [`PROXY_CONCURRENCY_PER_INSTALLATION`] permits,
-/// taken in authentication and held until the response stream ends.
+/// One of an installation's [`PROXY_CONCURRENCY_PER_INSTALLATION`] permits
+/// and one of the broker's [`PROXY_CONCURRENCY_TOTAL`], taken in
+/// authentication and held until the response stream ends.
 #[derive(Clone)]
-pub(crate) struct ProxyPermit(#[allow(dead_code)] Arc<OwnedSemaphorePermit>);
+pub(crate) struct ProxyPermit(
+    #[allow(dead_code)] Arc<(OwnedSemaphorePermit, OwnedSemaphorePermit)>,
+);
 
 /// What the proxy route shares across requests: the registry on the
 /// broker's pool, the journal queue, the per-installation permits and the
@@ -158,33 +172,98 @@ pub struct BrokerProxy {
     /// Refusals not journaled because the queue was over half full.
     refusals_unjournaled: AtomicU64,
     permits: Mutex<InstallationPermits>,
+    /// The broker-wide in-flight limit.
+    total: Arc<Semaphore>,
     clients: Mutex<IdleCache<reqwest::Client>>,
+    /// Bound credentials by `credential_ref`, so a request does not read
+    /// the secret store each time.
+    credentials: Mutex<IdleCache<Arc<Vec<u8>>>>,
 }
 
-/// Each installation's in-flight permits. An installation with nothing in
-/// flight is dropped from the map whenever another takes a permit, so an
-/// uninstalled or idle installation costs nothing.
+/// Why a request was refused before anything else ran.
+#[derive(Debug, PartialEq, Eq)]
+enum Limit {
+    /// The installation's in-flight limit.
+    Concurrency,
+    /// The installation's per-minute limit.
+    Rate,
+    /// The broker-wide in-flight limit.
+    Total,
+}
+
+/// Each installation's in-flight permits and request budget. An
+/// installation with nothing in flight and a full budget is dropped from
+/// the map whenever another takes a permit, so an uninstalled or idle
+/// installation costs nothing.
 #[derive(Default)]
 struct InstallationPermits {
-    by_installation: HashMap<String, Arc<Semaphore>>,
+    by_installation: HashMap<String, InstallationGate>,
+}
+
+struct InstallationGate {
+    in_flight: Arc<Semaphore>,
+    budget: RequestBudget,
+}
+
+/// A token bucket: [`PROXY_REQUESTS_PER_MINUTE_PER_INSTALLATION`] requests,
+/// refilled evenly over a minute.
+struct RequestBudget {
+    tokens: f64,
+    at: Instant,
+}
+
+impl RequestBudget {
+    const SIZE: f64 = PROXY_REQUESTS_PER_MINUTE_PER_INSTALLATION as f64;
+
+    fn full(now: Instant) -> Self {
+        Self {
+            tokens: Self::SIZE,
+            at: now,
+        }
+    }
+
+    fn refill(&mut self, now: Instant) {
+        let elapsed = now.saturating_duration_since(self.at).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * Self::SIZE / 60.0).min(Self::SIZE);
+        self.at = now;
+    }
 }
 
 impl InstallationPermits {
-    /// One of `installation_id`'s permits, or `None` at the limit. The
+    /// One of `installation_id`'s permits, taken from its budget. The
     /// permit is taken while the map is held, so no permit is ever taken
     /// from a semaphore the map has just dropped (which would let a second
-    /// semaphore hand out a second set of permits).
-    fn try_take(&mut self, installation_id: &str) -> Option<OwnedSemaphorePermit> {
-        self.by_installation.retain(|id, permits| {
+    /// semaphore hand out a second set of permits). A request refused for
+    /// concurrency spends no budget.
+    fn try_take(
+        &mut self,
+        installation_id: &str,
+        now: Instant,
+    ) -> Result<OwnedSemaphorePermit, Limit> {
+        self.by_installation.retain(|id, gate| {
+            gate.budget.refill(now);
             id == installation_id
-                || permits.available_permits() < PROXY_CONCURRENCY_PER_INSTALLATION
+                || gate.in_flight.available_permits() < PROXY_CONCURRENCY_PER_INSTALLATION
+                || gate.budget.tokens < RequestBudget::SIZE
         });
-        self.by_installation
+        let gate = self
+            .by_installation
             .entry(installation_id.to_string())
-            .or_insert_with(|| Arc::new(Semaphore::new(PROXY_CONCURRENCY_PER_INSTALLATION)))
+            .or_insert_with(|| InstallationGate {
+                in_flight: Arc::new(Semaphore::new(PROXY_CONCURRENCY_PER_INSTALLATION)),
+                budget: RequestBudget::full(now),
+            });
+        gate.budget.refill(now);
+        if gate.budget.tokens < 1.0 {
+            return Err(Limit::Rate);
+        }
+        let permit = gate
+            .in_flight
             .clone()
             .try_acquire_owned()
-            .ok()
+            .map_err(|_| Limit::Concurrency)?;
+        gate.budget.tokens -= 1.0;
+        Ok(permit)
     }
 
     #[cfg(test)]
@@ -224,6 +303,10 @@ impl<V: Clone> IdleCache<V> {
         self.entries
             .retain(|_, (_, used)| now.saturating_duration_since(*used) < idle);
         self.entries.insert(key, (value, now));
+    }
+
+    fn remove(&mut self, key: &str) {
+        self.entries.remove(key);
     }
 
     #[cfg(test)]
@@ -283,16 +366,47 @@ impl BrokerProxy {
             journal,
             refusals_unjournaled: AtomicU64::new(0),
             permits: Mutex::new(InstallationPermits::default()),
+            total: Arc::new(Semaphore::new(PROXY_CONCURRENCY_TOTAL)),
             clients: Mutex::new(IdleCache::new(CLIENT_IDLE)),
+            credentials: Mutex::new(IdleCache::new(CREDENTIAL_IDLE)),
         });
         (proxy, drain)
     }
 
-    fn try_permit(&self, installation_id: &str) -> Option<OwnedSemaphorePermit> {
-        self.permits
+    fn try_permit(&self, installation_id: &str) -> Result<ProxyPermit, Limit> {
+        let own = self
+            .permits
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .try_take(installation_id)
+            .try_take(installation_id, Instant::now())?;
+        let total = self
+            .total
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Limit::Total)?;
+        Ok(ProxyPermit(Arc::new((own, total))))
+    }
+
+    fn cached_credential(&self, credential_ref: &str) -> Option<Arc<Vec<u8>>> {
+        self.credentials
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(credential_ref, Instant::now())
+    }
+
+    fn cache_credential(&self, credential_ref: &str, value: Arc<Vec<u8>>) {
+        self.credentials
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(credential_ref.to_string(), value, Instant::now());
+    }
+
+    /// Drop a credential whose binding is gone (re-bound or unbound).
+    fn forget_credential(&self, credential_ref: &str) {
+        self.credentials
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(credential_ref);
     }
 
     /// A slot in the journal queue, held until the request's row is sent
@@ -380,9 +494,12 @@ impl BrokerProxy {
         }
         match self.store.connection(installation_id, slot).await {
             Ok(Some(c)) if c.credential_ref == credential_ref => Ok(()),
-            Ok(_) => Err(Recheck::Decided(
-                "cut: the connection was re-bound or unbound",
-            )),
+            Ok(_) => {
+                self.forget_credential(credential_ref);
+                Err(Recheck::Decided(
+                    "cut: the connection was re-bound or unbound",
+                ))
+            }
             Err(_) => Err(Recheck::Unreadable("cut: the connection could not be read")),
         }
     }
@@ -398,8 +515,10 @@ enum Recheck {
 }
 
 /// Take one of the installation's proxy permits, before anything reads the
-/// store or a secret (`broker::authenticate`). Over the limit, the request
-/// (`method uri_path`) is refused (429) — journaled like any refusal.
+/// store or a secret (`broker::authenticate`). Over the installation's
+/// in-flight or per-minute limit the request (`method uri_path`) is refused
+/// with a 429, over the broker-wide limit with a 503 — journaled like any
+/// refusal.
 pub(crate) async fn take_permit(
     st: &AppState,
     proxy: &BrokerProxy,
@@ -407,9 +526,10 @@ pub(crate) async fn take_permit(
     method: &str,
     uri_path: &str,
 ) -> Result<ProxyPermit, Response> {
-    if let Some(permit) = proxy.try_permit(installation_id) {
-        return Ok(ProxyPermit(Arc::new(permit)));
-    }
+    let limit = match proxy.try_permit(installation_id) {
+        Ok(permit) => return Ok(permit),
+        Err(limit) => limit,
+    };
     let started = Instant::now();
     let (slot, path) = split_connection_path(uri_path).unwrap_or(("", String::new()));
     let draft = Draft::new(
@@ -420,15 +540,32 @@ pub(crate) async fn take_permit(
         st.clock.now().await.0,
         started,
     );
-    let refusal = Refusal::new(
-        StatusCode::TOO_MANY_REQUESTS,
-        "concurrency",
-        format!(
-            "at most {PROXY_CONCURRENCY_PER_INSTALLATION} broker requests per installation at \
-             once"
-        ),
-    )
-    .retry_after(RETRY_AFTER_TOO_MANY_SECS);
+    let refusal = match limit {
+        Limit::Concurrency => Refusal::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "concurrency",
+            format!(
+                "at most {PROXY_CONCURRENCY_PER_INSTALLATION} broker requests per installation \
+                 at once"
+            ),
+        )
+        .retry_after(RETRY_AFTER_TOO_MANY_SECS),
+        Limit::Rate => Refusal::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate",
+            format!(
+                "at most {PROXY_REQUESTS_PER_MINUTE_PER_INSTALLATION} broker requests per \
+                 installation per minute"
+            ),
+        )
+        .retry_after(RETRY_AFTER_TOO_MANY_SECS),
+        Limit::Total => Refusal::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "broker busy",
+            "the broker is busy; retry",
+        )
+        .retry_after(RETRY_AFTER_BUSY_SECS),
+    };
     proxy.journal_refusal(draft.refused(refusal.status, refusal.reason));
     Err(refusal.respond())
 }
@@ -1057,6 +1194,9 @@ async fn bound_credential(
                 .retry_after(RETRY_AFTER_BUSY_SECS));
             }
         };
+        if let Some(credential) = proxy.cached_credential(&connection.credential_ref) {
+            return Ok((connection, credential.as_ref().clone()));
+        }
         let Some(secrets) = st.secrets.as_deref() else {
             // A misconfiguration, not the Plugin's business: scrubbed to a
             // request id on the way out.
@@ -1073,7 +1213,10 @@ async fn bound_credential(
             )
             .await
         {
-            Ok(secret) => return Ok((connection, secret.value)),
+            Ok(secret) => {
+                proxy.cache_credential(&connection.credential_ref, Arc::new(secret.value.clone()));
+                return Ok((connection, secret.value));
+            }
             Err(scarab_secrets::SecretError::NotFound) if !reread => reread = true,
             Err(scarab_secrets::SecretError::NotFound) => {
                 tracing::error!(
@@ -1253,27 +1396,77 @@ mod tests {
     /// stays, and its limit holds.
     #[test]
     fn idle_installations_leave_the_permit_map() {
+        // A minute apart, so each installation's budget is full again.
+        let t0 = Instant::now();
+        let t = |minutes: u64| t0 + Duration::from_secs(60 * minutes);
         let mut permits = InstallationPermits::default();
-        let a = permits.try_take("a").expect("a's first permit");
-        drop(permits.try_take("b").expect("b's first permit"));
+        let a = permits.try_take("a", t(0)).expect("a's first permit");
+        drop(permits.try_take("b", t(1)).expect("b's first permit"));
         assert_eq!(permits.tracked(), 2, "a holds a permit, b was just used");
 
-        drop(permits.try_take("c").expect("c's first permit"));
+        drop(permits.try_take("c", t(2)).expect("c's first permit"));
         assert_eq!(permits.tracked(), 2, "b had nothing in flight: dropped");
 
         drop(a);
-        drop(permits.try_take("d").expect("d's first permit"));
+        drop(permits.try_take("d", t(3)).expect("d's first permit"));
         assert_eq!(permits.tracked(), 1, "only d, just used, is left");
 
         let held: Vec<_> = (0..PROXY_CONCURRENCY_PER_INSTALLATION)
-            .map(|_| permits.try_take("e").expect("within e's limit"))
+            .map(|_| permits.try_take("e", t(4)).expect("within e's limit"))
             .collect();
-        drop(permits.try_take("f"));
-        assert!(
-            permits.try_take("e").is_none(),
+        drop(permits.try_take("f", t(4)));
+        assert_eq!(
+            permits.try_take("e", t(4)).err(),
+            Some(Limit::Concurrency),
             "e's limit survives pruning"
         );
         drop(held);
+    }
+
+    /// git-bug 4711823 (2): an installation may start
+    /// PROXY_REQUESTS_PER_MINUTE_PER_INSTALLATION requests in a burst, then
+    /// one more each tenth of a second; another installation's budget is
+    /// its own; a request refused for concurrency spends nothing.
+    #[test]
+    fn an_installation_starts_at_most_its_requests_per_minute() {
+        let t0 = Instant::now();
+        let mut permits = InstallationPermits::default();
+        for n in 0..PROXY_REQUESTS_PER_MINUTE_PER_INSTALLATION {
+            drop(
+                permits
+                    .try_take("a", t0)
+                    .unwrap_or_else(|l| panic!("request {n}: {l:?}")),
+            );
+        }
+        assert_eq!(permits.try_take("a", t0).err(), Some(Limit::Rate));
+        assert!(permits.try_take("b", t0).is_ok(), "b's budget is its own");
+
+        let tick =
+            Duration::from_millis(60_000 / PROXY_REQUESTS_PER_MINUTE_PER_INSTALLATION as u64);
+        drop(permits.try_take("a", t0 + tick).expect("refilled by one"));
+        assert_eq!(permits.try_take("a", t0 + tick).err(), Some(Limit::Rate));
+
+        // At the in-flight limit, refusals spend no budget: c is left one
+        // request once it holds every permit, and still has it after.
+        let t1 = t0 + Duration::from_secs(120);
+        let spare = PROXY_REQUESTS_PER_MINUTE_PER_INSTALLATION as usize
+            - PROXY_CONCURRENCY_PER_INSTALLATION
+            - 1;
+        for _ in 0..spare {
+            drop(permits.try_take("c", t1).expect("within c's budget"));
+        }
+        let held: Vec<_> = (0..PROXY_CONCURRENCY_PER_INSTALLATION)
+            .map(|_| permits.try_take("c", t1).expect("within c's limit"))
+            .collect();
+        for _ in 0..1000 {
+            assert_eq!(permits.try_take("c", t1).err(), Some(Limit::Concurrency));
+        }
+        drop(held);
+        assert!(
+            permits.try_take("c", t1).is_ok(),
+            "c's last request was not spent"
+        );
+        assert_eq!(permits.try_take("c", t1).err(), Some(Limit::Rate));
     }
 
     /// git-bug 4711823 (6): a cached value unused for its idle time goes

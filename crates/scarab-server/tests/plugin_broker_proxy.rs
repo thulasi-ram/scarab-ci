@@ -1401,3 +1401,50 @@ async fn an_orphaned_connection_credential_is_swept_after_its_grace() {
     assert_eq!(left, want);
     h.finish().await;
 }
+
+/// git-bug 4711823 (2): the broker reads a bound credential from the secret
+/// store once and keeps it for its credential_ref; a re-bind mints a new
+/// ref, so the new credential is read and sent from the next request on.
+#[tokio::test]
+async fn a_bound_credential_is_read_once_and_a_rebind_replaces_it() {
+    let Some(h) = harness().await else {
+        return;
+    };
+    let (up, base) = spawn_upstream().await;
+    let (_, token) = install(&h).await;
+    assert_eq!(bind(&h, &base).await.0, StatusCode::OK);
+    let (status, _, body) = send(&h.broker, plugin_get(&token, "/api/version")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // The secret store loses the credential: the cached one is still sent.
+    let key = h.secrets.list_scoped(&plugin_scope()).await.unwrap()[0].clone();
+    h.secrets.delete(&plugin_scope(), &key).await.unwrap();
+    let (status, _, body) = send(&h.broker, plugin_get(&token, "/api/version")).await;
+    assert_eq!(status, StatusCode::OK, "served from the cache: {body}");
+
+    let (status, body) = admin(
+        &h.public,
+        "PUT",
+        "/v1/orgs/acme/plugins/argo/connections/argocd",
+        Some(json!({ "base_url": base, "credential": "argo-token-rotated" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, _, body) = send(&h.broker, plugin_get(&token, "/api/version")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let sent: Vec<String> = up
+        .seen()
+        .iter()
+        .map(|s| s.headers["authorization"].to_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        sent,
+        [
+            format!("Bearer {ARGO_TOKEN}"),
+            format!("Bearer {ARGO_TOKEN}"),
+            "Bearer argo-token-rotated".to_string(),
+        ]
+    );
+    h.finish().await;
+}
