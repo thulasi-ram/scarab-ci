@@ -38,4 +38,7 @@ scarab-secrets-postgres = 84.9
 scarab-server = 85.9
 scarab-storage = 89.4
 scarab-storage-s3 = 85.2
-scarab-workspace-client = 79.3
+# 2026-11-08: 79.3 -> 78.7, from main's CI lcov (run 42444894279). The fmt
+# commit e229f162 split long lines: 9 more measured lines, 5 more covered
+# (1767/2242 -> 1772/2251), so the share fell while coverage grew.
+scarab-workspace-client = 78.7
