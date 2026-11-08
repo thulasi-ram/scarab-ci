@@ -124,6 +124,9 @@ async fn world() -> Option<World> {
         )
         .with_plugin_tokens(Arc::new(FakeTokenReview))
         .with_secrets(Arc::new(FakeSecrets::new()));
+    // The fake Argo CD listens on 127.0.0.1, which the broker refuses by
+    // default.
+    let st = st.with_broker_upstream_loopback_allowed(true);
     let public = router(st.clone());
     let broker_url = serve(broker::router(st)).await;
     let fake = FakeArgo::new(Some(ARGO_TOKEN.into()));
