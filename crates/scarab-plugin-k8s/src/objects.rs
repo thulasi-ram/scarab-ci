@@ -641,6 +641,7 @@ mod tests {
                 "https://argo.example".to_string(),
             )]),
             state: InstallationState::Enabled,
+            state_version: 0,
             runtime_status: RuntimeStatus::Pending,
             runtime_message: String::new(),
             probe_passed_at: None,

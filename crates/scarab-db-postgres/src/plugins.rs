@@ -58,8 +58,8 @@ fn saturating_i64(n: u64) -> i64 {
 }
 
 const INSTALLATION_COLUMNS: &str = "id, org, name, plugin, image, manifest, manifest_sha256, \
-     config, state, runtime_status, runtime_message, probe_passed_at, approved_by, approved_at, \
-     killed_by, killed_at, storage_claim, storage_mount_path";
+     config, state, state_version, runtime_status, runtime_message, probe_passed_at, approved_by, \
+     approved_at, killed_by, killed_at, storage_claim, storage_mount_path";
 
 /// One `plugin_installations` row back into the domain. A row whose manifest,
 /// config or state this binary cannot read is reported, never defaulted: a
@@ -109,6 +109,7 @@ fn installation_from_row(
         manifest_sha256: r.get("manifest_sha256"),
         config,
         state,
+        state_version: r.get("state_version"),
         runtime_status,
         runtime_message: r.get("runtime_message"),
         probe_passed_at: r.get("probe_passed_at"),
@@ -340,22 +341,25 @@ impl PluginStore for PostgresDb {
         &self,
         id: &str,
         decided_in: InstallationState,
+        decided_at_version: i64,
         status: RuntimeStatus,
         message: &str,
         probe_passed_at: Option<i64>,
     ) -> Result<bool, PluginStoreError> {
-        // Guarded by the state the runtime decided in: a kill or enable that
-        // committed meanwhile wins, and the runtime decides again next pass.
+        // Guarded by the state and state version the runtime decided in: a
+        // kill or enable that committed meanwhile wins, and the runtime
+        // decides again next pass.
         let written = sqlx::query(
             "UPDATE plugin_installations
                 SET runtime_status = $3, runtime_message = $4, probe_passed_at = $5
-              WHERE id = $1 AND state = $2",
+              WHERE id = $1 AND state = $2 AND state_version = $6",
         )
         .bind(id)
         .bind(decided_in.as_str())
         .bind(status.as_str())
         .bind(message)
         .bind(probe_passed_at)
+        .bind(decided_at_version)
         .execute(self.pool())
         .await
         .map_err(plugin_store_err)?
@@ -381,6 +385,7 @@ impl PluginStore for PostgresDb {
         let sql = format!(
             "UPDATE plugin_installations SET
                  state = $3,
+                 state_version = state_version + CASE WHEN state = $3 THEN 0 ELSE 1 END,
                  killed_by = CASE WHEN $3 = 'killed' THEN COALESCE(killed_by, $4) END,
                  killed_at = CASE WHEN $3 = 'killed' THEN COALESCE(killed_at, $5) END,
                  runtime_status = CASE WHEN $3 = 'enabled' AND state = 'killed'

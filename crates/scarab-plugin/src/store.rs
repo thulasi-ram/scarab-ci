@@ -123,14 +123,17 @@ pub trait PluginStore: Send + Sync {
 
     /// Record what the plugin runtime observed of installation `id`'s
     /// workload — written **only if the installation is still in
-    /// `decided_in`**, the state the runtime read before acting. A kill or
-    /// enable that lands while the runtime was probing or applying is then
-    /// never overwritten by a status decided for the old state; the next pass
-    /// decides again. Returns whether a row was written.
+    /// `decided_in` at `decided_at_version`**, the state and state version
+    /// the runtime read before acting. A kill or enable that lands while the
+    /// runtime was probing or applying is then never overwritten by a status
+    /// decided for the old state, even a kill and re-enable that leave the
+    /// state as it was (git-bug da0af59); the next pass decides again.
+    /// Returns whether a row was written.
     async fn set_runtime_status(
         &self,
         id: &str,
         decided_in: InstallationState,
+        decided_at_version: i64,
         status: RuntimeStatus,
         message: &str,
         probe_passed_at: Option<i64>,

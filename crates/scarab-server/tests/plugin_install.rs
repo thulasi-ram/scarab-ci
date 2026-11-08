@@ -281,7 +281,7 @@ async fn the_broker_refuses_an_installation_the_runtime_held() {
 
     for held in [RuntimeStatus::ProbeFailed, RuntimeStatus::Error] {
         assert!(pg
-            .set_runtime_status(&id, InstallationState::Enabled, held, "held", None)
+            .set_runtime_status(&id, InstallationState::Enabled, 0, held, "held", None)
             .await
             .unwrap());
         let (status, body) = whoami(&apps, Some(&token)).await;
@@ -295,6 +295,7 @@ async fn the_broker_refuses_an_installation_the_runtime_held() {
         .set_runtime_status(
             &id,
             InstallationState::Enabled,
+            0,
             RuntimeStatus::Running,
             "",
             Some(1)

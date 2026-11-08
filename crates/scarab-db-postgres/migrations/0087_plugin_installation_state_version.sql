@@ -1,0 +1,11 @@
+-- git-bug da0af59: a version for an installation's state, so the plugin
+-- runtime's status write is refused when the installation was killed and
+-- re-enabled while the runtime decided. The state alone is the same before
+-- and after (enabled -> killed -> enabled), so a status decided before the
+-- kill, with the probe the enable cleared, would land; the version differs.
+ALTER TABLE plugin_installations ADD COLUMN state_version BIGINT NOT NULL DEFAULT 0;
+--
+-- Expand step (ADR-0003): a column with a default. A server built before
+-- this migration refuses to boot against a database that has it; to roll
+-- back, delete row 87 from `_sqlx_migrations` and drop the column (leaving
+-- it makes the next roll-forward fail on ADD COLUMN).

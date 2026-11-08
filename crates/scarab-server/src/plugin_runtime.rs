@@ -459,6 +459,7 @@ impl PluginRuntimeLoop {
                 .set_runtime_status(
                     &i.id,
                     InstallationState::Enabled,
+                    i.state_version,
                     RuntimeStatus::Probing,
                     "isolation probe running",
                     i.probe_passed_at,
@@ -548,6 +549,7 @@ impl PluginRuntimeLoop {
                 .set_runtime_status(
                     &installation.id,
                     installation.state,
+                    installation.state_version,
                     status,
                     &message,
                     probe_passed_at,
@@ -585,6 +587,7 @@ mod tests {
             manifest_sha256: "0".repeat(64),
             config: BTreeMap::new(),
             state,
+            state_version: 0,
             runtime_status: RuntimeStatus::Pending,
             runtime_message: String::new(),
             probe_passed_at: None,

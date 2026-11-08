@@ -1226,12 +1226,20 @@ impl scarab_plugin::PluginStore for HeldJournal {
         &self,
         id: &str,
         decided_in: scarab_plugin::InstallationState,
+        decided_at_version: i64,
         status: scarab_plugin::RuntimeStatus,
         message: &str,
         probe_passed_at: Option<i64>,
     ) -> Result<bool, scarab_plugin::PluginStoreError> {
         self.inner
-            .set_runtime_status(id, decided_in, status, message, probe_passed_at)
+            .set_runtime_status(
+                id,
+                decided_in,
+                decided_at_version,
+                status,
+                message,
+                probe_passed_at,
+            )
             .await
     }
     async fn uninstall(

@@ -847,6 +847,7 @@ pub(crate) async fn install_plugin(
         manifest: entry.manifest.clone(),
         config: body.config,
         state: InstallationState::Enabled,
+        state_version: 0,
         runtime_status: RuntimeStatus::Pending,
         runtime_message: String::new(),
         probe_passed_at: None,

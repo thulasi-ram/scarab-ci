@@ -646,6 +646,10 @@ pub struct PluginInstallation {
     pub manifest_sha256: String,
     pub config: BTreeMap<String, String>,
     pub state: InstallationState,
+    /// Bumped by every change of `state`. The plugin runtime's status write
+    /// must name it, so a kill and re-enable while the runtime decided (the
+    /// same state before and after) still refuses that write.
+    pub state_version: i64,
     pub runtime_status: RuntimeStatus,
     pub runtime_message: String,
     pub probe_passed_at: Option<i64>,
