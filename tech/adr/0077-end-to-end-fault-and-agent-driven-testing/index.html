@@ -1,0 +1,776 @@
+<!DOCTYPE html><html lang="en" dir="ltr" data-theme="dark" data-has-toc data-has-sidebar class="astro-vdxcvpsm"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>0077. End-to-end, fault and agent-driven testing: one invariant checker, a few fault scenarios on a throwaway cluster, and a red-team agent that only writes tests | Scarab</title><link rel="canonical" href="https://thulasi-ram.github.io/scarab-ci/tech/adr/0077-end-to-end-fault-and-agent-driven-testing/"/><link rel="sitemap" href="/scarab-ci/sitemap-index.xml"/><link rel="icon" href="/scarab-ci/favicon.ico" sizes="32x32"/><link rel="apple-touch-icon" href="/scarab-ci/apple-touch-icon.png"/><link rel="shortcut icon" href="/scarab-ci/favicon.svg" type="image/svg+xml"/><meta name="generator" content="Astro v7.0.9"/><meta name="generator" content="Starlight v0.41.3"/><meta property="og:title" content="0077. End-to-end, fault and agent-driven testing: one invariant checker, a few fault scenarios on a throwaway cluster, and a red-team agent that only writes tests"/><meta property="og:type" content="article"/><meta property="og:url" content="https://thulasi-ram.github.io/scarab-ci/tech/adr/0077-end-to-end-fault-and-agent-driven-testing/"/><meta property="og:locale" content="en"/><meta property="og:site_name" content="Scarab"/><meta name="twitter:card" content="summary_large_image"/><script>
+	window.StarlightThemeProvider = (() => {
+		const storedTheme =
+			typeof localStorage !== 'undefined' && localStorage.getItem('starlight-theme');
+		const theme =
+			storedTheme ||
+			(window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+		document.documentElement.dataset.theme = theme === 'light' ? 'light' : 'dark';
+		return {
+			updatePickers(theme = storedTheme || 'auto') {
+				document.querySelectorAll('starlight-theme-select').forEach((picker) => {
+					const select = picker.querySelector('select');
+					if (select) select.value = theme;
+					/** @type {HTMLTemplateElement | null} */
+					const tmpl = document.querySelector(`#theme-icons`);
+					const newIcon = tmpl && tmpl.content.querySelector('.' + theme);
+					if (newIcon) {
+						const oldIcon = picker.querySelector('svg.label-icon');
+						if (oldIcon) {
+							oldIcon.replaceChildren(...newIcon.cloneNode(true).childNodes);
+						}
+					}
+				});
+			},
+		};
+	})();
+</script><template id="theme-icons"><svg aria-hidden="true" class="light astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M5 12a1 1 0 0 0-1-1H3a1 1 0 0 0 0 2h1a1 1 0 0 0 1-1Zm.64 5-.71.71a1 1 0 0 0 0 1.41 1 1 0 0 0 1.41 0l.71-.71A1 1 0 0 0 5.64 17ZM12 5a1 1 0 0 0 1-1V3a1 1 0 0 0-2 0v1a1 1 0 0 0 1 1Zm5.66 2.34a1 1 0 0 0 .7-.29l.71-.71a1 1 0 1 0-1.41-1.41l-.66.71a1 1 0 0 0 0 1.41 1 1 0 0 0 .66.29Zm-12-.29a1 1 0 0 0 1.41 0 1 1 0 0 0 0-1.41l-.71-.71a1.004 1.004 0 1 0-1.43 1.41l.73.71ZM21 11h-1a1 1 0 0 0 0 2h1a1 1 0 0 0 0-2Zm-2.64 6A1 1 0 0 0 17 18.36l.71.71a1 1 0 0 0 1.41 0 1 1 0 0 0 0-1.41l-.76-.66ZM12 6.5a5.5 5.5 0 1 0 5.5 5.5A5.51 5.51 0 0 0 12 6.5Zm0 9a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7Zm0 3.5a1 1 0 0 0-1 1v1a1 1 0 0 0 2 0v-1a1 1 0 0 0-1-1Z"/></svg><svg aria-hidden="true" class="dark astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M21.64 13a1 1 0 0 0-1.05-.14 8.049 8.049 0 0 1-3.37.73 8.15 8.15 0 0 1-8.14-8.1 8.59 8.59 0 0 1 .25-2A1 1 0 0 0 8 2.36a10.14 10.14 0 1 0 14 11.69 1 1 0 0 0-.36-1.05Zm-9.5 6.69A8.14 8.14 0 0 1 7.08 5.22v.27a10.15 10.15 0 0 0 10.14 10.14 9.784 9.784 0 0 0 2.1-.22 8.11 8.11 0 0 1-7.18 4.32v-.04Z"/></svg><svg aria-hidden="true" class="auto astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M21 14h-1V7a3 3 0 0 0-3-3H7a3 3 0 0 0-3 3v7H3a1 1 0 0 0-1 1v2a3 3 0 0 0 3 3h14a3 3 0 0 0 3-3v-2a1 1 0 0 0-1-1ZM6 7a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v7H6V7Zm14 10a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-1h16v1Z"/></svg></template><link rel="stylesheet" href="/scarab-ci/_astro/print.ehPL0gv-.css" media="print"><link rel="stylesheet" href="/scarab-ci/_astro/middleware.iSOPaR4s.css"><link rel="stylesheet" href="/scarab-ci/_astro/index.BdeWKgqi.css"><script type="module" src="/scarab-ci/_astro/page.B2uBVZjk.js"></script></head><body class="astro-vdxcvpsm"><a class="sl-skip-link astro-vxeigawq" href="#_top">Skip to content</a><div data-slot="layout" class="astro-6hobpl37"><header class="astro-6hobpl37"><div class="container-wrapper px-6 astro-6hobpl37"><div class="container astro-6hobpl37"><button class="show-modal astro-w34sq3kk" popovertargetaction="toggle" popovertarget="drawer"><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="astro-w34sq3kk"><path stroke-linecap="round" stroke-linejoin="round" d="M3.75 9h16.5m-16.5 6.75h16.5" class="astro-w34sq3kk"></path></svg><span class="sr-only astro-w34sq3kk">Toggle Menu</span></button><div class="site-title-wrapper astro-sycd25p5"><a href="/scarab-ci/" class="site-title astro-lygsa2fc"><img class="light:sl-hidden logo astro-lygsa2fc" alt="Scarab" src="/scarab-ci/_astro/scarab-dark.CS8ICdjI.svg" width="480" height="328"><img class="dark:sl-hidden logo astro-lygsa2fc" alt="Scarab" src="/scarab-ci/_astro/scarab.4XhTotfC.svg" width="480" height="328"><span class="title-text astro-lygsa2fc">Scarab</span></a><nav class="nav-bar astro-tahnhu4v"><a class="astro-tahnhu4v" href="/scarab-ci/get-started/overview/" class="astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke">Get Started</a><a class="astro-tahnhu4v" href="/scarab-ci/usage/pipeline-syntax/" class="astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke">Usage</a><a class="astro-tahnhu4v" href="/scarab-ci/reference/api/" class="astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke">References</a><a class="astro-tahnhu4v" href="https://demo-scarab.ahiravan.dev/" target="_blank" rel="noopener" class="astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke">Demo</a></nav></div><div class="header-right astro-sycd25p5"><site-search class="astro-sycd25p5 astro-goos2lhy" data-translations="{&quot;placeholder&quot;:&quot;Search&quot;}"><button data-open-modal disabled aria-label="Search" aria-keyshortcuts="Control+K" class="astro-goos2lhy"><span aria-hidden="true" class="astro-goos2lhy">Search</span><kbd class="sl-hidden md:sl-flex astro-goos2lhy" style="display: none;"><kbd class="astro-goos2lhy">Ctrl</kbd><kbd class="astro-goos2lhy">K</kbd></kbd></button><dialog style="padding:0" aria-label="Search" class="astro-goos2lhy"><div class="dialog-frame sl-flex astro-goos2lhy"><button data-close-modal class="sl-flex md:sl-hidden astro-goos2lhy">Cancel</button><div class="search-container astro-goos2lhy"><div id="starlight__search" class="astro-goos2lhy"></div></div></div></dialog></site-search><script>
+    (() => {
+        const openBtn = document.querySelector('button[data-open-modal]');
+        const shortcut = openBtn?.querySelector('kbd');
+        if (!openBtn || !(shortcut instanceof HTMLElement)) {
+            return;
+        }
+        const updateShortcutDisplay = () => {
+            shortcut.style.setProperty(
+                'display',
+                matchMedia('(min-width: 40rem)').matches ? 'flex' : 'none',
+                'important'
+            );
+        };
+        const platformKey = shortcut.querySelector('kbd');
+        // eslint-disable-next-line regexp/no-unused-capturing-group
+        if (platformKey && /(Mac|iPhone|iPod|iPad)/i.test(navigator.platform)) {
+            platformKey.textContent = '⌘';
+            openBtn.setAttribute('aria-keyshortcuts', 'Meta+K');
+        }
+        updateShortcutDisplay();
+        matchMedia('(min-width: 40rem)').addEventListener('change', updateShortcutDisplay);
+    })();
+</script><script type="module" src="/scarab-ci/_astro/Search.astro_astro_type_script_index_0_lang.BNSpSyix.js"></script><nav class="header-nav astro-sycd25p5"><div class="astro-sycd25p5"><a href="https://github.com/thulasi-ram/scarab-ci" rel="me" class="sl-flex button astro-bs4vfkht" data-variant="ghost"><span class="sr-only astro-bs4vfkht">GitHub</span><svg aria-hidden="true" class="astro-bs4vfkht astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M12 .3a12 12 0 0 0-3.8 23.38c.6.12.83-.26.83-.57L9 21.07c-3.34.72-4.04-1.61-4.04-1.61-.55-1.39-1.34-1.76-1.34-1.76-1.08-.74.09-.73.09-.73 1.2.09 1.83 1.24 1.83 1.24 1.08 1.83 2.81 1.3 3.5 1 .1-.78.42-1.31.76-1.61-2.67-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.14-.3-.54-1.52.1-3.18 0 0 1-.32 3.3 1.23a11.5 11.5 0 0 1 6 0c2.28-1.55 3.29-1.23 3.29-1.23.64 1.66.24 2.88.12 3.18a4.65 4.65 0 0 1 1.23 3.22c0 4.61-2.8 5.63-5.48 5.92.42.36.81 1.1.81 2.22l-.01 3.29c0 .31.2.69.82.57A12 12 0 0 0 12 .3Z"/></svg></a></div><div class="astro-sycd25p5"><starlight-theme-lucode-select class="astro-7vkpjdjh"><button aria-label="Select theme" aria-live="polite" class="sl-flex button astro-7vkpjdjh" title="Select theme" data-variant="ghost"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="sun astro-7vkpjdjh"><circle cx="12" cy="12" r="4" class="astro-7vkpjdjh"></circle><path d="M12 2v2" class="astro-7vkpjdjh"></path><path d="M12 20v2" class="astro-7vkpjdjh"></path><path d="m4.93 4.93 1.41 1.41" class="astro-7vkpjdjh"></path><path d="m17.66 17.66 1.41 1.41" class="astro-7vkpjdjh"></path><path d="M2 12h2" class="astro-7vkpjdjh"></path><path d="M20 12h2" class="astro-7vkpjdjh"></path><path d="m6.34 17.66-1.41 1.41" class="astro-7vkpjdjh"></path><path d="m19.07 4.93-1.41 1.41" class="astro-7vkpjdjh"></path></svg><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="moon astro-7vkpjdjh"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z" class="astro-7vkpjdjh"> </path></svg><span class="sr-only astro-7vkpjdjh">Toggle theme</span></button></starlight-theme-lucode-select><script>
+    // eslint-disable-next-line no-undef
+    StarlightThemeProvider.updatePickers();
+</script><script type="module">var e=`starlight-theme`;function t(e){return e===`auto`||e===`dark`||e===`light`?e:`auto`}function n(){return t(typeof localStorage<`u`&&localStorage.getItem(e))}function r(t){typeof localStorage<`u`&&localStorage.setItem(e,t===`light`||t===`dark`?t:``)}function i(){return matchMedia(`(prefers-color-scheme: light)`).matches?`light`:`dark`}function a(e){StarlightThemeProvider.updatePickers(e),document.documentElement.dataset.theme=e===`auto`?i():e,r(e)}matchMedia(`(prefers-color-scheme: light)`).addEventListener(`change`,()=>{n()===`auto`&&a(`auto`)}),customElements.define(`starlight-theme-lucode-select`,class extends HTMLElement{constructor(){super(),a(n());let e=this.querySelector(`button`);e?.addEventListener(`click`,()=>{let n=t(document.documentElement.dataset.theme),r=n===`dark`?`light`:n===`light`?`dark`:`auto`;a(r),e?.setAttribute(`aria-label`,`${r} theme`)})}});</script></div><div class="astro-sycd25p5"><script type="module">var e=class extends HTMLElement{constructor(){super();let e=this.querySelector(`select`);e&&(e.addEventListener(`change`,e=>{e.currentTarget instanceof HTMLSelectElement&&(window.location.pathname=e.currentTarget.value)}),window.addEventListener(`pageshow`,t=>{if(!t.persisted)return;let n=e.querySelector(`option[selected]`)?.index;n!==e.selectedIndex&&(e.selectedIndex=n??0)}))}};customElements.define(`starlight-lang-select`,e);</script></div></nav></div><scarab-version-select data-root="/scarab-ci/" data-base="/scarab-ci/" data-version="v0.3" hidden="true" class="astro-jcjov46q"><select aria-label="Documentation version" class="astro-jcjov46q"></select></scarab-version-select><script type="module" src="/scarab-ci/_astro/VersionSelect.astro_astro_type_script_index_0_lang.BvwAqe9Q.js"></script></div></div></header><main class="astro-6hobpl37"><div class="container-wrapper astro-6hobpl37"><div class="container container-wrapper-main astro-6hobpl37"><aside class="aside astro-6hobpl37"><div class="sidebar astro-5xeag62i"><div class="sidebar-border-gradient astro-5xeag62i"></div><div class="sidebar-spacer astro-5xeag62i"></div><div class="sidebar-fade-top astro-5xeag62i"></div><div class="container-sidebar astro-5xeag62i"><div class="sidebar-entries astro-5xeag62i"><div class="container-sidebar-entry astro-k3wmqijo"><h4 class="entry-title astro-k3wmqijo">Get Started</h4><div class="container-group-link astro-k3wmqijo"><a href="/scarab-ci/get-started/overview/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">Overview</span></a><a href="/scarab-ci/get-started/deploy-helm/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">Installation</span></a><a href="/scarab-ci/get-started/run-locally/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">Run locally</span></a><a href="/scarab-ci/get-started/local-development/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">Local Development</span></a></div></div><div class="container-sidebar-entry astro-k3wmqijo"><h4 class="entry-title astro-k3wmqijo">Usage</h4><div class="container-group-link astro-k3wmqijo"><a href="/scarab-ci/usage/pipeline-syntax/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">Pipeline Syntax</span></a><a href="/scarab-ci/usage/libraries/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">Libraries</span></a><a href="/scarab-ci/usage/secrets/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">Secrets</span></a><a href="/scarab-ci/usage/api-tokens/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">API tokens</span></a><a href="/scarab-ci/usage/environments/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">Environments</span></a><a href="/scarab-ci/usage/deploying-with-argo-cd/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">Deploying with Argo CD</span></a><a href="/scarab-ci/usage/environment-variables/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">Environment Variables</span></a></div></div><div class="container-sidebar-entry astro-k3wmqijo"><h4 class="entry-title astro-k3wmqijo">References</h4><div class="container-group-link astro-k3wmqijo"><a href="/scarab-ci/reference/api/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">API</span></a><div class="container-sidebar-entry astro-k3wmqijo"><h4 class="entry-title astro-k3wmqijo">ADR</h4><div class="container-group-link astro-k3wmqijo"><a href="/scarab-ci/tech/adr/0001-ci-as-durable-execution/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0001. CI as durable execution</span></a><a href="/scarab-ci/tech/adr/0002-durability-model/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0002. Durability model: durable DAG orchestrator + at-least-once steps</span></a><a href="/scarab-ci/tech/adr/0003-durability-substrate-postgres/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0003. Durability layer: build our own, DBOS-style on Postgres (Rust)</span></a><a href="/scarab-ci/tech/adr/0004-execution-topology/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0004. Execution topology: pod-per-step + content-addressed workspace</span></a><a href="/scarab-ci/tech/adr/0005-tenancy-and-k8s-only/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0005. Tenancy &amp; deployment; Kubernetes as the only backend</span></a><a href="/scarab-ci/tech/adr/0006-pipeline-ontology/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0006. Pipeline model: flat recursive DAG</span></a><a href="/scarab-ci/tech/adr/0007-data-passing-model/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0007. Data-passing model: Workspace / Result / Artifact / Cache</span></a><a href="/scarab-ci/tech/adr/0008-step-contract/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0008. Step contract: OCI image + convention + built-in kinds</span></a><a href="/scarab-ci/tech/adr/0009-dsl-ir-yaml-cel/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0009. DSL: typed Pipeline IR + YAML frontend + CEL</span></a><a href="/scarab-ci/tech/adr/0010-forge-integration/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0010. Forge integration: agnostic core, OIDC identity, in-repo config</span></a><a href="/scarab-ci/tech/adr/0011-durable-scheduler/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0011. Scheduling: durable admission control</span></a><a href="/scarab-ci/tech/adr/0012-api-surface/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0012. API surface: REST/OpenAPI + SSE + internal gRPC</span></a><a href="/scarab-ci/tech/adr/0013-history-and-observability/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0013. History &amp; observability: state tables + append-only event log</span></a><a href="/scarab-ci/tech/adr/0014-secrets/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0014. Secrets: envelope-encrypted PG + pluggable providers</span></a><a href="/scarab-ci/tech/adr/0015-supply-chain-oidc/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0015. Supply-chain: Scarab as OIDC issuer + provenance-by-construction</span></a><a href="/scarab-ci/tech/adr/0016-code-architecture/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0016. Code architecture: hexagonal + adapter crates + converged binary</span></a><a href="/scarab-ci/tech/adr/0017-testing-strategy/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0017. Correctness &amp; testing strategy</span></a><a href="/scarab-ci/tech/adr/0018-image-building/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0018. Container image building: rootless BuildKit</span></a><a href="/scarab-ci/tech/adr/0019-local-execution/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0019. Local execution: executor-local behind the Executor port</span></a><a href="/scarab-ci/tech/adr/0020-retry-and-failure/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0020. Retry &amp; failure taxonomy</span></a><a href="/scarab-ci/tech/adr/0021-double-effect-fencing/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0021. Double-effect hazard: fencing tokens + idempotency contract</span></a><a href="/scarab-ci/tech/adr/0022-upgrades-and-versioning/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0022. Upgrades &amp; schema evolution: version-tolerant from day one</span></a><a href="/scarab-ci/tech/adr/0023-dag-shape/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0023. DAG shape: static matrix v1, dynamic reserved</span></a><a href="/scarab-ci/tech/adr/0024-environments/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0024. Environments: a built-in entity with protection rules</span></a><a href="/scarab-ci/tech/adr/0025-cross-pipeline-orchestration/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0025. Cross-pipeline orchestration: nest vs trigger</span></a><a href="/scarab-ci/tech/adr/0026-resource-and-placement/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0026. Resource &amp; placement model</span></a><a href="/scarab-ci/tech/adr/0027-restart-semantics/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0027. Restart semantics: content-addressed smart invalidation</span></a><a href="/scarab-ci/tech/adr/0028-ui-stack/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0028. UI stack: SolidJS + TS + generated client</span></a><a href="/scarab-ci/tech/adr/0029-workspace-cas/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0029. Workspace content-addressing: per-file merkle CAS</span></a><a href="/scarab-ci/tech/adr/0030-operational-defaults/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0030. Operational defaults</span></a><a href="/scarab-ci/tech/adr/0031-pure-computation-deps/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0031. Purity means no I/O, not no dependencies: pure-computation crates allowed</span></a><a href="/scarab-ci/tech/adr/0032-slices-3-5-implementation-decisions/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0032. Slice 3–5 implementation decisions (forge, identity, scheduler, gates, secrets, OIDC, BuildKit)</span></a><a href="/scarab-ci/tech/adr/0033-transitive-skip/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0033. Transitive skip: a guarded-off step skips its descendants</span></a><a href="/scarab-ci/tech/adr/0034-external-gate-token/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0034. External-gate release: HMAC token</span></a><a href="/scarab-ci/tech/adr/0035-explicit-outputs/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0035. Explicit workspace `outputs:`</span></a><a href="/scarab-ci/tech/adr/0036-local-execution-dev-backend/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0036. Local execution: a non-production dev/CLI backend (amends 0005)</span></a><a href="/scarab-ci/tech/adr/0037-environment-governance/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0037. Environment governance: scoped secrets, approval-as-gate, admission at point-of-use</span></a><a href="/scarab-ci/tech/adr/0038-invoke-and-local-reuse/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0038. `invoke` is compile-time inlining; local reuse via `.scarab/lib`, third-party reuse via OCI images</span></a><a href="/scarab-ci/tech/adr/0039-privileged-images/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0039. Privileged step images: hardened baseline + governed capability grants per Environment</span></a><a href="/scarab-ci/tech/adr/0040-documentation-site/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0040. Documentation site: Astro Starlight, in-repo, DESIGN.md-branded</span></a><a href="/scarab-ci/tech/adr/0041-named-results-and-interpolation/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0041. Named step results + launch-time interpolation (`${{ outputs.&lt;id&gt;.&lt;name&gt; }}`)</span></a><a href="/scarab-ci/tech/adr/0042-trusted-egress-sidecar/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0042. Trusted per-Pod egress sidecar → fence-scoped results API → Postgres</span></a><a href="/scarab-ci/tech/adr/0043-launch-parameters-and-manual-dispatch/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0043. Launch parameters + manual dispatch as a repo-aware trigger</span></a><a href="/scarab-ci/tech/adr/0044-protection-ref-vs-read-ref/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0044. Branch protection matches a symbolic ref, not the commit SHA</span></a><a href="/scarab-ci/tech/adr/0045-source-provisioning/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0045. Source provisioning: the `clone` step kind</span></a><a href="/scarab-ci/tech/adr/0046-forge-auth-and-multi-adapter/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0046. Forge auth is adapter-internal; GitHub + Forgejo adapters in v1</span></a><a href="/scarab-ci/tech/adr/0047-retry-classification-and-attempt-model/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0047. Retry classification, attempt/fence model, and dead-letter (implements 0020)</span></a><a href="/scarab-ci/tech/adr/0048-fail-closed-startup/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0048. Fail-closed startup: validated config, boot refusal, mandatory Postgres</span></a><a href="/scarab-ci/tech/adr/0049-identity-and-access/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0049. Identity &amp; access: forge-agnostic authn, Scarab-native RBAC</span></a><a href="/scarab-ci/tech/adr/0050-retention-and-gc/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0050. Retention &amp; GC: mark-sweep CAS, lifecycle-keyed eligibility</span></a><a href="/scarab-ci/tech/adr/0051-multi-replica-operation/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0051. Multi-replica operation: tail lease, replica-agnostic SSE, shared OIDC key</span></a><a href="/scarab-ci/tech/adr/0052-artifacts/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0052. Artifacts: a dedicated per-run store, convention-emitted</span></a><a href="/scarab-ci/tech/adr/0053-observability-and-lifecycle/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0053. Observability &amp; lifecycle: metrics, structured logs, readiness, graceful shutdown</span></a><a href="/scarab-ci/tech/adr/0054-product-surface-serving/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0054. Product surface: embedded UI, run cancellation, API/CLI truthfulness</span></a><a href="/scarab-ci/tech/adr/0055-placement-profiles/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0055. Placement profiles: named profiles + baseline + governed `k8s_overlay`</span></a><a href="/scarab-ci/tech/adr/0056-run-takes-and-attempt-grain-evidence/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0056. Run Takes and attempt-grain evidence</span></a><a href="/scarab-ci/tech/adr/0057-run-provenance-trigger-context/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0057. Run provenance: trigger context and origin details</span></a><a href="/scarab-ci/tech/adr/0058-runtime-service-containers/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0058. Runtime service containers: co-located Sidecar (default) + Run-scoped Shared (opt-in)</span></a><a href="/scarab-ci/tech/adr/0059-tick-fault-isolation/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0059. Per-run tick fault isolation + bounded per-run failures</span></a><a href="/scarab-ci/tech/adr/0060-org-settings-connections-and-secret-management/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0060. Org settings: connection lifecycle, org/env secret editing, IaC-or-UI connections</span></a><a href="/scarab-ci/tech/adr/0061-workspace-data-path/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0061. Workspace data path: workspace service + node driver, lazy materialisation</span></a><a href="/scarab-ci/tech/adr/0062-workspace-export-lazy-without-node-driver/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0062. Workspace export: lazy materialisation without a node driver</span></a><a href="/scarab-ci/tech/adr/0063-step-logs-on-the-data-depot/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0063. Step logs live on the Data Depot, and the workspace service is renamed</span></a><a href="/scarab-ci/tech/adr/0064-durability-tiering-and-the-write-path/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0064. Durability tiering and the write path: warm-first, flush before `Succeeded`, and durability comes from the backing store</span></a><a href="/scarab-ci/tech/adr/0065-retention-cache-and-rederivation/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0065. Retention, Cache, and re-derivation: keep less, recompute on request, and let the operator tune it</span></a><a href="/scarab-ci/tech/adr/0066-the-depot-is-a-cache/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0066. The Depot is a cache: HA, warm-only, and what each costs</span></a><a href="/scarab-ci/tech/adr/0067-the-pack-is-the-record/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0067. The pack is the record: mandatory dependencies, a direct write path, and a self-describing bucket</span></a><a href="/scarab-ci/tech/adr/0068-the-infra-observer/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0068. The infra observer: narrating why a step has no logs</span></a><a href="/scarab-ci/tech/adr/0069-identity-links/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0069. Identity links: one Principal, many provider identities, pinned by immutable id</span></a><a href="/scarab-ci/tech/adr/0070-deployments-as-a-vendor-neutral-record/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0070. Deployments as a vendor-neutral record: what is live, not who approved</span></a><a href="/scarab-ci/tech/adr/0071-org-level-environments/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0071. Org-level Environments: a place that decides who may deploy into it</span></a><a href="/scarab-ci/tech/adr/0072-plugins-a-governed-extension-point/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0072. Plugins: a second, governed extension point beside Steps</span></a><a href="/scarab-ci/tech/adr/0073-step-up-confirmation/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0073. Step-up confirmation: a human confirms the exact action with a passkey</span></a><a href="/scarab-ci/tech/adr/0074-deployments-leave-core/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0074. Deployments leave core: Scarab governs the Run that deploys, the CD tool owns what is live</span></a><a href="/scarab-ci/tech/adr/0075-policy-engine/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0075. One policy engine for every governance rule: typed settings and CEL compile to a Policy IR</span></a><a href="/scarab-ci/tech/adr/0076-libraries-and-plugins-through-invoke/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0076. Libraries and plugins through `invoke`: installed YAML libraries, plugins as Principals that resolve gates</span></a><a href="/scarab-ci/tech/adr/0077-end-to-end-fault-and-agent-driven-testing/" aria-current="page" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0077. End-to-end, fault and agent-driven testing: one invariant checker, a few fault scenarios on a throwaway cluster, and a red-team agent that only writes tests</span></a><a href="/scarab-ci/tech/adr/0078-the-environment-adds-its-approval-gate/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0078. The Environment adds its approval gate</span></a><a href="/scarab-ci/tech/adr/0079-scarab-authority-needs-scarab-proof/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0079. Scarab-native authority moves only on Scarab-level proof</span></a><a href="/scarab-ci/tech/adr/readme/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">Architecture Decision Records</span></a></div></div><a href="/scarab-ci/tech/context/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">Thesis &amp; language (CONTEXT)</span></a></div></div></div><div class="sidebar-fade-bottom astro-5xeag62i"></div></div></div></aside><script type="module">var e=document.getElementById(`starlight__sidebar`),t=e?.querySelector(`sl-sidebar-state-persist`),n=`sl-sidebar-state`,r=()=>{let r=[],i=t?.dataset.hash||``;try{let e=sessionStorage.getItem(n),t=JSON.parse(e||`{}`);Array.isArray(t.open)&&t.hash===i&&(r=t.open)}catch{}return{hash:i,open:r,scroll:e?.scrollTop||0}},i=e=>{try{sessionStorage.setItem(n,JSON.stringify(e))}catch{}},a=()=>i(r()),o=(e,t)=>{let n=r();n.open[t]=e,i(n)};t?.addEventListener(`click`,e=>{if(!(e.target instanceof Element))return;let t=e.target.closest(`summary`)?.closest(`details`);if(!t)return;let n=t.querySelector(`sl-sidebar-restore`),r=parseInt(n?.dataset.index||``);isNaN(r)||o(!t.open,r)}),addEventListener(`visibilitychange`,()=>{document.visibilityState===`hidden`&&a()}),addEventListener(`pageHide`,a);</script><main class="container-main astro-c4hhlov6" data-slot="docs"><div class="main astro-c4hhlov6"><main data-pagefind-body class="astro-vdxcvpsm" lang="en" dir="ltr"><scarab-version-notice data-root="/scarab-ci/" data-base="/scarab-ci/" data-version="v0.3" data-pagefind-ignore="true" hidden="true" class="astro-lnhkisss">You are reading the docs for <strong class="astro-lnhkisss">v0.3</strong>. <a href="/scarab-ci/" class="astro-lnhkisss">The latest release is <span data-latest class="astro-lnhkisss"></span> →</a></scarab-version-notice><script type="module" src="/scarab-ci/_astro/VersionBanner.astro_astro_type_script_index_0_lang.DW4M5yKX.js"></script><div data-slot="doc-title" class="astro-5dl4r4d3"><div data-slot="doc-title-header" class="astro-5dl4r4d3"><h1 id="_top" class="astro-5dl4r4d3">0077. End-to-end, fault and agent-driven testing: one invariant checker, a few fault scenarios on a throwaway cluster, and a red-team agent that only writes tests</h1><div data-slot="doc-title-actions" class="astro-5dl4r4d3"><a data-slot="button" data-size="icon-md" href="/scarab-ci/tech/adr/0076-libraries-and-plugins-through-invoke/" class="astro-i6idhh3o link-button secondary astro-5dl4r4d3"><svg aria-hidden="true" class="astro-5dl4r4d3 astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M17 11H9.41l3.3-3.29a1.004 1.004 0 1 0-1.42-1.42l-5 5a1 1 0 0 0-.21.33 1 1 0 0 0 0 .76 1 1 0 0 0 .21.33l5 5a1.002 1.002 0 0 0 1.639-.325 1 1 0 0 0-.219-1.095L9.41 13H17a1 1 0 0 0 0-2Z"/></svg></a><a data-slot="button" data-size="icon-md" href="/scarab-ci/tech/adr/0078-the-environment-adds-its-approval-gate/" class="astro-i6idhh3o link-button secondary astro-5dl4r4d3"><svg aria-hidden="true" class="astro-5dl4r4d3 astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M17.92 11.62a1.001 1.001 0 0 0-.21-.33l-5-5a1.003 1.003 0 1 0-1.42 1.42l3.3 3.29H7a1 1 0 0 0 0 2h7.59l-3.3 3.29a1.002 1.002 0 0 0 .325 1.639 1 1 0 0 0 1.095-.219l5-5a1 1 0 0 0 .21-.33 1 1 0 0 0 0-.76Z"/></svg></a></div></div><!--  --></div><div class="markdown-wrapper astro-q6e3s5kt"><div class="sl-markdown-content astro-q6e3s5kt"><ul>
+<li><strong>Status:</strong> Accepted (2026-11-01)</li>
+<li><strong>Date:</strong> 2026-10-31</li>
+<li><strong>Deciders:</strong> thulasi.ram (architect)</li>
+<li><strong>Builds on:</strong> <a href="0017-testing-strategy.md">0017</a> (classical, lean,
+grow-from-bugs; the durability exception; the feature-acceptance addendum). This ADR
+enlarges 0017’s durability exception within limits and does not change 0017.</li>
+<li><strong>Relates:</strong> <a href="0011-durable-scheduler.md">0011</a> (scheduler lease),
+<a href="0021-double-effect-fencing.md">0021</a> (fences), <a href="0059-tick-fault-isolation.md">0059</a>
+(tick errors), <a href="0061-workspace-data-path.md">0061</a> and
+<a href="0066-the-depot-is-a-cache.md">0066</a> (the Data Depot), <a href="0063-step-logs-on-the-data-depot.md">0063</a>
+and <a href="0067-the-pack-is-the-record.md">0067</a> (logs and packs in object storage),
+<a href="0076-libraries-and-plugins-through-invoke.md">0076</a> (clone library, <code dir="auto">forge_token</code>, yank,
+plugin gates)</li>
+</ul>
+<div class="sl-heading-wrapper level-h2"><h2 id="context">Context</h2><a class="sl-anchor-link" href="#context"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Context”</span></a></div>
+<p>The owner’s direction (2026-10-31):</p>
+<ul>
+<li>Everything except external SaaS dependencies (the GitHub App and GitHub OAuth) is tested
+end to end on a real local stack.</li>
+<li>A few Jepsen-style fault tests, so that no broad class of failure goes untested.</li>
+<li>An <code dir="auto">--agentic</code> mode on <code dir="auto">just chaos</code>, <code dir="auto">just e2e</code> and <code dir="auto">just security</code>, where a red-team
+agent watches events and logs and drives scenarios.</li>
+</ul>
+<p>An audit of that proposal (read-only, 2026-10-31, against <code dir="auto">origin/main</code> @ 85309670) found
+the deterministic part worth building and the agent-driven chaos part not worth building
+yet. This ADR adopts the audit’s conclusions with the corrections noted below. The facts
+it rests on, checked again on <code dir="auto">origin/main</code> @ 71af72bc:</p>
+<p><strong>The stack tier is red and has no triage loop.</strong> The one stack-grain crash test,
+<code dir="auto">crash_resume_completes_exactly_once</code> (<code dir="auto">crates/scarab-e2e/tests/crash_resume.rs</code>), failed
+every nightly <code dir="auto">e2e</code> run from 1 to 19 October. It passed once on
+<code dir="auto">fix/e2e-crash-resume-workspace-env</code> (run 39224071150), which is merged, and failed again on
+main on 26 October (run 40288915802): after the SIGKILL and restart the Run stays
+<code dir="auto">running</code> with <code dir="auto">slow:running(x1)</code> and <code dir="auto">second:pending(x0)</code> until the 240 s wait in
+<code dir="auto">crates/scarab-e2e/tests/support/mod.rs:188</code> gives up. <code dir="auto">e2e.yml</code> was cut to weekly for this
+reason (<code dir="auto">.github/workflows/e2e.yml:7-10</code>). The <code dir="auto">kind</code> workflow is also red on main (run
+41185254634, 2026-10-31): <code dir="auto">kind load</code> fails in <code dir="auto">ctr images import --all-platforms</code>.
+<a href="../positioning.md">positioning.md</a> already says the live-Pod crash test “doesn’t pass yet”.
+More scenarios on a tier nobody triages add more red jobs; the cost of a fault tier is the
+triage, not the authoring.</p>
+<p><strong>Most races in this codebase are races between transactions on one Postgres.</strong> They are
+cheaper and deterministic in-process: <code dir="auto">crates/scarab-db-postgres/tests/durability_guard.rs</code>
+models a crash as “drop scheduler A, build scheduler B over the same Postgres”, with
+<code dir="auto">FakeClock</code> and <code dir="auto">FakeExecutor</code>. The code red teams (A1-A7, R2-E1..E8, <code dir="auto">202ee19c</code> atomic
+fenced gate waits) found most of the fixed bugs in this class and pinned them there. The
+stack sees what in-process tests cannot: the real Pod lifecycle, the Depot over HTTP with
+ClusterIP scatter and S3 multipart, the sqlx pool under TCP faults, and a process that dies
+in the middle of I/O.</p>
+<p><strong>The live N&gt;1 runs found what acceptance tests missed.</strong> git-bug <code dir="auto">afb13c2</code> (a drain’s
+parallel PUTs scatter across Depot replicas and the POST-receiving replica answers 422 for
+good) passed the “two routers, one Postgres, one bucket” acceptance test and showed up only
+on a live two-replica run. Only the dogfood and that run have ever used more than one
+replica.</p>
+<p><strong>Some proposed invariants do not hold on main as written:</strong></p>
+<ul>
+<li>“Every minted forge token is revoked”: on main nothing is minted that could be revoked.
+The Forgejo checkout credential is the admin’s configured token
+(<code dir="auto">crates/scarab-forge-forgejo/src/lib.rs:775-790</code>); workspace and results tokens are
+stateless HMAC with a TTL (<code dir="auto">crates/scarab-executor-k8s/src/workspace_token.rs:268</code>).
+ADR-0076 step 3 (on <code dir="auto">feat/plugin-gates</code>) adds the per-Attempt mint: the forge credential
+lives in a per-unit k8s Secret, <code dir="auto">take_forge_credential</code> reads it back and deletes it when
+the Attempt ends, and only a <code dir="auto">minted</code> credential (GitHub App mode) is revoked, through
+<code dir="auto">DELETE /installation/token</code>. A long-lived Forgejo or PAT token is removed and never
+revoked.</li>
+<li>“At most one concurrency slot holder” cannot fail as a snapshot: <code dir="auto">concurrency_slots</code> has
+<code dir="auto">group_key TEXT PRIMARY KEY</code> (<code dir="auto">crates/scarab-db-postgres/migrations/0008_concurrency.sql:15</code>),
+and the table is updated in place with no event.</li>
+<li>“A plugin never resolves a gate it does not own” tests a feature that is not on main
+(ADR-0076 step 4), and it is an authorization rule.</li>
+</ul>
+<p><strong>A crash between the two halves of Run creation is not reclaimed.</strong> <code dir="auto">begin_run_creation</code>
+inserts the Run with <code dir="auto">creating = TRUE</code>; <code dir="auto">finish_run_creation</code> clears it
+(<code dir="auto">crates/scarab-db-postgres/src/lib.rs:200-238</code>, migration <code dir="auto">0069_run_creating.sql</code>). The
+scheduler’s work list skips <code dir="auto">creating</code> rows (<code dir="auto">lib.rs:1392</code>). Nothing else reads or clears
+the flag, so a SIGKILL between the two leaves the Run Pending and invisible to the
+scheduler. git-bug <code dir="auto">ccbf7fe</code> (open) proposes a sweeper.</p>
+<p><strong>Leadership is a Postgres lease.</strong> <code dir="auto">is_leader</code> (<code dir="auto">crates/scarab-engine/src/scheduler.rs:2261</code>)
+re-takes a 30 s lease (<code dir="auto">scheduler.rs:2067</code>) whose expiry is computed from Postgres <code dir="auto">now()</code>
+(<code dir="auto">crates/scarab-db-postgres/src/lib.rs:2464</code>), then acts. A leader paused past the TTL
+resumes and acts once more before its next check. Whether row-level checks catch that write
+is what a pause test finds out.</p>
+<p><strong>The local credentials are within reach of anything that runs here.</strong> <code dir="auto">.envrc</code> (untracked)
+pins <code dir="auto">current-context: colima</code> through an overlay but appends <code dir="auto">~/.kube/config</code>, so every
+production context is one <code dir="auto">--context</code> flag away, and EKS contexts authenticate through
+<code dir="auto">~/.aws</code>. <code dir="auto">kubectx</code> is installed and changes the global current context.
+<code dir="auto">deploy/local-helm/deploy.sh:51-52</code> checks the context once and then runs about 20
+commands. <code dir="auto">just kube-tests</code> reads <code dir="auto">gh auth token</code> (<code dir="auto">Justfile:482</code>). A context name is set by
+the user, so a check on the name proves nothing about the cluster.</p>
+<div class="sl-heading-wrapper level-h2"><h2 id="decision">Decision</h2><a class="sl-anchor-link" href="#decision"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Decision”</span></a></div>
+<div class="sl-heading-wrapper level-h3"><h3 id="1-four-tiers-one-oracle">1. Four tiers, one oracle</h3><a class="sl-anchor-link" href="#1-four-tiers-one-oracle"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “1. Four tiers, one oracle”</span></a></div>
+<p>ADR-0017’s tiers stay: <strong>unit</strong>, <strong>functional</strong> (real router and engine in-process, fakes
+at ports, real Postgres), <strong>kind</strong> (executor against a real apiserver) and <strong>stack e2e</strong>.
+This ADR adds one tier and one tool:</p>
+<table>
+<thead>
+<tr>
+<th>Tier or tool</th>
+<th>Recipe</th>
+<th>Stack</th>
+<th>What belongs there</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>functional</td>
+<td><code dir="auto">just test</code></td>
+<td>in-process, real Postgres</td>
+<td>every race between transactions on one Postgres, every authorization rule</td>
+</tr>
+<tr>
+<td>stack e2e</td>
+<td><code dir="auto">just e2e</code></td>
+<td>proc mode: compose Postgres and MinIO, kind, <code dir="auto">scarab-server</code> and the Depot as host processes</td>
+<td>every feature end to end, except the GitHub App and GitHub OAuth</td>
+</tr>
+<tr>
+<td>forge e2e</td>
+<td><code dir="auto">just forgejo-verify</code></td>
+<td>proc mode plus a real Forgejo</td>
+<td>webhooks, bind, clone, statuses, and each ADR-0076 forge feature as it merges</td>
+</tr>
+<tr>
+<td>fault</td>
+<td><code dir="auto">just chaos</code></td>
+<td>a throwaway kind cluster with the real chart at 2 servers and 2 Depot replicas</td>
+<td>the ranked scenarios in §3</td>
+</tr>
+<tr>
+<td>security</td>
+<td><code dir="auto">just security</code></td>
+<td>proc mode plus Forgejo, two orgs</td>
+<td>probes with canary oracles (§6)</td>
+</tr>
+<tr>
+<td>red-team agent</td>
+<td><code dir="auto">--agentic</code> on the three recipes</td>
+<td>the same stacks</td>
+<td>finds candidate failures and writes them as replayable scenarios; gates nothing (§6, §7)</td>
+</tr>
+</tbody>
+</table>
+<p>“Everything except external SaaS” means: every feature whose path does not need GitHub.com
+has a stack e2e or forge e2e case. ADR-0017’s feature-acceptance rule decides when each case
+is due; this ADR does not add a land-time requirement beyond it. The GitHub App and OAuth
+adapters stay at the functional tier against a fake GitHub HTTP server, which is a true
+external under 0017. That includes the revocation call in ADR-0076’s <code dir="auto">forge_token</code>.</p>
+<p>A test runs at the cheapest tier that can see its failure. A transaction race found at the
+stack tier is reproduced and pinned at the functional tier; the stack scenario stays only if
+the functional test cannot see the failure.</p>
+<div class="sl-heading-wrapper level-h3"><h3 id="2-the-invariant-checker-is-the-shared-oracle">2. The invariant checker is the shared oracle</h3><a class="sl-anchor-link" href="#2-the-invariant-checker-is-the-shared-oracle"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “2. The invariant checker is the shared oracle”</span></a></div>
+<p>One checker, in the test harness (a library plus a binary, working name <code dir="auto">scarab-chaos</code>),
+reads the recorded state after a test or scenario and reports every invariant that does not
+hold. Every stack e2e test, fault scenario and security probe ends with a call to it. It
+replaces the hand-written end-of-test asserts in <code dir="auto">crash_resume.rs</code>, <code dir="auto">happy_path.rs</code> and the
+other stack e2e tests, so the suite gets shorter.</p>
+<p>Its inputs:</p>
+<ul>
+<li>the event log (<code dir="auto">events</code>) and the tables it projects into (<code dir="auto">runs</code>, <code dir="auto">step_runs</code>, <code dir="auto">attempts</code>);</li>
+<li>the Depot’s records (<code dir="auto">depot_packs</code>, <code dir="auto">depot_pack_members</code>, <code dir="auto">committed</code>,
+<code dir="auto">depot_fence_borrows</code>) and the objects in the bucket (HEAD and ranged GET);</li>
+<li>a Pod watcher in the harness: a kube watch on <code dir="auto">app.kubernetes.io/managed-by=scarab</code>
+that writes one JSONL line per change (UID, phase, container start and finish times,
+deletion), using the <code dir="auto">scarab.io/run</code>, <code dir="auto">scarab.io/step</code> and <code dir="auto">scarab.io/attempt</code> labels
+(<code dir="auto">crates/scarab-executor-k8s/src/lib.rs:4236-4238</code>);</li>
+<li>Forgejo’s commit statuses, when the scenario uses Forgejo.</li>
+</ul>
+<p>No product change is needed for any of these.</p>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Invariant</th>
+<th>Checked from</th>
+<th>Past bugs it would have caught</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>I1</td>
+<td><strong>(a)</strong> At most one Pod UID per Attempt fence. <strong>(b)</strong> Attempt N+1’s step container starts only after Attempt N’s container ended, or after N was journalled <code dir="auto">Lost</code> or superseded.</td>
+<td>Pod watcher, event log</td>
+<td>git-bug <code dir="auto">fd6e6d4</code> (orphaned Pod of a superseded Attempt), <code dir="auto">4c4ab5a1</code> (a stopped launch not torn down), ADR-0021’s double effect. The bound in (b) is an owner question.</td>
+</tr>
+<tr>
+<td>I2</td>
+<td>A Step that was ever <code dir="auto">Skipped</code> has no <code dir="auto">AttemptStarted</code> and no Pod.</td>
+<td>event log, Pod watcher</td>
+<td>No recorded escape. Kept because it is one query over data the checker already reads, and <code dir="auto">when:</code> exclusion is a promise users rely on.</td>
+</tr>
+<tr>
+<td>I3</td>
+<td>Every Run, including rows with <code dir="auto">creating = TRUE</code>, is terminal at the end of the scenario’s quiesce bound.</td>
+<td><code dir="auto">runs</code></td>
+<td>the red <code dir="auto">crash_resume</code>; git-bug <code dir="auto">9cdf38e</code> (Pod exits 0, step never settles); git-bug <code dir="auto">e140121</code> (a 20-30 s Depot outage dead-letters runs); <code dir="auto">77e6c429</code>, <code dir="auto">c2570c83</code> and git-bug <code dir="auto">ccbf7fe</code> (creation left half done)</td>
+</tr>
+<tr>
+<td>I4</td>
+<td>Every Succeeded Step’s <code dir="auto">output_snapshot</code> closure is in committed packs whose objects exist and whose byte ranges read back. A NULL snapshot passes. Membership may sit in another fence’s pack through <code dir="auto">depot_fence_borrows</code>. Run before retention TTLs expire.</td>
+<td>Depot tables, bucket</td>
+<td>git-bug <code dir="auto">afb13c2</code> (drain scatter, 422), git-bug <code dir="auto">ec294b7</code> (unrecorded cross-fence dependency), git-bug <code dir="auto">022aec8</code> (ghost pack session)</td>
+</tr>
+<tr>
+<td>I5</td>
+<td>Folding the event log with <code dir="auto">scarab-engine</code>’s fold gives the <code dir="auto">runs</code> and <code dir="auto">step_runs</code> rows.</td>
+<td>event log, tables</td>
+<td>git-bug <code dir="auto">586187a</code> (step terminal CAS and its journal entry in separate writes; fixed by <code dir="auto">edc5674c</code>), <code dir="auto">89505ace</code> (run transition, journal entry and status post in one commit)</td>
+</tr>
+<tr>
+<td>I6</td>
+<td>No two Runs in one concurrency group have step Pods running at the same time.</td>
+<td>Pod watcher, <code dir="auto">runs.concurrency_group</code></td>
+<td>git-bug <code dir="auto">5120335</code> (cross-tenant slot key), <code dir="auto">ad7a4950</code> (a cancelled holder holds until its unit is gone), <code dir="auto">deed1499</code> (auto-cancel writes the Run’s cancel intent)</td>
+</tr>
+<tr>
+<td>I7</td>
+<td>At most one <code dir="auto">GateResolved</code> per (Step, Attempt).</td>
+<td>event log</td>
+<td><code dir="auto">202ee19c</code> (atomic fenced gate waits, gate reject)</td>
+</tr>
+<tr>
+<td>I8</td>
+<td>After quiesce, no Pod, Secret, Service or NetworkPolicy carries a terminal Run’s label. Once ADR-0076 step 3 merges, this includes the per-unit forge-token Secret.</td>
+<td>kube API</td>
+<td>git-bug <code dir="auto">fd6e6d4</code>, <code dir="auto">15b0afe0</code> and <code dir="auto">fbde745a</code> (services not torn down), <code dir="auto">36a533da</code> and <code dir="auto">4c4ab5a1</code> (failed launches), git-bug <code dir="auto">e10cf7e</code> (sidecar Pod lingers after a terminal poll)</td>
+</tr>
+<tr>
+<td>I9</td>
+<td>Every terminal Attempt’s log bytes are in object storage (ADR-0067 §3).</td>
+<td><code dir="auto">attempts</code>, bucket</td>
+<td>No recorded escape at stack grain. Kept because logs moved off the control plane (ADR-0063) and only the stack exercises that path.</td>
+</tr>
+<tr>
+<td>I10</td>
+<td>No <code dir="auto">committed = FALSE</code> pack row older than the linger, and no committed pack row without its object.</td>
+<td>Depot tables, bucket</td>
+<td>git-bug <code dir="auto">ad79c90</code> (multipart debris, packs never deleted), git-bug <code dir="auto">022aec8</code></td>
+</tr>
+<tr>
+<td>I11</td>
+<td>The last commit status Forgejo holds for a SHA matches the Run’s terminal state.</td>
+<td>Forgejo API</td>
+<td><code dir="auto">29dbd64e</code> (three Runs racing over one commit status), <code dir="auto">b918b345</code> (a stale generation’s status post)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>The quiesce bound</strong> is computed per scenario, not guessed: lease TTL (30 s) + the
+workload’s step time + <code dir="auto">WS_DRAIN_ESCALATION_MS</code> (5 minutes,
+<code dir="auto">crates/scarab-executor-k8s/src/lib.rs:3934</code>) for any scenario that faults the Depot. A
+checker without the formula reports liveness failures that are not bugs.</p>
+<p><strong>Ordering.</strong> <code dir="auto">events.seq</code> is a <code dir="auto">BIGSERIAL</code> taken at insert, not at commit, and <code dir="auto">at</code> comes
+from each replica’s clock. The checker orders events by <code dir="auto">seq</code> only within one Run. Cross-Run
+ordering, where a scenario needs it, uses <code dir="auto">pg_xact_commit_timestamp(xmin)</code>, with the fault
+cluster’s Postgres started with <code dir="auto">track_commit_timestamp = on</code>.</p>
+<p><strong>What changed from the proposal.</strong> “Every minted token is revoked” becomes I8’s Secret
+check, which holds for Forgejo too. The revocation call itself only happens in GitHub App
+mode, so it is a functional test against the fake GitHub server. “At most one slot holder”
+becomes I6’s Pod-overlap form, which is the property users want (“serialize prod”). Plugin
+gate ownership moves to a functional test of the <code dir="auto">PluginGateResolver</code> role when ADR-0076
+step 4 merges.</p>
+<p><strong>Known slow paths are not failures.</strong> At Depot <code dir="auto">replicaCount &gt; 1</code>, cache restores almost
+always miss (git-bug <code dir="auto">12e2f6b</code>). The checker treats a cache miss as correct; whether that
+issue blocks the 2+2 topology is an owner question.</p>
+<div class="sl-heading-wrapper level-h3"><h3 id="3-fault-scenarios-ranked">3. Fault scenarios, ranked</h3><a class="sl-anchor-link" href="#3-fault-scenarios-ranked"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “3. Fault scenarios, ranked”</span></a></div>
+<p>A scenario is kept only while it names real bugs it would have caught, or a finding
+predicted from the code. Each is a seeded, replayable file: workload, faults and timing,
+quiesce bound.</p>
+<table>
+<thead>
+<tr>
+<th>Rank</th>
+<th>Scenario</th>
+<th>Where</th>
+<th>Precedent</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0</td>
+<td><code dir="auto">crash_resume</code> green, then kept green</td>
+<td><code dir="auto">just e2e</code></td>
+<td>red on main, 2026-10-26</td>
+<td>Prerequisite for the rest. Moves onto the checker.</td>
+</tr>
+<tr>
+<td>1</td>
+<td>Two Depot replicas; delete one Pod (grace 0) mid-drain, and in a second run mid-feed</td>
+<td><code dir="auto">just chaos</code></td>
+<td>git-bugs <code dir="auto">afb13c2</code>, <code dir="auto">e140121</code>, <code dir="auto">022aec8</code>, <code dir="auto">ad79c90</code>, <code dir="auto">ec294b7</code></td>
+<td>Highest yield. A toxiproxy reset in front of MinIO mid-multipart folds in here.</td>
+</tr>
+<tr>
+<td>2</td>
+<td>Two server replicas at steady state, then SIGKILL one mid-Run</td>
+<td><code dir="auto">just chaos</code></td>
+<td>git-bugs <code dir="auto">9cdf38e</code>, <code dir="auto">98ea804</code> (artifacts uploaded, never indexed); <code dir="auto">51d53707</code> (results ingest for a non-frontier Attempt); readoption</td>
+<td>Part of the yield comes from running two replicas at all, with no fault.</td>
+</tr>
+<tr>
+<td>3</td>
+<td>Postgres partition and ambiguous commit through toxiproxy (<code dir="auto">timeout</code>, <code dir="auto">reset_peer</code>, <code dir="auto">limit_data</code> to cut a COMMIT before its ack)</td>
+<td><code dir="auto">just chaos</code></td>
+<td>none: the fault has never been injected</td>
+<td>Separate proxies for the control plane and the Depot, which also connects to Postgres (ADR-0067 §2). Asks: is a retried <code dir="auto">commit_step_transition</code> after an unknown commit a no-op; does the sqlx pool recover; do tick errors stay contained (ADR-0059).</td>
+</tr>
+<tr>
+<td>4</td>
+<td>Leader paused (SIGSTOP) past the lease TTL, then resumed</td>
+<td>proc mode, in the harness</td>
+<td><code dir="auto">e85f927e</code>, <code dir="auto">33a67053</code> (plugin-runtime lease outlived by a pass)</td>
+<td>In helm mode the server is PID 1 with no init (<code dir="auto">docker/server/Dockerfile:92</code>), so it ignores SIGSTOP sent inside its PID namespace. Proc mode needs nothing new. Checked with I1 and I5.</td>
+</tr>
+<tr>
+<td>5</td>
+<td>A concurrency group under parallel dispatch, then kill the holder’s server</td>
+<td><code dir="auto">just chaos</code></td>
+<td>git-bug <code dir="auto">5120335</code>, <code dir="auto">ad7a4950</code>, <code dir="auto">deed1499</code></td>
+<td>Only the k8s-visible part: the old holder’s Pods still terminating while the new holder’s start (I6).</td>
+</tr>
+<tr>
+<td>6</td>
+<td>Kill mid-Run-creation through a failpoint</td>
+<td><code dir="auto">just chaos</code></td>
+<td><code dir="auto">77e6c429</code>, <code dir="auto">c2570c83</code>; git-bug <code dir="auto">ccbf7fe</code></td>
+<td>Predicted finding: the Run stays <code dir="auto">creating = TRUE</code> (Context). Fix and pin it at the functional tier first; the stack scenario stays as a failpoint regression.</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Cut:</strong></p>
+<ul>
+<li><strong>The gate release-versus-reject race</strong> (<code dir="auto">202ee19c</code>, <code dir="auto">4d8f671f</code>): a CAS race on one
+Postgres. A functional test with two concurrent API calls is deterministic and runs in
+milliseconds.</li>
+<li><strong>Plugin gate ownership:</strong> an authorization rule; functional tier (§2).</li>
+<li><strong>Clock skew:</strong> <code dir="auto">CLOCK_REALTIME</code> has no namespace, so every Pod on one kind node sees the
+same clock; per-Pod skew needs Chaos Mesh TimeChaos or <code dir="auto">libfaketime</code> in the image. Leases
+use Postgres <code dir="auto">now()</code>, and the past clock bugs (<code dir="auto">9f28b666</code>, <code dir="auto">9d9daf1b</code>) were fixed and
+pinned with <code dir="auto">FakeClock</code>, which is the right tier.</li>
+<li><strong>Argo CD in the fault cluster:</strong> 1 to 1.5 GiB and nothing for the durability invariants.
+A separate, rarely run <code dir="auto">just argocd-verify</code> (core install, no UI, no Dex) covers
+<code dir="auto">wait-live</code> once ADR-0076 step 4 merges.</li>
+<li><strong>Chaos Mesh and Litmus:</strong> privileged daemons and 0.5 to 1 GiB on a laptop VM. A small
+kube-rs nemesis (Pod delete with grace 0), host signals and toxiproxy cover the faults
+above.</li>
+</ul>
+<p><strong>The nemesis</strong> is code in the harness: kube-rs Pod deletes, SIGKILL and SIGSTOP/SIGCONT on
+host processes, and a toxiproxy client. A scenario run is driven from a seed and writes its
+actions to a scenario file, so a failing run replays without the original timing luck.
+Random-timing scenarios mean something only over repeats; a local nightly loop over the
+kept set is more useful than one pass.</p>
+<div class="sl-heading-wrapper level-h3"><h3 id="4-where-just-chaos-runs">4. Where <code dir="auto">just chaos</code> runs</h3><a class="sl-anchor-link" href="#4-where-just-chaos-runs"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “4. Where just chaos runs”</span></a></div>
+<p>Replaced by the <a href="#amendment-2026-11-01-one-kind-cluster-one-release">Amendment (2026-11-01)</a>:
+<code dir="auto">just chaos</code> switches the one release on the shared kind cluster instead of creating a cluster.</p>
+<p><code dir="auto">just chaos</code> creates a throwaway kind cluster, <code dir="auto">scarab-chaos</code>, with its own kubeconfig file
+(the pattern of <code dir="auto">deploy/local-proc/up.sh</code> and <code dir="auto">deploy/local-proc/plugin-verify.sh:45-55</code>).
+It installs the real chart with <code dir="auto">replicaCount: 2</code> and <code dir="auto">workspace.replicaCount: 2</code>, plus
+Postgres (with <code dir="auto">track_commit_timestamp = on</code>), MinIO and toxiproxy, and Forgejo when a
+scenario checks I11. It deletes the cluster afterwards unless asked to keep it, as
+<code dir="auto">just forgejo-verify keep</code> does.</p>
+<ul>
+<li>It never runs in colima’s <code dir="auto">scarab</code> namespace, which holds the dogfood stack and its data.</li>
+<li>It never uses the ambient kubeconfig. Every command gets the cluster’s own file, and the
+recipe checks that file’s server URL and CA against the values recorded at creation.</li>
+<li>Binaries are built on the host and copied into a thin image. Building the server image
+inside a 2-CPU colima VM takes minutes per change.</li>
+<li>The real chart gives what proc mode cannot: Services, the Depot StatefulSet and its PVCs,
+and ClusterIP scatter across replicas.</li>
+</ul>
+<p>Scenario 0 and scenario 4 run in proc mode, where the harness owns the server process, as
+<code dir="auto">crash_resume.rs</code> does today.</p>
+<div class="sl-heading-wrapper level-h3"><h3 id="5-failpoints">5. Failpoints</h3><a class="sl-anchor-link" href="#5-failpoints"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “5. Failpoints”</span></a></div>
+<p>The windows for scenario 6 and for a kill “after the Pod exists, before the Attempt is
+recorded” are milliseconds wide. An external kill rarely lands in them; a <code dir="auto">thread::spawn</code>
+race in this repo missed its window 64 times out of 64. So Scarab gains a few named
+failpoints through the <code dir="auto">fail</code> crate, behind a cargo feature <code dir="auto">failpoints</code> that is off by
+default and absent from release images:</p>
+<ul>
+<li>after Pod create, before the Attempt record;</li>
+<li>between <code dir="auto">begin_run_creation</code> and <code dir="auto">finish_run_creation</code>;</li>
+<li>after a pack is sealed, before its <code dir="auto">committed</code> row;</li>
+<li>after the S3 multipart complete.</li>
+</ul>
+<p>The release image build checks that the feature is off. New points are added only with a
+scenario that uses them. These are the “deterministic simulation later” that ADR-0017’s
+ports allow for, applied to named points instead of a framework. This puts test-only code
+paths in product crates, so it is an owner question.</p>
+<div class="sl-heading-wrapper level-h3"><h3 id="6-the-red-team-agent">6. The red-team agent</h3><a class="sl-anchor-link" href="#6-the-red-team-agent"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “6. The red-team agent”</span></a></div>
+<p>The agent is not a test tier. It is a red team at stack grain, run by hand, and its only
+output is a candidate scenario file. It gates nothing, and it never decides whether an
+invariant holds: the checker does.</p>
+<p><strong>A finding counts</strong> only when at least 3 of 5 agent-free replays of its scenario file
+fail the checker. Findings are deduplicated by invariant and code site. A finding that
+counts becomes a deterministic test at the cheapest tier that shows it (§1), under 0017’s
+grow-from-bugs rule.</p>
+<p><strong>It starts with <code dir="auto">just security --agentic</code></strong>, because security probes have oracles that
+give a clear yes or no:</p>
+<ul>
+<li><strong>Canary secrets</strong> seeded in the secret store; any appearance in step logs, the event
+log or object storage is a finding.</li>
+<li><strong>A canary command</strong> that writes a marker file if injected text ever executes; the target
+is templating (<code dir="auto">${{ }}</code>, <code dir="auto">event.*</code> once ADR-0076 merges) and crafted launch parameters.</li>
+<li><strong>Forged and replayed webhooks:</strong> a Run created, or a 2xx, is a finding.</li>
+<li><strong>Cross-org reads and writes</strong> between two seeded orgs: any 2xx on the other org’s
+resources is a finding.</li>
+<li><strong>Fork pull requests:</strong> a secret or a write token reaching a fork Run is a finding.</li>
+</ul>
+<p>The deterministic <code dir="auto">just security</code> runs a fixed set of these probes; the agent extends them.</p>
+<p><strong>The second use is confirming a code red-team hypothesis live.</strong> The agent gets one
+hypothesis (“a window between X and Y at file:line”) and tries to show it on the stack.
+That is a bounded search with a named target.</p>
+<p><strong><code dir="auto">just chaos --agentic</code> and <code dir="auto">just e2e --agentic</code> come later, and only if the security
+mode’s yield justifies them</strong> (findings that pass the replay rule, per run and per dollar).
+For distributed faults the act-observe cycle takes minutes (30 s lease, 5-minute drain
+escalation), so 100 turns explore a few dozen interleavings, where a seeded random nemesis
+explores hundreds at no token cost. The pass-or-fail signal depends on a quiesce bound, and
+an agent will chase timeouts.</p>
+<p><strong>Tools.</strong> Each mode has a small typed menu. The menu calls the same nemesis and probe code
+as the deterministic recipes, so the agent’s action log is a scenario file. Tools return
+summaries and diffs, never full logs: raw log dumps can triple the token cost, and logs are
+untrusted input.</p>
+<div class="sl-heading-wrapper level-h3"><h3 id="7-agent-safety">7. Agent safety</h3><a class="sl-anchor-link" href="#7-agent-safety"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “7. Agent safety”</span></a></div>
+<p>These are requirements of the agentic mode, not guidance. A run that cannot meet one does
+not start.</p>
+<ol>
+<li><strong>The agent process holds no credentials.</strong> It runs with <code dir="auto">HOME</code> set to its run
+directory, and cannot read <code dir="auto">~/.kube</code>, <code dir="auto">~/.aws</code>, <code dir="auto">~/.ssh</code>, <code dir="auto">~/.config/gh</code> or
+<code dir="auto">~/.gitconfig</code>. The preferred form is a container with only the repository (read-only)
+and the run directory mounted; the lighter form is the Claude Code sandbox with
+deny-read rules for those paths.</li>
+<li><strong>Only the tool server holds a credential</strong>, and it is minted per run for the throwaway
+cluster: a namespace-scoped ServiceAccount token from TokenRequest, one-hour expiry, a
+Role that allows <code dir="auto">pods</code> get, list, watch and delete and <code dir="auto">pods/log</code> get. The tool server
+pins the API server URL (127.0.0.1 and the kind port) and the CA fingerprint recorded at
+cluster creation, and refuses to start on any mismatch. It never reads the admin
+kubeconfig after setup. For <code dir="auto">security</code>, it also holds Scarab API tokens for the two
+seeded orgs and a token for the throwaway Forgejo.</li>
+<li><strong>No shell.</strong> The tools are a local stdio MCP server, a subcommand of the harness
+(<code dir="auto">scarab-chaos mcp</code>). Claude Code runs headless (<code dir="auto">--print</code>) with <code dir="auto">--mcp-config</code> and
+<code dir="auto">--strict-mcp-config</code>, its built-in tools turned off with <code dir="auto">--tools</code>, and only the
+<code dir="auto">mcp__chaos__*</code> tools allowed. These flags exist in the installed CLI (checked
+2026-10-31); the recipe checks them again before each run. There is no “run command”
+tool.</li>
+<li><strong>Git goes only to the throwaway Forgejo.</strong> The tool server runs git with
+<code dir="auto">GIT_CONFIG_GLOBAL=/dev/null</code> and <code dir="auto">GIT_CONFIG_NOSYSTEM=1</code>, and fixes the remote URL
+itself; no tool takes a remote as an argument.</li>
+<li><strong>Network:</strong> the agent process reaches only the model API. The tool server reaches only
+127.0.0.1 and the kind network.</li>
+<li><strong>Caps:</strong> wall clock (60 minutes by default), spend (<code dir="auto">--max-budget-usd</code>) and a maximum
+action count, all set by the recipe.</li>
+<li><strong>Record:</strong> every tool call and result goes to <code dir="auto">actions.jsonl</code> in a gitignored run
+directory. That file is the replayable scenario.</li>
+<li><strong>Logs, Forgejo content and API responses are untrusted input.</strong> The fixed menu bounds
+what a prompt injection in them can do.</li>
+</ol>
+<div class="sl-heading-wrapper level-h3"><h3 id="8-ci">8. CI</h3><a class="sl-anchor-link" href="#8-ci"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “8. CI”</span></a></div>
+<p>Nothing in this ADR runs per pull request. Actions minutes are limited, and stacked pull
+requests already spend them (git-bug <code dir="auto">ba1cab5</code> proposes label-based skipping). The checker
+runs inside the existing weekly <code dir="auto">e2e.yml</code>, because it replaces that suite’s asserts. After
+<code dir="auto">crash_resume</code> has been green there for several weeks, at most one fault scenario (rank 1,
+the Depot replica kill) may join the weekly workflow. The agentic mode never runs in CI.</p>
+<div class="sl-heading-wrapper level-h3"><h3 id="9-how-this-fits-adr-0017">9. How this fits ADR-0017</h3><a class="sl-anchor-link" href="#9-how-this-fits-adr-0017"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “9. How this fits ADR-0017”</span></a></div>
+<ul>
+<li><strong>It is the durability exception, enlarged by evidence.</strong> Every kept scenario names the
+bugs it would have caught, or a predicted finding. A scenario with neither stays out.</li>
+<li><strong>The checker is the shared oracle, not a framework.</strong> It replaces hand-written asserts,
+and the suite gets shorter.</li>
+<li><strong>It stays classical:</strong> no mocks at the stack tiers; real Postgres, real Kubernetes, real
+Depot, real Forgejo. The GitHub App and OAuth are true externals and stay faked.</li>
+<li><strong>Races go down a tier.</strong> A race between transactions on one Postgres belongs to the
+functional tier.</li>
+<li><strong>The agent feeds grow-from-bugs.</strong> Its only output is a test.</li>
+<li><strong>Failpoints are the deferred simulation</strong>, limited to named points behind a feature.</li>
+</ul>
+<div class="sl-heading-wrapper level-h2"><h2 id="consequences">Consequences</h2><a class="sl-anchor-link" href="#consequences"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Consequences”</span></a></div>
+<ul>
+<li><code dir="auto">crash_resume</code> has to be green before any new fault scenario is written. Until then this
+ADR produces the checker and nothing else at the stack tier.</li>
+<li>The checker reads the event payloads and the Depot tables directly, so a schema change
+there also changes the checker. That is the price of an oracle that does not trust the
+API it checks.</li>
+<li>Scarab gains new dependencies: the <code dir="auto">fail</code> crate (behind a feature), toxiproxy in the fault
+cluster, and a kube watch in the harness. Product crates gain failpoint macros, if the
+owner accepts them.</li>
+<li><strong>Laptop resources.</strong> colima is 2 vCPU and 4 GiB today. The fault cluster’s working set
+without Argo CD is about 5 to 7 GiB (kind control plane 0.7-1 GiB; two servers 0.5-1 GiB;
+two Depot replicas 1-2 GiB; Postgres, MinIO and toxiproxy 0.6-0.8 GiB; step Pods 0.5-1.5
+GiB; Forgejo 0.3-0.5 GiB). colima needs about 6 vCPU and 10 GiB for fault runs, and
+colima’s own k3s, which runs the dogfood stack, is stopped during them. That leaves about
+6 GiB on a 16 GiB host, not enough for a workspace cargo build at the same time: build
+first, then run.</li>
+<li><strong>Wall time.</strong> Cluster and image setup 3 to 6 minutes with host-built binaries (about 15
+with an image built inside colima); 3 to 8 minutes per scenario including its quiesce
+bound; 45 to 90 minutes for the kept set.</li>
+<li><strong>Agent cost.</strong> About 100 turns with context growing to about 150k tokens: 10 to 15 MTok
+of input (mostly cache reads), 0.5 to 1.5 MTok uncached or cache writes, 0.1 to 0.2 MTok
+of output. At Claude Opus 5.5 rates ($4 in, $20 out, $0.20 cache read per MTok, checked
+2026-10-31) that is about $8 to $20 per run; Claude Sonnet 5.5 ($2, $10, $0.20) about $5
+to $12. On a Claude Code subscription it is usage quota instead of dollars.</li>
+<li><strong>Triage.</strong> A red fault scenario is a timing bug until shown otherwise, and costs a human
+hour or more to read. The replay rule and the checker keep agent findings from adding to
+that.</li>
+<li>Scenario 6’s predicted finding means git-bug <code dir="auto">ccbf7fe</code> gets fixed and pinned at the
+functional tier before the scenario is written.</li>
+</ul>
+<div class="sl-heading-wrapper level-h2"><h2 id="alternatives-considered">Alternatives considered</h2><a class="sl-anchor-link" href="#alternatives-considered"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Alternatives considered”</span></a></div>
+<ul>
+<li><strong>Run the fault tier in colima’s <code dir="auto">scarab</code> namespace.</strong> Rejected: it holds the dogfood
+stack and its data, and the recipes there trust the current context by name.</li>
+<li><strong>Use the ambient kubeconfig with a current-context check.</strong> Rejected: a context name is
+set by the user, the check is a TOCTOU window that <code dir="auto">kubectx</code> can cross, and the merged
+config keeps production contexts one flag away.</li>
+<li><strong>Chaos Mesh or Litmus.</strong> Rejected: privileged daemons and memory the laptop VM does not
+have, for faults a small nemesis and toxiproxy already cover.</li>
+<li><strong>A NetworkPolicy to partition Postgres.</strong> Rejected: it does not cut established
+connections tracked by conntrack. Toxiproxy does, and can also cut a COMMIT before its
+ack.</li>
+<li><strong>Elle or Knossos as the checker.</strong> Rejected: they check client-observed transactional
+histories (list-append, registers). Scarab’s history is a journal the server writes. We
+take Jepsen’s structure (generator, nemesis, checker over a recorded history) and its
+rule that the checker, not the test author, decides.</li>
+<li><strong>A full deterministic simulation (FoundationDB, TigerBeetle’s VOPR, Antithesis).</strong> Not
+now: the cheap version exists (<code dir="auto">FakeClock</code>, <code dir="auto">InMemoryDb</code>, <code dir="auto">FakeExecutor</code>,
+<code dir="auto">durability_guard.rs</code>), and Antithesis is commercial and sized for larger systems. A
+seeded interleaving explorer over two <code dir="auto">Scheduler</code> instances on one Postgres may find more
+races than the stack fault tier at lower cost; it would be its own decision.</li>
+<li><strong>Random external kills for the creation and launch windows.</strong> Rejected: the windows are
+milliseconds wide; failpoints land in them every time.</li>
+<li><strong>Clock skew per Pod with <code dir="auto">libfaketime</code>.</strong> Rejected: it changes the image under test, and
+the clock bugs found so far are covered with <code dir="auto">FakeClock</code>.</li>
+<li><strong>Agent-driven chaos first.</strong> Rejected: slow act-observe cycles, a quiesce-dependent
+oracle and a seeded random nemesis that explores more interleavings for free. Security
+probing has clear oracles and goes first.</li>
+<li><strong>An agent with a shell, or scripts behind an allowlisted Bash prefix.</strong> Rejected:
+argument and metacharacter injection make an allowlisted prefix a weak boundary, and a
+shell reaches every credential on the machine. A stdio MCP server is less code and a
+narrower interface.</li>
+<li><strong>Letting the agent judge findings.</strong> Rejected: an agent will report timeouts as bugs. The
+checker decides, through agent-free replays.</li>
+<li><strong>Running fault scenarios per pull request.</strong> Rejected: Actions minutes are limited, and a
+red timing test on every push buys no signal.</li>
+<li><strong>Keeping “every minted token is revoked” and “at most one slot holder” as stack
+invariants.</strong> Rejected (§2): the first has nothing to check on a Forgejo-only stack, the
+second is enforced by a primary key.</li>
+</ul>
+<div class="sl-heading-wrapper level-h2"><h2 id="implementation-horizon">Implementation horizon</h2><a class="sl-anchor-link" href="#implementation-horizon"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Implementation horizon”</span></a></div>
+<ol>
+<li><strong><code dir="auto">crash_resume</code> green, and the checker.</strong> Diagnose and fix the 26 October failure; build
+the checker with the invariants that main can check (I1-I7, I9-I11, I8 without the
+forge-token Secret) and the Pod watcher; move every stack e2e test onto it and delete the
+asserts it replaces. Restore the weekly <code dir="auto">e2e.yml</code> to green.</li>
+<li><strong>Depot kill (rank 1).</strong> <code dir="auto">just chaos</code> with the throwaway cluster, the real chart at 2+2,
+the kube-rs nemesis, seeded scenario files and replay; the MinIO reset mid-multipart.</li>
+<li><strong>Server kill (rank 2), leader pause (rank 4) and the concurrency holder kill (rank 5).</strong></li>
+<li><strong>Postgres faults (rank 3)</strong> through toxiproxy, with separate proxies for the control
+plane and the Depot.</li>
+<li><strong>Failpoints and the creation kill (rank 6),</strong> after git-bug <code dir="auto">ccbf7fe</code> is fixed and
+pinned at the functional tier.</li>
+<li><strong><code dir="auto">just security</code> and <code dir="auto">just security --agentic</code></strong> with §7’s safety design: the MCP tool
+server, the per-run credential, canary secrets, the canary command, the replay rule.
+Hypothesis confirmation uses the same tool server.</li>
+<li><strong>Later, if step 6’s yield justifies it:</strong> <code dir="auto">just chaos --agentic</code> and <code dir="auto">just e2e --agentic</code>.</li>
+</ol>
+<p>Alongside these steps: each ADR-0076 step extends <code dir="auto">just forgejo-verify</code> when it merges (the
+clone library, <code dir="auto">forge_token</code> and I8’s forge-token Secret, yank), and step 4 adds
+<code dir="auto">just argocd-verify</code> for <code dir="auto">wait-live</code>.</p>
+<div class="sl-heading-wrapper level-h2"><h2 id="open-questions-for-the-owner">Open questions for the owner</h2><a class="sl-anchor-link" href="#open-questions-for-the-owner"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Open questions for the owner”</span></a></div>
+<ol>
+<li><strong>I1(b):</strong> may Attempt N+1’s container start while Attempt N’s container is still
+terminating after a <code dir="auto">Lost</code> verdict? If yes, within what bound?
+<strong>Answered (2026-11-01):</strong> yes, once N’s Pod object is gone from the API server. I1b
+fails if N’s step container is still seen running more than the Pod’s
+<code dir="auto">terminationGracePeriodSeconds</code> plus 30 s after that.</li>
+<li><strong>Runs left with <code dir="auto">creating = TRUE</code>:</strong> should a sweeper fail Runs whose creation is older
+than a bound (git-bug <code dir="auto">ccbf7fe</code>), and is a webhook redelivery for such a Run
+deduplicated away or does it create a second Run?
+<strong>Answered (2026-11-01):</strong> built on main in c711d64d. The leader fails a Run left
+<code dir="auto">creating = TRUE</code> for longer than 10 minutes (<code dir="auto">sweep_unfinished_creations</code>), pinned by
+<code dir="auto">crates/scarab-db-postgres/tests/creation_sweep.rs</code>. git-bug <code dir="auto">ccbf7fe</code> is closed.</li>
+<li><strong>Failpoints in product code</strong>, behind a cargo feature and absent from release images:
+acceptable?
+<strong>Answered (2026-11-01):</strong> yes, behind a cargo feature, and a point is added only with
+the scenario that uses it. The four windows in §5 are already handled in code (adopt on
+the deterministic fence, the creation sweeper, staged pack rows, the rowless-bytes
+scan), so failpoints verify them; none is needed for ranks 2 and 4.</li>
+<li><strong>git-bug <code dir="auto">12e2f6b</code></strong> (cache restores at Depot <code dir="auto">replicaCount &gt; 1</code> almost always miss): an
+accepted slow path that the checker allows, or a blocker for the 2+2 topology?
+<strong>Answered (2026-11-01):</strong> neither. A Cache is routed to one home Depot replica chosen
+from its key, so it hits at any replica count (git-bug <code dir="auto">12e2f6b</code>); a home that is down or
+remapped is a miss. See the Amendment (2026-11-01, grill).</li>
+<li><strong>Where fault runs happen:</strong> a throwaway kind cluster (proposed) or colima’s k3s, and may
+colima be resized to 6 vCPU and 10 GiB for them?
+Answered in part by the Amendment (2026-11-01): the shared kind cluster.
+<strong>Answered (2026-11-01):</strong> colima stays at 2 vCPU and 4 GiB; the stack measured about
+1.0 to 1.3 GiB.</li>
+<li><strong>Agent budget:</strong> a monthly cap, and does the agentic layer start with <code dir="auto">security</code>
+(proposed) rather than <code dir="auto">chaos</code>?
+<strong>Answered (2026-11-01):</strong> the agentic layer starts with <code dir="auto">security</code>. No cap until
+<code dir="auto">just security</code> exists; it is set from the cost of the first real run.</li>
+<li><strong>The SIGSTOP pause scenario:</strong> in scope? It was not in the original proposal.
+<strong>Answered (2026-11-01):</strong> yes, as rank 4, together with term fencing of the scheduler
+lease (git-bug <code dir="auto">aaf4e3e</code>), which the scenario proves.</li>
+</ol>
+<div class="sl-heading-wrapper level-h2"><h2 id="amendment-2026-11-01-one-kind-cluster-one-release">Amendment (2026-11-01): one kind cluster, one release</h2><a class="sl-anchor-link" href="#amendment-2026-11-01-one-kind-cluster-one-release"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Amendment (2026-11-01): one kind cluster, one release”</span></a></div>
+<p>Decided by the owner on 2026-11-01, after the live test in #63. It replaces §4, changes where
+<code dir="auto">just e2e</code> and <code dir="auto">just chaos</code> run in §1’s table, and replaces the proc-mode note on scenarios 0
+and 4 in §3. It answers open question 5 in part.</p>
+<div class="sl-heading-wrapper level-h3"><h3 id="why">Why</h3><a class="sl-anchor-link" href="#why"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Why”</span></a></div>
+<p>There are two local setups today, on two kinds of cluster:</p>
+<ul>
+<li>Proc mode (<code dir="auto">just up</code>, <code dir="auto">just e2e</code>, <code dir="auto">just forgejo-verify</code>, <code dir="auto">just kube-tests</code>) runs Postgres
+and MinIO in compose, the server and the Depot as macOS host processes, and step Pods in
+kind.</li>
+<li>Helm mode (<code dir="auto">just local-helm</code>) docker-builds the images and installs the chart into colima’s
+k3s.</li>
+</ul>
+<p>CI uses kind with host processes. §4 would have added a third setup: a new kind cluster per
+chaos run.</p>
+<p>Each setup has its own networking. Proc mode finds how a Pod reaches the host by probing from
+a Pod (<code dir="auto">deploy/local-proc/up.sh</code>), and a host process needs a second URL for the same Depot
+(<code dir="auto">SCARAB_WORKSPACE_CONTROL_URL</code>). The e2e harness missed the second URL, and that kept
+<code dir="auto">crash_resume</code> red until #63.</p>
+<div class="sl-heading-wrapper level-h3"><h3 id="decision-1">Decision</h3><a class="sl-anchor-link" href="#decision-1"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Decision”</span></a></div>
+<ol>
+<li><strong>One kind cluster for every local tier.</strong> <code dir="auto">just up</code>, <code dir="auto">just e2e</code>, <code dir="auto">just forgejo-verify</code>,
+<code dir="auto">just kube-tests</code>, <code dir="auto">just local-helm</code> and <code dir="auto">just chaos</code> use the same kind cluster and the real
+chart. No recipe uses colima’s k3s. Test binaries still run on the host and drive the
+cluster.</li>
+<li><strong>One release, and a mode is a set of Helm values:</strong> the database URL, the bucket, replica
+counts, and an image or a mounted binary. Scarab does not know which mode it runs in.
+Isolation comes from the infrastructure, through a different database URL and bucket.
+Whether the URL names another database or another schema is the recipe’s choice.</li>
+<li><strong>The server runs in the cluster in every mode, from a binary built on the host.</strong>
+<ul>
+<li>On macOS, <code dir="auto">cargo zigbuild -p scarab-server --target aarch64-unknown-linux-gnu.2.36</code> builds
+a Linux binary against bookworm’s glibc.</li>
+<li>A thin runtime image (<code dir="auto">debian:bookworm-slim</code> with <code dir="auto">ca-certificates</code> and a non-root user)
+runs it from a mounted directory: kind <code dir="auto">extraMounts</code> to the node, then <code dir="auto">hostPath</code> to the
+Pod. The UI’s <code dir="auto">dist</code> is mounted at <code dir="auto">SCARAB_UI_DIR</code>. A new build takes effect on
+<code dir="auto">kubectl rollout restart</code>.</li>
+<li>Measured on 2026-11-01: a cold dev build took 2m05s and an incremental one 28 s, against
+24 s for a native <code dir="auto">cargo build</code>. The binary migrated Postgres and answered <code dir="auto">/readyz</code>.</li>
+<li>The directory is mounted, not the file. Cargo writes a new file, and a file mount keeps
+the old one.</li>
+<li>A Linux CI runner builds natively.</li>
+<li>Step images (clone, sidecar, wsfetch) stay images: published tags, or built and loaded
+into kind when they change.</li>
+</ul>
+</li>
+<li><strong><code dir="auto">just chaos</code> switches the release instead of creating a cluster.</strong>
+<ul>
+<li>It refuses to start while the dev database has Runs in progress.</li>
+<li>It deletes the Depot’s PVCs. The warm cache holds blobs from the dev bucket. It would
+serve reads the chaos bucket cannot, and hide the faults rank 1 looks for. The Depot is a
+cache (<a href="0066-the-depot-is-a-cache.md">0066</a>), so dev’s refills from object storage later.</li>
+<li>It upgrades the release to chaos values: <code dir="auto">replicaCount: 2</code>, <code dir="auto">workspace.replicaCount: 2</code>,
+and a chaos database and bucket reached through toxiproxy. Plugins are off unless a
+scenario needs them. The plugin runtime removes plugin Deployments its database does not
+know (<code dir="auto">crates/scarab-server/src/plugin_runtime.rs:409</code>), so dev’s would be removed and
+then recreated when dev returns.</li>
+<li>It runs the scenarios, then upgrades the release back to dev values. Dev’s data stays in
+its own database and bucket.</li>
+</ul>
+</li>
+<li><strong>Signals come from the kind node.</strong> In the cluster the server is PID 1 with no init
+(<code dir="auto">docker/server/Dockerfile:92</code>). It ignores SIGSTOP sent from inside its PID namespace. The
+harness sends SIGKILL and SIGSTOP from the node’s PID namespace instead, which the kernel
+delivers. So scenarios 0 and 4 run in the cluster with the others. This is not verified yet;
+the first scenario built checks it. A Pod delete with grace 0 is a different fault: it
+creates a new Pod instead of restarting the container.</li>
+</ol>
+<div class="sl-heading-wrapper level-h3"><h3 id="consequences-1">Consequences</h3><a class="sl-anchor-link" href="#consequences-1"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Consequences”</span></a></div>
+<ul>
+<li>Pods reach the server and the Depot through Services in every mode. The Pod probe in
+<code dir="auto">up.sh</code> goes away, and so does the host-facing Depot URL in the e2e harness.</li>
+<li><code dir="auto">just chaos</code> and dev cannot run at the same time. A chaos run takes minutes.</li>
+<li>There is no native debugger on the server. Logs come from <code dir="auto">kubectl logs</code>.</li>
+<li>The Linux target adds about 1.6 GB under each worktree’s <code dir="auto">target/</code>.</li>
+<li>Postgres and MinIO are shared, and chaos uses its own database and bucket on them. The
+ranked scenarios fault them only through toxiproxy. A scenario that restarts the Postgres or
+MinIO process would also hit dev’s data.</li>
+</ul>
+<div class="sl-heading-wrapper level-h3"><h3 id="still-open">Still open</h3><a class="sl-anchor-link" href="#still-open"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Still open”</span></a></div>
+<ul>
+<li><strong>colima’s size.</strong> Two servers and two Depots request about 1.5 GiB (<code dir="auto">values.yaml</code>). Measure
+before resizing past 2 vCPU and 4 GiB. <strong>Answered (2026-11-01):</strong> measured; it stays at 2
+vCPU and 4 GiB.</li>
+<li><strong>Two converged replicas.</strong> <code dir="auto">values.yaml</code> advises one converged replica unless roles are
+split; rank 2 wants two. <strong>Answered (2026-11-01):</strong> N replicas are supported; see the
+Amendment (2026-11-01, grill).</li>
+<li><strong>The dogfood stack</strong> on colima’s k3s, stopped since 2026-10-28: move it to the kind cluster
+or retire it. <strong>Answered (2026-11-01):</strong> it runs on the kind cluster as the dogfood mode;
+colima’s k3s is retired.</li>
+</ul>
+<div class="sl-heading-wrapper level-h2"><h2 id="amendment-2026-11-01-grill">Amendment (2026-11-01, grill)</h2><a class="sl-anchor-link" href="#amendment-2026-11-01-grill"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Amendment (2026-11-01, grill)”</span></a></div>
+<p>Decided by the owner on 2026-11-01 in a grill of this ADR. The status moves to Accepted:
+ranks 0 and 1 are built, and the first Amendment is merged.</p>
+<div class="sl-heading-wrapper level-h3"><h3 id="decision-2">Decision</h3><a class="sl-anchor-link" href="#decision-2"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Decision”</span></a></div>
+<ol>
+<li><strong>N server replicas are a supported topology</strong>, converged or with split roles. Postgres is
+the coordination bus (ADR-0016). git-bug <code dir="auto">068cc0b</code> (two replicas drive one Pod’s drain) is
+fixed in the outbox claim, not by limiting replicas: <code dir="auto">reconcile</code> claims a launch intent for
+30 s and a drain inside its poll can outlast the claim. <code dir="auto">values.yaml</code> says scaling is safe.</li>
+<li><strong>The scheduler lease gets a term</strong>, as Raft does. Every takeover increments it, and every
+leader-only write checks owner and term inside its own transaction with <code dir="auto">FOR SHARE</code>, so a
+leader that resumes after a takeover writes nothing (git-bug <code dir="auto">aaf4e3e</code>). Rank 4 proves it.</li>
+<li><strong>Ranks 2 and 4 are next</strong>, in that order: rank 2 is the evidence for item 1, rank 4 for
+item 2. Ranks 3, 5 and 6 stay in the horizon.</li>
+<li><strong>I1b’s bound</strong> is the Pod’s <code dir="auto">terminationGracePeriodSeconds</code> plus 30 s after Attempt N’s
+Pod object is gone (open question 1).</li>
+<li><strong>N Depot replicas keep their Caches.</strong> The Depot is a cache (ADR-0066), so it needs no
+replication, sharding or sticky sessions for correctness; drains are scatter-safe since
+git-bug <code dir="auto">afb13c2</code>. A Cache was the exception: its saves and restores scattered, so at N &gt; 1
+it almost always missed. Each cache key now has one home replica, chosen by rendezvous
+hashing over the StatefulSet’s ordinals; the executor gives the Pod that replica’s address
+for cache content only (git-bug <code dir="auto">12e2f6b</code>). Peer fill by content owner was rejected: it
+turns the scatter into peer hops on every read path. Durable caches were rejected: they
+reverse ADR-0065’s warm-only decision. A cache root that a replica cannot walk no longer
+fails the token’s blob walk (git-bug <code dir="auto">2a79b73</code>).</li>
+<li><strong>Recipe names.</strong> The Justfile is grouped into modules (git-bug <code dir="auto">c043abf</code>). <code dir="auto">just e2e</code>
+becomes <code dir="auto">just test e2e</code> and gains the plugin runtime pass; <code dir="auto">just chaos</code> becomes
+<code dir="auto">just test chaos</code>; <code dir="auto">just forgejo-verify</code>, <code dir="auto">just kube-tests</code> and <code dir="auto">just plugin-kube-tests</code>
+are gone, folded into <code dir="auto">just test e2e</code>. The body of this ADR keeps the old names as history.</li>
+</ol>
+</div></div><!-- footer --><footer class="astro-l3glpecf"><div class="pagination-links print:hidden astro-urgzmesl"><a class="prev astro-urgzmesl" href="/scarab-ci/tech/adr/0076-libraries-and-plugins-through-invoke/" rel="prev"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="astro-urgzmesl"><path d="m15 18-6-6 6-6" class="astro-urgzmesl"></path></svg>0076. Libraries and plugins through `invoke`: installed YAML libraries, plugins as Principals that resolve gates</a><a class="next astro-urgzmesl" href="/scarab-ci/tech/adr/0078-the-environment-adds-its-approval-gate/" rel="next">0078. The Environment adds its approval gate<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="astro-urgzmesl"><path d="m9 18 6-6-6-6" class="astro-urgzmesl"></path></svg></a></div></footer></main></div><div class="toc astro-c4hhlov6"><div class="astro-zfomn2we"><starlight-toc data-min-h="2" data-max-h="3" class="astro-3zcp52y7"><nav aria-labelledby="starlight__on-this-page" class="astro-3zcp52y7"><p id="starlight__on-this-page" class="astro-3zcp52y7">On this page</p><ul style="--depth: 0;" class="astro-2faeg4pj"><li style="--depth: 0;" class="astro-2faeg4pj"><a href="#_top" style="--depth: 0;" class="astro-2faeg4pj">Overview</a></li><li style="--depth: 0;" class="astro-2faeg4pj"><a href="#context" style="--depth: 0;" class="astro-2faeg4pj">Context</a></li><li style="--depth: 0;" class="astro-2faeg4pj"><a href="#decision" style="--depth: 0;" class="astro-2faeg4pj">Decision</a><ul style="--depth: 1;" class="astro-2faeg4pj"><li style="--depth: 1;" class="astro-2faeg4pj"><a href="#1-four-tiers-one-oracle" style="--depth: 1;" class="astro-2faeg4pj">1. Four tiers, one oracle</a></li><li style="--depth: 1;" class="astro-2faeg4pj"><a href="#2-the-invariant-checker-is-the-shared-oracle" style="--depth: 1;" class="astro-2faeg4pj">2. The invariant checker is the shared oracle</a></li><li style="--depth: 1;" class="astro-2faeg4pj"><a href="#3-fault-scenarios-ranked" style="--depth: 1;" class="astro-2faeg4pj">3. Fault scenarios, ranked</a></li><li style="--depth: 1;" class="astro-2faeg4pj"><a href="#4-where-just-chaos-runs" style="--depth: 1;" class="astro-2faeg4pj">4. Where just chaos runs</a></li><li style="--depth: 1;" class="astro-2faeg4pj"><a href="#5-failpoints" style="--depth: 1;" class="astro-2faeg4pj">5. Failpoints</a></li><li style="--depth: 1;" class="astro-2faeg4pj"><a href="#6-the-red-team-agent" style="--depth: 1;" class="astro-2faeg4pj">6. The red-team agent</a></li><li style="--depth: 1;" class="astro-2faeg4pj"><a href="#7-agent-safety" style="--depth: 1;" class="astro-2faeg4pj">7. Agent safety</a></li><li style="--depth: 1;" class="astro-2faeg4pj"><a href="#8-ci" style="--depth: 1;" class="astro-2faeg4pj">8. CI</a></li><li style="--depth: 1;" class="astro-2faeg4pj"><a href="#9-how-this-fits-adr-0017" style="--depth: 1;" class="astro-2faeg4pj">9. How this fits ADR-0017</a></li></ul></li><li style="--depth: 0;" class="astro-2faeg4pj"><a href="#consequences" style="--depth: 0;" class="astro-2faeg4pj">Consequences</a></li><li style="--depth: 0;" class="astro-2faeg4pj"><a href="#alternatives-considered" style="--depth: 0;" class="astro-2faeg4pj">Alternatives considered</a></li><li style="--depth: 0;" class="astro-2faeg4pj"><a href="#implementation-horizon" style="--depth: 0;" class="astro-2faeg4pj">Implementation horizon</a></li><li style="--depth: 0;" class="astro-2faeg4pj"><a href="#open-questions-for-the-owner" style="--depth: 0;" class="astro-2faeg4pj">Open questions for the owner</a></li><li style="--depth: 0;" class="astro-2faeg4pj"><a href="#amendment-2026-11-01-one-kind-cluster-one-release" style="--depth: 0;" class="astro-2faeg4pj">Amendment (2026-11-01): one kind cluster, one release</a><ul style="--depth: 1;" class="astro-2faeg4pj"><li style="--depth: 1;" class="astro-2faeg4pj"><a href="#why" style="--depth: 1;" class="astro-2faeg4pj">Why</a></li><li style="--depth: 1;" class="astro-2faeg4pj"><a href="#decision-1" style="--depth: 1;" class="astro-2faeg4pj">Decision</a></li><li style="--depth: 1;" class="astro-2faeg4pj"><a href="#consequences-1" style="--depth: 1;" class="astro-2faeg4pj">Consequences</a></li><li style="--depth: 1;" class="astro-2faeg4pj"><a href="#still-open" style="--depth: 1;" class="astro-2faeg4pj">Still open</a></li></ul></li><li style="--depth: 0;" class="astro-2faeg4pj"><a href="#amendment-2026-11-01-grill" style="--depth: 0;" class="astro-2faeg4pj">Amendment (2026-11-01, grill)</a><ul style="--depth: 1;" class="astro-2faeg4pj"><li style="--depth: 1;" class="astro-2faeg4pj"><a href="#decision-2" style="--depth: 1;" class="astro-2faeg4pj">Decision</a></li></ul></li></ul></nav></starlight-toc><script type="module">var e=class extends HTMLElement{_current=this.querySelector(`a[aria-current="true"]`);minH=Number.parseInt(this.dataset.minH||`2`,10);maxH=Number.parseInt(this.dataset.maxH||`3`,10);set current(e){e!==this._current&&(this._current&&this._current.removeAttribute(`aria-current`),e.setAttribute(`aria-current`,`true`),this._current=e)}onIdle=e=>(window.requestIdleCallback||(e=>setTimeout(e,1)))(e);constructor(){super(),this.onIdle(()=>this.init())}init=()=>{let e=[...this.querySelectorAll(`a`)],t=e=>{if(e instanceof HTMLHeadingElement){if(e.id===`_top`)return!0;let t=e.tagName[1];if(t){let e=Number.parseInt(t,10);if(e>=this.minH&&e<=this.maxH)return!0}}return!1},n=e=>{if(!e)return null;let r=e;for(;e;){if(t(e))return e;for(e=e.previousElementSibling;e?.lastElementChild;)e=e.lastElementChild;let r=n(e);if(r)return r}return n(r.parentElement)},r=t=>{for(let{isIntersecting:r,target:i}of t){if(!r)continue;let t=n(i);if(!t)continue;let a=e.find(e=>e.hash===`#${encodeURIComponent(t.id)}`);if(a){this.current=a;break}}},i=document.querySelectorAll(`main [id], main [id] ~ *, main .content > *`),a,o=()=>{a||(a=new IntersectionObserver(r,{rootMargin:this.getRootMargin()}),i.forEach(e=>a.observe(e)))};o();let s;window.addEventListener(`resize`,()=>{a&&=(a.disconnect(),void 0),clearTimeout(s),s=setTimeout(()=>this.onIdle(o),200)})};getRootMargin(){let e=(document.querySelector(`header`)?.getBoundingClientRect().height||0)+(this.querySelector(`summary`)?.getBoundingClientRect().height||0)+32;return`-${e}px 0% ${e+53-document.documentElement.clientHeight}px`}};customElements.define(`starlight-toc`,e);</script></div></div></main></div></div></main><footer class="astro-6hobpl37"><div data-slot="footer-text" class="astro-6hobpl37">Scarab — a CI engine for Kubernetes: forge-native, on a durable core. Themed with <a href="https://github.com/lucas-labs/lucode-starlight-theme">Lucode Starlight</a>.</div></footer></div><div popover="auto" id="drawer" class="astro-cn5bvrke"><button class="sheet-overlay astro-cn5bvrke" popovertarget="drawer" popovertargetaction="hide"></button><div class="content astro-cn5bvrke"><div class="header astro-cn5bvrke"><button class="drag-icon astro-cn5bvrke" popovertarget="drawer" popovertargetaction="hide"><span class="astro-cn5bvrke"></span></button></div><div class="body astro-cn5bvrke"><div class="links-nav astro-cn5bvrke"><a href="/scarab-ci/get-started/overview/" class="astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke">Get Started</a><a href="/scarab-ci/usage/pipeline-syntax/" class="astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke">Usage</a><a href="/scarab-ci/reference/api/" class="astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke">References</a><a href="https://demo-scarab.ahiravan.dev/" target="_blank" rel="noopener" class="astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke">Demo</a></div><div class="links-docs astro-cn5bvrke"><div class="container-sidebar-entry astro-cn5bvrke"><h4 class="entry-title astro-cn5bvrke">Get Started</h4><a href="/scarab-ci/get-started/overview/" class="astro-cn5bvrke" data-active="false">Overview</a><a href="/scarab-ci/get-started/deploy-helm/" class="astro-cn5bvrke" data-active="false">Installation</a><a href="/scarab-ci/get-started/run-locally/" class="astro-cn5bvrke" data-active="false">Run locally</a><a href="/scarab-ci/get-started/local-development/" class="astro-cn5bvrke" data-active="false">Local Development</a></div><div class="container-sidebar-entry astro-cn5bvrke"><h4 class="entry-title astro-cn5bvrke">Usage</h4><a href="/scarab-ci/usage/pipeline-syntax/" class="astro-cn5bvrke" data-active="false">Pipeline Syntax</a><a href="/scarab-ci/usage/libraries/" class="astro-cn5bvrke" data-active="false">Libraries</a><a href="/scarab-ci/usage/secrets/" class="astro-cn5bvrke" data-active="false">Secrets</a><a href="/scarab-ci/usage/api-tokens/" class="astro-cn5bvrke" data-active="false">API tokens</a><a href="/scarab-ci/usage/environments/" class="astro-cn5bvrke" data-active="false">Environments</a><a href="/scarab-ci/usage/deploying-with-argo-cd/" class="astro-cn5bvrke" data-active="false">Deploying with Argo CD</a><a href="/scarab-ci/usage/environment-variables/" class="astro-cn5bvrke" data-active="false">Environment Variables</a></div><div class="container-sidebar-entry astro-cn5bvrke"><h4 class="entry-title astro-cn5bvrke">References</h4><a href="/scarab-ci/reference/api/" class="astro-cn5bvrke" data-active="false">API</a><a href="/scarab-ci/tech/context/" class="astro-cn5bvrke" data-active="false">Thesis &amp; language (CONTEXT)</a></div></div></div></div></div><script type="module">var e=document.getElementById(`drawer`);e&&e.addEventListener(`toggle`,e=>{let t=e.newState===`open`;document.documentElement.style.overflow=t?`hidden`:``,document.body.style.overflow=t?`hidden`:``});</script></body></html>
