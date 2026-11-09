@@ -191,6 +191,10 @@ the same rows from `GET /v1/orgs/{org}/plugins/{name}/broker-journal`, filtered 
   nothing applies the change, and the step waits until its timeout.
 - **Multi-source applications.** They report `.status.sync.revisions` (a list) in place of
   `.status.sync.revision`, so step 2's revision check needs adjusting for them.
+- **`OnDelete` StatefulSets and DaemonSets.** With `updateStrategy: OnDelete`, Kubernetes
+  replaces a Pod only when someone deletes it, and Argo CD can report the Application Healthy
+  while the old Pods still run the old image. Both the wait step and the plugin's `wait-live`
+  gate then say your image is live before it serves.
 - **Correctness is yours.** Scarab runs the step and reports its exit code; it doesn't check what
   the step checks.
 
