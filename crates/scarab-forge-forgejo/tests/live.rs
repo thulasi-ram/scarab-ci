@@ -290,19 +290,24 @@ async fn a_registered_hook_delivers_a_signed_push_we_can_normalize() {
     let (port, inbox) = capture_listener().await;
     let callback = format!("http://{callback_host}:{port}/webhooks/forgejo");
 
+    // First under an older secret, as a hook made before the secret changed
+    // (git-bug 27006cc).
+    ForgejoForge::new(&base, &token)
+        .with_webhook_secret("an-older-secret")
+        .register_webhook(&repo, &callback)
+        .await
+        .expect("register_webhook against a real Forgejo");
+    // Then under the current one. Idempotency, against the REAL list
+    // response: Forgejo 16 reports a hook's callback at top-level `url` and
+    // marks `config` deprecated, so an adapter that only read `config.url`
+    // would create a second hook here — and every later push would fan out
+    // into duplicate runs. And the existing hook must take the current
+    // secret: the delivery below is verified under it.
     let forge = ForgejoForge::new(&base, &token).with_webhook_secret(secret.clone());
     forge
         .register_webhook(&repo, &callback)
         .await
-        .expect("register_webhook against a real Forgejo");
-    // Idempotency, against the REAL list response. Forgejo 16 reports a hook's
-    // callback at top-level `url` and marks `config` deprecated, so an adapter
-    // that only read `config.url` would create a second hook here — and every
-    // later push would fan out into duplicate runs.
-    forge
-        .register_webhook(&repo, &callback)
-        .await
-        .expect("re-registration is a no-op");
+        .expect("re-registration updates the hook in place");
 
     let hooks: serde_json::Value = client
         .get(format!("{base}/api/v1/repos/{owner}/{name}/hooks"))

@@ -245,6 +245,17 @@ fn hook_create_body(callback_url: &str, secret: Option<&str>) -> Value {
     })
 }
 
+/// The `PATCH /repos/{owner}/{name}/hooks/{id}` body for a hook that already
+/// points at `callback_url`: the create body without its `type`, which an
+/// edit does not take. Pure, like [`hook_create_body`].
+fn hook_edit_body(callback_url: &str, secret: Option<&str>) -> Value {
+    let mut body = hook_create_body(callback_url, secret);
+    if let Some(fields) = body.as_object_mut() {
+        fields.remove("type");
+    }
+    body
+}
+
 /// The callback URL of a hook as returned by `GET /repos/{owner}/{name}/hooks`.
 /// Pure, and read from BOTH spellings on purpose.
 ///
@@ -708,23 +719,37 @@ impl ForgePort for ForgejoForge {
 
     /// REAL webhook registration (ADR-0046): Forgejo has no single-app
     /// webhook, so each repo gets one. Idempotent — an existing hook with the
-    /// same callback URL is left as-is.
+    /// same callback URL is updated in place, never duplicated.
     ///
     /// The hook carries the connection's `webhook_secret` in its config, which is
     /// what makes its deliveries verifiable at `/webhooks/forgejo`; without it the
-    /// server answers every delivery with 401.
+    /// server answers every delivery with 401. Forgejo never returns a hook's
+    /// secret, so an existing hook cannot be checked against the current one:
+    /// it is written again on every registration. Otherwise a hook made before
+    /// the secret changed keeps signing with the old one, and every delivery
+    /// is refused with 401 (git-bug 27006cc).
     async fn register_webhook(&self, repo: &RepoRef, callback_url: &str) -> Result<(), ForgeError> {
         let hooks_url = self.url(&format!("/repos/{}/{}/hooks", repo.owner, repo.name));
         let resp = self.send(|| self.client.get(&hooks_url)).await?;
         let hooks = ok_json(resp).await?;
-        let exists = hooks
+        let existing: Vec<u64> = hooks
             .as_array()
             .map(|arr| {
                 arr.iter()
-                    .any(|h| hook_callback_url(h) == Some(callback_url))
+                    .filter(|h| hook_callback_url(h) == Some(callback_url))
+                    .filter_map(|h| h.get("id").and_then(Value::as_u64))
+                    .collect()
             })
-            .unwrap_or(false);
-        if exists {
+            .unwrap_or_default();
+        if !existing.is_empty() {
+            let body = hook_edit_body(callback_url, self.webhook_secret.as_deref());
+            for id in existing {
+                let hook_url = format!("{hooks_url}/{id}");
+                let resp = self
+                    .send(|| self.client.patch(&hook_url).json(&body))
+                    .await?;
+                ok_json(resp).await?;
+            }
             return Ok(());
         }
         let body = hook_create_body(callback_url, self.webhook_secret.as_deref());
