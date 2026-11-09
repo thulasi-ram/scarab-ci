@@ -9,9 +9,12 @@
 //! `ProtectionRules`** of that row make, applied exactly as the pre-ADR-0071
 //! server applied them (the oracle functions below quote it). Covered:
 //! corpus row × {push main, push feature, PR, tag, comment, cron, manual
-//! ± reason} × grant requests × approval sets — plus a Project that only RAN
-//! a deploy into another Project's name, and the two never-seen cases the
-//! migration cannot preserve (a never-run referencer, a never-run name).
+//! ± reason} × grant requests × approval sets — plus the Projects that only
+//! RAN a deploy into a name they never defined (cross-project referencers,
+//! whose Runs the migration saw), and the two never-seen cases the migration
+//! cannot preserve (a Project that never ran a deploy into a name another
+//! Project defined, and a name nothing defined or ran), which are refused
+//! until an admin acts.
 //!
 //! Skips cleanly when `SCARAB_TEST_DATABASE_URL` is unset.
 
@@ -31,7 +34,10 @@ use scarab_engine::{
     Db, DeployContext, RunId, RunStatus, Scheduler, StepId, StepSpec, StepStatus, Timestamp,
 };
 use scarab_forge::{Event, RepoRef};
-use scarab_project::{GrantRequest, ProtectionRules};
+use scarab_project::{
+    EnvironmentGovernanceStore, EnvironmentProjectEligibility, GrantRequest, OrgEnvironment,
+    OrgEnvironmentStore, ProtectionRules,
+};
 use scarab_server::{
     dispatch_run, router, trigger_run_from_event, AppState, DispatchError, DispatchKind, LogService,
 };
@@ -123,19 +129,38 @@ async fn migrated_corpus(pool: &sqlx::PgPool) {
         .await
         .unwrap();
     }
-    // Run history: `edge` deployed into `canary` (which `ops` defines)
-    // without defining it — the cross-project referencer (c-full review L3).
-    sqlx::query(
-        "INSERT INTO runs (id, status, ir_version, event_schema_version, created_at,
-                           updated_at, deploy_org, deploy_project, deploy_environment,
-                           deploy_git_ref)
-         VALUES ('r-edge-canary', 'succeeded', 1, 1, 0, 0, $1, 'edge', 'canary',
-                 'refs/heads/main')",
-    )
-    .bind(ORG)
-    .execute(pool)
-    .await
-    .unwrap();
+    // Run history, `(run, status, project, deploy environment)`. The
+    // cross-project referencers (c-full review L3) deployed into a name they
+    // never defined: `edge` and `flaky` (its only Run failed) into `canary`,
+    // which `ops` defines; `svc`, which defines `staging`, into `canary`;
+    // `cli` into `prod`, which `web` and `api` define; `batch` into `adhoc`,
+    // which no Project defines. `quiet` ran, but never a deploy.
+    for (run, status, project, environment) in [
+        ("r-edge-canary", "succeeded", "edge", Some("canary")),
+        ("r-flaky-canary", "failed", "flaky", Some("canary")),
+        ("r-svc-canary", "succeeded", "svc", Some("canary")),
+        ("r-cli-prod", "succeeded", "cli", Some("prod")),
+        ("r-batch-adhoc", "succeeded", "batch", Some("adhoc")),
+        ("r-quiet-build", "succeeded", "quiet", None),
+    ] {
+        sqlx::query(
+            "INSERT INTO runs (id, status, ir_version, event_schema_version, created_at,
+                               updated_at, tenant_org, tenant_project, deploy_org,
+                               deploy_project, deploy_environment, deploy_git_ref)
+             VALUES ($1, $2, 1, 1, 0, 0, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(run)
+        .bind(status)
+        .bind(ORG)
+        .bind(project)
+        .bind(environment.map(|_| ORG))
+        .bind(environment.map(|_| project))
+        .bind(environment)
+        .bind(environment.map(|_| "refs/heads/main"))
+        .execute(pool)
+        .await
+        .unwrap();
+    }
     let m = MIGRATOR.iter().find(|m| m.version == 57).unwrap();
     sqlx::raw_sql(&m.sql).execute(pool).await.unwrap();
     for m in MIGRATOR.iter().filter(|m| m.version > 57) {
@@ -145,6 +170,16 @@ async fn migrated_corpus(pool: &sqlx::PgPool) {
 
 fn legacy(json: &serde_json::Value) -> ProtectionRules {
     serde_json::from_value(json.clone()).expect("a legacy row deserialises")
+}
+
+/// What d4 applied to a deploy from a Project with no definition of the
+/// name: no approvers, any ref (refless events too), no reason, an empty
+/// whitelist.
+fn no_rules() -> ProtectionRules {
+    legacy(&serde_json::json!({
+        "approvers": [], "wait_timer": 0, "allowed_refs": [], "concurrency": 0,
+        "secret_scope": { "Org": { "org": "" } }, "oidc_subject": ""
+    }))
 }
 
 fn repo(project: &str) -> RepoRef {
@@ -384,6 +419,33 @@ async fn dispatch(
     .await
 }
 
+/// Manual dispatch of the pipeline `yaml` (named `one`) for `project`,
+/// from `main`, with a reason.
+async fn dispatch_yaml(
+    pg: &Arc<PostgresDb>,
+    clock: &FakeClock,
+    project: &str,
+    yaml: &str,
+) -> Result<RunId, DispatchError> {
+    let forge = FakeForge::new()
+        .with_file(".scarab/one.yaml", yaml)
+        .with_commit("refs/heads/main", SHA);
+    dispatch_run(
+        &forge,
+        pg.as_ref(),
+        clock,
+        scarab_server::AdmissionPorts::governance(Some(pg.as_ref())),
+        "bob".into(),
+        repo(project),
+        "main".into(),
+        "one".into(),
+        BTreeMap::new(),
+        DispatchKind::Manual,
+        Some("check".into()),
+    )
+    .await
+}
+
 /// The cases the ADR-0071 migration can and cannot see beyond the defining
 /// Projects (c-full review F1/L3), pinned so the behaviour change is explicit:
 ///
@@ -404,13 +466,7 @@ async fn a_run_referencer_keeps_its_permissive_deploy_and_never_seen_cases_are_r
     let pg = Arc::new(PostgresDb::with_pool(tdb.pool.clone()));
     let clock = FakeClock::new(1_000);
 
-    // d4 admitted a Project with no definition as "no rules": no approvers,
-    // any ref (including refless events), no reason required.
-    let no_rules = legacy(&serde_json::json!({
-        "approvers": [], "wait_timer": 0, "allowed_refs": [], "concurrency": 0,
-        "secret_scope": { "Org": { "org": "" } }, "oidc_subject": ""
-    }));
-    assert_decides_as_legacy(&pg, &clock, "edge", "canary", &no_rules).await;
+    assert_decides_as_legacy(&pg, &clock, "edge", "canary", &no_rules()).await;
 
     let err = dispatch(&pg, &clock, "fresh", "canary", "main", Some("x".into()))
         .await
@@ -635,6 +691,72 @@ async fn run_at_gate(pg: &Arc<PostgresDb>, run: &RunId, ctx: &DeployContext) {
     );
 }
 
+/// The real router with the migrated governance wired, as gate approval
+/// sees it.
+fn gate_app(pg: &Arc<PostgresDb>) -> axum::Router {
+    let db: Arc<dyn Db> = pg.clone();
+    let logs = Arc::new(LogService::new(
+        Arc::new(InMemoryObjectStore::new()),
+        pg.clone(),
+    ));
+    router(
+        AppState::new(db, Arc::new(FakeClock::new(1_000)), logs)
+            .with_approval_history(pg.clone())
+            .with_environment_governance(pg.clone()),
+    )
+}
+
+/// Suspend `run` (`project`'s deploy into `environment` from `git_ref`) at
+/// its gate, record the `prior` approvals, approve through the API, and say
+/// whether the gate released.
+#[allow(clippy::too_many_arguments)]
+async fn gate_releases(
+    app: &axum::Router,
+    pg: &Arc<PostgresDb>,
+    clock: &FakeClock,
+    run: &RunId,
+    project: &str,
+    environment: &str,
+    git_ref: &str,
+    prior: &[String],
+) -> bool {
+    run_at_gate(
+        pg,
+        run,
+        &DeployContext {
+            org: ORG.into(),
+            project: project.into(),
+            environment: environment.into(),
+            git_ref: git_ref.into(),
+            locked_out: false,
+        },
+    )
+    .await;
+    for by in prior {
+        scarab_engine::record_gate_approval(pg.as_ref(), clock, run, &StepId("gate".into()), by)
+            .await
+            .unwrap();
+    }
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/runs/{}/gates/gate/approve", run.0))
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    pg.steps_of_run(run)
+        .await
+        .unwrap()
+        .iter()
+        .any(|s| s.step.0 == "gate" && s.status == StepStatus::Succeeded)
+}
+
 /// Gate approval: for every row × ref × set of prior approvals, the gate
 /// releases now iff the legacy rules' `admits` passed before. (Test-mode
 /// auth approves as `anonymous`, which no corpus rule names, so it is in the
@@ -647,16 +769,7 @@ async fn migrated_gates_release_for_exactly_the_approvals_the_legacy_rules_requi
     };
     migrated_corpus(&tdb.pool).await;
     let pg = Arc::new(PostgresDb::with_pool(tdb.pool.clone()));
-    let db: Arc<dyn Db> = pg.clone();
-    let logs = Arc::new(LogService::new(
-        Arc::new(InMemoryObjectStore::new()),
-        pg.clone(),
-    ));
-    let app = router(
-        AppState::new(db, Arc::new(FakeClock::new(1_000)), logs)
-            .with_approval_history(pg.clone())
-            .with_environment_governance(pg.clone()),
-    );
+    let app = gate_app(&pg);
     let clock = FakeClock::new(1_000);
     let people = ["alice", "bob", "carol"];
 
@@ -677,48 +790,17 @@ async fn migrated_gates_release_for_exactly_the_approvals_the_legacy_rules_requi
 
                 n += 1;
                 let run = RunId(format!("gate-{n}"));
-                run_at_gate(
+                let released = gate_releases(
+                    &app,
                     &pg,
+                    &clock,
                     &run,
-                    &DeployContext {
-                        org: ORG.into(),
-                        project: project.into(),
-                        environment: environment.into(),
-                        git_ref: git_ref.into(),
-                        locked_out: false,
-                    },
+                    project,
+                    environment,
+                    git_ref,
+                    &prior,
                 )
                 .await;
-                for by in &prior {
-                    scarab_engine::record_gate_approval(
-                        pg.as_ref(),
-                        &clock,
-                        &run,
-                        &StepId("gate".into()),
-                        by,
-                    )
-                    .await
-                    .unwrap();
-                }
-                let resp = app
-                    .clone()
-                    .oneshot(
-                        Request::builder()
-                            .method("POST")
-                            .uri(format!("/v1/runs/{}/gates/gate/approve", run.0))
-                            .header("content-type", "application/json")
-                            .body(Body::from("{}"))
-                            .unwrap(),
-                    )
-                    .await
-                    .unwrap();
-                assert_eq!(resp.status(), StatusCode::ACCEPTED);
-                let released = pg
-                    .steps_of_run(&run)
-                    .await
-                    .unwrap()
-                    .iter()
-                    .any(|s| s.step.0 == "gate" && s.status == StepStatus::Succeeded);
                 assert_eq!(
                     released, before,
                     "{project}/{environment} ref={git_ref} prior approvals={prior:?}"
@@ -726,6 +808,218 @@ async fn migrated_gates_release_for_exactly_the_approvals_the_legacy_rules_requi
             }
         }
     }
+
+    tdb.cleanup().await;
+}
+
+/// Projects that RAN a deploy into a name they never defined (c-full review
+/// L3). The migration saw each Run, so each Project is eligible, and with no
+/// overlay or grant it decides exactly as d4 decided a deploy with no
+/// definition: no rules. The definers' rules stay theirs.
+///
+/// - `edge`, and `flaky` (whose only Run failed), ran into `canary`, which
+///   `ops` defined with approver `alice`, branch and PR refs, a reason and a
+///   SYS_ADMIN grant.
+/// - `svc` defined `staging` (raw k8s overlays permitted) and ran into
+///   `canary`: its `staging` grant does not follow it there.
+/// - `cli` ran into `prod`, which `web` and `api` both defined.
+/// - `batch` ran into `adhoc`, which no Project defined. The name is
+///   referenced-only, so it admits every Project (ADR-0071 §10 step 6), and
+///   `fresh`, which never ran into it, deploys there with no rules as it did
+///   before. That is not a never-seen case: the migration saw the name.
+#[tokio::test]
+async fn cross_project_referencers_deploy_with_no_rules_and_never_take_the_definers_rules() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    migrated_corpus(&tdb.pool).await;
+    let pg = Arc::new(PostgresDb::with_pool(tdb.pool.clone()));
+    let clock = FakeClock::new(1_000);
+
+    for (project, environment) in [
+        ("edge", "canary"),
+        ("flaky", "canary"),
+        ("svc", "canary"),
+        ("cli", "prod"),
+        ("batch", "adhoc"),
+        ("fresh", "adhoc"),
+    ] {
+        assert_decides_as_legacy(&pg, &clock, project, environment, &no_rules()).await;
+    }
+
+    // A definer's grant is its own, in its own Environment.
+    let privileged = |environment: &str, image: &str, security: &str| {
+        format!(
+            "on: {{ manual: {{}} }}\nenvironment: {environment}\nsteps:\n  \
+             - {{ id: s, image: \"{image}\", security: {security} }}\n"
+        )
+    };
+    for (project, yaml, whose) in [
+        (
+            "edge",
+            privileged(
+                "canary",
+                "ghcr.io/acme/x@sha256:bbbb",
+                "{ add_capabilities: [SYS_ADMIN] }",
+            ),
+            "ops's SYS_ADMIN grant in canary",
+        ),
+        (
+            "cli",
+            privileged("prod", "ghcr.io/acme/x@sha256:aaaa", "{ privileged: true }"),
+            "api's privileged grant in prod",
+        ),
+    ] {
+        match dispatch_yaml(&pg, &clock, project, &yaml).await {
+            Err(DispatchError::Pipeline(m)) => {
+                assert!(m.contains("privilege request rejected"), "{project}: {m}")
+            }
+            other => panic!("{project} must not use {whose}: {other:?}"),
+        }
+    }
+    let overlay = "on: { manual: {} }\nenvironment: canary\nsteps:\n  - id: s\n    \
+                   image: busybox\n    k8s_overlay:\n      spec:\n        schedulerName: x\n";
+    match dispatch_yaml(&pg, &clock, "svc", overlay).await {
+        Err(DispatchError::Pipeline(m)) => assert!(m.contains("k8s_overlay"), "{m}"),
+        other => panic!("svc's staging grant must not permit overlays in canary: {other:?}"),
+    }
+    // In its own `staging` the grant still applies.
+    let own = overlay.replace("environment: canary", "environment: staging");
+    dispatch_yaml(&pg, &clock, "svc", &own)
+        .await
+        .expect("svc's own grant permits overlays in staging");
+
+    // A definer's approvers are its own: each referencer's gate releases
+    // with no approval (test-mode auth approves as `anonymous`).
+    let app = gate_app(&pg);
+    for (n, (project, environment)) in [("edge", "canary"), ("cli", "prod"), ("batch", "adhoc")]
+        .into_iter()
+        .enumerate()
+    {
+        let released = gate_releases(
+            &app,
+            &pg,
+            &clock,
+            &RunId(format!("referencer-gate-{n}")),
+            project,
+            environment,
+            "refs/heads/main",
+            &[],
+        )
+        .await;
+        assert!(released, "{project}/{environment}: no approver required");
+    }
+
+    tdb.cleanup().await;
+}
+
+/// A Project that never ran a deploy into a name another Project defined is
+/// refused after the migration, fail-closed, until an admin acts (ADR-0071
+/// §10; owner decision on a144fb1 item 8). Covered beyond `fresh`/`canary`:
+/// a name two Projects defined and a third ran into (`prod`), a name with one
+/// definer and no referencer (`release`), and a Project whose Runs never
+/// carried a deploy (`quiet`, which only built). Then the admin acts: adding
+/// the Project to the eligibility admits it under the baseline. A never-seen
+/// name needs an Environment and an eligibility, since a new Environment
+/// admits no Project.
+#[tokio::test]
+async fn projects_that_never_ran_a_deploy_are_refused_until_an_admin_acts() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    migrated_corpus(&tdb.pool).await;
+    let pg = Arc::new(PostgresDb::with_pool(tdb.pool.clone()));
+    let clock = FakeClock::new(1_000);
+
+    for (project, environment) in [
+        ("fresh", "canary"),
+        ("fresh", "prod"),
+        ("fresh", "release"),
+        ("quiet", "canary"),
+    ] {
+        let err = dispatch(&pg, &clock, project, environment, "main", Some("x".into()))
+            .await
+            .expect_err("a Project that never ran a deploy here is not eligible");
+        assert!(
+            matches!(err, DispatchError::NotEligible { .. }),
+            "{project}/{environment}: {err:?}"
+        );
+        let forge = FakeForge::new()
+            .with_file(".scarab/deploy.yaml", deploy_yaml(environment).as_str())
+            .with_commit("refs/heads/main", SHA);
+        for (label, event) in webhook_events(project) {
+            let runs = trigger_run_from_event(
+                &forge,
+                pg.as_ref(),
+                &clock,
+                scarab_server::AdmissionPorts::governance(Some(pg.as_ref())),
+                &event,
+            )
+            .await
+            .unwrap();
+            assert!(
+                runs.is_empty(),
+                "{project}/{environment} {label}: refused, no Run"
+            );
+        }
+    }
+
+    // The admin adds `fresh` to `canary`'s eligibility: it deploys under the
+    // permissive baseline with no overlay, as d4 did with no definition.
+    let canary = pg
+        .get_org_environment(ORG, "canary")
+        .await
+        .unwrap()
+        .unwrap();
+    let EnvironmentProjectEligibility::Projects(mut projects) = canary.eligibility else {
+        panic!("a defined name has an explicit eligibility list");
+    };
+    projects.push("fresh".into());
+    pg.put_environment_eligibility(
+        ORG,
+        "canary",
+        &EnvironmentProjectEligibility::Projects(projects),
+        "amy",
+        2_000,
+    )
+    .await
+    .unwrap();
+    assert_decides_as_legacy(&pg, &clock, "fresh", "canary", &no_rules()).await;
+    let err = dispatch(&pg, &clock, "quiet", "canary", "main", Some("x".into()))
+        .await
+        .expect_err("only the Project the admin added is admitted");
+    assert!(matches!(err, DispatchError::NotEligible { .. }), "{err:?}");
+
+    // A never-seen name: creating the Environment is not enough on its own.
+    pg.put_org_environment(&OrgEnvironment {
+        org: ORG.into(),
+        name: "nightly".into(),
+        display_name: None,
+        description: String::new(),
+        protection: Default::default(),
+        eligibility: Default::default(),
+        created_at: 0,
+        updated_at: 0,
+        updated_by: "amy".into(),
+    })
+    .await
+    .unwrap();
+    let err = dispatch(&pg, &clock, "web", "nightly", "main", Some("x".into()))
+        .await
+        .expect_err("a new Environment admits no Project");
+    assert!(matches!(err, DispatchError::NotEligible { .. }), "{err:?}");
+    pg.put_environment_eligibility(
+        ORG,
+        "nightly",
+        &EnvironmentProjectEligibility::Projects(vec!["web".into()]),
+        "amy",
+        3_000,
+    )
+    .await
+    .unwrap();
+    assert_decides_as_legacy(&pg, &clock, "web", "nightly", &no_rules()).await;
 
     tdb.cleanup().await;
 }
