@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1794206421,"nonce":"O+738/9q2wfw29jOmobHlm8OH1c=","message":"Fixed by PR #137 (db279f58): Forgejo's hook edit keeps the old secret, so registration now deletes and re-creates the hook with the current one. Full kind e2e green for every case in this ticket.","files":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":4,"timestamp":1794206421,"nonce":"Rm363sTiIUzuIDcYEHu0opo7Uws=","status":2}]}
