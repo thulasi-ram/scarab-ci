@@ -739,3 +739,188 @@ async fn under_enforced_step_up_the_broker_is_unchanged() {
     assert_eq!(status, StatusCode::OK, "{healthz}");
     tdb.cleanup().await;
 }
+
+/// One journal row of installation `id`, as the broker would write it.
+fn journal_row(
+    id: &str,
+    phase: scarab_plugin::BrokerJournalPhase,
+    started_at: i64,
+    query: Option<&str>,
+    denied_reason: Option<&str>,
+) -> scarab_plugin::BrokerJournalEntry {
+    scarab_plugin::BrokerJournalEntry {
+        request_id: format!("req-{started_at}"),
+        phase,
+        installation_id: id.into(),
+        slot: "argocd".into(),
+        method: "GET".into(),
+        path: format!("/api/v1/applications/app-{started_at}"),
+        upstream_path: Some(format!("/api/v1/applications/app-{started_at}")),
+        query: query.map(str::to_string),
+        rule: Some("GET /api/v1/applications/*".into()),
+        status: Some(200),
+        bytes: None,
+        started_at,
+        duration_ms: Some(3),
+        denied_reason: denied_reason.map(str::to_string),
+    }
+}
+
+/// An org admin reads an installation's broker journal newest first, a page
+/// at a time, narrowed by phase or to denied rows, with query keys but never
+/// query values. A member is refused; another org's installation is not
+/// found.
+#[tokio::test]
+async fn an_org_admin_reads_the_broker_journal_newest_first_by_page() {
+    use scarab_plugin::BrokerJournalPhase::{End, Head, Refused};
+    let Some((tdb, pg)) = migrated().await else {
+        return;
+    };
+    let scoped = |subject: &str| Principal {
+        subject: subject.into(),
+        display_name: None,
+        roles: vec![],
+    };
+    let auth = Arc::new(
+        FakeAuthenticator::new()
+            .with_credential("ada-code", scoped("ada"))
+            .with_credential("mel-code", scoped("mel")),
+    );
+    let rbac = Arc::new(InMemoryRbac::new());
+    for (subject, role) in [("ada", Role::Admin), ("mel", Role::Member)] {
+        rbac.grant(
+            &Binding {
+                subject: subject.into(),
+                scope: Scope::Org("acme".into()),
+                role,
+            },
+            BindingOrigin::Native,
+        )
+        .await
+        .unwrap();
+    }
+    let app = router(
+        state(pg.clone(), true)
+            .with_auth(auth, Arc::new(InMemorySessions::new()))
+            .with_rbac(rbac),
+    );
+    let session = |credential: &'static str| {
+        let app = app.clone();
+        async move {
+            let (_, body) = call(
+                &app,
+                "POST",
+                "/v1/auth/login",
+                None,
+                Some(json!({ "credential": credential })),
+            )
+            .await;
+            body["session"].as_str().unwrap().to_string()
+        }
+    };
+    let (ada, mel) = (session("ada-code").await, session("mel-code").await);
+    let (status, installed) = call(
+        &app,
+        "POST",
+        "/v1/orgs/acme/plugins",
+        Some(&ada),
+        Some(json!({ "name": "argocd", "plugin": "argocd", "image": image() })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{installed}");
+    let acme = installed["id"].as_str().unwrap().to_string();
+    let open = apps(pg.clone());
+    let globex = install(&open.public, "globex", "globex-argo").await;
+    let globex = globex.strip_prefix("tok-").unwrap().to_string();
+
+    // Oldest first.
+    pg.append_broker_journal(&[
+        journal_row(&acme, End, 1, Some("projects=prod"), None),
+        journal_row(
+            &acme,
+            Refused,
+            2,
+            Some("token=s3cret&projects=prod"),
+            Some("query"),
+        ),
+        journal_row(&globex, End, 2, None, None),
+        journal_row(&acme, Head, 3, None, None),
+        journal_row(&acme, End, 4, None, Some("cut: killed")),
+        journal_row(&acme, Refused, 5, None, Some("no read rule")),
+    ])
+    .await
+    .unwrap();
+
+    let read = |query: &str| {
+        let (app, ada) = (app.clone(), ada.clone());
+        let uri = format!("/v1/orgs/acme/plugins/argocd/broker-journal{query}");
+        async move {
+            let (status, body) = call(&app, "GET", &uri, Some(&ada), None).await;
+            assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+            body
+        }
+    };
+    let started = |page: &Value| -> Vec<i64> {
+        page["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["started_at"].as_i64().unwrap())
+            .collect()
+    };
+
+    let all = read("").await;
+    assert_eq!(started(&all), vec![5, 4, 3, 2, 1]);
+    assert_eq!(all["next_before"], Value::Null);
+    let refused = &all["entries"][3];
+    assert_eq!(refused["phase"], json!("refused"));
+    assert_eq!(refused["denied_reason"], json!("query"));
+    assert_eq!(refused["query_keys"], json!(["token", "projects"]));
+    assert!(
+        !all.to_string().contains("s3cret"),
+        "a query value is never returned: {all}"
+    );
+
+    let first = read("?limit=2").await;
+    assert_eq!(started(&first), vec![5, 4]);
+    let before = first["next_before"].as_i64().expect("an older page");
+    let second = read(&format!("?limit=2&before={before}")).await;
+    assert_eq!(started(&second), vec![3, 2]);
+    let before = second["next_before"].as_i64().expect("an older page");
+    let last = read(&format!("?limit=2&before={before}")).await;
+    assert_eq!(started(&last), vec![1]);
+    assert_eq!(last["next_before"], Value::Null);
+
+    assert_eq!(started(&read("?phase=refused").await), vec![5, 2]);
+    assert_eq!(started(&read("?denied=true").await), vec![5, 4, 2]);
+    assert_eq!(started(&read("?phase=end&denied=true").await), vec![4]);
+
+    let (status, _) = call(
+        &app,
+        "GET",
+        "/v1/orgs/acme/plugins/argocd/broker-journal?phase=killed",
+        Some(&ada),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "an unknown phase");
+    let (status, _) = call(
+        &app,
+        "GET",
+        "/v1/orgs/acme/plugins/argocd/broker-journal",
+        Some(&mel),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "a member reads the journal");
+    let (status, _) = call(
+        &app,
+        "GET",
+        "/v1/orgs/acme/plugins/globex-argo/broker-journal",
+        Some(&ada),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "another org's installation");
+    tdb.cleanup().await;
+}

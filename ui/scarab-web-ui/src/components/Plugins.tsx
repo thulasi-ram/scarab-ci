@@ -16,15 +16,20 @@
 // never inherits a credential entered for another. Plain http is allowed but
 // always flagged.
 //
+// "Broker journal" lists the requests the plugin sent to the broker in the
+// last 14 days, newest first: what was forwarded, what was refused and why.
+// Query values are never shown, only the parameter names.
+//
 // "Storage" names one PersistentVolumeClaim an operator created
 // in the plugin namespace; the runtime mounts it read-write into the plugin's
 // Pod. Scarab does not create, back up or read it. Moving it to another claim
 // or path asks for a step-up; adding or removing it does not.
-import { createResource, createSignal, For, Show } from "solid-js";
+import { createEffect, createResource, createSignal, For, on, Show } from "solid-js";
 import {
   deletePluginConnection,
   deletePluginStorage,
   enablePlugin,
+  getPluginBrokerJournal,
   installPlugin,
   killPlugin,
   listPluginCatalog,
@@ -33,13 +38,20 @@ import {
   putPluginConnection,
   putPluginStorage,
   uninstallPlugin,
+  type BrokerJournalEntry,
   type PluginCatalogEntry,
   type PluginConnection,
   type PluginInstallation,
 } from "../api/client";
 import {
+  appendJournalPage,
   connectionBaseUrlError,
   credentialBadge,
+  journalEmptyText,
+  journalEntryView,
+  journalParams,
+  type JournalFilter,
+  type JournalPhaseFilter,
   imageError,
   imageRepository,
   INSECURE_HTTP_WARNING,
@@ -63,7 +75,7 @@ import { relTime, absTime } from "../fmt";
 import Icon from "./Icon";
 import Modal, { ModalMessage, ModalSection } from "./Modal";
 import ConfirmDestructive, { ConfirmAction } from "./ConfirmDestructive";
-import { Field, Input, Select, Textarea } from "./Field";
+import { Checkbox, Field, Input, Select, Textarea } from "./Field";
 
 /** A badge tone in the StatusBadge palette's classes. */
 const BADGE: Record<BadgeTone, string> = {
@@ -248,6 +260,7 @@ function PluginRow(props: {
   const state = () => stateBadge(p().state);
   const runtime = () => runtimeBadge(p().runtime_status);
   const [connectionsOpen, setConnectionsOpen] = createSignal(false);
+  const [journalOpen, setJournalOpen] = createSignal(false);
 
   return (
     <li class="tok" classList={{ "tok-dead": killed() }}>
@@ -363,6 +376,16 @@ function PluginRow(props: {
       <Show when={connectionsOpen()}>
         <Connections org={props.org} installation={p().name} />
       </Show>
+
+      <div class="tok-facts">
+        <button class="btn btn-ghost btn-sm plg-toggle" onClick={() => setJournalOpen((o) => !o)}>
+          <Icon icon={journalOpen() ? "chevron-down" : "chevron-right"} size={12} /> broker journal
+        </button>
+      </div>
+
+      <Show when={journalOpen()}>
+        <BrokerJournal org={props.org} installation={p().name} />
+      </Show>
     </li>
   );
 }
@@ -472,6 +495,130 @@ function StorageEditor(props: {
           </ConfirmAction>
         )}
       </Show>
+    </div>
+  );
+}
+
+/** An installation's broker journal: the requests its plugin sent to the
+ *  broker, newest first, a page at a time. */
+function BrokerJournal(props: { org: string; installation: string }) {
+  const [filter, setFilter] = createSignal<JournalFilter>({ phase: "", deniedOnly: false });
+  const [entries, setEntries] = createSignal<BrokerJournalEntry[]>([]);
+  const [nextBefore, setNextBefore] = createSignal<number | null>(null);
+  const [loading, setLoading] = createSignal(false);
+  const [loaded, setLoaded] = createSignal(false);
+  const [error, setError] = createSignal<string | null>(null);
+  // Each load is numbered; a page that comes back after the filter changed
+  // is dropped.
+  let generation = 0;
+
+  const load = async (before: number | null) => {
+    const mine = before == null ? ++generation : generation;
+    setLoading(true);
+    setError(null);
+    try {
+      const page = await getPluginBrokerJournal(props.org, props.installation, journalParams(filter(), before));
+      if (mine !== generation) return;
+      setEntries((shown) => (before == null ? page.entries : appendJournalPage(shown, page.entries)));
+      setNextBefore(page.next_before ?? null);
+      setLoaded(true);
+    } catch (e) {
+      if (mine !== generation) return;
+      setError(e instanceof Error ? e.message : "Could not load the broker journal.");
+    } finally {
+      if (mine === generation) setLoading(false);
+    }
+  };
+
+  createEffect(
+    on(
+      () => [props.org, props.installation, filter()] as const,
+      () => void load(null),
+    ),
+  );
+
+  return (
+    <div class="plg-conns">
+      <div class="secrets-actions sec-filter evlog-filter">
+        <Field label="Phase">
+          <Select
+            value={filter().phase}
+            onValue={(v) => setFilter((f) => ({ ...f, phase: v as JournalPhaseFilter }))}
+          >
+            <option value="">All phases</option>
+            <option value="refused">refused</option>
+            <option value="head">head</option>
+            <option value="end">end</option>
+          </Select>
+        </Field>
+        <Checkbox
+          checked={filter().deniedOnly}
+          onChecked={(v) => setFilter((f) => ({ ...f, deniedOnly: v }))}
+          label="Refused or cut short only"
+        />
+      </div>
+      <Show when={error()}>
+        <p class="error">{error()}</p>
+      </Show>
+      <Show when={loaded()} fallback={<Show when={!error()}><p class="empty">loading…</p></Show>}>
+        <Show when={entries().length > 0} fallback={<p class="empty">{journalEmptyText(filter())}</p>}>
+          <div class="plg-journal-wrap">
+          <table class="table sec-table plg-journal">
+            <thead>
+              <tr>
+                <th>Time</th>
+                <th>Phase</th>
+                <th>Method</th>
+                <th>Path</th>
+                <th>Rule</th>
+                <th>Status</th>
+                <th>Bytes</th>
+                <th>Duration</th>
+                <th>Reason</th>
+              </tr>
+            </thead>
+            <tbody>
+              <For each={entries()}>
+                {(e) => {
+                  const v = journalEntryView(e);
+                  return (
+                    <tr title={`request ${e.request_id} · slot ${e.slot}`}>
+                      <td class="mono" title={absTime(e.started_at)}>
+                        {relTime(e.started_at)}
+                      </td>
+                      <td>
+                        <span class={BADGE[v.tone]}>{v.phase}</span>
+                      </td>
+                      <td class="mono">{e.method}</td>
+                      <td class="mono plg-journal-path">{v.path}</td>
+                      <td class="mono">{v.rule}</td>
+                      <td class="mono">{v.status}</td>
+                      <td class="mono">{v.bytes}</td>
+                      <td class="mono">{v.duration}</td>
+                      <td class="mono plg-killed">{v.reason}</td>
+                    </tr>
+                  );
+                }}
+              </For>
+            </tbody>
+          </table>
+          </div>
+        </Show>
+        <Show when={nextBefore()}>
+          {(before) => (
+            <div class="secrets-actions">
+              <button class="btn btn-ghost btn-sm" disabled={loading()} onClick={() => void load(before())}>
+                {loading() ? "Loading…" : "Load older"}
+              </button>
+            </div>
+          )}
+        </Show>
+      </Show>
+      <p class="subtle">
+        <small>
+          Kept for 14 days. Query values are not shown, only the parameter names.
+        </small>
+      </p>
     </div>
   );
 }

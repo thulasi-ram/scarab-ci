@@ -20,20 +20,21 @@
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::{Extension, Json};
 use scarab_engine::DbError;
 use scarab_identity::Action;
 use scarab_plugin::{
-    admit_for_mmp, validate_installation_name, ConnectionSlot, InstallationState, PluginCapability,
-    PluginConnection, PluginConnectionAuthScheme, PluginInstallation, PluginManifest,
-    PluginStorage, PluginStoreError, RequestRule, RuntimeStatus, MAX_CONNECTION_BASE_URL_CHARS,
+    admit_for_mmp, validate_installation_name, BrokerJournalFilter, BrokerJournalPhase,
+    BrokerJournalRecord, ConnectionSlot, InstallationState, PluginCapability, PluginConnection,
+    PluginConnectionAuthScheme, PluginInstallation, PluginManifest, PluginStorage,
+    PluginStoreError, RequestRule, RuntimeStatus, MAX_CONNECTION_BASE_URL_CHARS,
     MAX_CONNECTION_CA_PEM_BYTES, MAX_CONNECTION_CREDENTIAL_BYTES, PLUGIN_STORAGE_OWNER_ANNOTATION,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 
 use super::{authorize_scoped, rbac_scope, ApiError, AppState};
 use crate::step_up::GuardCtx;
@@ -615,6 +616,130 @@ pub struct PutPluginConnectionRequest {
     /// internal CA (https only). There is no skip-verify.
     #[serde(default)]
     pub ca_pem: Option<String>,
+}
+
+/// One phase of a broker journal row. `refused`: the broker answered the
+/// request itself and sent nothing upstream. `head`: it forwarded the request
+/// and the upstream's response head arrived. `end`: that response's body
+/// ended. A forwarded request has a `head` and an `end` row with the same
+/// `request_id`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BrokerJournalPhaseDto {
+    Refused,
+    Head,
+    End,
+}
+
+impl From<BrokerJournalPhase> for BrokerJournalPhaseDto {
+    fn from(p: BrokerJournalPhase) -> Self {
+        match p {
+            BrokerJournalPhase::Refused => Self::Refused,
+            BrokerJournalPhase::Head => Self::Head,
+            BrokerJournalPhase::End => Self::End,
+        }
+    }
+}
+
+impl From<BrokerJournalPhaseDto> for BrokerJournalPhase {
+    fn from(p: BrokerJournalPhaseDto) -> Self {
+        match p {
+            BrokerJournalPhaseDto::Refused => Self::Refused,
+            BrokerJournalPhaseDto::Head => Self::Head,
+            BrokerJournalPhaseDto::End => Self::End,
+        }
+    }
+}
+
+/// One row of an installation's broker journal: a request its plugin sent to
+/// the CredentialBroker, and what the broker did with it.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct BrokerJournalEntryDto {
+    /// The row's id; pass the last one of a page as `before` for the next.
+    pub id: i64,
+    /// Ties a request's `head` row to its `end` row.
+    pub request_id: String,
+    pub phase: BrokerJournalPhaseDto,
+    /// The connection slot the request named (it may name no real slot).
+    pub slot: String,
+    pub method: String,
+    /// The request path after the slot, as the plugin sent it.
+    pub path: String,
+    /// The path forwarded upstream; absent when it was refused before a read
+    /// rule matched.
+    pub upstream_path: Option<String>,
+    /// The names of the query parameters, in order. Their values are not
+    /// returned: on a refused row the query is stored as the plugin sent it.
+    pub query_keys: Vec<String>,
+    /// The read rule that admitted it (`GET /api/v1/applications/*`).
+    pub rule: Option<String>,
+    /// The status the plugin got: the upstream's, or the broker's refusal.
+    pub status: Option<u16>,
+    /// Response body bytes delivered to the plugin (`end` rows).
+    pub bytes: Option<u64>,
+    /// When the request reached the broker (Unix ms).
+    pub started_at: i64,
+    /// Until the refusal, the response head, or the end of the body.
+    pub duration_ms: Option<u64>,
+    /// Why the broker refused it, or why its stream ended short (`cut: …`).
+    pub denied_reason: Option<String>,
+}
+
+/// A page of an installation's broker journal, newest first.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct BrokerJournalPage {
+    pub entries: Vec<BrokerJournalEntryDto>,
+    /// Pass as `before` to read the next, older page; absent on the last.
+    pub next_before: Option<i64>,
+}
+
+/// `GET /v1/orgs/{org}/plugins/{name}/broker-journal` query.
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct BrokerJournalQuery {
+    /// At most this many rows (default 100, at most 500).
+    pub limit: Option<u32>,
+    /// Only rows older than this id: the previous page's `next_before`.
+    pub before: Option<i64>,
+    /// Only rows of this phase.
+    pub phase: Option<BrokerJournalPhaseDto>,
+    /// `true`: only rows with a `denied_reason` (refusals and streams that
+    /// ended short).
+    pub denied: Option<bool>,
+}
+
+const BROKER_JOURNAL_DEFAULT_LIMIT: u32 = 100;
+const BROKER_JOURNAL_MAX_LIMIT: u32 = 500;
+
+/// The names of a stored query's parameters, decoded, in order — never a
+/// value.
+fn query_keys(query: Option<&str>) -> Vec<String> {
+    let Some(query) = query.filter(|q| !q.is_empty()) else {
+        return Vec::new();
+    };
+    let mut url = reqwest::Url::parse("http://journal.invalid/").expect("a fixed URL parses");
+    url.set_query(Some(query));
+    url.query_pairs().map(|(k, _)| k.into_owned()).collect()
+}
+
+fn broker_journal_dto(record: BrokerJournalRecord) -> BrokerJournalEntryDto {
+    let e = record.entry;
+    BrokerJournalEntryDto {
+        id: record.id,
+        query_keys: query_keys(e.query.as_deref()),
+        request_id: e.request_id,
+        phase: e.phase.into(),
+        slot: e.slot,
+        method: e.method,
+        path: e.path,
+        upstream_path: e.upstream_path,
+        rule: e.rule,
+        status: e.status,
+        bytes: e.bytes,
+        started_at: e.started_at,
+        duration_ms: e.duration_ms,
+        denied_reason: e.denied_reason,
+    }
 }
 
 /// The bound form of an admin's base URL: an absolute `http(s)` URL with a
@@ -1368,6 +1493,64 @@ pub(crate) async fn delete_plugin_connection(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// An installation's broker journal, newest first: each request its plugin
+/// sent to the CredentialBroker, forwarded or refused, from the last 14 days.
+/// Administer on the Org.
+#[utoipa::path(
+    get,
+    path = "/v1/orgs/{org}/plugins/{name}/broker-journal",
+    params(
+        ("org" = String, Path, description = "org"),
+        ("name" = String, Path, description = "installation name"),
+        BrokerJournalQuery
+    ),
+    summary = "A plugin's broker journal, newest first (ADR-0072 §5)",
+    responses(
+        (status = 200, body = BrokerJournalPage),
+        (status = 400, description = "an unreadable query parameter"),
+        (status = 403, description = "not an org admin"),
+        (status = 404, description = "no such installation, or plugins not configured")
+    )
+)]
+pub(crate) async fn plugin_broker_journal(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((org, name)): Path<(String, String)>,
+    Query(q): Query<BrokerJournalQuery>,
+) -> Result<Json<BrokerJournalPage>, ApiError> {
+    org_admin(&st, &headers, &org).await?;
+    let store = store(&st)?;
+    let installation = store
+        .installation(&org, &name)
+        .await
+        .map_err(plugin_store_api_error)?
+        .ok_or(ApiError::NotFound)?;
+    let limit = q
+        .limit
+        .unwrap_or(BROKER_JOURNAL_DEFAULT_LIMIT)
+        .clamp(1, BROKER_JOURNAL_MAX_LIMIT) as usize;
+    // One row past the page says whether an older page exists.
+    let mut records = store
+        .broker_journal(
+            &installation.id,
+            &BrokerJournalFilter {
+                limit: limit + 1,
+                before: q.before,
+                phase: q.phase.map(Into::into),
+                denied_only: q.denied.unwrap_or(false),
+            },
+        )
+        .await
+        .map_err(plugin_store_api_error)?;
+    let more = records.len() > limit;
+    records.truncate(limit);
+    let next_before = more.then(|| records.last().map(|r| r.id)).flatten();
+    Ok(Json(BrokerJournalPage {
+        entries: records.into_iter().map(broker_journal_dto).collect(),
+        next_before,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1414,6 +1597,16 @@ mod tests {
         ] {
             assert!(check_image(&image, REPO, true).is_err(), "{image}");
         }
+    }
+
+    #[test]
+    fn a_journal_query_reads_as_its_keys_only() {
+        assert_eq!(query_keys(None), Vec::<String>::new());
+        assert_eq!(query_keys(Some("")), Vec::<String>::new());
+        assert_eq!(
+            query_keys(Some("projects=prod&token=s3cr%20t&a%5Bb%5D&projects=x")),
+            vec!["projects", "token", "a[b]", "projects"]
+        );
     }
 
     #[test]

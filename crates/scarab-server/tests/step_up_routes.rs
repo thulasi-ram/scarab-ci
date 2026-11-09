@@ -502,6 +502,12 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
         "READ",
     ),
     (
+        "GET",
+        "/v1/orgs/{org}/plugins/{name}/broker-journal",
+        "read",
+        "READ",
+    ),
+    (
         "PUT",
         "/v1/orgs/{org}/plugins/{name}/connections/{slot}",
         "plugin_connection.put",

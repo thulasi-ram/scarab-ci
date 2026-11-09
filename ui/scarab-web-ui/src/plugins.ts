@@ -163,7 +163,7 @@ export function pluginPublisher(imageOrRepository: string): string {
   return parts.length >= 2 ? parts[0]! : "";
 }
 
-// --- PluginConnections (ADR-0072 §5) ----------------------------------------
+// --- PluginConnections ----------------------------------------
 // An admin binds each manifest connection slot to the ONE destination the
 // broker may send the plugin's requests to, and the credential it adds. The
 // credential is write-only: the server never returns it, so the form only
@@ -268,7 +268,7 @@ export function credentialBadge(c: { configured: boolean; credential_set: boolea
       };
 }
 
-// ── Storage (ADR-0074 §7) ────────────────────────────────────────────────
+// ── Storage ────────────────────────────────────────────────
 // A plugin may mount ONE PersistentVolumeClaim that an operator created in
 // the plugin namespace. Scarab mounts it; it never creates, backs up or reads
 // it. The server is the authority on these rules; the form mirrors them so a
@@ -342,4 +342,110 @@ export function toStorageBody(
   if (pathProblem) return { error: pathProblem };
   const mount_path = form.mount_path.trim();
   return { body: { claim: form.claim.trim(), ...(mount_path ? { mount_path } : {}) } };
+}
+
+// ── Broker journal ───────────────────────────────────────────────────────
+// Every request a plugin sends to the CredentialBroker is journaled: one
+// `refused` row when the broker answered it itself, or a `head` row (the
+// upstream's response head arrived) and an `end` row (its body ended) when
+// it was forwarded. Rows are kept 14 days. Query values are never returned,
+// only the parameter names.
+
+/** The phase filter as the panel holds it; `""` = every phase. */
+export type JournalPhaseFilter = "" | "refused" | "head" | "end";
+export type JournalFilter = { phase: JournalPhaseFilter; deniedOnly: boolean };
+
+/** The query parameters of `GET …/plugins/{name}/broker-journal`. */
+export type JournalParams = {
+  limit?: number;
+  before?: number;
+  phase?: "refused" | "head" | "end";
+  denied?: boolean;
+};
+
+export const JOURNAL_PAGE = 100;
+
+/** The parameters for one page under `filter`; `before` continues from the
+ *  previous page's `next_before`. Unset filters are not sent. */
+export function journalParams(filter: JournalFilter, before?: number | null): JournalParams {
+  return {
+    limit: JOURNAL_PAGE,
+    ...(before != null ? { before } : {}),
+    ...(filter.phase ? { phase: filter.phase } : {}),
+    ...(filter.deniedOnly ? { denied: true } : {}),
+  };
+}
+
+/** `shown` followed by the rows of an older page, each id once (a page read
+ *  twice, from a double click, adds nothing). */
+export function appendJournalPage<T extends { id: number }>(shown: readonly T[], older: readonly T[]): T[] {
+  const seen = new Set(shown.map((e) => e.id));
+  return [...shown, ...older.filter((e) => !seen.has(e.id))];
+}
+
+/** A byte count for a table cell: `512 B`, `1.5 KiB`, `3.2 MiB`; `""` when
+ *  the row has none. */
+export function formatBytes(n: number | null | undefined): string {
+  if (n == null) return "";
+  if (n < 1024) return `${n} B`;
+  const units = ["KiB", "MiB", "GiB", "TiB"];
+  let v = n / 1024;
+  let u = 0;
+  while (v >= 1024 && u < units.length - 1) {
+    v /= 1024;
+    u += 1;
+  }
+  return `${v < 10 ? v.toFixed(1) : Math.round(v)} ${units[u]}`;
+}
+
+/** A journal row as the table shows it. */
+export type JournalEntryView = {
+  phase: string;
+  tone: BadgeTone;
+  /** The path as the plugin sent it, then the query's parameter names. */
+  path: string;
+  rule: string;
+  status: string;
+  bytes: string;
+  duration: string;
+  /** Why it was refused or cut short; `""` otherwise. */
+  reason: string;
+};
+
+/** The table's view of `e`. A refused row and a cut stream read as danger;
+ *  a 2xx as ok; anything else muted. */
+export function journalEntryView(e: {
+  phase: string;
+  path: string;
+  query_keys: readonly string[];
+  rule?: string | null;
+  status?: number | null;
+  bytes?: number | null;
+  duration_ms?: number | null;
+  denied_reason?: string | null;
+}): JournalEntryView {
+  const reason = e.denied_reason ?? "";
+  const tone: BadgeTone =
+    e.phase === "refused" || reason !== ""
+      ? "danger"
+      : e.status != null && e.status >= 200 && e.status < 300
+        ? "ok"
+        : "muted";
+  return {
+    phase: e.phase,
+    tone,
+    path: e.query_keys.length > 0 ? `${e.path}?${e.query_keys.join("&")}` : e.path,
+    rule: e.rule ?? "",
+    status: e.status != null ? String(e.status) : "",
+    bytes: formatBytes(e.bytes),
+    duration: e.duration_ms != null ? `${e.duration_ms} ms` : "",
+    reason,
+  };
+}
+
+/** The empty-table text: plain when nothing is filtered. */
+export function journalEmptyText(filter: JournalFilter): string {
+  return filter.phase || filter.deniedOnly
+    ? "No requests match these filters in the last 14 days."
+    : "No requests recorded in the last 14 days.";
 }

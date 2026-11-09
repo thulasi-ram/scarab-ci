@@ -4,8 +4,8 @@
 use async_trait::async_trait;
 
 use crate::{
-    BrokerJournalEntry, InstallationState, PluginConnection, PluginInstallation, PluginStorage,
-    RuntimeStatus,
+    BrokerJournalEntry, BrokerJournalFilter, BrokerJournalRecord, InstallationState,
+    PluginConnection, PluginInstallation, PluginStorage, RuntimeStatus,
 };
 
 /// A list read's page size when none is asked for, and the most one page
@@ -189,12 +189,14 @@ pub trait PluginStore: Send + Sync {
         entries: &[BrokerJournalEntry],
     ) -> Result<(), PluginStoreError>;
 
-    /// The installation's newest journal entries, newest first.
+    /// The installation's journal rows `filter` selects, newest first, in
+    /// one read. A row's id is the keyset: pass the last id of a page as
+    /// `before` to read the next, older one.
     async fn broker_journal(
         &self,
         installation_id: &str,
-        limit: usize,
-    ) -> Result<Vec<BrokerJournalEntry>, PluginStoreError>;
+        filter: &BrokerJournalFilter,
+    ) -> Result<Vec<BrokerJournalRecord>, PluginStoreError>;
 
     /// Drop journal entries started before `started_before`. Returns how many
     /// went.

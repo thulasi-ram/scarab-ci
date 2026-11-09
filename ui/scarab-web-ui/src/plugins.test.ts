@@ -1,6 +1,11 @@
 import { describe, it, expect } from "vitest";
 import {
+  appendJournalPage,
   connectionBaseUrlError,
+  formatBytes,
+  journalEmptyText,
+  journalEntryView,
+  journalParams,
   credentialBadge,
   credentialError,
   imageError,
@@ -187,7 +192,7 @@ describe("connection binding", () => {
   });
 });
 
-describe("storage (ADR-0074 §7)", () => {
+describe("storage", () => {
   it("takes a claim name the way Kubernetes names a PVC", () => {
     expect(storageClaimError("argocd-state")).toBeNull();
     expect(storageClaimError("state.v2")).toBeNull();
@@ -219,5 +224,65 @@ describe("storage (ADR-0074 §7)", () => {
     });
     expect(toStorageBody({ claim: "", mount_path: "/srv" }).error).toMatch(/Enter/);
     expect(toStorageBody({ claim: "argocd-state", mount_path: "/tmp" }).error).toMatch(/overlaps/);
+  });
+});
+
+describe("broker journal", () => {
+  it("sends only the filters that are set, and the cursor once there is one", () => {
+    expect(journalParams({ phase: "", deniedOnly: false })).toEqual({ limit: 100 });
+    expect(journalParams({ phase: "refused", deniedOnly: true }, 41)).toEqual({
+      limit: 100,
+      before: 41,
+      phase: "refused",
+      denied: true,
+    });
+    expect(journalParams({ phase: "end", deniedOnly: false }, null)).toEqual({ limit: 100, phase: "end" });
+  });
+
+  it("appends an older page without repeating a row", () => {
+    const shown = [{ id: 9 }, { id: 8 }];
+    expect(appendJournalPage(shown, [{ id: 8 }, { id: 7 }]).map((e) => e.id)).toEqual([9, 8, 7]);
+  });
+
+  it("formats bytes in binary units, and nothing for a row without them", () => {
+    expect(formatBytes(null)).toBe("");
+    expect(formatBytes(0)).toBe("0 B");
+    expect(formatBytes(1536)).toBe("1.5 KiB");
+    expect(formatBytes(50 * 1024 * 1024)).toBe("50 MiB");
+  });
+
+  it("shows query names, never values, and marks refusals and cut streams", () => {
+    const refused = journalEntryView({
+      phase: "refused",
+      path: "/api/v1/applications",
+      query_keys: ["token", "project"],
+      status: 403,
+      denied_reason: "query",
+    });
+    expect(refused.path).toBe("/api/v1/applications?token&project");
+    expect(refused.tone).toBe("danger");
+    expect(refused.reason).toBe("query");
+    expect(refused.bytes).toBe("");
+    const cut = journalEntryView({
+      phase: "end",
+      path: "/api/v1/stream/applications",
+      query_keys: [],
+      status: 200,
+      bytes: 2048,
+      duration_ms: 1200,
+      denied_reason: "cut: killed",
+    });
+    expect(cut.tone).toBe("danger");
+    expect(cut.duration).toBe("1200 ms");
+    const ok = journalEntryView({ phase: "head", path: "/api/version", query_keys: [], status: 200 });
+    expect(ok.tone).toBe("ok");
+    expect(ok.status).toBe("200");
+  });
+
+  it("says plainly when nothing was recorded, and when filters hide everything", () => {
+    expect(journalEmptyText({ phase: "", deniedOnly: false })).toBe("No requests recorded in the last 14 days.");
+    expect(journalEmptyText({ phase: "head", deniedOnly: false })).toBe(
+      "No requests match these filters in the last 14 days.",
+    );
   });
 });

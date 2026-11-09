@@ -172,7 +172,16 @@ async fn the_drop_removes_the_record_and_leaves_plugins_and_environments_intact(
         .expect("the installation survives");
     assert_eq!(installation.id, "00000000a1");
     assert_eq!(pg.connections("00000000a1").await.unwrap().len(), 1);
-    assert_eq!(pg.broker_journal("00000000a1", 10).await.unwrap().len(), 1);
+    assert_eq!(
+        pg.broker_journal(
+            "00000000a1",
+            &scarab_plugin::BrokerJournalFilter::newest(10)
+        )
+        .await
+        .unwrap()
+        .len(),
+        1
+    );
     let env = pg
         .get_org_environment("acme", "prod")
         .await

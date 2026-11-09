@@ -134,8 +134,8 @@ impl BrokerJournalPhase {
 }
 
 /// One row of the broker's journal of a request it proxied or refused
-/// (ADR-0072 §5 step 4). Written asynchronously; read by tests (an audit
-/// reader is MLP).
+/// (ADR-0072 §5 step 4). Written asynchronously; read back by an org admin
+/// through the installation's broker-journal endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrokerJournalEntry {
     /// Broker-minted, one per request: ties a `head` row to its `end` row.
@@ -168,6 +168,39 @@ pub struct BrokerJournalEntry {
     /// for the kill switch or a re-bind, `upstream body error`); `None` for
     /// a `head` row and a stream proxied to completion.
     pub denied_reason: Option<String>,
+}
+
+/// A stored journal row: its id (the keyset a page of the journal is read
+/// by) and the entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrokerJournalRecord {
+    pub id: i64,
+    pub entry: BrokerJournalEntry,
+}
+
+/// Which of an installation's journal rows a read returns: newest first, at
+/// most `limit` of them, all older than `before` when that is set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BrokerJournalFilter {
+    /// The page size; `0` reads the store's default page.
+    pub limit: usize,
+    /// Only rows with an id below this one: the previous page's last id.
+    pub before: Option<i64>,
+    /// Only rows of this phase.
+    pub phase: Option<BrokerJournalPhase>,
+    /// Only rows with a `denied_reason`: refusals and streams that ended
+    /// short.
+    pub denied_only: bool,
+}
+
+impl BrokerJournalFilter {
+    /// The newest `limit` rows, unfiltered.
+    pub fn newest(limit: usize) -> Self {
+        Self {
+            limit,
+            ..Self::default()
+        }
+    }
 }
 
 /// A read request a rule admits: what to forward, and why it was allowed.

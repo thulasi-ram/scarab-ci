@@ -574,6 +574,10 @@ pub(crate) fn governed_routes() -> Routes {
             "/v1/orgs/{org}/plugins/{name}/connections",
             plugins::list_plugin_connections,
         )
+        .get(
+            "/v1/orgs/{org}/plugins/{name}/broker-journal",
+            plugins::plugin_broker_journal,
+        )
         .put(
             "/v1/orgs/{org}/plugins/{name}/connections/{slot}",
             &ops::PLUGIN_CONNECTION_PUT,

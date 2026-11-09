@@ -173,6 +173,13 @@ progress deadline. It fails the gate at once when `app` is `.` or `..` or holds 
 Application name does. The gate's output `revision` is the git revision Argo synced. The run fails when
 the gate expires. See [Plugin gates](/scarab-ci/usage/pipeline-syntax/#plugin-gates).
 
+To see what the plugin asked Argo CD for, open **Settings → Plugins** and expand **broker journal**
+on the installation. It lists each request the broker forwarded or refused in the last 14 days,
+newest first: the path, the read rule that allowed it, the status, the bytes returned, and for a
+refusal the reason. Query parameter names are shown, their values are not. An org admin can read
+the same rows from `GET /v1/orgs/{org}/plugins/{name}/broker-journal`, filtered by `phase`
+(`refused`, `head` or `end`) or by `denied=true`, a page at a time with `before`.
+
 ## What this doesn't cover
 
 - **The wait costs a Pod and a secret.** The wait step holds a Pod for as long as it waits, and

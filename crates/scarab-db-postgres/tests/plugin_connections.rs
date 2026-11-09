@@ -17,9 +17,9 @@ use std::collections::BTreeMap;
 use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
 use scarab_plugin::{
-    BrokerJournalEntry, BrokerJournalPhase, ConnectionSlot, InstallationState, PluginCapability,
-    PluginConnection, PluginConnectionAuthScheme, PluginInstallation, PluginManifest, PluginStore,
-    PluginStoreError, RequestRule, RuntimeStatus,
+    BrokerJournalEntry, BrokerJournalFilter, BrokerJournalPhase, ConnectionSlot, InstallationState,
+    PluginCapability, PluginConnection, PluginConnectionAuthScheme, PluginInstallation,
+    PluginManifest, PluginStore, PluginStoreError, RequestRule, RuntimeStatus,
 };
 
 async fn migrated() -> Option<(common::TestDb, PostgresDb)> {
@@ -99,6 +99,16 @@ fn entry(installation_id: &str, path: &str, started_at: i64) -> BrokerJournalEnt
         duration_ms: Some(7),
         denied_reason: None,
     }
+}
+
+/// The installation's newest `limit` journal entries, newest first.
+async fn journal(db: &PostgresDb, installation_id: &str, limit: usize) -> Vec<BrokerJournalEntry> {
+    db.broker_journal(installation_id, &BrokerJournalFilter::newest(limit))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.entry)
+        .collect()
 }
 
 #[tokio::test]
@@ -248,7 +258,7 @@ async fn the_journal_keeps_order_outlives_an_uninstall_and_is_pruned_by_age() {
         .unwrap();
     db.append_broker_journal(&[]).await.unwrap();
 
-    let newest_first = db.broker_journal("0000000001", 10).await.unwrap();
+    let newest_first = journal(&db, "0000000001", 10).await;
     assert_eq!(
         newest_first,
         vec![
@@ -256,21 +266,106 @@ async fn the_journal_keeps_order_outlives_an_uninstall_and_is_pruned_by_age() {
             entry("0000000001", "/api/v1/applications", 1_000)
         ]
     );
-    assert_eq!(db.broker_journal("0000000001", 1).await.unwrap().len(), 1);
+    assert_eq!(journal(&db, "0000000001", 1).await.len(), 1);
 
     // Audit outlives the installation.
     db.uninstall("acme", "argocd", "amy", 3_000).await.unwrap();
-    assert_eq!(db.broker_journal("0000000001", 10).await.unwrap().len(), 2);
+    assert_eq!(journal(&db, "0000000001", 10).await.len(), 2);
 
     assert_eq!(db.prune_broker_journal(1_600).await.unwrap(), 2);
+    assert_eq!(journal(&db, "0000000001", 10).await, vec![refused]);
+    assert!(journal(&db, "0000000002", 10).await.is_empty());
+    tdb.cleanup().await;
+}
+
+/// A page of the journal is one keyset read: `before` continues from the
+/// previous page's last id, and the phase and denied filters narrow the
+/// rows in the database, not after the page is cut.
+#[tokio::test]
+async fn the_journal_reads_newest_first_by_page_phase_and_denial() {
+    let Some((tdb, db)) = migrated().await else {
+        return;
+    };
+    let refused = |started_at: i64| BrokerJournalEntry {
+        phase: BrokerJournalPhase::Refused,
+        status: Some(403),
+        bytes: None,
+        denied_reason: Some("no read rule".into()),
+        ..entry("0000000001", "/api/v1/session", started_at)
+    };
+    let cut = BrokerJournalEntry {
+        denied_reason: Some("cut: killed".into()),
+        ..entry("0000000001", "/api/v1/stream", 6)
+    };
+    // Oldest first: end 1, refused 2, end 3, refused 4, end 5, cut end 6,
+    // and another installation's row between them.
+    db.append_broker_journal(&[
+        entry("0000000001", "/a", 1),
+        refused(2),
+        entry("0000000002", "/elsewhere", 2),
+        entry("0000000001", "/a", 3),
+        refused(4),
+        entry("0000000001", "/a", 5),
+        cut.clone(),
+    ])
+    .await
+    .unwrap();
+    let read = |filter: BrokerJournalFilter| {
+        let db = &db;
+        async move {
+            db.broker_journal("0000000001", &filter)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|r| (r.id, r.entry.started_at))
+                .collect::<Vec<_>>()
+        }
+    };
+
+    let first = read(BrokerJournalFilter::newest(4)).await;
     assert_eq!(
-        db.broker_journal("0000000001", 10).await.unwrap(),
-        vec![refused]
+        first.iter().map(|r| r.1).collect::<Vec<_>>(),
+        vec![6, 5, 4, 3]
     );
-    assert!(db
-        .broker_journal("0000000002", 10)
-        .await
-        .unwrap()
-        .is_empty());
+    let second = read(BrokerJournalFilter {
+        before: Some(first[3].0),
+        ..BrokerJournalFilter::newest(4)
+    })
+    .await;
+    assert_eq!(second.iter().map(|r| r.1).collect::<Vec<_>>(), vec![2, 1]);
+
+    let refusals = read(BrokerJournalFilter {
+        phase: Some(BrokerJournalPhase::Refused),
+        ..BrokerJournalFilter::newest(1)
+    })
+    .await;
+    assert_eq!(refusals.iter().map(|r| r.1).collect::<Vec<_>>(), vec![4]);
+    let older_refusals = read(BrokerJournalFilter {
+        phase: Some(BrokerJournalPhase::Refused),
+        before: Some(refusals[0].0),
+        ..BrokerJournalFilter::newest(10)
+    })
+    .await;
+    assert_eq!(
+        older_refusals.iter().map(|r| r.1).collect::<Vec<_>>(),
+        vec![2]
+    );
+
+    let denied = read(BrokerJournalFilter {
+        denied_only: true,
+        ..BrokerJournalFilter::newest(10)
+    })
+    .await;
+    assert_eq!(
+        denied.iter().map(|r| r.1).collect::<Vec<_>>(),
+        vec![6, 4, 2]
+    );
+    let denied_ends = read(BrokerJournalFilter {
+        denied_only: true,
+        phase: Some(BrokerJournalPhase::End),
+        ..BrokerJournalFilter::newest(10)
+    })
+    .await;
+    assert_eq!(denied_ends.iter().map(|r| r.1).collect::<Vec<_>>(), vec![6]);
     tdb.cleanup().await;
 }

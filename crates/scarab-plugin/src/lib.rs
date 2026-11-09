@@ -31,10 +31,11 @@ mod storage;
 mod store;
 
 pub use connection::{
-    match_read_request, rule_label, BrokerJournalEntry, BrokerJournalPhase, PluginConnection,
-    PluginConnectionAuthScheme, ReadRequestMatch, ReadRequestRefusal, BROKER_JOURNAL_RETENTION_MS,
-    MAX_CONNECTION_BASE_URL_CHARS, MAX_CONNECTION_CA_PEM_BYTES, MAX_CONNECTION_CREDENTIAL_BYTES,
-    MAX_PROXY_PATH_CHARS, MAX_PROXY_PATH_SEGMENTS, MAX_PROXY_QUERY_CHARS, MAX_PROXY_QUERY_PARAMS,
+    match_read_request, rule_label, BrokerJournalEntry, BrokerJournalFilter, BrokerJournalPhase,
+    BrokerJournalRecord, PluginConnection, PluginConnectionAuthScheme, ReadRequestMatch,
+    ReadRequestRefusal, BROKER_JOURNAL_RETENTION_MS, MAX_CONNECTION_BASE_URL_CHARS,
+    MAX_CONNECTION_CA_PEM_BYTES, MAX_CONNECTION_CREDENTIAL_BYTES, MAX_PROXY_PATH_CHARS,
+    MAX_PROXY_PATH_SEGMENTS, MAX_PROXY_QUERY_CHARS, MAX_PROXY_QUERY_PARAMS,
 };
 
 pub use storage::{
