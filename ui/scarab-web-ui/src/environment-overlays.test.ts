@@ -10,6 +10,8 @@ import {
   toEligibilityBody,
   toGrantBody,
   toProtectionBody,
+  unprotectedBanner,
+  unprotectedButOpen,
 } from "./environment-overlays";
 
 const blank = () => rulesToForm(null);
@@ -88,26 +90,15 @@ describe("tightenable", () => {
 });
 
 describe("reportBanner", () => {
-  const line = (environment: string, acked: boolean, permissive: boolean, exists = true) => ({
-    environment,
-    acknowledged_at: acked ? 1 : null,
-    permissive_baseline: permissive,
-    environment_exists: exists,
+  const line = (acked: boolean) => ({ acknowledged_at: acked ? 1 : null });
+
+  it("counts the lines still to review", () => {
+    expect(reportBanner([line(false), line(true), line(false)])).toBe("2 migrated environments to review");
   });
 
-  it("counts open lines and permissive baselines separately", () => {
-    expect(reportBanner([line("prod", false, true), line("qa", true, true)])).toBe(
-      "1 migrated environment to review · 2 with a permissive baseline — set a baseline so the place is protected, not only each project",
-    );
-  });
-
-  it("says nothing once everything is reviewed and protected", () => {
-    expect(reportBanner([line("prod", true, false)])).toBeNull();
+  it("says nothing once every line is reviewed", () => {
+    expect(reportBanner([line(true)])).toBeNull();
     expect(reportBanner([])).toBeNull();
-  });
-
-  it("does not ask for a baseline on a deleted environment", () => {
-    expect(reportBanner([line("gone", true, false, false)])).toBeNull();
   });
 });
 
@@ -134,5 +125,38 @@ describe("toGrantBody", () => {
     );
     const twice = { digest: "sha256:aa", privileged: true, capabilities: "" };
     expect(toGrantBody([twice, twice], false).error).toMatch(/twice/);
+  });
+});
+
+describe("unprotected environments", () => {
+  type Rules = { approvers: string[]; allowed_refs: string[]; wait_timer_s: number; require_reason: boolean };
+  const permissive: Rules = { approvers: [], allowed_refs: [], wait_timer_s: 0, require_reason: false };
+  const guarded: Rules = { ...permissive, approvers: ["github:alice"] };
+  const env = (protection: Rules, all_projects: boolean, projects: string[] = []) => ({
+    protection,
+    eligibility: { all_projects, projects },
+  });
+
+  it("flags a permissive baseline only when some project may deploy", () => {
+    expect(unprotectedButOpen(env(permissive, true))).toBe(true);
+    expect(unprotectedButOpen(env(permissive, false, ["web-*"]))).toBe(true);
+    expect(unprotectedButOpen(env(permissive, false))).toBe(false);
+    expect(unprotectedButOpen(env(guarded, true))).toBe(false);
+  });
+
+  it("counts every open environment, not only migrated ones", () => {
+    expect(
+      unprotectedBanner([env(permissive, true), env(permissive, false, ["api"]), env(guarded, true)]),
+    ).toBe(
+      "2 environments take deploys with no baseline rule: only each project's own overlay protects them. Set a baseline on each.",
+    );
+    expect(unprotectedBanner([env(permissive, true)])).toBe(
+      "1 environment takes deploys with no baseline rule: only each project's own overlay protects it. Set a baseline on it.",
+    );
+  });
+
+  it("says nothing when every open environment has a baseline", () => {
+    expect(unprotectedBanner([env(guarded, true), env(permissive, false)])).toBeNull();
+    expect(unprotectedBanner([])).toBeNull();
   });
 });

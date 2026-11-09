@@ -117,6 +117,11 @@ An Environment's baseline protection rules are:
   Where only some of the approvers must approve, adding an approver needs a step-up, as removing
   one does.
 
+A baseline with no approver, any ref, no wait timer and no reason protects nothing; only each
+Project's own overlay does. While such an Environment admits at least one Project, the
+Environment list counts it in a warning, its row says **permissive baseline**, and its page asks
+for a baseline. An Environment that admits no Project is not counted: it takes no deploy.
+
 On the edit page these settings are in the **Approval gate** section: **When a pipeline has no
 approval gate** (**Add an approval gate** or **Refuse the run**), **Added gate expiry** (blank: no
 expiry), **Required approvals** (1 to the number of approvers; blank: every one) and **Maximum

@@ -40,6 +40,7 @@ import {
   isPermissive,
   rulesSummary,
   toGrantBody,
+  unprotectedButOpen,
   type ImageGrantRow,
   type RulesForm,
 } from "../environment-overlays";
@@ -219,6 +220,12 @@ function Details(props: { env: OrgEnvironment }) {
   const list = (xs: readonly string[], none: string) => (xs.length > 0 ? xs.join(", ") : none);
   return (
     <>
+    <Show when={unprotectedButOpen(props.env)}>
+      <p class="tok-warn env-warn" role="status">
+        <Icon icon="alert-triangle" size={14} /> Projects may deploy here and no baseline rule
+        protects it: only each project's own overlay does. Edit it to set a baseline.
+      </p>
+    </Show>
     <Show when={idleTimerWarning(rules())}>
       {(w) => (
         <p class="tok-warn env-warn" role="status">

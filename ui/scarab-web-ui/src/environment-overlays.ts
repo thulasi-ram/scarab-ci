@@ -1,4 +1,4 @@
-// Org-level Environment governance (ADR-0071 §1-3, §8, §10) as the UI has to
+// Org-level Environment governance as the UI has to
 // reason about it. Pure — no DOM, no fetch — so Settings › Environments, the
 // repository's Environments tab and their tests agree on what a form sends
 // and what a line says.
@@ -78,8 +78,8 @@ export function toProtectionBody(form: RulesForm): Built<ProtectionBody> {
 }
 
 /** The rules protect nothing: no approver, any ref, no wait, no reason — the
- *  baseline the migration gave every Environment (ADR-0071 §10 step 1).
- *  Shown as a warning: set a baseline. */
+ *  baseline the migration gave every Environment. Shown as a warning: set a
+ *  baseline. */
 export function isPermissive(rules: RulesLike): boolean {
   return (
     rules.approvers.length === 0 &&
@@ -120,6 +120,32 @@ export function eligibilityLabel(e: EligibilityLike): string {
   return projects.join(", ");
 }
 
+/** Some project may deploy into it: the all-projects toggle, or at least one
+ *  pattern. An empty list admits no project. */
+export function hasEligibleProjects(e: EligibilityLike): boolean {
+  return e.all_projects || (e.projects ?? []).length > 0;
+}
+
+/** The Environment is open to deploys and no baseline rule protects it: only
+ *  each project's own overlay does. One with no eligible project takes no
+ *  deploy, so its permissive baseline is not yet a gap. */
+export function unprotectedButOpen(env: {
+  protection: RulesLike;
+  eligibility: EligibilityLike;
+}): boolean {
+  return isPermissive(env.protection) && hasEligibleProjects(env.eligibility);
+}
+
+/** The banner over the org's Environment list: how many Environments take
+ *  deploys with no baseline rule. `null` when there are none. */
+export function unprotectedBanner(
+  envs: readonly { protection: RulesLike; eligibility: EligibilityLike }[],
+): string | null {
+  const n = envs.filter(unprotectedButOpen).length;
+  if (n === 0) return null;
+  return `${n} environment${n === 1 ? "" : "s"} ${n === 1 ? "takes" : "take"} deploys with no baseline rule: only each project's own overlay protects ${n === 1 ? "it" : "them"}. Set a baseline on ${n === 1 ? "it" : "each"}.`;
+}
+
 /** Why a pattern made only of `*` is refused: it would admit every project,
  *  which is the all-projects setting's job. The server says the same. */
 export const STAR_ONLY_PATTERN_ERROR =
@@ -158,28 +184,16 @@ export function tightenable<T extends { name: string; eligible: boolean; overlay
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
-/** A split-report line as the server serialises it (the fields used here). */
-export type ReportLineLike = {
-  environment: string;
-  acknowledged_at?: number | null;
-  permissive_baseline: boolean;
-  environment_exists: boolean;
-};
+/** A split-report line as the server serialises it (the field used here). */
+export type ReportLineLike = { acknowledged_at?: number | null };
 
-/** The count banner over the split report: lines still to review, and how
- *  many of the Environments in it still have a permissive baseline. `null`
- *  when there is nothing to say. */
+/** The count banner over the split report: the lines still to review. `null`
+ *  once every line is reviewed. Permissive baselines are counted by
+ *  [`unprotectedBanner`] over every Environment, not here. */
 export function reportBanner(lines: readonly ReportLineLike[]): string | null {
   const open = lines.filter((l) => l.acknowledged_at == null).length;
-  const permissive = lines.filter((l) => l.environment_exists && l.permissive_baseline).length;
-  const parts: string[] = [];
-  if (open > 0) parts.push(`${open} migrated environment${open === 1 ? "" : "s"} to review`);
-  if (permissive > 0) {
-    parts.push(
-      `${permissive} with a permissive baseline — set a baseline so the place is protected, not only each project`,
-    );
-  }
-  return parts.length ? parts.join(" · ") : null;
+  if (open === 0) return null;
+  return `${open} migrated environment${open === 1 ? "" : "s"} to review`;
 }
 
 /** One whitelist row as the grant form holds it. */
