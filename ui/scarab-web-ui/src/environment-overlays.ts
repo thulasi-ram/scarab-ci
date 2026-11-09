@@ -120,13 +120,30 @@ export function eligibilityLabel(e: EligibilityLike): string {
   return projects.join(", ");
 }
 
-/** The eligibility PUT body from the form's toggle and pattern list. */
+/** Why a pattern made only of `*` is refused: it would admit every project,
+ *  which is the all-projects setting's job. The server says the same. */
+export const STAR_ONLY_PATTERN_ERROR =
+  'A pattern of only * admits every project. Check "Every project" instead.';
+
+/** The eligibility PUT body from the form's toggle and pattern list. The
+ *  server's rules: patterns are trimmed, a pattern of only `*` is refused,
+ *  and project names match ignoring ASCII case, so two patterns that differ
+ *  only in case are one (the first is kept). */
 export function toEligibilityBody(
   allProjects: boolean,
   patterns: string,
 ): Built<{ all_projects: boolean; projects: string[] }> {
   if (allProjects) return { body: { all_projects: true, projects: [] } };
-  return { body: { all_projects: false, projects: splitList(patterns) } };
+  const projects: string[] = [];
+  const seen = new Set<string>();
+  for (const p of splitList(patterns)) {
+    if (/^\*+$/.test(p)) return { error: STAR_ONLY_PATTERN_ERROR };
+    const key = p.replace(/[A-Z]/g, (c) => c.toLowerCase());
+    if (seen.has(key)) continue;
+    seen.add(key);
+    projects.push(p);
+  }
+  return { body: { all_projects: false, projects } };
 }
 
 /** The Environments a Project may tighten: the eligible ones, plus any it

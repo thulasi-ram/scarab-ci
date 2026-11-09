@@ -774,6 +774,15 @@ impl EnvironmentGovernanceStore for RacingGovernance {
     ) -> Result<Option<scarab_project::EnvironmentNameClaim>, OrgEnvironmentError> {
         self.inner.claim_environment_name(org, name).await
     }
+    async fn delete_environment_cascade(
+        &self,
+        org: &str,
+        environment: &str,
+    ) -> Result<Option<scarab_project::EnvironmentCascadeDeletion>, OrgEnvironmentError> {
+        self.inner
+            .delete_environment_cascade(org, environment)
+            .await
+    }
     async fn duplicate_environment(
         &self,
         org: &str,

@@ -744,11 +744,22 @@ export interface paths {
         put: operations["put_org_environment"];
         post?: never;
         /**
-         * Delete an org Environment (ADR-0071)
+         * Delete an org Environment, with its overlays, grants and secrets when asked (ADR-0071)
          * @description Refused (409) while any Project holds an overlay or privilege grant in
          *     it (ADR-0071 §3, §8: those are never dropped as a side effect), and while
          *     any Project holds a secret in it (git-bug 52964b4): a secret never
          *     outlives its Environment, and is never dropped as a side effect either.
+         *     The refusal's JSON body lists them, with a count per kind.
+         *
+         *     With `?cascade=true` the admin asks for them to go too (git-bug
+         *     a144fb1): every Project's overlay and privilege grant, deleted with the
+         *     Environment and its eligibility in one transaction, and the
+         *     Environment's secrets. The secret store cannot share that transaction,
+         *     so the secrets are deleted first, under the Environment's name claim
+         *     (no secret write into the Environment can land meanwhile). If a secret
+         *     delete or the transaction fails, the Environment stays, and a retry
+         *     deletes what is left. What was deleted, by name, is recorded on the
+         *     operation's `op.completed` event in the OrgSecurityEventLog.
          */
         delete: operations["delete_org_environment"];
         options?: never;
@@ -3247,6 +3258,25 @@ export interface components {
             wait_timer_s: number;
         };
         /**
+         * @description Why a plain delete was refused (409): what the Environment still holds.
+         *     `?cascade=true` deletes all of it with the Environment.
+         */
+        EnvironmentDeleteBlockersDto: {
+            /** @description `environment_in_use`. */
+            code: string;
+            message: string;
+            overlay_count: number;
+            /** @description Projects holding an overlay in it. */
+            overlays: string[];
+            privilege_grant_count: number;
+            /** @description Projects holding a privilege grant in it. */
+            privilege_grants: string[];
+            /** @description Secret keys, across every Project. */
+            secret_count: number;
+            /** @description Its EnvironmentProjectSecretScope secrets, by Project. */
+            secrets: components["schemas"]["EnvironmentProjectSecretKeysDto"][];
+        };
+        /**
          * @description Which Projects may run Deploy Runs into an Environment (ADR-0071 §2):
          *     every Project in the org, or exactly those matching one of `projects`
          *     (project-name globs, `*` wildcards).
@@ -3255,8 +3285,10 @@ export interface components {
             /** @description Every Project in the org. `projects` must then be empty. */
             all_projects: boolean;
             /**
-             * @description Project-name globs. An empty list with `all_projects: false` admits
-             *     **no** Project — eligibility starts closed.
+             * @description Project-name globs, matched ignoring ASCII case. Stored trimmed; a
+             *     pattern of only `*` is refused (use `all_projects`), and so is one
+             *     listed twice. An empty list with `all_projects: false` admits **no**
+             *     Project — eligibility starts closed.
              */
             projects?: string[];
         };
@@ -3327,6 +3359,11 @@ export interface components {
         EnvironmentProjectPrivilegeGrantDto: {
             permit_k8s_overlay: boolean;
             privileged_images: components["schemas"]["ImageGrantDto"][];
+        };
+        /** @description One Project's secrets in an Environment, by key. Never a value. */
+        EnvironmentProjectSecretKeysDto: {
+            keys: string[];
+            project: string;
         };
         /**
          * @description Protection rules as one layer holds them — an Environment's baseline or a
@@ -7290,7 +7327,14 @@ export interface operations {
     };
     delete_org_environment: {
         parameters: {
-            query?: never;
+            query?: {
+                /**
+                 * @description `true`: delete every Project's overlay, privilege grant and secret
+                 *     in the Environment with it. Without it a delete is refused (409)
+                 *     while any exists, and the refusal lists them.
+                 */
+                cascade?: boolean;
+            };
             header?: never;
             path: {
                 /** @description org */
@@ -7309,7 +7353,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description not an org admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            /** @description not an org admin, or no step-up — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -7325,12 +7369,14 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description project overlays, grants or secrets still pin the Environment */
+            /** @description project overlays, grants or secrets still pin the Environment (JSON, without `cascade`); or, as text, it is being changed or its secrets cannot be listed */
             409: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": components["schemas"]["EnvironmentDeleteBlockersDto"];
+                };
             };
             /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
             429: {
@@ -7470,7 +7516,7 @@ export interface operations {
                     "application/json": components["schemas"]["EnvironmentEligibilityDto"];
                 };
             };
-            /** @description an empty or duplicated pattern, or patterns with all_projects */
+            /** @description an empty, `*`-only or duplicated pattern (after trimming, case ignored), or patterns with all_projects */
             400: {
                 headers: {
                     [name: string]: unknown;

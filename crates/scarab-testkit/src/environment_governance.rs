@@ -15,8 +15,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use scarab_project::{
-    migrate_legacy_environment, DeployGovernance, Environment, EnvironmentGovernanceStore,
-    EnvironmentMigrationAcknowledgement, EnvironmentMigrationReport,
+    migrate_legacy_environment, DeployGovernance, Environment, EnvironmentCascadeDeletion,
+    EnvironmentGovernanceStore, EnvironmentMigrationAcknowledgement, EnvironmentMigrationReport,
     EnvironmentMigrationReportProject, EnvironmentNameClaim, EnvironmentProjectEligibility,
     EnvironmentProjectOverlay, EnvironmentProjectPrivilegeGrant, EnvironmentProjectRecord,
     EnvironmentProtectionRules, ImageGrant, OrgEnvironment, OrgEnvironmentError, ProtectionRules,
@@ -367,6 +367,8 @@ impl EnvironmentGovernanceStore for InMemoryEnvironmentGovernance {
         updated_by: &str,
         updated_at: i64,
     ) -> Result<OrgEnvironment, OrgEnvironmentError> {
+        // Stored trimmed, as Postgres stores it.
+        let eligibility = &eligibility.normalized();
         eligibility.validate()?;
         let mut state = self.state.lock().unwrap();
         let env = state
@@ -503,6 +505,37 @@ impl EnvironmentGovernanceStore for InMemoryEnvironmentGovernance {
         })))
     }
 
+    async fn delete_environment_cascade(
+        &self,
+        org: &str,
+        environment: &str,
+    ) -> Result<Option<EnvironmentCascadeDeletion>, OrgEnvironmentError> {
+        // One lock: all or nothing, as Postgres' transaction.
+        let mut state = self.state.lock().unwrap();
+        let key = (org.to_string(), environment.to_string());
+        if state.environments.remove(&key).is_none() {
+            return Ok(None);
+        }
+        let in_env = |(o, e, _): &ProjectKey| o == org && e == environment;
+        let mut deleted = EnvironmentCascadeDeletion::default();
+        let overlays: Vec<ProjectKey> = state
+            .overlays
+            .keys()
+            .filter(|k| in_env(k))
+            .cloned()
+            .collect();
+        for k in overlays {
+            state.overlays.remove(&k);
+            deleted.overlays.push(k.2);
+        }
+        let grants: Vec<ProjectKey> = state.grants.keys().filter(|k| in_env(k)).cloned().collect();
+        for k in grants {
+            state.grants.remove(&k);
+            deleted.privilege_grants.push(k.2);
+        }
+        Ok(Some(deleted))
+    }
+
     async fn duplicate_environment(
         &self,
         org: &str,
@@ -527,7 +560,13 @@ impl EnvironmentGovernanceStore for InMemoryEnvironmentGovernance {
             updated_by: updated_by.to_string(),
             ..source
         };
-        copy.validate()?;
+        // The name and display name only: the eligibility is copied as
+        // stored, as Postgres copies it, so a row written before a pattern
+        // rule existed does not stop a duplicate.
+        scarab_project::validate_org_environment_name(&copy.name)?;
+        if let Some(d) = &copy.display_name {
+            scarab_project::validate_org_environment_display_name(d)?;
+        }
         if state
             .environments
             .contains_key(&(org.to_string(), to.to_string()))

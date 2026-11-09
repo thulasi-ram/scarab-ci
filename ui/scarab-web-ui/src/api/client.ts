@@ -4,6 +4,7 @@ import createClient from "openapi-fetch";
 import { createSignal } from "solid-js";
 import type { paths, components } from "./schema";
 import type { ParamSpec } from "../params";
+import { isDeleteBlockers } from "../org-environments";
 import { askStepUp, errorMessage, shareCeremony, withStepUp } from "../step-up";
 
 export type RunStatus = components["schemas"]["RunStatusResponse"];
@@ -741,13 +742,24 @@ export async function putOrgEnvironment(
 
 /** Delete an Environment (`DELETE /v1/orgs/{org}/environments/{env}`), org
  *  admins only. */
-export async function deleteOrgEnvironment(org: string, env: string): Promise<void> {
+/** What a plain delete answers (409) while projects hold overlays, grants or
+ *  secrets in the Environment. */
+export type EnvironmentDeleteBlockers = components["schemas"]["EnvironmentDeleteBlockersDto"];
+
+/** Delete an org Environment. `null` once deleted; the blockers when a plain
+ *  delete was refused because projects hold overlays, grants or secrets in
+ *  it. `cascade` deletes those with it. Any other refusal throws. */
+export async function deleteOrgEnvironment(
+  org: string,
+  env: string,
+  cascade = false,
+): Promise<EnvironmentDeleteBlockers | null> {
   const { error, response } = await api.DELETE("/v1/orgs/{org}/environments/{env}", {
-    params: { path: { org, env } },
+    params: { path: { org, env }, query: cascade ? { cascade: true } : {} },
   });
-  if (error) {
-    throw new Error(errorText(error) || `could not delete ${env} (${response.status})`);
-  }
+  if (!error) return null;
+  if (response.status === 409 && isDeleteBlockers(error)) return error;
+  throw new Error(errorText(error) || `could not delete ${env} (${response.status})`);
 }
 
 /** A duplicate's answer: the new Environment, what was copied, and what was

@@ -2,7 +2,10 @@ import { describe, it, expect } from "vitest";
 import { decodeParam } from "./settings-nav";
 import {
   approvalGateFacts,
+  blockerLines,
+  cascadeDeleteLabel,
   confirmsName,
+  isDeleteBlockers,
   durationText,
   idleTimerWarning,
   requiredApprovalsError,
@@ -23,6 +26,7 @@ import {
   toDuplicateBody,
   toEditForm,
   toPutBody,
+  type DeleteBlockersLike,
   type DuplicateResultLike,
   type EditableEnvironmentLike,
   type EnvironmentWrite,
@@ -508,5 +512,50 @@ describe("runSave", () => {
     });
     expect(problem).toBe("Could not check the environment before saving: network down.");
     expect(sent).toEqual([]);
+  });
+});
+
+describe("delete blockers", () => {
+  const blockers: DeleteBlockersLike = {
+    code: "environment_in_use",
+    overlay_count: 1,
+    privilege_grant_count: 2,
+    secret_count: 3,
+    overlays: ["web"],
+    privilege_grants: ["api", "web"],
+    secrets: [
+      { project: "api", keys: ["DB_PASSWORD"] },
+      { project: "web", keys: ["API_KEY", "DB_PASSWORD"] },
+    ],
+  };
+
+  it("recognises the 409 body and nothing else", () => {
+    expect(isDeleteBlockers(blockers)).toBe(true);
+    expect(isDeleteBlockers("environment `prod` is being changed; try again")).toBe(false);
+    expect(isDeleteBlockers({ code: "step_up_required", message: "confirm" })).toBe(false);
+  });
+
+  it("names every kind and count on the confirming button", () => {
+    expect(cascadeDeleteLabel(blockers)).toBe(
+      "Delete the environment and its 1 overlay, 2 grants and 3 secrets",
+    );
+  });
+
+  it("leaves out kinds with none", () => {
+    expect(
+      cascadeDeleteLabel({ ...blockers, overlay_count: 0, privilege_grant_count: 0, secret_count: 1 }),
+    ).toBe("Delete the environment and its 1 secret");
+    expect(
+      cascadeDeleteLabel({ ...blockers, overlay_count: 0, privilege_grant_count: 0, secret_count: 0 }),
+    ).toBe("Delete environment");
+  });
+
+  it("lists the projects and secret names", () => {
+    expect(blockerLines(blockers)).toEqual([
+      "Overlays of web",
+      "Privilege grants of api and web",
+      "Secrets of api: DB_PASSWORD",
+      "Secrets of web: API_KEY, DB_PASSWORD",
+    ]);
   });
 });

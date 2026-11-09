@@ -32,6 +32,7 @@ import {
   putOrgEnvironment,
   putPrivilegeGrant,
   type DuplicateEnvironmentResult,
+  type EnvironmentDeleteBlockers,
   type OrgEnvironment,
 } from "../api/client";
 import {
@@ -44,6 +45,8 @@ import {
 } from "../environment-overlays";
 import {
   approvalGateFacts,
+  blockerLines,
+  cascadeDeleteLabel,
   copiedSummary,
   displayNameError,
   durationText,
@@ -604,8 +607,9 @@ function EditForm(props: { org: string; env: OrgEnvironment }) {
                 label="Projects"
                 help={
                   <>
-                    Project (repository) names; <span class="mono">*</span> matches anything. Empty
-                    admits no project: a pipeline naming {props.env.name} is refused.
+                    Project (repository) names, case ignored; <span class="mono">*</span> matches
+                    anything. Empty admits no project: a pipeline naming {props.env.name} is
+                    refused.
                   </>
                 }
               >
@@ -850,31 +854,61 @@ function GrantsSection(props: { org: string; env: string; epoch: number; onChang
   );
 }
 
-/** Delete the Environment, after its name is typed. */
+/** Delete the Environment, after its name is typed. A plain delete is refused
+ *  while projects hold overlays, grants or secrets in it; the dialog then
+ *  lists them and its button deletes them with the Environment. */
 function DeleteSection(props: { org: string; name: string }) {
   const nav = useNavigate();
+  const [open, setOpen] = createSignal(false);
+  const [blockers, setBlockers] = createSignal<EnvironmentDeleteBlockers | null>(null);
+  const close = () => {
+    setOpen(false);
+    setBlockers(null);
+  };
+  const purpose = () =>
+    `Pipelines naming ${props.name} are refused until an environment of that name exists again.`;
+  const run = async () => {
+    const known = blockers();
+    const refused = await deleteOrgEnvironment(props.org, props.name, known !== null);
+    if (refused !== null) {
+      setBlockers(refused);
+      // Keeps the dialog open: the button now names what it deletes too.
+      throw new Error(
+        "Projects still hold overlays, grants or secrets here. Delete them with the environment, or remove them first.",
+      );
+    }
+    nav(environmentsHref(props.org));
+  };
   return (
     <div class="panel env-danger">
       <div class="panel-h">
         <span>Delete</span>
       </div>
       <div class="secrets-body">
-        <p>
-          Pipelines naming <b class="mono">{props.name}</b> are refused until an environment of that
-          name exists again.
-        </p>
+        <p>{purpose()}</p>
         <div>
-          <TypedConfirm
-            name={props.name}
-            label="Delete environment"
-            title={`Delete ${props.name}?`}
-            purpose={`Pipelines naming ${props.name} are refused until an environment of that name exists again.`}
-            confirm="Delete environment"
-            run={async () => {
-              await deleteOrgEnvironment(props.org, props.name);
-              nav(environmentsHref(props.org));
-            }}
-          />
+          <button class="btn btn-danger btn-sm" onClick={() => setOpen(true)}>
+            Delete environment
+          </button>
+          <Show when={open()}>
+            <ConfirmDestructive
+              title={`Delete ${props.name}?`}
+              purpose={purpose()}
+              name={props.name}
+              confirmLabel={blockers() ? cascadeDeleteLabel(blockers()!) : "Delete environment"}
+              onConfirm={run}
+              onClose={close}
+            >
+              {blockers() && (
+                <>
+                  <p>These go with it, and cannot be brought back:</p>
+                  <ul>
+                    <For each={blockerLines(blockers()!)}>{(line) => <li>{line}</li>}</For>
+                  </ul>
+                </>
+              )}
+            </ConfirmDestructive>
+          </Show>
         </div>
       </div>
     </div>

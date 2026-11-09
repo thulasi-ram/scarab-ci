@@ -37,12 +37,14 @@ scopes secrets. Add approvers and it becomes gated.
 ## Who may run in it
 
 An Environment admits Runs only from the Projects on its **eligibility** list: *all projects*, or
-an explicit list (project-name globs allowed). A new Environment starts with **no** eligible
-Projects, and a pipeline that names an unknown Environment, or one that doesn't admit its Project,
-is refused before any Pod starts. When a webhook-triggered pipeline is refused this way, Scarab
-posts a `failure` commit status under the pipeline's `scarab/<pipeline>` context that says what an
-org admin must change and links to the org's Environment settings. A push from a branch the
-Environment's `allowed_refs` leave out posts no status.
+an explicit list (project-name globs allowed). Patterns match project names ignoring case, so
+`Web*` admits `web-api`. A pattern of only `*` is refused: choose *all projects* instead. A new
+Environment starts with **no** eligible Projects, and a pipeline that names an unknown Environment,
+or one that doesn't admit its Project, is refused before any Pod starts. When a webhook-triggered
+pipeline is refused this way, Scarab posts a `failure` commit status under the pipeline's
+`scarab/<pipeline>` context that says what an org admin must change and links to the org's
+Environment settings. A push from a branch the Environment's `allowed_refs` leave out posts no
+status.
 
 Org admins create Environments and edit their eligibility and rules, under the org's
 **Settings › Environments** (`/orgs/<org>/settings/environments`).
@@ -54,7 +56,9 @@ name, description, the baseline, **Projects that may use** it, and, under **Proj
 grants**, each project's overlay and privilege grant. Its **Edit** button opens `…/<name>/edit`, where you change the display name,
 the description, the baseline and eligibility (one **Save** sends only the parts you changed),
 each project's privilege grant, and delete the Environment. Deleting it, or withdrawing a grant,
-asks you to type the Environment's name.
+asks you to type the Environment's name. While projects hold overlays, privilege grants or secrets
+in the Environment, a delete is refused and the dialog lists them; its button then deletes them
+with the Environment (`DELETE …?cascade=true`).
 
 ## Name and display name
 
@@ -240,7 +244,7 @@ Org Environments live under `/v1/orgs/{org}/environments` (writes need org admin
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/v1/orgs/{org}/environments` | List the org's Environments |
-| `PUT` / `GET` / `DELETE` | `/v1/orgs/{org}/environments/{env}` | Create or replace (display name and description), read, delete one |
+| `PUT` / `GET` / `DELETE` | `/v1/orgs/{org}/environments/{env}` | Create or replace (display name and description), read, delete one (`?cascade=true` also deletes its overlays, grants and secrets) |
 | `POST` | `/v1/orgs/{org}/environments/{env}/duplicate` | Copy it under a new name; the answer lists what was not copied |
 | `PUT` / `GET` | `/v1/orgs/{org}/environments/{env}/protection` | The baseline protection rules |
 | `PUT` / `GET` | `/v1/orgs/{org}/environments/{env}/eligibility` | Which Projects may run in it |
