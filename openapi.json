@@ -3942,6 +3942,103 @@
         ]
       }
     },
+    "/v1/orgs/{org}/plugins/{name}/broker-journal": {
+      "get": {
+        "tags": [
+          "Plugins"
+        ],
+        "summary": "A plugin's broker journal, newest first (ADR-0072 §5)",
+        "operationId": "plugin_broker_journal",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "installation name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "At most this many rows (default 100, at most 500).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "before",
+            "in": "query",
+            "description": "Only rows older than this id: the previous page's `next_before`.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "phase",
+            "in": "query",
+            "description": "Only rows of this phase.",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/BrokerJournalPhaseDto"
+            }
+          },
+          {
+            "name": "denied",
+            "in": "query",
+            "description": "`true`: only rows with a `denied_reason` (refusals and streams that\nended short).",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BrokerJournalPage"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "an unreadable query parameter"
+          },
+          "403": {
+            "description": "not an org admin"
+          },
+          "404": {
+            "description": "no such installation, or plugins not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
     "/v1/orgs/{org}/plugins/{name}/connections": {
       "get": {
         "tags": [
@@ -9035,6 +9132,137 @@
             "type": "string"
           }
         }
+      },
+      "BrokerJournalEntryDto": {
+        "type": "object",
+        "description": "One row of an installation's broker journal: a request its plugin sent to\nthe CredentialBroker, and what the broker did with it.",
+        "required": [
+          "id",
+          "request_id",
+          "phase",
+          "slot",
+          "method",
+          "path",
+          "query_keys",
+          "started_at"
+        ],
+        "properties": {
+          "bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Response body bytes delivered to the plugin (`end` rows).",
+            "minimum": 0
+          },
+          "denied_reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the broker refused it, or why its stream ended short (`cut: …`)."
+          },
+          "duration_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Until the refusal, the response head, or the end of the body.",
+            "minimum": 0
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The row's id; pass the last one of a page as `before` for the next."
+          },
+          "method": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string",
+            "description": "The request path after the slot, as the plugin sent it."
+          },
+          "phase": {
+            "$ref": "#/components/schemas/BrokerJournalPhaseDto"
+          },
+          "query_keys": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The names of the query parameters, in order. Their values are not\nreturned: on a refused row the query is stored as the plugin sent it."
+          },
+          "request_id": {
+            "type": "string",
+            "description": "Ties a request's `head` row to its `end` row."
+          },
+          "rule": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The read rule that admitted it (`GET /api/v1/applications/*`)."
+          },
+          "slot": {
+            "type": "string",
+            "description": "The connection slot the request named (it may name no real slot)."
+          },
+          "started_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When the request reached the broker (Unix ms)."
+          },
+          "status": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The status the plugin got: the upstream's, or the broker's refusal.",
+            "minimum": 0
+          },
+          "upstream_path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The path forwarded upstream; absent when it was refused before a read\nrule matched."
+          }
+        }
+      },
+      "BrokerJournalPage": {
+        "type": "object",
+        "description": "A page of an installation's broker journal, newest first.",
+        "required": [
+          "entries"
+        ],
+        "properties": {
+          "entries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BrokerJournalEntryDto"
+            }
+          },
+          "next_before": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Pass as `before` to read the next, older page; absent on the last."
+          }
+        }
+      },
+      "BrokerJournalPhaseDto": {
+        "type": "string",
+        "description": "One phase of a broker journal row. `refused`: the broker answered the\nrequest itself and sent nothing upstream. `head`: it forwarded the request\nand the upstream's response head arrived. `end`: that response's body\nended. A forwarded request has a `head` and an `end` row with the same\n`request_id`.",
+        "enum": [
+          "refused",
+          "head",
+          "end"
+        ]
       },
       "CapabilityRequirementDto": {
         "type": "object",
@@ -14609,7 +14837,7 @@
     },
     {
       "name": "Plugins",
-      "description": "PluginInstallations (ADR-0072): the first-party catalog, install and uninstall, the kill switch, and the PluginConnections the CredentialBroker proxies to."
+      "description": "PluginInstallations (ADR-0072): the first-party catalog, install and uninstall, the kill switch, the PluginConnections the CredentialBroker proxies to, and its journal of what each plugin asked for."
     },
     {
       "name": "Libraries",

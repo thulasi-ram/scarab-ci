@@ -1124,6 +1124,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/orgs/{org}/plugins/{name}/broker-journal": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** A plugin's broker journal, newest first (ADR-0072 §5) */
+        get: operations["plugin_broker_journal"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/orgs/{org}/plugins/{name}/connections": {
         parameters: {
             query?: never;
@@ -2706,6 +2723,77 @@ export interface components {
             kind: string;
             name: string;
         };
+        /**
+         * @description One row of an installation's broker journal: a request its plugin sent to
+         *     the CredentialBroker, and what the broker did with it.
+         */
+        BrokerJournalEntryDto: {
+            /**
+             * Format: int64
+             * @description Response body bytes delivered to the plugin (`end` rows).
+             */
+            bytes?: number | null;
+            /** @description Why the broker refused it, or why its stream ended short (`cut: …`). */
+            denied_reason?: string | null;
+            /**
+             * Format: int64
+             * @description Until the refusal, the response head, or the end of the body.
+             */
+            duration_ms?: number | null;
+            /**
+             * Format: int64
+             * @description The row's id; pass the last one of a page as `before` for the next.
+             */
+            id: number;
+            method: string;
+            /** @description The request path after the slot, as the plugin sent it. */
+            path: string;
+            phase: components["schemas"]["BrokerJournalPhaseDto"];
+            /**
+             * @description The names of the query parameters, in order. Their values are not
+             *     returned: on a refused row the query is stored as the plugin sent it.
+             */
+            query_keys: string[];
+            /** @description Ties a request's `head` row to its `end` row. */
+            request_id: string;
+            /** @description The read rule that admitted it (`GET /api/v1/applications/*`). */
+            rule?: string | null;
+            /** @description The connection slot the request named (it may name no real slot). */
+            slot: string;
+            /**
+             * Format: int64
+             * @description When the request reached the broker (Unix ms).
+             */
+            started_at: number;
+            /**
+             * Format: int32
+             * @description The status the plugin got: the upstream's, or the broker's refusal.
+             */
+            status?: number | null;
+            /**
+             * @description The path forwarded upstream; absent when it was refused before a read
+             *     rule matched.
+             */
+            upstream_path?: string | null;
+        };
+        /** @description A page of an installation's broker journal, newest first. */
+        BrokerJournalPage: {
+            entries: components["schemas"]["BrokerJournalEntryDto"][];
+            /**
+             * Format: int64
+             * @description Pass as `before` to read the next, older page; absent on the last.
+             */
+            next_before?: number | null;
+        };
+        /**
+         * @description One phase of a broker journal row. `refused`: the broker answered the
+         *     request itself and sent nothing upstream. `head`: it forwarded the request
+         *     and the upstream's response head arrived. `end`: that response's body
+         *     ended. A forwarded request has a `head` and an `end` row with the same
+         *     `request_id`.
+         * @enum {string}
+         */
+        BrokerJournalPhaseDto: "refused" | "head" | "end";
         /**
          * @description One capability Scarab needs of a forge app, as the preflight reports it
          *     (`scarab_forge::preflight::ForgeRequirement` on the wire).
@@ -8641,6 +8729,63 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["UninstalledPluginDto"];
                 };
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such installation, or plugins not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    plugin_broker_journal: {
+        parameters: {
+            query?: {
+                /** @description At most this many rows (default 100, at most 500). */
+                limit?: number;
+                /** @description Only rows older than this id: the previous page's `next_before`. */
+                before?: number;
+                /** @description Only rows of this phase. */
+                phase?: components["schemas"]["BrokerJournalPhaseDto"];
+                /**
+                 * @description `true`: only rows with a `denied_reason` (refusals and streams that
+                 *     ended short).
+                 */
+                denied?: boolean;
+            };
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description installation name */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BrokerJournalPage"];
+                };
+            };
+            /** @description an unreadable query parameter */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description not an org admin */
             403: {
