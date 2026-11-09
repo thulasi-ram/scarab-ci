@@ -3424,6 +3424,11 @@ h1, .crumb-head, .run-title {
 .plg-conn-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: var(--fs-sm); }
 .plg-slot { color: var(--soft-white); font-size: var(--fs-sm); }
 .plg-caps { display: flex; gap: 6px; flex-wrap: wrap; }
+/* The broker journal: one row per journaled request; the path wraps, the
+   short cells do not. */
+.plg-journal-wrap { overflow-x: auto; }
+.plg-journal td { white-space: nowrap; }
+.plg-journal td.plg-journal-path { white-space: normal; word-break: break-all; }
 /* A manifest capability on the install dialog: edged, not filled. */
 .dep-tag {
   font-family: var(--font-mono); font-size: var(--fs-xs);

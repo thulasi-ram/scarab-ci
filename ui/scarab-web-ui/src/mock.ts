@@ -33,6 +33,7 @@ type MigrationReportDto = components["schemas"]["EnvironmentMigrationReportDto"]
 type PluginCatalogEntryDto = components["schemas"]["PluginCatalogEntryDto"];
 type PluginInstallationDto = components["schemas"]["PluginInstallationDto"];
 type PluginConnectionDto = components["schemas"]["PluginConnectionDto"];
+type BrokerJournalEntryDto = components["schemas"]["BrokerJournalEntryDto"];
 type ScheduleDto = components["schemas"]["ScheduleDto"];
 type RefusedRunDto = components["schemas"]["RefusedRunDto"];
 
@@ -1079,6 +1080,69 @@ const pluginConnections: Record<string, PluginConnectionDto[]> = {
     }),
   ],
 };
+// Broker journal (ADR-0072 §5): `argocd`'s last few hours, newest first —
+// application reads (a `head` and an `end` row each), a watch stream cut by a
+// re-bind, and refusals: a query key no rule lists and a path no rule admits.
+// Enough rows for a second page. `argocd-us` has recorded nothing.
+const brokerJournal: Record<string, BrokerJournalEntryDto[]> = (() => {
+  const rows: BrokerJournalEntryDto[] = [];
+  let id = 4100;
+  const apps = ["checkout", "payments", "search", "ledger"];
+  // Oldest first; reversed at the end.
+  for (let i = 0; i < 70; i++) {
+    const started = ago((6 * 60 - i * 5) * min);
+    const req = `5c1e${(1000 + i).toString(16)}-7a2b-4c1d-9e3f-0b4a2d6c8e1f`;
+    const base = { request_id: req, slot: "argocd", method: "GET", started_at: started };
+    if (i % 17 === 5) {
+      rows.push({
+        ...base,
+        id: id++,
+        phase: "refused",
+        path: "/api/v1/applications",
+        upstream_path: null,
+        query_keys: ["projects", "refresh"],
+        rule: null,
+        status: 403,
+        bytes: null,
+        duration_ms: 0,
+        denied_reason: "query",
+      });
+      continue;
+    }
+    if (i % 23 === 11) {
+      rows.push({
+        ...base,
+        id: id++,
+        phase: "refused",
+        path: "/api/v1/session",
+        upstream_path: null,
+        query_keys: [],
+        rule: null,
+        status: 403,
+        bytes: null,
+        duration_ms: 0,
+        denied_reason: "no read rule",
+      });
+      continue;
+    }
+    const stream = i === 40;
+    const app = apps[i % apps.length]!;
+    const path = stream ? "/api/v1/stream/applications" : `/api/v1/applications/${app}`;
+    const rule = stream ? "GET /api/v1/stream/applications" : "GET /api/v1/applications/*";
+    const query_keys = stream ? ["projects", "resourceVersion"] : ["appNamespace"];
+    const forwarded = { ...base, path, upstream_path: path, query_keys, rule, status: 200 };
+    rows.push({ ...forwarded, id: id++, phase: "head", bytes: null, duration_ms: 40 + (i % 9) * 7, denied_reason: null });
+    rows.push({
+      ...forwarded,
+      id: id++,
+      phase: "end",
+      bytes: stream ? 186_412 : 3_100 + (i % 13) * 517,
+      duration_ms: stream ? 47 * min : 55 + (i % 9) * 9,
+      denied_reason: stream ? "cut: the connection was re-bound" : null,
+    });
+  }
+  return { argocd: rows.reverse(), "argocd-us": [] };
+})();
 const secretNames = { names: ["DATABASE_URL", "SENTRY_DSN"] };
 // Org scope (no `repo=`) holds the org-wide base of the inheritance chain — the
 // Settings page's Org Secrets section (ADR-0060).
@@ -1857,6 +1921,26 @@ function route(pathname: string, search: string, method: string, body = ""): Res
         owner_annotation: "scarab.io/plugin-installation",
         owner_annotation_value: `${found.org}/${found.name}`,
       },
+    });
+  }
+  if ((m = p.match(/^\/v1\/orgs\/[^/]+\/plugins\/([^/]+)\/broker-journal$/))) {
+    const found = plugins.find((x) => x.name === decodeURIComponent(m![1]!));
+    if (!found) return new Response("no such installation", { status: 404 });
+    const q = new URLSearchParams(search);
+    const limit = Math.min(Math.max(Number(q.get("limit") ?? 100) || 100, 1), 500);
+    const before = q.get("before");
+    const phase = q.get("phase");
+    const denied = q.get("denied") === "true";
+    const matching = (brokerJournal[found.name] ?? []).filter(
+      (e) =>
+        (before == null || e.id < Number(before)) &&
+        (!phase || e.phase === phase) &&
+        (!denied || e.denied_reason != null),
+    );
+    const entries = matching.slice(0, limit);
+    return json({
+      entries,
+      next_before: matching.length > limit ? entries[entries.length - 1]!.id : null,
     });
   }
   if ((m = p.match(/^\/v1\/orgs\/[^/]+\/plugins\/([^/]+)\/connections(?:\/([^/]+))?$/))) {

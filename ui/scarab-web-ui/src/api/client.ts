@@ -1113,6 +1113,30 @@ export async function deletePluginConnection(org: string, name: string, slot: st
   }
 }
 
+export type BrokerJournalEntry = components["schemas"]["BrokerJournalEntryDto"];
+export type BrokerJournalPage = components["schemas"]["BrokerJournalPage"];
+
+/** A page of an installation's broker journal, newest first
+ *  (`GET …/plugins/{name}/broker-journal`). */
+export async function getPluginBrokerJournal(
+  org: string,
+  name: string,
+  query: {
+    limit?: number;
+    before?: number;
+    phase?: components["schemas"]["BrokerJournalPhaseDto"];
+    denied?: boolean;
+  },
+): Promise<BrokerJournalPage> {
+  const { data, error, response } = await api.GET("/v1/orgs/{org}/plugins/{name}/broker-journal", {
+    params: { path: { org, name }, query },
+  });
+  if (error || !data) {
+    throw new Error(errorText(error) || `failed to load ${name}'s broker journal (${response.status})`);
+  }
+  return data;
+}
+
 /** Fetch a run's status + steps (dogfoods `GET /v1/runs/{id}`). */
 export async function getRun(id: string): Promise<RunStatus> {
   const { data, error } = await api.GET("/v1/runs/{id}", {
