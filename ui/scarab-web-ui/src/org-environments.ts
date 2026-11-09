@@ -455,6 +455,70 @@ export async function runSave(
   return null;
 }
 
+// ── Delete ───────────────────────────────────────────────────────────────────
+//
+// A plain `DELETE …/environments/<name>` is refused (409) while a project
+// holds an overlay, a privilege grant or a secret in the Environment. The
+// refusal lists them. `?cascade=true` deletes them with the Environment.
+
+/** The 409 body of a plain delete (structural). */
+export type DeleteBlockersLike = {
+  code: string;
+  overlay_count: number;
+  privilege_grant_count: number;
+  secret_count: number;
+  overlays: readonly string[];
+  privilege_grants: readonly string[];
+  secrets: readonly { project: string; keys: readonly string[] }[];
+};
+
+/** Is `x` the 409 body that lists what blocks a delete? */
+export function isDeleteBlockers(x: unknown): x is DeleteBlockersLike {
+  return (
+    typeof x === "object" &&
+    x !== null &&
+    (x as { code?: unknown }).code === "environment_in_use" &&
+    Array.isArray((x as { overlays?: unknown }).overlays)
+  );
+}
+
+const counted = (count: number, one: string, many: string) =>
+  `${count} ${count === 1 ? one : many}`;
+
+/** "a, b and c". */
+const andList = (xs: readonly string[]) =>
+  xs.length <= 1 ? xs.join("") : `${xs.slice(0, -1).join(", ")} and ${xs[xs.length - 1]}`;
+
+/** The confirming button once the blockers are known: "Delete the
+ *  environment and its 1 overlay, 1 grant and 2 secrets". Kinds with none
+ *  are left out. */
+export function cascadeDeleteLabel(b: DeleteBlockersLike): string {
+  const parts = [
+    b.overlay_count > 0 ? counted(b.overlay_count, "overlay", "overlays") : null,
+    b.privilege_grant_count > 0 ? counted(b.privilege_grant_count, "grant", "grants") : null,
+    b.secret_count > 0 ? counted(b.secret_count, "secret", "secrets") : null,
+  ].filter((p): p is string => p !== null);
+  return parts.length === 0
+    ? "Delete environment"
+    : `Delete the environment and its ${andList(parts)}`;
+}
+
+/** One line per kind that blocks the delete, naming the projects (and each
+ *  project's secret names). */
+export function blockerLines(b: DeleteBlockersLike): string[] {
+  const lines: string[] = [];
+  if (b.overlays.length > 0) {
+    lines.push(`Overlays of ${andList(b.overlays)}`);
+  }
+  if (b.privilege_grants.length > 0) {
+    lines.push(`Privilege grants of ${andList(b.privilege_grants)}`);
+  }
+  for (const s of b.secrets) {
+    lines.push(`Secrets of ${s.project}: ${s.keys.join(", ")}`);
+  }
+  return lines;
+}
+
 // ── Duplicate ────────────────────────────────────────────────────────────────
 //
 // `POST …/environments/<name>/duplicate` creates a new Environment with the

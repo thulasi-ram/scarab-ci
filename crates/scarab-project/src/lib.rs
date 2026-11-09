@@ -32,7 +32,7 @@ pub use org_environment::{
 mod environment_governance;
 pub use environment_governance::{
     effective_protection, migrate_legacy_environment, AllowedRefConstraint, ApprovalGateRules,
-    DeployGovernance, EffectiveProtection, EnvironmentGovernanceStore,
+    DeployGovernance, EffectiveProtection, EnvironmentCascadeDeletion, EnvironmentGovernanceStore,
     EnvironmentMigrationAcknowledgement, EnvironmentMigrationReport,
     EnvironmentMigrationReportProject, EnvironmentNameClaim, EnvironmentProjectEligibility,
     EnvironmentProjectOverlay, EnvironmentProjectPrivilegeGrant, EnvironmentProjectRecord,

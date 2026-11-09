@@ -13950,6 +13950,8 @@ impl utoipa::Modify for StepUpResponses {
         TokenSort,
         org_environments::OrgEnvironmentDto,
         org_environments::OrphanedSecretsDto,
+        org_environments::EnvironmentDeleteBlockersDto,
+        org_environments::EnvironmentProjectSecretKeysDto,
         org_environments::PutOrgEnvironmentRequest,
         org_environments::DuplicateOrgEnvironmentRequest,
         org_environments::DuplicateOrgEnvironmentResponse,

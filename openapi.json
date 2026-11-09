@@ -2001,8 +2001,8 @@
         "tags": [
           "Environments"
         ],
-        "summary": "Delete an org Environment (ADR-0071)",
-        "description": "Refused (409) while any Project holds an overlay or privilege grant in\nit (ADR-0071 §3, §8: those are never dropped as a side effect), and while\nany Project holds a secret in it (git-bug 52964b4): a secret never\noutlives its Environment, and is never dropped as a side effect either.",
+        "summary": "Delete an org Environment, with its overlays, grants and secrets when asked (ADR-0071)",
+        "description": "Refused (409) while any Project holds an overlay or privilege grant in\nit (ADR-0071 §3, §8: those are never dropped as a side effect), and while\nany Project holds a secret in it (git-bug 52964b4): a secret never\noutlives its Environment, and is never dropped as a side effect either.\nThe refusal's JSON body lists them, with a count per kind.\n\nWith `?cascade=true` the admin asks for them to go too (git-bug\na144fb1): every Project's overlay and privilege grant, deleted with the\nEnvironment and its eligibility in one transaction, and the\nEnvironment's secrets. The secret store cannot share that transaction,\nso the secrets are deleted first, under the Environment's name claim\n(no secret write into the Environment can land meanwhile). If a secret\ndelete or the transaction fails, the Environment stays, and a retry\ndeletes what is left. What was deleted, by name, is recorded on the\noperation's `op.completed` event in the OrgSecurityEventLog.",
         "operationId": "delete_org_environment",
         "parameters": [
           {
@@ -2022,6 +2022,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "cascade",
+            "in": "query",
+            "description": "`true`: delete every Project's overlay, privilege grant and secret\nin the Environment with it. Without it a delete is refused (409)\nwhile any exists, and the refusal lists them.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
           }
         ],
         "responses": {
@@ -2029,7 +2038,7 @@
             "description": "deleted"
           },
           "403": {
-            "description": "not an org admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "description": "not an org admin, or no step-up — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
             "content": {
               "application/json": {
                 "schema": {
@@ -2042,7 +2051,14 @@
             "description": "no such Environment, or not configured"
           },
           "409": {
-            "description": "project overlays, grants or secrets still pin the Environment"
+            "description": "project overlays, grants or secrets still pin the Environment (JSON, without `cascade`); or, as text, it is being changed or its secrets cannot be listed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EnvironmentDeleteBlockersDto"
+                }
+              }
+            }
           },
           "429": {
             "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
@@ -10021,6 +10037,63 @@
           }
         }
       },
+      "EnvironmentDeleteBlockersDto": {
+        "type": "object",
+        "description": "Why a plain delete was refused (409): what the Environment still holds.\n`?cascade=true` deletes all of it with the Environment.",
+        "required": [
+          "code",
+          "message",
+          "overlay_count",
+          "privilege_grant_count",
+          "secret_count",
+          "overlays",
+          "privilege_grants",
+          "secrets"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "`environment_in_use`."
+          },
+          "message": {
+            "type": "string"
+          },
+          "overlay_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "overlays": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Projects holding an overlay in it."
+          },
+          "privilege_grant_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "privilege_grants": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Projects holding a privilege grant in it."
+          },
+          "secret_count": {
+            "type": "integer",
+            "description": "Secret keys, across every Project.",
+            "minimum": 0
+          },
+          "secrets": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EnvironmentProjectSecretKeysDto"
+            },
+            "description": "Its EnvironmentProjectSecretScope secrets, by Project."
+          }
+        }
+      },
       "EnvironmentEligibilityDto": {
         "type": "object",
         "description": "Which Projects may run Deploy Runs into an Environment (ADR-0071 §2):\nevery Project in the org, or exactly those matching one of `projects`\n(project-name globs, `*` wildcards).",
@@ -10238,6 +10311,25 @@
             "items": {
               "$ref": "#/components/schemas/ImageGrantDto"
             }
+          }
+        }
+      },
+      "EnvironmentProjectSecretKeysDto": {
+        "type": "object",
+        "description": "One Project's secrets in an Environment, by key. Never a value.",
+        "required": [
+          "project",
+          "keys"
+        ],
+        "properties": {
+          "keys": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "project": {
+            "type": "string"
           }
         }
       },

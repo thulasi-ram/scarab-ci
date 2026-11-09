@@ -884,6 +884,35 @@ function projectEnvironments(project: string): ProjectEnvironmentDto[] {
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
+/** Secrets in each Environment's per-project scopes, by project: what a
+ *  delete of the Environment would take with it. Matches `secretMatrix`. */
+const environmentSecrets: Record<string, Record<string, string[]>> = {
+  production: { scarab: ["DATABASE_URL", "SLACK_WEBHOOK_URL"] },
+  qa: { scarab: ["DATABASE_URL"] },
+};
+
+/** The 409 a plain `DELETE …/environments/{env}` answers while projects hold
+ *  overlays, grants or secrets in it; `null` when nothing does. */
+function deleteBlockers(env: string) {
+  const overlayProjects = Object.keys(overlays[env] ?? {}).sort();
+  const grantProjects = Object.keys(grants[env] ?? {}).sort();
+  const secrets = Object.entries(environmentSecrets[env] ?? {})
+    .filter(([, keys]) => keys.length > 0)
+    .map(([project, keys]) => ({ project, keys }));
+  const secretCount = secrets.reduce((n, s) => n + s.keys.length, 0);
+  if (overlayProjects.length + grantProjects.length + secretCount === 0) return null;
+  return {
+    code: "environment_in_use",
+    message: `environment \`${env}\` still has project overlays, privilege grants or secrets`,
+    overlay_count: overlayProjects.length,
+    privilege_grant_count: grantProjects.length,
+    secret_count: secretCount,
+    overlays: overlayProjects,
+    privilege_grants: grantProjects,
+    secrets,
+  };
+}
+
 /** `GET …/environments/{env}/projects`: who holds an overlay or grant. */
 function environmentProjects(env: OrgEnvironmentDto): EnvironmentProjectDto[] {
   const names = new Set([
@@ -1801,7 +1830,15 @@ function route(pathname: string, search: string, method: string, body = ""): Res
   if ((m = p.match(/^\/v1\/orgs\/([^/]+)\/environments\/([^/]+)$/))) {
     const name = decodeURIComponent(m[2]!);
     const found = orgEnvironments.find((e) => e.name === name);
-    if (method === "DELETE") return new Response(null, { status: found ? 204 : 404 });
+    if (method === "DELETE") {
+      if (!found) return new Response("not found", { status: 404 });
+      // production is held by scarab's overlay, grant and secrets: a plain
+      // delete is refused with the list, `?cascade=true` deletes them too.
+      // Nothing is deleted here either way.
+      const blockers = deleteBlockers(name);
+      if (blockers && !new URLSearchParams(search).has("cascade")) return json(blockers, { status: 409 });
+      return new Response(null, { status: 204 });
+    }
     if (method === "PUT") {
       // Echo the stored record (or a fresh one) with the body's display name
       // and description; nothing is stored.

@@ -15,8 +15,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use scarab_project::{
-    migrate_legacy_environment, DeployGovernance, Environment, EnvironmentGovernanceStore,
-    EnvironmentMigrationAcknowledgement, EnvironmentMigrationReport,
+    migrate_legacy_environment, DeployGovernance, Environment, EnvironmentCascadeDeletion,
+    EnvironmentGovernanceStore, EnvironmentMigrationAcknowledgement, EnvironmentMigrationReport,
     EnvironmentMigrationReportProject, EnvironmentNameClaim, EnvironmentProjectEligibility,
     EnvironmentProjectOverlay, EnvironmentProjectPrivilegeGrant, EnvironmentProjectRecord,
     EnvironmentProtectionRules, ImageGrant, OrgEnvironment, OrgEnvironmentError, ProtectionRules,
@@ -503,6 +503,37 @@ impl EnvironmentGovernanceStore for InMemoryEnvironmentGovernance {
             claims: self.claims.clone(),
             key,
         })))
+    }
+
+    async fn delete_environment_cascade(
+        &self,
+        org: &str,
+        environment: &str,
+    ) -> Result<Option<EnvironmentCascadeDeletion>, OrgEnvironmentError> {
+        // One lock: all or nothing, as Postgres' transaction.
+        let mut state = self.state.lock().unwrap();
+        let key = (org.to_string(), environment.to_string());
+        if state.environments.remove(&key).is_none() {
+            return Ok(None);
+        }
+        let in_env = |(o, e, _): &ProjectKey| o == org && e == environment;
+        let mut deleted = EnvironmentCascadeDeletion::default();
+        let overlays: Vec<ProjectKey> = state
+            .overlays
+            .keys()
+            .filter(|k| in_env(k))
+            .cloned()
+            .collect();
+        for k in overlays {
+            state.overlays.remove(&k);
+            deleted.overlays.push(k.2);
+        }
+        let grants: Vec<ProjectKey> = state.grants.keys().filter(|k| in_env(k)).cloned().collect();
+        for k in grants {
+            state.grants.remove(&k);
+            deleted.privilege_grants.push(k.2);
+        }
+        Ok(Some(deleted))
     }
 
     async fn duplicate_environment(

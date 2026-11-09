@@ -248,6 +248,7 @@ pub async fn guard_with(table: &[RouteEntry], st: AppState, req: Request, next: 
         op,
         prepared: Some(prepared.clone()),
         ticket: Arc::new(Mutex::new(Ticket::Unresolved)),
+        completed_detail: Arc::default(),
     };
     let mut req = rebuild(parts, bytes);
 
@@ -256,7 +257,7 @@ pub async fn guard_with(table: &[RouteEntry], st: AppState, req: Request, next: 
         let resp = next.run(req).await;
         tripwire(&st, &ctx, Some(&prepared), resp.status()).await;
         if let Ticket::Authorised(confirmation) = ctx.ticket() {
-            completed(&st, op, &prepared, confirmation, resp.status()).await;
+            completed(&st, &ctx, &prepared, confirmation, resp.status()).await;
         }
         return resp;
     }
@@ -270,22 +271,25 @@ pub async fn guard_with(table: &[RouteEntry], st: AppState, req: Request, next: 
     *ctx.ticket.lock().unwrap() = Ticket::Authorised(confirmation.clone());
     req.extensions_mut().insert(ctx.clone());
     let resp = next.run(req).await;
-    completed(&st, op, &prepared, confirmation, resp.status()).await;
+    completed(&st, &ctx, &prepared, confirmation, resp.status()).await;
     resp
 }
 
-/// `op.completed`, best-effort, linked to the confirmation that authorised it.
+/// `op.completed`, best-effort, linked to the confirmation that authorised
+/// it, with what the handler noted ([`GuardCtx::note_completed`]).
 async fn completed(
     st: &AppState,
-    op: &'static Op,
+    ctx: &GuardCtx,
     p: &Prepared,
     confirmation: Option<String>,
     status: StatusCode,
 ) {
     let now = st.clock.now().await.0;
-    let mut ev = p.event(kind::OP_COMPLETED, op, &p.summary.target, now);
+    let mut ev = p.event(kind::OP_COMPLETED, ctx.op, &p.summary.target, now);
     ev.confirmation_id = confirmation;
-    ev.detail = serde_json::json!({ "status": status.as_u16() });
+    let mut detail = ctx.completed_detail.lock().unwrap().clone();
+    detail.insert("status".to_string(), status.as_u16().into());
+    ev.detail = Value::Object(detail);
     p.svc.record(ev).await;
 }
 

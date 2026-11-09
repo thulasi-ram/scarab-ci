@@ -811,6 +811,9 @@ pub struct GuardCtx {
     /// `None` when step-up is off.
     pub(crate) prepared: Option<Arc<Prepared>>,
     pub(crate) ticket: Arc<Mutex<Ticket>>,
+    /// What the handler adds to the operation's `op.completed` event: what
+    /// it did, beyond the status (what a cascade delete deleted).
+    pub(crate) completed_detail: Arc<Mutex<serde_json::Map<String, serde_json::Value>>>,
 }
 
 impl GuardCtx {
@@ -819,7 +822,18 @@ impl GuardCtx {
             op,
             prepared: None,
             ticket: Arc::new(Mutex::new(Ticket::Unresolved)),
+            completed_detail: Arc::default(),
         }
+    }
+
+    /// Record `value` under `key` in this operation's `op.completed` event
+    /// (written by the guard once the handler answers; none while step-up
+    /// is off).
+    pub(crate) fn note_completed(&self, key: &str, value: serde_json::Value) {
+        self.completed_detail
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), value);
     }
 
     pub(crate) fn ticket(&self) -> Ticket {

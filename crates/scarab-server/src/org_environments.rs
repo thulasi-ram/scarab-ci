@@ -22,8 +22,9 @@
 //! §7, MLP). The one exception is a Project's own overlay, which that
 //! Project's admins write too: it can only tighten their own deploys.
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use scarab_engine::DbError;
 use scarab_identity::Action;
@@ -543,34 +544,186 @@ pub(crate) async fn release_claim(claim: Option<EnvironmentNameClaim>) {
     }
 }
 
-/// Delete an Environment and its eligibility. Administer on the Org.
+/// `DELETE /v1/orgs/{org}/environments/{env}?cascade=true`.
+#[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct DeleteOrgEnvironmentQuery {
+    /// `true`: delete every Project's overlay, privilege grant and secret
+    /// in the Environment with it. Without it a delete is refused (409)
+    /// while any exists, and the refusal lists them.
+    #[serde(default)]
+    pub cascade: bool,
+}
+
+/// One Project's secrets in an Environment, by key. Never a value.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct EnvironmentProjectSecretKeysDto {
+    pub project: String,
+    pub keys: Vec<String>,
+}
+
+/// Why a plain delete was refused (409): what the Environment still holds.
+/// `?cascade=true` deletes all of it with the Environment.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct EnvironmentDeleteBlockersDto {
+    /// `environment_in_use`.
+    pub code: String,
+    pub message: String,
+    pub overlay_count: usize,
+    pub privilege_grant_count: usize,
+    /// Secret keys, across every Project.
+    pub secret_count: usize,
+    /// Projects holding an overlay in it.
+    pub overlays: Vec<String>,
+    /// Projects holding a privilege grant in it.
+    pub privilege_grants: Vec<String>,
+    /// Its EnvironmentProjectSecretScope secrets, by Project.
+    pub secrets: Vec<EnvironmentProjectSecretKeysDto>,
+}
+
+/// What hangs off an Environment: the Projects holding an overlay or a
+/// privilege grant in it, and its secrets by Project.
+#[derive(Debug, Default)]
+struct EnvironmentHoldings {
+    overlays: Vec<String>,
+    privilege_grants: Vec<String>,
+    secrets: Vec<EnvironmentProjectSecretKeysDto>,
+}
+
+impl EnvironmentHoldings {
+    fn secret_count(&self) -> usize {
+        self.secrets.iter().map(|s| s.keys.len()).sum()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.overlays.is_empty() && self.privilege_grants.is_empty() && self.secret_count() == 0
+    }
+
+    fn blockers(self, env: &str) -> EnvironmentDeleteBlockersDto {
+        let count = |n: usize, one: &str, many: &str| match n {
+            1 => format!("1 {one}"),
+            n => format!("{n} {many}"),
+        };
+        let secret_count = self.secret_count();
+        EnvironmentDeleteBlockersDto {
+            code: "environment_in_use".into(),
+            message: format!(
+                "environment `{env}` still has {}, {} and {}: delete them first, or delete \
+                 them with the environment (`?cascade=true`)",
+                count(self.overlays.len(), "project overlay", "project overlays"),
+                count(
+                    self.privilege_grants.len(),
+                    "privilege grant",
+                    "privilege grants"
+                ),
+                count(secret_count, "secret", "secrets"),
+            ),
+            overlay_count: self.overlays.len(),
+            privilege_grant_count: self.privilege_grants.len(),
+            secret_count,
+            overlays: self.overlays,
+            privilege_grants: self.privilege_grants,
+            secrets: self.secrets,
+        }
+    }
+}
+
+/// Read what hangs off `env`. Fails closed: a secret store that cannot say
+/// which secrets the Environment holds stops the delete (409).
+async fn environment_holdings(
+    st: &AppState,
+    governance: Option<&dyn EnvironmentGovernanceStore>,
+    org: &str,
+    env: &str,
+) -> Result<EnvironmentHoldings, ApiError> {
+    let mut holdings = EnvironmentHoldings::default();
+    if let Some(governance) = governance {
+        for record in governance
+            .environment_projects(org, env)
+            .await
+            .map_err(org_environment_api_error)?
+        {
+            if record.overlay.is_some() {
+                holdings.overlays.push(record.project.clone());
+            }
+            if record.privilege_grant.is_some() {
+                holdings.privilege_grants.push(record.project);
+            }
+        }
+    }
+    if let Some(secrets) = st.secrets.as_deref() {
+        let cannot_check = |e: scarab_secrets::SecretError| {
+            ApiError::Conflict(format!(
+                "cannot check environment `{env}` for secrets, so it is not deleted: {e}"
+            ))
+        };
+        for project in secrets
+            .environment_secret_projects(org, env)
+            .await
+            .map_err(cannot_check)?
+        {
+            let scope = scarab_secrets::SecretScope::EnvironmentProject {
+                org: org.to_string(),
+                project: project.clone(),
+                environment: env.to_string(),
+            };
+            let mut keys = secrets.list_scoped(&scope).await.map_err(cannot_check)?;
+            keys.sort();
+            if !keys.is_empty() {
+                holdings
+                    .secrets
+                    .push(EnvironmentProjectSecretKeysDto { project, keys });
+            }
+        }
+    }
+    Ok(holdings)
+}
+
+/// Delete an Environment and its eligibility. Administer on the Org, and a
+/// step-up (it is irreversible destruction, as deleting a secret is).
 ///
 /// Refused (409) while any Project holds an overlay or privilege grant in
 /// it (ADR-0071 §3, §8: those are never dropped as a side effect), and while
 /// any Project holds a secret in it (git-bug 52964b4): a secret never
 /// outlives its Environment, and is never dropped as a side effect either.
+/// The refusal's JSON body lists them, with a count per kind.
+///
+/// With `?cascade=true` the admin asks for them to go too (git-bug
+/// a144fb1): every Project's overlay and privilege grant, deleted with the
+/// Environment and its eligibility in one transaction, and the
+/// Environment's secrets. The secret store cannot share that transaction,
+/// so the secrets are deleted first, under the Environment's name claim
+/// (no secret write into the Environment can land meanwhile). If a secret
+/// delete or the transaction fails, the Environment stays, and a retry
+/// deletes what is left. What was deleted, by name, is recorded on the
+/// operation's `op.completed` event in the OrgSecurityEventLog.
 #[utoipa::path(
     delete,
     path = "/v1/orgs/{org}/environments/{env}",
     params(
         ("org" = String, Path, description = "org"),
-        ("env" = String, Path, description = "environment name")
+        ("env" = String, Path, description = "environment name"),
+        DeleteOrgEnvironmentQuery
     ),
-    summary = "Delete an org Environment (ADR-0071)",
+    summary = "Delete an org Environment, with its overlays, grants and secrets when asked (ADR-0071)",
     responses(
         (status = 204, description = "deleted"),
-        (status = 403, description = "not an org admin"),
+        (status = 403, description = "not an org admin, or no step-up"),
         (status = 404, description = "no such Environment, or not configured"),
-        (status = 409, description = "project overlays, grants or secrets still pin the Environment")
+        (status = 409, body = EnvironmentDeleteBlockersDto, description = "project overlays, grants or secrets still pin the Environment (JSON, without `cascade`); or, as text, it is being changed or its secrets cannot be listed")
     )
 )]
 pub(crate) async fn delete_org_environment(
     State(st): State<AppState>,
+    guard: Option<Extension<GuardCtx>>,
     headers: HeaderMap,
     Path((org, env)): Path<(String, String)>,
-) -> Result<StatusCode, ApiError> {
+    Query(query): Query<DeleteOrgEnvironmentQuery>,
+) -> Result<Response, ApiError> {
     let mut claim = None;
-    let answer = delete_org_environment_holding(st, headers, org, env, &mut claim).await;
+    let guard = guard.map(|Extension(g)| g);
+    let answer =
+        delete_org_environment_holding(st, guard, headers, org, env, query, &mut claim).await;
     release_claim(claim).await;
     answer
 }
@@ -579,17 +732,19 @@ pub(crate) async fn delete_org_environment(
 /// the caller to release.
 async fn delete_org_environment_holding(
     st: AppState,
+    guard: Option<GuardCtx>,
     headers: HeaderMap,
     org: String,
     env: String,
+    query: DeleteOrgEnvironmentQuery,
     claim: &mut Option<EnvironmentNameClaim>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<Response, ApiError> {
     let scope = rbac_scope(&org, None);
     authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
     let store = st.org_environments.as_ref().ok_or(ApiError::NotFound)?;
-    // Held through the secret check and the delete: a secret write into
-    // this Environment takes the same claim, so it cannot land between the
-    // two (git-bug 1a81c63).
+    // Held through the checks and the delete: a secret write into this
+    // Environment takes the same claim, so it cannot land between the two
+    // (git-bug 1a81c63).
     *claim = match st.environment_governance.as_deref() {
         Some(governance) => Some(
             governance
@@ -605,37 +760,73 @@ async fn delete_org_environment_holding(
         ),
         None => None,
     };
-    if let Some(secrets) = st.secrets.as_ref() {
-        // Fail closed: a store that cannot say whether the Environment holds
-        // secrets does not delete it.
-        let projects = secrets
-            .environment_secret_projects(&org, &env)
+    let governance = st.environment_governance.as_deref();
+    let holdings = environment_holdings(&st, governance, &org, &env).await?;
+
+    if !query.cascade {
+        if !holdings.is_empty() {
+            return Ok((StatusCode::CONFLICT, Json(holdings.blockers(&env))).into_response());
+        }
+        return if store
+            .delete_org_environment(&org, &env)
             .await
-            .map_err(|e| {
-                ApiError::Conflict(format!(
-                    "cannot check environment `{env}` for secrets, so it is not deleted: {e}"
-                ))
-            })?;
-        if !projects.is_empty() {
-            return Err(ApiError::Conflict(format!(
-                "environment `{env}` still holds secrets of project(s) {}: delete them first",
-                projects
-                    .iter()
-                    .map(|p| format!("`{p}`"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )));
+            .map_err(org_environment_api_error)?
+        {
+            Ok(StatusCode::NO_CONTENT.into_response())
+        } else {
+            Err(ApiError::NotFound)
+        };
+    }
+
+    let governance = governance.ok_or(ApiError::NotFound)?;
+    // Secrets first: the secret store cannot join the transaction below.
+    if let Some(secrets) = st.secrets.as_deref() {
+        for held in &holdings.secrets {
+            let scope = scarab_secrets::SecretScope::EnvironmentProject {
+                org: org.clone(),
+                project: held.project.clone(),
+                environment: env.clone(),
+            };
+            for key in &held.keys {
+                secrets.delete(&scope, key).await.map_err(|e| {
+                    ApiError::Db(DbError::Other(format!(
+                        "could not delete secret `{key}` of project `{}`, so environment \
+                         `{env}` was not deleted; retry to delete what is left: {e}",
+                        held.project
+                    )))
+                })?;
+            }
         }
     }
-    if store
-        .delete_org_environment(&org, &env)
+    let deleted = governance
+        .delete_environment_cascade(&org, &env)
         .await
         .map_err(org_environment_api_error)?
-    {
-        Ok(StatusCode::NO_CONTENT)
-    } else {
-        Err(ApiError::NotFound)
+        .ok_or(ApiError::NotFound)?;
+    let secret_count = holdings.secret_count();
+    tracing::info!(
+        org = %org,
+        environment = %env,
+        overlays = deleted.overlays.len(),
+        privilege_grants = deleted.privilege_grants.len(),
+        secrets = secret_count,
+        "environment deleted with its overlays, privilege grants and secrets"
+    );
+    if let Some(guard) = guard {
+        guard.note_completed(
+            "deleted",
+            serde_json::json!({
+                "cascade": true,
+                "overlay_count": deleted.overlays.len(),
+                "privilege_grant_count": deleted.privilege_grants.len(),
+                "secret_count": secret_count,
+                "overlays": deleted.overlays,
+                "privilege_grants": deleted.privilege_grants,
+                "secrets": holdings.secrets,
+            }),
+        );
     }
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 /// Secrets one Project holds under an Environment name that has no

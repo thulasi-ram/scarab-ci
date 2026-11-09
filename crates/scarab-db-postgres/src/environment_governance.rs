@@ -12,10 +12,11 @@ use sqlx::Row;
 
 use scarab_project::{
     validate_org_environment_display_name, validate_org_environment_name, DeployGovernance,
-    EnvironmentGovernanceStore, EnvironmentMigrationAcknowledgement, EnvironmentMigrationReport,
-    EnvironmentMigrationReportProject, EnvironmentNameClaim, EnvironmentProjectEligibility,
-    EnvironmentProjectOverlay, EnvironmentProjectPrivilegeGrant, EnvironmentProjectRecord,
-    EnvironmentProtectionRules, ImageGrant, OrgEnvironment, OrgEnvironmentError, ProtectionRules,
+    EnvironmentCascadeDeletion, EnvironmentGovernanceStore, EnvironmentMigrationAcknowledgement,
+    EnvironmentMigrationReport, EnvironmentMigrationReportProject, EnvironmentNameClaim,
+    EnvironmentProjectEligibility, EnvironmentProjectOverlay, EnvironmentProjectPrivilegeGrant,
+    EnvironmentProjectRecord, EnvironmentProtectionRules, ImageGrant, OrgEnvironment,
+    OrgEnvironmentError, ProtectionRules,
 };
 
 use crate::org_environments::{
@@ -1052,6 +1053,54 @@ impl EnvironmentGovernanceStore for PostgresDb {
         let copy = stored_environment(&mut tx, &row, org, to).await?;
         tx.commit().await.map_err(org_environment_store_err)?;
         Ok(copy)
+    }
+
+    async fn delete_environment_cascade(
+        &self,
+        org: &str,
+        environment: &str,
+    ) -> Result<Option<EnvironmentCascadeDeletion>, OrgEnvironmentError> {
+        let mut tx = self
+            .pool()
+            .begin()
+            .await
+            .map_err(org_environment_store_err)?;
+        // The row lock every eligibility write takes first, and one that
+        // conflicts with the key-share lock a new overlay or grant row takes
+        // on its Environment: a concurrent insert waits for this transaction
+        // and then finds no Environment (its foreign key fails).
+        match lock_environment(&mut tx, org, environment).await {
+            Ok(_) => {}
+            Err(OrgEnvironmentError::NotFound { .. }) => return Ok(None),
+            Err(e) => return Err(e),
+        }
+        let mut deleted = EnvironmentCascadeDeletion::default();
+        for (table, out) in [
+            ("environment_project_overlays", &mut deleted.overlays),
+            (
+                "environment_project_privilege_grants",
+                &mut deleted.privilege_grants,
+            ),
+        ] {
+            *out = sqlx::query_scalar(&format!(
+                "DELETE FROM {table} WHERE org = $1 AND environment = $2 RETURNING project"
+            ))
+            .bind(org)
+            .bind(environment)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(org_environment_store_err)?;
+            out.sort();
+        }
+        // Its eligibility goes with it (ON DELETE CASCADE).
+        sqlx::query("DELETE FROM org_environments WHERE org = $1 AND name = $2")
+            .bind(org)
+            .bind(environment)
+            .execute(&mut *tx)
+            .await
+            .map_err(org_environment_store_err)?;
+        tx.commit().await.map_err(org_environment_store_err)?;
+        Ok(Some(deleted))
     }
 
     async fn environment_projects(

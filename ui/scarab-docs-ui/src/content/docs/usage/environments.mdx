@@ -56,7 +56,9 @@ name, description, the baseline, **Projects that may use** it, and, under **Proj
 grants**, each project's overlay and privilege grant. Its **Edit** button opens `…/<name>/edit`, where you change the display name,
 the description, the baseline and eligibility (one **Save** sends only the parts you changed),
 each project's privilege grant, and delete the Environment. Deleting it, or withdrawing a grant,
-asks you to type the Environment's name.
+asks you to type the Environment's name. While projects hold overlays, privilege grants or secrets
+in the Environment, a delete is refused and the dialog lists them; its button then deletes them
+with the Environment (`DELETE …?cascade=true`).
 
 ## Name and display name
 
@@ -242,7 +244,7 @@ Org Environments live under `/v1/orgs/{org}/environments` (writes need org admin
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/v1/orgs/{org}/environments` | List the org's Environments |
-| `PUT` / `GET` / `DELETE` | `/v1/orgs/{org}/environments/{env}` | Create or replace (display name and description), read, delete one |
+| `PUT` / `GET` / `DELETE` | `/v1/orgs/{org}/environments/{env}` | Create or replace (display name and description), read, delete one (`?cascade=true` also deletes its overlays, grants and secrets) |
 | `POST` | `/v1/orgs/{org}/environments/{env}/duplicate` | Copy it under a new name; the answer lists what was not copied |
 | `PUT` / `GET` | `/v1/orgs/{org}/environments/{env}/protection` | The baseline protection rules |
 | `PUT` / `GET` | `/v1/orgs/{org}/environments/{env}/eligibility` | Which Projects may run in it |

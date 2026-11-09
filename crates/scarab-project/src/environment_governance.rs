@@ -144,6 +144,15 @@ impl ApprovalGateRules {
     }
 }
 
+/// What [`EnvironmentGovernanceStore::delete_environment_cascade`] deleted
+/// with the Environment: the Projects whose overlay and whose privilege
+/// grant went, each sorted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EnvironmentCascadeDeletion {
+    pub overlays: Vec<String>,
+    pub privilege_grants: Vec<String>,
+}
+
 /// One Project's **tighten-only** overlay over one Environment's baseline
 /// (ADR-0071 §3). Keyed by `(org, environment, project)`; how it combines
 /// with the baseline is [`effective_protection`]'s alone, and no merge it
@@ -1087,6 +1096,20 @@ pub trait EnvironmentGovernanceStore: Send + Sync {
         updated_by: &str,
         updated_at: i64,
     ) -> Result<OrgEnvironment, OrgEnvironmentError>;
+
+    /// Delete Environment `environment` of `org` with its eligibility and
+    /// every Project's overlay and privilege grant in it, in **one**
+    /// transaction: all of them go, or none does. What an admin's explicit
+    /// cascade delete asks for; a plain delete never drops an overlay or a
+    /// grant. `None` when there is no such Environment (nothing changed).
+    ///
+    /// The Environment's secrets live in the secret store, which this store
+    /// cannot share a transaction with: they are the caller's to delete.
+    async fn delete_environment_cascade(
+        &self,
+        org: &str,
+        environment: &str,
+    ) -> Result<Option<EnvironmentCascadeDeletion>, OrgEnvironmentError>;
 
     /// Every Project holding an overlay or a privilege grant in
     /// `environment`, by Project name, with its eligibility now — what the
