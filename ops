@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1794206421,"nonce":"7ABsw6p8561oRNdLT47V6xt6bBg=","message":"Live check done in PR #137 (db279f58): crates/scarab-e2e/tests/results_outputs.rs passes on kind (results -\u003e ${{ outputs.* }} in a later step's env). The Config classification fix was already on main.","files":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":4,"timestamp":1794206421,"nonce":"/1EeHfpulqXLgA0ydm+HVHyjiac=","status":2}]}
