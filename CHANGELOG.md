@@ -18,6 +18,8 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-09
+
 Adds libraries and plugin gates through `invoke`, a policy engine for Run creation, and
 checked forge credentials for Steps. Removes the `clone:` Step kind and the deployment
 record. Read Breaking changes before you upgrade.
@@ -831,7 +833,8 @@ The first release: the `scarab-server`, `scarab-clone`, `scarab-wsfetch` and
 `scarab-results-sidecar` images and the Helm chart at
 `oci://ghcr.io/thulasi-ram/charts/scarab`. It had no GitHub Release notes.
 
-[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/thulasi-ram/scarab-ci/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/thulasi-ram/scarab-ci/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/thulasi-ram/scarab-ci/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/thulasi-ram/scarab-ci/compare/v0.1.1...v0.2.0
