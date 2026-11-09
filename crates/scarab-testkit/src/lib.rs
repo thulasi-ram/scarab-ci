@@ -3501,7 +3501,8 @@ use scarab_forge::{
 #[derive(Default)]
 pub struct FakeForge {
     files: Mutex<HashMap<String, Vec<u8>>>,
-    statuses: Mutex<Vec<Status>>,
+    /// Each posted status and the commit sha it was posted on.
+    statuses: Mutex<Vec<(String, Status)>>,
     comments: Mutex<Vec<(u64, String)>>,
     /// Seeded `ref → resolved sha` mappings for [`latest_commit`](ForgePort::latest_commit).
     /// A ref with no mapping resolves through [`fake_commit_sha`]: itself when
@@ -3778,7 +3779,23 @@ impl FakeForge {
 
     /// Statuses pushed back via [`set_status`](ForgePort::set_status).
     pub fn statuses(&self) -> Vec<Status> {
-        self.statuses.lock().unwrap().clone()
+        self.statuses
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, s)| s.clone())
+            .collect()
+    }
+
+    /// Statuses pushed back on the commit `sha`.
+    pub fn statuses_on(&self, sha: &str) -> Vec<Status> {
+        self.statuses
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(on, _)| on == sha)
+            .map(|(_, s)| s.clone())
+            .collect()
     }
 
     /// Comments posted via [`post_comment`](ForgePort::post_comment).
@@ -4151,7 +4168,7 @@ impl ForgePort for FakeForge {
     async fn set_status(
         &self,
         _repo: &RepoRef,
-        _commit: &Commit,
+        commit: &Commit,
         status: Status,
     ) -> Result<(), ForgeError> {
         if *self.fail_status.lock().unwrap() {
@@ -4159,7 +4176,10 @@ impl ForgePort for FakeForge {
                 "resource not accessible by integration".into(),
             ));
         }
-        self.statuses.lock().unwrap().push(status);
+        self.statuses
+            .lock()
+            .unwrap()
+            .push((commit.sha.clone(), status));
         Ok(())
     }
 

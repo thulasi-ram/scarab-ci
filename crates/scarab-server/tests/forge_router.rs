@@ -186,6 +186,7 @@ async fn production_path_posts_a_status_with_run_deep_link_live() {
                 context: "scarab".into(),
                 state: StatusState::Success,
                 target_url: deep_link,
+                description: None,
             },
         )
         .await
