@@ -844,11 +844,15 @@ const grants: Record<string, Record<string, GrantDto>> = {
   },
 };
 
-/** The server's merge, so the fixtures' `effective` blocks are
+/** A copy of the server's merge, so the fixtures' `effective` blocks are
  *  what the server would answer: approvers union, ref layers ANDed, the
- *  stricter wait, reason if either sets it. */
-function effectiveOf(env: OrgEnvironmentDto, overlay: OverlayDto | undefined) {
-  const b: RulesDto = env.protection;
+ *  stricter wait, reason if either sets it. `mock.test.ts` checks it against
+ *  the merge cases the server's own test reads
+ *  (crates/scarab-server/tests/fixtures/effective_protection_cases.json). */
+export function effectiveOf(
+  b: RulesDto,
+  overlay: OverlayDto | undefined,
+): ProjectEnvironmentDto["effective"] {
   return {
     approvers: [...new Set([...b.approvers, ...(overlay?.approvers ?? [])])],
     allowed_ref_layers: overlay ? [b.allowed_refs, overlay.allowed_refs] : [b.allowed_refs],
@@ -876,7 +880,7 @@ function projectEnvironments(project: string): ProjectEnvironmentDto[] {
         eligible: eligible(env, project),
         baseline: env.protection,
         overlay: overlay ?? null,
-        effective: effectiveOf(env, overlay),
+        effective: effectiveOf(env.protection, overlay),
         privilege_grant: grants[env.name]?.[project] ?? null,
       };
     })
