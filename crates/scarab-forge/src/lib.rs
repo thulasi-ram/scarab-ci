@@ -76,6 +76,26 @@ pub struct Status {
     /// The deep-link back to the Scarab run — **required** (ADR-0046): a
     /// status without a way back to its run is a dead end in the PR.
     pub target_url: String,
+    /// One line shown beside the status. An adapter caps it at
+    /// [`STATUS_DESCRIPTION_MAX`] chars ([`cap_status_description`]); `None`
+    /// sends none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// The most chars a commit status description may hold: GitHub refuses a
+/// longer one. Forgejo is given the same cap so one text fits both.
+pub const STATUS_DESCRIPTION_MAX: usize = 140;
+
+/// `s` cut to [`STATUS_DESCRIPTION_MAX`] chars on a char boundary, ending in
+/// `…` when it was cut.
+pub fn cap_status_description(s: &str) -> String {
+    if s.chars().count() <= STATUS_DESCRIPTION_MAX {
+        return s.to_string();
+    }
+    let mut cut = truncate_on_char_boundary(s, STATUS_DESCRIPTION_MAX - 1);
+    cut.push('…');
+    cut
 }
 
 /// The state of a published [`Status`]. These four are the canonical, forge-
@@ -1497,6 +1517,7 @@ pub mod contract {
                 context: "scarab".into(),
                 state: StatusState::Pending,
                 target_url: "https://scarab.example/runs/r1".into(),
+                description: None,
             },
         )
         .await
@@ -2025,6 +2046,18 @@ mod tests {
         .trigger_title();
         assert_eq!(title.as_deref(), Some("feat: add the widget"));
         assert_eq!(cap_trigger_title("\u{0} \u{0}"), None);
+    }
+
+    #[test]
+    fn a_status_description_is_cut_to_the_forge_limit_on_a_char_boundary() {
+        let short = "environment `prod` does not exist";
+        assert_eq!(cap_status_description(short), short);
+        let exact = "é".repeat(STATUS_DESCRIPTION_MAX);
+        assert_eq!(cap_status_description(&exact), exact);
+        let long = "é".repeat(STATUS_DESCRIPTION_MAX + 5);
+        let cut = cap_status_description(&long);
+        assert_eq!(cut.chars().count(), STATUS_DESCRIPTION_MAX);
+        assert!(cut.ends_with('…'), "{cut}");
     }
 
     #[test]

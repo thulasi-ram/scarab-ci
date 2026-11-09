@@ -790,11 +790,14 @@ impl ForgePort for ForgejoForge {
             repo.owner, repo.name, commit.sha
         ));
         // Forgejo speaks the same four commit-status tokens.
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "state": status.state.as_wire(),
             "context": status.context,
             "target_url": status.target_url,
         });
+        if let Some(description) = &status.description {
+            body["description"] = scarab_forge::cap_status_description(description).into();
+        }
         let resp = self.send(|| self.client.post(&url).json(&body)).await?;
         ok_json(resp).await.map(|_| ())
     }

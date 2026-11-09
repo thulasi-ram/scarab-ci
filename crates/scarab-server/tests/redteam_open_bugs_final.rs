@@ -901,6 +901,7 @@ async fn two_replicas_cannot_leave_a_settled_runs_check_pending(w: World) {
                 context: "scarab".into(),
                 state: StatusState::Success,
                 target_url: "http://s/runs/rp".into(),
+                description: None,
             },
         )
         .await

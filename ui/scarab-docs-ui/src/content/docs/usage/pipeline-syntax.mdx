@@ -198,7 +198,9 @@ refused runs. Only pipelines in the same repository can be followed.
 Each pipeline posts its own commit status to the forge, named `scarab/<pipeline>` (its `name:`,
 or its file name), so two pipelines on one commit do not overwrite each other. Two pipelines with
 the same `name:` share one status. A branch protection rule requires `scarab/<pipeline>` for each
-pipeline it waits for.
+pipeline it waits for. A deploy pipeline whose Environment does not exist or does not admit the
+Project starts no Run, and its status is a `failure` that says why (see
+[Environments](/scarab-ci/usage/environments/#who-may-run-in-it)).
 
 ## Interface: `interface.inputs` (and `outputs`)
 
