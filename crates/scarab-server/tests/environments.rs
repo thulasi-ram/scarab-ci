@@ -164,6 +164,68 @@ async fn create_environment_for_web(app: &axum::Router, name: &str) {
     assert_eq!(status, StatusCode::OK, "{msg}");
 }
 
+/// Eligibility patterns are stored trimmed, a pattern of only `*` is a 400
+/// that points at `all_projects`, two patterns that differ only in case are
+/// one listed twice, and a stored pattern matches Project names ignoring
+/// case (git-bug a144fb1).
+#[tokio::test]
+async fn eligibility_patterns_are_trimmed_star_free_and_case_blind() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let pg = Arc::new(PostgresDb::with_pool(tdb.pool.clone()));
+    pg.migrate().await.unwrap();
+    let app = app(pg.clone());
+    create_environment_for_web(&app, "prod").await;
+    let uri = "/v1/orgs/acme/environments/prod/eligibility";
+
+    let (status, msg) = send(
+        &app,
+        "PUT",
+        uri,
+        Some(serde_json::json!({ "all_projects": false, "projects": ["*"] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{msg}");
+    assert!(
+        msg.contains("admits every project") && msg.contains("`all_projects`"),
+        "{msg}"
+    );
+    let (status, msg) = send(
+        &app,
+        "PUT",
+        uri,
+        Some(serde_json::json!({ "all_projects": false, "projects": ["web", "WEB "] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{msg}");
+    assert!(msg.contains("listed twice"), "{msg}");
+
+    let (status, msg) = send(
+        &app,
+        "PUT",
+        uri,
+        Some(serde_json::json!({ "all_projects": false, "projects": ["  Web* ", "api"] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{msg}");
+    assert_eq!(
+        json_of(&msg)["projects"],
+        serde_json::json!(["api", "Web*"]),
+        "stored trimmed, case kept (the store answers them sorted)"
+    );
+    let (_, body) = send(&app, "GET", "/v1/repos/acme/web-api/environments", None).await;
+    let listed = json_of(&body);
+    assert_eq!(listed[0]["name"], "prod", "{body}");
+    assert_eq!(
+        listed[0]["eligible"], true,
+        "`Web*` admits `web-api`: {body}"
+    );
+
+    tdb.cleanup().await;
+}
+
 /// Was: put / get / list / delete over `/v1/repos/{org}/{repo}/environments`.
 /// Since ADR-0071 the writes are 410 and the same management happens on the
 /// org Environment and the Project's overlay and grant; the repo-scoped GETs

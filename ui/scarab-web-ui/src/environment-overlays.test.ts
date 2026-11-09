@@ -6,6 +6,7 @@ import {
   reportBanner,
   rulesToForm,
   tightenable,
+  STAR_ONLY_PATTERN_ERROR,
   toEligibilityBody,
   toGrantBody,
   toProtectionBody,
@@ -61,6 +62,15 @@ describe("labels", () => {
     expect(toEligibilityBody(false, "web, team-*").body).toEqual({
       all_projects: false,
       projects: ["web", "team-*"],
+    });
+  });
+
+  it("refuses a pattern of only * and keeps one of two patterns that differ in case", () => {
+    expect(toEligibilityBody(false, "web, *").error).toBe(STAR_ONLY_PATTERN_ERROR);
+    expect(toEligibilityBody(false, " ** ").error).toBe(STAR_ONLY_PATTERN_ERROR);
+    expect(toEligibilityBody(false, "Web-*, web-*, *-api").body).toEqual({
+      all_projects: false,
+      projects: ["Web-*", "*-api"],
     });
   });
 });

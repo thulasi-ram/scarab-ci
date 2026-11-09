@@ -3255,8 +3255,10 @@ export interface components {
             /** @description Every Project in the org. `projects` must then be empty. */
             all_projects: boolean;
             /**
-             * @description Project-name globs. An empty list with `all_projects: false` admits
-             *     **no** Project — eligibility starts closed.
+             * @description Project-name globs, matched ignoring ASCII case. Stored trimmed; a
+             *     pattern of only `*` is refused (use `all_projects`), and so is one
+             *     listed twice. An empty list with `all_projects: false` admits **no**
+             *     Project — eligibility starts closed.
              */
             projects?: string[];
         };
@@ -7470,7 +7472,7 @@ export interface operations {
                     "application/json": components["schemas"]["EnvironmentEligibilityDto"];
                 };
             };
-            /** @description an empty or duplicated pattern, or patterns with all_projects */
+            /** @description an empty, `*`-only or duplicated pattern (after trimming, case ignored), or patterns with all_projects */
             400: {
                 headers: {
                     [name: string]: unknown;

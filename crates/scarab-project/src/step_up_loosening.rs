@@ -161,11 +161,15 @@ pub fn eligibility_loosenings(
     match (old, new) {
         (AllProjects, _) => Vec::new(),
         (Projects(_), AllProjects) => vec![Loosening::new("admits every project")],
-        (Projects(p), Projects(q)) => q
-            .iter()
-            .filter(|g| !covered(p, g))
-            .map(|g| Loosening::new(format!("admits projects matching `{g}`")))
-            .collect(),
+        // Patterns match Project names ignoring ASCII case, so they are
+        // compared that way: `Web*` → `web*` widens nothing.
+        (Projects(p), Projects(q)) => {
+            let old: Vec<String> = p.iter().map(|g| g.to_ascii_lowercase()).collect();
+            q.iter()
+                .filter(|g| !covered(&old, &g.to_ascii_lowercase()))
+                .map(|g| Loosening::new(format!("admits projects matching `{g}`")))
+                .collect()
+        }
     }
 }
 

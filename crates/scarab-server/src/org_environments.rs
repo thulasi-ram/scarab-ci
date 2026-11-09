@@ -1106,8 +1106,10 @@ async fn duplicate_org_environment_holding(
 pub struct EnvironmentEligibilityDto {
     /// Every Project in the org. `projects` must then be empty.
     pub all_projects: bool,
-    /// Project-name globs. An empty list with `all_projects: false` admits
-    /// **no** Project — eligibility starts closed.
+    /// Project-name globs, matched ignoring ASCII case. Stored trimmed; a
+    /// pattern of only `*` is refused (use `all_projects`), and so is one
+    /// listed twice. An empty list with `all_projects: false` admits **no**
+    /// Project — eligibility starts closed.
     #[serde(default)]
     pub projects: Vec<String>,
 }
@@ -1173,7 +1175,7 @@ pub(crate) async fn get_environment_eligibility(
     summary = "Replace which projects may deploy into an org Environment (ADR-0071 §2)",
     responses(
         (status = 200, body = EnvironmentEligibilityDto),
-        (status = 400, description = "an empty or duplicated pattern, or patterns with all_projects"),
+        (status = 400, description = "an empty, `*`-only or duplicated pattern (after trimming, case ignored), or patterns with all_projects"),
         (status = 403, description = "not an org admin"),
         (status = 404, description = "no such Environment, or not configured")
     )
@@ -1198,7 +1200,9 @@ pub(crate) async fn put_environment_eligibility(
             ))
         }
         (false, _) => EnvironmentProjectEligibility::Projects(body.projects),
-    };
+    }
+    // Patterns are stored trimmed; the rules and the loosening judge that.
+    .normalized();
     eligibility.validate().map_err(org_environment_api_error)?;
     // ADR-0073 §3 rule E2: widening who may deploy is a crown jewel.
     let current = stored_environment(store, &org, &env).await?;

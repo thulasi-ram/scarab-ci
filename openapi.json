@@ -2242,7 +2242,7 @@
             }
           },
           "400": {
-            "description": "an empty or duplicated pattern, or patterns with all_projects"
+            "description": "an empty, `*`-only or duplicated pattern (after trimming, case ignored), or patterns with all_projects"
           },
           "403": {
             "description": "not an org admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
@@ -10037,7 +10037,7 @@
             "items": {
               "type": "string"
             },
-            "description": "Project-name globs. An empty list with `all_projects: false` admits\n**no** Project — eligibility starts closed."
+            "description": "Project-name globs, matched ignoring ASCII case. Stored trimmed; a\npattern of only `*` is refused (use `all_projects`), and so is one\nlisted twice. An empty list with `all_projects: false` admits **no**\nProject — eligibility starts closed."
           }
         },
         "additionalProperties": false

@@ -861,7 +861,7 @@ function effectiveOf(env: OrgEnvironmentDto, overlay: OverlayDto | undefined) {
 const eligible = (env: OrgEnvironmentDto, project: string) =>
   env.eligibility.all_projects ||
   (env.eligibility.projects ?? []).some((p) =>
-    new RegExp(`^${p.split("*").map((x) => x.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*")}$`).test(project),
+    new RegExp(`^${p.split("*").map((x) => x.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*")}$`, "i").test(project),
   );
 
 /** `GET /v1/repos/{org}/{repo}/environments`: the org Environments the

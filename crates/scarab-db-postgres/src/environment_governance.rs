@@ -670,6 +670,8 @@ impl EnvironmentGovernanceStore for PostgresDb {
         updated_by: &str,
         updated_at: i64,
     ) -> Result<OrgEnvironment, OrgEnvironmentError> {
+        // Stored trimmed: the write rules judge the trimmed patterns.
+        let eligibility = &eligibility.normalized();
         eligibility.validate()?;
         let (all, patterns): (bool, &[String]) = match eligibility {
             EnvironmentProjectEligibility::AllProjects => (true, &[]),

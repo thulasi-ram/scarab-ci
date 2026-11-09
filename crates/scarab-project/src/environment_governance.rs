@@ -183,22 +183,53 @@ impl Default for EnvironmentProjectEligibility {
 
 impl EnvironmentProjectEligibility {
     /// Whether `project` may run Deploy Runs into this Environment.
+    ///
+    /// A pattern matches a Project name **ignoring ASCII case**. Project
+    /// names keep the case the forge reported, and GitHub and Forgejo both
+    /// treat a repository name case-insensitively, so `Web*` admits
+    /// `web-api`. A pattern is matched as stored: a row written before
+    /// patterns were trimmed on write is not trimmed here, so it admits no
+    /// Project it did not admit before.
     pub fn admits(&self, project: &str) -> bool {
         match self {
             Self::AllProjects => true,
-            Self::Projects(patterns) => patterns.iter().any(|p| glob_match(p, project)),
+            Self::Projects(patterns) => {
+                let project = project.to_ascii_lowercase();
+                patterns
+                    .iter()
+                    .any(|p| glob_match(&p.to_ascii_lowercase(), &project))
+            }
         }
     }
 
-    /// Shape-check the project patterns: non-empty, no control characters,
-    /// none listed twice. An empty pattern matches no Project name, so it is
-    /// refused as a typo rather than kept as a row that silently does nothing.
+    /// The eligibility as a write stores it: each pattern trimmed of
+    /// surrounding whitespace. Case is kept, as the admin typed it;
+    /// [`admits`](Self::admits) ignores it.
+    pub fn normalized(&self) -> Self {
+        match self {
+            Self::AllProjects => Self::AllProjects,
+            Self::Projects(patterns) => {
+                Self::Projects(patterns.iter().map(|p| p.trim().to_string()).collect())
+            }
+        }
+    }
+
+    /// Shape-check the project patterns as a write stores them (trimmed):
+    /// not empty, no control characters, not only `*` (that is
+    /// [`AllProjects`](Self::AllProjects)), and none listed twice once
+    /// trimmed and compared ignoring ASCII case. An empty pattern matches no
+    /// Project name, so it is refused as a typo rather than kept as a row
+    /// that silently does nothing.
+    ///
+    /// Applies on write only. A row stored before a rule existed still
+    /// reads, and still matches as stored.
     pub fn validate(&self) -> Result<(), OrgEnvironmentError> {
         let Self::Projects(patterns) = self else {
             return Ok(());
         };
         let mut seen = std::collections::BTreeSet::new();
         for pattern in patterns {
+            let pattern = pattern.trim();
             if pattern.is_empty() {
                 return Err(OrgEnvironmentError::Invalid(
                     "an eligible project pattern must not be empty".into(),
@@ -210,9 +241,15 @@ impl EnvironmentProjectEligibility {
                     pattern.escape_debug()
                 )));
             }
-            if !seen.insert(pattern) {
+            if pattern.chars().all(|c| c == '*') {
                 return Err(OrgEnvironmentError::Invalid(format!(
-                    "eligible project pattern `{pattern}` is listed twice"
+                    "eligible project pattern `{pattern}` admits every project: set \
+                     `all_projects` instead (\"Every project\" on the Environment's page)"
+                )));
+            }
+            if !seen.insert(pattern.to_ascii_lowercase()) {
+                return Err(OrgEnvironmentError::Invalid(format!(
+                    "eligible project pattern `{pattern}` is listed twice (case is ignored)"
                 )));
             }
         }
@@ -1173,6 +1210,68 @@ mod tests {
         assert!(EnvironmentProjectEligibility::AllProjects
             .validate()
             .is_ok());
+    }
+
+    /// A blank pattern, a pattern of only `*`, and two patterns that differ
+    /// only by edge spaces or ASCII case are refused; the `*` refusal names
+    /// the all-projects setting.
+    #[test]
+    fn eligibility_refuses_blank_star_only_and_near_duplicate_patterns() {
+        let invalid =
+            |patterns: &[&str]| match EnvironmentProjectEligibility::Projects(strings(patterns))
+                .validate()
+            {
+                Err(OrgEnvironmentError::Invalid(m)) => m,
+                other => panic!("{patterns:?}: {other:?}"),
+            };
+        assert!(invalid(&["   "]).contains("must not be empty"));
+        for star in [&["*"][..], &["**"], &["web", " * "]] {
+            let m = invalid(star);
+            assert!(m.contains("all_projects"), "{m}");
+        }
+        assert!(invalid(&["web", " web "]).contains("listed twice"));
+        assert!(invalid(&["Web*", "web*"]).contains("listed twice"));
+        // A `*` inside a pattern is a glob, not a request for every project.
+        assert!(
+            EnvironmentProjectEligibility::Projects(strings(&["*-api", "web*"]))
+                .validate()
+                .is_ok()
+        );
+    }
+
+    /// Project names keep the forge's case, and both forges treat a
+    /// repository name case-insensitively: so does eligibility.
+    #[test]
+    fn eligibility_matches_project_names_ignoring_ascii_case() {
+        let e = EnvironmentProjectEligibility::Projects(strings(&["Web*", "api"]));
+        assert!(e.admits("web-api"));
+        assert!(e.admits("WEB"));
+        assert!(e.admits("API"));
+        assert!(!e.admits("checkout"));
+    }
+
+    #[test]
+    fn eligibility_is_stored_trimmed_with_its_case() {
+        let e = EnvironmentProjectEligibility::Projects(strings(&["  Web* ", "api\t"]));
+        assert_eq!(
+            e.normalized(),
+            EnvironmentProjectEligibility::Projects(strings(&["Web*", "api"]))
+        );
+        assert_eq!(
+            EnvironmentProjectEligibility::AllProjects.normalized(),
+            EnvironmentProjectEligibility::AllProjects
+        );
+    }
+
+    /// Rows written before the write rules still read and match as stored:
+    /// a `*` row admits every project, an untrimmed one matches nothing it
+    /// did not match before.
+    #[test]
+    fn eligibility_rows_written_before_the_rules_still_match() {
+        assert!(EnvironmentProjectEligibility::Projects(strings(&["*"])).admits("anything"));
+        let untrimmed = EnvironmentProjectEligibility::Projects(strings(&[" web"]));
+        assert!(!untrimmed.admits("web"));
+        assert!(untrimmed.admits(" web"));
     }
 
     // --- effective_protection: one example per merge rule -----------------

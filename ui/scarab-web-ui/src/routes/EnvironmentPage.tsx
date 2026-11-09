@@ -604,8 +604,9 @@ function EditForm(props: { org: string; env: OrgEnvironment }) {
                 label="Projects"
                 help={
                   <>
-                    Project (repository) names; <span class="mono">*</span> matches anything. Empty
-                    admits no project: a pipeline naming {props.env.name} is refused.
+                    Project (repository) names, case ignored; <span class="mono">*</span> matches
+                    anything. Empty admits no project: a pipeline naming {props.env.name} is
+                    refused.
                   </>
                 }
               >

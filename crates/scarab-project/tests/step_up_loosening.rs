@@ -152,6 +152,9 @@ fn eligibility_loosens_by_opening_up() {
     );
     assert!(eligibility_loosenings(&projects(&["web-*"]), &projects(&["web-a"])).is_empty());
     assert!(eligibility_loosenings(&projects(&["web", "api"]), &projects(&[])).is_empty());
+    // Patterns match ignoring ASCII case: changing only the case widens
+    // nothing.
+    assert!(eligibility_loosenings(&projects(&["Web-*"]), &projects(&["web-A"])).is_empty());
 }
 
 // --- E4: privilege grants --------------------------------------------------

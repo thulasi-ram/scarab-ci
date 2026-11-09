@@ -367,6 +367,8 @@ impl EnvironmentGovernanceStore for InMemoryEnvironmentGovernance {
         updated_by: &str,
         updated_at: i64,
     ) -> Result<OrgEnvironment, OrgEnvironmentError> {
+        // Stored trimmed, as Postgres stores it.
+        let eligibility = &eligibility.normalized();
         eligibility.validate()?;
         let mut state = self.state.lock().unwrap();
         let env = state
@@ -527,7 +529,13 @@ impl EnvironmentGovernanceStore for InMemoryEnvironmentGovernance {
             updated_by: updated_by.to_string(),
             ..source
         };
-        copy.validate()?;
+        // The name and display name only: the eligibility is copied as
+        // stored, as Postgres copies it, so a row written before a pattern
+        // rule existed does not stop a duplicate.
+        scarab_project::validate_org_environment_name(&copy.name)?;
+        if let Some(d) = &copy.display_name {
+            scarab_project::validate_org_environment_display_name(d)?;
+        }
         if state
             .environments
             .contains_key(&(org.to_string(), to.to_string()))
