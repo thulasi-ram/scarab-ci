@@ -57,7 +57,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Request, State};
@@ -68,6 +68,8 @@ use axum::Extension;
 use futures::StreamExt;
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
+// Tokio's clock, so a test can pause and advance it past a cache's limits.
+use tokio::time::Instant;
 
 use scarab_plugin::{
     match_read_request, rule_label, BrokerJournalEntry, BrokerJournalPhase, ConnectionSlot,
@@ -120,17 +122,20 @@ const STREAM_BUFFER_CHUNKS: usize = 16;
 /// An upstream client unused this long is dropped; the next request for its
 /// CA builds a new one.
 const CLIENT_IDLE: Duration = Duration::from_secs(10 * 60);
-/// A bound credential unused this long is dropped from memory. Credential
-/// refs are never reused (a re-bind mints a new one), so a cached value is
-/// never stale; this only bounds how long an unused one stays in memory.
-const CREDENTIAL_IDLE: Duration = Duration::from_secs(15 * 60);
+/// A bound credential is read from the secret store again once its cached
+/// value is this old, used or not. A re-bind or an unbind drops the cached
+/// value at once; this limit covers a secret rotated or deleted in the
+/// store itself, which the broker is not told about. A secret gone from the
+/// store is refused (`credential missing`) from the next read on, never
+/// served from the old value.
+pub const CREDENTIAL_MAX_AGE: Duration = Duration::from_secs(60);
 
 /// The Plugin's headers that may travel upstream — content negotiation,
 /// conditional reads and an identifying agent, nothing that could change
 /// what the upstream does or as whom. (No `Range` or `Cache-Control`: the
-/// Argo CD reporter needs neither. No `Accept-Encoding`: the broker reads
-/// every response body for the credential, and cannot read a compressed
-/// one.)
+/// Argo CD reporter needs neither. No `Accept-Encoding`, deliberately: the
+/// broker reads every response body for the credential, and cannot read a
+/// compressed one.)
 pub const REQUEST_HEADERS: [&str; 5] = [
     "accept",
     "accept-language",
@@ -187,7 +192,8 @@ pub struct BrokerProxy {
     total: Arc<Semaphore>,
     clients: Mutex<IdleCache<reqwest::Client>>,
     /// Bound credentials by `credential_ref`, so a request does not read
-    /// the secret store each time.
+    /// the secret store each time; each is read again once it is
+    /// [`CREDENTIAL_MAX_AGE`] old.
     credentials: Mutex<IdleCache<Arc<Vec<u8>>>>,
     /// Whether upstream connections may go to loopback (tests only).
     loopback_allowed: bool,
@@ -285,37 +291,70 @@ impl InstallationPermits {
     }
 }
 
-/// Values by key, each dropped once it has gone unused for `idle`. Stale
-/// entries go whenever a value is inserted.
+/// Values by key, each dropped once it has gone unused for `idle` or is
+/// `max_age` old, whichever comes first. Stale entries go whenever a value
+/// is inserted.
 struct IdleCache<V> {
     idle: Duration,
-    entries: HashMap<String, (V, Instant)>,
+    max_age: Duration,
+    entries: HashMap<String, CacheEntry<V>>,
+}
+
+struct CacheEntry<V> {
+    value: V,
+    inserted: Instant,
+    used: Instant,
+}
+
+impl<V> CacheEntry<V> {
+    fn fresh(&self, now: Instant, idle: Duration, max_age: Duration) -> bool {
+        now.saturating_duration_since(self.used) < idle
+            && now.saturating_duration_since(self.inserted) < max_age
+    }
 }
 
 impl<V: Clone> IdleCache<V> {
+    /// Entries go once unused for `idle`, however old.
     fn new(idle: Duration) -> Self {
         Self {
             idle,
+            max_age: Duration::MAX,
+            entries: HashMap::new(),
+        }
+    }
+
+    /// Entries go once `max_age` old, however often used.
+    fn aged(max_age: Duration) -> Self {
+        Self {
+            idle: max_age,
+            max_age,
             entries: HashMap::new(),
         }
     }
 
     fn get(&mut self, key: &str, now: Instant) -> Option<V> {
-        let idle = self.idle;
+        let (idle, max_age) = (self.idle, self.max_age);
         match self.entries.get_mut(key) {
-            Some((value, used)) if now.saturating_duration_since(*used) < idle => {
-                *used = now;
-                Some(value.clone())
+            Some(entry) if entry.fresh(now, idle, max_age) => {
+                entry.used = now;
+                Some(entry.value.clone())
             }
             _ => None,
         }
     }
 
     fn insert(&mut self, key: String, value: V, now: Instant) {
-        let idle = self.idle;
+        let (idle, max_age) = (self.idle, self.max_age);
         self.entries
-            .retain(|_, (_, used)| now.saturating_duration_since(*used) < idle);
-        self.entries.insert(key, (value, now));
+            .retain(|_, entry| entry.fresh(now, idle, max_age));
+        self.entries.insert(
+            key,
+            CacheEntry {
+                value,
+                inserted: now,
+                used: now,
+            },
+        );
     }
 
     fn remove(&mut self, key: &str) {
@@ -383,7 +422,7 @@ impl BrokerProxy {
             permits: Mutex::new(InstallationPermits::default()),
             total: Arc::new(Semaphore::new(PROXY_CONCURRENCY_TOTAL)),
             clients: Mutex::new(IdleCache::new(CLIENT_IDLE)),
-            credentials: Mutex::new(IdleCache::new(CREDENTIAL_IDLE)),
+            credentials: Mutex::new(IdleCache::aged(CREDENTIAL_MAX_AGE)),
             loopback_allowed,
         });
         (proxy, drain)
@@ -1295,9 +1334,10 @@ async fn send_upstream(
     .await
     {
         Ok(Ok(resp)) => {
-            // The body is read for the credential, which a compressed body
-            // would hide. The broker asks for none (no Accept-Encoding goes
-            // upstream), so an encoded body is an upstream ignoring that.
+            // Deliberate: no Accept-Encoding goes upstream and an encoded
+            // body is refused, because the broker reads every body for the
+            // credential and cannot read a compressed one. An encoded body
+            // here is an upstream that ignored the missing header.
             if response_is_encoded(resp.headers()) {
                 tracing::warn!(installation = %installation_id, slot = %slot.name,
                     "broker: the upstream encoded its response; refused");
@@ -1844,6 +1884,25 @@ mod tests {
             "an entry past its idle time is not served even before it is dropped"
         );
     }
+
+    /// An aged cache serves a value until it is `max_age` old, however
+    /// often it was used, and then not at all.
+    #[test]
+    fn an_aged_cache_drops_a_value_at_its_age_even_while_used() {
+        let start = Instant::now();
+        let mut cache = IdleCache::aged(Duration::from_secs(60));
+        cache.insert("cred".into(), 1, start);
+        for secs in [10, 20, 30, 40, 50, 59] {
+            assert_eq!(
+                cache.get("cred", start + Duration::from_secs(secs)),
+                Some(1)
+            );
+        }
+        assert_eq!(cache.get("cred", start + Duration::from_secs(60)), None);
+        cache.insert("other".into(), 2, start + Duration::from_secs(60));
+        assert_eq!(cache.len(), 1, "the aged value is dropped on insert");
+    }
+
     use axum::http::header::HeaderName;
     use scarab_plugin::PluginConnectionAuthScheme;
 
