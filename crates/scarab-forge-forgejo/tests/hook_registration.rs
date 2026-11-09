@@ -1,11 +1,12 @@
 //! Registering a hook that already exists (git-bug 27006cc).
 //!
 //! Forgejo never returns a hook's secret, so the adapter cannot tell whether
-//! an existing hook signs with the connection's current secret. A hook made
-//! before the secret changed kept the old one, and the server refused every
-//! delivery with 401. Registration now writes the existing hook again, with
-//! the current secret, instead of leaving it as it was. Served over a real
-//! socket, because the requests on the wire are what is checked.
+//! an existing hook signs with the connection's current secret, and its hook
+//! edit keeps the old secret. A hook made before the secret changed kept the
+//! old one, and the server refused every delivery with 401. Registration now
+//! deletes the existing hook and creates it again with the current secret.
+//! Served over a real socket, because the requests on the wire are what is
+//! checked.
 
 use std::sync::{Arc, Mutex};
 
@@ -35,8 +36,8 @@ async fn forgejo_with_hooks(hooks: Value) -> (String, Seen) {
                 .push((method.clone(), uri.path().to_string(), parsed));
             let answer: Response = match (method, uri.path()) {
                 (Method::GET, "/api/v1/repos/acme/app/hooks") => axum::Json(hooks).into_response(),
-                (Method::PATCH, p) if p.starts_with("/api/v1/repos/acme/app/hooks/") => {
-                    axum::Json(json!({ "id": 7 })).into_response()
+                (Method::DELETE, p) if p.starts_with("/api/v1/repos/acme/app/hooks/") => {
+                    StatusCode::NO_CONTENT.into_response()
                 }
                 (Method::POST, "/api/v1/repos/acme/app/hooks") => {
                     (StatusCode::CREATED, axum::Json(json!({ "id": 8 }))).into_response()
@@ -60,7 +61,7 @@ fn repo() -> RepoRef {
 }
 
 #[tokio::test]
-async fn an_existing_hook_is_written_again_with_the_current_secret() {
+async fn an_existing_hook_is_created_again_with_the_current_secret() {
     // Forgejo 16 lists the callback at top-level `url`; the secret is never
     // in the listing.
     let (base, seen) = forgejo_with_hooks(json!([
@@ -76,19 +77,23 @@ async fn an_existing_hook_is_written_again_with_the_current_secret() {
         .expect("register over an existing hook");
 
     let seen = seen.lock().unwrap().clone();
-    let writes: Vec<_> = seen.iter().filter(|(m, _, _)| *m != Method::GET).collect();
+    let writes: Vec<_> = seen
+        .iter()
+        .filter(|(m, _, _)| *m != Method::GET)
+        .map(|(m, p, b)| (m.clone(), p.as_str(), b))
+        .collect();
+    assert_eq!(writes.len(), 2, "a delete, then a create: {seen:?}");
     assert_eq!(
-        writes.len(),
-        1,
-        "one write, to the matching hook only: {seen:?}"
+        (writes[0].0.clone(), writes[0].1),
+        (Method::DELETE, "/api/v1/repos/acme/app/hooks/7"),
+        "only the matching hook goes, and it goes first"
     );
-    let (method, path, body) = writes[0];
-    assert_eq!(method, Method::PATCH, "updated in place, not duplicated");
-    assert_eq!(path, "/api/v1/repos/acme/app/hooks/7");
+    let (method, path, body) = &writes[1];
+    assert_eq!(*method, Method::POST);
+    assert_eq!(*path, "/api/v1/repos/acme/app/hooks");
     assert_eq!(body["config"]["secret"], "secret-now");
     assert_eq!(body["config"]["url"], CALLBACK);
     assert_eq!(body["active"], true);
-    assert!(body.get("type").is_none(), "an edit takes no type: {body}");
 }
 
 #[tokio::test]

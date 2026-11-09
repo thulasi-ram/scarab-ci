@@ -12907,8 +12907,9 @@ async fn bind_repo(
 }
 
 /// Register the forge-side webhook for `repo` on `conn`, returning the failure as
-/// a human string. Idempotent by adapter contract (Forgejo skips a hook that
-/// already points at the same callback URL); a documented no-op on GitHub, where
+/// a human string. Idempotent by adapter contract (Forgejo replaces a hook that
+/// already points at the same callback URL, so it carries the current secret);
+/// a documented no-op on GitHub, where
 /// the App receives every installation's events on one endpoint.
 async fn try_register_webhook(
     st: &AppState,

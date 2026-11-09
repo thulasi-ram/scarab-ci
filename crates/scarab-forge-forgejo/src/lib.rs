@@ -245,17 +245,6 @@ fn hook_create_body(callback_url: &str, secret: Option<&str>) -> Value {
     })
 }
 
-/// The `PATCH /repos/{owner}/{name}/hooks/{id}` body for a hook that already
-/// points at `callback_url`: the create body without its `type`, which an
-/// edit does not take. Pure, like [`hook_create_body`].
-fn hook_edit_body(callback_url: &str, secret: Option<&str>) -> Value {
-    let mut body = hook_create_body(callback_url, secret);
-    if let Some(fields) = body.as_object_mut() {
-        fields.remove("type");
-    }
-    body
-}
-
 /// The callback URL of a hook as returned by `GET /repos/{owner}/{name}/hooks`.
 /// Pure, and read from BOTH spellings on purpose.
 ///
@@ -718,16 +707,19 @@ impl ForgePort for ForgejoForge {
     }
 
     /// REAL webhook registration (ADR-0046): Forgejo has no single-app
-    /// webhook, so each repo gets one. Idempotent — an existing hook with the
-    /// same callback URL is updated in place, never duplicated.
+    /// webhook, so each repo gets one. Idempotent: the repo ends with exactly
+    /// one hook for `callback_url`.
     ///
     /// The hook carries the connection's `webhook_secret` in its config, which is
     /// what makes its deliveries verifiable at `/webhooks/forgejo`; without it the
     /// server answers every delivery with 401. Forgejo never returns a hook's
-    /// secret, so an existing hook cannot be checked against the current one:
-    /// it is written again on every registration. Otherwise a hook made before
-    /// the secret changed keeps signing with the old one, and every delivery
-    /// is refused with 401 (git-bug 27006cc).
+    /// secret, and its hook edit (`PATCH`) answers 200 but keeps the old secret
+    /// (measured on Forgejo 16.0.1), so an existing hook for this callback is
+    /// deleted and created again with the current secret. Leaving it as it was
+    /// left a hook made before the secret changed signing with the old one, and
+    /// every delivery was refused with 401 (git-bug 27006cc). Deleting first
+    /// means a push in between is missed rather than delivered twice; both
+    /// callers are admin actions (bind, re-register), not a loop.
     async fn register_webhook(&self, repo: &RepoRef, callback_url: &str) -> Result<(), ForgeError> {
         let hooks_url = self.url(&format!("/repos/{}/{}/hooks", repo.owner, repo.name));
         let resp = self.send(|| self.client.get(&hooks_url)).await?;
@@ -741,16 +733,15 @@ impl ForgePort for ForgejoForge {
                     .collect()
             })
             .unwrap_or_default();
-        if !existing.is_empty() {
-            let body = hook_edit_body(callback_url, self.webhook_secret.as_deref());
-            for id in existing {
-                let hook_url = format!("{hooks_url}/{id}");
-                let resp = self
-                    .send(|| self.client.patch(&hook_url).json(&body))
-                    .await?;
-                ok_json(resp).await?;
+        for id in existing {
+            let hook_url = format!("{hooks_url}/{id}");
+            let resp = self.send(|| self.client.delete(&hook_url)).await?;
+            let status = resp.status();
+            // Gone already (a concurrent delete) is what was wanted.
+            if !status.is_success() && status != reqwest::StatusCode::NOT_FOUND {
+                let text = resp.text().await.unwrap_or_default();
+                return Err(ForgeError::Api(format!("{status}: {text}")));
             }
-            return Ok(());
         }
         let body = hook_create_body(callback_url, self.webhook_secret.as_deref());
         let resp = self

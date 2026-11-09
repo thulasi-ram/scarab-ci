@@ -301,13 +301,13 @@ async fn a_registered_hook_delivers_a_signed_push_we_can_normalize() {
     // response: Forgejo 16 reports a hook's callback at top-level `url` and
     // marks `config` deprecated, so an adapter that only read `config.url`
     // would create a second hook here — and every later push would fan out
-    // into duplicate runs. And the existing hook must take the current
+    // into duplicate runs. And the replaced hook must carry the current
     // secret: the delivery below is verified under it.
     let forge = ForgejoForge::new(&base, &token).with_webhook_secret(secret.clone());
     forge
         .register_webhook(&repo, &callback)
         .await
-        .expect("re-registration updates the hook in place");
+        .expect("re-registration replaces the hook");
 
     let hooks: serde_json::Value = client
         .get(format!("{base}/api/v1/repos/{owner}/{name}/hooks"))
