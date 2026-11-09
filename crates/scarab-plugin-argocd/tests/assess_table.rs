@@ -12,6 +12,7 @@
 
 use scarab_plugin_argocd::argo::{Application, ManagedResources};
 use scarab_plugin_argocd::assess::{assess, Status};
+use scarab_plugin_argocd::gates::{judge, Judgement};
 use scarab_plugin_argocd::version::{target_images, version_of};
 
 fn fixture(name: &str) -> String {
@@ -246,4 +247,23 @@ fn a_multi_source_application_is_judged_by_its_revision_lists() {
     let a = assess(&app("app-multi-source-failed-older.json"));
     assert_eq!(a.status, Status::InProgress, "{a:?}");
     assert_eq!(a.label, "awaiting auto-sync");
+}
+
+#[test]
+fn a_multi_source_pass_outputs_its_revisions_in_source_order() {
+    // No single `revision`: the output is every source's revision, in
+    // `spec.sources` order, joined by commas, never an empty string.
+    let j = judge(
+        &app("app-multi-source-synced-healthy.json"),
+        &managed("managed-web.json"),
+        "ghcr.io/acme/web:1.42.0",
+    );
+    assert_eq!(
+        j,
+        Judgement::Pass {
+            revision: "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678,\
+                       0f9e8d7c6b5a49382716f5e4d3c2b1a098765432"
+                .into()
+        }
+    );
 }

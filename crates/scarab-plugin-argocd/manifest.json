@@ -75,7 +75,7 @@
           {
             "name": "revision",
             "type": "string",
-            "description": "The git revision Argo CD synced."
+            "description": "The git revision Argo CD synced. For a multi-source Application, each source's revision in source order, joined by commas."
           }
         ]
       }

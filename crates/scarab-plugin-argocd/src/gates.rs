@@ -5,7 +5,8 @@
 //! The plugin asks Scarab for the open waits that name it, reads each
 //! Application through the broker's read proxy, and answers:
 //!
-//! - **pass**, with output `revision`, when [`assess`] says the Application
+//! - **pass**, with output `revision` (a multi-source Application's
+//!   revisions joined by `,`), when [`assess`] says the Application
 //!   is live (synced, healthy, no operation running) and its **target**
 //!   manifests render `image` ([`target_images`]): the same checks as the
 //!   documented wait Step (ADR-0074 §5);
@@ -88,7 +89,7 @@ pub fn judge(app: &Application, managed: &ManagedResources, image: &str) -> Judg
             let images = target_images(managed);
             if images.contains(image) {
                 Judgement::Pass {
-                    revision: app.status.sync.revision.clone().unwrap_or_default(),
+                    revision: synced_revision(app),
                 }
             } else {
                 Judgement::Wait {
@@ -98,6 +99,17 @@ pub fn judge(app: &Application, managed: &ManagedResources, image: &str) -> Judg
                 }
             }
         }
+    }
+}
+
+/// The `revision` output: the target revision, or for a multi-source
+/// Application (no single `revision`) every source's revision in
+/// `spec.sources` order, joined by `,`.
+fn synced_revision(app: &Application) -> String {
+    let sync = &app.status.sync;
+    match sync.revision.as_deref().filter(|r| !r.is_empty()) {
+        Some(r) => r.to_string(),
+        None => sync.revisions.join(","),
     }
 }
 
