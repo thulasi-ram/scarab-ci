@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":4,"timestamp":1794122605,"nonce":"Zy7Ve7uNKYWlXBsiz1GhUD+qY4E=","status":2}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1794200215,"nonce":"poaoSRiR6m64REtrHQVDHeSu2dM=","message":"Follow-up merged in PR #136 (d9491e68): a cached credential is re-read once it is 60s old; a secret gone from the store is refused. Accept-Encoding stays dropped (owner decision 2026-11-09).","files":null}]}
