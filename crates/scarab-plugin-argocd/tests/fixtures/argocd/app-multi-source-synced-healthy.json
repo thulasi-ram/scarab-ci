@@ -1,0 +1,143 @@
+{
+  "apiVersion": "argoproj.io/v1alpha1",
+  "kind": "Application",
+  "metadata": {
+    "name": "web",
+    "namespace": "argocd",
+    "resourceVersion": "48211990",
+    "generation": 1450
+  },
+  "spec": {
+    "project": "prod",
+    "sources": [
+      {
+        "repoURL": "https://git.example/acme/charts.git",
+        "path": "charts/web",
+        "targetRevision": "main",
+        "helm": {
+          "valueFiles": [
+            "$values/web/prod.yaml"
+          ]
+        }
+      },
+      {
+        "repoURL": "https://git.example/acme/gitops.git",
+        "targetRevision": "main",
+        "ref": "values"
+      }
+    ],
+    "destination": {
+      "server": "https://kubernetes.default.svc",
+      "namespace": "web"
+    },
+    "syncPolicy": {
+      "automated": {
+        "prune": true,
+        "selfHeal": true
+      },
+      "retry": {
+        "limit": 3
+      }
+    }
+  },
+  "status": {
+    "sync": {
+      "status": "Synced",
+      "revisions": [
+        "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+        "0f9e8d7c6b5a49382716f5e4d3c2b1a098765432"
+      ],
+      "comparedTo": {
+        "sources": [
+          {
+            "repoURL": "https://git.example/acme/charts.git",
+            "path": "charts/web",
+            "targetRevision": "main",
+            "helm": {
+              "valueFiles": [
+                "$values/web/prod.yaml"
+              ]
+            }
+          },
+          {
+            "repoURL": "https://git.example/acme/gitops.git",
+            "targetRevision": "main",
+            "ref": "values"
+          }
+        ],
+        "destination": {
+          "server": "https://kubernetes.default.svc",
+          "namespace": "web"
+        }
+      }
+    },
+    "health": {
+      "status": "Healthy",
+      "lastTransitionTime": "2026-10-21T09:13:58Z"
+    },
+    "reconciledAt": "2026-10-21T09:14:07Z",
+    "sourceTypes": [
+      "Helm",
+      "Directory"
+    ],
+    "summary": {
+      "images": [
+        "ghcr.io/acme/web:1.42.0"
+      ]
+    },
+    "resources": [
+      {
+        "group": "apps",
+        "version": "v1",
+        "kind": "Deployment",
+        "namespace": "web",
+        "name": "web",
+        "status": "Synced",
+        "health": {
+          "status": "Healthy"
+        }
+      }
+    ],
+    "operationState": {
+      "operation": {
+        "sync": {
+          "revisions": [
+            "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+            "0f9e8d7c6b5a49382716f5e4d3c2b1a098765432"
+          ]
+        },
+        "initiatedBy": {
+          "automated": true
+        }
+      },
+      "phase": "Succeeded",
+      "message": "successfully synced (all tasks run)",
+      "startedAt": "2026-10-21T09:12:00Z",
+      "finishedAt": "2026-10-21T09:12:40Z",
+      "syncResult": {
+        "revisions": [
+          "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+          "0f9e8d7c6b5a49382716f5e4d3c2b1a098765432"
+        ],
+        "sources": [
+          {
+            "repoURL": "https://git.example/acme/charts.git",
+            "path": "charts/web",
+            "targetRevision": "main",
+            "helm": {
+              "valueFiles": [
+                "$values/web/prod.yaml"
+              ]
+            }
+          },
+          {
+            "repoURL": "https://git.example/acme/gitops.git",
+            "targetRevision": "main",
+            "ref": "values"
+          }
+        ],
+        "resources": []
+      }
+    }
+  }
+}

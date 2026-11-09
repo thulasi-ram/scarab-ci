@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::{Request, StatusCode, Uri};
+use axum::http::{HeaderMap, Request, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -46,6 +46,15 @@ enum Upstream {
     Hang,
     /// Answers after this long.
     Delay(Duration),
+    /// Answers this status, with a `Retry-After: 1` on a 429 or 503.
+    Status(u16),
+}
+
+/// One request the plugin made, as the broker saw it.
+#[derive(Debug, Clone)]
+struct Seen {
+    path_and_query: String,
+    authorization: Option<String>,
 }
 
 #[derive(Default)]
@@ -53,6 +62,8 @@ struct Inner {
     pending: Vec<Value>,
     upstream: HashMap<String, Upstream>,
     release_status: HashMap<String, u16>,
+    proxied: Vec<Seen>,
+    api: Vec<Seen>,
     /// `(step, body)` of every release the gate API accepted or refused.
     answers: Vec<(String, Value)>,
 }
@@ -71,6 +82,13 @@ impl FakeBroker {
     }
 }
 
+fn authorization(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+}
+
 /// Decrements the in-flight count however the handler ends (a client that
 /// times out drops it).
 struct InFlight(Arc<AtomicUsize>);
@@ -81,17 +99,34 @@ impl Drop for InFlight {
     }
 }
 
-async fn proxy(State(b): State<FakeBroker>, uri: Uri) -> Response {
+async fn proxy(State(b): State<FakeBroker>, uri: Uri, headers: HeaderMap) -> Response {
     let now = b.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
     b.most_in_flight.fetch_max(now, Ordering::SeqCst);
     let _guard = InFlight(b.in_flight.clone());
     let pq = uri.path_and_query().map(|p| p.as_str()).unwrap_or("");
     let argo_pq = pq.strip_prefix(PROXY_PREFIX).unwrap_or(pq).to_string();
     let argo_path = argo_pq.split('?').next().unwrap_or("").to_string();
-    let upstream = b.lock().upstream.get(&argo_path).cloned();
+    let upstream = {
+        let mut inner = b.lock();
+        inner.proxied.push(Seen {
+            path_and_query: argo_pq.clone(),
+            authorization: authorization(&headers),
+        });
+        inner.upstream.get(&argo_path).cloned()
+    };
     match upstream {
         Some(Upstream::Hang) => return std::future::pending::<Response>().await,
         Some(Upstream::Delay(d)) => tokio::time::sleep(d).await,
+        Some(Upstream::Status(s)) => {
+            let status = StatusCode::from_u16(s).unwrap();
+            let mut resp =
+                (status, Json(json!({ "error": format!("upstream {s}") }))).into_response();
+            if s == 429 || s == 503 {
+                resp.headers_mut()
+                    .insert("retry-after", "1".parse().unwrap());
+            }
+            return resp;
+        }
         None => {}
     }
     // The broker's own credential, never the plugin's.
@@ -103,17 +138,27 @@ async fn proxy(State(b): State<FakeBroker>, uri: Uri) -> Response {
     b.argo.clone().oneshot(req).await.unwrap().into_response()
 }
 
-async fn list_gates(State(b): State<FakeBroker>) -> Json<Value> {
-    let inner = b.lock();
+async fn list_gates(State(b): State<FakeBroker>, uri: Uri, headers: HeaderMap) -> Json<Value> {
+    let mut inner = b.lock();
+    inner.api.push(Seen {
+        path_and_query: uri.to_string(),
+        authorization: authorization(&headers),
+    });
     Json(json!({ "gates": inner.pending.clone(), "next": null }))
 }
 
 async fn release(
     State(b): State<FakeBroker>,
     Path((run, step)): Path<(String, String)>,
+    uri: Uri,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
     let mut inner = b.lock();
+    inner.api.push(Seen {
+        path_and_query: uri.to_string(),
+        authorization: authorization(&headers),
+    });
     inner.answers.push((step.clone(), body));
     if let Some(s) = inner.release_status.get(&step) {
         let status = StatusCode::from_u16(*s).unwrap();
@@ -134,6 +179,7 @@ struct World {
     fb: FakeBroker,
     broker: Broker,
     api: GateApi,
+    broker_token: PathBuf,
 }
 
 fn token_file(name: &str, value: &str) -> PathBuf {
@@ -179,6 +225,7 @@ impl World {
             api: GateApi::new(&base, api_token, request_timeout).unwrap(),
             fake,
             fb,
+            broker_token,
         }
     }
 
@@ -189,6 +236,10 @@ impl World {
 
     fn upstream(&self, argo_path: &str, u: Upstream) {
         self.fb.lock().upstream.insert(argo_path.into(), u);
+    }
+
+    fn clear_upstream(&self) {
+        self.fb.lock().upstream.clear();
     }
 
     /// One open `wait-live` wait per app, step `live-<app>`.
@@ -315,4 +366,178 @@ async fn a_pass_reads_at_most_its_bound_of_applications_at_once() {
         GATE_READS_AT_ONCE,
         "proxied requests in flight at once"
     );
+}
+
+fn proxied_paths(w: &World) -> Vec<String> {
+    w.fb.lock()
+        .proxied
+        .iter()
+        .map(|s| s.path_and_query.clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn an_error_status_on_a_read_leaves_the_wait_open_for_the_next_pass() {
+    // 409 is not something Argo answers to a GET; 429 and 503 are the
+    // broker's own limits (per installation, and broker-wide), each with a
+    // Retry-After. The pass treats all three alike: the wait is not
+    // answered, the read is not retried within the pass, the other waits
+    // go on, and the next pass reads it again. The Retry-After is parsed
+    // (`BrokerError::Status::retry_after`) but the pass does not wait on
+    // it: the next pass comes a gate interval (15s) later anyway.
+    for status in [409u16, 429, 503] {
+        let w = World::new(Duration::from_secs(5)).await;
+        w.live("web");
+        w.live("api");
+        w.upstream("/api/v1/applications/web", Upstream::Status(status));
+        w.waits(&["web", "api"]);
+
+        let report = w.pass().await;
+        assert_eq!(report.released, [key("api")], "{status}: {report:?}");
+        assert_eq!(report.errors.len(), 1, "{status}: {report:?}");
+        assert!(
+            report.errors[0].starts_with(&format!(
+                "{}: reading `web`: broker answered {status}",
+                key("web")
+            )),
+            "{status}: {:?}",
+            report.errors
+        );
+        assert_eq!(w.answered_steps(), ["live-api"], "{status}");
+        assert_eq!(
+            proxied_paths(&w)
+                .iter()
+                .filter(|p| p.starts_with("/api/v1/applications/web"))
+                .count(),
+            1,
+            "{status}: one read of `web` in the pass, no retry"
+        );
+        assert_eq!(w.pending_steps(), ["live-web"], "{status}");
+
+        w.clear_upstream();
+        let report = w.pass().await;
+        assert_eq!(report.released, [key("web")], "{status}: {report:?}");
+        assert!(w.pending_steps().is_empty(), "{status}");
+    }
+}
+
+#[tokio::test]
+async fn a_409_on_the_answer_is_reported_and_the_pass_goes_on() {
+    // The gate API answers 409 to a wait that passed its expiry (or whose
+    // attempt moved on): the answer is reported once, not retried within
+    // the pass, and the other waits are answered.
+    let w = World::new(Duration::from_secs(5)).await;
+    w.live("web");
+    w.live("api");
+    w.waits(&["web", "api"]);
+    w.fb.lock().release_status.insert("live-web".into(), 409);
+
+    let report = w.pass().await;
+    assert_eq!(report.released, [key("api")], "{report:?}");
+    assert_eq!(report.errors.len(), 1, "{report:?}");
+    assert!(
+        report.errors[0].starts_with(&format!("{}: answering: broker answered 409", key("web"))),
+        "{:?}",
+        report.errors
+    );
+    let mut answered = w.answered_steps();
+    answered.sort();
+    assert_eq!(answered, ["live-api", "live-web"], "one answer each");
+}
+
+#[tokio::test]
+async fn the_plugin_sends_its_own_rotating_token_and_never_the_argo_token() {
+    // Two credentials rotate. The broker token is a projected ServiceAccount
+    // token the kubelet rewrites in place: the plugin re-reads the file for
+    // every request, so the request after a rotation carries the new one.
+    // The Argo token is bound in the broker, which adds it to each proxied
+    // request: the plugin never holds it, so a re-bind needs nothing from
+    // the plugin. What the plugin sends is its broker token, never Argo's.
+    let w = World::new(Duration::from_secs(5)).await;
+    w.fake.put_app(
+        "argocd",
+        "web",
+        FakeAppSpec {
+            sync: "OutOfSync".into(),
+            ..live_spec()
+        },
+    );
+    w.waits(&["web"]);
+    assert_eq!(w.pass().await.waiting, [key("web")]);
+    std::fs::write(&w.broker_token, "broker-token-2\n").unwrap();
+    w.live("web");
+    assert_eq!(w.pass().await.released, [key("web")]);
+
+    let proxied = w.fb.lock().proxied.clone();
+    let auth: Vec<&str> = proxied
+        .iter()
+        .map(|s| s.authorization.as_deref().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        auth,
+        [
+            "Bearer broker-token-1",
+            "Bearer broker-token-1",
+            "Bearer broker-token-2",
+            "Bearer broker-token-2",
+        ],
+        "two reads a pass, the second pass after the rotation"
+    );
+    let api = w.fb.lock().api.clone();
+    assert!(
+        api.iter()
+            .all(|s| s.authorization.as_deref() == Some("Bearer api-token-1")),
+        "{api:?}"
+    );
+    for s in proxied.iter().chain(api.iter()) {
+        assert!(
+            !s.authorization
+                .as_deref()
+                .unwrap_or("")
+                .contains(ARGO_TOKEN),
+            "the plugin sent the Argo token: {s:?}"
+        );
+    }
+    // And the broker's credential is what Argo saw on every read.
+    let argo = w.fake.requests();
+    assert_eq!(argo.len(), 4);
+    assert!(argo.iter().all(|r| r.authorized), "{argo:?}");
+}
+
+#[tokio::test]
+async fn an_application_deleted_between_passes_leaves_the_wait_open() {
+    // The plugin polls; it does not watch, so it sees no DELETED event. An
+    // Application deleted between two passes reads as Argo's 404 on the
+    // next one: the wait is not answered (an app-of-apps can create the
+    // Application again) and stays open until it expires, or until the
+    // Application is back and live.
+    let w = World::new(Duration::from_secs(5)).await;
+    w.fake.put_app(
+        "argocd",
+        "web",
+        FakeAppSpec {
+            sync: "OutOfSync".into(),
+            ..live_spec()
+        },
+    );
+    w.waits(&["web"]);
+    assert_eq!(w.pass().await.waiting, [key("web")]);
+
+    assert!(w.fake.delete_app("argocd", "web"));
+    let report = w.pass().await;
+    assert!(report.released.is_empty() && report.failed.is_empty() && report.waiting.is_empty());
+    assert_eq!(report.errors.len(), 1, "{report:?}");
+    assert!(
+        report.errors[0].starts_with(&format!(
+            "{}: reading `web`: broker answered 404",
+            key("web")
+        )),
+        "{:?}",
+        report.errors
+    );
+    assert!(w.answered_steps().is_empty());
+    assert_eq!(w.pending_steps(), ["live-web"]);
+
+    w.live("web");
+    assert_eq!(w.pass().await.released, [key("web")]);
 }
