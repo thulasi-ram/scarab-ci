@@ -32,10 +32,11 @@ use scarab_engine::{
     Db, DeployContext, RunId, RunStatus, Scheduler, StepId, StepSpec, StepStatus, Timestamp,
 };
 use scarab_project::{
-    EnvironmentGovernanceStore, EnvironmentStore, OrgEnvironmentStore, ProtectionRules,
+    ApprovalHistoryStore, EnvironmentGovernanceStore, OrgEnvironmentStore, ProtectionRules,
 };
 use scarab_secrets::{SecretProvider, SecretScope};
 use scarab_server::{router, AppState, LogService};
+use scarab_testkit::legacy_environments::put_legacy_project_environment;
 use scarab_testkit::{FakeClock, FakeExecutor, FakeSecrets, InMemoryObjectStore};
 
 fn rules(approvers: &[&str], allowed_refs: &[&str]) -> ProtectionRules {
@@ -58,14 +59,14 @@ fn rules(approvers: &[&str], allowed_refs: &[&str]) -> ProtectionRules {
 
 fn app_state(pg: Arc<PostgresDb>) -> AppState {
     let db: Arc<dyn Db> = pg.clone();
-    let envs: Arc<dyn EnvironmentStore> = pg.clone();
+    let history: Arc<dyn ApprovalHistoryStore> = pg.clone();
     let clock = Arc::new(FakeClock::new(1_000));
     let logs = Arc::new(LogService::new(
         Arc::new(InMemoryObjectStore::new()),
         pg.clone(),
     ));
     AppState::new(db, clock, logs)
-        .with_environments(envs)
+        .with_approval_history(history)
         .with_org_environments(pg.clone())
         .with_environment_governance(pg)
 }
@@ -526,7 +527,8 @@ async fn split_report_shows_merged_rules_and_acknowledges_once() {
     pg.migrate().await.unwrap();
     // Two pre-migration per-repo `prod`s, then the 0057 backfill over them.
     for (project, approver) in [("web", "alice"), ("api", "bob")] {
-        pg.put_environment(
+        put_legacy_project_environment(
+            &tdb.pool,
             "acme",
             project,
             &scarab_project::Environment {
@@ -534,8 +536,7 @@ async fn split_report_shows_merged_rules_and_acknowledges_once() {
                 protection: rules(&[approver], &["refs/heads/main"]),
             },
         )
-        .await
-        .unwrap();
+        .await;
     }
     // 0057 dropped its one-shot backfill; re-create it from the migration's
     // own text and run it over the pre-migration rows seeded above.
@@ -797,7 +798,7 @@ async fn secret_matrix_reports_effective_status() {
             b"y",
         );
     let db: Arc<dyn Db> = pg.clone();
-    let envs: Arc<dyn EnvironmentStore> = pg.clone();
+    let history: Arc<dyn ApprovalHistoryStore> = pg.clone();
     let clock = Arc::new(FakeClock::new(1_000));
     let logs = Arc::new(LogService::new(
         Arc::new(InMemoryObjectStore::new()),
@@ -806,7 +807,7 @@ async fn secret_matrix_reports_effective_status() {
     let secrets: Arc<dyn SecretProvider> = Arc::new(secrets);
     let app = router(
         AppState::new(db, clock, logs)
-            .with_environments(envs)
+            .with_approval_history(history)
             .with_environment_governance(pg.clone())
             .with_secrets(secrets),
     );

@@ -654,7 +654,7 @@ async fn migrated_gates_release_for_exactly_the_approvals_the_legacy_rules_requi
     ));
     let app = router(
         AppState::new(db, Arc::new(FakeClock::new(1_000)), logs)
-            .with_environments(pg.clone())
+            .with_approval_history(pg.clone())
             .with_environment_governance(pg.clone()),
     );
     let clock = FakeClock::new(1_000);

@@ -66,7 +66,7 @@ pub struct Org {
 /// **1 Project : 1 RepoRef** in v1 (monorepo per-subdir governance is
 /// deferred to an optional path scope). The Project's natural key is
 /// `(org, name)` where `name` is the repo's forge name — the pair every
-/// trigger event carries — which is what the [`EnvironmentStore`] and the
+/// trigger event carries — which is what the [`ApprovalHistoryStore`] and the
 /// deploy-admission paths key on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Project {
@@ -390,50 +390,22 @@ pub enum ProjectError {
     Store(String),
 }
 
-/// Durable store for the **legacy** per-Project environments and the legacy
-/// approval history recorded against them (ADR-0070 §1). Since ADR-0071's
-/// migration the environment half reads and writes the frozen
-/// `legacy_project_environments` table, which nothing in the server writes
-/// any more (the per-repo write API answers 410) and admission never reads;
-/// it survives for the golden tests and the split report. The history half
-/// (`record_deployment` / `deployments`) is still written on every gate
-/// release. Keyed by the owning
-/// [`Project`]'s natural key `(org, project)` (ADR-0046) — the project name
-/// is its repo's forge name (1:1 in v1), the key a run knows from its
-/// trigger (ADR-0037).
+/// Durable store for the **legacy approval history** (ADR-0024, ADR-0037,
+/// ADR-0070 §1): a [`Deployment`] record for each Environment approval gate
+/// wait whose approvals met the rules, written on every gate release and
+/// read back by `GET /v1/repos/{org}/{repo}/environments/{name}/deployments`.
+/// Despite the record's name it holds no target, version or outcome. Keyed
+/// by the owning [`Project`]'s natural key `(org, project)` (ADR-0046): the
+/// project name is its repo's forge name (1:1 in v1), the key a run knows
+/// from its trigger (ADR-0037).
+///
+/// The legacy per-Project environments themselves (the frozen
+/// `legacy_project_environments` table, ADR-0071 §10) have no store port:
+/// the server neither reads nor writes them through one. Tests that need
+/// legacy rows seed and read them with `scarab-testkit`'s
+/// `legacy_environments` helpers.
 #[async_trait]
-pub trait EnvironmentStore: Send + Sync {
-    /// Create or replace an environment's definition within a Project.
-    async fn put_environment(
-        &self,
-        org: &str,
-        project: &str,
-        env: &Environment,
-    ) -> Result<(), ProjectError>;
-
-    /// Fetch an environment by Project + name.
-    async fn get_environment(
-        &self,
-        org: &str,
-        project: &str,
-        name: &str,
-    ) -> Result<Option<Environment>, ProjectError>;
-
-    /// List the environments defined in a Project.
-    async fn list_environments(
-        &self,
-        org: &str,
-        project: &str,
-    ) -> Result<Vec<Environment>, ProjectError>;
-
-    /// Remove an environment. Idempotent: removing an absent one is Ok.
-    async fn delete_environment(
-        &self,
-        org: &str,
-        project: &str,
-        name: &str,
-    ) -> Result<(), ProjectError>;
-
+pub trait ApprovalHistoryStore: Send + Sync {
     /// Append a deployment to an environment's history. With `wait`, a
     /// second record for the same wait (two approvals that met the rules at
     /// once) is not written.
@@ -469,7 +441,7 @@ pub type CoverageColumn<'a> = Option<&'a str>;
 ///
 /// It has **no runtime effect**: it never blocks a deploy, never changes
 /// resolution, and is not consulted on the run path. Separate from
-/// [`EnvironmentStore`] so a deployment that cannot store markers still runs
+/// [`ApprovalHistoryStore`] so a deployment that cannot store markers still runs
 /// governance — the matrix simply shows no silenced cells.
 #[async_trait]
 pub trait SecretCoverageStore: Send + Sync {

@@ -199,12 +199,12 @@ pub struct AppState {
     /// a4cb94f). Shared by every clone of this state, so one process counts
     /// once; written by [`flush_api_token_uses`].
     pub api_token_uses: Arc<ApiTokenUses>,
-    /// The legacy per-Project environment store (ADR-0037), kept for the
-    /// legacy approval history (`record_deployment` on every gate release and
-    /// its read endpoint). Admission never reads it since ADR-0071 — see
+    /// The legacy approval history (ADR-0037, ADR-0070 §1):
+    /// `record_deployment` on every gate release and its read endpoint.
+    /// Admission never reads it since ADR-0071 — see
     /// [`environment_governance`](AppState::environment_governance). `None`
     /// disables the history endpoint.
-    pub environments: Option<Arc<dyn scarab_project::EnvironmentStore>>,
+    pub approval_history: Option<Arc<dyn scarab_project::ApprovalHistoryStore>>,
     /// Org-level Environment governance (ADR-0071 §2, §3, §8): what admits
     /// and governs every Deploy Run — eligibility, effective protection,
     /// privilege grants — at Run creation, at gate approval and at secret
@@ -369,7 +369,7 @@ impl AppState {
             sessions: None,
             api_tokens: None,
             api_token_uses: Arc::default(),
-            environments: None,
+            approval_history: None,
             environment_governance: None,
             policies: None,
             libraries: None,
@@ -457,11 +457,11 @@ impl AppState {
     }
 
     /// Enable the legacy approval history (ADR-0037, ADR-0070 §1).
-    pub fn with_environments(
+    pub fn with_approval_history(
         mut self,
-        environments: Arc<dyn scarab_project::EnvironmentStore>,
+        approval_history: Arc<dyn scarab_project::ApprovalHistoryStore>,
     ) -> Self {
-        self.environments = Some(environments);
+        self.approval_history = Some(approval_history);
         self
     }
 
@@ -10518,7 +10518,7 @@ async fn record_deployment(
     at: i64,
     wait: Option<&scarab_project::ApprovalWait>,
 ) -> Result<(), ApiError> {
-    let Some(store) = st.environments.as_ref() else {
+    let Some(store) = st.approval_history.as_ref() else {
         return Ok(());
     };
     store
@@ -11284,7 +11284,7 @@ async fn list_deployments(
 ) -> Result<Json<Vec<scarab_project::Deployment>>, ApiError> {
     let scope = rbac_scope(&org, Some(&repo));
     authorize_scoped(&st, &headers, Action::Read, Some(&scope)).await?;
-    let store = st.environments.as_ref().ok_or(ApiError::NotFound)?;
+    let store = st.approval_history.as_ref().ok_or(ApiError::NotFound)?;
     let history = store
         .deployments(&org, &repo, &name)
         .await

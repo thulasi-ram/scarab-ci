@@ -9,7 +9,7 @@ mod common;
 
 use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
-use scarab_project::{ApprovalWait, Deployment, EnvironmentStore};
+use scarab_project::{ApprovalHistoryStore, ApprovalWait, Deployment};
 
 fn record(at: i64, approved_by: &[&str]) -> Deployment {
     Deployment {

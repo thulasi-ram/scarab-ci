@@ -78,7 +78,6 @@ scarab-storage-s3 = { workspace = true }
 scarab-workspace-client = { workspace = true }
 scarab-executor-k8s = { workspace = true }
 scarab-executor-local = { workspace = true }
-scarab-testkit = { workspace = true }
 # ADR-0073 step-up: the WebAuthn relying party (passkey registration and
 # assertion verification). Its soft authenticator is a dev-only feature.
 scarab-webauthn = { workspace = true }
@@ -102,3 +101,6 @@ tempfile = { workspace = true }
 # `tokio::time::pause`/`advance`: a test moves the broker's cache clock past
 # CREDENTIAL_MAX_AGE without waiting a minute.
 tokio = { workspace = true, features = ["test-util"] }
+# Fakes for the tests. `postgres`: the seed helpers for the frozen
+# `legacy_project_environments` rows, which production never writes.
+scarab-testkit = { workspace = true, features = ["postgres"] }

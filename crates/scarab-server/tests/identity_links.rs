@@ -24,11 +24,14 @@ use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
 use scarab_engine::Db;
 use scarab_identity::{IdentityStore, ProviderIdentity, RbacStore, Role, Scope};
-use scarab_project::{EnvironmentGovernanceStore, EnvironmentStore, ProtectionRules};
+use scarab_project::{EnvironmentGovernanceStore, ProtectionRules};
 use scarab_secrets::SecretScope;
 use scarab_server::config::OAuthConfig;
 use scarab_server::oauth::OAuthAuthenticator;
 use scarab_server::{router, AppState, LogService};
+use scarab_testkit::legacy_environments::{
+    legacy_project_environment, put_legacy_project_environment,
+};
 use scarab_testkit::{FakeClock, InMemoryObjectStore};
 
 /// A stub provider: `good-code` → an access token; `/user` answers whatever
@@ -265,7 +268,7 @@ async fn linking_proves_and_merges_an_imported_account_without_email() {
             .with_oauth_login(ok)
             .with_rbac(pg.clone())
             .with_identities(pg.clone())
-            .with_environments(pg.clone()),
+            .with_approval_history(pg.clone()),
     );
 
     // An admin imported Ada's GitHub account before she ever signed in: an
@@ -285,7 +288,8 @@ async fn linking_proves_and_merges_an_imported_account_without_email() {
     pg.import_seeds(&api(), "default", &[("ada-gh".into(), Role::Member)], false)
         .await
         .unwrap();
-    pg.put_environment(
+    put_legacy_project_environment(
+        &tdb.pool,
         "acme",
         "web",
         &scarab_project::Environment {
@@ -307,15 +311,12 @@ async fn linking_proves_and_merges_an_imported_account_without_email() {
             },
         },
     )
-    .await
-    .unwrap();
+    .await;
     // ADR-0071: admission reads approvers from the org Environment's overlay
     // for `web` (what the migration made of the legacy row above) and from the
     // baseline. Seed both to name `ada-gh`, so the fold must rewrite them.
-    let legacy_rules = pg
-        .get_environment("acme", "web", "prod")
+    let legacy_rules = legacy_project_environment(&tdb.pool, "acme", "web", "prod")
         .await
-        .unwrap()
         .unwrap()
         .protection;
     common::governance::seed_migrated_environment(&pg, "acme", "web", "prod", legacy_rules).await;
@@ -404,10 +405,8 @@ async fn linking_proves_and_merges_an_imported_account_without_email() {
         Some(Role::Member)
     );
     assert_eq!(pg.role_of("ada-gh", &api()).await.unwrap(), None);
-    let env = pg
-        .get_environment("acme", "web", "prod")
+    let env = legacy_project_environment(&tdb.pool, "acme", "web", "prod")
         .await
-        .unwrap()
         .unwrap();
     assert_eq!(env.protection.approvers, vec![ada_id.to_string()]);
     // …and where admission reads approvers now (ADR-0071 §1, §3): the

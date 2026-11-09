@@ -25,7 +25,7 @@ use common::fresh_db;
 use common::governance::seed_migrated_environment;
 use scarab_db_postgres::PostgresDb;
 use scarab_engine::Db;
-use scarab_project::{EnvironmentStore, ProtectionRules, SecretCoverageStore};
+use scarab_project::{ApprovalHistoryStore, ProtectionRules, SecretCoverageStore};
 use scarab_secrets::{SecretProvider, SecretScope};
 use scarab_server::{router, AppState, LogService};
 use scarab_testkit::{FakeClock, FakeSecrets, InMemoryObjectStore};
@@ -73,11 +73,11 @@ async fn harness(pg: Arc<PostgresDb>, environments: &[&str]) -> Harness {
         Arc::new(InMemoryObjectStore::new()),
         pg.clone(),
     ));
-    let envs: Arc<dyn EnvironmentStore> = pg.clone();
+    let history: Arc<dyn ApprovalHistoryStore> = pg.clone();
     let coverage: Arc<dyn SecretCoverageStore> = pg.clone();
     let app = router(
         AppState::new(db, Arc::new(FakeClock::new(1_000)), logs)
-            .with_environments(envs)
+            .with_approval_history(history)
             .with_environment_governance(pg.clone())
             .with_secrets(secrets.clone())
             .with_secret_coverage(coverage),
