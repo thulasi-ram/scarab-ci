@@ -404,6 +404,28 @@ async fn lock_environment(
     .ok_or_else(|| not_found(org, environment))
 }
 
+/// Read an Environment's row inside `tx` under a share lock, or
+/// [`OrgEnvironmentError::NotFound`]. `FOR SHARE`, not `FOR KEY SHARE`: only
+/// a share lock conflicts with the row update every eligibility write makes,
+/// so the eligibility read after it cannot change before `tx` ends.
+async fn share_lock_environment(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    org: &str,
+    environment: &str,
+) -> Result<sqlx::postgres::PgRow, OrgEnvironmentError> {
+    sqlx::query(&format!(
+        "SELECT {ORG_ENVIRONMENT_COLUMNS} FROM org_environments
+         WHERE org = $1 AND name = $2
+         FOR SHARE"
+    ))
+    .bind(org)
+    .bind(environment)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(org_environment_store_err)?
+    .ok_or_else(|| not_found(org, environment))
+}
+
 /// Eligibility compared as a set: the store returns patterns sorted, a
 /// caller may hold them in any order.
 fn normalized_eligibility(e: &EnvironmentProjectEligibility) -> EnvironmentProjectEligibility {
@@ -722,7 +744,28 @@ impl EnvironmentGovernanceStore for PostgresDb {
             // is ONE conditional statement instead: insert-if-absent, or
             // update-if-unchanged. Either matches nothing when a concurrent
             // write got there first.
+            //
+            // A new overlay is only for a Project the Environment admits, and
+            // that is checked in this transaction, under a share lock on the
+            // Environment's row: an eligibility write updates that row first,
+            // so a withdrawal either commits before the check, which then sees
+            // it, or waits for this insert to commit.
             Some(None) => {
+                let mut tx = self
+                    .pool()
+                    .begin()
+                    .await
+                    .map_err(org_environment_store_err)?;
+                let row =
+                    share_lock_environment(&mut tx, &overlay.org, &overlay.environment).await?;
+                let environment =
+                    stored_environment(&mut tx, &row, &overlay.org, &overlay.environment).await?;
+                if !environment.eligibility.admits(&overlay.project) {
+                    return Err(OrgEnvironmentError::Conflict(format!(
+                        "`{}` is not eligible for environment `{}`, so it has nothing to tighten",
+                        overlay.project, overlay.environment
+                    )));
+                }
                 let inserted = overlay_write(
                     &OVERLAYS.insert_if_absent,
                     overlay,
@@ -730,15 +773,15 @@ impl EnvironmentGovernanceStore for PostgresDb {
                     updated_by,
                     updated_at,
                 )
-                .execute(self.pool())
+                .execute(&mut *tx)
                 .await
                 .map_err(|e| write_err(e, &overlay.org, &overlay.environment))?
                 .rows_affected();
-                return if inserted == 1 {
-                    Ok(())
-                } else {
-                    Err(OrgEnvironmentError::changed_concurrently())
-                };
+                if inserted != 1 {
+                    return Err(OrgEnvironmentError::changed_concurrently());
+                }
+                tx.commit().await.map_err(org_environment_store_err)?;
+                return Ok(());
             }
             Some(Some(old)) => {
                 let old_wait_timer_s = wait_timer_column(&old.rules)?;

@@ -390,11 +390,19 @@ impl EnvironmentGovernanceStore for InMemoryEnvironmentGovernance {
         _updated_at: i64,
     ) -> Result<(), OrgEnvironmentError> {
         let mut state = self.state.lock().unwrap();
-        if !state
+        let Some(environment) = state
             .environments
-            .contains_key(&(overlay.org.clone(), overlay.environment.clone()))
-        {
+            .get(&(overlay.org.clone(), overlay.environment.clone()))
+        else {
             return Err(not_found(&overlay.org, &overlay.environment));
+        };
+        // A new overlay is only for a Project the Environment admits, as in
+        // Postgres. The unconditional write does not check.
+        if matches!(expected, Some(None)) && !environment.eligibility.admits(&overlay.project) {
+            return Err(OrgEnvironmentError::Conflict(format!(
+                "`{}` is not eligible for environment `{}`, so it has nothing to tighten",
+                overlay.project, overlay.environment
+            )));
         }
         let key = (
             overlay.org.clone(),

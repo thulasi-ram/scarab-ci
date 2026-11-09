@@ -415,6 +415,101 @@ async fn a_write_that_loses_a_serialization_race_is_a_conflict() {
     tdb.cleanup().await;
 }
 
+/// A new overlay checks eligibility in its own write, under a share lock on
+/// the Environment's row, so an eligibility withdrawal cannot commit between
+/// the check and the insert. The interleaving is constructed: tx1 withdraws
+/// `web` and holds the row, the store's insert blocks on it, then tx1 commits
+/// under it and the insert is refused.
+#[tokio::test]
+async fn an_overlay_insert_waits_for_an_eligibility_withdrawal_and_is_refused() {
+    use scarab_project::{
+        EnvironmentGovernanceStore, EnvironmentProjectEligibility, EnvironmentProjectOverlay,
+    };
+    let Some((tdb, db)) = migrated().await else {
+        return;
+    };
+    db.put_org_environment(&org_environment("acme", "prod", 1_000))
+        .await
+        .unwrap();
+    db.put_environment_eligibility(
+        "acme",
+        "prod",
+        &EnvironmentProjectEligibility::Projects(vec!["web".into()]),
+        "amy",
+        1_000,
+    )
+    .await
+    .unwrap();
+
+    // tx1 withdraws `web` as an eligibility write does: the row first.
+    let mut tx1 = tdb.pool.begin().await.unwrap();
+    sqlx::query(
+        "UPDATE org_environments SET eligible_all_projects = false, updated_at = 2000
+         WHERE org = 'acme' AND name = 'prod'",
+    )
+    .execute(&mut *tx1)
+    .await
+    .unwrap();
+    sqlx::query(
+        "DELETE FROM environment_project_eligibility WHERE org = 'acme' AND environment = 'prod'",
+    )
+    .execute(&mut *tx1)
+    .await
+    .unwrap();
+    let db = std::sync::Arc::new(db);
+    let insert = tokio::spawn({
+        let db = db.clone();
+        async move {
+            let overlay = EnvironmentProjectOverlay {
+                org: "acme".into(),
+                environment: "prod".into(),
+                project: "web".into(),
+                rules: Default::default(),
+            };
+            db.put_environment_project_overlay_expecting(&overlay, Some(None), "bob", 2_000)
+                .await
+        }
+    });
+    // Wait until the insert's eligibility check is blocked on tx1's row lock.
+    let mut blocked = false;
+    for _ in 0..200 {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity
+             WHERE datname = current_database() AND wait_event_type = 'Lock'
+               AND query LIKE '%FOR SHARE%'",
+        )
+        .fetch_one(&tdb.pool)
+        .await
+        .unwrap();
+        if n > 0 {
+            blocked = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(
+        blocked,
+        "the overlay insert never waited for tx1's row lock"
+    );
+    tx1.commit().await.unwrap();
+
+    let refused = insert.await.unwrap();
+    assert!(
+        matches!(&refused, Err(OrgEnvironmentError::Conflict(m)) if m.contains("not eligible")),
+        "{refused:?}"
+    );
+    assert_eq!(
+        db.deploy_governance("acme", "web", "prod")
+            .await
+            .unwrap()
+            .unwrap()
+            .overlay,
+        None,
+        "no overlay for a Project the Environment no longer admits"
+    );
+    tdb.cleanup().await;
+}
+
 /// git-bug 66cce00: `If-None-Match: *` creates only; `If-Match` replaces only
 /// the Environment whose tag the caller read, checked under the row lock.
 #[tokio::test]

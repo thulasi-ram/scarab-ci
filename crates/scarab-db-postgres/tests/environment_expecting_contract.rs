@@ -258,6 +258,48 @@ async fn every_grant_field_is_compared(s: &dyn EnvironmentGovernanceStore) {
     }
 }
 
+/// A new overlay (`Some(None)`) is only for a Project the Environment
+/// admits, checked in the write itself: the API's earlier read could be
+/// overtaken by an eligibility withdrawal.
+async fn overlay_insert_requires_eligibility(s: &dyn EnvironmentGovernanceStore) {
+    s.put_environment_eligibility_expecting(
+        "acme",
+        "prod",
+        &EnvironmentProjectEligibility::Projects(vec!["web".into()]),
+        None,
+        "amy",
+        1,
+    )
+    .await
+    .unwrap();
+    let rules = EnvironmentProtectionRules {
+        require_reason: true,
+        ..Default::default()
+    };
+    let refused = s
+        .put_environment_project_overlay_expecting(
+            &overlay("api", rules.clone()),
+            Some(None),
+            "amy",
+            2,
+        )
+        .await;
+    assert!(
+        matches!(&refused, Err(OrgEnvironmentError::Conflict(m)) if m.contains("not eligible")),
+        "a new overlay for a Project the Environment does not admit: {refused:?}"
+    );
+    assert_eq!(stored_overlay(s, "api").await, None, "nothing was stored");
+    s.put_environment_project_overlay_expecting(
+        &overlay("web", rules.clone()),
+        Some(None),
+        "amy",
+        3,
+    )
+    .await
+    .unwrap();
+    assert_eq!(stored_overlay(s, "web").await, Some(rules));
+}
+
 macro_rules! contract_test {
     ($name:ident, $contract:ident) => {
         mod $name {
@@ -300,3 +342,4 @@ macro_rules! contract_test {
 
 contract_test!(overlay_expecting, every_overlay_field_is_compared);
 contract_test!(grant_expecting, every_grant_field_is_compared);
+contract_test!(overlay_insert, overlay_insert_requires_eligibility);
