@@ -28,7 +28,7 @@ use scarab_forge::{
     ForgeConnection, ForgeConnectionStore, ForgeKind, OrgAssignView, RegistryError, RepoRef,
     ResolvedRepo,
 };
-use scarab_project::{Deployment, Environment, EnvironmentStore, ProjectError};
+use scarab_project::{ApprovalHistoryStore, Deployment, ProjectError};
 
 /// `EnvironmentGovernanceStore` (ADR-0071 §2, §3, §8): baseline, eligibility,
 /// overlays and grants, and the one-snapshot read admission makes.
@@ -3588,108 +3588,14 @@ fn reg_err(e: sqlx::Error) -> RegistryError {
     RegistryError::Store(e.to_string())
 }
 
-/// The legacy per-Project environments (ADR-0037) on the table migration 0057
-/// renamed to `legacy_project_environments` and froze (ADR-0071 §10). The
-/// server never calls the environment half any more — the per-repo write API
-/// answers 410 and admission reads [`scarab_project::EnvironmentGovernanceStore`]
-/// — so it serves the golden tests that seed legacy rows; the approval-history
-/// half is still written on every gate release.
+/// The legacy approval history (ADR-0024, ADR-0070 §1) on the `deployments`
+/// table, written on every gate release. The frozen
+/// `legacy_project_environments` rows (ADR-0071 §10) have no writer here:
+/// the split report reads them, and an identity fold rewrites a folded id in
+/// their approver lists so the report never shows a Principal that no
+/// longer signs in.
 #[async_trait::async_trait]
-impl EnvironmentStore for PostgresDb {
-    async fn put_environment(
-        &self,
-        org: &str,
-        project: &str,
-        env: &Environment,
-    ) -> Result<(), ProjectError> {
-        let protection = serde_json::to_value(&env.protection)
-            .map_err(|e| ProjectError::Store(e.to_string()))?;
-        sqlx::query(
-            "INSERT INTO legacy_project_environments (org, project, name, protection)
-             VALUES ($1, $2, $3, $4)
-             ON CONFLICT (org, project, name) DO UPDATE SET protection = EXCLUDED.protection",
-        )
-        .bind(org)
-        .bind(project)
-        .bind(&env.name)
-        .bind(protection)
-        .execute(self.pool())
-        .await
-        .map_err(|e| ProjectError::Store(e.to_string()))?;
-        Ok(())
-    }
-
-    async fn get_environment(
-        &self,
-        org: &str,
-        project: &str,
-        name: &str,
-    ) -> Result<Option<Environment>, ProjectError> {
-        let row = sqlx::query(
-            "SELECT protection FROM legacy_project_environments
-             WHERE org = $1 AND project = $2 AND name = $3",
-        )
-        .bind(org)
-        .bind(project)
-        .bind(name)
-        .fetch_optional(self.pool())
-        .await
-        .map_err(|e| ProjectError::Store(e.to_string()))?;
-        row.map(|r| {
-            let protection = serde_json::from_value(r.get::<Value, _>("protection"))
-                .map_err(|e| ProjectError::Store(e.to_string()))?;
-            Ok(Environment {
-                name: name.to_string(),
-                protection,
-            })
-        })
-        .transpose()
-    }
-
-    async fn list_environments(
-        &self,
-        org: &str,
-        project: &str,
-    ) -> Result<Vec<Environment>, ProjectError> {
-        let rows = sqlx::query(
-            "SELECT name, protection FROM legacy_project_environments
-             WHERE org = $1 AND project = $2 ORDER BY name",
-        )
-        .bind(org)
-        .bind(project)
-        .fetch_all(self.pool())
-        .await
-        .map_err(|e| ProjectError::Store(e.to_string()))?;
-        rows.into_iter()
-            .map(|r| {
-                let protection = serde_json::from_value(r.get::<Value, _>("protection"))
-                    .map_err(|e| ProjectError::Store(e.to_string()))?;
-                Ok(Environment {
-                    name: r.get::<String, _>("name"),
-                    protection,
-                })
-            })
-            .collect()
-    }
-
-    async fn delete_environment(
-        &self,
-        org: &str,
-        project: &str,
-        name: &str,
-    ) -> Result<(), ProjectError> {
-        sqlx::query(
-            "DELETE FROM legacy_project_environments WHERE org = $1 AND project = $2 AND name = $3",
-        )
-        .bind(org)
-        .bind(project)
-        .bind(name)
-        .execute(self.pool())
-        .await
-        .map_err(|e| ProjectError::Store(e.to_string()))?;
-        Ok(())
-    }
-
+impl ApprovalHistoryStore for PostgresDb {
     async fn record_deployment(
         &self,
         d: &Deployment,

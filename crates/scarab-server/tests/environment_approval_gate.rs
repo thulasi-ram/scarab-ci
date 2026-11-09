@@ -29,8 +29,8 @@ use scarab_engine::ports::ExecState;
 use scarab_engine::{Clock, Db, FailureKind, RunId, RunStatus, Scheduler, StepId, StepStatus};
 use scarab_forge::RepoRef;
 use scarab_project::{
-    ApprovalGateRules, EnvironmentGovernanceStore, EnvironmentProjectEligibility,
-    EnvironmentProtectionRules, EnvironmentStore, MissingGateMode,
+    ApprovalGateRules, ApprovalHistoryStore, EnvironmentGovernanceStore,
+    EnvironmentProjectEligibility, EnvironmentProtectionRules, MissingGateMode,
 };
 use scarab_server::oidc::{verify, Rs256Issuer};
 use scarab_server::{
@@ -135,7 +135,7 @@ impl Stack {
     /// [`Stack::new`], with `history` as the legacy deployment history.
     async fn with_history(
         protection: EnvironmentProtectionRules,
-        history: Option<Arc<dyn EnvironmentStore>>,
+        history: Option<Arc<dyn ApprovalHistoryStore>>,
     ) -> Self {
         let governance = Arc::new(InMemoryEnvironmentGovernance::new().with_environment(
             "acme",
@@ -155,7 +155,7 @@ impl Stack {
         let mut state = AppState::new(db.clone(), clock.clone(), logs)
             .with_environment_governance(governance.clone());
         if let Some(history) = history {
-            state = state.with_environments(history);
+            state = state.with_approval_history(history);
         }
         let app = router(state);
         Self {
@@ -777,7 +777,11 @@ async fn a_timer_released_gate_has_its_deployment_record() {
     pg.migrate().await.unwrap();
     let mut protection = rules(&[ME]);
     protection.wait_timer_s = 60;
-    let s = Stack::with_history(protection, Some(pg.clone() as Arc<dyn EnvironmentStore>)).await;
+    let s = Stack::with_history(
+        protection,
+        Some(pg.clone() as Arc<dyn ApprovalHistoryStore>),
+    )
+    .await;
     let history = || pg.deployments("acme", "web", "prod");
 
     let run = s.dispatch(GATED).await.expect("admitted");

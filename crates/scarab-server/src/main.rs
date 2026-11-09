@@ -317,7 +317,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pg = PostgresDb::connect(&database_url).await?;
     pg.migrate().await?;
     // Keep a typed handle so the same Postgres adapter can back the `Db` port
-    // and every store port it implements (environments, governance, …).
+    // and every store port it implements (approval history, governance, …).
     let pg = Arc::new(pg);
     let db: Arc<dyn Db> = pg.clone();
 
@@ -911,7 +911,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_ui_url(config.ui_url.clone())
         // The legacy approval history (ADR-0024, ADR-0070 §1), still written
         // on every gate release.
-        .with_environments(pg.clone())
+        .with_approval_history(pg.clone())
         // Org-level Environment governance (ADR-0071): what admits and governs
         // every Deploy Run. ALWAYS wired here — an unwired store would admit
         // deploys with no rules, which only a hand-built test state may do.

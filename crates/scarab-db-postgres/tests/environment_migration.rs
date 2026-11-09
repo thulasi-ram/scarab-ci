@@ -25,8 +25,9 @@ use common::fresh_db;
 use scarab_db_postgres::{PostgresDb, MIGRATOR};
 use scarab_project::{
     migrate_legacy_environment, EnvironmentGovernanceStore, EnvironmentProjectEligibility,
-    EnvironmentProtectionRules, EnvironmentStore,
+    EnvironmentProtectionRules,
 };
+use scarab_testkit::legacy_environments::legacy_project_environment;
 use sqlx::{PgPool, Row};
 
 /// The legacy corpus: `(org, project, name, protection JSON)`, the JSON in
@@ -314,10 +315,8 @@ async fn backfill_reproduces_the_pure_migration_and_is_a_no_op_the_second_time()
 
     // Every legacy row → exactly the pure migration of it.
     for (org, project, name, _) in corpus() {
-        let legacy = db
-            .get_environment(org, project, name)
+        let legacy = legacy_project_environment(&pool, org, project, name)
             .await
-            .unwrap()
             .expect("legacy row readable");
         let (want_overlay, want_grant) = migrate_legacy_environment(org, project, &legacy);
         let g = db

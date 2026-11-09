@@ -1,0 +1,135 @@
+{
+  "about": "How the server merges an Environment's baseline with one Project's overlay into the effective rules (scarab_project::effective_protection, served as EffectiveProtectionDto). Read by crates/scarab-server/tests/effective_protection_cases.rs, which checks the server's merge gives each `effective`, and by ui/scarab-web-ui/src/mock.test.ts, which checks the UI mock's copy of the merge gives the same. `baseline` is in the shape GET returns `protection`; `overlay` in the shape of an overlay, or null for none.",
+  "cases": [
+    {
+      "name": "a permissive baseline and no overlay",
+      "baseline": { "approvers": [], "allowed_refs": [], "wait_timer_s": 0, "require_reason": false },
+      "overlay": null,
+      "effective": {
+        "approvers": [],
+        "allowed_ref_layers": [[]],
+        "wait_timer_s": 0,
+        "require_reason": false,
+        "approval_gate": { "missing_gate_mode": "add", "max_approval_age_s": 86400 }
+      }
+    },
+    {
+      "name": "no overlay: the baseline as it is, approval gate settings included",
+      "baseline": {
+        "approvers": ["alice", "bob"],
+        "allowed_refs": ["refs/heads/main"],
+        "wait_timer_s": 600,
+        "require_reason": true,
+        "approval_gate": {
+          "missing_gate_mode": "refuse",
+          "added_gate_expiry_s": 3600,
+          "required_approvals": 1,
+          "max_approval_age_s": 7200
+        }
+      },
+      "overlay": null,
+      "effective": {
+        "approvers": ["alice", "bob"],
+        "allowed_ref_layers": [["refs/heads/main"]],
+        "wait_timer_s": 600,
+        "require_reason": true,
+        "approval_gate": {
+          "missing_gate_mode": "refuse",
+          "added_gate_expiry_s": 3600,
+          "required_approvals": 1,
+          "max_approval_age_s": 7200
+        }
+      }
+    },
+    {
+      "name": "approvers: the union, baseline first, each listed once",
+      "baseline": { "approvers": ["alice", "bob", "alice"], "allowed_refs": [], "wait_timer_s": 0, "require_reason": false },
+      "overlay": { "approvers": ["bob", "carol"], "allowed_refs": [], "wait_timer_s": 0, "require_reason": false },
+      "effective": {
+        "approvers": ["alice", "bob", "carol"],
+        "allowed_ref_layers": [[], []],
+        "wait_timer_s": 0,
+        "require_reason": false,
+        "approval_gate": { "missing_gate_mode": "add", "max_approval_age_s": 86400 }
+      }
+    },
+    {
+      "name": "allowed refs: one layer each, never intersected",
+      "baseline": { "approvers": [], "allowed_refs": ["refs/heads/main"], "wait_timer_s": 0, "require_reason": false },
+      "overlay": { "approvers": [], "allowed_refs": ["refs/tags/*"], "wait_timer_s": 0, "require_reason": false },
+      "effective": {
+        "approvers": [],
+        "allowed_ref_layers": [["refs/heads/main"], ["refs/tags/*"]],
+        "wait_timer_s": 0,
+        "require_reason": false,
+        "approval_gate": { "missing_gate_mode": "add", "max_approval_age_s": 86400 }
+      }
+    },
+    {
+      "name": "allowed refs: an overlay's empty layer is kept",
+      "baseline": { "approvers": [], "allowed_refs": ["refs/heads/main", "refs/heads/release/*"], "wait_timer_s": 0, "require_reason": false },
+      "overlay": { "approvers": [], "allowed_refs": [], "wait_timer_s": 0, "require_reason": false },
+      "effective": {
+        "approvers": [],
+        "allowed_ref_layers": [["refs/heads/main", "refs/heads/release/*"], []],
+        "wait_timer_s": 0,
+        "require_reason": false,
+        "approval_gate": { "missing_gate_mode": "add", "max_approval_age_s": 86400 }
+      }
+    },
+    {
+      "name": "wait timer: the baseline's when it is the longer",
+      "baseline": { "approvers": ["alice"], "allowed_refs": [], "wait_timer_s": 900, "require_reason": false },
+      "overlay": { "approvers": [], "allowed_refs": [], "wait_timer_s": 60, "require_reason": false },
+      "effective": {
+        "approvers": ["alice"],
+        "allowed_ref_layers": [[], []],
+        "wait_timer_s": 900,
+        "require_reason": false,
+        "approval_gate": { "missing_gate_mode": "add", "max_approval_age_s": 86400 }
+      }
+    },
+    {
+      "name": "wait timer and reason: the overlay's when it sets them",
+      "baseline": { "approvers": ["alice"], "allowed_refs": [], "wait_timer_s": 0, "require_reason": false },
+      "overlay": { "approvers": ["j.lee"], "allowed_refs": [], "wait_timer_s": 300, "require_reason": true },
+      "effective": {
+        "approvers": ["alice", "j.lee"],
+        "allowed_ref_layers": [[], []],
+        "wait_timer_s": 300,
+        "require_reason": true,
+        "approval_gate": { "missing_gate_mode": "add", "max_approval_age_s": 86400 }
+      }
+    },
+    {
+      "name": "reason: the baseline's stays when the overlay does not set it",
+      "baseline": { "approvers": [], "allowed_refs": [], "wait_timer_s": 0, "require_reason": true },
+      "overlay": { "approvers": [], "allowed_refs": [], "wait_timer_s": 0, "require_reason": false },
+      "effective": {
+        "approvers": [],
+        "allowed_ref_layers": [[], []],
+        "wait_timer_s": 0,
+        "require_reason": true,
+        "approval_gate": { "missing_gate_mode": "add", "max_approval_age_s": 86400 }
+      }
+    },
+    {
+      "name": "approval gate settings: the baseline's, whatever the overlay",
+      "baseline": {
+        "approvers": ["alice", "bob", "carol"],
+        "allowed_refs": [],
+        "wait_timer_s": 0,
+        "require_reason": false,
+        "approval_gate": { "missing_gate_mode": "refuse", "required_approvals": 2, "max_approval_age_s": 86400 }
+      },
+      "overlay": { "approvers": ["dave"], "allowed_refs": ["refs/heads/main"], "wait_timer_s": 120, "require_reason": true },
+      "effective": {
+        "approvers": ["alice", "bob", "carol", "dave"],
+        "allowed_ref_layers": [[], ["refs/heads/main"]],
+        "wait_timer_s": 120,
+        "require_reason": true,
+        "approval_gate": { "missing_gate_mode": "refuse", "required_approvals": 2, "max_approval_age_s": 86400 }
+      }
+    }
+  ]
+}
