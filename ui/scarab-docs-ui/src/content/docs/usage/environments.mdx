@@ -39,7 +39,10 @@ scopes secrets. Add approvers and it becomes gated.
 An Environment admits Runs only from the Projects on its **eligibility** list: *all projects*, or
 an explicit list (project-name globs allowed). A new Environment starts with **no** eligible
 Projects, and a pipeline that names an unknown Environment, or one that doesn't admit its Project,
-is refused before any Pod starts.
+is refused before any Pod starts. When a webhook-triggered pipeline is refused this way, Scarab
+posts a `failure` commit status under the pipeline's `scarab/<pipeline>` context that says what an
+org admin must change and links to the org's Environment settings. A push from a branch the
+Environment's `allowed_refs` leave out posts no status.
 
 Org admins create Environments and edit their eligibility and rules, under the org's
 **Settings › Environments** (`/orgs/<org>/settings/environments`).
