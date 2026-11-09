@@ -5,7 +5,8 @@
 //! The plugin asks Scarab for the open waits that name it, reads each
 //! Application through the broker's read proxy, and answers:
 //!
-//! - **pass**, with output `revision`, when [`assess`] says the Application
+//! - **pass**, with output `revision` (a multi-source Application's
+//!   revisions joined by `,`), when [`assess`] says the Application
 //!   is live (synced, healthy, no operation running) and its **target**
 //!   manifests render `image` ([`target_images`]): the same checks as the
 //!   documented wait Step (ADR-0074 §5);
@@ -21,6 +22,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -33,6 +35,16 @@ use crate::version::target_images;
 pub const WAIT_LIVE: &str = "wait-live";
 /// The most waits asked for per page.
 const PAGE_LIMIT: u32 = 100;
+/// How many waits one pass reads from Argo CD at once, so one slow or
+/// unreachable Application holds up only its own wait, not the others for
+/// its whole request timeout. Each read is two proxied requests in turn
+/// (the Application, then its managed resources), so a pass holds at most
+/// this many of the broker's 16 in-flight permits per installation
+/// (`PROXY_CONCURRENCY_PER_INSTALLATION`), leaving the rest for the
+/// reachability check. A pass makes the same two requests per wait as
+/// before, so the broker's 600-per-minute budget per installation still
+/// caps it.
+pub const GATE_READS_AT_ONCE: usize = 4;
 /// The longest body read from the gate API.
 const MAX_API_BODY_BYTES: usize = 8 * 1024 * 1024;
 
@@ -77,7 +89,7 @@ pub fn judge(app: &Application, managed: &ManagedResources, image: &str) -> Judg
             let images = target_images(managed);
             if images.contains(image) {
                 Judgement::Pass {
-                    revision: app.status.sync.revision.clone().unwrap_or_default(),
+                    revision: synced_revision(app),
                 }
             } else {
                 Judgement::Wait {
@@ -87,6 +99,17 @@ pub fn judge(app: &Application, managed: &ManagedResources, image: &str) -> Judg
                 }
             }
         }
+    }
+}
+
+/// The `revision` output: the target revision, or for a multi-source
+/// Application (no single `revision`) every source's revision in
+/// `spec.sources` order, joined by `,`.
+fn synced_revision(app: &Application) -> String {
+    let sync = &app.status.sync;
+    match sync.revision.as_deref().filter(|r| !r.is_empty()) {
+        Some(r) => r.to_string(),
+        None => sync.revisions.join(","),
     }
 }
 
@@ -238,62 +261,111 @@ fn inputs(gate: &PendingGate) -> Option<(&str, &str)> {
     ))
 }
 
+/// What one pass did with one wait.
+enum Outcome {
+    /// Not a `wait-live` wait: left alone.
+    Skipped,
+    Released,
+    Failed,
+    Waiting,
+    Error(String),
+}
+
+/// The Application an `app` input names: `<name>`, in Argo CD's own
+/// namespace, or `<namespace>/<name>` (apps in any namespace, as the argocd
+/// CLI writes it), read with `?appNamespace=<namespace>`. `None` for
+/// anything else: `.` and `..` survive percent-encoding and a URL resolves
+/// them, so the read would name another path, and a further `/` is in no
+/// name. Neither becomes valid later, so the gate fails at once.
+fn application_ref(app: &str) -> Option<(Option<&str>, &str)> {
+    let (namespace, name) = match app.split_once('/') {
+        Some((ns, name)) => (Some(ns), name),
+        None => (None, app),
+    };
+    let names_nothing = |s: &str| s.is_empty() || s == "." || s == ".." || s.contains('/');
+    if names_nothing(name) || namespace.is_some_and(names_nothing) {
+        return None;
+    }
+    Some((namespace, name))
+}
+
 /// One pass: answer every open `wait-live` wait in `org` that Argo has
 /// decided. A wait for a gate this plugin does not know is left alone.
+///
+/// Up to [`GATE_READS_AT_ONCE`] waits are read and answered at once; the
+/// report lists them in the order the gate API listed them, whatever order
+/// their reads finished in.
 pub async fn resolve_pass(
     broker: &Broker,
     api: &GateApi,
     org: &str,
 ) -> Result<PassReport, BrokerError> {
+    let gates = api.pending(org).await?;
+    // By index: a closure over `&PendingGate` makes the future fail
+    // `Send` under `tokio::spawn` (rustc's higher-ranked lifetime limit).
+    let mut outcomes: Vec<(usize, Outcome)> = stream::iter(0..gates.len())
+        .map(|i| {
+            let gate = &gates[i];
+            async move { (i, resolve_one(broker, api, gate).await) }
+        })
+        .buffer_unordered(GATE_READS_AT_ONCE)
+        .collect()
+        .await;
+    outcomes.sort_by_key(|(i, _)| *i);
     let mut report = PassReport::default();
-    for gate in api.pending(org).await? {
+    for (i, outcome) in outcomes {
+        let gate = &gates[i];
         let key = format!("{}/{}", gate.run, gate.step);
-        if gate.gate != WAIT_LIVE {
-            continue;
-        }
-        let Some((app, image)) = inputs(&gate) else {
-            report
-                .errors
-                .push(format!("{key}: no `app` or `image` input"));
-            continue;
-        };
-        // `.` and `..` survive percent-encoding and a URL resolves them, so
-        // the read would name another path; a `/` is not in an Application
-        // name. Neither becomes valid later: fail the gate now.
-        if app.is_empty() || app == "." || app == ".." || app.contains('/') {
-            let verdict = Judgement::Fail {
-                reason: format!("`app` {app:?} is not an Argo CD Application name"),
-            };
-            match api.answer(&gate, &verdict).await {
-                Ok(()) => report.failed.push(key),
-                Err(e) => report.errors.push(format!("{key}: answering: {e}")),
-            }
-            continue;
-        }
-        let path = format!("/api/v1/applications/{}", encode_component(app));
-        let read = async {
-            let application: Application = broker.argocd_get(&path, &[]).await?;
-            let managed: ManagedResources = broker
-                .argocd_get(&format!("{path}/managed-resources"), &[])
-                .await?;
-            Ok::<_, BrokerError>((application, managed))
-        };
-        let verdict = match read.await {
-            Ok((application, managed)) => judge(&application, &managed, image),
-            Err(e) => {
-                report.errors.push(format!("{key}: reading `{app}`: {e}"));
-                continue;
-            }
-        };
-        if let Err(e) = api.answer(&gate, &verdict).await {
-            report.errors.push(format!("{key}: answering: {e}"));
-            continue;
-        }
-        match verdict {
-            Judgement::Pass { .. } => report.released.push(key),
-            Judgement::Fail { .. } => report.failed.push(key),
-            Judgement::Wait { .. } => report.waiting.push(key),
+        match outcome {
+            Outcome::Skipped => {}
+            Outcome::Released => report.released.push(key),
+            Outcome::Failed => report.failed.push(key),
+            Outcome::Waiting => report.waiting.push(key),
+            Outcome::Error(e) => report.errors.push(format!("{key}: {e}")),
         }
     }
     Ok(report)
+}
+
+/// Read one wait's Application and answer it.
+async fn resolve_one(broker: &Broker, api: &GateApi, gate: &PendingGate) -> Outcome {
+    if gate.gate != WAIT_LIVE {
+        return Outcome::Skipped;
+    }
+    let Some((app, image)) = inputs(gate) else {
+        return Outcome::Error("no `app` or `image` input".into());
+    };
+    let Some((namespace, name)) = application_ref(app) else {
+        let verdict = Judgement::Fail {
+            reason: format!("`app` {app:?} is not an Argo CD Application name"),
+        };
+        return match api.answer(gate, &verdict).await {
+            Ok(()) => Outcome::Failed,
+            Err(e) => Outcome::Error(format!("answering: {e}")),
+        };
+    };
+    let query: Vec<(&str, &str)> = namespace
+        .map(|ns| ("appNamespace", ns))
+        .into_iter()
+        .collect();
+    let path = format!("/api/v1/applications/{}", encode_component(name));
+    let read = async {
+        let application: Application = broker.argocd_get(&path, &query).await?;
+        let managed: ManagedResources = broker
+            .argocd_get(&format!("{path}/managed-resources"), &query)
+            .await?;
+        Ok::<_, BrokerError>((application, managed))
+    };
+    let verdict = match read.await {
+        Ok((application, managed)) => judge(&application, &managed, image),
+        Err(e) => return Outcome::Error(format!("reading `{app}`: {e}")),
+    };
+    if let Err(e) = api.answer(gate, &verdict).await {
+        return Outcome::Error(format!("answering: {e}"));
+    }
+    match verdict {
+        Judgement::Pass { .. } => Outcome::Released,
+        Judgement::Fail { .. } => Outcome::Failed,
+        Judgement::Wait { .. } => Outcome::Waiting,
+    }
 }

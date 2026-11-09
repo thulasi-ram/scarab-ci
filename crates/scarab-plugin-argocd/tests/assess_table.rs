@@ -5,10 +5,14 @@
 //! - **version** (ADR-0070 §4): target pod-template images, hooks excluded,
 //!   initContainers included, live state and `summary.images` ignored;
 //! - **assess** (ADR-0070 §5, §11; plan-d's table): `failed` only once Argo
-//!   gave up, `live` only synced and healthy.
+//!   gave up, `live` only synced and healthy;
+//! - **multi-source** Applications (`spec.sources`): `status.sync.revisions`
+//!   and the operation's `revisions` lists in place of the single
+//!   `revision`.
 
 use scarab_plugin_argocd::argo::{Application, ManagedResources};
 use scarab_plugin_argocd::assess::{assess, Status};
+use scarab_plugin_argocd::gates::{judge, Judgement};
 use scarab_plugin_argocd::version::{target_images, version_of};
 
 fn fixture(name: &str) -> String {
@@ -220,4 +224,46 @@ fn a_finished_operation_on_the_current_revision_decides_even_when_synced() {
     // The same failure on an older revision says nothing about this one.
     a.status.sync.revision = Some("ffffffffffffffffffffffffffffffffffffffff".into());
     assert_eq!(assess(&a).status, Status::Live);
+}
+
+#[test]
+fn a_multi_source_application_is_judged_by_its_revision_lists() {
+    // Synced and healthy, with only `revisions` set: live.
+    let live = app("app-multi-source-synced-healthy.json");
+    assert_eq!(live.status.sync.revision, None);
+    assert_eq!(live.status.sync.revisions.len(), 2);
+    assert_eq!(assess(&live).status, Status::Live);
+    // A failed operation whose `revisions` equal the target's: Argo gave up
+    // on this version.
+    let a = assess(&app("app-multi-source-failed-current.json"));
+    assert_eq!(a.status, Status::Failed, "{a:?}");
+    assert!(
+        a.label
+            .starts_with("sync failed: one or more objects failed to apply"),
+        "{a:?}"
+    );
+    // The same failure for an older first source says nothing about the
+    // current target: the sync status decides.
+    let a = assess(&app("app-multi-source-failed-older.json"));
+    assert_eq!(a.status, Status::InProgress, "{a:?}");
+    assert_eq!(a.label, "awaiting auto-sync");
+}
+
+#[test]
+fn a_multi_source_pass_outputs_its_revisions_in_source_order() {
+    // No single `revision`: the output is every source's revision, in
+    // `spec.sources` order, joined by commas, never an empty string.
+    let j = judge(
+        &app("app-multi-source-synced-healthy.json"),
+        &managed("managed-web.json"),
+        "ghcr.io/acme/web:1.42.0",
+    );
+    assert_eq!(
+        j,
+        Judgement::Pass {
+            revision: "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678,\
+                       0f9e8d7c6b5a49382716f5e4d3c2b1a098765432"
+                .into()
+        }
+    );
 }

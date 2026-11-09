@@ -63,7 +63,7 @@
           {
             "name": "app",
             "type": "string",
-            "description": "The Argo CD Application name."
+            "description": "The Argo CD Application name, or <namespace>/<name> for an Application outside Argo CD's own namespace."
           },
           {
             "name": "image",
@@ -75,7 +75,7 @@
           {
             "name": "revision",
             "type": "string",
-            "description": "The git revision Argo CD synced."
+            "description": "The git revision Argo CD synced. For a multi-source Application, each source's revision in source order, joined by commas."
           }
         ]
       }

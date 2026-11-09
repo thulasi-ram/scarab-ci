@@ -15,7 +15,11 @@
 //!
 //! The documented blind spots stay blind: tags not digests, and a
 //! config-only change (values, ConfigMap, replicas) leaves the version as it
-//! was.
+//! was. A third comes from health, not from this module: a StatefulSet or
+//! DaemonSet with `updateStrategy: OnDelete` replaces a Pod only when it is
+//! deleted, and Argo CD can report it Healthy while the old Pods still run
+//! the old image. Its target images then name a version that is not
+//! serving yet, and `wait-live` passes for it.
 
 use std::collections::BTreeSet;
 

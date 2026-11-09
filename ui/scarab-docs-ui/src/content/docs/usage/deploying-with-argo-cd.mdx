@@ -169,8 +169,11 @@ Application through Scarab's credential broker.
 The plugin passes the gate when Argo CD reports the Application synced and healthy, with no
 operation running, and its target manifests render `image`. It fails the gate with Argo's message
 when Argo gives up: a failed sync of the current revision, a failed hook, or a rollout past its
-progress deadline. It fails the gate at once when `app` is `.` or `..` or holds a `/`, which no
-Application name does. The gate's output `revision` is the git revision Argo synced. The run fails when
+progress deadline. For an Application outside Argo CD's own namespace (apps in any namespace),
+write `app` as `<namespace>/<name>`, as the `argocd` CLI does. The plugin fails the gate at once
+when `app` or its namespace is empty, `.` or `..`, or `app` holds a second `/`, which no
+Application name does. The gate's output `revision` is the git revision Argo synced; for a multi-source Application it
+is each source's revision, in the order of `spec.sources`, joined by commas. The run fails when
 the gate expires. See [Plugin gates](/scarab-ci/usage/pipeline-syntax/#plugin-gates).
 
 To see what the plugin asked Argo CD for, open **Settings → Plugins** and expand **broker journal**
@@ -191,6 +194,10 @@ the same rows from `GET /v1/orgs/{org}/plugins/{name}/broker-journal`, filtered 
   nothing applies the change, and the step waits until its timeout.
 - **Multi-source applications.** They report `.status.sync.revisions` (a list) in place of
   `.status.sync.revision`, so step 2's revision check needs adjusting for them.
+- **`OnDelete` StatefulSets and DaemonSets.** With `updateStrategy: OnDelete`, Kubernetes
+  replaces a Pod only when someone deletes it, and Argo CD can report the Application Healthy
+  while the old Pods still run the old image. Both the wait step and the plugin's `wait-live`
+  gate then say your image is live before it serves.
 - **Correctness is yours.** Scarab runs the step and reports its exit code; it doesn't check what
   the step checks.
 
