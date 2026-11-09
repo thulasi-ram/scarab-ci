@@ -23,7 +23,10 @@ use scarab_engine::{
     StepStatus,
 };
 use scarab_forge::{Event, RepoRef};
-use scarab_project::{EnvironmentGovernanceStore, EnvironmentProjectEligibility};
+use scarab_project::{
+    EnvironmentGovernanceStore, EnvironmentProjectEligibility, EnvironmentProjectPrivilegeGrant,
+    ImageGrant,
+};
 use scarab_secrets::{SecretProvider, SecretScope};
 use scarab_server::{
     dispatch_run, router, trigger_run_from_event, trigger_runs_from_event, AppState, DispatchError,
@@ -795,19 +798,25 @@ async fn secret_launch_rechecks_eligibility_and_releases_nothing_to_an_ineligibl
 /// `privileged` grant frozen into its spec at Run creation. Once the Project
 /// is no longer eligible, a re-drive of that step (a rerun or retry of the old
 /// Run) must not launch: the scheduler fails it `Config` with the refusal as
-/// its cause, and no Pod is created. The control: still eligible, it launches.
+/// its cause, and no Pod is created. The control: still eligible, with the
+/// grant that admitted the step still in place, it launches.
 #[tokio::test]
 async fn a_revoked_projects_privileged_step_without_secrets_fails_config() {
     for (governance, admitted) in [
         (prod_for_checkout_only(), false),
         (prod_for_everyone(), true),
     ] {
+        governance
+            .put_environment_project_privilege_grant(&privileged_grant(), "amy", 1)
+            .await
+            .unwrap();
         let db = Arc::new(InMemoryDb::new());
         let run = RunId("r1".into());
         let step = StepId("ship".into());
         let (_, mut spec) = secret_step();
         spec.secrets.clear();
         spec.privileged = true;
+        spec.image = pinned_image();
         db.create_run(&run, 1, 1, scarab_engine::Timestamp(1_000))
             .await
             .unwrap();
@@ -964,4 +973,162 @@ steps:
     let detail = format!("{:?}", attempts.last().unwrap());
     assert!(detail.contains("no longer eligible"), "{detail}");
     assert_ne!(status("ship").await, StepStatus::Succeeded);
+}
+
+// --- Privilege grants at launch ---------------------------------------------------
+
+/// The digest the grants below name.
+fn digest() -> String {
+    format!("sha256:{}", "a".repeat(64))
+}
+
+/// An image pinned to [`digest`].
+fn pinned_image() -> String {
+    format!("reg/x@{}", digest())
+}
+
+/// `web`'s grant in `prod`: [`digest`] may run privileged; no raw overlay.
+fn privileged_grant() -> EnvironmentProjectPrivilegeGrant {
+    EnvironmentProjectPrivilegeGrant {
+        org: "acme".into(),
+        environment: "prod".into(),
+        project: "web".into(),
+        privileged_images: vec![ImageGrant {
+            image_digest: digest(),
+            privileged: true,
+            capabilities: vec![],
+        }],
+        permit_k8s_overlay: false,
+    }
+}
+
+/// Launch `spec` through a `SecretInjectingExecutor` over `governance`, in a
+/// deploy Run of `web` into `prod` when `deploy`, else in an ordinary Run.
+/// Returns the result and whether the inner executor was called.
+async fn launch_with(
+    governance: InMemoryEnvironmentGovernance,
+    deploy: bool,
+    spec: &StepSpec,
+) -> (Result<ExecHandle, ExecError>, bool) {
+    let db = Arc::new(InMemoryDb::new());
+    if deploy {
+        db.set_run_deploy_context(
+            &RunId("r1".into()),
+            &DeployContext {
+                org: "acme".into(),
+                project: "web".into(),
+                environment: "prod".into(),
+                git_ref: "refs/heads/main".into(),
+                locked_out: false,
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let logs = Arc::new(LogService::new(
+        Arc::new(InMemoryObjectStore::new()),
+        db.clone(),
+    ));
+    let inner = Arc::new(RecordingExec::default());
+    let exec = SecretInjectingExecutor::new(
+        inner.clone(),
+        db.clone() as Arc<dyn Db>,
+        Arc::new(FakeSecrets::new()),
+        logs,
+    )
+    .with_environment_governance(Arc::new(governance));
+    let (step, _) = secret_step();
+    let result = exec.launch(&step, spec).await;
+    let launched = inner.launched.lock().unwrap().is_some();
+    (result, launched)
+}
+
+/// A privileged step admitted at Run creation launches while the Project's
+/// grant still names its image's digest. Once an admin removes the digest
+/// from the grant, a later launch of the same step (a rerun or retry of the
+/// old Run) is refused: the privileges were frozen into the stored spec, and
+/// the grant that allowed them is gone.
+#[tokio::test]
+async fn a_privileged_step_is_refused_at_launch_once_its_grant_is_withdrawn() {
+    let (_, mut spec) = secret_step();
+    spec.secrets.clear();
+    spec.privileged = true;
+    spec.image = pinned_image();
+
+    let governance = prod_for_everyone();
+    governance
+        .put_environment_project_privilege_grant(&privileged_grant(), "amy", 1)
+        .await
+        .unwrap();
+    let (result, launched) = launch_with(governance, true, &spec).await;
+    result.expect("the grant still names the digest");
+    assert!(launched);
+
+    let governance = prod_for_everyone();
+    let narrowed = EnvironmentProjectPrivilegeGrant {
+        privileged_images: vec![],
+        ..privileged_grant()
+    };
+    governance
+        .put_environment_project_privilege_grant(&narrowed, "amy", 2)
+        .await
+        .unwrap();
+    let (result, launched) = launch_with(governance, true, &spec).await;
+    let err = result.expect_err("the digest is no longer granted");
+    assert!(matches!(err, ExecError::Refused(_)), "{err:?}");
+    assert!(
+        err.to_string()
+            .contains("no longer granted in environment `prod`"),
+        "{err}"
+    );
+    assert!(!launched, "the inner executor was never called");
+}
+
+/// A step's raw `k8s_overlay` is refused at launch once the Project's grant
+/// no longer permits raw overlays, and launches while it does.
+#[tokio::test]
+async fn a_k8s_overlay_step_is_refused_at_launch_once_overlays_are_no_longer_permitted() {
+    let (_, mut spec) = secret_step();
+    spec.secrets.clear();
+    spec.k8s_overlay = Some(json!({}));
+
+    for (permit, admitted) in [(true, true), (false, false)] {
+        let governance = prod_for_everyone();
+        let grant = EnvironmentProjectPrivilegeGrant {
+            permit_k8s_overlay: permit,
+            ..privileged_grant()
+        };
+        governance
+            .put_environment_project_privilege_grant(&grant, "amy", 1)
+            .await
+            .unwrap();
+        let (result, launched) = launch_with(governance, true, &spec).await;
+        if admitted {
+            result.expect("the grant permits raw overlays");
+            assert!(launched);
+        } else {
+            let err = result.expect_err("raw overlays are no longer permitted");
+            assert!(matches!(err, ExecError::Refused(_)), "{err:?}");
+            assert!(
+                err.to_string()
+                    .contains("`k8s_overlay` is no longer permitted in environment `prod`"),
+                "{err}"
+            );
+            assert!(!launched, "the inner executor was never called");
+        }
+    }
+}
+
+/// `run_as_root` is self-service: it is not re-checked at launch, in a deploy
+/// Run whose Project holds no grant or in a Run with no Environment at all.
+#[tokio::test]
+async fn a_run_as_root_step_launches_without_a_grant() {
+    let (_, mut spec) = secret_step();
+    spec.secrets.clear();
+    spec.run_as_root = true;
+    for deploy in [true, false] {
+        let (result, launched) = launch_with(prod_for_everyone(), deploy, &spec).await;
+        result.expect("run_as_root needs no grant");
+        assert!(launched);
+    }
 }
