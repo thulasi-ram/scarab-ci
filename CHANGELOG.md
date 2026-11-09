@@ -18,6 +18,8 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-09
+
 Adds libraries and plugin gates through `invoke`, a policy engine for Run creation, and
 checked forge credentials for Steps. Removes the `clone:` Step kind and the deployment
 record. Read Breaking changes before you upgrade.
@@ -206,6 +208,35 @@ record. Read Breaking changes before you upgrade.
   `forge-username` are refused (git-bug bcf2c11). Upgrade every server replica before a pipeline
   uses `env: true`: a replica from an earlier version cannot read that entry in a stored Run.
 
+- **With `plugins.enabled: true`, the chart limits the plugin namespace and the broker port**
+  (#133, #135). Every plugin Pod restarts once on the upgrade, for its new 5 s termination
+  grace. Migration `0087_plugin_installation_state_version.sql` adds a column to
+  `plugin_installations`.
+  - The chart puts a ResourceQuota and a LimitRange in the plugin namespace
+    (`plugins.quota`): 50 Pods, requests 3 CPU / 4Gi, limits 25 CPU / 13Gi. That leaves room
+    for 47 plugins next to the isolation probe's 3 Pods. Raise `pods` and the other four
+    together, or Pods are refused before the count is reached.
+  - A NetworkPolicy on the server Pods (`plugins.brokerIngressPolicy`, default `true`) admits
+    the broker port only from plugin workloads in the plugin namespace. The API port stays open
+    to every source. Set it to `false` only if another policy already governs those Pods.
+  - The plugin namespace carries the label `scarab.io/plugin-runtime-owner=<release
+    namespace>.<release name>`, and the runtime holds every plugin in a namespace labelled for
+    another release or not labelled. If you create the namespace yourself
+    (`plugins.createNamespace: false`), add the label, and create the namespace before
+    `helm install`, since the chart now puts the quota in it. When `<namespace>.<name>` is
+    longer than 63 characters, the chart refuses to render: set `plugins.owner`.
+  - The isolation probe now also checks the internet over IPv6. On a dual-stack cluster whose
+    CNI enforces NetworkPolicy for IPv4 only, the probe fails and plugins are held.
+  - A probe that cannot tell (its Pods did not run) leaves running plugins running and starts
+    none. Once a plugin's last passed probe is 12 hours old, it is held as a failed probe
+    holds it; a passed probe releases it. The installation's `probe_failed` status says so.
+- **Eligibility patterns match project names ignoring case** (#141). GitHub and Forgejo treat
+  repository names that way, so a stored `Web*` now also admits `web-api`. Check the explicit
+  eligibility lists of your Environments for a pattern that now admits more Projects than you
+  want. Patterns are trimmed before they are checked and stored. A blank pattern, a pattern made
+  only of `*` (choose *all projects* instead), and two patterns that differ only in case or
+  surrounding spaces are refused (400). Patterns stored before the upgrade are not trimmed.
+
 ### Security
 
 - Secret values were written into the step Pod's spec as literal environment values, where
@@ -300,6 +331,25 @@ record. Read Breaking changes before you upgrade.
 - **Unpinning a Run's snapshots needs a step-up.** `DELETE /v1/runs/{id}/snapshots-pin`
   shortens how long the Run's snapshots are kept, so it now needs a step-up confirmation
   (window). Pinning does not.
+- **The CredentialBroker keeps a plugin's credential to its upstream** (#131, #136). A response
+  body that holds the bound credential is cut before any part of it reaches the plugin, however
+  the chunks split it. The broker connects only to an address that is not link-local, loopback
+  or a cloud metadata address, checked once per connection, NAT64 and IPv4-compatible forms
+  included; private ranges stay allowed. It no longer forwards the plugin's `Accept-Encoding`,
+  and refuses a response encoded anyway (502 `encoded body`), because it cannot scan a
+  compressed body. A cached credential is read from the secret store again once it is 60 s
+  old, so a rotated secret is used within a minute and a deleted one is refused (409,
+  journaled `credential missing`). An installation the plugin runtime holds is refused. Each
+  installation may make 600 requests a minute (429 `rate`), and the broker takes 256 at once
+  (503 `broker busy`). A `pc-*` secret that no binding names is deleted after 10 minutes.
+- **A withdrawn privilege grant no longer applies to reruns** (#138). Run creation checked a
+  Step's `privileged`, `add_capabilities` and raw `k8s_overlay` against the Project's privilege
+  grant in the Environment, but a launch checked only that the Environment still admitted the
+  Project, so a rerun of an old Run kept a grant an admin had narrowed since. Every launch now
+  checks the Step against the grant as it stands then, and a refused Step fails `Config` with
+  the reason. `run_as_root` is self-service and is not checked again. Adding an overlay for a
+  Project also checks eligibility in the same transaction, so an eligibility change made at the
+  same moment answers 409 instead of leaving an overlay for a Project that is no longer admitted.
 
 ### Features
 
@@ -445,6 +495,23 @@ record. Read Breaking changes before you upgrade.
   writes nothing when the person already has a binding in the org, a revoked one included. A
   person who has never signed in is refused (exit 3).
   [Grant the first roles](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#grant-the-first-roles)
+- **Broker journal** (#139). The CredentialBroker records every request a plugin makes through
+  it and keeps the rows 14 days. An org admin now reads them under Settings › Plugins, where
+  each installation has a **broker journal** table (time, phase, method, path, rule, status,
+  bytes, duration, reason) with a phase filter, a filter for refused or cut-short requests, and
+  **Load older**. The API is `GET /v1/orgs/{org}/plugins/{name}/broker-journal` with `limit`,
+  `before`, `phase` and `denied`. It returns the names of a request's query parameters, never
+  their values.
+  [Waiting with the Argo CD plugin](https://thulasi-ram.github.io/scarab-ci/usage/deploying-with-argo-cd/#waiting-with-the-argo-cd-plugin)
+- **Delete an Environment with what it holds** (#141). While Projects hold overlays, privilege
+  grants or secrets in an Environment, deleting it is refused, and the 409 now lists them as
+  JSON, with a count and the names for each kind. `DELETE
+  /v1/orgs/{org}/environments/{env}?cascade=true` deletes the Environment's secrets, then its
+  overlays, grants, eligibility and the Environment in one transaction. If a step fails, the
+  Environment stays and a retry finishes the delete. The delete dialog lists what blocks it
+  and offers to delete it all behind the typed-name confirmation, and the step-up confirmation
+  shows `cascade = true`.
+  [View and edit an Environment](https://thulasi-ram.github.io/scarab-ci/usage/environments/#view-and-edit-an-environment)
 
 ### Enhancement
 
@@ -502,6 +569,30 @@ record. Read Breaking changes before you upgrade.
   reads "overrides org". Names only; no value is shown. The secret matrix response adds
   `overrides`, which names the broader scope a set cell hides.
   [Secrets](https://thulasi-ram.github.io/scarab-ci/usage/secrets/#where-you-set-them-one-grid-by-scope)
+- **A refused deploy shows on the commit** (#140). When a push starts a pipeline that names an
+  Environment that does not exist, or one that does not admit the Project, the server now posts
+  a `failure` commit status on the pushed commit under the pipeline's `scarab/<pipeline>`
+  context. Its description says what to change, and it links to the org's Environments page or
+  to the Environment. A push from a branch the Environment's `allowed_refs` leave out posts no
+  status, so a deploy pipeline limited to `main` does not mark every pull request failed.
+- **Open Environments with no baseline rule are flagged** (#143). The Environment list counts,
+  in a warning, every Environment that admits at least one Project and whose baseline has no
+  approver, no ref rule, no wait timer and no reason. Those rows say **permissive baseline**, and
+  the Environment's page asks for a baseline. Before, only the migration's split report warned,
+  so an Environment created after it was never flagged. The split report's banner now counts
+  only the lines left to review.
+- **The Argo CD plugin's `wait-live` gate** (#142) reads an Application outside Argo CD's own
+  namespace when `app` is written `<namespace>/<name>`, as the `argocd` CLI takes it; a plain
+  name works as before. For a multi-source Application, the `revision` output is each source's
+  revision in the order of `spec.sources`, joined by commas; it was empty. The plugin reads four
+  gate waits at a time, so one slow Argo CD read no longer holds up the others. The docs name
+  the `OnDelete` blind spot: Argo CD can report an Application Healthy while its old Pods still
+  run.
+- **Plugin runtime** (#133). A runtime that shuts down releases its lease, so another server
+  replica takes over at once. An installation that is stopped or held, and already scaled down,
+  costs no Kubernetes API writes per pass. Each NetworkPolicy the runtime applies is read back,
+  and plugins do not start when the stored policy differs. The orphan sweep removes only objects
+  of its own release. A kubelet a plugin can reach is a note on the probe status, not a failure.
 
 ### Bug Fixes
 
@@ -551,6 +642,24 @@ record. Read Breaking changes before you upgrade.
 - A Step whose image sets `USER` to a name failed with only `CreateContainerConfigError`.
   The failure now says to use a numeric user: Steps run as non-root, and the kubelet can
   check only a numeric one. Scarab does not override the image's user.
+- **A Step's `timeout:` counts from when its process starts** (#123). It counted from when the
+  Attempt was claimed, so waiting for a node, pulling the image and fetching the workspace used
+  it up, and a Step that never ran failed as `Timeout`. Until the Step runs, a 30-minute limit
+  applies instead: a Step that has not started by then fails as never-started infrastructure,
+  with a message that says what it was waiting for, and is retried automatically. On Kubernetes
+  the Pod's `activeDeadlineSeconds` is now the timeout plus those 30 minutes. Migration
+  `0086_attempt_execution_started_at.sql` adds `attempts.execution_started_at`.
+- A launch that created its Pod and then failed on every delivery (on Kubernetes, the Pod was
+  accepted and the Secret write failed) dead-lettered its Run and left the Pod running. The
+  Run's teardown now finds and deletes it (#121).
+- An operator's cancel that was interrupted after its Steps were cancelled and before the Run
+  was written (a crash or a database error) ended the Run Failed, with a failure commit status.
+  It now ends Cancelled, unless a rerun or retry was asked for after the cancel (#125).
+- **Forgejo pushes stopped starting Runs after the webhook secret changed.** Binding a
+  repository again kept the existing hook, which still carried the old secret, so every
+  delivery got a 401. Forgejo does not change a hook's secret when the hook is edited, so
+  registering a hook now deletes the repository's hook for Scarab's callback and creates it
+  again with the current secret. A push made between the two is not delivered (#137).
 
 ### Tests
 
@@ -561,6 +670,14 @@ record. Read Breaking changes before you upgrade.
   mid-drain for longer than the lease TTL and shorter than the Pod's grace period; every Run
   must still succeed. C1 checks that a Cache restores from its home replica when no fault
   hit that replica.
+- `just test e2e` gains `results_outputs`, where a Step writes two results and the next reads
+  them through `${{ outputs.<id>.<name> }}` in its `env:`, and a check that a delivery under the
+  current Forgejo webhook secret verifies after a hook made with an older one (#137). The plugin
+  runtime's cluster suite tests the `cidr:` broker peer, with a negative case, and the Argo CD
+  pass checks that a Pod outside the plugin namespace cannot reach the broker port (#133).
+- The Environment migration equivalence tests cover Projects whose Runs name an Environment
+  only other Projects define, and Projects that never ran a deploy. One fixture file checks
+  both the server's effective-protection merge and the mock UI's (#144).
 
 ### Documentation
 
@@ -613,6 +730,10 @@ record. Read Breaking changes before you upgrade.
   `just release <version>` checks a release before it is tagged.
 - The ADR-0062 overlay change-set code, its tests and its recipes are deleted; ADR-0066 had
   already dropped the feature.
+- **New mark** (#130, #132). A rhinoceros beetle seen from the side, in ink and gold (cream and
+  gold on dark surfaces), replaces the halftone mark in the web UI, the docs site, the README
+  and the favicons, which use a one-colour version. `ui/brand/mark/` holds the source artwork
+  and the trace, and `just brand [check | png]` regenerates the SVGs and PNGs.
 
 ## [0.2.2] - 2026-10-28
 
@@ -712,7 +833,8 @@ The first release: the `scarab-server`, `scarab-clone`, `scarab-wsfetch` and
 `scarab-results-sidecar` images and the Helm chart at
 `oci://ghcr.io/thulasi-ram/charts/scarab`. It had no GitHub Release notes.
 
-[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/thulasi-ram/scarab-ci/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/thulasi-ram/scarab-ci/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/thulasi-ram/scarab-ci/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/thulasi-ram/scarab-ci/compare/v0.1.1...v0.2.0
