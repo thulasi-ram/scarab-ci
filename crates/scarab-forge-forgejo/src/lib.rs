@@ -707,25 +707,41 @@ impl ForgePort for ForgejoForge {
     }
 
     /// REAL webhook registration (ADR-0046): Forgejo has no single-app
-    /// webhook, so each repo gets one. Idempotent — an existing hook with the
-    /// same callback URL is left as-is.
+    /// webhook, so each repo gets one. Idempotent: the repo ends with exactly
+    /// one hook for `callback_url`.
     ///
     /// The hook carries the connection's `webhook_secret` in its config, which is
     /// what makes its deliveries verifiable at `/webhooks/forgejo`; without it the
-    /// server answers every delivery with 401.
+    /// server answers every delivery with 401. Forgejo never returns a hook's
+    /// secret, and its hook edit (`PATCH`) answers 200 but keeps the old secret
+    /// (measured on Forgejo 16.0.1), so an existing hook for this callback is
+    /// deleted and created again with the current secret. Leaving it as it was
+    /// left a hook made before the secret changed signing with the old one, and
+    /// every delivery was refused with 401 (git-bug 27006cc). Deleting first
+    /// means a push in between is missed rather than delivered twice; both
+    /// callers are admin actions (bind, re-register), not a loop.
     async fn register_webhook(&self, repo: &RepoRef, callback_url: &str) -> Result<(), ForgeError> {
         let hooks_url = self.url(&format!("/repos/{}/{}/hooks", repo.owner, repo.name));
         let resp = self.send(|| self.client.get(&hooks_url)).await?;
         let hooks = ok_json(resp).await?;
-        let exists = hooks
+        let existing: Vec<u64> = hooks
             .as_array()
             .map(|arr| {
                 arr.iter()
-                    .any(|h| hook_callback_url(h) == Some(callback_url))
+                    .filter(|h| hook_callback_url(h) == Some(callback_url))
+                    .filter_map(|h| h.get("id").and_then(Value::as_u64))
+                    .collect()
             })
-            .unwrap_or(false);
-        if exists {
-            return Ok(());
+            .unwrap_or_default();
+        for id in existing {
+            let hook_url = format!("{hooks_url}/{id}");
+            let resp = self.send(|| self.client.delete(&hook_url)).await?;
+            let status = resp.status();
+            // Gone already (a concurrent delete) is what was wanted.
+            if !status.is_success() && status != reqwest::StatusCode::NOT_FOUND {
+                let text = resp.text().await.unwrap_or_default();
+                return Err(ForgeError::Api(format!("{status}: {text}")));
+            }
         }
         let body = hook_create_body(callback_url, self.webhook_secret.as_deref());
         let resp = self

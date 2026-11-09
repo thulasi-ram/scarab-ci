@@ -86,12 +86,12 @@ async fn forgejo_adapter_passes_the_port_contract() {
     // registration (a per-repo hook is actually created here).
     assert_contract(&forge, &fx).await;
 
-    // register_webhook is idempotent: a second call with the same URL must
-    // not create a duplicate hook.
+    // register_webhook is idempotent: a second call with the same URL replaces
+    // the hook and does not create a duplicate.
     forge
         .register_webhook(&repo, "https://scarab.example/webhooks/x")
         .await
-        .expect("re-register is a no-op");
+        .expect("re-register replaces the hook");
 
     let ev = forge
         .normalize_event(fx.push_delivery.clone())
