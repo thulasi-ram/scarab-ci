@@ -22,10 +22,12 @@
 //! It is not limited to steps that carry a credential: a step with no secret
 //! and no OIDC token can still carry admitted `privileged` /
 //! `add_capabilities` / `k8s_overlay` grants, which are Environment authority
-//! too. A refusal is [`ExecError::Refused`], which the scheduler turns into a
-//! `Config` step failure carrying the reason. The same check holds a gate the
-//! scheduler would release on its own verdict (a timer that passed): the gate
-//! fails with the reason ([`Executor::gate_refusal`]).
+//! too, so each launch also checks them against the Project's privilege grant
+//! as it stands then: a grant an admin narrowed after Run creation holds back
+//! a rerun of the old Run. A refusal is [`ExecError::Refused`], which the
+//! scheduler turns into a `Config` step failure carrying the reason. The same
+//! check holds a gate the scheduler would release on its own verdict (a timer
+//! that passed): the gate fails with the reason ([`Executor::gate_refusal`]).
 
 use std::sync::Arc;
 
@@ -71,19 +73,60 @@ pub(crate) struct StepAdmission {
     pub(crate) before_approval: bool,
 }
 
+/// Why `spec` may not launch with the privileges Run creation admitted into
+/// it, judged against the Project's privilege grant in `environment` as it
+/// stands now (ADR-0071 §8), or `None` when it may. `privileged` and added
+/// capabilities must still be granted to the image's digest; a raw
+/// `k8s_overlay` must still be permitted. `run_as_root` is self-service and
+/// never re-checked. `spec.image` is the rendered image, which is what the
+/// digest whitelist matches.
+pub(crate) fn launch_grant_refusal(
+    environment: &str,
+    grant: Option<&scarab_project::EnvironmentProjectPrivilegeGrant>,
+    spec: &StepSpec,
+    locked_out: bool,
+) -> Option<String> {
+    use scarab_project::{EnvironmentProjectPrivilegeGrant, GrantRequest};
+
+    if spec.privileged || !spec.add_capabilities.is_empty() {
+        let req = GrantRequest {
+            run_as_root: false,
+            add_capabilities: spec.add_capabilities.clone(),
+            privileged: spec.privileged,
+        };
+        if let Err(violations) =
+            EnvironmentProjectPrivilegeGrant::admit_grants(grant, &req, &spec.image, locked_out)
+        {
+            return Some(format!(
+                "the step's privileges are no longer granted in environment `{environment}`: {}",
+                violations.join("; ")
+            ));
+        }
+    }
+    if spec.k8s_overlay.is_some() && !EnvironmentProjectPrivilegeGrant::permits_k8s_overlay(grant) {
+        return Some(format!(
+            "the step's raw `k8s_overlay` is no longer permitted in environment `{environment}`"
+        ));
+    }
+    None
+}
+
 /// Refuse when `step`'s run is a deploy whose Environment is gone or no
-/// longer admits its Project (ADR-0071 §2), or when the `step.admit`
-/// decision denies it ([`step_admit`]): the Environment's launch-time
-/// re-check, then the org's and Project's `step.admit` Policies when
-/// `policies` is wired. A run with no deploy context is judged by those
-/// Policies alone, and admitted when there is none. Shared by
-/// the launch decorators, so each makes the check before it uses a
-/// credential. `now_ms` is what an approval's age is measured to.
+/// longer admits its Project (ADR-0071 §2), when `spec` (given at a Step's
+/// launch) carries privileges the Project's grant there no longer allows
+/// ([`launch_grant_refusal`]), or when the `step.admit` decision denies it
+/// ([`step_admit`]): the Environment's launch-time re-check, then the org's
+/// and Project's `step.admit` Policies when `policies` is wired. A run with
+/// no deploy context is judged by those Policies alone, and admitted when
+/// there is none. Shared by the launch decorators, so each makes the check
+/// before it uses a credential. `now_ms` is what an approval's age is
+/// measured to.
 pub(crate) async fn ensure_deploy_still_admitted(
     db: &dyn Db,
     governance: &dyn scarab_project::EnvironmentGovernanceStore,
     policies: Option<&dyn scarab_policy::store::PolicyStore>,
     step: &StepRun,
+    spec: Option<&StepSpec>,
     now_ms: i64,
 ) -> Result<StepAdmission, ExecError> {
     let run = &step.run;
@@ -113,6 +156,16 @@ pub(crate) async fn ensure_deploy_still_admitted(
         .map_err(|e| ExecError::Other(format!("environment governance store: {e}")))?
     {
         Some(g) if g.eligible => {
+            if let Some(refusal) = spec.and_then(|spec| {
+                launch_grant_refusal(
+                    &ctx.environment,
+                    g.privilege_grant.as_ref(),
+                    spec,
+                    ctx.locked_out,
+                )
+            }) {
+                return Err(ExecError::Refused(refusal));
+            }
             let protection = g.effective_protection();
             let tenant = (ctx.org.as_str(), ctx.project.as_str());
             return step_admit(
@@ -544,11 +597,14 @@ impl SecretInjectingExecutor {
     /// scheduler fails the step (`Config`, with this reason) and nothing —
     /// credential, privilege grant, Pod — is used.
     ///
-    /// `consult` decides whether the `step.admit` Policies are consulted and
-    /// the decision recorded: at a Step's launch, not when a gate passes.
+    /// `spec` is the Step's launch spec, whose admitted privileges are
+    /// checked against the Project's grant now; a gate has none. `consult`
+    /// decides whether the `step.admit` Policies are consulted and the
+    /// decision recorded: at a Step's launch, not when a gate passes.
     async fn ensure_still_admitted(
         &self,
         step: &StepRun,
+        spec: Option<&StepSpec>,
         consult: bool,
     ) -> Result<StepAdmission, ExecError> {
         match &self.governance {
@@ -560,6 +616,7 @@ impl SecretInjectingExecutor {
                     governance.as_ref(),
                     policies,
                     step,
+                    spec,
                     now,
                 )
                 .await
@@ -659,7 +716,7 @@ impl Executor for SecretInjectingExecutor {
         // at Run creation; gating only credential use let a revoked Project's
         // privileged rerun launch indefinitely. A run with no deploy context
         // (ordinary CI) returns early inside the check.
-        let admission = self.ensure_still_admitted(step, true).await?;
+        let admission = self.ensure_still_admitted(step, Some(spec), true).await?;
         // Per-attempt OIDC token (ADR-0015): minted fresh on every launch,
         // in memory only — the k8s executor delivers it via a tmpfs file.
         let now_ms = std::time::SystemTime::now()
@@ -774,7 +831,10 @@ impl Executor for SecretInjectingExecutor {
         // admits the Project — the check the API's release and approve routes
         // make (git-bug 492a603). Then whatever the wrapped executor says.
         let refused = match self.ensure_not_yanked(gate).await {
-            Ok(()) => self.ensure_still_admitted(gate, false).await.map(|_| ()),
+            Ok(()) => self
+                .ensure_still_admitted(gate, None, false)
+                .await
+                .map(|_| ()),
             Err(e) => Err(e),
         };
         match refused {

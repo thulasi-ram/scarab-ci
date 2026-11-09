@@ -960,7 +960,10 @@ pub trait EnvironmentGovernanceStore: Send + Sync {
     /// [`put_environment_project_overlay`](Self::put_environment_project_overlay),
     /// refused with [`OrgEnvironmentError::Conflict`] unless the stored
     /// overlay is `expected` (when given): `Some(None)` expects the Project
-    /// to hold none, `Some(Some(o))` expects `o`'s rules.
+    /// to hold none, `Some(Some(o))` expects `o`'s rules. `Some(None)` is
+    /// also refused with `Conflict` when the Environment does not admit the
+    /// Project, checked in the same write so a concurrent withdrawal of
+    /// eligibility cannot slip between the check and the insert.
     async fn put_environment_project_overlay_expecting(
         &self,
         overlay: &EnvironmentProjectOverlay,

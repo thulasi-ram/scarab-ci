@@ -600,6 +600,9 @@ impl Executor for ForgeCredentialExecutor {
                     governance.as_ref(),
                     None,
                     step,
+                    // The grants are re-checked by SecretInjecting, which
+                    // every launch passes through after this one.
+                    None,
                     self.clock.now().await.0,
                 )
                 .await?;
