@@ -102,7 +102,11 @@ async fn happy_path_cli_dispatch_to_succeeded_with_logs() {
     // their base_url) by connection id across requests.
     let conn_id = format!("e2e-forgejo-{}", std::process::id());
     let cred_ref = format!("{conn_id}-token");
-    let (org, repo) = ("e2e", "happy");
+    // A repo per invocation too: a repo binds to one connection, so a fixed
+    // name is BoundElsewhere to the previous run's connection on any e2e
+    // database that is not new.
+    let repo_name = format!("happy-{}", std::process::id());
+    let (org, repo) = ("e2e", repo_name.as_str());
 
     let registry = scarab_db_postgres::PostgresDb::connect(&database_url())
         .await
