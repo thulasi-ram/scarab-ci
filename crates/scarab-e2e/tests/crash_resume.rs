@@ -216,6 +216,9 @@ async fn crash_resume_completes_exactly_once() {
     );
 
     // --- the run completes; evidence says exactly-once -----------------------
+    // A new client: the old one's pooled keep-alive connection died with the
+    // killed process, and its next request fails with IncompleteMessage.
+    let client = support::client();
     // Budget: outbox claim-lease (30s) + the 20s sleep + step 2 + slack.
     let rs = wait_for_terminal(&client, &base, &run, Duration::from_secs(240)).await;
     assert_eq!(

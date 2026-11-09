@@ -499,15 +499,16 @@ async fn busybox_runs_to_completion_and_relaunch_reattaches() {
 }
 
 /// Live step-timeout acceptance (ADR-0047): a sleeping step whose `timeout:`
-/// is 5s is killed by the kubelet (`activeDeadlineSeconds`) and surfaces as a
-/// classified `Timeout` failure. `#[ignore]`d + gated on SCARAB_TEST_KUBE.
+/// is 5s is admitted with `activeDeadlineSeconds` = 5s + the provisioning
+/// deadline; once the deadline is lowered the kubelet kills it and it surfaces
+/// as a classified `Timeout` failure. `#[ignore]`d + gated on SCARAB_TEST_KUBE.
 #[tokio::test]
 #[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
 async fn sleeping_step_is_killed_at_its_deadline() {
     let ns = enter_tier();
 
     let client = kube_client().await;
-    let exec = K8sExecutor::with_client(ns, client);
+    let exec = K8sExecutor::with_client(ns.clone(), client.clone());
     let step = StepRun {
         run: RunId(unique_run("run-timeout")),
         step: StepId("sleeper".into()),
@@ -553,7 +554,41 @@ async fn sleeping_step_is_killed_at_its_deadline() {
 
     let h = exec.launch(&step, &spec).await.expect("launch");
 
-    // The kubelet enforces the deadline; DeadlineExceeded classifies Timeout.
+    // The admitted deadline is the timeout plus the engine's provisioning
+    // deadline (git-bug cfb5edb): the engine enforces the timeout from
+    // execution start, and the kubelet's deadline is the backstop.
+    use kube::api::{Api, Patch, PatchParams};
+    let pods: Api<k8s_openapi::api::core::v1::Pod> = Api::namespaced(client.clone(), &ns);
+    let admitted = pods.get(&h.0).await.expect("admitted pod");
+    assert_eq!(
+        admitted
+            .spec
+            .as_ref()
+            .and_then(|s| s.active_deadline_seconds),
+        Some(i64::from(5 + scarab_engine::PROVISIONING_DEADLINE_SECS)),
+        "activeDeadlineSeconds = timeout + provisioning deadline"
+    );
+
+    // Waiting 30 minutes for that backstop is not a test, so once the step
+    // runs, lower the deadline (the API allows lowering it) and let the
+    // kubelet kill the Pod. A step that started classifies Timeout.
+    let mut running = false;
+    for _ in 0..60 {
+        if matches!(exec.poll(&h).await, Ok(ExecState::Running)) {
+            running = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    assert!(running, "the sleep step never reached Running");
+    pods.patch(
+        &h.0,
+        &PatchParams::default(),
+        &Patch::Merge(serde_json::json!({ "spec": { "activeDeadlineSeconds": 1 } })),
+    )
+    .await
+    .expect("lower activeDeadlineSeconds");
+
     let terminal = poll_to_terminal(&exec, &h, 90).await;
     match terminal {
         Some(ExecState::Failed { class, .. }) => assert_eq!(
@@ -2517,11 +2552,16 @@ async fn step_secrets_are_files_and_never_in_the_admitted_pod() {
     let pods: Api<k8s_openapi::api::core::v1::Pod> = Api::namespaced(client, &ns);
 
     let step = step_run_of(&unique_run("run-secrets"), "secrets");
+    // The script compares SHA-256 digests, not the values: a value written
+    // into the command would itself be in the admitted Pod and trip the check
+    // below. The digests are of `sekret-db-live` and `sekret-api-live`.
     let mut spec = busybox_spec(
         "set -eu; \
-         test \"$(cat /scarab/secrets/DB_PASSWORD)\" = sekret-db-live; \
-         test \"$(cat \"$SCARAB_SECRETS/API_TOKEN\")\" = sekret-api-live; \
-         test \"$API_TOKEN\" = sekret-api-live; \
+         db=bd7e5200c0c337b7659f64fd4e202a1fbf6c1e37452ccca6ca637b3f5fb389ab; \
+         api=0f1c6e301f923106ddafed6b0a46c002909f49d6fb17f7ae827ee5d3e88522ef; \
+         test \"$(sha256sum < /scarab/secrets/DB_PASSWORD | cut -d' ' -f1)\" = \"$db\"; \
+         test \"$(sha256sum < \"$SCARAB_SECRETS/API_TOKEN\" | cut -d' ' -f1)\" = \"$api\"; \
+         test \"$(printf %s \"$API_TOKEN\" | sha256sum | cut -d' ' -f1)\" = \"$api\"; \
          test -z \"${DB_PASSWORD:-}\"",
         true,
     );
