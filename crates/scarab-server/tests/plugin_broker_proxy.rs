@@ -28,8 +28,8 @@ use tower::ServiceExt;
 use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
 use scarab_plugin::{
-    BrokerJournalEntry, BrokerJournalPhase, PluginStore, PluginTokenVerifier, TokenRejected,
-    VerifiedServiceAccount,
+    BrokerJournalEntry, BrokerJournalFilter, BrokerJournalPhase, PluginStore, PluginTokenVerifier,
+    TokenRejected, VerifiedServiceAccount,
 };
 use scarab_secrets::{Secret, SecretProvider, SecretScope};
 use scarab_server::broker_proxy::{
@@ -328,7 +328,7 @@ async fn journal_until(
 ) -> Vec<BrokerJournalEntry> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let entries = pg.broker_journal(installation_id, 200).await.unwrap();
+        let entries = newest(pg, installation_id, 200).await;
         if done(&entries) {
             return entries;
         }
@@ -338,6 +338,16 @@ async fn journal_until(
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// The installation's newest `limit` journal entries, newest first.
+async fn newest(pg: &PostgresDb, installation_id: &str, limit: usize) -> Vec<BrokerJournalEntry> {
+    pg.broker_journal(installation_id, &BrokerJournalFilter::newest(limit))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.entry)
+        .collect()
 }
 
 /// The `phase` row of each request, newest first.
@@ -1289,9 +1299,9 @@ impl scarab_plugin::PluginStore for HeldJournal {
     async fn broker_journal(
         &self,
         installation_id: &str,
-        limit: usize,
-    ) -> Result<Vec<BrokerJournalEntry>, scarab_plugin::PluginStoreError> {
-        self.inner.broker_journal(installation_id, limit).await
+        filter: &BrokerJournalFilter,
+    ) -> Result<Vec<scarab_plugin::BrokerJournalRecord>, scarab_plugin::PluginStoreError> {
+        self.inner.broker_journal(installation_id, filter).await
     }
     async fn prune_broker_journal(
         &self,
@@ -1337,7 +1347,7 @@ async fn shutdown_writes_the_journal_entries_still_queued() {
     open.add_permits(1_000);
     assert!(finished.await.unwrap(), "the writer finished");
     // Read once, no waiting: everything queued before the drain is written.
-    let written = h.pg.broker_journal(&id, REFUSED + 10).await.unwrap();
+    let written = newest(&h.pg, &id, REFUSED + 10).await;
     assert_eq!(written.len(), REFUSED);
     h.finish().await;
 }
@@ -1703,7 +1713,7 @@ async fn shutdown_writes_the_row_of_a_read_still_waiting_on_its_upstream() {
         "the writer finished"
     );
     assert_eq!(read.await.unwrap().0, StatusCode::OK);
-    let rows = h.pg.broker_journal(&id, 10).await.unwrap();
+    let rows = newest(&h.pg, &id, 10).await;
     assert!(
         rows.iter().any(|e| e.phase == BrokerJournalPhase::Head),
         "the forwarded read has a head row: {rows:?}"

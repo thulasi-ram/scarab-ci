@@ -16,9 +16,10 @@ use serde_json::Value;
 use sqlx::Row;
 
 use scarab_plugin::{
-    BrokerJournalEntry, BrokerJournalPhase, InstallationState, PluginConnection,
-    PluginConnectionAuthScheme, PluginInstallation, PluginManifest, PluginStorage, PluginStore,
-    PluginStoreError, PluginUninstall, RuntimeStatus, PAGE_DEFAULT_LIMIT, PAGE_MAX_LIMIT,
+    BrokerJournalEntry, BrokerJournalFilter, BrokerJournalPhase, BrokerJournalRecord,
+    InstallationState, PluginConnection, PluginConnectionAuthScheme, PluginInstallation,
+    PluginManifest, PluginStorage, PluginStore, PluginStoreError, PluginUninstall, RuntimeStatus,
+    PAGE_DEFAULT_LIMIT, PAGE_MAX_LIMIT,
 };
 
 use crate::PostgresDb;
@@ -640,25 +641,33 @@ impl PluginStore for PostgresDb {
     async fn broker_journal(
         &self,
         installation_id: &str,
-        limit: usize,
-    ) -> Result<Vec<BrokerJournalEntry>, PluginStoreError> {
+        filter: &BrokerJournalFilter,
+    ) -> Result<Vec<BrokerJournalRecord>, PluginStoreError> {
+        // One read down (installation_id, id DESC); the phase and denied
+        // filters are applied to the rows that index walk yields.
         sqlx::query(
-            "SELECT installation_id, slot, method, path, rule, status, bytes, started_at,
+            "SELECT id, installation_id, slot, method, path, rule, status, bytes, started_at,
                     duration_ms, denied_reason, request_id, phase, upstream_path, query
                FROM plugin_broker_journal
               WHERE installation_id = $1
+                AND ($2::bigint IS NULL OR id < $2)
+                AND ($3::text IS NULL OR phase = $3)
+                AND (NOT $4 OR denied_reason IS NOT NULL)
               ORDER BY id DESC
-              LIMIT $2",
+              LIMIT $5",
         )
         .bind(installation_id)
-        .bind(page_limit(limit))
+        .bind(filter.before)
+        .bind(filter.phase.map(BrokerJournalPhase::as_str))
+        .bind(filter.denied_only)
+        .bind(page_limit(filter.limit))
         .fetch_all(self.pool())
         .await
         .map_err(plugin_store_err)?
         .iter()
         .map(|r| {
             let phase: String = r.get("phase");
-            Ok(BrokerJournalEntry {
+            let entry = BrokerJournalEntry {
                 request_id: r.get("request_id"),
                 phase: BrokerJournalPhase::parse(&phase).ok_or_else(|| {
                     PluginStoreError::Store(format!("broker journal: unreadable phase {phase:?}"))
@@ -679,6 +688,10 @@ impl PluginStore for PostgresDb {
                     .get::<Option<i64>, _>("duration_ms")
                     .map(|d| d.max(0) as u64),
                 denied_reason: r.get("denied_reason"),
+            };
+            Ok(BrokerJournalRecord {
+                id: r.get("id"),
+                entry,
             })
         })
         .collect()

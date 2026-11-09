@@ -13274,8 +13274,9 @@ const TAG_GROUPS: &[(&str, &str)] = &[
     (
         "Plugins",
         "PluginInstallations (ADR-0072): the first-party catalog, install and \
-         uninstall, the kill switch, and the PluginConnections the \
-         CredentialBroker proxies to.",
+         uninstall, the kill switch, the PluginConnections the \
+         CredentialBroker proxies to, and its journal of what each plugin \
+         asked for.",
     ),
     (
         "Libraries",
@@ -13658,6 +13659,7 @@ impl utoipa::Modify for StepUpResponses {
         plugins::put_plugin_storage,
         plugins::delete_plugin_storage,
         plugins::list_plugin_connections,
+        plugins::plugin_broker_journal,
         plugins::put_plugin_connection,
         plugins::delete_plugin_connection,
         secret_matrix,
@@ -13879,6 +13881,9 @@ impl utoipa::Modify for StepUpResponses {
         plugins::UninstalledPluginDto,
         plugins::PluginConnectionDto,
         plugins::PutPluginConnectionRequest,
+        plugins::BrokerJournalPhaseDto,
+        plugins::BrokerJournalEntryDto,
+        plugins::BrokerJournalPage,
         step_up::OpSummary,
         step_up::StepUpRefusal,
         step_up::WebauthnChallengeDto,

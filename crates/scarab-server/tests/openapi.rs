@@ -157,6 +157,7 @@ fn openapi_document_has_the_plugin_admin_api_but_not_the_broker() {
         ("/v1/orgs/{org}/plugins/{name}/kill", "post"),
         ("/v1/orgs/{org}/plugins/{name}/enable", "post"),
         ("/v1/orgs/{org}/plugins/{name}/connections", "get"),
+        ("/v1/orgs/{org}/plugins/{name}/broker-journal", "get"),
         ("/v1/orgs/{org}/plugins/{name}/connections/{slot}", "put"),
         ("/v1/orgs/{org}/plugins/{name}/connections/{slot}", "delete"),
     ] {
