@@ -3428,7 +3428,11 @@ h1, .crumb-head, .run-title {
    short cells do not. */
 .plg-journal-wrap { overflow-x: auto; }
 .plg-journal td { white-space: nowrap; }
-.plg-journal td.plg-journal-path { white-space: normal; word-break: break-all; }
+/* Path and rule wrap, but never narrower than a readable chunk: with only
+   break-all, the nowrap columns took the width and the path fell to one
+   character per line. */
+.plg-journal td.plg-journal-path,
+.plg-journal td.plg-journal-rule { white-space: normal; word-break: break-all; min-width: 22ch; }
 /* A manifest capability on the install dialog: edged, not filled. */
 .dep-tag {
   font-family: var(--font-mono); font-size: var(--fs-xs);

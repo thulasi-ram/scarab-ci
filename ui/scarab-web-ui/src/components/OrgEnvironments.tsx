@@ -31,7 +31,14 @@ import {
   type MigrationReportLine,
   type OrgEnvironment,
 } from "../api/client";
-import { eligibilityLabel, isPermissive, reportBanner, rulesSummary } from "../environment-overlays";
+import {
+  eligibilityLabel,
+  isPermissive,
+  reportBanner,
+  rulesSummary,
+  unprotectedBanner,
+  unprotectedButOpen,
+} from "../environment-overlays";
 import {
   displayNameError,
   environmentHref,
@@ -95,6 +102,13 @@ export default function OrgEnvironments(props: { org: string }) {
                 </p>
               }
             >
+              <Show when={unprotectedBanner(rows())}>
+                {(w) => (
+                  <p class="tok-warn env-warn" role="status">
+                    <Icon icon="alert-triangle" size={14} /> {w()}
+                  </p>
+                )}
+              </Show>
               <ul class="tok-list">
                 <For each={rows()}>{(env) => <EnvironmentRow org={props.org} env={env} />}</For>
               </ul>
@@ -155,8 +169,8 @@ function EnvironmentRow(props: { org: string; env: OrgEnvironment }) {
             </span>
           )}
         </Show>
-        <Show when={isPermissive(env().protection)}>
-          <span class="tok-role" title="No org-wide rule protects this place yet, only each project's own overlay">
+        <Show when={unprotectedButOpen(env())}>
+          <span class="tok-role" title="Projects may deploy here and no org-wide rule protects it, only each project's own overlay">
             permissive baseline
           </span>
         </Show>
