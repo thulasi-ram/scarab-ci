@@ -1012,7 +1012,8 @@ async fn an_environment_secret_lives_only_while_its_environment_does() {
 
     let (st, b) = h.cookie("DELETE", qa, None, &s).await;
     assert_eq!(st, StatusCode::CONFLICT, "{b}");
-    assert!(b.to_string().contains("`web`"), "{b}");
+    // The blockers name the Project whose secret pins the Environment.
+    assert_eq!(b["secrets"][0]["project"], "web", "{b}");
 
     let (st, b) = h
         .cookie(
