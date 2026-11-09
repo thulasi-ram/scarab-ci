@@ -4976,6 +4976,17 @@ pub(crate) async fn trigger_runs_from_files(
                     decision_id: None,
                     messages: Vec::new(),
                 });
+                // The commit shows it too: a `failure` status on the check
+                // line this pipeline's Runs use.
+                enqueue_refusal_status(
+                    db,
+                    clock,
+                    event,
+                    path,
+                    &run_pipeline_name(&ir, path),
+                    refusal,
+                )
+                .await;
             }
             // ADR-0075 §9: a `run.create` Policy denied this Run. Its
             // decision is in the org's decision log; the body names it and
@@ -5546,6 +5557,80 @@ async fn record_compile_failure<T>(
         record_refusal(db, clock, event, pipeline, "compile", message, &errors).await;
     }
     compiled
+}
+
+/// Outbox kind of the commit status for a pipeline an Environment refused on
+/// a forge event. [`drain_forge_statuses`] posts it beside the Runs'
+/// statuses, with the same retries and dead-lettering.
+pub const REFUSAL_STATUS: &str = "refusal_status";
+
+/// Queue a `failure` commit status on the event's commit for a deploy
+/// pipeline refused as `UnknownEnvironment` or `NotEligible`, under the
+/// context a Run of the pipeline posts under, so the refusal shows on the
+/// check line the Run would have used. The text says what an org admin must
+/// do, and the link opens the org's Environment settings.
+///
+/// Every other refusal queues nothing: `RefNotAllowed` is a branch-scoped
+/// Environment ignoring other branches, and a red status on every feature
+/// branch push would say nothing new. An event with no commit has nothing to
+/// post on. A failed enqueue is logged and the delivery goes on.
+async fn enqueue_refusal_status(
+    db: &dyn Db,
+    clock: &dyn Clock,
+    event: &scarab_forge::Event,
+    path: &str,
+    pipeline_name: &str,
+    refusal: &AdmissionRefusal,
+) {
+    let Some(repo) = event.repo() else {
+        return;
+    };
+    let ctx = event.context();
+    let Some(sha) = ctx["event"]["sha"].as_str().filter(|s| !s.is_empty()) else {
+        return;
+    };
+    let (org, project) = (&repo.owner, &repo.name);
+    let (description, target_path) = match refusal {
+        AdmissionRefusal::UnknownEnvironment { environment } => (
+            format!(
+                "environment `{environment}` does not exist in org `{org}`: an org admin must \
+                 create it and make `{project}` eligible"
+            ),
+            format!("/orgs/{org}/settings/environments"),
+        ),
+        AdmissionRefusal::NotEligible { environment } => (
+            format!(
+                "`{project}` may not deploy to environment `{environment}`: an org admin must \
+                 make `{project}` eligible"
+            ),
+            format!("/orgs/{org}/settings/environments/{environment}"),
+        ),
+        _ => return,
+    };
+    let run = run_id_for(event, path);
+    let msg = scarab_engine::OutboxMessage {
+        id: scarab_engine::OutboxId(0),
+        run: run.clone(),
+        kind: REFUSAL_STATUS.to_string(),
+        payload: serde_json::json!({
+            "repo": { "owner": org, "name": project },
+            "sha": sha,
+            "context": status_context(Some(pipeline_name)),
+            "description": scarab_forge::cap_status_description(&description),
+            "target_path": target_path,
+        }),
+        idempotency_key: format!("{REFUSAL_STATUS}:{}", run.0),
+        at: clock.now().await,
+    };
+    if let Err(e) = db.enqueue_outbox(&msg).await {
+        tracing::warn!(
+            org = %org,
+            project = %project,
+            pipeline = %path,
+            error = %e,
+            "queueing the refusal's commit status failed; the commit shows no status"
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7156,9 +7241,13 @@ async fn write_run_from_ir(
 /// that fails is left for redelivery (at-least-once, and `set_status` is
 /// idempotent on the forge). Returns how many statuses were posted.
 ///
+/// It posts the [`REFUSAL_STATUS`] messages the same way: the `failure` on a
+/// commit whose deploy pipeline an Environment refused.
+///
 /// `public_url` is Scarab's public base URL: every status carries the
 /// **required** deep-link back to its run (`{public_url}/runs/{id}`,
-/// ADR-0046) — a status without a way back to its run is a dead end.
+/// ADR-0046) — a status without a way back to its run is a dead end. A
+/// refusal has no Run; its link opens the org's Environment settings.
 pub async fn drain_forge_statuses(
     forge: &dyn scarab_forge::ForgePort,
     db: &dyn Db,
@@ -7167,44 +7256,25 @@ pub async fn drain_forge_statuses(
     visibility_ms: i64,
     public_url: &str,
 ) -> Result<usize, DbError> {
-    let msgs = db
+    let mut msgs = db
         .claim_outbox(owner, Some(RUN_STATUS_CHANGED), limit, visibility_ms)
         .await?;
+    msgs.extend(
+        db.claim_outbox(owner, Some(REFUSAL_STATUS), limit, visibility_ms)
+            .await?,
+    );
     let mut posted = 0;
     for msg in msgs {
-        // A run with no forge trigger (API/manual) has nothing to post — retire it.
-        let Some((repo, sha)) = run_forge_coords(db, &msg.run).await? else {
+        let post = if msg.kind == REFUSAL_STATUS {
+            refusal_status_post(&msg, public_url)
+        } else {
+            run_status_post(db, &msg, public_url).await?
+        };
+        // Nothing to post (no forge trigger, a superseded or malformed
+        // message): retire it.
+        let Some((repo, commit, status)) = post else {
             db.mark_dispatched(msg.id).await?;
             continue;
-        };
-        let to = msg
-            .payload
-            .get("to")
-            .and_then(|v| serde_json::from_value::<RunStatus>(v.clone()).ok());
-        let Some(to) = to else {
-            db.mark_dispatched(msg.id).await?; // malformed payload → drop, don't loop
-            continue;
-        };
-        // A superseded post is retired unposted (red team R2-E5): delivery
-        // is at-least-once, so a post that failed and is redelivered after
-        // its lease can land AFTER a newer verdict and leave the forge on the
-        // old one — a green rerun's required check stuck red. A post with no
-        // generation (written before it was carried) cannot be ordered, and
-        // is posted as before.
-        if let Some(generation) = msg.payload.get("generation").and_then(|g| g.as_u64()) {
-            if status_post_superseded(db, &msg.run, generation, to).await? {
-                db.mark_dispatched(msg.id).await?;
-                continue;
-            }
-        }
-        let status = scarab_forge::Status {
-            context: status_context(db.run_pipeline(&msg.run).await?.as_deref()),
-            state: run_status_to_forge(to),
-            target_url: format!("{}/runs/{}", public_url.trim_end_matches('/'), msg.run.0),
-        };
-        let commit = scarab_forge::Commit {
-            sha,
-            message: String::new(),
         };
         // Post the status. A failed post stays on the outbox for redelivery
         // (at-least-once; set_status is idempotent on the forge) but is no
@@ -7224,6 +7294,7 @@ pub async fn drain_forge_statuses(
                 crate::metrics::record_forge_status_failure();
                 tracing::warn!(
                     run = %msg.run.0,
+                    kind = %msg.kind,
                     repo = %format!("{}/{}", repo.owner, repo.name),
                     sha = %commit.sha,
                     failures,
@@ -7235,6 +7306,7 @@ pub async fn drain_forge_statuses(
                     crate::metrics::record_forge_status_dead_lettered();
                     tracing::error!(
                         run = %msg.run.0,
+                        kind = %msg.kind,
                         repo = %format!("{}/{}", repo.owner, repo.name),
                         sha = %commit.sha,
                         failures,
@@ -7247,6 +7319,88 @@ pub async fn drain_forge_statuses(
         }
     }
     Ok(posted)
+}
+
+/// The status a [`RUN_STATUS_CHANGED`] message posts, or `None` when it
+/// posts nothing: a Run with no forge trigger (API, manual), a malformed
+/// payload, or a post a newer verdict superseded.
+async fn run_status_post(
+    db: &dyn Db,
+    msg: &scarab_engine::OutboxMessage,
+    public_url: &str,
+) -> Result<
+    Option<(
+        scarab_forge::RepoRef,
+        scarab_forge::Commit,
+        scarab_forge::Status,
+    )>,
+    DbError,
+> {
+    let Some((repo, sha)) = run_forge_coords(db, &msg.run).await? else {
+        return Ok(None);
+    };
+    let to = msg
+        .payload
+        .get("to")
+        .and_then(|v| serde_json::from_value::<RunStatus>(v.clone()).ok());
+    let Some(to) = to else {
+        return Ok(None); // malformed payload → drop, don't loop
+    };
+    // A superseded post is retired unposted (red team R2-E5): delivery
+    // is at-least-once, so a post that failed and is redelivered after
+    // its lease can land AFTER a newer verdict and leave the forge on the
+    // old one — a green rerun's required check stuck red. A post with no
+    // generation (written before it was carried) cannot be ordered, and
+    // is posted as before.
+    if let Some(generation) = msg.payload.get("generation").and_then(|g| g.as_u64()) {
+        if status_post_superseded(db, &msg.run, generation, to).await? {
+            return Ok(None);
+        }
+    }
+    let status = scarab_forge::Status {
+        context: status_context(db.run_pipeline(&msg.run).await?.as_deref()),
+        state: run_status_to_forge(to),
+        target_url: format!("{}/runs/{}", public_url.trim_end_matches('/'), msg.run.0),
+        description: None,
+    };
+    let commit = scarab_forge::Commit {
+        sha,
+        message: String::new(),
+    };
+    Ok(Some((repo, commit, status)))
+}
+
+/// The `failure` status a [`REFUSAL_STATUS`] message posts
+/// ([`enqueue_refusal_status`]), or `None` for a malformed payload.
+fn refusal_status_post(
+    msg: &scarab_engine::OutboxMessage,
+    public_url: &str,
+) -> Option<(
+    scarab_forge::RepoRef,
+    scarab_forge::Commit,
+    scarab_forge::Status,
+)> {
+    let p = &msg.payload;
+    let field = |v: &serde_json::Value| v.as_str().map(str::to_string);
+    let repo = scarab_forge::RepoRef {
+        owner: field(&p["repo"]["owner"])?,
+        name: field(&p["repo"]["name"])?,
+    };
+    let commit = scarab_forge::Commit {
+        sha: field(&p["sha"])?,
+        message: String::new(),
+    };
+    let status = scarab_forge::Status {
+        context: field(&p["context"])?,
+        state: scarab_forge::StatusState::Failure,
+        target_url: format!(
+            "{}{}",
+            public_url.trim_end_matches('/'),
+            field(&p["target_path"])?
+        ),
+        description: field(&p["description"]),
+    };
+    Some((repo, commit, status))
 }
 
 /// Whether a `to` post of `run` from reopen generation `generation` is

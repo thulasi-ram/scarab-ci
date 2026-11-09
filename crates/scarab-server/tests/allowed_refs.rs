@@ -148,6 +148,13 @@ async fn push_on_disallowed_branch_is_denied() {
         runs.is_empty(),
         "a push on refs/heads/feature is denied a main-scoped env"
     );
+    // Filtering by branch is the rule working: no status on the commit, so
+    // a deploy restricted to main does not fail every feature branch's
+    // checks.
+    scarab_server::drain_forge_statuses(&forge, &db, "test", 100, 0, "https://scarab.example")
+        .await
+        .expect("drain");
+    assert!(forge.statuses().is_empty(), "{:?}", forge.statuses());
 }
 
 // An empty allowed_refs admits any ref (the rule is unrestricted).

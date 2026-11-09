@@ -189,6 +189,115 @@ async fn webhook_skips_a_deploy_from_an_ineligible_project() {
     );
 }
 
+const SHA: &str = "1234567890abcdef1234567890abcdef12345678";
+
+/// Post every queued commit status the way the server's tick does, and return
+/// the ones on the pushed commit under the deploy pipeline's context.
+async fn deploy_statuses(forge: &FakeForge, db: &InMemoryDb) -> Vec<scarab_forge::Status> {
+    scarab_server::drain_forge_statuses(forge, db, "test", 100, 0, "https://scarab.example/")
+        .await
+        .expect("drain");
+    forge
+        .statuses_on(SHA)
+        .into_iter()
+        .filter(|s| s.context == "scarab/deploy")
+        .collect()
+}
+
+/// A refused deploy also fails its check on the commit: one `failure`
+/// status under the context its Runs post under, saying what is missing and
+/// linking to the org's Environments, where an admin can add it.
+#[tokio::test]
+async fn webhook_refusal_for_an_unknown_environment_posts_a_failed_status() {
+    let forge = forge();
+    let db = InMemoryDb::new();
+    let governance = InMemoryEnvironmentGovernance::new(); // no `prod`
+    trigger_runs_from_event(
+        &forge,
+        &db,
+        &FakeClock::new(1_000),
+        scarab_server::AdmissionPorts::governance(Some(&governance)),
+        &push(),
+    )
+    .await
+    .unwrap();
+    let statuses = deploy_statuses(&forge, &db).await;
+    assert_eq!(statuses.len(), 1, "{statuses:?}");
+    let status = &statuses[0];
+    assert_eq!(status.state, scarab_forge::StatusState::Failure);
+    assert_eq!(
+        status.target_url,
+        "https://scarab.example/orgs/acme/settings/environments"
+    );
+    let description = status.description.as_deref().unwrap_or_default();
+    assert!(
+        description.contains("environment `prod` does not exist in org `acme`"),
+        "{description}"
+    );
+    assert!(
+        description.chars().count() <= scarab_forge::STATUS_DESCRIPTION_MAX,
+        "{description}"
+    );
+}
+
+/// The same for a Project the Environment does not admit; the link opens
+/// that Environment.
+#[tokio::test]
+async fn webhook_refusal_for_an_ineligible_project_posts_a_failed_status() {
+    let forge = forge();
+    let db = InMemoryDb::new();
+    let governance = prod_for_checkout_only();
+    trigger_runs_from_event(
+        &forge,
+        &db,
+        &FakeClock::new(1_000),
+        scarab_server::AdmissionPorts::governance(Some(&governance)),
+        &push(),
+    )
+    .await
+    .unwrap();
+    let statuses = deploy_statuses(&forge, &db).await;
+    assert_eq!(statuses.len(), 1, "{statuses:?}");
+    let status = &statuses[0];
+    assert_eq!(status.state, scarab_forge::StatusState::Failure);
+    assert_eq!(
+        status.target_url,
+        "https://scarab.example/orgs/acme/settings/environments/prod"
+    );
+    let description = status.description.as_deref().unwrap_or_default();
+    assert!(
+        description.contains("`web` may not deploy to environment `prod`"),
+        "{description}"
+    );
+}
+
+/// A deploy that is admitted posts its Run's statuses only, as before:
+/// nothing fails on the commit.
+#[tokio::test]
+async fn an_admitted_deploy_posts_no_failed_status() {
+    let forge = forge();
+    let db = InMemoryDb::new();
+    let governance = prod_for_everyone();
+    let outcome = trigger_runs_from_event(
+        &forge,
+        &db,
+        &FakeClock::new(1_000),
+        scarab_server::AdmissionPorts::governance(Some(&governance)),
+        &push(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.runs.len(), 2, "CI and the deploy both ran");
+    assert!(outcome.refused.is_empty(), "{:?}", outcome.refused);
+    let statuses = deploy_statuses(&forge, &db).await;
+    assert!(
+        statuses
+            .iter()
+            .all(|s| s.state != scarab_forge::StatusState::Failure && s.description.is_none()),
+        "{statuses:?}"
+    );
+}
+
 /// Over HTTP the delivery body names every refused deploy pipeline beside the
 /// runs that did start: `refused: [{pipeline, environment, reason}]`. Nobody
 /// waits on a webhook's response, but a forge's "recent deliveries" view
