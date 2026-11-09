@@ -35,10 +35,10 @@ async fn a_result_is_interpolated_into_a_later_step() {
                  printf '42' > /scarab/results/commits.json"] },
             { "id": "deploy", "image": "busybox:latest", "needs": ["version"],
               "security": { "run_as_root": true },
-              "env": [
-                ["PREV_VERSION", "${{ outputs.version.tag }}"],
-                ["COMMIT_COUNT", "${{ outputs.version.commits }}"]
-              ],
+              "env": {
+                "PREV_VERSION": "${{ outputs.version.tag }}",
+                "COMMIT_COUNT": "${{ outputs.version.commits }}"
+              },
               "command": ["sh", "-c",
                 "set -eu; echo \"tag=$PREV_VERSION commits=$COMMIT_COUNT\"; \
                  test \"$PREV_VERSION\" = v1.2.3; test \"$COMMIT_COUNT\" = 42"] }
