@@ -1,5 +1,5 @@
 // The dogfooded API client — typed end-to-end against the generated OpenAPI
-// schema (ADR-0012, 0028). The UI eats the same API as every other client.
+// schema. The UI eats the same API as every other client.
 import createClient from "openapi-fetch";
 import { createSignal } from "solid-js";
 import type { paths, components } from "./schema";
@@ -16,13 +16,13 @@ export type Artifact = components["schemas"]["ArtifactDto"];
 export type StepResult = components["schemas"]["StepResultDto"];
 export type WorkspaceListing = components["schemas"]["WorkspaceListing"];
 export type WorkspaceEntry = components["schemas"]["WorkspaceEntryDto"];
-/** One attempt at a step (ADR-0047) — the rerun/retry unit. */
+/** One attempt at a step — the rerun/retry unit. */
 export type Attempt = components["schemas"]["AttemptDto"];
 /** One step's status projection in a run's DAG. */
 export type StepStatus = components["schemas"]["StepStatusDto"];
-/** A run-scoped shared service instance (ADR-0058) — not a DAG node. */
+/** A run-scoped shared service instance — not a DAG node. */
 export type Service = components["schemas"]["ServiceStatusDto"];
-/** The cold tier's Workspace-Snapshot retention promise + any pin (ADR-0061 s5). */
+/** The cold tier's Workspace-Snapshot retention promise + any pin. */
 export type RetentionInfo = components["schemas"]["SnapshotRetentionDto"];
 /** A rerun preview: the resolved scope, and any widening over expired inputs. */
 export type RerunPlan = components["schemas"]["RerunPlanResponse"];
@@ -30,7 +30,7 @@ export type RerunPlan = components["schemas"]["RerunPlanResponse"];
 export const api = createClient<paths>({ baseUrl: "/" });
 
 /**
- * Is there no usable session? (ADR-0049)
+ * Is there no usable session?
  *
  * Set by the 401 middleware below and read by the app shell, which swaps the
  * whole UI for the sign-in screen. It lives here rather than in `session.ts`
@@ -55,7 +55,7 @@ api.use({
   },
 });
 
-// CSRF double-submit (ADR-0049): the session rides as an HttpOnly cookie; the
+// CSRF double-submit: the session rides as an HttpOnly cookie; the
 // server pairs it with a script-READABLE `scarab_csrf` cookie whose value we
 // echo in `x-csrf-token`. A cross-site page can trigger the cookie, but it can
 // never read this token.
@@ -85,7 +85,7 @@ api.use({
   },
 });
 
-// Step-up confirmation (ADR-0073). A crown-jewel operation answers
+// Step-up confirmation. A crown-jewel operation answers
 // `403 step_up_required` until this browser session holds a fresh passkey
 // confirmation; this turns that 403 into the StepUpDialog, a passkey prompt, a
 // `POST /v1/me/step-up`, and the SAME request again — so no call site in the
@@ -129,7 +129,7 @@ export async function listRuns(limit = 50): Promise<RunSummary[]> {
   return data.runs;
 }
 
-/** List the registered projects (`GET /v1/repos`, ADR-0046) — the dashboard's
+/** List the registered projects (`GET /v1/repos`) — the dashboard's
  * repo cards, most-recently-active first. Scoped server-side to what the caller
  * may Read. */
 export async function listProjects(): Promise<Project[]> {
@@ -151,7 +151,7 @@ export async function repoForgeUrl(org: string, repo: string): Promise<string | 
 /** One repo's most recent runs (`GET /v1/repos/{org}/{repo}/runs`) — the source
  * for a repo card's pass/fail chart and the Runs tab. Newest first. `filter`
  * narrows by Environment and by the deploy marker on the server, before
- * `limit` (ADR-0074 §2); build it with `runListFilter` (runs-filter.ts). */
+ * `limit`; build it with `runListFilter` (runs-filter.ts). */
 export async function listRepoRuns(
   org: string,
   repo: string,
@@ -167,7 +167,7 @@ export async function listRepoRuns(
   return data.runs;
 }
 
-/** The authenticated principal (`GET /v1/me`, ADR-0049) — the identity menu. */
+/** The authenticated principal (`GET /v1/me`) — the identity menu. */
 export type Me = components["schemas"]["MeResponse"];
 export async function getMe(): Promise<Me> {
   const { data, error } = await api.GET("/v1/me");
@@ -187,7 +187,7 @@ export async function logout(): Promise<void> {
   setUnauthenticated(true);
 }
 
-// --- Issued API tokens (ADR-0049) — the credential a machine can hold. ---
+// --- Issued API tokens — the credential a machine can hold. ---
 //
 // The plaintext exists in exactly ONE response, the mint 201, and nowhere else.
 // Scarab stores only its SHA-256, so a token that is not copied out of the
@@ -283,7 +283,7 @@ export async function revokeApiToken(org: string, id: string): Promise<void> {
   }
 }
 
-// --- Identity links (ADR-0069) — sign-in accounts, members, imports. ---
+// --- Identity links — sign-in accounts, members, imports. ---
 
 /** A configured login provider, for the sign-in page. */
 export type AuthProvider = components["schemas"]["AuthProviderDto"];
@@ -293,7 +293,7 @@ export type PrincipalMatch = components["schemas"]["PrincipalDto"];
  * signed in yet. */
 export type Binding = components["schemas"]["BindingDto"];
 
-/** The `scarab_csrf` double-submit token (ADR-0049), for the few calls made
+/** The `scarab_csrf` double-submit token, for the few calls made
  * with plain `fetch` rather than through `api` (whose middleware adds it). */
 function csrfToken(): string | undefined {
   return document.cookie
@@ -443,7 +443,7 @@ export async function listBindings(org: string): Promise<Binding[] | null> {
 }
 
 /** Natively grant `subject` a role, org-wide or on one project. The subject
- * must be an existing user (ADR-0069 §3) — pick it from `searchPrincipals`. */
+ * must be an existing user — pick it from `searchPrincipals`. */
 export async function grantRole(
   org: string,
   body: { subject: string; role: string; project?: string },
@@ -458,7 +458,7 @@ export async function revokeRole(org: string, subject: string, project?: string)
   await send(`/v1/orgs/${encodeURIComponent(org)}/bindings?${q}`, "DELETE");
 }
 
-/** Re-sync a repo's forge collaborators into roles (ADR-0069 §5): everyone the
+/** Re-sync a repo's forge collaborators into roles: everyone the
  * forge lists is seeded (pinned by their forge id, so whoever signs in with
  * that account gets exactly these roles), and anyone it no longer lists loses
  * the role the forge gave them. */
@@ -481,7 +481,7 @@ export async function searchPrincipals(org: string, q: string): Promise<Principa
   return (await res.json()) as PrincipalMatch[];
 }
 
-/** List a run's artifacts of record (`GET /v1/runs/{id}/artifacts`, ADR-0052). */
+/** List a run's artifacts of record (`GET /v1/runs/{id}/artifacts`). */
 export async function listArtifacts(id: string): Promise<Artifact[]> {
   const { data, error } = await api.GET("/v1/runs/{id}/artifacts", {
     params: { path: { id } },
@@ -494,7 +494,7 @@ export async function listArtifacts(id: string): Promise<Artifact[]> {
 
 /** Browser URL for one artifact's bytes (`GET /v1/runs/{id}/artifacts/{name}`,
  * streamed through the server — usable directly as an `<a href>` download).
- * Bare name = the of-record resolution (latest SUCCESSFUL version, ADR-0056);
+ * Bare name = the of-record resolution (latest SUCCESSFUL version);
  * `version` pins the exact `(step, attempt)` version — how a shadowed or
  * failed-attempt file stays reachable. */
 export function artifactUrl(
@@ -509,12 +509,12 @@ export function artifactUrl(
 }
 
 // --- Run detail Inspector: a step's browseable outputs. Results are the typed
-// values a step published (ADR-0041); the workspace is its output snapshot,
-// walked read-only from the content-addressed store (ADR-0029). ---
+// values a step published; the workspace is its output snapshot,
+// walked read-only from the content-addressed store. ---
 
 /** A step's named results (`GET …/steps/{step}/results`). Empty if it emitted
  * none. The Results tab, and the source the Outputs view derives from. With
- * `attempt`, that attempt's immutable evidence instead of the latest (ADR-0056). */
+ * `attempt`, that attempt's immutable evidence instead of the latest. */
 export async function getStepResults(
   id: string,
   step: string,
@@ -529,7 +529,7 @@ export async function getStepResults(
   return data;
 }
 
-/** What an attempt consumed (`GET …/steps/{step}/consumed`, ADR-0056): the map
+/** What an attempt consumed (`GET …/steps/{step}/consumed`): the map
  * `upstream step → attempt id` stamped at its launch. Bare = the attempt behind
  * the step's current evidence. Empty map when nothing was recorded. */
 export async function getConsumed(
@@ -566,7 +566,7 @@ export async function listWorkspace(
 
 /** Browser URL for one workspace file's bytes (`GET …/steps/{step}/workspace/file?path=`,
  * streamed through the server — usable directly as an `<a href>`). With
- * `attempt`, reads that attempt's immutable snapshot (ADR-0056). */
+ * `attempt`, reads that attempt's immutable snapshot. */
 export function workspaceFileUrl(
   id: string,
   step: string,
@@ -579,7 +579,7 @@ export function workspaceFileUrl(
   return attempt ? `${base}&attempt=${encodeURIComponent(attempt)}` : base;
 }
 
-// --- A repository's Environments (ADR-0071). Since the migration an
+// --- A repository's Environments. Since the migration an
 // Environment is org-level; a repository sees the ones its Project may deploy
 // into (or holds an overlay or grant in), each with the org's BASELINE, the
 // Project's own tighten-only OVERLAY, and the EFFECTIVE rules admission
@@ -664,7 +664,7 @@ export async function listApprovalHistory(
   return (await res.json()) as ApprovalRecord[];
 }
 
-// --- Org-level Environments (ADR-0071) — the place deploys land in: its
+// --- Org-level Environments — the place deploys land in: its
 // description (the whole-Environment PUT), and — each with its own write, so
 // that PUT can never reset them — its baseline protection, its eligibility,
 // and each Project's privilege grant. Org admins only. ---
@@ -853,7 +853,7 @@ export async function acknowledgeMigrationReport(
   return (await res.json()) as MigrationReportLine;
 }
 
-// --- Plugins (ADR-0072) — an org's PluginInstallations:
+// --- Plugins — an org's PluginInstallations:
 // approvals of one pinned digest of a first-party plugin, with a kill switch.
 // Every write's refusal text (403 third-party / 409 name taken or retired) is
 // passed through verbatim — it is the answer to "why will this not install". ---
@@ -865,7 +865,7 @@ export type PluginInstallation = components["schemas"]["PluginInstallationDto"];
 /** What an uninstall returns. */
 export type UninstalledPlugin = components["schemas"]["UninstalledPluginDto"];
 
-// --- Libraries (ADR-0076) ---------------------------------------------------
+// --- Libraries ---------------------------------------------------
 
 export type OrgLibraries = components["schemas"]["OrgLibrariesDto"];
 export type LibraryInstallation = components["schemas"]["LibraryInstallationDto"];
@@ -1040,7 +1040,7 @@ export async function uninstallPlugin(org: string, name: string): Promise<Uninst
 }
 
 /** Mount an operator-made PersistentVolumeClaim into the installation's Pod
- *  (`PUT …/plugins/{name}/storage`, ADR-0074 §7). Moving existing storage to
+ *  (`PUT …/plugins/{name}/storage`). Moving existing storage to
  *  another claim or path asks for a step-up. */
 export async function putPluginStorage(
   org: string,
@@ -1070,7 +1070,7 @@ export async function deletePluginStorage(org: string, name: string): Promise<Pl
 }
 
 /** One connection slot of an installation and what is bound to it — never
- *  the credential (ADR-0072 §5). */
+ *  the credential. */
 export type PluginConnection = components["schemas"]["PluginConnectionDto"];
 
 /** An installation's connection slots, in manifest order
@@ -1157,14 +1157,14 @@ export async function createRun(req: CreateRunRequest): Promise<string> {
   return data.id;
 }
 
-/** A prior run's frozen launch parameters, `name → value` (ADR-0043 §5) — used
+/** A prior run's frozen launch parameters, `name → value` — used
  * to pre-fill a re-run. The generated schema types this opaquely; the values
  * are plain JSON scalars. Empty when the run took none. */
 export function runParams(run: RunStatus): Record<string, unknown> {
   return (run.params ?? {}) as Record<string, unknown>;
 }
 
-// --- Run-Pipeline flow (ADR-0043 "World B"): repo → ref → catalog → pipeline →
+// --- Run-Pipeline flow: repo → ref → catalog → pipeline →
 // typed params → dispatch. One ref threads through; describe/catalog resolve it
 // to a SHA the dispatch pins to. The UI eats the same endpoints the CLI does
 // (invariant #5) — no client-side CEL, static validation only. ---
@@ -1256,7 +1256,7 @@ export async function dispatchRun(
     pipeline: string;
     params: Record<string, unknown>;
     kind?: DispatchKind;
-    /** Optional operator reason (ADR-0057) — stamped as the run Headline. */
+    /** Optional operator reason — stamped as the run Headline. */
     reason?: string;
   },
 ): Promise<DispatchResult> {
@@ -1332,7 +1332,7 @@ function errorText(error: unknown): string {
   }
 }
 
-// --- Live streams (ADR-0013). Logs live-tail via SSE; the event log is a
+// --- Live streams. Logs live-tail via SSE; the event log is a
 // finite snapshot we can plain-fetch even mid-run. Both are text/event-stream,
 // so they bypass the JSON openapi-fetch client. ---
 
@@ -1408,7 +1408,7 @@ export function streamStepLogs(
 
 /**
  * Live-stream ONE of a step's co-located SIDECAR containers' log output
- * (`GET …/steps/{step}/logs?sidecar=<index>`, ADR-0058), optionally scoped to a
+ * (`GET …/steps/{step}/logs?sidecar=<index>`), optionally scoped to a
  * single `attempt`. A sidecar lives inside the step's Pod, so its logs are
  * stored under the step's REAL attempt ids — the same attempt scoping as the
  * step's main container applies unchanged (`?sidecar=` composes with
@@ -1442,8 +1442,8 @@ export function streamStepSidecarLogs(
 
 /**
  * List a run's shared services (`GET /v1/runs/{id}/services`) — the current
- * Take's instances + lifecycle status, for the Services panel beside the DAG
- * (ADR-0058). Empty when the pipeline declares no shared services.
+ * Take's instances + lifecycle status, for the Services panel beside the DAG.
+ * Empty when the pipeline declares no shared services.
  */
 export async function listServices(id: string): Promise<Service[]> {
   const { data, error } = await api.GET("/v1/runs/{id}/services", {
@@ -1455,7 +1455,7 @@ export async function listServices(id: string): Promise<Service[]> {
 
 /**
  * Live-stream ONE shared service's log output (`GET …/services/{service}/logs`),
- * optionally scoped to a `take` — the Services panel's "logs" view (ADR-0058).
+ * optionally scoped to a `take` — the Services panel's "logs" view.
  * Best-effort, same SSE contract as step logs: replays committed chunks then
  * live-tails while the run is going. Returns a cleanup fn.
  */
@@ -1525,7 +1525,7 @@ export async function rerunStep(id: string, step: string): Promise<RerunPlan | n
   return data && Array.isArray(data.invalidated) ? data : null;
 }
 
-/** Retry a FAILED step (ADR-0056 amendment) — another attempt in the CURRENT
+/** Retry a FAILED step — another attempt in the CURRENT
  * Take, no fork. 409 if the step is not failed (rerun it instead). Returns the
  * EXECUTED plan like `rerunStep`. */
 export async function retryStep(id: string, step: string): Promise<RerunPlan | null> {
@@ -1536,10 +1536,9 @@ export async function retryStep(id: string, step: string): Promise<RerunPlan | n
   return data && Array.isArray(data.invalidated) ? data : null;
 }
 
-/** Preview a rerun (`GET …/steps/{step}/rerun-plan`, ADR-0061 s5): what it would
+/** Preview a rerun (`GET …/steps/{step}/rerun-plan`): what it would
  * actually execute, and whether expired workspace snapshots widen the scope
- * upstream. Read BEFORE the rerun, so a widened rerun is never a surprise
- * (ADR-0027 — smart never means mysterious). */
+ * upstream. Read BEFORE the rerun, so a widened rerun is never a surprise. */
 export async function fetchRerunPlan(id: string, step: string): Promise<RerunPlan> {
   const { data, error } = await api.GET("/v1/runs/{id}/steps/{step}/rerun-plan", {
     params: { path: { id, step } },
@@ -1548,7 +1547,7 @@ export async function fetchRerunPlan(id: string, step: string): Promise<RerunPla
   return data;
 }
 
-/** Pin this run's Workspace Snapshots (`POST …/snapshots-pin`, ADR-0061 s5):
+/** Pin this run's Workspace Snapshots (`POST …/snapshots-pin`):
  * keep them past the retention window for an investigation. Returns the run's
  * updated retention state. */
 export async function pinSnapshots(id: string): Promise<RetentionInfo> {
@@ -1597,8 +1596,8 @@ export async function approveGate(id: string, step: string): Promise<GateApprova
   return data;
 }
 
-/** Reject a waiting gate — fail it with a reason (`POST …/gates/{step}/reject`,
- * ADR-0070 §9). Any gate kind (`manual`/`timer`/`external`) that is
+/** Reject a waiting gate — fail it with a reason (`POST …/gates/{step}/reject`).
+ * Any gate kind (`manual`/`timer`/`external`) that is
  * pending and reached. The gate's Attempt fails with the reason and who
  * rejected it, its dependents are skipped, and the run ends `failed`. The
  * server's own words come back on failure: 400 for a missing/over-long reason,
@@ -1618,7 +1617,7 @@ export function isTerminal(status: string): boolean {
   return status === "succeeded" || status === "failed" || status === "cancelled";
 }
 
-// --- Secrets (ADR-0014). Values are write-only; the API never returns them. ---
+// --- Secrets. Values are write-only; the API never returns them. ---
 
 export type SecretScope = { org: string; repo?: string; environment?: string };
 
@@ -1649,7 +1648,7 @@ export async function deleteSecret(scope: SecretScope, name: string): Promise<vo
   }
 }
 
-// --- Forge connections (ADR-0060 parts C + D). Read + a re-sync heal action,
+// --- Forge connections. Read + a re-sync heal action,
 // plus the manual create/delete path that makes Forgejo onboardable.
 //
 // The credential is **write-only** end to end: it goes up in a create body and
@@ -1768,8 +1767,8 @@ export async function assignConnectionOrg(id: string, org: string): Promise<void
   }
 }
 
-// --- Repo binding = Project onboarding (ADR-0060 part C). There is no
-// `projects` table: a Project IS a `forge_repos` binding (ADR-0046), so these
+// --- Repo binding = Project onboarding. There is no
+// `projects` table: a Project IS a `forge_repos` binding, so these
 // calls are what bring a repo into existence as a governed Project. ---
 
 export type AvailableRepo = components["schemas"]["AvailableRepoDto"];
@@ -1836,7 +1835,7 @@ export async function unbindRepo(id: string, owner: string, name: string): Promi
   }
 }
 
-// --- Secret coverage matrix (ADR-0037) — and, since ADR-0060, the read model
+// --- Secret coverage matrix — and the read model
 // behind the repo/environment secret EDITOR. Each key's *effective* status per
 // column after inheritance; never a value. Not in the generated OpenAPI client,
 // so it goes through `send` — every route here authorizes as `Administer`, the
@@ -1879,7 +1878,7 @@ export function columnScope(org: string, repo: string, column: string): SecretSc
 }
 
 /**
- * Mark/unmark a cell as **intentionally unset** (ADR-0037). Advisory only — it
+ * Mark/unmark a cell as **intentionally unset**. Advisory only — it
  * silences a gap in the matrix and changes nothing about resolution or deploys.
  */
 export async function setSecretCellSilenced(
@@ -1901,7 +1900,7 @@ export async function setSecretCellSilenced(
   }
 }
 
-// --- Step-up confirmation (ADR-0073): passkeys, confirmations, the event log,
+// --- Step-up confirmation: passkeys, confirmations, the event log,
 // and the StepUpConfirmationRequest a machine raises for its human. ---
 //
 // Every governed call here goes through `api`, so a refusal is handled by the

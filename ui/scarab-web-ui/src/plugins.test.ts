@@ -192,7 +192,7 @@ describe("connection binding", () => {
   });
 });
 
-describe("storage (ADR-0074 §7)", () => {
+describe("storage", () => {
   it("takes a claim name the way Kubernetes names a PVC", () => {
     expect(storageClaimError("argocd-state")).toBeNull();
     expect(storageClaimError("state.v2")).toBeNull();

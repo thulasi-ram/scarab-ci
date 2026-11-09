@@ -163,7 +163,7 @@ export function pluginPublisher(imageOrRepository: string): string {
   return parts.length >= 2 ? parts[0]! : "";
 }
 
-// --- PluginConnections (ADR-0072 §5) ----------------------------------------
+// --- PluginConnections ----------------------------------------
 // An admin binds each manifest connection slot to the ONE destination the
 // broker may send the plugin's requests to, and the credential it adds. The
 // credential is write-only: the server never returns it, so the form only
@@ -268,7 +268,7 @@ export function credentialBadge(c: { configured: boolean; credential_set: boolea
       };
 }
 
-// ── Storage (ADR-0074 §7) ────────────────────────────────────────────────
+// ── Storage ────────────────────────────────────────────────
 // A plugin may mount ONE PersistentVolumeClaim that an operator created in
 // the plugin namespace. Scarab mounts it; it never creates, backs up or reads
 // it. The server is the authority on these rules; the form mirrors them so a

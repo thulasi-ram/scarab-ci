@@ -44,9 +44,9 @@ const min = 60000;
 const RUN_ID = "0190f8a2000071fb8c0011223344aabb";
 // The RICH run — the Playwright walkthrough fixture: two versions (a
 // RunRerunRequested boundary with superseded/shadowed attempts), a shared
-// service + a docked sidecar (ADR-0058), a pending manual gate, an artifact.
+// service + a docked sidecar, a pending manual gate, an artifact.
 const RICH_RUN_ID = "0190f8a2000071fb8c0099887766ccdd";
-// The GATES run (ADR-0070 §9): one Deploy Run showing every external gate
+// The GATES run: one Deploy Run showing every external gate
 // state — waiting, passed, failed with a reason. At
 // /acme/edge-gateway/runs/<id>.
 const GATES_RUN_ID = "0190f8a2000071fb8c00d3e9107a1616";
@@ -55,7 +55,7 @@ const GATES_RUN_ID = "0190f8a2000071fb8c00d3e9107a1616";
 const ENV_GATE_RUN_ID = "0190f8a2000071fb8c00e7a9b0c1d2e3";
 
 // ── /v1/me ────────────────────────────────────────────────────────────────
-// An Owner of the one implicit org (ADR-0060), so the Settings gear renders.
+// An Owner of the one implicit org, so the Settings gear renders.
 // The Owner role is global, so Avery is a global admin: Settings shows Connect
 // a forge and the unassigned connection below (git-bug 19b0a45).
 const me = {
@@ -66,14 +66,14 @@ const me = {
   global_admin: true,
   admin_orgs: ["acme"],
   token_mint_orgs: ["acme"],
-  // Signed in two ways (ADR-0069): the legacy GitHub provider and Okta.
+  // Signed in two ways: the legacy GitHub provider and Okta.
   identities: [
     { provider: "default", handle: "a-kim" },
     { provider: "okta", handle: "a.kim@acme.example" },
   ],
 };
 
-// ── identity links (ADR-0069) ─────────────────────────────────────────────
+// ── identity links ─────────────────────────────────────────────
 // Three providers so the login page shows the multi-provider choice and the
 // Account page has one left to link.
 const authProviders = [
@@ -215,7 +215,7 @@ const runStatus: RunStatusDto = {
   trigger_title: "Add exponential backoff to step retries",
   origin_pr_base: null,
   params: {},
-  // ADR-0061 s5: a live run is not on the retention clock at all (a non-terminal
+  // A live run is not on the retention clock at all (a non-terminal
   // run is never GC-eligible), so no expiry is promised and nothing is pinned.
   snapshot_retention: { retention_days: 14, expired: false, pinned: false },
   steps: [
@@ -299,7 +299,7 @@ const richRunStatus: RunStatusDto = {
   origin_pr_base: null,
   params: {},
   // Suspended on a gate, so likewise never GC-eligible regardless of age
-  // (ADR-0050) — but PINNED, to render the "keep this run's snapshots" state.
+  // — but PINNED, to render the "keep this run's snapshots" state.
   snapshot_retention: {
     retention_days: 14,
     expired: false,
@@ -440,7 +440,7 @@ const testLogLines = [
 ];
 
 // ── environments / secrets ───────────────────────────────────────────────────
-// A repository's Environments are org Environments now (ADR-0071): see
+// A repository's Environments are org Environments now: see
 // `orgEnvironments`, `overlays` and `projectEnvironments` below. This is the
 // legacy approval history per name.
 const deployments: Record<string, unknown[]> = {
@@ -468,7 +468,7 @@ const deployments: Record<string, unknown[]> = {
   preview: [],
 };
 
-// ── the GATES run (ADR-0070 §9) ──────────────────────────────────────────────
+// ── the GATES run ──────────────────────────────────────────────
 //   bump        ✓ → live        external gate WAITING
 //   bump-canary ✓ → live-canary external gate PASSED (with a reason)
 //   bump-eu     ✓ → live-eu     external gate FAILED (released with passed:false)
@@ -752,7 +752,7 @@ const policyDecisions = [
   policyDecision("d1", ago(50 * 60 * min), "scarab", [["pol-1", "passed"], ["pol-2", "not_matched"], ["pol-3", "passed"]]),
 ];
 
-// ── Org-level Environments (ADR-0071) — Settings › Environments. production
+// ── Org-level Environments — Settings › Environments. production
 // has a baseline and a display name; qa still has the permissive one and shows
 // its name. Writes echo back and persist nothing, except a duplicate, which is
 // kept for the page load.
@@ -816,7 +816,7 @@ const orgEnvironments: OrgEnvironmentDto[] = [
   },
 ];
 
-// Per-project overlays and grants (ADR-0071 §3, §8), keyed environment →
+// Per-project overlays and grants, keyed environment →
 // project. scarab tightens production (an extra approver, a reason, a wait);
 // it holds a grant for one privileged image there.
 const overlays: Record<string, Record<string, OverlayDto>> = {
@@ -844,7 +844,7 @@ const grants: Record<string, Record<string, GrantDto>> = {
   },
 };
 
-/** The server's merge (ADR-0071 §3), so the fixtures' `effective` blocks are
+/** The server's merge, so the fixtures' `effective` blocks are
  *  what the server would answer: approvers union, ref layers ANDed, the
  *  stricter wait, reason if either sets it. */
 function effectiveOf(env: OrgEnvironmentDto, overlay: OverlayDto | undefined) {
@@ -898,7 +898,7 @@ function environmentProjects(env: OrgEnvironmentDto): EnvironmentProjectDto[] {
   }));
 }
 
-// The migration's split report (ADR-0071 §10 step 8): production was merged
+// The migration's split report: production was merged
 // from scarab's and web-app's per-repo environments (they disagreed on
 // approvers and require_reason); qa was only ever named, so it was opened to
 // all projects and still has a permissive baseline — reviewed already.
@@ -958,7 +958,7 @@ const migrationReport: MigrationReportDto[] = [
   },
 ];
 
-// ── Plugins (ADR-0072) — Settings › Plugins. `argocd` is running;
+// ── Plugins — Settings › Plugins. `argocd` is running;
 // `argocd-us` is killed. Writes echo a record and persist nothing.
 const ARGOCD_REPO = "ghcr.io/thulasi-ram/scarab-plugin-argocd";
 const argocdManifest: PluginCatalogEntryDto["manifest"] = {
@@ -1029,7 +1029,7 @@ const pluginInstallation = (
   storage: null,
   ...o,
 });
-// Libraries (ADR-0076): one installed library with a newer first-party
+// Libraries: one installed library with a newer first-party
 // version that fixes a security problem.
 const plugins: PluginInstallationDto[] = [
   pluginInstallation("argocd", "4f2a1c9e7b3d", {
@@ -1050,7 +1050,7 @@ const plugins: PluginInstallationDto[] = [
     approved_at: ago(5 * 24 * 60 * min),
   }),
 ];
-// Connections (ADR-0072 §5): `argocd` is bound over https; `argocd-us` was
+// Connections: `argocd` is bound over https; `argocd-us` was
 // bound to an in-cluster Service over plain http (the flagged case). The
 // credential itself is never part of any response.
 const pluginConnection = (
@@ -1080,7 +1080,7 @@ const pluginConnections: Record<string, PluginConnectionDto[]> = {
     }),
   ],
 };
-// Broker journal (ADR-0072 §5): `argocd`'s last few hours, newest first —
+// Broker journal: `argocd`'s last few hours, newest first —
 // application reads (a `head` and an `end` row each), a watch stream cut by a
 // re-bind, and refusals: a query key no rule lists and a path no rule admits.
 // Enough rows for a second page. `argocd-us` has recorded nothing.
@@ -1145,10 +1145,10 @@ const brokerJournal: Record<string, BrokerJournalEntryDto[]> = (() => {
 })();
 const secretNames = { names: ["DATABASE_URL", "SENTRY_DSN"] };
 // Org scope (no `repo=`) holds the org-wide base of the inheritance chain — the
-// Settings page's Org Secrets section (ADR-0060).
+// Settings page's Org Secrets section.
 const orgSecretNames = { names: ["GHCR_TOKEN", "SENTRY_DSN"] };
 
-// One healthy GitHub connection covering the acme repos (ADR-0060 part C).
+// One healthy GitHub connection covering the acme repos.
 // Each connection serves one org (git-bug 19b0a45); `org: null` is unassigned
 // and listed to global admins only.
 const connections: components["schemas"]["ConnectionDto"][] = [
@@ -1171,8 +1171,8 @@ const connections: components["schemas"]["ConnectionDto"][] = [
     supports_preflight: true,
     managed_by_config: false,
   },
-  // A self-hosted Forgejo connection — the manually-onboarded kind (ADR-0060
-  // parts C/D), so the repo add/remove + webhook affordances render.
+  // A self-hosted Forgejo connection — the manually-onboarded kind, so the
+  // repo add/remove + webhook affordances render.
   {
     id: "forgejo-7f3a91c2",
     org: "acme",
@@ -1226,7 +1226,7 @@ const connectionPreflight = {
   subscribed_events: ["push", "pull_request"],
 };
 
-// What the Forgejo credential reaches — the bind pick-list (ADR-0060 slice 5).
+// What the Forgejo credential reaches — the bind pick-list.
 // The token also reaches a repo of another account, which the Add repository
 // dialog does not offer (the server would refuse to bind it).
 const availableRepos = [
@@ -1235,14 +1235,14 @@ const availableRepos = [
   { owner: "acme", name: "runbooks", bound: false },
   { owner: "globex", name: "shared-ci", bound: false },
 ];
-// The coverage matrix is now the repo/environment secret EDITOR (ADR-0060), so
+// The coverage matrix is now the repo/environment secret EDITOR, so
 // the fixture carries the repo-default column ("") and inheritance origins:
 // GHCR_TOKEN comes from the org, SENTRY_DSN is a repo key that overrides the
 // org's, DATABASE_URL is a repo default overridden in both environments,
 // SLACK_WEBHOOK_URL is production-only with qa silenced. The repo Secrets list
 // shows GHCR_TOKEN and SLACK_WEBHOOK_URL greyed out beside the repo's own keys.
 // Its environment columns are the org Environments the project may deploy
-// into (ADR-0071) — production and qa, as `projectEnvironments` lists them.
+// into — production and qa, as `projectEnvironments` lists them.
 // ── /v1/repos/acme/scarab/schedules: two `on: cron:` schedules ─────────────
 // The nightly one's last slot started a Run (the scarab run fixture); the
 // weekly one's last slot was missed, so it is also a refused row in the runs
@@ -1320,7 +1320,7 @@ const secretMatrix = {
   ],
 };
 
-// ── API tokens (ADR-0049, git-bug a4cb94f) ────────────────────────────────
+// ── API tokens (git-bug a4cb94f) ────────────────────────────────
 // Four records covering every state the panels render differently: a live token
 // in daily use, one narrowed to a single project and held by someone else, one
 // inside the two-week expiry warning, and a revoked one (a killed credential
@@ -1429,7 +1429,7 @@ function sortMockTokens(tokens: MockToken[], sort: string): MockToken[] {
   return [...tokens].sort((a, b) => key(b) - key(a) || b.created_at - a.created_at);
 }
 
-// ── step-up (ADR-0073) ────────────────────────────────────────────────────
+// ── step-up ────────────────────────────────────────────────────
 // Enforced, one admin (j.lee) without a passkey so the banner and the Settings
 // panel have something to say; a.kim holds two passkeys (one synced, one
 // device-bound). A pending confirmation request lives at
@@ -1679,7 +1679,7 @@ function route(pathname: string, search: string, method: string, body = ""): Res
   // /v1/repos/{org}/{repo}/runs
   if ((m = p.match(/^\/v1\/repos\/[^/]+\/([^/]+)\/runs$/))) {
     const { runs } = repoRuns[m[1]] ?? strip("ooooooooooooo");
-    // ADR-0076: the orders-api list leads with the library Runs.
+    // The orders-api list leads with the library Runs.
     if (m[1] === "orders-api" && !runs.some((r) => r.id === libraryRunSummaries[0]!.id)) {
       runs.unshift(...(libraryRunSummaries as typeof runs));
     }
@@ -1703,7 +1703,7 @@ function route(pathname: string, search: string, method: string, body = ""): Res
   if ((m = p.match(/^\/v1\/repos\/[^/]+\/([^/]+)\/environments$/))) {
     return json(projectEnvironments(decodeURIComponent(m[1]!)));
   }
-  // The retired per-repo writes (ADR-0071 §10): 410, as the server answers.
+  // The retired per-repo writes: 410, as the server answers.
   if (/^\/v1\/repos\/[^/]+\/[^/]+\/environments\/[^/]+$/.test(p) && method !== "GET") {
     return new Response("per-repo environments were replaced by org-level Environments", {
       status: 410,
@@ -1750,7 +1750,7 @@ function route(pathname: string, search: string, method: string, body = ""): Res
     return new Response(null, { status: 204 });
   }
 
-  // Org-level Environments (ADR-0071): list, one, and echoing writes.
+  // Org-level Environments: list, one, and echoing writes.
   if (/^\/v1\/orgs\/[^/]+\/environments$/.test(p)) return json(orgEnvironments);
   if (/^\/v1\/orgs\/[^/]+\/policies$/.test(p) && method === "GET") return json(orgPolicies);
   if (/^\/v1\/orgs\/[^/]+\/policy-decisions$/.test(p)) return json({ decisions: policyDecisions, next: null });
@@ -1828,7 +1828,7 @@ function route(pathname: string, search: string, method: string, body = ""): Res
     }
     return found ? json(found) : new Response("not found", { status: 404 });
   }
-  // Governance (ADR-0071): baseline, eligibility, projects, overlays,
+  // Governance: baseline, eligibility, projects, overlays,
   // grants. Bodies are not visible here, so writes echo what is stored.
   if ((m = p.match(/^\/v1\/orgs\/[^/]+\/environments\/([^/]+)\/(protection|eligibility|projects)$/))) {
     const env = orgEnvironments.find((e) => e.name === decodeURIComponent(m![1]!));
@@ -1889,7 +1889,7 @@ function route(pathname: string, search: string, method: string, body = ""): Res
     return json({ ...line, acknowledged_at: line.acknowledged_at ?? now, acknowledged_by: line.acknowledged_by ?? "a.kim" });
   }
 
-  // Plugins (ADR-0072): catalog, installations, kill/enable, uninstall.
+  // Plugins: catalog, installations, kill/enable, uninstall.
   if (/^\/v1\/orgs\/[^/]+\/plugin-catalog$/.test(p)) return json(pluginCatalog);
   if (/^\/v1\/orgs\/[^/]+\/plugins$/.test(p)) {
     if (method === "POST") {
@@ -2014,7 +2014,7 @@ function route(pathname: string, search: string, method: string, body = ""): Res
   }
   if (/^\/v1\/connections\/[^/]+\/available-repos$/.test(p)) return json(availableRepos);
   if (/^\/v1\/connections\/[^/]+\/preflight$/.test(p)) return json(connectionPreflight);
-  // Secret names are scope-addressed: no `repo=` is the org scope (ADR-0060).
+  // Secret names are scope-addressed: no `repo=` is the org scope.
   if (p === "/v1/secrets") {
     const scoped = new URLSearchParams(search).has("repo");
     return json(scoped ? secretNames : orgSecretNames);
@@ -2063,7 +2063,7 @@ function route(pathname: string, search: string, method: string, body = ""): Res
       { status: 202 },
     );
   }
-  // Reject a gate (ADR-0070 §9): the fixture is static, so it only answers.
+  // Reject a gate: the fixture is static, so it only answers.
   if (method === "POST" && /^\/v1\/runs\/[^/]+\/gates\/[^/]+\/reject$/.test(p)) {
     return json({ rejected: true }, { status: 202 });
   }
@@ -2077,7 +2077,7 @@ function route(pathname: string, search: string, method: string, body = ""): Res
     });
   if (p === `/v1/runs/${RICH_RUN_ID}/artifacts`) return json(richArtifacts);
   if (p === `/v1/runs/${RICH_RUN_ID}/services`) return json(richServices);
-  // The rerun PREVIEW (ADR-0061 s5 + git-bug 4afaa3e). RunDetail fetches this
+  // The rerun PREVIEW (git-bug 4afaa3e). RunDetail fetches this
   // per selection for LIVE runs too now, and the confirm popover renders it —
   // so the mock answers with a small realistic cascade over the acme fixture's
   // chain (clone → build → test → approve[gate]) rather than understating the
