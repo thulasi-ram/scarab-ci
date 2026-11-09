@@ -541,3 +541,69 @@ async fn an_application_deleted_between_passes_leaves_the_wait_open() {
     w.live("web");
     assert_eq!(w.pass().await.released, [key("web")]);
 }
+
+#[tokio::test]
+async fn an_application_outside_argos_namespace_is_read_with_app_namespace() {
+    // Apps in any namespace: `app: <namespace>/<name>`, as the argocd CLI
+    // writes it, reads the Application with `?appNamespace=<namespace>`
+    // (a query key manifest.json allows). A bare name sends none, and Argo
+    // looks in its own namespace.
+    let w = World::new(Duration::from_secs(5)).await;
+    w.fake.put_app("team-a", "web", live_spec());
+    w.live("api");
+    w.fb.lock().pending = vec![
+        wait("team-a/web", json!({ "app": "team-a/web", "image": IMAGE })),
+        wait("api", json!({ "app": "api", "image": IMAGE })),
+    ];
+    let report = w.pass().await;
+    assert_eq!(
+        report.released,
+        [key("team-a-web"), key("api")],
+        "{report:?}"
+    );
+    let mut paths = proxied_paths(&w);
+    paths.sort();
+    assert_eq!(
+        paths,
+        [
+            "/api/v1/applications/api",
+            "/api/v1/applications/api/managed-resources",
+            "/api/v1/applications/web/managed-resources?appNamespace=team-a",
+            "/api/v1/applications/web?appNamespace=team-a",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn an_app_that_names_no_application_fails_without_a_read() {
+    let bad = [
+        "",
+        ".",
+        "..",
+        "a/b/c",
+        "/web",
+        "team-a/",
+        "./web",
+        "team-a/..",
+        "..",
+    ];
+    let w = World::new(Duration::from_secs(5)).await;
+    w.fb.lock().pending = bad
+        .iter()
+        .enumerate()
+        .map(|(i, app)| wait(&format!("bad{i}"), json!({ "app": app, "image": IMAGE })))
+        .collect();
+    let report = w.pass().await;
+    assert_eq!(report.failed.len(), bad.len(), "{report:?}");
+    assert!(proxied_paths(&w).is_empty(), "{:?}", proxied_paths(&w));
+    for (_, body) in w.fb.lock().answers.iter() {
+        assert_eq!(body["passed"], false);
+        assert!(
+            body["reason"]
+                .as_str()
+                .unwrap()
+                .contains("is not an Argo CD Application name"),
+            "{body}"
+        );
+    }
+}

@@ -271,6 +271,24 @@ enum Outcome {
     Error(String),
 }
 
+/// The Application an `app` input names: `<name>`, in Argo CD's own
+/// namespace, or `<namespace>/<name>` (apps in any namespace, as the argocd
+/// CLI writes it), read with `?appNamespace=<namespace>`. `None` for
+/// anything else: `.` and `..` survive percent-encoding and a URL resolves
+/// them, so the read would name another path, and a further `/` is in no
+/// name. Neither becomes valid later, so the gate fails at once.
+fn application_ref(app: &str) -> Option<(Option<&str>, &str)> {
+    let (namespace, name) = match app.split_once('/') {
+        Some((ns, name)) => (Some(ns), name),
+        None => (None, app),
+    };
+    let names_nothing = |s: &str| s.is_empty() || s == "." || s == ".." || s.contains('/');
+    if names_nothing(name) || namespace.is_some_and(names_nothing) {
+        return None;
+    }
+    Some((namespace, name))
+}
+
 /// One pass: answer every open `wait-live` wait in `org` that Argo has
 /// decided. A wait for a gate this plugin does not know is left alone.
 ///
@@ -317,10 +335,7 @@ async fn resolve_one(broker: &Broker, api: &GateApi, gate: &PendingGate) -> Outc
     let Some((app, image)) = inputs(gate) else {
         return Outcome::Error("no `app` or `image` input".into());
     };
-    // `.` and `..` survive percent-encoding and a URL resolves them, so
-    // the read would name another path; a `/` is not in an Application
-    // name. Neither becomes valid later: fail the gate now.
-    if app.is_empty() || app == "." || app == ".." || app.contains('/') {
+    let Some((namespace, name)) = application_ref(app) else {
         let verdict = Judgement::Fail {
             reason: format!("`app` {app:?} is not an Argo CD Application name"),
         };
@@ -328,12 +343,16 @@ async fn resolve_one(broker: &Broker, api: &GateApi, gate: &PendingGate) -> Outc
             Ok(()) => Outcome::Failed,
             Err(e) => Outcome::Error(format!("answering: {e}")),
         };
-    }
-    let path = format!("/api/v1/applications/{}", encode_component(app));
+    };
+    let query: Vec<(&str, &str)> = namespace
+        .map(|ns| ("appNamespace", ns))
+        .into_iter()
+        .collect();
+    let path = format!("/api/v1/applications/{}", encode_component(name));
     let read = async {
-        let application: Application = broker.argocd_get(&path, &[]).await?;
+        let application: Application = broker.argocd_get(&path, &query).await?;
         let managed: ManagedResources = broker
-            .argocd_get(&format!("{path}/managed-resources"), &[])
+            .argocd_get(&format!("{path}/managed-resources"), &query)
             .await?;
         Ok::<_, BrokerError>((application, managed))
     };

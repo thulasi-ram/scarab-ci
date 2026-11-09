@@ -63,7 +63,7 @@
           {
             "name": "app",
             "type": "string",
-            "description": "The Argo CD Application name."
+            "description": "The Argo CD Application name, or <namespace>/<name> for an Application outside Argo CD's own namespace."
           },
           {
             "name": "image",

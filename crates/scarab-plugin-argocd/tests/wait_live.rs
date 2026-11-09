@@ -332,12 +332,12 @@ async fn wait_live_fails_the_gate_when_argo_gives_up() {
     w.finish().await;
 }
 
-/// An `app` of `.` or `..`, or one holding a `/`, would name another path
-/// once the URL is resolved: the gate fails with the reason, and nothing
-/// reaches Argo.
+/// An `app` of `.` or `..`, or one holding a second `/`, would name another
+/// path once the URL is resolved: the gate fails with the reason, and
+/// nothing reaches Argo. (One `/` is `<namespace>/<name>`.)
 #[tokio::test]
 async fn wait_live_fails_an_app_that_is_not_an_application_name() {
-    for app in ["..", ".", "a/b"] {
+    for app in ["..", ".", "a/b/c"] {
         let pipeline = PIPELINE.replace("app: payments-api", &format!("app: \"{app}\""));
         let Some(w) = world_with(&pipeline).await else {
             return;
