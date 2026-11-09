@@ -591,7 +591,7 @@ function BrokerJournal(props: { org: string; installation: string }) {
                       </td>
                       <td class="mono">{e.method}</td>
                       <td class="mono plg-journal-path">{v.path}</td>
-                      <td class="mono">{v.rule}</td>
+                      <td class="mono plg-journal-rule">{v.rule}</td>
                       <td class="mono">{v.status}</td>
                       <td class="mono">{v.bytes}</td>
                       <td class="mono">{v.duration}</td>
