@@ -3677,7 +3677,7 @@
     "/v1/orgs/{org}/plugin-installations/{id}": {
       "get": {
         "tags": [
-          "plugins"
+          "Plugins"
         ],
         "summary": "One plugin installation, by id (ADR-0072)",
         "operationId": "get_plugin_by_id",
