@@ -58,6 +58,8 @@ async fn connections_are_assigned_the_org_of_their_bindings() {
     .expect("seed");
 
     apply(&pool, |v| v == VERSION).await;
+    // The store reads today's schema; bring the rest of the migrations in.
+    apply(&pool, |v| v > VERSION).await;
 
     let db = PostgresDb::with_pool(pool.clone());
     let conn = |id: &'static str| {
@@ -128,6 +130,8 @@ async fn an_installation_holding_only_another_owners_repos_stays_unassigned() {
     .expect("seed");
 
     apply(&pool, |v| v == VERSION).await;
+    // The store reads today's schema; bring the rest of the migrations in.
+    apply(&pool, |v| v > VERSION).await;
 
     let db = PostgresDb::with_pool(pool.clone());
     let row = db
@@ -175,6 +179,8 @@ async fn an_installation_id_too_long_for_a_bigint_does_not_abort_the_migration()
     .expect("seed");
 
     apply(&pool, |v| v == VERSION).await;
+    // The store reads today's schema; bring the rest of the migrations in.
+    apply(&pool, |v| v > VERSION).await;
 
     let db = PostgresDb::with_pool(pool.clone());
     let long = db
@@ -228,6 +234,8 @@ async fn the_org_record_is_filled_from_every_org_keyed_table() {
     .expect("seed");
 
     apply(&pool, |v| v == VERSION).await;
+    // The store reads today's schema; bring the rest of the migrations in.
+    apply(&pool, |v| v > VERSION).await;
 
     let db = PostgresDb::with_pool(pool.clone());
     assert_eq!(
