@@ -1,54 +1,38 @@
-// Settings › Members: who holds which
-// role in the org, granting and revoking natively, and re-syncing a repo's
-// collaborators from its forge.
+// Settings › Members: who holds which role in the org, and granting and
+// revoking org roles. An org role applies to every repository of the org.
 //
-// Until now there was no UI for role bindings at all — only raw HTTP. Two
-// sources write them and the panel keeps them apart in the operator's head:
-// a NATIVE grant/revoke here is authoritative, and a forge re-sync only ever
-// seeds and refreshes what it seeded itself. "Not signed in yet" marks a user
-// a re-sync created from their forge account: whoever signs in with exactly
-// that account gets these roles, and nobody else can.
+// Repository roles live on each repository's Settings › Access, with the
+// forge re-sync that seeds them, so this list only names the repositories a
+// person also holds a role in and links there. Someone with repository roles
+// only is still listed: they are a member of the org in practice. "Not signed
+// in yet" marks a user a re-sync created from their forge account: whoever
+// signs in with exactly that account gets these roles, and nobody else can.
 import { For, Show, createResource, createSignal } from "solid-js";
-import {
-  grantRole,
-  importFromForge,
-  listBindings,
-  listProjects,
-  revokeRole,
-} from "../api/client";
+import { A } from "@solidjs/router";
+import { grantRole, listBindings, revokeRole } from "../api/client";
 import { memberRows } from "../identities";
 import Icon from "./Icon";
 import ConfirmDestructive from "./ConfirmDestructive";
-import { Field, Select } from "./Field";
+import { Select } from "./Field";
 import PrincipalSearch from "./PrincipalSearch";
 
 const ROLES = ["viewer", "member", "admin", "owner"];
 
 export default function Members(props: { org: string }) {
   const [bindings, { refetch }] = createResource(() => listBindings(props.org));
-  const [projects] = createResource(async () =>
-    (await listProjects().catch(() => []))
-      .filter((p) => p.org === props.org)
-      .map((p) => p.project)
-      .sort(),
-  );
   const [error, setError] = createSignal<string | null>(null);
-  const [notice, setNotice] = createSignal<string | null>(null);
   const [subject, setSubject] = createSignal("");
   const [role, setRole] = createSignal("member");
-  const [project, setProject] = createSignal("");
-  const [syncRepo, setSyncRepo] = createSignal("");
   const [busy, setBusy] = createSignal(false);
 
   const rows = () => memberRows(bindings() ?? []);
 
-  const act = async (what: () => Promise<string | void>) => {
+  const grant = async () => {
     setBusy(true);
     setError(null);
-    setNotice(null);
     try {
-      const msg = await what();
-      if (msg) setNotice(msg);
+      await grantRole(props.org, { subject: subject(), role: role() });
+      setSubject("");
       await refetch();
     } catch (e) {
       setError(e instanceof Error ? e.message : "That did not work.");
@@ -57,36 +41,22 @@ export default function Members(props: { org: string }) {
     }
   };
 
-  const grant = () =>
-    act(async () => {
-      await grantRole(props.org, {
-        subject: subject(),
-        role: role(),
-        ...(project() ? { project: project() } : {}),
-      });
-      setSubject("");
-    });
-
-  // The role the confirm dialog is about to revoke. A refusal shows in the
-  // dialog.
-  const [revoking, setRevoking] = createSignal<{ subject: string; project: string } | null>(null);
-  const revoke = async (s: string, p: string) => {
+  // The person whose org role the confirm dialog is about to revoke. A
+  // refusal shows in the dialog.
+  const [revoking, setRevoking] = createSignal<string | null>(null);
+  const revoke = async (s: string) => {
     setBusy(true);
     setError(null);
-    setNotice(null);
     try {
-      await revokeRole(props.org, s, p || undefined);
+      await revokeRole(props.org, s);
       await refetch();
     } finally {
       setBusy(false);
     }
   };
 
-  const resync = () =>
-    act(async () => {
-      const seeded = await importFromForge(props.org, syncRepo());
-      return `Re-synced ${props.org}/${syncRepo()} from its forge: ${seeded.length} collaborator${seeded.length === 1 ? "" : "s"} hold roles from it now.`;
-    });
+  const repoHref = (repo: string) =>
+    `/${encodeURIComponent(props.org)}/${encodeURIComponent(repo)}?tab=settings`;
 
   return (
     <div class="panel">
@@ -103,16 +73,13 @@ export default function Members(props: { org: string }) {
         <Show when={error()}>
           <p class="error">{error()}</p>
         </Show>
-        <Show when={notice()}>
-          <p class="notice-ok">{notice()}</p>
-        </Show>
 
         <Show when={!bindings.loading} fallback={<p class="empty">loading…</p>}>
           <Show
             when={bindings() !== null}
             fallback={
               <p class="empty">
-                This deployment has no role store — authorization is off (dev), so there is
+                This deployment has no role store: authorization is off (dev), so there is
                 nobody to grant anything to.
               </p>
             }
@@ -121,8 +88,7 @@ export default function Members(props: { org: string }) {
               when={rows().length > 0}
               fallback={
                 <p class="empty">
-                  Nobody holds a role in {props.org} yet. Re-sync a repository from its
-                  forge to bring in its collaborators, or grant someone below.
+                  Nobody holds a role in {props.org} yet. Grant someone an org role below.
                 </p>
               }
             >
@@ -141,24 +107,37 @@ export default function Members(props: { org: string }) {
                         </Show>
                       </div>
                       <div class="tok-facts">
-                        <Show when={r.orgRole}>
-                          <span>
-                            <span class="tok-role">{r.orgRole}</span> all of {props.org}
-                            <button class="btn btn-ghost btn-sm" disabled={busy()} onClick={() => setRevoking({ subject: r.subject, project: "" })}>
-                              revoke
-                            </button>
-                          </span>
-                        </Show>
-                        <For each={r.projects}>
-                          {(p) => (
+                        <Show
+                          when={r.orgRole}
+                          fallback={<span class="subtle">no org role</span>}
+                        >
+                          {(orgRole) => (
                             <span>
-                              <span class="tok-role">{p.role}</span> {p.project}
-                              <button class="btn btn-ghost btn-sm" disabled={busy()} onClick={() => setRevoking({ subject: r.subject, project: p.project })}>
+                              <span class="tok-role">{orgRole()}</span> all of {props.org}
+                              <button
+                                class="btn btn-ghost btn-sm"
+                                disabled={busy()}
+                                onClick={() => setRevoking(r.subject)}
+                              >
                                 revoke
                               </button>
                             </span>
                           )}
-                        </For>
+                        </Show>
+                        <Show when={r.repos.length > 0}>
+                          <span class="member-repos">
+                            also has roles in {r.repos.length}{" "}
+                            {r.repos.length === 1 ? "repository" : "repositories"}:{" "}
+                            <For each={r.repos}>
+                              {(repo, i) => (
+                                <>
+                                  {i() > 0 ? ", " : ""}
+                                  <A href={repoHref(repo)}>{repo}</A>
+                                </>
+                              )}
+                            </For>
+                          </span>
+                        </Show>
                       </div>
                     </li>
                   )}
@@ -168,7 +147,7 @@ export default function Members(props: { org: string }) {
 
             <div class="f">
               <div class="f-l">
-                <span class="f-lbl">Grant</span>
+                <span class="f-lbl">Grant an org role</span>
               </div>
               <Show
                 when={subject()}
@@ -179,10 +158,7 @@ export default function Members(props: { org: string }) {
                   <Select aria-label="role" value={role()} onValue={setRole}>
                     <For each={ROLES}>{(r) => <option value={r}>{r}</option>}</For>
                   </Select>
-                  <Select aria-label="scope" value={project()} onValue={setProject}>
-                    <option value="">all of {props.org}</option>
-                    <For each={projects() ?? []}>{(p) => <option value={p}>{p}</option>}</For>
-                  </Select>
+                  <span class="subtle">all of {props.org}</span>
                   <button class="btn btn-primary btn-sm" disabled={busy()} onClick={grant}>
                     grant
                   </button>
@@ -191,30 +167,20 @@ export default function Members(props: { org: string }) {
                   </button>
                 </div>
               </Show>
+              <p class="f-help">
+                An org role applies to every repository in {props.org}. To give someone a role on one
+                repository, use that repository's Settings › Access.
+              </p>
             </div>
 
-            <Field
-              label="Re-sync from forge"
-              help="Seeds roles from the repository's forge collaborators — admin → admin, write → member, read → viewer — pinned to each person's forge account, and removes the forge-given role of anyone the forge no longer lists. Native grants and revokes made here are never touched."
-            >
-              <div class="tok-life">
-                <Select value={syncRepo()} onValue={setSyncRepo}>
-                  <option value="">choose a repository…</option>
-                  <For each={projects() ?? []}>{(p) => <option value={p}>{p}</option>}</For>
-                </Select>
-                <button class="btn btn-ghost btn-sm" disabled={busy() || !syncRepo()} onClick={resync}>
-                  <Icon icon="rotate-cw" size={13} /> re-sync
-                </button>
-              </div>
-            </Field>
             <Show when={revoking()}>
-              {(r) => (
+              {(s) => (
                 <ConfirmDestructive
-                  title={`Revoke ${r().subject}'s role on ${r().project || `all of ${props.org}`}?`}
-                  purpose="A native revoke is durable: a later forge re-sync will not give it back."
-                  name={r().subject}
+                  title={`Revoke ${s()}'s role on all of ${props.org}?`}
+                  purpose="Their roles on single repositories stay. A revoke made here is kept: a later forge re-sync does not give the role back."
+                  name={s()}
                   confirmLabel="Revoke role"
-                  onConfirm={() => revoke(r().subject, r().project)}
+                  onConfirm={() => revoke(s())}
                   onClose={() => setRevoking(null)}
                 />
               )}

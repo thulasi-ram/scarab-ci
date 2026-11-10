@@ -47,6 +47,7 @@ import ConfirmDestructive from "../components/ConfirmDestructive";
 import { Checkbox, Field, Input, Select } from "../components/Field";
 import { addToList } from "../identities";
 import SecretKeyList from "../components/SecretKeyList";
+import RepoSettings from "../components/RepoSettings";
 import Doodle from "../components/Doodle";
 import AsciiScene from "../components/AsciiScene";
 import { mergeRefused, runEnvironmentOptions, runListFilter } from "../runs-filter";
@@ -621,15 +622,7 @@ export default function RepoView() {
 
       {/* ---- Settings ---- */}
       <Show when={tab() === "settings"}>
-        <div class="panel">
-          <div class="panel-h"><span>Settings</span></div>
-          <div class="settings-body">
-            <div class="set-row"><span class="k">Default branch</span><span class="mono">main</span></div>
-            <div class="set-row"><span class="k">Triggers</span><span class="mono">push · pull_request · tag · manual</span></div>
-            <div class="set-row"><span class="k">Webhook</span><span class="subtle">connects with the forge integration</span></div>
-            <button class="btn btn-danger btn-sm" style={{ "margin-top": "8px" }}>Disable repository</button>
-          </div>
-        </div>
+        <RepoSettings org={org()} repo={repo()} repoUrl={repoUrl() ?? null} />
       </Show>
 
       <Show when={envDialog() !== undefined}>

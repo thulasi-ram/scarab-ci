@@ -84,15 +84,73 @@ const authProviders = [
   { id: "okta", name: "Okta", default: false },
   { id: "forgejo", name: "Forgejo", default: false },
 ];
-// Members: a native org Owner, forge-imported collaborators (one never signed
-// in), and a project-scoped approver.
-const bindings = [
-  { subject: "a.kim", role: "owner", project: "", display_name: "Avery Kim", claimed: true },
-  { subject: "j.lee", role: "admin", project: "orders-api", display_name: "Jordan Lee", claimed: true },
-  { subject: "j.lee", role: "member", project: "scarab", display_name: "Jordan Lee", claimed: true },
-  { subject: "r.okafor", role: "member", project: "scarab", claimed: false },
-  { subject: "okta:s.patel@acme.example", role: "viewer", project: "", display_name: "Sam Patel", claimed: true },
+// Members and repository Access: an org Owner and an org admin; Jordan, an
+// org member who also holds roles on two repositories; collaborators the
+// forge gave a role on `scarab`, one of whom never signed in; and an org
+// viewer. So the `scarab` repository's Access shows a role granted in Scarab,
+// roles from the forge, and access through an org role. The list is mutable:
+// grant, revoke and re-sync change it for the life of the page.
+type MockBinding = components["schemas"]["BindingDto"];
+const bindings: MockBinding[] = [
+  { subject: "a.kim", role: "owner", project: "", display_name: "Avery Kim", claimed: true, origin: "native" },
+  { subject: "m.diaz", role: "admin", project: "", display_name: "Morgan Diaz", claimed: true, origin: "native" },
+  { subject: "j.lee", role: "member", project: "", display_name: "Jordan Lee", claimed: true, origin: "native" },
+  { subject: "j.lee", role: "admin", project: "orders-api", display_name: "Jordan Lee", claimed: true, origin: "native" },
+  { subject: "j.lee", role: "admin", project: "scarab", display_name: "Jordan Lee", claimed: true, origin: "native" },
+  { subject: "r.okafor", role: "member", project: "scarab", claimed: false, origin: "import" },
+  { subject: "t.nguyen", role: "viewer", project: "scarab", display_name: "Taylor Nguyen", claimed: true, origin: "import" },
+  { subject: "okta:s.patel@acme.example", role: "viewer", project: "", display_name: "Sam Patel", claimed: true, origin: "native" },
 ];
+// What the forge lists as each repository's collaborators, already mapped to
+// roles (admin → admin, write → member, read → viewer). A re-sync of `scarab`
+// raises Taylor to member and adds Priya; a repository not listed here has an
+// empty listing, which, as on the server, changes nothing.
+const forgeCollaborators: Record<string, MockBinding[]> = {
+  scarab: [
+    { subject: "r.okafor", role: "member", project: "scarab", claimed: false },
+    { subject: "t.nguyen", role: "member", project: "scarab", display_name: "Taylor Nguyen", claimed: true },
+    { subject: "p.ito", role: "viewer", project: "scarab", claimed: false },
+  ],
+};
+
+// The server's re-sync, in the mock: seed or refresh the forge's rows, never
+// a role granted in Scarab, and drop the forge's rows it no longer lists.
+function mockResync(repo: string): MockBinding[] {
+  const listed = forgeCollaborators[repo] ?? [];
+  if (listed.length === 0) return [];
+  for (const c of listed) {
+    const row = bindings.find((b) => b.subject === c.subject && b.project === repo);
+    if (!row) bindings.push({ ...c, origin: "import" });
+    else if (row.origin === "import") row.role = c.role;
+  }
+  for (let i = bindings.length - 1; i >= 0; i--) {
+    const b = bindings[i]!;
+    if (b.project === repo && b.origin === "import" && !listed.some((c) => c.subject === b.subject)) {
+      bindings.splice(i, 1);
+    }
+  }
+  return listed.map(({ subject, role, project }) => ({ subject, role, project }));
+}
+
+function mockGrant(req: { subject?: string; role?: string; project?: string }) {
+  const project = req.project ?? "";
+  const who = principals.find((x) => x.id === req.subject);
+  const row = bindings.find((b) => b.subject === req.subject && b.project === project);
+  if (row) {
+    row.role = req.role ?? row.role;
+    row.origin = "native";
+  } else {
+    bindings.push({
+      subject: req.subject ?? "",
+      role: req.role ?? "member",
+      project,
+      display_name: who?.display_name ?? null,
+      claimed: who?.claimed ?? true,
+      origin: "native",
+    });
+  }
+}
+
 const principals = [
   {
     id: "j.lee",
@@ -105,6 +163,18 @@ const principals = [
     display_name: null,
     claimed: false,
     identities: [{ provider: "default", handle: "r.okafor" }],
+  },
+  {
+    id: "m.diaz",
+    display_name: "Morgan Diaz",
+    claimed: true,
+    identities: [{ provider: "default", handle: "m.diaz" }],
+  },
+  {
+    id: "t.nguyen",
+    display_name: "Taylor Nguyen",
+    claimed: true,
+    identities: [{ provider: "default", handle: "t.nguyen" }],
   },
   {
     id: "okta:s.patel@acme.example",
@@ -1606,7 +1676,16 @@ function route(pathname: string, search: string, method: string, body = ""): Res
   }
   if (/^\/v1\/me\/identities\/[^/]+$/.test(p)) return new Response(null, { status: 204 });
   if (/^\/v1\/orgs\/[^/]+\/bindings$/.test(p)) {
-    return method === "GET" ? json(bindings) : new Response(null, { status: 204 });
+    if (method === "GET") return json(bindings);
+    if (method === "PUT") mockGrant(JSON.parse(body || "{}"));
+    if (method === "DELETE") {
+      const q = new URLSearchParams(search);
+      const i = bindings.findIndex(
+        (b) => b.subject === q.get("subject") && b.project === (q.get("project") ?? ""),
+      );
+      if (i >= 0) bindings.splice(i, 1);
+    }
+    return new Response(null, { status: 204 });
   }
   if (/^\/v1\/orgs\/[^/]+\/principals$/.test(p)) {
     const q = (new URLSearchParams(search).get("q") ?? "").toLowerCase();
@@ -1619,9 +1698,8 @@ function route(pathname: string, search: string, method: string, body = ""): Res
       ),
     );
   }
-  if (/^\/v1\/repos\/[^/]+\/[^/]+\/bindings\/import$/.test(p)) {
-    return json(bindings.filter((b) => b.project === "scarab"));
-  }
+  const imported = p.match(/^\/v1\/repos\/[^/]+\/([^/]+)\/bindings\/import$/);
+  if (imported) return json(mockResync(decodeURIComponent(imported[1]!)));
   if (p === "/v1/repos") return json(projects);
   if (p === "/v1/runs") return json({ runs });
 

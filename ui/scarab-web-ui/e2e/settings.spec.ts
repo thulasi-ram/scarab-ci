@@ -524,3 +524,73 @@ test("a token minted under Account settings shows in the org's list", async ({ p
   await expect(go).toBeEnabled();
   expect(errors).toEqual([]);
 });
+
+test("Members lists org roles only and links each person's repository roles", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/orgs/acme/settings/members");
+  const view = page.locator("section.page");
+  const jordan = view.locator("li.tok", { hasText: "Jordan Lee" });
+  await expect(jordan).toContainText("member all of acme");
+  await expect(jordan).toContainText("also has roles in 2 repositories");
+  await expect(jordan.getByRole("link", { name: "scarab" })).toHaveAttribute(
+    "href",
+    "/acme/scarab?tab=settings",
+  );
+  // Repository roles only: listed, with no org role and nothing to revoke here.
+  const okafor = view.locator("li.tok", { hasText: "r.okafor" });
+  await expect(okafor).toContainText("no org role");
+  await expect(okafor).toContainText("not signed in yet");
+  await expect(okafor.getByRole("button", { name: "revoke" })).toHaveCount(0);
+  // Grants are org-wide, and re-sync lives on the repository.
+  await expect(view.getByRole("combobox", { name: "scope" })).toHaveCount(0);
+  await expect(view.getByRole("button", { name: /re-sync/i })).toHaveCount(0);
+
+  await jordan.getByRole("link", { name: "scarab" }).click();
+  await expect(page).toHaveURL(/\/acme\/scarab\?tab=settings$/);
+  await expect(page.locator(".panel-h", { hasText: "Access" })).toBeVisible();
+  expect(errors).toEqual([]);
+});
+
+test("a repository's Access lists its roles and the org roles that reach it, and re-syncs from the forge", async ({
+  page,
+}) => {
+  const errors = collectErrors(page);
+  await page.goto("/acme/scarab?tab=settings");
+  const view = page.locator("section.page");
+  // The placeholder rows are gone; the connection comes from the server.
+  await expect(view.getByText("Default branch")).toHaveCount(0);
+  await expect(view.getByRole("button", { name: "Disable repository" })).toHaveCount(0);
+  await expect(view.getByRole("link", { name: "gh-acme" })).toBeVisible();
+
+  const access = view.locator(".panel", { has: page.locator(".panel-h", { hasText: "Access" }) });
+  await expect(access.locator("li.tok", { hasText: "Jordan Lee" })).toContainText("granted in Scarab");
+  const okafor = access.locator("li.tok", { hasText: "r.okafor" });
+  await expect(okafor).toContainText("from GitHub collaborators");
+  await expect(okafor).toContainText("not signed in yet");
+  const avery = access.locator("li.tok.access-via-org", { hasText: "Avery Kim" });
+  await expect(avery).toContainText("via org role owner");
+  await expect(avery.getByRole("button")).toHaveCount(0);
+
+  await access.getByRole("button", { name: "Re-sync collaborators" }).click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog.getByRole("heading", { name: "Re-sync collaborators from GitHub" })).toBeVisible();
+  await expect(dialog).toContainText("write → member");
+  await expect(dialog).toContainText("Roles granted or revoked in Scarab are never changed.");
+  await dialog.getByRole("button", { name: "Re-sync", exact: true }).click();
+  await expect(dialog).toContainText("Added: 1");
+  await expect(dialog).toContainText("p.ito");
+  await expect(dialog).toContainText("Changed: 1");
+  await expect(dialog).toContainText("viewer → member");
+  await dialog.getByRole("button", { name: "Done" }).click();
+  await expect(dialog).toHaveCount(0);
+  await expect(access.locator("li.tok", { hasText: "Taylor Nguyen" })).toContainText("member");
+  await expect(access.locator("li.tok", { hasText: "p.ito" })).toBeVisible();
+  expect(errors).toEqual([]);
+});
+
+test("a repository's Access is for org admins", async ({ page }) => {
+  await page.goto("/acme/scarab?tab=settings&admin_orgs=globex");
+  const view = page.locator("section.page");
+  await expect(view.getByText(/Only an admin of acme can see and change who has access/)).toBeVisible();
+  await expect(view.getByRole("button", { name: "Re-sync collaborators" })).toHaveCount(0);
+});

@@ -3326,6 +3326,19 @@ h1, .crumb-head, .run-title {
   font-size: var(--fs-sm); line-height: 1.45; color: var(--muted-sage);
 }
 .tok-life { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+/* ---- Members and a repository's Access ---- */
+/* The repositories a member also holds a role in: running text with links. */
+.tok-facts > span.member-repos { display: inline; }
+.member-repos a { color: var(--sage); }
+.member-repos a:hover { color: var(--emerald); }
+/* Access that comes from an org role: listed for the full picture, managed
+   under Members, so it recedes and has no actions. */
+.tok.access-via-org { opacity: 0.6; }
+.access-h {
+  margin: 4px 0 0; font-size: var(--fs-sm); font-weight: 600; color: var(--sage);
+}
+.resync-list { margin: 4px 0 0; padding-left: 18px; font-size: var(--fs-sm); color: var(--sage); }
 .f-ctl.tok-days { width: 120px; flex: none; }
 .tok-preset-on { border-color: var(--emerald); color: var(--emerald); }
 
