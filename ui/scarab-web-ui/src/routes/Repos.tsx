@@ -198,9 +198,18 @@ export default function Repos() {
                     <span class="repo-name">
                       <span class="repo-org">{p.org} /</span> {p.project}
                     </span>
-                    <span class="rr-coord mono">
-                      {p.owner}/{p.name}
-                    </span>
+                    {/* The forge repo the project is bound to; only worth a
+                        second line when it is not named like the project. */}
+                    <Show
+                      when={
+                        `${p.owner}/${p.name}`.toLowerCase() !==
+                        `${p.org}/${p.project}`.toLowerCase()
+                      }
+                    >
+                      <span class="rr-coord mono">
+                        {p.owner}/{p.name}
+                      </span>
+                    </Show>
                     <span class="rr-when mono">
                       {p.last_run_at ? relTime(p.last_run_at) : "never run"}
                     </span>
