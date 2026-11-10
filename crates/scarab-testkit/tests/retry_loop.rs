@@ -236,7 +236,7 @@ async fn a_failure_before_the_process_ran_tears_the_unit_down() {
             FakeExecutor::new(),
         );
         seed(&db, None).await;
-        exec.script_outcome(failed(class.clone()));
+        exec.script_outcome(failed(class));
         tick(&db, &clock, &exec).await; // a1 launches
         tick(&db, &clock, &exec).await; // a1's poll reports the failure
 
