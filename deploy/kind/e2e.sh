@@ -14,7 +14,7 @@
 #   5. the executor's and the plugin runtime's live cluster suites, in
 #      namespace scarab-kube-tests (the test process stands in for the
 #      control plane, so it gets the Depot, its bucket and its token secret)
-#   6. the first-party Argo CD plugin against a fake Argo CD on the host
+#   6. the Argo CD plugin against a fake Argo CD on the host
 #      (plugin-verify.sh, ADR-0072). Not nextest: it runs when there is no
 #      filter or the filter is part of its name, `plugin-argocd`. It is a
 #      child process with its own EXIT trap, which stops the fake Argo CD and
@@ -67,7 +67,7 @@ plugin_repo=scarab.local/scarab-plugin-argocd
 mkdir -p "$here/.state"
 plugin_values="$here/.state/e2e-plugin-values.json"
 cat > "$plugin_values" <<EOF
-{"plugins": {"enabled": true, "argocdRepo": "$plugin_repo"},
+{"plugins": {"enabled": true},
  "scarab": {"extraEnv": {"SCARAB_DEV_PLUGIN_ALLOW_TAG": "1"}}}
 EOF
 # Only this recipe asks up.sh for the public Forgejo tunnel.
@@ -137,6 +137,10 @@ export SCARAB_TEST_FORGEJO_URL="http://127.0.0.1:$forgejo_port"
 export SCARAB_TEST_FORGEJO_CALLBACK_HOST="$pod_host"
 SCARAB_TEST_CLONE_HASH="$(cat "$kind_dir/.state/e2e-clone-hash")"
 export SCARAB_TEST_CLONE_HASH
+# Where the forge_token cases install the clone library from: libs/clone.yaml
+# on github.com at a pushed commit (up.sh checked it).
+SCARAB_TEST_CLONE_SOURCE="$(cat "$kind_dir/.state/e2e-clone-source")"
+export SCARAB_TEST_CLONE_SOURCE
 
 export SCARAB_E2E=1
 export SCARAB_E2E_URL="$base"

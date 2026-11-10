@@ -3,14 +3,13 @@
 #
 #   scripts/pin_clone_image.sh <tag>        # e.g. 0.3.0, sha-<commit>, edge
 #
-# The first-party clone library pins its image by digest, and a release
-# cannot pin the image it builds itself: the digest exists only after the
-# build, and the manifest hashes libs/clone.yaml as committed. So a change to
-# docker/clone is published by image.yml first (on main as `sha-<commit>`, or
-# by a release), then this script writes that build's multi-arch digest into
-# libs/clone.yaml, and the release after that ships it. Commit the result, and
-# add its hash to libs/security-fixes.txt when the image fixes a security
-# problem.
+# Scarab's clone library pins its image by digest, and a release cannot pin
+# the image it builds itself: the digest exists only after the build, and an
+# org admin installs libs/clone.yaml as committed at the release. So a change
+# to docker/clone is published by image.yml first (on main as `sha-<commit>`,
+# or by a release), then this script writes that build's multi-arch digest
+# into libs/clone.yaml, and the release after that ships it. Commit the
+# result.
 set -euo pipefail
 tag="${1:?usage: scripts/pin_clone_image.sh <tag>}"
 repo="ghcr.io/thulasi-ram/scarab-clone"

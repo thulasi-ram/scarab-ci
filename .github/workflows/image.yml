@@ -1,4 +1,4 @@
-# Build (and publish) Scarab's first-party container images, multi-arch:
+# Build (and publish) Scarab's container images, multi-arch:
 #   - scarab-server           (the converged API/worker binary, docker/server/Dockerfile)
 #   - scarab-clone            (the canonical clone step image, ADR-0045)
 #   - scarab-results-sidecar  (the trusted results-egress sidecar, ADR-0042)

@@ -113,18 +113,26 @@ if [ "$mode" = dogfood ]; then
 elif [ "$mode" = e2e ]; then
   database=scarab_e2e
   bucket=scarab-e2e
-  # The forge_token cases bind an org whose first-party clone library the
-  # server installs from the release manifest (ADR-0076 §5). The server fetches
-  # libs/clone.yaml from github.com at the manifest's commit, so libs/ must be
-  # committed and pushed. In CI the checked-out commit is the pushed one.
+  # The forge_token cases install the clone library into their org, and the
+  # Argo CD pass installs the Argo CD plugin, as an org admin does: the server
+  # fetches libs/clone.yaml and the plugin's manifest from github.com at the
+  # commit that last changed each, so both must be committed and pushed. In CI
+  # the checked-out commit is the pushed one.
   need git
-  libs_commit="$(git -C "$root" log -1 --format=%H -- libs/)"
-  git -C "$root" diff --quiet "$libs_commit" -- libs/ \
-    || die "libs/ has uncommitted changes: the server fetches libs/clone.yaml from github.com at $libs_commit"
-  if [ "${GITHUB_ACTIONS:-}" != true ] \
-     && [ -z "$(git -C "$root" branch -r --contains "$libs_commit" 2>/dev/null)" ]; then
-    die "libs/ at $libs_commit is not pushed: the server fetches libs/clone.yaml from github.com at that commit"
-  fi
+  for f in libs/clone.yaml crates/scarab-plugin-argocd/manifest.json; do
+    c="$(git -C "$root" log -1 --format=%H -- "$f")"
+    [ -n "$c" ] || die "$f is not committed: the server fetches it from github.com"
+    git -C "$root" diff --quiet "$c" -- "$f" \
+      || die "$f has uncommitted changes: the server fetches it from github.com at $c"
+    if [ "${GITHUB_ACTIONS:-}" != true ] \
+       && [ -z "$(git -C "$root" branch -r --contains "$c" 2>/dev/null)" ]; then
+      die "$f at $c is not pushed: the server fetches it from github.com at that commit"
+    fi
+    case "$f" in
+      libs/*) libs_commit="$c" ;;
+      *) argocd_manifest_commit="$c" ;;
+    esac
+  done
 elif [ "$mode" = chaos ]; then
   database=scarab_chaos
   bucket=scarab-chaos
@@ -515,14 +523,13 @@ if [ "$switching" = 1 ]; then
 fi
 
 values="$(mktemp "$state/values.XXXXXX")"
-libs_dir="$(mktemp -d "$state/libs.XXXXXX")"
 # tunnel_unchecked: dogfood's cloudflared was applied and the outside check
 # below has not passed yet. Any exit in that window (a rollout timeout, a
 # failed command, Ctrl-C) scales it to 0, so the release is never left
 # public on a route nobody checked.
 tunnel_unchecked=0
 on_exit() {
-  rm -rf "$values" "$libs_dir" "${secret_file:-}" "${token_file:-}"
+  rm -rf "$values" "${secret_file:-}" "${token_file:-}"
   if [ "$tunnel_unchecked" = 1 ]; then
     echo "==> stopped before the tunnel check passed: scaling cloudflared to 0" >&2
     ( kc scale deploy scarab-cloudflared -n "$ns" --replicas=0 >/dev/null 2>&1 ) || true
@@ -533,32 +540,16 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 chmod 600 "$values"
 
-# The clone library (ADR-0076 §9): checkouts run `lib:thulasi-ram/clone` with
-# the image it pins, so the release gets a manifest listing a copy of
-# libs/clone.yaml that pins the scarab-clone:dev image built above.
-# `just stack up dogfood` installs that copy into the org after the roll-out.
-python3 -I - "$root/libs/clone.yaml" scarab-clone:dev > "$libs_dir/clone.yaml" <<'PY'
-import re, sys
-text = open(sys.argv[1]).read()
-new, n = re.subn(r"(?m)^(\s*image:\s*)ghcr\.io/thulasi-ram/scarab-clone\S*$", r"\g<1>" + sys.argv[2], text)
-if n != 1:
-    sys.exit("libs/clone.yaml: expected one scarab-clone image line")
-sys.stdout.write(new)
-PY
-python3 -I "$root/scripts/libs_manifest.py" --libs "$libs_dir" \
-  --repository github.com/thulasi-ram/scarab-ci \
-  --commit "$(git -C "$root" rev-parse HEAD)" --release v0.0.0-kind > "$libs_dir/manifest.json"
 if [ "$mode" = e2e ]; then
-  # e2e: the real libs/ (every library, the published clone image), at the
-  # pushed commit checked above; the forge_token cases compare the installed
-  # clone library's hash with SCARAB_TEST_CLONE_HASH.
-  python3 -I "$root/scripts/libs_manifest.py" --libs "$root/libs" \
-    --repository github.com/thulasi-ram/scarab-ci --commit "$libs_commit" \
-    --release v0.0.0-kind-e2e > "$libs_dir/manifest.json"
-  clone_hash="$(python3 -I -c 'import json,sys
-m=json.load(open(sys.argv[1]))
-print(next(l["versions"][-1]["content_hash"] for l in m["libraries"] if l["name"]=="clone"))' "$libs_dir/manifest.json")"
-  printf '%s\n' "$clone_hash" > "$state/e2e-clone-hash"
+  # The sources the e2e cases install from (checked as pushed above), and the
+  # clone library's content hash, which the forge_token cases compare with
+  # the installed version (SHA-256 of the file, as Scarab hashes a library).
+  printf '%s\n' "github.com/thulasi-ram/scarab-ci//libs/clone.yaml@$libs_commit" \
+    > "$state/e2e-clone-source"
+  shasum -a 256 "$root/libs/clone.yaml" | awk '{print $1}' > "$state/e2e-clone-hash"
+  printf '%s\n' \
+    "github.com/thulasi-ram/scarab-ci//crates/scarab-plugin-argocd/manifest.json@$argocd_manifest_commit" \
+    > "$state/e2e-argocd-manifest-source"
 fi
 
 # Roll the Pods when the binary or the staged UI changes, and only then: helm
@@ -586,14 +577,13 @@ V_APP_ID="$app_id" V_PUBLIC_URL="https://${dogfood_host:-}" V_TIMEOUT="${timeout
 V_UI_URL="$ui_url" V_OAUTH_CLIENT_ID="$oauth_client_id" V_OWNER="${dogfood_owner:-}" \
 V_DATABASE_URL="$database_url" V_MASTER_KEY="$master_key" V_RESULTS="$results_secret" \
 V_WORKSPACE="$workspace_secret" V_WEBHOOK="$webhook_secret" V_FORGEJO_WEBHOOK="$forgejo_webhook_secret" \
-python3 -I - "$libs_dir/manifest.json" > "$values" <<'PY2'
+python3 -I - > "$values" <<'PY2'
 import json, os, sys
 e = os.environ
 v = {
     "podAnnotations": {"scarab.dev/binary-sha256": e["V_SUM"]},
     "scarab": {
         "s3": {"bucket": e["V_BUCKET"], "endpoint": e["V_S3_ENDPOINT"]},
-        "libsManifest": open(sys.argv[1]).read(),
         "devInsecure": e["V_DEV_INSECURE"] == "true",
     },
     "secrets": {
@@ -617,13 +607,6 @@ if e["V_MODE"] == "chaos":
     v["replicaCount"] = 2
     v["workspace"] = {"replicaCount": 2}
     v["plugins"] = {"enabled": False}
-    # First-party libraries off: the Cache probe binds a repo, and the first
-    # bind into an org installs the org's default libraries, which reads
-    # libs/clone.yaml from github.com. The fault tier makes no network calls
-    # and none of its pipelines use a library. An empty manifest alone would
-    # not do it: the server then reads its release's manifest from GitHub.
-    v["scarab"]["libsManifest"] = ""
-    v["scarab"]["extraEnv"] = {"SCARAB_LIBS_MANIFEST": "off"}
     # ADR-0077 rank 4 SIGSTOPs the scheduler leader for a little over the
     # 30 s lease TTL. At the chart's 3 failures x 15 s the kubelet restarts
     # the stopped server in that window and the scenario is INCONCLUSIVE;
@@ -668,8 +651,6 @@ if [ "$mode" = dogfood ]; then
   kc create secret generic scarab-cloudflared -n "$ns" \
     --from-file="token=$token_file" --dry-run=client -o yaml | kc apply -f - >/dev/null
   rm -f "$token_file"
-  # The clone library copy, for the fresh-database checklist (seed.sh).
-  cp "$libs_dir/clone.yaml" "$state/dogfood-clone.yaml"
 else
   # A dev stack has no tunnel; remove one a dogfood run left.
   kc delete deploy scarab-cloudflared -n "$ns" --ignore-not-found >/dev/null
@@ -770,8 +751,9 @@ if [ "$mode" = dogfood ]; then
   # The Owner and member role bindings (`scarab-server admin grant
   # --if-absent` in the server Pod). On a fresh database also the one-time
   # steps that need a passkey: the `production` Environment and the clone
-  # library copy that pins scarab-clone:dev. On an existing one, the step that
-  # reinstalls the clone library when the installed copy differs. Without
+  # library, installed from its source like any library. On an existing one,
+  # the step that installs it when the installed version is not
+  # libs/clone.yaml. Without
   # login up.sh did those with plain curl.
   if [ "$fresh_database" = 1 ]; then
     bash "$here/seed.sh" --checklist

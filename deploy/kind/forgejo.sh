@@ -248,7 +248,8 @@ ensure_repo chaos-cache true
 total=$((total + 1))
 if [ -n "$tunnel_url" ]; then
   # The forge_token cases (crates/scarab-e2e/tests/forgejo_tunnel.rs). `ci`
-  # clones the private repo through the first-party clone library and reads a
+  # clones the private repo through the clone library (the case installs it
+  # and trusts its source) and reads a
   # file; `own` asks for forge_token in its own Step (refused on a connection
   # with a long-lived token); `sub` clones with submodules, and its one
   # submodule is ANOTHER private repo (no credential).

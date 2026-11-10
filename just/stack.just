@@ -90,7 +90,7 @@ up mode="dev" ref="":
 # a first sign-in creates). It grants only to someone with no role binding in
 # the org (`--if-absent`; a revoked one counts), so a role the Owner changed
 # or removed in the UI stays. It also says when the installed clone library
-# is not the one up.sh wrote. `checklist` prints the one-time steps of a
+# is not libs/clone.yaml. `checklist` prints the one-time steps of a
 # fresh database that need a passkey instead. See deploy/kind/seed.sh.
 [doc('Grant the dogfood Owner and member their roles; `checklist` adds the fresh-database steps')]
 seed mode="dogfood" what="":

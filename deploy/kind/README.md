@@ -191,17 +191,20 @@ this machine only.
 On a fresh database, `up.sh` also prints a checklist of the steps that now need
 a passkey, which it used to do with plain curl (`just stack seed dogfood
 checklist` prints it again). On an existing database it compares the clone
-library installed in the org with `deploy/kind/.state/dogfood-clone.yaml`
-(read with `psql` in the Postgres Pod) and prints step 3 when they differ:
+library installed in the org with `libs/clone.yaml` in the checkout (read with
+`psql` in the Postgres Pod) and prints step 3 when they differ:
 
 1. Sign in at `http://localhost:<port>` as the Owner and enroll a passkey in
    Settings > Security. Every new database needs a new one.
 2. Org settings > Environments: create `production` and make it eligible for
    all projects; the dogfood pipeline deploys to it.
-3. Org settings > Libraries: the clone library must pin `scarab-clone:dev`.
-   When it is missing, choose **Paste the files** and paste
-   `deploy/kind/.state/dogfood-clone.yaml`. When it pins another image,
-   uninstall it first.
+3. Org settings > Libraries > Install: fetch
+   `github.com/thulasi-ram/scarab-ci//libs/clone.yaml@<commit>` (the commit
+   seed.sh prints: the last pushed commit that changed the file), review it and
+   install it as `thulasi-ram/clone`. It runs the published `scarab-clone`
+   image the file pins. Nothing is installed in a new org without this step.
+   GitHub App mode mints the forge token per Run, so the source needs no
+   trust.
 4. To call the API, issue a token in Org settings > API tokens.
 
 To check that the member is refused an admin action, sign in as the member and

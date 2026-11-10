@@ -21,8 +21,8 @@
 # passkey (the `production` Environment and the clone library). Without login
 # up.sh did them with plain curl; with login they are crown-jewel operations.
 # Without --checklist, the clone library installed in the org is compared
-# with the copy up.sh wrote (read-only, with psql in the Postgres Pod), and
-# the step that reinstalls it is printed when they differ.
+# with libs/clone.yaml in this checkout (read-only, with psql in the Postgres
+# Pod), and the step that installs it is printed when they differ.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -63,12 +63,17 @@ for p in $pending; do
   echo "    sign in as $p at $ui_url, then run \`just stack seed dogfood\`"
 done
 
+# Scarab's clone library, installed like any library from its source on
+# github.com at the last commit that changed it. The dogfood stack is in
+# GitHub App mode, so its token is minted per Run and the source needs no
+# trust. The commit must be pushed: the server reads the file from GitHub.
+clone_commit="$(git -C "$here/../.." log -1 --format=%H -- libs/clone.yaml 2>/dev/null || true)"
 library_step() { # $1 the step's number
   cat <<TXT
-    $1. Org settings > Libraries: the clone library should pin scarab-clone:dev.
-       If it is missing, choose "Paste the files" and paste
-       deploy/kind/.state/dogfood-clone.yaml. If it pins another image,
-       uninstall it first.
+    $1. Org settings > Libraries > Install: fetch
+       github.com/thulasi-ram/scarab-ci//libs/clone.yaml@${clone_commit:-<commit>}
+       review it and install it as thulasi-ram/clone. If another version is
+       installed, this upgrades it.
 TXT
 }
 
@@ -84,11 +89,11 @@ if [ "${1:-}" = --checklist ]; then
 TXT
   library_step 3
   echo "    4. To use the API, issue a token in Org settings > API tokens."
-elif [ -f "$state/dogfood-clone.yaml" ]; then
-  # The installed copy's content hash (SHA-256 of the file, ADR-0076), read
-  # with psql in the Postgres Pod. The org goes in as a psql variable, never
-  # spliced into the SQL.
-  want="$(shasum -a 256 "$state/dogfood-clone.yaml" | awk '{print $1}')"
+else
+  # The installed version's content hash (SHA-256 of the file, ADR-0076),
+  # read with psql in the Postgres Pod, against libs/clone.yaml here. The org
+  # goes in as a psql variable, never spliced into the SQL.
+  want="$(shasum -a 256 "$here/../../libs/clone.yaml" | awk '{print $1}')"
   if have="$(printf '%s\n' "SELECT content_hash FROM library_installations
       WHERE org = :'org' AND publisher = 'thulasi-ram' AND name = 'clone';" \
     | kc exec -i -n "$ns" deploy/scarab-postgres -- \
@@ -97,7 +102,7 @@ elif [ -f "$state/dogfood-clone.yaml" ]; then
       if [ -z "$have" ]; then
         echo "==> the clone library is not installed in $org (needs a passkey confirmation)"
       else
-        echo "==> the clone library installed in $org is not deploy/kind/.state/dogfood-clone.yaml (needs a passkey confirmation)"
+        echo "==> the clone library installed in $org is not libs/clone.yaml at ${clone_commit:-HEAD} (needs a passkey confirmation)"
       fi
       library_step 1
     fi
