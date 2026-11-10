@@ -34,7 +34,7 @@
   --t-title: 600 20px/1.3 var(--font-ui);
   --t-label: 600 13px/1.5 var(--font-ui);
   --t-body: 400 13px/1.5 var(--font-ui);
-  --t-mono: 400 12px/1.5 var(--font-mono);
+  --t-mono: 500 12px/1.5 var(--font-mono);
   /* ── Surfaces (cool light ladder — clean, never warm/beige) ──────────── */
   --carapace-black: #f1f4f3; /* page + top-bar base (cool near-white, faint green) */
   --pine-deep: #e7ecea;      /* secondary chrome: table head, inputs, steps, panel headers */
@@ -636,6 +636,21 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
   color: var(--muted-sage);
 }
 
+/* A table inside a panel: the panel header is the one shaded band. The table
+   draws no frame of its own; its column heads are Label in the secondary ink
+   over one hairline; its scroll box reaches the panel's edges, and its first
+   and last columns sit at the panel header's 14px inset. */
+.panel .table { border: none; border-radius: 0; background: none; }
+.panel .table thead th {
+  background: none;
+  color: var(--sage);
+  border-bottom: 1px solid var(--border-soft);
+}
+.panel .table th:first-child, .panel .table td:first-child { padding-left: 14px; }
+.panel .table th:last-child, .panel .table td:last-child { padding-right: 14px; }
+.panel .secrets-body > :is(.table-scroll, .tok-table-scroll) { margin: 0 -14px; }
+.panel .plg-body > .plg-journal-wrap { margin: 0 -14px; }
+
 /* ---- Status badges ---------------------------------------------------- */
 
 .badge {
@@ -769,6 +784,7 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 /* Action buttons sit one level below the breadcrumb, not inline with it. */
 .run-toolbar {
   display: flex;
+  flex-wrap: wrap;
   justify-content: flex-end;
   gap: 8px;
   margin-bottom: 20px;
@@ -875,7 +891,7 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 .rc-group { margin: 0 0 8px; }
 .rc-group-title {
   margin: 0 0 4px; font: var(--t-label);
-  color: var(--muted-sage);
+  color: var(--soft-white);
 }
 .rc-row {
   display: flex; align-items: baseline; gap: 10px;
@@ -1070,7 +1086,7 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
   background: var(--pine-deep);
   border-bottom: 1px solid var(--border);
   font: var(--t-label);
-  color: var(--muted-sage);
+  color: var(--soft-white);
 }
 
 .prov {
@@ -1795,10 +1811,12 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
   font: var(--t-body); color: var(--sage);
 }
 .envt > thead > tr > th {
-  text-align: left; font: var(--t-label); color: var(--muted-sage);
-  padding: 10px 16px; background: var(--pine-deep); border-bottom: 1px solid var(--border);
+  text-align: left; font: var(--t-label); color: var(--sage);
+  padding: 10px 16px; border-bottom: 1px solid var(--border-soft);
   white-space: nowrap;
 }
+.envt > thead > tr > th:first-child, .envt > tbody > tr > td:first-child { padding-left: 14px; }
+.envt > thead > tr > th:last-child, .envt > tbody > tr > td:last-child { padding-right: 14px; }
 .envt > tbody > tr > td {
   padding: 11px 16px; border-bottom: 1px solid var(--border-soft);
   vertical-align: middle; white-space: nowrap;
@@ -1841,7 +1859,7 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 .envt-actions .envt-btn { font: var(--t-body); padding: 5px 12px; }
 
 /* ---- settings / secrets bodies ---- */
-.settings-body, .secrets-body { padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+.settings-body, .secrets-body { padding: 16px 14px; display: flex; flex-direction: column; gap: 12px; }
 .set-row { display: flex; justify-content: space-between; font: var(--t-body); color: var(--sage); }
 .set-row .k { color: var(--muted-sage); }
 .secrets-add { margin-top: 4px; }
@@ -1981,7 +1999,7 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 .dash-label {
   display: flex; align-items: center; gap: 7px;
   font: var(--t-label);
-  color: var(--muted-sage); margin: 30px 0 11px;
+  color: var(--soft-white); margin: 30px 0 11px;
 }
 .dash-label:first-of-type { margin-top: 8px; }
 .dash-label .count { color: var(--sage); }
@@ -2015,6 +2033,12 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 .inbox-msg .repo { color: var(--sage); }
 .inbox-detail { font: var(--t-mono); color: var(--muted-sage); }
 .inbox-age { font: var(--t-mono); color: var(--muted-sage); }
+/* A phone: what the row is about takes the first line at full width; the
+   verb, the age and the action share the second. */
+@media (max-width: 560px) {
+  .inbox-row { grid-template-columns: auto 1fr auto; gap: 8px 12px; }
+  .inbox-what { grid-column: 1 / -1; grid-row: 1; }
+}
 
 /* ---- all-clear (calm state) ---- */
 .allclear {
@@ -2286,6 +2310,14 @@ h1, .crumb-head, .run-title {
 .topbar-link:hover {
   color: var(--soft-white);
   background: color-mix(in srgb, var(--emerald) 8%, transparent);
+}
+/* A phone: the bar keeps every link and fits the window. Tighter gaps, and
+   the search chip shows its icon only (no keyboard, no ⌘K). */
+@media (max-width: 560px) {
+  .topbar { gap: 8px; padding: 4px 16px; }
+  .topbar-link { padding: 5px 6px; }
+  .search-chip { padding: 5px 8px; }
+  .search-chip-label, .search-chip .kbd { display: none; }
 }
 
 /* Search chip: show a label + a keycap, and open the palette on click. */
@@ -2835,11 +2867,11 @@ h1, .crumb-head, .run-title {
   transform-origin: 0 0; will-change: transform;
 }
 
-/* Section header for the Artifacts footer: Label, like .panel-h, in a
-   lighter ink one level down. */
+/* Section header for the Artifacts footer: Label in the primary ink, like
+   .panel-h. */
 .artifacts-foot .af-h {
   font: var(--t-label);
-  color: var(--sage);
+  color: var(--soft-white);
 }
 
 /* Services panel: a compact evidence section beneath the DAG in the
@@ -3348,10 +3380,8 @@ h1, .crumb-head, .run-title {
    full picture, managed under Members, so it recedes and has no actions. */
 .access-table tr.access-group th {
   text-align: left; font: var(--t-label); color: var(--sage);
-  padding: 10px 16px 8px;
-  background: var(--pine-deep);
-  border-top: 1px solid var(--border);
-  border-bottom: 1px solid var(--border-soft);
+  padding: 14px 14px 8px;
+  border-top: 1px solid var(--border-soft);
 }
 .access-table tr.access-group:hover { background: none; }
 .access-table tr.access-via-org td { opacity: 0.6; }
@@ -3382,7 +3412,7 @@ h1, .crumb-head, .run-title {
 .oenv-name { color: var(--muted-sage); }
 /* A duplicate's result: what was copied, then the checklist of what was not. */
 .dup-result { display: flex; flex-direction: column; gap: 8px; }
-.dup-h { margin: 4px 0 0; font: var(--t-label); color: var(--muted-sage); }
+.dup-h { margin: 4px 0 0; font: var(--t-label); color: var(--soft-white); }
 .dup-list { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 6px; font: var(--t-body); }
 .dup-items { margin-top: 2px; color: var(--sage); overflow-wrap: anywhere; }
 .oenv-rows { display: grid; gap: 6px; }
@@ -3413,6 +3443,8 @@ h1, .crumb-head, .run-title {
 .plg-body .empty, .plg-body .error, .plg-body .notice-ok, .plg-body .subtle { margin: 0; }
 .plg-body .plg-conn-row + .plg-conn-row { padding-top: 10px; border-top: 1px solid var(--border-soft); }
 .plg-conn-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+/* A long destination or credential note wraps inside the row on a phone. */
+.plg-conn-row > * { min-width: 0; overflow-wrap: anywhere; }
 .plg-slot { color: var(--soft-white); }
 .plg-caps { display: flex; gap: 6px; flex-wrap: wrap; }
 .plg-review { display: grid; gap: 8px; }
@@ -3530,7 +3562,7 @@ h1, .crumb-head, .run-title {
 
 .sec-sub {
   font: var(--t-label);
-  color: var(--muted-sage); margin: 18px 0 8px;
+  color: var(--soft-white); margin: 18px 0 8px;
 }
 .sec-table td { vertical-align: top; }
 .sec-table td:first-child, .sec-table td:nth-child(3) { white-space: nowrap; }
@@ -3539,8 +3571,10 @@ h1, .crumb-head, .run-title {
 .sec-warn { color: var(--warn); }
 .sec-ok { color: var(--ok); }
 .sec-plain { color: var(--sage); }
-.sec-add, .sec-filter { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-.sec-add .input, .sec-add .f-ctl { flex: 1 1 220px; max-width: 340px; }
+.sec-filter { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+/* Security › passkeys: the name the next passkey gets; Add passkey is in the
+   panel header. */
+.sec-name { max-width: 420px; margin-top: 4px; }
 .sec-filter .input { max-width: 280px; }
 .evlog-filter .f { flex: 0 1 200px; }
 .lib-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
@@ -3655,7 +3689,7 @@ h1, .crumb-head, .run-title {
 .chip-motion { color: var(--copper); }
 .chip-danger { color: var(--danger); }
 .chip-muted { color: var(--muted-sage); }
-.lib-sub-h { margin: 6px 0 0; font: var(--t-label); color: var(--muted-sage); }
+.lib-sub-h { margin: 6px 0 0; font: var(--t-label); color: var(--soft-white); }
 .lib-facts { display: grid; grid-template-columns: max-content 1fr; gap: 6px 12px; padding: 12px 14px; margin: 0; }
 .lib-facts dt { font: var(--t-label); color: var(--muted-sage); padding-top: 2px; }
 .lib-facts dd { margin: 0; color: var(--soft-white); word-break: break-word; }
@@ -3714,14 +3748,14 @@ h1, .crumb-head, .run-title {
 .chain .kind { font: var(--t-label); color: var(--muted-sage); border: 1px dotted currentColor; border-radius: 3px; padding: 0 5px; }
 .inputs-tbl td:first-child { white-space: nowrap; }
 .split2 { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; }
-.pane-sub { font: var(--t-label); color: var(--muted-sage); margin: 0 0 10px; }
+.pane-sub { font: var(--t-label); color: var(--soft-white); margin: 0 0 10px; }
 .rendered { margin: 0; background: var(--terminal); color: var(--terminal-ink); border: 1px solid var(--terminal-line); border-radius: var(--radius-sm); padding: 10px 12px; font: var(--t-mono); white-space: pre-wrap; word-break: break-all; }
 .rendered .from { color: var(--terminal-dim); }
 
 /* --- plugin gate pane --- */
 .gp { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
 .gp-card { border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 14px; display: grid; gap: 8px; align-content: start; }
-.gp-card h4 { margin: 0; font: var(--t-label); color: var(--muted-sage); }
+.gp-card h4 { margin: 0; font: var(--t-label); color: var(--soft-white); }
 .gp-big { font: var(--t-title); color: var(--soft-white); }
 /* A name (who releases the gate), not a state: Label under the card heading. */
 .gp-big.gp-name { font: var(--t-label); }
@@ -3855,11 +3889,11 @@ code.c { font: var(--t-mono); color: var(--copper); }
 .settings { display: grid; grid-template-columns: 200px minmax(0, 1fr); gap: 40px; }
 .settings-nav { position: sticky; top: 16px; align-self: start; display: flex; flex-direction: column; gap: 14px; padding-top: 6px; }
 .settings-nav-group { display: flex; flex-direction: column; gap: 1px; }
-.settings-nav-h { margin-bottom: 4px; padding-left: 10px; font: var(--t-label); color: var(--muted-sage); }
+.settings-nav-h { margin-bottom: 4px; padding-left: 10px; font: var(--t-label); color: var(--soft-white); }
 .settings-nav-orgpick { margin: 0 0 12px; width: 100%; }
-.settings-nav-link { display: block; padding: 6px 10px; border-radius: var(--radius-sm); border-left: 2px solid transparent; color: var(--sage); font: var(--t-body); text-decoration: none; }
+.settings-nav-link { display: block; padding: 6px 10px; border-radius: var(--radius-sm); color: var(--sage); font: var(--t-body); text-decoration: none; }
 .settings-nav-link:hover { color: var(--soft-white); background: var(--pine-deep); }
-.settings-nav-link.on { color: var(--emerald); font: var(--t-label); background: var(--pine-deep); border-left-color: var(--emerald); }
+.settings-nav-link.on { color: var(--emerald); font: var(--t-label); background: var(--pine-deep); }
 .settings-select { display: none; }
 /* A page under a section (one Environment, a library review): its heading is
    the trail from the section, at page-title size, not the section's h1. */

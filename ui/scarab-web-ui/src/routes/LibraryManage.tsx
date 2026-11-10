@@ -1,5 +1,7 @@
-// One installed library's page, `/orgs/<org>/settings/libraries/<publisher>~<name>/manage`,
-// inside the settings frame with Libraries marked in the sidebar.
+// One installed library's page, `/orgs/<org>/settings/libraries/<id>/manage`,
+// inside the settings frame with Libraries marked in the sidebar. The id is
+// the installation's; an upgrade keeps it. An old `<publisher>~<name>` URL is
+// sent on to the installation's id URL when that library is installed.
 //
 // It holds everything done to the installation: its version and source,
 // Upgrade (the install dialog with the source filled in, then the review
@@ -11,8 +13,9 @@
 // The server keeps one version per installation and no history of earlier
 // ones, so the page shows the installed version only.
 import { createMemo, createResource, createSignal, For, Show, type JSX } from "solid-js";
-import { A, useNavigate, useParams } from "@solidjs/router";
+import { A, Navigate, useNavigate, useParams } from "@solidjs/router";
 import {
+  getLibraryInstallation,
   listLibraries,
   removeLibrary,
   trustLibrarySource,
@@ -27,6 +30,7 @@ import {
   impactRunLabel,
   libraryChips,
   libraryId,
+  libraryManageHref,
   parseLibraryKey,
   shortHash,
   trustKey,
@@ -61,20 +65,69 @@ export default function LibraryManage() {
 }
 
 function Manage(props: { org: string; id: string }) {
+  // A URL from before installations had ids names `<publisher>~<name>`.
+  const legacy = parseLibraryKey(props.id);
+  return (
+    <Show when={legacy} fallback={<ById org={props.org} id={props.id} />}>
+      {(l) => <Legacy org={props.org} segment={props.id} publisher={l().publisher} name={l().name} />}
+    </Show>
+  );
+}
+
+/** An old `<publisher>~<name>` URL: on to the installation's id URL. */
+function Legacy(props: { org: string; segment: string; publisher: string; name: string }) {
+  const back = () => orgHref(props.org, "libraries");
+  const [libs] = createResource(() => listLibraries(props.org));
+  const found = () =>
+    libs.error ? undefined : libs()?.installations.find((l) => l.publisher === props.publisher && l.name === props.name);
+  return (
+    <>
+      <SettingsCrumbs
+        trail={[{ label: "Libraries", href: back() }, { label: libraryId(props), mono: true }]}
+        sub={
+          <>
+            <span class="mono">{props.org}</span> · manage a library
+          </>
+        }
+      />
+      <Show when={!libs.error} fallback={<p class="error">Could not load the org's libraries.</p>}>
+        <Show when={!libs.loading} fallback={<p class="empty">loading…</p>}>
+          <Show
+            when={found()}
+            fallback={
+              <p class="empty">
+                There is no library <b class="mono">{libraryId(props)}</b> installed in {props.org}.{" "}
+                <A href={back()}>All libraries</A>
+              </p>
+            }
+          >
+            {(l) => <Navigate href={libraryManageHref(props.org, l())} />}
+          </Show>
+        </Show>
+      </Show>
+    </>
+  );
+}
+
+function ById(props: { org: string; id: string }) {
   const nav = useNavigate();
   const back = () => orgHref(props.org, "libraries");
-  const wanted = parseLibraryKey(props.id);
-  const [libs, { refetch }] = createResource(() => listLibraries(props.org));
-  const lib = () =>
-    wanted && !libs.error ? libs()?.installations.find((l) => l.publisher === wanted.publisher && l.name === wanted.name) : undefined;
-  const title = () => (wanted ? libraryId(wanted) : props.id);
+  const [installed, { refetch: refetchOne }] = createResource(() => getLibraryInstallation(props.org, props.id));
+  // The org's trusted sources and yanks, for the tags and the trust panel.
+  const [libs, { refetch: refetchAll }] = createResource(() => listLibraries(props.org));
+  const lib = () => (installed.error ? undefined : (installed() ?? undefined));
+  const title = () => {
+    const l = lib();
+    return l ? libraryId(l) : props.id;
+  };
 
   const [notice, setNotice] = createSignal<string | null>(null);
   const [error, setError] = createSignal<string | null>(null);
   const done = (msg: string) => {
     setError(null);
     setNotice(msg);
-    void refetch();
+    void refetchOne();
+    void refetchAll();
   };
 
   return (
@@ -93,22 +146,25 @@ function Manage(props: { org: string; id: string }) {
       <Show when={error()}>
         <p class="error">{error()}</p>
       </Show>
-      <Show when={!libs.error} fallback={<p class="error">Could not load the org's libraries.</p>}>
-        <Show when={!libs.loading || lib()} fallback={<p class="empty">loading…</p>}>
+      <Show
+        when={!installed.error && !libs.error}
+        fallback={<p class="error">Could not load the org's libraries.</p>}
+      >
+        <Show when={(!installed.loading && !libs.loading) || (lib() && libs())} fallback={<p class="empty">loading…</p>}>
           <Show
-            when={lib()}
+            when={lib() && libs() ? { l: lib()!, all: libs()! } : undefined}
             fallback={
               <p class="empty">
-                There is no library <b class="mono">{title()}</b> installed in {props.org}.{" "}
+                There is no library <b class="mono">{props.id}</b> installed in {props.org}.{" "}
                 <A href={back()}>All libraries</A>
               </p>
             }
           >
-            {(l) => (
+            {(x) => (
               <Installation
                 org={props.org}
-                lib={l()}
-                libs={libs()!}
+                lib={x().l}
+                libs={x().all}
                 onDone={done}
                 onError={setError}
                 onRemoved={() => nav(back())}

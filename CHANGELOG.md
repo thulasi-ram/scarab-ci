@@ -213,12 +213,26 @@ release.yml uses that version's section as the GitHub Release text. See
   killed or probe failed, and **Install library** and **Install plugin** at the top right open
   the install dialog. Upgrading, trusting a source, yanking and removing a library, and killing,
   storage, connections, the broker journal and uninstalling a plugin are on the installation's
-  page (`…/settings/libraries/<publisher>~<name>/manage`, `…/settings/plugins/<id>/manage`).
+  page (`…/settings/libraries/<id>/manage`, `…/settings/plugins/<id>/manage`). Migration 0092
+  gives each library installation an id, kept across upgrades; `GET
+  /v1/orgs/{org}/library-installations/{id}` and `GET /v1/orgs/{org}/plugin-installations/{id}`
+  read one installation by its id. A `…/libraries/<publisher>~<name>/manage` link goes on to the
+  installation's id page.
   The library review page lays its facts and checks out on one grid, with Install in one row
   under the diff.
+- **Headings read as headings, and Mono is heavier.** Panel headers, section headings and the
+  settings sidebar's heading are in the primary ink instead of the muted one. The settings
+  sidebar marks the page you are on with its background and colour only, without the green
+  edge. Mono text is set at weight 500 instead of 400; the four text styles stay four.
+- **A table inside a panel no longer draws a second header band.** Members, a repository's
+  Access and Environments, Connections, API tokens, Libraries, Plugins, the security event
+  tables and a plugin's broker journal show their column heads as a plain label row over one
+  hairline, under the panel header, with their columns at the header's inset. Access's
+  "Through their org role" row is a plain label row with a hairline above it.
 - **Environments, Policies and Members follow the same list-and-page layout.** Each list has its
   add action at the right of its header (**New environment**, **Paste YAML** and **New policy**,
-  **Grant role**) and a **Manage** link per row. An Environment's read-only page and edit screen
+  **Grant role**) and a **Manage** link per row. Account settings › Security has **Add passkey**
+  at the right of the passkeys panel's header, and the new passkey's name as a field below. An Environment's read-only page and edit screen
   are one page, `…/settings/environments/<name>/manage`, with the details as one form; the old
   addresses redirect there. A Policy's page gains a **Decisions** tab with the decisions it
   matched; the Policies section drops its org-wide recent decisions and its read-only typed
@@ -249,6 +263,10 @@ release.yml uses that version's section as the GitHub Release text. See
 - A repository page no longer repeats the Environments tab's and the Secrets tab's actions
   in its header, and the Environments tab no longer lists approval history; each
   Environment links to its Runs.
+- On a phone no page scrolls sideways. The top bar keeps Search, Docs, API and the user menu
+  in the window (Search shows its icon only); a run's actions wrap onto more lines; the
+  dashboard's waiting rows put what they are about on a line of their own; and the Libraries,
+  Plugins, Connections and security event tables scroll inside their own box.
 
 ## [0.3.0] - 2026-11-09
 

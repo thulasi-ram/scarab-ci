@@ -412,6 +412,12 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
     ("GET", "/v1/orgs/{org}/libraries", "read", "READ"),
     (
         "GET",
+        "/v1/orgs/{org}/library-installations/{id}",
+        "read",
+        "READ",
+    ),
+    (
+        "GET",
         "/v1/orgs/{org}/library-yanks/{hash}/impact",
         "read",
         "READ",
@@ -461,6 +467,12 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
     ("GET", "/v1/orgs/{org}/gates", "read", "READ"),
     ("POST", "/v1/orgs/{org}/plugins", "plugin.install", "CJ-A"),
     ("GET", "/v1/orgs/{org}/plugins/{name}", "read", "READ"),
+    (
+        "GET",
+        "/v1/orgs/{org}/plugin-installations/{id}",
+        "read",
+        "READ",
+    ),
     (
         "DELETE",
         "/v1/orgs/{org}/plugins/{name}",

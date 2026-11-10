@@ -70,7 +70,8 @@ repositories your org owns. See [Forge connections](/scarab-ci/get-started/deplo
 ## Upgrade
 
 Each installed library has its own page, reached from its row under Settings › Libraries
-(`/orgs/<org>/settings/libraries/<publisher>~<name>/manage`). Its **Upgrade** asks for the newer
+(`/orgs/<org>/settings/libraries/<id>/manage`, where the id is the installation's and stays the
+same across upgrades). Its **Upgrade** asks for the newer
 commit of the same file. Scarab shows the diff from the installed version, and **Upgrade** on the
 review page installs it. The upgrade names the version it replaces, so if someone else changed the
 installation after you fetched, it fails and you fetch again to see the current diff.

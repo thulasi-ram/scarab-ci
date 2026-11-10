@@ -708,6 +708,60 @@ async fn an_uninstall_retires_the_name() {
     tdb.cleanup().await;
 }
 
+/// The settings page's URL carries an installation's id: the id reads the
+/// installation back in its own org, an id of another org's installation is
+/// a 404 there, and so is the id of an uninstalled one.
+#[tokio::test]
+async fn an_installation_is_read_by_its_id_in_its_own_org_only() {
+    let Some((tdb, pg)) = migrated().await else {
+        return;
+    };
+    let apps = apps(pg);
+    let acme = install(&apps.public, "acme", "argocd").await;
+    let globex = install(&apps.public, "globex", "argocd").await;
+    let (acme, globex) = (
+        acme.trim_start_matches("tok-").to_string(),
+        globex.trim_start_matches("tok-").to_string(),
+    );
+    let get = |org: &'static str, id: String| {
+        let app = apps.public.clone();
+        async move {
+            call(
+                &app,
+                "GET",
+                &format!("/v1/orgs/{org}/plugin-installations/{id}"),
+                None,
+                None,
+            )
+            .await
+        }
+    };
+
+    let (status, one) = get("acme", acme.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{one}");
+    assert_eq!(one["id"], json!(acme));
+    assert_eq!(one["name"], json!("argocd"));
+    let (status, _) = get("acme", globex.clone()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "another org's id");
+    let (status, _) = get("globex", acme.clone()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "another org's id");
+    let (status, _) = get("acme", "0000000000".into()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "an id that names nothing");
+
+    let (status, _) = call(
+        &apps.public,
+        "DELETE",
+        "/v1/orgs/acme/plugins/argocd",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = get("acme", acme).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "an uninstalled one");
+    tdb.cleanup().await;
+}
+
 /// ADR-0074 §7: an installation's storage claim is set at install, changed,
 /// cleared and read back over the API, on real Postgres. A shape the runtime
 /// could not mount safely is a 400 and stores nothing.
@@ -909,6 +963,18 @@ async fn a_member_cannot_fetch_install_list_or_kill() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "a member kills");
+    let (status, _) = call(
+        &app,
+        "GET",
+        &format!(
+            "/v1/orgs/acme/plugin-installations/{}",
+            installed["id"].as_str().unwrap()
+        ),
+        Some(&mel),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "a member reads one by id");
     tdb.cleanup().await;
 }
 

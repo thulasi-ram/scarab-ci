@@ -79,6 +79,9 @@ pub struct YankImpactDto {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct LibraryInstallationDto {
+    /// 10 lowercase hex, minted at the first install and kept by upgrades.
+    /// What the settings page's URL carries.
+    pub id: String,
     pub publisher: String,
     pub name: String,
     pub content_hash: String,
@@ -297,6 +300,7 @@ fn yank_dto(y: &LibraryYank) -> LibraryYankDto {
 
 fn installation_dto(i: &LibraryInstallation, yanks: &[LibraryYank]) -> LibraryInstallationDto {
     LibraryInstallationDto {
+        id: i.id.clone(),
         publisher: i.publisher.clone(),
         name: i.name.clone(),
         content_hash: i.content_hash.clone(),
@@ -555,6 +559,38 @@ pub(crate) async fn list_libraries(
     Ok(Json(
         crate::people::shown(st.identities.as_deref(), dto).await,
     ))
+}
+
+/// One installation of the org, by its id, with its yank. Read on the org.
+/// An id of another org's installation is not found.
+#[utoipa::path(
+    get,
+    path = "/v1/orgs/{org}/library-installations/{id}",
+    params(
+        ("org" = String, Path, description = "org"),
+        ("id" = String, Path, description = "installation id")
+    ),
+    summary = "One installed library, by id (ADR-0076 §4)",
+    responses(
+        (status = 200, body = LibraryInstallationDto),
+        (status = 403, description = "no read access to the org"),
+        (status = 404, description = "no installation with this id in the org, or libraries not configured")
+    )
+)]
+pub(crate) async fn get_library_installation(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((org, id)): Path<(String, String)>,
+) -> Result<Json<LibraryInstallationDto>, ApiError> {
+    org_caller(&st, &headers, &org, Action::Read).await?;
+    let store = store(&st)?;
+    let installation = store
+        .installation_by_id(&org, &id)
+        .await
+        .map_err(store_api_error)?
+        .ok_or(ApiError::NotFound)?;
+    let yanks = store.yanks(&org).await.map_err(store_api_error)?;
+    Ok(Json(installation_dto(&installation, &yanks)))
 }
 
 fn trusted_dto(t: &TrustedSource) -> TrustedSourceDto {

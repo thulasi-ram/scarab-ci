@@ -319,14 +319,15 @@ export function libraryId(l: { publisher: string; name: string }): string {
   return `lib:${l.publisher}/${l.name}`;
 }
 
-/** The one URL segment that names an installation in its org:
- *  `<publisher>~<name>`. Neither part can hold a `~` (see `segmentError`), so
- *  it splits back into the two. */
+/** What `<publisher>~<name>` named in a manage page's URL before the URL
+ *  carried the installation's id. Neither part can hold a `~` (see
+ *  `segmentError`), so it splits back into the two. */
 export function libraryKey(l: { publisher: string; name: string }): string {
   return `${l.publisher}~${l.name}`;
 }
 
-/** The publisher and name a `libraryKey` segment holds, or `null`. */
+/** The publisher and name an old `<publisher>~<name>` segment holds, or
+ *  `null`. The manage page turns one into the installation's id URL. */
 export function parseLibraryKey(key: string): { publisher: string; name: string } | null {
   const parts = key.split("~");
   if (parts.length !== 2) return null;
@@ -335,9 +336,9 @@ export function parseLibraryKey(key: string): { publisher: string; name: string 
   return { publisher, name };
 }
 
-/** The manage page of one installation in `org`. */
-export function libraryManageHref(org: string, l: { publisher: string; name: string }): string {
-  return `${orgHref(org, "libraries")}/${libraryKey(l)}/manage`;
+/** The manage page of one installation in `org`, by its id. */
+export function libraryManageHref(org: string, l: { id: string }): string {
+  return `${orgHref(org, "libraries")}/${encodeURIComponent(l.id)}/manage`;
 }
 
 /** A small state tag on a row or a heading. */

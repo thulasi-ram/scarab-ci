@@ -1,6 +1,6 @@
 // Library fixtures for mock mode (`just ui mock`): libraries with every
 // state tag (each one's manage page at
-// /orgs/acme/settings/libraries/<publisher>~<name>/manage), a stray yank and a
+// /orgs/acme/settings/libraries/<id>/manage), a stray yank and a
 // stray trusted source on the list, a yank's impact, an upgrade to review, Runs whose Steps come from
 // libraries (one with a yanked version), a plugin gate in each of its four
 // states, a Pipeline that does not compile, and refused triggers in the Runs
@@ -40,7 +40,7 @@ const YANK_REASON =
   "scarab-clone 0.4.0 writes the forge token to the log when a fetch fails; upgrade to b4d0f2a8c6e3 (v0.4.1)";
 
 // ── Settings › Libraries ─────────────────────────────────────────────────
-const installation = (o: Partial<S["LibraryInstallationDto"]> & Pick<S["LibraryInstallationDto"], "publisher" | "name" | "content_hash" | "source">): S["LibraryInstallationDto"] => ({
+const installation = (o: Partial<S["LibraryInstallationDto"]> & Pick<S["LibraryInstallationDto"], "id" | "publisher" | "name" | "content_hash" | "source">): S["LibraryInstallationDto"] => ({
   installed_by: "a.kim",
   installed_at: ago(6 * day),
   yanked: null,
@@ -50,16 +50,18 @@ const installation = (o: Partial<S["LibraryInstallationDto"]> & Pick<S["LibraryI
 const fullLibraries: S["OrgLibrariesDto"] = {
   installations: [
     installation({
+      id: "3e81c0a9f2",
       publisher: "thulasi-ram",
       name: "clone",
       content_hash: CLONE,
       source: CLONE_SRC,
       installed_at: ago(20 * day),
     }),
-    installation({ publisher: "acme", name: "deploy-helm", content_hash: HELM, source: HELM_SRC }),
-    installation({ publisher: "acme", name: "http-probe", content_hash: PROBE, source: "github.com/acme/scarab-libs//http-probe.yaml@8c2f4e1a9d7b3c5e0f6a2b8d4c1e7f9a3b5d2c6e", installed_by: "j.lee" }),
-    installation({ publisher: "acme", name: "git-tag", content_hash: h("6a0d3e9f2b17"), source: "github.com/acme/scarab-libs//git-tag.yaml@51c3b8e0f2a4d6c8e0b2a4c6e8f0a2b4c6d8e0f2", installed_at: ago(3 * day) }),
+    installation({ id: "b72d4f1e06", publisher: "acme", name: "deploy-helm", content_hash: HELM, source: HELM_SRC }),
+    installation({ id: "5c09e3a7d4", publisher: "acme", name: "http-probe", content_hash: PROBE, source: "github.com/acme/scarab-libs//http-probe.yaml@8c2f4e1a9d7b3c5e0f6a2b8d4c1e7f9a3b5d2c6e", installed_by: "j.lee" }),
+    installation({ id: "e4a61b8c39", publisher: "acme", name: "git-tag", content_hash: h("6a0d3e9f2b17"), source: "github.com/acme/scarab-libs//git-tag.yaml@51c3b8e0f2a4d6c8e0b2a4c6e8f0a2b4c6d8e0f2", installed_at: ago(3 * day) }),
     installation({
+      id: "91d7f05b2c",
       publisher: "platform",
       name: "kaniko-build",
       content_hash: h("7e2b9a4c1d08"),
@@ -389,6 +391,11 @@ export function libraryRoute(
 ): Response | null {
   let m: RegExpMatchArray | null;
   if (/^\/v1\/orgs\/[^/]+\/libraries$/.test(p)) return json(orgLibraries());
+  if ((m = p.match(/^\/v1\/orgs\/[^/]+\/library-installations\/([^/]+)$/))) {
+    const id = decodeURIComponent(m[1]!);
+    const found = orgLibraries().installations.find((l) => l.id === id);
+    return found ? json(found) : new Response("not found", { status: 404 });
+  }
   if (/^\/v1\/orgs\/[^/]+\/libraries\/fetch$/.test(p)) return json(fetchedUpgrade);
   if ((m = p.match(/^\/v1\/orgs\/[^/]+\/libraries\/([^/]+)\/([^/]+)$/))) {
     // Install echoes the reviewed version as installed now; remove answers
@@ -400,6 +407,7 @@ export function libraryRoute(
     const was = fullLibraries.installations.find((l) => l.publisher === publisher && l.name === name);
     return json(
       installation({
+        id: was?.id ?? "0a6f2d9e41",
         publisher,
         name,
         content_hash: req.content_hash ?? HELM_NEW,

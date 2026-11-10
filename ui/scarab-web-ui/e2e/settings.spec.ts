@@ -122,6 +122,18 @@ test("the old account addresses redirect and keep their query", async ({ page })
   expect(errors).toEqual([]);
 });
 
+test("Add passkey sits in the passkeys panel's header, with the name field below", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/settings/security");
+  const add = page.getByRole("button", { name: "Add passkey" });
+  await expect(add).toHaveCount(1);
+  const field = page.getByRole("textbox", { name: "Passkey name" });
+  await expect(field).toBeVisible();
+  const [a, f] = [await add.boundingBox(), await field.boundingBox()];
+  expect(a!.y).toBeLessThan(f!.y);
+  expect(errors).toEqual([]);
+});
+
 // The event log has no section of its own: it sits under the step-up
 // settings in Security, and its old address keeps its filters.
 test("the old Event log address opens Security with its filters, and the refusals preset filters the log", async ({
@@ -624,7 +636,8 @@ test("Install library opens a dialog, and its source is reviewed on its own page
   await expect(page.getByRole("heading", { level: 1 })).toHaveText(/Libraries\s*lib:acme\/deploy-helm$/);
   await expect(page.getByText("5d1e0c7a9b3f → 0c4e7b2a91f5")).toBeVisible();
   await page.getByRole("button", { name: "Upgrade", exact: true }).click();
-  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/libraries\/acme~deploy-helm\/manage$/);
+  // The manage page's URL carries the installation's id.
+  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/libraries\/b72d4f1e06\/manage$/);
   expect(errors).toEqual([]);
 });
 
@@ -632,7 +645,7 @@ test("a library's manage page holds its version, trust, yank and remove", async 
   const errors = collectErrors(page);
   await page.goto("/orgs/acme/settings/libraries");
   await page.getByRole("link", { name: "lib:acme/http-probe" }).click();
-  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/libraries\/acme~http-probe\/manage$/);
+  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/libraries\/5c09e3a7d4\/manage$/);
   const nav = page.getByRole("navigation", { name: "Settings" });
   await expect(nav.getByRole("link", { name: "Libraries", exact: true })).toHaveAttribute("aria-current", "page");
   await expect(page.getByRole("heading", { level: 1 })).toHaveText(/Libraries\s*lib:acme\/http-probe$/);
@@ -657,6 +670,19 @@ test("a library's manage page holds its version, trust, yank and remove", async 
   expect(errors).toEqual([]);
 });
 
+test("a library's old publisher~name address goes on to its id address", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/orgs/acme/settings/libraries/acme~http-probe/manage");
+  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/libraries\/5c09e3a7d4\/manage$/);
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText(/Libraries\s*lib:acme\/http-probe$/);
+  // A name that is not installed, and an id that names nothing, say so.
+  await page.goto("/orgs/acme/settings/libraries/acme~gone/manage");
+  await expect(page.getByText(/There is no library lib:acme\/gone installed in acme/)).toBeVisible();
+  await page.goto("/orgs/acme/settings/libraries/0000000000/manage");
+  await expect(page.getByText(/There is no library 0000000000 installed in acme/)).toBeVisible();
+  expect(errors).toEqual([]);
+});
+
 test("a plugin installation's manage page holds its state, config, kill and uninstall", async ({ page }) => {
   const errors = collectErrors(page);
   await page.goto("/orgs/acme/settings/plugins");
@@ -677,6 +703,10 @@ test("a plugin installation's manage page holds its state, config, kill and unin
   await dialog.getByRole("textbox").fill("argocd-us");
   await dialog.getByRole("button", { name: "Uninstall plugin" }).click();
   await expect(page).toHaveURL(/\/orgs\/acme\/settings\/plugins$/);
+
+  // An id that names no installation of the org says so.
+  await page.goto("/orgs/acme/settings/plugins/0000000000/manage");
+  await expect(page.getByText(/There is no plugin installation 0000000000 in acme/)).toBeVisible();
   expect(errors).toEqual([]);
 });
 
@@ -1387,6 +1417,32 @@ function sticksOut(page: Page) {
   });
 }
 
+/** Whatever lies outside the window on either side, top bar included, and is
+ *  not inside a box that scrolls sideways on its own. Decoration
+ *  (`aria-hidden`) is left out. */
+function outsideTheWindow(page: Page) {
+  return page.evaluate(() => {
+    const w = window.innerWidth;
+    const out: string[] = [];
+    for (const el of Array.from(document.body.querySelectorAll("*"))) {
+      const r = el.getBoundingClientRect();
+      if (r.width === 0 || (r.right <= w + 1 && r.left >= -1)) continue;
+      if (el.closest('[aria-hidden="true"]')) continue;
+      let p = el.parentElement;
+      let held = false;
+      while (p) {
+        if (["auto", "scroll"].includes(getComputedStyle(p).overflowX)) {
+          held = true;
+          break;
+        }
+        p = p.parentElement;
+      }
+      if (!held) out.push(`${el.tagName.toLowerCase()}.${(el as HTMLElement).className}`);
+    }
+    return out;
+  });
+}
+
 test("on a phone the Access and Members tables scroll inside their box, not the page", async ({ page }) => {
   await page.setViewportSize({ width: 375, height: 800 });
   await page.goto("/acme/scarab?tab=settings");
@@ -1395,6 +1451,34 @@ test("on a phone the Access and Members tables scroll inside their box, not the 
   await page.goto("/orgs/acme/settings/members");
   await expect(page.getByRole("table", { name: "Members" })).toBeVisible();
   expect(await sticksOut(page)).toEqual([]);
+});
+
+test("on a phone no page scrolls sideways, and the top bar keeps every link", async ({ page }) => {
+  await page.setViewportSize({ width: 375, height: 800 });
+  const pages: [string, string][] = [
+    ["/", "Dashboard"],
+    ["/orgs/acme", "acme"],
+    ["/acme/orders-api", "orders-api"],
+    ["/acme/orders-api?tab=settings", "orders-api"],
+    ["/acme/orders-api/runs/0190f8a2000071fb8c00a0760421aaaa", "#421"],
+    ["/orgs/acme/settings/libraries", "Libraries"],
+    ["/orgs/acme/settings/plugins", "Plugins"],
+    ["/orgs/acme/settings/plugins/4f2a1c9e7b/manage", "argocd"],
+    ["/orgs/acme/settings/connections", "Connections"],
+    ["/orgs/acme/settings/security", "Security"],
+    ["/settings/security", "Security"],
+  ];
+  for (const [url, heading] of pages) {
+    await page.goto(url);
+    await expect(page.getByRole("heading", { level: 1 }).first()).toContainText(heading);
+    const top = page.getByRole("navigation").first();
+    for (const name of ["Search", "Docs", "API"]) {
+      await expect(top.getByRole(name === "Search" ? "button" : "link", { name, exact: true })).toBeInViewport();
+    }
+    const width = await page.evaluate(() => [document.documentElement.scrollWidth, window.innerWidth]);
+    expect(width[0], url).toBeLessThanOrEqual(width[1]!);
+    expect(await outsideTheWindow(page), url).toEqual([]);
+  }
 });
 
 test("a repository's Access is for org admins", async ({ page }) => {

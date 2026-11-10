@@ -46,6 +46,86 @@ contract_test!(
     prune_never_installed
 );
 contract_test!(trust_is_per_org_by_source_and_keeps_the_first_record, trust);
+contract_test!(
+    an_installation_keeps_its_id_and_is_found_by_it_in_its_org,
+    ids
+);
+
+/// A first install mints an id, unique across orgs; an upgrade keeps it; a
+/// removal and a new install get a new one. A lookup by id finds only the
+/// org's own installation.
+async fn ids(store: &dyn LibraryStore) {
+    let mut minted = std::collections::BTreeSet::new();
+    let mut first = Vec::new();
+    for org in ["acme", "globex"] {
+        let v1 = store
+            .put_version(&version(org, V1, "github.com/acme/libs//deploy.yaml@aaaa"))
+            .await
+            .unwrap();
+        let i = store
+            .install(&install(org, &v1.content_hash, 1), &Replaces::Nothing)
+            .await
+            .unwrap();
+        assert_eq!(i.id.len(), 10, "{i:?}");
+        assert!(
+            i.id.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "{i:?}"
+        );
+        assert!(minted.insert(i.id.clone()), "ids are unique: {minted:?}");
+        first.push(i);
+    }
+    let acme = first[0].clone();
+    let globex = first[1].clone();
+    assert_eq!(
+        store.installation_by_id("acme", &acme.id).await.unwrap(),
+        Some(acme.clone())
+    );
+    assert_eq!(
+        store.installation_by_id("acme", &globex.id).await.unwrap(),
+        None,
+        "another org's id is not found"
+    );
+    assert_eq!(
+        store.installation_by_id("globex", &acme.id).await.unwrap(),
+        None
+    );
+
+    // An upgrade keeps the id.
+    let v2 = store
+        .put_version(&version(
+            "acme",
+            V2,
+            "github.com/acme/libs//deploy.yaml@bbbb",
+        ))
+        .await
+        .unwrap();
+    let up = store
+        .install(
+            &install("acme", &v2.content_hash, 2),
+            &Replaces::Version(acme.content_hash.clone()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(up.id, acme.id);
+    assert_eq!(
+        store.installations("acme").await.unwrap()[0].id,
+        acme.id,
+        "the list carries the id"
+    );
+
+    // Removed, the id names nothing; installed again, it gets a new one.
+    store.remove("acme", "acme", "deploy").await.unwrap();
+    assert_eq!(
+        store.installation_by_id("acme", &acme.id).await.unwrap(),
+        None
+    );
+    let again = store
+        .install(&install("acme", &v2.content_hash, 3), &Replaces::Nothing)
+        .await
+        .unwrap();
+    assert!(minted.insert(again.id.clone()), "a new id: {minted:?}");
+}
 
 async fn trust(store: &dyn LibraryStore) {
     let t = |by: &str, at: i64| TrustedSource {

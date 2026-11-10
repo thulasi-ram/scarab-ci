@@ -2218,6 +2218,10 @@ function route(pathname: string, search: string, method: string, body = ""): Res
     // The body is not visible here; echo the slot as bound.
     return json(list.find((c) => c.slot === slot) ?? pluginConnection(slot, {}));
   }
+  if ((m = p.match(/^\/v1\/orgs\/[^/]+\/plugin-installations\/([^/]+)$/))) {
+    const found = plugins.find((x) => x.id === decodeURIComponent(m![1]!));
+    return found ? json(found) : new Response("no such installation", { status: 404 });
+  }
   if ((m = p.match(/^\/v1\/orgs\/[^/]+\/plugins\/([^/]+)(?:\/(kill|enable))?$/))) {
     const found = plugins.find((x) => x.name === decodeURIComponent(m![1]!));
     if (!found) return new Response("no such installation", { status: 404 });

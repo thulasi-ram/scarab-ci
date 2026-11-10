@@ -949,6 +949,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/orgs/{org}/library-installations/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** One installed library, by id (ADR-0076 §4) */
+        get: operations["get_library_installation"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/orgs/{org}/library-trust": {
         parameters: {
             query?: never;
@@ -1063,6 +1080,23 @@ export interface paths {
         put?: never;
         /** Fetch a plugin manifest to review before installing (ADR-0072) */
         post: operations["fetch_plugin_manifest"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/plugin-installations/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** One plugin installation, by id (ADR-0072) */
+        get: operations["get_plugin_by_id"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -3758,6 +3792,11 @@ export interface components {
         };
         LibraryInstallationDto: {
             content_hash: string;
+            /**
+             * @description 10 lowercase hex, minted at the first install and kept by upgrades.
+             *     What the settings page's URL carries.
+             */
+            id: string;
             /** Format: int64 */
             installed_at: number;
             installed_by: string;
@@ -8626,6 +8665,44 @@ export interface operations {
             };
         };
     };
+    get_library_installation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description installation id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LibraryInstallationDto"];
+                };
+            };
+            /** @description no read access to the org */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no installation with this id in the org, or libraries not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     trust_library_source: {
         parameters: {
             query?: never;
@@ -8983,6 +9060,44 @@ export interface operations {
                 content?: never;
             };
             /** @description plugins not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_plugin_by_id: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description installation id (10 hex) */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PluginInstallationDto"];
+                };
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no installation with this id in the org, or plugins not configured */
             404: {
                 headers: {
                     [name: string]: unknown;

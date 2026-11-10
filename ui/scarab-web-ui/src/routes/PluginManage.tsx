@@ -40,9 +40,9 @@ import {
   enablePlugin,
   fetchPluginUpgrade,
   getPluginBrokerJournal,
+  getPluginInstallation,
   killPlugin,
   listPluginConnections,
-  listPlugins,
   putPluginConnection,
   putPluginStorage,
   uninstallPlugin,
@@ -117,8 +117,8 @@ export default function PluginManage() {
 function Manage(props: { org: string; id: string }) {
   const nav = useNavigate();
   const back = () => orgHref(props.org, "plugins");
-  const [plugins, { refetch }] = createResource(() => listPlugins(props.org));
-  const plugin = () => (plugins.error ? undefined : (plugins() ?? []).find((p) => p.id === props.id));
+  const [installation, { refetch }] = createResource(() => getPluginInstallation(props.org, props.id));
+  const plugin = () => (installation.error ? undefined : (installation() ?? undefined));
   const [notice, setNotice] = createSignal<string | null>(null);
   const [error, setError] = createSignal<string | null>(null);
   const done = (msg: string) => {
@@ -143,8 +143,8 @@ function Manage(props: { org: string; id: string }) {
       <Show when={error()}>
         <p class="error">{error()}</p>
       </Show>
-      <Show when={!plugins.error} fallback={<p class="error">Could not load the org's plugins.</p>}>
-        <Show when={!plugins.loading || plugin()} fallback={<p class="empty">loading…</p>}>
+      <Show when={!installation.error} fallback={<p class="error">Could not load the plugin installation.</p>}>
+        <Show when={!installation.loading || plugin()} fallback={<p class="empty">loading…</p>}>
           <Show
             when={plugin()}
             fallback={

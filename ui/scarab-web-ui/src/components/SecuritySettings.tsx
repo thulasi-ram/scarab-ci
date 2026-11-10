@@ -26,7 +26,7 @@ import { passkeyBadges, passkeyLabel, shouldAutoEnroll, wantsEnroll } from "../s
 import { createPasskey, webauthnAvailable, webauthnErrorText } from "../webauthn";
 import Icon from "./Icon";
 import ConfirmDestructive from "./ConfirmDestructive";
-import { Input } from "./Field";
+import { Field, Input } from "./Field";
 import SecurityEventTable from "./SecurityEventTable";
 
 export default function SecuritySettings() {
@@ -119,9 +119,16 @@ export default function SecuritySettings() {
   return (
     <div class="panel" id="security">
       <div class="panel-h">
-        <span>Security · passkeys</span>
-        <Show when={sec()}>
-          <span class="tok-count">{sec()!.passkeys.length}</span>
+        <span>
+          Security · passkeys{" "}
+          <Show when={sec()}>
+            <span class="tok-count">{sec()!.passkeys.length}</span>
+          </Show>
+        </span>
+        <Show when={enforced()}>
+          <button class="btn btn-primary btn-sm" disabled={busy()} onClick={() => enroll()}>
+            <Icon icon="plus" size={14} /> {busy() ? "Working…" : "Add passkey"}
+          </button>
         </Show>
       </div>
       <div class="secrets-body">
@@ -223,18 +230,18 @@ export default function SecuritySettings() {
                   </ul>
                 </Show>
 
-                <div class="secrets-actions sec-add">
+                <Field
+                  class="sec-name"
+                  label="Passkey name"
+                  help="Optional. Add passkey gives this name to the passkey it adds."
+                >
                   <Input
-                    aria-label="Passkey name"
-                    placeholder="Name it (MacBook Touch ID, YubiKey…)"
+                    placeholder="MacBook Touch ID, YubiKey…"
                     maxLength={64}
                     value={label()}
                     onValue={setLabel}
                   />
-                  <button class="btn btn-primary btn-sm" disabled={busy()} onClick={() => enroll()}>
-                    <Icon icon="plus" size={14} /> {busy() ? "Working…" : "Add passkey"}
-                  </button>
-                </div>
+                </Field>
                 <p class="subtle">
                   <small>
                     <Icon icon="shield-check" size={12} /> A first passkey needs a login from the

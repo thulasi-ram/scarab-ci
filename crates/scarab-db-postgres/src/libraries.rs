@@ -6,6 +6,11 @@
 //! same transaction. A first install racing another first install meets the
 //! primary key; that is [`LibraryStoreError::Conflict`] as well. Lists order
 //! by `COLLATE "C"`, bytewise, as the in-memory store does.
+//!
+//! A first install takes its id from the column's default (migration 0092).
+//! The insert names the id index as its conflict target, so an id that is
+//! already taken inserts nothing and the insert runs again with a new one;
+//! another installation under the same name is still a unique violation.
 
 use std::collections::BTreeMap;
 
@@ -54,13 +59,14 @@ fn version_from_row(r: &PgRow) -> LibraryVersion {
 }
 
 /// An installation joined with its version.
-const INSTALLATION_SELECT: &str = "SELECT i.org, i.publisher, i.name, i.content_hash, \
+const INSTALLATION_SELECT: &str = "SELECT i.id, i.org, i.publisher, i.name, i.content_hash, \
      v.source, i.installed_by, i.installed_at, i.step_up_ref \
      FROM library_installations i \
      JOIN library_versions v ON v.org = i.org AND v.content_hash = i.content_hash";
 
 fn installation_from_row(r: &PgRow) -> LibraryInstallation {
     LibraryInstallation {
+        id: r.get("id"),
         org: r.get("org"),
         publisher: r.get("publisher"),
         name: r.get("name"),
@@ -156,34 +162,59 @@ impl LibraryStore for PostgresDb {
             }
             _ => store_err(e),
         };
-        let write = match replaces {
-            Replaces::Nothing => sqlx::query(
-                "INSERT INTO library_installations \
-                 (org, publisher, name, content_hash, installed_by, installed_at, step_up_ref) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
-            ),
-            Replaces::Version(_) => sqlx::query(
+        let written = match replaces {
+            Replaces::Nothing => {
+                // 40 random bits collide about never; when they do, the
+                // default mints another on the next try.
+                let mut written = 0;
+                for _ in 0..3 {
+                    written = sqlx::query(
+                        "INSERT INTO library_installations \
+                         (org, publisher, name, content_hash, installed_by, installed_at, \
+                          step_up_ref) \
+                         VALUES ($1, $2, $3, $4, $5, $6, $7) \
+                         ON CONFLICT (id) DO NOTHING",
+                    )
+                    .bind(&new.org)
+                    .bind(&new.publisher)
+                    .bind(&new.name)
+                    .bind(&new.content_hash)
+                    .bind(&new.installed_by)
+                    .bind(new.installed_at)
+                    .bind(&new.step_up_ref)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(map_write)?
+                    .rows_affected();
+                    if written == 1 {
+                        break;
+                    }
+                }
+                if written == 0 {
+                    return Err(LibraryStoreError::Store(
+                        "no free installation id after 3 tries".into(),
+                    ));
+                }
+                written
+            }
+            Replaces::Version(h) => sqlx::query(
                 "UPDATE library_installations SET \
                    content_hash = $4, installed_by = $5, installed_at = $6, step_up_ref = $7 \
                  WHERE org = $1 AND publisher = $2 AND name = $3 AND content_hash = $8",
-            ),
-        }
-        .bind(&new.org)
-        .bind(&new.publisher)
-        .bind(&new.name)
-        .bind(&new.content_hash)
-        .bind(&new.installed_by)
-        .bind(new.installed_at)
-        .bind(&new.step_up_ref);
-        let write = match replaces {
-            Replaces::Nothing => write,
-            Replaces::Version(h) => write.bind(h),
-        };
-        let written = write
+            )
+            .bind(&new.org)
+            .bind(&new.publisher)
+            .bind(&new.name)
+            .bind(&new.content_hash)
+            .bind(&new.installed_by)
+            .bind(new.installed_at)
+            .bind(&new.step_up_ref)
+            .bind(h)
             .execute(&mut *tx)
             .await
             .map_err(map_write)?
-            .rows_affected();
+            .rows_affected(),
+        };
         if written == 0 {
             return Err(LibraryStoreError::Conflict);
         }
@@ -226,6 +257,22 @@ impl LibraryStore for PostgresDb {
         .bind(org)
         .bind(publisher)
         .bind(name)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(store_err)?;
+        Ok(row.as_ref().map(installation_from_row))
+    }
+
+    async fn installation_by_id(
+        &self,
+        org: &str,
+        id: &str,
+    ) -> Result<Option<LibraryInstallation>, LibraryStoreError> {
+        let row = sqlx::query(&format!(
+            "{INSTALLATION_SELECT} WHERE i.org = $1 AND i.id = $2"
+        ))
+        .bind(org)
+        .bind(id)
         .fetch_optional(self.pool())
         .await
         .map_err(store_err)?;

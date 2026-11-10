@@ -95,48 +95,50 @@ export default function Plugins(props: { org: string }) {
                 </p>
               }
             >
-              <table class="table lib-table" aria-label="Installed plugins">
-                <thead>
-                  <tr>
-                    <th>Installation</th>
-                    <th>Image</th>
-                    <th>State</th>
-                    <th>Approved</th>
-                    <th />
-                  </tr>
-                </thead>
-                <tbody>
-                  <For each={rows()}>
-                    {(p) => (
-                      <tr classList={{ dead: p.state === "killed" }}>
-                        <td>
-                          <A class="mono oenv-link" href={pluginManageHref(props.org, p)}>
-                            {p.name}
-                          </A>{" "}
-                          <span class="subtle mono" title="The plugin's name, from its manifest">
-                            · {p.plugin}
-                          </span>
-                        </td>
-                        <td class="mono" title={p.image}>
-                          {imageRepository(p.image).split("/").pop()} · {shortDigest(p.image)}
-                        </td>
-                        <td class="keep">
-                          <Chips chips={pluginChips(p)} />
-                        </td>
-                        <td title={absTime(p.approved_at)}>
-                          <span class="mono">{p.approved_by}</span>{" "}
-                          <span class="subtle">· {relTime(p.approved_at)}</span>
-                        </td>
-                        <td class="acts keep">
-                          <A class="btn btn-ghost btn-sm" href={pluginManageHref(props.org, p)}>
-                            Manage
-                          </A>
-                        </td>
-                      </tr>
-                    )}
-                  </For>
-                </tbody>
-              </table>
+              <div class="table-scroll">
+                <table class="table lib-table" aria-label="Installed plugins">
+                  <thead>
+                    <tr>
+                      <th>Installation</th>
+                      <th>Image</th>
+                      <th>State</th>
+                      <th>Approved</th>
+                      <th />
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <For each={rows()}>
+                      {(p) => (
+                        <tr classList={{ dead: p.state === "killed" }}>
+                          <td>
+                            <A class="mono oenv-link" href={pluginManageHref(props.org, p)}>
+                              {p.name}
+                            </A>{" "}
+                            <span class="subtle mono" title="The plugin's name, from its manifest">
+                              · {p.plugin}
+                            </span>
+                          </td>
+                          <td class="mono" title={p.image}>
+                            {imageRepository(p.image).split("/").pop()} · {shortDigest(p.image)}
+                          </td>
+                          <td class="keep">
+                            <Chips chips={pluginChips(p)} />
+                          </td>
+                          <td title={absTime(p.approved_at)}>
+                            <span class="mono">{p.approved_by}</span>{" "}
+                            <span class="subtle">· {relTime(p.approved_at)}</span>
+                          </td>
+                          <td class="acts keep">
+                            <A class="btn btn-ghost btn-sm" href={pluginManageHref(props.org, p)}>
+                              Manage
+                            </A>
+                          </td>
+                        </tr>
+                      )}
+                    </For>
+                  </tbody>
+                </table>
+              </div>
             </Show>
 
             <p class="subtle">
