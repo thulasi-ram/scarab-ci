@@ -37,6 +37,15 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ### Enhancement
 
+- **Repository roles moved to the repository.** Organization settings › Members shows each
+  person's org role only, grants and revokes org roles, and links the repositories a person also
+  holds a role in. A repository's Settings tab has an **Access** panel: who holds a role on it,
+  whether it was granted in Scarab or came from the forge's collaborators, the people its org
+  roles reach, grant and revoke at the repository, and **Re-sync collaborators**, which shows
+  who was added, changed and removed. The tab's placeholder rows and its Disable repository
+  button are gone; it shows the repository's forge connection. `GET /v1/orgs/{org}/bindings`
+  now says on each row whether the role was granted in Scarab (`origin: native`) or seeded by
+  a forge import (`origin: import`).
 - **A repository's Secrets tab is one key list.** Each key shows where it is set; expand it
   for one line per scope. An Environment filter shows each key's value for that Environment,
   and New secret takes a scope. It replaces the list and the grid.

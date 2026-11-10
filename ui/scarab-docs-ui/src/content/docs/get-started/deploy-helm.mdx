@@ -181,6 +181,17 @@ address. The user menu links the pages you may use:
 Connections is the one place a forge connection is added: **Add Forgejo connection** on an org's
 Connections, or New organization… for an org Scarab does not have yet.
 
+Members lists each person's org role, which applies to every repository in the org, and grants
+and revokes org roles. Someone who holds roles on single repositories only is listed with no org
+role, and each person's row links the repositories they hold a role in. A role on one repository
+is managed on that repository's **Settings** tab, under **Access** (org admins only). It lists who
+holds a role on the repository and whether it was granted in Scarab or came from the forge's
+collaborators, then, greyed, the people whose org role reaches it. **Re-sync collaborators**
+reads the repository's collaborators from the forge and gives each a role from their permission
+there: admin → admin, write → member, read → viewer. Someone the forge no longer lists loses the
+role it gave them; roles granted or revoked in Scarab are never changed. The dialog lists who was
+added, changed and removed.
+
 `/settings` opens the first org you administer; a global admin with no org yet gets New
 organization…, and anyone else their profile. The old addresses (`/account`, `/account/security`,
 `/settings/libraries/review`, and `/settings/server/connect-forge` from the former Server
