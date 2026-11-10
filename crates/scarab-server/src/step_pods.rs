@@ -125,14 +125,20 @@ pub fn select_leftovers(
     grace_ms: i64,
     cap: usize,
 ) -> Vec<Leftover> {
-    let by_label: HashMap<String, &RunSettlement> =
-        runs.iter().map(|s| (run_label_value(&s.run), s)).collect();
+    // A Run matches a label only when the label is its id unchanged: an id the
+    // label mapping would lowercase or truncate could share its label with
+    // another Run, so its objects are kept.
+    let by_label: HashMap<&str, &RunSettlement> = runs
+        .iter()
+        .filter(|s| run_label_value(&s.run) == s.run.0)
+        .map(|s| (s.run.0.as_str(), s))
+        .collect();
     objects
         .iter()
         .filter(|o| o.labels.get(MANAGED_BY).map(String::as_str) == Some("scarab"))
         .filter(|o| !(o.active && o.labels.get(DEBUG_LABEL).map(String::as_str) == Some("true")))
         .filter_map(|o| {
-            let run = by_label.get(o.labels.get(RUN_LABEL)?)?;
+            let run = by_label.get(o.labels.get(RUN_LABEL)?.as_str())?;
             (run.status.is_terminal() && now.0 - run.settled_at.0 > grace_ms).then(|| Leftover {
                 kind: o.kind,
                 name: o.name.clone(),
