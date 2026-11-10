@@ -34,6 +34,10 @@ release.yml uses that version's section as the GitHub Release text. See
   and New secret takes a scope. It replaces the list and the grid.
 - **Settings pages each have their own sidebar**, and Organization settings has an org
   dropdown at the top. The user menu links Account settings and Organization settings.
+- **An org's security event log is in Organization settings › Security**, below the step-up
+  settings, with its filters and paging. **Refusals, last 24h** filters it to recent refusals
+  and replaces the recent-refusals table. The Event log section is gone;
+  `/orgs/<org>/settings/events` redirects to Security and keeps its filters.
 
 ### Bug Fixes
 

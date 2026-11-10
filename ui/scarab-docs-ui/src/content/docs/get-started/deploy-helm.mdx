@@ -171,7 +171,9 @@ address. The user menu links the pages you may use:
   (your own tokens) and Appearance.
 - **Organization settings**, for the admins of an org, under `/orgs/<org>/settings/<section>`:
   Connections, Members, Environments, Plugins, Libraries, Secrets, API tokens (every token issued
-  in the org), Security and Event log. `/orgs/<org>/settings` opens Connections. The org
+  in the org) and Security (the step-up settings, then the org's security event log with its
+  filters; **Refusals, last 24h** filters it to recent refusals). `/orgs/<org>/settings` opens
+  Connections. The old address `/orgs/<org>/settings/events` opens Security. The org
   dropdown at the top of the sidebar switches org and keeps the section. For a global admin its
   last entry is **New organization…** (`/orgs/_new`), where a new org is created with its first
   Forgejo connection.
