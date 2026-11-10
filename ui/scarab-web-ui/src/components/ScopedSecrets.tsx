@@ -178,7 +178,7 @@ export function NewSecretDialog(props: {
       purpose={
         props.name
           ? "The new value replaces the old one, which cannot be read back."
-          : "Stored encrypted and never shown after you save it."
+          : "Encrypted at rest, never displayed — overwrite but never read back."
       }
       busy={saving()}
       onClose={props.onClose}
