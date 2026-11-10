@@ -13,10 +13,11 @@
 // tab, no filter) are the absent params, which keeps the bare repo URL clean.
 import { createResource, createSignal, createEffect, onCleanup, For, Show } from "solid-js";
 import { A, useParams, useNavigate, useSearchParams } from "@solidjs/router";
-import { orgPageHref } from "../org-page";
+import { orgPageHref, UNREACHABLE_NOTE } from "../org-page";
 import { recordVisit } from "../visited";
 import {
   listRepoRuns,
+  listProjects,
   repoForgeUrl,
   listEnvironments,
   putEnvironmentOverlay,
@@ -142,6 +143,16 @@ export default function RepoView() {
     () => ({ org: org(), repo: repo() }),
     (k) => repoForgeUrl(k.org, k.repo).catch(() => null),
   );
+
+  // This repo's Project, for whether its forge connection still reaches it.
+  const [project] = createResource(
+    () => ({ org: org(), repo: repo() }),
+    (k) =>
+      listProjects()
+        .then((ps) => ps.find((p) => p.org === k.org && p.project === k.repo) ?? null)
+        .catch(() => null),
+  );
+  const unreachable = () => project()?.unreachable_since != null;
 
   // Tab + filters are URL state (see the header comment). An unknown `?tab=`
   // falls back to Runs rather than rendering an empty page.
@@ -314,8 +325,19 @@ export default function RepoView() {
           </A>
           <span class="head-org">/</span>
           {repo()}
+          <Show when={unreachable()}>
+            <span class="repo-unreachable-tag" title={UNREACHABLE_NOTE}>
+              unreachable
+            </span>
+          </Show>
         </h1>
       </div>
+      <Show when={unreachable()}>
+        <p class="repo-unreachable-note">
+          <Icon icon="alert-triangle" size={13} /> {UNREACHABLE_NOTE}{" "}
+          <A href={orgPageHref(org())}>Organization page</A>
+        </p>
+      </Show>
       {/* Always rendered (fixed height) so the tab row never shifts between
           tabs with and without a CTA. */}
       <div class="page-toolbar">

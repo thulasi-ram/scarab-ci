@@ -41,7 +41,11 @@ release.yml uses that version's section as the GitHub Release text. See
   `{"ignored": "repository not enabled"}` and starts nothing. `POST
   /v1/connections/{id}/resync` binds nothing either: its response lists the repositories that
   are not enabled in `available` and the projects it moved off a connection that does not
-  serve their org in `moved`; the `bound` field is gone.
+  serve their org in `moved`; the `bound` field is gone. A repository removed from the App's
+  installation, or one of an uninstalled or suspended App, is no longer unbound: it keeps its
+  project and is marked unreachable (`unreachable_since`), its events are ignored, a manual run
+  answers 409, and the mark clears when GitHub covers it again or a re-sync lists it. Disable
+  removes it. This needs migration 0089, which adds a column.
   ([Enabling repositories](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#enabling-repositories))
 
 ### Features

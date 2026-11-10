@@ -57,7 +57,7 @@ import {
 import { relTime } from "../fmt";
 import { me, refetchMe } from "../session";
 import { FIRST_ORG_SECTION, orgHref } from "../settings-nav";
-import { orgPageHref } from "../org-page";
+import { orgPageHref, UNREACHABLE_NOTE } from "../org-page";
 import FormSection from "./FormSection";
 import Modal, { ModalMessage, ModalSection } from "./Modal";
 import ConfirmDestructive from "./ConfirmDestructive";
@@ -531,6 +531,11 @@ function ConnectionRow(props: { conn: Connection; onChanged: () => void }) {
                 <a class="conn-proj mono" href={`/${p.org}/${p.project}`}>
                   {p.org}/{p.project}
                 </a>
+                <Show when={p.unreachable_since != null}>
+                  <span class="repo-unreachable-tag" title={UNREACHABLE_NOTE}>
+                    unreachable
+                  </span>
+                </Show>
                 <Show when={manual()}>
                   <Show when={hooks()}>
                     <button

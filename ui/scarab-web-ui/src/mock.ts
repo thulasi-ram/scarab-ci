@@ -193,6 +193,7 @@ const proj = (project: string, mins: number | null) => ({
   owner: "acme",
   repo_url: `https://github.com/acme/${project}`,
   last_run_at: mins == null ? null : ago(mins * 60000),
+  unreachable_since: null as number | null,
 });
 const projects = [
   proj("scarab", 3),
@@ -200,7 +201,9 @@ const projects = [
   proj("inventory-svc", 48),
   proj("edge-gateway", 120),
   proj("billing", 9),
-  proj("messaging", 300),
+  // Removed from the GitHub App's installation two days ago: kept, and
+  // marked unreachable on its page, the org page and Connections.
+  { ...proj("messaging", 300), unreachable_since: ago(2 * 24 * 60 * 60000) },
   proj("scarab-infra", null),
 ];
 
@@ -1194,11 +1197,12 @@ const connections: components["schemas"]["ConnectionDto"][] = [
     credential_ref: "github-app",
     credential_present: true,
     last_delivery_at: ago(240000),
-    projects: projects.map(({ project }) => ({
+    projects: projects.map(({ project, unreachable_since }) => ({
       org: "acme",
       project,
       owner: "acme",
       name: project,
+      unreachable_since,
     })),
     supports_resync: true,
     supports_preflight: true,
@@ -1274,11 +1278,17 @@ const availableRepos = [
 // list runs to two pages of 25. Enable and Disable flip `enabled` here and
 // add or drop the project on /v1/repos, as the server would.
 type OrgRepoDto = components["schemas"]["OrgRepoDto"];
-const orgRepo = (name: string, connection: "gh-acme" | "forgejo-7f3a91c2", enabled: boolean): OrgRepoDto => ({
+const orgRepo = (
+  name: string,
+  connection: "gh-acme" | "forgejo-7f3a91c2",
+  enabled: boolean,
+  unreachable_since: number | null = null,
+): OrgRepoDto => ({
   owner: "acme",
   name,
   enabled,
   project: enabled ? name : null,
+  unreachable_since,
   connection_id: connection,
   kind: connection === "gh-acme" ? "github" : "forgejo",
   repo_url:
@@ -1286,7 +1296,7 @@ const orgRepo = (name: string, connection: "gh-acme" | "forgejo-7f3a91c2", enabl
   can_change: true,
 });
 const orgRepos: OrgRepoDto[] = [
-  ...projects.map((p) => orgRepo(p.name, "gh-acme", true)),
+  ...projects.map((p) => orgRepo(p.name, "gh-acme", true, p.unreachable_since)),
   orgRepo("infra", "forgejo-7f3a91c2", true),
   orgRepo("terraform-modules", "forgejo-7f3a91c2", false),
   orgRepo("runbooks", "forgejo-7f3a91c2", false),
@@ -1342,6 +1352,7 @@ function setRepoEnabled(owner: string, name: string, enabled: boolean): OrgRepoD
   if (!r) return undefined;
   r.enabled = enabled;
   r.project = enabled ? name : null;
+  r.unreachable_since = null;
   const i = projects.findIndex((p) => p.owner === owner && p.name === name);
   if (enabled && i < 0) projects.push(proj(name, null));
   if (!enabled && i >= 0) projects.splice(i, 1);

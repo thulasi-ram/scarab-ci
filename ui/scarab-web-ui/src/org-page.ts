@@ -85,3 +85,11 @@ export function paginate<T>(items: readonly T[], page: number, perPage: number):
   const start = (Math.max(1, Math.floor(page)) - 1) * perPage;
   return items.slice(start, start + perPage);
 }
+
+/**
+ * The line shown beside an unreachable repository: an enabled one whose
+ * connection no longer reaches it. Its project is kept until an admin
+ * disables it.
+ */
+export const UNREACHABLE_NOTE =
+  "The GitHub App no longer covers this repository, so its events are ignored and no run can start. Add it back to the App's installation on GitHub, or disable it to remove it from Scarab.";

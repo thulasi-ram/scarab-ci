@@ -166,8 +166,17 @@ does not retry them. A **Re-sync** (`POST /v1/connections/{id}/resync`) lists th
 forge reaches that are not enabled in `available` and binds none of them.
 
 Repositories that an earlier release bound when the App was installed stay enabled after an
-upgrade; nothing is unbound. A repository removed from the App's installation on GitHub is still
-unbound, since the App can no longer reach it.
+upgrade; nothing is unbound.
+
+Nothing the forge sends deletes a project either. When you remove an enabled repository from the
+App's installation on GitHub, or uninstall or suspend the App, its repositories stay enabled and
+are marked **unreachable** (`unreachable_since`, unix ms, on `GET /v1/repos`, the connection's
+projects and the org page rows). The repository's page and the org page say so. While a repository
+is unreachable, its events are ignored like those of a repository that is not enabled, a manual
+run answers 409, and any other forge call for it (a status post, a clone) fails with an error that
+names the reason. The mark clears when GitHub covers the repository again (an
+`installation_repositories` delivery that adds it, or an `unsuspend`), or when a re-sync lists it.
+To remove the project, disable the repository.
 
 ### Connections without an org
 

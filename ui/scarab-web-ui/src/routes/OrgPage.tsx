@@ -14,7 +14,7 @@
 import { For, Show, createResource, createSignal, onCleanup } from "solid-js";
 import { A, useParams } from "@solidjs/router";
 import { bindRepo, listOrgRepos, listRuns, unbindRepo, type OrgRepo } from "../api/client";
-import { clampPage, orgRunStats, pageCount, pageSpan } from "../org-page";
+import { UNREACHABLE_NOTE, clampPage, orgRunStats, pageCount, pageSpan } from "../org-page";
 import { FIRST_ORG_SECTION, decodeParam, orgHref } from "../settings-nav";
 import { me } from "../session";
 import ConfirmDestructive from "../components/ConfirmDestructive";
@@ -237,6 +237,11 @@ export default function OrgPage() {
                     >
                       {r.enabled ? "Enabled" : "Not enabled"}
                     </span>
+                    <Show when={r.unreachable_since != null}>
+                      <span class="repo-unreachable-tag" title={UNREACHABLE_NOTE}>
+                        unreachable
+                      </span>
+                    </Show>
                     <span class="rr-coord mono" title={`through connection ${r.connection_id}`}>
                       {r.kind}
                     </span>
@@ -270,6 +275,11 @@ export default function OrgPage() {
                           Disable
                         </button>
                       </Show>
+                    </Show>
+                    <Show when={r.unreachable_since != null}>
+                      <span class="repo-unreachable-note org-repo-note">
+                        <Icon icon="alert-triangle" size={12} /> {UNREACHABLE_NOTE}
+                      </span>
                     </Show>
                   </div>
                 )}
