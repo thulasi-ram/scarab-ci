@@ -207,11 +207,10 @@ export default function RepoView() {
     return env ? environmentLabel(env) : name;
   };
 
-  /** `undefined` = closed; `""` = open with no Environment picked; a name =
-   *  open on that Environment (its overlay prefilled). */
+  /** `undefined` = closed; a name = open on that Environment (its overlay
+   *  prefilled). */
   const [envDialog, setEnvDialog] = createSignal<string | undefined>(undefined);
   const [envEpoch, setEnvEpoch] = createSignal(0); // bump to refetch the env list after a create
-  const [secretFocus, setSecretFocus] = createSignal(0);
   // The two secret panels read the same store through separate fetches; each
   // bumps the OTHER's epoch after a write so neither shows a stale view.
   const [secretListEpoch, setSecretListEpoch] = createSignal(0);
@@ -292,14 +291,6 @@ export default function RepoView() {
           icon: "play",
           onClick: () => nav(`/${org()}/${repo()}/run`),
         };
-      case "environments":
-        return {
-          label: "Tighten for this project",
-          icon: "shield-check",
-          onClick: () => setEnvDialog(""),
-        };
-      case "secrets":
-        return { label: "New secret", icon: "plus", onClick: () => setSecretFocus((n) => n + 1) };
       default:
         return null;
     }
@@ -626,7 +617,6 @@ export default function RepoView() {
           scope={{ org: org(), repo: repo() }}
           title={`Secrets · ${org()}/${repo()}`}
           showInherited
-          focusPing={secretFocus()}
           epoch={secretListEpoch()}
           onChange={() => setSecretMatrixEpoch((n) => n + 1)}
         />

@@ -9,7 +9,7 @@
 // At the repo scope it also lists, greyed out, the keys the repo can use but
 // does not hold: the org's keys and keys set only in some environments. They
 // come from the secret matrix and cannot be edited here.
-import { createEffect, createResource, createSignal, For, Show } from "solid-js";
+import { createResource, createSignal, For, Show } from "solid-js";
 import {
   listSecrets,
   putSecret,
@@ -29,8 +29,6 @@ export default function ScopedSecrets(props: {
   title: string;
   /** Shown when the scope holds nothing yet. */
   emptyLabel?: string;
-  /** Bumping this opens the add-secret dialog (a header CTA elsewhere owns it). */
-  focusPing?: number;
   /** Bumping this refetches — another panel wrote to the same scope. */
   epoch?: number;
   /** Called after this panel writes, so a sibling view of the scope can refresh. */
@@ -60,12 +58,6 @@ export default function ScopedSecrets(props: {
     props.onChange?.();
   };
   const [showDialog, setShowDialog] = createSignal(false);
-
-  // The header "New secret" CTA pings us to open the add-secret modal. Guard on
-  // > 0 so we don't pop the dialog on the initial mount.
-  createEffect(() => {
-    if ((props.focusPing ?? 0) > 0) setShowDialog(true);
-  });
 
   return (
     <div class="panel">
