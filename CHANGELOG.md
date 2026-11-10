@@ -42,10 +42,15 @@ record. Read Breaking changes before you upgrade.
 
   `lib:thulasi-ram/clone` is a first-party library. The server reads the list of first-party
   libraries from this release's `libs-manifest.json` asset and installs them in an org when a
-  repository is first bound to it. For an org that existed before the upgrade, open
-  **Settings › Libraries**: when the defaults are missing, use **Retry**. A server that
-  cannot reach github.com can use a mirror, pasted files, or `SCARAB_LIBS_MANIFEST` (a file
-  path, an https URL, or `off`).
+  repository is first bound to it. **An org that existed before the upgrade gets nothing
+  installed,** and every Pipeline in it that invokes the clone library fails its check with
+  "`lib:thulasi-ram/clone` is not installed in this org" until an org admin installs it:
+  **Settings › Libraries › Install library**, pick the clone library from the release
+  manifest, review it, and confirm with a passkey. Do this in each existing org right after
+  the upgrade. A push that fails this check shows as a refused row in the repository's Runs
+  list. For a new org whose install could not read the manifest, Settings › Libraries offers
+  **Retry**, a mirror, or pasted files; `SCARAB_LIBS_MANIFEST` (a file path, an https URL, or
+  `off`) changes where the server reads the manifest.
 - **A bare `invoke:` path is an error.** Write `invoke: file:<path>` for a library in the same
   repository. The file must be marked `kind: library`.
 - **Values from outside the Pipeline go through `env:`.** Run parameters, `event` fields, Step
