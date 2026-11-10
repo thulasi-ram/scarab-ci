@@ -9,8 +9,10 @@
 // routes/LibraryManage.tsx).
 //
 // Two things belong to no installation, so they stay here: a yank of a
-// version no installation holds now, and trust in a source no installation
-// comes from. Lifting a yank asks for a step-up; stopping trust does not.
+// library with no installation at all (each library's manage page lists the
+// yanks of its own versions, earlier ones included), and trust in a source
+// no installation comes from. Lifting a yank asks for a step-up; stopping
+// trust does not.
 import { createResource, createSignal, For, Show } from "solid-js";
 import { A } from "@solidjs/router";
 import { listLibraries, untrustLibrarySource, unyankLibrary } from "../api/client";
@@ -18,9 +20,10 @@ import {
   libraryChips,
   libraryId,
   libraryManageHref,
+  removedLibraryYanks,
   shortHash,
   strayTrust,
-  strayYanks,
+  versionLabel,
 } from "../libraries";
 import { relTime, absTime } from "../fmt";
 import Chips from "./Chips";
@@ -45,7 +48,7 @@ export default function Libraries(props: { org: string }) {
   const unavailable = () => !libs.loading && !libs.error && libs() === null;
   const rows = () => data()?.installations ?? [];
   const trusted = () => data()?.trusted_sources ?? [];
-  const yanks = () => strayYanks(data()?.yanks ?? [], rows());
+  const yanks = () => removedLibraryYanks(data()?.yanks ?? [], rows());
   const loneTrust = () => strayTrust(trusted(), rows());
 
   const unyank = async (hash: string) => {
@@ -157,14 +160,16 @@ export default function Libraries(props: { org: string }) {
             </Show>
 
             <Show when={yanks().length > 0}>
-              <h3 class="lib-sub-h">Yanked versions no library holds now</h3>
-              <ul class="tok-list" aria-label="Yanked versions no library holds now">
+              <h3 class="lib-sub-h">Yanks of removed libraries</h3>
+              <ul class="tok-list" aria-label="Yanks of removed libraries">
                 <For each={yanks()}>
                   {(y) => (
                     <li class="tok">
                       <div class="tok-head">
-                        <span class="lib-hash">{shortHash(y.content_hash)}</span>
-                        <span class="plg-msg">{y.reason}</span>
+                        <span class="tok-name mono">{libraryId(y)}</span>
+                        <span class="mono lib-src" title={y.source}>
+                          {versionLabel(y.source)}
+                        </span>
                         <span class="oenv-actions">
                           <button class="btn btn-ghost btn-sm" onClick={() => void unyank(y.content_hash)}>
                             Lift yank
@@ -172,6 +177,7 @@ export default function Libraries(props: { org: string }) {
                         </span>
                       </div>
                       <div class="tok-facts" title={absTime(y.yanked_at)}>
+                        <span>{y.reason}</span>
                         <span>
                           yanked by {y.yanked_by} · {relTime(y.yanked_at)}
                         </span>

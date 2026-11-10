@@ -7,8 +7,10 @@ import {
   libraryManageHref,
   parseLibraryKey,
   segmentError,
+  removedLibraryYanks,
   strayTrust,
-  strayYanks,
+  versionLabel,
+  yanksOfLibrary,
   shortHash,
   sourceError,
   toFetchBody,
@@ -96,11 +98,41 @@ describe("the list and manage pages", () => {
     expect(yanked.map((c) => c.label)).toEqual(["yanked", "trusted source"]);
     expect(yanked[0]!.title).toBe("Yanked by j.lee: leaks a token");
   });
+  it("lists every yank of a library on its page, the installed version's marked", () => {
+    const y = (content_hash: string, publisher: string, name: string, yanked_at: number) => ({
+      content_hash,
+      publisher,
+      name,
+      yanked_at,
+    });
+    const helm = { publisher: "acme", name: "helm", content_hash: "cc" };
+    const yanks = [
+      y("aa", "acme", "helm", 1),
+      y("bb", "acme", "probe", 2),
+      // Installed as acme/helm, first fetched for another name.
+      y("cc", "acme", "helm-old", 3),
+    ];
+    expect(yanksOfLibrary(yanks, helm).map((x) => [x.content_hash, x.installed])).toEqual([
+      ["cc", true],
+      ["aa", false],
+    ]);
+    expect(yanksOfLibrary(yanks, { ...helm, content_hash: "dd" }).map((x) => x.installed)).toEqual([false]);
+  });
   it("keeps on the list only the yanks and trust no installation holds", () => {
-    const installed = [{ content_hash: "aa", source: `github.com/acme/libs//x.yaml@${C}` }];
-    expect(strayYanks([{ content_hash: "aa" }, { content_hash: "bb" }], installed)).toEqual([{ content_hash: "bb" }]);
+    const installed = [
+      { publisher: "acme", name: "x", content_hash: "aa", source: `github.com/acme/libs//x.yaml@${C}` },
+    ];
+    const yank = (content_hash: string, name: string) => ({ content_hash, publisher: "acme", name, yanked_at: 0 });
+    // An earlier version of an installed library is on its manage page, not here.
+    expect(
+      removedLibraryYanks([yank("aa", "x"), yank("a0", "x"), yank("bb", "gone")], installed).map((y) => y.content_hash),
+    ).toEqual(["bb"]);
     expect(
       strayTrust([{ source: "github.com/acme/libs//x.yaml" }, { source: "github.com/acme/libs//y.yaml" }], installed),
     ).toEqual([{ source: "github.com/acme/libs//y.yaml" }]);
+  });
+  it("names a version by its source and a short commit", () => {
+    expect(versionLabel(`github.com/acme/libs//x.yaml@${C}`)).toBe("github.com/acme/libs//x.yaml@0123456");
+    expect(versionLabel("github.com/acme/libs//x.yaml")).toBe("github.com/acme/libs//x.yaml");
   });
 });

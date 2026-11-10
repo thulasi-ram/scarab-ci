@@ -6,12 +6,15 @@
 // It holds everything done to the installation: its version and source,
 // Upgrade (the install dialog with the source filled in, then the review
 // page), trust in its source with forge credentials, yanking the installed
-// version and lifting the yank, and Remove, which asks for the name to be
-// typed. Trusting and lifting a yank ask for a step-up; stopping trust,
-// yanking and removing tighten and ask for nothing.
+// version, the yanked versions of this library with Lift yank on each, and
+// Remove, which asks for the name to be typed. Trusting and lifting a yank
+// ask for a step-up; stopping trust, yanking and removing tighten and ask
+// for nothing.
 //
 // The server keeps one version per installation and no history of earlier
-// ones, so the page shows the installed version only.
+// ones. A yank keeps its version, so the yanked versions table lists earlier
+// versions too: every yank of this `<publisher>/<name>`, read from the org's
+// yanks, the installed version's marked.
 import { createMemo, createResource, createSignal, For, Show, type JSX } from "solid-js";
 import { A, Navigate, useNavigate, useParams } from "@solidjs/router";
 import {
@@ -34,9 +37,11 @@ import {
   parseLibraryKey,
   shortHash,
   trustKey,
+  versionLabel,
   yankButtonLabel,
   yankImpactLine,
   yankReasonError,
+  yanksOfLibrary,
 } from "../libraries";
 import { absTime, relTime } from "../fmt";
 import { decodeParam, orgHref } from "../settings-nav";
@@ -193,10 +198,11 @@ function Installation(props: {
   const [yanking, setYanking] = createSignal(false);
   const [removing, setRemoving] = createSignal(false);
 
-  const unyank = async () => {
+  const yanks = () => yanksOfLibrary(props.libs.yanks, l());
+  const unyank = async (hash: string) => {
     try {
-      await unyankLibrary(props.org, l().content_hash);
-      props.onDone(`Version ${shortHash(l().content_hash)} can run again.`);
+      await unyankLibrary(props.org, hash);
+      props.onDone(`Version ${shortHash(hash)} can run again.`);
     } catch (e) {
       props.onError(e instanceof Error ? e.message : "Could not lift the yank.");
     }
@@ -267,44 +273,71 @@ function Installation(props: {
       </Section>
 
       <Section
-        title="Yank"
+        title="Yanked versions"
+        aside={
+          <Show when={yanks().length > 0}>
+            <span class="tok-count">{yanks().length}</span>
+          </Show>
+        }
         foot={
-          <Show
-            when={l().yanked}
-            fallback={
-              <button class="btn btn-danger btn-sm" onClick={() => setYanking(true)}>
-                <Icon icon="ban" size={14} /> Yank this version
-              </button>
-            }
-          >
-            <button class="btn btn-ghost btn-sm" onClick={() => void unyank()}>
-              Lift yank
+          <Show when={!l().yanked}>
+            <button class="btn btn-danger btn-sm" onClick={() => setYanking(true)}>
+              <Icon icon="ban" size={14} /> Yank this version
             </button>
           </Show>
         }
       >
-        <dl class="kv">
-          <Show
-            when={l().yanked}
-            fallback={
-              <>
-                <dt>State</dt>
-                <dd>Not yanked. Yanking stops this version from running in {props.org}.</dd>
-              </>
-            }
-          >
-            {(y) => (
-              <>
-                <dt>State</dt>
-                <dd class="lib-notice yank" title={absTime(y().yanked_at)}>
-                  Yanked by {y().yanked_by} · {relTime(y().yanked_at)}
-                </dd>
-                <dt>Reason</dt>
-                <dd>{y().reason}</dd>
-              </>
-            )}
-          </Show>
-        </dl>
+        <p class="kv-note kv-lead">
+          {l().yanked
+            ? `The installed version is yanked: it does not run in ${props.org}.`
+            : `The installed version is not yanked. Yanking stops it from running in ${props.org}.`}
+        </p>
+        <Show when={yanks().length > 0}>
+          <div class="table-scroll">
+            <table class="table lib-table" aria-label="Yanked versions">
+              <thead>
+                <tr>
+                  <th>Version</th>
+                  <th>Reason</th>
+                  <th class="nowrap">Yanked by</th>
+                  <th>When</th>
+                  <th />
+                </tr>
+              </thead>
+              <tbody>
+                <For each={yanks()}>
+                  {(y) => (
+                    <tr>
+                      <td class="lib-src" title={`${y.source}\n${y.content_hash}`}>
+                        {versionLabel(y.source)}
+                        <Show when={y.installed}>
+                          {" "}
+                          <Chips
+                            chips={[
+                              { label: "installed", tone: "muted", title: "The version installed now" },
+                            ]}
+                          />
+                        </Show>
+                      </td>
+                      <td>{y.reason}</td>
+                      <td class="nowrap">
+                        <span class="mono">{y.yanked_by}</span>
+                      </td>
+                      <td class="nowrap" title={absTime(y.yanked_at)}>
+                        {relTime(y.yanked_at)}
+                      </td>
+                      <td class="acts">
+                        <button class="btn btn-ghost btn-sm" onClick={() => void unyank(y.content_hash)}>
+                          Lift yank
+                        </button>
+                      </td>
+                    </tr>
+                  )}
+                </For>
+              </tbody>
+            </table>
+          </div>
+        </Show>
       </Section>
 
       <Section
