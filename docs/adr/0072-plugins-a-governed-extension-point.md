@@ -282,6 +282,37 @@ defend against `trusted_dom` code, which can change what is being confirmed.
 - **Upgrades.** A same-or-narrower manifest is a one-click upgrade by one org admin. A
   wider manifest gets a diff review of only the new capabilities. Elevated tiers
   (`delivered`, `trusted_dom`) need dual approval on every digest.
+
+> **Amended 2026-11-10 — how an upgrade, the manifest's source and its image are built.** The
+> bullet above stands; this records how the MMP builds it, and two additions.
+>
+> - **The source is recorded.** An installation keeps the source its manifest was read from
+>   (`<host>/<owner>/<repo>//<path>@<commit>`) and the ForgeConnection it was read through
+>   (migration 0091). Installations made before then have none, and the UI says "source not
+>   recorded".
+> - **Upgrade is fetch, compare, apply.** `POST …/plugins/{name}/upgrade-fetch` reads the new
+>   manifest, by default the recorded source's file at a commit the admin names (there is no
+>   branch resolution), and returns its diff against the installed manifest: what it adds,
+>   removes and keeps, by capability, connection slot, auth scheme, read rule, config key, gate
+>   and named image. `POST …/plugins/{name}/upgrade` reads the source again (409 if it no longer
+>   has the reviewed hash) and writes only over the installed manifest the admin compared against
+>   (409 otherwise). The installation keeps its id, name, config, storage, state and connection
+>   bindings; config keys and slots the new manifest drops go with it, and the version it replaced
+>   is recorded.
+> - **Same-or-narrower versus wider is decided by the server**, from the installed manifest and
+>   the one it reads, never from the request. Wider is any added capability, connection slot, auth
+>   scheme, read rule or gate (a gate whose definition changed counts as added), a manifest that
+>   stops naming its image or names another, or an image of another repository. An added config
+>   key is not wider: its value is the admin's, not the plugin's. A same-or-narrower upgrade,
+>   including a new digest of the same repository with the same manifest, needs no
+>   StepUpConfirmation; a wider one needs one bound to the action, as an install does. This
+>   narrows §8's "Plugin install and upgrade" to wider upgrades. Elevated tiers and dual approval
+>   do not exist yet, so nothing here addresses them.
+> - **A manifest may name its image.** The optional `image` field is a repository with no tag or
+>   digest. When it is set, an install or upgrade with an image of another repository is refused,
+>   so a manifest cannot be paired with another publisher's build. When it is absent, any
+>   repository is accepted and the review says the manifest names none. This is not publisher
+>   trust: it binds a manifest to a repository, not to a signing identity.
 - **Publisher trust.** A **PluginPublisher** is a signing identity (a Sigstore identity
   or key) an org trusts. **Unsigned images, or images from untrusted publishers, cannot be
   installed.** Scarab's own release identity is trusted by default (first-party). Trust is

@@ -324,6 +324,53 @@ The install body also takes `connection` (the connection the fetch read through)
 (values for the manifest's config keys) and `storage` (below). After the install, bind each
 connection slot under the installation, or with `PUT /v1/orgs/{org}/plugins/{name}/connections/{slot}`.
 
+The installation records the source it was read from and the connection it was read through.
+An installation made before Scarab recorded sources shows "source not recorded".
+
+A manifest can name the image repository the plugin ships as, in its `image` field
+(`"image": "ghcr.io/thulasi-ram/scarab-plugin-argocd"`, no tag or digest). Scarab then refuses an
+install or upgrade with an image of any other repository (400), so the manifest cannot be paired
+with someone else's build. A manifest without `image` installs with any repository, and the review
+says that it names none.
+
+#### Upgrade a plugin
+
+Open the installation's page and choose **Upgrade**, or use the API, in two steps:
+
+1. **Fetch and compare.** Give the new commit, and Scarab reads the recorded source's file at that
+   commit; or give a whole source to read another file. Scarab has no branch lookup, so you give
+   the commit. It shows what the new manifest adds, removes and keeps against the installed one:
+   capabilities, connection slots, auth schemes, read rules, config keys, gates and the named
+   image.
+2. **Upgrade.** Give the new image pinned by digest. Scarab reads the source again and refuses the
+   upgrade (409) if the manifest is not the one you compared, or if the installation changed since
+   you compared it.
+
+An upgrade that asks for nothing new needs no passkey: the new manifest removes things or keeps
+them, and the image is a new digest of the same repository. An upgrade that adds a capability, a
+connection slot, an auth scheme, a read rule or a gate, that stops naming its image or names
+another, or that moves the image to another repository, asks you to confirm with your passkey, as
+an install does. Scarab decides this from the two manifests; the request cannot say it.
+
+```sh
+curl -X POST "$SCARAB/v1/orgs/acme/plugins/notify/upgrade-fetch" \
+  -d '{"commit": "4b1e…", "image": "ghcr.io/acme/notify@sha256:…"}'
+# → {"source": "…@4b1e…", "manifest_sha256": "77d0…", "current_manifest_sha256": "a41c…",
+#    "diff": {"read_rules": {"added": [], "removed": ["api: GET /v1/legacy"], …}, …},
+#    "widenings": [], "needs_step_up": false, …}
+
+curl -X POST "$SCARAB/v1/orgs/acme/plugins/notify/upgrade" \
+  -d '{"image": "ghcr.io/acme/notify@sha256:…",
+       "source": "github.com/acme/scarab-plugins//notify/manifest.json@4b1e…",
+       "manifest_sha256": "77d0…", "expected_current_sha256": "a41c…"}'
+```
+
+The installation keeps its name, id, config, storage, state and connection bindings. A config key
+or connection slot the new manifest no longer declares is dropped, and a dropped binding's
+credential is deleted. Scarab keeps the version the upgrade replaced (image, manifest, source and
+who approved it) and restarts the plugin with the new image after the isolation probe passes
+again.
+
 #### Plugin storage
 
 Create the claim in the plugin namespace (`plugins.namespace`, default `scarab-plugins`) and

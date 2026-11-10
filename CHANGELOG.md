@@ -83,6 +83,16 @@ release.yml uses that version's section as the GitHub Release text. See
   the chart values `scarab.libsManifest` and `plugins.argocdRepo`, and the endpoints
   `POST /v1/orgs/{org}/library-defaults/retry` and `GET /v1/orgs/{org}/plugin-catalog`
   (404). Releases no longer carry a `libs-manifest.json` asset.
+- **Migration 0091** adds `manifest_source` and `manifest_connection` to
+  `plugin_installations` and a `plugin_installation_versions` table. Existing installations get
+  no source and show "source not recorded". A server from before 0091 cannot run against a
+  database migrated past it.
+- **A plugin manifest may name its image repository** (`"image": "ghcr.io/acme/plugin"`), and an
+  install or upgrade with an image of another repository is refused (400). Scarab's Argo CD
+  manifest names `ghcr.io/thulasi-ram/scarab-plugin-argocd`, so installing it from a fork's
+  repository needs a manifest that names the fork. A Scarab from before this release refuses a
+  manifest with the field.
+  ([Install a plugin](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#install-a-plugin))
 - **Migration 0090** adds the trusted sources above (trusted by `scarab:migration-0090`),
   drops `library_versions.first_party` and the `library_org_defaults` table. Installed
   libraries, their versions and yanks stay. A server from before 0090 cannot run against a
@@ -90,6 +100,14 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ### Features
 
+- **Upgrade a plugin in place.** An installation's page has Upgrade: give a new commit (the
+  recorded source's file at it) or another source, and a new image digest. Scarab shows what the
+  new manifest adds, removes and keeps, then applies it to the same installation, keeping its
+  config, storage and connections. An upgrade that asks for nothing new needs no passkey; one that
+  asks for more is confirmed like an install. The server decides which
+  (`POST /v1/orgs/{org}/plugins/{name}/upgrade-fetch`, then `…/upgrade`). Each installation now
+  records where its manifest was read.
+  ([Upgrade a plugin](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#upgrade-a-plugin))
 - **Any plugin can be installed.** An org admin fetches a plugin's manifest from a git source
   pinned to a commit, reviews its capabilities, connection slots, config keys and gates, and
   installs it by image digest with a passkey. Scarab's Argo CD plugin installs the same way;
