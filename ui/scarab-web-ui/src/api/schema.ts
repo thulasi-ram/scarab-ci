@@ -327,11 +327,12 @@ export interface paths {
         /**
          * Bind a repo to a connection, creating its Project, and register its webhook (ADR-0060)
          * @description There is no `projects` table: a Project *is* a `forge_repos` binding
-         *     (ADR-0046), so this endpoint is the repo→Project onboarding flow for any forge
-         *     without installation-style auto-registration. After it, the repo appears on
-         *     `GET /v1/repos`, can hold Environments and secrets, and its pushes resolve to
-         *     a tenant. GitHub keeps binding itself from the `installation` webhook; this is
-         *     the Forgejo path.
+         *     (ADR-0046), so this endpoint is the repo→Project onboarding flow — "Enable"
+         *     on the org's repositories page and "Add repository" on its Connections —
+         *     for every forge. After it, the repo appears on `GET /v1/repos`, can hold
+         *     Environments and secrets, and its pushes resolve to a tenant. A GitHub
+         *     installation makes its repos available but binds none of them, so this is
+         *     the GitHub path too.
          *
          *     Registration is attempted **after** the binding lands and its failure is
          *     *reported, not rolled back*: the binding is the durable governance fact, a
@@ -361,7 +362,8 @@ export interface paths {
          * @description The inverse of the bind above, and destructive in the same measure: the
          *     binding is the Project, so its Environments, scoped secrets and RBAC go with
          *     it. That is why re-sync never does this on a forge's say-so and why this is an
-         *     explicit, human-addressed endpoint.
+         *     explicit, human-addressed endpoint. It is permanent: no installation delivery
+         *     or re-sync binds the repo again; only another explicit bind does.
          *
          *     The forge-side webhook is deliberately **left in place**. Deleting hooks is
          *     not in the port (ADR-0046 exposes registration only), and a stale hook is
@@ -405,14 +407,21 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Re-bind repos the forge reports for this connection (ADR-0060)
-         * @description This is the **healing** path for GitHub, where installing the App *is*
-         *     registration and the registry is therefore only as current as the last
-         *     `installation_repositories` delivery. A dropped delivery leaves a repo the App
-         *     covers with no Project; re-sync notices.
+         * Report the repos the forge reaches that are not enabled, and move this org's Projects off connections that do not serve it (ADR-0060)
+         * @description Enabling a repository is opt-in, so re-sync **creates no Project**. A repo
+         *     the forge reports that is not bound is listed in `available`; an admin
+         *     enables it from the org's repositories page (`POST
+         *     /v1/connections/{id}/repos`). A repo an admin disabled therefore stays
+         *     disabled.
          *
-         *     It deliberately **only binds**. Unbinding on a forge's say-so would let one
-         *     failed API page delete governance — Environments, secrets and RBAC hang off a
+         *     The one change it makes is to an existing Project: a repo of this
+         *     connection's Org that is bound through a connection that does not serve
+         *     its owner (unassigned, or another Org's) moves to this one, with its
+         *     Project (git-bug 19b0a45). That is how an Org takes its repos back from a
+         *     legacy connection.
+         *
+         *     It **never unbinds**. Unbinding on a forge's say-so would let one failed
+         *     API page delete governance — Environments, secrets and RBAC hang off a
          *     Project — so removal stays an explicit human act. `confirmed` reports the
          *     overlap so a stale binding is still visible.
          */
@@ -1385,6 +1394,34 @@ export interface paths {
         };
         /** A Project typed setting's version history (ADR-0075 §11) */
         get: operations["list_project_policy_versions"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/repos": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * An org's repositories, enabled and not, one page at a time
+         * @description Enabling a repository is opt-in, so this is the list an admin enables
+         *     from (`POST /v1/connections/{id}/repos`) and disables from (`DELETE
+         *     /v1/connections/{id}/repos/{owner}/{name}`). The forge is asked live, as
+         *     the Add repository pick-list is (`…/available-repos`); no list of
+         *     available repositories is stored. The forge port returns a connection's
+         *     whole list, so the server pages the merged result.
+         *
+         *     Read on the org may list it; `can_change` says per row whether the caller
+         *     may also act on it.
+         */
+        get: operations["org_repos"];
         put?: never;
         post?: never;
         delete?: never;
@@ -2641,7 +2678,7 @@ export interface components {
         BindRepoResultDto: {
             /**
              * @description The governed Project's natural key — `(owner, name)` in v1 (1 Project : 1
-             *     RepoRef), the same mapping installation auto-registration uses.
+             *     RepoRef), the same mapping every bind uses.
              */
             org: string;
             project: string;
@@ -3772,6 +3809,52 @@ export interface components {
             trusted_sources: components["schemas"]["TrustedSourceDto"][];
             yanks: components["schemas"]["LibraryYankDto"][];
         };
+        /**
+         * @description One repository of an org: enabled (a Project, bound through a connection)
+         *     or reachable through one of the org's connections and not enabled.
+         */
+        OrgRepoDto: {
+            /**
+             * @description May the caller enable or disable it here? Needs Administer on the
+             *     connection's org, and a connection not managed by configuration.
+             */
+            can_change: boolean;
+            /**
+             * @description The connection it is bound through when enabled, else the one that
+             *     reaches it: the `{id}` of the bind and unbind endpoints.
+             */
+            connection_id: string;
+            /** @description Is it a Project? Enabling binds it; disabling unbinds it. */
+            enabled: boolean;
+            /** @description That connection's forge kind: `github` | `forgejo`. */
+            kind: string;
+            name: string;
+            owner: string;
+            /** @description The Project's name when enabled (the repo name). */
+            project?: string | null;
+            /** @description The repository's page on the forge. */
+            repo_url: string;
+        };
+        /** @description `GET /v1/orgs/{org}/repos` response: one page of the org's repositories. */
+        OrgReposPageDto: {
+            /** @description Does the caller administer the org? */
+            can_administer: boolean;
+            /** @description How many of the org's repositories are enabled, whatever the query. */
+            enabled_total: number;
+            /** Format: int32 */
+            page: number;
+            /** Format: int32 */
+            per_page: number;
+            /** @description This page, sorted by name. */
+            repos: components["schemas"]["OrgRepoDto"][];
+            /** @description How many repositories match the query, across every page. */
+            total: number;
+            /**
+             * @description Connections whose repositories could not be listed. Their enabled
+             *     repositories are still in the list; the ones not enabled are not.
+             */
+            unlisted: components["schemas"]["UnlistedConnectionDto"][];
+        };
         /** @description `GET /v1/orgs/{org}/security/summary`. */
         OrgSecuritySummary: {
             /** Format: int64 */
@@ -4659,20 +4742,33 @@ export interface components {
              */
             widened: string[];
         };
-        /** @description `POST /v1/connections/{id}/resync` body: what reconciliation changed. */
+        /**
+         * @description `POST /v1/connections/{id}/resync` body: what the forge reports, compared
+         *     with what is enabled.
+         */
         ResyncResultDto: {
-            /** @description Repos the forge reports that Scarab did not have bound — now bound. */
-            bound: string[];
+            /**
+             * @description Repos of the connection's Org the forge reports that are not enabled.
+             *     Re-sync does not enable them; an admin does, from the org's
+             *     repositories page.
+             */
+            available: string[];
             /**
              * @description How many bindings the forge confirms. Reported rather than acted on:
              *     see the handler's note on why re-sync never unbinds.
              */
             confirmed: number;
             /**
-             * @description Repos the forge reports that were not bound (git-bug 19b0a45): owned
-             *     by another account than the connection's Org, already bound through
-             *     another connection that serves an Org, or reported to a connection
-             *     that serves no Org yet (it binds nothing until it is assigned).
+             * @description Repos that were already Projects, bound through a connection that does
+             *     not serve their owner (unassigned, or another Org's), and now bound
+             *     through this one with their Projects (git-bug 19b0a45).
+             */
+            moved: string[];
+            /**
+             * @description Repos the forge reports that are neither available nor moved: owned by
+             *     another account than the connection's Org, already bound through
+             *     another connection that serves an Org, or reported to a connection that
+             *     serves no Org yet.
              */
             skipped: string[];
         };
@@ -5410,6 +5506,11 @@ export interface components {
         /** @description What an uninstall removed. */
         UninstalledPluginDto: {
             name: string;
+        };
+        /** @description A connection of the org that could not list its repositories, and why. */
+        UnlistedConnectionDto: {
+            connection_id: string;
+            reason: string;
         };
         /** @description A newer first-party version than the one installed. */
         UpdateNoticeDto: {
@@ -9728,6 +9829,49 @@ export interface operations {
                 content?: never;
             };
             /** @description no such Policy in this Project, or not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    org_repos: {
+        parameters: {
+            query?: {
+                /** @description 1-based page (default 1) */
+                page?: number;
+                /** @description repositories per page (default 25, max 100) */
+                per_page?: number;
+                /** @description only names containing this text, ignoring case */
+                q?: string;
+            };
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrgReposPageDto"];
+                };
+            };
+            /** @description no Read on the org */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no connection registry wired */
             404: {
                 headers: {
                     [name: string]: unknown;

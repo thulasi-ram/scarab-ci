@@ -133,6 +133,16 @@ async fn harness(forge: FakeForge) -> Harness {
         .await
         .unwrap();
     }
+    rbac.grant(
+        &Binding {
+            subject: "acme-reader".into(),
+            scope: Scope::Org("acme".into()),
+            role: Role::Viewer,
+        },
+        BindingOrigin::Native,
+    )
+    .await
+    .unwrap();
     let tokens = Arc::new(InMemoryApiTokens::new());
     tokens
         .put(
@@ -163,6 +173,7 @@ async fn harness(forge: FakeForge) -> Harness {
         FakeAuthenticator::new()
             .with_credential("root-code", person("root", vec![Role::Owner]))
             .with_credential("acme-code", person("acme-admin", vec![]))
+            .with_credential("acme-reader-code", person("acme-reader", vec![]))
             .with_credential("globex-code", person("globex-admin", vec![])),
     );
     let logs = Arc::new(LogService::new(
@@ -938,6 +949,83 @@ async fn an_installation_does_not_join_an_org_that_only_holds_data() {
     assert_eq!(c.org.as_deref(), Some("hooli"));
 }
 
+fn names(page: &serde_json::Value) -> Vec<String> {
+    page["repos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// The org's repositories page: every enabled repo and every one its
+/// connections reach that is not enabled, one page at a time. Only the
+/// org's own repos are listed, an admin may act on each row, a reader may
+/// only look, and an admin of another org is refused.
+#[tokio::test]
+async fn the_org_repos_page_lists_enabled_and_available_repos_to_the_orgs_readers() {
+    let h = harness(forge()).await;
+
+    let acme = login(&h.app, "acme-code").await;
+    let (st, page) = call(&h, "GET", "/v1/orgs/acme/repos", &acme, None).await;
+    assert_eq!(st, StatusCode::OK, "{page}");
+    assert_eq!(names(&page), vec!["api", "web"], "sorted by name: {page}");
+    assert_eq!(page["total"], 2);
+    assert_eq!(page["enabled_total"], 1);
+    assert_eq!(page["can_administer"], true);
+    let api = &page["repos"][0];
+    assert_eq!(api["enabled"], false);
+    assert!(api["project"].is_null());
+    assert_eq!(api["connection_id"], "gh-acme");
+    assert_eq!(api["can_change"], true);
+    assert_eq!(api["repo_url"], "https://github.com/acme/api");
+    let web = &page["repos"][1];
+    assert_eq!(web["enabled"], true);
+    assert_eq!(web["project"], "web");
+    assert_eq!(web["can_change"], true);
+    assert_eq!(page["unlisted"], serde_json::json!([]));
+
+    // Paged on the server, and filtered by name before paging.
+    let (_, p2) = call(
+        &h,
+        "GET",
+        "/v1/orgs/acme/repos?per_page=1&page=2",
+        &acme,
+        None,
+    )
+    .await;
+    assert_eq!(names(&p2), vec!["web"]);
+    assert_eq!(p2["total"], 2);
+    assert_eq!(p2["page"], 2);
+    assert_eq!(p2["per_page"], 1);
+    let (_, q) = call(&h, "GET", "/v1/orgs/acme/repos?q=AP", &acme, None).await;
+    assert_eq!(names(&q), vec!["api"]);
+    assert_eq!(q["total"], 1);
+    assert_eq!(
+        q["enabled_total"], 1,
+        "the enabled count ignores the filter"
+    );
+
+    // A reader sees the same list and may act on none of it.
+    let reader = login(&h.app, "acme-reader-code").await;
+    let (st, page) = call(&h, "GET", "/v1/orgs/acme/repos", &reader, None).await;
+    assert_eq!(st, StatusCode::OK, "{page}");
+    assert_eq!(names(&page), vec!["api", "web"]);
+    assert_eq!(page["can_administer"], false);
+    assert!(page["repos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|r| r["can_change"] == false));
+
+    // Another org's admin is refused, by session and by org token.
+    let globex = login(&h.app, "globex-code").await;
+    for bearer in [globex.as_str(), GLOBEX_TOKEN] {
+        let (st, _) = call(&h, "GET", "/v1/orgs/acme/repos", bearer, None).await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+    }
+}
+
 /// Disabling a GitHub repo is permanent: the unbind removes its Project, and
 /// neither a later re-sync nor a later delivery of the installation binds
 /// it again. The repo is listed as available instead.
@@ -966,4 +1054,12 @@ async fn a_disabled_repo_stays_disabled_after_a_resync() {
         "{b}"
     );
     assert!(h.db.resolve(&repo("acme", "web")).await.unwrap().is_none());
+
+    let (_, page) = call(&h, "GET", "/v1/orgs/acme/repos", &acme, None).await;
+    assert_eq!(page["enabled_total"], 0, "{page}");
+    assert!(page["repos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["name"] == "web" && r["enabled"] == false));
 }

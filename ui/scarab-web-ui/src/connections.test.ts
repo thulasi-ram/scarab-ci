@@ -45,22 +45,28 @@ describe("repositories offered to bind", () => {
 });
 
 describe("re-sync note", () => {
-  it("names what was bound", () => {
-    expect(resyncNote({ bound: ["acme/api"], confirmed: 2, skipped: [] })).toBe(
-      "Bound 1 new repository: acme/api.",
+  it("names the repositories that are not enabled, and binds none", () => {
+    expect(resyncNote({ available: ["acme/api"], moved: [], confirmed: 2, skipped: [] })).toBe(
+      "2 enabled repositories confirmed. 1 repository not enabled: acme/api. Enable them on the organization page.",
     );
   });
 
-  it("says when nothing changed", () => {
-    expect(resyncNote({ bound: [], confirmed: 3, skipped: [] })).toBe(
-      "Already in sync: 3 repositories confirmed.",
+  it("says only what was confirmed when nothing else changed", () => {
+    expect(resyncNote({ available: [], moved: [], confirmed: 3, skipped: [] })).toBe(
+      "3 enabled repositories confirmed.",
+    );
+  });
+
+  it("names the projects moved to this connection", () => {
+    expect(resyncNote({ available: [], moved: ["acme/web"], confirmed: 0 })).toBe(
+      "0 enabled repositories confirmed. Moved 1 repository to this connection: acme/web.",
     );
   });
 
   it("lists the repositories the server skipped", () => {
-    const note = resyncNote({ bound: [], confirmed: 1, skipped: ["globex/api", "other/x"] });
-    expect(note).toContain("Not bound: globex/api, other/x");
-    expect(note.startsWith("Already in sync: 1 repository confirmed.")).toBe(true);
+    const note = resyncNote({ available: [], confirmed: 1, skipped: ["globex/api", "other/x"] });
+    expect(note).toContain("Not listed: globex/api, other/x");
+    expect(note.startsWith("1 enabled repository confirmed.")).toBe(true);
   });
 });
 

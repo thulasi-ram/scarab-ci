@@ -1731,6 +1731,34 @@ export async function assignConnectionOrg(id: string, org: string): Promise<void
 // calls are what bring a repo into existence as a governed Project. ---
 
 export type AvailableRepo = components["schemas"]["AvailableRepoDto"];
+export type OrgRepo = components["schemas"]["OrgRepoDto"];
+export type OrgReposPage = components["schemas"]["OrgReposPageDto"];
+
+/**
+ * One page of an org's repositories (`GET /v1/orgs/{org}/repos`): every
+ * enabled one and every one its connections reach that is not enabled,
+ * sorted by name. The server pages and filters, so `q` narrows the whole
+ * list, not only the page.
+ */
+export async function listOrgRepos(
+  org: string,
+  opts: { page?: number; perPage?: number; q?: string } = {},
+): Promise<OrgReposPage> {
+  const { data, error, response } = await api.GET("/v1/orgs/{org}/repos", {
+    params: {
+      path: { org },
+      query: {
+        page: opts.page,
+        per_page: opts.perPage,
+        q: opts.q?.trim() ? opts.q.trim() : undefined,
+      },
+    },
+  });
+  if (error || !data) {
+    throw new Error(errorText(error) || `could not list the repositories (${response.status})`);
+  }
+  return data;
+}
 export type BindRepoResult = components["schemas"]["BindRepoResultDto"];
 
 /**

@@ -38,15 +38,30 @@ export function reposForOrg<T extends RepoLike>(
 }
 
 /** What a re-sync answered, as one line under the connection. */
-export function resyncNote(r: { bound: string[]; confirmed: number; skipped?: string[] }): string {
+export function resyncNote(r: {
+  available: string[];
+  moved?: string[];
+  confirmed: number;
+  skipped?: string[];
+}): string {
   const repos = (n: number) => (n === 1 ? "repository" : "repositories");
-  const head =
-    r.bound.length > 0
-      ? `Bound ${r.bound.length} new ${repos(r.bound.length)}: ${r.bound.join(", ")}.`
-      : `Already in sync: ${r.confirmed} ${repos(r.confirmed)} confirmed.`;
+  const parts = [`${r.confirmed} enabled ${repos(r.confirmed)} confirmed.`];
+  const moved = r.moved ?? [];
+  if (moved.length > 0) {
+    parts.push(`Moved ${moved.length} ${repos(moved.length)} to this connection: ${moved.join(", ")}.`);
+  }
+  if (r.available.length > 0) {
+    parts.push(
+      `${r.available.length} ${repos(r.available.length)} not enabled: ${r.available.join(", ")}. Enable them on the organization page.`,
+    );
+  }
   const skipped = r.skipped ?? [];
-  if (skipped.length === 0) return head;
-  return `${head} Not bound: ${skipped.join(", ")} (owned by another account, or already bound through another connection).`;
+  if (skipped.length > 0) {
+    parts.push(
+      `Not listed: ${skipped.join(", ")} (owned by another account, or enabled through another connection).`,
+    );
+  }
+  return parts.join(" ");
 }
 
 /**

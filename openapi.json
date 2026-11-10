@@ -570,7 +570,7 @@
           "Forge Connections"
         ],
         "summary": "Bind a repo to a connection, creating its Project, and register its webhook (ADR-0060)",
-        "description": "There is no `projects` table: a Project *is* a `forge_repos` binding\n(ADR-0046), so this endpoint is the repo→Project onboarding flow for any forge\nwithout installation-style auto-registration. After it, the repo appears on\n`GET /v1/repos`, can hold Environments and secrets, and its pushes resolve to\na tenant. GitHub keeps binding itself from the `installation` webhook; this is\nthe Forgejo path.\n\nRegistration is attempted **after** the binding lands and its failure is\n*reported, not rolled back*: the binding is the durable governance fact, a\nhook is a remote side effect on a system that may be momentarily unreachable,\nand unbinding on a failed hook call would delete a Project an admin just\nasked for. `POST …/repos/{owner}/{name}/webhook` retries.",
+        "description": "There is no `projects` table: a Project *is* a `forge_repos` binding\n(ADR-0046), so this endpoint is the repo→Project onboarding flow — \"Enable\"\non the org's repositories page and \"Add repository\" on its Connections —\nfor every forge. After it, the repo appears on `GET /v1/repos`, can hold\nEnvironments and secrets, and its pushes resolve to a tenant. A GitHub\ninstallation makes its repos available but binds none of them, so this is\nthe GitHub path too.\n\nRegistration is attempted **after** the binding lands and its failure is\n*reported, not rolled back*: the binding is the durable governance fact, a\nhook is a remote side effect on a system that may be momentarily unreachable,\nand unbinding on a failed hook call would delete a Project an admin just\nasked for. `POST …/repos/{owner}/{name}/webhook` retries.",
         "operationId": "bind_repo",
         "parameters": [
           {
@@ -643,7 +643,7 @@
           "Forge Connections"
         ],
         "summary": "Unbind a repo from a connection, removing its Project (ADR-0060)",
-        "description": "The inverse of the bind above, and destructive in the same measure: the\nbinding is the Project, so its Environments, scoped secrets and RBAC go with\nit. That is why re-sync never does this on a forge's say-so and why this is an\nexplicit, human-addressed endpoint.\n\nThe forge-side webhook is deliberately **left in place**. Deleting hooks is\nnot in the port (ADR-0046 exposes registration only), and a stale hook is\nharmless: an unbound repo's deliveries resolve to nothing and are dropped.",
+        "description": "The inverse of the bind above, and destructive in the same measure: the\nbinding is the Project, so its Environments, scoped secrets and RBAC go with\nit. That is why re-sync never does this on a forge's say-so and why this is an\nexplicit, human-addressed endpoint. It is permanent: no installation delivery\nor re-sync binds the repo again; only another explicit bind does.\n\nThe forge-side webhook is deliberately **left in place**. Deleting hooks is\nnot in the port (ADR-0046 exposes registration only), and a stale hook is\nharmless: an unbound repo's deliveries resolve to nothing and are dropped.",
         "operationId": "unbind_repo",
         "parameters": [
           {
@@ -778,8 +778,8 @@
         "tags": [
           "Forge Connections"
         ],
-        "summary": "Re-bind repos the forge reports for this connection (ADR-0060)",
-        "description": "This is the **healing** path for GitHub, where installing the App *is*\nregistration and the registry is therefore only as current as the last\n`installation_repositories` delivery. A dropped delivery leaves a repo the App\ncovers with no Project; re-sync notices.\n\nIt deliberately **only binds**. Unbinding on a forge's say-so would let one\nfailed API page delete governance — Environments, secrets and RBAC hang off a\nProject — so removal stays an explicit human act. `confirmed` reports the\noverlap so a stale binding is still visible.",
+        "summary": "Report the repos the forge reaches that are not enabled, and move this org's Projects off connections that do not serve it (ADR-0060)",
+        "description": "Enabling a repository is opt-in, so re-sync **creates no Project**. A repo\nthe forge reports that is not bound is listed in `available`; an admin\nenables it from the org's repositories page (`POST\n/v1/connections/{id}/repos`). A repo an admin disabled therefore stays\ndisabled.\n\nThe one change it makes is to an existing Project: a repo of this\nconnection's Org that is bound through a connection that does not serve\nits owner (unassigned, or another Org's) moves to this one, with its\nProject (git-bug 19b0a45). That is how an Org takes its repos back from a\nlegacy connection.\n\nIt **never unbinds**. Unbinding on a forge's say-so would let one failed\nAPI page delete governance — Environments, secrets and RBAC hang off a\nProject — so removal stays an explicit human act. `confirmed` reports the\noverlap so a stale binding is still visible.",
         "operationId": "resync_connection",
         "parameters": [
           {
@@ -5419,6 +5419,84 @@
         ]
       }
     },
+    "/v1/orgs/{org}/repos": {
+      "get": {
+        "tags": [
+          "Repositories"
+        ],
+        "summary": "An org's repositories, enabled and not, one page at a time",
+        "description": "Enabling a repository is opt-in, so this is the list an admin enables\nfrom (`POST /v1/connections/{id}/repos`) and disables from (`DELETE\n/v1/connections/{id}/repos/{owner}/{name}`). The forge is asked live, as\nthe Add repository pick-list is (`…/available-repos`); no list of\navailable repositories is stored. The forge port returns a connection's\nwhole list, so the server pages the merged result.\n\nRead on the org may list it; `can_change` says per row whether the caller\nmay also act on it.",
+        "operationId": "org_repos",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "description": "1-based page (default 1)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "per_page",
+            "in": "query",
+            "description": "repositories per page (default 25, max 100)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "description": "only names containing this text, ignoring case",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrgReposPageDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "no Read on the org"
+          },
+          "404": {
+            "description": "no connection registry wired"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
     "/v1/orgs/{org}/secrets/orphaned": {
       "get": {
         "tags": [
@@ -8920,7 +8998,7 @@
         "properties": {
           "org": {
             "type": "string",
-            "description": "The governed Project's natural key — `(owner, name)` in v1 (1 Project : 1\nRepoRef), the same mapping installation auto-registration uses."
+            "description": "The governed Project's natural key — `(owner, name)` in v1 (1 Project : 1\nRepoRef), the same mapping every bind uses."
           },
           "project": {
             "type": "string"
@@ -11159,6 +11237,107 @@
           }
         }
       },
+      "OrgRepoDto": {
+        "type": "object",
+        "description": "One repository of an org: enabled (a Project, bound through a connection)\nor reachable through one of the org's connections and not enabled.",
+        "required": [
+          "owner",
+          "name",
+          "enabled",
+          "connection_id",
+          "kind",
+          "repo_url",
+          "can_change"
+        ],
+        "properties": {
+          "can_change": {
+            "type": "boolean",
+            "description": "May the caller enable or disable it here? Needs Administer on the\nconnection's org, and a connection not managed by configuration."
+          },
+          "connection_id": {
+            "type": "string",
+            "description": "The connection it is bound through when enabled, else the one that\nreaches it: the `{id}` of the bind and unbind endpoints."
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "Is it a Project? Enabling binds it; disabling unbinds it."
+          },
+          "kind": {
+            "type": "string",
+            "description": "That connection's forge kind: `github` | `forgejo`."
+          },
+          "name": {
+            "type": "string"
+          },
+          "owner": {
+            "type": "string"
+          },
+          "project": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The Project's name when enabled (the repo name)."
+          },
+          "repo_url": {
+            "type": "string",
+            "description": "The repository's page on the forge."
+          }
+        }
+      },
+      "OrgReposPageDto": {
+        "type": "object",
+        "description": "`GET /v1/orgs/{org}/repos` response: one page of the org's repositories.",
+        "required": [
+          "repos",
+          "total",
+          "enabled_total",
+          "page",
+          "per_page",
+          "can_administer",
+          "unlisted"
+        ],
+        "properties": {
+          "can_administer": {
+            "type": "boolean",
+            "description": "Does the caller administer the org?"
+          },
+          "enabled_total": {
+            "type": "integer",
+            "description": "How many of the org's repositories are enabled, whatever the query.",
+            "minimum": 0
+          },
+          "page": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "per_page": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "repos": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OrgRepoDto"
+            },
+            "description": "This page, sorted by name."
+          },
+          "total": {
+            "type": "integer",
+            "description": "How many repositories match the query, across every page.",
+            "minimum": 0
+          },
+          "unlisted": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UnlistedConnectionDto"
+            },
+            "description": "Connections whose repositories could not be listed. Their enabled\nrepositories are still in the list; the ones not enabled are not."
+          }
+        }
+      },
       "OrgSecuritySummary": {
         "type": "object",
         "description": "`GET /v1/orgs/{org}/security/summary`.",
@@ -12975,31 +13154,39 @@
       },
       "ResyncResultDto": {
         "type": "object",
-        "description": "`POST /v1/connections/{id}/resync` body: what reconciliation changed.",
+        "description": "`POST /v1/connections/{id}/resync` body: what the forge reports, compared\nwith what is enabled.",
         "required": [
-          "bound",
+          "available",
+          "moved",
           "skipped",
           "confirmed"
         ],
         "properties": {
-          "bound": {
+          "available": {
             "type": "array",
             "items": {
               "type": "string"
             },
-            "description": "Repos the forge reports that Scarab did not have bound — now bound."
+            "description": "Repos of the connection's Org the forge reports that are not enabled.\nRe-sync does not enable them; an admin does, from the org's\nrepositories page."
           },
           "confirmed": {
             "type": "integer",
             "description": "How many bindings the forge confirms. Reported rather than acted on:\nsee the handler's note on why re-sync never unbinds.",
             "minimum": 0
           },
+          "moved": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Repos that were already Projects, bound through a connection that does\nnot serve their owner (unassigned, or another Org's), and now bound\nthrough this one with their Projects (git-bug 19b0a45)."
+          },
           "skipped": {
             "type": "array",
             "items": {
               "type": "string"
             },
-            "description": "Repos the forge reports that were not bound (git-bug 19b0a45): owned\nby another account than the connection's Org, already bound through\nanother connection that serves an Org, or reported to a connection\nthat serves no Org yet (it binds nothing until it is assigned)."
+            "description": "Repos the forge reports that are neither available nor moved: owned by\nanother account than the connection's Org, already bound through\nanother connection that serves an Org, or reported to a connection that\nserves no Org yet."
           }
         }
       },
@@ -14348,6 +14535,22 @@
         ],
         "properties": {
           "name": {
+            "type": "string"
+          }
+        }
+      },
+      "UnlistedConnectionDto": {
+        "type": "object",
+        "description": "A connection of the org that could not list its repositories, and why.",
+        "required": [
+          "connection_id",
+          "reason"
+        ],
+        "properties": {
+          "connection_id": {
+            "type": "string"
+          },
+          "reason": {
             "type": "string"
           }
         }

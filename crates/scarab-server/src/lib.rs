@@ -12879,6 +12879,246 @@ async fn available_repos(
     Ok(Json(out))
 }
 
+/// `GET /v1/orgs/{org}/repos` query: a page of the org's repositories.
+#[derive(Debug, Deserialize)]
+pub struct OrgReposQuery {
+    /// 1-based page number (default 1).
+    pub page: Option<u32>,
+    /// Repositories per page (default [`DEFAULT_ORG_REPOS_PER_PAGE`], at most
+    /// [`MAX_ORG_REPOS_PER_PAGE`]).
+    pub per_page: Option<u32>,
+    /// Only repositories whose name contains this text, ignoring case.
+    pub q: Option<String>,
+}
+
+/// Default page size for `GET /v1/orgs/{org}/repos`.
+const DEFAULT_ORG_REPOS_PER_PAGE: u32 = 25;
+/// Upper bound on its page size.
+const MAX_ORG_REPOS_PER_PAGE: u32 = 100;
+
+/// One repository of an org: enabled (a Project, bound through a connection)
+/// or reachable through one of the org's connections and not enabled.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct OrgRepoDto {
+    pub owner: String,
+    pub name: String,
+    /// Is it a Project? Enabling binds it; disabling unbinds it.
+    pub enabled: bool,
+    /// The Project's name when enabled (the repo name).
+    pub project: Option<String>,
+    /// The connection it is bound through when enabled, else the one that
+    /// reaches it: the `{id}` of the bind and unbind endpoints.
+    pub connection_id: String,
+    /// That connection's forge kind: `github` | `forgejo`.
+    pub kind: String,
+    /// The repository's page on the forge.
+    pub repo_url: String,
+    /// May the caller enable or disable it here? Needs Administer on the
+    /// connection's org, and a connection not managed by configuration.
+    pub can_change: bool,
+}
+
+/// A connection of the org that could not list its repositories, and why.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct UnlistedConnectionDto {
+    pub connection_id: String,
+    pub reason: String,
+}
+
+/// `GET /v1/orgs/{org}/repos` response: one page of the org's repositories.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct OrgReposPageDto {
+    /// This page, sorted by name.
+    pub repos: Vec<OrgRepoDto>,
+    /// How many repositories match the query, across every page.
+    pub total: usize,
+    /// How many of the org's repositories are enabled, whatever the query.
+    pub enabled_total: usize,
+    pub page: u32,
+    pub per_page: u32,
+    /// Does the caller administer the org?
+    pub can_administer: bool,
+    /// Connections whose repositories could not be listed. Their enabled
+    /// repositories are still in the list; the ones not enabled are not.
+    pub unlisted: Vec<UnlistedConnectionDto>,
+}
+
+/// The repositories of an org, one page at a time: every enabled one (a
+/// Project) and every one the org's connections reach that is not enabled.
+///
+/// Enabling a repository is opt-in, so this is the list an admin enables
+/// from (`POST /v1/connections/{id}/repos`) and disables from (`DELETE
+/// /v1/connections/{id}/repos/{owner}/{name}`). The forge is asked live, as
+/// the Add repository pick-list is (`…/available-repos`); no list of
+/// available repositories is stored. The forge port returns a connection's
+/// whole list, so the server pages the merged result.
+///
+/// Read on the org may list it; `can_change` says per row whether the caller
+/// may also act on it.
+#[utoipa::path(
+    get,
+    path = "/v1/orgs/{org}/repos",
+    summary = "An org's repositories, enabled and not, one page at a time",
+    params(
+        ("org" = String, Path, description = "org"),
+        ("page" = Option<u32>, Query, description = "1-based page (default 1)"),
+        ("per_page" = Option<u32>, Query, description = "repositories per page (default 25, max 100)"),
+        ("q" = Option<String>, Query, description = "only names containing this text, ignoring case")
+    ),
+    responses(
+        (status = 200, body = OrgReposPageDto),
+        (status = 403, description = "no Read on the org"),
+        (status = 404, description = "no connection registry wired")
+    )
+)]
+async fn org_repos(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(org): Path<String>,
+    Query(q): Query<OrgReposQuery>,
+) -> Result<Json<OrgReposPageDto>, ApiError> {
+    let caller = authenticate(&st, &headers, Action::Read).await?;
+    let scope = scarab_identity::Scope::Org(org.clone());
+    if !caller.may_globally(Action::Read) && !caller.may(&st, Action::Read, &scope).await? {
+        return Err(ApiError::Forbidden);
+    }
+    let global_admin = caller.may_globally(Action::Administer);
+    let can_administer = global_admin || caller.may(&st, Action::Administer, &scope).await?;
+    let connections = st.connections.as_ref().ok_or(ApiError::NotFound)?;
+    let registry = |e: scarab_forge::RegistryError| ApiError::BadRequest(e.to_string());
+    let config_owned: std::collections::BTreeSet<String> = connections
+        .config_owned_connection_ids()
+        .await
+        .map_err(registry)?
+        .into_iter()
+        .collect();
+
+    // May the caller bind and unbind through `conn` for this org? The same
+    // rule the bind and unbind endpoints apply, so a row never offers an
+    // action that answers 403, 404 or 409.
+    let mut may_change: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    let all = connections.list_connections().await.map_err(registry)?;
+    for conn in &all {
+        let ok = can_administer
+            && !config_owned.contains(&conn.id)
+            && conn.org.as_deref().is_none_or(|o| o == org)
+            && may_administer_connection(&st, &caller, global_admin, conn).await?;
+        may_change.insert(conn.id.clone(), ok);
+    }
+
+    // Keyed by (name, owner): sorted by name, one row per repository.
+    let mut rows: std::collections::BTreeMap<(String, String), OrgRepoDto> =
+        std::collections::BTreeMap::new();
+    // Every Project homed in this org, whichever connection it is bound through.
+    for conn in &all {
+        for repo in connections.repos_of(&conn.id).await.map_err(registry)? {
+            let Some(resolved) = connections.resolve(&repo).await.map_err(registry)? else {
+                continue;
+            };
+            if resolved.org != org {
+                continue;
+            }
+            rows.insert(
+                (repo.name.clone(), repo.owner.clone()),
+                OrgRepoDto {
+                    repo_url: web_repo_url(conn.kind, &conn.base_url, &repo.owner, &repo.name),
+                    owner: repo.owner,
+                    name: repo.name,
+                    enabled: true,
+                    project: Some(resolved.project),
+                    connection_id: conn.id.clone(),
+                    kind: conn.kind.as_str().to_string(),
+                    can_change: may_change.get(&conn.id).copied().unwrap_or(false),
+                },
+            );
+        }
+    }
+    let enabled_total = rows.len();
+
+    // What each connection serving the org reaches, owned by the org: only
+    // those can be bound through it (git-bug 19b0a45).
+    let mut unlisted = Vec::new();
+    for conn in all
+        .iter()
+        .filter(|c| c.org.as_deref() == Some(org.as_str()))
+    {
+        let reported = match connection_adapter(&st, conn).await {
+            Ok(forge) => forge.list_accessible_repos().await,
+            Err(_) => Err(scarab_forge::ForgeError::Api(
+                "no forge adapter is wired for this connection".into(),
+            )),
+        };
+        let reported = match reported {
+            Ok(repos) => repos,
+            Err(scarab_forge::ForgeError::Unsupported(_)) => {
+                unlisted.push(UnlistedConnectionDto {
+                    connection_id: conn.id.clone(),
+                    reason: format!(
+                        "{} cannot list its repositories; add one by name on the Connections page",
+                        conn.kind.as_str()
+                    ),
+                });
+                continue;
+            }
+            Err(e) => {
+                unlisted.push(UnlistedConnectionDto {
+                    connection_id: conn.id.clone(),
+                    reason: e.to_string(),
+                });
+                continue;
+            }
+        };
+        for repo in reported.into_iter().filter(|r| r.owner == org) {
+            rows.entry((repo.name.clone(), repo.owner.clone()))
+                .or_insert_with(|| OrgRepoDto {
+                    repo_url: web_repo_url(conn.kind, &conn.base_url, &repo.owner, &repo.name),
+                    owner: repo.owner,
+                    name: repo.name,
+                    enabled: false,
+                    project: None,
+                    connection_id: conn.id.clone(),
+                    kind: conn.kind.as_str().to_string(),
+                    can_change: may_change.get(&conn.id).copied().unwrap_or(false),
+                });
+        }
+    }
+
+    let needle =
+        q.q.as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .map(str::to_lowercase);
+    let matching: Vec<OrgRepoDto> = rows
+        .into_values()
+        .filter(|r| {
+            needle
+                .as_deref()
+                .is_none_or(|n| r.name.to_lowercase().contains(n))
+        })
+        .collect();
+    let total = matching.len();
+    let per_page = q
+        .per_page
+        .unwrap_or(DEFAULT_ORG_REPOS_PER_PAGE)
+        .clamp(1, MAX_ORG_REPOS_PER_PAGE);
+    let page = q.page.unwrap_or(1).max(1);
+    let skip = (page as usize - 1).saturating_mul(per_page as usize);
+    let repos = matching
+        .into_iter()
+        .skip(skip)
+        .take(per_page as usize)
+        .collect();
+    Ok(Json(OrgReposPageDto {
+        repos,
+        total,
+        enabled_total,
+        page,
+        per_page,
+        can_administer,
+        unlisted,
+    }))
+}
+
 /// Bind a repo to this connection — **which is how a Project comes into being**
 /// (ADR-0060 part C).
 ///
@@ -13443,7 +13683,7 @@ fn tag_for_path(path: &str) -> Option<&'static str> {
         "Secrets"
     } else if path.contains("/runs") {
         "Runs"
-    } else if path.starts_with("/v1/repos") {
+    } else if path.starts_with("/v1/repos") || path == "/v1/orgs/{org}/repos" {
         "Repositories"
     } else {
         return None;
@@ -13755,6 +13995,7 @@ impl utoipa::Modify for StepUpResponses {
         resync_connection,
         connection_preflight,
         available_repos,
+        org_repos,
         bind_repo,
         register_repo_webhook,
         unbind_repo,
@@ -13857,6 +14098,9 @@ impl utoipa::Modify for StepUpResponses {
         ConnectionOrgDto,
         CreatedConnectionDto,
         AvailableRepoDto,
+        OrgRepoDto,
+        OrgReposPageDto,
+        UnlistedConnectionDto,
         BindRepoRequest,
         BindRepoResultDto,
         ResyncResultDto,
