@@ -223,8 +223,18 @@ async fn list_runs_filters_by_org_before_the_limit() {
     let (_, doc) = list("/v1/runs?limit=2").await;
     assert_eq!(ids(&doc), vec!["globex-2", "globex-1"]);
 
-    let (status, _) = list("/v1/runs?org=").await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // A refusal's body is not JSON, so only its status is read.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/runs?org=")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
