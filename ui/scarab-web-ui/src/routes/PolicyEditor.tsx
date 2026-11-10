@@ -18,7 +18,7 @@
 //
 // Both render inside the settings frame, with Policies marked in the
 // sidebar. The server enforces Administer on the org for every write.
-import { createEffect, createMemo, createResource, createSignal, For, onCleanup, Show, type JSX } from "solid-js";
+import { createEffect, createMemo, createResource, createSignal, For, Index, onCleanup, Show, type JSX } from "solid-js";
 import { A, useLocation, useNavigate, useParams, useSearchParams } from "@solidjs/router";
 import {
   checkPolicy,
@@ -389,17 +389,19 @@ function EditForm(props: { org: string; stored?: PolicyRecord; onSaved: () => vo
             title="Rules"
             note="A rule denies when its condition holds. Its message is shown with the refusal and on the Run page."
           >
-            <For each={form().rules}>
+            {/* Index, not For: a keystroke replaces the rule object, and For
+                would rebuild the row and its textarea, which loses focus. */}
+            <Index each={form().rules}>
               {(rule, i) => (
                 <div class="pol-rule">
                   <div class="pol-rule-h">
-                    <span>Rule {i() + 1}</span>
+                    <span>Rule {i + 1}</span>
                     <span class="tok-role">deny</span>
                     <Show when={form().rules.length > 1}>
                       <button
                         class="btn btn-ghost btn-sm oenv-actions"
                         type="button"
-                        onClick={() => edit({ rules: form().rules.filter((_, j) => j !== i()) })}
+                        onClick={() => edit({ rules: form().rules.filter((_, j) => j !== i) })}
                       >
                         Remove
                       </button>
@@ -407,39 +409,39 @@ function EditForm(props: { org: string; stored?: PolicyRecord; onSaved: () => vo
                   </div>
                   <div class="f">
                     <div class="f-l">
-                      <label class="f-lbl" for={`pol-when-${i()}`}>
+                      <label class="f-lbl" for={`pol-when-${i}`}>
                         Condition
                       </label>
                       <span class="f-req" aria-hidden="true">*</span>
                     </div>
                     <CelInput
-                      id={`pol-when-${i()}`}
-                      value={rule.when}
-                      onValue={(v) => setRule(i(), { when: v })}
+                      id={`pol-when-${i}`}
+                      value={rule().when}
+                      onValue={(v) => setRule(i, { when: v })}
                       schema={schema()}
-                      invalid={(placed().rules.get(i())?.when ?? []).some((d) => d.severity === "error")}
+                      invalid={(placed().rules.get(i)?.when ?? []).some((d) => d.severity === "error")}
                     />
                     <Show
-                      when={(placed().rules.get(i())?.when ?? []).length > 0}
+                      when={(placed().rules.get(i)?.when ?? []).length > 0}
                       fallback={
                         <p class="f-help">
-                          <Show when={readsOf(i()).length > 0} fallback="A CEL expression over the checkpoint's input.">
-                            Reads <span class="mono">{readsOf(i()).join(", ")}</span>.
+                          <Show when={readsOf(i).length > 0} fallback="A CEL expression over the checkpoint's input.">
+                            Reads <span class="mono">{readsOf(i).join(", ")}</span>.
                           </Show>
                         </p>
                       }
                     >
-                      <ul class="pol-diags" aria-label={`Problems with rule ${i() + 1}`}>
-                        <For each={placed().rules.get(i())!.when}>{(d) => <DiagnosticLine d={d} />}</For>
+                      <ul class="pol-diags" aria-label={`Problems with rule ${i + 1}`}>
+                        <For each={placed().rules.get(i)!.when}>{(d) => <DiagnosticLine d={d} />}</For>
                       </ul>
                     </Show>
                   </div>
-                  <Field label="Message" required error={fieldError(placed().rules.get(i())?.message)}>
-                    <Input value={rule.message} onValue={(v) => setRule(i(), { message: v })} />
+                  <Field label="Message" required error={fieldError(placed().rules.get(i)?.message)}>
+                    <Input value={rule().message} onValue={(v) => setRule(i, { message: v })} />
                   </Field>
                 </div>
               )}
-            </For>
+            </Index>
             <div>
               <button
                 class="btn btn-ghost btn-sm"
