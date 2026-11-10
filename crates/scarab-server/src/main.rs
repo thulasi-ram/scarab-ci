@@ -509,6 +509,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // blobs + index past the class TTL. Non-terminal (incl. gate-suspended)
     // runs are never eligible by construction; metadata is retained.
     if config.role.runs_driver() {
+        // The step Pod sweep (git-bug 986542a) needs the step namespace: a
+        // kube client of its own, like the debug shell's below. Any other
+        // executor leaves no Pods, so the sweep does not run; no reachable
+        // cluster means the driver is off too (reported there).
+        let step_pods = match config.executor {
+            ExecutorKind::K8s => match K8sExecutor::connect(config.namespace.clone()).await {
+                Ok(exec) => Some(scarab_server::step_pods::StepPodSweep {
+                    cluster: Arc::new(exec),
+                    grace_ms: i64::from(config.retention_step_pod_minutes) * 60 * 1000,
+                }),
+                Err(e) => {
+                    tracing::warn!(error = %e, "step pod sweep off: no kubernetes cluster reachable");
+                    None
+                }
+            },
+            ExecutorKind::Local => None,
+        };
+        let step_pod_sweep_on = step_pods.is_some();
         scarab_server::retention::spawn_sweeper(
             db.clone(),
             workspace_cas.clone(),
@@ -544,8 +562,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 pg.clone() as Arc<dyn scarab_identity::ChallengeStore>,
                 pg.clone() as Arc<dyn scarab_identity::StepUpStore>,
             )),
+            step_pods,
             Duration::from_secs(300),
         );
+        if step_pod_sweep_on {
+            tracing::info!(
+                namespace = %config.namespace,
+                grace_minutes = config.retention_step_pod_minutes,
+                "step pod sweep on (deletes a finished Run's Pods after the grace; \
+                 Pods of Runs this database does not know are left alone)"
+            );
+        }
         tracing::info!(
             "retention sweeper on (logs {}d, workspace CAS {}d mark-sweep; metadata retained, ADR-0050)",
             config.retention_log_days,
