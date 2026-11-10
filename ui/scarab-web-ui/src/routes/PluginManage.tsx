@@ -29,8 +29,9 @@
 // new commit), shows what it adds, removes and keeps against the installed
 // one, and applies it with a new image. The installation keeps its name, id,
 // config, storage and connections. The server decides whether it needs a
-// passkey: when the new manifest asks for anything more, or the image moves
-// to another repository.
+// passkey: a new image digest is new code and always does, as an install
+// does, and so does a manifest that asks for more; only a narrower manifest
+// on the installed image needs none.
 import { createEffect, createMemo, createResource, createSignal, For, on, Show } from "solid-js";
 import { A, useNavigate, useParams } from "@solidjs/router";
 import {
@@ -72,6 +73,7 @@ import {
   STORAGE_NOTE,
   toStorageBody,
   type StorageForm,
+  imageChangesTheAnswer,
   imageError,
   imageRepository,
   imageRepositoryError,
@@ -850,17 +852,14 @@ function UpgradeDialog(props: {
   const [fetched, setFetched] = createSignal<FetchedPluginUpgrade | null>(null);
   const [busy, setBusy] = createSignal<"" | "fetch" | "upgrade">("");
   const [error, setError] = createSignal<string | null>(null);
-  // The image repository the server judged the upgrade with: the image sent
-  // with the read, or the installed one.
-  const [judgedRepo, setJudgedRepo] = createSignal("");
+  // The image the server judged the upgrade with: the one sent with the
+  // read, or the installed one.
+  const [judgedImage, setJudgedImage] = createSignal("");
   // Another source or connection drops the review: what is applied is what
-  // was compared. A new image drops it only when it moves to another
-  // repository, the one thing about the image the server's answer depends on.
+  // was compared. So does another image, since a new digest changes whether
+  // a passkey is needed; a half-typed one does not yet.
   const set = (k: keyof UpgradeFetchForm, v: string) => {
-    const t = v.trim();
-    if (k !== "image" || (t !== "" && !imageError(t) && imageRepository(t) !== judgedRepo())) {
-      setFetched(null);
-    }
+    if (k !== "image" || imageChangesTheAnswer(v, judgedImage())) setFetched(null);
     setForm((f) => ({ ...f, [k]: v }));
   };
   const fetchBody = () => toUpgradeFetchBody(form(), p().source);
@@ -880,7 +879,7 @@ function UpgradeDialog(props: {
     setError(null);
     try {
       setFetched(await fetchPluginUpgrade(props.org, p().name, body));
-      setJudgedRepo(imageRepository(body.image ?? p().image));
+      setJudgedImage(body.image ?? p().image);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not read the new manifest.");
     } finally {
@@ -1002,10 +1001,17 @@ function UpgradeDialog(props: {
               </dd>
             </dl>
             <UpgradeDiff groups={groups()} />
-            <p classList={{ "f-help": true, "plg-warn": f().needs_step_up }} data-testid="upgrade-step-up">
-              <Icon icon={f().needs_step_up ? "alert-triangle" : "shield-check"} size={12} />{" "}
-              {upgradeStepUpLine(f())}
-            </p>
+            <div classList={{ "f-help": true, "plg-warn": f().needs_step_up }} data-testid="upgrade-step-up">
+              <p>
+                <Icon icon={f().needs_step_up ? "alert-triangle" : "shield-check"} size={12} />{" "}
+                {upgradeStepUpLine(f())}
+              </p>
+              <Show when={f().step_up_reasons.length > 0}>
+                <ul class="plg-diff-list">
+                  <For each={f().step_up_reasons}>{(r) => <li>{r}</li>}</For>
+                </ul>
+              </Show>
+            </div>
           </ModalSection>
         )}
       </Show>

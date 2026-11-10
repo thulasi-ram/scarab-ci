@@ -4357,7 +4357,7 @@
           "Plugins"
         ],
         "summary": "Upgrade a plugin installation to a reviewed manifest and image (ADR-0072 §10)",
-        "description": "Same-or-narrower (nothing added, image of the same repository) needs no\nstep-up; wider is confirmed like an install (ADR-0072 §10). The server\ndecides which from the installed manifest and the one it reads here.\n409 when the installed manifest is no longer `expected_current_sha256`,\nand when the source no longer reads as `manifest_sha256`.",
+        "description": "A new image digest is new code and is confirmed like an install, whatever\nthe manifest (ADR-0072 §8, §10); so is a manifest that asks for more.\nOnly a same-or-narrower manifest on the installed image needs no step-up.\nThe server decides from the installed installation and the manifest it\nreads here. Refused while `SCARAB_PLUGINS=off` (409), as an install is.\n409 when the installed manifest is no longer `expected_current_sha256`,\nand when the source no longer reads as `manifest_sha256`.",
         "operationId": "upgrade_plugin",
         "parameters": [
           {
@@ -4404,7 +4404,7 @@
             "description": "a bad image or source, another plugin's manifest, a manifest that is not admissible, or an image the manifest does not name"
           },
           "403": {
-            "description": "not an org admin, a step-up is required (a wider manifest or another image repository), a host Scarab does not fetch from, or a private repository outside the org — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "description": "not an org admin, a step-up is required (a new image, or a manifest that asks for more), a host Scarab does not fetch from, or a private repository outside the org — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
             "content": {
               "application/json": {
                 "schema": {
@@ -4417,7 +4417,7 @@
             "description": "no such installation, or plugins not configured"
           },
           "409": {
-            "description": "the installation changed since the review, or the source no longer reads as the reviewed manifest"
+            "description": "plugins are off, the installation changed since the review, or the source no longer reads as the reviewed manifest"
           },
           "429": {
             "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
@@ -10637,7 +10637,7 @@
               "string",
               "null"
             ],
-            "description": "The image the upgrade would run, `<repository>@sha256:<64 hex>`. When\ngiven, it is checked against the new manifest's named repository, and\na move to another repository counts as a widening."
+            "description": "The image the upgrade would run, `<repository>@sha256:<64 hex>`. When\ngiven, it is checked against the new manifest's named repository, and\n`needs_step_up` is judged with it: any image other than the installed\none needs a step-up. Omitted: judged as keeping the installed image."
           },
           "source": {
             "type": [
@@ -10739,7 +10739,7 @@
           "current_manifest_sha256",
           "current_image",
           "diff",
-          "widenings",
+          "step_up_reasons",
           "needs_step_up"
         ],
         "properties": {
@@ -10773,18 +10773,18 @@
           },
           "needs_step_up": {
             "type": "boolean",
-            "description": "Whether `…/upgrade` asks for a step-up: exactly when it widens. Decided\nagain by the server at the upgrade."
+            "description": "Whether `…/upgrade` asks for a step-up: exactly when there is a\nreason. Decided again by the server at the upgrade."
           },
           "source": {
             "type": "string",
             "description": "The source as read, pinned to its commit: pass it to `…/upgrade`."
           },
-          "widenings": {
+          "step_up_reasons": {
             "type": "array",
             "items": {
               "type": "string"
             },
-            "description": "Each thing the upgrade adds that the installed version did not ask\nfor, as a sentence. Empty = the upgrade is same-or-narrower."
+            "description": "Why `…/upgrade` asks for a step-up, each as a sentence: what the new\nmanifest asks for that the installed one did not, and a new image\n(any digest other than the installed one is new code). Judged with\nthe request's `image`, or the installed image when it has none.\nEmpty = a narrowing on the same image, which needs none."
           }
         }
       },

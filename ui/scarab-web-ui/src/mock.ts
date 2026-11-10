@@ -903,8 +903,9 @@ function environmentProjects(env: OrgEnvironmentDto): EnvironmentProjectDto[] {
 // record and persist nothing, except an install and an upgrade, kept until
 // the page reloads. `argocd-us` was installed before sources were recorded.
 // An upgrade-fetch of `argocd-staging` reads a wider manifest (a read rule
-// and a gate added: a passkey); of any other installation, a narrower one
-// (the version rule removed: no passkey).
+// and a gate added); of any other installation, a narrower one (the version
+// rule removed). Either needs a passkey with an image other than the
+// installed one; only the narrower one on the installed image needs none.
 const ARGOCD_REPO = "ghcr.io/thulasi-ram/scarab-plugin-argocd";
 const argocdManifest: PluginManifestDto = {
   plugin: "argocd",
@@ -951,6 +952,7 @@ const fetchedPluginUpgrade = (
   installed: PluginInstallationDto,
   source: string,
   connection: string | null,
+  image: string | null,
 ): FetchedPluginUpgradeDto => {
   const wider = installed.name === "argocd-staging";
   const rules = argocdManifest.connections[0]!.read_rules;
@@ -985,8 +987,15 @@ const fetchedPluginUpgrade = (
       gates: group(wider ? ["wait-synced"] : [], [], ["wait-live"]),
       image: group([], [], [ARGOCD_REPO]),
     },
-    widenings: wider ? ["adds read rule `argocd: GET /api/v1/account`", "adds gate `wait-synced`"] : [],
-    needs_step_up: wider,
+    ...(() => {
+      const reasons = [
+        ...(wider ? ["adds read rule `argocd: GET /api/v1/account`", "adds gate `wait-synced`"] : []),
+        ...(image && image !== installed.image
+          ? [`runs new code: image \`${image}\` instead of \`${installed.image}\``]
+          : []),
+      ];
+      return { step_up_reasons: reasons, needs_step_up: reasons.length > 0 };
+    })(),
   };
 };
 // What `POST …/plugin-fetch` returns for any source: the Argo CD manifest,
@@ -2041,15 +2050,22 @@ function route(pathname: string, search: string, method: string, body = ""): Res
     const found = plugins.find((x) => x.name === decodeURIComponent(m![1]!));
     if (!found) return new Response("no such installation", { status: 404 });
     if (m[2]) {
-      const req = JSON.parse(body || "{}") as { source?: string; commit?: string; connection?: string };
+      const req = JSON.parse(body || "{}") as {
+        source?: string;
+        commit?: string;
+        connection?: string;
+        image?: string;
+      };
       if (!req.source && !found.source) {
         return new Response("this installation has no recorded source; give the full source", { status: 400 });
       }
       const source = req.source ?? `${(found.source ?? ARGOCD_SOURCE_PATH).replace(/@[0-9a-f]+$/, "")}@${req.commit}`;
-      return json(fetchedPluginUpgrade(found, source, req.connection ?? found.source_connection ?? null));
+      return json(
+        fetchedPluginUpgrade(found, source, req.connection ?? found.source_connection ?? null, req.image ?? null),
+      );
     }
     const req = JSON.parse(body || "{}") as { image: string; source: string; manifest_sha256: string };
-    const read = fetchedPluginUpgrade(found, req.source, null);
+    const read = fetchedPluginUpgrade(found, req.source, null, req.image);
     Object.assign(found, {
       image: req.image,
       source: req.source,

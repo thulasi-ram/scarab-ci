@@ -1619,14 +1619,15 @@ async fn an_upgrade_fetch_compares_the_new_manifest_with_the_installed_one() {
     assert_eq!(wider["diff"]["gates"]["unchanged"], json!(["wait-live"]));
     assert_eq!(wider["needs_step_up"], json!(true));
     assert_eq!(
-        wider["widenings"],
+        wider["step_up_reasons"],
         json!(["adds read rule `argocd: GET /api/v1/account`"])
     );
 
+    // Narrower, on the installed image: no step-up.
     let (status, narrower) = upgrade_fetch(
         &apps.public,
         "argocd",
-        json!({ "commit": "c".repeat(40), "image": format!("{REPO}@sha256:{}", "e".repeat(64)) }),
+        json!({ "commit": "c".repeat(40), "image": image() }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{narrower}");
@@ -1636,7 +1637,25 @@ async fn an_upgrade_fetch_compares_the_new_manifest_with_the_installed_one() {
     );
     assert_eq!(narrower["diff"]["read_rules"]["added"], json!([]));
     assert_eq!(narrower["needs_step_up"], json!(false));
-    assert_eq!(narrower["widenings"], json!([]));
+    assert_eq!(narrower["step_up_reasons"], json!([]));
+
+    // The same narrower manifest with a new digest: new code, a step-up.
+    let new_digest = format!("{REPO}@sha256:{}", "e".repeat(64));
+    let (status, new_code) = upgrade_fetch(
+        &apps.public,
+        "argocd",
+        json!({ "commit": "c".repeat(40), "image": new_digest }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{new_code}");
+    assert_eq!(new_code["needs_step_up"], json!(true));
+    assert_eq!(
+        new_code["step_up_reasons"],
+        json!([format!(
+            "runs new code: image `{new_digest}` instead of `{}`",
+            image()
+        )])
+    );
 
     // An image the new manifest does not name is refused at the fetch.
     let (status, body) = upgrade_fetch(
@@ -1812,5 +1831,39 @@ async fn an_upgrade_is_409_when_the_installation_changed_or_the_source_moved() {
     assert_eq!(status, StatusCode::OK, "{msg}");
     let (status, msg) = upgrade(&apps.public, "argocd", body).await;
     assert_eq!(status, StatusCode::CONFLICT, "{msg}");
+    tdb.cleanup().await;
+}
+
+/// While plugins are off an upgrade is refused (409), as an install is, and
+/// nothing is written.
+#[tokio::test]
+async fn an_upgrade_is_refused_while_plugins_are_off() {
+    let Some((tdb, pg)) = migrated().await else {
+        return;
+    };
+    let fetcher = Arc::new(argocd_fetcher());
+    fetcher.serve(&argocd_at('c'), &argocd_narrower());
+    let apps = apps_with(pg.clone(), fetcher.clone());
+    install(&apps.public, "acme", "argocd").await;
+    let (status, fetched) =
+        upgrade_fetch(&apps.public, "argocd", json!({ "commit": "c".repeat(40) })).await;
+    assert_eq!(status, StatusCode::OK, "{fetched}");
+    let off = router(state_with(pg.clone(), false, fetcher));
+    let (status, msg) = upgrade(
+        &off,
+        "argocd",
+        json!({
+            "image": image(),
+            "source": fetched["source"],
+            "manifest_sha256": fetched["manifest_sha256"],
+            "expected_current_sha256": fetched["current_manifest_sha256"],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{msg}");
+    assert!(msg.to_string().contains("SCARAB_PLUGINS=off"), "{msg}");
+    let row = pg.installation("acme", "argocd").await.unwrap().unwrap();
+    assert_eq!(row.manifest_sha256, manifest_sha256(ARGOCD_MANIFEST));
+    assert!(pg.installation_versions(&row.id).await.unwrap().is_empty());
     tdb.cleanup().await;
 }

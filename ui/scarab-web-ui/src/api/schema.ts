@@ -1218,9 +1218,11 @@ export interface paths {
         put?: never;
         /**
          * Upgrade a plugin installation to a reviewed manifest and image (ADR-0072 §10)
-         * @description Same-or-narrower (nothing added, image of the same repository) needs no
-         *     step-up; wider is confirmed like an install (ADR-0072 §10). The server
-         *     decides which from the installed manifest and the one it reads here.
+         * @description A new image digest is new code and is confirmed like an install, whatever
+         *     the manifest (ADR-0072 §8, §10); so is a manifest that asks for more.
+         *     Only a same-or-narrower manifest on the installed image needs no step-up.
+         *     The server decides from the installed installation and the manifest it
+         *     reads here. Refused while `SCARAB_PLUGINS=off` (409), as an install is.
          *     409 when the installed manifest is no longer `expected_current_sha256`,
          *     and when the source no longer reads as `manifest_sha256`.
          */
@@ -3497,7 +3499,8 @@ export interface components {
             /**
              * @description The image the upgrade would run, `<repository>@sha256:<64 hex>`. When
              *     given, it is checked against the new manifest's named repository, and
-             *     a move to another repository counts as a widening.
+             *     `needs_step_up` is judged with it: any image other than the installed
+             *     one needs a step-up. Omitted: judged as keeping the installed image.
              */
             image?: string | null;
             /**
@@ -3555,17 +3558,20 @@ export interface components {
             /** @description Pass it to `…/upgrade` as `manifest_sha256`. */
             manifest_sha256: string;
             /**
-             * @description Whether `…/upgrade` asks for a step-up: exactly when it widens. Decided
-             *     again by the server at the upgrade.
+             * @description Whether `…/upgrade` asks for a step-up: exactly when there is a
+             *     reason. Decided again by the server at the upgrade.
              */
             needs_step_up: boolean;
             /** @description The source as read, pinned to its commit: pass it to `…/upgrade`. */
             source: string;
             /**
-             * @description Each thing the upgrade adds that the installed version did not ask
-             *     for, as a sentence. Empty = the upgrade is same-or-narrower.
+             * @description Why `…/upgrade` asks for a step-up, each as a sentence: what the new
+             *     manifest asks for that the installed one did not, and a new image
+             *     (any digest other than the installed one is new code). Judged with
+             *     the request's `image`, or the installed image when it has none.
+             *     Empty = a narrowing on the same image, which needs none.
              */
-            widenings: string[];
+            step_up_reasons: string[];
         };
         /** @description The answer to a gate approval. */
         GateApprovalDto: {
@@ -9480,7 +9486,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description not an org admin, a step-up is required (a wider manifest or another image repository), a host Scarab does not fetch from, or a private repository outside the org — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            /** @description not an org admin, a step-up is required (a new image, or a manifest that asks for more), a host Scarab does not fetch from, or a private repository outside the org — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -9496,7 +9502,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description the installation changed since the review, or the source no longer reads as the reviewed manifest */
+            /** @description plugins are off, the installation changed since the review, or the source no longer reads as the reviewed manifest */
             409: {
                 headers: {
                     [name: string]: unknown;
