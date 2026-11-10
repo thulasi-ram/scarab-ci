@@ -87,9 +87,11 @@ connections under **Settings › Connections** (`/orgs/<org>/settings/connection
 see another org's connections, and `GET /v1/connections` lists only the connections of orgs you
 administer (`?org=<org>` narrows it to one).
 
-- **An org's first connection** is created by a global admin, under **Settings › Server
-  administration › Connect a forge** (`/settings/server/connect-forge`), or with
-  `POST /v1/connections` and an `org` field. After that, the org's own admins can add more.
+- **An org's first connection** is created by a global admin: in Organization settings, pick
+  **New organization…** at the bottom of the org dropdown (`/orgs/_new`), name the org and add its
+  Forgejo connection, or call `POST /v1/connections` with an `org` field. After that, the org's
+  own admins add more under its **Settings › Connections**. For GitHub, install the App on the
+  account instead: the installation registers the connection and the org.
 - **An org name** is not empty, is at most 100 characters, and has no `/`, spaces or control
   characters. It is not `.` or `..`, does not start with `_` (those names are Scarab's own), and
   is not one of `settings`, `orgs`, `account` or `security`: a project's page is
@@ -161,22 +163,27 @@ its own connection first.
 
 ## Settings
 
-The web UI has up to three settings pages, each with its own sidebar, and each section has its
-own address. The user menu links the pages you may use:
+The web UI has two settings pages, each with its own sidebar, and each section has its own
+address. The user menu links the pages you may use:
 
 - **Account settings**, for everyone, under `/settings/<section>`: Profile (your sign-in accounts),
   Security (your passkeys and security events), [API tokens](/scarab-ci/usage/api-tokens/)
   (your own tokens) and Appearance.
 - **Organization settings**, for the admins of an org, under `/orgs/<org>/settings/<section>`:
   Connections, Members, Environments, Plugins, Libraries, Secrets, API tokens (every token issued
-  in the org), Security and Event log. `/orgs/<org>/settings` opens Connections. The org dropdown at the top of the sidebar
-  switches org and keeps the section.
-- **Server administration**, for global admins, under `/settings/server/<section>`: Connect a
-  forge.
+  in the org), Security and Event log. `/orgs/<org>/settings` opens Connections. The org
+  dropdown at the top of the sidebar switches org and keeps the section. For a global admin its
+  last entry is **New organization…** (`/orgs/_new`), where a new org is created with its first
+  Forgejo connection.
 
-`/settings` opens the first org you administer, or your profile. The old addresses (`/account`,
-`/account/security`, `/settings/libraries/review`) redirect to the new ones. The UI shows only
-the pages you may use; the server checks every request.
+Connections is the one place a forge connection is added: **Add Forgejo connection** on an org's
+Connections, or New organization… for an org Scarab does not have yet.
+
+`/settings` opens the first org you administer; a global admin with no org yet gets New
+organization…, and anyone else their profile. The old addresses (`/account`, `/account/security`,
+`/settings/libraries/review`, and `/settings/server/connect-forge` from the former Server
+administration page) redirect to the new ones. The UI shows only the pages you may use; the
+server checks every request.
 
 ### Appearance
 
