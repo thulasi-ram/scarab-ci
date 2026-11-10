@@ -1,5 +1,5 @@
 // Your sign-in accounts: the accounts linked to you, and the way
-// to link another or unlink one. The Profile section of Your account.
+// to link another or unlink one. The Profile section of Account settings.
 //
 // Open to everyone signed in. Linking is a full browser round-trip to the
 // provider (the server needs the provider to prove you control that account),

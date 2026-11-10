@@ -1,7 +1,7 @@
 // Issued API tokens (git-bug a4cb94f). A token belongs to the person who
 // minted it, so there are two sections:
 //
-// - Your account › API tokens (`MyApiTokens`): mint, list and revoke your own.
+// - Account settings › API tokens (`MyApiTokens`): mint, list and revoke your own.
 // - Organization settings › API tokens (`OrgApiTokens`): every token issued in
 //   the org, whoever holds it, sorted by last use, calls or creation. An admin
 //   revokes any of them here; nobody mints here.
@@ -73,7 +73,7 @@ function NoTokenStore() {
   );
 }
 
-/** Your account › API tokens: the tokens you hold, in every org. */
+/** Account settings › API tokens: the tokens you hold, in every org. */
 export function MyApiTokens() {
   const [epoch, setEpoch] = createSignal(0);
   const [tokens] = createResource(epoch, () => listMyApiTokens());
@@ -274,7 +274,7 @@ export function OrgApiTokens(props: { org: string }) {
         <p class="subtle">
           Every token issued in {props.org}, whoever holds it. Tokens are personal: each
           person mints their own under{" "}
-          <A href={accountHref("tokens")}>Your account › API tokens</A>.
+          <A href={accountHref("tokens")}>Account settings › API tokens</A>.
         </p>
         <Show when={tokens.error}>
           <p class="error">Could not load API tokens.</p>

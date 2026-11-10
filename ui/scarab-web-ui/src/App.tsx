@@ -29,9 +29,11 @@ export default function App() {
     <Show when={!unauthenticated()} fallback={<Login />}>
     <Router root={Layout}>
       <Route path="/" component={Repos} />
-      {/* Settings (git-bug 734ffa1): Your account under /settings/<section>,
-          an org's settings under /orgs/<org>/settings/<section>. Static first
-          segments, so they outrank the /:org/:repo tier. */}
+      {/* Settings (git-bug 734ffa1), three separate pages: Account settings
+          under /settings/<section>, an org's settings under
+          /orgs/<org>/settings/<section>, server administration under
+          /settings/server/<section>. Static first segments, so they outrank
+          the /:org/:repo tier. */}
       <Route path="/settings" component={LegacySettings} />
       <Route path="/settings/:section" component={AccountSettings} />
       <Route path="/settings/server/:section?" component={ServerSettings} />
