@@ -243,24 +243,24 @@ function Details(props: { env: OrgEnvironment }) {
         </Show>
       </div>
       <dl class="lib-facts">
-        <dt>name</dt>
+        <dt>Name</dt>
         <dd class="m">{props.env.name}</dd>
-        <dt>display name</dt>
+        <dt>Display name</dt>
         <dd>{props.env.display_name || <span class="subtle">none: the name shows</span>}</dd>
-        <dt>description</dt>
+        <dt>Description</dt>
         <dd>{props.env.description || <span class="subtle">none</span>}</dd>
-        <dt>approvers</dt>
+        <dt>Approvers</dt>
         <dd class="m">{list(rules().approvers, "none")}</dd>
-        <dt>allowed refs</dt>
+        <dt>Allowed refs</dt>
         <dd class="m">{list(rules().allowed_refs, "any ref")}</dd>
-        <dt>wait timer</dt>
+        <dt>Wait timer</dt>
         <dd>
           {rules().wait_timer_s > 0 ? durationText(rules().wait_timer_s) : "none"}
           <Show when={rules().approvers.length > 0 && rules().wait_timer_s > 0}>
             <span class="subtle"> after the approvals are in</span>
           </Show>
         </dd>
-        <dt>reason</dt>
+        <dt>Reason</dt>
         <dd>{rules().require_reason ? "manual and API dispatches must give one" : "not required"}</dd>
         <For each={approvalGateFacts(rules().approval_gate, rules().approvers.length)}>
           {(f) => (
@@ -270,9 +270,9 @@ function Details(props: { env: OrgEnvironment }) {
             </>
           )}
         </For>
-        <dt>projects that may use {shownName(props.env)}</dt>
+        <dt>Projects that may use {shownName(props.env)}</dt>
         <dd class="m">{eligibilityLabel(props.env.eligibility)}</dd>
-        <dt>last changed</dt>
+        <dt>Last changed</dt>
         <dd>
           <span class="mono">{props.env.updated_by}</span> ·{" "}
           <span title={absTime(props.env.updated_at)}>{relTime(props.env.updated_at)}</span>
@@ -966,7 +966,7 @@ function DuplicateDialog(props: { org: string; env: OrgEnvironment; onClose: () 
           busy={saving()}
           onClose={props.onClose}
           after={{
-            label: "after duplicating",
+            label: "After duplicating",
             value: "Pipelines still deploy into the old name until their environment: is changed.",
           }}
           footer={

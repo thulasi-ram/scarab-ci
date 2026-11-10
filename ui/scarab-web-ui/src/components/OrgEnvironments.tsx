@@ -220,7 +220,7 @@ function CreateDialog(props: {
       busy={saving()}
       onClose={props.onClose}
       after={{
-        label: "after creating",
+        label: "After creating",
         value: "A new environment has no baseline rule and admits no project. Set both on its page.",
       }}
       footer={

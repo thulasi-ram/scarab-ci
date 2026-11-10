@@ -210,7 +210,7 @@ export default function RunPipeline() {
         <div class="rp-ref">
           <div class="rp-ref-row">
             <label class="field rp-ref-field">
-              <span class="field-label">branch / tag / sha</span>
+              <span class="field-label">Branch, tag or SHA</span>
               <div class="rp-combo">
                 <Input
                   mono
@@ -287,7 +287,7 @@ export default function RunPipeline() {
                     >
                       <Icon icon={p.error ? "bug" : "workflow"} size={15} />
                       <span class="mono rp-pipe-name">{p.name}</span>
-                      <Show when={p.api}><span class="rp-tag">api</span></Show>
+                      <Show when={p.api}><span class="rp-tag">API</span></Show>
                       <Show when={p.error}>
                         <span class="rp-pipe-err">failed to parse — {p.error}</span>
                       </Show>

@@ -17,13 +17,13 @@ test("app boots at / and renders the dashboard with no console errors", async ({
   await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible();
 
   // The action inbox rendered from the fixture's two suspended runs.
-  await expect(page.getByText(/waiting on you/)).toBeVisible();
+  await expect(page.getByText(/Waiting on you/)).toBeVisible();
 
   // The repo list renders real fixture content (cards + rows both count —
-  // `.first()` because a repo can appear in "most active" AND the full list).
+  // `.first()` because a repo can appear in "Most active" AND the full list).
   await expect(page.getByRole("link", { name: /orders-api/ }).first()).toBeVisible();
   await expect(page.getByRole("link", { name: /edge-gateway/ }).first()).toBeVisible();
-  await expect(page.getByText(/repos · 7/)).toBeVisible();
+  await expect(page.getByText(/Repos · 7/)).toBeVisible();
 
   // No degraded-mode copy leaked through.
   await expect(page.getByText(/Could not load/)).toHaveCount(0);

@@ -37,7 +37,7 @@ test("run-detail walkthrough: DAG, versions, activity, gate, tries, artifacts", 
   // build took two tries in this version — the ×N badge.
   await expect(page.getByRole("button", { name: /^build/ })).toContainText("×2");
   // The shared-service lane: label + the postgres peer node with its lifecycle.
-  await expect(page.getByText("services", { exact: true })).toBeVisible();
+  await expect(page.getByText("Services", { exact: true })).toBeVisible();
   const svcNode = page.getByRole("button", { name: /postgres/ });
   await expect(svcNode).toBeVisible();
   await expect(svcNode).toContainText("ready");
@@ -99,7 +99,7 @@ test("run-detail walkthrough: DAG, versions, activity, gate, tries, artifacts", 
   await expect(page.getByText("Artifacts", { exact: true })).toBeVisible();
   await expect(page.getByRole("link", { name: "scarab-dist.tar.gz" })).toBeVisible();
   await expect(page.getByText("build@a3")).toBeVisible();
-  await expect(page.getByText("of record", { exact: true })).toBeVisible();
+  await expect(page.getByText("Of record", { exact: true })).toBeVisible();
 });
 
 // The ENVIRONMENT GATE run in src/mock.ts: a deploy into production with a

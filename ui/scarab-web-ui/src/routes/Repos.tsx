@@ -173,7 +173,7 @@ export default function Repos() {
             }
           >
             <div class="dash-label">
-              waiting on you <span class="count">· {inbox().length}</span>
+              Waiting on you <span class="count">· {inbox().length}</span>
             </div>
             <div class="inbox">
               <For each={inbox()}>
@@ -208,7 +208,7 @@ export default function Repos() {
           {/* ── Recently visited (status cards with pass/fail strip) ──────────── */}
           <Show when={visited().length > 0}>
             <div class="dash-label">
-              {usingFallback() ? "most active" : "recently visited"}
+              {usingFallback() ? "Most active" : "Recently visited"}
               <span class="count">· {visited().length}</span>
             </div>
             <div class="rcard-grid">
@@ -218,7 +218,7 @@ export default function Repos() {
 
           {/* ── All repos (recency-sorted, searchable) ───────────────────────── */}
           <div class="dash-label repos-label">
-            repos <span class="count">· {projects()?.length ?? 0}</span>
+            Repos <span class="count">· {projects()?.length ?? 0}</span>
             <Show when={(projects()?.length ?? 0) > 6}>
               <div class="repo-search">
                 <Icon icon="search" size={13} />

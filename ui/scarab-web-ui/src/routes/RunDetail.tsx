@@ -754,7 +754,7 @@ export default function RunDetail() {
                 <Icon icon="chevron-right" size={20} class="crumb-head-sep" />
                 {/* The per-repo run number `#N` is the human handle (ADR-0057);
                     fall back to the short internal id for untenanted runs. */}
-                <span class="crumb-head-title mono" title={id()}>
+                <span class="crumb-head-title" title={id()}>
                   {r().run_number != null ? `#${r().run_number}` : `run ${id().slice(0, 8)}`}
                 </span>
               </h1>
@@ -1230,7 +1230,7 @@ export default function RunDetail() {
                     title={`run id ${id()} — click to copy`}
                     onClick={() => navigator.clipboard?.writeText(id())}
                   >
-                    <span class="idcap">id</span>
+                    <span class="idcap">ID</span>
                     <span class="mono subtle">{id().slice(0, 8)}</span>
                   </span>
                 </div>
@@ -1240,7 +1240,7 @@ export default function RunDetail() {
                 <StatusBadge status={r().status} />
                 <Show when={live() && !timeTraveling()}>
                   <span class="live-dot" title="live">
-                    <span class="dot" /> live
+                    <span class="dot" /> Live
                   </span>
                 </Show>
               </div>
@@ -1401,7 +1401,7 @@ export default function RunDetail() {
                             class="aofrecord"
                             title="what the bare name-addressed download serves"
                           >
-                            of record
+                            Of record
                           </span>
                         </Show>
                         <span class="fsize mono">{fmtSize(a.size)}</span>

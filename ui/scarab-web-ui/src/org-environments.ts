@@ -297,15 +297,15 @@ export function approvalGateFacts(
       : `${g.required_approvals} of ${approvers}`;
   return [
     {
-      label: "missing gate",
+      label: "Missing gate",
       value: g.missing_gate_mode === "add" ? "add an approval gate to the run" : "refuse the run",
     },
-    { label: "approvals needed", value: required },
+    { label: "Approvals needed", value: required },
     {
-      label: "added gate expiry",
+      label: "Added gate expiry",
       value: g.added_gate_expiry_s != null ? durationText(g.added_gate_expiry_s) : "none: waits for a decision",
     },
-    { label: "max approval age", value: durationText(g.max_approval_age_s) },
+    { label: "Max approval age", value: durationText(g.max_approval_age_s) },
   ];
 }
 

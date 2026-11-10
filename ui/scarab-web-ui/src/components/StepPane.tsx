@@ -473,7 +473,7 @@ export default function StepPane(props: {
             </Show>
             <Show when={parts().length > 0}>
               <div class="origin-strip">
-                <span class="k">origin</span>
+                <span class="k">Origin</span>
                 <For each={parts()}>
                   {(p, k) => (
                     <>
@@ -563,7 +563,7 @@ export default function StepPane(props: {
                   </Show>
                   <span class="grow1" />
                   <button class={`lgtog ${wrap() ? "on" : ""}`} onClick={() => setWrap((v) => !v)}>
-                    wrap
+                    Wrap
                   </button>
                 </div>
                 <Show when={!switching()} fallback={<LogSkeleton />}>
@@ -870,7 +870,7 @@ export default function StepPane(props: {
                   {(o) => (
                     <div class="split2">
                       <div>
-                        <p class="pane-sub">invoke chain</p>
+                        <p class="pane-sub">Invoke chain</p>
                         <ol class="chain">
                           <li>
                             <span class="dot">
@@ -896,14 +896,14 @@ export default function StepPane(props: {
                                     <span class="mono">{c.name}</span>
                                     <span class="lib-hash">{shortHash(c.content_hash)}</span>
                                     <Show when={c.kind !== "plugin"}>
-                                      <span class="subtle" style={{ "font-size": "var(--fs-sm)" }}>
+                                      <span class="subtle">
                                         invoked as <span class="mono">{s().id.split("/").slice(0, k() + 1).join("/")}</span>
                                       </span>
                                     </Show>
                                   </div>
                                   <Show when={c.source}>{(src) => <div class="lib-src">{src()}</div>}</Show>
                                   <Show when={c.kind === "library"}>
-                                    <div class="subtle" style={{ "font-size": "var(--fs-sm)" }}>
+                                    <div class="subtle">
                                       {c.yanked ? <span class="plg-killed">yanked in this org</span> : "not yanked"}
                                     </div>
                                   </Show>
@@ -919,7 +919,7 @@ export default function StepPane(props: {
                               <div class="l1">
                                 <span class="kind">step</span>
                                 <span class="mono">{s().id.split("/").pop()}</span>
-                                <span class="subtle" style={{ "font-size": "var(--fs-sm)" }}>
+                                <span class="subtle">
                                   → <span class="mono">{s().id}</span> in this Run
                                 </span>
                               </div>
@@ -928,14 +928,14 @@ export default function StepPane(props: {
                         </ol>
                       </div>
                       <div>
-                        <p class="pane-sub">inputs in this invocation's scope</p>
+                        <p class="pane-sub">Inputs in this invocation's scope</p>
                         <Show when={o().inputs.length > 0} fallback={<p class="empty">none: a Step in the Pipeline file reads the Run's parameters</p>}>
-                          <table class="table inputs-tbl" style={{ "font-size": "var(--fs-sm)" }}>
+                          <table class="table inputs-tbl">
                             <thead>
                               <tr>
-                                <th>input</th>
-                                <th>bound</th>
-                                <th>kind</th>
+                                <th>Input</th>
+                                <th>Bound</th>
+                                <th>Kind</th>
                               </tr>
                             </thead>
                             <tbody>
@@ -951,7 +951,7 @@ export default function StepPane(props: {
                             </tbody>
                           </table>
                         </Show>
-                        <p class="pane-sub" style={{ "margin-top": "14px" }}>rendered at launch</p>
+                        <p class="pane-sub" style={{ "margin-top": "14px" }}>Rendered at launch</p>
                         <Show when={o().rendered} fallback={<p class="empty">{o().render_note ?? "not rendered"}</p>}>
                           {(r) => (
                             <pre class="rendered">
@@ -979,8 +979,8 @@ export default function StepPane(props: {
                   <div class="tabpane">
                     <div class="gp">
                       <div class="gp-card">
-                        <h4>who releases it</h4>
-                        <div class="gp-big" style={{ "font-size": "var(--fs-lg)" }}>
+                        <h4>Who releases it</h4>
+                        <div class="gp-big gp-name">
                           {g().releaser}
                         </div>
                         <div class="gp-line">
@@ -1005,7 +1005,7 @@ export default function StepPane(props: {
                         </div>
                       </div>
                       <div class="gp-card">
-                        <h4>expiry</h4>
+                        <h4>Expiry</h4>
                         <Show
                           when={g().expires_at != null}
                           fallback={<div class="gp-line">The wait has not started: the gate is not reached yet.</div>}
@@ -1041,12 +1041,12 @@ export default function StepPane(props: {
                         </Show>
                       </div>
                       <div class="gp-card">
-                        <h4>inputs · rendered when the gate was reached</h4>
+                        <h4>Inputs · rendered when the gate was reached</h4>
                         <Show
                           when={g().inputs && typeof g().inputs === "object"}
                           fallback={<div class="gp-line">Rendered when the gate is reached.</div>}
                         >
-                          <table class="table" style={{ "font-size": "var(--fs-sm)" }}>
+                          <table class="table">
                             <tbody>
                               <For each={Object.entries((g().inputs ?? {}) as Record<string, unknown>)}>
                                 {([k, v]) => (
@@ -1064,7 +1064,7 @@ export default function StepPane(props: {
                         </Show>
                       </div>
                       <div class="gp-card">
-                        <h4>outputs</h4>
+                        <h4>Outputs</h4>
                         <Show when={g().outputs.length > 0} fallback={<div class="gp-line">This gate returns no outputs.</div>}>
                           <For each={g().outputs}>
                             {(o) => (

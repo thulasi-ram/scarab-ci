@@ -170,10 +170,10 @@ export default function Libraries(props: { org: string }) {
               <table class="table lib-table">
                 <thead>
                   <tr>
-                    <th>library</th>
-                    <th>version</th>
-                    <th>source</th>
-                    <th>installed</th>
+                    <th>Library</th>
+                    <th>Version</th>
+                    <th>Source</th>
+                    <th>Installed</th>
                     <th />
                   </tr>
                 </thead>
@@ -309,7 +309,7 @@ function LibraryRow(props: {
     <>
       <tr classList={{ dead: !!l().yanked }}>
         <td>
-          <div class="mono" style={{ color: "var(--soft-white)", "font-size": "var(--fs-md)" }}>
+          <div class="mono" style={{ color: "var(--soft-white)" }}>
             lib:{l().publisher}/{l().name}
           </div>
           <div class="lib-badges" style={{ "margin-top": "4px" }}>
@@ -343,7 +343,7 @@ function LibraryRow(props: {
           </span>
         </td>
         <td class="lib-src">{l().source}</td>
-        <td class="mono" style={{ "font-size": "var(--fs-sm)" }} title={absTime(l().installed_at)}>
+        <td class="mono" title={absTime(l().installed_at)}>
           {l().installed_by}
           <br />
           <span class="subtle">{relTime(l().installed_at)}</span>

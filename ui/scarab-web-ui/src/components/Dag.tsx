@@ -594,7 +594,7 @@ export default function Dag(props: {
             `measure()` can route edges to them. */}
         <Show when={(props.services?.length ?? 0) > 0}>
           <div class="dag-lane">
-            <span class="dag-lane-label">services</span>
+            <span class="dag-lane-label">Services</span>
             <div class="dag-lane-nodes">
               <For each={props.services}>
                 {(sv) => {

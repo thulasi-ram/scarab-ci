@@ -112,14 +112,14 @@ function StepUpModal(props: {
       }
     >
       <dl class="step-up-summary">
-        <dt>operation</dt>
+        <dt>Operation</dt>
         <dd>{r().summary.operation}</dd>
         <Show when={r().summary.target}>
-          <dt>target</dt>
+          <dt>Target</dt>
           <dd class="mono">{r().summary.target}</dd>
         </Show>
         <Show when={r().summary.changes.length > 0}>
-          <dt>changes</dt>
+          <dt>Changes</dt>
           <dd>
             <ul class="step-up-changes mono">
               <For each={r().summary.changes}>{(c) => <li>{c}</li>}</For>

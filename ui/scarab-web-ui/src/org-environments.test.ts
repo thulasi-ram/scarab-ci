@@ -439,18 +439,18 @@ describe("approvalGateFacts", () => {
     const facts = (g: Parameters<typeof approvalGateFacts>[0], n: number) =>
       Object.fromEntries(approvalGateFacts(g, n).map((f) => [f.label, f.value]));
     expect(facts(null, 2)).toEqual({
-      "missing gate": "add an approval gate to the run",
-      "approvals needed": "every approver",
-      "added gate expiry": "none: waits for a decision",
-      "max approval age": "24 hours",
+      "Missing gate": "add an approval gate to the run",
+      "Approvals needed": "every approver",
+      "Added gate expiry": "none: waits for a decision",
+      "Max approval age": "24 hours",
     });
     expect(
       facts({ missing_gate_mode: "refuse", required_approvals: 1, added_gate_expiry_s: 7200, max_approval_age_s: 3600 }, 3),
     ).toEqual({
-      "missing gate": "refuse the run",
-      "approvals needed": "1 of 3",
-      "added gate expiry": "2 hours",
-      "max approval age": "1 hour",
+      "Missing gate": "refuse the run",
+      "Approvals needed": "1 of 3",
+      "Added gate expiry": "2 hours",
+      "Max approval age": "1 hour",
     });
   });
 });

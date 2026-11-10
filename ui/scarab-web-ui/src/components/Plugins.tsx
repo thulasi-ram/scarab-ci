@@ -942,7 +942,7 @@ function InstallDialog(props: {
           {(c) => (
             <div>
               <p class="dlg-ctx">
-                <span class="k">publisher</span>{" "}
+                <span class="k">Publisher</span>{" "}
                 {pluginPublisher(c().image_repository) || "none in the image name"}
               </p>
               <p class="f-help">

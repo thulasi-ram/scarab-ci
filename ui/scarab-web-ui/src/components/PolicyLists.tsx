@@ -253,7 +253,7 @@ function ListDialog(props: {
       onClose={props.onClose}
       after={
         props.record && props.record.body.mode !== "audit"
-          ? { label: "step-up", value: "Changing an enforced list asks for a passkey." }
+          ? { label: "Step-up", value: "Changing an enforced list asks for a passkey." }
           : undefined
       }
       footer={

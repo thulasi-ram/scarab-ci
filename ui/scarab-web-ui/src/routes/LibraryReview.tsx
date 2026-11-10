@@ -200,11 +200,11 @@ function Review(props: { org: string }) {
               when={editing()}
               fallback={
                 <dl class="lib-facts">
-                  <dt>source</dt>
+                  <dt>Source</dt>
                   <dd class="m">{fetched()?.source ?? form().source}</dd>
-                  <dt>connection</dt>
+                  <dt>Connection</dt>
                   <dd>{connectionLabel()}</dd>
-                  <dt>publisher</dt>
+                  <dt>Publisher</dt>
                   <dd class="m">
                     {fetched()?.publisher || form().publisher || "the repository owner"}
                   </dd>
@@ -315,7 +315,7 @@ function Review(props: { org: string }) {
                 fallback={
                   <>
                     <p class="pane-sub" style={{ "margin-top": "18px" }}>
-                      content · {f().content.split("\n").length} lines
+                      Content · {f().content.split("\n").length} lines
                     </p>
                     <div class="ud">
                       <For each={f().content.split("\n")}>
@@ -333,7 +333,7 @@ function Review(props: { org: string }) {
                 {(cur) => (
                   <Show when={!same()} fallback={<p class="empty">This version is installed already.</p>}>
                     <p class="pane-sub" style={{ "margin-top": "18px" }}>
-                      diff · {counts().add} lines added, {counts().del} removed · unchanged lines folded
+                      Diff · {counts().add} lines added, {counts().del} removed · unchanged lines folded
                     </p>
                     <div class="sbs">
                       <div>
@@ -388,7 +388,7 @@ function Review(props: { org: string }) {
                     <span>What changes</span>
                   </div>
                   <dl class="lib-facts">
-                    <dt>version</dt>
+                    <dt>Version</dt>
                     <dd class="m">
                       <Show when={f().current} fallback={<span class="lib-hash">{shortHash(f().content_hash)}</span>}>
                         {(cur) => (
@@ -399,13 +399,13 @@ function Review(props: { org: string }) {
                         )}
                       </Show>
                     </dd>
-                    <dt>inputs</dt>
+                    <dt>Inputs</dt>
                     <dd>
                       {f().current
                         ? inputsChange(diffSides(lines()).old, f().content)
                         : inputsChange("", f().content)}
                     </dd>
-                    <dt>runs</dt>
+                    <dt>Runs</dt>
                     <dd>Runs already created keep the Steps they were compiled with.</dd>
                   </dl>
                   <div style={{ padding: "0 14px 14px", display: "flex", gap: "8px" }}>

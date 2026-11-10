@@ -153,7 +153,7 @@ test("an environment opens read-only and its Edit button opens the edit screen",
   // The view: the record, and no way to change it from here.
   const view = page.locator("section.page");
   await expect(view.getByText("customer-facing, eu-west-1 + us-east-1")).toBeVisible();
-  await expect(view.getByText("projects that may use Production")).toBeVisible();
+  await expect(view.getByText("Projects that may use Production")).toBeVisible();
   await expect(view.getByText("Project overlays and grants")).toBeVisible();
   await expect(view.getByText(/who may deploy/i)).toHaveCount(0);
   await expect(view.getByRole("textbox")).toHaveCount(0);

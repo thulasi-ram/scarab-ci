@@ -35,7 +35,7 @@ export function Field(props: {
   required?: boolean;
   /** Set when the control needs a known id (a test, an external label). */
   id?: string;
-  /** Show the label as written, not upper-cased (a key name, a typed name). */
+  /** Show the label in Body, not Label (a key name, a typed sentence). */
   plainLabel?: boolean;
   class?: string;
   children: JSX.Element;

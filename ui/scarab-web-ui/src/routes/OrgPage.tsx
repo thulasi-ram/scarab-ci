@@ -103,16 +103,16 @@ export default function OrgPage() {
       </div>
 
       {/* ── A few counts ─────────────────────────────────────────────── */}
-      <div class="dash-label">overview</div>
+      <div class="dash-label">Overview</div>
       <div class="org-stats">
         <div class="org-stat">
-          <span class="org-stat-n mono">
+          <span class="org-stat-n">
             <Show when={repos()} fallback="–">{(p) => p().enabled_total}</Show>
           </span>
           <span class="org-stat-label">enabled repositories</span>
         </div>
         <div class="org-stat">
-          <span class="org-stat-n mono">
+          <span class="org-stat-n">
             <Show when={runs()} fallback="–">
               {stats().partial ? "≥" : ""}
               {stats().lastDay}
@@ -127,13 +127,13 @@ export default function OrgPage() {
           </Show>
         </div>
         <div class="org-stat" classList={{ "org-stat-bad": stats().failedLastDay > 0 }}>
-          <span class="org-stat-n mono">
+          <span class="org-stat-n">
             <Show when={runs()} fallback="–">{stats().failedLastDay}</Show>
           </span>
           <span class="org-stat-label">failed, last 24 hours</span>
         </div>
         <A href="/" class="org-stat org-stat-link" classList={{ "org-stat-warn": stats().waiting > 0 }}>
-          <span class="org-stat-n mono">
+          <span class="org-stat-n">
             <Show when={runs()} fallback="–">{stats().waiting}</Show>
           </span>
           <span class="org-stat-label">waiting on a gate</span>
@@ -145,7 +145,7 @@ export default function OrgPage() {
 
       {/* ── Repositories ─────────────────────────────────────────────── */}
       <div class="dash-label repos-label">
-        repositories <span class="count">· {total()}</span>
+        Repositories <span class="count">· {total()}</span>
         <div class="repo-search">
           <Icon icon="search" size={13} />
           <input

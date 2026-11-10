@@ -103,7 +103,7 @@ export default function Modal(props: {
             <Show when={props.after}>
               {(a) => (
                 <div class="dlg-after">
-                  <span class="k">{a().label ?? "after saving"}</span>
+                  <span class="k">{a().label ?? "After saving"}</span>
                   <span>{a().value}</span>
                 </div>
               )}

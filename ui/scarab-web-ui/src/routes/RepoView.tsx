@@ -882,7 +882,7 @@ function EnvRow(props: {
           <Show when={props.env.overlay}>
             {(o) => (
               <p class="dlg-ctx">
-                <span class="k">this repo adds</span> {rulesSummary(o())}
+                <span class="k">This repo adds</span> {rulesSummary(o())}
               </p>
             )}
           </Show>
@@ -1020,7 +1020,7 @@ function EnvDialog(props: {
           <Show when={pickedEnv()}>
             {(env) => (
               <p class="dlg-ctx">
-                <span class="k">org baseline</span>{" "}
+                <span class="k">Org baseline</span>{" "}
                 {isPermissive(env().baseline) ? "no rule yet" : rulesSummary(env().baseline)}
               </p>
             )}
@@ -1181,14 +1181,14 @@ function RefusedRow(props: { r: RefusedRun }) {
           <Show when={sum().fix}>
             {(fix) => (
               <div class="rf-fix">
-                <span class="lbl">fix</span>
+                <span class="lbl">Fix</span>
                 <span>{fix()}</span>
               </div>
             )}
           </Show>
           <Show when={r().reason_kind === "yanked"}>
             <div class="rf-fix">
-              <span class="lbl">fix</span>
+              <span class="lbl">Fix</span>
               <span>an org admin upgrades the installation, then push again</span>
             </div>
           </Show>
