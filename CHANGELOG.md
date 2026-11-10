@@ -111,10 +111,10 @@ release.yml uses that version's section as the GitHub Release text. See
 - **Policy decisions on the Run page.** A Run that a policy applied to shows each decision: the
   checkpoint, each policy's outcome and message, and the input the rules saw.
   ([Policies](https://thulasi-ram.github.io/scarab-ci/usage/policies/#on-the-run-page))
-- **Library and plugin list forms.** The libraries allowed and blocked lists are edited on the
-  Libraries section, the plugin list on the Plugins section, and a project's own lists on its
-  repository Settings tab.
-  ([Policies](https://thulasi-ram.github.io/scarab-ci/usage/policies/#library-and-plugin-lists))
+- **Library and plugin policy forms.** The libraries allowed and blocked lists are edited under
+  Library policies on the Libraries section, the plugin list under Plugin policies on the Plugins
+  section, and a project's own under the same two titles on its repository Settings tab.
+  ([Policies](https://thulasi-ram.github.io/scarab-ci/usage/policies/#library-and-plugin-policies))
 - **Policy API for editors.** `POST /v1/orgs/{org}/policies/check` checks a draft (JSON or YAML)
   without saving it; `GET /v1/policy-checkpoints` serves each checkpoint's input schema;
   `POST /v1/orgs/{org}/policy-test` evaluates `step.admit` and `gate.resolve` inputs too;

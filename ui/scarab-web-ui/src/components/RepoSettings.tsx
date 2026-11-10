@@ -18,8 +18,8 @@
 // The bindings list and grant/revoke are org-admin actions on the server, so
 // the panel shows them to org admins only; anyone else sees a line saying so.
 //
-// Last, the repository's own library and plugin lists (PolicyLists, the one
-// place a project's lists are edited).
+// Last, the repository's own Library policies and Plugin policies
+// (PolicyLists, the one place a project's lists are edited).
 import { For, Show, createResource, createSignal } from "solid-js";
 import { A, useNavigate } from "@solidjs/router";
 import {
@@ -43,7 +43,7 @@ import Modal, { ModalMessage, ModalSection } from "./Modal";
 import { Select } from "./Field";
 import PrincipalSearch from "./PrincipalSearch";
 import PolicyLists from "./PolicyLists";
-import { LIBRARY_KINDS, PLUGIN_KINDS } from "../policies";
+import { LIBRARY_KINDS, LIBRARY_POLICIES_ANCHOR, PLUGIN_KINDS, PLUGIN_POLICIES_ANCHOR } from "../policies";
 
 const ROLES = ["viewer", "member", "admin", "owner"];
 
@@ -163,9 +163,17 @@ export default function RepoSettings(props: { org: string; repo: string; repoUrl
       <PolicyLists
         org={props.org}
         project={props.repo}
-        kinds={[...LIBRARY_KINDS, ...PLUGIN_KINDS]}
-        anchor="project-lists"
-        title="Library and plugin lists"
+        kinds={LIBRARY_KINDS}
+        anchor={LIBRARY_POLICIES_ANCHOR}
+        oldAnchor="project-lists"
+        title="Library policies"
+      />
+      <PolicyLists
+        org={props.org}
+        project={props.repo}
+        kinds={PLUGIN_KINDS}
+        anchor={PLUGIN_POLICIES_ANCHOR}
+        title="Plugin policies"
       />
     </>
   );

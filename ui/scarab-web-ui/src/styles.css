@@ -1842,7 +1842,8 @@ select.input {
 .set-row { display: flex; justify-content: space-between; font: var(--t-body); color: var(--sage); }
 .set-row .k { color: var(--muted-sage); }
 .secrets-add { margin-top: 4px; }
-.secrets-actions { margin-top: 4px; }
+/* A row of actions: the gap spaces the buttons, so none sets its own margin. */
+.secrets-actions { margin-top: 4px; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 
 /* ---- actions row (inline forms, the Environment page footer) ---- */
 .modal-actions { display: flex; gap: 10px; margin-top: 6px; }
@@ -4040,6 +4041,8 @@ code.c { font: var(--t-mono); color: var(--copper); }
 /* Settings › Policies */
 .pol-h { font: var(--t-label); margin: 14px 0 6px; }
 .pol-facts { margin: 6px 0 0; }
+/* Library and Plugin policies: one block per list, with room between them. */
+.tok-list.pol-lists { gap: 14px; }
 .tok-role.pol-denied { color: var(--danger); border-color: var(--danger); }
 
 /* ---- org page (/orgs/<org>): stat tiles, repository list, pager ---- */

@@ -49,7 +49,14 @@ import { MyApiTokens, OrgApiTokens } from "../components/ApiTokens";
 import OrgSecurity from "../components/OrgSecurity";
 import OrgPolicies from "../components/OrgPolicies";
 import PolicyLists from "../components/PolicyLists";
-import { LIBRARY_KINDS, LIBRARY_LISTS_ANCHOR, PLUGIN_KINDS, PLUGIN_LISTS_ANCHOR } from "../policies";
+import {
+  LIBRARY_KINDS,
+  LIBRARY_POLICIES_ANCHOR,
+  OLD_LIBRARY_POLICIES_ANCHOR,
+  OLD_PLUGIN_POLICIES_ANCHOR,
+  PLUGIN_KINDS,
+  PLUGIN_POLICIES_ANCHOR,
+} from "../policies";
 import Icon from "../components/Icon";
 
 const IDENTITY_ERROR = "Could not load your identity. Is the server up?";
@@ -333,14 +340,26 @@ function orgBody(id: string, org: string): JSX.Element {
       return (
         <>
           <Plugins org={org} />
-          <PolicyLists org={org} kinds={PLUGIN_KINDS} anchor={PLUGIN_LISTS_ANCHOR} title="Plugin list" />
+          <PolicyLists
+            org={org}
+            kinds={PLUGIN_KINDS}
+            anchor={PLUGIN_POLICIES_ANCHOR}
+            oldAnchor={OLD_PLUGIN_POLICIES_ANCHOR}
+            title="Plugin policies"
+          />
         </>
       );
     case "libraries":
       return (
         <>
           <Libraries org={org} />
-          <PolicyLists org={org} kinds={LIBRARY_KINDS} anchor={LIBRARY_LISTS_ANCHOR} title="Library lists" />
+          <PolicyLists
+            org={org}
+            kinds={LIBRARY_KINDS}
+            anchor={LIBRARY_POLICIES_ANCHOR}
+            oldAnchor={OLD_LIBRARY_POLICIES_ANCHOR}
+            title="Library policies"
+          />
         </>
       );
     case "secrets":

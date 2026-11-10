@@ -1,8 +1,8 @@
-// The library and plugin lists: typed settings, each one Policy at the org or
-// at one project. This panel is the one place each list is edited: the
-// Libraries section holds the library lists, the Plugins section the plugin
-// list, and a repository's Settings tab that project's own lists. The
-// Policies section links here.
+// Library policies and Plugin policies: typed settings, each one Policy at
+// the org or at one project, each an allow or block list. This panel is the
+// one place each list is edited: the Libraries section holds the Library
+// policies, the Plugins section the Plugin policies, and a repository's
+// Settings tab that project's own. The Policies section links here.
 //
 // A list is a rule without CEL: "libraries allowed here" denies a Run with a
 // Step or gate from a library matching none of its sources. A new list starts
@@ -49,6 +49,8 @@ export default function PolicyLists(props: {
   kinds: readonly SettingKind[];
   /** The panel's id, which the Policies section links to. */
   anchor: string;
+  /** An id the panel had before; a link with it still scrolls here. */
+  oldAnchor?: string;
   title: string;
 }) {
   const scope = (): PolicyScope => ({ org: props.org, project: props.project });
@@ -71,13 +73,21 @@ export default function PolicyLists(props: {
       .filter((p) => p.kind !== undefined && props.kinds.includes(p.kind))
       .sort((a, b) => a.name.localeCompare(b.name));
   const level = () => (props.project === undefined ? "org" : "project");
+  const plugins = () => props.kinds.includes("plugins_allowed");
+  const emptyText = () =>
+    props.project !== undefined
+      ? `No ${plugins() ? "plugin" : "library"} policies for ${props.project}: the org's apply.`
+      : plugins()
+        ? "No plugin policies: no plugin's gates may run until one names its installation."
+        : "No library policies: every installed library may be used.";
   // A link from the Policies section names this panel by its anchor; the
   // panel is below the section's own, which loads first, so scroll once the
   // lists are in.
   const location = useLocation();
   let panel: HTMLDivElement | undefined;
   createEffect(() => {
-    if (policies.state === "ready" && location.hash === `#${props.anchor}`) {
+    const hash = location.hash.slice(1);
+    if (policies.state === "ready" && hash !== "" && (hash === props.anchor || hash === props.oldAnchor)) {
       queueMicrotask(() => panel?.scrollIntoView({ block: "start" }));
     }
   });
@@ -96,7 +106,7 @@ export default function PolicyLists(props: {
       </div>
       <div class="secrets-body">
         <Show when={policies.error}>
-          <p class="error">Could not load the lists.</p>
+          <p class="error">Could not load the policies.</p>
         </Show>
         <Show when={notice()}>
           <p class="notice-ok">{notice()}</p>
@@ -106,15 +116,10 @@ export default function PolicyLists(props: {
             <Show
               when={rows().length > 0}
               fallback={
-                <p class="empty">
-                  No lists{props.project === undefined ? "" : ` for ${props.project}`}:{" "}
-                  {props.kinds.includes("plugins_allowed") && props.kinds.length === 1
-                    ? "no plugin's gates may run until a list names its installation."
-                    : "every installed library may be used."}
-                </p>
+                <p class="empty">{emptyText()}</p>
               }
             >
-              <ul class="tok-list" aria-label={props.title}>
+              <ul class="tok-list pol-lists" aria-label={props.title}>
                 <For each={rows()}>
                   {(p) => (
                     <li class="tok">

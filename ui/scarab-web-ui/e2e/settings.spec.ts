@@ -333,13 +333,13 @@ test("the Policies page lists CEL policies with their 7-day counts and the typed
   await expect(envs.getByRole("listitem").filter({ hasText: "Production" })).toContainText(
     "adds an approval gate when missing",
   );
-  const lists = page.getByRole("list", { name: "Library and plugin lists" });
+  const lists = page.getByRole("list", { name: "Library and plugin policies" });
   await expect(lists).toContainText("Libraries allowed");
   await expect(lists).toContainText("github.com/thulasi-ram/*");
   await expect(page.locator("section.page").getByRole("textbox")).toHaveCount(0);
   await lists.getByRole("link", { name: "Libraries" }).click();
-  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/libraries#library-lists$/);
-  await expect(page.getByRole("list", { name: "Library lists" })).toContainText("approved-libraries");
+  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/libraries#library-policies$/);
+  await expect(page.getByRole("list", { name: "Library policies" })).toContainText("approved-libraries");
 
   await page.goto("/orgs/acme/settings/policies");
   await envs.getByRole("listitem").filter({ hasText: "Production" }).getByRole("link", { name: "Edit" }).click();
@@ -449,10 +449,12 @@ test("a policy's history diffs each version against the one before", async ({ pa
   expect(errors).toEqual([]);
 });
 
-test("a library list is added on the Libraries section, in audit mode", async ({ page }) => {
+test("a library list is added under Library policies, in audit mode", async ({ page }) => {
   const errors = collectErrors(page);
-  await page.goto("/orgs/acme/settings/libraries");
-  const panel = page.locator("#library-lists");
+  // A link with the panel's old anchor still lands on it.
+  await page.goto("/orgs/acme/settings/libraries#library-lists");
+  const panel = page.locator("#library-policies");
+  await expect(panel.getByText("Library policies", { exact: true })).toBeInViewport();
   await panel.getByRole("button", { name: "Libraries blocked" }).click();
   const dialog = page.getByRole("dialog");
   await expect(dialog.getByRole("combobox", { name: "Mode" })).toHaveValue("audit");
@@ -462,7 +464,7 @@ test("a library list is added on the Libraries section, in audit mode", async ({
   await dialog.getByRole("textbox", { name: "Sources" }).fill("github.com/evil/*");
   await dialog.getByRole("button", { name: "Add list" }).click();
   await expect(page.getByText("libraries-blocked is added in audit mode.")).toBeVisible();
-  await expect(page.getByRole("list", { name: "Library lists" })).toContainText("github.com/evil/*");
+  await expect(page.getByRole("list", { name: "Library policies" })).toContainText("github.com/evil/*");
   expect(errors).toEqual([]);
 });
 

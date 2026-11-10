@@ -7,7 +7,7 @@
 //   the list; Edit and History open the editor's tabs.
 // - The newest decisions of the log.
 // - Typed settings: the rules that have a form next to their feature. Each
-//   Environment's rules, the library and plugin lists, and API token scopes,
+//   Environment's rules, the library and plugin policies, and API token scopes,
 //   each with a link to where it is edited.
 import { For, Show, createResource, createSignal } from "solid-js";
 import { A, useNavigate } from "@solidjs/router";
@@ -285,12 +285,12 @@ export default function OrgPolicies(props: { org: string }) {
             </ul>
           </Show>
 
-          <h3 class="pol-h">Library and plugin lists</h3>
+          <h3 class="pol-h">Library and plugin policies</h3>
           <Show
             when={settings().length > 0}
-            fallback={<p class="empty">No library or plugin lists: every installed library and plugin may be used.</p>}
+            fallback={<p class="empty">No library or plugin policies: every installed library and plugin may be used.</p>}
           >
-            <ul class="tok-list" aria-label="Library and plugin lists">
+            <ul class="tok-list" aria-label="Library and plugin policies">
               <For each={settings()}>
                 {(row) => (
                   <li class="tok">

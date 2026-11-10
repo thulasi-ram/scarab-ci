@@ -196,7 +196,8 @@ An org admin installs it like any other plugin ([Install a plugin](/scarab-ci/ge
    repository root, at the same commit), push it to a registry your cluster pulls from, and
    install it as `<repository>@sha256:<digest>`.
 3. Bind the `argocd` slot to your Argo CD's URL with a bearer token, and add the installation to
-   the plugin list (`plugins_allowed`), which no plugin's gates run without.
+   a plugin list (`plugins_allowed`, under Settings › Plugins › Plugin policies), which no
+   plugin's gates run without.
 
 ## What this doesn't cover
 

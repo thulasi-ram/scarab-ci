@@ -83,9 +83,14 @@ const SETTING_KINDS: Record<string, { label: string; section: string; list: stri
   plugins_allowed: { label: "Plugins whose gates may run", section: "plugins", list: "installations" },
 };
 
-/** The anchor of the list forms on the Libraries and Plugins sections. */
-export const LIBRARY_LISTS_ANCHOR = "library-lists";
-export const PLUGIN_LISTS_ANCHOR = "plugin-lists";
+/** The anchor of the Library policies panel on the Libraries section and of
+ *  the Plugin policies panel on the Plugins section. */
+export const LIBRARY_POLICIES_ANCHOR = "library-policies";
+export const PLUGIN_POLICIES_ANCHOR = "plugin-policies";
+/** The anchors those panels had before, kept so links sent with them still
+ *  scroll to the panel. */
+export const OLD_LIBRARY_POLICIES_ANCHOR = "library-lists";
+export const OLD_PLUGIN_POLICIES_ANCHOR = "plugin-lists";
 
 /** One typed-setting Policy as the page lists it. */
 export type TypedSettingRow = {
@@ -99,7 +104,7 @@ export type TypedSettingRow = {
   sectionLabel: string;
 };
 
-/** The library and plugin list rows, by name. An unknown setting kind is
+/** The library and plugin policy rows, by name. An unknown setting kind is
  *  shown by its wire name, linking to the Policies page itself. */
 export function typedSettingRows(org: string, policies: readonly StoredPolicyLike[]): TypedSettingRow[] {
   return policies
@@ -115,7 +120,7 @@ export function typedSettingRows(org: string, policies: readonly StoredPolicyLik
         values,
         appliesTo: appliesToProjects(p.policy),
         href: known
-          ? `${orgHref(org, known.section)}#${known.section === "plugins" ? PLUGIN_LISTS_ANCHOR : LIBRARY_LISTS_ANCHOR}`
+          ? `${orgHref(org, known.section)}#${known.section === "plugins" ? PLUGIN_POLICIES_ANCHOR : LIBRARY_POLICIES_ANCHOR}`
           : orgHref(org, "policies"),
         sectionLabel: known?.section === "plugins" ? "Plugins" : known ? "Libraries" : "Policies",
       };
@@ -228,7 +233,7 @@ export function runPolicySummary(views: readonly RunDecisionView[]): string {
   return parts.join(" · ");
 }
 
-// ── Library and plugin lists (typed settings) ────────────────────────────────
+// ── Library and plugin policies (typed settings) ─────────────────────────────
 
 export type SettingKind = "libraries_allowed" | "libraries_blocked" | "plugins_allowed";
 

@@ -1,6 +1,6 @@
 ---
 title: Policies
-description: Org rules written in CEL, checked as you type, tried on recent decisions before they enforce anything, and shown on every Run they decided. Library and plugin lists are rules with a form of their own.
+description: Org rules written in CEL, checked as you type, tried on recent decisions before they enforce anything, and shown on every Run they decided. Library and plugin policies are rules with a form of their own.
 ---
 
 A Policy is an org rule that Scarab checks at a fixed point in a Run's life: "no deploys from a
@@ -124,22 +124,23 @@ audit mode, allowed) with its message, and the input the rules saw. A Run no Pol
 shows nothing. The strip opens by itself when a decision denied. It reads
 `GET /v1/runs/{id}/policy-decisions`.
 
-## Library and plugin lists
+## Library and plugin policies
 
-Three rules have a form instead of CEL:
+Three rules have a form instead of CEL. Each is a list:
 
 | List | Where | What it denies |
 |------|-------|----------------|
-| Libraries allowed | Organization settings › Libraries | a Run with a Step or gate from a library matching none of its sources |
-| Libraries blocked | Organization settings › Libraries | a Run with a Step or gate from a library matching any of its sources |
-| Plugins whose gates may run | Organization settings › Plugins | a Run with a gate from a plugin installation not on the list |
+| Libraries allowed | Organization settings › Libraries › Library policies | a Run with a Step or gate from a library matching none of its sources |
+| Libraries blocked | Organization settings › Libraries › Library policies | a Run with a Step or gate from a library matching any of its sources |
+| Plugins whose gates may run | Organization settings › Plugins › Plugin policies | a Run with a gate from a plugin installation not on the list |
 
 A source is exact, or a prefix ending in `*` (`github.com/acme/*`); an installation is named
 exactly. An org list can be limited to some projects. A new library list starts in audit mode. No
 plugin's gates run until an enforced org list names the installation, so a plugin list starts
 enforced, and one in audit mode allows nothing.
 
-A project admin keeps the project's own lists on the repository's **Settings** tab. A project's
+A project admin keeps the project's own lists on the repository's **Settings** tab, under
+Library policies and Plugin policies. A project's
 list only narrows the org's: a Run must pass both. Project admins write these lists only, never
 CEL.
 
@@ -157,7 +158,7 @@ CEL.
 | `GET /v1/orgs/{org}/policy-decisions` | the decision log, newest first; `checkpoint`, `policy_id` and `since` narrow it |
 | `GET /v1/orgs/{org}/policy-decisions/counts` | each Policy's denies and would-denies since a time |
 | `GET /v1/runs/{id}/policy-decisions` | one Run's decisions |
-| `…/projects/{project}/policies` | a project's library and plugin lists, the same calls |
+| `…/projects/{project}/policies` | a project's library and plugin policies, the same calls |
 
 Checking, testing and replaying a draft need the org admin role, as saving one does.
 

@@ -90,7 +90,7 @@ describe("CEL Policies and typed settings", () => {
         label: "Plugins whose gates may run",
         values: ["argocd"],
         appliesTo: "all projects",
-        href: "/orgs/acme/settings/plugins#plugin-lists",
+        href: "/orgs/acme/settings/plugins#plugin-policies",
         sectionLabel: "Plugins",
       },
       {
@@ -99,7 +99,7 @@ describe("CEL Policies and typed settings", () => {
         label: "Libraries allowed",
         values: ["github.com/acme/*"],
         appliesTo: "all projects",
-        href: "/orgs/acme/settings/libraries#library-lists",
+        href: "/orgs/acme/settings/libraries#library-policies",
         sectionLabel: "Libraries",
       },
     ]);
