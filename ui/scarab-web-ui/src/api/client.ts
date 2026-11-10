@@ -983,6 +983,18 @@ export async function listPlugins(org: string): Promise<PluginInstallation[] | n
   return data;
 }
 
+/** One installation of the org by its id (`GET …/plugin-installations/{id}`);
+ *  `null` = no installation with this id in the org, or this server does not
+ *  run plugins (404). */
+export async function getPluginInstallation(org: string, id: string): Promise<PluginInstallation | null> {
+  const { data, error, response } = await api.GET("/v1/orgs/{org}/plugin-installations/{id}", {
+    params: { path: { org, id } },
+  });
+  if (response.status === 404) return null;
+  if (error || !data) throw new Error(errorText(error) || "failed to load the plugin installation");
+  return data;
+}
+
 /** Install a plugin from a reviewed manifest, its image pinned by digest
  *  (`POST …/plugins`). The server reads the source again and refuses (409)
  *  when it no longer has the reviewed hash. Asks for a step-up. */

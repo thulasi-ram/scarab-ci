@@ -467,6 +467,12 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
     ("POST", "/v1/orgs/{org}/plugins", "plugin.install", "CJ-A"),
     ("GET", "/v1/orgs/{org}/plugins/{name}", "read", "READ"),
     (
+        "GET",
+        "/v1/orgs/{org}/plugin-installations/{id}",
+        "read",
+        "READ",
+    ),
+    (
         "DELETE",
         "/v1/orgs/{org}/plugins/{name}",
         "plugin.uninstall",

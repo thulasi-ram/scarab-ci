@@ -550,6 +550,10 @@ pub(crate) fn governed_routes() -> Routes {
             plugins::install_plugin,
         )
         .get("/v1/orgs/{org}/plugins/{name}", plugins::get_plugin)
+        .get(
+            "/v1/orgs/{org}/plugin-installations/{id}",
+            plugins::get_plugin_by_id,
+        )
         .delete(
             "/v1/orgs/{org}/plugins/{name}",
             &ops::PLUGIN_UNINSTALL,

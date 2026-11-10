@@ -691,6 +691,10 @@ test("a plugin installation's manage page holds its state, config, kill and unin
   await dialog.getByRole("textbox").fill("argocd-us");
   await dialog.getByRole("button", { name: "Uninstall plugin" }).click();
   await expect(page).toHaveURL(/\/orgs\/acme\/settings\/plugins$/);
+
+  // An id that names no installation of the org says so.
+  await page.goto("/orgs/acme/settings/plugins/0000000000/manage");
+  await expect(page.getByText(/There is no plugin installation 0000000000 in acme/)).toBeVisible();
   expect(errors).toEqual([]);
 });
 

@@ -14042,6 +14042,7 @@ impl utoipa::Modify for StepUpResponses {
         plugins::list_plugins,
         plugins::install_plugin,
         plugins::get_plugin,
+        plugins::get_plugin_by_id,
         plugins::uninstall_plugin,
         plugins::kill_plugin,
         plugins::enable_plugin,

@@ -3619,6 +3619,61 @@
         ]
       }
     },
+    "/v1/orgs/{org}/plugin-installations/{id}": {
+      "get": {
+        "tags": [
+          "plugins"
+        ],
+        "summary": "One plugin installation, by id (ADR-0072)",
+        "operationId": "get_plugin_by_id",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "installation id (10 hex)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginInstallationDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "not an org admin"
+          },
+          "404": {
+            "description": "no installation with this id in the org, or plugins not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
     "/v1/orgs/{org}/plugins": {
       "get": {
         "tags": [

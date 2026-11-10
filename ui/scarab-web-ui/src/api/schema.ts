@@ -1069,6 +1069,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/orgs/{org}/plugin-installations/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** One plugin installation, by id (ADR-0072) */
+        get: operations["get_plugin_by_id"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/orgs/{org}/plugins": {
         parameters: {
             query?: never;
@@ -8934,6 +8951,44 @@ export interface operations {
                 content?: never;
             };
             /** @description plugins not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_plugin_by_id: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description installation id (10 hex) */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PluginInstallationDto"];
+                };
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no installation with this id in the org, or plugins not configured */
             404: {
                 headers: {
                     [name: string]: unknown;

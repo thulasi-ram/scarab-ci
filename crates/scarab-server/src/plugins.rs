@@ -1238,6 +1238,38 @@ pub(crate) async fn get_plugin(
     Ok(Json(installation_dto(&installation)))
 }
 
+/// One installation, by its server-minted id: what the settings page's URL
+/// carries. Administer on the Org. An id of another org's installation is
+/// not found here.
+#[utoipa::path(
+    get,
+    path = "/v1/orgs/{org}/plugin-installations/{id}",
+    params(
+        ("org" = String, Path, description = "org"),
+        ("id" = String, Path, description = "installation id (10 hex)")
+    ),
+    summary = "One plugin installation, by id (ADR-0072)",
+    responses(
+        (status = 200, body = PluginInstallationDto),
+        (status = 403, description = "not an org admin"),
+        (status = 404, description = "no installation with this id in the org, or plugins not configured")
+    )
+)]
+pub(crate) async fn get_plugin_by_id(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((org, id)): Path<(String, String)>,
+) -> Result<Json<PluginInstallationDto>, ApiError> {
+    org_admin(&st, &headers, &org).await?;
+    let installation = store(&st)?
+        .installation_by_id(&id)
+        .await
+        .map_err(plugin_store_api_error)?
+        .filter(|i| i.org == org)
+        .ok_or(ApiError::NotFound)?;
+    Ok(Json(installation_dto(&installation)))
+}
+
 /// Uninstall. Removes its connections (and their credentials), and retires
 /// the name in this org for good. Administer on the Org.
 #[utoipa::path(

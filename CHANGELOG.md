@@ -185,7 +185,8 @@ release.yml uses that version's section as the GitHub Release text. See
   storage, connections, the broker journal and uninstalling a plugin are on the installation's
   page (`…/settings/libraries/<id>/manage`, `…/settings/plugins/<id>/manage`). Migration 0092
   gives each library installation an id, kept across upgrades; `GET
-  /v1/orgs/{org}/library-installations/{id}` reads one installation by it. A `…/libraries/<publisher>~<name>/manage` link goes on to the
+  /v1/orgs/{org}/library-installations/{id}` and `GET /v1/orgs/{org}/plugin-installations/{id}`
+  read one installation by its id. A `…/libraries/<publisher>~<name>/manage` link goes on to the
   installation's id page.
   The library review page lays its facts and checks out on one grid, with Install in one row
   under the diff.
