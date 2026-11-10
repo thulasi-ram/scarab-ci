@@ -120,6 +120,24 @@ command -v helm >/dev/null 2>&1 || {
 NS="${NAMESPACE:-scarab}"
 TAG="${1:-${IMAGE_TAG:-edge}}"
 
+# A tag on the command line names the release for every image, not only the
+# server. The .env pins the sidecar and the fetcher to tags of their own (`edge`
+# in .env.example), so without this `deploy.sh 0.3.0` would run a 0.3.0 server
+# beside an `edge` sidecar. With it, `deploy.sh <ref>` deploys what
+# `just stack up demo-oracle <ref>` deploys; the box has no `just`. An image the
+# caller set in its environment still wins.
+if [ -n "${1:-}" ]; then
+  if [ -z "$_img_sidecar" ]; then
+    _i="${SCARAB_SIDECAR_IMAGE:-ghcr.io/thulasi-ram/scarab-results-sidecar:edge}"
+    export SCARAB_SIDECAR_IMAGE="${_i%:*}:$TAG"
+  fi
+  if [ -z "$_img_wsfetch" ]; then
+    _i="${SCARAB_WSFETCH_IMAGE:-ghcr.io/thulasi-ram/scarab-wsfetch:edge}"
+    export SCARAB_WSFETCH_IMAGE="${_i%:*}:$TAG"
+  fi
+  unset _i
+fi
+
 # Force a fresh Pod on every deploy. `edge` is a MUTABLE tag — it never changes
 # string-wise — so a re-run of `helm upgrade` renders a byte-identical Deployment,
 # K8s sees no diff, and the old Pod keeps running the stale image (pullPolicy:
@@ -464,6 +482,47 @@ kc apply -f "$ROOT/deploy/demo-oracle/steps.yaml"
 echo "==> in-cluster Postgres (+ nightly dump to R2)"
 kc apply -n "$NS" -f "$ROOT/deploy/demo-oracle/postgres.yaml"
 kc rollout status -n "$NS" deploy/scarab-postgres --timeout=180s
+
+# Before upgrading an existing release, dump the database under a key of its
+# own, so a bad upgrade can be rolled back to the moment before it. The Job is
+# the nightly CronJob's, with BACKUP_KEY set: the seven day-of-week slots are
+# left alone. A dump that fails stops the deploy before anything is upgraded.
+# These dumps are never pruned; delete old ones under pg/pre-deploy/ by hand.
+if hc status scarab -n "$NS" >/dev/null 2>&1; then
+  backup_job="scarab-predeploy-$DEPLOY_NONCE"
+  backup_key="pg/pre-deploy/$(date -u +%Y%m%dT%H%M%SZ)-$TAG.dump"
+  echo "==> pre-upgrade dump -> s3://$SCARAB_S3_BUCKET/$backup_key"
+  kc create job "$backup_job" -n "$NS" --from=cronjob/scarab-postgres-backup \
+    --dry-run=client -o yaml \
+    | kc set env --local -f - -c upload "BACKUP_KEY=$backup_key" -o yaml \
+    | kc apply -n "$NS" -f -
+  backup_state=""
+  for _ in $(seq 1 120); do
+    backup_state="$(kc get job "$backup_job" -n "$NS" \
+      -o jsonpath='{.status.conditions[?(@.status=="True")].type}' 2>/dev/null || true)"
+    case "$backup_state" in *Complete*|*Failed*) break ;; esac
+    sleep 5
+  done
+  case "$backup_state" in
+    *Complete*) echo "    dump done" ;;
+    *)
+      echo "refusing to upgrade: the pre-upgrade dump did not complete (${backup_state:-still running after 10 min})." >&2
+      echo "  kubectl -n $NS logs job/$backup_job --all-containers" >&2
+      exit 1
+      ;;
+  esac
+fi
+
+# Chart 0.2.1 and earlier put the chart version in the workspace StatefulSet's
+# claim template, a field Kubernetes never lets an update change, so
+# `helm upgrade` fails on it. Delete the StatefulSet once and keep its Pod and
+# volume, as the chart README's "Upgrading from 0.2.1 or earlier" says; the
+# upgrade recreates it, and it adopts both again.
+if [ -n "$(kc get sts scarab-workspace -n "$NS" \
+     -o jsonpath='{.spec.volumeClaimTemplates[*].metadata.labels.helm\.sh/chart}' 2>/dev/null || true)" ]; then
+  echo "==> scarab-workspace has a 0.2.1-era claim template: deleting the StatefulSet, keeping its Pod and volume"
+  kc delete sts scarab-workspace -n "$NS" --cascade=orphan
+fi
 
 echo "==> scarab-server + workspace service (image tag: $TAG)"
 hc upgrade --install scarab "$ROOT/deploy/helm/scarab" -n "$NS" \

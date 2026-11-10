@@ -36,6 +36,13 @@ help:
 #
 #   just stack up demo-oracle             # the latest published ghcr `edge`
 #   just stack up demo-oracle sha-<sha>   # a specific published SHA
+#   just stack up demo-oracle 0.3.0       # a release
+#
+# The box has no `just` by default; `bash deploy/demo-oracle/deploy.sh <ref>`
+# deploys the same images, because a tag argument sets the sidecar and wsfetch
+# tags too. Before an upgrade deploy.sh dumps the database under its own key
+# and removes a chart-0.2.1 StatefulSet (deploy/demo-oracle/README.md,
+# Upgrading).
 #
 # It runs only ON THE BOX, after `sudo bash deploy/demo-oracle/bootstrap.sh`
 # and after filling in deploy/demo-oracle/.env. The recipe refuses unless the
