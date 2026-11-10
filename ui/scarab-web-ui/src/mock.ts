@@ -61,8 +61,8 @@ const ENV_GATE_RUN_ID = "0190f8a2000071fb8c00e7a9b0c1d2e3";
 // ── /v1/me ────────────────────────────────────────────────────────────────
 // An Owner of the one implicit org, so the Settings gear renders.
 // The Owner role is global, so Avery is a global admin: the org dropdown in
-// Organization settings ends with New organization…, and Connections lists the
-// unassigned connection below (git-bug 19b0a45). Avery
+// Organization settings ends with New organization… (2 waiting): the two
+// connections below that serve no org wait on that page (git-bug 19b0a45). Avery
 // administers two orgs, so the org dropdown in Organization settings offers a
 // choice; globex has no connections or repositories of its own.
 const me = {
@@ -1201,8 +1201,12 @@ const connections: components["schemas"]["ConnectionDto"][] = [
     supports_preflight: false,
     managed_by_config: false,
   },
-  // An installation whose account could not be told apart from a same-named
-  // org on another forge, so it serves no org yet.
+  // Two installations that serve no org yet. 90211 is the App installed on
+  // the `acme` account again, under an installation whose account id no acme
+  // connection records, so the delivery could not prove it is acme's account.
+  // 90377 was registered before connections served orgs (a legacy
+  // connection), for an account no org has the name of. The connection list
+  // does not carry the account, so the page shows neither login.
   {
     id: "github-install-90211",
     org: null,
@@ -1217,7 +1221,39 @@ const connections: components["schemas"]["ConnectionDto"][] = [
     supports_preflight: false,
     managed_by_config: false,
   },
+  {
+    id: "github-install-90377",
+    org: null,
+    kind: "github",
+    base_url: "https://api.github.com",
+    web_url: "https://github.com",
+    credential_ref: "github-app",
+    credential_present: true,
+    last_delivery_at: ago(86_400_000),
+    enabled_repos: 0,
+    supports_resync: true,
+    supports_preflight: false,
+    managed_by_config: false,
+  },
 ];
+
+/**
+ * Why the server refuses to assign `conn` to `org`, as it words it
+ * (`admin_assign_refusal`): an org served by a connection to another forge or
+ * host, or an org that exists and no connection serves. Bound repositories of
+ * another owner are not modelled: no waiting connection here binds any.
+ */
+function assignRefusal(conn: components["schemas"]["ConnectionDto"], org: string): string | null {
+  const servers = connections.filter((c) => c.id !== conn.id && c.org === org);
+  const other = servers.find((c) => c.kind !== conn.kind || c.base_url !== conn.base_url);
+  if (other) {
+    return `org \`${org}\` has connection \`${other.id}\` to ${other.base_url}, another forge or host than ${conn.base_url}; an account of the same name there is not known to be the same account`;
+  }
+  if (servers.length === 0 && me.admin_orgs.includes(org)) {
+    return `org \`${org}\` exists but no connection serves it, so nothing shows that the account \`${org}\` on ${conn.base_url} is the same account`;
+  }
+  return null;
+}
 
 // A correctly-configured App (git-bug 90644c6). The interesting fixture is the
 // degraded one, but the demo stack shows a healthy install — the gap list is
@@ -2175,6 +2211,12 @@ function route(pathname: string, search: string, method: string, body = ""): Res
     const org = (JSON.parse(body || "{}") as { org?: string }).org ?? "";
     const found = connections.find((c) => c.id === m![1]);
     if (!found) return new Response("not found", { status: 404 });
+    const refused = assignRefusal(found, org);
+    if (refused) {
+      return new Response(`connection \`${found.id}\` cannot serve org \`${org}\`: ${refused}`, {
+        status: 409,
+      });
+    }
     found.org = org;
     if (!me.admin_orgs.includes(org)) me.admin_orgs = [...me.admin_orgs, org].sort();
     if (!me.token_mint_orgs.includes(org)) me.token_mint_orgs = [...me.token_mint_orgs, org].sort();

@@ -8,7 +8,8 @@
 // admins of that org, with an org dropdown at the top of the sidebar). The
 // user menu links each one. The org dropdown's last entry, for global admins,
 // is New organization… (`/orgs/_new`): a new org's first forge connection, in
-// the same frame. Under ~900px the section list becomes a `<select>` above
+// the same frame, and the connections that serve no org yet, which the entry
+// counts. Under ~900px the section list becomes a `<select>` above
 // the section, with the org dropdown above it. A page under a section (one
 // Environment, a library review) renders in the same frame, with its parent
 // section marked. The route table, the gating, which section a path sits in
@@ -28,6 +29,7 @@ import {
   groupHome,
   NEW_ORG_CHOICE,
   NEW_ORG_LABEL,
+  newOrgEntryLabel,
   orgPickHref,
   resolveSection,
   settingsHome,
@@ -39,7 +41,8 @@ import {
 import LinkedAccounts from "../components/LinkedAccounts";
 import SecuritySettings from "../components/SecuritySettings";
 import AppearanceSettings from "../components/AppearanceSettings";
-import Connections, { NewOrgConnection } from "../components/Connections";
+import Connections, { NewOrgConnection, WaitingConnections } from "../components/Connections";
+import { waitingCount } from "../waiting-connections";
 import Members from "../components/Members";
 import OrgEnvironments from "../components/OrgEnvironments";
 import Plugins from "../components/Plugins";
@@ -74,8 +77,9 @@ export function OrgSettings() {
 }
 
 /** `/orgs/_new` — a new org, made by its first forge connection (global
- *  admins). It renders in the org settings frame, with New organization…
- *  picked in the org dropdown. */
+ *  admins), under the connections that wait for an org, which can make one
+ *  too. It renders in the org settings frame, with New organization… picked
+ *  in the org dropdown. */
 export function NewOrgSettings() {
   return (
     <SettingsFrame kind="org">
@@ -83,6 +87,7 @@ export function NewOrgSettings() {
         <h1>{NEW_ORG_LABEL}</h1>
       </div>
       <p class="page-sub">its first forge connection</p>
+      <WaitingConnections />
       <NewOrgConnection />
     </SettingsFrame>
   );
@@ -260,8 +265,8 @@ export function SettingsCrumbs(props: { trail: Crumb[]; sub: JSX.Element }) {
  * The org dropdown at the top of an org page's sidebar, shown even for one
  * org so it is always in the same place. Picking an org keeps the section in
  * view. For a global admin its last entry is New organization…, picked on
- * that page (`org` undefined). Under ~900px it stays above the section
- * `<select>`.
+ * that page (`org` undefined), with the count of connections that wait for an
+ * org there. Under ~900px it stays above the section `<select>`.
  */
 function OrgPick(props: { org?: string; orgs: OrgChoice[]; newOrg: boolean; section?: string }) {
   const nav = useNavigate();
@@ -280,7 +285,7 @@ function OrgPick(props: { org?: string; orgs: OrgChoice[]; newOrg: boolean; sect
       </For>
       <Show when={props.newOrg}>
         <option value={NEW_ORG_CHOICE} selected={props.org === undefined}>
-          {NEW_ORG_LABEL}…
+          {newOrgEntryLabel(waitingCount(), true)}
         </option>
       </Show>
     </select>
