@@ -3347,11 +3347,6 @@ h1, .crumb-head, .run-title {
 .env-danger p { margin: 0; font-size: var(--fs-md); }
 .typed-confirm { display: flex; flex-direction: column; gap: 8px; max-width: 420px; }
 .typed-confirm label { display: flex; flex-direction: column; gap: 6px; font-size: var(--fs-sm); color: var(--sage); }
-/* The split report above the Environment list. */
-.oenv-report { border: 1px dashed var(--line, currentColor); border-radius: 8px; padding: 10px 12px; margin-bottom: 12px; }
-.oenv-report-h { display: flex; align-items: center; gap: 8px; font-size: var(--fs-sm); }
-.oenv-report-h .btn { margin-left: auto; }
-.oenv-report-projects { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; }
 .oenv-desc { font-size: var(--fs-sm); color: var(--sage); }
 /* The name pipelines use, beside an Environment's display name. */
 .oenv-name { font-size: var(--fs-sm); color: var(--muted-sage); }

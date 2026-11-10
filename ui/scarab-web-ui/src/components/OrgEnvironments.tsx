@@ -13,28 +13,14 @@
 // Environment's own read-only page, and every change to it is on that page's
 // edit screen (`routes/EnvironmentPage.tsx`, git-bug c11abc5).
 //
-// Above the list sits the migration's SPLIT REPORT: every name the migration
-// merged across projects, or opened to all projects, with each project's old
-// rules beside its overlay now, and a banner counting what is left to review
-// and which baselines are still permissive. Splitting a name that is really
-// two places is a YAML change in the projects concerned; the panel says so.
-//
 // Every server refusal (400/409) is shown verbatim: it is the answer to "why
 // will this not save".
 import { createResource, createSignal, For, Show } from "solid-js";
 import { A, useNavigate } from "@solidjs/router";
-import {
-  acknowledgeMigrationReport,
-  getMigrationReport,
-  listOrgEnvironments,
-  putOrgEnvironment,
-  type MigrationReportLine,
-  type OrgEnvironment,
-} from "../api/client";
+import { listOrgEnvironments, putOrgEnvironment, type OrgEnvironment } from "../api/client";
 import {
   eligibilityLabel,
   isPermissive,
-  reportBanner,
   rulesSummary,
   unprotectedBanner,
   unprotectedButOpen,
@@ -60,10 +46,6 @@ export default function OrgEnvironments(props: { org: string }) {
     (k) => listOrgEnvironments(k.org),
   );
   const [creating, setCreating] = createSignal(false);
-  const [report, { refetch: refetchReport }] = createResource(
-    () => ({ org: props.org, epoch: epoch() }),
-    (k) => getMigrationReport(k.org).catch(() => null),
-  );
 
   // `null` is the server answering "no org-Environment store here", which is a
   // different sentence from "none registered".
@@ -81,10 +63,6 @@ export default function OrgEnvironments(props: { org: string }) {
       <div class="secrets-body">
         <Show when={environments.error}>
           <p class="error">Could not load the org's environments.</p>
-        </Show>
-
-        <Show when={(report() ?? []).length > 0}>
-          <MigrationReport org={props.org} lines={report()!} onChanged={() => refetchReport()} />
         </Show>
 
         <Show when={!environments.loading} fallback={<p class="empty">loading…</p>}>
@@ -285,124 +263,5 @@ function CreateDialog(props: {
         <Input placeholder="what lands here, who runs it" value={description()} onValue={setDescription} />
       </Field>
     </Modal>
-  );
-}
-
-/** The migration's split report: each name merged
- *  across projects, or opened to all projects, with each project's old rules
- *  beside its overlay now. Shown only to org admins (the read needs
- *  Administer) and only while it has lines. */
-function MigrationReport(props: {
-  org: string;
-  lines: MigrationReportLine[];
-  onChanged: () => void;
-}) {
-  const [open, setOpen] = createSignal(false);
-  const [error, setError] = createSignal<string | null>(null);
-  const banner = () => reportBanner(props.lines);
-
-  const acknowledge = async (env: string) => {
-    setError(null);
-    try {
-      await acknowledgeMigrationReport(props.org, env);
-      props.onChanged();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : `Could not acknowledge ${env}.`);
-    }
-  };
-
-  return (
-    <div class="oenv-report">
-      <div class="oenv-report-h">
-        <Icon icon="alert-triangle" size={14} />
-        <span>{banner() ?? "Migration report — every line reviewed."}</span>
-        <button class="btn btn-ghost btn-sm" onClick={() => setOpen((o) => !o)}>
-          {open() ? "hide" : "review"}
-        </button>
-      </div>
-      <Show when={open()}>
-        <p class="fieldnote">
-          Per-repository environments of one name became one org environment, and each
-          project's old rules became its own overlay — so every project deploys exactly as
-          before. If a name was really two places (one <span class="mono">prod</span> that is{" "}
-          <span class="mono">prod-eu</span>), split it in YAML: change those projects'{" "}
-          <span class="mono">environment:</span> and create the new environment here.
-        </p>
-        <Show when={error()}>
-          <p class="error">{error()}</p>
-        </Show>
-        <ul class="tok-list">
-          <For each={props.lines}>
-            {(line) => (
-              <li class="tok">
-                <div class="tok-head">
-                  <span class="tok-name mono">{line.environment}</span>
-                  <Show when={line.referenced_only}>
-                    <span class="tok-role" title="No project defined it; it was opened to all projects">
-                      all projects
-                    </span>
-                  </Show>
-                  <Show when={line.environment_exists && line.permissive_baseline}>
-                    <span class="tok-role">permissive baseline — set a baseline</span>
-                  </Show>
-                  <Show when={!line.environment_exists}>
-                    <span class="tok-role">deleted since</span>
-                  </Show>
-                  <span class="oenv-actions">
-                    <Show
-                      when={line.acknowledged_at == null}
-                      fallback={
-                        <span class="subtle" title={absTime(line.acknowledged_at!)}>
-                          reviewed by {line.acknowledged_by}
-                        </span>
-                      }
-                    >
-                      <button class="btn btn-ghost btn-sm" onClick={() => acknowledge(line.environment)}>
-                        mark reviewed
-                      </button>
-                    </Show>
-                  </span>
-                </div>
-                <div class="tok-facts">
-                  <Show when={line.merged_projects.length > 0}>
-                    <span>merged from {line.merged_projects.join(", ")}</span>
-                  </Show>
-                  <Show when={line.referencing_projects.length > 0}>
-                    <span>named by {line.referencing_projects.join(", ")}</span>
-                  </Show>
-                  <Show when={line.differing_rules.length > 0}>
-                    <span>
-                      <Icon icon="alert-triangle" size={12} /> differed on{" "}
-                      {line.differing_rules.join(", ")}
-                    </span>
-                  </Show>
-                </div>
-                <div class="oenv-report-projects">
-                  <For each={line.projects}>
-                    {(p) => (
-                      <div class="env-h-row mono">
-                        <b>{p.project}</b>{" "}
-                        <span class="subtle">was</span>{" "}
-                        {p.legacy
-                          ? `${p.legacy.approvers.length} approver(s) · ${
-                              p.legacy.allowed_refs.join(" | ") || "any ref"
-                            }${p.legacy.require_reason ? " · reason" : ""}${
-                              p.legacy.privileged_images.length || p.legacy.permit_k8s_overlay
-                                ? " · privileges"
-                                : ""
-                            }`
-                          : "no rules (only named it)"}{" "}
-                        <span class="subtle">· now</span>{" "}
-                        {p.overlay ? rulesSummary(p.overlay) : "no overlay"}
-                      </div>
-                    )}
-                  </For>
-                </div>
-              </li>
-            )}
-          </For>
-        </ul>
-      </Show>
-    </div>
   );
 }

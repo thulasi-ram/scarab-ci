@@ -184,18 +184,6 @@ export function tightenable<T extends { name: string; eligible: boolean; overlay
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
-/** A split-report line as the server serialises it (the field used here). */
-export type ReportLineLike = { acknowledged_at?: number | null };
-
-/** The count banner over the split report: the lines still to review. `null`
- *  once every line is reviewed. Permissive baselines are counted by
- *  [`unprotectedBanner`] over every Environment, not here. */
-export function reportBanner(lines: readonly ReportLineLike[]): string | null {
-  const open = lines.filter((l) => l.acknowledged_at == null).length;
-  if (open === 0) return null;
-  return `${open} migrated environment${open === 1 ? "" : "s"} to review`;
-}
-
 /** One whitelist row as the grant form holds it. */
 export type ImageGrantRow = { digest: string; privileged: boolean; capabilities: string };
 

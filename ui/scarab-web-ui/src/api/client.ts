@@ -761,8 +761,6 @@ export type EnvironmentProject = components["schemas"]["EnvironmentProjectDto"];
 export type PrivilegeGrant = components["schemas"]["EnvironmentProjectPrivilegeGrantDto"];
 export type PutPrivilegeGrantRequest =
   components["schemas"]["PutEnvironmentProjectPrivilegeGrantRequest"];
-/** One line of the migration's split report. */
-export type MigrationReportLine = components["schemas"]["EnvironmentMigrationReportDto"];
 
 /** Replace an Environment's baseline. Returns the Environment as stored. */
 export async function putEnvironmentProtection(
@@ -812,30 +810,6 @@ export async function putPrivilegeGrant(
 /** Withdraw a Project's privilege grant. */
 export async function deletePrivilegeGrant(org: string, env: string, project: string): Promise<void> {
   await send(`${projectPath(org, env, project)}/privilege-grant`, "DELETE");
-}
-
-/** The migration's split report. `null` when the caller may not read it
- *  (403 — it needs Administer on the org) or the server has no governance
- *  store (404): the panel then simply does not show. */
-export async function getMigrationReport(org: string): Promise<MigrationReportLine[] | null> {
-  const { data, response } = await api.GET("/v1/orgs/{org}/environment-migration-report", {
-    params: { path: { org } },
-  });
-  if (response.status === 403 || response.status === 404) return null;
-  if (!data) throw new Error(`failed to load the migration report (${response.status})`);
-  return data;
-}
-
-/** Mark one split-report line reviewed (the first acknowledgement stands). */
-export async function acknowledgeMigrationReport(
-  org: string,
-  env: string,
-): Promise<MigrationReportLine> {
-  const res = await send(
-    `/v1/orgs/${encodeURIComponent(org)}/environment-migration-report/${encodeURIComponent(env)}/acknowledge`,
-    "POST",
-  );
-  return (await res.json()) as MigrationReportLine;
 }
 
 // --- Plugins — an org's PluginInstallations:

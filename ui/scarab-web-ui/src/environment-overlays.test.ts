@@ -3,7 +3,6 @@ import {
   eligibilityLabel,
   isPermissive,
   refLayersLabel,
-  reportBanner,
   rulesToForm,
   tightenable,
   STAR_ONLY_PATTERN_ERROR,
@@ -86,19 +85,6 @@ describe("tightenable", () => {
       { name: "dev", eligible: true },
     ];
     expect(tightenable(envs).map((e) => e.name)).toEqual(["dev", "prod", "staging"]);
-  });
-});
-
-describe("reportBanner", () => {
-  const line = (acked: boolean) => ({ acknowledged_at: acked ? 1 : null });
-
-  it("counts the lines still to review", () => {
-    expect(reportBanner([line(false), line(true), line(false)])).toBe("2 migrated environments to review");
-  });
-
-  it("says nothing once every line is reviewed", () => {
-    expect(reportBanner([line(true)])).toBeNull();
-    expect(reportBanner([])).toBeNull();
   });
 });
 

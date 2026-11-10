@@ -99,7 +99,7 @@ describe("duplicate", () => {
       projects_with_runs: ["checkout", "web"],
       old_oidc_subject: "scarab:org/acme/repo/*/env/prod/ref/*",
       new_oidc_subject: "scarab:org/acme/repo/*/env/prod-eu/ref/*",
-      notes: ["Run and approval history and the Cache stay with prod, which is not changed and stays until an admin deletes it."],
+      notes: ["Run history, approvals included, and the Cache stay with prod, which is not changed and stays until an admin deletes it."],
     },
   };
 

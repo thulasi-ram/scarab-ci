@@ -30,7 +30,6 @@ type OverlayDto = components["schemas"]["EnvironmentProjectOverlayDto"];
 type GrantDto = components["schemas"]["EnvironmentProjectPrivilegeGrantDto"];
 type ProjectEnvironmentDto = components["schemas"]["ProjectEnvironmentDto"];
 type EnvironmentProjectDto = components["schemas"]["EnvironmentProjectDto"];
-type MigrationReportDto = components["schemas"]["EnvironmentMigrationReportDto"];
 type PluginCatalogEntryDto = components["schemas"]["PluginCatalogEntryDto"];
 type PluginInstallationDto = components["schemas"]["PluginInstallationDto"];
 type PluginConnectionDto = components["schemas"]["PluginConnectionDto"];
@@ -910,66 +909,6 @@ function environmentProjects(env: OrgEnvironmentDto): EnvironmentProjectDto[] {
   }));
 }
 
-// The migration's split report: production was merged
-// from scarab's and web-app's per-repo environments (they disagreed on
-// approvers and require_reason); qa was only ever named, so it was opened to
-// all projects and still has a permissive baseline — reviewed already.
-const migrationReport: MigrationReportDto[] = [
-  {
-    environment: "production",
-    merged_projects: ["scarab", "web-app"],
-    referenced_only: false,
-    referencing_projects: [],
-    differing_rules: ["approvers", "require_reason"],
-    environment_exists: true,
-    permissive_baseline: false,
-    projects: [
-      {
-        project: "scarab",
-        legacy: {
-          approvers: ["ops-lead", "j.lee"],
-          allowed_refs: ["refs/heads/main"],
-          wait_timer: 300,
-          concurrency: 1,
-          require_reason: true,
-          privileged_images: grants.production!.scarab!.privileged_images,
-          permit_k8s_overlay: false,
-        },
-        overlay: overlays.production!.scarab!,
-      },
-      {
-        project: "web-app",
-        legacy: {
-          approvers: ["ops-lead"],
-          allowed_refs: ["refs/heads/main"],
-          wait_timer: 300,
-          concurrency: 1,
-          require_reason: false,
-          privileged_images: [],
-          permit_k8s_overlay: false,
-        },
-        overlay: null,
-      },
-    ],
-    created_at: ago(3 * 24 * 60 * min),
-    acknowledged_at: null,
-    acknowledged_by: null,
-  },
-  {
-    environment: "qa",
-    merged_projects: [],
-    referenced_only: true,
-    referencing_projects: ["scarab"],
-    differing_rules: [],
-    environment_exists: true,
-    permissive_baseline: true,
-    projects: [{ project: "scarab", legacy: null, overlay: null }],
-    created_at: ago(3 * 24 * 60 * min),
-    acknowledged_at: ago(2 * 24 * 60 * min),
-    acknowledged_by: "a.kim",
-  },
-];
-
 // ── Plugins — Settings › Plugins. `argocd` is running;
 // `argocd-us` is killed. Writes echo a record and persist nothing.
 const ARGOCD_REPO = "ghcr.io/thulasi-ram/scarab-plugin-argocd";
@@ -1799,7 +1738,7 @@ function route(pathname: string, search: string, method: string, body = ""): Res
           old_oidc_subject: `scarab:org/acme/repo/*/env/${old}/ref/*`,
           new_oidc_subject: `scarab:org/acme/repo/*/env/${name}/ref/*`,
           notes: [
-            `Run and approval history and the Cache stay with ${old}, which is not changed and stays until an admin deletes it.`,
+            `Run history, approvals included, and the Cache stay with ${old}, which is not changed and stays until an admin deletes it.`,
           ],
         },
       },
@@ -1897,12 +1836,6 @@ function route(pathname: string, search: string, method: string, body = ""): Res
       );
     }
     return stored ? json(stored) : new Response("not found", { status: 404 });
-  }
-  if (/^\/v1\/orgs\/[^/]+\/environment-migration-report$/.test(p)) return json(migrationReport);
-  if ((m = p.match(/^\/v1\/orgs\/[^/]+\/environment-migration-report\/([^/]+)\/acknowledge$/))) {
-    const line = migrationReport.find((l) => l.environment === decodeURIComponent(m![1]!));
-    if (!line) return new Response("not found", { status: 404 });
-    return json({ ...line, acknowledged_at: line.acknowledged_at ?? now, acknowledged_by: line.acknowledged_by ?? "a.kim" });
   }
 
   // Plugins: catalog, installations, kill/enable, uninstall.
