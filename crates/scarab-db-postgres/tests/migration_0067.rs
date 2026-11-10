@@ -185,7 +185,16 @@ async fn the_drop_removes_the_record_and_leaves_plugins_and_environments_intact(
         .expect("the environment store reads the kept schema")
         .expect("the environment survives");
     assert_eq!(env.description, "production");
-    assert_eq!(env.protection.approvers, vec!["user:amy".to_string()]);
+    // Since migration 0093 the list holds Principal ids; this one is the
+    // placeholder for `user:amy` (ADR-0080 §6).
+    let handles: Vec<String> = sqlx::query_scalar(
+        "SELECT p.handle FROM unnest($1::text[]) a JOIN principals p ON p.id = a",
+    )
+    .bind(&env.protection.approvers)
+    .fetch_all(&tdb.pool)
+    .await
+    .unwrap();
+    assert_eq!(handles, vec!["user:amy".to_string()]);
 
     tdb.cleanup().await;
 }

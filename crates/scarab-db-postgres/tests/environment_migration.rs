@@ -341,16 +341,38 @@ async fn backfill_reproduces_the_pure_migration_and_is_a_no_op_the_second_time()
         assert!(!exists, "0088 drops {gone}");
     }
     let db = PostgresDb::with_pool(pool.clone());
+    // Migration 0093 stores approvers as Principal ids (placeholders for
+    // these names nobody signed in as); `principals` maps each back to the
+    // name the pure migration kept (ADR-0080 §6).
+    let handles = |ids: Vec<String>| {
+        let pool = pool.clone();
+        async move {
+            let mut out = Vec::with_capacity(ids.len());
+            for id in ids {
+                out.push(
+                    sqlx::query_scalar::<_, String>("SELECT handle FROM principals WHERE id = $1")
+                        .bind(&id)
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap_or(id),
+                );
+            }
+            out
+        }
+    };
 
     // Every legacy row → exactly the pure migration of it.
     for (org, project, legacy) in &legacy_rows {
         let (org, project, name) = (org.as_str(), project.as_str(), legacy.name.as_str());
         let (want_overlay, want_grant) = migrate_legacy_environment(org, project, legacy);
-        let g = db
+        let mut g = db
             .deploy_governance(org, project, name)
             .await
             .unwrap()
             .unwrap_or_else(|| panic!("{org}/{name} has an org Environment"));
+        if let Some(o) = g.overlay.as_mut() {
+            o.rules.approvers = handles(std::mem::take(&mut o.rules.approvers)).await;
+        }
         assert!(g.eligible, "{org}/{project} stays eligible for {name}");
         assert_eq!(
             g.overlay,
@@ -395,7 +417,7 @@ async fn backfill_reproduces_the_pure_migration_and_is_a_no_op_the_second_time()
         .unwrap()
         .unwrap();
     assert_eq!(
-        carol.overlay.unwrap().rules.approvers,
+        handles(carol.overlay.unwrap().rules.approvers).await,
         vec!["carol".to_string(), "carol".to_string()]
     );
 

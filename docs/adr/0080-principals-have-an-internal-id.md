@@ -98,8 +98,9 @@ Every place a person names a Principal resolves what they typed before storing i
 4. Otherwise the write is refused, as ADR-0069 §3 requires.
 
 A merged Principal resolves to the one it was merged into. This is
-`resolve_principal` in `scarab-identity`, extended; it covers grants, approver lists,
-the forge import, the server's `grant` command and passkey reset.
+`resolve_principal` in `scarab-identity`, extended; it covers grants, revokes, approver
+lists, the server's `grant` command and passkey reset. The forge import pins people by
+their provider's immutable id, as before, and stores the id it finds or mints.
 
 ### 3. Reads accept either form
 
