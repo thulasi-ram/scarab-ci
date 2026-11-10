@@ -782,9 +782,16 @@ mod tests {
             ChallengePurpose::Window,
             ChallengePurpose::Action,
             ChallengePurpose::Request,
+            ChallengePurpose::Merge,
         ] {
             assert_eq!(ChallengePurpose::parse(p.as_str()), Some(p));
         }
+        assert_eq!(ChallengePurpose::parse("Window"), None, "names are exact");
+        assert_eq!(
+            ConfirmationKind::parse("merge"),
+            None,
+            "a merge confirms no kind"
+        );
         for k in [
             ConfirmationKind::Window,
             ConfirmationKind::Action,

@@ -946,6 +946,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_unpinned_principal_is_its_own_handle() {
+        let p = Principal::unpinned("dev", Some("Dev".into()), vec![Role::Admin]);
+        assert_eq!(p.subject, "dev");
+        assert_eq!(p.handle(), "dev");
+        assert_eq!(p.display_name.as_deref(), Some("Dev"));
+        assert_eq!(p.roles, vec![Role::Admin]);
+    }
+
+    #[test]
     fn role_capabilities_follow_the_hierarchy() {
         // Everyone reads.
         for r in [Role::Viewer, Role::Member, Role::Admin, Role::Owner] {

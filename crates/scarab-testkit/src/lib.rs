@@ -5292,6 +5292,21 @@ mod tests {
     use super::*;
     use scarab_engine::{Db, RunId, StepId, Timestamp};
 
+    /// A reference that is a Principal's id finds it by id, before any
+    /// handle lookup (ADR-0080): a placeholder's minted id is found.
+    #[tokio::test]
+    async fn lookup_principal_finds_a_principal_by_its_id() {
+        let ids = InMemoryIdentities::new();
+        let id = ids.seed_placeholder("old.handle");
+        assert!(scarab_identity::is_principal_id(&id));
+        let found = scarab_identity::lookup_principal(&ids, &id)
+            .await
+            .unwrap()
+            .expect("the id names a Principal");
+        assert_eq!(found.id, id);
+        assert_eq!(found.handle, "old.handle");
+    }
+
     /// The InMemoryDb round-trips a step's typed named results (ADR-0041): absent
     /// is the empty map, and a set map reads back with types preserved.
     #[tokio::test]
