@@ -1,13 +1,5 @@
 import { describe, it, expect } from "vitest";
-import {
-  connectionFor,
-  forgeName,
-  orgNameProblem,
-  reposForOrg,
-  resyncNote,
-  soleOwner,
-  unassignedConnections,
-} from "./connections";
+import { forgeName, orgNameProblem, resyncNote, unassignedConnections } from "./connections";
 
 describe("unassigned connections", () => {
   it("keeps only the connections with no org", () => {
@@ -18,29 +10,6 @@ describe("unassigned connections", () => {
       { id: "d", org: "globex" },
     ];
     expect(unassignedConnections(conns).map((c) => c.id)).toEqual(["b", "c"]);
-  });
-});
-
-describe("repositories offered to bind", () => {
-  const repos = [
-    { owner: "acme", name: "api" },
-    { owner: "verify-org", name: "team-repo" },
-    { owner: "acme", name: "web" },
-  ];
-
-  it("offers only the org's own repositories and counts the rest", () => {
-    const { offered, hidden } = reposForOrg(repos, "acme");
-    expect(offered.map((r) => r.name)).toEqual(["api", "web"]);
-    expect(hidden).toBe(1);
-  });
-
-  it("matches the owner exactly, not by prefix or case", () => {
-    expect(reposForOrg(repos, "Acme").offered).toEqual([]);
-    expect(reposForOrg(repos, "acm").offered).toEqual([]);
-  });
-
-  it("offers everything when the connection has no org", () => {
-    expect(reposForOrg(repos, null)).toEqual({ offered: repos, hidden: 0 });
   });
 });
 
@@ -84,26 +53,10 @@ describe("new org name", () => {
   });
 });
 
-describe("the org an unassigned connection can take", () => {
-  it("is the one owner of its repositories", () => {
-    expect(soleOwner([{ owner: "acme" }, { owner: "acme" }])).toBe("acme");
-  });
-
-  it("is none for repositories of several owners, or none bound", () => {
-    expect(soleOwner([{ owner: "acme" }, { owner: "globex" }])).toBeNull();
-    expect(soleOwner([])).toBeNull();
-  });
-});
-
-describe("the connection that serves a repository", () => {
-  it("finds it by bound project and names its forge", () => {
-    const conns = [
-      { id: "gh", kind: "github", projects: [{ org: "acme", project: "web" }] },
-      { id: "fj", kind: "forgejo", projects: [{ org: "acme", project: "infra" }] },
-    ];
-    expect(connectionFor(conns, "acme", "infra")?.id).toBe("fj");
-    expect(connectionFor(conns, "globex", "web")).toBeNull();
-    expect(forgeName(connectionFor(conns, "acme", "web")?.kind)).toBe("GitHub");
+describe("forge names", () => {
+  it("names the forge of a connection kind", () => {
+    expect(forgeName("github")).toBe("GitHub");
+    expect(forgeName("forgejo")).toBe("Forgejo");
     expect(forgeName(undefined)).toBe("the forge");
   });
 });

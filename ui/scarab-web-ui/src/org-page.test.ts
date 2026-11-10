@@ -9,6 +9,9 @@ describe("org page address", () => {
     expect(orgPageHref("acme")).toBe("/orgs/acme");
     expect(orgPageHref("a b")).toBe("/orgs/a%20b");
   });
+  it("narrows to one connection with ?connection=", () => {
+    expect(orgPageHref("acme", "gh acme")).toBe("/orgs/acme?connection=gh%20acme");
+  });
 });
 
 describe("org run stats", () => {

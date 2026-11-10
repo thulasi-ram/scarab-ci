@@ -1,6 +1,5 @@
 // Disable a repository: the one confirmation and the one unbind call behind
-// every Disable button: the org page's row, the repository's Settings tab and
-// a connection's project row under Organization settings › Connections.
+// both Disable buttons: the org page's row and the repository's Settings tab.
 //
 // Disabling unbinds the repository from its connection, which removes its
 // project with the project's environments, secrets and access grants. The

@@ -113,26 +113,6 @@ if [ "$mode" = dogfood ]; then
 elif [ "$mode" = e2e ]; then
   database=scarab_e2e
   bucket=scarab-e2e
-  # The forge_token cases install the clone library into their org, and the
-  # Argo CD pass installs the Argo CD plugin, as an org admin does: the server
-  # fetches libs/clone.yaml and the plugin's manifest from github.com at the
-  # commit that last changed each, so both must be committed and pushed. In CI
-  # the checked-out commit is the pushed one.
-  need git
-  for f in libs/clone.yaml crates/scarab-plugin-argocd/manifest.json; do
-    c="$(git -C "$root" log -1 --format=%H -- "$f")"
-    [ -n "$c" ] || die "$f is not committed: the server fetches it from github.com"
-    git -C "$root" diff --quiet "$c" -- "$f" \
-      || die "$f has uncommitted changes: the server fetches it from github.com at $c"
-    if [ "${GITHUB_ACTIONS:-}" != true ] \
-       && [ -z "$(git -C "$root" branch -r --contains "$c" 2>/dev/null)" ]; then
-      die "$f at $c is not pushed: the server fetches it from github.com at that commit"
-    fi
-    case "$f" in
-      libs/*) libs_commit="$c" ;;
-      *) argocd_manifest_commit="$c" ;;
-    esac
-  done
 elif [ "$mode" = chaos ]; then
   database=scarab_chaos
   bucket=scarab-chaos
@@ -540,18 +520,6 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 chmod 600 "$values"
 
-if [ "$mode" = e2e ]; then
-  # The sources the e2e cases install from (checked as pushed above), and the
-  # clone library's content hash, which the forge_token cases compare with
-  # the installed version (SHA-256 of the file, as Scarab hashes a library).
-  printf '%s\n' "github.com/thulasi-ram/scarab-ci//libs/clone.yaml@$libs_commit" \
-    > "$state/e2e-clone-source"
-  shasum -a 256 "$root/libs/clone.yaml" | awk '{print $1}' > "$state/e2e-clone-hash"
-  printf '%s\n' \
-    "github.com/thulasi-ram/scarab-ci//crates/scarab-plugin-argocd/manifest.json@$argocd_manifest_commit" \
-    > "$state/e2e-argocd-manifest-source"
-fi
-
 # Roll the Pods when the binary or the staged UI changes, and only then: helm
 # sees a new Pod template annotation. The server checks for ui/index.html at
 # start, so a UI staged after the Pod started needs a roll too.
@@ -746,6 +714,16 @@ if [ "$mode" != dogfood ]; then
     *) echo "warning: could not read org Environment $org/production (HTTP $code); not seeding it" >&2 ;;
   esac
 fi
+
+# Scarab's clone library, installed from the in-cluster Forgejo as an org admin
+# installs any library, pinned to the scarab-clone:dev image built above, with
+# its source trusted (deploy/kind/libs.sh). Dev: the dev org. e2e: the Forgejo
+# admin's org, where the forge_token cases run. Dogfood installs from
+# github.com by hand (seed.sh); chaos runs no library.
+case "$mode" in
+  dev) bash "$here/libs.sh" install "$org" ;;
+  e2e) bash "$here/libs.sh" install "$(env_get "$state/forgejo.env" SCARAB_TEST_FORGEJO_OWNER)" ;;
+esac
 
 if [ "$mode" = dogfood ]; then
   # The Owner and member role bindings (`scarab-server admin grant

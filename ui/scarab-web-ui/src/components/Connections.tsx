@@ -16,12 +16,12 @@
 //   does not exist yet, the New organization page (`NewOrgConnection`), which
 //   shows the same form with a field for the org's name.
 //
-// Repositories are opt-in for both. What a connection reaches is only
-// available; Add repository (or Enable on the org page) binds one, which
-// creates its project, and Disable unbinds it (DisableRepository, as on the org
-// page). Nothing the forge sends binds a repository again, so a disabled one
-// stays disabled. Re-sync asks the forge what
-// it reaches and lists what is not enabled.
+// Repositories are opt-in for both, and they are enabled and disabled in one
+// place: the org page (`/orgs/<org>`), which pages and filters them. A
+// connection here shows how many repositories it has enabled and links to the
+// org page narrowed to it (Manage repositories); it lists none of them, since
+// a connection can reach thousands. Re-sync asks the forge what it reaches and
+// lists what is not enabled.
 //
 // The token is write-only: it is typed once, posted once, and never rendered.
 // The row reports whether the *handle* resolves, which is the question an
@@ -36,32 +36,22 @@ import { createResource, createSignal, For, Show, type JSX } from "solid-js";
 import { A, useNavigate } from "@solidjs/router";
 import {
   assignConnectionOrg,
-  availableRepos,
-  bindRepo,
   connectionPreflight,
   createConnection,
   deleteConnection,
   listConnections,
-  registerRepoWebhook,
   resyncConnection,
   type CapabilityRequirement,
   type Connection,
 } from "../api/client";
-import {
-  orgNameProblem,
-  reposForOrg,
-  resyncNote,
-  soleOwner,
-  unassignedConnections,
-} from "../connections";
+import { orgNameProblem, resyncNote, unassignedConnections } from "../connections";
 import { relTime } from "../fmt";
 import { me, refetchMe } from "../session";
 import { FIRST_ORG_SECTION, orgHref } from "../settings-nav";
-import { orgPageHref, UNREACHABLE_NOTE } from "../org-page";
+import { orgPageHref } from "../org-page";
 import FormSection from "./FormSection";
 import Modal, { ModalMessage, ModalSection } from "./Modal";
 import ConfirmDestructive from "./ConfirmDestructive";
-import DisableRepository from "./DisableRepository";
 import { Field, Input } from "./Field";
 import Icon from "./Icon";
 
@@ -324,7 +314,7 @@ function ForgejoConnectionForm(props: {
         <Modal
           eyebrow={`${props.org} · connections`}
           title="Add Forgejo connection"
-          purpose="Connect a Forgejo or Codeberg instance. Its repositories become projects once you add them."
+          purpose="Connect a Forgejo or Codeberg instance. Its repositories become projects once you enable them on the organization page."
           busy={saving()}
           onClose={() => cancel()()}
           footer={
@@ -351,19 +341,8 @@ function ConnectionRow(props: { conn: Connection; onChanged: () => void }) {
   const [busy, setBusy] = createSignal(false);
   const [note, setNote] = createSignal<string | null>(null);
   const [error, setError] = createSignal<string | null>(null);
-  const [adding, setAdding] = createSignal(false);
   const [removing, setRemoving] = createSignal(false);
   const [assigning, setAssigning] = createSignal(false);
-
-  // Which connections accept in-product repo management: every kind, since
-  // enabling a repository is opt-in and the forge never re-binds one.
-  // Config-owned connections are read-only wherever they come from. An
-  // unassigned connection serves no org, so there is no owner to bind
-  // repositories for: it offers assign and remove only.
-  const manual = () => !c().managed_by_config && c().org != null;
-  // GitHub's App receives every repository's events on one endpoint, so there
-  // is no per-repository webhook to register.
-  const hooks = () => c().kind !== "github";
 
   const resync = async () => {
     setBusy(true);
@@ -380,28 +359,6 @@ function ConnectionRow(props: { conn: Connection; onChanged: () => void }) {
     }
   };
 
-  // Register (or re-register) one repo's forge-side hook. The retry for the one
-  // onboarding step that depends on the forge being reachable right now.
-  const registerWebhook = async (owner: string, name: string) => {
-    setBusy(true);
-    setNote(null);
-    setError(null);
-    try {
-      await registerRepoWebhook(c().id, owner, name);
-      setNote(`Webhook registered for ${owner}/${name}.`);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Could not register the webhook.");
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  // Disabling removes the Project, so it takes that repo's environments,
-  // secrets and access grants with it. The confirm says so; a refusal shows in it.
-  const [disabling, setDisabling] = createSignal<
-    { org: string; project: string; owner: string; name: string } | null
-  >(null);
-
   // Removing a connection removes the Projects it serves — a Project *is* the
   // binding — so the server refuses unless we acknowledge that explicitly. The
   // confirm names what goes and asks for the connection's id to be typed; a
@@ -411,7 +368,7 @@ function ConnectionRow(props: { conn: Connection; onChanged: () => void }) {
     setNote(null);
     setError(null);
     try {
-      await deleteConnection(c().id, c().projects.length > 0);
+      await deleteConnection(c().id, c().enabled_repos > 0);
       props.onChanged();
     } finally {
       setBusy(false);
@@ -499,66 +456,20 @@ function ConnectionRow(props: { conn: Connection; onChanged: () => void }) {
         <AppPreflight conn={c()} />
       </Show>
 
+      {/* How many, not which: a connection can hold thousands. The org page
+          lists them, pages and filters them, and enables and disables them. */}
       <div class="conn-projects">
-        <Show
-          when={c().projects.length > 0}
-          fallback={
-            <span class="subtle">
-              No repositories enabled yet.
-              <Show when={c().org}>
-                {(o) => (
-                  <>
-                    {" "}Enable them on the <A href={orgPageHref(o())}>organization page</A>.
-                  </>
-                )}
-              </Show>
-            </span>
-          }
-        >
-          <For each={c().projects}>
-            {(p) => (
-              <span class="conn-proj-row">
-                <a class="conn-proj mono" href={`/${p.org}/${p.project}`}>
-                  {p.org}/{p.project}
-                </a>
-                <Show when={p.unreachable_since != null}>
-                  <span class="repo-unreachable-tag" title={UNREACHABLE_NOTE}>
-                    unreachable
-                  </span>
-                </Show>
-                <Show when={manual()}>
-                  <Show when={hooks()}>
-                    <button
-                      class="btn btn-ghost btn-sm"
-                      disabled={busy()}
-                      title="Register (or re-register) this repository's webhook on the forge"
-                      onClick={() => registerWebhook(p.owner, p.name)}
-                    >
-                      <Icon icon="rotate-cw" size={12} /> Webhook
-                    </button>
-                  </Show>
-                  <button
-                    class="btn btn-danger btn-sm"
-                    disabled={busy()}
-                    title="Disable this repository: its project is removed from Scarab"
-                    onClick={() => setDisabling({ org: p.org, project: p.project, owner: p.owner, name: p.name })}
-                  >
-                    Disable
-                  </button>
-                </Show>
-              </span>
-            )}
-          </For>
+        <span class="subtle">
+          {c().enabled_repos} enabled {c().enabled_repos === 1 ? "repository" : "repositories"}
+        </span>
+        <Show when={c().org}>
+          {(o) => (
+            <A class="btn btn-ghost btn-sm" href={orgPageHref(o(), c().id)}>
+              Manage repositories
+            </A>
+          )}
         </Show>
       </div>
-
-      <Show when={manual()}>
-        <div class="secrets-actions">
-          <button class="btn btn-ghost btn-sm" disabled={busy()} onClick={() => setAdding(true)}>
-            <Icon icon="plus" size={13} /> Add repository
-          </button>
-        </div>
-      </Show>
 
       <Show when={assigning()}>
         <AssignConnection
@@ -575,33 +486,12 @@ function ConnectionRow(props: { conn: Connection; onChanged: () => void }) {
       <Show when={removing()}>
         <RemoveConnection conn={c()} onConfirm={remove} onClose={() => setRemoving(false)} />
       </Show>
-      <Show when={disabling()}>
-        {(r) => (
-          <DisableRepository
-            org={r().org}
-            repo={{ connection_id: c().id, owner: r().owner, name: r().name, project: r().project }}
-            onDisabled={() => props.onChanged()}
-            onClose={() => setDisabling(null)}
-          />
-        )}
-      </Show>
 
       <Show when={note()}>
         <p class="subtle"><small>{note()}</small></p>
       </Show>
       <Show when={error()}>
         <p class="error">{error()}</p>
-      </Show>
-
-      <Show when={adding()}>
-        <AddRepoDialog
-          conn={c()}
-          onClose={() => setAdding(false)}
-          onAdded={(msg) => {
-            setNote(msg);
-            props.onChanged();
-          }}
-        />
       </Show>
     </li>
   );
@@ -616,7 +506,7 @@ function RemoveConnection(props: {
   onConfirm: () => Promise<void>;
   onClose: () => void;
 }) {
-  const projects = () => props.conn.projects;
+  const n = () => props.conn.enabled_repos;
   return (
     <ConfirmDestructive
       title={`Remove the ${props.conn.kind} connection?`}
@@ -627,11 +517,9 @@ function RemoveConnection(props: {
       onClose={props.onClose}
     >
       <p>
-        <Show when={projects().length > 0} fallback="It serves no projects.">
-          This also removes {projects().length}{" "}
-          {projects().length === 1 ? "project" : "projects"} (
-          <span class="mono">{projects().map((p) => `${p.org}/${p.project}`).join(", ")}</span>)
-          with their environments, secrets and access grants.
+        <Show when={n() > 0} fallback="It serves no projects.">
+          This also removes its {n()} {n() === 1 ? "project" : "projects"}, with their
+          environments, secrets and access grants.
         </Show>
       </p>
     </ConfirmDestructive>
@@ -640,17 +528,16 @@ function RemoveConnection(props: {
 
 /**
  * Assign an unassigned connection to an org, for a global admin. The org is
- * the account that owns the repositories bound through it, so the field
- * starts with that owner when there is one. The server refuses an org that
- * does not own every bound repository, or one served by another forge, and
- * says why; the reason is shown as it comes.
+ * the account that owns the repositories bound through it. The server
+ * refuses an org that does not own every bound repository, or one served by
+ * another forge, and says why; the reason is shown as it comes.
  */
 function AssignConnection(props: {
   conn: Connection;
   onAssigned: (org: string) => void;
   onCancel: () => void;
 }) {
-  const [org, setOrg] = createSignal(soleOwner(props.conn.projects) ?? "");
+  const [org, setOrg] = createSignal("");
   const [saving, setSaving] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
   const problem = () => orgNameProblem(org());
@@ -714,7 +601,7 @@ function AssignConnection(props: {
  * It sits here, next to the credential line, because both failures it catches
  * are otherwise **invisible**. An App subscribed to no events still delivers
  * `installation`/`installation_repositories`, so the connection registers
- * itself, the projects list fills in, and nothing ever builds. An App without
+ * itself, its repositories can be enabled, and nothing ever builds. An App without
  * `statuses:write` runs pipelines happily and silently never posts a check. In
  * both cases the operator's only signal today is an absence.
  *
@@ -809,163 +696,5 @@ function PreflightGap(props: { gap: CapabilityRequirement; muted?: boolean }) {
       <code class="mono">{label()}</code>
       <span class="subtle">{props.gap.why}</span>
     </li>
-  );
-}
-
-/**
- * Bring repos on a connection under governance. Binding **creates the Project**
- * (there is no `projects` table — a Project is the binding), which is
- * why this dialog is the onboarding flow and not a convenience: no forge
- * binds a repository by itself. The org page offers the same as Enable.
- *
- * The pick-list comes from the forge, so nobody types `owner/name`. When the
- * adapter cannot enumerate, the field is offered instead — "I cannot look" and
- * "your token reaches nothing" must not render the same.
- *
- * It offers only repositories owned by the connection's org: the server
- * refuses any other owner (400), and when it does, its message is shown as is.
- */
-function AddRepoDialog(props: {
-  conn: Connection;
-  onClose: () => void;
-  onAdded: (note: string) => void;
-}) {
-  const [avail] = createResource(() => props.conn.id, availableRepos);
-  const org = () => props.conn.org ?? "";
-  const pick = () => reposForOrg(avail() ?? [], props.conn.org);
-  const [manualRepo, setManualRepo] = createSignal("");
-  const [busy, setBusy] = createSignal<string | null>(null);
-  const [error, setError] = createSignal<string | null>(null);
-
-  const add = async (owner: string, name: string) => {
-    setBusy(`${owner}/${name}`);
-    setError(null);
-    try {
-      const r = await bindRepo(props.conn.id, { owner, name });
-      props.onAdded(
-        r.webhook_registered
-          ? `Added ${r.org}/${r.project} and registered its webhook.`
-          : `Added ${r.org}/${r.project}, but the webhook could not be registered: ${r.webhook_error ?? "unknown reason"}. Pushes will not start runs until it is.`,
-      );
-      props.onClose();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Could not add the repository.");
-    } finally {
-      setBusy(null);
-    }
-  };
-
-  const addTyped = () => {
-    const [owner, name] = manualRepo().trim().split("/");
-    if (!owner || !name) {
-      setError("Enter the repository as owner/name.");
-      return;
-    }
-    void add(owner, name);
-  };
-
-  // The forge cannot list its repositories, so the dialog asks for one by name
-  // and its footer carries Add.
-  const typing = () => !avail.loading && avail() == null;
-
-  return (
-    <Modal
-      eyebrow={`${org()} · ${props.conn.id}`}
-      title="Add repository"
-      purpose={
-        props.conn.kind === "github"
-          ? "Adding a repository creates its project, so pushes start runs."
-          : "Adding a repository creates its project and registers a webhook, so pushes start runs."
-      }
-      busy={busy() != null}
-      onClose={props.onClose}
-      footer={
-        <>
-          <Show when={error()}>
-            <ModalMessage>{error()}</ModalMessage>
-          </Show>
-          <button class="btn btn-ghost" type="button" onClick={props.onClose}>
-            Cancel
-          </button>
-          <Show when={typing()}>
-            <button class="btn btn-primary" type="button" disabled={busy() != null} onClick={addTyped}>
-              <Icon icon="plus" size={14} /> Add
-            </button>
-          </Show>
-        </>
-      }
-    >
-      <Show when={avail.error}>
-        <p class="error">Could not ask the forge which repositories it can see.</p>
-      </Show>
-      <Show when={!avail.loading} fallback={<p class="empty">asking the forge…</p>}>
-        {/* `null` = this adapter cannot enumerate. Fall back to typing it. */}
-        <Show
-          when={avail() != null}
-          fallback={
-            <Field
-              label="Repository"
-              required
-              help={
-                <>
-                  This forge cannot list its repositories, so name one directly. It must be owned
-                  by <span class="mono">{org()}</span>.
-                </>
-              }
-            >
-              <Input mono autofocus placeholder={`${org()}/name`} value={manualRepo()} onValue={setManualRepo} />
-            </Field>
-          }
-        >
-          <Show
-            when={pick().offered.length > 0}
-            fallback={
-              <p class="empty">
-                <Show
-                  when={pick().hidden > 0}
-                  fallback="This connection's token does not reach any repository. Check its scopes on the forge."
-                >
-                  This connection's token reaches no repository owned by{" "}
-                  <span class="mono">{org()}</span>.
-                </Show>
-              </p>
-            }
-          >
-            <ul class="secret-list">
-              <For each={pick().offered}>
-                {(r) => (
-                  <li class="secret-row">
-                    <Icon icon="git-branch" size={14} />
-                    <code class="mono">
-                      {r.owner}/{r.name}
-                    </code>
-                    <Show
-                      when={!r.bound}
-                      fallback={<span class="subtle"><small>already added</small></span>}
-                    >
-                      <button
-                        class="btn btn-primary btn-sm"
-                        disabled={busy() != null}
-                        onClick={() => add(r.owner, r.name)}
-                      >
-                        {busy() === `${r.owner}/${r.name}` ? "Adding…" : "Add"}
-                      </button>
-                    </Show>
-                  </li>
-                )}
-              </For>
-            </ul>
-          </Show>
-        </Show>
-      </Show>
-      <Show when={pick().hidden > 0}>
-        <p class="f-help">
-          {pick().hidden} {pick().hidden === 1 ? "repository" : "repositories"} the token
-          reaches {pick().hidden === 1 ? "is" : "are"} owned by other accounts and not
-          listed. This connection binds only repositories owned by{" "}
-          <span class="mono">{org()}</span>.
-        </p>
-      </Show>
-    </Modal>
   );
 }

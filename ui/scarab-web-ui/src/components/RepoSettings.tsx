@@ -5,9 +5,15 @@
 // Disable is the org page's: the same confirmation and unbind call
 // (DisableRepository), offered under the rule the unbind endpoint applies:
 // the caller administers the org and the connection is not managed by
-// configuration. Both come from the org's connection list the panel already
-// loads, which names the repository's binding; no forge is asked. Once it is
-// disabled the repository has no page, so the tab goes to the org page.
+// configuration. The repository's project (`GET /v1/repos`, which the page
+// already loads) names its connection; the panel finds that connection in
+// the org's connection list for its health and whether configuration manages
+// it. No forge is asked. Once it is disabled the repository has no page, so
+// the tab goes to the org page.
+//
+// A Forgejo repository has its own webhook on the forge, so the panel also
+// offers Register webhook: the retry for when enabling could not register it.
+// GitHub delivers every repository's events to the App, so there is none.
 //
 // Access lists the repository's own role bindings, each with where it came
 // from (granted in Scarab, or seeded from the forge's collaborators by a
@@ -27,13 +33,15 @@ import {
   importFromForge,
   listBindings,
   listConnections,
+  registerRepoWebhook,
   revokeRole,
   type Binding,
+  type Project,
 } from "../api/client";
 import { me } from "../session";
 import { administers } from "../settings-nav";
 import { repoAccessRows, resyncDiff, type ResyncChange } from "../identities";
-import { connectionFor, forgeName } from "../connections";
+import { forgeName } from "../connections";
 import { absTime, relTime } from "../fmt";
 import { UNREACHABLE_NOTE, orgPageHref } from "../org-page";
 import Icon from "./Icon";
@@ -47,27 +55,46 @@ import { LIBRARY_KINDS, LIBRARY_POLICIES_ANCHOR, PLUGIN_KINDS, PLUGIN_POLICIES_A
 
 const ROLES = ["viewer", "member", "admin", "owner"];
 
-export default function RepoSettings(props: { org: string; repo: string; repoUrl: string | null }) {
+export default function RepoSettings(props: {
+  org: string;
+  repo: string;
+  /** The repository's project from `GET /v1/repos`; null when it has none. */
+  project: Project | null;
+}) {
   const canAdmin = () => administers(me(), props.org);
   // Connections are listed to org admins only. A failure leaves the rows out.
   const [connection] = createResource(
-    () => (canAdmin() ? { org: props.org, repo: props.repo } : false),
-    async (k) => connectionFor(await listConnections(k.org).catch(() => []), k.org, k.repo),
+    () => (canAdmin() && props.project ? { org: props.org, id: props.project.connection_id } : false),
+    async (k) => (await listConnections(k.org).catch(() => [])).find((c) => c.id === k.id) ?? null,
   );
   const forge = () => forgeName(connection()?.kind);
-  // The repository's binding on that connection.
-  const bound = () =>
-    connection()?.projects.find((x) => x.org === props.org && x.project === props.repo) ?? null;
   // What Disable unbinds, when the caller may: the connection is listed only
   // to org admins, and one managed by configuration is read-only here.
   const binding = (): DisableTarget | null => {
     const c = connection();
-    const p = bound();
+    const p = props.project;
     if (!c || !p || c.managed_by_config) return null;
     return { connection_id: c.id, owner: p.owner, name: p.name, project: p.project };
   };
   const [disabling, setDisabling] = createSignal(false);
   const navigate = useNavigate();
+
+  const [hooking, setHooking] = createSignal(false);
+  const [hookNote, setHookNote] = createSignal<string | null>(null);
+  const [hookError, setHookError] = createSignal<string | null>(null);
+  const registerWebhook = async (b: DisableTarget) => {
+    setHooking(true);
+    setHookNote(null);
+    setHookError(null);
+    try {
+      await registerRepoWebhook(b.connection_id, b.owner, b.name);
+      setHookNote("Webhook registered.");
+    } catch (e) {
+      setHookError(e instanceof Error ? e.message : "Could not register the webhook.");
+    } finally {
+      setHooking(false);
+    }
+  };
 
   return (
     <>
@@ -75,7 +102,7 @@ export default function RepoSettings(props: { org: string; repo: string; repoUrl
         <div class="panel-h"><span>Repository</span></div>
         <div class="settings-body">
           <Show
-            when={props.repoUrl}
+            when={props.project?.repo_url}
             fallback={<p class="empty">{props.org}/{props.repo} is not bound to a forge connection.</p>}
           >
             {(url) => (
@@ -122,16 +149,35 @@ export default function RepoSettings(props: { org: string; repo: string; repoUrl
             )}
           </Show>
           <Show when={binding()}>
-            <div class="repo-disable">
-              <button class="btn btn-danger btn-sm" type="button" onClick={() => setDisabling(true)}>
-                Disable repository
-              </button>
-              <Show when={bound()?.unreachable_since != null}>
-                <span class="repo-unreachable-note">
-                  <Icon icon="alert-triangle" size={12} /> {UNREACHABLE_NOTE}
-                </span>
-              </Show>
-            </div>
+            {(b) => (
+              <div class="repo-disable">
+                <Show when={connection()?.kind !== "github"}>
+                  <button
+                    class="btn btn-ghost btn-sm"
+                    type="button"
+                    disabled={hooking()}
+                    title="Register (or register again) this repository's webhook on the forge"
+                    onClick={() => void registerWebhook(b())}
+                  >
+                    <Icon icon="rotate-cw" size={12} /> {hooking() ? "Registering…" : "Register webhook"}
+                  </button>
+                </Show>
+                <button class="btn btn-danger btn-sm" type="button" onClick={() => setDisabling(true)}>
+                  Disable repository
+                </button>
+                <Show when={props.project?.unreachable_since != null}>
+                  <span class="repo-unreachable-note">
+                    <Icon icon="alert-triangle" size={12} /> {UNREACHABLE_NOTE}
+                  </span>
+                </Show>
+              </div>
+            )}
+          </Show>
+          <Show when={hookNote()}>
+            <p class="subtle"><small>{hookNote()}</small></p>
+          </Show>
+          <Show when={hookError()}>
+            <p class="error">{hookError()}</p>
           </Show>
         </div>
       </div>

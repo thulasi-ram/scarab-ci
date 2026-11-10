@@ -91,6 +91,9 @@ async fn registration_and_resolution_round_trip() {
         db.repos_of("gh-acme").await.unwrap(),
         vec![repo("acme", "api"), repo("acme", "web")],
     );
+    // The count the connections list shows, counted without the list.
+    assert_eq!(db.repo_count_of("gh-acme").await.unwrap(), 2);
+    assert_eq!(db.repo_count_of("codeberg-acme").await.unwrap(), 1);
 
     // resolve: RepoRef → owning Project + serving connection (with the rotated
     // credential handle, never the secret bytes).
@@ -145,6 +148,7 @@ async fn registration_and_resolution_round_trip() {
     assert!(db.get_connection("gh-acme").await.unwrap().is_none());
     assert!(db.resolve(&repo("acme", "web")).await.unwrap().is_none());
     assert!(db.repos_of("gh-acme").await.unwrap().is_empty());
+    assert_eq!(db.repo_count_of("gh-acme").await.unwrap(), 0);
 
     tdb.cleanup().await;
 }

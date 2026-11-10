@@ -9,8 +9,8 @@
 //! one live tier that makes network calls.
 //!
 //! On one push to a private repository, with a PAT connection (one long-lived
-//! token) and the clone library installed by an org admin from its source on
-//! github.com, with that source trusted:
+//! token) and the clone library installed from its source on the in-cluster
+//! Forgejo (deploy/kind/libs.sh), with that source trusted:
 //!
 //! - `ci` clones the private repository through `lib:thulasi-ram/clone` and a
 //!   later Step reads a file from it;
@@ -79,52 +79,16 @@ async fn a_private_repo_clones_with_the_forge_token_and_nothing_else_gets_it() {
     reclaim_quick_tunnel_connections(&http, &base).await;
     let (org, project) = connect_and_bind(&http, &base, &https, &token, &owner, &name).await;
 
-    // --- 1. an org admin installs the clone library and trusts its source ----
+    // --- 1. the clone library is installed, and its source trusted ---------
     // Nothing is installed in an org by default, and a PAT connection's
-    // long-lived token reaches only a Step from a trusted source. The org may
-    // be left from an earlier run, so each call is idempotent: an install
-    // replaces what is there, and trusting a trusted source keeps its record.
-    let fetched = json_ok(
-        http.post(format!("{base}/v1/orgs/{org}/libraries/fetch"))
-            .json(&serde_json::json!({
-                "source": clone_source,
-                "publisher": "thulasi-ram",
-                "name": "clone",
-            }))
-            .send()
-            .await
-            .expect("POST libraries/fetch"),
-        "fetch the clone library",
-    )
-    .await;
-    assert_eq!(fetched["content_hash"], clone_hash.as_str(), "{fetched:#}");
-    if fetched["current"]["content_hash"] != clone_hash.as_str() {
-        json_ok(
-            http.put(format!("{base}/v1/orgs/{org}/libraries/thulasi-ram/clone"))
-                .json(&serde_json::json!({
-                    "content_hash": clone_hash,
-                    "replaces": fetched["current"]["content_hash"],
-                }))
-                .send()
-                .await
-                .expect("PUT libraries/thulasi-ram/clone"),
-            "install the clone library",
-        )
-        .await;
-    }
+    // long-lived token reaches only a Step from a trusted source. deploy/kind/
+    // libs.sh installed the clone library into this org from the in-cluster
+    // Forgejo through the normal fetch and install calls, and trusted its
+    // source, as an org admin would.
     let trust_key = clone_source
         .rsplit_once('@')
         .map_or(clone_source.as_str(), |(path, _)| path)
         .to_string();
-    json_ok(
-        http.post(format!("{base}/v1/orgs/{org}/library-trust"))
-            .json(&serde_json::json!({ "source": trust_key }))
-            .send()
-            .await
-            .expect("POST library-trust"),
-        "trust the clone library's source",
-    )
-    .await;
     let libs = json_ok(
         http.get(format!("{base}/v1/orgs/{org}/libraries"))
             .send()
@@ -141,6 +105,7 @@ async fn a_private_repo_clones_with_the_forge_token_and_nothing_else_gets_it() {
         .cloned()
         .unwrap_or_else(|| panic!("clone is not installed: {libs:#}"));
     assert_eq!(clone["content_hash"], clone_hash.as_str(), "{clone:#}");
+    assert_eq!(clone["source"], clone_source.as_str(), "{clone:#}");
     assert!(
         libs["trusted_sources"]
             .as_array()

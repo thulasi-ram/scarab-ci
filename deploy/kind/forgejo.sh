@@ -9,6 +9,16 @@
 #   - the empty repo the Cache probe of `just test chaos` writes its pipeline to
 #   - with FORGEJO_TUNNEL_URL set (e2e mode): the private repos of the
 #     forge_token cases, one with a submodule at the tunnel URL
+#   - `<owner>/scarab-libs` for each org the stack installs libraries or
+#     plugins into (the admin `scarab-admin`, SCARAB_DEV_ORG and
+#     PLUGIN_VERIFY_ORG): Scarab's clone library pinned to the locally built
+#     scarab-clone:dev image, the notify library, and the Argo CD plugin's
+#     manifest. deploy/kind/libs.sh installs from it through a connection, so
+#     a local change to any of them is testable without a push and no install
+#     reads github.com. An org reads only its own repositories through its
+#     connection, so each org has its own copy, owned by a Forgejo user of
+#     the org's name (only the admin's own copy counts toward the repo total
+#     the pagination case expects).
 #
 # Writes deploy/kind/.state/forgejo.env (mode 600): the SCARAB_TEST_FORGEJO_*
 # contract the tests read, minus the two host-side values the e2e recipe adds
@@ -122,21 +132,23 @@ api() { curl -s -H "authorization: token $token" -H "content-type: application/j
 
 # Create a repo unless it already exists. $2=auto_init, $3=private (default false).
 ensure_repo() {
-  local name="$1" auto_init="$2" private="${3:-false}" code
-  code="$(api -o /dev/null -w '%{http_code}' "$base/api/v1/repos/$owner/$name")"
+  local name="$1" auto_init="$2" private="${3:-false}" o="${REPO_OWNER:-$owner}" code url
+  code="$(api -o /dev/null -w '%{http_code}' "$base/api/v1/repos/$o/$name")"
   [ "$code" = "200" ] && return 0
+  url="$base/api/v1/user/repos"
+  [ "$o" = "$owner" ] || url="$base/api/v1/admin/users/$o/repos"
   api -o /dev/null -X POST \
     -d "{\"name\":\"$name\",\"auto_init\":$auto_init,\"default_branch\":\"main\",\"private\":$private}" \
-    "$base/api/v1/user/repos"
+    "$url"
 }
 # Create the file on main, or update it when its content differs (so a seed
 # edited here reaches an existing cluster).
 put_file() {
-  local repo="$1" path="$2" content="$3" b64 sha
+  local repo="$1" path="$2" content="$3" o="${REPO_OWNER:-$owner}" b64 sha
   b64="$(printf '%s' "$content" | python3 -I -c 'import base64,sys;sys.stdout.write(base64.b64encode(sys.stdin.buffer.read()).decode())')"
   # The current file's sha when it exists, "same" when it already holds this
   # content, empty when there is none.
-  sha="$(api "$base/api/v1/repos/$owner/$repo/contents/$path?ref=main" | V_WANT="$b64" python3 -I -c '
+  sha="$(api "$base/api/v1/repos/$o/$repo/contents/$path?ref=main" | V_WANT="$b64" python3 -I -c '
 import base64, json, os, sys
 try:
     f = json.load(sys.stdin)
@@ -150,10 +162,10 @@ print("same" if have == base64.b64decode(os.environ["V_WANT"]) else f["sha"])
   case "$sha" in
     same) ;;
     '') api -o /dev/null -X POST -d "{\"content\":\"$b64\",\"message\":\"seed $path\",\"branch\":\"main\"}" \
-          "$base/api/v1/repos/$owner/$repo/contents/$path" ;;
+          "$base/api/v1/repos/$o/$repo/contents/$path" ;;
     *) echo "    updating $repo/$path"
        api -o /dev/null -X PUT -d "{\"content\":\"$b64\",\"sha\":\"$sha\",\"message\":\"seed $path\",\"branch\":\"main\"}" \
-          "$base/api/v1/repos/$owner/$repo/contents/$path" ;;
+          "$base/api/v1/repos/$o/$repo/contents/$path" ;;
   esac
 }
 
@@ -310,6 +322,47 @@ YAML
   rm -rf "$work"
 fi
 
+# The libraries and the plugin manifest the stack installs (deploy/kind/libs.sh).
+libs_repo=scarab-libs
+dev_org="${SCARAB_DEV_ORG:-thulasi-ram}"
+verify_org="${PLUGIN_VERIFY_ORG:-acme}"
+# libs/clone.yaml with its image pinned to the scarab-clone:dev image up.sh
+# builds and loads into kind, as an installed copy runs it.
+clone_dev="$(python3 -I - "$repo_root/libs/clone.yaml" scarab-clone:dev <<'PY'
+import re, sys
+text = open(sys.argv[1]).read()
+new, n = re.subn(r"(?m)^(\s*image:\s*)ghcr\.io/thulasi-ram/scarab-clone\S*$", r"\g<1>" + sys.argv[2], text)
+if n != 1:
+    sys.exit("libs/clone.yaml: expected one scarab-clone image line")
+sys.stdout.write(new)
+PY
+)"
+mkdir -p "$state/libs"
+printf '%s' "$clone_dev" > "$state/libs/clone.yaml"
+seeded_owners=""
+for o in "$owner" "$dev_org" "$verify_org"; do
+  case " $seeded_owners " in *" $o "*) continue ;; esac
+  seeded_owners="$seeded_owners $o"
+  echo "==> seeding $o/$libs_repo (clone pinned to scarab-clone:dev, notify, the Argo CD manifest)"
+  if [ "$o" != "$owner" ]; then
+    fj admin user create --username "$o" --password "$password" \
+      --email "$o@verify.invalid" --must-change-password=false >/dev/null 2>&1 || true
+  fi
+  REPO_OWNER="$o" ensure_repo "$libs_repo" true
+  REPO_OWNER="$o" put_file "$libs_repo" "clone.yaml" "$clone_dev"
+  REPO_OWNER="$o" put_file "$libs_repo" "notify.yaml" "$(cat "$repo_root/.scarab/lib/notify.yaml")"
+  REPO_OWNER="$o" put_file "$libs_repo" "argocd/manifest.json" \
+    "$(cat "$repo_root/crates/scarab-plugin-argocd/manifest.json")"
+  commit="$(api "$base/api/v1/repos/$o/$libs_repo/branches/main" \
+    | python3 -I -c 'import json,sys;print(json.load(sys.stdin)["commit"]["id"])')"
+  [ -n "$commit" ] || die "could not read the commit of $o/$libs_repo"
+  printf '%s\n' "$commit" > "$state/libs/$o.commit"
+done
+# Only the admin's own copy is in /user/repos.
+total=$((total + 1))
+libs_commit="$(cat "$state/libs/$owner.commit")"
+server_host="scarab-forgejo.$ns.svc.cluster.local"
+
 out="$state/forgejo.env"
 echo "==> writing $out"
 ( umask 077; cat > "$out" <<EOF
@@ -333,6 +386,12 @@ SCARAB_TEST_FORGEJO_WEBHOOK_SECRET=$webhook_secret
 SCARAB_TEST_FORGEJO_REPO=$owner/$hook_repo
 SCARAB_TEST_FORGEJO_PRIVATE_REPO=$private_repo
 SCARAB_TEST_FORGEJO_ADMIN_PASSWORD=$password
+# The admin's copy of the libraries (deploy/kind/libs.sh): the repo, its
+# commit, and the clone library the forge_token cases find installed.
+SCARAB_TEST_FORGEJO_LIBS_REPO=$libs_repo
+SCARAB_TEST_FORGEJO_LIBS_COMMIT=$libs_commit
+SCARAB_TEST_CLONE_SOURCE=$server_host/$owner/$libs_repo//clone.yaml@$libs_commit
+SCARAB_TEST_CLONE_HASH=$(printf '%s' "$clone_dev" | shasum -a 256 | awk '{print $1}')
 EOF
 )
 if [ -n "$tunnel_url" ]; then

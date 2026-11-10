@@ -6,7 +6,9 @@
 # installs it like any plugin: its manifest from
 # crates/scarab-plugin-argocd/manifest.json at a commit, and this image PINNED
 # BY DIGEST; the plugin runtime runs it in the `scarab-plugins` namespace
-# under the restricted Pod Security profile.
+# under the restricted Pod Security profile. .github/workflows/image.yml
+# publishes the default target as ghcr.io/thulasi-ram/scarab-plugin-argocd,
+# with the same tags as the other images.
 #
 # Targets:
 #   (default) `plugin` — the Plugin image. Distroless, uid 65532, nothing

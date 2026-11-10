@@ -10,9 +10,11 @@
 // The list is paged on the server: it asks each connection's forge for its
 // repositories on every load and merges them with the enabled ones. Who may
 // enable or disable each row comes from the server (`can_change`), the same
-// rule the bind and unbind endpoints apply.
+// rule the bind and unbind endpoints apply. `?connection=<id>` narrows it to
+// one connection's repositories; Organization settings › Connections links
+// each connection here that way.
 import { For, Show, createResource, createSignal, onCleanup } from "solid-js";
-import { A, useParams } from "@solidjs/router";
+import { A, useParams, useSearchParams } from "@solidjs/router";
 import { bindRepo, listOrgRepos, listRuns, type OrgRepo } from "../api/client";
 import { UNREACHABLE_NOTE, clampPage, orgRunStats, pageCount, pageSpan } from "../org-page";
 import { FIRST_ORG_SECTION, decodeParam, orgHref } from "../settings-nav";
@@ -40,9 +42,13 @@ export default function OrgPage() {
   let filterTimer: ReturnType<typeof setTimeout> | undefined;
   onCleanup(() => clearTimeout(filterTimer));
   const [epoch, setEpoch] = createSignal(0);
+  // One connection's repositories, when the address names one.
+  const [search_, setSearch] = useSearchParams<{ connection?: string }>();
+  const connection = () => search_.connection || undefined;
   const [repos] = createResource(
-    () => ({ org: org(), page: page(), q: query(), epoch: epoch() }),
-    (k) => listOrgRepos(k.org, { page: k.page, perPage: PER_PAGE, q: k.q }),
+    () => ({ org: org(), page: page(), q: query(), connection: connection(), epoch: epoch() }),
+    (k) =>
+      listOrgRepos(k.org, { page: k.page, perPage: PER_PAGE, q: k.q, connection: k.connection }),
   );
   const [runs] = createResource(org, (o) => listRuns(RUNS_LIMIT, o));
   const stats = () => orgRunStats(runs() ?? [], org(), Date.now(), RUNS_LIMIT);
@@ -76,7 +82,7 @@ export default function OrgPage() {
       const res = await bindRepo(r.connection_id, { owner: r.owner, name: r.name });
       setNote(
         res.webhook_error
-          ? `Enabled ${res.org}/${res.project}, but its webhook could not be registered: ${res.webhook_error}. Pushes will not start runs until it is (Connections, Webhook).`
+          ? `Enabled ${res.org}/${res.project}, but its webhook could not be registered: ${res.webhook_error}. Pushes will not start runs until it is: use Register webhook on the repository's Settings tab.`
           : `Enabled ${res.org}/${res.project}.`,
       );
       reload();
@@ -157,6 +163,25 @@ export default function OrgPage() {
           />
         </div>
       </div>
+      <Show when={connection()}>
+        {(id) => (
+          <p class="subtle">
+            <small>
+              Only the repositories of connection <code class="mono">{id()}</code>.{" "}
+              <button
+                class="btn btn-ghost btn-sm"
+                type="button"
+                onClick={() => {
+                  setSearch({ connection: undefined });
+                  setPage(1);
+                }}
+              >
+                Show all
+              </button>
+            </small>
+          </p>
+        )}
+      </Show>
       <p class="subtle org-repos-help">
         <small>
           Enabling a repository creates its project, so pushes to it start runs. Disabling removes
@@ -195,7 +220,7 @@ export default function OrgPage() {
             fallback={
               <p class="empty">
                 <Show
-                  when={query()}
+                  when={query() || connection()}
                   fallback={
                     <>
                       No repositories yet. Connect a forge to <span class="mono">{org()}</span>{" "}

@@ -171,6 +171,34 @@ pub async fn connect_and_bind(
     )
 }
 
+/// The id of `org`'s connection at `base_url`, as `GET /v1/connections`
+/// lists it.
+pub async fn connection_id(
+    http: &reqwest::Client,
+    base: &str,
+    org: &str,
+    base_url: &str,
+) -> String {
+    let want = base_url.trim_end_matches('/');
+    let all = json_ok(
+        http.get(format!("{base}/v1/connections"))
+            .send()
+            .await
+            .expect("GET /v1/connections"),
+        "list connections",
+    )
+    .await;
+    all.as_array()
+        .into_iter()
+        .flatten()
+        .find(|c| {
+            c["org"] == org && c["base_url"].as_str().map(|u| u.trim_end_matches('/')) == Some(want)
+        })
+        .and_then(|c| c["id"].as_str())
+        .unwrap_or_else(|| panic!("no connection of `{org}` at {base_url}: {all:#}"))
+        .to_string()
+}
+
 /// Commits a file through the contents API, on `branch` or on a new branch
 /// cut from main: a real commit, so a real signed delivery.
 pub async fn push_file(
