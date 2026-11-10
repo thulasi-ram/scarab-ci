@@ -3514,6 +3514,166 @@ impl LogChunks for PodLogChunks {
 }
 
 // ---------------------------------------------------------------------------
+// Leftover collection (git-bug 986542a)
+// ---------------------------------------------------------------------------
+
+/// The label every object this executor creates carries, as a list selector.
+pub const MANAGED_BY_SELECTOR: &str = "app.kubernetes.io/managed-by=scarab";
+
+/// The kinds of object a finished Run can leave in the step namespace: step,
+/// debug and shared-service Pods, and a shared service's Service and
+/// NetworkPolicy (ADR-0058). Per-Pod Secrets are not listed: each one is
+/// owner-referenced to its Pod, so Kubernetes deletes it with the Pod.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ManagedKind {
+    Pod,
+    Service,
+    NetworkPolicy,
+}
+
+impl ManagedKind {
+    pub const ALL: [ManagedKind; 3] = [
+        ManagedKind::Pod,
+        ManagedKind::Service,
+        ManagedKind::NetworkPolicy,
+    ];
+}
+
+/// One object found by [`K8sExecutor::list_managed`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedObject {
+    pub kind: ManagedKind,
+    pub name: String,
+    pub labels: std::collections::BTreeMap<String, String>,
+    /// A Pod in phase `Pending` or `Running` (or with no phase yet). Always
+    /// false for a Service or NetworkPolicy.
+    pub active: bool,
+}
+
+/// One page of [`K8sExecutor::list_managed`]; `continue_token` is `None` on
+/// the last page.
+#[derive(Debug, Clone, Default)]
+pub struct ManagedPage {
+    pub objects: Vec<ManagedObject>,
+    pub continue_token: Option<String>,
+}
+
+/// The `scarab.io/run` label value this executor stamps for `run`. Lossy for
+/// an id that is not already a lowercase DNS label of at most 63 characters;
+/// every id the server mints (a UUID string) maps to itself.
+pub fn run_label_value(run: &RunId) -> String {
+    sanitize_label(&run.0)
+}
+
+impl K8sExecutor {
+    /// One page of the objects of `kind` in the step namespace that carry
+    /// [`MANAGED_BY_SELECTOR`]. Pass the previous page's `continue_token` to
+    /// read the next.
+    pub async fn list_managed(
+        &self,
+        kind: ManagedKind,
+        continue_token: Option<String>,
+        limit: u32,
+    ) -> Result<ManagedPage, ExecError> {
+        let client = self.client.clone().ok_or(ExecError::Unavailable)?;
+        let mut params = kube::api::ListParams::default()
+            .labels(MANAGED_BY_SELECTOR)
+            .limit(limit);
+        if let Some(token) = continue_token {
+            params = params.continue_token(&token);
+        }
+        let err = |e: kube::Error| ExecError::Other(e.to_string());
+        let labels_of = |meta: &ObjectMeta| meta.labels.clone().unwrap_or_default();
+        Ok(match kind {
+            ManagedKind::Pod => {
+                let list = Api::<Pod>::namespaced(client, &self.namespace)
+                    .list(&params)
+                    .await
+                    .map_err(err)?;
+                ManagedPage {
+                    continue_token: list.metadata.continue_.filter(|t| !t.is_empty()),
+                    objects: list
+                        .items
+                        .into_iter()
+                        .map(|p| ManagedObject {
+                            kind,
+                            name: p.metadata.name.clone().unwrap_or_default(),
+                            labels: labels_of(&p.metadata),
+                            active: !matches!(
+                                p.status.as_ref().and_then(|s| s.phase.as_deref()),
+                                Some("Succeeded" | "Failed")
+                            ),
+                        })
+                        .collect(),
+                }
+            }
+            ManagedKind::Service => {
+                let list = Api::<Service>::namespaced(client, &self.namespace)
+                    .list(&params)
+                    .await
+                    .map_err(err)?;
+                ManagedPage {
+                    continue_token: list.metadata.continue_.filter(|t| !t.is_empty()),
+                    objects: list
+                        .items
+                        .into_iter()
+                        .map(|s| ManagedObject {
+                            kind,
+                            name: s.metadata.name.clone().unwrap_or_default(),
+                            labels: labels_of(&s.metadata),
+                            active: false,
+                        })
+                        .collect(),
+                }
+            }
+            ManagedKind::NetworkPolicy => {
+                let list = Api::<NetworkPolicy>::namespaced(client, &self.namespace)
+                    .list(&params)
+                    .await
+                    .map_err(err)?;
+                ManagedPage {
+                    continue_token: list.metadata.continue_.filter(|t| !t.is_empty()),
+                    objects: list
+                        .items
+                        .into_iter()
+                        .map(|n| ManagedObject {
+                            kind,
+                            name: n.metadata.name.clone().unwrap_or_default(),
+                            labels: labels_of(&n.metadata),
+                            active: false,
+                        })
+                        .collect(),
+                }
+            }
+        })
+    }
+
+    /// Delete one object of `kind` from the step namespace. Already gone is
+    /// success. A Pod's owner-referenced Secrets go with it.
+    pub async fn delete_managed(&self, kind: ManagedKind, name: &str) -> Result<(), ExecError> {
+        let client = self.client.clone().ok_or(ExecError::Unavailable)?;
+        let dp = DeleteParams::default();
+        match kind {
+            ManagedKind::Pod => ignore_missing(
+                Api::<Pod>::namespaced(client, &self.namespace)
+                    .delete(name, &dp)
+                    .await,
+            ),
+            ManagedKind::Service => ignore_missing(
+                Api::<Service>::namespaced(client, &self.namespace)
+                    .delete(name, &dp)
+                    .await,
+            ),
+            ManagedKind::NetworkPolicy => ignore_missing(
+                Api::<NetworkPolicy>::namespaced(client, &self.namespace)
+                    .delete(name, &dp)
+                    .await,
+            ),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Pure helpers (unit-testable without a cluster)
 // ---------------------------------------------------------------------------
 
