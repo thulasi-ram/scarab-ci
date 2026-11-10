@@ -1862,22 +1862,28 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 }
 .envt-sentence { margin: 0 0 10px; color: var(--soft-white); line-height: 1.5; }
 .envt-note { margin: 0 0 10px; color: var(--warn); }
-.envt-layers { width: 100%; border-collapse: collapse; margin-bottom: 12px; }
-/* The rule names get a column of their own with room after them; the two
-   layers share the rest. */
-.envt-layers th[scope="row"], .envt-layers thead th:first-child { width: 11em; }
-.envt-layers th, .envt-layers td {
-  text-align: left; padding: 5px 24px 5px 0; white-space: nowrap; font: var(--t-body);
-  border-bottom: 1px solid var(--border-soft);
+/* The expanded diff: the org's rules beside the rules in force, like a split
+   diff. Rule names get their own column; a rule this repo changed reads in
+   the primary ink, marked + with the in-force cell shaded; a rule that
+   follows the org reads in the metadata ink on both sides. */
+.envt-pname { margin: 0 0 10px; color: var(--sage); }
+.envt-diff-scroll { overflow-x: auto; margin-bottom: 12px; }
+.envt-diff {
+  width: 100%; border-collapse: collapse; background: var(--emerald-surface);
+  border: 1px solid var(--border-soft); border-radius: var(--radius-sm);
 }
-/* Column heads in the metadata ink over the full rule; each row's rule name
-   in the secondary ink; the values in the primary ink. */
-.envt-layers th { font: var(--t-label); color: var(--muted-sage); }
-.envt-layers thead th { border-bottom-color: var(--border); }
-.envt-layers tbody th { color: var(--sage); }
-.envt-layers td { font: var(--t-body); color: var(--soft-white); }
-.envt-layers td.envt-mono { font: var(--t-mono); }
-.envt-layers tbody tr:last-child > * { border-bottom: none; }
+.envt-diff th, .envt-diff td {
+  text-align: left; padding: 6px 12px; white-space: nowrap; font: var(--t-body);
+  border-bottom: 1px solid var(--border-soft); color: var(--muted-sage);
+}
+.envt-diff thead th { font: var(--t-label); border-bottom-color: var(--border); }
+.envt-diff th[scope="row"], .envt-diff thead th:first-child { width: 11em; font: var(--t-label); }
+.envt-diff td:nth-child(2) { width: 40%; border-right: 1px solid var(--border-soft); }
+.envt-diff td.envt-mono, .envt-diff .envt-mono { font: var(--t-mono); }
+.envt-diff tbody tr:last-child > * { border-bottom: none; }
+.envt-diff tr.changed > * { color: var(--soft-white); }
+.envt-diff tr.changed > .envt-diff-now { background: color-mix(in srgb, var(--emerald) 12%, transparent); }
+.envt-diff-mark { display: inline-block; width: 1em; font: var(--t-mono); color: var(--emerald); }
 .envt-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .envt-actions .envt-btn { font: var(--t-body); padding: 5px 12px; }
 
