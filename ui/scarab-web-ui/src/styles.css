@@ -4060,7 +4060,6 @@ code.c { font: var(--t-mono); color: var(--copper); }
 .gate-status.gate-env-line { color: var(--copper); }
 
 /* Settings › Policies */
-.pol-h { font: var(--t-label); margin: 14px 0 6px; }
 .pol-facts { margin: 6px 0 0; }
 /* Library and Plugin policies: one block per list, with room between them. */
 .tok-list.pol-lists { gap: 14px; }
@@ -4169,7 +4168,6 @@ a.head-org:hover { color: var(--emerald); text-decoration: underline; text-under
 .pol-diff-add { color: var(--ok); }
 .pol-diff-del { color: var(--danger); }
 .pol-diff-same { color: var(--muted-sage); }
-.pol-list-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 
 /* ── Mono class (keep LAST) ─────────────────────────────────────────────────
    An element marked `.mono` holds a machine value, so Mono wins over the

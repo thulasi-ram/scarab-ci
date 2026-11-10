@@ -2161,11 +2161,16 @@ export async function listOrgPolicies(org: string): Promise<PolicyRecord[] | nul
   return data;
 }
 
-/** The newest `limit` decisions of the org's log (at most 200). `null` when
- *  the server has no policy store (404). */
-export async function listOrgPolicyDecisions(org: string, limit = 200): Promise<PolicyDecisionPage | null> {
+/** The newest `limit` decisions of the org's log (at most 200); with
+ *  `policyId`, only those with a result for that Policy. `null` when the
+ *  server has no policy store (404). */
+export async function listOrgPolicyDecisions(
+  org: string,
+  limit = 200,
+  policyId?: string,
+): Promise<PolicyDecisionPage | null> {
   const { data, error, response } = await api.GET("/v1/orgs/{org}/policy-decisions", {
-    params: { path: { org }, query: { limit } },
+    params: { path: { org }, query: { limit, ...(policyId ? { policy_id: policyId } : {}) } },
   });
   if (response.status === 404) return null;
   if (error || !data) throw new Error(errorText(error) || "failed to load the org's policy decisions");

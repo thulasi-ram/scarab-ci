@@ -2,13 +2,14 @@
 // fetch, so the page and its tests agree.
 //
 // An org's rules live in two forms. CEL Policies are written as rules over a
-// checkpoint's input, in the policy editor (`policy-editor.ts`). Typed settings are rules with a form of their
-// own next to the feature they govern: an Environment's rules, the library and
-// plugin lists, API token scopes. The page lists those read-only, each with a
-// link to where it is edited.
+// checkpoint's input, in the policy editor (`policy-editor.ts`), and listed
+// on the Policies page. Typed settings are rules with a form of their own,
+// edited next to the feature they govern: an Environment's rules, the library
+// and plugin lists, API token scopes.
 //
-// Also here: the Run page's view of a Run's decisions, and the library and
-// plugin list forms (one Policy per list, at the org or one project).
+// Also here: one Policy's decisions, the Run page's view of a Run's
+// decisions, and the library and plugin list forms (one Policy per list, at
+// the org or one project).
 import type { components } from "./api/schema";
 import { orgHref } from "./settings-nav";
 
@@ -57,9 +58,6 @@ export type DecisionRecordLike = Omit<Schemas["PolicyDecisionRecordDto"], "decis
 /** A live CEL Policy (rules, not a typed setting). */
 export const isCelPolicy = (p: StoredPolicyLike) => !p.deleted && Array.isArray(p.policy.rules);
 
-/** A live typed-setting Policy (a library or plugin list). */
-export const isTypedSettingPolicy = (p: StoredPolicyLike) => !p.deleted && !!p.policy.setting;
-
 /** What a Policy's `match.projects` says, under the label "Applies to
  *  projects": every project, or the patterns, with any exceptions. */
 export function appliesToProjects(p: PolicyBody): string {
@@ -92,40 +90,15 @@ export const PLUGIN_POLICIES_ANCHOR = "plugin-policies";
 export const OLD_LIBRARY_POLICIES_ANCHOR = "library-lists";
 export const OLD_PLUGIN_POLICIES_ANCHOR = "plugin-lists";
 
-/** One typed-setting Policy as the page lists it. */
-export type TypedSettingRow = {
-  id: string;
-  name: string;
-  label: string;
-  values: string[];
-  appliesTo: string;
-  /** Where the feature it governs lives in org settings. */
-  href: string;
-  sectionLabel: string;
-};
-
-/** The library and plugin policy rows, by name. An unknown setting kind is
- *  shown by its wire name, linking to the Policies page itself. */
-export function typedSettingRows(org: string, policies: readonly StoredPolicyLike[]): TypedSettingRow[] {
-  return policies
-    .filter(isTypedSettingPolicy)
-    .map((p) => {
-      const [kind, body] = Object.entries(p.policy.setting!)[0] ?? ["", {}];
-      const known = SETTING_KINDS[kind];
-      const values = known ? (body[known.list] ?? []) : Object.values(body).flat();
-      return {
-        id: p.id,
-        name: p.name,
-        label: known?.label ?? kind,
-        values,
-        appliesTo: appliesToProjects(p.policy),
-        href: known
-          ? `${orgHref(org, known.section)}#${known.section === "plugins" ? PLUGIN_POLICIES_ANCHOR : LIBRARY_POLICIES_ANCHOR}`
-          : orgHref(org, "policies"),
-        sectionLabel: known?.section === "plugins" ? "Plugins" : known ? "Libraries" : "Policies",
-      };
-    })
-    .sort((a, b) => a.name.localeCompare(b.name));
+/** Where a typed-setting Policy is edited: the Libraries or Plugins section,
+ *  at its policies panel. `null` for a CEL Policy or a setting kind this page
+ *  does not know. */
+export function typedSettingHome(org: string, p: PolicyBody): { label: string; href: string } | null {
+  const known = SETTING_KINDS[Object.keys(p.setting ?? {})[0] ?? ""];
+  if (!known) return null;
+  return known.section === "plugins"
+    ? { label: "Plugins", href: `${orgHref(org, "plugins")}#${PLUGIN_POLICIES_ANCHOR}` }
+    : { label: "Libraries", href: `${orgHref(org, "libraries")}#${LIBRARY_POLICIES_ANCHOR}` };
 }
 
 /** A decision's verdict in words. */
@@ -213,6 +186,53 @@ export function runDecisionViews(decisions: readonly DecisionRecordLike[]): RunD
     });
   }
   return out.sort((a, b) => a.at - b.at);
+}
+
+// ── One Policy's decisions, on its page ──────────────────────────────────────
+
+/** One decision as a Policy's Decisions tab lists it: this Policy's outcome
+ *  in it, not the decision's as a whole. */
+export type PolicyDecisionRow = {
+  id: string;
+  at: number;
+  checkpoint: string;
+  project: string | null;
+  runId: string | null;
+  step: string | null;
+  attempt: number | null;
+  outcome: RunPolicyOutcome;
+  messages: string[];
+};
+
+/** A Policy's decisions, newest first, from the log filtered to the ones
+ *  with a result for it (`?policy_id=`). A decision its `match` did not
+ *  select is left out and counted in `notMatched`. */
+export function policyDecisionRows(
+  decisions: readonly DecisionRecordLike[],
+  policyId: string,
+): { rows: PolicyDecisionRow[]; notMatched: number } {
+  const rows: PolicyDecisionRow[] = [];
+  let notMatched = 0;
+  for (const d of decisions) {
+    const r = d.decision.results?.find((x) => x.policy_id === policyId);
+    if (!r) continue;
+    const o = runOutcome(r);
+    if (!o) {
+      notMatched++;
+      continue;
+    }
+    rows.push({
+      id: d.id,
+      at: d.at,
+      checkpoint: d.decision.checkpoint ?? "",
+      project: d.project ?? null,
+      runId: d.run_id ?? null,
+      step: d.step_id ?? null,
+      attempt: d.attempt ?? null,
+      ...o,
+    });
+  }
+  return { rows: rows.sort((a, b) => b.at - a.at), notMatched };
 }
 
 export const RUN_OUTCOME_LABEL: Record<RunPolicyOutcome, string> = {

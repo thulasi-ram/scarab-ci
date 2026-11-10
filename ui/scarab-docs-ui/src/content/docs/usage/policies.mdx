@@ -48,9 +48,20 @@ rules:
 Every Policy whose `match` fits is evaluated. Any enforced deny refuses, and every deny message
 is reported. A rule that fails to evaluate denies when its Policy is enforced.
 
+## The list
+
+**Organization settings › Policies** lists the org's CEL Policies. Each row shows the Policy's
+checkpoint, **audit** for one in audit mode, the projects and Environments it applies to, its
+counts for the last 7 days and its version, with **Enforce** on an audit-mode row and **Manage**,
+which opens the Policy's page (`/orgs/<org>/settings/policies/<id>`). The page has three tabs:
+**Edit**, **History** and **Decisions**. **Paste YAML** and **New policy** sit at the right of the
+list's header.
+
+Library and plugin policies are not on this list: each is edited on Libraries or Plugins (below).
+
 ## Write one in the editor
 
-**New policy** opens the editor, in five numbered parts:
+**New policy** opens the editor on its own page, in five numbered parts:
 
 1. **Policy**: the name, and the checkpoint. Changing the checkpoint checks the rules again
    against the new input.
@@ -109,6 +120,14 @@ synced from files: the copy in Scarab is the one that applies, and its history i
 
 Each save is a version. **History** lists them newest first: who saved it, when, the reason they
 gave, whether a passkey confirmed it, and a line diff against the version before.
+
+## Decisions
+
+**Decisions** lists the newest 200 recorded decisions this Policy's `match` selected, newest
+first: its own outcome in each (denied, would deny in audit mode, allowed), the checkpoint, the
+project, the Step and try for a launch, the deny message, and a link to the Run. It reads
+`GET /v1/orgs/{org}/policy-decisions?policy_id=<id>`; the decisions its `match` did not select are
+counted below the list.
 
 ## Counts on the list
 

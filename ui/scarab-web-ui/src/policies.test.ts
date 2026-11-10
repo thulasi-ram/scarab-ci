@@ -11,7 +11,8 @@ import {
   settingFormErrors,
   settingFormOf,
   splitEntries,
-  typedSettingRows,
+  policyDecisionRows,
+  typedSettingHome,
   type DecisionRecordLike,
   type StoredPolicyLike,
 } from "./policies";
@@ -82,27 +83,63 @@ describe("CEL Policies and typed settings", () => {
     expect([cel, gone, libs].filter(isCelPolicy).map((p) => p.name)).toEqual(["cel"]);
   });
 
-  it("lists each library or plugin list with a link to its feature's section", () => {
-    expect(typedSettingRows("acme", [cel, libs, plugins, gone])).toEqual([
-      {
-        id: "4",
-        name: "gates",
-        label: "Plugins whose gates may run",
-        values: ["argocd"],
-        appliesTo: "all projects",
-        href: "/orgs/acme/settings/plugins#plugin-policies",
-        sectionLabel: "Plugins",
-      },
-      {
-        id: "3",
-        name: "libs",
-        label: "Libraries allowed",
-        values: ["github.com/acme/*"],
-        appliesTo: "all projects",
-        href: "/orgs/acme/settings/libraries#library-policies",
-        sectionLabel: "Libraries",
-      },
+  it("sends a library or plugin list to its feature's policies panel, and nothing else anywhere", () => {
+    expect(typedSettingHome("acme", libs.policy)).toEqual({
+      label: "Libraries",
+      href: "/orgs/acme/settings/libraries#library-policies",
+    });
+    expect(typedSettingHome("a b", plugins.policy)).toEqual({
+      label: "Plugins",
+      href: "/orgs/a%20b/settings/plugins#plugin-policies",
+    });
+    expect(typedSettingHome("acme", cel.policy)).toBeNull();
+    expect(
+      typedSettingHome("acme", { name: "x", checkpoint: "run.create", setting: { unknown_kind: { a: [] } } }),
+    ).toBeNull();
+  });
+});
+
+describe("policyDecisionRows", () => {
+  const record = (
+    id: string,
+    at: number,
+    results: { policy_id: string; mode?: string; outcome: Record<string, unknown> }[],
+    extra: Partial<DecisionRecordLike> = {},
+  ): DecisionRecordLike => ({
+    id,
+    org: "acme",
+    at,
+    ...extra,
+    decision: {
+      checkpoint: "run.create",
+      results: results as DecisionRecordLike["decision"]["results"],
+      outcome: { kind: "allow" },
+    },
+  });
+
+  it("shows this Policy's outcome, newest first, and counts the decisions it did not match", () => {
+    const { rows, notMatched } = policyDecisionRows(
+      [
+        record("a", 1, [
+          { policy_id: "p1", outcome: { kind: "passed" } },
+          { policy_id: "p2", outcome: { kind: "denied", messages: ["other"] } },
+        ]),
+        record("b", 3, [{ policy_id: "p1", mode: "audit", outcome: { kind: "would_deny", messages: ["no"] } }], {
+          project: "web",
+          run_id: "r1",
+        }),
+        record("c", 2, [{ policy_id: "p1", outcome: { kind: "not_matched" } }]),
+        // Not this Policy's decision at all: neither listed nor counted.
+        record("d", 4, [{ policy_id: "p2", outcome: { kind: "passed" } }]),
+      ],
+      "p1",
+    );
+    expect(rows.map((r) => [r.id, r.outcome, r.messages])).toEqual([
+      ["b", "would_deny", ["no"]],
+      ["a", "allowed", []],
     ]);
+    expect(rows[0]).toMatchObject({ project: "web", runId: "r1", checkpoint: "run.create" });
+    expect(notMatched).toBe(1);
   });
 });
 

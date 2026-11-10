@@ -215,20 +215,12 @@ every launch its `match` selects, including Steps of Runs that no Environment go
 Runs `run.ref`, `run.environment` and `environment` are absent: test `has(run.environment)` or
 `environment != null` before reading them.
 
-## Every rule in one place
+## Policies over deploys
 
-**Settings › Policies** (`/orgs/<org>/settings/policies`) lists the org's rules read-only:
-
-- each CEL Policy, with its checkpoint, its mode, **Applies to projects** (its
-  `match.projects`, with any `except_projects`), the Environments it matches, and how often it
-  matched, denied and, in `audit` mode, would have denied in the newest 200 decisions of the
-  decision log (`GET /v1/orgs/{org}/policy-decisions`);
-- the newest decisions, with the deny messages;
-- the typed settings, each with a link to where it is edited: every Environment's rules, the
-  library and plugin lists, and API token scopes.
-
-CEL Policies are written with the policy API (`POST /v1/orgs/{org}/policies`); the page does not
-edit them.
+An Environment's own rules are set on its page. CEL Policies, which can also match on
+`environments`, are under **Settings › Policies** (`/orgs/<org>/settings/policies`): each row
+shows the Environments a Policy matches, and each Policy's page lists the decisions it made. See
+[Policies](/scarab-ci/usage/policies/).
 
 ## Scoped secrets
 

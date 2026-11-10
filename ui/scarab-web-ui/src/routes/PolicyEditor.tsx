@@ -1,5 +1,6 @@
 // One org Policy: `/orgs/<org>/settings/policies/<id>`, or `…/new` for a new
-// one. Two tabs: Edit and History (`?tab=history`).
+// one. Three tabs: Edit, History (`?tab=history`) and Decisions
+// (`?tab=decisions`); a new Policy has the editor only.
 //
 // Edit holds the whole Policy: name, checkpoint, what it applies to, mode
 // (audit for a new Policy), and its CEL rules. Every rule denies; its
@@ -14,7 +15,8 @@
 //
 // History lists every saved version, newest first, with who saved it, why,
 // whether a passkey confirmed it, and a line diff against the version
-// before.
+// before. Decisions lists the newest recorded decisions this Policy's match
+// selected, with its own outcome in each, linking to the Run.
 //
 // Both render inside the settings frame, with Policies marked in the
 // sidebar. The server enforces Administer on the org for every write.
@@ -25,6 +27,7 @@ import {
   createPolicy,
   deletePolicy,
   getOrgPolicy,
+  listOrgPolicyDecisions,
   listOrgPolicyVersions,
   listPolicyCheckpoints,
   replayPolicy,
@@ -54,7 +57,13 @@ import {
   type Diagnostic,
   type PolicyForm,
 } from "../policy-editor";
-import type { PolicyBody } from "../policies";
+import {
+  policyDecisionRows,
+  RUN_OUTCOME_LABEL,
+  typedSettingHome,
+  type DecisionRecordLike,
+  type PolicyBody,
+} from "../policies";
 import { diffStat, lineDiff } from "../line-diff";
 import { decodeParam, orgHref } from "../settings-nav";
 import { SettingsCrumbs, SettingsFrame } from "./Settings";
@@ -89,9 +98,17 @@ export default function PolicyEditorPage() {
   );
 }
 
+type Tab = "edit" | "history" | "decisions";
+const TABS: readonly [Tab, string][] = [
+  ["edit", "Edit"],
+  ["history", "History"],
+  ["decisions", "Decisions"],
+];
+
 function Editor(props: { org: string; id?: string }) {
   const [search, setSearch] = useSearchParams();
-  const tab = () => (props.id && search.tab === "history" ? "history" : "edit");
+  const tab = (): Tab =>
+    props.id && (search.tab === "history" || search.tab === "decisions") ? search.tab : "edit";
   const [stored, { refetch }] = createResource(
     () => props.id,
     (id) => getOrgPolicy(props.org, id),
@@ -118,12 +135,16 @@ function Editor(props: { org: string; id?: string }) {
       />
       <Show when={props.id}>
         <div class="tabs">
-          <button class={`tab ${tab() === "edit" ? "on" : ""}`} onClick={() => setSearch({ tab: "" })}>
-            Edit
-          </button>
-          <button class={`tab ${tab() === "history" ? "on" : ""}`} onClick={() => setSearch({ tab: "history" })}>
-            History
-          </button>
+          <For each={TABS}>
+            {([id, label]) => (
+              <button
+                class={`tab ${tab() === id ? "on" : ""}`}
+                onClick={() => setSearch({ tab: id === "edit" ? "" : id })}
+              >
+                {label}
+              </button>
+            )}
+          </For>
         </div>
       </Show>
       <Show when={!stored.error} fallback={<p class="error">Could not load the policy: {String(stored.error?.message ?? "")}</p>}>
@@ -135,22 +156,30 @@ function Editor(props: { org: string; id?: string }) {
             when={!stored()?.deleted}
             fallback={<p class="empty">This policy is deleted. Its history is kept under History.</p>}
           >
-            <Show when={!stored()?.policy || !(stored()!.policy as unknown as PolicyBody).setting}
-              fallback={
-                <p class="empty">
-                  This is a library or plugin list. Edit it on the{" "}
-                  <A href={orgHref(props.org, "libraries")}>Libraries</A> or{" "}
-                  <A href={orgHref(props.org, "plugins")}>Plugins</A> section.
-                </p>
-              }
-            >
-              <Show when={tab() === "edit"}>
-                <EditForm org={props.org} stored={stored() ?? undefined} onSaved={() => void refetch()} />
+            <Show when={tab() === "edit"}>
+              <Show
+                when={(stored()?.policy as unknown as PolicyBody | undefined)?.setting}
+                fallback={<EditForm org={props.org} stored={stored() ?? undefined} onSaved={() => void refetch()} />}
+              >
+                <Show
+                  when={typedSettingHome(props.org, stored()!.policy as unknown as PolicyBody)}
+                  fallback={<p class="empty">This is a list with a form of its own, which this page cannot edit.</p>}
+                >
+                  {(home) => (
+                    <p class="empty">
+                      This is a list with a form of its own, edited under{" "}
+                      <A href={home().href}>{home().label}</A>.
+                    </p>
+                  )}
+                </Show>
               </Show>
             </Show>
           </Show>
           <Show when={tab() === "history" && props.id}>
             <History org={props.org} id={props.id!} />
+          </Show>
+          <Show when={tab() === "decisions" && props.id}>
+            <Decisions org={props.org} id={props.id!} />
           </Show>
         </Show>
       </Show>
@@ -782,6 +811,90 @@ function History(props: { org: string; id: string }) {
                 }}
               </For>
             </ul>
+          </Show>
+        </Show>
+      </div>
+    </div>
+  );
+}
+
+/** How many of the newest decisions the Decisions tab reads (the server's
+ *  page size and cap). */
+const DECISIONS = 200;
+
+function Decisions(props: { org: string; id: string }) {
+  const [page] = createResource(() => listOrgPolicyDecisions(props.org, DECISIONS, props.id));
+  // The schema leaves a decision opaque; this reads it as `policies.ts` names it.
+  const view = () =>
+    policyDecisionRows(
+      (page.error ? [] : (page()?.decisions ?? [])).map((d) => ({
+        ...d,
+        decision: d.decision as unknown as DecisionRecordLike["decision"],
+      })),
+      props.id,
+    );
+  return (
+    <div class="panel">
+      <div class="panel-h">
+        <span>Decisions</span>
+        <Show when={view().rows.length > 0}>
+          <span class="tok-count">{view().rows.length}</span>
+        </Show>
+      </div>
+      <div class="secrets-body">
+        <Show when={!page.error} fallback={<p class="error">Could not load the decision log.</p>}>
+          <Show when={!page.loading || page()} fallback={<p class="empty">loading…</p>}>
+            <Show
+              when={view().rows.length > 0}
+              fallback={<p class="empty">No recorded decision this policy matched.</p>}
+            >
+              <ul class="tok-list" aria-label="Decisions">
+                <For each={view().rows}>
+                  {(d) => (
+                    <li class="tok">
+                      <div class="tok-head">
+                        <span class={`tok-role ${d.outcome === "denied" ? "pol-denied" : ""}`}>
+                          {RUN_OUTCOME_LABEL[d.outcome]}
+                        </span>
+                        <span class="mono">{d.checkpoint}</span>
+                        <Show when={d.project}>
+                          <span class="mono">{d.project}</span>
+                        </Show>
+                        <Show when={d.step}>
+                          <span class="mono subtle">
+                            {d.step}
+                            <Show when={d.attempt}> · try {d.attempt}</Show>
+                          </span>
+                        </Show>
+                        <Show
+                          when={replayRunHref(props.org, { project: d.project, run_id: d.runId })}
+                          fallback={<span class="subtle">refused Run</span>}
+                        >
+                          {(href) => <A href={href()}>run</A>}
+                        </Show>
+                        <span class="subtle" title={absTime(d.at)}>
+                          {relTime(d.at)}
+                        </span>
+                      </div>
+                      <Show when={d.messages.length > 0}>
+                        <div class="tok-facts">{d.messages.join(" · ")}</div>
+                      </Show>
+                    </li>
+                  )}
+                </For>
+              </ul>
+            </Show>
+            <p class="subtle">
+              <small>
+                The newest {DECISIONS} decisions with a result for this policy, with its own outcome
+                in each.
+                <Show when={view().notMatched > 0}>
+                  {" "}
+                  {view().notMatched} {view().notMatched === 1 ? "decision" : "decisions"} its match did
+                  not select {view().notMatched === 1 ? "is" : "are"} left out.
+                </Show>
+              </small>
+            </p>
           </Show>
         </Show>
       </div>

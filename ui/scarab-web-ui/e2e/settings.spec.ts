@@ -304,10 +304,14 @@ test("a repository's Environments tab is one table whose rows expand into the ru
   expect(errors).toEqual([]);
 });
 
-test("the Policies page lists CEL policies with their 7-day counts and the typed settings read-only", async ({ page }) => {
+test("the Policies page lists CEL policies with their 7-day counts, and each opens its own page", async ({ page }) => {
   const errors = collectErrors(page);
   await page.goto("/orgs/acme/settings/policies");
   await expect(page.getByRole("heading", { level: 1, name: "Policies", exact: true })).toBeVisible();
+  // Paste YAML and New policy sit in the section header.
+  const header = page.locator(".panel-h", { hasText: "CEL policies" });
+  await expect(header.getByRole("button", { name: "Paste YAML" })).toBeVisible();
+  await expect(header.getByRole("link", { name: "New policy" })).toBeVisible();
 
   // CEL policies: live ones only, with what they apply to and their counts.
   const cel = page.getByRole("list", { name: "CEL policies" });
@@ -324,27 +328,48 @@ test("the Policies page lists CEL policies with their 7-day counts and the typed
   await expect(forks.getByRole("button", { name: "Enforce" })).toHaveCount(0);
   await expect(cel).not.toContainText("old-rule");
 
-  // The decision log's newest entries.
-  const recent = page.getByRole("list", { name: "Recent decisions" });
-  await expect(recent.getByRole("listitem")).toHaveCount(7);
-  await expect(recent).toContainText("A pull request from a fork may not deploy to production.");
+  // The org-wide decision log and the typed settings are not on this page:
+  // each is on the page of what it is about.
+  await expect(page.getByRole("list", { name: "Recent decisions" })).toHaveCount(0);
+  await expect(page.getByText("Typed settings")).toHaveCount(0);
+  await expect(cel).not.toContainText("approved-libraries");
 
-  // Typed settings, read-only, each linking to where it is edited.
-  const envs = page.getByRole("list", { name: "Environment rules" });
-  await expect(envs.getByRole("listitem").filter({ hasText: "Production" })).toContainText(
-    "adds an approval gate when missing",
+  await forks.getByRole("link", { name: "Manage" }).click();
+  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/policies\/pol-1$/);
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText(/Policies\s*no-fork-deploys$/);
+  await expect(page.getByRole("navigation", { name: "Settings" }).locator('[aria-current="page"]')).toHaveText(
+    "Policies",
   );
-  const lists = page.getByRole("list", { name: "Library and plugin policies" });
-  await expect(lists).toContainText("Libraries allowed");
-  await expect(lists).toContainText("github.com/thulasi-ram/*");
-  await expect(page.locator("section.page").getByRole("textbox")).toHaveCount(0);
-  await lists.getByRole("link", { name: "Libraries" }).click();
+  expect(errors).toEqual([]);
+});
+
+test("a policy's Decisions tab lists its own outcome in each decision it matched", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/orgs/acme/settings/policies/pol-2");
+  await page.getByRole("button", { name: "Decisions", exact: true }).click();
+  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/policies\/pol-2\?tab=decisions$/);
+  const list = page.getByRole("list", { name: "Decisions", exact: true });
+  // release-from-main is in audit mode: it would have denied three times,
+  // and two decisions it did not match are left out.
+  await expect(list.getByRole("listitem")).toHaveCount(3);
+  await expect(list.getByRole("listitem").first()).toContainText("would deny (audit)");
+  await expect(list.getByRole("listitem").first()).toContainText("Deploy from main.");
+  await expect(page.getByText(/2 decisions its match did not select are left out/)).toBeVisible();
+  // Another policy's denial is not this one's.
+  await expect(list).not.toContainText("A pull request from a fork may not deploy to production.");
+  await list.getByRole("listitem").first().getByRole("link", { name: "run" }).click();
+  await expect(page).toHaveURL(/\/acme\/orders-api\/runs\//);
+  expect(errors).toEqual([]);
+});
+
+test("a library list's own page sends you to where it is edited", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/orgs/acme/settings/policies/pol-3");
+  await expect(page.getByText("This is a list with a form of its own, edited under Libraries.")).toBeVisible();
+  await expect(page.getByRole("textbox", { name: "Condition" })).toHaveCount(0);
+  await page.locator("section.page").getByRole("link", { name: "Libraries", exact: true }).last().click();
   await expect(page).toHaveURL(/\/orgs\/acme\/settings\/libraries#library-policies$/);
   await expect(page.getByRole("list", { name: "Library policies" })).toContainText("approved-libraries");
-
-  await page.goto("/orgs/acme/settings/policies");
-  await envs.getByRole("listitem").filter({ hasText: "Production" }).getByRole("link", { name: "Edit" }).click();
-  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/environments\/production\/manage$/);
   expect(errors).toEqual([]);
 });
 

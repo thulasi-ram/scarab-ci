@@ -49,7 +49,7 @@ export const ORG_SECTIONS: readonly SettingsSection[] = [
   { id: "plugins", label: "Plugins", sub: "installed plugins" },
   { id: "libraries", label: "Libraries", sub: "installed libraries" },
   { id: "secrets", label: "Secrets", sub: "org-wide secrets" },
-  { id: "policies", label: "Policies", sub: "CEL policies, their decisions, and every typed setting" },
+  { id: "policies", label: "Policies", sub: "CEL policies" },
   { id: "tokens", label: "API tokens", sub: "every token issued in the org" },
   { id: "security", label: "Security", sub: "step-up settings and the security event log" },
 ];
