@@ -637,14 +637,18 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 }
 
 /* A table inside a panel: the panel header is the one shaded band. The table
-   draws no frame of its own; its column heads are Label in the secondary ink
-   over one hairline; its scroll box reaches the panel's edges, and its first
-   and last columns sit at the panel header's 14px inset. */
+   draws no frame of its own; its column heads are Label in the metadata ink
+   over the full-strength rule, so they read apart from rows (whose names are
+   Label too, in the darker ink, over the soft rule); its scroll box reaches
+   the panel's edges, and its first and last columns sit at the panel
+   header's 14px inset. */
 .panel .table { border: none; border-radius: 0; background: none; }
 .panel .table thead th {
   background: none;
-  color: var(--sage);
-  border-bottom: 1px solid var(--border-soft);
+  color: var(--muted-sage);
+  padding-top: 8px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
 }
 .panel .table th:first-child, .panel .table td:first-child { padding-left: 14px; }
 .panel .table th:last-child, .panel .table td:last-child { padding-right: 14px; }
