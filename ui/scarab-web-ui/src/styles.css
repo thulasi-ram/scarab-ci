@@ -1198,7 +1198,9 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 .tcell-row { flex-direction: row; align-items: center; gap: 8px; max-width: none; width: 100%; }
 .tcell-row .tcell-kind { flex: none; color: var(--muted-sage); }
 .tcell-row .tcell-kind svg { color: var(--muted-sage); }
-.tcell-row .tcell-title { flex: 1; font: var(--t-body); color: var(--soft-white); }
+/* The Headline names the run, as a person names a members row: Label in the
+   primary ink. */
+.tcell-row .tcell-title { flex: 1; font: var(--t-label); color: var(--soft-white); }
 
 /* Thin divider between fact groups (code · who · when). */
 .pdiv { width: 1px; align-self: center; height: 15px; background: var(--border); flex: none; }
@@ -1783,7 +1785,9 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 .rr-body { display: flex; flex-direction: column; gap: 5px; min-width: 0; flex: 1; }
 .rr-head { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 16px; }
 .rr-facts { display: flex; align-items: center; flex-wrap: wrap; gap: 5px 14px; }
-.rr-facts .pfact { color: var(--muted-sage); }
+/* The facts line in the secondary ink, a step under the Headline and a step
+   over the icons; times and other quiet facts keep the metadata ink. */
+.rr-facts .pfact { color: var(--sage); }
 .rr-facts .pfact.live { color: var(--running-ink); }
 .rr-facts .pfact .mono { font: var(--t-mono); }
 .rr-facts-sep { color: var(--muted-sage); opacity: 0.5; }

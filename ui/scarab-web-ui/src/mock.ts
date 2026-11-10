@@ -261,10 +261,24 @@ export { runs as mockRuns };
 
 // ── per-repo run strips (dashboard cards) — status+duration_ms drive bars ────
 // Tune succeeded/failed ratios to the "N% pass" shown per card.
-const strip = (pattern: string) =>
+// Headlines for the filler runs, so every row reads like a real one.
+const STRIP_TITLES = [
+  "Retry flaky upload in the artifact step",
+  "Bump tokio to 1.41",
+  "Cache cargo registry between runs",
+  "Split integration tests by crate",
+  "Pin the base image by digest",
+  "Fix timezone in the nightly report",
+  "Drop the unused staging secret",
+];
+const strip = (pattern: string, first = 120) =>
   ({
     runs: pattern.split("").map((c, i) => ({
       id: `r${i}`,
+      run_number: first - i,
+      sha: (0x9e3779b1 * (first - i)).toString(16).padStart(8, "0").slice(-7) + "0".repeat(33),
+      trigger_kind: "push",
+      trigger_title: STRIP_TITLES[i % STRIP_TITLES.length],
       status: c === "x" ? "failed" : c === "c" ? "cancelled" : "succeeded",
       duration_ms: 40000 + ((i * 37) % 11) * 22000,
       created_at: ago((i + 1) * 900000),
