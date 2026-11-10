@@ -9,8 +9,10 @@
 // (git-bug 19b0a45); a global admin makes one from the org dropdown's last
 // entry, New organization…, which opens `/orgs/_new` in the same frame. Every
 // forge connection is added in one place, an org's Connections section, or
-// that page for an org that does not exist yet. The server enforces
-// `Administer` on every request; the gating here only decides what to show.
+// that page for an org that does not exist yet. The connections that serve no
+// org yet wait on that page too, and the dropdown entry counts them. The
+// server enforces `Administer` on every request; the gating here only decides
+// what to show.
 //
 // Pure functions over `{ can_administer, admin_orgs, global_admin }`, so the
 // no-DOM vitest tier covers the table, the gating, the org dropdown, the user
@@ -156,6 +158,17 @@ export const GROUP_HEADINGS: Record<SettingsGroupKind, string> = {
 
 /** The label of the org dropdown's last entry and of its page. */
 export const NEW_ORG_LABEL = "New organization";
+
+/**
+ * The New organization entry as the org dropdown (`ellipsis`) and the
+ * palette name it: with the count of forge connections that serve no
+ * organization yet, when there are any. They wait on that page for a global
+ * admin to choose one.
+ */
+export function newOrgEntryLabel(waiting: number, ellipsis: boolean): string {
+  const base = ellipsis ? `${NEW_ORG_LABEL}…` : NEW_ORG_LABEL;
+  return waiting > 0 ? `${base} (${waiting} waiting)` : base;
+}
 
 /** Is the org dropdown shown? Only on an org page, and only when it offers
  *  something: an org, or New organization…. */
@@ -346,8 +359,9 @@ export interface PaletteEntry {
   href: string;
 }
 
-/** Every settings section `who` can reach, for the ⌘K palette. */
-export function paletteEntries(who: SettingsCaller): PaletteEntry[] {
+/** Every settings section `who` can reach, for the ⌘K palette. `waiting`
+ *  counts the connections that serve no organization (global admins only). */
+export function paletteEntries(who: SettingsCaller, waiting = 0): PaletteEntry[] {
   const out: PaletteEntry[] = ACCOUNT_SECTIONS.map((s) => ({
     label: `${s.label} · your account`,
     sub: s.sub,
@@ -359,7 +373,14 @@ export function paletteEntries(who: SettingsCaller): PaletteEntry[] {
     }
   }
   if (who.global_admin) {
-    out.push({ label: NEW_ORG_LABEL, sub: "a new organization's first forge connection", href: NEW_ORG_HREF });
+    out.push({
+      label: newOrgEntryLabel(waiting, false),
+      sub:
+        waiting > 0
+          ? "a new organization, or a home for a connection that serves none"
+          : "a new organization's first forge connection",
+      href: NEW_ORG_HREF,
+    });
   }
   return out;
 }
