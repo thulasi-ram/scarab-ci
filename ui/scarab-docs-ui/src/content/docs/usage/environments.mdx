@@ -81,8 +81,8 @@ because it copies secrets and the projects that may use it. The new Environment 
 - every project's overlay and privilege grant;
 - the Environment's secrets set per project, with their values.
 
-The old Environment is not changed; it stays until an admin deletes it. Run and approval history
-and the Cache stay with it. When the copy is made, the page lists what it did not copy:
+The old Environment is not changed; it stays until an admin deletes it. Run history, approvals
+included, and the Cache stay with it. When the copy is made, the page lists what it did not copy:
 
 - the projects whose Runs used the old Environment: their pipelines' `environment:` must change;
 - the policies whose `match.environments` selects the old name and not the new one;

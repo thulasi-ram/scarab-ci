@@ -22,7 +22,15 @@ release.yml uses that version's section as the GitHub Release text. See
 
 - **`GET /v1/repos/{org}/{repo}/environments/{name}/deployments` is removed** and answers 404.
   It listed who approved which Run into an Environment, and the web UI no longer reads it.
-  The server still writes a record when an approval releases a gate; no API returns them.
+  The server no longer keeps that record: each Run keeps its approvals in its own history.
+  Migration 0088 drops the `deployments` table and the rows in it.
+- **The environment migration report is removed.** `GET /v1/orgs/{org}/environment-migration-report`
+  and `POST /v1/orgs/{org}/environment-migration-report/{env}/acknowledge` answer 404, and the
+  org Environments page no longer shows "migrated environments to review". Migration 0088 drops
+  the `environment_migration_report` table and `legacy_project_environments`, the per-repository
+  environments migration 0057 turned into org Environments. The overlays, privilege grants and
+  eligibility 0057 made from them stay. A server from before 0088 cannot run against a database
+  migrated past it.
 - **Server administration is removed from settings.** Account settings and Organization
   settings are separate pages. A global admin creates a new organization from "New
   organization…" in the org dropdown (`/orgs/_new`); `/settings/server/…` redirects there.
