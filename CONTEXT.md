@@ -197,13 +197,16 @@ owns the vendor-neutral nouns; a Plugin owns only vendor knowledge, so CD knowle
 in CD Plugins and core keeps no CD concept. **Scarab's own Plugins use the same contract and
 install path third parties do** — if one needs more, core changes.
 
-**Status (ADR-0074 §7).** The plugin runtime, the CredentialBroker and PluginConnections
-are built, but no built PluginCapability acts: a Plugin can be installed and run, and
-nothing it does reaches a Run. ADR-0076 makes a Plugin a non-human member of the Org
-that acts as a Principal **outside Runs**: it uses the public API under its own RBAC,
-reads state, and resolves the `plugin` Gates it defines. Core never calls a Plugin. Work
-done inside a Run stays a Step, reused through `invoke`. Until that is built, the rows
-below describe the contract. _Avoid_: **PluginAction**, **`plugin_action`**,
+**Status.** The plugin runtime, the CredentialBroker and PluginConnections are built.
+ADR-0076 makes a Plugin a non-human member of the Org that acts as a Principal **outside
+Runs**, and that is built for Gates: with its own `scarab-api` token a Plugin lists the
+waits on the `plugin` Gates it defines in its own Org and releases them with typed outputs
+or fails them with a reason. That is how a Plugin reaches a Run. It cannot pass a `manual`
+Gate, another installation's Gate or another Org's, or an expired wait, and a killed
+installation lists and resolves nothing (`crates/scarab-server/tests/plugin_gates.rs`).
+Core never calls a Plugin. Work done inside a Run stays a Step, reused through `invoke`.
+Not built: checking an image's signature (see **PluginPublisher**) and one-click upgrade
+(see **PluginInstallation**). _Avoid_: **PluginAction**, **`plugin_action`**,
 `offer_actions`, `subscribe_events`, `approve_gates`: designed in ADR-0072 and dropped by
 ADR-0074 and ADR-0076.
 

@@ -3,7 +3,11 @@
 - **Status:** Proposed
 - **Date:** 2026-10-28 (simplified 2026-10-29, see the end)
 - **Amended:** 2026-10-30 (§1: a library invocation is a scope rendered once at launch, and
-  inputs are no longer bound into the text at compile time; see "Amendment (2026-10-30)")
+  inputs are no longer bound into the text at compile time; see "Amendment (2026-10-30)");
+  2026-11-10 by PR #152 (§4, §5, §9, Consequences and the Implementation horizon: no release
+  manifest and no first-party mark, nothing installed into a new org, and the clone library
+  receives forge credentials only from a source an org admin trusted; migration
+  `0090_libraries_no_first_party.sql`; see the notes at those places)
 - **Deciders:** thulasi.ram (architect)
 - **Amends:** [0038](0038-invoke-and-local-reuse.md) (`invoke` gains a prefix per target
   kind, installed libraries and plugin gates; library inputs bind at compile time, read in a
@@ -184,6 +188,10 @@ An org admin installs a library from a git source pinned to a commit:
   is reserved. A name proves nothing about where a library came from: first-party
   status comes from the content hash (§5), and trust with forge credentials from the
   source (§9).
+
+  > **Amended 2026-11-10 by PR #152.** There is no first-party status: no content hash marks a
+  > version as Scarab's (see the note under §5). Trust with forge credentials comes only from a
+  > source an org admin trusted (see the note under §9).
 - An installation is usable by every Project in the org. A Policy narrows it to some
   Projects (§1).
 - Pipelines name it: `invoke: lib:acme/deploy-helm`. Compilation resolves the name to the
@@ -197,6 +205,33 @@ An org admin installs a library from a git source pinned to a commit:
   (`--server`); offline it reports them as unresolved and checks the rest.
 
 ### 5. First-party libraries: offered by default, not bundled
+
+> **Amended 2026-11-10 by PR #152 — Scarab's own libraries are installed like any other, and
+> nothing is installed by default.** The owner decided that code Scarab publishes is untrusted
+> code like anyone else's, so it gets no special case. This section no longer describes what
+> runs:
+>
+> - There is no release manifest and no first-party mark. A release publishes no library
+>   manifest, and `library_versions.first_party` is dropped.
+> - Nothing is installed into a new org. An org admin installs `libs/clone.yaml`, or any
+>   other file under `libs/`, from its git source at a commit (a release tag, for example)
+>   through §4's install, like any library. The retry, mirror and uploaded-copy path for new
+>   orgs is removed, with the `library_org_defaults` table that tracked it.
+> - Scarab shows no "newer version" or "security fix" notice, since both read the manifest.
+>   A fix is still a new LibraryVersion plus a yank (§6), but Scarab does not tell an admin
+>   that one exists.
+> - The names, removal by an admin, and the compile error for a library that is not
+>   installed stand.
+>
+> Migration `0090_libraries_no_first_party.sql` keeps existing orgs working: for every org
+> that stored a first-party clone version, it writes that version's source (without its
+> commit) as an explicitly trusted source, `trusted_by` = `scarab:migration-0090`, then drops
+> `first_party` and `library_org_defaults`. Installed libraries, versions and yanks are
+> unchanged.
+>
+> A catalog could bring update notices back. The owner has discussed an org-pinned catalog
+> file, an upgrade check an admin starts, upstream yanks shown only as advice, and no default
+> catalog. That is a direction, not a decision.
 
 First-party libraries live as YAML in the Scarab repository under `libs/`, for example
 `libs/clone.yaml`. Each release publishes them as a release asset with a manifest that
@@ -393,6 +428,16 @@ PolicyInvariants (ADR-0075 §7) bound it:
   the trusted library's Step receives it, and its image and command come from the
   library, not from the repository. This keeps today's guarantee that a repository's own
   code never reads that token.
+
+  > **Amended 2026-11-10 by PR #152.** No library is trusted by default, the clone library
+  > included. On a Forgejo or GitHub PAT connection the clone library's Step receives the
+  > token only when an org admin has trusted the source it was installed from:
+  > `POST /v1/orgs/{org}/library-trust` writes a `library_trusted_sources` row and needs a
+  > step-up (`library.trust`), and `DELETE` on the same path removes it. Trust is keyed by the
+  > source without its commit (`trust_key`, `crates/scarab-policy/src/library.rs`), so it
+  > still carries across upgrades from that source. Orgs that relied on the old default were
+  > given an explicit row by migration 0090 (see the note under §5). GitHub App mode is
+  > unchanged: its short-lived, repository-scoped token needs no trusted source.
 - **Fork pull requests always get `read`.** The decision is fixed at Run creation, as
   today.
 
@@ -455,6 +500,11 @@ stored with the Run (today it is computed at launch,
 | local executor refuses clone | it refuses `forge_token` |
 | Step id `checkout` | `checkout/git`; `needs: [checkout]` still works across the seam |
 
+> **Amended 2026-11-10 by PR #152.** The missing-clone lint row refers to a first-party mark
+> that no longer exists. The lint matches any installed library named `clone`, under any
+> publisher (`is_clone_library`, `crates/scarab-pipeline/src/lib.rs`). It is a warning and
+> grants nothing.
+
 **Removal.** The release that ships `lib:thulasi-ram/clone` removes the `clone` kind, with
 no deprecation window. A `clone:` Step fails the Pipeline check with a message naming
 `invoke: lib:thulasi-ram/clone`. Existing orgs are not given the library automatically
@@ -481,6 +531,11 @@ release notes say both.
 - The release that ships `lib:thulasi-ram/clone` breaks every Pipeline with `clone:` or a
   bare `invoke:` path, and checkouts stay broken in each org until its admin installs the
   library.
+
+  > **Amended 2026-11-10 by PR #152.** This now holds for a new org too: it starts with no
+  > libraries, so a Pipeline that checks out fails to compile until an admin installs the
+  > clone library. On a Forgejo or GitHub PAT connection, Run creation also refuses the
+  > checkout Step until the admin trusts the library's source (see the note under §9).
 - First-party library names follow the repository: if it moves, new installs get a new
   name.
 - Scarab stores library content, versions, sources and yanks, which is more to back up and
@@ -545,6 +600,10 @@ release notes say both.
    plugin` with its releaser column, required expiry and interpolation at the wait, the
    pending-gates query, PluginGateResolver with the `scarab-api` token, release with
    outputs, and Argo's `wait-live`.
+
+> **Amended 2026-11-10 by PR #152.** Item 2's "`libs/` and its release asset with a manifest,
+> default installation for new orgs with retry and mirror, update notices" was built and is
+> removed (see the note under §5). `libs/` stays, as a source to install from.
 
 Decided by the owner on 2026-10-29, in a simplification pass:
 
