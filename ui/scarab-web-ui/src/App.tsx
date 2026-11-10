@@ -9,7 +9,7 @@ import Repos from "./routes/Repos";
 import RepoView from "./routes/RepoView";
 import RunDetail from "./routes/RunDetail";
 import RunPipeline from "./routes/RunPipeline";
-import { AccountSettings, LegacySettings, OrgSettings, ServerSettings } from "./routes/Settings";
+import { AccountSettings, LegacySettings, NewOrgSettings, OrgSettings } from "./routes/Settings";
 import LibraryReview from "./routes/LibraryReview";
 import { EnvironmentEdit, EnvironmentView } from "./routes/EnvironmentPage";
 import ConfirmRequest from "./routes/ConfirmRequest";
@@ -29,15 +29,17 @@ export default function App() {
     <Show when={!unauthenticated()} fallback={<Login />}>
     <Router root={Layout}>
       <Route path="/" component={Repos} />
-      {/* Settings (git-bug 734ffa1), three separate pages: Account settings
+      {/* Settings (git-bug 734ffa1), two separate pages: Account settings
           under /settings/<section>, an org's settings under
-          /orgs/<org>/settings/<section>, server administration under
-          /settings/server/<section>. Static first segments, so they outrank
-          the /:org/:repo tier. */}
+          /orgs/<org>/settings/<section>. Static first segments, so they
+          outrank the /:org/:repo tier. */}
       <Route path="/settings" component={LegacySettings} />
       <Route path="/settings/:section" component={AccountSettings} />
-      <Route path="/settings/server/:section?" component={ServerSettings} />
       <Route path="/orgs/:org/settings/:section?" component={OrgSettings} />
+      {/* A new org's first forge connection, for global admins. `_new` holds
+          the org's place in the path, and no org may be named with a
+          leading `_`, so it shadows no org. */}
+      <Route path="/orgs/_new" component={NewOrgSettings} />
       {/* Install or upgrade a library: its own URL inside the settings
           frame, so the review can be sent to a second reviewer. */}
       <Route path="/orgs/:org/settings/libraries/review" component={LibraryReview} />
@@ -49,6 +51,8 @@ export default function App() {
       <Route path="/orgs/:org/settings/environments/:env/edit" component={EnvironmentEdit} />
       {/* Old addresses, kept for bookmarks and links sent before the move. */}
       <Route path="/settings/libraries/review" component={LegacySettings} />
+      {/* The former Server administration page: now New organization. */}
+      <Route path="/settings/server/:section?" component={LegacySettings} />
       <Route path="/account" component={LegacySettings} />
       <Route path="/account/security" component={LegacySettings} />
       {/* A machine's StepUpConfirmationRequest: the

@@ -15,7 +15,11 @@
 //   `installation_repositories` delivery leaving a covered repo with no Project.
 // - **Forgejo is fully in-product.** It emits no installation event, so an admin
 //   adds the connection here (base URL + token) — the only route that existed
-//   before was a hand-written database row.
+//   before was a hand-written database row. This is the one place a Forgejo
+//   connection is added: Add Forgejo connection on an org's Connections, or,
+//   for an org that does not exist yet, the New organization page
+//   (`NewOrgConnection`), which shows the same form with a field for the
+//   org's name.
 //
 // The token is write-only: it is typed once, posted once, and never rendered.
 // The row reports whether the *handle* resolves, which is the question an
@@ -143,9 +147,11 @@ export default function Connections(props: { org: string }) {
                 These connections serve no organization, so only global admins see them, here
                 on every organization's page. Assign one to the organization that owns its
                 repositories. If its repositories belong to more than one organization, give each
-                organization its own connection (for GitHub, install the App on that account; for
-                Forgejo, add one on its Connections page) and re-sync it there: the repositories
-                move to it with their projects. Then remove this one.
+                organization its own connection and re-sync it there: the repositories move to it
+                with their projects. Then remove this one. For GitHub, install the App on that
+                account. For Forgejo, use Add Forgejo connection on that organization's
+                Connections, or New organization… in the organization menu above if Scarab does
+                not have it yet.
               </small>
             </p>
             <ul class="conn-list">
@@ -161,15 +167,17 @@ export default function Connections(props: { org: string }) {
 }
 
 /**
- * Connect a forge: a new org's first connection, for a global admin. An org
- * comes into being with its first connection, so this cannot live in any
- * org's own settings. On success it lands on the new org's Connections page.
+ * The New organization page's body: a new org's first connection, for a
+ * global admin. An org comes into being with its first connection, so this
+ * is the connection form without a fixed org: the admin names it. On success
+ * it lands on the new org's Connections, where any further connection is
+ * added.
  */
-export function ConnectForge() {
+export function NewOrgConnection() {
   const nav = useNavigate();
   return (
     <div class="panel">
-      <div class="panel-h"><span>New organization</span></div>
+      <div class="panel-h"><span>First forge connection</span></div>
       <div class="secrets-body">
         <p class="subtle">
           An organization in Scarab is a forge account: the user or organization that owns the
@@ -205,8 +213,9 @@ export function ConnectForge() {
  * on the server, that can render it back.
  *
  * With `org`, the org is fixed (the org page it was opened from) and shown
- * read-only; without it, the caller names a new org. With `onCancel` it is a
- * dialog: the same sections in a Modal, the actions in its footer.
+ * read-only; without it, the caller names a new org (the New organization
+ * page). With `onCancel` it is a dialog: the same sections in a Modal, the
+ * actions in its footer.
  */
 function ForgejoConnectionForm(props: {
   org?: string;

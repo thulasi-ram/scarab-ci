@@ -2,15 +2,16 @@
 // section.
 //
 // The sidebar sits inside the usual 1200px `.page` column, not beside the
-// app: the top bar stays the only app-wide navigation. Three separate pages,
+// app: the top bar stays the only app-wide navigation. Two separate pages,
 // each listing only its own sections: Account settings (`/settings/<section>`,
-// everyone's), Organization settings (`/orgs/<org>/settings/<section>`,
-// admins of that org, with an org dropdown at the top of the sidebar) and
-// Server administration (`/settings/server/<section>`, global admins). The
-// user menu links each one. Under ~900px the section list becomes a
-// `<select>` above the section, with the org dropdown above it. A page under
-// a section (one Environment, a library review) renders in the same frame,
-// with its parent section marked. The route table, the gating, which section a path sits in
+// everyone's) and Organization settings (`/orgs/<org>/settings/<section>`,
+// admins of that org, with an org dropdown at the top of the sidebar). The
+// user menu links each one. The org dropdown's last entry, for global admins,
+// is New organization… (`/orgs/_new`): a new org's first forge connection, in
+// the same frame. Under ~900px the section list becomes a `<select>` above
+// the section, with the org dropdown above it. A page under a section (one
+// Environment, a library review) renders in the same frame, with its parent
+// section marked. The route table, the gating, which section a path sits in
 // and the old-URL redirects are pure functions in `settings-nav.ts`.
 //
 // Gating here is presentation: the server enforces `Administer` on the org
@@ -25,9 +26,12 @@ import {
   navGroup,
   decodeParam,
   groupHome,
-  orgSwitchHref,
+  NEW_ORG_CHOICE,
+  NEW_ORG_LABEL,
+  orgPickHref,
   resolveSection,
   settingsHome,
+  showsOrgPick,
   type OrgChoice,
   type SettingsGroupKind,
   type SettingsSection,
@@ -35,7 +39,7 @@ import {
 import LinkedAccounts from "../components/LinkedAccounts";
 import SecuritySettings from "../components/SecuritySettings";
 import AppearanceSettings from "../components/AppearanceSettings";
-import Connections, { ConnectForge } from "../components/Connections";
+import Connections, { NewOrgConnection } from "../components/Connections";
 import Members from "../components/Members";
 import OrgEnvironments from "../components/OrgEnvironments";
 import Plugins from "../components/Plugins";
@@ -61,13 +65,23 @@ export function OrgSettings() {
   return <SettingsShell kind="org" org={decodeParam(params.org)} section={params.section} />;
 }
 
-/** `/settings/server/:section?` — a section only a global admin may use. */
-export function ServerSettings() {
-  const params = useParams<{ section?: string }>();
-  return <SettingsShell kind="server" section={params.section} />;
+/** `/orgs/_new` — a new org, made by its first forge connection (global
+ *  admins). It renders in the org settings frame, with New organization…
+ *  picked in the org dropdown. */
+export function NewOrgSettings() {
+  return (
+    <SettingsFrame kind="org">
+      <div class="page-head">
+        <h1>{NEW_ORG_LABEL}</h1>
+      </div>
+      <p class="page-sub">its first forge connection</p>
+      <NewOrgConnection />
+    </SettingsFrame>
+  );
 }
 
-/** An old settings URL (`/settings`, `/account`, …): where it lives now. */
+/** An old settings URL (`/settings`, `/account`, `/settings/server/…`, …):
+ *  where it lives now. */
 export function LegacySettings() {
   const location = useLocation();
   return (
@@ -91,8 +105,7 @@ export function LegacySettings() {
 function SettingsShell(props: { kind: SettingsGroupKind; org?: string; section?: string }) {
   const section = () => resolveSection(props.kind, props.section);
   return (
-    // `/orgs/<org>/settings` or `/settings/server` alone opens the group's
-    // first section.
+    // `/orgs/<org>/settings` alone opens the org's first section.
     <Show when={props.section} fallback={<Navigate href={groupHome(props.kind, props.org)} />}>
       <SettingsFrame kind={props.kind} org={props.org} section={props.section}>
         <Show when={section()} fallback={<NotFound />}>
@@ -110,10 +123,12 @@ function SettingsShell(props: { kind: SettingsGroupKind; org?: string; section?:
  * stays in view and marks the section the page belongs to.
  *
  * On an org page the main column shows `children` only to an admin of that
- * org; everyone else sees why not.
+ * org, and on the New organization page (`kind` org, no `org`) only to a
+ * global admin; everyone else sees why not.
  */
 export function SettingsFrame(props: {
   kind: SettingsGroupKind;
+  /** The org in the URL; on an org page, undefined means New organization. */
   org?: string;
   /** The section id, so switching orgs lands on the same section. */
   section?: string;
@@ -134,8 +149,8 @@ export function SettingsFrame(props: {
           <div class="settings">
             <nav class="settings-nav" aria-label="Settings">
               <div class="settings-nav-group">
-                <Show when={g().orgs?.length}>
-                  <OrgPick org={g().org!} orgs={g().orgs!} section={props.section} />
+                <Show when={showsOrgPick(g())}>
+                  <OrgPick org={g().org} orgs={g().orgs ?? []} newOrg={!!g().newOrg} section={props.section} />
                 </Show>
                 <div class="settings-nav-h">{g().heading}</div>
                 <For each={g().items}>
@@ -171,11 +186,11 @@ export function SettingsFrame(props: {
               </Show>
 
               <Switch fallback={props.children}>
-                <Match when={props.kind === "org" && !administers(me(), props.org)}>
-                  <NotYours org={props.org!} />
-                </Match>
-                <Match when={props.kind === "server" && !me()?.global_admin}>
+                <Match when={props.kind === "org" && props.org === undefined && !me()?.global_admin}>
                   <NotGlobalAdmin />
+                </Match>
+                <Match when={props.kind === "org" && props.org !== undefined && !administers(me(), props.org)}>
+                  <NotYours org={props.org!} />
                 </Match>
               </Switch>
             </div>
@@ -236,15 +251,17 @@ export function SettingsCrumbs(props: { trail: Crumb[]; sub: JSX.Element }) {
 /**
  * The org dropdown at the top of an org page's sidebar, shown even for one
  * org so it is always in the same place. Picking an org keeps the section in
- * view. Under ~900px it stays above the section `<select>`.
+ * view. For a global admin its last entry is New organization…, picked on
+ * that page (`org` undefined). Under ~900px it stays above the section
+ * `<select>`.
  */
-function OrgPick(props: { org: string; orgs: OrgChoice[]; section?: string }) {
+function OrgPick(props: { org?: string; orgs: OrgChoice[]; newOrg: boolean; section?: string }) {
   const nav = useNavigate();
   return (
     <select
       class="input settings-nav-orgpick mono"
       aria-label="Organization"
-      onChange={(e) => nav(orgSwitchHref(e.currentTarget.value, props.section))}
+      onChange={(e) => nav(orgPickHref(e.currentTarget.value, props.section))}
     >
       <For each={props.orgs}>
         {(c) => (
@@ -253,6 +270,11 @@ function OrgPick(props: { org: string; orgs: OrgChoice[]; section?: string }) {
           </option>
         )}
       </For>
+      <Show when={props.newOrg}>
+        <option value={NEW_ORG_CHOICE} selected={props.org === undefined}>
+          {NEW_ORG_LABEL}…
+        </option>
+      </Show>
     </select>
   );
 }
@@ -269,21 +291,14 @@ function SectionPage(props: { kind: SettingsGroupKind; org?: string; section: Se
         <h1>{props.section.label}</h1>
       </div>
       <p class="page-sub">
-        <Switch fallback="your account">
-          <Match when={props.kind === "org"}>
-            <span class="mono">{props.org}</span>
-          </Match>
-          <Match when={props.kind === "server"}>this server</Match>
-        </Switch>{" "}
+        <Show when={props.kind === "org"} fallback="your account">
+          <span class="mono">{props.org}</span>
+        </Show>{" "}
         · {props.section.sub}
       </p>
       <Show when={key()} keyed>
         {(_key) =>
-          props.kind === "account"
-            ? accountBody(props.section.id)
-            : props.kind === "server"
-              ? serverBody(props.section.id)
-              : orgBody(props.section.id, props.org!)
+          props.kind === "account" ? accountBody(props.section.id) : orgBody(props.section.id, props.org!)
         }
       </Show>
     </>
@@ -300,15 +315,6 @@ function accountBody(id: string): JSX.Element {
       return <MyApiTokens />;
     case "appearance":
       return <AppearanceSettings />;
-    default:
-      return <NotFound />;
-  }
-}
-
-function serverBody(id: string): JSX.Element {
-  switch (id) {
-    case "connect-forge":
-      return <ConnectForge />;
     default:
       return <NotFound />;
   }
@@ -370,11 +376,11 @@ function NotYours(props: { org: string }) {
 function NotGlobalAdmin() {
   return (
     <div class="panel">
-      <div class="panel-h"><span>Server administration</span></div>
+      <div class="panel-h"><span>{NEW_ORG_LABEL}</span></div>
       <div class="secrets-body">
         <p class="empty">
-          This section needs a global <b>Administer</b> role. Ask a server administrator if you need
-          a new organization connected.
+          A new organization needs a global <b>Administer</b> role. Ask a server administrator if
+          you need one connected.
         </p>
       </div>
     </div>

@@ -57,8 +57,9 @@ const ENV_GATE_RUN_ID = "0190f8a2000071fb8c00e7a9b0c1d2e3";
 
 // ── /v1/me ────────────────────────────────────────────────────────────────
 // An Owner of the one implicit org, so the Settings gear renders.
-// The Owner role is global, so Avery is a global admin: Settings shows Connect
-// a forge and the unassigned connection below (git-bug 19b0a45). Avery
+// The Owner role is global, so Avery is a global admin: the org dropdown in
+// Organization settings ends with New organization…, and Connections lists the
+// unassigned connection below (git-bug 19b0a45). Avery
 // administers two orgs, so the org dropdown in Organization settings offers a
 // choice; globex has no connections or repositories of its own.
 const me = {

@@ -1,7 +1,8 @@
-// Settings shell (git-bug 734ffa1), in mock mode: account, org and server
-// settings are separate pages, every section in a page's sidebar opens at its
-// own URL under its own heading, the user menu reaches each page, the old
-// addresses redirect, and nothing errors on the way.
+// Settings shell (git-bug 734ffa1), in mock mode: account and org settings
+// are separate pages, every section in a page's sidebar opens at its own URL
+// under its own heading, the user menu reaches each page, a global admin makes
+// a new org from the org dropdown, the old addresses redirect, and nothing
+// errors on the way.
 import { test, expect, type Page } from "@playwright/test";
 
 function collectErrors(page: Page): string[] {
@@ -18,12 +19,11 @@ test("an admin lands on their org's settings", async ({ page }) => {
   await expect(page).toHaveURL(/\/orgs\/acme\/settings\/connections$/);
 });
 
-// Account settings, an org's settings and server administration are separate
-// pages: each sidebar lists its own sections and none of the others'.
+// Account settings and an org's settings are separate pages: each sidebar
+// lists its own sections and none of the other's.
 for (const [start, heading, count] of [
   ["/settings/profile", "Account settings", 4],
   ["/orgs/acme/settings/connections", "Organization settings", 10],
-  ["/settings/server/connect-forge", "Server administration", 1],
 ] as const) {
   test(`${heading} lists only its own sections, each at its own URL`, async ({ page }) => {
     const errors = collectErrors(page);
@@ -62,10 +62,8 @@ test("the user menu links each settings page, the org one to the org in view", a
     "href",
     "/settings/profile",
   );
-  await expect(menu.getByRole("menuitem", { name: "Server administration" })).toHaveAttribute(
-    "href",
-    "/settings/server/connect-forge",
-  );
+  // Two settings pages, so two entries.
+  await expect(menu.getByRole("menuitem", { name: /settings$/ })).toHaveCount(2);
   await menu.getByRole("menuitem", { name: "Organization settings" }).click();
   await expect(page).toHaveURL(/\/orgs\/globex\/settings\/connections$/);
   await expect(page.getByRole("combobox", { name: "Organization" })).toHaveValue("globex");
@@ -85,7 +83,8 @@ test("the org dropdown is there with one org, and on a narrow screen sits above 
   await page.goto("/orgs/acme/settings/members?admin_orgs=acme");
   const pick = page.getByRole("combobox", { name: "Organization" });
   await expect(pick).toBeVisible();
-  await expect(pick.locator("option")).toHaveText(["acme"]);
+  // The mock caller is a global admin, so New organization… ends the list.
+  await expect(pick.locator("option")).toHaveText(["acme", "New organization…"]);
 
   await page.setViewportSize({ width: 600, height: 900 });
   const section = page.getByRole("combobox", { name: "Settings section" });
@@ -382,10 +381,20 @@ test("Connections lists the org's connections and, for a global admin, the unass
   expect(errors).toEqual([]);
 });
 
-test("a global admin connects a forge for a new org and lands on its connections", async ({ page }) => {
+test("a global admin makes a new org from the org dropdown and lands on its connections", async ({ page }) => {
   const errors = collectErrors(page);
-  await page.goto("/settings/server/connect-forge");
-  await expect(page.getByRole("heading", { level: 1, name: "Connect a forge", exact: true })).toBeVisible();
+  await page.goto("/orgs/acme/settings/members");
+  const pick = page.getByRole("combobox", { name: "Organization" });
+  await expect(pick.locator("option").last()).toHaveText("New organization…");
+  await pick.selectOption({ label: "New organization…" });
+  await expect(page).toHaveURL(/\/orgs\/_new$/);
+  await expect(page.getByRole("heading", { level: 1, name: "New organization", exact: true })).toBeVisible();
+  // The org settings frame, with New organization… picked and no sections.
+  await expect(pick).toHaveValue("/orgs/_new");
+  const nav = page.getByRole("navigation", { name: "Settings" });
+  await expect(nav.getByText("Organization settings", { exact: true })).toBeVisible();
+  await expect(nav.getByRole("link")).toHaveCount(0);
+  await expect(page.getByText(/install the Scarab App on the account/)).toBeVisible();
   const add = page.getByRole("button", { name: "Add connection" });
   await expect(add).toBeDisabled();
   await page.locator("#conn-org").fill("initech");
@@ -399,6 +408,26 @@ test("a global admin connects a forge for a new org and lands on its connections
   await expect(page_.getByText("forgejo-5be0d4a1", { exact: true })).toBeVisible();
   await expect(page_.getByText("https://git.initech.dev", { exact: true })).toBeVisible();
   await expect(page_.getByText(/You do not administer/)).toHaveCount(0);
+  expect(errors).toEqual([]);
+});
+
+test("a global admin with no org lands on New organization, and the old server page sends them there", async ({ page }) => {
+  const errors = collectErrors(page);
+  // `?admin_orgs=,` makes the mock caller a global admin of no org.
+  await page.goto("/settings?admin_orgs=,");
+  await expect(page).toHaveURL(/\/orgs\/_new(\?|$)/);
+  await expect(page.getByRole("heading", { level: 1, name: "New organization", exact: true })).toBeVisible();
+  const pick = page.getByRole("combobox", { name: "Organization" });
+  await expect(pick.locator("option")).toHaveText(["New organization…"]);
+  await page.locator("button.avatar").click();
+  await expect(
+    page.getByRole("menu").getByRole("menuitem", { name: "Organization settings" }),
+  ).toHaveAttribute("href", "/orgs/_new");
+
+  await page.goto("/settings/server/connect-forge");
+  await expect(page).toHaveURL(/\/orgs\/_new$/);
+  await page.goto("/settings/server");
+  await expect(page).toHaveURL(/\/orgs\/_new$/);
   expect(errors).toEqual([]);
 });
 

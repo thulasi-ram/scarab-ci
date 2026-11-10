@@ -12,7 +12,6 @@ import { settingsMenu, type SettingsGroupKind } from "../settings-nav";
 const MENU_ICONS: Record<SettingsGroupKind, string> = {
   account: "user",
   org: "settings",
-  server: "database",
 };
 
 /** Initials from a display name ("Thulasi Ram" → "TR") or subject ("t.ram" → "T"). */
@@ -76,8 +75,8 @@ export default function UserMenu() {
             {/* Settings (git-bug 734ffa1): one entry per settings page,
                 since each page lists only its own sections. Account
                 settings for everyone; Organization settings for an org
-                admin, opening the org in view when they administer it;
-                Server administration for a global admin. */}
+                admin, opening the org in view when they administer it, and
+                for a global admin with no org, the New organization page. */}
             <For each={settingsMenu(user(), location.pathname)}>
               {(entry) => (
                 <A

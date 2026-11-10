@@ -1892,7 +1892,7 @@ select.input {
    actions, a health line, then the Projects it serves. */
 .conn-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
 /* The Forgejo connection form: numbered sections (the org, the instance, the
-   token), in the Add dialog and on Connect a forge. */
+   token), in the Add dialog and on the New organization page. */
 .conn-form { display: flex; flex-direction: column; gap: 14px; }
 .conn .typed-confirm { margin-top: 10px; }
 .conn .typed-confirm p { margin: 0; font-size: var(--fs-md); }
