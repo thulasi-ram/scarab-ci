@@ -302,15 +302,16 @@ defend against `trusted_dom` code, which can change what is being confirmed.
 >   (409 otherwise). The installation keeps its id, name, config, storage, state and connection
 >   bindings; config keys and slots the new manifest drops go with it, and the version it replaced
 >   is recorded.
-> - **Same-or-narrower versus wider is decided by the server**, from the installed manifest and
->   the one it reads, never from the request. Wider is any added capability, connection slot, auth
->   scheme, read rule or gate (a gate whose definition changed counts as added), a manifest that
->   stops naming its image or names another, or an image of another repository. An added config
->   key is not wider: its value is the admin's, not the plugin's. A same-or-narrower upgrade,
->   including a new digest of the same repository with the same manifest, needs no
->   StepUpConfirmation; a wider one needs one bound to the action, as an install does. This
->   narrows §8's "Plugin install and upgrade" to wider upgrades. Elevated tiers and dual approval
->   do not exist yet, so nothing here addresses them.
+> - **An upgrade stays a step-up for any new digest, as §8 says.** A new digest is new code, so
+>   an upgrade whose image is not the installed one needs a StepUpConfirmation bound to the
+>   action, as an install does, whatever its manifest: the same, narrower or wider. A wider
+>   manifest needs one too on the installed image. Wider is any added capability, connection
+>   slot, auth scheme, read rule or gate (a gate whose definition changed counts as added), or a
+>   manifest that stops naming its image or names another. An added config key is not wider: its
+>   value is the admin's, not the plugin's. The one exempt upgrade is a same-or-narrower manifest
+>   on the installed digest, which is the "one-click upgrade by one org admin" above. The server
+>   decides from the stored installation and the manifest it reads, never from the request.
+>   Elevated tiers and dual approval do not exist yet, so nothing here addresses them.
 > - **A manifest may name its image.** The optional `image` field is a repository with no tag or
 >   digest. When it is set, an install or upgrade with an image of another repository is refused,
 >   so a manifest cannot be paired with another publisher's build. When it is absent, any

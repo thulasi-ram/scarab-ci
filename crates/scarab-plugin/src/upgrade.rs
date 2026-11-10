@@ -1,8 +1,11 @@
 //! What an upgrade changes (ADR-0072 §10): the installed manifest against
 //! the one an admin read for the upgrade, item by item.
 //!
-//! An upgrade to a **same-or-narrower** manifest is a one-click upgrade by one
-//! org admin; one that is **wider** is governed like an install. Wider means
+//! A manifest that is **wider** than the installed one is governed like an
+//! install. (So is any new image digest, whatever the manifest: a new digest
+//! is new code. That is the server's check on the image, not this diff's;
+//! only a same-or-narrower manifest on the installed digest is exempt.) Wider
+//! means
 //! the new manifest asks for something the installed one did not: a
 //! capability, a connection slot, an auth scheme on a slot, a read rule, or a
 //! gate (a gate whose definition changed counts as added), or it stops

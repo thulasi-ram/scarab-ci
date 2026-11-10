@@ -95,9 +95,10 @@ test("the org dropdown is there with one org, and on a narrow screen sits above 
   await page.goto("/orgs/acme/settings/members?admin_orgs=acme");
   const pick = page.getByRole("combobox", { name: "Organization" });
   await expect(pick).toBeVisible();
-  // The mock caller is a global admin, so New organization… ends the list.
+  // The mock caller is a global admin, so New organization… ends the list,
+  // with the two connections that wait for an org.
   await pick.click();
-  await expect(listOptions(page)).toHaveText(["acme", "New organization…"]);
+  await expect(listOptions(page)).toHaveText(["acme", "New organization… (2 waiting)"]);
   await page.keyboard.press("Escape");
   await expect(page.getByRole("listbox")).toHaveCount(0);
 
@@ -712,7 +713,8 @@ test("Upgrade reads a new manifest, shows what changes and whether it needs a pa
   await page.goto("/orgs/acme/settings/plugins/9c0d33a1e5/manage");
   await expect(page.getByText("source not recorded", { exact: true })).toBeVisible();
 
-  // argocd-staging: the new manifest adds a rule and a gate, so it asks for a passkey.
+  // argocd-staging: the new manifest adds a rule and a gate, so it asks for a
+  // passkey even on the installed image.
   await page.goto("/orgs/acme/settings/plugins/2b7e90f1c4/manage");
   await page.getByRole("button", { name: "Upgrade" }).click();
   let dialog = page.getByRole("dialog");
@@ -723,21 +725,36 @@ test("Upgrade reads a new manifest, shows what changes and whether it needs a pa
   await expect(dialog.getByTestId("upgrade-step-up")).toContainText("confirm with your passkey");
   await dialog.getByRole("button", { name: "Cancel" }).click();
 
-  // argocd: the new manifest drops a rule, so it needs none; Upgrade applies it.
+  // argocd: the new manifest drops a rule. On the installed image it needs
+  // no passkey, and Upgrade applies it.
+  const installed = `${repo}@sha256:${"4f2a1c9e7b3d".padEnd(64, "0")}`;
   await page.goto("/orgs/acme/settings/plugins/4f2a1c9e7b/manage");
   await expect(page.getByText(/^github\.com\/acme\/scarab-plugin-argocd\/\/manifest\.json@/)).toBeVisible();
   await page.getByRole("button", { name: "Upgrade" }).click();
   dialog = page.getByRole("dialog");
   await dialog.getByRole("textbox", { name: "Commit or source" }).fill("e".repeat(40));
+  await dialog.getByRole("textbox", { name: "Image" }).fill(installed);
   const upgrade = dialog.getByRole("button", { name: "Upgrade", exact: true });
   await expect(upgrade).toBeDisabled();
   await dialog.getByRole("button", { name: "Read and compare" }).click();
   await expect(dialog.getByText("− argocd: GET /api/version")).toBeVisible();
   await expect(dialog.getByText("0 added · 1 removed", { exact: false })).toBeVisible();
   await expect(dialog.getByTestId("upgrade-step-up")).toContainText("needs no passkey");
-  await dialog.getByRole("textbox", { name: "Image" }).fill(`${repo}@sha256:${"9".repeat(64)}`);
+
+  // A new digest is new code: it drops the answer, and read again it needs a passkey.
+  const newDigest = `${repo}@sha256:${"9".repeat(64)}`;
+  await dialog.getByRole("textbox", { name: "Image" }).fill(newDigest);
+  await expect(upgrade).toBeDisabled();
+  await dialog.getByRole("button", { name: "Read and compare" }).click();
+  await expect(dialog.getByTestId("upgrade-step-up")).toContainText("confirm with your passkey");
+  await expect(dialog.getByTestId("upgrade-step-up")).toContainText(`runs new code: image \`${newDigest}\``);
+
+  // Back to the installed image: no passkey, and it applies.
+  await dialog.getByRole("textbox", { name: "Image" }).fill(installed);
+  await dialog.getByRole("button", { name: "Read and compare" }).click();
+  await expect(dialog.getByTestId("upgrade-step-up")).toContainText("needs no passkey");
   await upgrade.click();
-  await expect(page.getByText("argocd is upgraded to sha256:999999999999.")).toBeVisible();
+  await expect(page.getByText("argocd is upgraded to sha256:4f2a1c9e7b3d.")).toBeVisible();
   await expect(page.getByText(`github.com/acme/scarab-plugin-argocd//manifest.json@${"e".repeat(40)}`)).toBeVisible();
   expect(errors).toEqual([]);
 });
@@ -767,7 +784,7 @@ test("the org dropdown works from the keyboard, keeps the section, and skips an 
   await pick.focus();
   await page.keyboard.press("Enter");
   await expect(pick).toHaveAttribute("aria-expanded", "true");
-  await expect(listOptions(page)).toHaveText(["globex", "acme", "New organization…"]);
+  await expect(listOptions(page)).toHaveText(["globex", "acme", "New organization… (2 waiting)"]);
   await expect(listOptions(page).first()).toHaveAttribute("aria-disabled", "true");
   // The list opens on acme, the first org that can be picked; ArrowUp does
   // not move onto globex.
@@ -830,13 +847,17 @@ test("Appearance switches the palette and the mode, and the choice survives a re
   expect(errors).toEqual([]);
 });
 
-test("Connections lists the org's connections and, for a global admin, the unassigned ones apart", async ({ page }) => {
+test("Connections lists only the org's own connections", async ({ page }) => {
   const errors = collectErrors(page);
   await page.goto("/orgs/acme/settings/connections");
   const page_ = page.locator("section.page");
   const list = page_.getByRole("table", { name: "Forge connections" });
-  const unassigned = page_.locator(".panel", { hasText: "Unassigned connections" });
-  await expect(unassigned.getByText("github-install-90211", { exact: true })).toBeVisible();
+  await expect(list.getByText("forgejo-7f3a91c2", { exact: true })).toBeVisible();
+  // The connections that serve no org wait on the New organization page,
+  // even for a global admin.
+  await expect(page_.getByText("Waiting for an organization")).toHaveCount(0);
+  await expect(page_.getByText("Unassigned connections")).toHaveCount(0);
+  await expect(page_.getByText(/github-install-/)).toHaveCount(0);
 
   // One row per connection: forge and host linking to its page, how many
   // repositories it has enabled, and none of them listed.
@@ -850,8 +871,6 @@ test("Connections lists the org's connections and, for a global admin, the unass
   await expect(list.getByRole("link", { name: "acme/infra" })).toHaveCount(0);
   // Re-sync and Remove live on the connection's page, not on the list.
   await expect(list.getByRole("button", { name: /Re-sync|Remove/ })).toHaveCount(0);
-  // An unassigned connection serves no org, so it has no page to link to.
-  await expect(unassigned.getByRole("link", { name: "Manage", exact: true })).toHaveCount(0);
 
   // Add Forgejo connection sits in the panel header and opens a dialog.
   await page_.getByRole("button", { name: "Add Forgejo connection" }).click();
@@ -944,12 +963,12 @@ test("a global admin makes a new org from the org dropdown and lands on its conn
   await page.goto("/orgs/acme/settings/members");
   const pick = page.getByRole("combobox", { name: "Organization" });
   await pick.click();
-  await expect(listOptions(page).last()).toHaveText("New organization…");
+  await expect(listOptions(page).last()).toHaveText("New organization… (2 waiting)");
   await listOptions(page).last().click();
   await expect(page).toHaveURL(/\/orgs\/_new$/);
   await expect(page.getByRole("heading", { level: 1, name: "New organization", exact: true })).toBeVisible();
   // The org settings frame, with New organization… picked and no sections.
-  await expect(pick).toHaveText("New organization…");
+  await expect(pick).toHaveText("New organization… (2 waiting)");
   const nav = page.getByRole("navigation", { name: "Settings" });
   await expect(nav.getByText("Organization settings", { exact: true })).toBeVisible();
   await expect(nav.getByRole("link")).toHaveCount(0);
@@ -978,7 +997,7 @@ test("a global admin with no org lands on New organization, and the old server p
   await expect(page.getByRole("heading", { level: 1, name: "New organization", exact: true })).toBeVisible();
   const pick = page.getByRole("combobox", { name: "Organization" });
   await pick.click();
-  await expect(listOptions(page)).toHaveText(["New organization…"]);
+  await expect(listOptions(page)).toHaveText(["New organization… (2 waiting)"]);
   await page.keyboard.press("Escape");
   await page.locator("button.avatar").click();
   await expect(
@@ -992,24 +1011,94 @@ test("a global admin with no org lands on New organization, and the old server p
   expect(errors).toEqual([]);
 });
 
-test("a global admin assigns an unassigned connection to an org", async ({ page }) => {
+test("the org dropdown and the palette count the connections waiting for an org", async ({ page }) => {
   const errors = collectErrors(page);
-  await page.goto("/orgs/acme/settings/connections");
+  await page.goto("/orgs/acme/settings/members");
+  const pick = page.getByRole("combobox", { name: "Organization" });
+  await pick.click();
+  await expect(listOptions(page).last()).toHaveText("New organization… (2 waiting)");
+  await page.keyboard.press("Escape");
+  await page.keyboard.press("Control+k");
+  const palette = page.getByRole("dialog", { name: "Command palette" });
+  await palette.getByRole("textbox").fill("new organization");
+  await expect(palette.getByText("New organization (2 waiting)", { exact: true })).toBeVisible();
+  await page.keyboard.press("Escape");
+  expect(errors).toEqual([]);
+});
+
+test("New organization lists the connections waiting for an org, and a global admin gives each one", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/orgs/_new");
   const page_ = page.locator("section.page");
-  const unassigned = page_.locator(".panel", { hasText: "Unassigned connections" });
-  const row = unassigned.locator("li.conn", { hasText: "github-install-90211" });
+  const waiting = page_.locator(".panel", { hasText: "Waiting for an organization" });
+  // Above the new-org form.
+  const form = page_.locator(".panel", { hasText: "First forge connection" });
+  expect((await waiting.boundingBox())!.y).toBeLessThan((await form.boundingBox())!.y);
+  await expect(
+    waiting.getByText(
+      "Scarab could not prove these accounts own organizations of the same names, so they serve none until you choose.",
+    ),
+  ).toBeVisible();
+  const acmeRow = waiting.locator("li.conn", { hasText: "github-install-90211" });
+  const otherRow = waiting.locator("li.conn", { hasText: "github-install-90377" });
+  await expect(acmeRow.getByText("GitHub · github.com")).toBeVisible();
+  await expect(acmeRow.getByText("90211", { exact: true })).toBeVisible();
+  await expect(acmeRow.getByText("resolves")).toBeVisible();
+  await expect(acmeRow.getByText(/none recorded yet/)).toBeVisible();
+  await expect(acmeRow.getByRole("button", { name: "Remove", exact: true })).toBeVisible();
   // It binds nothing on a re-sync, so it offers none.
-  await expect(row.getByRole("button", { name: /Re-sync/ })).toHaveCount(0);
-  await row.getByRole("button", { name: "Assign to org" }).click();
-  const assign = row.getByRole("button", { name: "Assign", exact: true });
-  const field = row.getByRole("textbox", { name: "Organization to assign" });
-  await field.fill("a/b");
-  await expect(assign).toBeDisabled();
-  await field.fill("umbrella");
-  await expect(assign).toBeEnabled();
-  await assign.click();
-  // Assigned, it is no longer unassigned, so the panel goes.
-  await expect(unassigned).toHaveCount(0);
+  await expect(acmeRow.getByRole("button", { name: /Re-sync/ })).toHaveCount(0);
+
+  // acme is also served by a Forgejo connection, so the server refuses to
+  // assign a GitHub connection to it, and the page shows its reason as is.
+  await acmeRow.getByRole("button", { name: "Assign to an organization" }).click();
+  await expect(acmeRow.getByRole("combobox", { name: "Organization to assign" })).toHaveText("acme");
+  await acmeRow.getByRole("button", { name: "Assign", exact: true }).click();
+  await expect(
+    acmeRow.getByText(
+      "connection `github-install-90211` cannot serve org `acme`: org `acme` has connection `forgejo-7f3a91c2` to https://git.acme.dev, another forge or host than https://api.github.com; an account of the same name there is not known to be the same account",
+    ),
+  ).toBeVisible();
+  await acmeRow.getByRole("button", { name: "Cancel" }).click();
+
+  // A new org from the other one: an existing org's name is refused here.
+  await otherRow.getByRole("button", { name: "Create a new organization from it" }).click();
+  const name = otherRow.getByRole("textbox", { name: "New organization name" });
+  const create = otherRow.getByRole("button", { name: "Create organization" });
+  await name.fill("acme");
+  await expect(otherRow.getByText("acme is already an organization. Use Assign to an organization.")).toBeVisible();
+  await expect(create).toBeDisabled();
+  await name.fill("a/b");
+  await expect(create).toBeDisabled();
+  await name.fill("umbrella");
+  await create.click();
+  await expect(page).toHaveURL(/\/orgs\/umbrella\/settings\/connections$/);
+  await expect(page_.getByText("github-install-90377", { exact: true })).toBeVisible();
+  const pick = page.getByRole("combobox", { name: "Organization" });
+  await pick.click();
+  await expect(listOptions(page).last()).toHaveText("New organization… (1 waiting)");
+  await page.keyboard.press("Escape");
+
+  // The other one joins umbrella, which a GitHub connection now serves.
+  await choose(page, pick, "New organization… (1 waiting)");
+  await expect(page).toHaveURL(/\/orgs\/_new$/);
+  await expect(
+    waiting.getByText("Scarab could not prove this account owns an organization of the same name, so it serves none until you choose."),
+  ).toBeVisible();
+  await acmeRow.getByRole("button", { name: "Assign to an organization" }).click();
+  await choose(page, acmeRow.getByRole("combobox", { name: "Organization to assign" }), "umbrella");
+  await acmeRow.getByRole("button", { name: "Assign", exact: true }).click();
+  await expect(page).toHaveURL(/\/orgs\/umbrella\/settings\/connections$/);
+  await expect(page_.getByText("github-install-90211", { exact: true })).toBeVisible();
+  await pick.click();
+  await expect(listOptions(page).last()).toHaveText("New organization…");
+  await page.keyboard.press("Escape");
+
+  // None wait, so the panel is gone.
+  await choose(page, pick, "New organization…");
+  await expect(page).toHaveURL(/\/orgs\/_new$/);
+  await expect(page_.locator(".panel", { hasText: "First forge connection" })).toBeVisible();
+  await expect(waiting).toHaveCount(0);
   expect(errors).toEqual([]);
 });
 

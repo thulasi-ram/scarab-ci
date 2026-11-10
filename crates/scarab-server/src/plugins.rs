@@ -26,8 +26,9 @@
 //! source's file at a new commit), show what it adds, removes and keeps
 //! against the installed one, and apply it (`POST …/plugins/{name}/upgrade`)
 //! only if the installed manifest is still the one the admin compared
-//! against. The server decides from the two manifests whether the upgrade is
-//! same-or-narrower (no step-up) or wider (a step-up, as for an install).
+//! against. A new image digest is new code and needs a step-up, as an install
+//! does, and so does a manifest that asks for more; only a same-or-narrower
+//! manifest on the installed image is exempt. The server decides.
 //! A manifest may name its image repository; an install or upgrade with an
 //! image of another repository is refused.
 
@@ -601,7 +602,8 @@ pub struct FetchPluginUpgradeRequest {
     pub connection: Option<String>,
     /// The image the upgrade would run, `<repository>@sha256:<64 hex>`. When
     /// given, it is checked against the new manifest's named repository, and
-    /// a move to another repository counts as a widening.
+    /// `needs_step_up` is judged with it: any image other than the installed
+    /// one needs a step-up. Omitted: judged as keeping the installed image.
     #[serde(default)]
     pub image: Option<String>,
 }
@@ -678,11 +680,14 @@ pub struct FetchedPluginUpgradeDto {
     pub current_manifest_sha256: String,
     pub current_image: String,
     pub diff: ManifestDiffDto,
-    /// Each thing the upgrade adds that the installed version did not ask
-    /// for, as a sentence. Empty = the upgrade is same-or-narrower.
-    pub widenings: Vec<String>,
-    /// Whether `…/upgrade` asks for a step-up: exactly when it widens. Decided
-    /// again by the server at the upgrade.
+    /// Why `…/upgrade` asks for a step-up, each as a sentence: what the new
+    /// manifest asks for that the installed one did not, and a new image
+    /// (any digest other than the installed one is new code). Judged with
+    /// the request's `image`, or the installed image when it has none.
+    /// Empty = a narrowing on the same image, which needs none.
+    pub step_up_reasons: Vec<String>,
+    /// Whether `…/upgrade` asks for a step-up: exactly when there is a
+    /// reason. Decided again by the server at the upgrade.
     pub needs_step_up: bool,
 }
 
@@ -1340,24 +1345,32 @@ pub(crate) async fn enable_plugin(
     set_state(&st, &headers, &org, &name, InstallationState::Enabled).await
 }
 
-/// The installed manifest against `new`, and what the upgrade adds that
-/// was not approved: the manifest's widenings, and a move of the image to
-/// another repository (new code from another publisher). Decided here, from
-/// what the server holds and reads, never from the client.
-fn upgrade_widenings(
+/// The installed manifest against `new`, and why the upgrade needs a
+/// step-up: each thing the new manifest asks for that the installed one did
+/// not, and a new image. A new digest is new code (ADR-0072 §10), so any
+/// image other than the installed one is confirmed like an install, whatever
+/// the manifest; a move to another repository says so. `image: None` judges
+/// an upgrade that keeps the installed image. Decided here, from what the
+/// server holds and reads, never from the client.
+fn upgrade_step_up_reasons(
     current: &PluginInstallation,
     new: &PluginManifest,
     image: Option<&str>,
 ) -> (ManifestDiff, Vec<String>) {
     let diff = ManifestDiff::between(&current.manifest, new);
-    let mut widenings = diff.widenings();
-    if let Some(image) = image {
+    let mut reasons = diff.widenings();
+    if let Some(image) = image.filter(|i| *i != current.image) {
         let (was, now) = (image_repository(&current.image), image_repository(image));
         if was != now {
-            widenings.push(format!("moves the image from `{was}` to `{now}`"));
+            reasons.push(format!("moves the image from `{was}` to `{now}`"));
+        } else {
+            reasons.push(format!(
+                "runs new code: image `{image}` instead of `{}`",
+                current.image
+            ));
         }
     }
-    (diff, widenings)
+    (diff, reasons)
 }
 
 /// The manifest an upgrade-fetch reads: `source` as given, or the recorded
@@ -1445,7 +1458,7 @@ pub(crate) async fn fetch_plugin_upgrade(
             .check_image(image)
             .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     }
-    let (diff, widenings) = upgrade_widenings(&current, &manifest, image);
+    let (diff, reasons) = upgrade_step_up_reasons(&current, &manifest, image);
     Ok(Json(FetchedPluginUpgradeDto {
         source: src.to_string(),
         connection,
@@ -1455,8 +1468,8 @@ pub(crate) async fn fetch_plugin_upgrade(
         current_manifest_sha256: current.manifest_sha256,
         current_image: current.image,
         diff: (&diff).into(),
-        needs_step_up: !widenings.is_empty(),
-        widenings,
+        needs_step_up: !reasons.is_empty(),
+        step_up_reasons: reasons,
     }))
 }
 
@@ -1479,9 +1492,11 @@ fn same_plugin(current: &PluginInstallation, manifest: &PluginManifest) -> Resul
 /// declare is dropped (a dropped binding's credential is deleted). The
 /// version replaced is recorded. Administer on the Org.
 ///
-/// Same-or-narrower (nothing added, image of the same repository) needs no
-/// step-up; wider is confirmed like an install (ADR-0072 §10). The server
-/// decides which from the installed manifest and the one it reads here.
+/// A new image digest is new code and is confirmed like an install, whatever
+/// the manifest (ADR-0072 §8, §10); so is a manifest that asks for more.
+/// Only a same-or-narrower manifest on the installed image needs no step-up.
+/// The server decides from the installed installation and the manifest it
+/// reads here. Refused while `SCARAB_PLUGINS=off` (409), as an install is.
 /// 409 when the installed manifest is no longer `expected_current_sha256`,
 /// and when the source no longer reads as `manifest_sha256`.
 #[utoipa::path(
@@ -1496,9 +1511,9 @@ fn same_plugin(current: &PluginInstallation, manifest: &PluginManifest) -> Resul
     responses(
         (status = 200, body = PluginInstallationDto),
         (status = 400, description = "a bad image or source, another plugin's manifest, a manifest that is not admissible, or an image the manifest does not name"),
-        (status = 403, description = "not an org admin, a step-up is required (a wider manifest or another image repository), a host Scarab does not fetch from, or a private repository outside the org"),
+        (status = 403, description = "not an org admin, a step-up is required (a new image, or a manifest that asks for more), a host Scarab does not fetch from, or a private repository outside the org"),
         (status = 404, description = "no such installation, or plugins not configured"),
-        (status = 409, description = "the installation changed since the review, or the source no longer reads as the reviewed manifest")
+        (status = 409, description = "plugins are off, the installation changed since the review, or the source no longer reads as the reviewed manifest")
     )
 )]
 pub(crate) async fn upgrade_plugin(
@@ -1510,6 +1525,13 @@ pub(crate) async fn upgrade_plugin(
 ) -> Result<Json<PluginInstallationDto>, ApiError> {
     let by = org_admin(&st, &headers, &org).await?;
     let store = store(&st)?;
+    if !st.plugin_policy.enabled {
+        return Err(ApiError::Conflict(
+            "plugins are off on this Scarab (SCARAB_PLUGINS=off); an upgraded installation \
+             could never run"
+                .into(),
+        ));
+    }
     check_image(&body.image, st.plugin_policy.dev_allow_tag)?;
     let current = store
         .installation(&org, &name)
@@ -1542,11 +1564,11 @@ pub(crate) async fn upgrade_plugin(
     manifest
         .check_image(&body.image)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    let (_, widenings) = upgrade_widenings(&current, &manifest, Some(&body.image));
-    if widenings.is_empty() {
-        guard.exempt("a same-or-narrower manifest with an image of the same repository");
+    let (_, reasons) = upgrade_step_up_reasons(&current, &manifest, Some(&body.image));
+    if reasons.is_empty() {
+        guard.exempt("a same-or-narrower manifest on the installed image");
     } else {
-        guard.require(&st, widenings).await?;
+        guard.require(&st, reasons).await?;
     }
     let now = st.clock.now().await.0;
     let upgraded = store

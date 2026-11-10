@@ -35,6 +35,7 @@ import {
   upgradeDiffCounts,
   upgradeDiffView,
   upgradeStepUpLine,
+  imageChangesTheAnswer,
 } from "./plugins";
 
 const REPO = "ghcr.io/acme/scarab-plugin-argocd";
@@ -485,7 +486,15 @@ describe("the upgrade dialog", () => {
     expect(upgradeDiffCounts(groups)).toEqual({ added: 1, removed: 1, unchanged: 3 });
   });
   it("says whether a passkey is needed from the server's answer", () => {
-    expect(upgradeStepUpLine({ needs_step_up: true })).toMatch(/passkey/);
-    expect(upgradeStepUpLine({ needs_step_up: false })).toMatch(/no passkey/);
+    expect(upgradeStepUpLine({ needs_step_up: true })).toMatch(/confirm with your passkey/);
+    expect(upgradeStepUpLine({ needs_step_up: false })).toMatch(/keeps the installed image .* no passkey/);
+  });
+  it("drops the server's answer only for another well-formed image", () => {
+    const judged = `ghcr.io/acme/argocd@sha256:${"a".repeat(64)}`;
+    // A new digest of the same repository changes the answer: new code.
+    expect(imageChangesTheAnswer(`ghcr.io/acme/argocd@sha256:${"b".repeat(64)}`, judged)).toBe(true);
+    expect(imageChangesTheAnswer(` ${judged} `, judged)).toBe(false);
+    expect(imageChangesTheAnswer("ghcr.io/acme/argocd@sha256:bb", judged)).toBe(false);
+    expect(imageChangesTheAnswer("", judged)).toBe(false);
   });
 });

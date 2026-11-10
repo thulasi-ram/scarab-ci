@@ -1325,12 +1325,13 @@ pub static PLUGIN_UPGRADE: Op = op(
     "Upgrade a plugin",
     Class::Conditional {
         mode: A,
-        rule: "the new manifest asks for a capability, connection slot, auth scheme, read rule \
-               or gate the installed one did not, stops naming its image or names another, or \
-               the image moves to another repository; a same-or-narrower upgrade is exempt",
+        rule: "the image is not the installed one (a new digest is new code), or the new \
+               manifest asks for a capability, connection slot, auth scheme, read rule or gate \
+               the installed one did not, or stops naming its image or names another; a \
+               same-or-narrower manifest on the installed image is exempt",
     },
-    "§3 plugin upgrade (ADR-0072 §10: same-or-narrower is one admin's click, wider is \
-     governed like an install)",
+    "§3 plugin upgrade (ADR-0072 §8, §10: a new digest is new code; only a narrowing on the \
+     same digest is exempt)",
     ADMIN,
     OrgOf::Path("org"),
     &[],

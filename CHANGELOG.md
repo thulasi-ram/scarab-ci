@@ -103,8 +103,10 @@ release.yml uses that version's section as the GitHub Release text. See
 - **Upgrade a plugin in place.** An installation's page has Upgrade: give a new commit (the
   recorded source's file at it) or another source, and a new image digest. Scarab shows what the
   new manifest adds, removes and keeps, then applies it to the same installation, keeping its
-  config, storage and connections. An upgrade that asks for nothing new needs no passkey; one that
-  asks for more is confirmed like an install. The server decides which
+  config, storage and connections. A new image digest is new code, so an upgrade to one asks for
+  your passkey, as an install does; so does a manifest that asks for more. Only a narrower
+  manifest on the installed image needs no passkey. The server decides which, and refuses an
+  upgrade while plugins are off
   (`POST /v1/orgs/{org}/plugins/{name}/upgrade-fetch`, then `…/upgrade`). Each installation now
   records where its manifest was read.
   ([Upgrade a plugin](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#upgrade-a-plugin))
@@ -149,6 +151,11 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ### Enhancement
 
+- **Connections that serve no organization wait on New organization.** A global admin finds
+  them under **Waiting for an organization** on `/orgs/_new`, with their forge, installation id,
+  credential health and last delivery, and assigns each to an organization, creates a new
+  organization from it, or removes it. An org's Connections lists only that org's connections.
+  The org dropdown and the command palette count them: **New organization… (1 waiting)**.
 - **Repository roles moved to the repository.** Organization settings › Members shows each
   person's org role only, grants and revokes org roles, and links the repositories a person also
   holds a role in. A repository's Settings tab has an **Access** panel: who holds a role on it,

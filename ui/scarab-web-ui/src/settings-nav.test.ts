@@ -12,6 +12,7 @@ import {
   legacyRedirect,
   libraryReviewHref,
   navGroup,
+  newOrgEntryLabel,
   decodeParam,
   orgChoices,
   orgHref,
@@ -202,6 +203,15 @@ describe("New organization", () => {
     expect(paletteEntries(freshGlobal).map((e) => e.href)).toContain(NEW_ORG_HREF);
     expect(paletteEntries(globalWithOrg).map((e) => e.href)).toContain(NEW_ORG_HREF);
     expect(paletteEntries(admin).map((e) => e.href)).not.toContain(NEW_ORG_HREF);
+  });
+
+  it("counts the connections waiting for an org, in the dropdown and the palette", () => {
+    expect(newOrgEntryLabel(0, true)).toBe("New organization…");
+    expect(newOrgEntryLabel(1, true)).toBe("New organization… (1 waiting)");
+    expect(newOrgEntryLabel(3, false)).toBe("New organization (3 waiting)");
+    const entry = (n: number) => paletteEntries(globalWithOrg, n).find((e) => e.href === NEW_ORG_HREF)!;
+    expect(entry(0).label).toBe("New organization");
+    expect(entry(2).label).toBe("New organization (2 waiting)");
   });
 
   it("is not a section, and no sidebar marks a section on it", () => {

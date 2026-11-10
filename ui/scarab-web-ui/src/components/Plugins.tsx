@@ -142,8 +142,9 @@ export default function Plugins(props: { org: string }) {
             <p class="subtle">
               <small>
                 <Icon icon="shield-check" size={12} /> An installation approves one image digest
-                and exactly what its manifest asks for. An upgrade that asks for nothing new is one
-                click; one that asks for more is confirmed like an install. A plugin acts
+                and exactly what its manifest asks for. An upgrade to a new digest is new code and is
+                confirmed like an install; only narrowing the manifest on the installed digest is one
+                click. A plugin acts
                 as <span class="mono">plugin:&lt;name&gt;</span>, never as a person. Installing asks
                 you to confirm with your passkey.
               </small>

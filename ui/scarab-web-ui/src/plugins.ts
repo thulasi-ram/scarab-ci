@@ -262,9 +262,10 @@ export function sourceLabel(p: { source?: string | null }): string {
 // ── Upgrade ──────────────────────────────────────────────────────────────
 // An upgrade reads a new manifest (by default the recorded source's file at
 // a new commit), shows what it adds, removes and keeps against the installed
-// one, and applies it with a new image. The server decides whether it needs
-// a passkey: when it adds anything, or moves the image to another
-// repository.
+// one, and applies it with an image. The server decides whether it needs a
+// passkey: a new image digest is new code and always does, and so does a
+// manifest that asks for more. Only a narrower manifest on the installed
+// image needs none.
 
 const FULL_COMMIT = /^([0-9a-f]{40}|[0-9a-f]{64})$/;
 
@@ -405,8 +406,16 @@ export function upgradeDiffCounts(groups: readonly DiffGroupView[]): {
 /** The dialog's line on confirmation, from the server's answer. */
 export function upgradeStepUpLine(fetched: { needs_step_up: boolean }): string {
   return fetched.needs_step_up
-    ? "This upgrade asks for more than the installed version, so it asks you to confirm with your passkey."
-    : "This upgrade asks for nothing new, so it needs no passkey.";
+    ? "This upgrade asks you to confirm with your passkey, as an install does:"
+    : "This upgrade keeps the installed image and asks for nothing new, so it needs no passkey.";
+}
+
+/** Whether a changed image field makes the server's answer stale: a full,
+ *  well-formed image other than the one the answer was judged with. A
+ *  half-typed value changes nothing yet. */
+export function imageChangesTheAnswer(image: string, judgedWith: string): boolean {
+  const i = image.trim();
+  return i !== "" && imageError(i) === null && i !== judgedWith;
 }
 
 /** A name for a new installation: the plugin's own name, or `<plugin>-2`,

@@ -129,3 +129,68 @@ export function connectionChips(c: ConnectionSummaryLike): Chip[] {
 export function enabledReposLabel(n: number): string {
   return `${n} enabled ${n === 1 ? "repository" : "repositories"}`;
 }
+
+/** What the waiting panel reads from a connection. */
+export interface WaitingLike {
+  id: string;
+  kind: string;
+  web_url: string;
+  enabled_repos: number;
+}
+
+/**
+ * The GitHub App installation id of a connection the installation webhook
+ * registered (`github-install-<id>`), or null for any other connection.
+ */
+export function installationId(c: { id: string; kind: string }): string | null {
+  if (c.kind !== "github") return null;
+  const m = /^github-install-(\d+)$/.exec(c.id);
+  return m ? m[1]! : null;
+}
+
+/** One line of a waiting connection's facts: a label and its value. */
+export interface WaitingFact {
+  label: string;
+  value: string;
+}
+
+/**
+ * The facts the New organization page lists for a connection that serves no
+ * org: its forge and host, its installation id (GitHub), and how many
+ * repositories are enabled through it. The connection list does not carry
+ * the installation's account login or account id (git-bug bb8d644), so the
+ * account is not named.
+ */
+export function waitingFacts(c: WaitingLike): WaitingFact[] {
+  const out: WaitingFact[] = [
+    { label: "forge", value: `${forgeName(c.kind)} · ${c.web_url.replace(/^https?:\/\//, "")}` },
+  ];
+  const install = installationId(c);
+  if (install != null) out.push({ label: "installation", value: install });
+  const n = c.enabled_repos;
+  out.push({
+    label: "repositories",
+    value: n === 0 ? "none enabled" : `${n} enabled`,
+  });
+  return out;
+}
+
+/**
+ * Why `name` cannot name a new org made from a waiting connection, or null
+ * when it can: `orgNameProblem`, and a name that is already an org's (that
+ * is an assignment, which the other action makes).
+ */
+export function newOrgNameProblem(name: string, orgs: readonly string[]): string | null {
+  const problem = orgNameProblem(name);
+  if (problem != null) return problem;
+  const n = name.trim();
+  return orgs.includes(n) ? `${n} is already an organization. Use Assign to an organization.` : null;
+}
+
+/** The first line of the New organization page's waiting panel, for `n`
+ *  connections. */
+export function waitingIntro(n: number): string {
+  return n === 1
+    ? "Scarab could not prove this account owns an organization of the same name, so it serves none until you choose."
+    : "Scarab could not prove these accounts own organizations of the same names, so they serve none until you choose.";
+}
