@@ -289,6 +289,14 @@ release.yml uses that version's section as the GitHub Release text. See
   server's own database, a Pod of a Run that has not finished, and a running debug Pod are
   left alone. The chart's executor Role gains `list` on Services and NetworkPolicies
   (git-bug 986542a).
+- **A step that fails before it starts no longer leaves a Pod that holds CPU.** When a step
+  failed before its process ran (Unschedulable, a configuration error, missing inputs), its
+  Pod was kept and its Secrets were deleted. A Pod that was Pending was later placed on a
+  node, could not mount its Secrets, and held its CPU and memory request in Init. On the
+  demo's two-core node, two such Pods made every later step Unschedulable, and every Run
+  dead-lettered for nine hours. The engine now deletes the Pod when the step fails this way,
+  as it already did when a step did not start within the provisioning deadline. A Pod whose
+  step did run is kept, as before.
 - After linking an account that merged another one in, the redirect no longer names the merged
   account in its URL; it says `merged=1`, and the page says another account was merged.
 - The sign-in screen showed both logos in the light theme.

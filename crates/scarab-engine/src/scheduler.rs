@@ -3963,6 +3963,24 @@ impl<'a> Scheduler<'a> {
                         self.record_workspace_collisions(&run, &step, &attempt, &handle)
                             .await;
                     }
+                    // The process never ran: tear the unit down, as the
+                    // provisioning deadline below does. Nothing in it is
+                    // evidence, and the attempt's Secrets go with the
+                    // credential this poll took back, so a kept unit can
+                    // never start. A Pending Pod is still in the scheduler's
+                    // queue, though: once a node frees up it is placed, sits
+                    // in Init and holds its CPU and memory request until the
+                    // Run's Pod sweep, which on a small node makes every
+                    // later step Unschedulable (the demo box, 2026-11-10).
+                    if matches!(
+                        class,
+                        FailureClass::Infra {
+                            never_started: true
+                        } | FailureClass::Config
+                            | FailureClass::MissingInputs
+                    ) {
+                        let _ = self.executor.cancel(&handle).await;
+                    }
                     // The adapter classified the failure (ADR-0047); the engine
                     // consumes the class verbatim and applies retry policy.
                     let kind = match class {
