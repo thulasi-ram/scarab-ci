@@ -1810,8 +1810,11 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 .rr-fact svg { color: var(--muted-sage); flex: none; }
 .rr-fact.live { color: var(--running-ink); }
 
-/* ---- schedules (repo page, above the runs list) ---- */
-.sched-body { padding: 12px 16px; display: flex; flex-direction: column; gap: 10px; }
+/* ---- schedules (the repo page's Schedules tab) ---- */
+/* The pipeline names the row, so it takes the primary ink though it is Mono.
+   Rows do not open anything; the last run and Runs cells are the links. */
+.sched-table tbody tr { cursor: default; }
+.sched-table td:first-child .mono { color: var(--soft-white); }
 
 /* ---- environments ---- */
 /* The repo's Environments tab: one table, a row per Environment; a row

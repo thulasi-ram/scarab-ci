@@ -1,9 +1,9 @@
 // Repo dashboard (tier 2) — tabs over one repository: Runs (default),
-// Environments, Secrets, Settings. Each run row shows its origin as a grid of
+// Schedules, Environments, Secrets, Settings. Each run row shows its origin as a grid of
 // facts (author · ref · duration) under a header line (sha · status · trigger ·
 // when), fed by the origin fields RunSummaryDto now carries. Duration ticks live
 // for in-flight runs. The runs list filters by status, author, branch, PR,
-// pipeline, environment and deploys — environment and deploys on the server
+// pipeline, environment, deploys and scheduled — environment and deploys on the server
 // (it is how a Project's older deploys are found), the rest over
 // the loaded page. The header CTA is contextual to the active tab.
 //
@@ -62,14 +62,15 @@ import AsciiScene from "../components/AsciiScene";
 import { mergeRefused, runEnvironmentOptions, runListFilter } from "../runs-filter";
 import { environmentLabel, nameBeside, shownName } from "../org-environments";
 import { refusalSummary } from "../compile-errors";
-import { fireOutcome, pipelineShortName } from "../schedules";
+import { fireOutcome, isScheduled, pipelineShortName, scheduledRunsHref } from "../schedules";
 import ponderIdle from "../../../brand/ascii/generated/ponder-ponder.json";
 
-type Tab = "runs" | "environments" | "secrets" | "settings";
+type Tab = "runs" | "schedules" | "environments" | "secrets" | "settings";
 type StatusFilter = "all" | "running" | "failed" | "refused";
 
 const TABS: [Tab, string][] = [
   ["runs", "Runs"],
+  ["schedules", "Schedules"],
   ["environments", "Environments"],
   ["secrets", "Secrets"],
   ["settings", "Settings"],
@@ -192,6 +193,11 @@ export default function RepoView() {
   const secretEnv = () => one(search.secret_env);
   const setSecretEnv = filterSetter("secret_env");
   const setDeploysOnly = (on: boolean) => filterSetter("deploy")(on ? "1" : "");
+  // Scheduled toggle (`?scheduled=1`): only Runs a schedule started (trigger
+  // kind `cron`). Client-side, like the pipeline; a schedule on the Schedules
+  // tab links here with its pipeline.
+  const scheduledOnly = () => one(search.scheduled) === "1";
+  const setScheduledOnly = (on: boolean) => filterSetter("scheduled")(on ? "1" : "");
 
   // Only this repo's tenanted runs, straight from the per-repo endpoint.
   // The Environment and Deploys filters are part of the request,
@@ -207,12 +213,6 @@ export default function RepoView() {
   const [refused, { refetch: refetchRefused }] = createResource(
     () => ({ org: org(), repo: repo() }),
     (k) => listRefusedRuns(k.org, k.repo).catch(() => [] as RefusedRun[]),
-  );
-  // The Project's `on: cron:` schedules; an older server has none, and a repo
-  // without one shows no Schedules panel.
-  const [schedules, { refetch: refetchSchedules }] = createResource(
-    () => ({ org: org(), repo: repo() }),
-    (k) => listSchedules(k.org, k.repo).catch(() => [] as Schedule[]),
   );
   // The Project's Environments, for the Environment picker's options — the
   // loaded rows are already one Environment's once the filter is on. A caller
@@ -258,11 +258,12 @@ export default function RepoView() {
     !!prFilter() ||
     !!pipelineFilter() ||
     !!envFilter() ||
-    deploysOnly();
+    deploysOnly() ||
+    scheduledOnly();
 
   const clearFilters = () =>
     setSearch(
-      { status: "", author: "", branch: "", pr: "", pipeline: "", env: "", deploy: "" },
+      { status: "", author: "", branch: "", pr: "", pipeline: "", env: "", deploy: "", scheduled: "" },
       { replace: true },
     );
 
@@ -287,6 +288,7 @@ export default function RepoView() {
       // the previous filter never shows under the new one.
       if (env && r.environment !== env) return false;
       if (deploysOnly() && !r.deploy) return false;
+      if (scheduledOnly() && !isScheduled(r.trigger_kind)) return false;
       return true;
     });
   };
@@ -297,6 +299,7 @@ export default function RepoView() {
       status: statusFilter(),
       author: authorFilter(),
       pipeline: pipelineFilter(),
+      scheduled: scheduledOnly(),
       runOnly: !!branchFilter() || !!prFilter() || !!envFilter() || deploysOnly(),
     });
 
@@ -366,20 +369,6 @@ export default function RepoView() {
 
       {/* ---- Runs ---- */}
       <Show when={tab() === "runs"}>
-        <Show when={(schedules() ?? []).length > 0}>
-          <div class="panel">
-            <div class="panel-h">
-              <span>Schedules</span>
-              <span class="tok-count">{schedules()!.length}</span>
-            </div>
-            <div class="sched-body">
-              <For each={schedules()}>
-                {(s) => <ScheduleRow org={org()} repo={repo()} s={s} />}
-              </For>
-            </div>
-          </div>
-        </Show>
-
         <div class="filters">
           <For each={["all", "running", "failed", "refused"] as const}>
             {(f) => (
@@ -398,6 +387,14 @@ export default function RepoView() {
             onClick={() => setDeploysOnly(!deploysOnly())}
           >
             <Icon icon="rocket" size={12} /> deploys
+          </button>
+
+          <button
+            class={`fpill ${scheduledOnly() ? "on" : ""}`}
+            title="only runs a schedule started: a pipeline's `on: cron:`"
+            onClick={() => setScheduledOnly(!scheduledOnly())}
+          >
+            <Icon icon="clock" size={12} /> scheduled
           </button>
 
           <Show when={pipelines().length > 0}>
@@ -472,7 +469,6 @@ export default function RepoView() {
             onClick={() => {
               refetch();
               refetchRefused();
-              refetchSchedules();
             }}
           >
             <Icon icon="rotate-cw" size={13} /> Refresh
@@ -631,6 +627,11 @@ export default function RepoView() {
             </Show>
           </Show>
         </Show>
+      </Show>
+
+      {/* ---- Schedules ---- */}
+      <Show when={tab() === "schedules"}>
+        <RepoSchedules org={org()} repo={repo()} />
       </Show>
 
       {/* ---- Environments ---- */}
@@ -1066,54 +1067,110 @@ function EnvDialog(props: {
   );
 }
 
-/** One `on: cron:` schedule: its pipeline, the expression (UTC), the next
- *  slot, and how the Pipeline's last slot came out, linked to its Run. */
+// ---- schedules (the Project's `on: cron:` triggers) -----------------------
+// One table, a row per schedule: the pipeline, its expression (UTC, as read
+// from the default branch), the next slot, how the last slot came out, and a
+// link to the Runs tab showing that pipeline's scheduled Runs.
+
+function RepoSchedules(props: { org: string; repo: string }) {
+  // An older server has no schedules endpoint; it reads as none.
+  const [schedules] = createResource(
+    () => ({ org: props.org, repo: props.repo }),
+    (k) => listSchedules(k.org, k.repo).catch(() => [] as Schedule[]),
+  );
+  const rows = () => schedules() ?? [];
+  return (
+    <Show when={!schedules.loading} fallback={<p class="empty">loading…</p>}>
+      <Show
+        when={rows().length > 0}
+        fallback={
+          <p class="empty">
+            No schedules. Add <span class="mono">on: cron:</span> to a pipeline on the default
+            branch and its schedule shows here.
+          </p>
+        }
+      >
+        <div class="panel">
+          <div class="panel-h">
+            <span>
+              Schedules <span class="tok-count">{rows().length}</span>
+            </span>
+          </div>
+          <div class="secrets-body">
+            <div class="table-scroll">
+              <table class="table lib-table sched-table" aria-label="Schedules">
+                <thead>
+                  <tr>
+                    <th>Pipeline</th>
+                    <th>Schedule</th>
+                    <th>Next</th>
+                    <th>Last run</th>
+                    <th>Outcome</th>
+                    <th />
+                  </tr>
+                </thead>
+                <tbody>
+                  <For each={rows()}>
+                    {(s) => <ScheduleRow org={props.org} repo={props.repo} s={s} />}
+                  </For>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </Show>
+    </Show>
+  );
+}
+
+/** One `on: cron:` schedule as a table row. */
 function ScheduleRow(props: { org: string; repo: string; s: Schedule }) {
   const s = () => props.s;
   return (
-    <div class="rr-facts">
-      <span class="pfact strong" title={s().pipeline}>
-        <Icon icon="workflow" size={12} />
+    <tr>
+      <td title={s().pipeline}>
         <span class="mono">{pipelineShortName(s().pipeline)}</span>
-      </span>
-      <span class="pfact" title={`read from ${s().source_sha.slice(0, 7)} on the default branch`}>
-        <Icon icon="clock" size={12} />
-        <span class="mono">{s().schedule}</span>
-        <span>UTC</span>
-      </span>
-      <span class="pfact" title={absTime(s().next_fire_at)}>
-        <Icon icon="timer" size={12} />
-        <span>next {untilTime(s().next_fire_at)}</span>
-      </span>
-      <Show
-        when={s().last_fire}
-        fallback={<span class="pfact subtle">not fired yet</span>}
-      >
-        {(f) => {
-          const o = () => fireOutcome(f().outcome);
-          return (
-            <>
-              <span class="pfact" title={absTime(f().slot_at)}>
-                <Icon icon="history" size={12} />
-                <span>last {relTime(f().slot_at)}</span>
-                <Show when={f().schedule !== s().schedule}>
-                  <span class="mono" title="the schedule that fired">({f().schedule})</span>
-                </Show>
+      </td>
+      <td class="nowrap" title={`read from ${s().source_sha.slice(0, 7)} on the default branch`}>
+        <span class="mono">{s().schedule}</span> UTC
+      </td>
+      <td class="nowrap" title={absTime(s().next_fire_at)}>
+        {untilTime(s().next_fire_at)}
+      </td>
+      <Show when={s().last_fire} fallback={<td class="subtle">not fired yet</td>}>
+        {(f) => (
+          <td class="nowrap" title={absTime(f().slot_at)}>
+            <Show when={f().run_id} fallback={relTime(f().slot_at)}>
+              {(id) => (
+                <A class="oenv-link" href={`/${props.org}/${props.repo}/runs/${id()}`}>
+                  {relTime(f().slot_at)}
+                </A>
+              )}
+            </Show>
+            <Show when={f().schedule !== s().schedule}>
+              {" "}
+              <span class="mono" title="the schedule that fired">
+                {f().schedule}
               </span>
-              <span class={`rr-status ${o().tone}`}>{o().label}</span>
-              <Show when={f().run_id}>
-                {(id) => (
-                  <A class="pfact link" href={`/${props.org}/${props.repo}/runs/${id()}`}>
-                    <Icon icon="play" size={12} />
-                    <span>open the run</span>
-                  </A>
-                )}
-              </Show>
-            </>
-          );
-        }}
+            </Show>
+          </td>
+        )}
       </Show>
-    </div>
+      <td class="nowrap">
+        <Show when={s().last_fire}>
+          {(f) => <span class={`rr-status ${fireOutcome(f().outcome).tone}`}>{fireOutcome(f().outcome).label}</span>}
+        </Show>
+      </td>
+      <td class="acts keep">
+        <A
+          class="btn btn-ghost btn-sm"
+          href={scheduledRunsHref(props.org, props.repo, s().pipeline)}
+          title={`the scheduled runs of ${pipelineShortName(s().pipeline)}`}
+        >
+          Runs
+        </A>
+      </td>
+    </tr>
   );
 }
 

@@ -1514,6 +1514,7 @@ test("on a phone no page scrolls sideways, and the top bar keeps every link", as
     ["/orgs/acme", "acme"],
     ["/acme/orders-api", "orders-api"],
     ["/acme/orders-api?tab=settings", "orders-api"],
+    ["/acme/scarab?tab=schedules", "scarab"],
     ["/acme/orders-api/runs/0190f8a2000071fb8c00a0760421aaaa", "#421"],
     ["/orgs/acme/settings/libraries", "Libraries"],
     ["/orgs/acme/settings/plugins", "Plugins"],
@@ -1570,5 +1571,48 @@ test("an admin disables an unreachable repository from its Settings tab", async 
   const row = page.locator(".org-repo-row", { hasText: "messaging" });
   await expect(row).toContainText("Not enabled");
   await expect(row.getByRole("button", { name: "Enable" })).toBeVisible();
+  expect(errors).toEqual([]);
+});
+
+// A repository's `on: cron:` schedules have a tab of their own, not a panel
+// above the runs; a schedule's Runs link opens the Runs tab on the scheduled
+// runs of its pipeline.
+test("the Schedules tab lists the schedules and links to their scheduled runs", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/acme/scarab");
+  const view = page.locator("section.page");
+  await expect(view.locator(".runrow").first()).toBeVisible();
+  await expect(view.locator(".panel-h", { hasText: "Schedules" })).toHaveCount(0);
+
+  await view.locator(".tabs").getByRole("button", { name: "Schedules" }).click();
+  await expect(page).toHaveURL(/\/acme\/scarab\?tab=schedules$/);
+  const rows = view.getByRole("table", { name: "Schedules" }).locator("tbody tr");
+  await expect(rows).toHaveCount(3);
+  const nightly = rows.filter({ hasText: "nightly" });
+  await expect(nightly.getByRole("cell").nth(1)).toHaveText("0 2 * * * UTC");
+  await expect(nightly.getByRole("cell").nth(3).getByRole("link")).toHaveAttribute(
+    "href",
+    "/acme/scarab/runs/0190f8a2000071fb8c0011223344aabb",
+  );
+  await expect(nightly.getByRole("cell").nth(4)).toHaveText("ran");
+  await expect(rows.filter({ hasText: "audit" }).getByRole("cell").nth(4)).toHaveText("missed");
+  await expect(rows.filter({ hasText: "docs" }).getByRole("cell").nth(3)).toHaveText("not fired yet");
+
+  await nightly.getByRole("link", { name: "Runs" }).click();
+  await expect(page).toHaveURL(/\/acme\/scarab\?scheduled=1&pipeline=nightly$/);
+  await expect(view.locator(".tabs .tab.on")).toHaveText("Runs");
+  await expect(view.locator(".filters").getByRole("button", { name: "scheduled" })).toHaveClass(/\bon\b/);
+  const runs = view.locator(".runrow");
+  await expect(runs).toHaveCount(2);
+  for (const run of await runs.all()) {
+    await expect(run.locator(".rr-facts")).toContainText("nightly");
+    await expect(run.locator(".rr-head")).toContainText("0 2 * * *");
+  }
+
+  // Without the pipeline, the filter keeps only scheduled runs too.
+  await view.locator(".filters").getByRole("button", { name: "clear" }).click();
+  await expect(runs).toHaveCount(14);
+  await view.locator(".filters").getByRole("button", { name: "scheduled" }).click();
+  await expect(runs).toHaveCount(2);
   expect(errors).toEqual([]);
 });
