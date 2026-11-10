@@ -1795,7 +1795,7 @@ async fn an_unrecorded_authorisation_runs_nothing() {
 }
 
 // ---------------------------------------------------------------------------
-// The Event log page: cursor paging and filters
+// The org event log (in Settings > Security): cursor paging and filters
 // ---------------------------------------------------------------------------
 
 /// A seeded event: `at` in ms, an id that names it.
