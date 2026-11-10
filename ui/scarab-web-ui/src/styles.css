@@ -1855,7 +1855,8 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 }
 .envt-sentence { margin: 0 0 10px; color: var(--soft-white); line-height: 1.5; }
 .envt-note { margin: 0 0 10px; color: var(--warn); }
-.envt-layers { border-collapse: collapse; margin-bottom: 12px; }
+.envt-layers { width: 100%; border-collapse: collapse; margin-bottom: 12px; }
+.envt-layers th[scope="row"] { width: 1%; }
 .envt-layers th, .envt-layers td {
   text-align: left; padding: 5px 24px 5px 0; white-space: nowrap; font: var(--t-body);
   border-bottom: 1px solid var(--border-soft);
@@ -1912,17 +1913,25 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
   padding: 0 6px; border: 1px solid var(--border); border-radius: var(--radius-sm);
 }
 .skey-sum { flex: 1 1 16em; min-width: 0; color: var(--muted-sage); }
+/* An open key's scope lines share one grid, so the scope, its state and the
+   first action button line up from row to row: glyph | scope | state |
+   actions. The fold line's text spans the first three columns. */
 .skey-lines {
   list-style: none; margin: 0; padding: 0 12px 10px 36px;
-  display: flex; flex-direction: column; gap: 2px;
+  display: grid; grid-template-columns: 1em max-content minmax(0, 1fr) max-content;
+  column-gap: 10px; row-gap: 2px;
 }
+.skey-lines > li { grid-column: 1 / -1; }
 .skey-line {
-  display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px;
+  display: grid; grid-template-columns: subgrid; align-items: center;
   padding: 3px 0; color: var(--sage);
 }
+.skey-fold > .skey-state { grid-column: 1 / 4; }
 .skey-scope { min-width: 10em; color: var(--soft-white); overflow-wrap: anywhere; }
-.skey-state { color: var(--muted-sage); }
-.skey-acts { margin-left: auto; display: inline-flex; flex-wrap: wrap; gap: 6px; }
+.skey-state { color: var(--muted-sage); min-width: 0; }
+.skey-acts { display: inline-flex; flex-wrap: wrap; gap: 6px; }
+/* "set" and "edit" take the same width, so the second button lines up too. */
+.skey-acts > .btn:first-child { min-width: 4.5em; justify-content: center; }
 .skey-g { display: inline-block; width: 1em; text-align: center; }
 .skey-g-set { color: var(--ok); }
 .skey-g-inherited { color: var(--copper); }
@@ -1931,8 +1940,10 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 .skey-g-silenced { color: var(--muted-sage); opacity: 0.55; }
 .skey-legend b { font: var(--t-body); }
 @media (max-width: 560px) {
-  .skey-lines { padding-left: 12px; }
+  .skey-lines { padding-left: 12px; display: flex; flex-direction: column; }
+  .skey-line { display: flex; flex-wrap: wrap; gap: 4px 10px; }
   .skey-scope { min-width: 0; }
+  .skey-acts { margin-left: auto; }
 }
 
 /* Forge connections. One block per connection: identity line with its
