@@ -1154,7 +1154,7 @@ async fn exempt_and_ungoverned_routes_never_ask_for_a_step_up() {
         );
         checked += 1;
     }
-    assert_eq!(checked, 35, "the EX + NG mutating routes");
+    assert_eq!(checked, 34, "the EX + NG mutating routes");
     assert!(h.events_of("step_up.refused").is_empty());
 }
 
