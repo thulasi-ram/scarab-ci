@@ -158,7 +158,8 @@ Anyone who can read the org sees the same list without the buttons. The list com
 `GET /v1/orgs/{org}/repos?page=&per_page=&q=`, which asks each connection's forge on every
 request; a connection the forge would not answer for is named in `unlisted`, and its enabled
 repositories are still listed. **Settings › Connections** offers the same per connection, as
-**Add repository** and **Remove**.
+**Add repository** and **Remove**. An enabled repository's **Settings** tab has the same
+**Disable** for org admins, and goes to the org page once it is done.
 
 Events of a repository that is not enabled (a push to a repository the App covers, for example)
 are acknowledged with `200 {"ignored": "repository not enabled"}` and start nothing, so the forge
@@ -176,7 +177,7 @@ is unreachable, its events are ignored like those of a repository that is not en
 run answers 409, and any other forge call for it (a status post, a clone) fails with an error that
 names the reason. The mark clears when GitHub covers the repository again (an
 `installation_repositories` delivery that adds it, or an `unsuspend`), or when a re-sync lists it.
-To remove the project, disable the repository.
+To remove the project, disable the repository, on the org page or on its Settings tab.
 
 ### Connections without an org
 

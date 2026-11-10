@@ -4149,3 +4149,6 @@ a.head-org:hover { color: var(--emerald); text-decoration: underline; text-under
   font-size: var(--fs-sm); color: var(--warn); margin: 8px 0 0;
 }
 .org-repo-note { flex-basis: 100%; margin: 0; font-size: var(--fs-xs); }
+/* The repository Settings tab: Disable, with the unreachable line beside it. */
+.repo-disable { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin-top: 4px; }
+.repo-disable .repo-unreachable-note { margin: 0; font-size: var(--fs-xs); }

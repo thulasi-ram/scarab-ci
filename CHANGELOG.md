@@ -54,7 +54,9 @@ release.yml uses that version's section as the GitHub Release text. See
   failed runs in the last 24 hours and its runs waiting on a gate, and lists every repository
   the org's connections reach, 25 to a page, each Enabled or Not enabled. Org admins enable a
   repository there, or disable it after typing its name; disabling removes its project, and
-  nothing the forge sends enables it again. The org name in a repository's header links to it.
+  nothing the forge sends enables it again. A repository's Settings tab has the same Disable
+  for org admins, beside the unreachable line when the repository is marked so, and goes to the
+  org page afterwards. The org name in a repository's header links to it.
   The list is `GET /v1/orgs/{org}/repos`.
   ([Enabling repositories](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#enabling-repositories))
 - **Add repository and Remove for GitHub connections** under Organization settings ›
@@ -68,8 +70,8 @@ release.yml uses that version's section as the GitHub Release text. See
   holds a role in. A repository's Settings tab has an **Access** panel: who holds a role on it,
   whether it was granted in Scarab or came from the forge's collaborators, the people its org
   roles reach, grant and revoke at the repository, and **Re-sync collaborators**, which shows
-  who was added, changed and removed. The tab's placeholder rows and its Disable repository
-  button are gone; it shows the repository's forge connection. `GET /v1/orgs/{org}/bindings`
+  who was added, changed and removed. The tab's placeholder rows are gone; it shows the
+  repository's forge connection. `GET /v1/orgs/{org}/bindings`
   now says on each row whether the role was granted in Scarab (`origin: native`) or seeded by
   a forge import (`origin: import`).
 - **A repository's Secrets tab is one key list.** Each key shows where it is set; expand it

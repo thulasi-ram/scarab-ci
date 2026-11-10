@@ -13,11 +13,11 @@
 // rule the bind and unbind endpoints apply.
 import { For, Show, createResource, createSignal, onCleanup } from "solid-js";
 import { A, useParams } from "@solidjs/router";
-import { bindRepo, listOrgRepos, listRuns, unbindRepo, type OrgRepo } from "../api/client";
+import { bindRepo, listOrgRepos, listRuns, type OrgRepo } from "../api/client";
 import { UNREACHABLE_NOTE, clampPage, orgRunStats, pageCount, pageSpan } from "../org-page";
 import { FIRST_ORG_SECTION, decodeParam, orgHref } from "../settings-nav";
 import { me } from "../session";
-import ConfirmDestructive from "../components/ConfirmDestructive";
+import DisableRepository from "../components/DisableRepository";
 import Doodle from "../components/Doodle";
 import Icon from "../components/Icon";
 
@@ -85,12 +85,6 @@ export default function OrgPage() {
     } finally {
       setBusy(null);
     }
-  };
-
-  const disable = async (r: OrgRepo) => {
-    await unbindRepo(r.connection_id, r.owner, r.name);
-    setNote(`Disabled ${r.owner}/${r.name}.`);
-    reload();
   };
 
   return (
@@ -314,21 +308,15 @@ export default function OrgPage() {
 
       <Show when={disabling()}>
         {(r) => (
-          <ConfirmDestructive
-            eyebrow={`${org()} · ${r().connection_id}`}
-            title={`Disable ${r().owner}/${r().name}?`}
-            purpose="Its project is removed, with its environments, secrets and access grants."
-            name={`${r().owner}/${r().project ?? r().name}`}
-            confirmLabel="Disable repository"
-            onConfirm={() => disable(r())}
+          <DisableRepository
+            org={org()}
+            repo={r()}
+            onDisabled={() => {
+              setNote(`Disabled ${r().owner}/${r().name}.`);
+              reload();
+            }}
             onClose={() => setDisabling(null)}
-          >
-            <p>
-              Pushes to it stop starting runs. The repository on the forge is untouched, and no
-              installation event or re-sync enables it again. Enabling it later creates a new
-              project without the old one's settings.
-            </p>
-          </ConfirmDestructive>
+          />
         )}
       </Show>
     </section>

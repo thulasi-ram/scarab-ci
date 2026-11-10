@@ -1,5 +1,11 @@
 // A repository's Settings tab: what the server knows about where the
-// repository lives, then Access, the people who hold a role on it.
+// repository lives, with Disable for those who may unbind it, then Access,
+// the people who hold a role on it.
+//
+// Disable is the org page's: the same row from the org's repository list,
+// the same `can_change` from the server, the same confirmation and unbind
+// call (DisableRepository). Once it is disabled the repository has no page,
+// so the tab goes to the org page.
 //
 // Access lists the repository's own role bindings, each with where it came
 // from (granted in Scarab, or seeded from the forge's collaborators by a
@@ -10,22 +16,26 @@
 // The bindings list and grant/revoke are org-admin actions on the server, so
 // the panel shows them to org admins only; anyone else sees a line saying so.
 import { For, Show, createResource, createSignal } from "solid-js";
-import { A } from "@solidjs/router";
+import { A, useNavigate } from "@solidjs/router";
 import {
   grantRole,
   importFromForge,
   listBindings,
   listConnections,
+  listOrgRepos,
   revokeRole,
   type Binding,
+  type OrgRepo,
 } from "../api/client";
 import { me } from "../session";
 import { administers } from "../settings-nav";
 import { repoAccessRows, resyncDiff, type ResyncChange } from "../identities";
 import { connectionFor, forgeName } from "../connections";
 import { absTime, relTime } from "../fmt";
+import { UNREACHABLE_NOTE, orgPageHref } from "../org-page";
 import Icon from "./Icon";
 import ConfirmDestructive from "./ConfirmDestructive";
+import DisableRepository from "./DisableRepository";
 import Modal, { ModalMessage, ModalSection } from "./Modal";
 import { Select } from "./Field";
 import PrincipalSearch from "./PrincipalSearch";
@@ -40,6 +50,19 @@ export default function RepoSettings(props: { org: string; repo: string; repoUrl
     async (k) => connectionFor(await listConnections(k.org).catch(() => []), k.org, k.repo),
   );
   const forge = () => forgeName(connection()?.kind);
+  // This repository's row in the org's repository list: how the server
+  // unbinds it and whether the caller may. `can_change` needs Administer on
+  // the org, so nobody else asks. The list asks each connection's forge, but
+  // an enabled repository is in it even when its forge does not answer.
+  const [row] = createResource(
+    () => (canAdmin() ? { org: props.org, repo: props.repo } : false),
+    async (k): Promise<OrgRepo | null> => {
+      const page = await listOrgRepos(k.org, { q: k.repo, perPage: 100 }).catch(() => null);
+      return page?.repos.find((r) => r.enabled && r.project === k.repo) ?? null;
+    },
+  );
+  const [disabling, setDisabling] = createSignal(false);
+  const navigate = useNavigate();
 
   return (
     <>
@@ -93,8 +116,32 @@ export default function RepoSettings(props: { org: string; repo: string; repoUrl
               </>
             )}
           </Show>
+          <Show when={row()?.can_change ? row() : null}>
+            {(r) => (
+              <div class="repo-disable">
+                <button class="btn btn-danger btn-sm" type="button" onClick={() => setDisabling(true)}>
+                  Disable repository
+                </button>
+                <Show when={r().unreachable_since != null}>
+                  <span class="repo-unreachable-note">
+                    <Icon icon="alert-triangle" size={12} /> {UNREACHABLE_NOTE}
+                  </span>
+                </Show>
+              </div>
+            )}
+          </Show>
         </div>
       </div>
+      <Show when={disabling() ? row() : null}>
+        {(r) => (
+          <DisableRepository
+            org={props.org}
+            repo={r()}
+            onDisabled={() => navigate(orgPageHref(props.org))}
+            onClose={() => setDisabling(false)}
+          />
+        )}
+      </Show>
 
       <Show
         when={canAdmin()}

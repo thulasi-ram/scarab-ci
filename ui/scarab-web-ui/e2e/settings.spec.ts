@@ -601,7 +601,7 @@ test("a repository's Access lists its roles and the org roles that reach it, and
   const view = page.locator("section.page");
   // The placeholder rows are gone; the connection comes from the server.
   await expect(view.getByText("Default branch")).toHaveCount(0);
-  await expect(view.getByRole("button", { name: "Disable repository" })).toHaveCount(0);
+  await expect(view.getByRole("button", { name: "Disable repository" })).toBeVisible();
   await expect(view.getByRole("link", { name: "gh-acme" })).toBeVisible();
 
   const access = view.locator(".panel", { has: page.locator(".panel-h", { hasText: "Access" }) });
@@ -635,4 +635,35 @@ test("a repository's Access is for org admins", async ({ page }) => {
   const view = page.locator("section.page");
   await expect(view.getByText(/Only an admin of acme can see and change who has access/)).toBeVisible();
   await expect(view.getByRole("button", { name: "Re-sync collaborators" })).toHaveCount(0);
+  await expect(view.getByRole("button", { name: "Disable repository" })).toHaveCount(0);
+});
+
+// The Settings tab's Disable is the org page's: the same typed-name
+// confirmation and unbind, then the repository has no page, so it lands on
+// the org page with the repository not enabled.
+test("an admin disables an unreachable repository from its Settings tab", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/acme/messaging?tab=settings");
+  const repository = page.locator(".panel", {
+    has: page.locator(".panel-h", { hasText: "Repository" }),
+  });
+  await expect(repository.locator(".repo-disable")).toContainText(
+    "The GitHub App no longer covers this repository",
+  );
+  await repository.getByRole("button", { name: "Disable repository" }).click();
+
+  const dialog = page.getByRole("dialog");
+  await expect(dialog.getByRole("heading", { name: "Disable acme/messaging?" })).toBeVisible();
+  await expect(dialog).toContainText("environments, secrets and access grants");
+  const go = dialog.getByRole("button", { name: "Disable repository" });
+  await expect(go).toBeDisabled();
+  await dialog.getByRole("textbox").fill("acme/messaging");
+  await go.click();
+
+  await expect(page).toHaveURL(/\/orgs\/acme$/);
+  await page.getByRole("textbox", { name: "Filter repositories by name" }).fill("messaging");
+  const row = page.locator(".org-repo-row", { hasText: "messaging" });
+  await expect(row).toContainText("Not enabled");
+  await expect(row.getByRole("button", { name: "Enable" })).toBeVisible();
+  expect(errors).toEqual([]);
 });
