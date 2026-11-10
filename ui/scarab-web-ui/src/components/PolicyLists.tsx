@@ -169,13 +169,17 @@ export default function PolicyLists(props: {
         </Show>
       </div>
 
-      <Show when={editing()}>
+      {/* Keyed: the dialog holds the value it opened with. Saving closes it
+          (editing goes to null) and then posts the notice; a non-keyed
+          accessor read during that close throws, and the notice and the
+          refetch never happen. */}
+      <Show when={editing()} keyed>
         {(e) => (
           <ListDialog
             scope={scope()}
             level={level()}
-            record={typeof e() === "string" ? undefined : (e() as ListRecord)}
-            initial={typeof e() === "string" ? newSettingForm(e() as SettingKind) : settingFormOf((e() as ListRecord).body)}
+            record={typeof e === "string" ? undefined : e}
+            initial={typeof e === "string" ? newSettingForm(e) : settingFormOf(e.body)}
             onClose={() => setEditing(null)}
             onSaved={(msg) => {
               setEditing(null);
@@ -184,21 +188,21 @@ export default function PolicyLists(props: {
           />
         )}
       </Show>
-      <Show when={deleting()}>
+      <Show when={deleting()} keyed>
         {(p) => (
           <ConfirmDestructive
             eyebrow={props.project === undefined ? `${props.org} · policies` : `${props.org}/${props.project} · policies`}
-            title={`Delete ${p().name}?`}
+            title={`Delete ${p.name}?`}
             purpose={
-              p().body.mode === "audit"
+              p.body.mode === "audit"
                 ? "It is in audit mode, so nothing it enforces stops."
                 : "Runs it denies are admitted again. Deleting an enforced list asks for a passkey."
             }
-            name={p().name}
+            name={p.name}
             confirmLabel="Delete list"
             onConfirm={async () => {
-              await deletePolicy(scope(), p().id, p().version);
-              done(`${p().name} is deleted; its history stays.`);
+              await deletePolicy(scope(), p.id, p.version);
+              done(`${p.name} is deleted; its history stays.`);
             }}
             onClose={() => setDeleting(null)}
           />
