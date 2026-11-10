@@ -1297,6 +1297,13 @@ pub trait ForgeConnectionStore: Send + Sync {
     /// The repos a connection owns.
     async fn repos_of(&self, connection_id: &str) -> Result<Vec<RepoRef>, RegistryError>;
 
+    /// How many repos a connection owns: [`repos_of`](Self::repos_of)'s
+    /// length, without the list. The connections list shows this count, and
+    /// a connection can hold thousands of repos, so Postgres counts in SQL.
+    async fn repo_count_of(&self, connection_id: &str) -> Result<u64, RegistryError> {
+        Ok(self.repos_of(connection_id).await?.len() as u64)
+    }
+
     /// Resolve a forge coordinate to its owning Project + serving connection —
     /// *which forge, which base URL, which credentials* (ADR-0046). `None` for
     /// an unregistered repo (its webhooks are dropped).

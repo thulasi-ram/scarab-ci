@@ -1026,6 +1026,75 @@ async fn the_org_repos_page_lists_enabled_and_available_repos_to_the_orgs_reader
     }
 }
 
+/// `?connection=` narrows the org's repositories page to one connection:
+/// what is enabled through it and what only it reaches. The enabled count
+/// stays the org's. The Connections page links each connection here.
+#[tokio::test]
+async fn the_org_repos_page_filters_by_connection() {
+    let h = harness(forge()).await;
+    // A second acme connection, with a repo of its own.
+    h.db.put_connection(&conn(
+        "fj-acme",
+        ForgeKind::Forgejo,
+        "https://git.acme.test",
+        Some("acme"),
+        None,
+    ))
+    .await
+    .unwrap();
+    h.db.bind_repo("fj-acme", &repo("acme", "infra"), "acme", "infra")
+        .await
+        .unwrap();
+    let acme = login(&h.app, "acme-code").await;
+
+    let (st, page) = call(
+        &h,
+        "GET",
+        "/v1/orgs/acme/repos?connection=fj-acme",
+        &acme,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{page}");
+    // web is enabled through gh-acme, so it is not fj-acme's even though
+    // fj-acme's forge reaches it.
+    assert_eq!(names(&page), vec!["api", "infra"], "{page}");
+    assert!(page["repos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|r| r["connection_id"] == "fj-acme"));
+    assert_eq!(page["total"], 2);
+    assert_eq!(page["enabled_total"], 2, "the org's, whatever the filter");
+
+    let (_, page) = call(
+        &h,
+        "GET",
+        "/v1/orgs/acme/repos?connection=gh-acme",
+        &acme,
+        None,
+    )
+    .await;
+    assert_eq!(names(&page), vec!["api", "web"], "{page}");
+    assert!(page["repos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|r| r["connection_id"] == "gh-acme"));
+
+    // A connection of another org lists nothing of acme's.
+    let (st, page) = call(
+        &h,
+        "GET",
+        "/v1/orgs/acme/repos?connection=fj-globex",
+        &acme,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{page}");
+    assert_eq!(page["total"], 0, "{page}");
+}
+
 /// Disabling a GitHub repo is permanent: the unbind removes its Project, and
 /// neither a later re-sync nor a later delivery of the installation binds
 /// it again. The repo is listed as available instead.

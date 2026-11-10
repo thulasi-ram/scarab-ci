@@ -656,7 +656,7 @@ export default function RepoView() {
 
       {/* ---- Settings ---- */}
       <Show when={tab() === "settings"}>
-        <RepoSettings org={org()} repo={repo()} repoUrl={repoUrl() ?? null} />
+        <RepoSettings org={org()} repo={repo()} project={project() ?? null} />
       </Show>
 
       <Show when={envDialog() !== undefined}>
