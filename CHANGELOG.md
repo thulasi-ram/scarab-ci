@@ -93,6 +93,11 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ### Enhancement
 
+- **Connections that serve no organization wait on New organization.** A global admin finds
+  them under **Waiting for an organization** on `/orgs/_new`, with their forge, installation id,
+  credential health and last delivery, and assigns each to an organization, creates a new
+  organization from it, or removes it. An org's Connections lists only that org's connections.
+  The org dropdown and the command palette count them: **New organization… (1 waiting)**.
 - **Repository roles moved to the repository.** Organization settings › Members shows each
   person's org role only, grants and revokes org roles, and links the repositories a person also
   holds a role in. A repository's Settings tab has an **Access** panel: who holds a role on it,

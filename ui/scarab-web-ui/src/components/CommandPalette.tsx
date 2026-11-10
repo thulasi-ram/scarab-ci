@@ -8,6 +8,7 @@ import { listProjects, type Project } from "../api/client";
 import { paletteOpen as open, setPaletteOpen as setOpen } from "../palette";
 import { me } from "../session";
 import { paletteEntries, settingsMenu } from "../settings-nav";
+import { waitingCount } from "../waiting-connections";
 import Icon from "./Icon";
 
 type Item =
@@ -46,7 +47,7 @@ export default function CommandPalette() {
     const menu = me() ? settingsMenu(me()!, location.pathname) : [];
     const pages = (
       query
-        ? [...menu, ...(me() ? paletteEntries(me()!) : [])]
+        ? [...menu, ...(me() ? paletteEntries(me()!, waitingCount()) : [])]
             .filter((pg) => `${pg.label} settings ${pg.sub}`.toLowerCase().includes(query))
             .slice(0, 8)
         : menu

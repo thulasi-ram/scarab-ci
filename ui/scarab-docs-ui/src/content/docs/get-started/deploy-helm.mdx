@@ -186,7 +186,10 @@ To remove the project, disable the repository, on the org page or on its Setting
 
 ### Connections without an org
 
-A connection with no org is shown only to global admins, and its repositories keep working.
+A connection with no org is shown only to global admins, under **Waiting for an organization**
+on the New organization page (`/orgs/_new`), and its repositories keep working. An org's
+Connections does not list it. The org dropdown's last entry counts these connections, for
+example **New organization… (1 waiting)**, and so does the command palette.
 After an upgrade from a release before connections had an org, these are the connections whose
 repositories have several owners or none, and **every GitHub App installation connection**: the
 database does not hold an installation's account, and an earlier re-sync could bind another
@@ -197,8 +200,10 @@ they do not (no connection has an account id yet), so a global admin assigns it.
 leaves it unassigned. A re-sync through it binds nothing and lists every repository the forge
 reports in `skipped`, so the UI does not offer Re-sync on it.
 
-A global admin assigns it with **Assign to org** (`PUT /v1/connections/{id}/org` with
-`{ "org": "<name>" }`). It asks for step-up confirmation and is recorded in the org's event log.
+A global admin assigns it there with **Assign to an organization**, or makes a new org from it
+with **Create a new organization from it**. Both call `PUT /v1/connections/{id}/org` with
+`{ "org": "<name>" }`; a name no org has yet creates the org. It asks for step-up confirmation and
+is recorded in the org's event log.
 The server answers 409 with the reason when a repository bound through the connection is owned
 by another account, when the org is served by another forge or host, when the org exists with no
 connection, or when the connection is managed by configuration. Anyone other than a global admin,
@@ -229,7 +234,7 @@ address. The user menu links the pages you may use:
   Connections. The old address `/orgs/<org>/settings/events` opens Security. The org
   dropdown at the top of the sidebar switches org and keeps the section. For a global admin its
   last entry is **New organization…** (`/orgs/_new`), where a new org is created with its first
-  Forgejo connection.
+  Forgejo connection, and where the connections that serve no org wait for one.
 
 Connections is the one place a forge connection is added: **Add Forgejo connection** on an org's
 Connections, or New organization… for an org Scarab does not have yet.
