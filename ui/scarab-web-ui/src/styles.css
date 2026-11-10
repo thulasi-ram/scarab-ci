@@ -1960,17 +1960,8 @@ select.input {
 }
 .preflight-sev.req { color: var(--danger); border-color: var(--danger); }
 
-.conn-projects { display: flex; gap: 7px; flex-wrap: wrap; }
-.conn-proj {
-  padding: 1px 7px; border-radius: 4px;
-  background: var(--emerald-surface); border: 1px solid var(--border-soft);
-  color: var(--sage); text-decoration: none;
-}
-.conn-proj:hover { border-color: var(--emerald); color: var(--emerald); }
-/* A bound repo plus its per-repo actions (webhook / remove) on a connection
-   whose repos Scarab manages — Forgejo. Kept on one line so the chip reads as a
-   single unit rather than three loose controls. */
-.conn-proj-row { display: inline-flex; align-items: center; gap: 5px; }
+/* How many repositories a connection has enabled, and the link to them. */
+.conn-projects { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
 
 /* ════════════════════════════════════════════════════════════════════════
    Dashboard (engineer landing): action inbox · activity · all-clear

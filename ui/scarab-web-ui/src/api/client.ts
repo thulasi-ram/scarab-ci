@@ -1730,7 +1730,6 @@ export async function assignConnectionOrg(id: string, org: string): Promise<void
 // `projects` table: a Project IS a `forge_repos` binding, so these
 // calls are what bring a repo into existence as a governed Project. ---
 
-export type AvailableRepo = components["schemas"]["AvailableRepoDto"];
 export type OrgRepo = components["schemas"]["OrgRepoDto"];
 export type OrgReposPage = components["schemas"]["OrgReposPageDto"];
 
@@ -1742,7 +1741,7 @@ export type OrgReposPage = components["schemas"]["OrgReposPageDto"];
  */
 export async function listOrgRepos(
   org: string,
-  opts: { page?: number; perPage?: number; q?: string } = {},
+  opts: { page?: number; perPage?: number; q?: string; connection?: string } = {},
 ): Promise<OrgReposPage> {
   const { data, error, response } = await api.GET("/v1/orgs/{org}/repos", {
     params: {
@@ -1751,6 +1750,7 @@ export async function listOrgRepos(
         page: opts.page,
         per_page: opts.perPage,
         q: opts.q?.trim() ? opts.q.trim() : undefined,
+        connection: opts.connection || undefined,
       },
     },
   });
@@ -1760,21 +1760,6 @@ export async function listOrgRepos(
   return data;
 }
 export type BindRepoResult = components["schemas"]["BindRepoResultDto"];
-
-/**
- * The repos a connection's credential can reach (`GET …/available-repos`) — the
- * pick-list, so nobody has to type `owner/name`. Returns `null` when the adapter
- * cannot enumerate (501), which is NOT the same as "reaches nothing": the caller
- * falls back to a manual entry field instead of claiming the token is empty.
- */
-export async function availableRepos(id: string): Promise<AvailableRepo[] | null> {
-  const { data, error, response } = await api.GET("/v1/connections/{id}/available-repos", {
-    params: { path: { id } },
-  });
-  if (response.status === 501) return null;
-  if (error || !data) throw new Error("failed to list the connection's repositories");
-  return data;
-}
 
 /**
  * Bind a repo to a connection (`POST …/repos`) — **this creates the Project**,
