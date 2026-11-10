@@ -805,7 +805,14 @@ function EnvRow(props: {
         <td title={wait().title}>{wait().text}</td>
         <td>
           <Show when={chip()} fallback={<span class="envt-quiet">—</span>}>
-            {(c) => <span class="envt-chip" classList={{ warn: c().warn }}>{c().text}</span>}
+            {(c) => (
+              <span class="envt-repo" classList={{ warn: c().warn }}>
+                <Show when={c().warn}>
+                  <Icon icon="alert-triangle" size={13} />
+                </Show>
+                {c().text}
+              </span>
+            )}
           </Show>
         </td>
         <td>
