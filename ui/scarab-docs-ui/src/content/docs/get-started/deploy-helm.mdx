@@ -64,8 +64,8 @@ and has no error anywhere:
 - **Subscribe to events** (App → *Permissions & events → Subscribe to events*): check **Push** and
   **Pull request**. With the list empty, `push`/`pull_request` are never delivered, so nothing ever
   runs. But `installation` and `installation_repositories` still arrive (App-management events are
-  independent of the subscription list), so the connection registers and `GET /v1/repos` looks
-  fine. The symptom: *"the repo is registered but no run ever starts."*
+  independent of the subscription list), so the connection registers and its repositories are
+  listed on the org page. The symptom: *"the repo is enabled but no run ever starts."*
 - **Commit statuses: read & write** (App → *Permissions → Repository*): without `statuses:write`
   every status post is rejected `403 Resource not accessible by integration`. The run itself still
   succeeds, so the only visible effect is a pull request that never shows a Scarab status. Add
@@ -104,9 +104,10 @@ administer (`?org=<org>` narrows it to one).
   the same host with the same account id. A login can be renamed and then registered by another
   account, so a login alone does not join an org. An org exists once anything is kept for it:
   members, an API token, a secret, an Environment, a Policy, a Plugin or a library, as well as a
-  connection or a repository. Otherwise the connection stays unassigned and binds none of the
-  delivery's repositories. Once it serves an org, it mints tokens only from its own
-  installation, and only for repositories that org owns.
+  connection or a repository. Otherwise the connection stays unassigned until a global admin
+  assigns it. Either way the delivery binds no repository: see
+  [Enabling repositories](#enabling-repositories). Once it serves an org, it mints tokens only
+  from its own installation, and only for repositories that org owns.
 - **A connection declared in `scarab.connections`** names its org with `org:`. Without `org:`,
   the org is the one owner of its `repos:`. A repository of another owner, repositories of
   several owners without `org:`, no repositories and no `org:`, or a repository already bound
@@ -134,6 +135,42 @@ administer (`?org=<org>` narrows it to one).
         credential: { secret_ref: github-app }
   ```
 
+### Enabling repositories
+
+A repository becomes a project, with its own runs, Environments and secrets, only when an org
+admin enables it. Installing the GitHub App, adding repositories to the installation, adding a
+Forgejo connection and a re-sync all make repositories *available*; none of them enables one.
+
+The org page, `/orgs/<org>` (click the org name before a repository's name), lists every
+repository the org's connections reach, 25 to a page, each marked **Enabled** or **Not enabled**,
+with a few counts for the org above it: enabled repositories, runs in the last 24 hours, failed
+runs in the last 24 hours, and runs waiting on a gate. An org admin sees:
+
+- **Enable**, which binds the repository through the connection that reaches it
+  (`POST /v1/connections/{id}/repos`). For Forgejo it also registers the repository's webhook.
+  Pushes start runs from then on.
+- **Disable**, which unbinds it (`DELETE /v1/connections/{id}/repos/{owner}/{name}`) after you
+  type `<org>/<repository>` to confirm. The project goes with its Environment overlays, secrets and
+  access grants. Disabling sticks: no later installation event or re-sync enables the repository
+  again. Enabling it again creates a new project without the old one's settings.
+
+Anyone who can read the org sees the same list without the buttons. The list comes from
+`GET /v1/orgs/{org}/repos?page=&per_page=&q=`, which asks each connection's forge on every
+request; a connection the forge would not answer for is named in `unlisted`, and its enabled
+repositories are still listed. **Settings › Connections** offers the same per connection, as
+**Add repository** and **Remove**.
+
+Events of a repository that is not enabled (a push to a repository the App covers, for example)
+are acknowledged with `200 {"ignored": "repository not enabled"}` and start nothing, so the forge
+does not retry them. A **Re-sync** (`POST /v1/connections/{id}/resync`) lists the repositories the
+forge reaches that are not enabled in `available` and binds none of them.
+
+Repositories that an earlier release bound when the App was installed stay enabled after an
+upgrade; nothing is unbound. A repository removed from the App's installation on GitHub is still
+unbound, since the App can no longer reach it.
+
+### Connections without an org
+
 A connection with no org is shown only to global admins, and its repositories keep working.
 After an upgrade from a release before connections had an org, these are the connections whose
 repositories have several owners or none, and **every GitHub App installation connection**: the
@@ -153,7 +190,8 @@ connection, or when the connection is managed by configuration. Anyone other tha
 an API token included, gets 403.
 
 To split a connection whose repositories have several owners, add a connection for each org and
-bind or re-sync the repositories through it. A repository moves only off a connection that does
+enable or re-sync the repositories through it: a re-sync moves the org's projects off a
+connection that does not serve it (`moved`). A repository moves only off a connection that does
 not serve its owner (one with no org, or one of another org); one bound through a connection of
 its own org stays there, even when you bind it through another connection of the same org (409
 on Add repository, `skipped` on re-sync). Unbind it from the connection that holds it first.

@@ -34,6 +34,28 @@ release.yml uses that version's section as the GitHub Release text. See
 - **Server administration is removed from settings.** Account settings and Organization
   settings are separate pages. A global admin creates a new organization from "New
   organization…" in the org dropdown (`/orgs/_new`); `/settings/server/…` redirects there.
+- **Installing the GitHub App no longer enables its repositories.** An `installation` or
+  `installation_repositories` delivery registers the connection and binds nothing; an org
+  admin enables each repository on the new org page. Repositories bound before the upgrade
+  stay enabled. A push to a repository that is not enabled is answered `200` with
+  `{"ignored": "repository not enabled"}` and starts nothing. `POST
+  /v1/connections/{id}/resync` binds nothing either: its response lists the repositories that
+  are not enabled in `available` and the projects it moved off a connection that does not
+  serve their org in `moved`; the `bound` field is gone.
+  ([Enabling repositories](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#enabling-repositories))
+
+### Features
+
+- **An org page at `/orgs/<org>`.** It shows the org's enabled repositories, its runs and
+  failed runs in the last 24 hours and its runs waiting on a gate, and lists every repository
+  the org's connections reach, 25 to a page, each Enabled or Not enabled. Org admins enable a
+  repository there, or disable it after typing its name; disabling removes its project, and
+  nothing the forge sends enables it again. The org name in a repository's header links to it.
+  The list is `GET /v1/orgs/{org}/repos`.
+  ([Enabling repositories](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#enabling-repositories))
+- **Add repository and Remove for GitHub connections** under Organization settings ›
+  Connections, as for Forgejo.
+  ([Enabling repositories](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#enabling-repositories))
 
 ### Enhancement
 
