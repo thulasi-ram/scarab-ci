@@ -192,6 +192,7 @@ const proj = (project: string, mins: number | null) => ({
   name: project,
   owner: "acme",
   repo_url: `https://github.com/acme/${project}`,
+  connection_id: "gh-acme",
   last_run_at: mins == null ? null : ago(mins * 60000),
   unreachable_since: null as number | null,
 });
@@ -1197,19 +1198,13 @@ const connections: components["schemas"]["ConnectionDto"][] = [
     credential_ref: "github-app",
     credential_present: true,
     last_delivery_at: ago(240000),
-    projects: projects.map(({ project, unreachable_since }) => ({
-      org: "acme",
-      project,
-      owner: "acme",
-      name: project,
-      unreachable_since,
-    })),
+    // Counted from the org page's list when it is served (`withCounts`).
+    enabled_repos: 0,
     supports_resync: true,
     supports_preflight: true,
     managed_by_config: false,
   },
-  // A self-hosted Forgejo connection — the manually-onboarded kind, so the
-  // repo add/remove + webhook affordances render.
+  // A self-hosted Forgejo connection: the kind added here by an admin.
   {
     id: "forgejo-7f3a91c2",
     org: "acme",
@@ -1219,7 +1214,7 @@ const connections: components["schemas"]["ConnectionDto"][] = [
     credential_ref: "forgejo-7f3a91c2-credential",
     credential_present: true,
     last_delivery_at: ago(3_600_000),
-    projects: [{ org: "acme", project: "infra", owner: "acme", name: "infra" }],
+    enabled_repos: 0,
     supports_resync: true,
     // Forgejo tokens are not introspectable, so the preflight line is not
     // offered for them at all (the endpoint would only answer "unknown").
@@ -1237,7 +1232,7 @@ const connections: components["schemas"]["ConnectionDto"][] = [
     credential_ref: "github-app",
     credential_present: true,
     last_delivery_at: null,
-    projects: [],
+    enabled_repos: 0,
     supports_resync: true,
     supports_preflight: false,
     managed_by_config: false,
@@ -1263,15 +1258,6 @@ const connectionPreflight = {
   subscribed_events: ["push", "pull_request"],
 };
 
-// What the Forgejo credential reaches — the bind pick-list.
-// The token also reaches a repo of another account, which the Add repository
-// dialog does not offer (the server would refuse to bind it).
-const availableRepos = [
-  { owner: "acme", name: "infra", bound: true },
-  { owner: "acme", name: "terraform-modules", bound: false },
-  { owner: "acme", name: "runbooks", bound: false },
-  { owner: "globex", name: "shared-ci", bound: false },
-];
 // ── /v1/orgs/acme/repos: the org page's repository list ─────────────────
 // Every acme repository the two connections reach: the projects above are
 // enabled (and infra, through Forgejo), the rest are not. 33 of them, so the
@@ -1330,10 +1316,15 @@ const orgRepos: OrgRepoDto[] = [
 function orgReposPage(org: string, search: string): Response {
   const q = new URLSearchParams(search);
   const needle = (q.get("q") ?? "").trim().toLowerCase();
+  const connection = q.get("connection");
   const page = Math.max(1, Number(q.get("page") ?? 1) || 1);
   const perPage = Math.min(100, Math.max(1, Number(q.get("per_page") ?? 25) || 25));
   const all = org === "acme" ? orgRepos : [];
-  const matching = needle ? all.filter((r) => r.name.toLowerCase().includes(needle)) : all;
+  const matching = all.filter(
+    (r) =>
+      (!connection || r.connection_id === connection) &&
+      (!needle || r.name.toLowerCase().includes(needle)),
+  );
   const admin = me.admin_orgs.includes(org);
   return json({
     repos: paginate(matching, page, perPage).map((r) => ({ ...r, can_change: admin })),
@@ -1346,8 +1337,16 @@ function orgReposPage(org: string, search: string): Response {
   });
 }
 
+/** Each connection with its count of enabled repositories, from the org
+ *  page's list, so Enable and Disable move the counts. */
+const withCounts = (cs: typeof connections) =>
+  cs.map((c) => ({
+    ...c,
+    enabled_repos: orgRepos.filter((r) => r.enabled && r.connection_id === c.id).length,
+  }));
+
 /** Enable or disable `owner/name`: the org page's list, /v1/repos and the
- *  connections' projects follow. */
+ *  connections' counts follow. */
 function setRepoEnabled(owner: string, name: string, enabled: boolean): OrgRepoDto | undefined {
   const r = orgRepos.find((x) => x.owner === owner && x.name === name);
   if (!r) return undefined;
@@ -1355,15 +1354,10 @@ function setRepoEnabled(owner: string, name: string, enabled: boolean): OrgRepoD
   r.project = enabled ? name : null;
   r.unreachable_since = null;
   const i = projects.findIndex((p) => p.owner === owner && p.name === name);
-  if (enabled && i < 0) projects.push(proj(name, null));
-  if (!enabled && i >= 0) projects.splice(i, 1);
-  // The connection's own list of the projects it serves follows too.
-  for (const c of connections) c.projects = c.projects.filter((p) => !(p.owner === owner && p.name === name));
-  if (enabled) {
-    connections
-      .find((c) => c.id === r.connection_id)
-      ?.projects.push({ org: owner, project: name, owner, name, unreachable_since: null });
+  if (enabled && i < 0) {
+    projects.push({ ...proj(name, null), repo_url: r.repo_url, connection_id: r.connection_id });
   }
+  if (!enabled && i >= 0) projects.splice(i, 1);
   return r;
 }
 
@@ -2127,7 +2121,7 @@ function route(pathname: string, search: string, method: string, body = ""): Res
         credential_ref: `${id}-credential`,
         credential_present: true,
         last_delivery_at: null,
-        projects: [],
+        enabled_repos: 0,
         supports_resync: true,
         supports_preflight: false,
         managed_by_config: false,
@@ -2139,7 +2133,7 @@ function route(pathname: string, search: string, method: string, body = ""): Res
     // `?org=` lists one org's connections; without it, every org plus the
     // unassigned ones (the fixture caller is a global admin).
     const org = new URLSearchParams(search).get("org");
-    return json(org ? connections.filter((c) => c.org === org) : connections);
+    return json(withCounts(org ? connections.filter((c) => c.org === org) : connections));
   }
   if (method === "PUT" && (m = p.match(/^\/v1\/connections\/([^/]+)\/org$/))) {
     const org = (JSON.parse(body || "{}") as { org?: string }).org ?? "";
@@ -2165,11 +2159,14 @@ function route(pathname: string, search: string, method: string, body = ""): Res
     if (!r) return new Response("not reachable through this connection", { status: 400 });
     return json({ org: r.owner, project: r.name, webhook_registered: true, webhook_error: null });
   }
+  if (method === "POST" && (m = p.match(/^\/v1\/connections\/[^/]+\/repos\/([^/]+)\/([^/]+)\/webhook$/))) {
+    const [owner, name] = [decodeURIComponent(m[1]!), decodeURIComponent(m[2]!)];
+    return json({ org: owner, project: name, webhook_registered: true, webhook_error: null });
+  }
   if (method === "DELETE" && (m = p.match(/^\/v1\/connections\/[^/]+\/repos\/([^/]+)\/([^/]+)$/))) {
     setRepoEnabled(decodeURIComponent(m[1]!), decodeURIComponent(m[2]!), false);
     return new Response(null, { status: 204 });
   }
-  if (/^\/v1\/connections\/[^/]+\/available-repos$/.test(p)) return json(availableRepos);
   if (/^\/v1\/connections\/[^/]+\/preflight$/.test(p)) return json(connectionPreflight);
   // Secret names are scope-addressed: no `repo=` is the org scope.
   if (p === "/v1/secrets") {

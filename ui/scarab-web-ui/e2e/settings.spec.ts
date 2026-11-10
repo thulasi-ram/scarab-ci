@@ -432,37 +432,70 @@ test("Connections lists the org's connections and, for a global admin, the unass
   const unassigned = page_.locator(".panel", { hasText: "Unassigned connections" });
   await expect(unassigned.getByText("github-install-90211", { exact: true })).toBeVisible();
 
-  // Add repository offers only repositories owned by the org. GitHub
-  // connections offer it too now, so the Forgejo row's button is the one.
-  const forgejo = page_.locator("li.conn", { hasText: "forgejo-7f3a91c2" });
-  await forgejo.getByRole("button", { name: "Add repository" }).click();
-  await expect(page.getByText("acme/terraform-modules")).toBeVisible();
-  await expect(page.getByText("globex/shared-ci")).toHaveCount(0);
-  await page.locator(".dlg-scrim").click({ position: { x: 5, y: 5 } });
-  await expect(page.getByRole("dialog")).toHaveCount(0);
-
-  // Disabling one of its repositories is the org page's Disable: the same
-  // confirmation, with owner/project typed, and the project leaves the row.
+  // A connection shows how many repositories it has enabled and links to
+  // them on the org page; it lists none and enables or disables none.
   const row = page_.locator("li.conn", { hasText: "forgejo-7f3a91c2" });
-  await expect(row.getByRole("button", { name: "Remove", exact: true })).toHaveCount(1);
-  await row.getByRole("button", { name: "Disable", exact: true }).click();
-  const disable = page.getByRole("dialog");
-  await expect(disable.getByRole("heading", { name: "Disable acme/infra?" })).toBeVisible();
-  await expect(disable).toContainText("environments, secrets and access grants");
-  const off = disable.getByRole("button", { name: "Disable repository" });
-  await expect(off).toBeDisabled();
-  await disable.getByRole("textbox", { name: "Type acme/infra to confirm" }).fill("acme/infra");
-  await off.click();
-  await expect(page.getByRole("dialog")).toHaveCount(0);
-  await expect(row.getByRole("link", { name: "acme/infra" })).toHaveCount(0);
+  await expect(row).toContainText("1 enabled repository");
+  await expect(page_.locator("li.conn", { hasText: "gh-acme" })).toContainText("7 enabled repositories");
+  await expect(page_.getByRole("button", { name: "Add repository" })).toHaveCount(0);
+  await expect(page_.getByRole("button", { name: "Disable", exact: true })).toHaveCount(0);
+  await expect(page_.getByRole("link", { name: "acme/infra" })).toHaveCount(0);
+  // An unassigned connection serves no org, so it has no org page to link to.
+  await expect(unassigned.getByRole("link", { name: "Manage repositories" })).toHaveCount(0);
+  await expect(row.getByRole("link", { name: "Manage repositories" })).toHaveAttribute(
+    "href",
+    "/orgs/acme?connection=forgejo-7f3a91c2",
+  );
 
   // Removing a connection asks for its id typed exactly.
   await row.getByRole("button", { name: "Remove", exact: true }).click();
   const dialog = page.getByRole("dialog");
+  await expect(dialog).toContainText("This also removes its 1 project");
   const go = dialog.getByRole("button", { name: "Remove connection" });
   await expect(go).toBeDisabled();
   await dialog.getByRole("textbox", { name: "Type forgejo-7f3a91c2 to confirm" }).fill("forgejo-7f3a91c2");
   await expect(go).toBeEnabled();
+  expect(errors).toEqual([]);
+});
+
+// Manage repositories opens the org page narrowed to the connection, where
+// its repositories are enabled; a Forgejo repository's webhook is registered
+// again from its Settings tab.
+test("a connection's repositories are managed on the org page, and a Forgejo webhook on the repository", async ({
+  page,
+}) => {
+  const errors = collectErrors(page);
+  await page.goto("/orgs/acme/settings/connections");
+  const row = page.locator("li.conn", { hasText: "forgejo-7f3a91c2" });
+  await row.getByRole("link", { name: "Manage repositories" }).click();
+  await expect(page).toHaveURL(/\/orgs\/acme\?connection=forgejo-7f3a91c2$/);
+  const rows = page.locator(".org-repo-row");
+  await expect(rows).toHaveCount(3);
+  await expect(rows).toContainText(["infra", "runbooks", "terraform-modules"]);
+
+  const tf = rows.filter({ hasText: "terraform-modules" });
+  await tf.getByRole("button", { name: "Enable" }).click();
+  await expect(tf).toContainText("Enabled");
+  await page.getByRole("button", { name: "Show all" }).click();
+  await expect(page).toHaveURL(/\/orgs\/acme$/);
+  await expect(page.getByText("1–25 of 33")).toBeVisible();
+
+  // In the page, not a reload: the mock keeps the enable only until one.
+  await page.getByRole("textbox", { name: "Filter repositories by name" }).fill("terraform");
+  await page.getByRole("link", { name: "terraform-modules", exact: true }).click();
+  await page.locator(".tabs").getByRole("button", { name: "Settings" }).click();
+  await expect(page).toHaveURL(/\/acme\/terraform-modules\?tab=settings$/);
+  const repository = page.locator(".panel", {
+    has: page.locator(".panel-h", { hasText: "Repository" }),
+  });
+  await expect(repository.getByRole("link", { name: "forgejo-7f3a91c2" })).toBeVisible();
+  await repository.getByRole("button", { name: "Register webhook" }).click();
+  await expect(repository).toContainText("Webhook registered.");
+
+  // GitHub delivers every repository's events to the App: no webhook here.
+  await page.goto("/acme/scarab?tab=settings");
+  await expect(page.getByRole("button", { name: "Disable repository" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Register webhook" })).toHaveCount(0);
   expect(errors).toEqual([]);
 });
 

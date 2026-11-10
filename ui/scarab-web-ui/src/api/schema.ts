@@ -166,7 +166,7 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * Registered forge connections + their bound Projects and health (ADR-0060)
+         * Registered forge connections, how many repositories each has enabled, and their health (ADR-0060)
          * @description Read-only, and per Org (git-bug 19b0a45): the caller sees the connections
          *     of the Orgs it administers, and a global admin also sees the unassigned
          *     ones. No credential material is ever returned — only whether the handle
@@ -328,8 +328,7 @@ export interface paths {
          * Bind a repo to a connection, creating its Project, and register its webhook (ADR-0060)
          * @description There is no `projects` table: a Project *is* a `forge_repos` binding
          *     (ADR-0046), so this endpoint is the repo→Project onboarding flow — "Enable"
-         *     on the org's repositories page and "Add repository" on its Connections —
-         *     for every forge. After it, the repo appears on `GET /v1/repos`, can hold
+         *     on the org's repositories page — for every forge. After it, the repo appears on `GET /v1/repos`, can hold
          *     Environments and secrets, and its pushes resolve to a tenant. A GitHub
          *     installation makes its repos available but binds none of them, so this is
          *     the GitHub path too.
@@ -1414,7 +1413,7 @@ export interface paths {
          * @description Enabling a repository is opt-in, so this is the list an admin enables
          *     from (`POST /v1/connections/{id}/repos`) and disables from (`DELETE
          *     /v1/connections/{id}/repos/{owner}/{name}`). The forge is asked live, as
-         *     the Add repository pick-list is (`…/available-repos`); no list of
+         *     the bind pick-list is (`…/available-repos`); no list of
          *     available repositories is stored. The forge port returns a connection's
          *     whole list, so the server pages the merged result.
          *
@@ -2911,6 +2910,14 @@ export interface components {
              *     not the secret.
              */
             credential_ref: string;
+            /**
+             * Format: int64
+             * @description How many repositories are enabled through this connection: its repo
+             *     bindings, each a Project (ADR-0046). A count, not the list: a
+             *     connection can hold thousands. The org's repositories page
+             *     (`GET /v1/orgs/{org}/repos?connection=`) lists them.
+             */
+            enabled_repos: number;
             id: string;
             /** @description `github` | `forgejo`. */
             kind: string;
@@ -2934,11 +2941,6 @@ export interface components {
              *     visible to and editable by global admins only.
              */
             org?: string | null;
-            /**
-             * @description The Projects this connection serves, from its repo bindings — a Project
-             *     *is* a binding (ADR-0046), so this is the connection's whole footprint.
-             */
-            projects: components["schemas"]["ConnectionProjectDto"][];
             /**
              * @description Can this connection's app configuration be checked against what Scarab
              *     needs (`GET …/preflight`)? Decided from the kind, like `supports_resync`
@@ -3004,21 +3006,6 @@ export interface components {
              *     introspect, a credential that does not resolve, a forge that errored.
              */
             unavailable_reason?: string | null;
-        };
-        /** @description A Project a connection serves, plus the forge coordinate it came from. */
-        ConnectionProjectDto: {
-            name: string;
-            org: string;
-            owner: string;
-            project: string;
-            /**
-             * Format: int64
-             * @description Unix-ms since when its forge connection has not reached it (the
-             *     GitHub App's installation stopped covering it), or `null`. The
-             *     Project is kept; its events are ignored and no run can start until
-             *     the forge covers it again or an admin disables it.
-             */
-            unreachable_since?: number | null;
         };
         /** @description A named external system the plugin reaches through the broker. */
         ConnectionSlotDto: {
@@ -4455,6 +4442,12 @@ export interface components {
         };
         /** @description One registered project (governed repo, ADR-0046) in the repos list. */
         ProjectDto: {
+            /**
+             * @description The forge connection it is bound through: the `{id}` of
+             *     `/v1/connections/{id}/…`, and the row of `GET /v1/connections` that
+             *     says whether it is managed by configuration.
+             */
+            connection_id: string;
             /**
              * Format: int64
              * @description Epoch millis of the project's most recent run, or `null` if it has never
@@ -9869,6 +9862,8 @@ export interface operations {
                 per_page?: number;
                 /** @description only names containing this text, ignoring case */
                 q?: string;
+                /** @description only repositories of this connection id */
+                connection?: string;
             };
             header?: never;
             path: {
