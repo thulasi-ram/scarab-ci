@@ -169,8 +169,9 @@ sits in: the class means "this is a machine value".
 - A heading that used to be larger is Label; the space above it and the
   Body text under it set it apart. A heading (a panel header, a section
   heading, the settings sidebar's heading) is in the primary ink,
-  `--soft-white`, so it does not read as running text. Field labels, column
-  heads and the labels of label and value lists stay in `--muted-sage`.
+  `--soft-white`, so it does not read as running text. Field labels and the
+  labels of label and value lists stay in `--muted-sage`; column heads are in
+  `--sage` or `--muted-sage` (see Tables).
 - Secondary text is Body in `--sage` or `--muted-sage`. Colour is not a font
   variation, so it does not count against the four.
 - Mono is weight 500, not 400: at 12px, 400 reads thin next to Inter.
@@ -301,6 +302,13 @@ Placement is stricter than doodles, because motion competes with content:
 - Header row: Label in `--muted-sage` on `--pine-deep`. Body rows in Body,
   `--sage`, `--border-soft` separators, hover → faint emerald wash
   (`color-mix`). SHAs render in gold Mono; ids/timestamps in muted Mono.
+- A table inside a panel has no fill, frame or shaded header of its own: the
+  panel header is the one `--pine-deep` band. Its column heads are Label in
+  `--sage` over one `--border-soft` hairline, its scroll box reaches the
+  panel's edges, and its first and last columns sit at the panel header's
+  14px inset, as the panel body does. A group row inside it (Access's
+  "Through their org role") is a Label row with a `--border-soft` hairline
+  above it.
 
 ### Status badges
 - Pill, radius 6px, **mono** lowercase. `succeeded` → `--ok`; `failed` →

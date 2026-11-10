@@ -194,6 +194,11 @@ release.yml uses that version's section as the GitHub Release text. See
   settings sidebar's heading are in the primary ink instead of the muted one. The settings
   sidebar marks the page you are on with its background and colour only, without the green
   edge. Mono text is set at weight 500 instead of 400; the four text styles stay four.
+- **A table inside a panel no longer draws a second header band.** Members, a repository's
+  Access and Environments, Connections, API tokens, Libraries, Plugins, the security event
+  tables and a plugin's broker journal show their column heads as a plain label row over one
+  hairline, under the panel header, with their columns at the header's inset. Access's
+  "Through their org role" row is a plain label row with a hairline above it.
 - **Environments, Policies and Members follow the same list-and-page layout.** Each list has its
   add action at the right of its header (**New environment**, **Paste YAML** and **New policy**,
   **Grant role**) and a **Manage** link per row. Account settings › Security has **Add passkey**

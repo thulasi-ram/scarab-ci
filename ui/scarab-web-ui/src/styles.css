@@ -636,6 +636,21 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
   color: var(--muted-sage);
 }
 
+/* A table inside a panel: the panel header is the one shaded band. The table
+   draws no frame of its own; its column heads are Label in the secondary ink
+   over one hairline; its scroll box reaches the panel's edges, and its first
+   and last columns sit at the panel header's 14px inset. */
+.panel .table { border: none; border-radius: 0; background: none; }
+.panel .table thead th {
+  background: none;
+  color: var(--sage);
+  border-bottom: 1px solid var(--border-soft);
+}
+.panel .table th:first-child, .panel .table td:first-child { padding-left: 14px; }
+.panel .table th:last-child, .panel .table td:last-child { padding-right: 14px; }
+.panel .secrets-body > :is(.table-scroll, .tok-table-scroll) { margin: 0 -14px; }
+.panel .plg-body > .plg-journal-wrap { margin: 0 -14px; }
+
 /* ---- Status badges ---------------------------------------------------- */
 
 .badge {
@@ -1796,10 +1811,12 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
   font: var(--t-body); color: var(--sage);
 }
 .envt > thead > tr > th {
-  text-align: left; font: var(--t-label); color: var(--muted-sage);
-  padding: 10px 16px; background: var(--pine-deep); border-bottom: 1px solid var(--border);
+  text-align: left; font: var(--t-label); color: var(--sage);
+  padding: 10px 16px; border-bottom: 1px solid var(--border-soft);
   white-space: nowrap;
 }
+.envt > thead > tr > th:first-child, .envt > tbody > tr > td:first-child { padding-left: 14px; }
+.envt > thead > tr > th:last-child, .envt > tbody > tr > td:last-child { padding-right: 14px; }
 .envt > tbody > tr > td {
   padding: 11px 16px; border-bottom: 1px solid var(--border-soft);
   vertical-align: middle; white-space: nowrap;
@@ -1842,7 +1859,7 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 .envt-actions .envt-btn { font: var(--t-body); padding: 5px 12px; }
 
 /* ---- settings / secrets bodies ---- */
-.settings-body, .secrets-body { padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+.settings-body, .secrets-body { padding: 16px 14px; display: flex; flex-direction: column; gap: 12px; }
 .set-row { display: flex; justify-content: space-between; font: var(--t-body); color: var(--sage); }
 .set-row .k { color: var(--muted-sage); }
 .secrets-add { margin-top: 4px; }
@@ -3363,10 +3380,8 @@ h1, .crumb-head, .run-title {
    full picture, managed under Members, so it recedes and has no actions. */
 .access-table tr.access-group th {
   text-align: left; font: var(--t-label); color: var(--sage);
-  padding: 10px 16px 8px;
-  background: var(--pine-deep);
-  border-top: 1px solid var(--border);
-  border-bottom: 1px solid var(--border-soft);
+  padding: 14px 14px 8px;
+  border-top: 1px solid var(--border-soft);
 }
 .access-table tr.access-group:hover { background: none; }
 .access-table tr.access-via-org td { opacity: 0.6; }
