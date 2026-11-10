@@ -19,6 +19,7 @@
 // generated OpenAPI types (the same contract the real server serves).
 import type { components } from "./api/schema";
 import { libraryRoute, libraryRunSummaries } from "./mock-libraries";
+import { paginate } from "./org-page";
 
 type RunStatusDto = components["schemas"]["RunStatusResponse"];
 type RunSummaryDto = components["schemas"]["RunSummaryDto"];
@@ -1193,7 +1194,7 @@ const connections: components["schemas"]["ConnectionDto"][] = [
     credential_ref: "github-app",
     credential_present: true,
     last_delivery_at: ago(240000),
-    projects: ["scarab", "web", "api"].map((project) => ({
+    projects: projects.map(({ project }) => ({
       org: "acme",
       project,
       owner: "acme",
@@ -1267,6 +1268,86 @@ const availableRepos = [
   { owner: "acme", name: "runbooks", bound: false },
   { owner: "globex", name: "shared-ci", bound: false },
 ];
+// ── /v1/orgs/acme/repos: the org page's repository list ─────────────────
+// Every acme repository the two connections reach: the projects above are
+// enabled (and infra, through Forgejo), the rest are not. 33 of them, so the
+// list runs to two pages of 25. Enable and Disable flip `enabled` here and
+// add or drop the project on /v1/repos, as the server would.
+type OrgRepoDto = components["schemas"]["OrgRepoDto"];
+const orgRepo = (name: string, connection: "gh-acme" | "forgejo-7f3a91c2", enabled: boolean): OrgRepoDto => ({
+  owner: "acme",
+  name,
+  enabled,
+  project: enabled ? name : null,
+  connection_id: connection,
+  kind: connection === "gh-acme" ? "github" : "forgejo",
+  repo_url:
+    connection === "gh-acme" ? `https://github.com/acme/${name}` : `https://git.acme.dev/acme/${name}`,
+  can_change: true,
+});
+const orgRepos: OrgRepoDto[] = [
+  ...projects.map((p) => orgRepo(p.name, "gh-acme", true)),
+  orgRepo("infra", "forgejo-7f3a91c2", true),
+  orgRepo("terraform-modules", "forgejo-7f3a91c2", false),
+  orgRepo("runbooks", "forgejo-7f3a91c2", false),
+  ...[
+    "admin-portal",
+    "analytics-etl",
+    "auth-service",
+    "catalog",
+    "checkout-web",
+    "cli",
+    "design-system",
+    "docs-site",
+    "email-templates",
+    "feature-flags",
+    "fraud-rules",
+    "helm-charts",
+    "load-tests",
+    "mobile-app",
+    "notifications",
+    "pricing-engine",
+    "recommendations",
+    "search-indexer",
+    "shipping-rates",
+    "status-page",
+    "support-bot",
+    "web",
+    "api",
+  ].map((name) => orgRepo(name, "gh-acme", false)),
+].sort((a, b) => a.name.localeCompare(b.name));
+
+function orgReposPage(org: string, search: string): Response {
+  const q = new URLSearchParams(search);
+  const needle = (q.get("q") ?? "").trim().toLowerCase();
+  const page = Math.max(1, Number(q.get("page") ?? 1) || 1);
+  const perPage = Math.min(100, Math.max(1, Number(q.get("per_page") ?? 25) || 25));
+  const all = org === "acme" ? orgRepos : [];
+  const matching = needle ? all.filter((r) => r.name.toLowerCase().includes(needle)) : all;
+  const admin = me.admin_orgs.includes(org);
+  return json({
+    repos: paginate(matching, page, perPage).map((r) => ({ ...r, can_change: admin })),
+    total: matching.length,
+    enabled_total: all.filter((r) => r.enabled).length,
+    page,
+    per_page: perPage,
+    can_administer: admin,
+    unlisted: [],
+  });
+}
+
+/** Enable or disable `owner/name`: the org page's list and /v1/repos follow. */
+function setRepoEnabled(owner: string, name: string, enabled: boolean): OrgRepoDto | undefined {
+  const r = orgRepos.find((x) => x.owner === owner && x.name === name);
+  if (!r) return undefined;
+  r.enabled = enabled;
+  r.project = enabled ? name : null;
+  const i = projects.findIndex((p) => p.owner === owner && p.name === name);
+  if (enabled && i < 0) projects.push(proj(name, null));
+  if (!enabled && i >= 0) projects.splice(i, 1);
+  return r;
+}
+
 // The secret matrix behind a repo's Secrets key list carries the
 // repo-default column ("") and inheritance origins: GHCR_TOKEN comes from the
 // org (the `org` tag), SENTRY_DSN is a repo key that overrides the org's and is
@@ -2048,7 +2129,23 @@ function route(pathname: string, search: string, method: string, body = ""): Res
     return json({ id: found.id, org });
   }
   if (method === "POST" && /^\/v1\/connections\/[^/]+\/resync$/.test(p)) {
-    return json({ bound: [], confirmed: 3, skipped: ["globex/shared-ci"] });
+    return json({
+      available: orgRepos.filter((r) => !r.enabled).slice(0, 3).map((r) => `${r.owner}/${r.name}`),
+      moved: [],
+      confirmed: 3,
+      skipped: ["globex/shared-ci"],
+    });
+  }
+  if ((m = p.match(/^\/v1\/orgs\/([^/]+)\/repos$/))) return orgReposPage(decodeURIComponent(m[1]!), search);
+  if (method === "POST" && (m = p.match(/^\/v1\/connections\/[^/]+\/repos$/))) {
+    const req = JSON.parse(body || "{}") as { owner?: string; name?: string };
+    const r = setRepoEnabled(req.owner ?? "", req.name ?? "", true);
+    if (!r) return new Response("not reachable through this connection", { status: 400 });
+    return json({ org: r.owner, project: r.name, webhook_registered: true, webhook_error: null });
+  }
+  if (method === "DELETE" && (m = p.match(/^\/v1\/connections\/[^/]+\/repos\/([^/]+)\/([^/]+)$/))) {
+    setRepoEnabled(decodeURIComponent(m[1]!), decodeURIComponent(m[2]!), false);
+    return new Response(null, { status: 204 });
   }
   if (/^\/v1\/connections\/[^/]+\/available-repos$/.test(p)) return json(availableRepos);
   if (/^\/v1\/connections\/[^/]+\/preflight$/.test(p)) return json(connectionPreflight);
