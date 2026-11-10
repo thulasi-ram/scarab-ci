@@ -11,6 +11,7 @@ import RunDetail from "./routes/RunDetail";
 import RunPipeline from "./routes/RunPipeline";
 import { AccountSettings, LegacySettings, NewOrgSettings, OrgSettings } from "./routes/Settings";
 import LibraryReview from "./routes/LibraryReview";
+import LibraryManage from "./routes/LibraryManage";
 import { EnvironmentEdit, EnvironmentView } from "./routes/EnvironmentPage";
 import ConfirmRequest from "./routes/ConfirmRequest";
 import OrgPage from "./routes/OrgPage";
@@ -50,6 +51,11 @@ export default function App() {
       {/* Install or upgrade a library: its own URL inside the settings
           frame, so the review can be sent to a second reviewer. */}
       <Route path="/orgs/:org/settings/libraries/review" component={LibraryReview} />
+      {/* One installed library or plugin, managed on its own page inside the
+          settings frame. Six segments with static `libraries`/`plugins` and
+          `manage`, so they collide with no other route; a library is
+          `<publisher>~<name>`, a plugin installation its id. */}
+      <Route path="/orgs/:org/settings/libraries/:id/manage" component={LibraryManage} />
       {/* One Environment (git-bug c11abc5): read-only, and its edit screen,
           both inside the settings frame. Five and six segments under the static /orgs, so they collide with
           neither the settings sections nor /:org/:repo/runs/:id; the name is

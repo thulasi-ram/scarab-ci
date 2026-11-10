@@ -1,5 +1,7 @@
 // Library fixtures for mock mode (`just ui mock`): libraries with every
-// badge, a yank's impact, an upgrade to review, Runs whose Steps come from
+// state tag (each one's manage page at
+// /orgs/acme/settings/libraries/<publisher>~<name>/manage), a stray yank and a
+// stray trusted source on the list, a yank's impact, an upgrade to review, Runs whose Steps come from
 // libraries (one with a yanked version), a plugin gate in each of its four
 // states, a Pipeline that does not compile, and refused triggers in the Runs
 // list. Page query parameters pick a variant, so each screen can be
@@ -79,6 +81,8 @@ const fullLibraries: S["OrgLibrariesDto"] = {
   trusted_sources: [
     { source: CLONE_SRC.replace(/@.*/, ""), trusted_by: "a.kim", trusted_at: ago(20 * day) },
     { source: "github.com/acme/scarab-libs//git-tag.yaml", trusted_by: "a.kim", trusted_at: ago(3 * day) },
+    // No installation comes from it now: the list page keeps it.
+    { source: "github.com/acme/scarab-libs//release-notes.yaml", trusted_by: "j.lee", trusted_at: ago(40 * day) },
   ],
 };
 
@@ -386,6 +390,27 @@ export function libraryRoute(
   let m: RegExpMatchArray | null;
   if (/^\/v1\/orgs\/[^/]+\/libraries$/.test(p)) return json(orgLibraries());
   if (/^\/v1\/orgs\/[^/]+\/libraries\/fetch$/.test(p)) return json(fetchedUpgrade);
+  if ((m = p.match(/^\/v1\/orgs\/[^/]+\/libraries\/([^/]+)\/([^/]+)$/))) {
+    // Install echoes the reviewed version as installed now; remove answers
+    // 204. Nothing is kept.
+    if (method === "DELETE") return new Response(null, { status: 204 });
+    const req = JSON.parse(body || "{}") as { content_hash?: string };
+    const publisher = decodeURIComponent(m[1]!);
+    const name = decodeURIComponent(m[2]!);
+    const was = fullLibraries.installations.find((l) => l.publisher === publisher && l.name === name);
+    return json(
+      installation({
+        publisher,
+        name,
+        content_hash: req.content_hash ?? HELM_NEW,
+        source: req.content_hash === HELM_NEW ? HELM_NEW_SRC : (was?.source ?? HELM_NEW_SRC),
+        installed_at: now,
+      }),
+    );
+  }
+  if (/^\/v1\/orgs\/[^/]+\/library-yanks\/[^/]+$/.test(p) && method === "DELETE") {
+    return new Response(null, { status: 204 });
+  }
   if (/^\/v1\/orgs\/[^/]+\/library-yanks\/[^/]+\/impact$/.test(p)) return json(yankImpact);
   if (/^\/v1\/orgs\/[^/]+\/library-trust$/.test(p)) {
     // Echo a trust, without the commit; persist nothing.

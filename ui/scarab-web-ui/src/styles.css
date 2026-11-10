@@ -3390,23 +3390,20 @@ h1, .crumb-head, .run-title {
 .lib-add { color: var(--ok); }
 .lib-del { color: var(--danger); }
 .plg-msg { color: var(--sage); }
-.plg-toggle { margin-left: auto; }
-.plg-conns {
-  display: grid; gap: 7px;
-  margin-left: 6px; padding: 4px 0 2px 12px;
-  border-left: 1px dotted var(--border);
-}
-.plg-conns .empty, .plg-conns .error { margin: 0; }
+/* A manage page panel's body: storage form, connection slots, journal. */
+.plg-body { display: grid; gap: 10px; padding: 12px 14px; }
+.plg-body .empty, .plg-body .error, .plg-body .notice-ok, .plg-body .subtle { margin: 0; }
+.plg-body .plg-conn-row + .plg-conn-row { padding-top: 10px; border-top: 1px solid var(--border-soft); }
 .plg-conn-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .plg-slot { color: var(--soft-white); }
 .plg-caps { display: flex; gap: 6px; flex-wrap: wrap; }
 .plg-review { display: grid; gap: 8px; }
-.plg-review .lib-facts { padding: 0; }
+.plg-review .kv { padding: 0; }
 .plg-review-list { margin: 0; padding: 0; list-style: none; display: grid; gap: 6px; }
 .plg-review-rules { margin: 4px 0 0; padding-left: 16px; font: var(--t-mono); color: var(--sage); }
 /* The broker journal: one row per journaled request; the path wraps, the
    short cells do not. */
-.plg-journal-wrap { overflow-x: auto; }
+.plg-journal-wrap { overflow: auto; max-height: 28rem; }
 .plg-journal td { white-space: nowrap; }
 /* Path and rule wrap, but never narrower than a readable chunk: with only
    break-all, the nowrap columns took the width and the path fell to one
@@ -3543,15 +3540,12 @@ h1, .crumb-head, .run-title {
 /* ── Libraries, invocation boxes, origin, plugin gates, compile
    errors, refused runs. From the reviewed mock (adr-0076-ui-mock). ── */
 /* --- Libraries: proposed badges --- */
-.lib-trust { color: var(--ok-ink); }
-.lib-badges { display: inline-flex; gap: 6px; flex-wrap: wrap; align-items: center; }
 .lib-hash { font: var(--t-mono); color: var(--copper); }
 .lib-src { font: var(--t-mono); color: var(--muted-sage); word-break: break-all; }
 .lib-notice { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .lib-notice.yank { color: var(--danger); }
 /* table variant */
 .lib-table td { vertical-align: top; }
-.lib-table .sub td { padding-top: 0; border-top: none; }
 .lib-table tr.dead td:not(.keep) { opacity: .6; }
 .lib-table .acts { white-space: nowrap; text-align: right; }
 .lib-table .acts .btn { margin-left: 4px; }
@@ -3579,9 +3573,42 @@ h1, .crumb-head, .run-title {
 .sbs .ud { border: none; border-radius: 0; max-height: none; overflow-x: auto; }
 .sbs .ud-row { grid-template-columns: 30px 1fr; }
 .sbs .ud-row.blank { background: repeating-linear-gradient(135deg, transparent 0 6px, var(--border-soft) 6px 7px); }
-.lib-review { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 18px; align-items: start; }
-.lib-side { position: sticky; top: 104px; display: grid; gap: 12px; }
-.lib-side .panel { margin: 0; }
+/* The library review page and the manage pages: one column of panels.
+   Each panel's facts sit on one grid (.kv): a label column and a value
+   column, every row on a shared baseline, the same 14px inset as the panel
+   header. Actions sit in one footer row (.panel-foot, .rv-foot). */
+.rv { display: grid; gap: 16px; }
+.rv > .panel { margin: 0; }
+.kv { display: grid; grid-template-columns: 9.5rem minmax(0, 1fr); gap: 8px 16px; align-items: baseline; padding: 12px 14px; margin: 0; }
+.kv dt { font: var(--t-label); color: var(--muted-sage); }
+.kv dd { margin: 0; min-width: 0; font: var(--t-body); color: var(--soft-white); overflow-wrap: anywhere; }
+.kv dd.m { font: var(--t-mono); }
+.kv .lib-checks li svg { margin-top: 4px; }
+.kv-note { margin: 0; padding: 0 14px 12px; font: var(--t-body); color: var(--sage); }
+.kv + .kv-note { margin-top: -4px; }
+.kv-note.kv-lead { padding-top: 12px; }
+.panel-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 10px 14px; border-top: 1px solid var(--border-soft); }
+.rv-code { border: none; border-radius: 0; }
+.rv-code.ud { max-height: none; }
+.rv-foot {
+  position: sticky; bottom: 12px; z-index: 2;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  padding: 10px 14px;
+  border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--pine-deep);
+}
+.rv-foot-note { flex: 1 1 18rem; display: inline-flex; align-items: center; gap: 6px; font: var(--t-body); color: var(--sage); }
+@media (max-width: 640px) {
+  .kv { grid-template-columns: minmax(0, 1fr); gap: 2px 0; }
+  .kv dd { margin-bottom: 6px; }
+}
+/* State tags: one dotted .tok-state each, coloured by tone. */
+.chips { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.chip-ok { color: var(--ok-ink); }
+.chip-motion { color: var(--copper); }
+.chip-danger { color: var(--danger); }
+.chip-muted { color: var(--muted-sage); }
+.lib-sub-h { margin: 6px 0 0; font: var(--t-label); color: var(--muted-sage); }
 .lib-facts { display: grid; grid-template-columns: max-content 1fr; gap: 6px 12px; padding: 12px 14px; margin: 0; }
 .lib-facts dt { font: var(--t-label); color: var(--muted-sage); padding-top: 2px; }
 .lib-facts dd { margin: 0; color: var(--soft-white); word-break: break-word; }
@@ -3759,7 +3786,6 @@ code.c { font: var(--t-mono); color: var(--copper); }
 
 @media (max-width: 860px) {
   .sbs { grid-template-columns: 1fr; }
-  .lib-side { position: static; }
 }.dnode.plugin { border-style: dashed; border-color: var(--border-copper); }
 .dnode.waiting { border-color: var(--warn); }
 .lib-well .doodle { position: static; display: block; margin-bottom: 2px; }
@@ -3796,12 +3822,6 @@ code.c { font: var(--t-mono); color: var(--copper); }
 .settings-crumb-sep { color: var(--muted-sage); flex: none; }
 .settings-crumb-here { color: var(--soft-white); min-width: 0; overflow-wrap: anywhere; }
 .settings-crumb .mono { font: var(--t-title); }
-/* The review's side column drops below the file once the sidebar takes its
-   share of the width. */
-@media (max-width: 1180px) {
-  .settings-main .lib-review { grid-template-columns: minmax(0, 1fr); }
-  .settings-main .lib-side { position: static; }
-}
 @media (max-width: 900px) {
   .settings { grid-template-columns: 1fr; gap: 0; }
   .settings-nav { position: static; padding-top: 0; margin-bottom: 8px; }

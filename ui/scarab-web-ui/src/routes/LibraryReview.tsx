@@ -1,37 +1,33 @@
-// Install or upgrade a library — a page of its own inside the settings frame
+// Install or upgrade a library: a page of its own inside the settings frame
 // (Libraries marked in the sidebar), so a second reviewer can be sent its
-// URL. The source is fetched (the server reads it at its commit, checks it
-// compiles as a closed library and stores it); the page shows the file, or
-// the side-by-side diff from the installed version, the checks, and what
-// changes. Install then installs exactly the version shown, naming the
-// version it replaces, and asks for a step-up.
+// URL. The URL's query names the source (the Install library dialog builds
+// it); the page fetches it (the server reads it at its commit, checks it
+// compiles as a closed library and stores it) and shows what it is: the
+// facts and checks on one label and value grid, then the file, or the
+// side-by-side diff from the installed version. Install, in the footer row,
+// installs exactly the version shown, naming the version it replaces, and
+// asks for a step-up.
 //
 // Every library takes this one path, whoever publishes it.
-import { createEffect, createResource, createSignal, For, Show } from "solid-js";
-import { A, useNavigate, useParams, useSearchParams } from "@solidjs/router";
-import {
-  fetchLibrary,
-  installLibrary,
-  listConnections,
-  listLibraries,
-  type FetchedLibrary,
-} from "../api/client";
+import { createMemo, createResource, createSignal, For, Show } from "solid-js";
+import { useNavigate, useParams, useSearchParams } from "@solidjs/router";
+import { fetchLibrary, installLibrary, listConnections, listLibraries } from "../api/client";
 import {
   diffLines,
   diffSides,
   foldDiff,
   inputsChange,
+  libraryManageHref,
   numberDiff,
   reviewChecks,
   shortHash,
   sideBySide,
-  sourceError,
   toFetchBody,
   type FetchForm,
   type SideCell,
 } from "../libraries";
 import Icon from "../components/Icon";
-import { Field, Input, Select } from "../components/Field";
+import InstallLibraryDialog from "../components/LibraryInstall";
 import { decodeParam, orgHref } from "../settings-nav";
 import { me } from "../session";
 import { SettingsCrumbs, SettingsFrame } from "./Settings";
@@ -56,80 +52,48 @@ export default function LibraryReview() {
 
 function Review(props: { org: string }) {
   const nav = useNavigate();
-  const [search, setSearch] = useSearchParams();
-  const org = () => props.org;
+  const [search] = useSearchParams();
   const back = () => orgHref(props.org, "libraries");
-  const [libs] = createResource(org, (o) => listLibraries(o));
-  // A library is read through a connection of the installing org only.
+  const [libs] = createResource(() => props.org, (o) => listLibraries(o));
   const [connections] = createResource(
     () => props.org,
     (o) => listConnections(o).catch(() => []),
   );
-  const [form, setForm] = createSignal<FetchForm>({
+  // What the URL asks to review. The fetch follows it: a changed source
+  // (Change source, a shared link) fetches again.
+  const form = createMemo<FetchForm>(() => ({
     source: one(search.source),
     connection: one(search.connection),
     publisher: one(search.publisher),
     name: one(search.name),
+  }));
+  const request = createMemo(() => {
+    const body = toFetchBody(form()).body;
+    return body ? JSON.stringify(body) : false;
   });
-  const [editing, setEditing] = createSignal(one(search.source) === "");
-  const [fetched, setFetched] = createSignal<FetchedLibrary | null>(null);
-  const [fetchedAt, setFetchedAt] = createSignal<number | null>(null);
-  const [busy, setBusy] = createSignal<"" | "fetch" | "install">("");
+  const [fetching] = createResource(request, (b) => fetchLibrary(props.org, JSON.parse(b)));
+  // Only a finished fetch of the source in the URL: while another source is
+  // being fetched, the last one's version must not be installable.
+  const fetched = () => (fetching.state === "ready" ? fetching() : undefined);
+  const [changing, setChanging] = createSignal(false);
+  const [installing, setInstalling] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
-  const set = (k: keyof FetchForm, v: string) => {
-    setFetched(null);
-    setForm((f) => ({ ...f, [k]: v }));
-  };
-  const built = () => toFetchBody(form());
-
-  const doFetch = async () => {
-    const o = org();
-    const body = built().body;
-    if (!o || !body || busy()) return;
-    setBusy("fetch");
-    setError(null);
-    try {
-      const f = await fetchLibrary(o, body);
-      setFetched(f);
-      setFetchedAt(Date.now());
-      setEditing(false);
-      // The URL names what was fetched, so it can be sent to a reviewer.
-      setSearch(
-        { source: f.source, publisher: f.publisher, name: f.name, connection: form().connection || "" },
-        { replace: true },
-      );
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Could not fetch the library.");
-      setEditing(true);
-    } finally {
-      setBusy("");
-    }
-  };
-
-  // Opened with a source (an upgrade's "review", a shared link): fetch it.
-  let fetchedOnce = false;
-  createEffect(() => {
-    if (fetchedOnce || !org() || !built().body || one(search.source) === "") return;
-    fetchedOnce = true;
-    void doFetch();
-  });
 
   const doInstall = async () => {
-    const o = org();
     const f = fetched();
-    if (!o || !f || busy()) return;
-    setBusy("install");
+    if (!f || installing()) return;
+    setInstalling(true);
     setError(null);
     try {
-      await installLibrary(o, f.publisher, f.name, {
+      const done = await installLibrary(props.org, f.publisher, f.name, {
         content_hash: f.content_hash,
         replaces: f.current?.content_hash ?? null,
       });
-      nav(back());
+      nav(libraryManageHref(props.org, done));
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not install the library.");
     } finally {
-      setBusy("");
+      setInstalling(false);
     }
   };
 
@@ -151,7 +115,7 @@ function Review(props: { org: string }) {
     const f = fetched();
     const p = f?.publisher || form().publisher;
     const n = f?.name || form().name;
-    return p && n ? `lib:${p}/${n}` : "Install a library";
+    return p && n ? `lib:${p}/${n}` : "Review a library";
   };
   const connectionLabel = () => {
     const c = form().connection;
@@ -169,201 +133,53 @@ function Review(props: { org: string }) {
         ]}
         sub={
           <>
+            <span class="mono">{props.org}</span> ·{" "}
             {fetched()?.current ? "review an upgrade" : "review a library before installing it"}
-            <Show when={fetchedAt()}> · fetched just now by {me()?.subject}</Show>
+            <Show when={fetched()}> · fetched by {me()?.subject}</Show>
           </>
         }
       />
 
-      <div class="lib-review">
-        <div>
-          <div class="panel" style={{ "margin-top": 0 }}>
+      <Show
+        when={request()}
+        fallback={
+          <div class="panel">
             <div class="panel-h">
-              <span>Source</span>
-              <span class="grow1" />
-              <Show when={!editing()}>
-                <button class="btn btn-ghost btn-sm" onClick={() => setEditing(true)}>
-                  edit
-                </button>
-              </Show>
+              <span>Nothing to review</span>
             </div>
-            <Show
-              when={editing()}
-              fallback={
-                <dl class="lib-facts">
-                  <dt>Source</dt>
-                  <dd class="m">{fetched()?.source ?? form().source}</dd>
-                  <dt>Connection</dt>
-                  <dd>{connectionLabel()}</dd>
-                  <dt>Publisher</dt>
-                  <dd class="m">
-                    {fetched()?.publisher || form().publisher || "the repository owner"}
-                  </dd>
-                </dl>
-              }
-            >
-              <div class="secrets-body token-form">
-                <div class="form-r">
-                  <Field
-                    label="Source"
-                    required
-                    error={sourceError(form().source)}
-                    help="A file in a git repository at a full commit id. A public repository on github.com or a Forgejo connection's host is read without credentials."
-                  >
-                    <Input
-                      mono
-                      placeholder="github.com/acme/scarab-libs//deploy-helm.yaml@<commit>"
-                      value={form().source}
-                      onValue={(v) => set("source", v)}
-                    />
-                  </Field>
-                </div>
-                <Field label="Connection (private repository)">
-                  <Select value={form().connection} onValue={(v) => set("connection", v)}>
-                    <option value="">none: read it anonymously</option>
-                    <For each={connections() ?? []}>
-                      {(c) => (
-                        <option value={c.id}>
-                          {c.id} ({c.kind}, {c.base_url})
-                        </option>
-                      )}
-                    </For>
-                  </Select>
-                </Field>
-                <div class="f">
-                  <div class="f-l">
-                    <span class="f-lbl">Publisher and name (optional)</span>
-                  </div>
-                  <div class="lib-pair">
-                    <Input
-                      mono
-                      aria-label="publisher"
-                      placeholder="the repository owner"
-                      value={form().publisher}
-                      onValue={(v) => set("publisher", v)}
-                    />
-                    <Input
-                      mono
-                      aria-label="name"
-                      placeholder="the file name"
-                      value={form().name}
-                      onValue={(v) => set("name", v)}
-                    />
-                  </div>
-                  <p class="f-help">
-                    Pipelines name it{" "}
-                    <span class="mono">
-                      lib:{form().publisher || "<owner>"}/{form().name || "<file>"}
-                    </span>
-                    .
-                  </p>
-                </div>
-                <Show when={built().error && form().source.trim() !== "" && !sourceError(form().source)}>
-                  <p class="error">{built().error}</p>
-                </Show>
-                <div class="modal-actions">
-                  <button
-                    class="btn btn-primary btn-sm"
-                    disabled={!built().body || busy() !== ""}
-                    onClick={() => void doFetch()}
-                  >
-                    {busy() === "fetch" ? "Fetching…" : "Fetch and review"}
-                  </button>
-                </div>
-              </div>
-            </Show>
+            <p class="kv-note kv-lead">Give a library's source to fetch it and read it here before installing it.</p>
+            <div class="panel-foot">
+              <button class="btn btn-primary btn-sm" onClick={() => setChanging(true)}>
+                <Icon icon="plus" size={14} /> Install library
+              </button>
+            </div>
           </div>
-
-          <Show when={error()}>
-            <p class="error">{error()}</p>
-          </Show>
-          <Show when={busy() === "fetch"}>
-            <p class="empty">Fetching {form().source}…</p>
-          </Show>
-
-          <Show when={fetched()}>
-            {(f) => (
-              <Show
-                when={f().current}
-                fallback={
+        }
+      >
+        <div class="rv">
+          <div class="panel">
+            <div class="panel-h">
+              <span>{fetched()?.current ? "Upgrade" : "Install"}</span>
+              <button class="btn btn-ghost btn-sm" onClick={() => setChanging(true)}>
+                Change source
+              </button>
+            </div>
+            <dl class="kv">
+              <dt>Library</dt>
+              <dd class="m">{title().startsWith("lib:") ? title() : "the repository owner / the file name"}</dd>
+              <dt>Source</dt>
+              <dd class="m">{fetched()?.source ?? form().source}</dd>
+              <dt>Connection</dt>
+              <dd>{connectionLabel()}</dd>
+              <Show when={fetched()}>
+                {(f) => (
                   <>
-                    <p class="pane-sub" style={{ "margin-top": "18px" }}>
-                      Content · {f().content.split("\n").length} lines
-                    </p>
-                    <div class="ud">
-                      <For each={f().content.split("\n")}>
-                        {(t, k) => (
-                          <div class="ud-row" style={{ "grid-template-columns": "34px 1fr" }}>
-                            <span class="ln">{k() + 1}</span>
-                            <span class="tx">{t}</span>
-                          </div>
-                        )}
-                      </For>
-                    </div>
-                  </>
-                }
-              >
-                {(cur) => (
-                  <Show when={!same()} fallback={<p class="empty">This version is installed already.</p>}>
-                    <p class="pane-sub" style={{ "margin-top": "18px" }}>
-                      Diff · {counts().add} lines added, {counts().del} removed · unchanged lines folded
-                    </p>
-                    <div class="sbs">
-                      <div>
-                        <div class="sbs-h">
-                          installed <span class="lib-hash">{shortHash(cur().content_hash)}</span> · @
-                          {shortHash(cur().source.split("@").pop() ?? "")}
-                        </div>
-                        <div class="ud">
-                          <For each={sides().left}>{(c) => <Cell c={c} side="old" />}</For>
-                        </div>
-                      </div>
-                      <div>
-                        <div class="sbs-h">
-                          fetched <span class="lib-hash">{shortHash(f().content_hash)}</span> · @
-                          {shortHash(f().source.split("@").pop() ?? "")}
-                        </div>
-                        <div class="ud">
-                          <For each={sides().right}>{(c) => <Cell c={c} side="new" />}</For>
-                        </div>
-                      </div>
-                    </div>
-                  </Show>
-                )}
-              </Show>
-            )}
-          </Show>
-        </div>
-
-        <div class="lib-side">
-          <Show when={fetched()}>
-            {(f) => (
-              <>
-                <div class="panel">
-                  <div class="panel-h">
-                    <span>Checks</span>
-                  </div>
-                  <div style={{ padding: "12px 14px" }}>
-                    <ul class="lib-checks">
-                      <For each={checks()}>
-                        {(c) => (
-                          <li class={c.tone}>
-                            <Icon icon={c.tone === "ok" ? "check" : c.tone === "warn" ? "alert-triangle" : "search"} size={12} />
-                            <span>{c.text}</span>
-                          </li>
-                        )}
-                      </For>
-                    </ul>
-                  </div>
-                </div>
-                <div class="panel">
-                  <div class="panel-h">
-                    <span>What changes</span>
-                  </div>
-                  <dl class="lib-facts">
                     <dt>Version</dt>
-                    <dd class="m">
-                      <Show when={f().current} fallback={<span class="lib-hash">{shortHash(f().content_hash)}</span>}>
+                    <dd>
+                      <Show
+                        when={f().current}
+                        fallback={<span class="lib-hash">{shortHash(f().content_hash)}</span>}
+                      >
                         {(cur) => (
                           <>
                             <span class="lib-hash">{shortHash(cur().content_hash)}</span> →{" "}
@@ -374,39 +190,129 @@ function Review(props: { org: string }) {
                     </dd>
                     <dt>Inputs</dt>
                     <dd>
-                      {f().current
-                        ? inputsChange(diffSides(lines()).old, f().content)
-                        : inputsChange("", f().content)}
+                      {f().current ? inputsChange(diffSides(lines()).old, f().content) : inputsChange("", f().content)}
                     </dd>
                     <dt>Runs</dt>
                     <dd>Runs already created keep the Steps they were compiled with.</dd>
-                  </dl>
-                  <div style={{ padding: "0 14px 14px", display: "flex", gap: "8px" }}>
-                    <button
-                      class="btn btn-primary btn-sm"
-                      disabled={busy() !== "" || same()}
-                      onClick={() => void doInstall()}
-                    >
-                      <Icon icon={f().current ? "arrow-up" : "plus"} size={14} />{" "}
-                      {busy() === "install" ? "Installing…" : f().current ? "Upgrade" : "Install"}
-                    </button>
-                    <button class="btn btn-ghost btn-sm" onClick={() => nav(back())}>
-                      Discard
-                    </button>
+                    <dt>Checks</dt>
+                    <dd>
+                      <ul class="lib-checks">
+                        <For each={checks()}>
+                          {(c) => (
+                            <li class={c.tone}>
+                              <Icon
+                                icon={c.tone === "ok" ? "check" : c.tone === "warn" ? "alert-triangle" : "search"}
+                                size={12}
+                              />
+                              <span>{c.text}</span>
+                            </li>
+                          )}
+                        </For>
+                      </ul>
+                    </dd>
+                  </>
+                )}
+              </Show>
+            </dl>
+            <Show when={fetching.loading}>
+              <p class="kv-note">Fetching…</p>
+            </Show>
+            <Show when={fetching.error}>
+              <p class="kv-note error">
+                {fetching.error instanceof Error ? fetching.error.message : "Could not fetch the library."}
+              </p>
+            </Show>
+          </div>
+
+          <Show when={fetched()}>
+            {(f) => (
+              <Show
+                when={f().current}
+                fallback={
+                  <div class="panel">
+                    <div class="panel-h">
+                      <span>Content · {f().content.split("\n").length} lines</span>
+                    </div>
+                    <div class="ud rv-code">
+                      <For each={f().content.split("\n")}>
+                        {(t, k) => (
+                          <div class="ud-row" style={{ "grid-template-columns": "34px 1fr" }}>
+                            <span class="ln">{k() + 1}</span>
+                            <span class="tx">{t}</span>
+                          </div>
+                        )}
+                      </For>
+                    </div>
                   </div>
-                </div>
-              </>
+                }
+              >
+                {(cur) => (
+                  <Show when={!same()} fallback={<p class="empty">This version is installed already.</p>}>
+                    <div class="panel">
+                      <div class="panel-h">
+                        <span>
+                          Diff · {counts().add} lines added, {counts().del} removed · unchanged lines folded
+                        </span>
+                      </div>
+                      <div class="sbs rv-code">
+                        <div>
+                          <div class="sbs-h">
+                            installed <span class="lib-hash">{shortHash(cur().content_hash)}</span> · @
+                            {shortHash(cur().source.split("@").pop() ?? "")}
+                          </div>
+                          <div class="ud">
+                            <For each={sides().left}>{(c) => <Cell c={c} side="old" />}</For>
+                          </div>
+                        </div>
+                        <div>
+                          <div class="sbs-h">
+                            fetched <span class="lib-hash">{shortHash(f().content_hash)}</span> · @
+                            {shortHash(f().source.split("@").pop() ?? "")}
+                          </div>
+                          <div class="ud">
+                            <For each={sides().right}>{(c) => <Cell c={c} side="new" />}</For>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </Show>
+                )}
+              </Show>
             )}
           </Show>
-          <p class="subtle">
-            <small>
-              <Icon icon="shield-check" size={12} /> Installing asks you to confirm with your
-              passkey. The fetched version is stored for review; nothing is installed until you
-              confirm.
-            </small>
-          </p>
+
+          <div class="rv-foot">
+            <button
+              class="btn btn-primary btn-sm"
+              disabled={!fetched() || installing() || same()}
+              onClick={() => void doInstall()}
+            >
+              <Icon icon={fetched()?.current ? "arrow-up" : "plus"} size={14} />{" "}
+              {installing() ? "Installing…" : fetched()?.current ? "Upgrade" : "Install"}
+            </button>
+            <button class="btn btn-ghost btn-sm" onClick={() => nav(back())}>
+              Discard
+            </button>
+            <span class="rv-foot-note">
+              <Show
+                when={error()}
+                fallback={
+                  <>
+                    <Icon icon="shield-check" size={12} /> Installing asks you to confirm with your passkey.
+                    The fetched version is stored for review; nothing is installed until you confirm.
+                  </>
+                }
+              >
+                <span class="error">{error()}</span>
+              </Show>
+            </span>
+          </div>
         </div>
-      </div>
+      </Show>
+
+      <Show when={changing()}>
+        <InstallLibraryDialog org={props.org} initial={form()} onClose={() => setChanging(false)} />
+      </Show>
     </>
   );
 }

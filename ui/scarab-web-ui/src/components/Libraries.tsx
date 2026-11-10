@@ -1,109 +1,76 @@
-// Libraries — the Settings section where an org admin
-// installs a library from a git source, upgrades it after reading the diff,
-// removes it, and yanks a version.
+// Libraries: the Settings section listing an org's installed libraries, one
+// row each, with its version, its state tags and a link to its own page.
 //
-// The panel is a table of installations. Installing and upgrading happen on
-// their own page (`/orgs/<org>/settings/libraries/review`, routes/LibraryReview.tsx):
-// fetch, read the diff and the checks, then install, which asks for a
-// step-up. Removing and yanking tighten and ask for nothing; lifting a yank
-// asks for a step-up. Yanking opens a dialog that says which Runs in
-// progress use the version and can cancel them.
+// Install, top right, opens a dialog for the source; the file is then read
+// and reviewed on its own page (`…/settings/libraries/review`,
+// routes/LibraryReview.tsx) before it is installed. Everything done to one
+// installation (upgrade, trust its source, yank, remove) is on its manage
+// page (`…/settings/libraries/<publisher>~<name>/manage`,
+// routes/LibraryManage.tsx).
 //
-// Every library installs through the review page, whoever publishes it, and
-// a new org has none. No library receives a long-lived forge token until the
-// org trusts its source here; trusting asks for a step-up, and stopping does
-// not.
+// Two things belong to no installation, so they stay here: a yank of a
+// version no installation holds now, and trust in a source no installation
+// comes from. Lifting a yank asks for a step-up; stopping trust does not.
 import { createResource, createSignal, For, Show } from "solid-js";
-import { A, useNavigate } from "@solidjs/router";
+import { A } from "@solidjs/router";
+import { listLibraries, untrustLibrarySource, unyankLibrary } from "../api/client";
 import {
-  listLibraries,
-  removeLibrary,
-  trustLibrarySource,
-  untrustLibrarySource,
-  unyankLibrary,
-  yankImpact,
-  yankLibrary,
-  type LibraryInstallation,
-} from "../api/client";
-import {
-  reviewHref,
+  libraryChips,
+  libraryId,
+  libraryManageHref,
   shortHash,
-  trustKey,
-  trustNote,
-  impactRunLabel,
-  yankButtonLabel,
-  yankImpactLine,
-  yankReasonError,
+  strayTrust,
+  strayYanks,
 } from "../libraries";
 import { relTime, absTime } from "../fmt";
+import Chips from "./Chips";
 import Doodle from "./Doodle";
 import Icon from "./Icon";
-import Modal, { ModalMessage } from "./Modal";
-import ConfirmDestructive, { ConfirmAction } from "./ConfirmDestructive";
-import { Checkbox, Field, Textarea } from "./Field";
+import InstallLibraryDialog from "./LibraryInstall";
+import { ConfirmAction } from "./ConfirmDestructive";
 
 export default function Libraries(props: { org: string }) {
-  const nav = useNavigate();
   const [epoch, setEpoch] = createSignal(0);
   const [libs] = createResource(
     () => ({ org: props.org, epoch: epoch() }),
     (k) => listLibraries(k.org),
   );
-  const [yanking, setYanking] = createSignal<LibraryInstallation | null>(null);
+  const [installing, setInstalling] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
   const [notice, setNotice] = createSignal<string | null>(null);
+  const [untrusting, setUntrusting] = createSignal<string | null>(null);
   const reload = () => setEpoch((e) => e + 1);
 
+  const data = () => (libs.error ? undefined : libs());
   const unavailable = () => !libs.loading && !libs.error && libs() === null;
-  const rows = () => libs()?.installations ?? [];
-  const trusted = () => libs()?.trusted_sources ?? [];
+  const rows = () => data()?.installations ?? [];
+  const trusted = () => data()?.trusted_sources ?? [];
+  const yanks = () => strayYanks(data()?.yanks ?? [], rows());
+  const loneTrust = () => strayTrust(trusted(), rows());
 
-  const act = async (what: () => Promise<unknown>, fallback: string, done?: string) => {
+  const unyank = async (hash: string) => {
     setError(null);
     setNotice(null);
     try {
-      await what();
-      if (done) setNotice(done);
+      await unyankLibrary(props.org, hash);
+      setNotice(`Version ${shortHash(hash)} can run again.`);
       reload();
     } catch (e) {
-      setError(e instanceof Error ? e.message : fallback);
+      setError(e instanceof Error ? e.message : "Could not lift the yank.");
     }
   };
-
-  // The library the confirm dialog is about to remove. A refusal shows in the
-  // dialog.
-  const [removing, setRemoving] = createSignal<LibraryInstallation | null>(null);
-  const libId = (l: LibraryInstallation) => `lib:${l.publisher}/${l.name}`;
-  const remove = async (l: LibraryInstallation) => {
-    setError(null);
-    setNotice(null);
-    await removeLibrary(props.org, l.publisher, l.name);
-    setNotice(`${libId(l)} is removed.`);
-    reload();
-  };
-
-  // The source a confirm dialog is about to trust or stop trusting. A
-  // refusal shows in the dialog.
-  const [trusting, setTrusting] = createSignal<string | null>(null);
-  const [untrusting, setUntrusting] = createSignal<string | null>(null);
-  const done = (msg: string) => {
-    setError(null);
-    setNotice(msg);
-    reload();
-  };
-
-  const unyank = (hash: string) =>
-    void act(
-      () => unyankLibrary(props.org, hash),
-      "Could not lift the yank.",
-      `Version ${shortHash(hash)} can run again.`,
-    );
 
   return (
     <div class="panel">
       <div class="panel-h">
-        <span>Libraries · {props.org}</span>
-        <span class="tok-count">{rows().length}</span>
+        <span>
+          Libraries · {props.org} <span class="tok-count">{rows().length}</span>
+        </span>
+        <Show when={!unavailable()}>
+          <button class="btn btn-primary btn-sm" onClick={() => setInstalling(true)}>
+            <Icon icon="plus" size={14} /> Install library
+          </button>
+        </Show>
       </div>
       <div class="secrets-body">
         <Show when={libs.error}>
@@ -116,7 +83,7 @@ export default function Libraries(props: { org: string }) {
           <p class="notice-ok">{notice()}</p>
         </Show>
 
-        <Show when={!libs.loading} fallback={<p class="empty">loading…</p>}>
+        <Show when={!libs.loading || data()} fallback={<p class="empty">loading…</p>}>
           <Show when={!unavailable()} fallback={<p class="empty">This server does not manage libraries.</p>}>
             <Show
               when={rows().length > 0}
@@ -130,7 +97,8 @@ export default function Libraries(props: { org: string }) {
                     <p class="t2">
                       A Pipeline uses an installed library with{" "}
                       <span class="mono">invoke: lib:&lt;publisher&gt;/&lt;name&gt;</span>. To install
-                      one, enter its source: a file in a git repository at a full commit id, such as{" "}
+                      one, choose Install library and enter its source: a file in a git repository at
+                      a full commit id, such as{" "}
                       <span class="mono">github.com/acme/scarab-libs//deploy-helm.yaml@&lt;commit&gt;</span>.
                       You read the file before it is installed.
                     </p>
@@ -139,21 +107,16 @@ export default function Libraries(props: { org: string }) {
                       library installs the same way, from{" "}
                       <span class="mono">github.com/thulasi-ram/scarab-ci//libs/clone.yaml@&lt;commit&gt;</span>.
                     </p>
-                    <div class="acts">
-                      <button class="btn btn-primary btn-sm" onClick={() => nav(reviewHref(props.org, {}))}>
-                        <Icon icon="plus" size={14} /> Install library
-                      </button>
-                    </div>
                   </div>
                 </div>
               }
             >
-              <table class="table lib-table">
+              <table class="table lib-table" aria-label="Installed libraries">
                 <thead>
                   <tr>
                     <th>Library</th>
                     <th>Version</th>
-                    <th>Source</th>
+                    <th>State</th>
                     <th>Installed</th>
                     <th />
                   </tr>
@@ -161,39 +124,54 @@ export default function Libraries(props: { org: string }) {
                 <tbody>
                   <For each={rows()}>
                     {(l) => (
-                      <LibraryRow
-                        library={l}
-                        trust={trustNote(l, trusted())}
-                        onUpgrade={(source) =>
-                          nav(reviewHref(props.org, { source: source ?? l.source, publisher: l.publisher, name: l.name }))
-                        }
-                        onRemove={() => setRemoving(l)}
-                        onYank={() => setYanking(l)}
-                        onUnyank={() => unyank(l.content_hash)}
-                        onTrust={() => setTrusting(trustKey(l.source))}
-                      />
+                      <tr classList={{ dead: !!l.yanked }}>
+                        <td>
+                          <A class="mono oenv-link" href={libraryManageHref(props.org, l)}>
+                            {libraryId(l)}
+                          </A>
+                        </td>
+                        <td>
+                          <span class="lib-hash" title={l.content_hash}>
+                            {shortHash(l.content_hash)}
+                          </span>
+                        </td>
+                        <td class="keep">
+                          <Chips chips={libraryChips(l, trusted())} />
+                        </td>
+                        <td title={absTime(l.installed_at)}>
+                          <span class="mono">{l.installed_by}</span>{" "}
+                          <span class="subtle">· {relTime(l.installed_at)}</span>
+                        </td>
+                        <td class="acts keep">
+                          <A class="btn btn-ghost btn-sm" href={libraryManageHref(props.org, l)}>
+                            Manage
+                          </A>
+                        </td>
+                      </tr>
                     )}
                   </For>
                 </tbody>
               </table>
             </Show>
 
-            <Show when={(libs()?.yanks ?? []).some((y) => !rows().some((r) => r.content_hash === y.content_hash))}>
-              <p class="subtle">Yanked versions not installed now:</p>
-              <ul class="tok-list">
-                <For each={(libs()?.yanks ?? []).filter((y) => !rows().some((r) => r.content_hash === y.content_hash))}>
+            <Show when={yanks().length > 0}>
+              <h3 class="lib-sub-h">Yanked versions no library holds now</h3>
+              <ul class="tok-list" aria-label="Yanked versions no library holds now">
+                <For each={yanks()}>
                   {(y) => (
-                    <li class="tok tok-dead">
+                    <li class="tok">
                       <div class="tok-head">
-                        <span class="mono">{shortHash(y.content_hash)}</span>
+                        <span class="lib-hash">{shortHash(y.content_hash)}</span>
                         <span class="plg-msg">{y.reason}</span>
-                        <span class="subtle" title={absTime(y.yanked_at)}>
-                          by {y.yanked_by} · {relTime(y.yanked_at)}
-                        </span>
                         <span class="oenv-actions">
-                          <button class="btn btn-ghost btn-sm" onClick={() => unyank(y.content_hash)}>
-                            lift yank
+                          <button class="btn btn-ghost btn-sm" onClick={() => void unyank(y.content_hash)}>
+                            Lift yank
                           </button>
+                        </span>
+                      </div>
+                      <div class="tok-facts" title={absTime(y.yanked_at)}>
+                        <span>
+                          yanked by {y.yanked_by} · {relTime(y.yanked_at)}
                         </span>
                       </div>
                     </li>
@@ -202,31 +180,23 @@ export default function Libraries(props: { org: string }) {
               </ul>
             </Show>
 
-            <Show
-              when={trusted().length > 0}
-              fallback={
-                <p class="subtle">
-                  <small>
-                    <Icon icon="key-round" size={12} /> No source is trusted with forge credentials. No
-                    library receives a long-lived forge token until its source is trusted here.
-                  </small>
-                </p>
-              }
-            >
-              <p class="subtle">Trusted with forge credentials:</p>
-              <ul class="tok-list">
-                <For each={trusted()}>
+            <Show when={loneTrust().length > 0}>
+              <h3 class="lib-sub-h">Trusted sources no library comes from now</h3>
+              <ul class="tok-list" aria-label="Trusted sources no library comes from now">
+                <For each={loneTrust()}>
                   {(t) => (
                     <li class="tok">
                       <div class="tok-head">
-                        <span class="mono">{t.source}</span>
-                        <span class="subtle" title={absTime(t.trusted_at)}>
-                          by {t.trusted_by} · {relTime(t.trusted_at)}
-                        </span>
+                        <span class="mono lib-src">{t.source}</span>
                         <span class="oenv-actions">
                           <button class="btn btn-ghost btn-sm" onClick={() => setUntrusting(t.source)}>
-                            stop trusting
+                            Stop trusting
                           </button>
+                        </span>
+                      </div>
+                      <div class="tok-facts" title={absTime(t.trusted_at)}>
+                        <span>
+                          trusted by {t.trusted_by} · {relTime(t.trusted_at)}
                         </span>
                       </div>
                     </li>
@@ -235,73 +205,20 @@ export default function Libraries(props: { org: string }) {
               </ul>
             </Show>
 
-            <Show when={rows().length > 0}>
-              <div class="secrets-actions">
-                <button class="btn btn-primary btn-sm" onClick={() => nav(reviewHref(props.org, {}))}>
-                  <Icon icon="plus" size={14} /> Install library
-                </button>
-              </div>
-            </Show>
             <p class="subtle">
               <small>
                 <Icon icon="shield-check" size={12} /> An installation is one file at one commit,
-                stored in Scarab: a Pipeline never fetches it. Installing and upgrading, trusting a
-                source, and lifting a yank ask you to confirm with your passkey.
+                stored in Scarab: a Pipeline never fetches it. No library receives a long-lived forge
+                token until the org trusts its source. Installing and upgrading, trusting a source,
+                and lifting a yank ask you to confirm with your passkey.
               </small>
             </p>
           </Show>
         </Show>
       </div>
 
-      <Show when={yanking()}>
-        {(l) => (
-          <YankDialog
-            org={props.org}
-            library={l()}
-            onClose={() => setYanking(null)}
-            onYanked={(msg) => {
-              setYanking(null);
-              done(msg);
-            }}
-          />
-        )}
-      </Show>
-      <Show when={removing()}>
-        {(l) => (
-          <ConfirmDestructive
-            eyebrow={`${props.org} · libraries`}
-            title={`Remove ${libId(l())}?`}
-            purpose="Pipelines that invoke it stop compiling until it is installed again."
-            name={libId(l())}
-            confirmLabel="Remove library"
-            onConfirm={() => remove(l())}
-            onClose={() => setRemoving(null)}
-          >
-            <p>Runs already created keep the Steps they were compiled with.</p>
-          </ConfirmDestructive>
-        )}
-      </Show>
-      <Show when={trusting()}>
-        {(src) => (
-          <ConfirmAction
-            eyebrow={`${props.org} · libraries`}
-            title="Trust this source with forge credentials?"
-            purpose={<span class="mono">{src()}</span>}
-            confirmLabel="Trust source"
-            onConfirm={async () => {
-              await trustLibrarySource(props.org, src());
-              done(`${src()} is trusted with forge credentials.`);
-            }}
-            onClose={() => setTrusting(null)}
-          >
-            <p>
-              A Step from any version installed from this file that asks for{" "}
-              <span class="mono">forge_token</span> may receive a long-lived token of a Forgejo or
-              GitHub PAT connection. Trust holds across upgrades from the same file; review each
-              upgrade's diff. This asks you to confirm with your passkey.
-            </p>
-          </ConfirmAction>
-        )}
+      <Show when={installing()}>
+        <InstallLibraryDialog org={props.org} onClose={() => setInstalling(false)} />
       </Show>
       <Show when={untrusting()}>
         {(src) => (
@@ -313,7 +230,9 @@ export default function Libraries(props: { org: string }) {
             danger
             onConfirm={async () => {
               await untrustLibrarySource(props.org, src());
-              done(`${src()} is no longer trusted with forge credentials.`);
+              setError(null);
+              setNotice(`${src()} is no longer trusted with forge credentials.`);
+              reload();
             }}
             onClose={() => setUntrusting(null)}
           >
@@ -325,221 +244,5 @@ export default function Libraries(props: { org: string }) {
         )}
       </Show>
     </div>
-  );
-}
-
-/** One installation: two table rows, the second only for its notices. */
-function LibraryRow(props: {
-  library: LibraryInstallation;
-  trust: string | null;
-  onUpgrade: (source?: string) => void;
-  onRemove: () => void;
-  onYank: () => void;
-  onUnyank: () => void;
-  onTrust: () => void;
-}) {
-  const l = () => props.library;
-  return (
-    <>
-      <tr classList={{ dead: !!l().yanked }}>
-        <td>
-          <div class="mono" style={{ color: "var(--soft-white)" }}>
-            lib:{l().publisher}/{l().name}
-          </div>
-          <div class="lib-badges" style={{ "margin-top": "4px" }}>
-            <Show when={props.trust}>
-              {(t) => (
-                <span class="tok-state lib-trust" title={t()}>
-                  forge_token
-                </span>
-              )}
-            </Show>
-            <Show when={l().yanked}>
-              <span class="tok-state tok-revoked">yanked</span>
-            </Show>
-          </div>
-        </td>
-        <td>
-          <span class="lib-hash" title={l().content_hash}>
-            {shortHash(l().content_hash)}
-          </span>
-        </td>
-        <td class="lib-src">{l().source}</td>
-        <td class="mono" title={absTime(l().installed_at)}>
-          {l().installed_by}
-          <br />
-          <span class="subtle">{relTime(l().installed_at)}</span>
-        </td>
-        <td class="acts keep">
-          <button class="btn btn-ghost btn-sm" onClick={() => props.onUpgrade()}>
-            upgrade
-          </button>
-          <Show when={!props.trust}>
-            <button
-              class="btn btn-ghost btn-sm"
-              title="Let Steps from this source receive a long-lived forge token"
-              onClick={props.onTrust}
-            >
-              trust source
-            </button>
-          </Show>
-          <Show when={!l().yanked}>
-            <button class="btn btn-danger btn-sm" onClick={props.onYank}>
-              yank
-            </button>
-          </Show>
-          <button class="btn btn-ghost btn-sm" onClick={props.onRemove}>
-            remove
-          </button>
-        </td>
-      </tr>
-      <Show when={l().yanked}>
-        <tr class="sub">
-          <td colspan={5} class="keep">
-            <Show when={l().yanked}>
-              {(y) => (
-                <div class="lib-notice yank" title={absTime(y().yanked_at)}>
-                  <Icon icon="alert-triangle" size={12} /> yanked by {y().yanked_by} ·{" "}
-                  {relTime(y().yanked_at)}: {y().reason}
-                  <button class="btn btn-ghost btn-sm" onClick={props.onUnyank}>
-                    lift yank
-                  </button>
-                </div>
-              )}
-            </Show>
-          </td>
-        </tr>
-      </Show>
-    </>
-  );
-}
-
-/** Yank a version: the Runs in progress that use it, what happens, a
- *  required reason, and an opt-in cancel of those Runs. */
-function YankDialog(props: {
-  org: string;
-  library: LibraryInstallation;
-  onClose: () => void;
-  onYanked: (msg: string) => void;
-}) {
-  const l = () => props.library;
-  const [impact] = createResource(() => yankImpact(props.org, l().content_hash));
-  const [reason, setReason] = createSignal("");
-  const [cancel, setCancel] = createSignal(false);
-  const [busy, setBusy] = createSignal(false);
-  const [error, setError] = createSignal<string | null>(null);
-  const [reasonError, setReasonError] = createSignal<string | null>(null);
-  const runs = () => impact()?.runs ?? [];
-
-  const submit = async () => {
-    const problem = yankReasonError(reason());
-    setReasonError(problem);
-    if (problem) return;
-    setBusy(true);
-    setError(null);
-    try {
-      const y = await yankLibrary(props.org, l().content_hash, reason().trim(), cancel() && runs().length > 0);
-      const cancelled = y.cancelled_runs?.length ?? 0;
-      props.onYanked(
-        `Version ${shortHash(l().content_hash)} is yanked in ${props.org}.` +
-          (cancelled ? ` ${cancelled} ${cancelled === 1 ? "Run was" : "Runs were"} cancelled.` : ""),
-      );
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Could not yank the version.");
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  return (
-    <Modal
-      size="wide"
-      icon="ban"
-      eyebrow={`${props.org} · libraries`}
-      title={
-        <>
-          Yank lib:{l().publisher}/{l().name} <span class="mono">{shortHash(l().content_hash)}</span>
-        </>
-      }
-      purpose="Stop this version from running in this org."
-      busy={busy()}
-      onClose={props.onClose}
-      footer={
-        <>
-          <Show when={error()}>
-            <ModalMessage>{error()}</ModalMessage>
-          </Show>
-          <button class="btn btn-ghost" type="button" onClick={props.onClose} disabled={busy()}>
-            Cancel
-          </button>
-          <button
-            class="btn btn-danger"
-            type="button"
-            disabled={busy() || reason().trim() === ""}
-            onClick={() => void submit()}
-          >
-            <Icon icon="ban" size={14} /> {busy() ? "Yanking…" : yankButtonLabel(cancel(), runs().length)}
-          </button>
-        </>
-      }
-    >
-      <div class="yk-impact">
-        <Show when={!impact.loading} fallback={<div class="yk-count subtle">Counting the Runs that use it…</div>}>
-          <Show when={impact()} fallback={<div class="yk-count subtle">Could not count the Runs that use it.</div>}>
-            {(i) => (
-              <div class="yk-count">
-                {yankImpactLine(i())}
-                <Show when={runs().length > 0}>
-                  <span class="runs">
-                    <For each={runs()}>
-                      {(r, k) => (
-                        <>
-                          {k() > 0 ? " · " : ""}
-                          <A href={`/${props.org}/${r.project}/runs/${r.id}`}>{impactRunLabel(r)}</A>
-                          {r.running_steps.length > 0 ? ` (${r.running_steps.join(", ")} running)` : ""}
-                        </>
-                      )}
-                    </For>
-                  </span>
-                </Show>
-              </div>
-            )}
-          </Show>
-        </Show>
-        <ul class="yk-lines">
-          <li>
-            <span>
-              {cancel() && runs().length > 0
-                ? "The Runs above are cancelled, and their running Steps stop."
-                : "A Step that is running finishes."}
-            </span>
-          </li>
-          <li>
-            <span>
-              A later Step from this version fails as a config error, and Steps that need it do not
-              run. Gates from this version cannot be approved; a timer gate fails.
-            </span>
-          </li>
-          <li>
-            <span>New Runs and Reruns that use this version are refused.</span>
-          </li>
-        </ul>
-        <Show when={runs().length > 0}>
-          <Checkbox
-            checked={cancel()}
-            onChecked={setCancel}
-            label={`Cancel ${runs().length === 1 ? "this Run" : `these ${runs().length} Runs`} now`}
-          />
-        </Show>
-      </div>
-      <Field
-        label="Reason"
-        required
-        help="Shown with every refusal. Other orgs on this server are not affected. Yanking asks for no passkey; lifting a yank does."
-        error={reasonError()}
-      >
-        <Textarea rows={3} autofocus value={reason()} onValue={setReason} />
-      </Field>
-    </Modal>
   );
 }
