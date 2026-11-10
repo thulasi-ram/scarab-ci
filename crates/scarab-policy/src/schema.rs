@@ -17,7 +17,12 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 /// A CEL type, as far as the policy subset needs one.
-#[derive(Clone, Debug, PartialEq)]
+///
+/// Serialised as `{"kind": "list", "of": {"elem": …, "cap": 512}}`,
+/// `{"kind": "struct", "of": "Origin"}`, `{"kind": "string"}`: the
+/// checkpoint schema the policy API serves (`GET /v1/policy-checkpoints`).
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(tag = "kind", content = "of", rename_all = "snake_case")]
 pub enum Type {
     Bool,
     Int,
@@ -68,7 +73,7 @@ impl fmt::Display for Type {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct Field {
     pub name: String,
     pub ty: Type,
@@ -79,6 +84,9 @@ pub struct Field {
     /// element of a list of strings. A struct's strings use their own
     /// fields' caps.
     pub max_len: usize,
+    /// The field's documentation, from the Rust type's doc comment; empty
+    /// when it has none.
+    pub doc: String,
 }
 
 /// The longest string, in bytes, in a checkpoint input: names, ids, refs,
@@ -87,7 +95,7 @@ pub const MAX_STRING_LEN: usize = 1024;
 /// The longest [`FreeText`] string, in bytes: a dispatch reason.
 pub const MAX_FREE_TEXT_LEN: usize = 4096;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct StructDecl {
     pub name: String,
     pub fields: Vec<Field>,
@@ -99,7 +107,7 @@ impl StructDecl {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct EnumDecl {
     pub name: String,
     pub variants: Vec<String>,
@@ -230,19 +238,34 @@ impl PolicyType for Timestamp {
     }
 }
 
+/// The text of one field attribute when it is a doc comment, followed by a
+/// line break; nothing for any other attribute. [`policy_struct!`] joins
+/// them into [`Field::doc`].
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __policy_field_doc {
+    (doc = $doc:literal) => {
+        concat!($doc, "\n")
+    };
+    ($($other:tt)*) => {
+        ""
+    };
+}
+
 /// Declares a checkpoint input struct and its schema from one field list.
+/// A field's doc comment becomes its [`Field::doc`].
 #[macro_export]
 macro_rules! policy_struct {
     (
         $(#[$meta:meta])*
         $vis:vis struct $name:ident {
-            $( $(#[$fmeta:meta])* $fvis:vis $field:ident : $ty:ty ),* $(,)?
+            $( $(#[$($fattr:tt)*])* $fvis:vis $field:ident : $ty:ty ),* $(,)?
         }
     ) => {
         $(#[$meta])*
         #[derive(Clone, Debug, serde::Serialize)]
         $vis struct $name {
-            $( $(#[$fmeta])* $fvis $field : $ty ),*
+            $( $(#[$($fattr)*])* $fvis $field : $ty ),*
         }
 
         impl $crate::schema::PolicyType for $name {
@@ -254,6 +277,9 @@ macro_rules! policy_struct {
                         ty: <$ty as $crate::schema::PolicyType>::policy_type(reg),
                         optional: <$ty as $crate::schema::PolicyType>::OPTIONAL,
                         max_len: <$ty as $crate::schema::PolicyType>::MAX_LEN,
+                        doc: $crate::schema::doc_text(concat!(
+                            $( $crate::__policy_field_doc!($($fattr)*), )* ""
+                        )),
                     } ),*
                 ])
             }
@@ -286,9 +312,22 @@ macro_rules! policy_enum {
     };
 }
 
+/// Doc comment lines, as [`policy_struct!`] joins them, made into one
+/// paragraph: each line trimmed, blank lines dropped.
+pub fn doc_text(raw: &str) -> String {
+    raw.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// The input schema of one PolicyCheckpoint: its root struct's fields are the
 /// CEL variables a rule can read.
-#[derive(Clone, Debug)]
+///
+/// Serialised for the policy editor (`GET /v1/policy-checkpoints`): the
+/// variables, then every struct and enum they name, by name.
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct Schema {
     pub checkpoint: String,
     pub version: u32,

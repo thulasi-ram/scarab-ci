@@ -8,13 +8,13 @@ mod common;
 
 use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
-use scarab_policy::evaluate::{evaluate, MatchContext};
+use scarab_policy::evaluate::{evaluate, MatchContext, PolicyOutcome, PolicyResult};
 use scarab_policy::ir::{compile, Level};
-use scarab_policy::policy::{Checkpoint, Policy};
+use scarab_policy::policy::{Checkpoint, Mode, Policy};
 use scarab_policy::run_create::{self, TriggerKind};
 use scarab_policy::store::{
-    DecisionCursor, DecisionRecord, NewPolicy, PolicyChange, PolicyScope, PolicyStore,
-    PolicyStoreError,
+    DecisionCursor, DecisionFilter, DecisionRecord, NewPolicy, PolicyChange, PolicyDecisionCounts,
+    PolicyScope, PolicyStore, PolicyStoreError,
 };
 use scarab_testkit::InMemoryPolicies;
 use serde_json::json;
@@ -49,6 +49,7 @@ contract_test!(names_are_unique_among_live_policies, unique_names);
 contract_test!(effective_is_org_then_project, effective_policies);
 contract_test!(decisions_round_trip_and_page, decisions);
 contract_test!(names_order_bytewise_in_both_stores, bytewise_name_order);
+contract_test!(decision_log_filters_and_counts, filters_and_counts);
 
 fn body(name: &str, checkpoint: &str, when: &str) -> Policy {
     Policy::from_json(json!({
@@ -403,4 +404,128 @@ async fn decisions(s: &dyn PolicyStore) {
     let run1 = s.decisions_for_run("run-1").await.unwrap();
     assert_eq!(run1.len(), 4);
     assert_eq!(run1[2], admit("a1", 1));
+}
+
+/// An audit-mode Policy `p2`'s result.
+fn audit_result(outcome: PolicyOutcome) -> PolicyResult {
+    PolicyResult {
+        policy_id: "p2".into(),
+        version: 1,
+        name: "watch".into(),
+        level: Level::Org,
+        mode: Mode::Audit,
+        outcome,
+        before_approval: None,
+    }
+}
+
+fn counts(policy_id: &str, matched: u64, denied: u64, would_deny: u64) -> PolicyDecisionCounts {
+    PolicyDecisionCounts {
+        policy_id: policy_id.into(),
+        matched,
+        denied,
+        would_deny,
+    }
+}
+
+/// The decision log's filters (checkpoint, a Policy's result, a time) and
+/// the per-Policy counts read the same decisions in both stores, and the
+/// counts call a failed rule a deny when enforced and a would-deny in audit.
+async fn filters_and_counts(s: &dyn PolicyStore) {
+    // p1 (enforced) passes `a` and `d` and denies `b`; at `c`, a step.admit
+    // decision, p1 does not match and p2 (audit) fails; at `d` p2 would deny.
+    let a = record("f1", Some("run-1"), 1_000, false);
+    let b = record("f2", None, 2_000, true);
+    let mut c = record("f3", Some("run-2"), 3_000, false);
+    c.decision.checkpoint = Checkpoint::StepAdmit;
+    c.step_id = Some("deploy".into());
+    c.attempt = Some(1);
+    c.decision.results[0].outcome = PolicyOutcome::NotMatched;
+    c.decision.results.push(audit_result(PolicyOutcome::Error {
+        message: "boom".into(),
+    }));
+    let mut d = record("f4", Some("run-3"), 4_000, false);
+    d.decision
+        .results
+        .push(audit_result(PolicyOutcome::WouldDeny {
+            messages: vec!["watch".into()],
+        }));
+    let mut elsewhere = record("g1", None, 4_500, true);
+    elsewhere.org = "other".into();
+    for r in [&a, &b, &c, &d, &elsewhere] {
+        s.record_decision(r).await.unwrap();
+    }
+
+    let read = |f: DecisionFilter, limit: usize, before: Option<DecisionCursor>| async move {
+        s.filtered_org_decisions("acme", limit, before.as_ref(), &f)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|d| d.id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        read(DecisionFilter::default(), 0, None).await,
+        ["f4", "f3", "f2", "f1"]
+    );
+    let at = |c: Checkpoint| DecisionFilter {
+        checkpoint: Some(c),
+        ..DecisionFilter::default()
+    };
+    assert_eq!(read(at(Checkpoint::StepAdmit), 0, None).await, ["f3"]);
+    assert_eq!(
+        read(at(Checkpoint::RunCreate), 0, None).await,
+        ["f4", "f2", "f1"]
+    );
+    assert!(read(at(Checkpoint::GateResolve), 0, None).await.is_empty());
+    // A result for the Policy, matched or not.
+    let of = |id: &str| DecisionFilter {
+        policy_id: Some(id.into()),
+        ..DecisionFilter::default()
+    };
+    assert_eq!(read(of("p2"), 0, None).await, ["f4", "f3"]);
+    assert_eq!(read(of("p1"), 0, None).await, ["f4", "f3", "f2", "f1"]);
+    assert!(read(of("p9"), 0, None).await.is_empty());
+    let since = DecisionFilter {
+        since: Some(2_000),
+        ..DecisionFilter::default()
+    };
+    assert_eq!(read(since, 0, None).await, ["f4", "f3", "f2"]);
+    let both = DecisionFilter {
+        checkpoint: Some(Checkpoint::RunCreate),
+        since: Some(2_000),
+        ..DecisionFilter::default()
+    };
+    assert_eq!(read(both.clone(), 0, None).await, ["f4", "f2"]);
+    // A page holds `limit` of the selected decisions, and the cursor goes on.
+    assert_eq!(read(both.clone(), 1, None).await, ["f4"]);
+    let after_f4 = DecisionCursor {
+        at: 4_000,
+        id: "f4".into(),
+    };
+    assert_eq!(read(both, 1, Some(after_f4)).await, ["f2"]);
+    // Another org's decision is never read.
+    assert!(s
+        .filtered_org_decisions("other", 0, None, &of("p2"))
+        .await
+        .unwrap()
+        .is_empty());
+
+    assert_eq!(
+        s.org_decision_counts("acme", 0).await.unwrap(),
+        [counts("p1", 3, 1, 0), counts("p2", 2, 0, 2)]
+    );
+    assert_eq!(
+        s.org_decision_counts("acme", 3_000).await.unwrap(),
+        [counts("p1", 1, 0, 0), counts("p2", 2, 0, 2)]
+    );
+    assert!(s
+        .org_decision_counts("acme", 5_000)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        s.org_decision_counts("other", 0).await.unwrap(),
+        [counts("p1", 1, 1, 0)]
+    );
 }

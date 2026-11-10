@@ -137,6 +137,46 @@ pub fn schema_version(checkpoint: Checkpoint) -> Option<u32> {
 ///
 /// The IR names no stored Policy yet; see [`PolicyIr::with_identity`].
 pub fn compile(policy: &Policy, level: Level) -> Result<PolicyIr, Vec<Diagnostic>> {
+    let PolicyCheck { errors, rules } = check_policy(policy, level);
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    Ok(PolicyIr {
+        policy_id: String::new(),
+        version: 0,
+        content_hash: policy.content_hash(),
+        name: policy.name.clone(),
+        level,
+        checkpoint: policy.checkpoint,
+        match_: policy.match_.clone(),
+        mode: policy.mode,
+        rules: rules.into_iter().map(|(_, r)| r).collect(),
+    })
+}
+
+/// What checking a Policy found: every error, and each rule that compiled,
+/// by its index in `rules` (0 for a typed setting), with its warnings and
+/// the fields it reads. The policy editor shows both while a draft still has
+/// errors; [`compile`] succeeds only when `errors` is empty.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PolicyCheck {
+    pub errors: Vec<Diagnostic>,
+    pub rules: Vec<(usize, RuleIr)>,
+}
+
+impl PolicyCheck {
+    /// The `has()` warnings of the rules that compiled.
+    pub fn warnings(&self) -> impl Iterator<Item = &Diagnostic> {
+        self.rules.iter().flat_map(|(_, r)| match &r.predicate {
+            Predicate::Cel(c) => c.warnings.as_slice(),
+            Predicate::Typed(_) => &[],
+        })
+    }
+}
+
+/// [`compile`]'s checks, keeping the rules that compiled when others did
+/// not.
+pub fn check_policy(policy: &Policy, level: Level) -> PolicyCheck {
     let mut errors = Vec::new();
     validate_name(&policy.name, &mut errors);
     validate_match(&policy.match_, &mut errors);
@@ -146,7 +186,10 @@ pub fn compile(policy: &Policy, level: Level) -> Result<PolicyIr, Vec<Diagnostic
             "checkpoint",
             format!("checkpoint `{}` is not yet supported", policy.checkpoint),
         ));
-        return Err(errors);
+        return PolicyCheck {
+            errors,
+            rules: Vec::new(),
+        };
     }
     if policy.checkpoint != Checkpoint::RunCreate && !policy.match_.trigger_kinds.is_empty() {
         // A Run's trigger is part of the `run.create` input only.
@@ -218,20 +261,23 @@ pub fn compile(policy: &Policy, level: Level) -> Result<PolicyIr, Vec<Diagnostic
                     &mut errors,
                 );
                 match check_in(&schema, &rule.when, &Type::Bool, &mut patterns) {
-                    Ok(checked) => out.push(RuleIr {
-                        predicate: Predicate::Cel(CelPredicate {
-                            source: checked.source,
-                            cost: checked.cost,
-                            warnings: checked
-                                .warnings
-                                .into_iter()
-                                .map(|w| located(w, &format!("{at}.when")))
-                                .collect(),
-                            reads: checked.reads.into_iter().collect(),
-                        }),
-                        effect: rule.effect.clone(),
-                        message: rule.message.clone(),
-                    }),
+                    Ok(checked) => out.push((
+                        i,
+                        RuleIr {
+                            predicate: Predicate::Cel(CelPredicate {
+                                source: checked.source,
+                                cost: checked.cost,
+                                warnings: checked
+                                    .warnings
+                                    .into_iter()
+                                    .map(|w| located(w, &format!("{at}.when")))
+                                    .collect(),
+                                reads: checked.reads.into_iter().collect(),
+                            }),
+                            effect: rule.effect.clone(),
+                            message: rule.message.clone(),
+                        },
+                    )),
                     Err(ds) => {
                         errors.extend(ds.into_iter().map(|d| located(d, &format!("{at}.when"))))
                     }
@@ -250,24 +296,10 @@ pub fn compile(policy: &Policy, level: Level) -> Result<PolicyIr, Vec<Diagnostic
                     ),
                 ));
             }
-            vec![compile_setting(setting, &mut errors)]
+            vec![(0, compile_setting(setting, &mut errors))]
         }
     };
-
-    if !errors.is_empty() {
-        return Err(errors);
-    }
-    Ok(PolicyIr {
-        policy_id: String::new(),
-        version: 0,
-        content_hash: policy.content_hash(),
-        name: policy.name.clone(),
-        level,
-        checkpoint: policy.checkpoint,
-        match_: policy.match_.clone(),
-        mode: policy.mode,
-        rules,
-    })
+    PolicyCheck { errors, rules }
 }
 
 fn located(mut d: Diagnostic, at: &str) -> Diagnostic {

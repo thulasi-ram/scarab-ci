@@ -16,8 +16,9 @@ use sqlx::Row;
 use scarab_policy::evaluate::{DecisionOutcome, PolicyDecision, PolicyResult};
 use scarab_policy::policy::{Checkpoint, Policy};
 use scarab_policy::store::{
-    decision_page_limit, DecisionCursor, DecisionRecord, NewPolicy, PolicyChange, PolicyScope,
-    PolicyStore, PolicyStoreError, PolicyVersion, RunCreationRow, StoredPolicy,
+    decision_page_limit, DecisionCursor, DecisionFilter, DecisionRecord, NewPolicy, PolicyChange,
+    PolicyDecisionCounts, PolicyScope, PolicyStore, PolicyStoreError, PolicyVersion,
+    RunCreationRow, StoredPolicy,
 };
 
 use crate::PostgresDb;
@@ -447,6 +448,74 @@ impl PolicyStore for PostgresDb {
         .await
         .map_err(store_err)?;
         rows.iter().map(decision_from_row).collect()
+    }
+
+    async fn filtered_org_decisions(
+        &self,
+        org: &str,
+        limit: usize,
+        before: Option<&DecisionCursor>,
+        filter: &DecisionFilter,
+    ) -> Result<Vec<DecisionRecord>, PolicyStoreError> {
+        let limit = decision_page_limit(limit) as i64;
+        // `results @> [{"policy_id": …}]`: a result for that Policy, matched
+        // or not, as `DecisionFilter::selects` reads it.
+        let rows = sqlx::query(&format!(
+            "SELECT {DECISION_COLUMNS} FROM policy_decisions \
+             WHERE org = $1 AND ($3::BIGINT IS NULL OR (at, id) < ($3, $4)) \
+             AND ($5::TEXT IS NULL OR checkpoint = $5) \
+             AND ($6::TEXT IS NULL OR results @> jsonb_build_array(jsonb_build_object('policy_id', $6::TEXT))) \
+             AND ($7::BIGINT IS NULL OR at >= $7) \
+             ORDER BY at DESC, id DESC LIMIT $2"
+        ))
+        .bind(org)
+        .bind(limit)
+        .bind(before.map(|c| c.at))
+        .bind(before.map(|c| c.id.as_str()))
+        .bind(filter.checkpoint.map(Checkpoint::as_str))
+        .bind(filter.policy_id.as_deref())
+        .bind(filter.since)
+        .fetch_all(self.pool())
+        .await
+        .map_err(store_err)?;
+        rows.iter().map(decision_from_row).collect()
+    }
+
+    async fn org_decision_counts(
+        &self,
+        org: &str,
+        since: i64,
+    ) -> Result<Vec<PolicyDecisionCounts>, PolicyStoreError> {
+        // One row per Policy, counted as `count_decisions` counts: a failed
+        // rule denies when its Policy was enforced, and is a would-deny in
+        // audit mode.
+        let rows = sqlx::query(
+            "SELECT r->>'policy_id' AS policy_id, \
+               count(*) FILTER (WHERE r->'outcome'->>'kind' <> 'not_matched') AS matched, \
+               count(*) FILTER (WHERE r->'outcome'->>'kind' = 'denied' \
+                 OR (r->'outcome'->>'kind' = 'error' AND r->>'mode' = 'enforce')) AS denied, \
+               count(*) FILTER (WHERE r->'outcome'->>'kind' = 'would_deny' \
+                 OR (r->'outcome'->>'kind' = 'error' AND r->>'mode' = 'audit')) AS would_deny \
+             FROM policy_decisions d CROSS JOIN LATERAL jsonb_array_elements(d.results) r \
+             WHERE d.org = $1 AND d.at >= $2 \
+             GROUP BY 1 \
+             HAVING count(*) FILTER (WHERE r->'outcome'->>'kind' <> 'not_matched') > 0 \
+             ORDER BY 1",
+        )
+        .bind(org)
+        .bind(since)
+        .fetch_all(self.pool())
+        .await
+        .map_err(store_err)?;
+        Ok(rows
+            .iter()
+            .map(|r| PolicyDecisionCounts {
+                policy_id: r.get("policy_id"),
+                matched: r.get::<i64, _>("matched") as u64,
+                denied: r.get::<i64, _>("denied") as u64,
+                would_deny: r.get::<i64, _>("would_deny") as u64,
+            })
+            .collect())
     }
 }
 

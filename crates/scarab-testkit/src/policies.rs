@@ -8,8 +8,9 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use scarab_policy::policy::{Checkpoint, Policy};
 use scarab_policy::store::{
-    decision_page_limit, DecisionCursor, DecisionRecord, NewPolicy, PolicyChange, PolicyScope,
-    PolicyStore, PolicyStoreError, PolicyVersion, StoredPolicy,
+    count_decisions, decision_page_limit, DecisionCursor, DecisionFilter, DecisionRecord,
+    NewPolicy, PolicyChange, PolicyDecisionCounts, PolicyScope, PolicyStore, PolicyStoreError,
+    PolicyVersion, StoredPolicy,
 };
 
 #[derive(Default)]
@@ -283,5 +284,38 @@ impl PolicyStore for InMemoryPolicies {
         out.sort_by(|a, b| (b.at, &b.id).cmp(&(a.at, &a.id)));
         out.truncate(decision_page_limit(limit));
         Ok(out)
+    }
+
+    async fn filtered_org_decisions(
+        &self,
+        org: &str,
+        limit: usize,
+        before: Option<&DecisionCursor>,
+        filter: &DecisionFilter,
+    ) -> Result<Vec<DecisionRecord>, PolicyStoreError> {
+        let st = self.state.lock().unwrap();
+        let mut out: Vec<DecisionRecord> = st
+            .decisions
+            .iter()
+            .filter(|d| d.org == org && filter.selects(d))
+            .filter(|d| before.is_none_or(|c| (d.at, d.id.as_str()) < (c.at, c.id.as_str())))
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| (b.at, &b.id).cmp(&(a.at, &a.id)));
+        out.truncate(decision_page_limit(limit));
+        Ok(out)
+    }
+
+    async fn org_decision_counts(
+        &self,
+        org: &str,
+        since: i64,
+    ) -> Result<Vec<PolicyDecisionCounts>, PolicyStoreError> {
+        let st = self.state.lock().unwrap();
+        Ok(count_decisions(
+            st.decisions
+                .iter()
+                .filter(|d| d.org == org && d.at >= since),
+        ))
     }
 }
