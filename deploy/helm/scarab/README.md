@@ -358,6 +358,23 @@ The StatefulSet's `serviceName` is unchanged, so upgrading needs no migration.
 
 > **Unverified in this chart version:** per-availability-zone placement.
 
+### Upgrading to 0.3.0
+
+Read the Breaking changes of 0.3.0 in `CHANGELOG.md` first. Two of them need an
+action:
+
+- The server Deployment now defaults to `strategy.type: Recreate`, because a
+  0.2.x and a 0.3.0 server must not run at the same time. If you set
+  `strategy` to `RollingUpdate`, set it back for this upgrade.
+- The `clone:` Step kind is replaced by the first-party library
+  `lib:thulasi-ram/clone`. A new org gets it installed when its first
+  repository is bound; an org that existed before the upgrade does not. In
+  each existing org, an org admin opens **Settings › Libraries › Install
+  library**, picks the clone library from the release manifest, reviews it,
+  and confirms with a passkey. Until then a push whose Pipeline invokes it is
+  refused with "`lib:thulasi-ram/clone` is not installed in this org", shown as a
+  refused row in the repository's Runs list.
+
 ### Upgrading from 0.2.1 or earlier
 
 Up to 0.2.1 the StatefulSet's `volumeClaimTemplates` carried the chart and app
