@@ -11,11 +11,17 @@
 // plugin's gates run.
 // Adding a list needs no step-up; changing or deleting an enforced one asks
 // for a passkey (the client's step-up middleware handles that).
+//
+// Under the library lists, a read-only list of the sources the org trusts
+// with the forge token, each with links to the installed libraries that come
+// from it. Trust is not a Policy: it is given on a library's manage page and
+// kept with the org's libraries, so this list only shows it.
 import { createEffect, createResource, createSignal, For, Show } from "solid-js";
-import { useLocation } from "@solidjs/router";
+import { A, useLocation } from "@solidjs/router";
 import {
   createPolicy,
   deletePolicy,
+  listLibraries,
   listPolicies,
   updatePolicy,
   type PolicyRecord,
@@ -35,6 +41,8 @@ import {
   type SettingForm,
   type SettingKind,
 } from "../policies";
+import { libraryId, libraryManageHref, trustedSourceRows } from "../libraries";
+import { absTime, relTime } from "../fmt";
 import ConfirmDestructive from "./ConfirmDestructive";
 import Icon from "./Icon";
 import Modal, { ModalMessage, ModalSection } from "./Modal";
@@ -170,6 +178,9 @@ export default function PolicyLists(props: {
                 </small>
               </p>
             </Show>
+            <Show when={!plugins()}>
+              <TrustedSources org={props.org} />
+            </Show>
           </Show>
         </Show>
       </div>
@@ -214,6 +225,78 @@ export default function PolicyLists(props: {
         )}
       </Show>
     </div>
+  );
+}
+
+/** The sources the org trusts with the forge token, read-only, each with
+ *  the installed libraries that come from it. Nothing when the server does
+ *  not manage libraries. */
+function TrustedSources(props: { org: string }) {
+  const [libs] = createResource(
+    () => props.org,
+    (org) => listLibraries(org),
+  );
+  const data = () => (libs.error ? undefined : libs());
+  const rows = () => {
+    const d = data();
+    return d ? trustedSourceRows(d.trusted_sources, d.installations) : [];
+  };
+  return (
+    <Show when={data()}>
+      <h3 class="lib-sub-h">Sources trusted with the forge token</h3>
+      <Show
+        when={rows().length > 0}
+        fallback={<p class="empty">No source is trusted with the forge token.</p>}
+      >
+        <div class="table-scroll">
+          <table class="table lib-table" aria-label="Sources trusted with the forge token">
+            <thead>
+              <tr>
+                <th>Source</th>
+                <th>Trusted by</th>
+                <th>When</th>
+                <th>Installed libraries</th>
+              </tr>
+            </thead>
+            <tbody>
+              <For each={rows()}>
+                {(t) => (
+                  <tr>
+                    <td class="lib-src">{t.source}</td>
+                    <td>
+                      <span class="mono">{t.trusted_by}</span>
+                    </td>
+                    <td class="nowrap" title={absTime(t.trusted_at)}>
+                      {relTime(t.trusted_at)}
+                    </td>
+                    <td>
+                      <Show when={t.libraries.length > 0} fallback={<span class="subtle">no installed library</span>}>
+                        <For each={t.libraries}>
+                          {(l, k) => (
+                            <>
+                              {k() > 0 ? ", " : ""}
+                              <A class="mono oenv-link" href={libraryManageHref(props.org, l)}>
+                                {libraryId(l)}
+                              </A>
+                            </>
+                          )}
+                        </For>
+                      </Show>
+                    </td>
+                  </tr>
+                )}
+              </For>
+            </tbody>
+          </table>
+        </div>
+      </Show>
+      <p class="subtle">
+        <small>
+          Trust is given on a library's page and needs a passkey. A policy can still refuse the
+          forge token for some projects.
+        </small>
+      </p>
+    </Show>
   );
 }
 

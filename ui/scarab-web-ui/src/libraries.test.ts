@@ -9,6 +9,7 @@ import {
   segmentError,
   removedLibraryYanks,
   strayTrust,
+  trustedSourceRows,
   versionLabel,
   yanksOfLibrary,
   shortHash,
@@ -134,5 +135,17 @@ describe("the list and manage pages", () => {
   it("names a version by its source and a short commit", () => {
     expect(versionLabel(`github.com/acme/libs//x.yaml@${C}`)).toBe("github.com/acme/libs//x.yaml@0123456");
     expect(versionLabel("github.com/acme/libs//x.yaml")).toBe("github.com/acme/libs//x.yaml");
+  });
+  it("matches each trusted source to the installations that come from it", () => {
+    const installed = [
+      { id: "1", source: `github.com/acme/libs//x.yaml@${C}` },
+      { id: "2", source: `github.com/acme/libs//x.yaml@${"f".repeat(40)}` },
+      { id: "3", source: `github.com/acme/libs//x.yaml.bak@${C}` },
+    ];
+    const rows = trustedSourceRows(
+      [{ source: "github.com/acme/libs//x.yaml" }, { source: "github.com/acme/libs//y.yaml" }],
+      installed,
+    );
+    expect(rows.map((r) => r.libraries.map((l) => l.id))).toEqual([["1", "2"], []]);
   });
 });

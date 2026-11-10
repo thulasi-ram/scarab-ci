@@ -705,6 +705,25 @@ test("a library's yanked versions are on its manage page; the list keeps a remov
   expect(errors).toEqual([]);
 });
 
+test("Library policies list the sources trusted with the forge token, read-only", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/orgs/acme/settings/libraries");
+  const table = page.locator("#library-policies").getByRole("table", { name: "Sources trusted with the forge token" });
+  await expect(table.getByRole("row")).toHaveCount(4);
+  const clone = table.getByRole("row").filter({ hasText: "libs/clone.yaml" });
+  await expect(clone).toContainText("a.kim");
+  await expect(clone.getByRole("link", { name: "lib:thulasi-ram/clone" })).toHaveAttribute(
+    "href",
+    "/orgs/acme/settings/libraries/3e81c0a9f2/manage",
+  );
+  const lone = table.getByRole("row").filter({ hasText: "release-notes.yaml" });
+  await expect(lone).toContainText("no installed library");
+  await expect(lone.getByRole("link")).toHaveCount(0);
+  await expect(table.getByRole("button")).toHaveCount(0);
+  await expect(page.getByText("Trust is given on a library's page and needs a passkey.")).toBeVisible();
+  expect(errors).toEqual([]);
+});
+
 test("a library's old publisher~name address goes on to its id address", async ({ page }) => {
   const errors = collectErrors(page);
   await page.goto("/orgs/acme/settings/libraries/acme~http-probe/manage");

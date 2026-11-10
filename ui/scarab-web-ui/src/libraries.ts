@@ -410,3 +410,13 @@ export function strayTrust<T extends { source: string }>(
 ): T[] {
   return trusted.filter((t) => !installed.some((i) => trustKey(i.source) === t.source));
 }
+
+/** Each trusted source with the installations that come from it now, for
+ *  the read-only list under Library policies. An empty `libraries`: no
+ *  installation comes from the source. */
+export function trustedSourceRows<T extends { source: string }, I extends { source: string }>(
+  trusted: readonly T[],
+  installed: readonly I[],
+): (T & { libraries: I[] })[] {
+  return trusted.map((t) => ({ ...t, libraries: installed.filter((i) => trustKey(i.source) === t.source) }));
+}
