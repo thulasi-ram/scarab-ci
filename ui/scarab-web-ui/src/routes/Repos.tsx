@@ -14,6 +14,8 @@ import {
   type RunSummary,
 } from "../api/client";
 import { getVisited } from "../visited";
+import { me } from "../session";
+import { addConnectionHref } from "../settings-nav";
 import { inboxDetail, inboxRuns, inboxVerb } from "../gates";
 import { relTime, absTime } from "../fmt";
 import Icon from "../components/Icon";
@@ -24,6 +26,25 @@ import dungroller from "../../../brand/ascii/generated/dungroller-bare.json";
 const runHref = (r: RunSummary) => `/${r.org ?? "api"}/${r.project ?? "unknown"}/runs/${r.id}`;
 const tenant = (r: RunSummary) => (r.org && r.project ? `${r.org}/${r.project}` : null);
 const shortId = (id: string) => id.slice(0, 8);
+
+// The empty repo list: where repositories come from. A forge connection is
+// added in one place, an org's Connections (or New organization for a global
+// admin with no org), so this links there and does not offer its own.
+function NoRepos() {
+  const href = () => (me() ? addConnectionHref(me()!) : null);
+  return (
+    <>
+      No repos registered yet.{" "}
+      <Show when={href()} fallback="An organization admin adds them by connecting a forge.">
+        {(h) => (
+          <>
+            <A href={h()}>Add a forge connection</A> in Organization settings to bring them in.
+          </>
+        )}
+      </Show>
+    </>
+  );
+}
 
 // One "recently visited" status card: the repo's last runs as a pass/fail strip.
 function RepoStatusCard(props: { p: Project }) {
@@ -188,7 +209,7 @@ export default function Repos() {
           </div>
           <Show
             when={filtered().length > 0}
-            fallback={<p class="empty">{query() ? "No repos match." : "No repos registered yet."}</p>}
+            fallback={<p class="empty">{query() ? "No repos match." : <NoRepos />}</p>}
           >
             <div class="repo-list">
               <For each={filtered()}>
