@@ -1,5 +1,13 @@
 import { describe, it, expect } from "vitest";
-import { orgNameProblem, reposForOrg, resyncNote, soleOwner, unassignedConnections } from "./connections";
+import {
+  connectionFor,
+  forgeName,
+  orgNameProblem,
+  reposForOrg,
+  resyncNote,
+  soleOwner,
+  unassignedConnections,
+} from "./connections";
 
 describe("unassigned connections", () => {
   it("keeps only the connections with no org", () => {
@@ -78,5 +86,18 @@ describe("the org an unassigned connection can take", () => {
   it("is none for repositories of several owners, or none bound", () => {
     expect(soleOwner([{ owner: "acme" }, { owner: "globex" }])).toBeNull();
     expect(soleOwner([])).toBeNull();
+  });
+});
+
+describe("the connection that serves a repository", () => {
+  it("finds it by bound project and names its forge", () => {
+    const conns = [
+      { id: "gh", kind: "github", projects: [{ org: "acme", project: "web" }] },
+      { id: "fj", kind: "forgejo", projects: [{ org: "acme", project: "infra" }] },
+    ];
+    expect(connectionFor(conns, "acme", "infra")?.id).toBe("fj");
+    expect(connectionFor(conns, "globex", "web")).toBeNull();
+    expect(forgeName(connectionFor(conns, "acme", "web")?.kind)).toBe("GitHub");
+    expect(forgeName(undefined)).toBe("the forge");
   });
 });

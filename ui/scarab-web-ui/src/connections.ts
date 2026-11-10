@@ -72,3 +72,21 @@ export function orgNameProblem(name: string): string | null {
   if (/[\s/]/.test(n)) return "Use the forge account name alone, without spaces or slashes.";
   return null;
 }
+
+/** A connection's kind as people name the forge: `GitHub`, `Forgejo`. */
+export function forgeName(kind: string | null | undefined): string {
+  if (kind === "github") return "GitHub";
+  if (kind === "forgejo") return "Forgejo";
+  return "the forge";
+}
+
+/** The connection that serves `org/repo`, from a connection list: the one
+ * whose bound Projects include it. `null` when none in the list does (or the
+ * caller may not list connections). */
+export function connectionFor<T extends { projects: readonly { org: string; project: string }[] }>(
+  conns: readonly T[],
+  org: string,
+  repo: string,
+): T | null {
+  return conns.find((c) => c.projects.some((p) => p.org === org && p.project === repo)) ?? null;
+}

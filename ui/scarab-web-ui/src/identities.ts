@@ -2,7 +2,8 @@
 // DOM, no fetch — so the decisions that are easy to get subtly wrong are
 // testable without rendering: which sign-in buttons to offer, which accounts
 // can still be linked, whether unlinking is allowed, what a link callback's
-// outcome means, and how a flat binding list reads as one row per person.
+// outcome means, how a flat binding list reads as one row per person, who
+// has access to one repository, and what a forge re-sync changed.
 
 /** A configured login provider (`GET /v1/auth/providers`), structurally. */
 export type ProviderLike = { id: string; name: string; default: boolean };
@@ -18,6 +19,9 @@ export type BindingLike = {
   project: string;
   display_name?: string | null;
   claimed?: boolean | null;
+  /** `native` (granted in Scarab) or `import` (from the forge's
+   * collaborators). Absent on an import's response. */
+  origin?: string | null;
 };
 
 export type LoginChoice = { href: string; label: string; primary: boolean };
@@ -189,37 +193,138 @@ export async function confirmMerge(
 export type MemberRow = {
   subject: string;
   display: string;
-  /** `false` = imported from the forge, nobody has signed in as them yet. */
+  /** `true` = imported from the forge, nobody has signed in as them yet. */
   pending: boolean;
-  /** The org-wide role, if any. */
+  /** The org-wide role; `null` = they hold roles in repositories only. */
   orgRole: string | null;
-  /** Per-project roles, by project name. */
-  projects: { project: string; role: string }[];
+  /** The repositories they also hold a role in, by name. Their roles there
+   * are managed on each repository's Settings › Access. */
+  repos: string[];
 };
 
-/** One row per person, alphabetical by what is shown — an admin scanning for
- * "who can deploy" reads names, not binding tuples. */
+/** A person as the binding rows name them: who, under what name, and whether
+ * anyone has signed in as them yet. */
+function person(b: BindingLike) {
+  return {
+    subject: b.subject,
+    display: b.display_name || b.subject,
+    pending: b.claimed === false,
+  };
+}
+
+const byName = (a: { display: string; subject: string }, b: { display: string; subject: string }) =>
+  a.display.localeCompare(b.display) || a.subject.localeCompare(b.subject);
+
+/** The org's Members list: one row per person, with their org role and the
+ * repositories they hold a role in. Someone with repository roles only is a
+ * member in practice, so they are listed too, with no org role. Alphabetical
+ * by what is shown: an admin scanning for a person reads names. */
 export function memberRows(bindings: BindingLike[]): MemberRow[] {
   const by = new Map<string, MemberRow>();
   for (const b of bindings) {
     let row = by.get(b.subject);
     if (!row) {
-      row = {
-        subject: b.subject,
-        display: b.display_name || b.subject,
-        pending: b.claimed === false,
-        orgRole: null,
-        projects: [],
-      };
+      row = { ...person(b), orgRole: null, repos: [] };
       by.set(b.subject, row);
     }
-    if (b.project) row.projects.push({ project: b.project, role: b.role });
-    else row.orgRole = b.role;
+    if (!b.project) row.orgRole = b.role;
+    else if (!row.repos.includes(b.project)) row.repos.push(b.project);
   }
-  for (const row of by.values()) row.projects.sort((a, b) => a.project.localeCompare(b.project));
-  return [...by.values()].sort(
-    (a, b) => a.display.localeCompare(b.display) || a.subject.localeCompare(b.subject),
-  );
+  for (const row of by.values()) row.repos.sort((a, b) => a.localeCompare(b));
+  return [...by.values()].sort(byName);
+}
+
+/** Where a repository role came from: granted in Scarab, or seeded from the
+ * forge's collaborators by a re-sync. `null` when the server did not say. */
+export type RoleSource = "scarab" | "forge" | null;
+
+export function roleSource(origin: string | null | undefined): RoleSource {
+  if (origin === "native") return "scarab";
+  if (origin === "import") return "forge";
+  return null;
+}
+
+export type DirectAccessRow = {
+  subject: string;
+  display: string;
+  pending: boolean;
+  /** The role held on this repository. */
+  role: string;
+  source: RoleSource;
+  /** Their org role too, if any: the higher of the two applies. */
+  orgRole: string | null;
+};
+
+export type OrgAccessRow = {
+  subject: string;
+  display: string;
+  pending: boolean;
+  /** The org role that reaches this repository. */
+  orgRole: string;
+};
+
+/** Who has a role on `repo`: the people bound to it directly, and the people
+ * whose org role reaches it with no binding of their own here. An org role
+ * applies to every repository of the org; a repository role is managed here,
+ * the org role under Members. */
+export function repoAccessRows(
+  bindings: BindingLike[],
+  repo: string,
+): { direct: DirectAccessRow[]; viaOrg: OrgAccessRow[] } {
+  const orgRoles = new Map<string, string>();
+  for (const b of bindings) if (!b.project) orgRoles.set(b.subject, b.role);
+  const direct: DirectAccessRow[] = bindings
+    .filter((b) => b.project === repo)
+    .map((b) => ({
+      ...person(b),
+      role: b.role,
+      source: roleSource(b.origin),
+      orgRole: orgRoles.get(b.subject) ?? null,
+    }))
+    .sort(byName);
+  const here = new Set(direct.map((r) => r.subject));
+  const seen = new Set<string>();
+  const viaOrg: OrgAccessRow[] = [];
+  for (const b of bindings) {
+    if (b.project || here.has(b.subject) || seen.has(b.subject)) continue;
+    seen.add(b.subject);
+    viaOrg.push({ ...person(b), orgRole: b.role });
+  }
+  return { direct, viaOrg: viaOrg.sort(byName) };
+}
+
+export type ResyncChange = { subject: string; display: string; role: string; was?: string };
+
+/** What a forge re-sync of `repo` changed, from the bindings listed before
+ * and after it. Only rows the forge owns count: a re-sync never touches a
+ * role granted in Scarab. A row whose origin is unknown is counted as the
+ * forge's, so an older server still gets a result. */
+export function resyncDiff(
+  before: BindingLike[],
+  after: BindingLike[],
+  repo: string,
+): { added: ResyncChange[]; changed: ResyncChange[]; removed: ResyncChange[] } {
+  const forgeRows = (list: BindingLike[]) =>
+    new Map(
+      list
+        .filter((b) => b.project === repo && b.origin !== "native")
+        .map((b) => [b.subject, b] as const),
+    );
+  const was = forgeRows(before);
+  const now = forgeRows(after);
+  const added: ResyncChange[] = [];
+  const changed: ResyncChange[] = [];
+  const removed: ResyncChange[] = [];
+  for (const [subject, b] of now) {
+    const old = was.get(subject);
+    const row = { subject, display: person(b).display, role: b.role };
+    if (!old) added.push(row);
+    else if (old.role !== b.role) changed.push({ ...row, was: old.role });
+  }
+  for (const [subject, b] of was) {
+    if (!now.has(subject)) removed.push({ subject, display: person(b).display, role: b.role });
+  }
+  return { added: added.sort(byName), changed: changed.sort(byName), removed: removed.sort(byName) };
 }
 
 /**

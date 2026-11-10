@@ -10,6 +10,8 @@ import {
   loginChoices,
   memberRows,
   providerName,
+  repoAccessRows,
+  resyncDiff,
 } from "./identities";
 
 const github = { id: "default", name: "GitHub", default: true };
@@ -93,7 +95,7 @@ describe("linkNotice", () => {
 });
 
 describe("memberRows", () => {
-  it("folds bindings into one row per person, org role apart from projects", () => {
+  it("lists one row per person with their org role and the repositories they also hold a role in", () => {
     const rows = memberRows([
       { subject: "github:zed", role: "viewer", project: "web", display_name: "Zed" },
       { subject: "alice", role: "admin", project: "", display_name: "Alice" },
@@ -107,13 +109,62 @@ describe("memberRows", () => {
       display: "Alice",
       pending: false,
       orgRole: "admin",
-      projects: [
-        { project: "api", role: "viewer" },
-        { project: "web", role: "member" },
-      ],
+      repos: ["api", "web"],
     });
-    expect(rows[1].pending).toBe(true);
-    expect(rows[1].display).toBe("carol");
+    // Repository roles only: still a member, with no org role.
+    expect(rows[1]).toEqual({
+      subject: "carol",
+      display: "carol",
+      pending: true,
+      orgRole: null,
+      repos: ["web"],
+    });
+  });
+});
+
+describe("repoAccessRows", () => {
+  const bindings = [
+    { subject: "a.kim", role: "owner", project: "", display_name: "Avery", origin: "native" },
+    { subject: "j.lee", role: "member", project: "", display_name: "Jordan", origin: "native" },
+    { subject: "j.lee", role: "admin", project: "web", display_name: "Jordan", origin: "native" },
+    { subject: "r.ok", role: "viewer", project: "web", claimed: false, origin: "import" },
+    { subject: "s.p", role: "member", project: "api", display_name: "Sam", origin: "import" },
+    { subject: "old", role: "viewer", project: "web" },
+  ];
+
+  it("splits the people bound to the repository from those its org role reaches", () => {
+    const { direct, viaOrg } = repoAccessRows(bindings, "web");
+    expect(direct).toEqual([
+      { subject: "j.lee", display: "Jordan", pending: false, role: "admin", source: "scarab", orgRole: "member" },
+      { subject: "old", display: "old", pending: false, role: "viewer", source: null, orgRole: null },
+      { subject: "r.ok", display: "r.ok", pending: true, role: "viewer", source: "forge", orgRole: null },
+    ]);
+    // j.lee is bound here, so is not listed again under the org; s.p's role
+    // is on another repository and reaches nothing here.
+    expect(viaOrg).toEqual([{ subject: "a.kim", display: "Avery", pending: false, orgRole: "owner" }]);
+  });
+});
+
+describe("resyncDiff", () => {
+  it("reports the forge's rows added, changed and removed, never a role granted in Scarab", () => {
+    const before = [
+      { subject: "amy", role: "member", project: "web", origin: "native" },
+      { subject: "bo", role: "viewer", project: "web", origin: "import" },
+      { subject: "cy", role: "member", project: "web", origin: "import" },
+      { subject: "di", role: "viewer", project: "api", origin: "import" },
+    ];
+    const after = [
+      { subject: "amy", role: "member", project: "web", origin: "native" },
+      { subject: "bo", role: "admin", project: "web", origin: "import" },
+      { subject: "ed", role: "viewer", project: "web", origin: "import", display_name: "Ed" },
+      { subject: "di", role: "viewer", project: "api", origin: "import" },
+    ];
+    expect(resyncDiff(before, after, "web")).toEqual({
+      added: [{ subject: "ed", display: "Ed", role: "viewer" }],
+      changed: [{ subject: "bo", display: "bo", role: "admin", was: "viewer" }],
+      removed: [{ subject: "cy", display: "cy", role: "member" }],
+    });
+    expect(resyncDiff(before, before, "web")).toEqual({ added: [], changed: [], removed: [] });
   });
 });
 
