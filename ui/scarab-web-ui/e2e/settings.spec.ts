@@ -432,8 +432,10 @@ test("Connections lists the org's connections and, for a global admin, the unass
   const unassigned = page_.locator(".panel", { hasText: "Unassigned connections" });
   await expect(unassigned.getByText("github-install-90211", { exact: true })).toBeVisible();
 
-  // Add repository offers only repositories owned by the org.
-  await page_.getByRole("button", { name: "Add repository" }).click();
+  // Add repository offers only repositories owned by the org. GitHub
+  // connections offer it too now, so the Forgejo row's button is the one.
+  const forgejo = page_.locator("li.conn", { hasText: "forgejo-7f3a91c2" });
+  await forgejo.getByRole("button", { name: "Add repository" }).click();
   await expect(page.getByText("acme/terraform-modules")).toBeVisible();
   await expect(page.getByText("globex/shared-ci")).toHaveCount(0);
   await page.locator(".dlg-scrim").click({ position: { x: 5, y: 5 } });
