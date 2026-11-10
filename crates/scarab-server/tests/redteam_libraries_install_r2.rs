@@ -25,10 +25,9 @@ use scarab_engine::{Clock, Db, Executor, RunId, Scheduler, StepId, StepStatus};
 use scarab_forge::{Event, ForgeConnection, ForgeConnectionStore, ForgeKind, ForgePort, RepoRef};
 use scarab_policy::library::{
     content_hash, LibraryInstallation, LibraryStore, LibraryStoreError, LibraryVersion,
-    LibraryYank, NewInstallation, OrgLibraryDefaults, Replaces,
+    LibraryYank, NewInstallation, Replaces,
 };
 use scarab_server::forge_token::ForgeCredentialExecutor;
-use scarab_server::libraries::{LibraryManifest, ManifestLibrary, ManifestSource, ManifestVersion};
 use scarab_server::library_fetch::{
     append_capped, check_literal_host, is_public_ip, AnonymousFetcher, FetchError, HttpsFetcher,
 };
@@ -98,7 +97,6 @@ fn version(org: &str, publisher: &str, name: &str, content: &str, at: i64) -> Li
         source: format!("github.com/{publisher}/libs//{name}.yaml@{C1}"),
         publisher: publisher.into(),
         name: name.into(),
-        first_party: false,
         fetched_by: "amy".into(),
         fetched_at: at,
     }
@@ -332,15 +330,6 @@ impl LibraryStore for YankedDown {
     ) -> Result<u64, LibraryStoreError> {
         self.0.prune_never_installed(o, k, e).await
     }
-    async fn claim_defaults(&self, o: &str, at: i64) -> Result<bool, LibraryStoreError> {
-        self.0.claim_defaults(o, at).await
-    }
-    async fn defaults(&self, o: &str) -> Result<Option<OrgLibraryDefaults>, LibraryStoreError> {
-        self.0.defaults(o).await
-    }
-    async fn set_defaults(&self, d: &OrgLibraryDefaults) -> Result<(), LibraryStoreError> {
-        self.0.set_defaults(d).await
-    }
 }
 
 /// The store fails while a timer gate from a library is checked. The gate
@@ -454,7 +443,7 @@ struct Api {
     clock: Arc<FakeClock>,
 }
 
-fn api(forge: FakeForge, first_party: Option<LibraryManifest>) -> Api {
+fn api(forge: FakeForge) -> Api {
     let db = Arc::new(InMemoryDb::new());
     let libs = Arc::new(InMemoryLibraries::new());
     let http = Arc::new(FakeHttp::default());
@@ -463,15 +452,11 @@ fn api(forge: FakeForge, first_party: Option<LibraryManifest>) -> Api {
         Arc::new(InMemoryObjectStore::new()),
         db.clone(),
     ));
-    let mut st = AppState::new(db.clone(), clock.clone(), logs)
+    let st = AppState::new(db.clone(), clock.clone(), logs)
         .with_forge(Arc::new(forge))
         .with_forge_connections(db.clone())
         .with_libraries(libs.clone())
         .with_library_fetcher(http.clone());
-    st = st.with_first_party(match first_party {
-        Some(m) => ManifestSource::Fixed(m),
-        None => ManifestSource::Off,
-    });
     Api {
         app: router(st),
         db,
@@ -514,7 +499,7 @@ async fn bind(db: &InMemoryDb, conn: &str, owner: &str, name: &str, org: &str) {
 /// the same connection: the binding is to another org.
 #[tokio::test]
 async fn org_rule_a_shared_app_connection_does_not_open_another_orgs_bound_repo() {
-    let a = api(FakeForge::new().with_file("deploy.yaml", DEPLOY), None);
+    let a = api(FakeForge::new().with_file("deploy.yaml", DEPLOY));
     connect(
         &a.db,
         "github-install-1",
@@ -551,7 +536,7 @@ async fn org_rule_a_shared_app_connection_does_not_open_another_orgs_bound_repo(
 /// `acme`, and the Forgejo connection's credential must not read for it.
 #[tokio::test]
 async fn org_rule_an_owner_of_the_same_name_on_another_forge_is_not_the_org() {
-    let a = api(FakeForge::new().with_file("deploy.yaml", DEPLOY), None);
+    let a = api(FakeForge::new().with_file("deploy.yaml", DEPLOY));
     connect(&a.db, "gh", ForgeKind::GitHub, "https://api.github.com").await;
     connect(&a.db, "fj", ForgeKind::Forgejo, "https://git.example.com").await;
     bind(&a.db, "gh", "acme", "web", "acme").await;
@@ -579,7 +564,7 @@ async fn org_rule_an_owner_of_the_same_name_on_another_forge_is_not_the_org() {
 /// forge: the old binding must not carry over to the new forge.
 #[tokio::test]
 async fn org_rule_a_recreated_connection_id_does_not_inherit_the_old_binding() {
-    let a = api(FakeForge::new().with_file("deploy.yaml", DEPLOY), None);
+    let a = api(FakeForge::new().with_file("deploy.yaml", DEPLOY));
     connect(&a.db, "c1", ForgeKind::Forgejo, "https://git.example.com").await;
     bind(&a.db, "c1", "acme-tools", "libs", "acme").await;
     a.db.delete_connection("c1").await.unwrap();
@@ -595,54 +580,6 @@ async fn org_rule_a_recreated_connection_id_does_not_inherit_the_old_binding() {
     )
     .await;
     assert_eq!(st, StatusCode::FORBIDDEN, "{b}");
-}
-
-/// The defaults retry reads through `read_source` too: a mirror on another
-/// org's private repository, through a connection that reaches it, is
-/// refused by the org rule (the forge is not read, so the manifest-hash
-/// comparison never runs as an oracle on another org's file).
-#[tokio::test]
-async fn defaults_retry_a_mirror_on_another_orgs_repo_obeys_the_org_rule() {
-    let manifest = LibraryManifest {
-        schema: 1,
-        release: "v1".into(),
-        libraries: vec![ManifestLibrary {
-            publisher: "thulasi-ram".into(),
-            name: "clone".into(),
-            versions: vec![ManifestVersion {
-                content_hash: content_hash(DEPLOY),
-                source: format!("github.com/thulasi-ram/scarab-ci//libs/clone.yaml@{C1}"),
-                release: "v1".into(),
-                security_fix: false,
-            }],
-        }],
-    };
-    let a = api(
-        FakeForge::new().with_file("libs/clone.yaml", DEPLOY),
-        Some(manifest),
-    );
-    connect(&a.db, "gh", ForgeKind::GitHub, "https://api.github.com").await;
-    bind(&a.db, "gh", "globex", "private", "globex").await;
-    let (st, b) = call(
-        &a.app,
-        "POST",
-        "/v1/orgs/acme/library-defaults/retry",
-        Some(json!({ "mirror": "github.com/globex/private", "connection": "gh" })),
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK, "{b}");
-    assert!(
-        a.libs
-            .installation("acme", "thulasi-ram", "clone")
-            .await
-            .unwrap()
-            .is_none(),
-        "installed from another org's private repository: {b}"
-    );
-    assert!(
-        b.to_string().contains("does not belong to org `acme`"),
-        "not refused by the org rule: {b}"
-    );
 }
 
 // ===========================================================================
@@ -769,7 +706,7 @@ fn fetch_the_body_cap_refuses_one_byte_past_it() {
 /// installed), never with a store error or an install of other content.
 #[tokio::test]
 async fn prune_a_review_pushed_past_the_bound_fails_closed() {
-    let a = api(FakeForge::new(), None);
+    let a = api(FakeForge::new());
     let mut hashes = Vec::new();
     for i in 0..52 {
         let content = format!("{DEPLOY}# {i}\n");

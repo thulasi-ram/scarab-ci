@@ -489,7 +489,7 @@ pub(crate) fn governed_routes() -> Routes {
             "/v1/runs/{id}/policy-decisions",
             pol::list_run_policy_decisions,
         )
-        // ADR-0076: org-installed libraries, yanks, first-party defaults.
+        // ADR-0076: org-installed libraries, yanks, trusted sources.
         .get("/v1/orgs/{org}/libraries", lib::list_libraries)
         .get(
             "/v1/orgs/{org}/library-yanks/{hash}/impact",
@@ -521,11 +521,6 @@ pub(crate) fn governed_routes() -> Routes {
             lib::unyank_library,
         )
         .post(
-            "/v1/orgs/{org}/library-defaults/retry",
-            &ops::LIBRARY_DEFAULTS_RETRY,
-            lib::retry_library_defaults,
-        )
-        .post(
             "/v1/orgs/{org}/library-trust",
             &ops::LIBRARY_TRUST,
             lib::trust_library_source,
@@ -535,7 +530,11 @@ pub(crate) fn governed_routes() -> Routes {
             &ops::LIBRARY_UNTRUST,
             lib::untrust_library_source,
         )
-        .get("/v1/orgs/{org}/plugin-catalog", plugins::plugin_catalog)
+        .post(
+            "/v1/orgs/{org}/plugin-fetch",
+            &ops::PLUGIN_FETCH,
+            plugins::fetch_plugin_manifest,
+        )
         .get("/v1/orgs/{org}/plugins", plugins::list_plugins)
         .get(
             "/v1/orgs/{org}/gates",

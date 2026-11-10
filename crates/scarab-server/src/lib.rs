@@ -100,7 +100,7 @@ pub mod oauth;
 pub mod oidc;
 /// ADR-0071: the minimal org-level Environment — its admin/read API.
 pub mod org_environments;
-/// ADR-0072: PluginInstallations — the first-party catalog, install,
+/// ADR-0072: PluginInstallations — fetch a manifest to review, install,
 /// uninstall and the kill switch.
 pub mod plugin_gates;
 /// ADR-0072 §9: the plugin runtime's leased reconcile loop — namespace
@@ -118,6 +118,8 @@ mod routes;
 mod run_gate_view;
 pub mod run_origin;
 pub mod schedules;
+#[doc(hidden)]
+pub mod test_support;
 pub use routes::{route_table, RouteEntry};
 pub mod secret_executor;
 pub mod step_up;
@@ -219,9 +221,6 @@ pub struct AppState {
     /// Reads a library from a public forge (ADR-0076 §4). `None`: only
     /// installs through a ForgeConnection work.
     pub library_fetcher: Option<Arc<dyn library_fetch::AnonymousFetcher>>,
-    /// The release manifest that says which library versions are
-    /// first-party (ADR-0076 §5). Off unless wired.
-    pub first_party: Arc<libraries::FirstParty>,
     /// Org-level Environments (ADR-0071, MMP step 1). `None` disables
     /// `/v1/orgs/{org}/environments[/{env}]` (404).
     pub org_environments: Option<Arc<dyn scarab_project::OrgEnvironmentStore>>,
@@ -250,8 +249,8 @@ pub struct AppState {
     /// the audience `scarab-api` in production, static dev tokens under
     /// `SCARAB_DEV_INSECURE`. `None`: no plugin can list or resolve a gate.
     pub plugin_api_tokens: Option<Arc<dyn scarab_plugin::PluginTokenVerifier>>,
-    /// Whether installs are on, the plugin namespace, the first-party
-    /// catalog's repository and the dev tag knob. Off by default.
+    /// Whether installs are on, the plugin namespace and the dev tag knob.
+    /// Off by default.
     pub plugin_policy: Arc<plugins::PluginPolicy>,
     /// "Intentionally unset" markers for the secret coverage matrix (ADR-0037 D).
     /// Advisory annotations only — `None` disables marking, and the matrix simply
@@ -367,7 +366,6 @@ impl AppState {
             policies: None,
             libraries: None,
             library_fetcher: None,
-            first_party: Arc::new(libraries::FirstParty::new(libraries::ManifestSource::Off)),
             org_environments: None,
             plugins: None,
             broker_plugins: None,
@@ -481,12 +479,6 @@ impl AppState {
         fetcher: Arc<dyn library_fetch::AnonymousFetcher>,
     ) -> Self {
         self.library_fetcher = Some(fetcher);
-        self
-    }
-
-    /// Where the first-party release manifest is read from (ADR-0076 §5).
-    pub fn with_first_party(mut self, source: libraries::ManifestSource) -> Self {
-        self.first_party = Arc::new(libraries::FirstParty::new(source));
         self
     }
 
@@ -13303,10 +13295,6 @@ async fn bind_repo(
             scarab_forge::RegistryError::BoundElsewhere { .. } => ApiError::Conflict(e.to_string()),
             e => ApiError::BadRequest(e.to_string()),
         })?;
-    // A new org gets the first-party libraries (ADR-0076 §5): claimed now,
-    // installed in the background, so the bind never waits on a forge.
-    libraries::offer_defaults_on_bind(&st, &repo.owner).await;
-
     let (webhook_registered, webhook_error) = if req.register_webhook {
         match try_register_webhook(&st, &conn, &repo).await {
             Ok(()) => (true, None),
@@ -13690,15 +13678,16 @@ const TAG_GROUPS: &[(&str, &str)] = &[
     ),
     (
         "Plugins",
-        "PluginInstallations (ADR-0072): the first-party catalog, install and \
-         uninstall, the kill switch, the PluginConnections the \
+        "PluginInstallations (ADR-0072): fetch a manifest to review, install \
+         and uninstall, the kill switch, the PluginConnections the \
          CredentialBroker proxies to, and its journal of what each plugin \
          asked for.",
     ),
     (
         "Libraries",
         "Org-installed libraries (ADR-0076): fetch a version to review, \
-         install, upgrade and remove, yanks, and the first-party defaults.",
+         install, upgrade and remove, yanks, and the sources trusted with forge \
+         credentials.",
     ),
     (
         "Policies",
@@ -13762,7 +13751,7 @@ fn tag_for_path(path: &str) -> Option<&'static str> {
         // Before Runs: `/v1/runs/{id}/policy-decisions` is a Policy read.
         "Policies"
     } else if path.contains("/plugins")
-        || path.contains("/plugin-catalog")
+        || path.contains("/plugin-fetch")
         || path == "/v1/orgs/{org}/gates"
     {
         "Plugins"
@@ -14041,7 +14030,6 @@ impl utoipa::Modify for StepUpResponses {
         libraries::remove_library,
         libraries::yank_library,
         libraries::unyank_library,
-        libraries::retry_library_defaults,
         libraries::trust_library_source,
         libraries::untrust_library_source,
         libraries::get_yank_impact,
@@ -14067,7 +14055,7 @@ impl utoipa::Modify for StepUpResponses {
         policies::list_org_policy_decisions,
         policies::org_policy_decision_counts,
         policies::list_run_policy_decisions,
-        plugins::plugin_catalog,
+        plugins::fetch_plugin_manifest,
         plugins::list_plugins,
         plugins::install_plugin,
         plugins::get_plugin,
@@ -14245,10 +14233,6 @@ impl utoipa::Modify for StepUpResponses {
         libraries::OrgLibrariesDto,
         libraries::LibraryInstallationDto,
         libraries::LibraryYankDto,
-        libraries::UpdateNoticeDto,
-        libraries::FirstPartyLibraryDto,
-        libraries::LibraryDefaultsDto,
-        libraries::MissingDefaultDto,
         libraries::FetchLibraryRequest,
         libraries::FetchedLibraryDto,
         libraries::InstalledVersionDto,
@@ -14271,7 +14255,6 @@ impl utoipa::Modify for StepUpResponses {
         run_origin::BoundInputDto,
         run_origin::RenderedSpecDto,
         run_origin::StepOriginDto,
-        libraries::RetryDefaultsRequest,
         libraries::TrustedSourceDto,
         libraries::TrustSourceRequest,
         policies::PolicyDto,
@@ -14301,7 +14284,9 @@ impl utoipa::Modify for StepUpResponses {
         plugins::PluginManifestDto,
         plugins::GateDefinitionDto,
         plugins::GateFieldDto,
-        plugins::PluginCatalogEntryDto,
+        plugins::FetchPluginManifestRequest,
+        plugins::FetchedPluginManifestDto,
+        plugins::InstalledPluginManifestDto,
         plugins::InstallationStateDto,
         plugins::RuntimeStatusDto,
         plugins::PluginInstallationDto,

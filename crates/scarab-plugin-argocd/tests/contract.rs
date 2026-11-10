@@ -33,6 +33,7 @@ use scarab_plugin::{PluginTokenVerifier, TokenRejected, VerifiedServiceAccount};
 use scarab_plugin_argocd::broker::Broker;
 use scarab_plugin_argocd::{standby, Config};
 use scarab_server::plugins::PluginPolicy;
+use scarab_server::test_support::{argocd_fetcher, argocd_install_body};
 use scarab_server::{broker, router, AppState, LogService};
 use scarab_testkit::{FakeClock, FakeSecrets, InMemoryDb, InMemoryObjectStore};
 
@@ -100,7 +101,8 @@ struct World {
 }
 
 /// Scarab (public API + broker) over a fresh database, the fake Argo CD,
-/// and the first-party plugin installed as `argo` with its connection bound
+/// and the Argo CD plugin installed as `argo` from its manifest's source,
+/// with its connection bound
 /// to the fake.
 async fn world() -> Option<World> {
     let tdb = support::fresh_db().await?;
@@ -118,11 +120,12 @@ async fn world() -> Option<World> {
             PluginPolicy {
                 enabled: true,
                 namespace: NAMESPACE.into(),
-                argocd_repo: REPO.into(),
                 dev_allow_tag: false,
             },
         )
         .with_plugin_tokens(Arc::new(FakeTokenReview))
+        // The manifest an admin installs from, served without a network.
+        .with_library_fetcher(Arc::new(argocd_fetcher()))
         .with_secrets(Arc::new(FakeSecrets::new()));
     // The fake Argo CD listens on 127.0.0.1, which the broker refuses by
     // default.
@@ -136,11 +139,10 @@ async fn world() -> Option<World> {
         &public,
         "POST",
         &format!("/v1/orgs/{ORG}/plugins"),
-        Some(json!({
-            "name": INSTALLATION,
-            "plugin": "argocd",
-            "image": format!("{REPO}@sha256:{}", "a".repeat(64)),
-        })),
+        Some(argocd_install_body(
+            INSTALLATION,
+            &format!("{REPO}@sha256:{}", "a".repeat(64)),
+        )),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");

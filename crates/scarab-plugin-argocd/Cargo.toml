@@ -4,7 +4,7 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 
-# The first-party Argo CD Plugin (ADR-0072 §5/§11): reads Argo CD through the
+# The Argo CD Plugin (ADR-0072 §5/§11): reads Argo CD through the
 # CredentialBroker's read proxy. ADR-0074 removed the Deployment record it used
 # to report into; its Argo CD types and status rules stay as library code.
 #
@@ -13,8 +13,9 @@ license.workspace = true
 # again here in its own types — so a broker change that breaks the contract
 # breaks this crate's contract test, not a hidden shared type.
 #
-# `manifest.json` is compiled into the server's first-party catalog
-# (`include_str!`); it is the authority on what this plugin may read.
+# `manifest.json` is what an org admin installs it with (fetched from this
+# repository at a commit, like any plugin's manifest); it is the authority on
+# what this plugin may read.
 
 [lib]
 name = "scarab_plugin_argocd"

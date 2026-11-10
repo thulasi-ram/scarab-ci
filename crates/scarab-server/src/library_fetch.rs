@@ -67,10 +67,10 @@ fn host_ok(h: &str) -> bool {
         })
 }
 
-fn path_ok(p: &str) -> bool {
+fn path_ok(p: &str, extensions: &[&str]) -> bool {
     !p.is_empty()
         && p.len() <= 512
-        && (p.ends_with(".yaml") || p.ends_with(".yml"))
+        && extensions.iter().any(|e| p.ends_with(e))
         && p.split('/').all(|seg| {
             !seg.is_empty()
                 && seg != "."
@@ -84,8 +84,19 @@ fn path_ok(p: &str) -> bool {
 impl LibrarySource {
     /// Parses `[https://]<host>/<owner>/<repo>//<path>@<commit>`. The host is
     /// a lowercase DNS name with no port; the commit is a full commit id, so
-    /// the content cannot change after the admin reviews it.
+    /// the content cannot change after the admin reviews it. A library is a
+    /// `.yaml` or `.yml` file.
     pub fn parse(raw: &str) -> Result<Self, String> {
+        Self::parse_with(raw, &[".yaml", ".yml"])
+    }
+
+    /// [`parse`](Self::parse) for a plugin manifest: the same source, read
+    /// the same way, and the file may also be `.json`.
+    pub fn parse_manifest(raw: &str) -> Result<Self, String> {
+        Self::parse_with(raw, &[".json", ".yaml", ".yml"])
+    }
+
+    fn parse_with(raw: &str, extensions: &[&str]) -> Result<Self, String> {
         let shape = "a source is `<host>/<owner>/<repo>//<path>@<commit>`, for example \
                      `github.com/acme/scarab-libs//deploy-helm.yaml@<40-character commit>`";
         let text = raw.trim();
@@ -127,9 +138,14 @@ impl LibrarySource {
                 "{shape}: `{owner}/{repo}` is not a repository name"
             ));
         }
-        if !path_ok(path) {
+        if !path_ok(path, extensions) {
             return Err(format!(
-                "{shape}: `{path}` is not a repo-relative `.yaml` path"
+                "{shape}: `{path}` is not a repo-relative path ending in {}",
+                extensions
+                    .iter()
+                    .map(|e| format!("`{e}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
         }
         Ok(LibrarySource {

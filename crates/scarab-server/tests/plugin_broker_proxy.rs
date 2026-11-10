@@ -1,5 +1,5 @@
 //! The CredentialBroker's read proxy over HTTP (ADR-0072 §5, MMP slice d3):
-//! an org admin binds the first-party plugin's `argocd` connection slot on
+//! an org admin binds the Argo CD plugin's `argocd` connection slot on
 //! the public API, and the plugin reads through the broker's own router.
 //!
 //! The upstream is a real HTTP server — an in-process axum app on
@@ -36,6 +36,7 @@ use scarab_server::broker_proxy::{
     CREDENTIAL_MAX_AGE, KILL_RECHECK_INTERVAL, PROXY_CONCURRENCY_PER_INSTALLATION,
 };
 use scarab_server::plugins::{PluginPolicy, PLUGIN_CONNECTION_CREDENTIALS_ORG};
+use scarab_server::test_support::{argocd_fetcher, argocd_install_body};
 use scarab_server::{broker, router, AppState, LogService};
 use scarab_testkit::{FakeClock, FakeSecrets, InMemoryDb, InMemoryObjectStore};
 
@@ -214,11 +215,11 @@ async fn harness_with(adjust: impl FnOnce(AppState) -> AppState) -> Option<Harne
             PluginPolicy {
                 enabled: true,
                 namespace: NAMESPACE.into(),
-                argocd_repo: REPO.into(),
                 dev_allow_tag: false,
             },
         )
         .with_plugin_tokens(Arc::new(FakeTokenReview))
+        .with_library_fetcher(Arc::new(argocd_fetcher()))
         .with_secrets(secrets.clone())
         // The fake upstream listens on 127.0.0.1.
         .with_broker_upstream_loopback_allowed(true);
@@ -273,17 +274,17 @@ async fn admin(
     (status, body)
 }
 
-/// Install the first-party plugin as `argo` in `acme`; returns (id, token).
+/// Install the Argo CD plugin as `argo` in `acme`, from its manifest's
+/// source like any plugin; returns (id, token).
 async fn install(h: &Harness) -> (String, String) {
     let (status, body) = admin(
         &h.public,
         "POST",
         "/v1/orgs/acme/plugins",
-        Some(json!({
-            "name": "argo",
-            "plugin": "argocd",
-            "image": format!("{REPO}@sha256:{}", "a".repeat(64)),
-        })),
+        Some(argocd_install_body(
+            "argo",
+            &format!("{REPO}@sha256:{}", "a".repeat(64)),
+        )),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");

@@ -34,7 +34,7 @@ use scarab_project::ProjectError;
 /// overlays and grants, and the one-snapshot read admission makes.
 mod environment_governance;
 /// `LibraryStore` (ADR-0076): installed libraries, their versions, yanks
-/// and each org's first-party defaults.
+/// and the sources each org trusts with forge credentials.
 mod libraries;
 /// `OrgEnvironmentStore` (ADR-0071): the org-level Environment.
 mod org_environments;

@@ -9,7 +9,8 @@
 //! one live tier that makes network calls.
 //!
 //! On one push to a private repository, with a PAT connection (one long-lived
-//! token) and the first-party clone library installed by the org defaults:
+//! token) and the clone library installed by an org admin from its source on
+//! github.com, with that source trusted:
 //!
 //! - `ci` clones the private repository through `lib:thulasi-ram/clone` and a
 //!   later Step reads a file from it;
@@ -57,6 +58,7 @@ async fn a_private_repo_clones_with_the_forge_token_and_nothing_else_gets_it() {
     let owner = env("SCARAB_TEST_FORGEJO_OWNER");
     let name = env("SCARAB_TEST_FORGEJO_PRIVATE_REPO");
     let clone_hash = env("SCARAB_TEST_CLONE_HASH");
+    let clone_source = env("SCARAB_TEST_CLONE_SOURCE");
     let repo = format!("{owner}/{name}");
 
     // The repository is private: an anonymous clone could not succeed.
@@ -77,42 +79,76 @@ async fn a_private_repo_clones_with_the_forge_token_and_nothing_else_gets_it() {
     reclaim_quick_tunnel_connections(&http, &base).await;
     let (org, project) = connect_and_bind(&http, &base, &https, &token, &owner, &name).await;
 
-    // --- 1. the org defaults installed the first-party clone library --------
-    let installed = |libs: &serde_json::Value| {
-        libs["installations"]
+    // --- 1. an org admin installs the clone library and trusts its source ----
+    // Nothing is installed in an org by default, and a PAT connection's
+    // long-lived token reaches only a Step from a trusted source. The org may
+    // be left from an earlier run, so each call is idempotent: an install
+    // replaces what is there, and trusting a trusted source keeps its record.
+    let fetched = json_ok(
+        http.post(format!("{base}/v1/orgs/{org}/libraries/fetch"))
+            .json(&serde_json::json!({
+                "source": clone_source,
+                "publisher": "thulasi-ram",
+                "name": "clone",
+            }))
+            .send()
+            .await
+            .expect("POST libraries/fetch"),
+        "fetch the clone library",
+    )
+    .await;
+    assert_eq!(fetched["content_hash"], clone_hash.as_str(), "{fetched:#}");
+    if fetched["current"]["content_hash"] != clone_hash.as_str() {
+        json_ok(
+            http.put(format!("{base}/v1/orgs/{org}/libraries/thulasi-ram/clone"))
+                .json(&serde_json::json!({
+                    "content_hash": clone_hash,
+                    "replaces": fetched["current"]["content_hash"],
+                }))
+                .send()
+                .await
+                .expect("PUT libraries/thulasi-ram/clone"),
+            "install the clone library",
+        )
+        .await;
+    }
+    let trust_key = clone_source
+        .rsplit_once('@')
+        .map_or(clone_source.as_str(), |(path, _)| path)
+        .to_string();
+    json_ok(
+        http.post(format!("{base}/v1/orgs/{org}/library-trust"))
+            .json(&serde_json::json!({ "source": trust_key }))
+            .send()
+            .await
+            .expect("POST library-trust"),
+        "trust the clone library's source",
+    )
+    .await;
+    let libs = json_ok(
+        http.get(format!("{base}/v1/orgs/{org}/libraries"))
+            .send()
+            .await
+            .expect("GET libraries"),
+        "list libraries",
+    )
+    .await;
+    let clone = libs["installations"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|i| i["publisher"] == "thulasi-ram" && i["name"] == "clone")
+        .cloned()
+        .unwrap_or_else(|| panic!("clone is not installed: {libs:#}"));
+    assert_eq!(clone["content_hash"], clone_hash.as_str(), "{clone:#}");
+    assert!(
+        libs["trusted_sources"]
             .as_array()
             .into_iter()
             .flatten()
-            .find(|i| i["publisher"] == "thulasi-ram" && i["name"] == "clone")
-            .cloned()
-    };
-    let list = || async {
-        json_ok(
-            http.get(format!("{base}/v1/orgs/{org}/libraries"))
-                .send()
-                .await
-                .expect("GET libraries"),
-            "list libraries",
-        )
-        .await
-    };
-    let mut libs = list().await;
-    if installed(&libs).is_none() {
-        // An org first bound before the manifest was set: ask again.
-        json_ok(
-            http.post(format!("{base}/v1/orgs/{org}/library-defaults/retry"))
-                .json(&serde_json::json!({}))
-                .send()
-                .await
-                .expect("POST library-defaults/retry"),
-            "retry defaults",
-        )
-        .await;
-        libs = list().await;
-    }
-    let clone = installed(&libs).unwrap_or_else(|| panic!("clone is not installed: {libs:#}"));
-    assert_eq!(clone["first_party"], true, "{clone:#}");
-    assert_eq!(clone["content_hash"], clone_hash.as_str(), "{clone:#}");
+            .any(|t| t["source"] == trust_key.as_str()),
+        "{libs:#}"
+    );
 
     // --- 2. one push to main -------------------------------------------------
     let before = run_ids(&http, &base, &org, &project).await;

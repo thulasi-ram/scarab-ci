@@ -9,8 +9,8 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use scarab_pipeline::InstalledLibrary;
 use scarab_policy::library::{
-    DefaultsState, LibraryInstallation, LibraryStore, LibraryStoreError, LibraryVersion,
-    LibraryYank, NewInstallation, OrgLibraryDefaults, Replaces, TrustedSource,
+    LibraryInstallation, LibraryStore, LibraryStoreError, LibraryVersion, LibraryYank,
+    NewInstallation, Replaces, TrustedSource,
 };
 
 #[derive(Default)]
@@ -23,7 +23,6 @@ struct State {
     yanks: BTreeMap<(String, String), LibraryYank>,
     /// (org, hash) of every version installed at least once.
     installed_once: BTreeSet<(String, String)>,
-    defaults: BTreeMap<String, OrgLibraryDefaults>,
     /// (org, source) → trust.
     trusted: BTreeMap<(String, String), TrustedSource>,
 }
@@ -37,7 +36,6 @@ impl State {
             name: i.name.clone(),
             content_hash: i.content_hash.clone(),
             source: v.source.clone(),
-            first_party: v.first_party,
             installed_by: i.installed_by.clone(),
             installed_at: i.installed_at,
             step_up_ref: i.step_up_ref.clone(),
@@ -53,22 +51,6 @@ pub struct InMemoryLibraries {
 impl InMemoryLibraries {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Marks `org` as having had repos bound before libraries existed, as
-    /// migration 0071 does for every org in `forge_repos`.
-    pub fn with_offered_org(self, org: &str) -> Self {
-        self.state.lock().unwrap().defaults.insert(
-            org.to_string(),
-            OrgLibraryDefaults {
-                org: org.to_string(),
-                state: DefaultsState::Offered,
-                missing: Vec::new(),
-                mirror: None,
-                updated_at: 0,
-            },
-        );
-        self
     }
 }
 
@@ -259,37 +241,6 @@ impl LibraryStore for InMemoryLibraries {
             .filter(|y| y.org == org && content_hashes.contains(&y.content_hash))
             .cloned()
             .collect())
-    }
-
-    async fn claim_defaults(&self, org: &str, at: i64) -> Result<bool, LibraryStoreError> {
-        let mut st = self.state.lock().unwrap();
-        if st.defaults.contains_key(org) {
-            return Ok(false);
-        }
-        st.defaults.insert(
-            org.to_string(),
-            OrgLibraryDefaults {
-                org: org.to_string(),
-                state: DefaultsState::Pending,
-                missing: Vec::new(),
-                mirror: None,
-                updated_at: at,
-            },
-        );
-        Ok(true)
-    }
-
-    async fn defaults(&self, org: &str) -> Result<Option<OrgLibraryDefaults>, LibraryStoreError> {
-        Ok(self.state.lock().unwrap().defaults.get(org).cloned())
-    }
-
-    async fn set_defaults(&self, d: &OrgLibraryDefaults) -> Result<(), LibraryStoreError> {
-        self.state
-            .lock()
-            .unwrap()
-            .defaults
-            .insert(d.org.clone(), d.clone());
-        Ok(())
     }
 
     async fn trusted_sources(&self, org: &str) -> Result<Vec<TrustedSource>, LibraryStoreError> {

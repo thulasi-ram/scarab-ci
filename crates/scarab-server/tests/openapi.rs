@@ -145,7 +145,7 @@ fn openapi_document_has_the_plugin_admin_api_but_not_the_broker() {
 
     let paths = &doc["paths"];
     for (p, method) in [
-        ("/v1/orgs/{org}/plugin-catalog", "get"),
+        ("/v1/orgs/{org}/plugin-fetch", "post"),
         ("/v1/orgs/{org}/plugins", "get"),
         ("/v1/orgs/{org}/plugins", "post"),
         ("/v1/orgs/{org}/plugins/{name}", "get"),
@@ -169,12 +169,16 @@ fn openapi_document_has_the_plugin_admin_api_but_not_the_broker() {
             .all(|p| !p.starts_with("/_scarab/")),
         "the broker is not part of the public API"
     );
+    // There is no catalog of Scarab's own plugins, and no defaults retry.
+    assert!(paths.get("/v1/orgs/{org}/plugin-catalog").is_none());
+    assert!(paths.get("/v1/orgs/{org}/library-defaults/retry").is_none());
 
     let schemas = &doc["components"]["schemas"];
     for s in [
         "PluginInstallationDto",
         "InstallPluginRequest",
-        "PluginCatalogEntryDto",
+        "FetchPluginManifestRequest",
+        "FetchedPluginManifestDto",
         "PluginManifestDto",
         "PluginCapabilityDto",
         "UninstalledPluginDto",

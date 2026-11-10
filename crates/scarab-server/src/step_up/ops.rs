@@ -1165,6 +1165,16 @@ pub static TOKEN_MINT_OWN: Op = op(
     &["body:/org", "body:/project", "body:/name"],
 )
 .not_by_token();
+pub static PLUGIN_FETCH: Op = op(
+    "plugin.fetch",
+    "Fetch a plugin manifest to review",
+    Class::NotGoverned("reads a manifest for review; installs nothing"),
+    "ADR-0072 §1-2",
+    ADMIN,
+    OrgOf::Path("org"),
+    &[],
+    &["path:org", "body:/source"],
+);
 pub static PLUGIN_INSTALL: Op = op(
     "plugin.install",
     "Install a plugin",
@@ -1550,16 +1560,6 @@ pub static LIBRARY_UNYANK: Op = op(
     &["path:org", "path:hash"],
 )
 .describe_with(describe_library_unyank);
-pub static LIBRARY_DEFAULTS_RETRY: Op = op(
-    "library.defaults_retry",
-    "Install the first-party libraries",
-    Class::CrownJewel(W),
-    "ADR-0076 §5: installing loosens",
-    ADMIN,
-    OrgOf::Path("org"),
-    &[],
-    &["path:org", "body:/mirror"],
-);
 pub static LIBRARY_TRUST: Op = op(
     "library.trust",
     "Trust a library source with forge credentials",

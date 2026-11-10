@@ -1,6 +1,6 @@
 //! Plugins (ADR-0072, MMP slice d1): the org-admin API for
-//! PluginInstallations — the compiled-in first-party catalog, install,
-//! uninstall, the kill switch.
+//! PluginInstallations — fetch a manifest to review, install, uninstall, the
+//! kill switch.
 //!
 //! What a plugin itself calls lives on the CredentialBroker's own listener
 //! ([`crate::broker`]), never here: this module is the public API.
@@ -12,13 +12,16 @@
 //! endpoint — and every bind replaces destination and credential together,
 //! so a destination is never re-aimed with a credential entered for another.
 //!
-//! **Third-party installs are off** (ADR-0072 consequences) until
-//! StepUpConfirmation and publisher signatures exist: only a catalog entry
-//! compiled into this binary can be installed, and only by **digest** of its
-//! catalog repository. Every route needs Administer on the Org.
+//! **Every plugin installs the same way**, whoever published it: an org
+//! admin reads its PluginManifest from a git source pinned to a commit
+//! (`POST …/plugin-fetch`, which installs nothing), reviews what it asks for,
+//! and installs it by image **digest** with the manifest hash they reviewed
+//! (`POST …/plugins`, a step-up). The server reads the source again at
+//! install and refuses when it no longer has that hash, so what runs is what
+//! the admin approved. No plugin is installed or trusted by default, Scarab's
+//! own Argo CD plugin included. Every route needs Administer on the Org.
 
 use std::collections::BTreeMap;
-use std::sync::OnceLock;
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -37,11 +40,8 @@ use sha2::{Digest, Sha256};
 use utoipa::{IntoParams, ToSchema};
 
 use super::{authorize_scoped, rbac_scope, ApiError, AppState};
+use crate::library_fetch::LibrarySource;
 use crate::step_up::GuardCtx;
-
-/// The first-party Argo CD plugin's manifest, compiled in: what an admin
-/// approves for it is exactly this document plus a digest (ADR-0072 §1-2).
-const ARGOCD_MANIFEST_JSON: &str = include_str!("../../scarab-plugin-argocd/manifest.json");
 
 /// The reserved secret-scope org PluginConnection credentials live under
 /// (ADR-0072 §5), beside forge credentials' `_forge`: a connection row holds
@@ -64,9 +64,8 @@ pub struct PluginPolicy {
     pub enabled: bool,
     /// The namespace a broker caller's ServiceAccount must be in.
     pub namespace: String,
-    /// The repository the first-party Argo CD plugin installs from.
-    pub argocd_repo: String,
-    /// Dev only: a first-party install may name a tag instead of a digest.
+    /// Dev only: any install may name `<repository>:<tag>` instead of a
+    /// digest.
     pub dev_allow_tag: bool,
 }
 
@@ -75,7 +74,6 @@ impl PluginPolicy {
         Self {
             enabled: c.enabled,
             namespace: c.namespace.clone(),
-            argocd_repo: c.argocd_repo.clone(),
             dev_allow_tag: c.dev_allow_tag,
         }
     }
@@ -86,68 +84,65 @@ impl PluginPolicy {
     }
 }
 
-/// One plugin this binary can install.
-struct CatalogEntry {
-    manifest: PluginManifest,
-    repository: String,
-    description: &'static str,
+/// Is `r` an image repository: `[host[:port]/]path`, lowercase path
+/// components of `[a-z0-9._-]`, no tag and no digest?
+fn repository_ok(r: &str) -> bool {
+    if r.is_empty() || r.len() > 255 {
+        return false;
+    }
+    let parts: Vec<&str> = r.split('/').collect();
+    parts.iter().enumerate().all(|(i, part)| {
+        let host = i == 0 && parts.len() > 1;
+        !part.is_empty()
+            && !part.starts_with(['.', '-', '_'])
+            && part.bytes().all(|b| {
+                b.is_ascii_lowercase()
+                    || b.is_ascii_digit()
+                    || matches!(b, b'.' | b'_' | b'-')
+                    || (host && b == b':')
+            })
+    })
 }
 
-/// The compiled-in first-party catalog. Its manifests are this binary's own
-/// files, so one that does not parse or is not admitted is a build defect —
-/// `catalog_manifests_parse_and_are_admitted` keeps that from shipping.
-fn first_party_catalog(policy: &PluginPolicy) -> Vec<CatalogEntry> {
-    static ARGOCD: OnceLock<PluginManifest> = OnceLock::new();
-    let argocd = ARGOCD.get_or_init(|| {
-        serde_json::from_str(ARGOCD_MANIFEST_JSON).expect("the compiled-in Argo CD manifest parses")
-    });
-    vec![CatalogEntry {
-        manifest: argocd.clone(),
-        repository: policy.argocd_repo.clone(),
-        description: "Reads Argo CD Applications through the CredentialBroker and \
-                      resolves the `wait-live` gate (first-party).",
-    }]
-}
-
-/// The refusal every non-first-party install gets, verbatim.
-fn third_party_refusal(detail: String) -> ApiError {
-    ApiError::Denied(format!("third-party installs are off (ADR-0072): {detail}"))
-}
-
-/// `image` must be `<repository>@sha256:<64 lowercase hex>` — a digest is
-/// what an admin approves (ADR-0072 §10); a tag can change under the same
-/// name. `<repository>:<tag>` only under the dev knob.
-fn check_image(image: &str, repository: &str, allow_tag: bool) -> Result<(), ApiError> {
-    if let Some(digest) = image
-        .strip_prefix(repository)
-        .and_then(|rest| rest.strip_prefix("@sha256:"))
-    {
-        if digest.len() == 64
+/// `image` must be `<repository>@sha256:<64 lowercase hex>`, for any
+/// repository: a digest is what an admin approves (ADR-0072 §10), and a tag
+/// can change under the same name. `<repository>:<tag>` only under the dev
+/// knob, for every plugin alike.
+fn check_image(image: &str, allow_tag: bool) -> Result<(), ApiError> {
+    if let Some((repository, digest)) = image.split_once("@sha256:") {
+        if repository_ok(repository)
+            && digest.len() == 64
             && digest
-                .chars()
-                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         {
             return Ok(());
         }
-    }
-    if allow_tag {
-        if let Some(tag) = image
-            .strip_prefix(repository)
-            .and_then(|rest| rest.strip_prefix(':'))
-        {
+    } else if allow_tag {
+        // The tag is after the last `:` of the last path component, so a
+        // registry port is not read as one.
+        let last = image.rsplit('/').next().unwrap_or(image);
+        if let Some((_, tag)) = last.rsplit_once(':') {
+            let repository = &image[..image.len() - tag.len() - 1];
             let ok = !tag.is_empty()
                 && tag.len() <= 128
                 && !tag.starts_with(['.', '-'])
                 && tag
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'));
-            if ok {
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'));
+            if ok && repository_ok(repository) {
                 return Ok(());
             }
         }
     }
-    Err(third_party_refusal(format!(
-        "image `{image}` is not `{repository}@sha256:<digest>`"
+    Err(ApiError::BadRequest(format!(
+        "image `{image}` is not `<repository>@sha256:<64 lowercase hex>`: a plugin is installed \
+         by digest, so what runs is the image you approved{}",
+        if allow_tag {
+            " (or `<repository>:<tag>` under SCARAB_DEV_PLUGIN_ALLOW_TAG)"
+        } else {
+            ""
+        }
     )))
 }
 
@@ -158,7 +153,9 @@ fn mint_installation_id() -> String {
     bytes[..5].iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn manifest_sha256(manifest: &PluginManifest) -> String {
+/// The SHA-256 an installation records for its manifest: of the manifest
+/// as serde writes it, so the file's layout does not change it.
+pub fn manifest_sha256(manifest: &PluginManifest) -> String {
     let bytes = serde_json::to_vec(manifest).expect("a manifest serializes");
     Sha256::digest(&bytes)
         .iter()
@@ -367,17 +364,43 @@ impl From<&PluginManifest> for PluginManifestDto {
     }
 }
 
-/// A plugin this Scarab can install.
+/// `POST /v1/orgs/{org}/plugin-fetch`.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FetchPluginManifestRequest {
+    /// The plugin's manifest file, `<host>/<owner>/<repo>//<path>@<commit>`;
+    /// the path ends in `.json`, `.yaml` or `.yml`.
+    pub source: String,
+    /// A ForgeConnection id, for a private repository of the org. Omitted:
+    /// read anonymously over https from github.com or a Forgejo
+    /// connection's host.
+    #[serde(default)]
+    pub connection: Option<String>,
+}
+
+/// A plugin manifest read for review. Nothing is stored or installed.
 #[derive(Debug, Serialize, ToSchema)]
-pub struct PluginCatalogEntryDto {
-    /// The catalog key `POST …/plugins` names as `plugin`.
-    pub plugin: String,
-    pub description: String,
-    /// Install as `<image_repository>@sha256:<digest>`.
-    pub image_repository: String,
+pub struct FetchedPluginManifestDto {
+    /// The source as read, pinned to its commit.
+    pub source: String,
+    /// The file as read.
+    pub content: String,
+    /// What the plugin asks for: what an install approves with the image
+    /// digest.
     pub manifest: PluginManifestDto,
-    /// Always true today: third-party installs are off.
-    pub first_party: bool,
+    /// Pass it to `POST …/plugins` as `manifest_sha256`.
+    pub manifest_sha256: String,
+    /// The org's installations of the same plugin (`manifest.plugin`), by
+    /// name, each with the manifest hash it was approved with.
+    pub installed: Vec<InstalledPluginManifestDto>,
+}
+
+/// An installation of the plugin a fetch read.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct InstalledPluginManifestDto {
+    pub name: String,
+    pub image: String,
+    pub manifest_sha256: String,
 }
 
 /// Whether an installation's broker calls are accepted.
@@ -431,7 +454,7 @@ pub struct PluginInstallationDto {
     pub org: String,
     /// Unique in the org and never reused.
     pub name: String,
-    /// The catalog plugin.
+    /// The plugin's own name, from its manifest.
     pub plugin: String,
     /// `plugin:<name>` — what it acts as in audit.
     pub principal: String,
@@ -531,10 +554,17 @@ pub struct InstallPluginRequest {
     /// The installation's name: a DNS-1123 label, unique in the org and
     /// never reused once uninstalled.
     pub name: String,
-    /// The catalog plugin (`argocd`).
-    pub plugin: String,
-    /// `<catalog image_repository>@sha256:<64 hex>`.
+    /// `<repository>@sha256:<64 hex>`.
     pub image: String,
+    /// The manifest's source, as `POST …/plugin-fetch` read it. Read again
+    /// here.
+    pub source: String,
+    /// The connection the fetch read it through, if any.
+    #[serde(default)]
+    pub connection: Option<String>,
+    /// The `manifest_sha256` the fetch returned, which the admin reviewed.
+    /// The install is refused (409) when the source no longer reads as it.
+    pub manifest_sha256: String,
     /// Values for the manifest's `config_keys`; omitted = none.
     #[serde(default)]
     pub config: BTreeMap<String, String>,
@@ -841,37 +871,75 @@ fn store(st: &AppState) -> Result<&dyn scarab_plugin::PluginStore, ApiError> {
     st.plugins.as_deref().ok_or(ApiError::NotFound)
 }
 
-/// The plugins this Scarab can install. Administer on the Org.
+/// Reads a manifest from `source` and checks it: it parses as a
+/// PluginManifest, every rule of the manifest holds, and it asks only for
+/// capabilities this Scarab admits. Returns the source as read, the file and
+/// the manifest.
+async fn read_manifest(
+    st: &AppState,
+    org: &str,
+    source: &str,
+    connection: Option<&str>,
+) -> Result<(LibrarySource, String, PluginManifest), ApiError> {
+    let src = LibrarySource::parse_manifest(source).map_err(ApiError::BadRequest)?;
+    let content = crate::libraries::read_source(st, org, &src, connection).await?;
+    let manifest: PluginManifest = if src.path.ends_with(".json") {
+        serde_json::from_str(&content).map_err(|e| e.to_string())
+    } else {
+        serde_yaml::from_str(&content).map_err(|e| e.to_string())
+    }
+    .map_err(|e| ApiError::BadRequest(format!("{src} is not a plugin manifest: {e}")))?;
+    admit_for_mmp(&manifest)
+        .map_err(|e| ApiError::BadRequest(format!("{src} cannot be installed: {e}")))?;
+    Ok((src, content, manifest))
+}
+
+/// Read a plugin's manifest from a git source pinned to a commit, check it,
+/// and return what it asks for, to review before installing. Stores and
+/// installs nothing. Administer on the Org.
 #[utoipa::path(
-    get,
-    path = "/v1/orgs/{org}/plugin-catalog",
+    post,
+    path = "/v1/orgs/{org}/plugin-fetch",
     params(("org" = String, Path, description = "org")),
-    summary = "The installable (first-party) plugins (ADR-0072)",
+    request_body = FetchPluginManifestRequest,
+    summary = "Fetch a plugin manifest to review before installing (ADR-0072)",
     responses(
-        (status = 200, body = [PluginCatalogEntryDto]),
-        (status = 403, description = "not an org admin"),
+        (status = 200, body = FetchedPluginManifestDto),
+        (status = 400, description = "a bad source, a fetch that failed, or a file that is not an admissible plugin manifest"),
+        (status = 403, description = "not an org admin, a host Scarab does not fetch from, or a private repository outside the org"),
         (status = 404, description = "plugins not configured")
     )
 )]
-pub(crate) async fn plugin_catalog(
+pub(crate) async fn fetch_plugin_manifest(
     State(st): State<AppState>,
     headers: HeaderMap,
     Path(org): Path<String>,
-) -> Result<Json<Vec<PluginCatalogEntryDto>>, ApiError> {
+    Json(body): Json<FetchPluginManifestRequest>,
+) -> Result<Json<FetchedPluginManifestDto>, ApiError> {
     org_admin(&st, &headers, &org).await?;
-    store(&st)?;
-    Ok(Json(
-        first_party_catalog(&st.plugin_policy)
-            .iter()
-            .map(|e| PluginCatalogEntryDto {
-                plugin: e.manifest.plugin.clone(),
-                description: e.description.to_string(),
-                image_repository: e.repository.clone(),
-                manifest: (&e.manifest).into(),
-                first_party: true,
-            })
-            .collect(),
-    ))
+    super::refuse_reserved_org(&org, "have a plugin installed")?;
+    let store = store(&st)?;
+    let (src, content, manifest) =
+        read_manifest(&st, &org, &body.source, body.connection.as_deref()).await?;
+    let installed = store
+        .installations(&org)
+        .await
+        .map_err(plugin_store_api_error)?
+        .into_iter()
+        .filter(|i| i.plugin == manifest.plugin)
+        .map(|i| InstalledPluginManifestDto {
+            name: i.name,
+            image: i.image,
+            manifest_sha256: i.manifest_sha256,
+        })
+        .collect();
+    Ok(Json(FetchedPluginManifestDto {
+        source: src.to_string(),
+        content,
+        manifest_sha256: manifest_sha256(&manifest),
+        manifest: (&manifest).into(),
+        installed,
+    }))
 }
 
 /// The org's PluginInstallations, by name. Administer on the Org.
@@ -903,22 +971,24 @@ pub(crate) async fn list_plugins(
     Ok(Json(out))
 }
 
-/// Install a first-party plugin, pinned by digest. Administer on the Org.
+/// Install a plugin, pinned by image digest, with the manifest an admin
+/// reviewed (`POST …/plugin-fetch`). Every plugin installs this way. Needs a
+/// step-up. Administer on the Org.
 ///
-/// Third-party installs are off (403), and so are installs while
-/// `SCARAB_PLUGINS=off` (409).
+/// Refused while `SCARAB_PLUGINS=off` (409), and when the source no longer
+/// reads as the reviewed manifest (409).
 #[utoipa::path(
     post,
     path = "/v1/orgs/{org}/plugins",
     params(("org" = String, Path, description = "org")),
     request_body = InstallPluginRequest,
-    summary = "Install a first-party plugin (ADR-0072)",
+    summary = "Install a plugin from a reviewed manifest (ADR-0072)",
     responses(
         (status = 201, body = PluginInstallationDto),
-        (status = 400, description = "invalid name, config or storage"),
-        (status = 403, description = "not an org admin, or not a first-party plugin pinned by digest"),
+        (status = 400, description = "invalid name, image, source, manifest, config or storage"),
+        (status = 403, description = "not an org admin, no step-up, a host Scarab does not fetch from, or a private repository outside the org"),
         (status = 404, description = "plugins not configured"),
-        (status = 409, description = "the name is taken or retired, or plugins are off")
+        (status = 409, description = "the name is taken or retired, plugins are off, or the manifest is not the one reviewed")
     )
 )]
 pub(crate) async fn install_plugin(
@@ -938,21 +1008,21 @@ pub(crate) async fn install_plugin(
         ));
     }
     validate_installation_name(&body.name).map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    let catalog = first_party_catalog(&st.plugin_policy);
-    let entry = catalog
-        .iter()
-        .find(|e| e.manifest.plugin == body.plugin)
-        .ok_or_else(|| {
-            third_party_refusal(format!("`{}` is not a first-party plugin", body.plugin))
-        })?;
-    check_image(
-        &body.image,
-        &entry.repository,
-        st.plugin_policy.dev_allow_tag,
-    )?;
-    admit_for_mmp(&entry.manifest).map_err(|e| ApiError::Denied(e.to_string()))?;
-    entry
-        .manifest
+    check_image(&body.image, st.plugin_policy.dev_allow_tag)?;
+    // The admin approves (digest, manifest): read the manifest again and
+    // install it only if it is the one they reviewed.
+    let (_, _, manifest) =
+        read_manifest(&st, &org, &body.source, body.connection.as_deref()).await?;
+    let sha = manifest_sha256(&manifest);
+    if sha != body.manifest_sha256 {
+        return Err(ApiError::Conflict(format!(
+            "the manifest at {} now has hash {sha}, not the {} you reviewed; fetch it again \
+             and review what it asks for",
+            body.source.trim(),
+            body.manifest_sha256
+        )));
+    }
+    manifest
         .validate_config(&body.config)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let storage = body
@@ -966,10 +1036,10 @@ pub(crate) async fn install_plugin(
         id: mint_installation_id(),
         org,
         name: body.name,
-        plugin: entry.manifest.plugin.clone(),
+        plugin: manifest.plugin.clone(),
         image: body.image,
-        manifest_sha256: manifest_sha256(&entry.manifest),
-        manifest: entry.manifest.clone(),
+        manifest_sha256: sha,
+        manifest,
         config: body.config,
         state: InstallationState::Enabled,
         state_version: 0,
@@ -1555,47 +1625,56 @@ pub(crate) async fn plugin_broker_journal(
 mod tests {
     use super::*;
 
-    const REPO: &str = "ghcr.io/thulasi-ram/scarab-plugin-argocd";
-
+    /// The Argo CD plugin's manifest in this repository, the file its docs
+    /// point an admin at, is admissible like any other.
     #[test]
-    fn catalog_manifests_parse_and_are_admitted() {
-        for entry in first_party_catalog(&PluginPolicy::off()) {
-            assert_eq!(
-                admit_for_mmp(&entry.manifest),
-                Ok(()),
-                "{}",
-                entry.manifest.plugin
-            );
-        }
+    fn the_argocd_manifest_in_the_repository_is_admitted() {
+        let m: PluginManifest =
+            serde_json::from_str(include_str!("../../scarab-plugin-argocd/manifest.json")).unwrap();
+        assert_eq!(admit_for_mmp(&m), Ok(()));
     }
 
     #[test]
-    fn only_a_digest_of_the_catalog_repository_is_accepted() {
+    fn any_repository_is_accepted_by_digest_only() {
         let digest = "a".repeat(64);
-        assert!(check_image(&format!("{REPO}@sha256:{digest}"), REPO, false).is_ok());
-        for image in [
-            format!("{REPO}:v1"),
-            format!("{REPO}@sha256:{}", "A".repeat(64)),
-            format!("{REPO}@sha256:{}", "a".repeat(63)),
-            format!("{REPO}-evil@sha256:{digest}"),
-            format!("ghcr.io/evil/argocd@sha256:{digest}"),
-            format!("{REPO}@sha512:{digest}"),
-            REPO.to_string(),
+        for repo in [
+            "ghcr.io/thulasi-ram/scarab-plugin-argocd",
+            "ghcr.io/someone-else/slack-notifier",
+            "registry.example.com:5000/team/plugin",
+            "plugin",
         ] {
-            assert!(check_image(&image, REPO, false).is_err(), "{image}");
+            assert!(
+                check_image(&format!("{repo}@sha256:{digest}"), false).is_ok(),
+                "{repo}"
+            );
+            assert!(check_image(&format!("{repo}:v1"), false).is_err(), "{repo}");
+        }
+        for image in [
+            format!("ghcr.io/x/p@sha256:{}", "A".repeat(64)),
+            format!("ghcr.io/x/p@sha256:{}", "a".repeat(63)),
+            format!("ghcr.io/x/p@sha512:{digest}"),
+            format!("ghcr.io/X/p@sha256:{digest}"),
+            format!("@sha256:{digest}"),
+            format!("ghcr.io//p@sha256:{digest}"),
+            format!("ghcr.io/x/p:v1@sha256:{digest}"),
+            "ghcr.io/x/p".to_string(),
+        ] {
+            assert!(check_image(&image, false).is_err(), "{image}");
         }
     }
 
     #[test]
-    fn the_dev_knob_admits_a_tag_of_the_catalog_repository_only() {
-        assert!(check_image(&format!("{REPO}:dev"), REPO, true).is_ok());
+    fn the_dev_knob_admits_a_tag_of_any_repository() {
+        assert!(check_image("ghcr.io/x/argocd:dev", true).is_ok());
+        assert!(check_image("registry:5000/x/p:verify", true).is_ok());
+        assert!(check_image("scarab-plugin-argocd:verify", true).is_ok());
         for image in [
-            format!("{REPO}:"),
-            format!("{REPO}:-x"),
-            format!("{REPO}:a/b"),
-            "ghcr.io/evil/argocd:dev".to_string(),
+            "ghcr.io/x/p:",
+            "ghcr.io/x/p:-x",
+            "ghcr.io/x/p",
+            "registry:5000/x/p",
         ] {
-            assert!(check_image(&image, REPO, true).is_err(), "{image}");
+            assert!(check_image(image, true).is_err(), "{image}");
         }
     }
 

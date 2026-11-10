@@ -1011,7 +1011,13 @@ async fn rt_reserved_org_spellings_do_not_reach_the_plugin_scope() {
         .uri("/v1/orgs/%5Fforge/plugins")
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({"name": "x", "plugin": "argocd", "image": "img@sha256:00"}).to_string(),
+            json!({
+                "name": "x",
+                "image": "img@sha256:00",
+                "source": format!("github.com/acme/plugins//manifest.json@{}", "0".repeat(40)),
+                "manifest_sha256": "a".repeat(64),
+            })
+            .to_string(),
         ))
         .unwrap();
     let (st, b) = call(&app, install).await;

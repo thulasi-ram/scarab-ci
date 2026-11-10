@@ -950,23 +950,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/v1/orgs/{org}/library-defaults/retry": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Retry installing the first-party libraries (ADR-0076 §5) */
-        post: operations["retry_library_defaults"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/v1/orgs/{org}/library-trust": {
         parameters: {
             query?: never;
@@ -1053,17 +1036,17 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/v1/orgs/{org}/plugin-catalog": {
+    "/v1/orgs/{org}/plugin-fetch": {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        /** The installable (first-party) plugins (ADR-0072) */
-        get: operations["plugin_catalog"];
+        get?: never;
         put?: never;
-        post?: never;
+        /** Fetch a plugin manifest to review before installing (ADR-0072) */
+        post: operations["fetch_plugin_manifest"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1081,9 +1064,9 @@ export interface paths {
         get: operations["list_plugins"];
         put?: never;
         /**
-         * Install a first-party plugin (ADR-0072)
-         * @description Third-party installs are off (403), and so are installs while
-         *     `SCARAB_PLUGINS=off` (409).
+         * Install a plugin from a reviewed manifest (ADR-0072)
+         * @description Refused while `SCARAB_PLUGINS=off` (409), and when the source no longer
+         *     reads as the reviewed manifest (409).
          */
         post: operations["install_plugin"];
         delete?: never;
@@ -3451,6 +3434,20 @@ export interface components {
             /** @description `<host>/<owner>/<repo>//<path>@<commit>`. */
             source: string;
         };
+        /** @description `POST /v1/orgs/{org}/plugin-fetch`. */
+        FetchPluginManifestRequest: {
+            /**
+             * @description A ForgeConnection id, for a private repository of the org. Omitted:
+             *     read anonymously over https from github.com or a Forgejo
+             *     connection's host.
+             */
+            connection?: string | null;
+            /**
+             * @description The plugin's manifest file, `<host>/<owner>/<repo>//<path>@<commit>`;
+             *     the path ends in `.json`, `.yaml` or `.yml`.
+             */
+            source: string;
+        };
         FetchedLibraryDto: {
             content: string;
             content_hash: string;
@@ -3460,20 +3457,27 @@ export interface components {
              *     `+`, `-` or a space. Empty when nothing is installed.
              */
             diff: string;
-            first_party: boolean;
             name: string;
             publisher: string;
             source: string;
         };
-        /** @description A first-party library in the server's release manifest. */
-        FirstPartyLibraryDto: {
-            content_hash: string;
-            /** @description Installed in this org under its name, at any version. */
-            installed: boolean;
-            name: string;
-            publisher: string;
-            release: string;
-            security_fix: boolean;
+        /** @description A plugin manifest read for review. Nothing is stored or installed. */
+        FetchedPluginManifestDto: {
+            /** @description The file as read. */
+            content: string;
+            /**
+             * @description The org's installations of the same plugin (`manifest.plugin`), by
+             *     name, each with the manifest hash it was approved with.
+             */
+            installed: components["schemas"]["InstalledPluginManifestDto"][];
+            /**
+             * @description What the plugin asks for: what an install approves with the image
+             *     digest.
+             */
+            manifest: components["schemas"]["PluginManifestDto"];
+            /** @description Pass it to `POST …/plugins` as `manifest_sha256`. */
+            manifest_sha256: string;
+            /** @description The source as read, pinned to its commit. */
             source: string;
         };
         /** @description The answer to a gate approval. */
@@ -3597,15 +3601,25 @@ export interface components {
             config?: {
                 [key: string]: string;
             };
-            /** @description `<catalog image_repository>@sha256:<64 hex>`. */
+            /** @description The connection the fetch read it through, if any. */
+            connection?: string | null;
+            /** @description `<repository>@sha256:<64 hex>`. */
             image: string;
+            /**
+             * @description The `manifest_sha256` the fetch returned, which the admin reviewed.
+             *     The install is refused (409) when the source no longer reads as it.
+             */
+            manifest_sha256: string;
             /**
              * @description The installation's name: a DNS-1123 label, unique in the org and
              *     never reused once uninstalled.
              */
             name: string;
-            /** @description The catalog plugin (`argocd`). */
-            plugin: string;
+            /**
+             * @description The manifest's source, as `POST …/plugin-fetch` read it. Read again
+             *     here.
+             */
+            source: string;
             storage?: null | components["schemas"]["PluginStorageRequest"];
         };
         /**
@@ -3613,31 +3627,24 @@ export interface components {
          * @enum {string}
          */
         InstallationStateDto: "enabled" | "killed";
+        /** @description An installation of the plugin a fetch read. */
+        InstalledPluginManifestDto: {
+            image: string;
+            manifest_sha256: string;
+            name: string;
+        };
         InstalledVersionDto: {
             content_hash: string;
             source: string;
         };
-        LibraryDefaultsDto: {
-            mirror?: string | null;
-            missing: components["schemas"]["MissingDefaultDto"][];
-            /**
-             * @description `offered` (an org from before libraries: nothing installed without an
-             *     admin), `pending`, `installed` or `missing`.
-             */
-            state: string;
-            /** Format: int64 */
-            updated_at: number;
-        };
         LibraryInstallationDto: {
             content_hash: string;
-            first_party: boolean;
             /** Format: int64 */
             installed_at: number;
             installed_by: string;
             name: string;
             publisher: string;
             source: string;
-            update?: null | components["schemas"]["UpdateNoticeDto"];
             yanked?: null | components["schemas"]["LibraryYankDto"];
         };
         LibraryYankDto: {
@@ -3818,12 +3825,6 @@ export interface components {
              */
             token: string;
         };
-        MissingDefaultDto: {
-            error: string;
-            name: string;
-            /** @description Empty when the release manifest itself could not be read. */
-            publisher: string;
-        };
         /**
          * @description What Run creation does when a Step that uses the Environment's authority
          *     has no `manual` gate upstream (ADR-0078 §3).
@@ -3875,15 +3876,10 @@ export interface components {
             updated_by: string;
         };
         OrgLibrariesDto: {
-            defaults?: null | components["schemas"]["LibraryDefaultsDto"];
-            first_party: components["schemas"]["FirstPartyLibraryDto"][];
             installations: components["schemas"]["LibraryInstallationDto"][];
-            /** @description Why the release manifest could not be read, if it could not. */
-            manifest_error?: string | null;
             /**
              * @description The library sources this org trusts with long-lived forge credentials
-             *     (ADR-0076 §9), besides the first-party clone library, which it trusts
-             *     by default.
+             *     (ADR-0076 §9). No library is trusted without one.
              */
             trusted_sources: components["schemas"]["TrustedSourceDto"][];
             yanks: components["schemas"]["LibraryYankDto"][];
@@ -4161,17 +4157,6 @@ export interface components {
          * @enum {string}
          */
         PluginCapabilityDto: "report_deployments" | "subscribe_events" | "offer_actions" | "use_connection" | "contribute_ui" | "approve_gates" | "resolve_gates";
-        /** @description A plugin this Scarab can install. */
-        PluginCatalogEntryDto: {
-            description: string;
-            /** @description Always true today: third-party installs are off. */
-            first_party: boolean;
-            /** @description Install as `<image_repository>@sha256:<digest>`. */
-            image_repository: string;
-            manifest: components["schemas"]["PluginManifestDto"];
-            /** @description The catalog key `POST …/plugins` names as `plugin`. */
-            plugin: string;
-        };
         /**
          * @description One connection slot of an installation and what an admin bound to it
          *     (ADR-0072 §5). Never carries the credential, nor its secret key.
@@ -4283,7 +4268,7 @@ export interface components {
             /** @description Unique in the org and never reused. */
             name: string;
             org: string;
-            /** @description The catalog plugin. */
+            /** @description The plugin's own name, from its manifest. */
             plugin: string;
             /** @description `plugin:<name>` — what it acts as in audit. */
             principal: string;
@@ -5035,19 +5020,6 @@ export interface components {
              */
             skipped: string[];
         };
-        RetryDefaultsRequest: {
-            /** @description A ForgeConnection to read the mirror through. */
-            connection?: string | null;
-            /** @description Uploaded copies: `<publisher>/<name>` → the file's content. */
-            files?: {
-                [key: string]: string;
-            };
-            /**
-             * @description A mirror of Scarab's repository, `<host>/<owner>/<repo>`; each
-             *     library is read from the same path and commit there.
-             */
-            mirror?: string | null;
-        };
         RuleReadsDto: {
             /** @description The rule's index in `rules`; 0 for a typed setting. */
             index: number;
@@ -5774,14 +5746,6 @@ export interface components {
         UnlistedConnectionDto: {
             connection_id: string;
             reason: string;
-        };
-        /** @description A newer first-party version than the one installed. */
-        UpdateNoticeDto: {
-            content_hash: string;
-            release: string;
-            /** @description A version between the installed one and this one is a security fix. */
-            security_fix: boolean;
-            source: string;
         };
         /** @description `PUT …/policies/{id}`: the whole Policy, replaced. */
         UpdatePolicyRequest: {
@@ -8424,62 +8388,6 @@ export interface operations {
             };
         };
     };
-    retry_library_defaults: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description org */
-                org: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["RetryDefaultsRequest"];
-            };
-        };
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["LibraryDefaultsDto"];
-                };
-            };
-            /** @description a bad mirror, or an uploaded file for no first-party library */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description not an org admin, or no step-up — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["StepUpRefusal"];
-                };
-            };
-            /** @description libraries not configured */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
-            429: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
     trust_library_source: {
         parameters: {
             query?: never;
@@ -8538,13 +8446,14 @@ export interface operations {
     };
     untrust_library_source: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description The trusted source, `<host>/<owner>/<repo>//<path>`. */
+                source?: string;
+            };
             header?: never;
             path: {
                 /** @description org */
                 org: string;
-                /** @description The trusted source, `<host>/<owner>/<repo>//<path>`. */
-                source: string | null;
             };
             cookie?: never;
         };
@@ -8759,7 +8668,7 @@ export interface operations {
             };
         };
     };
-    plugin_catalog: {
+    fetch_plugin_manifest: {
         parameters: {
             query?: never;
             header?: never;
@@ -8769,17 +8678,28 @@ export interface operations {
             };
             cookie?: never;
         };
-        requestBody?: never;
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FetchPluginManifestRequest"];
+            };
+        };
         responses: {
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["PluginCatalogEntryDto"][];
+                    "application/json": components["schemas"]["FetchedPluginManifestDto"];
                 };
             };
-            /** @description not an org admin */
+            /** @description a bad source, a fetch that failed, or a file that is not an admissible plugin manifest */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an org admin, a host Scarab does not fetch from, or a private repository outside the org */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -8855,14 +8775,14 @@ export interface operations {
                     "application/json": components["schemas"]["PluginInstallationDto"];
                 };
             };
-            /** @description invalid name, config or storage */
+            /** @description invalid name, image, source, manifest, config or storage */
             400: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content?: never;
             };
-            /** @description not an org admin, or not a first-party plugin pinned by digest — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            /** @description not an org admin, no step-up, a host Scarab does not fetch from, or a private repository outside the org — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -8878,7 +8798,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description the name is taken or retired, or plugins are off */
+            /** @description the name is taken or retired, plugins are off, or the manifest is not the one reviewed */
             409: {
                 headers: {
                     [name: string]: unknown;

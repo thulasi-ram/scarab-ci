@@ -1,6 +1,9 @@
-//! The `LibraryStore` port (ADR-0076 §4, §5, §6): the libraries an org has
+//! The `LibraryStore` port (ADR-0076 §4, §6): the libraries an org has
 //! installed, the versions it has fetched, the versions it has yanked, and
-//! where its first-party defaults stand.
+//! the library sources it trusts with forge credentials.
+//!
+//! Every library is installed the same way, whoever wrote it: Scarab's own
+//! libraries carry no mark and no trust of their own.
 //!
 //! Everything is per org. There is no orgs table: an org is the `org` of a
 //! repo binding.
@@ -38,9 +41,6 @@ pub struct LibraryVersion {
     /// The `<publisher>/<name>` it was fetched for.
     pub publisher: String,
     pub name: String,
-    /// The hash is listed in a Scarab release manifest the server trusts
-    /// (ADR-0076 §5).
-    pub first_party: bool,
     pub fetched_by: String,
     pub fetched_at: i64,
 }
@@ -54,8 +54,6 @@ pub struct LibraryInstallation {
     pub content_hash: String,
     /// The installed version's source.
     pub source: String,
-    /// The installed version is first-party.
-    pub first_party: bool,
     pub installed_by: String,
     pub installed_at: i64,
     /// The StepUpConfirmation that approved the install, when one was needed.
@@ -102,63 +100,6 @@ pub struct LibraryYank {
     pub yanked_at: i64,
 }
 
-/// Where an org's first-party defaults stand (ADR-0076 §5).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DefaultsState {
-    /// The org had repos bound before libraries existed: it is offered the
-    /// first-party libraries, and none is installed without an admin.
-    Offered,
-    /// A first bind claimed the org; installing has not finished.
-    Pending,
-    /// Every default is installed.
-    Installed,
-    /// Some defaults could not be installed; `missing` says which and why.
-    Missing,
-}
-
-impl DefaultsState {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            DefaultsState::Offered => "offered",
-            DefaultsState::Pending => "pending",
-            DefaultsState::Installed => "installed",
-            DefaultsState::Missing => "missing",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        Some(match s {
-            "offered" => DefaultsState::Offered,
-            "pending" => DefaultsState::Pending,
-            "installed" => DefaultsState::Installed,
-            "missing" => DefaultsState::Missing,
-            _ => return None,
-        })
-    }
-}
-
-/// A default library that could not be installed.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MissingDefault {
-    pub publisher: String,
-    pub name: String,
-    /// Why, e.g. "fetching github.com/…: connection refused".
-    pub error: String,
-}
-
-/// An org's first-party defaults.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OrgLibraryDefaults {
-    pub org: String,
-    pub state: DefaultsState,
-    pub missing: Vec<MissingDefault>,
-    /// The base URL an admin pointed the defaults at instead of the release
-    /// source, if any.
-    pub mirror: Option<String>,
-    pub updated_at: i64,
-}
-
 /// A library source an org trusts with long-lived forge credentials
 /// (ADR-0076 §9). Keyed by the source without its commit ([`trust_key`]), so
 /// trust carries across upgrades from the same source.
@@ -181,20 +122,6 @@ pub fn trust_key(source: &str) -> &str {
         Some((path, commit)) if !commit.contains('/') => path,
         _ => source,
     }
-}
-
-/// The release manifest's name for the first-party clone library.
-pub const FIRST_PARTY_CLONE: (&str, &str) = ("thulasi-ram", "clone");
-
-/// Whether a stored version is the first-party clone library (ADR-0076 §5,
-/// §9): content listed in a Scarab release manifest under the clone
-/// library's name. A first-party version is stored under the name the
-/// manifest gives its content, never one the fetcher chose, so the stored
-/// `publisher` and `name` are the manifest's. The org trusts it with
-/// long-lived forge credentials by default, wherever the copy was fetched
-/// from; where it was fetched from says nothing about which library it is.
-pub fn is_first_party_clone(v: &LibraryVersion) -> bool {
-    v.first_party && (v.publisher.as_str(), v.name.as_str()) == FIRST_PARTY_CLONE
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -290,16 +217,6 @@ pub trait LibraryStore: Send + Sync {
         keep: usize,
         except: &str,
     ) -> Result<u64, LibraryStoreError>;
-
-    /// Records the org's defaults as [`DefaultsState::Pending`] if the org
-    /// has no record yet. `true` when this call made the record: the caller
-    /// installs the defaults. Exactly one caller gets `true` per org.
-    async fn claim_defaults(&self, org: &str, at: i64) -> Result<bool, LibraryStoreError>;
-
-    async fn defaults(&self, org: &str) -> Result<Option<OrgLibraryDefaults>, LibraryStoreError>;
-
-    /// Replaces the org's defaults record.
-    async fn set_defaults(&self, d: &OrgLibraryDefaults) -> Result<(), LibraryStoreError>;
 
     /// The sources the org trusts with long-lived forge credentials
     /// (ADR-0076 §9), by source. A store that keeps none trusts none, which
@@ -444,36 +361,6 @@ mod tests {
         assert_eq!(
             trust_key("github.com/acme/libs//git.yaml"),
             "github.com/acme/libs//git.yaml"
-        );
-    }
-
-    #[test]
-    fn the_first_party_clone_is_first_party_content_named_clone() {
-        let v = |first_party: bool, name: &str, source: &str| LibraryVersion {
-            org: "acme".into(),
-            content_hash: "a".repeat(64),
-            content: String::new(),
-            source: source.into(),
-            publisher: "thulasi-ram".into(),
-            name: name.into(),
-            first_party,
-            fetched_by: "u".into(),
-            fetched_at: 0,
-        };
-        let src = "github.com/thulasi-ram/scarab-ci//libs/clone.yaml@1111";
-        assert!(is_first_party_clone(&v(true, "clone", src)));
-        assert!(is_first_party_clone(&v(
-            true,
-            "clone",
-            "git.example.com/mirrors/scarab-ci//libs/checkout.yaml@1111"
-        )));
-        assert!(
-            !is_first_party_clone(&v(false, "clone", src)),
-            "not first-party"
-        );
-        assert!(
-            !is_first_party_clone(&v(true, "deploy", src)),
-            "another first-party library, fetched from a path named clone.yaml"
         );
     }
 

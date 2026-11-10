@@ -48,8 +48,8 @@ pub use store::{
     PluginStore, PluginStoreError, PluginUninstall, PAGE_DEFAULT_LIMIT, PAGE_MAX_LIMIT,
 };
 
-/// The longest installation or plugin name: a DNS-1123 label. Plugin names
-/// are a catalog key; both name Kubernetes objects in slice (d2).
+/// The longest installation or plugin name: a DNS-1123 label. Both name
+/// Kubernetes objects in slice (d2).
 pub use scarab_project::MAX_INSTALLATION_NAME_CHARS;
 
 /// How many hex characters a server-minted installation id has.
@@ -236,7 +236,7 @@ pub const KNOWN_AUTH_SCHEMES: [&str; 1] = ["bearer"];
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PluginManifest {
-    /// The Plugin's name: a DNS-1123 label, the catalog key.
+    /// The Plugin's name: a DNS-1123 label.
     pub plugin: String,
     pub capabilities: Vec<PluginCapability>,
     #[serde(default)]
@@ -638,7 +638,7 @@ pub struct PluginInstallation {
     pub id: String,
     pub org: String,
     pub name: String,
-    /// The catalog's plugin name (the manifest's `plugin`).
+    /// The plugin's name (the manifest's `plugin`).
     pub plugin: String,
     /// `<repository>@sha256:<digest>` (a tag only under the dev knob).
     pub image: String,
@@ -869,7 +869,7 @@ mod tests {
     }
 
     #[test]
-    fn the_first_party_shape_validates_and_is_admitted() {
+    fn the_argocd_shape_validates_and_is_admitted() {
         assert_eq!(argo_like().validate(), Ok(()));
         assert_eq!(admit_for_mmp(&argo_like()), Ok(()));
     }

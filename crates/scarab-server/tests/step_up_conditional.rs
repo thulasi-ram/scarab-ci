@@ -1338,7 +1338,6 @@ async fn moving_plugin_storage_needs_a_step_up_and_adding_or_removing_does_not()
             scarab_server::plugins::PluginPolicy {
                 enabled: true,
                 namespace: "scarab-plugins".into(),
-                argocd_repo: "ghcr.io/acme/argocd".into(),
                 dev_allow_tag: false,
             },
         )

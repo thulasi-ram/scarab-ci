@@ -1,12 +1,16 @@
 //! Plugins end to end over HTTP (ADR-0072, MMP slice d1): an org admin
-//! installs the first-party plugin on the public API, and the plugin proves
+//! fetches a plugin's manifest from its git source, installs it by image
+//! digest with the manifest hash they reviewed, and the plugin proves
 //! who it is to the CredentialBroker's own router (`whoami`) — refused when
 //! its token maps to nothing, and from the very next request once killed.
 //! Report ingest went with the Deployment record (ADR-0074).
 //!
-//! Real Postgres for every store; the token verifier is the one fake (it
-//! stands in for TokenReview, a true external — slice d2) and the clock is a
-//! `FakeClock`. Each test gets its own database (`fresh_db`) and skips
+//! Every plugin installs the same way, the Argo CD plugin included.
+//!
+//! Real Postgres for every store; the fakes are the token verifier (it
+//! stands in for TokenReview, a true external — slice d2) and the forge a
+//! manifest is read from (`StaticFetcher`, so no test makes a network call);
+//! the clock is a `FakeClock`. Each test gets its own database (`fresh_db`) and skips
 //! cleanly when `SCARAB_TEST_DATABASE_URL` is unset.
 
 mod common;
@@ -26,6 +30,10 @@ use scarab_plugin::{
     VerifiedServiceAccount,
 };
 use scarab_server::plugins::PluginPolicy;
+use scarab_server::test_support::{
+    argocd_fetcher, argocd_install_body, manifest_sha256, StaticFetcher, ARGOCD_MANIFEST,
+    ARGOCD_MANIFEST_SOURCE,
+};
 use scarab_server::{broker, router, AppState, LogService};
 use scarab_testkit::{
     FakeAuthenticator, FakeClock, InMemoryDb, InMemoryObjectStore, InMemoryRbac, InMemorySessions,
@@ -66,12 +74,16 @@ fn policy(enabled: bool) -> PluginPolicy {
     PluginPolicy {
         enabled,
         namespace: NAMESPACE.into(),
-        argocd_repo: REPO.into(),
         dev_allow_tag: false,
     }
 }
 
 fn state(pg: Arc<PostgresDb>, enabled: bool) -> AppState {
+    state_with(pg, enabled, Arc::new(argocd_fetcher()))
+}
+
+/// [`state`], reading manifests from `fetcher`.
+fn state_with(pg: Arc<PostgresDb>, enabled: bool, fetcher: Arc<StaticFetcher>) -> AppState {
     let db = Arc::new(InMemoryDb::new());
     let logs = Arc::new(LogService::new(
         Arc::new(InMemoryObjectStore::new()),
@@ -81,6 +93,7 @@ fn state(pg: Arc<PostgresDb>, enabled: bool) -> AppState {
         .with_org_environments(pg.clone())
         .with_plugins(pg, policy(enabled))
         .with_plugin_tokens(Arc::new(FakeTokenReview))
+        .with_library_fetcher(fetcher)
 }
 
 /// The public API and the broker over one state, authz off (every caller an
@@ -91,7 +104,12 @@ struct Apps {
 }
 
 fn apps(pg: Arc<PostgresDb>) -> Apps {
-    let st = state(pg, true);
+    apps_with(pg, Arc::new(argocd_fetcher()))
+}
+
+/// [`apps`], reading manifests from `fetcher`.
+fn apps_with(pg: Arc<PostgresDb>, fetcher: Arc<StaticFetcher>) -> Apps {
+    let st = state_with(pg, true, fetcher);
     Apps {
         public: router(st.clone()),
         broker: broker::router(st),
@@ -136,14 +154,48 @@ async fn call(
     (status, value)
 }
 
-/// Install `name` and return its token.
+/// The install body for the Argo CD plugin as `name`.
+fn argocd(name: &str) -> Value {
+    argocd_install_body(name, &image())
+}
+
+/// `body` with `key` set to `value`.
+fn with(mut body: Value, key: &str, value: Value) -> Value {
+    body[key] = value;
+    body
+}
+
+/// `POST …/plugin-fetch` of `source`, anonymously.
+async fn fetch(app: &axum::Router, org: &str, source: &str) -> (StatusCode, Value) {
+    call(
+        app,
+        "POST",
+        &format!("/v1/orgs/{org}/plugin-fetch"),
+        None,
+        Some(json!({ "source": source })),
+    )
+    .await
+}
+
+/// The names of `org`'s installations.
+async fn installed(app: &axum::Router, org: &str) -> Vec<String> {
+    let (status, list) = call(app, "GET", &format!("/v1/orgs/{org}/plugins"), None, None).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    list.as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// Install the Argo CD plugin as `name` and return its token.
 async fn install(app: &axum::Router, org: &str, name: &str) -> String {
     let (status, body) = call(
         app,
         "POST",
         &format!("/v1/orgs/{org}/plugins"),
         None,
-        Some(json!({ "name": name, "plugin": "argocd", "image": image() })),
+        Some(argocd(name)),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
@@ -337,53 +389,255 @@ async fn a_failing_workload_is_not_a_held_installation() {
     tdb.cleanup().await;
 }
 
+/// A plugin is installed by image digest, whoever published it: a tag, a
+/// digest of the wrong shape or a bare repository is a 400 and stores
+/// nothing, and any repository is accepted by digest. With
+/// SCARAB_PLUGINS=off every install is refused.
+///
+/// This test once asserted that every plugin but Argo CD from one repository
+/// was refused. That allowlist is gone: what an admin approves, for every
+/// plugin alike, is the image digest and the manifest they reviewed (see
+/// the tests below for the manifest half).
 #[tokio::test]
-async fn only_a_first_party_plugin_pinned_by_digest_installs() {
+async fn a_plugin_installs_only_by_digest_and_only_while_plugins_are_on() {
     let Some((tdb, pg)) = migrated().await else {
         return;
     };
     let apps = apps(pg.clone());
-    for (plugin, image) in [
-        (
-            "flux",
-            format!("ghcr.io/fluxcd/flux-plugin@sha256:{}", "a".repeat(64)),
-        ),
-        ("argocd", format!("{REPO}:latest")),
-        (
-            "argocd",
-            format!("ghcr.io/evil/argocd@sha256:{}", "a".repeat(64)),
-        ),
+    for image in [
+        format!("{REPO}:latest"),
+        REPO.to_string(),
+        format!("{REPO}@sha256:{}", "A".repeat(64)),
+        format!("{REPO}@sha256:{}", "a".repeat(63)),
+        format!("{REPO}@sha512:{}", "a".repeat(64)),
+        format!("{REPO}:v1@sha256:{}", "a".repeat(64)),
     ] {
         let (status, body) = call(
             &apps.public,
             "POST",
             "/v1/orgs/acme/plugins",
             None,
-            Some(json!({ "name": "p", "plugin": plugin, "image": image })),
+            Some(argocd_install_body("p", &image)),
         )
         .await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "{plugin} {image}");
-        assert!(
-            body.as_str()
-                .unwrap()
-                .contains("third-party installs are off (ADR-0072)"),
-            "{body}"
-        );
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{image}: {body}");
+        assert!(body.to_string().contains("sha256"), "{body}");
     }
-    let (_, list) = call(&apps.public, "GET", "/v1/orgs/acme/plugins", None, None).await;
-    assert_eq!(list, json!([]));
+    assert_eq!(installed(&apps.public, "acme").await, Vec::<String>::new());
 
-    // With SCARAB_PLUGINS=off even a first-party install is refused.
+    // Another repository, by digest, installs like Scarab's own.
+    let fork = format!("ghcr.io/someone-else/argocd-fork@sha256:{}", "b".repeat(64));
+    let (status, body) = call(
+        &apps.public,
+        "POST",
+        "/v1/orgs/acme/plugins",
+        None,
+        Some(argocd_install_body("fork", &fork)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["image"], json!(fork));
+
+    // With SCARAB_PLUGINS=off every install is refused.
     let off = router(state(pg, false));
     let (status, _) = call(
         &off,
         "POST",
         "/v1/orgs/acme/plugins",
         None,
-        Some(json!({ "name": "argocd", "plugin": "argocd", "image": image() })),
+        Some(argocd("argocd")),
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(installed(&off, "acme").await, vec!["fork".to_string()]);
+    tdb.cleanup().await;
+}
+
+/// The manifest names the plugin, so an install cannot: a body that still
+/// carries `plugin`, or that lacks the source or the reviewed hash, is
+/// refused before any source is read or anything stored.
+#[tokio::test]
+async fn an_install_body_that_names_the_plugin_or_skips_the_review_is_refused() {
+    let Some((tdb, pg)) = migrated().await else {
+        return;
+    };
+    let fetcher = Arc::new(argocd_fetcher());
+    let apps = apps_with(pg, fetcher.clone());
+    for body in [
+        with(argocd("argocd"), "plugin", json!("argocd")),
+        with(argocd("argocd"), "plugin", json!("flux")),
+        json!({ "name": "argocd", "image": image() }),
+        json!({ "name": "argocd", "image": image(), "source": ARGOCD_MANIFEST_SOURCE }),
+        json!({
+            "name": "argocd",
+            "image": image(),
+            "manifest_sha256": manifest_sha256(ARGOCD_MANIFEST),
+        }),
+    ] {
+        let (status, msg) = call(
+            &apps.public,
+            "POST",
+            "/v1/orgs/acme/plugins",
+            None,
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}: {msg}");
+    }
+    assert_eq!(fetcher.asked(), Vec::<String>::new(), "no source was read");
+    assert_eq!(installed(&apps.public, "acme").await, Vec::<String>::new());
+    tdb.cleanup().await;
+}
+
+/// The admin approves the manifest they reviewed, by its hash. An install
+/// is refused with 409 when the source now reads as another manifest (one
+/// read rule more), when the hash is one no fetch returned, or when the
+/// reviewed hash is sent with another source. Nothing is stored; the
+/// reviewed pair still installs.
+#[tokio::test]
+async fn an_install_whose_source_no_longer_reads_as_the_reviewed_manifest_is_409() {
+    let Some((tdb, pg)) = migrated().await else {
+        return;
+    };
+    let fetcher = Arc::new(argocd_fetcher());
+    let apps = apps_with(pg, fetcher.clone());
+    let (status, fetched) = fetch(&apps.public, "acme", ARGOCD_MANIFEST_SOURCE).await;
+    assert_eq!(status, StatusCode::OK, "{fetched}");
+    let reviewed = fetched["manifest_sha256"].as_str().unwrap().to_string();
+    assert_eq!(reviewed, manifest_sha256(ARGOCD_MANIFEST));
+
+    let mut wider: Value = serde_json::from_str(ARGOCD_MANIFEST).unwrap();
+    wider["connections"][0]["read_rules"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({ "method": "GET", "path": "/api/v1/account" }));
+    let wider = wider.to_string();
+    let other_source = format!(
+        "github.com/someone-else/plugins//argocd.json@{}",
+        "d".repeat(40)
+    );
+    fetcher.serve(&other_source, &wider);
+
+    // The same source now serves a manifest that asks for more.
+    fetcher.serve(ARGOCD_MANIFEST_SOURCE, &wider);
+    let (status, body) = call(
+        &apps.public,
+        "POST",
+        "/v1/orgs/acme/plugins",
+        None,
+        Some(argocd("argocd")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.to_string().contains("you reviewed"), "{body}");
+    fetcher.serve(ARGOCD_MANIFEST_SOURCE, ARGOCD_MANIFEST);
+
+    for body in [
+        // A hash no fetch returned.
+        with(argocd("argocd"), "manifest_sha256", json!("0".repeat(64))),
+        // The reviewed hash, with a source that reads as another manifest.
+        with(argocd("argocd"), "source", json!(other_source)),
+    ] {
+        let (status, msg) = call(
+            &apps.public,
+            "POST",
+            "/v1/orgs/acme/plugins",
+            None,
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}: {msg}");
+    }
+    assert_eq!(installed(&apps.public, "acme").await, Vec::<String>::new());
+
+    let (status, body) = call(
+        &apps.public,
+        "POST",
+        "/v1/orgs/acme/plugins",
+        None,
+        Some(argocd("argocd")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    tdb.cleanup().await;
+}
+
+/// A manifest that asks for a capability this Scarab does not admit is a
+/// 400 at fetch and at install, whoever published it, and names the
+/// capability. So is a file that is not a manifest (a write rule).
+#[tokio::test]
+async fn a_manifest_asking_for_a_capability_not_admitted_is_refused_at_fetch_and_install() {
+    let Some((tdb, pg)) = migrated().await else {
+        return;
+    };
+    let fetcher = Arc::new(StaticFetcher::new());
+    let apps = apps_with(pg, fetcher.clone());
+    for capability in [
+        "approve_gates",
+        "report_deployments",
+        "subscribe_events",
+        "offer_actions",
+        "contribute_ui",
+    ] {
+        let mut m: Value = serde_json::from_str(ARGOCD_MANIFEST).unwrap();
+        m["capabilities"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!(capability));
+        let manifest = m.to_string();
+        let source = format!(
+            "github.com/someone-else/plugins//{capability}.json@{}",
+            "c".repeat(40)
+        );
+        fetcher.serve(&source, &manifest);
+
+        let (status, body) = fetch(&apps.public, "acme", &source).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{capability}: {body}");
+        assert!(body.to_string().contains("cannot be installed"), "{body}");
+        assert!(body.to_string().contains(capability), "{body}");
+
+        let (status, body) = call(
+            &apps.public,
+            "POST",
+            "/v1/orgs/acme/plugins",
+            None,
+            Some(json!({
+                "name": "p",
+                "image": image(),
+                "source": source,
+                "manifest_sha256": manifest_sha256(&manifest),
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{capability}: {body}");
+    }
+
+    let mut m: Value = serde_json::from_str(ARGOCD_MANIFEST).unwrap();
+    m["connections"][0]["write_rules"] = json!([{ "method": "POST", "path": "/x" }]);
+    let source = format!(
+        "github.com/someone-else/plugins//writes.json@{}",
+        "c".repeat(40)
+    );
+    fetcher.serve(&source, &m.to_string());
+    let (status, body) = fetch(&apps.public, "acme", &source).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.to_string().contains("not a plugin manifest"), "{body}");
+    let (status, body) = call(
+        &apps.public,
+        "POST",
+        "/v1/orgs/acme/plugins",
+        None,
+        Some(json!({
+            "name": "p",
+            "image": image(),
+            "source": source,
+            "manifest_sha256": "0".repeat(64),
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    assert_eq!(installed(&apps.public, "acme").await, Vec::<String>::new());
     tdb.cleanup().await;
 }
 
@@ -401,7 +655,7 @@ async fn a_plugin_is_not_installed_into_a_reserved_org() {
             "POST",
             &format!("/v1/orgs/{org}/plugins"),
             None,
-            Some(json!({ "name": "argocd", "plugin": "argocd", "image": image() })),
+            Some(argocd("argocd")),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{org}: {body}");
@@ -448,7 +702,7 @@ async fn an_uninstall_retires_the_name() {
         "POST",
         "/v1/orgs/acme/plugins",
         None,
-        Some(json!({ "name": "argocd", "plugin": "argocd", "image": image() })),
+        Some(argocd("argocd")),
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "the name is retired");
@@ -480,9 +734,7 @@ async fn storage_is_set_at_install_changed_and_cleared() {
             "POST",
             "/v1/orgs/acme/plugins",
             None,
-            Some(json!({
-                "name": "argocd", "plugin": "argocd", "image": image(), "storage": storage
-            })),
+            Some(with(argocd("argocd"), "storage", storage.clone())),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{storage}: {body}");
@@ -496,10 +748,11 @@ async fn storage_is_set_at_install_changed_and_cleared() {
         "POST",
         "/v1/orgs/acme/plugins",
         None,
-        Some(json!({
-            "name": "argocd", "plugin": "argocd", "image": image(),
-            "storage": { "claim": "argocd-state" }
-        })),
+        Some(with(
+            argocd("argocd"),
+            "storage",
+            json!({ "claim": "argocd-state" }),
+        )),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
@@ -570,9 +823,9 @@ async fn storage_is_set_at_install_changed_and_cleared() {
     tdb.cleanup().await;
 }
 
-/// Installing, listing and killing need Administer on the Org.
+/// Fetching, installing, listing and killing need Administer on the Org.
 #[tokio::test]
-async fn a_member_cannot_install_list_or_kill() {
+async fn a_member_cannot_fetch_install_list_or_kill() {
     let Some((tdb, pg)) = migrated().await else {
         return;
     };
@@ -619,14 +872,31 @@ async fn a_member_cannot_install_list_or_kill() {
         }
     };
     let (ada, mel) = (session("ada-code").await, session("mel-code").await);
-    let body = || Some(json!({ "name": "argocd", "plugin": "argocd", "image": image() }));
+    let body = || Some(argocd("argocd"));
 
     let (status, _) = call(&app, "POST", "/v1/orgs/acme/plugins", Some(&mel), body()).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "a member installs");
-    for uri in ["/v1/orgs/acme/plugins", "/v1/orgs/acme/plugin-catalog"] {
-        let (status, _) = call(&app, "GET", uri, Some(&mel), None).await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "a member reads {uri}");
-    }
+    let (status, _) = call(&app, "GET", "/v1/orgs/acme/plugins", Some(&mel), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "a member lists");
+    let source = Some(json!({ "source": ARGOCD_MANIFEST_SOURCE }));
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/v1/orgs/acme/plugin-fetch",
+        Some(&mel),
+        source.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "a member fetches");
+    let (status, fetched) = call(
+        &app,
+        "POST",
+        "/v1/orgs/acme/plugin-fetch",
+        Some(&ada),
+        source,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{fetched}");
     let (status, installed) = call(&app, "POST", "/v1/orgs/acme/plugins", Some(&ada), body()).await;
     assert_eq!(status, StatusCode::CREATED, "{installed}");
     assert_eq!(installed["approved_by"], json!("ada"));
@@ -706,11 +976,19 @@ async fn under_enforced_step_up_the_broker_is_unchanged() {
         "POST",
         "/v1/orgs/acme/plugins",
         None,
-        Some(json!({ "name": "argocd-prod", "plugin": "argocd", "image": image() })),
+        Some(argocd("argocd-prod")),
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     assert_eq!(body["code"], json!("step_up_required"));
+    assert_eq!(
+        installed(&router(off.clone()), "acme").await,
+        Vec::<String>::new(),
+        "nothing is installed without the step-up"
+    );
+    // Reading a manifest to review installs nothing, so it needs no step-up.
+    let (status, fetched) = fetch(&router(on.clone()), "acme", ARGOCD_MANIFEST_SOURCE).await;
+    assert_eq!(status, StatusCode::OK, "{fetched}");
     // … so the admin side is set up with it off (it is not under test).
     let apps = Apps {
         public: router(off),
@@ -824,7 +1102,7 @@ async fn an_org_admin_reads_the_broker_journal_newest_first_by_page() {
         "POST",
         "/v1/orgs/acme/plugins",
         Some(&ada),
-        Some(json!({ "name": "argocd", "plugin": "argocd", "image": image() })),
+        Some(argocd("argocd")),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{installed}");
@@ -922,5 +1200,240 @@ async fn an_org_admin_reads_the_broker_journal_newest_first_by_page() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "another org's installation");
+    tdb.cleanup().await;
+}
+
+/// A plugin nobody at Scarab wrote, from someone else's repository.
+const SLACK_SOURCE: &str =
+    "github.com/someone-else/scarab-slack//manifest.yaml@5ac4000000000000000000000000000000000001";
+const SLACK_MANIFEST: &str = "\
+plugin: slack-notify
+capabilities: [use_connection]
+connections:
+  - name: slack
+    auth_schemes: [bearer]
+    read_rules:
+      - { method: GET, path: /api/conversations.info, query: [channel] }
+config_keys: [SLACK_CHANNEL]
+";
+
+fn slack_image() -> String {
+    format!("ghcr.io/someone-else/slack@sha256:{}", "b".repeat(64))
+}
+
+/// Fetch `source` for review in `org`, then install it as `name` from
+/// `image` with the hash the fetch returned: (the fetch, the installation).
+async fn fetch_and_install(
+    app: &axum::Router,
+    org: &str,
+    name: &str,
+    source: &str,
+    image: &str,
+    config: Value,
+) -> (Value, Value) {
+    let (status, fetched) = fetch(app, org, source).await;
+    assert_eq!(status, StatusCode::OK, "{fetched}");
+    let (status, installation) = call(
+        app,
+        "POST",
+        &format!("/v1/orgs/{org}/plugins"),
+        None,
+        Some(json!({
+            "name": name,
+            "image": image,
+            "source": source,
+            "manifest_sha256": fetched["manifest_sha256"],
+            "config": config,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{installation}");
+    (fetched, installation)
+}
+
+/// A plugin from another publisher, under an image of another repository,
+/// installs through the same fetch and install as the Argo CD plugin. The
+/// installation records the manifest the file holds, its hash and the
+/// image, and the broker and the connections view treat it as they treat
+/// Argo CD's.
+#[tokio::test]
+async fn a_third_party_plugin_installs_through_the_same_path_as_argocd() {
+    let Some((tdb, pg)) = migrated().await else {
+        return;
+    };
+    let fetcher = Arc::new(argocd_fetcher());
+    fetcher.serve(SLACK_SOURCE, SLACK_MANIFEST);
+    let apps = apps_with(pg.clone(), fetcher);
+
+    let (fetched, slack) = fetch_and_install(
+        &apps.public,
+        "acme",
+        "slack",
+        SLACK_SOURCE,
+        &slack_image(),
+        json!({ "SLACK_CHANNEL": "deploys" }),
+    )
+    .await;
+    assert_eq!(fetched["source"], json!(SLACK_SOURCE));
+    assert_eq!(fetched["content"], json!(SLACK_MANIFEST));
+    assert_eq!(fetched["manifest"]["plugin"], json!("slack-notify"));
+    assert_eq!(
+        fetched["manifest"]["capabilities"],
+        json!(["use_connection"])
+    );
+    assert_eq!(fetched["installed"], json!([]));
+    let sha = fetched["manifest_sha256"].as_str().unwrap();
+
+    assert_eq!(slack["plugin"], json!("slack-notify"));
+    assert_eq!(slack["principal"], json!("plugin:slack"));
+    assert_eq!(slack["image"], json!(slack_image()));
+    assert_eq!(slack["manifest_sha256"], json!(sha));
+    assert_eq!(slack["manifest"], fetched["manifest"]);
+    assert_eq!(slack["config"], json!({ "SLACK_CHANNEL": "deploys" }));
+
+    let row = pg.installation("acme", "slack").await.unwrap().unwrap();
+    let file: scarab_plugin::PluginManifest = serde_yaml::from_str(SLACK_MANIFEST).unwrap();
+    assert_eq!(row.manifest, file);
+    assert_eq!(row.manifest_sha256, sha);
+    assert_eq!(row.image, slack_image());
+    assert_eq!(row.plugin, "slack-notify");
+
+    let argocd_token = install(&apps.public, "acme", "argocd").await;
+    let slack_token = format!("tok-{}", slack["id"].as_str().unwrap());
+    for (name, plugin, token, slot) in [
+        ("slack", "slack-notify", slack_token, "slack"),
+        ("argocd", "argocd", argocd_token, "argocd"),
+    ] {
+        let (status, me) = whoami(&apps, Some(&token)).await;
+        assert_eq!(status, StatusCode::OK, "{name}: {me}");
+        assert_eq!(me["name"], json!(name));
+        assert_eq!(me["plugin"], json!(plugin));
+        let (status, slots) = call(
+            &apps.public,
+            "GET",
+            &format!("/v1/orgs/acme/plugins/{name}/connections"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{name}: {slots}");
+        let slots = slots.as_array().unwrap();
+        assert_eq!(slots.len(), 1, "{name}: {slots:?}");
+        assert_eq!(slots[0]["slot"], json!(slot));
+        assert_eq!(slots[0]["configured"], json!(false));
+    }
+    tdb.cleanup().await;
+}
+
+/// The Argo CD plugin gets what an admin approved and nothing else: its
+/// installation's manifest is the fetched file's, the install read the
+/// source again, and with no source the server can read there is no
+/// install at all.
+#[tokio::test]
+async fn the_argocd_plugin_gets_nothing_an_admin_did_not_approve() {
+    let Some((tdb, pg)) = migrated().await else {
+        return;
+    };
+    let fetcher = Arc::new(argocd_fetcher());
+    let apps = apps_with(pg.clone(), fetcher.clone());
+
+    let (fetched, installation) = fetch_and_install(
+        &apps.public,
+        "acme",
+        "argocd",
+        ARGOCD_MANIFEST_SOURCE,
+        &image(),
+        json!({}),
+    )
+    .await;
+    assert_eq!(fetched["content"], json!(ARGOCD_MANIFEST));
+    assert_eq!(installation["manifest"], fetched["manifest"]);
+    assert_eq!(installation["manifest_sha256"], fetched["manifest_sha256"]);
+    let row = pg.installation("acme", "argocd").await.unwrap().unwrap();
+    let file: scarab_plugin::PluginManifest = serde_json::from_str(ARGOCD_MANIFEST).unwrap();
+    assert_eq!(row.manifest, file);
+    assert_eq!(row.manifest_sha256, manifest_sha256(ARGOCD_MANIFEST));
+    // Read once to review and once again at install.
+    let asked = fetcher.asked();
+    assert_eq!(asked.len(), 2, "{asked:?}");
+    assert_eq!(asked[0], asked[1]);
+
+    // A commit the forge does not serve: 400. A host Scarab does not read
+    // from anonymously: 403. Neither installs.
+    for (source, want) in [
+        (
+            format!(
+                "github.com/thulasi-ram/scarab-ci//crates/scarab-plugin-argocd/manifest.json@{}",
+                "e".repeat(40)
+            ),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            format!(
+                "forge.example.com/acme/plugins//argocd.json@{}",
+                "e".repeat(40)
+            ),
+            StatusCode::FORBIDDEN,
+        ),
+    ] {
+        let (status, body) = fetch(&apps.public, "acme", &source).await;
+        assert_eq!(status, want, "fetch {source}: {body}");
+        let (status, body) = call(
+            &apps.public,
+            "POST",
+            "/v1/orgs/acme/plugins",
+            None,
+            Some(with(argocd("argocd-2"), "source", json!(source))),
+        )
+        .await;
+        assert_eq!(status, want, "install {source}: {body}");
+    }
+    assert_eq!(
+        installed(&apps.public, "acme").await,
+        vec!["argocd".to_string()]
+    );
+    tdb.cleanup().await;
+}
+
+/// A fetch lists the org's existing installations of the plugin it read,
+/// each with its image and the manifest hash it was approved with; not
+/// another plugin's, nor another org's.
+#[tokio::test]
+async fn a_fetch_lists_the_org_s_installations_of_the_same_plugin() {
+    let Some((tdb, pg)) = migrated().await else {
+        return;
+    };
+    let fetcher = Arc::new(argocd_fetcher());
+    fetcher.serve(SLACK_SOURCE, SLACK_MANIFEST);
+    let apps = apps_with(pg, fetcher);
+    let (status, fetched) = fetch(&apps.public, "acme", ARGOCD_MANIFEST_SOURCE).await;
+    assert_eq!(status, StatusCode::OK, "{fetched}");
+    assert_eq!(fetched["installed"], json!([]));
+
+    install(&apps.public, "acme", "argocd-stage").await;
+    install(&apps.public, "acme", "argocd-prod").await;
+    install(&apps.public, "globex", "argocd-prod").await;
+    fetch_and_install(
+        &apps.public,
+        "acme",
+        "slack",
+        SLACK_SOURCE,
+        &slack_image(),
+        json!({}),
+    )
+    .await;
+
+    let (status, fetched) = fetch(&apps.public, "acme", ARGOCD_MANIFEST_SOURCE).await;
+    assert_eq!(status, StatusCode::OK, "{fetched}");
+    let mut entries = fetched["installed"].as_array().unwrap().clone();
+    entries.sort_by_key(|e| e["name"].as_str().unwrap().to_string());
+    let sha = manifest_sha256(ARGOCD_MANIFEST);
+    assert_eq!(
+        entries,
+        vec![
+            json!({ "name": "argocd-prod", "image": image(), "manifest_sha256": sha }),
+            json!({ "name": "argocd-stage", "image": image(), "manifest_sha256": sha }),
+        ]
+    );
     tdb.cleanup().await;
 }

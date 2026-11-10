@@ -8,8 +8,8 @@ mod common;
 use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
 use scarab_policy::library::{
-    content_hash, DefaultsState, LibraryStore, LibraryStoreError, LibraryVersion, LibraryYank,
-    MissingDefault, NewInstallation, OrgLibraryDefaults, Replaces, TrustedSource,
+    content_hash, LibraryStore, LibraryStoreError, LibraryVersion, LibraryYank, NewInstallation,
+    Replaces, TrustedSource,
 };
 use scarab_testkit::InMemoryLibraries;
 
@@ -41,7 +41,6 @@ macro_rules! contract_test {
 contract_test!(versions_are_kept_per_org_by_hash, versions);
 contract_test!(install_upgrade_and_remove_check_what_they_replace, installs);
 contract_test!(yanks_are_per_org_and_keep_the_first_reason, yanks);
-contract_test!(defaults_are_claimed_once_per_org, defaults);
 contract_test!(
     prune_deletes_the_oldest_versions_never_installed,
     prune_never_installed
@@ -93,7 +92,6 @@ fn version(org: &str, content: &str, source: &str) -> LibraryVersion {
         source: source.into(),
         publisher: "acme".into(),
         name: "deploy".into(),
-        first_party: false,
         fetched_by: "user:amy".into(),
         fetched_at: 1_000,
     }
@@ -307,31 +305,6 @@ async fn yanks(store: &dyn LibraryStore) {
     );
     assert_eq!(store.unyank("acme", &v1.content_hash).await.unwrap(), None);
     assert!(store.yanked("acme", &hashes).await.unwrap().is_empty());
-}
-
-async fn defaults(store: &dyn LibraryStore) {
-    assert_eq!(store.defaults("acme").await.unwrap(), None);
-    assert!(store.claim_defaults("acme", 7).await.unwrap());
-    assert!(!store.claim_defaults("acme", 8).await.unwrap());
-    let d = store.defaults("acme").await.unwrap().unwrap();
-    assert_eq!(d.state, DefaultsState::Pending);
-    assert_eq!(d.updated_at, 7);
-
-    let missing = OrgLibraryDefaults {
-        org: "acme".into(),
-        state: DefaultsState::Missing,
-        missing: vec![MissingDefault {
-            publisher: "thulasi-ram".into(),
-            name: "clone".into(),
-            error: "connection refused".into(),
-        }],
-        mirror: Some("https://git.example/mirror".into()),
-        updated_at: 9,
-    };
-    store.set_defaults(&missing).await.unwrap();
-    assert_eq!(store.defaults("acme").await.unwrap(), Some(missing));
-    // A record set by hand also blocks a claim.
-    assert!(!store.claim_defaults("acme", 10).await.unwrap());
 }
 
 async fn prune_never_installed(store: &dyn LibraryStore) {

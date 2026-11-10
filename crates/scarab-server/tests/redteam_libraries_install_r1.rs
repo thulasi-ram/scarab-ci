@@ -1,5 +1,5 @@
-//! Red team r1 (ADR-0076 step 2): org-installed libraries, first-party
-//! libraries and yank, attacked as security boundaries — SSRF from the
+//! Red team r1 (ADR-0076 step 2): org-installed libraries, trusted sources
+//! and yank, attacked as security boundaries — SSRF from the
 //! server, cross-org access, running code an admin yanked, bypassing
 //! step-up, and racing installs.
 //!
@@ -394,7 +394,6 @@ async fn seed(libs: &InMemoryLibraries, org: &str, publisher: &str, name: &str, 
         source: format!("github.com/{publisher}/libs//{name}.yaml@{C1}"),
         publisher: publisher.into(),
         name: name.into(),
-        first_party: false,
         fetched_by: "seed".into(),
         fetched_at: 1,
     })
@@ -445,8 +444,15 @@ fn org_routes(org: &str) -> Vec<(&'static str, String, Option<Value>)> {
         ("DELETE", format!("/v1/orgs/{org}/library-yanks/{h}"), None),
         (
             "POST",
-            format!("/v1/orgs/{org}/library-defaults/retry"),
-            Some(json!({})),
+            format!("/v1/orgs/{org}/library-trust"),
+            Some(json!({ "source": format!("github.com/{org}/libs//deploy.yaml") })),
+        ),
+        (
+            "DELETE",
+            format!(
+                "/v1/orgs/{org}/library-trust?source=github.com%2F{org}%2Flibs%2F%2Fdeploy.yaml"
+            ),
+            None,
         ),
     ]
 }
@@ -469,6 +475,14 @@ async fn rbac_an_admin_of_one_org_cannot_read_or_change_anothers_libraries() {
         })
         .await
         .unwrap();
+    let globex_trust = scarab_policy::library::TrustedSource {
+        org: "globex".into(),
+        source: "github.com/globex/libs//deploy.yaml".into(),
+        trusted_by: "seed".into(),
+        trusted_at: 1,
+        step_up_ref: None,
+    };
+    lh.libs.trust_source(&globex_trust).await.unwrap();
     lh.http.serve(
         &format!("https://raw.githubusercontent.com/globex/libs/{C1}/deploy.yaml"),
         DEPLOY,
@@ -515,12 +529,15 @@ async fn rbac_an_admin_of_one_org_cannot_read_or_change_anothers_libraries() {
         .is_some());
     assert_eq!(lh.libs.yanks("globex").await.unwrap().len(), 1);
     assert!(lh.libs.installations("globex").await.unwrap().len() == 1);
-    assert!(lh.libs.defaults("globex").await.unwrap().is_none());
+    assert_eq!(
+        lh.libs.trusted_sources("globex").await.unwrap(),
+        vec![globex_trust]
+    );
     assert!(lh.http.asked.lock().unwrap().is_empty());
 }
 
 /// The library routes' step-up classes, through the enforcing router:
-/// install, un-yank and the defaults retry loosen and need a step-up;
+/// install, un-yank and trusting a source loosen and need a step-up;
 /// yank and remove tighten and do not; fetch installs nothing.
 #[tokio::test]
 async fn stepup_loosening_library_routes_need_a_step_up_and_tightening_ones_do_not() {
@@ -581,16 +598,18 @@ async fn stepup_loosening_library_routes_need_a_step_up_and_tightening_ones_do_n
     assert!(is_step_up(st, &b), "unyank: {st} {b}");
     assert_eq!(lh.libs.yanks("acme").await.unwrap().len(), 1);
 
-    // Defaults retry: needs a step-up.
+    // Trusting a source with forge credentials: needs a step-up, and
+    // nothing is trusted.
     let (st, b) = h
         .cookie(
             "POST",
-            "/v1/orgs/acme/library-defaults/retry",
-            Some(json!({ "files": {} })),
+            "/v1/orgs/acme/library-trust",
+            Some(json!({ "source": "github.com/thulasi-ram/scarab-ci//libs/clone.yaml" })),
             &s,
         )
         .await;
-    assert!(is_step_up(st, &b), "defaults retry: {st} {b}");
+    assert!(is_step_up(st, &b), "trust: {st} {b}");
+    assert!(lh.libs.trusted_sources("acme").await.unwrap().is_empty());
 
     // Fetch: no step-up, installs nothing.
     let (st, b) = h
@@ -1037,7 +1056,6 @@ async fn race_a_second_first_install_does_not_overwrite_the_first() {
             source: format!("github.com/acme/libs//x.yaml@{C1}"),
             publisher: "acme".into(),
             name: "x".into(),
-            first_party: false,
             fetched_by: "amy".into(),
             fetched_at: 1,
         })

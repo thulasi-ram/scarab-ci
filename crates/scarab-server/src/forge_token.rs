@@ -21,8 +21,9 @@
 //! - A Step receives a forge credential only when the forge mints a
 //!   short-lived token scoped to the Run's repository (GitHub App mode), or
 //!   when the Step comes from a library the org trusts with long-lived
-//!   credentials: the first-party clone library, or a source an org admin
-//!   trusted. On a Forgejo or GitHub PAT connection a repository's own code
+//!   credentials: one installed from a source an org admin trusted. No
+//!   library is trusted by default, Scarab's clone library included. On a
+//!   Forgejo or GitHub PAT connection a repository's own code
 //!   never reads the token.
 //! - A fork pull request always gets `read`.
 //! - `write` needs a forge that mints a write token, and by default a Run
@@ -198,9 +199,9 @@ pub async fn forge_token_refusals(
             else {
                 out.refusals.push(format!(
                     "step `{}` asks for `forge_token`, and this repository's forge connection hands \
-                     out one long-lived token, which only a Step from a library the org trusts may \
-                     receive (the first-party `lib:thulasi-ram/clone`, or a source an org admin \
-                     trusted); a repository's own Steps never receive it",
+                     out one long-lived token, which only a Step from a library installed from a \
+                     source an org admin trusted may receive (Org settings > Libraries); a \
+                     repository's own Steps never receive it",
                     step.id
                 ));
                 continue;
@@ -228,7 +229,7 @@ pub async fn forge_token_refusals(
 /// The content hash of the library version `step` was written in, when the
 /// org trusts that library with long-lived forge credentials: the library
 /// that defines it (the last link of its `origin`) is stored in the org,
-/// and is the first-party clone library or from a source the org trusts. A
+/// and was fetched from a source the org trusts. A
 /// Step written in the Pipeline file, or in a `file:` library, is the
 /// repository's own code: `None`.
 async fn trusted_library_step(
@@ -254,8 +255,8 @@ async fn trusted_library_step(
 }
 
 /// Whether the org trusts the library version `hash` with long-lived forge
-/// credentials: it is stored in the org, and is the first-party clone
-/// library or from a source in `trusted_sources`.
+/// credentials: it is stored in the org, and was fetched from a source in
+/// `trusted_sources`.
 async fn library_trusted(
     libraries: &dyn LibraryStore,
     org: &str,
@@ -269,8 +270,7 @@ async fn library_trusted(
     else {
         return Ok(false);
     };
-    Ok(scarab_policy::library::is_first_party_clone(&version)
-        || trusted_sources.contains(scarab_policy::library::trust_key(&version.source)))
+    Ok(trusted_sources.contains(scarab_policy::library::trust_key(&version.source)))
 }
 
 /// The org's trusted sources, as [`library_trusted`] reads them.
