@@ -441,9 +441,23 @@ test("Connections lists the org's connections and, for a global admin, the unass
   await page.locator(".dlg-scrim").click({ position: { x: 5, y: 5 } });
   await expect(page.getByRole("dialog")).toHaveCount(0);
 
-  // Removing a connection asks for its id typed exactly.
+  // Disabling one of its repositories is the org page's Disable: the same
+  // confirmation, with owner/project typed, and the project leaves the row.
   const row = page_.locator("li.conn", { hasText: "forgejo-7f3a91c2" });
-  await row.getByRole("button", { name: "Remove", exact: true }).first().click();
+  await expect(row.getByRole("button", { name: "Remove", exact: true })).toHaveCount(1);
+  await row.getByRole("button", { name: "Disable", exact: true }).click();
+  const disable = page.getByRole("dialog");
+  await expect(disable.getByRole("heading", { name: "Disable acme/infra?" })).toBeVisible();
+  await expect(disable).toContainText("environments, secrets and access grants");
+  const off = disable.getByRole("button", { name: "Disable repository" });
+  await expect(off).toBeDisabled();
+  await disable.getByRole("textbox", { name: "Type acme/infra to confirm" }).fill("acme/infra");
+  await off.click();
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await expect(row.getByRole("link", { name: "acme/infra" })).toHaveCount(0);
+
+  // Removing a connection asks for its id typed exactly.
+  await row.getByRole("button", { name: "Remove", exact: true }).click();
   const dialog = page.getByRole("dialog");
   const go = dialog.getByRole("button", { name: "Remove connection" });
   await expect(go).toBeDisabled();

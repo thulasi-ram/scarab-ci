@@ -18,8 +18,9 @@
 //
 // Repositories are opt-in for both. What a connection reaches is only
 // available; Add repository (or Enable on the org page) binds one, which
-// creates its project, and Remove unbinds it. Nothing the forge sends binds a
-// repository again, so a removed one stays removed. Re-sync asks the forge what
+// creates its project, and Disable unbinds it (DisableRepository, as on the org
+// page). Nothing the forge sends binds a repository again, so a disabled one
+// stays disabled. Re-sync asks the forge what
 // it reaches and lists what is not enabled.
 //
 // The token is write-only: it is typed once, posted once, and never rendered.
@@ -43,7 +44,6 @@ import {
   listConnections,
   registerRepoWebhook,
   resyncConnection,
-  unbindRepo,
   type CapabilityRequirement,
   type Connection,
 } from "../api/client";
@@ -61,6 +61,7 @@ import { orgPageHref, UNREACHABLE_NOTE } from "../org-page";
 import FormSection from "./FormSection";
 import Modal, { ModalMessage, ModalSection } from "./Modal";
 import ConfirmDestructive from "./ConfirmDestructive";
+import DisableRepository from "./DisableRepository";
 import { Field, Input } from "./Field";
 import Icon from "./Icon";
 
@@ -395,22 +396,11 @@ function ConnectionRow(props: { conn: Connection; onChanged: () => void }) {
     }
   };
 
-  // Unbinding removes the Project, so it takes that repo's environments, secrets
-  // and access grants with it. The confirm says so; a refusal shows in it.
-  const [removingRepo, setRemovingRepo] = createSignal<
+  // Disabling removes the Project, so it takes that repo's environments,
+  // secrets and access grants with it. The confirm says so; a refusal shows in it.
+  const [disabling, setDisabling] = createSignal<
     { org: string; project: string; owner: string; name: string } | null
   >(null);
-  const removeRepo = async (owner: string, name: string) => {
-    setBusy(true);
-    setNote(null);
-    setError(null);
-    try {
-      await unbindRepo(c().id, owner, name);
-      props.onChanged();
-    } finally {
-      setBusy(false);
-    }
-  };
 
   // Removing a connection removes the Projects it serves — a Project *is* the
   // binding — so the server refuses unless we acknowledge that explicitly. The
@@ -550,10 +540,10 @@ function ConnectionRow(props: { conn: Connection; onChanged: () => void }) {
                   <button
                     class="btn btn-danger btn-sm"
                     disabled={busy()}
-                    title="Remove this repository's project from Scarab"
-                    onClick={() => setRemovingRepo({ org: p.org, project: p.project, owner: p.owner, name: p.name })}
+                    title="Disable this repository: its project is removed from Scarab"
+                    onClick={() => setDisabling({ org: p.org, project: p.project, owner: p.owner, name: p.name })}
                   >
-                    Remove
+                    Disable
                   </button>
                 </Show>
               </span>
@@ -585,21 +575,14 @@ function ConnectionRow(props: { conn: Connection; onChanged: () => void }) {
       <Show when={removing()}>
         <RemoveConnection conn={c()} onConfirm={remove} onClose={() => setRemoving(false)} />
       </Show>
-      <Show when={removingRepo()}>
+      <Show when={disabling()}>
         {(r) => (
-          <ConfirmDestructive
-            title={`Remove ${r().org}/${r().project} from Scarab?`}
-            purpose="Its project — including environments, secrets and access grants — is removed with it."
-            name={`${r().org}/${r().project}`}
-            confirmLabel="Remove repository"
-            onConfirm={() => removeRepo(r().owner, r().name)}
-            onClose={() => setRemovingRepo(null)}
-          >
-            <p>
-              The repository itself and its webhook are untouched. No installation event or
-              re-sync adds it back; you can enable it again from the organization page.
-            </p>
-          </ConfirmDestructive>
+          <DisableRepository
+            org={r().org}
+            repo={{ connection_id: c().id, owner: r().owner, name: r().name, project: r().project }}
+            onDisabled={() => props.onChanged()}
+            onClose={() => setDisabling(null)}
+          />
         )}
       </Show>
 

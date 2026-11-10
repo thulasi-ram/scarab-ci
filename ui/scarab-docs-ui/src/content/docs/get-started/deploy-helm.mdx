@@ -158,8 +158,9 @@ Anyone who can read the org sees the same list without the buttons. The list com
 `GET /v1/orgs/{org}/repos?page=&per_page=&q=`, which asks each connection's forge on every
 request; a connection the forge would not answer for is named in `unlisted`, and its enabled
 repositories are still listed. **Settings › Connections** offers the same per connection, as
-**Add repository** and **Remove**. An enabled repository's **Settings** tab has the same
-**Disable** for org admins, and goes to the org page once it is done.
+**Add repository** and **Disable**. An enabled repository's **Settings** tab has the same
+**Disable** for org admins, and goes to the org page once it is done. All three ask for the same
+typed name.
 
 Events of a repository that is not enabled (a push to a repository the App covers, for example)
 are acknowledged with `200 {"ignored": "repository not enabled"}` and start nothing, so the forge

@@ -1346,7 +1346,8 @@ function orgReposPage(org: string, search: string): Response {
   });
 }
 
-/** Enable or disable `owner/name`: the org page's list and /v1/repos follow. */
+/** Enable or disable `owner/name`: the org page's list, /v1/repos and the
+ *  connections' projects follow. */
 function setRepoEnabled(owner: string, name: string, enabled: boolean): OrgRepoDto | undefined {
   const r = orgRepos.find((x) => x.owner === owner && x.name === name);
   if (!r) return undefined;
@@ -1356,6 +1357,13 @@ function setRepoEnabled(owner: string, name: string, enabled: boolean): OrgRepoD
   const i = projects.findIndex((p) => p.owner === owner && p.name === name);
   if (enabled && i < 0) projects.push(proj(name, null));
   if (!enabled && i >= 0) projects.splice(i, 1);
+  // The connection's own list of the projects it serves follows too.
+  for (const c of connections) c.projects = c.projects.filter((p) => !(p.owner === owner && p.name === name));
+  if (enabled) {
+    connections
+      .find((c) => c.id === r.connection_id)
+      ?.projects.push({ org: owner, project: name, owner, name, unreachable_since: null });
+  }
   return r;
 }
 

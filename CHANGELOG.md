@@ -59,8 +59,9 @@ release.yml uses that version's section as the GitHub Release text. See
   org page afterwards. The org name in a repository's header links to it.
   The list is `GET /v1/orgs/{org}/repos`.
   ([Enabling repositories](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#enabling-repositories))
-- **Add repository and Remove for GitHub connections** under Organization settings ›
-  Connections, as for Forgejo.
+- **Add repository and Disable for GitHub connections** under Organization settings ›
+  Connections, as for Forgejo. A connection's per-repository Remove is now Disable, with the
+  org page's confirmation.
   ([Enabling repositories](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#enabling-repositories))
 
 ### Enhancement
