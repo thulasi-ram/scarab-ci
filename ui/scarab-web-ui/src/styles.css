@@ -650,6 +650,11 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
   padding-bottom: 8px;
   border-bottom: 1px solid var(--border);
 }
+/* A row's first cell names the row: primary ink, and Label when it is not a
+   machine value, as a members row's person is. The other cells stay Body in
+   the secondary ink. */
+.panel .table tbody td:first-child { color: var(--soft-white); }
+.panel .table tbody td:first-child > .oenv-link:not(.mono) { font: var(--t-label); }
 .panel .table th:first-child, .panel .table td:first-child { padding-left: 14px; }
 .panel .table th:last-child, .panel .table td:last-child { padding-right: 14px; }
 .panel .secrets-body > :is(.table-scroll, .tok-table-scroll) { margin: 0 -14px; }
@@ -1815,8 +1820,8 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
   font: var(--t-body); color: var(--sage);
 }
 .envt > thead > tr > th {
-  text-align: left; font: var(--t-label); color: var(--sage);
-  padding: 10px 16px; border-bottom: 1px solid var(--border-soft);
+  text-align: left; font: var(--t-label); color: var(--muted-sage);
+  padding: 8px 16px; border-bottom: 1px solid var(--border);
   white-space: nowrap;
 }
 .envt > thead > tr > th:first-child, .envt > tbody > tr > td:first-child { padding-left: 14px; }
@@ -1855,8 +1860,12 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
   text-align: left; padding: 5px 24px 5px 0; white-space: nowrap; font: var(--t-body);
   border-bottom: 1px solid var(--border-soft);
 }
+/* Column heads in the metadata ink over the full rule; each row's rule name
+   in the secondary ink; the values in the primary ink. */
 .envt-layers th { font: var(--t-label); color: var(--muted-sage); }
-.envt-layers td { font: var(--t-body); color: var(--sage); }
+.envt-layers thead th { border-bottom-color: var(--border); }
+.envt-layers tbody th { color: var(--sage); }
+.envt-layers td { font: var(--t-body); color: var(--soft-white); }
 .envt-layers td.envt-mono { font: var(--t-mono); }
 .envt-layers tbody tr:last-child > * { border-bottom: none; }
 .envt-actions { display: flex; flex-wrap: wrap; gap: 8px; }
