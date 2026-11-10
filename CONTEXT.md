@@ -205,8 +205,9 @@ or fails them with a reason. That is how a Plugin reaches a Run. It cannot pass 
 Gate, another installation's Gate or another Org's, or an expired wait, and a killed
 installation lists and resolves nothing (`crates/scarab-server/tests/plugin_gates.rs`).
 Core never calls a Plugin. Work done inside a Run stays a Step, reused through `invoke`.
-Not built: checking an image's signature (see **PluginPublisher**) and one-click upgrade
-(see **PluginInstallation**). _Avoid_: **PluginAction**, **`plugin_action`**,
+An installation records the source its manifest was read from and upgrades in place (see
+**PluginInstallation**). Not built: checking an image's signature (see **PluginPublisher**).
+_Avoid_: **PluginAction**, **`plugin_action`**,
 `offer_actions`, `subscribe_events`, `approve_gates`: designed in ADR-0072 and dropped by
 ADR-0074 and ADR-0076.
 
