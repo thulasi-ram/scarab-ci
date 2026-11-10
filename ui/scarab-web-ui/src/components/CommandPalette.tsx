@@ -3,11 +3,11 @@
 // is a follow-up for orgs with thousands of repos). Keyboard-first: arrows to
 // move, Enter to go, Esc to close.
 import { createResource, createSignal, createMemo, createEffect, For, Show, onCleanup, onMount } from "solid-js";
-import { useNavigate } from "@solidjs/router";
+import { useLocation, useNavigate } from "@solidjs/router";
 import { listProjects, type Project } from "../api/client";
 import { paletteOpen as open, setPaletteOpen as setOpen } from "../palette";
 import { me } from "../session";
-import { paletteEntries } from "../settings-nav";
+import { paletteEntries, settingsMenu } from "../settings-nav";
 import Icon from "./Icon";
 
 type Item =
@@ -23,6 +23,7 @@ export default function CommandPalette() {
   const [sel, setSel] = createSignal(0);
   const [projects] = createResource(open, () => listProjects());
   const nav = useNavigate();
+  const location = useLocation();
   let inputRef: HTMLInputElement | undefined;
 
   const items = createMemo<Item[]>(() => {
@@ -39,14 +40,16 @@ export default function CommandPalette() {
         sub: `${p.owner}/${p.name}`,
         href: `/${p.org}/${p.project}`,
       }));
-    // Every settings section the caller can reach (git-bug 734ffa1); with
-    // nothing typed, one entry for Settings rather than all of them.
+    // The settings pages the caller can use, the same entries as the user
+    // menu (git-bug 734ffa1); with a query, also every section they can
+    // reach.
+    const menu = me() ? settingsMenu(me()!, location.pathname) : [];
     const pages = (
       query
-        ? (me() ? paletteEntries(me()!) : [])
+        ? [...menu, ...(me() ? paletteEntries(me()!) : [])]
             .filter((pg) => `${pg.label} settings ${pg.sub}`.toLowerCase().includes(query))
             .slice(0, 8)
-        : [{ label: "Settings", sub: "your account and organization settings", href: "/settings" }]
+        : menu
     )
       .map<Item>((pg) => ({ kind: "page", label: pg.label, sub: pg.sub, href: pg.href }));
     const out: Item[] = [...repos, ...pages];
