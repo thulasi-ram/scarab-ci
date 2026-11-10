@@ -289,7 +289,7 @@ describe("which section the sidebar marks", () => {
   });
 
   it("marks the parent section on a page under it", () => {
-    expect(activeSectionHref("/orgs/acme/settings/environments/production")).toBe(
+    expect(activeSectionHref("/orgs/acme/settings/environments/production/manage")).toBe(
       "/orgs/acme/settings/environments",
     );
     expect(activeSectionHref("/orgs/acme/settings/environments/production/edit")).toBe(

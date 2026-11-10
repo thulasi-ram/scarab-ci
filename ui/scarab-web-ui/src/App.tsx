@@ -13,7 +13,7 @@ import { AccountSettings, LegacySettings, NewOrgSettings, OrgSettings } from "./
 import LibraryReview from "./routes/LibraryReview";
 import LibraryManage from "./routes/LibraryManage";
 import PluginManage from "./routes/PluginManage";
-import { EnvironmentEdit, EnvironmentView } from "./routes/EnvironmentPage";
+import { EnvironmentManage, EnvironmentRedirect } from "./routes/EnvironmentPage";
 import ConfirmRequest from "./routes/ConfirmRequest";
 import OrgPage from "./routes/OrgPage";
 import PolicyEditor from "./routes/PolicyEditor";
@@ -58,12 +58,14 @@ export default function App() {
           `<publisher>~<name>`, a plugin installation its id. */}
       <Route path="/orgs/:org/settings/libraries/:id/manage" component={LibraryManage} />
       <Route path="/orgs/:org/settings/plugins/:id/manage" component={PluginManage} />
-      {/* One Environment (git-bug c11abc5): read-only, and its edit screen,
-          both inside the settings frame. Five and six segments under the static /orgs, so they collide with
-          neither the settings sections nor /:org/:repo/runs/:id; the name is
-          one encoded segment. */}
-      <Route path="/orgs/:org/settings/environments/:env" component={EnvironmentView} />
-      <Route path="/orgs/:org/settings/environments/:env/edit" component={EnvironmentEdit} />
+      {/* One Environment (git-bug c11abc5): its manage page inside the
+          settings frame. Six segments with a static last one, so it collides
+          with neither the settings sections nor /:org/:repo/runs/:id; the
+          name is one encoded segment. The former read-only page and edit
+          screen redirect to it. */}
+      <Route path="/orgs/:org/settings/environments/:env/manage" component={EnvironmentManage} />
+      <Route path="/orgs/:org/settings/environments/:env" component={EnvironmentRedirect} />
+      <Route path="/orgs/:org/settings/environments/:env/edit" component={EnvironmentRedirect} />
       {/* One org Policy, or `new`: its editor and history, inside the
           settings frame with Policies marked. */}
       <Route path="/orgs/:org/settings/policies/:id" component={PolicyEditor} />

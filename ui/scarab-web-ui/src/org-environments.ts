@@ -103,23 +103,21 @@ export function toPutBody(form: OrgEnvironmentForm): { body: OrgEnvironmentBody 
 
 // ── The Environment's own pages ──────────────────────────────────────────────
 //
-// An Environment is viewed at `/orgs/<org>/settings/environments/<name>`
-// (read-only) and changed at `…/<name>/edit`. Five and six segments under a
-// static `/orgs` first segment, so neither can collide with `/:org/:repo`,
-// `/:org/:repo/runs/:id` or the four-segment settings sections. The name is
-// one encoded segment: names may hold `/`, spaces and `%`.
+// An Environment is managed at `/orgs/<org>/settings/environments/<name>/manage`:
+// six segments under a static `/orgs` first segment, with a static last
+// segment, so it collides with neither `/:org/:repo/runs/:id` nor the
+// four-segment settings sections. The name is one encoded segment: names may
+// hold `/`, spaces and `%`. The addresses it had before, `…/<name>` and
+// `…/<name>/edit`, redirect here.
 
 const sectionHref = (org: string) => orgHref(org, "environments");
 
 /** The Environments list in org settings. */
 export const environmentsHref = (org: string) => sectionHref(org);
 
-/** The read-only page of one Environment. */
+/** The manage page of one Environment. */
 export const environmentHref = (org: string, name: string) =>
-  `${sectionHref(org)}/${encodeURIComponent(name)}`;
-
-/** The edit page of one Environment. */
-export const environmentEditHref = (org: string, name: string) => `${environmentHref(org, name)}/edit`;
+  `${sectionHref(org)}/${encodeURIComponent(name)}/manage`;
 
 /** A destructive action goes ahead only when the exact name is typed — case
  *  and spaces included, as everywhere else the name is used. */
@@ -282,34 +280,7 @@ export function idleTimerWarning(rules: { approvers: readonly string[]; wait_tim
   return `The ${durationText(rules.wait_timer_s)} wait timer does nothing until this environment has approvers: it waits on the approval gate, which only an environment with approvers has.`;
 }
 
-/** The approval gate settings in words, one line per setting, for the
- *  read-only view. */
-export function approvalGateFacts(
-  gate: ApprovalGateLike | null | undefined,
-  approvers: number,
-): { label: string; value: string }[] {
-  const g = gate ?? DEFAULT_APPROVAL_GATE;
-  const required =
-    g.required_approvals == null
-      ? approvers === 1
-        ? "the approver"
-        : "every approver"
-      : `${g.required_approvals} of ${approvers}`;
-  return [
-    {
-      label: "Missing gate",
-      value: g.missing_gate_mode === "add" ? "add an approval gate to the run" : "refuse the run",
-    },
-    { label: "Approvals needed", value: required },
-    {
-      label: "Added gate expiry",
-      value: g.added_gate_expiry_s != null ? durationText(g.added_gate_expiry_s) : "none: waits for a decision",
-    },
-    { label: "Max approval age", value: durationText(g.max_approval_age_s) },
-  ];
-}
-
-/** What the edit page holds: the display name, the description, the
+/** What the manage page's form holds: the display name, the description, the
  *  baseline and its approval gate settings, eligibility. */
 export type EnvironmentEditForm = {
   displayName: string;
@@ -321,7 +292,7 @@ export type EnvironmentEditForm = {
   patterns: string;
 };
 
-/** The stored record as the edit page reads it. Structural, like
+/** The stored record as the manage page reads it. Structural, like
  *  `OrgEnvironmentLike`. */
 export type EditableEnvironmentLike = OrgEnvironmentLike & {
   protection: RulesLike & { approval_gate?: ApprovalGateLike | null };

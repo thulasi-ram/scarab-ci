@@ -142,27 +142,19 @@ test("an org the caller does not administer shows no org sections", async ({ pag
   await expect(nav.getByRole("link", { name: "Members" })).toHaveCount(0);
 });
 
-test("an environment opens read-only and its Edit button opens the edit screen", async ({ page }) => {
+test("an environment is managed on one page, and its old addresses redirect there", async ({ page }) => {
   const errors = collectErrors(page);
   await page.goto("/orgs/acme/settings/environments");
-  // The list shows the display name, with the name pipelines use beside it.
+  // The list shows the display name, with the name pipelines use beside it,
+  // and New environment sits in the section header.
+  const list = page.getByRole("list", { name: "Environments" });
   await expect(page.locator(".oenv-name", { hasText: "production" })).toBeVisible();
-  await page.getByRole("link", { name: "Production", exact: true }).click();
-  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/environments\/production$/);
-
-  // The view: the record, and no way to change it from here.
-  const view = page.locator("section.page");
-  await expect(view.getByText("customer-facing, eu-west-1 + us-east-1")).toBeVisible();
-  await expect(view.getByText("Projects that may use Production")).toBeVisible();
-  await expect(view.getByText("Project overlays and grants")).toBeVisible();
-  await expect(view.getByText(/who may deploy/i)).toHaveCount(0);
-  await expect(view.getByRole("textbox")).toHaveCount(0);
-  await expect(view.getByRole("checkbox")).toHaveCount(0);
-  await expect(view.getByRole("button", { name: /delete|withdraw|grant|save/i })).toHaveCount(0);
+  await expect(page.locator(".panel-h").getByRole("button", { name: "New environment" })).toBeVisible();
+  await list.getByRole("listitem").filter({ hasText: "Production" }).getByRole("link", { name: "Manage" }).click();
+  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/environments\/production\/manage$/);
 
   // It sits in the settings frame, with its section marked in the sidebar.
   const nav = page.getByRole("navigation", { name: "Settings" });
-  await expect(nav).toBeVisible();
   await expect(nav.getByRole("link", { name: "Environments", exact: true })).toHaveAttribute(
     "aria-current",
     "page",
@@ -171,32 +163,32 @@ test("an environment opens read-only and its Edit button opens the edit screen",
   await expect(page.getByRole("heading", { level: 1 })).toHaveText(/Environments\s*Production$/);
   await expect(page.locator(".page-sub")).toContainText("production");
 
-  await view.getByRole("link", { name: "Edit", exact: true }).click();
-  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/environments\/production\/edit$/);
-
-  // The edit screen: every change the view left out, in the same frame.
-  await expect(nav).toBeVisible();
-  await expect(nav.getByRole("link", { name: "Environments", exact: true })).toHaveAttribute(
-    "aria-current",
-    "page",
-  );
-  await expect(nav.locator('[aria-current="page"]')).toHaveCount(1);
-  await expect(page.getByRole("heading", { level: 1 })).toHaveText(/Environments\s*Production\s*Edit/);
-  const edit = page.locator("section.page");
-  await expect(edit.getByRole("textbox", { name: "description", exact: true })).toHaveValue(
+  // The details are the form, filled with what is stored.
+  const manage = page.locator("section.page");
+  await expect(manage.getByRole("textbox", { name: "description", exact: true })).toHaveValue(
     "customer-facing, eu-west-1 + us-east-1",
   );
-  await expect(edit.getByRole("textbox", { name: "Display name", exact: true })).toHaveValue("Production");
-  await expect(edit.getByRole("textbox", { name: "Approvers", exact: true })).toHaveValue("ops-lead");
-  await expect(edit.getByRole("checkbox", { name: /every project in acme/i })).toBeChecked();
-  await expect(edit.getByRole("heading", { name: /Projects that may use Production/ })).toBeVisible();
-  // Nothing changed yet, so there is nothing to save.
-  await expect(edit.getByRole("button", { name: "Save", exact: true })).toBeDisabled();
-  await edit.getByRole("textbox", { name: "description", exact: true }).fill("customer-facing, eu-west-1");
-  await expect(edit.getByRole("button", { name: "Save", exact: true })).toBeEnabled();
+  await expect(manage.getByRole("textbox", { name: "Display name", exact: true })).toHaveValue("Production");
+  await expect(manage.getByRole("textbox", { name: "Approvers", exact: true })).toHaveValue("ops-lead");
+  await expect(manage.getByRole("checkbox", { name: /every project in acme/i })).toBeChecked();
+  await expect(manage.getByRole("heading", { name: /Projects that may use Production/ })).toBeVisible();
+  await expect(manage.getByRole("list", { name: "Project overlays and grants" })).toBeVisible();
+  await expect(manage.getByRole("button", { name: "Duplicate" })).toBeVisible();
+  // Nothing changed yet, so there is nothing to save or discard.
+  const save = manage.getByRole("button", { name: "Save", exact: true });
+  const discard = manage.getByRole("button", { name: "Discard changes" });
+  await expect(save).toBeDisabled();
+  await expect(discard).toBeDisabled();
+  await manage.getByRole("textbox", { name: "description", exact: true }).fill("customer-facing, eu-west-1");
+  await expect(save).toBeEnabled();
+  await discard.click();
+  await expect(manage.getByRole("textbox", { name: "description", exact: true })).toHaveValue(
+    "customer-facing, eu-west-1 + us-east-1",
+  );
+  await expect(save).toBeDisabled();
 
   // Delete asks, in a dialog, for the exact name before it is allowed.
-  await edit.getByRole("button", { name: "Delete environment" }).click();
+  await manage.getByRole("button", { name: "Delete environment" }).click();
   const dialog = page.getByRole("dialog");
   const confirm = dialog.getByRole("textbox", { name: "Type production to confirm" });
   const go = dialog.getByRole("button", { name: "Delete environment" });
@@ -208,58 +200,67 @@ test("an environment opens read-only and its Edit button opens the edit screen",
   await page.keyboard.press("Escape");
   await expect(dialog).toHaveCount(0);
 
-  // Cancel goes back to the view without saving.
-  await edit.getByRole("link", { name: "Cancel" }).click();
-  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/environments\/production$/);
+  // The former read-only page and edit screen land here, query kept.
+  await page.goto("/orgs/acme/settings/environments/production?from=link");
+  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/environments\/production\/manage\?from=link$/);
+  await page.goto("/orgs/acme/settings/environments/production/edit");
+  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/environments\/production\/manage$/);
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText(/Environments\s*Production$/);
   expect(errors).toEqual([]);
 });
 
-test("an environment's approval gate settings save and show on its page", async ({ page }) => {
+test("New environment opens its dialog from the section header and lands on the new one's page", async ({ page }) => {
   const errors = collectErrors(page);
-  await page.goto("/orgs/acme/settings/environments/production");
-  const view = page.locator("section.page");
-  await expect(view.getByText("add an approval gate to the run")).toBeVisible();
-  await expect(view.getByText("the approver", { exact: true })).toBeVisible();
+  await page.goto("/orgs/acme/settings/environments");
+  await page.getByRole("button", { name: "New environment" }).click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog.getByRole("heading", { name: "New environment" })).toBeVisible();
+  await dialog.getByRole("textbox", { name: "Name", exact: true }).fill("canary");
+  await dialog.getByRole("button", { name: "Create environment" }).click();
+  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/environments\/canary\/manage$/);
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText(/Environments\s*canary$/);
+  expect(errors).toEqual([]);
+});
 
-  await view.getByRole("link", { name: "Edit", exact: true }).click();
-  const edit = page.locator("section.page");
-  const mode = edit.getByRole("combobox", { name: "When a pipeline has no approval gate" });
+test("an environment's approval gate settings save on its page", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/orgs/acme/settings/environments/production/manage");
+  const manage = page.locator("section.page");
+  const mode = manage.getByRole("combobox", { name: "When a pipeline has no approval gate" });
   await expect(mode).toHaveValue("add");
-  await expect(edit.getByRole("textbox", { name: "Added gate expiry" })).toHaveValue("86400");
-  await expect(edit.getByRole("textbox", { name: "Maximum approval age" })).toHaveValue("86400");
+  await expect(manage.getByRole("textbox", { name: "Added gate expiry" })).toHaveValue("86400");
+  await expect(manage.getByRole("textbox", { name: "Maximum approval age" })).toHaveValue("86400");
   // One approver: a count above it cannot be saved.
-  const required = edit.getByRole("textbox", { name: "Required approvals" });
+  const required = manage.getByRole("textbox", { name: "Required approvals" });
   await required.fill("2");
-  await expect(edit.getByRole("alert")).toContainText("With one approver, the only count is 1.");
-  await expect(edit.getByRole("button", { name: "Save", exact: true })).toBeDisabled();
+  await expect(manage.getByRole("alert")).toContainText("With one approver, the only count is 1.");
+  await expect(manage.getByRole("button", { name: "Save", exact: true })).toBeDisabled();
   await required.fill("1");
   await mode.selectOption("refuse");
-  await edit.getByRole("button", { name: "Save", exact: true }).click();
+  await manage.getByRole("button", { name: "Save", exact: true }).click();
 
-  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/environments\/production$/);
-  await expect(view.getByText("refuse the run")).toBeVisible();
-  await expect(view.getByText("1 of 1")).toBeVisible();
+  // It stays on the page, the form now holding what is stored.
+  await expect(page.getByText("Production is saved.")).toBeVisible();
+  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/environments\/production\/manage$/);
+  await expect(mode).toHaveValue("refuse");
+  await expect(required).toHaveValue("1");
+  await expect(manage.getByRole("button", { name: "Save", exact: true })).toBeDisabled();
   expect(errors).toEqual([]);
 });
 
 test("a wait timer with no approvers is disabled and its environment warns", async ({ page }) => {
   const errors = collectErrors(page);
-  await page.goto("/orgs/acme/settings/environments/staging");
-  const view = page.locator("section.page");
-  await expect(view.getByRole("status")).toContainText(
-    "The 10 minutes wait timer does nothing until this environment has approvers",
-  );
-
-  await page.goto("/orgs/acme/settings/environments/staging/edit");
-  const edit = page.locator("section.page");
-  const wait = edit.getByRole("textbox", { name: "Wait timer" });
+  await page.goto("/orgs/acme/settings/environments/staging/manage");
+  const manage = page.locator("section.page");
+  await expect(manage.getByText(/The 10 minutes wait timer does nothing until this environment has approvers/)).toBeVisible();
+  const wait = manage.getByRole("textbox", { name: "Wait timer" });
   await expect(wait).toBeDisabled();
-  await expect(edit.getByText(/Needs approvers: the timer waits on the approval gate/)).toBeVisible();
-  await expect(edit.getByRole("textbox", { name: "Required approvals" })).toBeDisabled();
+  await expect(manage.getByText(/Needs approvers: the timer waits on the approval gate/)).toBeVisible();
+  await expect(manage.getByRole("textbox", { name: "Required approvals" })).toBeDisabled();
   // An approver turns both on.
-  await edit.getByRole("textbox", { name: "Approvers", exact: true }).fill("ops-lead");
+  await manage.getByRole("textbox", { name: "Approvers", exact: true }).fill("ops-lead");
   await expect(wait).toBeEnabled();
-  await expect(edit.getByRole("textbox", { name: "Required approvals" })).toBeEnabled();
+  await expect(manage.getByRole("textbox", { name: "Required approvals" })).toBeEnabled();
   expect(errors).toEqual([]);
 });
 
@@ -343,7 +344,7 @@ test("the Policies page lists CEL policies with their 7-day counts and the typed
 
   await page.goto("/orgs/acme/settings/policies");
   await envs.getByRole("listitem").filter({ hasText: "Production" }).getByRole("link", { name: "Edit" }).click();
-  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/environments\/production\/edit$/);
+  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/environments\/production\/manage$/);
   expect(errors).toEqual([]);
 });
 
@@ -470,7 +471,7 @@ test("a library list is added under Library policies, in audit mode", async ({ p
 
 test("duplicating an environment shows what was copied and what is left to do", async ({ page }) => {
   const errors = collectErrors(page);
-  await page.goto("/orgs/acme/settings/environments/production");
+  await page.goto("/orgs/acme/settings/environments/production/manage");
   await page.getByRole("button", { name: "Duplicate" }).click();
   const dialog = page.getByRole("dialog");
   const go = dialog.getByRole("button", { name: "Duplicate", exact: true });
@@ -495,7 +496,7 @@ test("duplicating an environment shows what was copied and what is left to do", 
   await expect(dialog.getByText("scarab:org/acme/repo/*/env/production-eu/ref/*", { exact: false })).toBeVisible();
 
   await dialog.getByRole("button", { name: "Open Production (copy)" }).click();
-  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/environments\/production-eu$/);
+  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/environments\/production-eu\/manage$/);
   await expect(page.getByRole("heading", { level: 1 })).toHaveText(/Environments\s*Production \(copy\)$/);
   expect(errors).toEqual([]);
 });

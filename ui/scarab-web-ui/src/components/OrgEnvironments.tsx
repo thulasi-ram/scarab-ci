@@ -9,9 +9,10 @@
 //   - per-project PRIVILEGE GRANTS (image digests, raw k8s_overlay), granted
 //     to one project, never to the Environment as a whole.
 //
-// This section is the list and the way to create one. Each name links to the
-// Environment's own read-only page, and every change to it is on that page's
-// edit screen (`routes/EnvironmentPage.tsx`, git-bug c11abc5).
+// This section is the list and the way to create one: New environment, top
+// right, opens a dialog for its name. Each row links to the Environment's
+// manage page (`…/environments/<name>/manage`, routes/EnvironmentPage.tsx,
+// git-bug c11abc5), which holds every change to it.
 //
 // Every server refusal (400/409) is shown verbatim: it is the answer to "why
 // will this not save".
@@ -55,9 +56,13 @@ export default function OrgEnvironments(props: { org: string }) {
   return (
     <div class="panel">
       <div class="panel-h">
-        <span>Environments · {props.org}</span>
-        <Show when={rows().length > 0}>
-          <span class="tok-count">{rows().length}</span>
+        <span>
+          Environments · {props.org} <span class="tok-count">{rows().length}</span>
+        </span>
+        <Show when={!unavailable() && !environments.error}>
+          <button class="btn btn-primary btn-sm" onClick={() => setCreating(true)}>
+            <Icon icon="plus" size={14} /> New environment
+          </button>
         </Show>
       </div>
       <div class="secrets-body">
@@ -70,16 +75,7 @@ export default function OrgEnvironments(props: { org: string }) {
             when={!unavailable()}
             fallback={<p class="empty">This server does not keep org-level environments.</p>}
           >
-            <Show
-              when={rows().length > 0}
-              fallback={
-                <p class="empty">
-                  No environments yet. A pipeline's <span class="mono">environment:</span>{" "}
-                  is refused until an environment of that name exists here and lets the
-                  project deploy into it.
-                </p>
-              }
-            >
+            <Show when={rows().length > 0} fallback={<p class="empty">No environments in {props.org} yet.</p>}>
               <Show when={unprotectedBanner(rows())}>
                 {(w) => (
                   <p class="tok-warn env-warn" role="status">
@@ -87,22 +83,18 @@ export default function OrgEnvironments(props: { org: string }) {
                   </p>
                 )}
               </Show>
-              <ul class="tok-list">
+              <ul class="tok-list" aria-label="Environments">
                 <For each={rows()}>{(env) => <EnvironmentRow org={props.org} env={env} />}</For>
               </ul>
             </Show>
 
-            <div class="secrets-actions">
-              <button class="btn btn-primary btn-sm" onClick={() => setCreating(true)}>
-                <Icon icon="plus" size={14} /> New environment
-              </button>
-            </div>
             <p class="subtle">
               <small>
-                <Icon icon="rocket" size={12} /> An org environment is the place deploys
-                land in, shared by every repository that deploys there. It decides which
-                projects may use it (eligibility) and under which rules (the baseline); each
-                repository can only tighten those for itself.
+                <Icon icon="rocket" size={12} /> An environment is where deploys land, shared by
+                every repository that deploys there. A pipeline's{" "}
+                <span class="mono">environment:</span> is refused until an environment of that name
+                exists here and lets the project use it. Each environment decides which projects may
+                use it and under which rules; a repository can only tighten those for itself.
               </small>
             </p>
           </Show>
@@ -125,8 +117,8 @@ export default function OrgEnvironments(props: { org: string }) {
   );
 }
 
-/** One registered Environment: its name (a link to its page), rules, and who
- *  last changed it. No controls: changes are on the Environment's page. */
+/** One registered Environment: its name, rules, who last changed it, and a
+ *  link to its manage page, where every change is made. */
 function EnvironmentRow(props: { org: string; env: OrgEnvironment }) {
   const env = () => props.env;
   return (
@@ -152,6 +144,11 @@ function EnvironmentRow(props: { org: string; env: OrgEnvironment }) {
             permissive baseline
           </span>
         </Show>
+        <span class="oenv-actions">
+          <A class="btn btn-ghost btn-sm" href={environmentHref(props.org, env().name)}>
+            Manage
+          </A>
+        </span>
       </div>
       <Show when={env().description}>
         <div class="oenv-desc">{env().description}</div>
@@ -176,7 +173,7 @@ function EnvironmentRow(props: { org: string; env: OrgEnvironment }) {
 
 /** Create an Environment: its name, display name and description. The name is
  *  fixed once it exists: it is the key every pipeline's `environment:` names.
- *  The rest is set on its edit page. */
+ *  The rest is set on its manage page. */
 function CreateDialog(props: {
   org: string;
   /** Names already registered: a create must not silently replace one. */

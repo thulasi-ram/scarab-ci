@@ -46,19 +46,23 @@ pipeline is refused this way, Scarab posts a `failure` commit status under the p
 Environment settings. A push from a branch the Environment's `allowed_refs` leave out posts no
 status.
 
-Org admins create Environments and edit their eligibility and rules, under the org's
-**Settings › Environments** (`/orgs/<org>/settings/environments`).
+Org admins create Environments and change their eligibility and rules, under the org's
+**Settings › Environments** (`/orgs/<org>/settings/environments`). **New environment**, at the
+right of the list's header, asks for the name, a display name and a description; the new
+Environment has no baseline rule and admits no project until you set both on its page.
 
-## View and edit an Environment
+## Manage an Environment
 
-Each Environment has a read-only page, `/orgs/<org>/settings/environments/<name>`: its display
-name, description, the baseline, **Projects that may use** it, and, under **Project overlays and
-grants**, each project's overlay and privilege grant. Its **Edit** button opens `…/<name>/edit`, where you change the display name,
-the description, the baseline and eligibility (one **Save** sends only the parts you changed),
-each project's privilege grant, and delete the Environment. Deleting it, or withdrawing a grant,
-asks you to type the Environment's name. While projects hold overlays, privilege grants or secrets
-in the Environment, a delete is refused and the dialog lists them; its button then deletes them
-with the Environment (`DELETE …?cascade=true`).
+Each Environment has one page, `/orgs/<org>/settings/environments/<name>/manage`, reached with
+**Manage** on its row. It holds the display name, the description, the baseline, the approval gate
+settings and **Projects that may use** it as one form: **Save** sends only the parts you changed,
+and **Discard changes** puts back what is stored. Below the form, **Project overlays and grants**
+lists each project's overlay and privilege grant, with grant and withdraw, and the page ends with
+**Duplicate** and **Delete**. Deleting the Environment, or withdrawing a grant, asks you to type
+its name. While projects hold overlays, privilege grants or secrets in the Environment, a delete is
+refused and the dialog lists them; its button then deletes them with the Environment
+(`DELETE …?cascade=true`). The page's former addresses, `…/environments/<name>` and
+`…/<name>/edit`, open it.
 
 ## Name and display name
 
@@ -122,7 +126,7 @@ Project's own overlay does. While such an Environment admits at least one Projec
 Environment list counts it in a warning, its row says **permissive baseline**, and its page asks
 for a baseline. An Environment that admits no Project is not counted: it takes no deploy.
 
-On the edit page these settings are in the **Approval gate** section: **When a pipeline has no
+On the Environment's page these settings are in the **Approval gate** section: **When a pipeline has no
 approval gate** (**Add an approval gate** or **Refuse the run**), **Added gate expiry** (blank: no
 expiry), **Required approvals** (1 to the number of approvers; blank: every one) and **Maximum
 approval age**, all in seconds. The **Wait timer** field is disabled while the Environment has no

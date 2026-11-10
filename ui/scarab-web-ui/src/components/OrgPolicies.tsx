@@ -23,7 +23,7 @@ import {
   type PolicyRecord,
 } from "../api/client";
 import { isPermissive, rulesSummary } from "../environment-overlays";
-import { environmentEditHref, nameBeside, shownName } from "../org-environments";
+import { environmentHref, nameBeside, shownName } from "../org-environments";
 import {
   appliesToEnvironments,
   appliesToProjects,
@@ -263,7 +263,7 @@ export default function OrgPolicies(props: { org: string }) {
                     <div class="tok-head">
                       <span class="tok-name">{shownName(env)}</span>
                       <Show when={nameBeside(env)}>{(n) => <span class="mono subtle">{n()}</span>}</Show>
-                      <A class="btn btn-ghost btn-sm oenv-actions" href={environmentEditHref(props.org, env.name)}>
+                      <A class="btn btn-ghost btn-sm oenv-actions" href={environmentHref(props.org, env.name)}>
                         Edit
                       </A>
                     </div>

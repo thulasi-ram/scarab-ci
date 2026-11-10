@@ -1915,28 +1915,30 @@ function route(pathname: string, search: string, method: string, body = ""): Res
       return new Response(null, { status: 204 });
     }
     if (method === "PUT") {
-      // Echo the stored record (or a fresh one) with the body's display name
-      // and description; nothing is stored.
+      // Echo the stored record with the body's display name and description;
+      // a change to one is not stored. A new one is kept for the life of the
+      // page, so its manage page opens.
       const req = JSON.parse(body || "{}") as { display_name?: string | null; description?: string };
       const written = { display_name: req.display_name ?? null, description: req.description ?? "" };
-      return json(
-        found ? { ...found, ...written } : {
-          org: decodeURIComponent(m[1]!),
-          name,
-          ...written,
-          // A new Environment: permissive baseline, no eligible project.
-          protection: {
-            approvers: [],
-            allowed_refs: [],
-            wait_timer_s: 0,
-            require_reason: false,
-          },
-          eligibility: { all_projects: false, projects: [] },
-          created_at: now,
-          updated_at: now,
-          updated_by: "a.kim",
+      if (found) return json({ ...found, ...written });
+      const created = {
+        org: decodeURIComponent(m[1]!),
+        name,
+        ...written,
+        // A new Environment: permissive baseline, no eligible project.
+        protection: {
+          approvers: [],
+          allowed_refs: [],
+          wait_timer_s: 0,
+          require_reason: false,
         },
-      );
+        eligibility: { all_projects: false, projects: [] },
+        created_at: now,
+        updated_at: now,
+        updated_by: "a.kim",
+      };
+      orgEnvironments.push(created as (typeof orgEnvironments)[number]);
+      return json(created);
     }
     return found ? json(found) : new Response("not found", { status: 404 });
   }
@@ -1949,7 +1951,7 @@ function route(pathname: string, search: string, method: string, body = ""): Res
     if (m[2] === "protection") {
       if (method !== "PUT") return json(env.protection);
       // The baseline PUT replaces it whole: keep it for the page load, so
-      // the view after a Save shows what was sent.
+      // the page after a Save shows what was sent.
       const req = JSON.parse(body || "{}") as Record<string, unknown>;
       const num = (k: string) => (typeof req[k] === "number" ? (req[k] as number) : null);
       const gate = (req.approval_gate ?? {}) as Record<string, unknown>;
