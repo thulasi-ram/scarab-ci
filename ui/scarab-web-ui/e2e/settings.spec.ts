@@ -921,14 +921,22 @@ test("a token minted under Account settings shows in the org's list", async ({ p
   await page.goto("/settings/tokens");
   await expect(page.getByRole("heading", { level: 1, name: "API tokens", exact: true })).toBeVisible();
   const page_ = page.locator("section.page");
-  await expect(page_.getByText("release-bot", { exact: true })).toBeVisible();
+  const mine = page_.getByRole("table", { name: "Your API tokens" });
+  await expect(mine.getByText("release-bot", { exact: true })).toBeVisible();
+  // Your own list has no owner column; each row carries its state tags.
+  await expect(mine.getByRole("columnheader", { name: "Owner" })).toHaveCount(0);
+  await expect(mine.getByRole("row", { name: /status poller/ })).toContainText("expires soon");
+  await expect(mine.getByRole("row", { name: /amy's laptop/ })).toContainText("revoked");
+  await expect(mine.getByRole("row", { name: /amy's laptop/ }).getByRole("button", { name: "Revoke" })).toHaveCount(0);
 
-  await page_.getByRole("button", { name: "New token" }).click();
+  // New token sits in the panel header.
+  await page_.locator(".panel-h").getByRole("button", { name: "New token" }).click();
   await page.getByRole("textbox", { name: "name" }).fill("e2e laptop");
   await page.getByRole("button", { name: "Mint token" }).click();
   await expect(page.getByText(/^scarab_pat_/)).toBeVisible();
   await page.getByRole("button", { name: "I've copied it" }).click();
   await expect(page_.getByText("e2e laptop", { exact: true })).toBeVisible();
+  await expect(mine.getByRole("row", { name: /e2e laptop/ })).toContainText("never used");
 
   // The org's list: the new token with its owner, and no mint button there.
   // Organization settings is its own page, reached from the user menu.
@@ -940,6 +948,8 @@ test("a token minted under Account settings shows in the org's list", async ({ p
   const row = page_.getByRole("row", { name: /e2e laptop/ });
   await expect(row).toBeVisible();
   await expect(row.getByText("a.kim", { exact: true })).toBeVisible();
+  await expect(row).toContainText("active");
+  await expect(row).toContainText("up to viewer");
   await expect(page_.getByRole("button", { name: "New token" })).toHaveCount(0);
 
   // By last use the project token is second; by calls the status poller,
