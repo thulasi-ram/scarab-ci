@@ -8960,6 +8960,13 @@
             ],
             "description": "The Principal's display name, when the identity store knows it\n(ADR-0069). Absent for a pre-upgrade bare subject nobody has signed in\nas since."
           },
+          "origin": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Who wrote the binding: `native` (granted in Scarab, which a forge\nre-sync never changes) or `import` (seeded from the forge's\ncollaborators, which a re-sync refreshes or removes). Set on the org\nlisting; absent on an import's response, which lists what the forge\ngave and not what each row holds."
+          },
           "project": {
             "type": "string",
             "description": "Empty = org-scoped."

@@ -675,7 +675,7 @@ impl OrgSecurityEventLog for InMemorySecurityEvents {
                 .bindings(org)
                 .await?
                 .into_iter()
-                .map(|b| b.subject)
+                .map(|(b, _)| b.subject)
                 .collect(),
             _ => BTreeSet::new(),
         };

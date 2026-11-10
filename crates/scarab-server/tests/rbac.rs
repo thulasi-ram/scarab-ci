@@ -514,6 +514,17 @@ async fn bindings_api_grants_lists_revokes_and_imports() {
         !subjects.contains(&"carol"),
         "tombstoned carol is not listed"
     );
+    // Each row says who wrote it: amy's grant is native, carol~2's role came
+    // from the forge.
+    let origin_of = |subject: &str| {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["subject"] == subject && b["project"] == "app")
+            .map(|b| b["origin"].as_str().unwrap().to_string())
+    };
+    assert_eq!(origin_of("amy").as_deref(), Some("native"));
+    assert_eq!(origin_of("carol~2").as_deref(), Some("import"));
 
     // A non-admin cannot manage bindings.
     let amy = login(&h.app, "amy-code").await;

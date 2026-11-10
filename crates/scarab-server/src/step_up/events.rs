@@ -432,7 +432,7 @@ async fn org_admins(
 ) -> Result<(BTreeSet<String>, u64), ApiError> {
     let mut admins = BTreeSet::new();
     if let Some(rbac) = st.rbac.as_ref() {
-        for b in rbac.bindings(org).await.map_err(store_err)? {
+        for (b, _) in rbac.bindings(org).await.map_err(store_err)? {
             if b.scope == Scope::Org(org.to_string()) && b.role >= Role::Admin {
                 admins.insert(b.subject);
             }

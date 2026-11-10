@@ -109,11 +109,20 @@ async fn scoped_roles_inherit_and_origins_respect_authority() {
     .unwrap();
     assert_eq!(db.role_of("bob", &app).await.unwrap(), Some(Role::Viewer));
 
-    // bindings() lists live grants of the org (tombstones excluded).
+    // An import-owned row, so the listing has both origins to report.
+    db.grant(
+        &binding("carol", web.clone(), Role::Viewer),
+        BindingOrigin::Import,
+    )
+    .await
+    .unwrap();
+
+    // bindings() lists live grants of the org (tombstones excluded), each
+    // with the origin of its row.
     let listed = db.bindings("acme").await.unwrap();
     let subjects: Vec<(&str, Option<&str>)> = listed
         .iter()
-        .map(|b| {
+        .map(|(b, _)| {
             (
                 b.subject.as_str(),
                 match &b.scope {
@@ -126,7 +135,18 @@ async fn scoped_roles_inherit_and_origins_respect_authority() {
     assert!(subjects.contains(&("alice", None)));
     assert!(subjects.contains(&("alice", Some("app"))));
     assert!(subjects.contains(&("bob", Some("app"))));
-    assert!(listed.iter().all(|b| b.scope.org() == "acme"));
+    assert!(listed.iter().all(|(b, _)| b.scope.org() == "acme"));
+    let origin_of = |subject: &str, project: &str| {
+        listed
+            .iter()
+            .find(|(b, _)| {
+                b.subject == subject
+                    && matches!(&b.scope, Scope::Project { name, .. } if name == project)
+            })
+            .map(|(_, o)| *o)
+    };
+    assert_eq!(origin_of("bob", "app"), Some(BindingOrigin::Native));
+    assert_eq!(origin_of("carol", "web"), Some(BindingOrigin::Import));
 
     tdb.cleanup().await;
 }

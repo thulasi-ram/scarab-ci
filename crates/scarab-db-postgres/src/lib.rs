@@ -4370,9 +4370,12 @@ impl scarab_identity::RbacStore for PostgresDb {
     async fn bindings(
         &self,
         org: &str,
-    ) -> Result<Vec<scarab_identity::Binding>, scarab_identity::IdentityError> {
+    ) -> Result<
+        Vec<(scarab_identity::Binding, scarab_identity::BindingOrigin)>,
+        scarab_identity::IdentityError,
+    > {
         let rows = sqlx::query(
-            "SELECT subject, project, role FROM rbac_bindings
+            "SELECT subject, project, role, origin FROM rbac_bindings
              WHERE org = $1 AND role IS NOT NULL
              ORDER BY subject, project",
         )
@@ -4393,11 +4396,18 @@ impl scarab_identity::RbacStore for PostgresDb {
                         name: project,
                     }
                 };
-                Some(scarab_identity::Binding {
-                    subject: r.get::<String, _>("subject"),
-                    scope,
-                    role,
-                })
+                let origin = match r.get::<String, _>("origin").as_str() {
+                    "import" => scarab_identity::BindingOrigin::Import,
+                    _ => scarab_identity::BindingOrigin::Native,
+                };
+                Some((
+                    scarab_identity::Binding {
+                        subject: r.get::<String, _>("subject"),
+                        scope,
+                        role,
+                    },
+                    origin,
+                ))
             })
             .collect())
     }

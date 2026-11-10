@@ -2666,6 +2666,14 @@ export interface components {
              *     as since.
              */
             display_name?: string | null;
+            /**
+             * @description Who wrote the binding: `native` (granted in Scarab, which a forge
+             *     re-sync never changes) or `import` (seeded from the forge's
+             *     collaborators, which a re-sync refreshes or removes). Set on the org
+             *     listing; absent on an import's response, which lists what the forge
+             *     gave and not what each row holds.
+             */
+            origin?: string | null;
             /** @description Empty = org-scoped. */
             project: string;
             role: string;

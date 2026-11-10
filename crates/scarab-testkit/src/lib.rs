@@ -4848,25 +4848,34 @@ impl scarab_identity::RbacStore for InMemoryRbac {
             .max())
     }
 
-    async fn bindings(&self, org: &str) -> Result<Vec<scarab_identity::Binding>, IdentityError> {
+    async fn bindings(
+        &self,
+        org: &str,
+    ) -> Result<Vec<(scarab_identity::Binding, scarab_identity::BindingOrigin)>, IdentityError>
+    {
         let rows = self.rows.lock().unwrap();
-        let mut out: Vec<scarab_identity::Binding> = rows
+        let mut out: Vec<(scarab_identity::Binding, scarab_identity::BindingOrigin)> = rows
             .iter()
             .filter(|((_, o, _), (role, _))| o == org && role.is_some())
-            .map(|((subject, o, p), (role, _))| scarab_identity::Binding {
-                subject: subject.clone(),
-                scope: if p.is_empty() {
-                    scarab_identity::Scope::Org(o.clone())
-                } else {
-                    scarab_identity::Scope::Project {
-                        org: o.clone(),
-                        name: p.clone(),
-                    }
-                },
-                role: role.unwrap(),
+            .map(|((subject, o, p), (role, origin))| {
+                (
+                    scarab_identity::Binding {
+                        subject: subject.clone(),
+                        scope: if p.is_empty() {
+                            scarab_identity::Scope::Org(o.clone())
+                        } else {
+                            scarab_identity::Scope::Project {
+                                org: o.clone(),
+                                name: p.clone(),
+                            }
+                        },
+                        role: role.unwrap(),
+                    },
+                    *origin,
+                )
             })
             .collect();
-        out.sort_by(|a, b| a.subject.cmp(&b.subject));
+        out.sort_by(|a, b| a.0.subject.cmp(&b.0.subject));
         Ok(out)
     }
 

@@ -8877,6 +8877,13 @@ pub struct BindingDto {
     /// know the subject.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub claimed: Option<bool>,
+    /// Who wrote the binding: `native` (granted in Scarab, which a forge
+    /// re-sync never changes) or `import` (seeded from the forge's
+    /// collaborators, which a re-sync refreshes or removes). Set on the org
+    /// listing; absent on an import's response, which lists what the forge
+    /// gave and not what each row holds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
 }
 
 /// `POST /v1/repos/{org}/{repo}/bindings/import` body: the forge users whose
@@ -8927,7 +8934,7 @@ async fn list_bindings(
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let mut out = Vec::with_capacity(bindings.len());
-    for b in bindings {
+    for (b, origin) in bindings {
         let record = match st.identities.as_ref() {
             Some(store) => store.principal(&b.subject).await.ok().flatten(),
             None => None,
@@ -8935,6 +8942,13 @@ async fn list_bindings(
         out.push(BindingDto {
             display_name: record.as_ref().and_then(|r| r.display_name.clone()),
             claimed: record.as_ref().map(|r| r.claimed_at.is_some()),
+            origin: Some(
+                match origin {
+                    scarab_identity::BindingOrigin::Native => "native",
+                    scarab_identity::BindingOrigin::Import => "import",
+                }
+                .to_string(),
+            ),
             subject: b.subject,
             role: role_name(b.role).to_string(),
             project: match b.scope {
@@ -9222,6 +9236,7 @@ async fn import_bindings(
                 project: repo.clone(),
                 display_name: None,
                 claimed: None,
+                origin: None,
             })
             .collect(),
     ))
