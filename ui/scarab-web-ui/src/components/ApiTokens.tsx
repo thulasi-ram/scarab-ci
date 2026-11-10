@@ -169,8 +169,8 @@ export function MyApiTokens() {
 }
 
 /**
- * One row per token: its name, its owner (`showOwner`, the org's list), its
- * scope and ceiling, its state tags, last use, calls, creation and expiry,
+ * One row per token: its name with its state tags, its owner (`showOwner`,
+ * the org's list), its scope and ceiling, last use, calls, creation and expiry,
  * and Revoke while it is live. `sort` marks the column the rows are sorted
  * by.
  */
@@ -192,7 +192,6 @@ function TokenTable(props: {
               <th>Owner</th>
             </Show>
             <th>Scope</th>
-            <th>State</th>
             <th aria-sort={sorted("last_used")}>Last used</th>
             <th aria-sort={sorted("use_count")}>Calls</th>
             <th aria-sort={sorted("created")}>Created</th>
@@ -218,8 +217,9 @@ function TokenRow(props: { token: ApiToken; showOwner?: boolean; onRevoke: () =>
   const state = () => tokenState(t(), now);
   return (
     <tr classList={{ "tok-dead": state() !== "live" }}>
-      <td>
+      <td class="keep">
         <span class="tok-name">{t().name}</span>
+        <Chips chips={tokenChips(t(), now)} />
       </td>
       <Show when={props.showOwner}>
         <td>
@@ -229,9 +229,6 @@ function TokenRow(props: { token: ApiToken; showOwner?: boolean; onRevoke: () =>
       <td>
         <span class="mono">{scopeLabel(t())}</span>{" "}
         <span class="tok-role">up to {t().role}</span>
-      </td>
-      <td class="keep">
-        <Chips chips={tokenChips(t(), now)} />
       </td>
       <td class="nw" title={t().last_used_at ? absTime(t().last_used_at!) : undefined}>
         {t().last_used_at ? relTime(t().last_used_at!) : "never"}

@@ -135,6 +135,51 @@ test("the old Event log address opens Security with its filters, and the refusal
   expect(errors).toEqual([]);
 });
 
+test("an owner resets a member's passkeys from a dialog: pick, type the name, see what was removed", async ({
+  page,
+}) => {
+  const errors = collectErrors(page);
+  await page.goto("/orgs/acme/settings/security");
+  const panel = page.locator(".panel", { hasText: "Security · step-up" });
+  // No member list inline: one button in the header.
+  await expect(panel.getByRole("radio")).toHaveCount(0);
+  await expect(panel.getByRole("link", { name: "enroll a passkey" })).toHaveAttribute(
+    "href",
+    "/settings/security?enroll=1",
+  );
+
+  // An admin without a passkey opens the dialog with that admin picked.
+  await panel.getByRole("list", { name: "Admins without a passkey" }).getByRole("button", { name: "j.lee" }).click();
+  let dialog = page.getByRole("dialog");
+  await expect(dialog.getByRole("radio", { name: /j\.lee/ })).toBeChecked();
+  await expect(dialog.getByText("no passkey", { exact: true })).toHaveCount(1);
+  await dialog.getByRole("button", { name: "Cancel" }).click();
+
+  await panel.getByRole("button", { name: "Reset passkeys" }).click();
+  dialog = page.getByRole("dialog");
+  const next = dialog.getByRole("button", { name: "Continue" });
+  await expect(next).toBeDisabled();
+  await dialog.getByRole("radio", { name: /m\.diaz/ }).check();
+  await next.click();
+
+  // The typed confirm; Cancel goes back to the member list.
+  dialog = page.getByRole("dialog");
+  await expect(dialog).toContainText("Reset every passkey m.diaz holds?");
+  await dialog.getByRole("button", { name: "Cancel" }).click();
+  await expect(page.getByRole("dialog").getByRole("radio", { name: /m\.diaz/ })).toBeChecked();
+  await page.getByRole("dialog").getByRole("button", { name: "Continue" }).click();
+  dialog = page.getByRole("dialog");
+  const go = dialog.getByRole("button", { name: "Reset passkeys" });
+  await expect(go).toBeDisabled();
+  await dialog.getByRole("textbox", { name: "Type m.diaz to confirm" }).fill("m.diaz");
+  await go.click();
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await expect(panel.locator(".notice-ok")).toHaveText("Reset m.diaz: 2 passkeys removed, 1 confirmation revoked.");
+  // An admin left with no passkey joins the list.
+  await expect(panel.getByRole("list", { name: "Admins without a passkey" })).toContainText("m.diaz");
+  expect(errors).toEqual([]);
+});
+
 test("an org the caller does not administer shows no org sections", async ({ page }) => {
   await page.goto("/orgs/initech/settings/members");
   await expect(page.getByText(/You do not administer/)).toBeVisible();
@@ -732,7 +777,7 @@ test("a connection's page holds its credential, deliveries, app check, re-sync a
   await expect(nav.getByRole("link", { name: "Connections" })).toHaveAttribute("aria-current", "page");
   const page_ = page.locator("section.page");
   await expect(page_.getByRole("heading", { level: 1 })).toContainText("gh-acme");
-  await expect(page_).toContainText("credential github-app resolves");
+  await expect(page_.locator(".panel", { hasText: "Credential" })).toContainText(/github-app\s*Status\s*Resolves\./);
   await expect(page_).toContainText("app configuration matches what Scarab needs");
   await expect(page_.getByRole("link", { name: "Manage on GitHub →" })).toHaveAttribute(
     "href",

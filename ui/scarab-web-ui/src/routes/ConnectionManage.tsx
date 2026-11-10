@@ -24,7 +24,7 @@ import { SettingsCrumbs, SettingsFrame } from "./Settings";
 import { Section } from "./LibraryManage";
 import Chips from "../components/Chips";
 import Icon from "../components/Icon";
-import { AppPreflight, CredentialFact, manageUrl, RemoveConnection } from "../components/Connections";
+import { AppPreflight, manageUrl, RemoveConnection } from "../components/Connections";
 
 /** `/orgs/:org/settings/connections/:id`. */
 export default function ConnectionManage() {
@@ -177,8 +177,9 @@ function Details(props: {
           <dt>Handle</dt>
           <dd class="m">{c().credential_ref}</dd>
           <dt>Status</dt>
-          <dd>
-            <CredentialFact conn={c()} />
+          <dd classList={{ "conn-ok": c().credential_present, "conn-bad": !c().credential_present }}>
+            <Icon icon={c().credential_present ? "shield-check" : "alert-triangle"} size={12} />{" "}
+            {c().credential_present ? "Resolves." : "Missing: Scarab cannot reach the forge."}
           </dd>
         </dl>
         <p class="kv-note">The token is stored encrypted and is never shown.</p>
@@ -199,7 +200,7 @@ function Details(props: {
 
       <Show when={c().supports_preflight}>
         <Section title="App configuration">
-          <div class="secrets-body">
+          <div class="conn-detail">
             <AppPreflight conn={c()} />
           </div>
         </Section>
