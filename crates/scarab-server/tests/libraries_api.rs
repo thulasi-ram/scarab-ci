@@ -463,9 +463,19 @@ async fn yank_needs_a_reason_and_unyank_lifts_it() {
     assert_eq!(st, StatusCode::OK, "{b}");
     let (_, list) = call(&h.app, "GET", "/v1/orgs/acme/libraries", None).await;
     assert_eq!(list["yanks"][0]["reason"], "CVE-2026-0001");
+    // A yank names the library and the pinned source of its version, read
+    // from the version row: the version is not installed, so nothing else
+    // in the list could say which library it belongs to.
+    let source = format!("github.com/acme/libs//deploy.yaml@{C1}");
+    for y in [&b, &list["yanks"][0]] {
+        assert_eq!(y["publisher"], "acme", "{y}");
+        assert_eq!(y["name"], "deploy", "{y}");
+        assert_eq!(y["source"], source, "{y}");
+    }
     let uri = format!("/v1/orgs/acme/library-yanks/{}", content_hash(V1));
-    let (st, _) = call(&h.app, "DELETE", &uri, None).await;
+    let (st, lifted) = call(&h.app, "DELETE", &uri, None).await;
     assert_eq!(st, StatusCode::OK);
+    assert_eq!(lifted["source"], source, "{lifted}");
     let (st, _) = call(&h.app, "DELETE", &uri, None).await;
     assert_eq!(st, StatusCode::NOT_FOUND);
 }

@@ -11320,6 +11320,9 @@
         "type": "object",
         "required": [
           "content_hash",
+          "publisher",
+          "name",
+          "source",
           "reason",
           "yanked_by",
           "yanked_at"
@@ -11335,8 +11338,19 @@
           "content_hash": {
             "type": "string"
           },
+          "name": {
+            "type": "string"
+          },
+          "publisher": {
+            "type": "string",
+            "description": "The library the yanked version was fetched for, `<publisher>/<name>`."
+          },
           "reason": {
             "type": "string"
+          },
+          "source": {
+            "type": "string",
+            "description": "The git source the version was fetched from, pinned to its commit."
           },
           "yanked_at": {
             "type": "integer",
