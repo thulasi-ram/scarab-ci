@@ -85,9 +85,39 @@ curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 |
 cp deploy/demo-oracle/.env.example deploy/demo-oracle/.env   # then fill it in
 just stack up demo-oracle                # deploy ghcr `edge`
 just stack up demo-oracle sha-<gitsha>   # deploy a specific published build
+just stack up demo-oracle 0.3.0          # deploy a release
 ```
 
+The box has no `just` unless you install one (1.43.0 or later). Without it, run
+the script the recipe runs; with a tag it deploys the same images:
+
+```sh
+bash deploy/demo-oracle/deploy.sh 0.3.0
+```
+
+A tag on the command line sets the server, results-sidecar and wsfetch images to
+that tag, whatever `.env` pins them to. An image set in the environment of the
+call still wins.
+
 `bootstrap.sh` is idempotent; so is `deploy.sh`. Re-run either freely.
+
+### Upgrading
+
+`deploy.sh` handles the two steps an upgrade used to need by hand:
+
+- **A dump first.** When the Helm release already exists, it runs the nightly
+  backup Job once with its own key, `pg/pre-deploy/<UTC time>-<tag>.dump`, and
+  waits for it. The seven nightly slots are not touched. If the dump fails, the
+  deploy stops before `helm upgrade`. These dumps are not pruned: delete old
+  ones under `pg/pre-deploy/` yourself.
+- **The 0.2.1 StatefulSet.** If `scarab-workspace` still has the chart version
+  in its claim template (chart 0.2.1 or earlier), it deletes the StatefulSet with
+  `--cascade=orphan`, keeping its Pod and volume, so `helm upgrade` can create
+  it again (see the chart README, "Upgrading from 0.2.1 or earlier").
+
+Read the release's Breaking changes in `CHANGELOG.md` before you upgrade. 0.3.0
+needs one step after it: install the clone library in each existing org
+(Settings › Libraries › Install library).
 
 **There is no local-build path**. Two Ampere
 cores will not compile this workspace in a time anyone will wait for, and doing
@@ -261,6 +291,8 @@ a contributor's push does, and nothing is faked.
 then `aws s3 cp` to R2 at `pg/scarab-<ISO-day-of-week>.dump`. **Seven rotating
 slots** (the eighth night overwrites the first), so the retention policy needs
 no bucket lifecycle rule and no prune job that could delete the wrong thing.
+`deploy.sh` writes one more dump before each upgrade, under `pg/pre-deploy/`
+(see Upgrading).
 
 Restore:
 
