@@ -155,12 +155,16 @@ runs in the last 24 hours, and runs waiting on a gate. An org admin sees:
   again. Enabling it again creates a new project without the old one's settings.
 
 Anyone who can read the org sees the same list without the buttons. The list comes from
-`GET /v1/orgs/{org}/repos?page=&per_page=&q=`, which asks each connection's forge on every
-request; a connection the forge would not answer for is named in `unlisted`, and its enabled
-repositories are still listed. **Settings › Connections** offers the same per connection, as
-**Add repository** and **Disable**. An enabled repository's **Settings** tab has the same
-**Disable** for org admins, and goes to the org page once it is done. All three ask for the same
-typed name.
+`GET /v1/orgs/{org}/repos?page=&per_page=&q=&connection=`, which asks each connection's forge on
+every request (with `connection`, only that connection's); a connection the forge would not
+answer for is named in `unlisted`, and its enabled repositories are still listed. The org page is
+where repositories are enabled. **Settings › Connections** shows how many repositories each
+connection has enabled (`enabled_repos` on `GET /v1/connections`) and links to the org page
+narrowed to that connection (**Manage repositories**). An enabled repository's **Settings** tab
+has the same **Disable** for org admins, and goes to the org page once it is done; both ask for
+the same typed name. For a Forgejo repository, the tab also has **Register webhook**
+(`POST /v1/connections/{id}/repos/{owner}/{name}/webhook`), for when enabling could not register
+it.
 
 Events of a repository that is not enabled (a push to a repository the App covers, for example)
 are acknowledged with `200 {"ignored": "repository not enabled"}` and start nothing, so the forge
@@ -172,8 +176,8 @@ upgrade; nothing is unbound.
 
 Nothing the forge sends deletes a project either. When you remove an enabled repository from the
 App's installation on GitHub, or uninstall or suspend the App, its repositories stay enabled and
-are marked **unreachable** (`unreachable_since`, unix ms, on `GET /v1/repos`, the connection's
-projects and the org page rows). The repository's page and the org page say so. While a repository
+are marked **unreachable** (`unreachable_since`, unix ms, on `GET /v1/repos` and the org page
+rows). The repository's page and the org page say so. While a repository
 is unreachable, its events are ignored like those of a repository that is not enabled, a manual
 run answers 409, and any other forge call for it (a status post, a clone) fails with an error that
 names the reason. The mark clears when GitHub covers the repository again (an
@@ -189,7 +193,7 @@ database does not hold an installation's account, and an earlier re-sync could b
 installation's repositories to it. An unassigned installation connection keeps looking up each
 repository's installation, so its repositories keep getting tokens. Its next `installation`
 delivery assigns it when the rules above allow it; for an org that existed before the upgrade
-they do not (no connection has an account id yet), so a global admin assigns it. Nothing assigns it an org as a side effect: opening Add repository, a re-sync or a bind
+they do not (no connection has an account id yet), so a global admin assigns it. Nothing assigns it an org as a side effect: listing what it reaches, a re-sync or a bind
 leaves it unassigned. A re-sync through it binds nothing and lists every repository the forge
 reports in `skipped`, so the UI does not offer Re-sync on it.
 
@@ -205,7 +209,7 @@ enable or re-sync the repositories through it: a re-sync moves the org's project
 connection that does not serve it (`moved`). A repository moves only off a connection that does
 not serve its owner (one with no org, or one of another org); one bound through a connection of
 its own org stays there, even when you bind it through another connection of the same org (409
-on Add repository, `skipped` on re-sync). Unbind it from the connection that holds it first.
+on the bind, `skipped` on re-sync). Unbind it from the connection that holds it first.
 When every repository has moved, remove the old connection. Removing a connection that still
 holds a repository of another org is refused (409, naming it): that org re-syncs or adds it on
 its own connection first.

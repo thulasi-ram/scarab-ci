@@ -7,9 +7,12 @@ import { inboxRuns, type InboxRunLike } from "./gates";
 /**
  * The org page. Under the static `/orgs/` segment, beside the org's settings
  * (`/orgs/<org>/settings/…`), so it cannot collide with the two-segment
- * `/:org/:repo` tier: `orgs` is a reserved org name on the server.
+ * `/:org/:repo` tier: `orgs` is a reserved org name on the server. With
+ * `connection`, its repository list shows only that connection's.
  */
-export const orgPageHref = (org: string) => `/orgs/${encodeURIComponent(org)}`;
+export const orgPageHref = (org: string, connection?: string) =>
+  `/orgs/${encodeURIComponent(org)}` +
+  (connection ? `?connection=${encodeURIComponent(connection)}` : "");
 
 /** What the run counts read from a run summary. */
 export type OrgRunLike = InboxRunLike & { org?: string | null; created_at: number };
