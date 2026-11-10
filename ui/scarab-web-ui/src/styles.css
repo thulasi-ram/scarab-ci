@@ -3539,8 +3539,10 @@ h1, .crumb-head, .run-title {
 .sec-warn { color: var(--warn); }
 .sec-ok { color: var(--ok); }
 .sec-plain { color: var(--sage); }
-.sec-add, .sec-filter { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-.sec-add .input, .sec-add .f-ctl { flex: 1 1 220px; max-width: 340px; }
+.sec-filter { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+/* Security › passkeys: the name the next passkey gets; Add passkey is in the
+   panel header. */
+.sec-name { max-width: 420px; margin-top: 4px; }
 .sec-filter .input { max-width: 280px; }
 .evlog-filter .f { flex: 0 1 200px; }
 .lib-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }

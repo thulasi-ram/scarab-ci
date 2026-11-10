@@ -122,6 +122,18 @@ test("the old account addresses redirect and keep their query", async ({ page })
   expect(errors).toEqual([]);
 });
 
+test("Add passkey sits in the passkeys panel's header, with the name field below", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/settings/security");
+  const add = page.getByRole("button", { name: "Add passkey" });
+  await expect(add).toHaveCount(1);
+  const field = page.getByRole("textbox", { name: "Passkey name" });
+  await expect(field).toBeVisible();
+  const [a, f] = [await add.boundingBox(), await field.boundingBox()];
+  expect(a!.y).toBeLessThan(f!.y);
+  expect(errors).toEqual([]);
+});
+
 // The event log has no section of its own: it sits under the step-up
 // settings in Security, and its old address keeps its filters.
 test("the old Event log address opens Security with its filters, and the refusals preset filters the log", async ({

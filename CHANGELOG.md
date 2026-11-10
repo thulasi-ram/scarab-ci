@@ -192,7 +192,8 @@ release.yml uses that version's section as the GitHub Release text. See
   under the diff.
 - **Environments, Policies and Members follow the same list-and-page layout.** Each list has its
   add action at the right of its header (**New environment**, **Paste YAML** and **New policy**,
-  **Grant role**) and a **Manage** link per row. An Environment's read-only page and edit screen
+  **Grant role**) and a **Manage** link per row. Account settings › Security has **Add passkey**
+  at the right of the passkeys panel's header, and the new passkey's name as a field below. An Environment's read-only page and edit screen
   are one page, `…/settings/environments/<name>/manage`, with the details as one form; the old
   addresses redirect there. A Policy's page gains a **Decisions** tab with the decisions it
   matched; the Policies section drops its org-wide recent decisions and its read-only typed
