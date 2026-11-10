@@ -512,6 +512,107 @@ test("the library review sits in the settings frame, with Libraries marked", asy
   expect(errors).toEqual([]);
 });
 
+test("Install library opens a dialog, and its source is reviewed on its own page", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/orgs/acme/settings/libraries");
+  const table = page.getByRole("table", { name: "Installed libraries" });
+  await expect(table.getByRole("row")).toHaveCount(6);
+  await expect(table.getByRole("row").filter({ hasText: "lib:platform/kaniko-build" })).toContainText("yanked");
+  // A yank and a trusted source that no installation holds stay on the list.
+  await expect(page.getByRole("list", { name: "Yanked versions no library holds now" })).toContainText("91f03ac2d7e5");
+  await expect(page.getByRole("list", { name: "Trusted sources no library comes from now" })).toContainText(
+    "release-notes.yaml",
+  );
+
+  await page.getByRole("button", { name: "Install library" }).click();
+  const dialog = page.getByRole("dialog");
+  const go = dialog.getByRole("button", { name: "Fetch and review" });
+  await expect(go).toBeDisabled();
+  await dialog
+    .getByRole("textbox", { name: "Source" })
+    .fill("github.com/acme/scarab-libs//deploy-helm.yaml@d41f07b29c3e8a6f5b1d0c9e7a2f4b8c6d3e1a90");
+  await go.click();
+  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/libraries\/review\?source=/);
+  // The mock answers every fetch with an upgrade of deploy-helm.
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText(/Libraries\s*lib:acme\/deploy-helm$/);
+  await expect(page.getByText("5d1e0c7a9b3f → 0c4e7b2a91f5")).toBeVisible();
+  await page.getByRole("button", { name: "Upgrade", exact: true }).click();
+  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/libraries\/acme~deploy-helm\/manage$/);
+  expect(errors).toEqual([]);
+});
+
+test("a library's manage page holds its version, trust, yank and remove", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/orgs/acme/settings/libraries");
+  await page.getByRole("link", { name: "lib:acme/http-probe" }).click();
+  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/libraries\/acme~http-probe\/manage$/);
+  const nav = page.getByRole("navigation", { name: "Settings" });
+  await expect(nav.getByRole("link", { name: "Libraries", exact: true })).toHaveAttribute("aria-current", "page");
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText(/Libraries\s*lib:acme\/http-probe$/);
+  await expect(page.getByText("untrusted source", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Trust source" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Yank this version" })).toBeVisible();
+
+  // Upgrade opens the install dialog with the installed source in it.
+  await page.getByRole("button", { name: "Upgrade" }).click();
+  const upgrade = page.getByRole("dialog");
+  await expect(upgrade.getByRole("textbox", { name: "Source" })).toHaveValue(/http-probe\.yaml@8c2f4e1a/);
+  await upgrade.getByRole("button", { name: "Cancel" }).click();
+
+  // Remove asks for the name to be typed, then goes back to the list.
+  await page.getByRole("button", { name: "Remove library" }).click();
+  const remove = page.getByRole("dialog");
+  const confirm = remove.getByRole("button", { name: "Remove library" });
+  await expect(confirm).toBeDisabled();
+  await remove.getByRole("textbox").fill("lib:acme/http-probe");
+  await confirm.click();
+  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/libraries$/);
+  expect(errors).toEqual([]);
+});
+
+test("a plugin installation's manage page holds its state, config, kill and uninstall", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/orgs/acme/settings/plugins");
+  const table = page.getByRole("table", { name: "Installed plugins" });
+  await expect(table.getByRole("row").filter({ hasText: "argocd-us" })).toContainText("killed");
+  await expect(table.getByRole("row").filter({ hasText: "argocd-staging" })).toContainText("probe failed");
+  await table.getByRole("row").filter({ hasText: "argocd-us" }).getByRole("link", { name: "Manage" }).click();
+  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/plugins\/9c0d33a1e5\/manage$/);
+  const nav = page.getByRole("navigation", { name: "Settings" });
+  await expect(nav.getByRole("link", { name: "Plugins", exact: true })).toHaveAttribute("aria-current", "page");
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText(/Plugins\s*argocd-us$/);
+  await expect(page.getByRole("button", { name: "Enable" })).toBeVisible();
+  await expect(page.getByText("ARGOCD_UI_URL", { exact: true })).toBeVisible();
+  await expect(page.getByText("wait-live", { exact: true })).toBeVisible();
+
+  await page.getByRole("button", { name: "Uninstall plugin" }).click();
+  const dialog = page.getByRole("dialog");
+  await dialog.getByRole("textbox").fill("argocd-us");
+  await dialog.getByRole("button", { name: "Uninstall plugin" }).click();
+  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/plugins$/);
+  expect(errors).toEqual([]);
+});
+
+test("Install plugin opens its dialog from the section header", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/orgs/acme/settings/plugins");
+  await page.getByRole("button", { name: "Install plugin" }).click();
+  const dialog = page.getByRole("dialog");
+  await dialog
+    .getByRole("textbox", { name: "Source" })
+    .fill("github.com/acme/scarab-plugin-argocd//plugin.json@6e1d0c9b8a7f6e5d4c3b2a1f0e9d8c7b6a5f4e3d");
+  await dialog.getByRole("button", { name: "Read and review" }).click();
+  await expect(dialog.getByText("Manifest SHA-256", { exact: true })).toBeVisible();
+  await dialog.getByRole("textbox", { name: "Name" }).fill("argocd-dev");
+  await dialog
+    .getByRole("textbox", { name: "Image" })
+    .fill(`ghcr.io/acme/argocd@sha256:${"a".repeat(64)}`);
+  await dialog.getByRole("button", { name: "Install", exact: true }).click();
+  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/plugins\/1d2e3f4a5b\/manage$/);
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText(/Plugins\s*argocd-dev$/);
+  expect(errors).toEqual([]);
+});
+
 test("switching org on a section shows the other org's settings, not the first's", async ({ page }) => {
   const errors = collectErrors(page);
   // The mock's caller administers acme and globex.
