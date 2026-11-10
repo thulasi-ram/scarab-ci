@@ -13,6 +13,7 @@ import { AccountSettings, LegacySettings, NewOrgSettings, OrgSettings } from "./
 import LibraryReview from "./routes/LibraryReview";
 import LibraryManage from "./routes/LibraryManage";
 import PluginManage from "./routes/PluginManage";
+import MemberManage from "./routes/MemberManage";
 import { EnvironmentManage, EnvironmentRedirect } from "./routes/EnvironmentPage";
 import ConfirmRequest from "./routes/ConfirmRequest";
 import OrgPage from "./routes/OrgPage";
@@ -58,6 +59,9 @@ export default function App() {
           `<publisher>~<name>`, a plugin installation its id. */}
       <Route path="/orgs/:org/settings/libraries/:id/manage" component={LibraryManage} />
       <Route path="/orgs/:org/settings/plugins/:id/manage" component={PluginManage} />
+      {/* One member, keyed by the subject (one encoded segment): a binding
+          has no id of its own. */}
+      <Route path="/orgs/:org/settings/members/:subject/manage" component={MemberManage} />
       {/* One Environment (git-bug c11abc5): its manage page inside the
           settings frame. Six segments with a static last one, so it collides
           with neither the settings sections nor /:org/:repo/runs/:id; the

@@ -234,9 +234,13 @@ address. The user menu links the pages you may use:
 Connections is the one place a forge connection is added: **Add Forgejo connection** on an org's
 Connections, or New organization… for an org Scarab does not have yet.
 
-Members lists each person's org role, which applies to every repository in the org, and grants
-and revokes org roles. Someone who holds roles on single repositories only is listed with no org
-role, and each person's row links the repositories they hold a role in. A role on one repository
+Members lists one row per person: their org role, which applies to every repository in the org,
+and how many repositories they hold a role in. Someone who holds roles on single repositories only
+is listed with no org role. **Grant role**, at the right of the list's header, grants an org role
+in a dialog. **Manage** on a row opens the person's page
+(`/orgs/<org>/settings/members/<subject>/manage`), where you change or revoke their org role
+(revoking asks you to type the subject) and see their repository roles, each linking to that
+repository's Access. A role on one repository
 is managed on that repository's **Settings** tab, under **Access** (org admins only). It lists who
 holds a role on the repository and whether it was granted in Scarab or came from the forge's
 collaborators, then, greyed, the people whose org role reaches it. **Re-sync collaborators**

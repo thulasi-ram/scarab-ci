@@ -295,6 +295,9 @@ describe("which section the sidebar marks", () => {
     expect(activeSectionHref("/orgs/acme/settings/environments/production/edit")).toBe(
       "/orgs/acme/settings/environments",
     );
+    expect(activeSectionHref("/orgs/acme/settings/members/okta%3As.patel%40acme.example/manage")).toBe(
+      "/orgs/acme/settings/members",
+    );
     expect(activeSectionHref("/orgs/acme/settings/libraries/review")).toBe(
       "/orgs/acme/settings/libraries",
     );

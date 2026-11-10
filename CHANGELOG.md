@@ -179,6 +179,15 @@ release.yml uses that version's section as the GitHub Release text. See
   page (`…/settings/libraries/<publisher>~<name>/manage`, `…/settings/plugins/<id>/manage`).
   The library review page lays its facts and checks out on one grid, with Install in one row
   under the diff.
+- **Environments, Policies and Members follow the same list-and-page layout.** Each list has its
+  add action at the right of its header (**New environment**, **Paste YAML** and **New policy**,
+  **Grant role**) and a **Manage** link per row. An Environment's read-only page and edit screen
+  are one page, `…/settings/environments/<name>/manage`, with the details as one form; the old
+  addresses redirect there. A Policy's page gains a **Decisions** tab with the decisions it
+  matched; the Policies section drops its org-wide recent decisions and its read-only typed
+  settings, which are edited on their own pages. Each member has a page,
+  `…/settings/members/<subject>/manage`, to change or revoke their org role and see their
+  repository roles.
 
 ### Bug Fixes
 

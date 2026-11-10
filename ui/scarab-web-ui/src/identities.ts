@@ -234,6 +234,35 @@ export function memberRows(bindings: BindingLike[]): MemberRow[] {
   return [...by.values()].sort(byName);
 }
 
+/** The roles an org role can be, lowest first. */
+export const ORG_ROLES = ["viewer", "member", "admin", "owner"] as const;
+
+/** A member's page in org settings,
+ *  `/orgs/<org>/settings/members/<subject>/manage`. A binding has no id of
+ *  its own, so the subject is the key: one encoded segment, before a static
+ *  last one, whatever it holds (`okta:s.patel@acme.example`, a `/`). */
+export const memberHref = (org: string, subject: string) =>
+  `/orgs/${encodeURIComponent(org)}/settings/members/${encodeURIComponent(subject)}/manage`;
+
+/** A repository's Settings tab, whose Access section holds its roles. */
+export const repoAccessHref = (org: string, repo: string) =>
+  `/${encodeURIComponent(org)}/${encodeURIComponent(repo)}?tab=settings`;
+
+/** "N repositories", for a member's row. */
+export const repoCountLabel = (n: number) => `${n} ${n === 1 ? "repository" : "repositories"}`;
+
+export type MemberRepoRole = { repo: string; role: string; source: RoleSource };
+
+/** The repositories `subject` holds a role in, with the role and where it
+ *  came from, by repository name. Read-only on the member's page: each is
+ *  changed on that repository's Settings › Access. */
+export function memberRepoRoles(bindings: BindingLike[], subject: string): MemberRepoRole[] {
+  return bindings
+    .filter((b) => b.subject === subject && b.project)
+    .map((b) => ({ repo: b.project, role: b.role, source: roleSource(b.origin) }))
+    .sort((a, b) => a.repo.localeCompare(b.repo));
+}
+
 /** Where a repository role came from: granted in Scarab, or seeded from the
  * forge's collaborators by a re-sync. `null` when the server did not say. */
 export type RoleSource = "scarab" | "forge" | null;

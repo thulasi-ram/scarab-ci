@@ -8,7 +8,11 @@ import {
   linkNotice,
   linkable,
   loginChoices,
+  memberHref,
+  memberRepoRoles,
   memberRows,
+  repoAccessHref,
+  repoCountLabel,
   providerName,
   repoAccessRows,
   resyncDiff,
@@ -233,5 +237,40 @@ describe("confirming a merge", () => {
     const { deps: d } = deps({ confirm: async () => ({ merged: null, removed_passkeys: 0 }) });
     const out = await confirmMerge("m1", {}, d);
     expect("notice" in out && out.notice.text).toContain("nothing was merged");
+  });
+});
+
+describe("a member's page", () => {
+  it("keys it by the subject, one encoded segment before a static manage", () => {
+    expect(memberHref("acme", "j.lee")).toBe("/orgs/acme/settings/members/j.lee/manage");
+    for (const subject of ["okta:s.patel@acme.example", "a/b c", "manage", "100%"]) {
+      const parts = memberHref("a b", subject).split("/").filter(Boolean);
+      expect(parts, subject).toHaveLength(6);
+      expect(parts[5], subject).toBe("manage");
+      expect(decodeURIComponent(parts[4]!), subject).toBe(subject);
+    }
+  });
+
+  it("links each repository to its Access settings", () => {
+    expect(repoAccessHref("acme", "web app")).toBe("/acme/web%20app?tab=settings");
+    expect(repoCountLabel(1)).toBe("1 repository");
+    expect(repoCountLabel(0)).toBe("0 repositories");
+  });
+
+  it("lists the member's repository roles only, by repository, with where each came from", () => {
+    expect(
+      memberRepoRoles(
+        [
+          { subject: "alice", role: "admin", project: "" },
+          { subject: "alice", role: "member", project: "web", origin: "native" },
+          { subject: "alice", role: "viewer", project: "api", origin: "import" },
+          { subject: "bob", role: "admin", project: "web" },
+        ],
+        "alice",
+      ),
+    ).toEqual([
+      { repo: "api", role: "viewer", source: "forge" },
+      { repo: "web", role: "member", source: "scarab" },
+    ]);
   });
 });

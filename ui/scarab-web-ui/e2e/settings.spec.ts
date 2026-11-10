@@ -908,29 +908,90 @@ test("a token minted under Account settings shows in the org's list", async ({ p
   expect(errors).toEqual([]);
 });
 
-test("Members lists org roles only and links each person's repository roles", async ({ page }) => {
+test("Members lists one row per person, each managed on its own page", async ({ page }) => {
   const errors = collectErrors(page);
   await page.goto("/orgs/acme/settings/members");
-  const view = page.locator("section.page");
-  const jordan = view.locator("li.tok", { hasText: "Jordan Lee" });
+  const list = page.getByRole("list", { name: "Members" });
+  const jordan = list.getByRole("listitem").filter({ hasText: "Jordan Lee" });
   await expect(jordan).toContainText("member all of acme");
-  await expect(jordan).toContainText("also has roles in 2 repositories");
-  await expect(jordan.getByRole("link", { name: "scarab" })).toHaveAttribute(
+  await expect(jordan).toContainText("2 repositories");
+  // Repository roles only: listed, with no org role.
+  const okafor = list.getByRole("listitem").filter({ hasText: "r.okafor" });
+  await expect(okafor).toContainText("no org role");
+  await expect(okafor).toContainText("not signed in yet");
+  // No inline revoke or grant form: those are on the person's page and in
+  // the Grant role dialog. Re-sync lives on the repository.
+  const view = page.locator("section.page");
+  await expect(view.getByRole("button", { name: /revoke/i })).toHaveCount(0);
+  await expect(view.getByRole("textbox", { name: "Find a user" })).toHaveCount(0);
+  await expect(view.getByRole("button", { name: /re-sync/i })).toHaveCount(0);
+
+  await jordan.getByRole("link", { name: "Manage" }).click();
+  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/members\/j\.lee\/manage$/);
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText(/Members\s*Jordan Lee$/);
+  const nav = page.getByRole("navigation", { name: "Settings" });
+  await expect(nav.locator('[aria-current="page"]')).toHaveText("Members");
+
+  // Repository roles are read-only links to each repository's Access.
+  await expect(page.getByRole("link", { name: "scarab", exact: true })).toHaveAttribute(
     "href",
     "/acme/scarab?tab=settings",
   );
-  // Repository roles only: listed, with no org role and nothing to revoke here.
-  const okafor = view.locator("li.tok", { hasText: "r.okafor" });
-  await expect(okafor).toContainText("no org role");
-  await expect(okafor).toContainText("not signed in yet");
-  await expect(okafor.getByRole("button", { name: "revoke" })).toHaveCount(0);
-  // Grants are org-wide, and re-sync lives on the repository.
-  await expect(view.getByRole("combobox", { name: "scope" })).toHaveCount(0);
-  await expect(view.getByRole("button", { name: /re-sync/i })).toHaveCount(0);
+  await expect(page.getByText("granted in Scarab").first()).toBeVisible();
+  await expect(page.getByText(/changed on that repository's Settings › Access/)).toHaveCount(1);
 
-  await jordan.getByRole("link", { name: "scarab" }).click();
+  // Change the org role: a grant replaces it.
+  const role = page.getByRole("combobox", { name: "Org role" });
+  await expect(role).toHaveValue("member");
+  await expect(page.getByRole("button", { name: "Change role" })).toBeDisabled();
+  await role.selectOption("admin");
+  await page.getByRole("button", { name: "Change role" }).click();
+  await expect(page.getByText("Jordan Lee is admin on all of acme.")).toBeVisible();
+
+  // Revoke asks for the subject typed exactly; repository roles stay.
+  await page.getByRole("button", { name: "Revoke" }).click();
+  const dialog = page.getByRole("dialog");
+  const go = dialog.getByRole("button", { name: "Revoke role" });
+  await expect(go).toBeDisabled();
+  await dialog.getByRole("textbox").fill("j.lee");
+  await go.click();
+  await expect(page.getByText("Jordan Lee no longer holds an org role in acme.")).toBeVisible();
+  await expect(page.locator(".kv").getByText("no org role")).toBeVisible();
+
+  await page.getByRole("link", { name: "scarab", exact: true }).click();
   await expect(page).toHaveURL(/\/acme\/scarab\?tab=settings$/);
   await expect(page.locator(".panel-h", { hasText: "Access" })).toBeVisible();
+  expect(errors).toEqual([]);
+});
+
+test("Grant role opens a dialog from the section header and grants an org role", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/orgs/acme/settings/members");
+  await page.locator(".panel-h").getByRole("button", { name: "Grant role" }).click();
+  const dialog = page.getByRole("dialog");
+  const grant = dialog.getByRole("button", { name: "Grant role" });
+  await expect(grant).toBeDisabled();
+  await dialog.getByRole("textbox", { name: "Find a user" }).fill("t.ng");
+  await dialog.getByRole("button", { name: /Taylor Nguyen/ }).click();
+  await dialog.getByRole("combobox", { name: "Role" }).selectOption("viewer");
+  await grant.click();
+  await expect(dialog).toHaveCount(0);
+  await expect(page.getByText("t.nguyen is viewer on all of acme.")).toBeVisible();
+  await expect(
+    page.getByRole("list", { name: "Members" }).getByRole("listitem").filter({ hasText: "Taylor Nguyen" }),
+  ).toContainText("viewer all of acme");
+  expect(errors).toEqual([]);
+});
+
+test("a member's page takes a subject with any characters", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/orgs/acme/settings/members");
+  await page.getByRole("list", { name: "Members" }).getByRole("link", { name: "Sam Patel" }).click();
+  await expect(page).toHaveURL(/\/members\/okta%3As\.patel%40acme\.example\/manage$/);
+  await expect(page.locator(".page-sub")).toContainText("okta:s.patel@acme.example");
+  await expect(page.getByText("No roles on single repositories.")).toBeVisible();
+  await page.goto("/orgs/acme/settings/members/nobody/manage");
+  await expect(page.getByText("nobody holds no role in acme.")).toBeVisible();
   expect(errors).toEqual([]);
 });
 
