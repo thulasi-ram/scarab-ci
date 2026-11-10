@@ -75,6 +75,7 @@ machine, see [Local Development](/scarab-ci/get-started/local-development/).
 | `SCARAB_RETENTION_LOG_DAYS` | Terminal runs' log TTL in days (default 30); metadata retained regardless. |
 | `SCARAB_RETENTION_ARTIFACT_DAYS` | Terminal runs' artifact TTL in days (default 90). |
 | `SCARAB_RETENTION_WORKSPACE_DAYS` | Terminal runs' workspace-CAS reachability TTL in days (default 14); non-terminal runs always reachable. |
+| `SCARAB_RETENTION_STEP_POD_MINUTES` | Minutes a finished Run's step Pods stay in the step namespace (default 60), so log capture can finish and a failed Pod can be inspected with `kubectl describe`. After that the server deletes them, with a shared service's Service and NetworkPolicy. It deletes only objects labelled `app.kubernetes.io/managed-by=scarab` whose Run is in its own database and has finished, so installs that share a step namespace leave each other's Pods alone. k8s executor only. |
 
 Scoped, per-environment configuration sits on top of these process-wide variables. See
 [Secrets](/scarab-ci/usage/secrets/) and [Environments](/scarab-ci/usage/environments/).

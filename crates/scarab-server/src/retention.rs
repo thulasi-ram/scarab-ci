@@ -25,8 +25,8 @@ pub struct RetentionConfig {
 }
 
 /// The lease name gating the sweeper to one replica at a time.
-const RETENTION_LEASE: &str = "retention-sweeper";
-const RETENTION_LEASE_TTL_MS: i64 = 5 * 60 * 1000;
+pub(crate) const RETENTION_LEASE: &str = "retention-sweeper";
+pub(crate) const RETENTION_LEASE_TTL_MS: i64 = 5 * 60 * 1000;
 /// Runs pruned per sweep pass — bounds one pass's work; the loop catches up.
 const SWEEP_BATCH: u32 = 100;
 
@@ -767,7 +767,8 @@ pub async fn sweep_cas(
 }
 
 /// Spawn the background sweeper: one retention pass + one CAS GC pass every
-/// `interval`, forever.
+/// `interval`, forever. `step_pods` adds the step Pod sweep
+/// ([`crate::step_pods`]) to each pass.
 pub fn spawn_sweeper(
     db: Arc<dyn Db>,
     cas: Arc<dyn scarab_storage::Cas>,
@@ -780,6 +781,7 @@ pub fn spawn_sweeper(
     plugins: Option<Arc<dyn scarab_plugin::PluginStore>>,
     connection_secrets: Option<Arc<dyn scarab_secrets::SecretProvider>>,
     step_up: Option<StepUpStores>,
+    step_pods: Option<crate::step_pods::StepPodSweep>,
     interval: std::time::Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -825,6 +827,21 @@ pub fn spawn_sweeper(
                     Ok(0) => {}
                     Ok(n) => tracing::info!(rows = n, "retention: reaped step-up rows"),
                     Err(e) => tracing::warn!(error = %e, "step-up reap failed"),
+                }
+            }
+            // Leftover step Pods of finished Runs (git-bug 986542a); `None`
+            // when the executor is not the k8s one.
+            if let Some(sweep) = &step_pods {
+                if let Err(e) = crate::step_pods::sweep_step_pods(
+                    &db,
+                    sweep.cluster.as_ref(),
+                    &clock,
+                    &owner,
+                    sweep.grace_ms,
+                )
+                .await
+                {
+                    tracing::warn!(error = %e, "step pod sweep failed");
                 }
             }
             if let Err(e) = sweep_cas(&db, &cas, &store, &clock, &owner, gc, depot.as_deref()).await
