@@ -59,6 +59,7 @@
 //! | `SCARAB_RETENTION_ARTIFACT_DAYS` | env | terminal runs' artifact TTL in days (ADR-0052); default 90 |
 //! | `SCARAB_RETENTION_WORKSPACE_DAYS` | env | terminal runs' workspace-CAS reachability TTL in days (ADR-0050 mark-sweep); default 14 — non-terminal runs always reachable |
 //! | `SCARAB_RETENTION_PACK_DAYS` | env | terminal runs' Depot pack TTL in days (git-bug 6499fb1, ADR-0065/0067); default = the workspace TTL, and must be ≥ it (packs back Workspace Snapshots) |
+//! | `SCARAB_RETENTION_STEP_POD_MINUTES` | env | how long after a Run finishes its step Pods, and a shared service's Service and NetworkPolicy, stay in the step namespace, in minutes (git-bug 986542a); default 60. The k8s executor only; a Pod whose Run this database does not know is never deleted |
 //! | `SCARAB_RETENTION_CONFIG_FILE` | env | path to the operator retention config (ADR-0065 s2): the named RetentionProfile registry, TTL-only (YAML/JSON, gitops-managed); a bad path/parse/validation is a boot failure |
 //! | `SCARAB_OAUTH_OWNERS` | env | comma-separated entries granted `Owner` at login (bootstrap until scoped RBAC, ADR-0049 C2); everyone else logs in as `Viewer`. An entry matches a **Principal id** (`alice` from the legacy provider, `github:alice` from a named one) **or** `<provider>:<email>` when THAT provider asserts `email_verified`. A bare email is accepted only with a single provider (ADR-0069) — unverified/absent verification never grants `Owner` |
 //! | `SCARAB_OAUTH_PROVIDER_ID` / `_PROVIDER_NAME` / `_FORGE_URL` | env | the legacy single provider's id (default `default`; it mints the pre-ADR-0069 bare ids), its login-button label, and the forge it IS (equal to that forge's connection `base_url`, e.g. `https://api.github.com`) so a forge import resolves through it (ADR-0069) |
@@ -691,6 +692,9 @@ pub struct Config {
     /// TTL would unback durable materialization while roots are still
     /// reachable.
     pub retention_pack_days: u32,
+    /// How long after a Run finishes its step Pods stay, in minutes (git-bug
+    /// 986542a; default 60). The step Pod sweep deletes them after that.
+    pub retention_step_pod_minutes: u32,
     /// Path to the operator **retention config** file (ADR-0065 s2): the named
     /// RetentionProfile registry (TTL-only), YAML/JSON, gitops-managed — the
     /// `placement_config_file` shape exactly. `None` = no profiles; every run
@@ -1334,6 +1338,12 @@ pub enum ConfigError {
     InvalidPackRetention(u32),
 
     #[error(
+        "SCARAB_RETENTION_STEP_POD_MINUTES is set but invalid — want a positive integer \
+         number of minutes (how long a finished Run's step Pods stay, default 60)."
+    )]
+    InvalidStepPodRetention,
+
+    #[error(
         "SCARAB_STEP_TIMEOUT_SECS is set but invalid — want a positive integer number \
          of seconds, at most 82800 (23h; the global default step deadline, ADR-0047). \
          The ceiling is the workspace drain token's: it expires at min(timeout + 10min, \
@@ -1822,6 +1832,16 @@ impl Config {
                 // Packs back workspace snapshots: the workspace TTL is the
                 // correct floor and the default.
                 None => retention_workspace_days,
+            },
+            retention_step_pod_minutes: match env("SCARAB_RETENTION_STEP_POD_MINUTES")
+                .filter(|v| !v.is_empty())
+            {
+                Some(v) => v
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|m| *m > 0)
+                    .ok_or(ConfigError::InvalidStepPodRetention)?,
+                None => crate::step_pods::DEFAULT_GRACE_MINUTES,
             },
             retention_config_file: env("SCARAB_RETENTION_CONFIG_FILE").filter(|v| !v.is_empty()),
             cas_concurrency,

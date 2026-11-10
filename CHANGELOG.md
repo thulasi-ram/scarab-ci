@@ -189,6 +189,15 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ### Bug Fixes
 
+- **Finished step Pods are deleted.** The k8s executor kept every step Pod after its step
+  ended, and nothing removed them: the demo had 472, and 9 Pending Pods of a dead-lettered
+  Run had failed scheduling for 72 days. The server now deletes the Pods of a Run that has
+  been finished (succeeded, failed, cancelled or dead-lettered) for longer than
+  `SCARAB_RETENTION_STEP_POD_MINUTES` (default 60), along with a shared service's Service
+  and NetworkPolicy, up to 200 objects every five minutes. A Pod whose Run is not in the
+  server's own database, a Pod of a Run that has not finished, and a running debug Pod are
+  left alone. The chart's executor Role gains `list` on Services and NetworkPolicies
+  (git-bug 986542a).
 - The sign-in screen showed both logos in the light theme.
 - A repository row on the dashboard no longer repeats its name when the forge repository is
   named like the project.
