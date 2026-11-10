@@ -23,6 +23,26 @@ release.yml uses that version's section as the GitHub Release text. See
 - **`GET /v1/repos/{org}/{repo}/environments/{name}/deployments` is removed** and answers 404.
   It listed who approved which Run into an Environment, and the web UI no longer reads it.
   The server still writes a record when an approval releases a gate; no API returns them.
+- **Server administration is removed from settings.** Account settings and Organization
+  settings are separate pages. A global admin creates a new organization from "New
+  organization…" in the org dropdown (`/orgs/_new`); `/settings/server/…` redirects there.
+
+### Enhancement
+
+- **A repository's Secrets tab is one key list.** Each key shows where it is set; expand it
+  for one line per scope. An Environment filter shows each key's value for that Environment,
+  and New secret takes a scope. It replaces the list and the grid.
+- **Settings pages each have their own sidebar**, and Organization settings has an org
+  dropdown at the top. The user menu links Account settings and Organization settings.
+
+### Bug Fixes
+
+- The sign-in screen showed both logos in the light theme.
+- A repository row on the dashboard no longer repeats its name when the forge repository is
+  named like the project.
+- A repository page no longer repeats the Environments tab's and the Secrets tab's actions
+  in its header, and the Environments tab no longer lists approval history; each
+  Environment links to its Runs.
 
 ## [0.3.0] - 2026-11-09
 
