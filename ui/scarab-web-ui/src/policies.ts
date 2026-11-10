@@ -2,8 +2,7 @@
 // fetch, so the page and its tests agree.
 //
 // An org's rules live in two forms. CEL Policies are written as rules over a
-// checkpoint's input; the page lists them with how often they denied and, in
-// audit mode, would have denied. Typed settings are rules with a form of their
+// checkpoint's input, in the policy editor (`policy-editor.ts`). Typed settings are rules with a form of their
 // own next to the feature they govern: an Environment's rules, the library and
 // plugin lists, API token scopes. The page lists those read-only, each with a
 // link to where it is edited.
@@ -54,44 +53,6 @@ export type DecisionRecordLike = Omit<Schemas["PolicyDecisionRecordDto"], "decis
     outcome?: { kind: string; messages?: string[] };
   };
 };
-
-/** How often one Policy took part in the decisions read. */
-export type PolicyCounts = {
-  /** Its `match` selected the consultation. */
-  matched: number;
-  /** It denied (enforce mode), or its rule failed in enforce mode and so
-   *  denied. */
-  denied: number;
-  /** In audit mode, it would have denied, or its rule failed. */
-  wouldDeny: number;
-};
-
-const ZERO: PolicyCounts = { matched: 0, denied: 0, wouldDeny: 0 };
-
-/** Each Policy's counts over `decisions`, by Policy id. A Policy absent from
- *  every decision has none; read it with {@link countsOf}. */
-export function policyCounts(decisions: readonly DecisionRecordLike[]): Map<string, PolicyCounts> {
-  const out = new Map<string, PolicyCounts>();
-  for (const d of decisions) {
-    for (const r of d.decision.results ?? []) {
-      const kind = r.outcome?.kind;
-      if (!kind || kind === "not_matched") continue;
-      const c = { ...(out.get(r.policy_id) ?? ZERO) };
-      c.matched += 1;
-      // A rule that fails denies in enforce mode only; in audit mode it is
-      // recorded, as a would-deny is.
-      const audit = r.mode === "audit";
-      if (kind === "denied" || (kind === "error" && !audit)) c.denied += 1;
-      if (kind === "would_deny" || (kind === "error" && audit)) c.wouldDeny += 1;
-      out.set(r.policy_id, c);
-    }
-  }
-  return out;
-}
-
-/** One Policy's counts, zero when it took part in none. */
-export const countsOf = (counts: Map<string, PolicyCounts>, id: string): PolicyCounts =>
-  counts.get(id) ?? ZERO;
 
 /** A live CEL Policy (rules, not a typed setting). */
 export const isCelPolicy = (p: StoredPolicyLike) => !p.deleted && Array.isArray(p.policy.rules);

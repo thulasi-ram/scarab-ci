@@ -60,7 +60,7 @@ function DecisionRow(props: { view: RunDecisionView }) {
           {(step) => (
             <span class="mono subtle">
               {step()}
-              <Show when={v().attempt}>{(n) => <> · attempt {n()}</>}</Show>
+              <Show when={v().attempt}>{(n) => <> · try {n()}</>}</Show>
             </span>
           )}
         </Show>

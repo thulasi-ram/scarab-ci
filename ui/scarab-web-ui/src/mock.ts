@@ -19,6 +19,7 @@
 // generated OpenAPI types (the same contract the real server serves).
 import type { components } from "./api/schema";
 import { libraryRoute, libraryRunSummaries } from "./mock-libraries";
+import { policyRoute } from "./mock-policies";
 import { paginate } from "./org-page";
 
 type RunStatusDto = components["schemas"]["RunStatusResponse"];
@@ -702,107 +703,6 @@ const envGateEventsBody = [
     egv(ago(3 * min), { AttemptStarted: { step: g, attempt: "a1" } }),
   ),
 ].join("");
-
-// ── Org Policies — Settings › Policies. Two CEL Policies (one in audit
-// mode), one library list, one deleted Policy the page leaves out, and a
-// decision log the counts come from.
-const orgPolicy = (
-  id: string,
-  policy: Record<string, unknown>,
-  extra: { deleted?: boolean; version?: number } = {},
-) => ({
-  id,
-  level: "org",
-  org: "acme",
-  name: policy.name as string,
-  version: extra.version ?? 1,
-  policy,
-  content_hash: "9f2c".padEnd(64, "0"),
-  created_at: ago(30 * 24 * 60 * min),
-  updated_at: ago(2 * 24 * 60 * min),
-  deleted: extra.deleted ?? false,
-});
-const orgPolicies = [
-  orgPolicy(
-    "pol-1",
-    {
-      name: "no-friday-deploys",
-      checkpoint: "run.create",
-      match: { projects: [], except_projects: [], environments: ["production"], trigger_kinds: [] },
-      mode: "enforce",
-      rules: [{ when: "now.weekday == 5", effect: "deny", message: "No deploys to production on Fridays." }],
-    },
-    { version: 3 },
-  ),
-  orgPolicy("pol-2", {
-    name: "release-from-main",
-    checkpoint: "run.create",
-    match: { projects: ["web-*"], except_projects: ["web-legacy"], environments: [], trigger_kinds: [] },
-    mode: "audit",
-    rules: [{ when: "trigger.ref != 'refs/heads/main'", effect: "deny", message: "Release from main." }],
-  }),
-  orgPolicy("pol-3", {
-    name: "approved-libraries",
-    checkpoint: "run.create",
-    match: { projects: [], except_projects: [], environments: [], trigger_kinds: [] },
-    mode: "enforce",
-    setting: { libraries_allowed: { sources: ["github.com/thulasi-ram/*", "github.com/acme/*"] } },
-  }),
-  orgPolicy(
-    "pol-4",
-    {
-      name: "old-rule",
-      checkpoint: "run.create",
-      match: { projects: [], except_projects: [], environments: [], trigger_kinds: [] },
-      mode: "enforce",
-      rules: [{ when: "false", effect: "deny", message: "never" }],
-    },
-    { deleted: true, version: 2 },
-  ),
-];
-const policyResult = (policy_id: string, kind: string) => ({
-  policy_id,
-  version: 1,
-  name: policy_id,
-  level: "org",
-  mode: policy_id === "pol-2" ? "audit" : "enforce",
-  outcome: kind === "denied" || kind === "would_deny" ? { kind, messages: ["…"] } : { kind },
-});
-const policyDecision = (
-  id: string,
-  at: number,
-  project: string,
-  results: [string, string][],
-  denied?: string,
-) => ({
-  id,
-  org: "acme",
-  project,
-  run_id: denied ? null : `0190f8a2000071fb8c00${id.padStart(12, "0")}`,
-  step_id: null,
-  attempt: null,
-  at,
-  decision: {
-    checkpoint: "run.create",
-    schema_version: 1,
-    input: {},
-    policy_set_digest: "ab12".padEnd(64, "0"),
-    results: results.map(([p, k]) => policyResult(p, k)),
-    outcome: denied ? { kind: "deny", messages: [denied] } : { kind: "allow" },
-  },
-});
-const policyDecisions = [
-  policyDecision("d4", ago(20 * min), "web-app", [["pol-1", "not_matched"], ["pol-2", "would_deny"], ["pol-3", "passed"]]),
-  policyDecision(
-    "d3",
-    ago(2 * 60 * min),
-    "scarab",
-    [["pol-1", "denied"], ["pol-2", "not_matched"], ["pol-3", "passed"]],
-    "no-friday-deploys: No deploys to production on Fridays.",
-  ),
-  policyDecision("d2", ago(26 * 60 * min), "web-app", [["pol-1", "passed"], ["pol-2", "passed"], ["pol-3", "passed"]]),
-  policyDecision("d1", ago(50 * 60 * min), "scarab", [["pol-1", "passed"], ["pol-2", "not_matched"], ["pol-3", "passed"]]),
-];
 
 // ── Org-level Environments — Settings › Environments. production
 // has a baseline and a display name; qa still has the permissive one and shows
@@ -1753,6 +1653,8 @@ function route(pathname: string, search: string, method: string, body = ""): Res
   if (p === "/v1/repos/acme/scarab/refused-runs") return json({ refused: scheduleRefused });
   const lib = libraryRoute(p, method, json);
   if (lib) return lib;
+  const pol = policyRoute(p, search, method, body, json);
+  if (pol) return pol;
   if (p === "/v1/me/security") return json(meSecurity);
   if (p === "/v1/me/security/events") {
     return json({ events: securityEvents.filter((e) => e.subject === "a.kim") });
@@ -1891,8 +1793,6 @@ function route(pathname: string, search: string, method: string, body = ""): Res
 
   // Org-level Environments: list, one, and echoing writes.
   if (/^\/v1\/orgs\/[^/]+\/environments$/.test(p)) return json(orgEnvironments);
-  if (/^\/v1\/orgs\/[^/]+\/policies$/.test(p) && method === "GET") return json(orgPolicies);
-  if (/^\/v1\/orgs\/[^/]+\/policy-decisions$/.test(p)) return json({ decisions: policyDecisions, next: null });
   // Duplicate: the copy is kept for this page load, so "Open" lands on it.
   if ((m = p.match(/^\/v1\/orgs\/([^/]+)\/environments\/([^/]+)\/duplicate$/)) && method === "POST") {
     const old = decodeURIComponent(m[2]!);

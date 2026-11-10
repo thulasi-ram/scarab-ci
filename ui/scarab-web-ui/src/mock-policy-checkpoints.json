@@ -1,0 +1,1561 @@
+[
+ {
+  "checkpoint": "run.create",
+  "effects": [
+   "deny"
+  ],
+  "match_keys": [
+   "projects",
+   "except_projects",
+   "environments",
+   "trigger_kinds"
+  ],
+  "schema": {
+   "checkpoint": "run.create",
+   "enums": {
+    "ForgeToken": {
+     "name": "ForgeToken",
+     "variants": [
+      "read",
+      "write"
+     ]
+    },
+    "GateKind": {
+     "name": "GateKind",
+     "variants": [
+      "manual",
+      "timer",
+      "external",
+      "plugin"
+     ]
+    },
+    "OriginKind": {
+     "name": "OriginKind",
+     "variants": [
+      "file",
+      "library",
+      "plugin",
+      "environment"
+     ]
+    },
+    "TriggerKind": {
+     "name": "TriggerKind",
+     "variants": [
+      "push",
+      "pull_request",
+      "tag",
+      "release",
+      "comment",
+      "cron",
+      "manual",
+      "api",
+      "upstream"
+     ]
+    }
+   },
+   "structs": {
+    "Gate": {
+     "fields": [
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "id",
+       "optional": false,
+       "ty": {
+        "kind": "string"
+       }
+      },
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "kind",
+       "optional": false,
+       "ty": {
+        "kind": "enum",
+        "of": "GateKind"
+       }
+      },
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "origin",
+       "optional": false,
+       "ty": {
+        "kind": "list",
+        "of": {
+         "cap": 8,
+         "elem": {
+          "kind": "struct",
+          "of": "Origin"
+         }
+        }
+       }
+      },
+      {
+       "doc": "The ids of the Steps that depend on this gate.",
+       "max_len": 1024,
+       "name": "dependents",
+       "optional": false,
+       "ty": {
+        "kind": "list",
+        "of": {
+         "cap": 512,
+         "elem": {
+          "kind": "string"
+         }
+        }
+       }
+      }
+     ],
+     "name": "Gate"
+    },
+    "Org": {
+     "fields": [
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "name",
+       "optional": false,
+       "ty": {
+        "kind": "string"
+       }
+      }
+     ],
+     "name": "Org"
+    },
+    "Origin": {
+     "fields": [
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "kind",
+       "optional": false,
+       "ty": {
+        "kind": "enum",
+        "of": "OriginKind"
+       }
+      },
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "name",
+       "optional": false,
+       "ty": {
+        "kind": "string"
+       }
+      },
+      {
+       "doc": "Where an installed library comes from; only `library` links have one.",
+       "max_len": 1024,
+       "name": "source",
+       "optional": true,
+       "ty": {
+        "kind": "string"
+       }
+      },
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "content_hash",
+       "optional": false,
+       "ty": {
+        "kind": "string"
+       }
+      }
+     ],
+     "name": "Origin"
+    },
+    "Pipeline": {
+     "fields": [
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "name",
+       "optional": false,
+       "ty": {
+        "kind": "string"
+       }
+      },
+      {
+       "doc": "Absent when the Pipeline names no Environment.",
+       "max_len": 1024,
+       "name": "environment",
+       "optional": true,
+       "ty": {
+        "kind": "string"
+       }
+      },
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "deploy",
+       "optional": false,
+       "ty": {
+        "kind": "bool"
+       }
+      }
+     ],
+     "name": "Pipeline"
+    },
+    "Project": {
+     "fields": [
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "name",
+       "optional": false,
+       "ty": {
+        "kind": "string"
+       }
+      }
+     ],
+     "name": "Project"
+    },
+    "RunCreateInput": {
+     "fields": [
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "org",
+       "optional": false,
+       "ty": {
+        "kind": "struct",
+        "of": "Org"
+       }
+      },
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "project",
+       "optional": false,
+       "ty": {
+        "kind": "struct",
+        "of": "Project"
+       }
+      },
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "trigger",
+       "optional": false,
+       "ty": {
+        "kind": "struct",
+        "of": "Trigger"
+       }
+      },
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "pipeline",
+       "optional": false,
+       "ty": {
+        "kind": "struct",
+        "of": "Pipeline"
+       }
+      },
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "steps",
+       "optional": false,
+       "ty": {
+        "kind": "list",
+        "of": {
+         "cap": 512,
+         "elem": {
+          "kind": "struct",
+          "of": "Step"
+         }
+        }
+       }
+      },
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "gates",
+       "optional": false,
+       "ty": {
+        "kind": "list",
+        "of": {
+         "cap": 32,
+         "elem": {
+          "kind": "struct",
+          "of": "Gate"
+         }
+        }
+       }
+      },
+      {
+       "doc": "The human or token creating the Run; absent for a webhook.",
+       "max_len": 1024,
+       "name": "principal",
+       "optional": true,
+       "ty": {
+        "kind": "string"
+       }
+      },
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "time",
+       "optional": false,
+       "ty": {
+        "kind": "timestamp"
+       }
+      }
+     ],
+     "name": "RunCreateInput"
+    },
+    "Step": {
+     "fields": [
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "id",
+       "optional": false,
+       "ty": {
+        "kind": "string"
+       }
+      },
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "image",
+       "optional": false,
+       "ty": {
+        "kind": "string"
+       }
+      },
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "digest",
+       "optional": true,
+       "ty": {
+        "kind": "string"
+       }
+      },
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "grants",
+       "optional": false,
+       "ty": {
+        "kind": "list",
+        "of": {
+         "cap": 16,
+         "elem": {
+          "kind": "string"
+         }
+        }
+       }
+      },
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "k8s_overlay",
+       "optional": false,
+       "ty": {
+        "kind": "bool"
+       }
+      },
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "secrets",
+       "optional": false,
+       "ty": {
+        "kind": "list",
+        "of": {
+         "cap": 32,
+         "elem": {
+          "kind": "string"
+         }
+        }
+       }
+      },
+      {
+       "doc": "The names in `secrets` whose entry has `env: true`: each is an environment variable of the Step as well as a file. Absent from inputs recorded before it existed, so a rule reads it as `has(step.env_secrets) && 'NAME' in step.env_secrets`.",
+       "max_len": 1024,
+       "name": "env_secrets",
+       "optional": true,
+       "ty": {
+        "kind": "list",
+        "of": {
+         "cap": 32,
+         "elem": {
+          "kind": "string"
+         }
+        }
+       }
+      },
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "placement_profiles",
+       "optional": false,
+       "ty": {
+        "kind": "list",
+        "of": {
+         "cap": 8,
+         "elem": {
+          "kind": "string"
+         }
+        }
+       }
+      },
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "deploy",
+       "optional": false,
+       "ty": {
+        "kind": "bool"
+       }
+      },
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "forge_token",
+       "optional": true,
+       "ty": {
+        "kind": "enum",
+        "of": "ForgeToken"
+       }
+      },
+      {
+       "doc": "The Step uses the Environment's authority (ADR-0075 \u00a75).",
+       "max_len": 1024,
+       "name": "uses_environment_authority",
+       "optional": false,
+       "ty": {
+        "kind": "bool"
+       }
+      },
+      {
+       "doc": "Empty for a Step written in the Pipeline file itself.",
+       "max_len": 1024,
+       "name": "origin",
+       "optional": false,
+       "ty": {
+        "kind": "list",
+        "of": {
+         "cap": 8,
+         "elem": {
+          "kind": "struct",
+          "of": "Origin"
+         }
+        }
+       }
+      },
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "upstream_gates",
+       "optional": false,
+       "ty": {
+        "kind": "list",
+        "of": {
+         "cap": 32,
+         "elem": {
+          "kind": "struct",
+          "of": "UpstreamGate"
+         }
+        }
+       }
+      }
+     ],
+     "name": "Step"
+    },
+    "Trigger": {
+     "fields": [
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "kind",
+       "optional": false,
+       "ty": {
+        "kind": "enum",
+        "of": "TriggerKind"
+       }
+      },
+      {
+       "doc": "The symbolic ref (`refs/heads/main`); a cron or API trigger may have none.",
+       "max_len": 1024,
+       "name": "ref",
+       "optional": true,
+       "ty": {
+        "kind": "string"
+       }
+      },
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "sha",
+       "optional": true,
+       "ty": {
+        "kind": "string"
+       }
+      },
+      {
+       "doc": "A pull request from a fork.",
+       "max_len": 1024,
+       "name": "fork",
+       "optional": false,
+       "ty": {
+        "kind": "bool"
+       }
+      },
+      {
+       "doc": "The forge account that caused the event.",
+       "max_len": 1024,
+       "name": "actor",
+       "optional": true,
+       "ty": {
+        "kind": "string"
+       }
+      },
+      {
+       "doc": "The Principal linked to `actor` (ADR-0069), when there is one.",
+       "max_len": 1024,
+       "name": "principal",
+       "optional": true,
+       "ty": {
+        "kind": "string"
+       }
+      },
+      {
+       "doc": "The reason given for a manual or API dispatch.",
+       "max_len": 4096,
+       "name": "reason",
+       "optional": true,
+       "ty": {
+        "kind": "string"
+       }
+      }
+     ],
+     "name": "Trigger"
+    },
+    "UpstreamGate": {
+     "fields": [
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "id",
+       "optional": false,
+       "ty": {
+        "kind": "string"
+       }
+      },
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "kind",
+       "optional": false,
+       "ty": {
+        "kind": "enum",
+        "of": "GateKind"
+       }
+      }
+     ],
+     "name": "UpstreamGate"
+    }
+   },
+   "variables": [
+    {
+     "doc": "",
+     "max_len": 1024,
+     "name": "org",
+     "optional": false,
+     "ty": {
+      "kind": "struct",
+      "of": "Org"
+     }
+    },
+    {
+     "doc": "",
+     "max_len": 1024,
+     "name": "project",
+     "optional": false,
+     "ty": {
+      "kind": "struct",
+      "of": "Project"
+     }
+    },
+    {
+     "doc": "",
+     "max_len": 1024,
+     "name": "trigger",
+     "optional": false,
+     "ty": {
+      "kind": "struct",
+      "of": "Trigger"
+     }
+    },
+    {
+     "doc": "",
+     "max_len": 1024,
+     "name": "pipeline",
+     "optional": false,
+     "ty": {
+      "kind": "struct",
+      "of": "Pipeline"
+     }
+    },
+    {
+     "doc": "",
+     "max_len": 1024,
+     "name": "steps",
+     "optional": false,
+     "ty": {
+      "kind": "list",
+      "of": {
+       "cap": 512,
+       "elem": {
+        "kind": "struct",
+        "of": "Step"
+       }
+      }
+     }
+    },
+    {
+     "doc": "",
+     "max_len": 1024,
+     "name": "gates",
+     "optional": false,
+     "ty": {
+      "kind": "list",
+      "of": {
+       "cap": 32,
+       "elem": {
+        "kind": "struct",
+        "of": "Gate"
+       }
+      }
+     }
+    },
+    {
+     "doc": "The human or token creating the Run; absent for a webhook.",
+     "max_len": 1024,
+     "name": "principal",
+     "optional": true,
+     "ty": {
+      "kind": "string"
+     }
+    },
+    {
+     "doc": "",
+     "max_len": 1024,
+     "name": "time",
+     "optional": false,
+     "ty": {
+      "kind": "timestamp"
+     }
+    }
+   ],
+   "version": 1
+  },
+  "schema_version": 1,
+  "trigger_kinds": [
+   "push",
+   "pull_request",
+   "tag",
+   "release",
+   "comment",
+   "cron",
+   "manual",
+   "api",
+   "upstream"
+  ]
+ },
+ {
+  "checkpoint": "step.admit",
+  "effects": [
+   "deny"
+  ],
+  "match_keys": [
+   "projects",
+   "except_projects",
+   "environments"
+  ],
+  "schema": {
+   "checkpoint": "step.admit",
+   "enums": {
+    "ForgeToken": {
+     "name": "ForgeToken",
+     "variants": [
+      "read",
+      "write"
+     ]
+    },
+    "OriginKind": {
+     "name": "OriginKind",
+     "variants": [
+      "file",
+      "library",
+      "plugin",
+      "environment"
+     ]
+    }
+   },
+   "structs": {
+    "AdmittedRun": {
+     "fields": [
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "id",
+       "optional": false,
+       "ty": {
+        "kind": "string"
+       }
+      },
+      {
+       "doc": "The Run's symbolic ref, when it is Environment-governed.",
+       "max_len": 1024,
+       "name": "ref",
+       "optional": true,
+       "ty": {
+        "kind": "string"
+       }
+      },
+      {
+       "doc": "The Run's Environment, when one governs it.",
+       "max_len": 1024,
+       "name": "environment",
+       "optional": true,
+       "ty": {
+        "kind": "string"
+       }
+      }
+     ],
+     "name": "AdmittedRun"
+    },
+    "AdmittedStep": {
+     "fields": [
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "id",
+       "optional": false,
+       "ty": {
+        "kind": "string"
+       }
+      },
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "image",
+       "optional": false,
+       "ty": {
+        "kind": "string"
+       }
+      },
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "deploy",
+       "optional": false,
+       "ty": {
+        "kind": "bool"
+       }
+      },
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "secrets",
+       "optional": false,
+       "ty": {
+        "kind": "list",
+        "of": {
+         "cap": 32,
+         "elem": {
+          "kind": "string"
+         }
+        }
+       }
+      },
+      {
+       "doc": "The names in `secrets` whose entry has `env: true`: each is an environment variable of the Step as well as a file. Absent from inputs recorded before it existed, so a rule reads it as `has(step.env_secrets) && 'NAME' in step.env_secrets`.",
+       "max_len": 1024,
+       "name": "env_secrets",
+       "optional": true,
+       "ty": {
+        "kind": "list",
+        "of": {
+         "cap": 32,
+         "elem": {
+          "kind": "string"
+         }
+        }
+       }
+      },
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "forge_token",
+       "optional": true,
+       "ty": {
+        "kind": "enum",
+        "of": "ForgeToken"
+       }
+      },
+      {
+       "doc": "The Step uses the Environment's authority (ADR-0075 \u00a75).",
+       "max_len": 1024,
+       "name": "uses_environment_authority",
+       "optional": false,
+       "ty": {
+        "kind": "bool"
+       }
+      },
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "origin",
+       "optional": false,
+       "ty": {
+        "kind": "list",
+        "of": {
+         "cap": 8,
+         "elem": {
+          "kind": "struct",
+          "of": "Origin"
+         }
+        }
+       }
+      }
+     ],
+     "name": "AdmittedStep"
+    },
+    "EnvironmentNow": {
+     "fields": [
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "has_approvers",
+       "optional": false,
+       "ty": {
+        "kind": "bool"
+       }
+      },
+      {
+       "doc": "The Run's ref is still allowed.",
+       "max_len": 1024,
+       "name": "ref_allowed",
+       "optional": false,
+       "ty": {
+        "kind": "bool"
+       }
+      },
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "max_approval_age_s",
+       "optional": false,
+       "ty": {
+        "kind": "uint"
+       }
+      }
+     ],
+     "name": "EnvironmentNow"
+    },
+    "Org": {
+     "fields": [
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "name",
+       "optional": false,
+       "ty": {
+        "kind": "string"
+       }
+      }
+     ],
+     "name": "Org"
+    },
+    "Origin": {
+     "fields": [
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "kind",
+       "optional": false,
+       "ty": {
+        "kind": "enum",
+        "of": "OriginKind"
+       }
+      },
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "name",
+       "optional": false,
+       "ty": {
+        "kind": "string"
+       }
+      },
+      {
+       "doc": "Where an installed library comes from; only `library` links have one.",
+       "max_len": 1024,
+       "name": "source",
+       "optional": true,
+       "ty": {
+        "kind": "string"
+       }
+      },
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "content_hash",
+       "optional": false,
+       "ty": {
+        "kind": "string"
+       }
+      }
+     ],
+     "name": "Origin"
+    },
+    "Project": {
+     "fields": [
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "name",
+       "optional": false,
+       "ty": {
+        "kind": "string"
+       }
+      }
+     ],
+     "name": "Project"
+    },
+    "StepAdmitInput": {
+     "fields": [
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "org",
+       "optional": false,
+       "ty": {
+        "kind": "struct",
+        "of": "Org"
+       }
+      },
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "project",
+       "optional": false,
+       "ty": {
+        "kind": "struct",
+        "of": "Project"
+       }
+      },
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "step",
+       "optional": false,
+       "ty": {
+        "kind": "struct",
+        "of": "AdmittedStep"
+       }
+      },
+      {
+       "doc": "The Attempt being launched, from 1.",
+       "max_len": 1024,
+       "name": "attempt",
+       "optional": false,
+       "ty": {
+        "kind": "uint"
+       }
+      },
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "run",
+       "optional": false,
+       "ty": {
+        "kind": "struct",
+        "of": "AdmittedRun"
+       }
+      },
+      {
+       "doc": "The Run's Environment as it is now; absent when none governs it.",
+       "max_len": 1024,
+       "name": "environment",
+       "optional": true,
+       "ty": {
+        "kind": "struct",
+        "of": "EnvironmentNow"
+       }
+      },
+      {
+       "doc": "The Environment approval gates upstream of the Step, in Pipeline order.",
+       "max_len": 1024,
+       "name": "approvals",
+       "optional": false,
+       "ty": {
+        "kind": "list",
+        "of": {
+         "cap": 32,
+         "elem": {
+          "kind": "struct",
+          "of": "UpstreamApproval"
+         }
+        }
+       }
+      },
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "time",
+       "optional": false,
+       "ty": {
+        "kind": "timestamp"
+       }
+      }
+     ],
+     "name": "StepAdmitInput"
+    },
+    "UpstreamApproval": {
+     "fields": [
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "gate",
+       "optional": false,
+       "ty": {
+        "kind": "string"
+       }
+      },
+      {
+       "doc": "Absent while the gate has not released.",
+       "max_len": 1024,
+       "name": "released_at",
+       "optional": true,
+       "ty": {
+        "kind": "timestamp"
+       }
+      },
+      {
+       "doc": "The approver set the gate's approvals met, when recorded.",
+       "max_len": 1024,
+       "name": "approvers",
+       "optional": false,
+       "ty": {
+        "kind": "list",
+        "of": {
+         "cap": 64,
+         "elem": {
+          "kind": "string"
+         }
+        }
+       }
+      },
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "required",
+       "optional": true,
+       "ty": {
+        "kind": "uint"
+       }
+      }
+     ],
+     "name": "UpstreamApproval"
+    }
+   },
+   "variables": [
+    {
+     "doc": "",
+     "max_len": 1024,
+     "name": "org",
+     "optional": false,
+     "ty": {
+      "kind": "struct",
+      "of": "Org"
+     }
+    },
+    {
+     "doc": "",
+     "max_len": 1024,
+     "name": "project",
+     "optional": false,
+     "ty": {
+      "kind": "struct",
+      "of": "Project"
+     }
+    },
+    {
+     "doc": "",
+     "max_len": 1024,
+     "name": "step",
+     "optional": false,
+     "ty": {
+      "kind": "struct",
+      "of": "AdmittedStep"
+     }
+    },
+    {
+     "doc": "The Attempt being launched, from 1.",
+     "max_len": 1024,
+     "name": "attempt",
+     "optional": false,
+     "ty": {
+      "kind": "uint"
+     }
+    },
+    {
+     "doc": "",
+     "max_len": 1024,
+     "name": "run",
+     "optional": false,
+     "ty": {
+      "kind": "struct",
+      "of": "AdmittedRun"
+     }
+    },
+    {
+     "doc": "The Run's Environment as it is now; absent when none governs it.",
+     "max_len": 1024,
+     "name": "environment",
+     "optional": true,
+     "ty": {
+      "kind": "struct",
+      "of": "EnvironmentNow"
+     }
+    },
+    {
+     "doc": "The Environment approval gates upstream of the Step, in Pipeline order.",
+     "max_len": 1024,
+     "name": "approvals",
+     "optional": false,
+     "ty": {
+      "kind": "list",
+      "of": {
+       "cap": 32,
+       "elem": {
+        "kind": "struct",
+        "of": "UpstreamApproval"
+       }
+      }
+     }
+    },
+    {
+     "doc": "",
+     "max_len": 1024,
+     "name": "time",
+     "optional": false,
+     "ty": {
+      "kind": "timestamp"
+     }
+    }
+   ],
+   "version": 1
+  },
+  "schema_version": 1,
+  "trigger_kinds": []
+ },
+ {
+  "checkpoint": "gate.resolve",
+  "effects": [
+   "deny"
+  ],
+  "match_keys": [
+   "projects",
+   "except_projects",
+   "environments"
+  ],
+  "schema": {
+   "checkpoint": "gate.resolve",
+   "enums": {
+    "GateKind": {
+     "name": "GateKind",
+     "variants": [
+      "manual",
+      "timer",
+      "external",
+      "plugin"
+     ]
+    },
+    "OriginKind": {
+     "name": "OriginKind",
+     "variants": [
+      "file",
+      "library",
+      "plugin",
+      "environment"
+     ]
+    },
+    "Verdict": {
+     "name": "Verdict",
+     "variants": [
+      "release"
+     ]
+    }
+   },
+   "structs": {
+    "Actor": {
+     "fields": [
+      {
+       "doc": "The acting Principal.",
+       "max_len": 1024,
+       "name": "principal",
+       "optional": false,
+       "ty": {
+        "kind": "string"
+       }
+      }
+     ],
+     "name": "Actor"
+    },
+    "GateResolveInput": {
+     "fields": [
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "org",
+       "optional": false,
+       "ty": {
+        "kind": "struct",
+        "of": "Org"
+       }
+      },
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "project",
+       "optional": false,
+       "ty": {
+        "kind": "struct",
+        "of": "Project"
+       }
+      },
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "gate",
+       "optional": false,
+       "ty": {
+        "kind": "struct",
+        "of": "GateUnderResolve"
+       }
+      },
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "verdict",
+       "optional": false,
+       "ty": {
+        "kind": "enum",
+        "of": "Verdict"
+       }
+      },
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "actor",
+       "optional": false,
+       "ty": {
+        "kind": "struct",
+        "of": "Actor"
+       }
+      },
+      {
+       "doc": "The Principals who have approved in the gate's current wait, this approval included.",
+       "max_len": 1024,
+       "name": "approvals",
+       "optional": false,
+       "ty": {
+        "kind": "list",
+        "of": {
+         "cap": 64,
+         "elem": {
+          "kind": "string"
+         }
+        }
+       }
+      },
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "run",
+       "optional": false,
+       "ty": {
+        "kind": "struct",
+        "of": "GateRun"
+       }
+      },
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "time",
+       "optional": false,
+       "ty": {
+        "kind": "timestamp"
+       }
+      }
+     ],
+     "name": "GateResolveInput"
+    },
+    "GateRun": {
+     "fields": [
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "id",
+       "optional": false,
+       "ty": {
+        "kind": "string"
+       }
+      },
+      {
+       "doc": "The Run's symbolic ref, when it is Environment-governed.",
+       "max_len": 1024,
+       "name": "ref",
+       "optional": true,
+       "ty": {
+        "kind": "string"
+       }
+      },
+      {
+       "doc": "The Run's Environment, when its Pipeline names one.",
+       "max_len": 1024,
+       "name": "environment",
+       "optional": true,
+       "ty": {
+        "kind": "string"
+       }
+      }
+     ],
+     "name": "GateRun"
+    },
+    "GateUnderResolve": {
+     "fields": [
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "id",
+       "optional": false,
+       "ty": {
+        "kind": "string"
+       }
+      },
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "kind",
+       "optional": false,
+       "ty": {
+        "kind": "enum",
+        "of": "GateKind"
+       }
+      },
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "origin",
+       "optional": false,
+       "ty": {
+        "kind": "list",
+        "of": {
+         "cap": 8,
+         "elem": {
+          "kind": "struct",
+          "of": "Origin"
+         }
+        }
+       }
+      },
+      {
+       "doc": "The gate is an Environment approval gate (ADR-0078 \u00a71).",
+       "max_len": 1024,
+       "name": "environment_approval_gate",
+       "optional": false,
+       "ty": {
+        "kind": "bool"
+       }
+      },
+      {
+       "doc": "The ids of the Steps that need it, directly.",
+       "max_len": 1024,
+       "name": "dependents",
+       "optional": false,
+       "ty": {
+        "kind": "list",
+        "of": {
+         "cap": 512,
+         "elem": {
+          "kind": "string"
+         }
+        }
+       }
+      }
+     ],
+     "name": "GateUnderResolve"
+    },
+    "Org": {
+     "fields": [
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "name",
+       "optional": false,
+       "ty": {
+        "kind": "string"
+       }
+      }
+     ],
+     "name": "Org"
+    },
+    "Origin": {
+     "fields": [
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "kind",
+       "optional": false,
+       "ty": {
+        "kind": "enum",
+        "of": "OriginKind"
+       }
+      },
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "name",
+       "optional": false,
+       "ty": {
+        "kind": "string"
+       }
+      },
+      {
+       "doc": "Where an installed library comes from; only `library` links have one.",
+       "max_len": 1024,
+       "name": "source",
+       "optional": true,
+       "ty": {
+        "kind": "string"
+       }
+      },
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "content_hash",
+       "optional": false,
+       "ty": {
+        "kind": "string"
+       }
+      }
+     ],
+     "name": "Origin"
+    },
+    "Project": {
+     "fields": [
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "name",
+       "optional": false,
+       "ty": {
+        "kind": "string"
+       }
+      }
+     ],
+     "name": "Project"
+    }
+   },
+   "variables": [
+    {
+     "doc": "",
+     "max_len": 1024,
+     "name": "org",
+     "optional": false,
+     "ty": {
+      "kind": "struct",
+      "of": "Org"
+     }
+    },
+    {
+     "doc": "",
+     "max_len": 1024,
+     "name": "project",
+     "optional": false,
+     "ty": {
+      "kind": "struct",
+      "of": "Project"
+     }
+    },
+    {
+     "doc": "",
+     "max_len": 1024,
+     "name": "gate",
+     "optional": false,
+     "ty": {
+      "kind": "struct",
+      "of": "GateUnderResolve"
+     }
+    },
+    {
+     "doc": "",
+     "max_len": 1024,
+     "name": "verdict",
+     "optional": false,
+     "ty": {
+      "kind": "enum",
+      "of": "Verdict"
+     }
+    },
+    {
+     "doc": "",
+     "max_len": 1024,
+     "name": "actor",
+     "optional": false,
+     "ty": {
+      "kind": "struct",
+      "of": "Actor"
+     }
+    },
+    {
+     "doc": "The Principals who have approved in the gate's current wait, this approval included.",
+     "max_len": 1024,
+     "name": "approvals",
+     "optional": false,
+     "ty": {
+      "kind": "list",
+      "of": {
+       "cap": 64,
+       "elem": {
+        "kind": "string"
+       }
+      }
+     }
+    },
+    {
+     "doc": "",
+     "max_len": 1024,
+     "name": "run",
+     "optional": false,
+     "ty": {
+      "kind": "struct",
+      "of": "GateRun"
+     }
+    },
+    {
+     "doc": "",
+     "max_len": 1024,
+     "name": "time",
+     "optional": false,
+     "ty": {
+      "kind": "timestamp"
+     }
+    }
+   ],
+   "version": 1
+  },
+  "schema_version": 1,
+  "trigger_kinds": []
+ }
+]

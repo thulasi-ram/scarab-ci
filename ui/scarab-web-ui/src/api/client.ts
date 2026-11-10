@@ -2219,3 +2219,82 @@ export async function deletePolicy(
   if (error || !data) throw new Error(errorText(error) || `could not delete the policy (${response.status})`);
   return data;
 }
+
+/** One saved version of a Policy (`PolicyVersionDto`). */
+export type PolicyVersionRecord = components["schemas"]["PolicyVersionDto"];
+/** What checking a draft found (`PolicyCheckResponse`). */
+export type PolicyCheckResult = components["schemas"]["PolicyCheckResponse"];
+/** One checkpoint's input schema, effects and `match` keys. */
+export type PolicyCheckpointInfo = components["schemas"]["PolicyCheckpointDto"];
+/** What a draft changes over the recorded decisions. */
+export type PolicyReplayResult = components["schemas"]["PolicyReplayResponse"];
+/** Each Policy's decision counts since a time. */
+export type PolicyDecisionCounts = components["schemas"]["PolicyDecisionCountsDto"];
+
+/** One org Policy by id, deleted or not. */
+export async function getOrgPolicy(org: string, id: string): Promise<PolicyRecord> {
+  const { data, error, response } = await api.GET("/v1/orgs/{org}/policies/{id}", {
+    params: { path: { org, id } },
+  });
+  if (error || !data) throw new Error(errorText(error) || `could not load the policy (${response.status})`);
+  return data;
+}
+
+/** Every version of an org Policy, oldest first. */
+export async function listOrgPolicyVersions(org: string, id: string): Promise<PolicyVersionRecord[]> {
+  const { data, error, response } = await api.GET("/v1/orgs/{org}/policies/{id}/versions", {
+    params: { path: { org, id } },
+  });
+  if (error || !data) throw new Error(errorText(error) || `could not load the policy's history (${response.status})`);
+  return data;
+}
+
+/** Check a draft org Policy without saving it: a body, or YAML as pasted. */
+export async function checkPolicy(
+  org: string,
+  draft: { policy: unknown } | { yaml: string },
+): Promise<PolicyCheckResult> {
+  const body =
+    "yaml" in draft ? { yaml: draft.yaml } : { policy: draft.policy as Record<string, never> };
+  const { data, error, response } = await api.POST("/v1/orgs/{org}/policies/check", {
+    params: { path: { org } },
+    body,
+  });
+  if (error || !data) throw new Error(errorText(error) || `could not check the policy (${response.status})`);
+  return data;
+}
+
+/** Each checkpoint's input schema, effects and `match` keys. */
+export async function listPolicyCheckpoints(): Promise<PolicyCheckpointInfo[]> {
+  const { data, error, response } = await api.GET("/v1/policy-checkpoints");
+  if (error || !data) throw new Error(errorText(error) || `could not load the checkpoints (${response.status})`);
+  return data;
+}
+
+/** A draft over the newest recorded decisions at its checkpoint: the ones
+ *  whose outcome for the Policy would change. `policyId` names the stored
+ *  Policy the draft edits. */
+export async function replayPolicy(
+  org: string,
+  policy: unknown,
+  policyId?: string,
+  limit = 200,
+): Promise<PolicyReplayResult> {
+  const { data, error, response } = await api.POST("/v1/orgs/{org}/policy-test/replay", {
+    params: { path: { org } },
+    body: { policy: policy as Record<string, never>, policy_id: policyId ?? null, limit },
+  });
+  if (error || !data) throw new Error(errorText(error) || `could not try the policy (${response.status})`);
+  return data;
+}
+
+/** Each Policy's denies and would-denies since `since` (unix ms). `null`
+ *  when the server has no policy store (404). */
+export async function policyDecisionCounts(org: string, since: number): Promise<PolicyDecisionCounts | null> {
+  const { data, error, response } = await api.GET("/v1/orgs/{org}/policy-decisions/counts", {
+    params: { path: { org }, query: { since } },
+  });
+  if (response.status === 404) return null;
+  if (error || !data) throw new Error(errorText(error) || "failed to count the org's policy decisions");
+  return data;
+}

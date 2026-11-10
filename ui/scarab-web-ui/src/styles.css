@@ -4171,3 +4171,38 @@ a.head-org:hover { color: var(--emerald); text-decoration: underline; text-under
   margin: 6px 0 0; padding: 10px 12px; max-height: 320px; overflow: auto;
   font-size: var(--fs-xs); background: var(--pine-deep); border-radius: var(--radius-sm);
 }
+
+/* The policy editor (Settings › Policies › one policy). */
+.pol-rule {
+  border: 1px solid var(--border-soft); border-radius: var(--radius);
+  padding: 10px 12px; display: flex; flex-direction: column; gap: 10px;
+}
+.pol-rule-h { display: flex; align-items: center; gap: 9px; font-size: var(--fs-sm); font-weight: 600; }
+.pol-kinds { display: flex; flex-wrap: wrap; gap: 6px 16px; }
+.pol-diags { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; font-size: var(--fs-sm); }
+.pol-diags li { display: flex; gap: 6px; align-items: baseline; }
+.pol-diag-error { color: var(--danger); }
+.pol-diag-warn { color: var(--copper); }
+.cel-input { position: relative; }
+.cel-complete {
+  list-style: none; margin: 4px 0 0; padding: 4px; display: grid; gap: 2px;
+  border: 1px solid var(--border); border-radius: var(--radius); background: var(--emerald-elevated);
+  font-size: var(--fs-sm); max-width: 640px;
+}
+.cel-complete li { display: flex; flex-wrap: wrap; gap: 4px 10px; padding: 4px 8px; border-radius: var(--radius-sm); cursor: pointer; }
+.cel-complete li.on, .cel-complete li:hover { background: var(--pine-deep); }
+.cel-opt { font-size: var(--fs-xs); color: var(--copper); }
+.cel-doc { flex-basis: 100%; color: var(--muted-sage); font-size: var(--fs-xs); }
+.pol-replay { display: flex; flex-direction: column; gap: 8px; }
+.pol-yaml summary, .pol-diff summary {
+  cursor: pointer; width: max-content; font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--muted-sage);
+}
+.pol-yaml summary:hover, .pol-diff summary:hover { color: var(--emerald); }
+.pol-yaml pre, .pol-diff pre {
+  margin: 6px 0 0; padding: 10px 12px; overflow: auto; max-height: 420px;
+  font-size: var(--fs-xs); background: var(--pine-deep); border-radius: var(--radius-sm);
+}
+.pol-diff-add { color: var(--ok); }
+.pol-diff-del { color: var(--danger); }
+.pol-diff-same { color: var(--muted-sage); }
+.pol-list-actions { display: flex; gap: 8px; flex-wrap: wrap; }

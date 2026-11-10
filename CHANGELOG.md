@@ -63,6 +63,29 @@ release.yml uses that version's section as the GitHub Release text. See
   Connections, as for Forgejo. A connection's per-repository Remove is now Disable, with the
   org page's confirmation.
   ([Enabling repositories](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#enabling-repositories))
+- **A policy editor in the web UI.** Organization settings › Policies has New policy and Paste
+  YAML. The editor checks the draft as you type and shows each finding at its field or at the
+  rule's line and column, completes field names from the checkpoint's input schema, starts a
+  new policy in audit mode, and "Try it" lists the recent decisions whose outcome the draft
+  would change, each linking to its Run. Saving a change to an enforced policy asks for a
+  passkey. Each policy has a History tab with a line diff between versions, and the list shows
+  how many Runs or Steps each policy denied, or would have denied, in the last 7 days, with
+  Enforce on audit-mode rows.
+  ([Policies](https://thulasi-ram.github.io/scarab-ci/usage/policies/))
+- **Policy decisions on the Run page.** A Run that a policy applied to shows each decision: the
+  checkpoint, each policy's outcome and message, and the input the rules saw.
+  ([Policies](https://thulasi-ram.github.io/scarab-ci/usage/policies/#on-the-run-page))
+- **Library and plugin list forms.** The libraries allowed and blocked lists are edited on the
+  Libraries section, the plugin list on the Plugins section, and a project's own lists on its
+  repository Settings tab.
+  ([Policies](https://thulasi-ram.github.io/scarab-ci/usage/policies/#library-and-plugin-lists))
+- **Policy API for editors.** `POST /v1/orgs/{org}/policies/check` checks a draft (JSON or YAML)
+  without saving it; `GET /v1/policy-checkpoints` serves each checkpoint's input schema;
+  `POST /v1/orgs/{org}/policy-test` evaluates `step.admit` and `gate.resolve` inputs too;
+  `POST /v1/orgs/{org}/policy-test/replay` runs a draft over recent decisions; the decision
+  log takes `checkpoint`, `policy_id` and `since`, and `…/policy-decisions/counts` counts each
+  policy's denies since a time.
+  ([Policies](https://thulasi-ram.github.io/scarab-ci/usage/policies/#api))
 
 ### Enhancement
 

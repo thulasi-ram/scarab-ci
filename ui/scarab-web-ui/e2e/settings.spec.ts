@@ -303,28 +303,30 @@ test("a repository's Environments tab is one table whose rows expand into the ru
   expect(errors).toEqual([]);
 });
 
-test("the Policies page lists CEL policies with their counts and the typed settings read-only", async ({ page }) => {
+test("the Policies page lists CEL policies with their 7-day counts and the typed settings read-only", async ({ page }) => {
   const errors = collectErrors(page);
   await page.goto("/orgs/acme/settings/policies");
   await expect(page.getByRole("heading", { level: 1, name: "Policies", exact: true })).toBeVisible();
 
   // CEL policies: live ones only, with what they apply to and their counts.
   const cel = page.getByRole("list", { name: "CEL policies" });
-  await expect(cel.getByRole("listitem")).toHaveCount(2);
-  const friday = cel.getByRole("listitem").filter({ hasText: "no-friday-deploys" });
-  await expect(friday).toContainText("Applies to projects");
-  await expect(friday).toContainText("all projects");
-  await expect(friday).toContainText("3 matched · 1 denied");
+  await expect(cel.getByRole("listitem")).toHaveCount(3);
+  const forks = cel.getByRole("listitem").filter({ hasText: "no-fork-deploys" });
+  await expect(forks).toContainText("all projects");
+  await expect(forks).toContainText("denied 1 in 7 days");
   const release = cel.getByRole("listitem").filter({ hasText: "release-from-main" });
   await expect(release).toContainText("audit");
-  await expect(release).toContainText("web-*, except web-legacy");
-  await expect(release).toContainText("2 matched · 0 denied · 1 would have denied");
+  await expect(release).toContainText("orders-*, inventory-*, except inventory-legacy");
+  // The decision 9 days old is outside the window.
+  await expect(release).toContainText("would deny 2 in 7 days");
+  await expect(release.getByRole("button", { name: "Enforce" })).toBeVisible();
+  await expect(forks.getByRole("button", { name: "Enforce" })).toHaveCount(0);
   await expect(cel).not.toContainText("old-rule");
 
   // The decision log's newest entries.
   const recent = page.getByRole("list", { name: "Recent decisions" });
-  await expect(recent.getByRole("listitem")).toHaveCount(4);
-  await expect(recent).toContainText("No deploys to production on Fridays.");
+  await expect(recent.getByRole("listitem")).toHaveCount(7);
+  await expect(recent).toContainText("A pull request from a fork may not deploy to production.");
 
   // Typed settings, read-only, each linking to where it is edited.
   const envs = page.getByRole("list", { name: "Environment rules" });
@@ -337,10 +339,130 @@ test("the Policies page lists CEL policies with their counts and the typed setti
   await expect(page.locator("section.page").getByRole("textbox")).toHaveCount(0);
   await lists.getByRole("link", { name: "Libraries" }).click();
   await expect(page).toHaveURL(/\/orgs\/acme\/settings\/libraries#library-lists$/);
+  await expect(page.getByRole("list", { name: "Library lists" })).toContainText("approved-libraries");
 
   await page.goto("/orgs/acme/settings/policies");
   await envs.getByRole("listitem").filter({ hasText: "Production" }).getByRole("link", { name: "Edit" }).click();
   await expect(page).toHaveURL(/\/orgs\/acme\/settings\/environments\/production\/edit$/);
+  expect(errors).toEqual([]);
+});
+
+test("enforcing an audit-mode policy from the list says what it would have denied", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/orgs/acme/settings/policies");
+  const release = page.getByRole("list", { name: "CEL policies" }).getByRole("listitem").filter({ hasText: "release-from-main" });
+  await release.getByRole("button", { name: "Enforce" }).click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog).toContainText("Enforce release-from-main?");
+  await expect(dialog).toContainText("would have denied 2 times");
+  await dialog.getByRole("button", { name: "Enforce", exact: true }).click();
+  await expect(page.getByText("release-from-main is enforced.")).toBeVisible();
+  await expect(release).toContainText("denied 0 in 7 days");
+  await expect(release.getByRole("button", { name: "Enforce" })).toHaveCount(0);
+  expect(errors).toEqual([]);
+});
+
+test("a new policy shows the checker's findings at its rule, completes field names, and tries the draft", async ({
+  page,
+}) => {
+  const errors = collectErrors(page);
+  await page.goto("/orgs/acme/settings/policies");
+  await page.getByRole("link", { name: "New policy" }).click();
+  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/policies\/new$/);
+  await expect(page.getByRole("combobox", { name: "Mode" })).toHaveValue("audit");
+
+  await page.getByRole("textbox", { name: "Name", exact: true }).fill("no-dev-deploys");
+  const condition = page.getByRole("textbox", { name: "Condition" });
+  await condition.fill("pipeline.nope");
+  const problems = page.getByRole("list", { name: "Problems with rule 1" });
+  await expect(problems).toContainText("line 1, column 1");
+  await expect(problems).toContainText("has no field `nope`");
+
+  // Field names complete from the checkpoint's input schema.
+  await condition.fill("");
+  await condition.pressSequentially("trigger.re");
+  const names = page.getByRole("listbox", { name: "Field names" });
+  await expect(names.getByRole("option")).toHaveCount(2);
+  await expect(names.getByRole("option").first()).toContainText("ref");
+  await condition.press("Tab");
+  await expect(condition).toHaveValue("trigger.ref");
+
+  // An optional field read without has() is a warning, not an error.
+  await condition.pressSequentially(" == 'refs/heads/dev'");
+  await expect(problems).toContainText("has(trigger.ref)");
+  await condition.fill("has(trigger.ref) && trigger.ref == 'refs/heads/dev'");
+  await expect(problems).toHaveCount(0);
+  await expect(page.getByText("Reads trigger, trigger.ref.")).toBeVisible();
+  await page.getByRole("textbox", { name: "Message" }).fill("No deploys from dev.");
+
+  await page.getByRole("button", { name: "Try it on recent decisions" }).click();
+  await expect(page.getByText(/recent run\.create decisions read/)).toBeVisible();
+  const changed = page.getByRole("list", { name: "Decisions that would change" });
+  await expect(changed.getByRole("listitem").first()).toContainText("would deny (audit)");
+
+  await page.getByRole("button", { name: "Add policy" }).click();
+  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/policies\/pol-\d+$/);
+  await expect(page.getByText("no-dev-deploys is added in audit mode.")).toBeVisible();
+  expect(errors).toEqual([]);
+});
+
+test("Paste YAML opens the policy in the editor, unsaved", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/orgs/acme/settings/policies");
+  await page.getByRole("button", { name: "Paste YAML" }).click();
+  const dialog = page.getByRole("dialog");
+  await dialog
+    .getByRole("textbox", { name: "Policy YAML" })
+    .fill(
+      [
+        "kind: policy",
+        "name: pasted-rule",
+        "checkpoint: step.admit",
+        "rules:",
+        "  - when: step.deploy",
+        "    effect: deny",
+        '    message: "No deploy Steps."',
+      ].join("\n"),
+    );
+  await dialog.getByRole("button", { name: "Open in editor" }).click();
+  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/policies\/new$/);
+  await expect(page.getByRole("textbox", { name: "Name", exact: true })).toHaveValue("pasted-rule");
+  await expect(page.getByRole("combobox", { name: "Checkpoint" })).toHaveValue("step.admit");
+  await expect(page.getByRole("textbox", { name: "Condition" })).toHaveValue("step.deploy");
+  expect(errors).toEqual([]);
+});
+
+test("a policy's history diffs each version against the one before", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/orgs/acme/settings/policies/pol-1?tab=history");
+  const versions = page.getByRole("list", { name: "Versions" });
+  await expect(versions.getByRole("listitem")).toHaveCount(3);
+  const newest = versions.getByRole("listitem").first();
+  await expect(newest).toContainText("version 3");
+  await expect(newest).toContainText("no would-denies in a week of audit");
+  await expect(newest).toContainText("Changes from version 2");
+  await expect(newest).toContainText("- mode: audit");
+  await expect(newest).toContainText("+ mode: enforce");
+  await page.getByRole("button", { name: "Edit" }).click();
+  await expect(page.getByRole("textbox", { name: "Condition" })).toHaveValue("trigger.fork && pipeline.deploy");
+  await expect(page.getByText("This policy is enforced: saving a change asks for a passkey.")).toBeVisible();
+  expect(errors).toEqual([]);
+});
+
+test("a library list is added on the Libraries section, in audit mode", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/orgs/acme/settings/libraries");
+  const panel = page.locator("#library-lists");
+  await panel.getByRole("button", { name: "Libraries blocked" }).click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog.getByRole("combobox", { name: "Mode" })).toHaveValue("audit");
+  await dialog.getByRole("textbox", { name: "Sources" }).fill("github.com/*/libs");
+  await dialog.getByRole("button", { name: "Add list" }).click();
+  await expect(dialog).toContainText("a prefix ending in *");
+  await dialog.getByRole("textbox", { name: "Sources" }).fill("github.com/evil/*");
+  await dialog.getByRole("button", { name: "Add list" }).click();
+  await expect(page.getByText("libraries-blocked is added in audit mode.")).toBeVisible();
+  await expect(page.getByRole("list", { name: "Library lists" })).toContainText("github.com/evil/*");
   expect(errors).toEqual([]);
 });
 

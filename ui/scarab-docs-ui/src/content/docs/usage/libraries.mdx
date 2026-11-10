@@ -56,7 +56,9 @@ curl -X PUT "$SCARAB/v1/orgs/acme/libraries/acme/deploy-helm" \
 **The name.** Pipelines name a library `lib:<publisher>/<name>`. The publisher defaults to the
 repository's owner and the name to the file name, and you can change both at install. Each
 publisher and name names one installation in the org. A name says nothing about where the library
-came from: the installation records its source, and Policies match on the source.
+came from: the installation records its source, and Policies match on the source. The
+libraries allowed and blocked lists, under **Libraries**, are such rules: see
+[Library and plugin lists](/scarab-ci/usage/policies/#library-and-plugin-lists).
 
 **Where Scarab reads from.** A public repository on github.com, or on the host of a Forgejo
 connection, is read without credentials, over https only, from public addresses only, with no

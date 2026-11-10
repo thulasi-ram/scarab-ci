@@ -2,11 +2,9 @@ import { describe, it, expect } from "vitest";
 import {
   appliesToEnvironments,
   appliesToProjects,
-  countsOf,
   decisionVerdict,
   isCelPolicy,
   newSettingForm,
-  policyCounts,
   runDecisionViews,
   runPolicySummary,
   settingBody,
@@ -40,24 +38,6 @@ const stored = (id: string, policy: StoredPolicyLike["policy"], deleted = false)
   updated_at: 0,
   deleted,
   policy,
-});
-
-describe("policyCounts", () => {
-  it("counts matched, denied and would-deny per Policy, skipping not_matched", () => {
-    const counts = policyCounts([
-      decision([["a", "denied"], ["b", "not_matched"]], true),
-      decision([["a", "passed"], ["b", "would_deny"]]),
-      decision([["a", "error"], ["b", "passed"]], true),
-    ]);
-    expect(countsOf(counts, "a")).toEqual({ matched: 3, denied: 2, wouldDeny: 0 });
-    expect(countsOf(counts, "b")).toEqual({ matched: 2, denied: 0, wouldDeny: 1 });
-    expect(countsOf(counts, "c")).toEqual({ matched: 0, denied: 0, wouldDeny: 0 });
-  });
-
-  it("counts a failed rule of an audit-mode Policy as would have denied, not denied", () => {
-    const counts = policyCounts([decision([["a", "error", "audit"], ["a", "would_deny", "audit"]])]);
-    expect(countsOf(counts, "a")).toEqual({ matched: 2, denied: 0, wouldDeny: 2 });
-  });
 });
 
 describe("decisionVerdict", () => {

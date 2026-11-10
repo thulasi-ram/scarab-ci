@@ -1,21 +1,24 @@
-// Settings → Policies: every rule the org holds, in one place, read-only.
+// Settings → Policies: every rule the org holds, in one place.
 //
-// - CEL Policies: each with its checkpoint, mode, the projects and
-//   environments it applies to, and how often it matched, denied and (in
-//   audit mode) would have denied in the newest decisions of the log.
-// - The newest decisions themselves.
+// - CEL Policies: each with its checkpoint, what it applies to, its mode, and
+//   how many Runs or Steps it denied (or, in audit mode, would have denied)
+//   in the last 7 days. New policy opens the editor; Paste YAML reads a
+//   `kind: policy` file into it. An audit-mode Policy can be enforced from
+//   the list; Edit and History open the editor's tabs.
+// - The newest decisions of the log.
 // - Typed settings: the rules that have a form next to their feature. Each
 //   Environment's rules, the library and plugin lists, and API token scopes,
 //   each with a link to where it is edited.
-//
-// Nothing is edited here: CEL Policies are written with the policy API, and
-// each typed setting is edited where its feature is.
-import { For, Show, createResource } from "solid-js";
-import { A } from "@solidjs/router";
+import { For, Show, createResource, createSignal } from "solid-js";
+import { A, useNavigate } from "@solidjs/router";
 import {
+  checkPolicy,
   listOrgEnvironments,
   listOrgPolicies,
   listOrgPolicyDecisions,
+  policyDecisionCounts,
+  updatePolicy,
+  type PolicyCheckResult,
   type PolicyDecisionPage,
   type PolicyRecord,
 } from "../api/client";
@@ -24,21 +27,30 @@ import { environmentEditHref, nameBeside, shownName } from "../org-environments"
 import {
   appliesToEnvironments,
   appliesToProjects,
-  countsOf,
   decisionVerdict,
   isCelPolicy,
-  policyCounts,
   typedSettingRows,
   type DecisionRecordLike,
   type PolicyBody,
   type StoredPolicyLike,
 } from "../policies";
+import {
+  diagnosticText,
+  policyEditHref,
+  policyHistoryHref,
+  windowCountLabel,
+  type WindowCounts,
+} from "../policy-editor";
 import { orgHref } from "../settings-nav";
 import { absTime, relTime } from "../fmt";
 import Icon from "./Icon";
+import Modal, { ModalMessage } from "./Modal";
+import { Field, Textarea } from "./Field";
 
 /** How many of the newest decisions the page lists. */
 const RECENT = 10;
+/** The window the list's counts cover. */
+const WINDOW_DAYS = 7;
 
 // The schema leaves a Policy's body and a decision opaque; these read only
 // those fields as the shapes `policies.ts` names.
@@ -48,19 +60,33 @@ const asDecisions = (ds: PolicyDecisionPage["decisions"]): DecisionRecordLike[] 
   ds.map((d) => ({ ...d, decision: d.decision as unknown as DecisionRecordLike["decision"] }));
 
 export default function OrgPolicies(props: { org: string }) {
-  const [policies] = createResource(() => props.org, listOrgPolicies);
-  const [decisions] = createResource(() => props.org, (org) => listOrgPolicyDecisions(org));
+  const [epoch, setEpoch] = createSignal(0);
+  const [policies] = createResource(
+    () => ({ org: props.org, epoch: epoch() }),
+    (k) => listOrgPolicies(k.org),
+  );
+  const [decisions] = createResource(() => props.org, (org) => listOrgPolicyDecisions(org, RECENT));
+  const [counts] = createResource(
+    () => ({ org: props.org, epoch: epoch() }),
+    (k) => policyDecisionCounts(k.org, Date.now() - WINDOW_DAYS * 86_400_000).catch(() => null),
+  );
   const [environments] = createResource(() => props.org, (org) => listOrgEnvironments(org).catch(() => null));
+  const [enforcing, setEnforcing] = createSignal<StoredPolicyLike | null>(null);
+  const [pasting, setPasting] = createSignal(false);
+  const [notice, setNotice] = createSignal<string | null>(null);
 
   const stored = () => asStored(policies() ?? []);
   const cel = () => stored().filter(isCelPolicy).sort((a, b) => a.name.localeCompare(b.name));
   // An errored resource throws when read, so the error is checked first.
   const log = () => (decisions.error ? [] : asDecisions(decisions()?.decisions ?? []));
-  const counts = () => policyCounts(log());
+  const countOf = (id: string): WindowCounts | undefined => counts()?.policies.find((c) => c.policy_id === id);
   const settings = () => typedSettingRows(props.org, stored());
 
   return (
     <>
+      <Show when={notice()}>
+        <p class="notice-ok">{notice()}</p>
+      </Show>
       <div class="panel">
         <div class="panel-h">
           <span>CEL policies</span>
@@ -70,38 +96,55 @@ export default function OrgPolicies(props: { org: string }) {
         </div>
         <div class="secrets-body">
           <Show when={!policies.error} fallback={<p class="error">Could not load the org's policies.</p>}>
-            <Show when={!policies.loading || policies()} fallback={<p class="empty">loading…</p>}>
+            <Show when={!policies.loading || policies.latest} fallback={<p class="empty">loading…</p>}>
               <Show
-                when={policies() !== null}
+                when={policies.latest !== null}
                 fallback={<p class="empty">Policies are not configured on this server.</p>}
               >
+                <div class="pol-list-actions">
+                  <A class="btn btn-primary btn-sm" href={policyEditHref(props.org)}>
+                    <Icon icon="plus" size={14} /> New policy
+                  </A>
+                  <button class="btn btn-ghost btn-sm" type="button" onClick={() => setPasting(true)}>
+                    Paste YAML
+                  </button>
+                </div>
                 <Show
                   when={cel().length > 0}
                   fallback={
                     <p class="empty">
-                      No CEL policies in {props.org}. Add one with the policy API:{" "}
-                      <span class="mono">POST /v1/orgs/{props.org}/policies</span>.
+                      No CEL policies in {props.org}. A policy is a rule over what a Run, a Step launch
+                      or a gate approval carries, such as "no deploys from a fork".
                     </p>
                   }
                 >
-                  <p class="subtle">
-                    <small>
-                      Counts are over the newest {log().length} decision{log().length === 1 ? "" : "s"} in
-                      the log.
-                    </small>
-                  </p>
                   <ul class="tok-list" aria-label="CEL policies">
                     <For each={cel()}>
                       {(p) => (
                         <li class="tok">
                           <div class="tok-head">
-                            <span class="tok-name mono">{p.name}</span>
+                            <A class="tok-name mono" href={policyEditHref(props.org, p.id)}>
+                              {p.name}
+                            </A>
                             <span class="tok-role mono">{p.policy.checkpoint}</span>
                             <Show when={p.policy.mode === "audit"}>
                               <span class="tok-role" title="Its denies are recorded, not enforced">
                                 audit
                               </span>
                             </Show>
+                            <span class="oenv-actions">
+                              <Show when={p.policy.mode === "audit"}>
+                                <button class="btn btn-ghost btn-sm" type="button" onClick={() => setEnforcing(p)}>
+                                  Enforce
+                                </button>
+                              </Show>
+                              <A class="btn btn-ghost btn-sm" href={policyEditHref(props.org, p.id)}>
+                                Edit
+                              </A>
+                              <A class="btn btn-ghost btn-sm" href={policyHistoryHref(props.org, p.id)}>
+                                History
+                              </A>
+                            </span>
                           </div>
                           <dl class="lib-facts pol-facts">
                             <dt>Applies to projects</dt>
@@ -110,9 +153,8 @@ export default function OrgPolicies(props: { org: string }) {
                             <dd class="m">{appliesToEnvironments(p.policy)}</dd>
                             <dt>Decisions</dt>
                             <dd>
-                              {countsOf(counts(), p.id).matched} matched · {countsOf(counts(), p.id).denied} denied
-                              <Show when={p.policy.mode === "audit"}>
-                                {" "}· {countsOf(counts(), p.id).wouldDeny} would have denied
+                              <Show when={counts()} fallback="no counts">
+                                {windowCountLabel(countOf(p.id), p.policy.mode, WINDOW_DAYS)}
                               </Show>
                             </dd>
                             <dt>Version</dt>
@@ -131,6 +173,27 @@ export default function OrgPolicies(props: { org: string }) {
           </Show>
         </div>
       </div>
+
+      <Show when={enforcing()}>
+        {(p) => (
+          <EnforceDialog
+            org={props.org}
+            policy={p()}
+            counts={countOf(p().id)}
+            onClose={() => setEnforcing(null)}
+            onDone={() => {
+              // Read before the dialog closes: the accessor is gone after.
+              const name = p().name;
+              setEnforcing(null);
+              setNotice(`${name} is enforced.`);
+              setEpoch((n) => n + 1);
+            }}
+          />
+        )}
+      </Show>
+      <Show when={pasting()}>
+        <PasteDialog org={props.org} onClose={() => setPasting(false)} />
+      </Show>
 
       <div class="panel">
         <div class="panel-h">
@@ -259,5 +322,126 @@ export default function OrgPolicies(props: { org: string }) {
         </div>
       </div>
     </>
+  );
+}
+
+/** Enforce an audit-mode Policy. Moving to enforce tightens, so it needs no
+ *  passkey. */
+function EnforceDialog(props: {
+  org: string;
+  policy: StoredPolicyLike;
+  counts: WindowCounts | undefined;
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  const [busy, setBusy] = createSignal(false);
+  const [error, setError] = createSignal<string | null>(null);
+  const go = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await updatePolicy(
+        { org: props.org },
+        props.policy.id,
+        { ...props.policy.policy, mode: "enforce" },
+        props.policy.version,
+        "enforce",
+      );
+      props.onDone();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "The server refused it.");
+      setBusy(false);
+    }
+  };
+  return (
+    <Modal
+      size="narrow"
+      eyebrow={`${props.org} · policies`}
+      title={`Enforce ${props.policy.name}?`}
+      purpose="From now on, what it matches and a rule holds for is refused."
+      busy={busy()}
+      onClose={props.onClose}
+      footer={
+        <>
+          <Show when={error()}>
+            <ModalMessage>{error()}</ModalMessage>
+          </Show>
+          <button class="btn btn-ghost" type="button" onClick={props.onClose} disabled={busy()}>
+            Cancel
+          </button>
+          <button class="btn btn-primary" type="button" onClick={go} disabled={busy()}>
+            {busy() ? "Enforcing…" : "Enforce"}
+          </button>
+        </>
+      }
+    >
+      <p>
+        In the last {WINDOW_DAYS} days it would have denied {props.counts?.would_deny ?? 0} time
+        {(props.counts?.would_deny ?? 0) === 1 ? "" : "s"}. Moving it back to audit later asks for a
+        passkey.
+      </p>
+    </Modal>
+  );
+}
+
+/** Paste a `kind: policy` YAML file: the server parses and checks it, and a
+ *  Policy opens in the editor, unsaved. */
+function PasteDialog(props: { org: string; onClose: () => void }) {
+  const nav = useNavigate();
+  const [yaml, setYaml] = createSignal("");
+  const [busy, setBusy] = createSignal(false);
+  const [error, setError] = createSignal<string | null>(null);
+  const [result, setResult] = createSignal<PolicyCheckResult | null>(null);
+  const go = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const r = await checkPolicy(props.org, { yaml: yaml() });
+      if (r.policy) {
+        nav(policyEditHref(props.org), { state: { draft: r.policy } });
+        return;
+      }
+      setResult(r);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "The server refused it.");
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Modal
+      eyebrow={`${props.org} · policies`}
+      title="Paste YAML"
+      purpose="A kind: policy file opens in the editor. Nothing is saved until you save it there."
+      busy={busy()}
+      onClose={props.onClose}
+      footer={
+        <>
+          <Show when={error()}>
+            <ModalMessage>{error()}</ModalMessage>
+          </Show>
+          <Show when={result() && !result()!.policy}>
+            <ModalMessage>{result()!.diagnostics.map(diagnosticText).join(" · ")}</ModalMessage>
+          </Show>
+          <button class="btn btn-ghost" type="button" onClick={props.onClose} disabled={busy()}>
+            Cancel
+          </button>
+          <button class="btn btn-primary" type="button" onClick={go} disabled={busy() || yaml().trim() === ""}>
+            {busy() ? "Reading…" : "Open in editor"}
+          </button>
+        </>
+      }
+    >
+      <Field label="Policy YAML">
+        <Textarea
+          mono
+          rows={12}
+          autofocus
+          value={yaml()}
+          onValue={setYaml}
+          placeholder={"kind: policy\nname: no-fork-deploys\ncheckpoint: run.create\nrules:\n  - when: trigger.fork && pipeline.deploy\n    effect: deny\n    message: A fork may not deploy."}
+        />
+      </Field>
+    </Modal>
   );
 }

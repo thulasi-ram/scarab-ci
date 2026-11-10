@@ -14,6 +14,7 @@ import LibraryReview from "./routes/LibraryReview";
 import { EnvironmentEdit, EnvironmentView } from "./routes/EnvironmentPage";
 import ConfirmRequest from "./routes/ConfirmRequest";
 import OrgPage from "./routes/OrgPage";
+import PolicyEditor from "./routes/PolicyEditor";
 
 export default function App() {
   // The sign-in gate sits ABOVE the Router, not inside its root, and that
@@ -55,6 +56,9 @@ export default function App() {
           one encoded segment. */}
       <Route path="/orgs/:org/settings/environments/:env" component={EnvironmentView} />
       <Route path="/orgs/:org/settings/environments/:env/edit" component={EnvironmentEdit} />
+      {/* One org Policy, or `new`: its editor and history, inside the
+          settings frame with Policies marked. */}
+      <Route path="/orgs/:org/settings/policies/:id" component={PolicyEditor} />
       {/* Old addresses, kept for bookmarks and links sent before the move. */}
       <Route path="/settings/libraries/review" component={LegacySettings} />
       {/* The former Server administration page: now New organization. */}
