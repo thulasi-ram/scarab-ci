@@ -2,10 +2,12 @@
 // repository lives, with Disable for those who may unbind it, then Access,
 // the people who hold a role on it.
 //
-// Disable is the org page's: the same row from the org's repository list,
-// the same `can_change` from the server, the same confirmation and unbind
-// call (DisableRepository). Once it is disabled the repository has no page,
-// so the tab goes to the org page.
+// Disable is the org page's: the same confirmation and unbind call
+// (DisableRepository), offered under the rule the unbind endpoint applies:
+// the caller administers the org and the connection is not managed by
+// configuration. Both come from the org's connection list the panel already
+// loads, which names the repository's binding; no forge is asked. Once it is
+// disabled the repository has no page, so the tab goes to the org page.
 //
 // Access lists the repository's own role bindings, each with where it came
 // from (granted in Scarab, or seeded from the forge's collaborators by a
@@ -22,10 +24,8 @@ import {
   importFromForge,
   listBindings,
   listConnections,
-  listOrgRepos,
   revokeRole,
   type Binding,
-  type OrgRepo,
 } from "../api/client";
 import { me } from "../session";
 import { administers } from "../settings-nav";
@@ -35,7 +35,7 @@ import { absTime, relTime } from "../fmt";
 import { UNREACHABLE_NOTE, orgPageHref } from "../org-page";
 import Icon from "./Icon";
 import ConfirmDestructive from "./ConfirmDestructive";
-import DisableRepository from "./DisableRepository";
+import DisableRepository, { type DisableTarget } from "./DisableRepository";
 import Modal, { ModalMessage, ModalSection } from "./Modal";
 import { Select } from "./Field";
 import PrincipalSearch from "./PrincipalSearch";
@@ -50,17 +50,17 @@ export default function RepoSettings(props: { org: string; repo: string; repoUrl
     async (k) => connectionFor(await listConnections(k.org).catch(() => []), k.org, k.repo),
   );
   const forge = () => forgeName(connection()?.kind);
-  // This repository's row in the org's repository list: how the server
-  // unbinds it and whether the caller may. `can_change` needs Administer on
-  // the org, so nobody else asks. The list asks each connection's forge, but
-  // an enabled repository is in it even when its forge does not answer.
-  const [row] = createResource(
-    () => (canAdmin() ? { org: props.org, repo: props.repo } : false),
-    async (k): Promise<OrgRepo | null> => {
-      const page = await listOrgRepos(k.org, { q: k.repo, perPage: 100 }).catch(() => null);
-      return page?.repos.find((r) => r.enabled && r.project === k.repo) ?? null;
-    },
-  );
+  // The repository's binding on that connection.
+  const bound = () =>
+    connection()?.projects.find((x) => x.org === props.org && x.project === props.repo) ?? null;
+  // What Disable unbinds, when the caller may: the connection is listed only
+  // to org admins, and one managed by configuration is read-only here.
+  const binding = (): DisableTarget | null => {
+    const c = connection();
+    const p = bound();
+    if (!c || !p || c.managed_by_config) return null;
+    return { connection_id: c.id, owner: p.owner, name: p.name, project: p.project };
+  };
   const [disabling, setDisabling] = createSignal(false);
   const navigate = useNavigate();
 
@@ -116,23 +116,21 @@ export default function RepoSettings(props: { org: string; repo: string; repoUrl
               </>
             )}
           </Show>
-          <Show when={row()?.can_change ? row() : null}>
-            {(r) => (
-              <div class="repo-disable">
-                <button class="btn btn-danger btn-sm" type="button" onClick={() => setDisabling(true)}>
-                  Disable repository
-                </button>
-                <Show when={r().unreachable_since != null}>
-                  <span class="repo-unreachable-note">
-                    <Icon icon="alert-triangle" size={12} /> {UNREACHABLE_NOTE}
-                  </span>
-                </Show>
-              </div>
-            )}
+          <Show when={binding()}>
+            <div class="repo-disable">
+              <button class="btn btn-danger btn-sm" type="button" onClick={() => setDisabling(true)}>
+                Disable repository
+              </button>
+              <Show when={bound()?.unreachable_since != null}>
+                <span class="repo-unreachable-note">
+                  <Icon icon="alert-triangle" size={12} /> {UNREACHABLE_NOTE}
+                </span>
+              </Show>
+            </div>
           </Show>
         </div>
       </div>
-      <Show when={disabling() ? row() : null}>
+      <Show when={disabling() ? binding() : null}>
         {(r) => (
           <DisableRepository
             org={props.org}
