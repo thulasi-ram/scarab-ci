@@ -1174,7 +1174,18 @@ async fn exempt_and_ungoverned_routes_never_ask_for_a_step_up() {
         );
         checked += 1;
     }
-    assert_eq!(checked, 34, "the EX + NG mutating routes");
+    // Counted from the reviewed classification, which
+    // `the_route_table_is_exactly_the_reviewed_classification` pins to the
+    // route table: the loop above must have visited every EX and NG route.
+    let reviewed = EXPECTED
+        .iter()
+        .filter(|(_, _, _, class)| matches!(*class, "EX" | "NG"))
+        .count();
+    assert!(
+        reviewed > 0,
+        "the reviewed classification names EX and NG routes"
+    );
+    assert_eq!(checked, reviewed, "the EX + NG mutating routes");
     assert!(h.events_of("step_up.refused").is_empty());
 }
 
