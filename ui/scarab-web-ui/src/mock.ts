@@ -10,8 +10,9 @@
 // references the crates), the rest are generic. Add `?theme=dark` (or `light`)
 // to the URL to pin the theme, and `?palette=mono` (or `emerald`) to pin the
 // palette (used for deterministic capture); otherwise the stored choices apply.
-// `?admin_orgs=acme,globex` makes the caller an admin of those orgs instead of
-// acme alone (the settings org switch).
+// The caller administers acme and globex, so the settings org dropdown has a
+// choice; `?admin_orgs=acme` (any comma-separated list) makes them an admin of
+// those orgs instead.
 
 // Type-only imports — erased at compile time, so the install-before-App-loads
 // ordering in index.tsx is unaffected. The fixtures typecheck against the
@@ -57,14 +58,16 @@ const ENV_GATE_RUN_ID = "0190f8a2000071fb8c00e7a9b0c1d2e3";
 // ── /v1/me ────────────────────────────────────────────────────────────────
 // An Owner of the one implicit org, so the Settings gear renders.
 // The Owner role is global, so Avery is a global admin: Settings shows Connect
-// a forge and the unassigned connection below (git-bug 19b0a45).
+// a forge and the unassigned connection below (git-bug 19b0a45). Avery
+// administers two orgs, so the org dropdown in Organization settings offers a
+// choice; globex has no connections or repositories of its own.
 const me = {
   subject: "a.kim",
   display_name: "Avery Kim",
   roles: ["Owner"],
   can_administer: true,
   global_admin: true,
-  admin_orgs: ["acme"],
+  admin_orgs: ["acme", "globex"],
   token_mint_orgs: ["acme"],
   // Signed in two ways: the legacy GitHub provider and Okta.
   identities: [
@@ -1730,7 +1733,7 @@ function route(pathname: string, search: string, method: string, body = ""): Res
   // the org under /v1/orgs/{org}/tokens. A mint returns an obviously-fake
   // plaintext so the one-time reveal can be exercised (and screenshotted), and
   // joins the list for the rest of the page's life, so a token minted under
-  // Your account shows in the org's list.
+  // Account settings shows in the org's list.
   if (p === "/v1/me/tokens") {
     if (method === "POST") return mintMockToken(body);
     return json(apiTokens.filter((t) => t.owner_subject === me.subject));
@@ -2178,7 +2181,7 @@ export function installMock() {
     document.documentElement.setAttribute("data-palette", pinnedPalette);
   }
 
-  // Which orgs the caller administers: `?admin_orgs=acme,globex`.
+  // Which orgs the caller administers: `?admin_orgs=acme` (default acme and globex).
   const adminOrgs = new URLSearchParams(window.location.search).get("admin_orgs");
   if (adminOrgs) me.admin_orgs = adminOrgs.split(",").filter(Boolean);
 

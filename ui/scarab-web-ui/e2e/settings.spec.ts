@@ -1,6 +1,7 @@
-// Settings shell (git-bug 734ffa1), in mock mode: every section in the sidebar
-// opens at its own URL under its own heading, the old addresses redirect, and
-// nothing errors on the way.
+// Settings shell (git-bug 734ffa1), in mock mode: account, org and server
+// settings are separate pages, every section in a page's sidebar opens at its
+// own URL under its own heading, the user menu reaches each page, the old
+// addresses redirect, and nothing errors on the way.
 import { test, expect, type Page } from "@playwright/test";
 
 function collectErrors(page: Page): string[] {
@@ -12,32 +13,86 @@ function collectErrors(page: Page): string[] {
   return errors;
 }
 
-test("an admin lands on their org's settings and every section opens at its own URL", async ({ page }) => {
-  const errors = collectErrors(page);
+test("an admin lands on their org's settings", async ({ page }) => {
   await page.goto("/settings");
   await expect(page).toHaveURL(/\/orgs\/acme\/settings\/connections$/);
+});
 
-  const nav = page.getByRole("navigation", { name: "Settings" });
-  const links = nav.getByRole("link");
-  const count = await links.count();
-  // Your account (4) + Organization settings (10) + Server administration (1)
-  // for the fixture's admin, who is a global admin.
-  expect(count).toBe(15);
+// Account settings, an org's settings and server administration are separate
+// pages: each sidebar lists its own sections and none of the others'.
+for (const [start, heading, count] of [
+  ["/settings/profile", "Account settings", 4],
+  ["/orgs/acme/settings/connections", "Organization settings", 10],
+  ["/settings/server/connect-forge", "Server administration", 1],
+] as const) {
+  test(`${heading} lists only its own sections, each at its own URL`, async ({ page }) => {
+    const errors = collectErrors(page);
+    await page.goto(start);
+    const nav = page.getByRole("navigation", { name: "Settings" });
+    await expect(nav.getByText(heading, { exact: true })).toBeVisible();
+    const links = nav.getByRole("link");
+    await expect(links).toHaveCount(count);
 
-  const seen = new Set<string>();
-  for (let i = 0; i < count; i++) {
-    const link = links.nth(i);
-    const label = (await link.textContent())!.trim();
-    const href = (await link.getAttribute("href"))!;
-    await link.click();
-    await expect(page).toHaveURL(new RegExp(`${href.replace(/[/]/g, "\\/")}$`));
-    await expect(page.getByRole("heading", { level: 1, name: label, exact: true })).toBeVisible();
-    await expect(link).toHaveAttribute("aria-current", "page");
-    seen.add(href);
-  }
-  expect(seen.size).toBe(count);
-  await expect(page.getByText(/There is no such settings section/)).toHaveCount(0);
+    const seen = new Set<string>();
+    for (let i = 0; i < count; i++) {
+      const link = links.nth(i);
+      const label = (await link.textContent())!.trim();
+      const href = (await link.getAttribute("href"))!;
+      expect(href.startsWith(start.slice(0, start.lastIndexOf("/") + 1)), href).toBe(true);
+      await link.click();
+      await expect(page).toHaveURL(new RegExp(`${href.replace(/[/]/g, "\\/")}$`));
+      await expect(page.getByRole("heading", { level: 1, name: label, exact: true })).toBeVisible();
+      await expect(link).toHaveAttribute("aria-current", "page");
+      seen.add(href);
+    }
+    expect(seen.size).toBe(count);
+    await expect(page.getByText(/There is no such settings section/)).toHaveCount(0);
+    expect(errors).toEqual([]);
+  });
+}
+
+test("the user menu links each settings page, the org one to the org in view", async ({ page }) => {
+  const errors = collectErrors(page);
+  // In an org's context (here its settings; a repository page counts too),
+  // Organization settings opens that org.
+  await page.goto("/orgs/globex/settings/members");
+  await page.locator("button.avatar").click();
+  const menu = page.getByRole("menu");
+  await expect(menu.getByRole("menuitem", { name: "Account settings" })).toHaveAttribute(
+    "href",
+    "/settings/profile",
+  );
+  await expect(menu.getByRole("menuitem", { name: "Server administration" })).toHaveAttribute(
+    "href",
+    "/settings/server/connect-forge",
+  );
+  await menu.getByRole("menuitem", { name: "Organization settings" }).click();
+  await expect(page).toHaveURL(/\/orgs\/globex\/settings\/connections$/);
+  await expect(page.getByRole("combobox", { name: "Organization" })).toHaveValue("globex");
+
+  // Outside an org, it opens the first org the caller administers.
+  await page.locator("button.avatar").click();
+  await page.getByRole("menu").getByRole("menuitem", { name: "Account settings" }).click();
+  await expect(page).toHaveURL(/\/settings\/profile$/);
+  await page.locator("button.avatar").click();
+  await expect(
+    page.getByRole("menu").getByRole("menuitem", { name: "Organization settings" }),
+  ).toHaveAttribute("href", "/orgs/acme/settings/connections");
   expect(errors).toEqual([]);
+});
+
+test("the org dropdown is there with one org, and on a narrow screen sits above the section list", async ({ page }) => {
+  await page.goto("/orgs/acme/settings/members?admin_orgs=acme");
+  const pick = page.getByRole("combobox", { name: "Organization" });
+  await expect(pick).toBeVisible();
+  await expect(pick.locator("option")).toHaveText(["acme"]);
+
+  await page.setViewportSize({ width: 600, height: 900 });
+  const section = page.getByRole("combobox", { name: "Settings section" });
+  await expect(pick).toBeVisible();
+  await expect(section).toBeVisible();
+  const [a, b] = [await pick.boundingBox(), await section.boundingBox()];
+  expect(a!.y).toBeLessThan(b!.y);
 });
 
 test("the old account addresses redirect and keep their query", async ({ page }) => {
@@ -53,7 +108,7 @@ test("the old account addresses redirect and keep their query", async ({ page })
 });
 
 test("an org the caller does not administer shows no org sections", async ({ page }) => {
-  await page.goto("/orgs/globex/settings/members");
+  await page.goto("/orgs/initech/settings/members");
   await expect(page.getByText(/You do not administer/)).toBeVisible();
   const nav = page.getByRole("navigation", { name: "Settings" });
   await expect(nav.getByRole("link", { name: "Members" })).toHaveCount(0);
@@ -267,8 +322,8 @@ test("the library review sits in the settings frame, with Libraries marked", asy
 
 test("switching org on a section shows the other org's settings, not the first's", async ({ page }) => {
   const errors = collectErrors(page);
-  // The mock makes the caller an admin of both orgs only when asked.
-  await page.goto("/orgs/acme/settings/secrets?admin_orgs=acme,globex");
+  // The mock's caller administers acme and globex.
+  await page.goto("/orgs/acme/settings/secrets");
   await expect(page.getByText("Org secrets · acme", { exact: true })).toBeVisible();
 
   await page.getByRole("combobox", { name: "Organization" }).selectOption("globex");
@@ -333,16 +388,16 @@ test("a global admin connects a forge for a new org and lands on its connections
   await expect(page.getByRole("heading", { level: 1, name: "Connect a forge", exact: true })).toBeVisible();
   const add = page.getByRole("button", { name: "Add connection" });
   await expect(add).toBeDisabled();
-  await page.locator("#conn-org").fill("globex");
-  await page.locator("#conn-url").fill("https://git.globex.dev");
+  await page.locator("#conn-org").fill("initech");
+  await page.locator("#conn-url").fill("https://git.initech.dev");
   await page.locator("#conn-token").fill("x".repeat(24));
   await add.click();
-  await expect(page).toHaveURL(/\/orgs\/globex\/settings\/connections$/);
-  // The page renders globex's connections, not the "You do not administer"
+  await expect(page).toHaveURL(/\/orgs\/initech\/settings\/connections$/);
+  // The page renders initech's connections, not the "You do not administer"
   // panel: the new org reached `admin_orgs` on the next `/v1/me`.
   const page_ = page.locator("section.page");
   await expect(page_.getByText("forgejo-5be0d4a1", { exact: true })).toBeVisible();
-  await expect(page_.getByText("https://git.globex.dev", { exact: true })).toBeVisible();
+  await expect(page_.getByText("https://git.initech.dev", { exact: true })).toBeVisible();
   await expect(page_.getByText(/You do not administer/)).toHaveCount(0);
   expect(errors).toEqual([]);
 });
@@ -368,7 +423,7 @@ test("a global admin assigns an unassigned connection to an org", async ({ page 
   expect(errors).toEqual([]);
 });
 
-test("a token minted under Your account shows in the org's list", async ({ page }) => {
+test("a token minted under Account settings shows in the org's list", async ({ page }) => {
   const errors = collectErrors(page);
   await page.goto("/settings/tokens");
   await expect(page.getByRole("heading", { level: 1, name: "API tokens", exact: true })).toBeVisible();
@@ -383,8 +438,11 @@ test("a token minted under Your account shows in the org's list", async ({ page 
   await expect(page_.getByText("e2e laptop", { exact: true })).toBeVisible();
 
   // The org's list: the new token with its owner, and no mint button there.
+  // Organization settings is its own page, reached from the user menu.
+  await page.locator("button.avatar").click();
+  await page.getByRole("menu").getByRole("menuitem", { name: "Organization settings" }).click();
   const nav = page.getByRole("navigation", { name: "Settings" });
-  await nav.locator('a[href="/orgs/acme/settings/tokens"]').click();
+  await nav.getByRole("link", { name: "API tokens", exact: true }).click();
   await expect(page).toHaveURL(/\/orgs\/acme\/settings\/tokens$/);
   const row = page_.getByRole("row", { name: /e2e laptop/ });
   await expect(row).toBeVisible();
