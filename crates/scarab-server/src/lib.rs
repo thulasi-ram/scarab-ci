@@ -13734,6 +13734,7 @@ fn tag_for_path(path: &str) -> Option<&'static str> {
         "Policies"
     } else if path.contains("/plugins")
         || path.contains("/plugin-fetch")
+        || path.contains("/plugin-installations")
         || path == "/v1/orgs/{org}/gates"
     {
         "Plugins"
