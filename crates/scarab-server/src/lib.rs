@@ -14007,6 +14007,7 @@ impl utoipa::Modify for StepUpResponses {
         org_environments::put_environment_project_privilege_grant,
         org_environments::delete_environment_project_privilege_grant,
         libraries::list_libraries,
+        libraries::get_library_installation,
         libraries::fetch_library,
         libraries::install_library,
         libraries::remove_library,

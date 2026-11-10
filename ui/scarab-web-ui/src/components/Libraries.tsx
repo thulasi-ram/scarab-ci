@@ -5,7 +5,7 @@
 // and reviewed on its own page (`…/settings/libraries/review`,
 // routes/LibraryReview.tsx) before it is installed. Everything done to one
 // installation (upgrade, trust its source, yank, remove) is on its manage
-// page (`…/settings/libraries/<publisher>~<name>/manage`,
+// page (`…/settings/libraries/<id>/manage`,
 // routes/LibraryManage.tsx).
 //
 // Two things belong to no installation, so they stay here: a yank of a

@@ -17,8 +17,12 @@ use scarab_policy::library::{
 struct State {
     /// (org, hash) → version.
     versions: BTreeMap<(String, String), LibraryVersion>,
-    /// (org, publisher, name) → installation, without the version's fields.
-    installations: BTreeMap<(String, String, String), NewInstallation>,
+    /// (org, publisher, name) → the installation's id and the installation,
+    /// without the version's fields.
+    installations: BTreeMap<(String, String, String), (String, NewInstallation)>,
+    /// How many ids were minted: the next id is this, in 10 hex. Postgres
+    /// mints random ids; a fake needs only distinct ones.
+    minted: u64,
     /// (org, hash) → yank.
     yanks: BTreeMap<(String, String), LibraryYank>,
     /// (org, hash) of every version installed at least once.
@@ -28,9 +32,10 @@ struct State {
 }
 
 impl State {
-    fn full(&self, i: &NewInstallation) -> LibraryInstallation {
+    fn full(&self, (id, i): &(String, NewInstallation)) -> LibraryInstallation {
         let v = &self.versions[&(i.org.clone(), i.content_hash.clone())];
         LibraryInstallation {
+            id: id.clone(),
             org: i.org.clone(),
             publisher: i.publisher.clone(),
             name: i.name.clone(),
@@ -90,7 +95,10 @@ impl LibraryStore for InMemoryLibraries {
             return Err(LibraryStoreError::UnknownVersion(new.content_hash.clone()));
         }
         let key = (new.org.clone(), new.publisher.clone(), new.name.clone());
-        let current = st.installations.get(&key).map(|i| i.content_hash.clone());
+        let current = st
+            .installations
+            .get(&key)
+            .map(|(_, i)| i.content_hash.clone());
         let ok = match replaces {
             Replaces::Nothing => current.is_none(),
             Replaces::Version(h) => current.as_deref() == Some(h.as_str()),
@@ -98,10 +106,19 @@ impl LibraryStore for InMemoryLibraries {
         if !ok {
             return Err(LibraryStoreError::Conflict);
         }
-        st.installations.insert(key, new.clone());
+        // An upgrade keeps the installation's id; a first install mints one.
+        let id = match st.installations.get(&key) {
+            Some((id, _)) => id.clone(),
+            None => {
+                st.minted += 1;
+                format!("{:010x}", st.minted)
+            }
+        };
+        let row = (id, new.clone());
+        st.installations.insert(key, row.clone());
         st.installed_once
             .insert((new.org.clone(), new.content_hash.clone()));
-        Ok(st.full(new))
+        Ok(st.full(&row))
     }
 
     async fn installation(
@@ -139,7 +156,7 @@ impl LibraryStore for InMemoryLibraries {
             .installations
             .iter()
             .filter(|((o, _, _), _)| o == org)
-            .map(|((_, p, n), i)| {
+            .map(|((_, p, n), (_, i))| {
                 let v = &st.versions[&(i.org.clone(), i.content_hash.clone())];
                 (
                     format!("{p}/{n}"),

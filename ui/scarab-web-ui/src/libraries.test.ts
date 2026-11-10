@@ -71,12 +71,16 @@ describe("lines", () => {
 });
 
 describe("the list and manage pages", () => {
-  it("names an installation in one URL segment that splits back", () => {
-    const l = { publisher: "acme", name: "deploy-helm.v2" };
+  it("names an installation in the URL by its id", () => {
+    const l = { id: "b72d4f1e06", publisher: "acme", name: "deploy-helm.v2" };
     expect(libraryId(l)).toBe("lib:acme/deploy-helm.v2");
+    expect(libraryManageHref("ac me", l)).toBe("/orgs/ac%20me/settings/libraries/b72d4f1e06/manage");
+  });
+  it("reads an old publisher~name segment back, to redirect it", () => {
+    const l = { publisher: "acme", name: "deploy-helm.v2" };
     expect(libraryKey(l)).toBe("acme~deploy-helm.v2");
     expect(parseLibraryKey(libraryKey(l))).toEqual(l);
-    expect(libraryManageHref("ac me", l)).toBe("/orgs/ac%20me/settings/libraries/acme~deploy-helm.v2/manage");
+    expect(parseLibraryKey("b72d4f1e06")).toBeNull();
   });
   it("refuses a segment that is not a publisher and a name", () => {
     for (const bad of ["acme", "acme~", "~x", "a~b~c", "acme~.x", "review"]) {

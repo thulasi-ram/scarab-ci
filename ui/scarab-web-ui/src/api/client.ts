@@ -849,6 +849,18 @@ export async function listLibraries(org: string): Promise<OrgLibraries | null> {
   return data;
 }
 
+/** One installation of the org by its id (`GET …/library-installations/{id}`);
+ *  `null` = no installation with this id in the org, or this server does not
+ *  manage libraries (404). */
+export async function getLibraryInstallation(org: string, id: string): Promise<LibraryInstallation | null> {
+  const { data, error, response } = await api.GET("/v1/orgs/{org}/library-installations/{id}", {
+    params: { path: { org, id } },
+  });
+  if (response.status === 404) return null;
+  if (error || !data) throw new Error(errorText(error) || "failed to load the library");
+  return data;
+}
+
 /** Fetch a version to review (`POST …/libraries/fetch`): stored, not installed. */
 export async function fetchLibrary(
   org: string,

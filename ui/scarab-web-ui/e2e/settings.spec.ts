@@ -624,7 +624,8 @@ test("Install library opens a dialog, and its source is reviewed on its own page
   await expect(page.getByRole("heading", { level: 1 })).toHaveText(/Libraries\s*lib:acme\/deploy-helm$/);
   await expect(page.getByText("5d1e0c7a9b3f → 0c4e7b2a91f5")).toBeVisible();
   await page.getByRole("button", { name: "Upgrade", exact: true }).click();
-  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/libraries\/acme~deploy-helm\/manage$/);
+  // The manage page's URL carries the installation's id.
+  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/libraries\/b72d4f1e06\/manage$/);
   expect(errors).toEqual([]);
 });
 
@@ -632,7 +633,7 @@ test("a library's manage page holds its version, trust, yank and remove", async 
   const errors = collectErrors(page);
   await page.goto("/orgs/acme/settings/libraries");
   await page.getByRole("link", { name: "lib:acme/http-probe" }).click();
-  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/libraries\/acme~http-probe\/manage$/);
+  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/libraries\/5c09e3a7d4\/manage$/);
   const nav = page.getByRole("navigation", { name: "Settings" });
   await expect(nav.getByRole("link", { name: "Libraries", exact: true })).toHaveAttribute("aria-current", "page");
   await expect(page.getByRole("heading", { level: 1 })).toHaveText(/Libraries\s*lib:acme\/http-probe$/);
@@ -654,6 +655,19 @@ test("a library's manage page holds its version, trust, yank and remove", async 
   await remove.getByRole("textbox").fill("lib:acme/http-probe");
   await confirm.click();
   await expect(page).toHaveURL(/\/orgs\/acme\/settings\/libraries$/);
+  expect(errors).toEqual([]);
+});
+
+test("a library's old publisher~name address goes on to its id address", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/orgs/acme/settings/libraries/acme~http-probe/manage");
+  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/libraries\/5c09e3a7d4\/manage$/);
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText(/Libraries\s*lib:acme\/http-probe$/);
+  // A name that is not installed, and an id that names nothing, say so.
+  await page.goto("/orgs/acme/settings/libraries/acme~gone/manage");
+  await expect(page.getByText(/There is no library lib:acme\/gone installed in acme/)).toBeVisible();
+  await page.goto("/orgs/acme/settings/libraries/0000000000/manage");
+  await expect(page.getByText(/There is no library 0000000000 installed in acme/)).toBeVisible();
   expect(errors).toEqual([]);
 });
 

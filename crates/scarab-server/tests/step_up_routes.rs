@@ -411,6 +411,12 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
     ("GET", "/v1/orgs/{org}/libraries", "read", "READ"),
     (
         "GET",
+        "/v1/orgs/{org}/library-installations/{id}",
+        "read",
+        "READ",
+    ),
+    (
+        "GET",
         "/v1/orgs/{org}/library-yanks/{hash}/impact",
         "read",
         "READ",

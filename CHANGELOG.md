@@ -183,7 +183,10 @@ release.yml uses that version's section as the GitHub Release text. See
   killed or probe failed, and **Install library** and **Install plugin** at the top right open
   the install dialog. Upgrading, trusting a source, yanking and removing a library, and killing,
   storage, connections, the broker journal and uninstalling a plugin are on the installation's
-  page (`…/settings/libraries/<publisher>~<name>/manage`, `…/settings/plugins/<id>/manage`).
+  page (`…/settings/libraries/<id>/manage`, `…/settings/plugins/<id>/manage`). Migration 0092
+  gives each library installation an id, kept across upgrades; `GET
+  /v1/orgs/{org}/library-installations/{id}` reads one installation by it. A `…/libraries/<publisher>~<name>/manage` link goes on to the
+  installation's id page.
   The library review page lays its facts and checks out on one grid, with Install in one row
   under the diff.
 - **Environments, Policies and Members follow the same list-and-page layout.** Each list has its

@@ -48,6 +48,11 @@ pub struct LibraryVersion {
 /// The version an org uses for one `<publisher>/<name>`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LibraryInstallation {
+    /// Store-minted when the library is first installed: 10 random
+    /// lowercase hex, unique across orgs. An upgrade keeps it; a removal and
+    /// a new install get a new one. What the settings page's URL carries.
+    #[serde(default)]
+    pub id: String,
     pub org: String,
     pub publisher: String,
     pub name: String,
@@ -165,6 +170,20 @@ pub trait LibraryStore: Send + Sync {
         publisher: &str,
         name: &str,
     ) -> Result<Option<LibraryInstallation>, LibraryStoreError>;
+
+    /// The installation in `org` with this id, or `None`: an id of another
+    /// org's installation is not found here.
+    async fn installation_by_id(
+        &self,
+        org: &str,
+        id: &str,
+    ) -> Result<Option<LibraryInstallation>, LibraryStoreError> {
+        Ok(self
+            .installations(org)
+            .await?
+            .into_iter()
+            .find(|i| i.id == id))
+    }
 
     /// The org's installations by publisher, then name (bytewise).
     async fn installations(&self, org: &str)

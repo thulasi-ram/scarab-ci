@@ -492,6 +492,10 @@ pub(crate) fn governed_routes() -> Routes {
         // ADR-0076: org-installed libraries, yanks, trusted sources.
         .get("/v1/orgs/{org}/libraries", lib::list_libraries)
         .get(
+            "/v1/orgs/{org}/library-installations/{id}",
+            lib::get_library_installation,
+        )
+        .get(
             "/v1/orgs/{org}/library-yanks/{hash}/impact",
             lib::get_yank_impact,
         )
