@@ -120,6 +120,7 @@ pub mod run_origin;
 pub mod schedules;
 pub use routes::{route_table, RouteEntry};
 pub mod secret_executor;
+pub mod step_pods;
 pub mod step_up;
 /// `--role workspace`: the ADR-0061 workspace service. Its own router, its own
 /// `/readyz`, and NO durable core — see the module docs.
