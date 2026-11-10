@@ -122,15 +122,17 @@ test("the old account addresses redirect and keep their query", async ({ page })
   expect(errors).toEqual([]);
 });
 
-test("Add passkey sits in the passkeys panel's header, with the name field below", async ({ page }) => {
+test("Add passkey sits in the passkeys panel's header and asks for the name in a dialog", async ({ page }) => {
   const errors = collectErrors(page);
   await page.goto("/settings/security");
-  const add = page.getByRole("button", { name: "Add passkey" });
-  await expect(add).toHaveCount(1);
   const field = page.getByRole("textbox", { name: "Passkey name" });
-  await expect(field).toBeVisible();
-  const [a, f] = [await add.boundingBox(), await field.boundingBox()];
-  expect(a!.y).toBeLessThan(f!.y);
+  await expect(field).toHaveCount(0);
+  await page.getByRole("button", { name: "Add passkey" }).click();
+  const dialog = page.getByRole("dialog", { name: "Add a passkey" });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByRole("textbox", { name: "Passkey name" })).toBeFocused();
+  await dialog.getByRole("button", { name: "Cancel" }).click();
+  await expect(dialog).toHaveCount(0);
   expect(errors).toEqual([]);
 });
 
