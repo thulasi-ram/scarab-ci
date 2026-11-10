@@ -263,6 +263,46 @@ test("a wait timer with no approvers is disabled and its environment warns", asy
   expect(errors).toEqual([]);
 });
 
+test("a repository's Environments tab is one table whose rows expand into the rules a deploy needs", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/acme/scarab?tab=environments");
+  const table = page.locator("table.envt");
+  const production = table.getByRole("row", { name: /Production/ });
+  await expect(production).toContainText("+1 approver");
+  await expect(production).toContainText("5 min");
+  await expect(table.getByRole("row", { name: /qa/ })).toContainText("no rules");
+  await expect(table.getByRole("row", { name: /Staging/ })).toContainText("not eligible");
+
+  // Expanding: the sentence, the two layers side by side, and the actions.
+  await expect(production).toHaveAttribute("aria-expanded", "false");
+  // The name cell, not the row's centre: the row also holds the Runs link.
+  await production.locator(".envt-name").click();
+  await expect(production).toHaveAttribute("aria-expanded", "true");
+  await expect(
+    table.getByText("A deploy from main needs 2 approvals and a reason, then waits 5 minutes."),
+  ).toBeVisible();
+  const layers = table.locator("table.envt-layers");
+  await expect(layers.getByRole("row", { name: /Approvers/ })).toContainText("ops-lead");
+  await expect(layers.getByRole("row", { name: /Approvers/ })).toContainText("j.lee");
+  await expect(layers.getByRole("row", { name: /Privileges/ })).toContainText("1 privileged image");
+  await expect(table.getByRole("button", { name: "Edit this repo's rules" })).toBeVisible();
+
+  // The keyboard folds it again.
+  await production.press("Enter");
+  await expect(production).toHaveAttribute("aria-expanded", "false");
+  await expect(layers).toHaveCount(0);
+
+  // A withdrawn environment says so, and keeps its overlay until removed.
+  await table.getByRole("row", { name: /Staging/ }).locator(".envt-name").click();
+  await expect(table.getByText("An org admin withdrew this repo. Its overlay stays until removed.")).toBeVisible();
+  await expect(table.getByRole("button", { name: "Remove" })).toBeVisible();
+
+  // The Runs link opens the Runs tab filtered by that environment.
+  await production.getByRole("link", { name: "Runs in Production" }).click();
+  await expect(page).toHaveURL(/\/acme\/scarab\?env=production$/);
+  expect(errors).toEqual([]);
+});
+
 test("the Policies page lists CEL policies with their counts and the typed settings read-only", async ({ page }) => {
   const errors = collectErrors(page);
   await page.goto("/orgs/acme/settings/policies");

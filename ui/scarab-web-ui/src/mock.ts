@@ -866,7 +866,10 @@ const orgEnvironments: OrgEnvironmentDto[] = [
 
 // Per-project overlays and grants, keyed environment →
 // project. scarab tightens production (an extra approver, a reason, a wait);
-// it holds a grant for one privileged image there.
+// it holds a grant for one privileged image there. It also keeps an overlay
+// on staging, which is no longer eligible for it (staging admits web-* only),
+// so its Environments tab shows all three cases beside qa, where no rule
+// protects a deploy.
 const overlays: Record<string, Record<string, OverlayDto>> = {
   production: {
     scarab: {
@@ -874,6 +877,14 @@ const overlays: Record<string, Record<string, OverlayDto>> = {
       allowed_refs: [],
       wait_timer_s: 300,
       require_reason: true,
+    },
+  },
+  staging: {
+    scarab: {
+      approvers: [],
+      allowed_refs: ["refs/heads/release/*"],
+      wait_timer_s: 0,
+      require_reason: false,
     },
   },
 };
