@@ -203,7 +203,7 @@ async fn fetches_keep_a_bounded_number_of_versions_never_installed() {
         let content =
             format!("kind: library\nsteps:\n  - id: s{n}\n    image: alpine@sha256:aaaa\n");
         h.http
-            .serve(&raw("acme", "libs", &commit, "deploy.yaml"), &content);
+            .serve_url(&raw("acme", "libs", &commit, "deploy.yaml"), &content);
         let (st, b) = fetch(
             &h,
             json!({ "source": format!("github.com/acme/libs//deploy.yaml@{commit}") }),
