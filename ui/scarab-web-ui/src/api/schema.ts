@@ -1623,23 +1623,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/v1/repos/{org}/{repo}/environments/{name}/deployments": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Legacy approval history (ADR-0070 §1) */
-        get: operations["list_deployments"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/v1/repos/{org}/{repo}/pipelines": {
         parameters: {
             query?: never;
@@ -10400,31 +10383,6 @@ export interface operations {
         responses: {
             /** @description gone; the body says where it went */
             410: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    list_deployments: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description repo owner */
-                org: string;
-                /** @description repo name */
-                repo: string;
-                /** @description Environment name */
-                name: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description most recent first */
-            200: {
                 headers: {
                     [name: string]: unknown;
                 };

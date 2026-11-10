@@ -3627,39 +3627,6 @@ impl ApprovalHistoryStore for PostgresDb {
         .map_err(|e| ProjectError::Store(e.to_string()))?;
         Ok(())
     }
-
-    async fn deployments(
-        &self,
-        org: &str,
-        project: &str,
-        environment: &str,
-    ) -> Result<Vec<Deployment>, ProjectError> {
-        let rows = sqlx::query(
-            "SELECT git_ref, run_id, approved_by, at FROM deployments
-             WHERE org = $1 AND project = $2 AND environment = $3 ORDER BY id DESC",
-        )
-        .bind(org)
-        .bind(project)
-        .bind(environment)
-        .fetch_all(self.pool())
-        .await
-        .map_err(|e| ProjectError::Store(e.to_string()))?;
-        rows.into_iter()
-            .map(|r| {
-                let approved_by = serde_json::from_value(r.get::<Value, _>("approved_by"))
-                    .map_err(|e| ProjectError::Store(e.to_string()))?;
-                Ok(Deployment {
-                    org: org.to_string(),
-                    project: project.to_string(),
-                    environment: environment.to_string(),
-                    git_ref: r.get::<String, _>("git_ref"),
-                    run: r.get::<String, _>("run_id"),
-                    approved_by,
-                    at: r.get::<i64, _>("at"),
-                })
-            })
-            .collect()
-    }
 }
 
 /// "Intentionally unset" markers for the advisory coverage matrix (ADR-0037 D).

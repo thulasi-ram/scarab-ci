@@ -7,8 +7,12 @@
 //! reads the legacy rows, and an identity fold rewrites approver ids in them,
 //! so a test of either seeds legacy rows here first, in the shape a
 //! pre-migration server wrote them.
+//!
+//! It also reads back the legacy approval history (the `deployments` table,
+//! ADR-0070 §1). Production writes a row on every gate release and no API
+//! reads it, so a test of that write reads the rows here.
 
-use scarab_project::{Environment, ProtectionRules};
+use scarab_project::{Deployment, Environment, ProtectionRules};
 use sqlx::{PgPool, Row};
 
 /// Create or replace one legacy per-Project environment row, as the retired
@@ -67,4 +71,38 @@ pub async fn legacy_project_environment(
             protection,
         }
     })
+}
+
+/// The legacy approval history of one environment, most recent first.
+///
+/// # Panics
+/// On a database error or a row whose approver list does not deserialise.
+pub async fn approval_history(
+    pool: &PgPool,
+    org: &str,
+    project: &str,
+    environment: &str,
+) -> Vec<Deployment> {
+    sqlx::query(
+        "SELECT git_ref, run_id, approved_by, at FROM deployments
+         WHERE org = $1 AND project = $2 AND environment = $3 ORDER BY id DESC",
+    )
+    .bind(org)
+    .bind(project)
+    .bind(environment)
+    .fetch_all(pool)
+    .await
+    .expect("read the approval history")
+    .into_iter()
+    .map(|r| Deployment {
+        org: org.to_string(),
+        project: project.to_string(),
+        environment: environment.to_string(),
+        git_ref: r.get::<String, _>("git_ref"),
+        run: r.get::<String, _>("run_id"),
+        approved_by: serde_json::from_value(r.get::<serde_json::Value, _>("approved_by"))
+            .expect("approvers deserialise"),
+        at: r.get::<i64, _>("at"),
+    })
+    .collect()
 }

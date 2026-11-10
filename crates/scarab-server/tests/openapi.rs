@@ -31,8 +31,8 @@ fn openapi_document_has_v1_paths_and_ir_schemas() {
 }
 
 /// ADR-0074 removed the Deployment record: its read API and schemas are off
-/// the documented surface, while the repo-scoped legacy approval history that
-/// shares the word stays with Environments.
+/// the documented surface. The repo-scoped legacy approval history read that
+/// shared the word is gone too.
 #[test]
 fn openapi_document_has_no_deployment_record() {
     let doc: serde_json::Value = serde_json::from_str(&scarab_server::openapi_json()).unwrap();
@@ -44,14 +44,10 @@ fn openapi_document_has_no_deployment_record() {
         "/v1/orgs/{org}/environments/{env}/deployments/{id}",
         "/v1/orgs/{org}/environments/{env}/deployment-targets",
         "/v1/orgs/{org}/plugins/{name}/unmapped-groupings",
+        "/v1/repos/{org}/{repo}/environments/{name}/deployments",
     ] {
         assert!(!paths.contains_key(p), "{p} is still documented");
     }
-    assert_eq!(
-        paths["/v1/repos/{org}/{repo}/environments/{name}/deployments"]["get"]["tags"],
-        serde_json::json!(["Environments"]),
-        "the legacy approval history stays with Environments"
-    );
     let schemas = doc["components"]["schemas"].as_object().unwrap();
     for s in [
         "DeploymentDto",

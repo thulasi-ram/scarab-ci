@@ -200,10 +200,10 @@ pub struct AppState {
     /// once; written by [`flush_api_token_uses`].
     pub api_token_uses: Arc<ApiTokenUses>,
     /// The legacy approval history (ADR-0037, ADR-0070 §1):
-    /// `record_deployment` on every gate release and its read endpoint.
-    /// Admission never reads it since ADR-0071 — see
+    /// `record_deployment` on every gate release. No endpoint reads it, and
+    /// admission never reads it since ADR-0071 — see
     /// [`environment_governance`](AppState::environment_governance). `None`
-    /// disables the history endpoint.
+    /// writes no history.
     pub approval_history: Option<Arc<dyn scarab_project::ApprovalHistoryStore>>,
     /// Org-level Environment governance (ADR-0071 §2, §3, §8): what admits
     /// and governs every Deploy Run — eligibility, effective protection,
@@ -11425,27 +11425,6 @@ async fn delete_environment(
     Err(per_repo_environment_writes_gone(&org, &repo, &name))
 }
 
-/// Legacy approval history (ADR-0070 §1): who approved which run into this
-/// environment, most recent first (ADR-0037). Despite the path, nothing here is
-/// a Deployment — a row is written when a manual gate is approved and records no
-/// target, version or outcome. Kept readable, read-only;
-/// admission happens in the run's gate-approval path. Read cap.
-#[utoipa::path(get, path = "/v1/repos/{org}/{repo}/environments/{name}/deployments", params(("org" = String, Path, description = "repo owner"), ("repo" = String, Path, description = "repo name"), ("name" = String, Path, description = "Environment name")), summary = "Legacy approval history (ADR-0070 §1)", responses((status = 200, description = "most recent first")))]
-async fn list_deployments(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-    Path((org, repo, name)): Path<(String, String, String)>,
-) -> Result<Json<Vec<scarab_project::Deployment>>, ApiError> {
-    let scope = rbac_scope(&org, Some(&repo));
-    authorize_scoped(&st, &headers, Action::Read, Some(&scope)).await?;
-    let store = st.approval_history.as_ref().ok_or(ApiError::NotFound)?;
-    let history = store
-        .deployments(&org, &repo, &name)
-        .await
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    Ok(Json(history))
-}
-
 /// The secret coverage matrix for a repo (ADR-0037 D, editable since ADR-0060):
 /// each key's effective status in the **repo default** column and in each
 /// environment column — `set` (a value at exactly that scope), `inherited`
@@ -13755,7 +13734,6 @@ impl utoipa::Modify for StepUpResponses {
         get_environment,
         list_environments,
         delete_environment,
-        list_deployments,
         org_environments::list_org_environments,
         org_environments::get_org_environment,
         org_environments::put_org_environment,

@@ -18,6 +18,12 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Breaking changes
+
+- **`GET /v1/repos/{org}/{repo}/environments/{name}/deployments` is removed** and answers 404.
+  It listed who approved which Run into an Environment, and the web UI no longer reads it.
+  The server still writes a record when an approval releases a gate; no API returns them.
+
 ## [0.3.0] - 2026-11-09
 
 Adds libraries and plugin gates through `invoke`, a policy engine for Run creation, and

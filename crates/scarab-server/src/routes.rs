@@ -344,10 +344,6 @@ pub(crate) fn governed_routes() -> Routes {
             &ops::ENV_LEGACY_DELETE,
             delete_environment,
         )
-        .get(
-            "/v1/repos/{org}/{repo}/environments/{name}/deployments",
-            list_deployments,
-        )
         .get("/v1/orgs/{org}/environments", oe::list_org_environments)
         .get("/v1/orgs/{org}/secrets/orphaned", oe::list_orphaned_secrets)
         .put(

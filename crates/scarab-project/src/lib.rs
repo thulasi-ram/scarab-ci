@@ -392,9 +392,10 @@ pub enum ProjectError {
 
 /// Durable store for the **legacy approval history** (ADR-0024, ADR-0037,
 /// ADR-0070 §1): a [`Deployment`] record for each Environment approval gate
-/// wait whose approvals met the rules, written on every gate release and
-/// read back by `GET /v1/repos/{org}/{repo}/environments/{name}/deployments`.
-/// Despite the record's name it holds no target, version or outcome. Keyed
+/// wait whose approvals met the rules, written on every gate release. No API
+/// reads it back; tests read it with `scarab-testkit`'s
+/// `legacy_environments::approval_history`. Despite the record's name it
+/// holds no target, version or outcome. Keyed
 /// by the owning [`Project`]'s natural key `(org, project)` (ADR-0046): the
 /// project name is its repo's forge name (1:1 in v1), the key a run knows
 /// from its trigger (ADR-0037).
@@ -414,14 +415,6 @@ pub trait ApprovalHistoryStore: Send + Sync {
         deployment: &Deployment,
         wait: Option<&ApprovalWait>,
     ) -> Result<(), ProjectError>;
-
-    /// The deployment history for an environment, most recent first.
-    async fn deployments(
-        &self,
-        org: &str,
-        project: &str,
-        environment: &str,
-    ) -> Result<Vec<Deployment>, ProjectError>;
 }
 
 /// Which column of a Project's secret-coverage view a marker sits in: one of its

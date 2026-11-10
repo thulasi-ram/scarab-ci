@@ -240,12 +240,6 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
         "environment.legacy_delete",
         "NG",
     ),
-    (
-        "GET",
-        "/v1/repos/{org}/{repo}/environments/{name}/deployments",
-        "read",
-        "READ",
-    ),
     ("GET", "/v1/orgs/{org}/environments", "read", "READ"),
     ("GET", "/v1/orgs/{org}/secrets/orphaned", "read", "READ"),
     (

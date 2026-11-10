@@ -6277,57 +6277,6 @@
         ]
       }
     },
-    "/v1/repos/{org}/{repo}/environments/{name}/deployments": {
-      "get": {
-        "tags": [
-          "Environments"
-        ],
-        "summary": "Legacy approval history (ADR-0070 §1)",
-        "operationId": "list_deployments",
-        "parameters": [
-          {
-            "name": "org",
-            "in": "path",
-            "description": "repo owner",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "repo",
-            "in": "path",
-            "description": "repo name",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "name",
-            "in": "path",
-            "description": "Environment name",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "most recent first"
-          }
-        },
-        "security": [
-          {
-            "apiToken": []
-          },
-          {
-            "sessionCookie": []
-          }
-        ]
-      }
-    },
     "/v1/repos/{org}/{repo}/pipelines": {
       "get": {
         "tags": [

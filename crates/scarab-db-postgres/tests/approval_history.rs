@@ -10,6 +10,7 @@ mod common;
 use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
 use scarab_project::{ApprovalHistoryStore, ApprovalWait, Deployment};
+use scarab_testkit::legacy_environments::approval_history;
 
 fn record(at: i64, approved_by: &[&str]) -> Deployment {
     Deployment {
@@ -38,7 +39,11 @@ async fn the_history_holds_one_record_per_gate_wait() {
     };
     let pg = PostgresDb::with_pool(tdb.pool.clone());
     pg.migrate().await.unwrap();
-    let count = || async { pg.deployments("acme", "web", "prod").await.unwrap().len() };
+    let count = || async {
+        approval_history(&tdb.pool, "acme", "web", "prod")
+            .await
+            .len()
+    };
 
     // The race: both approvals saw the rules unmet, both write for wait a1.
     pg.record_deployment(&record(10, &["amy", "bob"]), Some(&wait("a1")))

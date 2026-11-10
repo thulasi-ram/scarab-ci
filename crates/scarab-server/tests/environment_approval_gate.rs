@@ -37,6 +37,7 @@ use scarab_server::{
     dispatch_run, router, AppState, DispatchError, DispatchKind, LogService,
     SecretInjectingExecutor,
 };
+use scarab_testkit::legacy_environments::approval_history;
 use scarab_testkit::{
     FakeClock, FakeExecutor, FakeForge, FakeSecrets, InMemoryDb, InMemoryEnvironmentGovernance,
     InMemoryObjectStore,
@@ -782,7 +783,7 @@ async fn a_timer_released_gate_has_its_deployment_record() {
         Some(pg.clone() as Arc<dyn ApprovalHistoryStore>),
     )
     .await;
-    let history = || pg.deployments("acme", "web", "prod");
+    let history = || approval_history(&tdb.pool, "acme", "web", "prod");
 
     let run = s.dispatch(GATED).await.expect("admitted");
     s.tick(&run, 6).await;
@@ -795,7 +796,7 @@ async fn a_timer_released_gate_has_its_deployment_record() {
     s.tick(&run, 4).await;
     assert_eq!(s.status(&run, "approve").await, StepStatus::Succeeded);
     assert_eq!(releases(&s, &run, "approve").await, 1);
-    let records = history().await.unwrap();
+    let records = history().await;
     assert_eq!(records.len(), 1, "{records:?}");
     assert_eq!(records[0].run, run.0);
     assert_eq!(records[0].approved_by, vec![ME.to_string()]);
@@ -804,7 +805,7 @@ async fn a_timer_released_gate_has_its_deployment_record() {
     // No timer: the approval releases the gate, and one record is written.
     s.set_protection(rules(&[ME])).await;
     let at_once = approved(&s).await;
-    let records = history().await.unwrap();
+    let records = history().await;
     assert_eq!(records.len(), 2, "{records:?}");
     assert_eq!(records[0].run, at_once.0);
 

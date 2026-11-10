@@ -36,7 +36,7 @@ use scarab_project::{
 };
 use scarab_secrets::{SecretProvider, SecretScope};
 use scarab_server::{router, AppState, LogService};
-use scarab_testkit::legacy_environments::put_legacy_project_environment;
+use scarab_testkit::legacy_environments::{approval_history, put_legacy_project_environment};
 use scarab_testkit::{FakeClock, FakeExecutor, FakeSecrets, InMemoryObjectStore};
 
 fn rules(approvers: &[&str], allowed_refs: &[&str]) -> ProtectionRules {
@@ -307,17 +307,6 @@ async fn environment_management_crud_over_repo_scoped_routes() {
             .collect()
     };
     assert_eq!(names(&body), vec!["prod", "staging"]);
-
-    // Deployment (approval) history starts empty — the legacy read stays.
-    let (status, body) = send(
-        &app,
-        "GET",
-        "/v1/repos/acme/web/environments/prod/deployments",
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(json_of(&body), serde_json::json!([]));
 
     // The privileges the per-repo rules carried are an org admin's grant
     // now; an entry that can never match an image is refused.
@@ -782,10 +771,8 @@ async fn deploy_gate_releases_and_records_history_only_when_admitted() {
         Some(RunStatus::Suspended),
         "unmet approver → gate stays closed"
     );
-    assert!(pg
-        .deployments("acme", "web", "prod")
+    assert!(approval_history(&tdb.pool, "acme", "web", "prod")
         .await
-        .unwrap()
         .is_empty());
 
     // --- Case 2: approver requirement satisfied by the anonymous approver ---
@@ -818,7 +805,7 @@ async fn deploy_gate_releases_and_records_history_only_when_admitted() {
             .status,
         StepStatus::Succeeded
     );
-    let history = pg.deployments("acme", "web", "prod").await.unwrap();
+    let history = approval_history(&tdb.pool, "acme", "web", "prod").await;
     assert_eq!(history.len(), 1, "the admitted deploy is recorded once");
     assert_eq!(history[0].git_ref, "refs/heads/main");
     assert_eq!(history[0].approved_by, vec!["anonymous".to_string()]);
