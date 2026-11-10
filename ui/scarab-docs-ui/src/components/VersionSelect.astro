@@ -1,8 +1,14 @@
 ---
-// The docs version dropdown. Its options come from /scarab-ci/versions.json at
-// page load, not from the build: old lines are never rebuilt, yet must still
-// list every newer one. Hidden until the manifest loads and names this build's
-// line, so a local build (no version, no manifest) shows nothing.
+// The docs version menu: a button naming this build's line, opening a list of
+// links, one per line. Versions are places, so they are links, not a form
+// control. The list comes from /scarab-ci/versions.json at page load, not from
+// the build: old lines are never rebuilt, yet must still list every newer one.
+// Hidden until the manifest loads and names this build's line, so a local
+// build (no version, no manifest) shows nothing.
+//
+// Keyboard: Enter, Space or ArrowDown on the button opens the list and moves
+// to this line's link; ArrowUp/ArrowDown/Home/End move between links; Escape
+// closes it and puts the focus back on the button; Tab out closes it.
 import { DOCS_BASE, DOCS_ROOT, DOCS_VERSION } from '../lib/docs-env.mjs';
 ---
 
@@ -14,40 +20,116 @@ import { DOCS_BASE, DOCS_ROOT, DOCS_VERSION } from '../lib/docs-env.mjs';
       data-version={DOCS_VERSION}
       hidden
     >
-      <select aria-label="Documentation version" />
+      <button
+        type="button"
+        class="vs-button"
+        aria-expanded="false"
+        aria-controls="vs-list"
+        aria-label={`Documentation version: ${DOCS_VERSION}`}
+      >
+        <span class="vs-current">{DOCS_VERSION}</span>
+        <svg class="vs-caret" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
+          <path d="m6 9 6 6 6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
+      </button>
+      <ul id="vs-list" class="vs-list" aria-label="Documentation versions" hidden />
     </scarab-version-select>
   )
 }
 
 <script>
-  import { loadManifest, switchTo } from '../lib/versions-client';
+  import { baseOf, loadManifest, switchTo } from '../lib/versions-client';
 
   customElements.define(
     'scarab-version-select',
     class extends HTMLElement {
       async connectedCallback() {
         const { root = '', base = '', version = '' } = this.dataset;
-        const select = this.querySelector('select');
+        const button = this.querySelector('button');
+        const list = this.querySelector('ul');
         const manifest = await loadManifest(root);
-        if (!select || !manifest?.versions.some((v) => v.version === version)) return;
+        if (!button || !list || !manifest?.versions.some((v) => v.version === version)) return;
+
+        // The same page in each line; a click checks it exists there first.
+        const rest = location.pathname.startsWith(base) ? location.pathname.slice(base.length) : '';
         for (const { version: v } of manifest.versions) {
-          const label = v === manifest.latest ? `${v} (latest)` : v;
-          select.add(new Option(label, v, false, v === version));
+          const a = document.createElement('a');
+          a.href = baseOf(root, manifest, v) + rest;
+          a.textContent = v === manifest.latest ? `${v} (latest)` : v;
+          if (v === version) a.setAttribute('aria-current', 'page');
+          a.addEventListener('click', (e) => {
+            if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return;
+            e.preventDefault();
+            if (v === version) return close(true);
+            void switchTo(root, base, manifest, v);
+          });
+          const li = document.createElement('li');
+          li.append(a);
+          list.append(li);
         }
+        const links = () => [...list.querySelectorAll('a')];
+
+        const open = () => {
+          list.hidden = false;
+          button.setAttribute('aria-expanded', 'true');
+          (list.querySelector<HTMLAnchorElement>('a[aria-current]') ?? links()[0])?.focus();
+        };
+        const close = (refocus: boolean) => {
+          if (list.hidden) return;
+          list.hidden = true;
+          button.setAttribute('aria-expanded', 'false');
+          if (refocus) button.focus();
+        };
+
+        button.addEventListener('click', () => (list.hidden ? open() : close(false)));
+        button.addEventListener('keydown', (e) => {
+          if (e.key === 'ArrowDown' && list.hidden) {
+            e.preventDefault();
+            open();
+          }
+        });
+        list.addEventListener('keydown', (e) => {
+          const all = links();
+          const i = all.indexOf(document.activeElement as HTMLAnchorElement);
+          const to = (n: number) => {
+            e.preventDefault();
+            all[(n + all.length) % all.length]?.focus();
+          };
+          if (e.key === 'ArrowDown') to(i + 1);
+          else if (e.key === 'ArrowUp') to(i - 1);
+          else if (e.key === 'Home') to(0);
+          else if (e.key === 'End') to(all.length - 1);
+          else if (e.key === 'Escape') {
+            e.preventDefault();
+            close(true);
+          }
+        });
+        // Tab out, or a click anywhere else, closes it.
+        this.addEventListener('focusout', (e) => {
+          if (!this.contains(e.relatedTarget as Node | null)) close(false);
+        });
+        document.addEventListener('click', (e) => {
+          if (!this.contains(e.target as Node)) close(false);
+        });
+
         this.hidden = false;
-        select.addEventListener('change', () => switchTo(root, base, manifest, select.value));
       }
     },
   );
 </script>
 
 <style>
+  /* The links are made at page load, so their rules are :global. */
   scarab-version-select:not([hidden]) {
+    position: relative;
     display: flex;
     align-items: center;
     margin-inline-start: 0.5rem;
   }
-  select {
+  .vs-button {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
     height: 2rem;
     padding-inline: 0.5rem;
     border: 1px solid var(--border);
@@ -58,7 +140,60 @@ import { DOCS_BASE, DOCS_ROOT, DOCS_VERSION } from '../lib/docs-env.mjs';
     font-size: 0.8125rem;
     cursor: pointer;
   }
-  select:hover {
+  .vs-button:hover,
+  .vs-button[aria-expanded='true'] {
     background-color: color-mix(in oklab, var(--accent) 80%, transparent);
+  }
+  .vs-button:focus-visible {
+    outline: 2px solid var(--ring, var(--sl-color-accent));
+    outline-offset: 2px;
+  }
+  .vs-list :global(a:focus-visible) {
+    outline: 2px solid var(--ring, var(--sl-color-accent));
+    outline-offset: -2px;
+  }
+  .vs-caret {
+    color: var(--muted-foreground, currentColor);
+  }
+  .vs-list {
+    position: absolute;
+    top: calc(100% + 4px);
+    right: 0;
+    z-index: 50;
+    min-width: 9rem;
+    max-height: 60vh;
+    overflow-y: auto;
+    margin: 0;
+    padding: 0.25rem;
+    list-style: none;
+    background-color: var(--popover-background, var(--sl-color-bg));
+    color: var(--popover-foreground, var(--foreground));
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow-md);
+  }
+  .vs-list[hidden] {
+    display: none;
+  }
+  .vs-list :global(li) {
+    margin: 0;
+  }
+  .vs-list :global(a) {
+    display: block;
+    padding: 0.375rem 0.5rem;
+    border-radius: calc(var(--radius) * 0.75);
+    color: inherit;
+    font-family: var(--sl-font-mono);
+    font-size: 0.8125rem;
+    text-decoration: none;
+    white-space: nowrap;
+  }
+  .vs-list :global(a:hover),
+  .vs-list :global(a:focus) {
+    background-color: var(--accent);
+    color: var(--accent-foreground, inherit);
+  }
+  .vs-list :global(a[aria-current='page']) {
+    font-weight: 600;
   }
 </style>
