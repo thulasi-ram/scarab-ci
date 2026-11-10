@@ -100,6 +100,7 @@ pub mod oauth;
 pub mod oidc;
 /// ADR-0071: the minimal org-level Environment — its admin/read API.
 pub mod org_environments;
+pub mod people;
 /// ADR-0072: PluginInstallations — fetch a manifest to review, install,
 /// uninstall and the kill switch.
 pub mod plugin_gates;
@@ -110,7 +111,6 @@ pub mod plugins;
 /// ADR-0075: the Policy API — org Policies, Project typed settings, the
 /// decision logs and the policy test API.
 pub mod policies;
-pub mod people;
 mod policy_checkpoints;
 mod refused_runs;
 pub mod retention;
@@ -797,7 +797,9 @@ impl AppState {
     /// 3. else the default — a bare id is the `unqualified_ids` provider's.
     pub async fn login_provider_for(&self, subject: &str) -> Option<String> {
         let configured = |id: &str| self.oauth_providers.iter().any(|p| p.provider_id() == id);
-        let prefix = subject
+        // The prefix is the handle's (ADR-0080): an id carries none.
+        let handle = self.people([subject]).await.handle(subject);
+        let prefix = handle
             .split_once(':')
             .map(|(p, _)| p)
             .filter(|p| configured(p));
@@ -1178,6 +1180,17 @@ pub struct SnapshotRetentionDto {
     /// When it was pinned, epoch millis.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pinned_at: Option<i64>,
+}
+
+impl people::ShowsPeople for SnapshotRetentionDto {
+    fn refs(&self) -> Vec<&str> {
+        self.pinned_by.as_deref().into_iter().collect()
+    }
+    fn show(&mut self, people: &people::People) {
+        if let Some(by) = &mut self.pinned_by {
+            people.show_one(by);
+        }
+    }
 }
 
 /// Build the retention promise for a run from its durable facts plus the
@@ -2599,8 +2612,11 @@ async fn get_run(
         .run_snapshot_retention(&run)
         .await?
         .ok_or(ApiError::NotFound)?;
-    let snapshot_retention =
-        snapshot_retention_dto(&retention, st.snapshot_retention_days, st.clock.now().await);
+    let snapshot_retention = people::shown(
+        st.identities.as_deref(),
+        snapshot_retention_dto(&retention, st.snapshot_retention_days, st.clock.now().await),
+    )
+    .await;
     // Enrich each step with its sidecar services + shared-service opt-ins (ADR-
     // 0058) from the stored spec, so the FE can render sidecar nodes and `uses`
     // edges and address per-sidecar logs by index. A step with no stored spec
@@ -2684,7 +2700,8 @@ async fn get_events(
     if st.db.run_status(&run).await?.is_none() {
         return Err(ApiError::NotFound);
     }
-    let events = st.db.events(&run).await?;
+    // Each person by handle, whichever form the event stored (ADR-0080 §3).
+    let events = people::shown(st.identities.as_deref(), st.db.events(&run).await?).await;
     let items: Vec<Result<Event, Infallible>> = events
         .into_iter()
         .map(|e| {
@@ -3441,11 +3458,8 @@ async fn current_snapshot_retention(
         .run_snapshot_retention(run)
         .await?
         .ok_or(ApiError::NotFound)?;
-    Ok(Json(snapshot_retention_dto(
-        &r,
-        st.snapshot_retention_days,
-        st.clock.now().await,
-    )))
+    let dto = snapshot_retention_dto(&r, st.snapshot_retention_days, st.clock.now().await);
+    Ok(Json(people::shown(st.identities.as_deref(), dto).await))
 }
 
 /// Cancel a run (ADR-0054): drive its non-terminal steps and the run to
@@ -3517,8 +3531,12 @@ pub struct ProjectDto {
 /// The authenticated principal (ADR-0049) — powers the UI's identity menu.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct MeResponse {
-    /// Stable, forge-agnostic identity subject.
+    /// The Principal's id (ADR-0080): stable, random, never shown as a name.
     pub subject: String,
+    /// The same id, under the name every person response uses.
+    pub id: String,
+    /// The Principal's handle (`github:alice`): what people read and type.
+    pub handle: String,
     /// Human display name, when the identity provides one.
     pub display_name: Option<String>,
     /// The principal's Scarab-native roles (e.g. `["Owner"]`).
@@ -3588,6 +3606,8 @@ async fn me(State(st): State<AppState>, headers: HeaderMap) -> Result<Json<MeRes
     // owner's C1 bootstrap and nothing else — so an API token never reports an
     // administrable org it could not actually act on.
     Ok(Json(MeResponse {
+        id: caller.principal.subject.clone(),
+        handle: caller.principal.handle().to_string(),
         subject: caller.principal.subject,
         display_name: caller.principal.display_name,
         roles: caller
@@ -4759,13 +4779,15 @@ impl ActorLinks<'_> {
         else {
             return Ok(None);
         };
-        Ok(scarab_identity::resolve_principal_record(identities, &pinned)
-            .await
-            .map_err(|e| store_err("identities", e.to_string()))?
-            .map(|p| policy_checkpoints::Named {
-                id: p.id,
-                handle: p.handle,
-            }))
+        Ok(
+            scarab_identity::resolve_principal_record(identities, &pinned)
+                .await
+                .map_err(|e| store_err("identities", e.to_string()))?
+                .map(|p| policy_checkpoints::Named {
+                    id: p.id,
+                    handle: p.handle,
+                }),
+        )
     }
 }
 
@@ -9518,14 +9540,18 @@ pub struct MintedTokenDto {
 pub struct ApiTokenDto {
     pub id: String,
     pub name: String,
-    /// The principal who holds the token and whose live authority bounds it.
+    /// The id of the Principal who holds the token and whose live authority
+    /// bounds it (ADR-0080).
     pub owner_subject: String,
+    /// That Principal, as people read it.
+    pub owner: people::PersonDto,
     pub org: String,
     /// `None` for an org-scoped token.
     pub project: Option<String>,
     /// The granted ceiling, not the effective role — what the token can do
     /// depends on what its owner holds at the moment of each request.
     pub role: String,
+    /// Who minted it: a Principal's handle.
     pub created_by: String,
     /// Unix-ms.
     pub created_at: i64,
@@ -9551,6 +9577,11 @@ impl From<scarab_identity::ApiToken> for ApiTokenDto {
         Self {
             id: t.id,
             name: t.name,
+            owner: people::PersonDto {
+                id: t.owner_subject.clone(),
+                handle: t.owner_subject.clone(),
+                display_name: None,
+            },
             owner_subject: t.owner_subject,
             org,
             project,
@@ -9562,6 +9593,25 @@ impl From<scarab_identity::ApiToken> for ApiTokenDto {
             use_count: t.use_count,
             revoked_at: t.revoked_at,
         }
+    }
+}
+
+impl people::ShowsPeople for ApiTokenDto {
+    fn refs(&self) -> Vec<&str> {
+        vec![&self.owner_subject, &self.created_by]
+    }
+    fn show(&mut self, people: &people::People) {
+        self.owner = people.person(&self.owner_subject);
+        people.show_one(&mut self.created_by);
+    }
+}
+
+impl people::ShowsPeople for MintedTokenDto {
+    fn refs(&self) -> Vec<&str> {
+        self.record.refs()
+    }
+    fn show(&mut self, people: &people::People) {
+        self.record.show(people);
     }
 }
 
@@ -9746,10 +9796,16 @@ async fn mint_personal_token(
 
     Ok((
         StatusCode::CREATED,
-        Json(MintedTokenDto {
-            token: plaintext,
-            record: ApiTokenDto::from(token),
-        }),
+        Json(
+            people::shown(
+                st.identities.as_deref(),
+                MintedTokenDto {
+                    token: plaintext,
+                    record: ApiTokenDto::from(token),
+                },
+            )
+            .await,
+        ),
     )
         .into_response())
 }
@@ -9837,7 +9893,8 @@ async fn list_api_tokens(
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     sort_api_tokens(&mut tokens, q.sort.unwrap_or_default());
-    Ok(Json(tokens.into_iter().map(ApiTokenDto::from).collect()))
+    let dtos: Vec<ApiTokenDto> = tokens.into_iter().map(ApiTokenDto::from).collect();
+    Ok(Json(people::shown(st.identities.as_deref(), dtos).await))
 }
 
 /// The tokens the caller holds, in every org, newest first. A token caller
@@ -9863,13 +9920,12 @@ async fn list_own_api_tokens(
         .list_owned(&caller.principal.subject)
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    Ok(Json(
-        tokens
-            .into_iter()
-            .filter(|t| caller_sees_own_token(&caller, t))
-            .map(ApiTokenDto::from)
-            .collect(),
-    ))
+    let dtos: Vec<ApiTokenDto> = tokens
+        .into_iter()
+        .filter(|t| caller_sees_own_token(&caller, t))
+        .map(ApiTokenDto::from)
+        .collect();
+    Ok(Json(people::shown(st.identities.as_deref(), dtos).await))
 }
 
 /// May `caller` see and revoke `token` through `/v1/me/tokens`? Only its
@@ -10359,10 +10415,16 @@ async fn authenticate_api_token(
         }
     }
     let roles = token_owner_roles(st, &token.owner_subject).await;
+    // The owner's handle: what a dispatch through the token records as its
+    // Actor (ADR-0080 §4).
+    let handle = st
+        .people([token.owner_subject.as_str()])
+        .await
+        .handle(&token.owner_subject);
     Ok(Caller {
         principal: Principal {
             subject: token.owner_subject.clone(),
-            handle: String::new(),
+            handle,
             display_name: Some(format!("API token \u{201c}{}\u{201d}", token.name)),
             roles,
         },
@@ -11606,7 +11668,8 @@ async fn get_environment(
         .map_err(org_environments::org_environment_api_error)?
         .filter(|g| g.eligible || g.overlay.is_some() || g.privilege_grant.is_some())
         .ok_or(ApiError::NotFound)?;
-    Ok(Json((&governance).into()))
+    let dto: org_environments::ProjectEnvironmentDto = (&governance).into();
+    Ok(Json(people::shown(st.identities.as_deref(), dto).await))
 }
 
 /// The Environments this repo's Project may deploy into or holds an overlay
@@ -11628,7 +11691,9 @@ async fn list_environments(
         .project_environment_governance(&org, &repo)
         .await
         .map_err(org_environments::org_environment_api_error)?;
-    Ok(Json(governance.iter().map(Into::into).collect()))
+    let dtos: Vec<org_environments::ProjectEnvironmentDto> =
+        governance.iter().map(Into::into).collect();
+    Ok(Json(people::shown(st.identities.as_deref(), dtos).await))
 }
 
 /// **Retired** (ADR-0071 §10), like [`put_environment`]: always 410 with a

@@ -62,7 +62,7 @@ pub struct OrgEnvironmentDto {
     pub created_at: i64,
     /// Unix-ms.
     pub updated_at: i64,
-    /// Who last wrote it (a Principal subject).
+    /// Who last wrote it (a Principal's handle).
     pub updated_by: String,
 }
 
@@ -104,8 +104,9 @@ pub struct PutOrgEnvironmentRequest {
 /// Project's overlay (ADR-0071 §1, §3).
 #[derive(Debug, Serialize, ToSchema)]
 pub struct EnvironmentProtectionRulesDto {
-    /// Principal ids. Every one must approve (AND), unless the baseline's
-    /// `approval_gate.required_approvals` says how many of its own must.
+    /// Principal handles (stored as ids, ADR-0080). Every one must approve
+    /// (AND), unless the baseline's `approval_gate.required_approvals` says
+    /// how many of its own must.
     pub approvers: Vec<String>,
     /// Ref globs a deploy's symbolic ref must match; empty = any ref.
     pub allowed_refs: Vec<String>,
@@ -356,7 +357,10 @@ pub(crate) async fn list_org_environments(
         .list_org_environments(&org)
         .await
         .map_err(org_environment_api_error)?;
-    Ok(Json(environments.iter().map(Into::into).collect()))
+    let dtos: Vec<OrgEnvironmentDto> = environments.iter().map(Into::into).collect();
+    Ok(Json(
+        crate::people::shown(st.identities.as_deref(), dtos).await,
+    ))
 }
 
 /// One Environment. Read on the Org.
@@ -389,7 +393,11 @@ pub(crate) async fn get_org_environment(
         .await
         .map_err(org_environment_api_error)?
         .ok_or(ApiError::NotFound)?;
-    Ok((etag_header(&environment), Json((&environment).into())))
+    let dto: OrgEnvironmentDto = (&environment).into();
+    Ok((
+        etag_header(&environment),
+        Json(crate::people::shown(st.identities.as_deref(), dto).await),
+    ))
 }
 
 /// The `ETag` response header for `env`.
@@ -529,7 +537,11 @@ pub(crate) async fn put_org_environment(
     .await;
     release_claim(claim).await;
     let stored = stored?;
-    Ok((etag_header(&stored), Json((&stored).into())))
+    let dto: OrgEnvironmentDto = (&stored).into();
+    Ok((
+        etag_header(&stored),
+        Json(crate::people::shown(st.identities.as_deref(), dto).await),
+    ))
 }
 
 /// Free a handler's claim on an Environment name, and wait until it is
@@ -1278,11 +1290,17 @@ async fn duplicate_org_environment_holding(
     };
     Ok((
         StatusCode::CREATED,
-        Json(DuplicateOrgEnvironmentResponse {
-            environment: (&created).into(),
-            copied,
-            not_copied,
-        }),
+        Json(
+            crate::people::shown(
+                st.identities.as_deref(),
+                DuplicateOrgEnvironmentResponse {
+                    environment: (&created).into(),
+                    copied,
+                    not_copied,
+                },
+            )
+            .await,
+        ),
     ))
 }
 
@@ -1472,8 +1490,9 @@ async fn step_up_unless_tightening(
 #[derive(Debug, Default, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PutEnvironmentProtectionRequest {
-    /// Principal ids (ADR-0069): each must name an existing Principal; a
-    /// merged id is stored as the Principal it now is. All must approve.
+    /// Principal handles or ids (ADR-0069, ADR-0080): each must name an
+    /// existing Principal; a merged one is stored as the Principal it now is.
+    /// All must approve.
     #[serde(default)]
     pub approvers: Vec<String>,
     /// Ref globs (`refs/heads/main`, `refs/tags/*`); empty = any ref.
@@ -1644,6 +1663,19 @@ async fn checked_rules_with_gate(
     })
 }
 
+/// `rules` with its approvers shown by handle: what a loosening is judged
+/// over, so its words name people as they are typed. Handles are unique, so
+/// the judgement is the same as over ids.
+fn readable_rules(
+    people: &crate::people::People,
+    rules: &EnvironmentProtectionRules,
+) -> EnvironmentProtectionRules {
+    EnvironmentProtectionRules {
+        approvers: people.handles(&rules.approvers),
+        ..rules.clone()
+    }
+}
+
 /// A wait timer is a minimum wait on the Environment approval gate
 /// (ADR-0078 §4), so it needs approvers: refuse a non-zero one where the
 /// effective approvers (`approvers`) are empty. Stored data from before this
@@ -1691,7 +1723,10 @@ pub(crate) async fn get_environment_protection(
         .await
         .map_err(org_environment_api_error)?
         .ok_or(ApiError::NotFound)?;
-    Ok(Json((&environment.protection).into()))
+    let dto: EnvironmentProtectionRulesDto = (&environment.protection).into();
+    Ok(Json(
+        crate::people::shown(st.identities.as_deref(), dto).await,
+    ))
 }
 
 /// Replace an Environment's baseline. Administer on the Org (ADR-0071 §7).
@@ -1743,10 +1778,25 @@ pub(crate) async fn put_environment_protection(
     refuse_wait_timer_without_approvers(rules.wait_timer_s, &rules.approvers)?;
     // ADR-0073 §3 rule E1: loosening the baseline is a crown jewel.
     let current = stored_environment(store, &org, &env).await?;
+    // Judged over handles, so the person confirming reads "removes approver
+    // `github:amy`" and not an id (ADR-0080 §3).
+    let people = st
+        .people(
+            current
+                .protection
+                .approvers
+                .iter()
+                .chain(&rules.approvers)
+                .map(String::as_str),
+        )
+        .await;
     step_up_unless_tightening(
         &st,
         &guard,
-        protection_loosenings(&current.protection, &rules),
+        protection_loosenings(
+            &readable_rules(&people, &current.protection),
+            &readable_rules(&people, &rules),
+        ),
     )
     .await?;
     let now = st.clock.now().await.0;
@@ -1761,7 +1811,10 @@ pub(crate) async fn put_environment_protection(
         )
         .await
         .map_err(org_environment_api_error)?;
-    Ok(Json((&stored).into()))
+    let dto: OrgEnvironmentDto = (&stored).into();
+    Ok(Json(
+        crate::people::shown(st.identities.as_deref(), dto).await,
+    ))
 }
 
 /// Every Project holding an overlay or privilege grant in an Environment,
@@ -1791,7 +1844,10 @@ pub(crate) async fn list_environment_projects(
         .environment_projects(&org, &env)
         .await
         .map_err(org_environment_api_error)?;
-    Ok(Json(records.iter().map(Into::into).collect()))
+    let dtos: Vec<EnvironmentProjectDto> = records.iter().map(Into::into).collect();
+    Ok(Json(
+        crate::people::shown(st.identities.as_deref(), dtos).await,
+    ))
 }
 
 /// One Project's overlay in an Environment. Read on the Project (an org
@@ -1824,7 +1880,10 @@ pub(crate) async fn get_environment_project_overlay(
         .map_err(org_environment_api_error)?
         .ok_or(ApiError::NotFound)?;
     let overlay = governance.overlay.as_ref().ok_or(ApiError::NotFound)?;
-    Ok(Json(overlay.into()))
+    let dto: EnvironmentProjectOverlayDto = overlay.into();
+    Ok(Json(
+        crate::people::shown(st.identities.as_deref(), dto).await,
+    ))
 }
 
 /// Create or replace one Project's overlay. Administer on that Project — or
@@ -1902,10 +1961,27 @@ pub(crate) async fn put_environment_project_overlay(
     };
     // ADR-0073 §3 rule E1: loosening an overlay
     // (toward the baseline) is a crown jewel; creating one never loosens.
+    let people = st
+        .people(
+            governance
+                .overlay
+                .iter()
+                .flat_map(|o| &o.rules.approvers)
+                .chain(&overlay.rules.approvers)
+                .map(String::as_str),
+        )
+        .await;
+    let readable = |o: &EnvironmentProjectOverlay| EnvironmentProjectOverlay {
+        rules: readable_rules(&people, &o.rules),
+        ..o.clone()
+    };
     step_up_unless_tightening(
         &st,
         &guard,
-        overlay_loosenings(governance.overlay.as_ref(), &overlay),
+        overlay_loosenings(
+            governance.overlay.as_ref().map(readable).as_ref(),
+            &readable(&overlay),
+        ),
     )
     .await?;
     let now = st.clock.now().await.0;
@@ -1918,7 +1994,10 @@ pub(crate) async fn put_environment_project_overlay(
         )
         .await
         .map_err(org_environment_api_error)?;
-    Ok(Json((&overlay).into()))
+    let dto: EnvironmentProjectOverlayDto = (&overlay).into();
+    Ok(Json(
+        crate::people::shown(st.identities.as_deref(), dto).await,
+    ))
 }
 
 /// Remove one Project's overlay: its deploys fall back to the baseline.
@@ -2115,5 +2194,76 @@ pub(crate) async fn delete_environment_project_privilege_grant(
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiError::NotFound)
+    }
+}
+
+impl crate::people::ShowsPeople for EnvironmentProtectionRulesDto {
+    fn refs(&self) -> Vec<&str> {
+        self.approvers.iter().map(String::as_str).collect()
+    }
+    fn show(&mut self, people: &crate::people::People) {
+        people.show_all(&mut self.approvers);
+    }
+}
+
+impl crate::people::ShowsPeople for EffectiveProtectionDto {
+    fn refs(&self) -> Vec<&str> {
+        self.approvers.iter().map(String::as_str).collect()
+    }
+    fn show(&mut self, people: &crate::people::People) {
+        people.show_all(&mut self.approvers);
+    }
+}
+
+impl crate::people::ShowsPeople for OrgEnvironmentDto {
+    fn refs(&self) -> Vec<&str> {
+        let mut refs = self.protection.refs();
+        refs.push(&self.updated_by);
+        refs
+    }
+    fn show(&mut self, people: &crate::people::People) {
+        self.protection.show(people);
+        people.show_one(&mut self.updated_by);
+    }
+}
+
+impl crate::people::ShowsPeople for ProjectEnvironmentDto {
+    fn refs(&self) -> Vec<&str> {
+        let mut refs = self.baseline.refs();
+        refs.extend(self.overlay.refs());
+        refs.extend(self.effective.refs());
+        refs
+    }
+    fn show(&mut self, people: &crate::people::People) {
+        self.baseline.show(people);
+        self.overlay.show(people);
+        self.effective.show(people);
+    }
+}
+
+impl crate::people::ShowsPeople for EnvironmentProjectOverlayDto {
+    fn refs(&self) -> Vec<&str> {
+        self.approvers.iter().map(String::as_str).collect()
+    }
+    fn show(&mut self, people: &crate::people::People) {
+        people.show_all(&mut self.approvers);
+    }
+}
+
+impl crate::people::ShowsPeople for EnvironmentProjectDto {
+    fn refs(&self) -> Vec<&str> {
+        self.overlay.refs()
+    }
+    fn show(&mut self, people: &crate::people::People) {
+        self.overlay.show(people);
+    }
+}
+
+impl crate::people::ShowsPeople for DuplicateOrgEnvironmentResponse {
+    fn refs(&self) -> Vec<&str> {
+        self.environment.refs()
+    }
+    fn show(&mut self, people: &crate::people::People) {
+        self.environment.show(people);
     }
 }

@@ -131,7 +131,7 @@ pub struct PolicyVersionDto {
     #[schema(value_type = Object)]
     pub policy: Policy,
     pub content_hash: String,
-    /// The Principal who saved it.
+    /// The handle of the Principal who saved it.
     pub author: String,
     pub reason: String,
     /// The StepUpConfirmation that approved this save, when one was needed.
@@ -635,7 +635,19 @@ async fn versions_at(
     let store = store(st)?;
     stored_at(store, &scope, id).await?;
     let versions = store.versions(id).await.map_err(store_api_error)?;
-    Ok(Json(versions.into_iter().map(Into::into).collect()))
+    let dtos: Vec<PolicyVersionDto> = versions.into_iter().map(Into::into).collect();
+    Ok(Json(
+        crate::people::shown(st.identities.as_deref(), dtos).await,
+    ))
+}
+
+impl crate::people::ShowsPeople for PolicyVersionDto {
+    fn refs(&self) -> Vec<&str> {
+        vec![&self.author]
+    }
+    fn show(&mut self, people: &crate::people::People) {
+        people.show_one(&mut self.author);
+    }
 }
 
 async fn update_at(

@@ -15,7 +15,6 @@ use scarab_policy::run_create::{self as rc, Org, Project, TriggerKind};
 use scarab_policy::schema::{check_string_lengths, Capped, Timestamp};
 use scarab_policy::store::{DecisionRecord, PolicyStore, StoredPolicy};
 
-
 /// A Principal as a Policy input names it (ADR-0080 §4): the handle a rule's
 /// literals compare, and the id beside it. For a reference that names no
 /// Principal both are the reference.

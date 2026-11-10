@@ -529,6 +529,22 @@ impl PluginStorageRequest {
     }
 }
 
+/// [`installation_dto`] with each person shown by handle (ADR-0080 §3).
+async fn installation_view(st: &AppState, i: &PluginInstallation) -> PluginInstallationDto {
+    let people = st
+        .people(
+            [i.approved_by.as_str()]
+                .into_iter()
+                .chain(i.killed_by.as_deref()),
+        )
+        .await;
+    PluginInstallationDto {
+        approved_by: people.handle(&i.approved_by),
+        killed_by: people.handle_opt(i.killed_by.as_deref()),
+        ..installation_dto(i)
+    }
+}
+
 fn installation_dto(i: &PluginInstallation) -> PluginInstallationDto {
     PluginInstallationDto {
         id: i.id.clone(),
@@ -1103,7 +1119,7 @@ pub(crate) async fn list_plugins(
         .map_err(plugin_store_api_error)?;
     let mut out = Vec::with_capacity(installations.len());
     for installation in &installations {
-        out.push(installation_dto(installation));
+        out.push(installation_view(&st, installation).await);
     }
     Ok(Json(out))
 }
@@ -1206,7 +1222,10 @@ pub(crate) async fn install_plugin(
             other => break other.map_err(plugin_store_api_error)?,
         }
     };
-    Ok((StatusCode::CREATED, Json(installation_dto(&stored))))
+    Ok((
+        StatusCode::CREATED,
+        Json(installation_view(&st, &stored).await),
+    ))
 }
 
 /// One installation. Administer on the Org.
@@ -1235,7 +1254,7 @@ pub(crate) async fn get_plugin(
         .await
         .map_err(plugin_store_api_error)?
         .ok_or(ApiError::NotFound)?;
-    Ok(Json(installation_dto(&installation)))
+    Ok(Json(installation_view(&st, &installation).await))
 }
 
 /// Uninstall. Removes its connections (and their credentials), and retires
@@ -1295,7 +1314,7 @@ async fn set_state(
             "plugin installation killed (ADR-0072 §10)"
         );
     }
-    Ok(Json(installation_dto(&installation)))
+    Ok(Json(installation_view(&st, &installation).await))
 }
 
 /// The kill switch (ADR-0072 §10): from the next request on, nothing the
@@ -1601,7 +1620,7 @@ pub(crate) async fn upgrade_plugin(
         manifest_sha256 = upgraded.installation.manifest_sha256,
         "plugin installation upgraded (ADR-0072 §10)"
     );
-    Ok(Json(installation_dto(&upgraded.installation)))
+    Ok(Json(installation_view(&st, &upgraded.installation).await))
 }
 
 fn describe_storage(s: &PluginStorage) -> String {
@@ -1677,7 +1696,7 @@ pub(crate) async fn put_plugin_storage(
         mount_path = storage.mount_path,
         "plugin installation storage set (ADR-0074 §7)"
     );
-    Ok(Json(installation_dto(&updated)))
+    Ok(Json(installation_view(&st, &updated).await))
 }
 
 /// Remove the installation's storage: the runtime stops mounting the claim.
@@ -1711,7 +1730,7 @@ pub(crate) async fn delete_plugin_storage(
         .map_err(plugin_store_api_error)?
         .ok_or(ApiError::NotFound)?;
     let Some(was) = &current.storage else {
-        return Ok(Json(installation_dto(&current)));
+        return Ok(Json(installation_view(&st, &current).await));
     };
     let updated = store
         .set_installation_storage(&org, &name, None, Some(was))
@@ -1725,7 +1744,7 @@ pub(crate) async fn delete_plugin_storage(
         claim = was.claim,
         "plugin installation storage removed (ADR-0074 §7); the claim is left as it is"
     );
-    Ok(Json(installation_dto(&updated)))
+    Ok(Json(installation_view(&st, &updated).await))
 }
 
 /// An installation in `org` and the manifest slot `slot` of it, or 404.
@@ -1815,13 +1834,14 @@ pub(crate) async fn list_plugin_connections(
         .await
         .map_err(plugin_store_api_error)?;
     let keys = credential_keys(&st).await?;
+    let dtos: Vec<PluginConnectionDto> = installation
+        .manifest
+        .connections
+        .iter()
+        .map(|slot| connection_dto(slot, bound.iter().find(|c| c.slot == slot.name), &keys))
+        .collect();
     Ok(Json(
-        installation
-            .manifest
-            .connections
-            .iter()
-            .map(|slot| connection_dto(slot, bound.iter().find(|c| c.slot == slot.name), &keys))
-            .collect(),
+        crate::people::shown(st.identities.as_deref(), dtos).await,
     ))
 }
 
@@ -1919,7 +1939,21 @@ pub(crate) async fn put_plugin_connection(
         "plugin connection bound (ADR-0072 §5)"
     );
     let keys = credential_keys(&st).await?;
-    Ok(Json(connection_dto(&slot, Some(&connection), &keys)))
+    let dto = connection_dto(&slot, Some(&connection), &keys);
+    Ok(Json(
+        crate::people::shown(st.identities.as_deref(), dto).await,
+    ))
+}
+
+impl crate::people::ShowsPeople for PluginConnectionDto {
+    fn refs(&self) -> Vec<&str> {
+        self.updated_by.as_deref().into_iter().collect()
+    }
+    fn show(&mut self, people: &crate::people::People) {
+        if let Some(by) = &mut self.updated_by {
+            people.show_one(by);
+        }
+    }
 }
 
 /// Unbind a connection slot and delete its credential. The broker answers

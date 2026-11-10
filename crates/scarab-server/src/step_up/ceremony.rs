@@ -78,7 +78,10 @@ impl From<&Passkey> for PasskeyDto {
 /// `GET /v1/me/security`.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct MeSecurityResponse {
+    /// The caller's Principal id (ADR-0080).
     pub subject: String,
+    /// The caller's handle: what to sign in as.
+    pub handle: String,
     /// `enforce` or `off`.
     pub step_up: String,
     /// Holds at least one usable (not clone-flagged) passkey.
@@ -276,6 +279,7 @@ pub(crate) async fn me_security(
     let Some(svc) = st.step_up.service() else {
         return Ok(Json(MeSecurityResponse {
             subject,
+            handle: caller.principal.handle().to_string(),
             step_up: "off".into(),
             has_passkey: false,
             usable_passkey_count: 0,
@@ -311,6 +315,7 @@ pub(crate) async fn me_security(
     };
     Ok(Json(MeSecurityResponse {
         subject,
+        handle: caller.principal.handle().to_string(),
         step_up: "enforce".into(),
         has_passkey,
         usable_passkey_count,

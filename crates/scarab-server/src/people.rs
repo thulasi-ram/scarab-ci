@@ -194,11 +194,108 @@ mod tests {
             "plugin:argocd".to_string(),
         ];
         let people = People::lookup(Some(&store), refs.iter().map(String::as_str)).await;
-        assert_eq!(people.ids(&refs), vec![ada.id.clone(), "plugin:argocd".into()]);
+        assert_eq!(
+            people.ids(&refs),
+            vec![ada.id.clone(), "plugin:argocd".into()]
+        );
         assert_eq!(people.handle(&ada.id), "github:ada");
         assert_eq!(people.handle("plugin:argocd"), "plugin:argocd");
         // No store: every reference is its own id and handle.
         let none = People::lookup(None, refs.iter().map(String::as_str)).await;
         assert_eq!(none.ids(&refs), refs);
+    }
+}
+
+/// A response that names people by stored reference (ids after ADR-0080,
+/// handles before it): [`Self::refs`] lists them, [`Self::show`] swaps each
+/// for the handle people read.
+pub trait ShowsPeople {
+    fn refs(&self) -> Vec<&str>;
+    fn show(&mut self, people: &People);
+}
+
+impl<T: ShowsPeople> ShowsPeople for Vec<T> {
+    fn refs(&self) -> Vec<&str> {
+        self.iter().flat_map(ShowsPeople::refs).collect()
+    }
+    fn show(&mut self, people: &People) {
+        for t in self {
+            t.show(people);
+        }
+    }
+}
+
+impl<T: ShowsPeople> ShowsPeople for Option<T> {
+    fn refs(&self) -> Vec<&str> {
+        self.as_ref().map(ShowsPeople::refs).unwrap_or_default()
+    }
+    fn show(&mut self, people: &People) {
+        if let Some(t) = self {
+            t.show(people);
+        }
+    }
+}
+
+impl People {
+    /// Replace each reference in `list` with its handle.
+    pub fn show_all(&self, list: &mut [String]) {
+        for r in list {
+            *r = self.handle(r);
+        }
+    }
+
+    /// Replace `reference` with its handle.
+    pub fn show_one(&self, reference: &mut String) {
+        *reference = self.handle(reference);
+    }
+}
+
+/// `value` with every person it names shown by handle: one lookup for all
+/// of them.
+pub async fn shown<T: ShowsPeople>(store: Option<&dyn IdentityStore>, mut value: T) -> T {
+    let people = People::lookup(store, value.refs()).await;
+    value.show(&people);
+    value
+}
+
+impl ShowsPeople for scarab_engine::EventKind {
+    fn refs(&self) -> Vec<&str> {
+        use scarab_engine::EventPayload as P;
+        match &self.kind {
+            P::GateApproved { by, .. } => vec![by.as_str()],
+            P::EnvironmentApprovalMet { approvers, .. } => {
+                approvers.iter().map(String::as_str).collect()
+            }
+            P::RunCancelRequested { by, .. }
+            | P::GateResolved { by, .. }
+            | P::RunRerunRequested { by, .. }
+            | P::StepRetryRequested { by, .. }
+            | P::AttemptSuperseded { by, .. }
+            | P::RunSnapshotsPinned { by, .. }
+            | P::RunSnapshotsUnpinned { by, .. } => by.as_deref().into_iter().collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The event as the activity log shows it: each person by handle. The
+    /// stored event is never changed (ADR-0080 §3).
+    fn show(&mut self, people: &People) {
+        use scarab_engine::EventPayload as P;
+        match &mut self.kind {
+            P::GateApproved { by, .. } => people.show_one(by),
+            P::EnvironmentApprovalMet { approvers, .. } => people.show_all(approvers),
+            P::RunCancelRequested { by, .. }
+            | P::GateResolved { by, .. }
+            | P::RunRerunRequested { by, .. }
+            | P::StepRetryRequested { by, .. }
+            | P::AttemptSuperseded { by, .. }
+            | P::RunSnapshotsPinned { by, .. }
+            | P::RunSnapshotsUnpinned { by, .. } => {
+                if let Some(by) = by {
+                    people.show_one(by);
+                }
+            }
+            _ => {}
+        }
     }
 }

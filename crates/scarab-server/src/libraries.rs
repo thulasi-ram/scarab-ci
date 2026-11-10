@@ -108,6 +108,50 @@ pub struct TrustedSourceDto {
     pub trusted_at: i64,
 }
 
+impl crate::people::ShowsPeople for LibraryYankDto {
+    fn refs(&self) -> Vec<&str> {
+        vec![&self.yanked_by]
+    }
+    fn show(&mut self, people: &crate::people::People) {
+        people.show_one(&mut self.yanked_by);
+    }
+}
+
+impl crate::people::ShowsPeople for LibraryInstallationDto {
+    fn refs(&self) -> Vec<&str> {
+        let mut refs = vec![self.installed_by.as_str()];
+        refs.extend(self.yanked.refs());
+        refs
+    }
+    fn show(&mut self, people: &crate::people::People) {
+        people.show_one(&mut self.installed_by);
+        self.yanked.show(people);
+    }
+}
+
+impl crate::people::ShowsPeople for TrustedSourceDto {
+    fn refs(&self) -> Vec<&str> {
+        vec![&self.trusted_by]
+    }
+    fn show(&mut self, people: &crate::people::People) {
+        people.show_one(&mut self.trusted_by);
+    }
+}
+
+impl crate::people::ShowsPeople for OrgLibrariesDto {
+    fn refs(&self) -> Vec<&str> {
+        let mut refs = self.installations.refs();
+        refs.extend(self.yanks.refs());
+        refs.extend(self.trusted_sources.refs());
+        refs
+    }
+    fn show(&mut self, people: &crate::people::People) {
+        self.installations.show(people);
+        self.yanks.show(people);
+        self.trusted_sources.show(people);
+    }
+}
+
 /// `DELETE …/library-trust?source=…`.
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
@@ -500,14 +544,17 @@ pub(crate) async fn list_libraries(
     let installations = store.installations(&org).await.map_err(store_api_error)?;
     let yanks = store.yanks(&org).await.map_err(store_api_error)?;
     let trusted = store.trusted_sources(&org).await.map_err(store_api_error)?;
-    Ok(Json(OrgLibrariesDto {
+    let dto = OrgLibrariesDto {
         installations: installations
             .iter()
             .map(|i| installation_dto(i, &yanks))
             .collect(),
         yanks: yanks.iter().map(yank_dto).collect(),
         trusted_sources: trusted.iter().map(trusted_dto).collect(),
-    }))
+    };
+    Ok(Json(
+        crate::people::shown(st.identities.as_deref(), dto).await,
+    ))
 }
 
 fn trusted_dto(t: &TrustedSource) -> TrustedSourceDto {
@@ -570,7 +617,9 @@ pub(crate) async fn trust_library_source(
         .await
         .map_err(store_api_error)?;
     tracing::warn!(org = %t.org, source = %t.source, by = %by, "library source trusted with forge credentials");
-    Ok(Json(trusted_dto(&t)))
+    Ok(Json(
+        crate::people::shown(st.identities.as_deref(), trusted_dto(&t)).await,
+    ))
 }
 
 /// Stop trusting a library source with forge credentials. It tightens: no
@@ -766,7 +815,13 @@ pub(crate) async fn install_library(
         .await
         .map_err(store_api_error)?;
     let yanks = store.yanks(&org).await.map_err(store_api_error)?;
-    Ok(Json(installation_dto(&installed, &yanks)))
+    Ok(Json(
+        crate::people::shown(
+            st.identities.as_deref(),
+            installation_dto(&installed, &yanks),
+        )
+        .await,
+    ))
 }
 
 /// Remove an installation. Pipelines that invoke it then fail to compile,
@@ -862,7 +917,9 @@ pub(crate) async fn yank_library(
             }
         }
     }
-    Ok(Json(dto))
+    Ok(Json(
+        crate::people::shown(st.identities.as_deref(), dto).await,
+    ))
 }
 
 /// The Runs in progress in `org` whose Steps use version `hash`: read from
@@ -988,7 +1045,9 @@ pub(crate) async fn unyank_library(
         .await
         .map_err(store_api_error)?
         .ok_or(ApiError::NotFound)?;
-    Ok(Json(yank_dto(&y)))
+    Ok(Json(
+        crate::people::shown(st.identities.as_deref(), yank_dto(&y)).await,
+    ))
 }
 
 // ---------------------------------------------------------------------------

@@ -387,9 +387,29 @@ pub(crate) async fn step_views(
             );
         }
     }
+    // Who yanked or killed shows by handle (ADR-0080 §3).
+    let yanked: Vec<RunYankDto> = yanked.into_values().collect();
+    let people = st
+        .people(
+            yanked.iter().map(|y| y.yanked_by.as_str()).chain(
+                views
+                    .values()
+                    .filter_map(|v| v.plugin_gate.as_ref()?.killed_by.as_deref()),
+            ),
+        )
+        .await;
+    let mut yanked = yanked;
+    for y in &mut yanked {
+        people.show_one(&mut y.yanked_by);
+    }
+    for v in views.values_mut() {
+        if let Some(by) = v.plugin_gate.as_mut().and_then(|g| g.killed_by.as_mut()) {
+            people.show_one(by);
+        }
+    }
     Ok(StepViews {
         views,
-        yanked: yanked.into_values().collect(),
+        yanked,
         environment: ir.environment,
     })
 }

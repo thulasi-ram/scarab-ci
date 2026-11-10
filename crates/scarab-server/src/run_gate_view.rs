@@ -62,7 +62,8 @@ pub(crate) async fn step_gate_views(
     if !steps.iter().any(StepRun::is_gate) {
         return Ok(views);
     }
-    let events = st.db.events(run).await?;
+    // Who resolved a gate shows by handle (ADR-0080 §3).
+    let events = crate::people::shown(st.identities.as_deref(), st.db.events(run).await?).await;
     for gate in steps
         .iter()
         .filter(|s| s.gate_kind.as_deref() == Some("manual") && s.status == StepStatus::Pending)

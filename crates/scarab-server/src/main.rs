@@ -316,6 +316,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Durable store — mandatory, already guaranteed by the config gate.
     let pg = PostgresDb::connect(&database_url).await?;
     pg.migrate().await?;
+    // ADR-0080 §6: handles that differ only in case were kept as separate
+    // Principals by migration 0093. Say so at every boot until an operator
+    // has dealt with them; nothing merges them automatically.
+    match pg.case_duplicate_handles().await {
+        Ok(groups) => {
+            for group in groups {
+                tracing::warn!(
+                    handles = %group.join(", "),
+                    "principals: these handles differ only in case; each is its own \
+                     Principal (ADR-0080). Type them exactly in grants and approver lists"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "principals: could not check for case-only duplicate handles")
+        }
+    }
     // Keep a typed handle so the same Postgres adapter can back the `Db` port
     // and every store port it implements (governance, policies, …).
     let pg = Arc::new(pg);

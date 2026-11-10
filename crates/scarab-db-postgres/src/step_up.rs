@@ -1045,8 +1045,12 @@ impl OrgSecurityEventLog for PostgresDb {
              WHERE ($1::text IS NULL
                     OR e.org = $1
                     OR (e.org IS NULL AND e.kind = ANY($6) AND e.subject IN (
-                        SELECT subject FROM rbac_bindings WHERE org = $1 AND role IS NOT NULL)))
-               AND ($2::text IS NULL OR e.subject = $2)
+                        SELECT subject FROM rbac_bindings WHERE org = $1 AND role IS NOT NULL
+                        UNION
+                        SELECT p.handle FROM principals p
+                        JOIN rbac_bindings b ON b.subject = p.id
+                        WHERE b.org = $1 AND b.role IS NOT NULL)))
+               AND ($2::text IS NULL OR e.subject = $2 OR e.subject = ANY($10))
                AND (cardinality($3::text[]) = 0 OR e.kind = ANY($3))
                AND ($4::bigint IS NULL OR e.seq < $4)
                AND ($7::bigint IS NULL OR e.at >= $7)
@@ -1066,6 +1070,7 @@ impl OrgSecurityEventLog for PostgresDb {
         .bind(f.from_at)
         .bind(f.to_at)
         .bind(&f.target_contains)
+        .bind(&f.subject_aliases)
         .fetch_all(self.pool())
         .await
         .map_err(identity_err)?;

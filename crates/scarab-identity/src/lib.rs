@@ -45,7 +45,11 @@ pub struct Principal {
 impl Principal {
     /// A Principal whose id and handle are the same string: what a caller
     /// with no identity store (dev mode, tests) or a machine identity is.
-    pub fn unpinned(subject: impl Into<String>, display_name: Option<String>, roles: Vec<Role>) -> Self {
+    pub fn unpinned(
+        subject: impl Into<String>,
+        display_name: Option<String>,
+        roles: Vec<Role>,
+    ) -> Self {
         let subject = subject.into();
         Principal {
             handle: subject.clone(),
@@ -564,7 +568,10 @@ pub const PRINCIPAL_ID_PREFIX: &str = "p_";
 /// two forms apart.
 pub fn is_principal_id(s: &str) -> bool {
     s.strip_prefix(PRINCIPAL_ID_PREFIX).is_some_and(|hex| {
-        hex.len() == 32 && hex.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        hex.len() == 32
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     })
 }
 
@@ -649,8 +656,8 @@ fn is_clean_handle(s: &str) -> bool {
 /// it sit in another provider's namespace or squat a suffix, or has the shape
 /// of a Principal id (ADR-0080), in which case it is qualified like any other.
 pub fn base_handle(identity: &ProviderIdentity, unqualified: Option<&str>) -> String {
-    if let Some(legacy) = unqualified
-        .filter(|l| !l.is_empty() && !l.contains([':', '~']) && !is_principal_id(l))
+    if let Some(legacy) =
+        unqualified.filter(|l| !l.is_empty() && !l.contains([':', '~']) && !is_principal_id(l))
     {
         return legacy.to_string();
     }
@@ -868,7 +875,9 @@ pub async fn resolve_principal(
     store: &dyn IdentityStore,
     subject: &str,
 ) -> Result<Option<String>, IdentityError> {
-    Ok(resolve_principal_record(store, subject).await?.map(|p| p.id))
+    Ok(resolve_principal_record(store, subject)
+        .await?
+        .map(|p| p.id))
 }
 
 /// Claims to embed in a minted per-run OIDC JWT for keyless cloud federation
@@ -1156,10 +1165,7 @@ mod tests {
             base_handle(&ident("okta", "00u8", "x:y"), None),
             "okta:00u8"
         );
-        assert_eq!(
-            base_handle(&ident("okta", "a~b", ""), None),
-            "okta:a%7Eb"
-        );
+        assert_eq!(base_handle(&ident("okta", "a~b", ""), None), "okta:a%7Eb");
         // Unqualified (the legacy provider): the bare pre-upgrade subject, so
         // existing bindings keep resolving...
         assert_eq!(

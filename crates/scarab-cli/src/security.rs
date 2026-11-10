@@ -382,7 +382,12 @@ async fn setup(args: SetupArgs) -> i32 {
         return 0;
     }
 
-    let raw_subject = me["subject"].as_str().unwrap_or("");
+    // The handle is what to sign in as; an older server sends only the
+    // subject, which was the handle then.
+    let raw_subject = me["handle"]
+        .as_str()
+        .or_else(|| me["subject"].as_str())
+        .unwrap_or("");
     let subject = &sanitize(if raw_subject.is_empty() {
         "?"
     } else {
@@ -463,7 +468,12 @@ async fn status(conn: Conn) -> i32 {
     };
     println!(
         "subject: {}",
-        sanitize(me["subject"].as_str().unwrap_or("?"))
+        sanitize(
+            me["handle"]
+                .as_str()
+                .or_else(|| me["subject"].as_str())
+                .unwrap_or("?")
+        )
     );
     if step_up_off(&me) {
         println!("step-up: off on this server (dev-insecure) — nothing is enforced");

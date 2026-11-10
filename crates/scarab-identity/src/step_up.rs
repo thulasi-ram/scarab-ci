@@ -742,6 +742,9 @@ pub struct SecurityEvent {
 pub struct SecurityEventFilter {
     pub org: Option<String>,
     pub subject: Option<String>,
+    /// Other names of `subject`'s Principal: rows written before ADR-0080
+    /// name it by handle, rows after by id. Matched only with `subject`.
+    pub subject_aliases: Vec<String>,
     pub kinds: Vec<String>,
     /// Only events with `at >= from_at` (unix ms).
     pub from_at: Option<i64>,
