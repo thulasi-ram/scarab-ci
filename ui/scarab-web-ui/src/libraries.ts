@@ -7,7 +7,7 @@
 // reviewed, naming the hash it replaces). These helpers only let the form say
 // what is wrong before the round trip; where they could disagree, the server
 // wins and its text is shown.
-import { libraryReviewHref } from "./settings-nav";
+import { libraryReviewHref, orgHref } from "./settings-nav";
 
 const SEGMENT = /^[A-Za-z0-9_][A-Za-z0-9._-]{0,99}$/;
 const COMMIT = /^([0-9a-f]{40}|[0-9a-f]{64})$/;
@@ -310,4 +310,77 @@ export function reviewHref(
   for (const [k, v] of Object.entries(p)) if (v) q.set(k, v);
   const s = q.toString();
   return `${libraryReviewHref(org)}${s ? `?${s}` : ""}`;
+}
+
+// --- Settings › Libraries list and each library's manage page ---
+
+/** How pipelines name an installation: `lib:<publisher>/<name>`. */
+export function libraryId(l: { publisher: string; name: string }): string {
+  return `lib:${l.publisher}/${l.name}`;
+}
+
+/** The one URL segment that names an installation in its org:
+ *  `<publisher>~<name>`. Neither part can hold a `~` (see `segmentError`), so
+ *  it splits back into the two. */
+export function libraryKey(l: { publisher: string; name: string }): string {
+  return `${l.publisher}~${l.name}`;
+}
+
+/** The publisher and name a `libraryKey` segment holds, or `null`. */
+export function parseLibraryKey(key: string): { publisher: string; name: string } | null {
+  const parts = key.split("~");
+  if (parts.length !== 2) return null;
+  const [publisher, name] = parts as [string, string];
+  if (!publisher || !name || segmentError(publisher) || segmentError(name)) return null;
+  return { publisher, name };
+}
+
+/** The manage page of one installation in `org`. */
+export function libraryManageHref(org: string, l: { publisher: string; name: string }): string {
+  return `${orgHref(org, "libraries")}/${libraryKey(l)}/manage`;
+}
+
+/** A small state tag on a row or a heading. */
+export type ChipTone = "ok" | "motion" | "danger" | "muted";
+export type Chip = { label: string; tone: ChipTone; title: string };
+
+/** The state tags of one installation, most urgent first: yanked, then
+ *  whether its source is trusted with forge credentials. */
+export function libraryChips(
+  l: { source: string; yanked?: { reason: string; yanked_by: string } | null },
+  trusted: { source: string; trusted_by: string }[],
+): Chip[] {
+  const out: Chip[] = [];
+  if (l.yanked) {
+    out.push({ label: "yanked", tone: "danger", title: `Yanked by ${l.yanked.yanked_by}: ${l.yanked.reason}` });
+  }
+  const trust = trustNote(l, trusted);
+  out.push(
+    trust
+      ? { label: "trusted source", tone: "ok", title: trust }
+      : {
+          label: "untrusted source",
+          tone: "muted",
+          title: "No Step from this source receives a long-lived forge token until the org trusts the source.",
+        },
+  );
+  return out;
+}
+
+/** Yanks of versions no installation holds now: the list page keeps them,
+ *  since no manage page does. */
+export function strayYanks<Y extends { content_hash: string }>(
+  yanks: readonly Y[],
+  installed: readonly { content_hash: string }[],
+): Y[] {
+  return yanks.filter((y) => !installed.some((i) => i.content_hash === y.content_hash));
+}
+
+/** Trusted sources no installation comes from now: the list page keeps
+ *  them, since no manage page does. */
+export function strayTrust<T extends { source: string }>(
+  trusted: readonly T[],
+  installed: readonly { source: string }[],
+): T[] {
+  return trusted.filter((t) => !installed.some((i) => trustKey(i.source) === t.source));
 }

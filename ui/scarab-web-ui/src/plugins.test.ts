@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest";
 import {
   appendJournalPage,
+  pluginChips,
+  pluginManageHref,
   connectionBaseUrlError,
   formatBytes,
   journalEmptyText,
@@ -378,5 +380,20 @@ describe("broker journal", () => {
     expect(journalEmptyText({ phase: "head", deniedOnly: false })).toBe(
       "No requests match these filters in the last 14 days.",
     );
+  });
+});
+
+describe("the list and manage pages", () => {
+  it("tags a killed installation killed, and any other by what its runtime reports", () => {
+    expect(pluginChips({ state: "killed", runtime_status: "stopped" }).map((b) => b.label)).toEqual(["killed"]);
+    expect(pluginChips({ state: "enabled", runtime_status: "running" }).map((b) => [b.label, b.tone])).toEqual([
+      ["running", "ok"],
+    ]);
+    expect(pluginChips({ state: "enabled", runtime_status: "probe_failed" }).map((b) => [b.label, b.tone])).toEqual([
+      ["probe failed", "danger"],
+    ]);
+  });
+  it("links an installation's manage page by its id", () => {
+    expect(pluginManageHref("acme", { id: "4f2a1c9e7b" })).toBe("/orgs/acme/settings/plugins/4f2a1c9e7b/manage");
   });
 });

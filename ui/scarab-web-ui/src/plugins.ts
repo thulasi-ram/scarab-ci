@@ -10,6 +10,7 @@
 // let the form say what is wrong before the round trip — where the two could
 // disagree the server wins.
 import { pinnedSourceError } from "./libraries";
+import { orgHref } from "./settings-nav";
 
 /** A PluginInstallation name: a DNS-1123 label, as the server checks it. */
 const DNS1123_LABEL = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
@@ -278,6 +279,18 @@ const RUNTIME: Record<string, Badge> = {
  *  (a newer server) read muted rather than healthy. */
 export function runtimeBadge(status: string): Badge {
   return RUNTIME[status] ?? { label: status.replace(/_/g, " "), tone: "muted", title: status };
+}
+
+/** The state tags of one installation on the Plugins list: killed, or what
+ *  the runtime last observed (a killed one is scaled to zero, so its runtime
+ *  says nothing more). */
+export function pluginChips(p: { state: string; runtime_status: string }): Badge[] {
+  return p.state === "killed" ? [stateBadge(p.state)] : [runtimeBadge(p.runtime_status)];
+}
+
+/** The manage page of one installation in `org`, by its server-minted id. */
+export function pluginManageHref(org: string, p: { id: string }): string {
+  return `${orgHref(org, "plugins")}/${encodeURIComponent(p.id)}/manage`;
 }
 
 /** `…@sha256:4f2a1c9e7b3d…` → `sha256:4f2a1c9e7b3d`; a bare hex digest is
