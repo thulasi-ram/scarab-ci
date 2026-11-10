@@ -33,10 +33,9 @@ mod environment_governance;
 pub use environment_governance::{
     effective_protection, migrate_legacy_environment, AllowedRefConstraint, ApprovalGateRules,
     DeployGovernance, EffectiveProtection, EnvironmentCascadeDeletion, EnvironmentGovernanceStore,
-    EnvironmentMigrationAcknowledgement, EnvironmentMigrationReport,
-    EnvironmentMigrationReportProject, EnvironmentNameClaim, EnvironmentProjectEligibility,
-    EnvironmentProjectOverlay, EnvironmentProjectPrivilegeGrant, EnvironmentProjectRecord,
-    EnvironmentProtectionRules, LegacyRuleField, MissingGateMode, DEFAULT_MAX_APPROVAL_AGE_S,
+    EnvironmentNameClaim, EnvironmentProjectEligibility, EnvironmentProjectOverlay,
+    EnvironmentProjectPrivilegeGrant, EnvironmentProjectRecord, EnvironmentProtectionRules,
+    MissingGateMode, DEFAULT_MAX_APPROVAL_AGE_S,
 };
 
 /// Which Environment governance edits loosen it (ADR-0073 §3): the pure,
@@ -66,8 +65,7 @@ pub struct Org {
 /// **1 Project : 1 RepoRef** in v1 (monorepo per-subdir governance is
 /// deferred to an optional path scope). The Project's natural key is
 /// `(org, name)` where `name` is the repo's forge name — the pair every
-/// trigger event carries — which is what the [`ApprovalHistoryStore`] and the
-/// deploy-admission paths key on.
+/// trigger event carries — which is what the deploy-admission paths key on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Project {
     pub id: String,
@@ -93,8 +91,7 @@ impl Project {
 /// admits a Run by it: the migration turned each one into an
 /// [`EnvironmentProjectOverlay`] (and, where it carried privileges, an
 /// [`EnvironmentProjectPrivilegeGrant`]) via [`migrate_legacy_environment`].
-/// Kept to deserialise the frozen `legacy_project_environments` rows and as
-/// the oracle the migration's golden tests decide against.
+/// Kept as the oracle the migration's golden tests decide against.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Environment {
     pub name: String,
@@ -359,62 +356,11 @@ fn image_digest(image: &str) -> Option<&str> {
         .filter(|d| d.starts_with("sha256:"))
 }
 
-/// A recorded deployment into an [`Environment`] — the deployment history
-/// (ADR-0024, 0037). Scoped to the owning [`Project`] (`org`/`project`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Deployment {
-    pub org: String,
-    /// The owning Project's name (its repo's forge name, 1:1 in v1).
-    pub project: String,
-    pub environment: String,
-    pub git_ref: String,
-    pub run: String,
-    pub approved_by: Vec<String>,
-    /// Unix-ms timestamp the deployment was admitted.
-    pub at: i64,
-}
-
-/// The gate wait a [`Deployment`] record belongs to: the Environment
-/// approval gate Step and the Attempt that opened the wait. The history
-/// holds at most one record per wait (git-bug 1d06f2d).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ApprovalWait {
-    pub gate: String,
-    pub attempt: String,
-}
-
 /// Errors from the projects/environments store.
 #[derive(Debug, thiserror::Error)]
 pub enum ProjectError {
     #[error("store error: {0}")]
     Store(String),
-}
-
-/// Durable store for the **legacy approval history** (ADR-0024, ADR-0037,
-/// ADR-0070 §1): a [`Deployment`] record for each Environment approval gate
-/// wait whose approvals met the rules, written on every gate release. No API
-/// reads it back; tests read it with `scarab-testkit`'s
-/// `legacy_environments::approval_history`. Despite the record's name it
-/// holds no target, version or outcome. Keyed
-/// by the owning [`Project`]'s natural key `(org, project)` (ADR-0046): the
-/// project name is its repo's forge name (1:1 in v1), the key a run knows
-/// from its trigger (ADR-0037).
-///
-/// The legacy per-Project environments themselves (the frozen
-/// `legacy_project_environments` table, ADR-0071 §10) have no store port:
-/// the server neither reads nor writes them through one. Tests that need
-/// legacy rows seed and read them with `scarab-testkit`'s
-/// `legacy_environments` helpers.
-#[async_trait]
-pub trait ApprovalHistoryStore: Send + Sync {
-    /// Append a deployment to an environment's history. With `wait`, a
-    /// second record for the same wait (two approvals that met the rules at
-    /// once) is not written.
-    async fn record_deployment(
-        &self,
-        deployment: &Deployment,
-        wait: Option<&ApprovalWait>,
-    ) -> Result<(), ProjectError>;
 }
 
 /// Which column of a Project's secret-coverage view a marker sits in: one of its
@@ -433,9 +379,9 @@ pub type CoverageColumn<'a> = Option<&'a str>;
 /// marker silences one cell, recording "we meant this."
 ///
 /// It has **no runtime effect**: it never blocks a deploy, never changes
-/// resolution, and is not consulted on the run path. Separate from
-/// [`ApprovalHistoryStore`] so a deployment that cannot store markers still runs
-/// governance — the matrix simply shows no silenced cells.
+/// resolution, and is not consulted on the run path. A deployment that cannot
+/// store markers still runs governance — the matrix simply shows no silenced
+/// cells.
 #[async_trait]
 pub trait SecretCoverageStore: Send + Sync {
     /// Mark `key` as intentionally unset in `column`. Idempotent.

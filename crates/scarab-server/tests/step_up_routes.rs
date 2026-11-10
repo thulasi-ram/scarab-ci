@@ -327,18 +327,6 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
         "environment.privilege_grant.delete",
         "EX",
     ),
-    (
-        "GET",
-        "/v1/orgs/{org}/environment-migration-report",
-        "read",
-        "READ",
-    ),
-    (
-        "POST",
-        "/v1/orgs/{org}/environment-migration-report/{env}/acknowledge",
-        "environment.migration_report_ack",
-        "NG",
-    ),
     // ADR-0075 §10: adding tightens; an edit or delete of an enforced Policy
     // loosens (the handler decides from the stored mode).
     ("GET", "/v1/orgs/{org}/policies", "read", "READ"),

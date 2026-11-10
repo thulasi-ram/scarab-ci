@@ -101,6 +101,5 @@ tempfile = { workspace = true }
 # `tokio::time::pause`/`advance`: a test moves the broker's cache clock past
 # CREDENTIAL_MAX_AGE without waiting a minute.
 tokio = { workspace = true, features = ["test-util"] }
-# Fakes for the tests. `postgres`: the seed helpers for the frozen
-# `legacy_project_environments` rows, which production never writes.
-scarab-testkit = { workspace = true, features = ["postgres"] }
+# Fakes for the tests.
+scarab-testkit = { workspace = true }

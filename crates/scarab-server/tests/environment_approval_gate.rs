@@ -16,8 +16,6 @@
 //!
 //! Hermetic: in-memory Db, governance and forge, a fake clock and executor.
 
-mod common;
-
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -29,15 +27,14 @@ use scarab_engine::ports::ExecState;
 use scarab_engine::{Clock, Db, FailureKind, RunId, RunStatus, Scheduler, StepId, StepStatus};
 use scarab_forge::RepoRef;
 use scarab_project::{
-    ApprovalGateRules, ApprovalHistoryStore, EnvironmentGovernanceStore,
-    EnvironmentProjectEligibility, EnvironmentProtectionRules, MissingGateMode,
+    ApprovalGateRules, EnvironmentGovernanceStore, EnvironmentProjectEligibility,
+    EnvironmentProtectionRules, MissingGateMode,
 };
 use scarab_server::oidc::{verify, Rs256Issuer};
 use scarab_server::{
     dispatch_run, router, AppState, DispatchError, DispatchKind, LogService,
     SecretInjectingExecutor,
 };
-use scarab_testkit::legacy_environments::approval_history;
 use scarab_testkit::{
     FakeClock, FakeExecutor, FakeForge, FakeSecrets, InMemoryDb, InMemoryEnvironmentGovernance,
     InMemoryObjectStore,
@@ -130,14 +127,6 @@ impl Stack {
     /// `prod` in `acme`, every Project eligible, with `protection` as its
     /// baseline.
     async fn new(protection: EnvironmentProtectionRules) -> Self {
-        Self::with_history(protection, None).await
-    }
-
-    /// [`Stack::new`], with `history` as the legacy deployment history.
-    async fn with_history(
-        protection: EnvironmentProtectionRules,
-        history: Option<Arc<dyn ApprovalHistoryStore>>,
-    ) -> Self {
         let governance = Arc::new(InMemoryEnvironmentGovernance::new().with_environment(
             "acme",
             "prod",
@@ -153,11 +142,8 @@ impl Stack {
             Arc::new(InMemoryObjectStore::new()),
             db.clone(),
         ));
-        let mut state = AppState::new(db.clone(), clock.clone(), logs)
+        let state = AppState::new(db.clone(), clock.clone(), logs)
             .with_environment_governance(governance.clone());
-        if let Some(history) = history {
-            state = state.with_approval_history(history);
-        }
         let app = router(state);
         Self {
             db,
@@ -456,8 +442,9 @@ async fn only_an_approval_gate_needs_the_approvers() {
 }
 
 /// 2b94989: the wait timer is a minimum wait on the approval gate, counted
-/// on its wait clock. An approval given early is kept, and the scheduler
-/// releases the gate when the timer runs out.
+/// on its wait clock. An approval given early is kept, a second one while
+/// the timer runs changes nothing, and the scheduler releases the gate once
+/// when the timer runs out.
 #[tokio::test]
 async fn the_wait_timer_holds_the_gate_and_an_early_approval_counts() {
     let mut protection = rules(&[ME]);
@@ -482,6 +469,7 @@ async fn the_wait_timer_holds_the_gate_and_an_early_approval_counts() {
         s.step_dto(&run, "approve").await["approval_release_at"],
         wait_began + 60_000
     );
+    s.approve(&run, "approve").await;
 
     s.clock.advance(59_000);
     s.tick(&run, 2).await;
@@ -490,6 +478,7 @@ async fn the_wait_timer_holds_the_gate_and_an_early_approval_counts() {
     s.clock.advance(1_000);
     s.tick(&run, 4).await;
     assert_eq!(s.status(&run, "approve").await, StepStatus::Succeeded);
+    assert_eq!(releases(&s, &run, "approve").await, 1);
     assert_eq!(s.status(&run, "ship").await, StepStatus::Succeeded);
 }
 
@@ -764,67 +753,6 @@ steps:
     assert_eq!(body["released"], true, "{body}");
     s.tick(&run, 4).await;
     assert_eq!(s.status(&run, "deploy-main").await, StepStatus::Succeeded);
-}
-
-/// 2b94989: a gate the scheduler releases when the wait timer runs out has its
-/// deployment record, written once, when its approvals met the rules. A
-/// gate an approval releases at once also has exactly one.
-#[tokio::test]
-async fn a_timer_released_gate_has_its_deployment_record() {
-    let Some(tdb) = common::fresh_db().await else {
-        return;
-    };
-    let pg = Arc::new(scarab_db_postgres::PostgresDb::with_pool(tdb.pool.clone()));
-    pg.migrate().await.unwrap();
-    let mut protection = rules(&[ME]);
-    protection.wait_timer_s = 60;
-    let s = Stack::with_history(
-        protection,
-        Some(pg.clone() as Arc<dyn ApprovalHistoryStore>),
-    )
-    .await;
-    let history = || approval_history(&tdb.pool, "acme", "web", "prod");
-
-    let run = s.dispatch(GATED).await.expect("admitted");
-    s.tick(&run, 6).await;
-    let (status, body) = s.approve(&run, "approve").await;
-    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
-    assert_eq!(body["released"], false, "{body}");
-    // A second approval while the timer runs writes no second record.
-    s.approve(&run, "approve").await;
-    s.clock.advance(60_000);
-    s.tick(&run, 4).await;
-    assert_eq!(s.status(&run, "approve").await, StepStatus::Succeeded);
-    assert_eq!(releases(&s, &run, "approve").await, 1);
-    let records = history().await;
-    assert_eq!(records.len(), 1, "{records:?}");
-    assert_eq!(records[0].run, run.0);
-    assert_eq!(records[0].approved_by, vec![ME.to_string()]);
-    assert_eq!(records[0].git_ref, "refs/heads/main");
-
-    // No timer: the approval releases the gate, and one record is written.
-    s.set_protection(rules(&[ME])).await;
-    let at_once = approved(&s).await;
-    let records = history().await;
-    assert_eq!(records.len(), 2, "{records:?}");
-    assert_eq!(records[0].run, at_once.0);
-
-    // git-bug 1d06f2d: each record names the gate wait it belongs to, which
-    // is what makes a racing second record a no-op.
-    let keys: Vec<(String, Option<String>, Option<String>)> =
-        sqlx::query_as("SELECT run_id, gate_step, gate_attempt FROM deployments ORDER BY at")
-            .fetch_all(&tdb.pool)
-            .await
-            .unwrap();
-    assert_eq!(
-        keys,
-        vec![
-            (run.0.clone(), Some("approve".into()), Some("a1".into())),
-            (at_once.0.clone(), Some("approve".into()), Some("a1".into())),
-        ]
-    );
-
-    tdb.cleanup().await;
 }
 
 /// 220917f: one released approval gate upstream that passes every check is

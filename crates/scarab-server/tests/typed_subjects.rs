@@ -35,7 +35,6 @@ fn app(pg: Arc<PostgresDb>) -> axum::Router {
     // what a write may NAME, not who may write.
     router(
         AppState::new(db, Arc::new(FakeClock::new(1_000)), logs)
-            .with_approval_history(pg.clone())
             .with_org_environments(pg.clone())
             .with_environment_governance(pg.clone())
             .with_rbac(pg.clone())

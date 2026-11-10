@@ -3101,7 +3101,6 @@ dependencies = [
  "scarab-secrets",
  "scarab-storage",
  "serde_json",
- "sqlx",
  "tokio",
 ]
 

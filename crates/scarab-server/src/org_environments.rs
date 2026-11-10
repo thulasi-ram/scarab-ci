@@ -9,9 +9,7 @@
 //! - `…/eligibility` — which Projects may deploy at all (ADR-0071 §2);
 //! - `…/protection` — the baseline every Project's Deploy Runs obey (§1);
 //! - `…/projects/{project}/overlay` — one Project's tighten-only overlay (§3);
-//! - `…/projects/{project}/privilege-grant` — one Project's privileges (§8);
-//! - `/v1/orgs/{org}/environment-migration-report` — the split report the
-//!   migration left for an admin to review (§10 step 8).
+//! - `…/projects/{project}/privilege-grant` — one Project's privileges (§8).
 //!
 //! The whole-Environment PUT never touches the baseline or the eligibility —
 //! each has its own write — so the c-min form cannot reset either by
@@ -34,11 +32,10 @@ use scarab_project::{
 };
 use scarab_project::{
     eligibility_loosenings, overlay_loosenings, privilege_grant_loosenings, protection_loosenings,
-    DeployGovernance, EffectiveProtection, EnvironmentGovernanceStore, EnvironmentMigrationReport,
-    EnvironmentMigrationReportProject, EnvironmentNameClaim, EnvironmentProjectEligibility,
-    EnvironmentProjectOverlay, EnvironmentProjectPrivilegeGrant, EnvironmentProjectRecord,
-    EnvironmentProtectionRules, ImageGrant, Loosening, MissingGateMode, OrgEnvironment,
-    OrgEnvironmentError, ProtectionRules, WritePrecondition,
+    DeployGovernance, EffectiveProtection, EnvironmentGovernanceStore, EnvironmentNameClaim,
+    EnvironmentProjectEligibility, EnvironmentProjectOverlay, EnvironmentProjectPrivilegeGrant,
+    EnvironmentProjectRecord, EnvironmentProtectionRules, ImageGrant, Loosening, MissingGateMode,
+    OrgEnvironment, OrgEnvironmentError, WritePrecondition,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -1050,7 +1047,7 @@ async fn remove_copied_secrets(
 /// Not copied, and listed in the answer: Policies that select the old
 /// Environment and not the new one, the Projects whose Pipelines name the
 /// old one (from Run history), and the OIDC subject cloud trust policies
-/// match. Run and approval history and the Cache stay with the old
+/// match. Run history, approvals included, and the Cache stay with the old
 /// Environment, which is not changed.
 ///
 /// The secret store is a separate store from the Environment's, so the two
@@ -1268,8 +1265,8 @@ async fn duplicate_org_environment_holding(
         new_oidc_subject: oidc_subject_pattern(&org, &new_name),
         notes: vec![
             format!(
-                "Run and approval history and the Cache stay with {env}, which is not changed \
-                 and stays until an admin deletes it."
+                "Run history, approvals included, and the Cache stay with {env}, which is not \
+                 changed and stays until an admin deletes it."
             ),
             "Only Environment secrets set per Project are copied: org-wide Environment secrets \
              are not built yet."
@@ -2119,172 +2116,4 @@ pub(crate) async fn delete_environment_project_privilege_grant(
     } else {
         Err(ApiError::NotFound)
     }
-}
-
-// ---------------------------------------------------------------------------
-// The split report (ADR-0071 §10 step 8).
-// ---------------------------------------------------------------------------
-
-/// A Project's ADR-0037 per-repo rules as the migration found them. The
-/// canonical `secret_scope` / `oidc_subject` are left out: the server always
-/// derived them from the coordinates, so they never differed by choice.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct LegacyProtectionRulesDto {
-    pub approvers: Vec<String>,
-    pub allowed_refs: Vec<String>,
-    /// Seconds.
-    pub wait_timer: u32,
-    /// Stored but never read; not carried by the migration (§10 step 3).
-    pub concurrency: u32,
-    pub require_reason: bool,
-    pub privileged_images: Vec<ImageGrantDto>,
-    pub permit_k8s_overlay: bool,
-}
-
-impl From<&ProtectionRules> for LegacyProtectionRulesDto {
-    fn from(r: &ProtectionRules) -> Self {
-        Self {
-            approvers: r.approvers.clone(),
-            allowed_refs: r.allowed_refs.clone(),
-            wait_timer: r.wait_timer,
-            concurrency: r.concurrency,
-            require_reason: r.require_reason,
-            privileged_images: r.privileged_images.iter().map(Into::into).collect(),
-            permit_k8s_overlay: r.permit_k8s_overlay,
-        }
-    }
-}
-
-/// One Project in a split-report line: what it had, and what it has now.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct EnvironmentMigrationReportProjectDto {
-    pub project: String,
-    /// Its per-repo rules before the migration; absent for a Project whose
-    /// Runs only named the Environment.
-    pub legacy: Option<LegacyProtectionRulesDto>,
-    /// Its overlay now (the migration wrote it from `legacy`; it may have
-    /// been changed or removed since).
-    pub overlay: Option<EnvironmentProjectOverlayDto>,
-}
-
-impl From<&EnvironmentMigrationReportProject> for EnvironmentMigrationReportProjectDto {
-    fn from(p: &EnvironmentMigrationReportProject) -> Self {
-        Self {
-            project: p.project.clone(),
-            legacy: p.legacy.as_ref().map(Into::into),
-            overlay: p.overlay.as_ref().map(Into::into),
-        }
-    }
-}
-
-/// One line of the split report: an Environment name merged across several
-/// Projects, or created with eligibility *all projects* because no Project
-/// defined it. If the merged Projects really meant different places (one
-/// `prod` that is `prod-eu`), the split is a YAML change: those Projects
-/// rename their `environment:` and an org admin creates the new
-/// Environment — nothing is renamed for them.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct EnvironmentMigrationReportDto {
-    pub environment: String,
-    pub merged_projects: Vec<String>,
-    /// No Project defined it: migrated with eligibility *all projects*.
-    pub referenced_only: bool,
-    /// Projects whose Runs named it without defining it.
-    pub referencing_projects: Vec<String>,
-    /// The legacy rules the merged Projects disagreed on, by ADR-0037 field
-    /// name (`approvers`, `allowed_refs`, `wait_timer`, `require_reason`,
-    /// `privileged_images`, `permit_k8s_overlay`). Lists compare as sets.
-    pub differing_rules: Vec<String>,
-    /// The Environment still exists.
-    pub environment_exists: bool,
-    /// Its baseline is still the permissive one the migration gave it:
-    /// nothing org-wide protects it yet — set a baseline.
-    pub permissive_baseline: bool,
-    pub projects: Vec<EnvironmentMigrationReportProjectDto>,
-    /// Unix-ms.
-    pub created_at: i64,
-    /// Unix-ms; absent until an admin acknowledges the line.
-    pub acknowledged_at: Option<i64>,
-    pub acknowledged_by: Option<String>,
-}
-
-impl From<&EnvironmentMigrationReport> for EnvironmentMigrationReportDto {
-    fn from(r: &EnvironmentMigrationReport) -> Self {
-        Self {
-            environment: r.environment.clone(),
-            merged_projects: r.merged_projects.clone(),
-            referenced_only: r.referenced_only,
-            referencing_projects: r.referencing_projects.clone(),
-            differing_rules: r
-                .differing_legacy_rules()
-                .into_iter()
-                .map(|f| f.as_str().to_string())
-                .collect(),
-            environment_exists: r.baseline.is_some(),
-            permissive_baseline: r.permissive_baseline(),
-            projects: r.projects.iter().map(Into::into).collect(),
-            created_at: r.created_at,
-            acknowledged_at: r.acknowledged.as_ref().map(|a| a.at),
-            acknowledged_by: r.acknowledged.as_ref().map(|a| a.by.clone()),
-        }
-    }
-}
-
-/// The org's split report, by Environment name, acknowledged lines
-/// included. Administer on the Org: it shows every Project's old privileges.
-#[utoipa::path(
-    get,
-    path = "/v1/orgs/{org}/environment-migration-report",
-    params(("org" = String, Path, description = "org")),
-    summary = "The ADR-0071 migration's split report (ADR-0071 §10 step 8)",
-    responses(
-        (status = 200, body = [EnvironmentMigrationReportDto]),
-        (status = 403, description = "not an org admin"),
-        (status = 404, description = "not configured")
-    )
-)]
-pub(crate) async fn get_environment_migration_report(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-    Path(org): Path<String>,
-) -> Result<Json<Vec<EnvironmentMigrationReportDto>>, ApiError> {
-    let scope = rbac_scope(&org, None);
-    authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
-    let report = governance_store(&st)?
-        .environment_migration_report(&org)
-        .await
-        .map_err(org_environment_api_error)?;
-    Ok(Json(report.iter().map(Into::into).collect()))
-}
-
-/// Mark one line reviewed. Administer on the Org. The first
-/// acknowledgement stands; a repeat answers the line unchanged.
-#[utoipa::path(
-    post,
-    path = "/v1/orgs/{org}/environment-migration-report/{env}/acknowledge",
-    params(
-        ("org" = String, Path, description = "org"),
-        ("env" = String, Path, description = "environment name")
-    ),
-    summary = "Acknowledge a split-report line (ADR-0071 §10 step 8)",
-    responses(
-        (status = 200, body = EnvironmentMigrationReportDto),
-        (status = 403, description = "not an org admin"),
-        (status = 404, description = "no report line for that name, or not configured")
-    )
-)]
-pub(crate) async fn acknowledge_environment_migration_report(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-    Path((org, env)): Path<(String, String)>,
-) -> Result<Json<EnvironmentMigrationReportDto>, ApiError> {
-    let scope = rbac_scope(&org, None);
-    let principal = authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
-    let now = st.clock.now().await.0;
-    let line = governance_store(&st)?
-        .acknowledge_environment_migration_report(&org, &env, &principal.subject, now)
-        .await
-        .map_err(org_environment_api_error)?
-        .ok_or(ApiError::NotFound)?;
-    Ok(Json((&line).into()))
 }

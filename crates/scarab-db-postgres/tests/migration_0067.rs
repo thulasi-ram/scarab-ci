@@ -5,8 +5,8 @@
 //! table it drops and in every plugin table it must keep (0055 created both
 //! kinds), then 0067 runs. The record's tables and columns are gone; the
 //! plugin installation, its connection and its broker journal survive with
-//! their rows, the org Environment and its overlay keep their other columns,
-//! and the legacy approval-history `deployments` table is untouched. Finally
+//! their rows, and the org Environment and its overlay keep their other
+//! columns. Finally
 //! the store reads the surviving rows back through its own code, so the
 //! queries match the schema 0067 leaves. Skips cleanly when
 //! `SCARAB_TEST_DATABASE_URL` is unset.
@@ -102,8 +102,6 @@ async fn seed(pool: &PgPool) {
             (org, seq, environment, target_source, target_id, version, kind, at,
              report_status, report_label, report_source_at)
             VALUES ('acme', 1, 'prod', 'argo', 'argocd/web', 'v1', 'report', 1, 'live', 'synced', 1);
-        INSERT INTO deployments (org, project, environment, git_ref, run_id, approved_by, at)
-            VALUES ('acme', 'web', 'prod', 'refs/heads/main', 'r1', '["user:amy"]', 1);
         "#,
     )
     .execute(pool)
@@ -157,7 +155,6 @@ async fn the_drop_removes_the_record_and_leaves_plugins_and_environments_intact(
         ("plugin_broker_journal", 1),
         ("org_environments", 1),
         ("environment_project_overlays", 1),
-        ("deployments", 1),
     ] {
         assert!(table_exists(&pool, kept).await, "{kept} is kept");
         assert_eq!(count(&pool, kept).await, rows, "{kept} keeps its rows");

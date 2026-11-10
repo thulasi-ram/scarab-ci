@@ -754,16 +754,6 @@ pub static ENV_LEGACY_DELETE: Op = op(
     &[],
     &[],
 );
-pub static MIGRATION_ACK: Op = op(
-    "environment.migration_report_ack",
-    "Acknowledge an environment migration report",
-    Class::NotGoverned("an acknowledgement record; no governance change"),
-    "-",
-    ADMIN,
-    OrgOf::Path("org"),
-    &[],
-    &["path:org", "path:env"],
-);
 pub static CONNECTION_RESYNC: Op = op(
     "connection.resync",
     "Resync a forge connection",

@@ -412,15 +412,6 @@ pub(crate) fn governed_routes() -> Routes {
             &ops::PRIVILEGE_GRANT_DELETE,
             oe::delete_environment_project_privilege_grant,
         )
-        .get(
-            "/v1/orgs/{org}/environment-migration-report",
-            oe::get_environment_migration_report,
-        )
-        .post(
-            "/v1/orgs/{org}/environment-migration-report/{env}/acknowledge",
-            &ops::MIGRATION_ACK,
-            oe::acknowledge_environment_migration_report,
-        )
         // ADR-0075: org Policies, Project typed settings, decisions, the test API.
         .get("/v1/orgs/{org}/policies", pol::list_org_policies)
         .post(

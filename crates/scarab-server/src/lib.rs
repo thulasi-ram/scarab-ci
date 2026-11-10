@@ -199,12 +199,6 @@ pub struct AppState {
     /// a4cb94f). Shared by every clone of this state, so one process counts
     /// once; written by [`flush_api_token_uses`].
     pub api_token_uses: Arc<ApiTokenUses>,
-    /// The legacy approval history (ADR-0037, ADR-0070 §1):
-    /// `record_deployment` on every gate release. No endpoint reads it, and
-    /// admission never reads it since ADR-0071 — see
-    /// [`environment_governance`](AppState::environment_governance). `None`
-    /// writes no history.
-    pub approval_history: Option<Arc<dyn scarab_project::ApprovalHistoryStore>>,
     /// Org-level Environment governance (ADR-0071 §2, §3, §8): what admits
     /// and governs every Deploy Run — eligibility, effective protection,
     /// privilege grants — at Run creation, at gate approval and at secret
@@ -369,7 +363,6 @@ impl AppState {
             sessions: None,
             api_tokens: None,
             api_token_uses: Arc::default(),
-            approval_history: None,
             environment_governance: None,
             policies: None,
             libraries: None,
@@ -453,15 +446,6 @@ impl AppState {
     /// Enable the OIDC issuer (JWKS + discovery endpoints).
     pub fn with_oidc(mut self, issuer: Arc<oidc::Rs256Issuer>) -> Self {
         self.oidc = Some(issuer);
-        self
-    }
-
-    /// Enable the legacy approval history (ADR-0037, ADR-0070 §1).
-    pub fn with_approval_history(
-        mut self,
-        approval_history: Arc<dyn scarab_project::ApprovalHistoryStore>,
-    ) -> Self {
-        self.approval_history = Some(approval_history);
         self
     }
 
@@ -10394,9 +10378,8 @@ async fn approve_gate(
     let now = st.clock.now().await.0;
     // The gate's current wait: its open Attempt. When it began is what the
     // wait timer counts from (no open wait yet: count from now, which only
-    // waits longer); its id keys the approval history to one record per wait
-    // (git-bug 1d06f2d).
-    let open_wait = st
+    // waits longer).
+    let wait_began = st
         .db
         .steps_of_run(&run)
         .await
@@ -10407,13 +10390,9 @@ async fn approve_gate(
             s.attempts
                 .last()
                 .filter(|a| a.outcome == scarab_engine::AttemptOutcome::Running)
-                .map(|a| (a.started_at.0, a.id.0.clone()))
-        });
-    let wait_began = open_wait.as_ref().map_or(now, |(at, _)| *at);
-    let wait = open_wait.map(|(_, attempt)| scarab_project::ApprovalWait {
-        gate: step.0.clone(),
-        attempt,
-    });
+                .map(|a| a.started_at.0)
+        })
+        .unwrap_or(now);
     let release_rule = |approvals: &[String]| {
         rules.map(|(c, p)| {
             scarab_policy::environment_rules::gate_release(
@@ -10587,17 +10566,6 @@ async fn approve_gate(
                 .await
                 .map_err(ApiError::Db)?;
         }
-        // Record the deployment in the legacy approval history (ADR-0024,
-        // 0037, ADR-0070 §1), the record `GET …/environments/{name}/
-        // deployments` serves: once per wait, when its approvals first meet
-        // the rules. The scheduler, which releases the gate when the wait
-        // timer runs out, has no history store, so the record is written
-        // here whichever path releases the gate.
-        if recorded.is_none() {
-            if let Some((c, _)) = rules {
-                record_deployment(&st, c, &run, &approvers, now, wait.as_ref()).await?;
-            }
-        }
         if release.result.outcome != scarab_policy::evaluate::PolicyOutcome::Passed {
             // The scheduler releases the gate when the timer runs out.
             return Ok((
@@ -10640,17 +10608,6 @@ async fn approve_gate(
         .iter()
         .any(|s| s.step == step && s.status == StepStatus::Succeeded);
 
-    // 6. An Environment approval gate judged by no Environment rules (no
-    //    governance store wired) records its deployment on a real release (a
-    //    no-op re-release writes no duplicate). One judged by them recorded
-    //    it at step 4, when its approvals met the rules.
-    if released && approval_gate && rules.is_none() {
-        if let Some(c) = &ctx {
-            let now = st.clock.now().await.0;
-            record_deployment(&st, c, &run, &approvers, now, wait.as_ref()).await?;
-        }
-    }
-
     Ok((
         StatusCode::ACCEPTED,
         Json(GateApprovalDto {
@@ -10660,36 +10617,6 @@ async fn approve_gate(
         }),
     )
         .into_response())
-}
-
-/// Write one deploy of `run` to the legacy approval history, when a history
-/// store is wired: at most one per gate `wait`.
-async fn record_deployment(
-    st: &AppState,
-    c: &scarab_engine::DeployContext,
-    run: &RunId,
-    approvers: &[String],
-    at: i64,
-    wait: Option<&scarab_project::ApprovalWait>,
-) -> Result<(), ApiError> {
-    let Some(store) = st.approval_history.as_ref() else {
-        return Ok(());
-    };
-    store
-        .record_deployment(
-            &scarab_project::Deployment {
-                org: c.org.clone(),
-                project: c.project.clone(),
-                environment: c.environment.clone(),
-                git_ref: c.git_ref.clone(),
-                run: run.0.clone(),
-                approved_by: approvers.to_vec(),
-                at,
-            },
-            wait,
-        )
-        .await
-        .map_err(|e| ApiError::BadRequest(e.to_string()))
 }
 
 /// `POST /v1/runs/{id}/gates/{step}/reject` body: why the gate is failed.
@@ -13401,8 +13328,7 @@ const TAG_GROUPS: &[(&str, &str)] = &[
     (
         "Environments",
         "Org-level Environments (ADR-0071) and their governance; per-repo \
-         Environments and their protection rules, plus their legacy approval \
-         history.",
+         Environments and their protection rules.",
     ),
     (
         "Plugins",
@@ -13751,8 +13677,6 @@ impl utoipa::Modify for StepUpResponses {
         org_environments::get_environment_project_privilege_grant,
         org_environments::put_environment_project_privilege_grant,
         org_environments::delete_environment_project_privilege_grant,
-        org_environments::get_environment_migration_report,
-        org_environments::acknowledge_environment_migration_report,
         libraries::list_libraries,
         libraries::fetch_library,
         libraries::install_library,
@@ -13952,9 +13876,6 @@ impl utoipa::Modify for StepUpResponses {
         org_environments::EnvironmentProjectOverlayDto,
         org_environments::PutEnvironmentProjectPrivilegeGrantRequest,
         org_environments::EnvironmentProjectDto,
-        org_environments::LegacyProtectionRulesDto,
-        org_environments::EnvironmentMigrationReportProjectDto,
-        org_environments::EnvironmentMigrationReportDto,
         libraries::OrgLibrariesDto,
         libraries::LibraryInstallationDto,
         libraries::LibraryYankDto,

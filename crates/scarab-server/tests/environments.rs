@@ -4,10 +4,9 @@
 //!  1. Environment **management**: since ADR-0071 the per-repo writes are
 //!     410 and management is the org Environment, its baseline and
 //!     eligibility, and the Project's overlay and privilege grant; the
-//!     repo-scoped reads (one / list / legacy history) stay. Plus the
-//!     migration's split report.
+//!     repo-scoped reads (one / list) stay.
 //!  2. The new **admission model**: a deploy run suspends at a manual gate, and
-//!     approving it releases the run and records a deployment only once the
+//!     approving it releases the run only once the
 //!     accumulated approvers satisfy the environment's rules (ADR-0037) — not by
 //!     a caller-supplied approvals list (the old `POST …/deploy` is retired).
 //!
@@ -31,12 +30,9 @@ use scarab_engine::ports::ExecState;
 use scarab_engine::{
     Db, DeployContext, RunId, RunStatus, Scheduler, StepId, StepSpec, StepStatus, Timestamp,
 };
-use scarab_project::{
-    ApprovalHistoryStore, EnvironmentGovernanceStore, OrgEnvironmentStore, ProtectionRules,
-};
+use scarab_project::{EnvironmentGovernanceStore, OrgEnvironmentStore, ProtectionRules};
 use scarab_secrets::{SecretProvider, SecretScope};
 use scarab_server::{router, AppState, LogService};
-use scarab_testkit::legacy_environments::{approval_history, put_legacy_project_environment};
 use scarab_testkit::{FakeClock, FakeExecutor, FakeSecrets, InMemoryObjectStore};
 
 fn rules(approvers: &[&str], allowed_refs: &[&str]) -> ProtectionRules {
@@ -59,14 +55,12 @@ fn rules(approvers: &[&str], allowed_refs: &[&str]) -> ProtectionRules {
 
 fn app_state(pg: Arc<PostgresDb>) -> AppState {
     let db: Arc<dyn Db> = pg.clone();
-    let history: Arc<dyn ApprovalHistoryStore> = pg.clone();
     let clock = Arc::new(FakeClock::new(1_000));
     let logs = Arc::new(LogService::new(
         Arc::new(InMemoryObjectStore::new()),
         pg.clone(),
     ));
     AppState::new(db, clock, logs)
-        .with_approval_history(history)
         .with_org_environments(pg.clone())
         .with_environment_governance(pg)
 }
@@ -230,7 +224,7 @@ async fn eligibility_patterns_are_trimmed_star_free_and_case_blind() {
 /// Was: put / get / list / delete over `/v1/repos/{org}/{repo}/environments`.
 /// Since ADR-0071 the writes are 410 and the same management happens on the
 /// org Environment and the Project's overlay and grant; the repo-scoped GETs
-/// (one, list, legacy history) are what they always were — reads — now of
+/// (one, list) are what they always were — reads — now of
 /// what governs the Project.
 #[tokio::test]
 async fn environment_management_crud_over_repo_scoped_routes() {
@@ -525,147 +519,9 @@ async fn require_reason_persists_and_defaults_off_through_the_api() {
     tdb.cleanup().await;
 }
 
-/// The `CREATE FUNCTION adr0071_backfill()` section of migration 0057 — the
-/// migration drops the function after its one call, so a test that replays
-/// the backfill re-creates it from the migration's own text. Migration 0067
-/// (ADR-0074) dropped the deadline and per-target concurrency columns it
-/// writes, so those are cut from the text; everything else is verbatim.
-fn backfill_function_sql() -> String {
-    let verbatim = backfill_function_sql_0057();
-    let without = verbatim
-        .replace(
-            "description, deployment_deadline_ms, created_at",
-            "description, created_at",
-        )
-        .replace("n.name, '', 3600000, now_ms", "n.name, '', now_ms")
-        .replace(
-            "deployment_concurrency, deployment_gate_deadline_ms, updated_at",
-            "updated_at",
-        )
-        .replace(
-            "NULL, NULL, now_ms, 'migration:adr-0071'",
-            "now_ms, 'migration:adr-0071'",
-        );
-    assert!(!without.contains("deployment_"), "{without}");
-    without
-}
-
-fn backfill_function_sql_0057() -> &'static str {
-    const MIGRATION: &str =
-        include_str!("../../scarab-db-postgres/migrations/0057_org_environment_governance.sql");
-    let start = MIGRATION
-        .find("CREATE FUNCTION adr0071_backfill()")
-        .expect("0057 defines the backfill");
-    let end = start
-        + MIGRATION[start..]
-            .find("\n$$;")
-            .expect("the backfill body ends with `$$;`")
-        + "\n$$;".len();
-    &MIGRATION[start..end]
-}
-
-/// ADR-0071 §10 step 8 through the API: a name two Projects defined is one
-/// report line naming both, each with its legacy rules beside its overlay
-/// now, the rule they disagreed on, and the permissive baseline flagged
-/// until an admin sets one. Acknowledging stamps the first reviewer only.
-#[tokio::test]
-async fn split_report_shows_merged_rules_and_acknowledges_once() {
-    let Some(tdb) = fresh_db().await else {
-        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
-        return;
-    };
-    let pg = Arc::new(PostgresDb::with_pool(tdb.pool.clone()));
-    pg.migrate().await.unwrap();
-    // Two pre-migration per-repo `prod`s, then the 0057 backfill over them.
-    for (project, approver) in [("web", "alice"), ("api", "bob")] {
-        put_legacy_project_environment(
-            &tdb.pool,
-            "acme",
-            project,
-            &scarab_project::Environment {
-                name: "prod".into(),
-                protection: rules(&[approver], &["refs/heads/main"]),
-            },
-        )
-        .await;
-    }
-    // 0057 dropped its one-shot backfill; re-create it from the migration's
-    // own text and run it over the pre-migration rows seeded above.
-    sqlx::raw_sql(&backfill_function_sql())
-        .execute(&tdb.pool)
-        .await
-        .unwrap();
-    sqlx::query("SELECT adr0071_backfill()")
-        .execute(&tdb.pool)
-        .await
-        .unwrap();
-    let app = app(pg.clone());
-
-    let (status, body) = send(
-        &app,
-        "GET",
-        "/v1/orgs/acme/environment-migration-report",
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let report = json_of(&body);
-    let line = &report[0];
-    assert_eq!(line["environment"], "prod", "{report}");
-    assert_eq!(line["merged_projects"], serde_json::json!(["api", "web"]));
-    assert_eq!(line["differing_rules"], serde_json::json!(["approvers"]));
-    assert_eq!(line["permissive_baseline"], true);
-    assert_eq!(line["acknowledged_at"], serde_json::Value::Null);
-    let web = line["projects"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|p| p["project"] == "web")
-        .unwrap();
-    assert_eq!(web["legacy"]["approvers"], serde_json::json!(["alice"]));
-    assert_eq!(web["overlay"]["approvers"], serde_json::json!(["alice"]));
-
-    let ack = "/v1/orgs/acme/environment-migration-report/prod/acknowledge";
-    let (status, body) = send(&app, "POST", ack, None).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(json_of(&body)["acknowledged_by"], "anonymous");
-    let first_at = json_of(&body)["acknowledged_at"].clone();
-    assert_ne!(first_at, serde_json::Value::Null);
-    let (_, body) = send(&app, "POST", ack, None).await;
-    assert_eq!(json_of(&body)["acknowledged_at"], first_at, "first stands");
-    let (status, _) = send(
-        &app,
-        "POST",
-        "/v1/orgs/acme/environment-migration-report/nope/acknowledge",
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-
-    // Setting a baseline clears the warning.
-    let (status, msg) = send(
-        &app,
-        "PUT",
-        "/v1/orgs/acme/environments/prod/protection",
-        Some(serde_json::json!({ "allowed_refs": ["refs/heads/main"] })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{msg}");
-    let (_, body) = send(
-        &app,
-        "GET",
-        "/v1/orgs/acme/environment-migration-report",
-        None,
-    )
-    .await;
-    assert_eq!(json_of(&body)[0]["permissive_baseline"], false, "{body}");
-
-    tdb.cleanup().await;
-}
-
 /// Drive a deploy run to its manual gate, then approve it via HTTP. The gate
-/// releases (and a deployment is recorded) only when the environment's rules
-/// admit the accumulated approver; otherwise the run stays suspended.
+/// releases only when the environment's rules admit the accumulated
+/// approver; otherwise the run stays suspended.
 async fn drive_to_gate(pg: &Arc<PostgresDb>, run: &RunId) {
     let (a, g, b) = (
         StepId("a".into()),
@@ -722,7 +578,7 @@ async fn drive_to_gate(pg: &Arc<PostgresDb>, run: &RunId) {
 }
 
 #[tokio::test]
-async fn deploy_gate_releases_and_records_history_only_when_admitted() {
+async fn deploy_gate_releases_only_when_admitted() {
     let Some(tdb) = fresh_db().await else {
         eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
         return;
@@ -771,9 +627,6 @@ async fn deploy_gate_releases_and_records_history_only_when_admitted() {
         Some(RunStatus::Suspended),
         "unmet approver → gate stays closed"
     );
-    assert!(approval_history(&tdb.pool, "acme", "web", "prod")
-        .await
-        .is_empty());
 
     // --- Case 2: approver requirement satisfied by the anonymous approver ---
     seed_migrated_environment(
@@ -805,10 +658,6 @@ async fn deploy_gate_releases_and_records_history_only_when_admitted() {
             .status,
         StepStatus::Succeeded
     );
-    let history = approval_history(&tdb.pool, "acme", "web", "prod").await;
-    assert_eq!(history.len(), 1, "the admitted deploy is recorded once");
-    assert_eq!(history[0].git_ref, "refs/heads/main");
-    assert_eq!(history[0].approved_by, vec!["anonymous".to_string()]);
 
     tdb.cleanup().await;
 }
@@ -847,7 +696,6 @@ async fn secret_matrix_reports_effective_status() {
             b"y",
         );
     let db: Arc<dyn Db> = pg.clone();
-    let history: Arc<dyn ApprovalHistoryStore> = pg.clone();
     let clock = Arc::new(FakeClock::new(1_000));
     let logs = Arc::new(LogService::new(
         Arc::new(InMemoryObjectStore::new()),
@@ -856,7 +704,6 @@ async fn secret_matrix_reports_effective_status() {
     let secrets: Arc<dyn SecretProvider> = Arc::new(secrets);
     let app = router(
         AppState::new(db, clock, logs)
-            .with_approval_history(history)
             .with_environment_governance(pg.clone())
             .with_secrets(secrets),
     );

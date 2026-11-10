@@ -28,10 +28,10 @@ use scarab_engine::{Clock, Db, RunId, RunStatus, Scheduler, StepId, StepStatus};
 use scarab_forge::RepoRef;
 use scarab_identity::{ApiToken, ApiTokenStore, Role, Scope};
 use scarab_project::{
-    DeployGovernance, EnvironmentGovernanceStore, EnvironmentMigrationReport,
-    EnvironmentProjectEligibility, EnvironmentProjectOverlay, EnvironmentProjectPrivilegeGrant,
-    EnvironmentProjectRecord, EnvironmentProtectionRules, ImageGrant, OrgEnvironment,
-    OrgEnvironmentError, OrgEnvironmentStore,
+    DeployGovernance, EnvironmentGovernanceStore, EnvironmentProjectEligibility,
+    EnvironmentProjectOverlay, EnvironmentProjectPrivilegeGrant, EnvironmentProjectRecord,
+    EnvironmentProtectionRules, ImageGrant, OrgEnvironment, OrgEnvironmentError,
+    OrgEnvironmentStore,
 };
 use scarab_server::{dispatch_run, DispatchKind};
 use scarab_testkit::{FakeExecutor, FakeForge, InMemoryEnvironmentGovernance};
@@ -886,28 +886,6 @@ impl EnvironmentGovernanceStore for RacingGovernance {
         environment: &str,
     ) -> Result<Vec<EnvironmentProjectRecord>, OrgEnvironmentError> {
         self.inner.environment_projects(org, environment).await
-    }
-    async fn environment_migration_report(
-        &self,
-        org: &str,
-    ) -> Result<Vec<EnvironmentMigrationReport>, OrgEnvironmentError> {
-        self.inner.environment_migration_report(org).await
-    }
-    async fn acknowledge_environment_migration_report(
-        &self,
-        org: &str,
-        environment: &str,
-        acknowledged_by: &str,
-        acknowledged_at: i64,
-    ) -> Result<Option<EnvironmentMigrationReport>, OrgEnvironmentError> {
-        self.inner
-            .acknowledge_environment_migration_report(
-                org,
-                environment,
-                acknowledged_by,
-                acknowledged_at,
-            )
-            .await
     }
 }
 

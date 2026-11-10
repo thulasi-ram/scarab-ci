@@ -317,7 +317,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pg = PostgresDb::connect(&database_url).await?;
     pg.migrate().await?;
     // Keep a typed handle so the same Postgres adapter can back the `Db` port
-    // and every store port it implements (approval history, governance, …).
+    // and every store port it implements (governance, policies, …).
     let pg = Arc::new(pg);
     let db: Arc<dyn Db> = pg.clone();
 
@@ -909,9 +909,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Where people open the UI (SCARAB_UI_URL, default the public URL):
         // the OAuth callback and step-up confirmation links point there.
         .with_ui_url(config.ui_url.clone())
-        // The legacy approval history (ADR-0024, ADR-0070 §1), still written
-        // on every gate release.
-        .with_approval_history(pg.clone())
         // Org-level Environment governance (ADR-0071): what admits and governs
         // every Deploy Run. ALWAYS wired here — an unwired store would admit
         // deploys with no rules, which only a hand-built test state may do.

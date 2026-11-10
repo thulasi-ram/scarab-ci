@@ -701,7 +701,6 @@ fn gate_app(pg: &Arc<PostgresDb>) -> axum::Router {
     ));
     router(
         AppState::new(db, Arc::new(FakeClock::new(1_000)), logs)
-            .with_approval_history(pg.clone())
             .with_environment_governance(pg.clone()),
     )
 }

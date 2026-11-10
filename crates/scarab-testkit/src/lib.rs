@@ -28,12 +28,6 @@ use scarab_storage::{ObjectStore, StorageError};
 mod environment_governance;
 pub use environment_governance::InMemoryEnvironmentGovernance;
 
-/// Seed and read the frozen `legacy_project_environments` rows on Postgres
-/// (ADR-0071 §10), which production no longer writes. Behind the `postgres`
-/// feature, so the crate stays free of a database client by default.
-#[cfg(feature = "postgres")]
-pub mod legacy_environments;
-
 /// An in-memory `PolicyStore` (ADR-0075) with the Postgres adapter's
 /// versioning, name and concurrency rules.
 mod policies;

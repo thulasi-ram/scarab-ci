@@ -28,7 +28,7 @@ use scarab_forge::{
     ForgeConnection, ForgeConnectionStore, ForgeKind, OrgAssignView, RegistryError, RepoRef,
     ResolvedRepo,
 };
-use scarab_project::{ApprovalHistoryStore, Deployment, ProjectError};
+use scarab_project::ProjectError;
 
 /// `EnvironmentGovernanceStore` (ADR-0071 §2, §3, §8): baseline, eligibility,
 /// overlays and grants, and the one-snapshot read admission makes.
@@ -3588,47 +3588,6 @@ fn reg_err(e: sqlx::Error) -> RegistryError {
     RegistryError::Store(e.to_string())
 }
 
-/// The legacy approval history (ADR-0024, ADR-0070 §1) on the `deployments`
-/// table, written on every gate release. The frozen
-/// `legacy_project_environments` rows (ADR-0071 §10) have no writer here:
-/// the split report reads them, and an identity fold rewrites a folded id in
-/// their approver lists so the report never shows a Principal that no
-/// longer signs in.
-#[async_trait::async_trait]
-impl ApprovalHistoryStore for PostgresDb {
-    async fn record_deployment(
-        &self,
-        d: &Deployment,
-        wait: Option<&scarab_project::ApprovalWait>,
-    ) -> Result<(), ProjectError> {
-        let approved =
-            serde_json::to_value(&d.approved_by).map_err(|e| ProjectError::Store(e.to_string()))?;
-        // One row per gate wait (git-bug 1d06f2d): the unique index on
-        // (run_id, gate_step, gate_attempt) turns a racing second record
-        // into nothing. A record with no wait never collides.
-        sqlx::query(
-            "INSERT INTO deployments
-                 (org, project, environment, git_ref, run_id, approved_by, at, gate_step,
-                  gate_attempt)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-             ON CONFLICT (run_id, gate_step, gate_attempt) DO NOTHING",
-        )
-        .bind(&d.org)
-        .bind(&d.project)
-        .bind(&d.environment)
-        .bind(&d.git_ref)
-        .bind(&d.run)
-        .bind(approved)
-        .bind(d.at)
-        .bind(wait.map(|w| w.gate.as_str()))
-        .bind(wait.map(|w| w.attempt.as_str()))
-        .execute(self.pool())
-        .await
-        .map_err(|e| ProjectError::Store(e.to_string()))?;
-        Ok(())
-    }
-}
-
 /// "Intentionally unset" markers for the advisory coverage matrix (ADR-0037 D).
 /// The repo-default column is stored as `environment = ''` (see migration 0037).
 #[async_trait]
@@ -4672,47 +4631,6 @@ async fn merge_principal(
         .await
         .map_err(identity_err)?;
     }
-    // The frozen legacy rows too. Not a governance edit — nothing admits by
-    // them (ADR-0071 §10) — but the split report shows them to an admin, and
-    // a folded id must not reappear there as a Principal that no longer
-    // signs in.
-    let envs = sqlx::query(
-        "SELECT org, project, name, protection FROM legacy_project_environments
-         WHERE protection->'approvers' ? $1 FOR UPDATE",
-    )
-    .bind(from)
-    .fetch_all(&mut **tx)
-    .await
-    .map_err(identity_err)?;
-    for e in envs {
-        let mut protection: Value = e.get("protection");
-        if let Some(list) = protection
-            .get_mut("approvers")
-            .and_then(Value::as_array_mut)
-        {
-            let mut seen = std::collections::HashSet::new();
-            let rewritten: Vec<Value> = list
-                .iter()
-                .filter_map(Value::as_str)
-                .map(|a| if a == from { into } else { a })
-                .filter(|a| seen.insert(a.to_string()))
-                .map(|a| Value::String(a.to_string()))
-                .collect();
-            *list = rewritten;
-        }
-        sqlx::query(
-            "UPDATE legacy_project_environments SET protection = $4
-             WHERE org = $1 AND project = $2 AND name = $3",
-        )
-        .bind(e.get::<String, _>("org"))
-        .bind(e.get::<String, _>("project"))
-        .bind(e.get::<String, _>("name"))
-        .bind(&protection)
-        .execute(&mut **tx)
-        .await
-        .map_err(identity_err)?;
-    }
-
     // A passkey is registered for one Principal and never moves (ADR-0079
     // §3): `from`'s are deleted with it. The ids are the rows this DELETE
     // removed, so a passkey enrolled for `from` while the link ran is
