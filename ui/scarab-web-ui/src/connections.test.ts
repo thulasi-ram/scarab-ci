@@ -1,5 +1,14 @@
 import { describe, it, expect } from "vitest";
-import { forgeName, orgNameProblem, resyncNote, unassignedConnections } from "./connections";
+import {
+  forgeName,
+  installationId,
+  newOrgNameProblem,
+  orgNameProblem,
+  resyncNote,
+  unassignedConnections,
+  waitingFacts,
+  waitingIntro,
+} from "./connections";
 
 describe("unassigned connections", () => {
   it("keeps only the connections with no org", () => {
@@ -58,5 +67,55 @@ describe("forge names", () => {
     expect(forgeName("github")).toBe("GitHub");
     expect(forgeName("forgejo")).toBe("Forgejo");
     expect(forgeName(undefined)).toBe("the forge");
+  });
+});
+
+describe("connections waiting for an organization", () => {
+  const install = {
+    id: "github-install-90211",
+    kind: "github",
+    web_url: "https://github.com",
+    enabled_repos: 0,
+  };
+  const legacy = {
+    id: "forgejo-legacy",
+    kind: "forgejo",
+    web_url: "https://git.umbrella.dev",
+    enabled_repos: 2,
+  };
+
+  it("reads the installation id from an installation's connection id only", () => {
+    expect(installationId(install)).toBe("90211");
+    expect(installationId({ id: "github-install-90211", kind: "forgejo" })).toBeNull();
+    expect(installationId({ id: "gh-acme", kind: "github" })).toBeNull();
+    expect(installationId({ id: "github-install-12x", kind: "github" })).toBeNull();
+  });
+
+  it("lists the forge, the installation and how many repositories are enabled", () => {
+    expect(waitingFacts(install)).toEqual([
+      { label: "forge", value: "GitHub · github.com" },
+      { label: "installation", value: "90211" },
+      { label: "repositories", value: "none enabled" },
+    ]);
+    expect(waitingFacts(legacy)).toEqual([
+      { label: "forge", value: "Forgejo · git.umbrella.dev" },
+      { label: "repositories", value: "2 enabled" },
+    ]);
+  });
+
+  it("refuses an existing org's name for a new org, and every name orgNameProblem refuses", () => {
+    expect(newOrgNameProblem("acme", ["acme", "globex"])).toBe(
+      "acme is already an organization. Use Assign to an organization.",
+    );
+    expect(newOrgNameProblem(" umbrella ", ["acme"])).toBeNull();
+    expect(newOrgNameProblem("_new", ["acme"])).toBe(orgNameProblem("_new"));
+    expect(newOrgNameProblem("", [])).toBe("Name the organization.");
+  });
+
+  it("says why they wait, for one or several", () => {
+    expect(waitingIntro(1)).toBe(
+      "Scarab could not prove this account owns an organization of the same name, so it serves none until you choose.",
+    );
+    expect(waitingIntro(2)).toMatch(/^Scarab could not prove these accounts own organizations/);
   });
 });
