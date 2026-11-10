@@ -147,6 +147,14 @@ release.yml uses that version's section as the GitHub Release text. See
   (Inter 400, 13px) and Mono (JetBrains Mono 400, 12px) replace the five sizes, four weights and
   display face the pages mixed. Headings and column heads are in sentence case instead of
   upper case, and body text is 13px instead of 15px. The wordmark keeps its own face.
+- **Each library and plugin installation has its own page.** Organization settings › Libraries
+  and › Plugins list one row per installation, with tags such as yanked, untrusted source,
+  killed or probe failed, and **Install library** and **Install plugin** at the top right open
+  the install dialog. Upgrading, trusting a source, yanking and removing a library, and killing,
+  storage, connections, the broker journal and uninstalling a plugin are on the installation's
+  page (`…/settings/libraries/<publisher>~<name>/manage`, `…/settings/plugins/<id>/manage`).
+  The library review page lays its facts and checks out on one grid, with Install in one row
+  under the diff.
 
 ### Bug Fixes
 

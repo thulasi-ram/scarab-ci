@@ -340,7 +340,8 @@ spec:
       storage: 1Gi
 ```
 
-Then name it on the installation, under Settings › Plugins › storage, or with
+Then name it on the installation's page (Settings › Plugins, then the installation's row), under
+**Storage**, or with
 `PUT /v1/orgs/{org}/plugins/{name}/storage` and a body of
 `{"claim": "argocd-state", "mount_path": "/data"}`. `mount_path` defaults to `/data`; it
 can't be `/`, and it can't overlap `/tmp`, `/var/run/secrets` or the other paths the runtime

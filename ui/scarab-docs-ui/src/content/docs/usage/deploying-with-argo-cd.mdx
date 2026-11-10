@@ -176,8 +176,8 @@ Application name does. The gate's output `revision` is the git revision Argo syn
 is each source's revision, in the order of `spec.sources`, joined by commas. The run fails when
 the gate expires. See [Plugin gates](/scarab-ci/usage/pipeline-syntax/#plugin-gates).
 
-To see what the plugin asked Argo CD for, open **Settings → Plugins** and expand **broker journal**
-on the installation. It lists each request the broker forwarded or refused in the last 14 days,
+To see what the plugin asked Argo CD for, open **Settings → Plugins**, then the installation's page,
+and read its **Broker journal**. It lists each request the broker forwarded or refused in the last 14 days,
 newest first: the path, the read rule that allowed it, the status, the bytes returned, and for a
 refusal the reason. Query parameter names are shown, their values are not. An org admin can read
 the same rows from `GET /v1/orgs/{org}/plugins/{name}/broker-journal`, filtered by `phase`
