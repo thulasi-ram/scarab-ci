@@ -11,7 +11,7 @@
 // repositories on every load and merges them with the enabled ones. Who may
 // enable or disable each row comes from the server (`can_change`), the same
 // rule the bind and unbind endpoints apply.
-import { For, Show, createResource, createSignal } from "solid-js";
+import { For, Show, createResource, createSignal, onCleanup } from "solid-js";
 import { A, useParams } from "@solidjs/router";
 import { bindRepo, listOrgRepos, listRuns, unbindRepo, type OrgRepo } from "../api/client";
 import { clampPage, orgRunStats, pageCount, pageSpan } from "../org-page";
@@ -25,13 +25,20 @@ import Icon from "../components/Icon";
 const PER_PAGE = 25;
 /** How many of the most recent runs the counts are taken from (the server's cap). */
 const RUNS_LIMIT = 200;
+/** How long typing in the filter must pause before the list is asked again. */
+const FILTER_DELAY_MS = 300;
 
 export default function OrgPage() {
   const params = useParams<{ org: string }>();
   const org = () => decodeParam(params.org);
 
   const [page, setPage] = createSignal(1);
+  // What is typed, and what the list was last asked for: the list asks every
+  // connection's forge, so it waits until typing pauses.
+  const [typed, setTyped] = createSignal("");
   const [query, setQuery] = createSignal("");
+  let filterTimer: ReturnType<typeof setTimeout> | undefined;
+  onCleanup(() => clearTimeout(filterTimer));
   const [epoch, setEpoch] = createSignal(0);
   const [repos] = createResource(
     () => ({ org: org(), page: page(), q: query(), epoch: epoch() }),
@@ -46,8 +53,12 @@ export default function OrgPage() {
   const span = () => pageSpan(page(), PER_PAGE, total());
   const go = (p: number) => setPage(clampPage(p, total(), PER_PAGE));
   const search = (q: string) => {
-    setQuery(q);
-    setPage(1);
+    setTyped(q);
+    clearTimeout(filterTimer);
+    filterTimer = setTimeout(() => {
+      setQuery(q);
+      setPage(1);
+    }, FILTER_DELAY_MS);
   };
   const administers = () =>
     repos()?.can_administer === true || (me()?.admin_orgs ?? []).includes(org());
@@ -147,7 +158,7 @@ export default function OrgPage() {
             type="text"
             placeholder="Filter by name…"
             aria-label="Filter repositories by name"
-            value={query()}
+            value={typed()}
             onInput={(e) => search(e.currentTarget.value)}
           />
         </div>
