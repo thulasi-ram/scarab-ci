@@ -179,6 +179,13 @@ release.yml uses that version's section as the GitHub Release text. See
   page (`…/settings/libraries/<publisher>~<name>/manage`, `…/settings/plugins/<id>/manage`).
   The library review page lays its facts and checks out on one grid, with Install in one row
   under the diff.
+- **One dropdown across the web UI.** Every form picker, the org dropdown in Organization
+  settings and the section picker on a narrow screen open the same list as the run filters, in
+  place of the browser's own. A list longer than eight entries has a search box; a shorter one
+  is a plain list. It works from the keyboard (arrow keys, Home, End, type-ahead, Enter,
+  Escape), shows an org you do not administer without letting you pick it, sets New
+  organization… apart under a rule, and opens above a dialog. The docs version dropdown is a
+  menu of links to each version.
 
 ### Bug Fixes
 
