@@ -65,8 +65,22 @@ const ENV_GATE_RUN_ID = "0190f8a2000071fb8c00e7a9b0c1d2e3";
 // connections below that serve no org wait on that page (git-bug 19b0a45). Avery
 // administers two orgs, so the org dropdown in Organization settings offers a
 // choice; globex has no connections or repositories of its own.
+/** A mock Principal id (`p_` + 32 hex), fixed per handle so screenshots and
+ *  links stay stable. The server mints random ones (ADR-0080). */
+function pid(handle: string): string {
+  let h = 0x811c9dc5;
+  let out = "";
+  for (let round = 0; round < 4; round++) {
+    for (const c of `${round}:${handle}`) h = Math.imul(h ^ c.charCodeAt(0), 0x01000193) >>> 0;
+    out += h.toString(16).padStart(8, "0");
+  }
+  return `p_${out}`;
+}
+
 const me = {
-  subject: "a.kim",
+  subject: pid("a.kim"),
+  id: pid("a.kim"),
+  handle: "a.kim",
   display_name: "Avery Kim",
   roles: ["Owner"],
   can_administer: true,
@@ -96,14 +110,14 @@ const authProviders = [
 // grant, revoke and re-sync change it for the life of the page.
 type MockBinding = components["schemas"]["BindingDto"];
 const bindings: MockBinding[] = [
-  { subject: "a.kim", role: "owner", project: "", display_name: "Avery Kim", claimed: true, origin: "native" },
-  { subject: "m.diaz", role: "admin", project: "", display_name: "Morgan Diaz", claimed: true, origin: "native" },
-  { subject: "j.lee", role: "member", project: "", display_name: "Jordan Lee", claimed: true, origin: "native" },
-  { subject: "j.lee", role: "admin", project: "orders-api", display_name: "Jordan Lee", claimed: true, origin: "native" },
-  { subject: "j.lee", role: "admin", project: "scarab", display_name: "Jordan Lee", claimed: true, origin: "native" },
-  { subject: "r.okafor", role: "member", project: "scarab", claimed: false, origin: "import" },
-  { subject: "t.nguyen", role: "viewer", project: "scarab", display_name: "Taylor Nguyen", claimed: true, origin: "import" },
-  { subject: "okta:s.patel@acme.example", role: "viewer", project: "", display_name: "Sam Patel", claimed: true, origin: "native" },
+  { id: pid("a.kim"), handle: "a.kim", role: "owner", project: "", display_name: "Avery Kim", claimed: true, origin: "native" },
+  { id: pid("m.diaz"), handle: "m.diaz", role: "admin", project: "", display_name: "Morgan Diaz", claimed: true, origin: "native" },
+  { id: pid("j.lee"), handle: "j.lee", role: "member", project: "", display_name: "Jordan Lee", claimed: true, origin: "native" },
+  { id: pid("j.lee"), handle: "j.lee", role: "admin", project: "orders-api", display_name: "Jordan Lee", claimed: true, origin: "native" },
+  { id: pid("j.lee"), handle: "j.lee", role: "admin", project: "scarab", display_name: "Jordan Lee", claimed: true, origin: "native" },
+  { id: pid("r.okafor"), handle: "r.okafor", role: "member", project: "scarab", claimed: false, origin: "import" },
+  { id: pid("t.nguyen"), handle: "t.nguyen", role: "viewer", project: "scarab", display_name: "Taylor Nguyen", claimed: true, origin: "import" },
+  { id: pid("okta:s.patel@acme.example"), handle: "okta:s.patel@acme.example", role: "viewer", project: "", display_name: "Sam Patel", claimed: true, origin: "native" },
 ];
 // What the forge lists as each repository's collaborators, already mapped to
 // roles (admin → admin, write → member, read → viewer). A re-sync of `scarab`
@@ -111,9 +125,9 @@ const bindings: MockBinding[] = [
 // empty listing, which, as on the server, changes nothing.
 const forgeCollaborators: Record<string, MockBinding[]> = {
   scarab: [
-    { subject: "r.okafor", role: "member", project: "scarab", claimed: false },
-    { subject: "t.nguyen", role: "member", project: "scarab", display_name: "Taylor Nguyen", claimed: true },
-    { subject: "p.ito", role: "viewer", project: "scarab", claimed: false },
+    { id: pid("r.okafor"), handle: "r.okafor", role: "member", project: "scarab", claimed: false },
+    { id: pid("t.nguyen"), handle: "t.nguyen", role: "member", project: "scarab", display_name: "Taylor Nguyen", claimed: true },
+    { id: pid("p.ito"), handle: "p.ito", role: "viewer", project: "scarab", claimed: false },
   ],
 };
 
@@ -123,29 +137,32 @@ function mockResync(repo: string): MockBinding[] {
   const listed = forgeCollaborators[repo] ?? [];
   if (listed.length === 0) return [];
   for (const c of listed) {
-    const row = bindings.find((b) => b.subject === c.subject && b.project === repo);
+    const row = bindings.find((b) => b.id === c.id && b.project === repo);
     if (!row) bindings.push({ ...c, origin: "import" });
     else if (row.origin === "import") row.role = c.role;
   }
   for (let i = bindings.length - 1; i >= 0; i--) {
     const b = bindings[i]!;
-    if (b.project === repo && b.origin === "import" && !listed.some((c) => c.subject === b.subject)) {
+    if (b.project === repo && b.origin === "import" && !listed.some((c) => c.id === b.id)) {
       bindings.splice(i, 1);
     }
   }
-  return listed.map(({ subject, role, project }) => ({ subject, role, project }));
+  return listed.map(({ id, handle, role, project }) => ({ id, handle, role, project }));
 }
 
 function mockGrant(req: { subject?: string; role?: string; project?: string }) {
   const project = req.project ?? "";
-  const who = principals.find((x) => x.id === req.subject);
-  const row = bindings.find((b) => b.subject === req.subject && b.project === project);
+  // The server takes a handle or an id and stores the id.
+  const who = principals.find((x) => x.handle === req.subject || x.id === req.subject);
+  const id = who?.id ?? pid(req.subject ?? "");
+  const row = bindings.find((b) => b.id === id && b.project === project);
   if (row) {
     row.role = req.role ?? row.role;
     row.origin = "native";
   } else {
     bindings.push({
-      subject: req.subject ?? "",
+      id,
+      handle: who?.handle ?? req.subject ?? "",
       role: req.role ?? "member",
       project,
       display_name: who?.display_name ?? null,
@@ -157,31 +174,36 @@ function mockGrant(req: { subject?: string; role?: string; project?: string }) {
 
 const principals = [
   {
-    id: "j.lee",
+    id: pid("j.lee"),
+    handle: "j.lee",
     display_name: "Jordan Lee",
     claimed: true,
     identities: [{ provider: "default", handle: "j.lee" }],
   },
   {
-    id: "r.okafor",
+    id: pid("r.okafor"),
+    handle: "r.okafor",
     display_name: null,
     claimed: false,
     identities: [{ provider: "default", handle: "r.okafor" }],
   },
   {
-    id: "m.diaz",
+    id: pid("m.diaz"),
+    handle: "m.diaz",
     display_name: "Morgan Diaz",
     claimed: true,
     identities: [{ provider: "default", handle: "m.diaz" }],
   },
   {
-    id: "t.nguyen",
+    id: pid("t.nguyen"),
+    handle: "t.nguyen",
     display_name: "Taylor Nguyen",
     claimed: true,
     identities: [{ provider: "default", handle: "t.nguyen" }],
   },
   {
-    id: "okta:s.patel@acme.example",
+    id: pid("okta:s.patel@acme.example"),
+    handle: "okta:s.patel@acme.example",
     display_name: "Sam Patel",
     claimed: true,
     identities: [{ provider: "okta", handle: "s.patel@acme.example" }],
@@ -1475,7 +1497,8 @@ const apiTokens: components["schemas"]["ApiTokenDto"][] = [
   {
     id: "9f2c1d84-0f2b-4f3a-9a11-2b7c5d0e4a10",
     name: "release-bot",
-    owner_subject: "a.kim",
+    owner_subject: pid("a.kim"),
+    owner: { id: pid("a.kim"), handle: "a.kim", display_name: null },
     org: "acme",
     project: null,
     role: "member",
@@ -1489,7 +1512,8 @@ const apiTokens: components["schemas"]["ApiTokenDto"][] = [
   {
     id: "3b7a9c02-6d41-4b8e-8c22-71f0ab993c55",
     name: "orders-api deploy gate",
-    owner_subject: "j.lee",
+    owner_subject: pid("j.lee"),
+    owner: { id: pid("j.lee"), handle: "j.lee", display_name: null },
     org: "acme",
     project: "orders-api",
     role: "admin",
@@ -1503,7 +1527,8 @@ const apiTokens: components["schemas"]["ApiTokenDto"][] = [
   {
     id: "c41e7f60-2a88-4f19-b0d3-5e6a7c1b2d34",
     name: "status poller",
-    owner_subject: "a.kim",
+    owner_subject: pid("a.kim"),
+    owner: { id: pid("a.kim"), handle: "a.kim", display_name: null },
     org: "acme",
     project: null,
     role: "viewer",
@@ -1517,7 +1542,8 @@ const apiTokens: components["schemas"]["ApiTokenDto"][] = [
   {
     id: "7d5b0e13-9c44-4a27-8e61-0f3d2c8a55b7",
     name: "amy's laptop",
-    owner_subject: "a.kim",
+    owner_subject: pid("a.kim"),
+    owner: { id: pid("a.kim"), handle: "a.kim", display_name: null },
     org: "acme",
     project: null,
     role: "member",
@@ -1547,10 +1573,11 @@ function mintMockToken(body: string, pathOrg?: string): Response {
     id: `0000ffff-0000-4fff-8fff-${String(mintedTokens).padStart(12, "0")}`,
     name: req.name ?? "new token",
     owner_subject: me.subject,
+    owner: { id: me.id, handle: me.handle, display_name: me.display_name },
     org: pathOrg ?? req.org ?? "acme",
     project: req.project ?? null,
     role: req.role ?? "viewer",
-    created_by: me.subject,
+    created_by: me.handle,
     created_at: Date.now(),
     expires_at: Date.now() + (req.expires_in_days ?? 90) * day,
     last_used_at: null,
@@ -1682,7 +1709,8 @@ function orgEventsPage(search: string) {
 }
 
 const meSecurity: components["schemas"]["MeSecurityResponse"] = {
-  subject: "a.kim",
+  subject: pid("a.kim"),
+  handle: "a.kim",
   step_up: "enforce",
   has_passkey: true,
   usable_passkey_count: 2,
@@ -1775,12 +1803,28 @@ function route(pathname: string, search: string, method: string, body = ""): Res
   // step-up; an admin left with none joins the summary's list.
   const reset = method === "POST" ? p.match(/^\/v1\/orgs\/[^/]+\/members\/([^/]+)\/passkeys\/reset$/) : null;
   if (reset) {
-    const subject = decodeURIComponent(reset[1]!);
+    const id = decodeURIComponent(reset[1]!);
+    const handle = bindings.find((b) => b.id === id)?.handle ?? id;
     const without = orgSecuritySummary.admins_without_passkey;
-    const had = !without.includes(subject);
-    const admin = bindings.some((b) => b.subject === subject && b.project === "" && (b.role === "admin" || b.role === "owner"));
-    if (had && admin) without.push(subject);
-    return json({ subject, removed: had ? 2 : 0, windows_revoked: had ? 1 : 0 });
+    const had = !without.includes(handle);
+    const admin = bindings.some((b) => b.id === id && b.project === "" && (b.role === "admin" || b.role === "owner"));
+    if (had && admin) without.push(handle);
+    return json({ subject: id, handle, removed: had ? 2 : 0, windows_revoked: had ? 1 : 0 });
+  }
+  // One member by id: who they are and their roles in the org.
+  const member = method === "GET" ? p.match(/^\/v1\/orgs\/[^/]+\/members\/([^/]+)$/) : null;
+  if (member) {
+    const id = decodeURIComponent(member[1]!);
+    const held = bindings.filter((b) => b.id === id);
+    const who = principals.find((x) => x.id === id) ?? held[0];
+    if (!who) return new Response("not found", { status: 404 });
+    return json({
+      id,
+      handle: who.handle,
+      display_name: who.display_name ?? null,
+      claimed: who.claimed ?? true,
+      bindings: held,
+    });
   }
   if (p === "/v1/step-up/requests/req-demo-1") return json(stepUpRequest);
   // Removing a passkey is always-ask: answer with the refusal so the step-up
@@ -1814,8 +1858,9 @@ function route(pathname: string, search: string, method: string, body = ""): Res
     if (method === "PUT") mockGrant(JSON.parse(body || "{}"));
     if (method === "DELETE") {
       const q = new URLSearchParams(search);
+      const who = q.get("subject");
       const i = bindings.findIndex(
-        (b) => b.subject === q.get("subject") && b.project === (q.get("project") ?? ""),
+        (b) => (b.id === who || b.handle === who) && b.project === (q.get("project") ?? ""),
       );
       if (i >= 0) bindings.splice(i, 1);
     }
@@ -1826,7 +1871,7 @@ function route(pathname: string, search: string, method: string, body = ""): Res
     return json(
       principals.filter(
         (x) =>
-          x.id.toLowerCase().startsWith(q) ||
+          x.handle.toLowerCase().startsWith(q) ||
           (x.display_name ?? "").toLowerCase().includes(q) ||
           x.identities.some((i) => i.handle.toLowerCase().startsWith(q)),
       ),

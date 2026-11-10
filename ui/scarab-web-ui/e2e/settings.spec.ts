@@ -1224,7 +1224,8 @@ test("Members lists one row per person, each managed on its own page", async ({ 
   await expect(view.getByRole("button", { name: /re-sync/i })).toHaveCount(0);
 
   await jordan.getByRole("link", { name: "Manage" }).click();
-  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/members\/j\.lee\/manage$/);
+  // The URL carries the Principal's id, never the handle.
+  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/members\/p_[0-9a-f]{32}\/manage$/);
   await expect(page.getByRole("heading", { level: 1 })).toHaveText(/Members\s*Jordan Lee$/);
   const nav = page.getByRole("navigation", { name: "Settings" });
   await expect(nav.locator('[aria-current="page"]')).toHaveText("Members");
@@ -1245,7 +1246,7 @@ test("Members lists one row per person, each managed on its own page", async ({ 
   await page.getByRole("button", { name: "Change role" }).click();
   await expect(page.getByText("Jordan Lee is admin on all of acme.")).toBeVisible();
 
-  // Revoke asks for the subject typed exactly; repository roles stay.
+  // Revoke asks for the handle typed exactly; repository roles stay.
   await page.getByRole("button", { name: "Revoke" }).click();
   const dialog = page.getByRole("dialog");
   const go = dialog.getByRole("button", { name: "Revoke role" });
@@ -1280,15 +1281,16 @@ test("Grant role opens a dialog from the section header and grants an org role",
   expect(errors).toEqual([]);
 });
 
-test("a member's page takes a subject with any characters", async ({ page }) => {
+test("a member's page is addressed by id, never by an email handle", async ({ page }) => {
   const errors = collectErrors(page);
   await page.goto("/orgs/acme/settings/members");
   await page.getByRole("table", { name: "Members" }).getByRole("link", { name: "Sam Patel" }).click();
-  await expect(page).toHaveURL(/\/members\/okta%3As\.patel%40acme\.example\/manage$/);
+  await expect(page).toHaveURL(/\/members\/p_[0-9a-f]{32}\/manage$/);
+  expect(page.url()).not.toContain("patel");
   await expect(page.locator(".page-sub")).toContainText("okta:s.patel@acme.example");
   await expect(page.getByText("No roles on single repositories.")).toBeVisible();
-  await page.goto("/orgs/acme/settings/members/nobody/manage");
-  await expect(page.getByText("nobody holds no role in acme.")).toBeVisible();
+  await page.goto("/orgs/acme/settings/members/p_00000000000000000000000000000000/manage");
+  await expect(page.getByText("No such person in acme.")).toBeVisible();
   expect(errors).toEqual([]);
 });
 

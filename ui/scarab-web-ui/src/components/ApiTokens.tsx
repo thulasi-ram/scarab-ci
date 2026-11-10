@@ -223,7 +223,7 @@ function TokenRow(props: { token: ApiToken; showOwner?: boolean; onRevoke: () =>
       </td>
       <Show when={props.showOwner}>
         <td>
-          <span class="mono">{t().owner_subject}</span>
+          <span class="mono">{t().owner.handle}</span>
         </td>
       </Show>
       <td>
@@ -270,7 +270,7 @@ function RevokeToken(props: { token: ApiToken; onConfirm: () => Promise<void>; o
       onClose={props.onClose}
     >
       <p>
-        Held by <span class="mono">{props.token.owner_subject}</span>. Anything still using it (a
+        Held by <span class="mono">{props.token.owner.handle}</span>. Anything still using it (a
         CI job, a script, an agent) starts failing, and the token cannot be restored, only
         replaced.
       </p>
@@ -605,7 +605,7 @@ function MintTokenDialog(props: { onClose: () => void; onMinted: () => void }) {
             <code class="tok-secret mono">{m().token}</code>
             <p class="dlg-text">
               Send it as <code class="mono">Authorization: Bearer …</code>, or give it to the CLI as{" "}
-              <code class="mono">SCARAB_TOKEN</code>. It acts as <b>{m().record.owner_subject}</b>, up
+              <code class="mono">SCARAB_TOKEN</code>. It acts as <b>{m().record.owner.handle}</b>, up
               to <b>{m().record.role}</b> on <b>{scopeLabel(m().record)}</b>, and expires{" "}
               {absTime(m().record.expires_at)}.
             </p>

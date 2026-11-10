@@ -3440,7 +3440,62 @@
         ]
       }
     },
-    "/v1/orgs/{org}/members/{subject}/passkeys/reset": {
+    "/v1/orgs/{org}/members/{id}": {
+      "get": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "One member of an org and their roles (ADR-0080)",
+        "operationId": "get_member",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "the Principal's id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemberDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "not an org admin"
+          },
+          "404": {
+            "description": "no such Principal"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/members/{id}/passkeys/reset": {
       "post": {
         "tags": [
           "Auth & Identity"
@@ -3458,9 +3513,9 @@
             }
           },
           {
-            "name": "subject",
+            "name": "id",
             "in": "path",
-            "description": "the member's principal id",
+            "description": "the member's Principal id (a handle is accepted too)",
             "required": true,
             "schema": {
               "type": "string"
@@ -5228,7 +5283,7 @@
           {
             "name": "q",
             "in": "query",
-            "description": "id or handle prefix, or a display-name fragment",
+            "description": "handle prefix, or a display-name fragment",
             "required": true,
             "schema": {
               "type": "string"
@@ -9069,6 +9124,7 @@
           "id",
           "name",
           "owner_subject",
+          "owner",
           "org",
           "role",
           "created_by",
@@ -9083,7 +9139,8 @@
             "description": "Unix-ms."
           },
           "created_by": {
-            "type": "string"
+            "type": "string",
+            "description": "Who minted it: a Principal's handle."
           },
           "expires_at": {
             "type": "integer",
@@ -9107,9 +9164,13 @@
           "org": {
             "type": "string"
           },
+          "owner": {
+            "$ref": "#/components/schemas/PersonDto",
+            "description": "That Principal, as people read it."
+          },
           "owner_subject": {
             "type": "string",
-            "description": "The principal who holds the token and whose live authority bounds it."
+            "description": "The id of the Principal who holds the token and whose live authority\nbounds it (ADR-0080)."
           },
           "project": {
             "type": [
@@ -9365,7 +9426,8 @@
       "BindingDto": {
         "type": "object",
         "required": [
-          "subject",
+          "id",
+          "handle",
           "role",
           "project"
         ],
@@ -9382,7 +9444,15 @@
               "string",
               "null"
             ],
-            "description": "The Principal's display name, when the identity store knows it\n(ADR-0069). Absent for a pre-upgrade bare subject nobody has signed in\nas since."
+            "description": "The Principal's display name, when the identity store knows it\n(ADR-0069)."
+          },
+          "handle": {
+            "type": "string",
+            "description": "The Principal's handle (`github:alice`): what people read and type."
+          },
+          "id": {
+            "type": "string",
+            "description": "The Principal's id (ADR-0080): what a member's URL carries."
           },
           "origin": {
             "type": [
@@ -9396,9 +9466,6 @@
             "description": "Empty = org-scoped."
           },
           "role": {
-            "type": "string"
-          },
-          "subject": {
             "type": "string"
           }
         }
@@ -10506,7 +10573,7 @@
             "items": {
               "type": "string"
             },
-            "description": "Principal ids. Every one must approve (AND), unless the baseline's\n`approval_gate.required_approvals` says how many of its own must."
+            "description": "Principal handles (stored as ids, ADR-0080). Every one must approve\n(AND), unless the baseline's `approval_gate.required_approvals` says\nhow many of its own must."
           },
           "require_reason": {
             "type": "boolean",
@@ -11262,6 +11329,7 @@
         "required": [
           "session",
           "subject",
+          "handle",
           "csrf"
         ],
         "properties": {
@@ -11269,11 +11337,16 @@
             "type": "string",
             "description": "The session's CSRF token — browsers echo it in `x-csrf-token` on every\nmutation (also delivered as the readable `scarab_csrf` cookie)."
           },
+          "handle": {
+            "type": "string",
+            "description": "The Principal's handle: what people read."
+          },
           "session": {
             "type": "string"
           },
           "subject": {
-            "type": "string"
+            "type": "string",
+            "description": "The Principal's id (ADR-0080)."
           }
         }
       },
@@ -11355,6 +11428,8 @@
         "description": "The authenticated principal (ADR-0049) — powers the UI's identity menu.",
         "required": [
           "subject",
+          "id",
+          "handle",
           "roles",
           "can_administer",
           "admin_orgs",
@@ -11385,6 +11460,14 @@
             "type": "boolean",
             "description": "Does the caller hold a global `Administer` role? Only such a caller\nmay add the first connection of an Org that does not exist yet, or\nact on an unassigned connection (git-bug 19b0a45). Always `false` for\nan API token."
           },
+          "handle": {
+            "type": "string",
+            "description": "The Principal's handle (`github:alice`): what people read and type."
+          },
+          "id": {
+            "type": "string",
+            "description": "The same id, under the name every person response uses."
+          },
           "identities": {
             "type": "array",
             "items": {
@@ -11401,7 +11484,7 @@
           },
           "subject": {
             "type": "string",
-            "description": "Stable, forge-agnostic identity subject."
+            "description": "The Principal's id (ADR-0080): stable, random, never shown as a name."
           },
           "token_mint_orgs": {
             "type": "array",
@@ -11417,6 +11500,7 @@
         "description": "`GET /v1/me/security`.",
         "required": [
           "subject",
+          "handle",
           "step_up",
           "has_passkey",
           "usable_passkey_count",
@@ -11442,6 +11526,10 @@
             "type": "string",
             "description": "Where this human logs in again — through the login provider they sign\nin with — landing on enrollment (a relative URL). The one place the\nprovider is chosen: `scarab security setup` prints this."
           },
+          "handle": {
+            "type": "string",
+            "description": "The caller's handle: what to sign in as."
+          },
           "has_passkey": {
             "type": "boolean",
             "description": "Holds at least one usable (not clone-flagged) passkey."
@@ -11462,7 +11550,8 @@
             "description": "`enforce` or `off`."
           },
           "subject": {
-            "type": "string"
+            "type": "string",
+            "description": "The caller's Principal id (ADR-0080)."
           },
           "usable_passkey_count": {
             "type": "integer",
@@ -11477,6 +11566,43 @@
             ],
             "format": "int64",
             "description": "This browser session's open window, if any (unix ms)."
+          }
+        }
+      },
+      "MemberDto": {
+        "type": "object",
+        "description": "`GET /v1/orgs/{org}/members/{id}`: one person and the roles they hold in\nthe org (ADR-0080 §5). The member page reads this by the Principal's id.",
+        "required": [
+          "id",
+          "handle",
+          "bindings"
+        ],
+        "properties": {
+          "bindings": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BindingDto"
+            },
+            "description": "Their bindings in the org, org scope first, then by repository."
+          },
+          "claimed": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "`false` = created by a forge import, not signed into yet. Absent\nwhen no identity store knows them."
+          },
+          "display_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "handle": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
           }
         }
       },
@@ -11652,7 +11778,7 @@
           },
           "updated_by": {
             "type": "string",
-            "description": "Who last wrote it (a Principal subject)."
+            "description": "Who last wrote it (a Principal's handle)."
           }
         }
       },
@@ -11992,10 +12118,15 @@
         "description": "What a passkey reset removed.",
         "required": [
           "subject",
+          "handle",
           "removed",
           "windows_revoked"
         ],
         "properties": {
+          "handle": {
+            "type": "string",
+            "description": "Its handle (ADR-0080)."
+          },
           "removed": {
             "type": "integer",
             "format": "int64",
@@ -12004,7 +12135,7 @@
           },
           "subject": {
             "type": "string",
-            "description": "The principal whose passkeys were reset."
+            "description": "The id of the Principal whose passkeys were reset."
           },
           "windows_revoked": {
             "type": "integer",
@@ -12079,6 +12210,30 @@
               "null"
             ],
             "description": "Pass as `after` for the next page; absent on the last."
+          }
+        }
+      },
+      "PersonDto": {
+        "type": "object",
+        "description": "A person as an API response names them (ADR-0080 §5).",
+        "required": [
+          "id",
+          "handle"
+        ],
+        "properties": {
+          "display_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "handle": {
+            "type": "string",
+            "description": "What people type and read."
+          },
+          "id": {
+            "type": "string",
+            "description": "The Principal's id: what a URL carries. For a reference that names\nno Principal, the reference itself."
           }
         }
       },
@@ -13248,7 +13403,7 @@
           },
           "author": {
             "type": "string",
-            "description": "The Principal who saved it."
+            "description": "The handle of the Principal who saved it."
           },
           "content_hash": {
             "type": "string"
@@ -13282,6 +13437,7 @@
         "description": "A Principal, as the grant/approver typeahead offers it (ADR-0069 §3).",
         "required": [
           "id",
+          "handle",
           "claimed",
           "identities"
         ],
@@ -13296,9 +13452,13 @@
               "null"
             ]
           },
+          "handle": {
+            "type": "string",
+            "description": "What a grant or an approver entry is typed as."
+          },
           "id": {
             "type": "string",
-            "description": "What a grant or an approver entry stores."
+            "description": "The Principal's id (ADR-0080): what a grant or an approver entry\nstores, and what a URL carries."
           },
           "identities": {
             "type": "array",
@@ -13535,7 +13695,7 @@
             "items": {
               "type": "string"
             },
-            "description": "Principal ids (ADR-0069): each must name an existing Principal; a\nmerged id is stored as the Principal it now is. All must approve."
+            "description": "Principal handles or ids (ADR-0069, ADR-0080): each must name an\nexisting Principal; a merged one is stored as the Principal it now is.\nAll must approve."
           },
           "require_reason": {
             "type": "boolean",
@@ -14551,7 +14711,7 @@
           },
           "subject": {
             "type": "string",
-            "description": "The human/principal it is about."
+            "description": "The handle of the human/principal it is about."
           },
           "target": {
             "type": [

@@ -99,7 +99,7 @@ export default function LinkedAccounts() {
         {/* The id grants and approver lists name — shown verbatim in Mono,
             not in the panel header, because it is matched exactly. */}
         <p class="subtle">
-          You are <code class="mono">{me()!.subject}</code>.
+          You are <code class="mono">{me()!.handle}</code>.
         </p>
       </Show>
 

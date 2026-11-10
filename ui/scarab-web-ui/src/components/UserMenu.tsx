@@ -1,5 +1,5 @@
 // The signed-in identity: an avatar showing initials, opening a
-// dropdown with the principal's name, subject, and role, plus sign-out. Driven
+// dropdown with the principal's name, handle, and role, plus sign-out. Driven
 // by the real `GET /v1/me` — no more hardcoded placeholder.
 import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { A, useLocation } from "@solidjs/router";
@@ -14,7 +14,7 @@ const MENU_ICONS: Record<SettingsGroupKind, string> = {
   org: "settings",
 };
 
-/** Initials from a display name ("Thulasi Ram" → "TR") or subject ("t.ram" → "T"). */
+/** Initials from a display name ("Thulasi Ram" → "TR") or handle ("t.ram" → "T"). */
 function initials(name: string): string {
   const parts = name.trim().split(/[\s._-]+/).filter(Boolean);
   if (parts.length >= 2) return (parts[0][0] + parts[1][0]).toUpperCase();
@@ -26,7 +26,7 @@ export default function UserMenu() {
   const location = useLocation();
   let root: HTMLDivElement | undefined;
 
-  const label = () => me()?.display_name || me()?.subject || "";
+  const label = () => me()?.display_name || me()?.handle || "";
 
   onMount(() => {
     const onDoc = (e: MouseEvent) => {
@@ -63,8 +63,8 @@ export default function UserMenu() {
                 <span class="avatar-init">{initials(label())}</span>
               </span>
               <div class="um-id">
-                <div class="um-name">{user().display_name ?? user().subject}</div>
-                <div class="um-sub mono">{user().subject}</div>
+                <div class="um-name">{user().display_name ?? user().handle}</div>
+                <div class="um-sub mono">{user().handle}</div>
               </div>
             </div>
             <div class="um-roles">

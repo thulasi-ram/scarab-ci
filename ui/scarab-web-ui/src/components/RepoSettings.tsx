@@ -236,7 +236,9 @@ function RepoAccess(props: { org: string; repo: string; forge: string }) {
   const rows = () => repoAccessRows(bindings.error ? [] : (bindings() ?? []), props.repo);
   const [notice, setNotice] = createSignal<string | null>(null);
   const [granting, setGranting] = createSignal(false);
-  const [revoking, setRevoking] = createSignal<string | null>(null);
+  /** The person being revoked: their id (what the request names) and their
+   *  handle (what the dialog asks to type). */
+  const [revoking, setRevoking] = createSignal<{ id: string; handle: string } | null>(null);
   const [resyncing, setResyncing] = createSignal(false);
   // `null` is a deployment with no role store (authorization off).
   const available = () => !bindings.loading && !bindings.error && bindings() !== null;
@@ -244,8 +246,8 @@ function RepoAccess(props: { org: string; repo: string; forge: string }) {
     s === "forge" ? `from ${props.forge} collaborators` : s === "scarab" ? "granted in Scarab" : "";
 
   // A refusal shows in the confirm dialog.
-  const revoke = async (s: string) => {
-    await revokeRole(props.org, s, props.repo);
+  const revoke = async (id: string) => {
+    await revokeRole(props.org, id, props.repo);
     setNotice(null);
     await refetch();
   };
@@ -304,7 +306,7 @@ function RepoAccess(props: { org: string; repo: string; forge: string }) {
                       {(r) => (
                         <tr>
                           <td class="keep">
-                            <PersonCell display={r.display} subject={r.subject} pending={r.pending} />
+                            <PersonCell display={r.display} handle={r.handle} pending={r.pending} />
                           </td>
                           <td>
                             <span class="tok-role">{r.role}</span>
@@ -314,7 +316,7 @@ function RepoAccess(props: { org: string; repo: string; forge: string }) {
                           </td>
                           <td>{source(r.source)}</td>
                           <td class="acts keep">
-                            <button class="btn btn-danger btn-sm" onClick={() => setRevoking(r.subject)}>
+                            <button class="btn btn-danger btn-sm" onClick={() => setRevoking({ id: r.id, handle: r.handle })}>
                               Revoke
                             </button>
                           </td>
@@ -331,7 +333,7 @@ function RepoAccess(props: { org: string; repo: string; forge: string }) {
                         {(r) => (
                           <tr class="access-via-org">
                             <td class="keep">
-                              <PersonCell display={r.display} subject={r.subject} pending={r.pending} />
+                              <PersonCell display={r.display} handle={r.handle} pending={r.pending} />
                             </td>
                             <td>
                               via org role <span class="tok-role">{r.orgRole}</span>
@@ -371,11 +373,11 @@ function RepoAccess(props: { org: string; repo: string; forge: string }) {
       <Show when={revoking()}>
         {(s) => (
           <ConfirmDestructive
-            title={`Revoke ${s()}'s role on ${props.repo}?`}
+            title={`Revoke ${s().handle}'s role on ${props.repo}?`}
             purpose="A revoke made here is kept: a later forge re-sync does not give the role back. An org role they hold still applies."
-            name={s()}
+            name={s().handle}
             confirmLabel="Revoke role"
-            onConfirm={() => revoke(s())}
+            onConfirm={() => revoke(s().id)}
             onClose={() => setRevoking(null)}
           />
         )}
@@ -586,7 +588,7 @@ function ChangeList(props: { label: string; items: ResyncChange[] }) {
           <For each={props.items}>
             {(c) => (
               <li>
-                {c.display} <span class="mono subtle">{c.subject}</span>{" "}
+                {c.display} <span class="mono subtle">{c.handle}</span>{" "}
                 {c.was ? `${c.was} → ${c.role}` : c.role}
               </li>
             )}

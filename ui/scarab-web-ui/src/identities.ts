@@ -11,9 +11,12 @@ export type ProviderLike = { id: string; name: string; default: boolean };
 /** One linked account (`GET /v1/me` → `identities`), structurally. */
 export type IdentityLike = { provider: string; handle: string };
 
-/** One role binding (`GET /v1/orgs/{org}/bindings`), structurally. */
+/** One role binding (`GET /v1/orgs/{org}/bindings`), structurally. The
+ * person is named twice: `id`, the Principal's random id that a URL
+ * carries, and `handle` (`github:alice`), what people read and type. */
 export type BindingLike = {
-  subject: string;
+  id: string;
+  handle: string;
   role: string;
   /** Empty = org-wide. */
   project: string;
@@ -191,7 +194,10 @@ export async function confirmMerge(
 }
 
 export type MemberRow = {
-  subject: string;
+  /** The Principal's id: the row's key and the member page's URL. */
+  id: string;
+  /** What people read and type. */
+  handle: string;
   display: string;
   /** `true` = imported from the forge, nobody has signed in as them yet. */
   pending: boolean;
@@ -206,14 +212,15 @@ export type MemberRow = {
  * anyone has signed in as them yet. */
 function person(b: BindingLike) {
   return {
-    subject: b.subject,
-    display: b.display_name || b.subject,
+    id: b.id,
+    handle: b.handle,
+    display: b.display_name || b.handle,
     pending: b.claimed === false,
   };
 }
 
-const byName = (a: { display: string; subject: string }, b: { display: string; subject: string }) =>
-  a.display.localeCompare(b.display) || a.subject.localeCompare(b.subject);
+const byName = (a: { display: string; handle: string }, b: { display: string; handle: string }) =>
+  a.display.localeCompare(b.display) || a.handle.localeCompare(b.handle);
 
 /** The org's Members list: one row per person, with their org role and the
  * repositories they hold a role in. Someone with repository roles only is a
@@ -222,10 +229,10 @@ const byName = (a: { display: string; subject: string }, b: { display: string; s
 export function memberRows(bindings: BindingLike[]): MemberRow[] {
   const by = new Map<string, MemberRow>();
   for (const b of bindings) {
-    let row = by.get(b.subject);
+    let row = by.get(b.id);
     if (!row) {
       row = { ...person(b), orgRole: null, repos: [] };
-      by.set(b.subject, row);
+      by.set(b.id, row);
     }
     if (!b.project) row.orgRole = b.role;
     else if (!row.repos.includes(b.project)) row.repos.push(b.project);
@@ -237,12 +244,12 @@ export function memberRows(bindings: BindingLike[]): MemberRow[] {
 /** The roles an org role can be, lowest first. */
 export const ORG_ROLES = ["viewer", "member", "admin", "owner"] as const;
 
-/** A member's page in org settings,
- *  `/orgs/<org>/settings/members/<subject>/manage`. A binding has no id of
- *  its own, so the subject is the key: one encoded segment, before a static
- *  last one, whatever it holds (`okta:s.patel@acme.example`, a `/`). */
-export const memberHref = (org: string, subject: string) =>
-  `/orgs/${encodeURIComponent(org)}/settings/members/${encodeURIComponent(subject)}/manage`;
+/** A member's page in org settings, `/orgs/<org>/settings/members/<id>/manage`.
+ *  The segment is the Principal's id (`p_` and 32 hex characters), never the
+ *  handle: a handle can be an email, and a URL is not where personal data
+ *  belongs. Encoded all the same. */
+export const memberHref = (org: string, id: string) =>
+  `/orgs/${encodeURIComponent(org)}/settings/members/${encodeURIComponent(id)}/manage`;
 
 /** A repository's Settings tab, whose Access section holds its roles. */
 export const repoAccessHref = (org: string, repo: string) =>
@@ -253,12 +260,12 @@ export const repoCountLabel = (n: number) => `${n} ${n === 1 ? "repository" : "r
 
 export type MemberRepoRole = { repo: string; role: string; source: RoleSource };
 
-/** The repositories `subject` holds a role in, with the role and where it
- *  came from, by repository name. Read-only on the member's page: each is
+/** The repositories Principal `id` holds a role in, with the role and where
+ *  it came from, by repository name. Read-only on the member's page: each is
  *  changed on that repository's Settings › Access. */
-export function memberRepoRoles(bindings: BindingLike[], subject: string): MemberRepoRole[] {
+export function memberRepoRoles(bindings: BindingLike[], id: string): MemberRepoRole[] {
   return bindings
-    .filter((b) => b.subject === subject && b.project)
+    .filter((b) => b.id === id && b.project)
     .map((b) => ({ repo: b.project, role: b.role, source: roleSource(b.origin) }))
     .sort((a, b) => a.repo.localeCompare(b.repo));
 }
@@ -274,7 +281,8 @@ export function roleSource(origin: string | null | undefined): RoleSource {
 }
 
 export type DirectAccessRow = {
-  subject: string;
+  id: string;
+  handle: string;
   display: string;
   pending: boolean;
   /** The role held on this repository. */
@@ -285,7 +293,8 @@ export type DirectAccessRow = {
 };
 
 export type OrgAccessRow = {
-  subject: string;
+  id: string;
+  handle: string;
   display: string;
   pending: boolean;
   /** The org role that reaches this repository. */
@@ -301,28 +310,28 @@ export function repoAccessRows(
   repo: string,
 ): { direct: DirectAccessRow[]; viaOrg: OrgAccessRow[] } {
   const orgRoles = new Map<string, string>();
-  for (const b of bindings) if (!b.project) orgRoles.set(b.subject, b.role);
+  for (const b of bindings) if (!b.project) orgRoles.set(b.id, b.role);
   const direct: DirectAccessRow[] = bindings
     .filter((b) => b.project === repo)
     .map((b) => ({
       ...person(b),
       role: b.role,
       source: roleSource(b.origin),
-      orgRole: orgRoles.get(b.subject) ?? null,
+      orgRole: orgRoles.get(b.id) ?? null,
     }))
     .sort(byName);
-  const here = new Set(direct.map((r) => r.subject));
+  const here = new Set(direct.map((r) => r.id));
   const seen = new Set<string>();
   const viaOrg: OrgAccessRow[] = [];
   for (const b of bindings) {
-    if (b.project || here.has(b.subject) || seen.has(b.subject)) continue;
-    seen.add(b.subject);
+    if (b.project || here.has(b.id) || seen.has(b.id)) continue;
+    seen.add(b.id);
     viaOrg.push({ ...person(b), orgRole: b.role });
   }
   return { direct, viaOrg: viaOrg.sort(byName) };
 }
 
-export type ResyncChange = { subject: string; display: string; role: string; was?: string };
+export type ResyncChange = { id: string; handle: string; display: string; role: string; was?: string };
 
 /** What a forge re-sync of `repo` changed, from the bindings listed before
  * and after it. Only rows the forge owns count: a re-sync never touches a
@@ -337,28 +346,28 @@ export function resyncDiff(
     new Map(
       list
         .filter((b) => b.project === repo && b.origin !== "native")
-        .map((b) => [b.subject, b] as const),
+        .map((b) => [b.id, b] as const),
     );
   const was = forgeRows(before);
   const now = forgeRows(after);
   const added: ResyncChange[] = [];
   const changed: ResyncChange[] = [];
   const removed: ResyncChange[] = [];
-  for (const [subject, b] of now) {
-    const old = was.get(subject);
-    const row = { subject, display: person(b).display, role: b.role };
+  for (const [id, b] of now) {
+    const old = was.get(id);
+    const row = { id, handle: b.handle, display: person(b).display, role: b.role };
     if (!old) added.push(row);
     else if (old.role !== b.role) changed.push({ ...row, was: old.role });
   }
-  for (const [subject, b] of was) {
-    if (!now.has(subject)) removed.push({ subject, display: person(b).display, role: b.role });
+  for (const [id, b] of was) {
+    if (!now.has(id)) removed.push({ id, handle: b.handle, display: person(b).display, role: b.role });
   }
   return { added: added.sort(byName), changed: changed.sort(byName), removed: removed.sort(byName) };
 }
 
 /**
- * Append a picked Principal id to a comma-separated approver list, once.
- * Approvers are matched by exact id (ADR-0069 §3), so picking beats typing.
+ * Append a picked Principal's handle to a comma-separated approver list,
+ * once. The server stores the Principal it names, so picking beats typing.
  */
 export function addToList(list: string, id: string): string {
   const items = list

@@ -162,17 +162,18 @@ describe("Settings → Security", () => {
     expect(
       resetCandidates(
         [
-          { subject: "j.lee", display_name: "Jordan Lee" },
-          { subject: "a.kim", display_name: "Avery Kim" },
-          { subject: "j.lee", display_name: "Jordan Lee" },
-          { subject: "bot", display_name: null },
+          { id: "p_j", handle: "j.lee", display_name: "Jordan Lee" },
+          { id: "p_a", handle: "a.kim", display_name: "Avery Kim" },
+          { id: "p_j", handle: "j.lee", display_name: "Jordan Lee" },
+          { id: "p_b", handle: "bot", display_name: null },
         ],
+        // The summary names admins by handle.
         ["j.lee"],
       ),
     ).toEqual([
-      { subject: "a.kim", name: "Avery Kim", noPasskey: false },
-      { subject: "bot", name: "bot", noPasskey: false },
-      { subject: "j.lee", name: "Jordan Lee", noPasskey: true },
+      { id: "p_a", handle: "a.kim", name: "Avery Kim", noPasskey: false },
+      { id: "p_b", handle: "bot", name: "bot", noPasskey: false },
+      { id: "p_j", handle: "j.lee", name: "Jordan Lee", noPasskey: true },
     ]);
   });
 });
@@ -228,7 +229,7 @@ describe("the confirm page", () => {
 
 describe("resetResultText", () => {
   it("counts what the reset removed and revoked", () => {
-    expect(resetResultText({ subject: "j.lee", removed: 2, windows_revoked: 1 })).toBe(
+    expect(resetResultText({ subject: "p_j", handle: "j.lee", removed: 2, windows_revoked: 1 })).toBe(
       "Reset j.lee: 2 passkeys removed, 1 confirmation revoked.",
     );
     expect(resetResultText({ subject: "j.lee", removed: 1, windows_revoked: 0 })).toBe(

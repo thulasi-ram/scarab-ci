@@ -135,7 +135,7 @@ function Review(props: { org: string }) {
           <>
             <span class="mono">{props.org}</span> ·{" "}
             {fetched()?.current ? "review an upgrade" : "review a library before installing it"}
-            <Show when={fetched()}> · fetched by {me()?.subject}</Show>
+            <Show when={fetched()}> · fetched by {me()?.handle}</Show>
           </>
         }
       />

@@ -2,12 +2,12 @@
 // every repository of the org.
 //
 // One table row per person: their name (a link to their page) with the
-// subject a grant stores under it and "not signed in yet" for a user a forge
+// handle people type and "not signed in yet" for a user a forge
 // re-sync created, their org role, and how many repositories they hold a role
 // in. Someone with
 // repository roles only is listed too: they are a member of the org in
 // practice. Grant role, top right, grants an org role in a dialog. Changing
-// or revoking one is on the person's page (`…/settings/members/<subject>/
+// or revoking one is on the person's page (`…/settings/members/<id>/
 // manage`, routes/MemberManage.tsx), which also lists their repository roles.
 import { For, Show, createResource, createSignal } from "solid-js";
 import { A } from "@solidjs/router";
@@ -83,9 +83,9 @@ export default function Members(props: { org: string }) {
                           <td class="keep">
                             <PersonCell
                               display={r.display}
-                              subject={r.subject}
+                              handle={r.handle}
                               pending={r.pending}
-                              href={memberHref(props.org, r.subject)}
+                              href={memberHref(props.org, r.id)}
                             />
                           </td>
                           <td>
@@ -99,7 +99,7 @@ export default function Members(props: { org: string }) {
                             </Show>
                           </td>
                           <td class="acts keep">
-                            <A class="btn btn-ghost btn-sm" href={memberHref(props.org, r.subject)}>
+                            <A class="btn btn-ghost btn-sm" href={memberHref(props.org, r.id)}>
                               Manage
                             </A>
                           </td>
@@ -208,9 +208,9 @@ const NOT_SIGNED_IN = [
 ];
 
 /** A person in a table cell: their name (a link to `href` when given), the
- *  subject a grant stores under it, and "not signed in yet" for a user a forge
+ *  handle people type, and "not signed in yet" for a user a forge
  *  re-sync created. Members and a repository's Access both use it. */
-export function PersonCell(props: { display: string; subject: string; pending: boolean; href?: string }) {
+export function PersonCell(props: { display: string; handle: string; pending: boolean; href?: string }) {
   return (
     <>
       <span class="person-line">
@@ -225,7 +225,7 @@ export function PersonCell(props: { display: string; subject: string; pending: b
           <Chips chips={NOT_SIGNED_IN} />
         </Show>
       </span>
-      <span class="person-id mono">{props.subject}</span>
+      <span class="person-id mono">{props.handle}</span>
     </>
   );
 }

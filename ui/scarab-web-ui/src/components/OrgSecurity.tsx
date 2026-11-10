@@ -27,10 +27,11 @@ export default function OrgSecurity(props: { org: string }) {
   const [notice, setNotice] = createSignal<string | null>(null);
   // The reset dialog: closed (null), picking a member, or confirming one.
   const [step, setStep] = createSignal<"pick" | "confirm" | null>(null);
+  // The picked member's Principal id (what the reset's URL carries).
   const [member, setMember] = createSignal("");
-  const open = (subject = "") => {
+  const open = (id = "") => {
     setNotice(null);
-    setMember(subject);
+    setMember(id);
     setStep("pick");
   };
   const owner = () => canResetPasskeys(summary());
@@ -87,7 +88,7 @@ export default function OrgSecurity(props: { org: string }) {
                               <button
                                 class="sec-chip-btn mono"
                                 title={`Reset the passkeys ${a} holds`}
-                                onClick={() => open(a)}
+                                onClick={() => open(candidates().find((c) => c.handle === a)?.id ?? "")}
                               >
                                 {a}
                               </button>
@@ -123,12 +124,14 @@ export default function OrgSecurity(props: { org: string }) {
         />
       </Show>
       <Show when={step() === "confirm" && member()}>
-        {(subject) => (
+        {(id) => {
+          const handle = () => candidates().find((c) => c.id === id())?.handle ?? id();
+          return (
           <ConfirmDestructive
             eyebrow={`${props.org} · security`}
-            title={`Reset every passkey ${subject()} holds?`}
+            title={`Reset every passkey ${handle()} holds?`}
             purpose="They can no longer confirm anything until they enroll a new passkey from a fresh login."
-            name={subject()}
+            name={handle()}
             confirmLabel="Reset passkeys"
             onConfirm={reset}
             // Cancel goes back to the member list; after a reset the dialog is closed.
@@ -137,7 +140,8 @@ export default function OrgSecurity(props: { org: string }) {
             <p>Any open step-up window of theirs closes now.</p>
             <p>You will be asked to confirm this with your own passkey.</p>
           </ConfirmDestructive>
-        )}
+          );
+        }}
       </Show>
 
       <EventLog org={props.org} />
@@ -149,10 +153,11 @@ export default function OrgSecurity(props: { org: string }) {
  *  passkey marked. */
 function PickMember(props: {
   org: string;
-  members: { subject: string; name: string; noPasskey: boolean }[];
+  members: { id: string; handle: string; name: string; noPasskey: boolean }[];
   loading: boolean;
+  /** The picked member's id. */
   picked: string;
-  onPick: (subject: string) => void;
+  onPick: (id: string) => void;
   onNext: () => void;
   onClose: () => void;
 }) {
@@ -180,16 +185,16 @@ function PickMember(props: {
         <div class="sec-pick" role="radiogroup" aria-label="Member">
           <For each={props.members}>
             {(m) => (
-              <label classList={{ on: props.picked === m.subject }}>
+              <label classList={{ on: props.picked === m.id }}>
                 <input
                   type="radio"
                   name="reset-member"
-                  value={m.subject}
-                  checked={props.picked === m.subject}
-                  onChange={() => props.onPick(m.subject)}
+                  value={m.id}
+                  checked={props.picked === m.id}
+                  onChange={() => props.onPick(m.id)}
                 />
                 <span class="tok-name">{m.name}</span>
-                <span class="tok-scope mono">{m.subject}</span>
+                <span class="tok-scope mono">{m.handle}</span>
                 <Show when={m.noPasskey}>
                   <span class="tok-state tok-expired">no passkey</span>
                 </Show>

@@ -1018,7 +1018,24 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/v1/orgs/{org}/members/{subject}/passkeys/reset": {
+    "/v1/orgs/{org}/members/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** One member of an org and their roles (ADR-0080) */
+        get: operations["get_member"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/members/{id}/passkeys/reset": {
         parameters: {
             query?: never;
             header?: never;
@@ -2601,6 +2618,7 @@ export interface components {
              * @description Unix-ms.
              */
             created_at: number;
+            /** @description Who minted it: a Principal's handle. */
             created_by: string;
             /**
              * Format: int64
@@ -2616,7 +2634,12 @@ export interface components {
             last_used_at?: number | null;
             name: string;
             org: string;
-            /** @description The principal who holds the token and whose live authority bounds it. */
+            /** @description That Principal, as people read it. */
+            owner: components["schemas"]["PersonDto"];
+            /**
+             * @description The id of the Principal who holds the token and whose live authority
+             *     bounds it (ADR-0080).
+             */
             owner_subject: string;
             /** @description `None` for an org-scoped token. */
             project?: string | null;
@@ -2795,10 +2818,13 @@ export interface components {
             claimed?: boolean | null;
             /**
              * @description The Principal's display name, when the identity store knows it
-             *     (ADR-0069). Absent for a pre-upgrade bare subject nobody has signed in
-             *     as since.
+             *     (ADR-0069).
              */
             display_name?: string | null;
+            /** @description The Principal's handle (`github:alice`): what people read and type. */
+            handle: string;
+            /** @description The Principal's id (ADR-0080): what a member's URL carries. */
+            id: string;
             /**
              * @description Who wrote the binding: `native` (granted in Scarab, which a forge
              *     re-sync never changes) or `import` (seeded from the forge's
@@ -2810,7 +2836,6 @@ export interface components {
             /** @description Empty = org-scoped. */
             project: string;
             role: string;
-            subject: string;
         };
         /** @description One input in the scope of a Step's invocation. */
         BoundInputDto: {
@@ -3413,8 +3438,9 @@ export interface components {
             allowed_refs: string[];
             approval_gate?: null | components["schemas"]["ApprovalGateRulesDto"];
             /**
-             * @description Principal ids. Every one must approve (AND), unless the baseline's
-             *     `approval_gate.required_approvals` says how many of its own must.
+             * @description Principal handles (stored as ids, ADR-0080). Every one must approve
+             *     (AND), unless the baseline's `approval_gate.required_approvals` says
+             *     how many of its own must.
              */
             approvers: string[];
             /** @description A human dispatch must carry a reason (ADR-0057 §3). */
@@ -3764,7 +3790,10 @@ export interface components {
              *     mutation (also delivered as the readable `scarab_csrf` cookie).
              */
             csrf: string;
+            /** @description The Principal's handle: what people read. */
+            handle: string;
             session: string;
+            /** @description The Principal's id (ADR-0080). */
             subject: string;
         };
         /** @description The installed manifest against the new one, group by group. */
@@ -3829,6 +3858,10 @@ export interface components {
              *     an API token.
              */
             global_admin: boolean;
+            /** @description The Principal's handle (`github:alice`): what people read and type. */
+            handle: string;
+            /** @description The same id, under the name every person response uses. */
+            id: string;
             /**
              * @description The provider accounts this Principal can sign in with (ADR-0069).
              *     Empty when no identity store is wired (dev).
@@ -3836,7 +3869,7 @@ export interface components {
             identities: components["schemas"]["PrincipalIdentityDto"][];
             /** @description The principal's Scarab-native roles (e.g. `["Owner"]`). */
             roles: string[];
-            /** @description Stable, forge-agnostic identity subject. */
+            /** @description The Principal's id (ADR-0080): stable, random, never shown as a name. */
             subject: string;
             /**
              * @description The orgs this principal may mint a personal API token in, sorted: every
@@ -3864,6 +3897,8 @@ export interface components {
              *     provider is chosen: `scarab security setup` prints this.
              */
             fresh_login_url: string;
+            /** @description The caller's handle: what to sign in as. */
+            handle: string;
             /** @description Holds at least one usable (not clone-flagged) passkey. */
             has_passkey: boolean;
             /** @description The passkeys — empty for an API-token caller (see `passkeys_hidden`). */
@@ -3875,6 +3910,7 @@ export interface components {
             passkeys_hidden: boolean;
             /** @description `enforce` or `off`. */
             step_up: string;
+            /** @description The caller's Principal id (ADR-0080). */
             subject: string;
             /**
              * Format: int64
@@ -3886,6 +3922,22 @@ export interface components {
              * @description This browser session's open window, if any (unix ms).
              */
             window_expires_at?: number | null;
+        };
+        /**
+         * @description `GET /v1/orgs/{org}/members/{id}`: one person and the roles they hold in
+         *     the org (ADR-0080 §5). The member page reads this by the Principal's id.
+         */
+        MemberDto: {
+            /** @description Their bindings in the org, org scope first, then by repository. */
+            bindings: components["schemas"]["BindingDto"][];
+            /**
+             * @description `false` = created by a forge import, not signed into yet. Absent
+             *     when no identity store knows them.
+             */
+            claimed?: boolean | null;
+            display_name?: string | null;
+            handle: string;
+            id: string;
         };
         /**
          * @description `POST /v1/me/tokens` body: [`MintTokenRequest`] plus the org, which the
@@ -3995,7 +4047,7 @@ export interface components {
              * @description Unix-ms.
              */
             updated_at: number;
-            /** @description Who last wrote it (a Principal subject). */
+            /** @description Who last wrote it (a Principal's handle). */
             updated_by: string;
         };
         OrgLibrariesDto: {
@@ -4146,12 +4198,14 @@ export interface components {
         };
         /** @description What a passkey reset removed. */
         PasskeyResetDto: {
+            /** @description Its handle (ADR-0080). */
+            handle: string;
             /**
              * Format: int64
              * @description How many passkeys were removed.
              */
             removed: number;
-            /** @description The principal whose passkeys were reset. */
+            /** @description The id of the Principal whose passkeys were reset. */
             subject: string;
             /**
              * Format: int64
@@ -4190,6 +4244,17 @@ export interface components {
             gates: components["schemas"]["PendingGateDto"][];
             /** @description Pass as `after` for the next page; absent on the last. */
             next?: string | null;
+        };
+        /** @description A person as an API response names them (ADR-0080 §5). */
+        PersonDto: {
+            display_name?: string | null;
+            /** @description What people type and read. */
+            handle: string;
+            /**
+             * @description The Principal's id: what a URL carries. For a reference that names
+             *     no Principal, the reference itself.
+             */
+            id: string;
         };
         /**
          * @description `GET /v1/repos/{org}/{repo}/pipelines?ref=` body: the manually-dispatchable
@@ -4767,7 +4832,7 @@ export interface components {
         PolicyVersionDto: {
             /** Format: int64 */
             at: number;
-            /** @description The Principal who saved it. */
+            /** @description The handle of the Principal who saved it. */
             author: string;
             content_hash: string;
             /** @description This version deleted the Policy. */
@@ -4784,7 +4849,12 @@ export interface components {
             /** @description `false` = created by a forge import, not signed into yet. */
             claimed: boolean;
             display_name?: string | null;
-            /** @description What a grant or an approver entry stores. */
+            /** @description What a grant or an approver entry is typed as. */
+            handle: string;
+            /**
+             * @description The Principal's id (ADR-0080): what a grant or an approver entry
+             *     stores, and what a URL carries.
+             */
             id: string;
             identities: components["schemas"]["PrincipalIdentityDto"][];
         };
@@ -4918,8 +4988,9 @@ export interface components {
              */
             approval_gate?: components["schemas"]["PutApprovalGateRules"];
             /**
-             * @description Principal ids (ADR-0069): each must name an existing Principal; a
-             *     merged id is stored as the Principal it now is. All must approve.
+             * @description Principal handles or ids (ADR-0069, ADR-0080): each must name an
+             *     existing Principal; a merged one is stored as the Principal it now is.
+             *     All must approve.
              */
             approvers?: string[];
             /** @description A human dispatch must carry a reason (ADR-0057 §3). Omitted = off. */
@@ -5473,7 +5544,7 @@ export interface components {
             seq: number;
             /** @description SHA-256 of the session (never the session id). */
             session_hash?: string | null;
-            /** @description The human/principal it is about. */
+            /** @description The handle of the human/principal it is about. */
             subject: string;
             target?: string | null;
         };
@@ -8788,6 +8859,44 @@ export interface operations {
             };
         };
     };
+    get_member: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description the Principal's id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemberDto"];
+                };
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such Principal */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     reset_member_passkeys: {
         parameters: {
             query?: never;
@@ -8795,8 +8904,8 @@ export interface operations {
             path: {
                 /** @description org */
                 org: string;
-                /** @description the member's principal id */
-                subject: string;
+                /** @description the member's Principal id (a handle is accepted too) */
+                id: string;
             };
             cookie?: never;
         };
@@ -10099,7 +10208,7 @@ export interface operations {
     search_principals: {
         parameters: {
             query: {
-                /** @description id or handle prefix, or a display-name fragment */
+                /** @description handle prefix, or a display-name fragment */
                 q: string;
             };
             header?: never;

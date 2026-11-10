@@ -65,9 +65,8 @@ export default function App() {
           with neither the settings sections (four) nor another section's
           page; a connection id is one path segment. */}
       <Route path="/orgs/:org/settings/connections/:id" component={ConnectionManage} />
-      {/* One member, keyed by the subject (one encoded segment): a binding
-          has no id of its own. */}
-      <Route path="/orgs/:org/settings/members/:subject/manage" component={MemberManage} />
+      {/* One member, by the Principal's id: a URL never carries a handle. */}
+      <Route path="/orgs/:org/settings/members/:id/manage" component={MemberManage} />
       {/* One Environment (git-bug c11abc5): its manage page inside the
           settings frame. Six segments with a static last one, so it collides
           with neither the settings sections nor /:org/:repo/runs/:id; the

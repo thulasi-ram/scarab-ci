@@ -293,6 +293,7 @@ export type PrincipalMatch = components["schemas"]["PrincipalDto"];
 /** One role binding — enriched with the person's name and whether they have
  * signed in yet. */
 export type Binding = components["schemas"]["BindingDto"];
+export type Member = components["schemas"]["MemberDto"];
 
 /** The `scarab_csrf` double-submit token, for the few calls made
  * with plain `fetch` rather than through `api` (whose middleware adds it). */
@@ -431,6 +432,19 @@ export async function unlinkIdentity(provider: string): Promise<void> {
   await send(`/v1/me/identities/${encodeURIComponent(provider)}`, "DELETE");
 }
 
+/** One member of an org by Principal id (`GET /v1/orgs/{org}/members/{id}`):
+ * who they are and the roles they hold there. `null` when no such Principal
+ * exists or the deployment has no RBAC store (dev). */
+export async function getMember(org: string, id: string): Promise<Member | null> {
+  const { data, error, response } = await api.GET("/v1/orgs/{org}/members/{id}", {
+    params: { path: { org, id } },
+  });
+  if (response.status === 404) return null;
+  if (response.status === 401) setUnauthenticated(true);
+  if (error || !data) throw new Error(errorText(error) || `failed to load the member (${response.status})`);
+  return data;
+}
+
 /** An org's role bindings (`GET /v1/orgs/{org}/bindings`); `null` when the
  * deployment has no RBAC store (dev). */
 export async function listBindings(org: string): Promise<Binding[] | null> {
@@ -443,8 +457,9 @@ export async function listBindings(org: string): Promise<Binding[] | null> {
   return (await res.json()) as Binding[];
 }
 
-/** Natively grant `subject` a role, org-wide or on one project. The subject
- * must be an existing user — pick it from `searchPrincipals`. */
+/** Natively grant `subject` a role, org-wide or on one project. `subject` is
+ * a handle (or a Principal id) of an existing user — pick it from
+ * `searchPrincipals`. */
 export async function grantRole(
   org: string,
   body: { subject: string; role: string; project?: string },
@@ -452,7 +467,8 @@ export async function grantRole(
   await send(`/v1/orgs/${encodeURIComponent(org)}/bindings`, "PUT", body);
 }
 
-/** Natively revoke — a durable tombstone a later forge re-sync cannot undo. */
+/** Natively revoke — a durable tombstone a later forge re-sync cannot undo.
+ * `subject` is the Principal's id (a handle works too). */
 export async function revokeRole(org: string, subject: string, project?: string): Promise<void> {
   const q = new URLSearchParams({ subject });
   if (project) q.set("project", project);
@@ -2095,10 +2111,11 @@ export async function listOrgSecurityEvents(
 }
 
 /** An Owner resets a member's passkeys
- * (`POST /v1/orgs/{org}/members/{subject}/passkeys/reset`) — always-ask. */
-export async function resetMemberPasskeys(org: string, subject: string): Promise<PasskeyReset> {
-  const { data, error, response } = await api.POST("/v1/orgs/{org}/members/{subject}/passkeys/reset", {
-    params: { path: { org, subject } },
+ * (`POST /v1/orgs/{org}/members/{id}/passkeys/reset`, by Principal id) —
+ * always-ask. */
+export async function resetMemberPasskeys(org: string, id: string): Promise<PasskeyReset> {
+  const { data, error, response } = await api.POST("/v1/orgs/{org}/members/{id}/passkeys/reset", {
+    params: { path: { org, id } },
   });
   if (error || !data) throw new Error(errorText(error) || `could not reset passkeys (${response.status})`);
   return data;

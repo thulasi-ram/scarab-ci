@@ -101,15 +101,15 @@ describe("linkNotice", () => {
 describe("memberRows", () => {
   it("lists one row per person with their org role and the repositories they also hold a role in", () => {
     const rows = memberRows([
-      { subject: "github:zed", role: "viewer", project: "web", display_name: "Zed" },
-      { subject: "alice", role: "admin", project: "", display_name: "Alice" },
-      { subject: "alice", role: "member", project: "web", display_name: "Alice" },
-      { subject: "alice", role: "viewer", project: "api", display_name: "Alice" },
-      { subject: "carol", role: "admin", project: "web", claimed: false },
+      { id: "pgithub:zed", handle: "github:zed", role: "viewer", project: "web", display_name: "Zed" },
+      { id: "palice", handle: "alice", role: "admin", project: "", display_name: "Alice" },
+      { id: "palice", handle: "alice", role: "member", project: "web", display_name: "Alice" },
+      { id: "palice", handle: "alice", role: "viewer", project: "api", display_name: "Alice" },
+      { id: "pcarol", handle: "carol", role: "admin", project: "web", claimed: false },
     ]);
-    expect(rows.map((r) => r.subject)).toEqual(["alice", "carol", "github:zed"]);
+    expect(rows.map((r) => r.handle)).toEqual(["alice", "carol", "github:zed"]);
     expect(rows[0]).toEqual({
-      subject: "alice",
+      id: "palice", handle: "alice",
       display: "Alice",
       pending: false,
       orgRole: "admin",
@@ -117,7 +117,7 @@ describe("memberRows", () => {
     });
     // Repository roles only: still a member, with no org role.
     expect(rows[1]).toEqual({
-      subject: "carol",
+      id: "pcarol", handle: "carol",
       display: "carol",
       pending: true,
       orgRole: null,
@@ -128,45 +128,45 @@ describe("memberRows", () => {
 
 describe("repoAccessRows", () => {
   const bindings = [
-    { subject: "a.kim", role: "owner", project: "", display_name: "Avery", origin: "native" },
-    { subject: "j.lee", role: "member", project: "", display_name: "Jordan", origin: "native" },
-    { subject: "j.lee", role: "admin", project: "web", display_name: "Jordan", origin: "native" },
-    { subject: "r.ok", role: "viewer", project: "web", claimed: false, origin: "import" },
-    { subject: "s.p", role: "member", project: "api", display_name: "Sam", origin: "import" },
-    { subject: "old", role: "viewer", project: "web" },
+    { id: "pa.kim", handle: "a.kim", role: "owner", project: "", display_name: "Avery", origin: "native" },
+    { id: "pj.lee", handle: "j.lee", role: "member", project: "", display_name: "Jordan", origin: "native" },
+    { id: "pj.lee", handle: "j.lee", role: "admin", project: "web", display_name: "Jordan", origin: "native" },
+    { id: "pr.ok", handle: "r.ok", role: "viewer", project: "web", claimed: false, origin: "import" },
+    { id: "ps.p", handle: "s.p", role: "member", project: "api", display_name: "Sam", origin: "import" },
+    { id: "pold", handle: "old", role: "viewer", project: "web" },
   ];
 
   it("splits the people bound to the repository from those its org role reaches", () => {
     const { direct, viaOrg } = repoAccessRows(bindings, "web");
     expect(direct).toEqual([
-      { subject: "j.lee", display: "Jordan", pending: false, role: "admin", source: "scarab", orgRole: "member" },
-      { subject: "old", display: "old", pending: false, role: "viewer", source: null, orgRole: null },
-      { subject: "r.ok", display: "r.ok", pending: true, role: "viewer", source: "forge", orgRole: null },
+      { id: "pj.lee", handle: "j.lee", display: "Jordan", pending: false, role: "admin", source: "scarab", orgRole: "member" },
+      { id: "pold", handle: "old", display: "old", pending: false, role: "viewer", source: null, orgRole: null },
+      { id: "pr.ok", handle: "r.ok", display: "r.ok", pending: true, role: "viewer", source: "forge", orgRole: null },
     ]);
     // j.lee is bound here, so is not listed again under the org; s.p's role
     // is on another repository and reaches nothing here.
-    expect(viaOrg).toEqual([{ subject: "a.kim", display: "Avery", pending: false, orgRole: "owner" }]);
+    expect(viaOrg).toEqual([{ id: "pa.kim", handle: "a.kim", display: "Avery", pending: false, orgRole: "owner" }]);
   });
 });
 
 describe("resyncDiff", () => {
   it("reports the forge's rows added, changed and removed, never a role granted in Scarab", () => {
     const before = [
-      { subject: "amy", role: "member", project: "web", origin: "native" },
-      { subject: "bo", role: "viewer", project: "web", origin: "import" },
-      { subject: "cy", role: "member", project: "web", origin: "import" },
-      { subject: "di", role: "viewer", project: "api", origin: "import" },
+      { id: "pamy", handle: "amy", role: "member", project: "web", origin: "native" },
+      { id: "pbo", handle: "bo", role: "viewer", project: "web", origin: "import" },
+      { id: "pcy", handle: "cy", role: "member", project: "web", origin: "import" },
+      { id: "pdi", handle: "di", role: "viewer", project: "api", origin: "import" },
     ];
     const after = [
-      { subject: "amy", role: "member", project: "web", origin: "native" },
-      { subject: "bo", role: "admin", project: "web", origin: "import" },
-      { subject: "ed", role: "viewer", project: "web", origin: "import", display_name: "Ed" },
-      { subject: "di", role: "viewer", project: "api", origin: "import" },
+      { id: "pamy", handle: "amy", role: "member", project: "web", origin: "native" },
+      { id: "pbo", handle: "bo", role: "admin", project: "web", origin: "import" },
+      { id: "ped", handle: "ed", role: "viewer", project: "web", origin: "import", display_name: "Ed" },
+      { id: "pdi", handle: "di", role: "viewer", project: "api", origin: "import" },
     ];
     expect(resyncDiff(before, after, "web")).toEqual({
-      added: [{ subject: "ed", display: "Ed", role: "viewer" }],
-      changed: [{ subject: "bo", display: "bo", role: "admin", was: "viewer" }],
-      removed: [{ subject: "cy", display: "cy", role: "member" }],
+      added: [{ id: "ped", handle: "ed", display: "Ed", role: "viewer" }],
+      changed: [{ id: "pbo", handle: "bo", display: "bo", role: "admin", was: "viewer" }],
+      removed: [{ id: "pcy", handle: "cy", display: "cy", role: "member" }],
     });
     expect(resyncDiff(before, before, "web")).toEqual({ added: [], changed: [], removed: [] });
   });
@@ -241,14 +241,24 @@ describe("confirming a merge", () => {
 });
 
 describe("a member's page", () => {
-  it("keys it by the subject, one encoded segment before a static manage", () => {
-    expect(memberHref("acme", "j.lee")).toBe("/orgs/acme/settings/members/j.lee/manage");
-    for (const subject of ["okta:s.patel@acme.example", "a/b c", "manage", "100%"]) {
-      const parts = memberHref("a b", subject).split("/").filter(Boolean);
-      expect(parts, subject).toHaveLength(6);
-      expect(parts[5], subject).toBe("manage");
-      expect(decodeURIComponent(parts[4]!), subject).toBe(subject);
+  it("keys it by the Principal's id, never the handle, one encoded segment before a static manage", () => {
+    const id = "p_0123456789abcdef0123456789abcdef";
+    expect(memberHref("acme", id)).toBe(`/orgs/acme/settings/members/${id}/manage`);
+    // Encoded whatever it holds, so an odd value can never become a path.
+    for (const odd of ["a/b c", "manage", "100%"]) {
+      const parts = memberHref("a b", odd).split("/").filter(Boolean);
+      expect(parts, odd).toHaveLength(6);
+      expect(parts[5], odd).toBe("manage");
+      expect(decodeURIComponent(parts[4]!), odd).toBe(odd);
     }
+  });
+
+  it("puts the id in a member row's link, and keeps the handle for reading", () => {
+    const [row] = memberRows([
+      { id: "p_1", handle: "okta:s.patel@acme.example", role: "viewer", project: "" },
+    ]);
+    expect(memberHref("acme", row!.id)).not.toContain("patel");
+    expect(row!.handle).toBe("okta:s.patel@acme.example");
   });
 
   it("links each repository to its Access settings", () => {
@@ -261,12 +271,12 @@ describe("a member's page", () => {
     expect(
       memberRepoRoles(
         [
-          { subject: "alice", role: "admin", project: "" },
-          { subject: "alice", role: "member", project: "web", origin: "native" },
-          { subject: "alice", role: "viewer", project: "api", origin: "import" },
-          { subject: "bob", role: "admin", project: "web" },
+          { id: "palice", handle: "alice", role: "admin", project: "" },
+          { id: "palice", handle: "alice", role: "member", project: "web", origin: "native" },
+          { id: "palice", handle: "alice", role: "viewer", project: "api", origin: "import" },
+          { id: "pbob", handle: "bob", role: "admin", project: "web" },
         ],
-        "alice",
+        "palice",
       ),
     ).toEqual([
       { repo: "api", role: "viewer", source: "forge" },
