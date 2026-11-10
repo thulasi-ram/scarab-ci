@@ -1847,6 +1847,7 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 .secrets-add { margin-top: 4px; }
 /* A row of actions: the gap spaces the buttons, so none sets its own margin. */
 .secrets-actions { margin-top: 4px; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.link-choices { display: flex; flex-direction: column; align-items: stretch; gap: 8px; }
 
 /* ---- actions row (inline forms, the Environment page footer) ---- */
 .modal-actions { display: flex; gap: 10px; margin-top: 6px; }
@@ -3329,12 +3330,28 @@ h1, .crumb-head, .run-title {
 .tok-facts > span.member-repos { display: inline; }
 .member-repos a { color: var(--sage); }
 .member-repos a:hover { color: var(--emerald); }
-/* Access that comes from an org role: listed for the full picture, managed
-   under Members, so it recedes and has no actions. */
-.tok.access-via-org { opacity: 0.6; }
-.access-h {
-  margin: 4px 0 0; font: var(--t-label); color: var(--sage);
+/* Members and Access are tables of people: the name in Label, the subject
+   a grant stores in Mono under it. Each sits in a .table-scroll so a phone
+   scrolls the table, not the page. */
+.table-scroll { overflow-x: auto; }
+.person-table tbody tr { cursor: default; }
+.person-table .tok-state { white-space: nowrap; }
+.person-line { display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.person-name { font: var(--t-label); color: var(--soft-white); }
+.person-id { display: block; margin-top: 2px; }
+.access-panel .panel-h { flex-wrap: wrap; }
+.access-note { display: block; margin-top: 4px; color: var(--muted-sage); }
+/* Access that comes from an org role: listed under its own group row for the
+   full picture, managed under Members, so it recedes and has no actions. */
+.access-table tr.access-group th {
+  text-align: left; font: var(--t-label); color: var(--sage);
+  padding: 10px 16px 8px;
+  background: var(--pine-deep);
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border-soft);
 }
+.access-table tr.access-group:hover { background: none; }
+.access-table tr.access-via-org td { opacity: 0.6; }
 .resync-list { margin: 4px 0 0; padding-left: 18px; color: var(--sage); }
 .f-ctl.tok-days { width: 120px; flex: none; }
 .tok-preset-on { border-color: var(--emerald); color: var(--emerald); }
