@@ -135,12 +135,8 @@ set -a
 set +a
 export SCARAB_TEST_FORGEJO_URL="http://127.0.0.1:$forgejo_port"
 export SCARAB_TEST_FORGEJO_CALLBACK_HOST="$pod_host"
-SCARAB_TEST_CLONE_HASH="$(cat "$kind_dir/.state/e2e-clone-hash")"
-export SCARAB_TEST_CLONE_HASH
-# Where the forge_token cases install the clone library from: libs/clone.yaml
-# on github.com at a pushed commit (up.sh checked it).
-SCARAB_TEST_CLONE_SOURCE="$(cat "$kind_dir/.state/e2e-clone-source")"
-export SCARAB_TEST_CLONE_SOURCE
+# forgejo.env (above) also carries SCARAB_TEST_CLONE_SOURCE and _HASH: the
+# clone library libs.sh installed from the in-cluster Forgejo.
 
 export SCARAB_E2E=1
 export SCARAB_E2E_URL="$base"

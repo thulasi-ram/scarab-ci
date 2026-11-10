@@ -64,16 +64,20 @@ for p in $pending; do
 done
 
 # Scarab's clone library, installed like any library from its source on
-# github.com at the last commit that changed it. The dogfood stack is in
-# GitHub App mode, so its token is minted per Run and the source needs no
-# trust. The commit must be pushed: the server reads the file from GitHub.
+# github.com at the last commit that changed it. Dogfood runs in GitHub App
+# mode against real GitHub, so reading the library from github.com is what a
+# real install does (the dev and e2e modes install from the in-cluster
+# Forgejo instead, deploy/kind/libs.sh). Its token is minted per Run, so the
+# source needs no trust. The commit must be pushed: the server reads the file
+# from GitHub.
 clone_commit="$(git -C "$here/../.." log -1 --format=%H -- libs/clone.yaml 2>/dev/null || true)"
 library_step() { # $1 the step's number
   cat <<TXT
     $1. Org settings > Libraries > Install: fetch
        github.com/thulasi-ram/scarab-ci//libs/clone.yaml@${clone_commit:-<commit>}
-       review it and install it as thulasi-ram/clone. If another version is
-       installed, this upgrades it.
+       review it and install it as thulasi-ram/clone (from github.com: this
+       stack runs against real GitHub). If another version is installed,
+       this upgrades it.
 TXT
 }
 
