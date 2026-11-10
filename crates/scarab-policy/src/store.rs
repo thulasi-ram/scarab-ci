@@ -141,6 +141,77 @@ pub struct DecisionCursor {
 /// The most decisions one page of the org log returns.
 pub const MAX_DECISION_PAGE: usize = 200;
 
+/// Which of the org's decisions a page or a count reads. Every field left
+/// `None` selects every decision.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DecisionFilter {
+    /// Decisions at this checkpoint only.
+    pub checkpoint: Option<Checkpoint>,
+    /// Decisions with a result for this Policy, matched or not.
+    pub policy_id: Option<String>,
+    /// Decisions made at or after this time (unix ms).
+    pub since: Option<i64>,
+}
+
+impl DecisionFilter {
+    /// Whether `d` passes the filter: the reference the stores' queries are
+    /// held to.
+    pub fn selects(&self, d: &DecisionRecord) -> bool {
+        self.checkpoint.is_none_or(|c| d.decision.checkpoint == c)
+            && self.since.is_none_or(|t| d.at >= t)
+            && self
+                .policy_id
+                .as_deref()
+                .is_none_or(|id| d.decision.results.iter().any(|r| r.policy_id == id))
+    }
+}
+
+/// How often one Policy denied and, in audit mode, would have denied, over
+/// the decisions a count reads.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyDecisionCounts {
+    pub policy_id: String,
+    /// Its `match` selected the consultation.
+    pub matched: u64,
+    /// It denied, or a rule failed while it was enforced (which denies).
+    pub denied: u64,
+    /// In audit mode it would have denied, or a rule failed.
+    pub would_deny: u64,
+}
+
+/// Each Policy's counts over `decisions`, by Policy id: the reference the
+/// stores' count queries are held to. A Policy with no matched result is
+/// left out.
+pub fn count_decisions<'a>(
+    decisions: impl IntoIterator<Item = &'a DecisionRecord>,
+) -> Vec<PolicyDecisionCounts> {
+    use crate::evaluate::PolicyOutcome;
+    use crate::policy::Mode;
+    let mut out: std::collections::BTreeMap<String, PolicyDecisionCounts> = Default::default();
+    for d in decisions {
+        for r in &d.decision.results {
+            if r.outcome == PolicyOutcome::NotMatched {
+                continue;
+            }
+            let c = out
+                .entry(r.policy_id.clone())
+                .or_insert_with(|| PolicyDecisionCounts {
+                    policy_id: r.policy_id.clone(),
+                    ..Default::default()
+                });
+            c.matched += 1;
+            match (&r.outcome, r.mode) {
+                (PolicyOutcome::Denied { .. }, _)
+                | (PolicyOutcome::Error { .. }, Mode::Enforce) => c.denied += 1,
+                (PolicyOutcome::WouldDeny { .. }, _)
+                | (PolicyOutcome::Error { .. }, Mode::Audit) => c.would_deny += 1,
+                _ => {}
+            }
+        }
+    }
+    out.into_values().collect()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PolicyStoreError {
     /// No Policy (or no live Policy, for a write) by that id.
@@ -254,6 +325,75 @@ pub trait PolicyStore: Send + Sync {
         limit: usize,
         before: Option<&DecisionCursor>,
     ) -> Result<Vec<DecisionRecord>, PolicyStoreError>;
+
+    /// [`org_decisions`](Self::org_decisions), keeping only the decisions
+    /// `filter` selects: a page holds up to `limit` of those.
+    ///
+    /// The default pages through the whole log and filters each page; a
+    /// store that can filter in its query does so instead.
+    async fn filtered_org_decisions(
+        &self,
+        org: &str,
+        limit: usize,
+        before: Option<&DecisionCursor>,
+        filter: &DecisionFilter,
+    ) -> Result<Vec<DecisionRecord>, PolicyStoreError> {
+        let limit = decision_page_limit(limit);
+        let mut out = Vec::new();
+        let mut cursor = before.cloned();
+        loop {
+            let page = self
+                .org_decisions(org, MAX_DECISION_PAGE, cursor.as_ref())
+                .await?;
+            let full = page.len() == MAX_DECISION_PAGE;
+            cursor = page.last().map(|d| DecisionCursor {
+                at: d.at,
+                id: d.id.clone(),
+            });
+            for d in page {
+                // Newest first: everything after this one is older still.
+                if filter.since.is_some_and(|t| d.at < t) {
+                    return Ok(out);
+                }
+                if filter.selects(&d) {
+                    out.push(d);
+                    if out.len() == limit {
+                        return Ok(out);
+                    }
+                }
+            }
+            if !full {
+                return Ok(out);
+            }
+        }
+    }
+
+    /// Each Policy's [`PolicyDecisionCounts`] over the org's decisions made
+    /// at or after `since` (unix ms), as [`count_decisions`] counts them, by
+    /// Policy id. The default reads those decisions page by page.
+    async fn org_decision_counts(
+        &self,
+        org: &str,
+        since: i64,
+    ) -> Result<Vec<PolicyDecisionCounts>, PolicyStoreError> {
+        let mut all = Vec::new();
+        let mut cursor: Option<DecisionCursor> = None;
+        loop {
+            let page = self
+                .org_decisions(org, MAX_DECISION_PAGE, cursor.as_ref())
+                .await?;
+            let full = page.len() == MAX_DECISION_PAGE;
+            cursor = page.last().map(|d| DecisionCursor {
+                at: d.at,
+                id: d.id.clone(),
+            });
+            let before_since = page.iter().any(|d| d.at < since);
+            all.extend(page.into_iter().filter(|d| d.at >= since));
+            if !full || before_since {
+                return Ok(count_decisions(&all));
+            }
+        }
+    }
 }
 
 /// The first row of a Run, as `Db::begin_run_creation` writes it: the Run

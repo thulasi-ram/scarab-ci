@@ -10,14 +10,17 @@
 // references the crates), the rest are generic. Add `?theme=dark` (or `light`)
 // to the URL to pin the theme, and `?palette=mono` (or `emerald`) to pin the
 // palette (used for deterministic capture); otherwise the stored choices apply.
-// `?admin_orgs=acme,globex` makes the caller an admin of those orgs instead of
-// acme alone (the settings org switch).
+// The caller administers acme and globex, so the settings org dropdown has a
+// choice; `?admin_orgs=acme` (any comma-separated list) makes them an admin of
+// those orgs instead.
 
 // Type-only imports — erased at compile time, so the install-before-App-loads
 // ordering in index.tsx is unaffected. The fixtures typecheck against the
 // generated OpenAPI types (the same contract the real server serves).
 import type { components } from "./api/schema";
 import { libraryRoute, libraryRunSummaries } from "./mock-libraries";
+import { policyRoute } from "./mock-policies";
+import { paginate } from "./org-page";
 
 type RunStatusDto = components["schemas"]["RunStatusResponse"];
 type RunSummaryDto = components["schemas"]["RunSummaryDto"];
@@ -29,8 +32,9 @@ type OverlayDto = components["schemas"]["EnvironmentProjectOverlayDto"];
 type GrantDto = components["schemas"]["EnvironmentProjectPrivilegeGrantDto"];
 type ProjectEnvironmentDto = components["schemas"]["ProjectEnvironmentDto"];
 type EnvironmentProjectDto = components["schemas"]["EnvironmentProjectDto"];
-type MigrationReportDto = components["schemas"]["EnvironmentMigrationReportDto"];
-type PluginCatalogEntryDto = components["schemas"]["PluginCatalogEntryDto"];
+type PluginManifestDto = components["schemas"]["PluginManifestDto"];
+type FetchedPluginManifestDto = components["schemas"]["FetchedPluginManifestDto"];
+type FetchedPluginUpgradeDto = components["schemas"]["FetchedPluginUpgradeDto"];
 type PluginInstallationDto = components["schemas"]["PluginInstallationDto"];
 type PluginConnectionDto = components["schemas"]["PluginConnectionDto"];
 type BrokerJournalEntryDto = components["schemas"]["BrokerJournalEntryDto"];
@@ -56,15 +60,32 @@ const ENV_GATE_RUN_ID = "0190f8a2000071fb8c00e7a9b0c1d2e3";
 
 // ── /v1/me ────────────────────────────────────────────────────────────────
 // An Owner of the one implicit org, so the Settings gear renders.
-// The Owner role is global, so Avery is a global admin: Settings shows Connect
-// a forge and the unassigned connection below (git-bug 19b0a45).
+// The Owner role is global, so Avery is a global admin: the org dropdown in
+// Organization settings ends with New organization… (2 waiting): the two
+// connections below that serve no org wait on that page (git-bug 19b0a45). Avery
+// administers two orgs, so the org dropdown in Organization settings offers a
+// choice; globex has no connections or repositories of its own.
+/** A mock Principal id (`p_` + 32 hex), fixed per handle so screenshots and
+ *  links stay stable. The server mints random ones (ADR-0080). */
+function pid(handle: string): string {
+  let h = 0x811c9dc5;
+  let out = "";
+  for (let round = 0; round < 4; round++) {
+    for (const c of `${round}:${handle}`) h = Math.imul(h ^ c.charCodeAt(0), 0x01000193) >>> 0;
+    out += h.toString(16).padStart(8, "0");
+  }
+  return `p_${out}`;
+}
+
 const me = {
-  subject: "a.kim",
+  subject: pid("a.kim"),
+  id: pid("a.kim"),
+  handle: "a.kim",
   display_name: "Avery Kim",
   roles: ["Owner"],
   can_administer: true,
   global_admin: true,
-  admin_orgs: ["acme"],
+  admin_orgs: ["acme", "globex"],
   token_mint_orgs: ["acme"],
   // Signed in two ways: the legacy GitHub provider and Okta.
   identities: [
@@ -81,30 +102,108 @@ const authProviders = [
   { id: "okta", name: "Okta", default: false },
   { id: "forgejo", name: "Forgejo", default: false },
 ];
-// Members: a native org Owner, forge-imported collaborators (one never signed
-// in), and a project-scoped approver.
-const bindings = [
-  { subject: "a.kim", role: "owner", project: "", display_name: "Avery Kim", claimed: true },
-  { subject: "j.lee", role: "admin", project: "orders-api", display_name: "Jordan Lee", claimed: true },
-  { subject: "j.lee", role: "member", project: "scarab", display_name: "Jordan Lee", claimed: true },
-  { subject: "r.okafor", role: "member", project: "scarab", claimed: false },
-  { subject: "okta:s.patel@acme.example", role: "viewer", project: "", display_name: "Sam Patel", claimed: true },
+// Members and repository Access: an org Owner and an org admin; Jordan, an
+// org member who also holds roles on two repositories; collaborators the
+// forge gave a role on `scarab`, one of whom never signed in; and an org
+// viewer. So the `scarab` repository's Access shows a role granted in Scarab,
+// roles from the forge, and access through an org role. The list is mutable:
+// grant, revoke and re-sync change it for the life of the page.
+type MockBinding = components["schemas"]["BindingDto"];
+const bindings: MockBinding[] = [
+  { id: pid("a.kim"), handle: "a.kim", role: "owner", project: "", display_name: "Avery Kim", claimed: true, origin: "native" },
+  { id: pid("m.diaz"), handle: "m.diaz", role: "admin", project: "", display_name: "Morgan Diaz", claimed: true, origin: "native" },
+  { id: pid("j.lee"), handle: "j.lee", role: "member", project: "", display_name: "Jordan Lee", claimed: true, origin: "native" },
+  { id: pid("j.lee"), handle: "j.lee", role: "admin", project: "orders-api", display_name: "Jordan Lee", claimed: true, origin: "native" },
+  { id: pid("j.lee"), handle: "j.lee", role: "admin", project: "scarab", display_name: "Jordan Lee", claimed: true, origin: "native" },
+  { id: pid("r.okafor"), handle: "r.okafor", role: "member", project: "scarab", claimed: false, origin: "import" },
+  { id: pid("t.nguyen"), handle: "t.nguyen", role: "viewer", project: "scarab", display_name: "Taylor Nguyen", claimed: true, origin: "import" },
+  { id: pid("okta:s.patel@acme.example"), handle: "okta:s.patel@acme.example", role: "viewer", project: "", display_name: "Sam Patel", claimed: true, origin: "native" },
 ];
+// What the forge lists as each repository's collaborators, already mapped to
+// roles (admin → admin, write → member, read → viewer). A re-sync of `scarab`
+// raises Taylor to member and adds Priya; a repository not listed here has an
+// empty listing, which, as on the server, changes nothing.
+const forgeCollaborators: Record<string, MockBinding[]> = {
+  scarab: [
+    { id: pid("r.okafor"), handle: "r.okafor", role: "member", project: "scarab", claimed: false },
+    { id: pid("t.nguyen"), handle: "t.nguyen", role: "member", project: "scarab", display_name: "Taylor Nguyen", claimed: true },
+    { id: pid("p.ito"), handle: "p.ito", role: "viewer", project: "scarab", claimed: false },
+  ],
+};
+
+// The server's re-sync, in the mock: seed or refresh the forge's rows, never
+// a role granted in Scarab, and drop the forge's rows it no longer lists.
+function mockResync(repo: string): MockBinding[] {
+  const listed = forgeCollaborators[repo] ?? [];
+  if (listed.length === 0) return [];
+  for (const c of listed) {
+    const row = bindings.find((b) => b.id === c.id && b.project === repo);
+    if (!row) bindings.push({ ...c, origin: "import" });
+    else if (row.origin === "import") row.role = c.role;
+  }
+  for (let i = bindings.length - 1; i >= 0; i--) {
+    const b = bindings[i]!;
+    if (b.project === repo && b.origin === "import" && !listed.some((c) => c.id === b.id)) {
+      bindings.splice(i, 1);
+    }
+  }
+  return listed.map(({ id, handle, role, project }) => ({ id, handle, role, project }));
+}
+
+function mockGrant(req: { subject?: string; role?: string; project?: string }) {
+  const project = req.project ?? "";
+  // The server takes a handle or an id and stores the id.
+  const who = principals.find((x) => x.handle === req.subject || x.id === req.subject);
+  const id = who?.id ?? pid(req.subject ?? "");
+  const row = bindings.find((b) => b.id === id && b.project === project);
+  if (row) {
+    row.role = req.role ?? row.role;
+    row.origin = "native";
+  } else {
+    bindings.push({
+      id,
+      handle: who?.handle ?? req.subject ?? "",
+      role: req.role ?? "member",
+      project,
+      display_name: who?.display_name ?? null,
+      claimed: who?.claimed ?? true,
+      origin: "native",
+    });
+  }
+}
+
 const principals = [
   {
-    id: "j.lee",
+    id: pid("j.lee"),
+    handle: "j.lee",
     display_name: "Jordan Lee",
     claimed: true,
     identities: [{ provider: "default", handle: "j.lee" }],
   },
   {
-    id: "r.okafor",
+    id: pid("r.okafor"),
+    handle: "r.okafor",
     display_name: null,
     claimed: false,
     identities: [{ provider: "default", handle: "r.okafor" }],
   },
   {
-    id: "okta:s.patel@acme.example",
+    id: pid("m.diaz"),
+    handle: "m.diaz",
+    display_name: "Morgan Diaz",
+    claimed: true,
+    identities: [{ provider: "default", handle: "m.diaz" }],
+  },
+  {
+    id: pid("t.nguyen"),
+    handle: "t.nguyen",
+    display_name: "Taylor Nguyen",
+    claimed: true,
+    identities: [{ provider: "default", handle: "t.nguyen" }],
+  },
+  {
+    id: pid("okta:s.patel@acme.example"),
+    handle: "okta:s.patel@acme.example",
     display_name: "Sam Patel",
     claimed: true,
     identities: [{ provider: "okta", handle: "s.patel@acme.example" }],
@@ -118,7 +217,9 @@ const proj = (project: string, mins: number | null) => ({
   name: project,
   owner: "acme",
   repo_url: `https://github.com/acme/${project}`,
+  connection_id: "gh-acme",
   last_run_at: mins == null ? null : ago(mins * 60000),
+  unreachable_since: null as number | null,
 });
 const projects = [
   proj("scarab", 3),
@@ -126,7 +227,9 @@ const projects = [
   proj("inventory-svc", 48),
   proj("edge-gateway", 120),
   proj("billing", 9),
-  proj("messaging", 300),
+  // Removed from the GitHub App's installation two days ago: kept, and
+  // marked unreachable on its page, the org page and Connections.
+  { ...proj("messaging", 300), unreachable_since: ago(2 * 24 * 60 * 60000) },
   proj("scarab-infra", null),
 ];
 
@@ -180,10 +283,24 @@ export { runs as mockRuns };
 
 // ── per-repo run strips (dashboard cards) — status+duration_ms drive bars ────
 // Tune succeeded/failed ratios to the "N% pass" shown per card.
-const strip = (pattern: string) =>
+// Headlines for the filler runs, so every row reads like a real one.
+const STRIP_TITLES = [
+  "Retry flaky upload in the artifact step",
+  "Bump tokio to 1.41",
+  "Cache cargo registry between runs",
+  "Split integration tests by crate",
+  "Pin the base image by digest",
+  "Fix timezone in the nightly report",
+  "Drop the unused staging secret",
+];
+const strip = (pattern: string, first = 120) =>
   ({
     runs: pattern.split("").map((c, i) => ({
       id: `r${i}`,
+      run_number: first - i,
+      sha: (0x9e3779b1 * (first - i)).toString(16).padStart(8, "0").slice(-7) + "0".repeat(33),
+      trigger_kind: "push",
+      trigger_title: STRIP_TITLES[i % STRIP_TITLES.length],
       status: c === "x" ? "failed" : c === "c" ? "cancelled" : "succeeded",
       duration_ms: 40000 + ((i * 37) % 11) * 22000,
       created_at: ago((i + 1) * 900000),
@@ -195,8 +312,19 @@ const strip = (pattern: string) =>
       ...(i % 3 === 2 ? { environment: i % 2 ? "production" : "staging" } : {}),
     })),
   });
+// Two of scarab's runs were started by its nightly schedule (trigger kind
+// `cron`, titled with the expression, as the server records them), so the
+// Runs tab's scheduled filter and the Schedules tab's Runs link have rows.
+const scarabRuns = strip("ooxooooxooxooo");
+for (const i of [3, 7]) {
+  Object.assign(scarabRuns.runs[i]!, {
+    trigger_kind: "cron",
+    trigger_title: "0 2 * * *",
+    pipeline: "nightly",
+  });
+}
 const repoRuns: Record<string, ReturnType<typeof strip>> = {
-  scarab: strip("ooxooooxooxooo"), // ~64% pass window near the older tail
+  scarab: scarabRuns, // ~64% pass window near the older tail
   "orders-api": strip("oxooxooxooooo"),
   "inventory-svc": strip("oxoxooxxooxoo"), // ~50%
   "edge-gateway": strip("ooooooooxoooo"), // ~93%
@@ -440,33 +568,8 @@ const testLogLines = [
 ];
 
 // ── environments / secrets ───────────────────────────────────────────────────
-// A repository's Environments are org Environments now: see
-// `orgEnvironments`, `overlays` and `projectEnvironments` below. This is the
-// legacy approval history per name.
-const deployments: Record<string, unknown[]> = {
-  production: [
-    {
-      org: "acme",
-      project: "scarab",
-      environment: "production",
-      git_ref: "main",
-      run: "01984e00aa",
-      approved_by: ["ops-lead"],
-      at: ago(3600000),
-    },
-    {
-      org: "acme",
-      project: "scarab",
-      environment: "production",
-      git_ref: "main",
-      run: "01984d00bb",
-      approved_by: ["ops-lead"],
-      at: ago(86400000),
-    },
-  ],
-  staging: [],
-  preview: [],
-};
+// A repository's Environments are org Environments: see `orgEnvironments`,
+// `overlays` and `projectEnvironments` below.
 
 // ── the GATES run ──────────────────────────────────────────────
 //   bump        ✓ → live        external gate WAITING
@@ -651,107 +754,6 @@ const envGateEventsBody = [
   ),
 ].join("");
 
-// ── Org Policies — Settings › Policies. Two CEL Policies (one in audit
-// mode), one library list, one deleted Policy the page leaves out, and a
-// decision log the counts come from.
-const orgPolicy = (
-  id: string,
-  policy: Record<string, unknown>,
-  extra: { deleted?: boolean; version?: number } = {},
-) => ({
-  id,
-  level: "org",
-  org: "acme",
-  name: policy.name as string,
-  version: extra.version ?? 1,
-  policy,
-  content_hash: "9f2c".padEnd(64, "0"),
-  created_at: ago(30 * 24 * 60 * min),
-  updated_at: ago(2 * 24 * 60 * min),
-  deleted: extra.deleted ?? false,
-});
-const orgPolicies = [
-  orgPolicy(
-    "pol-1",
-    {
-      name: "no-friday-deploys",
-      checkpoint: "run.create",
-      match: { projects: [], except_projects: [], environments: ["production"], trigger_kinds: [] },
-      mode: "enforce",
-      rules: [{ when: "now.weekday == 5", effect: "deny", message: "No deploys to production on Fridays." }],
-    },
-    { version: 3 },
-  ),
-  orgPolicy("pol-2", {
-    name: "release-from-main",
-    checkpoint: "run.create",
-    match: { projects: ["web-*"], except_projects: ["web-legacy"], environments: [], trigger_kinds: [] },
-    mode: "audit",
-    rules: [{ when: "trigger.ref != 'refs/heads/main'", effect: "deny", message: "Release from main." }],
-  }),
-  orgPolicy("pol-3", {
-    name: "approved-libraries",
-    checkpoint: "run.create",
-    match: { projects: [], except_projects: [], environments: [], trigger_kinds: [] },
-    mode: "enforce",
-    setting: { libraries_allowed: { sources: ["github.com/thulasi-ram/*", "github.com/acme/*"] } },
-  }),
-  orgPolicy(
-    "pol-4",
-    {
-      name: "old-rule",
-      checkpoint: "run.create",
-      match: { projects: [], except_projects: [], environments: [], trigger_kinds: [] },
-      mode: "enforce",
-      rules: [{ when: "false", effect: "deny", message: "never" }],
-    },
-    { deleted: true, version: 2 },
-  ),
-];
-const policyResult = (policy_id: string, kind: string) => ({
-  policy_id,
-  version: 1,
-  name: policy_id,
-  level: "org",
-  mode: policy_id === "pol-2" ? "audit" : "enforce",
-  outcome: kind === "denied" || kind === "would_deny" ? { kind, messages: ["…"] } : { kind },
-});
-const policyDecision = (
-  id: string,
-  at: number,
-  project: string,
-  results: [string, string][],
-  denied?: string,
-) => ({
-  id,
-  org: "acme",
-  project,
-  run_id: denied ? null : `0190f8a2000071fb8c00${id.padStart(12, "0")}`,
-  step_id: null,
-  attempt: null,
-  at,
-  decision: {
-    checkpoint: "run.create",
-    schema_version: 1,
-    input: {},
-    policy_set_digest: "ab12".padEnd(64, "0"),
-    results: results.map(([p, k]) => policyResult(p, k)),
-    outcome: denied ? { kind: "deny", messages: [denied] } : { kind: "allow" },
-  },
-});
-const policyDecisions = [
-  policyDecision("d4", ago(20 * min), "web-app", [["pol-1", "not_matched"], ["pol-2", "would_deny"], ["pol-3", "passed"]]),
-  policyDecision(
-    "d3",
-    ago(2 * 60 * min),
-    "scarab",
-    [["pol-1", "denied"], ["pol-2", "not_matched"], ["pol-3", "passed"]],
-    "no-friday-deploys: No deploys to production on Fridays.",
-  ),
-  policyDecision("d2", ago(26 * 60 * min), "web-app", [["pol-1", "passed"], ["pol-2", "passed"], ["pol-3", "passed"]]),
-  policyDecision("d1", ago(50 * 60 * min), "scarab", [["pol-1", "passed"], ["pol-2", "not_matched"], ["pol-3", "passed"]]),
-];
-
 // ── Org-level Environments — Settings › Environments. production
 // has a baseline and a display name; qa still has the permissive one and shows
 // its name. Writes echo back and persist nothing, except a duplicate, which is
@@ -818,7 +820,10 @@ const orgEnvironments: OrgEnvironmentDto[] = [
 
 // Per-project overlays and grants, keyed environment →
 // project. scarab tightens production (an extra approver, a reason, a wait);
-// it holds a grant for one privileged image there.
+// it holds a grant for one privileged image there. It also keeps an overlay
+// on staging, which is no longer eligible for it (staging admits web-* only),
+// so its Environments tab shows all three cases beside qa, where no rule
+// protects a deploy.
 const overlays: Record<string, Record<string, OverlayDto>> = {
   production: {
     scarab: {
@@ -826,6 +831,14 @@ const overlays: Record<string, Record<string, OverlayDto>> = {
       allowed_refs: [],
       wait_timer_s: 300,
       require_reason: true,
+    },
+  },
+  staging: {
+    scarab: {
+      approvers: [],
+      allowed_refs: ["refs/heads/release/*"],
+      wait_timer_s: 0,
+      require_reason: false,
     },
   },
 };
@@ -931,71 +944,19 @@ function environmentProjects(env: OrgEnvironmentDto): EnvironmentProjectDto[] {
   }));
 }
 
-// The migration's split report: production was merged
-// from scarab's and web-app's per-repo environments (they disagreed on
-// approvers and require_reason); qa was only ever named, so it was opened to
-// all projects and still has a permissive baseline — reviewed already.
-const migrationReport: MigrationReportDto[] = [
-  {
-    environment: "production",
-    merged_projects: ["scarab", "web-app"],
-    referenced_only: false,
-    referencing_projects: [],
-    differing_rules: ["approvers", "require_reason"],
-    environment_exists: true,
-    permissive_baseline: false,
-    projects: [
-      {
-        project: "scarab",
-        legacy: {
-          approvers: ["ops-lead", "j.lee"],
-          allowed_refs: ["refs/heads/main"],
-          wait_timer: 300,
-          concurrency: 1,
-          require_reason: true,
-          privileged_images: grants.production!.scarab!.privileged_images,
-          permit_k8s_overlay: false,
-        },
-        overlay: overlays.production!.scarab!,
-      },
-      {
-        project: "web-app",
-        legacy: {
-          approvers: ["ops-lead"],
-          allowed_refs: ["refs/heads/main"],
-          wait_timer: 300,
-          concurrency: 1,
-          require_reason: false,
-          privileged_images: [],
-          permit_k8s_overlay: false,
-        },
-        overlay: null,
-      },
-    ],
-    created_at: ago(3 * 24 * 60 * min),
-    acknowledged_at: null,
-    acknowledged_by: null,
-  },
-  {
-    environment: "qa",
-    merged_projects: [],
-    referenced_only: true,
-    referencing_projects: ["scarab"],
-    differing_rules: [],
-    environment_exists: true,
-    permissive_baseline: true,
-    projects: [{ project: "scarab", legacy: null, overlay: null }],
-    created_at: ago(3 * 24 * 60 * min),
-    acknowledged_at: ago(2 * 24 * 60 * min),
-    acknowledged_by: "a.kim",
-  },
-];
-
-// ── Plugins — Settings › Plugins. `argocd` is running;
-// `argocd-us` is killed. Writes echo a record and persist nothing.
+// ── Plugins — Settings › Plugins. `argocd` is running; `argocd-us` is
+// killed; `argocd-staging` is held by a failed isolation probe. Each has a
+// manage page at /orgs/acme/settings/plugins/<id>/manage. Writes echo a
+// record and persist nothing, except an install and an upgrade, kept until
+// the page reloads. `argocd-us` was installed before sources were recorded.
+// An upgrade-fetch of `argocd-staging` reads a wider manifest (a read rule
+// and a gate added); of any other installation, a narrower one (the version
+// rule removed). Either needs a passkey with an image other than the
+// installed one; only the narrower one on the installed image needs none.
 const ARGOCD_REPO = "ghcr.io/thulasi-ram/scarab-plugin-argocd";
-const argocdManifest: PluginCatalogEntryDto["manifest"] = {
+const argocdManifest: PluginManifestDto = {
   plugin: "argocd",
+  image: ARGOCD_REPO,
   capabilities: ["use_connection", "resolve_gates"],
   connections: [
     {
@@ -1028,15 +989,75 @@ const argocdManifest: PluginCatalogEntryDto["manifest"] = {
     },
   ],
 };
-const pluginCatalog: PluginCatalogEntryDto[] = [
-  {
-    plugin: "argocd",
-    description: "Reads Argo CD Application state through its connection.",
-    image_repository: ARGOCD_REPO,
-    manifest: argocdManifest,
-    first_party: true,
-  },
-];
+const ARGOCD_MANIFEST_SHA = "b7e3".padEnd(64, "9");
+const ARGOCD_SOURCE_PATH = "github.com/acme/scarab-plugin-argocd//manifest.json";
+// What an upgrade-fetch of `name` reads (see above), with its diff against
+// the installed manifest.
+const ruleText = (r: { method: string; path: string; query: string[] }) =>
+  `argocd: ${r.method} ${r.path}${r.query.length ? ` ?${r.query.join("&")}` : ""}`;
+const fetchedPluginUpgrade = (
+  installed: PluginInstallationDto,
+  source: string,
+  connection: string | null,
+  image: string | null,
+): FetchedPluginUpgradeDto => {
+  const wider = installed.name === "argocd-staging";
+  const rules = argocdManifest.connections[0]!.read_rules;
+  const added = wider ? [{ method: "GET", path: "/api/v1/account", query: [] }] : [];
+  const kept = wider ? rules : rules.filter((r) => r.path !== "/api/version");
+  const manifest: PluginManifestDto = {
+    ...argocdManifest,
+    connections: [{ ...argocdManifest.connections[0]!, read_rules: [...kept, ...added] }],
+    gates: wider
+      ? [...argocdManifest.gates, { ...argocdManifest.gates[0]!, name: "wait-synced", description: "Pass when the Application is synced." }]
+      : argocdManifest.gates,
+  };
+  const group = (a: string[], r: string[], u: string[]) => ({ added: a, removed: r, unchanged: u });
+  return {
+    source,
+    connection,
+    content: JSON.stringify(manifest, null, 2) + "\n",
+    manifest,
+    manifest_sha256: (wider ? "c4d1" : "a9f0").padEnd(64, "7"),
+    current_manifest_sha256: installed.manifest_sha256,
+    current_image: installed.image,
+    diff: {
+      capabilities: group([], [], [...argocdManifest.capabilities]),
+      connections: group([], [], ["argocd"]),
+      auth_schemes: group([], [], ["argocd: bearer"]),
+      read_rules: group(
+        added.map(ruleText),
+        wider ? [] : rules.filter((r) => r.path === "/api/version").map(ruleText),
+        kept.map(ruleText),
+      ),
+      config_keys: group([], [], [...argocdManifest.config_keys]),
+      gates: group(wider ? ["wait-synced"] : [], [], ["wait-live"]),
+      image: group([], [], [ARGOCD_REPO]),
+    },
+    ...(() => {
+      const reasons = [
+        ...(wider ? ["adds read rule `argocd: GET /api/v1/account`", "adds gate `wait-synced`"] : []),
+        ...(image && image !== installed.image
+          ? [`runs new code: image \`${image}\` instead of \`${installed.image}\``]
+          : []),
+      ];
+      return { step_up_reasons: reasons, needs_step_up: reasons.length > 0 };
+    })(),
+  };
+};
+// What `POST …/plugin-fetch` returns for any source: the Argo CD manifest,
+// and the org's two installations of it (one approved with an older
+// manifest).
+const fetchedArgocdManifest = (source: string): FetchedPluginManifestDto => ({
+  source: source || "github.com/acme/scarab-plugin-argocd//plugin.json@6e1d0c9b8a7f6e5d4c3b2a1f0e9d8c7b6a5f4e3d",
+  content: JSON.stringify(argocdManifest, null, 2) + "\n",
+  manifest: argocdManifest,
+  manifest_sha256: ARGOCD_MANIFEST_SHA,
+  installed: [
+    { name: "argocd", image: `${ARGOCD_REPO}@sha256:${"4f2a1c9e7b3d".padEnd(64, "0")}`, manifest_sha256: ARGOCD_MANIFEST_SHA },
+    { name: "argocd-us", image: `${ARGOCD_REPO}@sha256:${"d81e6b02c4aa".padEnd(64, "0")}`, manifest_sha256: "91c0".padEnd(64, "2") },
+  ],
+});
 const pluginInstallation = (
   name: string,
   digest: string,
@@ -1048,7 +1069,9 @@ const pluginInstallation = (
   plugin: "argocd",
   principal: `plugin:${name}`,
   image: `${ARGOCD_REPO}@sha256:${digest.padEnd(64, "0")}`,
-  manifest_sha256: "b7e3".padEnd(64, "9"),
+  manifest_sha256: ARGOCD_MANIFEST_SHA,
+  source: `${ARGOCD_SOURCE_PATH}@6e1d0c9b8a7f6e5d4c3b2a1f0e9d8c7b6a5f4e3d`,
+  source_connection: null,
   config: { ARGOCD_UI_URL: "https://argocd.acme.example" },
   state: "enabled",
   runtime_status: "running",
@@ -1062,8 +1085,6 @@ const pluginInstallation = (
   storage: null,
   ...o,
 });
-// Libraries: one installed library with a newer first-party
-// version that fixes a security problem.
 const plugins: PluginInstallationDto[] = [
   pluginInstallation("argocd", "4f2a1c9e7b3d", {
     runtime_message: "watching 6 applications",
@@ -1081,6 +1102,16 @@ const plugins: PluginInstallationDto[] = [
     killed_by: "j.lee",
     killed_at: ago(90 * min),
     approved_at: ago(5 * 24 * 60 * min),
+    source: null,
+  }),
+  pluginInstallation("argocd-staging", "7b1c40e9d2f6", {
+    id: "2b7e90f1c4",
+    runtime_status: "probe_failed",
+    runtime_message: "the isolation probe reached 10.96.0.1:443; this cluster does not enforce the plugin's NetworkPolicy",
+    probe_passed_at: null,
+    approved_by: "j.lee",
+    approved_at: ago(2 * 60 * min),
+    config: {},
   }),
 ];
 // Connections: `argocd` is bound over https; `argocd-us` was
@@ -1194,18 +1225,13 @@ const connections: components["schemas"]["ConnectionDto"][] = [
     credential_ref: "github-app",
     credential_present: true,
     last_delivery_at: ago(240000),
-    projects: ["scarab", "web", "api"].map((project) => ({
-      org: "acme",
-      project,
-      owner: "acme",
-      name: project,
-    })),
+    // Counted from the org page's list when it is served (`withCounts`).
+    enabled_repos: 0,
     supports_resync: true,
     supports_preflight: true,
     managed_by_config: false,
   },
-  // A self-hosted Forgejo connection — the manually-onboarded kind, so the
-  // repo add/remove + webhook affordances render.
+  // A self-hosted Forgejo connection: the kind added here by an admin.
   {
     id: "forgejo-7f3a91c2",
     org: "acme",
@@ -1215,15 +1241,19 @@ const connections: components["schemas"]["ConnectionDto"][] = [
     credential_ref: "forgejo-7f3a91c2-credential",
     credential_present: true,
     last_delivery_at: ago(3_600_000),
-    projects: [{ org: "acme", project: "infra", owner: "acme", name: "infra" }],
+    enabled_repos: 0,
     supports_resync: true,
     // Forgejo tokens are not introspectable, so the preflight line is not
     // offered for them at all (the endpoint would only answer "unknown").
     supports_preflight: false,
     managed_by_config: false,
   },
-  // An installation whose account could not be told apart from a same-named
-  // org on another forge, so it serves no org yet.
+  // Two installations that serve no org yet. 90211 is the App installed on
+  // the `acme` account again, under an installation whose account id no acme
+  // connection records, so the delivery could not prove it is acme's account.
+  // 90377 was registered before connections served orgs (a legacy
+  // connection), for an account no org has the name of. The connection list
+  // does not carry the account, so the page shows neither login.
   {
     id: "github-install-90211",
     org: null,
@@ -1233,12 +1263,44 @@ const connections: components["schemas"]["ConnectionDto"][] = [
     credential_ref: "github-app",
     credential_present: true,
     last_delivery_at: null,
-    projects: [],
+    enabled_repos: 0,
+    supports_resync: true,
+    supports_preflight: false,
+    managed_by_config: false,
+  },
+  {
+    id: "github-install-90377",
+    org: null,
+    kind: "github",
+    base_url: "https://api.github.com",
+    web_url: "https://github.com",
+    credential_ref: "github-app",
+    credential_present: true,
+    last_delivery_at: ago(86_400_000),
+    enabled_repos: 0,
     supports_resync: true,
     supports_preflight: false,
     managed_by_config: false,
   },
 ];
+
+/**
+ * Why the server refuses to assign `conn` to `org`, as it words it
+ * (`admin_assign_refusal`): an org served by a connection to another forge or
+ * host, or an org that exists and no connection serves. Bound repositories of
+ * another owner are not modelled: no waiting connection here binds any.
+ */
+function assignRefusal(conn: components["schemas"]["ConnectionDto"], org: string): string | null {
+  const servers = connections.filter((c) => c.id !== conn.id && c.org === org);
+  const other = servers.find((c) => c.kind !== conn.kind || c.base_url !== conn.base_url);
+  if (other) {
+    return `org \`${org}\` has connection \`${other.id}\` to ${other.base_url}, another forge or host than ${conn.base_url}; an account of the same name there is not known to be the same account`;
+  }
+  if (servers.length === 0 && me.admin_orgs.includes(org)) {
+    return `org \`${org}\` exists but no connection serves it, so nothing shows that the account \`${org}\` on ${conn.base_url} is the same account`;
+  }
+  return null;
+}
 
 // A correctly-configured App (git-bug 90644c6). The interesting fixture is the
 // degraded one, but the demo stack shows a healthy install — the gap list is
@@ -1259,27 +1321,122 @@ const connectionPreflight = {
   subscribed_events: ["push", "pull_request"],
 };
 
-// What the Forgejo credential reaches — the bind pick-list.
-// The token also reaches a repo of another account, which the Add repository
-// dialog does not offer (the server would refuse to bind it).
-const availableRepos = [
-  { owner: "acme", name: "infra", bound: true },
-  { owner: "acme", name: "terraform-modules", bound: false },
-  { owner: "acme", name: "runbooks", bound: false },
-  { owner: "globex", name: "shared-ci", bound: false },
-];
-// The coverage matrix is now the repo/environment secret EDITOR, so
-// the fixture carries the repo-default column ("") and inheritance origins:
-// GHCR_TOKEN comes from the org, SENTRY_DSN is a repo key that overrides the
-// org's, DATABASE_URL is a repo default overridden in both environments,
-// SLACK_WEBHOOK_URL is production-only with qa silenced. The repo Secrets list
-// shows GHCR_TOKEN and SLACK_WEBHOOK_URL greyed out beside the repo's own keys.
-// Its environment columns are the org Environments the project may deploy
-// into — production and qa, as `projectEnvironments` lists them.
-// ── /v1/repos/acme/scarab/schedules: two `on: cron:` schedules ─────────────
+// ── /v1/orgs/acme/repos: the org page's repository list ─────────────────
+// Every acme repository the two connections reach: the projects above are
+// enabled (and infra, through Forgejo), the rest are not. 33 of them, so the
+// list runs to two pages of 25. Enable and Disable flip `enabled` here and
+// add or drop the project on /v1/repos, as the server would.
+type OrgRepoDto = components["schemas"]["OrgRepoDto"];
+const orgRepo = (
+  name: string,
+  connection: "gh-acme" | "forgejo-7f3a91c2",
+  enabled: boolean,
+  unreachable_since: number | null = null,
+): OrgRepoDto => ({
+  owner: "acme",
+  name,
+  enabled,
+  project: enabled ? name : null,
+  unreachable_since,
+  connection_id: connection,
+  kind: connection === "gh-acme" ? "github" : "forgejo",
+  repo_url:
+    connection === "gh-acme" ? `https://github.com/acme/${name}` : `https://git.acme.dev/acme/${name}`,
+  can_change: true,
+});
+const orgRepos: OrgRepoDto[] = [
+  ...projects.map((p) => orgRepo(p.name, "gh-acme", true, p.unreachable_since)),
+  orgRepo("infra", "forgejo-7f3a91c2", true),
+  orgRepo("terraform-modules", "forgejo-7f3a91c2", false),
+  orgRepo("runbooks", "forgejo-7f3a91c2", false),
+  ...[
+    "admin-portal",
+    "analytics-etl",
+    "auth-service",
+    "catalog",
+    "checkout-web",
+    "cli",
+    "design-system",
+    "docs-site",
+    "email-templates",
+    "feature-flags",
+    "fraud-rules",
+    "helm-charts",
+    "load-tests",
+    "mobile-app",
+    "notifications",
+    "pricing-engine",
+    "recommendations",
+    "search-indexer",
+    "shipping-rates",
+    "status-page",
+    "support-bot",
+    "web",
+    "api",
+  ].map((name) => orgRepo(name, "gh-acme", false)),
+].sort((a, b) => a.name.localeCompare(b.name));
+
+function orgReposPage(org: string, search: string): Response {
+  const q = new URLSearchParams(search);
+  const needle = (q.get("q") ?? "").trim().toLowerCase();
+  const connection = q.get("connection");
+  const page = Math.max(1, Number(q.get("page") ?? 1) || 1);
+  const perPage = Math.min(100, Math.max(1, Number(q.get("per_page") ?? 25) || 25));
+  const all = org === "acme" ? orgRepos : [];
+  const matching = all.filter(
+    (r) =>
+      (!connection || r.connection_id === connection) &&
+      (!needle || r.name.toLowerCase().includes(needle)),
+  );
+  const admin = me.admin_orgs.includes(org);
+  return json({
+    repos: paginate(matching, page, perPage).map((r) => ({ ...r, can_change: admin })),
+    total: matching.length,
+    enabled_total: all.filter((r) => r.enabled).length,
+    page,
+    per_page: perPage,
+    can_administer: admin,
+    unlisted: [],
+  });
+}
+
+/** Each connection with its count of enabled repositories, from the org
+ *  page's list, so Enable and Disable move the counts. */
+const withCounts = (cs: typeof connections) =>
+  cs.map((c) => ({
+    ...c,
+    enabled_repos: orgRepos.filter((r) => r.enabled && r.connection_id === c.id).length,
+  }));
+
+/** Enable or disable `owner/name`: the org page's list, /v1/repos and the
+ *  connections' counts follow. */
+function setRepoEnabled(owner: string, name: string, enabled: boolean): OrgRepoDto | undefined {
+  const r = orgRepos.find((x) => x.owner === owner && x.name === name);
+  if (!r) return undefined;
+  r.enabled = enabled;
+  r.project = enabled ? name : null;
+  r.unreachable_since = null;
+  const i = projects.findIndex((p) => p.owner === owner && p.name === name);
+  if (enabled && i < 0) {
+    projects.push({ ...proj(name, null), repo_url: r.repo_url, connection_id: r.connection_id });
+  }
+  if (!enabled && i >= 0) projects.splice(i, 1);
+  return r;
+}
+
+// The secret matrix behind a repo's Secrets key list carries the
+// repo-default column ("") and inheritance origins: GHCR_TOKEN comes from the
+// org (the `org` tag), SENTRY_DSN is a repo key that overrides the org's and is
+// inherited in both environments (so its expanded lines fold them away),
+// DATABASE_URL is a repo default overridden in both environments, and
+// SLACK_WEBHOOK_URL is production-only with qa unset on purpose. Its
+// environment columns are the org Environments the project may deploy into:
+// production and qa, as `projectEnvironments` lists them.
+// ── /v1/repos/acme/scarab/schedules: three `on: cron:` schedules ───────────
 // The nightly one's last slot started a Run (the scarab run fixture); the
-// weekly one's last slot was missed, so it is also a refused row in the runs
-// list, as the server records it.
+// weekly audit's last slot was missed, so it is also a refused row in the runs
+// list, as the server records it; the docs one was added since its last slot,
+// so it has not fired yet.
 const DAY = 24 * 60 * min;
 /** The next UTC slot at `hour`:00, on `weekday` (0 = Sunday) when given. */
 function nextUtc(hour: number, weekday?: number): number {
@@ -1305,6 +1462,13 @@ const schedules: ScheduleDto[] = [
     next_fire_at: nextUtc(6, 1),
     source_sha: SCHEDULE_SHA,
     last_fire: { schedule: "0 6 * * 1", slot_at: nextUtc(6, 1) - 7 * DAY, outcome: "missed" },
+  },
+  {
+    pipeline: ".scarab/docs.yaml",
+    schedule: "0 4 * * 0",
+    next_fire_at: nextUtc(4, 0),
+    source_sha: SCHEDULE_SHA,
+    last_fire: null,
   },
 ];
 const missedSlotMessage =
@@ -1366,7 +1530,8 @@ const apiTokens: components["schemas"]["ApiTokenDto"][] = [
   {
     id: "9f2c1d84-0f2b-4f3a-9a11-2b7c5d0e4a10",
     name: "release-bot",
-    owner_subject: "a.kim",
+    owner_subject: pid("a.kim"),
+    owner: { id: pid("a.kim"), handle: "a.kim", display_name: null },
     org: "acme",
     project: null,
     role: "member",
@@ -1380,7 +1545,8 @@ const apiTokens: components["schemas"]["ApiTokenDto"][] = [
   {
     id: "3b7a9c02-6d41-4b8e-8c22-71f0ab993c55",
     name: "orders-api deploy gate",
-    owner_subject: "j.lee",
+    owner_subject: pid("j.lee"),
+    owner: { id: pid("j.lee"), handle: "j.lee", display_name: null },
     org: "acme",
     project: "orders-api",
     role: "admin",
@@ -1394,7 +1560,8 @@ const apiTokens: components["schemas"]["ApiTokenDto"][] = [
   {
     id: "c41e7f60-2a88-4f19-b0d3-5e6a7c1b2d34",
     name: "status poller",
-    owner_subject: "a.kim",
+    owner_subject: pid("a.kim"),
+    owner: { id: pid("a.kim"), handle: "a.kim", display_name: null },
     org: "acme",
     project: null,
     role: "viewer",
@@ -1408,7 +1575,8 @@ const apiTokens: components["schemas"]["ApiTokenDto"][] = [
   {
     id: "7d5b0e13-9c44-4a27-8e61-0f3d2c8a55b7",
     name: "amy's laptop",
-    owner_subject: "a.kim",
+    owner_subject: pid("a.kim"),
+    owner: { id: pid("a.kim"), handle: "a.kim", display_name: null },
     org: "acme",
     project: null,
     role: "member",
@@ -1438,10 +1606,11 @@ function mintMockToken(body: string, pathOrg?: string): Response {
     id: `0000ffff-0000-4fff-8fff-${String(mintedTokens).padStart(12, "0")}`,
     name: req.name ?? "new token",
     owner_subject: me.subject,
+    owner: { id: me.id, handle: me.handle, display_name: me.display_name },
     org: pathOrg ?? req.org ?? "acme",
     project: req.project ?? null,
     role: req.role ?? "viewer",
-    created_by: me.subject,
+    created_by: me.handle,
     created_at: Date.now(),
     expires_at: Date.now() + (req.expires_in_days ?? 90) * day,
     last_used_at: null,
@@ -1508,9 +1677,9 @@ const securityEvents: SecurityEventDto[] = [
   }),
   secEvent(7, "passkey.enrolled", 3 * 24 * 60, { org: null, passkey_id: "pk-2" }),
 ];
-// Older Org events, so Settings → Event log has more than one page (50 a
-// page) to step through. Not in `securityEvents`: the Account → Security
-// list and the recent refusals stay as they were.
+// Older Org events, so the event log on Settings → Security has more than
+// one page (50 a page) to step through. Not in `securityEvents`: the
+// Account → Security list and the summary's recent refusals stay as they were.
 const OLDER_KINDS = ["op.authorised", "op.completed", "step_up.confirmed", "step_up.refused"];
 const OLDER_ACTORS = ["a.kim", "j.lee", "r.patel"];
 const OLDER_TARGETS = [
@@ -1573,7 +1742,8 @@ function orgEventsPage(search: string) {
 }
 
 const meSecurity: components["schemas"]["MeSecurityResponse"] = {
-  subject: "a.kim",
+  subject: pid("a.kim"),
+  handle: "a.kim",
   step_up: "enforce",
   has_passkey: true,
   usable_passkey_count: 2,
@@ -1652,14 +1822,43 @@ function route(pathname: string, search: string, method: string, body = ""): Res
   // Ahead of the library routes, which answer every other repo's refused
   // runs with an empty list.
   if (p === "/v1/repos/acme/scarab/refused-runs") return json({ refused: scheduleRefused });
-  const lib = libraryRoute(p, method, json);
+  const lib = libraryRoute(p, method, json, body);
   if (lib) return lib;
+  const pol = policyRoute(p, search, method, body, json);
+  if (pol) return pol;
   if (p === "/v1/me/security") return json(meSecurity);
   if (p === "/v1/me/security/events") {
     return json({ events: securityEvents.filter((e) => e.subject === "a.kim") });
   }
   if (/^\/v1\/orgs\/[^/]+\/security\/summary$/.test(p)) return json(orgSecuritySummary);
   if (/^\/v1\/orgs\/[^/]+\/security\/events$/.test(p)) return orgEventsPage(search);
+  // An owner resets a member's passkeys. The mock lets it through with no
+  // step-up; an admin left with none joins the summary's list.
+  const reset = method === "POST" ? p.match(/^\/v1\/orgs\/[^/]+\/members\/([^/]+)\/passkeys\/reset$/) : null;
+  if (reset) {
+    const id = decodeURIComponent(reset[1]!);
+    const handle = bindings.find((b) => b.id === id)?.handle ?? id;
+    const without = orgSecuritySummary.admins_without_passkey;
+    const had = !without.includes(handle);
+    const admin = bindings.some((b) => b.id === id && b.project === "" && (b.role === "admin" || b.role === "owner"));
+    if (had && admin) without.push(handle);
+    return json({ subject: id, handle, removed: had ? 2 : 0, windows_revoked: had ? 1 : 0 });
+  }
+  // One member by id: who they are and their roles in the org.
+  const member = method === "GET" ? p.match(/^\/v1\/orgs\/[^/]+\/members\/([^/]+)$/) : null;
+  if (member) {
+    const id = decodeURIComponent(member[1]!);
+    const held = bindings.filter((b) => b.id === id);
+    const who = principals.find((x) => x.id === id) ?? held[0];
+    if (!who) return new Response("not found", { status: 404 });
+    return json({
+      id,
+      handle: who.handle,
+      display_name: who.display_name ?? null,
+      claimed: who.claimed ?? true,
+      bindings: held,
+    });
+  }
   if (p === "/v1/step-up/requests/req-demo-1") return json(stepUpRequest);
   // Removing a passkey is always-ask: answer with the refusal so the step-up
   // dialog can be eyeballed (Cancel returns the 403 to the page).
@@ -1688,24 +1887,36 @@ function route(pathname: string, search: string, method: string, body = ""): Res
   }
   if (/^\/v1\/me\/identities\/[^/]+$/.test(p)) return new Response(null, { status: 204 });
   if (/^\/v1\/orgs\/[^/]+\/bindings$/.test(p)) {
-    return method === "GET" ? json(bindings) : new Response(null, { status: 204 });
+    if (method === "GET") return json(bindings);
+    if (method === "PUT") mockGrant(JSON.parse(body || "{}"));
+    if (method === "DELETE") {
+      const q = new URLSearchParams(search);
+      const who = q.get("subject");
+      const i = bindings.findIndex(
+        (b) => (b.id === who || b.handle === who) && b.project === (q.get("project") ?? ""),
+      );
+      if (i >= 0) bindings.splice(i, 1);
+    }
+    return new Response(null, { status: 204 });
   }
   if (/^\/v1\/orgs\/[^/]+\/principals$/.test(p)) {
     const q = (new URLSearchParams(search).get("q") ?? "").toLowerCase();
     return json(
       principals.filter(
         (x) =>
-          x.id.toLowerCase().startsWith(q) ||
+          x.handle.toLowerCase().startsWith(q) ||
           (x.display_name ?? "").toLowerCase().includes(q) ||
           x.identities.some((i) => i.handle.toLowerCase().startsWith(q)),
       ),
     );
   }
-  if (/^\/v1\/repos\/[^/]+\/[^/]+\/bindings\/import$/.test(p)) {
-    return json(bindings.filter((b) => b.project === "scarab"));
-  }
+  const imported = p.match(/^\/v1\/repos\/[^/]+\/([^/]+)\/bindings\/import$/);
+  if (imported) return json(mockResync(decodeURIComponent(imported[1]!)));
   if (p === "/v1/repos") return json(projects);
-  if (p === "/v1/runs") return json({ runs });
+  if (p === "/v1/runs") {
+    const org = new URLSearchParams(search).get("org");
+    return json({ runs: org ? runs.filter((r) => r.org === org) : runs });
+  }
 
   let m: RegExpMatchArray | null;
 
@@ -1742,10 +1953,6 @@ function route(pathname: string, search: string, method: string, body = ""): Res
       status: 410,
     });
   }
-  // /v1/repos/{org}/{repo}/environments/{name}/deployments
-  if ((m = p.match(/^\/v1\/repos\/[^/]+\/[^/]+\/environments\/([^/]+)\/deployments$/))) {
-    return json(deployments[m[1]] ?? []);
-  }
   // /v1/repos/{org}/{repo}/secrets/matrix
   if (/^\/v1\/repos\/[^/]+\/[^/]+\/secrets\/matrix$/.test(p)) return json(secretMatrix);
   // /v1/repos/{org}/{repo}/schedules
@@ -1759,7 +1966,7 @@ function route(pathname: string, search: string, method: string, body = ""): Res
   // the org under /v1/orgs/{org}/tokens. A mint returns an obviously-fake
   // plaintext so the one-time reveal can be exercised (and screenshotted), and
   // joins the list for the rest of the page's life, so a token minted under
-  // Your account shows in the org's list.
+  // Account settings shows in the org's list.
   if (p === "/v1/me/tokens") {
     if (method === "POST") return mintMockToken(body);
     return json(apiTokens.filter((t) => t.owner_subject === me.subject));
@@ -1785,8 +1992,6 @@ function route(pathname: string, search: string, method: string, body = ""): Res
 
   // Org-level Environments: list, one, and echoing writes.
   if (/^\/v1\/orgs\/[^/]+\/environments$/.test(p)) return json(orgEnvironments);
-  if (/^\/v1\/orgs\/[^/]+\/policies$/.test(p) && method === "GET") return json(orgPolicies);
-  if (/^\/v1\/orgs\/[^/]+\/policy-decisions$/.test(p)) return json({ decisions: policyDecisions, next: null });
   // Duplicate: the copy is kept for this page load, so "Open" lands on it.
   if ((m = p.match(/^\/v1\/orgs\/([^/]+)\/environments\/([^/]+)\/duplicate$/)) && method === "POST") {
     const old = decodeURIComponent(m[2]!);
@@ -1824,7 +2029,7 @@ function route(pathname: string, search: string, method: string, body = ""): Res
           old_oidc_subject: `scarab:org/acme/repo/*/env/${old}/ref/*`,
           new_oidc_subject: `scarab:org/acme/repo/*/env/${name}/ref/*`,
           notes: [
-            `Run and approval history and the Cache stay with ${old}, which is not changed and stays until an admin deletes it.`,
+            `Run history, approvals included, and the Cache stay with ${old}, which is not changed and stays until an admin deletes it.`,
           ],
         },
       },
@@ -1844,28 +2049,30 @@ function route(pathname: string, search: string, method: string, body = ""): Res
       return new Response(null, { status: 204 });
     }
     if (method === "PUT") {
-      // Echo the stored record (or a fresh one) with the body's display name
-      // and description; nothing is stored.
+      // Echo the stored record with the body's display name and description;
+      // a change to one is not stored. A new one is kept for the life of the
+      // page, so its manage page opens.
       const req = JSON.parse(body || "{}") as { display_name?: string | null; description?: string };
       const written = { display_name: req.display_name ?? null, description: req.description ?? "" };
-      return json(
-        found ? { ...found, ...written } : {
-          org: decodeURIComponent(m[1]!),
-          name,
-          ...written,
-          // A new Environment: permissive baseline, no eligible project.
-          protection: {
-            approvers: [],
-            allowed_refs: [],
-            wait_timer_s: 0,
-            require_reason: false,
-          },
-          eligibility: { all_projects: false, projects: [] },
-          created_at: now,
-          updated_at: now,
-          updated_by: "a.kim",
+      if (found) return json({ ...found, ...written });
+      const created = {
+        org: decodeURIComponent(m[1]!),
+        name,
+        ...written,
+        // A new Environment: permissive baseline, no eligible project.
+        protection: {
+          approvers: [],
+          allowed_refs: [],
+          wait_timer_s: 0,
+          require_reason: false,
         },
-      );
+        eligibility: { all_projects: false, projects: [] },
+        created_at: now,
+        updated_at: now,
+        updated_by: "a.kim",
+      };
+      orgEnvironments.push(created as (typeof orgEnvironments)[number]);
+      return json(created);
     }
     return found ? json(found) : new Response("not found", { status: 404 });
   }
@@ -1878,7 +2085,7 @@ function route(pathname: string, search: string, method: string, body = ""): Res
     if (m[2] === "protection") {
       if (method !== "PUT") return json(env.protection);
       // The baseline PUT replaces it whole: keep it for the page load, so
-      // the view after a Save shows what was sent.
+      // the page after a Save shows what was sent.
       const req = JSON.parse(body || "{}") as Record<string, unknown>;
       const num = (k: string) => (typeof req[k] === "number" ? (req[k] as number) : null);
       const gate = (req.approval_gate ?? {}) as Record<string, unknown>;
@@ -1923,31 +2130,81 @@ function route(pathname: string, search: string, method: string, body = ""): Res
     }
     return stored ? json(stored) : new Response("not found", { status: 404 });
   }
-  if (/^\/v1\/orgs\/[^/]+\/environment-migration-report$/.test(p)) return json(migrationReport);
-  if ((m = p.match(/^\/v1\/orgs\/[^/]+\/environment-migration-report\/([^/]+)\/acknowledge$/))) {
-    const line = migrationReport.find((l) => l.environment === decodeURIComponent(m![1]!));
-    if (!line) return new Response("not found", { status: 404 });
-    return json({ ...line, acknowledged_at: line.acknowledged_at ?? now, acknowledged_by: line.acknowledged_by ?? "a.kim" });
-  }
 
-  // Plugins: catalog, installations, kill/enable, uninstall.
-  if (/^\/v1\/orgs\/[^/]+\/plugin-catalog$/.test(p)) return json(pluginCatalog);
+  // Plugins: manifest review, installations, kill/enable, uninstall.
+  if (/^\/v1\/orgs\/[^/]+\/plugin-fetch$/.test(p) && method === "POST") {
+    // Any source reads as the Argo CD manifest.
+    const req = JSON.parse(body || "{}") as { source?: string };
+    return json(fetchedArgocdManifest(req.source ?? ""));
+  }
   if (/^\/v1\/orgs\/[^/]+\/plugins$/.test(p)) {
     if (method === "POST") {
-      // The body is not visible here; echo a fresh, still-pending install.
-      return json(
-        pluginInstallation("argocd-staging", "0a1b2c3d4e5f", {
-          id: "1d2e3f4a5b",
-          state: "enabled",
-          runtime_status: "pending",
-          runtime_message: "",
-          probe_passed_at: null,
-          approved_at: now,
-        }),
-        { status: 201 },
-      );
+      // A fresh, still-pending install of what was sent, kept until the page
+      // reloads, so its manage page opens.
+      const req = JSON.parse(body || "{}") as {
+        name?: string;
+        image?: string;
+        manifest_sha256?: string;
+        config?: Record<string, string>;
+        storage?: { claim: string; mount_path?: string | null } | null;
+      };
+      const name = req.name || "argocd-dev";
+      const made = pluginInstallation(name, "0a1b2c3d4e5f", {
+        id: "1d2e3f4a5b",
+        ...(req.image ? { image: req.image } : {}),
+        ...(req.manifest_sha256 ? { manifest_sha256: req.manifest_sha256 } : {}),
+        config: req.config ?? {},
+        storage: req.storage
+          ? {
+              claim: req.storage.claim,
+              mount_path: req.storage.mount_path || "/data",
+              owner_annotation: "scarab.io/plugin-installation",
+              owner_annotation_value: `acme/${name}`,
+            }
+          : null,
+        state: "enabled",
+        runtime_status: "pending",
+        runtime_message: "",
+        probe_passed_at: null,
+        approved_at: now,
+      });
+      plugins.push(made);
+      return json(made, { status: 201 });
     }
     return json(plugins);
+  }
+  if ((m = p.match(/^\/v1\/orgs\/[^/]+\/plugins\/([^/]+)\/upgrade(-fetch)?$/)) && method === "POST") {
+    const found = plugins.find((x) => x.name === decodeURIComponent(m![1]!));
+    if (!found) return new Response("no such installation", { status: 404 });
+    if (m[2]) {
+      const req = JSON.parse(body || "{}") as {
+        source?: string;
+        commit?: string;
+        connection?: string;
+        image?: string;
+      };
+      if (!req.source && !found.source) {
+        return new Response("this installation has no recorded source; give the full source", { status: 400 });
+      }
+      const source = req.source ?? `${(found.source ?? ARGOCD_SOURCE_PATH).replace(/@[0-9a-f]+$/, "")}@${req.commit}`;
+      return json(
+        fetchedPluginUpgrade(found, source, req.connection ?? found.source_connection ?? null, req.image ?? null),
+      );
+    }
+    const req = JSON.parse(body || "{}") as { image: string; source: string; manifest_sha256: string };
+    const read = fetchedPluginUpgrade(found, req.source, null, req.image);
+    Object.assign(found, {
+      image: req.image,
+      source: req.source,
+      manifest: read.manifest,
+      manifest_sha256: req.manifest_sha256,
+      approved_by: "a.kim",
+      approved_at: now,
+      runtime_status: "pending",
+      runtime_message: "",
+      probe_passed_at: null,
+    });
+    return json(found);
   }
   if ((m = p.match(/^\/v1\/orgs\/[^/]+\/plugins\/([^/]+)\/storage$/))) {
     const found = plugins.find((x) => x.name === decodeURIComponent(m![1]!));
@@ -1994,6 +2251,10 @@ function route(pathname: string, search: string, method: string, body = ""): Res
     // The body is not visible here; echo the slot as bound.
     return json(list.find((c) => c.slot === slot) ?? pluginConnection(slot, {}));
   }
+  if ((m = p.match(/^\/v1\/orgs\/[^/]+\/plugin-installations\/([^/]+)$/))) {
+    const found = plugins.find((x) => x.id === decodeURIComponent(m![1]!));
+    return found ? json(found) : new Response("no such installation", { status: 404 });
+  }
   if ((m = p.match(/^\/v1\/orgs\/[^/]+\/plugins\/([^/]+)(?:\/(kill|enable))?$/))) {
     const found = plugins.find((x) => x.name === decodeURIComponent(m![1]!));
     if (!found) return new Response("no such installation", { status: 404 });
@@ -2027,7 +2288,7 @@ function route(pathname: string, search: string, method: string, body = ""): Res
         credential_ref: `${id}-credential`,
         credential_present: true,
         last_delivery_at: null,
-        projects: [],
+        enabled_repos: 0,
         supports_resync: true,
         supports_preflight: false,
         managed_by_config: false,
@@ -2039,25 +2300,62 @@ function route(pathname: string, search: string, method: string, body = ""): Res
     // `?org=` lists one org's connections; without it, every org plus the
     // unassigned ones (the fixture caller is a global admin).
     const org = new URLSearchParams(search).get("org");
-    return json(org ? connections.filter((c) => c.org === org) : connections);
+    return json(withCounts(org ? connections.filter((c) => c.org === org) : connections));
   }
   if (method === "PUT" && (m = p.match(/^\/v1\/connections\/([^/]+)\/org$/))) {
     const org = (JSON.parse(body || "{}") as { org?: string }).org ?? "";
     const found = connections.find((c) => c.id === m![1]);
     if (!found) return new Response("not found", { status: 404 });
+    const refused = assignRefusal(found, org);
+    if (refused) {
+      return new Response(`connection \`${found.id}\` cannot serve org \`${org}\`: ${refused}`, {
+        status: 409,
+      });
+    }
     found.org = org;
     if (!me.admin_orgs.includes(org)) me.admin_orgs = [...me.admin_orgs, org].sort();
     if (!me.token_mint_orgs.includes(org)) me.token_mint_orgs = [...me.token_mint_orgs, org].sort();
     return json({ id: found.id, org });
   }
   if (method === "POST" && /^\/v1\/connections\/[^/]+\/resync$/.test(p)) {
-    return json({ bound: [], confirmed: 3, skipped: ["globex/shared-ci"] });
+    return json({
+      available: orgRepos.filter((r) => !r.enabled).slice(0, 3).map((r) => `${r.owner}/${r.name}`),
+      moved: [],
+      confirmed: 3,
+      skipped: ["globex/shared-ci"],
+    });
   }
-  if (/^\/v1\/connections\/[^/]+\/available-repos$/.test(p)) return json(availableRepos);
+  if ((m = p.match(/^\/v1\/orgs\/([^/]+)\/repos$/))) return orgReposPage(decodeURIComponent(m[1]!), search);
+  if (method === "POST" && (m = p.match(/^\/v1\/connections\/[^/]+\/repos$/))) {
+    const req = JSON.parse(body || "{}") as { owner?: string; name?: string };
+    const r = setRepoEnabled(req.owner ?? "", req.name ?? "", true);
+    if (!r) return new Response("not reachable through this connection", { status: 400 });
+    return json({ org: r.owner, project: r.name, webhook_registered: true, webhook_error: null });
+  }
+  if (method === "POST" && (m = p.match(/^\/v1\/connections\/[^/]+\/repos\/([^/]+)\/([^/]+)\/webhook$/))) {
+    const [owner, name] = [decodeURIComponent(m[1]!), decodeURIComponent(m[2]!)];
+    return json({ org: owner, project: name, webhook_registered: true, webhook_error: null });
+  }
+  if (method === "DELETE" && (m = p.match(/^\/v1\/connections\/[^/]+\/repos\/([^/]+)\/([^/]+)$/))) {
+    setRepoEnabled(decodeURIComponent(m[1]!), decodeURIComponent(m[2]!), false);
+    return new Response(null, { status: 204 });
+  }
   if (/^\/v1\/connections\/[^/]+\/preflight$/.test(p)) return json(connectionPreflight);
   // Secret names are scope-addressed: no `repo=` is the org scope.
+  // The org scope's names change with a save or a delete, for the life of
+  // the page.
   if (p === "/v1/secrets") {
-    const scoped = new URLSearchParams(search).has("repo");
+    const q = new URLSearchParams(search);
+    const scoped = q.has("repo");
+    if (!scoped && method === "POST") {
+      const req = JSON.parse(body || "{}") as { name?: string; repo?: string };
+      if (req.name && !req.repo && !orgSecretNames.names.includes(req.name)) orgSecretNames.names.push(req.name);
+      return new Response(null, { status: 204 });
+    }
+    if (!scoped && method === "DELETE") {
+      orgSecretNames.names = orgSecretNames.names.filter((n) => n !== q.get("name"));
+      return new Response(null, { status: 204 });
+    }
     return json(scoped ? secretNames : orgSecretNames);
   }
 
@@ -2207,7 +2505,7 @@ export function installMock() {
     document.documentElement.setAttribute("data-palette", pinnedPalette);
   }
 
-  // Which orgs the caller administers: `?admin_orgs=acme,globex`.
+  // Which orgs the caller administers: `?admin_orgs=acme` (default acme and globex).
   const adminOrgs = new URLSearchParams(window.location.search).get("admin_orgs");
   if (adminOrgs) me.admin_orgs = adminOrgs.split(",").filter(Boolean);
 

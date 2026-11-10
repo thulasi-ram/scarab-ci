@@ -9,8 +9,9 @@ another system, a status poller, an agent that starts Runs. Send it as
 
 ## Your tokens
 
-Tokens are personal. You mint, list and revoke your own under **Settings › Your account › API
-tokens** (`/settings/tokens`), or through the API:
+Tokens are personal. You mint, list and revoke your own under **Account settings › API tokens**
+(`/settings/tokens`). **New token**, at the top right, mints one, and each token is one row with
+the same columns as [the org's list](#the-orgs-list) except the owner. Through the API:
 
 | Call | What it does |
 |------|--------------|
@@ -39,8 +40,9 @@ the same personal token, with the org taken from the path.
 
 Org admins see every token issued in their org under **Settings › Organization settings › API
 tokens** (`/orgs/<org>/settings/tokens`), or with `GET /v1/orgs/{org}/tokens`. Each row shows the
-token's owner, name, scope and ceiling, when it was created, when it was last used, how many
-calls it has made, and when it expires. Sort it with `?sort=last_used` (the default),
+token's name, owner, scope and ceiling, its state (**active**, **expires soon** within 14 days,
+**revoked**, **expired**, **never used**), when it was last used, how many calls it has made,
+when it was created, and when it expires. Sort it with `?sort=last_used` (the default),
 `?sort=use_count` or `?sort=created`; each sorts newest or largest first. An admin can revoke any
 token in the org (`DELETE /v1/orgs/{org}/tokens/{id}`). Nobody mints from this page.
 

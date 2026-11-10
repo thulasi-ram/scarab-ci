@@ -27,6 +27,7 @@ use scarab_testkit::{
 fn scoped_principal(subject: &str) -> Principal {
     Principal {
         subject: subject.into(),
+        handle: String::new(),
         display_name: None,
         roles: vec![],
     }
@@ -88,6 +89,7 @@ fn harness_with(forge_url: Option<&str>) -> Harness {
                 "root-code",
                 Principal {
                     subject: "root".into(),
+                    handle: String::new(),
                     display_name: None,
                     roles: vec![Role::Owner], // global bootstrap owner
                 },
@@ -117,8 +119,9 @@ fn harness_with(forge_url: Option<&str>) -> Harness {
         };
         db.bind_repo("gh", &repo, "acme", "app").await.unwrap();
         // The scoped principals have signed in, so a native grant may name them.
+        // Their ids are their handles, so the sessions above name them.
         for (id, who) in [("1", "amy"), ("2", "eve")] {
-            identities.sign_in(&account(id, who), who, 1).await.unwrap();
+            identities.seed(who, &account(id, who));
         }
     });
     let app = router(
@@ -405,11 +408,19 @@ async fn bindings_api_grants_lists_revokes_and_imports() {
     let resp = h.app.clone().oneshot(resync()).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let imported = body_json(resp).await;
+    // Each imported person is a new Principal: a minted id, the handle
+    // people read (ADR-0080).
+    let id_of = |handle: &str| {
+        let ids = h.identities.clone();
+        let handle = handle.to_string();
+        async move { ids.by_handle(&handle).await.unwrap()[0].id.clone() }
+    };
+    let (carol, dan_id) = (id_of("carol").await, id_of("dan").await);
     assert_eq!(
         imported,
         serde_json::json!([
-            { "subject": "carol", "role": "admin", "project": "app" },
-            { "subject": "dan", "role": "viewer", "project": "app" },
+            { "id": carol, "handle": "carol", "role": "admin", "project": "app", "claimed": false },
+            { "id": dan_id, "handle": "dan", "role": "viewer", "project": "app", "claimed": false },
         ]),
         "no-access collaborators are not seeded"
     );
@@ -418,18 +429,24 @@ async fn bindings_api_grants_lists_revokes_and_imports() {
         name: "app".into(),
     };
     assert_eq!(
-        h.rbac.role_of("carol", &app_scope).await.unwrap(),
+        h.rbac.role_of(&carol, &app_scope).await.unwrap(),
         Some(Role::Admin)
     );
-    let dan = h.identities.principal("dan").await.unwrap().unwrap();
+    let dan = h.identities.principal(&dan_id).await.unwrap().unwrap();
     assert_eq!(dan.claimed_at, None, "imported, not yet signed into");
     // Signing in with THAT forge account claims it — same Principal.
     assert_eq!(
         h.identities
-            .sign_in(&account("4004", "dan"), "dan", 9)
+            .sign_in(
+                &account("4004", "dan"),
+                "dan",
+                scarab_identity::Placeholder::Never,
+                9
+            )
             .await
-            .unwrap(),
-        "dan"
+            .unwrap()
+            .id,
+        dan_id
     );
 
     // Native revoke via the API…
@@ -447,18 +464,18 @@ async fn bindings_api_grants_lists_revokes_and_imports() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-    assert_eq!(h.rbac.role_of("carol", &app_scope).await.unwrap(), None);
+    assert_eq!(h.rbac.role_of(&carol, &app_scope).await.unwrap(), None);
     // …and a re-sync does NOT resurrect the grant (native override wins).
     let resp = h.app.clone().oneshot(resync()).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(h.rbac.role_of("carol", &app_scope).await.unwrap(), None);
+    assert_eq!(h.rbac.role_of(&carol, &app_scope).await.unwrap(), None);
 
     // A listing that fails part-way changes NOTHING — never a partial prune.
     h.forge.fail_collaborators("page 2: 403 rate limited");
     let resp = h.app.clone().oneshot(resync()).await.unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        h.rbac.role_of("dan", &app_scope).await.unwrap(),
+        h.rbac.role_of(&dan_id, &app_scope).await.unwrap(),
         Some(Role::Viewer)
     );
 
@@ -473,13 +490,13 @@ async fn bindings_api_grants_lists_revokes_and_imports() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
-        h.rbac.role_of("dan", &app_scope).await.unwrap(),
+        h.rbac.role_of(&dan_id, &app_scope).await.unwrap(),
         Some(Role::Viewer),
         "a filtered import never prunes"
     );
     let resp = h.app.clone().oneshot(resync()).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(h.rbac.role_of("dan", &app_scope).await.unwrap(), None);
+    assert_eq!(h.rbac.role_of(&dan_id, &app_scope).await.unwrap(), None);
     // amy's NATIVE grant is not the forge's to remove.
     assert_eq!(
         h.rbac.role_of("amy", &app_scope).await.unwrap(),
@@ -491,8 +508,8 @@ async fn bindings_api_grants_lists_revokes_and_imports() {
     // person whose grant was explicitly revoked as `carol`.
     h.forge.set_collaborators(&[("6006", "carol", "admin")]);
     let resp = h.app.clone().oneshot(resync()).await.unwrap();
-    assert_eq!(body_json(resp).await[0]["subject"], "carol~2");
-    assert_eq!(h.rbac.role_of("carol", &app_scope).await.unwrap(), None);
+    assert_eq!(body_json(resp).await[0]["handle"], "carol~2");
+    assert_eq!(h.rbac.role_of(&carol, &app_scope).await.unwrap(), None);
 
     // Listing shows the live bindings.
     let v = body_json(
@@ -507,13 +524,24 @@ async fn bindings_api_grants_lists_revokes_and_imports() {
         .as_array()
         .unwrap()
         .iter()
-        .map(|b| b["subject"].as_str().unwrap())
+        .map(|b| b["handle"].as_str().unwrap())
         .collect();
     assert!(subjects.contains(&"amy"));
     assert!(
         !subjects.contains(&"carol"),
         "tombstoned carol is not listed"
     );
+    // Each row says who wrote it: amy's grant is native, carol~2's role came
+    // from the forge.
+    let origin_of = |subject: &str| {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["handle"] == subject && b["project"] == "app")
+            .map(|b| b["origin"].as_str().unwrap().to_string())
+    };
+    assert_eq!(origin_of("amy").as_deref(), Some("native"));
+    assert_eq!(origin_of("carol~2").as_deref(), Some("import"));
 
     // A non-admin cannot manage bindings.
     let amy = login(&h.app, "amy-code").await;
@@ -557,5 +585,5 @@ async fn an_import_with_no_provider_for_the_forge_is_a_409() {
     )
     .unwrap();
     assert!(msg.contains("SCARAB_OAUTH_FORGE_URL"), "{msg}");
-    assert!(h.identities.principal("carol").await.unwrap().is_none());
+    assert!(h.identities.by_handle("carol").await.unwrap().is_empty());
 }

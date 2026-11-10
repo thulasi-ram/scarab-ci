@@ -8,8 +8,14 @@ import {
   linkNotice,
   linkable,
   loginChoices,
+  memberHref,
+  memberRepoRoles,
   memberRows,
+  repoAccessHref,
+  repoCountLabel,
   providerName,
+  repoAccessRows,
+  resyncDiff,
 } from "./identities";
 
 const github = { id: "default", name: "GitHub", default: true };
@@ -78,9 +84,9 @@ describe("linkNotice", () => {
       kind: "ok",
       text: "Linked your GitHub account. You can now sign in with it.",
     });
-    const merged = linkNotice("?identity_linked=default&merged=ada-gh", [github]);
+    const merged = linkNotice("?identity_linked=default&merged=1", [github]);
     expect(merged?.kind).toBe("ok");
-    expect(merged?.text).toContain("signed in before as ada-gh");
+    expect(merged?.text).toContain("signed in here before as another account");
   });
 
   it("an error wins and carries the server's own words", () => {
@@ -93,27 +99,76 @@ describe("linkNotice", () => {
 });
 
 describe("memberRows", () => {
-  it("folds bindings into one row per person, org role apart from projects", () => {
+  it("lists one row per person with their org role and the repositories they also hold a role in", () => {
     const rows = memberRows([
-      { subject: "github:zed", role: "viewer", project: "web", display_name: "Zed" },
-      { subject: "alice", role: "admin", project: "", display_name: "Alice" },
-      { subject: "alice", role: "member", project: "web", display_name: "Alice" },
-      { subject: "alice", role: "viewer", project: "api", display_name: "Alice" },
-      { subject: "carol", role: "admin", project: "web", claimed: false },
+      { id: "pgithub:zed", handle: "github:zed", role: "viewer", project: "web", display_name: "Zed" },
+      { id: "palice", handle: "alice", role: "admin", project: "", display_name: "Alice" },
+      { id: "palice", handle: "alice", role: "member", project: "web", display_name: "Alice" },
+      { id: "palice", handle: "alice", role: "viewer", project: "api", display_name: "Alice" },
+      { id: "pcarol", handle: "carol", role: "admin", project: "web", claimed: false },
     ]);
-    expect(rows.map((r) => r.subject)).toEqual(["alice", "carol", "github:zed"]);
+    expect(rows.map((r) => r.handle)).toEqual(["alice", "carol", "github:zed"]);
     expect(rows[0]).toEqual({
-      subject: "alice",
+      id: "palice", handle: "alice",
       display: "Alice",
       pending: false,
       orgRole: "admin",
-      projects: [
-        { project: "api", role: "viewer" },
-        { project: "web", role: "member" },
-      ],
+      repos: ["api", "web"],
     });
-    expect(rows[1].pending).toBe(true);
-    expect(rows[1].display).toBe("carol");
+    // Repository roles only: still a member, with no org role.
+    expect(rows[1]).toEqual({
+      id: "pcarol", handle: "carol",
+      display: "carol",
+      pending: true,
+      orgRole: null,
+      repos: ["web"],
+    });
+  });
+});
+
+describe("repoAccessRows", () => {
+  const bindings = [
+    { id: "pa.kim", handle: "a.kim", role: "owner", project: "", display_name: "Avery", origin: "native" },
+    { id: "pj.lee", handle: "j.lee", role: "member", project: "", display_name: "Jordan", origin: "native" },
+    { id: "pj.lee", handle: "j.lee", role: "admin", project: "web", display_name: "Jordan", origin: "native" },
+    { id: "pr.ok", handle: "r.ok", role: "viewer", project: "web", claimed: false, origin: "import" },
+    { id: "ps.p", handle: "s.p", role: "member", project: "api", display_name: "Sam", origin: "import" },
+    { id: "pold", handle: "old", role: "viewer", project: "web" },
+  ];
+
+  it("splits the people bound to the repository from those its org role reaches", () => {
+    const { direct, viaOrg } = repoAccessRows(bindings, "web");
+    expect(direct).toEqual([
+      { id: "pj.lee", handle: "j.lee", display: "Jordan", pending: false, role: "admin", source: "scarab", orgRole: "member" },
+      { id: "pold", handle: "old", display: "old", pending: false, role: "viewer", source: null, orgRole: null },
+      { id: "pr.ok", handle: "r.ok", display: "r.ok", pending: true, role: "viewer", source: "forge", orgRole: null },
+    ]);
+    // j.lee is bound here, so is not listed again under the org; s.p's role
+    // is on another repository and reaches nothing here.
+    expect(viaOrg).toEqual([{ id: "pa.kim", handle: "a.kim", display: "Avery", pending: false, orgRole: "owner" }]);
+  });
+});
+
+describe("resyncDiff", () => {
+  it("reports the forge's rows added, changed and removed, never a role granted in Scarab", () => {
+    const before = [
+      { id: "pamy", handle: "amy", role: "member", project: "web", origin: "native" },
+      { id: "pbo", handle: "bo", role: "viewer", project: "web", origin: "import" },
+      { id: "pcy", handle: "cy", role: "member", project: "web", origin: "import" },
+      { id: "pdi", handle: "di", role: "viewer", project: "api", origin: "import" },
+    ];
+    const after = [
+      { id: "pamy", handle: "amy", role: "member", project: "web", origin: "native" },
+      { id: "pbo", handle: "bo", role: "admin", project: "web", origin: "import" },
+      { id: "ped", handle: "ed", role: "viewer", project: "web", origin: "import", display_name: "Ed" },
+      { id: "pdi", handle: "di", role: "viewer", project: "api", origin: "import" },
+    ];
+    expect(resyncDiff(before, after, "web")).toEqual({
+      added: [{ id: "ped", handle: "ed", display: "Ed", role: "viewer" }],
+      changed: [{ id: "pbo", handle: "bo", display: "bo", role: "admin", was: "viewer" }],
+      removed: [{ id: "pcy", handle: "cy", display: "cy", role: "member" }],
+    });
+    expect(resyncDiff(before, before, "web")).toEqual({ added: [], changed: [], removed: [] });
   });
 });
 
@@ -182,5 +237,50 @@ describe("confirming a merge", () => {
     const { deps: d } = deps({ confirm: async () => ({ merged: null, removed_passkeys: 0 }) });
     const out = await confirmMerge("m1", {}, d);
     expect("notice" in out && out.notice.text).toContain("nothing was merged");
+  });
+});
+
+describe("a member's page", () => {
+  it("keys it by the Principal's id, never the handle, one encoded segment before a static manage", () => {
+    const id = "p_0123456789abcdef0123456789abcdef";
+    expect(memberHref("acme", id)).toBe(`/orgs/acme/settings/members/${id}/manage`);
+    // Encoded whatever it holds, so an odd value can never become a path.
+    for (const odd of ["a/b c", "manage", "100%"]) {
+      const parts = memberHref("a b", odd).split("/").filter(Boolean);
+      expect(parts, odd).toHaveLength(6);
+      expect(parts[5], odd).toBe("manage");
+      expect(decodeURIComponent(parts[4]!), odd).toBe(odd);
+    }
+  });
+
+  it("puts the id in a member row's link, and keeps the handle for reading", () => {
+    const [row] = memberRows([
+      { id: "p_1", handle: "okta:s.patel@acme.example", role: "viewer", project: "" },
+    ]);
+    expect(memberHref("acme", row!.id)).not.toContain("patel");
+    expect(row!.handle).toBe("okta:s.patel@acme.example");
+  });
+
+  it("links each repository to its Access settings", () => {
+    expect(repoAccessHref("acme", "web app")).toBe("/acme/web%20app?tab=settings");
+    expect(repoCountLabel(1)).toBe("1 repository");
+    expect(repoCountLabel(0)).toBe("0 repositories");
+  });
+
+  it("lists the member's repository roles only, by repository, with where each came from", () => {
+    expect(
+      memberRepoRoles(
+        [
+          { id: "palice", handle: "alice", role: "admin", project: "" },
+          { id: "palice", handle: "alice", role: "member", project: "web", origin: "native" },
+          { id: "palice", handle: "alice", role: "viewer", project: "api", origin: "import" },
+          { id: "pbob", handle: "bob", role: "admin", project: "web" },
+        ],
+        "palice",
+      ),
+    ).toEqual([
+      { repo: "api", role: "viewer", source: "forge" },
+      { repo: "web", role: "member", source: "scarab" },
+    ]);
   });
 });

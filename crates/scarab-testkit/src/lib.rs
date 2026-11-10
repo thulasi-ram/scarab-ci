@@ -28,12 +28,6 @@ use scarab_storage::{ObjectStore, StorageError};
 mod environment_governance;
 pub use environment_governance::InMemoryEnvironmentGovernance;
 
-/// Seed and read the frozen `legacy_project_environments` rows on Postgres
-/// (ADR-0071 §10), which production no longer writes. Behind the `postgres`
-/// feature, so the crate stays free of a database client by default.
-#[cfg(feature = "postgres")]
-pub mod legacy_environments;
-
 /// An in-memory `PolicyStore` (ADR-0075) with the Postgres adapter's
 /// versioning, name and concurrency rules.
 mod policies;
@@ -280,6 +274,10 @@ struct InMemoryState {
     forge_connections: HashMap<String, scarab_forge::ForgeConnection>,
     /// Repo bindings: (owner, name) → (connection id, org, project).
     forge_repos: HashMap<(String, String), (String, String, String)>,
+    /// Bindings the serving connection no longer reaches: (owner, name) →
+    /// unix-ms since (the Postgres `forge_repos.unreachable_since`). Read only
+    /// while the binding exists; a bind or an unbind drops the entry.
+    forge_repo_unreachable: HashMap<(String, String), i64>,
     /// Connections owned by the declarative `connections:` config, not the DB
     /// (ADR-0060 part D single-owner marker; the `owned_by_config` column).
     forge_config_owned: std::collections::HashSet<String>,
@@ -1809,6 +1807,20 @@ impl Db for InMemoryDb {
         let mut out: Vec<RunSummary> = st
             .runs
             .iter()
+            .map(|(run, status)| fake_run_summary(&st, run, *status))
+            .collect();
+        // Newest first, then id — matches the adapter's ORDER BY.
+        out.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.run.0.cmp(&a.run.0)));
+        out.truncate(limit as usize);
+        Ok(out)
+    }
+
+    async fn list_runs_for_org(&self, org: &str, limit: u32) -> Result<Vec<RunSummary>, DbError> {
+        let st = self.state.lock().unwrap();
+        let mut out: Vec<RunSummary> = st
+            .runs
+            .iter()
+            .filter(|(run, _)| st.run_tenant.get(*run).is_some_and(|(o, _)| o == org))
             .map(|(run, status)| fake_run_summary(&st, run, *status))
             .collect();
         // Newest first, then id — matches the adapter's ORDER BY.
@@ -3885,6 +3897,9 @@ impl scarab_forge::ForgeConnectionStore for InMemoryDb {
         let mut st = self.state.lock().unwrap();
         st.forge_connections.remove(id);
         st.forge_repos.retain(|_, (conn, _, _)| conn != id);
+        let bound: std::collections::HashSet<(String, String)> =
+            st.forge_repos.keys().cloned().collect();
+        st.forge_repo_unreachable.retain(|k, _| bound.contains(k));
         st.forge_config_owned.remove(id);
         Ok(())
     }
@@ -3930,6 +3945,7 @@ impl scarab_forge::ForgeConnectionStore for InMemoryDb {
                 });
             }
         }
+        st.forge_repo_unreachable.remove(&key);
         st.forge_repos.insert(
             key,
             (
@@ -3954,6 +3970,42 @@ impl scarab_forge::ForgeConnectionStore for InMemoryDb {
             .is_some_and(|(c, _, _)| c == connection_id)
         {
             st.forge_repos.remove(&key);
+            st.forge_repo_unreachable.remove(&key);
+        }
+        Ok(())
+    }
+
+    async fn mark_repo_unreachable(
+        &self,
+        connection_id: &str,
+        repo: &scarab_forge::RepoRef,
+        at: i64,
+    ) -> Result<(), scarab_forge::RegistryError> {
+        let mut st = self.state.lock().unwrap();
+        let key = (repo.owner.clone(), repo.name.clone());
+        if st
+            .forge_repos
+            .get(&key)
+            .is_some_and(|(c, _, _)| c == connection_id)
+        {
+            st.forge_repo_unreachable.entry(key).or_insert(at);
+        }
+        Ok(())
+    }
+
+    async fn clear_repo_unreachable(
+        &self,
+        connection_id: &str,
+        repo: &scarab_forge::RepoRef,
+    ) -> Result<(), scarab_forge::RegistryError> {
+        let mut st = self.state.lock().unwrap();
+        let key = (repo.owner.clone(), repo.name.clone());
+        if st
+            .forge_repos
+            .get(&key)
+            .is_some_and(|(c, _, _)| c == connection_id)
+        {
+            st.forge_repo_unreachable.remove(&key);
         }
         Ok(())
     }
@@ -3991,6 +4043,10 @@ impl scarab_forge::ForgeConnectionStore for InMemoryDb {
                         connection: c.clone(),
                         org: org.clone(),
                         project: project.clone(),
+                        unreachable_since: st
+                            .forge_repo_unreachable
+                            .get(&(repo.owner.clone(), repo.name.clone()))
+                            .copied(),
                     })
             }))
     }
@@ -4517,8 +4573,10 @@ impl scarab_identity::ApiTokenStore for InMemoryApiTokens {
 }
 
 /// An in-memory [`scarab_identity::IdentityStore`] with the Postgres adapter's
-/// rules (ADR-0069): an identity is keyed by `(provider, external_id)`, a new
-/// one always mints a NEW Principal, and a minted id is never re-minted.
+/// rules (ADR-0069, ADR-0080): an identity is keyed by `(provider,
+/// external_id)`, a new one always mints a NEW Principal with a new id, and a
+/// handle is never re-minted, in any case. Ids come from a counter, not a
+/// CSPRNG: a fake needs them distinct, not secret.
 #[derive(Default)]
 pub struct InMemoryIdentities {
     inner: Mutex<IdentitiesState>,
@@ -4526,9 +4584,29 @@ pub struct InMemoryIdentities {
 
 #[derive(Default)]
 struct IdentitiesState {
+    /// id → record
     principals: HashMap<String, scarab_identity::PrincipalRecord>,
     /// (provider, external_id) → (principal id, identity)
     identities: HashMap<(String, String), (String, scarab_identity::ProviderIdentity)>,
+    /// Ids of legacy placeholders (migration 0093) not adopted yet.
+    placeholders: std::collections::HashSet<String>,
+    minted: u64,
+}
+
+impl IdentitiesState {
+    fn next_id(&mut self) -> String {
+        self.minted += 1;
+        let mut bytes = [0u8; 16];
+        bytes[8..].copy_from_slice(&self.minted.to_be_bytes());
+        scarab_identity::principal_id_from_bytes(bytes)
+    }
+
+    fn handle_taken(&self, handle: &str) -> bool {
+        let lower = handle.to_lowercase();
+        self.principals
+            .values()
+            .any(|p| p.handle.to_lowercase() == lower)
+    }
 }
 
 impl InMemoryIdentities {
@@ -4536,13 +4614,57 @@ impl InMemoryIdentities {
         Self::default()
     }
 
+    /// A claimed Principal whose **id is its handle**, pinned to
+    /// `identity`: for tests about grants and sessions that name people by
+    /// readable strings. Minted ids are `p_` + 32 hex (ADR-0080).
+    pub fn seed(&self, handle: &str, identity: &scarab_identity::ProviderIdentity) -> String {
+        let mut st = self.inner.lock().unwrap();
+        st.principals.insert(
+            handle.to_string(),
+            scarab_identity::PrincipalRecord {
+                id: handle.to_string(),
+                handle: handle.to_string(),
+                display_name: identity.display_name.clone(),
+                created_at: 0,
+                claimed_at: Some(0),
+                merged_into: None,
+            },
+        );
+        st.identities.insert(
+            (identity.provider.clone(), identity.external_id.clone()),
+            (handle.to_string(), identity.clone()),
+        );
+        handle.to_string()
+    }
+
+    /// A Principal with `handle` and no identity — what migration 0093
+    /// leaves for a pre-0052 binding subject that named nobody (ADR-0080 §6).
+    pub fn seed_placeholder(&self, handle: &str) -> String {
+        let mut st = self.inner.lock().unwrap();
+        let id = st.next_id();
+        st.principals.insert(
+            id.clone(),
+            scarab_identity::PrincipalRecord {
+                id: id.clone(),
+                handle: handle.to_string(),
+                display_name: None,
+                created_at: 0,
+                claimed_at: None,
+                merged_into: None,
+            },
+        );
+        st.placeholders.insert(id.clone());
+        id
+    }
+
     fn pin_or_mint(
         &self,
         identity: &scarab_identity::ProviderIdentity,
-        base_id: &str,
+        base_handle: &str,
+        placeholder: scarab_identity::Placeholder,
         now_ms: i64,
         claim: bool,
-    ) -> String {
+    ) -> scarab_identity::PrincipalRecord {
         let mut st = self.inner.lock().unwrap();
         let key = (identity.provider.clone(), identity.external_id.clone());
         if let Some((id, held)) = st.identities.get(&key).cloned() {
@@ -4563,24 +4685,53 @@ impl InMemoryIdentities {
                     p.claimed_at.get_or_insert(now_ms);
                 }
             }
-            return id;
+            return st.principals[&id].clone();
         }
-        let id = (1..)
-            .map(|n| scarab_identity::principal_id_candidate(base_id, n))
-            .find(|c| !st.principals.contains_key(c))
-            .expect("an unbounded candidate sequence always has a free id");
-        st.principals.insert(
-            id.clone(),
-            scarab_identity::PrincipalRecord {
-                id: id.clone(),
-                display_name: identity.display_name.clone(),
-                created_at: now_ms,
-                claimed_at: claim.then_some(now_ms),
-                merged_into: None,
-            },
-        );
+        let adopt = (placeholder == scarab_identity::Placeholder::AdoptExact)
+            .then(|| {
+                st.principals
+                    .values()
+                    .find(|p| {
+                        p.handle == base_handle
+                            && st.placeholders.contains(&p.id)
+                            && p.claimed_at.is_none()
+                            && p.merged_into.is_none()
+                    })
+                    .map(|p| p.id.clone())
+            })
+            .flatten();
+        let id = match adopt {
+            Some(id) => {
+                st.placeholders.remove(&id);
+                let p = st.principals.get_mut(&id).expect("just found");
+                if identity.display_name.is_some() {
+                    p.display_name = identity.display_name.clone();
+                }
+                p.claimed_at = claim.then_some(now_ms);
+                id
+            }
+            None => {
+                let handle = (1..)
+                    .map(|n| scarab_identity::handle_candidate(base_handle, n))
+                    .find(|c| !st.handle_taken(c))
+                    .expect("an unbounded candidate sequence always has a free handle");
+                let id = st.next_id();
+                st.principals.insert(
+                    id.clone(),
+                    scarab_identity::PrincipalRecord {
+                        id: id.clone(),
+                        handle,
+                        display_name: identity.display_name.clone(),
+                        created_at: now_ms,
+                        claimed_at: claim.then_some(now_ms),
+                        merged_into: None,
+                    },
+                );
+                id
+            }
+        };
         st.identities.insert(key, (id.clone(), identity.clone()));
-        id
+        st.principals[&id].clone()
     }
 }
 
@@ -4601,19 +4752,21 @@ impl scarab_identity::IdentityStore for InMemoryIdentities {
     async fn sign_in(
         &self,
         identity: &scarab_identity::ProviderIdentity,
-        base_id: &str,
+        base_handle: &str,
+        placeholder: scarab_identity::Placeholder,
         now_ms: i64,
-    ) -> Result<String, IdentityError> {
-        Ok(self.pin_or_mint(identity, base_id, now_ms, true))
+    ) -> Result<scarab_identity::PrincipalRecord, IdentityError> {
+        Ok(self.pin_or_mint(identity, base_handle, placeholder, now_ms, true))
     }
 
     async fn pin(
         &self,
         identity: &scarab_identity::ProviderIdentity,
-        base_id: &str,
+        base_handle: &str,
+        placeholder: scarab_identity::Placeholder,
         now_ms: i64,
-    ) -> Result<String, IdentityError> {
-        Ok(self.pin_or_mint(identity, base_id, now_ms, false))
+    ) -> Result<scarab_identity::PrincipalRecord, IdentityError> {
+        Ok(self.pin_or_mint(identity, base_handle, placeholder, now_ms, false))
     }
 
     /// Attach / already-linked / conflict, exactly as Postgres. A **merge**
@@ -4653,6 +4806,10 @@ impl scarab_identity::IdentityStore for InMemoryIdentities {
             Some(from) => {
                 let held = st.identities.values().filter(|(p, _)| *p == from).count();
                 if held > 1 {
+                    let from = st
+                        .principals
+                        .get(&from)
+                        .map_or(from.clone(), |p| p.handle.clone());
                     return Err(IdentityError::Conflict(format!(
                         "that {} account belongs to `{from}`, which also signs in another way",
                         identity.provider
@@ -4689,19 +4846,24 @@ impl scarab_identity::IdentityStore for InMemoryIdentities {
         Ok(())
     }
 
-    async fn aliases_of(&self, id: &str) -> Result<Vec<String>, IdentityError> {
+    async fn aliases_of(
+        &self,
+        id: &str,
+    ) -> Result<Vec<scarab_identity::PrincipalRecord>, IdentityError> {
         let st = self.inner.lock().unwrap();
-        let mut out: Vec<String> = Vec::new();
+        let mut out: Vec<scarab_identity::PrincipalRecord> = Vec::new();
         let mut frontier = vec![id.to_string()];
         while let Some(target) = frontier.pop() {
             for p in st.principals.values() {
-                if p.merged_into.as_deref() == Some(target.as_str()) && !out.contains(&p.id) {
-                    out.push(p.id.clone());
+                if p.merged_into.as_deref() == Some(target.as_str())
+                    && !out.iter().any(|o| o.id == p.id)
+                {
+                    out.push(p.clone());
                     frontier.push(p.id.clone());
                 }
             }
         }
-        out.sort();
+        out.sort_by(|a, b| a.handle.cmp(&b.handle));
         Ok(out)
     }
 
@@ -4710,6 +4872,25 @@ impl scarab_identity::IdentityStore for InMemoryIdentities {
         id: &str,
     ) -> Result<Option<scarab_identity::PrincipalRecord>, IdentityError> {
         Ok(self.inner.lock().unwrap().principals.get(id).cloned())
+    }
+
+    async fn by_handle(
+        &self,
+        handle: &str,
+    ) -> Result<Vec<scarab_identity::PrincipalRecord>, IdentityError> {
+        let st = self.inner.lock().unwrap();
+        if let Some(p) = st.principals.values().find(|p| p.handle == handle) {
+            return Ok(vec![p.clone()]);
+        }
+        let lower = handle.to_lowercase();
+        let mut out: Vec<_> = st
+            .principals
+            .values()
+            .filter(|p| p.handle.to_lowercase() == lower)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| a.handle.cmp(&b.handle));
+        Ok(out)
     }
 
     async fn identities_of(
@@ -4733,13 +4914,13 @@ impl scarab_identity::IdentityStore for InMemoryIdentities {
         limit: usize,
     ) -> Result<Vec<scarab_identity::PrincipalMatch>, IdentityError> {
         let q = query.to_lowercase();
-        let mut ids: Vec<String> = {
+        let mut found: Vec<(String, String)> = {
             let st = self.inner.lock().unwrap();
             st.principals
                 .values()
                 .filter(|p| p.merged_into.is_none())
                 .filter(|p| {
-                    p.id.to_lowercase().starts_with(&q)
+                    p.handle.to_lowercase().starts_with(&q)
                         || p.display_name
                             .as_deref()
                             .is_some_and(|d| d.to_lowercase().contains(&q))
@@ -4748,18 +4929,19 @@ impl scarab_identity::IdentityStore for InMemoryIdentities {
                             .values()
                             .any(|(pid, i)| pid == &p.id && i.handle.to_lowercase().starts_with(&q))
                 })
-                .map(|p| p.id.clone())
+                .map(|p| (p.handle.clone(), p.id.clone()))
                 .collect()
         };
-        ids.sort();
-        ids.truncate(limit);
+        found.sort();
+        found.truncate(limit);
         let mut out = Vec::new();
-        for id in ids {
+        for (_, id) in found {
             let identities = scarab_identity::IdentityStore::identities_of(self, &id).await?;
             let st = self.inner.lock().unwrap();
             let p = &st.principals[&id];
             out.push(scarab_identity::PrincipalMatch {
                 id: id.clone(),
+                handle: p.handle.clone(),
                 display_name: p.display_name.clone(),
                 claimed: p.claimed_at.is_some(),
                 identities,
@@ -4874,25 +5056,34 @@ impl scarab_identity::RbacStore for InMemoryRbac {
             .max())
     }
 
-    async fn bindings(&self, org: &str) -> Result<Vec<scarab_identity::Binding>, IdentityError> {
+    async fn bindings(
+        &self,
+        org: &str,
+    ) -> Result<Vec<(scarab_identity::Binding, scarab_identity::BindingOrigin)>, IdentityError>
+    {
         let rows = self.rows.lock().unwrap();
-        let mut out: Vec<scarab_identity::Binding> = rows
+        let mut out: Vec<(scarab_identity::Binding, scarab_identity::BindingOrigin)> = rows
             .iter()
             .filter(|((_, o, _), (role, _))| o == org && role.is_some())
-            .map(|((subject, o, p), (role, _))| scarab_identity::Binding {
-                subject: subject.clone(),
-                scope: if p.is_empty() {
-                    scarab_identity::Scope::Org(o.clone())
-                } else {
-                    scarab_identity::Scope::Project {
-                        org: o.clone(),
-                        name: p.clone(),
-                    }
-                },
-                role: role.unwrap(),
+            .map(|((subject, o, p), (role, origin))| {
+                (
+                    scarab_identity::Binding {
+                        subject: subject.clone(),
+                        scope: if p.is_empty() {
+                            scarab_identity::Scope::Org(o.clone())
+                        } else {
+                            scarab_identity::Scope::Project {
+                                org: o.clone(),
+                                name: p.clone(),
+                            }
+                        },
+                        role: role.unwrap(),
+                    },
+                    *origin,
+                )
             })
             .collect();
-        out.sort_by(|a, b| a.subject.cmp(&b.subject));
+        out.sort_by(|a, b| a.0.subject.cmp(&b.0.subject));
         Ok(out)
     }
 

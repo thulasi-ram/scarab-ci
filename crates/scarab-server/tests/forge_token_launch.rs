@@ -179,7 +179,6 @@ async fn trusted_library(libs: &InMemoryLibraries) -> String {
         source: format!("{TRUSTED}@{}", "1".repeat(40)),
         publisher: "acme".into(),
         name: "git".into(),
-        first_party: false,
         fetched_by: "amy".into(),
         fetched_at: 1,
     })
@@ -286,6 +285,57 @@ async fn a_launch_after_the_trust_is_removed_mints_nothing() {
         .unwrap()
         .token
         .starts_with("fake-write-token"));
+}
+
+/// A stored spec for the clone library's Step on a long-lived connection
+/// (a Run from before migration 0090, when the clone library was trusted
+/// by its name): the launch hands over nothing until the org trusts the
+/// source the clone version was fetched from, and then hands the token over.
+#[tokio::test]
+async fn a_clone_library_launch_gets_the_long_lived_token_only_once_its_source_is_trusted() {
+    use scarab_server::test_support::{CLONE_LIBRARY, CLONE_LIBRARY_SOURCE};
+    let inner = Arc::new(FakeExecutor::new());
+    let forge = Arc::new(FakeForge::new());
+    let libs = Arc::new(InMemoryLibraries::new());
+    libs.put_version(&LibraryVersion {
+        org: "acme".into(),
+        content_hash: content_hash(CLONE_LIBRARY),
+        content: CLONE_LIBRARY.into(),
+        source: CLONE_LIBRARY_SOURCE.into(),
+        publisher: "thulasi-ram".into(),
+        name: "clone".into(),
+        fetched_by: "amy".into(),
+        fetched_at: 1,
+    })
+    .await
+    .unwrap();
+    let mut spec = token_spec(ForgeToken::Read);
+    spec.forge_token.as_mut().unwrap().trusted_library = Some(content_hash(CLONE_LIBRARY));
+    let exec = ForgeCredentialExecutor::new(inner.clone(), forge.clone())
+        .with_libraries(Arc::new(InMemoryDb::new()), libs.clone());
+    let err = exec
+        .launch(&step_run("checkout/git"), &spec)
+        .await
+        .expect_err("the clone library is not trusted by its name");
+    assert!(err.to_string().contains("no longer trusts"), "{err}");
+
+    libs.trust_source(&TrustedSource {
+        org: "acme".into(),
+        source: scarab_policy::library::trust_key(CLONE_LIBRARY_SOURCE).into(),
+        trusted_by: "amy".into(),
+        trusted_at: 2,
+        step_up_ref: Some("su-1".into()),
+    })
+    .await
+    .unwrap();
+    let handle = exec.launch(&step_run("checkout/git"), &spec).await.unwrap();
+    assert!(inner
+        .launched_spec(&handle)
+        .unwrap()
+        .forge_token
+        .unwrap()
+        .credential
+        .is_some());
 }
 
 #[tokio::test]

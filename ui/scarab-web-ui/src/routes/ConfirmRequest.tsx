@@ -114,34 +114,34 @@ export default function ConfirmRequest() {
             </div>
             <div class="secrets-body">
               <dl class="step-up-summary">
-                <dt>operation</dt>
+                <dt>Operation</dt>
                 <dd>
                   {r().summary.operation} <span class="subtle mono">({r().op})</span>
                 </dd>
                 <Show when={r().summary.target}>
-                  <dt>target</dt>
+                  <dt>Target</dt>
                   <dd class="mono">{r().summary.target}</dd>
                 </Show>
                 <Show when={r().summary.changes.length > 0}>
-                  <dt>changes</dt>
+                  <dt>Changes</dt>
                   <dd>
                     <ul class="step-up-changes mono">
                       <For each={r().summary.changes}>{(c) => <li>{c}</li>}</For>
                     </ul>
                   </dd>
                 </Show>
-                <dt>request</dt>
+                <dt>Request</dt>
                 <dd class="mono">
                   {r().method} {r().path}
                   {r().query ? `?${r().query}` : ""}
                 </dd>
-                <dt>requested by</dt>
+                <dt>Requested by</dt>
                 <dd>{r().requested_by}</dd>
-                <dt>for</dt>
+                <dt>For</dt>
                 <dd class="mono">{r().for_human}</dd>
-                <dt>raised</dt>
+                <dt>Raised</dt>
                 <dd title={absTime(r().created_at)}>{relTime(r().created_at)}</dd>
-                <dt>expires</dt>
+                <dt>Expires</dt>
                 <dd>{absTime(r().expires_at)}</dd>
               </dl>
 

@@ -224,7 +224,7 @@
         "tags": [
           "Forge Connections"
         ],
-        "summary": "Registered forge connections + their bound Projects and health (ADR-0060)",
+        "summary": "Registered forge connections, how many repositories each has enabled, and their health (ADR-0060)",
         "description": "Read-only, and per Org (git-bug 19b0a45): the caller sees the connections\nof the Orgs it administers, and a global admin also sees the unassigned\nones. No credential material is ever returned — only whether the handle\nresolves.",
         "operationId": "list_connections",
         "parameters": [
@@ -570,7 +570,7 @@
           "Forge Connections"
         ],
         "summary": "Bind a repo to a connection, creating its Project, and register its webhook (ADR-0060)",
-        "description": "There is no `projects` table: a Project *is* a `forge_repos` binding\n(ADR-0046), so this endpoint is the repo→Project onboarding flow for any forge\nwithout installation-style auto-registration. After it, the repo appears on\n`GET /v1/repos`, can hold Environments and secrets, and its pushes resolve to\na tenant. GitHub keeps binding itself from the `installation` webhook; this is\nthe Forgejo path.\n\nRegistration is attempted **after** the binding lands and its failure is\n*reported, not rolled back*: the binding is the durable governance fact, a\nhook is a remote side effect on a system that may be momentarily unreachable,\nand unbinding on a failed hook call would delete a Project an admin just\nasked for. `POST …/repos/{owner}/{name}/webhook` retries.",
+        "description": "There is no `projects` table: a Project *is* a `forge_repos` binding\n(ADR-0046), so this endpoint is the repo→Project onboarding flow — \"Enable\"\non the org's repositories page — for every forge. After it, the repo appears on `GET /v1/repos`, can hold\nEnvironments and secrets, and its pushes resolve to a tenant. A GitHub\ninstallation makes its repos available but binds none of them, so this is\nthe GitHub path too.\n\nRegistration is attempted **after** the binding lands and its failure is\n*reported, not rolled back*: the binding is the durable governance fact, a\nhook is a remote side effect on a system that may be momentarily unreachable,\nand unbinding on a failed hook call would delete a Project an admin just\nasked for. `POST …/repos/{owner}/{name}/webhook` retries.",
         "operationId": "bind_repo",
         "parameters": [
           {
@@ -643,7 +643,7 @@
           "Forge Connections"
         ],
         "summary": "Unbind a repo from a connection, removing its Project (ADR-0060)",
-        "description": "The inverse of the bind above, and destructive in the same measure: the\nbinding is the Project, so its Environments, scoped secrets and RBAC go with\nit. That is why re-sync never does this on a forge's say-so and why this is an\nexplicit, human-addressed endpoint.\n\nThe forge-side webhook is deliberately **left in place**. Deleting hooks is\nnot in the port (ADR-0046 exposes registration only), and a stale hook is\nharmless: an unbound repo's deliveries resolve to nothing and are dropped.",
+        "description": "The inverse of the bind above, and destructive in the same measure: the\nbinding is the Project, so its Environments, scoped secrets and RBAC go with\nit. That is why re-sync never does this on a forge's say-so and why this is an\nexplicit, human-addressed endpoint. It is permanent: no installation delivery\nor re-sync binds the repo again; only another explicit bind does.\n\nThe forge-side webhook is deliberately **left in place**. Deleting hooks is\nnot in the port (ADR-0046 exposes registration only), and a stale hook is\nharmless: an unbound repo's deliveries resolve to nothing and are dropped.",
         "operationId": "unbind_repo",
         "parameters": [
           {
@@ -778,8 +778,8 @@
         "tags": [
           "Forge Connections"
         ],
-        "summary": "Re-bind repos the forge reports for this connection (ADR-0060)",
-        "description": "This is the **healing** path for GitHub, where installing the App *is*\nregistration and the registry is therefore only as current as the last\n`installation_repositories` delivery. A dropped delivery leaves a repo the App\ncovers with no Project; re-sync notices.\n\nIt deliberately **only binds**. Unbinding on a forge's say-so would let one\nfailed API page delete governance — Environments, secrets and RBAC hang off a\nProject — so removal stays an explicit human act. `confirmed` reports the\noverlap so a stale binding is still visible.",
+        "summary": "Report the repos the forge reaches that are not enabled, and move this org's Projects off connections that do not serve it (ADR-0060)",
+        "description": "Enabling a repository is opt-in, so re-sync **creates no Project**. A repo\nthe forge reports that is not bound is listed in `available`; an admin\nenables it from the org's repositories page (`POST\n/v1/connections/{id}/repos`). A repo an admin disabled therefore stays\ndisabled.\n\nThe one change it makes is to an existing Project: a repo of this\nconnection's Org that is bound through a connection that does not serve\nits owner (unassigned, or another Org's) moves to this one, with its\nProject (git-bug 19b0a45). That is how an Org takes its repos back from a\nlegacy connection.\n\nIt **never unbinds**. Unbinding on a forge's say-so would let one failed\nAPI page delete governance — Environments, secrets and RBAC hang off a\nProject — so removal stays an explicit human act. `confirmed` reports the\noverlap so a stale binding is still visible.",
         "operationId": "resync_connection",
         "parameters": [
           {
@@ -1677,110 +1677,6 @@
         ]
       }
     },
-    "/v1/orgs/{org}/environment-migration-report": {
-      "get": {
-        "tags": [
-          "Environments"
-        ],
-        "summary": "The ADR-0071 migration's split report (ADR-0071 §10 step 8)",
-        "operationId": "get_environment_migration_report",
-        "parameters": [
-          {
-            "name": "org",
-            "in": "path",
-            "description": "org",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/components/schemas/EnvironmentMigrationReportDto"
-                  }
-                }
-              }
-            }
-          },
-          "403": {
-            "description": "not an org admin"
-          },
-          "404": {
-            "description": "not configured"
-          }
-        },
-        "security": [
-          {
-            "apiToken": []
-          },
-          {
-            "sessionCookie": []
-          }
-        ]
-      }
-    },
-    "/v1/orgs/{org}/environment-migration-report/{env}/acknowledge": {
-      "post": {
-        "tags": [
-          "Environments"
-        ],
-        "summary": "Acknowledge a split-report line (ADR-0071 §10 step 8)",
-        "operationId": "acknowledge_environment_migration_report",
-        "parameters": [
-          {
-            "name": "org",
-            "in": "path",
-            "description": "org",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "env",
-            "in": "path",
-            "description": "environment name",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/EnvironmentMigrationReportDto"
-                }
-              }
-            }
-          },
-          "403": {
-            "description": "not an org admin"
-          },
-          "404": {
-            "description": "no report line for that name, or not configured"
-          }
-        },
-        "security": [
-          {
-            "apiToken": []
-          },
-          {
-            "sessionCookie": []
-          }
-        ]
-      }
-    },
     "/v1/orgs/{org}/environments": {
       "get": {
         "tags": [
@@ -2080,7 +1976,7 @@
           "Environments"
         ],
         "summary": "Duplicate an org Environment, its rules, eligibility, overlays, grants and secrets",
-        "description": "Not copied, and listed in the answer: Policies that select the old\nEnvironment and not the new one, the Projects whose Pipelines name the\nold one (from Run history), and the OIDC subject cloud trust policies\nmatch. Run and approval history and the Cache stay with the old\nEnvironment, which is not changed.\n\nThe secret store is a separate store from the Environment's, so the two\ncannot share a transaction. The secrets are copied first; the\nEnvironment, its eligibility, overlays and grants are then created in\none transaction. If either step fails, the copied secrets are deleted, so\nno partial Environment is left. A crash between the two leaves only\nsecrets under a name no Environment has, which no Run can resolve and\nwhich a retry refuses (409) until an admin deletes them. The new name is\nclaimed throughout: a second Duplicate to it is refused (409) before it\nwrites anything, and so is a create of it by the Environment PUT, so no\nother Environment takes the name while this one's secrets are written.",
+        "description": "Not copied, and listed in the answer: Policies that select the old\nEnvironment and not the new one, the Projects whose Pipelines name the\nold one (from Run history), and the OIDC subject cloud trust policies\nmatch. Run history, approvals included, and the Cache stay with the old\nEnvironment, which is not changed.\n\nThe secret store is a separate store from the Environment's, so the two\ncannot share a transaction. The secrets are copied first; the\nEnvironment, its eligibility, overlays and grants are then created in\none transaction. If either step fails, the copied secrets are deleted, so\nno partial Environment is left. A crash between the two leaves only\nsecrets under a name no Environment has, which no Run can resolve and\nwhich a retry refuses (409) until an admin deletes them. The new name is\nclaimed throughout: a second Duplicate to it is refused (409) before it\nwrites anything, and so is a create of it by the Environment PUT, so no\nother Environment takes the name while this one's secrets are written.",
         "operationId": "duplicate_org_environment",
         "parameters": [
           {
@@ -3247,13 +3143,13 @@
         ]
       }
     },
-    "/v1/orgs/{org}/library-defaults/retry": {
-      "post": {
+    "/v1/orgs/{org}/library-installations/{id}": {
+      "get": {
         "tags": [
           "Libraries"
         ],
-        "summary": "Retry installing the first-party libraries (ADR-0076 §5)",
-        "operationId": "retry_library_defaults",
+        "summary": "One installed library, by id (ADR-0076 §4)",
+        "operationId": "get_library_installation",
         "parameters": [
           {
             "name": "org",
@@ -3263,47 +3159,33 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "installation id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/RetryDefaultsRequest"
-              }
-            }
-          },
-          "required": true
-        },
         "responses": {
           "200": {
             "description": "",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/LibraryDefaultsDto"
+                  "$ref": "#/components/schemas/LibraryInstallationDto"
                 }
               }
             }
-          },
-          "400": {
-            "description": "a bad mirror, or an uploaded file for no first-party library"
           },
           "403": {
-            "description": "not an org admin, or no step-up — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/StepUpRefusal"
-                }
-              }
-            }
+            "description": "no read access to the org"
           },
           "404": {
-            "description": "libraries not configured"
-          },
-          "429": {
-            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
+            "description": "no installation with this id in the org, or libraries not configured"
           }
         },
         "security": [
@@ -3402,14 +3284,11 @@
           },
           {
             "name": "source",
-            "in": "path",
+            "in": "query",
             "description": "The trusted source, `<host>/<owner>/<repo>//<path>`.",
-            "required": true,
+            "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           }
         ],
@@ -3616,7 +3495,62 @@
         ]
       }
     },
-    "/v1/orgs/{org}/members/{subject}/passkeys/reset": {
+    "/v1/orgs/{org}/members/{id}": {
+      "get": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "One member of an org and their roles (ADR-0080)",
+        "operationId": "get_member",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "the Principal's id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemberDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "not an org admin"
+          },
+          "404": {
+            "description": "no such Principal"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/members/{id}/passkeys/reset": {
       "post": {
         "tags": [
           "Auth & Identity"
@@ -3634,9 +3568,9 @@
             }
           },
           {
-            "name": "subject",
+            "name": "id",
             "in": "path",
-            "description": "the member's principal id",
+            "description": "the member's Principal id (a handle is accepted too)",
             "required": true,
             "schema": {
               "type": "string"
@@ -3681,18 +3615,86 @@
         ]
       }
     },
-    "/v1/orgs/{org}/plugin-catalog": {
-      "get": {
+    "/v1/orgs/{org}/plugin-fetch": {
+      "post": {
         "tags": [
           "Plugins"
         ],
-        "summary": "The installable (first-party) plugins (ADR-0072)",
-        "operationId": "plugin_catalog",
+        "summary": "Fetch a plugin manifest to review before installing (ADR-0072)",
+        "operationId": "fetch_plugin_manifest",
         "parameters": [
           {
             "name": "org",
             "in": "path",
             "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FetchPluginManifestRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FetchedPluginManifestDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "a bad source, a fetch that failed, or a file that is not an admissible plugin manifest"
+          },
+          "403": {
+            "description": "not an org admin, a host Scarab does not fetch from, or a private repository outside the org"
+          },
+          "404": {
+            "description": "plugins not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/plugin-installations/{id}": {
+      "get": {
+        "tags": [
+          "Plugins"
+        ],
+        "summary": "One plugin installation, by id (ADR-0072)",
+        "operationId": "get_plugin_by_id",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "installation id (10 hex)",
             "required": true,
             "schema": {
               "type": "string"
@@ -3705,10 +3707,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/components/schemas/PluginCatalogEntryDto"
-                  }
+                  "$ref": "#/components/schemas/PluginInstallationDto"
                 }
               }
             }
@@ -3717,7 +3716,7 @@
             "description": "not an org admin"
           },
           "404": {
-            "description": "plugins not configured"
+            "description": "no installation with this id in the org, or plugins not configured"
           }
         },
         "security": [
@@ -3782,8 +3781,8 @@
         "tags": [
           "Plugins"
         ],
-        "summary": "Install a first-party plugin (ADR-0072)",
-        "description": "Third-party installs are off (403), and so are installs while\n`SCARAB_PLUGINS=off` (409).",
+        "summary": "Install a plugin from a reviewed manifest (ADR-0072)",
+        "description": "Refused while `SCARAB_PLUGINS=off` (409), and when the source no longer\nreads as the reviewed manifest (409).",
         "operationId": "install_plugin",
         "parameters": [
           {
@@ -3818,10 +3817,10 @@
             }
           },
           "400": {
-            "description": "invalid name, config or storage"
+            "description": "invalid name, image, source, manifest, config or storage"
           },
           "403": {
-            "description": "not an org admin, or not a first-party plugin pinned by digest — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "description": "not an org admin, no step-up, a host Scarab does not fetch from, or a private repository outside the org — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
             "content": {
               "application/json": {
                 "schema": {
@@ -3834,7 +3833,7 @@
             "description": "plugins not configured"
           },
           "409": {
-            "description": "the name is taken or retired, or plugins are off"
+            "description": "the name is taken or retired, plugins are off, or the manifest is not the one reviewed"
           },
           "429": {
             "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
@@ -4517,6 +4516,156 @@
         ]
       }
     },
+    "/v1/orgs/{org}/plugins/{name}/upgrade": {
+      "post": {
+        "tags": [
+          "Plugins"
+        ],
+        "summary": "Upgrade a plugin installation to a reviewed manifest and image (ADR-0072 §10)",
+        "description": "A new image digest is new code and is confirmed like an install, whatever\nthe manifest (ADR-0072 §8, §10); so is a manifest that asks for more.\nOnly a same-or-narrower manifest on the installed image needs no step-up.\nThe server decides from the installed installation and the manifest it\nreads here. Refused while `SCARAB_PLUGINS=off` (409), as an install is.\n409 when the installed manifest is no longer `expected_current_sha256`,\nand when the source no longer reads as `manifest_sha256`.",
+        "operationId": "upgrade_plugin",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "installation name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpgradePluginRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginInstallationDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "a bad image or source, another plugin's manifest, a manifest that is not admissible, or an image the manifest does not name"
+          },
+          "403": {
+            "description": "not an org admin, a step-up is required (a new image, or a manifest that asks for more), a host Scarab does not fetch from, or a private repository outside the org — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such installation, or plugins not configured"
+          },
+          "409": {
+            "description": "plugins are off, the installation changed since the review, or the source no longer reads as the reviewed manifest"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/plugins/{name}/upgrade-fetch": {
+      "post": {
+        "tags": [
+          "Plugins"
+        ],
+        "summary": "Fetch a plugin manifest to review an upgrade against the installed one (ADR-0072 §10)",
+        "operationId": "fetch_plugin_upgrade",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "installation name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FetchPluginUpgradeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FetchedPluginUpgradeDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "no source or commit, a bad source or image, a fetch that failed, a file that is not an admissible plugin manifest, another plugin's manifest, or an image the manifest does not name"
+          },
+          "403": {
+            "description": "not an org admin, a host Scarab does not fetch from, or a private repository outside the org"
+          },
+          "404": {
+            "description": "no such installation, or plugins not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
     "/v1/orgs/{org}/policies": {
       "get": {
         "tags": [
@@ -4614,6 +4763,62 @@
           },
           "409": {
             "description": "a live Policy here has that name, or the scope holds its 256 Policies"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/policies/check": {
+      "post": {
+        "tags": [
+          "Policies"
+        ],
+        "summary": "Check a draft org Policy without saving it (ADR-0075 §6)",
+        "operationId": "check_org_policy",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PolicyCheckRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PolicyCheckResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "not exactly one of `policy` and `yaml`, or `yaml` over 64 KiB"
+          },
+          "403": {
+            "description": "not an org admin"
           }
         },
         "security": [
@@ -4941,6 +5146,34 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "checkpoint",
+            "in": "query",
+            "description": "Only decisions at this checkpoint: `run.create`, `step.admit` or\n`gate.resolve`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "policy_id",
+            "in": "query",
+            "description": "Only decisions with a result for this Policy, matched or not.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "since",
+            "in": "query",
+            "description": "Only decisions made at or after this time, in unix milliseconds.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
           }
         ],
         "responses": {
@@ -4955,7 +5188,63 @@
             }
           },
           "400": {
-            "description": "`before` is not a cursor"
+            "description": "`before` is not a cursor, or `checkpoint` is not a checkpoint"
+          },
+          "403": {
+            "description": "no Read on the org"
+          },
+          "404": {
+            "description": "policies not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/policy-decisions/counts": {
+      "get": {
+        "tags": [
+          "Policies"
+        ],
+        "summary": "Each Policy's decision counts since a time (ADR-0075 §9)",
+        "operationId": "org_policy_decision_counts",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "since",
+            "in": "query",
+            "description": "Count decisions made at or after this time, in unix milliseconds.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PolicyDecisionCountsDto"
+                }
+              }
+            }
           },
           "403": {
             "description": "no Read on the org"
@@ -4979,8 +5268,8 @@
         "tags": [
           "Policies"
         ],
-        "summary": "Evaluate run.create Policies without enforcing or recording (ADR-0075 §9)",
-        "description": "Policies: `policy` (a draft, compiled at the org level; a 400 when it\ndoes not compile), `policy_id` (a stored Policy of this org), or neither\n(the org's and the input's Project's effective Policies, as admission\nconsults them). Input: `input`, `decision_id` (its recorded input and\nschema version), or `pipeline` (compiled here with `libs`; no forge\nread). A supplied or recorded input with a string or a list over its cap\nis a 400.\nA Pipeline whose Run is over an input cap is answered as admission\ndecides it: each matched Policy is an error, which denies when the Policy\nis enforced.\n\nPermissions: Read on the input's Project for its effective Policies\n(neither `policy` nor `policy_id`, which is what `scarab validate\n--server` sends) or its own typed setting by id; Read on the org for an\norg Policy by id; Administer on the org for a draft `policy`, as saving it\nwould need. Org Read covers every Project.",
+        "summary": "Evaluate Policies without enforcing or recording (ADR-0075 §9)",
+        "description": "Policies: `policy` (a draft, compiled at the org level; a 400 when it\ndoes not compile), `policy_id` (a stored Policy of this org), or neither\n(the org's and the input's Project's effective Policies, as the\ncheckpoint consults them). Input: `input` (at `checkpoint`, by default\nthe Policy's, else `run.create`), `decision_id` (its recorded input,\ncheckpoint and schema version), or `pipeline` (a `run.create` input,\ncompiled here with `libs`; no forge read). A Policy at another checkpoint\nthan the input is a 400. A supplied or recorded input with a string or a\nlist over its cap is a 400. The built-in Environment rules a recorded\n`step.admit` or `gate.resolve` decision holds are not evaluated again.\nA Pipeline whose Run is over an input cap is answered as admission\ndecides it: each matched Policy is an error, which denies when the Policy\nis enforced.\n\nPermissions: Read on the input's Project for its effective Policies\n(neither `policy` nor `policy_id`, which is what `scarab validate\n--server` sends) or its own typed setting by id; Read on the org for an\norg Policy by id; Administer on the org for a draft `policy`, as saving it\nwould need. Org Read covers every Project.",
         "operationId": "policy_test",
         "parameters": [
           {
@@ -5015,13 +5304,72 @@
             }
           },
           "400": {
-            "description": "not one input form, a draft that does not compile, a Pipeline that does not compile, a Run admission refuses before its Policies, an input that cannot be matched, or a supplied input with a string or a list over its cap"
+            "description": "not one input form, a draft that does not compile, a Pipeline that does not compile, a Run admission refuses before its Policies, a Policy at another checkpoint than the input, an input that cannot be matched, or a supplied input with a string or a list over its cap"
           },
           "403": {
             "description": "no Read on the input's Project or the org, an org Policy by id without Read on the org, or a draft `policy` without Administer on the org"
           },
           "404": {
             "description": "no such Policy or decision in this org, or policies not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/policy-test/replay": {
+      "post": {
+        "tags": [
+          "Policies"
+        ],
+        "summary": "Replay a draft Policy over recorded decisions (ADR-0075 §9)",
+        "operationId": "policy_test_replay",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PolicyReplayRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PolicyReplayResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "the draft does not compile"
+          },
+          "403": {
+            "description": "not an org admin"
+          },
+          "404": {
+            "description": "no such org Policy, or policies not configured"
           }
         },
         "security": [
@@ -5045,7 +5393,7 @@
           {
             "name": "q",
             "in": "query",
-            "description": "id or handle prefix, or a display-name fragment",
+            "description": "handle prefix, or a display-name fragment",
             "required": true,
             "schema": {
               "type": "string"
@@ -5523,6 +5871,93 @@
         ]
       }
     },
+    "/v1/orgs/{org}/repos": {
+      "get": {
+        "tags": [
+          "Repositories"
+        ],
+        "summary": "An org's repositories, enabled and not, one page at a time",
+        "description": "Enabling a repository is opt-in, so this is the list an admin enables\nfrom (`POST /v1/connections/{id}/repos`) and disables from (`DELETE\n/v1/connections/{id}/repos/{owner}/{name}`). The forge is asked live, as\nthe bind pick-list is (`…/available-repos`); no list of\navailable repositories is stored. The forge port returns a connection's\nwhole list, so the server pages the merged result.\n\nRead on the org may list it; `can_change` says per row whether the caller\nmay also act on it.",
+        "operationId": "org_repos",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "description": "1-based page (default 1)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "per_page",
+            "in": "query",
+            "description": "repositories per page (default 25, max 100)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "description": "only names containing this text, ignoring case",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "connection",
+            "in": "query",
+            "description": "only repositories of this connection id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrgReposPageDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "no Read on the org"
+          },
+          "404": {
+            "description": "no connection registry wired"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
     "/v1/orgs/{org}/secrets/orphaned": {
       "get": {
         "tags": [
@@ -5920,6 +6355,41 @@
         ]
       }
     },
+    "/v1/policy-checkpoints": {
+      "get": {
+        "tags": [
+          "Policies"
+        ],
+        "summary": "Each PolicyCheckpoint's input schema (ADR-0075 §2)",
+        "operationId": "list_policy_checkpoints",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PolicyCheckpointDto"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "not signed in"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
     "/v1/repos": {
       "get": {
         "tags": [
@@ -6054,6 +6524,9 @@
           },
           "403": {
             "description": "the caller may not dispatch, the pipeline's Environment does not exist in the org or does not admit this project (ADR-0071), or a run.create Policy denied the Run (ADR-0075); the body says why. No run is created"
+          },
+          "409": {
+            "description": "the repository is unreachable: its forge connection no longer covers it"
           }
         },
         "security": [
@@ -6265,57 +6738,6 @@
         "responses": {
           "410": {
             "description": "gone; the body says where it went"
-          }
-        },
-        "security": [
-          {
-            "apiToken": []
-          },
-          {
-            "sessionCookie": []
-          }
-        ]
-      }
-    },
-    "/v1/repos/{org}/{repo}/environments/{name}/deployments": {
-      "get": {
-        "tags": [
-          "Environments"
-        ],
-        "summary": "Legacy approval history (ADR-0070 §1)",
-        "operationId": "list_deployments",
-        "parameters": [
-          {
-            "name": "org",
-            "in": "path",
-            "description": "repo owner",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "repo",
-            "in": "path",
-            "description": "repo name",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "name",
-            "in": "path",
-            "description": "Environment name",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "most recent first"
           }
         },
         "security": [
@@ -6840,6 +7262,15 @@
               "format": "int32",
               "minimum": 0
             }
+          },
+          {
+            "name": "org",
+            "in": "query",
+            "description": "only this org's runs, applied before `limit`; must not be empty",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -6852,6 +7283,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "`org` present but empty"
           }
         },
         "security": [
@@ -8800,6 +9234,7 @@
           "id",
           "name",
           "owner_subject",
+          "owner",
           "org",
           "role",
           "created_by",
@@ -8814,7 +9249,8 @@
             "description": "Unix-ms."
           },
           "created_by": {
-            "type": "string"
+            "type": "string",
+            "description": "Who minted it: a Principal's handle."
           },
           "expires_at": {
             "type": "integer",
@@ -8838,9 +9274,13 @@
           "org": {
             "type": "string"
           },
+          "owner": {
+            "$ref": "#/components/schemas/PersonDto",
+            "description": "That Principal, as people read it."
+          },
           "owner_subject": {
             "type": "string",
-            "description": "The principal who holds the token and whose live authority bounds it."
+            "description": "The id of the Principal who holds the token and whose live authority\nbounds it (ADR-0080)."
           },
           "project": {
             "type": [
@@ -9075,7 +9515,7 @@
         "properties": {
           "org": {
             "type": "string",
-            "description": "The governed Project's natural key — `(owner, name)` in v1 (1 Project : 1\nRepoRef), the same mapping installation auto-registration uses."
+            "description": "The governed Project's natural key — `(owner, name)` in v1 (1 Project : 1\nRepoRef), the same mapping every bind uses."
           },
           "project": {
             "type": "string"
@@ -9096,7 +9536,8 @@
       "BindingDto": {
         "type": "object",
         "required": [
-          "subject",
+          "id",
+          "handle",
           "role",
           "project"
         ],
@@ -9113,16 +9554,28 @@
               "string",
               "null"
             ],
-            "description": "The Principal's display name, when the identity store knows it\n(ADR-0069). Absent for a pre-upgrade bare subject nobody has signed in\nas since."
+            "description": "The Principal's display name, when the identity store knows it\n(ADR-0069)."
+          },
+          "handle": {
+            "type": "string",
+            "description": "The Principal's handle (`github:alice`): what people read and type."
+          },
+          "id": {
+            "type": "string",
+            "description": "The Principal's id (ADR-0080): what a member's URL carries."
+          },
+          "origin": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Who wrote the binding: `native` (granted in Scarab, which a forge\nre-sync never changes) or `import` (seeded from the forge's\ncollaborators, which a re-sync refreshes or removes). Set on the org\nlisting; absent on an import's response, which lists what the forge\ngave and not what each row holds."
           },
           "project": {
             "type": "string",
             "description": "Empty = org-scoped."
           },
           "role": {
-            "type": "string"
-          },
-          "subject": {
             "type": "string"
           }
         }
@@ -9466,7 +9919,7 @@
           "web_url",
           "credential_ref",
           "credential_present",
-          "projects",
+          "enabled_repos",
           "supports_resync",
           "managed_by_config",
           "supports_preflight"
@@ -9483,6 +9936,12 @@
           "credential_ref": {
             "type": "string",
             "description": "The `_forge`-scoped handle the credential lives under. An opaque name,\nnot the secret."
+          },
+          "enabled_repos": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many repositories are enabled through this connection: its repo\nbindings, each a Project (ADR-0046). A count, not the list: a\nconnection can hold thousands. The org's repositories page\n(`GET /v1/orgs/{org}/repos?connection=`) lists them.",
+            "minimum": 0
           },
           "id": {
             "type": "string"
@@ -9509,13 +9968,6 @@
               "null"
             ],
             "description": "The Org this connection serves (git-bug 19b0a45); `null` = unassigned,\nvisible to and editable by global admins only."
-          },
-          "projects": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ConnectionProjectDto"
-            },
-            "description": "The Projects this connection serves, from its repo bindings — a Project\n*is* a binding (ADR-0046), so this is the connection's whole footprint."
           },
           "supports_preflight": {
             "type": "boolean",
@@ -9609,30 +10061,6 @@
               "null"
             ],
             "description": "Why the check could not run, when it could not — an adapter that cannot\nintrospect, a credential that does not resolve, a forge that errored."
-          }
-        }
-      },
-      "ConnectionProjectDto": {
-        "type": "object",
-        "description": "A Project a connection serves, plus the forge coordinate it came from.",
-        "required": [
-          "org",
-          "project",
-          "owner",
-          "name"
-        ],
-        "properties": {
-          "name": {
-            "type": "string"
-          },
-          "org": {
-            "type": "string"
-          },
-          "owner": {
-            "type": "string"
-          },
-          "project": {
-            "type": "string"
           }
         }
       },
@@ -10115,117 +10543,6 @@
         },
         "additionalProperties": false
       },
-      "EnvironmentMigrationReportDto": {
-        "type": "object",
-        "description": "One line of the split report: an Environment name merged across several\nProjects, or created with eligibility *all projects* because no Project\ndefined it. If the merged Projects really meant different places (one\n`prod` that is `prod-eu`), the split is a YAML change: those Projects\nrename their `environment:` and an org admin creates the new\nEnvironment — nothing is renamed for them.",
-        "required": [
-          "environment",
-          "merged_projects",
-          "referenced_only",
-          "referencing_projects",
-          "differing_rules",
-          "environment_exists",
-          "permissive_baseline",
-          "projects",
-          "created_at"
-        ],
-        "properties": {
-          "acknowledged_at": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64",
-            "description": "Unix-ms; absent until an admin acknowledges the line."
-          },
-          "acknowledged_by": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "created_at": {
-            "type": "integer",
-            "format": "int64",
-            "description": "Unix-ms."
-          },
-          "differing_rules": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            },
-            "description": "The legacy rules the merged Projects disagreed on, by ADR-0037 field\nname (`approvers`, `allowed_refs`, `wait_timer`, `require_reason`,\n`privileged_images`, `permit_k8s_overlay`). Lists compare as sets."
-          },
-          "environment": {
-            "type": "string"
-          },
-          "environment_exists": {
-            "type": "boolean",
-            "description": "The Environment still exists."
-          },
-          "merged_projects": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
-          },
-          "permissive_baseline": {
-            "type": "boolean",
-            "description": "Its baseline is still the permissive one the migration gave it:\nnothing org-wide protects it yet — set a baseline."
-          },
-          "projects": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/EnvironmentMigrationReportProjectDto"
-            }
-          },
-          "referenced_only": {
-            "type": "boolean",
-            "description": "No Project defined it: migrated with eligibility *all projects*."
-          },
-          "referencing_projects": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            },
-            "description": "Projects whose Runs named it without defining it."
-          }
-        }
-      },
-      "EnvironmentMigrationReportProjectDto": {
-        "type": "object",
-        "description": "One Project in a split-report line: what it had, and what it has now.",
-        "required": [
-          "project"
-        ],
-        "properties": {
-          "legacy": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/LegacyProtectionRulesDto",
-                "description": "Its per-repo rules before the migration; absent for a Project whose\nRuns only named the Environment."
-              }
-            ]
-          },
-          "overlay": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/EnvironmentProjectOverlayDto",
-                "description": "Its overlay now (the migration wrote it from `legacy`; it may have\nbeen changed or removed since)."
-              }
-            ]
-          },
-          "project": {
-            "type": "string"
-          }
-        }
-      },
       "EnvironmentProjectDto": {
         "type": "object",
         "description": "One Project's standing in one Environment, for the Environment's admin.",
@@ -10366,7 +10683,7 @@
             "items": {
               "type": "string"
             },
-            "description": "Principal ids. Every one must approve (AND), unless the baseline's\n`approval_gate.required_approvals` says how many of its own must."
+            "description": "Principal handles (stored as ids, ADR-0080). Every one must approve\n(AND), unless the baseline's `approval_gate.required_approvals` says\nhow many of its own must."
           },
           "require_reason": {
             "type": "boolean",
@@ -10453,6 +10770,62 @@
           }
         }
       },
+      "FetchPluginManifestRequest": {
+        "type": "object",
+        "description": "`POST /v1/orgs/{org}/plugin-fetch`.",
+        "required": [
+          "source"
+        ],
+        "properties": {
+          "connection": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A ForgeConnection id, for a private repository of the org. Omitted:\nread anonymously over https from github.com or a Forgejo\nconnection's host."
+          },
+          "source": {
+            "type": "string",
+            "description": "The plugin's manifest file, `<host>/<owner>/<repo>//<path>@<commit>`;\nthe path ends in `.json`, `.yaml` or `.yml`."
+          }
+        },
+        "additionalProperties": false
+      },
+      "FetchPluginUpgradeRequest": {
+        "type": "object",
+        "description": "`POST /v1/orgs/{org}/plugins/{name}/upgrade-fetch`: which manifest to\nread for the upgrade. Either `source`, or `commit` to read the file the\ninstallation's recorded source names at that commit.",
+        "properties": {
+          "commit": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A full commit id (40 or 64 lowercase hex). Read when `source` is\nomitted; the installation must have a recorded source then. There is\nno branch resolution: the admin names the commit."
+          },
+          "connection": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A ForgeConnection id to read it through. Omitted with `source`: read\nanonymously. Omitted with `commit`: the connection the recorded source\nwas read through."
+          },
+          "image": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The image the upgrade would run, `<repository>@sha256:<64 hex>`. When\ngiven, it is checked against the new manifest's named repository, and\n`needs_step_up` is judged with it: any image other than the installed\none needs a step-up. Omitted: judged as keeping the installed image."
+          },
+          "source": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The new manifest's source, `<host>/<owner>/<repo>//<path>@<commit>`.\nOmitted: the recorded source's file at `commit`."
+          }
+        },
+        "additionalProperties": false
+      },
       "FetchedLibraryDto": {
         "type": "object",
         "required": [
@@ -10461,7 +10834,6 @@
           "content_hash",
           "source",
           "content",
-          "first_party",
           "diff"
         ],
         "properties": {
@@ -10486,9 +10858,6 @@
             "type": "string",
             "description": "The change from `current`, one line per entry, each starting with\n`+`, `-` or a space. Empty when nothing is installed."
           },
-          "first_party": {
-            "type": "boolean"
-          },
           "name": {
             "type": "string"
           },
@@ -10500,40 +10869,99 @@
           }
         }
       },
-      "FirstPartyLibraryDto": {
+      "FetchedPluginManifestDto": {
         "type": "object",
-        "description": "A first-party library in the server's release manifest.",
+        "description": "A plugin manifest read for review. Nothing is stored or installed.",
         "required": [
-          "publisher",
-          "name",
-          "content_hash",
           "source",
-          "release",
-          "security_fix",
+          "content",
+          "manifest",
+          "manifest_sha256",
           "installed"
         ],
         "properties": {
-          "content_hash": {
-            "type": "string"
+          "content": {
+            "type": "string",
+            "description": "The file as read."
           },
           "installed": {
-            "type": "boolean",
-            "description": "Installed in this org under its name, at any version."
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/InstalledPluginManifestDto"
+            },
+            "description": "The org's installations of the same plugin (`manifest.plugin`), by\nname, each with the manifest hash it was approved with."
           },
-          "name": {
-            "type": "string"
+          "manifest": {
+            "$ref": "#/components/schemas/PluginManifestDto",
+            "description": "What the plugin asks for: what an install approves with the image\ndigest."
           },
-          "publisher": {
-            "type": "string"
-          },
-          "release": {
-            "type": "string"
-          },
-          "security_fix": {
-            "type": "boolean"
+          "manifest_sha256": {
+            "type": "string",
+            "description": "Pass it to `POST …/plugins` as `manifest_sha256`."
           },
           "source": {
+            "type": "string",
+            "description": "The source as read, pinned to its commit."
+          }
+        }
+      },
+      "FetchedPluginUpgradeDto": {
+        "type": "object",
+        "description": "A manifest read for an upgrade, and what it changes. Nothing is stored.",
+        "required": [
+          "source",
+          "content",
+          "manifest",
+          "manifest_sha256",
+          "current_manifest_sha256",
+          "current_image",
+          "diff",
+          "step_up_reasons",
+          "needs_step_up"
+        ],
+        "properties": {
+          "connection": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The connection it was read through: pass it to `…/upgrade`."
+          },
+          "content": {
+            "type": "string",
+            "description": "The file as read."
+          },
+          "current_image": {
             "type": "string"
+          },
+          "current_manifest_sha256": {
+            "type": "string",
+            "description": "The installed manifest's hash: pass it to `…/upgrade` as\n`expected_current_sha256`."
+          },
+          "diff": {
+            "$ref": "#/components/schemas/ManifestDiffDto"
+          },
+          "manifest": {
+            "$ref": "#/components/schemas/PluginManifestDto"
+          },
+          "manifest_sha256": {
+            "type": "string",
+            "description": "Pass it to `…/upgrade` as `manifest_sha256`."
+          },
+          "needs_step_up": {
+            "type": "boolean",
+            "description": "Whether `…/upgrade` asks for a step-up: exactly when there is a\nreason. Decided again by the server at the upgrade."
+          },
+          "source": {
+            "type": "string",
+            "description": "The source as read, pinned to its commit: pass it to `…/upgrade`."
+          },
+          "step_up_reasons": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Why `…/upgrade` asks for a step-up, each as a sentence: what the new\nmanifest asks for that the installed one did not, and a new image\n(any digest other than the installed one is new code). Judged with\nthe request's `image`, or the installed image when it has none.\nEmpty = a narrowing on the same image, which needs none."
           }
         }
       },
@@ -10812,8 +11240,9 @@
         "description": "`POST /v1/orgs/{org}/plugins`.",
         "required": [
           "name",
-          "plugin",
-          "image"
+          "image",
+          "source",
+          "manifest_sha256"
         ],
         "properties": {
           "config": {
@@ -10826,17 +11255,28 @@
               "type": "string"
             }
           },
+          "connection": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The connection the fetch read it through, if any."
+          },
           "image": {
             "type": "string",
-            "description": "`<catalog image_repository>@sha256:<64 hex>`."
+            "description": "`<repository>@sha256:<64 hex>`."
+          },
+          "manifest_sha256": {
+            "type": "string",
+            "description": "The `manifest_sha256` the fetch returned, which the admin reviewed.\nThe install is refused (409) when the source no longer reads as it."
           },
           "name": {
             "type": "string",
             "description": "The installation's name: a DNS-1123 label, unique in the org and\nnever reused once uninstalled."
           },
-          "plugin": {
+          "source": {
             "type": "string",
-            "description": "The catalog plugin (`argocd`)."
+            "description": "The manifest's source, as `POST …/plugin-fetch` read it. Read again\nhere."
           },
           "storage": {
             "oneOf": [
@@ -10860,6 +11300,26 @@
           "killed"
         ]
       },
+      "InstalledPluginManifestDto": {
+        "type": "object",
+        "description": "An installation of the plugin a fetch read.",
+        "required": [
+          "name",
+          "image",
+          "manifest_sha256"
+        ],
+        "properties": {
+          "image": {
+            "type": "string"
+          },
+          "manifest_sha256": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        }
+      },
       "InstalledVersionDto": {
         "type": "object",
         "required": [
@@ -10875,95 +11335,14 @@
           }
         }
       },
-      "LegacyProtectionRulesDto": {
-        "type": "object",
-        "description": "A Project's ADR-0037 per-repo rules as the migration found them. The\ncanonical `secret_scope` / `oidc_subject` are left out: the server always\nderived them from the coordinates, so they never differed by choice.",
-        "required": [
-          "approvers",
-          "allowed_refs",
-          "wait_timer",
-          "concurrency",
-          "require_reason",
-          "privileged_images",
-          "permit_k8s_overlay"
-        ],
-        "properties": {
-          "allowed_refs": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
-          },
-          "approvers": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
-          },
-          "concurrency": {
-            "type": "integer",
-            "format": "int32",
-            "description": "Stored but never read; not carried by the migration (§10 step 3).",
-            "minimum": 0
-          },
-          "permit_k8s_overlay": {
-            "type": "boolean"
-          },
-          "privileged_images": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ImageGrantDto"
-            }
-          },
-          "require_reason": {
-            "type": "boolean"
-          },
-          "wait_timer": {
-            "type": "integer",
-            "format": "int32",
-            "description": "Seconds.",
-            "minimum": 0
-          }
-        }
-      },
-      "LibraryDefaultsDto": {
-        "type": "object",
-        "required": [
-          "state",
-          "missing",
-          "updated_at"
-        ],
-        "properties": {
-          "mirror": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "missing": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/MissingDefaultDto"
-            }
-          },
-          "state": {
-            "type": "string",
-            "description": "`offered` (an org from before libraries: nothing installed without an\nadmin), `pending`, `installed` or `missing`."
-          },
-          "updated_at": {
-            "type": "integer",
-            "format": "int64"
-          }
-        }
-      },
       "LibraryInstallationDto": {
         "type": "object",
         "required": [
+          "id",
           "publisher",
           "name",
           "content_hash",
           "source",
-          "first_party",
           "installed_by",
           "installed_at"
         ],
@@ -10971,8 +11350,9 @@
           "content_hash": {
             "type": "string"
           },
-          "first_party": {
-            "type": "boolean"
+          "id": {
+            "type": "string",
+            "description": "10 lowercase hex, minted at the first install and kept by upgrades.\nWhat the settings page's URL carries."
           },
           "installed_at": {
             "type": "integer",
@@ -10989,17 +11369,6 @@
           },
           "source": {
             "type": "string"
-          },
-          "update": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/UpdateNoticeDto",
-                "description": "A newer first-party version exists."
-              }
-            ]
           },
           "yanked": {
             "oneOf": [
@@ -11018,6 +11387,9 @@
         "type": "object",
         "required": [
           "content_hash",
+          "publisher",
+          "name",
+          "source",
           "reason",
           "yanked_by",
           "yanked_at"
@@ -11033,8 +11405,19 @@
           "content_hash": {
             "type": "string"
           },
+          "name": {
+            "type": "string"
+          },
+          "publisher": {
+            "type": "string",
+            "description": "The library the yanked version was fetched for, `<publisher>/<name>`."
+          },
           "reason": {
             "type": "string"
+          },
+          "source": {
+            "type": "string",
+            "description": "The git source the version was fetched from, pinned to its commit."
           },
           "yanked_at": {
             "type": "integer",
@@ -11075,6 +11458,7 @@
         "required": [
           "session",
           "subject",
+          "handle",
           "csrf"
         ],
         "properties": {
@@ -11082,11 +11466,89 @@
             "type": "string",
             "description": "The session's CSRF token — browsers echo it in `x-csrf-token` on every\nmutation (also delivered as the readable `scarab_csrf` cookie)."
           },
+          "handle": {
+            "type": "string",
+            "description": "The Principal's handle: what people read."
+          },
           "session": {
             "type": "string"
           },
           "subject": {
-            "type": "string"
+            "type": "string",
+            "description": "The Principal's id (ADR-0080)."
+          }
+        }
+      },
+      "ManifestDiffDto": {
+        "type": "object",
+        "description": "The installed manifest against the new one, group by group.",
+        "required": [
+          "capabilities",
+          "connections",
+          "auth_schemes",
+          "read_rules",
+          "config_keys",
+          "gates",
+          "image"
+        ],
+        "properties": {
+          "auth_schemes": {
+            "$ref": "#/components/schemas/ManifestDiffGroupDto",
+            "description": "`<slot>: <scheme>`."
+          },
+          "capabilities": {
+            "$ref": "#/components/schemas/ManifestDiffGroupDto"
+          },
+          "config_keys": {
+            "$ref": "#/components/schemas/ManifestDiffGroupDto"
+          },
+          "connections": {
+            "$ref": "#/components/schemas/ManifestDiffGroupDto",
+            "description": "Connection slot names."
+          },
+          "gates": {
+            "$ref": "#/components/schemas/ManifestDiffGroupDto",
+            "description": "Gate names; a gate whose definition changed is both removed and\nadded."
+          },
+          "image": {
+            "$ref": "#/components/schemas/ManifestDiffGroupDto",
+            "description": "The image repository the manifest names."
+          },
+          "read_rules": {
+            "$ref": "#/components/schemas/ManifestDiffGroupDto",
+            "description": "`<slot>: <method> <path>[ ?<query keys>]`. One more allowed query key\nis a new rule."
+          }
+        }
+      },
+      "ManifestDiffGroupDto": {
+        "type": "object",
+        "description": "One group of an upgrade's manifest diff.",
+        "required": [
+          "added",
+          "removed",
+          "unchanged"
+        ],
+        "properties": {
+          "added": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Only in the new manifest."
+          },
+          "removed": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Only in the installed manifest."
+          },
+          "unchanged": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "In both."
           }
         }
       },
@@ -11095,6 +11557,8 @@
         "description": "The authenticated principal (ADR-0049) — powers the UI's identity menu.",
         "required": [
           "subject",
+          "id",
+          "handle",
           "roles",
           "can_administer",
           "admin_orgs",
@@ -11125,6 +11589,14 @@
             "type": "boolean",
             "description": "Does the caller hold a global `Administer` role? Only such a caller\nmay add the first connection of an Org that does not exist yet, or\nact on an unassigned connection (git-bug 19b0a45). Always `false` for\nan API token."
           },
+          "handle": {
+            "type": "string",
+            "description": "The Principal's handle (`github:alice`): what people read and type."
+          },
+          "id": {
+            "type": "string",
+            "description": "The same id, under the name every person response uses."
+          },
           "identities": {
             "type": "array",
             "items": {
@@ -11141,7 +11613,7 @@
           },
           "subject": {
             "type": "string",
-            "description": "Stable, forge-agnostic identity subject."
+            "description": "The Principal's id (ADR-0080): stable, random, never shown as a name."
           },
           "token_mint_orgs": {
             "type": "array",
@@ -11157,6 +11629,7 @@
         "description": "`GET /v1/me/security`.",
         "required": [
           "subject",
+          "handle",
           "step_up",
           "has_passkey",
           "usable_passkey_count",
@@ -11182,6 +11655,10 @@
             "type": "string",
             "description": "Where this human logs in again — through the login provider they sign\nin with — landing on enrollment (a relative URL). The one place the\nprovider is chosen: `scarab security setup` prints this."
           },
+          "handle": {
+            "type": "string",
+            "description": "The caller's handle: what to sign in as."
+          },
           "has_passkey": {
             "type": "boolean",
             "description": "Holds at least one usable (not clone-flagged) passkey."
@@ -11202,7 +11679,8 @@
             "description": "`enforce` or `off`."
           },
           "subject": {
-            "type": "string"
+            "type": "string",
+            "description": "The caller's Principal id (ADR-0080)."
           },
           "usable_passkey_count": {
             "type": "integer",
@@ -11217,6 +11695,43 @@
             ],
             "format": "int64",
             "description": "This browser session's open window, if any (unix ms)."
+          }
+        }
+      },
+      "MemberDto": {
+        "type": "object",
+        "description": "`GET /v1/orgs/{org}/members/{id}`: one person and the roles they hold in\nthe org (ADR-0080 §5). The member page reads this by the Principal's id.",
+        "required": [
+          "id",
+          "handle",
+          "bindings"
+        ],
+        "properties": {
+          "bindings": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BindingDto"
+            },
+            "description": "Their bindings in the org, org scope first, then by repository."
+          },
+          "claimed": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "`false` = created by a forge import, not signed into yet. Absent\nwhen no identity store knows them."
+          },
+          "display_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "handle": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
           }
         }
       },
@@ -11307,26 +11822,6 @@
           }
         }
       },
-      "MissingDefaultDto": {
-        "type": "object",
-        "required": [
-          "publisher",
-          "name",
-          "error"
-        ],
-        "properties": {
-          "error": {
-            "type": "string"
-          },
-          "name": {
-            "type": "string"
-          },
-          "publisher": {
-            "type": "string",
-            "description": "Empty when the release manifest itself could not be read."
-          }
-        }
-      },
       "MissingGateModeDto": {
         "type": "string",
         "description": "What Run creation does when a Step that uses the Environment's authority\nhas no `manual` gate upstream (ADR-0078 §3).",
@@ -11412,7 +11907,7 @@
           },
           "updated_by": {
             "type": "string",
-            "description": "Who last wrote it (a Principal subject)."
+            "description": "Who last wrote it (a Principal's handle)."
           }
         }
       },
@@ -11421,51 +11916,136 @@
         "required": [
           "installations",
           "yanks",
-          "first_party",
           "trusted_sources"
         ],
         "properties": {
-          "defaults": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/LibraryDefaultsDto"
-              }
-            ]
-          },
-          "first_party": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/FirstPartyLibraryDto"
-            }
-          },
           "installations": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/LibraryInstallationDto"
             }
           },
-          "manifest_error": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Why the release manifest could not be read, if it could not."
-          },
           "trusted_sources": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/TrustedSourceDto"
             },
-            "description": "The library sources this org trusts with long-lived forge credentials\n(ADR-0076 §9), besides the first-party clone library, which it trusts\nby default."
+            "description": "The library sources this org trusts with long-lived forge credentials\n(ADR-0076 §9). No library is trusted without one."
           },
           "yanks": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/LibraryYankDto"
             }
+          }
+        }
+      },
+      "OrgRepoDto": {
+        "type": "object",
+        "description": "One repository of an org: enabled (a Project, bound through a connection)\nor reachable through one of the org's connections and not enabled.",
+        "required": [
+          "owner",
+          "name",
+          "enabled",
+          "connection_id",
+          "kind",
+          "repo_url",
+          "can_change"
+        ],
+        "properties": {
+          "can_change": {
+            "type": "boolean",
+            "description": "May the caller enable or disable it here? Needs Administer on the\nconnection's org, and a connection not managed by configuration."
+          },
+          "connection_id": {
+            "type": "string",
+            "description": "The connection it is bound through when enabled, else the one that\nreaches it: the `{id}` of the bind and unbind endpoints."
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "Is it a Project? Enabling binds it; disabling unbinds it."
+          },
+          "kind": {
+            "type": "string",
+            "description": "That connection's forge kind: `github` | `forgejo`."
+          },
+          "name": {
+            "type": "string"
+          },
+          "owner": {
+            "type": "string"
+          },
+          "project": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The Project's name when enabled (the repo name)."
+          },
+          "repo_url": {
+            "type": "string",
+            "description": "The repository's page on the forge."
+          },
+          "unreachable_since": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "For an enabled repo: unix-ms since when its connection has not\nreached it (the GitHub App's installation stopped covering it), or\n`null`. Disable is the only way to remove it."
+          }
+        }
+      },
+      "OrgReposPageDto": {
+        "type": "object",
+        "description": "`GET /v1/orgs/{org}/repos` response: one page of the org's repositories.",
+        "required": [
+          "repos",
+          "total",
+          "enabled_total",
+          "page",
+          "per_page",
+          "can_administer",
+          "unlisted"
+        ],
+        "properties": {
+          "can_administer": {
+            "type": "boolean",
+            "description": "Does the caller administer the org?"
+          },
+          "enabled_total": {
+            "type": "integer",
+            "description": "How many of the org's repositories are enabled, whatever the query.",
+            "minimum": 0
+          },
+          "page": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "per_page": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "repos": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OrgRepoDto"
+            },
+            "description": "This page, sorted by name."
+          },
+          "total": {
+            "type": "integer",
+            "description": "How many repositories match the query, across every page.",
+            "minimum": 0
+          },
+          "unlisted": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UnlistedConnectionDto"
+            },
+            "description": "Connections whose repositories could not be listed. Their enabled\nrepositories are still in the list; the ones not enabled are not."
           }
         }
       },
@@ -11667,10 +12247,15 @@
         "description": "What a passkey reset removed.",
         "required": [
           "subject",
+          "handle",
           "removed",
           "windows_revoked"
         ],
         "properties": {
+          "handle": {
+            "type": "string",
+            "description": "Its handle (ADR-0080)."
+          },
           "removed": {
             "type": "integer",
             "format": "int64",
@@ -11679,7 +12264,7 @@
           },
           "subject": {
             "type": "string",
-            "description": "The principal whose passkeys were reset."
+            "description": "The id of the Principal whose passkeys were reset."
           },
           "windows_revoked": {
             "type": "integer",
@@ -11754,6 +12339,30 @@
               "null"
             ],
             "description": "Pass as `after` for the next page; absent on the last."
+          }
+        }
+      },
+      "PersonDto": {
+        "type": "object",
+        "description": "A person as an API response names them (ADR-0080 §5).",
+        "required": [
+          "id",
+          "handle"
+        ],
+        "properties": {
+          "display_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "handle": {
+            "type": "string",
+            "description": "What people type and read."
+          },
+          "id": {
+            "type": "string",
+            "description": "The Principal's id: what a URL carries. For a reference that names\nno Principal, the reference itself."
           }
         }
       },
@@ -11896,37 +12505,6 @@
           "approve_gates",
           "resolve_gates"
         ]
-      },
-      "PluginCatalogEntryDto": {
-        "type": "object",
-        "description": "A plugin this Scarab can install.",
-        "required": [
-          "plugin",
-          "description",
-          "image_repository",
-          "manifest",
-          "first_party"
-        ],
-        "properties": {
-          "description": {
-            "type": "string"
-          },
-          "first_party": {
-            "type": "boolean",
-            "description": "Always true today: third-party installs are off."
-          },
-          "image_repository": {
-            "type": "string",
-            "description": "Install as `<image_repository>@sha256:<digest>`."
-          },
-          "manifest": {
-            "$ref": "#/components/schemas/PluginManifestDto"
-          },
-          "plugin": {
-            "type": "string",
-            "description": "The catalog key `POST …/plugins` names as `plugin`."
-          }
-        }
       },
       "PluginConnectionDto": {
         "type": "object",
@@ -12190,7 +12768,7 @@
           },
           "plugin": {
             "type": "string",
-            "description": "The catalog plugin."
+            "description": "The plugin's own name, from its manifest."
           },
           "principal": {
             "type": "string",
@@ -12209,6 +12787,20 @@
           },
           "runtime_status": {
             "$ref": "#/components/schemas/RuntimeStatusDto"
+          },
+          "source": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Where the approved manifest was read,\n`<host>/<owner>/<repo>//<path>@<commit>`. Absent for an installation\nmade before the source was recorded."
+          },
+          "source_connection": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The ForgeConnection the source was read through; absent = read\nanonymously, or not recorded."
           },
           "state": {
             "$ref": "#/components/schemas/InstallationStateDto"
@@ -12261,6 +12853,13 @@
               "$ref": "#/components/schemas/GateDefinitionDto"
             },
             "description": "The gates the plugin resolves (ADR-0076 §7), by name; empty without\n`resolve_gates`."
+          },
+          "image": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The image repository the plugin ships as, when the manifest names\none: an install or upgrade must run an image of it. Absent = the\nmanifest does not name its image, so any repository is accepted."
           },
           "plugin": {
             "type": "string"
@@ -12315,6 +12914,164 @@
           }
         },
         "additionalProperties": false
+      },
+      "PolicyCheckRequest": {
+        "type": "object",
+        "description": "`POST …/policies/check`: name exactly one of `policy` and `yaml`.",
+        "properties": {
+          "policy": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "The draft Policy, as `POST …/policies` takes it."
+          },
+          "yaml": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The draft as YAML, such as a `kind: policy` file pasted into the\neditor. At most 64 KiB."
+          }
+        },
+        "additionalProperties": false
+      },
+      "PolicyCheckResponse": {
+        "type": "object",
+        "description": "What checking a draft found. Nothing is saved.",
+        "required": [
+          "ok",
+          "diagnostics",
+          "rules"
+        ],
+        "properties": {
+          "diagnostics": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PolicyDiagnosticDto"
+            },
+            "description": "Errors first, then the `has()` warnings of the rules that compiled."
+          },
+          "ok": {
+            "type": "boolean",
+            "description": "No error: saving this Policy at the org level would compile it."
+          },
+          "policy": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "The draft as `POST …/policies` takes it: what `yaml` parsed to (with\n`kind` dropped), or `policy` itself. Absent when the body is not a\nPolicy."
+          },
+          "rules": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RuleReadsDto"
+            },
+            "description": "Each rule that compiled, with the input fields it reads."
+          }
+        }
+      },
+      "PolicyCheckpointDto": {
+        "type": "object",
+        "description": "One PolicyCheckpoint as the policy editor needs it.",
+        "required": [
+          "checkpoint",
+          "schema_version",
+          "effects",
+          "match_keys",
+          "trigger_kinds",
+          "schema"
+        ],
+        "properties": {
+          "checkpoint": {
+            "type": "string",
+            "description": "`run.create`, `step.admit` or `gate.resolve`."
+          },
+          "effects": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The effects a Policy saved here may use. Only `deny` is evaluated\ntoday, at every checkpoint."
+          },
+          "match_keys": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The `match` keys a Policy here may set: `projects`,\n`except_projects`, `environments`, and `trigger_kinds` at\n`run.create` only."
+          },
+          "schema": {
+            "type": "object",
+            "description": "The input schema: `variables` (the CEL variables a rule reads), and\n`structs` and `enums` by name. Each field has `name`, `ty` (`{kind,\nof}`), `optional`, `max_len` and `doc`."
+          },
+          "schema_version": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "trigger_kinds": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The values `match.trigger_kinds` takes; empty where it is refused."
+          }
+        }
+      },
+      "PolicyCountsDto": {
+        "type": "object",
+        "required": [
+          "policy_id",
+          "matched",
+          "denied",
+          "would_deny"
+        ],
+        "properties": {
+          "denied": {
+            "type": "integer",
+            "format": "int64",
+            "description": "It denied, or a rule failed while it was enforced (which denies).",
+            "minimum": 0
+          },
+          "matched": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Decisions its `match` selected.",
+            "minimum": 0
+          },
+          "policy_id": {
+            "type": "string"
+          },
+          "would_deny": {
+            "type": "integer",
+            "format": "int64",
+            "description": "In audit mode it would have denied, or a rule failed.",
+            "minimum": 0
+          }
+        }
+      },
+      "PolicyDecisionCountsDto": {
+        "type": "object",
+        "description": "`GET …/policy-decisions/counts`.",
+        "required": [
+          "since",
+          "policies"
+        ],
+        "properties": {
+          "policies": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PolicyCountsDto"
+            },
+            "description": "One per Policy whose `match` selected at least one decision since\nthen, by id."
+          },
+          "since": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
       },
       "PolicyDecisionPageDto": {
         "type": "object",
@@ -12388,6 +13145,46 @@
               "string",
               "null"
             ]
+          }
+        }
+      },
+      "PolicyDiagnosticDto": {
+        "type": "object",
+        "description": "One finding about a draft.",
+        "required": [
+          "severity",
+          "at",
+          "line",
+          "column",
+          "expr",
+          "message"
+        ],
+        "properties": {
+          "at": {
+            "type": "string",
+            "description": "Where in the Policy: `name`, `match.projects`, `rules[0].when`,\n`rules[0].message`. Empty when the body is not a Policy."
+          },
+          "column": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "expr": {
+            "type": "string",
+            "description": "The sub-expression the finding is about, as the checker renders it."
+          },
+          "line": {
+            "type": "integer",
+            "format": "int32",
+            "description": "1-based line and column in the rule's `when`; 0 for a finding that\nis not about CEL.",
+            "minimum": 0
+          },
+          "message": {
+            "type": "string"
+          },
+          "severity": {
+            "type": "string",
+            "description": "`error` (the Policy cannot be saved) or `warning`."
           }
         }
       },
@@ -12484,6 +13281,73 @@
           }
         }
       },
+      "PolicyReplayRequest": {
+        "type": "object",
+        "description": "`POST …/policy-test/replay`.",
+        "required": [
+          "policy"
+        ],
+        "properties": {
+          "limit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "How many of the newest decisions at the draft's checkpoint to read\n(default and cap 200).",
+            "minimum": 0
+          },
+          "policy": {
+            "type": "object",
+            "description": "The draft Policy, compiled at the org level."
+          },
+          "policy_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The stored org Policy the draft edits: each decision's `before` is\nthat Policy's part in it. Absent for a new Policy: `before` is\n`allow`."
+          }
+        },
+        "additionalProperties": false
+      },
+      "PolicyReplayResponse": {
+        "type": "object",
+        "description": "What a draft would change over the recorded decisions. Nothing is\nenforced or recorded.",
+        "required": [
+          "checkpoint",
+          "read",
+          "evaluated",
+          "skipped",
+          "changed"
+        ],
+        "properties": {
+          "changed": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReplayChangeDto"
+            },
+            "description": "The decisions whose outcome for this Policy would change, newest\nfirst."
+          },
+          "checkpoint": {
+            "type": "string"
+          },
+          "evaluated": {
+            "type": "integer",
+            "description": "Decisions the draft was evaluated against.",
+            "minimum": 0
+          },
+          "read": {
+            "type": "integer",
+            "description": "Decisions read: the newest at the checkpoint, at most `limit`.",
+            "minimum": 0
+          },
+          "skipped": {
+            "type": "integer",
+            "description": "Decisions not evaluated: no recorded input (the Run was over an\ninput list cap), or an input of a schema version this server does\nnot evaluate.",
+            "minimum": 0
+          }
+        }
+      },
       "PolicyTestPipeline": {
         "type": "object",
         "description": "The Pipeline form of the policy test: what `scarab validate --server`\nsends.",
@@ -12528,6 +13392,13 @@
         "type": "object",
         "description": "`POST /v1/orgs/{org}/policy-test`. Name at most one of `policy` and\n`policy_id` (neither: the Project's effective Policies), and exactly one\nof `input`, `decision_id` and `pipeline`.",
         "properties": {
+          "checkpoint": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The checkpoint of `input`: `run.create`, `step.admit` or\n`gate.resolve`. Default: the checkpoint of `policy` or `policy_id`,\nelse `run.create`. A recorded decision is at its own checkpoint, and\na `pipeline` builds a `run.create` input."
+          },
           "decision_id": {
             "type": [
               "string",
@@ -12540,7 +13411,7 @@
               "object",
               "null"
             ],
-            "description": "A `run.create` input, as a PolicyDecision records it."
+            "description": "A checkpoint input, as a PolicyDecision records it."
           },
           "pipeline": {
             "oneOf": [
@@ -12661,7 +13532,7 @@
           },
           "author": {
             "type": "string",
-            "description": "The Principal who saved it."
+            "description": "The handle of the Principal who saved it."
           },
           "content_hash": {
             "type": "string"
@@ -12695,6 +13566,7 @@
         "description": "A Principal, as the grant/approver typeahead offers it (ADR-0069 §3).",
         "required": [
           "id",
+          "handle",
           "claimed",
           "identities"
         ],
@@ -12709,9 +13581,13 @@
               "null"
             ]
           },
+          "handle": {
+            "type": "string",
+            "description": "What a grant or an approver entry is typed as."
+          },
           "id": {
             "type": "string",
-            "description": "What a grant or an approver entry stores."
+            "description": "The Principal's id (ADR-0080): what a grant or an approver entry\nstores, and what a URL carries."
           },
           "identities": {
             "type": "array",
@@ -12746,9 +13622,14 @@
           "project",
           "owner",
           "name",
-          "repo_url"
+          "repo_url",
+          "connection_id"
         ],
         "properties": {
+          "connection_id": {
+            "type": "string",
+            "description": "The forge connection it is bound through: the `{id}` of\n`/v1/connections/{id}/…`, and the row of `GET /v1/connections` that\nsays whether it is managed by configuration."
+          },
           "last_run_at": {
             "type": [
               "integer",
@@ -12773,6 +13654,14 @@
           "repo_url": {
             "type": "string",
             "description": "The forge WEB base for this repo (e.g. `https://github.com/owner/name`) —\nwhat the UI appends `/commit/<sha>` or `/pull/<n>` to for deep links.\nDerived from the connection's kind + base_url (the stored base is the API\nhost, which differs from the web host on GitHub)."
+          },
+          "unreachable_since": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unix-ms since when its forge connection has not reached it (the\nGitHub App's installation stopped covering it), or `null`. The\nProject is kept; its events are ignored and no run can start until\nthe forge covers it again or an admin disables it."
           }
         }
       },
@@ -12935,7 +13824,7 @@
             "items": {
               "type": "string"
             },
-            "description": "Principal ids (ADR-0069): each must name an existing Principal; a\nmerged id is stored as the Principal it now is. All must approve."
+            "description": "Principal handles or ids (ADR-0069, ADR-0080): each must name an\nexisting Principal; a merged one is stored as the Principal it now is.\nAll must approve."
           },
           "require_reason": {
             "type": "boolean",
@@ -13206,6 +14095,68 @@
           }
         }
       },
+      "ReplayChangeDto": {
+        "type": "object",
+        "required": [
+          "decision_id",
+          "at",
+          "before",
+          "after",
+          "messages"
+        ],
+        "properties": {
+          "after": {
+            "type": "string",
+            "description": "The same for the draft."
+          },
+          "at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "attempt": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "before": {
+            "type": "string",
+            "description": "`allow`, `deny` or `would_deny`: the stored Policy's part in the\nrecorded decision, or `allow` when it had none."
+          },
+          "decision_id": {
+            "type": "string"
+          },
+          "messages": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The messages of the draft's rules that matched, or why one failed;\nempty when `after` is `allow`."
+          },
+          "project": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "run_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The Run the decision is about; absent for a refused `run.create`."
+          },
+          "step_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The Step and attempt of a `step.admit` decision."
+          }
+        }
+      },
       "RequestRuleDto": {
         "type": "object",
         "description": "An allowed read on a connection: method + path pattern (`*` = one\nsegment) + the query keys it may carry.",
@@ -13285,60 +14236,39 @@
       },
       "ResyncResultDto": {
         "type": "object",
-        "description": "`POST /v1/connections/{id}/resync` body: what reconciliation changed.",
+        "description": "`POST /v1/connections/{id}/resync` body: what the forge reports, compared\nwith what is enabled.",
         "required": [
-          "bound",
+          "available",
+          "moved",
           "skipped",
           "confirmed"
         ],
         "properties": {
-          "bound": {
+          "available": {
             "type": "array",
             "items": {
               "type": "string"
             },
-            "description": "Repos the forge reports that Scarab did not have bound — now bound."
+            "description": "Repos of the connection's Org the forge reports that are not enabled.\nRe-sync does not enable them; an admin does, from the org's\nrepositories page."
           },
           "confirmed": {
             "type": "integer",
             "description": "How many bindings the forge confirms. Reported rather than acted on:\nsee the handler's note on why re-sync never unbinds.",
             "minimum": 0
           },
+          "moved": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Repos that were already Projects, bound through a connection that does\nnot serve their owner (unassigned, or another Org's), and now bound\nthrough this one with their Projects (git-bug 19b0a45)."
+          },
           "skipped": {
             "type": "array",
             "items": {
               "type": "string"
             },
-            "description": "Repos the forge reports that were not bound (git-bug 19b0a45): owned\nby another account than the connection's Org, already bound through\nanother connection that serves an Org, or reported to a connection\nthat serves no Org yet (it binds nothing until it is assigned)."
-          }
-        }
-      },
-      "RetryDefaultsRequest": {
-        "type": "object",
-        "properties": {
-          "connection": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "A ForgeConnection to read the mirror through."
-          },
-          "files": {
-            "type": "object",
-            "description": "Uploaded copies: `<publisher>/<name>` → the file's content.",
-            "additionalProperties": {
-              "type": "string"
-            },
-            "propertyNames": {
-              "type": "string"
-            }
-          },
-          "mirror": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "A mirror of Scarab's repository, `<host>/<owner>/<repo>`; each\nlibrary is read from the same path and commit there."
+            "description": "Repos the forge reports that are neither available nor moved: owned by\nanother account than the connection's Org, already bound through\nanother connection that serves an Org, or reported to a connection that\nserves no Org yet."
           }
         }
       },
@@ -13910,7 +14840,7 @@
           },
           "subject": {
             "type": "string",
-            "description": "The human/principal it is about."
+            "description": "The handle of the human/principal it is about."
           },
           "target": {
             "type": [
@@ -14662,27 +15592,18 @@
           }
         }
       },
-      "UpdateNoticeDto": {
+      "UnlistedConnectionDto": {
         "type": "object",
-        "description": "A newer first-party version than the one installed.",
+        "description": "A connection of the org that could not list its repositories, and why.",
         "required": [
-          "content_hash",
-          "source",
-          "release",
-          "security_fix"
+          "connection_id",
+          "reason"
         ],
         "properties": {
-          "content_hash": {
+          "connection_id": {
             "type": "string"
           },
-          "release": {
-            "type": "string"
-          },
-          "security_fix": {
-            "type": "boolean",
-            "description": "A version between the installed one and this one is a security fix."
-          },
-          "source": {
+          "reason": {
             "type": "string"
           }
         }
@@ -14709,6 +15630,41 @@
               "string",
               "null"
             ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "UpgradePluginRequest": {
+        "type": "object",
+        "description": "`POST /v1/orgs/{org}/plugins/{name}/upgrade`.",
+        "required": [
+          "image",
+          "source",
+          "manifest_sha256",
+          "expected_current_sha256"
+        ],
+        "properties": {
+          "connection": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "expected_current_sha256": {
+            "type": "string",
+            "description": "The installed manifest's hash the diff was made against; 409 when the\ninstallation has changed since."
+          },
+          "image": {
+            "type": "string",
+            "description": "`<repository>@sha256:<64 hex>`."
+          },
+          "manifest_sha256": {
+            "type": "string",
+            "description": "The new manifest's hash the admin reviewed; 409 when the source no\nlonger reads as it."
+          },
+          "source": {
+            "type": "string",
+            "description": "The new manifest's source, as `…/upgrade-fetch` returned it. Read\nagain here."
           }
         },
         "additionalProperties": false
@@ -14925,15 +15881,15 @@
     },
     {
       "name": "Environments",
-      "description": "Org-level Environments (ADR-0071) and their governance; per-repo Environments and their protection rules, plus their legacy approval history."
+      "description": "Org-level Environments (ADR-0071) and their governance; per-repo Environments and their protection rules."
     },
     {
       "name": "Plugins",
-      "description": "PluginInstallations (ADR-0072): the first-party catalog, install and uninstall, the kill switch, the PluginConnections the CredentialBroker proxies to, and its journal of what each plugin asked for."
+      "description": "PluginInstallations (ADR-0072): fetch a manifest to review, install and uninstall, the kill switch, the PluginConnections the CredentialBroker proxies to, and its journal of what each plugin asked for."
     },
     {
       "name": "Libraries",
-      "description": "Org-installed libraries (ADR-0076): fetch a version to review, install, upgrade and remove, yanks, and the first-party defaults."
+      "description": "Org-installed libraries (ADR-0076): fetch a version to review, install, upgrade and remove, yanks, and the sources trusted with forge credentials."
     },
     {
       "name": "Policies",

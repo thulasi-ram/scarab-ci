@@ -25,7 +25,7 @@ export default function RunNumber(props: {
       onClick={copy}
     >
       <Show when={props.cap}>
-        <span class="cap">run</span>
+        <span class="cap">Run</span>
       </Show>
       <Show when={props.n != null} fallback={<span class="n mono">{props.id.slice(0, 7)}</span>}>
         <span class="n">

@@ -78,9 +78,6 @@ data:
   {{- with .Values.scarab.uiUrl }}
   SCARAB_UI_URL: {{ . | quote }}
   {{- end }}
-  {{- if .Values.scarab.libsManifest }}
-  SCARAB_LIBS_MANIFEST: {{ include "scarab.libsManifestPath" . | quote }}
-  {{- end }}
   {{- with .Values.scarab.stepTimeoutSecs }}
   SCARAB_STEP_TIMEOUT_SECS: {{ . | quote }}
   {{- end }}
@@ -169,9 +166,6 @@ data:
   SCARAB_PLUGIN_BROKER_PEER: {{ printf "pods:%s:app.kubernetes.io/name=%s,app.kubernetes.io/instance=%s" .Release.Namespace (include "scarab.name" .) .Release.Name | quote }}
   {{- with .Values.plugins.probeImage }}
   SCARAB_PLUGIN_PROBE_IMAGE: {{ . | quote }}
-  {{- end }}
-  {{- with .Values.plugins.argocdRepo }}
-  SCARAB_PLUGIN_ARGOCD_REPO: {{ . | quote }}
   {{- end }}
   {{- end }}
   {{- range $k, $v := .Values.scarab.extraEnv }}

@@ -4,7 +4,7 @@
 //! reset recorded; their next enrollment is a "first passkey" again, so it
 //! needs a fresh browser login.
 //!
-//! - **An Owner's reset** — `POST /v1/orgs/{org}/members/{subject}/passkeys/reset`,
+//! - **An Owner's reset** — `POST /v1/orgs/{org}/members/{id}/passkeys/reset`,
 //!   the always-ask crown jewel `passkey.reset`. The caller must be Owner of
 //!   the Org, the target a member of it — and, because a passkey is not
 //!   Org-scoped, the caller must be Owner of EVERY Org the target belongs to
@@ -45,8 +45,10 @@ pub const BREAK_GLASS_CALLER: &str = "operator:break-glass";
 /// What a passkey reset removed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
 pub struct PasskeyResetDto {
-    /// The principal whose passkeys were reset.
+    /// The id of the Principal whose passkeys were reset.
     pub subject: String,
+    /// Its handle (ADR-0080).
+    pub handle: String,
     /// How many passkeys were removed.
     pub removed: u64,
     /// How many standing step-up confirmations (windows, unconsumed action
@@ -57,10 +59,10 @@ pub struct PasskeyResetDto {
 /// Reset a member's passkeys (an Owner; always-ask).
 #[utoipa::path(
     post,
-    path = "/v1/orgs/{org}/members/{subject}/passkeys/reset",
+    path = "/v1/orgs/{org}/members/{id}/passkeys/reset",
     params(
         ("org" = String, Path, description = "org"),
-        ("subject" = String, Path, description = "the member's principal id")
+        ("id" = String, Path, description = "the member's Principal id (a handle is accepted too)")
     ),
     summary = "Reset a member's passkeys (ADR-0073 §10; Owner, always-ask step-up)",
     responses(
@@ -86,6 +88,8 @@ pub(crate) async fn reset_member_passkeys(
     // check and every removal below: bindings, tokens and passkeys live
     // under it, not under an alias.
     let subject = live_subject(&st, &subject).await?;
+    // Messages name the person by handle (ADR-0080 §3).
+    let handle = st.people([subject.as_str()]).await.handle(&subject);
     let rbac = st.rbac.as_ref().ok_or(ApiError::NotFound)?;
     let orgs = rbac.orgs_of(&subject).await.map_err(store_err)?;
     if !orgs.iter().any(|o| o == &org) {
@@ -102,7 +106,7 @@ pub(crate) async fn reset_member_passkeys(
     // power to reopen their first-passkey path.
     if !bootstrap && is_install_owner(&st, &subject).await? {
         return Err(ApiError::Denied(format!(
-            "`{subject}` is an install-wide owner: only a bootstrap owner can reset their \
+            "`{handle}` is an install-wide owner: only a bootstrap owner can reset their \
              passkeys"
         )));
     }
@@ -112,7 +116,7 @@ pub(crate) async fn reset_member_passkeys(
                 // Which other Orgs the member is in is those Orgs' business:
                 // the refusal does not name them.
                 return Err(ApiError::Denied(format!(
-                    "`{subject}` also belongs to an Org you do not own: a passkey is not \
+                    "`{handle}` also belongs to an Org you do not own: a passkey is not \
                      Org-scoped, so only an Owner of every Org they belong to (or a bootstrap \
                      owner) can reset theirs"
                 )));
@@ -147,6 +151,7 @@ pub(crate) async fn reset_member_passkeys(
     svc.record(ev).await;
     Ok(Json(PasskeyResetDto {
         subject,
+        handle,
         removed,
         windows_revoked,
     }))
@@ -188,6 +193,11 @@ async fn is_install_owner(st: &AppState, subject: &str) -> Result<bool, ApiError
              owner, so nothing was reset: {e}"
         ))
     })?;
+    let mut names = vec![subject.to_string()];
+    if let Ok(Some(p)) = store.principal(subject).await {
+        names.push(p.handle);
+    }
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
     Ok(identities.iter().any(|i| {
         let email = i.email.as_deref().filter(|_| i.email_verified);
         email.is_some()
@@ -195,7 +205,7 @@ async fn is_install_owner(st: &AppState, subject: &str) -> Result<bool, ApiError
                 .oauth_providers
                 .iter()
                 .filter(|p| p.provider_id() == i.provider)
-                .any(|p| p.matches_owner(subject, email))
+                .any(|p| p.matches_owner(&names, email))
     }))
 }
 
@@ -267,10 +277,11 @@ pub async fn reset_passkeys(
             return Err("the database has never been migrated; this command never migrates".into())
         }
     }
-    let subject = scarab_identity::resolve_principal(db, principal)
+    let record = scarab_identity::resolve_principal_record(db, principal)
         .await
         .map_err(|e| format!("could not resolve `{principal}`: {e}"))?
         .ok_or_else(|| format!("no principal `{principal}` exists"))?;
+    let (subject, handle) = (record.id, record.handle);
     // Logged first, or not done: the reset is recorded with what it is
     // about to remove, and nothing is removed if it cannot be recorded.
     let held = PasskeyStore::list(db, &subject)
@@ -286,8 +297,9 @@ pub async fn reset_passkeys(
     );
     ev.op = Some("passkey.break_glass_reset".into());
     ev.target = Some(subject.clone());
+    // The record names the Principal by id only (ADR-0080): what the
+    // operator typed may be a handle, which is personal data.
     ev.detail = serde_json::json!({
-        "requested": principal,
         "reason": reason,
         "host": operator.host,
         "os_user": operator.os_user,
@@ -307,6 +319,7 @@ pub async fn reset_passkeys(
         .map_err(|e| format!("could not revoke the step-ups of `{subject}`: {e}"))?;
     Ok(PasskeyResetDto {
         subject,
+        handle,
         removed,
         windows_revoked,
     })
@@ -325,6 +338,7 @@ pub const NO_PRINCIPAL: &str = "no principal";
 pub enum OperatorGrant {
     /// The principal already held exactly this role in the Org as a native
     /// binding: nothing written, nothing recorded.
+    /// `subject`, in every variant: the Principal's handle (ADR-0080).
     Unchanged { subject: String },
     /// The binding was written and recorded. `previous` is the Org-scope row
     /// it replaced, if any: a role, a revoked row (role `None`), or a role a
@@ -405,7 +419,7 @@ pub async fn grant_role(
             return Err("the database has never been migrated; this command never migrates".into())
         }
     }
-    let resolved = scarab_identity::resolve_principal(db, subject)
+    let record = scarab_identity::resolve_principal_record(db, subject)
         .await
         .map_err(|e| format!("could not resolve `{subject}`: {e}"))?
         .ok_or_else(|| {
@@ -414,6 +428,9 @@ pub async fn grant_role(
                  a role can name them"
             )
         })?;
+    // Rows are keyed by the id; what this returns and prints is the handle
+    // (ADR-0080).
+    let (resolved, handle) = (record.id, record.handle);
     let rows = || async {
         db.binding_rows(&resolved, org)
             .await
@@ -422,7 +439,7 @@ pub async fn grant_role(
     let existing = rows().await?;
     if if_absent && !existing.is_empty() {
         return Ok(OperatorGrant::Exists {
-            subject: resolved,
+            subject: handle,
             rows: existing,
         });
     }
@@ -435,7 +452,7 @@ pub async fn grant_role(
     let previous = existing.into_iter().find(|r| r.project.is_empty());
     if let Some(p) = &previous {
         if p.role.as_deref() == Some(name(role)) && p.origin == "native" {
-            return Ok(OperatorGrant::Unchanged { subject: resolved });
+            return Ok(OperatorGrant::Unchanged { subject: handle });
         }
     }
     let mut ev = event(
@@ -448,7 +465,6 @@ pub async fn grant_role(
     ev.op = Some("binding.operator_grant".into());
     ev.target = Some(resolved.clone());
     ev.detail = serde_json::json!({
-        "requested": subject,
         "role": name(role),
         "previous": previous.as_ref().and_then(|p| p.role.clone()),
         "previous_origin": previous.as_ref().map(|p| p.origin.clone()),
@@ -467,7 +483,7 @@ pub async fn grant_role(
         .await
         .map_err(|e| {
             format!(
-                "could not grant `{resolved}` {} in `{org}`; nothing was granted or \
+                "could not grant `{handle}` {} in `{org}`; nothing was granted or \
                  recorded: {e}",
                 name(role)
             )
@@ -477,11 +493,11 @@ pub async fn grant_role(
         // the UI meanwhile): leave it, as `--if-absent` promises.
         return Ok(OperatorGrant::Exists {
             rows: rows().await?,
-            subject: resolved,
+            subject: handle,
         });
     }
     Ok(OperatorGrant::Granted {
-        subject: resolved,
+        subject: handle,
         previous,
     })
 }

@@ -15,6 +15,7 @@ fn session(id: &str, subject: &str, expires_at: i64) -> Session {
         id: id.into(),
         principal: Principal {
             subject: subject.into(),
+            handle: String::new(),
             display_name: Some("Alice".into()),
             roles: vec![Role::Member],
         },

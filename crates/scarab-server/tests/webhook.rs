@@ -134,11 +134,15 @@ async fn unsupported_event_is_acknowledged_and_ignored() {
 
 /// App with BOTH forge endpoints + the registry (dedup) wired.
 fn multi_forge_app(db: Arc<InMemoryDb>) -> axum::Router {
+    multi_forge_app_with(db, FakeForge::new().with_file(".scarab/ci.yaml", CI_YAML))
+}
+
+/// [`multi_forge_app`] over a given forge.
+fn multi_forge_app_with(db: Arc<InMemoryDb>, forge: FakeForge) -> axum::Router {
     let clock = Arc::new(FakeClock::new(1_000));
     let store = Arc::new(InMemoryObjectStore::new());
     let logs = Arc::new(LogService::new(store, db.clone()));
-    let forge: Arc<dyn ForgePort> =
-        Arc::new(FakeForge::new().with_file(".scarab/ci.yaml", CI_YAML));
+    let forge: Arc<dyn ForgePort> = Arc::new(forge);
     router(
         AppState::new(db.clone(), clock, logs)
             .with_github_webhook_secret(SECRET.to_vec())
@@ -146,6 +150,30 @@ fn multi_forge_app(db: Arc<InMemoryDb>) -> axum::Router {
             .with_forge_connections(db)
             .with_forge(forge),
     )
+}
+
+/// Enable `acme/app` (the repo the push bodies name) through a connection of
+/// `kind`: with a registry wired, only an enabled repo's events start runs.
+async fn enable_app(db: &InMemoryDb, kind: scarab_forge::ForgeKind) {
+    use scarab_forge::{ForgeConnection, ForgeConnectionStore, RepoRef};
+    db.put_connection(&ForgeConnection {
+        id: "acme-conn".into(),
+        kind,
+        base_url: "https://forge.acme.test".into(),
+        credential_ref: "acme-conn-credential".into(),
+        org: Some("acme".into()),
+        installation_id: None,
+        account_id: None,
+    })
+    .await
+    .unwrap();
+    let app = RepoRef {
+        owner: "acme".into(),
+        name: "app".into(),
+    };
+    db.bind_repo("acme-conn", &app, "acme", "app")
+        .await
+        .unwrap();
 }
 
 fn forgejo_request(event: &str, delivery: &str, body: &[u8], signature: &str) -> Request<Body> {
@@ -166,6 +194,7 @@ fn forgejo_request(event: &str, delivery: &str, body: &[u8], signature: &str) ->
 #[tokio::test]
 async fn forgejo_endpoint_verifies_with_its_own_secret_and_creates_a_run() {
     let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    enable_app(&db, scarab_forge::ForgeKind::Forgejo).await;
     let app = multi_forge_app(db.clone());
 
     // Forgejo payload variant: owner.username instead of owner.login.
@@ -201,6 +230,7 @@ async fn forgejo_endpoint_verifies_with_its_own_secret_and_creates_a_run() {
 #[tokio::test]
 async fn replayed_delivery_is_ignored_idempotently() {
     let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    enable_app(&db, scarab_forge::ForgeKind::GitHub).await;
     let app = multi_forge_app(db.clone());
 
     let body = push_body();
@@ -232,50 +262,53 @@ async fn replayed_delivery_is_ignored_idempotently() {
     assert_eq!(db.active_runs().await.unwrap().len(), 2);
 }
 
-/// A GitHub `installation` webhook auto-registers a ForgeConnection and binds
-/// its repos to Projects (ADR-0046: installing the App IS registration).
+/// A GitHub `installation` webhook registers its ForgeConnection, serving
+/// the account's Org, and binds none of its repos: enabling one is opt-in.
+/// Before, every covered repo became a Project on install.
 #[tokio::test]
-async fn installation_webhook_auto_registers_the_connection_and_repos() {
+async fn an_installation_registers_its_connection_and_binds_nothing() {
     use scarab_forge::ForgeConnectionStore;
 
     let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
     let app = multi_forge_app(db.clone());
 
-    let body = serde_json::to_vec(&serde_json::json!({
-        "action": "created",
-        "installation": { "id": 42, "account": { "login": "acme" } },
-        "repositories": [ { "full_name": "acme/web" }, { "full_name": "acme/api" } ]
-    }))
-    .unwrap();
-    let sig = scarab_forge_github::sign_hex(SECRET, &body);
-    let req = Request::builder()
-        .method("POST")
-        .uri("/webhooks/github")
-        .header("content-type", "application/json")
-        .header("x-github-event", "installation")
-        .header("x-github-delivery", "install-d1")
-        .header("x-hub-signature-256", &sig)
-        .body(Body::from(body))
+    let resp = app
+        .clone()
+        .oneshot(installation_request(
+            "install-d1",
+            42,
+            "acme",
+            &["acme/web", "acme/api"],
+        ))
+        .await
         .unwrap();
-    let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["registered"]["available"], 2, "{body}");
 
-    // The connection exists and both repos resolve to their Projects.
     let conn = db
         .get_connection("github-install-42")
         .await
         .unwrap()
-        .expect("auto-registered connection");
+        .expect("registered connection");
     assert_eq!(conn.kind, scarab_forge::ForgeKind::GitHub);
-    let hit = db
-        .resolve(&scarab_forge::RepoRef {
-            owner: "acme".into(),
-            name: "web".into(),
-        })
-        .await
-        .unwrap()
-        .expect("repo bound");
-    assert_eq!((hit.org.as_str(), hit.project.as_str()), ("acme", "web"));
+    assert_eq!(conn.org.as_deref(), Some("acme"));
+    assert!(db.repos_of("github-install-42").await.unwrap().is_empty());
+    for name in ["web", "api"] {
+        assert!(db
+            .resolve(&scarab_forge::RepoRef {
+                owner: "acme".into(),
+                name: name.into(),
+            })
+            .await
+            .unwrap()
+            .is_none());
+    }
 }
 
 /// A signed `installation` delivery for installation `id` on account `login`
@@ -305,10 +338,10 @@ fn installation_request(delivery: &str, id: u64, login: &str, repos: &[&str]) ->
 
 /// git-bug 19b0a45: the installation connection serves the Org of the
 /// installation's account and records its installation id (tokens are minted
-/// from it alone). A repo of another owner in the delivery is not bound, and
-/// neither is a repo bound through another Org's connection.
+/// from it alone). It binds none of the delivery's repos, and a repo bound
+/// through another Org's connection stays there.
 #[tokio::test]
-async fn an_installation_serves_its_accounts_org_and_binds_only_its_repos() {
+async fn an_installation_serves_its_accounts_org_and_binds_nothing() {
     use scarab_forge::{ForgeConnection, ForgeConnectionStore, ForgeKind, RepoRef};
 
     let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
@@ -352,13 +385,9 @@ async fn an_installation_serves_its_accounts_org_and_binds_only_its_repos() {
         .unwrap();
     assert_eq!(conn.org.as_deref(), Some("acme"));
     assert_eq!(conn.installation_id, Some(7));
-    assert_eq!(
-        db.repos_of("github-install-7").await.unwrap(),
-        vec![RepoRef {
-            owner: "acme".into(),
-            name: "web".into()
-        }],
-        "only the account's own repo is bound"
+    assert!(
+        db.repos_of("github-install-7").await.unwrap().is_empty(),
+        "an installation binds nothing"
     );
     let still = db.resolve(&shared).await.unwrap().unwrap();
     assert_eq!(
@@ -503,4 +532,567 @@ async fn a_delivery_does_not_assign_a_connection_holding_another_owners_repo() {
         .unwrap()
         .unwrap();
     assert_eq!(globex.org, "globex");
+}
+
+// ---------------------------------------------------------------------------
+// Opt-in repositories: a GitHub installation makes its repos available, an
+// admin enables the ones Scarab builds, and nothing the forge sends enables or
+// re-enables one.
+// ---------------------------------------------------------------------------
+
+/// A signed `installation_repositories` delivery for installation `id`:
+/// `added` and `removed` are `owner/name`.
+fn installation_repositories_request(
+    delivery: &str,
+    id: u64,
+    login: &str,
+    added: &[&str],
+    removed: &[&str],
+) -> Request<Body> {
+    let full = |repos: &[&str]| -> Vec<serde_json::Value> {
+        repos
+            .iter()
+            .map(|r| serde_json::json!({ "full_name": r }))
+            .collect()
+    };
+    let body = serde_json::to_vec(&serde_json::json!({
+        "action": "added",
+        "installation": { "id": id, "account": { "login": login } },
+        "repositories_added": full(added),
+        "repositories_removed": full(removed),
+    }))
+    .unwrap();
+    let sig = scarab_forge_github::sign_hex(SECRET, &body);
+    Request::builder()
+        .method("POST")
+        .uri("/webhooks/github")
+        .header("content-type", "application/json")
+        .header("x-github-event", "installation_repositories")
+        .header("x-github-delivery", delivery)
+        .header("x-hub-signature-256", &sig)
+        .body(Body::from(body))
+        .unwrap()
+}
+
+/// A signed GitHub push to `acme/app` with delivery id `delivery`.
+fn push_request(delivery: &str) -> Request<Body> {
+    let body = push_body();
+    let sig = scarab_forge_github::sign_hex(SECRET, &body);
+    Request::builder()
+        .method("POST")
+        .uri("/webhooks/github")
+        .header("content-type", "application/json")
+        .header("x-github-event", "push")
+        .header("x-github-delivery", delivery)
+        .header("x-hub-signature-256", &sig)
+        .body(Body::from(body))
+        .unwrap()
+}
+
+async fn json_of(resp: axum::response::Response) -> serde_json::Value {
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+}
+
+/// An unauthenticated request: the app has no session store, so it acts as
+/// the dev owner.
+fn api(method: &str, uri: &str, body: Option<serde_json::Value>) -> Request<Body> {
+    let req = Request::builder().method(method).uri(uri);
+    match body {
+        Some(b) => req
+            .header("content-type", "application/json")
+            .body(Body::from(b.to_string())),
+        None => req.body(Body::empty()),
+    }
+    .unwrap()
+}
+
+/// A push to a repo the App covers but nobody enabled is acknowledged with a
+/// 2xx (so GitHub does not retry it) and starts nothing, although the repo
+/// has a pipeline that matches. Once enabled, the same push starts a run.
+#[tokio::test]
+async fn a_push_to_a_repo_that_is_not_enabled_is_acknowledged_and_ignored() {
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    let app = multi_forge_app(db.clone());
+    let resp = app
+        .clone()
+        .oneshot(installation_request("optin-i1", 42, "acme", &["acme/app"]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app.clone().oneshot(push_request("optin-p1")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_of(resp).await;
+    assert_eq!(body["ignored"], "repository not enabled", "{body}");
+    assert!(db.active_runs().await.unwrap().is_empty(), "no run");
+
+    let resp = app
+        .clone()
+        .oneshot(api(
+            "POST",
+            "/v1/connections/github-install-42/repos",
+            Some(serde_json::json!({ "owner": "acme", "name": "app", "register_webhook": false })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = app.clone().oneshot(push_request("optin-p2")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    assert_eq!(db.active_runs().await.unwrap().len(), 1);
+}
+
+/// Disabling is permanent: a repo an admin disabled is not bound again by a
+/// later `installation_repositories` delivery that lists it, nor by a
+/// re-sync, which lists it as available.
+#[tokio::test]
+async fn a_disabled_repo_stays_disabled_after_a_later_delivery() {
+    use scarab_forge::ForgeConnectionStore;
+
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    let app = multi_forge_app_with(
+        db.clone(),
+        FakeForge::new()
+            .with_file(".scarab/ci.yaml", CI_YAML)
+            .with_accessible_repos(&[("acme", "app")]),
+    );
+    let app_repo = scarab_forge::RepoRef {
+        owner: "acme".into(),
+        name: "app".into(),
+    };
+    let resp = app
+        .clone()
+        .oneshot(installation_request("dis-i1", 42, "acme", &["acme/app"]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = app
+        .clone()
+        .oneshot(api(
+            "POST",
+            "/v1/connections/github-install-42/repos",
+            Some(serde_json::json!({ "owner": "acme", "name": "app", "register_webhook": false })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = app
+        .clone()
+        .oneshot(api(
+            "DELETE",
+            "/v1/connections/github-install-42/repos/acme/app",
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // GitHub sends the repo again (removed from the App and added back).
+    let resp = app
+        .clone()
+        .oneshot(installation_repositories_request(
+            "dis-r1",
+            42,
+            "acme",
+            &["acme/app"],
+            &[],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(db.resolve(&app_repo).await.unwrap().is_none());
+
+    let resp = app
+        .clone()
+        .oneshot(api(
+            "POST",
+            "/v1/connections/github-install-42/resync",
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_of(resp).await;
+    assert_eq!(body["available"], serde_json::json!(["acme/app"]), "{body}");
+    assert!(db.resolve(&app_repo).await.unwrap().is_none());
+
+    // And its pushes stay ignored.
+    let resp = app.clone().oneshot(push_request("dis-p1")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(db.active_runs().await.unwrap().is_empty());
+}
+
+/// Repos an older server bound on install stay bound: a later delivery that
+/// adds other repos, and a re-sync, leave the existing Project where it is
+/// and enable nothing new. Nothing migrates bindings away.
+#[tokio::test]
+async fn existing_bindings_survive_later_deliveries_and_a_resync() {
+    use scarab_forge::{ForgeConnection, ForgeConnectionStore, ForgeKind, RepoRef};
+
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    // As an older server left it: the installation's connection, and the
+    // repo it bound when the App was installed.
+    db.put_connection(&ForgeConnection {
+        id: "github-install-42".into(),
+        kind: ForgeKind::GitHub,
+        base_url: "https://api.github.com".into(),
+        credential_ref: "github-app".into(),
+        org: Some("acme".into()),
+        installation_id: Some(42),
+        account_id: None,
+    })
+    .await
+    .unwrap();
+    let web = RepoRef {
+        owner: "acme".into(),
+        name: "web".into(),
+    };
+    let api_repo = RepoRef {
+        owner: "acme".into(),
+        name: "api".into(),
+    };
+    db.bind_repo("github-install-42", &web, "acme", "web")
+        .await
+        .unwrap();
+    let app = multi_forge_app_with(
+        db.clone(),
+        FakeForge::new().with_accessible_repos(&[("acme", "web"), ("acme", "api")]),
+    );
+
+    for (delivery, req) in [
+        (
+            "keep-i1",
+            installation_request("keep-i1", 42, "acme", &["acme/web", "acme/api"]),
+        ),
+        (
+            "keep-r1",
+            installation_repositories_request("keep-r1", 42, "acme", &["acme/api"], &[]),
+        ),
+    ] {
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{delivery}");
+        let hit = db.resolve(&web).await.unwrap().expect("still bound");
+        assert_eq!(hit.connection.id, "github-install-42", "{delivery}");
+        assert_eq!((hit.org.as_str(), hit.project.as_str()), ("acme", "web"));
+        assert!(db.resolve(&api_repo).await.unwrap().is_none(), "{delivery}");
+    }
+
+    let resp = app
+        .clone()
+        .oneshot(api(
+            "POST",
+            "/v1/connections/github-install-42/resync",
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_of(resp).await;
+    assert_eq!(body["confirmed"], 1, "{body}");
+    assert_eq!(body["available"], serde_json::json!(["acme/api"]), "{body}");
+    assert!(db.resolve(&web).await.unwrap().is_some());
+    assert!(db.resolve(&api_repo).await.unwrap().is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Unreachable repositories: a bound repo the installation stops covering
+// keeps its Project and is marked unreachable; nothing the forge sends
+// deletes it.
+// ---------------------------------------------------------------------------
+
+/// A signed `installation` delivery with `action` for installation `id`;
+/// `repos` (`owner/name`) are its `repositories`, omitted when `None`.
+fn installation_action_request(
+    delivery: &str,
+    id: u64,
+    login: &str,
+    action: &str,
+    repos: Option<&[&str]>,
+) -> Request<Body> {
+    let mut body = serde_json::json!({
+        "action": action,
+        "installation": { "id": id, "account": { "login": login } },
+    });
+    if let Some(repos) = repos {
+        body["repositories"] = repos
+            .iter()
+            .map(|r| serde_json::json!({ "full_name": r }))
+            .collect();
+    }
+    let body = serde_json::to_vec(&body).unwrap();
+    let sig = scarab_forge_github::sign_hex(SECRET, &body);
+    Request::builder()
+        .method("POST")
+        .uri("/webhooks/github")
+        .header("content-type", "application/json")
+        .header("x-github-event", "installation")
+        .header("x-github-delivery", delivery)
+        .header("x-hub-signature-256", &sig)
+        .body(Body::from(body))
+        .unwrap()
+}
+
+/// The installation 42 connection of acme with `names` bound, as an admin
+/// would have enabled them.
+async fn seed_installation(db: &InMemoryDb, names: &[&str]) {
+    use scarab_forge::{ForgeConnection, ForgeConnectionStore, ForgeKind, RepoRef};
+    db.put_connection(&ForgeConnection {
+        id: "github-install-42".into(),
+        kind: ForgeKind::GitHub,
+        base_url: "https://api.github.com".into(),
+        credential_ref: "github-app".into(),
+        org: Some("acme".into()),
+        installation_id: Some(42),
+        account_id: None,
+    })
+    .await
+    .unwrap();
+    for name in names {
+        let r = RepoRef {
+            owner: "acme".into(),
+            name: (*name).into(),
+        };
+        db.bind_repo("github-install-42", &r, "acme", name)
+            .await
+            .unwrap();
+    }
+}
+
+/// `acme/<name>`'s binding: (still bound?, unreachable since).
+async fn reach_of(db: &InMemoryDb, name: &str) -> (bool, Option<i64>) {
+    use scarab_forge::ForgeConnectionStore;
+    match db
+        .resolve(&scarab_forge::RepoRef {
+            owner: "acme".into(),
+            name: name.into(),
+        })
+        .await
+        .unwrap()
+    {
+        Some(r) => (true, r.unreachable_since),
+        None => (false, None),
+    }
+}
+
+/// A repo removed from the App's installation keeps its binding and its
+/// Project, marked unreachable since the delivery (the app's clock reads
+/// 1000). The API shows the mark. Before, the removal unbound it, which
+/// deleted the Project with its Environments, secrets and grants.
+#[tokio::test]
+async fn a_repo_removed_from_the_installation_is_marked_unreachable_and_kept() {
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    seed_installation(&db, &["web", "api"]).await;
+    let app = multi_forge_app(db.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(installation_repositories_request(
+            "unr-r1",
+            42,
+            "acme",
+            &[],
+            &["acme/web"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_of(resp).await;
+    assert_eq!(body["registered"]["unreachable"], 1, "{body}");
+
+    assert_eq!(reach_of(&db, "web").await, (true, Some(1_000)));
+    assert_eq!(reach_of(&db, "api").await, (true, None));
+
+    let resp = app
+        .clone()
+        .oneshot(api("GET", "/v1/repos", None))
+        .await
+        .unwrap();
+    let repos = json_of(resp).await;
+    let web = repos
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["project"] == "web")
+        .expect("the Project is still listed");
+    assert_eq!(web["unreachable_since"], 1_000);
+}
+
+/// An `installation_repositories` delivery that adds the repo back clears
+/// the mark.
+#[tokio::test]
+async fn a_later_added_delivery_clears_the_unreachable_mark() {
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    seed_installation(&db, &["web"]).await;
+    let app = multi_forge_app(db.clone());
+
+    for (delivery, added, removed) in [
+        ("clr-r1", &[][..], &["acme/web"][..]),
+        ("clr-r2", &["acme/web"][..], &[][..]),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(installation_repositories_request(
+                delivery, 42, "acme", added, removed,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{delivery}");
+    }
+    assert_eq!(reach_of(&db, "web").await, (true, None));
+}
+
+/// A re-sync whose forge lists the repo clears the mark.
+#[tokio::test]
+async fn a_resync_that_lists_the_repo_clears_the_unreachable_mark() {
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    seed_installation(&db, &["web"]).await;
+    let app = multi_forge_app_with(
+        db.clone(),
+        FakeForge::new().with_accessible_repos(&[("acme", "web")]),
+    );
+    let resp = app
+        .clone()
+        .oneshot(installation_repositories_request(
+            "rsy-r1",
+            42,
+            "acme",
+            &[],
+            &["acme/web"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(reach_of(&db, "web").await, (true, Some(1_000)));
+
+    let resp = app
+        .clone()
+        .oneshot(api(
+            "POST",
+            "/v1/connections/github-install-42/resync",
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(json_of(resp).await["confirmed"], 1);
+    assert_eq!(reach_of(&db, "web").await, (true, None));
+}
+
+/// Uninstalling the App marks every repo bound through its connection
+/// unreachable, listed in the delivery or not, and keeps them all;
+/// `unsuspend` covering them clears the marks; `suspend` (which lists no
+/// repositories) marks them all again.
+#[tokio::test]
+async fn uninstalling_or_suspending_the_app_marks_all_its_repos_unreachable() {
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    seed_installation(&db, &["web", "api"]).await;
+    let app = multi_forge_app(db.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(installation_action_request(
+            "gone-1",
+            42,
+            "acme",
+            "deleted",
+            Some(&["acme/web"]),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(reach_of(&db, "web").await, (true, Some(1_000)));
+    assert_eq!(reach_of(&db, "api").await, (true, Some(1_000)));
+
+    let resp = app
+        .clone()
+        .oneshot(installation_action_request(
+            "gone-2",
+            42,
+            "acme",
+            "unsuspend",
+            Some(&["acme/web", "acme/api"]),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(reach_of(&db, "web").await, (true, None));
+    assert_eq!(reach_of(&db, "api").await, (true, None));
+
+    let resp = app
+        .clone()
+        .oneshot(installation_action_request(
+            "gone-3", 42, "acme", "suspend", None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(reach_of(&db, "web").await, (true, Some(1_000)));
+    assert_eq!(reach_of(&db, "api").await, (true, Some(1_000)));
+}
+
+/// A push to an unreachable repo is acknowledged with a 2xx (no retry) and
+/// starts nothing, although the repo has a matching pipeline.
+#[tokio::test]
+async fn an_event_for_an_unreachable_repo_is_acknowledged_and_ignored() {
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    seed_installation(&db, &["app"]).await;
+    let app = multi_forge_app(db.clone());
+    let resp = app
+        .clone()
+        .oneshot(installation_repositories_request(
+            "ign-r1",
+            42,
+            "acme",
+            &[],
+            &["acme/app"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app.clone().oneshot(push_request("ign-p1")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_of(resp).await;
+    assert_eq!(body["ignored"], "repository unreachable", "{body}");
+    assert!(db.active_runs().await.unwrap().is_empty(), "no run");
+}
+
+/// A manual dispatch of an unreachable repo is refused with a 409 that says
+/// why, and no run is created.
+#[tokio::test]
+async fn manual_dispatch_of_an_unreachable_repo_is_refused() {
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    seed_installation(&db, &["app"]).await;
+    let app = multi_forge_app(db.clone());
+    let resp = app
+        .clone()
+        .oneshot(installation_repositories_request(
+            "dsp-r1",
+            42,
+            "acme",
+            &[],
+            &["acme/app"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .clone()
+        .oneshot(api(
+            "POST",
+            "/v1/repos/acme/app/dispatch",
+            Some(serde_json::json!({ "ref": "refs/heads/main", "pipeline": "ci" })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let msg = String::from_utf8_lossy(&bytes);
+    assert!(msg.contains("unreachable"), "{msg}");
+    assert!(db.active_runs().await.unwrap().is_empty(), "no run");
 }

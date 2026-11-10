@@ -61,14 +61,6 @@ scarab:
   # commit-status links stay on publicUrl. Empty => publicUrl. Browsers refuse
   # passkeys on an IP address, so a local one is http://localhost:<port>.
   uiUrl: ""
-  # The first-party library release manifest (ADR-0076 §5), as JSON text.
-  # Empty => the server reads `libs-manifest.json` from its own version's
-  # GitHub release. Set it for an air-gapped install, or for a build whose
-  # first-party libraries are not released (`just stack up` writes one that lists a
-  # clone library pinning the locally built scarab-clone image).
-  # The checkout image is the one `lib:thulasi-ram/clone` pins; to use a
-  # mirror, install a library version that pins the mirror's image.
-  libsManifest: ""
   # Global default step deadline in seconds (ADR-0047). Empty => server
   # default (3600). Per-step `timeout:` always overrides.
   stepTimeoutSecs: ""
@@ -520,8 +512,7 @@ workspace:
   serviceAccount:
     annotations: {}
 
-# Plugins (ADR-0072): long-lived vendor workloads (e.g. the first-party Argo CD
-# plugin) that Scarab runs in ONE shared namespace and talks to only through
+# Plugins (ADR-0072): long-lived vendor workloads (e.g. the Argo CD plugin) that Scarab runs in ONE shared namespace and talks to only through
 # the CredentialBroker — a second listener of scarab-server, exposed by a
 # ClusterIP Service and NEVER through the ingress.
 #
@@ -601,9 +592,6 @@ plugins:
   # pinned by digest. An override should be digest-pinned too: the probe's
   # verdict is only as good as the image printing it.
   probeImage: ""
-  # The repository first-party Argo CD installs must pin by digest. "" = the
-  # server default (ghcr.io/thulasi-ram/scarab-plugin-argocd).
-  argocdRepo: ""
 
 # RBAC the k8s executor needs to run one Pod per step in scarab.namespace.
 # NOTE: the workspace StatefulSet gets its own ServiceAccount with NO

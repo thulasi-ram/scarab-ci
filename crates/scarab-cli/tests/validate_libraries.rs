@@ -64,7 +64,6 @@ async fn serve() -> String {
             source: format!("github.com/acme/libs//deploy.yaml@{}", "1".repeat(40)),
             publisher: "acme".into(),
             name: "deploy".into(),
-            first_party: false,
             fetched_by: "amy".into(),
             fetched_at: 1,
         })

@@ -136,7 +136,7 @@ export default function VersionDropdown(props: {
                     <span class="vdrop-rowlbl">{row.label}</span>
                     <Show when={row.isLatest && props.live}>
                       <span class="vdrop-live">
-                        <span class="dot" /> live
+                        <span class="dot" /> Live
                       </span>
                     </Show>
                   </span>

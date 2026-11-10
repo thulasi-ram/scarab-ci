@@ -5,7 +5,7 @@ use async_trait::async_trait;
 
 use crate::{
     BrokerJournalEntry, BrokerJournalFilter, BrokerJournalRecord, InstallationState,
-    PluginConnection, PluginInstallation, PluginStorage, RuntimeStatus,
+    PluginConnection, PluginInstallation, PluginManifest, PluginStorage, RuntimeStatus,
 };
 
 /// A list read's page size when none is asked for, and the most one page
@@ -21,6 +21,55 @@ pub struct PluginUninstall {
     /// rows went with the installation; the caller deletes the secrets, which
     /// live in another store (ADR-0072 §5).
     pub connection_credential_refs: Vec<String>,
+}
+
+/// What an upgrade approves (ADR-0072 §10): a new image and manifest for an
+/// installation that keeps its id, name, config (less the keys the new
+/// manifest no longer declares), storage, state and connections (less the
+/// slots it no longer declares).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginUpgrade {
+    pub image: String,
+    pub manifest: PluginManifest,
+    pub manifest_sha256: String,
+    /// The source the new manifest was read from, as read.
+    pub source: String,
+    pub source_connection: Option<String>,
+    /// The Principal subject that approved the upgrade, and when (Unix-ms).
+    pub approved_by: String,
+    pub approved_at: i64,
+    /// The StepUpConfirmation that authorised it; `None` for a same-or-
+    /// narrower upgrade, which needs none.
+    pub step_up_ref: Option<String>,
+}
+
+/// What an upgrade stored, and what it unbound.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginUpgraded {
+    pub installation: PluginInstallation,
+    /// The SecretProvider keys of the connections bound to slots the new
+    /// manifest no longer declares: those rows went with the upgrade, and
+    /// the caller deletes the secrets.
+    pub connection_credential_refs: Vec<String>,
+}
+
+/// A version an installation ran before an upgrade replaced it: the history
+/// an upgrade records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginInstallationVersion {
+    pub installation_id: String,
+    pub image: String,
+    pub manifest: PluginManifest,
+    pub manifest_sha256: String,
+    pub source: Option<String>,
+    pub source_connection: Option<String>,
+    pub approved_by: String,
+    pub approved_at: i64,
+    /// Who upgraded it away, when, and the step-up that authorised that, if
+    /// one did.
+    pub replaced_by: String,
+    pub replaced_at: i64,
+    pub step_up_ref: Option<String>,
 }
 
 /// A [`PluginStore`] failure.
@@ -120,6 +169,30 @@ pub trait PluginStore: Send + Sync {
         storage: Option<&PluginStorage>,
         expected: Option<&PluginStorage>,
     ) -> Result<Option<PluginInstallation>, PluginStoreError>;
+
+    /// Upgrade the installation to `upgrade`'s image and manifest — **only if
+    /// its manifest is still `expected_manifest_sha256`**, the one the caller
+    /// read and judged the upgrade against ([`PluginStoreError::Changed`]
+    /// otherwise; nothing is written). In one transaction: the version it
+    /// replaces is recorded ([`Self::installation_versions`]); config keys
+    /// and connection slots the new manifest does not declare are dropped;
+    /// the state version is bumped and the runtime record reset to `pending`
+    /// with no probe, so the runtime proves isolation again before the new
+    /// image starts and a status decided for the old one never lands.
+    /// `None` if there is no such installation.
+    async fn upgrade_installation(
+        &self,
+        org: &str,
+        name: &str,
+        expected_manifest_sha256: &str,
+        upgrade: &PluginUpgrade,
+    ) -> Result<Option<PluginUpgraded>, PluginStoreError>;
+
+    /// The versions upgrades replaced, oldest first.
+    async fn installation_versions(
+        &self,
+        installation_id: &str,
+    ) -> Result<Vec<PluginInstallationVersion>, PluginStoreError>;
 
     /// Record what the plugin runtime observed of installation `id`'s
     /// workload — written **only if the installation is still in

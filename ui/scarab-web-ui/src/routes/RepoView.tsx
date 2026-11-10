@@ -1,9 +1,9 @@
 // Repo dashboard (tier 2) — tabs over one repository: Runs (default),
-// Environments, Secrets, Settings. Each run row shows its origin as a grid of
+// Schedules, Environments, Secrets, Settings. Each run row shows its origin as a grid of
 // facts (author · ref · duration) under a header line (sha · status · trigger ·
 // when), fed by the origin fields RunSummaryDto now carries. Duration ticks live
 // for in-flight runs. The runs list filters by status, author, branch, PR,
-// pipeline, environment and deploys — environment and deploys on the server
+// pipeline, environment, deploys and scheduled — environment and deploys on the server
 // (it is how a Project's older deploys are found), the rest over
 // the loaded page. The header CTA is contextual to the active tab.
 //
@@ -13,12 +13,13 @@
 // tab, no filter) are the absent params, which keeps the bare repo URL clean.
 import { createResource, createSignal, createEffect, onCleanup, For, Show } from "solid-js";
 import { A, useParams, useNavigate, useSearchParams } from "@solidjs/router";
+import { orgPageHref, UNREACHABLE_NOTE } from "../org-page";
 import { recordVisit } from "../visited";
 import {
   listRepoRuns,
+  listProjects,
   repoForgeUrl,
   listEnvironments,
-  listApprovalHistory,
   putEnvironmentOverlay,
   deleteEnvironmentOverlay,
   type RunSummary,
@@ -30,12 +31,19 @@ import {
 } from "../api/client";
 import {
   isPermissive,
-  refLayersLabel,
   rulesSummary,
   rulesToForm,
   tightenable,
   toProtectionBody,
 } from "../environment-overlays";
+import {
+  approversCell,
+  deploySentence,
+  ruleDiff,
+  refsCell,
+  repoChip,
+  waitCell,
+} from "../repo-environments";
 import { relTime, absTime, untilTime, duration } from "../fmt";
 import { forgeCommitUrl, forgePrUrl } from "../forge";
 import TriggerCell from "../components/TriggerCell";
@@ -47,21 +55,22 @@ import Modal, { ModalMessage, ModalSection } from "../components/Modal";
 import ConfirmDestructive from "../components/ConfirmDestructive";
 import { Checkbox, Field, Input, Select } from "../components/Field";
 import { addToList } from "../identities";
-import ScopedSecrets from "../components/ScopedSecrets";
-import SecretMatrixEditor from "../components/SecretMatrixEditor";
+import SecretKeyList from "../components/SecretKeyList";
+import RepoSettings from "../components/RepoSettings";
 import Doodle from "../components/Doodle";
 import AsciiScene from "../components/AsciiScene";
 import { mergeRefused, runEnvironmentOptions, runListFilter } from "../runs-filter";
 import { environmentLabel, nameBeside, shownName } from "../org-environments";
 import { refusalSummary } from "../compile-errors";
-import { fireOutcome, pipelineShortName } from "../schedules";
+import { fireOutcome, isScheduled, pipelineShortName, scheduledRunsHref } from "../schedules";
 import ponderIdle from "../../../brand/ascii/generated/ponder-ponder.json";
 
-type Tab = "runs" | "environments" | "secrets" | "settings";
+type Tab = "runs" | "schedules" | "environments" | "secrets" | "settings";
 type StatusFilter = "all" | "running" | "failed" | "refused";
 
 const TABS: [Tab, string][] = [
   ["runs", "Runs"],
+  ["schedules", "Schedules"],
   ["environments", "Environments"],
   ["secrets", "Secrets"],
   ["settings", "Settings"],
@@ -136,6 +145,16 @@ export default function RepoView() {
     (k) => repoForgeUrl(k.org, k.repo).catch(() => null),
   );
 
+  // This repo's Project, for whether its forge connection still reaches it.
+  const [project] = createResource(
+    () => ({ org: org(), repo: repo() }),
+    (k) =>
+      listProjects()
+        .then((ps) => ps.find((p) => p.org === k.org && p.project === k.repo) ?? null)
+        .catch(() => null),
+  );
+  const unreachable = () => project()?.unreachable_since != null;
+
   // Tab + filters are URL state (see the header comment). An unknown `?tab=`
   // falls back to Runs rather than rendering an empty page.
   const [search, setSearch] = useSearchParams();
@@ -169,7 +188,16 @@ export default function RepoView() {
   // Deploys toggle (`?deploy=1`): only deploy Runs — a pipeline or Step marked
   // `deploy: true`. Server-side, like the Environment.
   const deploysOnly = () => one(search.deploy) === "1";
+  // The Secrets tab's Environment (`?secret_env=`); its own key, so the Runs
+  // tab's Environment filter does not carry over.
+  const secretEnv = () => one(search.secret_env);
+  const setSecretEnv = filterSetter("secret_env");
   const setDeploysOnly = (on: boolean) => filterSetter("deploy")(on ? "1" : "");
+  // Scheduled toggle (`?scheduled=1`): only Runs a schedule started (trigger
+  // kind `cron`). Client-side, like the pipeline; a schedule on the Schedules
+  // tab links here with its pipeline.
+  const scheduledOnly = () => one(search.scheduled) === "1";
+  const setScheduledOnly = (on: boolean) => filterSetter("scheduled")(on ? "1" : "");
 
   // Only this repo's tenanted runs, straight from the per-repo endpoint.
   // The Environment and Deploys filters are part of the request,
@@ -186,12 +214,6 @@ export default function RepoView() {
     () => ({ org: org(), repo: repo() }),
     (k) => listRefusedRuns(k.org, k.repo).catch(() => [] as RefusedRun[]),
   );
-  // The Project's `on: cron:` schedules; an older server has none, and a repo
-  // without one shows no Schedules panel.
-  const [schedules, { refetch: refetchSchedules }] = createResource(
-    () => ({ org: org(), repo: repo() }),
-    (k) => listSchedules(k.org, k.repo).catch(() => [] as Schedule[]),
-  );
   // The Project's Environments, for the Environment picker's options — the
   // loaded rows are already one Environment's once the filter is on. A caller
   // who can't read them still gets the Environments seen on runs.
@@ -207,15 +229,10 @@ export default function RepoView() {
     return env ? environmentLabel(env) : name;
   };
 
-  /** `undefined` = closed; `""` = open with no Environment picked; a name =
-   *  open on that Environment (its overlay prefilled). */
+  /** `undefined` = closed; a name = open on that Environment (its overlay
+   *  prefilled). */
   const [envDialog, setEnvDialog] = createSignal<string | undefined>(undefined);
   const [envEpoch, setEnvEpoch] = createSignal(0); // bump to refetch the env list after a create
-  const [secretFocus, setSecretFocus] = createSignal(0);
-  // The two secret panels read the same store through separate fetches; each
-  // bumps the OTHER's epoch after a write so neither shows a stale view.
-  const [secretListEpoch, setSecretListEpoch] = createSignal(0);
-  const [secretMatrixEpoch, setSecretMatrixEpoch] = createSignal(0);
 
   // A 1s heartbeat so in-flight runs show a live, ticking elapsed time. Terminal
   // runs use their frozen `duration_ms` and ignore this.
@@ -241,11 +258,12 @@ export default function RepoView() {
     !!prFilter() ||
     !!pipelineFilter() ||
     !!envFilter() ||
-    deploysOnly();
+    deploysOnly() ||
+    scheduledOnly();
 
   const clearFilters = () =>
     setSearch(
-      { status: "", author: "", branch: "", pr: "", pipeline: "", env: "", deploy: "" },
+      { status: "", author: "", branch: "", pr: "", pipeline: "", env: "", deploy: "", scheduled: "" },
       { replace: true },
     );
 
@@ -270,6 +288,7 @@ export default function RepoView() {
       // the previous filter never shows under the new one.
       if (env && r.environment !== env) return false;
       if (deploysOnly() && !r.deploy) return false;
+      if (scheduledOnly() && !isScheduled(r.trigger_kind)) return false;
       return true;
     });
   };
@@ -280,6 +299,7 @@ export default function RepoView() {
       status: statusFilter(),
       author: authorFilter(),
       pipeline: pipelineFilter(),
+      scheduled: scheduledOnly(),
       runOnly: !!branchFilter() || !!prFilter() || !!envFilter() || deploysOnly(),
     });
 
@@ -292,14 +312,6 @@ export default function RepoView() {
           icon: "play",
           onClick: () => nav(`/${org()}/${repo()}/run`),
         };
-      case "environments":
-        return {
-          label: "Tighten for this project",
-          icon: "shield-check",
-          onClick: () => setEnvDialog(""),
-        };
-      case "secrets":
-        return { label: "New secret", icon: "plus", onClick: () => setSecretFocus((n) => n + 1) };
       default:
         return null;
     }
@@ -311,9 +323,24 @@ export default function RepoView() {
 
       <div class="page-head">
         <h1>
-          <span class="head-org">{org()}/</span>{repo()}
+          <A href={orgPageHref(org())} class="head-org" title={`${org()}: repositories and recent runs`}>
+            {org()}
+          </A>
+          <span class="head-org">/</span>
+          {repo()}
+          <Show when={unreachable()}>
+            <span class="repo-unreachable-tag" title={UNREACHABLE_NOTE}>
+              unreachable
+            </span>
+          </Show>
         </h1>
       </div>
+      <Show when={unreachable()}>
+        <p class="repo-unreachable-note">
+          <Icon icon="alert-triangle" size={13} /> {UNREACHABLE_NOTE}{" "}
+          <A href={orgPageHref(org())}>Organization page</A>
+        </p>
+      </Show>
       {/* Always rendered (fixed height) so the tab row never shifts between
           tabs with and without a CTA. */}
       <div class="page-toolbar">
@@ -342,20 +369,6 @@ export default function RepoView() {
 
       {/* ---- Runs ---- */}
       <Show when={tab() === "runs"}>
-        <Show when={(schedules() ?? []).length > 0}>
-          <div class="panel">
-            <div class="panel-h">
-              <span>Schedules</span>
-              <span class="tok-count">{schedules()!.length}</span>
-            </div>
-            <div class="sched-body">
-              <For each={schedules()}>
-                {(s) => <ScheduleRow org={org()} repo={repo()} s={s} />}
-              </For>
-            </div>
-          </div>
-        </Show>
-
         <div class="filters">
           <For each={["all", "running", "failed", "refused"] as const}>
             {(f) => (
@@ -374,6 +387,14 @@ export default function RepoView() {
             onClick={() => setDeploysOnly(!deploysOnly())}
           >
             <Icon icon="rocket" size={12} /> deploys
+          </button>
+
+          <button
+            class={`fpill ${scheduledOnly() ? "on" : ""}`}
+            title="only runs a schedule started: a pipeline's `on: cron:`"
+            onClick={() => setScheduledOnly(!scheduledOnly())}
+          >
+            <Icon icon="clock" size={12} /> scheduled
           </button>
 
           <Show when={pipelines().length > 0}>
@@ -448,7 +469,6 @@ export default function RepoView() {
             onClick={() => {
               refetch();
               refetchRefused();
-              refetchSchedules();
             }}
           >
             <Icon icon="rotate-cw" size={13} /> Refresh
@@ -609,6 +629,11 @@ export default function RepoView() {
         </Show>
       </Show>
 
+      {/* ---- Schedules ---- */}
+      <Show when={tab() === "schedules"}>
+        <RepoSchedules org={org()} repo={repo()} />
+      </Show>
+
       {/* ---- Environments ---- */}
       <Show when={tab() === "environments"}>
         <RepoEnvironments
@@ -622,33 +647,17 @@ export default function RepoView() {
 
       {/* ---- Secrets ---- */}
       <Show when={tab() === "secrets"}>
-        <ScopedSecrets
-          scope={{ org: org(), repo: repo() }}
-          title={`Secrets · ${org()}/${repo()}`}
-          showInherited
-          focusPing={secretFocus()}
-          epoch={secretListEpoch()}
-          onChange={() => setSecretMatrixEpoch((n) => n + 1)}
-        />
-        <SecretMatrixEditor
+        <SecretKeyList
           org={org()}
           repo={repo()}
-          epoch={secretMatrixEpoch()}
-          onChange={() => setSecretListEpoch((n) => n + 1)}
+          environment={secretEnv()}
+          onEnvironment={setSecretEnv}
         />
       </Show>
 
       {/* ---- Settings ---- */}
       <Show when={tab() === "settings"}>
-        <div class="panel">
-          <div class="panel-h"><span>Settings</span></div>
-          <div class="settings-body">
-            <div class="set-row"><span class="k">Default branch</span><span class="mono">main</span></div>
-            <div class="set-row"><span class="k">Triggers</span><span class="mono">push · pull_request · tag · manual</span></div>
-            <div class="set-row"><span class="k">Webhook</span><span class="subtle">connects with the forge integration</span></div>
-            <button class="btn btn-danger btn-sm" style={{ "margin-top": "8px" }}>Disable repository</button>
-          </div>
-        </div>
+        <RepoSettings org={org()} repo={repo()} project={project() ?? null} />
       </Show>
 
       <Show when={envDialog() !== undefined}>
@@ -666,10 +675,13 @@ export default function RepoView() {
 
 
 // ---- environments (org Environments as this project sees them) ----------
-// Each panel shows the org's BASELINE, this project's OVERLAY and the
-// EFFECTIVE rules — the last computed by the server, never merged here. The
-// project can only tighten (its overlay); the baseline, who may deploy and
-// any privileges are an org admin's, under Settings › Environments.
+// One table, a row per Environment: the rules a deploy from this project
+// meets (the server's `effective` block, never merged here), what this
+// project adds, and a link to its runs there. A row expands to set the org
+// baseline beside this project's overlay. The project can only tighten (its
+// overlay); the baseline, who may deploy and any privileges are an org
+// admin's, under Settings › Environments. Which rows are open lives in this
+// component only, not the URL.
 
 function RepoEnvironments(props: {
   org: string;
@@ -681,6 +693,13 @@ function RepoEnvironments(props: {
   // `epoch` is in the key so a save in EnvDialog re-fetches the list.
   const key = () => ({ org: props.org, repo: props.repo, epoch: props.epoch });
   const [envs] = createResource(key, ({ org, repo }) => listEnvironments(org, repo));
+  const [open, setOpen] = createSignal<ReadonlySet<string>>(new Set());
+  const toggle = (name: string) =>
+    setOpen((prev) => {
+      const next = new Set(prev);
+      if (!next.delete(name)) next.add(name);
+      return next;
+    });
 
   return (
     <Show when={!envs.loading} fallback={<p class="empty">loading…</p>}>
@@ -695,172 +714,208 @@ function RepoEnvironments(props: {
             </p>
           }
         >
-          <For each={envs()}>
-            {(env) => (
-              <EnvPanel
-                org={props.org}
-                repo={props.repo}
-                env={env}
-                onTighten={() => props.onTighten(env.name)}
-                onChanged={props.onChanged}
-              />
-            )}
-          </For>
+          <div class="panel envt-panel">
+            <div class="envt-scroll">
+              <table class="envt">
+                <thead>
+                  <tr>
+                    <th scope="col">Environment</th>
+                    <th scope="col">Approvers</th>
+                    <th scope="col">Refs</th>
+                    <th scope="col">Wait</th>
+                    <th scope="col">This repo</th>
+                    <th scope="col">Runs</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <For each={envs()}>
+                    {(env) => (
+                      <EnvRow
+                        org={props.org}
+                        repo={props.repo}
+                        env={env}
+                        expanded={open().has(env.name)}
+                        onToggle={() => toggle(env.name)}
+                        onTighten={() => props.onTighten(env.name)}
+                        onChanged={props.onChanged}
+                      />
+                    )}
+                  </For>
+                </tbody>
+              </table>
+            </div>
+          </div>
         </Show>
       </Show>
     </Show>
   );
 }
 
-// The history here is APPROVALS — what governance admitted into the
-// environment — not what went live.
-function EnvPanel(props: {
+// One Environment's row and, when expanded, its detail row under it.
+function EnvRow(props: {
   org: string;
   repo: string;
   env: ProjectEnvironment;
+  expanded: boolean;
+  onToggle: () => void;
   onTighten: () => void;
   onChanged: () => void;
 }) {
-  const key = () => ({ org: props.org, repo: props.repo, name: props.env.name });
-  const [history] = createResource(key, ({ org, repo, name }) =>
-    listApprovalHistory(org, repo, name).catch(() => []),
-  );
-  const [error, setError] = createSignal<string | null>(null);
   const [removing, setRemoving] = createSignal(false);
-  const effective = () => props.env.effective;
+  const detailId = () => `envt-detail-${props.env.name}`;
+  const wait = () => waitCell(props.env.effective);
+  const chip = () => repoChip(props.env);
+  const onKey = (e: KeyboardEvent) => {
+    // Only the row itself: Enter on the Runs link follows the link.
+    if (e.target !== e.currentTarget) return;
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      props.onToggle();
+    }
+  };
 
   return (
-    <div class="panel env-panel">
-      <div class="panel-h">
-        <span>
-          {shownName(props.env)}
-          <Show when={nameBeside(props.env)}>
-            {(name) => (
-              <span class="oenv-name mono" title="The name pipelines use">
-                {" "}
-                {name()}
+    <>
+      <tr
+        class="envt-row"
+        tabindex="0"
+        aria-expanded={props.expanded}
+        aria-controls={props.expanded ? detailId() : undefined}
+        onClick={props.onToggle}
+        onKeyDown={onKey}
+      >
+        <td>
+          <span class="envt-chev" aria-hidden="true">
+            <Icon icon={props.expanded ? "chevron-down" : "chevron-right"} size={14} />
+          </span>
+          {/* The name once; the name pipelines use is in the detail and the
+              tooltip. */}
+          <span
+            class="envt-name"
+            classList={{ "envt-mono": nameBeside(props.env) === null }}
+            title={nameBeside(props.env) ? `Pipelines name it ${props.env.name}` : undefined}
+          >
+            {shownName(props.env)}
+          </span>
+        </td>
+        <td>{approversCell(props.env)}</td>
+        <td class="envt-mono">{refsCell(props.env.effective.allowed_ref_layers)}</td>
+        <td title={wait().title}>{wait().text}</td>
+        <td>
+          <Show when={chip()} fallback={<span class="envt-quiet">—</span>}>
+            {(c) => (
+              <span class="envt-repo" classList={{ warn: c().warn }}>
+                <Show when={c().warn}>
+                  <Icon icon="alert-triangle" size={13} />
+                </Show>
+                {c().text}
               </span>
             )}
           </Show>
-        </span>
-        <span class="env-h-meta">
-          <Show when={!props.env.eligible}>
-            <span class="tok-role" title="An org admin withdrew this project's eligibility">
-              not eligible
-            </span>
-          </Show>
-          <Show when={(history() ?? []).length > 0}>
-            <span class="subtle mono">last approved {history()![0]!.git_ref}</span>
-          </Show>
-        </span>
-      </div>
-      <div class="env-body">
-        <div class="env-rules mono" title="What admission enforces for this project">
-          <Icon icon="shield-check" size={13} /> {effective().approvers.length} approver
-          {effective().approvers.length === 1 ? "" : "s"}
-          <Show when={effective().approvers.length > 0}>
-            {" "}({effective().approvers.join(", ")})
-          </Show>
-          <span class="dotsep">·</span> {refLayersLabel(effective().allowed_ref_layers)}
-          <Show when={effective().wait_timer_s > 0}>
-            <span class="dotsep">·</span>{" "}
-            <span
-              title={
-                effective().approvers.length > 0
-                  ? "A minimum wait on the approval gate, after the approvals are in"
-                  : "Does nothing: the timer needs approvers"
-              }
-            >
-              {effective().wait_timer_s}s wait
-              {effective().approvers.length > 0 ? "" : " (no approvers: does nothing)"}
-            </span>
-          </Show>
-          <Show when={effective().require_reason}>
-            <span class="dotsep">·</span> reason required
-          </Show>
-        </div>
-        <div class="env-layers">
-          <div class="env-h-row mono">
-            <span class="subtle">org baseline</span>{" "}
-            <Show
-              when={!isPermissive(props.env.baseline)}
-              fallback={<span class="subtle">permissive — no org-wide rule yet</span>}
-            >
-              {rulesSummary(props.env.baseline)}
-            </Show>
-          </div>
-          <div class="env-h-row mono">
-            <span class="subtle">{props.repo} overlay</span>{" "}
-            <Show when={props.env.overlay} fallback={<span class="subtle">none</span>}>
-              {(o) => rulesSummary(o())}
-            </Show>
-            <span class="oenv-actions">
-              <Show when={props.env.eligible || props.env.overlay}>
-                <button class="btn btn-ghost btn-sm" onClick={props.onTighten}>
-                  {props.env.overlay ? "edit" : "tighten"}
-                </button>
-              </Show>
-              <Show when={props.env.overlay}>
-                <button class="btn btn-ghost btn-sm" onClick={() => setRemoving(true)}>
-                  remove
-                </button>
-              </Show>
-            </span>
-          </div>
-          <Show when={props.env.privilege_grant}>
-            {(g) => (
-              <div class="env-h-row mono">
-                <span class="subtle">privileges</span> {g().privileged_images.length} image
-                {g().privileged_images.length === 1 ? "" : "s"}
-                <Show when={g().permit_k8s_overlay}> · raw k8s_overlay allowed</Show>
-              </div>
-            )}
-          </Show>
-        </div>
-        <Show when={error()}>
-          <p class="error">{error()}</p>
-        </Show>
-        <Show when={removing()}>
-          <ConfirmDestructive
-            eyebrow={`${props.org}/${props.repo} · environments`}
-            title={`Remove ${props.repo}'s overlay on ${props.env.name}?`}
-            purpose="Its deploys there fall back to the org baseline."
-            name={props.env.name}
-            confirmLabel="Remove overlay"
-            onConfirm={async () => {
-              setError(null);
-              await deleteEnvironmentOverlay(props.org, props.env.name, props.repo);
-              props.onChanged();
-            }}
-            onClose={() => setRemoving(false)}
+        </td>
+        <td>
+          <A
+            class="envt-link"
+            href={`/${props.org}/${props.repo}?env=${encodeURIComponent(props.env.name)}`}
+            aria-label={`Runs in ${shownName(props.env)}`}
+            onClick={(e) => e.stopPropagation()}
           >
-            <Show when={props.env.overlay}>
-              {(o) => (
-                <p class="dlg-ctx">
-                  <span class="k">overlay now</span> {rulesSummary(o())}
-                </p>
-              )}
+            View runs
+          </A>
+        </td>
+      </tr>
+      <Show when={props.expanded}>
+        <tr class="envt-detail" id={detailId()}>
+          <td colspan="6">
+            <p class="envt-sentence">
+              <For each={deploySentence(props.env)}>
+                {(s) => (s.mono ? <span class="envt-mono">{s.text}</span> : s.text)}
+              </For>
+            </p>
+            <Show when={nameBeside(props.env)}>
+              <p class="envt-pname">
+                Pipelines name it <span class="envt-mono">{props.env.name}</span>.
+              </p>
             </Show>
-          </ConfirmDestructive>
-        </Show>
-        <div class="env-history">
-          <div class="env-h-title mono">Approval history (legacy)</div>
-          <For
-            each={history() ?? []}
-            fallback={<div class="env-h-row mono subtle">no approvals recorded</div>}
-          >
-            {(h) => (
-              <div class="env-h-row mono">
-                <span class="subtle" title={absTime(h.at)}>{relTime(h.at)}</span> {h.git_ref}
-                <Show when={h.approved_by.length > 0}>
-                  <span class="ok-mark">✓</span> approved {h.approved_by.join(", ")}
+            <Show when={!props.env.eligible}>
+              <p class="envt-note">An org admin withdrew this repo. Its overlay stays until removed.</p>
+            </Show>
+            {/* Side by side, like a split diff: the org's rules on the left,
+                the rules in force here on the right; a rule this repo
+                changed is marked + and shaded. */}
+            <div class="envt-diff-scroll">
+              <table class="envt-diff">
+                <thead>
+                  <tr>
+                    <th scope="col">
+                      <span class="sr-only">Rule</span>
+                    </th>
+                    <th scope="col">Org</th>
+                    <th scope="col">In force here</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <For each={ruleDiff(props.env)}>
+                    {(r) => {
+                      const mono = (v: string) => r.mono && v !== "none" && v !== "Any";
+                      return (
+                        <tr classList={{ changed: r.changed }}>
+                          <th scope="row">{r.rule}</th>
+                          <td classList={{ "envt-mono": mono(r.org) }}>{r.org}</td>
+                          <td class="envt-diff-now">
+                            <span class="envt-diff-mark" aria-hidden="true">
+                              {r.changed ? "+" : ""}
+                            </span>
+                            <Show when={r.changed}>
+                              <span class="sr-only">changed by this repo: </span>
+                            </Show>
+                            <span classList={{ "envt-mono": mono(r.now) }}>{r.now}</span>
+                          </td>
+                        </tr>
+                      );
+                    }}
+                  </For>
+                </tbody>
+              </table>
+            </div>
+            <Show when={props.env.eligible || props.env.overlay}>
+              <div class="envt-actions">
+                <button class="btn btn-ghost envt-btn" type="button" onClick={props.onTighten}>
+                  {props.env.overlay ? "Edit this repo's rules" : "Add rules for this repo"}
+                </button>
+                <Show when={props.env.overlay}>
+                  <button class="btn btn-danger envt-btn" type="button" onClick={() => setRemoving(true)}>
+                    Remove
+                  </button>
                 </Show>
               </div>
+            </Show>
+          </td>
+        </tr>
+      </Show>
+      <Show when={removing()}>
+        <ConfirmDestructive
+          eyebrow={`${props.org}/${props.repo} · environments`}
+          title={`Remove ${props.repo}'s rules on ${props.env.name}?`}
+          purpose="Its deploys there fall back to the org baseline."
+          name={props.env.name}
+          confirmLabel="Remove rules"
+          onConfirm={async () => {
+            await deleteEnvironmentOverlay(props.org, props.env.name, props.repo);
+            props.onChanged();
+          }}
+          onClose={() => setRemoving(false)}
+        >
+          <Show when={props.env.overlay}>
+            {(o) => (
+              <p class="dlg-ctx">
+                <span class="k">This repo adds</span> {rulesSummary(o())}
+              </p>
             )}
-          </For>
-        </div>
-      </div>
-    </div>
+          </Show>
+        </ConfirmDestructive>
+      </Show>
+    </>
   );
 }
 
@@ -992,7 +1047,7 @@ function EnvDialog(props: {
           <Show when={pickedEnv()}>
             {(env) => (
               <p class="dlg-ctx">
-                <span class="k">org baseline</span>{" "}
+                <span class="k">Org baseline</span>{" "}
                 {isPermissive(env().baseline) ? "no rule yet" : rulesSummary(env().baseline)}
               </p>
             )}
@@ -1038,54 +1093,110 @@ function EnvDialog(props: {
   );
 }
 
-/** One `on: cron:` schedule: its pipeline, the expression (UTC), the next
- *  slot, and how the Pipeline's last slot came out, linked to its Run. */
+// ---- schedules (the Project's `on: cron:` triggers) -----------------------
+// One table, a row per schedule: the pipeline, its expression (UTC, as read
+// from the default branch), the next slot, how the last slot came out, and a
+// link to the Runs tab showing that pipeline's scheduled Runs.
+
+function RepoSchedules(props: { org: string; repo: string }) {
+  // An older server has no schedules endpoint; it reads as none.
+  const [schedules] = createResource(
+    () => ({ org: props.org, repo: props.repo }),
+    (k) => listSchedules(k.org, k.repo).catch(() => [] as Schedule[]),
+  );
+  const rows = () => schedules() ?? [];
+  return (
+    <Show when={!schedules.loading} fallback={<p class="empty">loading…</p>}>
+      <Show
+        when={rows().length > 0}
+        fallback={
+          <p class="empty">
+            No schedules. Add <span class="mono">on: cron:</span> to a pipeline on the default
+            branch and its schedule shows here.
+          </p>
+        }
+      >
+        <div class="panel">
+          <div class="panel-h">
+            <span>
+              Schedules <span class="tok-count">{rows().length}</span>
+            </span>
+          </div>
+          <div class="secrets-body">
+            <div class="table-scroll">
+              <table class="table lib-table sched-table" aria-label="Schedules">
+                <thead>
+                  <tr>
+                    <th>Pipeline</th>
+                    <th>Schedule</th>
+                    <th>Next</th>
+                    <th>Last run</th>
+                    <th>Outcome</th>
+                    <th />
+                  </tr>
+                </thead>
+                <tbody>
+                  <For each={rows()}>
+                    {(s) => <ScheduleRow org={props.org} repo={props.repo} s={s} />}
+                  </For>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </Show>
+    </Show>
+  );
+}
+
+/** One `on: cron:` schedule as a table row. */
 function ScheduleRow(props: { org: string; repo: string; s: Schedule }) {
   const s = () => props.s;
   return (
-    <div class="rr-facts">
-      <span class="pfact strong" title={s().pipeline}>
-        <Icon icon="workflow" size={12} />
+    <tr>
+      <td title={s().pipeline}>
         <span class="mono">{pipelineShortName(s().pipeline)}</span>
-      </span>
-      <span class="pfact" title={`read from ${s().source_sha.slice(0, 7)} on the default branch`}>
-        <Icon icon="clock" size={12} />
-        <span class="mono">{s().schedule}</span>
-        <span>UTC</span>
-      </span>
-      <span class="pfact" title={absTime(s().next_fire_at)}>
-        <Icon icon="timer" size={12} />
-        <span>next {untilTime(s().next_fire_at)}</span>
-      </span>
-      <Show
-        when={s().last_fire}
-        fallback={<span class="pfact subtle">not fired yet</span>}
-      >
-        {(f) => {
-          const o = () => fireOutcome(f().outcome);
-          return (
-            <>
-              <span class="pfact" title={absTime(f().slot_at)}>
-                <Icon icon="history" size={12} />
-                <span>last {relTime(f().slot_at)}</span>
-                <Show when={f().schedule !== s().schedule}>
-                  <span class="mono" title="the schedule that fired">({f().schedule})</span>
-                </Show>
+      </td>
+      <td class="nowrap" title={`read from ${s().source_sha.slice(0, 7)} on the default branch`}>
+        <span class="mono">{s().schedule}</span> UTC
+      </td>
+      <td class="nowrap" title={absTime(s().next_fire_at)}>
+        {untilTime(s().next_fire_at)}
+      </td>
+      <Show when={s().last_fire} fallback={<td class="subtle">not fired yet</td>}>
+        {(f) => (
+          <td class="nowrap" title={absTime(f().slot_at)}>
+            <Show when={f().run_id} fallback={relTime(f().slot_at)}>
+              {(id) => (
+                <A class="oenv-link" href={`/${props.org}/${props.repo}/runs/${id()}`}>
+                  {relTime(f().slot_at)}
+                </A>
+              )}
+            </Show>
+            <Show when={f().schedule !== s().schedule}>
+              {" "}
+              <span class="mono" title="the schedule that fired">
+                {f().schedule}
               </span>
-              <span class={`rr-status ${o().tone}`}>{o().label}</span>
-              <Show when={f().run_id}>
-                {(id) => (
-                  <A class="pfact link" href={`/${props.org}/${props.repo}/runs/${id()}`}>
-                    <Icon icon="play" size={12} />
-                    <span>open the run</span>
-                  </A>
-                )}
-              </Show>
-            </>
-          );
-        }}
+            </Show>
+          </td>
+        )}
       </Show>
-    </div>
+      <td class="nowrap">
+        <Show when={s().last_fire}>
+          {(f) => <span class={`rr-status ${fireOutcome(f().outcome).tone}`}>{fireOutcome(f().outcome).label}</span>}
+        </Show>
+      </td>
+      <td class="acts keep">
+        <A
+          class="btn btn-ghost btn-sm"
+          href={scheduledRunsHref(props.org, props.repo, s().pipeline)}
+          title={`the scheduled runs of ${pipelineShortName(s().pipeline)}`}
+        >
+          Runs
+        </A>
+      </td>
+    </tr>
   );
 }
 
@@ -1153,14 +1264,14 @@ function RefusedRow(props: { r: RefusedRun }) {
           <Show when={sum().fix}>
             {(fix) => (
               <div class="rf-fix">
-                <span class="lbl">fix</span>
+                <span class="lbl">Fix</span>
                 <span>{fix()}</span>
               </div>
             )}
           </Show>
           <Show when={r().reason_kind === "yanked"}>
             <div class="rf-fix">
-              <span class="lbl">fix</span>
+              <span class="lbl">Fix</span>
               <span>an org admin upgrades the installation, then push again</span>
             </div>
           </Show>

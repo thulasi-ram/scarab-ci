@@ -1,24 +1,19 @@
 //! ADR-0076 §4-§6 through the real router: fetch, install, upgrade with a
-//! diff, remove, yank, first-party defaults. The store, Db and forge are the
-//! in-memory ones; the one external faked is the forge's HTTP (an
-//! `AnonymousFetcher` that answers from a map and records every URL asked).
+//! diff, remove, yank, trusted sources. Scarab's own clone library is
+//! installed like any other, and a new org has no libraries. The store, Db
+//! and forge are the in-memory ones; the one external faked is the forge's
+//! HTTP (`StaticFetcher`: answers from a map and records every URL asked).
 
-use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
 use scarab_forge::{ForgeConnection, ForgeConnectionStore, ForgeKind};
-use scarab_policy::library::{content_hash, DefaultsState, LibraryStore};
-use scarab_server::libraries::{
-    install_org_defaults, offer_defaults_on_bind, DefaultsFrom, LibraryManifest, ManifestLibrary,
-    ManifestSource, ManifestVersion,
-};
-use scarab_server::library_fetch::{AnonymousFetcher, FetchError};
+use scarab_policy::library::{content_hash, LibraryStore};
+use scarab_server::test_support::{StaticFetcher, CLONE_LIBRARY, CLONE_LIBRARY_SOURCE};
 use scarab_server::{router, AppState, LogService};
 use scarab_testkit::{FakeClock, FakeForge, InMemoryDb, InMemoryLibraries, InMemoryObjectStore};
 
@@ -28,67 +23,32 @@ const C2: &str = "2222222222222222222222222222222222222222";
 const V1: &str = "kind: library\nsteps:\n  - id: helm\n    image: alpine/helm@sha256:aaaa\n";
 const V2: &str = "kind: library\nsteps:\n  - id: helm\n    image: alpine/helm@sha256:bbbb\n";
 
-/// The forge's HTTP: URL → body. A missing URL is a failed fetch.
-#[derive(Default)]
-struct FakeHttp {
-    files: Mutex<BTreeMap<String, String>>,
-    asked: Mutex<Vec<String>>,
-}
-
-impl FakeHttp {
-    fn serve(&self, url: &str, body: &str) {
-        self.files
-            .lock()
-            .unwrap()
-            .insert(url.to_string(), body.to_string());
-    }
-    fn asked(&self) -> Vec<String> {
-        self.asked.lock().unwrap().clone()
-    }
-}
-
-#[async_trait]
-impl AnonymousFetcher for FakeHttp {
-    async fn get(&self, url: &str) -> Result<Vec<u8>, FetchError> {
-        self.asked.lock().unwrap().push(url.to_string());
-        self.files
-            .lock()
-            .unwrap()
-            .get(url)
-            .map(|b| b.clone().into_bytes())
-            .ok_or_else(|| FetchError::Failed(format!("fetching {url}: connection refused")))
-    }
-}
-
 fn raw(owner: &str, repo: &str, commit: &str, path: &str) -> String {
     format!("https://raw.githubusercontent.com/{owner}/{repo}/{commit}/{path}")
 }
 
 struct H {
     app: axum::Router,
-    st: AppState,
-    http: Arc<FakeHttp>,
+    http: Arc<StaticFetcher>,
     db: Arc<InMemoryDb>,
     store: Arc<InMemoryLibraries>,
 }
 
-fn harness_with(manifest: ManifestSource, forge: FakeForge, store: InMemoryLibraries) -> H {
+fn harness_with(forge: FakeForge, store: InMemoryLibraries) -> H {
     let db = Arc::new(InMemoryDb::new());
     let logs = Arc::new(LogService::new(
         Arc::new(InMemoryObjectStore::new()),
         db.clone(),
     ));
-    let http = Arc::new(FakeHttp::default());
+    let http = Arc::new(StaticFetcher::new());
     let store = Arc::new(store);
     let st = AppState::new(db.clone(), Arc::new(FakeClock::new(1_000)), logs)
         .with_forge(Arc::new(forge))
         .with_forge_connections(db.clone())
         .with_libraries(store.clone())
-        .with_library_fetcher(http.clone())
-        .with_first_party(manifest);
+        .with_library_fetcher(http.clone());
     H {
-        app: router(st.clone()),
-        st,
+        app: router(st),
         http,
         db,
         store,
@@ -96,11 +56,7 @@ fn harness_with(manifest: ManifestSource, forge: FakeForge, store: InMemoryLibra
 }
 
 fn harness() -> H {
-    harness_with(
-        ManifestSource::Off,
-        FakeForge::new(),
-        InMemoryLibraries::new(),
-    )
+    harness_with(FakeForge::new(), InMemoryLibraries::new())
 }
 
 async fn call(
@@ -134,8 +90,10 @@ async fn fetch(h: &H, body: Value) -> (StatusCode, Value) {
 #[tokio::test]
 async fn install_then_upgrade_shows_the_diff_and_checks_what_it_replaces() {
     let h = harness();
-    h.http.serve(&raw("acme", "libs", C1, "deploy.yaml"), V1);
-    h.http.serve(&raw("acme", "libs", C2, "deploy.yaml"), V2);
+    h.http
+        .serve_url(&raw("acme", "libs", C1, "deploy.yaml"), V1);
+    h.http
+        .serve_url(&raw("acme", "libs", C2, "deploy.yaml"), V2);
 
     let (st, v1) = fetch(
         &h,
@@ -222,7 +180,8 @@ async fn install_then_upgrade_shows_the_diff_and_checks_what_it_replaces() {
 #[tokio::test]
 async fn fetches_keep_a_bounded_number_of_versions_never_installed() {
     let h = harness();
-    h.http.serve(&raw("acme", "libs", C1, "deploy.yaml"), V1);
+    h.http
+        .serve_url(&raw("acme", "libs", C1, "deploy.yaml"), V1);
     fetch(
         &h,
         json!({ "source": format!("github.com/acme/libs//deploy.yaml@{C1}") }),
@@ -244,7 +203,7 @@ async fn fetches_keep_a_bounded_number_of_versions_never_installed() {
         let content =
             format!("kind: library\nsteps:\n  - id: s{n}\n    image: alpine@sha256:aaaa\n");
         h.http
-            .serve(&raw("acme", "libs", &commit, "deploy.yaml"), &content);
+            .serve_url(&raw("acme", "libs", &commit, "deploy.yaml"), &content);
         let (st, b) = fetch(
             &h,
             json!({ "source": format!("github.com/acme/libs//deploy.yaml@{commit}") }),
@@ -281,7 +240,8 @@ async fn fetches_keep_a_bounded_number_of_versions_never_installed() {
 #[tokio::test]
 async fn a_publisher_can_be_chosen_at_install() {
     let h = harness();
-    h.http.serve(&raw("acme", "libs", C1, "deploy.yaml"), V1);
+    h.http
+        .serve_url(&raw("acme", "libs", C1, "deploy.yaml"), V1);
     let (st, b) = fetch(
         &h,
         json!({
@@ -337,7 +297,8 @@ async fn an_anonymous_fetch_never_reaches_an_unknown_host() {
 async fn a_file_that_invokes_a_repository_file_is_refused() {
     let h = harness();
     let open = "kind: library\nsteps:\n  - { id: x, invoke: file:.scarab/lib/x.yaml }\n";
-    h.http.serve(&raw("acme", "libs", C1, "open.yaml"), open);
+    h.http
+        .serve_url(&raw("acme", "libs", C1, "open.yaml"), open);
     let (st, b) = fetch(
         &h,
         json!({ "source": format!("github.com/acme/libs//open.yaml@{C1}") }),
@@ -376,7 +337,6 @@ async fn github_connection(db: &InMemoryDb, id: &str, org: Option<&str>) {
 #[tokio::test]
 async fn the_orgs_own_connection_reads_only_the_orgs_repositories() {
     let h = harness_with(
-        ManifestSource::Off,
         FakeForge::new().with_file("deploy.yaml", V1),
         InMemoryLibraries::new(),
     );
@@ -417,7 +377,6 @@ async fn the_orgs_own_connection_reads_only_the_orgs_repositories() {
 #[tokio::test]
 async fn a_private_source_must_belong_to_the_org() {
     let h = harness_with(
-        ManifestSource::Off,
         FakeForge::new().with_file("deploy.yaml", V1),
         InMemoryLibraries::new(),
     );
@@ -479,7 +438,8 @@ async fn a_private_source_must_belong_to_the_org() {
 #[tokio::test]
 async fn yank_needs_a_reason_and_unyank_lifts_it() {
     let h = harness();
-    h.http.serve(&raw("acme", "libs", C1, "deploy.yaml"), V1);
+    h.http
+        .serve_url(&raw("acme", "libs", C1, "deploy.yaml"), V1);
     fetch(
         &h,
         json!({ "source": format!("github.com/acme/libs//deploy.yaml@{C1}") }),
@@ -503,9 +463,19 @@ async fn yank_needs_a_reason_and_unyank_lifts_it() {
     assert_eq!(st, StatusCode::OK, "{b}");
     let (_, list) = call(&h.app, "GET", "/v1/orgs/acme/libraries", None).await;
     assert_eq!(list["yanks"][0]["reason"], "CVE-2026-0001");
+    // A yank names the library and the pinned source of its version, read
+    // from the version row: the version is not installed, so nothing else
+    // in the list could say which library it belongs to.
+    let source = format!("github.com/acme/libs//deploy.yaml@{C1}");
+    for y in [&b, &list["yanks"][0]] {
+        assert_eq!(y["publisher"], "acme", "{y}");
+        assert_eq!(y["name"], "deploy", "{y}");
+        assert_eq!(y["source"], source, "{y}");
+    }
     let uri = format!("/v1/orgs/acme/library-yanks/{}", content_hash(V1));
-    let (st, _) = call(&h.app, "DELETE", &uri, None).await;
+    let (st, lifted) = call(&h.app, "DELETE", &uri, None).await;
     assert_eq!(st, StatusCode::OK);
+    assert_eq!(lifted["source"], source, "{lifted}");
     let (st, _) = call(&h.app, "DELETE", &uri, None).await;
     assert_eq!(st, StatusCode::NOT_FOUND);
 }
@@ -546,236 +516,16 @@ async fn a_source_is_trusted_without_its_commit_and_untrusted() {
 }
 
 // ---------------------------------------------------------------------------
-// First-party
+// Scarab's clone library: no special treatment
 // ---------------------------------------------------------------------------
 
-const CLONE_V1: &str = "kind: library\nsteps:\n  - id: git\n    image: scarab-clone@sha256:1111\n";
-const CLONE_V2: &str = "kind: library\nsteps:\n  - id: git\n    image: scarab-clone@sha256:2222\n";
-
-fn release_manifest() -> LibraryManifest {
-    let v = |content: &str, commit: &str, release: &str, security_fix: bool| ManifestVersion {
-        content_hash: content_hash(content),
-        source: format!("github.com/thulasi-ram/scarab-ci//libs/clone.yaml@{commit}"),
-        release: release.into(),
-        security_fix,
-    };
-    LibraryManifest {
-        schema: 1,
-        release: "v0.4.0".into(),
-        libraries: vec![ManifestLibrary {
-            publisher: "thulasi-ram".into(),
-            name: "clone".into(),
-            versions: vec![
-                v(CLONE_V1, C1, "v0.3.0", false),
-                v(CLONE_V2, C2, "v0.4.0", true),
-            ],
-        }],
-    }
-}
-
-/// A new org gets the defaults; an unreachable source does not fail the
-/// bind, and the admin sees what is missing and can upload a copy.
+/// Through the real bind route: the first repository of an org binds and
+/// the org has no libraries, no trusted sources, and no fetch was made on
+/// its behalf.
 #[tokio::test]
-async fn a_new_org_gets_the_defaults_and_an_unreachable_source_is_recorded() {
-    let h = harness_with(
-        ManifestSource::Fixed(release_manifest()),
-        FakeForge::new(),
-        InMemoryLibraries::new(),
-    );
-    // Nothing is served: the release source cannot be reached.
-    let Ok(d) =
-        install_org_defaults(&h.st, "acme", "scarab:defaults", DefaultsFrom::default()).await
-    else {
-        panic!("installing the defaults failed outright");
-    };
-    assert_eq!(d.state, DefaultsState::Missing);
-    assert_eq!(d.missing.len(), 1);
-    assert_eq!(d.missing[0].name, "clone");
-    assert!(d.missing[0].error.contains("connection refused"), "{d:?}");
-
-    // An uploaded copy with other content is refused by hash.
-    let (st, b) = call(
-        &h.app,
-        "POST",
-        "/v1/orgs/acme/library-defaults/retry",
-        Some(json!({ "files": { "thulasi-ram/clone": CLONE_V1 } })),
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK, "{b}");
-    assert_eq!(b["state"], "missing");
-    assert!(b["missing"][0]["error"]
-        .as_str()
-        .unwrap()
-        .contains("the release manifest lists"));
-
-    // The release's copy installs, as first-party.
-    let (st, b) = call(
-        &h.app,
-        "POST",
-        "/v1/orgs/acme/library-defaults/retry",
-        Some(json!({ "files": { "thulasi-ram/clone": CLONE_V2 } })),
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK, "{b}");
-    assert_eq!(b["state"], "installed");
-    let i = h
-        .store
-        .installation("acme", "thulasi-ram", "clone")
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(i.first_party);
-    assert_eq!(i.content_hash, content_hash(CLONE_V2));
-}
-
-#[tokio::test]
-async fn a_mirror_is_read_at_the_release_path_and_commit() {
-    let h = harness_with(
-        ManifestSource::Fixed(release_manifest()),
-        FakeForge::new(),
-        InMemoryLibraries::new(),
-    );
-    h.http.serve(
-        &raw("mirrors", "scarab-ci", C2, "libs/clone.yaml"),
-        CLONE_V2,
-    );
-    let (st, b) = call(
-        &h.app,
-        "POST",
-        "/v1/orgs/acme/library-defaults/retry",
-        Some(json!({ "mirror": "github.com/mirrors/scarab-ci" })),
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK, "{b}");
-    assert_eq!(b["state"], "installed");
-    assert_eq!(b["mirror"], "github.com/mirrors/scarab-ci");
-    let i = h
-        .store
-        .installation("acme", "thulasi-ram", "clone")
-        .await
-        .unwrap()
-        .unwrap();
-    // The name comes from the manifest, not the mirror.
-    assert_eq!(
-        i.source,
-        format!("github.com/mirrors/scarab-ci//libs/clone.yaml@{C2}")
-    );
-}
-
-/// Binding the first repo of an org claims it and installs the defaults;
-/// an org that had repos before libraries is only offered them.
-#[tokio::test]
-async fn only_a_new_org_gets_defaults_on_bind() {
-    let h = harness_with(
-        ManifestSource::Fixed(release_manifest()),
-        FakeForge::new(),
-        InMemoryLibraries::new().with_offered_org("old"),
-    );
-    h.http.serve(
-        &raw("thulasi-ram", "scarab-ci", C2, "libs/clone.yaml"),
-        CLONE_V2,
-    );
-    offer_defaults_on_bind(&h.st, "old").await;
-    offer_defaults_on_bind(&h.st, "acme").await;
-    // The install runs in the background.
-    let mut state = None;
-    for _ in 0..200 {
-        state = h.store.defaults("acme").await.unwrap().map(|d| d.state);
-        if state != Some(DefaultsState::Pending) {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    assert_eq!(state, Some(DefaultsState::Installed));
-    assert!(h
-        .store
-        .installation("acme", "thulasi-ram", "clone")
-        .await
-        .unwrap()
-        .is_some());
-    assert_eq!(
-        h.store.defaults("old").await.unwrap().unwrap().state,
-        DefaultsState::Offered
-    );
-    assert!(h.store.installations("old").await.unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn an_older_first_party_version_shows_an_update_marked_as_a_security_fix() {
-    let h = harness_with(
-        ManifestSource::Fixed(release_manifest()),
-        FakeForge::new(),
-        InMemoryLibraries::new(),
-    );
-    h.http.serve(
-        &raw("thulasi-ram", "scarab-ci", C1, "libs/clone.yaml"),
-        CLONE_V1,
-    );
-    let (st, b) = fetch(
-        &h,
-        json!({ "source": format!("github.com/thulasi-ram/scarab-ci//libs/clone.yaml@{C1}") }),
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK, "{b}");
-    assert_eq!(b["first_party"], true);
-    call(
-        &h.app,
-        "PUT",
-        "/v1/orgs/acme/libraries/thulasi-ram/clone",
-        Some(json!({ "content_hash": content_hash(CLONE_V1) })),
-    )
-    .await;
-    let (_, list) = call(&h.app, "GET", "/v1/orgs/acme/libraries", None).await;
-    let i = &list["installations"][0];
-    assert_eq!(i["first_party"], true);
-    assert_eq!(i["update"]["content_hash"], content_hash(CLONE_V2));
-    assert_eq!(i["update"]["security_fix"], true);
-    assert_eq!(list["first_party"][0]["installed"], true);
-}
-
-/// First-party content is stored under the manifest's name for it: a
-/// mirror path does not rename it, and a request for another name is
-/// refused (trust in the clone library is keyed by that name).
-#[tokio::test]
-async fn first_party_content_is_stored_under_the_manifest_name() {
-    let h = harness_with(
-        ManifestSource::Fixed(release_manifest()),
-        FakeForge::new(),
-        InMemoryLibraries::new(),
-    );
-    h.http
-        .serve(&raw("mirrors", "copies", C1, "x/checkout.yaml"), CLONE_V1);
-    let source = format!("github.com/mirrors/copies//x/checkout.yaml@{C1}");
-    let (st, b) = fetch(&h, json!({ "source": source, "name": "deploy" })).await;
-    assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
-    assert!(b.to_string().contains("thulasi-ram/clone"), "{b}");
-    let (st, b) = fetch(&h, json!({ "source": source })).await;
-    assert_eq!(st, StatusCode::OK, "{b}");
-    assert_eq!(
-        (b["publisher"].as_str(), b["name"].as_str()),
-        (Some("thulasi-ram"), Some("clone"))
-    );
-    let v = h
-        .store
-        .version("acme", &content_hash(CLONE_V1))
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(scarab_policy::library::is_first_party_clone(&v), "{v:?}");
-}
-
-/// Through the real bind route: the first repo of an org binds whether or
-/// not the release source can be reached, and the org records what is
-/// missing.
-#[tokio::test]
-async fn a_bind_succeeds_when_the_defaults_cannot_be_fetched() {
-    let h = harness_with(
-        ManifestSource::Fixed(release_manifest()),
-        FakeForge::new(),
-        InMemoryLibraries::new(),
-    );
+async fn a_new_org_has_no_libraries_after_its_first_bind() {
+    let h = harness();
     github_connection(&h.db, "gh", Some("acme")).await;
-    // Nothing is served: every fetch fails.
     let (st, b) = call(
         &h.app,
         "POST",
@@ -784,23 +534,108 @@ async fn a_bind_succeeds_when_the_defaults_cannot_be_fetched() {
     )
     .await;
     assert!(st.is_success(), "{st} {b}");
-    let mut d = None;
-    for _ in 0..200 {
-        d = h.store.defaults("acme").await.unwrap();
-        if d.as_ref()
-            .is_some_and(|d| d.state != DefaultsState::Pending)
-        {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    let d = d.expect("the bind claimed the org");
-    assert_eq!(d.state, DefaultsState::Missing);
-    assert_eq!(d.missing[0].name, "clone");
+    let (st, list) = call(&h.app, "GET", "/v1/orgs/acme/libraries", None).await;
+    assert_eq!(st, StatusCode::OK, "{list}");
+    assert_eq!(list["installations"], json!([]), "{list}");
+    assert_eq!(list["trusted_sources"], json!([]), "{list}");
+    assert!(h.store.installations("acme").await.unwrap().is_empty());
+    assert!(h.http.asked().is_empty(), "{:?}", h.http.asked());
+}
+
+/// The clone library is fetched, installed and listed as any other
+/// library: nothing in the answers marks it, and no source is trusted until
+/// an org admin trusts one.
+#[tokio::test]
+async fn the_clone_library_installs_like_any_other_and_its_source_is_not_trusted() {
+    let h = harness();
+    h.http.serve(CLONE_LIBRARY_SOURCE, CLONE_LIBRARY);
+    let (st, b) = fetch(&h, json!({ "source": CLONE_LIBRARY_SOURCE })).await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(
+        (b["publisher"].as_str(), b["name"].as_str()),
+        (Some("thulasi-ram"), Some("clone"))
+    );
+    assert!(b.get("first_party").is_none(), "{b}");
+    let (st, i) = call(
+        &h.app,
+        "PUT",
+        "/v1/orgs/acme/libraries/thulasi-ram/clone",
+        Some(json!({ "content_hash": content_hash(CLONE_LIBRARY) })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{i}");
+    assert!(
+        i.get("first_party").is_none() && i.get("update").is_none(),
+        "{i}"
+    );
     let (_, list) = call(&h.app, "GET", "/v1/orgs/acme/libraries", None).await;
-    assert_eq!(list["defaults"]["state"], "missing");
-    assert!(h
-        .http
-        .asked()
-        .contains(&raw("thulasi-ram", "scarab-ci", C2, "libs/clone.yaml")));
+    assert_eq!(list["installations"][0]["source"], CLONE_LIBRARY_SOURCE);
+    assert_eq!(list["trusted_sources"], json!([]), "{list}");
+    assert!(list.get("defaults").is_none(), "{list}");
+
+    let (st, t) = call(
+        &h.app,
+        "POST",
+        "/v1/orgs/acme/library-trust",
+        Some(json!({ "source": CLONE_LIBRARY_SOURCE })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{t}");
+    let (_, list) = call(&h.app, "GET", "/v1/orgs/acme/libraries", None).await;
+    assert_eq!(
+        list["trusted_sources"][0]["source"],
+        "github.com/thulasi-ram/scarab-ci//libs/clone.yaml"
+    );
+}
+
+/// A fetch stores what it reads under the name the request gives, or the
+/// source's owner and file name: the clone library's content read from a
+/// mirror is not renamed to `thulasi-ram/clone`, and can be stored under
+/// any name.
+#[tokio::test]
+async fn the_clone_librarys_content_is_stored_under_the_name_the_fetch_gives() {
+    let h = harness();
+    h.http.serve_url(
+        &raw("mirrors", "copies", C1, "x/checkout.yaml"),
+        CLONE_LIBRARY,
+    );
+    let source = format!("github.com/mirrors/copies//x/checkout.yaml@{C1}");
+    let (st, b) = fetch(&h, json!({ "source": source })).await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(
+        (b["publisher"].as_str(), b["name"].as_str()),
+        (Some("mirrors"), Some("checkout"))
+    );
+    let (st, b) = fetch(&h, json!({ "source": source, "name": "deploy" })).await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(b["name"], "deploy");
+    let v = h
+        .store
+        .version("acme", &content_hash(CLONE_LIBRARY))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(v.source, source);
+    assert_eq!(
+        (v.publisher.as_str(), v.name.as_str()),
+        ("mirrors", "checkout")
+    );
+}
+
+/// The endpoint that retried the removed defaults install is gone.
+#[tokio::test]
+async fn there_is_no_defaults_retry_endpoint() {
+    let h = harness();
+    let (st, b) = call(
+        &h.app,
+        "POST",
+        "/v1/orgs/acme/library-defaults/retry",
+        Some(json!({})),
+    )
+    .await;
+    assert!(
+        st == StatusCode::NOT_FOUND || st == StatusCode::METHOD_NOT_ALLOWED,
+        "{st} {b}"
+    );
+    assert!(h.http.asked().is_empty());
 }

@@ -94,6 +94,7 @@ async fn app(
         "root-code",
         Principal {
             subject: "root".into(),
+            handle: String::new(),
             display_name: None,
             roles: vec![Role::Owner],
         },
@@ -153,6 +154,27 @@ async fn list(app: &axum::Router, token: &str) -> serde_json::Value {
     .unwrap()
 }
 
+/// `GET /v1/repos`: the Projects, each with the connection it is bound through.
+async fn repos(app: &axum::Router, token: &str) -> serde_json::Value {
+    let res = app
+        .clone()
+        .oneshot(
+            Request::get("/v1/repos")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    serde_json::from_slice(
+        &axum::body::to_bytes(res.into_body(), 256 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap()
+}
+
 /// The ticket's acceptance criterion, end to end.
 #[tokio::test]
 async fn a_config_declared_forgejo_connection_is_provisioned_healthy_and_read_only() {
@@ -196,9 +218,13 @@ async fn a_config_declared_forgejo_connection_is_provisioned_healthy_and_read_on
     assert!(!body.to_string().contains("tok-from-env"), "{body}");
     // No mutating affordance is offered.
     assert_eq!(c["supports_resync"], false);
-    // The declared repo shows up as the Project it created.
-    assert_eq!(c["projects"][0]["org"], "acme");
-    assert_eq!(c["projects"][0]["project"], "widgets");
+    // The declared repo shows up as the Project it created, bound through
+    // this connection.
+    assert_eq!(c["enabled_repos"], 1);
+    let projects = repos(&app, &token).await;
+    assert_eq!(projects[0]["org"], "acme");
+    assert_eq!(projects[0]["project"], "widgets");
+    assert_eq!(projects[0]["connection_id"], "forgejo-main");
 
     // …and the one mutating endpoint that exists refuses it outright, rather
     // than writing a binding whose home is the config.
@@ -303,7 +329,8 @@ async fn every_mutating_endpoint_refuses_a_config_owned_connection() {
 
     // The declared binding survived every attempt above.
     let body = list(&app, &token).await;
-    assert_eq!(body[0]["projects"][0]["project"], "widgets");
+    assert_eq!(body[0]["enabled_repos"], 1);
+    assert_eq!(repos(&app, &token).await[0]["project"], "widgets");
 
     // And a READ of the pick-list is still allowed.
     let res = app

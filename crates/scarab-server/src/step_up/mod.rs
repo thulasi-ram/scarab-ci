@@ -1407,18 +1407,25 @@ mod tests {
             email_verified: false,
             display_name: None,
         };
-        // A Principal id may itself hold an `@`: it names the Principal.
-        ids.sign_in(&ident("gh", "1", "bob@home"), "bob@home", 0)
+        // A handle may itself hold an `@`: it names the Principal.
+        let bob = ids
+            .sign_in(
+                &ident("gh", "1", "bob@home"),
+                "bob@home",
+                scarab_identity::Placeholder::Never,
+                0,
+            )
             .await
             .unwrap();
         let entries: Vec<String> = ["bob@home", "boss@acme.test", "gh:x@y.z", "nobody-yet"]
             .map(String::from)
             .to_vec();
         let got = resolve_owner_entries(Some(&ids), &entries).await;
-        assert_eq!(
-            got.principals.into_iter().collect::<Vec<_>>(),
-            vec!["bob@home".to_string(), "nobody-yet".to_string()]
-        );
+        // The handle resolves to the Principal's id; an entry nobody holds
+        // is kept as typed.
+        let mut want = vec![bob.id, "nobody-yet".to_string()];
+        want.sort();
+        assert_eq!(got.principals.into_iter().collect::<Vec<_>>(), want);
         assert_eq!(got.email_matchers, vec!["boss@acme.test", "gh:x@y.z"]);
         // With no identity store, only the shape decides.
         let got = resolve_owner_entries(None, &entries).await;

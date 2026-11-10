@@ -1,5 +1,7 @@
-# The first-party clone library (ADR-0076 §9): check out the Run's repository
-# at the commit the Run is pinned to.
+# Scarab's clone library (ADR-0076 §9): check out the Run's repository at the
+# commit the Run is pinned to. An org admin installs it like any library, from
+# github.com/thulasi-ram/scarab-ci//libs/clone.yaml at a release commit, and
+# trusts that source before it receives a long-lived forge token.
 #
 #   - id: checkout
 #     invoke: lib:thulasi-ram/clone

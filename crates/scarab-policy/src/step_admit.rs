@@ -62,8 +62,12 @@ policy_struct! {
         pub gate: String,
         /// Absent while the gate has not released.
         pub released_at: Option<Timestamp>,
-        /// The approver set the gate's approvals met, when recorded.
+        /// The handles of the approver set the gate's approvals met, when
+        /// recorded.
         pub approvers: Capped<String, MAX_APPROVERS>,
+        /// Their Principal ids, in the same order (ADR-0080). Absent from
+        /// inputs recorded before it existed.
+        pub approver_ids: Option<Capped<String, MAX_APPROVERS>>,
         pub required: Option<u64>,
     }
 }

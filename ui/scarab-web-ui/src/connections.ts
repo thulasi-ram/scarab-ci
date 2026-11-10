@@ -2,15 +2,11 @@
 // connection serves one org, and the org is the forge account that owns the
 // repositories it binds. The server enforces every rule here; these only
 // decide what the page offers, so the no-DOM vitest tier covers them.
+import type { Chip } from "./libraries";
 
 /** What these rules read from a connection. */
 export interface ConnectionLike {
   org?: string | null;
-}
-
-/** A repository as the forge lists it. */
-export interface RepoLike {
-  owner: string;
 }
 
 /**
@@ -21,43 +17,31 @@ export function unassignedConnections<T extends ConnectionLike>(conns: readonly 
   return conns.filter((c) => c.org == null);
 }
 
-/**
- * The repositories the Add repository dialog offers: those owned by the
- * connection's org. The server refuses any other owner, so offering one would
- * only produce an error. `hidden` counts the rest, so the dialog can say why
- * the list is shorter than what the token reaches. An unassigned connection
- * (`org` null) is never offered the dialog, so it gets the whole list.
- */
-export function reposForOrg<T extends RepoLike>(
-  repos: readonly T[],
-  org: string | null | undefined,
-): { offered: T[]; hidden: number } {
-  if (org == null) return { offered: [...repos], hidden: 0 };
-  const offered = repos.filter((r) => r.owner === org);
-  return { offered, hidden: repos.length - offered.length };
-}
-
 /** What a re-sync answered, as one line under the connection. */
-export function resyncNote(r: { bound: string[]; confirmed: number; skipped?: string[] }): string {
+export function resyncNote(r: {
+  available: string[];
+  moved?: string[];
+  confirmed: number;
+  skipped?: string[];
+}): string {
   const repos = (n: number) => (n === 1 ? "repository" : "repositories");
-  const head =
-    r.bound.length > 0
-      ? `Bound ${r.bound.length} new ${repos(r.bound.length)}: ${r.bound.join(", ")}.`
-      : `Already in sync: ${r.confirmed} ${repos(r.confirmed)} confirmed.`;
+  const parts = [`${r.confirmed} enabled ${repos(r.confirmed)} confirmed.`];
+  const moved = r.moved ?? [];
+  if (moved.length > 0) {
+    parts.push(`Moved ${moved.length} ${repos(moved.length)} to this connection: ${moved.join(", ")}.`);
+  }
+  if (r.available.length > 0) {
+    parts.push(
+      `${r.available.length} ${repos(r.available.length)} not enabled: ${r.available.join(", ")}. Enable them on the organization page.`,
+    );
+  }
   const skipped = r.skipped ?? [];
-  if (skipped.length === 0) return head;
-  return `${head} Not bound: ${skipped.join(", ")} (owned by another account, or already bound through another connection).`;
-}
-
-/**
- * The org an unassigned connection can be assigned to without a refusal: the
- * one owner of every repository bound through it. Null when it has none
- * bound (any org may be typed) or repositories of several owners (the server
- * refuses every org until they are moved).
- */
-export function soleOwner(projects: readonly RepoLike[]): string | null {
-  const owners = new Set(projects.map((p) => p.owner));
-  return owners.size === 1 ? [...owners][0]! : null;
+  if (skipped.length > 0) {
+    parts.push(
+      `Not listed: ${skipped.join(", ")} (owned by another account, or enabled through another connection).`,
+    );
+  }
+  return parts.join(" ");
 }
 
 /**
@@ -71,4 +55,142 @@ export function orgNameProblem(name: string): string | null {
   if (n.startsWith("_")) return "Names that start with _ are reserved.";
   if (/[\s/]/.test(n)) return "Use the forge account name alone, without spaces or slashes.";
   return null;
+}
+
+/** A connection's kind as people name the forge: `GitHub`, `Forgejo`. */
+export function forgeName(kind: string | null | undefined): string {
+  if (kind === "github") return "GitHub";
+  if (kind === "forgejo") return "Forgejo";
+  return "the forge";
+}
+
+/** What a connection's list row and page read. */
+export interface ConnectionSummaryLike {
+  kind: string;
+  base_url: string;
+  web_url: string;
+  credential_present: boolean;
+  last_delivery_at?: number | null;
+  managed_by_config: boolean;
+}
+
+/**
+ * The host people know a connection by: the forge's web host (`github.com`,
+ * `git.acme.dev`), not the API host (`api.github.com`). A URL that does not
+ * parse is shown as written.
+ */
+export function connectionHost(c: { web_url: string; base_url: string }): string {
+  const raw = c.web_url || c.base_url;
+  try {
+    return new URL(raw).host || raw;
+  } catch {
+    return raw;
+  }
+}
+
+/** The address of one connection's page, under the org's Connections. */
+export function connectionHref(org: string, id: string): string {
+  return `/orgs/${encodeURIComponent(org)}/settings/connections/${encodeURIComponent(id)}`;
+}
+
+/**
+ * The state tags of a connection, most urgent first: a credential that does
+ * not resolve, no webhook delivery recorded, and managed by configuration.
+ * A healthy connection that has had a delivery carries none.
+ */
+export function connectionChips(c: ConnectionSummaryLike): Chip[] {
+  const out: Chip[] = [];
+  if (!c.credential_present) {
+    out.push({
+      label: "credential missing",
+      tone: "danger",
+      title: "The credential's handle does not resolve, so Scarab cannot reach the forge.",
+    });
+  }
+  if (c.last_delivery_at == null) {
+    out.push({
+      label: "no deliveries yet",
+      tone: "muted",
+      title: `No webhook delivery from ${forgeName(c.kind)} has been recorded yet.`,
+    });
+  }
+  if (c.managed_by_config) {
+    out.push({
+      label: "managed by configuration",
+      tone: "muted",
+      title:
+        "Set in the server's connections: configuration (Helm scarab.connections or SCARAB_CONNECTIONS). Change or remove it there.",
+    });
+  }
+  return out;
+}
+
+/** "1 enabled repository", "7 enabled repositories". */
+export function enabledReposLabel(n: number): string {
+  return `${n} enabled ${n === 1 ? "repository" : "repositories"}`;
+}
+
+/** What the waiting panel reads from a connection. */
+export interface WaitingLike {
+  id: string;
+  kind: string;
+  web_url: string;
+  enabled_repos: number;
+}
+
+/**
+ * The GitHub App installation id of a connection the installation webhook
+ * registered (`github-install-<id>`), or null for any other connection.
+ */
+export function installationId(c: { id: string; kind: string }): string | null {
+  if (c.kind !== "github") return null;
+  const m = /^github-install-(\d+)$/.exec(c.id);
+  return m ? m[1]! : null;
+}
+
+/** One line of a waiting connection's facts: a label and its value. */
+export interface WaitingFact {
+  label: string;
+  value: string;
+}
+
+/**
+ * The facts the New organization page lists for a connection that serves no
+ * org: its forge and host, its installation id (GitHub), and how many
+ * repositories are enabled through it. The connection list does not carry
+ * the installation's account login or account id (git-bug bb8d644), so the
+ * account is not named.
+ */
+export function waitingFacts(c: WaitingLike): WaitingFact[] {
+  const out: WaitingFact[] = [
+    { label: "forge", value: `${forgeName(c.kind)} · ${c.web_url.replace(/^https?:\/\//, "")}` },
+  ];
+  const install = installationId(c);
+  if (install != null) out.push({ label: "installation", value: install });
+  const n = c.enabled_repos;
+  out.push({
+    label: "repositories",
+    value: n === 0 ? "none enabled" : `${n} enabled`,
+  });
+  return out;
+}
+
+/**
+ * Why `name` cannot name a new org made from a waiting connection, or null
+ * when it can: `orgNameProblem`, and a name that is already an org's (that
+ * is an assignment, which the other action makes).
+ */
+export function newOrgNameProblem(name: string, orgs: readonly string[]): string | null {
+  const problem = orgNameProblem(name);
+  if (problem != null) return problem;
+  const n = name.trim();
+  return orgs.includes(n) ? `${n} is already an organization. Use Assign to an organization.` : null;
+}
+
+/** The first line of the New organization page's waiting panel, for `n`
+ *  connections. */
+export function waitingIntro(n: number): string {
+  return n === 1
+    ? "Scarab could not prove this account owns an organization of the same name, so it serves none until you choose."
+    : "Scarab could not prove these accounts own organizations of the same names, so they serve none until you choose.";
 }

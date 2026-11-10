@@ -27,6 +27,7 @@ use scarab_policy::library::{
     content_hash, LibraryStore, LibraryVersion, LibraryYank, NewInstallation, Replaces,
 };
 use scarab_server::plugins::PluginPolicy;
+use scarab_server::test_support::{argocd_fetcher, argocd_install_body};
 use scarab_server::{
     broker, router, trigger_runs_from_event, AdmissionPorts, AppState, LogService,
 };
@@ -105,7 +106,6 @@ fn state(pg: Arc<PostgresDb>, clock: Arc<FakeClock>) -> AppState {
             PluginPolicy {
                 enabled: true,
                 namespace: NAMESPACE.into(),
-                argocd_repo: REPO.into(),
                 dev_allow_tag: false,
             },
         )
@@ -117,6 +117,7 @@ fn state(pg: Arc<PostgresDb>, clock: Arc<FakeClock>) -> AppState {
             prefix: "tok-",
             namespace: NAMESPACE,
         }))
+        .with_library_fetcher(Arc::new(argocd_fetcher()))
 }
 
 async fn send(app: &axum::Router, req: Request<Body>) -> (StatusCode, Value) {
@@ -174,14 +175,15 @@ async fn raw_release(
     send(app, req).await
 }
 
-/// Install the first-party Argo CD plugin as `name` in `org`; its id.
+/// Install the Argo CD plugin as `name` in `org`, from its manifest's
+/// source like any plugin.
 async fn install(app: &axum::Router, org: &str, name: &str) -> (StatusCode, Value) {
     call(
         app,
         "POST",
         &format!("/v1/orgs/{org}/plugins"),
         None,
-        Some(json!({ "name": name, "plugin": "argocd", "image": image() })),
+        Some(argocd_install_body(name, &image())),
     )
     .await
 }
@@ -557,7 +559,6 @@ async fn yanked_world() -> Option<World> {
         source: format!("github.com/acme/libs//deploy.yaml@{}", "1".repeat(40)),
         publisher: "acme".into(),
         name: "deploy".into(),
-        first_party: false,
         fetched_by: "amy".into(),
         fetched_at: 1,
     })

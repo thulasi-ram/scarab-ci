@@ -1,5 +1,18 @@
 import { describe, it, expect } from "vitest";
-import { orgNameProblem, reposForOrg, resyncNote, soleOwner, unassignedConnections } from "./connections";
+import {
+  connectionChips,
+  connectionHost,
+  connectionHref,
+  enabledReposLabel,
+  forgeName,
+  installationId,
+  newOrgNameProblem,
+  orgNameProblem,
+  resyncNote,
+  unassignedConnections,
+  waitingFacts,
+  waitingIntro,
+} from "./connections";
 
 describe("unassigned connections", () => {
   it("keeps only the connections with no org", () => {
@@ -13,46 +26,29 @@ describe("unassigned connections", () => {
   });
 });
 
-describe("repositories offered to bind", () => {
-  const repos = [
-    { owner: "acme", name: "api" },
-    { owner: "verify-org", name: "team-repo" },
-    { owner: "acme", name: "web" },
-  ];
-
-  it("offers only the org's own repositories and counts the rest", () => {
-    const { offered, hidden } = reposForOrg(repos, "acme");
-    expect(offered.map((r) => r.name)).toEqual(["api", "web"]);
-    expect(hidden).toBe(1);
-  });
-
-  it("matches the owner exactly, not by prefix or case", () => {
-    expect(reposForOrg(repos, "Acme").offered).toEqual([]);
-    expect(reposForOrg(repos, "acm").offered).toEqual([]);
-  });
-
-  it("offers everything when the connection has no org", () => {
-    expect(reposForOrg(repos, null)).toEqual({ offered: repos, hidden: 0 });
-  });
-});
-
 describe("re-sync note", () => {
-  it("names what was bound", () => {
-    expect(resyncNote({ bound: ["acme/api"], confirmed: 2, skipped: [] })).toBe(
-      "Bound 1 new repository: acme/api.",
+  it("names the repositories that are not enabled, and binds none", () => {
+    expect(resyncNote({ available: ["acme/api"], moved: [], confirmed: 2, skipped: [] })).toBe(
+      "2 enabled repositories confirmed. 1 repository not enabled: acme/api. Enable them on the organization page.",
     );
   });
 
-  it("says when nothing changed", () => {
-    expect(resyncNote({ bound: [], confirmed: 3, skipped: [] })).toBe(
-      "Already in sync: 3 repositories confirmed.",
+  it("says only what was confirmed when nothing else changed", () => {
+    expect(resyncNote({ available: [], moved: [], confirmed: 3, skipped: [] })).toBe(
+      "3 enabled repositories confirmed.",
+    );
+  });
+
+  it("names the projects moved to this connection", () => {
+    expect(resyncNote({ available: [], moved: ["acme/web"], confirmed: 0 })).toBe(
+      "0 enabled repositories confirmed. Moved 1 repository to this connection: acme/web.",
     );
   });
 
   it("lists the repositories the server skipped", () => {
-    const note = resyncNote({ bound: [], confirmed: 1, skipped: ["globex/api", "other/x"] });
-    expect(note).toContain("Not bound: globex/api, other/x");
-    expect(note.startsWith("Already in sync: 1 repository confirmed.")).toBe(true);
+    const note = resyncNote({ available: [], confirmed: 1, skipped: ["globex/api", "other/x"] });
+    expect(note).toContain("Not listed: globex/api, other/x");
+    expect(note.startsWith("1 enabled repository confirmed.")).toBe(true);
   });
 });
 
@@ -70,13 +66,106 @@ describe("new org name", () => {
   });
 });
 
-describe("the org an unassigned connection can take", () => {
-  it("is the one owner of its repositories", () => {
-    expect(soleOwner([{ owner: "acme" }, { owner: "acme" }])).toBe("acme");
+describe("forge names", () => {
+  it("names the forge of a connection kind", () => {
+    expect(forgeName("github")).toBe("GitHub");
+    expect(forgeName("forgejo")).toBe("Forgejo");
+    expect(forgeName(undefined)).toBe("the forge");
+  });
+});
+
+describe("a connection's list row", () => {
+  const healthy = {
+    kind: "github",
+    base_url: "https://api.github.com",
+    web_url: "https://github.com",
+    credential_present: true,
+    last_delivery_at: 1,
+    managed_by_config: false,
+  };
+
+  it("names the forge's web host, not its API host", () => {
+    expect(connectionHost(healthy)).toBe("github.com");
+    expect(connectionHost({ web_url: "", base_url: "https://git.acme.dev:3000/" })).toBe("git.acme.dev:3000");
+    expect(connectionHost({ web_url: "not a url", base_url: "" })).toBe("not a url");
   });
 
-  it("is none for repositories of several owners, or none bound", () => {
-    expect(soleOwner([{ owner: "acme" }, { owner: "globex" }])).toBeNull();
-    expect(soleOwner([])).toBeNull();
+  it("links to the connection's page under the org's Connections", () => {
+    expect(connectionHref("acme", "forgejo-7f3a91c2")).toBe("/orgs/acme/settings/connections/forgejo-7f3a91c2");
+    expect(connectionHref("a b", "x/y")).toBe("/orgs/a%20b/settings/connections/x%2Fy");
+  });
+
+  it("carries no tag when the credential resolves and a delivery came in", () => {
+    expect(connectionChips(healthy)).toEqual([]);
+  });
+
+  it("puts a missing credential first, then no deliveries, then configuration", () => {
+    const chips = connectionChips({
+      ...healthy,
+      credential_present: false,
+      last_delivery_at: null,
+      managed_by_config: true,
+    });
+    expect(chips.map((c) => [c.label, c.tone])).toEqual([
+      ["credential missing", "danger"],
+      ["no deliveries yet", "muted"],
+      ["managed by configuration", "muted"],
+    ]);
+    expect(chips[1]!.title).toContain("GitHub");
+  });
+
+  it("counts enabled repositories in words", () => {
+    expect(enabledReposLabel(1)).toBe("1 enabled repository");
+    expect(enabledReposLabel(0)).toBe("0 enabled repositories");
+  });
+});
+
+describe("connections waiting for an organization", () => {
+  const install = {
+    id: "github-install-90211",
+    kind: "github",
+    web_url: "https://github.com",
+    enabled_repos: 0,
+  };
+  const legacy = {
+    id: "forgejo-legacy",
+    kind: "forgejo",
+    web_url: "https://git.umbrella.dev",
+    enabled_repos: 2,
+  };
+
+  it("reads the installation id from an installation's connection id only", () => {
+    expect(installationId(install)).toBe("90211");
+    expect(installationId({ id: "github-install-90211", kind: "forgejo" })).toBeNull();
+    expect(installationId({ id: "gh-acme", kind: "github" })).toBeNull();
+    expect(installationId({ id: "github-install-12x", kind: "github" })).toBeNull();
+  });
+
+  it("lists the forge, the installation and how many repositories are enabled", () => {
+    expect(waitingFacts(install)).toEqual([
+      { label: "forge", value: "GitHub · github.com" },
+      { label: "installation", value: "90211" },
+      { label: "repositories", value: "none enabled" },
+    ]);
+    expect(waitingFacts(legacy)).toEqual([
+      { label: "forge", value: "Forgejo · git.umbrella.dev" },
+      { label: "repositories", value: "2 enabled" },
+    ]);
+  });
+
+  it("refuses an existing org's name for a new org, and every name orgNameProblem refuses", () => {
+    expect(newOrgNameProblem("acme", ["acme", "globex"])).toBe(
+      "acme is already an organization. Use Assign to an organization.",
+    );
+    expect(newOrgNameProblem(" umbrella ", ["acme"])).toBeNull();
+    expect(newOrgNameProblem("_new", ["acme"])).toBe(orgNameProblem("_new"));
+    expect(newOrgNameProblem("", [])).toBe("Name the organization.");
+  });
+
+  it("says why they wait, for one or several", () => {
+    expect(waitingIntro(1)).toBe(
+      "Scarab could not prove this account owns an organization of the same name, so it serves none until you choose.",
+    );
+    expect(waitingIntro(2)).toMatch(/^Scarab could not prove these accounts own organizations/);
   });
 });

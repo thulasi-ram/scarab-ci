@@ -1,0 +1,202 @@
+---
+title: Policies
+description: Org rules written in CEL, checked as you type, tried on recent decisions before they enforce anything, and shown on every Run they decided. Library and plugin policies are rules with a form of their own.
+---
+
+A Policy is an org rule that Scarab checks at a fixed point in a Run's life: "no deploys from a
+fork", "pin images by tag", "only these two people release production gates". Org admins write
+Policies under **Organization settings › Policies** (`/orgs/<org>/settings/policies`). Every
+decision is recorded, and the Run page shows the ones that applied to it.
+
+## Where a Policy is checked
+
+Each Policy names one checkpoint. Its rules read that checkpoint's input.
+
+| Checkpoint | When | The rules read |
+|------------|------|----------------|
+| `run.create` | a Run is about to be created, after its pipeline compiled and its trigger matched | `trigger` (kind, `ref`, `sha`, `fork`, `actor`, `principal`, `principal_id`, `reason`), `pipeline` (name, `environment`, `deploy`), `steps`, `gates`, `principal`, `principal_id`, `time` |
+| `step.admit` | every launch of a Step attempt, before any credential is used | `step` (image, secrets, `deploy`, `forge_token`, `origin`), `attempt`, `run` (`ref`, `environment`), `environment`, `approvals` (each with `approvers` and `approver_ids`), `time` |
+| `gate.resolve` | someone approves a manual gate, before the approval is recorded | `gate`, `verdict`, `actor.principal`, `actor.principal_id`, `approvals`, `approval_ids`, `run`, `time` |
+
+Every checkpoint also has `org` and `project`.
+
+A person is named by their handle, the readable name they sign in under (`github:alice`,
+`okta:s.patel@acme.example`): `principal`, `actor.principal`, `approvals` and `approvers` hold
+handles, so a rule compares them with the string people type. A handle never changes once it is
+given out. Each also has an `_id` field beside it with the person's Scarab id (`p_` and 32 hex
+characters), which a rule can compare when it must name exactly one person. Inputs recorded
+before the id fields existed do not have them, so a rule reads them with `has()`. `GET /v1/policy-checkpoints` serves each checkpoint's full input schema: every field, its type,
+whether it can be absent, and what it means. The editor completes field names from it.
+
+## A Policy
+
+```yaml
+kind: policy
+name: no-fork-deploys
+checkpoint: run.create
+mode: audit
+match:
+  environments: ["production"]
+rules:
+  - when: trigger.fork && pipeline.deploy
+    effect: deny
+    message: "A pull request from a fork may not deploy to production."
+```
+
+- **`match`** picks what the Policy applies to before any rule runs: `projects` and
+  `except_projects` (globs, `*` matches any run of characters), `environments`, and at
+  `run.create` only, `trigger_kinds`. An empty list matches everything.
+- **`rules`**: each `when` is a CEL expression over the checkpoint's input. When it holds, the
+  rule denies, and its `message` is what the refusal and the Run page show. The message is fixed
+  text: the Run page shows the input the rule saw next to it.
+- **`mode`**: `audit` records what the Policy would deny and denies nothing; `enforce` denies.
+  The editor starts a new Policy in `audit`.
+
+Every Policy whose `match` fits is evaluated. Any enforced deny refuses, and every deny message
+is reported. A rule that fails to evaluate denies when its Policy is enforced.
+
+## The list
+
+**Organization settings › Policies** lists the org's CEL Policies. Each row shows the Policy's
+checkpoint, **audit** for one in audit mode, the projects and Environments it applies to, its
+counts for the last 7 days and its version, with **Enforce** on an audit-mode row and **Manage**,
+which opens the Policy's page (`/orgs/<org>/settings/policies/<id>`). The page has three tabs:
+**Edit**, **History** and **Decisions**. **Paste YAML** and **New policy** sit at the right of the
+list's header.
+
+Library and plugin policies are not on this list: each is edited on Libraries or Plugins (below).
+
+## Write one in the editor
+
+**New policy** opens the editor on its own page, in five numbered parts:
+
+1. **Policy**: the name, and the checkpoint. Changing the checkpoint checks the rules again
+   against the new input.
+2. **Applies to**: `match`. Trigger kinds show at `run.create` only.
+3. **Mode**: audit or enforce.
+4. **Rules**: each rule's condition and message. Every rule denies.
+5. **Try it**: runs the draft over recent decisions (below).
+
+While you type, the server checks the draft (`POST /v1/orgs/{org}/policies/check`) and the page
+shows each finding where it belongs: a name or `match` problem under its field, a rule's under
+its condition with its line and column. Below a rule that checks, the page lists the fields it
+reads.
+
+Typing a variable and a dot lists its fields, with each one's type and meaning. After a list such
+as `steps`, it offers `exists`, `all` and `exists_one`, and inside `steps.exists(s, …` it
+completes `s.` from a Step's fields. Tab or Enter takes the highlighted name.
+
+A field that can be absent, such as `trigger.ref` (a cron Run has none), gets a warning when a
+rule reads it without `has()`. Reading an absent field is an error, and an error denies, so
+`trigger.ref != 'refs/heads/main'` alone would deny every Run without a ref. Write
+`has(trigger.ref) && trigger.ref != 'refs/heads/main'`.
+
+The CEL a Policy may use is a subset with a type checker: comparisons, `&&`, `||`, `!`, `in`,
+`startsWith`, `endsWith`, `contains`, `matches` with a literal pattern, `size`, and the three
+list macros. There is no arithmetic, string concatenation or indexing. A time window compares
+`time` with absolute timestamps: `time >= timestamp('2026-12-24T00:00:00Z')`.
+
+### Try it before it enforces
+
+**Try it on recent decisions** evaluates the draft over the newest 200 recorded decisions at its
+checkpoint (`POST /v1/orgs/{org}/policy-test/replay`) and lists the ones whose outcome would
+change, each with its project, Step and a link to its Run:
+
+- for a new Policy, every decision it would deny (or, in audit mode, would deny);
+- for an edit, every decision where the draft and the saved version disagree.
+
+Nothing is enforced or recorded. A decision whose Run was over an input size cap recorded no
+input; it is skipped, and the summary counts it. The comparison covers this Policy only: the
+Environment's built-in rules and other Policies are not part of it.
+
+### Save, enforce and step-up
+
+Adding a Policy needs no passkey: it can only refuse more. Changing a Policy that is in audit
+mode needs none either, and that includes moving it to enforce, which the list offers as
+**Enforce** on each audit-mode row. Any change to an enforced Policy, and deleting one, asks you
+to confirm with your passkey: whether an edited rule is looser cannot be decided, so every edit
+counts as loosening. Delete asks you to type the Policy's name.
+
+### Copy YAML and Paste YAML
+
+**Copy YAML** copies the draft as a `kind: policy` file. **Paste YAML** on the list reads one into
+the editor, unsaved, so you can keep a Policy next to your code and paste it in. Policies are not
+synced from files: the copy in Scarab is the one that applies, and its history is Scarab's.
+
+## History
+
+Each save is a version. **History** lists them newest first: who saved it, when, the reason they
+gave, whether a passkey confirmed it, and a line diff against the version before.
+
+## Decisions
+
+**Decisions** lists the newest 200 recorded decisions this Policy's `match` selected, newest
+first: its own outcome in each (denied, would deny in audit mode, allowed), the checkpoint, the
+project, the Step and try for a launch, the deny message, and a link to the Run. It reads
+`GET /v1/orgs/{org}/policy-decisions?policy_id=<id>`; the decisions its `match` did not select are
+counted below the list.
+
+## Counts on the list
+
+Each row of the list says how many decisions the Policy denied in the last 7 days, or for an
+audit-mode Policy how many it would have denied. That is the number to look at before
+**Enforce**. The counts are `GET /v1/orgs/{org}/policy-decisions/counts?since=<unix ms>`.
+
+## On the Run page
+
+A Run that any Policy applied to shows a **Policies** strip: each decision, oldest first, with its
+checkpoint (and the Step and try for a launch), each Policy's outcome (denied, would deny in
+audit mode, allowed) with its message, and the input the rules saw. A Run no Policy applied to
+shows nothing. The strip opens by itself when a decision denied. It reads
+`GET /v1/runs/{id}/policy-decisions`.
+
+## Library and plugin policies
+
+Three rules have a form instead of CEL. Each is a list:
+
+| List | Where | What it denies |
+|------|-------|----------------|
+| Libraries allowed | Organization settings › Libraries › Library policies | a Run with a Step or gate from a library matching none of its sources |
+| Libraries blocked | Organization settings › Libraries › Library policies | a Run with a Step or gate from a library matching any of its sources |
+| Plugins whose gates may run | Organization settings › Plugins › Plugin policies | a Run with a gate from a plugin installation not on the list |
+
+A source is exact, or a prefix ending in `*` (`github.com/acme/*`); an installation is named
+exactly. An org list can be limited to some projects. A new library list starts in audit mode. No
+plugin's gates run until an enforced org list names the installation, so a plugin list starts
+enforced, and one in audit mode allows nothing.
+
+A project admin keeps the project's own lists on the repository's **Settings** tab, under
+Library policies and Plugin policies. A project's
+list only narrows the org's: a Run must pass both. Project admins write these lists only, never
+CEL.
+
+## API
+
+| Call | What it does |
+|------|--------------|
+| `GET`, `POST /v1/orgs/{org}/policies` | list the org's Policies; add one |
+| `GET`, `PUT`, `DELETE /v1/orgs/{org}/policies/{id}` | read, replace (with `expected_version`), delete |
+| `GET /v1/orgs/{org}/policies/{id}/versions` | every version, oldest first |
+| `POST /v1/orgs/{org}/policies/check` | check a draft (`policy`, or `yaml`): findings and what each rule reads |
+| `GET /v1/policy-checkpoints` | each checkpoint's input schema, effects and `match` keys |
+| `POST /v1/orgs/{org}/policy-test` | evaluate a draft, a stored Policy or a project's Policies against one input, at any checkpoint |
+| `POST /v1/orgs/{org}/policy-test/replay` | a draft over recent decisions: the ones whose outcome changes |
+| `GET /v1/orgs/{org}/policy-decisions` | the decision log, newest first; `checkpoint`, `policy_id` and `since` narrow it |
+| `GET /v1/orgs/{org}/policy-decisions/counts` | each Policy's denies and would-denies since a time |
+| `GET /v1/runs/{id}/policy-decisions` | one Run's decisions |
+| `…/projects/{project}/policies` | a project's library and plugin policies, the same calls |
+
+Checking, testing and replaying a draft need the org admin role, as saving one does.
+
+## Limits
+
+- Only `deny` is evaluated. `require_approval` and `require_step_up` are refused when a Policy is
+  saved.
+- `match` has no actor kinds yet, so a `gate.resolve` Policy cannot apply to people only.
+- The editor writes org Policies. Environment-level Policies are not built.
+
+## References
+
+- [ADR-0075, Policy engine](/scarab-ci/tech/adr/0075-policy-engine/)
+- [ADR-0073, Step-up confirmation](/scarab-ci/tech/adr/0073-step-up-confirmation/)
+- [Libraries](/scarab-ci/usage/libraries/)

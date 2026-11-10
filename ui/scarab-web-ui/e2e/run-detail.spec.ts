@@ -37,7 +37,7 @@ test("run-detail walkthrough: DAG, versions, activity, gate, tries, artifacts", 
   // build took two tries in this version — the ×N badge.
   await expect(page.getByRole("button", { name: /^build/ })).toContainText("×2");
   // The shared-service lane: label + the postgres peer node with its lifecycle.
-  await expect(page.getByText("services", { exact: true })).toBeVisible();
+  await expect(page.getByText("Services", { exact: true })).toBeVisible();
   const svcNode = page.getByRole("button", { name: /postgres/ });
   await expect(svcNode).toBeVisible();
   await expect(svcNode).toContainText("ready");
@@ -99,7 +99,7 @@ test("run-detail walkthrough: DAG, versions, activity, gate, tries, artifacts", 
   await expect(page.getByText("Artifacts", { exact: true })).toBeVisible();
   await expect(page.getByRole("link", { name: "scarab-dist.tar.gz" })).toBeVisible();
   await expect(page.getByText("build@a3")).toBeVisible();
-  await expect(page.getByText("of record", { exact: true })).toBeVisible();
+  await expect(page.getByText("Of record", { exact: true })).toBeVisible();
 });
 
 // The ENVIRONMENT GATE run in src/mock.ts: a deploy into production with a
@@ -136,4 +136,29 @@ test("an environment approval gate says so, names who added it, and its wait tim
   // The step pane names the gate too.
   await added.click();
   await expect(page.locator(".gate-env-line")).toContainText("Environment approval gate · added by Production (production)");
+});
+
+// A Run a Policy refused a Step of (src/mock-policies.ts).
+const POLICY_RUN_ID = "0190f8a2000071fb8c00b01c7e0a5e11";
+
+test("the Run page lists the Run's policy decisions with the input each rule saw", async ({ page }) => {
+  await page.goto(`/acme/orders-api/runs/${POLICY_RUN_ID}`);
+  const decisions = page.getByRole("list", { name: "Policy decisions" });
+  // The strip opens by itself when a decision denied.
+  await expect(decisions).toBeVisible();
+  await expect(decisions.getByRole("listitem").filter({ hasText: "run.create" })).toContainText(
+    "would deny (audit)",
+  );
+  const launch = decisions.locator(":scope > li").filter({ hasText: "deploy · try 1" });
+  await expect(launch).toContainText("denied");
+  await expect(launch).toContainText("no-latest-images");
+  await expect(launch).toContainText("Pin the image by tag or digest, not :latest.");
+  await launch.getByText("Input the rules saw").click();
+  await expect(launch).toContainText("ghcr.io/acme/deployer:latest");
+});
+
+test("a Run no Policy applied to shows no Policies strip", async ({ page }) => {
+  await page.goto(`/acme/scarab/runs/${RICH_RUN_ID}`);
+  await expect(page.getByText("Wire shared postgres into the integration suite")).toBeVisible();
+  await expect(page.getByRole("list", { name: "Policy decisions" })).toHaveCount(0);
 });

@@ -504,7 +504,7 @@ mod tests {
         }
     }
 
-    /// The first-party Argo CD slot's shape.
+    /// The Argo CD plugin's slot shape.
     fn argo() -> ConnectionSlot {
         ConnectionSlot {
             name: "argocd".into(),

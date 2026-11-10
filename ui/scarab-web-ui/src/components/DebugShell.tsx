@@ -30,7 +30,7 @@ export default function DebugShell(props: {
     const token = (name: string, fallback: string) => css.getPropertyValue(name).trim() || fallback;
     const t = new Terminal({
       fontFamily: '"JetBrains Mono", ui-monospace, Menlo, monospace',
-      // --fs-sm: a canvas takes a number, not the CSS token.
+      // The Mono text style (--t-mono, 12px): a canvas takes a number, not the CSS token.
       fontSize: 12,
       cursorBlink: true,
       theme: {

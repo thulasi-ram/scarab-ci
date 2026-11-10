@@ -1,7 +1,8 @@
 //! [`PluginStore`] on Postgres (ADR-0072, migrations 0055 and 0056): the
 //! PluginInstallation registry with its kill switch, its PluginConnections
 //! and the broker journal. Migration 0068 adds an installation's storage
-//! claim (ADR-0074 §7).
+//! claim (ADR-0074 §7); 0091 the manifest's source and the versions upgrades
+//! replaced (ADR-0072 §10).
 //!
 //! **PluginConnections** (ADR-0072 §5, migration 0056): a bind takes the
 //! installation row `FOR UPDATE` before the connection row, and uninstall
@@ -18,8 +19,9 @@ use sqlx::Row;
 use scarab_plugin::{
     BrokerJournalEntry, BrokerJournalFilter, BrokerJournalPhase, BrokerJournalRecord,
     InstallationState, PluginConnection, PluginConnectionAuthScheme, PluginInstallation,
-    PluginManifest, PluginStorage, PluginStore, PluginStoreError, PluginUninstall, RuntimeStatus,
-    PAGE_DEFAULT_LIMIT, PAGE_MAX_LIMIT,
+    PluginInstallationVersion, PluginManifest, PluginStorage, PluginStore, PluginStoreError,
+    PluginUninstall, PluginUpgrade, PluginUpgraded, RuntimeStatus, PAGE_DEFAULT_LIMIT,
+    PAGE_MAX_LIMIT,
 };
 
 use crate::PostgresDb;
@@ -60,7 +62,8 @@ fn saturating_i64(n: u64) -> i64 {
 
 const INSTALLATION_COLUMNS: &str = "id, org, name, plugin, image, manifest, manifest_sha256, \
      config, state, state_version, runtime_status, runtime_message, probe_passed_at, approved_by, \
-     approved_at, killed_by, killed_at, storage_claim, storage_mount_path";
+     approved_at, killed_by, killed_at, storage_claim, storage_mount_path, manifest_source, \
+     manifest_connection";
 
 /// One `plugin_installations` row back into the domain. A row whose manifest,
 /// config or state this binary cannot read is reported, never defaulted: a
@@ -108,6 +111,8 @@ fn installation_from_row(
         image: r.get("image"),
         manifest,
         manifest_sha256: r.get("manifest_sha256"),
+        source: r.get("manifest_source"),
+        source_connection: r.get("manifest_connection"),
         config,
         state,
         state_version: r.get("state_version"),
@@ -198,9 +203,10 @@ impl PluginStore for PostgresDb {
             "INSERT INTO plugin_installations
                  (org, name, id, plugin, image, manifest, manifest_sha256, config, state,
                   runtime_status, runtime_message, probe_passed_at, approved_by, approved_at,
-                  killed_by, killed_at, storage_claim, storage_mount_path)
+                  killed_by, killed_at, storage_claim, storage_mount_path, manifest_source,
+                  manifest_connection)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-                     $17, $18)",
+                     $17, $18, $19, $20)",
         )
         .bind(&installation.org)
         .bind(&installation.name)
@@ -220,6 +226,8 @@ impl PluginStore for PostgresDb {
         .bind(installation.killed_at)
         .bind(installation.storage.as_ref().map(|s| s.claim.as_str()))
         .bind(installation.storage.as_ref().map(|s| s.mount_path.as_str()))
+        .bind(&installation.source)
+        .bind(&installation.source_connection)
         .execute(&mut *tx)
         .await
         .map_err(plugin_store_err)?;
@@ -336,6 +344,175 @@ impl PluginStore for PostgresDb {
             Some(_) => Err(PluginStoreError::Changed(name.to_string())),
             None => Ok(None),
         }
+    }
+
+    async fn upgrade_installation(
+        &self,
+        org: &str,
+        name: &str,
+        expected_manifest_sha256: &str,
+        upgrade: &PluginUpgrade,
+    ) -> Result<Option<PluginUpgraded>, PluginStoreError> {
+        let mut tx = self.pool().begin().await.map_err(plugin_store_err)?;
+        // The installation row's lock FIRST (the module's lock order), held
+        // to commit: a connection bind waits for it, so it cannot bind a slot
+        // this upgrade is about to drop.
+        let sql = format!(
+            "SELECT {INSTALLATION_COLUMNS} FROM plugin_installations
+              WHERE org = $1 AND name = $2 FOR UPDATE"
+        );
+        let Some(row) = sqlx::query(&sql)
+            .bind(org)
+            .bind(name)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(plugin_store_err)?
+        else {
+            return Ok(None);
+        };
+        let current = installation_from_row(&row)?;
+        // Conditional on the manifest the caller judged the upgrade against:
+        // whether it needed a step-up was decided from that (ADR-0073 §3).
+        if current.manifest_sha256 != expected_manifest_sha256 {
+            return Err(PluginStoreError::Changed(name.to_string()));
+        }
+        let mut next = current.clone();
+        next.image = upgrade.image.clone();
+        next.manifest = upgrade.manifest.clone();
+        next.manifest_sha256 = upgrade.manifest_sha256.clone();
+        next.source = Some(upgrade.source.clone());
+        next.source_connection = upgrade.source_connection.clone();
+        // A key the new manifest no longer declares is configuration nobody
+        // approved for it.
+        next.config
+            .retain(|k, _| upgrade.manifest.config_keys.iter().any(|d| d == k));
+        next.approved_by = upgrade.approved_by.clone();
+        next.approved_at = upgrade.approved_at;
+        next.validate()
+            .map_err(|e| PluginStoreError::Invalid(e.to_string()))?;
+
+        let manifest = |m: &PluginManifest| {
+            serde_json::to_value(m).map_err(|e| PluginStoreError::Store(e.to_string()))
+        };
+        sqlx::query(
+            "INSERT INTO plugin_installation_versions
+                 (installation_id, image, manifest, manifest_sha256, manifest_source,
+                  manifest_connection, approved_by, approved_at, replaced_by, replaced_at,
+                  step_up_ref)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+        )
+        .bind(&current.id)
+        .bind(&current.image)
+        .bind(manifest(&current.manifest)?)
+        .bind(&current.manifest_sha256)
+        .bind(&current.source)
+        .bind(&current.source_connection)
+        .bind(&current.approved_by)
+        .bind(current.approved_at)
+        .bind(&upgrade.approved_by)
+        .bind(upgrade.approved_at)
+        .bind(&upgrade.step_up_ref)
+        .execute(&mut *tx)
+        .await
+        .map_err(plugin_store_err)?;
+
+        // Bindings of slots the new manifest no longer declares: their rows
+        // go now, their secrets are the caller's to delete.
+        let slots: Vec<String> = upgrade
+            .manifest
+            .connections
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        let mut connection_credential_refs: Vec<String> = sqlx::query_scalar(
+            "DELETE FROM plugin_connections
+              WHERE installation_id = $1 AND NOT (slot = ANY($2))
+             RETURNING credential_ref",
+        )
+        .bind(&current.id)
+        .bind(&slots)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(plugin_store_err)?;
+        connection_credential_refs.sort();
+
+        // A new image is new code: the runtime proves isolation again before
+        // it starts (ADR-0072 §9), and the state version moves so a status
+        // the runtime decided for the old image is refused.
+        let config = serde_json::to_value(&next.config)
+            .map_err(|e| PluginStoreError::Store(e.to_string()))?;
+        let sql = format!(
+            "UPDATE plugin_installations SET
+                 image = $3, manifest = $4, manifest_sha256 = $5, config = $6,
+                 manifest_source = $7, manifest_connection = $8,
+                 approved_by = $9, approved_at = $10,
+                 state_version = state_version + 1,
+                 runtime_status = 'pending', runtime_message = '', probe_passed_at = NULL
+             WHERE org = $1 AND name = $2
+             RETURNING {INSTALLATION_COLUMNS}"
+        );
+        let row = sqlx::query(&sql)
+            .bind(org)
+            .bind(name)
+            .bind(&next.image)
+            .bind(manifest(&next.manifest)?)
+            .bind(&next.manifest_sha256)
+            .bind(config)
+            .bind(&next.source)
+            .bind(&next.source_connection)
+            .bind(&next.approved_by)
+            .bind(next.approved_at)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(plugin_store_err)?;
+        let installation = installation_from_row(&row)?;
+        tx.commit().await.map_err(plugin_store_err)?;
+        Ok(Some(PluginUpgraded {
+            installation,
+            connection_credential_refs,
+        }))
+    }
+
+    async fn installation_versions(
+        &self,
+        installation_id: &str,
+    ) -> Result<Vec<PluginInstallationVersion>, PluginStoreError> {
+        let rows = sqlx::query(
+            "SELECT installation_id, image, manifest, manifest_sha256, manifest_source,
+                    manifest_connection, approved_by, approved_at, replaced_by, replaced_at,
+                    step_up_ref
+               FROM plugin_installation_versions
+              WHERE installation_id = $1
+              ORDER BY id",
+        )
+        .bind(installation_id)
+        .fetch_all(self.pool())
+        .await
+        .map_err(plugin_store_err)?;
+        rows.iter()
+            .map(|r| {
+                let manifest: PluginManifest =
+                    serde_json::from_value(r.get::<Value, _>("manifest")).map_err(|e| {
+                        PluginStoreError::Store(format!(
+                            "plugin installation {installation_id}: unreadable earlier \
+                             manifest: {e}"
+                        ))
+                    })?;
+                Ok(PluginInstallationVersion {
+                    installation_id: r.get("installation_id"),
+                    image: r.get("image"),
+                    manifest,
+                    manifest_sha256: r.get("manifest_sha256"),
+                    source: r.get("manifest_source"),
+                    source_connection: r.get("manifest_connection"),
+                    approved_by: r.get("approved_by"),
+                    approved_at: r.get("approved_at"),
+                    replaced_by: r.get("replaced_by"),
+                    replaced_at: r.get("replaced_at"),
+                    step_up_ref: r.get("step_up_ref"),
+                })
+            })
+            .collect()
     }
 
     async fn set_runtime_status(

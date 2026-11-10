@@ -1,4 +1,4 @@
-// Org-installed libraries (ADR-0076 §4-§6), as the Settings › Libraries panel
+// Org-installed libraries, as the Settings › Libraries panel
 // reasons about them. Pure — no DOM, no fetch — so the panel and its tests
 // agree on what a form sends and what a line says.
 //
@@ -7,14 +7,18 @@
 // reviewed, naming the hash it replaces). These helpers only let the form say
 // what is wrong before the round trip; where they could disagree, the server
 // wins and its text is shown.
-import { libraryReviewHref } from "./settings-nav";
+import { libraryReviewHref, orgHref } from "./settings-nav";
 
 const SEGMENT = /^[A-Za-z0-9_][A-Za-z0-9._-]{0,99}$/;
 const COMMIT = /^([0-9a-f]{40}|[0-9a-f]{64})$/;
 
-/** Why `source` is not `<host>/<owner>/<repo>//<path>@<commit>`, or `null`.
- *  An empty field is not an error yet. */
-export function sourceError(source: string): string | null {
+/** Why `source` is not `<host>/<owner>/<repo>//<path>@<commit>` with a
+ *  path `file` accepts, or `null`. An empty field is not an error yet. The
+ *  library form and the plugin manifest form both read sources this way. */
+export function pinnedSourceError(
+  source: string,
+  file: { ext: RegExp; example: string; hint: string },
+): string | null {
   const s = source.trim().replace(/^https:\/\//, "");
   if (s === "") return null;
   const at = s.lastIndexOf("@");
@@ -25,16 +29,25 @@ export function sourceError(source: string): string | null {
   }
   const location = s.slice(0, at);
   const split = location.indexOf("//");
-  if (split < 0) return "Separate the repository from the file with //: github.com/acme/libs//deploy.yaml@<commit>.";
+  if (split < 0) return `Separate the repository from the file with //: github.com/acme/${file.example}@<commit>.`;
   const repo = location.slice(0, split).split("/");
   const path = location.slice(split + 2);
   if (repo.length !== 3 || !repo[0]!.includes(".") || !SEGMENT.test(repo[1]!) || !SEGMENT.test(repo[2]!)) {
     return "The repository is <host>/<owner>/<repo>, for example github.com/acme/scarab-libs.";
   }
-  if (!/\.ya?ml$/.test(path) || path.split("/").some((p) => p === "" || p === "." || p === "..")) {
-    return "The file is a repo-relative .yaml path.";
+  if (!file.ext.test(path) || path.split("/").some((p) => p === "" || p === "." || p === "..")) {
+    return file.hint;
   }
   return null;
+}
+
+/** Why `source` is not a library source, or `null`. */
+export function sourceError(source: string): string | null {
+  return pinnedSourceError(source, {
+    ext: /\.ya?ml$/,
+    example: "libs//deploy.yaml",
+    hint: "The file is a repo-relative .yaml path.",
+  });
 }
 
 /** Why `segment` cannot be a publisher or name, or `null` (empty = default). */
@@ -105,36 +118,7 @@ export function yankReasonError(reason: string): string | null {
   return null;
 }
 
-/** The update notice for an installation, as one line. */
-export function updateLine(update: { release: string; security_fix: boolean } | null | undefined): string | null {
-  if (!update) return null;
-  return update.security_fix
-    ? `${update.release} is available and fixes a security problem`
-    : `${update.release} is available`;
-}
-
-/** What the org's defaults record says, as one line; `null` when there is
- *  nothing to tell. */
-export function defaultsLine(
-  d: { state: string; missing: { publisher: string; name: string; error: string }[] } | null | undefined,
-): string | null {
-  if (!d) return null;
-  switch (d.state) {
-    case "pending":
-      return "Installing the first-party libraries…";
-    case "missing":
-      return `${d.missing.length === 1 ? "A first-party library is" : "First-party libraries are"} not installed: the source could not be read.`;
-    default:
-      return null;
-  }
-}
-
-/** A missing default, named: the release manifest itself has no name. */
-export function missingLabel(m: { publisher: string; name: string }): string {
-  return m.name ? `lib:${m.publisher}/${m.name}` : "release manifest";
-}
-
-// --- Settings › Libraries table, yank dialog and upgrade review (ADR-0076) ---
+// --- Settings › Libraries table, yank dialog and upgrade review ---
 
 /** A source without its commit: what trust with forge credentials is kept
  *  against (`scarab_policy::library::trust_key`). */
@@ -144,16 +128,13 @@ export function trustKey(source: string): string {
   return at < 0 ? s : s.slice(0, at);
 }
 
-/** Why an installation may receive a long-lived forge credential (ADR-0076
- *  §9): the first-party clone library by default, or a source the org
- *  trusts. `null` = it may not. */
+/** Why an installation may receive a long-lived forge credential: its
+ *  source is one the org trusts. `null` = it may not. No library is trusted
+ *  by default, whoever publishes it. */
 export function trustNote(
-  l: { publisher: string; name: string; source: string; first_party: boolean },
+  l: { source: string },
   trusted: { source: string; trusted_by: string }[],
 ): string | null {
-  if (l.first_party && l.publisher === "thulasi-ram" && l.name === "clone") {
-    return "Trusted with forge credentials by default: the first-party clone library.";
-  }
   const t = trusted.find((t) => t.source === trustKey(l.source));
   return t ? `Source trusted with forge credentials by ${t.trusted_by}.` : null;
 }
@@ -275,7 +256,6 @@ export type ReviewCheck = { tone: "ok" | "info" | "warn"; text: string };
  *  library; these lines say what that means for this file. */
 export function reviewChecks(
   content: string,
-  inManifest: boolean,
   installed: { publisher: string; name: string; content_hash: string }[],
 ): ReviewCheck[] {
   const out: ReviewCheck[] = [
@@ -303,11 +283,6 @@ export function reviewChecks(
     /\bforge_token\b/.test(content)
       ? { tone: "warn", text: "A Step asks for forge_token: it receives a forge credential only if this source is trusted" }
       : { tone: "info", text: "No Step asks for forge_token, so trust with forge credentials does not apply" },
-  );
-  out.push(
-    inManifest
-      ? { tone: "ok", text: "The hash is in Scarab's release manifest" }
-      : { tone: "info", text: "The hash is not in a Scarab release manifest" },
   );
   return out;
 }
@@ -337,32 +312,111 @@ export function reviewHref(
   return `${libraryReviewHref(org)}${s ? `?${s}` : ""}`;
 }
 
-/** A library Scarab's release manifest lists, as the review page offers it:
- *  a source to fill in and review like any other, nothing more. */
-export type ReleaseSource = {
-  id: string;
-  source: string;
-  publisher: string;
-  name: string;
-  release: string;
-  security_fix: boolean;
-};
+// --- Settings › Libraries list and each library's manage page ---
 
-/** The release manifest's libraries the org has not installed under their
- *  name, sorted by id. They go through the same fetch, review and install
- *  as any source; the manifest only says where to find them. */
-export function releaseSources(
-  listed: { publisher: string; name: string; source: string; release: string; security_fix: boolean; installed: boolean }[],
-): ReleaseSource[] {
-  return listed
-    .filter((l) => !l.installed)
-    .map((l) => ({
-      id: `lib:${l.publisher}/${l.name}`,
-      source: l.source,
-      publisher: l.publisher,
-      name: l.name,
-      release: l.release,
-      security_fix: l.security_fix,
-    }))
-    .sort((a, b) => a.id.localeCompare(b.id));
+/** How pipelines name an installation: `lib:<publisher>/<name>`. */
+export function libraryId(l: { publisher: string; name: string }): string {
+  return `lib:${l.publisher}/${l.name}`;
+}
+
+/** What `<publisher>~<name>` named in a manage page's URL before the URL
+ *  carried the installation's id. Neither part can hold a `~` (see
+ *  `segmentError`), so it splits back into the two. */
+export function libraryKey(l: { publisher: string; name: string }): string {
+  return `${l.publisher}~${l.name}`;
+}
+
+/** The publisher and name an old `<publisher>~<name>` segment holds, or
+ *  `null`. The manage page turns one into the installation's id URL. */
+export function parseLibraryKey(key: string): { publisher: string; name: string } | null {
+  const parts = key.split("~");
+  if (parts.length !== 2) return null;
+  const [publisher, name] = parts as [string, string];
+  if (!publisher || !name || segmentError(publisher) || segmentError(name)) return null;
+  return { publisher, name };
+}
+
+/** The manage page of one installation in `org`, by its id. */
+export function libraryManageHref(org: string, l: { id: string }): string {
+  return `${orgHref(org, "libraries")}/${encodeURIComponent(l.id)}/manage`;
+}
+
+/** A small state tag on a row or a heading. */
+export type ChipTone = "ok" | "motion" | "danger" | "muted";
+export type Chip = { label: string; tone: ChipTone; title: string };
+
+/** The state tags of one installation, most urgent first: yanked, then
+ *  whether its source is trusted with forge credentials. */
+export function libraryChips(
+  l: { source: string; yanked?: { reason: string; yanked_by: string } | null },
+  trusted: { source: string; trusted_by: string }[],
+): Chip[] {
+  const out: Chip[] = [];
+  if (l.yanked) {
+    out.push({ label: "yanked", tone: "danger", title: `Yanked by ${l.yanked.yanked_by}: ${l.yanked.reason}` });
+  }
+  const trust = trustNote(l, trusted);
+  out.push(
+    trust
+      ? { label: "trusted source", tone: "ok", title: trust }
+      : {
+          label: "untrusted source",
+          tone: "muted",
+          title: "No Step from this source receives a long-lived forge token until the org trusts the source.",
+        },
+  );
+  return out;
+}
+
+/** What a yank says about its version: the library it was fetched for and
+ *  the pinned source. */
+type YankOf = { content_hash: string; publisher: string; name: string; yanked_at: number };
+
+/** Every yank of `lib`'s versions, newest first: the yanks of its
+ *  `<publisher>/<name>`, and the installed version's whatever it was first
+ *  fetched for. `installed` marks the installed version's. The manage page
+ *  lists them. */
+export function yanksOfLibrary<Y extends YankOf>(
+  yanks: readonly Y[],
+  lib: { publisher: string; name: string; content_hash: string },
+): (Y & { installed: boolean })[] {
+  return yanks
+    .filter((y) => y.content_hash === lib.content_hash || (y.publisher === lib.publisher && y.name === lib.name))
+    .map((y) => ({ ...y, installed: y.content_hash === lib.content_hash }))
+    .sort((a, b) => b.yanked_at - a.yanked_at);
+}
+
+/** Yanks of libraries with no installation at all: the list page keeps
+ *  them, since no manage page does. */
+export function removedLibraryYanks<Y extends YankOf>(
+  yanks: readonly Y[],
+  installed: readonly { publisher: string; name: string; content_hash: string }[],
+): Y[] {
+  return yanks.filter((y) => !installed.some((i) => yanksOfLibrary([y], i).length > 0));
+}
+
+/** A version as a person reads it: its source with the commit cut to 7
+ *  characters, `github.com/acme/libs//deploy.yaml@8c2f4e1`. */
+export function versionLabel(source: string): string {
+  const at = source.lastIndexOf("@");
+  return at < 0 ? source : `${source.slice(0, at)}@${source.slice(at + 1, at + 8)}`;
+}
+
+/** Trusted sources no installation comes from now: the list page keeps
+ *  them, since no manage page does. */
+export function strayTrust<T extends { source: string }>(
+  trusted: readonly T[],
+  installed: readonly { source: string }[],
+): T[] {
+  return trusted.filter((t) => !installed.some((i) => trustKey(i.source) === t.source));
+}
+
+/** Each trusted source with the installations that come from it now, for
+ *  the read-only list under Library policies. An empty `libraries`: no
+ *  installation comes from the source. */
+export function trustedSourceRows<T extends { source: string }, I extends { source: string }>(
+  trusted: readonly T[],
+  installed: readonly I[],
+): (T & { libraries: I[] })[] {
+  return trusted.map((t) => ({ ...t, libraries: installed.filter((i) => trustKey(i.source) === t.source) }));
 }

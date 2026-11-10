@@ -74,7 +74,7 @@ function ErrorRow(props: { e: CompileError }) {
         <Show when={errorFix(e())}>
           {(fix) => (
             <div class="ck-fix">
-              <span class="lbl">fix</span>
+              <span class="lbl">Fix</span>
               <span>{fix()}</span>
               <Show when={change().length > 0}>
                 <button class="xs-link" onClick={copy}>

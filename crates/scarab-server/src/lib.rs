@@ -100,7 +100,8 @@ pub mod oauth;
 pub mod oidc;
 /// ADR-0071: the minimal org-level Environment — its admin/read API.
 pub mod org_environments;
-/// ADR-0072: PluginInstallations — the first-party catalog, install,
+pub mod people;
+/// ADR-0072: PluginInstallations — fetch a manifest to review, install,
 /// uninstall and the kill switch.
 pub mod plugin_gates;
 /// ADR-0072 §9: the plugin runtime's leased reconcile loop — namespace
@@ -118,6 +119,8 @@ mod routes;
 mod run_gate_view;
 pub mod run_origin;
 pub mod schedules;
+#[doc(hidden)]
+pub mod test_support;
 pub use routes::{route_table, RouteEntry};
 pub mod secret_executor;
 pub mod step_pods;
@@ -200,12 +203,6 @@ pub struct AppState {
     /// a4cb94f). Shared by every clone of this state, so one process counts
     /// once; written by [`flush_api_token_uses`].
     pub api_token_uses: Arc<ApiTokenUses>,
-    /// The legacy approval history (ADR-0037, ADR-0070 §1):
-    /// `record_deployment` on every gate release and its read endpoint.
-    /// Admission never reads it since ADR-0071 — see
-    /// [`environment_governance`](AppState::environment_governance). `None`
-    /// disables the history endpoint.
-    pub approval_history: Option<Arc<dyn scarab_project::ApprovalHistoryStore>>,
     /// Org-level Environment governance (ADR-0071 §2, §3, §8): what admits
     /// and governs every Deploy Run — eligibility, effective protection,
     /// privilege grants — at Run creation, at gate approval and at secret
@@ -226,9 +223,6 @@ pub struct AppState {
     /// Reads a library from a public forge (ADR-0076 §4). `None`: only
     /// installs through a ForgeConnection work.
     pub library_fetcher: Option<Arc<dyn library_fetch::AnonymousFetcher>>,
-    /// The release manifest that says which library versions are
-    /// first-party (ADR-0076 §5). Off unless wired.
-    pub first_party: Arc<libraries::FirstParty>,
     /// Org-level Environments (ADR-0071, MMP step 1). `None` disables
     /// `/v1/orgs/{org}/environments[/{env}]` (404).
     pub org_environments: Option<Arc<dyn scarab_project::OrgEnvironmentStore>>,
@@ -257,8 +251,8 @@ pub struct AppState {
     /// the audience `scarab-api` in production, static dev tokens under
     /// `SCARAB_DEV_INSECURE`. `None`: no plugin can list or resolve a gate.
     pub plugin_api_tokens: Option<Arc<dyn scarab_plugin::PluginTokenVerifier>>,
-    /// Whether installs are on, the plugin namespace, the first-party
-    /// catalog's repository and the dev tag knob. Off by default.
+    /// Whether installs are on, the plugin namespace and the dev tag knob.
+    /// Off by default.
     pub plugin_policy: Arc<plugins::PluginPolicy>,
     /// "Intentionally unset" markers for the secret coverage matrix (ADR-0037 D).
     /// Advisory annotations only — `None` disables marking, and the matrix simply
@@ -370,12 +364,10 @@ impl AppState {
             sessions: None,
             api_tokens: None,
             api_token_uses: Arc::default(),
-            approval_history: None,
             environment_governance: None,
             policies: None,
             libraries: None,
             library_fetcher: None,
-            first_party: Arc::new(libraries::FirstParty::new(libraries::ManifestSource::Off)),
             org_environments: None,
             plugins: None,
             broker_plugins: None,
@@ -457,15 +449,6 @@ impl AppState {
         self
     }
 
-    /// Enable the legacy approval history (ADR-0037, ADR-0070 §1).
-    pub fn with_approval_history(
-        mut self,
-        approval_history: Arc<dyn scarab_project::ApprovalHistoryStore>,
-    ) -> Self {
-        self.approval_history = Some(approval_history);
-        self
-    }
-
     /// Govern Deploy Runs by org-level Environments (ADR-0071): eligibility
     /// and effective protection at Run creation and gate approval, and the
     /// per-repo environment reads.
@@ -498,12 +481,6 @@ impl AppState {
         fetcher: Arc<dyn library_fetch::AnonymousFetcher>,
     ) -> Self {
         self.library_fetcher = Some(fetcher);
-        self
-    }
-
-    /// Where the first-party release manifest is read from (ADR-0076 §5).
-    pub fn with_first_party(mut self, source: libraries::ManifestSource) -> Self {
-        self.first_party = Arc::new(libraries::FirstParty::new(source));
         self
     }
 
@@ -719,6 +696,15 @@ impl AppState {
         self
     }
 
+    /// The Principals `refs` (ids or handles, mixed) name, looked up once
+    /// (ADR-0080 §3).
+    pub(crate) async fn people<'a>(
+        &self,
+        refs: impl IntoIterator<Item = &'a str>,
+    ) -> people::People {
+        people::People::lookup(self.identities.as_deref(), refs).await
+    }
+
     /// Set Scarab's public base URL (`SCARAB_PUBLIC_URL`) — the one place the
     /// server learns how the outside world reaches it.
     ///
@@ -812,7 +798,9 @@ impl AppState {
     /// 3. else the default — a bare id is the `unqualified_ids` provider's.
     pub async fn login_provider_for(&self, subject: &str) -> Option<String> {
         let configured = |id: &str| self.oauth_providers.iter().any(|p| p.provider_id() == id);
-        let prefix = subject
+        // The prefix is the handle's (ADR-0080): an id carries none.
+        let handle = self.people([subject]).await.handle(subject);
+        let prefix = handle
             .split_once(':')
             .map(|(p, _)| p)
             .filter(|p| configured(p));
@@ -1193,6 +1181,17 @@ pub struct SnapshotRetentionDto {
     /// When it was pinned, epoch millis.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pinned_at: Option<i64>,
+}
+
+impl people::ShowsPeople for SnapshotRetentionDto {
+    fn refs(&self) -> Vec<&str> {
+        self.pinned_by.as_deref().into_iter().collect()
+    }
+    fn show(&mut self, people: &people::People) {
+        if let Some(by) = &mut self.pinned_by {
+            people.show_one(by);
+        }
+    }
 }
 
 /// Build the retention promise for a run from its durable facts plus the
@@ -1994,6 +1993,31 @@ async fn create_run(
     ))
 }
 
+/// `409` when `owner/name` is bound but its connection no longer reaches it
+/// (the GitHub App's installation stopped covering it): a Run of it could
+/// not read its Pipeline, clone or post a status, so none is started.
+async fn refuse_unreachable_repo(st: &AppState, owner: &str, name: &str) -> Result<(), ApiError> {
+    let Some(connections) = st.connections.as_ref() else {
+        return Ok(());
+    };
+    let repo = scarab_forge::RepoRef {
+        owner: owner.to_string(),
+        name: name.to_string(),
+    };
+    let resolved = connections
+        .resolve(&repo)
+        .await
+        .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?;
+    if let Some(since) = resolved.and_then(|r| r.unreachable_since) {
+        return Err(ApiError::Conflict(format!(
+            "{owner}/{name} is unreachable since {since} (unix ms): its forge connection no \
+             longer covers it, so no run can start. Add it back to the GitHub App's \
+             installation, or disable it to remove it from Scarab."
+        )));
+    }
+    Ok(())
+}
+
 /// Dispatch a named repo pipeline at a ref (ADR-0043 "World B"). Authorized as a
 /// write (like [`create_run`]); a dispatch is a *trigger*, so a deploy pipeline
 /// still hits its Environment's protection rules at admission. Returns the new
@@ -2008,6 +2032,7 @@ async fn create_run(
     request_body = DispatchRequest,
     responses(
         (status = 201, description = "Run created", body = CreateRunResponse),
+        (status = 409, description = "the repository is unreachable: its forge connection no longer covers it"),
         (status = 403, description = "the caller may not dispatch, the pipeline's Environment does not exist in the org or does not admit this project (ADR-0071), or a run.create Policy denied the Run (ADR-0075); the body says why. No run is created")
     )
 )]
@@ -2023,6 +2048,7 @@ async fn dispatch(
     };
     let principal = authorize_scoped(&st, &headers, Action::Write, Some(&scope)).await?;
     refuse_nul_reason(req.reason.as_deref())?;
+    refuse_unreachable_repo(&st, &org, &repo).await?;
 
     // Dispatch rides the read-at-ref machinery, so a forge must be wired.
     let forge = st
@@ -2035,7 +2061,9 @@ async fn dispatch(
         st.db.as_ref(),
         st.clock.as_ref(),
         st.admission_ports(),
-        principal.subject,
+        // The Actor of a dispatch is the Principal's handle (ADR-0080 §4):
+        // what `when: event.actor == …` compares and the Runs list shows.
+        principal.handle().to_string(),
         scarab_forge::RepoRef {
             owner: org,
             name: repo,
@@ -2459,11 +2487,14 @@ pub fn compile_errors(text: &str) -> Vec<CompileErrorDto> {
         .collect()
 }
 
-/// Query for [`list_runs`]: an optional page size.
+/// Query for [`list_runs`]: an optional page size and org.
 #[derive(Debug, Deserialize)]
 pub struct ListRunsQuery {
     /// Max runs to return (default [`DEFAULT_RUNS_LIMIT`], capped at [`MAX_RUNS_LIMIT`]).
     pub limit: Option<u32>,
+    /// Only the runs of this org, filtered before `limit`. Absent = every
+    /// org; present but empty is a 400.
+    pub org: Option<String>,
 }
 
 /// Query for [`list_repo_runs`]: a page size plus an optional Environment.
@@ -2488,8 +2519,14 @@ const MAX_RUNS_LIMIT: u32 = 200;
 #[utoipa::path(
     get,
     path = "/v1/runs",
-    params(("limit" = Option<u32>, Query, description = "max runs to return (default 50, max 200)")),
-    responses((status = 200, body = RunListResponse))
+    params(
+        ("limit" = Option<u32>, Query, description = "max runs to return (default 50, max 200)"),
+        ("org" = Option<String>, Query, description = "only this org's runs, applied before `limit`; must not be empty")
+    ),
+    responses(
+        (status = 200, body = RunListResponse),
+        (status = 400, description = "`org` present but empty")
+    )
 )]
 async fn list_runs(
     State(st): State<AppState>,
@@ -2503,7 +2540,15 @@ async fn list_runs(
     // dev submissions) are visible to global roles only.
     let caller = authenticate(&st, &headers, Action::Read).await?;
     let limit = q.limit.unwrap_or(DEFAULT_RUNS_LIMIT).min(MAX_RUNS_LIMIT);
-    let mut runs = st.db.list_runs(limit).await?;
+    let mut runs = match q.org.as_deref() {
+        Some("") => {
+            return Err(ApiError::BadRequest(
+                "`org` must name an org; omit it to list every org's runs".into(),
+            ))
+        }
+        Some(org) => st.db.list_runs_for_org(org, limit).await?,
+        None => st.db.list_runs(limit).await?,
+    };
     if !caller.may_globally(Action::Read) {
         // Resolve each distinct tenant once, never per run.
         let mut allowed: std::collections::HashMap<(String, String), bool> =
@@ -2568,8 +2613,11 @@ async fn get_run(
         .run_snapshot_retention(&run)
         .await?
         .ok_or(ApiError::NotFound)?;
-    let snapshot_retention =
-        snapshot_retention_dto(&retention, st.snapshot_retention_days, st.clock.now().await);
+    let snapshot_retention = people::shown(
+        st.identities.as_deref(),
+        snapshot_retention_dto(&retention, st.snapshot_retention_days, st.clock.now().await),
+    )
+    .await;
     // Enrich each step with its sidecar services + shared-service opt-ins (ADR-
     // 0058) from the stored spec, so the FE can render sidecar nodes and `uses`
     // edges and address per-sidecar logs by index. A step with no stored spec
@@ -2653,7 +2701,8 @@ async fn get_events(
     if st.db.run_status(&run).await?.is_none() {
         return Err(ApiError::NotFound);
     }
-    let events = st.db.events(&run).await?;
+    // Each person by handle, whichever form the event stored (ADR-0080 §3).
+    let events = people::shown(st.identities.as_deref(), st.db.events(&run).await?).await;
     let items: Vec<Result<Event, Infallible>> = events
         .into_iter()
         .map(|e| {
@@ -3410,11 +3459,8 @@ async fn current_snapshot_retention(
         .run_snapshot_retention(run)
         .await?
         .ok_or(ApiError::NotFound)?;
-    Ok(Json(snapshot_retention_dto(
-        &r,
-        st.snapshot_retention_days,
-        st.clock.now().await,
-    )))
+    let dto = snapshot_retention_dto(&r, st.snapshot_retention_days, st.clock.now().await);
+    Ok(Json(people::shown(st.identities.as_deref(), dto).await))
 }
 
 /// Cancel a run (ADR-0054): drive its non-terminal steps and the run to
@@ -3468,17 +3514,30 @@ pub struct ProjectDto {
     /// Derived from the connection's kind + base_url (the stored base is the API
     /// host, which differs from the web host on GitHub).
     pub repo_url: String,
+    /// The forge connection it is bound through: the `{id}` of
+    /// `/v1/connections/{id}/…`, and the row of `GET /v1/connections` that
+    /// says whether it is managed by configuration.
+    pub connection_id: String,
     /// Epoch millis of the project's most recent run, or `null` if it has never
     /// run — the dashboard's recency signal (ADR-0046). The domain carries no
     /// push/created_at yet, so never-run repos have no ordering key here.
     pub last_run_at: Option<i64>,
+    /// Unix-ms since when its forge connection has not reached it (the
+    /// GitHub App's installation stopped covering it), or `null`. The
+    /// Project is kept; its events are ignored and no run can start until
+    /// the forge covers it again or an admin disables it.
+    pub unreachable_since: Option<i64>,
 }
 
 /// The authenticated principal (ADR-0049) — powers the UI's identity menu.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct MeResponse {
-    /// Stable, forge-agnostic identity subject.
+    /// The Principal's id (ADR-0080): stable, random, never shown as a name.
     pub subject: String,
+    /// The same id, under the name every person response uses.
+    pub id: String,
+    /// The Principal's handle (`github:alice`): what people read and type.
+    pub handle: String,
     /// Human display name, when the identity provides one.
     pub display_name: Option<String>,
     /// The principal's Scarab-native roles (e.g. `["Owner"]`).
@@ -3548,6 +3607,8 @@ async fn me(State(st): State<AppState>, headers: HeaderMap) -> Result<Json<MeRes
     // owner's C1 bootstrap and nothing else — so an API token never reports an
     // administrable org it could not actually act on.
     Ok(Json(MeResponse {
+        id: caller.principal.subject.clone(),
+        handle: caller.principal.handle().to_string(),
         subject: caller.principal.subject,
         display_name: caller.principal.display_name,
         roles: caller
@@ -3706,7 +3767,9 @@ async fn list_projects(
                 owner: repo.owner,
                 name: repo.name,
                 repo_url,
+                connection_id: resolved.connection.id,
                 last_run_at,
+                unreachable_since: resolved.unreachable_since,
             });
         }
     }
@@ -4650,26 +4713,50 @@ pub struct ActorLinks<'a> {
 }
 
 impl ActorLinks<'_> {
-    /// The Principal linked to `event`'s actor: `None` for a dispatch (its
-    /// actor is already a Principal, ADR-0075 §2), for an actor with no
-    /// immutable id, and when the repo has no forge connection, the forge no
-    /// login provider, or the account no Principal. A store failure is an
-    /// error, so a Policy that names Principals is never evaluated as if the
-    /// actor had none.
+    /// The Principal linked to `event`'s actor, as its id and handle. For a
+    /// dispatch, the actor IS a Principal's handle (ADR-0075 §2, ADR-0080
+    /// §4): it is looked up for its id (no identity store: the handle is the
+    /// id). For a webhook: `None` for an actor with no immutable id, and
+    /// when the repo has no forge connection, the forge no login provider,
+    /// or the account no Principal. A store failure is an error, so a Policy
+    /// that names Principals is never evaluated as if the actor had none.
     async fn principal_of(
         &self,
         event: &scarab_forge::Event,
         repo: &scarab_forge::RepoRef,
-    ) -> Result<Option<String>, TriggerError> {
-        let (Some(actor_id), Some(connections), Some(identities)) =
-            (event.actor_id(), self.connections, self.identities)
-        else {
-            return Ok(None);
-        };
+    ) -> Result<Option<policy_checkpoints::Named>, TriggerError> {
         let store_err = |what: &str, e: String| {
             TriggerError::Db(DbError::Other(format!(
                 "{what}: {e}; the Run was not created because its actor could not be resolved"
             )))
+        };
+        if let scarab_forge::Event::Manual { actor, .. } | scarab_forge::Event::Api { actor, .. } =
+            event
+        {
+            if actor.is_empty() {
+                return Ok(None);
+            }
+            let found = match self.identities {
+                Some(identities) => scarab_identity::lookup_principal(identities, actor)
+                    .await
+                    .map_err(|e| store_err("identities", e.to_string()))?,
+                None => None,
+            };
+            return Ok(Some(match found {
+                Some(p) => policy_checkpoints::Named {
+                    id: p.id,
+                    handle: p.handle,
+                },
+                None => policy_checkpoints::Named {
+                    id: actor.clone(),
+                    handle: actor.clone(),
+                },
+            }));
+        }
+        let (Some(actor_id), Some(connections), Some(identities)) =
+            (event.actor_id(), self.connections, self.identities)
+        else {
+            return Ok(None);
         };
         let Some(resolved) = connections
             .resolve(repo)
@@ -4693,9 +4780,15 @@ impl ActorLinks<'_> {
         else {
             return Ok(None);
         };
-        scarab_identity::resolve_principal(identities, &pinned)
-            .await
-            .map_err(|e| store_err("identities", e.to_string()))
+        Ok(
+            scarab_identity::resolve_principal_record(identities, &pinned)
+                .await
+                .map_err(|e| store_err("identities", e.to_string()))?
+                .map(|p| policy_checkpoints::Named {
+                    id: p.id,
+                    handle: p.handle,
+                }),
+        )
     }
 }
 
@@ -5925,15 +6018,18 @@ fn policy_store_err(e: scarab_policy::store::PolicyStoreError) -> TriggerError {
 }
 
 /// The `run.create` trigger of `event` (ADR-0075 §2). For a manual or API
-/// dispatch the actor is the authenticated Principal (the dispatch handler
-/// passes `principal.subject`), so it is both `trigger.principal` and the
-/// input's `principal`. A webhook actor is a forge login: its `principal`
+/// dispatch the actor is the authenticated Principal's handle (the dispatch
+/// handler passes `principal.handle()`, ADR-0080 §4), so it is both
+/// `trigger.principal` and the input's `principal`, with the id beside each. A webhook actor is a forge login: its `principal`
 /// is `linked`, the Principal its immutable account id is pinned to through
 /// identity links (ADR-0069, [`ActorLinks::principal_of`]), or none.
 fn run_create_trigger(
     event: &scarab_forge::Event,
-    linked: Option<String>,
-) -> (scarab_policy::run_create::Trigger, Option<String>) {
+    linked: Option<policy_checkpoints::Named>,
+) -> (
+    scarab_policy::run_create::Trigger,
+    Option<policy_checkpoints::Named>,
+) {
     use scarab_forge::{Event, TriggerKind as F};
     use scarab_policy::run_create::TriggerKind as P;
     let kind = match event.trigger_kind() {
@@ -5957,8 +6053,8 @@ fn run_create_trigger(
     }
     .filter(|s| !s.is_empty());
     let (principal, reason) = match event {
-        Event::Manual { actor, reason, .. } | Event::Api { actor, reason, .. } => (
-            (!actor.is_empty()).then(|| actor.clone()),
+        Event::Manual { reason, .. } | Event::Api { reason, .. } => (
+            linked,
             reason
                 .clone()
                 .filter(|r| !r.trim().is_empty())
@@ -5972,7 +6068,8 @@ fn run_create_trigger(
         sha,
         fork: event.is_fork_pr(),
         actor: event.actor().map(str::to_string),
-        principal: principal.clone(),
+        principal: principal.as_ref().map(|p| p.handle.clone()),
+        principal_id: principal.as_ref().map(|p| p.id.clone()),
         reason,
     };
     (trigger, principal)
@@ -5984,7 +6081,7 @@ fn run_create_trigger(
 /// and the policy test API.
 fn run_create_facts(
     event: &scarab_forge::Event,
-    linked: Option<String>,
+    linked: Option<policy_checkpoints::Named>,
     path: &str,
     repo: &scarab_forge::RepoRef,
     gov: &RunGovernance,
@@ -6012,7 +6109,8 @@ fn run_create_facts(
             trigger,
             pipeline_path: path.to_string(),
             environment,
-            principal,
+            principal: principal.as_ref().map(|p| p.handle.clone()),
+            principal_id: principal.map(|p| p.id),
             time,
             params: params.cloned().unwrap_or_default(),
             event: serde_json::Map::new(),
@@ -7516,6 +7614,34 @@ async fn ingest_event(
             Json(serde_json::json!({ "ignored": "no forge configured" })),
         ));
     };
+    // A repo the forge covers but no admin has enabled has no Project, and a
+    // bound one the connection no longer reaches cannot be read: their events
+    // are acknowledged and dropped, before any forge read. A 2xx, so
+    // the forge does not retry a delivery that will never be acted on (a
+    // GitHub App delivers every covered repo's events, enabled or not).
+    if let (Some(connections), Some(repo)) = (st.connections.as_ref(), event.repo()) {
+        let bound = connections
+            .resolve(repo)
+            .await
+            .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?;
+        match bound {
+            None => {
+                return Ok((
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "ignored": "repository not enabled" })),
+                ))
+            }
+            // The connection no longer reaches it (the App's installation
+            // stopped covering it): no forge read could succeed.
+            Some(r) if r.unreachable_since.is_some() => {
+                return Ok((
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "ignored": "repository unreachable" })),
+                ))
+            }
+            Some(_) => {}
+        }
+    }
     let triggered = async {
         if matches!(event, scarab_forge::Event::Cron { .. }) {
             return Ok(TriggerOutcome::default());
@@ -7584,9 +7710,22 @@ async fn ingest_event(
 /// The API base every GitHub App installation connection talks to.
 const GITHUB_API_BASE: &str = "https://api.github.com";
 
-/// Apply an installation delivery to the registry (ADR-0046: installing the
-/// App **is** registration), into the Org of the installation's account
+/// Apply an installation delivery to the registry: installing the App
+/// registers its connection, serving the Org of the installation's account
 /// (git-bug 19b0a45).
+///
+/// Enabling a repository is opt-in. The delivery binds none of the repos it
+/// adds: they are available, listed on the org's repositories page, and an
+/// admin enables the ones Scarab should build (`POST
+/// /v1/connections/{id}/repos`). So a repo an admin disabled stays disabled
+/// whatever the forge sends next.
+///
+/// Nothing is unbound either. A bound repo the installation stops covering,
+/// or every bound repo when the App is uninstalled or suspended, is marked
+/// unreachable and keeps its Project (Environments, secrets, grants); its
+/// events are ignored and no forge call is made for it. The mark clears when
+/// a delivery covers the repo again (or a re-sync lists it). Only an admin's
+/// unbind removes the Project.
 ///
 /// The connection `github-install-<id>` records its installation id and the
 /// account's immutable id, so once it serves an Org its tokens are minted
@@ -7664,39 +7803,21 @@ async fn register_installation(
             ),
         }
     }
-    // Unassigned: the repos wait for a global admin, so nothing is homed in
-    // an Org by name alone. Removals still apply.
-    let sync = if org.is_some() {
-        sync.clone()
-    } else {
-        scarab_forge_github::InstallationSync {
-            added: Vec::new(),
-            ..sync.clone()
-        }
-    };
-    let skipped =
-        scarab_forge_github::apply_installation_sync(connections, &conn_id, account, &sync)
-            .await
-            .map_err(registry)?;
-    for repo in &skipped {
-        tracing::warn!(
-            connection = %conn_id,
-            repo = %format!("{}/{}", repo.owner, repo.name),
-            "installation sync skipped a repo of another owner, or one bound through another \
-             org's connection"
-        );
-    }
-    // A new org gets the first-party libraries (ADR-0076 §5).
-    if sync.added.len() > skipped.len() {
-        libraries::offer_defaults_on_bind(st, account).await;
-    }
+    // Nothing is bound or unbound here. The added repos that are not bound
+    // are available and wait for an admin to enable them; bound repos the
+    // installation stops (or starts again) covering are marked unreachable
+    // (or reachable again).
+    let now = st.clock.now().await.0;
+    let reach = scarab_forge_github::apply_installation_reach(connections, &conn_id, sync, now)
+        .await
+        .map_err(registry)?;
     Ok((
         StatusCode::OK,
         Json(serde_json::json!({
             "registered": {
-                "added": sync.added.len() - skipped.len(),
-                "removed": sync.removed.len(),
-                "skipped": skipped.len(),
+                "available": sync.added.len(),
+                "unreachable": reach.marked,
+                "reachable_again": reach.cleared,
                 "org": org,
             },
         })),
@@ -7799,11 +7920,12 @@ fn delivery_assign_refusal(
 
 /// Inbound GitHub webhook ingest (ADR-0010, 0032, 0046): verify the HMAC
 /// signature with the GitHub secret, guard against replays by delivery id,
-/// auto-register installation events into the ForgeConnection registry
-/// (installing the App IS registration), normalize the payload to a canonical
-/// [`Event`](scarab_forge::Event), and durably create the triggered Runs.
-/// Unverified deliveries are rejected; administrative events (e.g. `ping`)
-/// are acknowledged and ignored.
+/// register installation events' connections in the ForgeConnection registry
+/// (their repos are only made available, see [`register_installation`]),
+/// normalize the payload to a canonical [`Event`](scarab_forge::Event), and
+/// durably create the triggered Runs. Unverified deliveries are rejected;
+/// administrative events (e.g. `ping`) and events of a repo that is not
+/// enabled are acknowledged and ignored.
 #[utoipa::path(post, path = "/webhooks/github", summary = "GitHub webhook ingest (HMAC-verified, ADR-0046)", responses((status = 202, description = "delivery accepted"), (status = 401, description = "bad signature")))]
 async fn github_webhook(
     State(st): State<AppState>,
@@ -7839,7 +7961,7 @@ async fn github_webhook(
         ));
     }
 
-    // Installation lifecycle → registry auto-registration (ADR-0046).
+    // Installation lifecycle → the connection's registration (ADR-0046).
     if let Some(sync) = scarab_forge_github::installation_sync(&delivery) {
         if let Some(connections) = st.connections.as_ref() {
             return register_installation(&st, connections.as_ref(), &sync).await;
@@ -7959,7 +8081,10 @@ pub struct LoginRequest {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct LoginResponse {
     pub session: String,
+    /// The Principal's id (ADR-0080).
     pub subject: String,
+    /// The Principal's handle: what people read.
+    pub handle: String,
     /// The session's CSRF token — browsers echo it in `x-csrf-token` on every
     /// mutation (also delivered as the readable `scarab_csrf` cookie).
     pub csrf: String,
@@ -8016,6 +8141,7 @@ async fn login(
         StatusCode::OK,
         Json(LoginResponse {
             session: session.id.clone(),
+            handle: principal.handle().to_string(),
             subject: principal.subject,
             csrf: csrf.clone(),
         }),
@@ -8397,16 +8523,18 @@ async fn link_callback(
         Ok(scarab_identity::LinkOutcome::Merged {
             from,
             removed_passkeys,
+            ..
         }) => {
             record_removed_passkeys(st, &principal.subject, &from, &removed_passkeys, &sid, now)
                 .await;
+            // A flag, not the folded account's handle: a URL carries no
+            // readable name (it lands in history and logs).
             format!(
-                "/settings/profile?identity_linked={}&merged={}",
-                flow.provider,
-                query_escape(&from)
+                "/settings/profile?identity_linked={}&merged=1",
+                flow.provider
             )
         }
-        Ok(scarab_identity::LinkOutcome::NeedsFoldedPasskey { from }) => {
+        Ok(scarab_identity::LinkOutcome::NeedsFoldedPasskey { from, .. }) => {
             match start_identity_merge(st, &sid, &principal.subject, &from, &identity, now).await {
                 Ok(id) => format!("/settings/profile?identity_merge={}", query_escape(&id)),
                 Err(why) => format!(
@@ -8714,6 +8842,7 @@ async fn confirm_identity_merge(
     {
         Ok(scarab_identity::LinkOutcome::Merged {
             from,
+            from_handle,
             removed_passkeys,
         }) => {
             record_removed_passkeys(
@@ -8726,7 +8855,7 @@ async fn confirm_identity_merge(
             )
             .await;
             Ok(Json(IdentityMergedDto {
-                merged: Some(from),
+                merged: Some(from_handle),
                 removed_passkeys: removed_passkeys.len(),
             }))
         }
@@ -8739,9 +8868,11 @@ async fn confirm_identity_merge(
             merged: None,
             removed_passkeys: 0,
         })),
-        Ok(scarab_identity::LinkOutcome::NeedsFoldedPasskey { from }) => Err(ApiError::Conflict(
-            format!("that passkey no longer belongs to `{from}`; start the link again"),
-        )),
+        Ok(scarab_identity::LinkOutcome::NeedsFoldedPasskey { from_handle, .. }) => {
+            Err(ApiError::Conflict(format!(
+                "that passkey no longer belongs to `{from_handle}`; start the link again"
+            )))
+        }
         Err(scarab_identity::IdentityError::Conflict(why)) => Err(ApiError::Conflict(why)),
         Err(e) => Err(ApiError::BadRequest(e.to_string())),
     }
@@ -8864,6 +8995,7 @@ async fn logout(State(st): State<AppState>, headers: HeaderMap) -> Result<Respon
 /// org-scoped (inherits down to every project of the org).
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct BindingRequest {
+    /// The person: a handle (`github:alice`) or a Principal id (ADR-0080).
     pub subject: String,
     /// `viewer` | `member` | `admin` | `owner`.
     pub role: String,
@@ -8880,13 +9012,15 @@ struct BindingQuery {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct BindingDto {
-    pub subject: String,
+    /// The Principal's id (ADR-0080): what a member's URL carries.
+    pub id: String,
+    /// The Principal's handle (`github:alice`): what people read and type.
+    pub handle: String,
     pub role: String,
     /// Empty = org-scoped.
     pub project: String,
     /// The Principal's display name, when the identity store knows it
-    /// (ADR-0069). Absent for a pre-upgrade bare subject nobody has signed in
-    /// as since.
+    /// (ADR-0069).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     /// `false` = created by a forge import and not signed into yet — the
@@ -8894,6 +9028,13 @@ pub struct BindingDto {
     /// know the subject.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub claimed: Option<bool>,
+    /// Who wrote the binding: `native` (granted in Scarab, which a forge
+    /// re-sync never changes) or `import` (seeded from the forge's
+    /// collaborators, which a re-sync refreshes or removes). Set on the org
+    /// listing; absent on an import's response, which lists what the forge
+    /// gave and not what each row holds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
 }
 
 /// `POST /v1/repos/{org}/{repo}/bindings/import` body: the forge users whose
@@ -8943,24 +9084,102 @@ async fn list_bindings(
         .bindings(&org)
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    let mut out = Vec::with_capacity(bindings.len());
-    for b in bindings {
-        let record = match st.identities.as_ref() {
-            Some(store) => store.principal(&b.subject).await.ok().flatten(),
-            None => None,
-        };
-        out.push(BindingDto {
-            display_name: record.as_ref().and_then(|r| r.display_name.clone()),
-            claimed: record.as_ref().map(|r| r.claimed_at.is_some()),
-            subject: b.subject,
-            role: role_name(b.role).to_string(),
-            project: match b.scope {
-                scarab_identity::Scope::Org(_) => String::new(),
-                scarab_identity::Scope::Project { name, .. } => name,
-            },
-        });
+    let people = st
+        .people(bindings.iter().map(|(b, _)| b.subject.as_str()))
+        .await;
+    Ok(Json(
+        bindings
+            .into_iter()
+            .map(|(b, origin)| binding_dto(&people, b, Some(origin)))
+            .collect(),
+    ))
+}
+
+/// One binding row as the API returns it, its person looked up in `people`.
+fn binding_dto(
+    people: &people::People,
+    b: scarab_identity::Binding,
+    origin: Option<scarab_identity::BindingOrigin>,
+) -> BindingDto {
+    let person = people.person(&b.subject);
+    BindingDto {
+        claimed: people.get(&b.subject).map(|r| r.claimed_at.is_some()),
+        id: person.id,
+        handle: person.handle,
+        display_name: person.display_name,
+        origin: origin.map(|o| {
+            match o {
+                scarab_identity::BindingOrigin::Native => "native",
+                scarab_identity::BindingOrigin::Import => "import",
+            }
+            .to_string()
+        }),
+        role: role_name(b.role).to_string(),
+        project: match b.scope {
+            scarab_identity::Scope::Org(_) => String::new(),
+            scarab_identity::Scope::Project { name, .. } => name,
+        },
     }
-    Ok(Json(out))
+}
+
+/// `GET /v1/orgs/{org}/members/{id}`: one person and the roles they hold in
+/// the org (ADR-0080 §5). The member page reads this by the Principal's id.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MemberDto {
+    pub id: String,
+    pub handle: String,
+    pub display_name: Option<String>,
+    /// `false` = created by a forge import, not signed into yet. Absent
+    /// when no identity store knows them.
+    pub claimed: Option<bool>,
+    /// Their bindings in the org, org scope first, then by repository.
+    pub bindings: Vec<BindingDto>,
+}
+
+/// One member of an org, by Principal id (ADR-0080 §5). Administer. A
+/// Principal with no binding in the org is still returned, with no
+/// bindings, so the page can say so; an id no Principal holds is a 404.
+#[utoipa::path(get, path = "/v1/orgs/{org}/members/{id}", summary = "One member of an org and their roles (ADR-0080)", params(("org" = String, Path, description = "org"), ("id" = String, Path, description = "the Principal's id")), responses((status = 200, body = MemberDto), (status = 403, description = "not an org admin"), (status = 404, description = "no such Principal")))]
+async fn get_member(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((org, id)): Path<(String, String)>,
+) -> Result<Json<MemberDto>, ApiError> {
+    let scope = scarab_identity::Scope::Org(org.clone());
+    authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
+    let rbac = st.rbac.as_ref().ok_or(ApiError::NotFound)?;
+    let record = match st.identities.as_ref() {
+        Some(store) => Some(
+            store
+                .principal(&id)
+                .await
+                .map_err(|e| ApiError::BadRequest(e.to_string()))?
+                .ok_or(ApiError::NotFound)?,
+        ),
+        None => None,
+    };
+    let bindings = rbac
+        .bindings(&org)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let people = st.people([id.as_str()]).await;
+    let mut mine: Vec<BindingDto> = bindings
+        .into_iter()
+        .filter(|(b, _)| b.subject == id)
+        .map(|(b, origin)| binding_dto(&people, b, Some(origin)))
+        .collect();
+    mine.sort_by(|a, b| a.project.cmp(&b.project));
+    if record.is_none() && mine.is_empty() {
+        return Err(ApiError::NotFound);
+    }
+    let person = people.person(&id);
+    Ok(Json(MemberDto {
+        id: person.id,
+        handle: person.handle,
+        display_name: person.display_name,
+        claimed: record.map(|r| r.claimed_at.is_some()),
+        bindings: mine,
+    }))
 }
 
 /// Natively grant `subject` a role in the org (or one of its projects).
@@ -8993,17 +9212,22 @@ async fn put_binding(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// An admin-typed subject → the Principal id it names (ADR-0069 §3): a merged
-/// id follows to its target; a string no Principal holds is refused. Granting
-/// to one would hand the role to whoever next produced that string at sign-in —
-/// the recycled-login takeover, re-opened for every pre-assigned surface.
+/// An admin-typed subject → the Principal id it names (ADR-0069 §3,
+/// ADR-0080 §2): a handle or an id, a handle matched exactly or, when exactly
+/// one does, ignoring case; a merged Principal follows to its target; a
+/// string no Principal holds is refused. Granting to one would hand the role
+/// to whoever next produced that string at sign-in — the recycled-login
+/// takeover, re-opened for every pre-assigned surface.
 async fn resolve_typed_subject(st: &AppState, subject: &str) -> Result<String, ApiError> {
     let Some(store) = st.identities.as_ref() else {
         return Ok(subject.to_string());
     };
     scarab_identity::resolve_principal(store.as_ref(), subject)
         .await
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?
+        .map_err(|e| match e {
+            scarab_identity::IdentityError::Conflict(why) => ApiError::BadRequest(why),
+            e => ApiError::BadRequest(e.to_string()),
+        })?
         .ok_or_else(|| {
             ApiError::BadRequest(format!(
                 "`{subject}` is not a Scarab user. They must sign in once, or be imported \
@@ -9031,8 +9255,11 @@ pub struct PrincipalIdentityDto {
 /// A Principal, as the grant/approver typeahead offers it (ADR-0069 §3).
 #[derive(Debug, Serialize, ToSchema)]
 pub struct PrincipalDto {
-    /// What a grant or an approver entry stores.
+    /// The Principal's id (ADR-0080): what a grant or an approver entry
+    /// stores, and what a URL carries.
     pub id: String,
+    /// What a grant or an approver entry is typed as.
+    pub handle: String,
     pub display_name: Option<String>,
     /// `false` = created by a forge import, not signed into yet.
     pub claimed: bool,
@@ -9043,7 +9270,7 @@ pub struct PrincipalDto {
 /// are install-wide, so this is Administer-gated and capped: an org admin needs
 /// to find someone who holds no role here yet, which no org-scoped list could
 /// contain.
-#[utoipa::path(get, path = "/v1/orgs/{org}/principals", summary = "Search users for a grant or approver entry (ADR-0069)", params(("q" = String, Query, description = "id or handle prefix, or a display-name fragment")), responses((status = 200, body = [PrincipalDto]), (status = 403, description = "not an org admin")))]
+#[utoipa::path(get, path = "/v1/orgs/{org}/principals", summary = "Search users for a grant or approver entry (ADR-0069)", params(("q" = String, Query, description = "handle prefix, or a display-name fragment")), responses((status = 200, body = [PrincipalDto]), (status = 403, description = "not an org admin")))]
 async fn search_principals(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -9066,6 +9293,7 @@ async fn search_principals(
             .into_iter()
             .map(|m| PrincipalDto {
                 id: m.id,
+                handle: m.handle,
                 display_name: m.display_name,
                 claimed: m.claimed,
                 identities: m
@@ -9100,7 +9328,9 @@ async fn delete_binding(
         Some(name) => scarab_identity::Scope::Project { org, name },
         None => org_scope,
     };
-    rbac.revoke(&q.subject, &scope)
+    // A handle or an id (ADR-0080 §2); the row is keyed by the id.
+    let subject = resolve_typed_subject(&st, &q.subject).await?;
+    rbac.revoke(&subject, &scope)
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     Ok(StatusCode::NO_CONTENT)
@@ -9213,11 +9443,13 @@ async fn import_bindings(
         let principal = identities
             .pin(
                 &identity,
-                &provider.base_id_for_forge_account(&identity),
+                &provider.base_handle_for_forge_account(&identity),
+                provider.placeholder_rule(),
                 now,
             )
             .await
-            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?
+            .id;
         match seeds.iter_mut().find(|(s, _)| *s == principal) {
             Some((_, r)) => *r = (*r).max(role),
             None => seeds.push((principal, role)),
@@ -9230,15 +9462,20 @@ async fn import_bindings(
     rbac.import_seeds(&scope, provider.provider_id(), &seeds, prune)
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let people = st.people(seeds.iter().map(|(s, _)| s.as_str())).await;
     Ok(Json(
         seeds
             .into_iter()
-            .map(|(subject, role)| BindingDto {
-                subject,
-                role: role_name(role).to_string(),
-                project: repo.clone(),
-                display_name: None,
-                claimed: None,
+            .map(|(subject, role)| {
+                binding_dto(
+                    &people,
+                    scarab_identity::Binding {
+                        subject,
+                        scope: scope.clone(),
+                        role,
+                    },
+                    None,
+                )
             })
             .collect(),
     ))
@@ -9307,14 +9544,18 @@ pub struct MintedTokenDto {
 pub struct ApiTokenDto {
     pub id: String,
     pub name: String,
-    /// The principal who holds the token and whose live authority bounds it.
+    /// The id of the Principal who holds the token and whose live authority
+    /// bounds it (ADR-0080).
     pub owner_subject: String,
+    /// That Principal, as people read it.
+    pub owner: people::PersonDto,
     pub org: String,
     /// `None` for an org-scoped token.
     pub project: Option<String>,
     /// The granted ceiling, not the effective role — what the token can do
     /// depends on what its owner holds at the moment of each request.
     pub role: String,
+    /// Who minted it: a Principal's handle.
     pub created_by: String,
     /// Unix-ms.
     pub created_at: i64,
@@ -9340,6 +9581,11 @@ impl From<scarab_identity::ApiToken> for ApiTokenDto {
         Self {
             id: t.id,
             name: t.name,
+            owner: people::PersonDto {
+                id: t.owner_subject.clone(),
+                handle: t.owner_subject.clone(),
+                display_name: None,
+            },
             owner_subject: t.owner_subject,
             org,
             project,
@@ -9351,6 +9597,25 @@ impl From<scarab_identity::ApiToken> for ApiTokenDto {
             use_count: t.use_count,
             revoked_at: t.revoked_at,
         }
+    }
+}
+
+impl people::ShowsPeople for ApiTokenDto {
+    fn refs(&self) -> Vec<&str> {
+        vec![&self.owner_subject, &self.created_by]
+    }
+    fn show(&mut self, people: &people::People) {
+        self.owner = people.person(&self.owner_subject);
+        people.show_one(&mut self.created_by);
+    }
+}
+
+impl people::ShowsPeople for MintedTokenDto {
+    fn refs(&self) -> Vec<&str> {
+        self.record.refs()
+    }
+    fn show(&mut self, people: &people::People) {
+        self.record.show(people);
     }
 }
 
@@ -9481,6 +9746,7 @@ async fn mint_personal_token(
     // message, instead of walking away with a dead token.
     let owner_view = Principal {
         subject: caller.principal.subject.clone(),
+        handle: String::new(),
         display_name: None,
         roles: token_owner_roles(st, &caller.principal.subject).await,
     };
@@ -9534,10 +9800,16 @@ async fn mint_personal_token(
 
     Ok((
         StatusCode::CREATED,
-        Json(MintedTokenDto {
-            token: plaintext,
-            record: ApiTokenDto::from(token),
-        }),
+        Json(
+            people::shown(
+                st.identities.as_deref(),
+                MintedTokenDto {
+                    token: plaintext,
+                    record: ApiTokenDto::from(token),
+                },
+            )
+            .await,
+        ),
     )
         .into_response())
 }
@@ -9625,7 +9897,8 @@ async fn list_api_tokens(
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     sort_api_tokens(&mut tokens, q.sort.unwrap_or_default());
-    Ok(Json(tokens.into_iter().map(ApiTokenDto::from).collect()))
+    let dtos: Vec<ApiTokenDto> = tokens.into_iter().map(ApiTokenDto::from).collect();
+    Ok(Json(people::shown(st.identities.as_deref(), dtos).await))
 }
 
 /// The tokens the caller holds, in every org, newest first. A token caller
@@ -9651,13 +9924,12 @@ async fn list_own_api_tokens(
         .list_owned(&caller.principal.subject)
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    Ok(Json(
-        tokens
-            .into_iter()
-            .filter(|t| caller_sees_own_token(&caller, t))
-            .map(ApiTokenDto::from)
-            .collect(),
-    ))
+    let dtos: Vec<ApiTokenDto> = tokens
+        .into_iter()
+        .filter(|t| caller_sees_own_token(&caller, t))
+        .map(ApiTokenDto::from)
+        .collect();
+    Ok(Json(people::shown(st.identities.as_deref(), dtos).await))
 }
 
 /// May `caller` see and revoke `token` through `/v1/me/tokens`? Only its
@@ -9980,15 +10252,24 @@ async fn live_role_in(
 async fn token_owner_roles(st: &AppState, subject: &str) -> Vec<scarab_identity::Role> {
     // An owners entry naming an id since merged into this Principal still
     // means them (ADR-0069 §6). A store failure only ever costs authority.
-    let mut ids = vec![subject.to_string()];
+    // An entry is typed as a handle and may be an id (ADR-0080 §4), so both
+    // of each name count.
+    let mut names = vec![subject.to_string()];
     if let Some(store) = st.identities.as_ref() {
-        ids.extend(store.aliases_of(subject).await.unwrap_or_default());
+        if let Ok(Some(p)) = store.principal(subject).await {
+            names.push(p.handle);
+        }
+        for a in store.aliases_of(subject).await.unwrap_or_default() {
+            names.push(a.id);
+            names.push(a.handle);
+        }
     }
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
     // The owners list is install-wide (ADR-0069), so any provider's view of it
     // answers; `max` keeps this correct should they ever differ.
     st.oauth_providers
         .iter()
-        .flat_map(|o| ids.iter().filter_map(|id| o.bootstrap_owner_role(id)))
+        .filter_map(|o| o.bootstrap_owner_role(&names))
         .max()
         .into_iter()
         .collect()
@@ -10016,6 +10297,7 @@ async fn authenticate(
     let Some(sessions) = st.sessions.as_ref() else {
         return Ok(Caller::dev_insecure_owner(Principal {
             subject: "anonymous".into(),
+            handle: String::new(),
             display_name: None,
             roles: vec![scarab_identity::Role::Owner],
         }));
@@ -10137,9 +10419,16 @@ async fn authenticate_api_token(
         }
     }
     let roles = token_owner_roles(st, &token.owner_subject).await;
+    // The owner's handle: what a dispatch through the token records as its
+    // Actor (ADR-0080 §4).
+    let handle = st
+        .people([token.owner_subject.as_str()])
+        .await
+        .handle(&token.owner_subject);
     Ok(Caller {
         principal: Principal {
             subject: token.owner_subject.clone(),
+            handle,
             display_name: Some(format!("API token \u{201c}{}\u{201d}", token.name)),
             roles,
         },
@@ -10230,6 +10519,26 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
 /// definition, shared with the engine's dedup: [`scarab_engine::gate_approvers`].
 fn gate_approvers(events: &[EventKind], step: &StepId) -> Vec<String> {
     scarab_engine::gate_approvers(events, step)
+}
+
+/// [`gate_approvers`] of `run`'s gate `step`, each mapped to the id of the
+/// Principal it names (ADR-0080 §3): an approval recorded under a handle
+/// before the upgrade and one recorded under the id count as one person,
+/// and both compare with an approver list of ids.
+async fn current_gate_approvers(
+    st: &AppState,
+    run: &RunId,
+    step: &StepId,
+) -> Result<Vec<String>, ApiError> {
+    let events = st.db.events(run).await.map_err(ApiError::Db)?;
+    Ok(people::canonical_ids(st.identities.as_deref(), &gate_approvers(&events, step)).await)
+}
+
+/// `approvers` (ids) as the handles people read.
+async fn approval_handles(st: &AppState, approvers: &[String]) -> Vec<String> {
+    st.people(approvers.iter().map(String::as_str))
+        .await
+        .handles(approvers)
 }
 
 /// Whether `step` of `run`, a Run an Environment governs, is an Environment
@@ -10373,6 +10682,12 @@ async fn approve_gate(
         Ok(p) => (p, None),
         Err(e) => (None, Some(e)),
     };
+    // Approver lists and approvals compare as ids, whichever form each was
+    // stored in (ADR-0080 §3).
+    let protection = match protection {
+        Some(p) => Some(people::canonical_protection(st.identities.as_deref(), &p).await),
+        None => None,
+    };
     let rules = match (&ctx, &protection) {
         (Some(c), Some(p)) if approval_gate => Some((c, p)),
         _ => None,
@@ -10395,9 +10710,8 @@ async fn approve_gate(
     let now = st.clock.now().await.0;
     // The gate's current wait: its open Attempt. When it began is what the
     // wait timer counts from (no open wait yet: count from now, which only
-    // waits longer); its id keys the approval history to one record per wait
-    // (git-bug 1d06f2d).
-    let open_wait = st
+    // waits longer).
+    let wait_began = st
         .db
         .steps_of_run(&run)
         .await
@@ -10408,13 +10722,9 @@ async fn approve_gate(
             s.attempts
                 .last()
                 .filter(|a| a.outcome == scarab_engine::AttemptOutcome::Running)
-                .map(|a| (a.started_at.0, a.id.0.clone()))
-        });
-    let wait_began = open_wait.as_ref().map_or(now, |(at, _)| *at);
-    let wait = open_wait.map(|(_, attempt)| scarab_project::ApprovalWait {
-        gate: step.0.clone(),
-        attempt,
-    });
+                .map(|a| a.started_at.0)
+        })
+        .unwrap_or(now);
     let release_rule = |approvals: &[String]| {
         rules.map(|(c, p)| {
             scarab_policy::environment_rules::gate_release(
@@ -10431,25 +10741,40 @@ async fn approve_gate(
     let decide = |approvals: Vec<String>| {
         let release = release_rule(&approvals);
         let checkpoint = checkpoint.as_ref();
-        let subject = principal.subject.clone();
+        let actor = policy_checkpoints::Named {
+            id: principal.subject.clone(),
+            handle: principal.handle().to_string(),
+        };
+        let st = &st;
         async move {
             let decision = match checkpoint {
-                Some(f) => Some(
-                    f.decide(
-                        &subject,
-                        &approvals,
-                        now,
-                        release.as_ref().map(|r| r.result.clone()),
+                Some(f) => {
+                    // A Policy reads handles, with the ids beside them.
+                    let people = st.people(approvals.iter().map(String::as_str)).await;
+                    let named: Vec<policy_checkpoints::Named> = approvals
+                        .iter()
+                        .map(|a| policy_checkpoints::Named {
+                            id: a.clone(),
+                            handle: people.handle(a),
+                        })
+                        .collect();
+                    Some(
+                        f.decide(
+                            &actor,
+                            &named,
+                            now,
+                            release.as_ref().map(|r| r.result.clone()),
+                        )
+                        .await
+                        .map_err(ApiError::Db)?,
                     )
-                    .await
-                    .map_err(ApiError::Db)?,
-                ),
+                }
                 None => None,
             };
             Ok::<_, ApiError>((approvals, release, decision))
         }
     };
-    let mut prospective = gate_approvers(&st.db.events(&run).await.map_err(ApiError::Db)?, &step);
+    let mut prospective = current_gate_approvers(&st, &run, &step).await?;
     if !prospective.contains(&principal.subject) {
         prospective.push(principal.subject.clone());
     }
@@ -10521,7 +10846,7 @@ async fn approve_gate(
     //    admin's change since — tightened rules, a withdrawn eligibility, a
     //    deleted Environment — governs the release. Another approval recorded
     //    since the decision was made changes the approvals: decide again.
-    let approvers = gate_approvers(&st.db.events(&run).await.map_err(ApiError::Db)?, &step);
+    let approvers = current_gate_approvers(&st, &run, &step).await?;
     if let Some(e) = held {
         return Err(e);
     }
@@ -10555,7 +10880,7 @@ async fn approve_gate(
                 StatusCode::ACCEPTED,
                 Json(GateApprovalDto {
                     released: false,
-                    approvals: Some(approvers),
+                    approvals: Some(approval_handles(&st, &approvers).await),
                     releases_at: None,
                 }),
             )
@@ -10568,9 +10893,17 @@ async fn approve_gate(
             &st.db.events(&run).await.map_err(ApiError::Db)?,
             &step,
         );
+        let recorded = match recorded {
+            Some(r) => Some((
+                people::canonical_approver_set(st.identities.as_deref(), &r.approvers).await,
+                r.required,
+                r.release_at,
+            )),
+            None => None,
+        };
         if recorded
             .as_ref()
-            .map(|r| (&r.approvers, r.required, r.release_at))
+            .map(|(approvers, required, release_at)| (approvers, *required, *release_at))
             != Some((&met.approvers, met.required, met.release_at))
         {
             st.db
@@ -10588,24 +10921,13 @@ async fn approve_gate(
                 .await
                 .map_err(ApiError::Db)?;
         }
-        // Record the deployment in the legacy approval history (ADR-0024,
-        // 0037, ADR-0070 §1), the record `GET …/environments/{name}/
-        // deployments` serves: once per wait, when its approvals first meet
-        // the rules. The scheduler, which releases the gate when the wait
-        // timer runs out, has no history store, so the record is written
-        // here whichever path releases the gate.
-        if recorded.is_none() {
-            if let Some((c, _)) = rules {
-                record_deployment(&st, c, &run, &approvers, now, wait.as_ref()).await?;
-            }
-        }
         if release.result.outcome != scarab_policy::evaluate::PolicyOutcome::Passed {
             // The scheduler releases the gate when the timer runs out.
             return Ok((
                 StatusCode::ACCEPTED,
                 Json(GateApprovalDto {
                     released: false,
-                    approvals: Some(approvers),
+                    approvals: Some(approval_handles(&st, &approvers).await),
                     releases_at: Some(met.release_at),
                 }),
             )
@@ -10641,17 +10963,6 @@ async fn approve_gate(
         .iter()
         .any(|s| s.step == step && s.status == StepStatus::Succeeded);
 
-    // 6. An Environment approval gate judged by no Environment rules (no
-    //    governance store wired) records its deployment on a real release (a
-    //    no-op re-release writes no duplicate). One judged by them recorded
-    //    it at step 4, when its approvals met the rules.
-    if released && approval_gate && rules.is_none() {
-        if let Some(c) = &ctx {
-            let now = st.clock.now().await.0;
-            record_deployment(&st, c, &run, &approvers, now, wait.as_ref()).await?;
-        }
-    }
-
     Ok((
         StatusCode::ACCEPTED,
         Json(GateApprovalDto {
@@ -10661,36 +10972,6 @@ async fn approve_gate(
         }),
     )
         .into_response())
-}
-
-/// Write one deploy of `run` to the legacy approval history, when a history
-/// store is wired: at most one per gate `wait`.
-async fn record_deployment(
-    st: &AppState,
-    c: &scarab_engine::DeployContext,
-    run: &RunId,
-    approvers: &[String],
-    at: i64,
-    wait: Option<&scarab_project::ApprovalWait>,
-) -> Result<(), ApiError> {
-    let Some(store) = st.approval_history.as_ref() else {
-        return Ok(());
-    };
-    store
-        .record_deployment(
-            &scarab_project::Deployment {
-                org: c.org.clone(),
-                project: c.project.clone(),
-                environment: c.environment.clone(),
-                git_ref: c.git_ref.clone(),
-                run: run.0.clone(),
-                approved_by: approvers.to_vec(),
-                at,
-            },
-            wait,
-        )
-        .await
-        .map_err(|e| ApiError::BadRequest(e.to_string()))
 }
 
 /// `POST /v1/runs/{id}/gates/{step}/reject` body: why the gate is failed.
@@ -11391,7 +11672,8 @@ async fn get_environment(
         .map_err(org_environments::org_environment_api_error)?
         .filter(|g| g.eligible || g.overlay.is_some() || g.privilege_grant.is_some())
         .ok_or(ApiError::NotFound)?;
-    Ok(Json((&governance).into()))
+    let dto: org_environments::ProjectEnvironmentDto = (&governance).into();
+    Ok(Json(people::shown(st.identities.as_deref(), dto).await))
 }
 
 /// The Environments this repo's Project may deploy into or holds an overlay
@@ -11413,7 +11695,9 @@ async fn list_environments(
         .project_environment_governance(&org, &repo)
         .await
         .map_err(org_environments::org_environment_api_error)?;
-    Ok(Json(governance.iter().map(Into::into).collect()))
+    let dtos: Vec<org_environments::ProjectEnvironmentDto> =
+        governance.iter().map(Into::into).collect();
+    Ok(Json(people::shown(st.identities.as_deref(), dtos).await))
 }
 
 /// **Retired** (ADR-0071 §10), like [`put_environment`]: always 410 with a
@@ -11424,27 +11708,6 @@ async fn delete_environment(
     Path((org, repo, name)): Path<(String, String, String)>,
 ) -> Result<StatusCode, ApiError> {
     Err(per_repo_environment_writes_gone(&org, &repo, &name))
-}
-
-/// Legacy approval history (ADR-0070 §1): who approved which run into this
-/// environment, most recent first (ADR-0037). Despite the path, nothing here is
-/// a Deployment — a row is written when a manual gate is approved and records no
-/// target, version or outcome. Kept readable, read-only;
-/// admission happens in the run's gate-approval path. Read cap.
-#[utoipa::path(get, path = "/v1/repos/{org}/{repo}/environments/{name}/deployments", params(("org" = String, Path, description = "repo owner"), ("repo" = String, Path, description = "repo name"), ("name" = String, Path, description = "Environment name")), summary = "Legacy approval history (ADR-0070 §1)", responses((status = 200, description = "most recent first")))]
-async fn list_deployments(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-    Path((org, repo, name)): Path<(String, String, String)>,
-) -> Result<Json<Vec<scarab_project::Deployment>>, ApiError> {
-    let scope = rbac_scope(&org, Some(&repo));
-    authorize_scoped(&st, &headers, Action::Read, Some(&scope)).await?;
-    let store = st.approval_history.as_ref().ok_or(ApiError::NotFound)?;
-    let history = store
-        .deployments(&org, &repo, &name)
-        .await
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    Ok(Json(history))
 }
 
 /// The secret coverage matrix for a repo (ADR-0037 D, editable since ADR-0060):
@@ -11705,9 +11968,11 @@ pub struct ConnectionDto {
     /// guard is keyed that way), so with two connections of one kind this is a
     /// per-kind liveness signal, not a per-connection one.
     pub last_delivery_at: Option<i64>,
-    /// The Projects this connection serves, from its repo bindings — a Project
-    /// *is* a binding (ADR-0046), so this is the connection's whole footprint.
-    pub projects: Vec<ConnectionProjectDto>,
+    /// How many repositories are enabled through this connection: its repo
+    /// bindings, each a Project (ADR-0046). A count, not the list: a
+    /// connection can hold thousands. The org's repositories page
+    /// (`GET /v1/orgs/{org}/repos?connection=`) lists them.
+    pub enabled_repos: u64,
     /// Can the forge enumerate what this credential reaches? Gates the re-sync
     /// affordance: GitHub can, so a drifted registry is healable; an adapter that
     /// cannot should not offer a button that always errors.
@@ -11723,15 +11988,6 @@ pub struct ConnectionDto {
     /// list must not perform one per row just to discover the button is
     /// pointless. The endpoint itself remains the authority.
     pub supports_preflight: bool,
-}
-
-/// A Project a connection serves, plus the forge coordinate it came from.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct ConnectionProjectDto {
-    pub org: String,
-    pub project: String,
-    pub owner: String,
-    pub name: String,
 }
 
 /// `POST /v1/connections` body (ADR-0060 part D, manual path): the forge to
@@ -11775,15 +12031,22 @@ pub struct ListConnectionsQuery {
     pub org: Option<String>,
 }
 
-/// `POST /v1/connections/{id}/resync` body: what reconciliation changed.
+/// `POST /v1/connections/{id}/resync` body: what the forge reports, compared
+/// with what is enabled.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ResyncResultDto {
-    /// Repos the forge reports that Scarab did not have bound — now bound.
-    pub bound: Vec<String>,
-    /// Repos the forge reports that were not bound (git-bug 19b0a45): owned
-    /// by another account than the connection's Org, already bound through
-    /// another connection that serves an Org, or reported to a connection
-    /// that serves no Org yet (it binds nothing until it is assigned).
+    /// Repos of the connection's Org the forge reports that are not enabled.
+    /// Re-sync does not enable them; an admin does, from the org's
+    /// repositories page.
+    pub available: Vec<String>,
+    /// Repos that were already Projects, bound through a connection that does
+    /// not serve their owner (unassigned, or another Org's), and now bound
+    /// through this one with their Projects (git-bug 19b0a45).
+    pub moved: Vec<String>,
+    /// Repos the forge reports that are neither available nor moved: owned by
+    /// another account than the connection's Org, already bound through
+    /// another connection that serves an Org, or reported to a connection that
+    /// serves no Org yet.
     pub skipped: Vec<String>,
     /// How many bindings the forge confirms. Reported rather than acted on:
     /// see the handler's note on why re-sync never unbinds.
@@ -12035,7 +12298,7 @@ fn is_loopback_callback(url: &str) -> bool {
 #[utoipa::path(
     get,
     path = "/v1/connections",
-    summary = "Registered forge connections + their bound Projects and health (ADR-0060)",
+    summary = "Registered forge connections, how many repositories each has enabled, and their health (ADR-0060)",
     params(("org" = Option<String>, Query, description = "only the connections serving this org")),
     responses(
         (status = 200, body = [ConnectionDto]),
@@ -12078,26 +12341,10 @@ async fn list_connections(
         .collect();
     let mut out = Vec::with_capacity(conns.len());
     for conn in conns {
-        let mut projects = Vec::new();
-        for repo in connections
-            .repos_of(&conn.id)
+        let enabled_repos = connections
+            .repo_count_of(&conn.id)
             .await
-            .map_err(|e| ApiError::BadRequest(e.to_string()))?
-        {
-            if let Some(resolved) = connections
-                .resolve(&repo)
-                .await
-                .map_err(|e| ApiError::BadRequest(e.to_string()))?
-            {
-                projects.push(ConnectionProjectDto {
-                    org: resolved.org,
-                    project: resolved.project,
-                    owner: repo.owner,
-                    name: repo.name,
-                });
-            }
-        }
-        projects.sort_by(|a, b| (&a.org, &a.project).cmp(&(&b.org, &b.project)));
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
         let credential_present = credential_present(&st, &conn).await;
         let last_delivery_at = connections
             .last_delivery_at(conn.kind)
@@ -12140,7 +12387,7 @@ async fn list_connections(
             credential_ref: conn.credential_ref,
             credential_present,
             last_delivery_at,
-            projects,
+            enabled_repos,
             supports_resync,
             supports_preflight,
             managed_by_config,
@@ -12386,21 +12633,28 @@ async fn connection_preflight(
 }
 
 /// Re-sync a connection against the forge (ADR-0060 part C): ask the forge which
-/// repos this credential reaches and bind any Scarab does not have yet.
+/// repos this credential reaches and report which of them are not enabled.
 ///
-/// This is the **healing** path for GitHub, where installing the App *is*
-/// registration and the registry is therefore only as current as the last
-/// `installation_repositories` delivery. A dropped delivery leaves a repo the App
-/// covers with no Project; re-sync notices.
+/// Enabling a repository is opt-in, so re-sync **creates no Project**. A repo
+/// the forge reports that is not bound is listed in `available`; an admin
+/// enables it from the org's repositories page (`POST
+/// /v1/connections/{id}/repos`). A repo an admin disabled therefore stays
+/// disabled.
 ///
-/// It deliberately **only binds**. Unbinding on a forge's say-so would let one
-/// failed API page delete governance — Environments, secrets and RBAC hang off a
+/// The one change it makes is to an existing Project: a repo of this
+/// connection's Org that is bound through a connection that does not serve
+/// its owner (unassigned, or another Org's) moves to this one, with its
+/// Project (git-bug 19b0a45). That is how an Org takes its repos back from a
+/// legacy connection.
+///
+/// It **never unbinds**. Unbinding on a forge's say-so would let one failed
+/// API page delete governance — Environments, secrets and RBAC hang off a
 /// Project — so removal stays an explicit human act. `confirmed` reports the
 /// overlap so a stale binding is still visible.
 #[utoipa::path(
     post,
     path = "/v1/connections/{id}/resync",
-    summary = "Re-bind repos the forge reports for this connection (ADR-0060)",
+    summary = "Report the repos the forge reaches that are not enabled, and move this org's Projects off connections that do not serve it (ADR-0060)",
     params(("id" = String, Path, description = "connection id")),
     responses(
         (status = 200, body = ResyncResultDto),
@@ -12417,7 +12671,7 @@ async fn resync_connection(
     let conn = authorize_connection(&st, &headers, &id).await?;
     let connections = st.connections.as_ref().ok_or(ApiError::NotFound)?;
     // Config-owned connections are read-only here (ADR-0060 part D): their repo
-    // bindings are declared in the `connections:` block, so a binding written by
+    // bindings are declared in the `connections:` block, so a binding moved by
     // re-sync would live outside the source that is authoritative for them —
     // drift by another name. Refuse BEFORE talking to the forge, and say where
     // the change belongs.
@@ -12452,56 +12706,57 @@ async fn resync_connection(
         .into_iter()
         .collect();
 
-    let mut bound = Vec::new();
+    let mut available = Vec::new();
+    let mut moved = Vec::new();
     let mut skipped = Vec::new();
     let mut confirmed = 0usize;
     for repo in reported {
+        let label = format!("{}/{}", repo.owner, repo.name);
         if known.contains(&repo) {
+            // The forge reaches it, so a mark from an installation that
+            // stopped covering it no longer holds.
+            connections
+                .clear_repo_unreachable(&id, &repo)
+                .await
+                .map_err(|e| ApiError::BadRequest(e.to_string()))?;
             confirmed += 1;
             continue;
         }
-        // A connection binds only its own Org's repos (git-bug 19b0a45). A
+        // A connection serves only its own Org's repos (git-bug 19b0a45). A
         // credential that reaches another owner's repo does not make it this
-        // Org's. An unassigned connection binds nothing: its repos would be
-        // homed by owner name alone, which is how an account joins a
-        // same-named Org of another forge. A global admin assigns it first.
-        if conn.org.as_deref() != Some(repo.owner.as_str()) {
-            skipped.push(format!("{}/{}", repo.owner, repo.name));
+        // Org's. An unassigned connection serves none: a global admin
+        // assigns it first.
+        if conn.org.as_deref() != Some(repo.owner.as_str()) || is_reserved_org(&repo.owner) {
+            skipped.push(label);
             continue;
         }
-        // A forge account named like one of Scarab's own Orgs is never homed
-        // there (the registry refuses it too); skipping it keeps one such
-        // repo from failing the whole re-sync.
-        if is_reserved_org(&repo.owner) {
-            tracing::warn!(
-                connection = %id,
-                repo = %format!("{}/{}", repo.owner, repo.name),
-                "re-sync skipped a repo whose owner is a reserved org name"
-            );
-            continue;
-        }
-        // Project name = repo name, org = repo owner — the same 1:1 mapping
-        // `apply_installation_sync` uses, so a re-synced Project is
-        // indistinguishable from a webhook-registered one.
-        match connections
-            .bind_repo(&id, &repo, &repo.owner, &repo.name)
+        let existing = connections
+            .resolve(&repo)
             .await
-        {
-            Ok(()) => {}
-            // Bound through another connection that serves an Org: re-sync
-            // moves a repo only off an unassigned one (git-bug 19b0a45).
-            Err(scarab_forge::RegistryError::BoundElsewhere { .. }) => {
-                skipped.push(format!("{}/{}", repo.owner, repo.name));
-                continue;
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        match existing {
+            // Not a Project: available to enable, and left alone.
+            None => available.push(label),
+            // A Project bound through a connection that does not serve its
+            // owner moves here. Same mapping as every bind (Project = repo
+            // name, Org = repo owner), so the Project is unchanged.
+            Some(existing) if existing.connection.org.as_deref() != Some(repo.owner.as_str()) => {
+                match connections
+                    .bind_repo(&id, &repo, &repo.owner, &repo.name)
+                    .await
+                {
+                    Ok(()) => moved.push(label),
+                    Err(scarab_forge::RegistryError::BoundElsewhere { .. }) => skipped.push(label),
+                    Err(e) => return Err(ApiError::BadRequest(e.to_string())),
+                }
             }
-            Err(e) => return Err(ApiError::BadRequest(e.to_string())),
+            // Bound through another connection of this Org: it stays there.
+            Some(_) => skipped.push(label),
         }
-        // A new org gets the first-party libraries (ADR-0076 §5).
-        libraries::offer_defaults_on_bind(&st, &repo.owner).await;
-        bound.push(format!("{}/{}", repo.owner, repo.name));
     }
     Ok(Json(ResyncResultDto {
-        bound,
+        available,
+        moved,
         skipped,
         confirmed,
     }))
@@ -12880,7 +13135,7 @@ fn default_true() -> bool {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct BindRepoResultDto {
     /// The governed Project's natural key — `(owner, name)` in v1 (1 Project : 1
-    /// RepoRef), the same mapping installation auto-registration uses.
+    /// RepoRef), the same mapping every bind uses.
     pub org: String,
     pub project: String,
     /// Did a forge-side webhook get registered (or already exist)?
@@ -12949,15 +13204,268 @@ async fn available_repos(
     Ok(Json(out))
 }
 
+/// `GET /v1/orgs/{org}/repos` query: a page of the org's repositories.
+#[derive(Debug, Deserialize)]
+pub struct OrgReposQuery {
+    /// 1-based page number (default 1).
+    pub page: Option<u32>,
+    /// Repositories per page (default [`DEFAULT_ORG_REPOS_PER_PAGE`], at most
+    /// [`MAX_ORG_REPOS_PER_PAGE`]).
+    pub per_page: Option<u32>,
+    /// Only repositories whose name contains this text, ignoring case.
+    pub q: Option<String>,
+    /// Only repositories of this connection: enabled through it, or, when
+    /// not enabled, reached through it. Only its forge is asked.
+    pub connection: Option<String>,
+}
+
+/// Default page size for `GET /v1/orgs/{org}/repos`.
+const DEFAULT_ORG_REPOS_PER_PAGE: u32 = 25;
+/// Upper bound on its page size.
+const MAX_ORG_REPOS_PER_PAGE: u32 = 100;
+
+/// One repository of an org: enabled (a Project, bound through a connection)
+/// or reachable through one of the org's connections and not enabled.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct OrgRepoDto {
+    pub owner: String,
+    pub name: String,
+    /// Is it a Project? Enabling binds it; disabling unbinds it.
+    pub enabled: bool,
+    /// The Project's name when enabled (the repo name).
+    pub project: Option<String>,
+    /// For an enabled repo: unix-ms since when its connection has not
+    /// reached it (the GitHub App's installation stopped covering it), or
+    /// `null`. Disable is the only way to remove it.
+    pub unreachable_since: Option<i64>,
+    /// The connection it is bound through when enabled, else the one that
+    /// reaches it: the `{id}` of the bind and unbind endpoints.
+    pub connection_id: String,
+    /// That connection's forge kind: `github` | `forgejo`.
+    pub kind: String,
+    /// The repository's page on the forge.
+    pub repo_url: String,
+    /// May the caller enable or disable it here? Needs Administer on the
+    /// connection's org, and a connection not managed by configuration.
+    pub can_change: bool,
+}
+
+/// A connection of the org that could not list its repositories, and why.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct UnlistedConnectionDto {
+    pub connection_id: String,
+    pub reason: String,
+}
+
+/// `GET /v1/orgs/{org}/repos` response: one page of the org's repositories.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct OrgReposPageDto {
+    /// This page, sorted by name.
+    pub repos: Vec<OrgRepoDto>,
+    /// How many repositories match the query, across every page.
+    pub total: usize,
+    /// How many of the org's repositories are enabled, whatever the query.
+    pub enabled_total: usize,
+    pub page: u32,
+    pub per_page: u32,
+    /// Does the caller administer the org?
+    pub can_administer: bool,
+    /// Connections whose repositories could not be listed. Their enabled
+    /// repositories are still in the list; the ones not enabled are not.
+    pub unlisted: Vec<UnlistedConnectionDto>,
+}
+
+/// The repositories of an org, one page at a time: every enabled one (a
+/// Project) and every one the org's connections reach that is not enabled.
+///
+/// Enabling a repository is opt-in, so this is the list an admin enables
+/// from (`POST /v1/connections/{id}/repos`) and disables from (`DELETE
+/// /v1/connections/{id}/repos/{owner}/{name}`). The forge is asked live, as
+/// the bind pick-list is (`…/available-repos`); no list of
+/// available repositories is stored. The forge port returns a connection's
+/// whole list, so the server pages the merged result.
+///
+/// Read on the org may list it; `can_change` says per row whether the caller
+/// may also act on it.
+#[utoipa::path(
+    get,
+    path = "/v1/orgs/{org}/repos",
+    summary = "An org's repositories, enabled and not, one page at a time",
+    params(
+        ("org" = String, Path, description = "org"),
+        ("page" = Option<u32>, Query, description = "1-based page (default 1)"),
+        ("per_page" = Option<u32>, Query, description = "repositories per page (default 25, max 100)"),
+        ("q" = Option<String>, Query, description = "only names containing this text, ignoring case"),
+        ("connection" = Option<String>, Query, description = "only repositories of this connection id")
+    ),
+    responses(
+        (status = 200, body = OrgReposPageDto),
+        (status = 403, description = "no Read on the org"),
+        (status = 404, description = "no connection registry wired")
+    )
+)]
+async fn org_repos(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(org): Path<String>,
+    Query(q): Query<OrgReposQuery>,
+) -> Result<Json<OrgReposPageDto>, ApiError> {
+    let caller = authenticate(&st, &headers, Action::Read).await?;
+    let scope = scarab_identity::Scope::Org(org.clone());
+    if !caller.may_globally(Action::Read) && !caller.may(&st, Action::Read, &scope).await? {
+        return Err(ApiError::Forbidden);
+    }
+    let global_admin = caller.may_globally(Action::Administer);
+    let can_administer = global_admin || caller.may(&st, Action::Administer, &scope).await?;
+    let connections = st.connections.as_ref().ok_or(ApiError::NotFound)?;
+    let registry = |e: scarab_forge::RegistryError| ApiError::BadRequest(e.to_string());
+    let config_owned: std::collections::BTreeSet<String> = connections
+        .config_owned_connection_ids()
+        .await
+        .map_err(registry)?
+        .into_iter()
+        .collect();
+
+    // May the caller bind and unbind through `conn` for this org? The same
+    // rule the bind and unbind endpoints apply, so a row never offers an
+    // action that answers 403, 404 or 409.
+    let mut may_change: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    let all = connections.list_connections().await.map_err(registry)?;
+    for conn in &all {
+        let ok = can_administer
+            && !config_owned.contains(&conn.id)
+            && conn.org.as_deref().is_none_or(|o| o == org)
+            && may_administer_connection(&st, &caller, global_admin, conn).await?;
+        may_change.insert(conn.id.clone(), ok);
+    }
+
+    // Keyed by (name, owner): sorted by name, one row per repository.
+    let mut rows: std::collections::BTreeMap<(String, String), OrgRepoDto> =
+        std::collections::BTreeMap::new();
+    // Every Project homed in this org, whichever connection it is bound through.
+    for conn in &all {
+        for repo in connections.repos_of(&conn.id).await.map_err(registry)? {
+            let Some(resolved) = connections.resolve(&repo).await.map_err(registry)? else {
+                continue;
+            };
+            if resolved.org != org {
+                continue;
+            }
+            rows.insert(
+                (repo.name.clone(), repo.owner.clone()),
+                OrgRepoDto {
+                    repo_url: web_repo_url(conn.kind, &conn.base_url, &repo.owner, &repo.name),
+                    owner: repo.owner,
+                    name: repo.name,
+                    enabled: true,
+                    project: Some(resolved.project),
+                    unreachable_since: resolved.unreachable_since,
+                    connection_id: conn.id.clone(),
+                    kind: conn.kind.as_str().to_string(),
+                    can_change: may_change.get(&conn.id).copied().unwrap_or(false),
+                },
+            );
+        }
+    }
+    let enabled_total = rows.len();
+
+    // What each connection serving the org reaches, owned by the org: only
+    // those can be bound through it (git-bug 19b0a45).
+    let mut unlisted = Vec::new();
+    // With `?connection=`, only that connection's forge is asked.
+    let only = q.connection.as_deref();
+    for conn in all
+        .iter()
+        .filter(|c| c.org.as_deref() == Some(org.as_str()) && only.is_none_or(|id| c.id == id))
+    {
+        let reported = match connection_adapter(&st, conn).await {
+            Ok(forge) => forge.list_accessible_repos().await,
+            Err(_) => Err(scarab_forge::ForgeError::Api(
+                "no forge adapter is wired for this connection".into(),
+            )),
+        };
+        let reported = match reported {
+            Ok(repos) => repos,
+            Err(scarab_forge::ForgeError::Unsupported(_)) => {
+                unlisted.push(UnlistedConnectionDto {
+                    connection_id: conn.id.clone(),
+                    reason: format!(
+                        "{} cannot list its repositories, so only the enabled ones are listed",
+                        conn.kind.as_str()
+                    ),
+                });
+                continue;
+            }
+            Err(e) => {
+                unlisted.push(UnlistedConnectionDto {
+                    connection_id: conn.id.clone(),
+                    reason: e.to_string(),
+                });
+                continue;
+            }
+        };
+        for repo in reported.into_iter().filter(|r| r.owner == org) {
+            rows.entry((repo.name.clone(), repo.owner.clone()))
+                .or_insert_with(|| OrgRepoDto {
+                    repo_url: web_repo_url(conn.kind, &conn.base_url, &repo.owner, &repo.name),
+                    owner: repo.owner,
+                    name: repo.name,
+                    enabled: false,
+                    project: None,
+                    unreachable_since: None,
+                    connection_id: conn.id.clone(),
+                    kind: conn.kind.as_str().to_string(),
+                    can_change: may_change.get(&conn.id).copied().unwrap_or(false),
+                });
+        }
+    }
+
+    let needle =
+        q.q.as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .map(str::to_lowercase);
+    let matching: Vec<OrgRepoDto> = rows
+        .into_values()
+        .filter(|r| {
+            only.is_none_or(|id| r.connection_id == id)
+                && needle
+                    .as_deref()
+                    .is_none_or(|n| r.name.to_lowercase().contains(n))
+        })
+        .collect();
+    let total = matching.len();
+    let per_page = q
+        .per_page
+        .unwrap_or(DEFAULT_ORG_REPOS_PER_PAGE)
+        .clamp(1, MAX_ORG_REPOS_PER_PAGE);
+    let page = q.page.unwrap_or(1).max(1);
+    let skip = (page as usize - 1).saturating_mul(per_page as usize);
+    let repos = matching
+        .into_iter()
+        .skip(skip)
+        .take(per_page as usize)
+        .collect();
+    Ok(Json(OrgReposPageDto {
+        repos,
+        total,
+        enabled_total,
+        page,
+        per_page,
+        can_administer,
+        unlisted,
+    }))
+}
+
 /// Bind a repo to this connection — **which is how a Project comes into being**
 /// (ADR-0060 part C).
 ///
 /// There is no `projects` table: a Project *is* a `forge_repos` binding
-/// (ADR-0046), so this endpoint is the repo→Project onboarding flow for any forge
-/// without installation-style auto-registration. After it, the repo appears on
-/// `GET /v1/repos`, can hold Environments and secrets, and its pushes resolve to
-/// a tenant. GitHub keeps binding itself from the `installation` webhook; this is
-/// the Forgejo path.
+/// (ADR-0046), so this endpoint is the repo→Project onboarding flow — "Enable"
+/// on the org's repositories page — for every forge. After it, the repo appears on `GET /v1/repos`, can hold
+/// Environments and secrets, and its pushes resolve to a tenant. A GitHub
+/// installation makes its repos available but binds none of them, so this is
+/// the GitHub path too.
 ///
 /// Registration is attempted **after** the binding lands and its failure is
 /// *reported, not rolled back*: the binding is the durable governance fact, a
@@ -13031,9 +13539,9 @@ async fn bind_repo(
         }
     }
 
-    // Project name = repo name, org = repo owner — identical to the mapping
-    // `apply_installation_sync` and re-sync use, so a manually-bound Project is
-    // indistinguishable from an auto-registered one.
+    // Project name = repo name, org = repo owner — the mapping every bind uses
+    // (and that GitHub installations used when they bound repos), so a Project
+    // bound here is indistinguishable from an older auto-registered one.
     connections
         .bind_repo(&id, &repo, &repo.owner, &repo.name)
         .await
@@ -13041,10 +13549,6 @@ async fn bind_repo(
             scarab_forge::RegistryError::BoundElsewhere { .. } => ApiError::Conflict(e.to_string()),
             e => ApiError::BadRequest(e.to_string()),
         })?;
-    // A new org gets the first-party libraries (ADR-0076 §5): claimed now,
-    // installed in the background, so the bind never waits on a forge.
-    libraries::offer_defaults_on_bind(&st, &repo.owner).await;
-
     let (webhook_registered, webhook_error) = if req.register_webhook {
         match try_register_webhook(&st, &conn, &repo).await {
             Ok(()) => (true, None),
@@ -13149,7 +13653,8 @@ async fn register_repo_webhook(
 /// The inverse of the bind above, and destructive in the same measure: the
 /// binding is the Project, so its Environments, scoped secrets and RBAC go with
 /// it. That is why re-sync never does this on a forge's say-so and why this is an
-/// explicit, human-addressed endpoint.
+/// explicit, human-addressed endpoint. It is permanent: no installation delivery
+/// or re-sync binds the repo again; only another explicit bind does.
 ///
 /// The forge-side webhook is deliberately **left in place**. Deleting hooks is
 /// not in the port (ADR-0046 exposes registration only), and a stale hook is
@@ -13423,20 +13928,20 @@ const TAG_GROUPS: &[(&str, &str)] = &[
     (
         "Environments",
         "Org-level Environments (ADR-0071) and their governance; per-repo \
-         Environments and their protection rules, plus their legacy approval \
-         history.",
+         Environments and their protection rules.",
     ),
     (
         "Plugins",
-        "PluginInstallations (ADR-0072): the first-party catalog, install and \
-         uninstall, the kill switch, the PluginConnections the \
+        "PluginInstallations (ADR-0072): fetch a manifest to review, install \
+         and uninstall, the kill switch, the PluginConnections the \
          CredentialBroker proxies to, and its journal of what each plugin \
          asked for.",
     ),
     (
         "Libraries",
         "Org-installed libraries (ADR-0076): fetch a version to review, \
-         install, upgrade and remove, yanks, and the first-party defaults.",
+         install, upgrade and remove, yanks, and the sources trusted with forge \
+         credentials.",
     ),
     (
         "Policies",
@@ -13491,6 +13996,7 @@ fn tag_for_path(path: &str) -> Option<&'static str> {
         || path.contains("/passkeys/")
         || path.contains("bindings")
         || path.contains("/principals")
+        || path.contains("/members/")
         || path.contains("/tokens")
     {
         "Auth & Identity"
@@ -13500,7 +14006,8 @@ fn tag_for_path(path: &str) -> Option<&'static str> {
         // Before Runs: `/v1/runs/{id}/policy-decisions` is a Policy read.
         "Policies"
     } else if path.contains("/plugins")
-        || path.contains("/plugin-catalog")
+        || path.contains("/plugin-fetch")
+        || path.contains("/plugin-installations")
         || path == "/v1/orgs/{org}/gates"
     {
         "Plugins"
@@ -13512,7 +14019,7 @@ fn tag_for_path(path: &str) -> Option<&'static str> {
         "Secrets"
     } else if path.contains("/runs") {
         "Runs"
-    } else if path.starts_with("/v1/repos") {
+    } else if path.starts_with("/v1/repos") || path == "/v1/orgs/{org}/repos" {
         "Repositories"
     } else {
         return None;
@@ -13747,6 +14254,7 @@ impl utoipa::Modify for StepUpResponses {
         list_own_api_tokens,
         revoke_own_api_token,
         list_bindings,
+        get_member,
         put_binding,
         delete_binding,
         import_bindings,
@@ -13756,7 +14264,6 @@ impl utoipa::Modify for StepUpResponses {
         get_environment,
         list_environments,
         delete_environment,
-        list_deployments,
         org_environments::list_org_environments,
         org_environments::get_org_environment,
         org_environments::put_org_environment,
@@ -13774,15 +14281,13 @@ impl utoipa::Modify for StepUpResponses {
         org_environments::get_environment_project_privilege_grant,
         org_environments::put_environment_project_privilege_grant,
         org_environments::delete_environment_project_privilege_grant,
-        org_environments::get_environment_migration_report,
-        org_environments::acknowledge_environment_migration_report,
         libraries::list_libraries,
+        libraries::get_library_installation,
         libraries::fetch_library,
         libraries::install_library,
         libraries::remove_library,
         libraries::yank_library,
         libraries::unyank_library,
-        libraries::retry_library_defaults,
         libraries::trust_library_source,
         libraries::untrust_library_source,
         libraries::get_yank_impact,
@@ -13802,15 +14307,22 @@ impl utoipa::Modify for StepUpResponses {
         policies::delete_project_policy,
         policies::list_project_policy_versions,
         policies::policy_test,
+        policies::policy_test_replay,
+        policies::check_org_policy,
+        policies::list_policy_checkpoints,
         policies::list_org_policy_decisions,
+        policies::org_policy_decision_counts,
         policies::list_run_policy_decisions,
-        plugins::plugin_catalog,
+        plugins::fetch_plugin_manifest,
         plugins::list_plugins,
         plugins::install_plugin,
         plugins::get_plugin,
+        plugins::get_plugin_by_id,
         plugins::uninstall_plugin,
         plugins::kill_plugin,
         plugins::enable_plugin,
+        plugins::fetch_plugin_upgrade,
+        plugins::upgrade_plugin,
         plugins::put_plugin_storage,
         plugins::delete_plugin_storage,
         plugins::list_plugin_connections,
@@ -13827,6 +14339,7 @@ impl utoipa::Modify for StepUpResponses {
         resync_connection,
         connection_preflight,
         available_repos,
+        org_repos,
         bind_repo,
         register_repo_webhook,
         unbind_repo,
@@ -13923,12 +14436,14 @@ impl utoipa::Modify for StepUpResponses {
         SecretMatrixRow,
         SilenceCellRequest,
         ConnectionDto,
-        ConnectionProjectDto,
         CreateConnectionRequest,
         AssignConnectionOrgRequest,
         ConnectionOrgDto,
         CreatedConnectionDto,
         AvailableRepoDto,
+        OrgRepoDto,
+        OrgReposPageDto,
+        UnlistedConnectionDto,
         BindRepoRequest,
         BindRepoResultDto,
         ResyncResultDto,
@@ -13943,6 +14458,8 @@ impl utoipa::Modify for StepUpResponses {
         ConfirmIdentityMergeRequest,
         IdentityMergedDto,
         PrincipalDto,
+        MemberDto,
+        people::PersonDto,
         PrincipalIdentityDto,
         MintTokenRequest,
         MintOwnTokenRequest,
@@ -13975,16 +14492,9 @@ impl utoipa::Modify for StepUpResponses {
         org_environments::EnvironmentProjectOverlayDto,
         org_environments::PutEnvironmentProjectPrivilegeGrantRequest,
         org_environments::EnvironmentProjectDto,
-        org_environments::LegacyProtectionRulesDto,
-        org_environments::EnvironmentMigrationReportProjectDto,
-        org_environments::EnvironmentMigrationReportDto,
         libraries::OrgLibrariesDto,
         libraries::LibraryInstallationDto,
         libraries::LibraryYankDto,
-        libraries::UpdateNoticeDto,
-        libraries::FirstPartyLibraryDto,
-        libraries::LibraryDefaultsDto,
-        libraries::MissingDefaultDto,
         libraries::FetchLibraryRequest,
         libraries::FetchedLibraryDto,
         libraries::InstalledVersionDto,
@@ -14007,7 +14517,6 @@ impl utoipa::Modify for StepUpResponses {
         run_origin::BoundInputDto,
         run_origin::RenderedSpecDto,
         run_origin::StepOriginDto,
-        libraries::RetryDefaultsRequest,
         libraries::TrustedSourceDto,
         libraries::TrustSourceRequest,
         policies::PolicyDto,
@@ -14022,13 +14531,29 @@ impl utoipa::Modify for StepUpResponses {
         policies::PolicyTestResponse,
         policies::PolicyReadsDto,
         policies::RuleReadsDto,
+        policies::PolicyCheckRequest,
+        policies::PolicyCheckResponse,
+        policies::PolicyDiagnosticDto,
+        policies::PolicyCheckpointDto,
+        policies::PolicyReplayRequest,
+        policies::PolicyReplayResponse,
+        policies::ReplayChangeDto,
+        policies::PolicyDecisionCountsDto,
+        policies::PolicyCountsDto,
         plugins::PluginCapabilityDto,
         plugins::RequestRuleDto,
         plugins::ConnectionSlotDto,
         plugins::PluginManifestDto,
         plugins::GateDefinitionDto,
         plugins::GateFieldDto,
-        plugins::PluginCatalogEntryDto,
+        plugins::FetchPluginManifestRequest,
+        plugins::FetchedPluginManifestDto,
+        plugins::InstalledPluginManifestDto,
+        plugins::FetchPluginUpgradeRequest,
+        plugins::ManifestDiffGroupDto,
+        plugins::ManifestDiffDto,
+        plugins::FetchedPluginUpgradeDto,
+        plugins::UpgradePluginRequest,
         plugins::InstallationStateDto,
         plugins::RuntimeStatusDto,
         plugins::PluginInstallationDto,

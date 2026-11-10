@@ -166,7 +166,7 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * Registered forge connections + their bound Projects and health (ADR-0060)
+         * Registered forge connections, how many repositories each has enabled, and their health (ADR-0060)
          * @description Read-only, and per Org (git-bug 19b0a45): the caller sees the connections
          *     of the Orgs it administers, and a global admin also sees the unassigned
          *     ones. No credential material is ever returned — only whether the handle
@@ -327,11 +327,11 @@ export interface paths {
         /**
          * Bind a repo to a connection, creating its Project, and register its webhook (ADR-0060)
          * @description There is no `projects` table: a Project *is* a `forge_repos` binding
-         *     (ADR-0046), so this endpoint is the repo→Project onboarding flow for any forge
-         *     without installation-style auto-registration. After it, the repo appears on
-         *     `GET /v1/repos`, can hold Environments and secrets, and its pushes resolve to
-         *     a tenant. GitHub keeps binding itself from the `installation` webhook; this is
-         *     the Forgejo path.
+         *     (ADR-0046), so this endpoint is the repo→Project onboarding flow — "Enable"
+         *     on the org's repositories page — for every forge. After it, the repo appears on `GET /v1/repos`, can hold
+         *     Environments and secrets, and its pushes resolve to a tenant. A GitHub
+         *     installation makes its repos available but binds none of them, so this is
+         *     the GitHub path too.
          *
          *     Registration is attempted **after** the binding lands and its failure is
          *     *reported, not rolled back*: the binding is the durable governance fact, a
@@ -361,7 +361,8 @@ export interface paths {
          * @description The inverse of the bind above, and destructive in the same measure: the
          *     binding is the Project, so its Environments, scoped secrets and RBAC go with
          *     it. That is why re-sync never does this on a forge's say-so and why this is an
-         *     explicit, human-addressed endpoint.
+         *     explicit, human-addressed endpoint. It is permanent: no installation delivery
+         *     or re-sync binds the repo again; only another explicit bind does.
          *
          *     The forge-side webhook is deliberately **left in place**. Deleting hooks is
          *     not in the port (ADR-0046 exposes registration only), and a stale hook is
@@ -405,14 +406,21 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Re-bind repos the forge reports for this connection (ADR-0060)
-         * @description This is the **healing** path for GitHub, where installing the App *is*
-         *     registration and the registry is therefore only as current as the last
-         *     `installation_repositories` delivery. A dropped delivery leaves a repo the App
-         *     covers with no Project; re-sync notices.
+         * Report the repos the forge reaches that are not enabled, and move this org's Projects off connections that do not serve it (ADR-0060)
+         * @description Enabling a repository is opt-in, so re-sync **creates no Project**. A repo
+         *     the forge reports that is not bound is listed in `available`; an admin
+         *     enables it from the org's repositories page (`POST
+         *     /v1/connections/{id}/repos`). A repo an admin disabled therefore stays
+         *     disabled.
          *
-         *     It deliberately **only binds**. Unbinding on a forge's say-so would let one
-         *     failed API page delete governance — Environments, secrets and RBAC hang off a
+         *     The one change it makes is to an existing Project: a repo of this
+         *     connection's Org that is bound through a connection that does not serve
+         *     its owner (unassigned, or another Org's) moves to this one, with its
+         *     Project (git-bug 19b0a45). That is how an Org takes its repos back from a
+         *     legacy connection.
+         *
+         *     It **never unbinds**. Unbinding on a forge's say-so would let one failed
+         *     API page delete governance — Environments, secrets and RBAC hang off a
          *     Project — so removal stays an explicit human act. `confirmed` reports the
          *     overlap so a stale binding is still visible.
          */
@@ -673,40 +681,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/v1/orgs/{org}/environment-migration-report": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** The ADR-0071 migration's split report (ADR-0071 §10 step 8) */
-        get: operations["get_environment_migration_report"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/orgs/{org}/environment-migration-report/{env}/acknowledge": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Acknowledge a split-report line (ADR-0071 §10 step 8) */
-        post: operations["acknowledge_environment_migration_report"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/v1/orgs/{org}/environments": {
         parameters: {
             query?: never;
@@ -781,7 +755,7 @@ export interface paths {
          * @description Not copied, and listed in the answer: Policies that select the old
          *     Environment and not the new one, the Projects whose Pipelines name the
          *     old one (from Run history), and the OIDC subject cloud trust policies
-         *     match. Run and approval history and the Cache stay with the old
+         *     match. Run history, approvals included, and the Cache stay with the old
          *     Environment, which is not changed.
          *
          *     The secret store is a separate store from the Environment's, so the two
@@ -975,17 +949,17 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/v1/orgs/{org}/library-defaults/retry": {
+    "/v1/orgs/{org}/library-installations/{id}": {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        /** One installed library, by id (ADR-0076 §4) */
+        get: operations["get_library_installation"];
         put?: never;
-        /** Retry installing the first-party libraries (ADR-0076 §5) */
-        post: operations["retry_library_defaults"];
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -1061,7 +1035,24 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/v1/orgs/{org}/members/{subject}/passkeys/reset": {
+    "/v1/orgs/{org}/members/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** One member of an org and their roles (ADR-0080) */
+        get: operations["get_member"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/members/{id}/passkeys/reset": {
         parameters: {
             query?: never;
             header?: never;
@@ -1078,15 +1069,32 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/v1/orgs/{org}/plugin-catalog": {
+    "/v1/orgs/{org}/plugin-fetch": {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        /** The installable (first-party) plugins (ADR-0072) */
-        get: operations["plugin_catalog"];
+        get?: never;
+        put?: never;
+        /** Fetch a plugin manifest to review before installing (ADR-0072) */
+        post: operations["fetch_plugin_manifest"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/plugin-installations/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** One plugin installation, by id (ADR-0072) */
+        get: operations["get_plugin_by_id"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1106,9 +1114,9 @@ export interface paths {
         get: operations["list_plugins"];
         put?: never;
         /**
-         * Install a first-party plugin (ADR-0072)
-         * @description Third-party installs are off (403), and so are installs while
-         *     `SCARAB_PLUGINS=off` (409).
+         * Install a plugin from a reviewed manifest (ADR-0072)
+         * @description Refused while `SCARAB_PLUGINS=off` (409), and when the source no longer
+         *     reads as the reviewed manifest (409).
          */
         post: operations["install_plugin"];
         delete?: never;
@@ -1250,6 +1258,49 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/orgs/{org}/plugins/{name}/upgrade": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Upgrade a plugin installation to a reviewed manifest and image (ADR-0072 §10)
+         * @description A new image digest is new code and is confirmed like an install, whatever
+         *     the manifest (ADR-0072 §8, §10); so is a manifest that asks for more.
+         *     Only a same-or-narrower manifest on the installed image needs no step-up.
+         *     The server decides from the installed installation and the manifest it
+         *     reads here. Refused while `SCARAB_PLUGINS=off` (409), as an install is.
+         *     409 when the installed manifest is no longer `expected_current_sha256`,
+         *     and when the source no longer reads as `manifest_sha256`.
+         */
+        post: operations["upgrade_plugin"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/plugins/{name}/upgrade-fetch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Fetch a plugin manifest to review an upgrade against the installed one (ADR-0072 §10) */
+        post: operations["fetch_plugin_upgrade"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/orgs/{org}/policies": {
         parameters: {
             query?: never;
@@ -1262,6 +1313,23 @@ export interface paths {
         put?: never;
         /** Add an org Policy (ADR-0075 §4, §10) */
         post: operations["create_org_policy"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/policies/check": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Check a draft org Policy without saving it (ADR-0075 §6) */
+        post: operations["check_org_policy"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1321,6 +1389,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/orgs/{org}/policy-decisions/counts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Each Policy's decision counts since a time (ADR-0075 §9) */
+        get: operations["org_policy_decision_counts"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/orgs/{org}/policy-test": {
         parameters: {
             query?: never;
@@ -1331,14 +1416,17 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Evaluate run.create Policies without enforcing or recording (ADR-0075 §9)
+         * Evaluate Policies without enforcing or recording (ADR-0075 §9)
          * @description Policies: `policy` (a draft, compiled at the org level; a 400 when it
          *     does not compile), `policy_id` (a stored Policy of this org), or neither
-         *     (the org's and the input's Project's effective Policies, as admission
-         *     consults them). Input: `input`, `decision_id` (its recorded input and
-         *     schema version), or `pipeline` (compiled here with `libs`; no forge
-         *     read). A supplied or recorded input with a string or a list over its cap
-         *     is a 400.
+         *     (the org's and the input's Project's effective Policies, as the
+         *     checkpoint consults them). Input: `input` (at `checkpoint`, by default
+         *     the Policy's, else `run.create`), `decision_id` (its recorded input,
+         *     checkpoint and schema version), or `pipeline` (a `run.create` input,
+         *     compiled here with `libs`; no forge read). A Policy at another checkpoint
+         *     than the input is a 400. A supplied or recorded input with a string or a
+         *     list over its cap is a 400. The built-in Environment rules a recorded
+         *     `step.admit` or `gate.resolve` decision holds are not evaluated again.
          *     A Pipeline whose Run is over an input cap is answered as admission
          *     decides it: each matched Policy is an error, which denies when the Policy
          *     is enforced.
@@ -1350,6 +1438,23 @@ export interface paths {
          *     would need. Org Read covers every Project.
          */
         post: operations["policy_test"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/policy-test/replay": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Replay a draft Policy over recorded decisions (ADR-0075 §9) */
+        post: operations["policy_test_replay"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1419,6 +1524,34 @@ export interface paths {
         };
         /** A Project typed setting's version history (ADR-0075 §11) */
         get: operations["list_project_policy_versions"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/repos": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * An org's repositories, enabled and not, one page at a time
+         * @description Enabling a repository is opt-in, so this is the list an admin enables
+         *     from (`POST /v1/connections/{id}/repos`) and disables from (`DELETE
+         *     /v1/connections/{id}/repos/{owner}/{name}`). The forge is asked live, as
+         *     the bind pick-list is (`…/available-repos`); no list of
+         *     available repositories is stored. The forge port returns a connection's
+         *     whole list, so the server pages the merged result.
+         *
+         *     Read on the org may list it; `can_change` says per row whether the caller
+         *     may also act on it.
+         */
+        get: operations["org_repos"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1508,6 +1641,23 @@ export interface paths {
         post?: never;
         /** Revoke an issued API token (ADR-0049) */
         delete: operations["revoke_api_token"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/policy-checkpoints": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Each PolicyCheckpoint's input schema (ADR-0075 §2) */
+        get: operations["list_policy_checkpoints"];
+        put?: never;
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -1618,23 +1768,6 @@ export interface paths {
         post?: never;
         /** Retired: per-repo environments are org-level Environments now (ADR-0071) */
         delete: operations["delete_environment"];
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/repos/{org}/{repo}/environments/{name}/deployments": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Legacy approval history (ADR-0070 §1) */
-        get: operations["list_deployments"];
-        put?: never;
-        post?: never;
-        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -2519,6 +2652,7 @@ export interface components {
              * @description Unix-ms.
              */
             created_at: number;
+            /** @description Who minted it: a Principal's handle. */
             created_by: string;
             /**
              * Format: int64
@@ -2534,7 +2668,12 @@ export interface components {
             last_used_at?: number | null;
             name: string;
             org: string;
-            /** @description The principal who holds the token and whose live authority bounds it. */
+            /** @description That Principal, as people read it. */
+            owner: components["schemas"]["PersonDto"];
+            /**
+             * @description The id of the Principal who holds the token and whose live authority
+             *     bounds it (ADR-0080).
+             */
             owner_subject: string;
             /** @description `None` for an org-scoped token. */
             project?: string | null;
@@ -2692,7 +2831,7 @@ export interface components {
         BindRepoResultDto: {
             /**
              * @description The governed Project's natural key — `(owner, name)` in v1 (1 Project : 1
-             *     RepoRef), the same mapping installation auto-registration uses.
+             *     RepoRef), the same mapping every bind uses.
              */
             org: string;
             project: string;
@@ -2713,14 +2852,24 @@ export interface components {
             claimed?: boolean | null;
             /**
              * @description The Principal's display name, when the identity store knows it
-             *     (ADR-0069). Absent for a pre-upgrade bare subject nobody has signed in
-             *     as since.
+             *     (ADR-0069).
              */
             display_name?: string | null;
+            /** @description The Principal's handle (`github:alice`): what people read and type. */
+            handle: string;
+            /** @description The Principal's id (ADR-0080): what a member's URL carries. */
+            id: string;
+            /**
+             * @description Who wrote the binding: `native` (granted in Scarab, which a forge
+             *     re-sync never changes) or `import` (seeded from the forge's
+             *     collaborators, which a re-sync refreshes or removes). Set on the org
+             *     listing; absent on an import's response, which lists what the forge
+             *     gave and not what each row holds.
+             */
+            origin?: string | null;
             /** @description Empty = org-scoped. */
             project: string;
             role: string;
-            subject: string;
         };
         /** @description One input in the scope of a Step's invocation. */
         BoundInputDto: {
@@ -2917,6 +3066,14 @@ export interface components {
              *     not the secret.
              */
             credential_ref: string;
+            /**
+             * Format: int64
+             * @description How many repositories are enabled through this connection: its repo
+             *     bindings, each a Project (ADR-0046). A count, not the list: a
+             *     connection can hold thousands. The org's repositories page
+             *     (`GET /v1/orgs/{org}/repos?connection=`) lists them.
+             */
+            enabled_repos: number;
             id: string;
             /** @description `github` | `forgejo`. */
             kind: string;
@@ -2940,11 +3097,6 @@ export interface components {
              *     visible to and editable by global admins only.
              */
             org?: string | null;
-            /**
-             * @description The Projects this connection serves, from its repo bindings — a Project
-             *     *is* a binding (ADR-0046), so this is the connection's whole footprint.
-             */
-            projects: components["schemas"]["ConnectionProjectDto"][];
             /**
              * @description Can this connection's app configuration be checked against what Scarab
              *     needs (`GET …/preflight`)? Decided from the kind, like `supports_resync`
@@ -3010,13 +3162,6 @@ export interface components {
              *     introspect, a credential that does not resolve, a forge that errored.
              */
             unavailable_reason?: string | null;
-        };
-        /** @description A Project a connection serves, plus the forge coordinate it came from. */
-        ConnectionProjectDto: {
-            name: string;
-            org: string;
-            owner: string;
-            project: string;
         };
         /** @description A named external system the plugin reaches through the broker. */
         ConnectionSlotDto: {
@@ -3292,53 +3437,6 @@ export interface components {
              */
             projects?: string[];
         };
-        /**
-         * @description One line of the split report: an Environment name merged across several
-         *     Projects, or created with eligibility *all projects* because no Project
-         *     defined it. If the merged Projects really meant different places (one
-         *     `prod` that is `prod-eu`), the split is a YAML change: those Projects
-         *     rename their `environment:` and an org admin creates the new
-         *     Environment — nothing is renamed for them.
-         */
-        EnvironmentMigrationReportDto: {
-            /**
-             * Format: int64
-             * @description Unix-ms; absent until an admin acknowledges the line.
-             */
-            acknowledged_at?: number | null;
-            acknowledged_by?: string | null;
-            /**
-             * Format: int64
-             * @description Unix-ms.
-             */
-            created_at: number;
-            /**
-             * @description The legacy rules the merged Projects disagreed on, by ADR-0037 field
-             *     name (`approvers`, `allowed_refs`, `wait_timer`, `require_reason`,
-             *     `privileged_images`, `permit_k8s_overlay`). Lists compare as sets.
-             */
-            differing_rules: string[];
-            environment: string;
-            /** @description The Environment still exists. */
-            environment_exists: boolean;
-            merged_projects: string[];
-            /**
-             * @description Its baseline is still the permissive one the migration gave it:
-             *     nothing org-wide protects it yet — set a baseline.
-             */
-            permissive_baseline: boolean;
-            projects: components["schemas"]["EnvironmentMigrationReportProjectDto"][];
-            /** @description No Project defined it: migrated with eligibility *all projects*. */
-            referenced_only: boolean;
-            /** @description Projects whose Runs named it without defining it. */
-            referencing_projects: string[];
-        };
-        /** @description One Project in a split-report line: what it had, and what it has now. */
-        EnvironmentMigrationReportProjectDto: {
-            legacy?: null | components["schemas"]["LegacyProtectionRulesDto"];
-            overlay?: null | components["schemas"]["EnvironmentProjectOverlayDto"];
-            project: string;
-        };
         /** @description One Project's standing in one Environment, for the Environment's admin. */
         EnvironmentProjectDto: {
             /** @description Whether the Environment's eligibility admits it now. */
@@ -3374,8 +3472,9 @@ export interface components {
             allowed_refs: string[];
             approval_gate?: null | components["schemas"]["ApprovalGateRulesDto"];
             /**
-             * @description Principal ids. Every one must approve (AND), unless the baseline's
-             *     `approval_gate.required_approvals` says how many of its own must.
+             * @description Principal handles (stored as ids, ADR-0080). Every one must approve
+             *     (AND), unless the baseline's `approval_gate.required_approvals` says
+             *     how many of its own must.
              */
             approvers: string[];
             /** @description A human dispatch must carry a reason (ADR-0057 §3). */
@@ -3425,6 +3524,51 @@ export interface components {
             /** @description `<host>/<owner>/<repo>//<path>@<commit>`. */
             source: string;
         };
+        /** @description `POST /v1/orgs/{org}/plugin-fetch`. */
+        FetchPluginManifestRequest: {
+            /**
+             * @description A ForgeConnection id, for a private repository of the org. Omitted:
+             *     read anonymously over https from github.com or a Forgejo
+             *     connection's host.
+             */
+            connection?: string | null;
+            /**
+             * @description The plugin's manifest file, `<host>/<owner>/<repo>//<path>@<commit>`;
+             *     the path ends in `.json`, `.yaml` or `.yml`.
+             */
+            source: string;
+        };
+        /**
+         * @description `POST /v1/orgs/{org}/plugins/{name}/upgrade-fetch`: which manifest to
+         *     read for the upgrade. Either `source`, or `commit` to read the file the
+         *     installation's recorded source names at that commit.
+         */
+        FetchPluginUpgradeRequest: {
+            /**
+             * @description A full commit id (40 or 64 lowercase hex). Read when `source` is
+             *     omitted; the installation must have a recorded source then. There is
+             *     no branch resolution: the admin names the commit.
+             */
+            commit?: string | null;
+            /**
+             * @description A ForgeConnection id to read it through. Omitted with `source`: read
+             *     anonymously. Omitted with `commit`: the connection the recorded source
+             *     was read through.
+             */
+            connection?: string | null;
+            /**
+             * @description The image the upgrade would run, `<repository>@sha256:<64 hex>`. When
+             *     given, it is checked against the new manifest's named repository, and
+             *     `needs_step_up` is judged with it: any image other than the installed
+             *     one needs a step-up. Omitted: judged as keeping the installed image.
+             */
+            image?: string | null;
+            /**
+             * @description The new manifest's source, `<host>/<owner>/<repo>//<path>@<commit>`.
+             *     Omitted: the recorded source's file at `commit`.
+             */
+            source?: string | null;
+        };
         FetchedLibraryDto: {
             content: string;
             content_hash: string;
@@ -3434,21 +3578,60 @@ export interface components {
              *     `+`, `-` or a space. Empty when nothing is installed.
              */
             diff: string;
-            first_party: boolean;
             name: string;
             publisher: string;
             source: string;
         };
-        /** @description A first-party library in the server's release manifest. */
-        FirstPartyLibraryDto: {
-            content_hash: string;
-            /** @description Installed in this org under its name, at any version. */
-            installed: boolean;
-            name: string;
-            publisher: string;
-            release: string;
-            security_fix: boolean;
+        /** @description A plugin manifest read for review. Nothing is stored or installed. */
+        FetchedPluginManifestDto: {
+            /** @description The file as read. */
+            content: string;
+            /**
+             * @description The org's installations of the same plugin (`manifest.plugin`), by
+             *     name, each with the manifest hash it was approved with.
+             */
+            installed: components["schemas"]["InstalledPluginManifestDto"][];
+            /**
+             * @description What the plugin asks for: what an install approves with the image
+             *     digest.
+             */
+            manifest: components["schemas"]["PluginManifestDto"];
+            /** @description Pass it to `POST …/plugins` as `manifest_sha256`. */
+            manifest_sha256: string;
+            /** @description The source as read, pinned to its commit. */
             source: string;
+        };
+        /** @description A manifest read for an upgrade, and what it changes. Nothing is stored. */
+        FetchedPluginUpgradeDto: {
+            /** @description The connection it was read through: pass it to `…/upgrade`. */
+            connection?: string | null;
+            /** @description The file as read. */
+            content: string;
+            current_image: string;
+            /**
+             * @description The installed manifest's hash: pass it to `…/upgrade` as
+             *     `expected_current_sha256`.
+             */
+            current_manifest_sha256: string;
+            diff: components["schemas"]["ManifestDiffDto"];
+            manifest: components["schemas"]["PluginManifestDto"];
+            /** @description Pass it to `…/upgrade` as `manifest_sha256`. */
+            manifest_sha256: string;
+            /**
+             * @description Whether `…/upgrade` asks for a step-up: exactly when there is a
+             *     reason. Decided again by the server at the upgrade.
+             */
+            needs_step_up: boolean;
+            /** @description The source as read, pinned to its commit: pass it to `…/upgrade`. */
+            source: string;
+            /**
+             * @description Why `…/upgrade` asks for a step-up, each as a sentence: what the new
+             *     manifest asks for that the installed one did not, and a new image
+             *     (any digest other than the installed one is new code). Judged with
+             *     the request's `image`, or the installed image when it has none.
+             *     Empty = a narrowing on the same image, which needs none.
+             */
+            step_up_reasons: string[];
         };
         /** @description The answer to a gate approval. */
         GateApprovalDto: {
@@ -3571,15 +3754,25 @@ export interface components {
             config?: {
                 [key: string]: string;
             };
-            /** @description `<catalog image_repository>@sha256:<64 hex>`. */
+            /** @description The connection the fetch read it through, if any. */
+            connection?: string | null;
+            /** @description `<repository>@sha256:<64 hex>`. */
             image: string;
+            /**
+             * @description The `manifest_sha256` the fetch returned, which the admin reviewed.
+             *     The install is refused (409) when the source no longer reads as it.
+             */
+            manifest_sha256: string;
             /**
              * @description The installation's name: a DNS-1123 label, unique in the org and
              *     never reused once uninstalled.
              */
             name: string;
-            /** @description The catalog plugin (`argocd`). */
-            plugin: string;
+            /**
+             * @description The manifest's source, as `POST …/plugin-fetch` read it. Read again
+             *     here.
+             */
+            source: string;
             storage?: null | components["schemas"]["PluginStorageRequest"];
         };
         /**
@@ -3587,60 +3780,41 @@ export interface components {
          * @enum {string}
          */
         InstallationStateDto: "enabled" | "killed";
+        /** @description An installation of the plugin a fetch read. */
+        InstalledPluginManifestDto: {
+            image: string;
+            manifest_sha256: string;
+            name: string;
+        };
         InstalledVersionDto: {
             content_hash: string;
             source: string;
         };
-        /**
-         * @description A Project's ADR-0037 per-repo rules as the migration found them. The
-         *     canonical `secret_scope` / `oidc_subject` are left out: the server always
-         *     derived them from the coordinates, so they never differed by choice.
-         */
-        LegacyProtectionRulesDto: {
-            allowed_refs: string[];
-            approvers: string[];
-            /**
-             * Format: int32
-             * @description Stored but never read; not carried by the migration (§10 step 3).
-             */
-            concurrency: number;
-            permit_k8s_overlay: boolean;
-            privileged_images: components["schemas"]["ImageGrantDto"][];
-            require_reason: boolean;
-            /**
-             * Format: int32
-             * @description Seconds.
-             */
-            wait_timer: number;
-        };
-        LibraryDefaultsDto: {
-            mirror?: string | null;
-            missing: components["schemas"]["MissingDefaultDto"][];
-            /**
-             * @description `offered` (an org from before libraries: nothing installed without an
-             *     admin), `pending`, `installed` or `missing`.
-             */
-            state: string;
-            /** Format: int64 */
-            updated_at: number;
-        };
         LibraryInstallationDto: {
             content_hash: string;
-            first_party: boolean;
+            /**
+             * @description 10 lowercase hex, minted at the first install and kept by upgrades.
+             *     What the settings page's URL carries.
+             */
+            id: string;
             /** Format: int64 */
             installed_at: number;
             installed_by: string;
             name: string;
             publisher: string;
             source: string;
-            update?: null | components["schemas"]["UpdateNoticeDto"];
             yanked?: null | components["schemas"]["LibraryYankDto"];
         };
         LibraryYankDto: {
             /** @description The Runs a yank with `cancel_runs` cancelled. Omitted otherwise. */
             cancelled_runs?: string[];
             content_hash: string;
+            name: string;
+            /** @description The library the yanked version was fetched for, `<publisher>/<name>`. */
+            publisher: string;
             reason: string;
+            /** @description The git source the version was fetched from, pinned to its commit. */
+            source: string;
             /** Format: int64 */
             yanked_at: number;
             yanked_by: string;
@@ -3660,8 +3834,41 @@ export interface components {
              *     mutation (also delivered as the readable `scarab_csrf` cookie).
              */
             csrf: string;
+            /** @description The Principal's handle: what people read. */
+            handle: string;
             session: string;
+            /** @description The Principal's id (ADR-0080). */
             subject: string;
+        };
+        /** @description The installed manifest against the new one, group by group. */
+        ManifestDiffDto: {
+            /** @description `<slot>: <scheme>`. */
+            auth_schemes: components["schemas"]["ManifestDiffGroupDto"];
+            capabilities: components["schemas"]["ManifestDiffGroupDto"];
+            config_keys: components["schemas"]["ManifestDiffGroupDto"];
+            /** @description Connection slot names. */
+            connections: components["schemas"]["ManifestDiffGroupDto"];
+            /**
+             * @description Gate names; a gate whose definition changed is both removed and
+             *     added.
+             */
+            gates: components["schemas"]["ManifestDiffGroupDto"];
+            /** @description The image repository the manifest names. */
+            image: components["schemas"]["ManifestDiffGroupDto"];
+            /**
+             * @description `<slot>: <method> <path>[ ?<query keys>]`. One more allowed query key
+             *     is a new rule.
+             */
+            read_rules: components["schemas"]["ManifestDiffGroupDto"];
+        };
+        /** @description One group of an upgrade's manifest diff. */
+        ManifestDiffGroupDto: {
+            /** @description Only in the new manifest. */
+            added: string[];
+            /** @description Only in the installed manifest. */
+            removed: string[];
+            /** @description In both. */
+            unchanged: string[];
         };
         /** @description The authenticated principal (ADR-0049) — powers the UI's identity menu. */
         MeResponse: {
@@ -3695,6 +3902,10 @@ export interface components {
              *     an API token.
              */
             global_admin: boolean;
+            /** @description The Principal's handle (`github:alice`): what people read and type. */
+            handle: string;
+            /** @description The same id, under the name every person response uses. */
+            id: string;
             /**
              * @description The provider accounts this Principal can sign in with (ADR-0069).
              *     Empty when no identity store is wired (dev).
@@ -3702,7 +3913,7 @@ export interface components {
             identities: components["schemas"]["PrincipalIdentityDto"][];
             /** @description The principal's Scarab-native roles (e.g. `["Owner"]`). */
             roles: string[];
-            /** @description Stable, forge-agnostic identity subject. */
+            /** @description The Principal's id (ADR-0080): stable, random, never shown as a name. */
             subject: string;
             /**
              * @description The orgs this principal may mint a personal API token in, sorted: every
@@ -3730,6 +3941,8 @@ export interface components {
              *     provider is chosen: `scarab security setup` prints this.
              */
             fresh_login_url: string;
+            /** @description The caller's handle: what to sign in as. */
+            handle: string;
             /** @description Holds at least one usable (not clone-flagged) passkey. */
             has_passkey: boolean;
             /** @description The passkeys — empty for an API-token caller (see `passkeys_hidden`). */
@@ -3741,6 +3954,7 @@ export interface components {
             passkeys_hidden: boolean;
             /** @description `enforce` or `off`. */
             step_up: string;
+            /** @description The caller's Principal id (ADR-0080). */
             subject: string;
             /**
              * Format: int64
@@ -3752,6 +3966,22 @@ export interface components {
              * @description This browser session's open window, if any (unix ms).
              */
             window_expires_at?: number | null;
+        };
+        /**
+         * @description `GET /v1/orgs/{org}/members/{id}`: one person and the roles they hold in
+         *     the org (ADR-0080 §5). The member page reads this by the Principal's id.
+         */
+        MemberDto: {
+            /** @description Their bindings in the org, org scope first, then by repository. */
+            bindings: components["schemas"]["BindingDto"][];
+            /**
+             * @description `false` = created by a forge import, not signed into yet. Absent
+             *     when no identity store knows them.
+             */
+            claimed?: boolean | null;
+            display_name?: string | null;
+            handle: string;
+            id: string;
         };
         /**
          * @description `POST /v1/me/tokens` body: [`MintTokenRequest`] plus the org, which the
@@ -3814,12 +4044,6 @@ export interface components {
              */
             token: string;
         };
-        MissingDefaultDto: {
-            error: string;
-            name: string;
-            /** @description Empty when the release manifest itself could not be read. */
-            publisher: string;
-        };
         /**
          * @description What Run creation does when a Step that uses the Environment's authority
          *     has no `manual` gate upstream (ADR-0078 §3).
@@ -3867,22 +4091,70 @@ export interface components {
              * @description Unix-ms.
              */
             updated_at: number;
-            /** @description Who last wrote it (a Principal subject). */
+            /** @description Who last wrote it (a Principal's handle). */
             updated_by: string;
         };
         OrgLibrariesDto: {
-            defaults?: null | components["schemas"]["LibraryDefaultsDto"];
-            first_party: components["schemas"]["FirstPartyLibraryDto"][];
             installations: components["schemas"]["LibraryInstallationDto"][];
-            /** @description Why the release manifest could not be read, if it could not. */
-            manifest_error?: string | null;
             /**
              * @description The library sources this org trusts with long-lived forge credentials
-             *     (ADR-0076 §9), besides the first-party clone library, which it trusts
-             *     by default.
+             *     (ADR-0076 §9). No library is trusted without one.
              */
             trusted_sources: components["schemas"]["TrustedSourceDto"][];
             yanks: components["schemas"]["LibraryYankDto"][];
+        };
+        /**
+         * @description One repository of an org: enabled (a Project, bound through a connection)
+         *     or reachable through one of the org's connections and not enabled.
+         */
+        OrgRepoDto: {
+            /**
+             * @description May the caller enable or disable it here? Needs Administer on the
+             *     connection's org, and a connection not managed by configuration.
+             */
+            can_change: boolean;
+            /**
+             * @description The connection it is bound through when enabled, else the one that
+             *     reaches it: the `{id}` of the bind and unbind endpoints.
+             */
+            connection_id: string;
+            /** @description Is it a Project? Enabling binds it; disabling unbinds it. */
+            enabled: boolean;
+            /** @description That connection's forge kind: `github` | `forgejo`. */
+            kind: string;
+            name: string;
+            owner: string;
+            /** @description The Project's name when enabled (the repo name). */
+            project?: string | null;
+            /** @description The repository's page on the forge. */
+            repo_url: string;
+            /**
+             * Format: int64
+             * @description For an enabled repo: unix-ms since when its connection has not
+             *     reached it (the GitHub App's installation stopped covering it), or
+             *     `null`. Disable is the only way to remove it.
+             */
+            unreachable_since?: number | null;
+        };
+        /** @description `GET /v1/orgs/{org}/repos` response: one page of the org's repositories. */
+        OrgReposPageDto: {
+            /** @description Does the caller administer the org? */
+            can_administer: boolean;
+            /** @description How many of the org's repositories are enabled, whatever the query. */
+            enabled_total: number;
+            /** Format: int32 */
+            page: number;
+            /** Format: int32 */
+            per_page: number;
+            /** @description This page, sorted by name. */
+            repos: components["schemas"]["OrgRepoDto"][];
+            /** @description How many repositories match the query, across every page. */
+            total: number;
+            /**
+             * @description Connections whose repositories could not be listed. Their enabled
+             *     repositories are still in the list; the ones not enabled are not.
+             */
+            unlisted: components["schemas"]["UnlistedConnectionDto"][];
         };
         /** @description `GET /v1/orgs/{org}/security/summary`. */
         OrgSecuritySummary: {
@@ -3970,12 +4242,14 @@ export interface components {
         };
         /** @description What a passkey reset removed. */
         PasskeyResetDto: {
+            /** @description Its handle (ADR-0080). */
+            handle: string;
             /**
              * Format: int64
              * @description How many passkeys were removed.
              */
             removed: number;
-            /** @description The principal whose passkeys were reset. */
+            /** @description The id of the Principal whose passkeys were reset. */
             subject: string;
             /**
              * Format: int64
@@ -4014,6 +4288,17 @@ export interface components {
             gates: components["schemas"]["PendingGateDto"][];
             /** @description Pass as `after` for the next page; absent on the last. */
             next?: string | null;
+        };
+        /** @description A person as an API response names them (ADR-0080 §5). */
+        PersonDto: {
+            display_name?: string | null;
+            /** @description What people type and read. */
+            handle: string;
+            /**
+             * @description The Principal's id: what a URL carries. For a reference that names
+             *     no Principal, the reference itself.
+             */
+            id: string;
         };
         /**
          * @description `GET /v1/repos/{org}/{repo}/pipelines?ref=` body: the manually-dispatchable
@@ -4104,17 +4389,6 @@ export interface components {
          * @enum {string}
          */
         PluginCapabilityDto: "report_deployments" | "subscribe_events" | "offer_actions" | "use_connection" | "contribute_ui" | "approve_gates" | "resolve_gates";
-        /** @description A plugin this Scarab can install. */
-        PluginCatalogEntryDto: {
-            description: string;
-            /** @description Always true today: third-party installs are off. */
-            first_party: boolean;
-            /** @description Install as `<image_repository>@sha256:<digest>`. */
-            image_repository: string;
-            manifest: components["schemas"]["PluginManifestDto"];
-            /** @description The catalog key `POST …/plugins` names as `plugin`. */
-            plugin: string;
-        };
         /**
          * @description One connection slot of an installation and what an admin bound to it
          *     (ADR-0072 §5). Never carries the credential, nor its secret key.
@@ -4226,7 +4500,7 @@ export interface components {
             /** @description Unique in the org and never reused. */
             name: string;
             org: string;
-            /** @description The catalog plugin. */
+            /** @description The plugin's own name, from its manifest. */
             plugin: string;
             /** @description `plugin:<name>` — what it acts as in audit. */
             principal: string;
@@ -4237,6 +4511,17 @@ export interface components {
             probe_passed_at?: number | null;
             runtime_message: string;
             runtime_status: components["schemas"]["RuntimeStatusDto"];
+            /**
+             * @description Where the approved manifest was read,
+             *     `<host>/<owner>/<repo>//<path>@<commit>`. Absent for an installation
+             *     made before the source was recorded.
+             */
+            source?: string | null;
+            /**
+             * @description The ForgeConnection the source was read through; absent = read
+             *     anonymously, or not recorded.
+             */
+            source_connection?: string | null;
             state: components["schemas"]["InstallationStateDto"];
             storage?: null | components["schemas"]["PluginStorageDto"];
         };
@@ -4253,6 +4538,12 @@ export interface components {
              *     `resolve_gates`.
              */
             gates: components["schemas"]["GateDefinitionDto"][];
+            /**
+             * @description The image repository the plugin ships as, when the manifest names
+             *     one: an install or upgrade must run an image of it. Absent = the
+             *     manifest does not name its image, so any repository is accepted.
+             */
+            image?: string | null;
             plugin: string;
         };
         /**
@@ -4288,6 +4579,85 @@ export interface components {
              */
             mount_path?: string | null;
         };
+        /** @description `POST …/policies/check`: name exactly one of `policy` and `yaml`. */
+        PolicyCheckRequest: {
+            /** @description The draft Policy, as `POST …/policies` takes it. */
+            policy?: Record<string, never> | null;
+            /**
+             * @description The draft as YAML, such as a `kind: policy` file pasted into the
+             *     editor. At most 64 KiB.
+             */
+            yaml?: string | null;
+        };
+        /** @description What checking a draft found. Nothing is saved. */
+        PolicyCheckResponse: {
+            /** @description Errors first, then the `has()` warnings of the rules that compiled. */
+            diagnostics: components["schemas"]["PolicyDiagnosticDto"][];
+            /** @description No error: saving this Policy at the org level would compile it. */
+            ok: boolean;
+            /**
+             * @description The draft as `POST …/policies` takes it: what `yaml` parsed to (with
+             *     `kind` dropped), or `policy` itself. Absent when the body is not a
+             *     Policy.
+             */
+            policy?: Record<string, never> | null;
+            /** @description Each rule that compiled, with the input fields it reads. */
+            rules: components["schemas"]["RuleReadsDto"][];
+        };
+        /** @description One PolicyCheckpoint as the policy editor needs it. */
+        PolicyCheckpointDto: {
+            /** @description `run.create`, `step.admit` or `gate.resolve`. */
+            checkpoint: string;
+            /**
+             * @description The effects a Policy saved here may use. Only `deny` is evaluated
+             *     today, at every checkpoint.
+             */
+            effects: string[];
+            /**
+             * @description The `match` keys a Policy here may set: `projects`,
+             *     `except_projects`, `environments`, and `trigger_kinds` at
+             *     `run.create` only.
+             */
+            match_keys: string[];
+            /**
+             * @description The input schema: `variables` (the CEL variables a rule reads), and
+             *     `structs` and `enums` by name. Each field has `name`, `ty` (`{kind,
+             *     of}`), `optional`, `max_len` and `doc`.
+             */
+            schema: Record<string, never>;
+            /** Format: int32 */
+            schema_version: number;
+            /** @description The values `match.trigger_kinds` takes; empty where it is refused. */
+            trigger_kinds: string[];
+        };
+        PolicyCountsDto: {
+            /**
+             * Format: int64
+             * @description It denied, or a rule failed while it was enforced (which denies).
+             */
+            denied: number;
+            /**
+             * Format: int64
+             * @description Decisions its `match` selected.
+             */
+            matched: number;
+            policy_id: string;
+            /**
+             * Format: int64
+             * @description In audit mode it would have denied, or a rule failed.
+             */
+            would_deny: number;
+        };
+        /** @description `GET …/policy-decisions/counts`. */
+        PolicyDecisionCountsDto: {
+            /**
+             * @description One per Policy whose `match` selected at least one decision since
+             *     then, by id.
+             */
+            policies: components["schemas"]["PolicyCountsDto"][];
+            /** Format: int64 */
+            since: number;
+        };
         /** @description One page of the org decision log, newest first. */
         PolicyDecisionPageDto: {
             decisions: components["schemas"]["PolicyDecisionRecordDto"][];
@@ -4313,6 +4683,27 @@ export interface components {
             /** @description The Run the decision admitted; absent for a refused `run.create`. */
             run_id?: string | null;
             step_id?: string | null;
+        };
+        /** @description One finding about a draft. */
+        PolicyDiagnosticDto: {
+            /**
+             * @description Where in the Policy: `name`, `match.projects`, `rules[0].when`,
+             *     `rules[0].message`. Empty when the body is not a Policy.
+             */
+            at: string;
+            /** Format: int32 */
+            column: number;
+            /** @description The sub-expression the finding is about, as the checker renders it. */
+            expr: string;
+            /**
+             * Format: int32
+             * @description 1-based line and column in the rule's `when`; 0 for a finding that
+             *     is not about CEL.
+             */
+            line: number;
+            message: string;
+            /** @description `error` (the Policy cannot be saved) or `warning`. */
+            severity: string;
         };
         /** @description A stored Policy, at its current version. */
         PolicyDto: {
@@ -4351,6 +4742,44 @@ export interface components {
             /** Format: int64 */
             version: number;
         };
+        /** @description `POST …/policy-test/replay`. */
+        PolicyReplayRequest: {
+            /**
+             * @description How many of the newest decisions at the draft's checkpoint to read
+             *     (default and cap 200).
+             */
+            limit?: number | null;
+            /** @description The draft Policy, compiled at the org level. */
+            policy: Record<string, never>;
+            /**
+             * @description The stored org Policy the draft edits: each decision's `before` is
+             *     that Policy's part in it. Absent for a new Policy: `before` is
+             *     `allow`.
+             */
+            policy_id?: string | null;
+        };
+        /**
+         * @description What a draft would change over the recorded decisions. Nothing is
+         *     enforced or recorded.
+         */
+        PolicyReplayResponse: {
+            /**
+             * @description The decisions whose outcome for this Policy would change, newest
+             *     first.
+             */
+            changed: components["schemas"]["ReplayChangeDto"][];
+            checkpoint: string;
+            /** @description Decisions the draft was evaluated against. */
+            evaluated: number;
+            /** @description Decisions read: the newest at the checkpoint, at most `limit`. */
+            read: number;
+            /**
+             * @description Decisions not evaluated: no recorded input (the Run was over an
+             *     input list cap), or an input of a schema version this server does
+             *     not evaluate.
+             */
+            skipped: number;
+        };
         /**
          * @description The Pipeline form of the policy test: what `scarab validate --server`
          *     sends.
@@ -4380,9 +4809,16 @@ export interface components {
          *     of `input`, `decision_id` and `pipeline`.
          */
         PolicyTestRequest: {
+            /**
+             * @description The checkpoint of `input`: `run.create`, `step.admit` or
+             *     `gate.resolve`. Default: the checkpoint of `policy` or `policy_id`,
+             *     else `run.create`. A recorded decision is at its own checkpoint, and
+             *     a `pipeline` builds a `run.create` input.
+             */
+            checkpoint?: string | null;
             /** @description A recorded decision of this org, whose input is evaluated again. */
             decision_id?: string | null;
-            /** @description A `run.create` input, as a PolicyDecision records it. */
+            /** @description A checkpoint input, as a PolicyDecision records it. */
             input?: Record<string, never> | null;
             pipeline?: null | components["schemas"]["PolicyTestPipeline"];
             /**
@@ -4440,7 +4876,7 @@ export interface components {
         PolicyVersionDto: {
             /** Format: int64 */
             at: number;
-            /** @description The Principal who saved it. */
+            /** @description The handle of the Principal who saved it. */
             author: string;
             content_hash: string;
             /** @description This version deleted the Policy. */
@@ -4457,7 +4893,12 @@ export interface components {
             /** @description `false` = created by a forge import, not signed into yet. */
             claimed: boolean;
             display_name?: string | null;
-            /** @description What a grant or an approver entry stores. */
+            /** @description What a grant or an approver entry is typed as. */
+            handle: string;
+            /**
+             * @description The Principal's id (ADR-0080): what a grant or an approver entry
+             *     stores, and what a URL carries.
+             */
             id: string;
             identities: components["schemas"]["PrincipalIdentityDto"][];
         };
@@ -4469,6 +4910,12 @@ export interface components {
         };
         /** @description One registered project (governed repo, ADR-0046) in the repos list. */
         ProjectDto: {
+            /**
+             * @description The forge connection it is bound through: the `{id}` of
+             *     `/v1/connections/{id}/…`, and the row of `GET /v1/connections` that
+             *     says whether it is managed by configuration.
+             */
+            connection_id: string;
             /**
              * Format: int64
              * @description Epoch millis of the project's most recent run, or `null` if it has never
@@ -4488,6 +4935,14 @@ export interface components {
              *     host, which differs from the web host on GitHub).
              */
             repo_url: string;
+            /**
+             * Format: int64
+             * @description Unix-ms since when its forge connection has not reached it (the
+             *     GitHub App's installation stopped covering it), or `null`. The
+             *     Project is kept; its events are ignored and no run can start until
+             *     the forge covers it again or an admin disables it.
+             */
+            unreachable_since?: number | null;
         };
         /**
          * @description An org-level Environment as one Project sees it (ADR-0071): the read
@@ -4577,8 +5032,9 @@ export interface components {
              */
             approval_gate?: components["schemas"]["PutApprovalGateRules"];
             /**
-             * @description Principal ids (ADR-0069): each must name an existing Principal; a
-             *     merged id is stored as the Principal it now is. All must approve.
+             * @description Principal handles or ids (ADR-0069, ADR-0080): each must name an
+             *     existing Principal; a merged one is stored as the Principal it now is.
+             *     All must approve.
              */
             approvers?: string[];
             /** @description A human dispatch must carry a reason (ADR-0057 §3). Omitted = off. */
@@ -4715,6 +5171,30 @@ export interface components {
             ][];
             image: string;
         };
+        ReplayChangeDto: {
+            /** @description The same for the draft. */
+            after: string;
+            /** Format: int64 */
+            at: number;
+            /** Format: int32 */
+            attempt?: number | null;
+            /**
+             * @description `allow`, `deny` or `would_deny`: the stored Policy's part in the
+             *     recorded decision, or `allow` when it had none.
+             */
+            before: string;
+            decision_id: string;
+            /**
+             * @description The messages of the draft's rules that matched, or why one failed;
+             *     empty when `after` is `allow`.
+             */
+            messages: string[];
+            project?: string | null;
+            /** @description The Run the decision is about; absent for a refused `run.create`. */
+            run_id?: string | null;
+            /** @description The Step and attempt of a `step.admit` decision. */
+            step_id?: string | null;
+        };
         /**
          * @description An allowed read on a connection: method + path pattern (`*` = one
          *     segment) + the query keys it may carry.
@@ -4771,35 +5251,35 @@ export interface components {
              */
             widened: string[];
         };
-        /** @description `POST /v1/connections/{id}/resync` body: what reconciliation changed. */
+        /**
+         * @description `POST /v1/connections/{id}/resync` body: what the forge reports, compared
+         *     with what is enabled.
+         */
         ResyncResultDto: {
-            /** @description Repos the forge reports that Scarab did not have bound — now bound. */
-            bound: string[];
+            /**
+             * @description Repos of the connection's Org the forge reports that are not enabled.
+             *     Re-sync does not enable them; an admin does, from the org's
+             *     repositories page.
+             */
+            available: string[];
             /**
              * @description How many bindings the forge confirms. Reported rather than acted on:
              *     see the handler's note on why re-sync never unbinds.
              */
             confirmed: number;
             /**
-             * @description Repos the forge reports that were not bound (git-bug 19b0a45): owned
-             *     by another account than the connection's Org, already bound through
-             *     another connection that serves an Org, or reported to a connection
-             *     that serves no Org yet (it binds nothing until it is assigned).
+             * @description Repos that were already Projects, bound through a connection that does
+             *     not serve their owner (unassigned, or another Org's), and now bound
+             *     through this one with their Projects (git-bug 19b0a45).
+             */
+            moved: string[];
+            /**
+             * @description Repos the forge reports that are neither available nor moved: owned by
+             *     another account than the connection's Org, already bound through
+             *     another connection that serves an Org, or reported to a connection that
+             *     serves no Org yet.
              */
             skipped: string[];
-        };
-        RetryDefaultsRequest: {
-            /** @description A ForgeConnection to read the mirror through. */
-            connection?: string | null;
-            /** @description Uploaded copies: `<publisher>/<name>` → the file's content. */
-            files?: {
-                [key: string]: string;
-            };
-            /**
-             * @description A mirror of Scarab's repository, `<host>/<owner>/<repo>`; each
-             *     library is read from the same path and commit there.
-             */
-            mirror?: string | null;
         };
         RuleReadsDto: {
             /** @description The rule's index in `rules`; 0 for a typed setting. */
@@ -5108,7 +5588,7 @@ export interface components {
             seq: number;
             /** @description SHA-256 of the session (never the session id). */
             session_hash?: string | null;
-            /** @description The human/principal it is about. */
+            /** @description The handle of the human/principal it is about. */
             subject: string;
             target?: string | null;
         };
@@ -5523,13 +6003,10 @@ export interface components {
         UninstalledPluginDto: {
             name: string;
         };
-        /** @description A newer first-party version than the one installed. */
-        UpdateNoticeDto: {
-            content_hash: string;
-            release: string;
-            /** @description A version between the installed one and this one is a security fix. */
-            security_fix: boolean;
-            source: string;
+        /** @description A connection of the org that could not list its repositories, and why. */
+        UnlistedConnectionDto: {
+            connection_id: string;
+            reason: string;
         };
         /** @description `PUT …/policies/{id}`: the whole Policy, replaced. */
         UpdatePolicyRequest: {
@@ -5541,6 +6018,27 @@ export interface components {
             expected_version: number;
             policy: Record<string, never>;
             reason?: string | null;
+        };
+        /** @description `POST /v1/orgs/{org}/plugins/{name}/upgrade`. */
+        UpgradePluginRequest: {
+            connection?: string | null;
+            /**
+             * @description The installed manifest's hash the diff was made against; 409 when the
+             *     installation has changed since.
+             */
+            expected_current_sha256: string;
+            /** @description `<repository>@sha256:<64 hex>`. */
+            image: string;
+            /**
+             * @description The new manifest's hash the admin reviewed; 409 when the source no
+             *     longer reads as it.
+             */
+            manifest_sha256: string;
+            /**
+             * @description The new manifest's source, as `…/upgrade-fetch` returned it. Read
+             *     again here.
+             */
+            source: string;
         };
         /** @description One waiting gate of a run in the list view ([`RunSummaryDto::waiting_gates`]). */
         WaitingGateDto: {
@@ -7105,80 +7603,6 @@ export interface operations {
             };
         };
     };
-    get_environment_migration_report: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description org */
-                org: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["EnvironmentMigrationReportDto"][];
-                };
-            };
-            /** @description not an org admin */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description not configured */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    acknowledge_environment_migration_report: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description org */
-                org: string;
-                /** @description environment name */
-                env: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["EnvironmentMigrationReportDto"];
-                };
-            };
-            /** @description not an org admin */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description no report line for that name, or not configured */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
     list_org_environments: {
         parameters: {
             query?: never;
@@ -8246,55 +8670,37 @@ export interface operations {
             };
         };
     };
-    retry_library_defaults: {
+    get_library_installation: {
         parameters: {
             query?: never;
             header?: never;
             path: {
                 /** @description org */
                 org: string;
+                /** @description installation id */
+                id: string;
             };
             cookie?: never;
         };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["RetryDefaultsRequest"];
-            };
-        };
+        requestBody?: never;
         responses: {
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["LibraryDefaultsDto"];
+                    "application/json": components["schemas"]["LibraryInstallationDto"];
                 };
             };
-            /** @description a bad mirror, or an uploaded file for no first-party library */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description not an org admin, or no step-up — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            /** @description no read access to the org */
             403: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content: {
-                    "application/json": components["schemas"]["StepUpRefusal"];
-                };
-            };
-            /** @description libraries not configured */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
                 content?: never;
             };
-            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
-            429: {
+            /** @description no installation with this id in the org, or libraries not configured */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -8360,13 +8766,14 @@ export interface operations {
     };
     untrust_library_source: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description The trusted source, `<host>/<owner>/<repo>//<path>`. */
+                source?: string;
+            };
             header?: never;
             path: {
                 /** @description org */
                 org: string;
-                /** @description The trusted source, `<host>/<owner>/<repo>//<path>`. */
-                source: string | null;
             };
             cookie?: never;
         };
@@ -8534,6 +8941,44 @@ export interface operations {
             };
         };
     };
+    get_member: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description the Principal's id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemberDto"];
+                };
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such Principal */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     reset_member_passkeys: {
         parameters: {
             query?: never;
@@ -8541,8 +8986,8 @@ export interface operations {
             path: {
                 /** @description org */
                 org: string;
-                /** @description the member's principal id */
-                subject: string;
+                /** @description the member's Principal id (a handle is accepted too) */
+                id: string;
             };
             cookie?: never;
         };
@@ -8581,13 +9026,62 @@ export interface operations {
             };
         };
     };
-    plugin_catalog: {
+    fetch_plugin_manifest: {
         parameters: {
             query?: never;
             header?: never;
             path: {
                 /** @description org */
                 org: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FetchPluginManifestRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FetchedPluginManifestDto"];
+                };
+            };
+            /** @description a bad source, a fetch that failed, or a file that is not an admissible plugin manifest */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an org admin, a host Scarab does not fetch from, or a private repository outside the org */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description plugins not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_plugin_by_id: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description installation id (10 hex) */
+                id: string;
             };
             cookie?: never;
         };
@@ -8598,7 +9092,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["PluginCatalogEntryDto"][];
+                    "application/json": components["schemas"]["PluginInstallationDto"];
                 };
             };
             /** @description not an org admin */
@@ -8608,7 +9102,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description plugins not configured */
+            /** @description no installation with this id in the org, or plugins not configured */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -8677,14 +9171,14 @@ export interface operations {
                     "application/json": components["schemas"]["PluginInstallationDto"];
                 };
             };
-            /** @description invalid name, config or storage */
+            /** @description invalid name, image, source, manifest, config or storage */
             400: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content?: never;
             };
-            /** @description not an org admin, or not a first-party plugin pinned by digest — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            /** @description not an org admin, no step-up, a host Scarab does not fetch from, or a private repository outside the org — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -8700,7 +9194,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description the name is taken or retired, or plugins are off */
+            /** @description the name is taken or retired, plugins are off, or the manifest is not the one reviewed */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -9188,6 +9682,120 @@ export interface operations {
             };
         };
     };
+    upgrade_plugin: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description installation name */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpgradePluginRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PluginInstallationDto"];
+                };
+            };
+            /** @description a bad image or source, another plugin's manifest, a manifest that is not admissible, or an image the manifest does not name */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an org admin, a step-up is required (a new image, or a manifest that asks for more), a host Scarab does not fetch from, or a private repository outside the org — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
+            /** @description no such installation, or plugins not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description plugins are off, the installation changed since the review, or the source no longer reads as the reviewed manifest */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    fetch_plugin_upgrade: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description installation name */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FetchPluginUpgradeRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FetchedPluginUpgradeDto"];
+                };
+            };
+            /** @description no source or commit, a bad source or image, a fetch that failed, a file that is not an admissible plugin manifest, another plugin's manifest, or an image the manifest does not name */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an org admin, a host Scarab does not fetch from, or a private repository outside the org */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such installation, or plugins not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     list_org_policies: {
         parameters: {
             query?: never;
@@ -9271,6 +9879,46 @@ export interface operations {
             };
             /** @description a live Policy here has that name, or the scope holds its 256 Policies */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    check_org_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PolicyCheckRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PolicyCheckResponse"];
+                };
+            };
+            /** @description not exactly one of `policy` and `yaml`, or `yaml` over 64 KiB */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an org admin */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -9494,6 +10142,15 @@ export interface operations {
                 limit?: number;
                 /** @description The `next` of the previous page. */
                 before?: string;
+                /**
+                 * @description Only decisions at this checkpoint: `run.create`, `step.admit` or
+                 *     `gate.resolve`.
+                 */
+                checkpoint?: string;
+                /** @description Only decisions with a result for this Policy, matched or not. */
+                policy_id?: string;
+                /** @description Only decisions made at or after this time, in unix milliseconds. */
+                since?: number;
             };
             header?: never;
             path: {
@@ -9512,12 +10169,51 @@ export interface operations {
                     "application/json": components["schemas"]["PolicyDecisionPageDto"];
                 };
             };
-            /** @description `before` is not a cursor */
+            /** @description `before` is not a cursor, or `checkpoint` is not a checkpoint */
             400: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            /** @description no Read on the org */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description policies not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    org_policy_decision_counts: {
+        parameters: {
+            query: {
+                /** @description Count decisions made at or after this time, in unix milliseconds. */
+                since: number;
+            };
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PolicyDecisionCountsDto"];
+                };
             };
             /** @description no Read on the org */
             403: {
@@ -9559,7 +10255,7 @@ export interface operations {
                     "application/json": components["schemas"]["PolicyTestResponse"];
                 };
             };
-            /** @description not one input form, a draft that does not compile, a Pipeline that does not compile, a Run admission refuses before its Policies, an input that cannot be matched, or a supplied input with a string or a list over its cap */
+            /** @description not one input form, a draft that does not compile, a Pipeline that does not compile, a Run admission refuses before its Policies, a Policy at another checkpoint than the input, an input that cannot be matched, or a supplied input with a string or a list over its cap */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -9582,10 +10278,57 @@ export interface operations {
             };
         };
     };
+    policy_test_replay: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PolicyReplayRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PolicyReplayResponse"];
+                };
+            };
+            /** @description the draft does not compile */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such org Policy, or policies not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     search_principals: {
         parameters: {
             query: {
-                /** @description id or handle prefix, or a display-name fragment */
+                /** @description handle prefix, or a display-name fragment */
                 q: string;
             };
             header?: never;
@@ -9922,6 +10665,51 @@ export interface operations {
             };
         };
     };
+    org_repos: {
+        parameters: {
+            query?: {
+                /** @description 1-based page (default 1) */
+                page?: number;
+                /** @description repositories per page (default 25, max 100) */
+                per_page?: number;
+                /** @description only names containing this text, ignoring case */
+                q?: string;
+                /** @description only repositories of this connection id */
+                connection?: string;
+            };
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrgReposPageDto"];
+                };
+            };
+            /** @description no Read on the org */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no connection registry wired */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     list_orphaned_secrets: {
         parameters: {
             query?: never;
@@ -10196,6 +10984,32 @@ export interface operations {
             };
         };
     };
+    list_policy_checkpoints: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PolicyCheckpointDto"][];
+                };
+            };
+            /** @description not signed in */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     list_projects: {
         parameters: {
             query?: never;
@@ -10293,6 +11107,13 @@ export interface operations {
             };
             /** @description the caller may not dispatch, the pipeline's Environment does not exist in the org or does not admit this project (ADR-0071), or a run.create Policy denied the Run (ADR-0075); the body says why. No run is created */
             403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description the repository is unreachable: its forge connection no longer covers it */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -10400,31 +11221,6 @@ export interface operations {
         responses: {
             /** @description gone; the body says where it went */
             410: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    list_deployments: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description repo owner */
-                org: string;
-                /** @description repo name */
-                repo: string;
-                /** @description Environment name */
-                name: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description most recent first */
-            200: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -10706,6 +11502,8 @@ export interface operations {
             query?: {
                 /** @description max runs to return (default 50, max 200) */
                 limit?: number;
+                /** @description only this org's runs, applied before `limit`; must not be empty */
+                org?: string;
             };
             header?: never;
             path?: never;
@@ -10720,6 +11518,13 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["RunListResponse"];
                 };
+            };
+            /** @description `org` present but empty */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
         };
     };

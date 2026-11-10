@@ -2,11 +2,17 @@ import { describe, it, expect } from "vitest";
 import {
   appliesToEnvironments,
   appliesToProjects,
-  countsOf,
   decisionVerdict,
   isCelPolicy,
-  policyCounts,
-  typedSettingRows,
+  newSettingForm,
+  runDecisionViews,
+  runPolicySummary,
+  settingBody,
+  settingFormErrors,
+  settingFormOf,
+  splitEntries,
+  policyDecisionRows,
+  typedSettingHome,
   type DecisionRecordLike,
   type StoredPolicyLike,
 } from "./policies";
@@ -33,24 +39,6 @@ const stored = (id: string, policy: StoredPolicyLike["policy"], deleted = false)
   updated_at: 0,
   deleted,
   policy,
-});
-
-describe("policyCounts", () => {
-  it("counts matched, denied and would-deny per Policy, skipping not_matched", () => {
-    const counts = policyCounts([
-      decision([["a", "denied"], ["b", "not_matched"]], true),
-      decision([["a", "passed"], ["b", "would_deny"]]),
-      decision([["a", "error"], ["b", "passed"]], true),
-    ]);
-    expect(countsOf(counts, "a")).toEqual({ matched: 3, denied: 2, wouldDeny: 0 });
-    expect(countsOf(counts, "b")).toEqual({ matched: 2, denied: 0, wouldDeny: 1 });
-    expect(countsOf(counts, "c")).toEqual({ matched: 0, denied: 0, wouldDeny: 0 });
-  });
-
-  it("counts a failed rule of an audit-mode Policy as would have denied, not denied", () => {
-    const counts = policyCounts([decision([["a", "error", "audit"], ["a", "would_deny", "audit"]])]);
-    expect(countsOf(counts, "a")).toEqual({ matched: 2, denied: 0, wouldDeny: 2 });
-  });
 });
 
 describe("decisionVerdict", () => {
@@ -95,26 +83,177 @@ describe("CEL Policies and typed settings", () => {
     expect([cel, gone, libs].filter(isCelPolicy).map((p) => p.name)).toEqual(["cel"]);
   });
 
-  it("lists each library or plugin list with a link to its feature's section", () => {
-    expect(typedSettingRows("acme", [cel, libs, plugins, gone])).toEqual([
-      {
-        id: "4",
-        name: "gates",
-        label: "Plugins whose gates may run",
-        values: ["argocd"],
-        appliesTo: "all projects",
-        href: "/orgs/acme/settings/plugins",
-        sectionLabel: "Plugins",
-      },
-      {
-        id: "3",
-        name: "libs",
-        label: "Libraries allowed",
-        values: ["github.com/acme/*"],
-        appliesTo: "all projects",
-        href: "/orgs/acme/settings/libraries",
-        sectionLabel: "Libraries",
-      },
+  it("sends a library or plugin list to its feature's policies panel, and nothing else anywhere", () => {
+    expect(typedSettingHome("acme", libs.policy)).toEqual({
+      label: "Libraries",
+      href: "/orgs/acme/settings/libraries#library-policies",
+    });
+    expect(typedSettingHome("a b", plugins.policy)).toEqual({
+      label: "Plugins",
+      href: "/orgs/a%20b/settings/plugins#plugin-policies",
+    });
+    expect(typedSettingHome("acme", cel.policy)).toBeNull();
+    expect(
+      typedSettingHome("acme", { name: "x", checkpoint: "run.create", setting: { unknown_kind: { a: [] } } }),
+    ).toBeNull();
+  });
+});
+
+describe("policyDecisionRows", () => {
+  const record = (
+    id: string,
+    at: number,
+    results: { policy_id: string; mode?: string; outcome: Record<string, unknown> }[],
+    extra: Partial<DecisionRecordLike> = {},
+  ): DecisionRecordLike => ({
+    id,
+    org: "acme",
+    at,
+    ...extra,
+    decision: {
+      checkpoint: "run.create",
+      results: results as DecisionRecordLike["decision"]["results"],
+      outcome: { kind: "allow" },
+    },
+  });
+
+  it("shows this Policy's outcome, newest first, and counts the decisions it did not match", () => {
+    const { rows, notMatched } = policyDecisionRows(
+      [
+        record("a", 1, [
+          { policy_id: "p1", outcome: { kind: "passed" } },
+          { policy_id: "p2", outcome: { kind: "denied", messages: ["other"] } },
+        ]),
+        record("b", 3, [{ policy_id: "p1", mode: "audit", outcome: { kind: "would_deny", messages: ["no"] } }], {
+          project: "web",
+          run_id: "r1",
+        }),
+        record("c", 2, [{ policy_id: "p1", outcome: { kind: "not_matched" } }]),
+        // Not this Policy's decision at all: neither listed nor counted.
+        record("d", 4, [{ policy_id: "p2", outcome: { kind: "passed" } }]),
+      ],
+      "p1",
+    );
+    expect(rows.map((r) => [r.id, r.outcome, r.messages])).toEqual([
+      ["b", "would_deny", ["no"]],
+      ["a", "allowed", []],
     ]);
+    expect(rows[0]).toMatchObject({ project: "web", runId: "r1", checkpoint: "run.create" });
+    expect(notMatched).toBe(1);
+  });
+});
+
+describe("runDecisionViews", () => {
+  const record = (
+    id: string,
+    at: number,
+    results: { policy_id: string; name?: string; mode?: string; outcome: Record<string, unknown> }[],
+    extra: Partial<DecisionRecordLike> = {},
+  ): DecisionRecordLike => ({
+    id,
+    org: "acme",
+    at,
+    ...extra,
+    decision: {
+      checkpoint: extra.step_id ? "step.admit" : "run.create",
+      input: { project: { name: "web" } },
+      results: results as DecisionRecordLike["decision"]["results"],
+      outcome: results.some((r) => r.outcome.kind === "denied") ? { kind: "deny", messages: ["no"] } : { kind: "allow" },
+    },
+  });
+
+  it("leaves out decisions no Policy matched, and the results that did not match", () => {
+    const views = runDecisionViews([
+      record("b", 2, [
+        { policy_id: "p1", name: "one", outcome: { kind: "denied", messages: ["Release from main."] } },
+        { policy_id: "p2", name: "two", outcome: { kind: "not_matched" } },
+      ]),
+      record("a", 1, [{ policy_id: "p2", name: "two", outcome: { kind: "not_matched" } }]),
+    ]);
+    expect(views.map((v) => v.id)).toEqual(["b"]);
+    expect(views[0]!.results).toEqual([
+      { policyId: "p1", name: "one", level: "", outcome: "denied", messages: ["Release from main."] },
+    ]);
+    expect(views[0]!.verdict).toBe("denied");
+    expect(views[0]!.input).toEqual({ project: { name: "web" } });
+  });
+
+  it("names a failed rule by its mode, and sorts oldest first", () => {
+    const views = runDecisionViews([
+      record("late", 9, [{ policy_id: "a", mode: "audit", outcome: { kind: "error", message: "boom" } }], {
+        step_id: "deploy",
+        attempt: 2,
+      }),
+      record("early", 1, [{ policy_id: "e", mode: "enforce", outcome: { kind: "error", message: "boom" } }]),
+    ]);
+    expect(views.map((v) => [v.id, v.results[0]!.outcome])).toEqual([
+      ["early", "denied"],
+      ["late", "would_deny"],
+    ]);
+    expect(views[1]!.step).toBe("deploy");
+    expect(views[1]!.attempt).toBe(2);
+  });
+
+  it("is empty for a Run with no decisions", () => {
+    expect(runDecisionViews([])).toEqual([]);
+  });
+
+  it("summarises denied decisions and audit-mode would-denies", () => {
+    const views = runDecisionViews([
+      record("a", 1, [{ policy_id: "p", outcome: { kind: "would_deny", messages: ["x"] } }]),
+      record("b", 2, [{ policy_id: "q", outcome: { kind: "denied", messages: ["y"] } }]),
+    ]);
+    expect(runPolicySummary(views)).toBe("2 decisions · 1 denied · 1 would deny in audit mode");
+  });
+});
+
+describe("library and plugin list forms", () => {
+  it("splits entries on lines and commas, dropping blanks and repeats", () => {
+    expect(splitEntries(" github.com/acme/*\n\ngithub.com/x, github.com/acme/* ")).toEqual([
+      "github.com/acme/*",
+      "github.com/x",
+    ]);
+  });
+
+  it("starts a library list in audit mode and a plugin list enforced", () => {
+    expect(newSettingForm("libraries_allowed").mode).toBe("audit");
+    expect(newSettingForm("plugins_allowed").mode).toBe("enforce");
+    expect(newSettingForm("libraries_blocked").name).toBe("libraries-blocked");
+  });
+
+  it("builds an org body with its match and a project body without one", () => {
+    const form = {
+      ...newSettingForm("libraries_allowed"),
+      entries: "github.com/acme/*",
+      projects: "web-*",
+      exceptProjects: "web-legacy",
+    };
+    expect(settingBody(form, "org")).toEqual({
+      name: "libraries-allowed",
+      checkpoint: "run.create",
+      mode: "audit",
+      setting: { libraries_allowed: { sources: ["github.com/acme/*"] } },
+      match: { projects: ["web-*"], except_projects: ["web-legacy"], environments: [], trigger_kinds: [] },
+    });
+    expect(settingBody(form, "project").match).toBeUndefined();
+  });
+
+  it("reads a stored list back into the form", () => {
+    const body = settingBody({ ...newSettingForm("plugins_allowed"), entries: "argocd\nflux" }, "org");
+    expect(settingFormOf(body)).toMatchObject({ kind: "plugins_allowed", entries: "argocd\nflux", mode: "enforce" });
+  });
+
+  it("refuses what the server would: a bad name, no entries, a misplaced *", () => {
+    expect(settingFormErrors({ ...newSettingForm("libraries_allowed"), name: "has space" })).toEqual({
+      name: "1 to 100 letters, digits, -, _ or .",
+      entries: "Add at least one entry.",
+    });
+    expect(
+      settingFormErrors({ ...newSettingForm("libraries_allowed"), entries: "github.com/*/libs" }).entries,
+    ).toMatch(/prefix ending in \*/);
+    expect(settingFormErrors({ ...newSettingForm("plugins_allowed"), entries: "argo*" }).entries).toMatch(
+      /no \*/,
+    );
+    expect(settingFormErrors({ ...newSettingForm("libraries_allowed"), entries: "github.com/acme/*" })).toEqual({});
   });
 });

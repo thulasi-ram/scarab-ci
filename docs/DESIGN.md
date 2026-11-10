@@ -21,8 +21,8 @@ high-contrast worksheet you operate all day — and keeps the carapace for two
 jobs it does best: an opt-in **dark mode**, and the **terminal panels** (logs +
 DAG canvas) that stay pine-black in *both* themes so the machine surface always
 looks like the machine. The signature is no longer "everything is dark green";
-it's **restraint plus technical marks**: gold shows up only as an edge, mono
-carries every label, and decoration speaks one **dotted** language — the page
+it's **restraint plus technical marks**: gold shows up only as an edge, four
+text styles carry all the text (§3), and decoration speaks one **dotted** language — the page
 dot-grid, dot-matrix doodles, and the dots-only ASCII beetles.
 
 Influence: the crisp, blueprint-y, mono-annotated feel of engineering marketing
@@ -63,7 +63,7 @@ corners are sharp-ish (5px cards / 3px controls) rather than soft.
 - Light-first cool-white ladder; opt-in carapace dark; pine-black terminals in both.
 - Emerald = the single interactive accent. Gold = edges & rare tokens only, never a fill.
 - One **dotted** decoration language (dot-grid, dot-matrix doodles, dots-only ASCII beetles); corners sharp-ish (5px/3px), never boxy-round.
-- Four typefaces, one job each: **Major Mono Display** (display + wordmark), **Space Grotesk** (section headings, card names), **Inter** (body/UI), **JetBrains Mono** (all chrome/labels/machine).
+- Four text styles (§3): Title, Label and Body in **Inter**, Mono in **JetBrains Mono** for machine values. **Space Grotesk** is only the wordmark.
 - Zero shadows (modal overlay excepted).
 
 ## 2. Color Palette & Roles
@@ -143,69 +143,56 @@ lives only in the doodles.
 
 ## 3. Typography
 
-### Families
-- **Major Mono Display** (`--font-display`; OFL, fontsource) — the display
-  voice: the page heading/breadcrumb row (`h1`, `.crumb-head`, `.run-title`;
-  docs page titles) AND the `Scarab` wordmark. The biform (uppercase skeletons
-  at lowercase heights) is the brand's typographic signature. Single weight —
-  never synthesize bold — and **zero tracking**. Its light strokes read
-  quieter than solid text, so it takes the deepest ink (`--display-ink`).
-  Section headings, card/repo names and everything else stay Space Grotesk —
-  a display voice over-accents at small/dense sizes.
-- **Inter** (`--font-ui`) — body & UI: paragraphs, buttons, table body, nav.
-  Weights 400/500/600.
-- **JetBrains Mono** (`--font-mono`) — **all chrome and machine tokens**:
-  eyebrows, section labels, table/column headers, filter pills, badges,
-  breadcrumbs, provenance keys, ids, SHAs, durations, log lines. Weights 400/500.
+### Four text styles
 
-Four typefaces, each with one clear job (display / headings / body / machine).
-The **mono-for-chrome** rule is the technical voice: anything that labels or
-identifies is mono; prose is Inter; the h1/breadcrumb row and the wordmark are
-Major Mono Display; section headings stay Space Grotesk.
+A page uses at most four font variations, size and weight included. The web
+UI has exactly four text styles, so every page stays within that. Each is a
+`font` shorthand token in `ui/scarab-web-ui/src/styles.css`:
 
-### Scale
+| Style | Token | Face | Weight · size | For |
+|-------|-------|------|---------------|-----|
+| Title | `--t-title` | Inter (`--font-ui`) | 600 · 20px | page titles (`h1`, the run and settings breadcrumb headings), dialog titles, stat figures |
+| Label | `--t-label` | Inter | 600 · 13px | names, section and panel headings, column heads, field labels, buttons, active tabs and nav links |
+| Body | `--t-body` | Inter | 400 · 13px | running text, values, form controls, nav links |
+| Mono | `--t-mono` | JetBrains Mono (`--font-mono`) | 500 · 12px | machine values: ids, SHAs, refs, durations, counts, code, logs |
 
-| Role | Family | Size | Weight | Tracking |
-|------|--------|------|--------|----------|
-| Display / Hero (`h1`) | Major Mono Display | 32px | 400 | 0 |
-| Run breadcrumb (`.crumb-head`) / title | Major Mono Display | 28px / 20px | 400 | 0 |
-| Section heading (`h2`) | Space Grotesk | 20px | 600 | -0.4px |
-| Card / repo name | Space Grotesk | 15px | 600 | -0.3px |
-| Wordmark (`.brand`) | Major Mono Display | 19px | 400 | 0 |
-| Body / button | Inter | 13px (`--fs-md`) | 400–600 | -0.16px |
-| Eyebrow / label / column head | **Mono** | 11px (`--fs-xs`) | 500 | +0.8–1.2px, UPPERCASE |
-| Filter pill / chip | Mono | 12px (`--fs-sm`) | 400 | 0 |
-| Code / id / SHA / log | Mono | 12px (`--fs-sm`) | 400 | 0 |
+Every text rule sets `font:` to one of the four tokens, or `font: inherit`.
+No rule sets `font-size`, `font-weight` or `font-family` on its own, and
+nothing is upper-cased or tracked. Headings are in sentence case.
+`src/styles.test.ts` checks the stylesheet for this.
 
-### Type scale
+An element with the `.mono` class takes Mono, whatever component style it
+sits in: the class means "this is a machine value".
 
-Inside the app, a font size is one of five steps, kept as custom properties in
-`ui/scarab-web-ui/src/styles.css`. Mono text uses the same steps.
+### Hierarchy without more sizes
 
-| Token | Size | Use |
-|-------|------|-----|
-| `--fs-xs` | 11px | badges, chips, hashes |
-| `--fs-sm` | 12px | table cells, secondary text |
-| `--fs-md` | 13px | body, form controls |
-| `--fs-lg` | 15px | section headings |
-| `--fs-xl` | 20px | page titles |
+- A heading that used to be larger is Label; the space above it and the
+  Body text under it set it apart. A heading (a panel header, a section
+  heading, the settings sidebar's heading) is in the primary ink,
+  `--soft-white`, so it does not read as running text. Field labels and the
+  labels of label and value lists stay in `--muted-sage`; column heads are in
+  `--sage` or `--muted-sage` (see Tables).
+- Secondary text is Body in `--sage` or `--muted-sage`. Colour is not a font
+  variation, so it does not count against the four.
+- Mono is weight 500, not 400: at 12px, 400 reads thin next to Inter.
+- Status chips and badges keep their data values as written (`succeeded`,
+  `push`, `unreachable`): lowercase Mono or Label, not upper-cased.
 
-Every component uses only these tokens: no literal font size and no
-half-pixel size. The exceptions are the display heading row (`h1` 32px,
-`.crumb-head` 28px, `.login-title` 22px) and the wordmark (`.brand` 19px),
-which belong to the brand voice above, and the ASCII scenes, which size from
-their own `--ascii-fs`.
+### Exemptions
 
-### Principles
-- **Punchy display, comfortable body.** Headlines are Space Grotesk 700 with
-  tight negative tracking (film-title weight); body is Inter at 1.5 for readability.
-- **Uppercase mono = structure.** Every micro-label — section headers, table
-  columns, provenance keys, form labels — is mono, uppercase, positive tracking.
-  This is the single biggest carrier of the "engineering worksheet" feel.
-- **Mono for anything machine.** Ids, SHAs, durations, log lines, secret names.
-- **Space Grotesk only for titles.** Don't spread the display face into body,
-  labels, or buttons — its character reads as personality precisely because it's
-  reserved for the few things that name a page or object.
+These keep their own face or size, and the regression test lists the same
+selectors:
+
+- The wordmark (`.brand`) and the login lockup under the emblem
+  (`.login-title`) are set in Space Grotesk (`--font-display`). They are the
+  brand mark, not text.
+- The ASCII scenes (`.ascii-scene pre`, `.ascii-fe`) size their dots from
+  `--ascii-fs`. They are pictures drawn with characters.
+
+The debug shell (xterm) draws on a canvas, so it takes a number instead of a
+token; it uses Mono's 12px.
+
+The docs site (§10) has its own type and is not covered here.
 
 ## 4. Signature System — dots & texture
 
@@ -227,8 +214,7 @@ content (`z-index:0`) alongside the doodles.
 Still the one place Scarab lets its hair down. Take clean **Lucide** line
 icons and rasterize them onto a coarse **dot matrix**: one dot per lit grid
 cell, so a stroke is *several dots wide* — a true dot-matrix rendering, the
-same language as the ASCII beetle scenes (dots-only ramp), the page dot-grid,
-and the biform display voice. (The rough.js hand-sketched era and the earlier
+same language as the ASCII beetle scenes (dots-only ramp) and the page dot-grid. (The rough.js hand-sketched era and the earlier
 single-dotted-outline pass are both retired.)
 
 ### Rendering recipe
@@ -301,8 +287,10 @@ Placement is stricter than doodles, because motion competes with content:
 ### Cards & panels
 - `.card`/`.panel`/`.prov`/`.repo-card`: `--emerald-surface` fill, `--border`
   hairline, radius `--radius`–`--radius-lg` (5–7px), zero shadow. Panel headers
-  (`.panel-h`) are a `--pine-deep` band with a mono uppercase label. Panels
-  carry no decoration.
+  (`.panel-h`) are a `--pine-deep` band with a Label heading in `--soft-white`.
+  Panels carry no decoration.
+- The settings sidebar marks the page you are on with a `--pine-deep`
+  background and `--emerald` Label text, and no edge.
 
 ### Terminals (logs + DAG)
 - `.logs` and `.dag` fill `--terminal` (pine-black) in both themes, with
@@ -311,9 +299,16 @@ Placement is stricter than doodles, because motion competes with content:
   gold edge. Edges are `--terminal-line` strokes.
 
 ### Tables & run list
-- Header row: **mono** 10–11px uppercase `--muted-sage` on `--pine-deep`. Body
-  rows 14px `--sage`, `--border-soft` separators, hover → faint emerald wash
-  (`color-mix`). SHAs render in gold mono; ids/timestamps in muted mono.
+- Header row: Label in `--muted-sage` on `--pine-deep`. Body rows in Body,
+  `--sage`, `--border-soft` separators, hover → faint emerald wash
+  (`color-mix`). SHAs render in gold Mono; ids/timestamps in muted Mono.
+- A table inside a panel has no fill, frame or shaded header of its own: the
+  panel header is the one `--pine-deep` band. Its column heads are Label in
+  `--sage` over one `--border-soft` hairline, its scroll box reaches the
+  panel's edges, and its first and last columns sit at the panel header's
+  14px inset, as the panel body does. A group row inside it (Access's
+  "Through their org role") is a Label row with a `--border-soft` hairline
+  above it.
 
 ### Status badges
 - Pill, radius 6px, **mono** lowercase. `succeeded` → `--ok`; `failed` →
@@ -325,13 +320,19 @@ Placement is stricter than doodles, because motion competes with content:
 - Every form field is a `Field` holding an `Input`, `Select`, `Textarea` or
   `Checkbox` (`components/Field.tsx`): a 30px box with an `--emerald-surface`
   fill and a `--border` hairline; focus → `--emerald` border + a soft emerald
-  ring. The label sits above in mono uppercase, the help line below; an error
+  ring. The label sits above in Label, the help line below; an error
   replaces the help line and marks the box. Values are in the UI face; mono only
   for machine values (ids, refs, keys, paths, URLs). Secret values are
   `type=password` and **write-only** (never rendered back).
+- Every dropdown is `SearchSelect` (`components/SearchSelect.tsx`); there is
+  no native `<select>`. `Select` puts it in the form box. A list of more than
+  eight options gets a search box; a shorter one is a plain list you move
+  through with the arrow keys and type-ahead. Options can sit under group
+  headings, behind a rule (an entry such as "New organization…"), or show
+  disabled. The list is portalled to `<body>`, so it is never clipped and
+  stacks above a dialog.
 - A few controls stay plain on purpose: the command palette, the repo filter,
-  the search inside `SearchSelect`, the settings section and org pickers, and the
-  reject-reason box on a gate.
+  the search inside `SearchSelect`, and the reject-reason box on a gate.
 
 ### Tabs & filter pills
 - Tabs: text buttons, active → `--emerald` text + emerald underline. Filter
@@ -380,9 +381,9 @@ dot grid), so it reads as a space waiting to be filled rather than as a card.
 - Use `--emerald` as the one interactive/active/success color.
 - Reserve `--copper`/gold for **edges and rare tokens only** — hairlines,
   doodle ink, SHAs, trigger glyphs.
-- Put mono on every label, header, id, and machine token — it *is* the voice.
+- Use one of the four text styles (§3) for every piece of text; Mono for every id and machine token.
 - Keep the dot-grid faint; dots are the signature, not a texture bath.
-- Set the h1/breadcrumb row and the wordmark in Major Mono Display; body in Inter.
+- Set the h1/breadcrumb row in Title; body in Body.
 - Sprinkle **1–2** dot-matrix doodles per page — background, faint, page-relevant.
 
 ### Don't
@@ -390,10 +391,10 @@ dot grid), so it reads as a space waiting to be filled rather than as a card.
 - Don't add box-shadows to flat chrome (modal overlay is the only exception).
 - Don't paint cards or active states in saturated emerald blocks — emerald is a
   thin working accent, not a slab.
-- Don't set labels/headers/ids in Inter — those are mono.
+- Don't add a fifth text style: no new size, weight or face, no upper-casing, no tracking.
 - Don't warm the light background toward beige/paper — it's a cool near-white.
 - Don't exceed two doodles per page.
-- Don't spread the pixel display face beyond titles (the wordmark stays Space Grotesk), or use gradients in the interface.
+- Don't use Space Grotesk outside the wordmark and the login lockup, or use gradients in the interface.
 
 ## 9. Agent Prompt Guide
 
@@ -418,20 +419,21 @@ dot grid), so it reads as a space waiting to be filled rather than as a card.
 - **Doodles**: same Lucide icons, dot-matrixed at the §5 settings, 1–2/page, faint.
 
 ### Fonts
-- **Space Grotesk** for titles only; **Inter** for body/UI; **JetBrains Mono**
-  for all chrome/labels/machine. All three self-hosted via `@fontsource`.
+- **Inter** 400/600 for Title, Label and Body; **JetBrains Mono** 500 for Mono
+  (400 only for the ASCII scenes and the debug shell's canvas);
+  **Space Grotesk** for the wordmark only. All three self-hosted via `@fontsource`.
 
 ### Example component prompts
-- "Runs table: mono 10.5px uppercase `--muted-sage` column heads on `--pine-deep`;
-  body rows 14px Inter `--sage` on `--emerald-surface`, `--border-soft` separators,
-  SHA in gold mono, hover → faint emerald wash. One faint `git-branch` doodle
+- "Runs table: Label `--muted-sage` column heads on `--pine-deep`;
+  Body rows `--sage` on `--emerald-surface`, `--border-soft` separators,
+  SHA in gold Mono, hover → faint emerald wash. One faint `git-branch` doodle
   in the background."
-- "Status badge: pill radius 6px, mono lowercase. succeeded → `--ok`; failed →
+- "Status badge: pill radius 6px, Mono lowercase. succeeded → `--ok`; failed →
   `--danger`; running → `--running` with a `--copper` hairline. Text `--badge-ink`."
-- "Run detail: run title in the display face; provenance block = card with
-  mono uppercase keys + gold SHA; DAG and logs are `--terminal` pine-black consoles
+- "Run detail: run title in Title; provenance block = card with
+  Label keys + gold Mono SHA; DAG and logs are `--terminal` pine-black consoles
   in both themes; primary actions dark-pine."
-- "Primary button: `--pine` fill, `--on-pine` text, 14px/600, radius 3px, zero
+- "Primary button: `--pine` fill, `--on-pine` text, Label, radius 3px, zero
   shadow; hover → `--emerald-bright`. Featured variant: transparent +
   `--copper` hairline, gold text."
 
@@ -439,7 +441,7 @@ dot grid), so it reads as a space waiting to be filled rather than as a card.
 1. Light default (cool, not warm); dark is a clean toggle; both styled. Logs/DAG stay pine-black.
 2. Emerald is the only working accent; gold is edges + rare tokens, never a fill.
 3. Zero shadows on flat chrome; depth = shade.
-4. Mono on every label/header/id; Major Mono Display for the h1/breadcrumb row + wordmark; Inter for body.
+4. Four text styles only (Title, Label, Body, Mono); Mono for ids and machine values; sentence case, no upper-casing.
 5. One dotted decoration language — faint dot-grid + dot-matrix doodles (1–2/page) + dots-only ASCII beetles.
 
 ## 10. Documentation surface (a distinct skin)

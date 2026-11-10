@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 mod connection;
 mod storage;
 mod store;
+mod upgrade;
 
 pub use connection::{
     match_read_request, rule_label, BrokerJournalEntry, BrokerJournalFilter, BrokerJournalPhase,
@@ -45,11 +46,14 @@ pub use storage::{
 };
 
 pub use store::{
-    PluginStore, PluginStoreError, PluginUninstall, PAGE_DEFAULT_LIMIT, PAGE_MAX_LIMIT,
+    PluginInstallationVersion, PluginStore, PluginStoreError, PluginUninstall, PluginUpgrade,
+    PluginUpgraded, PAGE_DEFAULT_LIMIT, PAGE_MAX_LIMIT,
 };
 
-/// The longest installation or plugin name: a DNS-1123 label. Plugin names
-/// are a catalog key; both name Kubernetes objects in slice (d2).
+pub use upgrade::{ManifestDiff, SetDiff};
+
+/// The longest installation or plugin name: a DNS-1123 label. Both name
+/// Kubernetes objects in slice (d2).
 pub use scarab_project::MAX_INSTALLATION_NAME_CHARS;
 
 /// How many hex characters a server-minted installation id has.
@@ -236,8 +240,16 @@ pub const KNOWN_AUTH_SCHEMES: [&str; 1] = ["bearer"];
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PluginManifest {
-    /// The Plugin's name: a DNS-1123 label, the catalog key.
+    /// The Plugin's name: a DNS-1123 label.
     pub plugin: String,
+    /// The image repository the Plugin ships as (`ghcr.io/acme/plugin`: no
+    /// tag, no digest). When set, an install or upgrade names an image of
+    /// this repository and no other, so a manifest cannot be paired with
+    /// another publisher's code. Absent from a manifest that does not name
+    /// one, so the SHA-256 of a manifest approved before this field existed
+    /// does not change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
     pub capabilities: Vec<PluginCapability>,
     #[serde(default)]
     pub connections: Vec<ConnectionSlot>,
@@ -270,6 +282,14 @@ impl PluginManifest {
                  lowercase letters, digits or `-`)",
                 self.plugin
             ));
+        }
+        if let Some(image) = &self.image {
+            if !is_image_repository(image) {
+                return invalid(format!(
+                    "image `{image}` must be a repository without a tag or digest \
+                     (`ghcr.io/acme/plugin`): lowercase path parts of `a-z`, `0-9`, `.`, `_`, `-`"
+                ));
+            }
         }
         if self.capabilities.is_empty() {
             return invalid("a plugin must ask for at least one capability".into());
@@ -355,6 +375,19 @@ impl PluginManifest {
             }
         }
         Ok(())
+    }
+
+    /// Is `image` (`<repository>@sha256:<digest>`, or `<repository>:<tag>`)
+    /// one this manifest may run? Any image when the manifest names no
+    /// repository; otherwise one of exactly that repository.
+    pub fn check_image(&self, image: &str) -> Result<(), PluginError> {
+        match &self.image {
+            Some(named) if image_repository(image) != named => Err(PluginError::ImageNotNamed {
+                image: image.to_string(),
+                named: named.clone(),
+            }),
+            _ => Ok(()),
+        }
     }
 
     /// The installation `config` checked against the declared keys: an
@@ -536,6 +569,40 @@ fn is_query_key(key: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
 }
 
+/// Is `r` an image repository: `[host[:port]/]path`, lowercase path
+/// components of `[a-z0-9._-]`, no tag and no digest?
+pub fn is_image_repository(r: &str) -> bool {
+    if r.is_empty() || r.len() > 255 {
+        return false;
+    }
+    let parts: Vec<&str> = r.split('/').collect();
+    parts.iter().enumerate().all(|(i, part)| {
+        let host = i == 0 && parts.len() > 1;
+        !part.is_empty()
+            && !part.starts_with(['.', '-', '_'])
+            && part.bytes().all(|b| {
+                b.is_ascii_lowercase()
+                    || b.is_ascii_digit()
+                    || matches!(b, b'.' | b'_' | b'-')
+                    || (host && b == b':')
+            })
+    })
+}
+
+/// The repository of an image reference: what is before `@sha256:`, or
+/// before the tag (the last `:` of the last path part, so a registry port is
+/// not read as a tag). A reference with neither is returned whole.
+pub fn image_repository(image: &str) -> &str {
+    if let Some((repository, _)) = image.split_once('@') {
+        return repository;
+    }
+    let last = image.rsplit('/').next().unwrap_or(image);
+    match last.rsplit_once(':') {
+        Some((_, tag)) => &image[..image.len() - tag.len() - 1],
+        None => image,
+    }
+}
+
 /// Can this release run a Plugin with `manifest`? Only the MMP's
 /// capabilities ([`MMP_ADMITTED_CAPABILITIES`]); anything else is refused by
 /// name so the admin learns what is missing, never accepted and ignored.
@@ -638,13 +705,19 @@ pub struct PluginInstallation {
     pub id: String,
     pub org: String,
     pub name: String,
-    /// The catalog's plugin name (the manifest's `plugin`).
+    /// The plugin's name (the manifest's `plugin`).
     pub plugin: String,
     /// `<repository>@sha256:<digest>` (a tag only under the dev knob).
     pub image: String,
     pub manifest: PluginManifest,
     /// SHA-256 (hex) of the manifest as approved.
     pub manifest_sha256: String,
+    /// Where the manifest was read, `<host>/<owner>/<repo>//<path>@<commit>`;
+    /// `None` for an installation made before the source was recorded.
+    pub source: Option<String>,
+    /// The ForgeConnection the source was read through; `None` = read
+    /// anonymously (or not recorded).
+    pub source_connection: Option<String>,
     pub config: BTreeMap<String, String>,
     pub state: InstallationState,
     /// Bumped by every change of `state`. The plugin runtime's status write
@@ -831,6 +904,12 @@ pub enum PluginError {
     Invalid(String),
     /// The manifest asks for a capability this release cannot run (ADR-0072
     /// implementation horizon). Lists them, comma-separated.
+    /// The manifest names its image repository and the image is of another.
+    #[error(
+        "image `{image}` is not of the repository the manifest names, `{named}`; a plugin \
+         runs only from the image its manifest names"
+    )]
+    ImageNotNamed { image: String, named: String },
     #[error(
         "this Scarab release cannot run plugins that ask for: {0} (only read-only \
          use_connection and resolve_gates are available, ADR-0072, ADR-0076 §8; \
@@ -854,6 +933,7 @@ mod tests {
     fn argo_like() -> PluginManifest {
         PluginManifest {
             plugin: "argocd".into(),
+            image: None,
             capabilities: vec![PluginCapability::UseConnection],
             connections: vec![ConnectionSlot {
                 name: "argocd".into(),
@@ -869,7 +949,7 @@ mod tests {
     }
 
     #[test]
-    fn the_first_party_shape_validates_and_is_admitted() {
+    fn the_argocd_shape_validates_and_is_admitted() {
         assert_eq!(argo_like().validate(), Ok(()));
         assert_eq!(admit_for_mmp(&argo_like()), Ok(()));
     }
@@ -1133,6 +1213,57 @@ mod tests {
         // empty must not change it.
         let json = serde_json::to_value(argo_like()).unwrap();
         assert!(json.get("gates").is_none(), "{json}");
+    }
+
+    #[test]
+    fn a_manifest_that_names_its_image_runs_only_that_repository() {
+        let mut m = argo_like();
+        // Absent: any repository, and the manifest serializes as before.
+        assert_eq!(m.check_image("ghcr.io/x/p@sha256:00"), Ok(()));
+        assert!(serde_json::to_value(&m).unwrap().get("image").is_none());
+
+        m.image = Some("ghcr.io/thulasi-ram/scarab-plugin-argocd".into());
+        assert_eq!(m.validate(), Ok(()));
+        let digest = "a".repeat(64);
+        for ok in [
+            format!("ghcr.io/thulasi-ram/scarab-plugin-argocd@sha256:{digest}"),
+            "ghcr.io/thulasi-ram/scarab-plugin-argocd:dev".to_string(),
+        ] {
+            assert_eq!(m.check_image(&ok), Ok(()), "{ok}");
+        }
+        for other in [
+            format!("ghcr.io/someone-else/scarab-plugin-argocd@sha256:{digest}"),
+            format!("ghcr.io/thulasi-ram/scarab-plugin-argocd-fork@sha256:{digest}"),
+            format!("ghcr.io/thulasi-ram@sha256:{digest}"),
+        ] {
+            assert!(
+                matches!(
+                    m.check_image(&other),
+                    Err(PluginError::ImageNotNamed { .. })
+                ),
+                "{other}"
+            );
+        }
+        // The field is a repository: no tag, no digest, no upper case.
+        for bad in ["ghcr.io/x/p:v1", "ghcr.io/x/p@sha256:00", "ghcr.io/X/p", ""] {
+            m.image = Some(bad.into());
+            assert!(
+                matches!(m.validate(), Err(PluginError::InvalidManifest(_))),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_image_s_repository_is_before_its_digest_or_tag() {
+        assert_eq!(image_repository("ghcr.io/x/p@sha256:ab"), "ghcr.io/x/p");
+        assert_eq!(image_repository("ghcr.io/x/p:v1"), "ghcr.io/x/p");
+        assert_eq!(
+            image_repository("registry:5000/x/p:v1"),
+            "registry:5000/x/p"
+        );
+        assert_eq!(image_repository("registry:5000/x/p"), "registry:5000/x/p");
+        assert_eq!(image_repository("p"), "p");
     }
 
     #[test]

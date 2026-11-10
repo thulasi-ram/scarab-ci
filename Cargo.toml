@@ -17,9 +17,9 @@
 [workspace]
 resolver = "2"
 # `crates/scarab-plugin-argocd` (ADR-0072) is a member like any other, but it
-# names NO `scarab-*` crate outside `[dev-dependencies]`: it is the first-party
-# reporter and proves the third-party plugin contract is reachable over HTTP
-# alone.
+# names NO `scarab-*` crate outside `[dev-dependencies]`: it is Scarab's own
+# plugin and proves the plugin contract any publisher uses is reachable over
+# HTTP alone.
 members = ["crates/*"]
 
 [workspace.package]

@@ -754,22 +754,12 @@ pub static ENV_LEGACY_DELETE: Op = op(
     &[],
     &[],
 );
-pub static MIGRATION_ACK: Op = op(
-    "environment.migration_report_ack",
-    "Acknowledge an environment migration report",
-    Class::NotGoverned("an acknowledgement record; no governance change"),
-    "-",
-    ADMIN,
-    OrgOf::Path("org"),
-    &[],
-    &["path:org", "path:env"],
-);
 pub static CONNECTION_RESYNC: Op = op(
     "connection.resync",
     "Resync a forge connection",
-    // Binds every reported-but-unbound repo through the same store call as
-    // `connection.bind_repo`, so it is governed the same way (else it is a
-    // bulk bypass of that crown jewel).
+    // Moves this org's Projects off connections that do not serve it through
+    // the same store call as `connection.bind_repo`, so it is governed the
+    // same way (else it is a bulk bypass of that crown jewel).
     Class::CrownJewel(W),
     "§3 ForgeConnection edits (AMBIG)",
     ADMIN,
@@ -1175,6 +1165,26 @@ pub static TOKEN_MINT_OWN: Op = op(
     &["body:/org", "body:/project", "body:/name"],
 )
 .not_by_token();
+pub static PLUGIN_FETCH: Op = op(
+    "plugin.fetch",
+    "Fetch a plugin manifest to review",
+    Class::NotGoverned("reads a manifest for review; installs nothing"),
+    "ADR-0072 §1-2",
+    ADMIN,
+    OrgOf::Path("org"),
+    &[],
+    &["path:org", "body:/source"],
+);
+pub static PLUGIN_UPGRADE_FETCH: Op = op(
+    "plugin.upgrade_fetch",
+    "Fetch a plugin manifest to review an upgrade",
+    Class::NotGoverned("reads a manifest and compares it with the installed one; changes nothing"),
+    "ADR-0072 §10",
+    ADMIN,
+    OrgOf::Path("org"),
+    &[],
+    &["path:org", "path:name"],
+);
 pub static PLUGIN_INSTALL: Op = op(
     "plugin.install",
     "Install a plugin",
@@ -1309,6 +1319,23 @@ pub static PRIVILEGE_GRANT_PUT: Op = op(
     OrgOf::Path("org"),
     &[],
     &["path:org", "path:env", "path:project"],
+);
+pub static PLUGIN_UPGRADE: Op = op(
+    "plugin.upgrade",
+    "Upgrade a plugin",
+    Class::Conditional {
+        mode: A,
+        rule: "the image is not the installed one (a new digest is new code), or the new \
+               manifest asks for a capability, connection slot, auth scheme, read rule or gate \
+               the installed one did not, or stops naming its image or names another; a \
+               same-or-narrower manifest on the installed image is exempt",
+    },
+    "§3 plugin upgrade (ADR-0072 §8, §10: a new digest is new code; only a narrowing on the \
+     same digest is exempt)",
+    ADMIN,
+    OrgOf::Path("org"),
+    &[],
+    &["path:org", "path:name", "body:/image"],
 );
 pub static PLUGIN_STORAGE_PUT: Op = op(
     "plugin.storage.put",
@@ -1482,6 +1509,26 @@ pub static POLICY_TEST: Op = op(
     &[],
     &["path:org"],
 );
+pub static POLICY_CHECK: Op = op(
+    "policy.check",
+    "Check a draft org Policy",
+    Class::NotGoverned("compiles a draft; saves nothing"),
+    "ADR-0075 §6",
+    ADMIN,
+    OrgOf::Path("org"),
+    &[],
+    &["path:org"],
+);
+pub static POLICY_REPLAY: Op = op(
+    "policy.replay",
+    "Replay a draft Policy over recorded decisions",
+    Class::NotGoverned("evaluates without enforcing or recording"),
+    "ADR-0075 §9",
+    ADMIN,
+    OrgOf::Path("org"),
+    &[],
+    &["path:org"],
+);
 
 pub static LIBRARY_FETCH: Op = op(
     "library.fetch",
@@ -1540,16 +1587,6 @@ pub static LIBRARY_UNYANK: Op = op(
     &["path:org", "path:hash"],
 )
 .describe_with(describe_library_unyank);
-pub static LIBRARY_DEFAULTS_RETRY: Op = op(
-    "library.defaults_retry",
-    "Install the first-party libraries",
-    Class::CrownJewel(W),
-    "ADR-0076 §5: installing loosens",
-    ADMIN,
-    OrgOf::Path("org"),
-    &[],
-    &["path:org", "body:/mirror"],
-);
 pub static LIBRARY_TRUST: Op = op(
     "library.trust",
     "Trust a library source with forge credentials",

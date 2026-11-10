@@ -107,8 +107,12 @@ policy_struct! {
         pub fork: bool,
         /// The forge account that caused the event.
         pub actor: Option<String>,
-        /// The Principal linked to `actor` (ADR-0069), when there is one.
+        /// The handle of the Principal linked to `actor` (ADR-0069), when
+        /// there is one.
         pub principal: Option<String>,
+        /// That Principal's id (ADR-0080). Absent from inputs recorded before
+        /// it existed.
+        pub principal_id: Option<String>,
         /// The reason given for a manual or API dispatch.
         pub reason: Option<FreeText>,
     }
@@ -185,8 +189,11 @@ policy_struct! {
         pub pipeline: Pipeline,
         pub steps: Capped<Step, MAX_STEPS>,
         pub gates: Capped<Gate, MAX_GATES>,
-        /// The human or token creating the Run; absent for a webhook.
+        /// The handle of the human or token creating the Run; absent for a
+        /// webhook.
         pub principal: Option<String>,
+        /// Its id (ADR-0080). Absent from inputs recorded before it existed.
+        pub principal_id: Option<String>,
         pub time: Timestamp,
     }
 }
@@ -213,8 +220,11 @@ pub struct RunCreateFacts {
     pub pipeline_path: String,
     /// The Environment the Run is governed by, when its Pipeline names one.
     pub environment: Option<String>,
-    /// The human or token creating the Run; `None` for a webhook.
+    /// The handle of the human or token creating the Run; `None` for a
+    /// webhook.
     pub principal: Option<String>,
+    /// Its id (ADR-0080).
+    pub principal_id: Option<String>,
     pub time: Timestamp,
     /// The Run's resolved launch parameters (empty for a webhook). Not part
     /// of the input: each Step's `image` is previewed with them, the image
@@ -548,6 +558,7 @@ pub fn input_from_pipeline(
         steps: capped(steps, &run, "Steps")?,
         gates: capped(gates, &run, "gates")?,
         principal: facts.principal,
+        principal_id: facts.principal_id,
         time: facts.time,
     })
 }

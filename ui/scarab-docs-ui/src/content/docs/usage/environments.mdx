@@ -46,19 +46,23 @@ pipeline is refused this way, Scarab posts a `failure` commit status under the p
 Environment settings. A push from a branch the Environment's `allowed_refs` leave out posts no
 status.
 
-Org admins create Environments and edit their eligibility and rules, under the org's
-**Settings › Environments** (`/orgs/<org>/settings/environments`).
+Org admins create Environments and change their eligibility and rules, under the org's
+**Settings › Environments** (`/orgs/<org>/settings/environments`). **New environment**, at the
+right of the list's header, asks for the name, a display name and a description; the new
+Environment has no baseline rule and admits no project until you set both on its page.
 
-## View and edit an Environment
+## Manage an Environment
 
-Each Environment has a read-only page, `/orgs/<org>/settings/environments/<name>`: its display
-name, description, the baseline, **Projects that may use** it, and, under **Project overlays and
-grants**, each project's overlay and privilege grant. Its **Edit** button opens `…/<name>/edit`, where you change the display name,
-the description, the baseline and eligibility (one **Save** sends only the parts you changed),
-each project's privilege grant, and delete the Environment. Deleting it, or withdrawing a grant,
-asks you to type the Environment's name. While projects hold overlays, privilege grants or secrets
-in the Environment, a delete is refused and the dialog lists them; its button then deletes them
-with the Environment (`DELETE …?cascade=true`).
+Each Environment has one page, `/orgs/<org>/settings/environments/<name>/manage`, reached with
+**Manage** on its row. It holds the display name, the description, the baseline, the approval gate
+settings and **Projects that may use** it as one form: **Save** sends only the parts you changed,
+and **Discard changes** puts back what is stored. Below the form, **Project overlays and grants**
+lists each project's overlay and privilege grant, with grant and withdraw, and the page ends with
+**Duplicate** and **Delete**. Deleting the Environment, or withdrawing a grant, asks you to type
+its name. While projects hold overlays, privilege grants or secrets in the Environment, a delete is
+refused and the dialog lists them; its button then deletes them with the Environment
+(`DELETE …?cascade=true`). The page's former addresses, `…/environments/<name>` and
+`…/<name>/edit`, open it.
 
 ## Name and display name
 
@@ -81,8 +85,8 @@ because it copies secrets and the projects that may use it. The new Environment 
 - every project's overlay and privilege grant;
 - the Environment's secrets set per project, with their values.
 
-The old Environment is not changed; it stays until an admin deletes it. Run and approval history
-and the Cache stay with it. When the copy is made, the page lists what it did not copy:
+The old Environment is not changed; it stays until an admin deletes it. Run history, approvals
+included, and the Cache stay with it. When the copy is made, the page lists what it did not copy:
 
 - the projects whose Runs used the old Environment: their pipelines' `environment:` must change;
 - the policies whose `match.environments` selects the old name and not the new one;
@@ -98,7 +102,10 @@ Duplicate runs.
 
 An Environment's baseline protection rules are:
 
-- **`approvers`**: principals whose approval is required. Approvals are recorded on a gate, not in
+- **`approvers`**: the people whose approval is required, each typed as their handle
+  (`github:alice`). A handle typed in another case names the same person when only one person
+  matches. Scarab stores each person's id, so the list keeps naming the same people whatever
+  they are called later, and shows them by handle. Approvals are recorded on a gate, not in
   a separate table: the Run's **Environment approval gate** collects distinct approver identities
   on the Run's durable event log (`GateApproved { step, by }`), and the Steps after it wait until
   the approvals are in. This survives restarts, and approvals cannot be forged. See
@@ -122,7 +129,7 @@ Project's own overlay does. While such an Environment admits at least one Projec
 Environment list counts it in a warning, its row says **permissive baseline**, and its page asks
 for a baseline. An Environment that admits no Project is not counted: it takes no deploy.
 
-On the edit page these settings are in the **Approval gate** section: **When a pipeline has no
+On the Environment's page these settings are in the **Approval gate** section: **When a pipeline has no
 approval gate** (**Add an approval gate** or **Refuse the run**), **Added gate expiry** (blank: no
 expiry), **Required approvals** (1 to the number of approvers; blank: every one) and **Maximum
 approval age**, all in seconds. The **Wait timer** field is disabled while the Environment has no
@@ -211,20 +218,12 @@ every launch its `match` selects, including Steps of Runs that no Environment go
 Runs `run.ref`, `run.environment` and `environment` are absent: test `has(run.environment)` or
 `environment != null` before reading them.
 
-## Every rule in one place
+## Policies over deploys
 
-**Settings › Policies** (`/orgs/<org>/settings/policies`) lists the org's rules read-only:
-
-- each CEL Policy, with its checkpoint, its mode, **Applies to projects** (its
-  `match.projects`, with any `except_projects`), the Environments it matches, and how often it
-  matched, denied and, in `audit` mode, would have denied in the newest 200 decisions of the
-  decision log (`GET /v1/orgs/{org}/policy-decisions`);
-- the newest decisions, with the deny messages;
-- the typed settings, each with a link to where it is edited: every Environment's rules, the
-  library and plugin lists, and API token scopes.
-
-CEL Policies are written with the policy API (`POST /v1/orgs/{org}/policies`); the page does not
-edit them.
+An Environment's own rules are set on its page. CEL Policies, which can also match on
+`environments`, are under **Settings › Policies** (`/orgs/<org>/settings/policies`): each row
+shows the Environments a Policy matches, and each Policy's page lists the decisions it made. See
+[Policies](/scarab-ci/usage/policies/).
 
 ## Scoped secrets
 

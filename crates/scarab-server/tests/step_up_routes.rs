@@ -77,7 +77,7 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
     ("GET", "/v1/orgs/{org}/security/summary", "read", "READ"),
     (
         "POST",
-        "/v1/orgs/{org}/members/{subject}/passkeys/reset",
+        "/v1/orgs/{org}/members/{id}/passkeys/reset",
         "passkey.reset",
         "CJ-A",
     ),
@@ -103,6 +103,7 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
         "CJ-W",
     ),
     ("GET", "/v1/orgs/{org}/principals", "read", "READ"),
+    ("GET", "/v1/orgs/{org}/members/{id}", "read", "READ"),
     ("GET", "/v1/orgs/{org}/tokens", "read", "READ"),
     ("POST", "/v1/orgs/{org}/tokens", "token.mint", "CJ-A"),
     ("DELETE", "/v1/orgs/{org}/tokens/{id}", "token.revoke", "EX"),
@@ -240,12 +241,6 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
         "environment.legacy_delete",
         "NG",
     ),
-    (
-        "GET",
-        "/v1/repos/{org}/{repo}/environments/{name}/deployments",
-        "read",
-        "READ",
-    ),
     ("GET", "/v1/orgs/{org}/environments", "read", "READ"),
     ("GET", "/v1/orgs/{org}/secrets/orphaned", "read", "READ"),
     (
@@ -333,18 +328,6 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
         "environment.privilege_grant.delete",
         "EX",
     ),
-    (
-        "GET",
-        "/v1/orgs/{org}/environment-migration-report",
-        "read",
-        "READ",
-    ),
-    (
-        "POST",
-        "/v1/orgs/{org}/environment-migration-report/{env}/acknowledge",
-        "environment.migration_report_ack",
-        "NG",
-    ),
     // ADR-0075 §10: adding tightens; an edit or delete of an enforced Policy
     // loosens (the handler decides from the stored mode).
     ("GET", "/v1/orgs/{org}/policies", "read", "READ"),
@@ -404,10 +387,35 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
         "read",
         "READ",
     ),
+    (
+        "POST",
+        "/v1/orgs/{org}/policies/check",
+        "policy.check",
+        "NG",
+    ),
     ("POST", "/v1/orgs/{org}/policy-test", "policy.test", "NG"),
+    (
+        "POST",
+        "/v1/orgs/{org}/policy-test/replay",
+        "policy.replay",
+        "NG",
+    ),
     ("GET", "/v1/orgs/{org}/policy-decisions", "read", "READ"),
+    (
+        "GET",
+        "/v1/orgs/{org}/policy-decisions/counts",
+        "read",
+        "READ",
+    ),
+    ("GET", "/v1/policy-checkpoints", "read", "READ"),
     ("GET", "/v1/runs/{id}/policy-decisions", "read", "READ"),
     ("GET", "/v1/orgs/{org}/libraries", "read", "READ"),
+    (
+        "GET",
+        "/v1/orgs/{org}/library-installations/{id}",
+        "read",
+        "READ",
+    ),
     (
         "GET",
         "/v1/orgs/{org}/library-yanks/{hash}/impact",
@@ -442,12 +450,6 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "POST",
-        "/v1/orgs/{org}/library-defaults/retry",
-        "library.defaults_retry",
-        "CJ-W",
-    ),
-    (
-        "POST",
         "/v1/orgs/{org}/library-trust",
         "library.trust",
         "CJ-W",
@@ -458,13 +460,19 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
         "library.untrust",
         "EX",
     ),
-    ("GET", "/v1/orgs/{org}/plugin-catalog", "read", "READ"),
+    ("POST", "/v1/orgs/{org}/plugin-fetch", "plugin.fetch", "NG"),
     ("GET", "/v1/orgs/{org}/plugins", "read", "READ"),
     // ADR-0076 §7: a plugin's open gate waits; the handler takes only its
     // scarab-api token, in its own org.
     ("GET", "/v1/orgs/{org}/gates", "read", "READ"),
     ("POST", "/v1/orgs/{org}/plugins", "plugin.install", "CJ-A"),
     ("GET", "/v1/orgs/{org}/plugins/{name}", "read", "READ"),
+    (
+        "GET",
+        "/v1/orgs/{org}/plugin-installations/{id}",
+        "read",
+        "READ",
+    ),
     (
         "DELETE",
         "/v1/orgs/{org}/plugins/{name}",
@@ -482,6 +490,18 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
         "/v1/orgs/{org}/plugins/{name}/enable",
         "plugin.enable",
         "CJ-W",
+    ),
+    (
+        "POST",
+        "/v1/orgs/{org}/plugins/{name}/upgrade-fetch",
+        "plugin.upgrade_fetch",
+        "NG",
+    ),
+    (
+        "POST",
+        "/v1/orgs/{org}/plugins/{name}/upgrade",
+        "plugin.upgrade",
+        "COND-A",
     ),
     (
         "PUT",
@@ -546,6 +566,7 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
         "read",
         "READ",
     ),
+    ("GET", "/v1/orgs/{org}/repos", "read", "READ"),
     (
         "POST",
         "/v1/connections/{id}/repos",
@@ -686,7 +707,7 @@ fn the_break_glass_is_not_reachable_over_http() {
         resets,
         vec![(
             "POST".to_string(),
-            "/v1/orgs/{org}/members/{subject}/passkeys/reset",
+            "/v1/orgs/{org}/members/{id}/passkeys/reset",
             "passkey.reset",
             "CJ-A"
         )]
@@ -964,7 +985,7 @@ async fn unpinning_snapshots_needs_a_step_up_and_pinning_does_not() {
     assert!(!is_step_up(st, &b), "a live window satisfies it: {st} {b}");
 }
 
-/// `connection.resync` binds every reported repo through the same path as
+/// `connection.resync` moves Projects through the same path as
 /// `connection.bind_repo`, so it needs the same window step-up: under
 /// enforcement an Owner without one is refused, exactly like bind_repo.
 #[tokio::test]
@@ -1062,9 +1083,12 @@ fn well_formed(r: &scarab_server::RouteEntry) -> (String, Option<Value>) {
         ("POST", "/v1/repos/{org}/{repo}/bindings/import") => Some(json!({"subjects": []})),
         ("POST", "/v1/secrets") => Some(json!({"org": "acme", "name": "X", "value": "v"})),
         ("DELETE", "/v1/secrets") => return ("/v1/secrets?org=acme&name=X".into(), None),
-        ("POST", "/v1/orgs/{org}/plugins") => {
-            Some(json!({"name": "argo", "plugin": "argocd", "image": "img@sha256:00"}))
-        }
+        ("POST", "/v1/orgs/{org}/plugins") => Some(json!({
+            "name": "argo",
+            "image": "img@sha256:00",
+            "source": format!("github.com/acme/plugins//manifest.json@{}", "0".repeat(40)),
+            "manifest_sha256": "a".repeat(64),
+        })),
         ("PUT", "/v1/orgs/{org}/plugins/{name}/connections/{slot}") => {
             Some(json!({"base_url": "https://argo.example", "credential": "c"}))
         }
@@ -1076,7 +1100,6 @@ fn well_formed(r: &scarab_server::RouteEntry) -> (String, Option<Value>) {
         ("PUT", "/v1/orgs/{org}/libraries/{publisher}/{name}") => {
             Some(json!({"content_hash": "a".repeat(64)}))
         }
-        ("POST", "/v1/orgs/{org}/library-defaults/retry") => Some(json!({})),
         ("POST", "/v1/orgs/{org}/environments/{env}/duplicate") => {
             Some(json!({"name": "prod-copy"}))
         }
@@ -1087,7 +1110,7 @@ fn well_formed(r: &scarab_server::RouteEntry) -> (String, Option<Value>) {
         | ("GET", _)
         | ("POST", "/v1/connections/{id}/resync")
         | ("POST", "/v1/orgs/{org}/plugins/{name}/enable")
-        | ("POST", "/v1/orgs/{org}/members/{subject}/passkeys/reset") => None,
+        | ("POST", "/v1/orgs/{org}/members/{id}/passkeys/reset") => None,
         (m, p) => panic!("add a well-formed request for the crown jewel {m} {p}"),
     };
     (uri, body)
@@ -1172,7 +1195,18 @@ async fn exempt_and_ungoverned_routes_never_ask_for_a_step_up() {
         );
         checked += 1;
     }
-    assert_eq!(checked, 35, "the EX + NG mutating routes");
+    // Counted from the reviewed classification, which
+    // `the_route_table_is_exactly_the_reviewed_classification` pins to the
+    // route table: the loop above must have visited every EX and NG route.
+    let reviewed = EXPECTED
+        .iter()
+        .filter(|(_, _, _, class)| matches!(*class, "EX" | "NG"))
+        .count();
+    assert!(
+        reviewed > 0,
+        "the reviewed classification names EX and NG routes"
+    );
+    assert_eq!(checked, reviewed, "the EX + NG mutating routes");
     assert!(h.events_of("step_up.refused").is_empty());
 }
 

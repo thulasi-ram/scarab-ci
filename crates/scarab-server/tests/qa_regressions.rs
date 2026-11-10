@@ -151,6 +151,7 @@ async fn operator_cancel_is_attributed_to_the_authenticated_principal() {
         "alice-code",
         Principal {
             subject: "alice".into(),
+            handle: String::new(),
             display_name: None,
             roles: vec![Role::Member],
         },

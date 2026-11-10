@@ -35,6 +35,7 @@ use scarab_plugin_argocd::broker::Broker;
 use scarab_plugin_argocd::gates::GateApi;
 use scarab_plugin_argocd::standby;
 use scarab_server::plugins::PluginPolicy;
+use scarab_server::test_support::{argocd_fetcher, argocd_install_body};
 use scarab_server::{
     broker, router, trigger_runs_from_event, AdmissionPorts, AppState, LogService,
 };
@@ -142,11 +143,12 @@ async fn world_with(pipeline: &str) -> Option<World> {
             PluginPolicy {
                 enabled: true,
                 namespace: NAMESPACE.into(),
-                argocd_repo: REPO.into(),
                 dev_allow_tag: false,
             },
         )
         .with_plugin_tokens(Arc::new(FakeTokenReview))
+        // The manifest an admin installs from, served without a network.
+        .with_library_fetcher(Arc::new(argocd_fetcher()))
         .with_plugin_api_tokens(Arc::new(FakeTokenReview))
         .with_secrets(Arc::new(FakeSecrets::new()));
     // The fake Argo CD listens on 127.0.0.1, which the broker refuses by
@@ -161,11 +163,7 @@ async fn world_with(pipeline: &str) -> Option<World> {
         &public,
         "POST",
         "/v1/orgs/acme/plugins",
-        json!({
-            "name": "argocd-prod",
-            "plugin": "argocd",
-            "image": format!("{REPO}@sha256:{}", "a".repeat(64)),
-        }),
+        argocd_install_body("argocd-prod", &format!("{REPO}@sha256:{}", "a".repeat(64))),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");

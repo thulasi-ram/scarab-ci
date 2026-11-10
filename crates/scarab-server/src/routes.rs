@@ -197,7 +197,7 @@ pub(crate) fn governed_routes() -> Routes {
             step_up::events::org_security_summary,
         )
         .post(
-            "/v1/orgs/{org}/members/{subject}/passkeys/reset",
+            "/v1/orgs/{org}/members/{id}/passkeys/reset",
             &ops::PASSKEY_RESET,
             step_up::admin::reset_member_passkeys,
         )
@@ -220,6 +220,7 @@ pub(crate) fn governed_routes() -> Routes {
             delete_binding,
         )
         .get("/v1/orgs/{org}/principals", search_principals)
+        .get("/v1/orgs/{org}/members/{id}", get_member)
         .get("/v1/orgs/{org}/tokens", list_api_tokens)
         .post("/v1/orgs/{org}/tokens", &ops::TOKEN_MINT, mint_api_token)
         .delete(
@@ -344,10 +345,6 @@ pub(crate) fn governed_routes() -> Routes {
             &ops::ENV_LEGACY_DELETE,
             delete_environment,
         )
-        .get(
-            "/v1/repos/{org}/{repo}/environments/{name}/deployments",
-            list_deployments,
-        )
         .get("/v1/orgs/{org}/environments", oe::list_org_environments)
         .get("/v1/orgs/{org}/secrets/orphaned", oe::list_orphaned_secrets)
         .put(
@@ -416,15 +413,6 @@ pub(crate) fn governed_routes() -> Routes {
             &ops::PRIVILEGE_GRANT_DELETE,
             oe::delete_environment_project_privilege_grant,
         )
-        .get(
-            "/v1/orgs/{org}/environment-migration-report",
-            oe::get_environment_migration_report,
-        )
-        .post(
-            "/v1/orgs/{org}/environment-migration-report/{env}/acknowledge",
-            &ops::MIGRATION_ACK,
-            oe::acknowledge_environment_migration_report,
-        )
         // ADR-0075: org Policies, Project typed settings, decisions, the test API.
         .get("/v1/orgs/{org}/policies", pol::list_org_policies)
         .post(
@@ -475,20 +463,39 @@ pub(crate) fn governed_routes() -> Routes {
             pol::list_project_policy_versions,
         )
         .post(
+            "/v1/orgs/{org}/policies/check",
+            &ops::POLICY_CHECK,
+            pol::check_org_policy,
+        )
+        .post(
             "/v1/orgs/{org}/policy-test",
             &ops::POLICY_TEST,
             pol::policy_test,
+        )
+        .post(
+            "/v1/orgs/{org}/policy-test/replay",
+            &ops::POLICY_REPLAY,
+            pol::policy_test_replay,
         )
         .get(
             "/v1/orgs/{org}/policy-decisions",
             pol::list_org_policy_decisions,
         )
         .get(
+            "/v1/orgs/{org}/policy-decisions/counts",
+            pol::org_policy_decision_counts,
+        )
+        .get("/v1/policy-checkpoints", pol::list_policy_checkpoints)
+        .get(
             "/v1/runs/{id}/policy-decisions",
             pol::list_run_policy_decisions,
         )
-        // ADR-0076: org-installed libraries, yanks, first-party defaults.
+        // ADR-0076: org-installed libraries, yanks, trusted sources.
         .get("/v1/orgs/{org}/libraries", lib::list_libraries)
+        .get(
+            "/v1/orgs/{org}/library-installations/{id}",
+            lib::get_library_installation,
+        )
         .get(
             "/v1/orgs/{org}/library-yanks/{hash}/impact",
             lib::get_yank_impact,
@@ -519,11 +526,6 @@ pub(crate) fn governed_routes() -> Routes {
             lib::unyank_library,
         )
         .post(
-            "/v1/orgs/{org}/library-defaults/retry",
-            &ops::LIBRARY_DEFAULTS_RETRY,
-            lib::retry_library_defaults,
-        )
-        .post(
             "/v1/orgs/{org}/library-trust",
             &ops::LIBRARY_TRUST,
             lib::trust_library_source,
@@ -533,7 +535,11 @@ pub(crate) fn governed_routes() -> Routes {
             &ops::LIBRARY_UNTRUST,
             lib::untrust_library_source,
         )
-        .get("/v1/orgs/{org}/plugin-catalog", plugins::plugin_catalog)
+        .post(
+            "/v1/orgs/{org}/plugin-fetch",
+            &ops::PLUGIN_FETCH,
+            plugins::fetch_plugin_manifest,
+        )
         .get("/v1/orgs/{org}/plugins", plugins::list_plugins)
         .get(
             "/v1/orgs/{org}/gates",
@@ -545,6 +551,10 @@ pub(crate) fn governed_routes() -> Routes {
             plugins::install_plugin,
         )
         .get("/v1/orgs/{org}/plugins/{name}", plugins::get_plugin)
+        .get(
+            "/v1/orgs/{org}/plugin-installations/{id}",
+            plugins::get_plugin_by_id,
+        )
         .delete(
             "/v1/orgs/{org}/plugins/{name}",
             &ops::PLUGIN_UNINSTALL,
@@ -559,6 +569,16 @@ pub(crate) fn governed_routes() -> Routes {
             "/v1/orgs/{org}/plugins/{name}/enable",
             &ops::PLUGIN_ENABLE,
             plugins::enable_plugin,
+        )
+        .post(
+            "/v1/orgs/{org}/plugins/{name}/upgrade-fetch",
+            &ops::PLUGIN_UPGRADE_FETCH,
+            plugins::fetch_plugin_upgrade,
+        )
+        .post(
+            "/v1/orgs/{org}/plugins/{name}/upgrade",
+            &ops::PLUGIN_UPGRADE,
+            plugins::upgrade_plugin,
         )
         .put(
             "/v1/orgs/{org}/plugins/{name}/storage",
@@ -611,6 +631,7 @@ pub(crate) fn governed_routes() -> Routes {
         )
         .get("/v1/connections/{id}/preflight", connection_preflight)
         .get("/v1/connections/{id}/available-repos", available_repos)
+        .get("/v1/orgs/{org}/repos", org_repos)
         .post(
             "/v1/connections/{id}/repos",
             &ops::CONNECTION_BIND_REPO,

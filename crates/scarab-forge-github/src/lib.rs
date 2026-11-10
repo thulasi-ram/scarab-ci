@@ -236,16 +236,18 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
 // Installation webhooks → registry sync (pure)
 // ---------------------------------------------------------------------------
 
-/// The registry effect of a GitHub `installation` / `installation_repositories`
-/// webhook (ADR-0046): installing the App **is** registration. The webhook
-/// route applies this to the `ForgeConnectionStore` via
-/// [`apply_installation_sync`].
+/// What a GitHub `installation` / `installation_repositories` webhook says
+/// changed: the repos the installation now covers (`added`) and the ones it
+/// no longer covers (`removed`). Installing the App registers its connection;
+/// a covered repo becomes a Project only when an admin enables it, so the
+/// webhook route binds none of `added`. It applies the change in reach to
+/// the repos already bound, via [`apply_installation_reach`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallationSync {
     /// The GitHub App installation the delivery belongs to.
     pub installation_id: u64,
-    /// The account (user/org login) the App was installed on — the default
-    /// Scarab Org for auto-registered Projects.
+    /// The account (user/org login) the App was installed on: the Scarab Org
+    /// its connection serves.
     pub account: String,
     /// The account's immutable GitHub id (`installation.account.id`): a
     /// login can be renamed and taken by another account, this id cannot
@@ -253,6 +255,10 @@ pub struct InstallationSync {
     pub account_id: Option<u64>,
     pub added: Vec<RepoRef>,
     pub removed: Vec<RepoRef>,
+    /// The installation reaches nothing any more: the App was uninstalled
+    /// (`deleted`) or suspended. Every repo bound through it is unreachable,
+    /// whether or not the delivery lists it.
+    pub covers_nothing: bool,
 }
 
 /// Parse an installation-lifecycle delivery into its registry effect. `None`
@@ -298,6 +304,7 @@ pub fn installation_sync(delivery: &WebhookDelivery) -> Option<InstallationSync>
                     account_id,
                     added: repos,
                     removed: vec![],
+                    covers_nothing: false,
                 }),
                 "deleted" | "suspend" => Some(InstallationSync {
                     installation_id,
@@ -305,6 +312,7 @@ pub fn installation_sync(delivery: &WebhookDelivery) -> Option<InstallationSync>
                     account_id,
                     added: vec![],
                     removed: repos,
+                    covers_nothing: true,
                 }),
                 _ => None,
             }
@@ -315,45 +323,55 @@ pub fn installation_sync(delivery: &WebhookDelivery) -> Option<InstallationSync>
             account_id,
             added: repos_at("/repositories_added"),
             removed: repos_at("/repositories_removed"),
+            covers_nothing: false,
         }),
         _ => None,
     }
 }
 
-/// Apply a parsed [`InstallationSync`] to the registry (ADR-0046
-/// auto-registration): added repos bind to `(org, repo.name)` under
-/// `connection_id` (Project name = repo name, 1:1 in v1); removed repos
-/// unbind. Idempotent — replayed deliveries re-apply harmlessly.
+/// What [`apply_installation_reach`] changed: how many bound repos it marked
+/// unreachable, and how many marks it cleared.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReachChange {
+    pub marked: usize,
+    pub cleared: usize,
+}
+
+/// Apply a parsed [`InstallationSync`] to the repos bound through
+/// `connection_id`. Nothing is bound or unbound: a repo the installation no
+/// longer covers (or every bound repo, when the App was uninstalled or
+/// suspended) is marked unreachable since `now`, and keeps its Project; a
+/// bound repo the installation covers again has its mark cleared. Only an
+/// admin's unbind removes a Project. Idempotent: a replayed delivery
+/// re-applies harmlessly, and a repeated mark keeps its first time.
 ///
-/// Returns the added repos it did **not** bind: one owned by another account
-/// than `org`, or one already bound through a connection of another Org
-/// (git-bug 19b0a45). A delivery is not failed for those; the caller logs
-/// them. A reserved `org` still fails it.
-pub async fn apply_installation_sync(
+/// Additions that are not bound are not applied: such a repo is available
+/// to enable, and becomes a Project only through an explicit bind.
+pub async fn apply_installation_reach(
     store: &dyn scarab_forge::ForgeConnectionStore,
     connection_id: &str,
-    org: &str,
     sync: &InstallationSync,
-) -> Result<Vec<RepoRef>, scarab_forge::RegistryError> {
-    let mut skipped = Vec::new();
-    for repo in &sync.added {
-        if repo.owner != org {
-            skipped.push(repo.clone());
-            continue;
-        }
-        match store.bind_repo(connection_id, repo, org, &repo.name).await {
-            Ok(()) => {}
-            Err(
-                scarab_forge::RegistryError::OrgMismatch { .. }
-                | scarab_forge::RegistryError::BoundElsewhere { .. },
-            ) => skipped.push(repo.clone()),
-            Err(e) => return Err(e),
-        }
+    now: i64,
+) -> Result<ReachChange, scarab_forge::RegistryError> {
+    let bound: std::collections::BTreeSet<RepoRef> =
+        store.repos_of(connection_id).await?.into_iter().collect();
+    let mut change = ReachChange::default();
+    let gone: Vec<&RepoRef> = if sync.covers_nothing {
+        bound.iter().collect()
+    } else {
+        sync.removed.iter().filter(|r| bound.contains(*r)).collect()
+    };
+    for repo in gone {
+        store
+            .mark_repo_unreachable(connection_id, repo, now)
+            .await?;
+        change.marked += 1;
     }
-    for repo in &sync.removed {
-        store.unbind_repo(connection_id, repo).await?;
+    for repo in sync.added.iter().filter(|r| bound.contains(*r)) {
+        store.clear_repo_unreachable(connection_id, repo).await?;
+        change.cleared += 1;
     }
-    Ok(skipped)
+    Ok(change)
 }
 
 // ---------------------------------------------------------------------------
@@ -1671,6 +1689,7 @@ mod tests {
                     },
                 ],
                 removed: vec![],
+                covers_nothing: false,
             }
         );
 
@@ -1700,7 +1719,7 @@ mod tests {
             }]
         );
 
-        // Uninstall removes its repos.
+        // Uninstalling (or suspending) covers nothing any more.
         let deleted = delivery(
             "installation",
             json!({
@@ -1712,6 +1731,12 @@ mod tests {
         let sync = installation_sync(&deleted).unwrap();
         assert!(sync.added.is_empty());
         assert_eq!(sync.removed.len(), 1);
+        assert!(sync.covers_nothing);
+        let suspended = delivery(
+            "installation",
+            json!({ "action": "suspend", "installation": { "id": 77 } }),
+        );
+        assert!(installation_sync(&suspended).unwrap().covers_nothing);
 
         // Non-installation deliveries are not registry events.
         assert!(installation_sync(&delivery("push", json!({}))).is_none());

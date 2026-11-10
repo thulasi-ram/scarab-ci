@@ -1,14 +1,20 @@
 // The signed-in identity: an avatar showing initials, opening a
-// dropdown with the principal's name, subject, and role, plus sign-out. Driven
+// dropdown with the principal's name, handle, and role, plus sign-out. Driven
 // by the real `GET /v1/me` — no more hardcoded placeholder.
-import { createSignal, onCleanup, onMount, Show } from "solid-js";
-import { A } from "@solidjs/router";
+import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import { A, useLocation } from "@solidjs/router";
 import Icon from "./Icon";
 import { logout } from "../api/client";
 import { me } from "../session";
 import { theme, toggleTheme } from "../theme";
+import { settingsMenu, type SettingsGroupKind } from "../settings-nav";
 
-/** Initials from a display name ("Thulasi Ram" → "TR") or subject ("t.ram" → "T"). */
+const MENU_ICONS: Record<SettingsGroupKind, string> = {
+  account: "user",
+  org: "settings",
+};
+
+/** Initials from a display name ("Thulasi Ram" → "TR") or handle ("t.ram" → "T"). */
 function initials(name: string): string {
   const parts = name.trim().split(/[\s._-]+/).filter(Boolean);
   if (parts.length >= 2) return (parts[0][0] + parts[1][0]).toUpperCase();
@@ -17,9 +23,10 @@ function initials(name: string): string {
 
 export default function UserMenu() {
   const [open, setOpen] = createSignal(false);
+  const location = useLocation();
   let root: HTMLDivElement | undefined;
 
-  const label = () => me()?.display_name || me()?.subject || "";
+  const label = () => me()?.display_name || me()?.handle || "";
 
   onMount(() => {
     const onDoc = (e: MouseEvent) => {
@@ -56,8 +63,8 @@ export default function UserMenu() {
                 <span class="avatar-init">{initials(label())}</span>
               </span>
               <div class="um-id">
-                <div class="um-name">{user().display_name ?? user().subject}</div>
-                <div class="um-sub mono">{user().subject}</div>
+                <div class="um-name">{user().display_name ?? user().handle}</div>
+                <div class="um-sub mono">{user().handle}</div>
               </div>
             </div>
             <div class="um-roles">
@@ -65,19 +72,24 @@ export default function UserMenu() {
                 <span class="um-role">{r}</span>
               ))}
             </div>
-            {/* Settings (git-bug 734ffa1): one entry for everyone. A
-                non-admin lands on their own account; an admin on their
-                first org's settings, with their account a click away in the
-                same sidebar. */}
-            <A
-              href="/settings"
-              class="um-item um-link"
-              role="menuitem"
-              onClick={() => setOpen(false)}
-            >
-              <Icon icon="settings" size={14} />
-              Settings
-            </A>
+            {/* Settings (git-bug 734ffa1): one entry per settings page,
+                since each page lists only its own sections. Account
+                settings for everyone; Organization settings for an org
+                admin, opening the org in view when they administer it, and
+                for a global admin with no org, the New organization page. */}
+            <For each={settingsMenu(user(), location.pathname)}>
+              {(entry) => (
+                <A
+                  href={entry.href}
+                  class="um-item um-link"
+                  role="menuitem"
+                  onClick={() => setOpen(false)}
+                >
+                  <Icon icon={MENU_ICONS[entry.kind]} size={14} />
+                  {entry.label}
+                </A>
+              )}
+            </For>
             {/* Says what the click DOES, not what the theme currently is — the
                 top-bar toggle it replaces could lean on a sun/moon crossfade
                 to carry that, and a text row cannot. Leaves the menu open, so

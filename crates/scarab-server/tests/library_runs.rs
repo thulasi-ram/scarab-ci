@@ -76,7 +76,6 @@ async fn installed(org: &str, content: &str) -> InMemoryLibraries {
         source: source(),
         publisher: "acme".into(),
         name: "deploy".into(),
-        first_party: false,
         fetched_by: "amy".into(),
         fetched_at: 1,
     })

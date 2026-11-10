@@ -4,6 +4,8 @@
 // picker's options can't come from them alone, or picking one Environment
 // would hide every other.
 
+import { isScheduled } from "./schedules";
+
 /** The Environment picker's options: the Project's Environments, every
  *  Environment a loaded run is governed by (a run can outlive the Project's
  *  eligibility for its Environment), and the selected one (a shared link can
@@ -49,15 +51,16 @@ export function barePipeline(path: string): string {
  *  - `refused` status shows only refusals; `running` and `failed` only Runs.
  *  - A refusal older than the oldest loaded Run is left out: the page shows
  *    a window of time, and an old refusal at its foot would read as recent.
- *  - The author and pipeline filters apply to refusals too; a filter a
- *    refusal cannot match (an Environment, deploys, a PR) leaves them out. */
+ *  - The author, pipeline and scheduled filters apply to refusals too (a
+ *    schedule's missed slot is a refused `cron` trigger); a filter a refusal
+ *    cannot match (an Environment, deploys, a PR) leaves them out. */
 export function mergeRefused<
   R extends { created_at: number },
-  F extends { created_at: number; actor?: string | null; pipeline: string },
+  F extends { created_at: number; actor?: string | null; pipeline: string; trigger_kind?: string | null },
 >(
   runs: readonly R[],
   refused: readonly F[],
-  f: { status: string; author: string; pipeline: string; runOnly: boolean },
+  f: { status: string; author: string; pipeline: string; runOnly: boolean; scheduled?: boolean },
 ): RunListRow<R, F>[] {
   const runRows: RunListRow<R, F>[] =
     f.status === "refused" ? [] : runs.map((run) => ({ kind: "run", run, at: run.created_at }));
@@ -68,6 +71,7 @@ export function mergeRefused<
         .filter((r) => f.status === "refused" || r.created_at >= oldest)
         .filter((r) => !f.author || r.actor === f.author)
         .filter((r) => !f.pipeline || barePipeline(r.pipeline) === f.pipeline)
+        .filter((r) => !f.scheduled || isScheduled(r.trigger_kind))
         .map((refused) => ({ kind: "refused", refused, at: refused.created_at }))
     : [];
   return [...runRows, ...refusedRows].sort((a, b) => b.at - a.at);

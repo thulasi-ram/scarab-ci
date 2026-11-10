@@ -81,6 +81,7 @@ pub struct Sess {
 pub fn owner(subject: &str) -> Principal {
     Principal {
         subject: subject.into(),
+        handle: String::new(),
         display_name: None,
         roles: vec![Role::Owner],
     }
@@ -89,6 +90,7 @@ pub fn owner(subject: &str) -> Principal {
 pub fn scoped(subject: &str) -> Principal {
     Principal {
         subject: subject.into(),
+        handle: String::new(),
         display_name: None,
         roles: vec![],
     }

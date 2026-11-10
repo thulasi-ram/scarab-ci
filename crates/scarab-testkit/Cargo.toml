@@ -22,12 +22,5 @@ serde_json = { workspace = true }
 # fence holds across a write (git-bug aaf4e3e). Every consumer of this crate
 # is a tokio test already.
 tokio = { workspace = true }
-# The `legacy_environments` seed helpers (feature `postgres`): the frozen
-# `legacy_project_environments` table has no production writer any more.
-sqlx = { workspace = true, optional = true }
-
-[features]
-postgres = ["dep:sqlx"]
-
 [dev-dependencies]
 tokio = { workspace = true }

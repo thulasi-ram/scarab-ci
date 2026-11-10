@@ -4,6 +4,9 @@
   `crates/scarab-plugin-argocd`, migrations `0055_plugins.sql` and
   `0056_plugin_connections.sql`, the `/v1/orgs/{org}/plugins/*` routes). See
   [Implementation horizon](#implementation-horizon) for what is still open.
+- **Amended:** 2026-11-10 by PR #152 (§10 publisher trust, Consequences and Implementation
+  horizon: every plugin installs through one path, third-party installs are on, no publisher
+  is trusted by default, and no image signature is checked yet; see the notes at those places)
 - **Date:** 2026-10-22
 - **Deciders:** thulasi.ram (architect)
 - **Builds on:** [0008](0008-step-contract.md) (a Step is any OCI image; the step
@@ -282,6 +285,38 @@ defend against `trusted_dom` code, which can change what is being confirmed.
 - **Upgrades.** A same-or-narrower manifest is a one-click upgrade by one org admin. A
   wider manifest gets a diff review of only the new capabilities. Elevated tiers
   (`delivered`, `trusted_dom`) need dual approval on every digest.
+
+> **Amended 2026-11-10 — how an upgrade, the manifest's source and its image are built.** The
+> bullet above stands; this records how the MMP builds it, and two additions.
+>
+> - **The source is recorded.** An installation keeps the source its manifest was read from
+>   (`<host>/<owner>/<repo>//<path>@<commit>`) and the ForgeConnection it was read through
+>   (migration 0091). Installations made before then have none, and the UI says "source not
+>   recorded".
+> - **Upgrade is fetch, compare, apply.** `POST …/plugins/{name}/upgrade-fetch` reads the new
+>   manifest, by default the recorded source's file at a commit the admin names (there is no
+>   branch resolution), and returns its diff against the installed manifest: what it adds,
+>   removes and keeps, by capability, connection slot, auth scheme, read rule, config key, gate
+>   and named image. `POST …/plugins/{name}/upgrade` reads the source again (409 if it no longer
+>   has the reviewed hash) and writes only over the installed manifest the admin compared against
+>   (409 otherwise). The installation keeps its id, name, config, storage, state and connection
+>   bindings; config keys and slots the new manifest drops go with it, and the version it replaced
+>   is recorded.
+> - **An upgrade stays a step-up for any new digest, as §8 says.** A new digest is new code, so
+>   an upgrade whose image is not the installed one needs a StepUpConfirmation bound to the
+>   action, as an install does, whatever its manifest: the same, narrower or wider. A wider
+>   manifest needs one too on the installed image. Wider is any added capability, connection
+>   slot, auth scheme, read rule or gate (a gate whose definition changed counts as added), or a
+>   manifest that stops naming its image or names another. An added config key is not wider: its
+>   value is the admin's, not the plugin's. The one exempt upgrade is a same-or-narrower manifest
+>   on the installed digest, which is the "one-click upgrade by one org admin" above. The server
+>   decides from the stored installation and the manifest it reads, never from the request.
+>   Elevated tiers and dual approval do not exist yet, so nothing here addresses them.
+> - **A manifest may name its image.** The optional `image` field is a repository with no tag or
+>   digest. When it is set, an install or upgrade with an image of another repository is refused,
+>   so a manifest cannot be paired with another publisher's build. When it is absent, any
+>   repository is accepted and the review says the manifest names none. This is not publisher
+>   trust: it binds a manifest to a repository, not to a signing identity.
 - **Publisher trust.** A **PluginPublisher** is a signing identity (a Sigstore identity
   or key) an org trusts. **Unsigned images, or images from untrusted publishers, cannot be
   installed.** Scarab's own release identity is trusted by default (first-party). Trust is
@@ -291,6 +326,36 @@ defend against `trusted_dom` code, which can change what is being confirmed.
 - **Kill switch.** An installation can be stopped at once, without an upgrade or an
   uninstall. It revokes at the token-to-installation mapping (§11), so the installation's
   reports and broker requests stop being accepted even before its token expires.
+
+> **Amended 2026-11-10 by PR #152 — every plugin installs the same way, and no publisher is
+> trusted by default.** The owner decided that code Scarab publishes is untrusted code like
+> anyone else's, so it gets no special case. The "Publisher trust" bullet above no longer
+> describes what runs: Scarab's own release identity is not trusted by default, and no plugin
+> is installed or allowed because of who published it. What is built:
+>
+> - **One install path.** An org admin reads a plugin's PluginManifest from a git source
+>   pinned to a commit with `POST /v1/orgs/{org}/plugin-fetch`, which installs nothing, and
+>   reviews what it asks for. `POST /v1/orgs/{org}/plugins` then installs
+>   `<repo>@sha256:<digest>` with the `manifest_sha256` that fetch returned. The server reads
+>   the source again and answers 409 when the manifest there no longer has that hash
+>   (`crates/scarab-server/src/plugins.rs`). Every install needs the same step-up,
+>   `plugin.install` (`crates/scarab-server/src/step_up/ops.rs`), whoever published the plugin.
+> - **No catalog.** The compiled-in Argo CD catalog entry and `SCARAB_PLUGIN_ARGOCD_REPO` are
+>   removed. Argo CD installs through the same two calls, with its manifest read from
+>   `crates/scarab-plugin-argocd/manifest.json` and its image published as
+>   `ghcr.io/thulasi-ram/scarab-plugin-argocd`.
+> - **Third-party installs are on** (see Consequences).
+>
+> The gaps this leaves:
+>
+> - **No signature is checked.** PluginPublisher signatures are not built, so an install is
+>   approved by its *(image digest, manifest)* alone. The bullet above stays as the design for
+>   signatures, without a publisher trusted by default. The operator ceiling's "which
+>   publishers may be trusted at all" waits for signatures too.
+> - **The manifest does not name its image.** The admin pairs a digest with the reviewed
+>   manifest, and nothing checks that the image is the one the manifest was written for.
+>   Plugin upgrade (the "Upgrades" bullet, which has no route yet) is the next planned change
+>   and is meant to close this gap. It is not built.
 
 ### 11. Reports reach core by push, under an identity core sets
 
@@ -327,6 +392,10 @@ defend against `trusted_dom` code, which can change what is being confirmed.
   that does not enforce it fail loudly rather than run unprotected.
 - Third-party installs stay **off** until StepUpConfirmation and publisher signatures
   exist. Until then only first-party plugins run.
+
+  > **Amended 2026-11-10 by PR #152.** Third-party installs are on. StepUpConfirmation is built
+  > and every plugin install needs it; publisher signatures are not built, and installs no
+  > longer wait for them. Scarab's own plugins install the same way. See the note under §10.
 - New components: a plugin runtime, a broker, a capability check, `plugin_action`, UI
   extension points, step-up. This is the largest new subsystem since the engine.
 - Verifying projected tokens needs TokenReview RBAC (`system:auth-delegator`) for the
@@ -384,3 +453,8 @@ defend against `trusted_dom` code, which can change what is being confirmed.
 - **Target state:** StepUpConfirmation; PluginPublisher signatures and the operator
   ceiling (which together switch third-party installs on); `approve_gates`;
   `subscribe_events`; `delivered` credentials; `trusted_dom`.
+
+> **Amended 2026-11-10 by PR #152.** "Third-party installs **off**" in the MMP and "which
+> together switch third-party installs on" in the target state no longer hold: third-party
+> installs are on without signatures, through the one install path in §10's note.
+> PluginPublisher signatures and the operator ceiling stay in the target state.

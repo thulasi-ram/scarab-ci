@@ -120,9 +120,9 @@ api.use({
 });
 
 /** List recent runs, newest first (dogfoods `GET /v1/runs`). */
-export async function listRuns(limit = 50): Promise<RunSummary[]> {
+export async function listRuns(limit = 50, org?: string): Promise<RunSummary[]> {
   const { data, error } = await api.GET("/v1/runs", {
-    params: { query: { limit } },
+    params: { query: org ? { limit, org } : { limit } },
   });
   if (error || !data) {
     throw new Error("failed to list runs");
@@ -293,6 +293,7 @@ export type PrincipalMatch = components["schemas"]["PrincipalDto"];
 /** One role binding — enriched with the person's name and whether they have
  * signed in yet. */
 export type Binding = components["schemas"]["BindingDto"];
+export type Member = components["schemas"]["MemberDto"];
 
 /** The `scarab_csrf` double-submit token, for the few calls made
  * with plain `fetch` rather than through `api` (whose middleware adds it). */
@@ -431,6 +432,19 @@ export async function unlinkIdentity(provider: string): Promise<void> {
   await send(`/v1/me/identities/${encodeURIComponent(provider)}`, "DELETE");
 }
 
+/** One member of an org by Principal id (`GET /v1/orgs/{org}/members/{id}`):
+ * who they are and the roles they hold there. `null` when no such Principal
+ * exists or the deployment has no RBAC store (dev). */
+export async function getMember(org: string, id: string): Promise<Member | null> {
+  const { data, error, response } = await api.GET("/v1/orgs/{org}/members/{id}", {
+    params: { path: { org, id } },
+  });
+  if (response.status === 404) return null;
+  if (response.status === 401) setUnauthenticated(true);
+  if (error || !data) throw new Error(errorText(error) || `failed to load the member (${response.status})`);
+  return data;
+}
+
 /** An org's role bindings (`GET /v1/orgs/{org}/bindings`); `null` when the
  * deployment has no RBAC store (dev). */
 export async function listBindings(org: string): Promise<Binding[] | null> {
@@ -443,8 +457,9 @@ export async function listBindings(org: string): Promise<Binding[] | null> {
   return (await res.json()) as Binding[];
 }
 
-/** Natively grant `subject` a role, org-wide or on one project. The subject
- * must be an existing user — pick it from `searchPrincipals`. */
+/** Natively grant `subject` a role, org-wide or on one project. `subject` is
+ * a handle (or a Principal id) of an existing user — pick it from
+ * `searchPrincipals`. */
 export async function grantRole(
   org: string,
   body: { subject: string; role: string; project?: string },
@@ -452,7 +467,8 @@ export async function grantRole(
   await send(`/v1/orgs/${encodeURIComponent(org)}/bindings`, "PUT", body);
 }
 
-/** Natively revoke — a durable tombstone a later forge re-sync cannot undo. */
+/** Natively revoke — a durable tombstone a later forge re-sync cannot undo.
+ * `subject` is the Principal's id (a handle works too). */
 export async function revokeRole(org: string, subject: string, project?: string): Promise<void> {
   const q = new URLSearchParams({ subject });
   if (project) q.set("project", project);
@@ -638,33 +654,6 @@ export async function deleteEnvironmentOverlay(
   await send(`${projectPath(org, env, project)}/overlay`, "DELETE");
 }
 
-/** One approval recorded when a run into an environment was admitted (`at` is
- *  epoch millis). The LEGACY `…/environments/{name}/deployments` route: it
- *  records what was *approved*, not what went live. */
-export type ApprovalRecord = {
-  org: string;
-  project: string;
-  environment: string;
-  git_ref: string;
-  run: string;
-  approved_by: string[];
-  at: number;
-};
-
-/** An environment's approval history, most recent first (legacy
- *  `GET /v1/repos/{org}/{repo}/environments/{name}/deployments`). */
-export async function listApprovalHistory(
-  org: string,
-  repo: string,
-  name: string,
-): Promise<ApprovalRecord[]> {
-  const res = await fetch(
-    `/v1/repos/${encodeURIComponent(org)}/${encodeURIComponent(repo)}/environments/${encodeURIComponent(name)}/deployments`,
-  );
-  if (!res.ok) throw new Error("failed to list approval history");
-  return (await res.json()) as ApprovalRecord[];
-}
-
 // --- Org-level Environments — the place deploys land in: its
 // description (the whole-Environment PUT), and — each with its own write, so
 // that PUT can never reset them — its baseline protection, its eligibility,
@@ -788,8 +777,6 @@ export type EnvironmentProject = components["schemas"]["EnvironmentProjectDto"];
 export type PrivilegeGrant = components["schemas"]["EnvironmentProjectPrivilegeGrantDto"];
 export type PutPrivilegeGrantRequest =
   components["schemas"]["PutEnvironmentProjectPrivilegeGrantRequest"];
-/** One line of the migration's split report. */
-export type MigrationReportLine = components["schemas"]["EnvironmentMigrationReportDto"];
 
 /** Replace an Environment's baseline. Returns the Environment as stored. */
 export async function putEnvironmentProtection(
@@ -841,48 +828,31 @@ export async function deletePrivilegeGrant(org: string, env: string, project: st
   await send(`${projectPath(org, env, project)}/privilege-grant`, "DELETE");
 }
 
-/** The migration's split report. `null` when the caller may not read it
- *  (403 — it needs Administer on the org) or the server has no governance
- *  store (404): the panel then simply does not show. */
-export async function getMigrationReport(org: string): Promise<MigrationReportLine[] | null> {
-  const { data, response } = await api.GET("/v1/orgs/{org}/environment-migration-report", {
-    params: { path: { org } },
-  });
-  if (response.status === 403 || response.status === 404) return null;
-  if (!data) throw new Error(`failed to load the migration report (${response.status})`);
-  return data;
-}
+// --- Plugins — an org's PluginInstallations: approvals of one image digest
+// and one reviewed manifest, with a kill switch. Every plugin installs the
+// same way: fetch its manifest from a git source, review it, then install.
+// Every write's refusal text (409 name taken or retired, or the source no
+// longer reads as the reviewed manifest) is passed through verbatim — it is
+// the answer to "why will this not install". ---
 
-/** Mark one split-report line reviewed (the first acknowledgement stands). */
-export async function acknowledgeMigrationReport(
-  org: string,
-  env: string,
-): Promise<MigrationReportLine> {
-  const res = await send(
-    `/v1/orgs/${encodeURIComponent(org)}/environment-migration-report/${encodeURIComponent(env)}/acknowledge`,
-    "POST",
-  );
-  return (await res.json()) as MigrationReportLine;
-}
-
-// --- Plugins — an org's PluginInstallations:
-// approvals of one pinned digest of a first-party plugin, with a kill switch.
-// Every write's refusal text (403 third-party / 409 name taken or retired) is
-// passed through verbatim — it is the answer to "why will this not install". ---
-
-/** A plugin this Scarab can install (first-party only, today). */
-export type PluginCatalogEntry = components["schemas"]["PluginCatalogEntryDto"];
 /** An org's approval to run one pinned digest of a plugin. */
 export type PluginInstallation = components["schemas"]["PluginInstallationDto"];
+/** What a plugin asks for: what an install approves with the image digest. */
+export type PluginManifest = components["schemas"]["PluginManifestDto"];
+/** A manifest read for review (`POST …/plugin-fetch`); nothing is stored. */
+export type FetchedPluginManifest = components["schemas"]["FetchedPluginManifestDto"];
 /** What an uninstall returns. */
 export type UninstalledPlugin = components["schemas"]["UninstalledPluginDto"];
+/** A manifest read for an upgrade, with its diff against the installed one
+ *  (`POST …/plugins/{name}/upgrade-fetch`); nothing is stored. */
+export type FetchedPluginUpgrade = components["schemas"]["FetchedPluginUpgradeDto"];
 
 // --- Libraries ---------------------------------------------------
 
 export type OrgLibraries = components["schemas"]["OrgLibrariesDto"];
 export type LibraryInstallation = components["schemas"]["LibraryInstallationDto"];
 export type FetchedLibrary = components["schemas"]["FetchedLibraryDto"];
-export type LibraryDefaults = components["schemas"]["LibraryDefaultsDto"];
+export type TrustedSource = components["schemas"]["TrustedSourceDto"];
 
 /** The org's libraries (`GET …/libraries`); `null` = this server does not
  *  manage libraries (404). */
@@ -892,6 +862,18 @@ export async function listLibraries(org: string): Promise<OrgLibraries | null> {
   });
   if (response.status === 404) return null;
   if (error || !data) throw new Error(errorText(error) || "failed to load the org's libraries");
+  return data;
+}
+
+/** One installation of the org by its id (`GET …/library-installations/{id}`);
+ *  `null` = no installation with this id in the org, or this server does not
+ *  manage libraries (404). */
+export async function getLibraryInstallation(org: string, id: string): Promise<LibraryInstallation | null> {
+  const { data, error, response } = await api.GET("/v1/orgs/{org}/library-installations/{id}", {
+    params: { path: { org, id } },
+  });
+  if (response.status === 404) return null;
+  if (error || !data) throw new Error(errorText(error) || "failed to load the library");
   return data;
 }
 
@@ -972,28 +954,37 @@ export async function unyankLibrary(org: string, hash: string): Promise<void> {
   if (!response.ok) throw new Error(errorText(error) || `could not lift the yank (${response.status})`);
 }
 
-/** Install the missing first-party libraries (`POST …/library-defaults/retry`),
- *  optionally from a mirror. Asks for a step-up. */
-export async function retryLibraryDefaults(
-  org: string,
-  body: components["schemas"]["RetryDefaultsRequest"],
-): Promise<LibraryDefaults> {
-  const { data, error, response } = await api.POST("/v1/orgs/{org}/library-defaults/retry", {
+/** Trust a library source with long-lived forge credentials (`POST
+ *  …/library-trust`). The commit is dropped: trust holds for every version
+ *  from the source. Asks for a step-up. */
+export async function trustLibrarySource(org: string, source: string): Promise<TrustedSource> {
+  const { data, error, response } = await api.POST("/v1/orgs/{org}/library-trust", {
     params: { path: { org } },
-    body,
+    body: { source },
   });
-  if (error || !data) throw new Error(errorText(error) || `could not install the libraries (${response.status})`);
+  if (error || !data) throw new Error(errorText(error) || `could not trust ${source} (${response.status})`);
   return data;
 }
 
-/** The installable plugins (`GET …/plugin-catalog`); `null` = this server
- *  runs no plugins (404). */
-export async function listPluginCatalog(org: string): Promise<PluginCatalogEntry[] | null> {
-  const { data, error, response } = await api.GET("/v1/orgs/{org}/plugin-catalog", {
-    params: { path: { org } },
+/** Stop trusting a library source (`DELETE …/library-trust?source=`). */
+export async function untrustLibrarySource(org: string, source: string): Promise<void> {
+  const { error, response } = await api.DELETE("/v1/orgs/{org}/library-trust", {
+    params: { path: { org }, query: { source } },
   });
-  if (response.status === 404) return null;
-  if (error || !data) throw new Error(errorText(error) || "failed to load the plugin catalog");
+  if (error) throw new Error(errorText(error) || `could not stop trusting ${source} (${response.status})`);
+}
+
+/** Read a plugin manifest from a git source for review (`POST
+ *  …/plugin-fetch`). Stores and installs nothing. */
+export async function fetchPluginManifest(
+  org: string,
+  body: components["schemas"]["FetchPluginManifestRequest"],
+): Promise<FetchedPluginManifest> {
+  const { data, error, response } = await api.POST("/v1/orgs/{org}/plugin-fetch", {
+    params: { path: { org } },
+    body,
+  });
+  if (error || !data) throw new Error(errorText(error) || `could not read ${body.source} (${response.status})`);
   return data;
 }
 
@@ -1008,7 +999,21 @@ export async function listPlugins(org: string): Promise<PluginInstallation[] | n
   return data;
 }
 
-/** Install a first-party plugin pinned by digest (`POST …/plugins`). */
+/** One installation of the org by its id (`GET …/plugin-installations/{id}`);
+ *  `null` = no installation with this id in the org, or this server does not
+ *  run plugins (404). */
+export async function getPluginInstallation(org: string, id: string): Promise<PluginInstallation | null> {
+  const { data, error, response } = await api.GET("/v1/orgs/{org}/plugin-installations/{id}", {
+    params: { path: { org, id } },
+  });
+  if (response.status === 404) return null;
+  if (error || !data) throw new Error(errorText(error) || "failed to load the plugin installation");
+  return data;
+}
+
+/** Install a plugin from a reviewed manifest, its image pinned by digest
+ *  (`POST …/plugins`). The server reads the source again and refuses (409)
+ *  when it no longer has the reviewed hash. Asks for a step-up. */
 export async function installPlugin(
   org: string,
   body: components["schemas"]["InstallPluginRequest"],
@@ -1078,6 +1083,40 @@ export async function deletePluginStorage(org: string, name: string): Promise<Pl
   if (error || !data) {
     throw new Error(errorText(error) || `could not remove ${name}'s storage (${response.status})`);
   }
+  return data;
+}
+
+/** Read the manifest an upgrade would install and compare it with the
+ *  installed one (`POST …/plugins/{name}/upgrade-fetch`). Stores nothing. */
+export async function fetchPluginUpgrade(
+  org: string,
+  name: string,
+  body: components["schemas"]["FetchPluginUpgradeRequest"],
+): Promise<FetchedPluginUpgrade> {
+  const { data, error, response } = await api.POST("/v1/orgs/{org}/plugins/{name}/upgrade-fetch", {
+    params: { path: { org, name } },
+    body,
+  });
+  if (error || !data) {
+    throw new Error(errorText(error) || `could not read the new manifest (${response.status})`);
+  }
+  return data;
+}
+
+/** Upgrade an installation to a reviewed manifest and image (`POST
+ *  …/plugins/{name}/upgrade`). The server decides whether it needs a
+ *  step-up, and refuses (409) when the installation or the source changed
+ *  since the review. */
+export async function upgradePlugin(
+  org: string,
+  name: string,
+  body: components["schemas"]["UpgradePluginRequest"],
+): Promise<PluginInstallation> {
+  const { data, error, response } = await api.POST("/v1/orgs/{org}/plugins/{name}/upgrade", {
+    params: { path: { org, name } },
+    body,
+  });
+  if (error || !data) throw new Error(errorText(error) || `could not upgrade ${name} (${response.status})`);
   return data;
 }
 
@@ -1783,23 +1822,36 @@ export async function assignConnectionOrg(id: string, org: string): Promise<void
 // `projects` table: a Project IS a `forge_repos` binding, so these
 // calls are what bring a repo into existence as a governed Project. ---
 
-export type AvailableRepo = components["schemas"]["AvailableRepoDto"];
-export type BindRepoResult = components["schemas"]["BindRepoResultDto"];
+export type OrgRepo = components["schemas"]["OrgRepoDto"];
+export type OrgReposPage = components["schemas"]["OrgReposPageDto"];
 
 /**
- * The repos a connection's credential can reach (`GET …/available-repos`) — the
- * pick-list, so nobody has to type `owner/name`. Returns `null` when the adapter
- * cannot enumerate (501), which is NOT the same as "reaches nothing": the caller
- * falls back to a manual entry field instead of claiming the token is empty.
+ * One page of an org's repositories (`GET /v1/orgs/{org}/repos`): every
+ * enabled one and every one its connections reach that is not enabled,
+ * sorted by name. The server pages and filters, so `q` narrows the whole
+ * list, not only the page.
  */
-export async function availableRepos(id: string): Promise<AvailableRepo[] | null> {
-  const { data, error, response } = await api.GET("/v1/connections/{id}/available-repos", {
-    params: { path: { id } },
+export async function listOrgRepos(
+  org: string,
+  opts: { page?: number; perPage?: number; q?: string; connection?: string } = {},
+): Promise<OrgReposPage> {
+  const { data, error, response } = await api.GET("/v1/orgs/{org}/repos", {
+    params: {
+      path: { org },
+      query: {
+        page: opts.page,
+        per_page: opts.perPage,
+        q: opts.q?.trim() ? opts.q.trim() : undefined,
+        connection: opts.connection || undefined,
+      },
+    },
   });
-  if (response.status === 501) return null;
-  if (error || !data) throw new Error("failed to list the connection's repositories");
+  if (error || !data) {
+    throw new Error(errorText(error) || `could not list the repositories (${response.status})`);
+  }
   return data;
 }
+export type BindRepoResult = components["schemas"]["BindRepoResultDto"];
 
 /**
  * Bind a repo to a connection (`POST …/repos`) — **this creates the Project**,
@@ -2083,10 +2135,11 @@ export async function listOrgSecurityEvents(
 }
 
 /** An Owner resets a member's passkeys
- * (`POST /v1/orgs/{org}/members/{subject}/passkeys/reset`) — always-ask. */
-export async function resetMemberPasskeys(org: string, subject: string): Promise<PasskeyReset> {
-  const { data, error, response } = await api.POST("/v1/orgs/{org}/members/{subject}/passkeys/reset", {
-    params: { path: { org, subject } },
+ * (`POST /v1/orgs/{org}/members/{id}/passkeys/reset`, by Principal id) —
+ * always-ask. */
+export async function resetMemberPasskeys(org: string, id: string): Promise<PasskeyReset> {
+  const { data, error, response } = await api.POST("/v1/orgs/{org}/members/{id}/passkeys/reset", {
+    params: { path: { org, id } },
   });
   if (error || !data) throw new Error(errorText(error) || `could not reset passkeys (${response.status})`);
   return data;
@@ -2149,13 +2202,182 @@ export async function listOrgPolicies(org: string): Promise<PolicyRecord[] | nul
   return data;
 }
 
-/** The newest `limit` decisions of the org's log (at most 200). `null` when
- *  the server has no policy store (404). */
-export async function listOrgPolicyDecisions(org: string, limit = 200): Promise<PolicyDecisionPage | null> {
+/** The newest `limit` decisions of the org's log (at most 200); with
+ *  `policyId`, only those with a result for that Policy. `null` when the
+ *  server has no policy store (404). */
+export async function listOrgPolicyDecisions(
+  org: string,
+  limit = 200,
+  policyId?: string,
+): Promise<PolicyDecisionPage | null> {
   const { data, error, response } = await api.GET("/v1/orgs/{org}/policy-decisions", {
-    params: { path: { org }, query: { limit } },
+    params: { path: { org }, query: { limit, ...(policyId ? { policy_id: policyId } : {}) } },
   });
   if (response.status === 404) return null;
   if (error || !data) throw new Error(errorText(error) || "failed to load the org's policy decisions");
+  return data;
+}
+
+/** A recorded decision (`PolicyDecisionRecordDto`). */
+export type PolicyDecisionRecord = components["schemas"]["PolicyDecisionRecordDto"];
+
+/** A Run's decisions, oldest first (`GET /v1/runs/{id}/policy-decisions`). */
+export async function listRunPolicyDecisions(runId: string): Promise<PolicyDecisionRecord[]> {
+  const { data, error, response } = await api.GET("/v1/runs/{id}/policy-decisions", {
+    params: { path: { id: runId } },
+  });
+  if (error || !data) {
+    throw new Error(errorText(error) || `failed to load the run's policy decisions (${response.status})`);
+  }
+  return data;
+}
+
+/** Where a Policy is stored: the org's own, or one project's typed settings. */
+export type PolicyScope = { org: string; project?: string };
+
+// The schema leaves an authored Policy opaque (`Record<string, never>`).
+type OpaquePolicy = Record<string, never>;
+
+/** The Policies stored at exactly `scope`. `null` when the server has no
+ *  policy store (404). */
+export async function listPolicies(scope: PolicyScope): Promise<PolicyRecord[] | null> {
+  if (scope.project === undefined) return listOrgPolicies(scope.org);
+  const { data, error, response } = await api.GET("/v1/orgs/{org}/projects/{project}/policies", {
+    params: { path: { org: scope.org, project: scope.project } },
+  });
+  if (response.status === 404) return null;
+  if (error || !data) throw new Error(errorText(error) || "failed to load the project's policies");
+  return data;
+}
+
+/** Add a Policy at `scope`. Adding one tightens, so it needs no step-up. */
+export async function createPolicy(scope: PolicyScope, policy: unknown, reason?: string): Promise<PolicyRecord> {
+  const body = { policy: policy as OpaquePolicy, reason: reason || null };
+  const { data, error, response } =
+    scope.project === undefined
+      ? await api.POST("/v1/orgs/{org}/policies", { params: { path: { org: scope.org } }, body })
+      : await api.POST("/v1/orgs/{org}/projects/{project}/policies", {
+          params: { path: { org: scope.org, project: scope.project } },
+          body,
+        });
+  if (error || !data) throw new Error(errorText(error) || `could not add the policy (${response.status})`);
+  return data;
+}
+
+/** Replace a Policy, judged against `expectedVersion`. Changing an enforced
+ *  Policy asks for a step-up, which the client's middleware handles. */
+export async function updatePolicy(
+  scope: PolicyScope,
+  id: string,
+  policy: unknown,
+  expectedVersion: number,
+  reason?: string,
+): Promise<PolicyRecord> {
+  const body = { policy: policy as OpaquePolicy, expected_version: expectedVersion, reason: reason || null };
+  const { data, error, response } =
+    scope.project === undefined
+      ? await api.PUT("/v1/orgs/{org}/policies/{id}", { params: { path: { org: scope.org, id } }, body })
+      : await api.PUT("/v1/orgs/{org}/projects/{project}/policies/{id}", {
+          params: { path: { org: scope.org, project: scope.project, id } },
+          body,
+        });
+  if (error || !data) throw new Error(errorText(error) || `could not save the policy (${response.status})`);
+  return data;
+}
+
+/** Delete a Policy (its history stays). */
+export async function deletePolicy(
+  scope: PolicyScope,
+  id: string,
+  expectedVersion: number,
+  reason?: string,
+): Promise<PolicyRecord> {
+  const query = { expected_version: expectedVersion, reason: reason || undefined };
+  const { data, error, response } =
+    scope.project === undefined
+      ? await api.DELETE("/v1/orgs/{org}/policies/{id}", { params: { path: { org: scope.org, id }, query } })
+      : await api.DELETE("/v1/orgs/{org}/projects/{project}/policies/{id}", {
+          params: { path: { org: scope.org, project: scope.project, id }, query },
+        });
+  if (error || !data) throw new Error(errorText(error) || `could not delete the policy (${response.status})`);
+  return data;
+}
+
+/** One saved version of a Policy (`PolicyVersionDto`). */
+export type PolicyVersionRecord = components["schemas"]["PolicyVersionDto"];
+/** What checking a draft found (`PolicyCheckResponse`). */
+export type PolicyCheckResult = components["schemas"]["PolicyCheckResponse"];
+/** One checkpoint's input schema, effects and `match` keys. */
+export type PolicyCheckpointInfo = components["schemas"]["PolicyCheckpointDto"];
+/** What a draft changes over the recorded decisions. */
+export type PolicyReplayResult = components["schemas"]["PolicyReplayResponse"];
+/** Each Policy's decision counts since a time. */
+export type PolicyDecisionCounts = components["schemas"]["PolicyDecisionCountsDto"];
+
+/** One org Policy by id, deleted or not. */
+export async function getOrgPolicy(org: string, id: string): Promise<PolicyRecord> {
+  const { data, error, response } = await api.GET("/v1/orgs/{org}/policies/{id}", {
+    params: { path: { org, id } },
+  });
+  if (error || !data) throw new Error(errorText(error) || `could not load the policy (${response.status})`);
+  return data;
+}
+
+/** Every version of an org Policy, oldest first. */
+export async function listOrgPolicyVersions(org: string, id: string): Promise<PolicyVersionRecord[]> {
+  const { data, error, response } = await api.GET("/v1/orgs/{org}/policies/{id}/versions", {
+    params: { path: { org, id } },
+  });
+  if (error || !data) throw new Error(errorText(error) || `could not load the policy's history (${response.status})`);
+  return data;
+}
+
+/** Check a draft org Policy without saving it: a body, or YAML as pasted. */
+export async function checkPolicy(
+  org: string,
+  draft: { policy: unknown } | { yaml: string },
+): Promise<PolicyCheckResult> {
+  const body =
+    "yaml" in draft ? { yaml: draft.yaml } : { policy: draft.policy as Record<string, never> };
+  const { data, error, response } = await api.POST("/v1/orgs/{org}/policies/check", {
+    params: { path: { org } },
+    body,
+  });
+  if (error || !data) throw new Error(errorText(error) || `could not check the policy (${response.status})`);
+  return data;
+}
+
+/** Each checkpoint's input schema, effects and `match` keys. */
+export async function listPolicyCheckpoints(): Promise<PolicyCheckpointInfo[]> {
+  const { data, error, response } = await api.GET("/v1/policy-checkpoints");
+  if (error || !data) throw new Error(errorText(error) || `could not load the checkpoints (${response.status})`);
+  return data;
+}
+
+/** A draft over the newest recorded decisions at its checkpoint: the ones
+ *  whose outcome for the Policy would change. `policyId` names the stored
+ *  Policy the draft edits. */
+export async function replayPolicy(
+  org: string,
+  policy: unknown,
+  policyId?: string,
+  limit = 200,
+): Promise<PolicyReplayResult> {
+  const { data, error, response } = await api.POST("/v1/orgs/{org}/policy-test/replay", {
+    params: { path: { org } },
+    body: { policy: policy as Record<string, never>, policy_id: policyId ?? null, limit },
+  });
+  if (error || !data) throw new Error(errorText(error) || `could not try the policy (${response.status})`);
+  return data;
+}
+
+/** Each Policy's denies and would-denies since `since` (unix ms). `null`
+ *  when the server has no policy store (404). */
+export async function policyDecisionCounts(org: string, since: number): Promise<PolicyDecisionCounts | null> {
+  const { data, error, response } = await api.GET("/v1/orgs/{org}/policy-decisions/counts", {
+    params: { path: { org }, query: { since } },
+  });
+  if (response.status === 404) return null;
+  if (error || !data) throw new Error(errorText(error) || "failed to count the org's policy decisions");
   return data;
 }

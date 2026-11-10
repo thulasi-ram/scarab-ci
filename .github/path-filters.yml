@@ -116,6 +116,16 @@ image_wsfetch:
   - ".github/workflows/image.yml"
   - ".github/path-filters.yml"
 
+# Context is the repo ROOT: the plugin crate is a workspace member, and its
+# Dockerfile prepares the dependency graph from every manifest (cargo-chef), so
+# it takes the whole cargo surface, but not the UI.
+image_plugin_argocd:
+  - *cargo
+  - "docker/plugin-argocd/**"
+  - ".dockerignore"
+  - ".github/workflows/image.yml"
+  - ".github/path-filters.yml"
+
 # The Helm chart (`image.yml`'s `chart` job): lint + render on a PR that touches
 # it, so a template that only fails at render time cannot first fail in a
 # release tag. Its rendered defaults read nothing outside `deploy/helm/`.

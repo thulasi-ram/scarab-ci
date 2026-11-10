@@ -1,10 +1,14 @@
 # syntax=docker/dockerfile:1
 #
-# scarab-plugin-argocd — the first-party Argo CD Plugin (ADR-0072, ADR-0074).
+# scarab-plugin-argocd — the Argo CD Plugin (ADR-0072, ADR-0074).
 # After ADR-0074 it reports nothing; it keeps the code that reads an Argo CD
-# Application, for the plugin-resolved gates of ADR-0076. Installed by an org admin PINNED BY DIGEST from the catalog
-# repository (SCARAB_PLUGIN_ARGOCD_REPO); the plugin runtime runs it in the
-# `scarab-plugins` namespace under the restricted Pod Security profile.
+# Application, for the plugin-resolved gates of ADR-0076. An org admin
+# installs it like any plugin: its manifest from
+# crates/scarab-plugin-argocd/manifest.json at a commit, and this image PINNED
+# BY DIGEST; the plugin runtime runs it in the `scarab-plugins` namespace
+# under the restricted Pod Security profile. .github/workflows/image.yml
+# publishes the default target as ghcr.io/thulasi-ram/scarab-plugin-argocd,
+# with the same tags as the other images.
 #
 # Targets:
 #   (default) `plugin` — the Plugin image. Distroless, uid 65532, nothing

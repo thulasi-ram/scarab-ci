@@ -1,8 +1,11 @@
-# Build (and publish) Scarab's first-party container images, multi-arch:
+# Build (and publish) Scarab's container images, multi-arch:
 #   - scarab-server           (the converged API/worker binary, docker/server/Dockerfile)
 #   - scarab-clone            (the canonical clone step image, ADR-0045)
 #   - scarab-results-sidecar  (the trusted results-egress sidecar, ADR-0042)
 #   - scarab-wsfetch          (the workspace fetcher init container, ADR-0061 s3-feed)
+#   - scarab-plugin-argocd    (the Argo CD plugin, ADR-0072; docker/plugin-argocd/Dockerfile,
+#                              its default `plugin` target. An org admin installs it
+#                              by digest with crates/scarab-plugin-argocd/manifest.json)
 #
 # ⚠ scarab-wsfetch is a temporally-ordered STEPPING STONE (ADR-0061 D2.3): it is
 # eager, and the CSI/FUSE node driver replaces it. git-bug 0628369 closes only
@@ -25,13 +28,13 @@ on:
     tags: ['v*']
   # NO workflow-level `paths:` on purpose. The `changes` job below filters
   # PER IMAGE from `.github/path-filters.yml`; an outer filter would be a SECOND
-  # copy of the same union that has to be kept in step with the four inner ones
+  # copy of the same union that has to be kept in step with the inner ones
   # — and it was already out of step (it never listed `rust-toolchain.toml`,
   # which both cargo-built images read). A docs-only PR now runs one ~15s
   # `changes` job that selects `[]` and builds nothing.
   #
   # `labeled` / `unlabeled` (see ci.yml's trigger note): ci:skip skips every
-  # job on the PR and removing it starts a run; ci:full builds all four images
+  # job on the PR and removing it starts a run; ci:full builds every image
   # and checks the chart whatever the path filters say.
   pull_request:
     types: [opened, synchronize, reopened, labeled, unlabeled]
@@ -58,19 +61,19 @@ jobs:
   # The per-image filters live in `.github/path-filters.yml` — the same file
   # `ci.yml` reads, so "did the UI change?" has one answer in this repo.
   #
-  # ON A PUSH OR A TAG, ALL FOUR GET EVERY TAG. The `edge` / `sha-<sha>` /
+  # ON A PUSH OR A TAG, EVERY IMAGE GETS EVERY TAG. The `edge` / `sha-<sha>` /
   # semver tags are how `just stack up demo-oracle sha-<sha>` and the chart
   # pin a build, and a tag that exists for some images and not others is a trap
   # you only discover in a deploy.
   #
-  # But a push to main no longer REBUILDS all four (Actions minutes are
-  # limited). When the previous main push published `sha-<before>` for all four
-  # images, an image whose inputs did not change since then is RE-TAGGED from
+  # But a push to main no longer REBUILDS every image (Actions minutes are
+  # limited). When the previous main push published `sha-<before>` for every
+  # image, an image whose inputs did not change since then is RE-TAGGED from
   # `sha-<before>` (seconds, no build) and only the changed ones are built. If
   # any `sha-<before>` is missing — that run was cancelled by
   # `cancel-in-progress`, or failed — everything is built, so a skipped change
   # can never be papered over by a stale image. Tags and dispatches always
-  # build all four.
+  # build every image.
   #
   # On a PR with the ci:skip label, or one started by another label's change,
   # this job skips with no runner started, and every job below skips with it.
@@ -126,7 +129,7 @@ jobs:
           done
           exit "$bad"
 
-      # Push to main only: did the previous push publish all four images? Only
+      # Push to main only: did the previous push publish every image? Only
       # then is "unchanged since `before`" a license to re-tag.
       - name: Is the previous main build complete?
         id: prev
@@ -145,7 +148,7 @@ jobs:
             ok=false
           else
             echo "$GH_TOKEN" | docker login "$REGISTRY" -u "$ACTOR" --password-stdin >/dev/null
-            for img in scarab-server scarab-clone scarab-results-sidecar scarab-wsfetch; do
+            for img in scarab-server scarab-clone scarab-results-sidecar scarab-wsfetch scarab-plugin-argocd; do
               if ! docker buildx imagetools inspect "$IMAGE_BASE/$img:sha-$BEFORE" >/dev/null 2>&1; then
                 echo "$img:sha-$BEFORE was never published: building all"
                 ok=false
@@ -168,9 +171,9 @@ jobs:
       - name: Select the images to build
         id: select
         env:
-          ALL: '["scarab-server","scarab-clone","scarab-results-sidecar","scarab-wsfetch"]'
+          ALL: '["scarab-server","scarab-clone","scarab-results-sidecar","scarab-wsfetch","scarab-plugin-argocd"]'
           IS_PR: ${{ github.event_name == 'pull_request' }}
-          # ci:full on a PR: build all four, as an unfiltered run would.
+          # ci:full on a PR: build every image, as an unfiltered run would.
           FULL: ${{ contains(github.event.pull_request.labels.*.name, 'ci:full') }}
           PREV_OK: ${{ steps.prev.outputs.ok == 'true' }}
           BEFORE: ${{ github.event.before }}
@@ -178,6 +181,7 @@ jobs:
           CLONE: ${{ steps.filter.outputs.image_clone }}
           SIDECAR: ${{ steps.filter.outputs.image_results_sidecar }}
           WSFETCH: ${{ steps.filter.outputs.image_wsfetch }}
+          PLUGIN_ARGOCD: ${{ steps.filter.outputs.image_plugin_argocd }}
         run: |
           set -euo pipefail
           retag='[]'
@@ -187,8 +191,10 @@ jobs:
             images=$(jq -cn \
               --arg server "$SERVER" --arg clone "$CLONE" \
               --arg sidecar "$SIDECAR" --arg wsfetch "$WSFETCH" \
+              --arg plugin_argocd "$PLUGIN_ARGOCD" \
               '[ {"scarab-server":$server, "scarab-clone":$clone,
-                  "scarab-results-sidecar":$sidecar, "scarab-wsfetch":$wsfetch}
+                  "scarab-results-sidecar":$sidecar, "scarab-wsfetch":$wsfetch,
+                  "scarab-plugin-argocd":$plugin_argocd}
                  | to_entries[] | select(.value == "true") | .key ]')
             if [ "$IS_PR" != "true" ]; then
               retag=$(jq -cn --argjson all "$ALL" --argjson built "$images" '$all - $built')
@@ -249,6 +255,9 @@ jobs:
             scarab-clone)           ctx=docker/clone     ; df=docker/clone/Dockerfile    ;;
             scarab-results-sidecar) ctx=docker/sidecar   ; df=docker/sidecar/Dockerfile  ;;
             scarab-wsfetch)         ctx=.                ; df=docker/wsfetch/Dockerfile  ;;
+            # The default target, `plugin`: the Dockerfile's `fake` stage (a
+            # fake Argo CD for tests) is never built or pushed here.
+            scarab-plugin-argocd)   ctx=.                ; df=docker/plugin-argocd/Dockerfile ;;
             *)
               echo "::error::unmapped image '$IMAGE' — add it to this case AND to .github/path-filters.yml"
               exit 1

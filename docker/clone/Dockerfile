@@ -1,7 +1,7 @@
 # The scarab-clone image (ADR-0045, ADR-0076 §9): git + git-lfs + the tmpfs
-# askpass helper + the pre-snapshot config-scrub guard. The first-party clone
-# library (libs/clone.yaml) pins it by digest; its Step is the one an org
-# trusts with a long-lived forge token, because this image keeps .git/config
+# askpass helper + the pre-snapshot config-scrub guard. Scarab's clone library
+# (libs/clone.yaml) pins it by digest. An org that trusts the library's source
+# gives its Step a long-lived forge token; this image keeps .git/config
 # credential-free and reads the token only from the mounted file.
 #
 # Non-root and minimal per the ADR-0039 restricted baseline: uid 65532, no

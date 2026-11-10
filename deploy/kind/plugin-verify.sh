@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
 # The Argo CD plugin pass of `just test e2e` (deploy/kind/e2e.sh runs it): the
-# first-party Argo CD Plugin on a REAL cluster (ADR-0072), on the kind release
-# in its e2e mode, which e2e.sh brought up with plugins on and the dev tag knob:
+# Argo CD Plugin on a REAL cluster (ADR-0072), on the kind release in its e2e
+# mode, which e2e.sh brought up with plugins on and the dev tag knob:
 #
 #   build the plugin image → kind load → a fake Argo CD on the host (the
 #   broker, in the server Pod, reads it at the host address a Pod reaches) →
-#   install the plugin through the API → bind its connection → wait for the
+#   install the plugin through the API as an org admin installs any plugin:
+#   read its manifest from `<org>/scarab-libs` on the in-cluster Forgejo
+#   (forgejo.sh seeds it from crates/scarab-plugin-argocd/manifest.json, naming
+#   the local image repository instead of the published one)
+#   through the org's connection (libs.sh), then install with that manifest's
+#   hash → bind its connection → wait for the
 #   isolation probe and the Pod →
 #   wait until the Pod has read Argo CD through the broker's read proxy (its
 #   standby check) → a Pod that is no plugin workload cannot reach the broker
@@ -38,10 +43,16 @@ root="$(cd "$here/../.." && pwd)"
 . "$here/test-env.sh"
 
 org="${PLUGIN_VERIFY_ORG:-acme}"
-# The repository e2e.sh allowed in the release's values (plugins.argocdRepo).
+# A tag, not a digest: kind images have no repository digest, and e2e.sh
+# turns on the dev knob that admits a tag for any plugin.
 repo="${PLUGIN_VERIFY_REPO:-scarab.local/scarab-plugin-argocd}"
 image="$repo:verify"
 state="$here/.state"
+# The manifest's copy on the in-cluster Forgejo, at the commit forgejo.sh
+# seeded (an org reads its own repositories through its own connection).
+libs_commit="$(cat "$state/libs/$org.commit" 2>/dev/null || true)"
+forgejo_host="scarab-forgejo.$ns.svc.cluster.local"
+manifest_source="$forgejo_host/$org/scarab-libs//argocd/manifest.json@$libs_commit"
 
 need docker; need kind; need kubectl; need curl; need python3; need cargo
 
@@ -124,9 +135,18 @@ fake_for_server="http://$pod_host:$fake_port"
 
 # --- 4. install and bind -------------------------------------------------------
 name="argo-$(date +%s)"
-step "installing the plugin as $org/$name"
+[ -n "$libs_commit" ] || fail "forgejo.sh seeded no $org/scarab-libs; run this through \`just test e2e\`"
+# The e2e cases before this pass reclaim every connection to the in-cluster
+# Forgejo, so the org's connection is made here.
+manifest_conn="$(bash "$here/libs.sh" connection "$org")" || fail "making $org's Forgejo connection"
+step "reading the plugin manifest from $manifest_source"
+fetched="$(curl -sf -X POST "$api/v1/orgs/$org/plugin-fetch" -H 'content-type: application/json' \
+  -d '{"source":"'"$manifest_source"'","connection":"'"$manifest_conn"'"}')" || fail "fetching the manifest refused"
+sha="$(echo "$fetched" | json 'd["manifest_sha256"]')"
+[ "$(echo "$fetched" | json 'd["manifest"]["plugin"]')" = argocd ] || fail "the manifest is not argocd's"
+step "installing the plugin as $org/$name (manifest $sha)"
 installed="$(curl -sf -X POST "$api/v1/orgs/$org/plugins" -H 'content-type: application/json' \
-  -d '{"name":"'"$name"'","plugin":"argocd","image":"'"$image"'"}')" \
+  -d '{"name":"'"$name"'","image":"'"$image"'","source":"'"$manifest_source"'","connection":"'"$manifest_conn"'","manifest_sha256":"'"$sha"'"}')" \
   || fail "install refused"
 id="$(echo "$installed" | json 'd["id"]')"
 echo "    installation id $id (ServiceAccount plugin-$id)"

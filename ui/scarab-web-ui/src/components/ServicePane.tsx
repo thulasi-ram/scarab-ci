@@ -58,7 +58,7 @@ export default function ServicePane(props: { runId: string; service: DagService 
           <span class="svc-readout-ports mono">port {props.service.ports!.join(", ")}</span>
         </Show>
         <span class="grow1" />
-        <span class="svc-readout-hint">live logs</span>
+        <span class="svc-readout-hint">Live logs</span>
       </div>
 
       {/* Best-effort live log tail. */}

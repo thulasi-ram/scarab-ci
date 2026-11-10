@@ -630,12 +630,15 @@ mod tests {
             image: format!("ghcr.io/acme/argocd@sha256:{}", "a".repeat(64)),
             manifest: PluginManifest {
                 plugin: "argocd".into(),
+                image: None,
                 capabilities: vec![PluginCapability::UseConnection],
                 connections: vec![],
                 config_keys: vec!["ARGOCD_UI_URL".into()],
                 gates: Default::default(),
             },
             manifest_sha256: "f".repeat(64),
+            source: None,
+            source_connection: None,
             config: BTreeMap::from([(
                 "ARGOCD_UI_URL".to_string(),
                 "https://argo.example".to_string(),

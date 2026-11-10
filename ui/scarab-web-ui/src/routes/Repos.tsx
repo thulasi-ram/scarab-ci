@@ -1,6 +1,6 @@
 // Dashboard — the engineer's landing tier, driven by the real API:
 // (1) an ACTION INBOX of suspended runs (a gate is holding them until someone
-// decides); (2) RECENTLY VISITED repos (browser-local, ADR-0046) as status
+// decides); (2) RECENTLY VISITED repos (browser-local) as status
 // cards, each with a rounded pass/fail bar strip of its last runs; (3) the full
 // repo list, most-recently-active first, with a search for orgs with many repos.
 // The old flat activity table is gone — recency now lives on the repo cards.
@@ -14,6 +14,9 @@ import {
   type RunSummary,
 } from "../api/client";
 import { getVisited } from "../visited";
+import { me } from "../session";
+import { addConnectionHref } from "../settings-nav";
+import { orgPageHref } from "../org-page";
 import { inboxDetail, inboxRuns, inboxVerb } from "../gates";
 import { relTime, absTime } from "../fmt";
 import Icon from "../components/Icon";
@@ -24,6 +27,48 @@ import dungroller from "../../../brand/ascii/generated/dungroller-bare.json";
 const runHref = (r: RunSummary) => `/${r.org ?? "api"}/${r.project ?? "unknown"}/runs/${r.id}`;
 const tenant = (r: RunSummary) => (r.org && r.project ? `${r.org}/${r.project}` : null);
 const shortId = (id: string) => id.slice(0, 8);
+
+// The empty repo list: where repositories come from. An org admin enables
+// them on the org's page; with no org yet, a global admin connects a forge on
+// New organization (the one place a first connection is added). So this links
+// there and offers no form of its own.
+function NoRepos() {
+  const orgs = () => (me()?.can_administer ? me()!.admin_orgs : []);
+  const connect = () => (me() ? addConnectionHref(me()!) : null);
+  return (
+    <>
+      No repositories enabled yet.{" "}
+      <Show
+        when={orgs().length > 0}
+        fallback={
+          <Show
+            when={connect()}
+            fallback="An organization admin enables them on the organization's page."
+          >
+            {(h) => (
+              <>
+                <A href={h()}>Connect a forge</A> to bring them in.
+              </>
+            )}
+          </Show>
+        }
+      >
+        Enable them on the page of{" "}
+        <For each={orgs()}>
+          {(o, i) => (
+            <>
+              {i() > 0 ? ", " : ""}
+              <A href={orgPageHref(o)} class="mono">
+                {o}
+              </A>
+            </>
+          )}
+        </For>
+        .
+      </Show>
+    </>
+  );
+}
 
 // One "recently visited" status card: the repo's last runs as a pass/fail strip.
 function RepoStatusCard(props: { p: Project }) {
@@ -128,7 +173,7 @@ export default function Repos() {
             }
           >
             <div class="dash-label">
-              waiting on you <span class="count">· {inbox().length}</span>
+              Waiting on you <span class="count">· {inbox().length}</span>
             </div>
             <div class="inbox">
               <For each={inbox()}>
@@ -163,7 +208,7 @@ export default function Repos() {
           {/* ── Recently visited (status cards with pass/fail strip) ──────────── */}
           <Show when={visited().length > 0}>
             <div class="dash-label">
-              {usingFallback() ? "most active" : "recently visited"}
+              {usingFallback() ? "Most active" : "Recently visited"}
               <span class="count">· {visited().length}</span>
             </div>
             <div class="rcard-grid">
@@ -173,7 +218,7 @@ export default function Repos() {
 
           {/* ── All repos (recency-sorted, searchable) ───────────────────────── */}
           <div class="dash-label repos-label">
-            repos <span class="count">· {projects()?.length ?? 0}</span>
+            Repos <span class="count">· {projects()?.length ?? 0}</span>
             <Show when={(projects()?.length ?? 0) > 6}>
               <div class="repo-search">
                 <Icon icon="search" size={13} />
@@ -188,7 +233,7 @@ export default function Repos() {
           </div>
           <Show
             when={filtered().length > 0}
-            fallback={<p class="empty">{query() ? "No repos match." : "No repos registered yet."}</p>}
+            fallback={<p class="empty">{query() ? "No repos match." : <NoRepos />}</p>}
           >
             <div class="repo-list">
               <For each={filtered()}>
@@ -198,9 +243,18 @@ export default function Repos() {
                     <span class="repo-name">
                       <span class="repo-org">{p.org} /</span> {p.project}
                     </span>
-                    <span class="rr-coord mono">
-                      {p.owner}/{p.name}
-                    </span>
+                    {/* The forge repo the project is bound to; only worth a
+                        second line when it is not named like the project. */}
+                    <Show
+                      when={
+                        `${p.owner}/${p.name}`.toLowerCase() !==
+                        `${p.org}/${p.project}`.toLowerCase()
+                      }
+                    >
+                      <span class="rr-coord mono">
+                        {p.owner}/{p.name}
+                      </span>
+                    </Show>
                     <span class="rr-when mono">
                       {p.last_run_at ? relTime(p.last_run_at) : "never run"}
                     </span>

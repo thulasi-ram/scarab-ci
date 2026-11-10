@@ -9,35 +9,38 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use scarab_pipeline::InstalledLibrary;
 use scarab_policy::library::{
-    DefaultsState, LibraryInstallation, LibraryStore, LibraryStoreError, LibraryVersion,
-    LibraryYank, NewInstallation, OrgLibraryDefaults, Replaces, TrustedSource,
+    LibraryInstallation, LibraryStore, LibraryStoreError, LibraryVersion, LibraryYank,
+    NewInstallation, Replaces, TrustedSource,
 };
 
 #[derive(Default)]
 struct State {
     /// (org, hash) → version.
     versions: BTreeMap<(String, String), LibraryVersion>,
-    /// (org, publisher, name) → installation, without the version's fields.
-    installations: BTreeMap<(String, String, String), NewInstallation>,
+    /// (org, publisher, name) → the installation's id and the installation,
+    /// without the version's fields.
+    installations: BTreeMap<(String, String, String), (String, NewInstallation)>,
+    /// How many ids were minted: the next id is this, in 10 hex. Postgres
+    /// mints random ids; a fake needs only distinct ones.
+    minted: u64,
     /// (org, hash) → yank.
     yanks: BTreeMap<(String, String), LibraryYank>,
     /// (org, hash) of every version installed at least once.
     installed_once: BTreeSet<(String, String)>,
-    defaults: BTreeMap<String, OrgLibraryDefaults>,
     /// (org, source) → trust.
     trusted: BTreeMap<(String, String), TrustedSource>,
 }
 
 impl State {
-    fn full(&self, i: &NewInstallation) -> LibraryInstallation {
+    fn full(&self, (id, i): &(String, NewInstallation)) -> LibraryInstallation {
         let v = &self.versions[&(i.org.clone(), i.content_hash.clone())];
         LibraryInstallation {
+            id: id.clone(),
             org: i.org.clone(),
             publisher: i.publisher.clone(),
             name: i.name.clone(),
             content_hash: i.content_hash.clone(),
             source: v.source.clone(),
-            first_party: v.first_party,
             installed_by: i.installed_by.clone(),
             installed_at: i.installed_at,
             step_up_ref: i.step_up_ref.clone(),
@@ -53,22 +56,6 @@ pub struct InMemoryLibraries {
 impl InMemoryLibraries {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Marks `org` as having had repos bound before libraries existed, as
-    /// migration 0071 does for every org in `forge_repos`.
-    pub fn with_offered_org(self, org: &str) -> Self {
-        self.state.lock().unwrap().defaults.insert(
-            org.to_string(),
-            OrgLibraryDefaults {
-                org: org.to_string(),
-                state: DefaultsState::Offered,
-                missing: Vec::new(),
-                mirror: None,
-                updated_at: 0,
-            },
-        );
-        self
     }
 }
 
@@ -108,7 +95,10 @@ impl LibraryStore for InMemoryLibraries {
             return Err(LibraryStoreError::UnknownVersion(new.content_hash.clone()));
         }
         let key = (new.org.clone(), new.publisher.clone(), new.name.clone());
-        let current = st.installations.get(&key).map(|i| i.content_hash.clone());
+        let current = st
+            .installations
+            .get(&key)
+            .map(|(_, i)| i.content_hash.clone());
         let ok = match replaces {
             Replaces::Nothing => current.is_none(),
             Replaces::Version(h) => current.as_deref() == Some(h.as_str()),
@@ -116,10 +106,19 @@ impl LibraryStore for InMemoryLibraries {
         if !ok {
             return Err(LibraryStoreError::Conflict);
         }
-        st.installations.insert(key, new.clone());
+        // An upgrade keeps the installation's id; a first install mints one.
+        let id = match st.installations.get(&key) {
+            Some((id, _)) => id.clone(),
+            None => {
+                st.minted += 1;
+                format!("{:010x}", st.minted)
+            }
+        };
+        let row = (id, new.clone());
+        st.installations.insert(key, row.clone());
         st.installed_once
             .insert((new.org.clone(), new.content_hash.clone()));
-        Ok(st.full(new))
+        Ok(st.full(&row))
     }
 
     async fn installation(
@@ -157,7 +156,7 @@ impl LibraryStore for InMemoryLibraries {
             .installations
             .iter()
             .filter(|((o, _, _), _)| o == org)
-            .map(|((_, p, n), i)| {
+            .map(|((_, p, n), (_, i))| {
                 let v = &st.versions[&(i.org.clone(), i.content_hash.clone())];
                 (
                     format!("{p}/{n}"),
@@ -259,37 +258,6 @@ impl LibraryStore for InMemoryLibraries {
             .filter(|y| y.org == org && content_hashes.contains(&y.content_hash))
             .cloned()
             .collect())
-    }
-
-    async fn claim_defaults(&self, org: &str, at: i64) -> Result<bool, LibraryStoreError> {
-        let mut st = self.state.lock().unwrap();
-        if st.defaults.contains_key(org) {
-            return Ok(false);
-        }
-        st.defaults.insert(
-            org.to_string(),
-            OrgLibraryDefaults {
-                org: org.to_string(),
-                state: DefaultsState::Pending,
-                missing: Vec::new(),
-                mirror: None,
-                updated_at: at,
-            },
-        );
-        Ok(true)
-    }
-
-    async fn defaults(&self, org: &str) -> Result<Option<OrgLibraryDefaults>, LibraryStoreError> {
-        Ok(self.state.lock().unwrap().defaults.get(org).cloned())
-    }
-
-    async fn set_defaults(&self, d: &OrgLibraryDefaults) -> Result<(), LibraryStoreError> {
-        self.state
-            .lock()
-            .unwrap()
-            .defaults
-            .insert(d.org.clone(), d.clone());
-        Ok(())
     }
 
     async fn trusted_sources(&self, org: &str) -> Result<Vec<TrustedSource>, LibraryStoreError> {

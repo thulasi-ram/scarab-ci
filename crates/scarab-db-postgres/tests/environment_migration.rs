@@ -14,20 +14,19 @@
 //!   c-min Environment keeps its description;
 //! - eligibility is definers ∪ run-referencers, and "all projects" for a name
 //!   no Project defined (referenced-only, or c-min only);
-//! - the split report lists merged, all-projects, and single-definer-plus-
-//!   referencer names, nothing else;
 //! - the second run changes nothing — and the function is gone from the
-//!   migrated schema (it is re-created here from the migration's own text).
+//!   migrated schema (it is re-created here from the migration's own text);
+//! - migration 0088 then drops the legacy rows and the report 0057 wrote,
+//!   and leaves what 0057 made from them.
 
 mod common;
 
 use common::fresh_db;
 use scarab_db_postgres::{PostgresDb, MIGRATOR};
 use scarab_project::{
-    migrate_legacy_environment, EnvironmentGovernanceStore, EnvironmentProjectEligibility,
-    EnvironmentProtectionRules,
+    migrate_legacy_environment, Environment, EnvironmentGovernanceStore,
+    EnvironmentProjectEligibility, EnvironmentProtectionRules, ProtectionRules,
 };
-use scarab_testkit::legacy_environments::legacy_project_environment;
 use sqlx::{PgPool, Row};
 
 /// The legacy corpus: `(org, project, name, protection JSON)`, the JSON in
@@ -259,7 +258,6 @@ async fn governance_snapshot(pool: &PgPool) -> Vec<String> {
             "environment_project_privilege_grants",
             "org, environment, project",
         ),
-        ("environment_migration_report", "org, environment"),
     ] {
         let rows = sqlx::query(&format!(
             "SELECT row_to_json(t)::text AS r FROM {table} t ORDER BY {order}"
@@ -301,29 +299,80 @@ async fn backfill_reproduces_the_pure_migration_and_is_a_no_op_the_second_time()
         "a second backfill changes nothing"
     );
 
-    // The store below reads today's schema (0079 adds the approval gate
-    // settings, 0080 the display name).
-    apply_after(&pool, 57).await;
-    let db = PostgresDb::with_pool(pool.clone());
+    // 0057 renamed the legacy rows and left them as they were; read them as
+    // legacy rules before migration 0088 drops them.
+    let mut legacy_rows = Vec::new();
+    for row in sqlx::query(
+        "SELECT org, project, name, protection FROM legacy_project_environments
+         ORDER BY org, project, name",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap()
+    {
+        let protection: ProtectionRules =
+            serde_json::from_value(row.get::<serde_json::Value, _>("protection"))
+                .expect("legacy rules deserialise");
+        legacy_rows.push((
+            row.get::<String, _>("org"),
+            row.get::<String, _>("project"),
+            Environment {
+                name: row.get::<String, _>("name"),
+                protection,
+            },
+        ));
+    }
+    assert_eq!(legacy_rows.len(), corpus().len());
 
-    // The legacy rows are frozen, not dropped, and still read as legacy rules.
-    let legacy_rows: i64 = sqlx::query_scalar("SELECT count(*) FROM legacy_project_environments")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(legacy_rows, corpus().len() as i64);
+    // The store below reads today's schema (0079 adds the approval gate
+    // settings, 0080 the display name), and 0088 drops the legacy rows, the
+    // report and the approval history.
+    apply_after(&pool, 57).await;
+    for gone in [
+        "legacy_project_environments",
+        "environment_migration_report",
+        "deployments",
+    ] {
+        let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+            .bind(gone)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(!exists, "0088 drops {gone}");
+    }
+    let db = PostgresDb::with_pool(pool.clone());
+    // Migration 0093 stores approvers as Principal ids (placeholders for
+    // these names nobody signed in as); `principals` maps each back to the
+    // name the pure migration kept (ADR-0080 §6).
+    let handles = |ids: Vec<String>| {
+        let pool = pool.clone();
+        async move {
+            let mut out = Vec::with_capacity(ids.len());
+            for id in ids {
+                out.push(
+                    sqlx::query_scalar::<_, String>("SELECT handle FROM principals WHERE id = $1")
+                        .bind(&id)
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap_or(id),
+                );
+            }
+            out
+        }
+    };
 
     // Every legacy row → exactly the pure migration of it.
-    for (org, project, name, _) in corpus() {
-        let legacy = legacy_project_environment(&pool, org, project, name)
-            .await
-            .expect("legacy row readable");
-        let (want_overlay, want_grant) = migrate_legacy_environment(org, project, &legacy);
-        let g = db
+    for (org, project, legacy) in &legacy_rows {
+        let (org, project, name) = (org.as_str(), project.as_str(), legacy.name.as_str());
+        let (want_overlay, want_grant) = migrate_legacy_environment(org, project, legacy);
+        let mut g = db
             .deploy_governance(org, project, name)
             .await
             .unwrap()
             .unwrap_or_else(|| panic!("{org}/{name} has an org Environment"));
+        if let Some(o) = g.overlay.as_mut() {
+            o.rules.approvers = handles(std::mem::take(&mut o.rules.approvers)).await;
+        }
         assert!(g.eligible, "{org}/{project} stays eligible for {name}");
         assert_eq!(
             g.overlay,
@@ -368,7 +417,7 @@ async fn backfill_reproduces_the_pure_migration_and_is_a_no_op_the_second_time()
         .unwrap()
         .unwrap();
     assert_eq!(
-        carol.overlay.unwrap().rules.approvers,
+        handles(carol.overlay.unwrap().rules.approvers).await,
         vec!["carol".to_string(), "carol".to_string()]
     );
 
@@ -443,50 +492,6 @@ async fn backfill_reproduces_the_pure_migration_and_is_a_no_op_the_second_time()
     assert_eq!(
         environment("preview").await.updated_by,
         "migration:adr-0071"
-    );
-
-    // The split report: merged names, all-projects names, and a single
-    // definer with a run-referencer — nothing else (`release`, `globex/prod`:
-    // one definer, no referencer).
-    let report = sqlx::query(
-        "SELECT org, environment, merged_projects, referenced_only, referencing_projects
-         FROM environment_migration_report ORDER BY org, environment",
-    )
-    .fetch_all(&pool)
-    .await
-    .unwrap()
-    .iter()
-    .map(|r| {
-        (
-            r.get::<String, _>("org"),
-            r.get::<String, _>("environment"),
-            r.get::<Vec<String>, _>("merged_projects"),
-            r.get::<bool, _>("referenced_only"),
-            r.get::<Vec<String>, _>("referencing_projects"),
-        )
-    })
-    .collect::<Vec<_>>();
-    let s = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<Vec<_>>();
-    assert_eq!(
-        report,
-        vec![
-            ("acme".into(), "preview".into(), s(&[]), true, s(&["docs"])),
-            (
-                "acme".into(),
-                "prod".into(),
-                s(&["api", "web"]),
-                false,
-                s(&["mobile"])
-            ),
-            ("acme".into(), "sandbox".into(), s(&[]), true, s(&[])),
-            (
-                "acme".into(),
-                "staging".into(),
-                s(&["web"]),
-                false,
-                s(&["ops"])
-            ),
-        ]
     );
 
     tdb.cleanup().await;

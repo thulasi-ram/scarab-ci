@@ -1,4 +1,4 @@
-//! The first-party Argo CD Plugin (ADR-0072).
+//! The Argo CD Plugin (ADR-0072).
 //!
 //! It runs in its own Pod in the `scarab-plugins` namespace and can reach
 //! only the CredentialBroker. It reads Argo CD through the broker's read

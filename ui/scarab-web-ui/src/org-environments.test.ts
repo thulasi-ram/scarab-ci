@@ -1,7 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { decodeParam } from "./settings-nav";
 import {
-  approvalGateFacts,
   blockerLines,
   cascadeDeleteLabel,
   confirmsName,
@@ -13,7 +12,6 @@ import {
   copiedSummary,
   displayNameError,
   duplicateChecklist,
-  environmentEditHref,
   environmentLabel,
   environmentHref,
   environmentsHref,
@@ -99,7 +97,7 @@ describe("duplicate", () => {
       projects_with_runs: ["checkout", "web"],
       old_oidc_subject: "scarab:org/acme/repo/*/env/prod/ref/*",
       new_oidc_subject: "scarab:org/acme/repo/*/env/prod-eu/ref/*",
-      notes: ["Run and approval history and the Cache stay with prod, which is not changed and stays until an admin deletes it."],
+      notes: ["Run history, approvals included, and the Cache stay with prod, which is not changed and stays until an admin deletes it."],
     },
   };
 
@@ -144,21 +142,23 @@ describe("nameError", () => {
 });
 
 describe("environment pages", () => {
-  it("put the name in one encoded segment under the Environments section", () => {
+  it("put the name in one encoded segment before a static manage segment", () => {
     expect(environmentsHref("acme")).toBe("/orgs/acme/settings/environments");
-    expect(environmentHref("acme", "prod")).toBe("/orgs/acme/settings/environments/prod");
-    expect(environmentEditHref("acme", "prod")).toBe("/orgs/acme/settings/environments/prod/edit");
-    // A name with `/` or a space stays one segment: five for the view, six
-    // for the edit page, whatever the name holds.
-    const view = environmentHref("acme", "prod/eu west");
-    expect(view).toBe("/orgs/acme/settings/environments/prod%2Feu%20west");
-    expect(view.split("/").filter(Boolean)).toHaveLength(5);
-    expect(environmentEditHref("acme", "edit").split("/").filter(Boolean)).toHaveLength(6);
+    expect(environmentHref("acme", "prod")).toBe("/orgs/acme/settings/environments/prod/manage");
+    // A name with `/` or a space stays one segment: six, whatever the name
+    // holds, including names that look like the page's own segments.
+    const page = environmentHref("acme", "prod/eu west");
+    expect(page).toBe("/orgs/acme/settings/environments/prod%2Feu%20west/manage");
+    for (const n of ["prod/eu west", "edit", "manage"]) {
+      const parts = environmentHref("acme", n).split("/").filter(Boolean);
+      expect(parts, n).toHaveLength(6);
+      expect(parts[5], n).toBe("manage");
+    }
   });
 
   it("read back the exact name from the route param", () => {
-    for (const n of ["prod", "prod/eu west", "100%", "Prod-EU", "edit"]) {
-      const seg = environmentHref("acme", n).split("/").pop()!;
+    for (const n of ["prod", "prod/eu west", "100%", "Prod-EU", "edit", "manage"]) {
+      const seg = environmentHref("acme", n).split("/").at(-2)!;
       expect(decodeParam(seg)).toBe(n);
     }
     // A malformed escape is taken as typed rather than throwing.
@@ -431,27 +431,6 @@ describe("durationText", () => {
     expect(durationText(5400)).toBe("1 hour 30 minutes");
     expect(durationText(45)).toBe("45 seconds");
     expect(durationText(90061)).toBe("25 hours 1 minute");
-  });
-});
-
-describe("approvalGateFacts", () => {
-  it("says every approver, or n of m", () => {
-    const facts = (g: Parameters<typeof approvalGateFacts>[0], n: number) =>
-      Object.fromEntries(approvalGateFacts(g, n).map((f) => [f.label, f.value]));
-    expect(facts(null, 2)).toEqual({
-      "missing gate": "add an approval gate to the run",
-      "approvals needed": "every approver",
-      "added gate expiry": "none: waits for a decision",
-      "max approval age": "24 hours",
-    });
-    expect(
-      facts({ missing_gate_mode: "refuse", required_approvals: 1, added_gate_expiry_s: 7200, max_approval_age_s: 3600 }, 3),
-    ).toEqual({
-      "missing gate": "refuse the run",
-      "approvals needed": "1 of 3",
-      "added gate expiry": "2 hours",
-      "max approval age": "1 hour",
-    });
   });
 });
 

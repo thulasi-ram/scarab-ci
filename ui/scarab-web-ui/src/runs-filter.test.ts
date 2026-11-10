@@ -71,4 +71,9 @@ describe("refused rows in the Runs list", () => {
     expect(ids(mergeRefused(runs, refused, { ...base, runOnly: true }))).toEqual(["r2", "r1"]);
     expect(barePipeline(".scarab/ci.yml")).toBe("ci");
   });
+
+  it("keeps only refused cron triggers under the scheduled filter", () => {
+    const withCron = [{ ...refused[0]!, trigger_kind: "cron" }, { ...refused[1]!, trigger_kind: "push" }];
+    expect(ids(mergeRefused(runs, withCron, { ...base, scheduled: true }))).toEqual(["x3", "r2", "r1"]);
+  });
 });

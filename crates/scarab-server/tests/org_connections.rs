@@ -133,6 +133,16 @@ async fn harness(forge: FakeForge) -> Harness {
         .await
         .unwrap();
     }
+    rbac.grant(
+        &Binding {
+            subject: "acme-reader".into(),
+            scope: Scope::Org("acme".into()),
+            role: Role::Viewer,
+        },
+        BindingOrigin::Native,
+    )
+    .await
+    .unwrap();
     let tokens = Arc::new(InMemoryApiTokens::new());
     tokens
         .put(
@@ -156,6 +166,7 @@ async fn harness(forge: FakeForge) -> Harness {
 
     let person = |subject: &str, roles: Vec<Role>| Principal {
         subject: subject.into(),
+        handle: String::new(),
         display_name: None,
         roles,
     };
@@ -163,6 +174,7 @@ async fn harness(forge: FakeForge) -> Harness {
         FakeAuthenticator::new()
             .with_credential("root-code", person("root", vec![Role::Owner]))
             .with_credential("acme-code", person("acme-admin", vec![]))
+            .with_credential("acme-reader-code", person("acme-reader", vec![]))
             .with_credential("globex-code", person("globex-admin", vec![])),
     );
     let logs = Arc::new(LogService::new(
@@ -523,9 +535,10 @@ async fn a_bind_refuses_a_repo_the_connections_org_does_not_own() {
     );
 }
 
-/// Re-sync binds what the credential reaches, but only the connection's own
-/// Org's repos, and never moves a repo bound through another Org's
-/// connection. An unassigned connection binds nothing on a re-sync.
+/// Re-sync reports what the credential reaches as available, but only the
+/// connection's own Org's repos, binds none of them, and never moves a repo
+/// bound through another Org's connection. An unassigned connection reports
+/// nothing available on a re-sync.
 #[tokio::test]
 async fn resync_never_binds_or_moves_another_orgs_repo() {
     let h = harness(forge()).await;
@@ -533,7 +546,12 @@ async fn resync_never_binds_or_moves_another_orgs_repo() {
 
     let (st, b) = call(&h, "POST", "/v1/connections/gh-acme/resync", &root, None).await;
     assert_eq!(st, StatusCode::OK, "{b}");
-    assert_eq!(b["bound"], serde_json::json!(["acme/api"]));
+    assert_eq!(b["available"], serde_json::json!(["acme/api"]));
+    assert_eq!(b["moved"], serde_json::json!([]));
+    assert!(
+        h.db.resolve(&repo("acme", "api")).await.unwrap().is_none(),
+        "available is not enabled"
+    );
     let mut skipped: Vec<&str> = b["skipped"]
         .as_array()
         .unwrap()
@@ -549,7 +567,6 @@ async fn resync_never_binds_or_moves_another_orgs_repo() {
     assert_eq!(st, StatusCode::OK, "{b}");
     for (r, holder) in [
         (repo("acme", "web"), "gh-acme"),
-        (repo("acme", "api"), "gh-acme"),
         (repo("globex", "site"), "fj-globex"),
     ] {
         assert_eq!(
@@ -580,7 +597,8 @@ async fn an_unassigned_connection_is_not_assigned_or_bound_by_a_resync() {
 
     let (st, b) = call(&h, "POST", "/v1/connections/gh-legacy/resync", &root, None).await;
     assert_eq!(st, StatusCode::OK, "{b}");
-    assert_eq!(b["bound"], serde_json::json!([]));
+    assert_eq!(b["available"], serde_json::json!([]));
+    assert_eq!(b["moved"], serde_json::json!([]));
     let mut skipped: Vec<&str> = b["skipped"]
         .as_array()
         .unwrap()
@@ -816,7 +834,7 @@ async fn removing_a_connection_never_takes_another_orgs_project_with_it() {
     .await;
     assert_eq!(st, StatusCode::OK, "{b}");
     assert!(
-        b["bound"]
+        b["moved"]
             .as_array()
             .unwrap()
             .contains(&serde_json::json!("globex/other")),
@@ -855,7 +873,9 @@ async fn removing_a_connection_never_takes_another_orgs_project_with_it() {
 /// new account (id 2) takes the free login `acme` and installs the App. Its
 /// installation is registered unassigned and binds nothing: the login is
 /// the same, the account is not. The account with id 1 installing again
-/// joins acme. Before the fix any GitHub installation named `acme` joined.
+/// joins acme, and, as every installation now, binds none of its repos: an
+/// admin enables them. Before the fix any GitHub installation named `acme`
+/// joined.
 #[tokio::test]
 async fn an_installation_by_a_new_holder_of_a_renamed_login_does_not_join_its_org() {
     let h = harness(forge()).await;
@@ -881,10 +901,8 @@ async fn an_installation_by_a_new_holder_of_a_renamed_login_does_not_join_its_or
             .unwrap()
             .unwrap();
     assert_eq!(c.org.as_deref(), Some("acme"));
-    assert_eq!(
-        h.db.repos_of("github-install-10").await.unwrap(),
-        vec![repo("acme", "more")]
-    );
+    assert!(h.db.repos_of("github-install-10").await.unwrap().is_empty());
+    assert!(h.db.resolve(&repo("acme", "more")).await.unwrap().is_none());
 }
 
 /// D7 of git-bug 19b0a45, the data-only case. A global admin sets up
@@ -930,4 +948,188 @@ async fn an_installation_does_not_join_an_org_that_only_holds_data() {
             .unwrap()
             .unwrap();
     assert_eq!(c.org.as_deref(), Some("hooli"));
+}
+
+fn names(page: &serde_json::Value) -> Vec<String> {
+    page["repos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// The org's repositories page: every enabled repo and every one its
+/// connections reach that is not enabled, one page at a time. Only the
+/// org's own repos are listed, an admin may act on each row, a reader may
+/// only look, and an admin of another org is refused.
+#[tokio::test]
+async fn the_org_repos_page_lists_enabled_and_available_repos_to_the_orgs_readers() {
+    let h = harness(forge()).await;
+
+    let acme = login(&h.app, "acme-code").await;
+    let (st, page) = call(&h, "GET", "/v1/orgs/acme/repos", &acme, None).await;
+    assert_eq!(st, StatusCode::OK, "{page}");
+    assert_eq!(names(&page), vec!["api", "web"], "sorted by name: {page}");
+    assert_eq!(page["total"], 2);
+    assert_eq!(page["enabled_total"], 1);
+    assert_eq!(page["can_administer"], true);
+    let api = &page["repos"][0];
+    assert_eq!(api["enabled"], false);
+    assert!(api["project"].is_null());
+    assert_eq!(api["connection_id"], "gh-acme");
+    assert_eq!(api["can_change"], true);
+    assert_eq!(api["repo_url"], "https://github.com/acme/api");
+    let web = &page["repos"][1];
+    assert_eq!(web["enabled"], true);
+    assert_eq!(web["project"], "web");
+    assert_eq!(web["can_change"], true);
+    assert_eq!(page["unlisted"], serde_json::json!([]));
+
+    // Paged on the server, and filtered by name before paging.
+    let (_, p2) = call(
+        &h,
+        "GET",
+        "/v1/orgs/acme/repos?per_page=1&page=2",
+        &acme,
+        None,
+    )
+    .await;
+    assert_eq!(names(&p2), vec!["web"]);
+    assert_eq!(p2["total"], 2);
+    assert_eq!(p2["page"], 2);
+    assert_eq!(p2["per_page"], 1);
+    let (_, q) = call(&h, "GET", "/v1/orgs/acme/repos?q=AP", &acme, None).await;
+    assert_eq!(names(&q), vec!["api"]);
+    assert_eq!(q["total"], 1);
+    assert_eq!(
+        q["enabled_total"], 1,
+        "the enabled count ignores the filter"
+    );
+
+    // A reader sees the same list and may act on none of it.
+    let reader = login(&h.app, "acme-reader-code").await;
+    let (st, page) = call(&h, "GET", "/v1/orgs/acme/repos", &reader, None).await;
+    assert_eq!(st, StatusCode::OK, "{page}");
+    assert_eq!(names(&page), vec!["api", "web"]);
+    assert_eq!(page["can_administer"], false);
+    assert!(page["repos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|r| r["can_change"] == false));
+
+    // Another org's admin is refused, by session and by org token.
+    let globex = login(&h.app, "globex-code").await;
+    for bearer in [globex.as_str(), GLOBEX_TOKEN] {
+        let (st, _) = call(&h, "GET", "/v1/orgs/acme/repos", bearer, None).await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+    }
+}
+
+/// `?connection=` narrows the org's repositories page to one connection:
+/// what is enabled through it and what only it reaches. The enabled count
+/// stays the org's. The Connections page links each connection here.
+#[tokio::test]
+async fn the_org_repos_page_filters_by_connection() {
+    let h = harness(forge()).await;
+    // A second acme connection, with a repo of its own.
+    h.db.put_connection(&conn(
+        "fj-acme",
+        ForgeKind::Forgejo,
+        "https://git.acme.test",
+        Some("acme"),
+        None,
+    ))
+    .await
+    .unwrap();
+    h.db.bind_repo("fj-acme", &repo("acme", "infra"), "acme", "infra")
+        .await
+        .unwrap();
+    let acme = login(&h.app, "acme-code").await;
+
+    let (st, page) = call(
+        &h,
+        "GET",
+        "/v1/orgs/acme/repos?connection=fj-acme",
+        &acme,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{page}");
+    // web is enabled through gh-acme, so it is not fj-acme's even though
+    // fj-acme's forge reaches it.
+    assert_eq!(names(&page), vec!["api", "infra"], "{page}");
+    assert!(page["repos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|r| r["connection_id"] == "fj-acme"));
+    assert_eq!(page["total"], 2);
+    assert_eq!(page["enabled_total"], 2, "the org's, whatever the filter");
+
+    let (_, page) = call(
+        &h,
+        "GET",
+        "/v1/orgs/acme/repos?connection=gh-acme",
+        &acme,
+        None,
+    )
+    .await;
+    assert_eq!(names(&page), vec!["api", "web"], "{page}");
+    assert!(page["repos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|r| r["connection_id"] == "gh-acme"));
+
+    // A connection of another org lists nothing of acme's.
+    let (st, page) = call(
+        &h,
+        "GET",
+        "/v1/orgs/acme/repos?connection=fj-globex",
+        &acme,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{page}");
+    assert_eq!(page["total"], 0, "{page}");
+}
+
+/// Disabling a GitHub repo is permanent: the unbind removes its Project, and
+/// neither a later re-sync nor a later delivery of the installation binds
+/// it again. The repo is listed as available instead.
+#[tokio::test]
+async fn a_disabled_repo_stays_disabled_after_a_resync() {
+    let h = harness(forge()).await;
+    let acme = login(&h.app, "acme-code").await;
+
+    let (st, b) = call(
+        &h,
+        "DELETE",
+        "/v1/connections/gh-acme/repos/acme/web",
+        &acme,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT, "{b}");
+
+    let (st, b) = call(&h, "POST", "/v1/connections/gh-acme/resync", &acme, None).await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert!(
+        b["available"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("acme/web")),
+        "{b}"
+    );
+    assert!(h.db.resolve(&repo("acme", "web")).await.unwrap().is_none());
+
+    let (_, page) = call(&h, "GET", "/v1/orgs/acme/repos", &acme, None).await;
+    assert_eq!(page["enabled_total"], 0, "{page}");
+    assert!(page["repos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["name"] == "web" && r["enabled"] == false));
 }

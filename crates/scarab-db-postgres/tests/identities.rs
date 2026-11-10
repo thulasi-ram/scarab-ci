@@ -1,8 +1,9 @@
-//! PG identity store (ADR-0069) against *real* Postgres: a sign-in is pinned
-//! by `(provider, external_id)`, a new identity always mints a NEW Principal,
-//! a minted id is never minted twice, and two racing first sign-ins of one
-//! identity converge on one Principal. Skips cleanly when
-//! `SCARAB_TEST_DATABASE_URL` is unset.
+//! PG identity store (ADR-0069, ADR-0080) against *real* Postgres: a sign-in
+//! is pinned by `(provider, external_id)`, a new identity always mints a NEW
+//! Principal with a new random id, a handle is never minted twice (nor one
+//! that differs only in case), and two racing first sign-ins of one identity
+//! converge on one Principal. Skips cleanly when `SCARAB_TEST_DATABASE_URL`
+//! is unset.
 
 mod common;
 
@@ -10,7 +11,12 @@ use std::sync::Arc;
 
 use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
-use scarab_identity::{IdentityStore, ProviderIdentity};
+use scarab_identity::{is_principal_id, IdentityStore, Placeholder, ProviderIdentity};
+
+/// The handle of Principal `id`.
+async fn handle_of(db: &PostgresDb, id: &str) -> String {
+    db.principal(id).await.unwrap().unwrap().handle
+}
 
 fn ident(external_id: &str, handle: &str) -> ProviderIdentity {
     ProviderIdentity {
@@ -34,19 +40,32 @@ async fn sign_in_pins_by_external_id_and_never_reuses_an_id() {
 
     // First sign-in mints the base id and claims it.
     let alice = db
-        .sign_in(&ident("1001", "alice"), "github:alice", 10)
+        .sign_in(
+            &ident("1001", "alice"),
+            "github:alice",
+            Placeholder::Never,
+            10,
+        )
         .await
-        .unwrap();
-    assert_eq!(alice, "github:alice");
+        .unwrap()
+        .id;
+    assert!(is_principal_id(&alice), "the key is a random id: {alice}");
+    assert_eq!(handle_of(&db, &alice).await, "github:alice");
     let rec = db.principal(&alice).await.unwrap().unwrap();
     assert_eq!(rec.claimed_at, Some(10));
     assert_eq!(rec.display_name.as_deref(), Some("alice (display)"));
 
     // A rename: same external id, new handle → same Principal, handle refreshed.
     let again = db
-        .sign_in(&ident("1001", "alice-renamed"), "github:alice-renamed", 20)
+        .sign_in(
+            &ident("1001", "alice-renamed"),
+            "github:alice-renamed",
+            Placeholder::Never,
+            20,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .id;
     assert_eq!(again, alice);
     let ids = db.identities_of(&alice).await.unwrap();
     assert_eq!(ids.len(), 1);
@@ -60,15 +79,28 @@ async fn sign_in_pins_by_external_id_and_never_reuses_an_id() {
     // A recycled login: the id `github:alice` exists, so the stranger gets the
     // next suffix — even though alice no longer carries that handle.
     let stranger = db
-        .sign_in(&ident("2002", "alice"), "github:alice", 30)
+        .sign_in(
+            &ident("2002", "alice"),
+            "github:alice",
+            Placeholder::Never,
+            30,
+        )
         .await
-        .unwrap();
-    assert_eq!(stranger, "github:alice~2");
+        .unwrap()
+        .id;
+    assert_ne!(stranger, alice);
+    assert_eq!(handle_of(&db, &stranger).await, "github:alice~2");
     let third = db
-        .sign_in(&ident("3003", "alice"), "github:alice", 40)
+        .sign_in(
+            &ident("3003", "alice"),
+            "github:alice",
+            Placeholder::Never,
+            40,
+        )
         .await
-        .unwrap();
-    assert_eq!(third, "github:alice~3");
+        .unwrap()
+        .id;
+    assert_eq!(handle_of(&db, &third).await, "github:alice~3");
 
     // Unknown ids have no record — the store never invents one on read.
     assert_eq!(db.principal("github:nobody").await.unwrap(), None);
@@ -87,9 +119,10 @@ async fn racing_first_sign_ins_of_one_identity_converge_on_one_principal() {
     for _ in 0..16 {
         let db = db.clone();
         tasks.push(tokio::spawn(async move {
-            db.sign_in(&ident("4004", "bob"), "github:bob", 1)
+            db.sign_in(&ident("4004", "bob"), "github:bob", Placeholder::Never, 1)
                 .await
                 .unwrap()
+                .id
         }));
     }
     let mut ids = Vec::new();
@@ -97,13 +130,10 @@ async fn racing_first_sign_ins_of_one_identity_converge_on_one_principal() {
         ids.push(t.await.unwrap());
     }
     ids.dedup();
-    assert_eq!(
-        ids,
-        vec!["github:bob".to_string()],
-        "one identity, one Principal"
-    );
+    assert_eq!(ids.len(), 1, "one identity, one Principal");
+    assert_eq!(handle_of(&db, &ids[0]).await, "github:bob");
     // And the losers' rolled-back mints left no `~N` principals behind.
-    assert_eq!(db.principal("github:bob~2").await.unwrap(), None);
+    assert!(db.by_handle("github:bob~2").await.unwrap().is_empty());
 }
 
 /// An import pins an identity WITHOUT claiming it; the sign-in that presents
@@ -119,19 +149,31 @@ async fn pin_mints_unclaimed_and_sign_in_claims_it() {
     db.migrate().await.unwrap();
 
     let carol = db
-        .pin(&ident("3003", "carol"), "github:carol", 5)
+        .pin(
+            &ident("3003", "carol"),
+            "github:carol",
+            Placeholder::Never,
+            5,
+        )
         .await
-        .unwrap();
-    assert_eq!(carol, "github:carol");
+        .unwrap()
+        .id;
+    assert_eq!(handle_of(&db, &carol).await, "github:carol");
     assert_eq!(
         db.principal(&carol).await.unwrap().unwrap().claimed_at,
         None
     );
     // Re-importing the same account is the same Principal, still unclaimed.
     assert_eq!(
-        db.pin(&ident("3003", "carol"), "github:carol", 6)
-            .await
-            .unwrap(),
+        db.pin(
+            &ident("3003", "carol"),
+            "github:carol",
+            Placeholder::Never,
+            6
+        )
+        .await
+        .unwrap()
+        .id,
         carol
     );
     assert_eq!(
@@ -144,16 +186,28 @@ async fn pin_mints_unclaimed_and_sign_in_claims_it() {
         email_verified: true,
         ..ident("3003", "carol")
     };
-    assert_eq!(db.sign_in(&signed, "github:carol", 7).await.unwrap(), carol);
+    assert_eq!(
+        db.sign_in(&signed, "github:carol", Placeholder::Never, 7)
+            .await
+            .unwrap()
+            .id,
+        carol
+    );
     assert_eq!(
         db.principal(&carol).await.unwrap().unwrap().claimed_at,
         Some(7)
     );
 
     // A later import (no email) refreshes the handle only.
-    db.pin(&ident("3003", "carol-renamed"), "github:carol-renamed", 8)
-        .await
-        .unwrap();
+    db.pin(
+        &ident("3003", "carol-renamed"),
+        "github:carol-renamed",
+        Placeholder::Never,
+        8,
+    )
+    .await
+    .unwrap()
+    .id;
     let held = db.identities_of(&carol).await.unwrap();
     assert_eq!(held[0].handle, "carol-renamed");
     assert_eq!(held[0].email.as_deref(), Some("carol@example.com"));
@@ -190,11 +244,21 @@ async fn link_merges_a_claimed_single_identity_principal_with_its_tokens() {
         provider: "okta".into(),
         ..ident("00u-ada", "ada@example.com")
     };
-    let ada = db.sign_in(&okta, "okta:ada@example.com", 1).await.unwrap();
-    let stray = db
-        .sign_in(&ident("1001", "ada-gh"), "github:ada-gh", 2)
+    let ada = db
+        .sign_in(&okta, "okta:ada@example.com", Placeholder::Never, 1)
         .await
-        .unwrap();
+        .unwrap()
+        .id;
+    let stray = db
+        .sign_in(
+            &ident("1001", "ada-gh"),
+            "github:ada-gh",
+            Placeholder::Never,
+            2,
+        )
+        .await
+        .unwrap()
+        .id;
     ApiTokenStore::put(
         &db,
         &ApiToken {
@@ -220,6 +284,7 @@ async fn link_merges_a_claimed_single_identity_principal_with_its_tokens() {
             id: "stray-session".into(),
             principal: Principal {
                 subject: stray.clone(),
+                handle: String::new(),
                 display_name: None,
                 roles: vec![],
             },
@@ -242,6 +307,7 @@ async fn link_merges_a_claimed_single_identity_principal_with_its_tokens() {
         outcome,
         LinkOutcome::Merged {
             from: stray.clone(),
+            from_handle: "github:ada-gh".into(),
             removed_passkeys: vec![],
         }
     );
@@ -251,7 +317,14 @@ async fn link_merges_a_claimed_single_identity_principal_with_its_tokens() {
         "the token follows the person"
     );
     assert_eq!(SessionStore::get(&db, "stray-session").await.unwrap(), None);
-    assert_eq!(db.aliases_of(&ada).await.unwrap(), vec![stray.clone()]);
+    let aliases: Vec<String> = db
+        .aliases_of(&ada)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|a| a.id)
+        .collect();
+    assert_eq!(aliases, vec![stray.clone()]);
     // Linking it again is a no-op, not a second merge.
     assert_eq!(
         db.link(&ada, &ident("1001", "ada-gh"), 4, &FoldedPasskey::Unproven)
@@ -287,13 +360,15 @@ async fn a_merge_of_a_principal_with_passkeys_needs_one_of_its_passkeys() {
         ..ident("00u-mallory", "mallory@example.com")
     };
     let mallory = db
-        .sign_in(&okta, "okta:mallory@example.com", 1)
+        .sign_in(&okta, "okta:mallory@example.com", Placeholder::Never, 1)
         .await
-        .unwrap();
+        .unwrap()
+        .id;
     let ada = db
-        .sign_in(&ident("1001", "ada"), "github:ada", 2)
+        .sign_in(&ident("1001", "ada"), "github:ada", Placeholder::Never, 2)
         .await
-        .unwrap();
+        .unwrap()
+        .id;
     for (id, owner, cred) in [("pk-m", &mallory, 1u8), ("pk-a", &ada, 2u8)] {
         sqlx::query(
             "INSERT INTO passkeys (id, principal_id, credential_id, public_key_cose, alg,
@@ -322,7 +397,10 @@ async fn a_merge_of_a_principal_with_passkeys_needs_one_of_its_passkeys() {
     ] {
         assert_eq!(
             db.link(&mallory, &gh_ada, 3, &proof).await.unwrap(),
-            LinkOutcome::NeedsFoldedPasskey { from: ada.clone() },
+            LinkOutcome::NeedsFoldedPasskey {
+                from: ada.clone(),
+                from_handle: "github:ada".into(),
+            },
             "{proof:?}"
         );
     }
@@ -334,7 +412,7 @@ async fn a_merge_of_a_principal_with_passkeys_needs_one_of_its_passkeys() {
         ],
         "nothing changed"
     );
-    assert_eq!(db.aliases_of(&mallory).await.unwrap(), Vec::<String>::new());
+    assert!(db.aliases_of(&mallory).await.unwrap().is_empty());
 
     // With a passkey of Ada's: merged, and Ada's passkey is deleted.
     assert_eq!(
@@ -343,6 +421,7 @@ async fn a_merge_of_a_principal_with_passkeys_needs_one_of_its_passkeys() {
             .unwrap(),
         LinkOutcome::Merged {
             from: ada.clone(),
+            from_handle: "github:ada".into(),
             removed_passkeys: vec!["pk-a".into()],
         }
     );
@@ -374,13 +453,15 @@ async fn a_passkey_enrolled_during_a_merge_stops_it() {
         ..ident("00u-mallory", "mallory@example.com")
     };
     let mallory = db
-        .sign_in(&okta, "okta:mallory@example.com", 1)
+        .sign_in(&okta, "okta:mallory@example.com", Placeholder::Never, 1)
         .await
-        .unwrap();
+        .unwrap()
+        .id;
     let ada = db
-        .sign_in(&ident("1001", "ada"), "github:ada", 2)
+        .sign_in(&ident("1001", "ada"), "github:ada", Placeholder::Never, 2)
         .await
-        .unwrap();
+        .unwrap()
+        .id;
     sqlx::query(&format!(
         "CREATE FUNCTION enroll_mid_merge() RETURNS trigger AS $$ BEGIN
            INSERT INTO passkeys (id, principal_id, credential_id, public_key_cose, alg,
@@ -405,9 +486,12 @@ async fn a_passkey_enrolled_during_a_merge_stops_it() {
         db.link(&mallory, &ident("1001", "ada"), 3, &FoldedPasskey::Unproven)
             .await
             .unwrap(),
-        LinkOutcome::NeedsFoldedPasskey { from: ada.clone() }
+        LinkOutcome::NeedsFoldedPasskey {
+            from: ada.clone(),
+            from_handle: "github:ada".into(),
+        }
     );
-    assert_eq!(db.aliases_of(&mallory).await.unwrap(), Vec::<String>::new());
+    assert!(db.aliases_of(&mallory).await.unwrap().is_empty());
     tdb.cleanup().await;
 }
 
@@ -422,8 +506,16 @@ async fn resolve_principal_follows_merges_and_refuses_a_merge_cycle() {
     };
     let db = PostgresDb::with_pool(tdb.pool.clone());
     db.migrate().await.unwrap();
-    let a = db.sign_in(&ident("1", "a"), "github:a", 1).await.unwrap();
-    let b = db.sign_in(&ident("2", "b"), "github:b", 2).await.unwrap();
+    let a = db
+        .sign_in(&ident("1", "a"), "github:a", Placeholder::Never, 1)
+        .await
+        .unwrap()
+        .id;
+    let b = db
+        .sign_in(&ident("2", "b"), "github:b", Placeholder::Never, 2)
+        .await
+        .unwrap()
+        .id;
 
     sqlx::query("UPDATE principals SET merged_into = $2 WHERE id = $1")
         .bind(&a)

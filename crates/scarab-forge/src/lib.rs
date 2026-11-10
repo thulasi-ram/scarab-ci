@@ -1107,6 +1107,11 @@ pub struct ResolvedRepo {
     /// its repo's forge name, 1:1 in v1.
     pub org: String,
     pub project: String,
+    /// Unix-ms since when the serving connection has not reached the repo
+    /// (the GitHub App's installation stopped covering it), or `None`. The
+    /// binding and its Project stay; nothing is read from or posted to the
+    /// forge for it until the mark clears.
+    pub unreachable_since: Option<i64>,
 }
 
 /// What deciding a connection's Org rests on (git-bug 19b0a45), read by
@@ -1268,8 +1273,36 @@ pub trait ForgeConnectionStore: Send + Sync {
     /// Remove a repo binding. Idempotent.
     async fn unbind_repo(&self, connection_id: &str, repo: &RepoRef) -> Result<(), RegistryError>;
 
+    /// Mark `repo`, bound through `connection_id`, unreachable since `at`
+    /// (unix ms): the forge says the connection no longer reaches it. The
+    /// binding and its Project stay. An existing mark keeps its earlier
+    /// time. No-op when the repo is not bound through `connection_id`.
+    async fn mark_repo_unreachable(
+        &self,
+        connection_id: &str,
+        repo: &RepoRef,
+        at: i64,
+    ) -> Result<(), RegistryError>;
+
+    /// Clear the mark [`mark_repo_unreachable`](Self::mark_repo_unreachable)
+    /// set: the forge reaches the repo again. No-op when the repo is not
+    /// bound through `connection_id` or is not marked. A bind
+    /// ([`upsert_repo_binding`](Self::upsert_repo_binding)) clears it too.
+    async fn clear_repo_unreachable(
+        &self,
+        connection_id: &str,
+        repo: &RepoRef,
+    ) -> Result<(), RegistryError>;
+
     /// The repos a connection owns.
     async fn repos_of(&self, connection_id: &str) -> Result<Vec<RepoRef>, RegistryError>;
+
+    /// How many repos a connection owns: [`repos_of`](Self::repos_of)'s
+    /// length, without the list. The connections list shows this count, and
+    /// a connection can hold thousands of repos, so Postgres counts in SQL.
+    async fn repo_count_of(&self, connection_id: &str) -> Result<u64, RegistryError> {
+        Ok(self.repos_of(connection_id).await?.len() as u64)
+    }
 
     /// Resolve a forge coordinate to its owning Project + serving connection —
     /// *which forge, which base URL, which credentials* (ADR-0046). `None` for

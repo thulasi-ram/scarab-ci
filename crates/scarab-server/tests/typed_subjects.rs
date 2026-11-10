@@ -1,5 +1,6 @@
 //! Admin-typed subjects must name a Principal (ADR-0069 §3), through the real
-//! router against *real* Postgres.
+//! router against *real* Postgres. People type handles; what is stored is the
+//! Principal's id, and what is read back is the handle (ADR-0080).
 //!
 //! Before: `put_binding` checked only for an empty string and approver lists
 //! were free text matched by exact equality, so a grant typed for someone who
@@ -35,7 +36,6 @@ fn app(pg: Arc<PostgresDb>) -> axum::Router {
     // what a write may NAME, not who may write.
     router(
         AppState::new(db, Arc::new(FakeClock::new(1_000)), logs)
-            .with_approval_history(pg.clone())
             .with_org_environments(pg.clone())
             .with_environment_governance(pg.clone())
             .with_rbac(pg.clone())
@@ -85,10 +85,17 @@ async fn grants_and_approvers_must_name_an_existing_principal() {
     let app = app(pg.clone());
 
     let alice = pg
-        .sign_in(&github("1001", "alice"), "github:alice", 1)
+        .sign_in(
+            &github("1001", "alice"),
+            "github:alice",
+            scarab_identity::Placeholder::Never,
+            1,
+        )
         .await
         .unwrap();
-    assert_eq!(alice, "github:alice");
+    assert_eq!(alice.handle, "github:alice");
+    let alice = alice.id;
+    assert!(scarab_identity::is_principal_id(&alice), "{alice}");
 
     // A grant to someone who has never signed in is refused, and nothing is
     // written — the string stays unclaimable.
@@ -108,27 +115,58 @@ async fn grants_and_approvers_must_name_an_existing_principal() {
         None
     );
 
-    // A grant to a signed-in Principal lands under its id.
+    // A grant typed as the handle lands under the Principal's id, and the
+    // handle typed in another case names the same one.
     let (status, msg) = send(
         &app,
         "PUT",
         "/v1/orgs/acme/bindings",
-        Some(serde_json::json!({ "subject": "github:alice", "role": "member" })),
+        Some(serde_json::json!({ "subject": "GitHub:Alice", "role": "member" })),
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{msg}");
     assert_eq!(
-        pg.role_of("github:alice", &Scope::Org("acme".into()))
+        pg.role_of(&alice, &Scope::Org("acme".into()))
             .await
             .unwrap(),
         Some(Role::Member)
     );
+    assert_eq!(
+        pg.role_of("github:alice", &Scope::Org("acme".into()))
+            .await
+            .unwrap(),
+        None,
+        "the handle is never a key"
+    );
+    // The listing names the person by id and handle.
+    let (status, body) = send(&app, "GET", "/v1/orgs/acme/bindings", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let listed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(listed[0]["id"], alice.as_str());
+    assert_eq!(listed[0]["handle"], "github:alice");
+    assert_eq!(listed[0]["display_name"], "Alice Liddell");
+    // One member, by id: the member page's read.
+    let (status, body) = send(&app, "GET", &format!("/v1/orgs/acme/members/{alice}"), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let member: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(member["handle"], "github:alice");
+    assert_eq!(member["claimed"], true);
+    assert_eq!(member["bindings"][0]["role"], "member");
+    let (status, _) = send(
+        &app,
+        "GET",
+        "/v1/orgs/acme/members/p_00000000000000000000000000000000",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 
     // A merged id follows to its target (the link/merge flow writes these;
     // staged directly here because that flow is a later slice).
     sqlx::query(
-        "INSERT INTO principals (id, created_at, merged_into) VALUES ('okta:alice', 1, 'github:alice')",
+        "INSERT INTO principals (handle, created_at, merged_into) VALUES ('okta:alice', 1, $1)",
     )
+    .bind(&alice)
     .execute(&tdb.pool)
     .await
     .unwrap();
@@ -144,11 +182,9 @@ async fn grants_and_approvers_must_name_an_existing_principal() {
         org: "acme".into(),
         name: "web".into(),
     };
-    assert_eq!(
-        pg.role_of("github:alice", &web).await.unwrap(),
-        Some(Role::Admin)
-    );
-    assert_eq!(pg.role_of("okta:alice", &web).await.unwrap(), None);
+    assert_eq!(pg.role_of(&alice, &web).await.unwrap(), Some(Role::Admin));
+    let folded = pg.by_handle("okta:alice").await.unwrap()[0].id.clone();
+    assert_eq!(pg.role_of(&folded, &web).await.unwrap(), None);
 
     // Approver lists. The per-repo write that took them is retired (410,
     // ADR-0071); approvers are written on an org Environment's baseline and
@@ -217,10 +253,7 @@ async fn grants_and_approvers_must_name_an_existing_principal() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(
-        stored.overlay.unwrap().rules.approvers,
-        vec!["github:alice"]
-    );
+    assert_eq!(stored.overlay.unwrap().rules.approvers, vec![alice.clone()]);
     assert_eq!(
         pg.get_org_environment("acme", "prod")
             .await
@@ -228,8 +261,13 @@ async fn grants_and_approvers_must_name_an_existing_principal() {
             .unwrap()
             .protection
             .approvers,
-        vec!["github:alice"]
+        vec![alice.clone()]
     );
+    // Read back, the approver is the handle people typed.
+    let (status, body) = send(&app, "GET", baseline, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let read: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(read["approvers"], serde_json::json!(["github:alice"]));
 
     // The typeahead: by handle prefix, by display-name fragment, never merged
     // ids, and LIKE wildcards are literal.
@@ -239,13 +277,14 @@ async fn grants_and_approvers_must_name_an_existing_principal() {
     assert_eq!(
         found,
         serde_json::json!([{
-            "id": "github:alice", "display_name": "Alice Liddell", "claimed": true,
+            "id": alice, "handle": "github:alice", "display_name": "Alice Liddell",
+            "claimed": true,
             "identities": [{ "provider": "github", "handle": "alice" }],
         }])
     );
     let (_, body) = send(&app, "GET", "/v1/orgs/acme/principals?q=Liddell", None).await;
     assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&body).unwrap()[0]["id"],
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()[0]["handle"],
         "github:alice"
     );
     let (_, body) = send(&app, "GET", "/v1/orgs/acme/principals?q=%25", None).await;

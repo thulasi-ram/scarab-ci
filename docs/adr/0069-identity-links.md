@@ -1,7 +1,8 @@
 # 0069. Identity links: one Principal, many provider identities, pinned by immutable id
 
 - **Status:** Accepted. Built on main (PR #10; migration `0052_identity_links.sql`, the
-  `/v1/me/identities/*` routes).
+  `/v1/me/identities/*` routes). §2, §7 and one rejected alternative amended
+  2026-11-10 by [0080](0080-principals-have-an-internal-id.md).
 - **Date:** 2026-10-16
 - **Deciders:** thulasi.ram (architect)
 - **Builds on:** [0049](0049-identity-and-access.md) (authn → `Principal`, native
@@ -82,6 +83,14 @@ fixes `principal_from`'s `v.to_string()`, which keeps the quotes of a string id.
 every login, and used only to mint ids and to display.
 
 ### 2. Principal ids are minted once, readable, then frozen
+
+> **Amended 2026-11-10 by [0080](0080-principals-have-an-internal-id.md).** The
+> readable string this section mints is now the Principal's **handle**: still minted
+> by these rules, unique, frozen, and what people type and read. The stored key is a
+> separate random id (`p_` and 32 hex characters) that every binding, token, approver
+> list and passkey holds, and that new history records. A new handle that equals an
+> existing one ignoring case takes the next `~N`. The reasons below for a readable
+> string still hold for the handle; they do not need it to be the key.
 
 When a Principal is created its id is chosen, and it never changes afterwards:
 
@@ -280,6 +289,12 @@ owners matcher, scoped per provider and gated on `email_verified`.
 
 ### 7. What stays a string
 
+> **Amended 2026-11-10 by [0080](0080-principals-have-an-internal-id.md).** History
+> columns and event `by` fields keep the string they were written with, and new ones
+> record the id; reads accept either. Sessions do not survive the upgrade to migration
+> 0093: they are deleted and everyone signs in again. The Actor of a manual or API Run
+> is the dispatching Principal's handle.
+
 - **Actor** (CONTEXT): for webhook runs it is the forge `sender.login`. It stays
   a forge fact, is never a Principal, and is never compared to one.
 - **History columns and event `by` fields** keep the id that was current when
@@ -335,6 +350,11 @@ The end state this is a step toward. None of it is decided here:
 - **Opaque `usr_<uuid>` ids.** Every field an admin types into and every attribution
   display would need a resolution layer, and `when: event.actor == …` would
   stop being writable. Rejected for §2.
+
+  > **Amended 2026-11-10 by [0080](0080-principals-have-an-internal-id.md).** An
+  > opaque id is now the stored key, and the readable string stays as the handle that
+  > people type and that `event.actor` carries. The resolution layer this entry
+  > feared is one lookup that takes either form.
 - **Identity-keyed bindings with a union lookup.** Here `rbac_bindings.subject`
   may be `provider#external_id`, and `role_of` unions a Principal's identity
   keys. It avoids pre-created Principals, but puts two kinds of subject in one

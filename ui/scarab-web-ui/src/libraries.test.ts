@@ -1,13 +1,20 @@
 import { describe, it, expect } from "vitest";
 import {
-  defaultsLine,
   diffLines,
-  missingLabel,
+  libraryChips,
+  libraryId,
+  libraryKey,
+  libraryManageHref,
+  parseLibraryKey,
   segmentError,
+  removedLibraryYanks,
+  strayTrust,
+  trustedSourceRows,
+  versionLabel,
+  yanksOfLibrary,
   shortHash,
   sourceError,
   toFetchBody,
-  updateLine,
   yankReasonError,
 } from "./libraries";
 
@@ -61,16 +68,84 @@ describe("diffLines", () => {
 describe("lines", () => {
   it("say what an admin needs to know", () => {
     expect(shortHash("a".repeat(64))).toBe("aaaaaaaaaaaa");
-    expect(updateLine(null)).toBeNull();
-    expect(updateLine({ release: "v0.4.0", security_fix: false })).toBe("v0.4.0 is available");
-    expect(updateLine({ release: "v0.4.0", security_fix: true })).toMatch(/security/);
     expect(yankReasonError(" ")).toMatch(/reason/);
     expect(yankReasonError("CVE-2026-1")).toBeNull();
-    expect(defaultsLine({ state: "installed", missing: [] })).toBeNull();
-    expect(defaultsLine({ state: "missing", missing: [{ publisher: "a", name: "b", error: "x" }] })).toMatch(
-      /not installed/,
+  });
+});
+
+describe("the list and manage pages", () => {
+  it("names an installation in the URL by its id", () => {
+    const l = { id: "b72d4f1e06", publisher: "acme", name: "deploy-helm.v2" };
+    expect(libraryId(l)).toBe("lib:acme/deploy-helm.v2");
+    expect(libraryManageHref("ac me", l)).toBe("/orgs/ac%20me/settings/libraries/b72d4f1e06/manage");
+  });
+  it("reads an old publisher~name segment back, to redirect it", () => {
+    const l = { publisher: "acme", name: "deploy-helm.v2" };
+    expect(libraryKey(l)).toBe("acme~deploy-helm.v2");
+    expect(parseLibraryKey(libraryKey(l))).toEqual(l);
+    expect(parseLibraryKey("b72d4f1e06")).toBeNull();
+  });
+  it("refuses a segment that is not a publisher and a name", () => {
+    for (const bad of ["acme", "acme~", "~x", "a~b~c", "acme~.x", "review"]) {
+      expect(parseLibraryKey(bad)).toBeNull();
+    }
+  });
+  it("tags a yanked version first, then whether its source is trusted", () => {
+    const source = `github.com/acme/libs//x.yaml@${C}`;
+    const trusted = [{ source: "github.com/acme/libs//x.yaml", trusted_by: "a.kim" }];
+    expect(libraryChips({ source }, []).map((c) => c.label)).toEqual(["untrusted source"]);
+    expect(libraryChips({ source }, trusted).map((c) => [c.label, c.tone])).toEqual([["trusted source", "ok"]]);
+    const yanked = libraryChips({ source, yanked: { reason: "leaks a token", yanked_by: "j.lee" } }, trusted);
+    expect(yanked.map((c) => c.label)).toEqual(["yanked", "trusted source"]);
+    expect(yanked[0]!.title).toBe("Yanked by j.lee: leaks a token");
+  });
+  it("lists every yank of a library on its page, the installed version's marked", () => {
+    const y = (content_hash: string, publisher: string, name: string, yanked_at: number) => ({
+      content_hash,
+      publisher,
+      name,
+      yanked_at,
+    });
+    const helm = { publisher: "acme", name: "helm", content_hash: "cc" };
+    const yanks = [
+      y("aa", "acme", "helm", 1),
+      y("bb", "acme", "probe", 2),
+      // Installed as acme/helm, first fetched for another name.
+      y("cc", "acme", "helm-old", 3),
+    ];
+    expect(yanksOfLibrary(yanks, helm).map((x) => [x.content_hash, x.installed])).toEqual([
+      ["cc", true],
+      ["aa", false],
+    ]);
+    expect(yanksOfLibrary(yanks, { ...helm, content_hash: "dd" }).map((x) => x.installed)).toEqual([false]);
+  });
+  it("keeps on the list only the yanks and trust no installation holds", () => {
+    const installed = [
+      { publisher: "acme", name: "x", content_hash: "aa", source: `github.com/acme/libs//x.yaml@${C}` },
+    ];
+    const yank = (content_hash: string, name: string) => ({ content_hash, publisher: "acme", name, yanked_at: 0 });
+    // An earlier version of an installed library is on its manage page, not here.
+    expect(
+      removedLibraryYanks([yank("aa", "x"), yank("a0", "x"), yank("bb", "gone")], installed).map((y) => y.content_hash),
+    ).toEqual(["bb"]);
+    expect(
+      strayTrust([{ source: "github.com/acme/libs//x.yaml" }, { source: "github.com/acme/libs//y.yaml" }], installed),
+    ).toEqual([{ source: "github.com/acme/libs//y.yaml" }]);
+  });
+  it("names a version by its source and a short commit", () => {
+    expect(versionLabel(`github.com/acme/libs//x.yaml@${C}`)).toBe("github.com/acme/libs//x.yaml@0123456");
+    expect(versionLabel("github.com/acme/libs//x.yaml")).toBe("github.com/acme/libs//x.yaml");
+  });
+  it("matches each trusted source to the installations that come from it", () => {
+    const installed = [
+      { id: "1", source: `github.com/acme/libs//x.yaml@${C}` },
+      { id: "2", source: `github.com/acme/libs//x.yaml@${"f".repeat(40)}` },
+      { id: "3", source: `github.com/acme/libs//x.yaml.bak@${C}` },
+    ];
+    const rows = trustedSourceRows(
+      [{ source: "github.com/acme/libs//x.yaml" }, { source: "github.com/acme/libs//y.yaml" }],
+      installed,
     );
-    expect(missingLabel({ publisher: "thulasi-ram", name: "clone" })).toBe("lib:thulasi-ram/clone");
-    expect(missingLabel({ publisher: "", name: "" })).toBe("release manifest");
+    expect(rows.map((r) => r.libraries.map((l) => l.id))).toEqual([["1", "2"], []]);
   });
 });

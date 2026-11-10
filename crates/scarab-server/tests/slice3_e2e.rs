@@ -79,6 +79,7 @@ async fn push_webhook_runs_pipeline_posts_checks_and_login_authorizes() {
         "alice-code",
         Principal {
             subject: "alice".into(),
+            handle: String::new(),
             display_name: None,
             roles: vec![Role::Member],
         },

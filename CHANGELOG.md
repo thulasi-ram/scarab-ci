@@ -18,6 +18,243 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Breaking changes
+
+- **Every user signs in again, and the upgrade needs `Recreate`.** A person now has a random,
+  fixed Scarab id (`p_` and 32 hex characters) beside the readable name they sign in under, which
+  is now called their handle (`github:alice`, `okta:s.patel@acme.example`). Migration 0093
+  gives every person an id, stores it in place of the handle in role bindings, API token owners,
+  approver lists, passkeys and pending step-up requests, and deletes every session, step-up
+  confirmation and WebAuthn challenge. History (the run event log, the security event log, policy
+  decisions, every `updated_by`) is not rewritten; it is shown by handle. A server from before
+  0093 cannot run against a database migrated past it: take a backup, upgrade with the
+  `Recreate` strategy (the chart's default), and restoring the backup is the way back.
+  A role binding written before migration 0052 that names nobody gets a placeholder that the
+  first sign-in producing exactly that name through the legacy provider takes over. Handles
+  that differ only in case are kept as separate people and logged at every boot; a new handle
+  that differs from an existing one only in case gets a `~2` suffix.
+  ([ADR-0080](https://github.com/thulasi-ram/scarab-ci/blob/main/docs/adr/0080-principals-have-an-internal-id.md))
+- **Member URLs carry the id, not the handle.** The member page is
+  `/orgs/<org>/settings/members/<id>/manage`, read through the new
+  `GET /v1/orgs/{org}/members/{id}`; old member links stop working. Passkey reset is
+  `POST /v1/orgs/{org}/members/{id}/passkeys/reset`.
+- **People in API responses are `{id, handle, display_name}`.** `GET /v1/orgs/{org}/bindings`
+  and the forge import return `id` and `handle` in place of `subject`; the principal search adds
+  `handle`; API token records add `owner`; `GET /v1/me`, `GET /v1/me/security` and
+  `POST /v1/auth/login` add `handle`, and their `subject` is now the id. Attribution fields
+  (`updated_by`, `created_by`, `pinned_by`, approvals, the run event log's `by`) show the handle.
+  Grants, revokes, approver lists, `scarab-server admin grant --subject` and
+  `SCARAB_OAUTH_OWNERS` take a handle, as before, or an id.
+- **The Actor of a manual or API Run is the dispatcher's handle**, so `when: event.actor == …`
+  keeps comparing the name people type. Policy inputs keep their handle fields and gain
+  `principal_id`, `trigger.principal_id`, `actor.principal_id`, `approval_ids` and
+  `approver_ids` beside them.
+
+- **`GET /v1/repos/{org}/{repo}/environments/{name}/deployments` is removed** and answers 404.
+  It listed who approved which Run into an Environment, and the web UI no longer reads it.
+  The server no longer keeps that record: each Run keeps its approvals in its own history.
+  Migration 0088 drops the `deployments` table and the rows in it.
+- **The environment migration report is removed.** `GET /v1/orgs/{org}/environment-migration-report`
+  and `POST /v1/orgs/{org}/environment-migration-report/{env}/acknowledge` answer 404, and the
+  org Environments page no longer shows "migrated environments to review". Migration 0088 drops
+  the `environment_migration_report` table and `legacy_project_environments`, the per-repository
+  environments migration 0057 turned into org Environments. The overlays, privilege grants and
+  eligibility 0057 made from them stay. A server from before 0088 cannot run against a database
+  migrated past it.
+- **Server administration is removed from settings.** Account settings and Organization
+  settings are separate pages. A global admin creates a new organization from "New
+  organization…" in the org dropdown (`/orgs/_new`); `/settings/server/…` redirects there.
+- **Installing the GitHub App no longer enables its repositories.** An `installation` or
+  `installation_repositories` delivery registers the connection and binds nothing; an org
+  admin enables each repository on the new org page. Repositories bound before the upgrade
+  stay enabled. A push to a repository that is not enabled is answered `200` with
+  `{"ignored": "repository not enabled"}` and starts nothing. `POST
+  /v1/connections/{id}/resync` binds nothing either: its response lists the repositories that
+  are not enabled in `available` and the projects it moved off a connection that does not
+  serve their org in `moved`; the `bound` field is gone. A repository removed from the App's
+  installation, or one of an uninstalled or suspended App, is no longer unbound: it keeps its
+  project and is marked unreachable (`unreachable_since`), its events are ignored, a manual run
+  answers 409, and the mark clears when GitHub covers it again or a re-sync lists it. Disable
+  removes it. This needs migration 0089, which adds a column.
+  ([Enabling repositories](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#enabling-repositories))
+- **Organization settings › Connections no longer lists repositories.** Each connection shows how
+  many it has enabled and links to the org page narrowed to it (Manage repositories); Add
+  repository, the per-repository Disable and the per-repository Webhook button are gone from it.
+  Repositories are enabled and disabled on the org page, and a Forgejo repository's webhook is
+  registered again from its Settings tab (Register webhook). `GET /v1/connections` returns
+  `enabled_repos`, a count, in place of the `projects` list. `GET /v1/repos` gives each project's
+  `connection_id`, and `GET /v1/orgs/{org}/repos` takes `connection=<id>`.
+  ([Enabling repositories](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#enabling-repositories))
+- **Scarab's libraries and plugins are installed like anyone else's.** The server reads no
+  release manifest, marks no library version first-party, and installs nothing into a new
+  org: a new org has no libraries until an org admin installs them. To install the clone
+  library, fetch `github.com/thulasi-ram/scarab-ci//libs/clone.yaml@<full commit of a release
+  tag>` under Organization settings › Libraries, review it and install it as
+  `lib:thulasi-ram/clone`. Until then a Pipeline that invokes it fails its check with
+  "`lib:thulasi-ram/clone` is not installed in this org".
+  ([Install Scarab's clone library](https://thulasi-ram.github.io/scarab-ci/usage/libraries/#install-scarabs-clone-library))
+- **The clone library is no longer trusted with forge credentials by default.** On a Forgejo
+  or GitHub token connection, a step receives the long-lived token only when an org admin
+  trusted its library's source (`POST /v1/orgs/{org}/library-trust`, with a step-up). A Run
+  that invokes the clone library from an untrusted source is refused with the reason. On a
+  GitHub App connection nothing changes. Migration 0090 adds the trusted source for every org
+  that had the clone library from 0.3.0's release manifest, so those orgs keep cloning.
+  ([Trusting a library with forge credentials](https://thulasi-ram.github.io/scarab-ci/usage/libraries/#trusting-a-library-with-forge-credentials))
+- **Plugins install from a manifest source and an image digest.** There is no compiled-in
+  catalog: an org admin gives the manifest's source
+  (`<host>/<owner>/<repo>//<path>@<commit>`, read like a library source), reviews what it
+  asks for, and installs it with an image pinned `<repository>@sha256:<digest>` from any
+  repository (`POST /v1/orgs/{org}/plugin-fetch`, then `POST /v1/orgs/{org}/plugins`). The
+  install body takes `source` and `manifest_sha256` in place of `plugin`, and the server
+  refuses it (409) when the source no longer reads as the reviewed manifest.
+  `SCARAB_DEV_PLUGIN_ALLOW_TAG` admits a tag for every plugin alike.
+  ([Install a plugin](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#install-a-plugin))
+- **Removed:** the server variables `SCARAB_LIBS_MANIFEST` and `SCARAB_PLUGIN_ARGOCD_REPO`,
+  the chart values `scarab.libsManifest` and `plugins.argocdRepo`, and the endpoints
+  `POST /v1/orgs/{org}/library-defaults/retry` and `GET /v1/orgs/{org}/plugin-catalog`
+  (404). Releases no longer carry a `libs-manifest.json` asset.
+- **Migration 0091** adds `manifest_source` and `manifest_connection` to
+  `plugin_installations` and a `plugin_installation_versions` table. Existing installations get
+  no source and show "source not recorded". A server from before 0091 cannot run against a
+  database migrated past it.
+- **A plugin manifest may name its image repository** (`"image": "ghcr.io/acme/plugin"`), and an
+  install or upgrade with an image of another repository is refused (400). Scarab's Argo CD
+  manifest names `ghcr.io/thulasi-ram/scarab-plugin-argocd`, so installing it from a fork's
+  repository needs a manifest that names the fork. A Scarab from before this release refuses a
+  manifest with the field.
+  ([Install a plugin](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#install-a-plugin))
+- **Migration 0090** adds the trusted sources above (trusted by `scarab:migration-0090`),
+  drops `library_versions.first_party` and the `library_org_defaults` table. Installed
+  libraries, their versions and yanks stay. A server from before 0090 cannot run against a
+  database migrated past it.
+
+### Features
+
+- **Upgrade a plugin in place.** An installation's page has Upgrade: give a new commit (the
+  recorded source's file at it) or another source, and a new image digest. Scarab shows what the
+  new manifest adds, removes and keeps, then applies it to the same installation, keeping its
+  config, storage and connections. A new image digest is new code, so an upgrade to one asks for
+  your passkey, as an install does; so does a manifest that asks for more. Only a narrower
+  manifest on the installed image needs no passkey. The server decides which, and refuses an
+  upgrade while plugins are off
+  (`POST /v1/orgs/{org}/plugins/{name}/upgrade-fetch`, then `…/upgrade`). Each installation now
+  records where its manifest was read.
+  ([Upgrade a plugin](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#upgrade-a-plugin))
+- **Any plugin can be installed.** An org admin fetches a plugin's manifest from a git source
+  pinned to a commit, reviews its capabilities, connection slots, config keys and gates, and
+  installs it by image digest with a passkey. Scarab's Argo CD plugin installs the same way;
+  its image is now published as `ghcr.io/thulasi-ram/scarab-plugin-argocd` with the other
+  images, for linux/amd64 and linux/arm64.
+  ([Install a plugin](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#install-a-plugin))
+- **An org page at `/orgs/<org>`.** It shows the org's enabled repositories, its runs and
+  failed runs in the last 24 hours and its runs waiting on a gate, and lists every repository
+  the org's connections reach, 25 to a page, each Enabled or Not enabled. Org admins enable a
+  repository there, or disable it after typing its name; disabling removes its project, and
+  nothing the forge sends enables it again. A repository's Settings tab has the same Disable
+  for org admins, beside the unreachable line when the repository is marked so, and goes to the
+  org page afterwards. The org name in a repository's header links to it.
+  The list is `GET /v1/orgs/{org}/repos`.
+  ([Enabling repositories](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#enabling-repositories))
+- **A policy editor in the web UI.** Organization settings › Policies has New policy and Paste
+  YAML. The editor checks the draft as you type and shows each finding at its field or at the
+  rule's line and column, completes field names from the checkpoint's input schema, starts a
+  new policy in audit mode, and "Try it" lists the recent decisions whose outcome the draft
+  would change, each linking to its Run. Saving a change to an enforced policy asks for a
+  passkey. Each policy has a History tab with a line diff between versions, and the list shows
+  how many Runs or Steps each policy denied, or would have denied, in the last 7 days, with
+  Enforce on audit-mode rows.
+  ([Policies](https://thulasi-ram.github.io/scarab-ci/usage/policies/))
+- **Policy decisions on the Run page.** A Run that a policy applied to shows each decision: the
+  checkpoint, each policy's outcome and message, and the input the rules saw.
+  ([Policies](https://thulasi-ram.github.io/scarab-ci/usage/policies/#on-the-run-page))
+- **Library and plugin policy forms.** The libraries allowed and blocked lists are edited under
+  Library policies on the Libraries section, the plugin list under Plugin policies on the Plugins
+  section, and a project's own under the same two titles on its repository Settings tab.
+  ([Policies](https://thulasi-ram.github.io/scarab-ci/usage/policies/#library-and-plugin-policies))
+- **Policy API for editors.** `POST /v1/orgs/{org}/policies/check` checks a draft (JSON or YAML)
+  without saving it; `GET /v1/policy-checkpoints` serves each checkpoint's input schema;
+  `POST /v1/orgs/{org}/policy-test` evaluates `step.admit` and `gate.resolve` inputs too;
+  `POST /v1/orgs/{org}/policy-test/replay` runs a draft over recent decisions; the decision
+  log takes `checkpoint`, `policy_id` and `since`, and `…/policy-decisions/counts` counts each
+  policy's denies since a time.
+  ([Policies](https://thulasi-ram.github.io/scarab-ci/usage/policies/#api))
+
+### Enhancement
+
+- **Connections that serve no organization wait on New organization.** A global admin finds
+  them under **Waiting for an organization** on `/orgs/_new`, with their forge, installation id,
+  credential health and last delivery, and assigns each to an organization, creates a new
+  organization from it, or removes it. An org's Connections lists only that org's connections.
+  The org dropdown and the command palette count them: **New organization… (1 waiting)**.
+- **Repository roles moved to the repository.** Organization settings › Members shows each
+  person's org role only, grants and revokes org roles, and links the repositories a person also
+  holds a role in. A repository's Settings tab has an **Access** panel: who holds a role on it,
+  whether it was granted in Scarab or came from the forge's collaborators, the people its org
+  roles reach, grant and revoke at the repository, and **Re-sync collaborators**, which shows
+  who was added, changed and removed. The tab's placeholder rows are gone; it shows the
+  repository's forge connection. `GET /v1/orgs/{org}/bindings`
+  now says on each row whether the role was granted in Scarab (`origin: native`) or seeded by
+  a forge import (`origin: import`).
+- **A repository's Secrets tab is one key list.** Each key shows where it is set; expand it
+  for one line per scope. An Environment filter shows each key's value for that Environment,
+  and New secret takes a scope. It replaces the list and the grid.
+- **Settings pages each have their own sidebar**, and Organization settings has an org
+  dropdown at the top. The user menu links Account settings and Organization settings.
+- **An org's security event log is in Organization settings › Security**, below the step-up
+  settings, with its filters and paging. **Refusals, last 24h** filters it to recent refusals
+  and replaces the recent-refusals table. The Event log section is gone;
+  `/orgs/<org>/settings/events` redirects to Security and keeps its filters.
+- **The web UI uses four text styles.** Title (Inter 600, 20px), Label (Inter 600, 13px), Body
+  (Inter 400, 13px) and Mono (JetBrains Mono 400, 12px) replace the five sizes, four weights and
+  display face the pages mixed. Headings and column heads are in sentence case instead of
+  upper case, and body text is 13px instead of 15px. The wordmark keeps its own face.
+- **Each library and plugin installation has its own page.** Organization settings › Libraries
+  and › Plugins list one row per installation, with tags such as yanked, untrusted source,
+  killed or probe failed, and **Install library** and **Install plugin** at the top right open
+  the install dialog. Upgrading, trusting a source, yanking and removing a library, and killing,
+  storage, connections, the broker journal and uninstalling a plugin are on the installation's
+  page (`…/settings/libraries/<id>/manage`, `…/settings/plugins/<id>/manage`). Migration 0092
+  gives each library installation an id, kept across upgrades; `GET
+  /v1/orgs/{org}/library-installations/{id}` and `GET /v1/orgs/{org}/plugin-installations/{id}`
+  read one installation by its id. A `…/libraries/<publisher>~<name>/manage` link goes on to the
+  installation's id page.
+  The library review page lays its facts and checks out on one grid, with Install in one row
+  under the diff.
+- **Headings read as headings, and Mono is heavier.** Panel headers, section headings and the
+  settings sidebar's heading are in the primary ink instead of the muted one. The settings
+  sidebar marks the page you are on with its background and colour only, without the green
+  edge. Mono text is set at weight 500 instead of 400; the four text styles stay four.
+- **A table inside a panel no longer draws a second header band.** Members, a repository's
+  Access and Environments, Connections, API tokens, Libraries, Plugins, the security event
+  tables and a plugin's broker journal show their column heads as a plain label row over one
+  hairline, under the panel header, with their columns at the header's inset. Access's
+  "Through their org role" row is a plain label row with a hairline above it.
+- **Environments, Policies and Members follow the same list-and-page layout.** Each list has its
+  add action at the right of its header (**New environment**, **Paste YAML** and **New policy**,
+  **Grant role**) and a **Manage** link per row. Account settings › Security has **Add passkey**
+  at the right of the passkeys panel's header, and the new passkey's name as a field below. An Environment's read-only page and edit screen
+  are one page, `…/settings/environments/<name>/manage`, with the details as one form; the old
+  addresses redirect there. A Policy's page gains a **Decisions** tab with the decisions it
+  matched; the Policies section drops its org-wide recent decisions and its read-only typed
+  settings, which are edited on their own pages. Each member has a page,
+  `…/settings/members/<subject>/manage`, to change or revoke their org role and see their
+  repository roles.
+- **One dropdown across the web UI.** Every form picker, the org dropdown in Organization
+  settings and the section picker on a narrow screen open the same list as the run filters, in
+  place of the browser's own. A list longer than eight entries has a search box; a shorter one
+  is a plain list. It works from the keyboard (arrow keys, Home, End, type-ahead, Enter,
+  Escape), shows an org you do not administer without letting you pick it, sets New
+  organization… apart under a rule, and opens above a dialog. The docs version dropdown is a
+  menu of links to each version.
+- **Connections, Secrets, API tokens and Security in Organization settings are reorganised.**
+  Connections lists one row per connection, with tags such as credential missing or no
+  deliveries yet; each connection has its own page (`…/settings/connections/<id>`) with its
+  credential, last delivery, app check, Manage repositories, Re-sync and Remove. Secrets has
+  New secret at the top right and Replace and Delete (with the name typed) on each row. Both API
+  token pages list tokens with the same row and tags (active, expires soon, revoked, never
+  used), and New token moves to the header of Account settings › API tokens. On Security, an
+  owner resets a member's passkeys from a Reset passkeys dialog instead of an inline list.
+
 ### Bug Fixes
 
 - **Finished step Pods are deleted.** The k8s executor kept every step Pod after its step
@@ -29,6 +266,16 @@ release.yml uses that version's section as the GitHub Release text. See
   server's own database, a Pod of a Run that has not finished, and a running debug Pod are
   left alone. The chart's executor Role gains `list` on Services and NetworkPolicies
   (git-bug 986542a).
+- The sign-in screen showed both logos in the light theme.
+- A repository row on the dashboard no longer repeats its name when the forge repository is
+  named like the project.
+- A repository page no longer repeats the Environments tab's and the Secrets tab's actions
+  in its header, and the Environments tab no longer lists approval history; each
+  Environment links to its Runs.
+- On a phone no page scrolls sideways. The top bar keeps Search, Docs, API and the user menu
+  in the window (Search shows its icon only); a run's actions wrap onto more lines; the
+  dashboard's waiting rows put what they are about on a line of their own; and the Libraries,
+  Plugins, Connections and security event tables scroll inside their own box.
 
 ## [0.3.0] - 2026-11-09
 

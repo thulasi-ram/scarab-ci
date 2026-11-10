@@ -29,9 +29,6 @@ use scarab_secrets::SecretScope;
 use scarab_server::config::OAuthConfig;
 use scarab_server::oauth::OAuthAuthenticator;
 use scarab_server::{router, AppState, LogService};
-use scarab_testkit::legacy_environments::{
-    legacy_project_environment, put_legacy_project_environment,
-};
 use scarab_testkit::{FakeClock, InMemoryObjectStore};
 
 /// A stub provider: `good-code` → an access token; `/user` answers whatever
@@ -267,8 +264,7 @@ async fn linking_proves_and_merges_an_imported_account_without_email() {
             .with_oauth_login(gh)
             .with_oauth_login(ok)
             .with_rbac(pg.clone())
-            .with_identities(pg.clone())
-            .with_approval_history(pg.clone()),
+            .with_identities(pg.clone()),
     );
 
     // An admin imported Ada's GitHub account before she ever signed in: an
@@ -281,50 +277,43 @@ async fn linking_proves_and_merges_an_imported_account_without_email() {
         email_verified: false,
         display_name: None,
     };
-    assert_eq!(pg.pin(&gh_ada, "ada-gh", 1).await.unwrap(), "ada-gh");
-    pg.import_seeds(&web(), "default", &[("ada-gh".into(), Role::Admin)], false)
+    let imported = pg
+        .pin(&gh_ada, "ada-gh", scarab_identity::Placeholder::Never, 1)
         .await
         .unwrap();
-    pg.import_seeds(&api(), "default", &[("ada-gh".into(), Role::Member)], false)
+    assert_eq!(imported.handle, "ada-gh");
+    // What bindings and approver lists store is the id (ADR-0080).
+    let ada_gh = imported.id;
+    pg.import_seeds(&web(), "default", &[(ada_gh.clone(), Role::Admin)], false)
         .await
         .unwrap();
-    put_legacy_project_environment(
-        &tdb.pool,
-        "acme",
-        "web",
-        &scarab_project::Environment {
-            name: "prod".into(),
-            protection: ProtectionRules {
-                approvers: vec!["ada-gh".into()],
-                wait_timer: 0,
-                allowed_refs: vec![],
-                concurrency: 1,
-                secret_scope: SecretScope::EnvironmentProject {
-                    org: "acme".into(),
-                    project: "web".into(),
-                    environment: "prod".into(),
-                },
-                oidc_subject: "scarab:org/acme/repo/web/env/prod".into(),
-                privileged_images: vec![],
-                permit_k8s_overlay: false,
-                require_reason: false,
-            },
-        },
-    )
-    .await;
+    pg.import_seeds(&api(), "default", &[(ada_gh.clone(), Role::Member)], false)
+        .await
+        .unwrap();
     // ADR-0071: admission reads approvers from the org Environment's overlay
-    // for `web` (what the migration made of the legacy row above) and from the
+    // for `web` (what the migration made of these legacy rules) and from the
     // baseline. Seed both to name `ada-gh`, so the fold must rewrite them.
-    let legacy_rules = legacy_project_environment(&tdb.pool, "acme", "web", "prod")
-        .await
-        .unwrap()
-        .protection;
+    let legacy_rules = ProtectionRules {
+        approvers: vec![ada_gh.clone()],
+        wait_timer: 0,
+        allowed_refs: vec![],
+        concurrency: 1,
+        secret_scope: SecretScope::EnvironmentProject {
+            org: "acme".into(),
+            project: "web".into(),
+            environment: "prod".into(),
+        },
+        oidc_subject: "scarab:org/acme/repo/web/env/prod".into(),
+        privileged_images: vec![],
+        permit_k8s_overlay: false,
+        require_reason: false,
+    };
     common::governance::seed_migrated_environment(&pg, "acme", "web", "prod", legacy_rules).await;
     pg.put_environment_protection(
         "acme",
         "prod",
         &scarab_project::EnvironmentProtectionRules {
-            approvers: vec!["ada-gh".into(), "bob".into()],
+            approvers: vec![ada_gh.clone(), "bob".into()],
             ..Default::default()
         },
         "amy",
@@ -338,9 +327,10 @@ async fn linking_proves_and_merges_an_imported_account_without_email() {
     // match from looking tempting.
     let mut ada = browser_sign_in(&app, "okta").await;
     let before = me(&app, &mut ada).await;
-    assert_eq!(before["subject"], "okta:ada@example.com");
+    assert_eq!(before["handle"], "okta:ada@example.com");
     assert_eq!(before["roles"], serde_json::json!(["Viewer"]));
-    let ada_id = "okta:ada@example.com";
+    let ada_id = before["subject"].as_str().unwrap().to_string();
+    let ada_id = ada_id.as_str();
     // A deliberate native downgrade the merge must not undo.
     pg.grant(
         &scarab_identity::Binding {
@@ -391,9 +381,9 @@ async fn linking_proves_and_merges_an_imported_account_without_email() {
     assert_eq!(resp.status(), StatusCode::FOUND);
     assert_eq!(
         resp.headers()["location"],
-        "/settings/profile?identity_linked=default&merged=ada-gh"
+        "/settings/profile?identity_linked=default&merged=1"
     );
-    let folded = pg.principal("ada-gh").await.unwrap().unwrap();
+    let folded = pg.principal(&ada_gh).await.unwrap().unwrap();
     assert_eq!(folded.merged_into.as_deref(), Some(ada_id));
     assert_eq!(
         pg.role_of(ada_id, &web()).await.unwrap(),
@@ -404,13 +394,9 @@ async fn linking_proves_and_merges_an_imported_account_without_email() {
         pg.role_of(ada_id, &api()).await.unwrap(),
         Some(Role::Member)
     );
-    assert_eq!(pg.role_of("ada-gh", &api()).await.unwrap(), None);
-    let env = legacy_project_environment(&tdb.pool, "acme", "web", "prod")
-        .await
-        .unwrap();
-    assert_eq!(env.protection.approvers, vec![ada_id.to_string()]);
-    // …and where admission reads approvers now (ADR-0071 §1, §3): the
-    // baseline (order kept) and `web`'s overlay.
+    assert_eq!(pg.role_of(&ada_gh, &api()).await.unwrap(), None);
+    // Where admission reads approvers (ADR-0071 §1, §3): the baseline (order
+    // kept) and `web`'s overlay.
     let governance = pg
         .deploy_governance("acme", "web", "prod")
         .await
@@ -457,8 +443,12 @@ async fn linking_proves_and_merges_an_imported_account_without_email() {
         loc.starts_with("/settings/profile?identity_link_error="),
         "{loc}"
     );
+    let bob_id = me(&app, &mut bob2).await["subject"]
+        .as_str()
+        .unwrap()
+        .to_string();
     assert_eq!(
-        pg.principal("bob").await.unwrap().unwrap().merged_into,
+        pg.principal(&bob_id).await.unwrap().unwrap().merged_into,
         None
     );
 

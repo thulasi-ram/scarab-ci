@@ -64,8 +64,8 @@ and has no error anywhere:
 - **Subscribe to events** (App → *Permissions & events → Subscribe to events*): check **Push** and
   **Pull request**. With the list empty, `push`/`pull_request` are never delivered, so nothing ever
   runs. But `installation` and `installation_repositories` still arrive (App-management events are
-  independent of the subscription list), so the connection registers and `GET /v1/repos` looks
-  fine. The symptom: *"the repo is registered but no run ever starts."*
+  independent of the subscription list), so the connection registers and its repositories are
+  listed on the org page. The symptom: *"the repo is enabled but no run ever starts."*
 - **Commit statuses: read & write** (App → *Permissions → Repository*): without `statuses:write`
   every status post is rejected `403 Resource not accessible by integration`. The run itself still
   succeeds, so the only visible effect is a pull request that never shows a Scarab status. Add
@@ -87,9 +87,11 @@ connections under **Settings › Connections** (`/orgs/<org>/settings/connection
 see another org's connections, and `GET /v1/connections` lists only the connections of orgs you
 administer (`?org=<org>` narrows it to one).
 
-- **An org's first connection** is created by a global admin, under **Settings › Server
-  administration › Connect a forge** (`/settings/server/connect-forge`), or with
-  `POST /v1/connections` and an `org` field. After that, the org's own admins can add more.
+- **An org's first connection** is created by a global admin: in Organization settings, pick
+  **New organization…** at the bottom of the org dropdown (`/orgs/_new`), name the org and add its
+  Forgejo connection, or call `POST /v1/connections` with an `org` field. After that, the org's
+  own admins add more under its **Settings › Connections**. For GitHub, install the App on the
+  account instead: the installation registers the connection and the org.
 - **An org name** is not empty, is at most 100 characters, and has no `/`, spaces or control
   characters. It is not `.` or `..`, does not start with `_` (those names are Scarab's own), and
   is not one of `settings`, `orgs`, `account` or `security`: a project's page is
@@ -102,9 +104,10 @@ administer (`?org=<org>` narrows it to one).
   the same host with the same account id. A login can be renamed and then registered by another
   account, so a login alone does not join an org. An org exists once anything is kept for it:
   members, an API token, a secret, an Environment, a Policy, a Plugin or a library, as well as a
-  connection or a repository. Otherwise the connection stays unassigned and binds none of the
-  delivery's repositories. Once it serves an org, it mints tokens only from its own
-  installation, and only for repositories that org owns.
+  connection or a repository. Otherwise the connection stays unassigned until a global admin
+  assigns it. Either way the delivery binds no repository: see
+  [Enabling repositories](#enabling-repositories). Once it serves an org, it mints tokens only
+  from its own installation, and only for repositories that org owns.
 - **A connection declared in `scarab.connections`** names its org with `org:`. Without `org:`,
   the org is the one owner of its `repos:`. A repository of another owner, repositories of
   several owners without `org:`, no repositories and no `org:`, or a repository already bound
@@ -132,51 +135,143 @@ administer (`?org=<org>` narrows it to one).
         credential: { secret_ref: github-app }
   ```
 
-A connection with no org is shown only to global admins, and its repositories keep working.
+### Enabling repositories
+
+A repository becomes a project, with its own runs, Environments and secrets, only when an org
+admin enables it. Installing the GitHub App, adding repositories to the installation, adding a
+Forgejo connection and a re-sync all make repositories *available*; none of them enables one.
+
+The org page, `/orgs/<org>` (click the org name before a repository's name), lists every
+repository the org's connections reach, 25 to a page, each marked **Enabled** or **Not enabled**,
+with a few counts for the org above it: enabled repositories, runs in the last 24 hours, failed
+runs in the last 24 hours, and runs waiting on a gate. An org admin sees:
+
+- **Enable**, which binds the repository through the connection that reaches it
+  (`POST /v1/connections/{id}/repos`). For Forgejo it also registers the repository's webhook.
+  Pushes start runs from then on.
+- **Disable**, which unbinds it (`DELETE /v1/connections/{id}/repos/{owner}/{name}`) after you
+  type `<org>/<repository>` to confirm. The project goes with its Environment overlays, secrets and
+  access grants. Disabling sticks: no later installation event or re-sync enables the repository
+  again. Enabling it again creates a new project without the old one's settings.
+
+Anyone who can read the org sees the same list without the buttons. The list comes from
+`GET /v1/orgs/{org}/repos?page=&per_page=&q=&connection=`, which asks each connection's forge on
+every request (with `connection`, only that connection's); a connection the forge would not
+answer for is named in `unlisted`, and its enabled repositories are still listed. The org page is
+where repositories are enabled. **Settings › Connections** shows how many repositories each
+connection has enabled (`enabled_repos` on `GET /v1/connections`), and each connection's page
+links to the org page narrowed to that connection (**Manage repositories**). An enabled repository's **Settings** tab
+has the same **Disable** for org admins, and goes to the org page once it is done; both ask for
+the same typed name. For a Forgejo repository, the tab also has **Register webhook**
+(`POST /v1/connections/{id}/repos/{owner}/{name}/webhook`), for when enabling could not register
+it.
+
+Events of a repository that is not enabled (a push to a repository the App covers, for example)
+are acknowledged with `200 {"ignored": "repository not enabled"}` and start nothing, so the forge
+does not retry them. A **Re-sync** (`POST /v1/connections/{id}/resync`) lists the repositories the
+forge reaches that are not enabled in `available` and binds none of them.
+
+Repositories that an earlier release bound when the App was installed stay enabled after an
+upgrade; nothing is unbound.
+
+Nothing the forge sends deletes a project either. When you remove an enabled repository from the
+App's installation on GitHub, or uninstall or suspend the App, its repositories stay enabled and
+are marked **unreachable** (`unreachable_since`, unix ms, on `GET /v1/repos` and the org page
+rows). The repository's page and the org page say so. While a repository
+is unreachable, its events are ignored like those of a repository that is not enabled, a manual
+run answers 409, and any other forge call for it (a status post, a clone) fails with an error that
+names the reason. The mark clears when GitHub covers the repository again (an
+`installation_repositories` delivery that adds it, or an `unsuspend`), or when a re-sync lists it.
+To remove the project, disable the repository, on the org page or on its Settings tab.
+
+### Connections without an org
+
+A connection with no org is shown only to global admins, under **Waiting for an organization**
+on the New organization page (`/orgs/_new`), and its repositories keep working. An org's
+Connections does not list it. The org dropdown's last entry counts these connections, for
+example **New organization… (1 waiting)**, and so does the command palette.
 After an upgrade from a release before connections had an org, these are the connections whose
 repositories have several owners or none, and **every GitHub App installation connection**: the
 database does not hold an installation's account, and an earlier re-sync could bind another
 installation's repositories to it. An unassigned installation connection keeps looking up each
 repository's installation, so its repositories keep getting tokens. Its next `installation`
 delivery assigns it when the rules above allow it; for an org that existed before the upgrade
-they do not (no connection has an account id yet), so a global admin assigns it. Nothing assigns it an org as a side effect: opening Add repository, a re-sync or a bind
+they do not (no connection has an account id yet), so a global admin assigns it. Nothing assigns it an org as a side effect: listing what it reaches, a re-sync or a bind
 leaves it unassigned. A re-sync through it binds nothing and lists every repository the forge
 reports in `skipped`, so the UI does not offer Re-sync on it.
 
-A global admin assigns it with **Assign to org** (`PUT /v1/connections/{id}/org` with
-`{ "org": "<name>" }`). It asks for step-up confirmation and is recorded in the org's event log.
+A global admin assigns it there with **Assign to an organization**, or makes a new org from it
+with **Create a new organization from it**. Both call `PUT /v1/connections/{id}/org` with
+`{ "org": "<name>" }`; a name no org has yet creates the org. It asks for step-up confirmation and
+is recorded in the org's event log.
 The server answers 409 with the reason when a repository bound through the connection is owned
 by another account, when the org is served by another forge or host, when the org exists with no
 connection, or when the connection is managed by configuration. Anyone other than a global admin,
 an API token included, gets 403.
 
 To split a connection whose repositories have several owners, add a connection for each org and
-bind or re-sync the repositories through it. A repository moves only off a connection that does
+enable or re-sync the repositories through it: a re-sync moves the org's projects off a
+connection that does not serve it (`moved`). A repository moves only off a connection that does
 not serve its owner (one with no org, or one of another org); one bound through a connection of
 its own org stays there, even when you bind it through another connection of the same org (409
-on Add repository, `skipped` on re-sync). Unbind it from the connection that holds it first.
+on the bind, `skipped` on re-sync). Unbind it from the connection that holds it first.
 When every repository has moved, remove the old connection. Removing a connection that still
 holds a repository of another org is refused (409, naming it): that org re-syncs or adds it on
 its own connection first.
 
 ## Settings
 
-The web UI's settings page has a sidebar with up to three groups, and each section has its own
-address:
+The web UI has two settings pages, each with its own sidebar, and each section has its own
+address. The user menu links the pages you may use:
 
-- **Your account**, for everyone, under `/settings/<section>`: Profile (your sign-in accounts),
+- **Account settings**, for everyone, under `/settings/<section>`: Profile (your sign-in accounts),
   Security (your passkeys and security events), [API tokens](/scarab-ci/usage/api-tokens/)
   (your own tokens) and Appearance.
 - **Organization settings**, for the admins of an org, under `/orgs/<org>/settings/<section>`:
   Connections, Members, Environments, Plugins, Libraries, Secrets, API tokens (every token issued
-  in the org), Security and Event log. `/orgs/<org>/settings` opens Connections. An admin of several orgs switches org at the top
-  of the group.
-- **Server administration**, for global admins, under `/settings/server/<section>`: Connect a
-  forge.
+  in the org) and Security (the step-up settings, then the org's security event log with its
+  filters; **Refusals, last 24h** filters it to recent refusals). `/orgs/<org>/settings` opens
+  Connections. The old address `/orgs/<org>/settings/events` opens Security. The org
+  dropdown at the top of the sidebar switches org and keeps the section. For a global admin its
+  last entry is **New organization…** (`/orgs/_new`), where a new org is created with its first
+  Forgejo connection, and where the connections that serve no org wait for one.
 
-`/settings` opens the first org you administer, or your profile. The old addresses (`/account`,
-`/account/security`, `/settings/libraries/review`) redirect to the new ones. The UI shows only
-the groups you may use; the server checks every request.
+Connections is the one place a forge connection is added: **Add Forgejo connection**, top right
+of an org's Connections, or New organization… for an org Scarab does not have yet. Connections
+lists one row per connection: its forge and host, tags such as **credential missing**, **no
+deliveries yet** or **managed by configuration**, how many repositories it has enabled and its
+last webhook delivery. The forge and host link to the connection's page
+(`/orgs/<org>/settings/connections/<id>`), which shows its id, whether its credential resolves,
+its last delivery and, for GitHub, the App's configuration check, and has **Manage
+repositories**, **Re-sync**, **Manage on GitHub** and **Remove**. Removing asks you to type the
+connection's id. A connection managed by configuration has no Re-sync or Remove there.
+
+On Security, an owner resets the passkeys of a member who lost theirs with **Reset passkeys**, at
+the top right: pick the member (the admins without a passkey are marked), then type their name.
+Clicking an admin in **Admins without a passkey** opens the same dialog with that admin picked.
+The reset asks you to confirm with your own passkey, and the page says how many passkeys and
+confirmations it removed.
+
+Members lists one row per person: their org role, which applies to every repository in the org,
+and how many repositories they hold a role in. Someone who holds roles on single repositories only
+is listed with no org role. **Grant role**, at the right of the list's header, grants an org role
+in a dialog. **Manage** on a row opens the person's page
+(`/orgs/<org>/settings/members/<subject>/manage`), where you change or revoke their org role
+(revoking asks you to type the subject) and see their repository roles, each linking to that
+repository's Access. A role on one repository
+is managed on that repository's **Settings** tab, under **Access** (org admins only). It lists who
+holds a role on the repository and whether it was granted in Scarab or came from the forge's
+collaborators, then, greyed, the people whose org role reaches it. **Re-sync collaborators**
+reads the repository's collaborators from the forge and gives each a role from their permission
+there: admin → admin, write → member, read → viewer. Someone the forge no longer lists loses the
+role it gave them; roles granted or revoked in Scarab are never changed. The dialog lists who was
+added, changed and removed.
+
+`/settings` opens the first org you administer; a global admin with no org yet gets New
+organization…, and anyone else their profile. The old addresses (`/account`, `/account/security`,
+`/settings/libraries/review`, and `/settings/server/connect-forge` from the former Server
+administration page) redirect to the new ones. The UI shows only the pages you may use; the
+server checks every request.
 
 ### Appearance
 
@@ -217,6 +312,90 @@ A plugin that needs storage brings its own: you create a PersistentVolumeClaim i
 namespace and the plugin runtime mounts it. Scarab doesn't provision, back up or read that
 volume, and its data is outside what Scarab keeps.
 
+#### Install a plugin
+
+Every plugin installs the same way, Scarab's own Argo CD plugin included: no plugin is installed
+or trusted by default. An org admin installs one under Organization settings › Plugins ›
+**Install plugin**, or with the API, in two steps:
+
+1. **Fetch and review.** Give the plugin's manifest as a source,
+   `<host>/<owner>/<repo>//<path>@<commit>`, where the path ends in `.json`, `.yaml` or `.yml` and
+   the commit is a full commit id. Scarab reads it the way it reads a
+   [library source](/scarab-ci/usage/libraries/#install-a-library): without credentials from
+   github.com or a Forgejo connection's host, or through a connection of your org for a private
+   repository. It checks the manifest and shows what the plugin asks for: its capabilities, its
+   connection slots and the requests each slot allows, its config keys and its gates. Nothing is
+   installed yet.
+2. **Install.** Name the installation and give the plugin's image pinned by digest,
+   `<repository>@sha256:<digest>`, from any registry your cluster pulls from. Scarab reads the
+   source again and refuses the install (409) if the manifest is no longer the one you reviewed.
+   This asks you to confirm with your passkey.
+
+```sh
+curl -X POST "$SCARAB/v1/orgs/acme/plugin-fetch" \
+  -d '{"source": "github.com/acme/scarab-plugins//notify/manifest.json@8c2f…"}'
+# → {"source": "…", "manifest": {…}, "manifest_sha256": "a41c…", "content": "…", "installed": []}
+
+curl -X POST "$SCARAB/v1/orgs/acme/plugins" \
+  -d '{"name": "notify", "image": "ghcr.io/acme/notify@sha256:…",
+       "source": "github.com/acme/scarab-plugins//notify/manifest.json@8c2f…",
+       "manifest_sha256": "a41c…"}'
+```
+
+The install body also takes `connection` (the connection the fetch read through), `config`
+(values for the manifest's config keys) and `storage` (below). After the install, bind each
+connection slot under the installation, or with `PUT /v1/orgs/{org}/plugins/{name}/connections/{slot}`.
+
+The installation records the source it was read from and the connection it was read through.
+An installation made before Scarab recorded sources shows "source not recorded".
+
+A manifest can name the image repository the plugin ships as, in its `image` field
+(`"image": "ghcr.io/thulasi-ram/scarab-plugin-argocd"`, no tag or digest). Scarab then refuses an
+install or upgrade with an image of any other repository (400), so the manifest cannot be paired
+with someone else's build. A manifest without `image` installs with any repository, and the review
+says that it names none.
+
+#### Upgrade a plugin
+
+Open the installation's page and choose **Upgrade**, or use the API, in two steps:
+
+1. **Fetch and compare.** Give the new commit, and Scarab reads the recorded source's file at that
+   commit; or give a whole source to read another file. Scarab has no branch lookup, so you give
+   the commit. It shows what the new manifest adds, removes and keeps against the installed one:
+   capabilities, connection slots, auth schemes, read rules, config keys, gates and the named
+   image.
+2. **Upgrade.** Give the image pinned by digest: a new one, or the installed one to change only
+   the manifest. Scarab reads the source again and refuses the upgrade (409) if the manifest is
+   not the one you compared, if the installation changed since you compared it, or while plugins
+   are off.
+
+A new image digest is new code, so an upgrade to one asks you to confirm with your passkey, as an
+install does, even when the manifest is the same or narrower. So does a manifest that adds a
+capability, a connection slot, an auth scheme, a read rule or a gate, or that stops naming its
+image or names another. The one upgrade that needs no passkey keeps the installed image and
+removes from the manifest or keeps it as it is. Scarab decides this from the installation and the
+manifest it reads; the request cannot say it. Give the image to the fetch too, and its answer
+(`needs_step_up`, with `step_up_reasons`) says which applies.
+
+```sh
+curl -X POST "$SCARAB/v1/orgs/acme/plugins/notify/upgrade-fetch" \
+  -d '{"commit": "4b1e…", "image": "ghcr.io/acme/notify@sha256:…"}'
+# → {"source": "…@4b1e…", "manifest_sha256": "77d0…", "current_manifest_sha256": "a41c…",
+#    "diff": {"read_rules": {"added": [], "removed": ["api: GET /v1/legacy"], …}, …},
+#    "step_up_reasons": ["runs new code: image `…` instead of `…`"], "needs_step_up": true, …}
+
+curl -X POST "$SCARAB/v1/orgs/acme/plugins/notify/upgrade" \
+  -d '{"image": "ghcr.io/acme/notify@sha256:…",
+       "source": "github.com/acme/scarab-plugins//notify/manifest.json@4b1e…",
+       "manifest_sha256": "77d0…", "expected_current_sha256": "a41c…"}'
+```
+
+The installation keeps its name, id, config, storage, state and connection bindings. A config key
+or connection slot the new manifest no longer declares is dropped, and a dropped binding's
+credential is deleted. Scarab keeps the version the upgrade replaced (image, manifest, source and
+who approved it) and restarts the plugin with the new image after the isolation probe passes
+again.
+
 #### Plugin storage
 
 Create the claim in the plugin namespace (`plugins.namespace`, default `scarab-plugins`) and
@@ -237,7 +416,8 @@ spec:
       storage: 1Gi
 ```
 
-Then name it on the installation, under Settings › Plugins › storage, or with
+Then name it on the installation's page (Settings › Plugins, then the installation's row), under
+**Storage**, or with
 `PUT /v1/orgs/{org}/plugins/{name}/storage` and a body of
 `{"claim": "argocd-state", "mount_path": "/data"}`. `mount_path` defaults to `/data`; it
 can't be `/`, and it can't overlap `/tmp`, `/var/run/secrets` or the other paths the runtime
@@ -322,8 +502,9 @@ Members page, run the server binary with the database URL:
 scarab-server admin grant --org acme --subject github:alice --role member --reason "first members"
 ```
 
-`--role` is `viewer`, `member`, `admin` or `owner`. The person must have signed in once; until
-then the command exits 3 and says so. The command sets the role exactly: it lowers a higher
+`--subject` is the person's handle, the name they signed in under (`github:alice`); their
+Scarab id (`p_` and 32 hex characters) works too. `--role` is `viewer`, `member`, `admin` or
+`owner`. The person must have signed in once; until then the command exits 3 and says so. The command sets the role exactly: it lowers a higher
 role, restores a revoked one, and turns a role a forge import gave into one the forge sync
 does not change. When the person already holds that role, nothing is written. Each grant is
 recorded in the org's event log as `binding.operator_grant`, with the host, OS user and

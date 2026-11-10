@@ -15,6 +15,15 @@ use scarab_policy::run_create::{self as rc, Org, Project, TriggerKind};
 use scarab_policy::schema::{check_string_lengths, Capped, Timestamp};
 use scarab_policy::store::{DecisionRecord, PolicyStore, StoredPolicy};
 
+/// A Principal as a Policy input names it (ADR-0080 §4): the handle a rule's
+/// literals compare, and the id beside it. For a reference that names no
+/// Principal both are the reference.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Named {
+    pub id: String,
+    pub handle: String,
+}
+
 /// What a `gate.resolve` consultation of one gate knows besides the
 /// approvals and the time.
 pub(crate) struct GateResolveFacts {
@@ -86,8 +95,8 @@ impl GateResolveFacts {
     /// workers.
     pub(crate) async fn decide(
         &self,
-        actor: &str,
-        approvals: &[String],
+        actor: &Named,
+        approvals: &[Named],
         now_ms: i64,
         builtin: Option<PolicyResult>,
     ) -> Result<PolicyDecision, DbError> {
@@ -117,11 +126,19 @@ impl GateResolveFacts {
 
     fn input(
         &self,
-        actor: &str,
-        approvals: &[String],
+        actor: &Named,
+        approvals: &[Named],
         now_ms: i64,
     ) -> Result<serde_json::Value, String> {
         let gate = self.gate.clone()?;
+        let too_many = || {
+            format!(
+                "the gate has {} approvals, more than the {} a gate.resolve Policy can \
+                 check",
+                approvals.len(),
+                gr::MAX_APPROVALS
+            )
+        };
         let input = GateResolveInput {
             org: Org {
                 name: self.org.clone(),
@@ -132,16 +149,15 @@ impl GateResolveFacts {
             gate,
             verdict: gr::Verdict::Release,
             actor: gr::Actor {
-                principal: actor.to_string(),
+                principal: actor.handle.clone(),
+                principal_id: Some(actor.id.clone()),
             },
-            approvals: Capped::new(approvals.to_vec()).ok_or_else(|| {
-                format!(
-                    "the gate has {} approvals, more than the {} a gate.resolve Policy can \
-                     check",
-                    approvals.len(),
-                    gr::MAX_APPROVALS
-                )
-            })?,
+            approvals: Capped::new(approvals.iter().map(|a| a.handle.clone()).collect())
+                .ok_or_else(too_many)?,
+            approval_ids: Some(
+                Capped::new(approvals.iter().map(|a| a.id.clone()).collect())
+                    .ok_or_else(too_many)?,
+            ),
             run: self.run.clone(),
             time: Timestamp::from_unix_millis(now_ms)
                 .ok_or_else(|| format!("the time {now_ms} is out of range"))?,

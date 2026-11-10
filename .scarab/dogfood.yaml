@@ -117,8 +117,8 @@ services:
       exec: [pg_isready, -U, postgres]
 
 steps:
-  # --- checkout (ADR-0076 §9): the first-party clone library ----------------
-  # The org installs `lib:thulasi-ram/clone`; its Step is `checkout/git`, and
+  # --- checkout (ADR-0076 §9): Scarab's clone library ------------------------
+  # An org admin installs `lib:thulasi-ram/clone`; its Step is `checkout/git`, and
   # `needs: [checkout]` reaches it across the invoke.
   - id: checkout
     invoke: lib:thulasi-ram/clone

@@ -26,6 +26,7 @@ use scarab_testkit::{
 fn scoped(subject: &str) -> Principal {
     Principal {
         subject: subject.into(),
+        handle: String::new(),
         display_name: None,
         roles: vec![],
     }
@@ -77,6 +78,7 @@ async fn harness(bind: &[(&str, &str)]) -> Harness {
                 "root-code",
                 Principal {
                     subject: "root".into(),
+                    handle: String::new(),
                     display_name: None,
                     roles: vec![Role::Owner], // global bootstrap owner
                 },

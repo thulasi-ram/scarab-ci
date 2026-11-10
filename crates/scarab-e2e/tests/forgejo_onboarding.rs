@@ -225,13 +225,10 @@ async fn a_real_forgejo_repo_onboards_and_its_push_becomes_a_run() {
 // refuses only the Pipeline that reads it, and a yank refuses a Rerun.
 // ---------------------------------------------------------------------------
 
-/// The library this case installs: `.scarab/lib/notify.yaml` of this
-/// repository at the commit that gave it a numeric non-root user (edd63788),
-/// fetched anonymously from github.com. It asks for no forge token, so it
-/// runs against a plain-HTTP Forgejo.
-const NOTIFY_SOURCE: &str =
-    "github.com/thulasi-ram/scarab-ci//.scarab/lib/notify.yaml@edd63788668ca551d4871f2a0856c0dc56783493";
-
+/// The library this case installs is `.scarab/lib/notify.yaml` of this
+/// checkout, which deploy/kind/forgejo.sh copies into the org's
+/// `scarab-libs` repository on the in-cluster Forgejo. It asks for no forge
+/// token, so it runs against a plain-HTTP Forgejo.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs the kind release and a seeded Forgejo; run `just test e2e`"]
 async fn an_installed_library_runs_and_a_yank_refuses_its_rerun() {
@@ -248,9 +245,28 @@ async fn an_installed_library_runs_and_a_yank_refuses_its_rerun() {
     let (org, project) = connect_and_bind(&http, &base, &server_side, &token, &owner, &name).await;
 
     // --- 1. fetch and install lib:thulasi-ram/notify ------------------------
+    // From the org's copy of the libraries on this Forgejo (deploy/kind/
+    // forgejo.sh seeds it from .scarab/lib/notify.yaml), read through the
+    // org's own connection: no install reads github.com.
+    let conn = connection_id(&http, &base, &org, &server_side).await;
+    let host = reqwest::Url::parse(&server_side)
+        .expect("SCARAB_TEST_FORGEJO_SERVER_URL is a URL")
+        .host_str()
+        .expect("a host")
+        .to_string();
+    let notify_source = format!(
+        "{host}/{owner}/{}//notify.yaml@{}",
+        env("SCARAB_TEST_FORGEJO_LIBS_REPO"),
+        env("SCARAB_TEST_FORGEJO_LIBS_COMMIT")
+    );
     let fetched = json_ok(
         http.post(format!("{base}/v1/orgs/{org}/libraries/fetch"))
-            .json(&serde_json::json!({ "source": NOTIFY_SOURCE }))
+            .json(&serde_json::json!({
+                "source": notify_source,
+                "connection": conn,
+                "publisher": "thulasi-ram",
+                "name": "notify",
+            }))
             .send()
             .await
             .expect("POST libraries/fetch"),

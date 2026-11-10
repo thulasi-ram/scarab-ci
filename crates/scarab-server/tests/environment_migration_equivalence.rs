@@ -699,10 +699,13 @@ fn gate_app(pg: &Arc<PostgresDb>) -> axum::Router {
         Arc::new(InMemoryObjectStore::new()),
         pg.clone(),
     ));
+    // Migration 0093 stores approver lists as Principal ids (placeholders for
+    // these names nobody signed in as); approvals recorded under a name are
+    // compared through the identity store, as on a server with login.
     router(
         AppState::new(db, Arc::new(FakeClock::new(1_000)), logs)
-            .with_approval_history(pg.clone())
-            .with_environment_governance(pg.clone()),
+            .with_environment_governance(pg.clone())
+            .with_identities(pg.clone()),
     )
 }
 

@@ -144,7 +144,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                      step-up confirmation(s); recorded as passkey.break_glass_reset \
                      (host {}, user {}). Their next passkey needs a fresh browser login.",
                     done.removed,
-                    done.subject,
+                    done.handle,
                     done.windows_revoked,
                     operator.host,
                     operator.os_user
@@ -316,8 +316,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Durable store — mandatory, already guaranteed by the config gate.
     let pg = PostgresDb::connect(&database_url).await?;
     pg.migrate().await?;
+    // ADR-0080 §6: handles that differ only in case were kept as separate
+    // Principals by migration 0093. Say so at every boot until an operator
+    // has dealt with them; nothing merges them automatically.
+    match pg.case_duplicate_handles().await {
+        Ok(groups) => {
+            for group in groups {
+                tracing::warn!(
+                    handles = %group.join(", "),
+                    "principals: these handles differ only in case; each is its own \
+                     Principal (ADR-0080). Type them exactly in grants and approver lists"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "principals: could not check for case-only duplicate handles")
+        }
+    }
     // Keep a typed handle so the same Postgres adapter can back the `Db` port
-    // and every store port it implements (approval history, governance, …).
+    // and every store port it implements (governance, policies, …).
     let pg = Arc::new(pg);
     let db: Arc<dyn Db> = pg.clone();
 
@@ -679,20 +696,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         scarab_server::connections_config::CredentialOverrides::from_specs(&config.connections)
             .with_github_app_pem(github_app_pem.clone(), config.github_app_id.is_some()),
     );
-    // The orgs config bound repos into: offered their first-party libraries
-    // once the API state exists (ADR-0076 §5).
-    let mut provisioned_orgs = std::collections::BTreeSet::new();
     {
         let provisioned =
             scarab_server::connections_config::provision(pg.as_ref(), &config.connections)
                 .await
                 .map_err(|e| format!("refusing to start: {e}"))?;
-        provisioned_orgs.extend(
-            provisioned
-                .bound
-                .iter()
-                .filter_map(|r| r.split_once('/').map(|(org, _)| org.to_string())),
-        );
         if !provisioned.owned.is_empty() {
             tracing::info!(
                 connections = ?provisioned.owned,
@@ -863,7 +871,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .with_libraries(pg.clone())
                     // ADR-0075 §3: the `step.admit` decision at each launch,
                     // recorded once per Attempt.
-                    .with_policies(pg.clone());
+                    .with_policies(pg.clone())
+                    // ADR-0080 §3: a recorded approver set compares as ids.
+                    .with_identities(pg.clone());
             // Per-attempt OIDC federation tokens (ADR-0015), tmpfs-delivered.
             if let (Some(issuer), Some(oidc_cfg)) = (oidc_issuer.clone(), &config.oidc) {
                 secret_exec = secret_exec.with_oidc(
@@ -887,7 +897,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .with_libraries(db.clone(), pg.clone())
                     // So is a deploy Step whose Environment no longer admits
                     // its Project (ADR-0071 §2).
-                    .with_environment_governance(db.clone(), pg.clone()),
+                    .with_environment_governance(db.clone(), pg.clone())
+                    .with_identities(pg.clone()),
             );
             // Local host processes finish instantly, so re-poll them quickly; k8s
             // Pods take time, so the default window avoids thundering re-claims.
@@ -936,9 +947,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Where people open the UI (SCARAB_UI_URL, default the public URL):
         // the OAuth callback and step-up confirmation links point there.
         .with_ui_url(config.ui_url.clone())
-        // The legacy approval history (ADR-0024, ADR-0070 §1), still written
-        // on every gate release.
-        .with_approval_history(pg.clone())
         // Org-level Environment governance (ADR-0071): what admits and governs
         // every Deploy Run. ALWAYS wired here — an unwired store would admit
         // deploys with no rules, which only a hand-built test state may do.
@@ -946,12 +954,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Stored Policies (ADR-0075), consulted at Run creation.
         .with_policies(pg.clone())
         // Org-installed libraries and yanks (ADR-0076): compiling resolves
-        // `lib:` through them; the release manifest says which versions are
-        // first-party (`SCARAB_LIBS_MANIFEST`: unset, `off`, a URL or a file).
+        // `lib:` through them.
         .with_libraries(pg.clone())
-        .with_first_party(scarab_server::libraries::ManifestSource::from_env(
-            std::env::var("SCARAB_LIBS_MANIFEST").ok().as_deref(),
-        ))
         // Org-level Environments (ADR-0071): their admin API.
         .with_org_environments(pg.clone())
         // The PluginInstallation registry (ADR-0072). Wired whatever
@@ -994,11 +998,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match scarab_server::library_fetch::HttpsFetcher::new() {
         Ok(f) => state = state.with_library_fetcher(Arc::new(f)),
         Err(e) => tracing::warn!(error = %e, "anonymous library fetches are off"),
-    }
-    // A new org bound by config gets the first-party libraries (ADR-0076 §5);
-    // claimed here, installed in the background.
-    for org in &provisioned_orgs {
-        scarab_server::libraries::offer_defaults_on_bind(&state, org).await;
     }
     // The rerun-widening oracle's strict handle (git-bug 4afaa3e amendment F1):
     // only exists when a Depot is configured — without one, `workspace_cas` IS

@@ -4,14 +4,16 @@
 // nobody holds would be claimed by whoever produced it first at sign-in — so
 // the input is a search over the users Scarab knows, not a free-text
 // box. It shows who someone IS (name, linked accounts, whether they have
-// signed in yet) and hands back the id a grant stores.
+// signed in yet) and hands back their handle, which the server resolves to
+// the Principal a grant stores.
 import { For, Show, createSignal, onCleanup } from "solid-js";
 import { searchPrincipals, type PrincipalMatch } from "../api/client";
 import { Input } from "./Field";
 
 export default function PrincipalSearch(props: {
   org: string;
-  onPick: (id: string) => void;
+  /** Called with the picked person's handle. */
+  onPick: (handle: string) => void;
   placeholder?: string;
 }) {
   const [q, setQ] = createSignal("");
@@ -40,8 +42,8 @@ export default function PrincipalSearch(props: {
     }, 180);
   };
 
-  const pick = (id: string) => {
-    props.onPick(id);
+  const pick = (handle: string) => {
+    props.onPick(handle);
     setQ("");
     setHits([]);
   };
@@ -68,9 +70,9 @@ export default function PrincipalSearch(props: {
           <For each={hits()}>
             {(h) => (
               <li>
-                <button type="button" class="ps-hit" onClick={() => pick(h.id)}>
-                  <span class="ps-name">{h.display_name || h.id}</span>
-                  <span class="ps-id mono">{h.id}</span>
+                <button type="button" class="ps-hit" onClick={() => pick(h.handle)}>
+                  <span class="ps-name">{h.display_name || h.handle}</span>
+                  <span class="ps-id mono">{h.handle}</span>
                   <For each={h.identities}>
                     {(i) => (
                       <span class="ps-acct mono">

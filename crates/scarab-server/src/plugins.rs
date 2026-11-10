@@ -1,6 +1,6 @@
 //! Plugins (ADR-0072, MMP slice d1): the org-admin API for
-//! PluginInstallations — the compiled-in first-party catalog, install,
-//! uninstall, the kill switch.
+//! PluginInstallations — fetch a manifest to review, install, uninstall, the
+//! kill switch.
 //!
 //! What a plugin itself calls lives on the CredentialBroker's own listener
 //! ([`crate::broker`]), never here: this module is the public API.
@@ -12,13 +12,27 @@
 //! endpoint — and every bind replaces destination and credential together,
 //! so a destination is never re-aimed with a credential entered for another.
 //!
-//! **Third-party installs are off** (ADR-0072 consequences) until
-//! StepUpConfirmation and publisher signatures exist: only a catalog entry
-//! compiled into this binary can be installed, and only by **digest** of its
-//! catalog repository. Every route needs Administer on the Org.
+//! **Every plugin installs the same way**, whoever published it: an org
+//! admin reads its PluginManifest from a git source pinned to a commit
+//! (`POST …/plugin-fetch`, which installs nothing), reviews what it asks for,
+//! and installs it by image **digest** with the manifest hash they reviewed
+//! (`POST …/plugins`, a step-up). The server reads the source again at
+//! install and refuses when it no longer has that hash, so what runs is what
+//! the admin approved. No plugin is installed or trusted by default, Scarab's
+//! own Argo CD plugin included. Every route needs Administer on the Org.
+//!
+//! **Upgrades** (ADR-0072 §10, amended 2026-11-10) read a new manifest the same
+//! way (`POST …/plugins/{name}/upgrade-fetch`, by default the recorded
+//! source's file at a new commit), show what it adds, removes and keeps
+//! against the installed one, and apply it (`POST …/plugins/{name}/upgrade`)
+//! only if the installed manifest is still the one the admin compared
+//! against. A new image digest is new code and needs a step-up, as an install
+//! does, and so does a manifest that asks for more; only a same-or-narrower
+//! manifest on the installed image is exempt. The server decides.
+//! A manifest may name its image repository; an install or upgrade with an
+//! image of another repository is refused.
 
 use std::collections::BTreeMap;
-use std::sync::OnceLock;
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -26,22 +40,21 @@ use axum::{Extension, Json};
 use scarab_engine::DbError;
 use scarab_identity::Action;
 use scarab_plugin::{
-    admit_for_mmp, validate_installation_name, BrokerJournalFilter, BrokerJournalPhase,
-    BrokerJournalRecord, ConnectionSlot, InstallationState, PluginCapability, PluginConnection,
+    admit_for_mmp, image_repository, is_image_repository, validate_installation_name,
+    BrokerJournalFilter, BrokerJournalPhase, BrokerJournalRecord, ConnectionSlot,
+    InstallationState, ManifestDiff, PluginCapability, PluginConnection,
     PluginConnectionAuthScheme, PluginInstallation, PluginManifest, PluginStorage,
-    PluginStoreError, RequestRule, RuntimeStatus, MAX_CONNECTION_BASE_URL_CHARS,
-    MAX_CONNECTION_CA_PEM_BYTES, MAX_CONNECTION_CREDENTIAL_BYTES, PLUGIN_STORAGE_OWNER_ANNOTATION,
+    PluginStoreError, PluginUpgrade, RequestRule, RuntimeStatus, SetDiff,
+    MAX_CONNECTION_BASE_URL_CHARS, MAX_CONNECTION_CA_PEM_BYTES, MAX_CONNECTION_CREDENTIAL_BYTES,
+    PLUGIN_STORAGE_OWNER_ANNOTATION,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use utoipa::{IntoParams, ToSchema};
 
 use super::{authorize_scoped, rbac_scope, ApiError, AppState};
+use crate::library_fetch::LibrarySource;
 use crate::step_up::GuardCtx;
-
-/// The first-party Argo CD plugin's manifest, compiled in: what an admin
-/// approves for it is exactly this document plus a digest (ADR-0072 §1-2).
-const ARGOCD_MANIFEST_JSON: &str = include_str!("../../scarab-plugin-argocd/manifest.json");
 
 /// The reserved secret-scope org PluginConnection credentials live under
 /// (ADR-0072 §5), beside forge credentials' `_forge`: a connection row holds
@@ -64,9 +77,8 @@ pub struct PluginPolicy {
     pub enabled: bool,
     /// The namespace a broker caller's ServiceAccount must be in.
     pub namespace: String,
-    /// The repository the first-party Argo CD plugin installs from.
-    pub argocd_repo: String,
-    /// Dev only: a first-party install may name a tag instead of a digest.
+    /// Dev only: any install may name `<repository>:<tag>` instead of a
+    /// digest.
     pub dev_allow_tag: bool,
 }
 
@@ -75,7 +87,6 @@ impl PluginPolicy {
         Self {
             enabled: c.enabled,
             namespace: c.namespace.clone(),
-            argocd_repo: c.argocd_repo.clone(),
             dev_allow_tag: c.dev_allow_tag,
         }
     }
@@ -86,68 +97,45 @@ impl PluginPolicy {
     }
 }
 
-/// One plugin this binary can install.
-struct CatalogEntry {
-    manifest: PluginManifest,
-    repository: String,
-    description: &'static str,
-}
-
-/// The compiled-in first-party catalog. Its manifests are this binary's own
-/// files, so one that does not parse or is not admitted is a build defect —
-/// `catalog_manifests_parse_and_are_admitted` keeps that from shipping.
-fn first_party_catalog(policy: &PluginPolicy) -> Vec<CatalogEntry> {
-    static ARGOCD: OnceLock<PluginManifest> = OnceLock::new();
-    let argocd = ARGOCD.get_or_init(|| {
-        serde_json::from_str(ARGOCD_MANIFEST_JSON).expect("the compiled-in Argo CD manifest parses")
-    });
-    vec![CatalogEntry {
-        manifest: argocd.clone(),
-        repository: policy.argocd_repo.clone(),
-        description: "Reads Argo CD Applications through the CredentialBroker and \
-                      resolves the `wait-live` gate (first-party).",
-    }]
-}
-
-/// The refusal every non-first-party install gets, verbatim.
-fn third_party_refusal(detail: String) -> ApiError {
-    ApiError::Denied(format!("third-party installs are off (ADR-0072): {detail}"))
-}
-
-/// `image` must be `<repository>@sha256:<64 lowercase hex>` — a digest is
-/// what an admin approves (ADR-0072 §10); a tag can change under the same
-/// name. `<repository>:<tag>` only under the dev knob.
-fn check_image(image: &str, repository: &str, allow_tag: bool) -> Result<(), ApiError> {
-    if let Some(digest) = image
-        .strip_prefix(repository)
-        .and_then(|rest| rest.strip_prefix("@sha256:"))
-    {
-        if digest.len() == 64
+/// `image` must be `<repository>@sha256:<64 lowercase hex>`, for any
+/// repository: a digest is what an admin approves (ADR-0072 §10), and a tag
+/// can change under the same name. `<repository>:<tag>` only under the dev
+/// knob, for every plugin alike.
+fn check_image(image: &str, allow_tag: bool) -> Result<(), ApiError> {
+    if let Some((repository, digest)) = image.split_once("@sha256:") {
+        if is_image_repository(repository)
+            && digest.len() == 64
             && digest
-                .chars()
-                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         {
             return Ok(());
         }
-    }
-    if allow_tag {
-        if let Some(tag) = image
-            .strip_prefix(repository)
-            .and_then(|rest| rest.strip_prefix(':'))
-        {
+    } else if allow_tag {
+        // The tag is after the last `:` of the last path component, so a
+        // registry port is not read as one.
+        let last = image.rsplit('/').next().unwrap_or(image);
+        if let Some((_, tag)) = last.rsplit_once(':') {
+            let repository = &image[..image.len() - tag.len() - 1];
             let ok = !tag.is_empty()
                 && tag.len() <= 128
                 && !tag.starts_with(['.', '-'])
                 && tag
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'));
-            if ok {
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'));
+            if ok && is_image_repository(repository) {
                 return Ok(());
             }
         }
     }
-    Err(third_party_refusal(format!(
-        "image `{image}` is not `{repository}@sha256:<digest>`"
+    Err(ApiError::BadRequest(format!(
+        "image `{image}` is not `<repository>@sha256:<64 lowercase hex>`: a plugin is installed \
+         by digest, so what runs is the image you approved{}",
+        if allow_tag {
+            " (or `<repository>:<tag>` under SCARAB_DEV_PLUGIN_ALLOW_TAG)"
+        } else {
+            ""
+        }
     )))
 }
 
@@ -158,7 +146,9 @@ fn mint_installation_id() -> String {
     bytes[..5].iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn manifest_sha256(manifest: &PluginManifest) -> String {
+/// The SHA-256 an installation records for its manifest: of the manifest
+/// as serde writes it, so the file's layout does not change it.
+pub fn manifest_sha256(manifest: &PluginManifest) -> String {
     let bytes = serde_json::to_vec(manifest).expect("a manifest serializes");
     Sha256::digest(&bytes)
         .iter()
@@ -282,6 +272,10 @@ pub struct ConnectionSlotDto {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct PluginManifestDto {
     pub plugin: String,
+    /// The image repository the plugin ships as, when the manifest names
+    /// one: an install or upgrade must run an image of it. Absent = the
+    /// manifest does not name its image, so any repository is accepted.
+    pub image: Option<String>,
     pub capabilities: Vec<PluginCapabilityDto>,
     pub connections: Vec<ConnectionSlotDto>,
     pub config_keys: Vec<String>,
@@ -324,6 +318,7 @@ impl From<&PluginManifest> for PluginManifestDto {
     fn from(m: &PluginManifest) -> Self {
         Self {
             plugin: m.plugin.clone(),
+            image: m.image.clone(),
             capabilities: m.capabilities.iter().map(|c| (*c).into()).collect(),
             connections: m
                 .connections
@@ -367,17 +362,43 @@ impl From<&PluginManifest> for PluginManifestDto {
     }
 }
 
-/// A plugin this Scarab can install.
+/// `POST /v1/orgs/{org}/plugin-fetch`.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FetchPluginManifestRequest {
+    /// The plugin's manifest file, `<host>/<owner>/<repo>//<path>@<commit>`;
+    /// the path ends in `.json`, `.yaml` or `.yml`.
+    pub source: String,
+    /// A ForgeConnection id, for a private repository of the org. Omitted:
+    /// read anonymously over https from github.com or a Forgejo
+    /// connection's host.
+    #[serde(default)]
+    pub connection: Option<String>,
+}
+
+/// A plugin manifest read for review. Nothing is stored or installed.
 #[derive(Debug, Serialize, ToSchema)]
-pub struct PluginCatalogEntryDto {
-    /// The catalog key `POST …/plugins` names as `plugin`.
-    pub plugin: String,
-    pub description: String,
-    /// Install as `<image_repository>@sha256:<digest>`.
-    pub image_repository: String,
+pub struct FetchedPluginManifestDto {
+    /// The source as read, pinned to its commit.
+    pub source: String,
+    /// The file as read.
+    pub content: String,
+    /// What the plugin asks for: what an install approves with the image
+    /// digest.
     pub manifest: PluginManifestDto,
-    /// Always true today: third-party installs are off.
-    pub first_party: bool,
+    /// Pass it to `POST …/plugins` as `manifest_sha256`.
+    pub manifest_sha256: String,
+    /// The org's installations of the same plugin (`manifest.plugin`), by
+    /// name, each with the manifest hash it was approved with.
+    pub installed: Vec<InstalledPluginManifestDto>,
+}
+
+/// An installation of the plugin a fetch read.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct InstalledPluginManifestDto {
+    pub name: String,
+    pub image: String,
+    pub manifest_sha256: String,
 }
 
 /// Whether an installation's broker calls are accepted.
@@ -431,13 +452,20 @@ pub struct PluginInstallationDto {
     pub org: String,
     /// Unique in the org and never reused.
     pub name: String,
-    /// The catalog plugin.
+    /// The plugin's own name, from its manifest.
     pub plugin: String,
     /// `plugin:<name>` — what it acts as in audit.
     pub principal: String,
     pub image: String,
     pub manifest: PluginManifestDto,
     pub manifest_sha256: String,
+    /// Where the approved manifest was read,
+    /// `<host>/<owner>/<repo>//<path>@<commit>`. Absent for an installation
+    /// made before the source was recorded.
+    pub source: Option<String>,
+    /// The ForgeConnection the source was read through; absent = read
+    /// anonymously, or not recorded.
+    pub source_connection: Option<String>,
     pub config: BTreeMap<String, String>,
     pub state: InstallationStateDto,
     pub runtime_status: RuntimeStatusDto,
@@ -501,6 +529,22 @@ impl PluginStorageRequest {
     }
 }
 
+/// [`installation_dto`] with each person shown by handle (ADR-0080 §3).
+async fn installation_view(st: &AppState, i: &PluginInstallation) -> PluginInstallationDto {
+    let people = st
+        .people(
+            [i.approved_by.as_str()]
+                .into_iter()
+                .chain(i.killed_by.as_deref()),
+        )
+        .await;
+    PluginInstallationDto {
+        approved_by: people.handle(&i.approved_by),
+        killed_by: people.handle_opt(i.killed_by.as_deref()),
+        ..installation_dto(i)
+    }
+}
+
 fn installation_dto(i: &PluginInstallation) -> PluginInstallationDto {
     PluginInstallationDto {
         id: i.id.clone(),
@@ -511,6 +555,8 @@ fn installation_dto(i: &PluginInstallation) -> PluginInstallationDto {
         image: i.image.clone(),
         manifest: (&i.manifest).into(),
         manifest_sha256: i.manifest_sha256.clone(),
+        source: i.source.clone(),
+        source_connection: i.source_connection.clone(),
         config: i.config.clone(),
         state: i.state.into(),
         runtime_status: i.runtime_status.into(),
@@ -531,16 +577,153 @@ pub struct InstallPluginRequest {
     /// The installation's name: a DNS-1123 label, unique in the org and
     /// never reused once uninstalled.
     pub name: String,
-    /// The catalog plugin (`argocd`).
-    pub plugin: String,
-    /// `<catalog image_repository>@sha256:<64 hex>`.
+    /// `<repository>@sha256:<64 hex>`.
     pub image: String,
+    /// The manifest's source, as `POST …/plugin-fetch` read it. Read again
+    /// here.
+    pub source: String,
+    /// The connection the fetch read it through, if any.
+    #[serde(default)]
+    pub connection: Option<String>,
+    /// The `manifest_sha256` the fetch returned, which the admin reviewed.
+    /// The install is refused (409) when the source no longer reads as it.
+    pub manifest_sha256: String,
     /// Values for the manifest's `config_keys`; omitted = none.
     #[serde(default)]
     pub config: BTreeMap<String, String>,
     /// A PersistentVolumeClaim to mount (ADR-0074 §7); omitted = none.
     #[serde(default)]
     pub storage: Option<PluginStorageRequest>,
+}
+
+/// `POST /v1/orgs/{org}/plugins/{name}/upgrade-fetch`: which manifest to
+/// read for the upgrade. Either `source`, or `commit` to read the file the
+/// installation's recorded source names at that commit.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FetchPluginUpgradeRequest {
+    /// The new manifest's source, `<host>/<owner>/<repo>//<path>@<commit>`.
+    /// Omitted: the recorded source's file at `commit`.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// A full commit id (40 or 64 lowercase hex). Read when `source` is
+    /// omitted; the installation must have a recorded source then. There is
+    /// no branch resolution: the admin names the commit.
+    #[serde(default)]
+    pub commit: Option<String>,
+    /// A ForgeConnection id to read it through. Omitted with `source`: read
+    /// anonymously. Omitted with `commit`: the connection the recorded source
+    /// was read through.
+    #[serde(default)]
+    pub connection: Option<String>,
+    /// The image the upgrade would run, `<repository>@sha256:<64 hex>`. When
+    /// given, it is checked against the new manifest's named repository, and
+    /// `needs_step_up` is judged with it: any image other than the installed
+    /// one needs a step-up. Omitted: judged as keeping the installed image.
+    #[serde(default)]
+    pub image: Option<String>,
+}
+
+/// One group of an upgrade's manifest diff.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ManifestDiffGroupDto {
+    /// Only in the new manifest.
+    pub added: Vec<String>,
+    /// Only in the installed manifest.
+    pub removed: Vec<String>,
+    /// In both.
+    pub unchanged: Vec<String>,
+}
+
+impl<T: ToString> From<&SetDiff<T>> for ManifestDiffGroupDto {
+    fn from(d: &SetDiff<T>) -> Self {
+        let strings = |xs: &[T]| xs.iter().map(ToString::to_string).collect();
+        Self {
+            added: strings(&d.added),
+            removed: strings(&d.removed),
+            unchanged: strings(&d.unchanged),
+        }
+    }
+}
+
+/// The installed manifest against the new one, group by group.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ManifestDiffDto {
+    pub capabilities: ManifestDiffGroupDto,
+    /// Connection slot names.
+    pub connections: ManifestDiffGroupDto,
+    /// `<slot>: <scheme>`.
+    pub auth_schemes: ManifestDiffGroupDto,
+    /// `<slot>: <method> <path>[ ?<query keys>]`. One more allowed query key
+    /// is a new rule.
+    pub read_rules: ManifestDiffGroupDto,
+    pub config_keys: ManifestDiffGroupDto,
+    /// Gate names; a gate whose definition changed is both removed and
+    /// added.
+    pub gates: ManifestDiffGroupDto,
+    /// The image repository the manifest names.
+    pub image: ManifestDiffGroupDto,
+}
+
+impl From<&ManifestDiff> for ManifestDiffDto {
+    fn from(d: &ManifestDiff) -> Self {
+        Self {
+            capabilities: (&d.capabilities).into(),
+            connections: (&d.connections).into(),
+            auth_schemes: (&d.auth_schemes).into(),
+            read_rules: (&d.read_rules).into(),
+            config_keys: (&d.config_keys).into(),
+            gates: (&d.gates).into(),
+            image: (&d.image).into(),
+        }
+    }
+}
+
+/// A manifest read for an upgrade, and what it changes. Nothing is stored.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct FetchedPluginUpgradeDto {
+    /// The source as read, pinned to its commit: pass it to `…/upgrade`.
+    pub source: String,
+    /// The connection it was read through: pass it to `…/upgrade`.
+    pub connection: Option<String>,
+    /// The file as read.
+    pub content: String,
+    pub manifest: PluginManifestDto,
+    /// Pass it to `…/upgrade` as `manifest_sha256`.
+    pub manifest_sha256: String,
+    /// The installed manifest's hash: pass it to `…/upgrade` as
+    /// `expected_current_sha256`.
+    pub current_manifest_sha256: String,
+    pub current_image: String,
+    pub diff: ManifestDiffDto,
+    /// Why `…/upgrade` asks for a step-up, each as a sentence: what the new
+    /// manifest asks for that the installed one did not, and a new image
+    /// (any digest other than the installed one is new code). Judged with
+    /// the request's `image`, or the installed image when it has none.
+    /// Empty = a narrowing on the same image, which needs none.
+    pub step_up_reasons: Vec<String>,
+    /// Whether `…/upgrade` asks for a step-up: exactly when there is a
+    /// reason. Decided again by the server at the upgrade.
+    pub needs_step_up: bool,
+}
+
+/// `POST /v1/orgs/{org}/plugins/{name}/upgrade`.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UpgradePluginRequest {
+    /// `<repository>@sha256:<64 hex>`.
+    pub image: String,
+    /// The new manifest's source, as `…/upgrade-fetch` returned it. Read
+    /// again here.
+    pub source: String,
+    #[serde(default)]
+    pub connection: Option<String>,
+    /// The new manifest's hash the admin reviewed; 409 when the source no
+    /// longer reads as it.
+    pub manifest_sha256: String,
+    /// The installed manifest's hash the diff was made against; 409 when the
+    /// installation has changed since.
+    pub expected_current_sha256: String,
 }
 
 /// What an uninstall removed.
@@ -841,37 +1024,75 @@ fn store(st: &AppState) -> Result<&dyn scarab_plugin::PluginStore, ApiError> {
     st.plugins.as_deref().ok_or(ApiError::NotFound)
 }
 
-/// The plugins this Scarab can install. Administer on the Org.
+/// Reads a manifest from `source` and checks it: it parses as a
+/// PluginManifest, every rule of the manifest holds, and it asks only for
+/// capabilities this Scarab admits. Returns the source as read, the file and
+/// the manifest.
+async fn read_manifest(
+    st: &AppState,
+    org: &str,
+    source: &str,
+    connection: Option<&str>,
+) -> Result<(LibrarySource, String, PluginManifest), ApiError> {
+    let src = LibrarySource::parse_manifest(source).map_err(ApiError::BadRequest)?;
+    let content = crate::libraries::read_source(st, org, &src, connection).await?;
+    let manifest: PluginManifest = if src.path.ends_with(".json") {
+        serde_json::from_str(&content).map_err(|e| e.to_string())
+    } else {
+        serde_yaml::from_str(&content).map_err(|e| e.to_string())
+    }
+    .map_err(|e| ApiError::BadRequest(format!("{src} is not a plugin manifest: {e}")))?;
+    admit_for_mmp(&manifest)
+        .map_err(|e| ApiError::BadRequest(format!("{src} cannot be installed: {e}")))?;
+    Ok((src, content, manifest))
+}
+
+/// Read a plugin's manifest from a git source pinned to a commit, check it,
+/// and return what it asks for, to review before installing. Stores and
+/// installs nothing. Administer on the Org.
 #[utoipa::path(
-    get,
-    path = "/v1/orgs/{org}/plugin-catalog",
+    post,
+    path = "/v1/orgs/{org}/plugin-fetch",
     params(("org" = String, Path, description = "org")),
-    summary = "The installable (first-party) plugins (ADR-0072)",
+    request_body = FetchPluginManifestRequest,
+    summary = "Fetch a plugin manifest to review before installing (ADR-0072)",
     responses(
-        (status = 200, body = [PluginCatalogEntryDto]),
-        (status = 403, description = "not an org admin"),
+        (status = 200, body = FetchedPluginManifestDto),
+        (status = 400, description = "a bad source, a fetch that failed, or a file that is not an admissible plugin manifest"),
+        (status = 403, description = "not an org admin, a host Scarab does not fetch from, or a private repository outside the org"),
         (status = 404, description = "plugins not configured")
     )
 )]
-pub(crate) async fn plugin_catalog(
+pub(crate) async fn fetch_plugin_manifest(
     State(st): State<AppState>,
     headers: HeaderMap,
     Path(org): Path<String>,
-) -> Result<Json<Vec<PluginCatalogEntryDto>>, ApiError> {
+    Json(body): Json<FetchPluginManifestRequest>,
+) -> Result<Json<FetchedPluginManifestDto>, ApiError> {
     org_admin(&st, &headers, &org).await?;
-    store(&st)?;
-    Ok(Json(
-        first_party_catalog(&st.plugin_policy)
-            .iter()
-            .map(|e| PluginCatalogEntryDto {
-                plugin: e.manifest.plugin.clone(),
-                description: e.description.to_string(),
-                image_repository: e.repository.clone(),
-                manifest: (&e.manifest).into(),
-                first_party: true,
-            })
-            .collect(),
-    ))
+    super::refuse_reserved_org(&org, "have a plugin installed")?;
+    let store = store(&st)?;
+    let (src, content, manifest) =
+        read_manifest(&st, &org, &body.source, body.connection.as_deref()).await?;
+    let installed = store
+        .installations(&org)
+        .await
+        .map_err(plugin_store_api_error)?
+        .into_iter()
+        .filter(|i| i.plugin == manifest.plugin)
+        .map(|i| InstalledPluginManifestDto {
+            name: i.name,
+            image: i.image,
+            manifest_sha256: i.manifest_sha256,
+        })
+        .collect();
+    Ok(Json(FetchedPluginManifestDto {
+        source: src.to_string(),
+        content,
+        manifest_sha256: manifest_sha256(&manifest),
+        manifest: (&manifest).into(),
+        installed,
+    }))
 }
 
 /// The org's PluginInstallations, by name. Administer on the Org.
@@ -898,27 +1119,29 @@ pub(crate) async fn list_plugins(
         .map_err(plugin_store_api_error)?;
     let mut out = Vec::with_capacity(installations.len());
     for installation in &installations {
-        out.push(installation_dto(installation));
+        out.push(installation_view(&st, installation).await);
     }
     Ok(Json(out))
 }
 
-/// Install a first-party plugin, pinned by digest. Administer on the Org.
+/// Install a plugin, pinned by image digest, with the manifest an admin
+/// reviewed (`POST …/plugin-fetch`). Every plugin installs this way. Needs a
+/// step-up. Administer on the Org.
 ///
-/// Third-party installs are off (403), and so are installs while
-/// `SCARAB_PLUGINS=off` (409).
+/// Refused while `SCARAB_PLUGINS=off` (409), and when the source no longer
+/// reads as the reviewed manifest (409).
 #[utoipa::path(
     post,
     path = "/v1/orgs/{org}/plugins",
     params(("org" = String, Path, description = "org")),
     request_body = InstallPluginRequest,
-    summary = "Install a first-party plugin (ADR-0072)",
+    summary = "Install a plugin from a reviewed manifest (ADR-0072)",
     responses(
         (status = 201, body = PluginInstallationDto),
-        (status = 400, description = "invalid name, config or storage"),
-        (status = 403, description = "not an org admin, or not a first-party plugin pinned by digest"),
+        (status = 400, description = "invalid name, image, source, manifest, config or storage"),
+        (status = 403, description = "not an org admin, no step-up, a host Scarab does not fetch from, or a private repository outside the org"),
         (status = 404, description = "plugins not configured"),
-        (status = 409, description = "the name is taken or retired, or plugins are off")
+        (status = 409, description = "the name is taken or retired, plugins are off, or the manifest is not the one reviewed")
     )
 )]
 pub(crate) async fn install_plugin(
@@ -938,21 +1161,24 @@ pub(crate) async fn install_plugin(
         ));
     }
     validate_installation_name(&body.name).map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    let catalog = first_party_catalog(&st.plugin_policy);
-    let entry = catalog
-        .iter()
-        .find(|e| e.manifest.plugin == body.plugin)
-        .ok_or_else(|| {
-            third_party_refusal(format!("`{}` is not a first-party plugin", body.plugin))
-        })?;
-    check_image(
-        &body.image,
-        &entry.repository,
-        st.plugin_policy.dev_allow_tag,
-    )?;
-    admit_for_mmp(&entry.manifest).map_err(|e| ApiError::Denied(e.to_string()))?;
-    entry
-        .manifest
+    check_image(&body.image, st.plugin_policy.dev_allow_tag)?;
+    // The admin approves (digest, manifest): read the manifest again and
+    // install it only if it is the one they reviewed.
+    let (src, _, manifest) =
+        read_manifest(&st, &org, &body.source, body.connection.as_deref()).await?;
+    let sha = manifest_sha256(&manifest);
+    if sha != body.manifest_sha256 {
+        return Err(ApiError::Conflict(format!(
+            "the manifest at {} now has hash {sha}, not the {} you reviewed; fetch it again \
+             and review what it asks for",
+            body.source.trim(),
+            body.manifest_sha256
+        )));
+    }
+    manifest
+        .check_image(&body.image)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    manifest
         .validate_config(&body.config)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let storage = body
@@ -966,10 +1192,12 @@ pub(crate) async fn install_plugin(
         id: mint_installation_id(),
         org,
         name: body.name,
-        plugin: entry.manifest.plugin.clone(),
+        plugin: manifest.plugin.clone(),
         image: body.image,
-        manifest_sha256: manifest_sha256(&entry.manifest),
-        manifest: entry.manifest.clone(),
+        manifest_sha256: sha,
+        manifest,
+        source: Some(src.to_string()),
+        source_connection: body.connection,
         config: body.config,
         state: InstallationState::Enabled,
         state_version: 0,
@@ -994,7 +1222,10 @@ pub(crate) async fn install_plugin(
             other => break other.map_err(plugin_store_api_error)?,
         }
     };
-    Ok((StatusCode::CREATED, Json(installation_dto(&stored))))
+    Ok((
+        StatusCode::CREATED,
+        Json(installation_view(&st, &stored).await),
+    ))
 }
 
 /// One installation. Administer on the Org.
@@ -1022,6 +1253,38 @@ pub(crate) async fn get_plugin(
         .installation(&org, &name)
         .await
         .map_err(plugin_store_api_error)?
+        .ok_or(ApiError::NotFound)?;
+    Ok(Json(installation_view(&st, &installation).await))
+}
+
+/// One installation, by its server-minted id: what the settings page's URL
+/// carries. Administer on the Org. An id of another org's installation is
+/// not found here.
+#[utoipa::path(
+    get,
+    path = "/v1/orgs/{org}/plugin-installations/{id}",
+    params(
+        ("org" = String, Path, description = "org"),
+        ("id" = String, Path, description = "installation id (10 hex)")
+    ),
+    summary = "One plugin installation, by id (ADR-0072)",
+    responses(
+        (status = 200, body = PluginInstallationDto),
+        (status = 403, description = "not an org admin"),
+        (status = 404, description = "no installation with this id in the org, or plugins not configured")
+    )
+)]
+pub(crate) async fn get_plugin_by_id(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((org, id)): Path<(String, String)>,
+) -> Result<Json<PluginInstallationDto>, ApiError> {
+    org_admin(&st, &headers, &org).await?;
+    let installation = store(&st)?
+        .installation_by_id(&id)
+        .await
+        .map_err(plugin_store_api_error)?
+        .filter(|i| i.org == org)
         .ok_or(ApiError::NotFound)?;
     Ok(Json(installation_dto(&installation)))
 }
@@ -1083,7 +1346,7 @@ async fn set_state(
             "plugin installation killed (ADR-0072 §10)"
         );
     }
-    Ok(Json(installation_dto(&installation)))
+    Ok(Json(installation_view(&st, &installation).await))
 }
 
 /// The kill switch (ADR-0072 §10): from the next request on, nothing the
@@ -1131,6 +1394,265 @@ pub(crate) async fn enable_plugin(
     Path((org, name)): Path<(String, String)>,
 ) -> Result<Json<PluginInstallationDto>, ApiError> {
     set_state(&st, &headers, &org, &name, InstallationState::Enabled).await
+}
+
+/// The installed manifest against `new`, and why the upgrade needs a
+/// step-up: each thing the new manifest asks for that the installed one did
+/// not, and a new image. A new digest is new code (ADR-0072 §10), so any
+/// image other than the installed one is confirmed like an install, whatever
+/// the manifest; a move to another repository says so. `image: None` judges
+/// an upgrade that keeps the installed image. Decided here, from what the
+/// server holds and reads, never from the client.
+fn upgrade_step_up_reasons(
+    current: &PluginInstallation,
+    new: &PluginManifest,
+    image: Option<&str>,
+) -> (ManifestDiff, Vec<String>) {
+    let diff = ManifestDiff::between(&current.manifest, new);
+    let mut reasons = diff.widenings();
+    if let Some(image) = image.filter(|i| *i != current.image) {
+        let (was, now) = (image_repository(&current.image), image_repository(image));
+        if was != now {
+            reasons.push(format!("moves the image from `{was}` to `{now}`"));
+        } else {
+            reasons.push(format!(
+                "runs new code: image `{image}` instead of `{}`",
+                current.image
+            ));
+        }
+    }
+    (diff, reasons)
+}
+
+/// The manifest an upgrade-fetch reads: `source` as given, or the recorded
+/// source's file at `commit`, with the connection to read it through.
+fn upgrade_source(
+    current: &PluginInstallation,
+    body: &FetchPluginUpgradeRequest,
+) -> Result<(String, Option<String>), ApiError> {
+    let given = |c: &Option<String>| {
+        c.as_deref()
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .map(String::from)
+    };
+    if let Some(source) = given(&body.source) {
+        return Ok((source, given(&body.connection)));
+    }
+    let Some(commit) = given(&body.commit) else {
+        return Err(ApiError::BadRequest(
+            "name the new manifest: a `source`, or a `commit` to read the recorded source at"
+                .into(),
+        ));
+    };
+    let Some(recorded) = &current.source else {
+        return Err(ApiError::BadRequest(format!(
+            "installation `{}` has no recorded source (it was installed before sources were \
+             recorded); give the full `source` of the new manifest",
+            current.name
+        )));
+    };
+    let src = LibrarySource::parse_manifest(recorded).map_err(ApiError::BadRequest)?;
+    let source = format!(
+        "{}/{}/{}//{}@{commit}",
+        src.host, src.owner, src.repo, src.path
+    );
+    let connection = given(&body.connection).or_else(|| current.source_connection.clone());
+    Ok((source, connection))
+}
+
+/// Read the manifest an upgrade would install and compare it with the
+/// installed one: what it adds, removes and keeps, and whether the upgrade
+/// needs a step-up. Stores nothing. Administer on the Org.
+#[utoipa::path(
+    post,
+    path = "/v1/orgs/{org}/plugins/{name}/upgrade-fetch",
+    params(
+        ("org" = String, Path, description = "org"),
+        ("name" = String, Path, description = "installation name")
+    ),
+    request_body = FetchPluginUpgradeRequest,
+    summary = "Fetch a plugin manifest to review an upgrade against the installed one (ADR-0072 §10)",
+    responses(
+        (status = 200, body = FetchedPluginUpgradeDto),
+        (status = 400, description = "no source or commit, a bad source or image, a fetch that failed, a file that is not an admissible plugin manifest, another plugin's manifest, or an image the manifest does not name"),
+        (status = 403, description = "not an org admin, a host Scarab does not fetch from, or a private repository outside the org"),
+        (status = 404, description = "no such installation, or plugins not configured")
+    )
+)]
+pub(crate) async fn fetch_plugin_upgrade(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((org, name)): Path<(String, String)>,
+    Json(body): Json<FetchPluginUpgradeRequest>,
+) -> Result<Json<FetchedPluginUpgradeDto>, ApiError> {
+    org_admin(&st, &headers, &org).await?;
+    let store = store(&st)?;
+    let current = store
+        .installation(&org, &name)
+        .await
+        .map_err(plugin_store_api_error)?
+        .ok_or(ApiError::NotFound)?;
+    let image = body
+        .image
+        .as_deref()
+        .map(str::trim)
+        .filter(|i| !i.is_empty());
+    if let Some(image) = image {
+        check_image(image, st.plugin_policy.dev_allow_tag)?;
+    }
+    let (source, connection) = upgrade_source(&current, &body)?;
+    let (src, content, manifest) = read_manifest(&st, &org, &source, connection.as_deref()).await?;
+    same_plugin(&current, &manifest)?;
+    if let Some(image) = image {
+        manifest
+            .check_image(image)
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    }
+    let (diff, reasons) = upgrade_step_up_reasons(&current, &manifest, image);
+    Ok(Json(FetchedPluginUpgradeDto {
+        source: src.to_string(),
+        connection,
+        content,
+        manifest_sha256: manifest_sha256(&manifest),
+        manifest: (&manifest).into(),
+        current_manifest_sha256: current.manifest_sha256,
+        current_image: current.image,
+        diff: (&diff).into(),
+        needs_step_up: !reasons.is_empty(),
+        step_up_reasons: reasons,
+    }))
+}
+
+/// An upgrade keeps the installation's plugin: another plugin's manifest is
+/// another installation.
+fn same_plugin(current: &PluginInstallation, manifest: &PluginManifest) -> Result<(), ApiError> {
+    if manifest.plugin != current.plugin {
+        return Err(ApiError::BadRequest(format!(
+            "the manifest is plugin `{}`, but installation `{}` runs `{}`; install it as a new \
+             plugin instead",
+            manifest.plugin, current.name, current.plugin
+        )));
+    }
+    Ok(())
+}
+
+/// Upgrade an installation to a new image and the manifest an admin reviewed
+/// (`…/upgrade-fetch`), keeping its id, name, config, storage, state and
+/// connections. A config key or connection slot the new manifest does not
+/// declare is dropped (a dropped binding's credential is deleted). The
+/// version replaced is recorded. Administer on the Org.
+///
+/// A new image digest is new code and is confirmed like an install, whatever
+/// the manifest (ADR-0072 §8, §10); so is a manifest that asks for more.
+/// Only a same-or-narrower manifest on the installed image needs no step-up.
+/// The server decides from the installed installation and the manifest it
+/// reads here. Refused while `SCARAB_PLUGINS=off` (409), as an install is.
+/// 409 when the installed manifest is no longer `expected_current_sha256`,
+/// and when the source no longer reads as `manifest_sha256`.
+#[utoipa::path(
+    post,
+    path = "/v1/orgs/{org}/plugins/{name}/upgrade",
+    params(
+        ("org" = String, Path, description = "org"),
+        ("name" = String, Path, description = "installation name")
+    ),
+    request_body = UpgradePluginRequest,
+    summary = "Upgrade a plugin installation to a reviewed manifest and image (ADR-0072 §10)",
+    responses(
+        (status = 200, body = PluginInstallationDto),
+        (status = 400, description = "a bad image or source, another plugin's manifest, a manifest that is not admissible, or an image the manifest does not name"),
+        (status = 403, description = "not an org admin, a step-up is required (a new image, or a manifest that asks for more), a host Scarab does not fetch from, or a private repository outside the org"),
+        (status = 404, description = "no such installation, or plugins not configured"),
+        (status = 409, description = "plugins are off, the installation changed since the review, or the source no longer reads as the reviewed manifest")
+    )
+)]
+pub(crate) async fn upgrade_plugin(
+    State(st): State<AppState>,
+    Extension(guard): Extension<GuardCtx>,
+    headers: HeaderMap,
+    Path((org, name)): Path<(String, String)>,
+    Json(body): Json<UpgradePluginRequest>,
+) -> Result<Json<PluginInstallationDto>, ApiError> {
+    let by = org_admin(&st, &headers, &org).await?;
+    let store = store(&st)?;
+    if !st.plugin_policy.enabled {
+        return Err(ApiError::Conflict(
+            "plugins are off on this Scarab (SCARAB_PLUGINS=off); an upgraded installation \
+             could never run"
+                .into(),
+        ));
+    }
+    check_image(&body.image, st.plugin_policy.dev_allow_tag)?;
+    let current = store
+        .installation(&org, &name)
+        .await
+        .map_err(plugin_store_api_error)?
+        .ok_or(ApiError::NotFound)?;
+    if current.manifest_sha256 != body.expected_current_sha256 {
+        return Err(ApiError::Conflict(format!(
+            "installation `{name}` now runs manifest {}, not the {} you compared against; \
+             review the upgrade again",
+            current.manifest_sha256, body.expected_current_sha256
+        )));
+    }
+    let connection = body
+        .connection
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty());
+    let (src, _, manifest) = read_manifest(&st, &org, &body.source, connection).await?;
+    let sha = manifest_sha256(&manifest);
+    if sha != body.manifest_sha256 {
+        return Err(ApiError::Conflict(format!(
+            "the manifest at {} now has hash {sha}, not the {} you reviewed; fetch it again \
+             and review what it changes",
+            body.source.trim(),
+            body.manifest_sha256
+        )));
+    }
+    same_plugin(&current, &manifest)?;
+    manifest
+        .check_image(&body.image)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let (_, reasons) = upgrade_step_up_reasons(&current, &manifest, Some(&body.image));
+    if reasons.is_empty() {
+        guard.exempt("a same-or-narrower manifest on the installed image");
+    } else {
+        guard.require(&st, reasons).await?;
+    }
+    let now = st.clock.now().await.0;
+    let upgraded = store
+        .upgrade_installation(
+            &org,
+            &name,
+            &body.expected_current_sha256,
+            &PluginUpgrade {
+                image: body.image.clone(),
+                manifest,
+                manifest_sha256: sha,
+                source: src.to_string(),
+                source_connection: connection.map(String::from),
+                approved_by: by.clone(),
+                approved_at: now,
+                step_up_ref: guard.confirmation_id(),
+            },
+        )
+        .await
+        .map_err(plugin_store_api_error)?
+        .ok_or(ApiError::NotFound)?;
+    for credential_ref in &upgraded.connection_credential_refs {
+        delete_connection_credential(&st, credential_ref).await;
+    }
+    tracing::warn!(
+        org,
+        installation = name,
+        by,
+        image = body.image,
+        manifest_sha256 = upgraded.installation.manifest_sha256,
+        "plugin installation upgraded (ADR-0072 §10)"
+    );
+    Ok(Json(installation_view(&st, &upgraded.installation).await))
 }
 
 fn describe_storage(s: &PluginStorage) -> String {
@@ -1206,7 +1728,7 @@ pub(crate) async fn put_plugin_storage(
         mount_path = storage.mount_path,
         "plugin installation storage set (ADR-0074 §7)"
     );
-    Ok(Json(installation_dto(&updated)))
+    Ok(Json(installation_view(&st, &updated).await))
 }
 
 /// Remove the installation's storage: the runtime stops mounting the claim.
@@ -1240,7 +1762,7 @@ pub(crate) async fn delete_plugin_storage(
         .map_err(plugin_store_api_error)?
         .ok_or(ApiError::NotFound)?;
     let Some(was) = &current.storage else {
-        return Ok(Json(installation_dto(&current)));
+        return Ok(Json(installation_view(&st, &current).await));
     };
     let updated = store
         .set_installation_storage(&org, &name, None, Some(was))
@@ -1254,7 +1776,7 @@ pub(crate) async fn delete_plugin_storage(
         claim = was.claim,
         "plugin installation storage removed (ADR-0074 §7); the claim is left as it is"
     );
-    Ok(Json(installation_dto(&updated)))
+    Ok(Json(installation_view(&st, &updated).await))
 }
 
 /// An installation in `org` and the manifest slot `slot` of it, or 404.
@@ -1344,13 +1866,14 @@ pub(crate) async fn list_plugin_connections(
         .await
         .map_err(plugin_store_api_error)?;
     let keys = credential_keys(&st).await?;
+    let dtos: Vec<PluginConnectionDto> = installation
+        .manifest
+        .connections
+        .iter()
+        .map(|slot| connection_dto(slot, bound.iter().find(|c| c.slot == slot.name), &keys))
+        .collect();
     Ok(Json(
-        installation
-            .manifest
-            .connections
-            .iter()
-            .map(|slot| connection_dto(slot, bound.iter().find(|c| c.slot == slot.name), &keys))
-            .collect(),
+        crate::people::shown(st.identities.as_deref(), dtos).await,
     ))
 }
 
@@ -1448,7 +1971,21 @@ pub(crate) async fn put_plugin_connection(
         "plugin connection bound (ADR-0072 §5)"
     );
     let keys = credential_keys(&st).await?;
-    Ok(Json(connection_dto(&slot, Some(&connection), &keys)))
+    let dto = connection_dto(&slot, Some(&connection), &keys);
+    Ok(Json(
+        crate::people::shown(st.identities.as_deref(), dto).await,
+    ))
+}
+
+impl crate::people::ShowsPeople for PluginConnectionDto {
+    fn refs(&self) -> Vec<&str> {
+        self.updated_by.as_deref().into_iter().collect()
+    }
+    fn show(&mut self, people: &crate::people::People) {
+        if let Some(by) = &mut self.updated_by {
+            people.show_one(by);
+        }
+    }
 }
 
 /// Unbind a connection slot and delete its credential. The broker answers
@@ -1555,47 +2092,56 @@ pub(crate) async fn plugin_broker_journal(
 mod tests {
     use super::*;
 
-    const REPO: &str = "ghcr.io/thulasi-ram/scarab-plugin-argocd";
-
+    /// The Argo CD plugin's manifest in this repository, the file its docs
+    /// point an admin at, is admissible like any other.
     #[test]
-    fn catalog_manifests_parse_and_are_admitted() {
-        for entry in first_party_catalog(&PluginPolicy::off()) {
-            assert_eq!(
-                admit_for_mmp(&entry.manifest),
-                Ok(()),
-                "{}",
-                entry.manifest.plugin
-            );
-        }
+    fn the_argocd_manifest_in_the_repository_is_admitted() {
+        let m: PluginManifest =
+            serde_json::from_str(include_str!("../../scarab-plugin-argocd/manifest.json")).unwrap();
+        assert_eq!(admit_for_mmp(&m), Ok(()));
     }
 
     #[test]
-    fn only_a_digest_of_the_catalog_repository_is_accepted() {
+    fn any_repository_is_accepted_by_digest_only() {
         let digest = "a".repeat(64);
-        assert!(check_image(&format!("{REPO}@sha256:{digest}"), REPO, false).is_ok());
-        for image in [
-            format!("{REPO}:v1"),
-            format!("{REPO}@sha256:{}", "A".repeat(64)),
-            format!("{REPO}@sha256:{}", "a".repeat(63)),
-            format!("{REPO}-evil@sha256:{digest}"),
-            format!("ghcr.io/evil/argocd@sha256:{digest}"),
-            format!("{REPO}@sha512:{digest}"),
-            REPO.to_string(),
+        for repo in [
+            "ghcr.io/thulasi-ram/scarab-plugin-argocd",
+            "ghcr.io/someone-else/slack-notifier",
+            "registry.example.com:5000/team/plugin",
+            "plugin",
         ] {
-            assert!(check_image(&image, REPO, false).is_err(), "{image}");
+            assert!(
+                check_image(&format!("{repo}@sha256:{digest}"), false).is_ok(),
+                "{repo}"
+            );
+            assert!(check_image(&format!("{repo}:v1"), false).is_err(), "{repo}");
+        }
+        for image in [
+            format!("ghcr.io/x/p@sha256:{}", "A".repeat(64)),
+            format!("ghcr.io/x/p@sha256:{}", "a".repeat(63)),
+            format!("ghcr.io/x/p@sha512:{digest}"),
+            format!("ghcr.io/X/p@sha256:{digest}"),
+            format!("@sha256:{digest}"),
+            format!("ghcr.io//p@sha256:{digest}"),
+            format!("ghcr.io/x/p:v1@sha256:{digest}"),
+            "ghcr.io/x/p".to_string(),
+        ] {
+            assert!(check_image(&image, false).is_err(), "{image}");
         }
     }
 
     #[test]
-    fn the_dev_knob_admits_a_tag_of_the_catalog_repository_only() {
-        assert!(check_image(&format!("{REPO}:dev"), REPO, true).is_ok());
+    fn the_dev_knob_admits_a_tag_of_any_repository() {
+        assert!(check_image("ghcr.io/x/argocd:dev", true).is_ok());
+        assert!(check_image("registry:5000/x/p:verify", true).is_ok());
+        assert!(check_image("scarab-plugin-argocd:verify", true).is_ok());
         for image in [
-            format!("{REPO}:"),
-            format!("{REPO}:-x"),
-            format!("{REPO}:a/b"),
-            "ghcr.io/evil/argocd:dev".to_string(),
+            "ghcr.io/x/p:",
+            "ghcr.io/x/p:-x",
+            "ghcr.io/x/p",
+            "registry:5000/x/p",
         ] {
-            assert!(check_image(&image, REPO, true).is_err(), "{image}");
+            assert!(check_image(image, true).is_err(), "{image}");
         }
     }
 

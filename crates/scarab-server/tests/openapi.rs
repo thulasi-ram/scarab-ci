@@ -31,8 +31,8 @@ fn openapi_document_has_v1_paths_and_ir_schemas() {
 }
 
 /// ADR-0074 removed the Deployment record: its read API and schemas are off
-/// the documented surface, while the repo-scoped legacy approval history that
-/// shares the word stays with Environments.
+/// the documented surface. The repo-scoped legacy approval history read that
+/// shared the word is gone too.
 #[test]
 fn openapi_document_has_no_deployment_record() {
     let doc: serde_json::Value = serde_json::from_str(&scarab_server::openapi_json()).unwrap();
@@ -44,14 +44,10 @@ fn openapi_document_has_no_deployment_record() {
         "/v1/orgs/{org}/environments/{env}/deployments/{id}",
         "/v1/orgs/{org}/environments/{env}/deployment-targets",
         "/v1/orgs/{org}/plugins/{name}/unmapped-groupings",
+        "/v1/repos/{org}/{repo}/environments/{name}/deployments",
     ] {
         assert!(!paths.contains_key(p), "{p} is still documented");
     }
-    assert_eq!(
-        paths["/v1/repos/{org}/{repo}/environments/{name}/deployments"]["get"]["tags"],
-        serde_json::json!(["Environments"]),
-        "the legacy approval history stays with Environments"
-    );
     let schemas = doc["components"]["schemas"].as_object().unwrap();
     for s in [
         "DeploymentDto",
@@ -149,7 +145,7 @@ fn openapi_document_has_the_plugin_admin_api_but_not_the_broker() {
 
     let paths = &doc["paths"];
     for (p, method) in [
-        ("/v1/orgs/{org}/plugin-catalog", "get"),
+        ("/v1/orgs/{org}/plugin-fetch", "post"),
         ("/v1/orgs/{org}/plugins", "get"),
         ("/v1/orgs/{org}/plugins", "post"),
         ("/v1/orgs/{org}/plugins/{name}", "get"),
@@ -173,12 +169,16 @@ fn openapi_document_has_the_plugin_admin_api_but_not_the_broker() {
             .all(|p| !p.starts_with("/_scarab/")),
         "the broker is not part of the public API"
     );
+    // There is no catalog of Scarab's own plugins, and no defaults retry.
+    assert!(paths.get("/v1/orgs/{org}/plugin-catalog").is_none());
+    assert!(paths.get("/v1/orgs/{org}/library-defaults/retry").is_none());
 
     let schemas = &doc["components"]["schemas"];
     for s in [
         "PluginInstallationDto",
         "InstallPluginRequest",
-        "PluginCatalogEntryDto",
+        "FetchPluginManifestRequest",
+        "FetchedPluginManifestDto",
         "PluginManifestDto",
         "PluginCapabilityDto",
         "UninstalledPluginDto",

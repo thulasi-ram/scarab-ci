@@ -8,8 +8,8 @@ mod common;
 use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
 use scarab_policy::library::{
-    content_hash, DefaultsState, LibraryStore, LibraryStoreError, LibraryVersion, LibraryYank,
-    MissingDefault, NewInstallation, OrgLibraryDefaults, Replaces, TrustedSource,
+    content_hash, LibraryStore, LibraryStoreError, LibraryVersion, LibraryYank, NewInstallation,
+    Replaces, TrustedSource,
 };
 use scarab_testkit::InMemoryLibraries;
 
@@ -41,12 +41,91 @@ macro_rules! contract_test {
 contract_test!(versions_are_kept_per_org_by_hash, versions);
 contract_test!(install_upgrade_and_remove_check_what_they_replace, installs);
 contract_test!(yanks_are_per_org_and_keep_the_first_reason, yanks);
-contract_test!(defaults_are_claimed_once_per_org, defaults);
 contract_test!(
     prune_deletes_the_oldest_versions_never_installed,
     prune_never_installed
 );
 contract_test!(trust_is_per_org_by_source_and_keeps_the_first_record, trust);
+contract_test!(
+    an_installation_keeps_its_id_and_is_found_by_it_in_its_org,
+    ids
+);
+
+/// A first install mints an id, unique across orgs; an upgrade keeps it; a
+/// removal and a new install get a new one. A lookup by id finds only the
+/// org's own installation.
+async fn ids(store: &dyn LibraryStore) {
+    let mut minted = std::collections::BTreeSet::new();
+    let mut first = Vec::new();
+    for org in ["acme", "globex"] {
+        let v1 = store
+            .put_version(&version(org, V1, "github.com/acme/libs//deploy.yaml@aaaa"))
+            .await
+            .unwrap();
+        let i = store
+            .install(&install(org, &v1.content_hash, 1), &Replaces::Nothing)
+            .await
+            .unwrap();
+        assert_eq!(i.id.len(), 10, "{i:?}");
+        assert!(
+            i.id.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "{i:?}"
+        );
+        assert!(minted.insert(i.id.clone()), "ids are unique: {minted:?}");
+        first.push(i);
+    }
+    let acme = first[0].clone();
+    let globex = first[1].clone();
+    assert_eq!(
+        store.installation_by_id("acme", &acme.id).await.unwrap(),
+        Some(acme.clone())
+    );
+    assert_eq!(
+        store.installation_by_id("acme", &globex.id).await.unwrap(),
+        None,
+        "another org's id is not found"
+    );
+    assert_eq!(
+        store.installation_by_id("globex", &acme.id).await.unwrap(),
+        None
+    );
+
+    // An upgrade keeps the id.
+    let v2 = store
+        .put_version(&version(
+            "acme",
+            V2,
+            "github.com/acme/libs//deploy.yaml@bbbb",
+        ))
+        .await
+        .unwrap();
+    let up = store
+        .install(
+            &install("acme", &v2.content_hash, 2),
+            &Replaces::Version(acme.content_hash.clone()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(up.id, acme.id);
+    assert_eq!(
+        store.installations("acme").await.unwrap()[0].id,
+        acme.id,
+        "the list carries the id"
+    );
+
+    // Removed, the id names nothing; installed again, it gets a new one.
+    store.remove("acme", "acme", "deploy").await.unwrap();
+    assert_eq!(
+        store.installation_by_id("acme", &acme.id).await.unwrap(),
+        None
+    );
+    let again = store
+        .install(&install("acme", &v2.content_hash, 3), &Replaces::Nothing)
+        .await
+        .unwrap();
+    assert!(minted.insert(again.id.clone()), "a new id: {minted:?}");
+}
 
 async fn trust(store: &dyn LibraryStore) {
     let t = |by: &str, at: i64| TrustedSource {
@@ -93,7 +172,6 @@ fn version(org: &str, content: &str, source: &str) -> LibraryVersion {
         source: source.into(),
         publisher: "acme".into(),
         name: "deploy".into(),
-        first_party: false,
         fetched_by: "user:amy".into(),
         fetched_at: 1_000,
     }
@@ -307,31 +385,6 @@ async fn yanks(store: &dyn LibraryStore) {
     );
     assert_eq!(store.unyank("acme", &v1.content_hash).await.unwrap(), None);
     assert!(store.yanked("acme", &hashes).await.unwrap().is_empty());
-}
-
-async fn defaults(store: &dyn LibraryStore) {
-    assert_eq!(store.defaults("acme").await.unwrap(), None);
-    assert!(store.claim_defaults("acme", 7).await.unwrap());
-    assert!(!store.claim_defaults("acme", 8).await.unwrap());
-    let d = store.defaults("acme").await.unwrap().unwrap();
-    assert_eq!(d.state, DefaultsState::Pending);
-    assert_eq!(d.updated_at, 7);
-
-    let missing = OrgLibraryDefaults {
-        org: "acme".into(),
-        state: DefaultsState::Missing,
-        missing: vec![MissingDefault {
-            publisher: "thulasi-ram".into(),
-            name: "clone".into(),
-            error: "connection refused".into(),
-        }],
-        mirror: Some("https://git.example/mirror".into()),
-        updated_at: 9,
-    };
-    store.set_defaults(&missing).await.unwrap();
-    assert_eq!(store.defaults("acme").await.unwrap(), Some(missing));
-    // A record set by hand also blocks a claim.
-    assert!(!store.claim_defaults("acme", 10).await.unwrap());
 }
 
 async fn prune_never_installed(store: &dyn LibraryStore) {

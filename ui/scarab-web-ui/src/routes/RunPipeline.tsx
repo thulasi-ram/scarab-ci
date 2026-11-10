@@ -6,6 +6,7 @@
 // predicate runs server-side at dispatch and comes back as a per-field error.
 import { createResource, createSignal, createEffect, For, Show } from "solid-js";
 import { A, useParams, useNavigate, useLocation } from "@solidjs/router";
+import { orgPageHref } from "../org-page";
 import { listRefs, listPipelines, pipelineInterface, dispatchRun, PipelineCompileError } from "../api/client";
 import CompileErrors from "../components/CompileErrors";
 import {
@@ -187,6 +188,8 @@ export default function RunPipeline() {
 
       <div class="run-head">
         <h1 class="crumb-head">
+          <A href={orgPageHref(org())} class="crumb-head-org">{org()}</A>
+          <Icon icon="chevron-right" size={20} class="crumb-head-sep" />
           <A href={`/${org()}/${repo()}`} class="crumb-head-link">{repo()}</A>
           <Icon icon="chevron-right" size={20} class="crumb-head-sep" />
           <span class="crumb-head-title">Run pipeline</span>
@@ -207,7 +210,7 @@ export default function RunPipeline() {
         <div class="rp-ref">
           <div class="rp-ref-row">
             <label class="field rp-ref-field">
-              <span class="field-label">branch / tag / sha</span>
+              <span class="field-label">Branch, tag or SHA</span>
               <div class="rp-combo">
                 <Input
                   mono
@@ -284,7 +287,7 @@ export default function RunPipeline() {
                     >
                       <Icon icon={p.error ? "bug" : "workflow"} size={15} />
                       <span class="mono rp-pipe-name">{p.name}</span>
-                      <Show when={p.api}><span class="rp-tag">api</span></Show>
+                      <Show when={p.api}><span class="rp-tag">API</span></Show>
                       <Show when={p.error}>
                         <span class="rp-pipe-err">failed to parse — {p.error}</span>
                       </Show>

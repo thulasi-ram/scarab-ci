@@ -32,6 +32,7 @@ use scarab_forge::{
 };
 use scarab_policy::library::{
     content_hash, LibraryStore, LibraryVersion, LibraryYank, NewInstallation, Replaces,
+    TrustedSource,
 };
 use scarab_server::forge_token::ForgeCredentialExecutor;
 use scarab_server::{router, trigger_runs_from_event, AdmissionPorts, AppState, LogService};
@@ -71,12 +72,14 @@ fn long_lived(files: &[(&str, &str)]) -> FakeForge {
         .with_commit("refs/heads/main", SHA)
 }
 
+/// `content` installed in `org` as `thulasi-ram/clone` from `source`; with
+/// `trusted`, `org` also trusts that source.
 async fn install_in(
     libs: &InMemoryLibraries,
     org: &str,
     content: &str,
     source: &str,
-    first_party: bool,
+    trusted: bool,
 ) {
     libs.put_version(&LibraryVersion {
         org: org.into(),
@@ -85,7 +88,6 @@ async fn install_in(
         source: source.into(),
         publisher: "thulasi-ram".into(),
         name: "clone".into(),
-        first_party,
         fetched_by: "amy".into(),
         fetched_at: 1,
     })
@@ -105,6 +107,17 @@ async fn install_in(
     )
     .await
     .unwrap();
+    if trusted {
+        libs.trust_source(&TrustedSource {
+            org: org.into(),
+            source: scarab_policy::library::trust_key(source).into(),
+            trusted_by: "amy".into(),
+            trusted_at: 2,
+            step_up_ref: Some("su-1".into()),
+        })
+        .await
+        .unwrap();
+    }
 }
 
 fn step_run(run: &str, id: &str) -> StepRun {
@@ -168,8 +181,9 @@ async fn rt2_an_old_shape_stored_spec_fails_closed_on_a_long_lived_connection() 
 }
 
 /// ATTACK: the stored `trusted_library` names a hash that org `other`
-/// trusts (first-party there), while the Run's repository is `acme`, whose
-/// store does not hold it. Trust must be read in the Run's org.
+/// trusts (its source is trusted there), while the Run's repository is
+/// `acme`, whose store does not hold it. Trust must be read in the Run's
+/// org.
 #[tokio::test]
 async fn rt2_a_hash_trusted_in_another_org_is_refused_at_launch() {
     let libs = Arc::new(InMemoryLibraries::new());
@@ -194,7 +208,7 @@ steps:
   - { id: checkout, invoke: lib:thulasi-ram/clone }
 "#;
 
-/// ATTACK: the first-party clone version a Run was admitted with is yanked
+/// ATTACK: the trusted clone version a Run was admitted with is yanked
 /// in the org afterwards. A rerun of the stored Run on a long-lived
 /// connection must mint nothing.
 #[tokio::test]
@@ -317,7 +331,7 @@ async fn rt2_a_connection_swapped_between_the_check_and_the_mint_hands_over_noth
 
 /// ATTACK: `POST /v1/runs` takes steps directly. A caller supplies
 /// `forge_token`, a `trusted_library` hash and an `origin` naming the
-/// first-party clone library on a Step whose image and command are theirs.
+/// clone library on a Step whose image and command are theirs.
 /// No stored spec may carry a forge token.
 #[tokio::test]
 async fn rt2_an_inline_api_run_cannot_store_a_forge_token() {

@@ -618,10 +618,9 @@ async fn bootstrap_owners_are_counted_only_for_a_global_caller() {
 #[tokio::test]
 async fn an_email_owners_entry_is_reported_apart_not_counted() {
     let ids = Arc::new(scarab_testkit::InMemoryIdentities::new());
+    // Their ids are their handles, so the sessions below name them.
     for handle in ["root", "bob"] {
-        ids.sign_in(&identity("default", handle, handle), handle, T0)
-            .await
-            .unwrap();
+        ids.seed(handle, &identity("default", handle, handle));
     }
     let wired = ids.clone();
     let h = harness_with(move |st| {
@@ -670,7 +669,8 @@ async fn an_org_owner_cannot_reset_an_install_owner_by_id() {
 #[tokio::test]
 async fn an_org_owner_cannot_reset_an_install_owner_by_verified_email() {
     let ids = Arc::new(scarab_testkit::InMemoryIdentities::new());
-    ids.sign_in(
+    ids.seed(
+        "root",
         &ProviderIdentity {
             provider: "default".into(),
             external_id: "root-sub".into(),
@@ -679,11 +679,7 @@ async fn an_org_owner_cannot_reset_an_install_owner_by_verified_email() {
             email_verified: true,
             display_name: None,
         },
-        "root",
-        T0,
-    )
-    .await
-    .unwrap();
+    );
     let wired = ids.clone();
     let h = harness_with(move |st| {
         st.with_oauth_login(provider_with_owners(&["root@acme.test"]))
@@ -736,10 +732,7 @@ async fn merged_bob(pg: &Arc<PostgresDb>) -> (Harness, String) {
             .with_api_tokens(toks as Arc<dyn ApiTokenStore>)
     });
     for (provider, ext, handle) in [("github", "b1", "bob"), ("forgejo", "f1", "bobby")] {
-        let id = IdentityStore::sign_in(pg.as_ref(), &identity(provider, ext, handle), handle, T0)
-            .await
-            .unwrap();
-        assert_eq!(id, handle);
+        common::seed_principal(pg, provider, ext, handle).await;
     }
     h.grant("bobby", Scope::Org("acme".into()), Role::Admin)
         .await;
@@ -906,13 +899,15 @@ async fn a_merge_deletes_the_folded_id_s_passkeys_once_one_proves_it() {
     assert_eq!(
         link(scarab_identity::FoldedPasskey::Unproven).await,
         scarab_identity::LinkOutcome::NeedsFoldedPasskey {
-            from: "bobby".into()
+            from: "bobby".into(),
+            from_handle: "bobby".into(),
         }
     );
     assert_eq!(
         link(scarab_identity::FoldedPasskey::Proven(key.clone())).await,
         scarab_identity::LinkOutcome::Merged {
             from: "bobby".into(),
+            from_handle: "bobby".into(),
             removed_passkeys: vec![key],
         }
     );
@@ -1006,22 +1001,7 @@ async fn the_break_glass_resets_and_is_recorded() {
     };
     let h = harness_on(Backend::Pg(pg.clone()), |st| st);
     // amy is a Principal (she signed in once).
-    let amy_id = IdentityStore::sign_in(
-        pg.as_ref(),
-        &ProviderIdentity {
-            provider: "github".into(),
-            external_id: "1".into(),
-            handle: "amy".into(),
-            email: None,
-            email_verified: false,
-            display_name: None,
-        },
-        "amy",
-        T0,
-    )
-    .await
-    .unwrap();
-    assert_eq!(amy_id, "amy");
+    common::seed_principal(&pg, "github", "1", "amy").await;
     let (amy, mut soft) = member(&h, "amy", "acme", Role::Owner).await;
     h.open_window(&amy, &mut soft).await;
 
@@ -1110,22 +1090,7 @@ async fn the_operator_grant_is_idempotent_and_recorded() {
     let Some((tdb, pg)) = fresh_pg().await else {
         return;
     };
-    let alice = IdentityStore::sign_in(
-        pg.as_ref(),
-        &ProviderIdentity {
-            provider: "github".into(),
-            external_id: "7".into(),
-            handle: "alice".into(),
-            email: None,
-            email_verified: false,
-            display_name: None,
-        },
-        "github:alice",
-        T0,
-    )
-    .await
-    .unwrap();
-    assert_eq!(alice, "github:alice");
+    common::seed_principal(&pg, "github", "7", "github:alice").await;
     let operator = OperatorInfo {
         host: "laptop".into(),
         os_user: "ops".into(),
@@ -1297,8 +1262,8 @@ async fn the_operator_grant_is_idempotent_and_recorded() {
     tdb.cleanup().await;
 }
 
-/// `login` signed in once through the `github` provider: a Principal
-/// `github:<login>` exists.
+/// `login` signed in once through the `github` provider: a Principal with
+/// handle `github:<login>` exists. Returns its (random) id.
 async fn signed_in(pg: &PostgresDb, login: &str, external_id: &str) -> String {
     IdentityStore::sign_in(
         pg,
@@ -1311,10 +1276,12 @@ async fn signed_in(pg: &PostgresDb, login: &str, external_id: &str) -> String {
             display_name: None,
         },
         &format!("github:{login}"),
+        scarab_identity::Placeholder::Never,
         T0,
     )
     .await
     .unwrap()
+    .id
 }
 
 fn operator() -> OperatorInfo {
@@ -1360,7 +1327,7 @@ async fn the_if_absent_grant_leaves_existing_bindings_alone() {
     assert_eq!(
         first,
         OperatorGrant::Granted {
-            subject: alice.clone(),
+            subject: "github:alice".into(),
             previous: None
         }
     );
@@ -1482,7 +1449,7 @@ async fn a_grant_over_an_imported_role_makes_it_native() {
     assert_eq!(
         seeded,
         OperatorGrant::Exists {
-            subject: dave.clone(),
+            subject: "github:dave".into(),
             rows: vec![imported.clone()]
         }
     );
@@ -1494,7 +1461,7 @@ async fn a_grant_over_an_imported_role_makes_it_native() {
     assert_eq!(
         granted,
         OperatorGrant::Granted {
-            subject: dave.clone(),
+            subject: "github:dave".into(),
             previous: Some(imported)
         }
     );
@@ -1511,7 +1478,12 @@ async fn a_grant_over_an_imported_role_makes_it_native() {
     let again = grant_role(&pg, "acme", &dave, "member", false, None, &op, T0)
         .await
         .unwrap();
-    assert_eq!(again, OperatorGrant::Unchanged { subject: dave });
+    assert_eq!(
+        again,
+        OperatorGrant::Unchanged {
+            subject: "github:dave".into()
+        }
+    );
     tdb.cleanup().await;
 }
 
@@ -1588,7 +1560,8 @@ async fn the_grant_command_exits_3_for_someone_who_never_signed_in() {
     let (code, _, stderr) = run(&alice, "root", &[]);
     assert_eq!(code, Some(1), "{stderr}");
 
-    let (code, stdout, stderr) = run(&alice, "member", &["--if-absent"]);
+    // Typed as people type it: the handle (ADR-0080).
+    let (code, stdout, stderr) = run("github:alice", "member", &["--if-absent"]);
     assert_eq!(code, Some(0), "{stderr}");
     assert!(stdout.contains("now holds member"), "{stdout}");
     let (code, stdout, stderr) = run(&alice, "owner", &["--if-absent"]);
@@ -1795,7 +1768,7 @@ async fn an_unrecorded_authorisation_runs_nothing() {
 }
 
 // ---------------------------------------------------------------------------
-// The Event log page: cursor paging and filters
+// The org event log (in Settings > Security): cursor paging and filters
 // ---------------------------------------------------------------------------
 
 /// A seeded event: `at` in ms, an id that names it.

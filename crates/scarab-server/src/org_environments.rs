@@ -9,9 +9,7 @@
 //! - `…/eligibility` — which Projects may deploy at all (ADR-0071 §2);
 //! - `…/protection` — the baseline every Project's Deploy Runs obey (§1);
 //! - `…/projects/{project}/overlay` — one Project's tighten-only overlay (§3);
-//! - `…/projects/{project}/privilege-grant` — one Project's privileges (§8);
-//! - `/v1/orgs/{org}/environment-migration-report` — the split report the
-//!   migration left for an admin to review (§10 step 8).
+//! - `…/projects/{project}/privilege-grant` — one Project's privileges (§8).
 //!
 //! The whole-Environment PUT never touches the baseline or the eligibility —
 //! each has its own write — so the c-min form cannot reset either by
@@ -34,11 +32,10 @@ use scarab_project::{
 };
 use scarab_project::{
     eligibility_loosenings, overlay_loosenings, privilege_grant_loosenings, protection_loosenings,
-    DeployGovernance, EffectiveProtection, EnvironmentGovernanceStore, EnvironmentMigrationReport,
-    EnvironmentMigrationReportProject, EnvironmentNameClaim, EnvironmentProjectEligibility,
-    EnvironmentProjectOverlay, EnvironmentProjectPrivilegeGrant, EnvironmentProjectRecord,
-    EnvironmentProtectionRules, ImageGrant, Loosening, MissingGateMode, OrgEnvironment,
-    OrgEnvironmentError, ProtectionRules, WritePrecondition,
+    DeployGovernance, EffectiveProtection, EnvironmentGovernanceStore, EnvironmentNameClaim,
+    EnvironmentProjectEligibility, EnvironmentProjectOverlay, EnvironmentProjectPrivilegeGrant,
+    EnvironmentProjectRecord, EnvironmentProtectionRules, ImageGrant, Loosening, MissingGateMode,
+    OrgEnvironment, OrgEnvironmentError, WritePrecondition,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -65,7 +62,7 @@ pub struct OrgEnvironmentDto {
     pub created_at: i64,
     /// Unix-ms.
     pub updated_at: i64,
-    /// Who last wrote it (a Principal subject).
+    /// Who last wrote it (a Principal's handle).
     pub updated_by: String,
 }
 
@@ -107,8 +104,9 @@ pub struct PutOrgEnvironmentRequest {
 /// Project's overlay (ADR-0071 §1, §3).
 #[derive(Debug, Serialize, ToSchema)]
 pub struct EnvironmentProtectionRulesDto {
-    /// Principal ids. Every one must approve (AND), unless the baseline's
-    /// `approval_gate.required_approvals` says how many of its own must.
+    /// Principal handles (stored as ids, ADR-0080). Every one must approve
+    /// (AND), unless the baseline's `approval_gate.required_approvals` says
+    /// how many of its own must.
     pub approvers: Vec<String>,
     /// Ref globs a deploy's symbolic ref must match; empty = any ref.
     pub allowed_refs: Vec<String>,
@@ -359,7 +357,10 @@ pub(crate) async fn list_org_environments(
         .list_org_environments(&org)
         .await
         .map_err(org_environment_api_error)?;
-    Ok(Json(environments.iter().map(Into::into).collect()))
+    let dtos: Vec<OrgEnvironmentDto> = environments.iter().map(Into::into).collect();
+    Ok(Json(
+        crate::people::shown(st.identities.as_deref(), dtos).await,
+    ))
 }
 
 /// One Environment. Read on the Org.
@@ -392,7 +393,11 @@ pub(crate) async fn get_org_environment(
         .await
         .map_err(org_environment_api_error)?
         .ok_or(ApiError::NotFound)?;
-    Ok((etag_header(&environment), Json((&environment).into())))
+    let dto: OrgEnvironmentDto = (&environment).into();
+    Ok((
+        etag_header(&environment),
+        Json(crate::people::shown(st.identities.as_deref(), dto).await),
+    ))
 }
 
 /// The `ETag` response header for `env`.
@@ -532,7 +537,11 @@ pub(crate) async fn put_org_environment(
     .await;
     release_claim(claim).await;
     let stored = stored?;
-    Ok((etag_header(&stored), Json((&stored).into())))
+    let dto: OrgEnvironmentDto = (&stored).into();
+    Ok((
+        etag_header(&stored),
+        Json(crate::people::shown(st.identities.as_deref(), dto).await),
+    ))
 }
 
 /// Free a handler's claim on an Environment name, and wait until it is
@@ -1050,7 +1059,7 @@ async fn remove_copied_secrets(
 /// Not copied, and listed in the answer: Policies that select the old
 /// Environment and not the new one, the Projects whose Pipelines name the
 /// old one (from Run history), and the OIDC subject cloud trust policies
-/// match. Run and approval history and the Cache stay with the old
+/// match. Run history, approvals included, and the Cache stay with the old
 /// Environment, which is not changed.
 ///
 /// The secret store is a separate store from the Environment's, so the two
@@ -1268,8 +1277,8 @@ async fn duplicate_org_environment_holding(
         new_oidc_subject: oidc_subject_pattern(&org, &new_name),
         notes: vec![
             format!(
-                "Run and approval history and the Cache stay with {env}, which is not changed \
-                 and stays until an admin deletes it."
+                "Run history, approvals included, and the Cache stay with {env}, which is not \
+                 changed and stays until an admin deletes it."
             ),
             "Only Environment secrets set per Project are copied: org-wide Environment secrets \
              are not built yet."
@@ -1281,11 +1290,17 @@ async fn duplicate_org_environment_holding(
     };
     Ok((
         StatusCode::CREATED,
-        Json(DuplicateOrgEnvironmentResponse {
-            environment: (&created).into(),
-            copied,
-            not_copied,
-        }),
+        Json(
+            crate::people::shown(
+                st.identities.as_deref(),
+                DuplicateOrgEnvironmentResponse {
+                    environment: (&created).into(),
+                    copied,
+                    not_copied,
+                },
+            )
+            .await,
+        ),
     ))
 }
 
@@ -1475,8 +1490,9 @@ async fn step_up_unless_tightening(
 #[derive(Debug, Default, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PutEnvironmentProtectionRequest {
-    /// Principal ids (ADR-0069): each must name an existing Principal; a
-    /// merged id is stored as the Principal it now is. All must approve.
+    /// Principal handles or ids (ADR-0069, ADR-0080): each must name an
+    /// existing Principal; a merged one is stored as the Principal it now is.
+    /// All must approve.
     #[serde(default)]
     pub approvers: Vec<String>,
     /// Ref globs (`refs/heads/main`, `refs/tags/*`); empty = any ref.
@@ -1647,6 +1663,19 @@ async fn checked_rules_with_gate(
     })
 }
 
+/// `rules` with its approvers shown by handle: what a loosening is judged
+/// over, so its words name people as they are typed. Handles are unique, so
+/// the judgement is the same as over ids.
+fn readable_rules(
+    people: &crate::people::People,
+    rules: &EnvironmentProtectionRules,
+) -> EnvironmentProtectionRules {
+    EnvironmentProtectionRules {
+        approvers: people.handles(&rules.approvers),
+        ..rules.clone()
+    }
+}
+
 /// A wait timer is a minimum wait on the Environment approval gate
 /// (ADR-0078 §4), so it needs approvers: refuse a non-zero one where the
 /// effective approvers (`approvers`) are empty. Stored data from before this
@@ -1694,7 +1723,10 @@ pub(crate) async fn get_environment_protection(
         .await
         .map_err(org_environment_api_error)?
         .ok_or(ApiError::NotFound)?;
-    Ok(Json((&environment.protection).into()))
+    let dto: EnvironmentProtectionRulesDto = (&environment.protection).into();
+    Ok(Json(
+        crate::people::shown(st.identities.as_deref(), dto).await,
+    ))
 }
 
 /// Replace an Environment's baseline. Administer on the Org (ADR-0071 §7).
@@ -1746,10 +1778,25 @@ pub(crate) async fn put_environment_protection(
     refuse_wait_timer_without_approvers(rules.wait_timer_s, &rules.approvers)?;
     // ADR-0073 §3 rule E1: loosening the baseline is a crown jewel.
     let current = stored_environment(store, &org, &env).await?;
+    // Judged over handles, so the person confirming reads "removes approver
+    // `github:amy`" and not an id (ADR-0080 §3).
+    let people = st
+        .people(
+            current
+                .protection
+                .approvers
+                .iter()
+                .chain(&rules.approvers)
+                .map(String::as_str),
+        )
+        .await;
     step_up_unless_tightening(
         &st,
         &guard,
-        protection_loosenings(&current.protection, &rules),
+        protection_loosenings(
+            &readable_rules(&people, &current.protection),
+            &readable_rules(&people, &rules),
+        ),
     )
     .await?;
     let now = st.clock.now().await.0;
@@ -1764,7 +1811,10 @@ pub(crate) async fn put_environment_protection(
         )
         .await
         .map_err(org_environment_api_error)?;
-    Ok(Json((&stored).into()))
+    let dto: OrgEnvironmentDto = (&stored).into();
+    Ok(Json(
+        crate::people::shown(st.identities.as_deref(), dto).await,
+    ))
 }
 
 /// Every Project holding an overlay or privilege grant in an Environment,
@@ -1794,7 +1844,10 @@ pub(crate) async fn list_environment_projects(
         .environment_projects(&org, &env)
         .await
         .map_err(org_environment_api_error)?;
-    Ok(Json(records.iter().map(Into::into).collect()))
+    let dtos: Vec<EnvironmentProjectDto> = records.iter().map(Into::into).collect();
+    Ok(Json(
+        crate::people::shown(st.identities.as_deref(), dtos).await,
+    ))
 }
 
 /// One Project's overlay in an Environment. Read on the Project (an org
@@ -1827,7 +1880,10 @@ pub(crate) async fn get_environment_project_overlay(
         .map_err(org_environment_api_error)?
         .ok_or(ApiError::NotFound)?;
     let overlay = governance.overlay.as_ref().ok_or(ApiError::NotFound)?;
-    Ok(Json(overlay.into()))
+    let dto: EnvironmentProjectOverlayDto = overlay.into();
+    Ok(Json(
+        crate::people::shown(st.identities.as_deref(), dto).await,
+    ))
 }
 
 /// Create or replace one Project's overlay. Administer on that Project — or
@@ -1905,10 +1961,27 @@ pub(crate) async fn put_environment_project_overlay(
     };
     // ADR-0073 §3 rule E1: loosening an overlay
     // (toward the baseline) is a crown jewel; creating one never loosens.
+    let people = st
+        .people(
+            governance
+                .overlay
+                .iter()
+                .flat_map(|o| &o.rules.approvers)
+                .chain(&overlay.rules.approvers)
+                .map(String::as_str),
+        )
+        .await;
+    let readable = |o: &EnvironmentProjectOverlay| EnvironmentProjectOverlay {
+        rules: readable_rules(&people, &o.rules),
+        ..o.clone()
+    };
     step_up_unless_tightening(
         &st,
         &guard,
-        overlay_loosenings(governance.overlay.as_ref(), &overlay),
+        overlay_loosenings(
+            governance.overlay.as_ref().map(readable).as_ref(),
+            &readable(&overlay),
+        ),
     )
     .await?;
     let now = st.clock.now().await.0;
@@ -1921,7 +1994,10 @@ pub(crate) async fn put_environment_project_overlay(
         )
         .await
         .map_err(org_environment_api_error)?;
-    Ok(Json((&overlay).into()))
+    let dto: EnvironmentProjectOverlayDto = (&overlay).into();
+    Ok(Json(
+        crate::people::shown(st.identities.as_deref(), dto).await,
+    ))
 }
 
 /// Remove one Project's overlay: its deploys fall back to the baseline.
@@ -2121,170 +2197,73 @@ pub(crate) async fn delete_environment_project_privilege_grant(
     }
 }
 
-// ---------------------------------------------------------------------------
-// The split report (ADR-0071 §10 step 8).
-// ---------------------------------------------------------------------------
-
-/// A Project's ADR-0037 per-repo rules as the migration found them. The
-/// canonical `secret_scope` / `oidc_subject` are left out: the server always
-/// derived them from the coordinates, so they never differed by choice.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct LegacyProtectionRulesDto {
-    pub approvers: Vec<String>,
-    pub allowed_refs: Vec<String>,
-    /// Seconds.
-    pub wait_timer: u32,
-    /// Stored but never read; not carried by the migration (§10 step 3).
-    pub concurrency: u32,
-    pub require_reason: bool,
-    pub privileged_images: Vec<ImageGrantDto>,
-    pub permit_k8s_overlay: bool,
-}
-
-impl From<&ProtectionRules> for LegacyProtectionRulesDto {
-    fn from(r: &ProtectionRules) -> Self {
-        Self {
-            approvers: r.approvers.clone(),
-            allowed_refs: r.allowed_refs.clone(),
-            wait_timer: r.wait_timer,
-            concurrency: r.concurrency,
-            require_reason: r.require_reason,
-            privileged_images: r.privileged_images.iter().map(Into::into).collect(),
-            permit_k8s_overlay: r.permit_k8s_overlay,
-        }
+impl crate::people::ShowsPeople for EnvironmentProtectionRulesDto {
+    fn refs(&self) -> Vec<&str> {
+        self.approvers.iter().map(String::as_str).collect()
+    }
+    fn show(&mut self, people: &crate::people::People) {
+        people.show_all(&mut self.approvers);
     }
 }
 
-/// One Project in a split-report line: what it had, and what it has now.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct EnvironmentMigrationReportProjectDto {
-    pub project: String,
-    /// Its per-repo rules before the migration; absent for a Project whose
-    /// Runs only named the Environment.
-    pub legacy: Option<LegacyProtectionRulesDto>,
-    /// Its overlay now (the migration wrote it from `legacy`; it may have
-    /// been changed or removed since).
-    pub overlay: Option<EnvironmentProjectOverlayDto>,
-}
-
-impl From<&EnvironmentMigrationReportProject> for EnvironmentMigrationReportProjectDto {
-    fn from(p: &EnvironmentMigrationReportProject) -> Self {
-        Self {
-            project: p.project.clone(),
-            legacy: p.legacy.as_ref().map(Into::into),
-            overlay: p.overlay.as_ref().map(Into::into),
-        }
+impl crate::people::ShowsPeople for EffectiveProtectionDto {
+    fn refs(&self) -> Vec<&str> {
+        self.approvers.iter().map(String::as_str).collect()
+    }
+    fn show(&mut self, people: &crate::people::People) {
+        people.show_all(&mut self.approvers);
     }
 }
 
-/// One line of the split report: an Environment name merged across several
-/// Projects, or created with eligibility *all projects* because no Project
-/// defined it. If the merged Projects really meant different places (one
-/// `prod` that is `prod-eu`), the split is a YAML change: those Projects
-/// rename their `environment:` and an org admin creates the new
-/// Environment — nothing is renamed for them.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct EnvironmentMigrationReportDto {
-    pub environment: String,
-    pub merged_projects: Vec<String>,
-    /// No Project defined it: migrated with eligibility *all projects*.
-    pub referenced_only: bool,
-    /// Projects whose Runs named it without defining it.
-    pub referencing_projects: Vec<String>,
-    /// The legacy rules the merged Projects disagreed on, by ADR-0037 field
-    /// name (`approvers`, `allowed_refs`, `wait_timer`, `require_reason`,
-    /// `privileged_images`, `permit_k8s_overlay`). Lists compare as sets.
-    pub differing_rules: Vec<String>,
-    /// The Environment still exists.
-    pub environment_exists: bool,
-    /// Its baseline is still the permissive one the migration gave it:
-    /// nothing org-wide protects it yet — set a baseline.
-    pub permissive_baseline: bool,
-    pub projects: Vec<EnvironmentMigrationReportProjectDto>,
-    /// Unix-ms.
-    pub created_at: i64,
-    /// Unix-ms; absent until an admin acknowledges the line.
-    pub acknowledged_at: Option<i64>,
-    pub acknowledged_by: Option<String>,
-}
-
-impl From<&EnvironmentMigrationReport> for EnvironmentMigrationReportDto {
-    fn from(r: &EnvironmentMigrationReport) -> Self {
-        Self {
-            environment: r.environment.clone(),
-            merged_projects: r.merged_projects.clone(),
-            referenced_only: r.referenced_only,
-            referencing_projects: r.referencing_projects.clone(),
-            differing_rules: r
-                .differing_legacy_rules()
-                .into_iter()
-                .map(|f| f.as_str().to_string())
-                .collect(),
-            environment_exists: r.baseline.is_some(),
-            permissive_baseline: r.permissive_baseline(),
-            projects: r.projects.iter().map(Into::into).collect(),
-            created_at: r.created_at,
-            acknowledged_at: r.acknowledged.as_ref().map(|a| a.at),
-            acknowledged_by: r.acknowledged.as_ref().map(|a| a.by.clone()),
-        }
+impl crate::people::ShowsPeople for OrgEnvironmentDto {
+    fn refs(&self) -> Vec<&str> {
+        let mut refs = self.protection.refs();
+        refs.push(&self.updated_by);
+        refs
+    }
+    fn show(&mut self, people: &crate::people::People) {
+        self.protection.show(people);
+        people.show_one(&mut self.updated_by);
     }
 }
 
-/// The org's split report, by Environment name, acknowledged lines
-/// included. Administer on the Org: it shows every Project's old privileges.
-#[utoipa::path(
-    get,
-    path = "/v1/orgs/{org}/environment-migration-report",
-    params(("org" = String, Path, description = "org")),
-    summary = "The ADR-0071 migration's split report (ADR-0071 §10 step 8)",
-    responses(
-        (status = 200, body = [EnvironmentMigrationReportDto]),
-        (status = 403, description = "not an org admin"),
-        (status = 404, description = "not configured")
-    )
-)]
-pub(crate) async fn get_environment_migration_report(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-    Path(org): Path<String>,
-) -> Result<Json<Vec<EnvironmentMigrationReportDto>>, ApiError> {
-    let scope = rbac_scope(&org, None);
-    authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
-    let report = governance_store(&st)?
-        .environment_migration_report(&org)
-        .await
-        .map_err(org_environment_api_error)?;
-    Ok(Json(report.iter().map(Into::into).collect()))
+impl crate::people::ShowsPeople for ProjectEnvironmentDto {
+    fn refs(&self) -> Vec<&str> {
+        let mut refs = self.baseline.refs();
+        refs.extend(self.overlay.refs());
+        refs.extend(self.effective.refs());
+        refs
+    }
+    fn show(&mut self, people: &crate::people::People) {
+        self.baseline.show(people);
+        self.overlay.show(people);
+        self.effective.show(people);
+    }
 }
 
-/// Mark one line reviewed. Administer on the Org. The first
-/// acknowledgement stands; a repeat answers the line unchanged.
-#[utoipa::path(
-    post,
-    path = "/v1/orgs/{org}/environment-migration-report/{env}/acknowledge",
-    params(
-        ("org" = String, Path, description = "org"),
-        ("env" = String, Path, description = "environment name")
-    ),
-    summary = "Acknowledge a split-report line (ADR-0071 §10 step 8)",
-    responses(
-        (status = 200, body = EnvironmentMigrationReportDto),
-        (status = 403, description = "not an org admin"),
-        (status = 404, description = "no report line for that name, or not configured")
-    )
-)]
-pub(crate) async fn acknowledge_environment_migration_report(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-    Path((org, env)): Path<(String, String)>,
-) -> Result<Json<EnvironmentMigrationReportDto>, ApiError> {
-    let scope = rbac_scope(&org, None);
-    let principal = authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
-    let now = st.clock.now().await.0;
-    let line = governance_store(&st)?
-        .acknowledge_environment_migration_report(&org, &env, &principal.subject, now)
-        .await
-        .map_err(org_environment_api_error)?
-        .ok_or(ApiError::NotFound)?;
-    Ok(Json((&line).into()))
+impl crate::people::ShowsPeople for EnvironmentProjectOverlayDto {
+    fn refs(&self) -> Vec<&str> {
+        self.approvers.iter().map(String::as_str).collect()
+    }
+    fn show(&mut self, people: &crate::people::People) {
+        people.show_all(&mut self.approvers);
+    }
+}
+
+impl crate::people::ShowsPeople for EnvironmentProjectDto {
+    fn refs(&self) -> Vec<&str> {
+        self.overlay.refs()
+    }
+    fn show(&mut self, people: &crate::people::People) {
+        self.overlay.show(people);
+    }
+}
+
+impl crate::people::ShowsPeople for DuplicateOrgEnvironmentResponse {
+    fn refs(&self) -> Vec<&str> {
+        self.environment.refs()
+    }
+    fn show(&mut self, people: &crate::people::People) {
+        self.environment.show(people);
+    }
 }

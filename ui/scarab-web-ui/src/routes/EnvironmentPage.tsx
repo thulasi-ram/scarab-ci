@@ -1,25 +1,25 @@
-// One org Environment, on two pages (git-bug c11abc5).
+// One org Environment's manage page,
+// `/orgs/<org>/settings/environments/<name>/manage` (git-bug c11abc5).
 //
-// `/orgs/<org>/settings/environments/<name>` shows it, read-only: the
-// description, the baseline every project's deploys obey, which projects may
-// deploy, and each project's overlay and privilege grant. One Edit button goes
-// to `…/<name>/edit`, which holds every change: description, baseline and
-// eligibility (one Save, sending only the parts that changed), each project's
-// privilege grant (saved per project), and Delete. Withdrawing a grant and
-// deleting the Environment each ask for the exact name to be typed.
+// One page holds the Environment and every change to it: its display name,
+// description, baseline, approval gate and eligibility in one form (one Save,
+// sending only the parts that changed), the projects with an overlay or a
+// privilege grant here, each project's grant (saved per project), Duplicate
+// and Delete. Withdrawing a grant and deleting the Environment each ask for
+// the exact name to be typed. The addresses the read-only page and the edit
+// screen had (`…/<name>` and `…/<name>/edit`) redirect here.
 //
 // The name cannot be changed: it is the key every pipeline's `environment:`
 // and the OIDC subject (`…/env/<name>/…`) use. The display name can: headings
 // show it, with the name beside it in mono. To move to another name, Duplicate
-// (on the view) copies the Environment, its rules, eligibility, overlays,
-// grants and secrets under the new name, and lists what it did not copy.
+// copies the Environment, its rules, eligibility, overlays, grants and
+// secrets under the new name, and lists what it did not copy.
 //
-// Both render inside the settings frame, with Environments marked in the
-// sidebar, and each has its own URL to send as a link. The frame shows them
-// only to an admin of the org; the server enforces Administer on every
-// request.
-import { createMemo, createResource, createSignal, For, Show, type JSX } from "solid-js";
-import { A, useNavigate, useParams } from "@solidjs/router";
+// It renders inside the settings frame, with Environments marked in the
+// sidebar. The frame shows it only to an admin of the org; the server
+// enforces Administer on every request.
+import { createEffect, createMemo, createResource, createSignal, For, on, Show, type JSX } from "solid-js";
+import { Navigate, useLocation, useNavigate, useParams, A } from "@solidjs/router";
 import {
   deleteOrgEnvironment,
   deletePrivilegeGrant,
@@ -36,7 +36,6 @@ import {
   type OrgEnvironment,
 } from "../api/client";
 import {
-  eligibilityLabel,
   isPermissive,
   rulesSummary,
   toGrantBody,
@@ -45,18 +44,15 @@ import {
   type RulesForm,
 } from "../environment-overlays";
 import {
-  approvalGateFacts,
   blockerLines,
   cascadeDeleteLabel,
   copiedSummary,
   displayNameError,
-  durationText,
   formHasApprovers,
   idleTimerWarning,
   requiredApprovalsError,
   type ApprovalGateForm,
   duplicateChecklist,
-  environmentEditHref,
   environmentHref,
   environmentLabel,
   environmentsHref,
@@ -69,7 +65,7 @@ import {
 } from "../org-environments";
 import { addToList } from "../identities";
 import { decodeParam } from "../settings-nav";
-import { SettingsCrumbs, SettingsFrame, type Crumb } from "./Settings";
+import { SettingsCrumbs, SettingsFrame } from "./Settings";
 import { absTime, relTime } from "../fmt";
 import PrincipalSearch from "../components/PrincipalSearch";
 import FormSection from "../components/FormSection";
@@ -100,6 +96,18 @@ function EnvironmentFrame(props: { children: (org: string, name: string) => JSX.
   );
 }
 
+/** `…/environments/:env` and `…/:env/edit`, the addresses of the former
+ *  read-only page and edit screen: the manage page, query and hash kept. */
+export function EnvironmentRedirect() {
+  const params = useParams<{ org: string; env: string }>();
+  const location = useLocation();
+  return (
+    <Navigate
+      href={`${environmentHref(decodeParam(params.org), decodeParam(params.env))}${location.search}${location.hash}`}
+    />
+  );
+}
+
 /** The Environment by name (`GET …/environments/{env}`). `undefined` while
  *  loading; `null` when there is none of that name. */
 function useEnvironment(org: string, name: string) {
@@ -107,26 +115,17 @@ function useEnvironment(org: string, name: string) {
   return [env, refetch] as const;
 }
 
-/** The trail both pages share, at the top of the settings main column. It
- *  shows the display name once the Environment has loaded, and the name
- *  pipelines use beside the org below it. */
-function Head(props: { org: string; name: string; env?: OrgEnvironment | null; edit?: boolean }) {
+/** The trail at the top of the settings main column. It shows the display
+ *  name once the Environment has loaded, and the name pipelines use beside
+ *  the org below it. */
+function Head(props: { org: string; name: string; env?: OrgEnvironment | null }) {
   const record = () => ({ name: props.name, display_name: props.env?.display_name });
-  const here = (): Crumb => ({
-    label: shownName(record()),
-    mono: nameBeside(record()) === null,
-  });
-  const trail = (): Crumb[] =>
-    props.edit
-      ? [
-          { label: "Environments", href: environmentsHref(props.org) },
-          { ...here(), href: environmentHref(props.org, props.name) },
-          { label: "Edit" },
-        ]
-      : [{ label: "Environments", href: environmentsHref(props.org) }, here()];
   return (
     <SettingsCrumbs
-      trail={trail()}
+      trail={[
+        { label: "Environments", href: environmentsHref(props.org) },
+        { label: shownName(record()), mono: nameBeside(record()) === null },
+      ]}
       sub={
         <>
           <span class="mono">{props.org}</span>
@@ -140,7 +139,7 @@ function Head(props: { org: string; name: string; env?: OrgEnvironment | null; e
               </>
             )}
           </Show>{" "}
-          · {props.edit ? "edit an environment" : "where deploys land"}
+          · manage an environment
         </>
       }
     />
@@ -179,26 +178,31 @@ function Guard(props: {
   );
 }
 
-// ── View ─────────────────────────────────────────────────────────────────────
+// ── Manage ───────────────────────────────────────────────────────────────────
 
-/** `/orgs/:org/settings/environments/:env` — the Environment, read-only. */
-export function EnvironmentView() {
-  return <EnvironmentFrame>{(org, name) => <View org={org} name={name} />}</EnvironmentFrame>;
+/** `/orgs/:org/settings/environments/:env/manage` — the Environment and every
+ *  change to it. */
+export function EnvironmentManage() {
+  return <EnvironmentFrame>{(org, name) => <Manage org={org} name={name} />}</EnvironmentFrame>;
 }
 
-function View(props: { org: string; name: string }) {
-  const [env] = useEnvironment(props.org, props.name);
+function Manage(props: { org: string; name: string }) {
+  const [env, refetch] = useEnvironment(props.org, props.name);
+  const [notice, setNotice] = createSignal<string | null>(null);
   const [duplicating, setDuplicating] = createSignal(false);
+  // Bumped by Discard changes: the form is built again from what is stored.
+  const [formKey, setFormKey] = createSignal(0);
+  const [grantsEpoch, setGrantsEpoch] = createSignal(0);
   return (
     <>
       <Head org={props.org} name={props.name} env={env()} />
+      <Show when={notice()}>
+        <p class="notice-ok">{notice()}</p>
+      </Show>
       <Guard org={props.org} name={props.name} env={env()} loading={env.loading} error={env.error}>
         {(e) => (
-          <>
+          <div class="env-edit">
             <div class="run-toolbar">
-              <A href={environmentEditHref(props.org, e.name)} class="btn btn-primary btn-sm">
-                Edit
-              </A>
               <button class="btn btn-ghost btn-sm" onClick={() => setDuplicating(true)}>
                 <Icon icon="copy" size={14} /> Duplicate
               </button>
@@ -206,93 +210,50 @@ function View(props: { org: string; name: string }) {
             <Show when={duplicating()}>
               <DuplicateDialog org={props.org} env={e} onClose={() => setDuplicating(false)} />
             </Show>
-            <Details env={e} />
-            <ProjectsPanel org={props.org} env={e.name} />
-          </>
+            <Show when={unprotectedButOpen(e)}>
+              <p class="tok-warn env-warn" role="status">
+                <Icon icon="alert-triangle" size={14} /> Projects may deploy here and no baseline rule
+                protects it: only each project's own overlay does. Set a baseline below.
+              </p>
+            </Show>
+            <Show when={formKey() + 1} keyed>
+              {(_k) => (
+                <EditForm
+                  org={props.org}
+                  env={e}
+                  onEdited={() => setNotice(null)}
+                  onDiscard={() => setFormKey((k) => k + 1)}
+                  onSaved={() => {
+                    setNotice(`${shownName(e)} is saved.`);
+                    void refetch();
+                  }}
+                />
+              )}
+            </Show>
+            <GrantsSection
+              org={props.org}
+              env={e.name}
+              epoch={grantsEpoch()}
+              onChanged={() => setGrantsEpoch((n) => n + 1)}
+            />
+            <DeleteSection org={props.org} name={e.name} />
+          </div>
         )}
       </Guard>
     </>
   );
 }
 
-function Details(props: { env: OrgEnvironment }) {
-  const rules = () => props.env.protection;
-  const list = (xs: readonly string[], none: string) => (xs.length > 0 ? xs.join(", ") : none);
-  return (
-    <>
-    <Show when={unprotectedButOpen(props.env)}>
-      <p class="tok-warn env-warn" role="status">
-        <Icon icon="alert-triangle" size={14} /> Projects may deploy here and no baseline rule
-        protects it: only each project's own overlay does. Edit it to set a baseline.
-      </p>
-    </Show>
-    <Show when={idleTimerWarning(rules())}>
-      {(w) => (
-        <p class="tok-warn env-warn" role="status">
-          <Icon icon="alert-triangle" size={14} /> {w()}
-        </p>
-      )}
-    </Show>
-    <div class="panel">
-      <div class="panel-h">
-        <span>Environment</span>
-        <Show when={isPermissive(rules())}>
-          <span class="tok-role" title="No org-wide rule protects this place yet, only each project's own overlay">
-            permissive baseline
-          </span>
-        </Show>
-      </div>
-      <dl class="lib-facts">
-        <dt>name</dt>
-        <dd class="m">{props.env.name}</dd>
-        <dt>display name</dt>
-        <dd>{props.env.display_name || <span class="subtle">none: the name shows</span>}</dd>
-        <dt>description</dt>
-        <dd>{props.env.description || <span class="subtle">none</span>}</dd>
-        <dt>approvers</dt>
-        <dd class="m">{list(rules().approvers, "none")}</dd>
-        <dt>allowed refs</dt>
-        <dd class="m">{list(rules().allowed_refs, "any ref")}</dd>
-        <dt>wait timer</dt>
-        <dd>
-          {rules().wait_timer_s > 0 ? durationText(rules().wait_timer_s) : "none"}
-          <Show when={rules().approvers.length > 0 && rules().wait_timer_s > 0}>
-            <span class="subtle"> after the approvals are in</span>
-          </Show>
-        </dd>
-        <dt>reason</dt>
-        <dd>{rules().require_reason ? "manual and API dispatches must give one" : "not required"}</dd>
-        <For each={approvalGateFacts(rules().approval_gate, rules().approvers.length)}>
-          {(f) => (
-            <>
-              <dt>{f.label}</dt>
-              <dd>{f.value}</dd>
-            </>
-          )}
-        </For>
-        <dt>projects that may use {shownName(props.env)}</dt>
-        <dd class="m">{eligibilityLabel(props.env.eligibility)}</dd>
-        <dt>last changed</dt>
-        <dd>
-          <span class="mono">{props.env.updated_by}</span> ·{" "}
-          <span title={absTime(props.env.updated_at)}>{relTime(props.env.updated_at)}</span>
-        </dd>
-      </dl>
-    </div>
-    </>
-  );
-}
-
-/** The projects with an overlay or a privilege grant here, read-only. On the
- *  edit page each row also carries grant and withdraw. */
+/** The projects with an overlay or a privilege grant here, each with its
+ *  grant and withdraw actions. */
 function ProjectsPanel(props: {
   org: string;
   env: string;
-  epoch?: number;
-  actions?: (p: { project: string; hasGrant: boolean }) => JSX.Element;
+  epoch: number;
+  actions: (p: { project: string; hasGrant: boolean }) => JSX.Element;
 }) {
   const [projects] = createResource(
-    () => ({ org: props.org, env: props.env, epoch: props.epoch ?? 0 }),
+    () => ({ org: props.org, env: props.env, epoch: props.epoch }),
     (k) => listEnvironmentProjects(k.org, k.env),
   );
   return (
@@ -307,7 +268,7 @@ function ProjectsPanel(props: {
               when={(projects() ?? []).length > 0}
               fallback={<p class="empty">No project has an overlay or privileges here.</p>}
             >
-              <ul class="tok-list">
+              <ul class="tok-list" aria-label="Project overlays and grants">
                 <For each={projects()}>
                   {(p) => (
                     <li class="tok">
@@ -316,13 +277,9 @@ function ProjectsPanel(props: {
                         <Show when={!p.eligible}>
                           <span class="tok-role">not eligible</span>
                         </Show>
-                        <Show when={props.actions}>
-                          {(a) => (
-                            <span class="oenv-actions">
-                              {a()({ project: p.project, hasGrant: !!p.privilege_grant })}
-                            </span>
-                          )}
-                        </Show>
+                        <span class="oenv-actions">
+                          {props.actions({ project: p.project, hasGrant: !!p.privilege_grant })}
+                        </span>
                       </div>
                       <div class="tok-facts">
                         <span title="The project's own overlay, which can only tighten the baseline">
@@ -352,27 +309,17 @@ function ProjectsPanel(props: {
   );
 }
 
-// ── Edit ─────────────────────────────────────────────────────────────────────
-
-/** `/orgs/:org/settings/environments/:env/edit` — every change to it. */
-export function EnvironmentEdit() {
-  return <EnvironmentFrame>{(org, name) => <Edit org={org} name={name} />}</EnvironmentFrame>;
-}
-
-function Edit(props: { org: string; name: string }) {
-  const [env] = useEnvironment(props.org, props.name);
-  return (
-    <>
-      <Head org={props.org} name={props.name} env={env()} edit />
-      <Guard org={props.org} name={props.name} env={env()} loading={env.loading} error={env.error}>
-        {(e) => <EditForm org={props.org} env={e} />}
-      </Guard>
-    </>
-  );
-}
-
-function EditForm(props: { org: string; env: OrgEnvironment }) {
-  const nav = useNavigate();
+/** The Environment's details as one form: display name, description,
+ *  baseline, approval gate and eligibility. Save sends only the parts that
+ *  changed; Discard changes builds the form again from what is stored. */
+function EditForm(props: {
+  org: string;
+  env: OrgEnvironment;
+  onSaved: () => void;
+  onDiscard: () => void;
+  /** Any change to the form: a "saved" notice no longer describes it. */
+  onEdited: () => void;
+}) {
   const initial = toEditForm(props.env);
   const [displayName, setDisplayName] = createSignal(initial.displayName);
   const [description, setDescription] = createSignal(initial.description);
@@ -382,7 +329,6 @@ function EditForm(props: { org: string; env: OrgEnvironment }) {
   const [patterns, setPatterns] = createSignal(initial.patterns);
   const [saving, setSaving] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
-  const [grantsEpoch, setGrantsEpoch] = createSignal(0);
   const setRule = (patch: Partial<RulesForm>) => setBaseline((b) => ({ ...b, ...patch }));
   const setGateField = (patch: Partial<ApprovalGateForm>) => setGate((g) => ({ ...g, ...patch }));
   const hasApprovers = () => formHasApprovers(baseline());
@@ -397,7 +343,10 @@ function EditForm(props: { org: string; env: OrgEnvironment }) {
       allProjects: allProjects(),
       patterns: patterns(),
     });
-  const viewHref = () => environmentHref(props.org, props.env.name);
+  const pending = () => (plan().writes?.length ?? 0) > 0;
+  createEffect(
+    on([displayName, description, baseline, gate, allProjects, patterns], () => props.onEdited(), { defer: true }),
+  );
 
   const save = async () => {
     const writes = plan().writes;
@@ -420,17 +369,27 @@ function EditForm(props: { org: string; env: OrgEnvironment }) {
         setError(problem);
         return;
       }
-      nav(viewHref());
+      props.onSaved();
     } finally {
       setSaving(false);
     }
   };
 
   return (
-    <div class="env-edit">
+    <>
       <div class="panel">
         <div class="panel-h">
           <span>Environment</span>
+          <span class="oenv-actions">
+            <Show when={isPermissive(props.env.protection)}>
+              <span class="tok-role" title="No org-wide rule protects this place yet, only each project's own overlay">
+                permissive baseline
+              </span>
+            </Show>
+            <span class="subtle" title={absTime(props.env.updated_at)}>
+              changed by <span class="mono">{props.env.updated_by}</span> · {relTime(props.env.updated_at)}
+            </span>
+          </span>
         </div>
         <div class="secrets-body token-form">
           <FormSection n={1} title="Name">
@@ -637,29 +596,16 @@ function EditForm(props: { org: string; env: OrgEnvironment }) {
             <p class="error">{error()}</p>
           </Show>
           <div class="modal-actions">
-            <button
-              class="btn btn-primary"
-              disabled={!!plan().error || (plan().writes?.length ?? 0) === 0 || saving()}
-              onClick={save}
-            >
+            <button class="btn btn-primary" disabled={!!plan().error || !pending() || saving()} onClick={save}>
               {saving() ? "Saving…" : "Save"}
             </button>
-            <A href={viewHref()} class="btn btn-ghost">
-              Cancel
-            </A>
+            <button class="btn btn-ghost" disabled={!pending() || saving()} onClick={props.onDiscard}>
+              Discard changes
+            </button>
           </div>
         </div>
       </div>
-
-      <GrantsSection
-        org={props.org}
-        env={props.env.name}
-        epoch={grantsEpoch()}
-        onChanged={() => setGrantsEpoch((e) => e + 1)}
-      />
-
-      <DeleteSection org={props.org} name={props.env.name} />
-    </div>
+    </>
   );
 }
 
@@ -966,7 +912,7 @@ function DuplicateDialog(props: { org: string; env: OrgEnvironment; onClose: () 
           busy={saving()}
           onClose={props.onClose}
           after={{
-            label: "after duplicating",
+            label: "After duplicating",
             value: "Pipelines still deploy into the old name until their environment: is changed.",
           }}
           footer={

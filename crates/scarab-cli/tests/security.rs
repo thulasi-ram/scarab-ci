@@ -59,6 +59,7 @@ fn next_id() -> u64 {
 fn scoped(subject: &str) -> Principal {
     Principal {
         subject: subject.into(),
+        handle: String::new(),
         display_name: None,
         roles: vec![],
     }

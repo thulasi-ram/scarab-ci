@@ -28,13 +28,13 @@ use scarab_forge::{
     ForgeConnection, ForgeConnectionStore, ForgeKind, OrgAssignView, RegistryError, RepoRef,
     ResolvedRepo,
 };
-use scarab_project::{ApprovalHistoryStore, Deployment, ProjectError};
+use scarab_project::ProjectError;
 
 /// `EnvironmentGovernanceStore` (ADR-0071 §2, §3, §8): baseline, eligibility,
 /// overlays and grants, and the one-snapshot read admission makes.
 mod environment_governance;
 /// `LibraryStore` (ADR-0076): installed libraries, their versions, yanks
-/// and each org's first-party defaults.
+/// and the sources each org trusts with forge credentials.
 mod libraries;
 /// `OrgEnvironmentStore` (ADR-0071): the org-level Environment.
 mod org_environments;
@@ -78,6 +78,12 @@ impl PostgresDb {
             pool,
             leader_tx_bound: std::time::Duration::from_millis(scarab_engine::LEADER_TX_BOUND_MS),
         }
+    }
+
+    /// The connection pool, for tests that seed rows the ports never write
+    /// (a Principal with a chosen id, say).
+    pub fn pool_for_tests(&self) -> &PgPool {
+        &self.pool
     }
 
     /// Override the leader-fenced transaction bound (tests that stall one on
@@ -1781,6 +1787,25 @@ impl Db for PostgresDb {
         rows.into_iter().map(run_summary_from_row).collect()
     }
 
+    async fn list_runs_for_org(&self, org: &str, limit: u32) -> Result<Vec<RunSummary>, DbError> {
+        // `runs_tenant_idx` leads with `tenant_org`.
+        let rows = sqlx::query(
+            "SELECT id, status, created_at, updated_at, tenant_org, tenant_project, run_number,
+                    origin_trigger_kind, origin_actor, origin_ref, origin_sha, origin_pr_number,
+                    origin_pr_base, pipeline, trigger_title, deploy_environment, is_deploy_run
+             FROM runs
+             WHERE tenant_org = $1
+             ORDER BY created_at DESC, id DESC
+             LIMIT $2",
+        )
+        .bind(org)
+        .bind(limit as i64)
+        .fetch_all(self.pool())
+        .await
+        .map_err(db_err)?;
+        rows.into_iter().map(run_summary_from_row).collect()
+    }
+
     async fn list_runs_for_tenant(
         &self,
         org: &str,
@@ -3296,7 +3321,8 @@ impl ForgeConnectionStore for PostgresDb {
              ON CONFLICT (owner, name) DO UPDATE SET
                  connection_id = EXCLUDED.connection_id,
                  org = EXCLUDED.org,
-                 project = EXCLUDED.project
+                 project = EXCLUDED.project,
+                 unreachable_since = NULL
              WHERE forge_repos.connection_id = EXCLUDED.connection_id
                 OR NOT EXISTS (
                     SELECT 1 FROM forge_connections c
@@ -3342,6 +3368,45 @@ impl ForgeConnectionStore for PostgresDb {
         Ok(())
     }
 
+    async fn mark_repo_unreachable(
+        &self,
+        connection_id: &str,
+        repo: &RepoRef,
+        at: i64,
+    ) -> Result<(), RegistryError> {
+        sqlx::query(
+            "UPDATE forge_repos SET unreachable_since = COALESCE(unreachable_since, $4)
+             WHERE connection_id = $1 AND owner = $2 AND name = $3",
+        )
+        .bind(connection_id)
+        .bind(&repo.owner)
+        .bind(&repo.name)
+        .bind(at)
+        .execute(self.pool())
+        .await
+        .map_err(reg_err)?;
+        Ok(())
+    }
+
+    async fn clear_repo_unreachable(
+        &self,
+        connection_id: &str,
+        repo: &RepoRef,
+    ) -> Result<(), RegistryError> {
+        sqlx::query(
+            "UPDATE forge_repos SET unreachable_since = NULL
+             WHERE connection_id = $1 AND owner = $2 AND name = $3
+               AND unreachable_since IS NOT NULL",
+        )
+        .bind(connection_id)
+        .bind(&repo.owner)
+        .bind(&repo.name)
+        .execute(self.pool())
+        .await
+        .map_err(reg_err)?;
+        Ok(())
+    }
+
     async fn repos_of(&self, connection_id: &str) -> Result<Vec<RepoRef>, RegistryError> {
         let rows = sqlx::query(
             "SELECT owner, name FROM forge_repos WHERE connection_id = $1 ORDER BY owner, name",
@@ -3359,10 +3424,20 @@ impl ForgeConnectionStore for PostgresDb {
             .collect())
     }
 
+    async fn repo_count_of(&self, connection_id: &str) -> Result<u64, RegistryError> {
+        let n: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM forge_repos WHERE connection_id = $1")
+                .bind(connection_id)
+                .fetch_one(self.pool())
+                .await
+                .map_err(reg_err)?;
+        Ok(n as u64)
+    }
+
     async fn resolve(&self, repo: &RepoRef) -> Result<Option<ResolvedRepo>, RegistryError> {
         let row = sqlx::query(
             "SELECT c.id, c.kind, c.base_url, c.credential_ref, c.org AS conn_org,
-                    c.installation_id, c.account_id, r.org, r.project
+                    c.installation_id, c.account_id, r.org, r.project, r.unreachable_since
              FROM forge_repos r JOIN forge_connections c ON c.id = r.connection_id
              WHERE r.owner = $1 AND r.name = $2",
         )
@@ -3375,6 +3450,7 @@ impl ForgeConnectionStore for PostgresDb {
             Ok(ResolvedRepo {
                 org: r.get::<String, _>("org"),
                 project: r.get::<String, _>("project"),
+                unreachable_since: r.get::<Option<i64>, _>("unreachable_since"),
                 connection: connection_from_row(r)?,
             })
         })
@@ -3610,80 +3686,6 @@ async fn lock_org(
 
 fn reg_err(e: sqlx::Error) -> RegistryError {
     RegistryError::Store(e.to_string())
-}
-
-/// The legacy approval history (ADR-0024, ADR-0070 §1) on the `deployments`
-/// table, written on every gate release. The frozen
-/// `legacy_project_environments` rows (ADR-0071 §10) have no writer here:
-/// the split report reads them, and an identity fold rewrites a folded id in
-/// their approver lists so the report never shows a Principal that no
-/// longer signs in.
-#[async_trait::async_trait]
-impl ApprovalHistoryStore for PostgresDb {
-    async fn record_deployment(
-        &self,
-        d: &Deployment,
-        wait: Option<&scarab_project::ApprovalWait>,
-    ) -> Result<(), ProjectError> {
-        let approved =
-            serde_json::to_value(&d.approved_by).map_err(|e| ProjectError::Store(e.to_string()))?;
-        // One row per gate wait (git-bug 1d06f2d): the unique index on
-        // (run_id, gate_step, gate_attempt) turns a racing second record
-        // into nothing. A record with no wait never collides.
-        sqlx::query(
-            "INSERT INTO deployments
-                 (org, project, environment, git_ref, run_id, approved_by, at, gate_step,
-                  gate_attempt)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-             ON CONFLICT (run_id, gate_step, gate_attempt) DO NOTHING",
-        )
-        .bind(&d.org)
-        .bind(&d.project)
-        .bind(&d.environment)
-        .bind(&d.git_ref)
-        .bind(&d.run)
-        .bind(approved)
-        .bind(d.at)
-        .bind(wait.map(|w| w.gate.as_str()))
-        .bind(wait.map(|w| w.attempt.as_str()))
-        .execute(self.pool())
-        .await
-        .map_err(|e| ProjectError::Store(e.to_string()))?;
-        Ok(())
-    }
-
-    async fn deployments(
-        &self,
-        org: &str,
-        project: &str,
-        environment: &str,
-    ) -> Result<Vec<Deployment>, ProjectError> {
-        let rows = sqlx::query(
-            "SELECT git_ref, run_id, approved_by, at FROM deployments
-             WHERE org = $1 AND project = $2 AND environment = $3 ORDER BY id DESC",
-        )
-        .bind(org)
-        .bind(project)
-        .bind(environment)
-        .fetch_all(self.pool())
-        .await
-        .map_err(|e| ProjectError::Store(e.to_string()))?;
-        rows.into_iter()
-            .map(|r| {
-                let approved_by = serde_json::from_value(r.get::<Value, _>("approved_by"))
-                    .map_err(|e| ProjectError::Store(e.to_string()))?;
-                Ok(Deployment {
-                    org: org.to_string(),
-                    project: project.to_string(),
-                    environment: environment.to_string(),
-                    git_ref: r.get::<String, _>("git_ref"),
-                    run: r.get::<String, _>("run_id"),
-                    approved_by,
-                    at: r.get::<i64, _>("at"),
-                })
-            })
-            .collect()
-    }
 }
 
 /// "Intentionally unset" markers for the advisory coverage matrix (ADR-0037 D).
@@ -4468,9 +4470,12 @@ impl scarab_identity::RbacStore for PostgresDb {
     async fn bindings(
         &self,
         org: &str,
-    ) -> Result<Vec<scarab_identity::Binding>, scarab_identity::IdentityError> {
+    ) -> Result<
+        Vec<(scarab_identity::Binding, scarab_identity::BindingOrigin)>,
+        scarab_identity::IdentityError,
+    > {
         let rows = sqlx::query(
-            "SELECT subject, project, role FROM rbac_bindings
+            "SELECT subject, project, role, origin FROM rbac_bindings
              WHERE org = $1 AND role IS NOT NULL
              ORDER BY subject, project",
         )
@@ -4491,11 +4496,18 @@ impl scarab_identity::RbacStore for PostgresDb {
                         name: project,
                     }
                 };
-                Some(scarab_identity::Binding {
-                    subject: r.get::<String, _>("subject"),
-                    scope,
-                    role,
-                })
+                let origin = match r.get::<String, _>("origin").as_str() {
+                    "import" => scarab_identity::BindingOrigin::Import,
+                    _ => scarab_identity::BindingOrigin::Native,
+                };
+                Some((
+                    scarab_identity::Binding {
+                        subject: r.get::<String, _>("subject"),
+                        scope,
+                        role,
+                    },
+                    origin,
+                ))
             })
             .collect())
     }
@@ -4617,6 +4629,20 @@ fn api_token_from_row(r: &sqlx::postgres::PgRow) -> Option<scarab_identity::ApiT
 /// needs a handful; this bound only stops a pathological loop.
 const MAX_PRINCIPAL_SUFFIX: u32 = 10_000;
 
+/// The columns [`principal_from_row`] reads.
+const PRINCIPAL_COLS: &str = "id, handle, display_name, created_at, claimed_at, merged_into";
+
+fn principal_from_row(r: &sqlx::postgres::PgRow) -> scarab_identity::PrincipalRecord {
+    scarab_identity::PrincipalRecord {
+        id: r.get("id"),
+        handle: r.get("handle"),
+        display_name: r.get("display_name"),
+        created_at: r.get("created_at"),
+        claimed_at: r.get("claimed_at"),
+        merged_into: r.get("merged_into"),
+    }
+}
+
 /// Fold Principal `from` into `into` inside `tx` (ADR-0069 §6). Everything
 /// that NAMES `from` and would otherwise strand its authority moves:
 ///
@@ -4729,47 +4755,6 @@ async fn merge_principal(
         .await
         .map_err(identity_err)?;
     }
-    // The frozen legacy rows too. Not a governance edit — nothing admits by
-    // them (ADR-0071 §10) — but the split report shows them to an admin, and
-    // a folded id must not reappear there as a Principal that no longer
-    // signs in.
-    let envs = sqlx::query(
-        "SELECT org, project, name, protection FROM legacy_project_environments
-         WHERE protection->'approvers' ? $1 FOR UPDATE",
-    )
-    .bind(from)
-    .fetch_all(&mut **tx)
-    .await
-    .map_err(identity_err)?;
-    for e in envs {
-        let mut protection: Value = e.get("protection");
-        if let Some(list) = protection
-            .get_mut("approvers")
-            .and_then(Value::as_array_mut)
-        {
-            let mut seen = std::collections::HashSet::new();
-            let rewritten: Vec<Value> = list
-                .iter()
-                .filter_map(Value::as_str)
-                .map(|a| if a == from { into } else { a })
-                .filter(|a| seen.insert(a.to_string()))
-                .map(|a| Value::String(a.to_string()))
-                .collect();
-            *list = rewritten;
-        }
-        sqlx::query(
-            "UPDATE legacy_project_environments SET protection = $4
-             WHERE org = $1 AND project = $2 AND name = $3",
-        )
-        .bind(e.get::<String, _>("org"))
-        .bind(e.get::<String, _>("project"))
-        .bind(e.get::<String, _>("name"))
-        .bind(&protection)
-        .execute(&mut **tx)
-        .await
-        .map_err(identity_err)?;
-    }
-
     // A passkey is registered for one Principal and never moves (ADR-0079
     // §3): `from`'s are deleted with it. The ids are the rows this DELETE
     // removed, so a passkey enrolled for `from` while the link ran is
@@ -4802,17 +4787,19 @@ async fn merge_principal(
 }
 
 impl PostgresDb {
-    /// The identity's Principal, or a freshly minted one under the first free
-    /// `~N` of `base_id` (ADR-0069). `claim` = a sign-in: refresh the contact
-    /// details and stamp `claimed_at`. Otherwise an import: refresh the handle
-    /// only, and mint unclaimed.
+    /// The identity's Principal, or a freshly minted one (a new random id)
+    /// under the first free `~N` of `base_handle`, compared ignoring case
+    /// (ADR-0069 §2, ADR-0080 §1). `claim` = a sign-in: refresh the contact
+    /// details and stamp `claimed_at`. Otherwise an import: refresh the
+    /// handle only, and mint unclaimed.
     async fn pin_or_mint(
         &self,
         identity: &scarab_identity::ProviderIdentity,
-        base_id: &str,
+        base_handle: &str,
+        placeholder: scarab_identity::Placeholder,
         now_ms: i64,
         claim: bool,
-    ) -> Result<String, scarab_identity::IdentityError> {
+    ) -> Result<scarab_identity::PrincipalRecord, scarab_identity::IdentityError> {
         // Two passes at most: if a racing sign-in pins the same identity
         // between our lookup and our insert, our mint rolls back and the
         // second lookup finds theirs. Converging on ONE Principal is the point.
@@ -4838,64 +4825,89 @@ impl PostgresDb {
                     .execute(self.pool())
                     .await
                     .map_err(identity_err)?;
-                    return Ok(id);
+                } else {
+                    sqlx::query(
+                        "UPDATE principal_identities
+                         SET handle = $3, email = $4, email_verified = $5, last_login_at = $6
+                         WHERE provider = $1 AND external_id = $2",
+                    )
+                    .bind(&identity.provider)
+                    .bind(&identity.external_id)
+                    .bind(&identity.handle)
+                    .bind(&identity.email)
+                    .bind(identity.email_verified)
+                    .bind(now_ms)
+                    .execute(self.pool())
+                    .await
+                    .map_err(identity_err)?;
+                    sqlx::query(
+                        "UPDATE principals
+                         SET display_name = COALESCE($2, display_name),
+                             claimed_at = COALESCE(claimed_at, $3)
+                         WHERE id = $1",
+                    )
+                    .bind(&id)
+                    .bind(&identity.display_name)
+                    .bind(now_ms)
+                    .execute(self.pool())
+                    .await
+                    .map_err(identity_err)?;
                 }
-                sqlx::query(
-                    "UPDATE principal_identities
-                     SET handle = $3, email = $4, email_verified = $5, last_login_at = $6
-                     WHERE provider = $1 AND external_id = $2",
-                )
-                .bind(&identity.provider)
-                .bind(&identity.external_id)
-                .bind(&identity.handle)
-                .bind(&identity.email)
-                .bind(identity.email_verified)
-                .bind(now_ms)
-                .execute(self.pool())
-                .await
-                .map_err(identity_err)?;
-                sqlx::query(
-                    "UPDATE principals
-                     SET display_name = COALESCE($2, display_name),
-                         claimed_at = COALESCE(claimed_at, $3)
-                     WHERE id = $1",
-                )
-                .bind(&id)
-                .bind(&identity.display_name)
-                .bind(now_ms)
-                .execute(self.pool())
-                .await
-                .map_err(identity_err)?;
-                return Ok(id);
+                return self.principal_required(&id).await;
             }
 
-            // Never seen: mint. The PK is the existence check — insert and,
-            // on conflict, take the next suffix. No check-then-act.
             let mut tx = self.pool().begin().await.map_err(identity_err)?;
-            let mut minted = None;
-            for n in 1..=MAX_PRINCIPAL_SUFFIX {
-                let id = scarab_identity::principal_id_candidate(base_id, n);
-                let inserted = sqlx::query(
-                    "INSERT INTO principals (id, display_name, created_at, claimed_at)
-                     VALUES ($1, $2, $3, $4)
-                     ON CONFLICT (id) DO NOTHING",
+            // A legacy placeholder (migration 0093) whose handle is exactly
+            // this one: adopted, never minted around, so a pre-0052 grant
+            // reaches the person the pre-0052 server would have given it to.
+            let mut minted: Option<String> = None;
+            if placeholder == scarab_identity::Placeholder::AdoptExact {
+                minted = sqlx::query_scalar(
+                    "UPDATE principals
+                     SET legacy_placeholder = FALSE,
+                         display_name = COALESCE($2, display_name),
+                         claimed_at = $3
+                     WHERE id = (SELECT id FROM principals
+                                 WHERE handle = $1 AND legacy_placeholder
+                                   AND claimed_at IS NULL AND merged_into IS NULL
+                                 FOR UPDATE)
+                     RETURNING id",
                 )
-                .bind(&id)
+                .bind(base_handle)
                 .bind(&identity.display_name)
-                .bind(now_ms)
                 .bind(claim.then_some(now_ms))
-                .execute(&mut *tx)
+                .fetch_optional(&mut *tx)
                 .await
-                .map_err(identity_err)?
-                .rows_affected();
-                if inserted == 1 {
-                    minted = Some(id);
-                    break;
+                .map_err(identity_err)?;
+            }
+            // Never seen: mint. The unique indexes (the handle, and the
+            // handle ignoring case) are the existence check — insert and, on
+            // conflict, take the next suffix. No check-then-act.
+            if minted.is_none() {
+                for n in 1..=MAX_PRINCIPAL_SUFFIX {
+                    let handle = scarab_identity::handle_candidate(base_handle, n);
+                    let id: Option<String> = sqlx::query_scalar(
+                        "INSERT INTO principals (handle, display_name, created_at, claimed_at)
+                         VALUES ($1, $2, $3, $4)
+                         ON CONFLICT DO NOTHING
+                         RETURNING id",
+                    )
+                    .bind(&handle)
+                    .bind(&identity.display_name)
+                    .bind(now_ms)
+                    .bind(claim.then_some(now_ms))
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(identity_err)?;
+                    if id.is_some() {
+                        minted = id;
+                        break;
+                    }
                 }
             }
             let id = minted.ok_or_else(|| {
                 scarab_identity::IdentityError::Issuance(format!(
-                    "no free principal id for `{base_id}`"
+                    "no free principal handle for `{base_handle}`"
                 ))
             })?;
             let pinned_now = sqlx::query(
@@ -4919,7 +4931,7 @@ impl PostgresDb {
             .rows_affected();
             if pinned_now == 1 {
                 tx.commit().await.map_err(identity_err)?;
-                return Ok(id);
+                return self.principal_required(&id).await;
             }
             // Lost the race: drop our unseen mint and resolve theirs.
             tx.rollback().await.map_err(identity_err)?;
@@ -4928,6 +4940,50 @@ impl PostgresDb {
             "identity {}:{} could not be pinned",
             identity.provider, identity.external_id
         )))
+    }
+
+    async fn principal_required(
+        &self,
+        id: &str,
+    ) -> Result<scarab_identity::PrincipalRecord, scarab_identity::IdentityError> {
+        scarab_identity::IdentityStore::principal(self, id)
+            .await?
+            .ok_or_else(|| {
+                scarab_identity::IdentityError::Issuance(format!("principal `{id}` vanished"))
+            })
+    }
+
+    /// The handle of Principal `id`, or `id` itself when it names nobody.
+    async fn handle_of(&self, tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, id: &str) -> String {
+        sqlx::query_scalar::<_, String>("SELECT handle FROM principals WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&mut **tx)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| id.to_string())
+    }
+
+    /// The handles that equal another ignoring case (ADR-0080 §6), grouped:
+    /// each inner list is one group, oldest first. Logged at boot so an
+    /// operator can see them; nothing merges them automatically.
+    pub async fn case_duplicate_handles(
+        &self,
+    ) -> Result<Vec<Vec<String>>, scarab_identity::IdentityError> {
+        let rows = sqlx::query(
+            "SELECT array_agg(handle ORDER BY created_at, handle) AS handles
+             FROM principals
+             GROUP BY lower(handle)
+             HAVING count(*) > 1
+             ORDER BY lower(handle)",
+        )
+        .fetch_all(self.pool())
+        .await
+        .map_err(identity_err)?;
+        Ok(rows
+            .iter()
+            .map(|r| r.get::<Vec<String>, _>("handles"))
+            .collect())
     }
 }
 
@@ -4952,19 +5008,23 @@ impl scarab_identity::IdentityStore for PostgresDb {
     async fn sign_in(
         &self,
         identity: &scarab_identity::ProviderIdentity,
-        base_id: &str,
+        base_handle: &str,
+        placeholder: scarab_identity::Placeholder,
         now_ms: i64,
-    ) -> Result<String, scarab_identity::IdentityError> {
-        self.pin_or_mint(identity, base_id, now_ms, true).await
+    ) -> Result<scarab_identity::PrincipalRecord, scarab_identity::IdentityError> {
+        self.pin_or_mint(identity, base_handle, placeholder, now_ms, true)
+            .await
     }
 
     async fn pin(
         &self,
         identity: &scarab_identity::ProviderIdentity,
-        base_id: &str,
+        base_handle: &str,
+        placeholder: scarab_identity::Placeholder,
         now_ms: i64,
-    ) -> Result<String, scarab_identity::IdentityError> {
-        self.pin_or_mint(identity, base_id, now_ms, false).await
+    ) -> Result<scarab_identity::PrincipalRecord, scarab_identity::IdentityError> {
+        self.pin_or_mint(identity, base_handle, placeholder, now_ms, false)
+            .await
     }
 
     async fn link(
@@ -5032,11 +5092,12 @@ impl scarab_identity::IdentityStore for PostgresDb {
                 .fetch_one(&mut *tx)
                 .await
                 .map_err(identity_err)?;
+                let from_handle = self.handle_of(&mut tx, &from).await;
                 if held > 1 {
                     return Err(conflict(format!(
-                        "that {} account belongs to `{from}`, which also signs in another \
-                         way — proving this one account does not prove you are `{from}`, \
-                         so merging the two needs an admin",
+                        "that {} account belongs to `{from_handle}`, which also signs in \
+                         another way — proving this one account does not prove you are \
+                         `{from_handle}`, so merging the two needs an admin",
                         identity.provider
                     )));
                 }
@@ -5058,7 +5119,10 @@ impl scarab_identity::IdentityStore for PostgresDb {
                 };
                 if !held_passkeys.is_empty() && !proven {
                     tx.rollback().await.map_err(identity_err)?;
-                    return Ok(scarab_identity::LinkOutcome::NeedsFoldedPasskey { from });
+                    return Ok(scarab_identity::LinkOutcome::NeedsFoldedPasskey {
+                        from,
+                        from_handle,
+                    });
                 }
                 let removed_passkeys = merge_principal(&mut tx, &from, principal).await?;
                 // The DELETE removed a passkey the check did not see (enrolled
@@ -5069,7 +5133,10 @@ impl scarab_identity::IdentityStore for PostgresDb {
                     .any(|id| !held_passkeys.contains(id))
                 {
                     tx.rollback().await.map_err(identity_err)?;
-                    return Ok(scarab_identity::LinkOutcome::NeedsFoldedPasskey { from });
+                    return Ok(scarab_identity::LinkOutcome::NeedsFoldedPasskey {
+                        from,
+                        from_handle,
+                    });
                 }
                 sqlx::query(
                     "UPDATE principal_identities
@@ -5089,6 +5156,7 @@ impl scarab_identity::IdentityStore for PostgresDb {
                 .map_err(identity_err)?;
                 scarab_identity::LinkOutcome::Merged {
                     from,
+                    from_handle,
                     removed_passkeys,
                 }
             }
@@ -5130,40 +5198,80 @@ impl scarab_identity::IdentityStore for PostgresDb {
         Ok(())
     }
 
-    async fn aliases_of(&self, id: &str) -> Result<Vec<String>, scarab_identity::IdentityError> {
-        sqlx::query_scalar(
+    async fn aliases_of(
+        &self,
+        id: &str,
+    ) -> Result<Vec<scarab_identity::PrincipalRecord>, scarab_identity::IdentityError> {
+        let rows = sqlx::query(&format!(
             "WITH RECURSIVE folded(id) AS (
                  SELECT id FROM principals WHERE merged_into = $1
                  UNION
                  SELECT p.id FROM principals p JOIN folded f ON p.merged_into = f.id
              )
-             SELECT id FROM folded ORDER BY id",
-        )
+             SELECT {PRINCIPAL_COLS} FROM principals WHERE id IN (SELECT id FROM folded)
+             ORDER BY handle"
+        ))
         .bind(id)
         .fetch_all(self.pool())
         .await
-        .map_err(identity_err)
+        .map_err(identity_err)?;
+        Ok(rows.iter().map(principal_from_row).collect())
     }
 
     async fn principal(
         &self,
         id: &str,
     ) -> Result<Option<scarab_identity::PrincipalRecord>, scarab_identity::IdentityError> {
-        let row = sqlx::query(
-            "SELECT id, display_name, created_at, claimed_at, merged_into
-             FROM principals WHERE id = $1",
-        )
+        let row = sqlx::query(&format!(
+            "SELECT {PRINCIPAL_COLS} FROM principals WHERE id = $1"
+        ))
         .bind(id)
         .fetch_optional(self.pool())
         .await
         .map_err(identity_err)?;
-        Ok(row.map(|r| scarab_identity::PrincipalRecord {
-            id: r.get("id"),
-            display_name: r.get("display_name"),
-            created_at: r.get("created_at"),
-            claimed_at: r.get("claimed_at"),
-            merged_into: r.get("merged_into"),
-        }))
+        Ok(row.as_ref().map(principal_from_row))
+    }
+
+    async fn by_handle(
+        &self,
+        handle: &str,
+    ) -> Result<Vec<scarab_identity::PrincipalRecord>, scarab_identity::IdentityError> {
+        let exact = sqlx::query(&format!(
+            "SELECT {PRINCIPAL_COLS} FROM principals WHERE handle = $1"
+        ))
+        .bind(handle)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(identity_err)?;
+        if let Some(r) = exact {
+            return Ok(vec![principal_from_row(&r)]);
+        }
+        let rows = sqlx::query(&format!(
+            "SELECT {PRINCIPAL_COLS} FROM principals WHERE lower(handle) = lower($1)
+             ORDER BY handle"
+        ))
+        .bind(handle)
+        .fetch_all(self.pool())
+        .await
+        .map_err(identity_err)?;
+        Ok(rows.iter().map(principal_from_row).collect())
+    }
+
+    async fn lookup_many(
+        &self,
+        refs: &[String],
+    ) -> Result<Vec<scarab_identity::PrincipalRecord>, scarab_identity::IdentityError> {
+        if refs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(&format!(
+            "SELECT {PRINCIPAL_COLS} FROM principals WHERE id = ANY($1) OR handle = ANY($1)"
+        ))
+        .bind(refs)
+        .fetch_all(self.pool())
+        .await
+        .map_err(identity_err)?;
+        Ok(rows.iter().map(principal_from_row).collect())
     }
 
     async fn identities_of(
@@ -5201,13 +5309,13 @@ impl scarab_identity::IdentityStore for PostgresDb {
     ) -> Result<Vec<scarab_identity::PrincipalMatch>, scarab_identity::IdentityError> {
         let q = scarab_identity::like_literal(query);
         let rows = sqlx::query(
-            "SELECT p.id, p.display_name, p.claimed_at FROM principals p
+            "SELECT p.id, p.handle, p.display_name, p.claimed_at FROM principals p
              WHERE p.merged_into IS NULL
-               AND (p.id ILIKE $1 || '%'
+               AND (p.handle ILIKE $1 || '%'
                     OR p.display_name ILIKE '%' || $1 || '%'
                     OR EXISTS (SELECT 1 FROM principal_identities i
                                WHERE i.principal_id = p.id AND i.handle ILIKE $1 || '%'))
-             ORDER BY p.id
+             ORDER BY p.handle
              LIMIT $2",
         )
         .bind(&q)
@@ -5220,6 +5328,7 @@ impl scarab_identity::IdentityStore for PostgresDb {
             let id: String = r.get("id");
             out.push(scarab_identity::PrincipalMatch {
                 identities: self.identities_of(&id).await?,
+                handle: r.get("handle"),
                 display_name: r.get("display_name"),
                 claimed: r.get::<Option<i64>, _>("claimed_at").is_some(),
                 id,

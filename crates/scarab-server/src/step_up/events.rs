@@ -88,7 +88,7 @@ pub struct SecurityEventDto {
     /// `passkey.enrolled|removed|reset|break_glass_reset|clone_suspected`,
     /// `guard.not_consulted`, `binding.operator_grant`.
     pub kind: String,
-    /// The human/principal it is about.
+    /// The handle of the human/principal it is about.
     pub subject: String,
     /// `session:cookie`, `session:bearer`, `api_token:<id>`,
     /// `operator:break-glass` or `operator:grant`.
@@ -201,6 +201,7 @@ fn filter_of(q: &EventsQuery) -> Result<SecurityEventFilter, ApiError> {
     Ok(SecurityEventFilter {
         org: None,
         subject: text_param(&q.actor),
+        subject_aliases: Vec::new(),
         kinds: q
             .kind
             .as_deref()
@@ -236,6 +237,19 @@ async fn page(
     // One more than the page: whether it comes back says whether there is a
     // next page, so the last page carries no cursor to an empty one.
     let limit = filter.limit.max(1);
+    // A person, by handle or id, matches the rows stored under either
+    // (ADR-0080 §3).
+    let mut filter = filter;
+    if let Some(who) = filter.subject.clone() {
+        if let Some(p) = st.people([who.as_str()]).await.get(&who).cloned() {
+            filter.subject = Some(p.id.clone());
+            for name in [p.handle, who] {
+                if name != p.id && !filter.subject_aliases.contains(&name) {
+                    filter.subject_aliases.push(name);
+                }
+            }
+        }
+    }
     let mut events = svc
         .events
         .list(&SecurityEventFilter {
@@ -247,8 +261,16 @@ async fn page(
     let more = events.len() > limit as usize;
     events.truncate(limit as usize);
     let next_before = more.then(|| events.last().map(|e| e.seq)).flatten();
+    // Each row names its person by handle, whichever form it stored.
+    let people = st.people(events.iter().map(|e| e.subject.as_str())).await;
     Ok(SecurityEventsResponse {
-        events: events.into_iter().map(SecurityEventDto::from).collect(),
+        events: events
+            .into_iter()
+            .map(|e| SecurityEventDto {
+                subject: people.handle(&e.subject),
+                ..SecurityEventDto::from(e)
+            })
+            .collect(),
         next_cursor: next_before.map(encode_cursor),
         next_before,
     })
@@ -376,6 +398,8 @@ pub(crate) async fn my_security_events(
         ));
     }
     let mut filter = filter_of(&q)?;
+    // Rows from before ADR-0080 name the caller by handle.
+    filter.subject_aliases = vec![caller.principal.handle().to_string()];
     filter.subject = Some(caller.principal.subject);
     Ok(Json(page(&st, filter).await?))
 }
@@ -432,7 +456,7 @@ async fn org_admins(
 ) -> Result<(BTreeSet<String>, u64), ApiError> {
     let mut admins = BTreeSet::new();
     if let Some(rbac) = st.rbac.as_ref() {
-        for b in rbac.bindings(org).await.map_err(store_err)? {
+        for (b, _) in rbac.bindings(org).await.map_err(store_err)? {
             if b.scope == Scope::Org(org.to_string()) && b.role >= Role::Admin {
                 admins.insert(b.subject);
             }
@@ -507,6 +531,23 @@ pub(crate) async fn org_security_summary(
         .into_iter()
         .filter(|e| e.at >= now - RECENT_REFUSALS_WINDOW_MS)
         .map(SecurityEventDto::from)
+        .collect::<Vec<_>>();
+    // People by handle (ADR-0080 §3).
+    let people = st
+        .people(
+            admins_without_passkey
+                .iter()
+                .map(String::as_str)
+                .chain(recent_refusals.iter().map(|e| e.subject.as_str())),
+        )
+        .await;
+    let admins_without_passkey = people.handles(&admins_without_passkey);
+    let recent_refusals: Vec<SecurityEventDto> = recent_refusals
+        .into_iter()
+        .map(|e| SecurityEventDto {
+            subject: people.handle(&e.subject),
+            ..e
+        })
         .collect();
     let pending_requests = svc
         .confirmations

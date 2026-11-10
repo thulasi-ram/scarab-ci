@@ -679,6 +679,7 @@ async fn a_plugin_subject_never_raises_a_request() {
         .session(
             Principal {
                 subject: "plugin:argo".into(),
+                handle: String::new(),
                 display_name: None,
                 roles: vec![],
             },

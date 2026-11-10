@@ -84,7 +84,6 @@ async fn installed(content: &str) -> InMemoryLibraries {
         source: source(),
         publisher: "acme".into(),
         name: "deploy".into(),
-        first_party: false,
         fetched_by: "amy".into(),
         fetched_at: 1,
     })
@@ -479,4 +478,80 @@ async fn a_compile_failure_has_each_errors_fields_and_is_kept_on_push() {
     assert_eq!(kept[0].reason_kind, "compile");
     assert_eq!(kept[0].errors[0]["kind"], "command_value");
     assert_eq!(kept[0].errors[0]["step"], "tag");
+}
+
+/// The manage page reads one installation by its id: the list carries the
+/// id, the id reads the installation back with its yank, and an id of
+/// another org's installation is not found in this org.
+#[tokio::test]
+async fn an_installation_is_read_by_its_id_in_its_own_org_only() {
+    let h = harness(CI_YAML).await;
+    // The same library installed in a second org gets its own id.
+    h.libs
+        .put_version(&LibraryVersion {
+            org: "globex".into(),
+            content_hash: content_hash(DEPLOY),
+            content: DEPLOY.into(),
+            source: source(),
+            publisher: "acme".into(),
+            name: "deploy".into(),
+            fetched_by: "amy".into(),
+            fetched_at: 1,
+        })
+        .await
+        .unwrap();
+    let globex = h
+        .libs
+        .install(
+            &NewInstallation {
+                org: "globex".into(),
+                publisher: "acme".into(),
+                name: "deploy".into(),
+                content_hash: content_hash(DEPLOY),
+                installed_by: "amy".into(),
+                installed_at: 1,
+                step_up_ref: None,
+            },
+            &Replaces::Nothing,
+        )
+        .await
+        .unwrap();
+    yank(h.libs.as_ref()).await;
+
+    let (st, list) = call(&h.app, "GET", "/v1/orgs/acme/libraries", None).await;
+    assert_eq!(st, StatusCode::OK, "{list}");
+    let id = list["installations"][0]["id"].as_str().unwrap().to_string();
+    assert!(!id.is_empty());
+    assert_ne!(id, globex.id, "each installation has its own id");
+
+    let (st, one) = call(
+        &h.app,
+        "GET",
+        &format!("/v1/orgs/acme/library-installations/{id}"),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{one}");
+    assert_eq!(one["id"], id);
+    assert_eq!(one["publisher"], "acme");
+    assert_eq!(one["name"], "deploy");
+    assert_eq!(one["yanked"]["reason"], "writes the token to the log");
+
+    // globex's id names nothing in acme, and acme's nothing in globex.
+    let (st, _) = call(
+        &h.app,
+        "GET",
+        &format!("/v1/orgs/acme/library-installations/{}", globex.id),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call(
+        &h.app,
+        "GET",
+        &format!("/v1/orgs/globex/library-installations/{id}"),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
 }

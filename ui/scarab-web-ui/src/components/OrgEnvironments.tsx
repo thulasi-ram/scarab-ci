@@ -9,32 +9,19 @@
 //   - per-project PRIVILEGE GRANTS (image digests, raw k8s_overlay), granted
 //     to one project, never to the Environment as a whole.
 //
-// This section is the list and the way to create one. Each name links to the
-// Environment's own read-only page, and every change to it is on that page's
-// edit screen (`routes/EnvironmentPage.tsx`, git-bug c11abc5).
-//
-// Above the list sits the migration's SPLIT REPORT: every name the migration
-// merged across projects, or opened to all projects, with each project's old
-// rules beside its overlay now, and a banner counting what is left to review
-// and which baselines are still permissive. Splitting a name that is really
-// two places is a YAML change in the projects concerned; the panel says so.
+// This section is the list and the way to create one: New environment, top
+// right, opens a dialog for its name. Each row links to the Environment's
+// manage page (`…/environments/<name>/manage`, routes/EnvironmentPage.tsx,
+// git-bug c11abc5), which holds every change to it.
 //
 // Every server refusal (400/409) is shown verbatim: it is the answer to "why
 // will this not save".
 import { createResource, createSignal, For, Show } from "solid-js";
 import { A, useNavigate } from "@solidjs/router";
-import {
-  acknowledgeMigrationReport,
-  getMigrationReport,
-  listOrgEnvironments,
-  putOrgEnvironment,
-  type MigrationReportLine,
-  type OrgEnvironment,
-} from "../api/client";
+import { listOrgEnvironments, putOrgEnvironment, type OrgEnvironment } from "../api/client";
 import {
   eligibilityLabel,
   isPermissive,
-  reportBanner,
   rulesSummary,
   unprotectedBanner,
   unprotectedButOpen,
@@ -60,10 +47,6 @@ export default function OrgEnvironments(props: { org: string }) {
     (k) => listOrgEnvironments(k.org),
   );
   const [creating, setCreating] = createSignal(false);
-  const [report, { refetch: refetchReport }] = createResource(
-    () => ({ org: props.org, epoch: epoch() }),
-    (k) => getMigrationReport(k.org).catch(() => null),
-  );
 
   // `null` is the server answering "no org-Environment store here", which is a
   // different sentence from "none registered".
@@ -73,9 +56,13 @@ export default function OrgEnvironments(props: { org: string }) {
   return (
     <div class="panel">
       <div class="panel-h">
-        <span>Environments · {props.org}</span>
-        <Show when={rows().length > 0}>
-          <span class="tok-count">{rows().length}</span>
+        <span>
+          Environments · {props.org} <span class="tok-count">{rows().length}</span>
+        </span>
+        <Show when={!unavailable() && !environments.error}>
+          <button class="btn btn-primary btn-sm" onClick={() => setCreating(true)}>
+            <Icon icon="plus" size={14} /> New environment
+          </button>
         </Show>
       </div>
       <div class="secrets-body">
@@ -83,25 +70,12 @@ export default function OrgEnvironments(props: { org: string }) {
           <p class="error">Could not load the org's environments.</p>
         </Show>
 
-        <Show when={(report() ?? []).length > 0}>
-          <MigrationReport org={props.org} lines={report()!} onChanged={() => refetchReport()} />
-        </Show>
-
         <Show when={!environments.loading} fallback={<p class="empty">loading…</p>}>
           <Show
             when={!unavailable()}
             fallback={<p class="empty">This server does not keep org-level environments.</p>}
           >
-            <Show
-              when={rows().length > 0}
-              fallback={
-                <p class="empty">
-                  No environments yet. A pipeline's <span class="mono">environment:</span>{" "}
-                  is refused until an environment of that name exists here and lets the
-                  project deploy into it.
-                </p>
-              }
-            >
+            <Show when={rows().length > 0} fallback={<p class="empty">No environments in {props.org} yet.</p>}>
               <Show when={unprotectedBanner(rows())}>
                 {(w) => (
                   <p class="tok-warn env-warn" role="status">
@@ -109,22 +83,18 @@ export default function OrgEnvironments(props: { org: string }) {
                   </p>
                 )}
               </Show>
-              <ul class="tok-list">
+              <ul class="tok-list" aria-label="Environments">
                 <For each={rows()}>{(env) => <EnvironmentRow org={props.org} env={env} />}</For>
               </ul>
             </Show>
 
-            <div class="secrets-actions">
-              <button class="btn btn-primary btn-sm" onClick={() => setCreating(true)}>
-                <Icon icon="plus" size={14} /> New environment
-              </button>
-            </div>
             <p class="subtle">
               <small>
-                <Icon icon="rocket" size={12} /> An org environment is the place deploys
-                land in, shared by every repository that deploys there. It decides which
-                projects may use it (eligibility) and under which rules (the baseline); each
-                repository can only tighten those for itself.
+                <Icon icon="rocket" size={12} /> An environment is where deploys land, shared by
+                every repository that deploys there. A pipeline's{" "}
+                <span class="mono">environment:</span> is refused until an environment of that name
+                exists here and lets the project use it. Each environment decides which projects may
+                use it and under which rules; a repository can only tighten those for itself.
               </small>
             </p>
           </Show>
@@ -147,8 +117,8 @@ export default function OrgEnvironments(props: { org: string }) {
   );
 }
 
-/** One registered Environment: its name (a link to its page), rules, and who
- *  last changed it. No controls: changes are on the Environment's page. */
+/** One registered Environment: its name, rules, who last changed it, and a
+ *  link to its manage page, where every change is made. */
 function EnvironmentRow(props: { org: string; env: OrgEnvironment }) {
   const env = () => props.env;
   return (
@@ -174,6 +144,11 @@ function EnvironmentRow(props: { org: string; env: OrgEnvironment }) {
             permissive baseline
           </span>
         </Show>
+        <span class="oenv-actions">
+          <A class="btn btn-ghost btn-sm" href={environmentHref(props.org, env().name)}>
+            Manage
+          </A>
+        </span>
       </div>
       <Show when={env().description}>
         <div class="oenv-desc">{env().description}</div>
@@ -198,7 +173,7 @@ function EnvironmentRow(props: { org: string; env: OrgEnvironment }) {
 
 /** Create an Environment: its name, display name and description. The name is
  *  fixed once it exists: it is the key every pipeline's `environment:` names.
- *  The rest is set on its edit page. */
+ *  The rest is set on its manage page. */
 function CreateDialog(props: {
   org: string;
   /** Names already registered: a create must not silently replace one. */
@@ -242,7 +217,7 @@ function CreateDialog(props: {
       busy={saving()}
       onClose={props.onClose}
       after={{
-        label: "after creating",
+        label: "After creating",
         value: "A new environment has no baseline rule and admits no project. Set both on its page.",
       }}
       footer={
@@ -285,124 +260,5 @@ function CreateDialog(props: {
         <Input placeholder="what lands here, who runs it" value={description()} onValue={setDescription} />
       </Field>
     </Modal>
-  );
-}
-
-/** The migration's split report: each name merged
- *  across projects, or opened to all projects, with each project's old rules
- *  beside its overlay now. Shown only to org admins (the read needs
- *  Administer) and only while it has lines. */
-function MigrationReport(props: {
-  org: string;
-  lines: MigrationReportLine[];
-  onChanged: () => void;
-}) {
-  const [open, setOpen] = createSignal(false);
-  const [error, setError] = createSignal<string | null>(null);
-  const banner = () => reportBanner(props.lines);
-
-  const acknowledge = async (env: string) => {
-    setError(null);
-    try {
-      await acknowledgeMigrationReport(props.org, env);
-      props.onChanged();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : `Could not acknowledge ${env}.`);
-    }
-  };
-
-  return (
-    <div class="oenv-report">
-      <div class="oenv-report-h">
-        <Icon icon="alert-triangle" size={14} />
-        <span>{banner() ?? "Migration report — every line reviewed."}</span>
-        <button class="btn btn-ghost btn-sm" onClick={() => setOpen((o) => !o)}>
-          {open() ? "hide" : "review"}
-        </button>
-      </div>
-      <Show when={open()}>
-        <p class="fieldnote">
-          Per-repository environments of one name became one org environment, and each
-          project's old rules became its own overlay — so every project deploys exactly as
-          before. If a name was really two places (one <span class="mono">prod</span> that is{" "}
-          <span class="mono">prod-eu</span>), split it in YAML: change those projects'{" "}
-          <span class="mono">environment:</span> and create the new environment here.
-        </p>
-        <Show when={error()}>
-          <p class="error">{error()}</p>
-        </Show>
-        <ul class="tok-list">
-          <For each={props.lines}>
-            {(line) => (
-              <li class="tok">
-                <div class="tok-head">
-                  <span class="tok-name mono">{line.environment}</span>
-                  <Show when={line.referenced_only}>
-                    <span class="tok-role" title="No project defined it; it was opened to all projects">
-                      all projects
-                    </span>
-                  </Show>
-                  <Show when={line.environment_exists && line.permissive_baseline}>
-                    <span class="tok-role">permissive baseline — set a baseline</span>
-                  </Show>
-                  <Show when={!line.environment_exists}>
-                    <span class="tok-role">deleted since</span>
-                  </Show>
-                  <span class="oenv-actions">
-                    <Show
-                      when={line.acknowledged_at == null}
-                      fallback={
-                        <span class="subtle" title={absTime(line.acknowledged_at!)}>
-                          reviewed by {line.acknowledged_by}
-                        </span>
-                      }
-                    >
-                      <button class="btn btn-ghost btn-sm" onClick={() => acknowledge(line.environment)}>
-                        mark reviewed
-                      </button>
-                    </Show>
-                  </span>
-                </div>
-                <div class="tok-facts">
-                  <Show when={line.merged_projects.length > 0}>
-                    <span>merged from {line.merged_projects.join(", ")}</span>
-                  </Show>
-                  <Show when={line.referencing_projects.length > 0}>
-                    <span>named by {line.referencing_projects.join(", ")}</span>
-                  </Show>
-                  <Show when={line.differing_rules.length > 0}>
-                    <span>
-                      <Icon icon="alert-triangle" size={12} /> differed on{" "}
-                      {line.differing_rules.join(", ")}
-                    </span>
-                  </Show>
-                </div>
-                <div class="oenv-report-projects">
-                  <For each={line.projects}>
-                    {(p) => (
-                      <div class="env-h-row mono">
-                        <b>{p.project}</b>{" "}
-                        <span class="subtle">was</span>{" "}
-                        {p.legacy
-                          ? `${p.legacy.approvers.length} approver(s) · ${
-                              p.legacy.allowed_refs.join(" | ") || "any ref"
-                            }${p.legacy.require_reason ? " · reason" : ""}${
-                              p.legacy.privileged_images.length || p.legacy.permit_k8s_overlay
-                                ? " · privileges"
-                                : ""
-                            }`
-                          : "no rules (only named it)"}{" "}
-                        <span class="subtle">· now</span>{" "}
-                        {p.overlay ? rulesSummary(p.overlay) : "no overlay"}
-                      </div>
-                    )}
-                  </For>
-                </div>
-              </li>
-            )}
-          </For>
-        </ul>
-      </Show>
-    </div>
   );
 }

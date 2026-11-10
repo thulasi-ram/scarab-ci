@@ -313,19 +313,32 @@ export function canResetPasskeys(s: { caller_role?: string | null } | null | und
   return s?.caller_role === "owner";
 }
 
-/** The members a reset can name: each subject once (a person may hold a
- * binding on the org and on several projects), sorted, with whether they are
- * one of the admins holding no passkey. */
+/** What a passkey reset did, as one line. */
+export function resetResultText(r: {
+  subject: string;
+  handle?: string | null;
+  removed: number;
+  windows_revoked: number;
+}): string {
+  const keys = `${r.removed} passkey${r.removed === 1 ? "" : "s"} removed`;
+  const windows = `${r.windows_revoked} confirmation${r.windows_revoked === 1 ? "" : "s"} revoked`;
+  return `Reset ${r.handle || r.subject}: ${keys}, ${windows}.`;
+}
+
+/** The members a reset can name: each person once (a person may hold a
+ * binding on the org and on several projects), by handle, with whether they
+ * are one of the admins holding no passkey (`withoutPasskey` lists
+ * handles). `id` is what the reset's URL carries. */
 export function resetCandidates(
-  bindings: { subject: string; display_name?: string | null }[],
+  bindings: { id: string; handle: string; display_name?: string | null }[],
   withoutPasskey: string[],
-): { subject: string; name: string; noPasskey: boolean }[] {
-  const seen = new Map<string, string>();
+): { id: string; handle: string; name: string; noPasskey: boolean }[] {
+  const seen = new Map<string, { handle: string; name: string }>();
   for (const b of bindings) {
-    if (!seen.has(b.subject)) seen.set(b.subject, b.display_name || b.subject);
+    if (!seen.has(b.id)) seen.set(b.id, { handle: b.handle, name: b.display_name || b.handle });
   }
   const missing = new Set(withoutPasskey);
   return [...seen.entries()]
-    .sort(([a], [b]) => a.localeCompare(b))
-    .map(([subject, name]) => ({ subject, name, noPasskey: missing.has(subject) }));
+    .sort(([, a], [, b]) => a.handle.localeCompare(b.handle))
+    .map(([id, p]) => ({ id, handle: p.handle, name: p.name, noPasskey: missing.has(p.handle) }));
 }

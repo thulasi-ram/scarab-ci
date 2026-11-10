@@ -14,14 +14,20 @@
 // Mono is for machine values only (refs, URLs, ids, hashes): pass `mono`.
 // Names and prose stay in the UI face.
 import {
+  children,
   createContext,
+  createMemo,
+  createSignal,
   createUniqueId,
+  onCleanup,
+  onMount,
   splitProps,
   Show,
   useContext,
   type JSX,
 } from "solid-js";
 import Icon from "./Icon";
+import SearchSelect, { type SelectOption } from "./SearchSelect";
 
 type FieldCtx = { id: string; describedBy: () => string | undefined; invalid: () => boolean };
 const FieldContext = createContext<FieldCtx>();
@@ -35,7 +41,7 @@ export function Field(props: {
   required?: boolean;
   /** Set when the control needs a known id (a test, an external label). */
   id?: string;
-  /** Show the label as written, not upper-cased (a key name, a typed name). */
+  /** Show the label in Body, not Label (a key name, a typed sentence). */
   plainLabel?: boolean;
   class?: string;
   children: JSX.Element;
@@ -124,6 +130,13 @@ export function Input(props: InputProps) {
   );
 }
 
+/**
+ * A dropdown in a form box. Its options are `<option>` children (in
+ * `<optgroup>`s for headed groups), as for a native `<select>`, so a form
+ * writes it the same way; they render as `SearchSelect`, the app's one
+ * dropdown. The `<option>`s sit in a hidden `<select>` only to be read: a
+ * change to their text or their list shows in the dropdown.
+ */
 export function Select(props: {
   value: string;
   onValue: (v: string) => void;
@@ -132,28 +145,63 @@ export function Select(props: {
   id?: string;
   invalid?: boolean;
   "aria-label"?: string;
+  /** Show the search box. By default it shows above eight options. */
+  search?: boolean;
   children: JSX.Element;
 }) {
   const a = useFieldAttrs(props);
+  const resolved = children(() => props.children);
+  const [changed, setChanged] = createSignal(0);
+  const options = createMemo(() => {
+    changed();
+    return readOptions(resolved.toArray());
+  });
+  let source!: HTMLSelectElement;
+  onMount(() => {
+    const seen = new MutationObserver(() => setChanged((n) => n + 1));
+    seen.observe(source, { subtree: true, childList: true, characterData: true, attributes: true });
+    onCleanup(() => seen.disconnect());
+  });
   return (
     <div class={`f-ctl f-sel${a.invalid() ? " is-err" : ""}${props.disabled ? " is-dis" : ""}`}>
-      <select
+      <select ref={source} hidden aria-hidden="true" tabindex={-1}>
+        {resolved()}
+      </select>
+      <SearchSelect
         id={a.id()}
-        class={`f-inp${props.mono ? " mono" : ""}`}
+        class="ss-field"
+        mono={props.mono}
         value={props.value}
+        options={options()}
+        onChange={props.onValue}
+        search={props.search}
         disabled={props.disabled}
         aria-label={props["aria-label"]}
         aria-describedby={a.describedBy()}
-        aria-invalid={a.invalid() || undefined}
-        onChange={(e) => props.onValue(e.currentTarget.value)}
-      >
-        {props.children}
-      </select>
-      <span class="f-chev">
-        <Icon icon="chevron-down" size={14} />
-      </span>
+        aria-invalid={a.invalid()}
+      />
     </div>
   );
+}
+
+/** The options of `<option>` / `<optgroup>` nodes, in order. */
+function readOptions(nodes: unknown[]): SelectOption[] {
+  const out: SelectOption[] = [];
+  const one = (o: HTMLOptionElement, group?: string): SelectOption => ({
+    value: o.value,
+    label: (o.textContent ?? "").replace(/\s+/g, " ").trim(),
+    disabled: o.disabled || undefined,
+    group,
+  });
+  for (const n of nodes) {
+    if (n instanceof HTMLOptionElement) out.push(one(n));
+    else if (n instanceof HTMLOptGroupElement) {
+      for (const o of Array.from(n.children)) {
+        if (o instanceof HTMLOptionElement) out.push(one(o, n.label));
+      }
+    }
+  }
+  return out;
 }
 
 export function Textarea(props: {

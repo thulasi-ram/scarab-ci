@@ -182,6 +182,16 @@ impl RegistryForge {
                     repo.owner, repo.name
                 ))
             })?;
+        // The connection no longer reaches it (the GitHub App's installation
+        // stopped covering it): say so rather than send a call the forge
+        // answers with a 404.
+        if let Some(since) = resolved.unreachable_since {
+            return Err(ForgeError::Api(format!(
+                "repo {}/{} is unreachable since {since} (unix ms): connection `{}` no longer \
+                 covers it",
+                repo.owner, repo.name, resolved.connection.id
+            )));
+        }
         // A binding through a connection that serves an Org is that Org's
         // repo (git-bug 19b0a45); the registry guarantees it, and nothing is
         // asked of the forge if a row says otherwise.

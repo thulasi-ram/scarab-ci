@@ -1,5 +1,5 @@
 // Your sign-in accounts: the accounts linked to you, and the way
-// to link another or unlink one. The Profile section of Your account.
+// to link another or unlink one. The Profile section of Account settings.
 //
 // Open to everyone signed in. Linking is a full browser round-trip to the
 // provider (the server needs the provider to prove you control that account),
@@ -18,6 +18,7 @@ import {
 } from "../api/client";
 import Icon from "./Icon";
 import ConfirmDestructive from "./ConfirmDestructive";
+import Modal from "./Modal";
 import {
   canUnlink,
   confirmMerge as runMergeConfirm,
@@ -34,6 +35,7 @@ export default function LinkedAccounts() {
   const [me, { refetch }] = createResource(getMe);
   const [providers] = createResource(listAuthProviders);
   const [busy, setBusy] = createSignal(false);
+  const [choosing, setChoosing] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
 
   // A confirmed merge replaces the callback's notice.
@@ -94,10 +96,10 @@ export default function LinkedAccounts() {
   return (
     <>
       <Show when={me()}>
-        {/* The id grants and approver lists name — shown verbatim, never in
-            the uppercased panel header, because it is matched exactly. */}
+        {/* The id grants and approver lists name — shown verbatim in Mono,
+            not in the panel header, because it is matched exactly. */}
         <p class="subtle">
-          You are <code class="mono">{me()!.subject}</code>.
+          You are <code class="mono">{me()!.handle}</code>.
         </p>
       </Show>
 
@@ -195,18 +197,45 @@ export default function LinkedAccounts() {
 
           <Show when={linkable(providers() ?? [], identities()).length > 0 && identities().length > 0}>
             <div class="secrets-actions">
-              <For each={linkable(providers() ?? [], identities())}>
-                {(p) => (
-                  <button
-                    class="btn btn-primary btn-sm"
-                    disabled={busy()}
-                    onClick={() => link(p.id)}
-                  >
-                    <Icon icon="plus" size={14} /> Link {p.name}
-                  </button>
-                )}
-              </For>
+              {/* One button whatever the operator named its providers: with
+                  one left to link it goes straight there, with several it
+                  asks which. */}
+              <button
+                class="btn btn-primary btn-sm"
+                disabled={busy()}
+                onClick={() => {
+                  const left = linkable(providers() ?? [], identities());
+                  if (left.length === 1) void link(left[0]!.id);
+                  else setChoosing(true);
+                }}
+              >
+                <Icon icon="plus" size={14} /> Link a forge account
+              </button>
             </div>
+          </Show>
+          <Show when={choosing()}>
+            <Modal
+              title="Link a forge account"
+              purpose="Pick where the account lives. You will sign in there and come back here."
+              icon="plus"
+              busy={busy()}
+              onClose={() => setChoosing(false)}
+              footer={
+                <button class="btn btn-ghost" type="button" onClick={() => setChoosing(false)}>
+                  Cancel
+                </button>
+              }
+            >
+              <div class="link-choices">
+                <For each={linkable(providers() ?? [], identities())}>
+                  {(p) => (
+                    <button class="btn btn-ghost" type="button" disabled={busy()} onClick={() => link(p.id)}>
+                      {p.name}
+                    </button>
+                  )}
+                </For>
+              </div>
+            </Modal>
           </Show>
           <Show when={unlinking()}>
             {(u) => (

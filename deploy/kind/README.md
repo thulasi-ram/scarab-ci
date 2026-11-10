@@ -73,8 +73,10 @@ the mount. `just stack up` builds them locally and loads them into the node:
 
 Local builds keep these helpers in step with the tree. A published `edge` tag
 is built from `main`, and a `scarab-wsfetch` older than the server fails every
-drain. The release gets a library manifest whose copy of `libs/clone.yaml`
-pins `scarab-clone:dev`.
+drain. The clone library the stack installs is a copy of `libs/clone.yaml`
+that pins `scarab-clone:dev` (see [Libraries and plugins](#libraries-and-plugins)),
+so a change under `docker/clone` or to `libs/clone.yaml` is tested without a
+push.
 
 Images are loaded as a one-platform archive (`docker save --platform` and
 `kind load image-archive`). `kind load docker-image` imports every platform
@@ -191,17 +193,22 @@ this machine only.
 On a fresh database, `up.sh` also prints a checklist of the steps that now need
 a passkey, which it used to do with plain curl (`just stack seed dogfood
 checklist` prints it again). On an existing database it compares the clone
-library installed in the org with `deploy/kind/.state/dogfood-clone.yaml`
-(read with `psql` in the Postgres Pod) and prints step 3 when they differ:
+library installed in the org with `libs/clone.yaml` in the checkout (read with
+`psql` in the Postgres Pod) and prints step 3 when they differ:
 
 1. Sign in at `http://localhost:<port>` as the Owner and enroll a passkey in
    Settings > Security. Every new database needs a new one.
 2. Org settings > Environments: create `production` and make it eligible for
    all projects; the dogfood pipeline deploys to it.
-3. Org settings > Libraries: the clone library must pin `scarab-clone:dev`.
-   When it is missing, choose **Paste the files** and paste
-   `deploy/kind/.state/dogfood-clone.yaml`. When it pins another image,
-   uninstall it first.
+3. Org settings > Libraries > Install: fetch
+   `github.com/thulasi-ram/scarab-ci//libs/clone.yaml@<commit>` (the commit
+   seed.sh prints: the last pushed commit that changed the file), review it and
+   install it as `thulasi-ram/clone`. It runs the published `scarab-clone`
+   image the file pins. Nothing is installed in a new org without this step.
+   GitHub App mode mints the forge token per Run, so the source needs no
+   trust. Dogfood runs against real GitHub, so installing from github.com is
+   expected here; the dev and e2e modes install from the in-cluster Forgejo
+   instead.
 4. To call the API, issue a token in Org settings > API tokens.
 
 To check that the member is refused an admin action, sign in as the member and
@@ -271,7 +278,7 @@ non-zero when any failed:
 | forgejo-onboarding | add connection → pick-list → bind → hook → real push → Run, through the server; one test at a time |
 | forgejo-tunnel | the forge_token cases, through the quick tunnel |
 | cluster | the executor's and the plugin runtime's live cluster suites, in namespace `scarab-kube-tests` |
-| plugin-argocd | `plugin-verify.sh`: builds the Argo CD plugin image and loads it, starts a fake Argo CD on the host, installs and binds the plugin through the API, then checks the isolation probe, the Pod's read of Argo CD through the broker with the bound credential, and that the kill switch makes the broker answer 403 and scales the workload to 0. It stops the fake Argo CD when it ends |
+| plugin-argocd | `plugin-verify.sh`: builds the Argo CD plugin image and loads it, starts a fake Argo CD on the host, installs the plugin through the API from the manifest in `acme/scarab-libs` on the in-cluster Forgejo (fetch, then install with the reviewed hash and a tag under the dev knob), binds its connection, then checks the isolation probe, the Pod's read of Argo CD through the broker with the bound credential, and that the kill switch makes the broker answer 403 and scales the workload to 0. It stops the fake Argo CD when it ends |
 | crash_resume | last, on its own: it kills the server every other case talks to |
 
 `just test e2e <filter>` passes a nextest filter to every nextest pass; the
@@ -502,10 +509,38 @@ reachable from the internet while the tunnel runs. `just test e2e` deletes the
 tunnel when it exits, on success, failure or Ctrl-C, and the next run gets a
 new URL. Nothing else opens it: `up.sh e2e` without the flag runs without a
 tunnel, every `up.sh` run deletes one a run left, `just stack down keep` deletes it, and `just stack reload` after `just test e2e` goes to
-dev. In e2e mode the release's library manifest is the real
-`libs/` at its last commit, which the server fetches from github.com, so
-`libs/` must be committed and pushed; the release's `publicUrl` is the server's
-Service, where Forgejo delivers hooks.
+dev. In e2e mode the release's `publicUrl` is the server's Service, where
+Forgejo delivers hooks.
+
+## Libraries and plugins
+
+Nothing is installed in a new org, so the stack installs what its pipelines
+and tests use through the same calls an org admin makes, from the in-cluster
+Forgejo. No install reads github.com, and nothing has to be committed or
+pushed first.
+
+- `forgejo.sh` (every mode) seeds `<owner>/scarab-libs` for the Forgejo admin
+  (`scarab-admin`), for `SCARAB_DEV_ORG` (default `thulasi-ram`) and for
+  `PLUGIN_VERIFY_ORG` (default `acme`): `clone.yaml` (this checkout's
+  `libs/clone.yaml` with its image pinned to `scarab-clone:dev`),
+  `notify.yaml` (`.scarab/lib/notify.yaml`) and `argocd/manifest.json`
+  (`crates/scarab-plugin-argocd/manifest.json`). An org reads a private source
+  only through its own connection and only from its own repositories, so each
+  org gets its own copy, owned by a Forgejo user of the org's name.
+- `libs.sh install <org>` makes a Forgejo connection for the org (replacing
+  one an earlier run left: `forgejo.sh` revokes the previous token), fetches
+  `scarab-forgejo.scarab.svc.cluster.local/<org>/scarab-libs//clone.yaml@<commit>`
+  through it, installs it as `lib:thulasi-ram/clone`, and trusts that source
+  through `/library-trust`, so its Step receives the connection's token.
+  `just stack up` runs it for `SCARAB_DEV_ORG`; `just test e2e` runs it for
+  `scarab-admin`, the org of the forge_token cases.
+- The forgejo-onboarding case installs `notify.yaml` from the same repository
+  through its own connection; `plugin-verify.sh` reads `argocd/manifest.json`
+  from `acme/scarab-libs` (`libs.sh connection acme`).
+
+Dogfood mode installs the clone library from github.com by hand (step 3 of
+its checklist above), as a real install against GitHub does. Chaos mode
+installs nothing.
 
 ## CI
 

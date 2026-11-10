@@ -7,6 +7,7 @@
 // life — `revoked_at`, `expires_at`, and neither — and the panel has to collapse
 // them into one word per row. Doing that inline at the call site is how "expired
 // three weeks ago" ends up rendered next to a Revoke button.
+import type { Chip } from "./libraries";
 
 /** The record shape these helpers need — structural, so `ApiToken` satisfies it
  * without this module importing the generated schema. */
@@ -153,3 +154,36 @@ export const TOKEN_SORTS = [
   { sort: "use_count", label: "Calls" },
   { sort: "created", label: "Created" },
 ] as const;
+
+/** How many of `tokens` can still authenticate: the count beside a list's
+ * heading. */
+export function activeCount(tokens: readonly TokenLike[], now: number): number {
+  return tokens.filter((t) => isLive(t, now)).length;
+}
+
+/**
+ * A token's state tags: what it is (active, revoked or expired), then whether
+ * a live one expires within two weeks, then whether it has never been used.
+ */
+export function tokenChips(t: TokenLike & { last_used_at?: number | null }, now: number): Chip[] {
+  const out: Chip[] = [];
+  const state = tokenState(t, now);
+  if (state === "revoked") {
+    out.push({ label: "revoked", tone: "danger", title: "Revoked: every request that presents it is refused." });
+  } else if (state === "expired") {
+    out.push({ label: "expired", tone: "muted", title: "Past its expiry: every request that presents it is refused." });
+  } else {
+    out.push({ label: "active", tone: "ok", title: "It can authenticate requests until it expires or is revoked." });
+    if (expiresSoon(t, now)) {
+      out.push({
+        label: "expires soon",
+        tone: "motion",
+        title: `It expires within ${EXPIRY_WARNING_DAYS} days. Mint a replacement before then.`,
+      });
+    }
+  }
+  if (t.last_used_at == null) {
+    out.push({ label: "never used", tone: "muted", title: "No request has presented it yet." });
+  }
+  return out;
+}

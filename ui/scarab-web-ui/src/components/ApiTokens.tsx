@@ -1,10 +1,14 @@
 // Issued API tokens (git-bug a4cb94f). A token belongs to the person who
 // minted it, so there are two sections:
 //
-// - Your account › API tokens (`MyApiTokens`): mint, list and revoke your own.
+// - Account settings › API tokens (`MyApiTokens`): mint (top right), list and
+//   revoke your own.
 // - Organization settings › API tokens (`OrgApiTokens`): every token issued in
 //   the org, whoever holds it, sorted by last use, calls or creation. An admin
 //   revokes any of them here; nobody mints here.
+//
+// Both list one row per token with the same table (`TokenTable`); the org's
+// adds the owner. A token has no page of its own: the row holds all there is.
 //
 // The plaintext exists in one response, the mint 201, because Scarab stores
 // only a SHA-256 of it. There is no "show token" anywhere in this file: a token
@@ -37,9 +41,9 @@ import {
   type TokenSort,
 } from "../api/client";
 import {
+  activeCount,
   expiresSoon,
   expiryLabel,
-  isLive,
   lifetimeError,
   MAX_TOKEN_DAYS,
   mintableOrgs,
@@ -47,11 +51,13 @@ import {
   scopeLabel,
   sortTokens,
   TOKEN_SORTS,
+  tokenChips,
   tokenState,
   type TokenRole,
 } from "../api-tokens";
 import { accountHref } from "../settings-nav";
 import { relTime, absTime } from "../fmt";
+import Chips from "./Chips";
 import Icon from "./Icon";
 import Modal, { ModalMessage, ModalSection } from "./Modal";
 import ConfirmDestructive from "./ConfirmDestructive";
@@ -73,7 +79,22 @@ function NoTokenStore() {
   );
 }
 
-/** Your account › API tokens: the tokens you hold, in every org. */
+/** "3 active", beside a list's heading; nothing when none is. */
+function ActiveCount(props: { tokens: readonly ApiToken[] }) {
+  const n = () => activeCount(props.tokens, Date.now());
+  return (
+    <Show when={n() > 0}>
+      <span class="tok-count">{n()} active</span>
+    </Show>
+  );
+}
+
+/** `null` is the deployment answering "I have no token store", which is not
+ *  the same sentence as "there are no tokens". */
+const noStore = (r: { loading: boolean; error: unknown; latest?: ApiToken[] | null }) =>
+  !r.loading && !r.error && r.latest === null;
+
+/** Account settings › API tokens: the tokens you hold, in every org. */
 export function MyApiTokens() {
   const [epoch, setEpoch] = createSignal(0);
   const [tokens] = createResource(epoch, () => listMyApiTokens());
@@ -81,11 +102,8 @@ export function MyApiTokens() {
   const [revoking, setRevoking] = createSignal<string | null>(null);
   const reload = () => setEpoch((e) => e + 1);
 
-  // `null` is the deployment answering "I have no token store", which is not
-  // the same sentence as "you have no tokens".
-  const unavailable = () => !tokens.loading && !tokens.error && tokens() === null;
+  const unavailable = () => noStore(tokens);
   const rows = () => sortTokens(tokens() ?? [], Date.now());
-  const liveCount = () => rows().filter((t) => isLive(t, Date.now())).length;
 
   const revokingToken = () => rows().find((t) => t.id === revoking());
   // A refusal shows in the confirm dialog.
@@ -97,9 +115,13 @@ export function MyApiTokens() {
   return (
     <div class="panel">
       <div class="panel-h">
-        <span>Your API tokens</span>
-        <Show when={liveCount() > 0}>
-          <span class="tok-count">{liveCount()} active</span>
+        <span>
+          Your API tokens <ActiveCount tokens={rows()} />
+        </span>
+        <Show when={!unavailable()}>
+          <button class="btn btn-primary btn-sm" onClick={() => setMinting(true)}>
+            <Icon icon="plus" size={14} /> New token
+          </button>
         </Show>
       </div>
       <div class="secrets-body">
@@ -119,18 +141,8 @@ export function MyApiTokens() {
                 </p>
               }
             >
-              <ul class="tok-list">
-                <For each={rows()}>
-                  {(t) => <TokenRow token={t} onRevoke={() => setRevoking(t.id)} />}
-                </For>
-              </ul>
+              <TokenTable label="Your API tokens" tokens={rows()} onRevoke={(t) => setRevoking(t.id)} />
             </Show>
-
-            <div class="secrets-actions">
-              <button class="btn btn-primary btn-sm" onClick={() => setMinting(true)}>
-                <Icon icon="plus" size={14} /> New token
-              </button>
-            </div>
             <p class="subtle">
               <small>
                 <Icon icon="shield-check" size={12} /> Stored as a SHA-256 digest and shown
@@ -156,65 +168,93 @@ export function MyApiTokens() {
   );
 }
 
-/** One of your tokens: what it is, what it may do, and whether it is alive. */
-function TokenRow(props: { token: ApiToken; onRevoke: () => void }) {
+/**
+ * One row per token: its name with its state tags, its owner (`showOwner`,
+ * the org's list), its scope and ceiling, last use, calls, creation and expiry,
+ * and Revoke while it is live. `sort` marks the column the rows are sorted
+ * by.
+ */
+function TokenTable(props: {
+  label: string;
+  tokens: readonly ApiToken[];
+  showOwner?: boolean;
+  sort?: TokenSort;
+  onRevoke: (t: ApiToken) => void;
+}) {
+  const sorted = (s: TokenSort) => (props.sort === s ? "descending" : undefined);
+  return (
+    <div class="tok-table-scroll">
+      <table class="table tok-table" aria-label={props.label}>
+        <thead>
+          <tr>
+            <th>Name</th>
+            <Show when={props.showOwner}>
+              <th>Owner</th>
+            </Show>
+            <th>Scope</th>
+            <th aria-sort={sorted("last_used")}>Last used</th>
+            <th aria-sort={sorted("use_count")}>Calls</th>
+            <th aria-sort={sorted("created")}>Created</th>
+            <th>Expires</th>
+            <th />
+          </tr>
+        </thead>
+        <tbody>
+          <For each={props.tokens}>
+            {(t) => <TokenRow token={t} showOwner={props.showOwner} onRevoke={() => props.onRevoke(t)} />}
+          </For>
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/** One token. Last use and calls are written back at most once a minute
+ *  server-side, so both are approximate. */
+function TokenRow(props: { token: ApiToken; showOwner?: boolean; onRevoke: () => void }) {
   const t = () => props.token;
   const now = Date.now();
   const state = () => tokenState(t(), now);
-
   return (
-    <li class="tok" classList={{ "tok-dead": state() !== "live" }}>
-      <div class="tok-head">
-        <Icon icon="key-round" size={15} />
+    <tr classList={{ "tok-dead": state() !== "live" }}>
+      <td class="keep">
         <span class="tok-name">{t().name}</span>
-        <span class="tok-scope mono">{scopeLabel(t())}</span>
+        <Chips chips={tokenChips(t(), now)} />
+      </td>
+      <Show when={props.showOwner}>
+        <td>
+          <span class="mono">{t().owner.handle}</span>
+        </td>
+      </Show>
+      <td>
+        <span class="mono">{scopeLabel(t())}</span>{" "}
         <span class="tok-role">up to {t().role}</span>
-        <Show when={state() === "revoked"}>
-          <span class="tok-state tok-revoked">revoked</span>
-        </Show>
-        <Show when={state() === "expired"}>
-          <span class="tok-state tok-expired">expired</span>
-        </Show>
-        <Show when={state() === "live"}>
-          <button class="btn btn-danger btn-sm tok-revoke" onClick={props.onRevoke}>
-            Revoke
-          </button>
-        </Show>
-      </div>
-      <div class="tok-facts">
-        {/* Written back at most once a minute server-side, so both the last use
-            and the call count are approximate. */}
-        <span title={t().last_used_at ? absTime(t().last_used_at!) : undefined}>
-          <Icon icon="clock" size={12} />
-          {t().last_used_at ? `last used ${relTime(t().last_used_at!)}` : "never used"}
-        </span>
-        <span>
-          <Icon icon="history" size={12} />
-          {t().use_count === 1 ? "1 call" : `${t().use_count.toLocaleString("en-US")} calls`}
-        </span>
+      </td>
+      <td class="nw" title={t().last_used_at ? absTime(t().last_used_at!) : undefined}>
+        {t().last_used_at ? relTime(t().last_used_at!) : "never"}
+      </td>
+      <td class="nw mono">{t().use_count.toLocaleString("en-US")}</td>
+      <td class="nw" title={absTime(t().created_at)}>
+        {relTime(t().created_at)}
+      </td>
+      <td class="nw" title={absTime(t().revoked_at ?? t().expires_at)}>
         <Show
           when={state() === "revoked"}
           fallback={
-            <span
-              class={expiresSoon(t(), now) ? "tok-soon" : undefined}
-              title={absTime(t().expires_at)}
-            >
-              <Icon icon="timer" size={12} />
-              {expiryLabel(t(), now)}
-            </span>
+            <span class={expiresSoon(t(), now) ? "tok-soon" : undefined}>{expiryLabel(t(), now)}</span>
           }
         >
-          <span title={absTime(t().revoked_at!)}>
-            <Icon icon="timer" size={12} />
-            revoked {relTime(t().revoked_at!)}
-          </span>
+          revoked {relTime(t().revoked_at!)}
         </Show>
-        <span title={absTime(t().created_at)}>
-          <Icon icon="user" size={12} />
-          created {relTime(t().created_at)}
-        </span>
-      </div>
-    </li>
+      </td>
+      <td class="nw">
+        <Show when={state() === "live"}>
+          <button class="btn btn-danger btn-sm" onClick={props.onRevoke}>
+            Revoke
+          </button>
+        </Show>
+      </td>
+    </tr>
   );
 }
 
@@ -230,7 +270,7 @@ function RevokeToken(props: { token: ApiToken; onConfirm: () => Promise<void>; o
       onClose={props.onClose}
     >
       <p>
-        Held by <span class="mono">{props.token.owner_subject}</span>. Anything still using it (a
+        Held by <span class="mono">{props.token.owner.handle}</span>. Anything still using it (a
         CI job, a script, an agent) starts failing, and the token cannot be restored, only
         replaced.
       </p>
@@ -249,11 +289,10 @@ export function OrgApiTokens(props: { org: string }) {
   const [revoking, setRevoking] = createSignal<string | null>(null);
   const reload = () => setEpoch((e) => e + 1);
 
-  const unavailable = () => !tokens.loading && !tokens.error && tokens() === null;
+  const unavailable = () => noStore(tokens);
   // The server's order, as asked for: a stale row keeps its place, so the list
   // does not move under the cursor between refetches.
   const rows = () => tokens() ?? [];
-  const liveCount = () => rows().filter((t) => isLive(t, Date.now())).length;
   const revokingToken = () => rows().find((t) => t.id === revoking());
 
   // A refusal shows in the confirm dialog.
@@ -265,16 +304,15 @@ export function OrgApiTokens(props: { org: string }) {
   return (
     <div class="panel">
       <div class="panel-h">
-        <span>API tokens · {props.org}</span>
-        <Show when={liveCount() > 0}>
-          <span class="tok-count">{liveCount()} active</span>
-        </Show>
+        <span>
+          API tokens · {props.org} <ActiveCount tokens={rows()} />
+        </span>
       </div>
       <div class="secrets-body">
         <p class="subtle">
           Every token issued in {props.org}, whoever holds it. Tokens are personal: each
           person mints their own under{" "}
-          <A href={accountHref("tokens")}>Your account › API tokens</A>.
+          <A href={accountHref("tokens")}>Account settings › API tokens</A>.
         </p>
         <Show when={tokens.error}>
           <p class="error">Could not load API tokens.</p>
@@ -301,27 +339,13 @@ export function OrgApiTokens(props: { org: string }) {
               when={rows().length > 0}
               fallback={<p class="empty">No tokens have been issued in {props.org} yet.</p>}
             >
-              <div class="tok-table-scroll">
-                <table class="table tok-table">
-                  <thead>
-                    <tr>
-                      <th>Name</th>
-                      <th>Owner</th>
-                      <th>Scope</th>
-                      <th aria-sort={sort() === "last_used" ? "descending" : undefined}>Last used</th>
-                      <th aria-sort={sort() === "use_count" ? "descending" : undefined}>Calls</th>
-                      <th aria-sort={sort() === "created" ? "descending" : undefined}>Created</th>
-                      <th>Expires</th>
-                      <th />
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <For each={rows()}>
-                      {(t) => <OrgTokenRow token={t} onRevoke={() => setRevoking(t.id)} />}
-                    </For>
-                  </tbody>
-                </table>
-              </div>
+              <TokenTable
+                label={`API tokens issued in ${props.org}`}
+                tokens={rows()}
+                showOwner
+                sort={sort()}
+                onRevoke={(t) => setRevoking(t.id)}
+              />
             </Show>
           </Show>
           <Show when={revokingToken()}>
@@ -341,49 +365,6 @@ export function OrgApiTokens(props: { org: string }) {
         </Show>
       </div>
     </div>
-  );
-}
-
-/** One row of the org's list. */
-function OrgTokenRow(props: { token: ApiToken; onRevoke: () => void }) {
-  const t = () => props.token;
-  const now = Date.now();
-  const state = () => tokenState(t(), now);
-  return (
-    <tr classList={{ "tok-dead": state() !== "live" }}>
-      <td>
-        <span class="tok-name">{t().name}</span>
-      </td>
-      <td>
-        <span class="mono">{t().owner_subject}</span>
-      </td>
-      <td>
-        <span class="mono">{scopeLabel(t())}</span>{" "}
-        <span class="tok-role">up to {t().role}</span>
-      </td>
-      <td title={t().last_used_at ? absTime(t().last_used_at!) : undefined}>
-        {t().last_used_at ? relTime(t().last_used_at!) : "never"}
-      </td>
-      <td class="mono">{t().use_count.toLocaleString("en-US")}</td>
-      <td title={absTime(t().created_at)}>{relTime(t().created_at)}</td>
-      <td title={absTime(t().revoked_at ?? t().expires_at)}>
-        <Show
-          when={state() === "revoked"}
-          fallback={
-            <span class={expiresSoon(t(), now) ? "tok-soon" : undefined}>{expiryLabel(t(), now)}</span>
-          }
-        >
-          <span class="tok-state tok-revoked">revoked</span>
-        </Show>
-      </td>
-      <td>
-        <Show when={state() === "live"}>
-          <button class="btn btn-danger btn-sm" onClick={props.onRevoke}>
-            Revoke
-          </button>
-        </Show>
-      </td>
-    </tr>
   );
 }
 
@@ -624,7 +605,7 @@ function MintTokenDialog(props: { onClose: () => void; onMinted: () => void }) {
             <code class="tok-secret mono">{m().token}</code>
             <p class="dlg-text">
               Send it as <code class="mono">Authorization: Bearer …</code>, or give it to the CLI as{" "}
-              <code class="mono">SCARAB_TOKEN</code>. It acts as <b>{m().record.owner_subject}</b>, up
+              <code class="mono">SCARAB_TOKEN</code>. It acts as <b>{m().record.owner.handle}</b>, up
               to <b>{m().record.role}</b> on <b>{scopeLabel(m().record)}</b>, and expires{" "}
               {absTime(m().record.expires_at)}.
             </p>

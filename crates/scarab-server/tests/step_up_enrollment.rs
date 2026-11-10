@@ -320,15 +320,19 @@ async fn the_fresh_login_link_follows_the_principals_pinned_identity() {
         email_verified: false,
         display_name: None,
     };
-    let id = pg.pin(&okta_zed, "zed", 1).await.unwrap();
-    assert_eq!(id, "zed");
+    let zed = pg
+        .pin(&okta_zed, "zed", scarab_identity::Placeholder::Never, 1)
+        .await
+        .unwrap();
+    assert_eq!(zed.handle, "zed");
+    let id = zed.id;
     let store = pg.clone();
     let h = harness_with(move |st: AppState| {
         st.with_oauth_login(provider("default", true))
             .with_oauth_login(provider("okta", false))
             .with_identities(store)
     });
-    let (url, st, to) = fresh_login_for(&h, "zed").await;
+    let (url, st, to) = fresh_login_for(&h, &id).await;
     assert!(url.contains("provider=okta"), "{url}");
     assert_eq!(st, StatusCode::FOUND);
     assert!(to.starts_with("https://okta.example.com/authorize"), "{to}");

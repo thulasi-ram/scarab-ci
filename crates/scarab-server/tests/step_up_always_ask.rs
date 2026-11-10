@@ -114,7 +114,12 @@ async fn plugin_install_and_plugin_connection_are_always_ask() {
         (
             "POST",
             "/v1/orgs/acme/plugins",
-            json!({"name": "argo", "plugin": "argocd", "image": "img@sha256:00"}),
+            json!({
+                "name": "argo",
+                "image": "img@sha256:00",
+                "source": format!("github.com/acme/plugins//manifest.json@{}", "0".repeat(40)),
+                "manifest_sha256": "a".repeat(64),
+            }),
             "plugin.install",
         ),
         (

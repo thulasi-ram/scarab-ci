@@ -456,6 +456,7 @@ async fn a_linked_webhook_actor_is_the_run_create_principal() {
                 display_name: None,
             },
             "github:octocat",
+            scarab_identity::Placeholder::Never,
             1,
         )
         .await
@@ -483,7 +484,10 @@ async fn a_linked_webhook_actor_is_the_run_create_principal() {
             body: Policy::from_json(json!({
                 "name": "no-octocat", "checkpoint": "run.create", "mode": "enforce",
                 "rules": [{
-                    "when": format!("has(trigger.principal) && trigger.principal == \"{pinned}\""),
+                    "when": format!(
+                        "has(trigger.principal) && trigger.principal == \"{}\"",
+                        pinned.handle
+                    ),
                     "effect": "deny", "message": "not this Principal"
                 }]
             }))
@@ -534,11 +538,12 @@ async fn a_linked_webhook_actor_is_the_run_create_principal() {
     assert_eq!(linked.refused.len(), 1);
     let denied = policies.org_decisions("acme", 0, None).await.unwrap();
     assert_eq!(denied.len(), 1);
-    assert_eq!(
-        denied[0].decision.input["trigger"]["principal"],
-        json!(pinned)
-    );
-    assert_eq!(denied[0].decision.input["principal"], json!(pinned));
+    // The handle, which the rule compares, and the id beside it (ADR-0080).
+    let input = &denied[0].decision.input;
+    assert_eq!(input["trigger"]["principal"], json!(pinned.handle));
+    assert_eq!(input["trigger"]["principal_id"], json!(pinned.id));
+    assert_eq!(input["principal"], json!(pinned.handle));
+    assert_eq!(input["principal_id"], json!(pinned.id));
 
     // The same login under an id nobody linked has no `principal`.
     let unlinked = trigger_runs_from_event(

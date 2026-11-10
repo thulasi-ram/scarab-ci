@@ -62,6 +62,48 @@ async fn missing_credential_material_fails_loudly_at_use_time() {
     assert!(err.to_string().contains("unavailable"), "{err}");
 }
 
+/// A bound repo the connection no longer reaches (the GitHub App's
+/// installation stopped covering it) fails every call with an error that
+/// says so, before any credential is fetched or the forge asked: a status
+/// post or a clone gets that reason instead of the forge's 404.
+#[tokio::test]
+async fn an_unreachable_repo_fails_with_a_clear_error_without_asking_the_forge() {
+    let registry = Arc::new(InMemoryDb::new());
+    registry
+        .put_connection(&ForgeConnection {
+            id: "gh-1".into(),
+            kind: ForgeKind::GitHub,
+            base_url: "https://api.github.com".into(),
+            credential_ref: "gh-1-credential".into(),
+            org: Some("acme".into()),
+            installation_id: None,
+            account_id: None,
+        })
+        .await
+        .unwrap();
+    registry
+        .bind_repo("gh-1", &repo("acme", "web"), "acme", "web")
+        .await
+        .unwrap();
+    registry
+        .mark_repo_unreachable("gh-1", &repo("acme", "web"), 5_000)
+        .await
+        .unwrap();
+    // No credential either: a call that got past the mark would fail on it.
+    let forge = RegistryForge::new(registry, Arc::new(FakeSecrets::new()), None, None);
+
+    let err = forge
+        .latest_commit(&repo("acme", "web"), "main")
+        .await
+        .expect_err("an unreachable repo is not routed");
+    assert!(err.to_string().contains("unreachable"), "{err}");
+    let err = forge
+        .mint_checkout_credential(&repo("acme", "web"), false)
+        .await
+        .expect_err("no clone credential for an unreachable repo");
+    assert!(err.to_string().contains("unreachable"), "{err}");
+}
+
 /// A connection with **nothing bound yet** still yields an adapter (ADR-0060).
 ///
 /// This is the whole reason `ForgeAdapters` exists alongside the repo-routed

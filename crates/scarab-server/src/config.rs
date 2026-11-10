@@ -73,9 +73,8 @@
 //! | `SCARAB_PLUGIN_OWNER` | env | which Scarab release this is, `<release namespace>.<release name>` (a label value): stamped on the plugin namespace (`scarab.io/plugin-runtime-owner`) and on everything the runtime creates. The runtime refuses a namespace stamped for another release, or not stamped. Unset = the runtime refuses its baseline and no Plugin runs. The chart sets it |
 //! | `SCARAB_PLUGIN_BROKER_PEER` | env | how the `plugin-egress` NetworkPolicy names the broker: `pods:<namespace>:<k=v,…>` or `cidr:<ip>/<prefix>` (at most a /24). Unset = the runtime refuses its baseline and no Plugin runs |
 //! | `SCARAB_PLUGIN_PROBE_IMAGE` | env | the isolation-probe and per-Pod self-check image (ADR-0072 §9); default `busybox:1.36.1` pinned by digest. Pin an override by digest too |
-//! | `SCARAB_PLUGIN_ARGOCD_REPO` | env | the repository the first-party Argo CD plugin installs from; default `ghcr.io/thulasi-ram/scarab-plugin-argocd`. An install must pin it by `@sha256:` digest |
 //! | `SCARAB_DEV_PLUGIN_TOKENS` | env | **dev only, needs `SCARAB_DEV_INSECURE`**: `<installation-id>=<token>,…` static broker tokens standing in for TokenReview (slice d2). Loud at boot |
-//! | `SCARAB_DEV_PLUGIN_ALLOW_TAG` | env | **dev only, needs `SCARAB_DEV_INSECURE`**: `1` lets a first-party install name a tag instead of a digest (kind/colima images have no repo digest). Loud at boot |
+//! | `SCARAB_DEV_PLUGIN_ALLOW_TAG` | env | **dev only, needs `SCARAB_DEV_INSECURE`**: `1` lets any plugin install name a tag instead of a digest (kind/colima images have no repo digest). Loud at boot |
 //!
 //! Step-runtime env is injected *into* step containers (or their init/sidecar
 //! containers) by the executors and is **not** boot configuration — this table
@@ -782,8 +781,6 @@ fn step_up_public_url_ok(public_url: &str) -> bool {
 pub const DEFAULT_BROKER_ADDR: &str = "0.0.0.0:8090";
 /// The shared namespace Plugins run in (ADR-0072 §9).
 pub const DEFAULT_PLUGIN_NAMESPACE: &str = "scarab-plugins";
-/// Where the first-party Argo CD plugin's image is published.
-pub const DEFAULT_PLUGIN_ARGOCD_REPO: &str = "ghcr.io/thulasi-ram/scarab-plugin-argocd";
 
 /// The plugin runtime's knobs (ADR-0072). Fail-closed: `enabled` is off
 /// unless asked for, a junk value refuses boot, and the two dev knobs exist
@@ -808,9 +805,8 @@ pub struct PluginsConfig {
     /// namespace and on everything the runtime creates. Validated as a
     /// label value. `None` = unset: the runtime refuses its baseline.
     pub owner: Option<String>,
-    /// The repository the first-party Argo CD catalog entry installs from.
-    pub argocd_repo: String,
-    /// Dev only: accept `<repo>:<tag>` for a first-party install.
+    /// Dev only: accept `<repo>:<tag>` instead of `<repo>@sha256:<digest>`
+    /// for any plugin install.
     pub dev_allow_tag: bool,
     /// Dev only: static `(installation id, token)` pairs standing in for
     /// TokenReview.
@@ -905,21 +901,6 @@ impl PluginsConfig {
                 return Err(invalid(format!("SCARAB_PLUGIN_BROKER_PEER: {e}")));
             }
         }
-        let argocd_repo =
-            set("SCARAB_PLUGIN_ARGOCD_REPO").unwrap_or_else(|| DEFAULT_PLUGIN_ARGOCD_REPO.into());
-        // A repository, not a reference: the digest (or dev tag) is the
-        // install's to name.
-        if argocd_repo.contains('@')
-            || argocd_repo
-                .rsplit('/')
-                .next()
-                .is_some_and(|l| l.contains(':'))
-        {
-            return Err(invalid(format!(
-                "SCARAB_PLUGIN_ARGOCD_REPO must be a repository with no tag or digest, got \
-                 {argocd_repo:?}"
-            )));
-        }
         let dev_allow_tag = match set("SCARAB_DEV_PLUGIN_ALLOW_TAG").as_deref() {
             None | Some("0") | Some("false") => false,
             Some("1") | Some("true") if dev_insecure => true,
@@ -977,7 +958,6 @@ impl PluginsConfig {
             broker_peer,
             probe_image: set("SCARAB_PLUGIN_PROBE_IMAGE"),
             owner,
-            argocd_repo,
             dev_allow_tag,
             dev_tokens,
         })
@@ -993,7 +973,6 @@ impl PluginsConfig {
             broker_peer: None,
             probe_image: None,
             owner: None,
-            argocd_repo: DEFAULT_PLUGIN_ARGOCD_REPO.into(),
             dev_allow_tag: false,
             dev_tokens: Vec::new(),
         }
@@ -1886,7 +1865,7 @@ impl Config {
         }
         if self.plugins.dev_allow_tag {
             warnings.push(
-                "⚠ PLUGIN TAG INSTALLS — first-party plugins may be installed by TAG, so what \
+                "⚠ PLUGIN TAG INSTALLS — plugins may be installed by TAG, so what \
                  was approved can change under the same name (SCARAB_DEV_PLUGIN_ALLOW_TAG, \
                  dev only)"
                     .to_string(),
@@ -2101,7 +2080,7 @@ impl Config {
             },
             if self.plugins.enabled {
                 format!(
-                    "plugins: ON (ADR-0072) — broker {}, namespace {}, argocd from {}; \
+                    "plugins: ON (ADR-0072) — broker {}, namespace {}; \
                      token verification: {}; installs: {}",
                     if self.role.serves_broker() {
                         format!("on {}", self.plugins.broker_addr)
@@ -2109,7 +2088,6 @@ impl Config {
                         "not served by this role (api/converged only)".to_string()
                     },
                     self.plugins.namespace,
-                    self.plugins.argocd_repo,
                     if self.plugins.dev_tokens.is_empty() {
                         format!(
                             "TokenReview once a cluster is reachable (else every broker call \
@@ -2125,9 +2103,9 @@ impl Config {
                         )
                     },
                     if self.plugins.dev_allow_tag {
-                        "first-party, digest or DEV tag"
+                        "reviewed manifest, digest or DEV tag"
                     } else {
-                        "first-party, digest-pinned only"
+                        "reviewed manifest, digest-pinned only"
                     },
                 )
             } else {
@@ -4178,8 +4156,6 @@ connections:
             // or every Pod of a namespace (ADR-0072 §9).
             &[("SCARAB_PLUGIN_BROKER_PEER", "cidr:0.0.0.0/0")],
             &[("SCARAB_PLUGIN_BROKER_PEER", "pods:scarab:")],
-            &[("SCARAB_PLUGIN_ARGOCD_REPO", "ghcr.io/x/argocd:v1")],
-            &[("SCARAB_PLUGIN_ARGOCD_REPO", "ghcr.io/x/argocd@sha256:abc")],
             &[("SCARAB_DEV_PLUGIN_TOKENS", "not-an-id=tok")],
             &[("SCARAB_DEV_PLUGIN_TOKENS", "0123456789=")],
             &[("SCARAB_DEV_PLUGIN_TOKENS", "0123456789=a,abcdefabcd=a")],
@@ -4193,12 +4169,6 @@ connections:
                 "{pairs:?}"
             );
         }
-        // A registry port is fine in a repository name.
-        assert!(plugins_from(
-            &[("SCARAB_PLUGIN_ARGOCD_REPO", "registry:5000/x/argocd")],
-            true
-        )
-        .is_ok());
     }
 
     #[test]

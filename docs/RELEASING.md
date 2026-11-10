@@ -42,7 +42,9 @@ On a branch from main:
    `cargo check` so `Cargo.lock` follows.
 3. If `docker/clone` changed since the last release, pin `libs/clone.yaml` to
    a published build of it: `scripts/pin_clone_image.sh sha-<commit>`. A
-   release cannot pin the image it builds itself.
+   release cannot pin the image it builds itself. The docs tell org admins to
+   install `libs/clone.yaml` from a release tag's commit, so the file at each
+   tag must pin an image that is already published.
 4. If the UI changed, run `just docs screenshots` and look at the images
    before you commit them.
 5. Run `just release X.Y.Z`. It checks:
@@ -76,8 +78,9 @@ The tag starts three workflows:
   and publishes the chart to `oci://ghcr.io/thulasi-ram/charts/scarab`.
 - `release.yml` creates the GitHub Release. Its text is the `[X.Y.Z]` section
   of CHANGELOG.md, the install lines, and GitHub's list of merged pull
-  requests. It fails when the section is missing. It also uploads
-  `libs-manifest.json` and the library files.
+  requests. It fails when the section is missing. It also uploads the
+  library files under `libs/` as copies to read; the server does not read
+  them, and the release writes no library manifest.
 - `docs.yml` publishes the docs for the `X.Y` line.
 
 To change the Release text afterwards, edit CHANGELOG.md on main and edit the

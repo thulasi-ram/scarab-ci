@@ -432,9 +432,14 @@ pub(crate) async fn replay_caller(st: &AppState, a: &ReplayAuthority) -> Result<
             // min(its ceiling and scope, the owner's live role) — and "a token
             // may not mint tokens" still holds.
             let roles = crate::token_owner_roles(st, &token.owner_subject).await;
+            let handle = st
+                .people([token.owner_subject.as_str()])
+                .await
+                .handle(&token.owner_subject);
             Ok(Caller {
                 principal: Principal {
                     subject: token.owner_subject.clone(),
+                    handle,
                     display_name: Some(format!("API token \u{201c}{}\u{201d}", token.name)),
                     roles,
                 },
@@ -465,6 +470,7 @@ pub(crate) async fn replay_caller(st: &AppState, a: &ReplayAuthority) -> Result<
             Ok(Caller {
                 principal: Principal {
                     subject: session.principal.subject.clone(),
+                    handle: session.principal.handle.clone(),
                     display_name: session.principal.display_name.clone(),
                     roles,
                 },
@@ -568,7 +574,7 @@ async fn is_for_human(st: &AppState, subject: &str, for_human: &str) -> bool {
             .await
             .unwrap_or_default()
             .iter()
-            .any(|a| a == for_human),
+            .any(|a| a.id == for_human || a.handle == for_human),
         None => false,
     }
 }
@@ -680,7 +686,20 @@ pub(crate) async fn get_request(
         return Err(probe_refused(&st, &svc, &id, &caller, Some(&r)).await);
     }
     let now = st.clock.now().await.0;
-    Ok(Json(StepUpRequestDto::new(&r, now)))
+    let mut dto = StepUpRequestDto::new(&r, now);
+    // People by handle (ADR-0080 §3).
+    let people = st
+        .people(
+            [dto.for_human.as_str()]
+                .into_iter()
+                .chain(dto.confirmed_by.as_deref()),
+        )
+        .await;
+    people.show_one(&mut dto.for_human);
+    if let Some(by) = &mut dto.confirmed_by {
+        people.show_one(by);
+    }
+    Ok(Json(dto))
 }
 
 /// A challenge whose answer confirms this request (committed to its digest).

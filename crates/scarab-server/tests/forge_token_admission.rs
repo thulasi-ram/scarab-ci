@@ -3,9 +3,9 @@
 //!
 //! - A Step receives a forge credential only when the forge mints a
 //!   short-lived repository token (GitHub App mode), or when it comes from a
-//!   library the org trusts: the first-party clone library, or a source an
-//!   org admin trusted. A repository's own Step never gets a Forgejo or PAT
-//!   connection's token.
+//!   library installed from a source an org admin trusted. No library is
+//!   trusted by default, Scarab's clone library included. A repository's own
+//!   Step never gets a Forgejo or PAT connection's token.
 //! - A fork pull request gets `read` whatever it asks for.
 //! - `write` needs a minting forge, a Run governed by an Environment that
 //!   restricts refs, and, where that Environment has approvers, a manual gate
@@ -105,7 +105,6 @@ async fn install(
     name: &str,
     content: &str,
     source: &str,
-    first_party: bool,
 ) {
     libs.put_version(&LibraryVersion {
         org: "acme".into(),
@@ -114,7 +113,6 @@ async fn install(
         source: source.into(),
         publisher: publisher.into(),
         name: name.into(),
-        first_party,
         fetched_by: "amy".into(),
         fetched_at: 1,
     })
@@ -142,9 +140,25 @@ async fn install(
     .unwrap();
 }
 
-async fn with_first_party_clone() -> InMemoryLibraries {
+/// Trusts `source` (its commit stripped) in `acme`.
+async fn trust(libs: &InMemoryLibraries, source: &str) {
+    libs.trust_source(&TrustedSource {
+        org: "acme".into(),
+        source: scarab_policy::library::trust_key(source).into(),
+        trusted_by: "amy".into(),
+        trusted_at: 2,
+        step_up_ref: Some("su-1".into()),
+    })
+    .await
+    .unwrap();
+}
+
+/// The clone library installed in `acme` from its source, and that source
+/// trusted by an org admin.
+async fn with_trusted_clone() -> InMemoryLibraries {
     let libs = InMemoryLibraries::new();
-    install(&libs, "thulasi-ram", "clone", CLONE, CLONE_SOURCE, true).await;
+    install(&libs, "thulasi-ram", "clone", CLONE, CLONE_SOURCE).await;
+    trust(&libs, CLONE_SOURCE).await;
     libs
 }
 
@@ -190,7 +204,7 @@ steps:
 #[tokio::test]
 async fn a_repositorys_own_forge_token_step_on_a_long_lived_connection_is_refused() {
     let db = InMemoryDb::new();
-    let libs = with_first_party_clone().await;
+    let libs = with_trusted_clone().await;
     let forge = long_lived(&[(".scarab/ci.yaml", OWN_STEP_YAML)]);
     let out = trigger(
         &db,
@@ -224,14 +238,14 @@ async fn a_repositorys_own_forge_token_step_on_a_long_lived_connection_is_refuse
     );
 }
 
-/// The trusted first-party clone library's Step on a long-lived connection:
+/// The clone library's Step, from a trusted source, on a long-lived connection:
 /// admitted, it reads the Run's commit and clone URL, consumes no
 /// workspace, and at launch gets the credential beside its env — no env
 /// value is the token.
 #[tokio::test]
-async fn the_first_party_clone_step_gets_the_credential_and_no_env_carries_it() {
+async fn the_trusted_clone_step_gets_the_credential_and_no_env_carries_it() {
     let db = Arc::new(InMemoryDb::new());
-    let libs = Arc::new(with_first_party_clone().await);
+    let libs = Arc::new(with_trusted_clone().await);
     let forge = Arc::new(long_lived(&[(".scarab/ci.yaml", CHECKOUT_YAML)]));
     let out = trigger(
         db.as_ref(),
@@ -308,7 +322,7 @@ async fn a_forge_token_step_on_an_http_connection_is_refused() {
     .await
     .unwrap();
     db.bind_repo("fj", &repo(), "acme", "web").await.unwrap();
-    let libs = with_first_party_clone().await;
+    let libs = with_trusted_clone().await;
     let forge = minting(&[(".scarab/ci.yaml", CHECKOUT_YAML)]);
     let ports = AdmissionPorts {
         connections: Some(&db),
@@ -328,19 +342,62 @@ async fn a_forge_token_step_on_an_http_connection_is_refused() {
     assert_eq!(trigger(&db, &forge, ports, &push()).await.runs.len(), 1);
 }
 
-/// The same clone library content, not first-party, from another source:
-/// the org has not trusted it, so it is the repository's choice of code.
+/// The clone library installed from its own source gets no long-lived token
+/// until an org admin trusts that source; once trusted, the same Pipeline is
+/// admitted. Nothing about the library itself is trusted by default.
 #[tokio::test]
-async fn a_clone_copy_that_is_not_first_party_is_refused_a_long_lived_token() {
+async fn the_clone_library_gets_no_long_lived_token_until_its_source_is_trusted() {
     let db = InMemoryDb::new();
     let libs = InMemoryLibraries::new();
+    install(&libs, "thulasi-ram", "clone", CLONE, CLONE_SOURCE).await;
+    let forge = long_lived(&[(".scarab/ci.yaml", CHECKOUT_YAML)]);
+    let reason = refused_reason(
+        &trigger(
+            &db,
+            &forge,
+            AdmissionPorts::default().with_libraries(&libs),
+            &push(),
+        )
+        .await,
+    );
+    assert!(
+        reason.contains("step `checkout/git`")
+            && reason.contains(
+                "only a Step from a library installed from a source an org admin trusted"
+            ),
+        "{reason}"
+    );
+    assert_eq!(forge.credential_calls(), 0);
+
+    trust(&libs, CLONE_SOURCE).await;
+    let out = trigger(
+        &db,
+        &forge,
+        AdmissionPorts::default().with_libraries(&libs),
+        &push(),
+    )
+    .await;
+    assert_eq!(out.runs.len(), 1, "{:?}", out.refused);
+    assert_eq!(
+        stored_token(&db, &out.runs[0], "checkout/git").await,
+        Some(ForgeToken::Read)
+    );
+}
+
+/// The same clone library content, under the same name, from another
+/// source the org did not trust: it is the repository's choice of code.
+#[tokio::test]
+async fn a_clone_copy_from_an_untrusted_source_is_refused_a_long_lived_token() {
+    let db = InMemoryDb::new();
+    let libs = InMemoryLibraries::new();
+    // The org trusts the clone library's own source; this copy is not from it.
+    trust(&libs, CLONE_SOURCE).await;
     install(
         &libs,
         "thulasi-ram",
         "clone",
         CLONE,
         "github.com/mallory/clone//libs/clone.yaml@2222222222222222222222222222222222222222",
-        false,
     )
     .await;
     let forge = long_lived(&[(".scarab/ci.yaml", CHECKOUT_YAML)]);
@@ -380,7 +437,7 @@ async fn trust_follows_the_source_across_upgrades() {
             commit.to_string().repeat(40)
         )
     };
-    install(&libs, "acme", "pusher", PUSHER, &at('1'), false).await;
+    install(&libs, "acme", "pusher", PUSHER, &at('1')).await;
     let forge = long_lived(&[(".scarab/ci.yaml", PUSHER_YAML)]);
     let ports = || AdmissionPorts::default().with_libraries(&libs);
     assert!(
@@ -401,7 +458,7 @@ async fn trust_follows_the_source_across_upgrades() {
 
     // An upgrade from the same source keeps the trust.
     let v2 = format!("{PUSHER}    timeout: 60\n");
-    install(&libs, "acme", "pusher", &v2, &at('2'), false).await;
+    install(&libs, "acme", "pusher", &v2, &at('2')).await;
     let out = trigger(&db, &forge, ports(), &push()).await;
     assert_eq!(out.runs.len(), 1, "{:?}", out.refused);
 
@@ -413,7 +470,6 @@ async fn trust_follows_the_source_across_upgrades() {
         "pusher",
         &v3,
         &format!("github.com/mallory/libs//pusher.yaml@{}", "3".repeat(40)),
-        false,
     )
     .await;
     assert!(
@@ -421,7 +477,7 @@ async fn trust_follows_the_source_across_upgrades() {
     );
 
     // Untrusting refuses again.
-    install(&libs, "acme", "pusher", &v2, &at('2'), false).await;
+    install(&libs, "acme", "pusher", &v2, &at('2')).await;
     libs.untrust_source("acme", "github.com/acme/libs//pusher.yaml")
         .await
         .unwrap();
@@ -790,7 +846,7 @@ async fn a_bad_branch_refuses_only_the_pipelines_that_read_it() {
 #[tokio::test]
 async fn reading_event_sha_on_a_trigger_without_one_refuses_the_run() {
     let db = InMemoryDb::new();
-    let libs = with_first_party_clone().await;
+    let libs = with_trusted_clone().await;
     let yaml = "on: { tag: {} }\nsteps: [{ id: checkout, invoke: lib:thulasi-ram/clone }]\n";
     let forge = long_lived(&[(".scarab/ci.yaml", yaml)]).with_commit("refs/tags/v1", SHA);
     let tag = Event::Tag {
