@@ -1818,13 +1818,60 @@ select.input {
 .sched-body { padding: 12px 16px; display: flex; flex-direction: column; gap: 10px; }
 
 /* ---- environments ---- */
-.env-panel .env-body { padding: 14px 16px; }
-.env-rules { display: flex; align-items: center; gap: 6px; font-size: var(--fs-sm); color: var(--sage); margin-bottom: 12px; }
-/* Baseline / overlay / privileges, one line each. */
-.env-layers { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }
-.env-layers .env-h-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
-.env-h-row { font-size: var(--fs-sm); color: var(--sage); }
-.env-h-meta { display: inline-flex; align-items: center; gap: 12px; }
+/* The repo's Environments tab: one table, a row per Environment; a row
+   expands into a detail row. Four type styles only: Label 600/13 UI (names,
+   heads, buttons), Body 400/13 UI, Mono 400/12. On a narrow screen the table
+   scrolls sideways inside its panel and nothing else does. */
+.envt-scroll { overflow-x: auto; }
+.envt {
+  width: 100%; border-collapse: collapse;
+  font-family: var(--font-ui); font-size: 13px; font-weight: 400; color: var(--sage);
+}
+.envt > thead > tr > th {
+  text-align: left; font-weight: 600; font-size: 13px; color: var(--muted-sage);
+  padding: 10px 16px; background: var(--pine-deep); border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+.envt > tbody > tr > td {
+  padding: 11px 16px; border-bottom: 1px solid var(--border-soft);
+  vertical-align: middle; white-space: nowrap;
+}
+.envt > tbody > tr:last-child > td { border-bottom: none; }
+.envt-row { cursor: pointer; transition: background 0.1s ease; }
+.envt-row:hover { background: color-mix(in srgb, var(--emerald) 6%, transparent); }
+.envt-row:focus-visible { outline: 2px solid var(--emerald); outline-offset: -2px; }
+.envt-row[aria-expanded="true"] { background: color-mix(in srgb, var(--emerald) 4%, transparent); }
+.envt-row[aria-expanded="true"] > td { border-bottom-color: transparent; }
+.envt-chev { display: inline-flex; vertical-align: -2px; margin-right: 6px; color: var(--muted-sage); }
+.envt-name { font-weight: 600; color: var(--soft-white); }
+.envt-mono { font-family: var(--font-mono); font-size: 12px; font-weight: 400; }
+.envt-name.envt-mono { font-weight: 400; }
+.envt-quiet { color: var(--muted-sage); }
+.envt-chip {
+  display: inline-block; padding: 1px 8px; border: 1px solid var(--border);
+  border-radius: 20px; font-size: 13px; line-height: 18px; color: var(--sage);
+}
+.envt-chip.warn { color: var(--warn); border-color: var(--border-warn); }
+.envt-link { color: var(--emerald); text-decoration: none; }
+.envt-link:hover { text-decoration: underline; }
+/* The expanded detail: a sentence, the two layers side by side, actions. */
+.envt > tbody > tr.envt-detail > td {
+  white-space: normal; padding: 4px 16px 16px 36px;
+  background: color-mix(in srgb, var(--emerald) 4%, transparent);
+}
+.envt-sentence { margin: 0 0 10px; color: var(--soft-white); line-height: 1.5; }
+.envt-note { margin: 0 0 10px; color: var(--warn); }
+.envt-layers { border-collapse: collapse; margin-bottom: 12px; }
+.envt-layers th, .envt-layers td {
+  text-align: left; padding: 5px 24px 5px 0; white-space: nowrap; font-size: 13px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.envt-layers th { font-weight: 600; color: var(--muted-sage); }
+.envt-layers td { font-weight: 400; color: var(--sage); }
+.envt-layers td.envt-mono { font-size: 12px; }
+.envt-layers tbody tr:last-child > * { border-bottom: none; }
+.envt-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.envt-actions .envt-btn { font-size: 13px; padding: 5px 12px; }
 
 /* ---- settings / secrets bodies ---- */
 .settings-body, .secrets-body { padding: 16px; display: flex; flex-direction: column; gap: 12px; }

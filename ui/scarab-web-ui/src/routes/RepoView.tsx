@@ -29,12 +29,19 @@ import {
 } from "../api/client";
 import {
   isPermissive,
-  refLayersLabel,
   rulesSummary,
   rulesToForm,
   tightenable,
   toProtectionBody,
 } from "../environment-overlays";
+import {
+  approversCell,
+  deploySentence,
+  layerRows,
+  refsCell,
+  repoChip,
+  waitCell,
+} from "../repo-environments";
 import { relTime, absTime, untilTime, duration } from "../fmt";
 import { forgeCommitUrl, forgePrUrl } from "../forge";
 import TriggerCell from "../components/TriggerCell";
@@ -640,10 +647,13 @@ export default function RepoView() {
 
 
 // ---- environments (org Environments as this project sees them) ----------
-// Each panel shows the org's BASELINE, this project's OVERLAY and the
-// EFFECTIVE rules — the last computed by the server, never merged here. The
-// project can only tighten (its overlay); the baseline, who may deploy and
-// any privileges are an org admin's, under Settings › Environments.
+// One table, a row per Environment: the rules a deploy from this project
+// meets (the server's `effective` block, never merged here), what this
+// project adds, and a link to its runs there. A row expands to set the org
+// baseline beside this project's overlay. The project can only tighten (its
+// overlay); the baseline, who may deploy and any privileges are an org
+// admin's, under Settings › Environments. Which rows are open lives in this
+// component only, not the URL.
 
 function RepoEnvironments(props: {
   org: string;
@@ -655,6 +665,13 @@ function RepoEnvironments(props: {
   // `epoch` is in the key so a save in EnvDialog re-fetches the list.
   const key = () => ({ org: props.org, repo: props.repo, epoch: props.epoch });
   const [envs] = createResource(key, ({ org, repo }) => listEnvironments(org, repo));
+  const [open, setOpen] = createSignal<ReadonlySet<string>>(new Set());
+  const toggle = (name: string) =>
+    setOpen((prev) => {
+      const next = new Set(prev);
+      if (!next.delete(name)) next.add(name);
+      return next;
+    });
 
   return (
     <Show when={!envs.loading} fallback={<p class="empty">loading…</p>}>
@@ -669,155 +686,182 @@ function RepoEnvironments(props: {
             </p>
           }
         >
-          <For each={envs()}>
-            {(env) => (
-              <EnvPanel
-                org={props.org}
-                repo={props.repo}
-                env={env}
-                onTighten={() => props.onTighten(env.name)}
-                onChanged={props.onChanged}
-              />
-            )}
-          </For>
+          <div class="panel envt-panel">
+            <div class="envt-scroll">
+              <table class="envt">
+                <thead>
+                  <tr>
+                    <th scope="col">Environment</th>
+                    <th scope="col">Approvers</th>
+                    <th scope="col">Refs</th>
+                    <th scope="col">Wait</th>
+                    <th scope="col">This repo</th>
+                    <th scope="col">Runs</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <For each={envs()}>
+                    {(env) => (
+                      <EnvRow
+                        org={props.org}
+                        repo={props.repo}
+                        env={env}
+                        expanded={open().has(env.name)}
+                        onToggle={() => toggle(env.name)}
+                        onTighten={() => props.onTighten(env.name)}
+                        onChanged={props.onChanged}
+                      />
+                    )}
+                  </For>
+                </tbody>
+              </table>
+            </div>
+          </div>
         </Show>
       </Show>
     </Show>
   );
 }
 
-// What ran in the environment lives on the Runs tab (filtered by it), so the
-// panel shows the rules only and links there.
-function EnvPanel(props: {
+// One Environment's row and, when expanded, its detail row under it.
+function EnvRow(props: {
   org: string;
   repo: string;
   env: ProjectEnvironment;
+  expanded: boolean;
+  onToggle: () => void;
   onTighten: () => void;
   onChanged: () => void;
 }) {
-  const [error, setError] = createSignal<string | null>(null);
   const [removing, setRemoving] = createSignal(false);
-  const effective = () => props.env.effective;
+  const detailId = () => `envt-detail-${props.env.name}`;
+  const wait = () => waitCell(props.env.effective);
+  const chip = () => repoChip(props.env);
+  const onKey = (e: KeyboardEvent) => {
+    // Only the row itself: Enter on the Runs link follows the link.
+    if (e.target !== e.currentTarget) return;
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      props.onToggle();
+    }
+  };
 
   return (
-    <div class="panel env-panel">
-      <div class="panel-h">
-        <span>
-          {shownName(props.env)}
+    <>
+      <tr
+        class="envt-row"
+        tabindex="0"
+        aria-expanded={props.expanded}
+        aria-controls={props.expanded ? detailId() : undefined}
+        onClick={props.onToggle}
+        onKeyDown={onKey}
+      >
+        <td>
+          <span class="envt-chev" aria-hidden="true">
+            <Icon icon={props.expanded ? "chevron-down" : "chevron-right"} size={14} />
+          </span>
+          <span class="envt-name" classList={{ "envt-mono": nameBeside(props.env) === null }}>
+            {shownName(props.env)}
+          </span>
           <Show when={nameBeside(props.env)}>
             {(name) => (
-              <span class="oenv-name mono" title="The name pipelines use">
+              <span class="envt-mono envt-quiet" title="The name pipelines use">
                 {" "}
                 {name()}
               </span>
             )}
           </Show>
-        </span>
-        <span class="env-h-meta">
-          <Show when={!props.env.eligible}>
-            <span class="tok-role" title="An org admin withdrew this project's eligibility">
-              not eligible
-            </span>
+        </td>
+        <td>{approversCell(props.env)}</td>
+        <td class="envt-mono">{refsCell(props.env.effective.allowed_ref_layers)}</td>
+        <td title={wait().title}>{wait().text}</td>
+        <td>
+          <Show when={chip()} fallback={<span class="envt-quiet">—</span>}>
+            {(c) => <span class="envt-chip" classList={{ warn: c().warn }}>{c().text}</span>}
           </Show>
+        </td>
+        <td>
           <A
-            class="subtle mono"
+            class="envt-link"
             href={`/${props.org}/${props.repo}?env=${encodeURIComponent(props.env.name)}`}
+            aria-label={`Runs in ${shownName(props.env)}`}
+            onClick={(e) => e.stopPropagation()}
           >
-            runs in {props.env.name} →
+            View runs
           </A>
-        </span>
-      </div>
-      <div class="env-body">
-        <div class="env-rules mono" title="What admission enforces for this project">
-          <Icon icon="shield-check" size={13} /> {effective().approvers.length} approver
-          {effective().approvers.length === 1 ? "" : "s"}
-          <Show when={effective().approvers.length > 0}>
-            {" "}({effective().approvers.join(", ")})
-          </Show>
-          <span class="dotsep">·</span> {refLayersLabel(effective().allowed_ref_layers)}
-          <Show when={effective().wait_timer_s > 0}>
-            <span class="dotsep">·</span>{" "}
-            <span
-              title={
-                effective().approvers.length > 0
-                  ? "A minimum wait on the approval gate, after the approvals are in"
-                  : "Does nothing: the timer needs approvers"
-              }
-            >
-              {effective().wait_timer_s}s wait
-              {effective().approvers.length > 0 ? "" : " (no approvers: does nothing)"}
-            </span>
-          </Show>
-          <Show when={effective().require_reason}>
-            <span class="dotsep">·</span> reason required
-          </Show>
-        </div>
-        <div class="env-layers">
-          <div class="env-h-row mono">
-            <span class="subtle">org baseline</span>{" "}
-            <Show
-              when={!isPermissive(props.env.baseline)}
-              fallback={<span class="subtle">permissive — no org-wide rule yet</span>}
-            >
-              {rulesSummary(props.env.baseline)}
+        </td>
+      </tr>
+      <Show when={props.expanded}>
+        <tr class="envt-detail" id={detailId()}>
+          <td colspan="6">
+            <p class="envt-sentence">
+              <For each={deploySentence(props.env)}>
+                {(s) => (s.mono ? <span class="envt-mono">{s.text}</span> : s.text)}
+              </For>
+            </p>
+            <Show when={!props.env.eligible}>
+              <p class="envt-note">An org admin withdrew this repo. Its overlay stays until removed.</p>
             </Show>
-          </div>
-          <div class="env-h-row mono">
-            <span class="subtle">{props.repo} overlay</span>{" "}
-            <Show when={props.env.overlay} fallback={<span class="subtle">none</span>}>
-              {(o) => rulesSummary(o())}
-            </Show>
-            <span class="oenv-actions">
-              <Show when={props.env.eligible || props.env.overlay}>
-                <button class="btn btn-ghost btn-sm" onClick={props.onTighten}>
-                  {props.env.overlay ? "edit" : "tighten"}
+            <table class="envt-layers">
+              <thead>
+                <tr>
+                  <th scope="col">
+                    <span class="sr-only">Rule</span>
+                  </th>
+                  <th scope="col">Org baseline</th>
+                  <th scope="col">This repo adds</th>
+                </tr>
+              </thead>
+              <tbody>
+                <For each={layerRows(props.env)}>
+                  {(r) => (
+                    <tr>
+                      <th scope="row">{r.rule}</th>
+                      <td classList={{ "envt-mono": r.mono && r.baseline !== "—" }}>{r.baseline}</td>
+                      <td classList={{ "envt-mono": r.mono && r.overlay !== "—" }}>{r.overlay}</td>
+                    </tr>
+                  )}
+                </For>
+              </tbody>
+            </table>
+            <Show when={props.env.eligible || props.env.overlay}>
+              <div class="envt-actions">
+                <button class="btn btn-ghost envt-btn" type="button" onClick={props.onTighten}>
+                  {props.env.overlay ? "Edit this repo's rules" : "Add rules for this repo"}
                 </button>
-              </Show>
-              <Show when={props.env.overlay}>
-                <button class="btn btn-ghost btn-sm" onClick={() => setRemoving(true)}>
-                  remove
-                </button>
-              </Show>
-            </span>
-          </div>
-          <Show when={props.env.privilege_grant}>
-            {(g) => (
-              <div class="env-h-row mono">
-                <span class="subtle">privileges</span> {g().privileged_images.length} image
-                {g().privileged_images.length === 1 ? "" : "s"}
-                <Show when={g().permit_k8s_overlay}> · raw k8s_overlay allowed</Show>
+                <Show when={props.env.overlay}>
+                  <button class="btn btn-danger envt-btn" type="button" onClick={() => setRemoving(true)}>
+                    Remove
+                  </button>
+                </Show>
               </div>
+            </Show>
+          </td>
+        </tr>
+      </Show>
+      <Show when={removing()}>
+        <ConfirmDestructive
+          eyebrow={`${props.org}/${props.repo} · environments`}
+          title={`Remove ${props.repo}'s rules on ${props.env.name}?`}
+          purpose="Its deploys there fall back to the org baseline."
+          name={props.env.name}
+          confirmLabel="Remove rules"
+          onConfirm={async () => {
+            await deleteEnvironmentOverlay(props.org, props.env.name, props.repo);
+            props.onChanged();
+          }}
+          onClose={() => setRemoving(false)}
+        >
+          <Show when={props.env.overlay}>
+            {(o) => (
+              <p class="dlg-ctx">
+                <span class="k">this repo adds</span> {rulesSummary(o())}
+              </p>
             )}
           </Show>
-        </div>
-        <Show when={error()}>
-          <p class="error">{error()}</p>
-        </Show>
-        <Show when={removing()}>
-          <ConfirmDestructive
-            eyebrow={`${props.org}/${props.repo} · environments`}
-            title={`Remove ${props.repo}'s overlay on ${props.env.name}?`}
-            purpose="Its deploys there fall back to the org baseline."
-            name={props.env.name}
-            confirmLabel="Remove overlay"
-            onConfirm={async () => {
-              setError(null);
-              await deleteEnvironmentOverlay(props.org, props.env.name, props.repo);
-              props.onChanged();
-            }}
-            onClose={() => setRemoving(false)}
-          >
-            <Show when={props.env.overlay}>
-              {(o) => (
-                <p class="dlg-ctx">
-                  <span class="k">overlay now</span> {rulesSummary(o())}
-                </p>
-              )}
-            </Show>
-          </ConfirmDestructive>
-        </Show>
-      </div>
-    </div>
+        </ConfirmDestructive>
+      </Show>
+    </>
   );
 }
 
