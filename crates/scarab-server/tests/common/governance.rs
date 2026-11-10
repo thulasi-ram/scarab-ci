@@ -1,26 +1,24 @@
-//! Seed org-level Environment governance (ADR-0071) on real Postgres the way
-//! migration 0057 leaves a legacy per-Project environment, so a test written
-//! against the per-Project `ProtectionRules` is ported by changing its setup
-//! only — never its assertions.
+//! Seed org-level Environment governance (ADR-0071) on real Postgres: one
+//! Project's overlay over an Environment's baseline, with the Project
+//! eligible for it.
 #![allow(dead_code)] // each test binary uses its own subset
 
 use scarab_db_postgres::PostgresDb;
 use scarab_project::{
-    migrate_legacy_environment, Environment, EnvironmentGovernanceStore,
-    EnvironmentProjectEligibility, OrgEnvironment, OrgEnvironmentStore, ProtectionRules,
+    EnvironmentGovernanceStore, EnvironmentProjectEligibility, EnvironmentProjectOverlay,
+    EnvironmentProtectionRules, OrgEnvironment, OrgEnvironmentStore,
 };
 
-/// Make `project`'s legacy environment `name` (with `protection`) what ADR-0071
-/// §10 makes of it: the org Environment `name` (created with the permissive
-/// baseline if missing — step 1), `project` added to
-/// its eligibility by exact name (step 6), and `project`'s overlay and grant
-/// from [`migrate_legacy_environment`] (steps 2, 3, 5) — replacing any it had.
-pub async fn seed_migrated_environment(
+/// Give `project` the overlay `rules` over Environment `name`, replacing any
+/// it had. The Environment is created with the permissive baseline if
+/// missing, and `project` is added to its eligibility by exact name unless
+/// it already admits every Project.
+pub async fn seed_project_overlay(
     pg: &PostgresDb,
     org: &str,
     project: &str,
     name: &str,
-    protection: ProtectionRules,
+    rules: EnvironmentProtectionRules,
 ) {
     let existing = pg.get_org_environment(org, name).await.unwrap();
     let env = match existing {
@@ -35,7 +33,7 @@ pub async fn seed_migrated_environment(
                 eligibility: Default::default(),
                 created_at: 0,
                 updated_at: 0,
-                updated_by: "migration:adr-0071".into(),
+                updated_by: "test".into(),
             })
             .await
             .unwrap(),
@@ -47,30 +45,20 @@ pub async fn seed_migrated_environment(
                 org,
                 name,
                 &EnvironmentProjectEligibility::Projects(projects),
-                "migration:adr-0071",
+                "test",
                 0,
             )
             .await
             .unwrap();
         }
     }
-    let legacy = Environment {
-        name: name.into(),
-        protection,
+    let overlay = EnvironmentProjectOverlay {
+        org: org.into(),
+        environment: name.into(),
+        project: project.into(),
+        rules,
     };
-    let (overlay, grant) = migrate_legacy_environment(org, project, &legacy);
-    pg.put_environment_project_overlay(&overlay, "migration:adr-0071", 0)
+    pg.put_environment_project_overlay(&overlay, "test", 0)
         .await
         .unwrap();
-    match grant {
-        Some(grant) => pg
-            .put_environment_project_privilege_grant(&grant, "migration:adr-0071", 0)
-            .await
-            .unwrap(),
-        None => {
-            pg.delete_environment_project_privilege_grant(org, name, project)
-                .await
-                .unwrap();
-        }
-    }
 }

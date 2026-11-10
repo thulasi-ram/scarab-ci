@@ -24,32 +24,22 @@ use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 
 use common::fresh_db;
-use common::governance::seed_migrated_environment;
+use common::governance::seed_project_overlay;
 use scarab_db_postgres::PostgresDb;
 use scarab_engine::ports::ExecState;
 use scarab_engine::{
     Db, DeployContext, RunId, RunStatus, Scheduler, StepId, StepSpec, StepStatus, Timestamp,
 };
-use scarab_project::{EnvironmentGovernanceStore, OrgEnvironmentStore, ProtectionRules};
+use scarab_project::{EnvironmentGovernanceStore, EnvironmentProtectionRules, OrgEnvironmentStore};
 use scarab_secrets::{SecretProvider, SecretScope};
 use scarab_server::{router, AppState, LogService};
 use scarab_testkit::{FakeClock, FakeExecutor, FakeSecrets, InMemoryObjectStore};
 
-fn rules(approvers: &[&str], allowed_refs: &[&str]) -> ProtectionRules {
-    ProtectionRules {
+fn rules(approvers: &[&str], allowed_refs: &[&str]) -> EnvironmentProtectionRules {
+    EnvironmentProtectionRules {
         approvers: approvers.iter().map(|s| s.to_string()).collect(),
-        wait_timer: 0,
         allowed_refs: allowed_refs.iter().map(|s| s.to_string()).collect(),
-        concurrency: 1,
-        secret_scope: SecretScope::EnvironmentProject {
-            org: "acme".into(),
-            project: "web".into(),
-            environment: "prod".into(),
-        },
-        oidc_subject: "scarab:acme/web/prod".into(),
-        privileged_images: Vec::new(),
-        permit_k8s_overlay: false,
-        require_reason: false,
+        ..Default::default()
     }
 }
 
@@ -603,8 +593,8 @@ async fn deploy_gate_releases_only_when_admitted() {
     };
 
     // --- Case 1: approver requirement NOT met by the anonymous approver ---
-    // (ADR-0071: `web`'s legacy rules, as the migration leaves them.)
-    seed_migrated_environment(
+    // (ADR-0071: `web`'s overlay over the permissive baseline.)
+    seed_project_overlay(
         &pg,
         "acme",
         "web",
@@ -629,7 +619,7 @@ async fn deploy_gate_releases_only_when_admitted() {
     );
 
     // --- Case 2: approver requirement satisfied by the anonymous approver ---
-    seed_migrated_environment(
+    seed_project_overlay(
         &pg,
         "acme",
         "web",
@@ -674,7 +664,7 @@ async fn secret_matrix_reports_effective_status() {
     let pg = Arc::new(PostgresDb::with_pool(tdb.pool.clone()));
     pg.migrate().await.unwrap();
     for name in ["prod", "staging"] {
-        seed_migrated_environment(&pg, "acme", "web", name, rules(&[], &[])).await;
+        seed_project_overlay(&pg, "acme", "web", name, rules(&[], &[])).await;
     }
     // SHARED lives once at repo scope; PROD_ONLY only at prod's env scope.
     let secrets = FakeSecrets::new()

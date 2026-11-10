@@ -23,8 +23,7 @@ use scarab_engine::{
     StepSpec,
 };
 use scarab_forge::RepoRef;
-use scarab_project::{Environment, ProtectionRules};
-use scarab_secrets::SecretScope;
+use scarab_project::EnvironmentProtectionRules;
 use scarab_server::{dispatch_run, router, AppState, DispatchError, DispatchKind, LogService};
 use scarab_testkit::{
     FakeClock, FakeExecutor, InMemoryDb, InMemoryEnvironmentGovernance, InMemoryObjectStore,
@@ -54,36 +53,17 @@ steps:
 
 // --- governance without Postgres ----------------------------------------------
 
-/// The legacy `prod` environment as ADR-0071's migration hands it to
-/// admission: an org Environment `prod` (permissive baseline, `web`
-/// eligible) with `web`'s old rules as its overlay. The governance assertions
-/// below are the pre-ADR-0071 ones, unchanged.
-fn migrated(protection: ProtectionRules) -> InMemoryEnvironmentGovernance {
-    InMemoryEnvironmentGovernance::new().with_migrated_legacy_environment(
-        "acme",
-        "web",
-        &Environment {
-            name: "prod".into(),
-            protection,
-        },
-    )
+/// An org Environment `prod` (permissive baseline, `web` eligible) with
+/// `rules` as `web`'s overlay.
+fn prod_env(rules: EnvironmentProtectionRules) -> InMemoryEnvironmentGovernance {
+    InMemoryEnvironmentGovernance::new().with_project_overlay("acme", "web", "prod", rules)
 }
 
-fn prod_rules(approvers: &[&str], allowed_refs: &[&str]) -> ProtectionRules {
-    ProtectionRules {
+fn prod_rules(approvers: &[&str], allowed_refs: &[&str]) -> EnvironmentProtectionRules {
+    EnvironmentProtectionRules {
         approvers: approvers.iter().map(|s| s.to_string()).collect(),
-        wait_timer: 0,
         allowed_refs: allowed_refs.iter().map(|s| s.to_string()).collect(),
-        concurrency: 1,
-        secret_scope: SecretScope::EnvironmentProject {
-            org: "acme".into(),
-            project: "web".into(),
-            environment: "prod".into(),
-        },
-        oidc_subject: "scarab:acme/web/prod".into(),
-        privileged_images: Vec::new(),
-        permit_k8s_overlay: false,
-        require_reason: false,
+        ..Default::default()
     }
 }
 
@@ -446,7 +426,7 @@ async fn dispatched_deploy_suspends_on_the_approval_gate() {
     let forge = scarab_testkit::FakeForge::new().with_file(".scarab/deploy.yaml", DEPLOY_YAML);
     let db = Arc::new(InMemoryDb::new());
     let clock = Arc::new(FakeClock::new(1_000));
-    let envs = Arc::new(migrated(prod_rules(&["alice"], &["refs/heads/main"])));
+    let envs = Arc::new(prod_env(prod_rules(&["alice"], &["refs/heads/main"])));
 
     let run = dispatch_run(
         &forge,
@@ -502,7 +482,7 @@ async fn dispatch_ref_disallowed_by_environment_is_rejected_fail_closed() {
     let db = Arc::new(InMemoryDb::new());
     let clock = Arc::new(FakeClock::new(1_000));
     // prod only admits refs/heads/main.
-    let envs = Arc::new(migrated(prod_rules(&[], &["refs/heads/main"])));
+    let envs = Arc::new(prod_env(prod_rules(&[], &["refs/heads/main"])));
 
     let err = dispatch_run(
         &forge,
@@ -533,7 +513,7 @@ async fn dispatch_ref_disallowed_by_environment_is_rejected_fail_closed() {
 async fn require_reason_env() -> Arc<InMemoryEnvironmentGovernance> {
     let mut protection = prod_rules(&[], &[]);
     protection.require_reason = true;
-    Arc::new(migrated(protection))
+    Arc::new(prod_env(protection))
 }
 
 /// A `require_reason` environment blocks a reasonless human dispatch at the
@@ -650,7 +630,7 @@ async fn dispatch_to_branch_scoped_env_admits_and_pins_the_resolved_sha() {
         .with_commit("main", "1234567890abcdef1234567890abcdef12345678");
     let db = Arc::new(InMemoryDb::new());
     let clock = Arc::new(FakeClock::new(1_000));
-    let envs = Arc::new(migrated(prod_rules(&[], &["refs/heads/main"])));
+    let envs = Arc::new(prod_env(prod_rules(&[], &["refs/heads/main"])));
 
     // Bare branch name `main` → canonicalized to refs/heads/main → admitted.
     let run = dispatch_run(
@@ -997,7 +977,7 @@ async fn governed_deploy_serializes_without_cancelling_the_holder() {
         .with_commit("refs/heads/main", "5ba1");
     let db = Arc::new(InMemoryDb::new());
     let clock = Arc::new(FakeClock::new(1_000));
-    let envs = Arc::new(migrated(prod_rules(&[], &["refs/heads/main"])));
+    let envs = Arc::new(prod_env(prod_rules(&[], &["refs/heads/main"])));
 
     let dispatch = || {
         let forge = &forge;

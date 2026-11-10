@@ -23,8 +23,8 @@ use scarab_engine::{
 };
 use scarab_storage::{ObjectStore, StorageError};
 
-/// An in-memory `EnvironmentGovernanceStore` (ADR-0071), and the seeding that
-/// mirrors the §10 migration of a legacy per-Project environment.
+/// An in-memory `EnvironmentGovernanceStore` (ADR-0071), with a helper that
+/// seeds one Project's overlay.
 mod environment_governance;
 pub use environment_governance::InMemoryEnvironmentGovernance;
 

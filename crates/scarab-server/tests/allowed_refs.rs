@@ -11,8 +11,7 @@
 
 use scarab_engine::Db;
 use scarab_forge::{Event, RepoRef};
-use scarab_project::{Environment, ProtectionRules};
-use scarab_secrets::SecretScope;
+use scarab_project::EnvironmentProtectionRules;
 use scarab_server::trigger_run_from_event;
 use scarab_testkit::{FakeClock, FakeForge, InMemoryDb, InMemoryEnvironmentGovernance};
 
@@ -33,42 +32,21 @@ steps:
   - { id: ship, image: busybox, command: ["true"] }
 "#;
 
-fn prod_rules(allowed_refs: &[&str]) -> ProtectionRules {
-    ProtectionRules {
-        approvers: vec![],
-        wait_timer: 0,
+fn prod_rules(allowed_refs: &[&str]) -> EnvironmentProtectionRules {
+    EnvironmentProtectionRules {
         allowed_refs: allowed_refs.iter().map(|s| s.to_string()).collect(),
-        concurrency: 1,
-        secret_scope: SecretScope::EnvironmentProject {
-            org: "acme".into(),
-            project: "web".into(),
-            environment: "prod".into(),
-        },
-        oidc_subject: "scarab:acme/web/prod".into(),
-        privileged_images: Vec::new(),
-        permit_k8s_overlay: false,
-        require_reason: false,
+        ..Default::default()
     }
 }
 
-/// The legacy `prod` environment, as ADR-0071's migration hands it to
-/// admission: an org Environment `prod` (permissive baseline, `web` eligible)
-/// with `web`'s old rules as its overlay. The assertions below are the
-/// pre-ADR-0071 ones, unchanged — they now prove the migrated governance
-/// decides as the per-repo rules did.
-fn migrated(protection: ProtectionRules) -> InMemoryEnvironmentGovernance {
-    InMemoryEnvironmentGovernance::new().with_migrated_legacy_environment(
-        "acme",
-        "web",
-        &Environment {
-            name: "prod".into(),
-            protection,
-        },
-    )
+/// An org Environment `prod` (permissive baseline, `web` eligible) with
+/// `rules` as `web`'s overlay.
+fn prod_env(rules: EnvironmentProtectionRules) -> InMemoryEnvironmentGovernance {
+    InMemoryEnvironmentGovernance::new().with_project_overlay("acme", "web", "prod", rules)
 }
 
 async fn env_store(allowed_refs: &[&str]) -> InMemoryEnvironmentGovernance {
-    migrated(prod_rules(allowed_refs))
+    prod_env(prod_rules(allowed_refs))
 }
 
 fn push(branch: &str) -> Event {
@@ -244,7 +222,7 @@ async fn push_into_a_require_reason_env_is_exempt() {
     let (forge, db, clock) = setup();
     let mut protection = prod_rules(&[]); // unrestricted refs
     protection.require_reason = true;
-    let envs = migrated(protection);
+    let envs = prod_env(protection);
 
     let runs = trigger_run_from_event(
         &forge,
