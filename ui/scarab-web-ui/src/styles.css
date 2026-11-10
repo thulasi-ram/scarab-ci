@@ -3257,7 +3257,10 @@ h1, .crumb-head, .run-title {
   padding: 40px 32px 32px;
   text-align: center;
 }
-.login-emblem { display: block; margin: 0 auto 18px; }
+/* No display here: it would beat the light/dark toggle near .brand-emblem
+   (same specificity, later rule) and show both marks. */
+.login-emblem { margin: 0 auto 18px; }
+.login-emblem--light { display: block; }
 .login-title {
   font-size: 22px;
   letter-spacing: 0.01em;
