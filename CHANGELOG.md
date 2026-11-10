@@ -84,7 +84,9 @@ release.yml uses that version's section as the GitHub Release text. See
 
 - **Any plugin can be installed.** An org admin fetches a plugin's manifest from a git source
   pinned to a commit, reviews its capabilities, connection slots, config keys and gates, and
-  installs it by image digest with a passkey. Scarab's Argo CD plugin installs the same way.
+  installs it by image digest with a passkey. Scarab's Argo CD plugin installs the same way;
+  its image is now published as `ghcr.io/thulasi-ram/scarab-plugin-argocd` with the other
+  images, for linux/amd64 and linux/arm64.
   ([Install a plugin](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#install-a-plugin))
 - **An org page at `/orgs/<org>`.** It shows the org's enabled repositories, its runs and
   failed runs in the last 24 hours and its runs waiting on a gate, and lists every repository

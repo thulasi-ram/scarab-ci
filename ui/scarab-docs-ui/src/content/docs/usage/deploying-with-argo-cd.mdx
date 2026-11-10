@@ -191,10 +191,18 @@ An org admin installs it like any other plugin ([Install a plugin](/scarab-ci/ge
    `github.com/thulasi-ram/scarab-ci//crates/scarab-plugin-argocd/manifest.json@<commit>`.
    It asks for `use_connection` and `resolve_gates`, one connection slot `argocd` that allows
    only `GET` requests to a fixed list of Argo CD API paths, and the `wait-live` gate.
-2. Install it with its image pinned by digest. Scarab's release workflow does not publish this
-   image yet: build it from `docker/plugin-argocd/Dockerfile` (the build context is the
-   repository root, at the same commit), push it to a registry your cluster pulls from, and
-   install it as `<repository>@sha256:<digest>`.
+2. Install it with its image pinned by digest. Scarab publishes the image as
+   `ghcr.io/thulasi-ram/scarab-plugin-argocd`, for linux/amd64 and linux/arm64, tagged with
+   the release version, and `edge` and `sha-<commit>` for each commit on `main`. Use
+   the build from the same commit as the manifest, and read its digest:
+
+   ```sh
+   docker buildx imagetools inspect ghcr.io/thulasi-ram/scarab-plugin-argocd:<version>
+   ```
+
+   then install `ghcr.io/thulasi-ram/scarab-plugin-argocd@sha256:<digest>`. A tag can move; the
+   digest you approve cannot. To run your own build, build `docker/plugin-argocd/Dockerfile`
+   from the repository root and push it to a registry your cluster pulls from.
 3. Bind the `argocd` slot to your Argo CD's URL with a bearer token, and add the installation to
    the plugin list (`plugins_allowed`), which no plugin's gates run without.
 
