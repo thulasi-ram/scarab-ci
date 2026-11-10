@@ -107,6 +107,10 @@ release.yml uses that version's section as the GitHub Release text. See
   settings, with its filters and paging. **Refusals, last 24h** filters it to recent refusals
   and replaces the recent-refusals table. The Event log section is gone;
   `/orgs/<org>/settings/events` redirects to Security and keeps its filters.
+- **The web UI uses four text styles.** Title (Inter 600, 20px), Label (Inter 600, 13px), Body
+  (Inter 400, 13px) and Mono (JetBrains Mono 400, 12px) replace the five sizes, four weights and
+  display face the pages mixed. Headings and column heads are in sentence case instead of
+  upper case, and body text is 13px instead of 15px. The wordmark keeps its own face.
 
 ### Bug Fixes
 
