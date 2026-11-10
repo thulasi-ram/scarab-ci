@@ -523,9 +523,10 @@ async fn a_bind_refuses_a_repo_the_connections_org_does_not_own() {
     );
 }
 
-/// Re-sync binds what the credential reaches, but only the connection's own
-/// Org's repos, and never moves a repo bound through another Org's
-/// connection. An unassigned connection binds nothing on a re-sync.
+/// Re-sync reports what the credential reaches as available, but only the
+/// connection's own Org's repos, binds none of them, and never moves a repo
+/// bound through another Org's connection. An unassigned connection reports
+/// nothing available on a re-sync.
 #[tokio::test]
 async fn resync_never_binds_or_moves_another_orgs_repo() {
     let h = harness(forge()).await;
@@ -533,7 +534,12 @@ async fn resync_never_binds_or_moves_another_orgs_repo() {
 
     let (st, b) = call(&h, "POST", "/v1/connections/gh-acme/resync", &root, None).await;
     assert_eq!(st, StatusCode::OK, "{b}");
-    assert_eq!(b["bound"], serde_json::json!(["acme/api"]));
+    assert_eq!(b["available"], serde_json::json!(["acme/api"]));
+    assert_eq!(b["moved"], serde_json::json!([]));
+    assert!(
+        h.db.resolve(&repo("acme", "api")).await.unwrap().is_none(),
+        "available is not enabled"
+    );
     let mut skipped: Vec<&str> = b["skipped"]
         .as_array()
         .unwrap()
@@ -549,7 +555,6 @@ async fn resync_never_binds_or_moves_another_orgs_repo() {
     assert_eq!(st, StatusCode::OK, "{b}");
     for (r, holder) in [
         (repo("acme", "web"), "gh-acme"),
-        (repo("acme", "api"), "gh-acme"),
         (repo("globex", "site"), "fj-globex"),
     ] {
         assert_eq!(
@@ -580,7 +585,8 @@ async fn an_unassigned_connection_is_not_assigned_or_bound_by_a_resync() {
 
     let (st, b) = call(&h, "POST", "/v1/connections/gh-legacy/resync", &root, None).await;
     assert_eq!(st, StatusCode::OK, "{b}");
-    assert_eq!(b["bound"], serde_json::json!([]));
+    assert_eq!(b["available"], serde_json::json!([]));
+    assert_eq!(b["moved"], serde_json::json!([]));
     let mut skipped: Vec<&str> = b["skipped"]
         .as_array()
         .unwrap()
@@ -816,7 +822,7 @@ async fn removing_a_connection_never_takes_another_orgs_project_with_it() {
     .await;
     assert_eq!(st, StatusCode::OK, "{b}");
     assert!(
-        b["bound"]
+        b["moved"]
             .as_array()
             .unwrap()
             .contains(&serde_json::json!("globex/other")),
@@ -855,7 +861,9 @@ async fn removing_a_connection_never_takes_another_orgs_project_with_it() {
 /// new account (id 2) takes the free login `acme` and installs the App. Its
 /// installation is registered unassigned and binds nothing: the login is
 /// the same, the account is not. The account with id 1 installing again
-/// joins acme. Before the fix any GitHub installation named `acme` joined.
+/// joins acme, and, as every installation now, binds none of its repos: an
+/// admin enables them. Before the fix any GitHub installation named `acme`
+/// joined.
 #[tokio::test]
 async fn an_installation_by_a_new_holder_of_a_renamed_login_does_not_join_its_org() {
     let h = harness(forge()).await;
@@ -881,10 +889,8 @@ async fn an_installation_by_a_new_holder_of_a_renamed_login_does_not_join_its_or
             .unwrap()
             .unwrap();
     assert_eq!(c.org.as_deref(), Some("acme"));
-    assert_eq!(
-        h.db.repos_of("github-install-10").await.unwrap(),
-        vec![repo("acme", "more")]
-    );
+    assert!(h.db.repos_of("github-install-10").await.unwrap().is_empty());
+    assert!(h.db.resolve(&repo("acme", "more")).await.unwrap().is_none());
 }
 
 /// D7 of git-bug 19b0a45, the data-only case. A global admin sets up
@@ -930,4 +936,34 @@ async fn an_installation_does_not_join_an_org_that_only_holds_data() {
             .unwrap()
             .unwrap();
     assert_eq!(c.org.as_deref(), Some("hooli"));
+}
+
+/// Disabling a GitHub repo is permanent: the unbind removes its Project, and
+/// neither a later re-sync nor a later delivery of the installation binds
+/// it again. The repo is listed as available instead.
+#[tokio::test]
+async fn a_disabled_repo_stays_disabled_after_a_resync() {
+    let h = harness(forge()).await;
+    let acme = login(&h.app, "acme-code").await;
+
+    let (st, b) = call(
+        &h,
+        "DELETE",
+        "/v1/connections/gh-acme/repos/acme/web",
+        &acme,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT, "{b}");
+
+    let (st, b) = call(&h, "POST", "/v1/connections/gh-acme/resync", &acme, None).await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert!(
+        b["available"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("acme/web")),
+        "{b}"
+    );
+    assert!(h.db.resolve(&repo("acme", "web")).await.unwrap().is_none());
 }

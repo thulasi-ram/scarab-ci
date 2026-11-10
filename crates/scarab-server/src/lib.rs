@@ -7499,6 +7499,22 @@ async fn ingest_event(
             Json(serde_json::json!({ "ignored": "no forge configured" })),
         ));
     };
+    // A repo the forge covers but no admin has enabled has no Project: its
+    // events are acknowledged and dropped, before any forge read. A 2xx, so
+    // the forge does not retry a delivery that will never be acted on (a
+    // GitHub App delivers every covered repo's events, enabled or not).
+    if let (Some(connections), Some(repo)) = (st.connections.as_ref(), event.repo()) {
+        let bound = connections
+            .resolve(repo)
+            .await
+            .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?;
+        if bound.is_none() {
+            return Ok((
+                StatusCode::OK,
+                Json(serde_json::json!({ "ignored": "repository not enabled" })),
+            ));
+        }
+    }
     let triggered = async {
         if matches!(event, scarab_forge::Event::Cron { .. }) {
             return Ok(TriggerOutcome::default());
@@ -7567,9 +7583,16 @@ async fn ingest_event(
 /// The API base every GitHub App installation connection talks to.
 const GITHUB_API_BASE: &str = "https://api.github.com";
 
-/// Apply an installation delivery to the registry (ADR-0046: installing the
-/// App **is** registration), into the Org of the installation's account
+/// Apply an installation delivery to the registry: installing the App
+/// registers its connection, serving the Org of the installation's account
 /// (git-bug 19b0a45).
+///
+/// Enabling a repository is opt-in. The delivery binds none of the repos it
+/// adds: they are available, listed on the org's repositories page, and an
+/// admin enables the ones Scarab should build (`POST
+/// /v1/connections/{id}/repos`). So a repo an admin disabled stays disabled
+/// whatever the forge sends next. A repo the installation stops covering is
+/// still unbound, as before: no token can be minted for it any more.
 ///
 /// The connection `github-install-<id>` records its installation id and the
 /// account's immutable id, so once it serves an Org its tokens are minted
@@ -7582,7 +7605,6 @@ const GITHUB_API_BASE: &str = "https://api.github.com";
 /// repos, and waits for a global admin to assign it
 /// (`PUT /v1/connections/{id}/org`).
 async fn register_installation(
-    st: &AppState,
     connections: &dyn scarab_forge::ForgeConnectionStore,
     sync: &scarab_forge_github::InstallationSync,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
@@ -7647,39 +7669,17 @@ async fn register_installation(
             ),
         }
     }
-    // Unassigned: the repos wait for a global admin, so nothing is homed in
-    // an Org by name alone. Removals still apply.
-    let sync = if org.is_some() {
-        sync.clone()
-    } else {
-        scarab_forge_github::InstallationSync {
-            added: Vec::new(),
-            ..sync.clone()
-        }
-    };
-    let skipped =
-        scarab_forge_github::apply_installation_sync(connections, &conn_id, account, &sync)
-            .await
-            .map_err(registry)?;
-    for repo in &skipped {
-        tracing::warn!(
-            connection = %conn_id,
-            repo = %format!("{}/{}", repo.owner, repo.name),
-            "installation sync skipped a repo of another owner, or one bound through another \
-             org's connection"
-        );
-    }
-    // A new org gets the first-party libraries (ADR-0076 §5).
-    if sync.added.len() > skipped.len() {
-        libraries::offer_defaults_on_bind(st, account).await;
-    }
+    // Nothing is bound here (opt-in): the added repos are reported as
+    // available and wait for an admin to enable them. Removals apply.
+    let removed = scarab_forge_github::apply_installation_removals(connections, &conn_id, sync)
+        .await
+        .map_err(registry)?;
     Ok((
         StatusCode::OK,
         Json(serde_json::json!({
             "registered": {
-                "added": sync.added.len() - skipped.len(),
-                "removed": sync.removed.len(),
-                "skipped": skipped.len(),
+                "available": sync.added.len(),
+                "removed": removed,
                 "org": org,
             },
         })),
@@ -7782,11 +7782,12 @@ fn delivery_assign_refusal(
 
 /// Inbound GitHub webhook ingest (ADR-0010, 0032, 0046): verify the HMAC
 /// signature with the GitHub secret, guard against replays by delivery id,
-/// auto-register installation events into the ForgeConnection registry
-/// (installing the App IS registration), normalize the payload to a canonical
-/// [`Event`](scarab_forge::Event), and durably create the triggered Runs.
-/// Unverified deliveries are rejected; administrative events (e.g. `ping`)
-/// are acknowledged and ignored.
+/// register installation events' connections in the ForgeConnection registry
+/// (their repos are only made available, see [`register_installation`]),
+/// normalize the payload to a canonical [`Event`](scarab_forge::Event), and
+/// durably create the triggered Runs. Unverified deliveries are rejected;
+/// administrative events (e.g. `ping`) and events of a repo that is not
+/// enabled are acknowledged and ignored.
 #[utoipa::path(post, path = "/webhooks/github", summary = "GitHub webhook ingest (HMAC-verified, ADR-0046)", responses((status = 202, description = "delivery accepted"), (status = 401, description = "bad signature")))]
 async fn github_webhook(
     State(st): State<AppState>,
@@ -7822,10 +7823,10 @@ async fn github_webhook(
         ));
     }
 
-    // Installation lifecycle → registry auto-registration (ADR-0046).
+    // Installation lifecycle → the connection's registration (ADR-0046).
     if let Some(sync) = scarab_forge_github::installation_sync(&delivery) {
         if let Some(connections) = st.connections.as_ref() {
-            return register_installation(&st, connections.as_ref(), &sync).await;
+            return register_installation(connections.as_ref(), &sync).await;
         }
         return Ok((
             StatusCode::OK,
@@ -11695,15 +11696,22 @@ pub struct ListConnectionsQuery {
     pub org: Option<String>,
 }
 
-/// `POST /v1/connections/{id}/resync` body: what reconciliation changed.
+/// `POST /v1/connections/{id}/resync` body: what the forge reports, compared
+/// with what is enabled.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ResyncResultDto {
-    /// Repos the forge reports that Scarab did not have bound — now bound.
-    pub bound: Vec<String>,
-    /// Repos the forge reports that were not bound (git-bug 19b0a45): owned
-    /// by another account than the connection's Org, already bound through
-    /// another connection that serves an Org, or reported to a connection
-    /// that serves no Org yet (it binds nothing until it is assigned).
+    /// Repos of the connection's Org the forge reports that are not enabled.
+    /// Re-sync does not enable them; an admin does, from the org's
+    /// repositories page.
+    pub available: Vec<String>,
+    /// Repos that were already Projects, bound through a connection that does
+    /// not serve their owner (unassigned, or another Org's), and now bound
+    /// through this one with their Projects (git-bug 19b0a45).
+    pub moved: Vec<String>,
+    /// Repos the forge reports that are neither available nor moved: owned by
+    /// another account than the connection's Org, already bound through
+    /// another connection that serves an Org, or reported to a connection that
+    /// serves no Org yet.
     pub skipped: Vec<String>,
     /// How many bindings the forge confirms. Reported rather than acted on:
     /// see the handler's note on why re-sync never unbinds.
@@ -12306,21 +12314,28 @@ async fn connection_preflight(
 }
 
 /// Re-sync a connection against the forge (ADR-0060 part C): ask the forge which
-/// repos this credential reaches and bind any Scarab does not have yet.
+/// repos this credential reaches and report which of them are not enabled.
 ///
-/// This is the **healing** path for GitHub, where installing the App *is*
-/// registration and the registry is therefore only as current as the last
-/// `installation_repositories` delivery. A dropped delivery leaves a repo the App
-/// covers with no Project; re-sync notices.
+/// Enabling a repository is opt-in, so re-sync **creates no Project**. A repo
+/// the forge reports that is not bound is listed in `available`; an admin
+/// enables it from the org's repositories page (`POST
+/// /v1/connections/{id}/repos`). A repo an admin disabled therefore stays
+/// disabled.
 ///
-/// It deliberately **only binds**. Unbinding on a forge's say-so would let one
-/// failed API page delete governance — Environments, secrets and RBAC hang off a
+/// The one change it makes is to an existing Project: a repo of this
+/// connection's Org that is bound through a connection that does not serve
+/// its owner (unassigned, or another Org's) moves to this one, with its
+/// Project (git-bug 19b0a45). That is how an Org takes its repos back from a
+/// legacy connection.
+///
+/// It **never unbinds**. Unbinding on a forge's say-so would let one failed
+/// API page delete governance — Environments, secrets and RBAC hang off a
 /// Project — so removal stays an explicit human act. `confirmed` reports the
 /// overlap so a stale binding is still visible.
 #[utoipa::path(
     post,
     path = "/v1/connections/{id}/resync",
-    summary = "Re-bind repos the forge reports for this connection (ADR-0060)",
+    summary = "Report the repos the forge reaches that are not enabled, and move this org's Projects off connections that do not serve it (ADR-0060)",
     params(("id" = String, Path, description = "connection id")),
     responses(
         (status = 200, body = ResyncResultDto),
@@ -12337,7 +12352,7 @@ async fn resync_connection(
     let conn = authorize_connection(&st, &headers, &id).await?;
     let connections = st.connections.as_ref().ok_or(ApiError::NotFound)?;
     // Config-owned connections are read-only here (ADR-0060 part D): their repo
-    // bindings are declared in the `connections:` block, so a binding written by
+    // bindings are declared in the `connections:` block, so a binding moved by
     // re-sync would live outside the source that is authoritative for them —
     // drift by another name. Refuse BEFORE talking to the forge, and say where
     // the change belongs.
@@ -12372,56 +12387,51 @@ async fn resync_connection(
         .into_iter()
         .collect();
 
-    let mut bound = Vec::new();
+    let mut available = Vec::new();
+    let mut moved = Vec::new();
     let mut skipped = Vec::new();
     let mut confirmed = 0usize;
     for repo in reported {
+        let label = format!("{}/{}", repo.owner, repo.name);
         if known.contains(&repo) {
             confirmed += 1;
             continue;
         }
-        // A connection binds only its own Org's repos (git-bug 19b0a45). A
+        // A connection serves only its own Org's repos (git-bug 19b0a45). A
         // credential that reaches another owner's repo does not make it this
-        // Org's. An unassigned connection binds nothing: its repos would be
-        // homed by owner name alone, which is how an account joins a
-        // same-named Org of another forge. A global admin assigns it first.
-        if conn.org.as_deref() != Some(repo.owner.as_str()) {
-            skipped.push(format!("{}/{}", repo.owner, repo.name));
+        // Org's. An unassigned connection serves none: a global admin
+        // assigns it first.
+        if conn.org.as_deref() != Some(repo.owner.as_str()) || is_reserved_org(&repo.owner) {
+            skipped.push(label);
             continue;
         }
-        // A forge account named like one of Scarab's own Orgs is never homed
-        // there (the registry refuses it too); skipping it keeps one such
-        // repo from failing the whole re-sync.
-        if is_reserved_org(&repo.owner) {
-            tracing::warn!(
-                connection = %id,
-                repo = %format!("{}/{}", repo.owner, repo.name),
-                "re-sync skipped a repo whose owner is a reserved org name"
-            );
-            continue;
-        }
-        // Project name = repo name, org = repo owner — the same 1:1 mapping
-        // `apply_installation_sync` uses, so a re-synced Project is
-        // indistinguishable from a webhook-registered one.
-        match connections
-            .bind_repo(&id, &repo, &repo.owner, &repo.name)
+        let existing = connections
+            .resolve(&repo)
             .await
-        {
-            Ok(()) => {}
-            // Bound through another connection that serves an Org: re-sync
-            // moves a repo only off an unassigned one (git-bug 19b0a45).
-            Err(scarab_forge::RegistryError::BoundElsewhere { .. }) => {
-                skipped.push(format!("{}/{}", repo.owner, repo.name));
-                continue;
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        match existing {
+            // Not a Project: available to enable, and left alone.
+            None => available.push(label),
+            // A Project bound through a connection that does not serve its
+            // owner moves here. Same mapping as every bind (Project = repo
+            // name, Org = repo owner), so the Project is unchanged.
+            Some(existing) if existing.connection.org.as_deref() != Some(repo.owner.as_str()) => {
+                match connections
+                    .bind_repo(&id, &repo, &repo.owner, &repo.name)
+                    .await
+                {
+                    Ok(()) => moved.push(label),
+                    Err(scarab_forge::RegistryError::BoundElsewhere { .. }) => skipped.push(label),
+                    Err(e) => return Err(ApiError::BadRequest(e.to_string())),
+                }
             }
-            Err(e) => return Err(ApiError::BadRequest(e.to_string())),
+            // Bound through another connection of this Org: it stays there.
+            Some(_) => skipped.push(label),
         }
-        // A new org gets the first-party libraries (ADR-0076 §5).
-        libraries::offer_defaults_on_bind(&st, &repo.owner).await;
-        bound.push(format!("{}/{}", repo.owner, repo.name));
     }
     Ok(Json(ResyncResultDto {
-        bound,
+        available,
+        moved,
         skipped,
         confirmed,
     }))
@@ -12800,7 +12810,7 @@ fn default_true() -> bool {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct BindRepoResultDto {
     /// The governed Project's natural key — `(owner, name)` in v1 (1 Project : 1
-    /// RepoRef), the same mapping installation auto-registration uses.
+    /// RepoRef), the same mapping every bind uses.
     pub org: String,
     pub project: String,
     /// Did a forge-side webhook get registered (or already exist)?
@@ -12873,11 +12883,12 @@ async fn available_repos(
 /// (ADR-0060 part C).
 ///
 /// There is no `projects` table: a Project *is* a `forge_repos` binding
-/// (ADR-0046), so this endpoint is the repo→Project onboarding flow for any forge
-/// without installation-style auto-registration. After it, the repo appears on
-/// `GET /v1/repos`, can hold Environments and secrets, and its pushes resolve to
-/// a tenant. GitHub keeps binding itself from the `installation` webhook; this is
-/// the Forgejo path.
+/// (ADR-0046), so this endpoint is the repo→Project onboarding flow — "Enable"
+/// on the org's repositories page and "Add repository" on its Connections —
+/// for every forge. After it, the repo appears on `GET /v1/repos`, can hold
+/// Environments and secrets, and its pushes resolve to a tenant. A GitHub
+/// installation makes its repos available but binds none of them, so this is
+/// the GitHub path too.
 ///
 /// Registration is attempted **after** the binding lands and its failure is
 /// *reported, not rolled back*: the binding is the durable governance fact, a
@@ -12951,9 +12962,9 @@ async fn bind_repo(
         }
     }
 
-    // Project name = repo name, org = repo owner — identical to the mapping
-    // `apply_installation_sync` and re-sync use, so a manually-bound Project is
-    // indistinguishable from an auto-registered one.
+    // Project name = repo name, org = repo owner — the mapping every bind uses
+    // (and that GitHub installations used when they bound repos), so a Project
+    // bound here is indistinguishable from an older auto-registered one.
     connections
         .bind_repo(&id, &repo, &repo.owner, &repo.name)
         .await
@@ -13069,7 +13080,8 @@ async fn register_repo_webhook(
 /// The inverse of the bind above, and destructive in the same measure: the
 /// binding is the Project, so its Environments, scoped secrets and RBAC go with
 /// it. That is why re-sync never does this on a forge's say-so and why this is an
-/// explicit, human-addressed endpoint.
+/// explicit, human-addressed endpoint. It is permanent: no installation delivery
+/// or re-sync binds the repo again; only another explicit bind does.
 ///
 /// The forge-side webhook is deliberately **left in place**. Deleting hooks is
 /// not in the port (ADR-0046 exposes registration only), and a stale hook is

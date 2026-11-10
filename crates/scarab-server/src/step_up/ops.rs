@@ -757,9 +757,9 @@ pub static ENV_LEGACY_DELETE: Op = op(
 pub static CONNECTION_RESYNC: Op = op(
     "connection.resync",
     "Resync a forge connection",
-    // Binds every reported-but-unbound repo through the same store call as
-    // `connection.bind_repo`, so it is governed the same way (else it is a
-    // bulk bypass of that crown jewel).
+    // Moves this org's Projects off connections that do not serve it through
+    // the same store call as `connection.bind_repo`, so it is governed the
+    // same way (else it is a bulk bypass of that crown jewel).
     Class::CrownJewel(W),
     "§3 ForgeConnection edits (AMBIG)",
     ADMIN,

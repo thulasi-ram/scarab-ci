@@ -349,9 +349,9 @@ async fn an_installation_does_not_join_an_org_that_has_no_connection() {
         .unwrap()
         .unwrap();
     assert_eq!(conn.org.as_deref(), Some("umbrella"));
-    assert_eq!(
-        pg.repos_of("github-install-10").await.unwrap(),
-        vec![repo("umbrella", "app")]
+    assert!(
+        pg.repos_of("github-install-10").await.unwrap().is_empty(),
+        "an installation binds none of its repos: an admin enables them"
     );
 
     tdb.cleanup().await;

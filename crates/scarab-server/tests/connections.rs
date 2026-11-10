@@ -1,15 +1,17 @@
 //! Feature acceptance for the connections surface (ADR-0060 part C): the
-//! read API global Settings renders, and the GitHub **re-sync** that heals a
-//! registry which drifted from the forge.
+//! read API global Settings renders, and the **re-sync** that compares the
+//! registry with what the forge reaches.
 //!
 //! Two invariants carry the weight:
 //!
 //!  1. **Credential material never leaves.** The DTO says whether the handle
 //!     resolves; the bytes stay put. A health readout that leaked the secret it
 //!     was reporting on would be worse than no readout.
-//!  2. **Re-sync only binds.** A Project is a repo binding, and Environments,
-//!     secrets and RBAC hang off it — so letting a forge API page decide to
-//!     *remove* one would make a transient error destroy governance.
+//!  2. **Re-sync neither creates nor removes a Project.** Enabling a repo is
+//!     opt-in, so what the forge reaches is reported as available; and a
+//!     Project is a repo binding with Environments, secrets and RBAC hanging
+//!     off it, so letting a forge API page *remove* one would make a transient
+//!     error destroy governance.
 //!
 //! Hermetic: InMemoryDb doubles as the connection registry, FakeForge as the
 //! forge, FakeSecrets as the credential provider.
@@ -338,10 +340,11 @@ async fn listing_needs_administer_on_the_org() {
     }
 }
 
+/// Enabling a repo is opt-in: a re-sync reports the repos the forge reaches
+/// that are not enabled, and binds none of them. Before, it bound them all,
+/// so a repo an admin removed came back on the next re-sync.
 #[tokio::test]
-async fn resync_binds_a_repo_whose_webhook_was_missed() {
-    // GitHub covers three repos; Scarab only knows one — the state after a
-    // dropped `installation_repositories` delivery.
+async fn resync_reports_available_repos_and_binds_none() {
     let h = harness(
         &[("acme", "web")],
         Arc::new(FakeForge::new().with_accessible_repos(&[
@@ -354,44 +357,44 @@ async fn resync_binds_a_repo_whose_webhook_was_missed() {
     .await;
     let root = login(&h.app, "root-code").await;
 
-    let result: serde_json::Value = serde_json::from_str(
-        &body_bytes(
-            h.app
-                .clone()
-                .oneshot(authed("POST", "/v1/connections/gh/resync", &root))
-                .await
-                .unwrap(),
+    for _ in 0..2 {
+        let result: serde_json::Value = serde_json::from_str(
+            &body_bytes(
+                h.app
+                    .clone()
+                    .oneshot(authed("POST", "/v1/connections/gh/resync", &root))
+                    .await
+                    .unwrap(),
+            )
+            .await,
         )
-        .await,
-    )
-    .unwrap();
-    let mut bound: Vec<&str> = result["bound"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|b| b.as_str().unwrap())
-        .collect();
-    bound.sort();
-    assert_eq!(bound, vec!["acme/api", "acme/ops"]);
-    assert_eq!(
-        result["confirmed"], 1,
-        "the already-bound repo is confirmed"
-    );
+        .unwrap();
+        let mut available: Vec<&str> = result["available"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b.as_str().unwrap())
+            .collect();
+        available.sort();
+        assert_eq!(available, vec!["acme/api", "acme/ops"], "{result}");
+        assert_eq!(result["moved"], serde_json::json!([]), "{result}");
+        assert_eq!(
+            result["confirmed"], 1,
+            "the already-bound repo is confirmed"
+        );
+    }
 
-    // The healed repos are real Projects now — they resolve, and they appear on
-    // the Repos page, which is the whole point.
+    // Neither is a Project: neither resolves nor appears on the Repos page.
     for name in ["api", "ops"] {
-        let resolved =
+        assert!(
             h.db.resolve(&RepoRef {
                 owner: "acme".into(),
                 name: name.into(),
             })
             .await
             .unwrap()
-            .expect("bound repo resolves to a Project");
-        assert_eq!(
-            (resolved.org.as_str(), resolved.project.as_str()),
-            ("acme", name)
+            .is_none(),
+            "acme/{name} was bound by a re-sync"
         );
     }
     let repos = body_bytes(
@@ -402,22 +405,8 @@ async fn resync_binds_a_repo_whose_webhook_was_missed() {
             .unwrap(),
     )
     .await;
-    assert!(repos.contains("\"project\":\"ops\""), "{repos}");
-
-    // Idempotent: a second re-sync confirms everything and binds nothing.
-    let again: serde_json::Value = serde_json::from_str(
-        &body_bytes(
-            h.app
-                .clone()
-                .oneshot(authed("POST", "/v1/connections/gh/resync", &root))
-                .await
-                .unwrap(),
-        )
-        .await,
-    )
-    .unwrap();
-    assert_eq!(again["bound"], serde_json::json!([]));
-    assert_eq!(again["confirmed"], 3);
+    assert!(!repos.contains("\"project\":\"ops\""), "{repos}");
+    assert!(repos.contains("\"project\":\"web\""), "{repos}");
 }
 
 #[tokio::test]
@@ -1384,10 +1373,10 @@ async fn unbinding_removes_the_project() {
 }
 
 /// Review S4: the reserved-org refusal guarded only the manual bind. A
-/// re-sync binds every repo the forge lists — a forge account named `_forge`
-/// would have homed a Project in Scarab's own credential scope. It is
-/// skipped there, and the registry refuses it on every other path
-/// (installation sync, declarative connections).
+/// re-sync used to bind every repo the forge lists — a forge account named
+/// `_forge` would have homed a Project in Scarab's own credential scope. A
+/// re-sync binds nothing now, and does not offer such a repo as available
+/// either; the registry refuses it on every bind path.
 #[tokio::test]
 async fn no_bind_path_homes_a_repo_in_a_reserved_org() {
     let h = harness(
@@ -1408,24 +1397,27 @@ async fn no_bind_path_homes_a_repo_in_a_reserved_org() {
         .await,
     )
     .unwrap();
-    assert_eq!(result["bound"], serde_json::json!(["acme/api"]), "{result}");
+    assert_eq!(
+        result["available"],
+        serde_json::json!(["acme/api"]),
+        "{result}"
+    );
+    assert_eq!(
+        result["skipped"],
+        serde_json::json!(["_forge/web"]),
+        "{result}"
+    );
     let forge_web = RepoRef {
         owner: "_forge".into(),
         name: "web".into(),
     };
     assert!(h.db.resolve(&forge_web).await.unwrap().is_none());
 
-    // The installation-sync path (GitHub) goes through the same registry.
-    let sync = scarab_forge_github::InstallationSync {
-        installation_id: 1,
-        account_id: None,
-        account: "_forge".into(),
-        added: vec![forge_web.clone()],
-        removed: vec![],
-    };
-    let err = scarab_forge_github::apply_installation_sync(h.db.as_ref(), "gh", "_forge", &sync)
-        .await
-        .expect_err("a reserved org is refused");
+    // The registry refuses it whoever asks.
+    let err =
+        h.db.bind_repo("gh", &forge_web, "_forge", "web")
+            .await
+            .expect_err("a reserved org is refused");
     assert!(
         matches!(err, scarab_forge::RegistryError::ReservedOrg(ref o) if o == "_forge"),
         "{err:?}"
@@ -1783,7 +1775,7 @@ async fn a_forgejo_connection_offers_resync_too() {
         .unwrap();
     assert_eq!(fj["supports_resync"], true);
 
-    // And it works: re-sync binds what the credential reaches.
+    // And it works: re-sync reports what the credential reaches, binding none.
     let resp = h
         .app
         .clone()
@@ -1796,5 +1788,14 @@ async fn a_forgejo_connection_offers_resync_too() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let result: serde_json::Value = serde_json::from_str(&body_bytes(resp).await).unwrap();
-    assert_eq!(result["bound"], serde_json::json!(["acme/web"]));
+    assert_eq!(result["available"], serde_json::json!(["acme/web"]));
+    assert!(h
+        .db
+        .resolve(&RepoRef {
+            owner: "acme".into(),
+            name: "web".into()
+        })
+        .await
+        .unwrap()
+        .is_none());
 }

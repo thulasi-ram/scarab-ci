@@ -946,7 +946,7 @@ async fn unpinning_snapshots_needs_a_step_up_and_pinning_does_not() {
     assert!(!is_step_up(st, &b), "a live window satisfies it: {st} {b}");
 }
 
-/// `connection.resync` binds every reported repo through the same path as
+/// `connection.resync` moves Projects through the same path as
 /// `connection.bind_repo`, so it needs the same window step-up: under
 /// enforcement an Owner without one is refused, exactly like bind_repo.
 #[tokio::test]

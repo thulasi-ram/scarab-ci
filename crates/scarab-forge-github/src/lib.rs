@@ -236,16 +236,18 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
 // Installation webhooks → registry sync (pure)
 // ---------------------------------------------------------------------------
 
-/// The registry effect of a GitHub `installation` / `installation_repositories`
-/// webhook (ADR-0046): installing the App **is** registration. The webhook
-/// route applies this to the `ForgeConnectionStore` via
-/// [`apply_installation_sync`].
+/// What a GitHub `installation` / `installation_repositories` webhook says
+/// changed: the repos the installation now covers (`added`) and the ones it
+/// no longer covers (`removed`). Installing the App registers its connection;
+/// a covered repo becomes a Project only when an admin enables it, so the
+/// webhook route binds none of `added` and applies only `removed`, via
+/// [`apply_installation_removals`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallationSync {
     /// The GitHub App installation the delivery belongs to.
     pub installation_id: u64,
-    /// The account (user/org login) the App was installed on — the default
-    /// Scarab Org for auto-registered Projects.
+    /// The account (user/org login) the App was installed on: the Scarab Org
+    /// its connection serves.
     pub account: String,
     /// The account's immutable GitHub id (`installation.account.id`): a
     /// login can be renamed and taken by another account, this id cannot
@@ -320,40 +322,30 @@ pub fn installation_sync(delivery: &WebhookDelivery) -> Option<InstallationSync>
     }
 }
 
-/// Apply a parsed [`InstallationSync`] to the registry (ADR-0046
-/// auto-registration): added repos bind to `(org, repo.name)` under
-/// `connection_id` (Project name = repo name, 1:1 in v1); removed repos
-/// unbind. Idempotent — replayed deliveries re-apply harmlessly.
+/// Apply the removals of a parsed [`InstallationSync`] to the registry: a
+/// repo the installation no longer covers is unbound from `connection_id`,
+/// which removes its Project. Idempotent: a replayed delivery re-applies
+/// harmlessly.
 ///
-/// Returns the added repos it did **not** bind: one owned by another account
-/// than `org`, or one already bound through a connection of another Org
-/// (git-bug 19b0a45). A delivery is not failed for those; the caller logs
-/// them. A reserved `org` still fails it.
-pub async fn apply_installation_sync(
+/// Additions are not applied. A repo the App covers is available to enable;
+/// it becomes a Project only through an explicit bind, so a later delivery
+/// never re-binds a repo an admin disabled. Returns how many removals named
+/// a repo bound through this connection.
+pub async fn apply_installation_removals(
     store: &dyn scarab_forge::ForgeConnectionStore,
     connection_id: &str,
-    org: &str,
     sync: &InstallationSync,
-) -> Result<Vec<RepoRef>, scarab_forge::RegistryError> {
-    let mut skipped = Vec::new();
-    for repo in &sync.added {
-        if repo.owner != org {
-            skipped.push(repo.clone());
-            continue;
-        }
-        match store.bind_repo(connection_id, repo, org, &repo.name).await {
-            Ok(()) => {}
-            Err(
-                scarab_forge::RegistryError::OrgMismatch { .. }
-                | scarab_forge::RegistryError::BoundElsewhere { .. },
-            ) => skipped.push(repo.clone()),
-            Err(e) => return Err(e),
-        }
-    }
+) -> Result<usize, scarab_forge::RegistryError> {
+    let bound: std::collections::BTreeSet<RepoRef> =
+        store.repos_of(connection_id).await?.into_iter().collect();
+    let mut removed = 0;
     for repo in &sync.removed {
-        store.unbind_repo(connection_id, repo).await?;
+        if bound.contains(repo) {
+            store.unbind_repo(connection_id, repo).await?;
+            removed += 1;
+        }
     }
-    Ok(skipped)
+    Ok(removed)
 }
 
 // ---------------------------------------------------------------------------
