@@ -90,3 +90,89 @@ export function connectionFor<T extends { projects: readonly { org: string; proj
 ): T | null {
   return conns.find((c) => c.projects.some((p) => p.org === org && p.project === repo)) ?? null;
 }
+
+/** What the waiting panel reads from a connection. */
+export interface WaitingLike {
+  id: string;
+  kind: string;
+  web_url: string;
+  projects: readonly RepoLike[];
+}
+
+/**
+ * The GitHub App installation id of a connection the installation webhook
+ * registered (`github-install-<id>`), or null for any other connection.
+ */
+export function installationId(c: { id: string; kind: string }): string | null {
+  if (c.kind !== "github") return null;
+  const m = /^github-install-(\d+)$/.exec(c.id);
+  return m ? m[1]! : null;
+}
+
+/** One line of a waiting connection's facts: a label and its value. */
+export interface WaitingFact {
+  label: string;
+  value: string;
+}
+
+/**
+ * The facts the New organization page lists for a connection that serves no
+ * org: its forge and host, its installation id (GitHub), and the account
+ * that owns the repositories bound through it, when one does. The connection
+ * list does not carry the installation's account login or account id, so
+ * those are named only through bound repositories.
+ */
+export function waitingFacts(c: WaitingLike): WaitingFact[] {
+  const out: WaitingFact[] = [
+    { label: "forge", value: `${forgeName(c.kind)} · ${c.web_url.replace(/^https?:\/\//, "")}` },
+  ];
+  const install = installationId(c);
+  if (install != null) out.push({ label: "installation", value: install });
+  const owner = soleOwner(c.projects);
+  if (owner != null) out.push({ label: "account", value: owner });
+  const n = c.projects.length;
+  out.push({
+    label: "repositories",
+    value: n === 0 ? "none bound" : `${n} bound`,
+  });
+  return out;
+}
+
+/**
+ * The name the Create a new organization form starts with: the account that
+ * owns every repository bound through the connection, or empty.
+ */
+export function newOrgPrefill(c: { projects: readonly RepoLike[] }): string {
+  return soleOwner(c.projects) ?? "";
+}
+
+/**
+ * Why `name` cannot name a new org made from a waiting connection, or null
+ * when it can: `orgNameProblem`, and a name that is already an org's (that
+ * is an assignment, which the other action makes).
+ */
+export function newOrgNameProblem(name: string, orgs: readonly string[]): string | null {
+  const problem = orgNameProblem(name);
+  if (problem != null) return problem;
+  const n = name.trim();
+  return orgs.includes(n) ? `${n} is already an organization. Use Assign to an organization.` : null;
+}
+
+/**
+ * The org an Assign to an organization form starts with: the sole owner of
+ * the connection's bound repositories when that is an org, else the first
+ * org, else empty (there is none to assign to).
+ */
+export function assignDefault(c: { projects: readonly RepoLike[] }, orgs: readonly string[]): string {
+  const owner = soleOwner(c.projects);
+  if (owner != null && orgs.includes(owner)) return owner;
+  return orgs[0] ?? "";
+}
+
+/** The first line of the New organization page's waiting panel, for `n`
+ *  connections. */
+export function waitingIntro(n: number): string {
+  return n === 1
+    ? "Scarab could not prove this account owns an organization of the same name, so it serves none until you choose."
+    : "Scarab could not prove these accounts own organizations of the same names, so they serve none until you choose.";
+}

@@ -27,9 +27,9 @@
 //
 // Each connection serves one org (git-bug 19b0a45): the forge account that owns
 // the repositories it binds. This section lists the connections of the org in
-// the URL. A connection that serves no org yet ("unassigned") is listed to a
-// global admin in a panel of its own, on every org's page, because no org's
-// list includes it.
+// the URL, and only those. A connection that serves no org yet is listed to a
+// global admin on the New organization page (`WaitingConnections`), where it
+// is assigned to an org or makes a new one.
 import { createResource, createSignal, For, Show, type JSX } from "solid-js";
 import { useNavigate } from "@solidjs/router";
 import {
@@ -47,19 +47,23 @@ import {
   type Connection,
 } from "../api/client";
 import {
+  assignDefault,
+  newOrgNameProblem,
+  newOrgPrefill,
   orgNameProblem,
   reposForOrg,
   resyncNote,
-  soleOwner,
-  unassignedConnections,
+  waitingFacts,
+  waitingIntro,
 } from "../connections";
 import { relTime } from "../fmt";
 import { me, refetchMe } from "../session";
 import { FIRST_ORG_SECTION, orgHref } from "../settings-nav";
+import { refetchWaiting, waitingConnections } from "../waiting-connections";
 import FormSection from "./FormSection";
 import Modal, { ModalMessage, ModalSection } from "./Modal";
 import ConfirmDestructive from "./ConfirmDestructive";
-import { Field, Input } from "./Field";
+import { Field, Input, Select } from "./Field";
 import Icon from "./Icon";
 
 /** Where a connection's own management lives, when the forge has such a page. */
@@ -75,13 +79,6 @@ export default function Connections(props: { org: string }) {
   const [conns] = createResource(
     () => ({ org: props.org, epoch: epoch() }),
     (k) => listConnections(k.org),
-  );
-  // Only a global admin is sent unassigned connections; for anyone else the
-  // request is not made.
-  const global = () => me()?.global_admin === true;
-  const [unassigned] = createResource(
-    () => (global() ? { epoch: epoch() } : false),
-    () => listConnections().then(unassignedConnections),
   );
   const [adding, setAdding] = createSignal(false);
   const reload = () => setEpoch((e) => e + 1);
@@ -137,31 +134,6 @@ export default function Connections(props: { org: string }) {
           />
         </Show>
       </div>
-
-      <Show when={global() && (unassigned()?.length ?? 0) > 0}>
-        <div class="panel">
-          <div class="panel-h"><span>Unassigned connections</span></div>
-          <div class="secrets-body">
-            <p class="subtle">
-              <small>
-                These connections serve no organization, so only global admins see them, here
-                on every organization's page. Assign one to the organization that owns its
-                repositories. If its repositories belong to more than one organization, give each
-                organization its own connection and re-sync it there: the repositories move to it
-                with their projects. Then remove this one. For GitHub, install the App on that
-                account. For Forgejo, use Add Forgejo connection on that organization's
-                Connections, or New organization… in the organization menu above if Scarab does
-                not have it yet.
-              </small>
-            </p>
-            <ul class="conn-list">
-              <For each={unassigned()}>
-                {(c) => <ConnectionRow conn={c} onChanged={reload} />}
-              </For>
-            </ul>
-          </div>
-        </div>
-      </Show>
     </>
   );
 }
@@ -348,15 +320,12 @@ function ConnectionRow(props: { conn: Connection; onChanged: () => void }) {
   const [error, setError] = createSignal<string | null>(null);
   const [adding, setAdding] = createSignal(false);
   const [removing, setRemoving] = createSignal(false);
-  const [assigning, setAssigning] = createSignal(false);
 
   // Which connections accept in-product repo management. GitHub does not: its
   // repo selection lives on GitHub (the App's coverage decides it), so an add or
   // remove here would be undone by the next `installation_repositories`
   // delivery. Config-owned connections are read-only wherever they come from.
-  // An unassigned connection serves no org, so there is no owner to bind
-  // repositories for: it offers assign and remove only.
-  const manual = () => c().kind !== "github" && !c().managed_by_config && c().org != null;
+  const manual = () => c().kind !== "github" && !c().managed_by_config;
 
   const resync = async () => {
     setBusy(true);
@@ -447,18 +416,7 @@ function ConnectionRow(props: { conn: Connection; onChanged: () => void }) {
             </a>
           )}
         </Show>
-        <Show when={c().org == null && !c().managed_by_config}>
-          <button
-            class="btn btn-ghost btn-sm"
-            disabled={busy() || assigning()}
-            title="Choose the organization this connection serves"
-            onClick={() => setAssigning(true)}
-          >
-            Assign to org
-          </button>
-        </Show>
-        {/* An unassigned connection binds nothing on a re-sync, so it offers none. */}
-        <Show when={c().supports_resync && !c().managed_by_config && c().org != null}>
+        <Show when={c().supports_resync && !c().managed_by_config}>
           <button
             class="btn btn-ghost btn-sm"
             disabled={busy()}
@@ -484,19 +442,7 @@ function ConnectionRow(props: { conn: Connection; onChanged: () => void }) {
         <span class="subtle">
           id <code class="mono">{c().id}</code>
         </span>
-        {/* Credential health. The most common silent breakage is a database
-            restored without its secrets — invisible until a run fails. */}
-        <span classList={{ "conn-ok": c().credential_present, "conn-bad": !c().credential_present }}>
-          <Icon icon={c().credential_present ? "shield-check" : "alert-triangle"} size={12} />{" "}
-          credential <code class="mono">{c().credential_ref}</code>{" "}
-          {c().credential_present ? "resolves" : "MISSING — the forge cannot be reached"}
-        </span>
-        {/* `null` means no delivery has been recorded, which is unknown rather
-            than broken — a brand-new connection has simply not been used yet. */}
-        <span class="subtle">
-          last delivery{" "}
-          {c().last_delivery_at != null ? relTime(c().last_delivery_at!) : "— none recorded yet"}
-        </span>
+        <HealthFacts conn={c()} />
       </div>
 
       <Show when={c().supports_preflight}>
@@ -548,18 +494,6 @@ function ConnectionRow(props: { conn: Connection; onChanged: () => void }) {
             <Icon icon="plus" size={13} /> Add repository
           </button>
         </div>
-      </Show>
-
-      <Show when={assigning()}>
-        <AssignConnection
-          conn={c()}
-          onAssigned={(org) => {
-            setAssigning(false);
-            setNote(`Assigned to ${org}. It is listed on that organization's Connections page.`);
-            props.onChanged();
-          }}
-          onCancel={() => setAssigning(false)}
-        />
       </Show>
 
       <Show when={removing()}>
@@ -632,30 +566,169 @@ function RemoveConnection(props: {
   );
 }
 
+/** A connection's credential health and its last delivery. */
+function HealthFacts(props: { conn: Connection }) {
+  const c = () => props.conn;
+  return (
+    <>
+      {/* Credential health. The most common silent breakage is a database
+          restored without its secrets — invisible until a run fails. */}
+      <span classList={{ "conn-ok": c().credential_present, "conn-bad": !c().credential_present }}>
+        <Icon icon={c().credential_present ? "shield-check" : "alert-triangle"} size={12} />{" "}
+        credential <code class="mono">{c().credential_ref}</code>{" "}
+        {c().credential_present ? "resolves" : "MISSING — the forge cannot be reached"}
+      </span>
+      {/* `null` means no delivery has been recorded, which is unknown rather
+          than broken — a brand-new connection has simply not been used yet. */}
+      <span class="subtle">
+        last delivery{" "}
+        {c().last_delivery_at != null ? relTime(c().last_delivery_at!) : "— none recorded yet"}
+      </span>
+    </>
+  );
+}
+
 /**
- * Assign an unassigned connection to an org, for a global admin. The org is
- * the account that owns the repositories bound through it, so the field
- * starts with that owner when there is one. The server refuses an org that
- * does not own every bound repository, or one served by another forge, and
- * says why; the reason is shown as it comes.
+ * The connections that serve no org yet, on the New organization page, for a
+ * global admin: a GitHub App installation whose account has the name of an
+ * existing org but whose account id does not prove it is that org's account,
+ * an account whose name cannot be an org's, or a connection made before
+ * connections served orgs. Each is assigned to an existing org or makes a
+ * new one (the same `PUT /v1/connections/{id}/org`: a name no org has yet
+ * creates the org). Hidden when there are none.
+ */
+export function WaitingConnections() {
+  const list = () => (waitingConnections.error ? [] : (waitingConnections.latest ?? []));
+  return (
+    <Show when={list().length > 0}>
+      <div class="panel">
+        <div class="panel-h"><span>Waiting for an organization</span></div>
+        <div class="secrets-body">
+          <p class="subtle">{waitingIntro(list().length)}</p>
+          <p class="subtle">
+            <small>
+              Assign each one to the organization that owns its repositories, or create a new
+              organization from it. Until then it adds no repositories.
+            </small>
+          </p>
+          <ul class="conn-list">
+            <For each={list()}>{(c) => <WaitingRow conn={c} />}</For>
+          </ul>
+        </div>
+      </div>
+    </Show>
+  );
+}
+
+/** One waiting connection: its facts, Assign to an organization, Create a new
+ *  organization from it, and Remove. */
+function WaitingRow(props: { conn: Connection }) {
+  const nav = useNavigate();
+  const c = () => props.conn;
+  const [mode, setMode] = createSignal<"assign" | "create" | null>(null);
+  const [removing, setRemoving] = createSignal(false);
+  // A global admin is sent every org in `admin_orgs`.
+  const orgs = () => [...(me()?.admin_orgs ?? [])].sort();
+
+  // Assigned, it serves that org: refresh the waiting list (and `/v1/me`,
+  // which lists a new org only once asked again), then open the org's
+  // Connections, where it is now listed.
+  const done = async (org: string) => {
+    await refetchMe();
+    void refetchWaiting();
+    nav(orgHref(org, FIRST_ORG_SECTION));
+  };
+  const remove = async () => {
+    await deleteConnection(c().id, c().projects.length > 0);
+    void refetchWaiting();
+  };
+
+  return (
+    <li class="conn">
+      <div class="conn-head">
+        <span class="conn-kind mono">{c().kind}</span>
+        <code class="mono conn-base">{c().id}</code>
+        <Show when={c().managed_by_config}>
+          <span
+            class="conn-tag"
+            title="Provisioned from the server's connections: configuration (Helm scarab.connections / SCARAB_CONNECTIONS) and authoritative there. Set its org there."
+          >
+            managed by configuration
+          </span>
+        </Show>
+        <span class="topbar-spacer" />
+        <Show when={manageUrl(c())}>
+          {(href) => (
+            <a class="btn btn-ghost btn-sm" href={href()} target="_blank" rel="noreferrer">
+              Manage on {c().kind === "github" ? "GitHub" : "the forge"} →
+            </a>
+          )}
+        </Show>
+        <Show when={!c().managed_by_config}>
+          <button
+            class="btn btn-ghost btn-sm"
+            disabled={orgs().length === 0}
+            title={orgs().length === 0 ? "There is no organization to assign it to yet" : undefined}
+            onClick={() => setMode("assign")}
+          >
+            Assign to an organization
+          </button>
+          <button class="btn btn-ghost btn-sm" onClick={() => setMode("create")}>
+            Create a new organization from it
+          </button>
+          <button class="btn btn-danger btn-sm" disabled={removing()} onClick={() => setRemoving(true)}>
+            Remove
+          </button>
+        </Show>
+      </div>
+
+      <div class="conn-facts">
+        <For each={waitingFacts(c())}>
+          {(f) => (
+            <span class="subtle">
+              {f.label} <code class="mono">{f.value}</code>
+            </span>
+          )}
+        </For>
+        <HealthFacts conn={c()} />
+      </div>
+
+      <Show when={mode() === "assign"}>
+        <AssignConnection conn={c()} orgs={orgs()} onAssigned={done} onCancel={() => setMode(null)} />
+      </Show>
+      <Show when={mode() === "create"}>
+        <CreateOrgFromConnection conn={c()} orgs={orgs()} onCreated={done} onCancel={() => setMode(null)} />
+      </Show>
+      <Show when={removing()}>
+        <RemoveConnection conn={c()} onConfirm={remove} onClose={() => setRemoving(false)} />
+      </Show>
+    </li>
+  );
+}
+
+/**
+ * Assign a waiting connection to an existing org. The org is the account
+ * that owns the repositories bound through it, so the choice starts with that
+ * owner when it is an org. The server refuses an org that does not own every
+ * bound repository, one served by another forge, or one no connection
+ * serves, and says why; the reason is shown as it comes.
  */
 function AssignConnection(props: {
   conn: Connection;
-  onAssigned: (org: string) => void;
+  orgs: string[];
+  onAssigned: (org: string) => Promise<void>;
   onCancel: () => void;
 }) {
-  const [org, setOrg] = createSignal(soleOwner(props.conn.projects) ?? "");
+  const [org, setOrg] = createSignal(assignDefault(props.conn, props.orgs));
   const [saving, setSaving] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
-  const problem = () => orgNameProblem(org());
   const save = async () => {
-    if (problem() != null || saving()) return;
+    if (org() === "" || saving()) return;
     setSaving(true);
     setError(null);
     try {
-      const name = org().trim();
-      await assignConnectionOrg(props.conn.id, name);
-      props.onAssigned(name);
+      await assignConnectionOrg(props.conn.id, org());
+      await props.onAssigned(org());
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not assign the connection.");
     } finally {
@@ -664,17 +737,71 @@ function AssignConnection(props: {
   };
   return (
     <div class="typed-confirm">
-      <p>
-        Which organization does <span class="mono">{props.conn.id}</span> serve? Its admins then
-        manage it, and it binds only repositories that organization owns.
-      </p>
-      <Field label="Organization" error={org().trim() !== "" ? problem() : null}>
+      <Field
+        label="Organization"
+        help="Its admins then manage the connection, and it binds only repositories that organization owns."
+      >
+        <Select mono aria-label="Organization to assign" value={org()} onValue={setOrg}>
+          <For each={props.orgs}>{(o) => <option value={o}>{o}</option>}</For>
+        </Select>
+      </Field>
+      <Show when={error()}>
+        <p class="error">{error()}</p>
+      </Show>
+      <div class="modal-actions">
+        <button class="btn btn-primary btn-sm" disabled={saving() || org() === ""} onClick={() => void save()}>
+          {saving() ? "Assigning…" : "Assign"}
+        </button>
+        <button class="btn btn-ghost btn-sm" onClick={() => props.onCancel()}>
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Make a new org from a waiting connection: the same assignment, to a name no
+ * org has yet, which creates the org. The name starts with the account that
+ * owns the connection's bound repositories, when one does.
+ */
+function CreateOrgFromConnection(props: {
+  conn: Connection;
+  orgs: string[];
+  onCreated: (org: string) => Promise<void>;
+  onCancel: () => void;
+}) {
+  const [name, setName] = createSignal(newOrgPrefill(props.conn));
+  const [saving, setSaving] = createSignal(false);
+  const [error, setError] = createSignal<string | null>(null);
+  const problem = () => newOrgNameProblem(name(), props.orgs);
+  const save = async () => {
+    if (problem() != null || saving()) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const org = name().trim();
+      await assignConnectionOrg(props.conn.id, org);
+      await props.onCreated(org);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not create the organization.");
+    } finally {
+      setSaving(false);
+    }
+  };
+  return (
+    <div class="typed-confirm">
+      <Field
+        label="New organization"
+        help="The forge account that owns the repositories, by its name on the forge."
+        error={name().trim() !== "" ? problem() : null}
+      >
         <Input
           mono
-          aria-label="Organization to assign"
+          aria-label="New organization name"
           placeholder="acme"
-          value={org()}
-          onValue={setOrg}
+          value={name()}
+          onValue={setName}
           onKeyDown={(e) => {
             if (e.key === "Enter") void save();
           }}
@@ -685,12 +812,8 @@ function AssignConnection(props: {
         <p class="error">{error()}</p>
       </Show>
       <div class="modal-actions">
-        <button
-          class="btn btn-primary btn-sm"
-          disabled={saving() || problem() != null}
-          onClick={() => void save()}
-        >
-          {saving() ? "Assigning…" : "Assign"}
+        <button class="btn btn-primary btn-sm" disabled={saving() || problem() != null} onClick={() => void save()}>
+          {saving() ? "Creating…" : "Create organization"}
         </button>
         <button class="btn btn-ghost btn-sm" onClick={() => props.onCancel()}>
           Cancel
