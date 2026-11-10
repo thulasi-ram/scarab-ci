@@ -161,22 +161,22 @@ its own connection first.
 
 ## Settings
 
-The web UI's settings page has a sidebar with up to three groups, and each section has its own
-address:
+The web UI has up to three settings pages, each with its own sidebar, and each section has its
+own address. The user menu links the pages you may use:
 
-- **Your account**, for everyone, under `/settings/<section>`: Profile (your sign-in accounts),
+- **Account settings**, for everyone, under `/settings/<section>`: Profile (your sign-in accounts),
   Security (your passkeys and security events), [API tokens](/scarab-ci/usage/api-tokens/)
   (your own tokens) and Appearance.
 - **Organization settings**, for the admins of an org, under `/orgs/<org>/settings/<section>`:
   Connections, Members, Environments, Plugins, Libraries, Secrets, API tokens (every token issued
-  in the org), Security and Event log. `/orgs/<org>/settings` opens Connections. An admin of several orgs switches org at the top
-  of the group.
+  in the org), Security and Event log. `/orgs/<org>/settings` opens Connections. The org dropdown at the top of the sidebar
+  switches org and keeps the section.
 - **Server administration**, for global admins, under `/settings/server/<section>`: Connect a
   forge.
 
 `/settings` opens the first org you administer, or your profile. The old addresses (`/account`,
 `/account/security`, `/settings/libraries/review`) redirect to the new ones. The UI shows only
-the groups you may use; the server checks every request.
+the pages you may use; the server checks every request.
 
 ### Appearance
 
