@@ -46,8 +46,7 @@ import Modal, { ModalMessage, ModalSection } from "../components/Modal";
 import ConfirmDestructive from "../components/ConfirmDestructive";
 import { Checkbox, Field, Input, Select } from "../components/Field";
 import { addToList } from "../identities";
-import ScopedSecrets from "../components/ScopedSecrets";
-import SecretMatrixEditor from "../components/SecretMatrixEditor";
+import SecretKeyList from "../components/SecretKeyList";
 import Doodle from "../components/Doodle";
 import AsciiScene from "../components/AsciiScene";
 import { mergeRefused, runEnvironmentOptions, runListFilter } from "../runs-filter";
@@ -168,6 +167,10 @@ export default function RepoView() {
   // Deploys toggle (`?deploy=1`): only deploy Runs — a pipeline or Step marked
   // `deploy: true`. Server-side, like the Environment.
   const deploysOnly = () => one(search.deploy) === "1";
+  // The Secrets tab's Environment (`?secret_env=`); its own key, so the Runs
+  // tab's Environment filter does not carry over.
+  const secretEnv = () => one(search.secret_env);
+  const setSecretEnv = filterSetter("secret_env");
   const setDeploysOnly = (on: boolean) => filterSetter("deploy")(on ? "1" : "");
 
   // Only this repo's tenanted runs, straight from the per-repo endpoint.
@@ -210,10 +213,6 @@ export default function RepoView() {
    *  prefilled). */
   const [envDialog, setEnvDialog] = createSignal<string | undefined>(undefined);
   const [envEpoch, setEnvEpoch] = createSignal(0); // bump to refetch the env list after a create
-  // The two secret panels read the same store through separate fetches; each
-  // bumps the OTHER's epoch after a write so neither shows a stale view.
-  const [secretListEpoch, setSecretListEpoch] = createSignal(0);
-  const [secretMatrixEpoch, setSecretMatrixEpoch] = createSignal(0);
 
   // A 1s heartbeat so in-flight runs show a live, ticking elapsed time. Terminal
   // runs use their frozen `duration_ms` and ignore this.
@@ -612,18 +611,11 @@ export default function RepoView() {
 
       {/* ---- Secrets ---- */}
       <Show when={tab() === "secrets"}>
-        <ScopedSecrets
-          scope={{ org: org(), repo: repo() }}
-          title={`Secrets · ${org()}/${repo()}`}
-          showInherited
-          epoch={secretListEpoch()}
-          onChange={() => setSecretMatrixEpoch((n) => n + 1)}
-        />
-        <SecretMatrixEditor
+        <SecretKeyList
           org={org()}
           repo={repo()}
-          epoch={secretMatrixEpoch()}
-          onChange={() => setSecretListEpoch((n) => n + 1)}
+          environment={secretEnv()}
+          onEnvironment={setSecretEnv}
         />
       </Show>
 
