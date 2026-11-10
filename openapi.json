@@ -4351,6 +4351,156 @@
         ]
       }
     },
+    "/v1/orgs/{org}/plugins/{name}/upgrade": {
+      "post": {
+        "tags": [
+          "Plugins"
+        ],
+        "summary": "Upgrade a plugin installation to a reviewed manifest and image (ADR-0072 §10)",
+        "description": "Same-or-narrower (nothing added, image of the same repository) needs no\nstep-up; wider is confirmed like an install (ADR-0072 §10). The server\ndecides which from the installed manifest and the one it reads here.\n409 when the installed manifest is no longer `expected_current_sha256`,\nand when the source no longer reads as `manifest_sha256`.",
+        "operationId": "upgrade_plugin",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "installation name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpgradePluginRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginInstallationDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "a bad image or source, another plugin's manifest, a manifest that is not admissible, or an image the manifest does not name"
+          },
+          "403": {
+            "description": "not an org admin, a step-up is required (a wider manifest or another image repository), a host Scarab does not fetch from, or a private repository outside the org — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such installation, or plugins not configured"
+          },
+          "409": {
+            "description": "the installation changed since the review, or the source no longer reads as the reviewed manifest"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/plugins/{name}/upgrade-fetch": {
+      "post": {
+        "tags": [
+          "Plugins"
+        ],
+        "summary": "Fetch a plugin manifest to review an upgrade against the installed one (ADR-0072 §10)",
+        "operationId": "fetch_plugin_upgrade",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "installation name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FetchPluginUpgradeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FetchedPluginUpgradeDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "no source or commit, a bad source or image, a fetch that failed, a file that is not an admissible plugin manifest, another plugin's manifest, or an image the manifest does not name"
+          },
+          "403": {
+            "description": "not an org admin, a host Scarab does not fetch from, or a private repository outside the org"
+          },
+          "404": {
+            "description": "no such installation, or plugins not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
     "/v1/orgs/{org}/policies": {
       "get": {
         "tags": [
@@ -10464,6 +10614,41 @@
         },
         "additionalProperties": false
       },
+      "FetchPluginUpgradeRequest": {
+        "type": "object",
+        "description": "`POST /v1/orgs/{org}/plugins/{name}/upgrade-fetch`: which manifest to\nread for the upgrade. Either `source`, or `commit` to read the file the\ninstallation's recorded source names at that commit.",
+        "properties": {
+          "commit": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A full commit id (40 or 64 lowercase hex). Read when `source` is\nomitted; the installation must have a recorded source then. There is\nno branch resolution: the admin names the commit."
+          },
+          "connection": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A ForgeConnection id to read it through. Omitted with `source`: read\nanonymously. Omitted with `commit`: the connection the recorded source\nwas read through."
+          },
+          "image": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The image the upgrade would run, `<repository>@sha256:<64 hex>`. When\ngiven, it is checked against the new manifest's named repository, and\na move to another repository counts as a widening."
+          },
+          "source": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The new manifest's source, `<host>/<owner>/<repo>//<path>@<commit>`.\nOmitted: the recorded source's file at `commit`."
+          }
+        },
+        "additionalProperties": false
+      },
       "FetchedLibraryDto": {
         "type": "object",
         "required": [
@@ -10540,6 +10725,66 @@
           "source": {
             "type": "string",
             "description": "The source as read, pinned to its commit."
+          }
+        }
+      },
+      "FetchedPluginUpgradeDto": {
+        "type": "object",
+        "description": "A manifest read for an upgrade, and what it changes. Nothing is stored.",
+        "required": [
+          "source",
+          "content",
+          "manifest",
+          "manifest_sha256",
+          "current_manifest_sha256",
+          "current_image",
+          "diff",
+          "widenings",
+          "needs_step_up"
+        ],
+        "properties": {
+          "connection": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The connection it was read through: pass it to `…/upgrade`."
+          },
+          "content": {
+            "type": "string",
+            "description": "The file as read."
+          },
+          "current_image": {
+            "type": "string"
+          },
+          "current_manifest_sha256": {
+            "type": "string",
+            "description": "The installed manifest's hash: pass it to `…/upgrade` as\n`expected_current_sha256`."
+          },
+          "diff": {
+            "$ref": "#/components/schemas/ManifestDiffDto"
+          },
+          "manifest": {
+            "$ref": "#/components/schemas/PluginManifestDto"
+          },
+          "manifest_sha256": {
+            "type": "string",
+            "description": "Pass it to `…/upgrade` as `manifest_sha256`."
+          },
+          "needs_step_up": {
+            "type": "boolean",
+            "description": "Whether `…/upgrade` asks for a step-up: exactly when it widens. Decided\nagain by the server at the upgrade."
+          },
+          "source": {
+            "type": "string",
+            "description": "The source as read, pinned to its commit: pass it to `…/upgrade`."
+          },
+          "widenings": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Each thing the upgrade adds that the installed version did not ask\nfor, as a sentence. Empty = the upgrade is same-or-narrower."
           }
         }
       },
@@ -11029,6 +11274,79 @@
           },
           "subject": {
             "type": "string"
+          }
+        }
+      },
+      "ManifestDiffDto": {
+        "type": "object",
+        "description": "The installed manifest against the new one, group by group.",
+        "required": [
+          "capabilities",
+          "connections",
+          "auth_schemes",
+          "read_rules",
+          "config_keys",
+          "gates",
+          "image"
+        ],
+        "properties": {
+          "auth_schemes": {
+            "$ref": "#/components/schemas/ManifestDiffGroupDto",
+            "description": "`<slot>: <scheme>`."
+          },
+          "capabilities": {
+            "$ref": "#/components/schemas/ManifestDiffGroupDto"
+          },
+          "config_keys": {
+            "$ref": "#/components/schemas/ManifestDiffGroupDto"
+          },
+          "connections": {
+            "$ref": "#/components/schemas/ManifestDiffGroupDto",
+            "description": "Connection slot names."
+          },
+          "gates": {
+            "$ref": "#/components/schemas/ManifestDiffGroupDto",
+            "description": "Gate names; a gate whose definition changed is both removed and\nadded."
+          },
+          "image": {
+            "$ref": "#/components/schemas/ManifestDiffGroupDto",
+            "description": "The image repository the manifest names."
+          },
+          "read_rules": {
+            "$ref": "#/components/schemas/ManifestDiffGroupDto",
+            "description": "`<slot>: <method> <path>[ ?<query keys>]`. One more allowed query key\nis a new rule."
+          }
+        }
+      },
+      "ManifestDiffGroupDto": {
+        "type": "object",
+        "description": "One group of an upgrade's manifest diff.",
+        "required": [
+          "added",
+          "removed",
+          "unchanged"
+        ],
+        "properties": {
+          "added": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Only in the new manifest."
+          },
+          "removed": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Only in the installed manifest."
+          },
+          "unchanged": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "In both."
           }
         }
       },
@@ -12186,6 +12504,20 @@
           "runtime_status": {
             "$ref": "#/components/schemas/RuntimeStatusDto"
           },
+          "source": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Where the approved manifest was read,\n`<host>/<owner>/<repo>//<path>@<commit>`. Absent for an installation\nmade before the source was recorded."
+          },
+          "source_connection": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The ForgeConnection the source was read through; absent = read\nanonymously, or not recorded."
+          },
           "state": {
             "$ref": "#/components/schemas/InstallationStateDto"
           },
@@ -12237,6 +12569,13 @@
               "$ref": "#/components/schemas/GateDefinitionDto"
             },
             "description": "The gates the plugin resolves (ADR-0076 §7), by name; empty without\n`resolve_gates`."
+          },
+          "image": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The image repository the plugin ships as, when the manifest names\none: an install or upgrade must run an image of it. Absent = the\nmanifest does not name its image, so any repository is accepted."
           },
           "plugin": {
             "type": "string"
@@ -15002,6 +15341,41 @@
               "string",
               "null"
             ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "UpgradePluginRequest": {
+        "type": "object",
+        "description": "`POST /v1/orgs/{org}/plugins/{name}/upgrade`.",
+        "required": [
+          "image",
+          "source",
+          "manifest_sha256",
+          "expected_current_sha256"
+        ],
+        "properties": {
+          "connection": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "expected_current_sha256": {
+            "type": "string",
+            "description": "The installed manifest's hash the diff was made against; 409 when the\ninstallation has changed since."
+          },
+          "image": {
+            "type": "string",
+            "description": "`<repository>@sha256:<64 hex>`."
+          },
+          "manifest_sha256": {
+            "type": "string",
+            "description": "The new manifest's hash the admin reviewed; 409 when the source no\nlonger reads as it."
+          },
+          "source": {
+            "type": "string",
+            "description": "The new manifest's source, as `…/upgrade-fetch` returned it. Read\nagain here."
           }
         },
         "additionalProperties": false

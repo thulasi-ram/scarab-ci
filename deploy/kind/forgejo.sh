@@ -339,6 +339,21 @@ PY
 )"
 mkdir -p "$state/libs"
 printf '%s' "$clone_dev" > "$state/libs/clone.yaml"
+# The Argo CD manifest names its published image repository, and an install
+# refuses an image of any other; the stack runs the locally built image, so
+# the seeded copy names that repository instead (plugin-verify.sh's default).
+argocd_repo="${PLUGIN_VERIFY_REPO:-scarab.local/scarab-plugin-argocd}"
+argocd_dev="$(python3 -I - "$repo_root/crates/scarab-plugin-argocd/manifest.json" "$argocd_repo" <<'PY'
+import json, sys
+path, repo = sys.argv[1], sys.argv[2]
+with open(path) as f:
+    m = json.load(f)
+if "image" not in m:
+    sys.exit("crates/scarab-plugin-argocd/manifest.json: expected an image field")
+m["image"] = repo
+sys.stdout.write(json.dumps(m, indent=2) + "\n")
+PY
+)"
 seeded_owners=""
 for o in "$owner" "$dev_org" "$verify_org"; do
   case " $seeded_owners " in *" $o "*) continue ;; esac
@@ -351,8 +366,7 @@ for o in "$owner" "$dev_org" "$verify_org"; do
   REPO_OWNER="$o" ensure_repo "$libs_repo" true
   REPO_OWNER="$o" put_file "$libs_repo" "clone.yaml" "$clone_dev"
   REPO_OWNER="$o" put_file "$libs_repo" "notify.yaml" "$(cat "$repo_root/.scarab/lib/notify.yaml")"
-  REPO_OWNER="$o" put_file "$libs_repo" "argocd/manifest.json" \
-    "$(cat "$repo_root/crates/scarab-plugin-argocd/manifest.json")"
+  REPO_OWNER="$o" put_file "$libs_repo" "argocd/manifest.json" "$argocd_dev"
   commit="$(api "$base/api/v1/repos/$o/$libs_repo/branches/main" \
     | python3 -I -c 'import json,sys;print(json.load(sys.stdin)["commit"]["id"])')"
   [ -n "$commit" ] || die "could not read the commit of $o/$libs_repo"

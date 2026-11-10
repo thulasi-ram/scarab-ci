@@ -1293,6 +1293,7 @@ fn plugin_installation() -> scarab_plugin::PluginInstallation {
         image: format!("ghcr.io/acme/argocd@sha256:{}", "a".repeat(64)),
         manifest: scarab_plugin::PluginManifest {
             plugin: "argocd".into(),
+            image: None,
             capabilities: vec![scarab_plugin::PluginCapability::UseConnection],
             connections: vec![scarab_plugin::ConnectionSlot {
                 name: "argocd".into(),
@@ -1307,6 +1308,8 @@ fn plugin_installation() -> scarab_plugin::PluginInstallation {
             gates: Default::default(),
         },
         manifest_sha256: "0".repeat(64),
+        source: None,
+        source_connection: None,
         config: Default::default(),
         state: scarab_plugin::InstallationState::Enabled,
         state_version: 0,
@@ -1400,5 +1403,255 @@ async fn moving_plugin_storage_needs_a_step_up_and_adding_or_removing_does_not()
         .await;
     assert_ok(st, &b);
     assert_eq!(stored().await, Some(claim("state-a")));
+    tdb.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------
+// Plugin upgrade (ADR-0072 §10)
+// ---------------------------------------------------------------------------
+
+/// The Argo CD manifest at `commit` (40 hex) of this repository.
+fn argocd_at(commit: char) -> String {
+    format!(
+        "github.com/thulasi-ram/scarab-ci//crates/scarab-plugin-argocd/manifest.json@{}",
+        commit.to_string().repeat(40)
+    )
+}
+
+fn argocd_manifest_with(edit: impl FnOnce(&mut Value)) -> String {
+    let mut m: Value = serde_json::from_str(scarab_server::test_support::ARGOCD_MANIFEST).unwrap();
+    edit(&mut m);
+    m.to_string()
+}
+
+/// A same-or-narrower upgrade (a read rule removed, the image a new digest
+/// of the same repository) needs no step-up. A wider one (a read rule
+/// added) asks for one, every time,
+/// and the human confirms what widens — decided by the server from the
+/// manifests, whatever the client says. A refused upgrade writes nothing;
+/// once confirmed, it goes through and the version it replaced records the
+/// confirmation.
+#[tokio::test]
+async fn a_narrower_plugin_upgrade_needs_no_step_up_and_a_wider_one_does() {
+    use scarab_plugin::PluginStore;
+    use scarab_server::test_support::{manifest_sha256, StaticFetcher, ARGOCD_MANIFEST};
+
+    let Some(tdb) = fresh_db().await else { return };
+    let pg = Arc::new(PostgresDb::with_pool(tdb.pool.clone()));
+    pg.migrate().await.unwrap();
+    let repo = "ghcr.io/thulasi-ram/scarab-plugin-argocd";
+    let digest = |c: char| format!("{repo}@sha256:{}", c.to_string().repeat(64));
+    let mut installed = plugin_installation();
+    installed.manifest = serde_json::from_str(ARGOCD_MANIFEST).unwrap();
+    installed.manifest_sha256 = manifest_sha256(ARGOCD_MANIFEST);
+    installed.image = digest('a');
+    pg.install(&installed).await.unwrap();
+
+    let narrower = argocd_manifest_with(|m| {
+        m["connections"][0]["read_rules"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|r| r["path"] != "/api/version")
+    });
+    let wider = argocd_manifest_with(|m| {
+        m["connections"][0]["read_rules"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({ "method": "GET", "path": "/api/v1/account" }))
+    });
+    let fetcher = Arc::new(StaticFetcher::new());
+    fetcher.serve(&argocd_at('c'), &narrower);
+    fetcher.serve(&argocd_at('d'), &wider);
+    let (plugins, f) = (pg.clone(), fetcher.clone());
+    let h = harness_with(move |st| {
+        st.with_plugins(
+            plugins,
+            scarab_server::plugins::PluginPolicy {
+                enabled: true,
+                namespace: "scarab-plugins".into(),
+                dev_allow_tag: false,
+            },
+        )
+        .with_library_fetcher(f)
+    });
+    let (s, mut soft) = signed_in_admin(&h).await;
+    let uri = "/v1/orgs/acme/plugins/argocd/upgrade";
+    let body = |commit: char, manifest: &str, current: &str, image: String| {
+        json!({
+            "image": image,
+            "source": argocd_at(commit),
+            "manifest_sha256": manifest_sha256(manifest),
+            "expected_current_sha256": current,
+        })
+    };
+    let stored_sha = || async {
+        pg.installation("acme", "argocd")
+            .await
+            .unwrap()
+            .unwrap()
+            .manifest_sha256
+    };
+
+    // Narrower, a new digest of the same repository: no step-up.
+    let (st, b) = h
+        .cookie(
+            "POST",
+            uri,
+            Some(body(
+                'c',
+                &narrower,
+                &manifest_sha256(ARGOCD_MANIFEST),
+                digest('b'),
+            )),
+            &s,
+        )
+        .await;
+    assert_ok(st, &b);
+    assert_eq!(stored_sha().await, manifest_sha256(&narrower));
+
+    // Wider: always asks, and the human confirms the rule it adds.
+    let wide = body('d', &wider, &manifest_sha256(&narrower), digest('b'));
+    let (st, b) = h.cookie("POST", uri, Some(wide.clone()), &s).await;
+    assert_step_up(st, &b, "action");
+    assert_eq!(b["op"], "plugin.upgrade", "{b}");
+    let changes = b["summary"]["changes"].to_string();
+    assert!(
+        changes.contains("adds read rule `argocd: GET /api/v1/account`"),
+        "{changes}"
+    );
+    assert!(
+        changes.contains("adds read rule `argocd: GET /api/version`"),
+        "{changes}"
+    );
+    assert_eq!(stored_sha().await, manifest_sha256(&narrower));
+
+    // A client's claim that it is narrower is no part of the request.
+    let mut claimed = wide.clone();
+    claimed["needs_step_up"] = json!(false);
+    let (st, b) = h.cookie("POST", uri, Some(claimed), &s).await;
+    assert!(st.is_client_error() && st != StatusCode::OK, "{st} {b}");
+    assert_eq!(stored_sha().await, manifest_sha256(&narrower));
+
+    // An image of another repository: the Argo CD manifest names its
+    // repository, so the move is refused outright, before any step-up (the
+    // next test moves a plugin whose manifest names none).
+    let moved = body(
+        'c',
+        &narrower,
+        &manifest_sha256(&narrower),
+        format!("ghcr.io/thulasi-ram/other@sha256:{}", "c".repeat(64)),
+    );
+    let (st, b) = h.cookie("POST", uri, Some(moved), &s).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+
+    // Confirmed, the wider upgrade goes through.
+    let (st, b) = h.cookie("POST", uri, Some(wide.clone()), &s).await;
+    assert_step_up(st, &b, "action");
+    let (st, conf) = h.answer(&s, &mut soft, &b["challenge"]).await;
+    assert_eq!(st, StatusCode::OK, "{conf}");
+    let (st, b) = h.cookie("POST", uri, Some(wide), &s).await;
+    assert_ok(st, &b);
+    assert_eq!(stored_sha().await, manifest_sha256(&wider));
+    let history = pg.installation_versions(&installed.id).await.unwrap();
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0].step_up_ref, None);
+    assert!(history[1].step_up_ref.is_some(), "{history:?}");
+    tdb.cleanup().await;
+}
+
+/// A manifest that names no image: the same manifest under an image of
+/// another repository is new code from elsewhere, so it asks for a step-up.
+#[tokio::test]
+async fn moving_a_plugin_to_another_image_repository_needs_a_step_up() {
+    use scarab_plugin::PluginStore;
+    use scarab_server::test_support::StaticFetcher;
+
+    let Some(tdb) = fresh_db().await else { return };
+    let pg = Arc::new(PostgresDb::with_pool(tdb.pool.clone()));
+    pg.migrate().await.unwrap();
+    let installed = plugin_installation();
+    pg.install(&installed).await.unwrap();
+    let source = format!("github.com/acme/argocd//manifest.json@{}", "1".repeat(40));
+    let file = serde_json::to_string(&installed.manifest).unwrap();
+    let fetcher = Arc::new(StaticFetcher::new());
+    fetcher.serve(&source, &file);
+    let (plugins, f) = (pg.clone(), fetcher.clone());
+    let h = harness_with(move |st| {
+        st.with_plugins(
+            plugins,
+            scarab_server::plugins::PluginPolicy {
+                enabled: true,
+                namespace: "scarab-plugins".into(),
+                dev_allow_tag: false,
+            },
+        )
+        .with_library_fetcher(f)
+    });
+    let (s, _soft) = signed_in_admin(&h).await;
+    let sha = scarab_server::plugins::manifest_sha256(&installed.manifest);
+    // The fixture's stored hash is a placeholder: compare against it.
+    let body = |image: String| {
+        json!({
+            "image": image,
+            "source": source,
+            "manifest_sha256": sha,
+            "expected_current_sha256": installed.manifest_sha256,
+        })
+    };
+    let (st, b) = h
+        .cookie(
+            "POST",
+            "/v1/orgs/acme/plugins/argocd/upgrade-fetch",
+            Some(json!({ "source": source, "image": format!("ghcr.io/elsewhere/argocd@sha256:{}", "c".repeat(64)) })),
+            &s,
+        )
+        .await;
+    assert_ok(st, &b);
+    assert_eq!(b["needs_step_up"], json!(true), "{b}");
+    assert_eq!(
+        b["widenings"],
+        json!(["moves the image from `ghcr.io/acme/argocd` to `ghcr.io/elsewhere/argocd`"])
+    );
+    let (st, b) = h
+        .cookie(
+            "POST",
+            "/v1/orgs/acme/plugins/argocd/upgrade",
+            Some(body(format!(
+                "ghcr.io/elsewhere/argocd@sha256:{}",
+                "c".repeat(64)
+            ))),
+            &s,
+        )
+        .await;
+    assert_step_up(st, &b, "action");
+    assert!(
+        b["summary"]["changes"]
+            .to_string()
+            .contains("moves the image"),
+        "{b}"
+    );
+    assert_eq!(
+        pg.installation("acme", "argocd")
+            .await
+            .unwrap()
+            .unwrap()
+            .image,
+        installed.image
+    );
+    // A new digest of the same repository, with the same manifest, is
+    // same-or-narrower: it records the source, with no step-up.
+    let (st, b) = h
+        .cookie(
+            "POST",
+            "/v1/orgs/acme/plugins/argocd/upgrade",
+            Some(body(format!(
+                "ghcr.io/acme/argocd@sha256:{}",
+                "d".repeat(64)
+            ))),
+            &s,
+        )
+        .await;
+    assert_ok(st, &b);
+    assert_eq!(b["source"], json!(source));
     tdb.cleanup().await;
 }

@@ -41,6 +41,7 @@ fn installation(org: &str, name: &str, id: &str) -> PluginInstallation {
         image: format!("ghcr.io/acme/argocd@sha256:{}", "a".repeat(64)),
         manifest: PluginManifest {
             plugin: "argocd".into(),
+            image: None,
             capabilities: vec![PluginCapability::UseConnection],
             connections: vec![ConnectionSlot {
                 name: "argocd".into(),
@@ -55,6 +56,8 @@ fn installation(org: &str, name: &str, id: &str) -> PluginInstallation {
             gates: Default::default(),
         },
         manifest_sha256: "0".repeat(64),
+        source: None,
+        source_connection: None,
         config: BTreeMap::new(),
         state: InstallationState::Enabled,
         state_version: 0,

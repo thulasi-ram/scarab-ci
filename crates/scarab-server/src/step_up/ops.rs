@@ -1175,6 +1175,16 @@ pub static PLUGIN_FETCH: Op = op(
     &[],
     &["path:org", "body:/source"],
 );
+pub static PLUGIN_UPGRADE_FETCH: Op = op(
+    "plugin.upgrade_fetch",
+    "Fetch a plugin manifest to review an upgrade",
+    Class::NotGoverned("reads a manifest and compares it with the installed one; changes nothing"),
+    "ADR-0072 §10",
+    ADMIN,
+    OrgOf::Path("org"),
+    &[],
+    &["path:org", "path:name"],
+);
 pub static PLUGIN_INSTALL: Op = op(
     "plugin.install",
     "Install a plugin",
@@ -1309,6 +1319,22 @@ pub static PRIVILEGE_GRANT_PUT: Op = op(
     OrgOf::Path("org"),
     &[],
     &["path:org", "path:env", "path:project"],
+);
+pub static PLUGIN_UPGRADE: Op = op(
+    "plugin.upgrade",
+    "Upgrade a plugin",
+    Class::Conditional {
+        mode: A,
+        rule: "the new manifest asks for a capability, connection slot, auth scheme, read rule \
+               or gate the installed one did not, stops naming its image or names another, or \
+               the image moves to another repository; a same-or-narrower upgrade is exempt",
+    },
+    "§3 plugin upgrade (ADR-0072 §10: same-or-narrower is one admin's click, wider is \
+     governed like an install)",
+    ADMIN,
+    OrgOf::Path("org"),
+    &[],
+    &["path:org", "path:name", "body:/image"],
 );
 pub static PLUGIN_STORAGE_PUT: Op = op(
     "plugin.storage.put",

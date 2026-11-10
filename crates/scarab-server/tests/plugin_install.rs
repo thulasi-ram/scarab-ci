@@ -425,18 +425,17 @@ async fn a_plugin_installs_only_by_digest_and_only_while_plugins_are_on() {
     }
     assert_eq!(installed(&apps.public, "acme").await, Vec::<String>::new());
 
-    // Another repository, by digest, installs like Scarab's own.
-    let fork = format!("ghcr.io/someone-else/argocd-fork@sha256:{}", "b".repeat(64));
+    // By digest, it installs from the repository its manifest names.
     let (status, body) = call(
         &apps.public,
         "POST",
         "/v1/orgs/acme/plugins",
         None,
-        Some(argocd_install_body("fork", &fork)),
+        Some(argocd("argocd-a")),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
-    assert_eq!(body["image"], json!(fork));
+    assert_eq!(body["image"], json!(image()));
 
     // With SCARAB_PLUGINS=off every install is refused.
     let off = router(state(pg, false));
@@ -449,7 +448,7 @@ async fn a_plugin_installs_only_by_digest_and_only_while_plugins_are_on() {
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(installed(&off, "acme").await, vec!["fork".to_string()]);
+    assert_eq!(installed(&off, "acme").await, vec!["argocd-a".to_string()]);
     tdb.cleanup().await;
 }
 
@@ -1435,5 +1434,383 @@ async fn a_fetch_lists_the_org_s_installations_of_the_same_plugin() {
             json!({ "name": "argocd-stage", "image": image(), "manifest_sha256": sha }),
         ]
     );
+    tdb.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------
+// The recorded source, the manifest's image, and upgrades (ADR-0072 §10)
+// ---------------------------------------------------------------------------
+
+/// The Argo CD manifest's file at `commit` (40 hex).
+fn argocd_at(commit: char) -> String {
+    format!(
+        "github.com/thulasi-ram/scarab-ci//crates/scarab-plugin-argocd/manifest.json@{}",
+        commit.to_string().repeat(40)
+    )
+}
+
+/// The Argo CD manifest with `edit` applied, as a file.
+fn argocd_manifest_with(edit: impl FnOnce(&mut Value)) -> String {
+    let mut m: Value = serde_json::from_str(ARGOCD_MANIFEST).unwrap();
+    edit(&mut m);
+    m.to_string()
+}
+
+/// One more read rule than the Argo CD manifest asks for.
+fn argocd_wider() -> String {
+    argocd_manifest_with(|m| {
+        m["connections"][0]["read_rules"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({ "method": "GET", "path": "/api/v1/account" }))
+    })
+}
+
+/// The Argo CD manifest without its `/api/version` rule.
+fn argocd_narrower() -> String {
+    argocd_manifest_with(|m| {
+        m["connections"][0]["read_rules"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|r| r["path"] != "/api/version")
+    })
+}
+
+async fn upgrade_fetch(app: &axum::Router, name: &str, body: Value) -> (StatusCode, Value) {
+    call(
+        app,
+        "POST",
+        &format!("/v1/orgs/acme/plugins/{name}/upgrade-fetch"),
+        None,
+        Some(body),
+    )
+    .await
+}
+
+async fn upgrade(app: &axum::Router, name: &str, body: Value) -> (StatusCode, Value) {
+    call(
+        app,
+        "POST",
+        &format!("/v1/orgs/acme/plugins/{name}/upgrade"),
+        None,
+        Some(body),
+    )
+    .await
+}
+
+/// An install records where its manifest was read, normalized, with the
+/// connection it was read through and the manifest's hash.
+#[tokio::test]
+async fn an_install_records_the_manifest_source_and_hash() {
+    let Some((tdb, pg)) = migrated().await else {
+        return;
+    };
+    let apps = apps(pg.clone());
+    let typed = with(
+        argocd("argocd"),
+        "source",
+        json!(format!("https://{ARGOCD_MANIFEST_SOURCE}")),
+    );
+    let (status, body) = call(
+        &apps.public,
+        "POST",
+        "/v1/orgs/acme/plugins",
+        None,
+        Some(typed),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["source"], json!(ARGOCD_MANIFEST_SOURCE));
+    assert_eq!(body["source_connection"], Value::Null);
+    let row = pg.installation("acme", "argocd").await.unwrap().unwrap();
+    assert_eq!(row.source.as_deref(), Some(ARGOCD_MANIFEST_SOURCE));
+    assert_eq!(row.source_connection, None);
+    assert_eq!(row.manifest_sha256, manifest_sha256(ARGOCD_MANIFEST));
+    tdb.cleanup().await;
+}
+
+/// The Argo CD manifest names its image repository: an install of an image
+/// of another repository is refused, by name, and nothing is stored. A
+/// manifest that names no image says so (its `image` is null), and installs
+/// from any repository.
+#[tokio::test]
+async fn a_manifest_that_names_its_image_refuses_an_image_of_another_repository() {
+    let Some((tdb, pg)) = migrated().await else {
+        return;
+    };
+    let fetcher = Arc::new(argocd_fetcher());
+    fetcher.serve(SLACK_SOURCE, SLACK_MANIFEST);
+    let apps = apps_with(pg, fetcher);
+    let (status, fetched) = fetch(&apps.public, "acme", ARGOCD_MANIFEST_SOURCE).await;
+    assert_eq!(status, StatusCode::OK, "{fetched}");
+    assert_eq!(fetched["manifest"]["image"], json!(REPO));
+
+    for other in [
+        format!("ghcr.io/someone-else/argocd-fork@sha256:{}", "b".repeat(64)),
+        format!("{REPO}-fork@sha256:{}", "b".repeat(64)),
+    ] {
+        let (status, body) = call(
+            &apps.public,
+            "POST",
+            "/v1/orgs/acme/plugins",
+            None,
+            Some(argocd_install_body("fork", &other)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{other}: {body}");
+        assert!(body.to_string().contains(REPO), "{body}");
+    }
+    assert_eq!(installed(&apps.public, "acme").await, Vec::<String>::new());
+
+    let (status, fetched) = fetch(&apps.public, "acme", SLACK_SOURCE).await;
+    assert_eq!(status, StatusCode::OK, "{fetched}");
+    assert_eq!(fetched["manifest"]["image"], Value::Null);
+    fetch_and_install(
+        &apps.public,
+        "acme",
+        "slack",
+        SLACK_SOURCE,
+        &format!("ghcr.io/anyone/anything@sha256:{}", "c".repeat(64)),
+        json!({}),
+    )
+    .await;
+    tdb.cleanup().await;
+}
+
+/// An upgrade-fetch reads the recorded source's file at the commit the
+/// admin names and compares it with the installed manifest: a wider one
+/// lists what it adds and needs a step-up, a narrower one lists what it
+/// removes and does not. The image, when given, must be one the new
+/// manifest names. Nothing is stored.
+#[tokio::test]
+async fn an_upgrade_fetch_compares_the_new_manifest_with_the_installed_one() {
+    let Some((tdb, pg)) = migrated().await else {
+        return;
+    };
+    let fetcher = Arc::new(argocd_fetcher());
+    fetcher.serve(&argocd_at('b'), &argocd_wider());
+    fetcher.serve(&argocd_at('c'), &argocd_narrower());
+    let apps = apps_with(pg.clone(), fetcher);
+    install(&apps.public, "acme", "argocd").await;
+
+    let (status, wider) =
+        upgrade_fetch(&apps.public, "argocd", json!({ "commit": "b".repeat(40) })).await;
+    assert_eq!(status, StatusCode::OK, "{wider}");
+    assert_eq!(wider["source"], json!(argocd_at('b')));
+    assert_eq!(
+        wider["current_manifest_sha256"],
+        json!(manifest_sha256(ARGOCD_MANIFEST))
+    );
+    assert_eq!(
+        wider["manifest_sha256"],
+        json!(manifest_sha256(&argocd_wider()))
+    );
+    let rules = &wider["diff"]["read_rules"];
+    assert_eq!(rules["added"], json!(["argocd: GET /api/v1/account"]));
+    assert_eq!(rules["removed"], json!([]));
+    assert!(rules["unchanged"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("argocd: GET /api/version")));
+    assert_eq!(
+        wider["diff"]["capabilities"]["unchanged"],
+        json!(["use_connection", "resolve_gates"])
+    );
+    assert_eq!(wider["diff"]["gates"]["unchanged"], json!(["wait-live"]));
+    assert_eq!(wider["needs_step_up"], json!(true));
+    assert_eq!(
+        wider["widenings"],
+        json!(["adds read rule `argocd: GET /api/v1/account`"])
+    );
+
+    let (status, narrower) = upgrade_fetch(
+        &apps.public,
+        "argocd",
+        json!({ "commit": "c".repeat(40), "image": format!("{REPO}@sha256:{}", "e".repeat(64)) }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{narrower}");
+    assert_eq!(
+        narrower["diff"]["read_rules"]["removed"],
+        json!(["argocd: GET /api/version"])
+    );
+    assert_eq!(narrower["diff"]["read_rules"]["added"], json!([]));
+    assert_eq!(narrower["needs_step_up"], json!(false));
+    assert_eq!(narrower["widenings"], json!([]));
+
+    // An image the new manifest does not name is refused at the fetch.
+    let (status, body) = upgrade_fetch(
+        &apps.public,
+        "argocd",
+        json!({ "commit": "c".repeat(40), "image": format!("ghcr.io/evil/argocd@sha256:{}", "e".repeat(64)) }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    // Neither a source nor a commit: nothing to read.
+    let (status, _) = upgrade_fetch(&apps.public, "argocd", json!({})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) =
+        upgrade_fetch(&apps.public, "nope", json!({ "commit": "c".repeat(40) })).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // An installation from before sources were recorded needs the full source.
+    sqlx::query("UPDATE plugin_installations SET manifest_source = NULL")
+        .execute(&tdb.pool)
+        .await
+        .unwrap();
+    let (status, body) =
+        upgrade_fetch(&apps.public, "argocd", json!({ "commit": "c".repeat(40) })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.to_string().contains("no recorded source"), "{body}");
+    let (status, body) =
+        upgrade_fetch(&apps.public, "argocd", json!({ "source": argocd_at('c') })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Nothing was stored.
+    let row = pg.installation("acme", "argocd").await.unwrap().unwrap();
+    assert_eq!(row.manifest_sha256, manifest_sha256(ARGOCD_MANIFEST));
+    assert!(pg.installation_versions(&row.id).await.unwrap().is_empty());
+    tdb.cleanup().await;
+}
+
+/// An upgrade keeps the installation — its id, name, config, storage and
+/// state — runs the new image with the new manifest, records the new source,
+/// and records the version it replaced.
+#[tokio::test]
+async fn an_upgrade_keeps_the_installation_and_records_the_version_it_replaced() {
+    let Some((tdb, pg)) = migrated().await else {
+        return;
+    };
+    let v2_source = format!(
+        "github.com/someone-else/scarab-slack//manifest.yaml@{}",
+        "2".repeat(40)
+    );
+    let v2 = SLACK_MANIFEST.replace(
+        "config_keys: [SLACK_CHANNEL]",
+        "config_keys: [SLACK_CHANNEL, SLACK_EMOJI]",
+    );
+    assert_ne!(v2, SLACK_MANIFEST);
+    let fetcher = Arc::new(argocd_fetcher());
+    fetcher.serve(SLACK_SOURCE, SLACK_MANIFEST);
+    fetcher.serve(&v2_source, &v2);
+    let apps = apps_with(pg.clone(), fetcher);
+    let (_, before) = fetch_and_install(
+        &apps.public,
+        "acme",
+        "slack",
+        SLACK_SOURCE,
+        &slack_image(),
+        json!({ "SLACK_CHANNEL": "deploys" }),
+    )
+    .await;
+    let (status, _) = call(
+        &apps.public,
+        "PUT",
+        "/v1/orgs/acme/plugins/slack/storage",
+        None,
+        Some(json!({ "claim": "slack-state" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, fetched) =
+        upgrade_fetch(&apps.public, "slack", json!({ "commit": "2".repeat(40) })).await;
+    assert_eq!(status, StatusCode::OK, "{fetched}");
+    assert_eq!(
+        fetched["diff"]["config_keys"]["added"],
+        json!(["SLACK_EMOJI"])
+    );
+    assert_eq!(fetched["needs_step_up"], json!(false));
+    let new_image = format!("ghcr.io/someone-else/slack@sha256:{}", "9".repeat(64));
+    let (status, after) = upgrade(
+        &apps.public,
+        "slack",
+        json!({
+            "image": new_image,
+            "source": fetched["source"],
+            "manifest_sha256": fetched["manifest_sha256"],
+            "expected_current_sha256": fetched["current_manifest_sha256"],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{after}");
+    assert_eq!(after["id"], before["id"]);
+    assert_eq!(after["name"], json!("slack"));
+    assert_eq!(after["image"], json!(new_image));
+    assert_eq!(after["manifest_sha256"], fetched["manifest_sha256"]);
+    assert_eq!(after["source"], json!(v2_source));
+    assert_eq!(after["config"], json!({ "SLACK_CHANNEL": "deploys" }));
+    assert_eq!(after["storage"]["claim"], json!("slack-state"));
+    assert_eq!(after["state"], json!("enabled"));
+    assert_eq!(after["runtime_status"], json!("pending"));
+    assert_eq!(
+        after["manifest"]["config_keys"],
+        json!(["SLACK_CHANNEL", "SLACK_EMOJI"])
+    );
+
+    let id = before["id"].as_str().unwrap();
+    let history = pg.installation_versions(id).await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].image, slack_image());
+    assert_eq!(
+        history[0].manifest_sha256,
+        before["manifest_sha256"].as_str().unwrap()
+    );
+    assert_eq!(history[0].source.as_deref(), Some(SLACK_SOURCE));
+    tdb.cleanup().await;
+}
+
+/// The upgrade is a compare-and-swap on the installed manifest: one judged
+/// against a manifest that is no longer installed is 409, and so is one
+/// whose source no longer reads as the manifest reviewed. Neither writes.
+#[tokio::test]
+async fn an_upgrade_is_409_when_the_installation_changed_or_the_source_moved() {
+    let Some((tdb, pg)) = migrated().await else {
+        return;
+    };
+    let fetcher = Arc::new(argocd_fetcher());
+    fetcher.serve(&argocd_at('c'), &argocd_narrower());
+    let apps = apps_with(pg.clone(), fetcher.clone());
+    install(&apps.public, "acme", "argocd").await;
+    let (status, fetched) =
+        upgrade_fetch(&apps.public, "argocd", json!({ "commit": "c".repeat(40) })).await;
+    assert_eq!(status, StatusCode::OK, "{fetched}");
+    let body = json!({
+        "image": format!("{REPO}@sha256:{}", "e".repeat(64)),
+        "source": fetched["source"],
+        "manifest_sha256": fetched["manifest_sha256"],
+        "expected_current_sha256": fetched["current_manifest_sha256"],
+    });
+
+    // Someone else's change landed first.
+    let (status, msg) = upgrade(
+        &apps.public,
+        "argocd",
+        with(
+            body.clone(),
+            "expected_current_sha256",
+            json!("0".repeat(64)),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{msg}");
+    // The source now reads as another manifest.
+    fetcher.serve(&argocd_at('c'), &argocd_wider());
+    let (status, msg) = upgrade(&apps.public, "argocd", body.clone()).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{msg}");
+    assert!(msg.to_string().contains("you reviewed"), "{msg}");
+    let row = pg.installation("acme", "argocd").await.unwrap().unwrap();
+    assert_eq!(row.manifest_sha256, manifest_sha256(ARGOCD_MANIFEST));
+    assert_eq!(row.image, image());
+    assert!(pg.installation_versions(&row.id).await.unwrap().is_empty());
+
+    // As reviewed, it goes through; the same body again is judged against a
+    // manifest no longer installed.
+    fetcher.serve(&argocd_at('c'), &argocd_narrower());
+    let (status, msg) = upgrade(&apps.public, "argocd", body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{msg}");
+    let (status, msg) = upgrade(&apps.public, "argocd", body).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{msg}");
     tdb.cleanup().await;
 }

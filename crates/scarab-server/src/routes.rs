@@ -561,6 +561,16 @@ pub(crate) fn governed_routes() -> Routes {
             &ops::PLUGIN_ENABLE,
             plugins::enable_plugin,
         )
+        .post(
+            "/v1/orgs/{org}/plugins/{name}/upgrade-fetch",
+            &ops::PLUGIN_UPGRADE_FETCH,
+            plugins::fetch_plugin_upgrade,
+        )
+        .post(
+            "/v1/orgs/{org}/plugins/{name}/upgrade",
+            &ops::PLUGIN_UPGRADE,
+            plugins::upgrade_plugin,
+        )
         .put(
             "/v1/orgs/{org}/plugins/{name}/storage",
             &ops::PLUGIN_STORAGE_PUT,

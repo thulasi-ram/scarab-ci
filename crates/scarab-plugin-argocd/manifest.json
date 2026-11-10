@@ -1,5 +1,6 @@
 {
   "plugin": "argocd",
+  "image": "ghcr.io/thulasi-ram/scarab-plugin-argocd",
   "capabilities": [
     "use_connection",
     "resolve_gates"

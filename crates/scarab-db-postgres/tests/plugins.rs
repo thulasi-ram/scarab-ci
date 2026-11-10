@@ -4,7 +4,8 @@
 //! Postgres can show is what spans rows: names unique per Org, a kill that
 //! records who and when (and an enable that clears it), the runtime record
 //! written only in the state it was decided in, and an uninstall that retires
-//! its name for good. Report ingest went with the Deployment record
+//! its name for good, and an upgrade written only over the manifest it was
+//! judged against (migration 0091). Report ingest went with the Deployment record
 //! (ADR-0074). Every test gets its own database (`fresh_db`). Skips cleanly
 //! when `SCARAB_TEST_DATABASE_URL` is unset.
 
@@ -15,8 +16,9 @@ use std::collections::BTreeMap;
 use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
 use scarab_plugin::{
-    ConnectionSlot, InstallationState, PluginCapability, PluginInstallation, PluginManifest,
-    PluginStorage, PluginStore, PluginStoreError, RequestRule, RuntimeStatus,
+    ConnectionSlot, InstallationState, PluginCapability, PluginConnection,
+    PluginConnectionAuthScheme, PluginInstallation, PluginManifest, PluginStorage, PluginStore,
+    PluginStoreError, PluginUpgrade, RequestRule, RuntimeStatus,
 };
 
 async fn migrated() -> Option<(common::TestDb, PostgresDb)> {
@@ -32,6 +34,7 @@ async fn migrated() -> Option<(common::TestDb, PostgresDb)> {
 fn manifest() -> PluginManifest {
     PluginManifest {
         plugin: "argocd".into(),
+        image: None,
         capabilities: vec![PluginCapability::UseConnection],
         connections: vec![ConnectionSlot {
             name: "argocd".into(),
@@ -56,6 +59,8 @@ fn installation(org: &str, name: &str, id: &str) -> PluginInstallation {
         image: format!("ghcr.io/acme/argocd@sha256:{}", "a".repeat(64)),
         manifest: manifest(),
         manifest_sha256: "0".repeat(64),
+        source: None,
+        source_connection: None,
         config: BTreeMap::new(),
         state: InstallationState::Enabled,
         state_version: 0,
@@ -388,5 +393,164 @@ async fn storage_writes_only_over_the_storage_the_caller_read() {
             .execute(&tdb.pool)
             .await;
     assert!(half.is_err(), "the CHECK keeps storage whole");
+    tdb.cleanup().await;
+}
+
+fn slot(name: &str) -> ConnectionSlot {
+    ConnectionSlot {
+        name: name.into(),
+        auth_schemes: vec!["bearer".into()],
+        read_rules: vec![RequestRule {
+            method: "GET".into(),
+            path: "/api/version".into(),
+            query: vec![],
+        }],
+    }
+}
+
+/// An upgrade is written only over the manifest the caller judged it
+/// against, keeps the installation's id, config it still declares, storage,
+/// state and the bindings of slots it still declares, resets the runtime
+/// record so isolation is proved again, and records the version it
+/// replaced. A refused upgrade writes nothing.
+#[tokio::test]
+async fn an_upgrade_is_conditional_on_the_manifest_and_records_the_version_it_replaced() {
+    let Some((tdb, db)) = migrated().await else {
+        return;
+    };
+    let mut argo = installation("acme", "argocd", "0000000001");
+    argo.manifest.connections.push(slot("github"));
+    argo.manifest.config_keys = vec!["ARGOCD_UI_URL".into(), "OLD_KEY".into()];
+    argo.config = BTreeMap::from([
+        ("ARGOCD_UI_URL".to_string(), "https://argo".to_string()),
+        ("OLD_KEY".to_string(), "x".to_string()),
+    ]);
+    argo.source = Some(format!(
+        "github.com/acme/argocd//manifest.json@{}",
+        "1".repeat(40)
+    ));
+    argo.storage = Some(PluginStorage::new("argocd-state", None).unwrap());
+    db.install(&argo).await.unwrap();
+    db.set_runtime_status(
+        &argo.id,
+        InstallationState::Enabled,
+        0,
+        RuntimeStatus::Running,
+        "",
+        Some(5_000),
+    )
+    .await
+    .unwrap();
+    for (slot, credential_ref) in [("argocd", "pc-argocd"), ("github", "pc-github")] {
+        db.put_connection(&PluginConnection {
+            installation_id: argo.id.clone(),
+            slot: slot.into(),
+            base_url: "https://example.test".into(),
+            auth_scheme: PluginConnectionAuthScheme::Bearer,
+            credential_ref: credential_ref.into(),
+            ca_pem: None,
+            updated_by: "amy".into(),
+            updated_at: 2_000,
+        })
+        .await
+        .unwrap();
+    }
+
+    // The new manifest drops the `github` slot and the `OLD_KEY` config key.
+    let mut next = argo.manifest.clone();
+    next.connections.retain(|s| s.name == "argocd");
+    next.config_keys = vec!["ARGOCD_UI_URL".into()];
+    let upgrade = PluginUpgrade {
+        image: format!("ghcr.io/acme/argocd@sha256:{}", "b".repeat(64)),
+        manifest: next.clone(),
+        manifest_sha256: "1".repeat(64),
+        source: format!("github.com/acme/argocd//manifest.json@{}", "2".repeat(40)),
+        source_connection: Some("forge-1".into()),
+        approved_by: "bob".into(),
+        approved_at: 9_000,
+        step_up_ref: None,
+    };
+
+    // Judged against another manifest: refused, nothing written.
+    assert_eq!(
+        db.upgrade_installation("acme", "argocd", &"f".repeat(64), &upgrade)
+            .await,
+        Err(PluginStoreError::Changed("argocd".into()))
+    );
+    let unchanged = db.installation("acme", "argocd").await.unwrap().unwrap();
+    assert_eq!(unchanged.manifest, argo.manifest);
+    assert_eq!(db.connections(&argo.id).await.unwrap().len(), 2);
+    assert_eq!(db.installation_versions(&argo.id).await.unwrap(), vec![]);
+    assert_eq!(
+        db.upgrade_installation("acme", "nope", &argo.manifest_sha256, &upgrade)
+            .await,
+        Ok(None)
+    );
+
+    let done = db
+        .upgrade_installation("acme", "argocd", &argo.manifest_sha256, &upgrade)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        done.connection_credential_refs,
+        vec!["pc-github".to_string()]
+    );
+    let now = done.installation;
+    assert_eq!(
+        now,
+        db.installation("acme", "argocd").await.unwrap().unwrap()
+    );
+    assert_eq!(now.id, argo.id);
+    assert_eq!(now.image, upgrade.image);
+    assert_eq!(now.manifest, next);
+    assert_eq!(now.manifest_sha256, upgrade.manifest_sha256);
+    assert_eq!(now.source.as_deref(), Some(upgrade.source.as_str()));
+    assert_eq!(now.source_connection.as_deref(), Some("forge-1"));
+    assert_eq!(
+        now.config,
+        BTreeMap::from([("ARGOCD_UI_URL".to_string(), "https://argo".to_string())])
+    );
+    assert_eq!(now.storage, argo.storage);
+    assert_eq!(now.state, InstallationState::Enabled);
+    assert_eq!((now.approved_by.as_str(), now.approved_at), ("bob", 9_000));
+    // The new image proves isolation again; a status decided for the old
+    // one no longer lands.
+    assert_eq!(now.runtime_status, RuntimeStatus::Pending);
+    assert_eq!(now.probe_passed_at, None);
+    assert_eq!(now.state_version, 1);
+    assert!(!db
+        .set_runtime_status(
+            &argo.id,
+            InstallationState::Enabled,
+            0,
+            RuntimeStatus::Running,
+            "",
+            Some(6_000)
+        )
+        .await
+        .unwrap());
+    let slots: Vec<String> = db
+        .connections(&argo.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|c| c.slot)
+        .collect();
+    assert_eq!(slots, vec!["argocd".to_string()]);
+
+    let history = db.installation_versions(&argo.id).await.unwrap();
+    assert_eq!(history.len(), 1);
+    let was = &history[0];
+    assert_eq!(was.image, argo.image);
+    assert_eq!(was.manifest, argo.manifest);
+    assert_eq!(was.manifest_sha256, argo.manifest_sha256);
+    assert_eq!(was.source, argo.source);
+    assert_eq!((was.approved_by.as_str(), was.approved_at), ("amy", 1_000));
+    assert_eq!((was.replaced_by.as_str(), was.replaced_at), ("bob", 9_000));
+
+    // The history goes with the installation.
+    db.uninstall("acme", "argocd", "amy", 10_000).await.unwrap();
+    assert_eq!(db.installation_versions(&argo.id).await.unwrap(), vec![]);
     tdb.cleanup().await;
 }

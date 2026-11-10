@@ -7,7 +7,8 @@
 #   broker, in the server Pod, reads it at the host address a Pod reaches) →
 #   install the plugin through the API as an org admin installs any plugin:
 #   read its manifest from `<org>/scarab-libs` on the in-cluster Forgejo
-#   (forgejo.sh seeds it from crates/scarab-plugin-argocd/manifest.json)
+#   (forgejo.sh seeds it from crates/scarab-plugin-argocd/manifest.json, naming
+#   the local image repository instead of the published one)
 #   through the org's connection (libs.sh), then install with that manifest's
 #   hash → bind its connection → wait for the
 #   isolation probe and the Pod →

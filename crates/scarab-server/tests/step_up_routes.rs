@@ -479,6 +479,18 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
         "CJ-W",
     ),
     (
+        "POST",
+        "/v1/orgs/{org}/plugins/{name}/upgrade-fetch",
+        "plugin.upgrade_fetch",
+        "NG",
+    ),
+    (
+        "POST",
+        "/v1/orgs/{org}/plugins/{name}/upgrade",
+        "plugin.upgrade",
+        "COND-A",
+    ),
+    (
         "PUT",
         "/v1/orgs/{org}/plugins/{name}/storage",
         "plugin.storage.put",

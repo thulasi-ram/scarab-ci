@@ -506,6 +506,7 @@ fn installation(image: &str) -> PluginInstallation {
         // A manifest `validate()` accepts: `use_connection` needs a slot.
         manifest: PluginManifest {
             plugin: "argocd".into(),
+            image: None,
             capabilities: vec![PluginCapability::UseConnection],
             connections: vec![ConnectionSlot {
                 name: "argocd".into(),
@@ -520,6 +521,8 @@ fn installation(image: &str) -> PluginInstallation {
             gates: Default::default(),
         },
         manifest_sha256: "f".repeat(64),
+        source: None,
+        source_connection: None,
         config: BTreeMap::new(),
         state: InstallationState::Enabled,
         state_version: 0,

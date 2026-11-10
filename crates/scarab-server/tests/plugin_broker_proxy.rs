@@ -1235,6 +1235,24 @@ impl scarab_plugin::PluginStore for HeldJournal {
             .set_installation_storage(org, name, storage, expected)
             .await
     }
+    async fn upgrade_installation(
+        &self,
+        org: &str,
+        name: &str,
+        expected_manifest_sha256: &str,
+        upgrade: &scarab_plugin::PluginUpgrade,
+    ) -> Result<Option<scarab_plugin::PluginUpgraded>, scarab_plugin::PluginStoreError> {
+        self.inner
+            .upgrade_installation(org, name, expected_manifest_sha256, upgrade)
+            .await
+    }
+    async fn installation_versions(
+        &self,
+        installation_id: &str,
+    ) -> Result<Vec<scarab_plugin::PluginInstallationVersion>, scarab_plugin::PluginStoreError>
+    {
+        self.inner.installation_versions(installation_id).await
+    }
     async fn set_runtime_status(
         &self,
         id: &str,
