@@ -895,8 +895,10 @@ function environmentProjects(env: OrgEnvironmentDto): EnvironmentProjectDto[] {
   }));
 }
 
-// ── Plugins — Settings › Plugins. `argocd` is running;
-// `argocd-us` is killed. Writes echo a record and persist nothing.
+// ── Plugins — Settings › Plugins. `argocd` is running; `argocd-us` is
+// killed; `argocd-staging` is held by a failed isolation probe. Each has a
+// manage page at /orgs/acme/settings/plugins/<id>/manage. Writes echo a
+// record and persist nothing, except an install, kept until the page reloads.
 const ARGOCD_REPO = "ghcr.io/thulasi-ram/scarab-plugin-argocd";
 const argocdManifest: PluginManifestDto = {
   plugin: "argocd",
@@ -988,6 +990,15 @@ const plugins: PluginInstallationDto[] = [
     killed_by: "j.lee",
     killed_at: ago(90 * min),
     approved_at: ago(5 * 24 * 60 * min),
+  }),
+  pluginInstallation("argocd-staging", "7b1c40e9d2f6", {
+    id: "2b7e90f1c4",
+    runtime_status: "probe_failed",
+    runtime_message: "the isolation probe reached 10.96.0.1:443; this cluster does not enforce the plugin's NetworkPolicy",
+    probe_passed_at: null,
+    approved_by: "j.lee",
+    approved_at: ago(2 * 60 * min),
+    config: {},
   }),
 ];
 // Connections: `argocd` is bound over https; `argocd-us` was
@@ -1942,7 +1953,8 @@ function route(pathname: string, search: string, method: string, body = ""): Res
   }
   if (/^\/v1\/orgs\/[^/]+\/plugins$/.test(p)) {
     if (method === "POST") {
-      // Echo a fresh, still-pending install of what was sent; nothing is kept.
+      // A fresh, still-pending install of what was sent, kept until the page
+      // reloads, so its manage page opens.
       const req = JSON.parse(body || "{}") as {
         name?: string;
         image?: string;
@@ -1950,29 +1962,28 @@ function route(pathname: string, search: string, method: string, body = ""): Res
         config?: Record<string, string>;
         storage?: { claim: string; mount_path?: string | null } | null;
       };
-      const name = req.name || "argocd-staging";
-      return json(
-        pluginInstallation(name, "0a1b2c3d4e5f", {
-          id: "1d2e3f4a5b",
-          ...(req.image ? { image: req.image } : {}),
-          ...(req.manifest_sha256 ? { manifest_sha256: req.manifest_sha256 } : {}),
-          config: req.config ?? {},
-          storage: req.storage
-            ? {
-                claim: req.storage.claim,
-                mount_path: req.storage.mount_path || "/data",
-                owner_annotation: "scarab.io/plugin-installation",
-                owner_annotation_value: `acme/${name}`,
-              }
-            : null,
-          state: "enabled",
-          runtime_status: "pending",
-          runtime_message: "",
-          probe_passed_at: null,
-          approved_at: now,
-        }),
-        { status: 201 },
-      );
+      const name = req.name || "argocd-dev";
+      const made = pluginInstallation(name, "0a1b2c3d4e5f", {
+        id: "1d2e3f4a5b",
+        ...(req.image ? { image: req.image } : {}),
+        ...(req.manifest_sha256 ? { manifest_sha256: req.manifest_sha256 } : {}),
+        config: req.config ?? {},
+        storage: req.storage
+          ? {
+              claim: req.storage.claim,
+              mount_path: req.storage.mount_path || "/data",
+              owner_annotation: "scarab.io/plugin-installation",
+              owner_annotation_value: `acme/${name}`,
+            }
+          : null,
+        state: "enabled",
+        runtime_status: "pending",
+        runtime_message: "",
+        probe_passed_at: null,
+        approved_at: now,
+      });
+      plugins.push(made);
+      return json(made, { status: 201 });
     }
     return json(plugins);
   }
