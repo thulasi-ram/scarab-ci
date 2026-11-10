@@ -7,9 +7,10 @@
 //! `require_reason` and `permit_k8s_overlay` existed — then 0057 runs, then
 //! the backfill runs a **second** time. Pinned:
 //!
-//! - every migrated overlay and grant equals the pure
-//!   `migrate_legacy_environment` of its legacy row (the function whose
-//!   decisions the c1 proptests prove identical to the old rules);
+//! - every migrated overlay and grant equals the one [`expected`] writes out
+//!   for its legacy row: approvers, allowed refs, wait timer and
+//!   `require_reason` carried verbatim, concurrency dropped, and a grant only
+//!   where the row carried a whitelist or permitted raw overlays;
 //! - every created Environment has the permissive baseline; a pre-existing
 //!   c-min Environment keeps its description;
 //! - eligibility is definers ∪ run-referencers, and "all projects" for a name
@@ -24,8 +25,9 @@ mod common;
 use common::fresh_db;
 use scarab_db_postgres::{PostgresDb, MIGRATOR};
 use scarab_project::{
-    migrate_legacy_environment, Environment, EnvironmentGovernanceStore,
-    EnvironmentProjectEligibility, EnvironmentProtectionRules, ProtectionRules,
+    ApprovalGateRules, EnvironmentGovernanceStore, EnvironmentProjectEligibility,
+    EnvironmentProjectOverlay, EnvironmentProjectPrivilegeGrant, EnvironmentProtectionRules,
+    ImageGrant,
 };
 use sqlx::{PgPool, Row};
 
@@ -114,6 +116,107 @@ fn corpus() -> Vec<(&'static str, &'static str, &'static str, serde_json::Value)
                 "secret_scope": { "Org": { "org": "" } },
                 "oidc_subject": ""
             }),
+        ),
+    ]
+}
+
+/// What 0057 makes of each [`corpus`] row, in corpus order: the Project's
+/// overlay and, where the row carried a privilege, its grant.
+fn expected() -> Vec<(
+    EnvironmentProjectOverlay,
+    Option<EnvironmentProjectPrivilegeGrant>,
+)> {
+    let strings = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let overlay = |org: &str,
+                   project: &str,
+                   environment: &str,
+                   approvers: &[&str],
+                   allowed_refs: &[&str],
+                   wait_timer_s: u32,
+                   require_reason: bool| EnvironmentProjectOverlay {
+        org: org.into(),
+        environment: environment.into(),
+        project: project.into(),
+        rules: EnvironmentProtectionRules {
+            approvers: strings(approvers),
+            allowed_refs: strings(allowed_refs),
+            wait_timer_s,
+            require_reason,
+            approval_gate: ApprovalGateRules::default(),
+        },
+    };
+    let grant = |org: &str,
+                 project: &str,
+                 environment: &str,
+                 privileged_images: Vec<ImageGrant>,
+                 permit_k8s_overlay: bool| EnvironmentProjectPrivilegeGrant {
+        org: org.into(),
+        environment: environment.into(),
+        project: project.into(),
+        privileged_images,
+        permit_k8s_overlay,
+    };
+    vec![
+        (
+            overlay(
+                "acme",
+                "web",
+                "prod",
+                &["alice", "bob"],
+                &["refs/heads/main"],
+                30,
+                false,
+            ),
+            None,
+        ),
+        (
+            overlay("acme", "api", "prod", &[], &["main"], 0, true),
+            Some(grant(
+                "acme",
+                "api",
+                "prod",
+                vec![
+                    ImageGrant {
+                        image_digest: "sha256:aaaa".into(),
+                        privileged: true,
+                        capabilities: strings(&["NET_ADMIN"]),
+                    },
+                    ImageGrant {
+                        image_digest: "sha256:bbbb".into(),
+                        privileged: false,
+                        capabilities: Vec::new(),
+                    },
+                ],
+                false,
+            )),
+        ),
+        (
+            overlay("acme", "web", "staging", &[], &[], 0, false),
+            Some(grant("acme", "web", "staging", Vec::new(), true)),
+        ),
+        (
+            overlay(
+                "acme",
+                "api",
+                "release",
+                &["carol", "carol"],
+                &["refs/tags/v*", "refs/tags/hotfix-*"],
+                0,
+                false,
+            ),
+            None,
+        ),
+        (
+            overlay(
+                "globex",
+                "shop",
+                "prod",
+                &["dave"],
+                &["refs/heads/*"],
+                0,
+                false,
+            ),
+            None,
         ),
     ]
 }
@@ -274,7 +377,7 @@ async fn governance_snapshot(pool: &PgPool) -> Vec<String> {
 }
 
 #[tokio::test]
-async fn backfill_reproduces_the_pure_migration_and_is_a_no_op_the_second_time() {
+async fn backfill_converts_each_legacy_row_and_is_a_no_op_the_second_time() {
     let Some(tdb) = fresh_db().await else {
         eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
         return;
@@ -299,30 +402,12 @@ async fn backfill_reproduces_the_pure_migration_and_is_a_no_op_the_second_time()
         "a second backfill changes nothing"
     );
 
-    // 0057 renamed the legacy rows and left them as they were; read them as
-    // legacy rules before migration 0088 drops them.
-    let mut legacy_rows = Vec::new();
-    for row in sqlx::query(
-        "SELECT org, project, name, protection FROM legacy_project_environments
-         ORDER BY org, project, name",
-    )
-    .fetch_all(&pool)
-    .await
-    .unwrap()
-    {
-        let protection: ProtectionRules =
-            serde_json::from_value(row.get::<serde_json::Value, _>("protection"))
-                .expect("legacy rules deserialise");
-        legacy_rows.push((
-            row.get::<String, _>("org"),
-            row.get::<String, _>("project"),
-            Environment {
-                name: row.get::<String, _>("name"),
-                protection,
-            },
-        ));
-    }
-    assert_eq!(legacy_rows.len(), corpus().len());
+    // 0057 renamed the legacy rows and left them as they were, until 0088.
+    let legacy_rows: i64 = sqlx::query_scalar("SELECT count(*) FROM legacy_project_environments")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(legacy_rows, corpus().len() as i64);
 
     // The store below reads today's schema (0079 adds the approval gate
     // settings, 0080 the display name), and 0088 drops the legacy rows, the
@@ -343,7 +428,7 @@ async fn backfill_reproduces_the_pure_migration_and_is_a_no_op_the_second_time()
     let db = PostgresDb::with_pool(pool.clone());
     // Migration 0093 stores approvers as Principal ids (placeholders for
     // these names nobody signed in as); `principals` maps each back to the
-    // name the pure migration kept (ADR-0080 §6).
+    // name the legacy row held (ADR-0080 §6).
     let handles = |ids: Vec<String>| {
         let pool = pool.clone();
         async move {
@@ -361,10 +446,14 @@ async fn backfill_reproduces_the_pure_migration_and_is_a_no_op_the_second_time()
         }
     };
 
-    // Every legacy row → exactly the pure migration of it.
-    for (org, project, legacy) in &legacy_rows {
-        let (org, project, name) = (org.as_str(), project.as_str(), legacy.name.as_str());
-        let (want_overlay, want_grant) = migrate_legacy_environment(org, project, legacy);
+    // Every legacy row → exactly its expected overlay and grant.
+    assert_eq!(expected().len(), corpus().len());
+    for (want_overlay, want_grant) in expected() {
+        let (org, project, name) = (
+            want_overlay.org.as_str(),
+            want_overlay.project.as_str(),
+            want_overlay.environment.as_str(),
+        );
         let mut g = db
             .deploy_governance(org, project, name)
             .await
@@ -375,8 +464,8 @@ async fn backfill_reproduces_the_pure_migration_and_is_a_no_op_the_second_time()
         }
         assert!(g.eligible, "{org}/{project} stays eligible for {name}");
         assert_eq!(
-            g.overlay,
-            Some(want_overlay),
+            g.overlay.as_ref(),
+            Some(&want_overlay),
             "{org}/{project}/{name} overlay"
         );
         assert_eq!(
@@ -390,8 +479,8 @@ async fn backfill_reproduces_the_pure_migration_and_is_a_no_op_the_second_time()
         );
     }
 
-    // The two old-JSON shapes the pure function never saw as JSON: absent
-    // keys read as off, and a bare `main` / duplicate approver stay verbatim.
+    // The old-JSON shapes: absent keys read as off, and a bare `main` /
+    // duplicate approver stay verbatim.
     let api_prod = db
         .deploy_governance("acme", "api", "prod")
         .await
