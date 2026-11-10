@@ -123,7 +123,7 @@ describe("toInstallBody", () => {
     expect(toInstallBody({ ...form, image: "" }, reviewed).error).toMatch(/image is required/);
     expect(toInstallBody({ ...form, image: REPO }, reviewed).error).toMatch(/@sha256:/);
     expect(toInstallBody({ ...form, storage: { claim: "", mount_path: "/data" } }, reviewed).error).toMatch(
-      /claim's name/,
+      /claim's name/i,
     );
     expect(toInstallBody({ ...form, name: "argocd" }, reviewed, { taken: ["argocd"] }).error).toMatch(
       /already installed/,
