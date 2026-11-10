@@ -4100,3 +4100,40 @@ code.c { font-family: var(--font-mono); font-size: var(--fs-sm); color: var(--co
 .pol-h { font-size: var(--fs-sm); font-weight: 600; margin: 14px 0 6px; }
 .pol-facts { margin: 6px 0 0; }
 .tok-role.pol-denied { color: var(--danger); border-color: var(--danger); }
+
+/* ---- org page (/orgs/<org>): stat tiles, repository list, pager ---- */
+.org-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+@media (max-width: 1000px) { .org-stats { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 560px) { .org-stats { grid-template-columns: 1fr; } }
+.org-stat {
+  display: flex; flex-direction: column; gap: 4px;
+  background: var(--emerald-surface); border: 1px solid var(--border);
+  border-radius: var(--radius-lg); padding: 14px 16px;
+  text-decoration: none; color: inherit;
+}
+.org-stat-link { transition: border-color 0.12s ease; }
+.org-stat-link:hover { border-color: var(--emerald); }
+.org-stat-n { font-size: var(--fs-xl); color: var(--soft-white); }
+.org-stat-label { font-size: var(--fs-sm); color: var(--muted-sage); }
+.org-stat-sub { font-size: var(--fs-xs); color: var(--muted-sage); }
+.org-stat-bad .org-stat-n { color: var(--danger); }
+.org-stat-warn .org-stat-n { color: var(--warn); }
+.org-repos-help { margin: -4px 0 10px; }
+.org-repo-row { flex-wrap: wrap; }
+.org-repo-link { color: var(--soft-white); text-decoration: none; }
+.org-repo-link:hover { color: var(--emerald); text-decoration: underline; text-underline-offset: 3px; }
+.org-repo-off { color: var(--muted-sage); }
+.org-repo-state {
+  font-family: var(--font-mono); font-size: var(--fs-xs); text-transform: uppercase;
+  letter-spacing: 0.5px; color: var(--muted-sage);
+  border: 1px solid var(--border); border-radius: 4px; padding: 1px 6px;
+}
+.org-repo-state.org-repo-on { color: var(--ok-ink); border-color: currentColor; }
+.org-repo-forge { text-decoration: none; }
+.org-repo-forge:hover { color: var(--emerald); text-decoration: underline; }
+.org-pager { display: flex; align-items: center; gap: 10px; margin-top: 12px; flex-wrap: wrap; }
+/* The org before a repo's name links to the org page. */
+a.head-org { text-decoration: none; }
+a.head-org:hover { color: var(--emerald); text-decoration: underline; text-underline-offset: 4px; }
+.crumb-head-org { font-size: var(--fs-xl); font-weight: 400; color: var(--muted-sage); text-decoration: none; flex: none; }
+.crumb-head-org:hover { color: var(--emerald); text-decoration: underline; text-underline-offset: 4px; }

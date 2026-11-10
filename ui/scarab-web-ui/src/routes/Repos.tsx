@@ -1,6 +1,6 @@
 // Dashboard — the engineer's landing tier, driven by the real API:
 // (1) an ACTION INBOX of suspended runs (a gate is holding them until someone
-// decides); (2) RECENTLY VISITED repos (browser-local, ADR-0046) as status
+// decides); (2) RECENTLY VISITED repos (browser-local) as status
 // cards, each with a rounded pass/fail bar strip of its last runs; (3) the full
 // repo list, most-recently-active first, with a search for orgs with many repos.
 // The old flat activity table is gone — recency now lives on the repo cards.
@@ -16,6 +16,7 @@ import {
 import { getVisited } from "../visited";
 import { me } from "../session";
 import { addConnectionHref } from "../settings-nav";
+import { orgPageHref } from "../org-page";
 import { inboxDetail, inboxRuns, inboxVerb } from "../gates";
 import { relTime, absTime } from "../fmt";
 import Icon from "../components/Icon";
@@ -27,20 +28,43 @@ const runHref = (r: RunSummary) => `/${r.org ?? "api"}/${r.project ?? "unknown"}
 const tenant = (r: RunSummary) => (r.org && r.project ? `${r.org}/${r.project}` : null);
 const shortId = (id: string) => id.slice(0, 8);
 
-// The empty repo list: where repositories come from. A forge connection is
-// added in one place, an org's Connections (or New organization for a global
-// admin with no org), so this links there and does not offer its own.
+// The empty repo list: where repositories come from. An org admin enables
+// them on the org's page; with no org yet, a global admin connects a forge on
+// New organization (the one place a first connection is added). So this links
+// there and offers no form of its own.
 function NoRepos() {
-  const href = () => (me() ? addConnectionHref(me()!) : null);
+  const orgs = () => (me()?.can_administer ? me()!.admin_orgs : []);
+  const connect = () => (me() ? addConnectionHref(me()!) : null);
   return (
     <>
-      No repos registered yet.{" "}
-      <Show when={href()} fallback="An organization admin adds them by connecting a forge.">
-        {(h) => (
-          <>
-            <A href={h()}>Add a forge connection</A> in Organization settings to bring them in.
-          </>
-        )}
+      No repositories enabled yet.{" "}
+      <Show
+        when={orgs().length > 0}
+        fallback={
+          <Show
+            when={connect()}
+            fallback="An organization admin enables them on the organization's page."
+          >
+            {(h) => (
+              <>
+                <A href={h()}>Connect a forge</A> to bring them in.
+              </>
+            )}
+          </Show>
+        }
+      >
+        Enable them on the page of{" "}
+        <For each={orgs()}>
+          {(o, i) => (
+            <>
+              {i() > 0 ? ", " : ""}
+              <A href={orgPageHref(o)} class="mono">
+                {o}
+              </A>
+            </>
+          )}
+        </For>
+        .
       </Show>
     </>
   );

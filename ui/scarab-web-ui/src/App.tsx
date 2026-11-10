@@ -1,5 +1,5 @@
 // App = the client-side router. Repo-first, deep-linkable tiers:
-// repos → repo → run. Each is a real URL, shareable and refreshable.
+// repos → org → repo → run. Each is a real URL, shareable and refreshable.
 import { Show } from "solid-js";
 import { Router, Route } from "@solidjs/router";
 import Layout from "./Layout";
@@ -13,6 +13,7 @@ import { AccountSettings, LegacySettings, NewOrgSettings, OrgSettings } from "./
 import LibraryReview from "./routes/LibraryReview";
 import { EnvironmentEdit, EnvironmentView } from "./routes/EnvironmentPage";
 import ConfirmRequest from "./routes/ConfirmRequest";
+import OrgPage from "./routes/OrgPage";
 
 export default function App() {
   // The sign-in gate sits ABOVE the Router, not inside its root, and that
@@ -35,6 +36,11 @@ export default function App() {
           outrank the /:org/:repo tier. */}
       <Route path="/settings" component={LegacySettings} />
       <Route path="/settings/:section" component={AccountSettings} />
+      {/* The org page: its counts and its repositories, enabled or not.
+          Under the static /orgs segment like the org's settings, so it
+          cannot collide with /:org/:repo (the server refuses an org named
+          `orgs`). The static /orgs/_new below outranks this :org route. */}
+      <Route path="/orgs/:org" component={OrgPage} />
       <Route path="/orgs/:org/settings/:section?" component={OrgSettings} />
       {/* A new org's first forge connection, for global admins. `_new` holds
           the org's place in the path, and no org may be named with a

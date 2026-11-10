@@ -13,6 +13,7 @@
 // tab, no filter) are the absent params, which keeps the bare repo URL clean.
 import { createResource, createSignal, createEffect, onCleanup, For, Show } from "solid-js";
 import { A, useParams, useNavigate, useSearchParams } from "@solidjs/router";
+import { orgPageHref } from "../org-page";
 import { recordVisit } from "../visited";
 import {
   listRepoRuns,
@@ -308,7 +309,11 @@ export default function RepoView() {
 
       <div class="page-head">
         <h1>
-          <span class="head-org">{org()}/</span>{repo()}
+          <A href={orgPageHref(org())} class="head-org" title={`${org()}: repositories and recent runs`}>
+            {org()}
+          </A>
+          <span class="head-org">/</span>
+          {repo()}
         </h1>
       </div>
       {/* Always rendered (fixed height) so the tab row never shifts between

@@ -10,6 +10,7 @@
 // re-adoptions are witnessed.
 import { createSignal, createEffect, createResource, onMount, onCleanup, For, Show } from "solid-js";
 import { A, useParams, useNavigate } from "@solidjs/router";
+import { orgPageHref } from "../org-page";
 import {
   getRun,
   fetchEvents,
@@ -746,6 +747,8 @@ export default function RunDetail() {
             <div class="run-head">
               <span class={`sdot lg ${r().status}`} />
               <h1 class="crumb-head">
+                <A href={orgPageHref(org())} class="crumb-head-org">{org()}</A>
+                <Icon icon="chevron-right" size={20} class="crumb-head-sep" />
                 <A href={`/${org()}/${repo()}`} class="crumb-head-link">{repo()}</A>
                 <Icon icon="chevron-right" size={20} class="crumb-head-sep" />
                 {/* The per-repo run number `#N` is the human handle (ADR-0057);

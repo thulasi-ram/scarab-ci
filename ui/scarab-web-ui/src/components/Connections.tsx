@@ -5,21 +5,22 @@
 // resolves a forge coordinate to a governed Project, and a Project *is* that
 // binding. So this list is the whole footprint of Scarab's reach.
 //
-// The surface is **asymmetric by forge**, and that asymmetry is the design:
+// The connection itself differs by forge:
 //
-// - **GitHub is observe-only.** Installing the App *is* registration — there is
-//   no API for Scarab to install it, uninstall it, or change which repos it
-//   covers. Pretending otherwise would mean a create form that cannot work. What
-//   the UI can honestly offer is a deep link to the place that does own it, and a
-//   **re-sync** for the one failure mode Scarab can fix by itself: a dropped
-//   `installation_repositories` delivery leaving a covered repo with no Project.
-// - **Forgejo is fully in-product.** It emits no installation event, so an admin
-//   adds the connection here (base URL + token) — the only route that existed
-//   before was a hand-written database row. This is the one place a Forgejo
-//   connection is added: Add Forgejo connection on an org's Connections, or,
-//   for an org that does not exist yet, the New organization page
-//   (`NewOrgConnection`), which shows the same form with a field for the
-//   org's name.
+// - **GitHub** connections register themselves: installing the App creates
+//   the connection. Scarab cannot install, uninstall or change which repos it
+//   covers, so the row links to GitHub for that.
+// - **Forgejo** emits no installation event, so an admin adds the connection
+//   here (base URL + token). This is the one place a Forgejo connection is
+//   added: Add Forgejo connection on an org's Connections, or, for an org that
+//   does not exist yet, the New organization page (`NewOrgConnection`), which
+//   shows the same form with a field for the org's name.
+//
+// Repositories are opt-in for both. What a connection reaches is only
+// available; Add repository (or Enable on the org page) binds one, which
+// creates its project, and Remove unbinds it. Nothing the forge sends binds a
+// repository again, so a removed one stays removed. Re-sync asks the forge what
+// it reaches and lists what is not enabled.
 //
 // The token is write-only: it is typed once, posted once, and never rendered.
 // The row reports whether the *handle* resolves, which is the question an
@@ -31,7 +32,7 @@
 // global admin in a panel of its own, on every org's page, because no org's
 // list includes it.
 import { createResource, createSignal, For, Show, type JSX } from "solid-js";
-import { useNavigate } from "@solidjs/router";
+import { A, useNavigate } from "@solidjs/router";
 import {
   assignConnectionOrg,
   availableRepos,
@@ -56,6 +57,7 @@ import {
 import { relTime } from "../fmt";
 import { me, refetchMe } from "../session";
 import { FIRST_ORG_SECTION, orgHref } from "../settings-nav";
+import { orgPageHref } from "../org-page";
 import FormSection from "./FormSection";
 import Modal, { ModalMessage, ModalSection } from "./Modal";
 import ConfirmDestructive from "./ConfirmDestructive";
@@ -101,8 +103,9 @@ export default function Connections(props: { org: string }) {
                 <p class="empty">
                   No forge connected to <b class="mono">{props.org}</b> yet. For GitHub, install
                   the Scarab App on the <span class="mono">{props.org}</span> account. The
-                  installation webhook registers the connection and its repositories. For Forgejo
-                  or Codeberg, add the connection below.
+                  installation webhook registers the connection; you then enable its repositories
+                  on the <A href={orgPageHref(props.org)}>organization page</A>. For Forgejo or
+                  Codeberg, add the connection below.
                 </p>
               }
             >
@@ -121,7 +124,8 @@ export default function Connections(props: { org: string }) {
               <small>
                 GitHub connections register themselves when the App is installed, so there is
                 nothing to add here for them. A connection binds only repositories owned by{" "}
-                <span class="mono">{props.org}</span>.
+                <span class="mono">{props.org}</span>, and only the ones you enable: see the{" "}
+                <A href={orgPageHref(props.org)}>organization page</A>.
               </small>
             </p>
           </Show>
@@ -350,13 +354,15 @@ function ConnectionRow(props: { conn: Connection; onChanged: () => void }) {
   const [removing, setRemoving] = createSignal(false);
   const [assigning, setAssigning] = createSignal(false);
 
-  // Which connections accept in-product repo management. GitHub does not: its
-  // repo selection lives on GitHub (the App's coverage decides it), so an add or
-  // remove here would be undone by the next `installation_repositories`
-  // delivery. Config-owned connections are read-only wherever they come from.
-  // An unassigned connection serves no org, so there is no owner to bind
+  // Which connections accept in-product repo management: every kind, since
+  // enabling a repository is opt-in and the forge never re-binds one.
+  // Config-owned connections are read-only wherever they come from. An
+  // unassigned connection serves no org, so there is no owner to bind
   // repositories for: it offers assign and remove only.
-  const manual = () => c().kind !== "github" && !c().managed_by_config && c().org != null;
+  const manual = () => !c().managed_by_config && c().org != null;
+  // GitHub's App receives every repository's events on one endpoint, so there
+  // is no per-repository webhook to register.
+  const hooks = () => c().kind !== "github";
 
   const resync = async () => {
     setBusy(true);
@@ -462,7 +468,7 @@ function ConnectionRow(props: { conn: Connection; onChanged: () => void }) {
           <button
             class="btn btn-ghost btn-sm"
             disabled={busy()}
-            title="Ask the forge which repositories this connection covers and bind any that are missing"
+            title="Ask the forge which repositories this connection reaches and list the ones not enabled"
             onClick={resync}
           >
             <Icon icon="rotate-cw" size={13} /> {busy() ? "Re-syncing…" : "Re-sync"}
@@ -506,7 +512,18 @@ function ConnectionRow(props: { conn: Connection; onChanged: () => void }) {
       <div class="conn-projects">
         <Show
           when={c().projects.length > 0}
-          fallback={<span class="subtle">No repositories bound yet.</span>}
+          fallback={
+            <span class="subtle">
+              No repositories enabled yet.
+              <Show when={c().org}>
+                {(o) => (
+                  <>
+                    {" "}Enable them on the <A href={orgPageHref(o())}>organization page</A>.
+                  </>
+                )}
+              </Show>
+            </span>
+          }
         >
           <For each={c().projects}>
             {(p) => (
@@ -514,19 +531,17 @@ function ConnectionRow(props: { conn: Connection; onChanged: () => void }) {
                 <a class="conn-proj mono" href={`/${p.org}/${p.project}`}>
                   {p.org}/{p.project}
                 </a>
-                {/* Manual repo management only where it is real. GitHub's repo
-                    selection lives on GitHub — the App's coverage decides it, and
-                    an unbind here would just be undone by the next
-                    `installation_repositories` delivery. */}
                 <Show when={manual()}>
-                  <button
-                    class="btn btn-ghost btn-sm"
-                    disabled={busy()}
-                    title="Register (or re-register) this repository's webhook on the forge"
-                    onClick={() => registerWebhook(p.owner, p.name)}
-                  >
-                    <Icon icon="rotate-cw" size={12} /> Webhook
-                  </button>
+                  <Show when={hooks()}>
+                    <button
+                      class="btn btn-ghost btn-sm"
+                      disabled={busy()}
+                      title="Register (or re-register) this repository's webhook on the forge"
+                      onClick={() => registerWebhook(p.owner, p.name)}
+                    >
+                      <Icon icon="rotate-cw" size={12} /> Webhook
+                    </button>
+                  </Show>
                   <button
                     class="btn btn-danger btn-sm"
                     disabled={busy()}
@@ -575,7 +590,10 @@ function ConnectionRow(props: { conn: Connection; onChanged: () => void }) {
             onConfirm={() => removeRepo(r().owner, r().name)}
             onClose={() => setRemovingRepo(null)}
           >
-            <p>The repository itself and its webhook are untouched.</p>
+            <p>
+              The repository itself and its webhook are untouched. No installation event or
+              re-sync adds it back; you can enable it again from the organization page.
+            </p>
           </ConfirmDestructive>
         )}
       </Show>
@@ -809,7 +827,8 @@ function PreflightGap(props: { gap: CapabilityRequirement; muted?: boolean }) {
 /**
  * Bring repos on a connection under governance. Binding **creates the Project**
  * (there is no `projects` table — a Project is the binding), which is
- * why this dialog is the Forgejo onboarding flow and not a convenience.
+ * why this dialog is the onboarding flow and not a convenience: no forge
+ * binds a repository by itself. The org page offers the same as Enable.
  *
  * The pick-list comes from the forge, so nobody types `owner/name`. When the
  * adapter cannot enumerate, the field is offered instead — "I cannot look" and
@@ -865,7 +884,11 @@ function AddRepoDialog(props: {
     <Modal
       eyebrow={`${org()} · ${props.conn.id}`}
       title="Add repository"
-      purpose="Adding a repository creates its project and registers a webhook, so pushes start runs."
+      purpose={
+        props.conn.kind === "github"
+          ? "Adding a repository creates its project, so pushes start runs."
+          : "Adding a repository creates its project and registers a webhook, so pushes start runs."
+      }
       busy={busy() != null}
       onClose={props.onClose}
       footer={
