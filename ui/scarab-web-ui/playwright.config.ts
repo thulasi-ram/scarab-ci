@@ -5,7 +5,10 @@
 // derivations and the rendered DOM) are not browser-specific.
 import { defineConfig, devices } from "@playwright/test";
 
-const PORT = 4173;
+// PLAYWRIGHT_PORT lets parallel runs in different worktrees use their own
+// server. Never reuse a running server: on a busy port the run fails instead
+// of testing another branch's code.
+const PORT = Number(process.env.PLAYWRIGHT_PORT ?? 4173);
 
 export default defineConfig({
   testDir: "e2e",
@@ -21,7 +24,7 @@ export default defineConfig({
     // strict port so a stray dev server on 5173 never gets picked up silently.
     command: `npm run dev:mock -- --port ${PORT} --strictPort`,
     url: `http://localhost:${PORT}`,
-    reuseExistingServer: !process.env.CI,
+    reuseExistingServer: false,
     timeout: 60_000,
   },
 });

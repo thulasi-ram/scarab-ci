@@ -4,6 +4,9 @@
   `crates/scarab-plugin-argocd`, migrations `0055_plugins.sql` and
   `0056_plugin_connections.sql`, the `/v1/orgs/{org}/plugins/*` routes). See
   [Implementation horizon](#implementation-horizon) for what is still open.
+- **Amended:** 2026-11-10 by PR #152 (§10 publisher trust, Consequences and Implementation
+  horizon: every plugin installs through one path, third-party installs are on, no publisher
+  is trusted by default, and no image signature is checked yet; see the notes at those places)
 - **Date:** 2026-10-22
 - **Deciders:** thulasi.ram (architect)
 - **Builds on:** [0008](0008-step-contract.md) (a Step is any OCI image; the step
@@ -292,6 +295,36 @@ defend against `trusted_dom` code, which can change what is being confirmed.
   uninstall. It revokes at the token-to-installation mapping (§11), so the installation's
   reports and broker requests stop being accepted even before its token expires.
 
+> **Amended 2026-11-10 by PR #152 — every plugin installs the same way, and no publisher is
+> trusted by default.** The owner decided that code Scarab publishes is untrusted code like
+> anyone else's, so it gets no special case. The "Publisher trust" bullet above no longer
+> describes what runs: Scarab's own release identity is not trusted by default, and no plugin
+> is installed or allowed because of who published it. What is built:
+>
+> - **One install path.** An org admin reads a plugin's PluginManifest from a git source
+>   pinned to a commit with `POST /v1/orgs/{org}/plugin-fetch`, which installs nothing, and
+>   reviews what it asks for. `POST /v1/orgs/{org}/plugins` then installs
+>   `<repo>@sha256:<digest>` with the `manifest_sha256` that fetch returned. The server reads
+>   the source again and answers 409 when the manifest there no longer has that hash
+>   (`crates/scarab-server/src/plugins.rs`). Every install needs the same step-up,
+>   `plugin.install` (`crates/scarab-server/src/step_up/ops.rs`), whoever published the plugin.
+> - **No catalog.** The compiled-in Argo CD catalog entry and `SCARAB_PLUGIN_ARGOCD_REPO` are
+>   removed. Argo CD installs through the same two calls, with its manifest read from
+>   `crates/scarab-plugin-argocd/manifest.json` and its image published as
+>   `ghcr.io/thulasi-ram/scarab-plugin-argocd`.
+> - **Third-party installs are on** (see Consequences).
+>
+> The gaps this leaves:
+>
+> - **No signature is checked.** PluginPublisher signatures are not built, so an install is
+>   approved by its *(image digest, manifest)* alone. The bullet above stays as the design for
+>   signatures, without a publisher trusted by default. The operator ceiling's "which
+>   publishers may be trusted at all" waits for signatures too.
+> - **The manifest does not name its image.** The admin pairs a digest with the reviewed
+>   manifest, and nothing checks that the image is the one the manifest was written for.
+>   Plugin upgrade (the "Upgrades" bullet, which has no route yet) is the next planned change
+>   and is meant to close this gap. It is not built.
+
 ### 11. Reports reach core by push, under an identity core sets
 
 - **Push to the broker.** A reporting Plugin pushes DeploymentStatusReports to a reserved
@@ -327,6 +360,10 @@ defend against `trusted_dom` code, which can change what is being confirmed.
   that does not enforce it fail loudly rather than run unprotected.
 - Third-party installs stay **off** until StepUpConfirmation and publisher signatures
   exist. Until then only first-party plugins run.
+
+  > **Amended 2026-11-10 by PR #152.** Third-party installs are on. StepUpConfirmation is built
+  > and every plugin install needs it; publisher signatures are not built, and installs no
+  > longer wait for them. Scarab's own plugins install the same way. See the note under §10.
 - New components: a plugin runtime, a broker, a capability check, `plugin_action`, UI
   extension points, step-up. This is the largest new subsystem since the engine.
 - Verifying projected tokens needs TokenReview RBAC (`system:auth-delegator`) for the
@@ -384,3 +421,8 @@ defend against `trusted_dom` code, which can change what is being confirmed.
 - **Target state:** StepUpConfirmation; PluginPublisher signatures and the operator
   ceiling (which together switch third-party installs on); `approve_gates`;
   `subscribe_events`; `delivered` credentials; `trusted_dom`.
+
+> **Amended 2026-11-10 by PR #152.** "Third-party installs **off**" in the MMP and "which
+> together switch third-party installs on" in the target state no longer hold: third-party
+> installs are on without signatures, through the one install path in §10's note.
+> PluginPublisher signatures and the operator ceiling stay in the target state.
