@@ -321,6 +321,9 @@ function ResyncDialog(props: {
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
   const [result, setResult] = createSignal<ReturnType<typeof resyncDiff> | null>(null);
+  // Set once the import itself succeeded, so a failed read afterwards is not
+  // reported as a failed re-sync.
+  const [done, setDone] = createSignal(false);
 
   const run = async () => {
     setBusy(true);
@@ -328,9 +331,14 @@ function ResyncDialog(props: {
     try {
       const before: Binding[] = (await listBindings(props.org)) ?? [];
       await importFromForge(props.org, props.repo);
-      const after: Binding[] = (await listBindings(props.org)) ?? [];
-      setResult(resyncDiff(before, after, props.repo));
+      setDone(true);
       props.onDone();
+      try {
+        const after: Binding[] = (await listBindings(props.org)) ?? [];
+        setResult(resyncDiff(before, after, props.repo));
+      } catch {
+        setError("Re-synced. Could not load what changed; the Access list shows the roles now.");
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : "The re-sync failed.");
     } finally {
@@ -357,7 +365,7 @@ function ResyncDialog(props: {
             <ModalMessage>{error()}</ModalMessage>
           </Show>
           <Show
-            when={result()}
+            when={done()}
             fallback={
               <>
                 <button class="btn btn-ghost" type="button" onClick={props.onClose} disabled={busy()}>
