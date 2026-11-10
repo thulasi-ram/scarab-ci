@@ -203,6 +203,55 @@ async fn post_start_classes_fail_immediately_without_the_assertion() {
     }
 }
 
+/// An attempt that ends before its process ran has its unit torn down, the
+/// way the provisioning deadline already tears one down. The demo box
+/// (2026-11-10): an Unschedulable Pod was kept after its attempt ended, its
+/// forge-token Secret was deleted, and when CPU freed up the Pod was
+/// scheduled, could never mount the Secret, and held its CPU request in Init.
+/// Two of those made every later step Unschedulable. A unit whose process
+/// ran is kept for inspection, as before.
+#[tokio::test]
+async fn a_failure_before_the_process_ran_tears_the_unit_down() {
+    for (class, torn_down) in [
+        (
+            FailureClass::Infra {
+                never_started: true,
+            },
+            true,
+        ),
+        (FailureClass::Config, true),
+        (FailureClass::MissingInputs, true),
+        (
+            FailureClass::Infra {
+                never_started: false,
+            },
+            false,
+        ),
+        (FailureClass::Step, false),
+        (FailureClass::Timeout, false),
+    ] {
+        let (db, clock, exec) = (
+            InMemoryDb::new(),
+            FakeClock::new(1_000),
+            FakeExecutor::new(),
+        );
+        seed(&db, None).await;
+        exec.script_outcome(failed(class.clone()));
+        tick(&db, &clock, &exec).await; // a1 launches
+        tick(&db, &clock, &exec).await; // a1's poll reports the failure
+
+        assert!(
+            attempts(&db).await[0].failure.is_some(),
+            "{class:?}: a1 settled"
+        );
+        assert_eq!(
+            exec.cancelled_handles().contains(&handle(1).0),
+            torn_down,
+            "{class:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn configured_retry_covers_post_start_failures_and_consumes_budget() {
     let (db, clock, exec) = (
