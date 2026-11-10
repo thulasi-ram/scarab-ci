@@ -290,8 +290,19 @@ const strip = (pattern: string, first = 120) =>
       ...(i % 3 === 2 ? { environment: i % 2 ? "production" : "staging" } : {}),
     })),
   });
+// Two of scarab's runs were started by its nightly schedule (trigger kind
+// `cron`, titled with the expression, as the server records them), so the
+// Runs tab's scheduled filter and the Schedules tab's Runs link have rows.
+const scarabRuns = strip("ooxooooxooxooo");
+for (const i of [3, 7]) {
+  Object.assign(scarabRuns.runs[i]!, {
+    trigger_kind: "cron",
+    trigger_title: "0 2 * * *",
+    pipeline: "nightly",
+  });
+}
 const repoRuns: Record<string, ReturnType<typeof strip>> = {
-  scarab: strip("ooxooooxooxooo"), // ~64% pass window near the older tail
+  scarab: scarabRuns, // ~64% pass window near the older tail
   "orders-api": strip("oxooxooxooooo"),
   "inventory-svc": strip("oxoxooxxooxoo"), // ~50%
   "edge-gateway": strip("ooooooooxoooo"), // ~93%
@@ -1399,10 +1410,11 @@ function setRepoEnabled(owner: string, name: string, enabled: boolean): OrgRepoD
 // SLACK_WEBHOOK_URL is production-only with qa unset on purpose. Its
 // environment columns are the org Environments the project may deploy into:
 // production and qa, as `projectEnvironments` lists them.
-// ── /v1/repos/acme/scarab/schedules: two `on: cron:` schedules ─────────────
+// ── /v1/repos/acme/scarab/schedules: three `on: cron:` schedules ───────────
 // The nightly one's last slot started a Run (the scarab run fixture); the
-// weekly one's last slot was missed, so it is also a refused row in the runs
-// list, as the server records it.
+// weekly audit's last slot was missed, so it is also a refused row in the runs
+// list, as the server records it; the docs one was added since its last slot,
+// so it has not fired yet.
 const DAY = 24 * 60 * min;
 /** The next UTC slot at `hour`:00, on `weekday` (0 = Sunday) when given. */
 function nextUtc(hour: number, weekday?: number): number {
@@ -1428,6 +1440,13 @@ const schedules: ScheduleDto[] = [
     next_fire_at: nextUtc(6, 1),
     source_sha: SCHEDULE_SHA,
     last_fire: { schedule: "0 6 * * 1", slot_at: nextUtc(6, 1) - 7 * DAY, outcome: "missed" },
+  },
+  {
+    pipeline: ".scarab/docs.yaml",
+    schedule: "0 4 * * 0",
+    next_fire_at: nextUtc(4, 0),
+    source_sha: SCHEDULE_SHA,
+    last_fire: null,
   },
 ];
 const missedSlotMessage =

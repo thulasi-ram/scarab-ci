@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { fireOutcome } from "./schedules";
+import { fireOutcome, isScheduled, scheduledRunsHref } from "./schedules";
 
 describe("fireOutcome", () => {
   it("reads a refused or missed slot as a failure, as the refused list does", () => {
@@ -13,3 +13,20 @@ describe("fireOutcome", () => {
   });
 });
 
+
+describe("isScheduled", () => {
+  it("matches only the cron trigger kind", () => {
+    expect(isScheduled("cron")).toBe(true);
+    expect(isScheduled("push")).toBe(false);
+    expect(isScheduled(null)).toBe(false);
+    expect(isScheduled(undefined)).toBe(false);
+  });
+});
+
+describe("scheduledRunsHref", () => {
+  it("opens the Runs tab on the scheduled filter and the pipeline's short name", () => {
+    expect(scheduledRunsHref("acme", "scarab", ".scarab/nightly.yaml")).toBe(
+      "/acme/scarab?scheduled=1&pipeline=nightly",
+    );
+  });
+});
