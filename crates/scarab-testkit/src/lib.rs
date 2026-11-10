@@ -2518,6 +2518,26 @@ impl Db for InMemoryDb {
         Ok(out)
     }
 
+    async fn run_settlements(
+        &self,
+        runs: &[RunId],
+    ) -> Result<Vec<scarab_engine::RunSettlement>, DbError> {
+        let st = self.state.lock().unwrap();
+        Ok(runs
+            .iter()
+            .filter_map(|run| {
+                let status = *st.runs.get(run)?;
+                Some(scarab_engine::RunSettlement {
+                    run: run.clone(),
+                    status,
+                    // The fake tracks only creation time; the retention
+                    // sweeps above use it as the settle clock too.
+                    settled_at: st.run_created.get(run).copied().unwrap_or(Timestamp(0)),
+                })
+            })
+            .collect())
+    }
+
     async fn log_object_keys_of_run(&self, run: &RunId) -> Result<Vec<String>, DbError> {
         let st = self.state.lock().unwrap();
         Ok(st

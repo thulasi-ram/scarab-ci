@@ -137,6 +137,18 @@ pub struct SnapshotRetention {
     pub pinned_by: Option<String>,
 }
 
+/// A Run's status and the time of its last status change, as
+/// [`Db::run_settlements`] reports it. For a terminal Run the time is when it
+/// finished.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunSettlement {
+    pub run: RunId,
+    pub status: RunStatus,
+    /// The same column [`SnapshotRetention::settled_at`] and the retention
+    /// sweeps read (`runs.updated_at`).
+    pub settled_at: Timestamp,
+}
+
 /// Whether the **immutable Workspace Snapshot** a DAG edge names can still be
 /// materialised (ADR-0061 s5).
 ///
@@ -1278,6 +1290,13 @@ pub trait Db: Send + Sync {
     /// weeks) is NEVER returned, regardless of age.
     async fn prunable_log_runs(&self, cutoff: Timestamp, limit: u32)
         -> Result<Vec<RunId>, DbError>;
+
+    /// The status and last status-change time of each of `runs` that exists
+    /// in this database, in no particular order. An id this database does not
+    /// know is left out, so a caller can tell "not ours" from "ours". The step
+    /// Pod sweep (git-bug 986542a) reads it to decide which leftover Pods to
+    /// delete.
+    async fn run_settlements(&self, runs: &[RunId]) -> Result<Vec<RunSettlement>, DbError>;
 
     /// Every log-chunk object key a run holds (across steps/attempts) — what
     /// the sweeper deletes from the object store before dropping the index.

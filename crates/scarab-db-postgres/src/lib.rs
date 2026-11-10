@@ -2857,6 +2857,30 @@ impl Db for PostgresDb {
             .collect())
     }
 
+    async fn run_settlements(
+        &self,
+        runs: &[RunId],
+    ) -> Result<Vec<scarab_engine::RunSettlement>, DbError> {
+        if runs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<&str> = runs.iter().map(|r| r.0.as_str()).collect();
+        let rows = sqlx::query("SELECT id, status, updated_at FROM runs WHERE id = ANY($1)")
+            .bind(&ids)
+            .fetch_all(self.pool())
+            .await
+            .map_err(db_err)?;
+        rows.into_iter()
+            .map(|r| -> Result<scarab_engine::RunSettlement, DbError> {
+                Ok(scarab_engine::RunSettlement {
+                    run: RunId(r.get::<String, _>("id")),
+                    status: run_status_from_str(r.get::<String, _>("status"))?,
+                    settled_at: Timestamp(r.get::<i64, _>("updated_at")),
+                })
+            })
+            .collect()
+    }
+
     async fn log_object_keys_of_run(&self, run: &RunId) -> Result<Vec<String>, DbError> {
         let rows = sqlx::query("SELECT object_key FROM log_chunks WHERE run_id = $1")
             .bind(&run.0)

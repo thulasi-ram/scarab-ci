@@ -187,8 +187,12 @@ spec:
                 # right depth for a demo — the DB holds run history, and run
                 # CONTENT already expires in 3-7 days (see the
                 # SCARAB_RETENTION_* values in values.yaml).
+                #
+                # BACKUP_KEY replaces the slot: deploy.sh sets it on the one-off
+                # Job it takes before an upgrade, so that dump has its own key
+                # and never overwrites a nightly one.
                 - |
-                  key="pg/scarab-$(date -u +%u).dump"
+                  key="${BACKUP_KEY:-pg/scarab-$(date -u +%u).dump}"
                   echo "==> uploading /dump/scarab.dump -> s3://$S3_BUCKET/$key"
                   aws s3 cp /dump/scarab.dump "s3://$S3_BUCKET/$key" \
                     --endpoint-url "$S3_ENDPOINT" --only-show-errors
