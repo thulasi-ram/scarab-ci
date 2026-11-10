@@ -1246,14 +1246,14 @@ const availableRepos = [
   { owner: "acme", name: "runbooks", bound: false },
   { owner: "globex", name: "shared-ci", bound: false },
 ];
-// The coverage matrix is now the repo/environment secret EDITOR, so
-// the fixture carries the repo-default column ("") and inheritance origins:
-// GHCR_TOKEN comes from the org, SENTRY_DSN is a repo key that overrides the
-// org's, DATABASE_URL is a repo default overridden in both environments,
-// SLACK_WEBHOOK_URL is production-only with qa silenced. The repo Secrets list
-// shows GHCR_TOKEN and SLACK_WEBHOOK_URL greyed out beside the repo's own keys.
-// Its environment columns are the org Environments the project may deploy
-// into — production and qa, as `projectEnvironments` lists them.
+// The secret matrix behind a repo's Secrets key list carries the
+// repo-default column ("") and inheritance origins: GHCR_TOKEN comes from the
+// org (the `org` tag), SENTRY_DSN is a repo key that overrides the org's and is
+// inherited in both environments (so its expanded lines fold them away),
+// DATABASE_URL is a repo default overridden in both environments, and
+// SLACK_WEBHOOK_URL is production-only with qa unset on purpose. Its
+// environment columns are the org Environments the project may deploy into:
+// production and qa, as `projectEnvironments` lists them.
 // ── /v1/repos/acme/scarab/schedules: two `on: cron:` schedules ─────────────
 // The nightly one's last slot started a Run (the scarab run fixture); the
 // weekly one's last slot was missed, so it is also a refused row in the runs
