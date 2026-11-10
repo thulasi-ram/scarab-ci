@@ -336,12 +336,7 @@ function EditForm(props: { org: string; stored?: PolicyRecord; onSaved: () => vo
             >
               <Select mono value={form().checkpoint} onValue={(v) => edit({ checkpoint: v })}>
                 <For each={checkpoints() ?? [{ checkpoint: form().checkpoint } as PolicyCheckpointInfo]}>
-                  {(c) => (
-                    // `selected` keeps the choice when the options load after the form.
-                    <option value={c.checkpoint} selected={c.checkpoint === form().checkpoint}>
-                      {c.checkpoint}
-                    </option>
-                  )}
+                  {(c) => <option value={c.checkpoint}>{c.checkpoint}</option>}
                 </For>
               </Select>
             </Field>

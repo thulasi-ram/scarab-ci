@@ -713,13 +713,6 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
   color: var(--muted-sage);
 }
 
-/* A select's own box is taller than a text field's at the same padding; pin it
-   to the text field's height (line + padding + border) so controls line up. */
-select.input {
-  height: calc(17px + 2 * 8px + 2px);
-  cursor: pointer;
-}
-
 .input:focus {
   outline: none;
   border-color: var(--emerald);
@@ -1609,12 +1602,17 @@ select.input {
   width: 100%; justify-content: flex-start; gap: 8px;
   padding: 8px 10px; font: var(--t-body); line-height: 17px; border-radius: var(--radius-sm);
 }
-.ss-block .ss-label { color: var(--soft-white); }
-.ss-block .ss-caret { margin-left: auto; }
+.ss-block .ss-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; color: var(--soft-white); }
+.ss-block .ss-caret { margin-left: auto; flex: none; }
+.ss-block.mono { font: var(--t-mono); }
+/* The sidebar size: full width, a little shorter than a form field. */
+.ss-block.ss-compact { padding: 5px 8px; }
+.ss-trigger:focus-visible { outline: 2px solid var(--emerald); outline-offset: 2px; }
 
 .ss-pop {
   position: fixed; z-index: 1000;
-  padding: 5px; min-width: 200px; max-width: 380px;
+  display: flex; flex-direction: column;
+  padding: 5px; min-width: 200px; max-width: min(380px, calc(100vw - 16px));
   background: var(--emerald-elevated); border: 1px solid var(--border);
   border-radius: var(--radius-sm); box-shadow: 0 10px 30px rgba(0, 0, 0, 0.28);
 }
@@ -1627,7 +1625,8 @@ select.input {
   width: 100%; border: none; background: none; outline: none;
   font: var(--t-body); color: var(--soft-white);
 }
-.ss-list { list-style: none; margin: 5px 0 0; padding: 0; max-height: 256px; overflow-y: auto; }
+.ss-list { list-style: none; margin: 0; padding: 0; max-height: 256px; overflow-y: auto; overscroll-behavior: contain; }
+.ss-search + .ss-list { margin-top: 5px; }
 .ss-opt {
   display: flex; align-items: center; gap: 8px;
   padding: 7px 8px; border-radius: 4px; cursor: pointer;
@@ -1635,6 +1634,11 @@ select.input {
 }
 .ss-opt.on { background: color-mix(in srgb, var(--emerald) 15%, transparent); }
 .ss-opt.ss-clear { color: var(--muted-sage); }
+.ss-opt.ss-dis { cursor: default; color: var(--muted-sage); }
+.ss-opt-ic { flex: none; color: var(--muted-sage); }
+.ss-pop.mono .ss-opt { font: var(--t-mono); }
+.ss-sep { height: 1px; margin: 4px 2px; background: var(--border-soft); }
+.ss-group { padding: 8px 8px 3px; font: var(--t-label); color: var(--muted-sage); }
 .ss-opt-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ss-tag {
   flex: none; font: var(--t-label);
@@ -3806,9 +3810,9 @@ code.c { font: var(--t-mono); color: var(--copper); }
 .lib-table td { font: var(--t-body); }
 
 /* Settings shell (git-bug 734ffa1): an in-page sidebar inside the .page
-   column, one page's sections only; under 900px the list becomes a <select>
+   column, one page's sections only; under 900px the list becomes a dropdown
    above the section, and the sidebar keeps only its heading and the org
-   dropdown, above that <select>. */
+   dropdown, above that one. */
 .settings { display: grid; grid-template-columns: 200px minmax(0, 1fr); gap: 40px; }
 .settings-nav { position: sticky; top: 16px; align-self: start; display: flex; flex-direction: column; gap: 14px; padding-top: 6px; }
 .settings-nav-group { display: flex; flex-direction: column; gap: 1px; }
@@ -3929,9 +3933,20 @@ code.c { font: var(--t-mono); color: var(--copper); }
 .f-inp::placeholder { color: var(--muted-sage); opacity: 1; }
 .f-inp:disabled { cursor: not-allowed; color: var(--muted-sage); -webkit-text-fill-color: var(--muted-sage); }
 .f-aff { font: var(--t-mono); color: var(--muted-sage); white-space: nowrap; }
-.f-sel select.f-inp { appearance: none; -webkit-appearance: none; cursor: pointer; padding-right: 22px; }
-.f-sel select.f-inp option { background: var(--emerald-elevated); color: var(--soft-white); }
-.f-chev { position: absolute; right: 9px; display: inline-flex; pointer-events: none; color: var(--muted-sage); }
+/* A Select is a SearchSelect trigger filling the box; the box draws the
+   border and the focus ring. */
+.f-sel { padding: 0; }
+.ss-trigger.ss-field {
+  flex: 1; min-width: 0; height: 28px; padding: 0 9px; gap: 8px;
+  border: 0; border-radius: inherit; background: transparent;
+  font: var(--t-body); color: var(--soft-white); text-align: left;
+}
+.ss-trigger.ss-field.mono { font: var(--t-mono); }
+.ss-field .ss-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--soft-white); }
+.ss-field .ss-placeholder { color: var(--muted-sage); }
+.ss-field:focus-visible { outline: none; }
+.ss-trigger.ss-field:disabled { opacity: 1; color: var(--muted-sage); }
+.ss-field:disabled .ss-label { color: var(--muted-sage); }
 .f-area { align-items: stretch; padding: 6px 9px; }
 .f-area textarea.f-inp { height: auto; min-height: 80px; resize: vertical; line-height: 1.6; tab-size: 2; }
 

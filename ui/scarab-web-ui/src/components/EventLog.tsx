@@ -89,9 +89,7 @@ export default function EventLog(props: { org: string }) {
               <option value="">All events</option>
               <For each={EVENT_KINDS}>
                 {(k) => (
-                  <option value={k} selected={k === view().kind}>
-                    {eventKindLabel(k)}
-                  </option>
+                  <option value={k}>{eventKindLabel(k)}</option>
                 )}
               </For>
             </Select>
