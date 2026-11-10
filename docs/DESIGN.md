@@ -310,9 +310,15 @@ Placement is stricter than doodles, because motion competes with content:
   replaces the help line and marks the box. Values are in the UI face; mono only
   for machine values (ids, refs, keys, paths, URLs). Secret values are
   `type=password` and **write-only** (never rendered back).
+- Every dropdown is `SearchSelect` (`components/SearchSelect.tsx`); there is
+  no native `<select>`. `Select` puts it in the form box. A list of more than
+  eight options gets a search box; a shorter one is a plain list you move
+  through with the arrow keys and type-ahead. Options can sit under group
+  headings, behind a rule (an entry such as "New organization…"), or show
+  disabled. The list is portalled to `<body>`, so it is never clipped and
+  stacks above a dialog.
 - A few controls stay plain on purpose: the command palette, the repo filter,
-  the search inside `SearchSelect`, the settings section and org pickers, and the
-  reject-reason box on a gate.
+  the search inside `SearchSelect`, and the reject-reason box on a gate.
 
 ### Tabs & filter pills
 - Tabs: text buttons, active → `--emerald` text + emerald underline. Filter

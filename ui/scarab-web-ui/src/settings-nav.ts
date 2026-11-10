@@ -100,7 +100,7 @@ export function resolveSection(
  * The href of the sidebar section `pathname` sits in: the section's own URL,
  * or the section a page under it belongs to (`…/environments/<name>/edit` is
  * in Environments, `…/libraries/review` in Libraries). The sidebar link and
- * the narrow-screen `<select>` both mark this one. `null` outside settings or
+ * the narrow-screen section dropdown both mark this one. `null` outside settings or
  * for a section that does not exist.
  *
  * The org is decoded and escaped again with `orgHref`, so the result

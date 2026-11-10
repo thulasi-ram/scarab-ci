@@ -8,7 +8,7 @@
 // admins of that org, with an org dropdown at the top of the sidebar). The
 // user menu links each one. The org dropdown's last entry, for global admins,
 // is New organization… (`/orgs/_new`): a new org's first forge connection, in
-// the same frame. Under ~900px the section list becomes a `<select>` above
+// the same frame. Under ~900px the section list becomes a dropdown above
 // the section, with the org dropdown above it. A page under a section (one
 // Environment, a library review) renders in the same frame, with its parent
 // section marked. The route table, the gating, which section a path sits in
@@ -58,6 +58,7 @@ import {
   PLUGIN_POLICIES_ANCHOR,
 } from "../policies";
 import Icon from "../components/Icon";
+import SearchSelect, { type SelectOption } from "../components/SearchSelect";
 
 const IDENTITY_ERROR = "Could not load your identity. Is the server up?";
 
@@ -126,7 +127,7 @@ function SettingsShell(props: { kind: SettingsGroupKind; org?: string; section?:
 
 /**
  * The settings page around `children`: the sidebar, the narrow-screen
- * `<select>`, and the main column. A section renders in it, and so does a
+ * section dropdown, and the main column. A section renders in it, and so does a
  * page under a section (one Environment, a library review), so the sidebar
  * stays in view and marks the section the page belongs to.
  *
@@ -178,19 +179,16 @@ export function SettingsFrame(props: {
 
             <div class="settings-main">
               <Show when={g().items.length > 0}>
-                <select
-                  class="input settings-select"
-                  aria-label="Settings section"
-                  onChange={(e) => nav(e.currentTarget.value)}
-                >
-                  <For each={g().items}>
-                    {(item) => (
-                      <option value={item.href} selected={active() === item.href}>
-                        {item.label}
-                      </option>
-                    )}
-                  </For>
-                </select>
+                <div class="settings-select">
+                  <SearchSelect
+                    class="ss-block"
+                    aria-label="Settings section"
+                    search={false}
+                    value={active() ?? ""}
+                    onChange={(href) => nav(href)}
+                    options={g().items.map((item) => ({ value: item.href, label: item.label }))}
+                  />
+                </div>
               </Show>
 
               <Switch fallback={props.children}>
@@ -261,29 +259,29 @@ export function SettingsCrumbs(props: { trail: Crumb[]; sub: JSX.Element }) {
  * org so it is always in the same place. Picking an org keeps the section in
  * view. For a global admin its last entry is New organization…, picked on
  * that page (`org` undefined). Under ~900px it stays above the section
- * `<select>`.
+ * dropdown. An org listed that you do not administer (the one in the URL)
+ * shows but cannot be picked.
  */
 function OrgPick(props: { org?: string; orgs: OrgChoice[]; newOrg: boolean; section?: string }) {
   const nav = useNavigate();
+  const options = (): SelectOption[] => [
+    ...props.orgs.map((c) => ({ value: c.org, label: c.org, disabled: !c.administered })),
+    ...(props.newOrg
+      ? [{ value: NEW_ORG_CHOICE, label: `${NEW_ORG_LABEL}…`, icon: "plus", separator: true }]
+      : []),
+  ];
   return (
-    <select
-      class="input settings-nav-orgpick mono"
-      aria-label="Organization"
-      onChange={(e) => nav(orgPickHref(e.currentTarget.value, props.section))}
-    >
-      <For each={props.orgs}>
-        {(c) => (
-          <option value={c.org} selected={c.org === props.org} disabled={!c.administered}>
-            {c.org}
-          </option>
-        )}
-      </For>
-      <Show when={props.newOrg}>
-        <option value={NEW_ORG_CHOICE} selected={props.org === undefined}>
-          {NEW_ORG_LABEL}…
-        </option>
-      </Show>
-    </select>
+    <div class="settings-nav-orgpick">
+      <SearchSelect
+        class="ss-block ss-compact"
+        mono
+        aria-label="Organization"
+        value={props.org ?? NEW_ORG_CHOICE}
+        onChange={(v) => nav(orgPickHref(v, props.section))}
+        options={options()}
+        searchPlaceholder="Search organizations…"
+      />
+    </div>
   );
 }
 

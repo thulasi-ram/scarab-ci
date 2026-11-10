@@ -3,7 +3,7 @@
 // under its own heading, the user menu reaches each page, a global admin makes
 // a new org from the org dropdown, the old addresses redirect, and nothing
 // errors on the way.
-import { test, expect, type Page } from "@playwright/test";
+import { test, expect, type Locator, type Page } from "@playwright/test";
 
 function collectErrors(page: Page): string[] {
   const errors: string[] = [];
@@ -12,6 +12,18 @@ function collectErrors(page: Page): string[] {
     if (msg.type() === "error") errors.push(`console.error: ${msg.text()}`);
   });
   return errors;
+}
+
+/** The options of an open dropdown (the app's one dropdown, not a native
+ *  select): open `combobox` first. */
+function listOptions(page: Page) {
+  return page.getByRole("listbox").getByRole("option");
+}
+
+/** Open the dropdown `combobox` and pick the option named `name`. */
+async function choose(page: Page, combobox: Locator, name: string) {
+  await combobox.click();
+  await listOptions(page).getByText(name, { exact: true }).click();
 }
 
 test("an admin lands on their org's settings", async ({ page }) => {
@@ -66,7 +78,7 @@ test("the user menu links each settings page, the org one to the org in view", a
   await expect(menu.getByRole("menuitem", { name: /settings$/ })).toHaveCount(2);
   await menu.getByRole("menuitem", { name: "Organization settings" }).click();
   await expect(page).toHaveURL(/\/orgs\/globex\/settings\/connections$/);
-  await expect(page.getByRole("combobox", { name: "Organization" })).toHaveValue("globex");
+  await expect(page.getByRole("combobox", { name: "Organization" })).toHaveText("globex");
 
   // Outside an org, it opens the first org the caller administers.
   await page.locator("button.avatar").click();
@@ -84,7 +96,10 @@ test("the org dropdown is there with one org, and on a narrow screen sits above 
   const pick = page.getByRole("combobox", { name: "Organization" });
   await expect(pick).toBeVisible();
   // The mock caller is a global admin, so New organization… ends the list.
-  await expect(pick.locator("option")).toHaveText(["acme", "New organization…"]);
+  await pick.click();
+  await expect(listOptions(page)).toHaveText(["acme", "New organization…"]);
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("listbox")).toHaveCount(0);
 
   await page.setViewportSize({ width: 600, height: 900 });
   const section = page.getByRole("combobox", { name: "Settings section" });
@@ -224,7 +239,7 @@ test("an environment's approval gate settings save and show on its page", async 
   await view.getByRole("link", { name: "Edit", exact: true }).click();
   const edit = page.locator("section.page");
   const mode = edit.getByRole("combobox", { name: "When a pipeline has no approval gate" });
-  await expect(mode).toHaveValue("add");
+  await expect(mode).toHaveText("Add an approval gate");
   await expect(edit.getByRole("textbox", { name: "Added gate expiry" })).toHaveValue("86400");
   await expect(edit.getByRole("textbox", { name: "Maximum approval age" })).toHaveValue("86400");
   // One approver: a count above it cannot be saved.
@@ -233,7 +248,7 @@ test("an environment's approval gate settings save and show on its page", async 
   await expect(edit.getByRole("alert")).toContainText("With one approver, the only count is 1.");
   await expect(edit.getByRole("button", { name: "Save", exact: true })).toBeDisabled();
   await required.fill("1");
-  await mode.selectOption("refuse");
+  await choose(page, mode, "Refuse the run");
   await edit.getByRole("button", { name: "Save", exact: true }).click();
 
   await expect(page).toHaveURL(/\/orgs\/acme\/settings\/environments\/production$/);
@@ -369,7 +384,7 @@ test("a new policy shows the checker's findings at its rule, completes field nam
   await page.goto("/orgs/acme/settings/policies");
   await page.getByRole("link", { name: "New policy" }).click();
   await expect(page).toHaveURL(/\/orgs\/acme\/settings\/policies\/new$/);
-  await expect(page.getByRole("combobox", { name: "Mode" })).toHaveValue("audit");
+  await expect(page.getByRole("combobox", { name: "Mode" })).toHaveText("audit");
 
   await page.getByRole("textbox", { name: "Name", exact: true }).fill("no-dev-deploys");
   const condition = page.getByRole("textbox", { name: "Condition" });
@@ -427,7 +442,7 @@ test("Paste YAML opens the policy in the editor, unsaved", async ({ page }) => {
   await dialog.getByRole("button", { name: "Open in editor" }).click();
   await expect(page).toHaveURL(/\/orgs\/acme\/settings\/policies\/new$/);
   await expect(page.getByRole("textbox", { name: "Name", exact: true })).toHaveValue("pasted-rule");
-  await expect(page.getByRole("combobox", { name: "Checkpoint" })).toHaveValue("step.admit");
+  await expect(page.getByRole("combobox", { name: "Checkpoint" })).toHaveText("step.admit");
   await expect(page.getByRole("textbox", { name: "Condition" })).toHaveValue("step.deploy");
   expect(errors).toEqual([]);
 });
@@ -457,7 +472,7 @@ test("a library list is added under Library policies, in audit mode", async ({ p
   await expect(panel.getByText("Library policies", { exact: true })).toBeInViewport();
   await panel.getByRole("button", { name: "Libraries blocked" }).click();
   const dialog = page.getByRole("dialog");
-  await expect(dialog.getByRole("combobox", { name: "Mode" })).toHaveValue("audit");
+  await expect(dialog.getByRole("combobox", { name: "Mode" })).toHaveText("audit");
   await dialog.getByRole("textbox", { name: "Sources" }).fill("github.com/*/libs");
   await dialog.getByRole("button", { name: "Add list" }).click();
   await expect(dialog).toContainText("a prefix ending in *");
@@ -662,10 +677,62 @@ test("switching org on a section shows the other org's settings, not the first's
   await page.goto("/orgs/acme/settings/secrets");
   await expect(page.getByText("Org secrets · acme", { exact: true })).toBeVisible();
 
-  await page.getByRole("combobox", { name: "Organization" }).selectOption("globex");
+  await choose(page, page.getByRole("combobox", { name: "Organization" }), "globex");
   await expect(page).toHaveURL(/\/orgs\/globex\/settings\/secrets$/);
   await expect(page.getByText("Org secrets · globex", { exact: true })).toBeVisible();
   await expect(page.getByText("Org secrets · acme", { exact: true })).toHaveCount(0);
+  expect(errors).toEqual([]);
+});
+
+test("the org dropdown works from the keyboard, keeps the section, and skips an org you do not administer", async ({
+  page,
+}) => {
+  const errors = collectErrors(page);
+  // The caller administers acme only, so globex, the org in the URL, shows
+  // but cannot be picked.
+  await page.goto("/orgs/globex/settings/secrets?admin_orgs=acme");
+  const pick = page.getByRole("combobox", { name: "Organization" });
+  await expect(pick).toHaveText("globex");
+  await pick.focus();
+  await page.keyboard.press("Enter");
+  await expect(pick).toHaveAttribute("aria-expanded", "true");
+  await expect(listOptions(page)).toHaveText(["globex", "acme", "New organization…"]);
+  await expect(listOptions(page).first()).toHaveAttribute("aria-disabled", "true");
+  // The list opens on acme, the first org that can be picked; ArrowUp does
+  // not move onto globex.
+  await page.keyboard.press("ArrowUp");
+  await page.keyboard.press("Enter");
+  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/secrets(\?|$)/);
+  await expect(page.getByText("Org secrets · acme", { exact: true })).toBeVisible();
+  await expect(pick).toBeFocused();
+
+  // Type-ahead opens the list on the entry it matches; Enter takes it.
+  await page.keyboard.press("n");
+  await expect(listOptions(page).last()).toHaveClass(/\bon\b/);
+  await page.keyboard.press("Enter");
+  await expect(page).toHaveURL(/\/orgs\/_new$/);
+  await expect(page.getByRole("heading", { level: 1, name: "New organization", exact: true })).toBeVisible();
+  expect(errors).toEqual([]);
+});
+
+test("a dropdown in a dialog opens above it, and Escape closes the list, not the dialog", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/orgs/acme/settings/libraries");
+  await page.locator("#library-policies").getByRole("button", { name: "Libraries blocked" }).click();
+  const dialog = page.getByRole("dialog");
+  const mode = dialog.getByRole("combobox", { name: "Mode" });
+  await mode.click();
+  // Two options: a plain list, no search box.
+  await expect(listOptions(page)).toHaveText(["audit", "enforce"]);
+  await expect(page.getByRole("textbox", { name: /^Search/ })).toHaveCount(0);
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("listbox")).toHaveCount(0);
+  await expect(dialog).toBeVisible();
+  await expect(mode).toBeFocused();
+  // A click lands on the option, so the list is above the dialog.
+  await choose(page, mode, "enforce");
+  await expect(mode).toHaveText("enforce");
+  await expect(dialog).toBeVisible();
   expect(errors).toEqual([]);
 });
 
@@ -771,12 +838,13 @@ test("a global admin makes a new org from the org dropdown and lands on its conn
   const errors = collectErrors(page);
   await page.goto("/orgs/acme/settings/members");
   const pick = page.getByRole("combobox", { name: "Organization" });
-  await expect(pick.locator("option").last()).toHaveText("New organization…");
-  await pick.selectOption({ label: "New organization…" });
+  await pick.click();
+  await expect(listOptions(page).last()).toHaveText("New organization…");
+  await listOptions(page).last().click();
   await expect(page).toHaveURL(/\/orgs\/_new$/);
   await expect(page.getByRole("heading", { level: 1, name: "New organization", exact: true })).toBeVisible();
   // The org settings frame, with New organization… picked and no sections.
-  await expect(pick).toHaveValue("/orgs/_new");
+  await expect(pick).toHaveText("New organization…");
   const nav = page.getByRole("navigation", { name: "Settings" });
   await expect(nav.getByText("Organization settings", { exact: true })).toBeVisible();
   await expect(nav.getByRole("link")).toHaveCount(0);
@@ -804,7 +872,9 @@ test("a global admin with no org lands on New organization, and the old server p
   await expect(page).toHaveURL(/\/orgs\/_new(\?|$)/);
   await expect(page.getByRole("heading", { level: 1, name: "New organization", exact: true })).toBeVisible();
   const pick = page.getByRole("combobox", { name: "Organization" });
-  await expect(pick.locator("option")).toHaveText(["New organization…"]);
+  await pick.click();
+  await expect(listOptions(page)).toHaveText(["New organization…"]);
+  await page.keyboard.press("Escape");
   await page.locator("button.avatar").click();
   await expect(
     page.getByRole("menu").getByRole("menuitem", { name: "Organization settings" }),
