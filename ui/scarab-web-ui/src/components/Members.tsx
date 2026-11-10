@@ -1,9 +1,10 @@
 // Settings › Members: who holds which role in the org. An org role applies to
 // every repository of the org.
 //
-// One row per person: their name (a link to their page), the subject a grant
-// stores, "not signed in yet" for a user a forge re-sync created, their org
-// role, and how many repositories they hold a role in. Someone with
+// One table row per person: their name (a link to their page) with the
+// subject a grant stores under it and "not signed in yet" for a user a forge
+// re-sync created, their org role, and how many repositories they hold a role
+// in. Someone with
 // repository roles only is listed too: they are a member of the org in
 // practice. Grant role, top right, grants an org role in a dialog. Changing
 // or revoking one is on the person's page (`…/settings/members/<subject>/
@@ -13,6 +14,7 @@ import { A } from "@solidjs/router";
 import { grantRole, listBindings } from "../api/client";
 import { memberHref, memberRows, ORG_ROLES, repoCountLabel } from "../identities";
 import Icon from "./Icon";
+import Chips from "./Chips";
 import Modal, { ModalMessage } from "./Modal";
 import { Field, Select } from "./Field";
 import PrincipalSearch from "./PrincipalSearch";
@@ -64,46 +66,49 @@ export default function Members(props: { org: string }) {
                 </Show>
               }
             >
-              <ul class="tok-list" aria-label="Members">
-                <For each={rows()}>
-                  {(r) => (
-                    <li class="tok">
-                      <div class="tok-head">
-                        <Icon icon="user" size={15} />
-                        <A class="tok-name oenv-link" href={memberHref(props.org, r.subject)}>
-                          {r.display}
-                        </A>
-                        <span class="tok-scope mono">{r.subject}</span>
-                        <Show when={r.pending}>
-                          <span
-                            class="tok-state tok-expired"
-                            title="Imported from the forge; becomes theirs when they sign in with that forge account"
-                          >
-                            not signed in yet
-                          </span>
-                        </Show>
-                        <span class="oenv-actions">
-                          <A class="btn btn-ghost btn-sm" href={memberHref(props.org, r.subject)}>
-                            Manage
-                          </A>
-                        </span>
-                      </div>
-                      <div class="tok-facts">
-                        <Show when={r.orgRole} fallback={<span class="subtle">no org role</span>}>
-                          {(role) => (
-                            <span>
-                              <span class="tok-role">{role()}</span> all of {props.org}
-                            </span>
-                          )}
-                        </Show>
-                        <Show when={r.repos.length > 0}>
-                          <span>{repoCountLabel(r.repos.length)}</span>
-                        </Show>
-                      </div>
-                    </li>
-                  )}
-                </For>
-              </ul>
+              <div class="table-scroll">
+                <table class="table lib-table person-table" aria-label="Members">
+                  <thead>
+                    <tr>
+                      <th>Person</th>
+                      <th>Org role</th>
+                      <th>Repositories</th>
+                      <th />
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <For each={rows()}>
+                      {(r) => (
+                        <tr>
+                          <td class="keep">
+                            <PersonCell
+                              display={r.display}
+                              subject={r.subject}
+                              pending={r.pending}
+                              href={memberHref(props.org, r.subject)}
+                            />
+                          </td>
+                          <td>
+                            <Show when={r.orgRole} fallback={<span class="subtle">no org role</span>}>
+                              {(role) => <span class="tok-role">{role()}</span>}
+                            </Show>
+                          </td>
+                          <td>
+                            <Show when={r.repos.length > 0} fallback={<span class="subtle">none</span>}>
+                              {repoCountLabel(r.repos.length)}
+                            </Show>
+                          </td>
+                          <td class="acts keep">
+                            <A class="btn btn-ghost btn-sm" href={memberHref(props.org, r.subject)}>
+                              Manage
+                            </A>
+                          </td>
+                        </tr>
+                      )}
+                    </For>
+                  </tbody>
+                </table>
+              </div>
             </Show>
           </Show>
         </Show>
@@ -191,5 +196,36 @@ export function GrantRoleDialog(props: {
         </Select>
       </Field>
     </Modal>
+  );
+}
+
+const NOT_SIGNED_IN = [
+  {
+    label: "not signed in yet",
+    tone: "muted" as const,
+    title: "Imported from the forge; becomes theirs when they sign in with that forge account",
+  },
+];
+
+/** A person in a table cell: their name (a link to `href` when given), the
+ *  subject a grant stores under it, and "not signed in yet" for a user a forge
+ *  re-sync created. Members and a repository's Access both use it. */
+export function PersonCell(props: { display: string; subject: string; pending: boolean; href?: string }) {
+  return (
+    <>
+      <span class="person-line">
+        <Show when={props.href} fallback={<span class="person-name">{props.display}</span>}>
+          {(href) => (
+            <A class="person-name oenv-link" href={href()}>
+              {props.display}
+            </A>
+          )}
+        </Show>
+        <Show when={props.pending}>
+          <Chips chips={NOT_SIGNED_IN} />
+        </Show>
+      </span>
+      <span class="person-id mono">{props.subject}</span>
+    </>
   );
 }

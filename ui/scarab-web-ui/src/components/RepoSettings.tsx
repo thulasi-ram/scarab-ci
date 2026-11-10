@@ -15,11 +15,12 @@
 // offers Register webhook: the retry for when enabling could not register it.
 // GitHub delivers every repository's events to the App, so there is none.
 //
-// Access lists the repository's own role bindings, each with where it came
-// from (granted in Scarab, or seeded from the forge's collaborators by a
-// re-sync), and below them, greyed, the people whose org role reaches the
-// repository. Org roles are managed under Settings › Members; this panel
-// grants, revokes and re-syncs at this repository's scope only.
+// Access is one table: the repository's own role bindings, each with where it
+// came from (granted in Scarab, or seeded from the forge's collaborators by a
+// re-sync) and Revoke, then, under a "Through their org role" group row and
+// greyed, the people whose org role reaches the repository. Org roles are
+// managed under Settings › Members; this panel grants (Grant access, top
+// right, in a dialog), revokes and re-syncs at this repository's scope only.
 //
 // The bindings list and grant/revoke are org-admin actions on the server, so
 // the panel shows them to org admins only; anyone else sees a line saying so.
@@ -40,7 +41,7 @@ import {
 } from "../api/client";
 import { me } from "../session";
 import { administers } from "../settings-nav";
-import { repoAccessRows, resyncDiff, type ResyncChange } from "../identities";
+import { repoAccessRows, resyncDiff, type ResyncChange, type RoleSource } from "../identities";
 import { forgeName } from "../connections";
 import { absTime, relTime } from "../fmt";
 import { UNREACHABLE_NOTE, orgPageHref } from "../org-page";
@@ -48,8 +49,9 @@ import Icon from "./Icon";
 import ConfirmDestructive from "./ConfirmDestructive";
 import DisableRepository, { type DisableTarget } from "./DisableRepository";
 import Modal, { ModalMessage, ModalSection } from "./Modal";
-import { Select } from "./Field";
+import { Field, Select } from "./Field";
 import PrincipalSearch from "./PrincipalSearch";
+import { PersonCell } from "./Members";
 import PolicyLists from "./PolicyLists";
 import { LIBRARY_KINDS, LIBRARY_POLICIES_ANCHOR, PLUGIN_KINDS, PLUGIN_POLICIES_ANCHOR } from "../policies";
 
@@ -230,59 +232,49 @@ function RepoAccess(props: { org: string; repo: string; forge: string }) {
     () => props.org,
     (org) => listBindings(org),
   );
-  const rows = () => repoAccessRows(bindings() ?? [], props.repo);
-  const [error, setError] = createSignal<string | null>(null);
-  const [subject, setSubject] = createSignal("");
-  const [role, setRole] = createSignal("member");
-  const [busy, setBusy] = createSignal(false);
+  // A resource read in its error state throws, so an error lists nobody.
+  const rows = () => repoAccessRows(bindings.error ? [] : (bindings() ?? []), props.repo);
+  const [notice, setNotice] = createSignal<string | null>(null);
+  const [granting, setGranting] = createSignal(false);
   const [revoking, setRevoking] = createSignal<string | null>(null);
   const [resyncing, setResyncing] = createSignal(false);
+  // `null` is a deployment with no role store (authorization off).
+  const available = () => !bindings.loading && !bindings.error && bindings() !== null;
+  const source = (s: RoleSource) =>
+    s === "forge" ? `from ${props.forge} collaborators` : s === "scarab" ? "granted in Scarab" : "";
 
-  const grant = async () => {
-    setBusy(true);
-    setError(null);
-    try {
-      await grantRole(props.org, { subject: subject(), role: role(), project: props.repo });
-      setSubject("");
-      await refetch();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "That did not work.");
-    } finally {
-      setBusy(false);
-    }
-  };
-
+  // A refusal shows in the confirm dialog.
   const revoke = async (s: string) => {
-    setBusy(true);
-    setError(null);
-    try {
-      await revokeRole(props.org, s, props.repo);
-      await refetch();
-    } finally {
-      setBusy(false);
-    }
+    await revokeRole(props.org, s, props.repo);
+    setNotice(null);
+    await refetch();
   };
 
   return (
-    <div class="panel">
+    <div class="panel access-panel">
       <div class="panel-h">
         <span>Access · {props.repo}</span>
-        <Show when={bindings()}>
-          <button class="btn btn-ghost btn-sm" onClick={() => setResyncing(true)}>
-            <Icon icon="rotate-cw" size={13} /> Re-sync collaborators
-          </button>
+        <Show when={available()}>
+          <span class="oenv-actions">
+            <button class="btn btn-ghost btn-sm" onClick={() => setResyncing(true)}>
+              <Icon icon="rotate-cw" size={13} /> Re-sync collaborators
+            </button>
+            <button class="btn btn-primary btn-sm" onClick={() => setGranting(true)}>
+              <Icon icon="plus" size={14} /> Grant access
+            </button>
+          </span>
         </Show>
       </div>
       <div class="secrets-body">
         <Show when={bindings.error}>
           <p class="error">Could not load who has access.</p>
         </Show>
-        <Show when={error()}>
-          <p class="error">{error()}</p>
+        <Show when={notice()}>
+          <p class="notice-ok">{notice()}</p>
         </Show>
-        <Show when={!bindings.loading} fallback={<p class="empty">loading…</p>}>
+        <Show when={!bindings.loading || bindings()} fallback={<p class="empty">loading…</p>}>
           <Show
-            when={bindings() !== null}
+            when={bindings.error || bindings() !== null}
             fallback={
               <p class="empty">
                 This deployment has no role store: authorization is off (dev), so there is
@@ -290,102 +282,71 @@ function RepoAccess(props: { org: string; repo: string; forge: string }) {
               </p>
             }
           >
-            <Show
-              when={rows().direct.length > 0}
-              fallback={
-                <p class="empty">
-                  Nobody holds a role on {props.repo} itself. Grant someone a role below, or
-                  re-sync the repository's collaborators from {props.forge}.
-                </p>
-              }
-            >
-              <ul class="tok-list">
-                <For each={rows().direct}>
-                  {(r) => (
-                    <li class="tok">
-                      <div class="tok-head">
-                        <Icon icon="user" size={15} />
-                        <span class="tok-name">{r.display}</span>
-                        <span class="tok-scope mono">{r.subject}</span>
-                        <Show when={r.pending}>
-                          <span class="tok-state tok-expired" title="Imported from the forge; becomes theirs when they sign in with that forge account">
-                            not signed in yet
-                          </span>
-                        </Show>
-                      </div>
-                      <div class="tok-facts">
-                        <span>
-                          <span class="tok-role">{r.role}</span>
-                          <Show when={r.source}>
-                            {(src) => (
-                              <span>
-                                {src() === "forge"
-                                  ? `from ${props.forge} collaborators`
-                                  : "granted in Scarab"}
-                              </span>
-                            )}
-                          </Show>
-                          <button
-                            class="btn btn-ghost btn-sm"
-                            disabled={busy()}
-                            onClick={() => setRevoking(r.subject)}
-                          >
-                            revoke
-                          </button>
-                        </span>
-                        <Show when={r.orgRole}>
-                          {(o) => <span>also org role {o()}; the higher applies</span>}
-                        </Show>
-                      </div>
-                    </li>
-                  )}
-                </For>
-              </ul>
+            <Show when={rows().direct.length === 0 && !bindings.error}>
+              <p class="empty">
+                Nobody holds a role on {props.repo} itself. Grant someone access, or re-sync
+                the repository's collaborators from {props.forge}.
+              </p>
             </Show>
-
-            <div class="f">
-              <div class="f-l">
-                <span class="f-lbl">Grant a role on {props.repo}</span>
+            <Show when={rows().direct.length + rows().viaOrg.length > 0}>
+              <div class="table-scroll">
+                <table class="table lib-table person-table access-table" aria-label={`Access to ${props.repo}`}>
+                  <thead>
+                    <tr>
+                      <th>Person</th>
+                      <th>Role</th>
+                      <th>Source</th>
+                      <th />
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <For each={rows().direct}>
+                      {(r) => (
+                        <tr>
+                          <td class="keep">
+                            <PersonCell display={r.display} subject={r.subject} pending={r.pending} />
+                          </td>
+                          <td>
+                            <span class="tok-role">{r.role}</span>
+                            <Show when={r.orgRole}>
+                              {(o) => <span class="access-note">also org role {o()}; the higher applies</span>}
+                            </Show>
+                          </td>
+                          <td>{source(r.source)}</td>
+                          <td class="acts keep">
+                            <button class="btn btn-danger btn-sm" onClick={() => setRevoking(r.subject)}>
+                              Revoke
+                            </button>
+                          </td>
+                        </tr>
+                      )}
+                    </For>
+                    <Show when={rows().viaOrg.length > 0}>
+                      <tr class="access-group">
+                        <th colSpan={4} scope="colgroup">
+                          Through their org role
+                        </th>
+                      </tr>
+                      <For each={rows().viaOrg}>
+                        {(r) => (
+                          <tr class="access-via-org">
+                            <td class="keep">
+                              <PersonCell display={r.display} subject={r.subject} pending={r.pending} />
+                            </td>
+                            <td>
+                              via org role <span class="tok-role">{r.orgRole}</span>
+                            </td>
+                            <td>all of {props.org}</td>
+                            <td />
+                          </tr>
+                        )}
+                      </For>
+                    </Show>
+                  </tbody>
+                </table>
               </div>
-              <Show
-                when={subject()}
-                fallback={<PrincipalSearch org={props.org} onPick={setSubject} />}
-              >
-                <div class="tok-life">
-                  <span class="tok-scope mono">{subject()}</span>
-                  <Select aria-label="role" value={role()} onValue={setRole}>
-                    <For each={ROLES}>{(r) => <option value={r}>{r}</option>}</For>
-                  </Select>
-                  <button class="btn btn-primary btn-sm" disabled={busy()} onClick={grant}>
-                    grant
-                  </button>
-                  <button class="btn btn-ghost btn-sm" onClick={() => setSubject("")}>
-                    cancel
-                  </button>
-                </div>
-              </Show>
-            </div>
-
+            </Show>
             <Show when={rows().viaOrg.length > 0}>
-              <h3 class="access-h">Through their org role</h3>
-              <ul class="tok-list">
-                <For each={rows().viaOrg}>
-                  {(r) => (
-                    <li class="tok access-via-org">
-                      <div class="tok-head">
-                        <Icon icon="user" size={15} />
-                        <span class="tok-name">{r.display}</span>
-                        <span class="tok-scope mono">{r.subject}</span>
-                      </div>
-                      <div class="tok-facts">
-                        <span>
-                          via org role <span class="tok-role">{r.orgRole}</span>
-                        </span>
-                      </div>
-                    </li>
-                  )}
-                </For>
-              </ul>
               <p class="f-help">
                 Org roles apply to every repository in {props.org}. Change them under{" "}
                 <A href={`/orgs/${encodeURIComponent(props.org)}/settings/members`}>Settings › Members</A>.
@@ -395,6 +356,18 @@ function RepoAccess(props: { org: string; repo: string; forge: string }) {
         </Show>
       </div>
 
+      <Show when={granting()}>
+        <GrantAccessDialog
+          org={props.org}
+          repo={props.repo}
+          onClose={() => setGranting(false)}
+          onGranted={(subject, role) => {
+            setGranting(false);
+            setNotice(`${subject} is ${role} on ${props.repo}.`);
+            void refetch();
+          }}
+        />
+      </Show>
       <Show when={revoking()}>
         {(s) => (
           <ConfirmDestructive
@@ -417,6 +390,77 @@ function RepoAccess(props: { org: string; repo: string; forge: string }) {
         />
       </Show>
     </div>
+  );
+}
+
+/** Grant a role on one repository: find the user, pick the role. A grant to
+ *  someone who holds a role here already replaces it. */
+function GrantAccessDialog(props: {
+  org: string;
+  repo: string;
+  onClose: () => void;
+  onGranted: (subject: string, role: string) => void;
+}) {
+  const [subject, setSubject] = createSignal("");
+  const [role, setRole] = createSignal("member");
+  const [busy, setBusy] = createSignal(false);
+  const [error, setError] = createSignal<string | null>(null);
+
+  const grant = async () => {
+    if (!subject() || busy()) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await grantRole(props.org, { subject: subject(), role: role(), project: props.repo });
+      props.onGranted(subject(), role());
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "The server refused the grant.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal
+      eyebrow={`${props.org}/${props.repo} · access`}
+      title="Grant access"
+      purpose={`A role on ${props.repo} only. Org roles are managed under Settings › Members.`}
+      busy={busy()}
+      onClose={props.onClose}
+      footer={
+        <>
+          <Show when={error()}>
+            <ModalMessage>{error()}</ModalMessage>
+          </Show>
+          <button class="btn btn-ghost" type="button" onClick={props.onClose} disabled={busy()}>
+            Cancel
+          </button>
+          <button class="btn btn-primary" type="button" disabled={!subject() || busy()} onClick={grant}>
+            {busy() ? "Granting…" : "Grant access"}
+          </button>
+        </>
+      }
+    >
+      <Field
+        label="User"
+        required
+        help="A user exists once they have signed in, or once a re-sync imported their forge account."
+      >
+        <Show when={subject()} fallback={<PrincipalSearch org={props.org} onPick={setSubject} />}>
+          <div class="tok-life">
+            <span class="tok-scope mono">{subject()}</span>
+            <button class="btn btn-ghost btn-sm" type="button" onClick={() => setSubject("")}>
+              Change
+            </button>
+          </div>
+        </Show>
+      </Field>
+      <Field label="Role" help={`Held on ${props.repo}. A grant to someone with a role here replaces it.`}>
+        <Select value={role()} onValue={setRole}>
+          <For each={ROLES}>{(r) => <option value={r}>{r}</option>}</For>
+        </Select>
+      </Field>
+    </Modal>
   );
 }
 

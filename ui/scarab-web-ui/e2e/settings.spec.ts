@@ -1203,14 +1203,19 @@ test("a token minted under Account settings shows in the org's list", async ({ p
 test("Members lists one row per person, each managed on its own page", async ({ page }) => {
   const errors = collectErrors(page);
   await page.goto("/orgs/acme/settings/members");
-  const list = page.getByRole("list", { name: "Members" });
-  const jordan = list.getByRole("listitem").filter({ hasText: "Jordan Lee" });
-  await expect(jordan).toContainText("member all of acme");
-  await expect(jordan).toContainText("2 repositories");
+  const table = page.getByRole("table", { name: "Members" });
+  await expect(table.getByRole("row").first().getByRole("columnheader")).toHaveText([
+    "Person",
+    "Org role",
+    "Repositories",
+    "",
+  ]);
+  const jordan = table.getByRole("row").filter({ hasText: "Jordan Lee" });
+  await expect(jordan.getByRole("cell")).toHaveText([/^Jordan Lee\s*j\.lee$/, "member", "2 repositories", "Manage"]);
   // Repository roles only: listed, with no org role.
-  const okafor = list.getByRole("listitem").filter({ hasText: "r.okafor" });
-  await expect(okafor).toContainText("no org role");
-  await expect(okafor).toContainText("not signed in yet");
+  const okafor = table.getByRole("row").filter({ hasText: "r.okafor" });
+  await expect(okafor.getByRole("cell").nth(0)).toContainText("not signed in yet");
+  await expect(okafor.getByRole("cell").nth(1)).toHaveText("no org role");
   // No inline revoke or grant form: those are on the person's page and in
   // the Grant role dialog. Re-sync lives on the repository.
   const view = page.locator("section.page");
@@ -1270,15 +1275,15 @@ test("Grant role opens a dialog from the section header and grants an org role",
   await expect(dialog).toHaveCount(0);
   await expect(page.getByText("t.nguyen is viewer on all of acme.")).toBeVisible();
   await expect(
-    page.getByRole("list", { name: "Members" }).getByRole("listitem").filter({ hasText: "Taylor Nguyen" }),
-  ).toContainText("viewer all of acme");
+    page.getByRole("table", { name: "Members" }).getByRole("row").filter({ hasText: "Taylor Nguyen" }).getByRole("cell").nth(1),
+  ).toHaveText("viewer");
   expect(errors).toEqual([]);
 });
 
 test("a member's page takes a subject with any characters", async ({ page }) => {
   const errors = collectErrors(page);
   await page.goto("/orgs/acme/settings/members");
-  await page.getByRole("list", { name: "Members" }).getByRole("link", { name: "Sam Patel" }).click();
+  await page.getByRole("table", { name: "Members" }).getByRole("link", { name: "Sam Patel" }).click();
   await expect(page).toHaveURL(/\/members\/okta%3As\.patel%40acme\.example\/manage$/);
   await expect(page.locator(".page-sub")).toContainText("okta:s.patel@acme.example");
   await expect(page.getByText("No roles on single repositories.")).toBeVisible();
@@ -1299,13 +1304,25 @@ test("a repository's Access lists its roles and the org roles that reach it, and
   await expect(view.getByRole("link", { name: "gh-acme" })).toBeVisible();
 
   const access = view.locator(".panel", { has: page.locator(".panel-h", { hasText: "Access" }) });
-  await expect(access.locator("li.tok", { hasText: "Jordan Lee" })).toContainText("granted in Scarab");
-  const okafor = access.locator("li.tok", { hasText: "r.okafor" });
-  await expect(okafor).toContainText("from GitHub collaborators");
-  await expect(okafor).toContainText("not signed in yet");
-  const avery = access.locator("li.tok.access-via-org", { hasText: "Avery Kim" });
-  await expect(avery).toContainText("via org role owner");
+  const table = access.getByRole("table", { name: "Access to scarab" });
+  await expect(table.getByRole("row").first().getByRole("columnheader")).toHaveText(["Person", "Role", "Source", ""]);
+  const row = (who: string) => table.getByRole("row").filter({ hasText: who });
+  await expect(row("Jordan Lee").getByRole("cell").nth(2)).toHaveText("granted in Scarab");
+  await expect(row("Jordan Lee").getByRole("button", { name: "Revoke" })).toBeVisible();
+  const okafor = row("r.okafor").getByRole("cell");
+  await expect(okafor.nth(0)).toContainText("not signed in yet");
+  await expect(okafor.nth(2)).toHaveText("from GitHub collaborators");
+  // Access through an org role sits below its own group row, read-only.
+  const rows = table.getByRole("row");
+  const group = rows.filter({ hasText: "Through their org role" });
+  await expect(group).toHaveCount(1);
+  const avery = row("Avery Kim");
+  await expect(avery.getByRole("cell").nth(1)).toHaveText("via org role owner");
   await expect(avery.getByRole("button")).toHaveCount(0);
+  const texts = await rows.allTextContents();
+  const at = (s: string) => texts.findIndex((t) => t.includes(s));
+  expect(at("Jordan Lee")).toBeLessThan(at("Through their org role"));
+  expect(at("Through their org role")).toBeLessThan(at("Avery Kim"));
 
   await access.getByRole("button", { name: "Re-sync collaborators" }).click();
   const dialog = page.getByRole("dialog");
@@ -1319,9 +1336,63 @@ test("a repository's Access lists its roles and the org roles that reach it, and
   await expect(dialog).toContainText("viewer → member");
   await dialog.getByRole("button", { name: "Done" }).click();
   await expect(dialog).toHaveCount(0);
-  await expect(access.locator("li.tok", { hasText: "Taylor Nguyen" })).toContainText("member");
-  await expect(access.locator("li.tok", { hasText: "p.ito" })).toBeVisible();
+  await expect(row("Taylor Nguyen").getByRole("cell").nth(1)).toHaveText("member");
+  await expect(row("p.ito")).toBeVisible();
   expect(errors).toEqual([]);
+});
+
+test("Grant access opens a dialog from the Access header and the person joins the table", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/acme/scarab?tab=settings");
+  const access = page.locator(".panel", { has: page.locator(".panel-h", { hasText: "Access" }) });
+  await access.locator(".panel-h").getByRole("button", { name: "Grant access" }).click();
+  const dialog = page.getByRole("dialog");
+  const grant = dialog.getByRole("button", { name: "Grant access" });
+  await expect(grant).toBeDisabled();
+  await dialog.getByRole("textbox", { name: "Find a user" }).fill("t.ng");
+  await dialog.getByRole("button", { name: /Taylor Nguyen/ }).click();
+  await choose(page, dialog.getByRole("combobox", { name: "Role" }), "admin");
+  await grant.click();
+  await expect(dialog).toHaveCount(0);
+  await expect(access.getByText("t.nguyen is admin on scarab.")).toBeVisible();
+  const taylor = access.getByRole("table").getByRole("row").filter({ hasText: "Taylor Nguyen" });
+  await expect(taylor.getByRole("cell").nth(1)).toHaveText("admin");
+  await expect(taylor.getByRole("cell").nth(2)).toHaveText("granted in Scarab");
+  expect(errors).toEqual([]);
+});
+
+/** Elements of the page body that reach past the right edge of the window
+ *  without a sideways-scrolling box around them to hold them. */
+function sticksOut(page: Page) {
+  return page.locator("section.page").evaluate((root) => {
+    const w = window.innerWidth;
+    const out: string[] = [];
+    for (const el of Array.from(root.querySelectorAll("*"))) {
+      const r = el.getBoundingClientRect();
+      if (r.width === 0 || r.right <= w + 1) continue;
+      let p = el.parentElement;
+      let held = false;
+      while (p && p !== root) {
+        if (["auto", "scroll", "hidden"].includes(getComputedStyle(p).overflowX)) {
+          held = true;
+          break;
+        }
+        p = p.parentElement;
+      }
+      if (!held) out.push(`${el.tagName.toLowerCase()}.${(el as HTMLElement).className}`);
+    }
+    return out;
+  });
+}
+
+test("on a phone the Access and Members tables scroll inside their box, not the page", async ({ page }) => {
+  await page.setViewportSize({ width: 375, height: 800 });
+  await page.goto("/acme/scarab?tab=settings");
+  await expect(page.getByRole("table", { name: "Access to scarab" })).toBeVisible();
+  expect(await sticksOut(page)).toEqual([]);
+  await page.goto("/orgs/acme/settings/members");
+  await expect(page.getByRole("table", { name: "Members" })).toBeVisible();
+  expect(await sticksOut(page)).toEqual([]);
 });
 
 test("a repository's Access is for org admins", async ({ page }) => {
