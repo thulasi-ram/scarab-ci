@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1794289346,"nonce":"hAEQ6ZFYOnJTbpbfOxc38yUw71g=","message":"Closed 2026-11-10: PR #146 merged (CHANGELOG 0.3.0 entry + chart README 'Upgrading to 0.3.0'); the v0.3.0 GitHub Release text was corrected to match. The demo builds pushes again (Run 01a1c3eb succeeded).","files":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":4,"timestamp":1794289346,"nonce":"5Wqulgc37wy+Iionjmxm9jwAcAw=","status":2}]}
