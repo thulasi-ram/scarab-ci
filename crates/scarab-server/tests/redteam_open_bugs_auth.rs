@@ -1138,9 +1138,7 @@ async fn rt_an_alias_reset_cannot_skip_the_every_org_owner_check() {
         st.with_identities(ids as Arc<dyn IdentityStore>)
     });
     for (provider, ext, handle) in [("github", "b1", "bob"), ("forgejo", "f1", "bobby")] {
-        IdentityStore::sign_in(pg.as_ref(), &identity(provider, ext, handle), handle, T0)
-            .await
-            .unwrap();
+        common::seed_principal(&pg, provider, ext, handle).await;
     }
     h.grant("bob", Scope::Org("acme".into()), Role::Member)
         .await;

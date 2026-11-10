@@ -4594,6 +4594,29 @@ impl InMemoryIdentities {
         Self::default()
     }
 
+    /// A claimed Principal whose **id is its handle**, pinned to
+    /// `identity`: for tests about grants and sessions that name people by
+    /// readable strings. Minted ids are `p_` + 32 hex (ADR-0080).
+    pub fn seed(&self, handle: &str, identity: &scarab_identity::ProviderIdentity) -> String {
+        let mut st = self.inner.lock().unwrap();
+        st.principals.insert(
+            handle.to_string(),
+            scarab_identity::PrincipalRecord {
+                id: handle.to_string(),
+                handle: handle.to_string(),
+                display_name: identity.display_name.clone(),
+                created_at: 0,
+                claimed_at: Some(0),
+                merged_into: None,
+            },
+        );
+        st.identities.insert(
+            (identity.provider.clone(), identity.external_id.clone()),
+            (handle.to_string(), identity.clone()),
+        );
+        handle.to_string()
+    }
+
     /// A Principal with `handle` and no identity — what migration 0093
     /// leaves for a pre-0052 binding subject that named nobody (ADR-0080 §6).
     pub fn seed_placeholder(&self, handle: &str) -> String {

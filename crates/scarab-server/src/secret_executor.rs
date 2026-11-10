@@ -334,7 +334,16 @@ async fn step_admit(
             None => Ok(admission),
         };
     };
-    let input = step_admit_input(tenant, governed, step, spec, &gates, now_ms);
+    // A Policy reads approvers by handle, with the ids beside them (ADR-0080).
+    let people = crate::people::People::lookup(
+        identities,
+        gates
+            .iter()
+            .filter_map(|g| g.met.as_ref())
+            .flat_map(|(a, _)| a.iter().map(String::as_str)),
+    )
+    .await;
+    let input = step_admit_input(tenant, governed, step, spec, &gates, &people, now_ms);
     let match_ctx = scarab_policy::evaluate::MatchContext {
         project: project.to_string(),
         environment: governed.map(|(ctx, _)| ctx.environment.clone()),
@@ -451,6 +460,7 @@ fn step_admit_input(
     step: &StepRun,
     spec: Option<(&scarab_pipeline::PipelineIr, &scarab_pipeline::StepSpec)>,
     gates: &[scarab_policy::environment_rules::UpstreamGateFacts],
+    people: &crate::people::People,
     now_ms: i64,
 ) -> Result<serde_json::Value, String> {
     use scarab_policy::run_create as rc;
@@ -470,11 +480,12 @@ fn step_admit_input(
         .iter()
         .map(|g| {
             let (approvers, required) = g.met.clone().unwrap_or_default();
+            let too_many = || format!("gate `{}` lists too many approvers", g.gate);
             Ok(sa::UpstreamApproval {
                 gate: g.gate.clone(),
                 released_at: g.released_at.map(time).transpose()?,
-                approvers: Capped::new(approvers)
-                    .ok_or_else(|| format!("gate `{}` lists too many approvers", g.gate))?,
+                approvers: Capped::new(people.handles(&approvers)).ok_or_else(too_many)?,
+                approver_ids: Some(Capped::new(people.ids(&approvers)).ok_or_else(too_many)?),
                 required: required.map(u64::from),
             })
         })

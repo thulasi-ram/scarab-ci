@@ -20,6 +20,36 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ### Breaking changes
 
+- **Every user signs in again, and the upgrade needs `Recreate`.** A person now has a random,
+  fixed Scarab id (`p_` and 32 hex characters) beside the readable name they sign in under, which
+  is now called their handle (`github:alice`, `okta:s.patel@acme.example`). Migration 0093
+  gives every person an id, stores it in place of the handle in role bindings, API token owners,
+  approver lists, passkeys and pending step-up requests, and deletes every session, step-up
+  confirmation and WebAuthn challenge. History (the run event log, the security event log, policy
+  decisions, every `updated_by`) is not rewritten; it is shown by handle. A server from before
+  0093 cannot run against a database migrated past it: take a backup, upgrade with the
+  `Recreate` strategy (the chart's default), and restoring the backup is the way back.
+  A role binding written before migration 0052 that names nobody gets a placeholder that the
+  first sign-in producing exactly that name through the legacy provider takes over. Handles
+  that differ only in case are kept as separate people and logged at every boot; a new handle
+  that differs from an existing one only in case gets a `~2` suffix.
+  ([ADR-0080](https://github.com/thulasi-ram/scarab-ci/blob/main/docs/adr/0080-principals-have-an-internal-id.md))
+- **Member URLs carry the id, not the handle.** The member page is
+  `/orgs/<org>/settings/members/<id>/manage`, read through the new
+  `GET /v1/orgs/{org}/members/{id}`; old member links stop working. Passkey reset is
+  `POST /v1/orgs/{org}/members/{id}/passkeys/reset`.
+- **People in API responses are `{id, handle, display_name}`.** `GET /v1/orgs/{org}/bindings`
+  and the forge import return `id` and `handle` in place of `subject`; the principal search adds
+  `handle`; API token records add `owner`; `GET /v1/me`, `GET /v1/me/security` and
+  `POST /v1/auth/login` add `handle`, and their `subject` is now the id. Attribution fields
+  (`updated_by`, `created_by`, `pinned_by`, approvals, the run event log's `by`) show the handle.
+  Grants, revokes, approver lists, `scarab-server admin grant --subject` and
+  `SCARAB_OAUTH_OWNERS` take a handle, as before, or an id.
+- **The Actor of a manual or API Run is the dispatcher's handle**, so `when: event.actor == …`
+  keeps comparing the name people type. Policy inputs keep their handle fields and gain
+  `principal_id`, `trigger.principal_id`, `actor.principal_id`, `approval_ids` and
+  `approver_ids` beside them.
+
 - **`GET /v1/repos/{org}/{repo}/environments/{name}/deployments` is removed** and answers 404.
   It listed who approved which Run into an Environment, and the web UI no longer reads it.
   The server no longer keeps that record: each Run keeps its approvals in its own history.

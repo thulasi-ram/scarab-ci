@@ -14,11 +14,18 @@ Each Policy names one checkpoint. Its rules read that checkpoint's input.
 
 | Checkpoint | When | The rules read |
 |------------|------|----------------|
-| `run.create` | a Run is about to be created, after its pipeline compiled and its trigger matched | `trigger` (kind, `ref`, `sha`, `fork`, `actor`, `principal`, `reason`), `pipeline` (name, `environment`, `deploy`), `steps`, `gates`, `principal`, `time` |
-| `step.admit` | every launch of a Step attempt, before any credential is used | `step` (image, secrets, `deploy`, `forge_token`, `origin`), `attempt`, `run` (`ref`, `environment`), `environment`, `approvals`, `time` |
-| `gate.resolve` | someone approves a manual gate, before the approval is recorded | `gate`, `verdict`, `actor.principal`, `approvals`, `run`, `time` |
+| `run.create` | a Run is about to be created, after its pipeline compiled and its trigger matched | `trigger` (kind, `ref`, `sha`, `fork`, `actor`, `principal`, `principal_id`, `reason`), `pipeline` (name, `environment`, `deploy`), `steps`, `gates`, `principal`, `principal_id`, `time` |
+| `step.admit` | every launch of a Step attempt, before any credential is used | `step` (image, secrets, `deploy`, `forge_token`, `origin`), `attempt`, `run` (`ref`, `environment`), `environment`, `approvals` (each with `approvers` and `approver_ids`), `time` |
+| `gate.resolve` | someone approves a manual gate, before the approval is recorded | `gate`, `verdict`, `actor.principal`, `actor.principal_id`, `approvals`, `approval_ids`, `run`, `time` |
 
-Every checkpoint also has `org` and `project`. `GET /v1/policy-checkpoints` serves each checkpoint's full input schema: every field, its type,
+Every checkpoint also has `org` and `project`.
+
+A person is named by their handle, the readable name they sign in under (`github:alice`,
+`okta:s.patel@acme.example`): `principal`, `actor.principal`, `approvals` and `approvers` hold
+handles, so a rule compares them with the string people type. A handle never changes once it is
+given out. Each also has an `_id` field beside it with the person's Scarab id (`p_` and 32 hex
+characters), which a rule can compare when it must name exactly one person. Inputs recorded
+before the id fields existed do not have them, so a rule reads them with `has()`. `GET /v1/policy-checkpoints` serves each checkpoint's full input schema: every field, its type,
 whether it can be absent, and what it means. The editor completes field names from it.
 
 ## A Policy

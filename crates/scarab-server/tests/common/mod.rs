@@ -86,6 +86,41 @@ pub async fn fresh_pg() -> Option<(TestDb, std::sync::Arc<scarab_db_postgres::Po
     Some((tdb, pg))
 }
 
+/// A claimed Principal whose **id is its handle**, pinned to `(provider,
+/// external_id)`: a later sign-in with that identity lands on it. For tests
+/// that are about step-up, merges or grants rather than id minting, so they
+/// can name people by readable strings. Production ids are random
+/// (`p_` + 32 hex, ADR-0080); the store never relies on their shape beyond
+/// [`scarab_identity::is_principal_id`].
+#[allow(dead_code)]
+pub async fn seed_principal(
+    pg: &scarab_db_postgres::PostgresDb,
+    provider: &str,
+    external_id: &str,
+    handle: &str,
+) -> String {
+    let pool = pg.pool_for_tests();
+    sqlx::query(
+        "INSERT INTO principals (id, handle, created_at, claimed_at) VALUES ($1, $1, 0, 0)",
+    )
+    .bind(handle)
+    .execute(pool)
+    .await
+    .expect("seed a principal");
+    sqlx::query(
+        "INSERT INTO principal_identities
+             (provider, external_id, principal_id, handle, linked_at, last_login_at)
+         VALUES ($1, $2, $3, $3, 0, 0)",
+    )
+    .bind(provider)
+    .bind(external_id)
+    .bind(handle)
+    .execute(pool)
+    .await
+    .expect("seed its identity");
+    handle.to_string()
+}
+
 /// Replace the database path in a connection URL, preserving query params.
 fn swap_db(url: &str, dbname: &str) -> String {
     let (base, query) = match url.split_once('?') {

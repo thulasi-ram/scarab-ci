@@ -640,7 +640,7 @@ fn misspelt_field() {
     assert_eq!(
         rejected(r#"trigger.rfe == "x""#),
         "1:8: `trigger.rfe`: no field `rfe` on Trigger (did you mean `ref`?); \
-         fields are kind, ref, sha, fork, actor, principal, reason"
+         fields are kind, ref, sha, fork, actor, principal, principal_id, reason"
     );
 }
 
@@ -649,7 +649,7 @@ fn misspelt_variable() {
     assert_rejected(
         r#"triger.kind == "push""#,
         "`triger`: no variable `triger` at run.create (did you mean `trigger`?); \
-         variables are org, project, trigger, pipeline, steps, gates, principal, time",
+         variables are org, project, trigger, pipeline, steps, gates, principal, principal_id, time",
     );
 }
 

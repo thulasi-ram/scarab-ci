@@ -220,9 +220,7 @@ async fn send_raw(h: &Harness, req: Request<Body>) -> axum::response::Response {
 async fn link_harness_with(extra: &[&str]) -> (Harness, Arc<InMemoryIdentities>) {
     let base = stub_provider(json!({ "id": 666, "login": "mallory" })).await;
     let ids = Arc::new(InMemoryIdentities::new());
-    ids.sign_in(&identity("okta", "amy-sub", "amy"), "amy", T0)
-        .await
-        .unwrap();
+    ids.seed("amy", &identity("okta", "amy-sub", "amy"));
     let mut providers = vec![oauth_provider_named(
         &base,
         ids.clone() as Arc<dyn IdentityStore>,
@@ -934,7 +932,8 @@ async fn an_unlogged_request_confirmation_cannot_be_retried_into_running() {
 #[tokio::test]
 async fn an_install_owner_matched_by_email_case_is_still_protected() {
     let ids = Arc::new(InMemoryIdentities::new());
-    ids.sign_in(
+    ids.seed(
+        "root",
         &ProviderIdentity {
             provider: "default".into(),
             external_id: "root-sub".into(),
@@ -943,11 +942,7 @@ async fn an_install_owner_matched_by_email_case_is_still_protected() {
             email_verified: true,
             display_name: None,
         },
-        "root",
-        T0,
-    )
-    .await
-    .unwrap();
+    );
     let wired = ids.clone();
     let provider = oauth_provider_named(
         "http://127.0.0.1:9",

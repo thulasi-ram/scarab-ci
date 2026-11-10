@@ -168,7 +168,7 @@ pub async fn canonical_approver_set(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scarab_identity::{Placeholder, ProviderIdentity};
+    use scarab_identity::{IdentityStore, Placeholder, ProviderIdentity};
 
     fn ident(external_id: &str, handle: &str) -> ProviderIdentity {
         ProviderIdentity {
@@ -203,6 +203,94 @@ mod tests {
         // No store: every reference is its own id and handle.
         let none = People::lookup(None, refs.iter().map(String::as_str)).await;
         assert_eq!(none.ids(&refs), refs);
+    }
+
+    /// Two people who must both approve: ada and bob, stored (after
+    /// migration 0093) as ids. ada approved before the upgrade, so her
+    /// `GateApproved.by` is her handle; bob approved after it, under his id.
+    async fn ada_and_bob() -> (
+        scarab_testkit::InMemoryIdentities,
+        scarab_identity::PrincipalRecord,
+        scarab_identity::PrincipalRecord,
+        scarab_project::EffectiveProtection,
+    ) {
+        let store = scarab_testkit::InMemoryIdentities::new();
+        let ada = store
+            .sign_in(&ident("1", "ada"), "github:ada", Placeholder::Never, 0)
+            .await
+            .unwrap();
+        let bob = store
+            .sign_in(&ident("2", "bob"), "github:bob", Placeholder::Never, 0)
+            .await
+            .unwrap();
+        let protection = scarab_project::effective_protection(
+            &scarab_project::EnvironmentProtectionRules {
+                approvers: vec![ada.id.clone(), bob.id.clone()],
+                ..Default::default()
+            },
+            None,
+        );
+        (store, ada, bob, protection)
+    }
+
+    #[tokio::test]
+    async fn approvals_count_whichever_form_they_were_recorded_in() {
+        let (store, ada, bob, protection) = ada_and_bob().await;
+        let recorded = vec!["github:ada".to_string(), bob.id.clone()];
+        // As stored, the handle matches nobody on a list of ids.
+        assert_eq!(protection.approval_violations(&recorded).len(), 1);
+        // Through the resolver both count.
+        let approvals = canonical_ids(Some(&store), &recorded).await;
+        assert_eq!(approvals, vec![ada.id.clone(), bob.id.clone()]);
+        assert!(protection.approval_violations(&approvals).is_empty());
+        // The same person under both forms is one approval, not two.
+        let twice = vec!["github:ada".to_string(), ada.id.clone()];
+        assert_eq!(canonical_ids(Some(&store), &twice).await, vec![ada.id]);
+    }
+
+    #[tokio::test]
+    async fn a_gate_released_before_the_upgrade_still_launches_after_it() {
+        use scarab_policy::environment_rules::{launch_recheck, LaunchFacts, UpstreamGateFacts};
+        let (store, _ada, _bob, protection) = ada_and_bob().await;
+        // The release recorded the approver set as it was then: handles,
+        // sorted, as `approver_set` sorted them.
+        let met_then = vec!["github:ada".to_string(), "github:bob".to_string()];
+        let check = |met: Vec<String>, protection: &scarab_project::EffectiveProtection| {
+            let gates = [UpstreamGateFacts {
+                gate: "approve".into(),
+                released_at: Some(1_000),
+                met: Some((met, None)),
+            }];
+            launch_recheck(LaunchFacts {
+                environment: "prod",
+                git_ref: "refs/heads/main",
+                protection,
+                step: "deploy",
+                uses_authority: Some(true),
+                approval_gates: &gates,
+                now_ms: 2_000,
+            })
+            .refusal
+        };
+        // Compared as stored, the set "changed" and the launch is refused.
+        let raw = check(met_then.clone(), &protection).expect("refused as stored");
+        assert!(raw.contains("approvers changed"), "{raw}");
+        // Both sides through the resolver: the same people, so it launches.
+        let met = canonical_approver_set(Some(&store), &met_then).await;
+        let now = canonical_protection(Some(&store), &protection).await;
+        assert_eq!(check(met, &now), None);
+        // A real change still refuses: bob is no longer an approver.
+        let fewer = scarab_project::effective_protection(
+            &scarab_project::EnvironmentProtectionRules {
+                approvers: vec![protection.approvers[0].clone()],
+                ..Default::default()
+            },
+            None,
+        );
+        let met = canonical_approver_set(Some(&store), &met_then).await;
+        let refused = check(met, &canonical_protection(Some(&store), &fewer).await)
+            .expect("a changed set refuses");
+        assert!(refused.contains("approvers changed"), "{refused}");
     }
 }
 

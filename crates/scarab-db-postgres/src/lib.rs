@@ -80,6 +80,12 @@ impl PostgresDb {
         }
     }
 
+    /// The connection pool, for tests that seed rows the ports never write
+    /// (a Principal with a chosen id, say).
+    pub fn pool_for_tests(&self) -> &PgPool {
+        &self.pool
+    }
+
     /// Override the leader-fenced transaction bound (tests that stall one on
     /// purpose).
     pub fn with_leader_tx_bound(mut self, bound: std::time::Duration) -> Self {

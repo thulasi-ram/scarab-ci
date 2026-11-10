@@ -77,7 +77,7 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
     ("GET", "/v1/orgs/{org}/security/summary", "read", "READ"),
     (
         "POST",
-        "/v1/orgs/{org}/members/{subject}/passkeys/reset",
+        "/v1/orgs/{org}/members/{id}/passkeys/reset",
         "passkey.reset",
         "CJ-A",
     ),
@@ -103,6 +103,7 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
         "CJ-W",
     ),
     ("GET", "/v1/orgs/{org}/principals", "read", "READ"),
+    ("GET", "/v1/orgs/{org}/members/{id}", "read", "READ"),
     ("GET", "/v1/orgs/{org}/tokens", "read", "READ"),
     ("POST", "/v1/orgs/{org}/tokens", "token.mint", "CJ-A"),
     ("DELETE", "/v1/orgs/{org}/tokens/{id}", "token.revoke", "EX"),
@@ -694,7 +695,7 @@ fn the_break_glass_is_not_reachable_over_http() {
         resets,
         vec![(
             "POST".to_string(),
-            "/v1/orgs/{org}/members/{subject}/passkeys/reset",
+            "/v1/orgs/{org}/members/{id}/passkeys/reset",
             "passkey.reset",
             "CJ-A"
         )]
@@ -1097,7 +1098,7 @@ fn well_formed(r: &scarab_server::RouteEntry) -> (String, Option<Value>) {
         | ("GET", _)
         | ("POST", "/v1/connections/{id}/resync")
         | ("POST", "/v1/orgs/{org}/plugins/{name}/enable")
-        | ("POST", "/v1/orgs/{org}/members/{subject}/passkeys/reset") => None,
+        | ("POST", "/v1/orgs/{org}/members/{id}/passkeys/reset") => None,
         (m, p) => panic!("add a well-formed request for the crown jewel {m} {p}"),
     };
     (uri, body)

@@ -95,8 +95,10 @@ fn gate_resolve_input(actor: &str) -> Value {
         verdict: gr::Verdict::Release,
         actor: gr::Actor {
             principal: actor.into(),
+            principal_id: None,
         },
         approvals: Capped::new(vec![actor.to_string()]).unwrap(),
+        approval_ids: None,
         run: gr::GateRun {
             id: "run-1".into(),
             r#ref: None,

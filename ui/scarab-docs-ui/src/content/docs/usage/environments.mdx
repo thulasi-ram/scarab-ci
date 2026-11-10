@@ -102,7 +102,10 @@ Duplicate runs.
 
 An Environment's baseline protection rules are:
 
-- **`approvers`**: principals whose approval is required. Approvals are recorded on a gate, not in
+- **`approvers`**: the people whose approval is required, each typed as their handle
+  (`github:alice`). A handle typed in another case names the same person when only one person
+  matches. Scarab stores each person's id, so the list keeps naming the same people whatever
+  they are called later, and shows them by handle. Approvals are recorded on a gate, not in
   a separate table: the Run's **Environment approval gate** collects distinct approver identities
   on the Run's durable event log (`GateApproved { step, by }`), and the Steps after it wait until
   the approvals are in. This survives restarts, and approvals cannot be forged. See

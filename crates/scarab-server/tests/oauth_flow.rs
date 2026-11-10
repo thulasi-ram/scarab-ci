@@ -739,7 +739,7 @@ async fn api_login_works_without_a_verifier_and_forwards_one_when_given() {
     let resp = api_login(&app, "good-code").await;
     assert_eq!(resp.status(), StatusCode::OK);
     let v = body_json(resp).await;
-    assert_eq!(v["subject"], "alice");
+    assert_eq!(v["handle"], "alice");
     assert_eq!(p.verifiers.lock().unwrap().as_slice(), &[None]);
 
     let resp = app
@@ -788,7 +788,7 @@ async fn verified_id_token_claims_beat_userinfo() {
     assert_eq!(resp.status(), StatusCode::OK);
     let v = body_json(resp).await;
     assert_eq!(
-        v["subject"], "8f3c-opaque-uuid",
+        v["handle"], "8f3c-opaque-uuid",
         "the verified id_token subject wins over userinfo's `alice`"
     );
     assert_eq!(
@@ -897,7 +897,7 @@ async fn provider_without_an_id_token_still_logs_in_via_userinfo() {
         let p = provider(None).await;
         let app = app_for(&p, vec!["alice".into()], oidc);
         let v = body_json(api_login(&app, "good-code").await).await;
-        assert_eq!(v["subject"], "alice", "oidc mode: {oidc}");
+        assert_eq!(v["handle"], "alice", "oidc mode: {oidc}");
         assert_eq!(*p.userinfo_hits.lock().unwrap(), 1);
         let session = v["session"].as_str().unwrap();
         assert!(may_write(&app, session).await, "alice is an owner");
@@ -912,7 +912,7 @@ async fn plain_oauth2_mode_ignores_an_id_token() {
     let app = app_for(&p, vec!["8f3c-opaque-uuid".into()], false);
 
     let v = body_json(api_login(&app, "good-code").await).await;
-    assert_eq!(v["subject"], "alice", "userinfo remains the identity");
+    assert_eq!(v["handle"], "alice", "userinfo remains the identity");
     assert_eq!(*p.userinfo_hits.lock().unwrap(), 1);
     let session = v["session"].as_str().unwrap();
     assert!(
@@ -939,7 +939,7 @@ async fn verified_email_owner_entry_grants_owner() {
 
     let v = body_json(api_login(&app, "good-code").await).await;
     // The email is only a MATCHER: the stored identity is still the stable sub.
-    assert_eq!(v["subject"], "8f3c-opaque-uuid");
+    assert_eq!(v["handle"], "8f3c-opaque-uuid");
     let session = v["session"].as_str().unwrap();
     assert!(may_write(&app, session).await, "verified email ⇒ Owner");
 }
@@ -958,7 +958,7 @@ async fn unverified_email_owner_entry_does_not_grant_owner() {
         let app = app_for(&p, vec!["ada@example.com".into()], true);
 
         let v = body_json(api_login(&app, "good-code").await).await;
-        assert_eq!(v["subject"], "8f3c-opaque-uuid");
+        assert_eq!(v["handle"], "8f3c-opaque-uuid");
         let session = v["session"].as_str().unwrap();
         assert!(
             !may_write(&app, session).await,
@@ -987,14 +987,18 @@ async fn a_recycled_login_is_a_new_principal_and_inherits_nothing() {
     // bare owner entry still means the person it always meant.
     let resp = api_login(&app, "good-code").await;
     let first = body_json(resp).await;
-    assert_eq!(first["subject"], "alice");
+    assert_eq!(first["handle"], "alice");
     assert!(may_write(&app, first["session"].as_str().unwrap()).await);
 
     // alice renames herself: same immutable id, new login → same Principal.
     *p.user.lock().unwrap() =
         serde_json::json!({ "id": 1001, "login": "alice-renamed", "name": "Alice A" });
     let renamed = body_json(api_login(&app, "good-code").await).await;
-    assert_eq!(renamed["subject"], "alice", "a rename keeps the Principal");
+    assert_eq!(
+        renamed["subject"], first["subject"],
+        "a rename keeps the Principal"
+    );
+    assert_eq!(renamed["handle"], "alice", "and its frozen handle");
     assert!(may_write(&app, renamed["session"].as_str().unwrap()).await);
 
     // A stranger claims the released login: different immutable id.
@@ -1002,9 +1006,10 @@ async fn a_recycled_login_is_a_new_principal_and_inherits_nothing() {
         serde_json::json!({ "id": 2002, "login": "alice", "name": "Not Alice" });
     let stranger = body_json(api_login(&app, "good-code").await).await;
     assert_eq!(
-        stranger["subject"], "alice~2",
+        stranger["handle"], "alice~2",
         "never the existing Principal"
     );
+    assert_ne!(stranger["subject"], first["subject"]);
     assert!(
         !may_write(&app, stranger["session"].as_str().unwrap()).await,
         "the recycled login must not inherit alice's Owner entry"
@@ -1127,7 +1132,7 @@ async fn two_providers_keep_two_alices_apart() {
 
     // The API path: default provider when unnamed, Forgejo when named.
     let gh = body_json(api_login(&app, "good-code").await).await;
-    assert_eq!(gh["subject"], "alice");
+    assert_eq!(gh["handle"], "alice");
     assert!(may_write(&app, gh["session"].as_str().unwrap()).await);
     let named = app
         .clone()
@@ -1144,7 +1149,7 @@ async fn two_providers_keep_two_alices_apart() {
         )
         .await
         .unwrap();
-    assert_eq!(body_json(named).await["subject"], "forgejo:alice");
+    assert_eq!(body_json(named).await["handle"], "forgejo:alice");
 
     // An unknown provider is refused, never silently defaulted.
     let resp = app

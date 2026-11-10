@@ -8080,7 +8080,10 @@ pub struct LoginRequest {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct LoginResponse {
     pub session: String,
+    /// The Principal's id (ADR-0080).
     pub subject: String,
+    /// The Principal's handle: what people read.
+    pub handle: String,
     /// The session's CSRF token — browsers echo it in `x-csrf-token` on every
     /// mutation (also delivered as the readable `scarab_csrf` cookie).
     pub csrf: String,
@@ -8137,6 +8140,7 @@ async fn login(
         StatusCode::OK,
         Json(LoginResponse {
             session: session.id.clone(),
+            handle: principal.handle().to_string(),
             subject: principal.subject,
             csrf: csrf.clone(),
         }),
@@ -13992,6 +13996,7 @@ fn tag_for_path(path: &str) -> Option<&'static str> {
         || path.contains("/passkeys/")
         || path.contains("bindings")
         || path.contains("/principals")
+        || path.contains("/members/")
         || path.contains("/tokens")
     {
         "Auth & Identity"

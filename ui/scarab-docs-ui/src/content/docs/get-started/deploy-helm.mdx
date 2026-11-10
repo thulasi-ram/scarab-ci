@@ -502,8 +502,9 @@ Members page, run the server binary with the database URL:
 scarab-server admin grant --org acme --subject github:alice --role member --reason "first members"
 ```
 
-`--role` is `viewer`, `member`, `admin` or `owner`. The person must have signed in once; until
-then the command exits 3 and says so. The command sets the role exactly: it lowers a higher
+`--subject` is the person's handle, the name they signed in under (`github:alice`); their
+Scarab id (`p_` and 32 hex characters) works too. `--role` is `viewer`, `member`, `admin` or
+`owner`. The person must have signed in once; until then the command exits 3 and says so. The command sets the role exactly: it lowers a higher
 role, restores a revoked one, and turns a role a forge import gave into one the forge sync
 does not change. When the person already holds that role, nothing is written. Each grant is
 recorded in the org's event log as `binding.operator_grant`, with the host, OS user and

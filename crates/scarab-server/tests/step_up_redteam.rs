@@ -191,9 +191,7 @@ async fn send_raw(h: &Harness, req: Request<Body>) -> axum::response::Response {
 async fn an_identity_link_cannot_be_completed_without_a_step_up() {
     let base = stub_provider(json!({ "id": 666, "login": "mallory" })).await;
     let ids = Arc::new(InMemoryIdentities::new());
-    ids.sign_in(&identity("okta", "amy-sub", "amy"), "amy", T0)
-        .await
-        .unwrap();
+    ids.seed("amy", &identity("okta", "amy-sub", "amy"));
     let provider = oauth_provider(&base, ids.clone() as Arc<dyn IdentityStore>);
     let wired = ids.clone();
     let h = harness_with(move |st| {
@@ -251,9 +249,7 @@ async fn an_identity_link_cannot_be_completed_without_a_step_up() {
 async fn link_harness() -> (Harness, Arc<InMemoryIdentities>) {
     let base = stub_provider(json!({ "id": 666, "login": "mallory" })).await;
     let ids = Arc::new(InMemoryIdentities::new());
-    ids.sign_in(&identity("okta", "amy-sub", "amy"), "amy", T0)
-        .await
-        .unwrap();
+    ids.seed("amy", &identity("okta", "amy-sub", "amy"));
     let provider = oauth_provider(&base, ids.clone() as Arc<dyn IdentityStore>);
     let wired = ids.clone();
     let h = harness_with(move |st| {
@@ -699,10 +695,7 @@ async fn merge_harness() -> Option<(
     let pg = Arc::new(scarab_db_postgres::PostgresDb::with_pool(tdb.pool.clone()));
     pg.migrate().await.unwrap();
     for (provider, ext, handle) in [("okta", "amy-sub", "amy"), ("default", "666", "mallory")] {
-        let id = IdentityStore::sign_in(pg.as_ref(), &identity(provider, ext, handle), handle, T0)
-            .await
-            .unwrap();
-        assert_eq!(id, handle);
+        common::seed_principal(&pg, provider, ext, handle).await;
     }
     let base = stub_provider(json!({ "id": 666, "login": "mallory" })).await;
     let provider = oauth_provider(&base, pg.clone() as Arc<dyn IdentityStore>);
