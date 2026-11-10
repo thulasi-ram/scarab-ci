@@ -23,8 +23,8 @@ pub mod scheduler;
 pub mod schedules;
 
 pub use ports::{
-    Clock, Db, Executor, LeaderTerm, LogChunks, SnapshotRetention, StepLaunch, WorkspaceSnapshots,
-    LEADER_TX_BOUND_MS, SCHEDULER_LEASE,
+    Clock, Db, Executor, LeaderTerm, LogChunks, RunSettlement, SnapshotRetention, StepLaunch,
+    WorkspaceSnapshots, LEADER_TX_BOUND_MS, SCHEDULER_LEASE,
 };
 pub use scheduler::{
     cancel_run_request, environment_approval_met, fail_run_creation, gate_approvers,
