@@ -103,8 +103,10 @@ release.yml uses that version's section as the GitHub Release text. See
 - **Upgrade a plugin in place.** An installation's page has Upgrade: give a new commit (the
   recorded source's file at it) or another source, and a new image digest. Scarab shows what the
   new manifest adds, removes and keeps, then applies it to the same installation, keeping its
-  config, storage and connections. An upgrade that asks for nothing new needs no passkey; one that
-  asks for more is confirmed like an install. The server decides which
+  config, storage and connections. A new image digest is new code, so an upgrade to one asks for
+  your passkey, as an install does; so does a manifest that asks for more. Only a narrower
+  manifest on the installed image needs no passkey. The server decides which, and refuses an
+  upgrade while plugins are off
   (`POST /v1/orgs/{org}/plugins/{name}/upgrade-fetch`, then `…/upgrade`). Each installation now
   records where its manifest was read.
   ([Upgrade a plugin](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#upgrade-a-plugin))

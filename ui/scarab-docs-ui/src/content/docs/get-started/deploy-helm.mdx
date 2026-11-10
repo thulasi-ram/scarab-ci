@@ -342,22 +342,25 @@ Open the installation's page and choose **Upgrade**, or use the API, in two step
    the commit. It shows what the new manifest adds, removes and keeps against the installed one:
    capabilities, connection slots, auth schemes, read rules, config keys, gates and the named
    image.
-2. **Upgrade.** Give the new image pinned by digest. Scarab reads the source again and refuses the
-   upgrade (409) if the manifest is not the one you compared, or if the installation changed since
-   you compared it.
+2. **Upgrade.** Give the image pinned by digest: a new one, or the installed one to change only
+   the manifest. Scarab reads the source again and refuses the upgrade (409) if the manifest is
+   not the one you compared, if the installation changed since you compared it, or while plugins
+   are off.
 
-An upgrade that asks for nothing new needs no passkey: the new manifest removes things or keeps
-them, and the image is a new digest of the same repository. An upgrade that adds a capability, a
-connection slot, an auth scheme, a read rule or a gate, that stops naming its image or names
-another, or that moves the image to another repository, asks you to confirm with your passkey, as
-an install does. Scarab decides this from the two manifests; the request cannot say it.
+A new image digest is new code, so an upgrade to one asks you to confirm with your passkey, as an
+install does, even when the manifest is the same or narrower. So does a manifest that adds a
+capability, a connection slot, an auth scheme, a read rule or a gate, or that stops naming its
+image or names another. The one upgrade that needs no passkey keeps the installed image and
+removes from the manifest or keeps it as it is. Scarab decides this from the installation and the
+manifest it reads; the request cannot say it. Give the image to the fetch too, and its answer
+(`needs_step_up`, with `step_up_reasons`) says which applies.
 
 ```sh
 curl -X POST "$SCARAB/v1/orgs/acme/plugins/notify/upgrade-fetch" \
   -d '{"commit": "4b1e…", "image": "ghcr.io/acme/notify@sha256:…"}'
 # → {"source": "…@4b1e…", "manifest_sha256": "77d0…", "current_manifest_sha256": "a41c…",
 #    "diff": {"read_rules": {"added": [], "removed": ["api: GET /v1/legacy"], …}, …},
-#    "widenings": [], "needs_step_up": false, …}
+#    "step_up_reasons": ["runs new code: image `…` instead of `…`"], "needs_step_up": true, …}
 
 curl -X POST "$SCARAB/v1/orgs/acme/plugins/notify/upgrade" \
   -d '{"image": "ghcr.io/acme/notify@sha256:…",
