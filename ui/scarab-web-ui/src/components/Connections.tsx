@@ -115,43 +115,45 @@ export default function Connections(props: { org: string }) {
                 </Show>
               }
             >
-              <table class="table lib-table conn-table" aria-label="Forge connections">
-                <thead>
-                  <tr>
-                    <th>Connection</th>
-                    <th>State</th>
-                    <th>Repositories</th>
-                    <th>Last delivery</th>
-                    <th />
-                  </tr>
-                </thead>
-                <tbody>
-                  <For each={rows()}>
-                    {(c) => (
-                      <tr>
-                        <td>
-                          <A class="oenv-link" href={connectionHref(props.org, c.id)}>
-                            {forgeName(c.kind)} <span class="mono">{connectionHost(c)}</span>
-                          </A>
-                          <span class="conn-id mono">{c.id}</span>
-                        </td>
-                        <td class="keep">
-                          <Chips chips={connectionChips(c)} />
-                        </td>
-                        <td>{enabledReposLabel(c.enabled_repos)}</td>
-                        <td title={c.last_delivery_at != null ? absTime(c.last_delivery_at) : undefined}>
-                          {c.last_delivery_at != null ? relTime(c.last_delivery_at) : "none yet"}
-                        </td>
-                        <td class="acts keep">
-                          <A class="btn btn-ghost btn-sm" href={connectionHref(props.org, c.id)}>
-                            Manage
-                          </A>
-                        </td>
-                      </tr>
-                    )}
-                  </For>
-                </tbody>
-              </table>
+              <div class="table-scroll">
+                <table class="table lib-table conn-table" aria-label="Forge connections">
+                  <thead>
+                    <tr>
+                      <th>Connection</th>
+                      <th>State</th>
+                      <th>Repositories</th>
+                      <th>Last delivery</th>
+                      <th />
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <For each={rows()}>
+                      {(c) => (
+                        <tr>
+                          <td>
+                            <A class="oenv-link" href={connectionHref(props.org, c.id)}>
+                              {forgeName(c.kind)} <span class="mono">{connectionHost(c)}</span>
+                            </A>
+                            <span class="conn-id mono">{c.id}</span>
+                          </td>
+                          <td class="keep">
+                            <Chips chips={connectionChips(c)} />
+                          </td>
+                          <td>{enabledReposLabel(c.enabled_repos)}</td>
+                          <td title={c.last_delivery_at != null ? absTime(c.last_delivery_at) : undefined}>
+                            {c.last_delivery_at != null ? relTime(c.last_delivery_at) : "none yet"}
+                          </td>
+                          <td class="acts keep">
+                            <A class="btn btn-ghost btn-sm" href={connectionHref(props.org, c.id)}>
+                              Manage
+                            </A>
+                          </td>
+                        </tr>
+                      )}
+                    </For>
+                  </tbody>
+                </table>
+              </div>
             </Show>
             <p class="subtle">
               <small>

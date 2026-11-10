@@ -33,7 +33,7 @@ export default function Layout(props: ParentProps) {
           <span>Scarab</span>
         </A>
         <span class="topbar-spacer" />
-        <button class="search-chip" type="button" onClick={() => setPaletteOpen(true)}>
+        <button class="search-chip" type="button" aria-label="Search" onClick={() => setPaletteOpen(true)}>
           <Icon icon="search" size={13} />
           <span class="search-chip-label">Search</span>
           <span class="mono kbd">⌘K</span>

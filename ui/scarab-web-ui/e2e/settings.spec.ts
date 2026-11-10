@@ -1415,6 +1415,32 @@ function sticksOut(page: Page) {
   });
 }
 
+/** Whatever lies outside the window on either side, top bar included, and is
+ *  not inside a box that scrolls sideways on its own. Decoration
+ *  (`aria-hidden`) is left out. */
+function outsideTheWindow(page: Page) {
+  return page.evaluate(() => {
+    const w = window.innerWidth;
+    const out: string[] = [];
+    for (const el of Array.from(document.body.querySelectorAll("*"))) {
+      const r = el.getBoundingClientRect();
+      if (r.width === 0 || (r.right <= w + 1 && r.left >= -1)) continue;
+      if (el.closest('[aria-hidden="true"]')) continue;
+      let p = el.parentElement;
+      let held = false;
+      while (p) {
+        if (["auto", "scroll"].includes(getComputedStyle(p).overflowX)) {
+          held = true;
+          break;
+        }
+        p = p.parentElement;
+      }
+      if (!held) out.push(`${el.tagName.toLowerCase()}.${(el as HTMLElement).className}`);
+    }
+    return out;
+  });
+}
+
 test("on a phone the Access and Members tables scroll inside their box, not the page", async ({ page }) => {
   await page.setViewportSize({ width: 375, height: 800 });
   await page.goto("/acme/scarab?tab=settings");
@@ -1423,6 +1449,34 @@ test("on a phone the Access and Members tables scroll inside their box, not the 
   await page.goto("/orgs/acme/settings/members");
   await expect(page.getByRole("table", { name: "Members" })).toBeVisible();
   expect(await sticksOut(page)).toEqual([]);
+});
+
+test("on a phone no page scrolls sideways, and the top bar keeps every link", async ({ page }) => {
+  await page.setViewportSize({ width: 375, height: 800 });
+  const pages: [string, string][] = [
+    ["/", "Dashboard"],
+    ["/orgs/acme", "acme"],
+    ["/acme/orders-api", "orders-api"],
+    ["/acme/orders-api?tab=settings", "orders-api"],
+    ["/acme/orders-api/runs/0190f8a2000071fb8c00a0760421aaaa", "#421"],
+    ["/orgs/acme/settings/libraries", "Libraries"],
+    ["/orgs/acme/settings/plugins", "Plugins"],
+    ["/orgs/acme/settings/plugins/4f2a1c9e7b/manage", "argocd"],
+    ["/orgs/acme/settings/connections", "Connections"],
+    ["/orgs/acme/settings/security", "Security"],
+    ["/settings/security", "Security"],
+  ];
+  for (const [url, heading] of pages) {
+    await page.goto(url);
+    await expect(page.getByRole("heading", { level: 1 }).first()).toContainText(heading);
+    const top = page.getByRole("navigation").first();
+    for (const name of ["Search", "Docs", "API"]) {
+      await expect(top.getByRole(name === "Search" ? "button" : "link", { name, exact: true })).toBeInViewport();
+    }
+    const width = await page.evaluate(() => [document.documentElement.scrollWidth, window.innerWidth]);
+    expect(width[0], url).toBeLessThanOrEqual(width[1]!);
+    expect(await outsideTheWindow(page), url).toEqual([]);
+  }
 });
 
 test("a repository's Access is for org admins", async ({ page }) => {

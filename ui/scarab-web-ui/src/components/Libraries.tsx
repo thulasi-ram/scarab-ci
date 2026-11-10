@@ -111,47 +111,49 @@ export default function Libraries(props: { org: string }) {
                 </div>
               }
             >
-              <table class="table lib-table" aria-label="Installed libraries">
-                <thead>
-                  <tr>
-                    <th>Library</th>
-                    <th>Version</th>
-                    <th>State</th>
-                    <th>Installed</th>
-                    <th />
-                  </tr>
-                </thead>
-                <tbody>
-                  <For each={rows()}>
-                    {(l) => (
-                      <tr classList={{ dead: !!l.yanked }}>
-                        <td>
-                          <A class="mono oenv-link" href={libraryManageHref(props.org, l)}>
-                            {libraryId(l)}
-                          </A>
-                        </td>
-                        <td>
-                          <span class="lib-hash" title={l.content_hash}>
-                            {shortHash(l.content_hash)}
-                          </span>
-                        </td>
-                        <td class="keep">
-                          <Chips chips={libraryChips(l, trusted())} />
-                        </td>
-                        <td title={absTime(l.installed_at)}>
-                          <span class="mono">{l.installed_by}</span>{" "}
-                          <span class="subtle">· {relTime(l.installed_at)}</span>
-                        </td>
-                        <td class="acts keep">
-                          <A class="btn btn-ghost btn-sm" href={libraryManageHref(props.org, l)}>
-                            Manage
-                          </A>
-                        </td>
-                      </tr>
-                    )}
-                  </For>
-                </tbody>
-              </table>
+              <div class="table-scroll">
+                <table class="table lib-table" aria-label="Installed libraries">
+                  <thead>
+                    <tr>
+                      <th>Library</th>
+                      <th>Version</th>
+                      <th>State</th>
+                      <th>Installed</th>
+                      <th />
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <For each={rows()}>
+                      {(l) => (
+                        <tr classList={{ dead: !!l.yanked }}>
+                          <td>
+                            <A class="mono oenv-link" href={libraryManageHref(props.org, l)}>
+                              {libraryId(l)}
+                            </A>
+                          </td>
+                          <td>
+                            <span class="lib-hash" title={l.content_hash}>
+                              {shortHash(l.content_hash)}
+                            </span>
+                          </td>
+                          <td class="keep">
+                            <Chips chips={libraryChips(l, trusted())} />
+                          </td>
+                          <td title={absTime(l.installed_at)}>
+                            <span class="mono">{l.installed_by}</span>{" "}
+                            <span class="subtle">· {relTime(l.installed_at)}</span>
+                          </td>
+                          <td class="acts keep">
+                            <A class="btn btn-ghost btn-sm" href={libraryManageHref(props.org, l)}>
+                              Manage
+                            </A>
+                          </td>
+                        </tr>
+                      )}
+                    </For>
+                  </tbody>
+                </table>
+              </div>
             </Show>
 
             <Show when={yanks().length > 0}>

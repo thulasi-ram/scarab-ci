@@ -224,6 +224,10 @@ release.yml uses that version's section as the GitHub Release text. See
 - A repository page no longer repeats the Environments tab's and the Secrets tab's actions
   in its header, and the Environments tab no longer lists approval history; each
   Environment links to its Runs.
+- On a phone no page scrolls sideways. The top bar keeps Search, Docs, API and the user menu
+  in the window (Search shows its icon only); a run's actions wrap onto more lines; the
+  dashboard's waiting rows put what they are about on a line of their own; and the Libraries,
+  Plugins, Connections and security event tables scroll inside their own box.
 
 ## [0.3.0] - 2026-11-09
 
