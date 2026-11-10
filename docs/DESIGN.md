@@ -154,7 +154,7 @@ UI has exactly four text styles, so every page stays within that. Each is a
 | Title | `--t-title` | Inter (`--font-ui`) | 600 · 20px | page titles (`h1`, the run and settings breadcrumb headings), dialog titles, stat figures |
 | Label | `--t-label` | Inter | 600 · 13px | names, section and panel headings, column heads, field labels, buttons, active tabs and nav links |
 | Body | `--t-body` | Inter | 400 · 13px | running text, values, form controls, nav links |
-| Mono | `--t-mono` | JetBrains Mono (`--font-mono`) | 400 · 12px | machine values: ids, SHAs, refs, durations, counts, code, logs |
+| Mono | `--t-mono` | JetBrains Mono (`--font-mono`) | 500 · 12px | machine values: ids, SHAs, refs, durations, counts, code, logs |
 
 Every text rule sets `font:` to one of the four tokens, or `font: inherit`.
 No rule sets `font-size`, `font-weight` or `font-family` on its own, and
@@ -167,9 +167,13 @@ sits in: the class means "this is a machine value".
 ### Hierarchy without more sizes
 
 - A heading that used to be larger is Label; the space above it and the
-  Body text under it set it apart.
+  Body text under it set it apart. A heading (a panel header, a section
+  heading, the settings sidebar's heading) is in the primary ink,
+  `--soft-white`, so it does not read as running text. Field labels, column
+  heads and the labels of label and value lists stay in `--muted-sage`.
 - Secondary text is Body in `--sage` or `--muted-sage`. Colour is not a font
   variation, so it does not count against the four.
+- Mono is weight 500, not 400: at 12px, 400 reads thin next to Inter.
 - Status chips and badges keep their data values as written (`succeeded`,
   `push`, `unreachable`): lowercase Mono or Label, not upper-cased.
 
@@ -282,8 +286,10 @@ Placement is stricter than doodles, because motion competes with content:
 ### Cards & panels
 - `.card`/`.panel`/`.prov`/`.repo-card`: `--emerald-surface` fill, `--border`
   hairline, radius `--radius`–`--radius-lg` (5–7px), zero shadow. Panel headers
-  (`.panel-h`) are a `--pine-deep` band with a Label heading. Panels
-  carry no decoration.
+  (`.panel-h`) are a `--pine-deep` band with a Label heading in `--soft-white`.
+  Panels carry no decoration.
+- The settings sidebar marks the page you are on with a `--pine-deep`
+  background and `--emerald` Label text, and no edge.
 
 ### Terminals (logs + DAG)
 - `.logs` and `.dag` fill `--terminal` (pine-black) in both themes, with
@@ -405,7 +411,8 @@ dot grid), so it reads as a space waiting to be filled rather than as a card.
 - **Doodles**: same Lucide icons, dot-matrixed at the §5 settings, 1–2/page, faint.
 
 ### Fonts
-- **Inter** 400/600 for Title, Label and Body; **JetBrains Mono** 400 for Mono;
+- **Inter** 400/600 for Title, Label and Body; **JetBrains Mono** 500 for Mono
+  (400 only for the ASCII scenes and the debug shell's canvas);
   **Space Grotesk** for the wordmark only. All three self-hosted via `@fontsource`.
 
 ### Example component prompts

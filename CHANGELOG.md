@@ -190,6 +190,10 @@ release.yml uses that version's section as the GitHub Release text. See
   installation's id page.
   The library review page lays its facts and checks out on one grid, with Install in one row
   under the diff.
+- **Headings read as headings, and Mono is heavier.** Panel headers, section headings and the
+  settings sidebar's heading are in the primary ink instead of the muted one. The settings
+  sidebar marks the page you are on with its background and colour only, without the green
+  edge. Mono text is set at weight 500 instead of 400; the four text styles stay four.
 - **Environments, Policies and Members follow the same list-and-page layout.** Each list has its
   add action at the right of its header (**New environment**, **Paste YAML** and **New policy**,
   **Grant role**) and a **Manage** link per row. Account settings › Security has **Add passkey**
