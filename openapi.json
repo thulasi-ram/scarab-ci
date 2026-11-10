@@ -1677,110 +1677,6 @@
         ]
       }
     },
-    "/v1/orgs/{org}/environment-migration-report": {
-      "get": {
-        "tags": [
-          "Environments"
-        ],
-        "summary": "The ADR-0071 migration's split report (ADR-0071 §10 step 8)",
-        "operationId": "get_environment_migration_report",
-        "parameters": [
-          {
-            "name": "org",
-            "in": "path",
-            "description": "org",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/components/schemas/EnvironmentMigrationReportDto"
-                  }
-                }
-              }
-            }
-          },
-          "403": {
-            "description": "not an org admin"
-          },
-          "404": {
-            "description": "not configured"
-          }
-        },
-        "security": [
-          {
-            "apiToken": []
-          },
-          {
-            "sessionCookie": []
-          }
-        ]
-      }
-    },
-    "/v1/orgs/{org}/environment-migration-report/{env}/acknowledge": {
-      "post": {
-        "tags": [
-          "Environments"
-        ],
-        "summary": "Acknowledge a split-report line (ADR-0071 §10 step 8)",
-        "operationId": "acknowledge_environment_migration_report",
-        "parameters": [
-          {
-            "name": "org",
-            "in": "path",
-            "description": "org",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "env",
-            "in": "path",
-            "description": "environment name",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/EnvironmentMigrationReportDto"
-                }
-              }
-            }
-          },
-          "403": {
-            "description": "not an org admin"
-          },
-          "404": {
-            "description": "no report line for that name, or not configured"
-          }
-        },
-        "security": [
-          {
-            "apiToken": []
-          },
-          {
-            "sessionCookie": []
-          }
-        ]
-      }
-    },
     "/v1/orgs/{org}/environments": {
       "get": {
         "tags": [
@@ -2080,7 +1976,7 @@
           "Environments"
         ],
         "summary": "Duplicate an org Environment, its rules, eligibility, overlays, grants and secrets",
-        "description": "Not copied, and listed in the answer: Policies that select the old\nEnvironment and not the new one, the Projects whose Pipelines name the\nold one (from Run history), and the OIDC subject cloud trust policies\nmatch. Run and approval history and the Cache stay with the old\nEnvironment, which is not changed.\n\nThe secret store is a separate store from the Environment's, so the two\ncannot share a transaction. The secrets are copied first; the\nEnvironment, its eligibility, overlays and grants are then created in\none transaction. If either step fails, the copied secrets are deleted, so\nno partial Environment is left. A crash between the two leaves only\nsecrets under a name no Environment has, which no Run can resolve and\nwhich a retry refuses (409) until an admin deletes them. The new name is\nclaimed throughout: a second Duplicate to it is refused (409) before it\nwrites anything, and so is a create of it by the Environment PUT, so no\nother Environment takes the name while this one's secrets are written.",
+        "description": "Not copied, and listed in the answer: Policies that select the old\nEnvironment and not the new one, the Projects whose Pipelines name the\nold one (from Run history), and the OIDC subject cloud trust policies\nmatch. Run history, approvals included, and the Cache stay with the old\nEnvironment, which is not changed.\n\nThe secret store is a separate store from the Environment's, so the two\ncannot share a transaction. The secrets are copied first; the\nEnvironment, its eligibility, overlays and grants are then created in\none transaction. If either step fails, the copied secrets are deleted, so\nno partial Environment is left. A crash between the two leaves only\nsecrets under a name no Environment has, which no Run can resolve and\nwhich a retry refuses (409) until an admin deletes them. The new name is\nclaimed throughout: a second Duplicate to it is refused (409) before it\nwrites anything, and so is a create of it by the Environment PUT, so no\nother Environment takes the name while this one's secrets are written.",
         "operationId": "duplicate_org_environment",
         "parameters": [
           {
@@ -10064,117 +9960,6 @@
         },
         "additionalProperties": false
       },
-      "EnvironmentMigrationReportDto": {
-        "type": "object",
-        "description": "One line of the split report: an Environment name merged across several\nProjects, or created with eligibility *all projects* because no Project\ndefined it. If the merged Projects really meant different places (one\n`prod` that is `prod-eu`), the split is a YAML change: those Projects\nrename their `environment:` and an org admin creates the new\nEnvironment — nothing is renamed for them.",
-        "required": [
-          "environment",
-          "merged_projects",
-          "referenced_only",
-          "referencing_projects",
-          "differing_rules",
-          "environment_exists",
-          "permissive_baseline",
-          "projects",
-          "created_at"
-        ],
-        "properties": {
-          "acknowledged_at": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64",
-            "description": "Unix-ms; absent until an admin acknowledges the line."
-          },
-          "acknowledged_by": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "created_at": {
-            "type": "integer",
-            "format": "int64",
-            "description": "Unix-ms."
-          },
-          "differing_rules": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            },
-            "description": "The legacy rules the merged Projects disagreed on, by ADR-0037 field\nname (`approvers`, `allowed_refs`, `wait_timer`, `require_reason`,\n`privileged_images`, `permit_k8s_overlay`). Lists compare as sets."
-          },
-          "environment": {
-            "type": "string"
-          },
-          "environment_exists": {
-            "type": "boolean",
-            "description": "The Environment still exists."
-          },
-          "merged_projects": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
-          },
-          "permissive_baseline": {
-            "type": "boolean",
-            "description": "Its baseline is still the permissive one the migration gave it:\nnothing org-wide protects it yet — set a baseline."
-          },
-          "projects": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/EnvironmentMigrationReportProjectDto"
-            }
-          },
-          "referenced_only": {
-            "type": "boolean",
-            "description": "No Project defined it: migrated with eligibility *all projects*."
-          },
-          "referencing_projects": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            },
-            "description": "Projects whose Runs named it without defining it."
-          }
-        }
-      },
-      "EnvironmentMigrationReportProjectDto": {
-        "type": "object",
-        "description": "One Project in a split-report line: what it had, and what it has now.",
-        "required": [
-          "project"
-        ],
-        "properties": {
-          "legacy": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/LegacyProtectionRulesDto",
-                "description": "Its per-repo rules before the migration; absent for a Project whose\nRuns only named the Environment."
-              }
-            ]
-          },
-          "overlay": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/EnvironmentProjectOverlayDto",
-                "description": "Its overlay now (the migration wrote it from `legacy`; it may have\nbeen changed or removed since)."
-              }
-            ]
-          },
-          "project": {
-            "type": "string"
-          }
-        }
-      },
       "EnvironmentProjectDto": {
         "type": "object",
         "description": "One Project's standing in one Environment, for the Environment's admin.",
@@ -10821,57 +10606,6 @@
           },
           "source": {
             "type": "string"
-          }
-        }
-      },
-      "LegacyProtectionRulesDto": {
-        "type": "object",
-        "description": "A Project's ADR-0037 per-repo rules as the migration found them. The\ncanonical `secret_scope` / `oidc_subject` are left out: the server always\nderived them from the coordinates, so they never differed by choice.",
-        "required": [
-          "approvers",
-          "allowed_refs",
-          "wait_timer",
-          "concurrency",
-          "require_reason",
-          "privileged_images",
-          "permit_k8s_overlay"
-        ],
-        "properties": {
-          "allowed_refs": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
-          },
-          "approvers": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
-          },
-          "concurrency": {
-            "type": "integer",
-            "format": "int32",
-            "description": "Stored but never read; not carried by the migration (§10 step 3).",
-            "minimum": 0
-          },
-          "permit_k8s_overlay": {
-            "type": "boolean"
-          },
-          "privileged_images": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ImageGrantDto"
-            }
-          },
-          "require_reason": {
-            "type": "boolean"
-          },
-          "wait_timer": {
-            "type": "integer",
-            "format": "int32",
-            "description": "Seconds.",
-            "minimum": 0
           }
         }
       },
@@ -14874,7 +14608,7 @@
     },
     {
       "name": "Environments",
-      "description": "Org-level Environments (ADR-0071) and their governance; per-repo Environments and their protection rules, plus their legacy approval history."
+      "description": "Org-level Environments (ADR-0071) and their governance; per-repo Environments and their protection rules."
     },
     {
       "name": "Plugins",

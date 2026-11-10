@@ -673,40 +673,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/v1/orgs/{org}/environment-migration-report": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** The ADR-0071 migration's split report (ADR-0071 §10 step 8) */
-        get: operations["get_environment_migration_report"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/orgs/{org}/environment-migration-report/{env}/acknowledge": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Acknowledge a split-report line (ADR-0071 §10 step 8) */
-        post: operations["acknowledge_environment_migration_report"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/v1/orgs/{org}/environments": {
         parameters: {
             query?: never;
@@ -781,7 +747,7 @@ export interface paths {
          * @description Not copied, and listed in the answer: Policies that select the old
          *     Environment and not the new one, the Projects whose Pipelines name the
          *     old one (from Run history), and the OIDC subject cloud trust policies
-         *     match. Run and approval history and the Cache stay with the old
+         *     match. Run history, approvals included, and the Cache stay with the old
          *     Environment, which is not changed.
          *
          *     The secret store is a separate store from the Environment's, so the two
@@ -3275,53 +3241,6 @@ export interface components {
              */
             projects?: string[];
         };
-        /**
-         * @description One line of the split report: an Environment name merged across several
-         *     Projects, or created with eligibility *all projects* because no Project
-         *     defined it. If the merged Projects really meant different places (one
-         *     `prod` that is `prod-eu`), the split is a YAML change: those Projects
-         *     rename their `environment:` and an org admin creates the new
-         *     Environment — nothing is renamed for them.
-         */
-        EnvironmentMigrationReportDto: {
-            /**
-             * Format: int64
-             * @description Unix-ms; absent until an admin acknowledges the line.
-             */
-            acknowledged_at?: number | null;
-            acknowledged_by?: string | null;
-            /**
-             * Format: int64
-             * @description Unix-ms.
-             */
-            created_at: number;
-            /**
-             * @description The legacy rules the merged Projects disagreed on, by ADR-0037 field
-             *     name (`approvers`, `allowed_refs`, `wait_timer`, `require_reason`,
-             *     `privileged_images`, `permit_k8s_overlay`). Lists compare as sets.
-             */
-            differing_rules: string[];
-            environment: string;
-            /** @description The Environment still exists. */
-            environment_exists: boolean;
-            merged_projects: string[];
-            /**
-             * @description Its baseline is still the permissive one the migration gave it:
-             *     nothing org-wide protects it yet — set a baseline.
-             */
-            permissive_baseline: boolean;
-            projects: components["schemas"]["EnvironmentMigrationReportProjectDto"][];
-            /** @description No Project defined it: migrated with eligibility *all projects*. */
-            referenced_only: boolean;
-            /** @description Projects whose Runs named it without defining it. */
-            referencing_projects: string[];
-        };
-        /** @description One Project in a split-report line: what it had, and what it has now. */
-        EnvironmentMigrationReportProjectDto: {
-            legacy?: null | components["schemas"]["LegacyProtectionRulesDto"];
-            overlay?: null | components["schemas"]["EnvironmentProjectOverlayDto"];
-            project: string;
-        };
         /** @description One Project's standing in one Environment, for the Environment's admin. */
         EnvironmentProjectDto: {
             /** @description Whether the Environment's eligibility admits it now. */
@@ -3573,28 +3492,6 @@ export interface components {
         InstalledVersionDto: {
             content_hash: string;
             source: string;
-        };
-        /**
-         * @description A Project's ADR-0037 per-repo rules as the migration found them. The
-         *     canonical `secret_scope` / `oidc_subject` are left out: the server always
-         *     derived them from the coordinates, so they never differed by choice.
-         */
-        LegacyProtectionRulesDto: {
-            allowed_refs: string[];
-            approvers: string[];
-            /**
-             * Format: int32
-             * @description Stored but never read; not carried by the migration (§10 step 3).
-             */
-            concurrency: number;
-            permit_k8s_overlay: boolean;
-            privileged_images: components["schemas"]["ImageGrantDto"][];
-            require_reason: boolean;
-            /**
-             * Format: int32
-             * @description Seconds.
-             */
-            wait_timer: number;
         };
         LibraryDefaultsDto: {
             mirror?: string | null;
@@ -7081,80 +6978,6 @@ export interface operations {
             };
             /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
             429: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    get_environment_migration_report: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description org */
-                org: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["EnvironmentMigrationReportDto"][];
-                };
-            };
-            /** @description not an org admin */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description not configured */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    acknowledge_environment_migration_report: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description org */
-                org: string;
-                /** @description environment name */
-                env: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["EnvironmentMigrationReportDto"];
-                };
-            };
-            /** @description not an org admin */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description no report line for that name, or not configured */
-            404: {
                 headers: {
                     [name: string]: unknown;
                 };
