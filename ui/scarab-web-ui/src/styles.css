@@ -4152,3 +4152,22 @@ a.head-org:hover { color: var(--emerald); text-decoration: underline; text-under
 /* The repository Settings tab: Disable, with the unreachable line beside it. */
 .repo-disable { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin-top: 4px; }
 .repo-disable .repo-unreachable-note { margin: 0; font-size: var(--fs-xs); }
+
+/* The Run page's Policies strip: a collapsible panel of decisions. */
+.run-policies { margin-bottom: 14px; }
+.run-policies > summary { cursor: pointer; list-style: none; }
+.run-policies > summary::-webkit-details-marker { display: none; }
+.run-policies[open] > summary { border-bottom: 1px solid var(--border-soft); }
+.run-pol-list { padding: 12px 14px; }
+.run-pol-results { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; font-size: var(--fs-sm); }
+.run-pol-results li { display: flex; gap: 9px; flex-wrap: wrap; align-items: baseline; }
+.run-pol-outcome { font-family: var(--font-mono); font-size: var(--fs-xs); min-width: 13ch; color: var(--muted-sage); }
+.run-pol-denied { color: var(--danger); }
+.run-pol-would_deny, .run-pol-requires { color: var(--copper); }
+.run-pol-msg { color: var(--sage); }
+.run-pol-input summary { cursor: pointer; width: max-content; font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--muted-sage); }
+.run-pol-input summary:hover { color: var(--emerald); }
+.run-pol-input pre {
+  margin: 6px 0 0; padding: 10px 12px; max-height: 320px; overflow: auto;
+  font-size: var(--fs-xs); background: var(--pine-deep); border-radius: var(--radius-sm);
+}

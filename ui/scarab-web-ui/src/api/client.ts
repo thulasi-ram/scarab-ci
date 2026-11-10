@@ -2134,3 +2134,88 @@ export async function listOrgPolicyDecisions(org: string, limit = 200): Promise<
   if (error || !data) throw new Error(errorText(error) || "failed to load the org's policy decisions");
   return data;
 }
+
+/** A recorded decision (`PolicyDecisionRecordDto`). */
+export type PolicyDecisionRecord = components["schemas"]["PolicyDecisionRecordDto"];
+
+/** A Run's decisions, oldest first (`GET /v1/runs/{id}/policy-decisions`). */
+export async function listRunPolicyDecisions(runId: string): Promise<PolicyDecisionRecord[]> {
+  const { data, error, response } = await api.GET("/v1/runs/{id}/policy-decisions", {
+    params: { path: { id: runId } },
+  });
+  if (error || !data) {
+    throw new Error(errorText(error) || `failed to load the run's policy decisions (${response.status})`);
+  }
+  return data;
+}
+
+/** Where a Policy is stored: the org's own, or one project's typed settings. */
+export type PolicyScope = { org: string; project?: string };
+
+// The schema leaves an authored Policy opaque (`Record<string, never>`).
+type OpaquePolicy = Record<string, never>;
+
+/** The Policies stored at exactly `scope`. `null` when the server has no
+ *  policy store (404). */
+export async function listPolicies(scope: PolicyScope): Promise<PolicyRecord[] | null> {
+  if (scope.project === undefined) return listOrgPolicies(scope.org);
+  const { data, error, response } = await api.GET("/v1/orgs/{org}/projects/{project}/policies", {
+    params: { path: { org: scope.org, project: scope.project } },
+  });
+  if (response.status === 404) return null;
+  if (error || !data) throw new Error(errorText(error) || "failed to load the project's policies");
+  return data;
+}
+
+/** Add a Policy at `scope`. Adding one tightens, so it needs no step-up. */
+export async function createPolicy(scope: PolicyScope, policy: unknown, reason?: string): Promise<PolicyRecord> {
+  const body = { policy: policy as OpaquePolicy, reason: reason || null };
+  const { data, error, response } =
+    scope.project === undefined
+      ? await api.POST("/v1/orgs/{org}/policies", { params: { path: { org: scope.org } }, body })
+      : await api.POST("/v1/orgs/{org}/projects/{project}/policies", {
+          params: { path: { org: scope.org, project: scope.project } },
+          body,
+        });
+  if (error || !data) throw new Error(errorText(error) || `could not add the policy (${response.status})`);
+  return data;
+}
+
+/** Replace a Policy, judged against `expectedVersion`. Changing an enforced
+ *  Policy asks for a step-up, which the client's middleware handles. */
+export async function updatePolicy(
+  scope: PolicyScope,
+  id: string,
+  policy: unknown,
+  expectedVersion: number,
+  reason?: string,
+): Promise<PolicyRecord> {
+  const body = { policy: policy as OpaquePolicy, expected_version: expectedVersion, reason: reason || null };
+  const { data, error, response } =
+    scope.project === undefined
+      ? await api.PUT("/v1/orgs/{org}/policies/{id}", { params: { path: { org: scope.org, id } }, body })
+      : await api.PUT("/v1/orgs/{org}/projects/{project}/policies/{id}", {
+          params: { path: { org: scope.org, project: scope.project, id } },
+          body,
+        });
+  if (error || !data) throw new Error(errorText(error) || `could not save the policy (${response.status})`);
+  return data;
+}
+
+/** Delete a Policy (its history stays). */
+export async function deletePolicy(
+  scope: PolicyScope,
+  id: string,
+  expectedVersion: number,
+  reason?: string,
+): Promise<PolicyRecord> {
+  const query = { expected_version: expectedVersion, reason: reason || undefined };
+  const { data, error, response } =
+    scope.project === undefined
+      ? await api.DELETE("/v1/orgs/{org}/policies/{id}", { params: { path: { org: scope.org, id }, query } })
+      : await api.DELETE("/v1/orgs/{org}/projects/{project}/policies/{id}", {
+          params: { path: { org: scope.org, project: scope.project, id }, query },
+        });
+  if (error || !data) throw new Error(errorText(error) || `could not delete the policy (${response.status})`);
+  return data;
+}

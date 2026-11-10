@@ -336,7 +336,7 @@ test("the Policies page lists CEL policies with their counts and the typed setti
   await expect(lists).toContainText("github.com/thulasi-ram/*");
   await expect(page.locator("section.page").getByRole("textbox")).toHaveCount(0);
   await lists.getByRole("link", { name: "Libraries" }).click();
-  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/libraries$/);
+  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/libraries#library-lists$/);
 
   await page.goto("/orgs/acme/settings/policies");
   await envs.getByRole("listitem").filter({ hasText: "Production" }).getByRole("link", { name: "Edit" }).click();

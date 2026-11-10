@@ -77,6 +77,7 @@ import { clock, clockLow, isYankRefusal, rerunYank, yankNote } from "../run-orig
 import { relTime, absTime, duration } from "../fmt";
 import { forgeCommitUrl, forgePrUrl } from "../forge";
 import StatusBadge from "../components/StatusBadge";
+import RunPolicies from "../components/RunPolicies";
 import Icon from "../components/Icon";
 import Doodle from "../components/Doodle";
 import Dag, { type DagStep, type DagService, type DagControls } from "../components/Dag";
@@ -1244,6 +1245,8 @@ export default function RunDetail() {
                 </Show>
               </div>
             </div>
+
+            <RunPolicies runId={id()} live={live()} />
 
             {/* Pipeline component (Proposal B — stack): a full-width blueprint
                 band on TOP, with the selected step's (or service's) evidence
