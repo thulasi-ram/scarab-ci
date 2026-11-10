@@ -47,6 +47,14 @@ release.yml uses that version's section as the GitHub Release text. See
   answers 409, and the mark clears when GitHub covers it again or a re-sync lists it. Disable
   removes it. This needs migration 0089, which adds a column.
   ([Enabling repositories](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#enabling-repositories))
+- **Organization settings › Connections no longer lists repositories.** Each connection shows how
+  many it has enabled and links to the org page narrowed to it (Manage repositories); Add
+  repository, the per-repository Disable and the per-repository Webhook button are gone from it.
+  Repositories are enabled and disabled on the org page, and a Forgejo repository's webhook is
+  registered again from its Settings tab (Register webhook). `GET /v1/connections` returns
+  `enabled_repos`, a count, in place of the `projects` list. `GET /v1/repos` gives each project's
+  `connection_id`, and `GET /v1/orgs/{org}/repos` takes `connection=<id>`.
+  ([Enabling repositories](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#enabling-repositories))
 
 ### Features
 
@@ -58,10 +66,6 @@ release.yml uses that version's section as the GitHub Release text. See
   for org admins, beside the unreachable line when the repository is marked so, and goes to the
   org page afterwards. The org name in a repository's header links to it.
   The list is `GET /v1/orgs/{org}/repos`.
-  ([Enabling repositories](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#enabling-repositories))
-- **Add repository and Disable for GitHub connections** under Organization settings ›
-  Connections, as for Forgejo. A connection's per-repository Remove is now Disable, with the
-  org page's confirmation.
   ([Enabling repositories](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#enabling-repositories))
 
 ### Enhancement
