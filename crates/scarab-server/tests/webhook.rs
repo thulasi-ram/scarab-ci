@@ -795,3 +795,304 @@ async fn existing_bindings_survive_later_deliveries_and_a_resync() {
     assert!(db.resolve(&web).await.unwrap().is_some());
     assert!(db.resolve(&api_repo).await.unwrap().is_none());
 }
+
+// ---------------------------------------------------------------------------
+// Unreachable repositories: a bound repo the installation stops covering
+// keeps its Project and is marked unreachable; nothing the forge sends
+// deletes it.
+// ---------------------------------------------------------------------------
+
+/// A signed `installation` delivery with `action` for installation `id`;
+/// `repos` (`owner/name`) are its `repositories`, omitted when `None`.
+fn installation_action_request(
+    delivery: &str,
+    id: u64,
+    login: &str,
+    action: &str,
+    repos: Option<&[&str]>,
+) -> Request<Body> {
+    let mut body = serde_json::json!({
+        "action": action,
+        "installation": { "id": id, "account": { "login": login } },
+    });
+    if let Some(repos) = repos {
+        body["repositories"] = repos
+            .iter()
+            .map(|r| serde_json::json!({ "full_name": r }))
+            .collect();
+    }
+    let body = serde_json::to_vec(&body).unwrap();
+    let sig = scarab_forge_github::sign_hex(SECRET, &body);
+    Request::builder()
+        .method("POST")
+        .uri("/webhooks/github")
+        .header("content-type", "application/json")
+        .header("x-github-event", "installation")
+        .header("x-github-delivery", delivery)
+        .header("x-hub-signature-256", &sig)
+        .body(Body::from(body))
+        .unwrap()
+}
+
+/// The installation 42 connection of acme with `names` bound, as an admin
+/// would have enabled them.
+async fn seed_installation(db: &InMemoryDb, names: &[&str]) {
+    use scarab_forge::{ForgeConnection, ForgeConnectionStore, ForgeKind, RepoRef};
+    db.put_connection(&ForgeConnection {
+        id: "github-install-42".into(),
+        kind: ForgeKind::GitHub,
+        base_url: "https://api.github.com".into(),
+        credential_ref: "github-app".into(),
+        org: Some("acme".into()),
+        installation_id: Some(42),
+        account_id: None,
+    })
+    .await
+    .unwrap();
+    for name in names {
+        let r = RepoRef {
+            owner: "acme".into(),
+            name: (*name).into(),
+        };
+        db.bind_repo("github-install-42", &r, "acme", name)
+            .await
+            .unwrap();
+    }
+}
+
+/// `acme/<name>`'s binding: (still bound?, unreachable since).
+async fn reach_of(db: &InMemoryDb, name: &str) -> (bool, Option<i64>) {
+    use scarab_forge::ForgeConnectionStore;
+    match db
+        .resolve(&scarab_forge::RepoRef {
+            owner: "acme".into(),
+            name: name.into(),
+        })
+        .await
+        .unwrap()
+    {
+        Some(r) => (true, r.unreachable_since),
+        None => (false, None),
+    }
+}
+
+/// A repo removed from the App's installation keeps its binding and its
+/// Project, marked unreachable since the delivery (the app's clock reads
+/// 1000). The API shows the mark. Before, the removal unbound it, which
+/// deleted the Project with its Environments, secrets and grants.
+#[tokio::test]
+async fn a_repo_removed_from_the_installation_is_marked_unreachable_and_kept() {
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    seed_installation(&db, &["web", "api"]).await;
+    let app = multi_forge_app(db.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(installation_repositories_request(
+            "unr-r1",
+            42,
+            "acme",
+            &[],
+            &["acme/web"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_of(resp).await;
+    assert_eq!(body["registered"]["unreachable"], 1, "{body}");
+
+    assert_eq!(reach_of(&db, "web").await, (true, Some(1_000)));
+    assert_eq!(reach_of(&db, "api").await, (true, None));
+
+    let resp = app
+        .clone()
+        .oneshot(api("GET", "/v1/repos", None))
+        .await
+        .unwrap();
+    let repos = json_of(resp).await;
+    let web = repos
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["project"] == "web")
+        .expect("the Project is still listed");
+    assert_eq!(web["unreachable_since"], 1_000);
+}
+
+/// An `installation_repositories` delivery that adds the repo back clears
+/// the mark.
+#[tokio::test]
+async fn a_later_added_delivery_clears_the_unreachable_mark() {
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    seed_installation(&db, &["web"]).await;
+    let app = multi_forge_app(db.clone());
+
+    for (delivery, added, removed) in [
+        ("clr-r1", &[][..], &["acme/web"][..]),
+        ("clr-r2", &["acme/web"][..], &[][..]),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(installation_repositories_request(
+                delivery, 42, "acme", added, removed,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{delivery}");
+    }
+    assert_eq!(reach_of(&db, "web").await, (true, None));
+}
+
+/// A re-sync whose forge lists the repo clears the mark.
+#[tokio::test]
+async fn a_resync_that_lists_the_repo_clears_the_unreachable_mark() {
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    seed_installation(&db, &["web"]).await;
+    let app = multi_forge_app_with(
+        db.clone(),
+        FakeForge::new().with_accessible_repos(&[("acme", "web")]),
+    );
+    let resp = app
+        .clone()
+        .oneshot(installation_repositories_request(
+            "rsy-r1",
+            42,
+            "acme",
+            &[],
+            &["acme/web"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(reach_of(&db, "web").await, (true, Some(1_000)));
+
+    let resp = app
+        .clone()
+        .oneshot(api(
+            "POST",
+            "/v1/connections/github-install-42/resync",
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(json_of(resp).await["confirmed"], 1);
+    assert_eq!(reach_of(&db, "web").await, (true, None));
+}
+
+/// Uninstalling the App marks every repo bound through its connection
+/// unreachable, listed in the delivery or not, and keeps them all;
+/// `unsuspend` covering them clears the marks; `suspend` (which lists no
+/// repositories) marks them all again.
+#[tokio::test]
+async fn uninstalling_or_suspending_the_app_marks_all_its_repos_unreachable() {
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    seed_installation(&db, &["web", "api"]).await;
+    let app = multi_forge_app(db.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(installation_action_request(
+            "gone-1",
+            42,
+            "acme",
+            "deleted",
+            Some(&["acme/web"]),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(reach_of(&db, "web").await, (true, Some(1_000)));
+    assert_eq!(reach_of(&db, "api").await, (true, Some(1_000)));
+
+    let resp = app
+        .clone()
+        .oneshot(installation_action_request(
+            "gone-2",
+            42,
+            "acme",
+            "unsuspend",
+            Some(&["acme/web", "acme/api"]),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(reach_of(&db, "web").await, (true, None));
+    assert_eq!(reach_of(&db, "api").await, (true, None));
+
+    let resp = app
+        .clone()
+        .oneshot(installation_action_request(
+            "gone-3", 42, "acme", "suspend", None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(reach_of(&db, "web").await, (true, Some(1_000)));
+    assert_eq!(reach_of(&db, "api").await, (true, Some(1_000)));
+}
+
+/// A push to an unreachable repo is acknowledged with a 2xx (no retry) and
+/// starts nothing, although the repo has a matching pipeline.
+#[tokio::test]
+async fn an_event_for_an_unreachable_repo_is_acknowledged_and_ignored() {
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    seed_installation(&db, &["app"]).await;
+    let app = multi_forge_app(db.clone());
+    let resp = app
+        .clone()
+        .oneshot(installation_repositories_request(
+            "ign-r1",
+            42,
+            "acme",
+            &[],
+            &["acme/app"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app.clone().oneshot(push_request("ign-p1")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_of(resp).await;
+    assert_eq!(body["ignored"], "repository unreachable", "{body}");
+    assert!(db.active_runs().await.unwrap().is_empty(), "no run");
+}
+
+/// A manual dispatch of an unreachable repo is refused with a 409 that says
+/// why, and no run is created.
+#[tokio::test]
+async fn manual_dispatch_of_an_unreachable_repo_is_refused() {
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    seed_installation(&db, &["app"]).await;
+    let app = multi_forge_app(db.clone());
+    let resp = app
+        .clone()
+        .oneshot(installation_repositories_request(
+            "dsp-r1",
+            42,
+            "acme",
+            &[],
+            &["acme/app"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .clone()
+        .oneshot(api(
+            "POST",
+            "/v1/repos/acme/app/dispatch",
+            Some(serde_json::json!({ "ref": "refs/heads/main", "pipeline": "ci" })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let msg = String::from_utf8_lossy(&bytes);
+    assert!(msg.contains("unreachable"), "{msg}");
+    assert!(db.active_runs().await.unwrap().is_empty(), "no run");
+}

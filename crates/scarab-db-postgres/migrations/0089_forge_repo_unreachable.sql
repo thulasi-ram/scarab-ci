@@ -1,0 +1,13 @@
+-- A bound repo the forge connection no longer reaches: the GitHub App's
+-- installation stopped covering it, or the App was uninstalled or suspended.
+-- The binding and its Project stay (only an admin's unbind removes them);
+-- this records since when (unix ms) the repo has been unreachable, so its
+-- events are ignored and nothing is read from or posted to the forge for it.
+-- NULL = reachable. Cleared when the forge reports the repo again, and by a
+-- bind.
+ALTER TABLE forge_repos ADD COLUMN unreachable_since BIGINT;
+--
+-- Expand step (ADR-0003): a nullable column. A server built before this
+-- migration refuses to boot against a database that has it; to roll back,
+-- delete row 89 from `_sqlx_migrations` and drop the column (leaving it
+-- makes the next roll-forward fail on ADD COLUMN).

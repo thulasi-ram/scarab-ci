@@ -3011,6 +3011,14 @@ export interface components {
             org: string;
             owner: string;
             project: string;
+            /**
+             * Format: int64
+             * @description Unix-ms since when its forge connection has not reached it (the
+             *     GitHub App's installation stopped covering it), or `null`. The
+             *     Project is kept; its events are ignored and no run can start until
+             *     the forge covers it again or an admin disables it.
+             */
+            unreachable_since?: number | null;
         };
         /** @description A named external system the plugin reaches through the broker. */
         ConnectionSlotDto: {
@@ -3834,6 +3842,13 @@ export interface components {
             project?: string | null;
             /** @description The repository's page on the forge. */
             repo_url: string;
+            /**
+             * Format: int64
+             * @description For an enabled repo: unix-ms since when its connection has not
+             *     reached it (the GitHub App's installation stopped covering it), or
+             *     `null`. Disable is the only way to remove it.
+             */
+            unreachable_since?: number | null;
         };
         /** @description `GET /v1/orgs/{org}/repos` response: one page of the org's repositories. */
         OrgReposPageDto: {
@@ -4459,6 +4474,14 @@ export interface components {
              *     host, which differs from the web host on GitHub).
              */
             repo_url: string;
+            /**
+             * Format: int64
+             * @description Unix-ms since when its forge connection has not reached it (the
+             *     GitHub App's installation stopped covering it), or `null`. The
+             *     Project is kept; its events are ignored and no run can start until
+             *     the forge covers it again or an admin disables it.
+             */
+            unreachable_since?: number | null;
         };
         /**
          * @description An org-level Environment as one Project sees it (ADR-0071): the read
@@ -10251,6 +10274,13 @@ export interface operations {
             };
             /** @description the caller may not dispatch, the pipeline's Environment does not exist in the org or does not admit this project (ADR-0071), or a run.create Policy denied the Run (ADR-0075); the body says why. No run is created */
             403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description the repository is unreachable: its forge connection no longer covers it */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

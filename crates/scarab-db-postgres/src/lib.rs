@@ -3291,7 +3291,8 @@ impl ForgeConnectionStore for PostgresDb {
              ON CONFLICT (owner, name) DO UPDATE SET
                  connection_id = EXCLUDED.connection_id,
                  org = EXCLUDED.org,
-                 project = EXCLUDED.project
+                 project = EXCLUDED.project,
+                 unreachable_since = NULL
              WHERE forge_repos.connection_id = EXCLUDED.connection_id
                 OR NOT EXISTS (
                     SELECT 1 FROM forge_connections c
@@ -3337,6 +3338,45 @@ impl ForgeConnectionStore for PostgresDb {
         Ok(())
     }
 
+    async fn mark_repo_unreachable(
+        &self,
+        connection_id: &str,
+        repo: &RepoRef,
+        at: i64,
+    ) -> Result<(), RegistryError> {
+        sqlx::query(
+            "UPDATE forge_repos SET unreachable_since = COALESCE(unreachable_since, $4)
+             WHERE connection_id = $1 AND owner = $2 AND name = $3",
+        )
+        .bind(connection_id)
+        .bind(&repo.owner)
+        .bind(&repo.name)
+        .bind(at)
+        .execute(self.pool())
+        .await
+        .map_err(reg_err)?;
+        Ok(())
+    }
+
+    async fn clear_repo_unreachable(
+        &self,
+        connection_id: &str,
+        repo: &RepoRef,
+    ) -> Result<(), RegistryError> {
+        sqlx::query(
+            "UPDATE forge_repos SET unreachable_since = NULL
+             WHERE connection_id = $1 AND owner = $2 AND name = $3
+               AND unreachable_since IS NOT NULL",
+        )
+        .bind(connection_id)
+        .bind(&repo.owner)
+        .bind(&repo.name)
+        .execute(self.pool())
+        .await
+        .map_err(reg_err)?;
+        Ok(())
+    }
+
     async fn repos_of(&self, connection_id: &str) -> Result<Vec<RepoRef>, RegistryError> {
         let rows = sqlx::query(
             "SELECT owner, name FROM forge_repos WHERE connection_id = $1 ORDER BY owner, name",
@@ -3357,7 +3397,7 @@ impl ForgeConnectionStore for PostgresDb {
     async fn resolve(&self, repo: &RepoRef) -> Result<Option<ResolvedRepo>, RegistryError> {
         let row = sqlx::query(
             "SELECT c.id, c.kind, c.base_url, c.credential_ref, c.org AS conn_org,
-                    c.installation_id, c.account_id, r.org, r.project
+                    c.installation_id, c.account_id, r.org, r.project, r.unreachable_since
              FROM forge_repos r JOIN forge_connections c ON c.id = r.connection_id
              WHERE r.owner = $1 AND r.name = $2",
         )
@@ -3370,6 +3410,7 @@ impl ForgeConnectionStore for PostgresDb {
             Ok(ResolvedRepo {
                 org: r.get::<String, _>("org"),
                 project: r.get::<String, _>("project"),
+                unreachable_since: r.get::<Option<i64>, _>("unreachable_since"),
                 connection: connection_from_row(r)?,
             })
         })

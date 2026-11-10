@@ -274,6 +274,10 @@ struct InMemoryState {
     forge_connections: HashMap<String, scarab_forge::ForgeConnection>,
     /// Repo bindings: (owner, name) → (connection id, org, project).
     forge_repos: HashMap<(String, String), (String, String, String)>,
+    /// Bindings the serving connection no longer reaches: (owner, name) →
+    /// unix-ms since (the Postgres `forge_repos.unreachable_since`). Read only
+    /// while the binding exists; a bind or an unbind drops the entry.
+    forge_repo_unreachable: HashMap<(String, String), i64>,
     /// Connections owned by the declarative `connections:` config, not the DB
     /// (ADR-0060 part D single-owner marker; the `owned_by_config` column).
     forge_config_owned: std::collections::HashSet<String>,
@@ -3873,6 +3877,9 @@ impl scarab_forge::ForgeConnectionStore for InMemoryDb {
         let mut st = self.state.lock().unwrap();
         st.forge_connections.remove(id);
         st.forge_repos.retain(|_, (conn, _, _)| conn != id);
+        let bound: std::collections::HashSet<(String, String)> =
+            st.forge_repos.keys().cloned().collect();
+        st.forge_repo_unreachable.retain(|k, _| bound.contains(k));
         st.forge_config_owned.remove(id);
         Ok(())
     }
@@ -3918,6 +3925,7 @@ impl scarab_forge::ForgeConnectionStore for InMemoryDb {
                 });
             }
         }
+        st.forge_repo_unreachable.remove(&key);
         st.forge_repos.insert(
             key,
             (
@@ -3942,6 +3950,42 @@ impl scarab_forge::ForgeConnectionStore for InMemoryDb {
             .is_some_and(|(c, _, _)| c == connection_id)
         {
             st.forge_repos.remove(&key);
+            st.forge_repo_unreachable.remove(&key);
+        }
+        Ok(())
+    }
+
+    async fn mark_repo_unreachable(
+        &self,
+        connection_id: &str,
+        repo: &scarab_forge::RepoRef,
+        at: i64,
+    ) -> Result<(), scarab_forge::RegistryError> {
+        let mut st = self.state.lock().unwrap();
+        let key = (repo.owner.clone(), repo.name.clone());
+        if st
+            .forge_repos
+            .get(&key)
+            .is_some_and(|(c, _, _)| c == connection_id)
+        {
+            st.forge_repo_unreachable.entry(key).or_insert(at);
+        }
+        Ok(())
+    }
+
+    async fn clear_repo_unreachable(
+        &self,
+        connection_id: &str,
+        repo: &scarab_forge::RepoRef,
+    ) -> Result<(), scarab_forge::RegistryError> {
+        let mut st = self.state.lock().unwrap();
+        let key = (repo.owner.clone(), repo.name.clone());
+        if st
+            .forge_repos
+            .get(&key)
+            .is_some_and(|(c, _, _)| c == connection_id)
+        {
+            st.forge_repo_unreachable.remove(&key);
         }
         Ok(())
     }
@@ -3979,6 +4023,10 @@ impl scarab_forge::ForgeConnectionStore for InMemoryDb {
                         connection: c.clone(),
                         org: org.clone(),
                         project: project.clone(),
+                        unreachable_since: st
+                            .forge_repo_unreachable
+                            .get(&(repo.owner.clone(), repo.name.clone()))
+                            .copied(),
                     })
             }))
     }

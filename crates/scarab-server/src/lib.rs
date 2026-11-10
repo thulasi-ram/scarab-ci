@@ -1977,6 +1977,31 @@ async fn create_run(
     ))
 }
 
+/// `409` when `owner/name` is bound but its connection no longer reaches it
+/// (the GitHub App's installation stopped covering it): a Run of it could
+/// not read its Pipeline, clone or post a status, so none is started.
+async fn refuse_unreachable_repo(st: &AppState, owner: &str, name: &str) -> Result<(), ApiError> {
+    let Some(connections) = st.connections.as_ref() else {
+        return Ok(());
+    };
+    let repo = scarab_forge::RepoRef {
+        owner: owner.to_string(),
+        name: name.to_string(),
+    };
+    let resolved = connections
+        .resolve(&repo)
+        .await
+        .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?;
+    if let Some(since) = resolved.and_then(|r| r.unreachable_since) {
+        return Err(ApiError::Conflict(format!(
+            "{owner}/{name} is unreachable since {since} (unix ms): its forge connection no \
+             longer covers it, so no run can start. Add it back to the GitHub App's \
+             installation, or disable it to remove it from Scarab."
+        )));
+    }
+    Ok(())
+}
+
 /// Dispatch a named repo pipeline at a ref (ADR-0043 "World B"). Authorized as a
 /// write (like [`create_run`]); a dispatch is a *trigger*, so a deploy pipeline
 /// still hits its Environment's protection rules at admission. Returns the new
@@ -1991,6 +2016,7 @@ async fn create_run(
     request_body = DispatchRequest,
     responses(
         (status = 201, description = "Run created", body = CreateRunResponse),
+        (status = 409, description = "the repository is unreachable: its forge connection no longer covers it"),
         (status = 403, description = "the caller may not dispatch, the pipeline's Environment does not exist in the org or does not admit this project (ADR-0071), or a run.create Policy denied the Run (ADR-0075); the body says why. No run is created")
     )
 )]
@@ -2006,6 +2032,7 @@ async fn dispatch(
     };
     let principal = authorize_scoped(&st, &headers, Action::Write, Some(&scope)).await?;
     refuse_nul_reason(req.reason.as_deref())?;
+    refuse_unreachable_repo(&st, &org, &repo).await?;
 
     // Dispatch rides the read-at-ref machinery, so a forge must be wired.
     let forge = st
@@ -3472,6 +3499,11 @@ pub struct ProjectDto {
     /// run — the dashboard's recency signal (ADR-0046). The domain carries no
     /// push/created_at yet, so never-run repos have no ordering key here.
     pub last_run_at: Option<i64>,
+    /// Unix-ms since when its forge connection has not reached it (the
+    /// GitHub App's installation stopped covering it), or `null`. The
+    /// Project is kept; its events are ignored and no run can start until
+    /// the forge covers it again or an admin disables it.
+    pub unreachable_since: Option<i64>,
 }
 
 /// The authenticated principal (ADR-0049) — powers the UI's identity menu.
@@ -3707,6 +3739,7 @@ async fn list_projects(
                 name: repo.name,
                 repo_url,
                 last_run_at,
+                unreachable_since: resolved.unreachable_since,
             });
         }
     }
@@ -7516,8 +7549,9 @@ async fn ingest_event(
             Json(serde_json::json!({ "ignored": "no forge configured" })),
         ));
     };
-    // A repo the forge covers but no admin has enabled has no Project: its
-    // events are acknowledged and dropped, before any forge read. A 2xx, so
+    // A repo the forge covers but no admin has enabled has no Project, and a
+    // bound one the connection no longer reaches cannot be read: their events
+    // are acknowledged and dropped, before any forge read. A 2xx, so
     // the forge does not retry a delivery that will never be acted on (a
     // GitHub App delivers every covered repo's events, enabled or not).
     if let (Some(connections), Some(repo)) = (st.connections.as_ref(), event.repo()) {
@@ -7525,11 +7559,22 @@ async fn ingest_event(
             .resolve(repo)
             .await
             .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?;
-        if bound.is_none() {
-            return Ok((
-                StatusCode::OK,
-                Json(serde_json::json!({ "ignored": "repository not enabled" })),
-            ));
+        match bound {
+            None => {
+                return Ok((
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "ignored": "repository not enabled" })),
+                ))
+            }
+            // The connection no longer reaches it (the App's installation
+            // stopped covering it): no forge read could succeed.
+            Some(r) if r.unreachable_since.is_some() => {
+                return Ok((
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "ignored": "repository unreachable" })),
+                ))
+            }
+            Some(_) => {}
         }
     }
     let triggered = async {
@@ -7608,8 +7653,14 @@ const GITHUB_API_BASE: &str = "https://api.github.com";
 /// adds: they are available, listed on the org's repositories page, and an
 /// admin enables the ones Scarab should build (`POST
 /// /v1/connections/{id}/repos`). So a repo an admin disabled stays disabled
-/// whatever the forge sends next. A repo the installation stops covering is
-/// still unbound, as before: no token can be minted for it any more.
+/// whatever the forge sends next.
+///
+/// Nothing is unbound either. A bound repo the installation stops covering,
+/// or every bound repo when the App is uninstalled or suspended, is marked
+/// unreachable and keeps its Project (Environments, secrets, grants); its
+/// events are ignored and no forge call is made for it. The mark clears when
+/// a delivery covers the repo again (or a re-sync lists it). Only an admin's
+/// unbind removes the Project.
 ///
 /// The connection `github-install-<id>` records its installation id and the
 /// account's immutable id, so once it serves an Org its tokens are minted
@@ -7622,6 +7673,7 @@ const GITHUB_API_BASE: &str = "https://api.github.com";
 /// repos, and waits for a global admin to assign it
 /// (`PUT /v1/connections/{id}/org`).
 async fn register_installation(
+    st: &AppState,
     connections: &dyn scarab_forge::ForgeConnectionStore,
     sync: &scarab_forge_github::InstallationSync,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
@@ -7686,9 +7738,12 @@ async fn register_installation(
             ),
         }
     }
-    // Nothing is bound here (opt-in): the added repos are reported as
-    // available and wait for an admin to enable them. Removals apply.
-    let removed = scarab_forge_github::apply_installation_removals(connections, &conn_id, sync)
+    // Nothing is bound or unbound here. The added repos that are not bound
+    // are available and wait for an admin to enable them; bound repos the
+    // installation stops (or starts again) covering are marked unreachable
+    // (or reachable again).
+    let now = st.clock.now().await.0;
+    let reach = scarab_forge_github::apply_installation_reach(connections, &conn_id, sync, now)
         .await
         .map_err(registry)?;
     Ok((
@@ -7696,7 +7751,8 @@ async fn register_installation(
         Json(serde_json::json!({
             "registered": {
                 "available": sync.added.len(),
-                "removed": removed,
+                "unreachable": reach.marked,
+                "reachable_again": reach.cleared,
                 "org": org,
             },
         })),
@@ -7843,7 +7899,7 @@ async fn github_webhook(
     // Installation lifecycle → the connection's registration (ADR-0046).
     if let Some(sync) = scarab_forge_github::installation_sync(&delivery) {
         if let Some(connections) = st.connections.as_ref() {
-            return register_installation(connections.as_ref(), &sync).await;
+            return register_installation(&st, connections.as_ref(), &sync).await;
         }
         return Ok((
             StatusCode::OK,
@@ -11670,6 +11726,11 @@ pub struct ConnectionProjectDto {
     pub project: String,
     pub owner: String,
     pub name: String,
+    /// Unix-ms since when its forge connection has not reached it (the
+    /// GitHub App's installation stopped covering it), or `null`. The
+    /// Project is kept; its events are ignored and no run can start until
+    /// the forge covers it again or an admin disables it.
+    pub unreachable_since: Option<i64>,
 }
 
 /// `POST /v1/connections` body (ADR-0060 part D, manual path): the forge to
@@ -12039,6 +12100,7 @@ async fn list_connections(
                     project: resolved.project,
                     owner: repo.owner,
                     name: repo.name,
+                    unreachable_since: resolved.unreachable_since,
                 });
             }
         }
@@ -12411,6 +12473,12 @@ async fn resync_connection(
     for repo in reported {
         let label = format!("{}/{}", repo.owner, repo.name);
         if known.contains(&repo) {
+            // The forge reaches it, so a mark from an installation that
+            // stopped covering it no longer holds.
+            connections
+                .clear_repo_unreachable(&id, &repo)
+                .await
+                .map_err(|e| ApiError::BadRequest(e.to_string()))?;
             confirmed += 1;
             continue;
         }
@@ -12923,6 +12991,10 @@ pub struct OrgRepoDto {
     pub enabled: bool,
     /// The Project's name when enabled (the repo name).
     pub project: Option<String>,
+    /// For an enabled repo: unix-ms since when its connection has not
+    /// reached it (the GitHub App's installation stopped covering it), or
+    /// `null`. Disable is the only way to remove it.
+    pub unreachable_since: Option<i64>,
     /// The connection it is bound through when enabled, else the one that
     /// reaches it: the `{id}` of the bind and unbind endpoints.
     pub connection_id: String,
@@ -13043,6 +13115,7 @@ async fn org_repos(
                     name: repo.name,
                     enabled: true,
                     project: Some(resolved.project),
+                    unreachable_since: resolved.unreachable_since,
                     connection_id: conn.id.clone(),
                     kind: conn.kind.as_str().to_string(),
                     can_change: may_change.get(&conn.id).copied().unwrap_or(false),
@@ -13093,6 +13166,7 @@ async fn org_repos(
                     name: repo.name,
                     enabled: false,
                     project: None,
+                    unreachable_since: None,
                     connection_id: conn.id.clone(),
                     kind: conn.kind.as_str().to_string(),
                     can_change: may_change.get(&conn.id).copied().unwrap_or(false),
