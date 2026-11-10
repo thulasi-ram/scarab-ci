@@ -872,6 +872,50 @@ test("a global admin assigns an unassigned connection to an org", async ({ page 
   expect(errors).toEqual([]);
 });
 
+test("org secrets: New secret in the header, Replace with the name filled in, Delete with the name typed", async ({
+  page,
+}) => {
+  const errors = collectErrors(page);
+  await page.goto("/orgs/acme/settings/secrets");
+  const panel = page.locator(".panel", { hasText: "Org secrets · acme" });
+  const list = panel.getByRole("list", { name: "Secrets" });
+  await expect(list.getByRole("listitem")).toHaveCount(2);
+
+  // New secret, from the panel header.
+  await panel.getByRole("button", { name: "New secret" }).click();
+  let dialog = page.getByRole("dialog");
+  await expect(dialog.getByRole("heading", { name: "New secret" })).toBeVisible();
+  await dialog.getByRole("textbox", { name: "Name" }).fill("NPM_TOKEN");
+  await dialog.getByLabel("Value").fill("npm_x");
+  await dialog.getByRole("button", { name: "Save" }).click();
+  await expect(list.getByText("NPM_TOKEN", { exact: true })).toBeVisible();
+
+  // Replace keeps the name and still asks before overwriting.
+  await list.getByRole("listitem").filter({ hasText: "GHCR_TOKEN" }).getByRole("button", { name: "Replace" }).click();
+  dialog = page.getByRole("dialog");
+  await expect(dialog.getByRole("heading", { name: "Replace secret" })).toBeVisible();
+  await expect(dialog.getByRole("textbox", { name: "Name" })).toHaveValue("GHCR_TOKEN");
+  const save = dialog.getByRole("button", { name: "Save" });
+  await expect(save).toBeDisabled();
+  await dialog.getByRole("checkbox").check();
+  await expect(save).toBeEnabled();
+  await dialog.getByRole("button", { name: "Cancel" }).click();
+
+  // Delete asks for the name typed exactly.
+  await list.getByRole("listitem").filter({ hasText: "SENTRY_DSN" }).getByRole("button", { name: "Delete" }).click();
+  dialog = page.getByRole("dialog");
+  const go = dialog.getByRole("button", { name: "Delete secret" });
+  await expect(go).toBeDisabled();
+  await dialog.getByRole("textbox", { name: "Type SENTRY_DSN to confirm" }).fill("SENTRY_DSN");
+  await go.click();
+  await expect(list.getByText("SENTRY_DSN", { exact: true })).toHaveCount(0);
+
+  // One note, inside the panel; no button under the list.
+  await expect(panel.getByText(/Values are never shown\. Setting a name again replaces it\./)).toHaveCount(1);
+  await expect(page.locator("section.page").getByRole("button", { name: "New secret" })).toHaveCount(1);
+  expect(errors).toEqual([]);
+});
+
 test("a token minted under Account settings shows in the org's list", async ({ page }) => {
   const errors = collectErrors(page);
   await page.goto("/settings/tokens");

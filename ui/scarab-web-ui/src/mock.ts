@@ -2189,8 +2189,20 @@ function route(pathname: string, search: string, method: string, body = ""): Res
   }
   if (/^\/v1\/connections\/[^/]+\/preflight$/.test(p)) return json(connectionPreflight);
   // Secret names are scope-addressed: no `repo=` is the org scope.
+  // The org scope's names change with a save or a delete, for the life of
+  // the page.
   if (p === "/v1/secrets") {
-    const scoped = new URLSearchParams(search).has("repo");
+    const q = new URLSearchParams(search);
+    const scoped = q.has("repo");
+    if (!scoped && method === "POST") {
+      const req = JSON.parse(body || "{}") as { name?: string; repo?: string };
+      if (req.name && !req.repo && !orgSecretNames.names.includes(req.name)) orgSecretNames.names.push(req.name);
+      return new Response(null, { status: 204 });
+    }
+    if (!scoped && method === "DELETE") {
+      orgSecretNames.names = orgSecretNames.names.filter((n) => n !== q.get("name"));
+      return new Response(null, { status: 204 });
+    }
     return json(scoped ? secretNames : orgSecretNames);
   }
 
