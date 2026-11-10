@@ -1,7 +1,8 @@
 // Library fixtures for mock mode (`just ui mock`): libraries with every
 // state tag (each one's manage page at
-// /orgs/acme/settings/libraries/<id>/manage), a stray yank and a
-// stray trusted source on the list, a yank's impact, an upgrade to review, Runs whose Steps come from
+// /orgs/acme/settings/libraries/<id>/manage; deploy-helm's lists an earlier
+// yanked version), a yank of a removed library and a stray trusted source on
+// the list, a yank's impact, an upgrade to review, Runs whose Steps come from
 // libraries (one with a yanked version), a plugin gate in each of its four
 // states, a Pipeline that does not compile, and refused triggers in the Runs
 // list. Page query parameters pick a variant, so each screen can be
@@ -35,6 +36,18 @@ const HELM_NEW = h("0c4e7b2a91f5");
 const PROBE = h("2c8f61d0a9e4");
 const CLONE_SRC = "github.com/thulasi-ram/scarab-ci//libs/clone.yaml@1f0e9d8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f2e";
 const HELM_SRC = "github.com/acme/scarab-libs//deploy-helm.yaml@8c2f4e1a9d7b3c5e0f6a2b8d4c1e7f9a3b5d2c6e";
+const HELM_OLD_SRC = "github.com/acme/scarab-libs//deploy-helm.yaml@3a9e5c1f7b2d8e4a6c0f9b3d5e7a1c2f4b6d8e0a";
+const KANIKO = h("7e2b9a4c1d08");
+const KANIKO_SRC = "git.acme.dev/platform/scarab-libs//kaniko-build.yaml@0d9e6c2b7a15f3e1d9c7b5a3f1e9d7c5b3a1f9e7";
+const KANIKO_YANK = {
+  content_hash: KANIKO,
+  publisher: "platform",
+  name: "kaniko-build",
+  source: KANIKO_SRC,
+  reason: "pins kaniko v1.23.0, which prints registry credentials when a push fails",
+  yanked_by: "a.kim",
+  yanked_at: ago(2 * 3_600_000),
+};
 const HELM_NEW_SRC = "github.com/acme/scarab-libs//deploy-helm.yaml@d41f07b29c3e8a6f5b1d0c9e7a2f4b8c6d3e1a90";
 const YANK_REASON =
   "scarab-clone 0.4.0 writes the forge token to the log when a fetch fails; upgrade to b4d0f2a8c6e3 (v0.4.1)";
@@ -64,21 +77,35 @@ const fullLibraries: S["OrgLibrariesDto"] = {
       id: "91d7f05b2c",
       publisher: "platform",
       name: "kaniko-build",
-      content_hash: h("7e2b9a4c1d08"),
-      source: "git.acme.dev/platform/scarab-libs//kaniko-build.yaml@0d9e6c2b7a15f3e1d9c7b5a3f1e9d7c5b3a1f9e7",
+      content_hash: KANIKO,
+      source: KANIKO_SRC,
       installed_by: "j.lee",
       installed_at: ago(12 * day),
-      yanked: {
-        content_hash: h("7e2b9a4c1d08"),
-        reason: "pins kaniko v1.23.0, which prints registry credentials when a push fails",
-        yanked_by: "a.kim",
-        yanked_at: ago(2 * 3_600_000),
-      },
+      yanked: KANIKO_YANK,
     }),
   ],
   yanks: [
-    { content_hash: h("7e2b9a4c1d08"), reason: "pins kaniko v1.23.0, which prints registry credentials when a push fails", yanked_by: "a.kim", yanked_at: ago(2 * 3_600_000) },
-    { content_hash: h("91f03ac2d7e5"), reason: "ran helm without --atomic; a failed upgrade left payments-api half rolled out", yanked_by: "a.kim", yanked_at: ago(9 * day) },
+    KANIKO_YANK,
+    // An earlier version of an installed library: on deploy-helm's manage page.
+    {
+      content_hash: h("91f03ac2d7e5"),
+      publisher: "acme",
+      name: "deploy-helm",
+      source: HELM_OLD_SRC,
+      reason: "ran helm without --atomic; a failed upgrade left payments-api half rolled out",
+      yanked_by: "a.kim",
+      yanked_at: ago(9 * day),
+    },
+    // A library no longer installed: the list page keeps its yank.
+    {
+      content_hash: h("c7a1e05f3b92"),
+      publisher: "acme",
+      name: "slack-notify",
+      source: "github.com/acme/scarab-libs//slack-notify.yaml@6e2a9c4f1b8d3e7a0c5f2b9d4e6a1c8f3b7d0e52",
+      reason: "printed the Slack webhook URL in the Step log",
+      yanked_by: "j.lee",
+      yanked_at: ago(30 * day),
+    },
   ],
   trusted_sources: [
     { source: CLONE_SRC.replace(/@.*/, ""), trusted_by: "a.kim", trusted_at: ago(20 * day) },
@@ -429,7 +456,15 @@ export function libraryRoute(
     if (method === "DELETE") return new Response(null, { status: 204 });
   }
   if (/^\/v1\/orgs\/[^/]+\/library-yanks$/.test(p) && method === "POST") {
-    return json({ content_hash: CLONE, reason: YANK_REASON, yanked_by: "a.kim", yanked_at: now });
+    return json({
+      content_hash: CLONE,
+      publisher: "thulasi-ram",
+      name: "clone",
+      source: CLONE_SRC,
+      reason: YANK_REASON,
+      yanked_by: "a.kim",
+      yanked_at: now,
+    });
   }
   for (const r of [libRun, yankRun]) {
     if (p === `/v1/runs/${r.id}`) return json(r);

@@ -3809,7 +3809,12 @@ export interface components {
             /** @description The Runs a yank with `cancel_runs` cancelled. Omitted otherwise. */
             cancelled_runs?: string[];
             content_hash: string;
+            name: string;
+            /** @description The library the yanked version was fetched for, `<publisher>/<name>`. */
+            publisher: string;
             reason: string;
+            /** @description The git source the version was fetched from, pinned to its commit. */
+            source: string;
             /** Format: int64 */
             yanked_at: number;
             yanked_by: string;

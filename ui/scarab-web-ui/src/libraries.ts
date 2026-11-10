@@ -368,13 +368,38 @@ export function libraryChips(
   return out;
 }
 
-/** Yanks of versions no installation holds now: the list page keeps them,
- *  since no manage page does. */
-export function strayYanks<Y extends { content_hash: string }>(
+/** What a yank says about its version: the library it was fetched for and
+ *  the pinned source. */
+type YankOf = { content_hash: string; publisher: string; name: string; yanked_at: number };
+
+/** Every yank of `lib`'s versions, newest first: the yanks of its
+ *  `<publisher>/<name>`, and the installed version's whatever it was first
+ *  fetched for. `installed` marks the installed version's. The manage page
+ *  lists them. */
+export function yanksOfLibrary<Y extends YankOf>(
   yanks: readonly Y[],
-  installed: readonly { content_hash: string }[],
+  lib: { publisher: string; name: string; content_hash: string },
+): (Y & { installed: boolean })[] {
+  return yanks
+    .filter((y) => y.content_hash === lib.content_hash || (y.publisher === lib.publisher && y.name === lib.name))
+    .map((y) => ({ ...y, installed: y.content_hash === lib.content_hash }))
+    .sort((a, b) => b.yanked_at - a.yanked_at);
+}
+
+/** Yanks of libraries with no installation at all: the list page keeps
+ *  them, since no manage page does. */
+export function removedLibraryYanks<Y extends YankOf>(
+  yanks: readonly Y[],
+  installed: readonly { publisher: string; name: string; content_hash: string }[],
 ): Y[] {
-  return yanks.filter((y) => !installed.some((i) => i.content_hash === y.content_hash));
+  return yanks.filter((y) => !installed.some((i) => yanksOfLibrary([y], i).length > 0));
+}
+
+/** A version as a person reads it: its source with the commit cut to 7
+ *  characters, `github.com/acme/libs//deploy.yaml@8c2f4e1`. */
+export function versionLabel(source: string): string {
+  const at = source.lastIndexOf("@");
+  return at < 0 ? source : `${source.slice(0, at)}@${source.slice(at + 1, at + 8)}`;
 }
 
 /** Trusted sources no installation comes from now: the list page keeps
@@ -384,4 +409,14 @@ export function strayTrust<T extends { source: string }>(
   installed: readonly { source: string }[],
 ): T[] {
   return trusted.filter((t) => !installed.some((i) => trustKey(i.source) === t.source));
+}
+
+/** Each trusted source with the installations that come from it now, for
+ *  the read-only list under Library policies. An empty `libraries`: no
+ *  installation comes from the source. */
+export function trustedSourceRows<T extends { source: string }, I extends { source: string }>(
+  trusted: readonly T[],
+  installed: readonly I[],
+): (T & { libraries: I[] })[] {
+  return trusted.map((t) => ({ ...t, libraries: installed.filter((i) => trustKey(i.source) === t.source) }));
 }

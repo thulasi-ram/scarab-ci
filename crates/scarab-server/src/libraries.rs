@@ -45,6 +45,11 @@ const MAX_REASON_BYTES: usize = 2_000;
 #[derive(Debug, Serialize, ToSchema)]
 pub struct LibraryYankDto {
     pub content_hash: String,
+    /// The library the yanked version was fetched for, `<publisher>/<name>`.
+    pub publisher: String,
+    pub name: String,
+    /// The git source the version was fetched from, pinned to its commit.
+    pub source: String,
     pub reason: String,
     pub yanked_by: String,
     pub yanked_at: i64,
@@ -288,9 +293,13 @@ fn check_names(publisher: &str, name: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn yank_dto(y: &LibraryYank) -> LibraryYankDto {
+/// `publisher`, `name`, `source`: of the yanked version.
+fn yank_dto(y: &LibraryYank, publisher: &str, name: &str, source: &str) -> LibraryYankDto {
     LibraryYankDto {
         content_hash: y.content_hash.clone(),
+        publisher: publisher.to_string(),
+        name: name.to_string(),
+        source: source.to_string(),
         reason: y.reason.clone(),
         yanked_by: y.yanked_by.clone(),
         yanked_at: y.yanked_at,
@@ -310,8 +319,28 @@ fn installation_dto(i: &LibraryInstallation, yanks: &[LibraryYank]) -> LibraryIn
         yanked: yanks
             .iter()
             .find(|y| y.content_hash == i.content_hash)
-            .map(yank_dto),
+            .map(|y| yank_dto(y, &i.publisher, &i.name, &i.source)),
     }
+}
+
+/// A yank with the library and source of its version, read from the
+/// version row. Every yank has one: `library_yanks` references
+/// `library_versions`.
+async fn described_yank(
+    store: &dyn LibraryStore,
+    y: &LibraryYank,
+) -> Result<LibraryYankDto, ApiError> {
+    let v = store
+        .version(&y.org, &y.content_hash)
+        .await
+        .map_err(store_api_error)?
+        .ok_or_else(|| {
+            ApiError::Db(DbError::Other(format!(
+                "yank of {} in org {} has no stored version",
+                y.content_hash, y.org
+            )))
+        })?;
+    Ok(yank_dto(y, &v.publisher, &v.name, &v.source))
 }
 
 /// A line diff of `old` to `new`: common lines start with a space, removed
@@ -548,12 +577,16 @@ pub(crate) async fn list_libraries(
     let installations = store.installations(&org).await.map_err(store_api_error)?;
     let yanks = store.yanks(&org).await.map_err(store_api_error)?;
     let trusted = store.trusted_sources(&org).await.map_err(store_api_error)?;
+    let mut described = Vec::with_capacity(yanks.len());
+    for y in &yanks {
+        described.push(described_yank(store, y).await?);
+    }
     let dto = OrgLibrariesDto {
         installations: installations
             .iter()
             .map(|i| installation_dto(i, &yanks))
             .collect(),
-        yanks: yanks.iter().map(yank_dto).collect(),
+        yanks: described,
         trusted_sources: trusted.iter().map(trusted_dto).collect(),
     };
     Ok(Json(
@@ -924,7 +957,8 @@ pub(crate) async fn yank_library(
         )));
     }
     let now = st.clock.now().await.0;
-    let y = store(&st)?
+    let store = store(&st)?;
+    let y = store
         .yank(&LibraryYank {
             org,
             content_hash: body.content_hash,
@@ -935,7 +969,7 @@ pub(crate) async fn yank_library(
         .await
         .map_err(store_api_error)?;
     tracing::warn!(org = %y.org, version = %y.content_hash, by = %by, "library version yanked");
-    let mut dto = yank_dto(&y);
+    let mut dto = described_yank(store, &y).await?;
     // After the yank is stored, so no Step from the version launches while
     // the Runs are being cancelled. Each cancel is the operator cancel a
     // Run's Cancel button makes, journalled with the caller as `by`.
@@ -1076,13 +1110,15 @@ pub(crate) async fn unyank_library(
     Path((org, hash)): Path<(String, String)>,
 ) -> Result<Json<LibraryYankDto>, ApiError> {
     org_caller(&st, &headers, &org, Action::Administer).await?;
-    let y = store(&st)?
+    let store = store(&st)?;
+    let y = store
         .unyank(&org, &hash)
         .await
         .map_err(store_api_error)?
         .ok_or(ApiError::NotFound)?;
+    let dto = described_yank(store, &y).await?;
     Ok(Json(
-        crate::people::shown(st.identities.as_deref(), yank_dto(&y)).await,
+        crate::people::shown(st.identities.as_deref(), dto).await,
     ))
 }
 

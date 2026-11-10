@@ -3640,6 +3640,7 @@ h1, .crumb-head, .run-title {
 .lib-table tr.dead td:not(.keep) { opacity: .6; }
 .lib-table .acts { white-space: nowrap; text-align: right; }
 .lib-table .acts .btn { margin-left: 4px; }
+.lib-table .nowrap { white-space: nowrap; }
 /* cards-by-publisher variant */
 
 /* --- install / upgrade --- */

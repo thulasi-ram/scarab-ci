@@ -619,8 +619,9 @@ test("Install library opens a dialog, and its source is reviewed on its own page
   const table = page.getByRole("table", { name: "Installed libraries" });
   await expect(table.getByRole("row")).toHaveCount(6);
   await expect(table.getByRole("row").filter({ hasText: "lib:platform/kaniko-build" })).toContainText("yanked");
-  // A yank and a trusted source that no installation holds stay on the list.
-  await expect(page.getByRole("list", { name: "Yanked versions no library holds now" })).toContainText("91f03ac2d7e5");
+  // A yank of a removed library and a trusted source that no installation
+  // holds stay on the list.
+  await expect(page.getByRole("list", { name: "Yanks of removed libraries" })).toContainText("lib:acme/slack-notify");
   await expect(page.getByRole("list", { name: "Trusted sources no library comes from now" })).toContainText(
     "release-notes.yaml",
   );
@@ -669,6 +670,57 @@ test("a library's manage page holds its version, trust, yank and remove", async 
   await remove.getByRole("textbox").fill("lib:acme/http-probe");
   await confirm.click();
   await expect(page).toHaveURL(/\/orgs\/acme\/settings\/libraries$/);
+  expect(errors).toEqual([]);
+});
+
+test("a library's yanked versions are on its manage page; the list keeps a removed library's", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/orgs/acme/settings/libraries");
+  // The list names only the removed library's yank: deploy-helm's earlier
+  // version and kaniko-build's installed one are on their own pages.
+  const removed = page.getByRole("list", { name: "Yanks of removed libraries" });
+  await expect(removed.getByRole("listitem")).toHaveCount(1);
+  await expect(removed).toContainText("lib:acme/slack-notify");
+  await expect(removed).toContainText("slack-notify.yaml@6e2a9c4");
+  await expect(removed.getByRole("button", { name: "Lift yank" })).toBeVisible();
+
+  // deploy-helm is installed, not yanked, and an earlier version is.
+  await page.getByRole("link", { name: "lib:acme/deploy-helm" }).click();
+  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/libraries\/b72d4f1e06\/manage$/);
+  const yanked = page.getByRole("table", { name: "Yanked versions" });
+  await expect(yanked.getByRole("row")).toHaveCount(2);
+  const earlier = yanked.getByRole("row").filter({ hasText: "deploy-helm.yaml@3a9e5c1" });
+  await expect(earlier).toContainText("ran helm without --atomic");
+  await expect(earlier).toContainText("a.kim");
+  await expect(earlier).not.toContainText("installed");
+  await expect(page.getByRole("button", { name: "Yank this version" })).toBeVisible();
+  await earlier.getByRole("button", { name: "Lift yank" }).click();
+  await expect(page.getByText("Version 91f03ac2d7e5 can run again.")).toBeVisible();
+
+  // kaniko-build's installed version is yanked: marked, and no second yank.
+  await page.goto("/orgs/acme/settings/libraries/91d7f05b2c/manage");
+  const own = page.getByRole("table", { name: "Yanked versions" }).getByRole("row").filter({ hasText: "kaniko-build.yaml@0d9e6c2" });
+  await expect(own).toContainText("installed");
+  await expect(page.getByRole("button", { name: "Yank this version" })).toHaveCount(0);
+  expect(errors).toEqual([]);
+});
+
+test("Library policies list the sources trusted with the forge token, read-only", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/orgs/acme/settings/libraries");
+  const table = page.locator("#library-policies").getByRole("table", { name: "Sources trusted with the forge token" });
+  await expect(table.getByRole("row")).toHaveCount(4);
+  const clone = table.getByRole("row").filter({ hasText: "libs/clone.yaml" });
+  await expect(clone).toContainText("a.kim");
+  await expect(clone.getByRole("link", { name: "lib:thulasi-ram/clone" })).toHaveAttribute(
+    "href",
+    "/orgs/acme/settings/libraries/3e81c0a9f2/manage",
+  );
+  const lone = table.getByRole("row").filter({ hasText: "release-notes.yaml" });
+  await expect(lone).toContainText("no installed library");
+  await expect(lone.getByRole("link")).toHaveCount(0);
+  await expect(table.getByRole("button")).toHaveCount(0);
+  await expect(page.getByText("Trust is given on a library's page and needs a passkey.")).toBeVisible();
   expect(errors).toEqual([]);
 });
 
