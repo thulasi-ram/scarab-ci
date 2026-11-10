@@ -1243,6 +1243,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/orgs/{org}/policies/check": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Check a draft org Policy without saving it (ADR-0075 §6) */
+        post: operations["check_org_policy"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/orgs/{org}/policies/{id}": {
         parameters: {
             query?: never;
@@ -1296,6 +1313,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/orgs/{org}/policy-decisions/counts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Each Policy's decision counts since a time (ADR-0075 §9) */
+        get: operations["org_policy_decision_counts"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/orgs/{org}/policy-test": {
         parameters: {
             query?: never;
@@ -1306,14 +1340,17 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Evaluate run.create Policies without enforcing or recording (ADR-0075 §9)
+         * Evaluate Policies without enforcing or recording (ADR-0075 §9)
          * @description Policies: `policy` (a draft, compiled at the org level; a 400 when it
          *     does not compile), `policy_id` (a stored Policy of this org), or neither
-         *     (the org's and the input's Project's effective Policies, as admission
-         *     consults them). Input: `input`, `decision_id` (its recorded input and
-         *     schema version), or `pipeline` (compiled here with `libs`; no forge
-         *     read). A supplied or recorded input with a string or a list over its cap
-         *     is a 400.
+         *     (the org's and the input's Project's effective Policies, as the
+         *     checkpoint consults them). Input: `input` (at `checkpoint`, by default
+         *     the Policy's, else `run.create`), `decision_id` (its recorded input,
+         *     checkpoint and schema version), or `pipeline` (a `run.create` input,
+         *     compiled here with `libs`; no forge read). A Policy at another checkpoint
+         *     than the input is a 400. A supplied or recorded input with a string or a
+         *     list over its cap is a 400. The built-in Environment rules a recorded
+         *     `step.admit` or `gate.resolve` decision holds are not evaluated again.
          *     A Pipeline whose Run is over an input cap is answered as admission
          *     decides it: each matched Policy is an error, which denies when the Policy
          *     is enforced.
@@ -1325,6 +1362,23 @@ export interface paths {
          *     would need. Org Read covers every Project.
          */
         post: operations["policy_test"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/policy-test/replay": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Replay a draft Policy over recorded decisions (ADR-0075 §9) */
+        post: operations["policy_test_replay"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1511,6 +1565,23 @@ export interface paths {
         post?: never;
         /** Revoke an issued API token (ADR-0049) */
         delete: operations["revoke_api_token"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/policy-checkpoints": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Each PolicyCheckpoint's input schema (ADR-0075 §2) */
+        get: operations["list_policy_checkpoints"];
+        put?: never;
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -4274,6 +4345,74 @@ export interface components {
              */
             mount_path?: string | null;
         };
+        /** @description `POST …/policies/check`. */
+        PolicyCheckRequest: {
+            /** @description The draft Policy, as `POST …/policies` takes it. */
+            policy: Record<string, never>;
+        };
+        /** @description What checking a draft found. Nothing is saved. */
+        PolicyCheckResponse: {
+            /** @description Errors first, then the `has()` warnings of the rules that compiled. */
+            diagnostics: components["schemas"]["PolicyDiagnosticDto"][];
+            /** @description No error: saving this Policy at the org level would compile it. */
+            ok: boolean;
+            /** @description Each rule that compiled, with the input fields it reads. */
+            rules: components["schemas"]["RuleReadsDto"][];
+        };
+        /** @description One PolicyCheckpoint as the policy editor needs it. */
+        PolicyCheckpointDto: {
+            /** @description `run.create`, `step.admit` or `gate.resolve`. */
+            checkpoint: string;
+            /**
+             * @description The effects a Policy saved here may use. Only `deny` is evaluated
+             *     today, at every checkpoint.
+             */
+            effects: string[];
+            /**
+             * @description The `match` keys a Policy here may set: `projects`,
+             *     `except_projects`, `environments`, and `trigger_kinds` at
+             *     `run.create` only.
+             */
+            match_keys: string[];
+            /**
+             * @description The input schema: `variables` (the CEL variables a rule reads), and
+             *     `structs` and `enums` by name. Each field has `name`, `ty` (`{kind,
+             *     of}`), `optional`, `max_len` and `doc`.
+             */
+            schema: Record<string, never>;
+            /** Format: int32 */
+            schema_version: number;
+            /** @description The values `match.trigger_kinds` takes; empty where it is refused. */
+            trigger_kinds: string[];
+        };
+        PolicyCountsDto: {
+            /**
+             * Format: int64
+             * @description It denied, or a rule failed while it was enforced (which denies).
+             */
+            denied: number;
+            /**
+             * Format: int64
+             * @description Decisions its `match` selected.
+             */
+            matched: number;
+            policy_id: string;
+            /**
+             * Format: int64
+             * @description In audit mode it would have denied, or a rule failed.
+             */
+            would_deny: number;
+        };
+        /** @description `GET …/policy-decisions/counts`. */
+        PolicyDecisionCountsDto: {
+            /**
+             * @description One per Policy whose `match` selected at least one decision since
+             *     then, by id.
+             */
+            policies: components["schemas"]["PolicyCountsDto"][];
+            /** Format: int64 */
+            since: number;
+        };
         /** @description One page of the org decision log, newest first. */
         PolicyDecisionPageDto: {
             decisions: components["schemas"]["PolicyDecisionRecordDto"][];
@@ -4299,6 +4438,27 @@ export interface components {
             /** @description The Run the decision admitted; absent for a refused `run.create`. */
             run_id?: string | null;
             step_id?: string | null;
+        };
+        /** @description One finding about a draft. */
+        PolicyDiagnosticDto: {
+            /**
+             * @description Where in the Policy: `name`, `match.projects`, `rules[0].when`,
+             *     `rules[0].message`. Empty when the body is not a Policy.
+             */
+            at: string;
+            /** Format: int32 */
+            column: number;
+            /** @description The sub-expression the finding is about, as the checker renders it. */
+            expr: string;
+            /**
+             * Format: int32
+             * @description 1-based line and column in the rule's `when`; 0 for a finding that
+             *     is not about CEL.
+             */
+            line: number;
+            message: string;
+            /** @description `error` (the Policy cannot be saved) or `warning`. */
+            severity: string;
         };
         /** @description A stored Policy, at its current version. */
         PolicyDto: {
@@ -4337,6 +4497,44 @@ export interface components {
             /** Format: int64 */
             version: number;
         };
+        /** @description `POST …/policy-test/replay`. */
+        PolicyReplayRequest: {
+            /**
+             * @description How many of the newest decisions at the draft's checkpoint to read
+             *     (default and cap 200).
+             */
+            limit?: number | null;
+            /** @description The draft Policy, compiled at the org level. */
+            policy: Record<string, never>;
+            /**
+             * @description The stored org Policy the draft edits: each decision's `before` is
+             *     that Policy's part in it. Absent for a new Policy: `before` is
+             *     `allow`.
+             */
+            policy_id?: string | null;
+        };
+        /**
+         * @description What a draft would change over the recorded decisions. Nothing is
+         *     enforced or recorded.
+         */
+        PolicyReplayResponse: {
+            /**
+             * @description The decisions whose outcome for this Policy would change, newest
+             *     first.
+             */
+            changed: components["schemas"]["ReplayChangeDto"][];
+            checkpoint: string;
+            /** @description Decisions the draft was evaluated against. */
+            evaluated: number;
+            /** @description Decisions read: the newest at the checkpoint, at most `limit`. */
+            read: number;
+            /**
+             * @description Decisions not evaluated: no recorded input (the Run was over an
+             *     input list cap), or an input of a schema version this server does
+             *     not evaluate.
+             */
+            skipped: number;
+        };
         /**
          * @description The Pipeline form of the policy test: what `scarab validate --server`
          *     sends.
@@ -4366,9 +4564,16 @@ export interface components {
          *     of `input`, `decision_id` and `pipeline`.
          */
         PolicyTestRequest: {
+            /**
+             * @description The checkpoint of `input`: `run.create`, `step.admit` or
+             *     `gate.resolve`. Default: the checkpoint of `policy` or `policy_id`,
+             *     else `run.create`. A recorded decision is at its own checkpoint, and
+             *     a `pipeline` builds a `run.create` input.
+             */
+            checkpoint?: string | null;
             /** @description A recorded decision of this org, whose input is evaluated again. */
             decision_id?: string | null;
-            /** @description A `run.create` input, as a PolicyDecision records it. */
+            /** @description A checkpoint input, as a PolicyDecision records it. */
             input?: Record<string, never> | null;
             pipeline?: null | components["schemas"]["PolicyTestPipeline"];
             /**
@@ -4708,6 +4913,30 @@ export interface components {
                 string
             ][];
             image: string;
+        };
+        ReplayChangeDto: {
+            /** @description The same for the draft. */
+            after: string;
+            /** Format: int64 */
+            at: number;
+            /** Format: int32 */
+            attempt?: number | null;
+            /**
+             * @description `allow`, `deny` or `would_deny`: the stored Policy's part in the
+             *     recorded decision, or `allow` when it had none.
+             */
+            before: string;
+            decision_id: string;
+            /**
+             * @description The messages of the draft's rules that matched, or why one failed;
+             *     empty when `after` is `allow`.
+             */
+            messages: string[];
+            project?: string | null;
+            /** @description The Run the decision is about; absent for a refused `run.create`. */
+            run_id?: string | null;
+            /** @description The Step and attempt of a `step.admit` decision. */
+            step_id?: string | null;
         };
         /**
          * @description An allowed read on a connection: method + path pattern (`*` = one
@@ -9216,6 +9445,39 @@ export interface operations {
             };
         };
     };
+    check_org_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PolicyCheckRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PolicyCheckResponse"];
+                };
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     get_org_policy: {
         parameters: {
             query?: never;
@@ -9432,6 +9694,15 @@ export interface operations {
                 limit?: number;
                 /** @description The `next` of the previous page. */
                 before?: string;
+                /**
+                 * @description Only decisions at this checkpoint: `run.create`, `step.admit` or
+                 *     `gate.resolve`.
+                 */
+                checkpoint?: string;
+                /** @description Only decisions with a result for this Policy, matched or not. */
+                policy_id?: string;
+                /** @description Only decisions made at or after this time, in unix milliseconds. */
+                since?: number;
             };
             header?: never;
             path: {
@@ -9450,12 +9721,51 @@ export interface operations {
                     "application/json": components["schemas"]["PolicyDecisionPageDto"];
                 };
             };
-            /** @description `before` is not a cursor */
+            /** @description `before` is not a cursor, or `checkpoint` is not a checkpoint */
             400: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            /** @description no Read on the org */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description policies not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    org_policy_decision_counts: {
+        parameters: {
+            query: {
+                /** @description Count decisions made at or after this time, in unix milliseconds. */
+                since: number;
+            };
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PolicyDecisionCountsDto"];
+                };
             };
             /** @description no Read on the org */
             403: {
@@ -9497,7 +9807,7 @@ export interface operations {
                     "application/json": components["schemas"]["PolicyTestResponse"];
                 };
             };
-            /** @description not one input form, a draft that does not compile, a Pipeline that does not compile, a Run admission refuses before its Policies, an input that cannot be matched, or a supplied input with a string or a list over its cap */
+            /** @description not one input form, a draft that does not compile, a Pipeline that does not compile, a Run admission refuses before its Policies, a Policy at another checkpoint than the input, an input that cannot be matched, or a supplied input with a string or a list over its cap */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -9512,6 +9822,53 @@ export interface operations {
                 content?: never;
             };
             /** @description no such Policy or decision in this org, or policies not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    policy_test_replay: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PolicyReplayRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PolicyReplayResponse"];
+                };
+            };
+            /** @description the draft does not compile */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such org Policy, or policies not configured */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -10170,6 +10527,32 @@ export interface operations {
             };
             /** @description no such live token in this org */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_policy_checkpoints: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PolicyCheckpointDto"][];
+                };
+            };
+            /** @description not signed in */
+            401: {
                 headers: {
                     [name: string]: unknown;
                 };

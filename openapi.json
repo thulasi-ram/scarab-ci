@@ -4522,6 +4522,59 @@
         ]
       }
     },
+    "/v1/orgs/{org}/policies/check": {
+      "post": {
+        "tags": [
+          "Policies"
+        ],
+        "summary": "Check a draft org Policy without saving it (ADR-0075 §6)",
+        "operationId": "check_org_policy",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PolicyCheckRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PolicyCheckResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "not an org admin"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
     "/v1/orgs/{org}/policies/{id}": {
       "get": {
         "tags": [
@@ -4837,6 +4890,34 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "checkpoint",
+            "in": "query",
+            "description": "Only decisions at this checkpoint: `run.create`, `step.admit` or\n`gate.resolve`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "policy_id",
+            "in": "query",
+            "description": "Only decisions with a result for this Policy, matched or not.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "since",
+            "in": "query",
+            "description": "Only decisions made at or after this time, in unix milliseconds.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
           }
         ],
         "responses": {
@@ -4851,7 +4932,63 @@
             }
           },
           "400": {
-            "description": "`before` is not a cursor"
+            "description": "`before` is not a cursor, or `checkpoint` is not a checkpoint"
+          },
+          "403": {
+            "description": "no Read on the org"
+          },
+          "404": {
+            "description": "policies not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/policy-decisions/counts": {
+      "get": {
+        "tags": [
+          "Policies"
+        ],
+        "summary": "Each Policy's decision counts since a time (ADR-0075 §9)",
+        "operationId": "org_policy_decision_counts",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "since",
+            "in": "query",
+            "description": "Count decisions made at or after this time, in unix milliseconds.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PolicyDecisionCountsDto"
+                }
+              }
+            }
           },
           "403": {
             "description": "no Read on the org"
@@ -4875,8 +5012,8 @@
         "tags": [
           "Policies"
         ],
-        "summary": "Evaluate run.create Policies without enforcing or recording (ADR-0075 §9)",
-        "description": "Policies: `policy` (a draft, compiled at the org level; a 400 when it\ndoes not compile), `policy_id` (a stored Policy of this org), or neither\n(the org's and the input's Project's effective Policies, as admission\nconsults them). Input: `input`, `decision_id` (its recorded input and\nschema version), or `pipeline` (compiled here with `libs`; no forge\nread). A supplied or recorded input with a string or a list over its cap\nis a 400.\nA Pipeline whose Run is over an input cap is answered as admission\ndecides it: each matched Policy is an error, which denies when the Policy\nis enforced.\n\nPermissions: Read on the input's Project for its effective Policies\n(neither `policy` nor `policy_id`, which is what `scarab validate\n--server` sends) or its own typed setting by id; Read on the org for an\norg Policy by id; Administer on the org for a draft `policy`, as saving it\nwould need. Org Read covers every Project.",
+        "summary": "Evaluate Policies without enforcing or recording (ADR-0075 §9)",
+        "description": "Policies: `policy` (a draft, compiled at the org level; a 400 when it\ndoes not compile), `policy_id` (a stored Policy of this org), or neither\n(the org's and the input's Project's effective Policies, as the\ncheckpoint consults them). Input: `input` (at `checkpoint`, by default\nthe Policy's, else `run.create`), `decision_id` (its recorded input,\ncheckpoint and schema version), or `pipeline` (a `run.create` input,\ncompiled here with `libs`; no forge read). A Policy at another checkpoint\nthan the input is a 400. A supplied or recorded input with a string or a\nlist over its cap is a 400. The built-in Environment rules a recorded\n`step.admit` or `gate.resolve` decision holds are not evaluated again.\nA Pipeline whose Run is over an input cap is answered as admission\ndecides it: each matched Policy is an error, which denies when the Policy\nis enforced.\n\nPermissions: Read on the input's Project for its effective Policies\n(neither `policy` nor `policy_id`, which is what `scarab validate\n--server` sends) or its own typed setting by id; Read on the org for an\norg Policy by id; Administer on the org for a draft `policy`, as saving it\nwould need. Org Read covers every Project.",
         "operationId": "policy_test",
         "parameters": [
           {
@@ -4911,13 +5048,72 @@
             }
           },
           "400": {
-            "description": "not one input form, a draft that does not compile, a Pipeline that does not compile, a Run admission refuses before its Policies, an input that cannot be matched, or a supplied input with a string or a list over its cap"
+            "description": "not one input form, a draft that does not compile, a Pipeline that does not compile, a Run admission refuses before its Policies, a Policy at another checkpoint than the input, an input that cannot be matched, or a supplied input with a string or a list over its cap"
           },
           "403": {
             "description": "no Read on the input's Project or the org, an org Policy by id without Read on the org, or a draft `policy` without Administer on the org"
           },
           "404": {
             "description": "no such Policy or decision in this org, or policies not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/policy-test/replay": {
+      "post": {
+        "tags": [
+          "Policies"
+        ],
+        "summary": "Replay a draft Policy over recorded decisions (ADR-0075 §9)",
+        "operationId": "policy_test_replay",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PolicyReplayRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PolicyReplayResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "the draft does not compile"
+          },
+          "403": {
+            "description": "not an org admin"
+          },
+          "404": {
+            "description": "no such org Policy, or policies not configured"
           }
         },
         "security": [
@@ -5882,6 +6078,41 @@
           },
           "404": {
             "description": "no such live token in this org"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/policy-checkpoints": {
+      "get": {
+        "tags": [
+          "Policies"
+        ],
+        "summary": "Each PolicyCheckpoint's input schema (ADR-0075 §2)",
+        "operationId": "list_policy_checkpoints",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PolicyCheckpointDto"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "not signed in"
           }
         },
         "security": [
@@ -12216,6 +12447,150 @@
         },
         "additionalProperties": false
       },
+      "PolicyCheckRequest": {
+        "type": "object",
+        "description": "`POST …/policies/check`.",
+        "required": [
+          "policy"
+        ],
+        "properties": {
+          "policy": {
+            "type": "object",
+            "description": "The draft Policy, as `POST …/policies` takes it."
+          }
+        },
+        "additionalProperties": false
+      },
+      "PolicyCheckResponse": {
+        "type": "object",
+        "description": "What checking a draft found. Nothing is saved.",
+        "required": [
+          "ok",
+          "diagnostics",
+          "rules"
+        ],
+        "properties": {
+          "diagnostics": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PolicyDiagnosticDto"
+            },
+            "description": "Errors first, then the `has()` warnings of the rules that compiled."
+          },
+          "ok": {
+            "type": "boolean",
+            "description": "No error: saving this Policy at the org level would compile it."
+          },
+          "rules": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RuleReadsDto"
+            },
+            "description": "Each rule that compiled, with the input fields it reads."
+          }
+        }
+      },
+      "PolicyCheckpointDto": {
+        "type": "object",
+        "description": "One PolicyCheckpoint as the policy editor needs it.",
+        "required": [
+          "checkpoint",
+          "schema_version",
+          "effects",
+          "match_keys",
+          "trigger_kinds",
+          "schema"
+        ],
+        "properties": {
+          "checkpoint": {
+            "type": "string",
+            "description": "`run.create`, `step.admit` or `gate.resolve`."
+          },
+          "effects": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The effects a Policy saved here may use. Only `deny` is evaluated\ntoday, at every checkpoint."
+          },
+          "match_keys": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The `match` keys a Policy here may set: `projects`,\n`except_projects`, `environments`, and `trigger_kinds` at\n`run.create` only."
+          },
+          "schema": {
+            "type": "object",
+            "description": "The input schema: `variables` (the CEL variables a rule reads), and\n`structs` and `enums` by name. Each field has `name`, `ty` (`{kind,\nof}`), `optional`, `max_len` and `doc`."
+          },
+          "schema_version": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "trigger_kinds": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The values `match.trigger_kinds` takes; empty where it is refused."
+          }
+        }
+      },
+      "PolicyCountsDto": {
+        "type": "object",
+        "required": [
+          "policy_id",
+          "matched",
+          "denied",
+          "would_deny"
+        ],
+        "properties": {
+          "denied": {
+            "type": "integer",
+            "format": "int64",
+            "description": "It denied, or a rule failed while it was enforced (which denies).",
+            "minimum": 0
+          },
+          "matched": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Decisions its `match` selected.",
+            "minimum": 0
+          },
+          "policy_id": {
+            "type": "string"
+          },
+          "would_deny": {
+            "type": "integer",
+            "format": "int64",
+            "description": "In audit mode it would have denied, or a rule failed.",
+            "minimum": 0
+          }
+        }
+      },
+      "PolicyDecisionCountsDto": {
+        "type": "object",
+        "description": "`GET …/policy-decisions/counts`.",
+        "required": [
+          "since",
+          "policies"
+        ],
+        "properties": {
+          "policies": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PolicyCountsDto"
+            },
+            "description": "One per Policy whose `match` selected at least one decision since\nthen, by id."
+          },
+          "since": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
       "PolicyDecisionPageDto": {
         "type": "object",
         "description": "One page of the org decision log, newest first.",
@@ -12288,6 +12663,46 @@
               "string",
               "null"
             ]
+          }
+        }
+      },
+      "PolicyDiagnosticDto": {
+        "type": "object",
+        "description": "One finding about a draft.",
+        "required": [
+          "severity",
+          "at",
+          "line",
+          "column",
+          "expr",
+          "message"
+        ],
+        "properties": {
+          "at": {
+            "type": "string",
+            "description": "Where in the Policy: `name`, `match.projects`, `rules[0].when`,\n`rules[0].message`. Empty when the body is not a Policy."
+          },
+          "column": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "expr": {
+            "type": "string",
+            "description": "The sub-expression the finding is about, as the checker renders it."
+          },
+          "line": {
+            "type": "integer",
+            "format": "int32",
+            "description": "1-based line and column in the rule's `when`; 0 for a finding that\nis not about CEL.",
+            "minimum": 0
+          },
+          "message": {
+            "type": "string"
+          },
+          "severity": {
+            "type": "string",
+            "description": "`error` (the Policy cannot be saved) or `warning`."
           }
         }
       },
@@ -12384,6 +12799,73 @@
           }
         }
       },
+      "PolicyReplayRequest": {
+        "type": "object",
+        "description": "`POST …/policy-test/replay`.",
+        "required": [
+          "policy"
+        ],
+        "properties": {
+          "limit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "How many of the newest decisions at the draft's checkpoint to read\n(default and cap 200).",
+            "minimum": 0
+          },
+          "policy": {
+            "type": "object",
+            "description": "The draft Policy, compiled at the org level."
+          },
+          "policy_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The stored org Policy the draft edits: each decision's `before` is\nthat Policy's part in it. Absent for a new Policy: `before` is\n`allow`."
+          }
+        },
+        "additionalProperties": false
+      },
+      "PolicyReplayResponse": {
+        "type": "object",
+        "description": "What a draft would change over the recorded decisions. Nothing is\nenforced or recorded.",
+        "required": [
+          "checkpoint",
+          "read",
+          "evaluated",
+          "skipped",
+          "changed"
+        ],
+        "properties": {
+          "changed": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReplayChangeDto"
+            },
+            "description": "The decisions whose outcome for this Policy would change, newest\nfirst."
+          },
+          "checkpoint": {
+            "type": "string"
+          },
+          "evaluated": {
+            "type": "integer",
+            "description": "Decisions the draft was evaluated against.",
+            "minimum": 0
+          },
+          "read": {
+            "type": "integer",
+            "description": "Decisions read: the newest at the checkpoint, at most `limit`.",
+            "minimum": 0
+          },
+          "skipped": {
+            "type": "integer",
+            "description": "Decisions not evaluated: no recorded input (the Run was over an\ninput list cap), or an input of a schema version this server does\nnot evaluate.",
+            "minimum": 0
+          }
+        }
+      },
       "PolicyTestPipeline": {
         "type": "object",
         "description": "The Pipeline form of the policy test: what `scarab validate --server`\nsends.",
@@ -12428,6 +12910,13 @@
         "type": "object",
         "description": "`POST /v1/orgs/{org}/policy-test`. Name at most one of `policy` and\n`policy_id` (neither: the Project's effective Policies), and exactly one\nof `input`, `decision_id` and `pipeline`.",
         "properties": {
+          "checkpoint": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The checkpoint of `input`: `run.create`, `step.admit` or\n`gate.resolve`. Default: the checkpoint of `policy` or `policy_id`,\nelse `run.create`. A recorded decision is at its own checkpoint, and\na `pipeline` builds a `run.create` input."
+          },
           "decision_id": {
             "type": [
               "string",
@@ -12440,7 +12929,7 @@
               "object",
               "null"
             ],
-            "description": "A `run.create` input, as a PolicyDecision records it."
+            "description": "A checkpoint input, as a PolicyDecision records it."
           },
           "pipeline": {
             "oneOf": [
@@ -13111,6 +13600,68 @@
           },
           "image": {
             "type": "string"
+          }
+        }
+      },
+      "ReplayChangeDto": {
+        "type": "object",
+        "required": [
+          "decision_id",
+          "at",
+          "before",
+          "after",
+          "messages"
+        ],
+        "properties": {
+          "after": {
+            "type": "string",
+            "description": "The same for the draft."
+          },
+          "at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "attempt": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "before": {
+            "type": "string",
+            "description": "`allow`, `deny` or `would_deny`: the stored Policy's part in the\nrecorded decision, or `allow` when it had none."
+          },
+          "decision_id": {
+            "type": "string"
+          },
+          "messages": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The messages of the draft's rules that matched, or why one failed;\nempty when `after` is `allow`."
+          },
+          "project": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "run_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The Run the decision is about; absent for a refused `run.create`."
+          },
+          "step_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The Step and attempt of a `step.admit` decision."
           }
         }
       },

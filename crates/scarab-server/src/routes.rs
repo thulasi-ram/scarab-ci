@@ -462,14 +462,29 @@ pub(crate) fn governed_routes() -> Routes {
             pol::list_project_policy_versions,
         )
         .post(
+            "/v1/orgs/{org}/policies/check",
+            &ops::POLICY_CHECK,
+            pol::check_org_policy,
+        )
+        .post(
             "/v1/orgs/{org}/policy-test",
             &ops::POLICY_TEST,
             pol::policy_test,
+        )
+        .post(
+            "/v1/orgs/{org}/policy-test/replay",
+            &ops::POLICY_REPLAY,
+            pol::policy_test_replay,
         )
         .get(
             "/v1/orgs/{org}/policy-decisions",
             pol::list_org_policy_decisions,
         )
+        .get(
+            "/v1/orgs/{org}/policy-decisions/counts",
+            pol::org_policy_decision_counts,
+        )
+        .get("/v1/policy-checkpoints", pol::list_policy_checkpoints)
         .get(
             "/v1/runs/{id}/policy-decisions",
             pol::list_run_policy_decisions,

@@ -386,8 +386,27 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
         "read",
         "READ",
     ),
+    (
+        "POST",
+        "/v1/orgs/{org}/policies/check",
+        "policy.check",
+        "NG",
+    ),
     ("POST", "/v1/orgs/{org}/policy-test", "policy.test", "NG"),
+    (
+        "POST",
+        "/v1/orgs/{org}/policy-test/replay",
+        "policy.replay",
+        "NG",
+    ),
     ("GET", "/v1/orgs/{org}/policy-decisions", "read", "READ"),
+    (
+        "GET",
+        "/v1/orgs/{org}/policy-decisions/counts",
+        "read",
+        "READ",
+    ),
+    ("GET", "/v1/policy-checkpoints", "read", "READ"),
     ("GET", "/v1/runs/{id}/policy-decisions", "read", "READ"),
     ("GET", "/v1/orgs/{org}/libraries", "read", "READ"),
     (

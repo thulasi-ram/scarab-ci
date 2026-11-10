@@ -34,7 +34,18 @@
 //! or a Pipeline compiled here from the YAML and library sources the caller
 //! sends (no forge read). `scarab validate --server` calls the last form.
 //! The effective Policies need Read on the input's Project, an org Policy by
-//! id needs Read on the org, and a draft needs Administer on the org.
+//! id needs Read on the org, and a draft needs Administer on the org. Every
+//! checkpoint is evaluated; the Pipeline form builds a `run.create` input.
+//! `…/policy-test/replay` evaluates a draft over the newest recorded
+//! decisions at its checkpoint and answers the ones whose outcome changes.
+//!
+//! **The policy editor's reads.** `…/policies/check` compiles a draft and
+//! answers its diagnostics (errors and `has()` warnings, each at a path and
+//! a line and column of the rule) and the fields each rule reads, without
+//! saving. `GET /v1/policy-checkpoints` serves each checkpoint's input
+//! schema, the effects it allows and its `match` keys.
+//! `…/policy-decisions/counts` counts each Policy's denies and would-denies
+//! since a time; the decision log filters by checkpoint, Policy and time.
 
 use std::collections::BTreeMap;
 
@@ -43,13 +54,16 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::{Extension, Json};
 use scarab_engine::{DbError, RunId};
 use scarab_identity::Action;
-use scarab_policy::evaluate::{evaluate_stored, MatchContext, PolicyDecision};
-use scarab_policy::ir::{compile, Level, Predicate};
+use scarab_policy::evaluate::{
+    evaluate, evaluate_stored, MatchContext, PolicyDecision, PolicyOutcome, PolicyResult,
+};
+use scarab_policy::ir::{check_policy, compile, Level, Predicate, RuleIr};
 use scarab_policy::policy::{Checkpoint, Mode, Policy};
 use scarab_policy::run_create::{self, TriggerKind};
+use scarab_policy::schema::Schema;
 use scarab_policy::store::{
-    DecisionCursor, DecisionRecord, NewPolicy, PolicyChange, PolicyScope, PolicyStore,
-    PolicyStoreError, PolicyVersion, StoredPolicy,
+    DecisionCursor, DecisionFilter, DecisionRecord, NewPolicy, PolicyChange, PolicyScope,
+    PolicyStore, PolicyStoreError, PolicyVersion, StoredPolicy,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -227,6 +241,40 @@ pub struct PolicyDecisionsQuery {
     pub limit: Option<usize>,
     /// The `next` of the previous page.
     pub before: Option<String>,
+    /// Only decisions at this checkpoint: `run.create`, `step.admit` or
+    /// `gate.resolve`.
+    pub checkpoint: Option<String>,
+    /// Only decisions with a result for this Policy, matched or not.
+    pub policy_id: Option<String>,
+    /// Only decisions made at or after this time, in unix milliseconds.
+    pub since: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct PolicyDecisionCountsQuery {
+    /// Count decisions made at or after this time, in unix milliseconds.
+    pub since: i64,
+}
+
+/// `GET …/policy-decisions/counts`.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PolicyDecisionCountsDto {
+    pub since: i64,
+    /// One per Policy whose `match` selected at least one decision since
+    /// then, by id.
+    pub policies: Vec<PolicyCountsDto>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PolicyCountsDto {
+    pub policy_id: String,
+    /// Decisions its `match` selected.
+    pub matched: u64,
+    /// It denied, or a rule failed while it was enforced (which denies).
+    pub denied: u64,
+    /// In audit mode it would have denied, or a rule failed.
+    pub would_deny: u64,
 }
 
 /// `POST /v1/orgs/{org}/policy-test`. Name at most one of `policy` and
@@ -244,10 +292,16 @@ pub struct PolicyTestRequest {
     /// A stored Policy of this org (either level).
     #[serde(default)]
     pub policy_id: Option<String>,
-    /// A `run.create` input, as a PolicyDecision records it.
+    /// A checkpoint input, as a PolicyDecision records it.
     #[serde(default)]
     #[schema(value_type = Option<Object>)]
     pub input: Option<Value>,
+    /// The checkpoint of `input`: `run.create`, `step.admit` or
+    /// `gate.resolve`. Default: the checkpoint of `policy` or `policy_id`,
+    /// else `run.create`. A recorded decision is at its own checkpoint, and
+    /// a `pipeline` builds a `run.create` input.
+    #[serde(default)]
+    pub checkpoint: Option<String>,
     /// A recorded decision of this org, whose input is evaluated again.
     #[serde(default)]
     pub decision_id: Option<String>,
@@ -1008,8 +1062,10 @@ fn parse_cursor(s: &str) -> Result<DecisionCursor, ApiError> {
     })
 }
 
-/// The org's decision log, newest first: every `run.create` consultation,
-/// those that refused a Run included (ADR-0075 §9).
+/// The org's decision log, newest first: every consultation, the
+/// `run.create` decisions that refused a Run included (ADR-0075 §9).
+/// `checkpoint`, `policy_id` and `since` narrow it; a page then holds up to
+/// `limit` of the decisions they select.
 #[utoipa::path(
     get,
     path = "/v1/orgs/{org}/policy-decisions",
@@ -1017,7 +1073,7 @@ fn parse_cursor(s: &str) -> Result<DecisionCursor, ApiError> {
     summary = "The org's PolicyDecision log (ADR-0075 §9)",
     responses(
         (status = 200, body = PolicyDecisionPageDto),
-        (status = 400, description = "`before` is not a cursor"),
+        (status = 400, description = "`before` is not a cursor, or `checkpoint` is not a checkpoint"),
         (status = 403, description = "no Read on the org"),
         (status = 404, description = "policies not configured")
     )
@@ -1032,10 +1088,19 @@ pub(crate) async fn list_org_policy_decisions(
     let store = store(&st)?;
     let before = q.before.as_deref().map(parse_cursor).transpose()?;
     let limit = scarab_policy::store::decision_page_limit(q.limit.unwrap_or(0));
-    let page = store
-        .org_decisions(&org, limit, before.as_ref())
-        .await
-        .map_err(store_api_error)?;
+    let filter = DecisionFilter {
+        checkpoint: q.checkpoint.as_deref().map(checkpoint_named).transpose()?,
+        policy_id: q.policy_id,
+        since: q.since,
+    };
+    let page = if filter == DecisionFilter::default() {
+        store.org_decisions(&org, limit, before.as_ref()).await
+    } else {
+        store
+            .filtered_org_decisions(&org, limit, before.as_ref(), &filter)
+            .await
+    }
+    .map_err(store_api_error)?;
     let next = (page.len() == limit)
         .then(|| page.last().map(cursor_text))
         .flatten();
@@ -1083,30 +1148,55 @@ pub(crate) async fn list_run_policy_decisions(
 // The policy test API
 // ---------------------------------------------------------------------------
 
-/// What a `run.create` input's `match` is evaluated against, read from the
-/// input itself, so a supplied or recorded input is matched as admission
-/// matched it.
-fn match_context_of(input: &Value) -> Result<MatchContext, ApiError> {
-    let bad = |what: &str| ApiError::BadRequest(format!("the input has no {what}"));
+/// What an input's `match` is evaluated against, read from the input
+/// itself, so a supplied or recorded input is matched as the checkpoint
+/// matched it: the Project, the Environment (`pipeline.environment` at
+/// `run.create`, `run.environment` at the other two), and at `run.create`
+/// the trigger kind. `match.trigger_kinds` is refused outside `run.create`,
+/// so the kind given there is never read, as at the checkpoints themselves.
+fn match_context(checkpoint: Checkpoint, input: &Value) -> Result<MatchContext, String> {
+    let bad = |what: &str| format!("the input has no {what}");
     let project = input
         .pointer("/project/name")
         .and_then(Value::as_str)
         .ok_or_else(|| bad("`project.name`"))?
         .to_string();
-    let environment = match input.pointer("/pipeline/environment") {
+    let (env_at, env_name) = match checkpoint {
+        Checkpoint::RunCreate => ("/pipeline/environment", "string `pipeline.environment`"),
+        Checkpoint::StepAdmit | Checkpoint::GateResolve => {
+            ("/run/environment", "string `run.environment`")
+        }
+    };
+    let environment = match input.pointer(env_at) {
         None | Some(Value::Null) => None,
         Some(Value::String(e)) => Some(e.clone()),
-        Some(_) => return Err(bad("string `pipeline.environment`")),
+        Some(_) => return Err(bad(env_name)),
     };
-    let trigger_kind: TriggerKind = input
-        .pointer("/trigger/kind")
-        .cloned()
-        .and_then(|k| serde_json::from_value(k).ok())
-        .ok_or_else(|| bad("valid `trigger.kind`"))?;
+    let trigger_kind: TriggerKind = match checkpoint {
+        Checkpoint::RunCreate => input
+            .pointer("/trigger/kind")
+            .cloned()
+            .and_then(|k| serde_json::from_value(k).ok())
+            .ok_or_else(|| bad("valid `trigger.kind`"))?,
+        Checkpoint::StepAdmit | Checkpoint::GateResolve => TriggerKind::Manual,
+    };
     Ok(MatchContext {
         project,
         environment,
         trigger_kind,
+    })
+}
+
+fn match_context_of(checkpoint: Checkpoint, input: &Value) -> Result<MatchContext, ApiError> {
+    match_context(checkpoint, input).map_err(ApiError::BadRequest)
+}
+
+/// A checkpoint named in a request.
+fn checkpoint_named(name: &str) -> Result<Checkpoint, ApiError> {
+    Checkpoint::parse(name).ok_or_else(|| {
+        ApiError::BadRequest(format!(
+            "`{name}` is not a checkpoint: name `run.create`, `step.admit` or `gate.resolve`"
+        ))
     })
 }
 
@@ -1332,26 +1422,52 @@ async fn pipeline_input(
 }
 
 /// A supplied or recorded input with a string or a list over its cap is a
-/// 400: the evaluator would refuse to bind it, no admission records one, and
-/// the plugin default, which reads the gates without binding them, would
+/// 400: the evaluator would refuse to bind it, no checkpoint records one,
+/// and the plugin default, which reads the gates without binding them, would
 /// walk an uncapped list whole.
-fn check_input_caps(input: &Value, schema_version: u32) -> Result<(), ApiError> {
+fn check_input_caps(
+    checkpoint: Checkpoint,
+    input: &Value,
+    schema_version: u32,
+) -> Result<(), ApiError> {
+    input_over_cap(checkpoint, input, schema_version).map_err(ApiError::BadRequest)
+}
+
+fn input_over_cap(
+    checkpoint: Checkpoint,
+    input: &Value,
+    schema_version: u32,
+) -> Result<(), String> {
     use scarab_policy::schema::OverCap;
-    let Some(schema) = scarab_policy::ir::schema_for(Checkpoint::RunCreate, schema_version) else {
+    let Some(schema) = scarab_policy::ir::schema_for(checkpoint, schema_version) else {
         return Ok(());
     };
-    scarab_policy::schema::check_caps(&schema, input).map_err(|e| {
-        ApiError::BadRequest(match e {
-            OverCap::String(e) => format!(
-                "the input's `{}` is {} bytes; a run.create input string is at most {} bytes",
-                e.path, e.len, e.max
-            ),
-            OverCap::List(e) => format!(
-                "the input's `{}` has {} items; a run.create input holds at most {} there",
-                e.path, e.len, e.cap
-            ),
-        })
+    scarab_policy::schema::check_caps(&schema, input).map_err(|e| match e {
+        OverCap::String(e) => format!(
+            "the input's `{}` is {} bytes; a {checkpoint} input string is at most {} bytes",
+            e.path, e.len, e.max
+        ),
+        OverCap::List(e) => format!(
+            "the input's `{}` has {} items; a {checkpoint} input holds at most {} there",
+            e.path, e.len, e.cap
+        ),
     })
+}
+
+/// A draft Policy as a stored row, so the evaluator that takes stored
+/// Policies takes it too: id `id` ("" for a plain draft), version 0.
+fn draft_row(org: &str, id: String, policy: Policy) -> StoredPolicy {
+    StoredPolicy {
+        id,
+        scope: org_scope(org),
+        name: policy.name.clone(),
+        version: 0,
+        content_hash: policy.content_hash(),
+        body: policy,
+        created_at: 0,
+        updated_at: 0,
+        deleted: false,
+    }
 }
 
 /// What each rule of `policies` reads.
@@ -1368,18 +1484,7 @@ fn reads_of(policies: &[StoredPolicy]) -> Vec<PolicyReadsDto> {
                     ir.rules
                         .iter()
                         .enumerate()
-                        .map(|(index, r)| match &r.predicate {
-                            Predicate::Cel(c) => RuleReadsDto {
-                                index,
-                                predicate: "cel".into(),
-                                reads: c.reads.clone(),
-                            },
-                            Predicate::Typed(_) => RuleReadsDto {
-                                index,
-                                predicate: "typed".into(),
-                                reads: Vec::new(),
-                            },
-                        })
+                        .map(|(index, r)| rule_reads(index, r))
                         .collect()
                 })
                 .unwrap_or_default(),
@@ -1387,8 +1492,8 @@ fn reads_of(policies: &[StoredPolicy]) -> Vec<PolicyReadsDto> {
         .collect()
 }
 
-/// Evaluate `run.create` Policies without enforcing and without recording
-/// (ADR-0075 §9). Read on the org evaluates stored Policies: the answer
+/// Evaluate Policies without enforcing and without recording (ADR-0075 §9),
+/// at any checkpoint. Read on the org evaluates stored Policies: the answer
 /// names org Policies and can replay any recorded decision of the org, both
 /// of which org Read already shows. Read on a Project evaluates that
 /// Project's effective Policies and replays its decisions, which is what a
@@ -1398,11 +1503,14 @@ fn reads_of(policies: &[StoredPolicy]) -> Vec<PolicyReadsDto> {
 ///
 /// Policies: `policy` (a draft, compiled at the org level; a 400 when it
 /// does not compile), `policy_id` (a stored Policy of this org), or neither
-/// (the org's and the input's Project's effective Policies, as admission
-/// consults them). Input: `input`, `decision_id` (its recorded input and
-/// schema version), or `pipeline` (compiled here with `libs`; no forge
-/// read). A supplied or recorded input with a string or a list over its cap
-/// is a 400.
+/// (the org's and the input's Project's effective Policies, as the
+/// checkpoint consults them). Input: `input` (at `checkpoint`, by default
+/// the Policy's, else `run.create`), `decision_id` (its recorded input,
+/// checkpoint and schema version), or `pipeline` (a `run.create` input,
+/// compiled here with `libs`; no forge read). A Policy at another checkpoint
+/// than the input is a 400. A supplied or recorded input with a string or a
+/// list over its cap is a 400. The built-in Environment rules a recorded
+/// `step.admit` or `gate.resolve` decision holds are not evaluated again.
 /// A Pipeline whose Run is over an input cap is answered as admission
 /// decides it: each matched Policy is an error, which denies when the Policy
 /// is enforced.
@@ -1417,10 +1525,10 @@ fn reads_of(policies: &[StoredPolicy]) -> Vec<PolicyReadsDto> {
     path = "/v1/orgs/{org}/policy-test",
     params(("org" = String, Path, description = "org")),
     request_body = PolicyTestRequest,
-    summary = "Evaluate run.create Policies without enforcing or recording (ADR-0075 §9)",
+    summary = "Evaluate Policies without enforcing or recording (ADR-0075 §9)",
     responses(
         (status = 200, body = PolicyTestResponse),
-        (status = 400, description = "not one input form, a draft that does not compile, a Pipeline that does not compile, a Run admission refuses before its Policies, an input that cannot be matched, or a supplied input with a string or a list over its cap"),
+        (status = 400, description = "not one input form, a draft that does not compile, a Pipeline that does not compile, a Run admission refuses before its Policies, a Policy at another checkpoint than the input, an input that cannot be matched, or a supplied input with a string or a list over its cap"),
         (status = 403, description = "no Read on the input's Project or the org, an org Policy by id without Read on the org, or a draft `policy` without Administer on the org"),
         (status = 404, description = "no such Policy or decision in this org, or policies not configured")
     )
@@ -1474,13 +1582,42 @@ pub(crate) async fn policy_test(
         ));
     }
 
-    // The input (an `Err` when a Pipeline's could not be built), its schema
-    // version, what `match` sees, and the Pipeline's plugin gates.
-    let (input, schema_version, ctx, plugin_gates) = if let Some(input) = body.input {
-        let ctx = match_context_of(&input)?;
+    // A draft is compiled first: its checkpoint is the input's default.
+    let draft = match body.policy {
+        Some(raw) => Some(compiled_body(raw, Level::Org).await?),
+        None => None,
+    };
+    // A stored Policy by id: read now for its checkpoint, but a missing one
+    // is answered only after the input's permissions are, as before.
+    let stored: Option<Option<StoredPolicy>> = match &body.policy_id {
+        Some(id) => Some(
+            store
+                .get(id)
+                .await
+                .map_err(store_api_error)?
+                .filter(|p| p.scope.org() == org && !p.deleted),
+        ),
+        None => None,
+    };
+    let policy_checkpoint = draft.as_ref().map(|p| p.checkpoint).or(stored
+        .as_ref()
+        .and_then(Option::as_ref)
+        .map(|p| p.body.checkpoint));
+
+    // The input (an `Err` when a Pipeline's could not be built), its
+    // checkpoint and schema version, what `match` sees, and the Pipeline's
+    // plugin gates.
+    let (input, checkpoint, schema_version, ctx, plugin_gates) = if let Some(input) = body.input {
+        let checkpoint = match body.checkpoint.as_deref() {
+            Some(name) => checkpoint_named(name)?,
+            None => policy_checkpoint.unwrap_or(Checkpoint::RunCreate),
+        };
+        let version =
+            scarab_policy::ir::schema_version(checkpoint).expect("every checkpoint has a schema");
+        let ctx = match_context_of(checkpoint, &input)?;
         project_allowed(ctx.project.clone()).await?;
-        check_input_caps(&input, run_create::SCHEMA_VERSION)?;
-        (Ok(input), run_create::SCHEMA_VERSION, ctx, None)
+        check_input_caps(checkpoint, &input, version)?;
+        (Ok(input), checkpoint, version, ctx, None)
     } else if let Some(id) = body.decision_id {
         let record = store
             .decision(&id)
@@ -1493,10 +1630,14 @@ pub(crate) async fn policy_test(
             None if org_allowed => {}
             None => return Err(ApiError::Forbidden),
         }
-        if record.decision.checkpoint != Checkpoint::RunCreate {
+        let checkpoint = record.decision.checkpoint;
+        if body
+            .checkpoint
+            .as_deref()
+            .is_some_and(|c| Checkpoint::parse(c) != Some(checkpoint))
+        {
             return Err(ApiError::BadRequest(format!(
-                "decision `{id}` is at `{}`; only `run.create` is evaluated",
-                record.decision.checkpoint
+                "decision `{id}` is at `{checkpoint}`; leave out `checkpoint` or name that one"
             )));
         }
         if record.decision.input.is_null() {
@@ -1504,39 +1645,49 @@ pub(crate) async fn policy_test(
                 "decision `{id}` recorded no input (its Run did not fit an input list cap)"
             )));
         }
-        check_input_caps(&record.decision.input, record.decision.schema_version)?;
-        let ctx = match_context_of(&record.decision.input)?;
+        check_input_caps(
+            checkpoint,
+            &record.decision.input,
+            record.decision.schema_version,
+        )?;
+        let ctx = match_context_of(checkpoint, &record.decision.input)?;
         let version = record.decision.schema_version;
-        (Ok(record.decision.input), version, ctx, None)
+        (Ok(record.decision.input), checkpoint, version, ctx, None)
     } else {
         let pipeline = body.pipeline.expect("one form is present");
+        if body
+            .checkpoint
+            .as_deref()
+            .is_some_and(|c| c != Checkpoint::RunCreate.as_str())
+        {
+            return Err(ApiError::BadRequest(
+                "a `pipeline` builds a run.create input; leave out `checkpoint`".into(),
+            ));
+        }
         project_allowed(pipeline.project.clone()).await?;
         let (input, ctx, gates) =
             pipeline_input(&st, &org, &caller.principal.subject, pipeline).await?;
-        (input, run_create::SCHEMA_VERSION, ctx, Some(gates))
+        (
+            input,
+            Checkpoint::RunCreate,
+            run_create::SCHEMA_VERSION,
+            ctx,
+            Some(gates),
+        )
     };
+    if let Some(at) = policy_checkpoint.filter(|c| *c != checkpoint) {
+        return Err(ApiError::BadRequest(format!(
+            "the policy is at `{at}` and the input at `{checkpoint}`; a Policy is evaluated at \
+             its own checkpoint only"
+        )));
+    }
 
     // The Policies, as stored rows, so one evaluator serves all three.
-    let policies: Vec<StoredPolicy> = if let Some(raw) = body.policy {
-        let policy = compiled_body(raw, Level::Org).await?;
-        vec![StoredPolicy {
-            id: String::new(),
-            scope: org_scope(&org),
-            name: policy.name.clone(),
-            version: 0,
-            content_hash: policy.content_hash(),
-            body: policy,
-            created_at: 0,
-            updated_at: 0,
-            deleted: false,
-        }]
-    } else if let Some(id) = body.policy_id {
-        let p = store
-            .get(&id)
-            .await
-            .map_err(store_api_error)?
-            .filter(|p| p.scope.org() == org && !p.deleted)
-            .ok_or(ApiError::NotFound)?;
+    let policies: Vec<StoredPolicy> = if let Some(policy) = draft {
+        vec![draft_row(&org, String::new(), policy)]
+    } else if let Some(p) = stored {
+        let p = p.ok_or(ApiError::NotFound)?;
+        let id = p.id.clone();
         // An org Policy is read with org Read, as listing it is.
         if p.scope.project().is_none() && !org_allowed {
             return Err(ApiError::Forbidden);
@@ -1552,7 +1703,7 @@ pub(crate) async fn policy_test(
         vec![p]
     } else {
         store
-            .effective(&org, Some(&ctx.project), Checkpoint::RunCreate)
+            .effective(&org, Some(&ctx.project), checkpoint)
             .await
             .map_err(store_api_error)?
     };
@@ -1560,7 +1711,7 @@ pub(crate) async fn policy_test(
     let reads_input = policies.clone();
     let decision = blocking(move || {
         evaluate_stored(
-            Checkpoint::RunCreate,
+            checkpoint,
             schema_version,
             input.as_ref().map_err(String::as_str),
             plugin_gates.as_deref(),
@@ -1573,5 +1724,458 @@ pub(crate) async fn policy_test(
     Ok(Json(PolicyTestResponse {
         decision,
         policies: reads,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Counts, checking a draft, the checkpoint schemas, and replay
+// ---------------------------------------------------------------------------
+
+/// Each Policy's denies and would-denies over the org's decisions since a
+/// time: what the Policies page shows as "denied N in 7 days". Counted in
+/// the store, so it is not limited to one page of the log.
+#[utoipa::path(
+    get,
+    path = "/v1/orgs/{org}/policy-decisions/counts",
+    params(("org" = String, Path, description = "org"), PolicyDecisionCountsQuery),
+    summary = "Each Policy's decision counts since a time (ADR-0075 §9)",
+    responses(
+        (status = 200, body = PolicyDecisionCountsDto),
+        (status = 403, description = "no Read on the org"),
+        (status = 404, description = "policies not configured")
+    )
+)]
+pub(crate) async fn org_policy_decision_counts(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(org): Path<String>,
+    Query(q): Query<PolicyDecisionCountsQuery>,
+) -> Result<Json<PolicyDecisionCountsDto>, ApiError> {
+    authorize_scoped(&st, &headers, Action::Read, Some(&rbac_scope(&org, None))).await?;
+    let counts = store(&st)?
+        .org_decision_counts(&org, q.since)
+        .await
+        .map_err(store_api_error)?;
+    Ok(Json(PolicyDecisionCountsDto {
+        since: q.since,
+        policies: counts
+            .into_iter()
+            .map(|c| PolicyCountsDto {
+                policy_id: c.policy_id,
+                matched: c.matched,
+                denied: c.denied,
+                would_deny: c.would_deny,
+            })
+            .collect(),
+    }))
+}
+
+/// `POST …/policies/check`.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyCheckRequest {
+    /// The draft Policy, as `POST …/policies` takes it.
+    #[schema(value_type = Object)]
+    pub policy: Value,
+}
+
+/// What checking a draft found. Nothing is saved.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PolicyCheckResponse {
+    /// No error: saving this Policy at the org level would compile it.
+    pub ok: bool,
+    /// Errors first, then the `has()` warnings of the rules that compiled.
+    pub diagnostics: Vec<PolicyDiagnosticDto>,
+    /// Each rule that compiled, with the input fields it reads.
+    pub rules: Vec<RuleReadsDto>,
+}
+
+/// One finding about a draft.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PolicyDiagnosticDto {
+    /// `error` (the Policy cannot be saved) or `warning`.
+    pub severity: String,
+    /// Where in the Policy: `name`, `match.projects`, `rules[0].when`,
+    /// `rules[0].message`. Empty when the body is not a Policy.
+    pub at: String,
+    /// 1-based line and column in the rule's `when`; 0 for a finding that
+    /// is not about CEL.
+    pub line: u32,
+    pub column: u32,
+    /// The sub-expression the finding is about, as the checker renders it.
+    pub expr: String,
+    pub message: String,
+}
+
+fn diagnostic_dto(severity: &str, d: &scarab_policy::check::Diagnostic) -> PolicyDiagnosticDto {
+    PolicyDiagnosticDto {
+        severity: severity.to_string(),
+        at: d.at.clone(),
+        line: d.line,
+        column: d.column,
+        expr: d.expr.clone(),
+        message: d.message.clone(),
+    }
+}
+
+fn rule_reads(index: usize, r: &RuleIr) -> RuleReadsDto {
+    match &r.predicate {
+        Predicate::Cel(c) => RuleReadsDto {
+            index,
+            predicate: "cel".into(),
+            reads: c.reads.clone(),
+        },
+        Predicate::Typed(_) => RuleReadsDto {
+            index,
+            predicate: "typed".into(),
+            reads: Vec::new(),
+        },
+    }
+}
+
+/// Compile a draft org Policy and answer every finding, without saving it:
+/// the policy editor calls this as the author types. Errors and warnings
+/// carry where they are (`rules[0].when`) and, for CEL, the line and column
+/// in the rule. A body that is not a Policy is one error. Needs Administer
+/// on the org, as testing a draft does: the checker runs on what the caller
+/// wrote.
+#[utoipa::path(
+    post,
+    path = "/v1/orgs/{org}/policies/check",
+    params(("org" = String, Path, description = "org")),
+    request_body = PolicyCheckRequest,
+    summary = "Check a draft org Policy without saving it (ADR-0075 §6)",
+    responses(
+        (status = 200, body = PolicyCheckResponse),
+        (status = 403, description = "not an org admin")
+    )
+)]
+pub(crate) async fn check_org_policy(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(org): Path<String>,
+    Json(body): Json<PolicyCheckRequest>,
+) -> Result<Json<PolicyCheckResponse>, ApiError> {
+    authorize_scoped(
+        &st,
+        &headers,
+        Action::Administer,
+        Some(&rbac_scope(&org, None)),
+    )
+    .await?;
+    let policy = match Policy::from_json(body.policy) {
+        Ok(p) => p,
+        Err(e) => {
+            return Ok(Json(PolicyCheckResponse {
+                ok: false,
+                diagnostics: vec![PolicyDiagnosticDto {
+                    severity: "error".into(),
+                    at: String::new(),
+                    line: 0,
+                    column: 0,
+                    expr: String::new(),
+                    message: format!("invalid Policy: {e}"),
+                }],
+                rules: Vec::new(),
+            }))
+        }
+    };
+    let checked = blocking(move || check_policy(&policy, Level::Org)).await?;
+    let mut diagnostics: Vec<PolicyDiagnosticDto> = checked
+        .errors
+        .iter()
+        .map(|d| diagnostic_dto("error", d))
+        .collect();
+    diagnostics.extend(checked.warnings().map(|d| diagnostic_dto("warning", d)));
+    Ok(Json(PolicyCheckResponse {
+        ok: checked.errors.is_empty(),
+        diagnostics,
+        rules: checked
+            .rules
+            .iter()
+            .map(|(i, r)| rule_reads(*i, r))
+            .collect(),
+    }))
+}
+
+/// One PolicyCheckpoint as the policy editor needs it.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PolicyCheckpointDto {
+    /// `run.create`, `step.admit` or `gate.resolve`.
+    pub checkpoint: String,
+    pub schema_version: u32,
+    /// The effects a Policy saved here may use. Only `deny` is evaluated
+    /// today, at every checkpoint.
+    pub effects: Vec<String>,
+    /// The `match` keys a Policy here may set: `projects`,
+    /// `except_projects`, `environments`, and `trigger_kinds` at
+    /// `run.create` only.
+    pub match_keys: Vec<String>,
+    /// The values `match.trigger_kinds` takes; empty where it is refused.
+    pub trigger_kinds: Vec<String>,
+    /// The input schema: `variables` (the CEL variables a rule reads), and
+    /// `structs` and `enums` by name. Each field has `name`, `ty` (`{kind,
+    /// of}`), `optional`, `max_len` and `doc`.
+    #[schema(value_type = Object)]
+    pub schema: Schema,
+}
+
+/// Each PolicyCheckpoint's input schema, the effects a Policy there may use
+/// and its `match` keys: what the policy editor completes field names from.
+/// Generated from the Rust types that build each input, so it is the schema
+/// the checker uses.
+#[utoipa::path(
+    get,
+    path = "/v1/policy-checkpoints",
+    summary = "Each PolicyCheckpoint's input schema (ADR-0075 §2)",
+    responses(
+        (status = 200, body = [PolicyCheckpointDto]),
+        (status = 401, description = "not signed in")
+    )
+)]
+pub(crate) async fn list_policy_checkpoints(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<PolicyCheckpointDto>>, ApiError> {
+    super::authenticate(&st, &headers, Action::Read).await?;
+    Ok(Json(
+        Checkpoint::ALL
+            .into_iter()
+            .filter(|c| c.is_consulted())
+            .map(checkpoint_dto)
+            .collect(),
+    ))
+}
+
+fn checkpoint_dto(c: Checkpoint) -> PolicyCheckpointDto {
+    let version = scarab_policy::ir::schema_version(c).expect("a consulted checkpoint");
+    let schema = scarab_policy::ir::schema_for(c, version).expect("its current schema");
+    let run_create = c == Checkpoint::RunCreate;
+    let mut match_keys = vec!["projects", "except_projects", "environments"];
+    if run_create {
+        match_keys.push("trigger_kinds");
+    }
+    PolicyCheckpointDto {
+        checkpoint: c.as_str().to_string(),
+        schema_version: version,
+        // `compile` refuses every other effect, here or not yet built.
+        effects: vec!["deny".to_string()],
+        match_keys: match_keys.into_iter().map(str::to_string).collect(),
+        trigger_kinds: if run_create {
+            schema.enum_decl("TriggerKind").variants.clone()
+        } else {
+            Vec::new()
+        },
+        schema,
+    }
+}
+
+/// `POST …/policy-test/replay`.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyReplayRequest {
+    /// The draft Policy, compiled at the org level.
+    #[schema(value_type = Object)]
+    pub policy: Value,
+    /// The stored org Policy the draft edits: each decision's `before` is
+    /// that Policy's part in it. Absent for a new Policy: `before` is
+    /// `allow`.
+    #[serde(default)]
+    pub policy_id: Option<String>,
+    /// How many of the newest decisions at the draft's checkpoint to read
+    /// (default and cap 200).
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// What a draft would change over the recorded decisions. Nothing is
+/// enforced or recorded.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PolicyReplayResponse {
+    pub checkpoint: String,
+    /// Decisions read: the newest at the checkpoint, at most `limit`.
+    pub read: usize,
+    /// Decisions the draft was evaluated against.
+    pub evaluated: usize,
+    /// Decisions not evaluated: no recorded input (the Run was over an
+    /// input list cap), or an input of a schema version this server does
+    /// not evaluate.
+    pub skipped: usize,
+    /// The decisions whose outcome for this Policy would change, newest
+    /// first.
+    pub changed: Vec<ReplayChangeDto>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ReplayChangeDto {
+    pub decision_id: String,
+    /// The Run the decision is about; absent for a refused `run.create`.
+    pub run_id: Option<String>,
+    pub project: Option<String>,
+    /// The Step and attempt of a `step.admit` decision.
+    pub step_id: Option<String>,
+    pub attempt: Option<u32>,
+    pub at: i64,
+    /// `allow`, `deny` or `would_deny`: the stored Policy's part in the
+    /// recorded decision, or `allow` when it had none.
+    pub before: String,
+    /// The same for the draft.
+    pub after: String,
+    /// The messages of the draft's rules that matched, or why one failed;
+    /// empty when `after` is `allow`.
+    pub messages: Vec<String>,
+}
+
+/// The most decisions one replay reads.
+pub const MAX_REPLAY: usize = 200;
+
+/// A Policy's part in a decision: an enforced deny or failed rule denies,
+/// an audit-mode one would deny, anything else allows.
+fn verdict_of(r: &PolicyResult) -> &'static str {
+    match (&r.outcome, r.mode) {
+        (PolicyOutcome::Denied { .. }, _) | (PolicyOutcome::Error { .. }, Mode::Enforce) => "deny",
+        (PolicyOutcome::WouldDeny { .. }, _) | (PolicyOutcome::Error { .. }, Mode::Audit) => {
+            "would_deny"
+        }
+        _ => "allow",
+    }
+}
+
+fn messages_of(r: &PolicyResult) -> Vec<String> {
+    match &r.outcome {
+        PolicyOutcome::Denied { messages } | PolicyOutcome::WouldDeny { messages } => {
+            messages.clone()
+        }
+        PolicyOutcome::Error { message } => vec![message.clone()],
+        _ => Vec::new(),
+    }
+}
+
+/// The draft's part in each recorded decision, against the stored Policy's
+/// (`policy_id`): the decisions whose outcome changes, how many were
+/// evaluated, and how many had no input to evaluate. Runs on the blocking
+/// pool.
+fn replay(
+    checkpoint: Checkpoint,
+    draft: &scarab_policy::ir::PolicyIr,
+    policy_id: Option<&str>,
+    records: &[DecisionRecord],
+) -> (Vec<ReplayChangeDto>, usize, usize) {
+    let (mut changed, mut evaluated, mut skipped) = (Vec::new(), 0, 0);
+    for record in records {
+        let d = &record.decision;
+        let input = &d.input;
+        let readable = !input.is_null()
+            && scarab_policy::ir::schema_for(checkpoint, d.schema_version).is_some()
+            && input_over_cap(checkpoint, input, d.schema_version).is_ok();
+        let ctx = match match_context(checkpoint, input) {
+            Ok(ctx) if readable => ctx,
+            _ => {
+                skipped += 1;
+                continue;
+            }
+        };
+        evaluated += 1;
+        let decision = evaluate(
+            checkpoint,
+            d.schema_version,
+            input,
+            &ctx,
+            std::slice::from_ref(draft),
+        );
+        let Some(after) = decision.results.first() else {
+            continue;
+        };
+        let before = policy_id
+            .and_then(|id| d.results.iter().find(|r| r.policy_id == id))
+            .map(verdict_of)
+            .unwrap_or("allow");
+        if before != verdict_of(after) {
+            changed.push(ReplayChangeDto {
+                decision_id: record.id.clone(),
+                run_id: record.run_id.clone(),
+                project: record.project.clone(),
+                step_id: record.step_id.clone(),
+                attempt: record.attempt,
+                at: record.at,
+                before: before.to_string(),
+                after: verdict_of(after).to_string(),
+                messages: messages_of(after),
+            });
+        }
+    }
+    (changed, evaluated, skipped)
+}
+
+/// Evaluate a draft Policy over the newest recorded decisions at its
+/// checkpoint and answer the ones whose outcome for this Policy would
+/// change: "Try it" in the policy editor. With `policy_id`, `before` is the
+/// stored Policy's part in each decision; without, a new Policy's `before`
+/// is `allow`. A decision with no recorded input is skipped and counted.
+/// The built-in Environment rules and the plugin default are not part of
+/// the comparison. Nothing is enforced or recorded. Needs Administer on the
+/// org, as a draft does.
+#[utoipa::path(
+    post,
+    path = "/v1/orgs/{org}/policy-test/replay",
+    params(("org" = String, Path, description = "org")),
+    request_body = PolicyReplayRequest,
+    summary = "Replay a draft Policy over recorded decisions (ADR-0075 §9)",
+    responses(
+        (status = 200, body = PolicyReplayResponse),
+        (status = 400, description = "the draft does not compile"),
+        (status = 403, description = "not an org admin"),
+        (status = 404, description = "no such org Policy, or policies not configured")
+    )
+)]
+pub(crate) async fn policy_test_replay(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(org): Path<String>,
+    Json(body): Json<PolicyReplayRequest>,
+) -> Result<Json<PolicyReplayResponse>, ApiError> {
+    authorize_scoped(
+        &st,
+        &headers,
+        Action::Administer,
+        Some(&rbac_scope(&org, None)),
+    )
+    .await?;
+    let store = store(&st)?;
+    let policy = compiled_body(body.policy, Level::Org).await?;
+    if let Some(id) = &body.policy_id {
+        // The Policy being edited: an org Policy of this org, live or not.
+        stored_at(store, &org_scope(&org), id).await?;
+    }
+    let checkpoint = policy.checkpoint;
+    let limit = body.limit.unwrap_or(MAX_REPLAY).clamp(1, MAX_REPLAY);
+    let records = store
+        .filtered_org_decisions(
+            &org,
+            limit,
+            None,
+            &DecisionFilter {
+                checkpoint: Some(checkpoint),
+                ..DecisionFilter::default()
+            },
+        )
+        .await
+        .map_err(store_api_error)?;
+    let read = records.len();
+    let policy_id = body.policy_id;
+    let (changed, evaluated, skipped) = blocking(move || {
+        let id = policy_id.clone().unwrap_or_default();
+        let ir = draft_row(&org, id, policy)
+            .compile()
+            .expect("the draft compiled above");
+        replay(checkpoint, &ir, policy_id.as_deref(), &records)
+    })
+    .await?;
+    Ok(Json(PolicyReplayResponse {
+        checkpoint: checkpoint.as_str().to_string(),
+        read,
+        evaluated,
+        skipped,
+        changed,
     }))
 }

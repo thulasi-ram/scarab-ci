@@ -1472,6 +1472,26 @@ pub static POLICY_TEST: Op = op(
     &[],
     &["path:org"],
 );
+pub static POLICY_CHECK: Op = op(
+    "policy.check",
+    "Check a draft org Policy",
+    Class::NotGoverned("compiles a draft; saves nothing"),
+    "ADR-0075 §6",
+    ADMIN,
+    OrgOf::Path("org"),
+    &[],
+    &["path:org"],
+);
+pub static POLICY_REPLAY: Op = op(
+    "policy.replay",
+    "Replay a draft Policy over recorded decisions",
+    Class::NotGoverned("evaluates without enforcing or recording"),
+    "ADR-0075 §9",
+    ADMIN,
+    OrgOf::Path("org"),
+    &[],
+    &["path:org"],
+);
 
 pub static LIBRARY_FETCH: Op = op(
     "library.fetch",
