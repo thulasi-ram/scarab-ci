@@ -39,7 +39,7 @@ import {
 import {
   approversCell,
   deploySentence,
-  layerRows,
+  ruleDiff,
   refsCell,
   repoChip,
   waitCell,
@@ -788,17 +788,15 @@ function EnvRow(props: {
           <span class="envt-chev" aria-hidden="true">
             <Icon icon={props.expanded ? "chevron-down" : "chevron-right"} size={14} />
           </span>
-          <span class="envt-name" classList={{ "envt-mono": nameBeside(props.env) === null }}>
+          {/* The name once; the name pipelines use is in the detail and the
+              tooltip. */}
+          <span
+            class="envt-name"
+            classList={{ "envt-mono": nameBeside(props.env) === null }}
+            title={nameBeside(props.env) ? `Pipelines name it ${props.env.name}` : undefined}
+          >
             {shownName(props.env)}
           </span>
-          <Show when={nameBeside(props.env)}>
-            {(name) => (
-              <span class="envt-mono envt-quiet" title="The name pipelines use">
-                {" "}
-                {name()}
-              </span>
-            )}
-          </Show>
         </td>
         <td>{approversCell(props.env)}</td>
         <td class="envt-mono">{refsCell(props.env.effective.allowed_ref_layers)}</td>
@@ -834,31 +832,52 @@ function EnvRow(props: {
                 {(s) => (s.mono ? <span class="envt-mono">{s.text}</span> : s.text)}
               </For>
             </p>
+            <Show when={nameBeside(props.env)}>
+              <p class="envt-pname">
+                Pipelines name it <span class="envt-mono">{props.env.name}</span>.
+              </p>
+            </Show>
             <Show when={!props.env.eligible}>
               <p class="envt-note">An org admin withdrew this repo. Its overlay stays until removed.</p>
             </Show>
-            <table class="envt-layers">
-              <thead>
-                <tr>
-                  <th scope="col">
-                    <span class="sr-only">Rule</span>
-                  </th>
-                  <th scope="col">Org baseline</th>
-                  <th scope="col">This repo adds</th>
-                </tr>
-              </thead>
-              <tbody>
-                <For each={layerRows(props.env)}>
-                  {(r) => (
-                    <tr>
-                      <th scope="row">{r.rule}</th>
-                      <td classList={{ "envt-mono": r.mono && r.baseline !== "—" }}>{r.baseline}</td>
-                      <td classList={{ "envt-mono": r.mono && r.overlay !== "—" }}>{r.overlay}</td>
-                    </tr>
-                  )}
-                </For>
-              </tbody>
-            </table>
+            {/* Side by side, like a split diff: the org's rules on the left,
+                the rules in force here on the right; a rule this repo
+                changed is marked + and shaded. */}
+            <div class="envt-diff-scroll">
+              <table class="envt-diff">
+                <thead>
+                  <tr>
+                    <th scope="col">
+                      <span class="sr-only">Rule</span>
+                    </th>
+                    <th scope="col">Org</th>
+                    <th scope="col">In force here</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <For each={ruleDiff(props.env)}>
+                    {(r) => {
+                      const mono = (v: string) => r.mono && v !== "none" && v !== "Any";
+                      return (
+                        <tr classList={{ changed: r.changed }}>
+                          <th scope="row">{r.rule}</th>
+                          <td classList={{ "envt-mono": mono(r.org) }}>{r.org}</td>
+                          <td class="envt-diff-now">
+                            <span class="envt-diff-mark" aria-hidden="true">
+                              {r.changed ? "+" : ""}
+                            </span>
+                            <Show when={r.changed}>
+                              <span class="sr-only">changed by this repo: </span>
+                            </Show>
+                            <span classList={{ "envt-mono": mono(r.now) }}>{r.now}</span>
+                          </td>
+                        </tr>
+                      );
+                    }}
+                  </For>
+                </tbody>
+              </table>
+            </div>
             <Show when={props.env.eligible || props.env.overlay}>
               <div class="envt-actions">
                 <button class="btn btn-ghost envt-btn" type="button" onClick={props.onTighten}>

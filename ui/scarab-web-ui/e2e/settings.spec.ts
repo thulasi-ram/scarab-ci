@@ -349,7 +349,7 @@ test("a repository's Environments tab is one table whose rows expand into the ru
   await expect(table.getByRole("row", { name: /qa/ })).toContainText("no rules");
   await expect(table.getByRole("row", { name: /Staging/ })).toContainText("not eligible");
 
-  // Expanding: the sentence, the two layers side by side, and the actions.
+  // Expanding: the sentence, the org's rules beside the rules in force, and the actions.
   await expect(production).toHaveAttribute("aria-expanded", "false");
   // The name cell, not the row's centre: the row also holds the Runs link.
   await production.locator(".envt-name").click();
@@ -357,16 +357,23 @@ test("a repository's Environments tab is one table whose rows expand into the ru
   await expect(
     table.getByText("A deploy from main needs 2 approvals and a reason, then waits 5 minutes."),
   ).toBeVisible();
-  const layers = table.locator("table.envt-layers");
-  await expect(layers.getByRole("row", { name: /Approvers/ })).toContainText("ops-lead");
-  await expect(layers.getByRole("row", { name: /Approvers/ })).toContainText("j.lee");
-  await expect(layers.getByRole("row", { name: /Privileges/ })).toContainText("1 privileged image");
+  // The name pipelines use is said once, in the detail, not beside the name.
+  await expect(production.getByText("production", { exact: true })).toHaveCount(0);
+  await expect(table.getByText("Pipelines name it")).toBeVisible();
+  // Side by side: the org's value, then the value in force; a changed rule is marked.
+  const diff = table.locator("table.envt-diff");
+  const approvers = diff.getByRole("row", { name: /Approvers/ });
+  await expect(approvers.getByRole("cell").nth(0)).toHaveText("ops-lead");
+  await expect(approvers.getByRole("cell").nth(1)).toContainText("ops-lead, j.lee");
+  await expect(approvers).toHaveClass(/changed/);
+  await expect(diff.getByRole("row", { name: /Refs/ })).not.toHaveClass(/changed/);
+  await expect(diff.getByRole("row", { name: /Privileges/ })).toContainText("1 privileged image");
   await expect(table.getByRole("button", { name: "Edit this repo's rules" })).toBeVisible();
 
   // The keyboard folds it again.
   await production.press("Enter");
   await expect(production).toHaveAttribute("aria-expanded", "false");
-  await expect(layers).toHaveCount(0);
+  await expect(diff).toHaveCount(0);
 
   // A withdrawn environment says so, and keeps its overlay until removed.
   await table.getByRole("row", { name: /Staging/ }).locator(".envt-name").click();

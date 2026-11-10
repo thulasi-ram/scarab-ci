@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   approversCell,
   deploySentence,
-  layerRows,
+  ruleDiff,
   refsCell,
   repoChip,
   segmentsText,
@@ -123,23 +123,30 @@ describe("repoChip", () => {
   });
 });
 
-describe("layerRows", () => {
-  it("sets the baseline beside what the overlay adds, and the repo's privileges", () => {
+describe("ruleDiff", () => {
+  it("sets the org's value beside the value in force, and marks what this repo changed", () => {
     const e = env(
       { approvers: ["ops-lead"], allowed_refs: ["refs/heads/main"] },
       { approvers: ["ops-lead", "j.lee"], wait_timer_s: 300, require_reason: true },
       { privilege_grant: { privileged_images: [{}], permit_k8s_overlay: true } },
     );
-    expect(layerRows(e).map((r) => [r.rule, r.baseline, r.overlay])).toEqual([
-      ["Approvers", "ops-lead", "j.lee"],
-      ["Refs", "main", "—"],
-      ["Wait", "—", "5 min"],
-      ["Reason", "—", "Required"],
-      ["Privileges", "—", "1 privileged image, raw k8s_overlay allowed"],
+    expect(ruleDiff(e).map((r) => [r.rule, r.org, r.now, r.changed])).toEqual([
+      ["Approvers", "ops-lead", "ops-lead, j.lee", true],
+      ["Refs", "main", "main", false],
+      ["Wait", "none", "5 min", true],
+      ["Reason", "none", "Required", true],
+      ["Privileges", "none", "1 privileged image, raw k8s_overlay allowed", true],
     ]);
   });
 
-  it("reads — for every rule this repo adds when it has no overlay", () => {
-    expect(layerRows(env({ require_reason: true })).map((r) => r.overlay)).toEqual(["—", "—", "—", "—", "—"]);
+  it("a ref must match both layers", () => {
+    const e = env({ allowed_refs: ["refs/heads/main"] }, { allowed_refs: ["refs/tags/v*"] });
+    expect(ruleDiff(e)[1]).toMatchObject({ org: "main", now: "main and v*", changed: true });
+  });
+
+  it("changes nothing without an overlay, or when the overlay repeats the org", () => {
+    expect(ruleDiff(env({ require_reason: true })).map((r) => r.changed)).toEqual([false, false, false, false, false]);
+    const same = env({ approvers: ["a"], wait_timer_s: 600 }, { approvers: ["a"], wait_timer_s: 300 });
+    expect(ruleDiff(same).map((r) => r.changed)).toEqual([false, false, false, false, false]);
   });
 });

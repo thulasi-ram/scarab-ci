@@ -188,20 +188,26 @@ export function deploySentence(env: RepoEnvLike): Seg[] {
   }, []);
 }
 
-/** One row of the expanded table: a rule, what the org baseline sets and what
- *  this repository adds. `mono` when the values are ids or refs. */
-export type LayerRow = { rule: string; baseline: string; overlay: string; mono: boolean };
+/** One row of the expanded diff: a rule, the org's value, the value in force
+ *  for this repository, and whether this repository changed it. `mono` when
+ *  the values are ids or refs. */
+export type RuleDiffRow = { rule: string; org: string; now: string; changed: boolean; mono: boolean };
 
-/** The expanded row's table. The overlay column shows only what tightens the
- *  baseline: an approver the baseline already has, a shorter wait or a
- *  reason it already asks for adds nothing and reads `—`. Privileges are
- *  this repository's grant; the baseline sets none. */
-export function layerRows(env: RepoEnvLike): LayerRow[] {
+/** The expanded row's side-by-side diff: each rule as the org sets it and as
+ *  it applies here. An overlay only tightens, so a rule changes when the
+ *  overlay adds to it: an approver the org already has, a shorter wait or a
+ *  reason the org already asks for changes nothing. Privileges are this
+ *  repository's grant; the org sets none. */
+export function ruleDiff(env: RepoEnvLike): RuleDiffRow[] {
   const b = env.baseline;
   const o = env.overlay;
-  const list = (xs: readonly string[]) => (xs.length > 0 ? xs.join(", ") : "—");
+  const none = "none";
+  const added = addedApprovers(env);
+  const refsB = b.allowed_refs.map(shortRef).join(", ");
+  const refsO = o && o.allowed_refs.length > 0 ? o.allowed_refs.map(shortRef).join(", ") : "";
+  const wait = Math.max(b.wait_timer_s, o?.wait_timer_s ?? 0);
   const grant = env.privilege_grant;
-  let privileges = "—";
+  let privileges = none;
   if (grant && (grant.privileged_images.length > 0 || grant.permit_k8s_overlay)) {
     const n = grant.privileged_images.length;
     const parts: string[] = [];
@@ -209,26 +215,37 @@ export function layerRows(env: RepoEnvLike): LayerRow[] {
     if (grant.permit_k8s_overlay) parts.push("raw k8s_overlay allowed");
     privileges = parts.join(", ");
   }
+  const approvers = [...b.approvers, ...added];
   return [
-    { rule: "Approvers", baseline: list(b.approvers), overlay: list(addedApprovers(env)), mono: true },
+    {
+      rule: "Approvers",
+      org: b.approvers.length > 0 ? b.approvers.join(", ") : none,
+      now: approvers.length > 0 ? approvers.join(", ") : none,
+      changed: added.length > 0,
+      mono: true,
+    },
     {
       rule: "Refs",
-      baseline: b.allowed_refs.length > 0 ? b.allowed_refs.map(shortRef).join(", ") : "Any",
-      overlay: o && o.allowed_refs.length > 0 ? o.allowed_refs.map(shortRef).join(", ") : "—",
+      org: refsB || "Any",
+      // A ref must match every layer, so two layers read `main and release/*`.
+      now: [refsB, refsO].filter((r) => r !== "").join(" and ") || "Any",
+      changed: refsO !== "",
       mono: true,
     },
     {
       rule: "Wait",
-      baseline: b.wait_timer_s > 0 ? waitShort(b.wait_timer_s) : "—",
-      overlay: o && o.wait_timer_s > b.wait_timer_s ? waitShort(o.wait_timer_s) : "—",
+      org: b.wait_timer_s > 0 ? waitShort(b.wait_timer_s) : none,
+      now: wait > 0 ? waitShort(wait) : none,
+      changed: !!o && o.wait_timer_s > b.wait_timer_s,
       mono: false,
     },
     {
       rule: "Reason",
-      baseline: b.require_reason ? "Required" : "—",
-      overlay: o?.require_reason && !b.require_reason ? "Required" : "—",
+      org: b.require_reason ? "Required" : none,
+      now: b.require_reason || o?.require_reason ? "Required" : none,
+      changed: !!o?.require_reason && !b.require_reason,
       mono: false,
     },
-    { rule: "Privileges", baseline: "—", overlay: privileges, mono: false },
+    { rule: "Privileges", org: none, now: privileges, changed: privileges !== none, mono: false },
   ];
 }
