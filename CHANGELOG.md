@@ -18,6 +18,8 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-11
+
 ### Breaking changes
 
 - **Every user signs in again, and the upgrade needs `Recreate`.** A person now has a random,
@@ -232,12 +234,13 @@ release.yml uses that version's section as the GitHub Release text. See
 - **Environments, Policies and Members follow the same list-and-page layout.** Each list has its
   add action at the right of its header (**New environment**, **Paste YAML** and **New policy**,
   **Grant role**) and a **Manage** link per row. Account settings › Security has **Add passkey**
-  at the right of the passkeys panel's header, and the new passkey's name as a field below. An Environment's read-only page and edit screen
+  at the right of the passkeys panel's header; it opens a dialog that asks for the new
+  passkey's name. An Environment's read-only page and edit screen
   are one page, `…/settings/environments/<name>/manage`, with the details as one form; the old
   addresses redirect there. A Policy's page gains a **Decisions** tab with the decisions it
   matched; the Policies section drops its org-wide recent decisions and its read-only typed
   settings, which are edited on their own pages. Each member has a page,
-  `…/settings/members/<subject>/manage`, to change or revoke their org role and see their
+  `…/settings/members/<id>/manage`, to change or revoke their org role and see their
   repository roles.
 - **One dropdown across the web UI.** Every form picker, the org dropdown in Organization
   settings and the section picker on a narrow screen open the same list as the run filters, in
@@ -254,6 +257,26 @@ release.yml uses that version's section as the GitHub Release text. See
   token pages list tokens with the same row and tags (active, expires soon, revoked, never
   used), and New token moves to the header of Account settings › API tokens. On Security, an
   owner resets a member's passkeys from a Reset passkeys dialog instead of an inline list.
+- **A repository's schedules have their own tab.** The Schedules tab lists each `on: cron:`
+  schedule with its next and last run and how the last one came out, and links to its runs. The
+  Runs tab drops the schedules panel and gains a **scheduled** filter, which also keeps a
+  schedule's refused runs.
+- **A library's page lists its yanked versions.** The table holds every yank of that library,
+  earlier versions included, with Lift yank; the Libraries list keeps only yanks of libraries
+  that are no longer installed. A yank in the API now carries the library's `publisher`, `name`
+  and `source`.
+- **Library policies show the sources trusted with the forge token.** The list is read-only and
+  links each source to the libraries installed from it; trust is still given on a library's
+  page.
+- **An open environment shows the org's rules beside the rules in force.** A repository's
+  Environments tab sets each rule's org value beside the value that applies, and marks the rules
+  the repository changed. The row names the environment once; the name pipelines use is in the
+  detail. The This repo cell is plain text, with a warning icon for not eligible and no rules.
+- **One Link a forge account button** replaces a Link button per forge in Account settings; with
+  more than one forge left to link, it asks which.
+- **Tables and run rows are easier to read.** Column heads are lighter than the rows under them,
+  and a row's first cell is in the primary ink. A run row shows its Headline as Label and its
+  facts in the secondary ink. A secret's scope lines line up across every open key.
 
 ### Bug Fixes
 
@@ -266,6 +289,8 @@ release.yml uses that version's section as the GitHub Release text. See
   server's own database, a Pod of a Run that has not finished, and a running debug Pod are
   left alone. The chart's executor Role gains `list` on Services and NetworkPolicies
   (git-bug 986542a).
+- After linking an account that merged another one in, the redirect no longer names the merged
+  account in its URL; it says `merged=1`, and the page says another account was merged.
 - The sign-in screen showed both logos in the light theme.
 - A repository row on the dashboard no longer repeats its name when the forge repository is
   named like the project.
@@ -1097,7 +1122,8 @@ The first release: the `scarab-server`, `scarab-clone`, `scarab-wsfetch` and
 `scarab-results-sidecar` images and the Helm chart at
 `oci://ghcr.io/thulasi-ram/charts/scarab`. It had no GitHub Release notes.
 
-[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/thulasi-ram/scarab-ci/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/thulasi-ram/scarab-ci/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/thulasi-ram/scarab-ci/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/thulasi-ram/scarab-ci/compare/v0.2.0...v0.2.1
