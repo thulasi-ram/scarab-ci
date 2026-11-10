@@ -435,6 +435,7 @@ pub(crate) async fn replay_caller(st: &AppState, a: &ReplayAuthority) -> Result<
             Ok(Caller {
                 principal: Principal {
                     subject: token.owner_subject.clone(),
+                    handle: String::new(),
                     display_name: Some(format!("API token \u{201c}{}\u{201d}", token.name)),
                     roles,
                 },
@@ -465,6 +466,7 @@ pub(crate) async fn replay_caller(st: &AppState, a: &ReplayAuthority) -> Result<
             Ok(Caller {
                 principal: Principal {
                     subject: session.principal.subject.clone(),
+                    handle: String::new(),
                     display_name: session.principal.display_name.clone(),
                     roles,
                 },
@@ -568,7 +570,7 @@ async fn is_for_human(st: &AppState, subject: &str, for_human: &str) -> bool {
             .await
             .unwrap_or_default()
             .iter()
-            .any(|a| a == for_human),
+            .any(|a| a.id == for_human || a.handle == for_human),
         None => false,
     }
 }

@@ -830,6 +830,7 @@ async fn a_member_cannot_fetch_install_list_or_kill() {
     };
     let scoped = |subject: &str| Principal {
         subject: subject.into(),
+        handle: String::new(),
         display_name: None,
         roles: vec![],
     };
@@ -1055,6 +1056,7 @@ async fn an_org_admin_reads_the_broker_journal_newest_first_by_page() {
     };
     let scoped = |subject: &str| Principal {
         subject: subject.into(),
+        handle: String::new(),
         display_name: None,
         roles: vec![],
     };

@@ -197,7 +197,7 @@ pub(crate) fn governed_routes() -> Routes {
             step_up::events::org_security_summary,
         )
         .post(
-            "/v1/orgs/{org}/members/{subject}/passkeys/reset",
+            "/v1/orgs/{org}/members/{id}/passkeys/reset",
             &ops::PASSKEY_RESET,
             step_up::admin::reset_member_passkeys,
         )
@@ -220,6 +220,7 @@ pub(crate) fn governed_routes() -> Routes {
             delete_binding,
         )
         .get("/v1/orgs/{org}/principals", search_principals)
+        .get("/v1/orgs/{org}/members/{id}", get_member)
         .get("/v1/orgs/{org}/tokens", list_api_tokens)
         .post("/v1/orgs/{org}/tokens", &ops::TOKEN_MINT, mint_api_token)
         .delete(

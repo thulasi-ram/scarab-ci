@@ -94,6 +94,7 @@ fn base() -> RunCreateInput {
             fork: false,
             actor: Some("octocat".to_string()),
             principal: Some("user:octocat".to_string()),
+            principal_id: None,
             reason: None,
         },
         pipeline: Pipeline {
@@ -109,6 +110,7 @@ fn base() -> RunCreateInput {
             dependents: strings(&["deploy/helm"]),
         }]),
         principal: None,
+        principal_id: None,
         time: at("2026-11-02T10:00:00Z"),
     }
 }
@@ -592,6 +594,7 @@ fn unguarded_optional_variable_warns_and_fails_closed() {
         r#"principal == "user:octocat""#,
         &RunCreateInput {
             principal: Some("user:octocat".to_string()),
+            principal_id: None,
             ..base()
         }
     ));
@@ -601,6 +604,7 @@ fn unguarded_optional_variable_warns_and_fails_closed() {
         r#"principal != null && principal.startsWith("bot:")"#,
         &RunCreateInput {
             principal: Some("user:octocat".to_string()),
+            principal_id: None,
             ..base()
         }
     ));

@@ -61,6 +61,9 @@ pub struct SecretInjectingExecutor {
     /// recorded. `None` = the Environment's built-in re-check only, nothing
     /// recorded.
     policies: Option<Arc<dyn scarab_policy::store::PolicyStore>>,
+    /// Principals: a recorded approver set compares as ids (ADR-0080 §3).
+    /// `None` compares the strings as stored.
+    identities: Option<Arc<dyn scarab_identity::IdentityStore>>,
 }
 
 /// What the launch decorators learn from a Step's admission.
@@ -125,6 +128,7 @@ pub(crate) async fn ensure_deploy_still_admitted(
     db: &dyn Db,
     governance: &dyn scarab_project::EnvironmentGovernanceStore,
     policies: Option<&dyn scarab_policy::store::PolicyStore>,
+    identities: Option<&dyn scarab_identity::IdentityStore>,
     step: &StepRun,
     spec: Option<&StepSpec>,
     now_ms: i64,
@@ -148,7 +152,16 @@ pub(crate) async fn ensure_deploy_still_admitted(
             // No Project: no Policy can match.
             return Ok(StepAdmission::default());
         };
-        return step_admit(db, Some(policies), (&org, &project), None, step, now_ms).await;
+        return step_admit(
+            db,
+            Some(policies),
+            identities,
+            (&org, &project),
+            None,
+            step,
+            now_ms,
+        )
+        .await;
     };
     let refusal = match governance
         .deploy_governance(&ctx.org, &ctx.project, &ctx.environment)
@@ -166,11 +179,15 @@ pub(crate) async fn ensure_deploy_still_admitted(
             }) {
                 return Err(ExecError::Refused(refusal));
             }
-            let protection = g.effective_protection();
+            // Approver lists compare as ids, whichever form each was stored
+            // in (ADR-0080 §3).
+            let protection =
+                crate::people::canonical_protection(identities, &g.effective_protection()).await;
             let tenant = (ctx.org.as_str(), ctx.project.as_str());
             return step_admit(
                 db,
                 policies,
+                identities,
                 tenant,
                 Some((&ctx, &protection)),
                 step,
@@ -225,6 +242,7 @@ async fn stored_pipeline(
 async fn step_admit(
     db: &dyn Db,
     policies: Option<&dyn scarab_policy::store::PolicyStore>,
+    identities: Option<&dyn scarab_identity::IdentityStore>,
     tenant: (&str, &str),
     governed: Option<(
         &scarab_engine::DeployContext,
@@ -268,18 +286,25 @@ async fn step_admit(
                     .await
                     .map_err(|e| ExecError::Other(e.to_string()))?
             };
-            gates
-                .iter()
-                .map(|g| {
-                    let gate = scarab_engine::StepId(g.id.clone());
-                    UpstreamGateFacts {
-                        gate: g.id.clone(),
-                        released_at: scarab_engine::gate_released_at(&events, &gate).map(|t| t.0),
-                        met: scarab_engine::environment_approval_met(&events, &gate)
-                            .map(|m| (m.approvers, m.required)),
-                    }
-                })
-                .collect()
+            let mut facts = Vec::with_capacity(gates.len());
+            for g in &gates {
+                let gate = scarab_engine::StepId(g.id.clone());
+                // A gate released before ADR-0080 recorded handles: compared
+                // as ids, the set it met is still the set now.
+                let met = match scarab_engine::environment_approval_met(&events, &gate) {
+                    Some(m) => Some((
+                        crate::people::canonical_approver_set(identities, &m.approvers).await,
+                        m.required,
+                    )),
+                    None => None,
+                };
+                facts.push(UpstreamGateFacts {
+                    gate: g.id.clone(),
+                    released_at: scarab_engine::gate_released_at(&events, &gate).map(|t| t.0),
+                    met,
+                });
+            }
+            facts
         }
         None => Vec::new(),
     };
@@ -536,7 +561,15 @@ impl SecretInjectingExecutor {
             libraries: None,
             clock: Arc::new(crate::SystemClock),
             policies: None,
+            identities: None,
         }
+    }
+
+    /// Compare recorded approver sets as Principal ids at every launch
+    /// (ADR-0080 §3).
+    pub fn with_identities(mut self, identities: Arc<dyn scarab_identity::IdentityStore>) -> Self {
+        self.identities = Some(identities);
+        self
     }
 
     /// Consult the `step.admit` Policies at every launch of a Step, in a Run
@@ -615,6 +648,7 @@ impl SecretInjectingExecutor {
                     self.db.as_ref(),
                     governance.as_ref(),
                     policies,
+                    self.identities.as_deref(),
                     step,
                     spec,
                     now,

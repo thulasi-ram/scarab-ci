@@ -18,6 +18,7 @@ use scarab_testkit::{
 fn principal(subject: &str, role: Role) -> Principal {
     Principal {
         subject: subject.into(),
+        handle: String::new(),
         display_name: None,
         roles: vec![role],
     }

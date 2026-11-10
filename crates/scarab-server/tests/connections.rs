@@ -132,6 +132,7 @@ async fn harness_at(
                 "root-code",
                 Principal {
                     subject: "root".into(),
+                    handle: String::new(),
                     display_name: None,
                     roles: vec![Role::Owner],
                 },
@@ -140,6 +141,7 @@ async fn harness_at(
                 "orgadmin-code",
                 Principal {
                     subject: "orgadmin".into(),
+                    handle: String::new(),
                     display_name: None,
                     roles: vec![],
                 },
@@ -148,6 +150,7 @@ async fn harness_at(
                 "viewer-code",
                 Principal {
                     subject: "viewer".into(),
+                    handle: String::new(),
                     display_name: None,
                     roles: vec![Role::Viewer],
                 },

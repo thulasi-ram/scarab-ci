@@ -314,6 +314,8 @@ pub struct ForgeCredentialExecutor {
     minted: Mutex<HashMap<String, Vec<(RepoRef, String)>>>,
     /// What an approval's age is measured to at launch (ADR-0078 §5).
     clock: Arc<dyn scarab_engine::Clock>,
+    /// Principals: a recorded approver set compares as ids (ADR-0080 §3).
+    identities: Option<Arc<dyn scarab_identity::IdentityStore>>,
 }
 
 impl ForgeCredentialExecutor {
@@ -326,7 +328,14 @@ impl ForgeCredentialExecutor {
             governance: None,
             minted: Mutex::new(HashMap::new()),
             clock: Arc::new(crate::SystemClock),
+            identities: None,
         }
+    }
+
+    /// Compare recorded approver sets as Principal ids (ADR-0080 §3).
+    pub fn with_identities(mut self, identities: Arc<dyn scarab_identity::IdentityStore>) -> Self {
+        self.identities = Some(identities);
+        self
     }
 
     /// Why a Step whose credential would be the connection's long-lived
@@ -599,6 +608,7 @@ impl Executor for ForgeCredentialExecutor {
                     db.as_ref(),
                     governance.as_ref(),
                     None,
+                    self.identities.as_deref(),
                     step,
                     // The grants are re-checked by SecretInjecting, which
                     // every launch passes through after this one.

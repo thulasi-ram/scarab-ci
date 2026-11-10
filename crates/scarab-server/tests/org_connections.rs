@@ -166,6 +166,7 @@ async fn harness(forge: FakeForge) -> Harness {
 
     let person = |subject: &str, roles: Vec<Role>| Principal {
         subject: subject.into(),
+        handle: String::new(),
         display_name: None,
         roles,
     };

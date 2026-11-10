@@ -110,6 +110,7 @@ pub mod plugins;
 /// ADR-0075: the Policy API — org Policies, Project typed settings, the
 /// decision logs and the policy test API.
 pub mod policies;
+pub mod people;
 mod policy_checkpoints;
 mod refused_runs;
 pub mod retention;
@@ -692,6 +693,15 @@ impl AppState {
     pub fn with_identities(mut self, store: Arc<dyn scarab_identity::IdentityStore>) -> Self {
         self.identities = Some(store);
         self
+    }
+
+    /// The Principals `refs` (ids or handles, mixed) name, looked up once
+    /// (ADR-0080 §3).
+    pub(crate) async fn people<'a>(
+        &self,
+        refs: impl IntoIterator<Item = &'a str>,
+    ) -> people::People {
+        people::People::lookup(self.identities.as_deref(), refs).await
     }
 
     /// Set Scarab's public base URL (`SCARAB_PUBLIC_URL`) — the one place the
@@ -2037,7 +2047,9 @@ async fn dispatch(
         st.db.as_ref(),
         st.clock.as_ref(),
         st.admission_ports(),
-        principal.subject,
+        // The Actor of a dispatch is the Principal's handle (ADR-0080 §4):
+        // what `when: event.actor == …` compares and the Runs list shows.
+        principal.handle().to_string(),
         scarab_forge::RepoRef {
             owner: org,
             name: repo,
@@ -4680,26 +4692,50 @@ pub struct ActorLinks<'a> {
 }
 
 impl ActorLinks<'_> {
-    /// The Principal linked to `event`'s actor: `None` for a dispatch (its
-    /// actor is already a Principal, ADR-0075 §2), for an actor with no
-    /// immutable id, and when the repo has no forge connection, the forge no
-    /// login provider, or the account no Principal. A store failure is an
-    /// error, so a Policy that names Principals is never evaluated as if the
-    /// actor had none.
+    /// The Principal linked to `event`'s actor, as its id and handle. For a
+    /// dispatch, the actor IS a Principal's handle (ADR-0075 §2, ADR-0080
+    /// §4): it is looked up for its id (no identity store: the handle is the
+    /// id). For a webhook: `None` for an actor with no immutable id, and
+    /// when the repo has no forge connection, the forge no login provider,
+    /// or the account no Principal. A store failure is an error, so a Policy
+    /// that names Principals is never evaluated as if the actor had none.
     async fn principal_of(
         &self,
         event: &scarab_forge::Event,
         repo: &scarab_forge::RepoRef,
-    ) -> Result<Option<String>, TriggerError> {
-        let (Some(actor_id), Some(connections), Some(identities)) =
-            (event.actor_id(), self.connections, self.identities)
-        else {
-            return Ok(None);
-        };
+    ) -> Result<Option<policy_checkpoints::Named>, TriggerError> {
         let store_err = |what: &str, e: String| {
             TriggerError::Db(DbError::Other(format!(
                 "{what}: {e}; the Run was not created because its actor could not be resolved"
             )))
+        };
+        if let scarab_forge::Event::Manual { actor, .. } | scarab_forge::Event::Api { actor, .. } =
+            event
+        {
+            if actor.is_empty() {
+                return Ok(None);
+            }
+            let found = match self.identities {
+                Some(identities) => scarab_identity::lookup_principal(identities, actor)
+                    .await
+                    .map_err(|e| store_err("identities", e.to_string()))?,
+                None => None,
+            };
+            return Ok(Some(match found {
+                Some(p) => policy_checkpoints::Named {
+                    id: p.id,
+                    handle: p.handle,
+                },
+                None => policy_checkpoints::Named {
+                    id: actor.clone(),
+                    handle: actor.clone(),
+                },
+            }));
+        }
+        let (Some(actor_id), Some(connections), Some(identities)) =
+            (event.actor_id(), self.connections, self.identities)
+        else {
+            return Ok(None);
         };
         let Some(resolved) = connections
             .resolve(repo)
@@ -4723,9 +4759,13 @@ impl ActorLinks<'_> {
         else {
             return Ok(None);
         };
-        scarab_identity::resolve_principal(identities, &pinned)
+        Ok(scarab_identity::resolve_principal_record(identities, &pinned)
             .await
-            .map_err(|e| store_err("identities", e.to_string()))
+            .map_err(|e| store_err("identities", e.to_string()))?
+            .map(|p| policy_checkpoints::Named {
+                id: p.id,
+                handle: p.handle,
+            }))
     }
 }
 
@@ -5955,15 +5995,18 @@ fn policy_store_err(e: scarab_policy::store::PolicyStoreError) -> TriggerError {
 }
 
 /// The `run.create` trigger of `event` (ADR-0075 §2). For a manual or API
-/// dispatch the actor is the authenticated Principal (the dispatch handler
-/// passes `principal.subject`), so it is both `trigger.principal` and the
-/// input's `principal`. A webhook actor is a forge login: its `principal`
+/// dispatch the actor is the authenticated Principal's handle (the dispatch
+/// handler passes `principal.handle()`, ADR-0080 §4), so it is both
+/// `trigger.principal` and the input's `principal`, with the id beside each. A webhook actor is a forge login: its `principal`
 /// is `linked`, the Principal its immutable account id is pinned to through
 /// identity links (ADR-0069, [`ActorLinks::principal_of`]), or none.
 fn run_create_trigger(
     event: &scarab_forge::Event,
-    linked: Option<String>,
-) -> (scarab_policy::run_create::Trigger, Option<String>) {
+    linked: Option<policy_checkpoints::Named>,
+) -> (
+    scarab_policy::run_create::Trigger,
+    Option<policy_checkpoints::Named>,
+) {
     use scarab_forge::{Event, TriggerKind as F};
     use scarab_policy::run_create::TriggerKind as P;
     let kind = match event.trigger_kind() {
@@ -5987,8 +6030,8 @@ fn run_create_trigger(
     }
     .filter(|s| !s.is_empty());
     let (principal, reason) = match event {
-        Event::Manual { actor, reason, .. } | Event::Api { actor, reason, .. } => (
-            (!actor.is_empty()).then(|| actor.clone()),
+        Event::Manual { reason, .. } | Event::Api { reason, .. } => (
+            linked,
             reason
                 .clone()
                 .filter(|r| !r.trim().is_empty())
@@ -6002,7 +6045,8 @@ fn run_create_trigger(
         sha,
         fork: event.is_fork_pr(),
         actor: event.actor().map(str::to_string),
-        principal: principal.clone(),
+        principal: principal.as_ref().map(|p| p.handle.clone()),
+        principal_id: principal.as_ref().map(|p| p.id.clone()),
         reason,
     };
     (trigger, principal)
@@ -6014,7 +6058,7 @@ fn run_create_trigger(
 /// and the policy test API.
 fn run_create_facts(
     event: &scarab_forge::Event,
-    linked: Option<String>,
+    linked: Option<policy_checkpoints::Named>,
     path: &str,
     repo: &scarab_forge::RepoRef,
     gov: &RunGovernance,
@@ -6042,7 +6086,8 @@ fn run_create_facts(
             trigger,
             pipeline_path: path.to_string(),
             environment,
-            principal,
+            principal: principal.as_ref().map(|p| p.handle.clone()),
+            principal_id: principal.map(|p| p.id),
             time,
             params: params.cloned().unwrap_or_default(),
             event: serde_json::Map::new(),
@@ -8450,17 +8495,20 @@ async fn link_callback(
     {
         Ok(scarab_identity::LinkOutcome::Merged {
             from,
+            from_handle,
             removed_passkeys,
         }) => {
             record_removed_passkeys(st, &principal.subject, &from, &removed_passkeys, &sid, now)
                 .await;
+            // The handle, for the person's own notice: it names the account
+            // they just proved they hold.
             format!(
                 "/settings/profile?identity_linked={}&merged={}",
                 flow.provider,
-                query_escape(&from)
+                query_escape(&from_handle)
             )
         }
-        Ok(scarab_identity::LinkOutcome::NeedsFoldedPasskey { from }) => {
+        Ok(scarab_identity::LinkOutcome::NeedsFoldedPasskey { from, .. }) => {
             match start_identity_merge(st, &sid, &principal.subject, &from, &identity, now).await {
                 Ok(id) => format!("/settings/profile?identity_merge={}", query_escape(&id)),
                 Err(why) => format!(
@@ -8768,6 +8816,7 @@ async fn confirm_identity_merge(
     {
         Ok(scarab_identity::LinkOutcome::Merged {
             from,
+            from_handle,
             removed_passkeys,
         }) => {
             record_removed_passkeys(
@@ -8780,7 +8829,7 @@ async fn confirm_identity_merge(
             )
             .await;
             Ok(Json(IdentityMergedDto {
-                merged: Some(from),
+                merged: Some(from_handle),
                 removed_passkeys: removed_passkeys.len(),
             }))
         }
@@ -8793,9 +8842,11 @@ async fn confirm_identity_merge(
             merged: None,
             removed_passkeys: 0,
         })),
-        Ok(scarab_identity::LinkOutcome::NeedsFoldedPasskey { from }) => Err(ApiError::Conflict(
-            format!("that passkey no longer belongs to `{from}`; start the link again"),
-        )),
+        Ok(scarab_identity::LinkOutcome::NeedsFoldedPasskey { from_handle, .. }) => {
+            Err(ApiError::Conflict(format!(
+                "that passkey no longer belongs to `{from_handle}`; start the link again"
+            )))
+        }
         Err(scarab_identity::IdentityError::Conflict(why)) => Err(ApiError::Conflict(why)),
         Err(e) => Err(ApiError::BadRequest(e.to_string())),
     }
@@ -8918,6 +8969,7 @@ async fn logout(State(st): State<AppState>, headers: HeaderMap) -> Result<Respon
 /// org-scoped (inherits down to every project of the org).
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct BindingRequest {
+    /// The person: a handle (`github:alice`) or a Principal id (ADR-0080).
     pub subject: String,
     /// `viewer` | `member` | `admin` | `owner`.
     pub role: String,
@@ -8934,13 +8986,15 @@ struct BindingQuery {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct BindingDto {
-    pub subject: String,
+    /// The Principal's id (ADR-0080): what a member's URL carries.
+    pub id: String,
+    /// The Principal's handle (`github:alice`): what people read and type.
+    pub handle: String,
     pub role: String,
     /// Empty = org-scoped.
     pub project: String,
     /// The Principal's display name, when the identity store knows it
-    /// (ADR-0069). Absent for a pre-upgrade bare subject nobody has signed in
-    /// as since.
+    /// (ADR-0069).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     /// `false` = created by a forge import and not signed into yet — the
@@ -9004,31 +9058,102 @@ async fn list_bindings(
         .bindings(&org)
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    let mut out = Vec::with_capacity(bindings.len());
-    for (b, origin) in bindings {
-        let record = match st.identities.as_ref() {
-            Some(store) => store.principal(&b.subject).await.ok().flatten(),
-            None => None,
-        };
-        out.push(BindingDto {
-            display_name: record.as_ref().and_then(|r| r.display_name.clone()),
-            claimed: record.as_ref().map(|r| r.claimed_at.is_some()),
-            origin: Some(
-                match origin {
-                    scarab_identity::BindingOrigin::Native => "native",
-                    scarab_identity::BindingOrigin::Import => "import",
-                }
-                .to_string(),
-            ),
-            subject: b.subject,
-            role: role_name(b.role).to_string(),
-            project: match b.scope {
-                scarab_identity::Scope::Org(_) => String::new(),
-                scarab_identity::Scope::Project { name, .. } => name,
-            },
-        });
+    let people = st
+        .people(bindings.iter().map(|(b, _)| b.subject.as_str()))
+        .await;
+    Ok(Json(
+        bindings
+            .into_iter()
+            .map(|(b, origin)| binding_dto(&people, b, Some(origin)))
+            .collect(),
+    ))
+}
+
+/// One binding row as the API returns it, its person looked up in `people`.
+fn binding_dto(
+    people: &people::People,
+    b: scarab_identity::Binding,
+    origin: Option<scarab_identity::BindingOrigin>,
+) -> BindingDto {
+    let person = people.person(&b.subject);
+    BindingDto {
+        claimed: people.get(&b.subject).map(|r| r.claimed_at.is_some()),
+        id: person.id,
+        handle: person.handle,
+        display_name: person.display_name,
+        origin: origin.map(|o| {
+            match o {
+                scarab_identity::BindingOrigin::Native => "native",
+                scarab_identity::BindingOrigin::Import => "import",
+            }
+            .to_string()
+        }),
+        role: role_name(b.role).to_string(),
+        project: match b.scope {
+            scarab_identity::Scope::Org(_) => String::new(),
+            scarab_identity::Scope::Project { name, .. } => name,
+        },
     }
-    Ok(Json(out))
+}
+
+/// `GET /v1/orgs/{org}/members/{id}`: one person and the roles they hold in
+/// the org (ADR-0080 §5). The member page reads this by the Principal's id.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MemberDto {
+    pub id: String,
+    pub handle: String,
+    pub display_name: Option<String>,
+    /// `false` = created by a forge import, not signed into yet. Absent
+    /// when no identity store knows them.
+    pub claimed: Option<bool>,
+    /// Their bindings in the org, org scope first, then by repository.
+    pub bindings: Vec<BindingDto>,
+}
+
+/// One member of an org, by Principal id (ADR-0080 §5). Administer. A
+/// Principal with no binding in the org is still returned, with no
+/// bindings, so the page can say so; an id no Principal holds is a 404.
+#[utoipa::path(get, path = "/v1/orgs/{org}/members/{id}", summary = "One member of an org and their roles (ADR-0080)", params(("org" = String, Path, description = "org"), ("id" = String, Path, description = "the Principal's id")), responses((status = 200, body = MemberDto), (status = 403, description = "not an org admin"), (status = 404, description = "no such Principal")))]
+async fn get_member(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((org, id)): Path<(String, String)>,
+) -> Result<Json<MemberDto>, ApiError> {
+    let scope = scarab_identity::Scope::Org(org.clone());
+    authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
+    let rbac = st.rbac.as_ref().ok_or(ApiError::NotFound)?;
+    let record = match st.identities.as_ref() {
+        Some(store) => Some(
+            store
+                .principal(&id)
+                .await
+                .map_err(|e| ApiError::BadRequest(e.to_string()))?
+                .ok_or(ApiError::NotFound)?,
+        ),
+        None => None,
+    };
+    let bindings = rbac
+        .bindings(&org)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let people = st.people([id.as_str()]).await;
+    let mut mine: Vec<BindingDto> = bindings
+        .into_iter()
+        .filter(|(b, _)| b.subject == id)
+        .map(|(b, origin)| binding_dto(&people, b, Some(origin)))
+        .collect();
+    mine.sort_by(|a, b| a.project.cmp(&b.project));
+    if record.is_none() && mine.is_empty() {
+        return Err(ApiError::NotFound);
+    }
+    let person = people.person(&id);
+    Ok(Json(MemberDto {
+        id: person.id,
+        handle: person.handle,
+        display_name: person.display_name,
+        claimed: record.map(|r| r.claimed_at.is_some()),
+        bindings: mine,
+    }))
 }
 
 /// Natively grant `subject` a role in the org (or one of its projects).
@@ -9061,17 +9186,22 @@ async fn put_binding(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// An admin-typed subject → the Principal id it names (ADR-0069 §3): a merged
-/// id follows to its target; a string no Principal holds is refused. Granting
-/// to one would hand the role to whoever next produced that string at sign-in —
-/// the recycled-login takeover, re-opened for every pre-assigned surface.
+/// An admin-typed subject → the Principal id it names (ADR-0069 §3,
+/// ADR-0080 §2): a handle or an id, a handle matched exactly or, when exactly
+/// one does, ignoring case; a merged Principal follows to its target; a
+/// string no Principal holds is refused. Granting to one would hand the role
+/// to whoever next produced that string at sign-in — the recycled-login
+/// takeover, re-opened for every pre-assigned surface.
 async fn resolve_typed_subject(st: &AppState, subject: &str) -> Result<String, ApiError> {
     let Some(store) = st.identities.as_ref() else {
         return Ok(subject.to_string());
     };
     scarab_identity::resolve_principal(store.as_ref(), subject)
         .await
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?
+        .map_err(|e| match e {
+            scarab_identity::IdentityError::Conflict(why) => ApiError::BadRequest(why),
+            e => ApiError::BadRequest(e.to_string()),
+        })?
         .ok_or_else(|| {
             ApiError::BadRequest(format!(
                 "`{subject}` is not a Scarab user. They must sign in once, or be imported \
@@ -9099,8 +9229,11 @@ pub struct PrincipalIdentityDto {
 /// A Principal, as the grant/approver typeahead offers it (ADR-0069 §3).
 #[derive(Debug, Serialize, ToSchema)]
 pub struct PrincipalDto {
-    /// What a grant or an approver entry stores.
+    /// The Principal's id (ADR-0080): what a grant or an approver entry
+    /// stores, and what a URL carries.
     pub id: String,
+    /// What a grant or an approver entry is typed as.
+    pub handle: String,
     pub display_name: Option<String>,
     /// `false` = created by a forge import, not signed into yet.
     pub claimed: bool,
@@ -9111,7 +9244,7 @@ pub struct PrincipalDto {
 /// are install-wide, so this is Administer-gated and capped: an org admin needs
 /// to find someone who holds no role here yet, which no org-scoped list could
 /// contain.
-#[utoipa::path(get, path = "/v1/orgs/{org}/principals", summary = "Search users for a grant or approver entry (ADR-0069)", params(("q" = String, Query, description = "id or handle prefix, or a display-name fragment")), responses((status = 200, body = [PrincipalDto]), (status = 403, description = "not an org admin")))]
+#[utoipa::path(get, path = "/v1/orgs/{org}/principals", summary = "Search users for a grant or approver entry (ADR-0069)", params(("q" = String, Query, description = "handle prefix, or a display-name fragment")), responses((status = 200, body = [PrincipalDto]), (status = 403, description = "not an org admin")))]
 async fn search_principals(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -9134,6 +9267,7 @@ async fn search_principals(
             .into_iter()
             .map(|m| PrincipalDto {
                 id: m.id,
+                handle: m.handle,
                 display_name: m.display_name,
                 claimed: m.claimed,
                 identities: m
@@ -9168,7 +9302,9 @@ async fn delete_binding(
         Some(name) => scarab_identity::Scope::Project { org, name },
         None => org_scope,
     };
-    rbac.revoke(&q.subject, &scope)
+    // A handle or an id (ADR-0080 §2); the row is keyed by the id.
+    let subject = resolve_typed_subject(&st, &q.subject).await?;
+    rbac.revoke(&subject, &scope)
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     Ok(StatusCode::NO_CONTENT)
@@ -9281,11 +9417,13 @@ async fn import_bindings(
         let principal = identities
             .pin(
                 &identity,
-                &provider.base_id_for_forge_account(&identity),
+                &provider.base_handle_for_forge_account(&identity),
+                provider.placeholder_rule(),
                 now,
             )
             .await
-            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?
+            .id;
         match seeds.iter_mut().find(|(s, _)| *s == principal) {
             Some((_, r)) => *r = (*r).max(role),
             None => seeds.push((principal, role)),
@@ -9298,16 +9436,20 @@ async fn import_bindings(
     rbac.import_seeds(&scope, provider.provider_id(), &seeds, prune)
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let people = st.people(seeds.iter().map(|(s, _)| s.as_str())).await;
     Ok(Json(
         seeds
             .into_iter()
-            .map(|(subject, role)| BindingDto {
-                subject,
-                role: role_name(role).to_string(),
-                project: repo.clone(),
-                display_name: None,
-                claimed: None,
-                origin: None,
+            .map(|(subject, role)| {
+                binding_dto(
+                    &people,
+                    scarab_identity::Binding {
+                        subject,
+                        scope: scope.clone(),
+                        role,
+                    },
+                    None,
+                )
             })
             .collect(),
     ))
@@ -9550,6 +9692,7 @@ async fn mint_personal_token(
     // message, instead of walking away with a dead token.
     let owner_view = Principal {
         subject: caller.principal.subject.clone(),
+        handle: String::new(),
         display_name: None,
         roles: token_owner_roles(st, &caller.principal.subject).await,
     };
@@ -10049,15 +10192,24 @@ async fn live_role_in(
 async fn token_owner_roles(st: &AppState, subject: &str) -> Vec<scarab_identity::Role> {
     // An owners entry naming an id since merged into this Principal still
     // means them (ADR-0069 §6). A store failure only ever costs authority.
-    let mut ids = vec![subject.to_string()];
+    // An entry is typed as a handle and may be an id (ADR-0080 §4), so both
+    // of each name count.
+    let mut names = vec![subject.to_string()];
     if let Some(store) = st.identities.as_ref() {
-        ids.extend(store.aliases_of(subject).await.unwrap_or_default());
+        if let Ok(Some(p)) = store.principal(subject).await {
+            names.push(p.handle);
+        }
+        for a in store.aliases_of(subject).await.unwrap_or_default() {
+            names.push(a.id);
+            names.push(a.handle);
+        }
     }
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
     // The owners list is install-wide (ADR-0069), so any provider's view of it
     // answers; `max` keeps this correct should they ever differ.
     st.oauth_providers
         .iter()
-        .flat_map(|o| ids.iter().filter_map(|id| o.bootstrap_owner_role(id)))
+        .filter_map(|o| o.bootstrap_owner_role(&names))
         .max()
         .into_iter()
         .collect()
@@ -10085,6 +10237,7 @@ async fn authenticate(
     let Some(sessions) = st.sessions.as_ref() else {
         return Ok(Caller::dev_insecure_owner(Principal {
             subject: "anonymous".into(),
+            handle: String::new(),
             display_name: None,
             roles: vec![scarab_identity::Role::Owner],
         }));
@@ -10209,6 +10362,7 @@ async fn authenticate_api_token(
     Ok(Caller {
         principal: Principal {
             subject: token.owner_subject.clone(),
+            handle: String::new(),
             display_name: Some(format!("API token \u{201c}{}\u{201d}", token.name)),
             roles,
         },
@@ -10299,6 +10453,26 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
 /// definition, shared with the engine's dedup: [`scarab_engine::gate_approvers`].
 fn gate_approvers(events: &[EventKind], step: &StepId) -> Vec<String> {
     scarab_engine::gate_approvers(events, step)
+}
+
+/// [`gate_approvers`] of `run`'s gate `step`, each mapped to the id of the
+/// Principal it names (ADR-0080 §3): an approval recorded under a handle
+/// before the upgrade and one recorded under the id count as one person,
+/// and both compare with an approver list of ids.
+async fn current_gate_approvers(
+    st: &AppState,
+    run: &RunId,
+    step: &StepId,
+) -> Result<Vec<String>, ApiError> {
+    let events = st.db.events(run).await.map_err(ApiError::Db)?;
+    Ok(people::canonical_ids(st.identities.as_deref(), &gate_approvers(&events, step)).await)
+}
+
+/// `approvers` (ids) as the handles people read.
+async fn approval_handles(st: &AppState, approvers: &[String]) -> Vec<String> {
+    st.people(approvers.iter().map(String::as_str))
+        .await
+        .handles(approvers)
 }
 
 /// Whether `step` of `run`, a Run an Environment governs, is an Environment
@@ -10442,6 +10616,12 @@ async fn approve_gate(
         Ok(p) => (p, None),
         Err(e) => (None, Some(e)),
     };
+    // Approver lists and approvals compare as ids, whichever form each was
+    // stored in (ADR-0080 §3).
+    let protection = match protection {
+        Some(p) => Some(people::canonical_protection(st.identities.as_deref(), &p).await),
+        None => None,
+    };
     let rules = match (&ctx, &protection) {
         (Some(c), Some(p)) if approval_gate => Some((c, p)),
         _ => None,
@@ -10495,25 +10675,40 @@ async fn approve_gate(
     let decide = |approvals: Vec<String>| {
         let release = release_rule(&approvals);
         let checkpoint = checkpoint.as_ref();
-        let subject = principal.subject.clone();
+        let actor = policy_checkpoints::Named {
+            id: principal.subject.clone(),
+            handle: principal.handle().to_string(),
+        };
+        let st = &st;
         async move {
             let decision = match checkpoint {
-                Some(f) => Some(
-                    f.decide(
-                        &subject,
-                        &approvals,
-                        now,
-                        release.as_ref().map(|r| r.result.clone()),
+                Some(f) => {
+                    // A Policy reads handles, with the ids beside them.
+                    let people = st.people(approvals.iter().map(String::as_str)).await;
+                    let named: Vec<policy_checkpoints::Named> = approvals
+                        .iter()
+                        .map(|a| policy_checkpoints::Named {
+                            id: a.clone(),
+                            handle: people.handle(a),
+                        })
+                        .collect();
+                    Some(
+                        f.decide(
+                            &actor,
+                            &named,
+                            now,
+                            release.as_ref().map(|r| r.result.clone()),
+                        )
+                        .await
+                        .map_err(ApiError::Db)?,
                     )
-                    .await
-                    .map_err(ApiError::Db)?,
-                ),
+                }
                 None => None,
             };
             Ok::<_, ApiError>((approvals, release, decision))
         }
     };
-    let mut prospective = gate_approvers(&st.db.events(&run).await.map_err(ApiError::Db)?, &step);
+    let mut prospective = current_gate_approvers(&st, &run, &step).await?;
     if !prospective.contains(&principal.subject) {
         prospective.push(principal.subject.clone());
     }
@@ -10585,7 +10780,7 @@ async fn approve_gate(
     //    admin's change since — tightened rules, a withdrawn eligibility, a
     //    deleted Environment — governs the release. Another approval recorded
     //    since the decision was made changes the approvals: decide again.
-    let approvers = gate_approvers(&st.db.events(&run).await.map_err(ApiError::Db)?, &step);
+    let approvers = current_gate_approvers(&st, &run, &step).await?;
     if let Some(e) = held {
         return Err(e);
     }
@@ -10619,7 +10814,7 @@ async fn approve_gate(
                 StatusCode::ACCEPTED,
                 Json(GateApprovalDto {
                     released: false,
-                    approvals: Some(approvers),
+                    approvals: Some(approval_handles(&st, &approvers).await),
                     releases_at: None,
                 }),
             )
@@ -10632,9 +10827,17 @@ async fn approve_gate(
             &st.db.events(&run).await.map_err(ApiError::Db)?,
             &step,
         );
+        let recorded = match recorded {
+            Some(r) => Some((
+                people::canonical_approver_set(st.identities.as_deref(), &r.approvers).await,
+                r.required,
+                r.release_at,
+            )),
+            None => None,
+        };
         if recorded
             .as_ref()
-            .map(|r| (&r.approvers, r.required, r.release_at))
+            .map(|(approvers, required, release_at)| (approvers, *required, *release_at))
             != Some((&met.approvers, met.required, met.release_at))
         {
             st.db
@@ -10658,7 +10861,7 @@ async fn approve_gate(
                 StatusCode::ACCEPTED,
                 Json(GateApprovalDto {
                     released: false,
-                    approvals: Some(approvers),
+                    approvals: Some(approval_handles(&st, &approvers).await),
                     releases_at: Some(met.release_at),
                 }),
             )
@@ -13980,6 +14183,7 @@ impl utoipa::Modify for StepUpResponses {
         list_own_api_tokens,
         revoke_own_api_token,
         list_bindings,
+        get_member,
         put_binding,
         delete_binding,
         import_bindings,
@@ -14181,6 +14385,8 @@ impl utoipa::Modify for StepUpResponses {
         ConfirmIdentityMergeRequest,
         IdentityMergedDto,
         PrincipalDto,
+        MemberDto,
+        people::PersonDto,
         PrincipalIdentityDto,
         MintTokenRequest,
         MintOwnTokenRequest,

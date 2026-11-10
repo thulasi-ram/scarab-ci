@@ -39,8 +39,11 @@ policy_struct! {
 
 policy_struct! {
     pub struct Actor {
-        /// The acting Principal.
+        /// The acting Principal's handle (`github:alice`).
         pub principal: String,
+        /// The acting Principal's id (ADR-0080). Absent from inputs recorded
+        /// before it existed.
+        pub principal_id: Option<String>,
     }
 }
 
@@ -62,9 +65,12 @@ policy_struct! {
         pub gate: GateUnderResolve,
         pub verdict: Verdict,
         pub actor: Actor,
-        /// The Principals who have approved in the gate's current wait, this
-        /// approval included.
+        /// The handles of the Principals who have approved in the gate's
+        /// current wait, this approval included.
         pub approvals: Capped<String, MAX_APPROVALS>,
+        /// Their ids, in the same order (ADR-0080). Absent from inputs
+        /// recorded before it existed.
+        pub approval_ids: Option<Capped<String, MAX_APPROVALS>>,
         pub run: GateRun,
         pub time: Timestamp,
     }

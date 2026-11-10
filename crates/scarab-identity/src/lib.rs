@@ -27,7 +27,15 @@ pub use step_up::{
 /// An authenticated principal (a human user or a machine identity).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Principal {
+    /// The Principal's **id** (ADR-0080): random, immutable, the key every
+    /// binding, token owner, approver list and passkey stores and the value
+    /// new history records. Without an identity store (dev, tests) it is the
+    /// same string as `handle`.
     pub subject: String,
+    /// The readable **handle** (`github:alice`, ADR-0069 §2): what people
+    /// type and read, and what `event.actor` and the CEL handle fields carry.
+    #[serde(default)]
+    pub handle: String,
     pub display_name: Option<String>,
     /// The principal's Scarab-native roles (seeded from the forge at login, but
     /// authoritative in Scarab).
@@ -35,6 +43,27 @@ pub struct Principal {
 }
 
 impl Principal {
+    /// A Principal whose id and handle are the same string: what a caller
+    /// with no identity store (dev mode, tests) or a machine identity is.
+    pub fn unpinned(subject: impl Into<String>, display_name: Option<String>, roles: Vec<Role>) -> Self {
+        let subject = subject.into();
+        Principal {
+            handle: subject.clone(),
+            subject,
+            display_name,
+            roles,
+        }
+    }
+
+    /// The handle, or the id for a snapshot that carries none.
+    pub fn handle(&self) -> &str {
+        if self.handle.is_empty() {
+            &self.subject
+        } else {
+            &self.handle
+        }
+    }
+
     /// Is this principal allowed to perform `action` (by any of its roles)?
     pub fn can(&self, action: Action) -> bool {
         self.roles.iter().any(|r| r.allows(action))
@@ -494,31 +523,61 @@ pub struct ProviderIdentity {
     pub display_name: Option<String>,
 }
 
-/// A Principal's own record (ADR-0069 §1). Rows are never deleted: an id,
-/// once minted, is never minted again — that is what stops a freed id from
-/// being claimed by whoever produces the same string next.
+/// A Principal's own record (ADR-0069 §1, ADR-0080). Rows are never
+/// deleted: a handle, once minted, is never minted again — that is what
+/// stops a freed handle from being claimed by whoever produces the same
+/// string next.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrincipalRecord {
-    /// The `Principal.subject` every binding, token and approver list stores.
+    /// The random, immutable id ([`is_principal_id`]): the key every binding,
+    /// token and approver list stores.
     pub id: String,
+    /// The readable, frozen handle (`github:alice`).
+    pub handle: String,
     pub display_name: Option<String>,
     pub created_at: i64,
     /// `None` until someone has actually signed in as this Principal.
     pub claimed_at: Option<i64>,
-    /// Set once this Principal has been folded into another.
+    /// The id of the Principal this one was folded into, once it has been.
     pub merged_into: Option<String>,
 }
 
 /// A Principal as a search returns it (ADR-0069 §3): enough for an admin to
-/// pick the right person in a typeahead — the id they will grant to, what the
-/// person is called, and whether anyone has signed in as them yet.
+/// pick the right person in a typeahead — the handle they will type, what
+/// the person is called, and whether anyone has signed in as them yet.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrincipalMatch {
     pub id: String,
+    pub handle: String,
     pub display_name: Option<String>,
     /// `false` = created by a forge import; nobody has signed in as it yet.
     pub claimed: bool,
     pub identities: Vec<ProviderIdentity>,
+}
+
+/// The prefix of every Principal id (ADR-0080).
+pub const PRINCIPAL_ID_PREFIX: &str = "p_";
+
+/// Is `s` shaped like a Principal id: `p_` and 32 lowercase hex characters
+/// (a UUID v4 without its dashes)? A handle never is ([`base_handle`]
+/// qualifies a legacy subject of this shape), so the shape alone tells the
+/// two forms apart.
+pub fn is_principal_id(s: &str) -> bool {
+    s.strip_prefix(PRINCIPAL_ID_PREFIX).is_some_and(|hex| {
+        hex.len() == 32 && hex.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+/// A Principal id from 16 random bytes (a UUID v4's): `p_` + 32 hex. The
+/// randomness comes from the caller — a CSPRNG is I/O and stays out of this
+/// crate.
+pub fn principal_id_from_bytes(bytes: [u8; 16]) -> String {
+    let mut out = String::with_capacity(34);
+    out.push_str(PRINCIPAL_ID_PREFIX);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
 }
 
 /// Escape `%`, `_` and `\` so a typed query is matched literally by `LIKE`.
@@ -543,14 +602,22 @@ pub enum LinkOutcome {
     /// `from`'s passkeys, deleted by the merge (ADR-0079 §3: a passkey is
     /// registered for one Principal and never moves).
     Merged {
+        /// The folded Principal's id.
         from: String,
+        /// Its handle, for the message the person reads.
+        #[serde(default)]
+        from_handle: String,
         removed_passkeys: Vec<String>,
     },
     /// `from` holds passkeys, and the link carried no proof from one of
     /// them ([`FoldedPasskey::Unproven`]): nothing changed. Proving the
     /// sign-in proves control of the identity, not the right to move
     /// `from`'s Scarab authority (ADR-0079 §1, §2).
-    NeedsFoldedPasskey { from: String },
+    NeedsFoldedPasskey {
+        from: String,
+        #[serde(default)]
+        from_handle: String,
+    },
 }
 
 /// What a link has proven about the Principal it may fold in
@@ -574,15 +641,17 @@ fn is_clean_handle(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '@' | '+' | '-'))
 }
 
-/// The id a NEW Principal for `identity` is minted under, before any suffix
-/// (ADR-0069 §2). `unqualified` is the legacy subject an `unqualified_ids`
-/// provider would always have produced (`sub` → `login` → `id`); it is kept
-/// bare so pre-upgrade bindings, tokens and approver entries keep resolving —
-/// unless it carries a `:` or `~`, which would let it sit in another
-/// provider's namespace or squat a suffix, in which case it is qualified like
-/// any other.
-pub fn base_principal_id(identity: &ProviderIdentity, unqualified: Option<&str>) -> String {
-    if let Some(legacy) = unqualified.filter(|l| !l.is_empty() && !l.contains([':', '~'])) {
+/// The handle a NEW Principal for `identity` is minted under, before any
+/// suffix (ADR-0069 §2). `unqualified` is the legacy subject an
+/// `unqualified_ids` provider would always have produced (`sub` → `login` →
+/// `id`); it is kept bare so pre-upgrade bindings, tokens and approver
+/// entries keep resolving — unless it carries a `:` or `~`, which would let
+/// it sit in another provider's namespace or squat a suffix, or has the shape
+/// of a Principal id (ADR-0080), in which case it is qualified like any other.
+pub fn base_handle(identity: &ProviderIdentity, unqualified: Option<&str>) -> String {
+    if let Some(legacy) = unqualified
+        .filter(|l| !l.is_empty() && !l.contains([':', '~']) && !is_principal_id(l))
+    {
         return legacy.to_string();
     }
     if is_clean_handle(&identity.handle) {
@@ -600,13 +669,27 @@ pub fn base_principal_id(identity: &ProviderIdentity, unqualified: Option<&str>)
 
 /// The `n`th candidate for `base`: the base itself, then `base~2`, `base~3`, …
 /// A suffix is taken whenever the base exists **at all** (claimed, unclaimed
-/// or merged) — never only when its holder looks like someone else.
-pub fn principal_id_candidate(base: &str, n: u32) -> String {
+/// or merged, in any case) — never only when its holder looks like someone
+/// else.
+pub fn handle_candidate(base: &str, n: u32) -> String {
     if n <= 1 {
         base.to_string()
     } else {
         format!("{base}~{n}")
     }
+}
+
+/// How a sign-in or an import may treat an unclaimed **legacy placeholder**
+/// (ADR-0080 §6): a Principal migration 0093 created for a pre-0052 binding
+/// subject that named nobody.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Placeholder {
+    /// Never adopt one: a handle a placeholder holds is taken, as any other.
+    Never,
+    /// Adopt the placeholder whose handle is exactly the base: only an
+    /// `unqualified_ids` provider, which produces the same bare strings the
+    /// pre-0052 server stored, passes this.
+    AdoptExact,
 }
 
 /// Durable store of Principals and their pinned provider identities
@@ -615,8 +698,11 @@ pub fn principal_id_candidate(base: &str, n: u32) -> String {
 pub trait IdentityStore: Send + Sync {
     /// Sign-in. Returns the id of the Principal pinned to `(provider,
     /// external_id)` — refreshing its handle/email and marking it claimed — or,
-    /// for an identity never seen, a **freshly minted** Principal under the
-    /// first free [`principal_id_candidate`] of `base_id`.
+    /// for an identity never seen, a **freshly minted** Principal (a new
+    /// random id) under the first free [`handle_candidate`] of
+    /// `base_handle`, compared ignoring case. Under
+    /// [`Placeholder::AdoptExact`], an unclaimed legacy placeholder whose
+    /// handle is exactly `base_handle` is adopted instead of minting `~2`.
     ///
     /// Never attaches a new identity to an existing Principal: that happens
     /// only through an explicit, proven link. A login whose handle matches
@@ -624,9 +710,10 @@ pub trait IdentityStore: Send + Sync {
     async fn sign_in(
         &self,
         identity: &ProviderIdentity,
-        base_id: &str,
+        base_handle: &str,
+        placeholder: Placeholder,
         now_ms: i64,
-    ) -> Result<String, IdentityError>;
+    ) -> Result<PrincipalRecord, IdentityError>;
     /// Forge import (ADR-0069 §5): the Principal pinned to `identity`, its
     /// handle refreshed — or, for an account nobody has signed in as yet, a
     /// freshly minted **unclaimed** one (`claimed_at` NULL) holding it. Never
@@ -635,9 +722,10 @@ pub trait IdentityStore: Send + Sync {
     async fn pin(
         &self,
         identity: &ProviderIdentity,
-        base_id: &str,
+        base_handle: &str,
+        placeholder: Placeholder,
         now_ms: i64,
-    ) -> Result<String, IdentityError>;
+    ) -> Result<PrincipalRecord, IdentityError>;
     /// The Principal pinned to `(provider, external_id)`, if any. A lookup
     /// only: it never mints, claims or refreshes. Merges are not followed;
     /// pass the id to [`resolve_principal`].
@@ -648,6 +736,23 @@ pub trait IdentityStore: Send + Sync {
     ) -> Result<Option<String>, IdentityError>;
     /// The Principal record for `id`, if one was ever minted.
     async fn principal(&self, id: &str) -> Result<Option<PrincipalRecord>, IdentityError>;
+    /// The Principals a typed `handle` may name: the one whose handle is
+    /// exactly `handle`, else every one whose handle equals it ignoring case
+    /// (more than one only for case-only duplicates minted before ADR-0080).
+    async fn by_handle(&self, handle: &str) -> Result<Vec<PrincipalRecord>, IdentityError>;
+    /// The Principals `refs` name, each by id or exact handle (ADR-0080 §3:
+    /// history holds either). A ref that names nobody is left out.
+    async fn lookup_many(&self, refs: &[String]) -> Result<Vec<PrincipalRecord>, IdentityError> {
+        let mut out = Vec::new();
+        for r in refs {
+            if let Some(p) = lookup_principal(self, r).await? {
+                if !out.iter().any(|o: &PrincipalRecord| o.id == p.id) {
+                    out.push(p);
+                }
+            }
+        }
+        Ok(out)
+    }
     /// Every identity pinned to Principal `id`, ordered by provider.
     async fn identities_of(&self, id: &str) -> Result<Vec<ProviderIdentity>, IdentityError>;
     /// Attach `identity` — just proven by an OAuth round-trip the signed-in
@@ -671,39 +776,99 @@ pub trait IdentityStore: Send + Sync {
     /// as. The caller drops the roles imported through it first
     /// ([`RbacStore::drop_imports`]).
     async fn unlink(&self, principal: &str, provider: &str) -> Result<(), IdentityError>;
-    /// Every id folded into `id`, transitively (ADR-0069 §6) — an owners entry
-    /// naming one of them still means this Principal.
-    async fn aliases_of(&self, id: &str) -> Result<Vec<String>, IdentityError>;
-    /// Unmerged Principals whose id or a handle starts with `query`, or whose
-    /// display name contains it (case-insensitive), ordered by id, at most
-    /// `limit`.
+    /// Every Principal folded into `id`, transitively (ADR-0069 §6) — an
+    /// owners entry naming one of their handles still means this Principal.
+    async fn aliases_of(&self, id: &str) -> Result<Vec<PrincipalRecord>, IdentityError>;
+    /// Unmerged Principals whose handle or a provider handle starts with
+    /// `query`, or whose display name contains it (case-insensitive), ordered
+    /// by handle, at most `limit`.
     async fn search(&self, query: &str, limit: usize)
         -> Result<Vec<PrincipalMatch>, IdentityError>;
 }
 
-/// What an admin-typed subject means (ADR-0069 §3): the live Principal it
-/// names, following merges to their target. `None` = no such Principal was
-/// ever minted, which is a refusal — a string nobody holds would be claimed by
-/// whoever next produced it at sign-in.
-pub async fn resolve_principal(
+/// The Principal `reference` names, by id or by exact handle (ADR-0080 §3):
+/// the one lookup every read of a stored person reference uses, because
+/// history written before ADR-0080 holds handles and history written after
+/// it holds ids. Merges are **not** followed — a reference keeps meaning the
+/// Principal that acted. `None`: the string names no Principal (a webhook
+/// Actor, `plugin:<name>`, `external:<step>`), and is shown as stored.
+pub async fn lookup_principal<S: IdentityStore + ?Sized>(
+    store: &S,
+    reference: &str,
+) -> Result<Option<PrincipalRecord>, IdentityError> {
+    if is_principal_id(reference) {
+        if let Some(p) = store.principal(reference).await? {
+            return Ok(Some(p));
+        }
+    }
+    Ok(store
+        .by_handle(reference)
+        .await?
+        .into_iter()
+        .find(|p| p.handle == reference))
+}
+
+/// What an admin-typed subject means (ADR-0069 §3, ADR-0080 §2): the live
+/// Principal it names — by id, else by exact handle, else by the one handle
+/// that matches ignoring case — following merges to their target. `None` =
+/// no such Principal was ever minted, which is a refusal: a string nobody
+/// holds would be claimed by whoever next produced it at sign-in. Two
+/// case-only duplicates matching is a `Conflict` naming both.
+pub async fn resolve_principal_record(
     store: &dyn IdentityStore,
     subject: &str,
-) -> Result<Option<String>, IdentityError> {
-    let mut id = subject.to_string();
+) -> Result<Option<PrincipalRecord>, IdentityError> {
+    let typed = subject.trim();
+    let first = if is_principal_id(typed) {
+        store.principal(typed).await?
+    } else {
+        None
+    };
+    let first = match first {
+        Some(p) => p,
+        None => {
+            let mut found = store.by_handle(typed).await?;
+            match found.len() {
+                0 => return Ok(None),
+                1 => found.remove(0),
+                _ => {
+                    found.sort_by(|a, b| a.handle.cmp(&b.handle));
+                    return Err(IdentityError::Conflict(format!(
+                        "`{typed}` matches more than one person when case is ignored ({}); \
+                         type the handle exactly",
+                        found
+                            .iter()
+                            .map(|p| format!("`{}`", p.handle))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )));
+                }
+            }
+        }
+    };
+    let mut p = first;
     // A merge target can itself be merged later; the chain is short, and a
     // bound keeps a corrupt cycle from spinning.
     for _ in 0..16 {
-        match store.principal(&id).await? {
-            None => return Ok(None),
-            Some(p) => match p.merged_into {
-                Some(next) => id = next,
-                None => return Ok(Some(id)),
+        match p.merged_into.clone() {
+            None => return Ok(Some(p)),
+            Some(next) => match store.principal(&next).await? {
+                Some(n) => p = n,
+                None => return Ok(None),
             },
         }
     }
     Err(IdentityError::Issuance(format!(
         "principal `{subject}` has a merge chain that does not end"
     )))
+}
+
+/// [`resolve_principal_record`]'s id: what a write stores.
+pub async fn resolve_principal(
+    store: &dyn IdentityStore,
+    subject: &str,
+) -> Result<Option<String>, IdentityError> {
+    Ok(resolve_principal_record(store, subject).await?.map(|p| p.id))
 }
 
 /// Claims to embed in a minted per-run OIDC JWT for keyless cloud federation
@@ -849,6 +1014,7 @@ mod tests {
     fn principal_can_checks_any_held_role() {
         let p = Principal {
             subject: "alice".into(),
+            handle: String::new(),
             display_name: None,
             roles: vec![Role::Viewer, Role::Member],
         };
@@ -870,6 +1036,7 @@ mod tests {
             id: "sid".into(),
             principal: Principal {
                 subject: "alice".into(),
+                handle: String::new(),
                 display_name: None,
                 roles: vec![Role::Owner],
             },
@@ -892,6 +1059,7 @@ mod tests {
             id: "the-session-id".into(),
             principal: Principal {
                 subject: "alice".into(),
+                handle: String::new(),
                 display_name: None,
                 roles: vec![],
             },
@@ -920,6 +1088,7 @@ mod tests {
             id: "sid".into(),
             principal: Principal {
                 subject: "alice".into(),
+                handle: String::new(),
                 display_name: None,
                 roles: vec![],
             },
@@ -970,40 +1139,63 @@ mod tests {
         // Qualified: the provider prefix is what keeps Forgejo-alice and
         // GitHub-alice apart.
         assert_eq!(
-            base_principal_id(&ident("github", "1", "alice"), None),
+            base_handle(&ident("github", "1", "alice"), None),
             "github:alice"
         );
         assert_eq!(
-            base_principal_id(&ident("forgejo", "1", "alice"), None),
+            base_handle(&ident("forgejo", "1", "alice"), None),
             "forgejo:alice"
         );
         // A handle that could leave its namespace or forge a suffix falls back
         // to the provider's opaque id.
         assert_eq!(
-            base_principal_id(&ident("okta", "00u8", "ada~2"), None),
+            base_handle(&ident("okta", "00u8", "ada~2"), None),
             "okta:00u8"
         );
         assert_eq!(
-            base_principal_id(&ident("okta", "00u8", "x:y"), None),
+            base_handle(&ident("okta", "00u8", "x:y"), None),
             "okta:00u8"
         );
         assert_eq!(
-            base_principal_id(&ident("okta", "a~b", ""), None),
+            base_handle(&ident("okta", "a~b", ""), None),
             "okta:a%7Eb"
         );
         // Unqualified (the legacy provider): the bare pre-upgrade subject, so
         // existing bindings keep resolving...
         assert_eq!(
-            base_principal_id(&ident("default", "1", "alice"), Some("alice")),
+            base_handle(&ident("default", "1", "alice"), Some("alice")),
             "alice"
         );
         // ...unless it would sit in a qualified namespace.
         assert_eq!(
-            base_principal_id(&ident("default", "1", "alice"), Some("github:alice")),
+            base_handle(&ident("default", "1", "alice"), Some("github:alice")),
             "default:alice"
         );
-        assert_eq!(principal_id_candidate("github:alice", 1), "github:alice");
-        assert_eq!(principal_id_candidate("github:alice", 2), "github:alice~2");
+        // ...or would look like a Principal id (ADR-0080).
+        let id_shaped = "p_0123456789abcdef0123456789abcdef";
+        assert!(is_principal_id(id_shaped));
+        assert_eq!(
+            base_handle(&ident("default", "7", "alice"), Some(id_shaped)),
+            "default:alice"
+        );
+        assert_eq!(handle_candidate("github:alice", 1), "github:alice");
+        assert_eq!(handle_candidate("github:alice", 2), "github:alice~2");
+    }
+
+    #[test]
+    fn a_principal_id_has_one_shape() {
+        let id = principal_id_from_bytes([0xab; 16]);
+        assert_eq!(id, format!("p_{}", "ab".repeat(16)));
+        assert!(is_principal_id(&id));
+        for not in [
+            "github:alice",
+            "p_",
+            "p_ABABABABABABABABABABABABABABABAB",
+            "p_abababababababababababababababa",
+            "q_abababababababababababababababab",
+        ] {
+            assert!(!is_principal_id(not), "{not}");
+        }
     }
 
     #[test]

@@ -1666,7 +1666,7 @@ pub(crate) async fn policy_test(
         }
         project_allowed(pipeline.project.clone()).await?;
         let (input, ctx, gates) =
-            pipeline_input(&st, &org, &caller.principal.subject, pipeline).await?;
+            pipeline_input(&st, &org, caller.principal.handle(), pipeline).await?;
         (
             input,
             Checkpoint::RunCreate,

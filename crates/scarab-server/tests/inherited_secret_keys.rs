@@ -33,6 +33,7 @@ const REPO_URL_VALUE: &str = "repo-url-s3cr3t";
 fn scoped(subject: &str) -> Principal {
     Principal {
         subject: subject.into(),
+        handle: String::new(),
         display_name: None,
         roles: vec![],
     }

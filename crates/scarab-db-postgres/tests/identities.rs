@@ -220,6 +220,7 @@ async fn link_merges_a_claimed_single_identity_principal_with_its_tokens() {
             id: "stray-session".into(),
             principal: Principal {
                 subject: stray.clone(),
+                handle: String::new(),
                 display_name: None,
                 roles: vec![],
             },

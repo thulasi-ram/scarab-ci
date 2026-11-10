@@ -26,6 +26,7 @@ const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 fn scoped_principal(subject: &str) -> Principal {
     Principal {
         subject: subject.into(),
+        handle: String::new(),
         display_name: None,
         roles: vec![],
     }
@@ -50,6 +51,7 @@ fn harness() -> Harness {
                 "root-code",
                 Principal {
                     subject: "root".into(),
+                    handle: String::new(),
                     display_name: None,
                     roles: vec![Role::Owner], // global bootstrap owner
                 },

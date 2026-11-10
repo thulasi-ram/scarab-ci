@@ -27,6 +27,7 @@ use scarab_testkit::{
 fn scoped_principal(subject: &str) -> Principal {
     Principal {
         subject: subject.into(),
+        handle: String::new(),
         display_name: None,
         roles: vec![],
     }
@@ -88,6 +89,7 @@ fn harness_with(forge_url: Option<&str>) -> Harness {
                 "root-code",
                 Principal {
                     subject: "root".into(),
+                    handle: String::new(),
                     display_name: None,
                     roles: vec![Role::Owner], // global bootstrap owner
                 },

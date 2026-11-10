@@ -94,6 +94,7 @@ async fn app(
         "root-code",
         Principal {
             subject: "root".into(),
+            handle: String::new(),
             display_name: None,
             roles: vec![Role::Owner],
         },

@@ -4599,6 +4599,20 @@ fn api_token_from_row(r: &sqlx::postgres::PgRow) -> Option<scarab_identity::ApiT
 /// needs a handful; this bound only stops a pathological loop.
 const MAX_PRINCIPAL_SUFFIX: u32 = 10_000;
 
+/// The columns [`principal_from_row`] reads.
+const PRINCIPAL_COLS: &str = "id, handle, display_name, created_at, claimed_at, merged_into";
+
+fn principal_from_row(r: &sqlx::postgres::PgRow) -> scarab_identity::PrincipalRecord {
+    scarab_identity::PrincipalRecord {
+        id: r.get("id"),
+        handle: r.get("handle"),
+        display_name: r.get("display_name"),
+        created_at: r.get("created_at"),
+        claimed_at: r.get("claimed_at"),
+        merged_into: r.get("merged_into"),
+    }
+}
+
 /// Fold Principal `from` into `into` inside `tx` (ADR-0069 §6). Everything
 /// that NAMES `from` and would otherwise strand its authority moves:
 ///
@@ -4743,17 +4757,19 @@ async fn merge_principal(
 }
 
 impl PostgresDb {
-    /// The identity's Principal, or a freshly minted one under the first free
-    /// `~N` of `base_id` (ADR-0069). `claim` = a sign-in: refresh the contact
-    /// details and stamp `claimed_at`. Otherwise an import: refresh the handle
-    /// only, and mint unclaimed.
+    /// The identity's Principal, or a freshly minted one (a new random id)
+    /// under the first free `~N` of `base_handle`, compared ignoring case
+    /// (ADR-0069 §2, ADR-0080 §1). `claim` = a sign-in: refresh the contact
+    /// details and stamp `claimed_at`. Otherwise an import: refresh the
+    /// handle only, and mint unclaimed.
     async fn pin_or_mint(
         &self,
         identity: &scarab_identity::ProviderIdentity,
-        base_id: &str,
+        base_handle: &str,
+        placeholder: scarab_identity::Placeholder,
         now_ms: i64,
         claim: bool,
-    ) -> Result<String, scarab_identity::IdentityError> {
+    ) -> Result<scarab_identity::PrincipalRecord, scarab_identity::IdentityError> {
         // Two passes at most: if a racing sign-in pins the same identity
         // between our lookup and our insert, our mint rolls back and the
         // second lookup finds theirs. Converging on ONE Principal is the point.
@@ -4779,64 +4795,89 @@ impl PostgresDb {
                     .execute(self.pool())
                     .await
                     .map_err(identity_err)?;
-                    return Ok(id);
+                } else {
+                    sqlx::query(
+                        "UPDATE principal_identities
+                         SET handle = $3, email = $4, email_verified = $5, last_login_at = $6
+                         WHERE provider = $1 AND external_id = $2",
+                    )
+                    .bind(&identity.provider)
+                    .bind(&identity.external_id)
+                    .bind(&identity.handle)
+                    .bind(&identity.email)
+                    .bind(identity.email_verified)
+                    .bind(now_ms)
+                    .execute(self.pool())
+                    .await
+                    .map_err(identity_err)?;
+                    sqlx::query(
+                        "UPDATE principals
+                         SET display_name = COALESCE($2, display_name),
+                             claimed_at = COALESCE(claimed_at, $3)
+                         WHERE id = $1",
+                    )
+                    .bind(&id)
+                    .bind(&identity.display_name)
+                    .bind(now_ms)
+                    .execute(self.pool())
+                    .await
+                    .map_err(identity_err)?;
                 }
-                sqlx::query(
-                    "UPDATE principal_identities
-                     SET handle = $3, email = $4, email_verified = $5, last_login_at = $6
-                     WHERE provider = $1 AND external_id = $2",
-                )
-                .bind(&identity.provider)
-                .bind(&identity.external_id)
-                .bind(&identity.handle)
-                .bind(&identity.email)
-                .bind(identity.email_verified)
-                .bind(now_ms)
-                .execute(self.pool())
-                .await
-                .map_err(identity_err)?;
-                sqlx::query(
-                    "UPDATE principals
-                     SET display_name = COALESCE($2, display_name),
-                         claimed_at = COALESCE(claimed_at, $3)
-                     WHERE id = $1",
-                )
-                .bind(&id)
-                .bind(&identity.display_name)
-                .bind(now_ms)
-                .execute(self.pool())
-                .await
-                .map_err(identity_err)?;
-                return Ok(id);
+                return self.principal_required(&id).await;
             }
 
-            // Never seen: mint. The PK is the existence check — insert and,
-            // on conflict, take the next suffix. No check-then-act.
             let mut tx = self.pool().begin().await.map_err(identity_err)?;
-            let mut minted = None;
-            for n in 1..=MAX_PRINCIPAL_SUFFIX {
-                let id = scarab_identity::principal_id_candidate(base_id, n);
-                let inserted = sqlx::query(
-                    "INSERT INTO principals (id, display_name, created_at, claimed_at)
-                     VALUES ($1, $2, $3, $4)
-                     ON CONFLICT (id) DO NOTHING",
+            // A legacy placeholder (migration 0093) whose handle is exactly
+            // this one: adopted, never minted around, so a pre-0052 grant
+            // reaches the person the pre-0052 server would have given it to.
+            let mut minted: Option<String> = None;
+            if placeholder == scarab_identity::Placeholder::AdoptExact {
+                minted = sqlx::query_scalar(
+                    "UPDATE principals
+                     SET legacy_placeholder = FALSE,
+                         display_name = COALESCE($2, display_name),
+                         claimed_at = $3
+                     WHERE id = (SELECT id FROM principals
+                                 WHERE handle = $1 AND legacy_placeholder
+                                   AND claimed_at IS NULL AND merged_into IS NULL
+                                 FOR UPDATE)
+                     RETURNING id",
                 )
-                .bind(&id)
+                .bind(base_handle)
                 .bind(&identity.display_name)
-                .bind(now_ms)
                 .bind(claim.then_some(now_ms))
-                .execute(&mut *tx)
+                .fetch_optional(&mut *tx)
                 .await
-                .map_err(identity_err)?
-                .rows_affected();
-                if inserted == 1 {
-                    minted = Some(id);
-                    break;
+                .map_err(identity_err)?;
+            }
+            // Never seen: mint. The unique indexes (the handle, and the
+            // handle ignoring case) are the existence check — insert and, on
+            // conflict, take the next suffix. No check-then-act.
+            if minted.is_none() {
+                for n in 1..=MAX_PRINCIPAL_SUFFIX {
+                    let handle = scarab_identity::handle_candidate(base_handle, n);
+                    let id: Option<String> = sqlx::query_scalar(
+                        "INSERT INTO principals (handle, display_name, created_at, claimed_at)
+                         VALUES ($1, $2, $3, $4)
+                         ON CONFLICT DO NOTHING
+                         RETURNING id",
+                    )
+                    .bind(&handle)
+                    .bind(&identity.display_name)
+                    .bind(now_ms)
+                    .bind(claim.then_some(now_ms))
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(identity_err)?;
+                    if id.is_some() {
+                        minted = id;
+                        break;
+                    }
                 }
             }
             let id = minted.ok_or_else(|| {
                 scarab_identity::IdentityError::Issuance(format!(
-                    "no free principal id for `{base_id}`"
+                    "no free principal handle for `{base_handle}`"
                 ))
             })?;
             let pinned_now = sqlx::query(
@@ -4860,7 +4901,7 @@ impl PostgresDb {
             .rows_affected();
             if pinned_now == 1 {
                 tx.commit().await.map_err(identity_err)?;
-                return Ok(id);
+                return self.principal_required(&id).await;
             }
             // Lost the race: drop our unseen mint and resolve theirs.
             tx.rollback().await.map_err(identity_err)?;
@@ -4869,6 +4910,50 @@ impl PostgresDb {
             "identity {}:{} could not be pinned",
             identity.provider, identity.external_id
         )))
+    }
+
+    async fn principal_required(
+        &self,
+        id: &str,
+    ) -> Result<scarab_identity::PrincipalRecord, scarab_identity::IdentityError> {
+        scarab_identity::IdentityStore::principal(self, id)
+            .await?
+            .ok_or_else(|| {
+                scarab_identity::IdentityError::Issuance(format!("principal `{id}` vanished"))
+            })
+    }
+
+    /// The handle of Principal `id`, or `id` itself when it names nobody.
+    async fn handle_of(&self, tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, id: &str) -> String {
+        sqlx::query_scalar::<_, String>("SELECT handle FROM principals WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&mut **tx)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| id.to_string())
+    }
+
+    /// The handles that equal another ignoring case (ADR-0080 §6), grouped:
+    /// each inner list is one group, oldest first. Logged at boot so an
+    /// operator can see them; nothing merges them automatically.
+    pub async fn case_duplicate_handles(
+        &self,
+    ) -> Result<Vec<Vec<String>>, scarab_identity::IdentityError> {
+        let rows = sqlx::query(
+            "SELECT array_agg(handle ORDER BY created_at, handle) AS handles
+             FROM principals
+             GROUP BY lower(handle)
+             HAVING count(*) > 1
+             ORDER BY lower(handle)",
+        )
+        .fetch_all(self.pool())
+        .await
+        .map_err(identity_err)?;
+        Ok(rows
+            .iter()
+            .map(|r| r.get::<Vec<String>, _>("handles"))
+            .collect())
     }
 }
 
@@ -4893,19 +4978,23 @@ impl scarab_identity::IdentityStore for PostgresDb {
     async fn sign_in(
         &self,
         identity: &scarab_identity::ProviderIdentity,
-        base_id: &str,
+        base_handle: &str,
+        placeholder: scarab_identity::Placeholder,
         now_ms: i64,
-    ) -> Result<String, scarab_identity::IdentityError> {
-        self.pin_or_mint(identity, base_id, now_ms, true).await
+    ) -> Result<scarab_identity::PrincipalRecord, scarab_identity::IdentityError> {
+        self.pin_or_mint(identity, base_handle, placeholder, now_ms, true)
+            .await
     }
 
     async fn pin(
         &self,
         identity: &scarab_identity::ProviderIdentity,
-        base_id: &str,
+        base_handle: &str,
+        placeholder: scarab_identity::Placeholder,
         now_ms: i64,
-    ) -> Result<String, scarab_identity::IdentityError> {
-        self.pin_or_mint(identity, base_id, now_ms, false).await
+    ) -> Result<scarab_identity::PrincipalRecord, scarab_identity::IdentityError> {
+        self.pin_or_mint(identity, base_handle, placeholder, now_ms, false)
+            .await
     }
 
     async fn link(
@@ -4973,11 +5062,12 @@ impl scarab_identity::IdentityStore for PostgresDb {
                 .fetch_one(&mut *tx)
                 .await
                 .map_err(identity_err)?;
+                let from_handle = self.handle_of(&mut tx, &from).await;
                 if held > 1 {
                     return Err(conflict(format!(
-                        "that {} account belongs to `{from}`, which also signs in another \
-                         way — proving this one account does not prove you are `{from}`, \
-                         so merging the two needs an admin",
+                        "that {} account belongs to `{from_handle}`, which also signs in \
+                         another way — proving this one account does not prove you are \
+                         `{from_handle}`, so merging the two needs an admin",
                         identity.provider
                     )));
                 }
@@ -4999,7 +5089,10 @@ impl scarab_identity::IdentityStore for PostgresDb {
                 };
                 if !held_passkeys.is_empty() && !proven {
                     tx.rollback().await.map_err(identity_err)?;
-                    return Ok(scarab_identity::LinkOutcome::NeedsFoldedPasskey { from });
+                    return Ok(scarab_identity::LinkOutcome::NeedsFoldedPasskey {
+                        from,
+                        from_handle,
+                    });
                 }
                 let removed_passkeys = merge_principal(&mut tx, &from, principal).await?;
                 // The DELETE removed a passkey the check did not see (enrolled
@@ -5010,7 +5103,10 @@ impl scarab_identity::IdentityStore for PostgresDb {
                     .any(|id| !held_passkeys.contains(id))
                 {
                     tx.rollback().await.map_err(identity_err)?;
-                    return Ok(scarab_identity::LinkOutcome::NeedsFoldedPasskey { from });
+                    return Ok(scarab_identity::LinkOutcome::NeedsFoldedPasskey {
+                        from,
+                        from_handle,
+                    });
                 }
                 sqlx::query(
                     "UPDATE principal_identities
@@ -5030,6 +5126,7 @@ impl scarab_identity::IdentityStore for PostgresDb {
                 .map_err(identity_err)?;
                 scarab_identity::LinkOutcome::Merged {
                     from,
+                    from_handle,
                     removed_passkeys,
                 }
             }
@@ -5071,40 +5168,80 @@ impl scarab_identity::IdentityStore for PostgresDb {
         Ok(())
     }
 
-    async fn aliases_of(&self, id: &str) -> Result<Vec<String>, scarab_identity::IdentityError> {
-        sqlx::query_scalar(
+    async fn aliases_of(
+        &self,
+        id: &str,
+    ) -> Result<Vec<scarab_identity::PrincipalRecord>, scarab_identity::IdentityError> {
+        let rows = sqlx::query(&format!(
             "WITH RECURSIVE folded(id) AS (
                  SELECT id FROM principals WHERE merged_into = $1
                  UNION
                  SELECT p.id FROM principals p JOIN folded f ON p.merged_into = f.id
              )
-             SELECT id FROM folded ORDER BY id",
-        )
+             SELECT {PRINCIPAL_COLS} FROM principals WHERE id IN (SELECT id FROM folded)
+             ORDER BY handle"
+        ))
         .bind(id)
         .fetch_all(self.pool())
         .await
-        .map_err(identity_err)
+        .map_err(identity_err)?;
+        Ok(rows.iter().map(principal_from_row).collect())
     }
 
     async fn principal(
         &self,
         id: &str,
     ) -> Result<Option<scarab_identity::PrincipalRecord>, scarab_identity::IdentityError> {
-        let row = sqlx::query(
-            "SELECT id, display_name, created_at, claimed_at, merged_into
-             FROM principals WHERE id = $1",
-        )
+        let row = sqlx::query(&format!(
+            "SELECT {PRINCIPAL_COLS} FROM principals WHERE id = $1"
+        ))
         .bind(id)
         .fetch_optional(self.pool())
         .await
         .map_err(identity_err)?;
-        Ok(row.map(|r| scarab_identity::PrincipalRecord {
-            id: r.get("id"),
-            display_name: r.get("display_name"),
-            created_at: r.get("created_at"),
-            claimed_at: r.get("claimed_at"),
-            merged_into: r.get("merged_into"),
-        }))
+        Ok(row.as_ref().map(principal_from_row))
+    }
+
+    async fn by_handle(
+        &self,
+        handle: &str,
+    ) -> Result<Vec<scarab_identity::PrincipalRecord>, scarab_identity::IdentityError> {
+        let exact = sqlx::query(&format!(
+            "SELECT {PRINCIPAL_COLS} FROM principals WHERE handle = $1"
+        ))
+        .bind(handle)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(identity_err)?;
+        if let Some(r) = exact {
+            return Ok(vec![principal_from_row(&r)]);
+        }
+        let rows = sqlx::query(&format!(
+            "SELECT {PRINCIPAL_COLS} FROM principals WHERE lower(handle) = lower($1)
+             ORDER BY handle"
+        ))
+        .bind(handle)
+        .fetch_all(self.pool())
+        .await
+        .map_err(identity_err)?;
+        Ok(rows.iter().map(principal_from_row).collect())
+    }
+
+    async fn lookup_many(
+        &self,
+        refs: &[String],
+    ) -> Result<Vec<scarab_identity::PrincipalRecord>, scarab_identity::IdentityError> {
+        if refs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(&format!(
+            "SELECT {PRINCIPAL_COLS} FROM principals WHERE id = ANY($1) OR handle = ANY($1)"
+        ))
+        .bind(refs)
+        .fetch_all(self.pool())
+        .await
+        .map_err(identity_err)?;
+        Ok(rows.iter().map(principal_from_row).collect())
     }
 
     async fn identities_of(
@@ -5142,13 +5279,13 @@ impl scarab_identity::IdentityStore for PostgresDb {
     ) -> Result<Vec<scarab_identity::PrincipalMatch>, scarab_identity::IdentityError> {
         let q = scarab_identity::like_literal(query);
         let rows = sqlx::query(
-            "SELECT p.id, p.display_name, p.claimed_at FROM principals p
+            "SELECT p.id, p.handle, p.display_name, p.claimed_at FROM principals p
              WHERE p.merged_into IS NULL
-               AND (p.id ILIKE $1 || '%'
+               AND (p.handle ILIKE $1 || '%'
                     OR p.display_name ILIKE '%' || $1 || '%'
                     OR EXISTS (SELECT 1 FROM principal_identities i
                                WHERE i.principal_id = p.id AND i.handle ILIKE $1 || '%'))
-             ORDER BY p.id
+             ORDER BY p.handle
              LIMIT $2",
         )
         .bind(&q)
@@ -5161,6 +5298,7 @@ impl scarab_identity::IdentityStore for PostgresDb {
             let id: String = r.get("id");
             out.push(scarab_identity::PrincipalMatch {
                 identities: self.identities_of(&id).await?,
+                handle: r.get("handle"),
                 display_name: r.get("display_name"),
                 claimed: r.get::<Option<i64>, _>("claimed_at").is_some(),
                 id,

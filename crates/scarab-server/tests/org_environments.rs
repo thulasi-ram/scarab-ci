@@ -265,6 +265,7 @@ async fn writes_need_org_administer_and_reads_need_org_read() {
 
     let scoped = |subject: &str| Principal {
         subject: subject.into(),
+        handle: String::new(),
         display_name: None,
         roles: vec![],
     };

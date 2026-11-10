@@ -144,7 +144,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                      step-up confirmation(s); recorded as passkey.break_glass_reset \
                      (host {}, user {}). Their next passkey needs a fresh browser login.",
                     done.removed,
-                    done.subject,
+                    done.handle,
                     done.windows_revoked,
                     operator.host,
                     operator.os_user
@@ -827,7 +827,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .with_libraries(pg.clone())
                     // ADR-0075 §3: the `step.admit` decision at each launch,
                     // recorded once per Attempt.
-                    .with_policies(pg.clone());
+                    .with_policies(pg.clone())
+                    // ADR-0080 §3: a recorded approver set compares as ids.
+                    .with_identities(pg.clone());
             // Per-attempt OIDC federation tokens (ADR-0015), tmpfs-delivered.
             if let (Some(issuer), Some(oidc_cfg)) = (oidc_issuer.clone(), &config.oidc) {
                 secret_exec = secret_exec.with_oidc(
@@ -851,7 +853,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .with_libraries(db.clone(), pg.clone())
                     // So is a deploy Step whose Environment no longer admits
                     // its Project (ADR-0071 §2).
-                    .with_environment_governance(db.clone(), pg.clone()),
+                    .with_environment_governance(db.clone(), pg.clone())
+                    .with_identities(pg.clone()),
             );
             // Local host processes finish instantly, so re-poll them quickly; k8s
             // Pods take time, so the default window avoids thundering re-claims.

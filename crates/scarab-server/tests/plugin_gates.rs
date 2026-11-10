@@ -553,6 +553,7 @@ async fn a_plugin_cannot_release_a_manual_gate_another_installation_s_or_another
         "ada-code",
         Principal {
             subject: "ada".into(),
+            handle: String::new(),
             display_name: None,
             roles: vec![],
         },

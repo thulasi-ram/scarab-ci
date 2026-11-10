@@ -320,11 +320,11 @@ impl OAuthAuthenticator {
         self.cfg.forge_url.as_deref()
     }
 
-    /// The id a new Principal for a forge account would be minted under —
+    /// The handle a new Principal for a forge account would be minted under —
     /// for a forge import, which knows only `(id, login)`. On a forge the
     /// legacy subject IS the login (no OIDC `sub`).
-    pub fn base_id_for_forge_account(&self, identity: &ProviderIdentity) -> String {
-        self.base_id(identity, &identity.handle)
+    pub fn base_handle_for_forge_account(&self, identity: &ProviderIdentity) -> String {
+        self.base_handle(identity, &identity.handle)
     }
 
     /// Pin every sign-in through `store` (ADR-0069): the Principal is the one
@@ -546,46 +546,67 @@ impl OAuthAuthenticator {
         Ok((identity, legacy))
     }
 
-    /// The id a new Principal for `identity` is minted under (ADR-0069 §2).
-    fn base_id(&self, identity: &ProviderIdentity, legacy: &str) -> String {
-        scarab_identity::base_principal_id(identity, self.cfg.unqualified_ids.then_some(legacy))
+    /// The handle a new Principal for `identity` is minted under (ADR-0069 §2).
+    fn base_handle(&self, identity: &ProviderIdentity, legacy: &str) -> String {
+        scarab_identity::base_handle(identity, self.cfg.unqualified_ids.then_some(legacy))
+    }
+
+    /// Whether this provider's sign-ins may adopt a legacy placeholder
+    /// (ADR-0080 §6): only an `unqualified_ids` provider produces the bare
+    /// strings the pre-0052 server stored.
+    pub fn placeholder_rule(&self) -> scarab_identity::Placeholder {
+        if self.cfg.unqualified_ids {
+            scarab_identity::Placeholder::AdoptExact
+        } else {
+            scarab_identity::Placeholder::Never
+        }
     }
 
     /// Map provider claims to a [`Principal`] **without** an identity store:
-    /// the subject is the would-be minted id, unpinned. Roles are the C1
+    /// the subject is the would-be minted handle, unpinned. Roles are the C1
     /// bootstrap: configured owners get `Owner`, everyone else `Viewer`.
     #[cfg(test)]
     fn principal_from(&self, claims: &serde_json::Value) -> Result<Principal, IdentityError> {
         let (identity, legacy) = self.identity_from(claims, false)?;
-        let subject = self.base_id(&identity, &legacy);
-        Ok(self.principal_with(subject, &identity, &[]))
+        let handle = self.base_handle(&identity, &legacy);
+        Ok(self.principal_with(handle.clone(), handle, &identity, &[]))
     }
 
     /// Map provider claims to a [`Principal`], pinned through the identity
-    /// store when one is wired (ADR-0069).
+    /// store when one is wired (ADR-0069). Its `subject` is the Principal's
+    /// id and `handle` its handle (ADR-0080).
     async fn principal_for(
         &self,
         claims: &serde_json::Value,
         from_id_token: bool,
     ) -> Result<Principal, IdentityError> {
         let (identity, legacy) = self.identity_from(claims, from_id_token)?;
-        let base = self.base_id(&identity, &legacy);
-        let (subject, aliases) = match &self.identities {
+        let base = self.base_handle(&identity, &legacy);
+        let (id, handle, aliases) = match &self.identities {
             Some(store) => {
-                let id = store.sign_in(&identity, &base, now_ms()).await?;
-                let aliases = store.aliases_of(&id).await?;
-                (id, aliases)
+                let p = store
+                    .sign_in(&identity, &base, self.placeholder_rule(), now_ms())
+                    .await?;
+                let aliases: Vec<String> = store
+                    .aliases_of(&p.id)
+                    .await?
+                    .into_iter()
+                    .flat_map(|a| [a.id, a.handle])
+                    .collect();
+                (p.id, p.handle, aliases)
             }
-            None => (base, Vec::new()),
+            None => (base.clone(), base, Vec::new()),
         };
-        Ok(self.principal_with(subject, &identity, &aliases))
+        Ok(self.principal_with(id, handle, &identity, &aliases))
     }
 
-    /// `aliases`: ids folded into `subject` by a merge (ADR-0069 §6) — an
-    /// owners entry naming one of them still means this person.
+    /// `aliases`: the ids and handles of Principals folded into this one by a
+    /// merge (ADR-0069 §6) — an owners entry naming one of them still means
+    /// this person.
     fn principal_with(
         &self,
-        subject: String,
+        id: String,
+        handle: String,
         identity: &ProviderIdentity,
         aliases: &[String],
     ) -> Principal {
@@ -593,16 +614,18 @@ impl OAuthAuthenticator {
             .email
             .as_deref()
             .filter(|_| identity.email_verified);
-        let role = if std::iter::once(&subject)
-            .chain(aliases)
-            .any(|id| self.is_owner(id, verified))
-        {
+        let names: Vec<&str> = [id.as_str(), handle.as_str()]
+            .into_iter()
+            .chain(aliases.iter().map(String::as_str))
+            .collect();
+        let role = if self.is_owner(&names, verified) {
             Role::Owner
         } else {
             Role::Viewer
         };
         Principal {
-            subject,
+            subject: id,
+            handle,
             display_name: identity.display_name.clone(),
             roles: vec![role],
         }
@@ -631,11 +654,15 @@ impl OAuthAuthenticator {
     /// will actually do" the same answer: an email-matched owner is told at
     /// mint that they need a binding, rather than being handed a token that
     /// silently holds nothing.
-    pub fn bootstrap_owner_role(&self, subject: &str) -> Option<Role> {
+    ///
+    /// `names`: the Principal's id and handle, and those of the Principals
+    /// merged into it — an owners entry is typed as a handle, and may be an
+    /// id (ADR-0080 §4).
+    pub fn bootstrap_owner_role(&self, names: &[&str]) -> Option<Role> {
         self.cfg
             .owners
             .iter()
-            .any(|o| o == subject)
+            .any(|o| names.contains(&o.as_str()))
             .then_some(Role::Owner)
     }
 
@@ -650,9 +677,12 @@ impl OAuthAuthenticator {
     ///   mint a global Owner;
     /// - a bare email matches any provider, which boot permits only when there
     ///   is exactly one.
-    fn is_owner(&self, subject: &str, verified_email: Option<&str>) -> bool {
+    ///
+    /// `names`: the Principal's id and handle (and its aliases'); an entry
+    /// matches either form (ADR-0080 §4).
+    fn is_owner(&self, names: &[&str], verified_email: Option<&str>) -> bool {
         self.cfg.owners.iter().any(|o| {
-            o == subject
+            names.contains(&o.as_str())
                 || verified_email.is_some_and(|email| {
                     let (provider, addr) = owner_entry_email(o);
                     provider.is_none_or(|p| p == self.cfg.provider_id)
@@ -663,8 +693,8 @@ impl OAuthAuthenticator {
 
     /// [`is_owner`](Self::is_owner), for the step-up reset's "is the target
     /// an install-wide owner?" (ADR-0073 §10) — the one owners matcher.
-    pub(crate) fn matches_owner(&self, subject: &str, verified_email: Option<&str>) -> bool {
-        self.is_owner(subject, verified_email)
+    pub(crate) fn matches_owner(&self, names: &[&str], verified_email: Option<&str>) -> bool {
+        self.is_owner(names, verified_email)
     }
 
     /// Verify an `id_token`: RS256 signature against the issuer's JWKS, plus
