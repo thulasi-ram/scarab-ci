@@ -41,9 +41,12 @@ RUN cargo chef cook --release --locked -p scarab-server \
         --recipe-path recipe.json
 
 # Manifests + all workspace crates. `ui/` is npm (not a cargo member) and is
-# excluded by .dockerignore, so it never enters the build context.
+# excluded by .dockerignore, so it never enters the build context. `libs/` is
+# not a crate, but `scarab-server` embeds `libs/clone.yaml` with
+# `include_str!` (`src/test_support.rs`), so the build fails without it.
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY libs ./libs
 
 # Build only the server binary in release mode, on top of the cooked
 # dependencies.

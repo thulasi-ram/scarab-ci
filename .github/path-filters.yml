@@ -87,6 +87,8 @@ image_server:
   - *cargo
   - *ui_src
   - "openapi.json"
+  # scarab-server embeds it with include_str! (src/test_support.rs).
+  - "libs/clone.yaml"
   - "docker/server/Dockerfile"
   - ".dockerignore"
   - ".github/workflows/image.yml"
