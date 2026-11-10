@@ -1207,6 +1207,47 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/orgs/{org}/plugins/{name}/upgrade": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Upgrade a plugin installation to a reviewed manifest and image (ADR-0072 §10)
+         * @description Same-or-narrower (nothing added, image of the same repository) needs no
+         *     step-up; wider is confirmed like an install (ADR-0072 §10). The server
+         *     decides which from the installed manifest and the one it reads here.
+         *     409 when the installed manifest is no longer `expected_current_sha256`,
+         *     and when the source no longer reads as `manifest_sha256`.
+         */
+        post: operations["upgrade_plugin"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/plugins/{name}/upgrade-fetch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Fetch a plugin manifest to review an upgrade against the installed one (ADR-0072 §10) */
+        post: operations["fetch_plugin_upgrade"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/orgs/{org}/policies": {
         parameters: {
             query?: never;
@@ -3435,6 +3476,36 @@ export interface components {
              */
             source: string;
         };
+        /**
+         * @description `POST /v1/orgs/{org}/plugins/{name}/upgrade-fetch`: which manifest to
+         *     read for the upgrade. Either `source`, or `commit` to read the file the
+         *     installation's recorded source names at that commit.
+         */
+        FetchPluginUpgradeRequest: {
+            /**
+             * @description A full commit id (40 or 64 lowercase hex). Read when `source` is
+             *     omitted; the installation must have a recorded source then. There is
+             *     no branch resolution: the admin names the commit.
+             */
+            commit?: string | null;
+            /**
+             * @description A ForgeConnection id to read it through. Omitted with `source`: read
+             *     anonymously. Omitted with `commit`: the connection the recorded source
+             *     was read through.
+             */
+            connection?: string | null;
+            /**
+             * @description The image the upgrade would run, `<repository>@sha256:<64 hex>`. When
+             *     given, it is checked against the new manifest's named repository, and
+             *     a move to another repository counts as a widening.
+             */
+            image?: string | null;
+            /**
+             * @description The new manifest's source, `<host>/<owner>/<repo>//<path>@<commit>`.
+             *     Omitted: the recorded source's file at `commit`.
+             */
+            source?: string | null;
+        };
         FetchedLibraryDto: {
             content: string;
             content_hash: string;
@@ -3466,6 +3537,35 @@ export interface components {
             manifest_sha256: string;
             /** @description The source as read, pinned to its commit. */
             source: string;
+        };
+        /** @description A manifest read for an upgrade, and what it changes. Nothing is stored. */
+        FetchedPluginUpgradeDto: {
+            /** @description The connection it was read through: pass it to `…/upgrade`. */
+            connection?: string | null;
+            /** @description The file as read. */
+            content: string;
+            current_image: string;
+            /**
+             * @description The installed manifest's hash: pass it to `…/upgrade` as
+             *     `expected_current_sha256`.
+             */
+            current_manifest_sha256: string;
+            diff: components["schemas"]["ManifestDiffDto"];
+            manifest: components["schemas"]["PluginManifestDto"];
+            /** @description Pass it to `…/upgrade` as `manifest_sha256`. */
+            manifest_sha256: string;
+            /**
+             * @description Whether `…/upgrade` asks for a step-up: exactly when it widens. Decided
+             *     again by the server at the upgrade.
+             */
+            needs_step_up: boolean;
+            /** @description The source as read, pinned to its commit: pass it to `…/upgrade`. */
+            source: string;
+            /**
+             * @description Each thing the upgrade adds that the installed version did not ask
+             *     for, as a sentence. Empty = the upgrade is same-or-narrower.
+             */
+            widenings: string[];
         };
         /** @description The answer to a gate approval. */
         GateApprovalDto: {
@@ -3660,6 +3760,36 @@ export interface components {
             csrf: string;
             session: string;
             subject: string;
+        };
+        /** @description The installed manifest against the new one, group by group. */
+        ManifestDiffDto: {
+            /** @description `<slot>: <scheme>`. */
+            auth_schemes: components["schemas"]["ManifestDiffGroupDto"];
+            capabilities: components["schemas"]["ManifestDiffGroupDto"];
+            config_keys: components["schemas"]["ManifestDiffGroupDto"];
+            /** @description Connection slot names. */
+            connections: components["schemas"]["ManifestDiffGroupDto"];
+            /**
+             * @description Gate names; a gate whose definition changed is both removed and
+             *     added.
+             */
+            gates: components["schemas"]["ManifestDiffGroupDto"];
+            /** @description The image repository the manifest names. */
+            image: components["schemas"]["ManifestDiffGroupDto"];
+            /**
+             * @description `<slot>: <method> <path>[ ?<query keys>]`. One more allowed query key
+             *     is a new rule.
+             */
+            read_rules: components["schemas"]["ManifestDiffGroupDto"];
+        };
+        /** @description One group of an upgrade's manifest diff. */
+        ManifestDiffGroupDto: {
+            /** @description Only in the new manifest. */
+            added: string[];
+            /** @description Only in the installed manifest. */
+            removed: string[];
+            /** @description In both. */
+            unchanged: string[];
         };
         /** @description The authenticated principal (ADR-0049) — powers the UI's identity menu. */
         MeResponse: {
@@ -4266,6 +4396,17 @@ export interface components {
             probe_passed_at?: number | null;
             runtime_message: string;
             runtime_status: components["schemas"]["RuntimeStatusDto"];
+            /**
+             * @description Where the approved manifest was read,
+             *     `<host>/<owner>/<repo>//<path>@<commit>`. Absent for an installation
+             *     made before the source was recorded.
+             */
+            source?: string | null;
+            /**
+             * @description The ForgeConnection the source was read through; absent = read
+             *     anonymously, or not recorded.
+             */
+            source_connection?: string | null;
             state: components["schemas"]["InstallationStateDto"];
             storage?: null | components["schemas"]["PluginStorageDto"];
         };
@@ -4282,6 +4423,12 @@ export interface components {
              *     `resolve_gates`.
              */
             gates: components["schemas"]["GateDefinitionDto"][];
+            /**
+             * @description The image repository the plugin ships as, when the manifest names
+             *     one: an install or upgrade must run an image of it. Absent = the
+             *     manifest does not name its image, so any repository is accepted.
+             */
+            image?: string | null;
             plugin: string;
         };
         /**
@@ -5750,6 +5897,27 @@ export interface components {
             expected_version: number;
             policy: Record<string, never>;
             reason?: string | null;
+        };
+        /** @description `POST /v1/orgs/{org}/plugins/{name}/upgrade`. */
+        UpgradePluginRequest: {
+            connection?: string | null;
+            /**
+             * @description The installed manifest's hash the diff was made against; 409 when the
+             *     installation has changed since.
+             */
+            expected_current_sha256: string;
+            /** @description `<repository>@sha256:<64 hex>`. */
+            image: string;
+            /**
+             * @description The new manifest's hash the admin reviewed; 409 when the source no
+             *     longer reads as it.
+             */
+            manifest_sha256: string;
+            /**
+             * @description The new manifest's source, as `…/upgrade-fetch` returned it. Read
+             *     again here.
+             */
+            source: string;
         };
         /** @description One waiting gate of a run in the list view ([`RunSummaryDto::waiting_gates`]). */
         WaitingGateDto: {
@@ -9272,6 +9440,120 @@ export interface operations {
             };
             /** @description the storage changed meanwhile */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    upgrade_plugin: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description installation name */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpgradePluginRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PluginInstallationDto"];
+                };
+            };
+            /** @description a bad image or source, another plugin's manifest, a manifest that is not admissible, or an image the manifest does not name */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an org admin, a step-up is required (a wider manifest or another image repository), a host Scarab does not fetch from, or a private repository outside the org — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
+            /** @description no such installation, or plugins not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description the installation changed since the review, or the source no longer reads as the reviewed manifest */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    fetch_plugin_upgrade: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description installation name */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FetchPluginUpgradeRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FetchedPluginUpgradeDto"];
+                };
+            };
+            /** @description no source or commit, a bad source or image, a fetch that failed, a file that is not an admissible plugin manifest, another plugin's manifest, or an image the manifest does not name */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an org admin, a host Scarab does not fetch from, or a private repository outside the org */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such installation, or plugins not configured */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

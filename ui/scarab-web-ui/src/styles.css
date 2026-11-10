@@ -3392,6 +3392,16 @@ h1, .crumb-head, .run-title {
 .plg-review .kv { padding: 0; }
 .plg-review-list { margin: 0; padding: 0; list-style: none; display: grid; gap: 6px; }
 .plg-review-rules { margin: 4px 0 0; padding-left: 16px; font: var(--t-mono); color: var(--sage); }
+/* A fact the review flags (a manifest that names no image). */
+.plg-warn { color: var(--warn); }
+/* An upgrade's diff, one group per kind: what the new manifest adds (in the
+   warning colour), removes (struck through) and keeps (collapsed). */
+.plg-diff { display: grid; gap: 10px; }
+.plg-diff-h { margin: 0 0 4px; font: var(--t-label); }
+.plg-diff-list { margin: 0; padding: 0; list-style: none; display: grid; gap: 2px; font: var(--t-mono); word-break: break-all; }
+.plg-diff-add { color: var(--warn); }
+.plg-diff-del { color: var(--sage); text-decoration: line-through; }
+.plg-diff-same { color: var(--muted-sage); }
 /* The broker journal: one row per journaled request; the path wraps, the
    short cells do not. */
 .plg-journal-wrap { overflow: auto; max-height: 28rem; }

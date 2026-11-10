@@ -24,12 +24,20 @@
 // plugin namespace; the runtime mounts it read-write into the plugin's Pod.
 // Scarab does not create, back up or read it. Moving it to another claim or
 // path asks for a step-up; adding or removing it does not.
+//
+// "Upgrade" reads a new manifest (by default the recorded source's file at a
+// new commit), shows what it adds, removes and keeps against the installed
+// one, and applies it with a new image. The installation keeps its name, id,
+// config, storage and connections. The server decides whether it needs a
+// passkey: when the new manifest asks for anything more, or the image moves
+// to another repository.
 import { createEffect, createMemo, createResource, createSignal, For, on, Show } from "solid-js";
 import { A, useNavigate, useParams } from "@solidjs/router";
 import {
   deletePluginConnection,
   deletePluginStorage,
   enablePlugin,
+  fetchPluginUpgrade,
   getPluginBrokerJournal,
   killPlugin,
   listPluginConnections,
@@ -37,7 +45,9 @@ import {
   putPluginConnection,
   putPluginStorage,
   uninstallPlugin,
+  upgradePlugin,
   type BrokerJournalEntry,
+  type FetchedPluginUpgrade,
   type PluginConnection,
   type PluginInstallation,
 } from "../api/client";
@@ -62,6 +72,18 @@ import {
   STORAGE_NOTE,
   toStorageBody,
   type StorageForm,
+  imageError,
+  imageRepository,
+  imageRepositoryError,
+  manifestImageFact,
+  sourceLabel,
+  toUpgradeBody,
+  toUpgradeFetchBody,
+  upgradeDiffCounts,
+  upgradeDiffView,
+  upgradeStepUpLine,
+  type DiffGroupView,
+  type UpgradeFetchForm,
 } from "../plugins";
 import { absTime, relTime } from "../fmt";
 import { decodeParam, orgHref } from "../settings-nav";
@@ -72,6 +94,7 @@ import Chips from "../components/Chips";
 import Icon from "../components/Icon";
 import ConfirmDestructive, { ConfirmAction } from "../components/ConfirmDestructive";
 import { Checkbox, Field, Input, Select, Textarea } from "../components/Field";
+import Modal, { ModalMessage, ModalSection } from "../components/Modal";
 
 /** `/orgs/:org/settings/plugins/:id/manage`. */
 export default function PluginManage() {
@@ -159,6 +182,7 @@ function Installation(props: {
   const killed = () => p().state === "killed";
   const runtime = () => runtimeBadge(p().runtime_status);
   const [killing, setKilling] = createSignal(false);
+  const [upgrading, setUpgrading] = createSignal(false);
   const [uninstalling, setUninstalling] = createSignal(false);
   const configKeys = () => [...new Set([...p().manifest.config_keys, ...Object.keys(p().config)])];
 
@@ -174,6 +198,9 @@ function Installation(props: {
   return (
     <>
       <div class="run-toolbar">
+        <button class="btn btn-ghost btn-sm" onClick={() => setUpgrading(true)}>
+          <Icon icon="arrow-up" size={14} /> Upgrade
+        </button>
         <Show
           when={killed()}
           fallback={
@@ -204,6 +231,17 @@ function Installation(props: {
           </dd>
           <dt>Manifest SHA-256</dt>
           <dd class="m">{p().manifest_sha256}</dd>
+          <dt>Source</dt>
+          <dd class="m" classList={{ subtle: !p().source }} title="Where the approved manifest was read">
+            {sourceLabel(p())}
+            <Show when={p().source_connection}>
+              {(c) => <span class="subtle"> · read through {c()}</span>}
+            </Show>
+          </dd>
+          <dt>Named image</dt>
+          <dd class={p().manifest.image ? "m" : "plg-warn"}>
+            {p().manifest.image ?? "The manifest does not name its image."}
+          </dd>
           <dt>Approved</dt>
           <dd title={absTime(p().approved_at)}>
             by <span class="mono">{p().approved_by}</span> · {relTime(p().approved_at)}
@@ -304,6 +342,17 @@ function Installation(props: {
         <p class="kv-note kv-lead">The name {p().name} is retired: it can never be installed again in this org.</p>
       </Section>
 
+      <Show when={upgrading()}>
+        <UpgradeDialog
+          org={props.org}
+          plugin={p()}
+          onClose={() => setUpgrading(false)}
+          onUpgraded={(u) => {
+            setUpgrading(false);
+            props.onDone(`${u.name} is upgraded to ${shortDigest(u.image)}.`);
+          }}
+        />
+      </Show>
       <Show when={killing()}>
         <ConfirmAction
           eyebrow={`${props.org} · plugins`}
@@ -782,6 +831,228 @@ function ConnectionRow(props: {
           <p>A stream it has open is cut within seconds.</p>
         </ConfirmDestructive>
       </Show>
+    </div>
+  );
+}
+
+/** Upgrade an installation: read the new manifest, review what it adds,
+ *  removes and keeps against the installed one, and apply it with a new
+ *  image. The server says whether it needs a passkey, and decides it again
+ *  when the upgrade is sent. */
+function UpgradeDialog(props: {
+  org: string;
+  plugin: PluginInstallation;
+  onClose: () => void;
+  onUpgraded: (p: PluginInstallation) => void;
+}) {
+  const p = () => props.plugin;
+  const [form, setForm] = createSignal<UpgradeFetchForm>({ ref: "", connection: "", image: "" });
+  const [fetched, setFetched] = createSignal<FetchedPluginUpgrade | null>(null);
+  const [busy, setBusy] = createSignal<"" | "fetch" | "upgrade">("");
+  const [error, setError] = createSignal<string | null>(null);
+  // The image repository the server judged the upgrade with: the image sent
+  // with the read, or the installed one.
+  const [judgedRepo, setJudgedRepo] = createSignal("");
+  // Another source or connection drops the review: what is applied is what
+  // was compared. A new image drops it only when it moves to another
+  // repository, the one thing about the image the server's answer depends on.
+  const set = (k: keyof UpgradeFetchForm, v: string) => {
+    const t = v.trim();
+    if (k !== "image" || (t !== "" && !imageError(t) && imageRepository(t) !== judgedRepo())) {
+      setFetched(null);
+    }
+    setForm((f) => ({ ...f, [k]: v }));
+  };
+  const fetchBody = () => toUpgradeFetchBody(form(), p().source);
+  const built = () => toUpgradeBody(form().image, fetched());
+  const groups = () => {
+    const f = fetched();
+    return f ? upgradeDiffView(f.diff) : [];
+  };
+  const imageProblem = () =>
+    imageError(form().image.trim()) ??
+    imageRepositoryError(form().image, fetched()?.manifest.image ?? p().manifest.image);
+
+  const doFetch = async () => {
+    const body = fetchBody().body;
+    if (!body || busy()) return;
+    setBusy("fetch");
+    setError(null);
+    try {
+      setFetched(await fetchPluginUpgrade(props.org, p().name, body));
+      setJudgedRepo(imageRepository(body.image ?? p().image));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not read the new manifest.");
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const apply = async () => {
+    const body = built().body;
+    if (!body || busy()) return;
+    setBusy("upgrade");
+    setError(null);
+    try {
+      props.onUpgraded(await upgradePlugin(props.org, p().name, body));
+    } catch (e) {
+      // A 409 (the installation or the source changed since the review) is
+      // the whole answer.
+      setError(e instanceof Error ? e.message : `Could not upgrade ${p().name}.`);
+    } finally {
+      setBusy("");
+    }
+  };
+
+  return (
+    <Modal
+      size="wide"
+      eyebrow={`${props.org} · ${p().name}`}
+      title={`Upgrade ${p().name}`}
+      purpose="Read the new manifest, review what changes, and run it with a new image."
+      busy={busy() !== ""}
+      onClose={props.onClose}
+      after={{ label: "Kept", value: "the name, id, config, storage, state and connections" }}
+      footer={
+        <>
+          <Show when={error()}>
+            <ModalMessage>{error()}</ModalMessage>
+          </Show>
+          <button class="btn btn-ghost" type="button" onClick={props.onClose} disabled={busy() !== ""}>
+            Cancel
+          </button>
+          <button
+            class="btn btn-primary"
+            type="button"
+            disabled={!built().body || busy() !== ""}
+            onClick={() => void apply()}
+          >
+            <Icon icon="arrow-up" size={14} /> {busy() === "upgrade" ? "Upgrading…" : "Upgrade"}
+          </button>
+        </>
+      }
+    >
+      <ModalSection n={1} title="New version">
+        <Field
+          label={p().source ? "Commit or source" : "Source"}
+          required
+          error={fetchBody().error && form().ref.trim() !== "" ? fetchBody().error : null}
+          help={
+            <Show
+              when={p().source}
+              fallback={
+                <>
+                  This installation's source was not recorded. Enter the manifest's whole source:{" "}
+                  <span class="mono">&lt;host&gt;/&lt;owner&gt;/&lt;repo&gt;//&lt;path&gt;@&lt;commit&gt;</span>.
+                </>
+              }
+            >
+              {(src) => (
+                <>
+                  A full commit id reads <span class="mono">{src().replace(/@[0-9a-f]+$/, "")}</span> at
+                  that commit. A whole source reads another file.
+                </>
+              )}
+            </Show>
+          }
+        >
+          <Input mono placeholder={p().source ? "<40-character commit>" : "github.com/acme/plugin//manifest.json@<commit>"} value={form().ref} onValue={(v) => set("ref", v)} />
+        </Field>
+        <Field
+          label="Image"
+          required
+          error={imageProblem()}
+          help={
+            <>
+              Pinned by digest. Now <span class="mono">{imageRepository(p().image)}</span> at{" "}
+              <span class="mono">{shortDigest(p().image)}</span>.
+            </>
+          }
+        >
+          <Input
+            mono
+            placeholder={`${imageRepository(p().image)}@sha256:…`}
+            value={form().image}
+            onValue={(v) => set("image", v)}
+          />
+        </Field>
+        <div class="modal-actions">
+          <button
+            class="btn btn-ghost btn-sm"
+            type="button"
+            disabled={!fetchBody().body || busy() !== ""}
+            onClick={() => void doFetch()}
+          >
+            <Icon icon="search" size={14} /> {busy() === "fetch" ? "Reading…" : "Read and compare"}
+          </button>
+        </div>
+      </ModalSection>
+
+      <Show when={fetched()}>
+        {(f) => (
+          <ModalSection n={2} title="What changes">
+            <dl class="kv">
+              <dt>Source</dt>
+              <dd class="m">{f().source}</dd>
+              <dt>Manifest SHA-256</dt>
+              <dd class="m">{f().manifest_sha256}</dd>
+              <dt>Named image</dt>
+              <dd classList={{ m: !manifestImageFact(f().manifest).warn, "plg-warn": manifestImageFact(f().manifest).warn }}>
+                {f().manifest.image ?? manifestImageFact(f().manifest).text}
+              </dd>
+            </dl>
+            <UpgradeDiff groups={groups()} />
+            <p classList={{ "f-help": true, "plg-warn": f().needs_step_up }} data-testid="upgrade-step-up">
+              <Icon icon={f().needs_step_up ? "alert-triangle" : "shield-check"} size={12} />{" "}
+              {upgradeStepUpLine(f())}
+            </p>
+          </ModalSection>
+        )}
+      </Show>
+    </Modal>
+  );
+}
+
+/** The diff of an upgrade, group by group: added in the warning colour,
+ *  removed struck through, unchanged collapsed. */
+function UpgradeDiff(props: { groups: DiffGroupView[] }) {
+  const counts = () => upgradeDiffCounts(props.groups);
+  return (
+    <div class="plg-diff">
+      <p class="subtle">
+        {counts().added} added · {counts().removed} removed · {counts().unchanged} unchanged
+      </p>
+      <For each={props.groups}>
+        {(g) => (
+          <section class="plg-diff-group">
+            <h4 class="plg-diff-h">{g.title}</h4>
+            <ul class="plg-diff-list">
+              <For each={g.added}>
+                {(x) => (
+                  <li class="plg-diff-add" title="Added">
+                    + {x}
+                  </li>
+                )}
+              </For>
+              <For each={g.removed}>
+                {(x) => (
+                  <li class="plg-diff-del" title="Removed">
+                    − {x}
+                  </li>
+                )}
+              </For>
+            </ul>
+            <Show when={g.unchanged.length > 0}>
+              <details>
+                <summary class="subtle">{g.unchanged.length} unchanged</summary>
+                <ul class="plg-diff-list plg-diff-same">
+                  <For each={g.unchanged}>{(x) => <li>{x}</li>}</For>
+                </ul>
+              </details>
+            </Show>
+          </section>
+        )}
+      </For>
     </div>
   );
 }

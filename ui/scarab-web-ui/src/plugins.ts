@@ -230,6 +230,185 @@ export function manifestReview(fetched: {
   };
 }
 
+/** What the review says about the image a manifest names. A manifest that
+ *  names its repository runs only an image of it; one that names none runs
+ *  any image an admin pairs it with, which the review flags. */
+export function manifestImageFact(manifest: { image?: string | null }): {
+  text: string;
+  warn: boolean;
+} {
+  return manifest.image
+    ? { text: `runs only an image of ${manifest.image}`, warn: false }
+    : {
+        text: "The manifest does not name its image: any repository can be paired with it. Check the image below is the publisher's.",
+        warn: true,
+      };
+}
+
+/** Why `image` cannot run with a manifest that names `named`, or `null`.
+ *  The server checks this too; the form says it before the round trip. */
+export function imageRepositoryError(image: string, named: string | null | undefined): string | null {
+  const i = image.trim();
+  if (!named || i === "" || imageError(i)) return null;
+  const repo = imageRepository(i);
+  return repo === named ? null : `The manifest runs only images of ${named}, not ${repo}.`;
+}
+
+/** The manage page's line for where the manifest was read. */
+export function sourceLabel(p: { source?: string | null }): string {
+  return p.source ?? "source not recorded";
+}
+
+// ── Upgrade ──────────────────────────────────────────────────────────────
+// An upgrade reads a new manifest (by default the recorded source's file at
+// a new commit), shows what it adds, removes and keeps against the installed
+// one, and applies it with a new image. The server decides whether it needs
+// a passkey: when it adds anything, or moves the image to another
+// repository.
+
+const FULL_COMMIT = /^([0-9a-f]{40}|[0-9a-f]{64})$/;
+
+/** The upgrade form as the dialog holds it. */
+export type UpgradeFetchForm = {
+  /** A full commit id (the recorded source at it) or a whole source. */
+  ref: string;
+  /** A ForgeConnection id; empty = the recorded one with a commit, or
+   *  anonymous with a source. */
+  connection: string;
+  image: string;
+};
+
+/** What `POST …/plugins/{name}/upgrade-fetch` carries — structurally the
+ *  generated `FetchPluginUpgradeRequest`. */
+export type UpgradeFetchBody = {
+  source?: string;
+  commit?: string;
+  connection?: string;
+  image?: string;
+};
+
+/** The body for `form`, or the first reason it cannot be sent. A bare
+ *  commit needs a recorded source to read it in. */
+export function toUpgradeFetchBody(
+  form: UpgradeFetchForm,
+  recordedSource: string | null | undefined,
+): { body: UpgradeFetchBody; error?: undefined } | { body?: undefined; error: string } {
+  const ref = form.ref.trim().replace(/^https:\/\//, "");
+  if (!ref) return { error: recordedSource ? "Enter the new commit or a source." : "Enter the new manifest's source." };
+  const image = form.image.trim();
+  if (image) {
+    const problem = imageError(image);
+    if (problem) return { error: problem };
+  }
+  const connection = form.connection.trim();
+  const rest = { ...(connection ? { connection } : {}), ...(image ? { image } : {}) };
+  if (FULL_COMMIT.test(ref)) {
+    if (!recordedSource) {
+      return { error: "This installation's source was not recorded: enter the whole source, not only a commit." };
+    }
+    return { body: { commit: ref, ...rest } };
+  }
+  const problem = manifestSourceError(ref);
+  if (problem) return { error: problem };
+  return { body: { source: ref, ...rest } };
+}
+
+/** The reviewed upgrade an apply names: what `…/upgrade-fetch` returned. */
+export type ReviewedUpgrade = {
+  source: string;
+  connection?: string | null;
+  manifest_sha256: string;
+  current_manifest_sha256: string;
+  manifest: { image?: string | null };
+};
+
+/** What `POST …/plugins/{name}/upgrade` carries — structurally the
+ *  generated `UpgradePluginRequest`. */
+export type UpgradeBody = {
+  image: string;
+  source: string;
+  connection?: string;
+  manifest_sha256: string;
+  expected_current_sha256: string;
+};
+
+/** The body for upgrading to `reviewed` with `image`, or the first reason it
+ *  cannot be sent. */
+export function toUpgradeBody(
+  image: string,
+  reviewed: ReviewedUpgrade | null,
+): { body: UpgradeBody; error?: undefined } | { body?: undefined; error: string } {
+  if (!reviewed) return { error: "Read the new manifest and review it first." };
+  const i = image.trim();
+  if (!i) return { error: "An image is required." };
+  const problem = imageError(i) ?? imageRepositoryError(i, reviewed.manifest.image);
+  if (problem) return { error: problem };
+  return {
+    body: {
+      image: i,
+      source: reviewed.source,
+      ...(reviewed.connection ? { connection: reviewed.connection } : {}),
+      manifest_sha256: reviewed.manifest_sha256,
+      expected_current_sha256: reviewed.current_manifest_sha256,
+    },
+  };
+}
+
+/** One group of a manifest diff, as the server sends it. */
+export type DiffGroup = { added: readonly string[]; removed: readonly string[]; unchanged: readonly string[] };
+
+/** A group as the upgrade dialog shows it. */
+export type DiffGroupView = {
+  key: string;
+  title: string;
+  added: string[];
+  removed: string[];
+  unchanged: string[];
+};
+
+const DIFF_GROUPS: [string, string][] = [
+  ["capabilities", "Capabilities"],
+  ["connections", "Connections"],
+  ["auth_schemes", "Auth schemes"],
+  ["read_rules", "Read rules"],
+  ["gates", "Gates"],
+  ["config_keys", "Config keys"],
+  ["image", "Named image"],
+];
+
+/** The upgrade's diff as the dialog lists it: every group that has
+ *  anything, in a fixed order. */
+export function upgradeDiffView(diff: Record<string, DiffGroup>): DiffGroupView[] {
+  return DIFF_GROUPS.flatMap(([key, title]) => {
+    const g = diff[key];
+    if (!g || g.added.length + g.removed.length + g.unchanged.length === 0) return [];
+    return [{ key, title, added: [...g.added], removed: [...g.removed], unchanged: [...g.unchanged] }];
+  });
+}
+
+/** Everything the upgrade adds, removes and keeps, summed over the groups. */
+export function upgradeDiffCounts(groups: readonly DiffGroupView[]): {
+  added: number;
+  removed: number;
+  unchanged: number;
+} {
+  return groups.reduce(
+    (n, g) => ({
+      added: n.added + g.added.length,
+      removed: n.removed + g.removed.length,
+      unchanged: n.unchanged + g.unchanged.length,
+    }),
+    { added: 0, removed: 0, unchanged: 0 },
+  );
+}
+
+/** The dialog's line on confirmation, from the server's answer. */
+export function upgradeStepUpLine(fetched: { needs_step_up: boolean }): string {
+  return fetched.needs_step_up
+    ? "This upgrade asks for more than the installed version, so it asks you to confirm with your passkey."
+    : "This upgrade asks for nothing new, so it needs no passkey.";
+}
+
 /** A name for a new installation: the plugin's own name, or `<plugin>-2`,
  *  `-3`, … while that is taken. */
 export function suggestedInstallName(plugin: string, taken: readonly string[]): string {

@@ -27,6 +27,14 @@ import {
   toInstallBody,
   toManifestFetchBody,
   toStorageBody,
+  imageRepositoryError,
+  manifestImageFact,
+  sourceLabel,
+  toUpgradeBody,
+  toUpgradeFetchBody,
+  upgradeDiffCounts,
+  upgradeDiffView,
+  upgradeStepUpLine,
 } from "./plugins";
 
 const REPO = "ghcr.io/acme/scarab-plugin-argocd";
@@ -395,5 +403,89 @@ describe("the list and manage pages", () => {
   });
   it("links an installation's manage page by its id", () => {
     expect(pluginManageHref("acme", { id: "4f2a1c9e7b" })).toBe("/orgs/acme/settings/plugins/4f2a1c9e7b/manage");
+  });
+});
+
+describe("the recorded source and the manifest's image", () => {
+  const REPO = "ghcr.io/acme/argocd";
+  const digest = (c: string) => `@sha256:${c.repeat(64)}`;
+  it("says when the source was not recorded", () => {
+    expect(sourceLabel({ source: null })).toBe("source not recorded");
+    expect(sourceLabel({ source: "github.com/a/b//m.json@x" })).toBe("github.com/a/b//m.json@x");
+  });
+  it("flags a manifest that names no image, and states the one that does", () => {
+    expect(manifestImageFact({ image: null }).warn).toBe(true);
+    expect(manifestImageFact({}).text).toMatch(/does not name its image/);
+    expect(manifestImageFact({ image: REPO })).toEqual({ text: `runs only an image of ${REPO}`, warn: false });
+  });
+  it("refuses an image of another repository than the one the manifest names", () => {
+    expect(imageRepositoryError(`${REPO}${digest("a")}`, REPO)).toBeNull();
+    expect(imageRepositoryError(`ghcr.io/evil/argocd${digest("a")}`, REPO)).toMatch(/only images of ghcr.io\/acme\/argocd/);
+    expect(imageRepositoryError(`ghcr.io/evil/argocd${digest("a")}`, null)).toBeNull();
+    // A malformed image is imageError's to report.
+    expect(imageRepositoryError("ghcr.io/evil/argocd:v1", REPO)).toBeNull();
+  });
+});
+
+describe("the upgrade dialog", () => {
+  const commit = "c".repeat(40);
+  const recorded = `github.com/acme/argocd//manifest.json@${"1".repeat(40)}`;
+  it("reads the recorded source at a bare commit, or another whole source", () => {
+    expect(toUpgradeFetchBody({ ref: commit, connection: "", image: "" }, recorded)).toEqual({
+      body: { commit },
+    });
+    const other = `github.com/acme/other//manifest.json@${commit}`;
+    expect(toUpgradeFetchBody({ ref: `https://${other}`, connection: "forge-1", image: "" }, recorded)).toEqual({
+      body: { source: other, connection: "forge-1" },
+    });
+  });
+  it("needs the whole source when none was recorded, and checks the image shape", () => {
+    expect(toUpgradeFetchBody({ ref: commit, connection: "", image: "" }, null).error).toMatch(/not recorded/);
+    expect(toUpgradeFetchBody({ ref: "", connection: "", image: "" }, null).error).toMatch(/source/);
+    expect(toUpgradeFetchBody({ ref: commit, connection: "", image: "x:latest" }, recorded).error).toMatch(/digest/);
+    expect(toUpgradeFetchBody({ ref: commit, connection: "", image: `x@sha256:${"a".repeat(64)}` }, recorded)).toEqual({
+      body: { commit, image: `x@sha256:${"a".repeat(64)}` },
+    });
+  });
+  it("sends the reviewed hashes and refuses an image the new manifest does not name", () => {
+    const reviewed = {
+      source: `${recorded.slice(0, -40)}${commit}`,
+      connection: null,
+      manifest_sha256: "n".repeat(64),
+      current_manifest_sha256: "o".repeat(64),
+      manifest: { image: "ghcr.io/acme/argocd" },
+    };
+    expect(toUpgradeBody("x", null).error).toMatch(/review/);
+    expect(toUpgradeBody(`ghcr.io/evil/argocd@sha256:${"a".repeat(64)}`, reviewed).error).toMatch(/only images/);
+    expect(toUpgradeBody(`ghcr.io/acme/argocd@sha256:${"a".repeat(64)}`, reviewed)).toEqual({
+      body: {
+        image: `ghcr.io/acme/argocd@sha256:${"a".repeat(64)}`,
+        source: reviewed.source,
+        manifest_sha256: reviewed.manifest_sha256,
+        expected_current_sha256: reviewed.current_manifest_sha256,
+      },
+    });
+  });
+  it("lists the diff's non-empty groups in a fixed order and sums them", () => {
+    const g = (added: string[], removed: string[], unchanged: string[]) => ({ added, removed, unchanged });
+    const groups = upgradeDiffView({
+      image: g([], [], ["ghcr.io/acme/argocd"]),
+      read_rules: g(["argocd: GET /api/v1/account"], ["argocd: GET /api/version"], ["argocd: GET /x"]),
+      capabilities: g([], [], ["use_connection"]),
+      gates: g([], [], []),
+    });
+    expect(groups.map((x) => x.key)).toEqual(["capabilities", "read_rules", "image"]);
+    expect(groups[1]).toEqual({
+      key: "read_rules",
+      title: "Read rules",
+      added: ["argocd: GET /api/v1/account"],
+      removed: ["argocd: GET /api/version"],
+      unchanged: ["argocd: GET /x"],
+    });
+    expect(upgradeDiffCounts(groups)).toEqual({ added: 1, removed: 1, unchanged: 3 });
+  });
+  it("says whether a passkey is needed from the server's answer", () => {
+    expect(upgradeStepUpLine({ needs_step_up: true })).toMatch(/passkey/);
+    expect(upgradeStepUpLine({ needs_step_up: false })).toMatch(/no passkey/);
   });
 });

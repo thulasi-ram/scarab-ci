@@ -34,6 +34,7 @@ type ProjectEnvironmentDto = components["schemas"]["ProjectEnvironmentDto"];
 type EnvironmentProjectDto = components["schemas"]["EnvironmentProjectDto"];
 type PluginManifestDto = components["schemas"]["PluginManifestDto"];
 type FetchedPluginManifestDto = components["schemas"]["FetchedPluginManifestDto"];
+type FetchedPluginUpgradeDto = components["schemas"]["FetchedPluginUpgradeDto"];
 type PluginInstallationDto = components["schemas"]["PluginInstallationDto"];
 type PluginConnectionDto = components["schemas"]["PluginConnectionDto"];
 type BrokerJournalEntryDto = components["schemas"]["BrokerJournalEntryDto"];
@@ -899,10 +900,15 @@ function environmentProjects(env: OrgEnvironmentDto): EnvironmentProjectDto[] {
 // ── Plugins — Settings › Plugins. `argocd` is running; `argocd-us` is
 // killed; `argocd-staging` is held by a failed isolation probe. Each has a
 // manage page at /orgs/acme/settings/plugins/<id>/manage. Writes echo a
-// record and persist nothing, except an install, kept until the page reloads.
+// record and persist nothing, except an install and an upgrade, kept until
+// the page reloads. `argocd-us` was installed before sources were recorded.
+// An upgrade-fetch of `argocd-staging` reads a wider manifest (a read rule
+// and a gate added: a passkey); of any other installation, a narrower one
+// (the version rule removed: no passkey).
 const ARGOCD_REPO = "ghcr.io/thulasi-ram/scarab-plugin-argocd";
 const argocdManifest: PluginManifestDto = {
   plugin: "argocd",
+  image: ARGOCD_REPO,
   capabilities: ["use_connection", "resolve_gates"],
   connections: [
     {
@@ -936,6 +942,53 @@ const argocdManifest: PluginManifestDto = {
   ],
 };
 const ARGOCD_MANIFEST_SHA = "b7e3".padEnd(64, "9");
+const ARGOCD_SOURCE_PATH = "github.com/acme/scarab-plugin-argocd//manifest.json";
+// What an upgrade-fetch of `name` reads (see above), with its diff against
+// the installed manifest.
+const ruleText = (r: { method: string; path: string; query: string[] }) =>
+  `argocd: ${r.method} ${r.path}${r.query.length ? ` ?${r.query.join("&")}` : ""}`;
+const fetchedPluginUpgrade = (
+  installed: PluginInstallationDto,
+  source: string,
+  connection: string | null,
+): FetchedPluginUpgradeDto => {
+  const wider = installed.name === "argocd-staging";
+  const rules = argocdManifest.connections[0]!.read_rules;
+  const added = wider ? [{ method: "GET", path: "/api/v1/account", query: [] }] : [];
+  const kept = wider ? rules : rules.filter((r) => r.path !== "/api/version");
+  const manifest: PluginManifestDto = {
+    ...argocdManifest,
+    connections: [{ ...argocdManifest.connections[0]!, read_rules: [...kept, ...added] }],
+    gates: wider
+      ? [...argocdManifest.gates, { ...argocdManifest.gates[0]!, name: "wait-synced", description: "Pass when the Application is synced." }]
+      : argocdManifest.gates,
+  };
+  const group = (a: string[], r: string[], u: string[]) => ({ added: a, removed: r, unchanged: u });
+  return {
+    source,
+    connection,
+    content: JSON.stringify(manifest, null, 2) + "\n",
+    manifest,
+    manifest_sha256: (wider ? "c4d1" : "a9f0").padEnd(64, "7"),
+    current_manifest_sha256: installed.manifest_sha256,
+    current_image: installed.image,
+    diff: {
+      capabilities: group([], [], [...argocdManifest.capabilities]),
+      connections: group([], [], ["argocd"]),
+      auth_schemes: group([], [], ["argocd: bearer"]),
+      read_rules: group(
+        added.map(ruleText),
+        wider ? [] : rules.filter((r) => r.path === "/api/version").map(ruleText),
+        kept.map(ruleText),
+      ),
+      config_keys: group([], [], [...argocdManifest.config_keys]),
+      gates: group(wider ? ["wait-synced"] : [], [], ["wait-live"]),
+      image: group([], [], [ARGOCD_REPO]),
+    },
+    widenings: wider ? ["adds read rule `argocd: GET /api/v1/account`", "adds gate `wait-synced`"] : [],
+    needs_step_up: wider,
+  };
+};
 // What `POST …/plugin-fetch` returns for any source: the Argo CD manifest,
 // and the org's two installations of it (one approved with an older
 // manifest).
@@ -961,6 +1014,8 @@ const pluginInstallation = (
   principal: `plugin:${name}`,
   image: `${ARGOCD_REPO}@sha256:${digest.padEnd(64, "0")}`,
   manifest_sha256: ARGOCD_MANIFEST_SHA,
+  source: `${ARGOCD_SOURCE_PATH}@6e1d0c9b8a7f6e5d4c3b2a1f0e9d8c7b6a5f4e3d`,
+  source_connection: null,
   config: { ARGOCD_UI_URL: "https://argocd.acme.example" },
   state: "enabled",
   runtime_status: "running",
@@ -991,6 +1046,7 @@ const plugins: PluginInstallationDto[] = [
     killed_by: "j.lee",
     killed_at: ago(90 * min),
     approved_at: ago(5 * 24 * 60 * min),
+    source: null,
   }),
   pluginInstallation("argocd-staging", "7b1c40e9d2f6", {
     id: "2b7e90f1c4",
@@ -1980,6 +2036,32 @@ function route(pathname: string, search: string, method: string, body = ""): Res
       return json(made, { status: 201 });
     }
     return json(plugins);
+  }
+  if ((m = p.match(/^\/v1\/orgs\/[^/]+\/plugins\/([^/]+)\/upgrade(-fetch)?$/)) && method === "POST") {
+    const found = plugins.find((x) => x.name === decodeURIComponent(m![1]!));
+    if (!found) return new Response("no such installation", { status: 404 });
+    if (m[2]) {
+      const req = JSON.parse(body || "{}") as { source?: string; commit?: string; connection?: string };
+      if (!req.source && !found.source) {
+        return new Response("this installation has no recorded source; give the full source", { status: 400 });
+      }
+      const source = req.source ?? `${(found.source ?? ARGOCD_SOURCE_PATH).replace(/@[0-9a-f]+$/, "")}@${req.commit}`;
+      return json(fetchedPluginUpgrade(found, source, req.connection ?? found.source_connection ?? null));
+    }
+    const req = JSON.parse(body || "{}") as { image: string; source: string; manifest_sha256: string };
+    const read = fetchedPluginUpgrade(found, req.source, null);
+    Object.assign(found, {
+      image: req.image,
+      source: req.source,
+      manifest: read.manifest,
+      manifest_sha256: req.manifest_sha256,
+      approved_by: "a.kim",
+      approved_at: now,
+      runtime_status: "pending",
+      runtime_message: "",
+      probe_passed_at: null,
+    });
+    return json(found);
   }
   if ((m = p.match(/^\/v1\/orgs\/[^/]+\/plugins\/([^/]+)\/storage$/))) {
     const found = plugins.find((x) => x.name === decodeURIComponent(m![1]!));

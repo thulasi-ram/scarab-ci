@@ -827,6 +827,9 @@ export type PluginManifest = components["schemas"]["PluginManifestDto"];
 export type FetchedPluginManifest = components["schemas"]["FetchedPluginManifestDto"];
 /** What an uninstall returns. */
 export type UninstalledPlugin = components["schemas"]["UninstalledPluginDto"];
+/** A manifest read for an upgrade, with its diff against the installed one
+ *  (`POST …/plugins/{name}/upgrade-fetch`); nothing is stored. */
+export type FetchedPluginUpgrade = components["schemas"]["FetchedPluginUpgradeDto"];
 
 // --- Libraries ---------------------------------------------------
 
@@ -1040,6 +1043,40 @@ export async function deletePluginStorage(org: string, name: string): Promise<Pl
   if (error || !data) {
     throw new Error(errorText(error) || `could not remove ${name}'s storage (${response.status})`);
   }
+  return data;
+}
+
+/** Read the manifest an upgrade would install and compare it with the
+ *  installed one (`POST …/plugins/{name}/upgrade-fetch`). Stores nothing. */
+export async function fetchPluginUpgrade(
+  org: string,
+  name: string,
+  body: components["schemas"]["FetchPluginUpgradeRequest"],
+): Promise<FetchedPluginUpgrade> {
+  const { data, error, response } = await api.POST("/v1/orgs/{org}/plugins/{name}/upgrade-fetch", {
+    params: { path: { org, name } },
+    body,
+  });
+  if (error || !data) {
+    throw new Error(errorText(error) || `could not read the new manifest (${response.status})`);
+  }
+  return data;
+}
+
+/** Upgrade an installation to a reviewed manifest and image (`POST
+ *  …/plugins/{name}/upgrade`). The server decides whether it needs a
+ *  step-up, and refuses (409) when the installation or the source changed
+ *  since the review. */
+export async function upgradePlugin(
+  org: string,
+  name: string,
+  body: components["schemas"]["UpgradePluginRequest"],
+): Promise<PluginInstallation> {
+  const { data, error, response } = await api.POST("/v1/orgs/{org}/plugins/{name}/upgrade", {
+    params: { path: { org, name } },
+    body,
+  });
+  if (error || !data) throw new Error(errorText(error) || `could not upgrade ${name} (${response.status})`);
   return data;
 }
 

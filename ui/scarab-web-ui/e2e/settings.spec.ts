@@ -603,13 +603,56 @@ test("Install plugin opens its dialog from the section header", async ({ page })
     .fill("github.com/acme/scarab-plugin-argocd//plugin.json@6e1d0c9b8a7f6e5d4c3b2a1f0e9d8c7b6a5f4e3d");
   await dialog.getByRole("button", { name: "Read and review" }).click();
   await expect(dialog.getByText("Manifest SHA-256", { exact: true })).toBeVisible();
+  await expect(dialog.getByTestId("review-image")).toHaveText(
+    "runs only an image of ghcr.io/thulasi-ram/scarab-plugin-argocd",
+  );
   await dialog.getByRole("textbox", { name: "Name" }).fill("argocd-dev");
-  await dialog
-    .getByRole("textbox", { name: "Image" })
-    .fill(`ghcr.io/acme/argocd@sha256:${"a".repeat(64)}`);
+  // An image of another repository than the manifest names cannot be sent.
+  const image = dialog.getByRole("textbox", { name: "Image" });
+  await image.fill(`ghcr.io/acme/argocd@sha256:${"a".repeat(64)}`);
+  await expect(dialog.getByText(/runs only images of/)).toBeVisible();
+  await expect(dialog.getByRole("button", { name: "Install", exact: true })).toBeDisabled();
+  await image.fill(`ghcr.io/thulasi-ram/scarab-plugin-argocd@sha256:${"a".repeat(64)}`);
   await dialog.getByRole("button", { name: "Install", exact: true }).click();
   await expect(page).toHaveURL(/\/orgs\/acme\/settings\/plugins\/1d2e3f4a5b\/manage$/);
   await expect(page.getByRole("heading", { level: 1 })).toHaveText(/Plugins\s*argocd-dev$/);
+  expect(errors).toEqual([]);
+});
+
+test("Upgrade reads a new manifest, shows what changes and whether it needs a passkey", async ({ page }) => {
+  const errors = collectErrors(page);
+  const repo = "ghcr.io/thulasi-ram/scarab-plugin-argocd";
+  // argocd-us was installed before sources were recorded.
+  await page.goto("/orgs/acme/settings/plugins/9c0d33a1e5/manage");
+  await expect(page.getByText("source not recorded", { exact: true })).toBeVisible();
+
+  // argocd-staging: the new manifest adds a rule and a gate, so it asks for a passkey.
+  await page.goto("/orgs/acme/settings/plugins/2b7e90f1c4/manage");
+  await page.getByRole("button", { name: "Upgrade" }).click();
+  let dialog = page.getByRole("dialog");
+  await dialog.getByRole("textbox", { name: "Commit or source" }).fill("d".repeat(40));
+  await dialog.getByRole("button", { name: "Read and compare" }).click();
+  await expect(dialog.getByText("+ argocd: GET /api/v1/account")).toBeVisible();
+  await expect(dialog.getByText("+ wait-synced")).toBeVisible();
+  await expect(dialog.getByTestId("upgrade-step-up")).toContainText("confirm with your passkey");
+  await dialog.getByRole("button", { name: "Cancel" }).click();
+
+  // argocd: the new manifest drops a rule, so it needs none; Upgrade applies it.
+  await page.goto("/orgs/acme/settings/plugins/4f2a1c9e7b/manage");
+  await expect(page.getByText(/^github\.com\/acme\/scarab-plugin-argocd\/\/manifest\.json@/)).toBeVisible();
+  await page.getByRole("button", { name: "Upgrade" }).click();
+  dialog = page.getByRole("dialog");
+  await dialog.getByRole("textbox", { name: "Commit or source" }).fill("e".repeat(40));
+  const upgrade = dialog.getByRole("button", { name: "Upgrade", exact: true });
+  await expect(upgrade).toBeDisabled();
+  await dialog.getByRole("button", { name: "Read and compare" }).click();
+  await expect(dialog.getByText("− argocd: GET /api/version")).toBeVisible();
+  await expect(dialog.getByText("0 added · 1 removed", { exact: false })).toBeVisible();
+  await expect(dialog.getByTestId("upgrade-step-up")).toContainText("needs no passkey");
+  await dialog.getByRole("textbox", { name: "Image" }).fill(`${repo}@sha256:${"9".repeat(64)}`);
+  await upgrade.click();
+  await expect(page.getByText("argocd is upgraded to sha256:999999999999.")).toBeVisible();
+  await expect(page.getByText(`github.com/acme/scarab-plugin-argocd//manifest.json@${"e".repeat(40)}`)).toBeVisible();
   expect(errors).toEqual([]);
 });
 

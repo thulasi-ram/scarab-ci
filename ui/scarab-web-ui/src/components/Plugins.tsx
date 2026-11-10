@@ -23,6 +23,8 @@ import {
 import {
   imageError,
   imageRepository,
+  imageRepositoryError,
+  manifestImageFact,
   installNameError,
   manifestReview,
   manifestSourceError,
@@ -140,7 +142,8 @@ export default function Plugins(props: { org: string }) {
             <p class="subtle">
               <small>
                 <Icon icon="shield-check" size={12} /> An installation approves one image digest
-                and exactly what its manifest asks for: a new digest is a new install. A plugin acts
+                and exactly what its manifest asks for. An upgrade that asks for nothing new is one
+                click; one that asks for more is confirmed like an install. A plugin acts
                 as <span class="mono">plugin:&lt;name&gt;</span>, never as a person. Installing asks
                 you to confirm with your passkey.
               </small>
@@ -221,6 +224,8 @@ function InstallDialog(props: {
 
   const built = () => {
     const f = fetched();
+    const named = imageRepositoryError(image(), f?.manifest.image);
+    if (named) return { error: named };
     return toInstallBody(
       { name: name(), image: image(), config: config(), storage: storage() },
       f ? { source: f.source, manifest_sha256: f.manifest_sha256, connection: fetchedVia() || undefined } : null,
@@ -229,7 +234,7 @@ function InstallDialog(props: {
   };
   // Quiet while a field is untouched.
   const nameProblem = () => (name() ? installNameError(name(), props.taken) : null);
-  const imageProblem = () => imageError(image().trim());
+  const imageProblem = () => imageError(image().trim()) ?? imageRepositoryError(image(), fetched()?.manifest.image);
   const storageProblem = () => {
     const s = storage();
     if (s.claim.trim() === "" && s.mount_path.trim() === "") return null;
@@ -352,8 +357,9 @@ function InstallDialog(props: {
             error={imageProblem()}
             help={
               <>
-                Any repository, pinned by digest: <span class="mono">&lt;repository&gt;@sha256:&lt;64 hex&gt;</span>.
-                A tag can change under the same name; a digest cannot.
+                Pinned by digest: <span class="mono">&lt;repository&gt;@sha256:&lt;64 hex&gt;</span>, of
+                the repository the manifest names when it names one. A tag can change under the same
+                name; a digest cannot.
               </>
             }
           >
@@ -427,6 +433,22 @@ function ManifestReviewView(props: { fetched: FetchedPluginManifest }) {
         <dd class="m">{props.fetched.source}</dd>
         <dt>Manifest SHA-256</dt>
         <dd class="m">{props.fetched.manifest_sha256}</dd>
+        <dt>Image</dt>
+        <dd
+          class={manifestImageFact(props.fetched.manifest).warn ? "plg-warn" : "m"}
+          data-testid="review-image"
+        >
+          <Show
+            when={!manifestImageFact(props.fetched.manifest).warn}
+            fallback={
+              <>
+                <Icon icon="alert-triangle" size={12} /> {manifestImageFact(props.fetched.manifest).text}
+              </>
+            }
+          >
+            {manifestImageFact(props.fetched.manifest).text}
+          </Show>
+        </dd>
         <dt>Capabilities</dt>
         <dd>
           <Show when={r().capabilities.length > 0} fallback={<span class="subtle">none</span>}>
