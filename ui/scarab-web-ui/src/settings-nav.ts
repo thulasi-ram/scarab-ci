@@ -1,10 +1,11 @@
 // The settings route table (git-bug 734ffa1): which sections exist, where
 // each one lives, who sees which group, and where the old URLs go.
 //
-// Three groups. **Your account** is everyone's and lives under `/settings/…`.
-// **Organization settings** belongs to one org and lives under
-// `/orgs/<org>/settings/…`, so an admin of two orgs can reach both and a link
-// names the org it is about. **Server administration** is for global admins
+// Three settings pages, each with its own sidebar. **Account settings** is
+// everyone's and lives under `/settings/…`. **Organization settings** belongs
+// to one org and lives under `/orgs/<org>/settings/…`, so an admin of two orgs
+// can reach both (an org dropdown tops its sidebar) and a link names the org
+// it is about. **Server administration** is for global admins
 // only and lives under `/settings/server/…`: today it holds Connect a forge,
 // the way a new org comes into being (its first connection), which no org's
 // own settings can offer because the org does not exist yet (git-bug
@@ -12,7 +13,8 @@
 // here only decides what to show.
 //
 // Pure functions over `{ can_administer, admin_orgs, global_admin }`, so the
-// no-DOM vitest tier covers the table, the gating and the redirects.
+// no-DOM vitest tier covers the table, the gating, the org dropdown, the user
+// menu entries and the redirects.
 
 export type SettingsGroupKind = "account" | "org" | "server";
 
@@ -102,7 +104,7 @@ export function resolveSection(
  * for a section that does not exist.
  *
  * The org is decoded and escaped again with `orgHref`, so the result
- * compares equal to the hrefs `navGroups` builds however the path spelled it.
+ * compares equal to the hrefs `navGroup` builds however the path spelled it.
  */
 export function activeSectionHref(pathname: string): string | null {
   const parts = pathname.split("/").filter((p) => p !== "");
@@ -128,46 +130,144 @@ export interface NavItem {
   href: string;
 }
 
+/** One entry of the org dropdown. */
+export interface OrgChoice {
+  org: string;
+  /** False only for the org in the URL when the caller does not administer
+   *  it: the dropdown shows it, but it cannot be picked. */
+  administered: boolean;
+}
+
+/** The sidebar of one settings page: one group, never the others. */
 export interface NavGroup {
   kind: SettingsGroupKind;
   heading: string;
-  /** The org this group configures (org group only). */
+  /** The org this page configures (org page only). */
   org?: string;
-  /** Other orgs the caller administers, to switch to (org group only). */
-  otherOrgs?: string[];
+  /** The org dropdown's entries (org page only). Empty when the caller
+   *  administers no org, and then no dropdown is shown. */
+  orgs?: OrgChoice[];
   items: NavItem[];
 }
 
+export const GROUP_HEADINGS: Record<SettingsGroupKind, string> = {
+  account: "Account settings",
+  org: "Organization settings",
+  server: "Server administration",
+};
+
+/** The orgs `who` administers, sorted. */
+export function administeredOrgs(who: SettingsCaller): string[] {
+  return who.can_administer ? [...who.admin_orgs].sort() : [];
+}
+
 /**
- * The sidebar for `who`, with `org` the org in the URL (undefined on an
- * account page, where the org group shows the first administrable org).
+ * The org dropdown at the top of an org page's sidebar: every org `who`
+ * administers, shown even when there is only one so the control is always in
+ * the same place. When the org in the URL is not one of them, it is listed
+ * too, marked not administered, so the dropdown still names the page's org.
  */
-export function navGroups(who: SettingsCaller, org: string | undefined): NavGroup[] {
-  const groups: NavGroup[] = [
+export function orgChoices(who: SettingsCaller, current: string): OrgChoice[] {
+  const orgs = administeredOrgs(who);
+  if (orgs.length === 0) return [];
+  const out: OrgChoice[] = orgs.map((org) => ({ org, administered: true }));
+  if (!orgs.includes(current)) out.unshift({ org: current, administered: false });
+  return out;
+}
+
+/** Where picking `target` in the org dropdown goes: the same section in that
+ *  org, or its first section when no known section is in view. */
+export function orgSwitchHref(target: string, section: string | undefined): string {
+  return resolveSection("org", section) ? orgHref(target, section!) : groupHome("org", target);
+}
+
+/**
+ * The sidebar of the settings page of `kind` (with `org` the org in the URL
+ * on an org page): that page's sections only. Account settings, an org's
+ * settings and server administration are separate pages; the user menu
+ * links each one (`settingsMenu`).
+ *
+ * The sections are listed only to a caller who may use them: an org page
+ * lists them to an admin of that org, the server page to a global admin.
+ */
+export function navGroup(who: SettingsCaller, kind: SettingsGroupKind, org?: string): NavGroup {
+  const heading = GROUP_HEADINGS[kind];
+  if (kind === "org") {
+    const shown = org ?? "";
+    return {
+      kind,
+      heading,
+      org: shown,
+      orgs: orgChoices(who, shown),
+      items: administers(who, shown)
+        ? ORG_SECTIONS.map((s) => ({ id: s.id, label: s.label, href: orgHref(shown, s.id) }))
+        : [],
+    };
+  }
+  if (kind === "server") {
+    return {
+      kind,
+      heading,
+      items: who.global_admin
+        ? SERVER_SECTIONS.map((s) => ({ id: s.id, label: s.label, href: serverHref(s.id) }))
+        : [],
+    };
+  }
+  return {
+    kind,
+    heading,
+    items: ACCOUNT_SECTIONS.map((s) => ({ id: s.id, label: s.label, href: accountHref(s.id) })),
+  };
+}
+
+/** Top-level paths that are not an org (`/:org/:repo` sits below them). */
+const NOT_AN_ORG = new Set(["settings", "orgs", "account", "security"]);
+
+/**
+ * The org `pathname` is about, or undefined: `/<org>/<repo>/…` and
+ * `/orgs/<org>/settings/…`. Decoded.
+ */
+export function contextOrg(pathname: string): string | undefined {
+  const parts = pathname.split("/").filter((p) => p !== "");
+  if (parts[0] === "orgs" && parts[1] !== undefined && parts[2] === "settings") return decodeParam(parts[1]);
+  if (parts.length >= 2 && !NOT_AN_ORG.has(parts[0]!)) return decodeParam(parts[0]!);
+  return undefined;
+}
+
+export interface MenuEntry {
+  kind: SettingsGroupKind;
+  label: string;
+  /** One line for the command palette. */
+  sub: string;
+  href: string;
+}
+
+/**
+ * The settings entries of the user menu, one per settings page `who` can
+ * use. Organization settings opens the org of the page in view when the
+ * caller administers it (`pathname`, see `contextOrg`), else their first
+ * administered org; it is left out for a caller who administers none. Server
+ * administration is for global admins only.
+ */
+export function settingsMenu(who: SettingsCaller, pathname: string): MenuEntry[] {
+  const out: MenuEntry[] = [
     {
       kind: "account",
-      heading: "Your account",
-      items: ACCOUNT_SECTIONS.map((s) => ({ id: s.id, label: s.label, href: accountHref(s.id) })),
+      label: GROUP_HEADINGS.account,
+      sub: "your profile, security and API tokens",
+      href: groupHome("account"),
     },
   ];
-  const shown = org ?? who.admin_orgs[0];
-  if (administers(who, shown)) {
-    groups.push({
-      kind: "org",
-      heading: "Organization settings",
-      org: shown,
-      otherOrgs: who.admin_orgs.filter((o) => o !== shown),
-      items: ORG_SECTIONS.map((s) => ({ id: s.id, label: s.label, href: orgHref(shown!, s.id) })),
-    });
+  const orgs = administeredOrgs(who);
+  const here = contextOrg(pathname);
+  const org = here !== undefined && orgs.includes(here) ? here : orgs[0];
+  if (org !== undefined) {
+    out.push({ kind: "org", label: GROUP_HEADINGS.org, sub: org, href: groupHome("org", org) });
   }
   if (who.global_admin) {
-    groups.push({
-      kind: "server",
-      heading: "Server administration",
-      items: SERVER_SECTIONS.map((s) => ({ id: s.id, label: s.label, href: serverHref(s.id) })),
-    });
+    out.push({ kind: "server", label: GROUP_HEADINGS.server, sub: "this server", href: groupHome("server") });
   }
-  return groups;
+  return out;
 }
 
 /** Where a group's URL with no section opens: its first section

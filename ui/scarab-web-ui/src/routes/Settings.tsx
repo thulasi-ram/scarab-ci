@@ -2,13 +2,15 @@
 // section.
 //
 // The sidebar sits inside the usual 1200px `.page` column, not beside the
-// app: the top bar stays the only app-wide navigation. Three groups — Your
-// account (`/settings/<section>`, everyone's), Organization settings
-// (`/orgs/<org>/settings/<section>`, admins of that org) and Server
-// administration (`/settings/server/<section>`, global admins). Under ~900px
-// the list becomes a `<select>` above the section. A page under a section (one
-// Environment, a library review) renders in the same frame, with its parent
-// section marked. The route table, the gating, which section a path sits in
+// app: the top bar stays the only app-wide navigation. Three separate pages,
+// each listing only its own sections: Account settings (`/settings/<section>`,
+// everyone's), Organization settings (`/orgs/<org>/settings/<section>`,
+// admins of that org, with an org dropdown at the top of the sidebar) and
+// Server administration (`/settings/server/<section>`, global admins). The
+// user menu links each one. Under ~900px the section list becomes a
+// `<select>` above the section, with the org dropdown above it. A page under
+// a section (one Environment, a library review) renders in the same frame,
+// with its parent section marked. The route table, the gating, which section a path sits in
 // and the old-URL redirects are pure functions in `settings-nav.ts`.
 //
 // Gating here is presentation: the server enforces `Administer` on the org
@@ -20,13 +22,13 @@ import {
   activeSectionHref,
   administers,
   legacyRedirect,
-  navGroups,
+  navGroup,
   decodeParam,
-  FIRST_ORG_SECTION,
   groupHome,
-  orgHref,
+  orgSwitchHref,
   resolveSection,
   settingsHome,
+  type OrgChoice,
   type SettingsGroupKind,
   type SettingsSection,
 } from "../settings-nav";
@@ -47,7 +49,7 @@ import Icon from "../components/Icon";
 
 const IDENTITY_ERROR = "Could not load your identity. Is the server up?";
 
-/** `/settings/:section` — a section of Your account. */
+/** `/settings/:section` — a section of Account settings. */
 export function AccountSettings() {
   const params = useParams<{ section: string }>();
   return <SettingsShell kind="account" section={params.section} />;
@@ -119,7 +121,7 @@ export function SettingsFrame(props: {
 }) {
   const nav = useNavigate();
   const location = useLocation();
-  const groups = createMemo(() => (me() ? navGroups(me()!, props.org) : []));
+  const group = createMemo(() => (me() ? navGroup(me()!, props.kind, props.org) : undefined));
   const active = createMemo(() => activeSectionHref(location.pathname));
 
   return (
@@ -127,64 +129,58 @@ export function SettingsFrame(props: {
       <Show when={me.error}>
         <p class="error">{IDENTITY_ERROR}</p>
       </Show>
-      <Show when={me()} fallback={<Show when={!me.error}><p class="empty">loading…</p></Show>}>
-        <div class="settings">
-          <nav class="settings-nav" aria-label="Settings">
-            <For each={groups()}>
-              {(g) => (
-                <div class="settings-nav-group">
-                  <div class="settings-nav-h">{g.heading}</div>
-                  <Show when={g.org}>
-                    {(o) => <OrgSwitch org={o()} others={g.otherOrgs ?? []} section={props.section} />}
-                  </Show>
-                  <For each={g.items}>
+      <Show when={group()} fallback={<Show when={!me.error}><p class="empty">loading…</p></Show>}>
+        {(g) => (
+          <div class="settings">
+            <nav class="settings-nav" aria-label="Settings">
+              <div class="settings-nav-group">
+                <Show when={g().orgs?.length}>
+                  <OrgPick org={g().org!} orgs={g().orgs!} section={props.section} />
+                </Show>
+                <div class="settings-nav-h">{g().heading}</div>
+                <For each={g().items}>
+                  {(item) => (
+                    <A
+                      href={item.href}
+                      class="settings-nav-link"
+                      classList={{ on: active() === item.href }}
+                      aria-current={active() === item.href ? "page" : undefined}
+                    >
+                      {item.label}
+                    </A>
+                  )}
+                </For>
+              </div>
+            </nav>
+
+            <div class="settings-main">
+              <Show when={g().items.length > 0}>
+                <select
+                  class="input settings-select"
+                  aria-label="Settings section"
+                  onChange={(e) => nav(e.currentTarget.value)}
+                >
+                  <For each={g().items}>
                     {(item) => (
-                      <A
-                        href={item.href}
-                        class="settings-nav-link"
-                        classList={{ on: active() === item.href }}
-                        aria-current={active() === item.href ? "page" : undefined}
-                      >
+                      <option value={item.href} selected={active() === item.href}>
                         {item.label}
-                      </A>
+                      </option>
                     )}
                   </For>
-                </div>
-              )}
-            </For>
-          </nav>
+                </select>
+              </Show>
 
-          <div class="settings-main">
-            <select
-              class="input settings-select"
-              aria-label="Settings section"
-              onChange={(e) => nav(e.currentTarget.value)}
-            >
-              <For each={groups()}>
-                {(g) => (
-                  <optgroup label={g.org ? `${g.heading} · ${g.org}` : g.heading}>
-                    <For each={g.items}>
-                      {(item) => (
-                        <option value={item.href} selected={active() === item.href}>
-                          {item.label}
-                        </option>
-                      )}
-                    </For>
-                  </optgroup>
-                )}
-              </For>
-            </select>
-
-            <Switch fallback={props.children}>
-              <Match when={props.kind === "org" && !administers(me(), props.org)}>
-                <NotYours org={props.org!} />
-              </Match>
-              <Match when={props.kind === "server" && !me()?.global_admin}>
-                <NotGlobalAdmin />
-              </Match>
-            </Switch>
+              <Switch fallback={props.children}>
+                <Match when={props.kind === "org" && !administers(me(), props.org)}>
+                  <NotYours org={props.org!} />
+                </Match>
+                <Match when={props.kind === "server" && !me()?.global_admin}>
+                  <NotGlobalAdmin />
+                </Match>
+              </Switch>
+            </div>
           </div>
-        </div>
+        )}
       </Show>
     </section>
   );
@@ -237,25 +233,27 @@ export function SettingsCrumbs(props: { trail: Crumb[]; sub: JSX.Element }) {
   );
 }
 
-/** The org name in the group heading; a picker when there is more than one. */
-function OrgSwitch(props: { org: string; others: string[]; section?: string }) {
+/**
+ * The org dropdown at the top of an org page's sidebar, shown even for one
+ * org so it is always in the same place. Picking an org keeps the section in
+ * view. Under ~900px it stays above the section `<select>`.
+ */
+function OrgPick(props: { org: string; orgs: OrgChoice[]; section?: string }) {
   const nav = useNavigate();
   return (
-    <Show when={props.others.length > 0} fallback={<div class="settings-nav-org mono">{props.org}</div>}>
-      <select
-        class="input settings-nav-orgpick mono"
-        aria-label="Organization"
-        onChange={(e) => nav(orgHref(e.currentTarget.value, props.section ?? FIRST_ORG_SECTION))}
-      >
-        <For each={[props.org, ...props.others].sort()}>
-          {(o) => (
-            <option value={o} selected={o === props.org}>
-              {o}
-            </option>
-          )}
-        </For>
-      </select>
-    </Show>
+    <select
+      class="input settings-nav-orgpick mono"
+      aria-label="Organization"
+      onChange={(e) => nav(orgSwitchHref(e.currentTarget.value, props.section))}
+    >
+      <For each={props.orgs}>
+        {(c) => (
+          <option value={c.org} selected={c.org === props.org} disabled={!c.administered}>
+            {c.org}
+          </option>
+        )}
+      </For>
+    </select>
   );
 }
 

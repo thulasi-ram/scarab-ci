@@ -5,16 +5,20 @@ import {
   SERVER_SECTIONS,
   accountHref,
   activeSectionHref,
+  contextOrg,
   groupHome,
   legacyRedirect,
   libraryReviewHref,
-  navGroups,
+  navGroup,
   decodeParam,
+  orgChoices,
   orgHref,
+  orgSwitchHref,
   paletteEntries,
   resolveSection,
   serverHref,
   settingsHome,
+  settingsMenu,
 } from "./settings-nav";
 
 type Who = { can_administer: boolean; admin_orgs: string[]; global_admin?: boolean };
@@ -61,45 +65,155 @@ describe("route table", () => {
   it("gives the org's event log its own section, last in the org group", () => {
     expect(resolveSection("org", "events")?.label).toBe("Event log");
     expect(ORG_SECTIONS.map((s) => s.id).slice(-2)).toEqual(["security", "events"]);
-    expect(navGroups(admin, "acme")[1]!.items.at(-1)!.href).toBe("/orgs/acme/settings/events");
-    // Only the org group has it: your own events stay on Your account → Security.
+    expect(navGroup(admin, "org", "acme").items.at(-1)!.href).toBe("/orgs/acme/settings/events");
+    // Only the org page has it: your own events stay on Account settings → Security.
     expect(resolveSection("account", "events")).toBeUndefined();
   });
 });
 
-describe("admin gating", () => {
-  it("shows a non-admin only their own group", () => {
-    const groups = navGroups(member, undefined);
-    expect(groups.map((g) => g.kind)).toEqual(["account"]);
-    expect(groups[0]!.items.map((i) => i.href)).toEqual([
-      "/settings/profile",
-      "/settings/security",
-      "/settings/tokens",
-      "/settings/appearance",
+describe("one settings page, one group", () => {
+  it("lists only the account sections on an account page, for everyone", () => {
+    for (const who of [member, admin, globalWithOrg]) {
+      const g = navGroup(who, "account");
+      expect(g.kind).toBe("account");
+      expect(g.heading).toBe("Account settings");
+      expect(g.items.map((i) => i.href)).toEqual([
+        "/settings/profile",
+        "/settings/security",
+        "/settings/tokens",
+        "/settings/appearance",
+      ]);
+      expect(g.orgs).toBeUndefined();
+    }
+  });
+
+  it("lists only that org's sections on an org page", () => {
+    const g = navGroup(globalWithOrg, "org", "acme");
+    expect(g.heading).toBe("Organization settings");
+    expect(g.org).toBe("acme");
+    expect(g.items.map((i) => i.href)).toEqual(ORG_SECTIONS.map((s) => orgHref("acme", s.id)));
+    // No account or server section rides along.
+    expect(g.items.some((i) => i.href.startsWith("/settings/"))).toBe(false);
+  });
+
+  it("lists only the server sections on the server page", () => {
+    const g = navGroup(globalWithOrg, "server");
+    expect(g.heading).toBe("Server administration");
+    expect(g.items.map((i) => i.href)).toEqual(["/settings/server/connect-forge"]);
+  });
+
+  it("lists no org sections for an org the caller does not administer", () => {
+    expect(navGroup(admin, "org", "globex").items).toEqual([]);
+    expect(navGroup(member, "org", "acme").items).toEqual([]);
+    // Listed in admin_orgs but without Administer: still nothing.
+    expect(navGroup({ can_administer: false, admin_orgs: ["acme"] }, "org", "acme").items).toEqual([]);
+  });
+
+  it("lists no server sections to a caller who is not a global admin", () => {
+    expect(navGroup(admin, "server").items).toEqual([]);
+    expect(navGroup({ ...admin, global_admin: false }, "server").items).toEqual([]);
+  });
+});
+
+describe("the org dropdown", () => {
+  it("is there with one org, so it is always in the same place", () => {
+    expect(orgChoices(admin, "acme")).toEqual([{ org: "acme", administered: true }]);
+    expect(navGroup(admin, "org", "acme").orgs).toEqual([{ org: "acme", administered: true }]);
+  });
+
+  it("lists every org the caller administers, sorted, whichever is in view", () => {
+    const unsorted: Who = { can_administer: true, admin_orgs: ["globex", "acme"] };
+    const want = [
+      { org: "acme", administered: true },
+      { org: "globex", administered: true },
+    ];
+    expect(orgChoices(unsorted, "acme")).toEqual(want);
+    expect(orgChoices(unsorted, "globex")).toEqual(want);
+  });
+
+  it("shows the org in view, not pickable, when the caller does not administer it", () => {
+    expect(orgChoices(twoOrgs, "initech")).toEqual([
+      { org: "initech", administered: false },
+      { org: "acme", administered: true },
+      { org: "globex", administered: true },
     ]);
   });
 
-  it("shows an admin their account and the org in view", () => {
-    const groups = navGroups(admin, "acme");
-    expect(groups.map((g) => g.kind)).toEqual(["account", "org"]);
-    const org = groups[1]!;
-    expect(org.heading).toBe("Organization settings");
-    expect(org.items.map((i) => i.href)).toContain("/orgs/acme/settings/connections");
+  it("is not shown to a caller who administers no org", () => {
+    expect(orgChoices(member, "acme")).toEqual([]);
+    expect(orgChoices({ can_administer: false, admin_orgs: ["acme"] }, "acme")).toEqual([]);
+    expect(orgChoices(freshGlobal, "acme")).toEqual([]);
   });
 
-  it("shows no org group for an org the caller does not administer", () => {
-    expect(navGroups(admin, "globex").map((g) => g.kind)).toEqual(["account"]);
-    expect(navGroups(member, "acme").map((g) => g.kind)).toEqual(["account"]);
+  it("keeps the section in view when switching org", () => {
+    expect(orgSwitchHref("globex", "secrets")).toBe("/orgs/globex/settings/secrets");
+    // From a page under a section (one Environment), the section itself.
+    expect(orgSwitchHref("globex", "environments")).toBe("/orgs/globex/settings/environments");
+    expect(orgSwitchHref("a b", "members")).toBe("/orgs/a%20b/settings/members");
   });
 
-  it("defaults the org group to the first administrable org outside an org route", () => {
-    const groups = navGroups(twoOrgs, undefined);
-    expect(groups[1]?.org).toBe("acme");
+  it("falls back to the first section when no known section is in view", () => {
+    expect(orgSwitchHref("globex", undefined)).toBe("/orgs/globex/settings/connections");
+    expect(orgSwitchHref("globex", "nope")).toBe("/orgs/globex/settings/connections");
+    // An account section is not an org section.
+    expect(orgSwitchHref("globex", "profile")).toBe("/orgs/globex/settings/connections");
+  });
+});
+
+describe("the user menu's settings entries", () => {
+  const kinds = (who: Who, path = "/") => settingsMenu(who, path).map((e) => e.kind);
+
+  it("offers a member Account settings only", () => {
+    expect(settingsMenu(member, "/")).toEqual([
+      expect.objectContaining({ label: "Account settings", href: "/settings/profile" }),
+    ]);
+    expect(kinds({ can_administer: false, admin_orgs: ["acme"] })).toEqual(["account"]);
   });
 
-  it("lists the other administrable orgs to switch to", () => {
-    expect(navGroups(twoOrgs, "globex")[1]?.otherOrgs).toEqual(["acme"]);
-    expect(navGroups(admin, "acme")[1]?.otherOrgs).toEqual([]);
+  it("offers Organization settings to an org admin, and Server administration to a global admin", () => {
+    expect(kinds(admin)).toEqual(["account", "org"]);
+    expect(kinds(globalWithOrg)).toEqual(["account", "org", "server"]);
+    // A global admin before any org exists: no org page to open.
+    expect(kinds(freshGlobal)).toEqual(["account", "server"]);
+    const server = settingsMenu(freshGlobal, "/").find((e) => e.kind === "server")!;
+    expect(server.label).toBe("Server administration");
+    expect(server.href).toBe("/settings/server/connect-forge");
+  });
+
+  it("opens the org in view when the caller administers it", () => {
+    const org = (path: string) => settingsMenu(twoOrgs, path).find((e) => e.kind === "org")!.href;
+    expect(org("/globex/shared-ci")).toBe("/orgs/globex/settings/connections");
+    expect(org("/globex/shared-ci/runs/0190")).toBe("/orgs/globex/settings/connections");
+    expect(org("/orgs/globex/settings/members")).toBe("/orgs/globex/settings/connections");
+    expect(org("/orgs/globex/settings/environments/prod/edit")).toBe("/orgs/globex/settings/connections");
+  });
+
+  it("opens the first administered org elsewhere, or in an org the caller does not administer", () => {
+    const org = (path: string) => settingsMenu(twoOrgs, path).find((e) => e.kind === "org")!.href;
+    expect(org("/")).toBe("/orgs/acme/settings/connections");
+    expect(org("/settings/profile")).toBe("/orgs/acme/settings/connections");
+    expect(org("/settings/server/connect-forge")).toBe("/orgs/acme/settings/connections");
+    expect(org("/initech/web")).toBe("/orgs/acme/settings/connections");
+  });
+});
+
+describe("the org a page is about", () => {
+  it("reads it from a repository path and an org settings path, decoded", () => {
+    expect(contextOrg("/acme/orders-api")).toBe("acme");
+    expect(contextOrg("/acme/orders-api/runs/1")).toBe("acme");
+    expect(contextOrg("/acme/orders-api/run")).toBe("acme");
+    expect(contextOrg("/orgs/a%20b/settings/members")).toBe("a b");
+    expect(contextOrg("/orgs/acme/settings")).toBe("acme");
+  });
+
+  it("finds none on a page that is not about an org", () => {
+    expect(contextOrg("/")).toBeUndefined();
+    expect(contextOrg("/settings/profile")).toBeUndefined();
+    expect(contextOrg("/settings/server/connect-forge")).toBeUndefined();
+    expect(contextOrg("/account/security")).toBeUndefined();
+    expect(contextOrg("/security/confirm/abc")).toBeUndefined();
+    // One segment is not a repository path.
+    expect(contextOrg("/acme")).toBeUndefined();
   });
 });
 
@@ -125,7 +239,9 @@ describe("which section the sidebar marks", () => {
   });
 
   it("returns exactly one sidebar href for every section", () => {
-    for (const item of navGroups(admin, "acme").flatMap((g) => g.items)) {
+    const items = (["account", "org", "server"] as const).flatMap((k) => navGroup(globalWithOrg, k, "acme").items);
+    expect(items.length).toBe(ACCOUNT_SECTIONS.length + ORG_SECTIONS.length + SERVER_SECTIONS.length);
+    for (const item of items) {
       expect(activeSectionHref(item.href)).toBe(item.href);
       expect(activeSectionHref(`${item.href}/anything/below`)).toBe(item.href);
     }
@@ -151,29 +267,21 @@ describe("which section the sidebar marks", () => {
 });
 
 describe("connect a forge (a new org's first connection)", () => {
-  it("lives at its own URL, apart from Your account", () => {
+  it("lives at its own URL, apart from Account settings", () => {
     expect(serverHref("connect-forge")).toBe("/settings/server/connect-forge");
     expect(resolveSection("server", "connect-forge")?.label).toBe("Connect a forge");
     expect(resolveSection("account", "connect-forge")).toBeUndefined();
     expect(resolveSection("org", "connect-forge")).toBeUndefined();
   });
 
-  it("is shown to a global admin with no org yet", () => {
-    const groups = navGroups(freshGlobal, undefined);
-    expect(groups.map((g) => g.kind)).toEqual(["account", "server"]);
-    expect(groups[1]!.items.map((i) => i.href)).toEqual(["/settings/server/connect-forge"]);
-  });
-
-  it("is shown to a global admin next to the org in view", () => {
-    expect(navGroups(globalWithOrg, "acme").map((g) => g.kind)).toEqual(["account", "org", "server"]);
-  });
-
-  it("is not shown to an org admin who is not a global admin", () => {
-    expect(navGroups(admin, "acme").map((g) => g.kind)).toEqual(["account", "org"]);
-    expect(navGroups({ ...admin, global_admin: false }, "acme").map((g) => g.kind)).toEqual([
-      "account",
-      "org",
+  it("is on the server page of a global admin, even with no org yet", () => {
+    expect(navGroup(freshGlobal, "server").items.map((i) => i.href)).toEqual([
+      "/settings/server/connect-forge",
     ]);
+  });
+
+  it("is not on the server page of an org admin who is not a global admin", () => {
+    expect(navGroup(admin, "server").items).toEqual([]);
   });
 
   it("is in the palette for a global admin only", () => {
