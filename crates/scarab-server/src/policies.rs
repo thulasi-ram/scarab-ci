@@ -1770,20 +1770,33 @@ pub(crate) async fn org_policy_decision_counts(
     }))
 }
 
-/// `POST …/policies/check`.
+/// `POST …/policies/check`: name exactly one of `policy` and `yaml`.
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyCheckRequest {
     /// The draft Policy, as `POST …/policies` takes it.
-    #[schema(value_type = Object)]
-    pub policy: Value,
+    #[serde(default)]
+    #[schema(value_type = Option<Object>)]
+    pub policy: Option<Value>,
+    /// The draft as YAML, such as a `kind: policy` file pasted into the
+    /// editor. At most 64 KiB.
+    #[serde(default)]
+    pub yaml: Option<String>,
 }
+
+/// The longest `yaml` a check reads, in bytes.
+pub const MAX_POLICY_YAML: usize = 64 * 1024;
 
 /// What checking a draft found. Nothing is saved.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct PolicyCheckResponse {
     /// No error: saving this Policy at the org level would compile it.
     pub ok: bool,
+    /// The draft as `POST …/policies` takes it: what `yaml` parsed to (with
+    /// `kind` dropped), or `policy` itself. Absent when the body is not a
+    /// Policy.
+    #[schema(value_type = Option<Object>)]
+    pub policy: Option<Value>,
     /// Errors first, then the `has()` warnings of the rules that compiled.
     pub diagnostics: Vec<PolicyDiagnosticDto>,
     /// Each rule that compiled, with the input fields it reads.
@@ -1836,7 +1849,9 @@ fn rule_reads(index: usize, r: &RuleIr) -> RuleReadsDto {
 /// Compile a draft org Policy and answer every finding, without saving it:
 /// the policy editor calls this as the author types. Errors and warnings
 /// carry where they are (`rules[0].when`) and, for CEL, the line and column
-/// in the rule. A body that is not a Policy is one error. Needs Administer
+/// in the rule. A body that is not a Policy is one error. `yaml` takes the
+/// draft as YAML (a pasted `kind: policy` file) and answers it as JSON in
+/// `policy`, so the editor can load it. Needs Administer
 /// on the org, as testing a draft does: the checker runs on what the caller
 /// wrote.
 #[utoipa::path(
@@ -1847,6 +1862,7 @@ fn rule_reads(index: usize, r: &RuleIr) -> RuleReadsDto {
     summary = "Check a draft org Policy without saving it (ADR-0075 §6)",
     responses(
         (status = 200, body = PolicyCheckResponse),
+        (status = 400, description = "not exactly one of `policy` and `yaml`, or `yaml` over 64 KiB"),
         (status = 403, description = "not an org admin")
     )
 )]
@@ -1863,23 +1879,44 @@ pub(crate) async fn check_org_policy(
         Some(&rbac_scope(&org, None)),
     )
     .await?;
-    let policy = match Policy::from_json(body.policy) {
-        Ok(p) => p,
-        Err(e) => {
-            return Ok(Json(PolicyCheckResponse {
-                ok: false,
-                diagnostics: vec![PolicyDiagnosticDto {
-                    severity: "error".into(),
-                    at: String::new(),
-                    line: 0,
-                    column: 0,
-                    expr: String::new(),
-                    message: format!("invalid Policy: {e}"),
-                }],
-                rules: Vec::new(),
-            }))
+    let not_a_policy = |message: String| {
+        Json(PolicyCheckResponse {
+            ok: false,
+            policy: None,
+            diagnostics: vec![PolicyDiagnosticDto {
+                severity: "error".into(),
+                at: String::new(),
+                line: 0,
+                column: 0,
+                expr: String::new(),
+                message,
+            }],
+            rules: Vec::new(),
+        })
+    };
+    let raw = match (body.policy, body.yaml) {
+        (Some(p), None) => p,
+        (None, Some(y)) if y.len() > MAX_POLICY_YAML => {
+            return Err(ApiError::BadRequest(format!(
+                "`yaml` is at most {MAX_POLICY_YAML} bytes; this one is {}",
+                y.len()
+            )))
+        }
+        (None, Some(y)) => match serde_yaml::from_str::<Value>(&y) {
+            Ok(v) => v,
+            Err(e) => return Ok(not_a_policy(format!("the YAML does not parse: {e}"))),
+        },
+        _ => {
+            return Err(ApiError::BadRequest(
+                "name exactly one of `policy` and `yaml`".into(),
+            ))
         }
     };
+    let policy = match Policy::from_json(raw) {
+        Ok(p) => p,
+        Err(e) => return Ok(not_a_policy(format!("invalid Policy: {e}"))),
+    };
+    let parsed = serde_json::to_value(&policy).ok();
     let checked = blocking(move || check_policy(&policy, Level::Org)).await?;
     let mut diagnostics: Vec<PolicyDiagnosticDto> = checked
         .errors
@@ -1889,6 +1926,7 @@ pub(crate) async fn check_org_policy(
     diagnostics.extend(checked.warnings().map(|d| diagnostic_dto("warning", d)));
     Ok(Json(PolicyCheckResponse {
         ok: checked.errors.is_empty(),
+        policy: parsed,
         diagnostics,
         rules: checked
             .rules

@@ -236,6 +236,43 @@ async fn check_answers_errors_and_warnings_at_their_rule_and_saves_nothing() {
     assert_eq!(b["diagnostics"].as_array().unwrap().len(), 1, "{b}");
     assert_eq!(b["diagnostics"][0]["at"], "");
 
+    // YAML, as pasted: parsed, checked, and answered as JSON with `kind`
+    // dropped.
+    let yaml = "kind: policy\nname: no-forks\ncheckpoint: run.create\nrules:\n  - when: trigger.fork\n    effect: deny\n    message: No forks.\n";
+    let (st, b) = h
+        .cookie(
+            "POST",
+            "/v1/orgs/acme/policies/check",
+            Some(json!({ "yaml": yaml })),
+            &oscar,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(b["ok"], true, "{b}");
+    assert_eq!(b["policy"]["name"], "no-forks");
+    assert_eq!(b["policy"]["rules"][0]["when"], "trigger.fork");
+    assert!(b["policy"].get("kind").is_none(), "{b}");
+    let (st, b) = h
+        .cookie(
+            "POST",
+            "/v1/orgs/acme/policies/check",
+            Some(json!({ "yaml": "name: [unclosed" })),
+            &oscar,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(b["ok"], false);
+    assert!(b["policy"].is_null(), "{b}");
+    let (st, _) = h
+        .cookie(
+            "POST",
+            "/v1/orgs/acme/policies/check",
+            Some(json!({ "yaml": yaml, "policy": {} })),
+            &oscar,
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
     // A member may not run the checker; nothing was saved either way.
     let (st, _) = check(draft, mia).await;
     assert_eq!(st, StatusCode::FORBIDDEN);

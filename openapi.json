@@ -4561,6 +4561,9 @@
               }
             }
           },
+          "400": {
+            "description": "not exactly one of `policy` and `yaml`, or `yaml` over 64 KiB"
+          },
           "403": {
             "description": "not an org admin"
           }
@@ -12449,14 +12452,21 @@
       },
       "PolicyCheckRequest": {
         "type": "object",
-        "description": "`POST …/policies/check`.",
-        "required": [
-          "policy"
-        ],
+        "description": "`POST …/policies/check`: name exactly one of `policy` and `yaml`.",
         "properties": {
           "policy": {
-            "type": "object",
+            "type": [
+              "object",
+              "null"
+            ],
             "description": "The draft Policy, as `POST …/policies` takes it."
+          },
+          "yaml": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The draft as YAML, such as a `kind: policy` file pasted into the\neditor. At most 64 KiB."
           }
         },
         "additionalProperties": false
@@ -12480,6 +12490,13 @@
           "ok": {
             "type": "boolean",
             "description": "No error: saving this Policy at the org level would compile it."
+          },
+          "policy": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "The draft as `POST …/policies` takes it: what `yaml` parsed to (with\n`kind` dropped), or `policy` itself. Absent when the body is not a\nPolicy."
           },
           "rules": {
             "type": "array",

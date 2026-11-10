@@ -4345,10 +4345,15 @@ export interface components {
              */
             mount_path?: string | null;
         };
-        /** @description `POST …/policies/check`. */
+        /** @description `POST …/policies/check`: name exactly one of `policy` and `yaml`. */
         PolicyCheckRequest: {
             /** @description The draft Policy, as `POST …/policies` takes it. */
-            policy: Record<string, never>;
+            policy?: Record<string, never> | null;
+            /**
+             * @description The draft as YAML, such as a `kind: policy` file pasted into the
+             *     editor. At most 64 KiB.
+             */
+            yaml?: string | null;
         };
         /** @description What checking a draft found. Nothing is saved. */
         PolicyCheckResponse: {
@@ -4356,6 +4361,12 @@ export interface components {
             diagnostics: components["schemas"]["PolicyDiagnosticDto"][];
             /** @description No error: saving this Policy at the org level would compile it. */
             ok: boolean;
+            /**
+             * @description The draft as `POST …/policies` takes it: what `yaml` parsed to (with
+             *     `kind` dropped), or `policy` itself. Absent when the body is not a
+             *     Policy.
+             */
+            policy?: Record<string, never> | null;
             /** @description Each rule that compiled, with the input fields it reads. */
             rules: components["schemas"]["RuleReadsDto"][];
         };
@@ -9468,6 +9479,13 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["PolicyCheckResponse"];
                 };
+            };
+            /** @description not exactly one of `policy` and `yaml`, or `yaml` over 64 KiB */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description not an org admin */
             403: {
