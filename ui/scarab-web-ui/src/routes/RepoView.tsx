@@ -18,7 +18,6 @@ import {
   listRepoRuns,
   repoForgeUrl,
   listEnvironments,
-  listApprovalHistory,
   putEnvironmentOverlay,
   deleteEnvironmentOverlay,
   type RunSummary,
@@ -702,8 +701,8 @@ function RepoEnvironments(props: {
   );
 }
 
-// The history here is APPROVALS — what governance admitted into the
-// environment — not what went live.
+// What ran in the environment lives on the Runs tab (filtered by it), so the
+// panel shows the rules only and links there.
 function EnvPanel(props: {
   org: string;
   repo: string;
@@ -711,10 +710,6 @@ function EnvPanel(props: {
   onTighten: () => void;
   onChanged: () => void;
 }) {
-  const key = () => ({ org: props.org, repo: props.repo, name: props.env.name });
-  const [history] = createResource(key, ({ org, repo, name }) =>
-    listApprovalHistory(org, repo, name).catch(() => []),
-  );
   const [error, setError] = createSignal<string | null>(null);
   const [removing, setRemoving] = createSignal(false);
   const effective = () => props.env.effective;
@@ -739,9 +734,12 @@ function EnvPanel(props: {
               not eligible
             </span>
           </Show>
-          <Show when={(history() ?? []).length > 0}>
-            <span class="subtle mono">last approved {history()![0]!.git_ref}</span>
-          </Show>
+          <A
+            class="subtle mono"
+            href={`/${props.org}/${props.repo}?env=${encodeURIComponent(props.env.name)}`}
+          >
+            runs in {props.env.name} →
+          </A>
         </span>
       </div>
       <div class="env-body">
@@ -833,22 +831,6 @@ function EnvPanel(props: {
             </Show>
           </ConfirmDestructive>
         </Show>
-        <div class="env-history">
-          <div class="env-h-title mono">Approval history (legacy)</div>
-          <For
-            each={history() ?? []}
-            fallback={<div class="env-h-row mono subtle">no approvals recorded</div>}
-          >
-            {(h) => (
-              <div class="env-h-row mono">
-                <span class="subtle" title={absTime(h.at)}>{relTime(h.at)}</span> {h.git_ref}
-                <Show when={h.approved_by.length > 0}>
-                  <span class="ok-mark">✓</span> approved {h.approved_by.join(", ")}
-                </Show>
-              </div>
-            )}
-          </For>
-        </div>
       </div>
     </div>
   );

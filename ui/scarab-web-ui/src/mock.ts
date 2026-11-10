@@ -440,33 +440,8 @@ const testLogLines = [
 ];
 
 // ── environments / secrets ───────────────────────────────────────────────────
-// A repository's Environments are org Environments now: see
-// `orgEnvironments`, `overlays` and `projectEnvironments` below. This is the
-// legacy approval history per name.
-const deployments: Record<string, unknown[]> = {
-  production: [
-    {
-      org: "acme",
-      project: "scarab",
-      environment: "production",
-      git_ref: "main",
-      run: "01984e00aa",
-      approved_by: ["ops-lead"],
-      at: ago(3600000),
-    },
-    {
-      org: "acme",
-      project: "scarab",
-      environment: "production",
-      git_ref: "main",
-      run: "01984d00bb",
-      approved_by: ["ops-lead"],
-      at: ago(86400000),
-    },
-  ],
-  staging: [],
-  preview: [],
-};
+// A repository's Environments are org Environments: see `orgEnvironments`,
+// `overlays` and `projectEnvironments` below.
 
 // ── the GATES run ──────────────────────────────────────────────
 //   bump        ✓ → live        external gate WAITING
@@ -1741,10 +1716,6 @@ function route(pathname: string, search: string, method: string, body = ""): Res
     return new Response("per-repo environments were replaced by org-level Environments", {
       status: 410,
     });
-  }
-  // /v1/repos/{org}/{repo}/environments/{name}/deployments
-  if ((m = p.match(/^\/v1\/repos\/[^/]+\/[^/]+\/environments\/([^/]+)\/deployments$/))) {
-    return json(deployments[m[1]] ?? []);
   }
   // /v1/repos/{org}/{repo}/secrets/matrix
   if (/^\/v1\/repos\/[^/]+\/[^/]+\/secrets\/matrix$/.test(p)) return json(secretMatrix);

@@ -1836,15 +1836,11 @@ select.input {
 /* ---- environments ---- */
 .env-panel .env-body { padding: 14px 16px; }
 .env-rules { display: flex; align-items: center; gap: 6px; font-size: var(--fs-sm); color: var(--sage); margin-bottom: 12px; }
-.env-history { display: flex; flex-direction: column; gap: 6px; }
-/* Baseline / overlay / privileges, one line each, above the history. */
+/* Baseline / overlay / privileges, one line each. */
 .env-layers { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }
 .env-layers .env-h-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .env-h-row { font-size: var(--fs-sm); color: var(--sage); }
-.ok-mark { color: var(--ok); margin: 0 4px; }
-/* The legacy approval list is labelled as such. */
 .env-h-meta { display: inline-flex; align-items: center; gap: 12px; }
-.env-h-title { font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 1px; color: var(--muted-sage); }
 
 /* ---- settings / secrets bodies ---- */
 .settings-body, .secrets-body { padding: 16px; display: flex; flex-direction: column; gap: 12px; }

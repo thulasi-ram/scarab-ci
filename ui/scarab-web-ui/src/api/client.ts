@@ -638,33 +638,6 @@ export async function deleteEnvironmentOverlay(
   await send(`${projectPath(org, env, project)}/overlay`, "DELETE");
 }
 
-/** One approval recorded when a run into an environment was admitted (`at` is
- *  epoch millis). The LEGACY `…/environments/{name}/deployments` route: it
- *  records what was *approved*, not what went live. */
-export type ApprovalRecord = {
-  org: string;
-  project: string;
-  environment: string;
-  git_ref: string;
-  run: string;
-  approved_by: string[];
-  at: number;
-};
-
-/** An environment's approval history, most recent first (legacy
- *  `GET /v1/repos/{org}/{repo}/environments/{name}/deployments`). */
-export async function listApprovalHistory(
-  org: string,
-  repo: string,
-  name: string,
-): Promise<ApprovalRecord[]> {
-  const res = await fetch(
-    `/v1/repos/${encodeURIComponent(org)}/${encodeURIComponent(repo)}/environments/${encodeURIComponent(name)}/deployments`,
-  );
-  if (!res.ok) throw new Error("failed to list approval history");
-  return (await res.json()) as ApprovalRecord[];
-}
-
 // --- Org-level Environments — the place deploys land in: its
 // description (the whole-Environment PUT), and — each with its own write, so
 // that PUT can never reset them — its baseline protection, its eligibility,
