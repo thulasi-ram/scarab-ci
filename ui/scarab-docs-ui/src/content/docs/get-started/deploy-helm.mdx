@@ -286,6 +286,40 @@ A plugin that needs storage brings its own: you create a PersistentVolumeClaim i
 namespace and the plugin runtime mounts it. Scarab doesn't provision, back up or read that
 volume, and its data is outside what Scarab keeps.
 
+#### Install a plugin
+
+Every plugin installs the same way, Scarab's own Argo CD plugin included: no plugin is installed
+or trusted by default. An org admin installs one under Organization settings › Plugins ›
+**Install plugin**, or with the API, in two steps:
+
+1. **Fetch and review.** Give the plugin's manifest as a source,
+   `<host>/<owner>/<repo>//<path>@<commit>`, where the path ends in `.json`, `.yaml` or `.yml` and
+   the commit is a full commit id. Scarab reads it the way it reads a
+   [library source](/scarab-ci/usage/libraries/#install-a-library): without credentials from
+   github.com or a Forgejo connection's host, or through a connection of your org for a private
+   repository. It checks the manifest and shows what the plugin asks for: its capabilities, its
+   connection slots and the requests each slot allows, its config keys and its gates. Nothing is
+   installed yet.
+2. **Install.** Name the installation and give the plugin's image pinned by digest,
+   `<repository>@sha256:<digest>`, from any registry your cluster pulls from. Scarab reads the
+   source again and refuses the install (409) if the manifest is no longer the one you reviewed.
+   This asks you to confirm with your passkey.
+
+```sh
+curl -X POST "$SCARAB/v1/orgs/acme/plugin-fetch" \
+  -d '{"source": "github.com/acme/scarab-plugins//notify/manifest.json@8c2f…"}'
+# → {"source": "…", "manifest": {…}, "manifest_sha256": "a41c…", "content": "…", "installed": []}
+
+curl -X POST "$SCARAB/v1/orgs/acme/plugins" \
+  -d '{"name": "notify", "image": "ghcr.io/acme/notify@sha256:…",
+       "source": "github.com/acme/scarab-plugins//notify/manifest.json@8c2f…",
+       "manifest_sha256": "a41c…"}'
+```
+
+The install body also takes `connection` (the connection the fetch read through), `config`
+(values for the manifest's config keys) and `storage` (below). After the install, bind each
+connection slot under the installation, or with `PUT /v1/orgs/{org}/plugins/{name}/connections/{slot}`.
+
 #### Plugin storage
 
 Create the claim in the plugin namespace (`plugins.namespace`, default `scarab-plugins`) and

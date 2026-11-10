@@ -47,9 +47,45 @@ release.yml uses that version's section as the GitHub Release text. See
   answers 409, and the mark clears when GitHub covers it again or a re-sync lists it. Disable
   removes it. This needs migration 0089, which adds a column.
   ([Enabling repositories](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#enabling-repositories))
+- **Scarab's libraries and plugins are installed like anyone else's.** The server reads no
+  release manifest, marks no library version first-party, and installs nothing into a new
+  org: a new org has no libraries until an org admin installs them. To install the clone
+  library, fetch `github.com/thulasi-ram/scarab-ci//libs/clone.yaml@<full commit of a release
+  tag>` under Organization settings › Libraries, review it and install it as
+  `lib:thulasi-ram/clone`. Until then a Pipeline that invokes it fails its check with
+  "`lib:thulasi-ram/clone` is not installed in this org".
+  ([Install Scarab's clone library](https://thulasi-ram.github.io/scarab-ci/usage/libraries/#install-scarabs-clone-library))
+- **The clone library is no longer trusted with forge credentials by default.** On a Forgejo
+  or GitHub token connection, a step receives the long-lived token only when an org admin
+  trusted its library's source (`POST /v1/orgs/{org}/library-trust`, with a step-up). A Run
+  that invokes the clone library from an untrusted source is refused with the reason. On a
+  GitHub App connection nothing changes. Migration 0090 adds the trusted source for every org
+  that had the clone library from 0.3.0's release manifest, so those orgs keep cloning.
+  ([Trusting a library with forge credentials](https://thulasi-ram.github.io/scarab-ci/usage/libraries/#trusting-a-library-with-forge-credentials))
+- **Plugins install from a manifest source and an image digest.** There is no compiled-in
+  catalog: an org admin gives the manifest's source
+  (`<host>/<owner>/<repo>//<path>@<commit>`, read like a library source), reviews what it
+  asks for, and installs it with an image pinned `<repository>@sha256:<digest>` from any
+  repository (`POST /v1/orgs/{org}/plugin-fetch`, then `POST /v1/orgs/{org}/plugins`). The
+  install body takes `source` and `manifest_sha256` in place of `plugin`, and the server
+  refuses it (409) when the source no longer reads as the reviewed manifest.
+  `SCARAB_DEV_PLUGIN_ALLOW_TAG` admits a tag for every plugin alike.
+  ([Install a plugin](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#install-a-plugin))
+- **Removed:** the server variables `SCARAB_LIBS_MANIFEST` and `SCARAB_PLUGIN_ARGOCD_REPO`,
+  the chart values `scarab.libsManifest` and `plugins.argocdRepo`, and the endpoints
+  `POST /v1/orgs/{org}/library-defaults/retry` and `GET /v1/orgs/{org}/plugin-catalog`
+  (404). Releases no longer carry a `libs-manifest.json` asset.
+- **Migration 0090** adds the trusted sources above (trusted by `scarab:migration-0090`),
+  drops `library_versions.first_party` and the `library_org_defaults` table. Installed
+  libraries, their versions and yanks stay. A server from before 0090 cannot run against a
+  database migrated past it.
 
 ### Features
 
+- **Any plugin can be installed.** An org admin fetches a plugin's manifest from a git source
+  pinned to a commit, reviews its capabilities, connection slots, config keys and gates, and
+  installs it by image digest with a passkey. Scarab's Argo CD plugin installs the same way.
+  ([Install a plugin](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#install-a-plugin))
 - **An org page at `/orgs/<org>`.** It shows the org's enabled repositories, its runs and
   failed runs in the last 24 hours and its runs waiting on a gate, and lists every repository
   the org's connections reach, 25 to a page, each Enabled or Not enabled. Org admins enable a

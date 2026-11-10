@@ -358,6 +358,19 @@ The StatefulSet's `serviceName` is unchanged, so upgrading needs no migration.
 
 > **Unverified in this chart version:** per-availability-zone placement.
 
+### Upgrading from 0.3.0
+
+The release after 0.3.0 reads no release manifest and installs no library
+into a new org: an org admin installs the clone library in each new org, and
+on a Forgejo or GitHub token connection also trusts its source with forge
+credentials. The values `scarab.libsManifest` and `plugins.argocdRepo` are
+gone; the chart ignores them if your values still set them. Database
+migration 0090 trusts the clone library's source in every org that had it
+from 0.3.0's manifest, so those orgs keep cloning. A server from before 0090
+cannot run against a migrated database. Read the Breaking changes in
+`CHANGELOG.md`; the docs site's Libraries and Deploying with Argo CD pages
+describe how to install the clone library and a plugin.
+
 ### Upgrading to 0.3.0
 
 Read the Breaking changes of 0.3.0 in `CHANGELOG.md` first. Two of them need an
@@ -371,7 +384,10 @@ action:
   repository is bound; an org that existed before the upgrade does not. In
   each existing org, an org admin opens **Settings › Libraries › Install
   library**, picks the clone library from the release manifest, reviews it,
-  and confirms with a passkey. Until then a push whose Pipeline invokes it is
+  and confirms with a passkey. (From the release after 0.3.0 there is no
+  release manifest: give the source
+  `github.com/thulasi-ram/scarab-ci//libs/clone.yaml@<commit of a release tag>`
+  instead.) Until then a push whose Pipeline invokes it is
   refused with "`lib:thulasi-ram/clone` is not installed in this org", shown as a
   refused row in the repository's Runs list.
 
