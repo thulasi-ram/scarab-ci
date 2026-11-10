@@ -18,9 +18,24 @@
 
 :root,
 [data-theme="light"] {
-  /* Type scale (DESIGN.md §3). Mono uses the same steps. Every font size is
-     one of these, except the display heading row (h1, .crumb-head,
-     .login-title) and the wordmark (.brand), which keep their own sizes. */
+  /* Type (DESIGN.md §3): four text styles, and no others. A page that uses
+     only these stays within four font variations, size and weight included.
+     Every text rule sets `font:` to one of them, or `font: inherit`.
+       Title  page titles (h1, the run/settings breadcrumb heading, dialog
+              titles, stat figures)
+       Label  names, section and panel headings, column heads, buttons,
+              active tabs and nav links
+       Body   running text, values, form controls, nav links
+       Mono   machine values: ids, shas, refs, durations, counts, code, logs
+     Hierarchy comes from weight, spacing and colour, never from a fifth size.
+     Exemptions (src/styles.test.ts lists the same selectors): the wordmark
+     `.brand` and the login lockup `.login-title` keep the display face, and
+     the ASCII scenes size their dots from --ascii-fs. */
+  --t-title: 600 20px/1.3 var(--font-ui);
+  --t-label: 600 13px/1.5 var(--font-ui);
+  --t-body: 400 13px/1.5 var(--font-ui);
+  --t-mono: 400 12px/1.5 var(--font-mono);
+  /* The old five-step scale: removed once no rule reads it. */
   --fs-xs: 11px;  /* badges, chips, hashes */
   --fs-sm: 12px;  /* table cells, secondary text */
   --fs-md: 13px;  /* body, form controls */
