@@ -2,6 +2,7 @@
 // connection serves one org, and the org is the forge account that owns the
 // repositories it binds. The server enforces every rule here; these only
 // decide what the page offers, so the no-DOM vitest tier covers them.
+import type { Chip } from "./libraries";
 
 /** What these rules read from a connection. */
 export interface ConnectionLike {
@@ -61,4 +62,70 @@ export function forgeName(kind: string | null | undefined): string {
   if (kind === "github") return "GitHub";
   if (kind === "forgejo") return "Forgejo";
   return "the forge";
+}
+
+/** What a connection's list row and page read. */
+export interface ConnectionSummaryLike {
+  kind: string;
+  base_url: string;
+  web_url: string;
+  credential_present: boolean;
+  last_delivery_at?: number | null;
+  managed_by_config: boolean;
+}
+
+/**
+ * The host people know a connection by: the forge's web host (`github.com`,
+ * `git.acme.dev`), not the API host (`api.github.com`). A URL that does not
+ * parse is shown as written.
+ */
+export function connectionHost(c: { web_url: string; base_url: string }): string {
+  const raw = c.web_url || c.base_url;
+  try {
+    return new URL(raw).host || raw;
+  } catch {
+    return raw;
+  }
+}
+
+/** The address of one connection's page, under the org's Connections. */
+export function connectionHref(org: string, id: string): string {
+  return `/orgs/${encodeURIComponent(org)}/settings/connections/${encodeURIComponent(id)}`;
+}
+
+/**
+ * The state tags of a connection, most urgent first: a credential that does
+ * not resolve, no webhook delivery recorded, and managed by configuration.
+ * A healthy connection that has had a delivery carries none.
+ */
+export function connectionChips(c: ConnectionSummaryLike): Chip[] {
+  const out: Chip[] = [];
+  if (!c.credential_present) {
+    out.push({
+      label: "credential missing",
+      tone: "danger",
+      title: "The credential's handle does not resolve, so Scarab cannot reach the forge.",
+    });
+  }
+  if (c.last_delivery_at == null) {
+    out.push({
+      label: "no deliveries yet",
+      tone: "muted",
+      title: `No webhook delivery from ${forgeName(c.kind)} has been recorded yet.`,
+    });
+  }
+  if (c.managed_by_config) {
+    out.push({
+      label: "managed by configuration",
+      tone: "muted",
+      title:
+        "Set in the server's connections: configuration (Helm scarab.connections or SCARAB_CONNECTIONS). Change or remove it there.",
+    });
+  }
+  return out;
+}
+
+/** "1 enabled repository", "7 enabled repositories". */
+export function enabledReposLabel(n: number): string {
+  return `${n} enabled ${n === 1 ? "repository" : "repositories"}`;
 }

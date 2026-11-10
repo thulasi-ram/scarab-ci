@@ -1961,8 +1961,8 @@ select.input {
 }
 .preflight-sev.req { color: var(--danger); border-color: var(--danger); }
 
-/* How many repositories a connection has enabled, and the link to them. */
-.conn-projects { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+/* The Connections list: a connection's id under its forge and host. */
+.conn-id { display: block; margin-top: 2px; color: var(--muted-sage); }
 
 /* ════════════════════════════════════════════════════════════════════════
    Dashboard (engineer landing): action inbox · activity · all-clear

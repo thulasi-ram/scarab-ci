@@ -159,8 +159,8 @@ Anyone who can read the org sees the same list without the buttons. The list com
 every request (with `connection`, only that connection's); a connection the forge would not
 answer for is named in `unlisted`, and its enabled repositories are still listed. The org page is
 where repositories are enabled. **Settings › Connections** shows how many repositories each
-connection has enabled (`enabled_repos` on `GET /v1/connections`) and links to the org page
-narrowed to that connection (**Manage repositories**). An enabled repository's **Settings** tab
+connection has enabled (`enabled_repos` on `GET /v1/connections`), and each connection's page
+links to the org page narrowed to that connection (**Manage repositories**). An enabled repository's **Settings** tab
 has the same **Disable** for org admins, and goes to the org page once it is done; both ask for
 the same typed name. For a Forgejo repository, the tab also has **Register webhook**
 (`POST /v1/connections/{id}/repos/{owner}/{name}/webhook`), for when enabling could not register
@@ -231,8 +231,15 @@ address. The user menu links the pages you may use:
   last entry is **New organization…** (`/orgs/_new`), where a new org is created with its first
   Forgejo connection.
 
-Connections is the one place a forge connection is added: **Add Forgejo connection** on an org's
-Connections, or New organization… for an org Scarab does not have yet.
+Connections is the one place a forge connection is added: **Add Forgejo connection**, top right
+of an org's Connections, or New organization… for an org Scarab does not have yet. Connections
+lists one row per connection: its forge and host, tags such as **credential missing**, **no
+deliveries yet** or **managed by configuration**, how many repositories it has enabled and its
+last webhook delivery. The forge and host link to the connection's page
+(`/orgs/<org>/settings/connections/<id>`), which shows its id, whether its credential resolves,
+its last delivery and, for GitHub, the App's configuration check, and has **Manage
+repositories**, **Re-sync**, **Manage on GitHub** and **Remove**. Removing asks you to type the
+connection's id. A connection managed by configuration has no Re-sync or Remove there.
 
 Members lists each person's org role, which applies to every repository in the org, and grants
 and revokes org roles. Someone who holds roles on single repositories only is listed with no org

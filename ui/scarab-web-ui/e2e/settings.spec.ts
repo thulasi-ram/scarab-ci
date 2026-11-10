@@ -696,33 +696,68 @@ test("Connections lists the org's connections and, for a global admin, the unass
   const errors = collectErrors(page);
   await page.goto("/orgs/acme/settings/connections");
   const page_ = page.locator("section.page");
-  await expect(page_.getByText("forgejo-7f3a91c2", { exact: true })).toBeVisible();
+  const list = page_.getByRole("table", { name: "Forge connections" });
   const unassigned = page_.locator(".panel", { hasText: "Unassigned connections" });
   await expect(unassigned.getByText("github-install-90211", { exact: true })).toBeVisible();
 
-  // A connection shows how many repositories it has enabled and links to
-  // them on the org page; it lists none and enables or disables none.
-  const row = page_.locator("li.conn", { hasText: "forgejo-7f3a91c2" });
-  await expect(row).toContainText("1 enabled repository");
-  await expect(page_.locator("li.conn", { hasText: "gh-acme" })).toContainText("7 enabled repositories");
-  await expect(page_.getByRole("button", { name: "Add repository" })).toHaveCount(0);
-  await expect(page_.getByRole("button", { name: "Disable", exact: true })).toHaveCount(0);
-  await expect(page_.getByRole("link", { name: "acme/infra" })).toHaveCount(0);
-  // An unassigned connection serves no org, so it has no org page to link to.
-  await expect(unassigned.getByRole("link", { name: "Manage repositories" })).toHaveCount(0);
-  await expect(row.getByRole("link", { name: "Manage repositories" })).toHaveAttribute(
+  // One row per connection: forge and host linking to its page, how many
+  // repositories it has enabled, and none of them listed.
+  const row = list.getByRole("row", { name: /forgejo-7f3a91c2/ });
+  await expect(row.getByRole("link", { name: "Forgejo git.acme.dev" })).toHaveAttribute(
     "href",
-    "/orgs/acme?connection=forgejo-7f3a91c2",
+    "/orgs/acme/settings/connections/forgejo-7f3a91c2",
   );
+  await expect(row).toContainText("1 enabled repository");
+  await expect(list.getByRole("row", { name: /gh-acme/ })).toContainText("7 enabled repositories");
+  await expect(list.getByRole("link", { name: "acme/infra" })).toHaveCount(0);
+  // Re-sync and Remove live on the connection's page, not on the list.
+  await expect(list.getByRole("button", { name: /Re-sync|Remove/ })).toHaveCount(0);
+  // An unassigned connection serves no org, so it has no page to link to.
+  await expect(unassigned.getByRole("link", { name: "Manage", exact: true })).toHaveCount(0);
 
-  // Removing a connection asks for its id typed exactly.
-  await row.getByRole("button", { name: "Remove", exact: true }).click();
+  // Add Forgejo connection sits in the panel header and opens a dialog.
+  await page_.getByRole("button", { name: "Add Forgejo connection" }).click();
+  await expect(page.getByRole("dialog")).toContainText("Connect a Forgejo or Codeberg instance");
+  await page.getByRole("dialog").getByRole("button", { name: "Cancel" }).click();
+  expect(errors).toEqual([]);
+});
+
+test("a connection's page holds its credential, deliveries, app check, re-sync and remove", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/orgs/acme/settings/connections");
+  await page.getByRole("row", { name: /gh-acme/ }).getByRole("link", { name: "Manage", exact: true }).click();
+  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/connections\/gh-acme$/);
+  // Inside the settings frame, with Connections marked.
+  const nav = page.getByRole("navigation", { name: "Settings" });
+  await expect(nav.getByRole("link", { name: "Connections" })).toHaveAttribute("aria-current", "page");
+  const page_ = page.locator("section.page");
+  await expect(page_.getByRole("heading", { level: 1 })).toContainText("gh-acme");
+  await expect(page_).toContainText("credential github-app resolves");
+  await expect(page_).toContainText("app configuration matches what Scarab needs");
+  await expect(page_.getByRole("link", { name: "Manage on GitHub →" })).toHaveAttribute(
+    "href",
+    "https://github.com/settings/installations",
+  );
+  await expect(page_.getByRole("link", { name: "Manage repositories" })).toHaveAttribute(
+    "href",
+    "/orgs/acme?connection=gh-acme",
+  );
+  await page_.getByRole("button", { name: /Re-sync/ }).click();
+  await expect(page_.locator(".notice-ok")).toContainText("enabled repositories confirmed");
+
+  // Removing it asks for its id typed exactly.
+  await page_.getByRole("button", { name: "Remove connection" }).click();
   const dialog = page.getByRole("dialog");
-  await expect(dialog).toContainText("This also removes its 1 project");
+  await expect(dialog).toContainText("This also removes its 7 projects");
   const go = dialog.getByRole("button", { name: "Remove connection" });
   await expect(go).toBeDisabled();
-  await dialog.getByRole("textbox", { name: "Type forgejo-7f3a91c2 to confirm" }).fill("forgejo-7f3a91c2");
+  await dialog.getByRole("textbox", { name: "Type gh-acme to confirm" }).fill("gh-acme");
   await expect(go).toBeEnabled();
+  await dialog.getByRole("button", { name: "Cancel" }).click();
+
+  // A connection the org does not have says so.
+  await page.goto("/orgs/acme/settings/connections/nope");
+  await expect(page.locator("section.page")).toContainText("nope is not a connection of acme");
   expect(errors).toEqual([]);
 });
 
@@ -733,9 +768,8 @@ test("a connection's repositories are managed on the org page, and a Forgejo web
   page,
 }) => {
   const errors = collectErrors(page);
-  await page.goto("/orgs/acme/settings/connections");
-  const row = page.locator("li.conn", { hasText: "forgejo-7f3a91c2" });
-  await row.getByRole("link", { name: "Manage repositories" }).click();
+  await page.goto("/orgs/acme/settings/connections/forgejo-7f3a91c2");
+  await page.getByRole("link", { name: "Manage repositories" }).click();
   await expect(page).toHaveURL(/\/orgs\/acme\?connection=forgejo-7f3a91c2$/);
   const rows = page.locator(".org-repo-row");
   await expect(rows).toHaveCount(3);
@@ -792,7 +826,7 @@ test("a global admin makes a new org from the org dropdown and lands on its conn
   // panel: the new org reached `admin_orgs` on the next `/v1/me`.
   const page_ = page.locator("section.page");
   await expect(page_.getByText("forgejo-5be0d4a1", { exact: true })).toBeVisible();
-  await expect(page_.getByText("https://git.initech.dev", { exact: true })).toBeVisible();
+  await expect(page_.getByRole("link", { name: "Forgejo git.initech.dev" })).toBeVisible();
   await expect(page_.getByText(/You do not administer/)).toHaveCount(0);
   expect(errors).toEqual([]);
 });

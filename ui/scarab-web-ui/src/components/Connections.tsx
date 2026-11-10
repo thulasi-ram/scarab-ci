@@ -1,37 +1,43 @@
-// Forge connections — the Settings section that answers "is my
-// forge still wired up, and what does it cover?"
+// Forge connections: the Settings section that answers "is my forge still
+// wired up, and what does it cover?"
 //
 // A connection is the thing that makes a repo a Project: `ForgeConnection`
 // resolves a forge coordinate to a governed Project, and a Project *is* that
 // binding. So this list is the whole footprint of Scarab's reach.
 //
+// The section lists one row per connection: its forge and host, linking to
+// the connection's own page (`…/settings/connections/<id>`,
+// routes/ConnectionManage.tsx), its state tags, how many repositories it has
+// enabled and its last delivery. Everything done to one connection (re-sync,
+// the app's configuration check, removing it) is on that page.
+//
 // The connection itself differs by forge:
 //
 // - **GitHub** connections register themselves: installing the App creates
 //   the connection. Scarab cannot install, uninstall or change which repos it
-//   covers, so the row links to GitHub for that.
+//   covers, so the connection's page links to GitHub for that.
 // - **Forgejo** emits no installation event, so an admin adds the connection
 //   here (base URL + token). This is the one place a Forgejo connection is
-//   added: Add Forgejo connection on an org's Connections, or, for an org that
-//   does not exist yet, the New organization page (`NewOrgConnection`), which
-//   shows the same form with a field for the org's name.
+//   added: Add Forgejo connection, top right of an org's Connections, or, for
+//   an org that does not exist yet, the New organization page
+//   (`NewOrgConnection`), which shows the same form with a field for the
+//   org's name.
 //
 // Repositories are opt-in for both, and they are enabled and disabled in one
 // place: the org page (`/orgs/<org>`), which pages and filters them. A
-// connection here shows how many repositories it has enabled and links to the
-// org page narrowed to it (Manage repositories); it lists none of them, since
-// a connection can reach thousands. Re-sync asks the forge what it reaches and
-// lists what is not enabled.
+// connection's page links to the org page narrowed to it (Manage
+// repositories); nothing here lists them, since a connection can reach
+// thousands.
 //
 // The token is write-only: it is typed once, posted once, and never rendered.
-// The row reports whether the *handle* resolves, which is the question an
-// operator actually has ("is my forge still wired up?").
+// The page reports whether the *handle* resolves, which is the question an
+// operator has ("is my forge still wired up?").
 //
 // Each connection serves one org (git-bug 19b0a45): the forge account that owns
 // the repositories it binds. This section lists the connections of the org in
 // the URL. A connection that serves no org yet ("unassigned") is listed to a
 // global admin in a panel of its own, on every org's page, because no org's
-// list includes it.
+// list includes it; it has no page of its own, since no org's list finds it.
 import { createResource, createSignal, For, Show, type JSX } from "solid-js";
 import { A, useNavigate } from "@solidjs/router";
 import {
@@ -40,15 +46,22 @@ import {
   createConnection,
   deleteConnection,
   listConnections,
-  resyncConnection,
   type CapabilityRequirement,
   type Connection,
 } from "../api/client";
-import { orgNameProblem, resyncNote, unassignedConnections } from "../connections";
-import { relTime } from "../fmt";
+import {
+  connectionChips,
+  connectionHost,
+  connectionHref,
+  enabledReposLabel,
+  forgeName,
+  orgNameProblem,
+  unassignedConnections,
+} from "../connections";
+import { absTime, relTime } from "../fmt";
 import { me, refetchMe } from "../session";
 import { FIRST_ORG_SECTION, orgHref } from "../settings-nav";
-import { orgPageHref } from "../org-page";
+import Chips from "./Chips";
 import FormSection from "./FormSection";
 import Modal, { ModalMessage, ModalSection } from "./Modal";
 import ConfirmDestructive from "./ConfirmDestructive";
@@ -56,7 +69,7 @@ import { Field, Input } from "./Field";
 import Icon from "./Icon";
 
 /** Where a connection's own management lives, when the forge has such a page. */
-function manageUrl(c: Connection): string | null {
+export function manageUrl(c: Connection): string | null {
   // GitHub App installations are managed per-account on github.com; the exact
   // installation id isn't in our model, so link to the account's app settings
   // where the install is listed.
@@ -78,45 +91,78 @@ export default function Connections(props: { org: string }) {
   );
   const [adding, setAdding] = createSignal(false);
   const reload = () => setEpoch((e) => e + 1);
+  const rows = () => (conns.error ? [] : (conns() ?? []));
 
   return (
     <>
       <div class="panel">
-        <div class="panel-h"><span>Forge connections</span></div>
+        <div class="panel-h">
+          <span>
+            Forge connections · {props.org} <span class="tok-count">{rows().length}</span>
+          </span>
+          <button class="btn btn-primary btn-sm" onClick={() => setAdding(true)}>
+            <Icon icon="plus" size={14} /> Add Forgejo connection
+          </button>
+        </div>
         <div class="secrets-body">
           <Show when={conns.error}>
             <p class="error">Could not load connections.</p>
           </Show>
           <Show when={!conns.loading} fallback={<p class="empty">loading…</p>}>
             <Show
-              when={(conns()?.length ?? 0) > 0}
+              when={rows().length > 0}
               fallback={
-                <p class="empty">
-                  No forge connected to <b class="mono">{props.org}</b> yet. For GitHub, install
-                  the Scarab App on the <span class="mono">{props.org}</span> account. The
-                  installation webhook registers the connection; you then enable its repositories
-                  on the <A href={orgPageHref(props.org)}>organization page</A>. For Forgejo or
-                  Codeberg, add the connection below.
-                </p>
+                <Show when={!conns.error}>
+                  <p class="empty">
+                    No forge connected to <b class="mono">{props.org}</b> yet.
+                  </p>
+                </Show>
               }
             >
-              <ul class="conn-list">
-                <For each={conns()}>
-                  {(c) => <ConnectionRow conn={c} onChanged={reload} />}
-                </For>
-              </ul>
+              <table class="table lib-table conn-table" aria-label="Forge connections">
+                <thead>
+                  <tr>
+                    <th>Connection</th>
+                    <th>State</th>
+                    <th>Repositories</th>
+                    <th>Last delivery</th>
+                    <th />
+                  </tr>
+                </thead>
+                <tbody>
+                  <For each={rows()}>
+                    {(c) => (
+                      <tr>
+                        <td>
+                          <A class="oenv-link" href={connectionHref(props.org, c.id)}>
+                            {forgeName(c.kind)} <span class="mono">{connectionHost(c)}</span>
+                          </A>
+                          <span class="conn-id mono">{c.id}</span>
+                        </td>
+                        <td class="keep">
+                          <Chips chips={connectionChips(c)} />
+                        </td>
+                        <td>{enabledReposLabel(c.enabled_repos)}</td>
+                        <td title={c.last_delivery_at != null ? absTime(c.last_delivery_at) : undefined}>
+                          {c.last_delivery_at != null ? relTime(c.last_delivery_at) : "none yet"}
+                        </td>
+                        <td class="acts keep">
+                          <A class="btn btn-ghost btn-sm" href={connectionHref(props.org, c.id)}>
+                            Manage
+                          </A>
+                        </td>
+                      </tr>
+                    )}
+                  </For>
+                </tbody>
+              </table>
             </Show>
-            <div class="secrets-actions">
-              <button class="btn btn-primary btn-sm" onClick={() => setAdding(true)}>
-                <Icon icon="plus" size={14} /> Add Forgejo connection
-              </button>
-            </div>
             <p class="subtle">
               <small>
-                GitHub connections register themselves when the App is installed, so there is
-                nothing to add here for them. A connection binds only repositories owned by{" "}
-                <span class="mono">{props.org}</span>, and only the ones you enable: see the{" "}
-                <A href={orgPageHref(props.org)}>organization page</A>.
+                GitHub connections register themselves when the Scarab App is installed on the{" "}
+                <span class="mono">{props.org}</span> account. For Forgejo or Codeberg, use Add
+                Forgejo connection. A connection binds only repositories owned by{" "}
+                <span class="mono">{props.org}</span>, and only the ones you enable from its page.
               </small>
             </p>
           </Show>
@@ -143,15 +189,12 @@ export default function Connections(props: { org: string }) {
                 on every organization's page. Assign one to the organization that owns its
                 repositories. If its repositories belong to more than one organization, give each
                 organization its own connection and re-sync it there: the repositories move to it
-                with their projects. Then remove this one. For GitHub, install the App on that
-                account. For Forgejo, use Add Forgejo connection on that organization's
-                Connections, or New organization… in the organization menu above if Scarab does
-                not have it yet.
+                with their projects. Then remove this one.
               </small>
             </p>
             <ul class="conn-list">
               <For each={unassigned()}>
-                {(c) => <ConnectionRow conn={c} onChanged={reload} />}
+                {(c) => <UnassignedRow conn={c} onChanged={reload} />}
               </For>
             </ul>
           </div>
@@ -336,43 +379,22 @@ function ForgejoConnectionForm(props: {
   );
 }
 
-function ConnectionRow(props: { conn: Connection; onChanged: () => void }) {
+/**
+ * A connection that serves no org, for a global admin: its forge and id, its
+ * credential and last delivery, Assign to org and Remove. It has no page of
+ * its own and offers no re-sync, since it binds nothing for an org.
+ */
+function UnassignedRow(props: { conn: Connection; onChanged: () => void }) {
   const c = () => props.conn;
-  const [busy, setBusy] = createSignal(false);
   const [note, setNote] = createSignal<string | null>(null);
-  const [error, setError] = createSignal<string | null>(null);
   const [removing, setRemoving] = createSignal(false);
   const [assigning, setAssigning] = createSignal(false);
 
-  const resync = async () => {
-    setBusy(true);
-    setNote(null);
-    setError(null);
-    try {
-      const r = await resyncConnection(c().id);
-      setNote(resyncNote(r));
-      props.onChanged();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Re-sync failed.");
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  // Removing a connection removes the Projects it serves — a Project *is* the
-  // binding — so the server refuses unless we acknowledge that explicitly. The
-  // confirm names what goes and asks for the connection's id to be typed; a
-  // refusal shows in it.
+  // Removing a connection removes the Projects it serves, so the server
+  // refuses unless that is acknowledged; a refusal shows in the confirm.
   const remove = async () => {
-    setBusy(true);
-    setNote(null);
-    setError(null);
-    try {
-      await deleteConnection(c().id, c().enabled_repos > 0);
-      props.onChanged();
-    } finally {
-      setBusy(false);
-    }
+    await deleteConnection(c().id, c().enabled_repos > 0);
+    props.onChanged();
   };
 
   return (
@@ -380,14 +402,10 @@ function ConnectionRow(props: { conn: Connection; onChanged: () => void }) {
       <div class="conn-head">
         <span class="conn-kind mono">{c().kind}</span>
         <code class="mono conn-base">{c().base_url}</code>
-        {/* Config-owned connections are read-only here on purpose: the
-            `connections:` block is authoritative, so an edit made here
-            would be silently reverted on the next boot. The tag names the source
-            so the change has an obvious home. */}
         <Show when={c().managed_by_config}>
           <span
             class="conn-tag"
-            title="Provisioned from the server's connections: configuration (Helm scarab.connections / SCARAB_CONNECTIONS) and authoritative there — this connection cannot be edited or removed here."
+            title="Provisioned from the server's connections: configuration (Helm scarab.connections / SCARAB_CONNECTIONS) and authoritative there. It cannot be changed or removed here."
           >
             managed by configuration
           </span>
@@ -396,35 +414,22 @@ function ConnectionRow(props: { conn: Connection; onChanged: () => void }) {
         <Show when={manageUrl(c())}>
           {(href) => (
             <a class="btn btn-ghost btn-sm" href={href()} target="_blank" rel="noreferrer">
-              Manage on {c().kind === "github" ? "GitHub" : "the forge"} →
+              Manage on {forgeName(c().kind)} →
             </a>
           )}
         </Show>
-        <Show when={c().org == null && !c().managed_by_config}>
+        <Show when={!c().managed_by_config}>
           <button
             class="btn btn-ghost btn-sm"
-            disabled={busy() || assigning()}
+            disabled={assigning()}
             title="Choose the organization this connection serves"
             onClick={() => setAssigning(true)}
           >
             Assign to org
           </button>
-        </Show>
-        {/* An unassigned connection binds nothing on a re-sync, so it offers none. */}
-        <Show when={c().supports_resync && !c().managed_by_config && c().org != null}>
-          <button
-            class="btn btn-ghost btn-sm"
-            disabled={busy()}
-            title="Ask the forge which repositories this connection reaches and list the ones not enabled"
-            onClick={resync}
-          >
-            <Icon icon="rotate-cw" size={13} /> {busy() ? "Re-syncing…" : "Re-sync"}
-          </button>
-        </Show>
-        <Show when={!c().managed_by_config}>
           <button
             class="btn btn-danger btn-sm"
-            disabled={busy() || removing()}
+            disabled={removing()}
             title="Remove this connection from Scarab"
             onClick={() => setRemoving(true)}
           >
@@ -437,38 +442,11 @@ function ConnectionRow(props: { conn: Connection; onChanged: () => void }) {
         <span class="subtle">
           id <code class="mono">{c().id}</code>
         </span>
-        {/* Credential health. The most common silent breakage is a database
-            restored without its secrets — invisible until a run fails. */}
-        <span classList={{ "conn-ok": c().credential_present, "conn-bad": !c().credential_present }}>
-          <Icon icon={c().credential_present ? "shield-check" : "alert-triangle"} size={12} />{" "}
-          credential <code class="mono">{c().credential_ref}</code>{" "}
-          {c().credential_present ? "resolves" : "MISSING — the forge cannot be reached"}
-        </span>
-        {/* `null` means no delivery has been recorded, which is unknown rather
-            than broken — a brand-new connection has simply not been used yet. */}
+        <CredentialFact conn={c()} />
         <span class="subtle">
           last delivery{" "}
-          {c().last_delivery_at != null ? relTime(c().last_delivery_at!) : "— none recorded yet"}
+          {c().last_delivery_at != null ? relTime(c().last_delivery_at!) : "none recorded yet"}
         </span>
-      </div>
-
-      <Show when={c().supports_preflight}>
-        <AppPreflight conn={c()} />
-      </Show>
-
-      {/* How many, not which: a connection can hold thousands. The org page
-          lists them, pages and filters them, and enables and disables them. */}
-      <div class="conn-projects">
-        <span class="subtle">
-          {c().enabled_repos} enabled {c().enabled_repos === 1 ? "repository" : "repositories"}
-        </span>
-        <Show when={c().org}>
-          {(o) => (
-            <A class="btn btn-ghost btn-sm" href={orgPageHref(o(), c().id)}>
-              Manage repositories
-            </A>
-          )}
-        </Show>
       </div>
 
       <Show when={assigning()}>
@@ -490,10 +468,21 @@ function ConnectionRow(props: { conn: Connection; onChanged: () => void }) {
       <Show when={note()}>
         <p class="subtle"><small>{note()}</small></p>
       </Show>
-      <Show when={error()}>
-        <p class="error">{error()}</p>
-      </Show>
     </li>
+  );
+}
+
+/** Whether a connection's credential handle resolves. The most common silent
+ *  breakage is a database restored without its secrets, which no one sees
+ *  until a run fails. */
+export function CredentialFact(props: { conn: Connection }) {
+  const c = () => props.conn;
+  return (
+    <span classList={{ "conn-ok": c().credential_present, "conn-bad": !c().credential_present }}>
+      <Icon icon={c().credential_present ? "shield-check" : "alert-triangle"} size={12} />{" "}
+      credential <code class="mono">{c().credential_ref}</code>{" "}
+      {c().credential_present ? "resolves" : "is missing: Scarab cannot reach the forge"}
+    </span>
   );
 }
 
@@ -501,7 +490,7 @@ function ConnectionRow(props: { conn: Connection; onChanged: () => void }) {
  * The confirm for removing a connection: what goes with it, and its id typed
  * exactly. Removing it removes every Project it serves.
  */
-function RemoveConnection(props: {
+export function RemoveConnection(props: {
   conn: Connection;
   onConfirm: () => Promise<void>;
   onClose: () => void;
@@ -615,7 +604,7 @@ function AssignConnection(props: {
  * "you are fine". When we could not look, the requirement list is shown instead,
  * so the answer is still actionable.
  */
-function AppPreflight(props: { conn: Connection }) {
+export function AppPreflight(props: { conn: Connection }) {
   const [report] = createResource(() => props.conn.id, connectionPreflight);
   const required = () => report()?.missing.filter((g) => g.severity === "required") ?? [];
   const recommended = () => report()?.missing.filter((g) => g.severity === "recommended") ?? [];
