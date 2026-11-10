@@ -27,12 +27,15 @@ import { createPasskey, webauthnAvailable, webauthnErrorText } from "../webauthn
 import Icon from "./Icon";
 import ConfirmDestructive from "./ConfirmDestructive";
 import { Field, Input } from "./Field";
+import Modal, { ModalMessage } from "./Modal";
 import SecurityEventTable from "./SecurityEventTable";
 
 export default function SecuritySettings() {
   const location = useLocation();
   const [sec, { refetch }] = createResource(getMySecurity);
   const [label, setLabel] = createSignal("");
+  // The Add passkey dialog (the name field) is open while set.
+  const [adding, setAdding] = createSignal(false);
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
   const [notice, setNotice] = createSignal<string | null>(null);
@@ -69,11 +72,13 @@ export default function SecuritySettings() {
       const added = await finishPasskeyRegistration(options.id, credential);
       setNotice(`Passkey "${added.label}" added.`);
       setLabel("");
+      setAdding(false);
       await refetch();
       await loadEvents();
     } catch (e) {
       if (e instanceof FreshLoginRequiredError) {
         setFreshLogin({ message: e.message, url: e.loginUrl });
+        setAdding(false);
       } else if (auto && (e as { name?: string } | null)?.name === "NotAllowedError") {
         // The arrival-time start had no click behind it; some browsers refuse
         // that. Not an error the person made — just ask for the click.
@@ -126,7 +131,14 @@ export default function SecuritySettings() {
           </Show>
         </span>
         <Show when={enforced()}>
-          <button class="btn btn-primary btn-sm" disabled={busy()} onClick={() => enroll()}>
+          <button
+            class="btn btn-primary btn-sm"
+            disabled={busy()}
+            onClick={() => {
+              setError(null);
+              setAdding(true);
+            }}
+          >
             <Icon icon="plus" size={14} /> {busy() ? "Working…" : "Add passkey"}
           </button>
         </Show>
@@ -138,7 +150,7 @@ export default function SecuritySettings() {
         <Show when={notice()}>
           <p class="notice-ok">{notice()}</p>
         </Show>
-        <Show when={error()}>
+        <Show when={error() && !adding()}>
           <p class="error">{error()}</p>
         </Show>
         <Show when={freshLogin()}>
@@ -230,18 +242,6 @@ export default function SecuritySettings() {
                   </ul>
                 </Show>
 
-                <Field
-                  class="sec-name"
-                  label="Passkey name"
-                  help="Optional. Add passkey gives this name to the passkey it adds."
-                >
-                  <Input
-                    placeholder="MacBook Touch ID, YubiKey…"
-                    maxLength={64}
-                    value={label()}
-                    onValue={setLabel}
-                  />
-                </Field>
                 <p class="subtle">
                   <small>
                     <Icon icon="shield-check" size={12} /> A first passkey needs a login from the
@@ -252,6 +252,52 @@ export default function SecuritySettings() {
               </Show>
             </>
           )}
+        </Show>
+
+        <Show when={adding()}>
+          <Modal
+            title="Add a passkey"
+            purpose="Your browser asks you to create it with Touch ID, Windows Hello or a security key."
+            icon="plus"
+            busy={busy()}
+            onClose={() => setAdding(false)}
+            footer={
+              <>
+                <Show when={error()}>
+                  <ModalMessage>{error()}</ModalMessage>
+                </Show>
+                <button
+                  class="btn btn-ghost"
+                  type="button"
+                  disabled={busy()}
+                  onClick={() => setAdding(false)}
+                >
+                  Cancel
+                </button>
+                <button class="btn btn-primary" type="submit" form="add-passkey" disabled={busy()}>
+                  {busy() ? "Working…" : "Add passkey"}
+                </button>
+              </>
+            }
+          >
+            <form
+              id="add-passkey"
+              onSubmit={(e) => {
+                e.preventDefault();
+                void enroll();
+              }}
+            >
+              <Field label="Passkey name" help="Optional. Shown in your passkey list.">
+                <Input
+                  placeholder="MacBook Touch ID, YubiKey…"
+                  maxLength={64}
+                  value={label()}
+                  onValue={setLabel}
+                  autofocus
+                />
+              </Field>
+            </form>
+          </Modal>
         </Show>
 
         <Show when={removing()}>
