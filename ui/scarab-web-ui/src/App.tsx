@@ -55,6 +55,9 @@ export default function App() {
       <Route path="/settings/server/:section?" component={LegacySettings} />
       <Route path="/account" component={LegacySettings} />
       <Route path="/account/security" component={LegacySettings} />
+      {/* An org's former Event log section, now part of Security. A static
+          last segment, so it outranks /orgs/:org/settings/:section. */}
+      <Route path="/orgs/:org/settings/events" component={LegacySettings} />
       {/* A machine's StepUpConfirmationRequest: the
           `confirmation_url` its human opens. Three segments, so it can't
           collide with the two-segment /:org/:repo tier. */}

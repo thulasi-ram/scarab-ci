@@ -1487,9 +1487,9 @@ const securityEvents: SecurityEventDto[] = [
   }),
   secEvent(7, "passkey.enrolled", 3 * 24 * 60, { org: null, passkey_id: "pk-2" }),
 ];
-// Older Org events, so Settings → Event log has more than one page (50 a
-// page) to step through. Not in `securityEvents`: the Account → Security
-// list and the recent refusals stay as they were.
+// Older Org events, so the event log on Settings → Security has more than
+// one page (50 a page) to step through. Not in `securityEvents`: the
+// Account → Security list and the summary's recent refusals stay as they were.
 const OLDER_KINDS = ["op.authorised", "op.completed", "step_up.confirmed", "step_up.refused"];
 const OLDER_ACTORS = ["a.kim", "j.lee", "r.patel"];
 const OLDER_TARGETS = [

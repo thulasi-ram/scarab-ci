@@ -1,4 +1,5 @@
-// Settings → Event log: how the URL becomes a request and the form a URL.
+// The event log on Organization settings → Security: how the URL becomes a
+// request and the form a URL.
 import { describe, expect, it } from "vitest";
 import {
   emptyText,
@@ -10,6 +11,8 @@ import {
   parseInstant,
   rangeProblem,
   readView,
+  refusalsLastDay,
+  REFUSAL_KIND,
   requestFor,
   toLocalInput,
 } from "./event-log";
@@ -157,5 +160,21 @@ describe("isFiltered / emptyText", () => {
     expect(emptyText(none, false)).toBe("No security events yet.");
     expect(emptyText({ ...none, kind: "passkey.reset" }, false)).toBe("No events match these filters.");
     expect(emptyText({ ...none, kind: "passkey.reset" }, true)).toBe("No older events.");
+  });
+});
+
+describe("refusalsLastDay", () => {
+  it("asks for refusals from 24 hours ago, to the minute, and nothing else", () => {
+    const now = Date.UTC(2026, 10, 10, 14, 5, 42);
+    const f = refusalsLastDay(now);
+    expect(f).toEqual({ ...none, kind: "step_up.refused", from: "2026-11-09T14:05Z" });
+    expect(REFUSAL_KIND).toBe("step_up.refused");
+    // Through the same URL the form writes, and a request the server reads.
+    const search = filterSearch(f);
+    expect(search.cursor).toBe("");
+    expect(requestFor(readView(search))).toEqual({
+      kind: "step_up.refused",
+      from: Date.UTC(2026, 10, 9, 14, 5),
+    });
   });
 });

@@ -65,11 +65,12 @@ describe("route table", () => {
     expect(resolveSection("account", "members")).toBeUndefined();
   });
 
-  it("gives the org's event log its own section, last in the org group", () => {
-    expect(resolveSection("org", "events")?.label).toBe("Event log");
-    expect(ORG_SECTIONS.map((s) => s.id).slice(-2)).toEqual(["security", "events"]);
-    expect(navGroup(admin, "org", "acme").items.at(-1)!.href).toBe("/orgs/acme/settings/events");
-    // Only the org page has it: your own events stay on Account settings → Security.
+  it("keeps the org's event log in its Security section, last in the org group", () => {
+    expect(ORG_SECTIONS.map((s) => s.id).at(-1)).toBe("security");
+    expect(navGroup(admin, "org", "acme").items.at(-1)!.href).toBe("/orgs/acme/settings/security");
+    // No section of its own any more: the old URL redirects (see "old URLs").
+    expect(resolveSection("org", "events")).toBeUndefined();
+    expect(activeSectionHref("/orgs/acme/settings/events")).toBeNull();
     expect(resolveSection("account", "events")).toBeUndefined();
   });
 });
@@ -402,6 +403,19 @@ describe("old URLs", () => {
       expect(legacyRedirect(path, "", admin), path).toBe("/orgs/acme/settings/connections");
       expect(legacyRedirect(path, "", member), path).toBe("/settings/profile");
     }
+  });
+
+  it("redirects an org's former Event log to its Security section, keeping the filters", () => {
+    const q = "?kind=step_up.refused&from=2026-11-01T09:30Z&cursor=c2VxOjQy";
+    expect(legacyRedirect("/orgs/acme/settings/events", q, admin)).toBe(`/orgs/acme/settings/security${q}`);
+    expect(legacyRedirect("/orgs/acme/settings/events/", "", admin)).toBe("/orgs/acme/settings/security");
+    // The org is decoded and escaped again, as every org href is.
+    expect(legacyRedirect("/orgs/a%20b/settings/events", "", admin)).toBe("/orgs/a%20b/settings/security");
+    // Whoever follows it: the Security section decides what they may see.
+    expect(legacyRedirect("/orgs/globex/settings/events", "", member)).toBe("/orgs/globex/settings/security");
+    // Only that path: a section, or a page under one, is not an old URL.
+    expect(legacyRedirect("/orgs/acme/settings/security", "", admin)).toBeNull();
+    expect(legacyRedirect("/orgs/acme/settings/events/x", "", admin)).toBeNull();
   });
 
   it("leaves every other path alone", () => {

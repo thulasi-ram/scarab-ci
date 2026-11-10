@@ -1,6 +1,6 @@
-// Settings → Event log (git-bug fa23028): the org's security event log on a
-// page of its own, one server page at a time, with its filters in the URL so
-// a filtered view can be shared.
+// The org's security event log (git-bug fa23028), under the posture panel of
+// Organization settings → Security: one server page at a time, with its
+// filters in the URL so a filtered view can be shared.
 //
 // Pure — no DOM, no fetch — so the no-DOM vitest tier covers how the URL
 // becomes a request and how the form becomes a URL.
@@ -122,6 +122,19 @@ export function fromLocalInput(local: string): string {
   const d = new Date(+m[1]!, +m[2]! - 1, +m[3]!, +m[4]!, +m[5]!);
   if (!Number.isFinite(d.getTime())) return "";
   return `${d.toISOString().slice(0, 16)}Z`;
+}
+
+/** The kind the server writes when it refuses a change for a missing
+ *  step-up. */
+export const REFUSAL_KIND = "step_up.refused";
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/** The "Refusals, last 24h" preset: refusals from 24 hours before `now`
+ *  (unix ms), to the minute, with every other filter cleared. */
+export function refusalsLastDay(now: number): EventLogFilter {
+  const from = `${new Date(now - DAY_MS).toISOString().slice(0, 16)}Z`;
+  return { kind: REFUSAL_KIND, actor: "", target: "", from, to: "" };
 }
 
 /** The empty table's words. */

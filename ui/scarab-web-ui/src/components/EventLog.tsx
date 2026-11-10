@@ -1,8 +1,10 @@
-// Settings → Event log (git-bug fa23028): the org's security event log on its
-// own page. One server page at a time, newest first; filters by kind, actor,
-// target text and time range. The filters and the page's cursor live in the
+// The org's security event log (git-bug fa23028), below the posture panel of
+// Organization settings → Security. One server page at a time, newest first;
+// filters by kind, actor, target text and time range, and a preset for the
+// last 24 hours of refusals. The filters and the page's cursor live in the
 // URL (`event-log.ts`), so a filtered view can be shared and Back returns to
-// the newer page.
+// the newer page. The Security section reads no other search param, so these
+// names are the log's alone.
 import { For, Show, createEffect, createMemo, createResource, createSignal, on } from "solid-js";
 import { useSearchParams } from "@solidjs/router";
 import { listOrgSecurityEvents } from "../api/client";
@@ -15,6 +17,7 @@ import {
   isFiltered,
   rangeProblem,
   readView,
+  refusalsLastDay,
   requestFor,
   toLocalInput,
   type EventLogFilter,
@@ -107,6 +110,9 @@ export default function EventLog(props: { org: string }) {
           </Field>
           <button class="btn btn-primary btn-sm" type="submit">
             Apply
+          </button>
+          <button class="btn btn-ghost btn-sm" type="button" onClick={() => apply(refusalsLastDay(Date.now()))}>
+            Refusals, last 24h
           </button>
           <Show when={isFiltered(view())}>
             <button class="btn btn-ghost btn-sm" type="button" onClick={clear}>

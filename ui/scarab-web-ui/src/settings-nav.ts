@@ -51,8 +51,7 @@ export const ORG_SECTIONS: readonly SettingsSection[] = [
   { id: "secrets", label: "Secrets", sub: "org-wide secrets" },
   { id: "policies", label: "Policies", sub: "CEL policies, their decisions, and every typed setting" },
   { id: "tokens", label: "API tokens", sub: "every token issued in the org" },
-  { id: "security", label: "Security", sub: "step-up settings and recent refusals" },
-  { id: "events", label: "Event log", sub: "every security event, filterable" },
+  { id: "security", label: "Security", sub: "step-up settings and the security event log" },
 ];
 
 /** An org's home section: where `/orgs/<org>/settings` opens, and where
@@ -308,7 +307,8 @@ export function addConnectionHref(who: SettingsCaller): string | null {
 /**
  * Where an old settings URL now lives, keeping its query string (an old
  * `/account?identity_linked=…` or `/account/security?enroll=1` link still
- * lands on the right section). `null` when `pathname` is not an old URL.
+ * lands on the right section, and an old filtered event log link keeps its
+ * filters). `null` when `pathname` is not an old URL.
  */
 export function legacyRedirect(pathname: string, search: string, who: SettingsCaller): string | null {
   const path = pathname.replace(/\/+$/, "") || "/";
@@ -325,6 +325,12 @@ export function legacyRedirect(pathname: string, search: string, who: SettingsCa
     }
     default:
       break;
+  }
+  // The former Event log section of an org: the log is now under the
+  // Security section's step-up settings, and reads the same query params.
+  const parts = path.split("/").filter((p) => p !== "");
+  if (parts.length === 4 && parts[0] === "orgs" && parts[2] === "settings" && parts[3] === "events") {
+    return orgHref(decodeParam(parts[1]!), "security") + search;
   }
   // The former Server administration page, whose one section (Connect a
   // forge) made a new org: now the New organization page.

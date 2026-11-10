@@ -48,7 +48,6 @@ import ScopedSecrets from "../components/ScopedSecrets";
 import { MyApiTokens, OrgApiTokens } from "../components/ApiTokens";
 import OrgSecurity from "../components/OrgSecurity";
 import OrgPolicies from "../components/OrgPolicies";
-import EventLog from "../components/EventLog";
 import Icon from "../components/Icon";
 
 const IDENTITY_ERROR = "Could not load your identity. Is the server up?";
@@ -80,8 +79,8 @@ export function NewOrgSettings() {
   );
 }
 
-/** An old settings URL (`/settings`, `/account`, `/settings/server/…`, …):
- *  where it lives now. */
+/** An old settings URL (`/settings`, `/account`, `/settings/server/…`, an
+ *  org's former Event log, …): where it lives now. */
 export function LegacySettings() {
   const location = useLocation();
   return (
@@ -352,8 +351,6 @@ function orgBody(id: string, org: string): JSX.Element {
       return <OrgApiTokens org={org} />;
     case "security":
       return <OrgSecurity org={org} />;
-    case "events":
-      return <EventLog org={org} />;
     default:
       return <NotFound />;
   }

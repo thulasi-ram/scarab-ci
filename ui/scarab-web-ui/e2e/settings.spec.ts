@@ -23,7 +23,7 @@ test("an admin lands on their org's settings", async ({ page }) => {
 // lists its own sections and none of the other's.
 for (const [start, heading, count] of [
   ["/settings/profile", "Account settings", 4],
-  ["/orgs/acme/settings/connections", "Organization settings", 10],
+  ["/orgs/acme/settings/connections", "Organization settings", 9],
 ] as const) {
   test(`${heading} lists only its own sections, each at its own URL`, async ({ page }) => {
     const errors = collectErrors(page);
@@ -103,6 +103,35 @@ test("the old account addresses redirect and keep their query", async ({ page })
   await page.goto("/account?identity_linked=forgejo");
   await expect(page).toHaveURL(/\/settings\/profile\?identity_linked=forgejo$/);
   await expect(page.getByText(/Linked your Forgejo account/)).toBeVisible();
+  expect(errors).toEqual([]);
+});
+
+// The event log has no section of its own: it sits under the step-up
+// settings in Security, and its old address keeps its filters.
+test("the old Event log address opens Security with its filters, and the refusals preset filters the log", async ({
+  page,
+}) => {
+  const errors = collectErrors(page);
+  await page.goto("/orgs/acme/settings/events?kind=passkey.enrolled");
+  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/security\?kind=passkey\.enrolled$/);
+  await expect(page.getByRole("heading", { level: 1, name: "Security", exact: true })).toBeVisible();
+  const nav = page.getByRole("navigation", { name: "Settings" });
+  await expect(nav.getByRole("link", { name: "Security", exact: true })).toHaveAttribute("aria-current", "page");
+  await expect(nav.getByRole("link", { name: "Event log" })).toHaveCount(0);
+  // The step-up settings sit above the log.
+  await expect(page.getByText(/Step-up is enforced/)).toBeVisible();
+  const rows = page.locator(".sec-table tbody tr");
+  await expect(rows).toHaveCount(1);
+  await expect(rows.first()).toContainText("Passkey enrolled");
+
+  // One click: the refusals of the last 24 hours, through the URL. The mock
+  // holds two; its older refusals are four days old.
+  await page.getByRole("button", { name: "Refusals, last 24h" }).click();
+  await expect(page).toHaveURL(/[?&]kind=step_up\.refused(&|$)/);
+  await expect(page).toHaveURL(/[?&]from=/);
+  await expect(rows).toHaveCount(2);
+  for (const r of await rows.all()) await expect(r).toContainText("Refused: step-up required");
+  await expect(page.getByRole("button", { name: "Clear filters" })).toBeVisible();
   expect(errors).toEqual([]);
 });
 
